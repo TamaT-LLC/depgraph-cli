@@ -8,7 +8,7 @@ use depgraph_store::{CoverageRecord, DiagnosticRecord, Store};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tokio::task::JoinSet;
+use tokio::task::{Id, JoinSet};
 use uuid::Uuid;
 
 use crate::{
@@ -62,6 +62,7 @@ pub async fn run_scan(
 
     let mut failures = Vec::new();
     let mut join_set = JoinSet::new();
+    let mut task_adapters = BTreeMap::new();
     for adapter in adapters {
         match locate_worker(adapter) {
             Ok(spec) => {
@@ -69,9 +70,10 @@ pub async fn run_scan(
                 let scan_id = scan_id.clone();
                 let scan_config = config.scan.clone();
                 let profiles = config.profiles.clone();
-                join_set.spawn(async move {
+                let task = join_set.spawn(async move {
                     execute_worker(spec, root, scan_id, scan_config, profiles).await
                 });
+                task_adapters.insert(task.id(), adapter);
             }
             Err(error) => {
                 let error = format!("{error:#}");
@@ -82,14 +84,16 @@ pub async fn run_scan(
     }
 
     let mut outputs = Vec::new();
-    while let Some(result) = join_set.join_next().await {
+    while let Some(result) = join_set.join_next_with_id().await {
         match result {
-            Ok(output) => outputs.push(output),
-            Err(error) => failures.push((
-                AdapterKind::Rust,
-                format!("worker task failed: {error}"),
-                false,
-            )),
+            Ok((task_id, output)) => {
+                task_adapters.remove(&task_id);
+                outputs.push(output);
+            }
+            Err(error) => {
+                let adapter = task_adapter(&mut task_adapters, error.id());
+                failures.push((adapter, format!("worker task failed: {error}"), false));
+            }
         }
     }
     outputs.sort_by_key(|output| output.adapter);
@@ -175,6 +179,12 @@ pub async fn run_scan(
 
     store.finish_scan(&scan_id, "completed", None, true)?;
     snapshot_outcome(store, &scan_id, 0)
+}
+
+fn task_adapter(task_adapters: &mut BTreeMap<Id, AdapterKind>, task_id: Id) -> AdapterKind {
+    task_adapters
+        .remove(&task_id)
+        .expect("every spawned worker task must have a registered adapter")
 }
 
 fn ingest_worker_output(
@@ -365,6 +375,25 @@ mod tests {
         assert!(error.contains("security policy"));
         assert_eq!(store.latest_attempt_id()?, None);
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn panicking_worker_task_is_attributed_to_its_adapter() {
+        let mut join_set = JoinSet::<WorkerOutput>::new();
+        let task = join_set.spawn(async { panic!("web worker panic fixture") });
+        let mut task_adapters = BTreeMap::from([(task.id(), AdapterKind::Web)]);
+
+        let error = join_set
+            .join_next_with_id()
+            .await
+            .expect("worker task should complete")
+            .expect_err("worker task should panic");
+
+        assert_eq!(
+            task_adapter(&mut task_adapters, error.id()),
+            AdapterKind::Web
+        );
+        assert!(task_adapters.is_empty());
     }
 
     #[test]
