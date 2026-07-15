@@ -1,0 +1,37 @@
+# ドキュメントインデックス
+
+| ID | Layer | Feature | Scope | Title | Status |
+| --- | --- | --- | --- | --- | --- |
+| PROJ-ARC-001 | L4 | dependency-graph | feature | アーキテクチャ設計: Semantic Dependency Graph CLI | Draft |
+
+## 統計
+
+### レイヤー別
+
+| Layer | Count |
+| --- | ---: |
+| L0 | 0 |
+| L1 | 0 |
+| L2 | 0 |
+| L3 | 0 |
+| L4 | 1 |
+| L5 | 0 |
+| Total | 1 |
+
+### ステータス別
+
+| Status | Count |
+| --- | ---: |
+| Draft | 1 |
+| Active | 0 |
+| Deprecated | 0 |
+
+### 機能別
+
+| Feature | Count |
+| --- | ---: |
+| dependency-graph | 1 |
+
+## 更新履歴
+
+- 2026-07-15: `PROJ-ARC-001` を追加
