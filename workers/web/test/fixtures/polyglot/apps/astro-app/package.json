@@ -1,0 +1,7 @@
+{
+  "name": "@fixture/astro-app",
+  "version": "1.0.0",
+  "dependencies": {
+    "astro": "7.0.9"
+  }
+}

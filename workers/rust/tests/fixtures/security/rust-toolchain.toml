@@ -1,0 +1,2 @@
+[toolchain]
+channel = "depgraph-must-not-install"

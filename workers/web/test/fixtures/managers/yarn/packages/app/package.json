@@ -1,0 +1,5 @@
+{
+  "name": "yarn-app",
+  "version": "1.0.0",
+  "dependencies": { "lodash": "^4.17.0" }
+}

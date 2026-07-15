@@ -1,0 +1,421 @@
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::PathBuf,
+};
+
+use anyhow::{Context, Result};
+use depgraph_store::{CoverageRecord, DiagnosticRecord, Store};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use tokio::task::JoinSet;
+use uuid::Uuid;
+
+use crate::{
+    config::Config,
+    worker::{
+        AdapterKind, WorkerOutput, detect_adapters, execute_worker, is_security_error,
+        locate_worker,
+    },
+};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScanOutcome {
+    pub scan_id: String,
+    pub status: String,
+    pub exit_code: u8,
+    pub coverage: CoverageRecord,
+    pub diagnostics: Vec<DiagnosticRecord>,
+}
+
+pub async fn run_scan(
+    store: &mut Store,
+    root: PathBuf,
+    config: &Config,
+    strict: bool,
+) -> Result<ScanOutcome> {
+    let root = root
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize {}", root.display()))?;
+    if root.parent().is_none() {
+        anyhow::bail!(
+            "security policy violation: a filesystem root cannot be used as a safe scan root"
+        );
+    }
+    let scan_id = Uuid::new_v4().to_string();
+    store.start_scan(&scan_id, &root, strict)?;
+
+    let adapters = match detect_adapters(&root, config.scan.follow_symlinks) {
+        Ok(adapters) => adapters,
+        Err(error) => {
+            add_core_diagnostic(
+                store,
+                &scan_id,
+                "error",
+                "workspace-detection-failed",
+                &format!("{error:#}"),
+            )?;
+            store.finish_scan(&scan_id, "failed", Some(&error.to_string()), false)?;
+            return snapshot_outcome(store, &scan_id, 3);
+        }
+    };
+
+    let mut failures = Vec::new();
+    let mut join_set = JoinSet::new();
+    for adapter in adapters {
+        match locate_worker(adapter) {
+            Ok(spec) => {
+                let root = root.clone();
+                let scan_id = scan_id.clone();
+                let scan_config = config.scan.clone();
+                let profiles = config.profiles.clone();
+                join_set.spawn(async move {
+                    execute_worker(spec, root, scan_id, scan_config, profiles).await
+                });
+            }
+            Err(error) => {
+                let error = format!("{error:#}");
+                let security = is_security_error(&error);
+                failures.push((adapter, error, security));
+            }
+        }
+    }
+
+    let mut outputs = Vec::new();
+    while let Some(result) = join_set.join_next().await {
+        match result {
+            Ok(output) => outputs.push(output),
+            Err(error) => failures.push((
+                AdapterKind::Rust,
+                format!("worker task failed: {error}"),
+                false,
+            )),
+        }
+    }
+    outputs.sort_by_key(|output| output.adapter);
+
+    let mut global_upserts = BTreeMap::<(String, String), Value>::new();
+    for output in outputs {
+        let adapter = output.adapter;
+        let security_violation = output.security_violation;
+        if let Err(error) = ingest_worker_output(store, &scan_id, output, &mut global_upserts) {
+            failures.push((adapter, format!("{error:#}"), security_violation));
+        }
+    }
+    for (adapter, error, security_violation) in &failures {
+        add_core_diagnostic(
+            store,
+            &scan_id,
+            "error",
+            if *security_violation {
+                "security-policy"
+            } else {
+                "worker-failure"
+            },
+            &format!("{}: {error}", adapter.name()),
+        )?;
+    }
+
+    if failures.is_empty() && !store.has_final_coverage(&scan_id)? {
+        ingest_empty_coverage(store, &scan_id)?;
+    }
+
+    if !failures.is_empty() {
+        let summary = failures
+            .iter()
+            .map(|(adapter, error, _)| format!("{}: {error}", adapter.name()))
+            .collect::<Vec<_>>()
+            .join("; ");
+        store.mark_coverage_incomplete(&scan_id, &format!("worker failure: {summary}"))?;
+        let security_violation = failures.iter().any(|(_, _, security)| *security);
+        store.finish_scan(
+            &scan_id,
+            if security_violation {
+                "security_failed"
+            } else {
+                "partial"
+            },
+            Some(&summary),
+            false,
+        )?;
+        return snapshot_outcome(store, &scan_id, if security_violation { 4 } else { 3 });
+    }
+
+    if let Err(error) = store.validate_scan(&scan_id) {
+        add_core_diagnostic(
+            store,
+            &scan_id,
+            "error",
+            "graph-validation-failed",
+            &format!("{error:#}"),
+        )?;
+        store.finish_scan(&scan_id, "failed", Some(&error.to_string()), false)?;
+        return snapshot_outcome(store, &scan_id, 3);
+    }
+
+    let coverage = store.load_snapshot(&scan_id)?.coverage;
+    let strict_failure = strict
+        && (coverage.unresolved > config.strict.max_unresolved
+            || coverage.files_skipped > config.strict.max_skipped
+            || coverage.unsupported_syntax > config.strict.max_unsupported_syntax);
+    if strict_failure {
+        let message = format!(
+            "strict policy failed: unresolved={} (max {}), skipped={} (max {}), unsupported={} (max {})",
+            coverage.unresolved,
+            config.strict.max_unresolved,
+            coverage.files_skipped,
+            config.strict.max_skipped,
+            coverage.unsupported_syntax,
+            config.strict.max_unsupported_syntax
+        );
+        add_core_diagnostic(store, &scan_id, "error", "strict-policy", &message)?;
+        store.finish_scan(&scan_id, "policy_failed", Some(&message), false)?;
+        return snapshot_outcome(store, &scan_id, 1);
+    }
+
+    store.finish_scan(&scan_id, "completed", None, true)?;
+    snapshot_outcome(store, &scan_id, 0)
+}
+
+fn ingest_worker_output(
+    store: &mut Store,
+    scan_id: &str,
+    output: WorkerOutput,
+    global_upserts: &mut BTreeMap<(String, String), Value>,
+) -> Result<()> {
+    store.save_adapter_log(
+        scan_id,
+        output.adapter.name(),
+        &output.stderr,
+        output.stderr_truncated,
+    )?;
+    let worker_error = output.error.clone();
+    const ORDER: &[&str] = &[
+        "scan_started",
+        "profile_declared",
+        "node_upsert",
+        "dependency_site",
+        "edge_upsert",
+        "diagnostic",
+        "file_completed",
+        "profile_completed",
+        "scan_completed",
+    ];
+    let mut ordered = Vec::with_capacity(output.events.len());
+    for event_type in ORDER {
+        ordered.extend(
+            output
+                .events
+                .iter()
+                .filter(|event| event.get("event").and_then(Value::as_str) == Some(*event_type)),
+        );
+    }
+    if worker_error.is_some() {
+        let available_sites = ordered
+            .iter()
+            .filter_map(|event| {
+                (event.get("event").and_then(Value::as_str) == Some("dependency_site"))
+                    .then(|| event.get("site")?.get("id")?.as_str())
+                    .flatten()
+                    .map(ToOwned::to_owned)
+            })
+            .collect::<BTreeSet<_>>();
+        // A truncated but otherwise valid protocol prefix can contain an edge
+        // before its dependency_site. Do not let that edge's store FK roll
+        // back independent nodes, diagnostics, and coverage from the prefix.
+        ordered.retain(|event| {
+            if event.get("event").and_then(Value::as_str) != Some("edge_upsert") {
+                return true;
+            }
+            event
+                .get("edge")
+                .and_then(|edge| edge.get("site_id"))
+                .and_then(Value::as_str)
+                .is_none_or(|site_id| available_sites.contains(site_id))
+        });
+    }
+    for event in &ordered {
+        if let Some((kind, object)) = upsert_object(event) {
+            let id = object
+                .get("id")
+                .and_then(Value::as_str)
+                .context("upsert object is missing id")?;
+            let key = (kind.to_owned(), id.to_owned());
+            if let Some(previous) = global_upserts.get(&key) {
+                if previous != object {
+                    anyhow::bail!("conflicting cross-worker {kind} upsert for {id}");
+                }
+            } else {
+                global_upserts.insert(key, object.clone());
+            }
+        }
+    }
+    store.ingest_events(&ordered)?;
+    if let Some(error) = worker_error {
+        anyhow::bail!("{} worker failed: {error}", output.adapter.name());
+    }
+    Ok(())
+}
+
+fn upsert_object(event: &Value) -> Option<(&'static str, &Value)> {
+    match event.get("event").and_then(Value::as_str) {
+        Some("profile_declared") => event.get("profile").map(|value| ("profile", value)),
+        Some("node_upsert") => event.get("node").map(|value| ("node", value)),
+        Some("dependency_site") => event.get("site").map(|value| ("site", value)),
+        Some("edge_upsert") => event.get("edge").map(|value| ("edge", value)),
+        Some("diagnostic") => event.get("diagnostic").map(|value| ("diagnostic", value)),
+        _ => None,
+    }
+}
+
+fn add_core_diagnostic(
+    store: &mut Store,
+    scan_id: &str,
+    severity: &str,
+    code: &str,
+    message: &str,
+) -> Result<()> {
+    let mut hasher = Sha256::new();
+    hasher.update(scan_id.as_bytes());
+    hasher.update(code.as_bytes());
+    hasher.update(message.as_bytes());
+    let id = format!("diagnostic:{}", hex::encode(hasher.finalize()));
+    store.ingest_event(&json!({
+        "event":"diagnostic",
+        "protocol_version":"1.0",
+        "scan_id":scan_id,
+        "adapter":"core",
+        "adapter_version":env!("CARGO_PKG_VERSION"),
+        "seq":0,
+        "diagnostic":{
+            "id":id,
+            "severity":severity,
+            "code":code,
+            "message":message
+        }
+    }))
+}
+
+fn ingest_empty_coverage(store: &mut Store, scan_id: &str) -> Result<()> {
+    store.ingest_event(&json!({
+        "event":"scan_completed",
+        "protocol_version":"1.0",
+        "scan_id":scan_id,
+        "adapter":"core",
+        "adapter_version":env!("CARGO_PKG_VERSION"),
+        "seq":1,
+        "coverage":{
+            "profiles":0,
+            "files_discovered":0,
+            "files_analyzed":0,
+            "files_skipped":0,
+            "dependency_sites":0,
+            "resolved":0,
+            "candidates":0,
+            "external":0,
+            "unresolved":0,
+            "unsupported_syntax":0,
+            "project_code_executed":false,
+            "completeness":["syntax-complete"],
+            "reasons":[]
+        }
+    }))
+}
+
+fn snapshot_outcome(store: &Store, scan_id: &str, exit_code: u8) -> Result<ScanOutcome> {
+    let snapshot = store.load_snapshot(scan_id)?;
+    Ok(ScanOutcome {
+        scan_id: scan_id.to_owned(),
+        status: snapshot.scan.status,
+        exit_code,
+        coverage: snapshot.coverage,
+        diagnostics: snapshot.diagnostics,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn empty_repository_produces_a_successful_scan() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let mut store = Store::open_in_memory()?;
+        let outcome = run_scan(
+            &mut store,
+            root.path().to_path_buf(),
+            &Config::default(),
+            false,
+        )
+        .await?;
+        assert_eq!(outcome.exit_code, 0);
+        assert_eq!(outcome.status, "completed");
+        assert_eq!(outcome.coverage.dependency_sites, 0);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn filesystem_root_is_rejected_before_a_scan_is_started() -> Result<()> {
+        let mut store = Store::open_in_memory()?;
+        let error = run_scan(&mut store, PathBuf::from("/"), &Config::default(), false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("security policy"));
+        assert_eq!(store.latest_attempt_id()?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn orphan_edge_in_a_failed_prefix_does_not_roll_back_independent_nodes() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let mut store = Store::open_in_memory()?;
+        store.start_scan("partial-scan", root.path(), false)?;
+        let common = |event: &str, seq: u64| {
+            json!({
+                "event":event,"protocol_version":"1.0","scan_id":"partial-scan",
+                "adapter":"go","adapter_version":"0.1.0","seq":seq
+            })
+        };
+        let mut started = common("scan_started", 1);
+        started["root"] = json!(root.path());
+        started["project_code_executed"] = json!(false);
+        started["safe_mode"] = json!(true);
+        let mut profile = common("profile_declared", 2);
+        profile["profile"] = json!({
+            "id":"go:test","language":"go","features":[],"environment":{},"properties":{}
+        });
+        let mut node = common("node_upsert", 3);
+        node["node"] = json!({
+            "id":"file:kept","kind":"file","locator":"file://kept.go","properties":{}
+        });
+        let mut edge = common("edge_upsert", 4);
+        edge["edge"] = json!({
+            "id":"edge:orphan","site_id":"site:not-yet-emitted","source":"file:kept",
+            "target":"file:missing","kind":"imports","phase":"source","environment":"host",
+            "profile_id":"go:test","resolution_status":"resolved","precision":"exact",
+            "condition":{"op":"all","conditions":[]},"generated":false,"evidence":[{
+                "kind":"source","extractor":"fixture","extractor_version":"0.1.0",
+                "path":"kept.go","start_line":1,"start_column":1,"end_line":1,"end_column":2,
+                "properties":{}
+            }]
+        });
+        let output = WorkerOutput {
+            adapter: AdapterKind::Go,
+            events: vec![started, profile, node, edge],
+            stderr: String::new(),
+            stderr_truncated: false,
+            error: Some("malformed NDJSON after valid prefix".to_owned()),
+            security_violation: false,
+        };
+
+        assert!(
+            ingest_worker_output(&mut store, "partial-scan", output, &mut BTreeMap::new()).is_err()
+        );
+        let snapshot = store.load_snapshot("partial-scan")?;
+        assert!(snapshot.nodes.iter().any(|node| node.id == "file:kept"));
+        assert!(snapshot.edges.is_empty());
+        Ok(())
+    }
+}

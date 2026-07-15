@@ -1,0 +1,4 @@
+[package]
+name = "local-lib"
+version.workspace = true
+edition.workspace = true

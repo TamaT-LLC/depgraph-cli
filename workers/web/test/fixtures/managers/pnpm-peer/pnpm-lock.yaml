@@ -1,0 +1,8 @@
+lockfileVersion: '9.0'
+packages:
+  peerful@1.0.0(peer@1.0.0):
+    peerDependencies:
+      peer: 1.0.0
+  peerful@1.0.0(peer@2.0.0):
+    peerDependencies:
+      peer: 2.0.0

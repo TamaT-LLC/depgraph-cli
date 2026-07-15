@@ -1,0 +1,520 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/TamaT-LLC/depgraph-cli/schemas/depgraph-protocol-v1.schema.json",
+  "title": "depgraph worker protocol v1.0",
+  "description": "One JSON object per line. Unknown optional properties are permitted for compatible protocol evolution.",
+  "oneOf": [
+    { "$ref": "#/$defs/scan_started" },
+    { "$ref": "#/$defs/profile_declared" },
+    { "$ref": "#/$defs/node_upsert" },
+    { "$ref": "#/$defs/edge_upsert" },
+    { "$ref": "#/$defs/dependency_site_event" },
+    { "$ref": "#/$defs/diagnostic_event" },
+    { "$ref": "#/$defs/file_completed" },
+    { "$ref": "#/$defs/profile_completed" },
+    { "$ref": "#/$defs/scan_completed" }
+  ],
+  "$defs": {
+    "non_empty_string": {
+      "type": "string",
+      "minLength": 1
+    },
+    "properties": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "common": {
+      "type": "object",
+      "properties": {
+        "protocol_version": { "const": "1.0" },
+        "scan_id": { "$ref": "#/$defs/non_empty_string" },
+        "adapter": { "$ref": "#/$defs/non_empty_string" },
+        "adapter_version": { "$ref": "#/$defs/non_empty_string" },
+        "seq": { "type": "integer", "minimum": 0 }
+      },
+      "required": [
+        "protocol_version",
+        "scan_id",
+        "adapter",
+        "adapter_version",
+        "seq"
+      ],
+      "additionalProperties": true
+    },
+    "condition": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "op": { "const": "all" },
+            "conditions": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/condition" }
+            }
+          },
+          "required": ["op", "conditions"],
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "properties": {
+            "op": { "const": "any" },
+            "conditions": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/condition" }
+            }
+          },
+          "required": ["op", "conditions"],
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "properties": {
+            "op": { "const": "not" },
+            "condition": { "$ref": "#/$defs/condition" }
+          },
+          "required": ["op", "condition"],
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "properties": {
+            "op": { "const": "eq" },
+            "key": { "$ref": "#/$defs/non_empty_string" },
+            "value": { "type": ["string", "number", "boolean", "null"] }
+          },
+          "required": ["op", "key", "value"],
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "properties": {
+            "op": { "const": "in" },
+            "key": { "$ref": "#/$defs/non_empty_string" },
+            "values": {
+              "type": "array",
+              "items": { "type": ["string", "number", "boolean", "null"] }
+            }
+          },
+          "required": ["op", "key", "values"],
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "properties": {
+            "op": { "const": "defined" },
+            "key": { "$ref": "#/$defs/non_empty_string" }
+          },
+          "required": ["op", "key"],
+          "additionalProperties": true
+        }
+      ]
+    },
+    "resolution_status": {
+      "enum": ["resolved", "candidates", "external", "unresolved"]
+    },
+    "precision": {
+      "enum": ["exact", "overapprox", "heuristic", "observed"]
+    },
+    "phase": {
+      "enum": ["source", "semantic", "build", "runtime"]
+    },
+    "evidence": {
+      "type": "object",
+      "properties": {
+        "kind": { "enum": ["source", "semantic", "build", "runtime"] },
+        "extractor": { "$ref": "#/$defs/non_empty_string" },
+        "extractor_version": { "$ref": "#/$defs/non_empty_string" },
+        "path": { "$ref": "#/$defs/non_empty_string" },
+        "start_line": { "type": "integer", "minimum": 1 },
+        "start_column": { "type": "integer", "minimum": 1 },
+        "end_line": { "type": "integer", "minimum": 1 },
+        "end_column": { "type": "integer", "minimum": 1 },
+        "detail": { "type": "string" },
+        "properties": { "$ref": "#/$defs/properties" }
+      },
+      "required": ["kind", "extractor", "extractor_version"],
+      "dependentRequired": {
+        "start_line": ["path", "start_column", "end_line", "end_column"],
+        "start_column": ["path", "start_line", "end_line", "end_column"],
+        "end_line": ["path", "start_line", "start_column", "end_column"],
+        "end_column": ["path", "start_line", "start_column", "end_line"]
+      },
+      "additionalProperties": true
+    },
+    "spanned_evidence": {
+      "allOf": [
+        { "$ref": "#/$defs/evidence" },
+        {
+          "type": "object",
+          "required": [
+            "path",
+            "start_line",
+            "start_column",
+            "end_line",
+            "end_column"
+          ]
+        }
+      ]
+    },
+    "node": {
+      "type": "object",
+      "properties": {
+        "id": { "$ref": "#/$defs/non_empty_string" },
+        "kind": { "$ref": "#/$defs/non_empty_string" },
+        "locator": { "$ref": "#/$defs/non_empty_string" },
+        "display_name": { "type": ["string", "null"] },
+        "properties": { "$ref": "#/$defs/properties" }
+      },
+      "required": ["id", "kind", "locator", "properties"],
+      "additionalProperties": true
+    },
+    "edge": {
+      "type": "object",
+      "properties": {
+        "id": { "$ref": "#/$defs/non_empty_string" },
+        "source": { "$ref": "#/$defs/non_empty_string" },
+        "target": { "$ref": "#/$defs/non_empty_string" },
+        "kind": { "$ref": "#/$defs/non_empty_string" },
+        "site_id": { "type": ["string", "null"] },
+        "phase": { "$ref": "#/$defs/phase" },
+        "environment": { "type": ["string", "null"] },
+        "profile_id": { "$ref": "#/$defs/non_empty_string" },
+        "condition": { "$ref": "#/$defs/condition" },
+        "resolution_status": { "$ref": "#/$defs/resolution_status" },
+        "precision": { "$ref": "#/$defs/precision" },
+        "generated": { "type": "boolean" },
+        "evidence": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/evidence" }
+        }
+      },
+      "required": [
+        "id",
+        "source",
+        "target",
+        "kind",
+        "phase",
+        "profile_id",
+        "condition",
+        "resolution_status",
+        "precision",
+        "generated",
+        "evidence"
+      ],
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "phase": { "enum": ["source", "semantic"] }
+            },
+            "required": ["phase"]
+          },
+          "then": {
+            "properties": {
+              "evidence": {
+                "contains": { "$ref": "#/$defs/spanned_evidence" },
+                "minContains": 1
+              }
+            }
+          }
+        }
+      ],
+      "additionalProperties": true
+    },
+    "dependency_site": {
+      "type": "object",
+      "properties": {
+        "id": { "$ref": "#/$defs/non_empty_string" },
+        "source": { "$ref": "#/$defs/non_empty_string" },
+        "kind": { "$ref": "#/$defs/non_empty_string" },
+        "specifier": { "type": "string" },
+        "resolution_status": { "$ref": "#/$defs/resolution_status" },
+        "target_ids": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/non_empty_string" },
+          "uniqueItems": true
+        },
+        "profile_id": { "$ref": "#/$defs/non_empty_string" },
+        "condition": { "$ref": "#/$defs/condition" },
+        "precision": { "$ref": "#/$defs/precision" },
+        "reason": { "type": ["string", "null"], "minLength": 1 },
+        "evidence": {
+          "type": "array",
+          "minItems": 1,
+          "contains": { "$ref": "#/$defs/spanned_evidence" },
+          "minContains": 1,
+          "items": { "$ref": "#/$defs/evidence" }
+        }
+      },
+      "required": [
+        "id",
+        "source",
+        "kind",
+        "specifier",
+        "resolution_status",
+        "target_ids",
+        "profile_id",
+        "condition",
+        "precision",
+        "evidence"
+      ],
+      "additionalProperties": true
+    },
+    "profile": {
+      "type": "object",
+      "properties": {
+        "id": { "$ref": "#/$defs/non_empty_string" },
+        "language": { "$ref": "#/$defs/non_empty_string" },
+        "toolchain": { "type": ["string", "object", "null"] },
+        "command": { "type": ["string", "null"] },
+        "target": { "type": ["string", "null"] },
+        "features": { "type": ["array", "null"], "items": { "type": "string" } },
+        "environment": {
+          "oneOf": [
+            { "$ref": "#/$defs/properties" },
+            { "type": "null" }
+          ]
+        },
+        "source_revision": { "type": ["string", "null"] },
+        "properties": {
+          "oneOf": [
+            { "$ref": "#/$defs/properties" },
+            { "type": "null" }
+          ]
+        }
+      },
+      "required": ["id", "language"],
+      "additionalProperties": true
+    },
+    "diagnostic": {
+      "type": "object",
+      "properties": {
+        "id": { "$ref": "#/$defs/non_empty_string" },
+        "severity": { "enum": ["info", "warning", "error"] },
+        "code": { "$ref": "#/$defs/non_empty_string" },
+        "message": { "$ref": "#/$defs/non_empty_string" },
+        "profile_id": { "type": ["string", "null"], "minLength": 1 },
+        "path": { "type": ["string", "null"], "minLength": 1 },
+        "start_line": { "type": ["integer", "null"], "minimum": 1 },
+        "start_column": { "type": ["integer", "null"], "minimum": 1 },
+        "end_line": { "type": ["integer", "null"], "minimum": 1 },
+        "end_column": { "type": ["integer", "null"], "minimum": 1 },
+        "evidence": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/evidence" }
+        },
+        "properties": { "$ref": "#/$defs/properties" }
+      },
+      "required": ["id", "severity", "code", "message"],
+      "dependentRequired": {
+        "start_line": ["path", "start_column", "end_line", "end_column"],
+        "start_column": ["path", "start_line", "end_line", "end_column"],
+        "end_line": ["path", "start_line", "start_column", "end_column"],
+        "end_column": ["path", "start_line", "start_column", "end_line"]
+      },
+      "additionalProperties": true
+    },
+    "coverage": {
+      "type": "object",
+      "properties": {
+        "profiles": { "type": "integer", "minimum": 0 },
+        "files_discovered": { "type": "integer", "minimum": 0 },
+        "files_analyzed": { "type": "integer", "minimum": 0 },
+        "files_skipped": { "type": "integer", "minimum": 0 },
+        "dependency_sites": { "type": "integer", "minimum": 0 },
+        "resolved": { "type": "integer", "minimum": 0 },
+        "candidates": { "type": "integer", "minimum": 0 },
+        "external": { "type": "integer", "minimum": 0 },
+        "unresolved": { "type": "integer", "minimum": 0 },
+        "unsupported_syntax": { "type": "integer", "minimum": 0 },
+        "project_code_executed": { "type": "boolean" },
+        "completeness": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "syntax-complete",
+              "semantic-complete",
+              "build-observed",
+              "runtime-observed"
+            ]
+          },
+          "uniqueItems": true
+        },
+        "reasons": { "type": "array", "items": { "type": "string" } }
+      },
+      "required": [
+        "profiles",
+        "files_discovered",
+        "files_analyzed",
+        "files_skipped",
+        "dependency_sites",
+        "resolved",
+        "candidates",
+        "external",
+        "unresolved",
+        "unsupported_syntax",
+        "project_code_executed",
+        "completeness",
+        "reasons"
+      ],
+      "additionalProperties": true
+    },
+    "scan_started": {
+      "allOf": [
+        { "$ref": "#/$defs/common" },
+        {
+          "type": "object",
+          "properties": {
+            "event": { "const": "scan_started" },
+            "root": { "$ref": "#/$defs/non_empty_string" },
+            "project_code_executed": { "type": "boolean" },
+            "safe_mode": { "type": "boolean" }
+          },
+          "required": ["event", "root", "project_code_executed", "safe_mode"],
+          "additionalProperties": true
+        }
+      ]
+    },
+    "profile_declared": {
+      "allOf": [
+        { "$ref": "#/$defs/common" },
+        {
+          "type": "object",
+          "properties": {
+            "event": { "const": "profile_declared" },
+            "profile": { "$ref": "#/$defs/profile" }
+          },
+          "required": ["event", "profile"],
+          "additionalProperties": true
+        }
+      ]
+    },
+    "node_upsert": {
+      "allOf": [
+        { "$ref": "#/$defs/common" },
+        {
+          "type": "object",
+          "properties": {
+            "event": { "const": "node_upsert" },
+            "node": { "$ref": "#/$defs/node" }
+          },
+          "required": ["event", "node"],
+          "additionalProperties": true
+        }
+      ]
+    },
+    "edge_upsert": {
+      "allOf": [
+        { "$ref": "#/$defs/common" },
+        {
+          "type": "object",
+          "properties": {
+            "event": { "const": "edge_upsert" },
+            "edge": { "$ref": "#/$defs/edge" }
+          },
+          "required": ["event", "edge"],
+          "additionalProperties": true
+        }
+      ]
+    },
+    "dependency_site_event": {
+      "allOf": [
+        { "$ref": "#/$defs/common" },
+        {
+          "type": "object",
+          "properties": {
+            "event": { "const": "dependency_site" },
+            "site": { "$ref": "#/$defs/dependency_site" }
+          },
+          "required": ["event", "site"],
+          "additionalProperties": true
+        }
+      ]
+    },
+    "diagnostic_event": {
+      "allOf": [
+        { "$ref": "#/$defs/common" },
+        {
+          "type": "object",
+          "properties": {
+            "event": { "const": "diagnostic" },
+            "diagnostic": { "$ref": "#/$defs/diagnostic" }
+          },
+          "required": ["event", "diagnostic"],
+          "additionalProperties": true
+        }
+      ]
+    },
+    "file_completed": {
+      "allOf": [
+        { "$ref": "#/$defs/common" },
+        {
+          "type": "object",
+          "properties": {
+            "event": { "const": "file_completed" },
+            "path": { "$ref": "#/$defs/non_empty_string" },
+            "discovered_sites": { "type": "integer", "minimum": 0 },
+            "emitted_sites": { "type": "integer", "minimum": 0 },
+            "skipped_sites": { "type": "integer", "minimum": 0, "default": 0 },
+            "skipped": { "type": "boolean" },
+            "reason": { "type": ["string", "null"] }
+          },
+          "required": ["event", "path", "discovered_sites", "emitted_sites", "skipped"],
+          "allOf": [
+            {
+              "if": {
+                "properties": { "skipped": { "const": true } },
+                "required": ["skipped"]
+              },
+              "then": {
+                "properties": { "reason": { "type": "string", "minLength": 1 } },
+                "required": ["reason"]
+              }
+            },
+            {
+              "if": {
+                "properties": { "skipped_sites": { "minimum": 1 } },
+                "required": ["skipped_sites"]
+              },
+              "then": {
+                "properties": { "skipped": { "const": true } }
+              }
+            }
+          ],
+          "additionalProperties": true
+        }
+      ]
+    },
+    "profile_completed": {
+      "allOf": [
+        { "$ref": "#/$defs/common" },
+        {
+          "type": "object",
+          "properties": {
+            "event": { "const": "profile_completed" },
+            "profile_id": { "$ref": "#/$defs/non_empty_string" },
+            "coverage": { "$ref": "#/$defs/coverage" }
+          },
+          "required": ["event", "profile_id", "coverage"],
+          "additionalProperties": true
+        }
+      ]
+    },
+    "scan_completed": {
+      "allOf": [
+        { "$ref": "#/$defs/common" },
+        {
+          "type": "object",
+          "properties": {
+            "event": { "const": "scan_completed" },
+            "coverage": { "$ref": "#/$defs/coverage" }
+          },
+          "required": ["event", "coverage"],
+          "additionalProperties": true
+        }
+      ]
+    }
+  }
+}

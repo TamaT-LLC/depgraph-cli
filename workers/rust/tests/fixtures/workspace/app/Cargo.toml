@@ -1,0 +1,27 @@
+[package]
+name = "app"
+version.workspace = true
+edition.workspace = true
+build = "build.rs"
+
+[dependencies]
+renamed = { package = "local-lib", path = "../local-lib", optional = true }
+fixture-macro = { package = "macro-crate", path = "../macro-crate" }
+shared.workspace = true
+
+[dev-dependencies]
+dev_local = { package = "local-lib", path = "../local-lib" }
+
+[build-dependencies]
+build_local = { package = "local-lib", path = "../local-lib" }
+
+[target.'cfg(unix)'.dependencies]
+unix_local = { package = "local-lib", path = "../local-lib" }
+
+[[example]]
+name = "demo"
+path = "examples/demo.rs"
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"

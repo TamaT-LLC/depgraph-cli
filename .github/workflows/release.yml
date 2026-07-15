@@ -1,0 +1,102 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  quality:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install 1.93.1 --profile minimal --component rustfmt,clippy
+      - run: rustup default 1.93.1
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 1.26.1
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.0
+          standalone: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.18.0
+      - run: cargo xtask test
+
+  benchmark:
+    needs: quality
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install 1.93.1 --profile minimal
+      - run: rustup default 1.93.1
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 1.26.1
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.0
+          standalone: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.18.0
+      - run: scripts/benchmark-mvp.sh
+
+  package:
+    needs: quality
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: macos-15
+            target: aarch64-apple-darwin
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install 1.93.1 --profile minimal
+      - run: rustup default 1.93.1
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 1.26.1
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.0
+          standalone: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.18.0
+      - name: Build archive, checksums, SBOM, and license inventory
+        env:
+          DEPGRAPH_TARGET: ${{ matrix.target }}
+        run: cargo xtask package
+      - uses: actions/upload-artifact@v4
+        with:
+          name: depgraph-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.sha256
+          if-no-files-found: error
+
+  publish:
+    needs: [package, benchmark]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${GITHUB_REF_NAME}" artifacts/* --generate-notes --verify-tag

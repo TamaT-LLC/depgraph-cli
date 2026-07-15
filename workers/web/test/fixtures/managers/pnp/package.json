@@ -1,0 +1,7 @@
+{
+  "name": "manager-pnp",
+  "version": "1.0.0",
+  "private": true,
+  "packageManager": "yarn@4.9.0",
+  "workspaces": ["packages/*"]
+}

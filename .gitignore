@@ -1,0 +1,11 @@
+/target/
+/dist/
+/.depgraph/
+*.db
+*.db-shm
+*.db-wal
+workers/go/bin/
+workers/web/dist/
+workers/web/node_modules/
+*.log
+.DS_Store

@@ -1,0 +1,4 @@
+[workspace]
+members = ["member", "missing", "crates/*"]
+exclude = ["crates/excluded"]
+resolver = "2"

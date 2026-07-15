@@ -1,0 +1,7 @@
+{
+  "name": "manager-bun",
+  "version": "1.0.0",
+  "private": true,
+  "packageManager": "bun@1.2.0",
+  "workspaces": ["packages/*"]
+}
