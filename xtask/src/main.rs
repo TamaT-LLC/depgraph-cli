@@ -97,7 +97,10 @@ fn main() -> Result<()> {
 
 fn build(release: bool) -> Result<()> {
     let mut cargo = Command::new("cargo");
-    cargo.args(["build", "--workspace", "--locked"]);
+    // The running xtask executable cannot be replaced on Windows. It is a
+    // build-time tool rather than a release artifact, so exclude it from the
+    // product workspace build.
+    cargo.args(["build", "--workspace", "--exclude", "xtask", "--locked"]);
     if release {
         cargo.arg("--release");
     }
