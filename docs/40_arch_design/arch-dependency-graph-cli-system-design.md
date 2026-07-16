@@ -3,7 +3,7 @@ id: PROJ-ARC-001
 layer: L4
 feature: dependency-graph
 scope: feature
-status: Draft
+status: Active
 upstream: []
 downstream: []
 owner: TakehiroT
@@ -11,6 +11,14 @@ updated: 2026-07-15
 ---
 
 # アーキテクチャ設計: Semantic Dependency Graph CLI
+
+## 実装ステータス
+
+2026-07-15 時点で Milestone 0〜1 の MVP を実装済み。package/file/import/route graph、safe static scan、protocol 1.0、SQLite evidence store、query/export/doctor、Rust/Go/Web worker、native release archiveを対象とする。
+
+safe scanではcanonical root外へのsymlink readを拒否し、相対PATH・repository内toolchain・Node実行hookを除外する。Goは制限付き`go/packages`からparser fallbackへ移行し、Cargo metadataはneutral cwdから`--frozen --offline --no-deps`で実行する。配布物はworker/runtime checksumを検証し、manifestまたは同梱layout欠損時にfail closedとする。
+
+symbol/type/call/component/server function、build観測、incremental/watch、snapshot/diff/impact、architecture policy、runtime traceは本設計の後続Milestoneとして未実装である。
 
 ## 1. 目的
 

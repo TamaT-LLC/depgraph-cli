@@ -1,0 +1,6 @@
+{
+  "name": "manager-pnpm-negated",
+  "version": "1.0.0",
+  "private": true,
+  "packageManager": "pnpm@10.33.0"
+}

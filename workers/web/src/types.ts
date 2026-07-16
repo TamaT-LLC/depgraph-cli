@@ -1,0 +1,184 @@
+import { createHash } from "node:crypto";
+
+export const PROTOCOL_VERSION = "1.0" as const;
+export const ADAPTER = "web" as const;
+export const ADAPTER_VERSION = "0.1.0" as const;
+
+const DEFAULT_WEB_ENVIRONMENTS = ["browser", "server"] as const;
+
+function readWebEnvironments(): { environments: string[]; issue: string | null } {
+  const raw = process.env.DEPGRAPH_PROFILE_CONFIG;
+  if (!raw) return { environments: [...DEFAULT_WEB_ENVIRONMENTS], issue: null };
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("profile config must be an object");
+    const value = (parsed as Record<string, unknown>).web_environments;
+    if (value === undefined) return { environments: [...DEFAULT_WEB_ENVIRONMENTS], issue: null };
+    if (!Array.isArray(value) || !value.every((item) => typeof item === "string")) throw new Error("web_environments must be an array of strings");
+    const environments = [...new Set(value.map((item) => item.trim().toLowerCase()).filter(Boolean))].sort();
+    if (environments.length === 0) return { environments: [...DEFAULT_WEB_ENVIRONMENTS], issue: "web_environments was empty; browser/server defaults were used" };
+    return { environments, issue: null };
+  } catch (error) {
+    return {
+      environments: [...DEFAULT_WEB_ENVIRONMENTS],
+      issue: `DEPGRAPH_PROFILE_CONFIG was not usable: ${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
+}
+
+const profileSelection = readWebEnvironments();
+export const WEB_ENVIRONMENTS = profileSelection.environments;
+export const PROFILE_CONFIG_ISSUE = profileSelection.issue;
+const profileDigest = createHash("sha256")
+  .update(JSON.stringify({ environments: WEB_ENVIRONMENTS, language: "web", mode: "production" }), "utf8")
+  .digest("hex");
+export const PROFILE_ID = `profile:sha256:${profileDigest}`;
+
+export type JsonPrimitive = string | number | boolean | null;
+export type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue };
+
+export type Condition =
+  | { op: "all" | "any"; conditions: Condition[] }
+  | { op: "not"; condition: Condition }
+  | { op: "eq"; key: string; value: JsonPrimitive }
+  | { op: "in"; key: string; values: JsonPrimitive[] }
+  | { op: "defined"; key: string };
+
+export const WEB_CONDITION: Condition = {
+  op: "all",
+  conditions: [
+    { op: "eq", key: "mode", value: "production" },
+    { op: "in", key: "environment", values: WEB_ENVIRONMENTS },
+  ],
+};
+
+export const WEB_UNIVERSAL_ENVIRONMENT = WEB_ENVIRONMENTS.join(",");
+
+export function preferredWebEnvironment(preferred: string): string {
+  return WEB_ENVIRONMENTS.includes(preferred) ? preferred : WEB_ENVIRONMENTS[0]!;
+}
+
+export type ResolutionStatus = "resolved" | "candidates" | "external" | "unresolved";
+export type Precision = "exact" | "overapprox" | "heuristic" | "observed";
+
+export interface Evidence {
+  kind: "source" | "semantic" | "build" | "runtime";
+  extractor: string;
+  extractor_version: string;
+  path: string;
+  start_line: number;
+  start_column: number;
+  end_line: number;
+  end_column: number;
+  detail?: string;
+  properties?: Record<string, JsonValue>;
+}
+
+export interface GraphNode {
+  id: string;
+  kind:
+    | "workspace"
+    | "package_instance"
+    | "build_unit"
+    | "module"
+    | "file"
+    | "route"
+    | "external_system"
+    | "unknown_target";
+  locator: string;
+  display_name: string;
+  properties: Record<string, JsonValue>;
+}
+
+export interface DependencySite {
+  id: string;
+  source: string;
+  kind: string;
+  specifier: string;
+  resolution_status: ResolutionStatus;
+  target_ids: string[];
+  profile_id: string;
+  condition: Condition;
+  precision: Precision;
+  reason: string | null;
+  evidence: Evidence[];
+}
+
+export interface GraphEdge {
+  id: string;
+  source: string;
+  target: string;
+  kind: string;
+  site_id: string | null;
+  phase: "source" | "semantic" | "build" | "runtime";
+  environment: string;
+  profile_id: string;
+  condition: Condition;
+  resolution_status: ResolutionStatus;
+  precision: Precision;
+  generated: boolean;
+  evidence: Evidence[];
+}
+
+export interface Diagnostic {
+  id: string;
+  severity: "info" | "warning" | "error";
+  code: string;
+  message: string;
+  path: string | null;
+  profile_id: string;
+  evidence?: Evidence[];
+}
+
+export interface FileCoverage {
+  file_id: string;
+  path: string;
+  expected_sites: number;
+  produced_sites: number;
+  skipped_sites: number;
+  resolved: number;
+  candidates: number;
+  external: number;
+  unresolved: number;
+  unsupported_syntax: number;
+}
+
+export interface Coverage {
+  profiles: number;
+  files_discovered: number;
+  files_analyzed: number;
+  files_skipped: number;
+  dependency_sites: number;
+  resolved: number;
+  candidates: number;
+  external: number;
+  unresolved: number;
+  unsupported_syntax: number;
+  project_code_executed: boolean;
+  completeness: string[];
+  reasons: string[];
+}
+
+export interface ScanModel {
+  nodes: GraphNode[];
+  sites: DependencySite[];
+  edges: GraphEdge[];
+  diagnostics: Diagnostic[];
+  files: FileCoverage[];
+  coverage: Coverage;
+  repositoryIdentity: string;
+  packageManager: string;
+  lockfile: string | null;
+  detectedFrameworks: string[];
+}
+
+export interface CommonEvent {
+  event: string;
+  protocol_version: typeof PROTOCOL_VERSION;
+  scan_id: string;
+  adapter: typeof ADAPTER;
+  adapter_version: typeof ADAPTER_VERSION;
+  seq: number;
+}
+
+export type ProtocolEvent = CommonEvent & Record<string, unknown>;

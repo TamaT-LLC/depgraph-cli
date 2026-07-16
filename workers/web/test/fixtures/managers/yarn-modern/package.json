@@ -1,0 +1,7 @@
+{
+  "name": "manager-yarn-modern",
+  "version": "1.0.0",
+  "private": true,
+  "packageManager": "yarn@4.9.0",
+  "workspaces": ["packages/*"]
+}

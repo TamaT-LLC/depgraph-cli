@@ -1,0 +1,10 @@
+[workspace]
+members = ["app", "local-lib", "macro-crate"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+shared = { package = "local-lib", path = "local-lib" }

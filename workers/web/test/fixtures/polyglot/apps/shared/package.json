@@ -1,0 +1,11 @@
+{
+  "name": "@fixture/shared",
+  "version": "1.0.0",
+  "exports": {
+    ".": {
+      "browser": "./src/browser.ts",
+      "node": "./src/server.ts",
+      "default": "./src/index.ts"
+    }
+  }
+}

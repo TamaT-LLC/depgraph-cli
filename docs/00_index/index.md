@@ -2,7 +2,7 @@
 
 | ID | Layer | Feature | Scope | Title | Status |
 | --- | --- | --- | --- | --- | --- |
-| PROJ-ARC-001 | L4 | dependency-graph | feature | アーキテクチャ設計: Semantic Dependency Graph CLI | Draft |
+| PROJ-ARC-001 | L4 | dependency-graph | feature | アーキテクチャ設計: Semantic Dependency Graph CLI | Active |
 
 ## 統計
 
@@ -22,8 +22,8 @@
 
 | Status | Count |
 | --- | ---: |
-| Draft | 1 |
-| Active | 0 |
+| Draft | 0 |
+| Active | 1 |
 | Deprecated | 0 |
 
 ### 機能別
@@ -35,3 +35,4 @@
 ## 更新履歴
 
 - 2026-07-15: `PROJ-ARC-001` を追加
+- 2026-07-15: Milestone 0〜1 MVP実装に伴い `PROJ-ARC-001` をActiveへ更新

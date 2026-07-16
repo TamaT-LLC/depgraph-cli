@@ -1,0 +1,21 @@
+[package]
+name = "xtask"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+flate2 = "1.1"
+hex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+spdx = "0.13"
+tar = { version = "0.4", default-features = false }
+tempfile.workspace = true
+walkdir.workspace = true
+zip = { version = "8.1", default-features = false, features = ["deflate-flate2"] }

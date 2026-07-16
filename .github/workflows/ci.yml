@@ -1,0 +1,140 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install 1.93.1 --profile minimal --component rustfmt,clippy
+      - run: rustup default 1.93.1
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
+
+  go:
+    runs-on: ubuntu-24.04
+    env:
+      GOTOOLCHAIN: local
+      GOFLAGS: -mod=readonly
+    defaults:
+      run:
+        working-directory: workers/go
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 1.26.1
+      - run: test -z "$(gofmt -l .)"
+      - run: go vet ./...
+      - run: go test -race ./...
+
+  web:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: workers/web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.0
+          standalone: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.18.0
+          cache: pnpm
+          cache-dependency-path: workers/web/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm check
+      - run: pnpm test
+
+  integration:
+    needs: [rust, go, web]
+    strategy:
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install 1.93.1 --profile minimal
+      - run: rustup default 1.93.1
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 1.26.1
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.0
+          standalone: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.18.0
+      - run: cargo xtask build
+      - name: Web end-to-end and deterministic export
+        shell: bash
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp -d)"
+          target/debug/depgraph --store "$tmp/one.db" scan workers/web/test/fixtures/polyglot --json > "$tmp/scan.json"
+          jq -e '.status == "completed" and .coverage.project_code_executed == false' "$tmp/scan.json"
+          target/debug/depgraph --store "$tmp/one.db" export --format json > "$tmp/one.json"
+          target/debug/depgraph --store "$tmp/two.db" scan workers/web/test/fixtures/polyglot --json > /dev/null
+          target/debug/depgraph --store "$tmp/two.db" export --format json > "$tmp/two.json"
+          jq -S '.graph | {nodes, sites, edges, coverage}' "$tmp/one.json" > "$tmp/one.graph.json"
+          jq -S '.graph | {nodes, sites, edges, coverage}' "$tmp/two.json" > "$tmp/two.graph.json"
+          diff -u "$tmp/one.graph.json" "$tmp/two.graph.json"
+          test ! -e workers/web/test/fixtures/polyglot/apps/next-app/NEXT_CONFIG_EXECUTED
+          test ! -e workers/web/test/fixtures/polyglot/apps/astro-app/ASTRO_CONFIG_EXECUTED
+      - name: Go end-to-end
+        shell: bash
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp -d)"
+          target/debug/depgraph --store "$tmp/go.db" scan workers/go/internal/worker/testdata/workspace --json > "$tmp/go.json"
+          jq -e '.status == "completed" and .coverage.dependency_sites > 0' "$tmp/go.json"
+          target/debug/depgraph --store "$tmp/go.db" doctor --json | jq -e '.latest_attempt.project_code_executed == false'
+      - name: Rust end-to-end and safe build capability inventory
+        shell: bash
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp -d)"
+          fixture="workers/rust/tests/fixtures/security"
+          target/debug/depgraph --store "$tmp/rust.db" scan "$fixture" --json > "$tmp/rust.json"
+          jq -e '.status == "completed" and .coverage.dependency_sites > 0 and .coverage.project_code_executed == false' "$tmp/rust.json"
+          test ! -e "$fixture/BUILD_SCRIPT_EXECUTED"
+          test ! -e "$fixture/PROC_MACRO_EXECUTED"
+          test ! -e "$fixture/CONFIG_EXECUTED"
+
+  windows-smoke:
+    needs: [rust, go, web]
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install 1.93.1 --profile minimal
+      - run: rustup default 1.93.1
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 1.26.1
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.0
+          standalone: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.18.0
+      - run: cargo xtask build
+      - run: target\debug\depgraph.exe --version
+      - run: target\debug\depgraph-rust-worker.exe --version
+      - run: workers\go\bin\depgraph-go-worker.exe --version
+      - run: node workers\web\dist\worker.mjs --version

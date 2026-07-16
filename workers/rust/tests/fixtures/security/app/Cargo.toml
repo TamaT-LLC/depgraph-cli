@@ -1,0 +1,8 @@
+[package]
+name = "security-app"
+version.workspace = true
+edition.workspace = true
+build = "build.rs"
+
+[dependencies]
+security-macro = { path = "../security-macro" }
