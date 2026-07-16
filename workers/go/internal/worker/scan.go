@@ -195,19 +195,20 @@ func (resolution localModuleResolution) requirementTargets(source Module, requir
 }
 
 type scannerState struct {
-	root              string
-	workspaceIdentity string
-	profile           Profile
-	goPackages        goPackagesInventory
-	moduleResolution  localModuleResolution
-	nodes             map[string]Node
-	edges             map[string]Edge
-	sites             map[string]Site
-	diagnostics       []Diagnostic
-	files             []FileCompletion
-	unsupported       int
-	unknownNodeID     string
-	workspaceNodeID   string
+	root               string
+	workspaceIdentity  string
+	profile            Profile
+	goPackages         goPackagesInventory
+	moduleResolution   localModuleResolution
+	nodes              map[string]Node
+	edges              map[string]Edge
+	sites              map[string]Site
+	diagnostics        []Diagnostic
+	files              []FileCompletion
+	unsupported        int
+	semanticIncomplete bool
+	unknownNodeID      string
+	workspaceNodeID    string
 }
 
 func (s *scannerState) scopedID(kind string, parts ...string) string {
@@ -377,6 +378,8 @@ func Scan(root string) (Result, error) {
 	for _, source := range sources {
 		state.extractFileDependencies(source, groups)
 	}
+	state.semanticIncomplete = true
+	state.extractGoSemanticGraph(sources)
 
 	result := state.result(discoveredFiles)
 	return result, nil
@@ -956,8 +959,14 @@ func (s *scannerState) result(discoveredFiles int) Result {
 	if result.Coverage.FilesSkipped == 0 && result.Coverage.UnsupportedSyntax == 0 {
 		result.Coverage.Completeness = append(result.Coverage.Completeness, "syntax-complete")
 	}
+	if s.goPackages.Status == "loaded" && !s.semanticIncomplete {
+		result.Coverage.Completeness = append(result.Coverage.Completeness, "semantic-complete")
+	}
 	if s.goPackages.Fallback {
 		result.Coverage.Reasons = append(result.Coverage.Reasons, "go-packages-parser-fallback")
+	}
+	if s.goPackages.Status == "loaded" && s.semanticIncomplete {
+		result.Coverage.Reasons = append(result.Coverage.Reasons, "go-semantic-incomplete")
 	}
 	if result.Coverage.FilesSkipped > 0 {
 		result.Coverage.Reasons = append(result.Coverage.Reasons, "files-skipped")

@@ -83,20 +83,33 @@ func TestScanWorkspaceFixture(t *testing.T) {
 			}
 		}
 		for _, evidence := range site.Evidence {
-			if evidence.Extractor != "go-static-worker" || evidence.ExtractorVersion != AdapterVersion {
+			extractor := "go-static-worker"
+			if evidence.Kind == "semantic" {
+				extractor = "go-types"
+			}
+			if evidence.Extractor != extractor || evidence.ExtractorVersion != AdapterVersion {
 				t.Fatalf("site evidence lacks extractor identity: %+v", evidence)
 			}
 		}
 	}
 	for _, edge := range result.Edges {
-		if edge.Phase != "source" || edge.Environment != "any" {
-			t.Fatalf("edge lacks source phase/environment: %+v", edge)
+		if edge.Environment != "any" {
+			t.Fatalf("edge lacks environment: %+v", edge)
 		}
 		if edge.Evidence == nil {
 			t.Fatalf("edge evidence must be an array: %+v", edge)
 		}
+		extractor := ""
+		switch edge.Phase {
+		case "source":
+			extractor = "go-static-worker"
+		case "semantic":
+			extractor = "go-types"
+		default:
+			t.Fatalf("edge has invalid phase: %+v", edge)
+		}
 		for _, evidence := range edge.Evidence {
-			if evidence.Extractor != "go-static-worker" || evidence.ExtractorVersion != AdapterVersion {
+			if evidence.Extractor != extractor || evidence.ExtractorVersion != AdapterVersion {
 				t.Fatalf("edge evidence lacks extractor identity: %+v", evidence)
 			}
 		}
