@@ -670,6 +670,63 @@ func TestGoPackagesIndependentPreflightFailureIsPartial(t *testing.T) {
 	}
 }
 
+func TestGoPackagesNestedModuleSymlinkDoesNotDisableParent(t *testing.T) {
+	root := canonicalTestRoot(t, t.TempDir())
+	nested := filepath.Join(root, "nested")
+	outside := filepath.Join(t.TempDir(), "outside.go")
+	writeTestFile(t, filepath.Join(root, "go.mod"), "module example.com/parent\n\ngo 1.26.1\n")
+	writeTestFile(t, filepath.Join(root, "parent.go"), "package parent\n\nfunc Parent() int { return 1 }\n")
+	writeTestFile(t, filepath.Join(nested, "go.mod"), "module example.com/nested\n\ngo 1.26.1\n")
+	writeTestFile(t, filepath.Join(nested, "nested.go"), "package nested\n")
+	writeTestFile(t, outside, "package nested\n\nconst Outside = true\n")
+	if err := os.Symlink(outside, filepath.Join(nested, "unsafe.go")); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+
+	result, err := Scan(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Profile.Properties["go_packages_status"] != "partial" {
+		t.Fatalf("nested module preflight status = %q; diagnostics=%+v", result.Profile.Properties["go_packages_status"], result.Diagnostics)
+	}
+	typedCount, err := strconv.Atoi(result.Profile.Properties["go_packages_typed_packages"])
+	if err != nil || typedCount < 1 {
+		t.Fatalf("parent module types were lost: properties=%+v", result.Profile.Properties)
+	}
+	if !hasDiagnostic(result.Diagnostics, "go_packages_source_confinement") || result.Coverage.ProjectCodeExecuted {
+		t.Fatalf("nested module fallback was not retained safely: coverage=%+v diagnostics=%+v", result.Coverage, result.Diagnostics)
+	}
+}
+
+func TestGoPackagesUnsafeNestedReplacementStillDisablesParent(t *testing.T) {
+	root := canonicalTestRoot(t, t.TempDir())
+	nested := filepath.Join(root, "nested")
+	outside := filepath.Join(t.TempDir(), "outside.go")
+	writeTestFile(t, filepath.Join(root, "go.mod"), "module example.com/parent\n\ngo 1.26.1\n\nrequire example.com/nested v0.0.0\nreplace example.com/nested => ./nested\n")
+	writeTestFile(t, filepath.Join(root, "parent.go"), "package parent\n\nimport \"example.com/nested\"\n\nfunc Parent() int { return nested.Value() }\n")
+	writeTestFile(t, filepath.Join(nested, "go.mod"), "module example.com/nested\n\ngo 1.26.1\n")
+	writeTestFile(t, filepath.Join(nested, "nested.go"), "package nested\n\nfunc Value() int { return 1 }\n")
+	writeTestFile(t, outside, "package nested\n\nconst Outside = true\n")
+	if err := os.Symlink(outside, filepath.Join(nested, "unsafe.go")); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+
+	result, err := Scan(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Profile.Properties["go_packages_status"] != "fallback" {
+		t.Fatalf("unsafe nested replacement status = %q; diagnostics=%+v", result.Profile.Properties["go_packages_status"], result.Diagnostics)
+	}
+	if result.Profile.Properties["go_packages_typed_packages"] != "0" {
+		t.Fatalf("unsafe replacement leaked typed packages: properties=%+v", result.Profile.Properties)
+	}
+	if !hasDiagnostic(result.Diagnostics, "go_packages_source_confinement") || !hasDiagnostic(result.Diagnostics, "go_packages_module_confined_fallback") || result.Coverage.ProjectCodeExecuted {
+		t.Fatalf("unsafe replacement did not fail closed: coverage=%+v diagnostics=%+v", result.Coverage, result.Diagnostics)
+	}
+}
+
 func TestGoPackagesUnsafeWorkspaceRetainsIndependentTypedModule(t *testing.T) {
 	root := canonicalTestRoot(t, t.TempDir())
 	workspaceA := filepath.Join(root, "workspace-a")

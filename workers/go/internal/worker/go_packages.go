@@ -156,7 +156,7 @@ func loadGoPackagesInventoryWith(root string, modules []Module, work WorkFile, t
 			modulePreflights[canonicalPathForConfinement(module.Dir)] = goModulePreflight{Code: "go_packages_module_confined_fallback", Reason: reason}
 			continue
 		}
-		if reason := moduleSourceConfinementIssue(module); reason != "" {
+		if reason := moduleSourceConfinementIssue(module, knownModuleDirs); reason != "" {
 			modulePreflights[canonicalPathForConfinement(module.Dir)] = goModulePreflight{Code: "go_packages_source_confinement", Reason: reason}
 		}
 	}
@@ -539,7 +539,7 @@ func collectGoTypedPackage(root string, module Module, pkg *packages.Package) (g
 	}, nil
 }
 
-func moduleSourceConfinementIssue(module Module) string {
+func moduleSourceConfinementIssue(module Module, knownModuleDirs map[string]bool) string {
 	var issue string
 	err := filepath.WalkDir(module.Dir, func(path string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
@@ -549,8 +549,13 @@ func moduleSourceConfinementIssue(module Module) string {
 			issue = fmt.Sprintf("symlink %q is not eligible for typed loading in safe mode", filepath.ToSlash(relativePath(module.Dir, path)))
 			return fs.SkipAll
 		}
-		if entry.IsDir() && path != module.Dir && (entry.Name() == ".git" || entry.Name() == ".hg" || entry.Name() == ".svn") {
-			return fs.SkipDir
+		if entry.IsDir() && path != module.Dir {
+			if knownModuleDirs[canonicalPathForConfinement(path)] {
+				return fs.SkipDir
+			}
+			if entry.Name() == ".git" || entry.Name() == ".hg" || entry.Name() == ".svn" {
+				return fs.SkipDir
+			}
 		}
 		return nil
 	})
