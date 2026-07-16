@@ -1,8 +1,11 @@
 import { realpath, stat } from "node:fs/promises";
 import path from "node:path";
-import ts from "typescript";
 import { inventoryFiles } from "./fs";
 import { scan } from "./scanner";
+import {
+  TYPESCRIPT_COMPILER_PROFILE_PROPERTIES,
+  TYPESCRIPT_COMPILER_VERSION,
+} from "./typescript-compiler";
 import {
   ADAPTER,
   ADAPTER_VERSION,
@@ -73,7 +76,7 @@ function eventsFor(model: ScanModel, root: string, scanId: string): ProtocolEven
     profile: {
       id: PROFILE_ID,
       language: "web",
-      toolchain: `typescript ${ts.version}`,
+      toolchain: `typescript ${TYPESCRIPT_COMPILER_VERSION}`,
       command: "scan",
       target: `web:${WEB_ENVIRONMENTS.join(",")}`,
       features: model.detectedFrameworks,
@@ -82,10 +85,7 @@ function eventsFor(model: ScanModel, root: string, scanId: string): ProtocolEven
         module_resolution: "static-safe",
         package_manager: model.packageManager,
         lockfile: model.lockfile ?? "",
-        bundled_typescript: "true",
-        typescript_syntax_compiler: "native-7.0.2",
-        typescript_compiler_processes: "1",
-        typescript_project_filesystem: "isolated-virtual",
+        ...TYPESCRIPT_COMPILER_PROFILE_PROPERTIES,
         project_code_executed: "false",
       },
     },
@@ -155,7 +155,7 @@ async function main(): Promise<void> {
     return;
   }
   if ("version" in options) {
-    process.stdout.write(`depgraph-web-worker ${ADAPTER_VERSION} (protocol ${PROTOCOL_VERSION}; typescript ${ts.version})\n`);
+    process.stdout.write(`depgraph-web-worker ${ADAPTER_VERSION} (protocol ${PROTOCOL_VERSION}; typescript ${TYPESCRIPT_COMPILER_VERSION})\n`);
     return;
   }
   try {

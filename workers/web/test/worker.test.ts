@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { cp, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, cp, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -37,9 +37,37 @@ test("worker emits deterministic protocol graph without executing project code",
   const second = await run("scan-two");
 
   assert.equal(first.events[0]?.event, "scan_started");
+  assert.equal(first.events[0]?.project_code_executed, false);
   assert.equal(first.events.at(-1)?.event, "scan_completed");
   assert.ok(first.events.every((event, index) => event.protocol_version === "1.0" && event.adapter === "web" && event.seq === index + 1));
   assert.match(first.stderr, /project code executed=false/u);
+
+  const profile = first.events.find((event) => event.event === "profile_declared")?.profile;
+  assert.equal(profile?.toolchain, "typescript 7.0.2");
+  assert.deepEqual(
+    Object.fromEntries([
+      "typescript_compiler_source",
+      "typescript_compiler_version",
+      "typescript_compiler_selection",
+      "typescript_compiler_fallback",
+      "typescript_analysis_mode",
+      "typescript_project_local_policy",
+      "typescript_project_local_loaded",
+      "typescript_typechecker_status",
+      "project_code_executed",
+    ].map((key) => [key, profile?.properties[key]])),
+    {
+      typescript_compiler_source: "bundled",
+      typescript_compiler_version: "7.0.2",
+      typescript_compiler_selection: "bundled-only",
+      typescript_compiler_fallback: "fail-closed",
+      typescript_analysis_mode: "syntax-only",
+      typescript_project_local_policy: "metadata-only",
+      typescript_project_local_loaded: "false",
+      typescript_typechecker_status: "not-invoked",
+      project_code_executed: "false",
+    },
+  );
 
   const nodes = first.events.filter((event) => event.event === "node_upsert").map((event) => event.node);
   const sites = first.events.filter((event) => event.event === "dependency_site").map((event) => event.site);
@@ -1074,6 +1102,136 @@ test("bun.lockb and project TypeScript/framework versions are reported staticall
   const locked = await run("locked-versions", lockRoot);
   assert.ok(locked.events.some((event) => event.diagnostic?.code === "web.project_typescript_not_loaded" && event.diagnostic?.message.includes("7.1.4")));
   assert.ok(locked.events.some((event) => event.diagnostic?.code === "web.best_effort_framework_version" && event.diagnostic?.message.includes("@tanstack/react-start 1.2.3")));
+});
+
+test("unsupported project-local TypeScript is metadata only and its module is never executed", async (context) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "depgraph-web-worker-malicious-typescript-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  const localTypeScript = path.join(root, "node_modules", "typescript");
+  const marker = path.join(root, "PROJECT_TYPESCRIPT_EXECUTED");
+  await mkdir(localTypeScript, { recursive: true });
+  await Promise.all([
+    writeFile(path.join(root, "package.json"), JSON.stringify({
+      name: "malicious-typescript-fixture",
+      version: "1.0.0",
+      devDependencies: { typescript: "99.0.0-evil" },
+    })),
+    writeFile(path.join(root, "index.ts"), "export const safe = true;\n"),
+    writeFile(path.join(localTypeScript, "package.json"), JSON.stringify({
+      name: "typescript",
+      version: "99.0.0-evil",
+      main: "index.cjs",
+    })),
+    writeFile(
+      path.join(localTypeScript, "index.cjs"),
+      `require("node:fs").writeFileSync(${JSON.stringify(marker)}, "executed"); module.exports = { version: "99.0.0-evil" };\n`,
+    ),
+  ]);
+
+  const result = await run("malicious-project-typescript", root);
+  const profile = result.events.find((event) => event.event === "profile_declared")?.profile;
+  const diagnostics = result.events.filter((event) => event.event === "diagnostic").map((event) => event.diagnostic);
+  const localDiagnostic = diagnostics.find((diagnostic) => diagnostic.code === "web.project_typescript_not_loaded");
+
+  assert.match(localDiagnostic?.message ?? "", /project-local TypeScript 99\.0\.0-evil/u);
+  assert.match(localDiagnostic?.message ?? "", /installed package manifest/u);
+  assert.equal(localDiagnostic?.path, "package.json");
+  assert.equal(profile?.properties.typescript_compiler_source, "bundled");
+  assert.equal(profile?.properties.typescript_compiler_version, "7.0.2");
+  assert.equal(profile?.properties.typescript_project_local_policy, "metadata-only");
+  assert.equal(profile?.properties.typescript_project_local_loaded, "false");
+  assert.equal(profile?.properties.project_code_executed, "false");
+  assert.equal(result.events[0]?.project_code_executed, false);
+  await assert.rejects(import("node:fs/promises").then(({ stat }) => stat(marker)));
+});
+
+test("relocated packaged worker fails closed when its adjacent TypeScript compiler is missing", async (context) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "depgraph-web-worker-missing-compiler-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  // node_modules is excluded from source inventory, so this also proves that
+  // an empty TS/JS source set still validates the compiler before declaring a
+  // bundled, fail-closed profile.
+  const relocatedWorker = path.join(root, "node_modules", ".bin", "worker.mjs");
+  const marker = path.join(root, "PROJECT_TYPESCRIPT_EXECUTED");
+  const platformPackageName = `typescript-${process.platform}-${process.arch}`;
+  const projectPlatformRoot = path.join(root, "node_modules", "@typescript", platformPackageName);
+  const fakeCompiler = path.join(projectPlatformRoot, "lib", process.platform === "win32" ? "tsc.exe" : "tsc");
+  await Promise.all([
+    mkdir(path.dirname(relocatedWorker), { recursive: true }),
+    mkdir(path.dirname(fakeCompiler), { recursive: true }),
+    mkdir(path.join(root, "node_modules", "typescript"), { recursive: true }),
+  ]);
+  await Promise.all([
+    cp(worker, relocatedWorker),
+    cp(fileURLToPath(new URL("../dist/astro.wasm", import.meta.url)), path.join(path.dirname(relocatedWorker), "astro.wasm")),
+    writeFile(path.join(root, "package.json"), JSON.stringify({ name: "missing-compiler-fixture", version: "1.0.0" })),
+    writeFile(path.join(root, "node_modules", "typescript", "package.json"), JSON.stringify({
+      name: "typescript",
+      version: "7.0.2",
+    })),
+    writeFile(path.join(projectPlatformRoot, "package.json"), JSON.stringify({
+      name: `@typescript/${platformPackageName}`,
+      version: "7.0.2",
+    })),
+    writeFile(
+      fakeCompiler,
+      process.platform === "win32"
+        ? "this is intentionally not a real executable\n"
+        : `#!${process.execPath}\nrequire("node:fs").writeFileSync(${JSON.stringify(marker)}, "executed");\n`,
+    ),
+  ]);
+  if (process.platform !== "win32") await chmod(fakeCompiler, 0o755);
+
+  await assert.rejects(
+    execute(process.execPath, [relocatedWorker, "--root", root, "--scan-id", "missing-adjacent-compiler"]),
+    (error: unknown) => {
+      const stderr = typeof error === "object" && error !== null && "stderr" in error
+        ? String(error.stderr)
+        : String(error);
+      assert.match(stderr, /bundled TypeScript 7\.0\.2 compiler is missing next to packaged worker/u);
+      assert.doesNotMatch(stderr, /node_modules[\\/]@typescript/u);
+      return true;
+    },
+  );
+  await assert.rejects(import("node:fs/promises").then(({ stat }) => stat(marker)));
+});
+
+test("dynamic framework config is diagnosed without evaluating project code", async (context) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "depgraph-web-worker-dynamic-config-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  const marker = path.join(root, "DYNAMIC_CONFIG_EXECUTED");
+  await Promise.all([
+    writeFile(path.join(root, "package.json"), JSON.stringify({ name: "dynamic-config-fixture", version: "1.0.0" })),
+    writeFile(path.join(root, "index.ts"), "export const safe = true;\n"),
+    writeFile(path.join(root, "next.config.mjs"), `
+      import { writeFileSync } from "node:fs";
+      writeFileSync(${JSON.stringify(marker)}, "executed");
+      const dynamicBasePath = process.env.BASE_PATH;
+      export default {
+        basePath: dynamicBasePath,
+        webpack: (config) => config,
+      };
+    `),
+  ]);
+
+  const result = await run("dynamic-config", root);
+  const diagnostics = result.events.filter((event) => event.event === "diagnostic").map((event) => event.diagnostic);
+  assert.ok(diagnostics.some((diagnostic) => (
+    diagnostic.code === "web.executable_config_not_executed" && diagnostic.path === "next.config.mjs"
+  )));
+  assert.ok(diagnostics.some((diagnostic) => (
+    diagnostic.code === "web.static_config_unresolved"
+      && diagnostic.path === "next.config.mjs"
+      && /basePath is not a static string literal/u.test(diagnostic.message)
+  )));
+  assert.ok(diagnostics.some((diagnostic) => (
+    diagnostic.code === "web.static_config_runtime_ignored"
+      && diagnostic.path === "next.config.mjs"
+      && /webpack requires project code evaluation/u.test(diagnostic.message)
+  )));
+  assert.equal(result.events[0]?.project_code_executed, false);
+  assert.equal(result.events.find((event) => event.event === "profile_declared")?.profile.properties.project_code_executed, "false");
+  await assert.rejects(import("node:fs/promises").then(({ stat }) => stat(marker)));
 });
 
 test("workspace metadata and generated routes cannot be read through out-of-root symlinks", async (context) => {

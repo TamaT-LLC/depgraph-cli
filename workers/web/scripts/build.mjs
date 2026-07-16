@@ -18,6 +18,11 @@ const bundle = await build({
   format: "esm",
   target: "node24",
   metafile: true,
+  define: {
+    // Source-mode tests may use dist/typescript explicitly, but a packaged
+    // worker must require its own release-adjacent compiler and fail closed.
+    __DEPGRAPH_PACKAGED_WORKER__: "true",
+  },
   // The release ships a single self-contained worker file. An external map
   // would leave a dangling sourceMappingURL unless it were also part of the
   // checksum-verified runtime manifest.

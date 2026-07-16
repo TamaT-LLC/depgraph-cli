@@ -7,7 +7,7 @@ status: Active
 upstream: []
 downstream: []
 owner: TakehiroT
-updated: 2026-07-15
+updated: 2026-07-16
 ---
 
 # アーキテクチャ設計: Semantic Dependency Graph CLI
@@ -443,12 +443,90 @@ reflection、`unsafe`、`go:linkname`、assembly、plugin、native callback は 
 
 ### 11.1 TypeScript / JavaScript Core
 
-- project local の TypeScript version を優先する
-- `createProgram`、`TypeChecker`、module resolver を利用する
+Milestone 1 の safe scan は、ADR-006 に従い、depgraph に同梱された checksum 検証済み TypeScript のみを解析器として使用する。現在の固定 version は `7.0.2` である。project-local TypeScript は `package.json` と lockfile から version metadata を検出するだけで、module、native compiler、標準 library を load / execute しない。MVP は bundled lexical API と、隔離された native compiler process による syntactic diagnostics を使用し、`createProgram` / `TypeChecker` による意味解析はまだ実行しない。
+
 - import / export / re-export / type-only / `require` / literal dynamic import を抽出する
 - template / computed import は有限候補または unresolved site とする
 - workspace と lockfile から npm / pnpm / Yarn / Bun の package instance を生成する
 - pnpm peer dependency や Yarn PnP は `name@version` ではなく locator 単位で識別する
+- compiler へ渡す入力は inventory 済み source bytes と worker が生成した neutral project に限定し、`noResolve`、`noLib`、`noCheck`、空の `plugins` を指定した isolated virtual filesystem で解析する
+
+#### Compiler 選択と fallback
+
+安全性と再現性のため、project repository に compiler の選択権を与えない。project-local compiler は project と同じ権限で読み込まれる JavaScript/native code であり、module 解決、package manager、PnP loader、plugin、config の初期化を通じて scan 時に任意コードを実行し得る。一方で bundled compiler は project 固有 version との差により新構文や意味解決の互換性が下がり得る。この差は project compiler への暗黙 fallback ではなく、diagnostic、coverage、version metadata で可視化する。
+
+選択順序は次のとおりとする。
+
+1. release archive では、core が release manifest に固定された component name、version、root、entrypoint、canonical whole-tree SHA-256 を検証する。欠損、追加、改変、symlink、root 外 escape のいずれかを検出した component は起動しない。
+2. Web worker は release-adjacent compiler のみを使用する。source checkout では build step が、worker 自身に pin された `typescript` と対応する `@typescript/typescript-{platform}-{arch}` の package identity / version を検証して `dist/typescript` へ copy する。source-mode test はその build artifact の固定 path だけを使用し、scan root、process cwd、ancestor の `node_modules` から compiler を探索しない。
+3. project-local TypeScript は、bundled と同一 version でも、互換 version でも、未対応 version でも選択しない。検出した version と取得元だけを diagnostic に残す。
+4. bundled compiler を使用できない場合、lexical-only、project-local compiler、system `tsc` へ fallback しない。Web profile を incomplete として非 0 で終了する。他 adapter の graph は保持できるが、Web scan または全体 scan を complete として扱わない。
+
+| 状態 | 選択 / fallback | metadata | diagnostic と結果 |
+| --- | --- | --- | --- |
+| 検証済み bundled compiler が利用可能 | bundled `7.0.2`、fallback なし | 下表の固定値を記録 | 通常継続 |
+| project-local TypeScript を検出（同一、互換、未対応 version を含む） | bundled のまま。project-local は metadata-only | 検出 version と manifest / lockfile の取得元を diagnostic message に記録 | `web.project_typescript_not_loaded`（info）。未対応 version でも暗黙に load せず、bundled parser が解釈できない構文は `web.unsupported_syntax` と coverage に記録 |
+| source-mode の bundled JavaScript API が検証 baseline と異なる | worker-owned build artifact がある場合だけ継続。project への fallback なし | 実際の bundled version を記録 | `web.best_effort_typescript_version`（warning）。通常の build / release gate はこの状態を許可しない |
+| executable / dynamic config、package-based config `extends`、plugin が必要 | 実行せず、静的に安全な literal だけを採用 | `project_code_executed=false` | `web.static_config_unresolved` または `web.static_config_runtime_ignored` と `web.executable_config_not_executed`。該当解釈を skipped / unresolved とする |
+| release manifest / required component が missing、または component が version不一致、追加・改変・symlinkを含む | fallback なし、worker 起動前に拒否 | 信頼できないため Web compiler metadata を生成しない | core `security-policy`、scan `security_failed`、exit `4` |
+| 開発実行で worker-local compiler が missing / identity不一致 | fallback なし、Web worker 失敗 | Web profile を complete にしない | core `worker-failure`、scan `partial`、exit `3` |
+| compiler が crash、内部 30 秒 timeout、malformed response | fallback なし、当該 Web scan を破棄 | Web profile を complete にしない | core `worker-failure`、scan `partial`、exit `3` |
+| core の worker timeout / cancel | process tree を停止し、fallback なし | Web profile を complete にしない | core `worker-failure`、scan `partial`、exit `3` |
+
+Web profile は少なくとも次の properties を持つ。値は compiler 選択の監査入力であり、profile declaration と diagnostic から再現可能でなければならない。compiler version を cache key / profile identity へ組み込む変更は、cache contract と protocol compatibility を定義してから別途行う。
+
+| Property | MVP value | 意味 |
+| --- | --- | --- |
+| `typescript_compiler_source` | `bundled` | project / system compiler を使用していない |
+| `typescript_compiler_version` | `7.0.2` | 実際に使用した bundled compiler version |
+| `typescript_compiler_selection` | `bundled-only` | project metadata によって選択を変更しない |
+| `typescript_compiler_fallback` | `fail-closed` | compiler failureを別解析器の成功へ格下げしない |
+| `typescript_analysis_mode` | `syntax-only` | TypeChecker の意味解決結果ではない |
+| `typescript_project_local_policy` | `metadata-only` | project-local compiler は version inventory の対象に限定する |
+| `typescript_project_local_loaded` | `false` | project-local compiler module / binary / library を load していない |
+| `typescript_typechecker_status` | `not-invoked` | MVP では TypeChecker を呼び出していない |
+| `typescript_project_filesystem` | `isolated-virtual` | compiler に repository filesystem を直接公開していない |
+| `project_code_executed` | `false` | project code、hook、plugin、script、executable config を実行していない |
+
+#### Safe scan の read / execute 境界
+
+| 操作 | safe scan | 条件 |
+| --- | --- | --- |
+| canonical root 内の regular source file を読む | 許可 | inventory と realpath confinement を通過し、symlink 経由で root 外へ出ないこと |
+| `package.json`、対応 lockfile、`.pnp.data.json`、`.git/config` を読む | 許可 | package / repository identity data として読み、package manager や loader を起動しないこと |
+| root 内の installed-package manifest を読む | 許可 | package exports または TypeScript version metadata に限定し、module / binary を load しないこと |
+| `tsconfig.json` / `jsconfig.json` と framework config source を読む | 許可 | JSON または既知 property の静的 literal だけを解釈すること。dynamic value は unresolved とする |
+| project-local `node_modules/typescript/package.json` を読む | version metadata に限り許可 | compiler code、binary、standard library、package export を解決または load しないこと |
+| 既存 generated file / build artifact を読む | 許可 | canonical root 内にあり、generated provenance を graph に残すこと |
+| project module、project-local TypeScript、`.pnp.cjs` を `import` / `require` / `eval` する | 禁止 | 同一 version であっても禁止 |
+| package manager、lifecycle script、framework / bundler command を起動する | 禁止 | `resolve --build --allow-project-code` の明示 opt-in が必要 |
+| `tsconfig` plugin、custom transformer、framework integration、Vite / Webpack plugin、executable config を実行する | 禁止 | 静的 literal で表せない効果は skipped / unresolved と diagnostic に残す |
+
+`scan_started`、profile、coverage の `project_code_executed=false` は単なる期待値ではなく safe scan の invariant である。この境界を証明できない入力や失敗を検出した場合、値を `false` のまま成功扱いせず fail closed とする。
+
+#### 将来 TypeChecker の導入 gate
+
+Milestone 2 の最初の TypeChecker backend も bundled-only を維持する。project-local compiler を opt-in で許可するには、compiler artifact identity と integrity、module/config/plugin 非実行、version compatibility、sandbox を扱う後続 ADR と security review を別途必須とする。
+
+導入前に、少なくとも次の matrix を release fixture と CI で検証する。
+
+| 軸 | 必須ケース | 期待結果 |
+| --- | --- | --- |
+| compiler metadata | project-localなし、bundledと同一、旧version、新version、範囲指定、壊れたmanifest | 常に bundled を選択し、検出 metadata と非load diagnostic が決定的 |
+| release integrity | 正常、entrypoint欠損、file欠損、file追加、content改変、symlink、version不一致 | 正常系以外は worker 起動前に `security-policy` で fail closed |
+| platform | Tier 1 の各 OS / arch と、対応 native package 不在 | 対応artifactだけが成功し、不在時にsystem/project compilerへfallbackしない |
+| config / module boundary | static JSON/literal、dynamic JS/TS config、package `extends`、`.pnp.cjs`、plugin/custom transformer、悪意あるproject-local TypeScript | safe inputだけを読み、任意コードの副作用がなく、`project_code_executed=false` |
+| semantic coverage | ESM/CJS、type-only、package exports、path alias、JSX、generics、broken / newer syntax | 各siteを `resolved / candidates / external / unresolved` のいずれかへ分類し、unsupported入力を黙って省略しない |
+| failure | compiler diagnostic、crash、内部timeout、core timeout、cancel、malformed output | crash/timeout系はsemantic-completeにせず非0。partial graph、ledger、diagnostic が再現可能 |
+| determinism | 同一source、compiler、profileの反復scan | stable ID、edge/site、diagnostic、出力順、profile metadata が一致 |
+
+TypeChecker backend の受け入れ条件は次のすべてを満たすこととする。
+
+1. compiler 選択と実versionが上記 properties に記録され、semantic evidence に compiler / adapter version と profile が含まれる。
+2. inventory 済み bytes と安全な static config だけから program を構築し、project module、plugin、config、package manager を load / execute しないことを副作用 fixture で検証する。
+3. syntax-only graph を上書きせず semantic evidence として union し、すべての dependency site と skipped input を coverage ledger に残す。
+4. missing、tampered、unsupported compiler、crash、timeout で project / system compiler または syntax-only success へ fallbackせず、該当 profile を incomplete にする。
+5. `project_code_executed=false`、snapshot determinism、protocol backward compatibilityをTier 1 matrixで満たす。
 
 ### 11.2 Next.js
 
@@ -734,6 +812,10 @@ policy result も evidence span を持ち、CI annotation へ変換できるよ�
 
 **採用。** build / runtime 結果で static graph を上書きしない。矛盾も evidence と diagnostic として保持する。
 
+### ADR-006: Bundled-only TypeScript Compiler for Safe Scan
+
+**採用。** safe scan の compiler は、release manifest で version、entrypoint、canonical whole-tree SHA-256 を検証した bundled TypeScript に限定する。project-local TypeScript は version metadata の読取だけを許可し、同一versionであっても module、native compiler、standard library、plugin、config を load / execute しない。compiler の missing、tampering、crash、timeout では project-local / system compiler や lexical-only success へ fallbackせず、Web profileをincompleteとして非0終了する。これによりproject compilerとの完全な互換性より、`project_code_executed=false`、配布物integrity、決定性を優先する。規範的な選択表、安全境界、diagnostic、将来TypeCheckerの導入gateは11.1節に定める。
+
 ## 21. Roadmap
 
 ### Milestone 0: Schema and Contract
@@ -794,7 +876,6 @@ policy result も evidence span を持ち、CI annotation へ変換できるよ�
 
 - binary / product の最終名称を `depgraph` とするか
 - Go worker と Node worker を release artifact にどう同梱するか
-- project local TypeScript version と bundled fallback の優先規則
 - Next.js の既存 adapter と observer を安全に chain する方法
 - default profile matrix の範囲と組合せ爆発の抑制方法
 - Rust compiler-precise backend をどの toolchain channel で提供するか
@@ -821,4 +902,5 @@ policy result も evidence span を持ち、CI annotation へ変換できるよ�
 
 ## 26. 更新履歴
 
+- 2026-07-16: ADR-006としてsafe scanのbundled-only TypeScript compiler選択、fail-closed境界、diagnostic、将来TypeChecker導入gateを確定
 - 2026-07-15: 初版を作成
