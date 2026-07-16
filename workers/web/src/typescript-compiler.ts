@@ -1,8 +1,9 @@
 import type { ChildProcess } from "node:child_process";
 import { constants as fsConstants } from "node:fs";
-import { access, readFile, realpath, stat } from "node:fs/promises";
+import { access, realpath, stat } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import ts from "typescript";
 import { API, type Diagnostic as CompilerDiagnostic } from "typescript/unstable/async";
 import {
   SyntaxKind,
@@ -14,9 +15,25 @@ import {
 } from "typescript/unstable/ast";
 import type { FileSystem, FileSystemEntries } from "typescript/unstable/fs";
 
-const TYPESCRIPT_VERSION = "7.0.2";
+export const TYPESCRIPT_COMPILER_VERSION = ts.version;
+export const TYPESCRIPT_COMPILER_PROFILE_PROPERTIES = Object.freeze({
+  bundled_typescript: "true",
+  typescript_syntax_compiler: `native-${TYPESCRIPT_COMPILER_VERSION}`,
+  typescript_compiler_source: "bundled",
+  typescript_compiler_version: TYPESCRIPT_COMPILER_VERSION,
+  typescript_compiler_selection: "bundled-only",
+  typescript_compiler_fallback: "fail-closed",
+  typescript_analysis_mode: "syntax-only",
+  typescript_project_local_policy: "metadata-only",
+  typescript_project_local_loaded: "false",
+  typescript_typechecker_status: "not-invoked",
+  typescript_compiler_processes: "1",
+  typescript_project_filesystem: "isolated-virtual",
+} as const);
 const COMPILER_TIMEOUT_MS = 30_000;
 const COMPILER_BASENAME = process.platform === "win32" ? "tsc.exe" : "tsc";
+declare const __DEPGRAPH_PACKAGED_WORKER__: boolean;
+const PACKAGED_WORKER = typeof __DEPGRAPH_PACKAGED_WORKER__ !== "undefined" && __DEPGRAPH_PACKAGED_WORKER__;
 const VIRTUAL_ROOT = path.join(path.parse(process.execPath).root, "__depgraph_typescript_syntax__");
 const VIRTUAL_CONFIG = path.join(VIRTUAL_ROOT, "tsconfig.json");
 const NEUTRAL_CWD = path.parse(process.execPath).root;
@@ -76,11 +93,6 @@ export function isConfinedTypeScriptInputPath(value: string): boolean {
     && !portable.split("/").some((part) => part === "" || part === "." || part === "..");
 }
 
-function isWithin(parent: string, child: string): boolean {
-  const relative = path.relative(parent, child);
-  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
-}
-
 async function usableCompiler(candidate: string): Promise<string | null> {
   try {
     const resolved = await realpath(candidate);
@@ -92,42 +104,26 @@ async function usableCompiler(candidate: string): Promise<string | null> {
   }
 }
 
-/**
- * Resolve only release-adjacent or worker-installation artifacts. In
- * particular, this never resolves a compiler relative to the scanned root or
- * the worker process cwd.
- */
+/** Resolve only build-produced artifacts at fixed paths relative to this file. */
 export async function resolveTypeScriptCompiler(): Promise<string> {
   const adjacent = fileURLToPath(new URL(`./typescript/lib/${COMPILER_BASENAME}`, import.meta.url));
   const bundled = await usableCompiler(adjacent);
   if (bundled !== null) return bundled;
 
-  let typescriptManifest: string;
-  try {
-    typescriptManifest = fileURLToPath(import.meta.resolve("typescript/package.json"));
-  } catch (error) {
-    throw new Error(`bundled TypeScript ${TYPESCRIPT_VERSION} package is unavailable: ${String(error)}`);
+  // The release bundle receives this compile-time marker from build.mjs. A
+  // relocated or incomplete release must fail here: package resolution could
+  // otherwise select node_modules owned by the repository being scanned.
+  if (PACKAGED_WORKER) {
+    throw new Error(`bundled TypeScript ${TYPESCRIPT_COMPILER_VERSION} compiler is missing next to packaged worker: ${adjacent}`);
   }
-  const typescriptRoot = await realpath(path.dirname(typescriptManifest));
-  const platformPackageName = `typescript-${process.platform}-${process.arch}`;
-  const platformRoot = path.resolve(typescriptRoot, "..", "@typescript", platformPackageName);
-  const platformManifest = path.join(platformRoot, "package.json");
-  let packageMetadata: { name?: unknown; version?: unknown };
-  try {
-    packageMetadata = JSON.parse(await readFile(platformManifest, "utf8")) as { name?: unknown; version?: unknown };
-  } catch (error) {
-    throw new Error(`bundled TypeScript native package @typescript/${platformPackageName} is unavailable: ${String(error)}`);
-  }
-  if (packageMetadata.name !== `@typescript/${platformPackageName}` || packageMetadata.version !== TYPESCRIPT_VERSION) {
-    throw new Error(`bundled TypeScript native package identity mismatch: expected @typescript/${platformPackageName}@${TYPESCRIPT_VERSION}`);
-  }
-  const resolvedPlatformRoot = await realpath(platformRoot);
-  const candidate = path.join(resolvedPlatformRoot, "lib", process.platform === "win32" ? "tsc.exe" : "tsc");
-  const compiler = await usableCompiler(candidate);
-  if (compiler === null || !isWithin(resolvedPlatformRoot, compiler)) {
-    throw new Error(`bundled TypeScript native compiler is missing or escapes its package: ${candidate}`);
-  }
-  return compiler;
+
+  // Source-mode tests and development run only after `pnpm build`; point them
+  // explicitly at that verified build artifact. This path is independent of
+  // cwd and the scan root and never walks ancestor node_modules directories.
+  const developmentArtifact = fileURLToPath(new URL(`../dist/typescript/lib/${COMPILER_BASENAME}`, import.meta.url));
+  const developmentCompiler = await usableCompiler(developmentArtifact);
+  if (developmentCompiler !== null) return developmentCompiler;
+  throw new Error(`bundled TypeScript ${TYPESCRIPT_COMPILER_VERSION} development compiler is unavailable; run pnpm build: ${developmentArtifact}`);
 }
 
 function addDirectory(
@@ -331,10 +327,13 @@ function withTimeout<T>(operation: Promise<T>, timeoutMs: number): Promise<T> {
 export async function collectTypeScriptSyntacticDiagnostics(
   sources: ReadonlyMap<string, string>,
 ): Promise<TypeScriptSyntaxDiagnostics> {
+  // Validate the selected compiler even for repositories with no TS/JS
+  // sources. The profile must not attest to a bundled, fail-closed compiler
+  // that was never resolved.
+  const compiler = await resolveTypeScriptCompiler();
   const result = new TypeScriptSyntaxDiagnostics();
   if (sources.size === 0) return result;
 
-  const compiler = await resolveTypeScriptCompiler();
   const virtualFiles = new Map<string, string>();
   const virtualToRelative = new Map<string, string>();
   const configFiles: string[] = [];
