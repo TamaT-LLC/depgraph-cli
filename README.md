@@ -60,7 +60,7 @@ Selectors accept `id:`, `path:`, `package:`, and `route:` prefixes. A bare selec
 
 ## Safe-scan boundary
 
-The default scan reads source, manifests, lockfiles, static JSON/JSONC configuration, and existing generated files. It does not execute project configuration, plugins, package managers, generators, build scripts, proc macros, or project-local TypeScript. The Web worker uses bundled TypeScript. Go first requests metadata through `go/packages` with networking, external drivers, cgo, toolchain download, and writes disabled, then retains the standard-parser inventory as its fallback. Cargo metadata is attempted only in frozen/offline/no-deps mode from a neutral working directory.
+The default scan reads source, manifests, lockfiles, static JSON/JSONC configuration, and existing generated files. It does not execute project configuration, plugins, package managers, generators, build scripts, proc macros, or project-local TypeScript. The Web worker uses bundled TypeScript. Go requests typed syntax and type information through `go/packages` with networking, telemetry, external drivers, cgo, toolchain download, and repository writes disabled, then retains the standard-parser inventory as its fallback. Cargo metadata is attempted only in frozen/offline/no-deps mode from a neutral working directory.
 
 Worker and toolchain lookup uses a canonical absolute `PATH`: relative entries, the scan root, and symlink aliases into the scan root are removed. Child environments omit execution hooks such as `NODE_OPTIONS`; direct reads resolve symlinks and remain confined to the canonical repository root. Release workers and runtime assets are checksum verified, and packaged builds fail closed when their manifest or bundled layout is missing.
 

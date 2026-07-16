@@ -317,7 +317,7 @@ func Scan(root string) (Result, error) {
 	configuredTags := configuredGoTags()
 	goPackages := loadGoPackagesInventory(absRoot, modules, work, configuredTags)
 	initialDiagnostics = append(initialDiagnostics, goPackages.Diagnostics...)
-	// The constrained metadata pass always disables cgo. GOOS/GOARCH and this
+	// The constrained typed-package pass always disables cgo. GOOS/GOARCH and this
 	// effective cgo state are profile axes even when no custom build tags were
 	// requested; otherwise host scans on different platforms would share IDs.
 	const cgoEnabled = "0"

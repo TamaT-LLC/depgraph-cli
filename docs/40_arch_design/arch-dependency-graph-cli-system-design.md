@@ -419,7 +419,7 @@ build script と proc macro は任意コードを実行できる。safe mode で
 ### 10.1 Package / Type Scan
 
 1. `go env`、`go.work`、`go.mod` の toolchain snapshot を取得する。
-2. `go/packages.Load` で source、compiled file、test variant、module、embed 情報を取得する。
+2. offline/read-only、telemetry/cgo/external driver無効、公式`x/mod`検証、repository symlink事前拒否の制約下で `go/packages.Load` を実行し、source、compiled file、test variant、module、embed、typed syntax、`TypesInfo` を取得する。module単位で失敗した場合はtyped結果を破棄し、parser inventoryを維持する。
 3. AST と `go/types.Info` から definition、use、selection、type、method set、generic instance を生成する。
 4. named object は object identity、local object は source span で stable ID を作る。
 
