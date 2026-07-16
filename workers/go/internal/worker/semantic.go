@@ -22,25 +22,28 @@ type goSemanticExtractor struct {
 	typeNodesByResolver   map[string]string
 	symbolNodesByResolver map[string]string
 	nodeResolvers         map[string]string
+	symbolOrigins         map[string][]goSemanticSymbolOrigin
 	complete              bool
 	beforeSites           map[string]bool
 }
 
 type goSemanticPackage struct {
-	extractor       *goSemanticExtractor
-	typed           goTypedPackage
-	files           []goTypedFile
-	universeFiles   []goTypedFile
-	packageLocator  string
-	packageNodeID   string
-	parents         map[ast.Node]ast.Node
-	owners          map[ast.Node]string
-	objectNodes     map[types.Object]string
-	objectResolvers map[types.Object]string
-	typeSpecNodes   map[*ast.TypeSpec]string
-	namedTypes      []goSemanticNamedType
-	namedTypeIDs    map[string]bool
-	extends         []goSemanticExtends
+	extractor        *goSemanticExtractor
+	typed            goTypedPackage
+	files            []goTypedFile
+	universeFiles    []goTypedFile
+	packageLocator   string
+	packageNodeID    string
+	parents          map[ast.Node]ast.Node
+	owners           map[ast.Node]string
+	objectNodes      map[types.Object]string
+	objectResolvers  map[types.Object]string
+	instanceNodes    map[*ast.Ident]string
+	callInitializers map[*ast.ValueSpec]string
+	typeSpecNodes    map[*ast.TypeSpec]string
+	namedTypes       []goSemanticNamedType
+	namedTypeIDs     map[string]bool
+	extends          []goSemanticExtends
 }
 
 type goSemanticNamedType struct {
@@ -67,6 +70,7 @@ func (s *scannerState) extractGoSemanticGraph(sources []*sourceFile) {
 		typeNodesByResolver:   map[string]string{},
 		symbolNodesByResolver: map[string]string{},
 		nodeResolvers:         map[string]string{},
+		symbolOrigins:         map[string][]goSemanticSymbolOrigin{},
 		complete:              true,
 		beforeSites:           make(map[string]bool, len(s.sites)),
 	}
@@ -101,6 +105,9 @@ func (s *scannerState) extractGoSemanticGraph(sources []*sourceFile) {
 		context.emitSelections()
 		context.emitTypeUsesAndInstances()
 	}
+	for _, context := range extractor.contexts {
+		context.emitCalls()
+	}
 	extractor.emitImplements()
 
 	extractor.accountSemanticSites()
@@ -111,15 +118,17 @@ func (s *scannerState) extractGoSemanticGraph(sources []*sourceFile) {
 
 func (e *goSemanticExtractor) newPackage(typed goTypedPackage) *goSemanticPackage {
 	context := &goSemanticPackage{
-		extractor:       e,
-		typed:           typed,
-		packageLocator:  goSemanticPackageLocator(typed),
-		parents:         map[ast.Node]ast.Node{},
-		owners:          map[ast.Node]string{},
-		objectNodes:     map[types.Object]string{},
-		objectResolvers: map[types.Object]string{},
-		typeSpecNodes:   map[*ast.TypeSpec]string{},
-		namedTypeIDs:    map[string]bool{},
+		extractor:        e,
+		typed:            typed,
+		packageLocator:   goSemanticPackageLocator(typed),
+		parents:          map[ast.Node]ast.Node{},
+		owners:           map[ast.Node]string{},
+		objectNodes:      map[types.Object]string{},
+		objectResolvers:  map[types.Object]string{},
+		instanceNodes:    map[*ast.Ident]string{},
+		callInitializers: map[*ast.ValueSpec]string{},
+		typeSpecNodes:    map[*ast.TypeSpec]string{},
+		namedTypeIDs:     map[string]bool{},
 	}
 	context.packageNodeID = e.packageNodeID(typed)
 	for _, file := range typed.Files {
@@ -370,9 +379,20 @@ func (p *goSemanticPackage) declareTypeMembers(file goTypedFile) {
 		}
 		ownerResolver := p.extractor.nodeResolvers[ownerID]
 		if len(field.Names) == 0 {
-			p.owners[field] = ownerID
 			if _, isInterface := container.(*ast.InterfaceType); isInterface {
+				p.owners[field] = ownerID
 				p.recordExtends(ownerID, field.Type, file)
+				return true
+			}
+			identifier, object := p.embeddedFieldDefinition(field)
+			if identifier == nil || object == nil {
+				p.owners[field] = ownerID
+				return true
+			}
+			resolver := ownerResolver + "." + object.Name()
+			nodeID := p.ensureSymbol(object, identifier, file, ownerID, resolver, "field")
+			if nodeID != "" {
+				p.owners[field] = nodeID
 			}
 			return true
 		}
@@ -394,6 +414,28 @@ func (p *goSemanticPackage) declareTypeMembers(file goTypedFile) {
 		}
 		return true
 	})
+}
+
+func (p *goSemanticPackage) embeddedFieldDefinition(field *ast.Field) (*ast.Ident, *types.Var) {
+	var identifier *ast.Ident
+	var object *types.Var
+	ast.Inspect(field.Type, func(node ast.Node) bool {
+		if identifier != nil {
+			return false
+		}
+		candidate, ok := node.(*ast.Ident)
+		if !ok {
+			return true
+		}
+		variable, ok := p.typed.TypesInfo.Defs[candidate].(*types.Var)
+		if !ok || !variable.IsField() {
+			return true
+		}
+		identifier = candidate
+		object = variable
+		return false
+	})
+	return identifier, object
 }
 
 func (p *goSemanticPackage) declareValueSpecs(file goTypedFile) {
@@ -647,6 +689,7 @@ func (p *goSemanticPackage) ensureSymbol(object types.Object, identifier *ast.Id
 	p.extractor.nodeResolvers[nodeID] = resolver
 	if named {
 		p.extractor.registerResolver(p.extractor.symbolNodesByResolver, resolver, nodeID, file.Path)
+		p.extractor.registerSymbolOrigin(nodeID, p.typed)
 	}
 	if declaredBy != "" {
 		p.extractor.addRelation("declares", declaredBy, nodeID, p.condition(file.Path), evidence, p.generated(file.Path))
@@ -1061,8 +1104,9 @@ func (p *goSemanticPackage) emitSelections() {
 			}
 			if function, ok := object.(*types.Func); ok {
 				resolver := goSemanticFunctionResolver(function)
-				if p.extractor.symbolNodesByResolver[resolver] != "" {
-					p.objectNodes[object] = p.extractor.symbolNodesByResolver[resolver]
+				packagePath := goSemanticFunctionPackagePath(function)
+				if nodeID := p.visibleSymbolNode(resolver, packagePath); nodeID != "" {
+					p.objectNodes[object] = nodeID
 					p.objectResolvers[object] = resolver
 				}
 			}
@@ -1170,8 +1214,15 @@ func (p *goSemanticPackage) emitInstance(file goTypedFile, identifier *ast.Ident
 		semanticKind = "function_instance"
 		originResolver = goSemanticFunctionResolver(typed)
 		originNodeID = p.objectNodes[typed]
+		packagePath := goSemanticFunctionPackagePath(typed)
+		if originNodeID != "" && !p.symbolNodeVisible(originNodeID, packagePath) {
+			originNodeID = ""
+		}
 		if originNodeID == "" {
-			originNodeID = p.extractor.symbolNodesByResolver[originResolver]
+			originNodeID = p.visibleSymbolNode(originResolver, packagePath)
+		}
+		if originNodeID != "" {
+			originResolver = p.extractor.nodeResolvers[originNodeID]
 		}
 	default:
 		return
@@ -1204,6 +1255,8 @@ func (p *goSemanticPackage) emitInstance(file goTypedFile, identifier *ast.Ident
 			},
 		}
 		if p.extractor.addNode(externalNode, file.Path) {
+			p.instanceNodes[identifier] = externalID
+			p.extractor.nodeResolvers[externalID] = resolver
 			p.extractor.addRelation("instantiates", ownerID, externalID, p.condition(file.Path), evidence, p.generated(file.Path))
 		}
 		return
@@ -1241,6 +1294,7 @@ func (p *goSemanticPackage) emitInstance(file goTypedFile, identifier *ast.Ident
 	if !p.extractor.addNode(nodeValue, file.Path) {
 		return
 	}
+	p.instanceNodes[identifier] = nodeID
 	p.extractor.nodeResolvers[nodeID] = resolver
 	if nodeKind == "type" {
 		p.recordInstanceNamedType(nodeID, instance.Type, evidence, file.Path)

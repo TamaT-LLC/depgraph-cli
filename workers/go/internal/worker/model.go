@@ -267,9 +267,7 @@ func sortResult(result *Result) {
 	sort.Slice(result.Sites, func(i, j int) bool { return result.Sites[i].ID < result.Sites[j].ID })
 	sort.Slice(result.Edges, func(i, j int) bool { return result.Edges[i].ID < result.Edges[j].ID })
 	sort.Slice(result.Diagnostics, func(i, j int) bool {
-		li := result.Diagnostics[i].Path + "\x00" + result.Diagnostics[i].Code + "\x00" + result.Diagnostics[i].Message
-		lj := result.Diagnostics[j].Path + "\x00" + result.Diagnostics[j].Code + "\x00" + result.Diagnostics[j].Message
-		return li < lj
+		return result.Diagnostics[i].ID < result.Diagnostics[j].ID
 	})
 	sort.Slice(result.Files, func(i, j int) bool { return result.Files[i].Path < result.Files[j].Path })
 	for i := range result.Sites {

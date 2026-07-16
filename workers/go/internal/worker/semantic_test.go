@@ -177,7 +177,7 @@ func TestGoSemanticIdentitiesRelationsAndGenericOrder(t *testing.T) {
 	semanticRequireStrictTypeUse(t, result, concreteWork.ID, input.ID)
 	semanticRequireStrictTypeUse(t, result, concreteWork.ID, output.ID)
 	semanticRequireInitializerTypeUse(t, result, workerType.ID)
-	semanticRequirePackageInitializers(t, result, 5)
+	semanticRequirePackageInitializers(t, result, 6)
 	semanticRequireAnonymousMembersNotNamed(t, result, "Ghost", "Phantom")
 	semanticRequireDistinctScopedTypeArguments(t, result, semanticPackagePath+".Convert", 2)
 	semanticRequireGenericInstanceCount(t, result, semanticPackagePath+".FuncBox", 1)
@@ -190,6 +190,234 @@ func TestGoSemanticIdentitiesRelationsAndGenericOrder(t *testing.T) {
 	genericMatchInstance := semanticFindGenericInstance(t, result, "type", semanticPackagePath+".GenericMatch", []string{"int"})
 	semanticRequireSiteLessRelation(t, result, "implements", genericMatcherInstance.ID, genericMatchInstance.ID)
 	semanticRequireScopedGenericImplements(t, result, semanticPackagePath+".ScopedBox", semanticPackagePath+".ScopedContract", 2)
+}
+
+func TestGoSemanticDirectCallsAreStrictAndConservative(t *testing.T) {
+	result := semanticScanFixture(t)
+	semanticAssertAllStrictCalls(t, result)
+
+	direct := semanticFindNamedNode(t, result, "symbol", "function", semanticPackagePath+".DirectCallMatrix")
+	externalCall := semanticFindNamedNode(t, result, "symbol", "function", semanticPackagePath+".ExternalCall")
+	method := semanticFindNamedNode(t, result, "symbol", "method", semanticPackagePath+".(MethodExpressionTarget).Execute")
+	inferred := semanticFindGenericInstance(t, result, "symbol", semanticPackagePath+".InferredCall", []string{"int"})
+
+	directExternalCalls := 0
+	closureExternalCalls := 0
+	packageExternalCalls := 0
+	methodCalls := 0
+	inferredCalls := 0
+	closureCalls := 0
+	callFileUnresolved := map[string]int{}
+	callFileDiagnostics := map[string]bool{}
+	conversionSite := false
+	nodes := make(map[string]Node, len(result.Nodes))
+	for _, node := range result.Nodes {
+		nodes[node.ID] = node
+	}
+	for _, edge := range result.Edges {
+		if edge.Kind != "calls" {
+			continue
+		}
+		site := semanticSiteByID(t, result, edge.SiteID)
+		primary := site.Evidence[0]
+		if primary.Path == "model/calls.go" && primary.StartLine == 48 {
+			conversionSite = true
+		}
+		if primary.Path == "model/calls.go" && site.ResolutionStatus == "unresolved" {
+			callFileUnresolved[site.Reason]++
+		}
+		if edge.Target == externalCall.ID && primary.Path == "model/calls.go" {
+			switch semanticNodeKind(nodes[edge.Source]) {
+			case "function":
+				if edge.Source != direct.ID {
+					t.Fatalf("ExternalCall has unexpected function caller: %+v", edge)
+				}
+				directExternalCalls++
+			case "closure":
+				closureExternalCalls++
+			case "package_initializer":
+				packageExternalCalls++
+			default:
+				t.Fatalf("ExternalCall has invalid caller: edge=%+v source=%+v", edge, nodes[edge.Source])
+			}
+		}
+		if edge.Source == direct.ID && edge.Target == method.ID {
+			methodCalls++
+		}
+		if edge.Source == direct.ID && edge.Target == inferred.ID {
+			inferredCalls++
+		}
+		if edge.Source == direct.ID && semanticNodeKind(nodes[edge.Target]) == "closure" {
+			closureCalls++
+		}
+	}
+	if directExternalCalls != 2 || closureExternalCalls != 1 || packageExternalCalls != 1 {
+		t.Fatalf("ExternalCall callers = direct:%d closure:%d package:%d, want 2/1/1", directExternalCalls, closureExternalCalls, packageExternalCalls)
+	}
+	if methodCalls != 2 || inferredCalls != 1 || closureCalls != 1 {
+		t.Fatalf("exact direct calls = method:%d inferred:%d closure:%d, want 2/1/1", methodCalls, inferredCalls, closureCalls)
+	}
+	if conversionSite {
+		t.Fatal("type conversion was emitted as a call site")
+	}
+	if !reflect.DeepEqual(callFileUnresolved, map[string]int{
+		"interface_dispatch": 2, "function_value_dispatch": 4, "reflection_dispatch": 1,
+	}) {
+		t.Fatalf("calls.go unresolved classifications = %v", callFileUnresolved)
+	}
+
+	externalResolvers := map[string]bool{}
+	for _, site := range result.Sites {
+		if site.Kind != "call" || len(site.Evidence) == 0 || site.Evidence[0].Path != "model/calls.go" || site.ResolutionStatus != "external" {
+			continue
+		}
+		target := nodes[site.TargetIDs[0]]
+		resolver, _ := target.Properties["resolver_identity"].(string)
+		externalResolvers[resolver] = true
+	}
+	for _, resolver := range []string{"fmt.Sprintf", "builtin.println", "reflect.ValueOf"} {
+		if !externalResolvers[resolver] {
+			t.Fatalf("external direct call %q was not classified exactly: %v", resolver, externalResolvers)
+		}
+	}
+
+	for _, diagnostic := range result.Diagnostics {
+		if diagnostic.Code != "go_call_unresolved" || diagnostic.Path != "model/calls.go" {
+			continue
+		}
+		if diagnostic.ID == "" || callFileDiagnostics[diagnostic.ID] {
+			t.Fatalf("unresolved call diagnostic has a missing/duplicate ID: %+v", diagnostic)
+		}
+		callFileDiagnostics[diagnostic.ID] = true
+		if len(diagnostic.Evidence) == 0 || diagnostic.StartLine != diagnostic.Evidence[0].StartLine || diagnostic.StartColumn != diagnostic.Evidence[0].StartColumn {
+			t.Fatalf("unresolved call diagnostic lost its primary span: %+v", diagnostic)
+		}
+	}
+	if len(callFileDiagnostics) != 7 {
+		t.Fatalf("calls.go unresolved diagnostics = %d, want 7", len(callFileDiagnostics))
+	}
+
+	internalTest := semanticFindNamedNode(t, result, "symbol", "function", semanticPackagePath+".TestInternal")
+	build := semanticFindNamedNode(t, result, "symbol", "function", semanticPackagePath+".Build")
+	convert := semanticFindGenericInstance(t, result, "symbol", semanticPackagePath+".Convert", []string{
+		semanticPackagePath + ".Output", semanticPackagePath + ".Input",
+	})
+	semanticRequireStrictCall(t, result, build.ID, convert.ID)
+	internalCall := semanticRequireStrictCall(t, result, internalTest.ID, build.ID)
+	if goSemanticConditionValue(internalCall.Condition, "go.package_variant") != "internal_test" {
+		t.Fatalf("internal test direct call lost its variant: %+v", internalCall)
+	}
+	externalTest := semanticFindNamedNode(t, result, "symbol", "function", semanticExternalTestPath+".TestExternal")
+	externalVariantCall := semanticRequireStrictCall(t, result, externalTest.ID, build.ID)
+	if goSemanticConditionValue(externalVariantCall.Condition, "go.package_variant") != "external_test" {
+		t.Fatalf("external test direct call lost its variant: %+v", externalVariantCall)
+	}
+}
+
+func TestGoSemanticDirectCallAcrossPackages(t *testing.T) {
+	root := t.TempDir()
+	writeTestFile(t, filepath.Join(root, "go.mod"), "module example.com/calls\n\ngo 1.26.1\n")
+	writeTestFile(t, filepath.Join(root, "lib", "lib.go"), "package lib\n\nfunc Run() {}\n")
+	writeTestFile(t, filepath.Join(root, "app", "app.go"), "package app\n\nimport \"example.com/calls/lib\"\n\nfunc Caller() { lib.Run() }\n")
+
+	result, err := Scan(root)
+	if err != nil {
+		t.Fatalf("Scan() error = %v", err)
+	}
+	caller := semanticFindNamedNode(t, result, "symbol", "function", "example.com/calls/app.Caller")
+	callee := semanticFindNamedNode(t, result, "symbol", "function", "example.com/calls/lib.Run")
+	semanticRequireStrictCall(t, result, caller.ID, callee.ID)
+	semanticAssertAllStrictCalls(t, result)
+}
+
+func TestGoSemanticDirectCallAcrossWorkspaceModules(t *testing.T) {
+	root := t.TempDir()
+	writeTestFile(t, filepath.Join(root, "go.work"), "go 1.26.1\n\nuse (\n\t./app\n\t./lib\n)\n")
+	writeTestFile(t, filepath.Join(root, "lib", "go.mod"), "module example.com/workspace-lib\n\ngo 1.26.1\n")
+	writeTestFile(t, filepath.Join(root, "lib", "lib.go"), "package lib\n\nfunc Run() {}\n")
+	writeTestFile(t, filepath.Join(root, "app", "go.mod"), "module example.com/workspace-app\n\ngo 1.26.1\n\nrequire example.com/workspace-lib v0.0.0\n")
+	writeTestFile(t, filepath.Join(root, "app", "app.go"), "package app\n\nimport \"example.com/workspace-lib\"\n\nfunc Caller() { lib.Run() }\n")
+
+	result, err := Scan(root)
+	if err != nil {
+		t.Fatalf("Scan() error = %v", err)
+	}
+	caller := semanticFindNamedNode(t, result, "symbol", "function", "example.com/workspace-app.Caller")
+	callee := semanticFindNamedNode(t, result, "symbol", "function", "example.com/workspace-lib.Run")
+	semanticRequireStrictCall(t, result, caller.ID, callee.ID)
+	semanticAssertAllStrictCalls(t, result)
+}
+
+func TestGoSemanticDirectCallDoesNotResolveInvisibleSiblingModule(t *testing.T) {
+	root := t.TempDir()
+	writeTestFile(t, filepath.Join(root, "shadow", "go.mod"), "module golang.org/x/mod\n\ngo 1.26.1\n")
+	writeTestFile(t, filepath.Join(root, "shadow", "module", "module.go"), `package module
+
+func Check(path, version string) error { return nil }
+
+type Version struct {
+	Path    string
+	Version string
+}
+
+func (Version) String() string { return "shadow" }
+`)
+	writeTestFile(t, filepath.Join(root, "app", "go.mod"), `module example.com/invisible-app
+
+go 1.26.1
+
+require golang.org/x/mod v0.38.0
+`)
+	writeTestFile(t, filepath.Join(root, "app", "go.sum"), `golang.org/x/mod v0.38.0 h1:MECBjubtXD7yj4HrhIUcywNaGeNVUdfVnxmPajOk4yk=
+golang.org/x/mod v0.38.0/go.mod h1:V6Xz0pq8TQ3dGqVQ1FVHuelZpAL0uNhSkk9ogYP3c40=
+`)
+	writeTestFile(t, filepath.Join(root, "app", "app.go"), `package app
+
+import "golang.org/x/mod/module"
+
+func Caller() string {
+	_ = module.Check("example.com/value", "v1.0.0")
+	return (module.Version{Path: "example.com/value", Version: "v1.0.0"}).String()
+}
+`)
+
+	result, err := Scan(root)
+	if err != nil {
+		t.Fatalf("Scan() error = %v", err)
+	}
+	caller := semanticFindNamedNode(t, result, "symbol", "function", "example.com/invisible-app.Caller")
+	shadowCheck := semanticFindNamedNode(t, result, "symbol", "function", "golang.org/x/mod/module.Check")
+	shadowString := semanticFindNamedNode(t, result, "symbol", "method", "golang.org/x/mod/module.(Version).String")
+	shadowTargets := map[string]bool{shadowCheck.ID: true, shadowString.ID: true}
+	nodes := make(map[string]Node, len(result.Nodes))
+	for _, node := range result.Nodes {
+		nodes[node.ID] = node
+	}
+	wantResolvers := map[string]bool{
+		"golang.org/x/mod/module.Check":            true,
+		"golang.org/x/mod/module.(Version).String": true,
+	}
+	seenResolvers := map[string]bool{}
+	callCount := 0
+	for _, edge := range result.Edges {
+		if edge.Kind != "calls" || edge.Source != caller.ID {
+			continue
+		}
+		callCount++
+		if shadowTargets[edge.Target] {
+			t.Fatalf("external dependency call resolved to an invisible sibling module: %+v", edge)
+		}
+		target := nodes[edge.Target]
+		resolver, _ := target.Properties["resolver_identity"].(string)
+		if edge.ResolutionStatus != "external" || edge.Precision != "exact" || target.Kind != "external_system" || !wantResolvers[resolver] {
+			t.Fatalf("invisible sibling call has invalid external target: edge=%+v target=%+v", edge, target)
+		}
+		seenResolvers[resolver] = true
+	}
+	if callCount != 2 || !reflect.DeepEqual(seenResolvers, wantResolvers) {
+		t.Fatalf("external calls = %d/%v, want 2/%v", callCount, seenResolvers, wantResolvers)
+	}
+	semanticAssertAllStrictCalls(t, result)
 }
 
 func TestGoSemanticDeclarationPreservesBuildCondition(t *testing.T) {
@@ -771,6 +999,107 @@ func semanticAssertAllStrictTypeUses(t *testing.T, result Result) {
 			edge.ResolutionStatus != site.ResolutionStatus || edge.Precision != site.Precision ||
 			!reflect.DeepEqual(edge.Evidence[0], site.Evidence[0]) {
 			t.Fatalf("type_uses edge disagrees with site: edge=%+v site=%+v", edge, site)
+		}
+	}
+}
+
+func semanticRequireStrictCall(t *testing.T, result Result, sourceID, targetID string) Edge {
+	t.Helper()
+	for _, edge := range result.Edges {
+		if edge.Kind == "calls" && edge.Source == sourceID && edge.Target == targetID {
+			return edge
+		}
+	}
+	t.Fatalf("missing calls edge %s -> %s; semantic edges:\n%s", sourceID, targetID, semanticEdgeSummary(result))
+	return Edge{}
+}
+
+func semanticAssertAllStrictCalls(t *testing.T, result Result) {
+	t.Helper()
+	nodes := make(map[string]Node, len(result.Nodes))
+	sites := make(map[string]Site, len(result.Sites))
+	for _, node := range result.Nodes {
+		nodes[node.ID] = node
+	}
+	for _, site := range result.Sites {
+		sites[site.ID] = site
+		if site.Kind != "call" {
+			continue
+		}
+		if nodes[site.Source].Kind != "symbol" {
+			t.Fatalf("call site source is not a symbol: site=%+v source=%+v", site, nodes[site.Source])
+		}
+		if len(site.TargetIDs) != 1 {
+			t.Fatalf("direct call target count = %d, want 1: %+v", len(site.TargetIDs), site)
+		}
+		semanticAssertEvidence(t, site.Evidence)
+		primary := site.Evidence[0]
+		if dispatch, _ := primary.Properties["dispatch"].(string); dispatch == "" {
+			t.Fatalf("direct call evidence lacks dispatch classification: %+v", primary)
+		}
+		wantSiteID := semanticCanonicalValueID("site", map[string]any{
+			"condition": site.Condition, "kind": site.Kind, "path": primary.Path,
+			"profile_id": site.ProfileID, "source": site.Source,
+			"span": map[string]any{
+				"start_line": primary.StartLine, "start_column": primary.StartColumn,
+				"end_line": primary.EndLine, "end_column": primary.EndColumn,
+			},
+		})
+		if site.ID != wantSiteID {
+			t.Fatalf("call site ID = %q, want %q: %+v", site.ID, wantSiteID, site)
+		}
+		target := nodes[site.TargetIDs[0]]
+		switch site.ResolutionStatus {
+		case "resolved":
+			if site.Precision != "exact" || target.Kind != "symbol" || site.Reason != "" {
+				t.Fatalf("resolved call has invalid precision/target/reason: site=%+v target=%+v", site, target)
+			}
+		case "external":
+			if site.Precision != "exact" || target.Kind != "external_system" || site.Reason != "" {
+				t.Fatalf("external call has invalid precision/target/reason: site=%+v target=%+v", site, target)
+			}
+		case "unresolved":
+			if site.Precision != "heuristic" || target.Kind != "unknown_target" || site.Reason == "" {
+				t.Fatalf("unresolved call lost sentinel/reason: site=%+v target=%+v", site, target)
+			}
+		default:
+			t.Fatalf("direct call has invalid resolution status: %+v", site)
+		}
+	}
+
+	edgesBySite := map[string]int{}
+	seenEdges := map[string]bool{}
+	for _, edge := range result.Edges {
+		if edge.Kind != "calls" {
+			continue
+		}
+		if seenEdges[edge.ID] {
+			t.Fatalf("duplicate calls edge ID: %s", edge.ID)
+		}
+		seenEdges[edge.ID] = true
+		site, ok := sites[edge.SiteID]
+		if !ok || site.Kind != "call" {
+			t.Fatalf("calls edge lacks call site: %+v", edge)
+		}
+		edgesBySite[edge.SiteID]++
+		if edge.Source != site.Source || edge.Target != site.TargetIDs[0] || edge.ProfileID != site.ProfileID ||
+			edge.ResolutionStatus != site.ResolutionStatus || edge.Precision != site.Precision ||
+			!reflect.DeepEqual(edge.Condition, site.Condition) || !reflect.DeepEqual(edge.Evidence[0], site.Evidence[0]) {
+			t.Fatalf("calls edge disagrees with its site: edge=%+v site=%+v", edge, site)
+		}
+		if edge.Phase != "semantic" || edge.Environment != "any" {
+			t.Fatalf("calls edge lost semantic phase/environment: %+v", edge)
+		}
+		wantEdgeID := semanticCanonicalValueID("edge", map[string]any{
+			"kind": edge.Kind, "site_id": edge.SiteID, "target": edge.Target,
+		})
+		if edge.ID != wantEdgeID {
+			t.Fatalf("calls edge ID = %q, want %q", edge.ID, wantEdgeID)
+		}
+	}
+	for _, site := range sites {
+		if site.Kind == "call" && edgesBySite[site.ID] != 1 {
+			t.Fatalf("call site %s has %d calls edges, want 1", site.ID, edgesBySite[site.ID])
 		}
 	}
 }
