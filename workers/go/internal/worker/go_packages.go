@@ -134,17 +134,19 @@ func loadGoPackagesInventoryWith(root string, modules []Module, work WorkFile, t
 	baseEnvironment := commandEnvironment.Values
 
 	workPath, workSafe, workReason := confinedWorkFile(root, work)
+	sourceWorkPath := workPath
+	workspaceFallback := false
 	if !workSafe && work.Path != "" {
+		workspaceFallback = true
 		inventory.Diagnostics = append(inventory.Diagnostics, goPackagesDiagnostic(
 			root,
 			"go_packages_workspace_disabled",
 			"warning",
-			workReason+"; go/packages was not invoked because workspace semantics could not be isolated safely, and the parser retained workspace syntax",
+			workReason+"; go/packages was not invoked for parsed workspace members, independent modules continue with GOWORK=off, and the parser retained workspace syntax",
 		))
-		return inventory
+		workPath = ""
+		sourceWorkPath = lexicalWorkspacePath(root, work.Path)
 	}
-	sourceWorkPath := workPath
-	workspaceFallback := false
 	modulePreflights := make(map[string]goModulePreflight, len(orderedModules))
 	for _, module := range orderedModules {
 		if module.ManifestPath == "" {
@@ -159,7 +161,9 @@ func loadGoPackagesInventoryWith(root string, modules []Module, work WorkFile, t
 		}
 	}
 	propagateUnsafeLocalReplacements(root, orderedModules, modulePreflights)
-	if sourceWorkPath != "" {
+	if !workSafe && sourceWorkPath != "" {
+		disableWorkspaceTypedLoading(root, orderedModules, work, sourceWorkPath, modulePreflights, workReason)
+	} else if sourceWorkPath != "" {
 		workspaceFailure := ""
 		for _, module := range orderedModules {
 			if !moduleIsWorkspaceMember(root, module, work, sourceWorkPath) {
@@ -834,6 +838,21 @@ func confinedWorkFile(root string, work WorkFile) (string, bool, string) {
 		}
 	}
 	return resolved, true, ""
+}
+
+func lexicalWorkspacePath(root, path string) string {
+	if path == "" {
+		return ""
+	}
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return ""
+	}
+	absolute = filepath.Clean(absolute)
+	if !isWithinRoot(root, absolute) {
+		return ""
+	}
+	return absolute
 }
 
 func workFileMatchesOfficial(work WorkFile, official *modfile.WorkFile) bool {

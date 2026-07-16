@@ -286,7 +286,7 @@ func TestGoPackagesRejectsSymlinkedWorkspaceBeforeInvokingLoader(t *testing.T) {
 	writeTestFile(t, filepath.Join(root, "go.mod"), "module example.com/work-link\n\ngo 1.26.1\n")
 	writeTestFile(t, filepath.Join(root, "work.go"), "package worklink\n")
 	target := filepath.Join(root, "config", "go.work")
-	writeTestFile(t, target, "go 1.26.1\n\nuse ..\n")
+	writeTestFile(t, target, "go 1.26.1\n\nuse .\n")
 	workPath := filepath.Join(root, "go.work")
 	if err := os.Symlink(target, workPath); err != nil {
 		t.Skipf("symlink unavailable: %v", err)
@@ -308,6 +308,75 @@ func TestGoPackagesRejectsSymlinkedWorkspaceBeforeInvokingLoader(t *testing.T) {
 	}
 	if inventory.Status != "fallback" || !hasDiagnostic(inventory.Diagnostics, "go_packages_workspace_disabled") {
 		t.Fatalf("symlinked workspace fallback missing: %+v", inventory)
+	}
+}
+
+func TestGoPackagesSymlinkedWorkspaceRetainsIndependentTypedModule(t *testing.T) {
+	root := canonicalTestRoot(t, t.TempDir())
+	workspace := filepath.Join(root, "workspace")
+	independent := filepath.Join(root, "independent")
+	target := filepath.Join(root, "config", "go.work")
+	writeTestFile(t, target, "go 1.26.1\n\nuse ./workspace\n")
+	if err := os.Symlink(target, filepath.Join(root, "go.work")); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	writeTestFile(t, filepath.Join(workspace, "go.mod"), "module example.com/workspace\n\ngo 1.26.1\n")
+	writeTestFile(t, filepath.Join(workspace, "workspace.go"), "package workspace\n")
+	writeTestFile(t, filepath.Join(independent, "go.mod"), "module example.com/independent\n\ngo 1.26.1\n")
+	writeTestFile(t, filepath.Join(independent, "independent.go"), "package independent\n\nfunc Value() int { return 1 }\n")
+
+	result, err := Scan(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Profile.Properties["go_packages_status"] != "partial" {
+		t.Fatalf("symlinked workspace status = %q; diagnostics=%+v", result.Profile.Properties["go_packages_status"], result.Diagnostics)
+	}
+	typedCount, err := strconv.Atoi(result.Profile.Properties["go_packages_typed_packages"])
+	if err != nil || typedCount < 1 {
+		t.Fatalf("independent module types were lost: properties=%+v", result.Profile.Properties)
+	}
+	if !hasDiagnostic(result.Diagnostics, "go_packages_workspace_disabled") || result.Coverage.ProjectCodeExecuted {
+		t.Fatalf("symlinked workspace fallback was not retained safely: coverage=%+v diagnostics=%+v", result.Coverage, result.Diagnostics)
+	}
+}
+
+func TestGoPackagesOutOfRootWorkspaceSymlinkMarksIndependentLoadPartial(t *testing.T) {
+	parent := t.TempDir()
+	repository := filepath.Join(parent, "repo")
+	if err := os.MkdirAll(repository, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	root := canonicalTestRoot(t, repository)
+	independent := filepath.Join(root, "independent")
+	outsideWork := filepath.Join(parent, "outside", "go.work")
+	writeTestFile(t, outsideWork, "go 1.26.1\n\nuse .\n")
+	if err := os.Symlink(outsideWork, filepath.Join(root, "go.work")); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	writeTestFile(t, filepath.Join(independent, "go.mod"), "module example.com/independent\n\ngo 1.26.1\n")
+	writeTestFile(t, filepath.Join(independent, "independent.go"), "package independent\n\nfunc Value() int { return 1 }\n")
+
+	result, err := Scan(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Profile.Properties["go_packages_status"] != "partial" {
+		t.Fatalf("out-of-root workspace status = %q; diagnostics=%+v", result.Profile.Properties["go_packages_status"], result.Diagnostics)
+	}
+	typedCount, err := strconv.Atoi(result.Profile.Properties["go_packages_typed_packages"])
+	if err != nil || typedCount < 1 {
+		t.Fatalf("independent module types were lost: properties=%+v", result.Profile.Properties)
+	}
+	if !hasDiagnostic(result.Diagnostics, "go_packages_workspace_disabled") || result.Coverage.ProjectCodeExecuted {
+		t.Fatalf("out-of-root workspace fallback was not retained safely: coverage=%+v diagnostics=%+v", result.Coverage, result.Diagnostics)
+	}
+	for _, node := range result.Nodes {
+		if node.Kind == "workspace" {
+			if enabled, _ := node.Properties["go_work"].(bool); enabled {
+				t.Fatalf("untrusted go.work was promoted to workspace metadata: %+v", node)
+			}
+		}
 	}
 }
 
