@@ -157,6 +157,235 @@
         }
       ]
     },
+    "semantic_spanned_evidence": {
+      "allOf": [
+        { "$ref": "#/$defs/spanned_evidence" },
+        {
+          "type": "object",
+          "properties": {
+            "kind": { "const": "semantic" }
+          },
+          "required": ["kind"]
+        }
+      ]
+    },
+    "candidate_semantic_evidence": {
+      "allOf": [
+        { "$ref": "#/$defs/semantic_spanned_evidence" },
+        {
+          "type": "object",
+          "properties": {
+            "properties": {
+              "type": "object",
+              "properties": {
+                "algorithm": { "$ref": "#/$defs/non_empty_string" }
+              },
+              "required": ["algorithm"],
+              "additionalProperties": true
+            }
+          },
+          "required": ["properties"]
+        }
+      ]
+    },
+    "identity_span": {
+      "type": "object",
+      "properties": {
+        "start_line": { "type": "integer", "minimum": 1 },
+        "start_column": { "type": "integer", "minimum": 1 },
+        "end_line": { "type": "integer", "minimum": 1 },
+        "end_column": { "type": "integer", "minimum": 1 }
+      },
+      "required": ["start_line", "start_column", "end_line", "end_column"],
+      "additionalProperties": true
+    },
+    "semantic_identity_base": {
+      "type": "object",
+      "properties": {
+        "language": { "$ref": "#/$defs/non_empty_string" },
+        "package_locator": { "$ref": "#/$defs/non_empty_string" }
+      },
+      "required": ["language", "package_locator"],
+      "additionalProperties": true
+    },
+    "symbol_identity": {
+      "allOf": [
+        { "$ref": "#/$defs/semantic_identity_base" },
+        {
+          "type": "object",
+          "properties": {
+            "identity_kind": {
+              "enum": ["named", "local", "anonymous", "generated"]
+            },
+            "symbol_kind": { "$ref": "#/$defs/non_empty_string" },
+            "resolver_identity": { "$ref": "#/$defs/non_empty_string" },
+            "enclosing_symbol": { "$ref": "#/$defs/non_empty_string" },
+            "generated_from": { "$ref": "#/$defs/non_empty_string" },
+            "relative_path": { "$ref": "#/$defs/non_empty_string" },
+            "span": { "$ref": "#/$defs/identity_span" }
+          },
+          "required": ["identity_kind", "symbol_kind"],
+          "oneOf": [
+            {
+              "properties": { "identity_kind": { "const": "named" } },
+              "required": ["resolver_identity"]
+            },
+            {
+              "properties": {
+                "identity_kind": {
+                  "enum": ["local", "anonymous", "generated"]
+                }
+              },
+              "required": ["relative_path", "span"],
+              "anyOf": [
+                { "required": ["enclosing_symbol"] },
+                { "required": ["generated_from"] }
+              ]
+            }
+          ],
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "symbol_kind": {
+                    "anyOf": [
+                      { "pattern": "^local_" },
+                      { "const": "parameter" }
+                    ]
+                  }
+                },
+                "required": ["symbol_kind"]
+              },
+              "then": {
+                "properties": { "identity_kind": { "const": "local" } }
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "symbol_kind": {
+                    "anyOf": [
+                      { "pattern": "^anonymous_" },
+                      { "enum": ["closure", "lambda"] }
+                    ]
+                  }
+                },
+                "required": ["symbol_kind"]
+              },
+              "then": {
+                "properties": { "identity_kind": { "const": "anonymous" } }
+              }
+            },
+            {
+              "if": {
+                "properties": { "symbol_kind": { "pattern": "^generated_" } },
+                "required": ["symbol_kind"]
+              },
+              "then": {
+                "properties": { "identity_kind": { "const": "generated" } }
+              }
+            }
+          ],
+          "additionalProperties": true
+        }
+      ]
+    },
+    "type_identity": {
+      "allOf": [
+        { "$ref": "#/$defs/semantic_identity_base" },
+        {
+          "type": "object",
+          "properties": {
+            "type_kind": { "$ref": "#/$defs/non_empty_string" },
+            "resolver_identity": { "$ref": "#/$defs/non_empty_string" }
+          },
+          "required": ["type_kind", "resolver_identity"],
+          "additionalProperties": true
+        }
+      ]
+    },
+    "semantic_edge_base": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^edge:sha256:[0-9a-f]{64}$"
+        },
+        "site_id": {
+          "type": "string",
+          "pattern": "^site:sha256:[0-9a-f]{64}$"
+        },
+        "phase": { "const": "semantic" },
+        "evidence": {
+          "type": "array",
+          "minItems": 1,
+          "prefixItems": [
+            { "$ref": "#/$defs/semantic_spanned_evidence" }
+          ],
+          "items": { "$ref": "#/$defs/evidence" }
+        }
+      },
+      "required": ["site_id"]
+    },
+    "semantic_site_base": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^site:sha256:[0-9a-f]{64}$"
+        },
+        "evidence": {
+          "type": "array",
+          "minItems": 1,
+          "prefixItems": [
+            { "$ref": "#/$defs/semantic_spanned_evidence" }
+          ],
+          "items": { "$ref": "#/$defs/evidence" }
+        }
+      }
+    },
+    "semantic_resolution": {
+      "allOf": [
+        {
+          "if": {
+            "properties": { "resolution_status": { "const": "resolved" } },
+            "required": ["resolution_status"]
+          },
+          "then": {
+            "properties": { "precision": { "const": "exact" } }
+          }
+        },
+        {
+          "if": {
+            "properties": { "resolution_status": { "const": "candidates" } },
+            "required": ["resolution_status"]
+          },
+          "then": {
+            "properties": { "precision": { "const": "overapprox" } }
+          }
+        },
+        {
+          "if": {
+            "properties": { "resolution_status": { "const": "external" } },
+            "required": ["resolution_status"]
+          },
+          "then": {
+            "properties": {
+              "precision": { "enum": ["exact", "heuristic"] }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "resolution_status": { "const": "unresolved" } },
+            "required": ["resolution_status"]
+          },
+          "then": {
+            "properties": { "precision": { "const": "heuristic" } }
+          }
+        }
+      ]
+    },
     "node": {
       "type": "object",
       "properties": {
@@ -168,6 +397,67 @@
       },
       "required": ["id", "kind", "locator", "properties"],
       "additionalProperties": true
+    },
+    "semantic_node": {
+      "allOf": [
+        { "$ref": "#/$defs/node" },
+        {
+          "oneOf": [
+            {
+              "type": "object",
+              "properties": {
+                "kind": { "const": "symbol" },
+                "id": {
+                  "type": "string",
+                  "pattern": "^symbol:sha256:[0-9a-f]{64}$"
+                },
+                "properties": {
+                  "type": "object",
+                  "properties": {
+                    "language": { "$ref": "#/$defs/non_empty_string" },
+                    "package_locator": { "$ref": "#/$defs/non_empty_string" },
+                    "symbol_kind": { "$ref": "#/$defs/non_empty_string" },
+                    "canonical_identity": { "$ref": "#/$defs/symbol_identity" }
+                  },
+                  "required": [
+                    "language",
+                    "package_locator",
+                    "symbol_kind",
+                    "canonical_identity"
+                  ]
+                }
+              },
+              "required": ["kind"]
+            },
+            {
+              "type": "object",
+              "properties": {
+                "kind": { "const": "type" },
+                "id": {
+                  "type": "string",
+                  "pattern": "^type:sha256:[0-9a-f]{64}$"
+                },
+                "properties": {
+                  "type": "object",
+                  "properties": {
+                    "language": { "$ref": "#/$defs/non_empty_string" },
+                    "package_locator": { "$ref": "#/$defs/non_empty_string" },
+                    "type_kind": { "$ref": "#/$defs/non_empty_string" },
+                    "canonical_identity": { "$ref": "#/$defs/type_identity" }
+                  },
+                  "required": [
+                    "language",
+                    "package_locator",
+                    "type_kind",
+                    "canonical_identity"
+                  ]
+                }
+              },
+              "required": ["kind"]
+            }
+          ]
+        }
+      ]
     },
     "edge": {
       "type": "object",
@@ -223,6 +513,47 @@
       ],
       "additionalProperties": true
     },
+    "semantic_edge": {
+      "allOf": [
+        { "$ref": "#/$defs/edge" },
+        { "$ref": "#/$defs/semantic_edge_base" },
+        { "$ref": "#/$defs/semantic_resolution" },
+        {
+          "oneOf": [
+            {
+              "type": "object",
+              "properties": { "kind": { "const": "type_uses" } },
+              "required": ["kind"]
+            },
+            {
+              "type": "object",
+              "properties": {
+                "kind": { "const": "calls" },
+                "resolution_status": {
+                  "enum": ["resolved", "external", "unresolved"]
+                }
+              },
+              "required": ["kind"]
+            },
+            {
+              "type": "object",
+              "properties": {
+                "kind": { "const": "may_call" },
+                "resolution_status": { "const": "candidates" },
+                "precision": { "const": "overapprox" },
+                "evidence": {
+                  "type": "array",
+                  "prefixItems": [
+                    { "$ref": "#/$defs/candidate_semantic_evidence" }
+                  ]
+                }
+              },
+              "required": ["kind"]
+            }
+          ]
+        }
+      ]
+    },
     "dependency_site": {
       "type": "object",
       "properties": {
@@ -261,6 +592,64 @@
         "evidence"
       ],
       "additionalProperties": true
+    },
+    "semantic_site": {
+      "allOf": [
+        { "$ref": "#/$defs/dependency_site" },
+        { "$ref": "#/$defs/semantic_site_base" },
+        { "$ref": "#/$defs/semantic_resolution" },
+        {
+          "type": "object",
+          "properties": {
+            "kind": { "enum": ["call", "type_use"] },
+            "target_ids": { "type": "array", "minItems": 1 }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "resolution_status": {
+                "enum": ["resolved", "external", "unresolved"]
+              }
+            },
+            "required": ["resolution_status"]
+          },
+          "then": {
+            "properties": { "target_ids": { "maxItems": 1 } }
+          }
+        },
+        {
+          "if": {
+            "properties": { "resolution_status": { "const": "unresolved" } },
+            "required": ["resolution_status"]
+          },
+          "then": {
+            "properties": {
+              "reason": { "$ref": "#/$defs/non_empty_string" }
+            },
+            "required": ["reason"]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": { "const": "call" },
+              "resolution_status": { "const": "candidates" }
+            },
+            "required": ["kind", "resolution_status"]
+          },
+          "then": {
+            "properties": {
+              "evidence": {
+                "type": "array",
+                "prefixItems": [
+                  { "$ref": "#/$defs/candidate_semantic_evidence" }
+                ]
+              }
+            }
+          }
+        }
+      ]
     },
     "profile": {
       "type": "object",

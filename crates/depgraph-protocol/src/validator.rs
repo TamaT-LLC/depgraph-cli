@@ -1,7 +1,9 @@
 use crate::{
-    Condition, DependencySite, Diagnostic, Evidence, GraphEdge, GraphNode, PROTOCOL_VERSION, Phase,
-    Profile, ProtocolEvent, ResolutionStatus,
+    Condition, DependencySite, Diagnostic, Evidence, EvidenceKind, GraphEdge, GraphNode,
+    PROTOCOL_VERSION, Phase, Precision, Profile, ProtocolEvent, ResolutionStatus, canonical_json,
+    stable_id_from_value,
 };
+use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::BufRead;
 use std::path::{Component, Path, PathBuf};
@@ -547,6 +549,36 @@ pub fn validate_safe_ndjson(reader: impl BufRead) -> Result<ValidatedProtocol, P
     validate_ndjson_with(reader, ProtocolValidator::for_safe_scan())
 }
 
+/// Validates a protocol-v1 stream and then applies the opt-in Milestone 2
+/// semantic graph contract for symbol/type nodes and semantic dependencies.
+///
+/// The base protocol intentionally keeps node and edge kinds as an open
+/// vocabulary. Producers that emit the shared semantic graph vocabulary can
+/// call this stricter validator without narrowing protocol-v1 compatibility
+/// for other producers.
+pub fn validate_semantic_ndjson(reader: impl BufRead) -> Result<ValidatedProtocol, ProtocolError> {
+    let protocol = validate_ndjson(reader)?;
+    validate_semantic_contract(&protocol)?;
+    Ok(protocol)
+}
+
+/// Applies both safe static-scan validation and the opt-in Milestone 2
+/// semantic graph contract.
+pub fn validate_safe_semantic_ndjson(
+    reader: impl BufRead,
+) -> Result<ValidatedProtocol, ProtocolError> {
+    let protocol = validate_safe_ndjson(reader)?;
+    validate_semantic_contract(&protocol)?;
+    Ok(protocol)
+}
+
+/// Validates the opt-in Milestone 2 semantic graph contract on an already
+/// validated protocol stream.
+pub fn validate_semantic_contract(protocol: &ValidatedProtocol) -> Result<(), ProtocolError> {
+    validate_site_edge_maps(&protocol.nodes, &protocol.edges, &protocol.sites)?;
+    validate_semantic_maps(&protocol.nodes, &protocol.edges, &protocol.sites)
+}
+
 fn validate_ndjson_with(
     reader: impl BufRead,
     mut validator: ProtocolValidator,
@@ -759,6 +791,137 @@ fn validate_site_edge_maps(
     Ok(())
 }
 
+fn validate_semantic_maps(
+    nodes: &BTreeMap<String, GraphNode>,
+    edges: &BTreeMap<String, GraphEdge>,
+    sites: &BTreeMap<String, DependencySite>,
+) -> Result<(), ProtocolError> {
+    for node in nodes.values() {
+        validate_semantic_node(node)?;
+        if node.kind == "symbol"
+            && let Some(identity) = node.properties.get("canonical_identity")
+        {
+            for field in ["enclosing_symbol", "generated_from"] {
+                if let Some(origin) = identity.get(field).and_then(Value::as_str) {
+                    let origin_node = nodes.get(origin).ok_or_else(|| {
+                        ProtocolError::Invariant(format!(
+                            "symbol node {} canonical_identity.{field} references missing node {origin}",
+                            node.id
+                        ))
+                    })?;
+                    if field == "enclosing_symbol" && origin_node.kind != "symbol" {
+                        return invariant(format!(
+                            "symbol node {} canonical_identity.enclosing_symbol references non-symbol node {} of kind {}",
+                            node.id, origin_node.id, origin_node.kind
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    for edge in edges.values() {
+        validate_semantic_edge(edge)?;
+        if !matches!(edge.kind.as_str(), "type_uses" | "calls" | "may_call") {
+            continue;
+        }
+        let site_id = edge
+            .site_id
+            .as_deref()
+            .expect("semantic edge validation requires a site ID");
+        let site = sites
+            .get(site_id)
+            .expect("base validation requires referenced sites to exist");
+        let expected_site_kind = match edge.kind.as_str() {
+            "calls" | "may_call" => "call",
+            "type_uses" => "type_use",
+            _ => unreachable!("semantic edge kind matched above"),
+        };
+        if site.kind != expected_site_kind {
+            return invariant(format!(
+                "semantic edge {} of kind {} requires a {expected_site_kind} dependency site, found {}",
+                edge.id, edge.kind, site.kind
+            ));
+        }
+    }
+
+    for site in sites.values() {
+        validate_semantic_site(site)?;
+        if !matches!(site.kind.as_str(), "call" | "type_use") {
+            continue;
+        }
+        let source_node = nodes
+            .get(&site.source)
+            .expect("base validation requires dependency-site sources to exist");
+        match site.kind.as_str() {
+            "call" if source_node.kind != "symbol" => {
+                return invariant(format!(
+                    "semantic call site {} source {} must be a symbol node",
+                    site.id, source_node.id
+                ));
+            }
+            "type_use" if !matches!(source_node.kind.as_str(), "symbol" | "type") => {
+                return invariant(format!(
+                    "semantic type-use site {} source {} must be a symbol or type node",
+                    site.id, source_node.id
+                ));
+            }
+            _ => {}
+        }
+
+        if matches!(
+            site.resolution_status,
+            ResolutionStatus::Resolved | ResolutionStatus::Candidates
+        ) {
+            for target_id in &site.target_ids {
+                let target = nodes
+                    .get(target_id)
+                    .expect("base validation requires dependency-site targets to exist");
+                match site.kind.as_str() {
+                    "call" if target.kind != "symbol" => {
+                        return invariant(format!(
+                            "semantic call site {} concrete target {} must be a symbol node",
+                            site.id, target.id
+                        ));
+                    }
+                    "type_use" if target.kind != "type" => {
+                        return invariant(format!(
+                            "semantic type-use site {} concrete target {} must be a type node",
+                            site.id, target.id
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let expected_edge_kind = match site.kind.as_str() {
+            "call" if site.resolution_status == ResolutionStatus::Candidates => "may_call",
+            "call" => "calls",
+            "type_use" => "type_uses",
+            _ => unreachable!("semantic site kind matched above"),
+        };
+        for edge in edges
+            .values()
+            .filter(|edge| edge.site_id.as_deref() == Some(site.id.as_str()))
+        {
+            if edge.kind != expected_edge_kind {
+                return invariant(format!(
+                    "semantic dependency site {} requires {expected_edge_kind} edges, found {}",
+                    site.id, edge.kind
+                ));
+            }
+            if evidence_span_key(&site.evidence[0]) != evidence_span_key(&edge.evidence[0]) {
+                return invariant(format!(
+                    "semantic edge {} primary span does not match dependency site {}",
+                    edge.id, site.id
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn is_payload_event(event: &ProtocolEvent) -> bool {
     matches!(
         event,
@@ -820,6 +983,378 @@ fn validate_site(site: &DependencySite) -> Result<(), ProtocolError> {
     validate_dependency_evidence("dependency_site", &site.evidence, true)
 }
 
+fn validate_semantic_node(node: &GraphNode) -> Result<(), ProtocolError> {
+    let kind_property = match node.kind.as_str() {
+        "symbol" => "symbol_kind",
+        "type" => "type_kind",
+        _ => return Ok(()),
+    };
+    let language = required_node_property(node, "language")?;
+    let package_locator = required_node_property(node, "package_locator")?;
+    let semantic_kind = required_node_property(node, kind_property)?;
+    let identity = node.properties.get("canonical_identity").ok_or_else(|| {
+        ProtocolError::Invariant(format!(
+            "{} node {} must include properties.canonical_identity",
+            node.kind, node.id
+        ))
+    })?;
+    if !identity.is_object() {
+        return invariant(format!(
+            "{} node {} canonical_identity must be an object",
+            node.kind, node.id
+        ));
+    }
+    for (field, expected) in [
+        ("language", language),
+        ("package_locator", package_locator),
+        (kind_property, semantic_kind),
+    ] {
+        let found = required_identity_string(identity, field, &node.id)?;
+        if found != expected {
+            return invariant(format!(
+                "{} node {} property {field}={expected:?} disagrees with canonical_identity value {found:?}",
+                node.kind, node.id
+            ));
+        }
+    }
+
+    match node.kind.as_str() {
+        "symbol" => validate_symbol_identity(identity, &node.id)?,
+        "type" => {
+            required_identity_string(identity, "resolver_identity", &node.id)?;
+        }
+        _ => unreachable!("semantic node kind matched above"),
+    }
+
+    let expected_id = stable_id_from_value(&node.kind, identity);
+    if node.id != expected_id {
+        return invariant(format!(
+            "{} node {} does not match its canonical identity; expected {}",
+            node.kind, node.id, expected_id
+        ));
+    }
+    Ok(())
+}
+
+fn required_node_property<'a>(node: &'a GraphNode, field: &str) -> Result<&'a str, ProtocolError> {
+    node.properties
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            ProtocolError::Invariant(format!(
+                "{} node {} must include non-empty properties.{field}",
+                node.kind, node.id
+            ))
+        })
+}
+
+fn required_identity_string<'a>(
+    identity: &'a Value,
+    field: &str,
+    node_id: &str,
+) -> Result<&'a str, ProtocolError> {
+    identity
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            ProtocolError::Invariant(format!(
+                "semantic node {node_id} canonical_identity.{field} must be a non-empty string"
+            ))
+        })
+}
+
+fn validate_symbol_identity(identity: &Value, node_id: &str) -> Result<(), ProtocolError> {
+    let identity_kind = required_identity_string(identity, "identity_kind", node_id)?;
+    let symbol_kind = required_identity_string(identity, "symbol_kind", node_id)?;
+    if let Some(expected) = reserved_symbol_identity_kind(symbol_kind)
+        && identity_kind != expected
+    {
+        return invariant(format!(
+            "symbol node {node_id} symbol_kind {symbol_kind:?} requires canonical_identity.identity_kind={expected:?}"
+        ));
+    }
+
+    match identity_kind {
+        "named" => {
+            required_identity_string(identity, "resolver_identity", node_id)?;
+            return Ok(());
+        }
+        "local" | "anonymous" | "generated" => {}
+        other => {
+            return invariant(format!(
+                "symbol node {node_id} canonical_identity.identity_kind has unsupported value {other:?}"
+            ));
+        }
+    }
+
+    let has_origin = ["enclosing_symbol", "generated_from"].iter().any(|field| {
+        identity
+            .get(*field)
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.is_empty())
+    });
+    if !has_origin {
+        return invariant(format!(
+            "{identity_kind} symbol node {node_id} canonical_identity must include enclosing_symbol or generated_from"
+        ));
+    }
+    let relative_path = required_identity_string(identity, "relative_path", node_id)?;
+    validate_canonical_relative_path("symbol canonical_identity.relative_path", relative_path)?;
+    let span = identity.get("span").ok_or_else(|| {
+        ProtocolError::Invariant(format!(
+            "symbol node {node_id} local canonical_identity must include span"
+        ))
+    })?;
+    validate_identity_span(span, node_id)
+}
+
+fn reserved_symbol_identity_kind(symbol_kind: &str) -> Option<&'static str> {
+    if symbol_kind.starts_with("local_") || symbol_kind == "parameter" {
+        Some("local")
+    } else if symbol_kind.starts_with("anonymous_") || matches!(symbol_kind, "closure" | "lambda") {
+        Some("anonymous")
+    } else if symbol_kind.starts_with("generated_") {
+        Some("generated")
+    } else {
+        None
+    }
+}
+
+fn validate_identity_span(span: &Value, node_id: &str) -> Result<(), ProtocolError> {
+    let coordinate = |field: &str| -> Result<u32, ProtocolError> {
+        let value = span.get(field).and_then(Value::as_u64).ok_or_else(|| {
+            ProtocolError::Invariant(format!(
+                "symbol node {node_id} canonical_identity.span.{field} must be a positive integer"
+            ))
+        })?;
+        let value = u32::try_from(value).map_err(|_| {
+            ProtocolError::Invariant(format!(
+                "symbol node {node_id} canonical_identity.span.{field} exceeds u32"
+            ))
+        })?;
+        if value == 0 {
+            return invariant(format!(
+                "symbol node {node_id} canonical_identity.span.{field} must be at least 1"
+            ));
+        }
+        Ok(value)
+    };
+    let start = (coordinate("start_line")?, coordinate("start_column")?);
+    let end = (coordinate("end_line")?, coordinate("end_column")?);
+    if end < start {
+        return invariant(format!(
+            "symbol node {node_id} canonical identity span end precedes start"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_semantic_edge(edge: &GraphEdge) -> Result<(), ProtocolError> {
+    if !matches!(edge.kind.as_str(), "type_uses" | "calls" | "may_call") {
+        return Ok(());
+    }
+    if edge.phase != Phase::Semantic {
+        return invariant(format!(
+            "semantic edge {} of kind {} must use phase=semantic",
+            edge.id, edge.kind
+        ));
+    }
+    let site_id = edge.site_id.as_deref().ok_or_else(|| {
+        ProtocolError::Invariant(format!(
+            "semantic edge {} of kind {} must reference a dependency site",
+            edge.id, edge.kind
+        ))
+    })?;
+    let primary =
+        validate_primary_semantic_evidence(&format!("semantic edge {}", edge.id), &edge.evidence)?;
+    validate_semantic_resolution(
+        &format!("semantic edge {}", edge.id),
+        edge.resolution_status,
+        edge.precision,
+    )?;
+    match edge.kind.as_str() {
+        "calls" if edge.resolution_status == ResolutionStatus::Candidates => {
+            return invariant(format!(
+                "direct calls edge {} cannot use candidates; emit may_call edges",
+                edge.id
+            ));
+        }
+        "may_call"
+            if edge.resolution_status != ResolutionStatus::Candidates
+                || edge.precision != Precision::Overapprox =>
+        {
+            return invariant(format!(
+                "may_call edge {} must use candidates/overapprox",
+                edge.id
+            ));
+        }
+        "may_call" => {
+            validate_candidate_algorithm(&format!("may_call edge {}", edge.id), primary)?;
+        }
+        _ => {}
+    }
+    let expected_id = stable_id_from_value(
+        "edge",
+        &json!({
+            "kind": edge.kind,
+            "site_id": site_id,
+            "target": edge.target,
+        }),
+    );
+    if edge.id != expected_id {
+        return invariant(format!(
+            "semantic edge {} does not match its canonical identity; expected {}",
+            edge.id, expected_id
+        ));
+    }
+    Ok(())
+}
+
+fn validate_semantic_site(site: &DependencySite) -> Result<(), ProtocolError> {
+    if !matches!(site.kind.as_str(), "call" | "type_use") {
+        return Ok(());
+    }
+    let primary = validate_primary_semantic_evidence(
+        &format!("semantic dependency site {}", site.id),
+        &site.evidence,
+    )?;
+    validate_semantic_resolution(
+        &format!("semantic dependency site {}", site.id),
+        site.resolution_status,
+        site.precision,
+    )?;
+    if site.kind == "call" && site.resolution_status == ResolutionStatus::Candidates {
+        validate_candidate_algorithm(&format!("candidate call site {}", site.id), primary)?;
+    }
+    if site.target_ids.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return invariant(format!(
+            "semantic dependency site {} target IDs must be unique and sorted",
+            site.id
+        ));
+    }
+    if site.resolution_status == ResolutionStatus::Unresolved && site.reason.is_none() {
+        return invariant(format!(
+            "unresolved semantic dependency site {} must include a reason",
+            site.id
+        ));
+    }
+
+    let path = primary
+        .path
+        .as_deref()
+        .expect("primary semantic evidence has a complete span");
+    let expected_id = stable_id_from_value(
+        "site",
+        &json!({
+            "condition": site.condition.canonicalized(),
+            "kind": site.kind,
+            "path": path,
+            "profile_id": site.profile_id,
+            "source": site.source,
+            "span": {
+                "end_column": primary.end_column.expect("complete span"),
+                "end_line": primary.end_line.expect("complete span"),
+                "start_column": primary.start_column.expect("complete span"),
+                "start_line": primary.start_line.expect("complete span"),
+            }
+        }),
+    );
+    if site.id != expected_id {
+        return invariant(format!(
+            "semantic dependency site {} does not match its canonical identity; expected {}",
+            site.id, expected_id
+        ));
+    }
+    Ok(())
+}
+
+fn validate_primary_semantic_evidence<'a>(
+    owner: &str,
+    evidence: &'a [Evidence],
+) -> Result<&'a Evidence, ProtocolError> {
+    let primary = evidence.first().ok_or_else(|| {
+        ProtocolError::Invariant(format!("{owner} must include primary semantic evidence"))
+    })?;
+    if primary.kind != EvidenceKind::Semantic || !has_complete_span(primary) {
+        return invariant(format!(
+            "{owner} evidence[0] must be semantic evidence with a complete source span"
+        ));
+    }
+    validate_canonical_relative_path(
+        &format!("{owner} primary evidence path"),
+        primary
+            .path
+            .as_deref()
+            .expect("complete span includes path"),
+    )?;
+
+    let supporting_keys: Vec<_> = evidence[1..]
+        .iter()
+        .map(|item| {
+            let value = serde_json::to_value(item).expect("Evidence is always serializable");
+            canonical_json(&value)
+        })
+        .collect();
+    if supporting_keys.windows(2).any(|pair| pair[0] > pair[1]) {
+        return invariant(format!(
+            "{owner} supporting evidence must be in canonical JSON order"
+        ));
+    }
+    Ok(primary)
+}
+
+fn validate_candidate_algorithm(owner: &str, primary: &Evidence) -> Result<(), ProtocolError> {
+    if primary
+        .properties
+        .get("algorithm")
+        .and_then(Value::as_str)
+        .is_none_or(|algorithm| algorithm.is_empty())
+    {
+        return invariant(format!(
+            "{owner} primary evidence must include a non-empty properties.algorithm"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_semantic_resolution(
+    owner: &str,
+    status: ResolutionStatus,
+    precision: Precision,
+) -> Result<(), ProtocolError> {
+    let valid = match status {
+        ResolutionStatus::Resolved => precision == Precision::Exact,
+        ResolutionStatus::Candidates => precision == Precision::Overapprox,
+        ResolutionStatus::External => matches!(precision, Precision::Exact | Precision::Heuristic),
+        ResolutionStatus::Unresolved => precision == Precision::Heuristic,
+    };
+    if !valid {
+        return invariant(format!(
+            "{owner} has invalid semantic resolution/precision combination {status:?}/{precision:?}"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_canonical_relative_path(owner: &str, path: &str) -> Result<(), ProtocolError> {
+    let has_drive_prefix = path.as_bytes().get(1) == Some(&b':');
+    if path.is_empty()
+        || path.starts_with('/')
+        || path.contains('\\')
+        || has_drive_prefix
+        || path
+            .split('/')
+            .any(|component| component.is_empty() || matches!(component, "." | ".."))
+    {
+        return invariant(format!(
+            "{owner} must be a normalized repository-relative path, found {path:?}"
+        ));
+    }
+    Ok(())
+}
+
 fn validate_dependency_evidence(
     owner: &str,
     evidence: &[Evidence],
@@ -843,6 +1378,27 @@ fn has_complete_span(evidence: &Evidence) -> bool {
         && evidence.start_column.is_some()
         && evidence.end_line.is_some()
         && evidence.end_column.is_some()
+}
+
+fn evidence_span_key(evidence: &Evidence) -> (&str, u32, u32, u32, u32) {
+    (
+        evidence
+            .path
+            .as_deref()
+            .expect("semantic primary evidence has a path"),
+        evidence
+            .start_line
+            .expect("semantic primary evidence has a start line"),
+        evidence
+            .start_column
+            .expect("semantic primary evidence has a start column"),
+        evidence
+            .end_line
+            .expect("semantic primary evidence has an end line"),
+        evidence
+            .end_column
+            .expect("semantic primary evidence has an end column"),
+    )
 }
 
 fn validate_diagnostic(diagnostic: &Diagnostic) -> Result<(), ProtocolError> {

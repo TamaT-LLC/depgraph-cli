@@ -23,7 +23,8 @@ pub use model::{
 pub use stable_id::{StableIdInput, canonical_json, stable_id, stable_id_from_value};
 pub use validator::{
     MAX_EVENT_LINE_BYTES, ProtocolError, ProtocolValidator, ValidatedProtocol, ValidationPolicy,
-    validate_ndjson, validate_safe_ndjson, validate_site_edge_invariants,
+    validate_ndjson, validate_safe_ndjson, validate_safe_semantic_ndjson,
+    validate_semantic_contract, validate_semantic_ndjson, validate_site_edge_invariants,
 };
 
 /// The only protocol version accepted by this crate.
