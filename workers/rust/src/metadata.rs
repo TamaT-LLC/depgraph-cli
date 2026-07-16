@@ -386,13 +386,8 @@ pub(crate) fn run_cargo_metadata(root: &Path, manifest_path: &Path) -> Result<Ca
         // Cargo and rustup discover .cargo/config.toml and rust-toolchain.toml
         // by walking upward from cwd. The manifest path is absolute, so use a
         // neutral cwd and never expose project configuration to the toolchain.
-        .current_dir(neutral.path())
-        .env_clear()
-        .env("CARGO_NET_OFFLINE", "true")
-        .env("CARGO_TERM_COLOR", "never")
-        .env("RUSTC", "rustc")
-        .env("RUSTC_WRAPPER", "")
-        .env("RUSTC_WORKSPACE_WRAPPER", "");
+        .current_dir(neutral.path());
+    configure_cargo_safety_environment(&mut command);
     let safe_path = sanitized_path(root)?;
     command.env("PATH", safe_path);
     configure_path_environment(&mut command, root, neutral.path())?;
@@ -413,6 +408,19 @@ pub(crate) fn run_cargo_metadata(root: &Path, manifest_path: &Path) -> Result<Ca
         bail!("cargo metadata exited unsuccessfully");
     }
     serde_json::from_slice(&output.stdout).context("decode cargo metadata JSON DTO")
+}
+
+fn configure_cargo_safety_environment(command: &mut Command) {
+    command
+        .env_clear()
+        .env("CARGO_NET_OFFLINE", "true")
+        .env("CARGO_TERM_COLOR", "never")
+        // The resolved `cargo` can be a rustup proxy. Cargo's offline flag does
+        // not prevent rustup from downloading an absent active toolchain.
+        .env("RUSTUP_AUTO_INSTALL", "0")
+        .env("RUSTC", "rustc")
+        .env("RUSTC_WRAPPER", "")
+        .env("RUSTC_WORKSPACE_WRAPPER", "");
 }
 
 fn neutral_environment(root: &Path) -> Result<TempDir> {
@@ -529,11 +537,26 @@ pub(crate) fn apply_lock_versions(packages: &mut [Package], lock: &LockIndex) {
 
 #[cfg(test)]
 mod tests {
-    use super::{CargoMetadata, LockIndex, neutral_environment, safe_external_directory};
+    use super::{
+        CargoMetadata, LockIndex, configure_cargo_safety_environment, neutral_environment,
+        safe_external_directory,
+    };
     use crate::manifest::ManifestDocument;
     use depgraph_protocol::Condition;
     use serde_json::{Value, json};
-    use std::path::Path;
+    use std::{ffi::OsStr, path::Path, process::Command};
+
+    #[test]
+    fn cargo_metadata_disables_rustup_auto_install() {
+        let mut command = Command::new("cargo");
+        configure_cargo_safety_environment(&mut command);
+
+        let auto_install = command
+            .get_envs()
+            .find(|(key, _)| *key == OsStr::new("RUSTUP_AUTO_INSTALL"))
+            .and_then(|(_, value)| value);
+        assert_eq!(auto_install, Some(OsStr::new("0")));
+    }
 
     #[test]
     fn metadata_environment_rejects_relative_and_repository_directories() {

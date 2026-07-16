@@ -1,5 +1,5 @@
 use crate::{
-    ADAPTER_VERSION, EXTRACTOR,
+    ADAPTER_VERSION, EXTRACTOR, RUST_HIR_INTEGRATION_POLICY, RUST_TOOLCHAIN_BASELINE,
     manifest::{
         Dependency, ManifestDocument, Package, expanded_features, normalize_path, parse_packages,
         select_static_documents, slash_path, workspace_identity,
@@ -146,13 +146,13 @@ pub fn scan(root: &Path) -> Result<ScanResult> {
     let mut state = State::new(root.clone(), repository_identity, profile);
 
     if let Some((path, declared)) = declared_rust_toolchain(&root)
-        && declared != "1.93.1"
+        && declared != RUST_TOOLCHAIN_BASELINE
     {
         state.add_diagnostic(
             DiagnosticSeverity::Info,
             "RUST_TOOLCHAIN_BEST_EFFORT",
             &format!(
-                "repository declares Rust {declared} rather than the verified 1.93.1 baseline; static analysis continues on a best-effort basis"
+                "repository declares Rust {declared} rather than the verified {RUST_TOOLCHAIN_BASELINE} baseline; static analysis continues on a best-effort basis"
             ),
             Some(&path),
             None,
@@ -1835,13 +1835,25 @@ fn rust_profile(packages: &[Package]) -> Profile {
         source_revision: None,
         properties: properties(json!({
             "analysis": "syntax",
+            "analysis_backend": "static-syntax",
+            "rust_hir_backend": "disabled",
+            "rust_hir_status": "not-invoked",
+            "rust_hir_integration_policy": RUST_HIR_INTEGRATION_POLICY,
+            "rust_analyzer_revision": "not-bundled",
+            "rust_toolchain_baseline": RUST_TOOLCHAIN_BASELINE,
+            "crate_graph_source_policy": "cargo-metadata-or-static-manifest",
+            "syntax_fallback": "enabled",
             "effective_target": selected_target,
             "host_target": host_target,
             "requested_features": selection.rust_features,
             "expanded_features": expanded_profile_features,
             "configured_targets": selection.rust_targets,
             "build_scripts_executed": false,
-            "proc_macros_executed": false
+            "proc_macros_executed": false,
+            "build_script_policy": "disabled",
+            "proc_macro_policy": "disabled",
+            "project_code_executed": false,
+            "project_toolchain_executed": false
         })),
     }
 }
@@ -2327,6 +2339,19 @@ mod tests {
                 .diagnostics
                 .iter()
                 .any(|diagnostic| diagnostic.code == "RUST_TOOLCHAIN_BEST_EFFORT")
+        );
+        assert_eq!(
+            result.profile.properties["rust_toolchain_baseline"],
+            RUST_TOOLCHAIN_BASELINE
+        );
+        assert_eq!(
+            result.profile.properties["rust_hir_integration_policy"],
+            RUST_HIR_INTEGRATION_POLICY
+        );
+        assert_eq!(result.profile.properties["project_code_executed"], false);
+        assert_eq!(
+            result.profile.properties["project_toolchain_executed"],
+            false
         );
     }
 

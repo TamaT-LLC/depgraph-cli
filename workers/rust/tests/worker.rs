@@ -1,5 +1,6 @@
 use depgraph_protocol::{
-    EvidenceKind, Phase, Precision, ProtocolEvent, ResolutionStatus, validate_ndjson,
+    CompletenessLevel, EvidenceKind, Phase, Precision, ProtocolEvent, ResolutionStatus,
+    validate_ndjson,
 };
 use depgraph_rust_worker::{ADAPTER_VERSION, build_events, scan};
 use std::{
@@ -161,6 +162,65 @@ fn armed_security_fixture_proves_safe_scan_does_not_execute_project_code() {
         );
     }
     assert!(!result.coverage.project_code_executed);
+    assert_eq!(result.profile.properties["rust_hir_backend"], "disabled");
+    assert_eq!(result.profile.properties["rust_hir_status"], "not-invoked");
+    assert_eq!(result.profile.properties["build_script_policy"], "disabled");
+    assert_eq!(result.profile.properties["proc_macro_policy"], "disabled");
+    assert_eq!(result.profile.properties["project_code_executed"], false);
+    assert_eq!(
+        result.profile.properties["project_toolchain_executed"],
+        false
+    );
+    for (site_kind, diagnostic_code, coverage_reason) in [
+        (
+            "build_script_execution",
+            "BUILD_SCRIPT_NOT_EXECUTED",
+            "build-script-not-executed",
+        ),
+        (
+            "proc_macro_execution",
+            "PROC_MACRO_NOT_EXECUTED",
+            "proc-macro-not-executed",
+        ),
+    ] {
+        let site = result
+            .sites
+            .iter()
+            .find(|site| site.kind == site_kind)
+            .unwrap_or_else(|| panic!("missing {site_kind} site"));
+        assert_eq!(site.resolution_status, ResolutionStatus::Unresolved);
+        assert!(
+            site.reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("does not execute"))
+        );
+        assert!(!site.target_ids.is_empty());
+        assert!(site.target_ids.iter().all(|target| {
+            result
+                .nodes
+                .iter()
+                .any(|node| node.id == *target && node.kind == "unknown_target")
+        }));
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == diagnostic_code)
+        );
+        assert!(
+            result
+                .coverage
+                .reasons
+                .iter()
+                .any(|reason| reason == coverage_reason)
+        );
+    }
+    assert!(
+        !result
+            .coverage
+            .completeness
+            .contains(&CompletenessLevel::SemanticComplete)
+    );
 
     let armed_copy = temp.path().join("armed");
     copy_tree(&security_fixture(), &armed_copy);
@@ -183,6 +243,92 @@ fn armed_security_fixture_proves_safe_scan_does_not_execute_project_code() {
             "fixture did not arm {marker}"
         );
     }
+}
+
+#[test]
+fn missing_cargo_preserves_static_syntax_graph_without_semantic_completeness() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("simple-crate");
+    let empty_path = temp.path().join("empty-path");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::create_dir_all(&empty_path).unwrap();
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname='simple-crate'\nversion='0.1.0'\nedition='2024'\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        "pub mod model;\npub use model::Thing;\n",
+    )
+    .unwrap();
+    fs::write(root.join("src/model.rs"), "pub struct Thing;\n").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_depgraph-rust-worker"))
+        .arg("--root")
+        .arg(&root)
+        .arg("--scan-id")
+        .arg("missing-cargo-fallback")
+        .env("PATH", &empty_path)
+        .env_remove("DEPGRAPH_PROFILE_CONFIG")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "fallback worker failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let validated = validate_ndjson(Cursor::new(output.stdout)).unwrap();
+    assert!(
+        validated
+            .diagnostics
+            .values()
+            .any(|diagnostic| diagnostic.code == "CARGO_METADATA_FALLBACK")
+    );
+    let profile = validated.profiles.values().next().unwrap();
+    assert_eq!(profile.properties["analysis_backend"], "static-syntax");
+    assert_eq!(profile.properties["rust_hir_backend"], "disabled");
+    assert_eq!(profile.properties["rust_hir_status"], "not-invoked");
+    assert_eq!(profile.properties["syntax_fallback"], "enabled");
+    assert!(validated.nodes.values().any(|node| node.kind == "module"));
+    assert!(validated.sites.values().any(|site| {
+        site.kind == "rust_reexport"
+            && site.specifier == "model::Thing"
+            && site.resolution_status == ResolutionStatus::Resolved
+    }));
+    assert!(
+        validated
+            .edges
+            .values()
+            .all(|edge| edge.phase == Phase::Source)
+    );
+
+    let coverage = validated
+        .events
+        .iter()
+        .find_map(|event| match event {
+            ProtocolEvent::ScanCompleted(completed) => Some(&completed.coverage),
+            _ => None,
+        })
+        .expect("scan coverage");
+    assert!(!coverage.project_code_executed);
+    assert!(
+        coverage
+            .reasons
+            .iter()
+            .any(|reason| reason == "cargo-metadata-fallback")
+    );
+    assert!(
+        coverage
+            .completeness
+            .contains(&CompletenessLevel::SyntaxComplete)
+    );
+    assert!(
+        !coverage
+            .completeness
+            .contains(&CompletenessLevel::SemanticComplete)
+    );
 }
 
 #[test]
@@ -360,6 +506,27 @@ fn default_rust_profile_has_stable_hashed_host_identity() {
     assert!(!target.is_empty());
     assert_eq!(first.environment["rust.host_target"], target);
     assert_eq!(first.properties["effective_target"], target);
+    assert_eq!(first.properties["analysis"], "syntax");
+    assert_eq!(first.properties["analysis_backend"], "static-syntax");
+    assert_eq!(first.properties["rust_hir_backend"], "disabled");
+    assert_eq!(first.properties["rust_hir_status"], "not-invoked");
+    assert_eq!(
+        first.properties["rust_hir_integration_policy"],
+        "pinned-rust-analyzer-library"
+    );
+    assert_eq!(first.properties["rust_analyzer_revision"], "not-bundled");
+    assert_eq!(first.properties["rust_toolchain_baseline"], "1.93.1");
+    assert_eq!(
+        first.properties["crate_graph_source_policy"],
+        "cargo-metadata-or-static-manifest"
+    );
+    assert_eq!(first.properties["syntax_fallback"], "enabled");
+    assert_eq!(first.properties["build_script_policy"], "disabled");
+    assert_eq!(first.properties["proc_macro_policy"], "disabled");
+    assert_eq!(first.properties["project_code_executed"], false);
+    assert_eq!(first.properties["project_toolchain_executed"], false);
+    assert_eq!(first.properties["build_scripts_executed"], false);
+    assert_eq!(first.properties["proc_macros_executed"], false);
 }
 
 #[test]
