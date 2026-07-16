@@ -464,18 +464,30 @@ fn verify_fallback_safety(runner: &Runner<'_>, temp: &Path, fixture: &Path) -> R
         .map(fs::read)
         .collect::<std::io::Result<Vec<_>>>()?;
 
-    let partial_store = temp.join("partial-fallback.db");
-    let partial_scan = runner.scan(&partial_store, fixture)?;
-    assert_fallback_result(runner, &partial_store, &partial_scan, "partial")?;
+    let default_path_store = temp.join("default-path-fallback.db");
+    let default_path_scan = runner.scan(&default_path_store, fixture)?;
+    assert_parser_fallback_scan(
+        runner,
+        &default_path_store,
+        &default_path_scan,
+        "default-PATH",
+        expected_default_path_go_packages_status(cfg!(target_os = "windows")),
+    )?;
 
     let empty_path = temp.join("empty-path");
     fs::create_dir_all(&empty_path)?;
     let empty_path = empty_path
         .canonicalize()
         .context("failed to canonicalize the empty fallback PATH")?;
-    let full_store = temp.join("full-fallback.db");
-    let full_scan = runner.scan_with_path(&full_store, fixture, &empty_path)?;
-    assert_fallback_result(runner, &full_store, &full_scan, "fallback")?;
+    let empty_path_store = temp.join("empty-path-fallback.db");
+    let empty_path_scan = runner.scan_with_path(&empty_path_store, fixture, &empty_path)?;
+    assert_parser_fallback_scan(
+        runner,
+        &empty_path_store,
+        &empty_path_scan,
+        "empty-PATH",
+        "fallback",
+    )?;
 
     for (path, original) in protected_paths.iter().zip(before) {
         ensure!(
@@ -494,33 +506,45 @@ fn verify_fallback_safety(runner: &Runner<'_>, temp: &Path, fixture: &Path) -> R
     Ok(())
 }
 
-fn assert_fallback_result(
+fn expected_default_path_go_packages_status(target_is_windows: bool) -> &'static str {
+    // This armed workspace retains independent typed modules on Unix. The
+    // Windows go/packages load has no active typed packages, so its safe,
+    // deterministic result is a full parser fallback instead.
+    if target_is_windows {
+        "fallback"
+    } else {
+        "partial"
+    }
+}
+
+fn assert_parser_fallback_scan(
     runner: &Runner<'_>,
     store: &Path,
     scan: &Value,
+    scenario: &str,
     expected_status: &str,
 ) -> Result<()> {
     ensure!(
         scan["status"] == "completed"
             && scan["exit_code"] == 0
             && scan["coverage"]["project_code_executed"] == false,
-        "{expected_status} fallback scan failed its safe completion contract: {scan}"
+        "{scenario} parser-fallback scan failed its safe completion contract: {scan}"
     );
     ensure!(
         string_array_contains(&scan["coverage"]["completeness"], "syntax-complete")
             && !string_array_contains(&scan["coverage"]["completeness"], "semantic-complete")
             && string_array_contains(&scan["coverage"]["reasons"], "go-packages-parser-fallback"),
-        "{expected_status} fallback scan lost its explicit completeness/reason ledger: {scan}"
+        "{scenario} parser-fallback scan lost its explicit completeness/reason ledger: {scan}"
     );
 
     let exported = runner.export_json(store)?;
     ensure!(
         scan["coverage"] == exported["graph"]["coverage"],
-        "{expected_status} fallback scan and export coverage disagree"
+        "{scenario} parser-fallback scan and export coverage disagree"
     );
     let graph = exported
         .get("graph")
-        .with_context(|| format!("{expected_status} fallback JSON export has no graph"))?;
+        .with_context(|| format!("{scenario} parser-fallback JSON export has no graph"))?;
     assert_ledger(graph)?;
     ensure!(
         !graph_array(graph, "nodes")?.is_empty()
@@ -528,7 +552,7 @@ fn assert_fallback_result(
             && graph["coverage"]["dependency_sites"]
                 .as_u64()
                 .is_some_and(|count| count > 0),
-        "{expected_status} fallback returned an empty parser graph: {graph}"
+        "{scenario} parser fallback returned an empty parser graph: {graph}"
     );
     if expected_status == "fallback" {
         ensure!(
@@ -538,17 +562,17 @@ fn assert_fallback_result(
                 && graph_array(graph, "edges")?
                     .iter()
                     .all(|edge| edge["phase"] != "semantic"),
-            "full parser fallback unexpectedly retained semantic nodes or edges: {graph}"
+            "{scenario} full parser fallback unexpectedly retained semantic nodes or edges: {graph}"
         );
     }
     let go_profile = graph_array(graph, "profiles")?
         .iter()
         .find(|profile| profile["language"] == "go")
-        .with_context(|| format!("{expected_status} fallback export has no Go profile"))?;
+        .with_context(|| format!("{scenario} parser-fallback export has no Go profile"))?;
     ensure!(
         go_profile["properties"]["go_packages_status"] == expected_status
             && go_profile["coverage"]["project_code_executed"] == false,
-        "fallback Go profile lost {expected_status}/safety metadata: {go_profile}"
+        "{scenario} Go profile lost expected {expected_status}/safety metadata: {go_profile}"
     );
     Ok(())
 }
@@ -1130,5 +1154,16 @@ fn executable_name(name: &str) -> String {
         format!("{name}.exe")
     } else {
         name.to_owned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::expected_default_path_go_packages_status;
+
+    #[test]
+    fn default_path_go_packages_status_is_platform_specific() {
+        assert_eq!(expected_default_path_go_packages_status(false), "partial");
+        assert_eq!(expected_default_path_go_packages_status(true), "fallback");
     }
 }
