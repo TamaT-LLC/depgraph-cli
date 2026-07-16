@@ -5,6 +5,7 @@ import (
 	"go/ast"
 	"go/types"
 	"path/filepath"
+	"sort"
 	"strings"
 )
 
@@ -21,6 +22,18 @@ type goSemanticCallTarget struct {
 	reason    string
 	dispatch  string
 	callKind  string
+}
+
+type goSemanticPendingCall struct {
+	context   *goSemanticPackage
+	file      goTypedFile
+	call      *ast.CallExpr
+	callerID  string
+	target    goSemanticCallTarget
+	specifier string
+	condition Condition
+	evidence  []Evidence
+	generated bool
 }
 
 func (p *goSemanticPackage) emitCalls() {
@@ -56,6 +69,14 @@ func (p *goSemanticPackage) emitCalls() {
 			}
 			evidence := p.evidence(file, call, specifier, properties)
 			if target.status == "unresolved" {
+				if target.reason == "interface_dispatch" || target.reason == "function_value_dispatch" {
+					p.extractor.pendingCalls = append(p.extractor.pendingCalls, goSemanticPendingCall{
+						context: p, file: file, call: call, callerID: callerID, target: target,
+						specifier: specifier, condition: p.condition(file.Path), evidence: evidence,
+						generated: p.generated(file.Path),
+					})
+					return true
+				}
 				p.extractor.failCall(file.Path, specifier, target.reason, evidence)
 			}
 			p.extractor.addCall(
@@ -222,6 +243,21 @@ func (e *goSemanticExtractor) registerSymbolOrigin(nodeID string, pkg goTypedPac
 		}
 	}
 	e.symbolOrigins[nodeID] = append(e.symbolOrigins[nodeID], origin)
+}
+
+func (e *goSemanticExtractor) inheritSymbolOrigins(nodeID, originNodeID string) {
+	for _, origin := range e.symbolOrigins[originNodeID] {
+		duplicate := false
+		for _, existing := range e.symbolOrigins[nodeID] {
+			if existing == origin {
+				duplicate = true
+				break
+			}
+		}
+		if !duplicate {
+			e.symbolOrigins[nodeID] = append(e.symbolOrigins[nodeID], origin)
+		}
+	}
 }
 
 func (p *goSemanticPackage) visibleSymbolNode(resolver, importPath string) string {
@@ -455,6 +491,79 @@ func (e *goSemanticExtractor) addCall(
 		return
 	}
 	e.state.edges[edge.ID] = edge
+}
+
+func (e *goSemanticExtractor) addCandidateCall(pending goSemanticPendingCall, targetIDs []string, evidence []Evidence) bool {
+	if pending.callerID == "" || len(targetIDs) == 0 || len(evidence) == 0 {
+		return false
+	}
+	targetSet := make(map[string]bool, len(targetIDs))
+	for _, targetID := range targetIDs {
+		if targetID == "" || e.state.nodes[targetID].Kind != "symbol" {
+			return false
+		}
+		targetSet[targetID] = true
+	}
+	targetIDs = targetIDs[:0]
+	for targetID := range targetSet {
+		targetIDs = append(targetIDs, targetID)
+	}
+	sort.Strings(targetIDs)
+
+	condition := canonicalCondition(pending.condition)
+	primary := evidence[0]
+	siteIdentity := map[string]any{
+		"condition": condition, "kind": "call", "path": primary.Path,
+		"profile_id": e.state.profile.ID, "source": pending.callerID,
+		"span": goSemanticSpan(primary),
+	}
+	site := Site{
+		ID: stableIDFromValue("site", siteIdentity), Source: pending.callerID, Kind: "call",
+		Specifier: pending.specifier, ResolutionStatus: "candidates", TargetIDs: append([]string(nil), targetIDs...),
+		ProfileID: e.state.profile.ID, Condition: condition, Precision: "overapprox",
+		Evidence: append([]Evidence(nil), evidence...),
+	}
+	if old, ok := e.state.sites[site.ID]; ok {
+		if !goSemanticEqual(old, site) {
+			e.fail("go_semantic_identity_conflict", primary.Path, "conflicting candidate call site "+site.ID)
+			return false
+		}
+	}
+	edges := make([]Edge, 0, len(targetIDs))
+	for _, targetID := range targetIDs {
+		edgeIdentity := map[string]any{"kind": "may_call", "site_id": site.ID, "target": targetID}
+		edge := Edge{
+			ID: stableIDFromValue("edge", edgeIdentity), Source: pending.callerID, Target: targetID,
+			Kind: "may_call", SiteID: site.ID, Phase: "semantic", Environment: "any",
+			ResolutionStatus: "candidates", ProfileID: e.state.profile.ID, Condition: condition,
+			Precision: "overapprox", Generated: pending.generated, Evidence: append([]Evidence(nil), evidence...),
+		}
+		if old, ok := e.state.edges[edge.ID]; ok && !goSemanticEqual(old, edge) {
+			e.fail("go_semantic_identity_conflict", primary.Path, "conflicting semantic may_call edge "+edge.ID)
+			return false
+		}
+		edges = append(edges, edge)
+	}
+	e.state.sites[site.ID] = site
+	for _, edge := range edges {
+		e.state.edges[edge.ID] = edge
+	}
+	return true
+}
+
+func (e *goSemanticExtractor) emitPendingUnresolved(pending goSemanticPendingCall) {
+	e.failCall(pending.file.Path, pending.specifier, pending.target.reason, pending.evidence)
+	e.addCall(
+		pending.callerID,
+		pending.target.nodeID,
+		pending.specifier,
+		pending.target.status,
+		pending.target.precision,
+		pending.target.reason,
+		pending.condition,
+		pending.evidence,
+		pending.generated,
+	)
 }
 
 func (e *goSemanticExtractor) failCall(path, specifier, reason string, evidence []Evidence) {

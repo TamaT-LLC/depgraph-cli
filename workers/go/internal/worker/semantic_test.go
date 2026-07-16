@@ -208,6 +208,7 @@ func TestGoSemanticDirectCallsAreStrictAndConservative(t *testing.T) {
 	inferredCalls := 0
 	closureCalls := 0
 	callFileUnresolved := map[string]int{}
+	callFileCandidates := map[string]int{}
 	callFileDiagnostics := map[string]bool{}
 	conversionSite := false
 	nodes := make(map[string]Node, len(result.Nodes))
@@ -261,19 +262,28 @@ func TestGoSemanticDirectCallsAreStrictAndConservative(t *testing.T) {
 		t.Fatal("type conversion was emitted as a call site")
 	}
 	if !reflect.DeepEqual(callFileUnresolved, map[string]int{
-		"interface_dispatch": 2, "function_value_dispatch": 4, "reflection_dispatch": 1,
+		"function_value_dispatch": 3, "reflection_dispatch": 1,
 	}) {
 		t.Fatalf("calls.go unresolved classifications = %v", callFileUnresolved)
 	}
-
 	externalResolvers := map[string]bool{}
 	for _, site := range result.Sites {
+		if site.Kind == "call" && len(site.Evidence) > 0 && site.Evidence[0].Path == "model/calls.go" && site.ResolutionStatus == "candidates" {
+			dispatch, _ := site.Evidence[0].Properties["dispatch"].(string)
+			callFileCandidates[dispatch]++
+			if dispatch == "function_value" && !reflect.DeepEqual(site.TargetIDs, []string{externalCall.ID}) {
+				t.Fatalf("known function-value candidate targets = %v, want ExternalCall", site.TargetIDs)
+			}
+		}
 		if site.Kind != "call" || len(site.Evidence) == 0 || site.Evidence[0].Path != "model/calls.go" || site.ResolutionStatus != "external" {
 			continue
 		}
 		target := nodes[site.TargetIDs[0]]
 		resolver, _ := target.Properties["resolver_identity"].(string)
 		externalResolvers[resolver] = true
+	}
+	if !reflect.DeepEqual(callFileCandidates, map[string]int{"interface": 2, "function_value": 1}) {
+		t.Fatalf("calls.go candidate sites by dispatch = %v, want two interface and one function-value candidate", callFileCandidates)
 	}
 	for _, resolver := range []string{"fmt.Sprintf", "builtin.println", "reflect.ValueOf"} {
 		if !externalResolvers[resolver] {
@@ -293,8 +303,8 @@ func TestGoSemanticDirectCallsAreStrictAndConservative(t *testing.T) {
 			t.Fatalf("unresolved call diagnostic lost its primary span: %+v", diagnostic)
 		}
 	}
-	if len(callFileDiagnostics) != 7 {
-		t.Fatalf("calls.go unresolved diagnostics = %d, want 7", len(callFileDiagnostics))
+	if len(callFileDiagnostics) != 4 {
+		t.Fatalf("calls.go unresolved diagnostics = %d, want 4", len(callFileDiagnostics))
 	}
 
 	internalTest := semanticFindNamedNode(t, result, "symbol", "function", semanticPackagePath+".TestInternal")
@@ -1029,8 +1039,13 @@ func semanticAssertAllStrictCalls(t *testing.T, result Result) {
 		if nodes[site.Source].Kind != "symbol" {
 			t.Fatalf("call site source is not a symbol: site=%+v source=%+v", site, nodes[site.Source])
 		}
-		if len(site.TargetIDs) != 1 {
-			t.Fatalf("direct call target count = %d, want 1: %+v", len(site.TargetIDs), site)
+		if len(site.TargetIDs) == 0 || !sort.StringsAreSorted(site.TargetIDs) {
+			t.Fatalf("call target IDs are not a non-empty sorted set: %+v", site)
+		}
+		for index := 1; index < len(site.TargetIDs); index++ {
+			if site.TargetIDs[index-1] == site.TargetIDs[index] {
+				t.Fatalf("call target IDs are not unique: %+v", site)
+			}
 		}
 		semanticAssertEvidence(t, site.Evidence)
 		primary := site.Evidence[0]
@@ -1048,41 +1063,63 @@ func semanticAssertAllStrictCalls(t *testing.T, result Result) {
 		if site.ID != wantSiteID {
 			t.Fatalf("call site ID = %q, want %q: %+v", site.ID, wantSiteID, site)
 		}
-		target := nodes[site.TargetIDs[0]]
 		switch site.ResolutionStatus {
 		case "resolved":
-			if site.Precision != "exact" || target.Kind != "symbol" || site.Reason != "" {
-				t.Fatalf("resolved call has invalid precision/target/reason: site=%+v target=%+v", site, target)
+			if len(site.TargetIDs) != 1 || site.Precision != "exact" || nodes[site.TargetIDs[0]].Kind != "symbol" || site.Reason != "" {
+				t.Fatalf("resolved call has invalid precision/target/reason: site=%+v target=%+v", site, nodes[site.TargetIDs[0]])
 			}
 		case "external":
-			if site.Precision != "exact" || target.Kind != "external_system" || site.Reason != "" {
-				t.Fatalf("external call has invalid precision/target/reason: site=%+v target=%+v", site, target)
+			if len(site.TargetIDs) != 1 || site.Precision != "exact" || nodes[site.TargetIDs[0]].Kind != "external_system" || site.Reason != "" {
+				t.Fatalf("external call has invalid precision/target/reason: site=%+v target=%+v", site, nodes[site.TargetIDs[0]])
 			}
 		case "unresolved":
-			if site.Precision != "heuristic" || target.Kind != "unknown_target" || site.Reason == "" {
-				t.Fatalf("unresolved call lost sentinel/reason: site=%+v target=%+v", site, target)
+			if len(site.TargetIDs) != 1 || site.Precision != "heuristic" || nodes[site.TargetIDs[0]].Kind != "unknown_target" || site.Reason == "" {
+				t.Fatalf("unresolved call lost sentinel/reason: site=%+v target=%+v", site, nodes[site.TargetIDs[0]])
+			}
+		case "candidates":
+			algorithm, _ := primary.Properties["algorithm"].(string)
+			if site.Precision != "overapprox" || site.Reason != "" || primary.Extractor != "go-ssa" || algorithm == "" {
+				t.Fatalf("candidate call lost SSA provenance: %+v", site)
+			}
+			for _, targetID := range site.TargetIDs {
+				if nodes[targetID].Kind != "symbol" {
+					t.Fatalf("candidate call target is not a symbol: site=%+v target=%+v", site, nodes[targetID])
+				}
 			}
 		default:
-			t.Fatalf("direct call has invalid resolution status: %+v", site)
+			t.Fatalf("call has invalid resolution status: %+v", site)
 		}
 	}
 
-	edgesBySite := map[string]int{}
+	edgesBySite := map[string]map[string]bool{}
 	seenEdges := map[string]bool{}
 	for _, edge := range result.Edges {
-		if edge.Kind != "calls" {
+		if edge.Kind != "calls" && edge.Kind != "may_call" {
 			continue
 		}
 		if seenEdges[edge.ID] {
-			t.Fatalf("duplicate calls edge ID: %s", edge.ID)
+			t.Fatalf("duplicate call edge ID: %s", edge.ID)
 		}
 		seenEdges[edge.ID] = true
 		site, ok := sites[edge.SiteID]
 		if !ok || site.Kind != "call" {
 			t.Fatalf("calls edge lacks call site: %+v", edge)
 		}
-		edgesBySite[edge.SiteID]++
-		if edge.Source != site.Source || edge.Target != site.TargetIDs[0] || edge.ProfileID != site.ProfileID ||
+		expectedKind := "calls"
+		if site.ResolutionStatus == "candidates" {
+			expectedKind = "may_call"
+		}
+		if edge.Kind != expectedKind {
+			t.Fatalf("call edge kind = %q, want %q: edge=%+v site=%+v", edge.Kind, expectedKind, edge, site)
+		}
+		if edgesBySite[edge.SiteID] == nil {
+			edgesBySite[edge.SiteID] = map[string]bool{}
+		}
+		if edgesBySite[edge.SiteID][edge.Target] {
+			t.Fatalf("duplicate call edge target for site: %+v", edge)
+		}
+		edgesBySite[edge.SiteID][edge.Target] = true
+		if !containsString(site.TargetIDs, edge.Target) || edge.Source != site.Source || edge.ProfileID != site.ProfileID ||
 			edge.ResolutionStatus != site.ResolutionStatus || edge.Precision != site.Precision ||
 			!reflect.DeepEqual(edge.Condition, site.Condition) || !reflect.DeepEqual(edge.Evidence[0], site.Evidence[0]) {
 			t.Fatalf("calls edge disagrees with its site: edge=%+v site=%+v", edge, site)
@@ -1098,8 +1135,16 @@ func semanticAssertAllStrictCalls(t *testing.T, result Result) {
 		}
 	}
 	for _, site := range sites {
-		if site.Kind == "call" && edgesBySite[site.ID] != 1 {
-			t.Fatalf("call site %s has %d calls edges, want 1", site.ID, edgesBySite[site.ID])
+		if site.Kind != "call" {
+			continue
+		}
+		if len(edgesBySite[site.ID]) != len(site.TargetIDs) {
+			t.Fatalf("call site %s has %d edges, want %d", site.ID, len(edgesBySite[site.ID]), len(site.TargetIDs))
+		}
+		for _, targetID := range site.TargetIDs {
+			if !edgesBySite[site.ID][targetID] {
+				t.Fatalf("call site %s lacks edge to %s", site.ID, targetID)
+			}
 		}
 	}
 }
@@ -1257,7 +1302,9 @@ func semanticAssertEvidence(t *testing.T, evidence []Evidence) {
 		t.Fatal("semantic relation has no evidence")
 	}
 	primary := evidence[0]
-	if primary.Kind != "semantic" || primary.Extractor != semanticEvidenceExtractor || primary.ExtractorVersion != AdapterVersion {
+	if primary.Kind != "semantic" ||
+		(primary.Extractor != semanticEvidenceExtractor && primary.Extractor != "go-ssa") ||
+		primary.ExtractorVersion != AdapterVersion {
 		t.Fatalf("semantic evidence has invalid extractor identity: %+v", primary)
 	}
 	if primary.Path == "" || filepath.IsAbs(primary.Path) || strings.Contains(primary.Path, "\\") {

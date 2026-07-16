@@ -42,6 +42,16 @@ type goTypedPackage struct {
 	Types             *types.Package
 	TypesInfo         *types.Info
 	TypesSizes        types.Sizes
+	SSAInput          *goSSAInput
+}
+
+// goSSAInput preserves exactly one successful packages.Load type universe.
+// SSA programs must never combine packages from separate loads because their
+// FileSet and go/types object identities are unrelated.
+type goSSAInput struct {
+	ModulePath        string
+	ModuleRelativeDir string
+	Roots             []*packages.Package
 }
 
 type goTypedFile struct {
@@ -432,6 +442,14 @@ func loadGoPackagesInventoryWith(root string, modules []Module, work WorkFile, t
 			})
 		} else {
 			completeModules++
+			ssaInput := &goSSAInput{
+				ModulePath:        module.Path,
+				ModuleRelativeDir: module.RelativeDir,
+				Roots:             append([]*packages.Package(nil), loaded...),
+			}
+			for index := range moduleTypedPackages {
+				moduleTypedPackages[index].SSAInput = ssaInput
+			}
 			inventory.TypedPackages = append(inventory.TypedPackages, moduleTypedPackages...)
 		}
 	}

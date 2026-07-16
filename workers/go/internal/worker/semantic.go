@@ -23,7 +23,13 @@ type goSemanticExtractor struct {
 	symbolNodesByResolver map[string]string
 	nodeResolvers         map[string]string
 	symbolOrigins         map[string][]goSemanticSymbolOrigin
+	symbolNodesByObject   map[types.Object]string
+	symbolNodesBySyntax   map[ast.Node]string
+	closureNodesBySpan    map[goSemanticSourceSpanKey]string
+	functionInstances     map[string]string
+	symbolVariants        map[string]map[string]bool
 	diagnosticIDs         map[string]bool
+	pendingCalls          []goSemanticPendingCall
 	complete              bool
 	beforeSites           map[string]bool
 }
@@ -72,6 +78,11 @@ func (s *scannerState) extractGoSemanticGraph(sources []*sourceFile) {
 		symbolNodesByResolver: map[string]string{},
 		nodeResolvers:         map[string]string{},
 		symbolOrigins:         map[string][]goSemanticSymbolOrigin{},
+		symbolNodesByObject:   map[types.Object]string{},
+		symbolNodesBySyntax:   map[ast.Node]string{},
+		closureNodesBySpan:    map[goSemanticSourceSpanKey]string{},
+		functionInstances:     map[string]string{},
+		symbolVariants:        map[string]map[string]bool{},
 		diagnosticIDs:         map[string]bool{},
 		complete:              true,
 		beforeSites:           make(map[string]bool, len(s.sites)),
@@ -115,6 +126,7 @@ func (s *scannerState) extractGoSemanticGraph(sources []*sourceFile) {
 	for _, context := range extractor.contexts {
 		context.emitCalls()
 	}
+	extractor.emitSSACalls()
 	extractor.emitImplements()
 
 	extractor.accountSemanticSites()
@@ -322,6 +334,7 @@ func (p *goSemanticPackage) declareObjects() {
 			nodeID := p.ensureSymbol(object, declaration.Name, file, declaredBy, resolver, "")
 			if nodeID != "" {
 				p.owners[declaration] = nodeID
+				p.extractor.symbolNodesBySyntax[declaration] = nodeID
 			}
 			return true
 		})
@@ -503,6 +516,10 @@ func (p *goSemanticPackage) declareClosures(file goTypedFile) {
 			return true
 		}
 		p.owners[literal] = nodeID
+		p.extractor.symbolNodesBySyntax[literal] = nodeID
+		p.extractor.registerClosureSourceSpan(nodeID, evidence[0])
+		p.extractor.registerSymbolOrigin(nodeID, p.typed)
+		p.extractor.registerSymbolVariant(nodeID, p.condition(file.Path))
 		p.extractor.nodeResolvers[nodeID] = nodeID
 		p.extractor.addRelation("declares", ownerID, nodeID, p.condition(file.Path), evidence, p.generated(file.Path))
 		return true
@@ -530,6 +547,7 @@ func (p *goSemanticPackage) ensurePackageInitializer(file goTypedFile, node ast.
 		return ""
 	}
 	p.extractor.nodeResolvers[nodeID] = nodeID
+	p.extractor.registerSymbolVariant(nodeID, p.condition(file.Path))
 	p.extractor.addRelation("declares", p.packageNodeID, nodeID, p.condition(file.Path), evidence, p.generated(file.Path))
 	return nodeID
 }
@@ -690,6 +708,8 @@ func (p *goSemanticPackage) ensureSymbol(object types.Object, identifier *ast.Id
 	}
 	p.objectNodes[object] = nodeID
 	p.objectResolvers[object] = resolver
+	p.extractor.symbolNodesByObject[object] = nodeID
+	p.extractor.registerSymbolVariant(nodeID, p.condition(file.Path))
 	if resolver == "" {
 		resolver = nodeID
 	}
@@ -1303,6 +1323,11 @@ func (p *goSemanticPackage) emitInstance(file goTypedFile, identifier *ast.Ident
 	}
 	p.instanceNodes[identifier] = nodeID
 	p.extractor.nodeResolvers[nodeID] = resolver
+	if nodeKind == "symbol" {
+		p.extractor.registerResolver(p.extractor.functionInstances, resolver, nodeID, file.Path)
+		p.extractor.inheritSymbolOrigins(nodeID, originNodeID)
+		p.extractor.registerSymbolVariant(nodeID, p.condition(file.Path))
+	}
 	if nodeKind == "type" {
 		p.recordInstanceNamedType(nodeID, instance.Type, evidence, file.Path)
 	}
@@ -1606,6 +1631,38 @@ func goSemanticSpan(evidence Evidence) map[string]any {
 		"start_line": evidence.StartLine, "start_column": evidence.StartColumn,
 		"end_line": evidence.EndLine, "end_column": evidence.EndColumn,
 	}
+}
+
+type goSemanticSourceSpanKey struct {
+	path        string
+	startLine   int
+	startColumn int
+	endLine     int
+	endColumn   int
+}
+
+func goSemanticSourceSpanFromEvidence(evidence Evidence) (goSemanticSourceSpanKey, bool) {
+	key := goSemanticSourceSpanKey{
+		path:        cleanSlash(evidence.Path),
+		startLine:   evidence.StartLine,
+		startColumn: evidence.StartColumn,
+		endLine:     evidence.EndLine,
+		endColumn:   evidence.EndColumn,
+	}
+	return key, key.path != "" && key.startLine > 0 && key.startColumn > 0 && key.endLine > 0 && key.endColumn > 0
+}
+
+func (e *goSemanticExtractor) registerClosureSourceSpan(nodeID string, evidence Evidence) {
+	key, ok := goSemanticSourceSpanFromEvidence(evidence)
+	if !ok {
+		e.fail("go_semantic_identity", evidence.Path, "closure has no stable source span")
+		return
+	}
+	if old := e.closureNodesBySpan[key]; old != "" && old != nodeID {
+		e.fail("go_semantic_identity_conflict", evidence.Path, fmt.Sprintf("closure source span maps to both %s and %s", old, nodeID))
+		return
+	}
+	e.closureNodesBySpan[key] = nodeID
 }
 
 func goSemanticEqual(left, right any) bool {
