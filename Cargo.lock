@@ -310,6 +310,7 @@ dependencies = [
  "assert_cmd",
  "clap",
  "depgraph-core",
+ "depgraph-protocol",
  "depgraph-store",
  "predicates",
  "serde",

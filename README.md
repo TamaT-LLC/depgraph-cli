@@ -9,13 +9,13 @@ The MVP implements the architecture described in [the system design](docs/40_arc
 ## Supported MVP graph
 
 - Cargo workspace/package/target/dependency and Rust file/module/import/re-export sites
-- Go workspace/module/package variant/file/import, build constraint, test, embed, generated, vendor, and cgo sites
+- Go workspace/module/package variant/file/import, symbol/type/direct call/candidate call, build constraint, test, embed, generated, vendor, and cgo sites
 - npm/pnpm/Yarn/Bun workspace/package/file and ESM/CJS/type-only/dynamic import sites
 - Next.js App/Pages filesystem routes
 - Astro pages/endpoints and frontmatter imports
 - TanStack file routes and existing generated route trees
 
-Symbol/type/call analysis, code-based routes, server functions, build observation, runtime traces, incremental updates, snapshots, and architecture policies belong to later milestones.
+Rust and Web symbol/type/call analysis, code-based routes, server functions, build observation, runtime traces, incremental updates, snapshots, and architecture policies belong to later milestones.
 
 ## Build
 
@@ -48,6 +48,16 @@ depgraph deps path:src/app.ts --transitive
 depgraph dependents package:example
 depgraph why path:src/app.ts route:/products/$id
 depgraph cycles --level file
+
+# Go semantic graph queries use canonical resolver identities.
+depgraph deps symbol:example.com/semantic/model.Build --transitive
+depgraph dependents type:example.com/semantic/model.Worker --json
+depgraph why symbol:example.com/semantic/model.Build type:example.com/semantic/model.Input --json
+depgraph cycles --level symbol
+
+# If a selector is ambiguous, rerun it with a stable ID from the candidates.
+depgraph deps "id:$STABLE_ID" --json
+
 depgraph unresolved --json
 depgraph export --format json --output graph.json
 depgraph export --format dot > graph.dot
@@ -56,7 +66,7 @@ depgraph export --format mermaid > graph.mmd
 
 SQLite is stored under the operating system cache directory, keyed by the canonical repository root. Use global `--store PATH` for a specific database and global `--scan-id ID` to inspect a retained partial scan. Queries default to the latest successful scan; `doctor` reports the latest attempt.
 
-Selectors accept `id:`, `path:`, `package:`, and `route:` prefixes. A bare selector is allowed only when it resolves unambiguously.
+Selectors accept `id:`, `path:`, `package:`, `route:`, `symbol:`, and `type:` prefixes. `symbol:` and `type:` only match their respective node kind. A bare or prefixed selector must resolve unambiguously; when candidates are reported, copy the complete stable ID (for example `symbol:sha256:...`) and retry as `id:<stable-id>`.
 
 ## Safe-scan boundary
 
