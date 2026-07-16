@@ -247,24 +247,35 @@ edge kind は追加可能とするが、既存 kind の意味を protocol versio
 ```json
 {
   "id": "edge:sha256:...",
-  "source": "ts://workspace/app/src/page.tsx#Page",
-  "target": "route://next/app/products/$id",
+  "source": "symbol:sha256:...",
+  "target": "route:sha256:...",
   "kind": "route_entry",
+  "site_id": "site:sha256:...",
   "phase": "semantic",
   "environment": "server",
   "profile_id": "web:production:server",
-  "condition": "mode == production && runtime == server",
+  "condition": {
+    "op": "all",
+    "conditions": [
+      { "op": "eq", "key": "mode", "value": "production" },
+      { "op": "eq", "key": "runtime", "value": "server" }
+    ]
+  },
   "resolution_status": "resolved",
   "precision": "exact",
-  "evidence": {
-    "extractor": "next-static-adapter",
-    "extractor_version": "0.1.0",
-    "path": "src/app/products/[id]/page.tsx",
-    "start_line": 1,
-    "start_column": 1,
-    "end_line": 1,
-    "end_column": 42
-  },
+  "evidence": [
+    {
+      "kind": "semantic",
+      "extractor": "next-static-adapter",
+      "extractor_version": "0.1.0",
+      "path": "src/app/products/[id]/page.tsx",
+      "start_line": 1,
+      "start_column": 1,
+      "end_line": 1,
+      "end_column": 42,
+      "properties": {}
+    }
+  ],
   "generated": false
 }
 ```
@@ -282,6 +293,48 @@ stable ID は表示名ではなく、言語 resolver が返す canonical identit
 - route: framework + router instance + canonical route pattern + environment
 
 local variable、anonymous function、generated wrapper 等は source span と生成元 identity を用いる。ファイル移動をまたぐ完全な ID 安定性は保証せず、snapshot diff では rename detection を別途行う。
+
+### 7.5 Semantic Graph Contract（protocol 1.0）
+
+protocol 1.0 の node / edge kind は open vocabulary だが、Milestone 2 の worker は次の規約を共通 contract とする。`symbol` / `type` node は通常の必須 field に加え、`properties` に以下を必須とする。
+
+後方互換性のため、protocol 1.0 の root Schema と通常の `validate_ndjson` / `validate_safe_ndjson` は kind の open vocabulary を維持する。Milestone 2 worker は Schema の `$defs.semantic_node` / `$defs.semantic_edge` / `$defs.semantic_site` と、Rust の `validate_semantic_ndjson` / `validate_safe_semantic_ndjson` を明示的に選び、この節の追加契約を検証する。
+
+| Node kind | 必須 property | 意味 |
+| --- | --- | --- |
+| `symbol` | `language`, `package_locator`, `symbol_kind`, `canonical_identity` | resolver が返した function、method、variable、export、item 等の identity |
+| `type` | `language`, `package_locator`, `type_kind`, `canonical_identity` | resolver が返した named type、trait、interface、type alias 等の identity |
+
+`package_locator` は package manager / resolver が決めた package instance identity であり、version、source、replace、peer context 等を必要に応じて含める。`canonical_identity` は node ID の hash 入力そのものを JSON object で保持し、top-level の `language`、`package_locator`、`symbol_kind` / `type_kind` と同じ値を含める。symbol identity は `identity_kind` を `named / local / anonymous / generated` から必須で選ぶ。`named` は `resolver_identity` を必須とし、それ以外は `enclosing_symbol` または `generated_from`、normalized relative path、1-origin の source span を必須とする。`local_*` と `parameter`、`anonymous_*` と `closure / lambda`、`generated_*` の予約済み `symbol_kind` は、それぞれ同名の identity category と一致させる。set として扱う配列は producer が canonical sort し、generic argument 等の順序に意味がある配列は resolver order を保持する。
+
+```text
+symbol node ID = stable_id_from_value("symbol", canonical_identity)
+type node ID   = stable_id_from_value("type", canonical_identity)
+```
+
+semantic dependency site と edge は次の規約に従う。
+
+| Edge kind | source / target | 許可する resolution | 用途 |
+| --- | --- | --- | --- |
+| `type_uses` | 利用元 `symbol` または `type` / `type` または sentinel | `resolved`, `candidates`, `external`, `unresolved` | signature、body、constraint 等からの型参照 |
+| `calls` | caller `symbol` / 単一 callee `symbol` または sentinel | `resolved`, `external`, `unresolved` | static direct call または認識済みだが未解決の direct call site |
+| `may_call` | caller `symbol` / 候補 callee `symbol` | `candidates` のみ | interface dispatch 等の保守的 call graph |
+
+resolution と precision、target は次の組み合わせに固定する。
+
+- `resolved` は concrete `symbol` / `type` 1件を指し、`precision=exact` とする。
+- `candidates` は canonical sort した concrete target 1件以上を持ち、`precision=overapprox` とする。候補が1件でも動的dispatchの一意性が証明されていなければ `resolved` へ昇格しない。call site は候補ごとの `may_call` edge、type site は候補ごとの `type_uses` edgeを生成する。
+- `external` は `external_system` node 1件を指す。worker が target locator を canonical external identity として確定した場合は `exact`、境界またはspecifierだけを特定した場合は `heuristic` と申告する。共通 validator は sentinel kind と status / precision の組み合わせを検証し、locator の言語固有な正確性は各 worker の contract test で検証する。
+- `unresolved` は `unknown_target` node 1件を指し、`precision=heuristic` と非空の `reason` を必須とする。
+
+- edge は `phase=semantic` とする。edge と dependency site の `evidence[0]` は dependency occurrence を表す primary evidence とし、`kind=semantic`、extractor、extractor version、normalized relative path、完全な source span を必須とする。site ID は常にこの primary spanから作る。追加 evidence は primary の後で canonical JSON順に並べる。
+- direct call は target 1件の dependency site と `calls` edge 1件で表す。
+- candidate call は call site 1件につき dependency site 1件と候補ごとの `may_call` edge を生成する。全 candidate edge は同じ `site_id`、`resolution_status=candidates`、`precision=overapprox` を持つ。site と各 edge の primary evidence は、RTA、CHA、VTA 等の解析方式を非空の `evidence[0].properties.algorithm` に必須で記録する。
+- site ID の canonical input は `source`、site `kind`、`profile_id`、canonical condition、normalized path、source span とする。候補 target 集合は候補増減で site identity を変えないため含めない。
+- edge ID の canonical input は `site_id`、edge `kind`、`target` とする。これにより同じ site の候補を独立に追加・削除できる。
+- worker は `stable_id_from_value("site", input)` と `stable_id_from_value("edge", input)` を使用する。candidate target ID は昇順にする。event は `scan_started`、`profile_declared`（ID順）、`node_upsert`（node ID順）、`dependency_site`（site ID順）、`edge_upsert`（edge ID順）、`diagnostic`（ID順）、`file_completed`（path順）、`profile_completed`（profile ID順）、`scan_completed` の順に出力する。
+
+`crates/depgraph-protocol/tests/fixtures/protocol-v1.semantic.golden.ndjson` をこの contract の互換性 fixture とする。既存の source phase fixture は protocol 1.0 の後方互換 fixture として変更しない。
 
 ## 8. Profile と条件付き Graph
 
