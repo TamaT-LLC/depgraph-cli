@@ -14,11 +14,11 @@ updated: 2026-07-16
 
 ## 実装ステータス
 
-2026-07-15 時点で Milestone 0〜1 の MVP を実装済み。package/file/import/route graph、safe static scan、protocol 1.0、SQLite evidence store、query/export/doctor、Rust/Go/Web worker、native release archiveを対象とする。
+2026-07-16 時点で Milestone 0〜1 の MVP に加え、Milestone 2 の Go semantic vertical sliceを実装済みである。Go workerは制限付き`go/packages`、`go/types`、serial SSAからsymbol/type/generic instance、`declares`、`extends`、`implements`、`instantiates`、`type_uses`、exact `calls`、RTA/CHA candidate `may_call`をprotocol semantic graphとして出力する。これらはSQLite evidence storeへ保存され、symbol/type selector、deps/dependents/why/cycles、JSON/DOT/Mermaid exportの対象となる。
 
 safe scanではcanonical root外へのsymlink readを拒否し、相対PATH・repository内toolchain・Node実行hookを除外する。Goは制限付き`go/packages`からparser fallbackへ移行し、Cargo metadataはneutral cwdから`--frozen --offline --no-deps`で実行する。配布物はworker/runtime checksumを検証し、manifestまたは同梱layout欠損時にfail closedとする。
 
-symbol/type/call/component/server function、build観測、incremental/watch、snapshot/diff/impact、architecture policy、runtime traceは本設計の後続Milestoneとして未実装である。
+Rust HIR、TypeScript TypeChecker、frameworkのcomponent/server function semantic edge、build観測、incremental/watch、snapshot/diff/impact、architecture policy、runtime traceは本設計の後続Milestoneとして未実装である。Go VTAおよびreflection/native境界の追加refinementも未実装である。
 
 ## 1. 目的
 
@@ -495,21 +495,26 @@ nightly / `rustc_private` への依存は version 固定した worker 内へ隔�
 
 ## 10. Go Adapter
 
-### 10.1 Package / Type Scan
+### 10.1 Package / Type Scan（Go vertical slice実装済み）
 
-1. `go env`、`go.work`、`go.mod` の toolchain snapshot を取得する。
-2. offline/read-only、telemetry/cgo/external driver無効、公式`x/mod`検証、repository symlink事前拒否の制約下で `go/packages.Load` を実行し、source、compiled file、test variant、module、embed、typed syntax、`TypesInfo` を取得する。module単位で失敗した場合はtyped結果を破棄し、parser inventoryを維持する。
-3. AST と `go/types.Info` から definition、use、selection、type、method set、generic instance を生成する。
-4. named object は object identity、local object は source span で stable ID を作る。
+1. worker runtimeのGo version、GOOS、GOARCH、強制された`CGO_ENABLED=0`、設定済みbuild tagsをprofileへ記録し、`go.mod` / `go.work`は静的にparseする。検証baselineはGo 1.26.1であり、差異はbest-effort diagnosticとする。
+2. offline/read-only、telemetry/cgo/external driver無効、公式`x/mod`検証、repository symlink事前拒否の制約下で`go/packages.Load`を実行する。module全体のtyped loadが不完全な場合、そのmoduleのtyped結果を破棄し、parser inventoryを維持する。独立して成功したmoduleのsemantic結果は保持できる。
+3. retained ASTと`go/types.Info`からnamed/local symbol、method、closure、package initializer、named type、generic function/type instanceを生成する。
+4. semantic relationとして`declares`、`extends`、`implements`、`instantiates`、dependency siteを持つ`type_uses`を生成する。一般的なvalue/reference use edgeは未実装である。
+5. named objectはresolver identity、local objectはenclosing symbolとrepository-relative source spanをcanonical identityへ含める。absolute checkout rootはsemantic identityへ含めない。
 
-### 10.2 Call Graph
+### 10.2 Call Graph（Go vertical slice実装済み）
 
-- static direct call: `exact`
-- main / test program: RTA を基本候補とする
-- library / partial program: CHA を保守的候補とする
-- VTA: opt-in refinement とし、experimental 性を diagnostic に残す
+- `go/types`で静的に解決できるfunction、method、closure、generic instanceは`calls / resolved / exact`とする。
+- builtinおよびworkspace外functionは`calls / external / exact`とする。
+- type conversionはcall siteとして計上しない。
+- interface dispatchとfunction-value dispatchは`InstantiateGenerics | BuildSerially`のSSAで解析する。
+- completeなmain/test programでRTA到達可能なsiteはRTAを使用する。
+- library、dependency bodyが不完全なprogram、RTAで到達しないsiteはCHAへfallbackする。
+- candidate callはsiteを`candidates / overapprox`とし、候補ごとに`may_call` edgeを生成する。候補が1件でもexactへ昇格しない。
+- VTAは未実装であり、将来のopt-in refinement候補とする。
 
-reflection、`unsafe`、`go:linkname`、assembly、plugin、native callback は `overapprox` または `unresolved` とする。
+`reflect.Value.Call` / `CallSlice`はunresolvedとする。`unsafe`、`go:linkname`、assembly、plugin、cgo/native callbackはclosed-world call graph外の境界として`go_callgraph_limit`を記録する。SSA build失敗、dependency body不足、repository symbolへ写像できないcandidateはdiagnosticを残し、exact targetを捏造しない。
 
 ### 10.3 Generated / cgo
 
@@ -517,6 +522,16 @@ reflection、`unsafe`、`go:linkname`、assembly、plugin、native callback は 
 - `go:generate` は generator invocation として記録するが、入出力対応を根拠なく確定しない
 - cgo file、directive、native library、header reference を記録する
 - C / C++ include graph や native call graph は将来の Clang adapter に委譲する
+
+### 10.4 Completeness / Fallback / Determinism
+
+parser inventoryはtyped loadの成否にかかわらず保持する。typed packageはmodule単位でatomicに採用し、失敗moduleのtyped packageだけを破棄する。profileの`go_packages_status`は`loaded / partial / fallback`のいずれかとする。
+
+`semantic-complete`は、全moduleが`loaded`であり、semantic extractorと必要なSSA構築が失敗しなかった場合だけ付与する。これは全dynamic/native callの解決を意味しない。reflectionや宣言済みcall graph境界によるunresolved siteは`semantic-complete`と併存し得るため、`unresolved-sites`、diagnostic、dependency-site ledgerを別途確認する。
+
+partial/fallback時は`go-packages-parser-fallback`、loaded後のextractor失敗時は`go-semantic-incomplete`をcoverage reasonへ記録する。safe scanでは全経路で`project_code_executed=false`を維持する。
+
+stable IDはcanonical JSONから生成し、module/package、node/site/edge、diagnostic、file coverage、candidate target、conditionをcanonical sortする。SSAはserialにbuildする。同一source、Go toolchain、GOOS/GOARCH、build tags、およびoffline dependency availabilityを決定性の入力とする。offline module-cache snapshotは現時点でprofile identityへfingerprintされないため、cache availabilityが異なるrunは同一入力として扱わない。
 
 ## 11. Web Adapter
 
@@ -823,8 +838,13 @@ policy result も evidence span を持ち、CI annotation へ変換できるよ�
 - go.mod / go.work / replace / vendor
 - normal / internal test / external test package
 - build tags、GOOS / GOARCH、cgo
-- generics、interface dispatch、reflection、generated file
-- embed、go:generate、assembly boundary
+- named/local symbol、type、generic instance、`declares` / `extends` / `implements` / `instantiates` / `type_uses`
+- exact direct call、external call、RTA/CHA interface/function-value candidate、reflection unresolved
+- `expected-graph.json`は`scope=required_semantic_subgraph`としてOS / Go versionに依存しない必須node / relationだけを固定し、fixture全体の完全goldenとは扱わない
+- real Go workerからSQLite store、symbol/type selector、deps/dependents/why/cycles、JSON/DOT/Mermaid exportまでのE2E
+- 同一fixtureの2回scanによるnodes/sites/edges/coverageとcanonical exportの決定性
+- module単位partial/fallback、ledger、`project_code_executed=false`
+- generated file、embed、go:generate非実行、assembly / native call graph境界
 
 ### 18.4 Web Fixture
 
@@ -850,7 +870,9 @@ policy result も evidence span を持ち、CI annotation へ変換できるよ�
 
 ### 19.1 決定性
 
-同一 source、toolchain、adapter、profile から同一 stable ID、graph、coverage summary を生成する。出力順は canonical sort する。
+同一source、toolchain、adapter、profile、およびadapterが参照するdependency snapshotから同一stable ID、graph、coverage summaryを生成する。出力順はcanonical sortする。scan IDはattempt identityでありgraph identityには含めず、異なるscan ID間ではgraph payloadまたはexportを比較する。
+
+Go semantic scanではGOOS/GOARCH、build tags、強制されたcgo無効状態、offline dependency availabilityを決定性の入力に含める。offline module-cache snapshotは現状profile identityへfingerprintされないため、cache stateが異なるscanを同一決定性入力として扱わない。
 
 ### 19.2 性能目標
 
@@ -919,11 +941,13 @@ policy result も evidence span を持ち、CI annotation へ変換できるよ�
 
 ### Milestone 2: Semantic Graph
 
-- Rust HIR
-- Go types / SSA
-- TypeScript TypeChecker
-- symbol / type / direct call / candidate call
-- component / route / server function edge
+- Go types / serial SSA vertical slice: 実装済み
+- Go symbol / type / direct call / RTA・CHA candidate callとCLI query/export E2E: 実装済み
+- Go VTA、reflection、unsafe/native境界のrefinement: 未実装
+- Rust HIR: 未実装
+- TypeScript TypeChecker: 未実装
+- 他adapterのsymbol / type / direct call / candidate call: 未実装
+- component / route / server function semantic edge: 未実装
 
 ### Milestone 3: Build Evidence
 
@@ -958,7 +982,7 @@ policy result も evidence span を持ち、CI annotation へ変換できるよ�
 ## 23. Open Questions
 
 - binary / product の最終名称を `depgraph` とするか
-- Go worker と Node worker を release artifact にどう同梱するか
+- Goのoffline dependency source / module-cache snapshotをprofile identityへどうfingerprintするか
 - Next.js の既存 adapter と observer を安全に chain する方法
 - default profile matrix の範囲と組合せ爆発の抑制方法
 - Rust compiler-precise MIR backend をどの opt-in toolchain channel で提供するか（safe HIR backend の方式は ADR-007 で決定済み）
@@ -985,6 +1009,7 @@ policy result も evidence span を持ち、CI annotation へ変換できるよ�
 
 ## 26. 更新履歴
 
+- 2026-07-16: Go semantic vertical sliceの実装状況、go/types relation、RTA/CHA call graph、module単位safe fallback、決定性、CLI E2E受け入れ境界を現行実装へ同期
 - 2026-07-16: ADR-007としてexact pinしたrust-analyzer libraryのRust worker統合、safe crate graph / VFS、toolchain matrix、fallback、配布・更新gateを確定（revision選定まではHIR disabled）
 - 2026-07-16: ADR-006としてsafe scanのbundled-only TypeScript compiler選択、fail-closed境界、diagnostic、将来TypeChecker導入gateを確定
 - 2026-07-15: 初版を作成

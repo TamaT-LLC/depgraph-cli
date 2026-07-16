@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -118,6 +119,130 @@ func TestGoSemanticGraphCoversObjectsTypesAndTestVariants(t *testing.T) {
 	if completion.EmittedSites != semanticSitesInModel {
 		t.Fatalf("model/model.go emitted site ledger = %d, want %d semantic sites: %+v", completion.EmittedSites, semanticSitesInModel, completion)
 	}
+}
+
+func TestGoSemanticFixtureMatchesExpectedGraph(t *testing.T) {
+	result := semanticScanFixture(t)
+	contractPath := filepath.Join(semanticFixtureRoot(t), "expected-graph.json")
+	encoded, err := os.ReadFile(contractPath)
+	if err != nil {
+		t.Fatalf("read semantic fixture contract: %v", err)
+	}
+	var contract semanticFixtureExpectedGraph
+	decoder := json.NewDecoder(bytes.NewReader(encoded))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&contract); err != nil {
+		t.Fatalf("decode semantic fixture contract: %v", err)
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		t.Fatalf("semantic fixture contract has trailing JSON: %v", err)
+	}
+	if contract.SchemaVersion != "1.0" || contract.Scope != "required_semantic_subgraph" || len(contract.Nodes) == 0 || len(contract.Relations) == 0 {
+		t.Fatalf("semantic fixture contract is empty or unsupported: %+v", contract)
+	}
+
+	nodesByLocator := make(map[string]Node, len(result.Nodes))
+	for _, node := range result.Nodes {
+		if previous, duplicate := nodesByLocator[node.Locator]; duplicate && previous.ID != node.ID {
+			t.Fatalf("fixture locator %q maps to multiple nodes: %s and %s", node.Locator, previous.ID, node.ID)
+		}
+		nodesByLocator[node.Locator] = node
+	}
+	for _, expected := range contract.Nodes {
+		node, ok := nodesByLocator[expected.Locator]
+		if !ok {
+			t.Fatalf("fixture expected node %q was not emitted", expected.Locator)
+		}
+		if node.Kind != expected.Kind || semanticNodeKind(node) != expected.SemanticKind {
+			t.Fatalf("fixture node %q = %s/%s, want %s/%s", expected.Locator, node.Kind, semanticNodeKind(node), expected.Kind, expected.SemanticKind)
+		}
+	}
+
+	for _, expected := range contract.Relations {
+		source, sourceOK := nodesByLocator[expected.SourceLocator]
+		target, targetOK := nodesByLocator[expected.TargetLocator]
+		if !sourceOK || !targetOK {
+			t.Fatalf("fixture relation %s -> %s references missing nodes", expected.SourceLocator, expected.TargetLocator)
+		}
+		matched := 0
+		for _, edge := range result.Edges {
+			if edge.Source != source.ID || edge.Target != target.ID || edge.Kind != expected.Kind ||
+				!semanticFixtureEvidenceMatches(edge.Evidence, expected.Evidence) {
+				continue
+			}
+			matched++
+			if edge.Phase != expected.Phase || edge.ResolutionStatus != expected.ResolutionStatus || edge.Precision != expected.Precision {
+				t.Fatalf("fixture edge %s -> %s has invalid relation contract: %+v", expected.SourceLocator, expected.TargetLocator, edge)
+			}
+			if edge.SiteID == "" {
+				t.Fatalf("fixture dependency edge %s -> %s has no site", expected.SourceLocator, expected.TargetLocator)
+			}
+			site := semanticSiteByID(t, result, edge.SiteID)
+			if site.Source != source.ID || site.Kind != expected.SiteKind ||
+				site.ResolutionStatus != expected.ResolutionStatus || site.Precision != expected.Precision ||
+				!containsString(site.TargetIDs, target.ID) || !semanticFixtureEvidenceMatches(site.Evidence, expected.Evidence) {
+				t.Fatalf("fixture site disagrees with expected relation %s -> %s: %+v", expected.SourceLocator, expected.TargetLocator, site)
+			}
+		}
+		if matched == 0 {
+			t.Fatalf("fixture expected relation %s --%s--> %s was not emitted", expected.SourceLocator, expected.Kind, expected.TargetLocator)
+		}
+	}
+}
+
+type semanticFixtureExpectedGraph struct {
+	SchemaVersion string                            `json:"schema_version"`
+	Scope         string                            `json:"scope"`
+	Nodes         []semanticFixtureExpectedNode     `json:"nodes"`
+	Relations     []semanticFixtureExpectedRelation `json:"relations"`
+}
+
+type semanticFixtureExpectedNode struct {
+	Locator      string `json:"locator"`
+	Kind         string `json:"kind"`
+	SemanticKind string `json:"semantic_kind"`
+}
+
+type semanticFixtureExpectedRelation struct {
+	SourceLocator    string                          `json:"source_locator"`
+	TargetLocator    string                          `json:"target_locator"`
+	SiteKind         string                          `json:"site_kind"`
+	Kind             string                          `json:"kind"`
+	Phase            string                          `json:"phase"`
+	ResolutionStatus string                          `json:"resolution_status"`
+	Precision        string                          `json:"precision"`
+	Evidence         semanticFixtureExpectedEvidence `json:"evidence"`
+}
+
+type semanticFixtureExpectedEvidence struct {
+	Kind             string            `json:"kind"`
+	Extractor        string            `json:"extractor"`
+	ExtractorVersion string            `json:"extractor_version"`
+	Path             string            `json:"path"`
+	StartLine        int               `json:"start_line"`
+	StartColumn      int               `json:"start_column"`
+	EndLine          int               `json:"end_line"`
+	EndColumn        int               `json:"end_column"`
+	Properties       map[string]string `json:"properties"`
+}
+
+func semanticFixtureEvidenceMatches(actual []Evidence, expected semanticFixtureExpectedEvidence) bool {
+	if len(actual) == 0 {
+		return false
+	}
+	primary := actual[0]
+	if primary.Kind != expected.Kind || primary.Extractor != expected.Extractor ||
+		primary.ExtractorVersion != expected.ExtractorVersion || primary.Path != expected.Path ||
+		primary.StartLine != expected.StartLine || primary.StartColumn != expected.StartColumn ||
+		primary.EndLine != expected.EndLine || primary.EndColumn != expected.EndColumn {
+		return false
+	}
+	for key, value := range expected.Properties {
+		if actualValue, ok := primary.Properties[key].(string); !ok || actualValue != value {
+			return false
+		}
+	}
+	return true
 }
 
 func TestGoSemanticIdentitiesRelationsAndGenericOrder(t *testing.T) {

@@ -53,3 +53,11 @@ var PackageInitialized = ExternalCall("package")
 func InvokeFunctionType[F ~func()](function F) {
 	function()
 }
+
+func CycleLeft() {
+	CycleRight()
+}
+
+func CycleRight() {
+	CycleLeft()
+}

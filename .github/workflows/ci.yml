@@ -96,14 +96,8 @@ jobs:
           diff -u "$tmp/one.graph.json" "$tmp/two.graph.json"
           test ! -e workers/web/test/fixtures/polyglot/apps/next-app/NEXT_CONFIG_EXECUTED
           test ! -e workers/web/test/fixtures/polyglot/apps/astro-app/ASTRO_CONFIG_EXECUTED
-      - name: Go end-to-end
-        shell: bash
-        run: |
-          set -euo pipefail
-          tmp="$(mktemp -d)"
-          target/debug/depgraph --store "$tmp/go.db" scan workers/go/internal/worker/testdata/workspace --json > "$tmp/go.json"
-          jq -e '.status == "completed" and .coverage.dependency_sites > 0' "$tmp/go.json"
-          target/debug/depgraph --store "$tmp/go.db" doctor --json | jq -e '.latest_attempt.project_code_executed == false'
+      - name: Go semantic end-to-end, determinism, and safe fallback
+        run: cargo xtask go-semantic-e2e
       - name: Rust end-to-end and safe build capability inventory
         shell: bash
         run: |
@@ -138,3 +132,4 @@ jobs:
       - run: target\debug\depgraph-rust-worker.exe --version
       - run: workers\go\bin\depgraph-go-worker.exe --version
       - run: node workers\web\dist\worker.mjs --version
+      - run: cargo xtask go-semantic-e2e

@@ -12,6 +12,8 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
+mod go_semantic_e2e;
+
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const SBOM_SCOPE: &str = "Scope: package-manager component boundary; system runtimes/toolchains and dependencies embedded inside upstream prebuilt packages are not recursively enumerated.";
 
@@ -28,6 +30,7 @@ enum Task {
         release: bool,
     },
     Test,
+    GoSemanticE2e,
     Package,
 }
 
@@ -91,6 +94,9 @@ fn main() -> Result<()> {
     match Cli::parse().command {
         Task::Build { release } => build(release),
         Task::Test => test(),
+        Task::GoSemanticE2e => {
+            go_semantic_e2e::run_development(&workspace_root(), &cargo_target_dir())
+        }
         Task::Package => package(),
     }
 }
@@ -156,6 +162,7 @@ fn test() -> Result<()> {
         .env("GOTOOLCHAIN", "local")
         .env("GOFLAGS", "-mod=readonly")
         .current_dir("workers/go"))?;
+    go_semantic_e2e::run_development(&workspace_root(), &cargo_target_dir())?;
     run(Command::new(pnpm_program())
         .args(["install", "--frozen-lockfile"])
         .current_dir("workers/web"))?;
@@ -1055,8 +1062,8 @@ fn verify_archive(archive: &Path, name: &str) -> Result<()> {
         }
     }
 
+    go_semantic_e2e::verify(&workspace_root(), &executable, None)?;
     let go_fixture = Path::new("workers/go/internal/worker/testdata/workspace").canonicalize()?;
-    verify_packaged_scan(&executable, &verify_root.join("go.db"), &go_fixture, "go")?;
     verify_packaged_layout_fails_closed(&executable, &extracted, &verify_root, &go_fixture)?;
     fs::remove_dir_all(verify_root)?;
     Ok(())
@@ -1371,6 +1378,13 @@ fn cargo_target_dir() -> PathBuf {
     std::env::var_os("CARGO_TARGET_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("target"))
+}
+
+fn workspace_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("xtask must be located directly under the workspace root")
+        .to_path_buf()
 }
 
 fn executable_name(name: &str) -> String {
