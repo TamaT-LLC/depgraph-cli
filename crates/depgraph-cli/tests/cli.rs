@@ -213,6 +213,286 @@ fn graph_worker(reverse_payload_order: bool) -> String {
 }
 
 #[cfg(unix)]
+struct SemanticGraphFixture {
+    worker: String,
+    alpha_id: String,
+    beta_id: String,
+    only_symbol_id: String,
+    shared_type_id: String,
+    only_type_id: String,
+    alpha_beta_edge_id: String,
+}
+
+#[cfg(unix)]
+fn semantic_graph_worker() -> SemanticGraphFixture {
+    use depgraph_protocol::stable_id_from_value;
+    use serde_json::json;
+
+    const PACKAGE_LOCATOR: &str = "go:example.test/fixture@workspace#example.test/fixture";
+    const PROFILE_ID: &str = "go:test";
+
+    let summary = coverage(2, 2, 0);
+    let symbol_identity = |resolver_identity: &str| {
+        json!({
+            "identity_kind": "named",
+            "language": "go",
+            "package_locator": PACKAGE_LOCATOR,
+            "resolver_identity": resolver_identity,
+            "symbol_kind": "function"
+        })
+    };
+    let type_identity = |resolver_identity: &str| {
+        json!({
+            "language": "go",
+            "package_locator": PACKAGE_LOCATOR,
+            "resolver_identity": resolver_identity,
+            "type_kind": "named"
+        })
+    };
+
+    let alpha_identity = symbol_identity("example.test/fixture.Alpha");
+    let beta_identity = symbol_identity("example.test/fixture.Beta");
+    let only_symbol_identity = symbol_identity("example.test/fixture.OnlySymbol");
+    let shared_type_identity = type_identity("example.test/fixture.Shared");
+    let only_type_identity = type_identity("example.test/fixture.OnlyType");
+    let alpha_id = stable_id_from_value("symbol", &alpha_identity);
+    let beta_id = stable_id_from_value("symbol", &beta_identity);
+    let only_symbol_id = stable_id_from_value("symbol", &only_symbol_identity);
+    let shared_type_id = stable_id_from_value("type", &shared_type_identity);
+    let only_type_id = stable_id_from_value("type", &only_type_identity);
+
+    let semantic_evidence = |line: u64| {
+        json!([{
+            "kind": "semantic",
+            "extractor": "go-types",
+            "extractor_version": "1.0",
+            "path": "main.go",
+            "start_line": line,
+            "start_column": 2,
+            "end_line": line,
+            "end_column": 18,
+            "detail": "resolved calls",
+            "properties": {"relation": "calls"}
+        }])
+    };
+    let condition = json!({"op": "all", "conditions": []});
+    let alpha_evidence = semantic_evidence(10);
+    let beta_evidence = semantic_evidence(20);
+
+    let site_id = |source: &str, line: u64| {
+        stable_id_from_value(
+            "site",
+            &json!({
+                "condition": condition,
+                "kind": "call",
+                "path": "main.go",
+                "profile_id": PROFILE_ID,
+                "source": source,
+                "span": {
+                    "end_column": 18,
+                    "end_line": line,
+                    "start_column": 2,
+                    "start_line": line
+                }
+            }),
+        )
+    };
+    let alpha_beta_site_id = site_id(&alpha_id, 10);
+    let beta_alpha_site_id = site_id(&beta_id, 20);
+    let edge_id = |site_id: &str, target: &str| {
+        stable_id_from_value(
+            "edge",
+            &json!({"kind": "calls", "site_id": site_id, "target": target}),
+        )
+    };
+    let alpha_beta_edge_id = edge_id(&alpha_beta_site_id, &beta_id);
+    let beta_alpha_edge_id = edge_id(&beta_alpha_site_id, &alpha_id);
+
+    let mut lines = vec![
+        PARSE_ARGS.to_owned(),
+        common_event(
+            "scan_started",
+            1,
+            r#", "root":"%s","project_code_executed":false,"safe_mode":true"#,
+            r#" "$root""#,
+        ),
+        common_event(
+            "profile_declared",
+            2,
+            r#", "profile":{"id":"go:test","language":"go","features":[],"environment":{},"properties":{}}"#,
+            "",
+        ),
+    ];
+
+    let semantic_properties = |kind: &str, identity: serde_json::Value| {
+        let mut properties = json!({
+            "language": "go",
+            "package_locator": PACKAGE_LOCATOR,
+            "canonical_identity": identity
+        });
+        properties[kind] = if kind == "symbol_kind" {
+            json!("function")
+        } else {
+            json!("named")
+        };
+        properties
+    };
+    let mut nodes = [
+        json!({
+            "id": alpha_id,
+            "kind": "symbol",
+            "locator": "go://example.test/fixture.Alpha",
+            "display_name": "Shared",
+            "properties": semantic_properties("symbol_kind", alpha_identity)
+        }),
+        json!({
+            "id": beta_id,
+            "kind": "symbol",
+            "locator": "go://example.test/fixture.Beta",
+            "display_name": "Shared",
+            "properties": semantic_properties("symbol_kind", beta_identity)
+        }),
+        json!({
+            "id": only_symbol_id,
+            "kind": "symbol",
+            "locator": "go://example.test/fixture.OnlySymbol",
+            "display_name": "OnlySymbol",
+            "properties": semantic_properties("symbol_kind", only_symbol_identity)
+        }),
+        json!({
+            "id": shared_type_id,
+            "kind": "type",
+            "locator": "go://example.test/fixture.Shared",
+            "display_name": "Shared",
+            "properties": semantic_properties("type_kind", shared_type_identity)
+        }),
+        json!({
+            "id": only_type_id,
+            "kind": "type",
+            "locator": "go://example.test/fixture.OnlyType",
+            "display_name": "OnlyType",
+            "properties": semantic_properties("type_kind", only_type_identity)
+        }),
+    ];
+    nodes.sort_by(|left, right| left["id"].as_str().cmp(&right["id"].as_str()));
+    for (index, node) in nodes.iter().enumerate() {
+        lines.push(common_event(
+            "node_upsert",
+            index as u64 + 3,
+            &format!(r#", "node":{node}"#),
+            "",
+        ));
+    }
+
+    let mut sites = [
+        json!({
+            "id": alpha_beta_site_id,
+            "source": alpha_id,
+            "kind": "call",
+            "specifier": "Beta",
+            "resolution_status": "resolved",
+            "target_ids": [beta_id],
+            "profile_id": PROFILE_ID,
+            "condition": condition,
+            "precision": "exact",
+            "evidence": alpha_evidence
+        }),
+        json!({
+            "id": beta_alpha_site_id,
+            "source": beta_id,
+            "kind": "call",
+            "specifier": "Alpha",
+            "resolution_status": "resolved",
+            "target_ids": [alpha_id],
+            "profile_id": PROFILE_ID,
+            "condition": condition,
+            "precision": "exact",
+            "evidence": beta_evidence
+        }),
+    ];
+    sites.sort_by(|left, right| left["id"].as_str().cmp(&right["id"].as_str()));
+    for (index, site) in sites.iter().enumerate() {
+        lines.push(common_event(
+            "dependency_site",
+            index as u64 + 8,
+            &format!(r#", "site":{site}"#),
+            "",
+        ));
+    }
+
+    let mut edges = [
+        json!({
+            "id": alpha_beta_edge_id,
+            "source": alpha_id,
+            "target": beta_id,
+            "kind": "calls",
+            "site_id": alpha_beta_site_id,
+            "phase": "semantic",
+            "environment": "host",
+            "profile_id": PROFILE_ID,
+            "condition": condition,
+            "resolution_status": "resolved",
+            "precision": "exact",
+            "generated": false,
+            "evidence": alpha_evidence
+        }),
+        json!({
+            "id": beta_alpha_edge_id,
+            "source": beta_id,
+            "target": alpha_id,
+            "kind": "calls",
+            "site_id": beta_alpha_site_id,
+            "phase": "semantic",
+            "environment": "host",
+            "profile_id": PROFILE_ID,
+            "condition": condition,
+            "resolution_status": "resolved",
+            "precision": "exact",
+            "generated": false,
+            "evidence": beta_evidence
+        }),
+    ];
+    edges.sort_by(|left, right| left["id"].as_str().cmp(&right["id"].as_str()));
+    for (index, edge) in edges.iter().enumerate() {
+        lines.push(common_event(
+            "edge_upsert",
+            index as u64 + 10,
+            &format!(r#", "edge":{edge}"#),
+            "",
+        ));
+    }
+    lines.extend([
+        common_event(
+            "file_completed",
+            12,
+            r#", "path":"main.go","discovered_sites":2,"emitted_sites":2,"skipped_sites":0,"skipped":false"#,
+            "",
+        ),
+        common_event(
+            "profile_completed",
+            13,
+            &format!(r#", "profile_id":"go:test","coverage":{summary}"#),
+            "",
+        ),
+        common_event(
+            "scan_completed",
+            14,
+            &format!(r#", "coverage":{summary}"#),
+            "",
+        ),
+    ]);
+    SemanticGraphFixture {
+        worker: lines.join("\n"),
+        alpha_id,
+        beta_id,
+        only_symbol_id,
+        shared_type_id,
+        only_type_id,
+        alpha_beta_edge_id,
+    }
+}
+
+#[cfg(unix)]
 fn unresolved_worker() -> String {
     let summary = coverage(1, 0, 1);
     [
@@ -874,6 +1154,204 @@ fn ambiguous_bare_selector_lists_candidates_and_explicit_selector_works() {
         .assert()
         .code(2)
         .stderr(predicate::str::contains("did not match any node"));
+}
+
+#[cfg(unix)]
+#[test]
+fn semantic_selectors_cycles_and_query_evidence_are_exposed() {
+    let root = fixture_root();
+    let temp = tempfile::tempdir().unwrap();
+    let store = temp.path().join("graph.db");
+    let worker = temp.path().join("semantic-graph.sh");
+    let fixture = semantic_graph_worker();
+    write_worker(&worker, &fixture.worker);
+
+    let contract_output = std::process::Command::new(&worker)
+        .args([
+            "--root",
+            root.path().to_str().unwrap(),
+            "--scan-id",
+            "semantic-contract-check",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        contract_output.status.success(),
+        "semantic fixture worker failed: {}",
+        String::from_utf8_lossy(&contract_output.stderr)
+    );
+    depgraph_protocol::validate_safe_semantic_ndjson(std::io::Cursor::new(&contract_output.stdout))
+        .expect("CLI semantic fixture must satisfy the strict semantic contract");
+
+    let scan = scan_with_worker(root.path(), &store, &worker, false);
+    assert_eq!(
+        scan.status.code(),
+        Some(0),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&scan.stdout),
+        String::from_utf8_lossy(&scan.stderr)
+    );
+
+    let query = |arguments: &[&str]| {
+        let output = Command::cargo_bin("depgraph")
+            .unwrap()
+            .args(["--store", store.to_str().unwrap()])
+            .args(arguments)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "args={arguments:?}\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    };
+
+    let symbol = query(&["deps", "symbol:OnlySymbol", "--json"]);
+    let symbol: serde_json::Value = serde_json::from_slice(&symbol.stdout).unwrap();
+    assert_eq!(symbol["data"]["root"]["id"], fixture.only_symbol_id);
+    assert_eq!(symbol["data"]["root"]["kind"], "symbol");
+
+    let r#type = query(&["deps", "type:Shared", "--json"]);
+    let r#type: serde_json::Value = serde_json::from_slice(&r#type.stdout).unwrap();
+    assert_eq!(r#type["data"]["root"]["id"], fixture.shared_type_id);
+    assert_eq!(r#type["data"]["root"]["kind"], "type");
+
+    for (selector, excluded_id) in [
+        ("symbol:OnlyType", fixture.only_type_id.as_str()),
+        ("type:OnlySymbol", fixture.only_symbol_id.as_str()),
+    ] {
+        Command::cargo_bin("depgraph")
+            .unwrap()
+            .args([
+                "--store",
+                store.to_str().unwrap(),
+                "deps",
+                selector,
+                "--json",
+            ])
+            .assert()
+            .code(2)
+            .stderr(predicate::str::contains("did not match any node"))
+            .stderr(predicate::str::contains(excluded_id).not());
+    }
+
+    Command::cargo_bin("depgraph")
+        .unwrap()
+        .args([
+            "--store",
+            store.to_str().unwrap(),
+            "deps",
+            "symbol:Shared",
+            "--json",
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("is ambiguous"))
+        .stderr(predicate::str::contains(format!(
+            "go://example.test/fixture.Alpha (symbol, id:{})",
+            fixture.alpha_id
+        )))
+        .stderr(predicate::str::contains(format!(
+            "go://example.test/fixture.Beta (symbol, id:{})",
+            fixture.beta_id
+        )))
+        .stderr(predicate::str::contains(format!("id:{}", fixture.shared_type_id)).not());
+
+    let alpha_selector = format!("id:{}", fixture.alpha_id);
+    let beta_selector = format!("id:{}", fixture.beta_id);
+    let deps = query(&["deps", &alpha_selector, "--json"]);
+    let deps: serde_json::Value = serde_json::from_slice(&deps.stdout).unwrap();
+    assert_eq!(deps["data"]["root"]["id"], fixture.alpha_id);
+    assert_eq!(deps["data"]["edges"][0]["id"], fixture.alpha_beta_edge_id);
+    assert_eq!(
+        deps["data"]["steps"][0]["edge"]["id"],
+        fixture.alpha_beta_edge_id
+    );
+    assert_eq!(deps["data"]["steps"][0]["evidence"][0]["kind"], "semantic");
+    assert_eq!(
+        deps["data"]["steps"][0]["evidence"][0]["properties"]["relation"],
+        "calls"
+    );
+
+    let dependents = query(&["dependents", &beta_selector, "--json"]);
+    let dependents: serde_json::Value = serde_json::from_slice(&dependents.stdout).unwrap();
+    assert_eq!(
+        dependents["data"]["steps"][0]["evidence"][0]["kind"],
+        "semantic"
+    );
+
+    let why = query(&["why", &alpha_selector, &beta_selector, "--json"]);
+    let why: serde_json::Value = serde_json::from_slice(&why.stdout).unwrap();
+    assert_eq!(why["data"]["steps"][0]["edge"]["phase"], "semantic");
+    assert_eq!(why["data"]["steps"][0]["evidence"][0]["kind"], "semantic");
+
+    let exported = query(&["export", "--format", "json"]);
+    let exported: serde_json::Value = serde_json::from_slice(&exported.stdout).unwrap();
+    let semantic_edges = exported["graph"]["edges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|edge| edge["phase"] == "semantic" && edge["kind"] == "calls")
+        .collect::<Vec<_>>();
+    assert_eq!(semantic_edges.len(), 2);
+    assert!(
+        exported["graph"]["evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|evidence| {
+                evidence["owner_type"] == "edge"
+                    && evidence["owner_id"] == fixture.alpha_beta_edge_id
+                    && evidence["kind"] == "semantic"
+                    && evidence["extractor"] == "go-types"
+            })
+    );
+
+    for arguments in [
+        vec!["deps", alpha_selector.as_str()],
+        vec!["dependents", beta_selector.as_str()],
+        vec!["why", alpha_selector.as_str(), beta_selector.as_str()],
+    ] {
+        let output = query(&arguments);
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            stdout
+                .contains("evidence semantic main.go:10:2-10:18 via go-types@1.0 (resolved calls)")
+        );
+        if arguments[0] == "why" {
+            assert!(stdout.starts_with("go://example.test/fixture.Alpha\n"));
+            assert!(stdout.contains(&format!(
+                "  --calls [resolved; exact; go:test]--> {}",
+                fixture.beta_id
+            )));
+            assert!(stdout.contains("      condition: true"));
+        } else {
+            assert!(stdout.contains(&format!(
+                "{} --calls [resolved; exact; go:test]--> {}",
+                fixture.alpha_id, fixture.beta_id
+            )));
+            assert!(stdout.contains("    condition: true"));
+        }
+    }
+
+    let cycles = query(&["cycles", "--level", "symbol", "--json"]);
+    let repeated_cycles = query(&["cycles", "--level", "symbol", "--json"]);
+    assert_eq!(cycles.stdout, repeated_cycles.stdout);
+    let cycles: serde_json::Value = serde_json::from_slice(&cycles.stdout).unwrap();
+    let (first, second) = if fixture.alpha_id < fixture.beta_id {
+        (&fixture.alpha_id, &fixture.beta_id)
+    } else {
+        (&fixture.beta_id, &fixture.alpha_id)
+    };
+    assert_eq!(
+        cycles["data"],
+        serde_json::json!([{
+            "level": "symbol",
+            "node_ids": [first, second, first]
+        }])
+    );
 }
 
 #[cfg(unix)]

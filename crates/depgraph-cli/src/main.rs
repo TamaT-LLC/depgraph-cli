@@ -96,6 +96,7 @@ enum Commands {
 enum CycleLevelArg {
     Package,
     File,
+    Symbol,
     Route,
 }
 
@@ -311,7 +312,7 @@ async fn run(cli: Cli) -> Result<u8> {
             let result = traverse(&snapshot, &selector, transitive, false)?;
             print_structured("deps", scan_id, &result, json)?;
             if !json {
-                print_edges(&result.edges);
+                print_path_steps(&result.steps);
             }
             Ok(0)
         }
@@ -324,7 +325,7 @@ async fn run(cli: Cli) -> Result<u8> {
             let result = traverse(&snapshot, &selector, transitive, true)?;
             print_structured("dependents", scan_id, &result, json)?;
             if !json {
-                print_edges(&result.edges);
+                print_path_steps(&result.steps);
             }
             Ok(0)
         }
@@ -335,35 +336,7 @@ async fn run(cli: Cli) -> Result<u8> {
             if !json {
                 if result.path_found {
                     println!("{}", result.from.locator);
-                    for step in result.steps {
-                        println!(
-                            "  --{} [{}; {}; {}]--> {}",
-                            step.edge.kind,
-                            step.edge.resolution_status,
-                            step.edge.precision,
-                            step.edge.profile_id,
-                            step.edge.target
-                        );
-                        println!("      condition: {}", step.condition_text);
-                        for evidence in step.evidence {
-                            println!(
-                                "      evidence {} {}:{}:{}-{}:{} via {}@{}{}",
-                                evidence.kind,
-                                evidence.path,
-                                evidence.start_line,
-                                evidence.start_column,
-                                evidence.end_line,
-                                evidence.end_column,
-                                evidence.extractor,
-                                evidence.extractor_version,
-                                evidence
-                                    .detail
-                                    .as_deref()
-                                    .map(|detail| format!(" ({detail})"))
-                                    .unwrap_or_default()
-                            );
-                        }
-                    }
+                    print_why_steps(&result.steps);
                 } else {
                     println!(
                         "no dependency path exists from {} to {}",
@@ -378,6 +351,7 @@ async fn run(cli: Cli) -> Result<u8> {
             let level = match level {
                 CycleLevelArg::Package => CycleLevel::Package,
                 CycleLevelArg::File => CycleLevel::File,
+                CycleLevelArg::Symbol => CycleLevel::Symbol,
                 CycleLevelArg::Route => CycleLevel::Route,
             };
             let result = depgraph_core::cycles(&snapshot, level);
@@ -490,11 +464,55 @@ fn print_structured<T: Serialize>(
     Ok(())
 }
 
-fn print_edges(edges: &[depgraph_store::EdgeRecord]) {
-    for edge in edges {
+fn print_path_steps(steps: &[depgraph_core::query::PathStep]) {
+    for step in steps {
+        let edge = &step.edge;
         println!(
-            "{} --{} [{}; {}]--> {}",
-            edge.source, edge.kind, edge.resolution_status, edge.precision, edge.target
+            "{} --{} [{}; {}; {}]--> {}",
+            edge.source,
+            edge.kind,
+            edge.resolution_status,
+            edge.precision,
+            edge.profile_id,
+            edge.target
+        );
+        println!("    condition: {}", step.condition_text);
+        print_evidence(&step.evidence, "    ");
+    }
+}
+
+fn print_why_steps(steps: &[depgraph_core::query::PathStep]) {
+    for step in steps {
+        println!(
+            "  --{} [{}; {}; {}]--> {}",
+            step.edge.kind,
+            step.edge.resolution_status,
+            step.edge.precision,
+            step.edge.profile_id,
+            step.edge.target
+        );
+        println!("      condition: {}", step.condition_text);
+        print_evidence(&step.evidence, "      ");
+    }
+}
+
+fn print_evidence(evidence: &[depgraph_store::EvidenceRecord], indent: &str) {
+    for evidence in evidence {
+        println!(
+            "{indent}evidence {} {}:{}:{}-{}:{} via {}@{}{}",
+            evidence.kind,
+            evidence.path,
+            evidence.start_line,
+            evidence.start_column,
+            evidence.end_line,
+            evidence.end_column,
+            evidence.extractor,
+            evidence.extractor_version,
+            evidence
+                .detail
+                .as_deref()
+                .map(|detail| format!(" ({detail})"))
+                .unwrap_or_default()
         );
     }
 }

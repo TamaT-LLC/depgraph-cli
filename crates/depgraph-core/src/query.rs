@@ -10,6 +10,7 @@ use serde::Serialize;
 pub enum CycleLevel {
     Package,
     File,
+    Symbol,
     Route,
 }
 
@@ -18,6 +19,7 @@ impl CycleLevel {
         match self {
             Self::Package => "package_instance",
             Self::File => "file",
+            Self::Symbol => "symbol",
             Self::Route => "route",
         }
     }
@@ -28,6 +30,7 @@ pub struct TraversalResult {
     pub root: NodeRecord,
     pub nodes: Vec<NodeRecord>,
     pub edges: Vec<EdgeRecord>,
+    pub steps: Vec<PathStep>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -60,7 +63,12 @@ pub struct UnresolvedResult {
 pub fn resolve_selector(snapshot: &GraphSnapshot, selector: &str) -> Result<NodeRecord> {
     let (kind, query) = selector
         .split_once(':')
-        .filter(|(prefix, _)| matches!(*prefix, "id" | "path" | "package" | "route"))
+        .filter(|(prefix, _)| {
+            matches!(
+                *prefix,
+                "id" | "path" | "package" | "route" | "symbol" | "type"
+            )
+        })
         .unwrap_or(("bare", selector));
     let query = query.trim();
     if query.is_empty() {
@@ -74,6 +82,8 @@ pub fn resolve_selector(snapshot: &GraphSnapshot, selector: &str) -> Result<Node
             "package" => node.kind == "package_instance",
             "route" => node.kind == "route",
             "path" => node.kind == "file",
+            "symbol" => node.kind == "symbol",
+            "type" => node.kind == "type",
             _ => true,
         };
         if !kind_matches {
@@ -86,10 +96,19 @@ pub fn resolve_selector(snapshot: &GraphSnapshot, selector: &str) -> Result<Node
                 .get("path")
                 .and_then(serde_json::Value::as_str)
                 .is_some_and(|path| path == query);
+        let resolver_identity_matches = matches!(kind, "symbol" | "type")
+            && node
+                .properties
+                .get("canonical_identity")
+                .and_then(|identity| identity.get("resolver_identity"))
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|identity| identity == query);
         let exact_match = if kind == "id" {
             node.id == query
         } else {
-            path_matches || values.iter().any(|value| value.as_str() == query)
+            path_matches
+                || resolver_identity_matches
+                || values.iter().any(|value| value.as_str() == query)
         };
         if exact_match {
             exact.push(node.clone());
@@ -116,11 +135,11 @@ fn choose_unique(selector: &str, mut candidates: Vec<NodeRecord>) -> Result<Node
             let choices = candidates
                 .iter()
                 .take(10)
-                .map(|node| format!("{} ({})", node.locator, node.kind))
+                .map(|node| format!("{} ({}, id:{})", node.locator, node.kind, node.id))
                 .collect::<Vec<_>>()
                 .join(", ");
             bail!(
-                "selector {selector:?} is ambiguous; use an explicit prefix or stable id. candidates: {choices}"
+                "selector {selector:?} is ambiguous; select a candidate with id:<stable-id>. candidates: {choices}"
             )
         }
     }
@@ -159,10 +178,21 @@ pub fn traverse(
         .filter(|id| *id != &root.id)
         .filter_map(|id| node_map.get(id).cloned())
         .collect();
+    let edges: Vec<_> = selected_edges.into_values().collect();
+    let evidence = edge_evidence_map(snapshot);
+    let steps = edges
+        .iter()
+        .map(|edge| PathStep {
+            edge: edge.clone(),
+            condition_text: render_condition(&edge.condition),
+            evidence: evidence.get(&edge.id).cloned().unwrap_or_default(),
+        })
+        .collect();
     Ok(TraversalResult {
         root,
         nodes,
-        edges: selected_edges.into_values().collect(),
+        edges,
+        steps,
     })
 }
 
@@ -203,19 +233,7 @@ pub fn why(snapshot: &GraphSnapshot, from: &str, to: &str) -> Result<WhyResult> 
             steps: Vec::new(),
         });
     }
-    let evidence_map = snapshot
-        .evidence
-        .iter()
-        .filter(|item| item.owner_type == "edge")
-        .fold(
-            BTreeMap::<String, Vec<EvidenceRecord>>::new(),
-            |mut map, item| {
-                map.entry(item.owner_id.clone())
-                    .or_default()
-                    .push(item.clone());
-                map
-            },
-        );
+    let evidence_map = edge_evidence_map(snapshot);
     let mut current = to.id.clone();
     let mut reversed = Vec::new();
     while current != from.id {
@@ -375,6 +393,43 @@ fn node_map(snapshot: &GraphSnapshot) -> BTreeMap<String, NodeRecord> {
         .collect()
 }
 
+fn edge_evidence_map(snapshot: &GraphSnapshot) -> BTreeMap<String, Vec<EvidenceRecord>> {
+    let mut evidence = snapshot
+        .evidence
+        .iter()
+        .filter(|item| item.owner_type == "edge")
+        .fold(
+            BTreeMap::<String, Vec<EvidenceRecord>>::new(),
+            |mut map, item| {
+                map.entry(item.owner_id.clone())
+                    .or_default()
+                    .push(item.clone());
+                map
+            },
+        );
+    for records in evidence.values_mut() {
+        records.sort_by(|left, right| {
+            left.ordinal
+                .cmp(&right.ordinal)
+                .then(left.kind.cmp(&right.kind))
+                .then(left.path.cmp(&right.path))
+                .then(left.start_line.cmp(&right.start_line))
+                .then(left.start_column.cmp(&right.start_column))
+                .then(left.end_line.cmp(&right.end_line))
+                .then(left.end_column.cmp(&right.end_column))
+                .then(left.extractor.cmp(&right.extractor))
+                .then(left.extractor_version.cmp(&right.extractor_version))
+                .then(left.detail.cmp(&right.detail))
+                .then_with(|| {
+                    left.properties
+                        .to_string()
+                        .cmp(&right.properties.to_string())
+                })
+        });
+    }
+    evidence
+}
+
 fn adjacency(snapshot: &GraphSnapshot, reverse: bool) -> BTreeMap<String, Vec<&EdgeRecord>> {
     let mut adjacency = BTreeMap::<String, Vec<&EdgeRecord>>::new();
     for edge in &snapshot.edges {
@@ -400,6 +455,34 @@ mod tests {
     use super::*;
     use depgraph_store::{CoverageRecord, ScanRecord};
     use serde_json::json;
+
+    fn node(id: &str, kind: &str, locator: &str, display_name: &str) -> NodeRecord {
+        NodeRecord {
+            id: id.to_owned(),
+            kind: kind.to_owned(),
+            locator: locator.to_owned(),
+            display_name: display_name.to_owned(),
+            properties: json!({}),
+        }
+    }
+
+    fn evidence(owner_type: &str, owner_id: &str, ordinal: i64, path: &str) -> EvidenceRecord {
+        EvidenceRecord {
+            owner_type: owner_type.to_owned(),
+            owner_id: owner_id.to_owned(),
+            ordinal,
+            kind: "semantic".to_owned(),
+            extractor: "go-types".to_owned(),
+            extractor_version: "1".to_owned(),
+            path: path.to_owned(),
+            start_line: 1,
+            start_column: 1,
+            end_line: 1,
+            end_column: 2,
+            detail: None,
+            properties: json!({}),
+        }
+    }
 
     fn snapshot() -> GraphSnapshot {
         let nodes = ["a", "b", "c"]
@@ -479,5 +562,189 @@ mod tests {
         let result = cycles(&snapshot(), CycleLevel::File);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].node_ids.first(), result[0].node_ids.last());
+    }
+
+    #[test]
+    fn semantic_selectors_only_match_their_node_kind() -> Result<()> {
+        let mut graph = snapshot();
+        let mut type_node = node(
+            "type:sha256:222",
+            "type",
+            "example.com/module.Common",
+            "Common",
+        );
+        type_node.properties = json!({
+            "canonical_identity": {"resolver_identity": 42}
+        });
+        graph.nodes = vec![
+            node(
+                "symbol:sha256:111",
+                "symbol",
+                "example.com/module.Common",
+                "Common",
+            ),
+            type_node,
+            node("file:sha256:333", "file", "file://Common", "Common"),
+        ];
+
+        assert_eq!(
+            resolve_selector(&graph, "symbol:Common")?.id,
+            "symbol:sha256:111"
+        );
+        assert_eq!(
+            resolve_selector(&graph, "type:Common")?.id,
+            "type:sha256:222"
+        );
+        assert_eq!(
+            resolve_selector(&graph, "id:symbol:sha256:111")?.kind,
+            "symbol"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn semantic_selector_prefers_exact_resolver_identity_over_locator_partial_matches() -> Result<()>
+    {
+        let mut graph = snapshot();
+        let symbol_resolver = "example.com/semantic/model.InferredCall";
+        let type_resolver = "example.com/semantic/model.GenericMatcher";
+        let semantic_node = |id: &str, kind: &str, resolver: &str, display_name: &str| NodeRecord {
+            id: id.to_owned(),
+            kind: kind.to_owned(),
+            locator: format!("go-{kind}:{resolver}"),
+            display_name: display_name.to_owned(),
+            properties: json!({
+                "language": "go",
+                "package_locator": "go-package:example.com/semantic/model",
+                "canonical_identity": {
+                    "language": "go",
+                    "package_locator": "go-package:example.com/semantic/model",
+                    "identity_kind": "named",
+                    "resolver_identity": resolver,
+                }
+            }),
+        };
+        graph.nodes = vec![
+            semantic_node("symbol:origin", "symbol", symbol_resolver, "InferredCall"),
+            semantic_node(
+                "symbol:instance",
+                "symbol",
+                &format!("{symbol_resolver}[int]"),
+                "InferredCall[int]",
+            ),
+            semantic_node("type:origin", "type", type_resolver, "GenericMatcher"),
+            semantic_node(
+                "type:instance",
+                "type",
+                &format!("{type_resolver}[string]"),
+                "GenericMatcher[string]",
+            ),
+        ];
+
+        assert_eq!(
+            resolve_selector(&graph, &format!("symbol:{symbol_resolver}"))?.id,
+            "symbol:origin"
+        );
+        assert_eq!(
+            resolve_selector(&graph, &format!("type:{type_resolver}"))?.id,
+            "type:origin"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_selector_prefixes_remain_compatible() -> Result<()> {
+        let mut graph = snapshot();
+        let mut file = node("file:id", "file", "file://src/lib.rs", "lib.rs");
+        file.properties = json!({"path": "src/lib.rs"});
+        graph.nodes = vec![
+            file,
+            node("package:id", "package_instance", "pkg://demo", "demo"),
+            node(
+                "route:id",
+                "route",
+                "route:///products/$id",
+                "/products/$id",
+            ),
+        ];
+
+        assert_eq!(resolve_selector(&graph, "id:file:id")?.id, "file:id");
+        assert_eq!(resolve_selector(&graph, "path:src/lib.rs")?.id, "file:id");
+        assert_eq!(resolve_selector(&graph, "package:demo")?.id, "package:id");
+        assert_eq!(
+            resolve_selector(&graph, "route:/products/$id")?.id,
+            "route:id"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ambiguous_selector_lists_stable_ids_in_deterministic_order() {
+        let mut graph = snapshot();
+        graph.nodes = vec![
+            node("symbol:z", "symbol", "go://z.Shared", "Shared"),
+            node("symbol:a", "symbol", "go://a.Shared", "Shared"),
+        ];
+
+        let message = resolve_selector(&graph, "symbol:Shared")
+            .expect_err("selector must be ambiguous")
+            .to_string();
+        assert_eq!(
+            message,
+            "selector \"symbol:Shared\" is ambiguous; select a candidate with id:<stable-id>. candidates: go://a.Shared (symbol, id:symbol:a), go://z.Shared (symbol, id:symbol:z)"
+        );
+    }
+
+    #[test]
+    fn traversal_steps_include_only_owned_edge_evidence_in_canonical_order() -> Result<()> {
+        let mut graph = snapshot();
+        graph.edges[0].phase = "semantic".to_owned();
+        graph.evidence = vec![
+            evidence("edge", "e0", 2, "second.go"),
+            evidence("site", "e0", 0, "site.go"),
+            evidence("edge", "e1", 0, "other-edge.go"),
+            evidence("edge", "e0", 0, "first.go"),
+        ];
+
+        let deps = traverse(&graph, "id:a", false, false)?;
+        assert_eq!(deps.edges.len(), 1);
+        assert_eq!(deps.steps.len(), 1);
+        assert_eq!(deps.steps[0].edge.id, "e0");
+        assert_eq!(
+            deps.steps[0]
+                .evidence
+                .iter()
+                .map(|item| (item.ordinal, item.path.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(0, "first.go"), (2, "second.go")]
+        );
+
+        let dependents = traverse(&graph, "id:b", false, true)?;
+        assert_eq!(dependents.steps.len(), 1);
+        assert_eq!(dependents.steps[0].edge.id, "e0");
+        assert_eq!(dependents.steps[0].evidence.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn representative_symbol_cycle_is_deterministic() {
+        let mut graph = snapshot();
+        for node in &mut graph.nodes {
+            node.kind = "symbol".to_owned();
+        }
+        let expected_node_ids = vec![
+            "a".to_owned(),
+            "b".to_owned(),
+            "c".to_owned(),
+            "a".to_owned(),
+        ];
+
+        let first = cycles(&graph, CycleLevel::Symbol);
+        graph.edges.reverse();
+        let reversed = cycles(&graph, CycleLevel::Symbol);
+
+        assert_eq!(first[0].level, "symbol");
+        assert_eq!(first[0].node_ids, expected_node_ids);
+        assert_eq!(reversed[0].node_ids, expected_node_ids);
     }
 }
