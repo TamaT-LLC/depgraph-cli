@@ -1,0 +1,216 @@
+{
+  "schema_version": "1.0",
+  "scope": "required_semantic_subgraph",
+  "nodes": [
+    {
+      "locator": "go-symbol:example.com/semantic/model.Build",
+      "kind": "symbol",
+      "semantic_kind": "function"
+    },
+    {
+      "locator": "go-symbol:example.com/semantic/model.CycleLeft",
+      "kind": "symbol",
+      "semantic_kind": "function"
+    },
+    {
+      "locator": "go-symbol:example.com/semantic/model.CycleRight",
+      "kind": "symbol",
+      "semantic_kind": "function"
+    },
+    {
+      "locator": "go-symbol:example.com/semantic/model.DirectCallMatrix",
+      "kind": "symbol",
+      "semantic_kind": "function"
+    },
+    {
+      "locator": "go-symbol:example.com/semantic/model.ExternalCall",
+      "kind": "symbol",
+      "semantic_kind": "function"
+    },
+    {
+      "locator": "go-symbol:example.com/semantic/model.(MethodExpressionTarget).Execute",
+      "kind": "symbol",
+      "semantic_kind": "method"
+    },
+    {
+      "locator": "go-type:example.com/semantic/model.Input",
+      "kind": "type",
+      "semantic_kind": "struct"
+    },
+    {
+      "locator": "go-type:example.com/semantic/model.Worker",
+      "kind": "type",
+      "semantic_kind": "interface"
+    }
+  ],
+  "relations": [
+    {
+      "source_locator": "go-symbol:example.com/semantic/model.Build",
+      "target_locator": "go-type:example.com/semantic/model.Input",
+      "site_kind": "type_use",
+      "kind": "type_uses",
+      "phase": "semantic",
+      "resolution_status": "resolved",
+      "precision": "exact",
+      "evidence": {
+        "kind": "semantic",
+        "extractor": "go-types",
+        "extractor_version": "0.1.0",
+        "path": "model/model.go",
+        "start_line": 43,
+        "start_column": 18,
+        "end_line": 43,
+        "end_column": 23,
+        "properties": {
+          "resolver_identity": "example.com/semantic/model.Input"
+        }
+      }
+    },
+    {
+      "source_locator": "go-symbol:example.com/semantic/model.DirectCallMatrix",
+      "target_locator": "go-symbol:example.com/semantic/model.ExternalCall",
+      "site_kind": "call",
+      "kind": "calls",
+      "phase": "semantic",
+      "resolution_status": "resolved",
+      "precision": "exact",
+      "evidence": {
+        "kind": "semantic",
+        "extractor": "go-types",
+        "extractor_version": "0.1.0",
+        "path": "model/calls.go",
+        "start_line": 27,
+        "start_column": 11,
+        "end_line": 27,
+        "end_column": 32,
+        "properties": {
+          "call_kind": "function",
+          "dispatch": "static",
+          "resolver_identity": "example.com/semantic/model.ExternalCall"
+        }
+      }
+    },
+    {
+      "source_locator": "go-symbol:example.com/semantic/model.DirectCallMatrix",
+      "target_locator": "go-symbol:example.com/semantic/model.ExternalCall",
+      "site_kind": "call",
+      "kind": "may_call",
+      "phase": "semantic",
+      "resolution_status": "candidates",
+      "precision": "overapprox",
+      "evidence": {
+        "kind": "semantic",
+        "extractor": "go-ssa",
+        "extractor_version": "0.1.0",
+        "path": "model/calls.go",
+        "start_line": 42,
+        "start_column": 6,
+        "end_line": 42,
+        "end_column": 30,
+        "properties": {
+          "algorithm": "cha",
+          "analysis_scope": "partial_program",
+          "dispatch": "function_value",
+          "selection_reason": "library_or_partial_program"
+        }
+      }
+    },
+    {
+      "source_locator": "go-symbol:example.com/semantic/model.DirectCallMatrix",
+      "target_locator": "go-symbol:example.com/semantic/model.(MethodExpressionTarget).Execute",
+      "site_kind": "call",
+      "kind": "calls",
+      "phase": "semantic",
+      "resolution_status": "resolved",
+      "precision": "exact",
+      "evidence": {
+        "kind": "semantic",
+        "extractor": "go-types",
+        "extractor_version": "0.1.0",
+        "path": "model/calls.go",
+        "start_line": 32,
+        "start_column": 2,
+        "end_line": 32,
+        "end_column": 36,
+        "properties": {
+          "call_kind": "method",
+          "dispatch": "static",
+          "resolver_identity": "example.com/semantic/model.(MethodExpressionTarget).Execute"
+        }
+      }
+    },
+    {
+      "source_locator": "go-symbol:example.com/semantic/model.DirectCallMatrix",
+      "target_locator": "go-symbol:example.com/semantic/model.(MethodExpressionTarget).Execute",
+      "site_kind": "call",
+      "kind": "may_call",
+      "phase": "semantic",
+      "resolution_status": "candidates",
+      "precision": "overapprox",
+      "evidence": {
+        "kind": "semantic",
+        "extractor": "go-ssa",
+        "extractor_version": "0.1.0",
+        "path": "model/calls.go",
+        "start_line": 38,
+        "start_column": 2,
+        "end_line": 38,
+        "end_column": 19,
+        "properties": {
+          "algorithm": "cha",
+          "analysis_scope": "partial_program",
+          "dispatch": "interface",
+          "selection_reason": "library_or_partial_program"
+        }
+      }
+    },
+    {
+      "source_locator": "go-symbol:example.com/semantic/model.CycleLeft",
+      "target_locator": "go-symbol:example.com/semantic/model.CycleRight",
+      "site_kind": "call",
+      "kind": "calls",
+      "phase": "semantic",
+      "resolution_status": "resolved",
+      "precision": "exact",
+      "evidence": {
+        "kind": "semantic",
+        "extractor": "go-types",
+        "extractor_version": "0.1.0",
+        "path": "model/calls.go",
+        "start_line": 58,
+        "start_column": 2,
+        "end_line": 58,
+        "end_column": 14,
+        "properties": {
+          "call_kind": "function",
+          "dispatch": "static",
+          "resolver_identity": "example.com/semantic/model.CycleRight"
+        }
+      }
+    },
+    {
+      "source_locator": "go-symbol:example.com/semantic/model.CycleRight",
+      "target_locator": "go-symbol:example.com/semantic/model.CycleLeft",
+      "site_kind": "call",
+      "kind": "calls",
+      "phase": "semantic",
+      "resolution_status": "resolved",
+      "precision": "exact",
+      "evidence": {
+        "kind": "semantic",
+        "extractor": "go-types",
+        "extractor_version": "0.1.0",
+        "path": "model/calls.go",
+        "start_line": 62,
+        "start_column": 2,
+        "end_line": 62,
+        "end_column": 13,
+        "properties": {
+          "call_kind": "function",
+          "dispatch": "static",
+          "resolver_identity": "example.com/semantic/model.CycleLeft"
+        }
+      }
+    }
+  ]
+}
