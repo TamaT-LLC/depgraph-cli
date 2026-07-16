@@ -478,10 +478,9 @@ func (e *goSemanticExtractor) failCall(path, specifier, reason string, evidence 
 		Evidence:   append([]Evidence(nil), evidence...),
 		Properties: map[string]any{"reason": reason}, Recoverable: true,
 	}
-	for _, existing := range e.state.diagnostics {
-		if existing.ID == diagnostic.ID {
-			return
-		}
+	if e.diagnosticIDs[diagnostic.ID] {
+		return
 	}
+	e.diagnosticIDs[diagnostic.ID] = true
 	e.state.diagnostics = append(e.state.diagnostics, diagnostic)
 }

@@ -23,6 +23,7 @@ type goSemanticExtractor struct {
 	symbolNodesByResolver map[string]string
 	nodeResolvers         map[string]string
 	symbolOrigins         map[string][]goSemanticSymbolOrigin
+	diagnosticIDs         map[string]bool
 	complete              bool
 	beforeSites           map[string]bool
 }
@@ -71,8 +72,14 @@ func (s *scannerState) extractGoSemanticGraph(sources []*sourceFile) {
 		symbolNodesByResolver: map[string]string{},
 		nodeResolvers:         map[string]string{},
 		symbolOrigins:         map[string][]goSemanticSymbolOrigin{},
+		diagnosticIDs:         map[string]bool{},
 		complete:              true,
 		beforeSites:           make(map[string]bool, len(s.sites)),
+	}
+	for _, diagnostic := range s.diagnostics {
+		if diagnostic.ID != "" {
+			extractor.diagnosticIDs[diagnostic.ID] = true
+		}
 	}
 	for _, source := range sources {
 		extractor.sources[source.RelPath] = source
