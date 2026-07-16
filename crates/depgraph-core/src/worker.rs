@@ -508,11 +508,12 @@ fn worker_spec_from_path(
     runtime_requirement: Option<String>,
 ) -> WorkerSpec {
     if adapter == AdapterKind::Web {
+        let entrypoint = process_argument_path(&path);
         WorkerSpec {
             adapter,
             program: OsString::from("node"),
-            leading_args: vec![path.clone().into_os_string()],
-            display: format!("node {}", path.display()),
+            leading_args: vec![entrypoint.clone()],
+            display: format!("node {}", Path::new(&entrypoint).display()),
             artifact_path: path,
             runtime_requirement,
             expected_version: None,
@@ -527,6 +528,50 @@ fn worker_spec_from_path(
             runtime_requirement,
             expected_version: None,
         }
+    }
+}
+
+// Windows canonicalization deliberately returns a verbatim path (`\\?\...`).
+// That form is useful for integrity and confinement checks, but Node.js treats
+// a verbatim drive path passed as its entry script as `C:` and fails with
+// EISDIR. Preserve the canonical artifact path on WorkerSpec and normalize
+// only the argument handed to the external runtime.
+#[cfg(windows)]
+fn process_argument_path(path: &Path) -> OsString {
+    use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
+
+    let wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    OsString::from_wide(&without_windows_verbatim_prefix(&wide))
+}
+
+#[cfg(not(windows))]
+fn process_argument_path(path: &Path) -> OsString {
+    path.as_os_str().to_owned()
+}
+
+#[cfg(any(windows, test))]
+fn without_windows_verbatim_prefix(path: &[u16]) -> Vec<u16> {
+    const VERBATIM: &[u16] = &[b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16];
+    const VERBATIM_UNC: &[u16] = &[
+        b'\\' as u16,
+        b'\\' as u16,
+        b'?' as u16,
+        b'\\' as u16,
+        b'U' as u16,
+        b'N' as u16,
+        b'C' as u16,
+        b'\\' as u16,
+    ];
+
+    if let Some(rest) = path.strip_prefix(VERBATIM_UNC) {
+        [b'\\' as u16, b'\\' as u16]
+            .into_iter()
+            .chain(rest.iter().copied())
+            .collect()
+    } else if let Some(rest) = path.strip_prefix(VERBATIM) {
+        rest.to_vec()
+    } else {
+        path.to_vec()
     }
 }
 
@@ -1275,6 +1320,31 @@ fn parse_events_preserving_prefix(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalizes_windows_verbatim_paths_for_external_runtimes() {
+        let wide = |value: &str| value.encode_utf16().collect::<Vec<_>>();
+        let text = |value: Vec<u16>| String::from_utf16(&value).unwrap();
+
+        assert_eq!(
+            text(without_windows_verbatim_prefix(&wide(
+                r"\\?\C:\release\libexec\worker.mjs"
+            ))),
+            r"C:\release\libexec\worker.mjs"
+        );
+        assert_eq!(
+            text(without_windows_verbatim_prefix(&wide(
+                r"\\?\UNC\server\share\worker.mjs"
+            ))),
+            r"\\server\share\worker.mjs"
+        );
+        assert_eq!(
+            text(without_windows_verbatim_prefix(&wide(
+                r"C:\release\libexec\worker.mjs"
+            ))),
+            r"C:\release\libexec\worker.mjs"
+        );
+    }
 
     #[test]
     fn detects_workspace_markers_without_build_directories() -> Result<()> {
