@@ -267,8 +267,10 @@ func Scan(root string) (Result, error) {
 
 	work := WorkFile{}
 	workPath := filepath.Join(absRoot, "go.work")
+	untrustedWorkPath := ""
 	if _, lstatErr := os.Lstat(workPath); lstatErr == nil {
 		if _, resolveErr := resolveRegularFileWithinRoot(absRoot, workPath); resolveErr != nil {
+			untrustedWorkPath = workPath
 			ledgerPath := skippedMetadataPath("go.work")
 			reason := fmt.Sprintf("go.work could not be inventoried: %v", resolveErr)
 			skippedMetadata = append(skippedMetadata, FileCompletion{
@@ -300,6 +302,7 @@ func Scan(root string) (Result, error) {
 			}
 		}
 	} else if !os.IsNotExist(lstatErr) {
+		untrustedWorkPath = workPath
 		reason := fmt.Sprintf("go.work could not be inventoried: %v", lstatErr)
 		skippedMetadata = append(skippedMetadata, FileCompletion{
 			Path: "go.work", DiscoveredSites: 1, SkippedSites: 1, Skipped: true, Reason: reason,
@@ -315,9 +318,14 @@ func Scan(root string) (Result, error) {
 	}
 	workspaceIdentity := strings.Join(identityParts, "|")
 	configuredTags := configuredGoTags()
-	goPackages := loadGoPackagesInventory(absRoot, modules, work, configuredTags)
+	goPackagesWork := work
+	if untrustedWorkPath != "" {
+		goPackagesWork.Path = untrustedWorkPath
+		goPackagesWork.ParseIssues++
+	}
+	goPackages := loadGoPackagesInventory(absRoot, modules, goPackagesWork, configuredTags)
 	initialDiagnostics = append(initialDiagnostics, goPackages.Diagnostics...)
-	// The constrained metadata pass always disables cgo. GOOS/GOARCH and this
+	// The constrained typed-package pass always disables cgo. GOOS/GOARCH and this
 	// effective cgo state are profile axes even when no custom build tags were
 	// requested; otherwise host scans on different platforms would share IDs.
 	const cgoEnabled = "0"
