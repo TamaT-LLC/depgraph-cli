@@ -16,3 +16,5 @@ pub use scanner::{FileCoverage, ScanResult, scan};
 pub const ADAPTER: &str = "rust";
 pub const ADAPTER_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const EXTRACTOR: &str = "rust-static";
+pub const RUST_TOOLCHAIN_BASELINE: &str = "1.93.1";
+pub const RUST_HIR_INTEGRATION_POLICY: &str = "pinned-rust-analyzer-library";

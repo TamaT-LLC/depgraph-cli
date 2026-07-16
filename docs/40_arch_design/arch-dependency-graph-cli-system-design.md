@@ -390,29 +390,108 @@ TypeScript の `type_target` と runtime / bundler の `runtime_target` は別 e
 
 ## 9. Rust Adapter
 
-### 9.1 Safe Semantic Scan
+### 9.1 現状と採用 backend
 
-1. `cargo metadata --format-version 1` で workspace、package、target、dependency、resolved feature を取得する。
-2. rust-analyzer の project model で crate graph と active `cfg` を構築する。
-3. HIR / Semantics を用いて module、import、re-export、type、trait、impl、direct call を解決する。
-4. macro invocation と展開結果の provenance を可能な範囲で保持する。
+Milestone 1 の Rust worker は `syn` による syntax-only adapter である。`cargo metadata --format-version 1 --no-deps --frozen --offline` に成功した場合は workspace member、target、dependency declaration を利用し、失敗時は confined な manifest / lockfile の静的解析へ fallback する。`--no-deps` の出力は完全な resolve graph ではなく、現在の feature list も workspace 全体を決定的に近似した値である。この結果に `semantic-complete` を付与しない。
 
-`syn` や tree-sitter は、toolchain を利用できない場合の syntax inventory と broken source の fallback に限定する。
+現行の Cargo metadata path は Cargo 起動後に workspace member / path dependency を scan root へ絞り込むため、`members = ["../outside"]` のような manifest が Cargo に scan root 外の manifest を読ませる可能性を起動前には排除できない。この DTO は syntax inventory の best-effort 補助情報に限定し、safe HIR の入力としては不適格とする。9.3節の preflight / confined mirror gate が実装されるまで、この点からも HIR を有効化しない。
 
-### 9.2 Compiler-precise Scan
+Milestone 2 の HIR backend には、ADR-007 に従い、version を exact pin した rust-analyzer library 群を `depgraph-rust-worker` へ静的 link する方式を採用する。Rust worker 自体は core から独立 process として timeout、cancel、process-tree 停止、stdout / stderr 上限の管理下にあるため、library 統合でも core と HIR の障害境界は維持される。
 
-将来の opt-in backend として次を検討する。
+2026-07-16 時点で rust-analyzer の実 version / revision は未選定である。未検証 version を推測で記載せず、全 rust-analyzer crate の exact pin、compatibility fixture、safe-scan gate、release gate が揃うまで `rust_hir_backend=disabled` とする。したがって現在の supported HIR matrix は空であり、syntax inventory のみが有効である。
+
+### 9.2 方式比較
+
+| 方式 | 安全性 / 決定性 | graph 抽出 interface | 配布 / 障害境界 | 判定 |
+| --- | --- | --- | --- | --- |
+| exact pin した rust-analyzer library を Rust worker へ link | worker が crate graph、`cfg`、VFS を所有し、project config 探索と子 process 起動を API 境界で排除できる | HIR / Semantics に直接アクセスし、node / site / edge と source span を同一 transaction で構築できる | 既存 Rust worker の process 隔離と checksum を再利用できる。internal API 変更に弱いため exact pin が必須 | **採用** |
+| bundled `rust-analyzer` 外部 process、LSP / private command 利用 | config、Cargo、flycheck、proc-macro 起動を個別に無効化する必要がある | LSP に bulk HIR / type / call graph の安定 contract がなく、private request 依存が残る | OS / arch ごとの別 binary、checksum、handshake、子 process 監督が必要 | **棄却** |
+| system / project-local `rust-analyzer` 外部 process | PATH、rustup shim、project-local binary、自動 update で version と実行コードが変化する | 入力ごとに API と挙動が変わる | release manifest で integrity を保証できない | **safe scan で禁止** |
+| `syn` のみ | project code を実行せず broken source にも部分対応しやすい | compiler の name / type / trait resolution を再現できない | 現 worker 内で利用済み | **syntax inventory / fallback に限定** |
+
+### 9.3 Safe crate graph、`cfg`、VFS 境界
+
+HIR backend は rust-analyzer の workspace discovery、`load_cargo`、flycheck、proc-macro server、project config loader を呼び出さない。worker が次の safe input だけから analysis database を構築する。
+
+1. canonical scan root 内で inventory 済みの manifest、lockfile、Rust source bytes
+2. Cargo がたどり得る workspace member、path dependency、`patch` / `replace` manifest path を起動前に静的検証し、すべて scan root 内の admitted file と証明できる場合に限り、neutral cwd、`env_clear`、sanitized absolute `PATH`、`--frozen --offline --no-deps` で得た Cargo metadata DTO
+3. canonical sort / deduplicate 済みの profile target、crate ごとの edition、requested feature、worker-owned `cfg` table
+4. worker が発行した VFS file ID と canonical relative path
+
+crate graph には selected workspace target と scan root 内の path dependency だけを実 crate として追加する。registry / git dependency、`std` / `core` / `alloc`、scan root 外の path dependency は external sentinel とし、その定義が必要な resolution は `external` または `unresolved` にする。初期 HIR backend は system / project の sysroot source、Cargo registry source、`target/` artifact、`rust-project.json`、`.cargo/config*`、custom target JSON を load しない。current profile の workspace-global feature 展開を exact input とせず、package / crate ごとに feature `cfg` を再構築する。
+
+preflight が glob、symlink、外部 workspace member / path dependency、未知の Cargo path-bearing key を一意に confined と判定できない場合は Cargo metadata を起動せず、静的 manifest fallback と `RUST_HIR_CRATE_GRAPH_UNAVAILABLE` を選ぶ。Cargo の read set を OS sandbox で直接制限できない target でも同じ結果にする。実装時は admitted manifest / lockfile と target auto-discovery に必要な admitted source layout を worker-owned temporary directory へ複製した Cargo-visible input mirror で Cargo metadata を実行し、元 project tree の manifest path を Cargo に渡さない。source を複製しない場合は安全な placeholder と明示 target table で auto-discovery を無効化する。manifest / lockfile の absolute path-bearing field は mirror path へ rewrite できる既知 field に限定し、それ以外は reject する。Cargo が返す mirror absolute path は検証後に元の inventory ID へ写像し、graph identity に temporary path を入れない。
+
+rust-analyzer 側に arbitrary path を読む file loader を渡さない。`include!` 等は inventory 済みの confined file に解決できる場合だけ展開し、`OUT_DIR`、project environment、wrapper / compiler hook を注入しない。declarative macro と rust-analyzer 内の builtin macro は、追加 I/O や process を起動しない純粋な token 展開に限って利用できる。rust-analyzer / HIR phase から proc-macro dynamic library、proc-macro server、build script、Cargo check、project compilation、`RUSTC_WRAPPER`、`RUSTC_WORKSPACE_WRAPPER` を起動しない。外部 command は前段の制限済み Cargo metadata と、HIR enable gate 専用の `cargo --version --verbose` / `rustc --version --verbose` probe だけを許可する。どちらも `RUSTUP_AUTO_INSTALL=0` を必須とし、toolchain / component の download や user / project directory への write を許可しない。
+
+build script と proc macro は現行と同じく unresolved dependency site、`BUILD_SCRIPT_NOT_EXECUTED` / `PROC_MACRO_NOT_EXECUTED`、coverage reason として残す。selected crate にこれらの出力へ依存する site がある場合、HIR の一部を利用できても `semantic-complete` としない。safe scan の `project_code_executed=false` は profile / coverage / scan 全体で維持する。
+
+### 9.4 Supported toolchain matrix
+
+Rust の build baseline は repository、CI、doctor で固定済みの `1.93.1` とする。`Cargo.toml` の `rust-version=1.93` は MSRV declaration であり、HIR backend の exact compatibility pin の代替にはしない。rust-analyzer は必要な全 crate を同一 exact version / revision に固定し、`Cargo.lock`、worker handshake、profile metadata、release manifest へ記録する。semver range、複数 rust-analyzer revision の混在、runtime での自動選択は禁止する。
+
+| 状態 | Rust / Cargo | edition | effective target | rust-analyzer pin | HIR 判定 |
+| --- | --- | --- | --- | --- | --- |
+| 現在 | build / doctor baseline `1.93.1` | syntax parser が受理した edition | profile の host / configured target | 未選定 | `disabled`。syntax-only |
+| 初回 enable 候補 | neutral cwd / cleared project environment で probe した resolved system `rustc` / `cargo` が exact `1.93.1` baseline pair。project の `rust-toolchain*` pin がないか `1.93.1` と整合 | `2015` / `2018` / `2021` / `2024` | `x86_64-unknown-linux-gnu`、`aarch64-unknown-linux-gnu`、`x86_64-apple-darwin`、`aarch64-apple-darwin`、`x86_64-pc-windows-msvc` のうち fixture と package gate を通過した組合せ | `1.93.1` で全 gate を通過した単一 exact pin | confined Cargo metadata が成功した場合のみ enable。各 OS / edition / target はテスト通過後に個別に supported へ昇格 |
+| 非対応 toolchain | observed version 不一致、unavailable、または project が別 version / `stable` / `beta` / `nightly` を pin | 任意 | 任意 | 選択しない | syntax-only fallback。対応を semver から推測しない |
+| 非対応 input | baseline 一致 | 未対応 / malformed | custom target JSON、未検証 cross target | exact pin 済みでも選択しない | syntax-only fallback |
+| crate model 不完全 | baseline 一致 | supported | supported | exact pin 済み | Cargo metadata fallback、manifest / lockfile 不正、crate-scoped feature / `cfg` 構築不能なら syntax-only fallback |
+
+version probe は metadata と同じ system-command resolver、neutral cwd、`env_clear`、`RUSTUP_AUTO_INSTALL=0`、timeout / output 上限を使い、scan root、project `rust-toolchain*`、`.cargo/config*`、rustup override の影響を受けないことを armed fixture で証明する。fixture は未導入 toolchainを指定しても network request、toolchain install、user / project directory write が発生しないことも検証する。probe failure、version parse failure、rustc / Cargo の不一致時は HIR を起動しない。toolchain file は metadata として静的に読むだけとし、rustup に project channel の install / switch / download を依頼しない。floating channel が実行時に偶然 `1.93.1` を指しても reproducible pin とみなさない。`semantic-complete` は HIR enabled と同義ではなく、selected profile の source / crate graph / `cfg` / macro / type / dependency site がすべて分類済みで、skipped / unsupported / unresolved の理由がない場合に限る。
+
+### 9.5 Fallback、diagnostic、coverage
+
+| 状態 | 挙動 | diagnostic / coverage | 終了 |
+| --- | --- | --- | --- |
+| rust-analyzer exact pin / enable gate 完了前 | 現行 `syn` inventory だけを実行 | profile `rust_hir_backend=disabled`、`analysis=syntax` | syntax scan 自体の policy に従う |
+| toolchain / edition / target が matrix 外 | HIR を起動せず syntax graph を保持 | `RUST_HIR_TOOLCHAIN_UNSUPPORTED` または `RUST_HIR_INPUT_UNSUPPORTED`、reason `rust-hir-unsupported` | non-strict は継続。`semantic-complete` なし |
+| Cargo preflight 非適合 / safe Cargo metadata 失敗 / static manifest fallback | Cargo を起動しないか HIR crate graph を作らず、syntax graph を保持 | 既存 `CARGO_METADATA_FALLBACK` + `RUST_HIR_CRATE_GRAPH_UNAVAILABLE`、reason `rust-hir-crate-graph-unavailable` | non-strict は継続。`semantic-complete` なし |
+| external crate / sysroot 定義が必要 | sentinel で `external` または unknown target で `unresolved` | `RUST_HIR_EXTERNAL_DEFINITION_UNAVAILABLE`、該当 site と reason を ledger へ記録 | 継続。unresolved があれば `semantic-complete` なし |
+| build script / proc macro が必要 | 実行 / dynamic library load をせず影響 site を unresolved にする | 既存 `BUILD_SCRIPT_NOT_EXECUTED` / `PROC_MACRO_NOT_EXECUTED`、`project_code_executed=false` | 継続。`semantic-complete` なし |
+| HIR が typed recoverable error を返す | その profile の semantic event を全破棄し、syntax graph を保持 | `RUST_HIR_BACKEND_FAILURE`、reason `rust-hir-backend-failure` | partial coverage。strict policy の対象 |
+| HIR の panic / OOM、worker timeout / cancel、malformed protocol | 同一 process 内で syntax success へ格下げず Rust worker を失敗とする | core `worker-failure`、Rust profile incomplete。他 worker の graph は保持 | scan `partial`、exit `3` |
+| packaged Rust worker が missing / checksum不一致 | development worker、system / project rust-analyzer、syntax-only へ fallback しない | 現行 core `security-policy` | `security_failed`、exit `4` |
+| packaged Rust worker の protocol / adapter / backend version不一致、release-root 内 symlink | HIR enable 前の release gate では security policy として拒否する。現行 core は adapter mismatch を worker failure、release-root 内 symlinkを許容するため、そのまま HIR 対応済みとは申告しない | 後続 task で verifier / schema を強化し contract test を追加 | gate 完了後は `security_failed`、exit `4` |
+
+HIR enabled profile は少なくとも `analysis_backend=rust-analyzer-hir`、`rust_hir_backend=ra-library`、`rust_hir_status`、exact pin を示す `rust_analyzer_revision`、`rust_toolchain_baseline=1.93.1`、`rust_toolchain_observed`、`crate_graph_source=cargo-metadata`、`proc_macro_expansion=disabled`、`build_scripts_executed=false`、`proc_macros_executed=false` を machine-readable property として記録する。`rust_analyzer_revision` が `not-bundled` または未定のまま `ra-library` を申告してはならない。
+
+### 9.6 Version pin、更新、release 要件
+
+rust-analyzer は internal API を安定 contract とみなさない。導入 / 更新は次の atomic 手順で行う。
+
+1. Rust `1.93.1` で build できる rust-analyzer candidate を選び、利用する全 crate を exact `=` version または単一 commit revision に固定する。candidate の number / revision は検証開始時にはじめて設計書へ記録する。
+2. `Cargo.lock`、backend constant、worker `--version` handshake、profile metadata、supported matrix を同一 PR で更新する。rust-analyzer crate の duplicate revision を CI で拒否する。
+3. edition 2015 / 2018 / 2021 / 2024、feature / target-specific dependency、workspace / path dependency、broken / newer syntax、external dependency、build script、proc macro、malicious `.cargo/config` / wrapper、metadata fallback の golden / safety fixture を実行する。2回 scan の node / site / edge / coverage と source span の決定性も比較する。
+4. Tier 1 の macOS / Linux、Tier 2 の Windows package matrix で build、test、worker handshake、benchmark を実行し、SBOM / third-party license inventory を再生成する。新しい組合せはすべての gate 通過後だけ supported へ追加する。
+5. Rust baseline と rust-analyzer pin を独立に更新しない。regression 時は両者と lockfile / matrix を前回検証済みの組合せへ atomic rollback する。
+
+library 群は Rust worker binary に静的 link するため、release archive へ別の rust-analyzer executable を同梱しない。release manifest の Rust worker SHA-256 が backend code も一緒に保護する。package gate は handshake と manifest に記録した backend version / revision の一致を検証し、Cargo dependency graph から rust-analyzer 群を SPDX SBOM と license inventory へ含める。worker binary の missing / tampering は現行 packaged-layout verification で worker 起動前に fail closed する。
+
+初期 HIR backend は sysroot source を release 同梱しない。将来、exact な standard-library resolution のために sysroot source を追加する場合は、現行の実行可能 `entrypoint` 必須 `runtime_component` を流用しない。`kind=data-tree` と optional entrypoint、version、canonical root、whole-tree SHA-256 を持つ release component schema / verifier を先に導入し、missing / tampering / symlink 時に exit `4` で fail closed する。system / project `rust-src` への暗黙 fallback は行わない。
+
+### 9.7 後続 HIR 実装の分割
+
+| 後続 task | 期間 | 主な完了条件 | 前提 |
+| --- | --- | --- | --- |
+| RA pin と toolchain probe / in-memory VFS scaffold | 1〜2日 | exact dependency / revision、backend metadata / handshake、neutral version probe、inventory bytes だけを読む smoke test。HIR はまだ graph に昇格しない | なし |
+| Cargo read-confinement preflight / mirror | 1〜2日 | 外部 member / path / symlink fixture で Cargo を起動せず、manifest / lockfile / target layout の Cargo-visible mirror と absolute path rewrite / reject を検証する | なし |
+| Safe crate graph / per-crate `cfg` builder | 2〜3日 | workspace target、path dependency、edition、feature、supported target を analysis database へ投入。external / custom target / static fallback を ledger 化 | RA scaffold + Cargo confinement |
+| HIR symbol / type vertical slice | 2〜3日 | definition / reference / type / trait / impl の stable ID、source span、semantic contract fixture | crate graph builder |
+| HIR direct-call resolution | 2〜3日 | function / method call の `calls`、external / unresolved、macro provenance、candidate と exact の区別 | symbol / type slice |
+| Fallback / coverage / safety matrix | 1〜2日 | unsupported toolchain、metadata failure、proc macro / build script、backend typed failure、`project_code_executed=false` の contract test | crate graph + semantic slice |
+| Release schema / determinism E2E | 2〜3日 | worker version / symlink fail-closed、data-tree component schema、2回 scan、query / export、Tier 1 package、SBOM / license、benchmark gate | 上記すべて |
+
+### 9.8 Compiler-precise Scan
+
+rust-analyzer HIR backend と compiler-precise backend は別の意思決定とする。HIR safe scan は project の compiler / build hook を実行しない。将来の opt-in compiler-precise backend でのみ次を検討する。
 
 - Cargo unit graph
 - `RUSTC_WRAPPER`
 - typed MIR
 - monomorphized item graph
 
-nightly / `rustc_private` への依存は version 固定した worker 内へ隔離し、MVP の必須条件にしない。
-
-### 9.3 実行コード境界
-
-build script と proc macro は任意コードを実行できる。safe mode では自動実行せず、未展開または既存 artifact 利用として ledger へ記録する。実行する場合は `resolve --build --allow-project-code` を明示必須とする。
+nightly / `rustc_private` への依存は version 固定した worker 内へ隔離し、MVP または HIR safe scan の必須条件にしない。project code を実行する場合は `resolve --build --allow-project-code` を明示必須とし、phase / evidence を safe HIR graph と分離する。
 
 ## 10. Go Adapter
 
@@ -816,6 +895,10 @@ policy result も evidence span を持ち、CI annotation へ変換できるよ�
 
 **採用。** safe scan の compiler は、release manifest で version、entrypoint、canonical whole-tree SHA-256 を検証した bundled TypeScript に限定する。project-local TypeScript は version metadata の読取だけを許可し、同一versionであっても module、native compiler、standard library、plugin、config を load / execute しない。compiler の missing、tampering、crash、timeout では project-local / system compiler や lexical-only success へ fallbackせず、Web profileをincompleteとして非0終了する。これによりproject compilerとの完全な互換性より、`project_code_executed=false`、配布物integrity、決定性を優先する。規範的な選択表、安全境界、diagnostic、将来TypeCheckerの導入gateは11.1節に定める。
 
+### ADR-007: Pinned rust-analyzer Library in the Rust Worker
+
+**採用。** Rust HIR は、単一 exact version / revision へ固定した rust-analyzer library 群を既存の `depgraph-rust-worker` へ静的 link し、worker-owned crate graph / `cfg` / confined in-memory VFS で実行する。bundled 外部 rust-analyzer process は安定した bulk HIR export contract を持たず、config / Cargo / proc-macro 起動と別 artifact の監督を増やすため棄却する。system / project-local rust-analyzer は version、integrity、`project_code_executed=false` を保証できないため safe scan で禁止する。library の panic / timeout は既存の worker process 境界で隔離し、同一 process 内で syntax success へ格下げない。現在は rust-analyzer revision 未選定のため HIR を disabled とし、exact pin と全 gate が揃った場合だけ supported matrix を拡張する。規範的な安全境界、fallback、配布、更新手順は9節に定める。
+
 ## 21. Roadmap
 
 ### Milestone 0: Schema and Contract
@@ -878,7 +961,7 @@ policy result も evidence span を持ち、CI annotation へ変換できるよ�
 - Go worker と Node worker を release artifact にどう同梱するか
 - Next.js の既存 adapter と observer を安全に chain する方法
 - default profile matrix の範囲と組合せ爆発の抑制方法
-- Rust compiler-precise backend をどの toolchain channel で提供するか
+- Rust compiler-precise MIR backend をどの opt-in toolchain channel で提供するか（safe HIR backend の方式は ADR-007 で決定済み）
 - GraphQL / OpenAPI / Protocol Buffers / FFI adapter の優先順位
 - public OSS とするか、初期は private 検証とするか
 - graph query language を導入する時期
@@ -902,5 +985,6 @@ policy result も evidence span を持ち、CI annotation へ変換できるよ�
 
 ## 26. 更新履歴
 
+- 2026-07-16: ADR-007としてexact pinしたrust-analyzer libraryのRust worker統合、safe crate graph / VFS、toolchain matrix、fallback、配布・更新gateを確定（revision選定まではHIR disabled）
 - 2026-07-16: ADR-006としてsafe scanのbundled-only TypeScript compiler選択、fail-closed境界、diagnostic、将来TypeChecker導入gateを確定
 - 2026-07-15: 初版を作成
