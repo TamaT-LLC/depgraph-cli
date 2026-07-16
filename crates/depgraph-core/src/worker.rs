@@ -936,7 +936,6 @@ impl ProcessTreeGuard {
         }
         #[cfg(windows)]
         {
-            use std::os::windows::io::AsRawHandle as _;
             use windows_sys::Win32::{
                 Foundation::CloseHandle,
                 System::JobObjects::{
@@ -946,6 +945,7 @@ impl ProcessTreeGuard {
                 },
             };
 
+            let process_handle = child.raw_handle().context("worker has no process handle")?;
             let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
             limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
             let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
@@ -960,8 +960,8 @@ impl ProcessTreeGuard {
                     std::mem::size_of_val(&limits) as u32,
                 )
             };
-            let assigned = configured != 0
-                && unsafe { AssignProcessToJobObject(job, child.as_raw_handle() as _) } != 0;
+            let assigned =
+                configured != 0 && unsafe { AssignProcessToJobObject(job, process_handle) } != 0;
             if !assigned {
                 let error = std::io::Error::last_os_error();
                 unsafe {
