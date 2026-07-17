@@ -9,6 +9,7 @@ mod cargo_mirror;
 mod emit;
 mod hir_project;
 pub mod hir_scaffold;
+mod hir_semantic;
 mod manifest;
 mod metadata;
 mod scanner;

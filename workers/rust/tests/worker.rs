@@ -1,6 +1,6 @@
 use depgraph_protocol::{
     CompletenessLevel, EvidenceKind, Phase, Precision, ProtocolEvent, ResolutionStatus,
-    validate_ndjson,
+    stable_id_from_value, validate_ndjson, validate_safe_semantic_ndjson,
 };
 use depgraph_rust_worker::{
     ADAPTER_VERSION, RUST_ANALYZER_CRATE_VERSION, RUST_ANALYZER_REVISION,
@@ -22,6 +22,10 @@ fn security_fixture() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/security")
 }
 
+fn semantic_fixture() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/semantic")
+}
+
 #[test]
 fn typed_output_validates_and_contains_all_nine_events() {
     let result = scan(&fixture()).unwrap();
@@ -31,7 +35,7 @@ fn typed_output_validates_and_contains_all_nine_events() {
         serde_json::to_writer(&mut ndjson, event).unwrap();
         ndjson.push(b'\n');
     }
-    let validated = validate_ndjson(Cursor::new(&ndjson)).unwrap();
+    let validated = validate_safe_semantic_ndjson(Cursor::new(&ndjson)).unwrap();
     let names: BTreeSet<_> = validated
         .events
         .iter()
@@ -55,18 +59,29 @@ fn typed_output_validates_and_contains_all_nine_events() {
         validated
             .edges
             .values()
-            .all(|edge| edge.phase == Phase::Source)
+            .any(|edge| edge.phase == Phase::Source)
     );
     assert!(
         validated
             .edges
             .values()
-            .all(|edge| edge.evidence.iter().all(|evidence| {
+            .any(|edge| edge.phase == Phase::Semantic)
+    );
+    assert!(validated.edges.values().all(|edge| {
+        edge.evidence.iter().all(|evidence| match edge.phase {
+            Phase::Source => {
                 evidence.kind == EvidenceKind::Source
                     && evidence.extractor == "rust-static"
                     && evidence.extractor_version == ADAPTER_VERSION
-            }))
-    );
+            }
+            Phase::Semantic => {
+                evidence.kind == EvidenceKind::Semantic
+                    && evidence.extractor == "rust-analyzer-hir"
+                    && evidence.extractor_version == RUST_ANALYZER_CRATE_VERSION
+            }
+            Phase::Build | Phase::Runtime => false,
+        })
+    }));
     assert!(
         validated
             .diagnostics
@@ -75,6 +90,585 @@ fn typed_output_validates_and_contains_all_nine_events() {
     );
     assert!(result.coverage.unsupported_syntax > 0);
     assert!(result.coverage.completeness.is_empty());
+}
+
+#[test]
+fn hir_definition_graph_emits_exact_nodes_and_structural_relations() {
+    let result = scan(&semantic_fixture()).unwrap();
+    let events = build_events("rust-semantic-fixture", &result).unwrap();
+    let mut ndjson = Vec::new();
+    for event in &events {
+        serde_json::to_writer(&mut ndjson, event).unwrap();
+        ndjson.push(b'\n');
+    }
+    validate_safe_semantic_ndjson(Cursor::new(ndjson)).unwrap();
+
+    assert_eq!(
+        result.profile.properties["analysis"],
+        "syntax+hir-definitions"
+    );
+    assert_eq!(
+        result.profile.properties["analysis_backend"],
+        "static-syntax+rust-analyzer-hir"
+    );
+    assert_eq!(
+        result.profile.properties["rust_hir_status"],
+        "definition-graph-emitted"
+    );
+    assert_eq!(
+        result.profile.properties["rust_hir_semantic_issue_count"],
+        0
+    );
+    assert!(
+        !result
+            .coverage
+            .completeness
+            .contains(&CompletenessLevel::SemanticComplete)
+    );
+
+    let semantic_nodes: Vec<_> = result
+        .nodes
+        .iter()
+        .filter(|node| matches!(node.kind.as_str(), "symbol" | "type"))
+        .collect();
+    assert!(!semantic_nodes.is_empty());
+    for node in &semantic_nodes {
+        let identity = &node.properties["canonical_identity"];
+        assert_eq!(node.id, stable_id_from_value(&node.kind, identity));
+        assert_eq!(node.properties["language"], "rust");
+        if let Some(path) = node
+            .properties
+            .get("source_path")
+            .and_then(|path| path.as_str())
+        {
+            assert!(!Path::new(path).is_absolute());
+        } else {
+            assert!(matches!(
+                node.properties
+                    .get("symbol_kind")
+                    .or_else(|| node.properties.get("type_kind"))
+                    .and_then(serde_json::Value::as_str),
+                Some("function_instance" | "generic_instance")
+            ));
+        }
+        let serialized = serde_json::to_string(identity).unwrap();
+        assert!(!serialized.contains(semantic_fixture().to_string_lossy().as_ref()));
+        assert!(!serialized.contains("external:"));
+    }
+
+    let symbol_kinds: BTreeSet<_> = semantic_nodes
+        .iter()
+        .filter(|node| node.kind == "symbol")
+        .filter_map(|node| node.properties["symbol_kind"].as_str())
+        .collect();
+    assert!(
+        [
+            "function",
+            "method",
+            "associated_function",
+            "associated_constant",
+            "field",
+            "enum_variant",
+            "impl",
+            "parameter",
+            "local_variable",
+            "function_instance",
+        ]
+        .into_iter()
+        .all(|kind| symbol_kinds.contains(kind))
+    );
+    let type_kinds: BTreeSet<_> = semantic_nodes
+        .iter()
+        .filter(|node| node.kind == "type")
+        .filter_map(|node| node.properties["type_kind"].as_str())
+        .collect();
+    assert!(
+        [
+            "struct",
+            "enum",
+            "trait",
+            "type_alias",
+            "associated_type",
+            "type_parameter",
+            "generic_instance",
+        ]
+        .into_iter()
+        .all(|kind| type_kinds.contains(kind))
+    );
+    assert!(!semantic_nodes.iter().any(|node| {
+        node.kind == "symbol"
+            && node.properties["symbol_kind"] == "function_instance"
+            && node.properties["resolver_identity"]
+                .as_str()
+                .is_some_and(|resolver| resolver.contains("Envelope::value"))
+    }));
+    assert!(semantic_nodes.iter().any(|node| {
+        node.kind == "type"
+            && node.properties["type_kind"] == "generic_instance"
+            && node.properties["type_arguments"]
+                .as_array()
+                .is_some_and(|arguments| {
+                    arguments.iter().any(|argument| argument == "T=builtin:u32")
+                })
+    }));
+
+    let semantic_edges: Vec<_> = result
+        .edges
+        .iter()
+        .filter(|edge| edge.phase == Phase::Semantic)
+        .collect();
+    assert!(!semantic_edges.is_empty());
+    for edge in &semantic_edges {
+        assert!(matches!(
+            edge.kind.as_str(),
+            "declares" | "extends" | "implements" | "instantiates"
+        ));
+        assert_eq!(edge.site_id, None);
+        assert_eq!(edge.resolution_status, ResolutionStatus::Resolved);
+        assert_eq!(edge.precision, Precision::Exact);
+        assert!(edge.condition.render().contains("rust.crate_instance"));
+        let primary = edge.evidence.first().expect("semantic evidence");
+        assert_eq!(primary.kind, EvidenceKind::Semantic);
+        assert_eq!(primary.extractor, "rust-analyzer-hir");
+        assert_eq!(primary.extractor_version, RUST_ANALYZER_CRATE_VERSION);
+        assert!(
+            primary
+                .path
+                .as_deref()
+                .is_some_and(|path| !Path::new(path).is_absolute())
+        );
+        assert!(primary.start_line.is_some_and(|line| line > 0));
+        assert!(primary.start_column.is_some_and(|column| column > 0));
+        assert!(primary.end_line.is_some_and(|line| line > 0));
+        assert!(primary.end_column.is_some_and(|column| column > 0));
+        assert_eq!(
+            primary.properties["rust_analyzer_revision"],
+            RUST_ANALYZER_REVISION
+        );
+        let span = serde_json::json!({
+            "start_line": primary.start_line.unwrap(),
+            "start_column": primary.start_column.unwrap(),
+            "end_line": primary.end_line.unwrap(),
+            "end_column": primary.end_column.unwrap(),
+        });
+        assert_eq!(
+            edge.id,
+            stable_id_from_value(
+                "edge",
+                &serde_json::json!({
+                    "condition": edge.condition,
+                    "kind": edge.kind,
+                    "profile_id": edge.profile_id,
+                    "source": edge.source,
+                    "target": edge.target,
+                    "path": primary.path.as_deref().unwrap(),
+                    "span": span,
+                }),
+            )
+        );
+    }
+
+    let node_id = |resolver: &str| {
+        semantic_nodes
+            .iter()
+            .find(|node| {
+                node.properties
+                    .get("resolver_identity")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(resolver)
+            })
+            .map(|node| node.id.as_str())
+            .unwrap_or_else(|| panic!("missing semantic node {resolver}"))
+    };
+    let crate_key = "Cargo.toml#lib:rust_semantic_fixture:src/lib.rs";
+    let identified = node_id(&format!("{crate_key}::crate::domain::Identified"));
+    let named = node_id(&format!("{crate_key}::crate::domain::Named"));
+    let record = node_id(&format!("{crate_key}::crate::domain::Record"));
+    assert!(semantic_edges.iter().any(|edge| {
+        edge.kind == "extends" && edge.source == named && edge.target == identified
+    }));
+    assert!(semantic_edges.iter().any(|edge| {
+        edge.kind == "implements" && edge.source == record && edge.target == identified
+    }));
+    assert!(semantic_edges.iter().any(|edge| {
+        edge.kind == "implements" && edge.source == record && edge.target == named
+    }));
+    assert!(
+        semantic_edges
+            .iter()
+            .any(|edge| edge.kind == "instantiates")
+    );
+    assert!(
+        !result
+            .sites
+            .iter()
+            .any(|site| matches!(site.kind.as_str(), "call" | "type_use"))
+    );
+}
+
+#[test]
+fn hir_definition_graph_is_repeatable_and_checkout_independent() {
+    let first_temp = tempfile::tempdir().unwrap();
+    let second_temp = tempfile::tempdir().unwrap();
+    let first_root = first_temp.path().join("one");
+    let second_root = second_temp.path().join("two");
+    copy_tree(&semantic_fixture(), &first_root);
+    copy_tree(&semantic_fixture(), &second_root);
+
+    let first = scan(&first_root).unwrap();
+    let repeated = scan(&first_root).unwrap();
+    let second = scan(&second_root).unwrap();
+    let semantic_nodes = |result: &depgraph_rust_worker::ScanResult| {
+        result
+            .nodes
+            .iter()
+            .filter(|node| matches!(node.kind.as_str(), "symbol" | "type"))
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    let semantic_edges = |result: &depgraph_rust_worker::ScanResult| {
+        result
+            .edges
+            .iter()
+            .filter(|edge| edge.phase == Phase::Semantic)
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(semantic_nodes(&first), semantic_nodes(&repeated));
+    assert_eq!(semantic_edges(&first), semantic_edges(&repeated));
+    assert_eq!(semantic_nodes(&first), semantic_nodes(&second));
+    assert_eq!(semantic_edges(&first), semantic_edges(&second));
+}
+
+#[test]
+fn test_mode_skips_ambiguous_source_bound_locals_and_instances() {
+    let output = Command::new(env!("CARGO_BIN_EXE_depgraph-rust-worker"))
+        .arg("--root")
+        .arg(semantic_fixture())
+        .arg("--scan-id")
+        .arg("semantic-test-mode")
+        .env("DEPGRAPH_PROFILE_CONFIG", r#"{"rust_mode":"test"}"#)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "test-mode worker failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let validated = validate_safe_semantic_ndjson(Cursor::new(output.stdout)).unwrap();
+    let profile = validated.profiles.values().next().unwrap();
+    assert_eq!(
+        profile.properties["rust_hir_status"],
+        "definition-graph-partial"
+    );
+    assert_eq!(profile.properties["rust_hir_semantic_issue_count"], 2);
+    assert_eq!(
+        validated
+            .diagnostics
+            .values()
+            .filter(|diagnostic| diagnostic.code == "RUST_HIR_SOURCE_CONTEXT_AMBIGUOUS")
+            .count(),
+        2
+    );
+    assert!(
+        validated
+            .nodes
+            .values()
+            .any(|node| { node.kind == "symbol" && node.properties["symbol_kind"] == "function" })
+    );
+    assert!(!validated.nodes.values().any(|node| {
+        node.kind == "symbol"
+            && matches!(
+                node.properties["symbol_kind"].as_str(),
+                Some("parameter" | "local_variable" | "function_instance")
+            )
+    }));
+    assert!(
+        !validated.nodes.values().any(|node| {
+            node.kind == "type" && node.properties["type_kind"] == "generic_instance"
+        })
+    );
+}
+
+#[test]
+fn invalid_source_discards_the_hir_delta_and_preserves_syntax_output() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("broken");
+    copy_tree(&semantic_fixture(), &root);
+    fs::write(
+        root.join("src/lib.rs"),
+        "pub mod domain;\npub fn broken( {\n",
+    )
+    .unwrap();
+
+    let result = scan(&root).unwrap();
+    assert!(
+        result
+            .nodes
+            .iter()
+            .all(|node| !matches!(node.kind.as_str(), "symbol" | "type"))
+    );
+    assert!(result.edges.iter().all(|edge| edge.phase == Phase::Source));
+    assert_eq!(
+        result.profile.properties["analysis_backend"],
+        "static-syntax"
+    );
+    assert_eq!(
+        result.profile.properties["rust_hir_project_model"],
+        "unavailable"
+    );
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| { diagnostic.code == "RUST_HIR_CRATE_GRAPH_UNAVAILABLE" })
+    );
+    assert!(result.nodes.iter().any(|node| node.kind == "module"));
+}
+
+#[test]
+fn external_and_unresolved_types_do_not_become_fake_exact_semantic_nodes() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("unresolved");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname='unresolved-types'\nversion='0.1.0'\nedition='2024'\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("Cargo.lock"),
+        "version = 4\n\n[[package]]\nname = \"unresolved-types\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"pub struct Local;
+pub trait LocalTrait {}
+pub fn accepts(_: std::path::PathBuf, _: missing::Thing) {}
+impl missing::Trait for Local {}
+impl LocalTrait for std::path::PathBuf {}
+"#,
+    )
+    .unwrap();
+
+    let result = scan(&root).unwrap();
+    assert!(result.nodes.iter().any(|node| {
+        node.kind == "type"
+            && node.properties["resolver_identity"]
+                .as_str()
+                .is_some_and(|resolver| resolver.ends_with("::Local"))
+    }));
+    assert!(result.nodes.iter().any(|node| {
+        node.kind == "symbol"
+            && node
+                .properties
+                .get("resolver_identity")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|resolver| resolver.ends_with("::accepts"))
+    }));
+    assert!(!result.nodes.iter().any(|node| {
+        matches!(node.kind.as_str(), "symbol" | "type")
+            && node
+                .properties
+                .get("resolver_identity")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|identity| {
+                    identity.contains("PathBuf") || identity.contains("missing::Thing")
+                })
+    }));
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| { diagnostic.code == "RUST_HIR_IMPL_TRAIT_TARGET_UNAVAILABLE" })
+    );
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| { diagnostic.code == "RUST_HIR_IMPL_SELF_TYPE_UNREPRESENTABLE" })
+    );
+    assert_eq!(
+        result.profile.properties["rust_hir_status"],
+        "definition-graph-partial"
+    );
+}
+
+#[test]
+fn generated_derive_definitions_are_not_promoted_to_ordinary_exact_nodes() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("derive");
+    write_minimal_crate(
+        &root,
+        "derive-fixture",
+        r#"#[derive(Clone)]
+pub struct Derived { pub value: u32 }
+macro_rules! generated_impl {
+    () => { impl Derived { pub fn generated(&self) {} } };
+}
+generated_impl!();
+"#,
+    );
+
+    let result = scan(&root).unwrap();
+    assert!(result.nodes.iter().any(|node| {
+        node.kind == "type"
+            && node.properties["resolver_identity"]
+                .as_str()
+                .is_some_and(|resolver| resolver.ends_with("::Derived"))
+    }));
+    assert!(
+        !result
+            .nodes
+            .iter()
+            .any(|node| { node.kind == "symbol" && node.properties["symbol_kind"] == "impl" })
+    );
+    assert!(result.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "RUST_HIR_GENERATED_IMPL_SKIPPED"
+            || diagnostic.code == "RUST_HIR_GENERATED_DEFINITION_SKIPPED"
+    }));
+}
+
+#[test]
+fn const_generic_instances_are_skipped_instead_of_collapsing_exact_ids() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("const-generics");
+    write_minimal_crate(
+        &root,
+        "const-generic-fixture",
+        r#"pub struct Inner<T, const N: usize> { pub value: T }
+pub struct Outer<T> { pub value: T }
+pub fn first(value: u8) -> Outer<Inner<u8, 1>> {
+    Outer::<Inner<u8, 1>> { value: Inner::<u8, 1> { value } }
+}
+pub fn second(value: u8) -> Outer<Inner<u8, 2>> {
+    Outer::<Inner<u8, 2>> { value: Inner::<u8, 2> { value } }
+}
+"#,
+    );
+
+    let result = scan(&root).unwrap();
+    assert!(
+        !result.nodes.iter().any(|node| {
+            node.kind == "type" && node.properties["type_kind"] == "generic_instance"
+        })
+    );
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| { diagnostic.code == "RUST_HIR_CONST_GENERIC_INSTANCE_SKIPPED" })
+    );
+    assert_eq!(
+        result.profile.properties["rust_hir_status"],
+        "definition-graph-partial"
+    );
+}
+
+#[test]
+fn ambiguous_locals_and_anonymous_bodies_are_skipped_without_losing_the_delta() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("local-boundaries");
+    write_minimal_crate(
+        &root,
+        "local-boundary-fixture",
+        r#"pub struct Boxed<T> { pub value: T }
+pub struct ConstDefault<const N: usize = { let signature_local = 1; signature_local }>;
+
+pub fn signature(_: [u8; { let signature_fn_local = 1; signature_fn_local }]) {}
+
+pub fn patterns(value: Option<(u32, u32)>) {
+    let (Some((chosen, _)) | Some((_, chosen))) = value else { return; };
+    let closure_value = |closure_input: u32| {
+        let inside_closure = closure_input;
+        Boxed::<u32> { value: inside_closure }
+    };
+    let _ = (chosen, closure_value);
+}
+"#,
+    );
+
+    let result = scan(&root).unwrap();
+    assert_ne!(result.profile.properties["rust_hir_status"], "failed");
+    assert!(result.nodes.iter().any(|node| {
+        node.kind == "symbol"
+            && node.properties["symbol_kind"] == "function"
+            && node.display_name.as_deref() == Some("patterns")
+    }));
+    assert_eq!(
+        result
+            .nodes
+            .iter()
+            .filter(|node| {
+                node.kind == "symbol"
+                    && node.properties["symbol_kind"] == "local_variable"
+                    && node.display_name.as_deref() == Some("chosen")
+            })
+            .count(),
+        1
+    );
+    assert!(!result.nodes.iter().any(|node| {
+        node.kind == "symbol"
+            && matches!(
+                node.display_name.as_deref(),
+                Some("closure_input" | "inside_closure" | "signature_local" | "signature_fn_local")
+            )
+    }));
+    assert!(
+        !result.nodes.iter().any(|node| {
+            node.kind == "type" && node.properties["type_kind"] == "generic_instance"
+        })
+    );
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| { diagnostic.code == "RUST_HIR_ANONYMOUS_BODY_DEFINITION_SKIPPED" })
+    );
+}
+
+#[test]
+fn implicit_self_and_partial_dyn_bounds_do_not_collapse_generic_instances() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("implicit-types");
+    write_minimal_crate(
+        &root,
+        "implicit-type-fixture",
+        r#"pub struct Wrap<T> { pub value: T }
+pub struct Borrowed<'a, T> { pub value: &'a T }
+pub trait Marker {}
+pub trait First { fn wrapped() -> Wrap<Self> where Self: Sized; }
+pub trait Second { fn wrapped() -> Wrap<Self> where Self: Sized; }
+pub fn dynamic(value: &dyn Marker) -> Wrap<&dyn Marker> { Wrap { value } }
+pub fn borrowed<'a>(value: &'a u8) -> Borrowed<'a, u8> {
+    Borrowed::<u8> { value }
+}
+"#,
+    );
+
+    let result = scan(&root).unwrap();
+    assert!(
+        !result.nodes.iter().any(|node| {
+            node.kind == "type" && node.properties["type_kind"] == "generic_instance"
+        })
+    );
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| { diagnostic.code == "RUST_HIR_GENERIC_INSTANCE_UNREPRESENTABLE" })
+    );
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| { diagnostic.code == "RUST_HIR_LIFETIME_GENERIC_INSTANCE_SKIPPED" })
+    );
+    assert_eq!(
+        result.profile.properties["rust_hir_status"],
+        "definition-graph-partial"
+    );
 }
 
 #[test]
@@ -100,8 +694,16 @@ fn extracts_cargo_targets_conditions_modules_and_safe_mode_sites() {
     assert_eq!(result.profile.properties["rust_hir_project_model"], "ready");
     assert_eq!(
         result.profile.properties["rust_hir_enable_gate"],
-        "semantic-emission-pending"
+        "import-call-and-release-gates-pending"
     );
+    assert_eq!(
+        result.profile.properties["rust_hir_backend"],
+        "rust-analyzer-hir"
+    );
+    assert!(matches!(
+        result.profile.properties["rust_hir_status"].as_str(),
+        Some("definition-graph-emitted" | "definition-graph-partial")
+    ));
     assert_eq!(
         result.profile.properties["crate_graph_source"],
         "confined-cargo-metadata"
@@ -685,10 +1287,6 @@ fn default_rust_profile_has_stable_hashed_host_identity() {
     assert!(!target.is_empty());
     assert_eq!(first.environment["rust.host_target"], target);
     assert_eq!(first.properties["effective_target"], target);
-    assert_eq!(first.properties["analysis"], "syntax");
-    assert_eq!(first.properties["analysis_backend"], "static-syntax");
-    assert_eq!(first.properties["rust_hir_backend"], "disabled");
-    assert_eq!(first.properties["rust_hir_status"], "not-invoked");
     assert_eq!(
         first.properties["rust_hir_integration_policy"],
         "pinned-rust-analyzer-library"
@@ -712,6 +1310,23 @@ fn default_rust_profile_has_stable_hashed_host_identity() {
         probe_status,
         "compatible" | "unsupported" | "unavailable"
     ));
+    if probe_status == "compatible" {
+        assert_eq!(first.properties["analysis"], "syntax+hir-definitions");
+        assert_eq!(
+            first.properties["analysis_backend"],
+            "static-syntax+rust-analyzer-hir"
+        );
+        assert_eq!(first.properties["rust_hir_backend"], "rust-analyzer-hir");
+        assert!(matches!(
+            first.properties["rust_hir_status"].as_str(),
+            Some("definition-graph-emitted" | "definition-graph-partial")
+        ));
+    } else {
+        assert_eq!(first.properties["analysis"], "syntax");
+        assert_eq!(first.properties["analysis_backend"], "static-syntax");
+        assert_eq!(first.properties["rust_hir_backend"], "disabled");
+        assert_eq!(first.properties["rust_hir_status"], "not-invoked");
+    }
     assert_eq!(
         first.properties["rust_toolchain_observed"]["status"],
         probe_status
@@ -721,7 +1336,7 @@ fn default_rust_profile_has_stable_hashed_host_identity() {
         assert_eq!(first.properties["rust_hir_project_model"], "ready");
         assert_eq!(
             first.properties["rust_hir_enable_gate"],
-            "semantic-emission-pending"
+            "import-call-and-release-gates-pending"
         );
         assert!(
             first.properties["rust_hir_project_file_count"]
@@ -1085,7 +1700,7 @@ version = "0.1.0"
 }
 
 #[test]
-fn graph_ids_are_independent_of_checkout_and_metadata_fallback() {
+fn graph_ids_are_independent_of_checkout_and_regenerated_lockfile() {
     let first_temp = tempfile::tempdir().unwrap();
     let second_temp = tempfile::tempdir().unwrap();
     let first_root = first_temp.path().join("one");
@@ -1095,6 +1710,22 @@ fn graph_ids_are_independent_of_checkout_and_metadata_fallback() {
     let first = scan(&first_root).unwrap();
     fs::remove_file(second_root.join("Cargo.lock")).unwrap();
     let second = scan(&second_root).unwrap();
+
+    assert_eq!(
+        first.profile.properties["crate_graph_source"],
+        "confined-cargo-metadata"
+    );
+    assert_eq!(
+        second.profile.properties["crate_graph_source"],
+        "confined-cargo-metadata"
+    );
+    assert!(first.edges.iter().any(|edge| edge.phase == Phase::Semantic));
+    assert!(
+        second
+            .edges
+            .iter()
+            .any(|edge| edge.phase == Phase::Semantic)
+    );
     assert_eq!(
         first.nodes.iter().map(|node| &node.id).collect::<Vec<_>>(),
         second.nodes.iter().map(|node| &node.id).collect::<Vec<_>>()
@@ -1107,6 +1738,89 @@ fn graph_ids_are_independent_of_checkout_and_metadata_fallback() {
         first.edges.iter().map(|edge| &edge.id).collect::<Vec<_>>(),
         second.edges.iter().map(|edge| &edge.id).collect::<Vec<_>>()
     );
+}
+
+#[test]
+fn metadata_fallback_is_explicit_and_checkout_stable() {
+    let metadata_temp = tempfile::tempdir().unwrap();
+    let first_temp = tempfile::tempdir().unwrap();
+    let second_temp = tempfile::tempdir().unwrap();
+    let metadata_root = metadata_temp.path().join("metadata");
+    let first_root = first_temp.path().join("fallback-one");
+    let second_root = second_temp.path().join("fallback-two");
+    copy_tree(&fixture(), &metadata_root);
+    copy_tree(&fixture(), &first_root);
+    copy_tree(&fixture(), &second_root);
+    fs::write(first_root.join("Cargo.lock"), "[[package").unwrap();
+    fs::write(second_root.join("Cargo.lock"), "[[package").unwrap();
+
+    let metadata = scan(&metadata_root).unwrap();
+    let first = scan(&first_root).unwrap();
+    let repeated = scan(&first_root).unwrap();
+    let second = scan(&second_root).unwrap();
+    assert!(
+        metadata
+            .edges
+            .iter()
+            .any(|edge| edge.phase == Phase::Semantic)
+    );
+
+    for fallback in [&first, &repeated, &second] {
+        assert_eq!(
+            fallback.profile.properties["crate_graph_source"],
+            "static-manifest-fallback"
+        );
+        assert_eq!(
+            fallback.profile.properties["rust_hir_status"],
+            "not-invoked"
+        );
+        assert!(
+            fallback
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "CARGO_METADATA_FALLBACK")
+        );
+        assert!(
+            fallback
+                .coverage
+                .reasons
+                .iter()
+                .any(|reason| reason == "rust-hir-crate-graph-unavailable")
+        );
+        assert!(
+            !fallback
+                .nodes
+                .iter()
+                .any(|node| matches!(node.kind.as_str(), "symbol" | "type"))
+        );
+        assert!(
+            !fallback
+                .edges
+                .iter()
+                .any(|edge| edge.phase == Phase::Semantic)
+        );
+    }
+
+    let graph_ids = |result: &depgraph_rust_worker::ScanResult| {
+        let node_ids = result
+            .nodes
+            .iter()
+            .map(|node| node.id.clone())
+            .collect::<BTreeSet<_>>();
+        let site_ids = result
+            .sites
+            .iter()
+            .map(|site| site.id.clone())
+            .collect::<BTreeSet<_>>();
+        let edge_ids = result
+            .edges
+            .iter()
+            .map(|edge| edge.id.clone())
+            .collect::<BTreeSet<_>>();
+        (node_ids, site_ids, edge_ids)
+    };
+    assert_eq!(graph_ids(&first), graph_ids(&repeated));
+    assert_eq!(graph_ids(&first), graph_ids(&second));
 }
 
 #[test]
@@ -1173,4 +1887,19 @@ fn copy_tree(source: &Path, destination: &Path) {
             fs::copy(entry.path(), destination_path).unwrap();
         }
     }
+}
+
+fn write_minimal_crate(root: &Path, package_name: &str, source: &str) {
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("Cargo.toml"),
+        format!("[package]\nname='{package_name}'\nversion='0.1.0'\nedition='2024'\n"),
+    )
+    .unwrap();
+    fs::write(
+        root.join("Cargo.lock"),
+        format!("version = 4\n\n[[package]]\nname = \"{package_name}\"\nversion = \"0.1.0\"\n"),
+    )
+    .unwrap();
+    fs::write(root.join("src/lib.rs"), source).unwrap();
 }

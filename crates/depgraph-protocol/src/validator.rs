@@ -632,6 +632,36 @@ pub fn validate_site_edge_invariants(
     validate_site_edge_maps(&nodes, &edges, &sites)
 }
 
+/// Validates an in-memory graph against both the base endpoint/site contract
+/// and the opt-in semantic symbol/type/dependency contract.
+///
+/// Workers use this before atomically merging a semantic delta with an
+/// existing syntax graph, avoiding a serialize/parse round trip solely for
+/// contract validation.
+pub fn validate_semantic_graph(
+    nodes: &[GraphNode],
+    edges: &[GraphEdge],
+    sites: &[DependencySite],
+) -> Result<(), ProtocolError> {
+    let nodes: BTreeMap<_, _> = nodes
+        .iter()
+        .cloned()
+        .map(|node| (node.id.clone(), node))
+        .collect();
+    let edges: BTreeMap<_, _> = edges
+        .iter()
+        .cloned()
+        .map(|edge| (edge.id.clone(), edge))
+        .collect();
+    let sites: BTreeMap<_, _> = sites
+        .iter()
+        .cloned()
+        .map(|site| (site.id.clone(), site))
+        .collect();
+    validate_site_edge_maps(&nodes, &edges, &sites)?;
+    validate_semantic_maps(&nodes, &edges, &sites)
+}
+
 fn validate_site_edge_maps(
     nodes: &BTreeMap<String, GraphNode>,
     edges: &BTreeMap<String, GraphEdge>,
