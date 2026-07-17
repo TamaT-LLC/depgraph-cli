@@ -1,6 +1,9 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use depgraph_rust_worker::{ADAPTER_VERSION, build_events, scan};
+use depgraph_rust_worker::{
+    ADAPTER_VERSION, RUST_ANALYZER_CRATE_VERSION, RUST_ANALYZER_REVISION,
+    RUST_ANALYZER_SALSA_VERSION, build_events, scan,
+};
 use std::{
     io::{BufWriter, Write},
     path::PathBuf,
@@ -25,7 +28,9 @@ fn main() {
 fn run() -> Result<()> {
     let raw_args = std::env::args_os().skip(1).collect::<Vec<_>>();
     if raw_args.len() == 1 && matches!(raw_args[0].to_str(), Some("--version" | "-V")) {
-        println!("depgraph-rust-worker {ADAPTER_VERSION} (protocol 1.0)");
+        println!(
+            "depgraph-rust-worker {ADAPTER_VERSION} (protocol 1.0; rust-analyzer {RUST_ANALYZER_CRATE_VERSION}; rust-analyzer-revision {RUST_ANALYZER_REVISION}; salsa {RUST_ANALYZER_SALSA_VERSION})"
+        );
         return Ok(());
     }
     let args = Args::try_parse().map_err(|error| anyhow::anyhow!(error.to_string()))?;

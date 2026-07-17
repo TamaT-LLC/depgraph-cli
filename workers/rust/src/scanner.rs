@@ -1,11 +1,13 @@
 use crate::{
-    ADAPTER_VERSION, EXTRACTOR, RUST_HIR_INTEGRATION_POLICY, RUST_TOOLCHAIN_BASELINE,
+    ADAPTER_VERSION, EXTRACTOR, RUST_ANALYZER_CRATE_VERSION, RUST_ANALYZER_REVISION,
+    RUST_ANALYZER_SALSA_VERSION, RUST_HIR_INTEGRATION_POLICY, RUST_TOOLCHAIN_BASELINE,
     manifest::{
         Dependency, ManifestDocument, Package, expanded_features, normalize_path, parse_packages,
         select_static_documents, slash_path, workspace_identity,
     },
     metadata::{LockIndex, apply_lock_versions, run_cargo_metadata},
     source::{Occurrence, SourceSpan, collect_occurrences},
+    toolchain::{RustToolchainProbe, ToolchainProbeStatus, probe_rust_toolchain},
 };
 use anyhow::{Context, Result, bail};
 use depgraph_protocol::{
@@ -98,6 +100,17 @@ pub fn scan(root: &Path) -> Result<ScanResult> {
     if !root.is_dir() {
         bail!("scan root is not a directory: {}", root.display());
     }
+    let toolchain_probe = probe_rust_toolchain(&root);
+    let declared_toolchain = declared_rust_toolchain(&root);
+    let hir_toolchain_status = match &declared_toolchain {
+        RustToolchainDeclaration::Valid { channel, .. } if channel != RUST_TOOLCHAIN_BASELINE => {
+            ToolchainProbeStatus::Unsupported
+        }
+        RustToolchainDeclaration::Invalid { .. } => ToolchainProbeStatus::Unsupported,
+        RustToolchainDeclaration::Absent | RustToolchainDeclaration::Valid { .. } => {
+            toolchain_probe.status()
+        }
+    };
 
     let (documents, discovery_failures) = discover_manifests(&root)?;
     let metadata_manifest = documents
@@ -142,22 +155,68 @@ pub fn scan(root: &Path) -> Result<ScanResult> {
         (packages, active_documents, lock)
     });
     let repository_identity = workspace_identity(&packages, &active_documents);
-    let profile = rust_profile(&packages);
+    let profile = rust_profile(
+        &packages,
+        &toolchain_probe,
+        hir_toolchain_status,
+        declared_toolchain.channel(),
+        declared_toolchain.status(),
+    );
     let mut state = State::new(root.clone(), repository_identity, profile);
 
-    if let Some((path, declared)) = declared_rust_toolchain(&root)
-        && declared != RUST_TOOLCHAIN_BASELINE
-    {
-        state.add_diagnostic(
+    match &declared_toolchain {
+        RustToolchainDeclaration::Valid { path, channel } if channel != RUST_TOOLCHAIN_BASELINE => {
+            state.add_diagnostic(
+                DiagnosticSeverity::Info,
+                "RUST_TOOLCHAIN_BEST_EFFORT",
+                &format!(
+                    "repository declares Rust {channel} rather than the verified {RUST_TOOLCHAIN_BASELINE} baseline; static analysis continues on a best-effort basis"
+                ),
+                Some(path),
+                None,
+                &format!("toolchain:{channel}"),
+            );
+        }
+        RustToolchainDeclaration::Invalid { path, reason } => {
+            state.add_diagnostic(
+                DiagnosticSeverity::Warning,
+                "RUST_TOOLCHAIN_INVALID",
+                &format!(
+                    "repository toolchain declaration is not safely usable: {reason}; static analysis continues without HIR"
+                ),
+                Some(path),
+                None,
+                "toolchain:invalid",
+            );
+        }
+        RustToolchainDeclaration::Absent | RustToolchainDeclaration::Valid { .. } => {}
+    }
+    match hir_toolchain_status {
+        ToolchainProbeStatus::Compatible => state.add_diagnostic(
             DiagnosticSeverity::Info,
-            "RUST_TOOLCHAIN_BEST_EFFORT",
+            "RUST_HIR_SCAFFOLD_READY",
             &format!(
-                "repository declares Rust {declared} rather than the verified {RUST_TOOLCHAIN_BASELINE} baseline; static analysis continues on a best-effort basis"
+                "rust-analyzer {RUST_ANALYZER_CRATE_VERSION} ({RUST_ANALYZER_REVISION}) is pinned and the Rust {RUST_TOOLCHAIN_BASELINE} probe passed; semantic graph emission remains disabled until the safe project model is complete"
             ),
-            Some(&path),
             None,
-            &format!("toolchain:{declared}"),
-        );
+            None,
+            "rust-hir-scaffold-ready",
+        ),
+        ToolchainProbeStatus::Unsupported | ToolchainProbeStatus::Unavailable => {
+            state.reasons.insert("rust-hir-unsupported".into());
+            let reason = declared_toolchain
+                .rejection_reason()
+                .or_else(|| toolchain_probe.reason().map(str::to_owned))
+                .unwrap_or_else(|| "the verified Rust toolchain pair is unavailable".into());
+            state.add_diagnostic(
+                DiagnosticSeverity::Warning,
+                "RUST_HIR_TOOLCHAIN_UNSUPPORTED",
+                &format!("{reason}; HIR remains disabled and syntax analysis continues"),
+                declared_toolchain.path(),
+                None,
+                &format!("rust-hir-toolchain:{}", hir_toolchain_status.as_str()),
+            );
+        }
     }
 
     for document in &active_documents {
@@ -1775,7 +1834,13 @@ fn discover_manifests(root: &Path) -> Result<(Vec<ManifestDocument>, Vec<Discove
     Ok((documents, failures))
 }
 
-fn rust_profile(packages: &[Package]) -> Profile {
+fn rust_profile(
+    packages: &[Package],
+    toolchain_probe: &RustToolchainProbe,
+    hir_toolchain_status: ToolchainProbeStatus,
+    declared_toolchain: Option<&str>,
+    declared_toolchain_status: &str,
+) -> Profile {
     let mut selection = std::env::var("DEPGRAPH_PROFILE_CONFIG")
         .ok()
         .and_then(|raw| serde_json::from_str::<RustProfileSelection>(&raw).ok())
@@ -1818,7 +1883,10 @@ fn rust_profile(packages: &[Package]) -> Profile {
         language: "rust".into(),
         toolchain: Some(json!({
             "metadata_command": "cargo metadata --format-version 1 --no-deps --frozen --offline",
-            "adapter_version": ADAPTER_VERSION
+            "adapter_version": ADAPTER_VERSION,
+            "hir_probe": toolchain_probe.as_value(),
+            "declared_toolchain": declared_toolchain,
+            "declared_toolchain_status": declared_toolchain_status,
         })),
         command: Some("check".into()),
         target: Some(selected_target.clone()),
@@ -1838,9 +1906,21 @@ fn rust_profile(packages: &[Package]) -> Profile {
             "analysis_backend": "static-syntax",
             "rust_hir_backend": "disabled",
             "rust_hir_status": "not-invoked",
+            "rust_hir_scaffold": "available",
+            "rust_hir_enable_gate": if hir_toolchain_status == ToolchainProbeStatus::Compatible {
+                "safe-project-model-pending"
+            } else {
+                "toolchain-unsupported"
+            },
             "rust_hir_integration_policy": RUST_HIR_INTEGRATION_POLICY,
-            "rust_analyzer_revision": "not-bundled",
+            "rust_analyzer_version": RUST_ANALYZER_CRATE_VERSION,
+            "rust_analyzer_revision": RUST_ANALYZER_REVISION,
+            "rust_analyzer_salsa_version": RUST_ANALYZER_SALSA_VERSION,
             "rust_toolchain_baseline": RUST_TOOLCHAIN_BASELINE,
+            "rust_toolchain_probe_status": toolchain_probe.status().as_str(),
+            "rust_hir_toolchain_status": hir_toolchain_status.as_str(),
+            "rust_toolchain_declaration_status": declared_toolchain_status,
+            "rust_toolchain_observed": toolchain_probe.as_value(),
             "crate_graph_source_policy": "cargo-metadata-or-static-manifest",
             "syntax_fallback": "enabled",
             "effective_target": selected_target,
@@ -2100,34 +2180,126 @@ fn properties(value: Value) -> Properties {
     serde_json::from_value(value).expect("properties are always a JSON object")
 }
 
-fn declared_rust_toolchain(root: &Path) -> Option<(String, String)> {
+#[derive(Debug)]
+enum RustToolchainDeclaration {
+    Absent,
+    Valid { path: String, channel: String },
+    Invalid { path: String, reason: String },
+}
+
+impl RustToolchainDeclaration {
+    fn status(&self) -> &'static str {
+        match self {
+            Self::Absent => "absent",
+            Self::Valid { .. } => "valid",
+            Self::Invalid { .. } => "invalid",
+        }
+    }
+
+    fn channel(&self) -> Option<&str> {
+        match self {
+            Self::Valid { channel, .. } => Some(channel),
+            Self::Absent | Self::Invalid { .. } => None,
+        }
+    }
+
+    fn path(&self) -> Option<&str> {
+        match self {
+            Self::Valid { path, .. } | Self::Invalid { path, .. } => Some(path),
+            Self::Absent => None,
+        }
+    }
+
+    fn rejection_reason(&self) -> Option<String> {
+        match self {
+            Self::Valid { channel, .. } if channel != RUST_TOOLCHAIN_BASELINE => Some(format!(
+                "repository toolchain declaration {channel} does not exactly match {RUST_TOOLCHAIN_BASELINE}"
+            )),
+            Self::Invalid { reason, .. } => Some(format!(
+                "repository toolchain declaration is invalid: {reason}"
+            )),
+            Self::Absent | Self::Valid { .. } => None,
+        }
+    }
+}
+
+fn declared_rust_toolchain(root: &Path) -> RustToolchainDeclaration {
     for name in ["rust-toolchain.toml", "rust-toolchain"] {
         let candidate = root.join(name);
-        let Ok(canonical) = candidate.canonicalize() else {
-            continue;
+        match fs::symlink_metadata(&candidate) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                return RustToolchainDeclaration::Invalid {
+                    path: name.to_owned(),
+                    reason: "metadata could not be read".into(),
+                };
+            }
+        }
+        let canonical = match candidate.canonicalize() {
+            Ok(canonical) => canonical,
+            Err(_) => {
+                return RustToolchainDeclaration::Invalid {
+                    path: name.to_owned(),
+                    reason: "path could not be resolved".into(),
+                };
+            }
         };
         if !canonical.starts_with(root) || !canonical.is_file() {
-            continue;
+            return RustToolchainDeclaration::Invalid {
+                path: name.to_owned(),
+                reason: "path resolves outside the scan root or is not a regular file".into(),
+            };
         }
-        let Ok(source) = fs::read_to_string(canonical) else {
-            continue;
+        let source = match fs::read_to_string(canonical) {
+            Ok(source) => source,
+            Err(_) => {
+                return RustToolchainDeclaration::Invalid {
+                    path: name.to_owned(),
+                    reason: "file is unreadable or is not UTF-8".into(),
+                };
+            }
         };
         let declared = if name.ends_with(".toml") {
-            toml::from_str::<toml::Value>(&source)
-                .ok()?
-                .get("toolchain")?
-                .get("channel")?
-                .as_str()?
-                .trim()
-                .to_owned()
+            let parsed = match toml::from_str::<toml::Value>(&source) {
+                Ok(parsed) => parsed,
+                Err(_) => {
+                    return RustToolchainDeclaration::Invalid {
+                        path: name.to_owned(),
+                        reason: "TOML is malformed".into(),
+                    };
+                }
+            };
+            match parsed
+                .get("toolchain")
+                .and_then(|toolchain| toolchain.get("channel"))
+                .and_then(toml::Value::as_str)
+                .map(str::trim)
+                .filter(|channel| !channel.is_empty())
+            {
+                Some(channel) => channel.to_owned(),
+                None => {
+                    return RustToolchainDeclaration::Invalid {
+                        path: name.to_owned(),
+                        reason: "toolchain.channel is missing or empty".into(),
+                    };
+                }
+            }
         } else {
             source.trim().to_owned()
         };
-        if !declared.is_empty() {
-            return Some((name.to_owned(), declared));
+        if declared.is_empty() {
+            return RustToolchainDeclaration::Invalid {
+                path: name.to_owned(),
+                reason: "toolchain channel is empty".into(),
+            };
         }
+        return RustToolchainDeclaration::Valid {
+            path: name.to_owned(),
+            channel: declared,
+        };
     }
-    None
+    RustToolchainDeclaration::Absent
 }
 
 fn relative_path(root: &Path, path: &Path) -> String {
@@ -2352,6 +2524,92 @@ mod tests {
         assert_eq!(
             result.profile.properties["project_toolchain_executed"],
             false
+        );
+        assert_eq!(
+            result.profile.properties["rust_hir_toolchain_status"],
+            "unsupported"
+        );
+        assert_eq!(
+            result.profile.properties["rust_toolchain_declaration_status"],
+            "valid"
+        );
+        assert_eq!(
+            result.profile.properties["rust_toolchain_probe_status"],
+            result.profile.properties["rust_toolchain_observed"]["status"]
+        );
+    }
+
+    #[test]
+    fn malformed_toolchain_declaration_fails_closed_for_hir() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("src")).unwrap();
+        std::fs::write(
+            temp.path().join("Cargo.toml"),
+            "[package]\nname='malformed-toolchain'\nversion='0.1.0'\nedition='2024'\n",
+        )
+        .unwrap();
+        std::fs::write(temp.path().join("src/lib.rs"), "pub fn value() {}\n").unwrap();
+        std::fs::write(
+            temp.path().join("rust-toolchain.toml"),
+            "[toolchain\nchannel='1.93.1'\n",
+        )
+        .unwrap();
+
+        let result = scan(temp.path()).unwrap();
+        assert_eq!(
+            result.profile.properties["rust_hir_toolchain_status"],
+            "unsupported"
+        );
+        assert_eq!(
+            result.profile.properties["rust_toolchain_declaration_status"],
+            "invalid"
+        );
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "RUST_TOOLCHAIN_INVALID")
+        );
+        assert!(
+            !result
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "RUST_HIR_SCAFFOLD_READY")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_toolchain_symlink_fails_closed_for_hir() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname='linked-toolchain'\nversion='0.1.0'\nedition='2024'\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub fn value() {}\n").unwrap();
+        let outside = temp.path().join("rust-toolchain.toml");
+        std::fs::write(&outside, "[toolchain]\nchannel='1.93.1'\n").unwrap();
+        symlink(&outside, root.join("rust-toolchain.toml")).unwrap();
+
+        let result = scan(&root).unwrap();
+        assert_eq!(
+            result.profile.properties["rust_hir_toolchain_status"],
+            "unsupported"
+        );
+        assert_eq!(
+            result.profile.properties["rust_toolchain_declaration_status"],
+            "invalid"
+        );
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "RUST_TOOLCHAIN_INVALID")
         );
     }
 
