@@ -1,7 +1,7 @@
 use crate::{
-    Condition, DependencySite, Diagnostic, Evidence, EvidenceKind, GraphEdge, GraphNode,
-    PROTOCOL_VERSION, Phase, Precision, Profile, ProtocolEvent, ResolutionStatus, canonical_json,
-    stable_id_from_value,
+    CompletenessLevel, Condition, DependencySite, Diagnostic, Evidence, EvidenceKind, GraphEdge,
+    GraphNode, PROTOCOL_VERSION, Phase, Precision, Profile, ProtocolEvent, ResolutionStatus,
+    canonical_json, stable_id_from_value,
 };
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -334,14 +334,19 @@ impl ProtocolValidator {
                         profile_id: completed.profile_id.clone(),
                     });
                 }
-                validate_coverage(&completed.coverage)?;
-                validate_profile_coverage(&completed.profile_id, &completed.coverage, &self.sites)?;
                 if self.safe_mode && completed.coverage.project_code_executed {
                     return Err(ProtocolError::Invariant(format!(
                         "safe-mode profile {} reports project_code_executed=true",
                         completed.profile_id
                     )));
                 }
+                validate_coverage(&completed.coverage)?;
+                validate_profile_coverage(&completed.profile_id, &completed.coverage, &self.sites)?;
+                let profile = self
+                    .profiles
+                    .get(&completed.profile_id)
+                    .expect("profile completion requires a declared profile");
+                validate_profile_completeness(profile, &completed.coverage)?;
                 self.profile_coverage
                     .insert(completed.profile_id.clone(), completed.coverage.clone());
                 self.payload_closed = true;
@@ -358,6 +363,11 @@ impl ProtocolValidator {
                         profile_ids: uncompleted,
                     });
                 }
+                if self.safe_mode && completed.coverage.project_code_executed {
+                    return Err(ProtocolError::Invariant(
+                        "safe-mode coverage reports project_code_executed=true".into(),
+                    ));
+                }
                 validate_coverage(&completed.coverage)?;
                 validate_scan_coverage(
                     &completed.coverage,
@@ -371,11 +381,6 @@ impl ProtocolValidator {
                         "scan_started project_code_executed={} but final coverage reports {}",
                         self.project_code_executed, completed.coverage.project_code_executed
                     )));
-                }
-                if self.safe_mode && completed.coverage.project_code_executed {
-                    return Err(ProtocolError::Invariant(
-                        "safe-mode coverage reports project_code_executed=true".into(),
-                    ));
                 }
                 validate_site_edge_maps(&self.nodes, &self.edges, &self.sites)?;
                 self.state = StreamState::Completed;
@@ -1841,6 +1846,107 @@ fn validate_coverage(coverage: &crate::Coverage) -> Result<(), ProtocolError> {
     Ok(())
 }
 
+fn validate_profile_completeness(
+    profile: &Profile,
+    coverage: &crate::Coverage,
+) -> Result<(), ProtocolError> {
+    if profile.language != "rust"
+        || !coverage
+            .completeness
+            .contains(&CompletenessLevel::SemanticComplete)
+    {
+        return Ok(());
+    }
+
+    if !coverage
+        .completeness
+        .contains(&CompletenessLevel::SyntaxComplete)
+    {
+        return invariant(format!(
+            "Rust semantic-complete profile {} must also report syntax-complete",
+            profile.id
+        ));
+    }
+    if coverage
+        .reasons
+        .iter()
+        .any(|reason| reason == "rust-hir-backend-failure")
+    {
+        return invariant(format!(
+            "Rust semantic-complete profile {} cannot report rust-hir-backend-failure",
+            profile.id
+        ));
+    }
+
+    for (field, actual) in [
+        ("files_skipped", coverage.files_skipped),
+        ("unsupported_syntax", coverage.unsupported_syntax),
+        ("unresolved", coverage.unresolved),
+    ] {
+        if actual != 0 {
+            return invariant(format!(
+                "Rust semantic-complete profile {} requires {field}=0, found {actual}",
+                profile.id
+            ));
+        }
+    }
+    if coverage.project_code_executed {
+        return invariant(format!(
+            "Rust semantic-complete profile {} requires coverage project_code_executed=false",
+            profile.id
+        ));
+    }
+
+    for (property, expected) in [
+        ("analysis", "syntax+hir-imports-types-calls"),
+        ("analysis_backend", "static-syntax+rust-analyzer-hir"),
+        ("rust_hir_backend", "rust-analyzer-hir"),
+        ("rust_hir_status", "import-type-call-graph-emitted"),
+        ("rust_hir_project_model", "ready"),
+        ("rust_hir_enable_gate", "release-gate-pending"),
+        ("crate_graph_source", "confined-cargo-metadata"),
+        ("cargo_metadata_input", "confined-mirror"),
+        ("rust_toolchain_probe_status", "compatible"),
+        ("rust_hir_toolchain_status", "compatible"),
+        ("proc_macro_expansion", "disabled"),
+        ("build_script_policy", "disabled"),
+        ("proc_macro_policy", "disabled"),
+    ] {
+        let actual = profile.properties.get(property).and_then(Value::as_str);
+        if actual != Some(expected) {
+            return invariant(format!(
+                "Rust semantic-complete profile {} requires properties.{property}={expected:?}, found {actual:?}",
+                profile.id
+            ));
+        }
+    }
+    let semantic_issue_count = profile
+        .properties
+        .get("rust_hir_semantic_issue_count")
+        .and_then(Value::as_u64);
+    if semantic_issue_count != Some(0) {
+        return invariant(format!(
+            "Rust semantic-complete profile {} requires properties.rust_hir_semantic_issue_count=0, found {semantic_issue_count:?}",
+            profile.id
+        ));
+    }
+    for property in [
+        "project_code_executed",
+        "project_toolchain_executed",
+        "build_scripts_executed",
+        "proc_macros_executed",
+    ] {
+        let actual = profile.properties.get(property).and_then(Value::as_bool);
+        if actual != Some(false) {
+            return invariant(format!(
+                "Rust semantic-complete profile {} requires properties.{property}=false, found {actual:?}",
+                profile.id
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate_profile_coverage(
     profile_id: &str,
     coverage: &crate::Coverage,
@@ -1936,6 +2042,23 @@ fn validate_aggregate_profile_coverage(
         return invariant(
             "scan coverage hides project code execution reported by a profile".into(),
         );
+    }
+
+    for blocking_reason in ["rust-hir-backend-failure"] {
+        if profiles.values().any(|profile| {
+            profile
+                .reasons
+                .iter()
+                .any(|reason| reason == blocking_reason)
+        }) && !aggregate
+            .reasons
+            .iter()
+            .any(|reason| reason == blocking_reason)
+        {
+            return invariant(format!(
+                "scan coverage omits blocking profile reason {blocking_reason}"
+            ));
+        }
     }
     Ok(())
 }

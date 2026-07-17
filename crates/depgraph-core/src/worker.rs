@@ -8,7 +8,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use depgraph_protocol::{MAX_EVENT_LINE_BYTES, ProtocolEvent, ProtocolValidator};
+use depgraph_protocol::{MAX_EVENT_LINE_BYTES, ProtocolError, ProtocolEvent, ProtocolValidator};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -64,7 +64,62 @@ pub struct WorkerOutput {
     pub stderr: String,
     pub stderr_truncated: bool,
     pub error: Option<String>,
+    pub(crate) failure_kind: Option<WorkerFailureKind>,
     pub security_violation: bool,
+}
+
+#[derive(Debug)]
+struct WorkerExecution {
+    events: Vec<Value>,
+    stderr: String,
+    stderr_truncated: bool,
+    error: Option<String>,
+    failure_kind: Option<WorkerFailureKind>,
+    security_violation: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum WorkerFailureKind {
+    Timeout,
+    Cancelled,
+    MalformedProtocol,
+    OutputLimit,
+    NonzeroExit,
+    IncompleteProtocol,
+    TaskPanic,
+    Other,
+}
+
+impl WorkerFailureKind {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Timeout => "timeout",
+            Self::Cancelled => "cancelled",
+            Self::MalformedProtocol => "malformed-protocol",
+            Self::OutputLimit => "output-limit",
+            Self::NonzeroExit => "nonzero-exit",
+            Self::IncompleteProtocol => "incomplete-protocol",
+            Self::TaskPanic => "task-panic",
+            Self::Other => "other",
+        }
+    }
+}
+
+fn select_worker_failure_kind(kinds: &[WorkerFailureKind]) -> Option<WorkerFailureKind> {
+    const PRECEDENCE: &[WorkerFailureKind] = &[
+        WorkerFailureKind::Timeout,
+        WorkerFailureKind::Cancelled,
+        WorkerFailureKind::NonzeroExit,
+        WorkerFailureKind::OutputLimit,
+        WorkerFailureKind::MalformedProtocol,
+        WorkerFailureKind::IncompleteProtocol,
+        WorkerFailureKind::TaskPanic,
+        WorkerFailureKind::Other,
+    ];
+    PRECEDENCE
+        .iter()
+        .copied()
+        .find(|candidate| kinds.contains(candidate))
 }
 
 pub fn detect_adapters(root: &Path, follow_symlinks: bool) -> Result<Vec<AdapterKind>> {
@@ -594,17 +649,15 @@ pub async fn execute_worker(
 ) -> WorkerOutput {
     let adapter = spec.adapter;
     match execute_worker_inner(&spec, &root, &scan_id, &config, &profiles).await {
-        Ok((events, stderr, truncated, error)) => {
-            let security_violation = error.as_deref().is_some_and(is_security_error);
-            WorkerOutput {
-                adapter,
-                events,
-                stderr,
-                stderr_truncated: truncated,
-                error,
-                security_violation,
-            }
-        }
+        Ok(execution) => WorkerOutput {
+            adapter,
+            events: execution.events,
+            stderr: execution.stderr,
+            stderr_truncated: execution.stderr_truncated,
+            error: execution.error,
+            failure_kind: execution.failure_kind,
+            security_violation: execution.security_violation,
+        },
         Err(error) => {
             let error = format!("{error:#}");
             WorkerOutput {
@@ -612,6 +665,7 @@ pub async fn execute_worker(
                 events: Vec::new(),
                 stderr: String::new(),
                 stderr_truncated: false,
+                failure_kind: Some(WorkerFailureKind::Other),
                 security_violation: is_security_error(&error),
                 error: Some(error),
             }
@@ -620,11 +674,11 @@ pub async fn execute_worker(
 }
 
 pub(crate) fn is_security_error(error: &str) -> bool {
-    error.contains("project_code_executed=true")
-        || error.contains("security policy")
-        || error.contains("checksum mismatch")
-        || error.contains("unsafe path")
-        || error.contains("escapes scan root")
+    error.starts_with("security policy violation:")
+        || error.starts_with("security policy violation at line ")
+        || error.starts_with("safe-mode scan reports project_code_executed=true")
+        || (error.starts_with("protocol path ") && error.contains(" escapes scan root "))
+        || (error.starts_with("bundled ") && error.contains(" checksum mismatch"))
 }
 
 async fn execute_worker_inner(
@@ -633,7 +687,7 @@ async fn execute_worker_inner(
     scan_id: &str,
     config: &ScanConfig,
     profiles: &ProfileConfig,
-) -> Result<(Vec<Value>, String, bool, Option<String>)> {
+) -> Result<WorkerExecution> {
     execute_worker_inner_with_cancellation(
         spec,
         root,
@@ -652,7 +706,7 @@ async fn execute_worker_inner_with_cancellation<F>(
     config: &ScanConfig,
     profiles: &ProfileConfig,
     cancellation: F,
-) -> Result<(Vec<Value>, String, bool, Option<String>)>
+) -> Result<WorkerExecution>
 where
     F: Future<Output = std::io::Result<()>>,
 {
@@ -718,6 +772,7 @@ where
     let stderr_task = tokio::spawn(read_capped(stderr, config.max_stderr_bytes));
 
     let mut errors = Vec::new();
+    let mut failure_kinds = Vec::new();
     enum WaitResult {
         Process(
             std::result::Result<
@@ -737,23 +792,28 @@ where
     match wait_result {
         WaitResult::Process(Ok(Ok(status))) if !status.success() => {
             errors.push(format!("{} exited with {status}", spec.display));
+            failure_kinds.push(WorkerFailureKind::NonzeroExit);
         }
         WaitResult::Process(Ok(Ok(_))) => {}
         WaitResult::Process(Ok(Err(error))) => {
             errors.push(format!("failed to wait for {}: {error}", spec.display));
+            failure_kinds.push(WorkerFailureKind::Other);
         }
         WaitResult::Process(Err(_)) => {
             errors.push(format!(
                 "{} timed out after {} seconds",
                 spec.display, config.worker_timeout_seconds
             ));
+            failure_kinds.push(WorkerFailureKind::Timeout);
             terminate_worker(&mut child, &process_guard).await;
         }
         WaitResult::Cancelled(signal) => {
             if let Err(error) = signal {
                 errors.push(format!("failed to listen for cancellation: {error}"));
+                failure_kinds.push(WorkerFailureKind::Other);
             } else {
                 errors.push(format!("{} cancelled by user", spec.display));
+                failure_kinds.push(WorkerFailureKind::Cancelled);
             }
             terminate_worker(&mut child, &process_guard).await;
         }
@@ -762,10 +822,20 @@ where
     // exits. Closing the tree here also guarantees inherited pipes reach EOF.
     process_guard.terminate();
 
+    let previous_error_count = errors.len();
     let (stdout_bytes, stdout_truncated) =
         finish_reader(stdout_task, "stdout", &mut errors).await?;
+    failure_kinds.extend(std::iter::repeat_n(
+        WorkerFailureKind::Other,
+        errors.len() - previous_error_count,
+    ));
+    let previous_error_count = errors.len();
     let (stderr_bytes, stderr_truncated) =
         finish_reader(stderr_task, "stderr", &mut errors).await?;
+    failure_kinds.extend(std::iter::repeat_n(
+        WorkerFailureKind::Other,
+        errors.len() - previous_error_count,
+    ));
     let stderr = String::from_utf8_lossy(&stderr_bytes).into_owned();
     let parsed = parse_events_preserving_prefix(
         &stdout_bytes,
@@ -780,15 +850,33 @@ where
             "{} protocol output exceeded {} bytes",
             spec.display, config.max_protocol_bytes
         ));
+        failure_kinds.push(WorkerFailureKind::OutputLimit);
     }
     if let Some(error) = parsed.error {
         errors.push(error);
+        failure_kinds.push(
+            parsed
+                .failure_kind
+                .expect("a protocol error always has a typed failure kind"),
+        );
     }
-    if !errors.is_empty() && !stderr.is_empty() {
-        errors.push(format!("stderr: {stderr}"));
-    }
-    let error = (!errors.is_empty()).then(|| errors.join("; "));
-    Ok((parsed.events, stderr, stderr_truncated, error))
+    // Classify only supervisor/protocol errors. Worker stderr is retained for
+    // diagnosis but must never be able to spoof timeout/security categories.
+    let control_error = (!errors.is_empty()).then(|| errors.join("; "));
+    let failure_kind = select_worker_failure_kind(&failure_kinds);
+    let security_violation = parsed.security_violation;
+    let error = match (control_error, stderr.is_empty()) {
+        (Some(error), false) => Some(format!("{error}; stderr: {stderr}")),
+        (error, _) => error,
+    };
+    Ok(WorkerExecution {
+        events: parsed.events,
+        stderr,
+        stderr_truncated,
+        error,
+        failure_kind,
+        security_violation,
+    })
 }
 
 async fn read_capped(
@@ -1216,6 +1304,22 @@ pub fn parse_and_validate_events(
 struct ParsedProtocol {
     events: Vec<Value>,
     error: Option<String>,
+    failure_kind: Option<WorkerFailureKind>,
+    security_violation: bool,
+}
+
+fn protocol_error_is_security(error: &ProtocolError) -> bool {
+    match error {
+        ProtocolError::UnsafeScanMode { .. } | ProtocolError::UnsafePath { .. } => true,
+        ProtocolError::Invariant(message) => {
+            message == "safe-mode scan reports project_code_executed=true"
+                || message == "safe-mode coverage reports project_code_executed=true"
+                || message == "scan coverage hides project code execution reported by a profile"
+                || (message.starts_with("safe-mode profile ")
+                    && message.ends_with(" reports project_code_executed=true"))
+        }
+        _ => false,
+    }
 }
 
 fn parse_events_preserving_prefix(
@@ -1229,6 +1333,8 @@ fn parse_events_preserving_prefix(
     let mut validator = ProtocolValidator::for_safe_scan();
     let line_limit = configured_line_limit.min(MAX_EVENT_LINE_BYTES);
     let mut parse_error = None;
+    let mut failure_kind = None;
+    let mut security_violation = false;
     for (line_index, mut line) in stdout.split(|byte| *byte == b'\n').enumerate() {
         if line.last() == Some(&b'\r') {
             line = &line[..line.len() - 1];
@@ -1241,6 +1347,7 @@ fn parse_events_preserving_prefix(
                 "protocol line {} exceeds {line_limit} bytes",
                 line_index + 1
             ));
+            failure_kind = Some(WorkerFailureKind::OutputLimit);
             break;
         }
         let event: ProtocolEvent = match serde_json::from_slice(line) {
@@ -1250,15 +1357,18 @@ fn parse_events_preserving_prefix(
                     "malformed NDJSON at line {}: {error}",
                     line_index + 1
                 ));
+                failure_kind = Some(WorkerFailureKind::MalformedProtocol);
                 break;
             }
         };
         if event.common().scan_id != expected_scan_id {
             parse_error = Some(format!("scan_id mismatch at line {}", line_index + 1));
+            failure_kind = Some(WorkerFailureKind::MalformedProtocol);
             break;
         }
         if event.common().adapter != expected_adapter {
             parse_error = Some(format!("adapter mismatch at line {}", line_index + 1));
+            failure_kind = Some(WorkerFailureKind::MalformedProtocol);
             break;
         }
         if expected_adapter_version
@@ -1270,6 +1380,7 @@ fn parse_events_preserving_prefix(
                 expected_adapter_version.unwrap_or_default(),
                 event.common().adapter_version
             ));
+            failure_kind = Some(WorkerFailureKind::MalformedProtocol);
             break;
         }
         if let ProtocolEvent::ScanStarted(started) = &event {
@@ -1278,6 +1389,8 @@ fn parse_events_preserving_prefix(
                     "security policy violation at line {}: normal scans require safe_mode=true and project_code_executed=false",
                     line_index + 1
                 ));
+                failure_kind = Some(WorkerFailureKind::MalformedProtocol);
+                security_violation = true;
                 break;
             }
             let declared_root = PathBuf::from(&started.root)
@@ -1289,14 +1402,17 @@ fn parse_events_preserving_prefix(
                     declared_root.display(),
                     root.display()
                 ));
+                failure_kind = Some(WorkerFailureKind::MalformedProtocol);
                 break;
             }
         }
         if let Err(error) = validator.push(event) {
+            security_violation = protocol_error_is_security(&error);
             parse_error = Some(format!(
                 "protocol validation failed at line {}: {error}",
                 line_index + 1
             ));
+            failure_kind = Some(WorkerFailureKind::MalformedProtocol);
             break;
         }
     }
@@ -1305,6 +1421,7 @@ fn parse_events_preserving_prefix(
         && let Err(error) = validator.finish()
     {
         parse_error = Some(format!("incomplete protocol stream: {error}"));
+        failure_kind = Some(WorkerFailureKind::IncompleteProtocol);
     }
     let events = prefix
         .into_iter()
@@ -1314,6 +1431,8 @@ fn parse_events_preserving_prefix(
     ParsedProtocol {
         events,
         error: parse_error,
+        failure_kind,
+        security_violation,
     }
 }
 
@@ -1398,6 +1517,27 @@ mod tests {
             "protocol path ../secret escapes scan root /project"
         ));
         assert!(!is_security_error("worker timed out"));
+        assert!(!is_security_error(
+            "failed to start /tmp/security policy/checksum mismatch/worker"
+        ));
+    }
+
+    #[test]
+    fn protocol_values_cannot_spoof_security_classification() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let root = root.path().canonicalize()?;
+        let output = format!(
+            "{{\"event\":\"scan_started\",\"protocol_version\":\"1.0\",\"scan_id\":\"s\",\"adapter\":\"security policy\",\"adapter_version\":\"0.1.0\",\"seq\":1,\"root\":{},\"project_code_executed\":false,\"safe_mode\":true}}\n",
+            serde_json::to_string(&root.to_string_lossy())?
+        );
+        let parsed =
+            parse_events_preserving_prefix(output.as_bytes(), "s", "go", &root, 4096, None);
+        assert_eq!(
+            parsed.failure_kind,
+            Some(WorkerFailureKind::MalformedProtocol)
+        );
+        assert!(!parsed.security_violation);
+        Ok(())
     }
 
     #[test]
@@ -1732,7 +1872,7 @@ exec sleep 10
         };
         // Keep this test independent from the process-wide Ctrl-C listener;
         // cancellation has its own deterministic test below.
-        let (events, stderr, stderr_truncated, error) = execute_worker_inner_with_cancellation(
+        let execution = execute_worker_inner_with_cancellation(
             &spec,
             &root,
             "timeout-scan",
@@ -1751,10 +1891,12 @@ exec sleep 10
             std::future::pending::<std::io::Result<()>>(),
         )
         .await?;
-        assert_eq!(events.len(), 2);
-        assert!(error.unwrap().contains("timed out"));
-        assert_eq!(stderr, "01234567");
-        assert!(stderr_truncated);
+        assert_eq!(execution.events.len(), 2);
+        assert!(execution.error.unwrap().contains("timed out"));
+        assert_eq!(execution.stderr, "01234567");
+        assert!(execution.stderr_truncated);
+        assert_eq!(execution.failure_kind, Some(WorkerFailureKind::Timeout));
+        assert!(!execution.security_violation);
         Ok(())
     }
 
@@ -1800,7 +1942,7 @@ exec sleep 30
         };
         let started = Instant::now();
         let ready = temp.path().join("ready");
-        let (events, stderr, truncated, error) = execute_worker_inner_with_cancellation(
+        let execution = execute_worker_inner_with_cancellation(
             &spec,
             &root,
             "cancel-scan",
@@ -1824,10 +1966,12 @@ exec sleep 30
         )
         .await?;
         assert!(started.elapsed() < Duration::from_secs(2));
-        assert_eq!(events.len(), 2);
-        assert_eq!(stderr, "worker-log");
-        assert!(!truncated);
-        assert!(error.unwrap().contains("cancelled by user"));
+        assert_eq!(execution.events.len(), 2);
+        assert_eq!(execution.stderr, "worker-log");
+        assert!(!execution.stderr_truncated);
+        assert!(execution.error.unwrap().contains("cancelled by user"));
+        assert_eq!(execution.failure_kind, Some(WorkerFailureKind::Cancelled));
+        assert!(!execution.security_violation);
         Ok(())
     }
 
@@ -1927,7 +2071,7 @@ printf '{"event":"scan_completed","protocol_version":"1.0","scan_id":"%s","adapt
             runtime_requirement: None,
             expected_version: None,
         };
-        let (events, _, _, error) = execute_worker_inner_with_cancellation(
+        let execution = execute_worker_inner_with_cancellation(
             &spec,
             &root,
             "neutral-cwd-scan",
@@ -1936,8 +2080,10 @@ printf '{"event":"scan_completed","protocol_version":"1.0","scan_id":"%s","adapt
             std::future::pending::<std::io::Result<()>>(),
         )
         .await?;
-        assert_eq!(events.len(), 2);
-        assert!(error.is_none(), "{error:?}");
+        assert_eq!(execution.events.len(), 2);
+        assert!(execution.error.is_none(), "{:?}", execution.error);
+        assert_eq!(execution.failure_kind, None);
+        assert!(!execution.security_violation);
         assert!(!root.join("CWD_MARKER").exists());
         Ok(())
     }

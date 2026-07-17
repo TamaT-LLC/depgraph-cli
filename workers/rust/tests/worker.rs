@@ -940,13 +940,37 @@ fn hir_import_type_graph_is_repeatable_and_checkout_independent() {
     assert_eq!(semantic_nodes(&first), semantic_nodes(&repeated));
     assert_eq!(semantic_edges(&first), semantic_edges(&repeated));
     assert_eq!(semantic_sites(&first), semantic_sites(&repeated));
+    assert_eq!(first.profile, repeated.profile);
+    assert_eq!(first.nodes, repeated.nodes);
+    assert_eq!(first.edges, repeated.edges);
+    assert_eq!(first.sites, repeated.sites);
+    assert_eq!(first.diagnostics, repeated.diagnostics);
     assert_eq!(first.coverage, repeated.coverage);
     assert_eq!(first.files, repeated.files);
     assert_eq!(semantic_nodes(&first), semantic_nodes(&second));
     assert_eq!(semantic_edges(&first), semantic_edges(&second));
     assert_eq!(semantic_sites(&first), semantic_sites(&second));
+    assert_eq!(first.profile, second.profile);
+    assert_eq!(first.nodes, second.nodes);
+    assert_eq!(first.edges, second.edges);
+    assert_eq!(first.sites, second.sites);
+    assert_eq!(first.diagnostics, second.diagnostics);
     assert_eq!(first.coverage, second.coverage);
     assert_eq!(first.files, second.files);
+
+    let deterministic_events = |result: &depgraph_rust_worker::ScanResult| {
+        build_events("deterministic-rust-scan", result)
+            .unwrap()
+            .into_iter()
+            .skip(1)
+            .map(|event| serde_json::to_value(event).unwrap())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        deterministic_events(&first),
+        deterministic_events(&repeated)
+    );
+    assert_eq!(deterministic_events(&first), deterministic_events(&second));
 }
 
 #[test]
@@ -1497,7 +1521,7 @@ fn extracts_cargo_targets_conditions_modules_and_safe_mode_sites() {
     assert_eq!(result.profile.properties["rust_hir_project_model"], "ready");
     assert_eq!(
         result.profile.properties["rust_hir_enable_gate"],
-        "fallback-and-release-gates-pending"
+        "release-gate-pending"
     );
     assert_eq!(
         result.profile.properties["rust_hir_backend"],
@@ -1565,6 +1589,28 @@ fn extracts_cargo_targets_conditions_modules_and_safe_mode_sites() {
     assert!(result.sites.iter().any(|site| site.kind == "extern_crate"));
     assert!(result.sites.iter().any(|site| site.kind == "include_str"));
     assert!(result.sites.iter().any(|site| {
+        site.kind == "include"
+            && site.specifier.contains("OUT_DIR")
+            && site.resolution_status == ResolutionStatus::Unresolved
+            && site
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("OUT_DIR"))
+    }));
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "RUST_HIR_OUT_DIR_UNAVAILABLE")
+    );
+    assert!(
+        result
+            .coverage
+            .reasons
+            .iter()
+            .any(|reason| reason == "rust-hir-out-dir-unavailable")
+    );
+    assert!(result.sites.iter().any(|site| {
         site.kind == "build_script_execution"
             && site.resolution_status == ResolutionStatus::Unresolved
     }));
@@ -1595,6 +1641,121 @@ fn safe_scan_never_executes_config_build_script_or_proc_macro() {
     assert!(!copied.join("BUILD_SCRIPT_EXECUTED").exists());
     assert!(!copied.join("PROC_MACRO_EXECUTED").exists());
     assert!(!copied.join("CONFIG_EXECUTED").exists());
+    assert!(!result.coverage.project_code_executed);
+}
+
+#[test]
+fn macro_and_build_environment_boundaries_are_explicitly_ledgered() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("macro-boundaries");
+    write_minimal_crate(
+        &root,
+        "macro-boundaries",
+        r#"#![doc = include_str!(concat!(env!("OUT_DIR"), "/crate.md"))]
+#[derive(Debug, ExternalDerive)]
+#[external::marker]
+pub struct Item;
+
+#[derive(Foo + Bar)]
+pub struct InvalidAttribute;
+
+#[unsafe(export_name = env!("SYMBOL"))]
+pub extern "C" fn exported() {}
+
+external::expand!();
+pub const GENERATED: &str = env!("OUT_DIR");
+"#,
+    );
+
+    let result = scan(&root).unwrap();
+
+    let proc_macro_sites: Vec<_> = result
+        .sites
+        .iter()
+        .filter(|site| site.kind == "proc_macro_expansion")
+        .collect();
+    assert!(proc_macro_sites.len() >= 3, "sites: {:?}", result.sites);
+    assert!(proc_macro_sites.iter().all(|site| {
+        site.resolution_status == ResolutionStatus::Unresolved && !site.target_ids.is_empty()
+    }));
+    assert!(result.sites.iter().any(|site| {
+        site.kind == "macro_expansion"
+            && site.specifier == "external::expand!"
+            && site.resolution_status == ResolutionStatus::Unresolved
+    }));
+    let out_dir = result
+        .sites
+        .iter()
+        .find(|site| site.kind == "build_environment" && site.specifier == "OUT_DIR")
+        .expect("OUT_DIR build environment boundary");
+    assert_eq!(out_dir.resolution_status, ResolutionStatus::Unresolved);
+    assert!(result.sites.iter().any(|site| {
+        site.kind == "build_environment"
+            && site.specifier == "SYMBOL"
+            && site.resolution_status == ResolutionStatus::Unresolved
+    }));
+    assert!(result.sites.iter().any(|site| {
+        site.kind == "include_str"
+            && site.specifier.contains("OUT_DIR")
+            && site.resolution_status == ResolutionStatus::Unresolved
+    }));
+    assert!(result.sites.iter().any(|site| {
+        site.kind == "unsupported_attribute"
+            && site.specifier.starts_with("derive(")
+            && site.resolution_status == ResolutionStatus::Unresolved
+    }));
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "PROC_MACRO_EXPANSION_NOT_EXECUTED")
+    );
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "MACRO_EXPANSION_NOT_EVALUATED")
+    );
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "RUST_HIR_OUT_DIR_UNAVAILABLE")
+    );
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "RUST_ATTRIBUTE_UNSUPPORTED")
+    );
+    assert!(result.coverage.unsupported_syntax > 0);
+    assert!(
+        result
+            .coverage
+            .reasons
+            .iter()
+            .any(|reason| reason == "proc-macro-expansion-not-executed")
+    );
+    assert!(
+        result
+            .coverage
+            .reasons
+            .iter()
+            .any(|reason| reason == "macro-expansion-not-evaluated")
+    );
+    assert!(
+        result
+            .coverage
+            .reasons
+            .iter()
+            .any(|reason| reason == "rust-hir-out-dir-unavailable")
+    );
+    assert!(
+        !result
+            .coverage
+            .completeness
+            .contains(&CompletenessLevel::SemanticComplete)
+    );
     assert!(!result.coverage.project_code_executed);
 }
 
@@ -1643,6 +1804,11 @@ fn armed_security_fixture_proves_safe_scan_does_not_execute_project_code() {
         false
     );
     assert!(result.edges.iter().all(|edge| edge.phase == Phase::Source));
+    assert!(result.sites.iter().any(|site| {
+        site.kind == "macro_expansion"
+            && site.specifier == "security_macro::touch!"
+            && site.resolution_status == ResolutionStatus::Unresolved
+    }));
     for (site_kind, diagnostic_code, coverage_reason) in [
         (
             "build_script_execution",
@@ -2142,7 +2308,7 @@ fn default_rust_profile_has_stable_hashed_host_identity() {
         assert_eq!(first.properties["rust_hir_project_model"], "ready");
         assert_eq!(
             first.properties["rust_hir_enable_gate"],
-            "fallback-and-release-gates-pending"
+            "release-gate-pending"
         );
         assert!(
             first.properties["rust_hir_project_file_count"]
@@ -2234,6 +2400,62 @@ fn unsupported_target_is_explicitly_ledgered_for_the_hir_project_model() {
             .reasons
             .iter()
             .any(|reason| reason == "rust-hir-unsupported")
+    );
+}
+
+#[test]
+fn unsupported_edition_is_explicit_and_preserves_the_syntax_graph() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("unsupported-edition");
+    write_minimal_crate(&root, "unsupported-edition", "pub struct SyntaxOnly;\n");
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname='unsupported-edition'\nversion='0.1.0'\nedition='2099'\n",
+    )
+    .unwrap();
+
+    let result = scan(&root).unwrap();
+    if result.profile.properties["rust_hir_toolchain_status"] != "compatible" {
+        assert_eq!(
+            result.profile.properties["rust_hir_project_model"],
+            "not-invoked"
+        );
+        return;
+    }
+
+    assert_eq!(
+        result.profile.properties["rust_hir_project_model"],
+        "unsupported"
+    );
+    assert_eq!(
+        result.profile.properties["rust_hir_enable_gate"],
+        "input-unsupported"
+    );
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "RUST_HIR_INPUT_UNSUPPORTED")
+    );
+    assert!(
+        result
+            .coverage
+            .reasons
+            .iter()
+            .any(|reason| reason == "rust-hir-unsupported")
+    );
+    assert!(result.nodes.iter().any(|node| node.kind == "file"));
+    assert!(
+        result
+            .edges
+            .iter()
+            .all(|edge| edge.phase != Phase::Semantic)
+    );
+    assert!(
+        !result
+            .coverage
+            .completeness
+            .contains(&CompletenessLevel::SemanticComplete)
     );
 }
 
@@ -2637,6 +2859,28 @@ fn metadata_fallback_is_explicit_and_checkout_stable() {
     };
     assert_eq!(graph_ids(&first), graph_ids(&repeated));
     assert_eq!(graph_ids(&first), graph_ids(&second));
+    for candidate in [&repeated, &second] {
+        assert_eq!(first.profile, candidate.profile);
+        assert_eq!(first.nodes, candidate.nodes);
+        assert_eq!(first.sites, candidate.sites);
+        assert_eq!(first.edges, candidate.edges);
+        assert_eq!(first.diagnostics, candidate.diagnostics);
+        assert_eq!(first.files, candidate.files);
+        assert_eq!(first.coverage, candidate.coverage);
+    }
+    let deterministic_events = |result: &depgraph_rust_worker::ScanResult| {
+        build_events("deterministic-fallback-scan", result)
+            .unwrap()
+            .into_iter()
+            .skip(1)
+            .map(|event| serde_json::to_value(event).unwrap())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        deterministic_events(&first),
+        deterministic_events(&repeated)
+    );
+    assert_eq!(deterministic_events(&first), deterministic_events(&second));
 }
 
 #[test]

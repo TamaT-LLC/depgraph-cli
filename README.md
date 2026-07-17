@@ -16,11 +16,16 @@ The MVP implements the architecture described in [the system design](docs/40_arc
 - Astro pages/endpoints and frontmatter imports
 - TanStack file routes and existing generated route trees
 
-Rust final fallback/coverage and release gates, Web symbol/type/call analysis,
-code-based routes, server functions, build observation, runtime traces,
-incremental updates, snapshots, and architecture policies belong to later
-milestones. The current Rust HIR graph does not yet claim
-`semantic-complete`.
+Rust HIR final fallback/coverage handling is complete. A profile claims
+`semantic-complete` only when syntax coverage is complete, the exact compatible
+HIR backend uses confined Cargo metadata with a ready project model and an
+emitted graph, the semantic issue count is zero, and skipped, unsupported, and
+unresolved counts are all zero. Candidate and external sites are allowed. The
+successful profile remains `rust_hir_enable_gate=release-gate-pending`: Issue
+#30 package/release verification is not implemented, so this is not a
+release-ready claim. Web symbol/type/call analysis, code-based routes, server
+functions, build observation, runtime traces, incremental updates, snapshots,
+and architecture policies belong to later milestones.
 
 ## Build
 
@@ -85,6 +90,11 @@ Executable or unsupported configuration becomes a diagnostic or unresolved site.
 
 The default `.depgraph.toml` strict policy permits zero skipped files, unsupported syntax, or unresolved sites. Candidate and external dependencies alone do not fail strict mode.
 
+A typed Rust HIR backend failure atomically discards the semantic delta,
+preserves the syntax graph, and fails strict policy. A Rust worker panic,
+timeout, cancellation, or malformed protocol result leaves the overall scan
+partial with exit code `3`.
+
 | Code | Meaning |
 | ---: | --- |
 | 0 | Operation completed without a policy violation |
@@ -104,3 +114,6 @@ Failed/partial scans and diagnostics remain stored, but only a complete policy-p
 - `xtask`: reproducible build, full quality checks, release archives, checksums, SBOM, and license inventory
 
 Run `cargo xtask package` to create a native archive under `dist/`. Release archives place `depgraph` under `bin/`, compatible workers under `libexec/`, and include a checksum-verified release manifest, protocol schema, SPDX SBOM, and third-party license inventory.
+
+The Issue #30 Rust HIR package/release verifier remains unimplemented; package
+creation alone does not make the HIR backend release-ready.

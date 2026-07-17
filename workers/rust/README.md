@@ -15,8 +15,10 @@ database for the HIR definition and dependency graph: canonical `symbol` and
 `type` nodes, site-less `declares`, `extends`, `implements`, and `instantiates`
 relations, HIR-refined import/re-export sites, semantic `type_uses`, and
 exact/candidate calls are validated and atomically unioned with the syntax
-graph. The final fallback/release gates remain, so the worker does not yet
-claim `semantic-complete`.
+graph. The final fallback/coverage matrix is complete, and an eligible profile
+can now claim `semantic-complete`. The package/release verifier remains Issue
+#30 and is not implemented; successful semantic profiles therefore retain
+`rust_hir_enable_gate=release-gate-pending` and are not release-ready.
 
 Preflight rejects ambiguous globs, symlinks, out-of-root workspace members and
 path dependencies, and unknown Cargo path-bearing fields before Cargo starts.
@@ -90,19 +92,28 @@ safe cfg profile is intentionally normalized to debug assertions plus unwind
 panic semantics; cfg-affecting Cargo `dev`/`test` profile overrides are
 classified as typed unsupported input. Direct `cfg`/`cfg_attr` and
 syntactically direct, unqualified `cfg!` predicates are conservatively
-validated. A declarative macro expansion that contains calls is retained as one
+validated, including recursive `all` / `any` / single-operand `not` arity.
+Other built-in attributes remain explicit `unsupported_attribute` boundaries
+until their shape, value, and placement have an attribute-specific validator;
+generic `syn::Meta` parse success alone never permits `semantic-complete`. A
+declarative macro expansion that contains calls is retained as one
 generated, unresolved call boundary at the invocation span with macro
 provenance; generated calls are not individually up-mapped to ordinary source
-calls. Name resolution and cfg created by expansion remain part of the later
-semantic slice.
+calls. Name resolution and cfg created by expansion remain explicit
+unsupported or unresolved coverage boundaries unless the safe inputs classify
+them exactly.
 
 `rust_hir_project_model=ready` means the atomic VFS, crate graph, and cfg input
 were constructed. Semantic extraction success is reported separately as
 `rust_hir_status=import-type-call-graph-emitted` or
-`import-type-call-graph-partial`; neither means that all fallback conditions
-were classified. Missing modules and includes remain
-unresolved syntax sites with coverage reasons, so the profile cannot yet claim
-`semantic-complete`.
+`import-type-call-graph-partial`. A profile claims `semantic-complete` only
+when it also has `syntax-complete`, uses the exact compatible HIR backend and
+`confined-cargo-metadata`, has a `ready` project model and
+`import-type-call-graph-emitted` status, records
+`rust_hir_semantic_issue_count=0`, and reports zero skipped files, unsupported
+syntax, and unresolved sites. Candidate and external sites are classified
+outcomes and do not block completeness. Missing modules and includes remain
+unresolved syntax sites with coverage reasons and therefore do block it.
 
 An external `rust-analyzer` LSP process is not selected. Its project-loading
 path can start Cargo, build-script, proc-macro, and flycheck services, while
@@ -133,7 +144,8 @@ The current Cargo-facing phase may:
   using a neutral directory, cleared project environment,
   `RUSTUP_AUTO_INSTALL=0`, timeout, and output limit.
 
-The completed safe project-model, definition, and dependency slices now:
+The completed safe project-model, definition, dependency, and fallback slices
+now:
 
 - consume the already-admitted manifests and source bytes to build an in-memory
   multi-file VFS, per-crate cfg set, and local crate graph;
@@ -162,12 +174,20 @@ Block-local aliases whose external definition source is unavailable are kept
 as unresolved type-use sites; the worker does not leak those aliases into the
 surrounding module or infer unqualified prelude names without exact HIR proof.
 
-The remaining semantic and release slices may also:
+Unsupported toolchain/edition/target input, confined metadata fallback, broken
+source or attribute payloads, missing modules/includes, nested `OUT_DIR`
+includes/environment macros, build scripts, proc macros, unverified bang-macro
+identity, and unavailable external definitions all receive deterministic
+diagnostic/coverage or dependency-site ledger entries. A typed semantic backend
+failure discards the complete semantic delta atomically, preserves the syntax
+graph, and is a strict-policy failure. A panic, timeout, cancellation, or
+malformed worker result is a worker failure; the core preserves other adapter
+results and records the overall scan as partial with exit code `3`.
 
-- complete the final fallback/coverage matrix and determine when a selected
-  profile is eligible for `semantic-complete`;
-- read a release-owned, checksum-verified sysroot snapshot after that component
-  is introduced by the HIR implementation.
+The remaining Issue #30 release slice may introduce a release-owned,
+checksum-verified sysroot snapshot and must add its data-tree schema and
+package verifier first. That slice is unimplemented, and no current HIR result
+is a release-ready claim.
 
 Safe mode must not:
 
@@ -192,27 +212,33 @@ best-effort outside that baseline. The worker probes the resolved system
 matches the exact baseline. The rust-analyzer revision is selected, the smoke
 scaffold and deterministic multi-file project model are available, and Cargo
 metadata input reads are confined. When those inputs are compatible, the HIR
-definition, import/re-export, type-use, and call graph is emitted now; the final
-fallback/coverage matrix and release gate remain incomplete. A
-verified sysroot is additionally required only when the profile claims exact
-standard-library resolution.
+definition, import/re-export, type-use, and call graph is emitted. The final
+fallback/coverage matrix is complete; only the Issue #30 package/release gate
+remains. A verified sysroot is additionally required only when a future
+profile claims exact standard-library resolution.
 
-| Project/toolchain state | Current result | HIR eligibility after the remaining gates |
+| Project/toolchain state | Current result | Semantic completeness / release status |
 | --- | --- | --- |
-| Exact `1.93.1`, supported target, and complete confined crate graph | Static syntax graph plus HIR definitions, refined imports/re-exports, `type_uses`, and exact/candidate calls; status is `import-type-call-graph-emitted` or `import-type-call-graph-partial` | Final fallback and release gates remain |
-| No project toolchain declaration | The neutral probe decides eligibility; an exact compatible pair may emit the import/type/call graph | Eligible only when every effective input is the verified baseline |
+| Exact `1.93.1`, supported target, and complete confined crate graph | Static syntax graph plus HIR definitions, refined imports/re-exports, `type_uses`, and exact/candidate calls | `semantic-complete` only with `syntax-complete`, exact compatible HIR, confined metadata, `ready` / `emitted`, issue count `0`, and skipped / unsupported / unresolved all `0`; gate remains `release-gate-pending` |
+| No project toolchain declaration | The neutral probe decides eligibility; an exact compatible pair may emit the import/type/call graph | Eligible only when every effective input is the verified baseline and the completeness conditions hold |
 | Older, newer, or nightly declaration | `RUST_TOOLCHAIN_BEST_EFFORT`; static syntax graph | Syntax fallback; never `semantic-complete` |
 | Custom or malformed declaration, unreadable file, or external symlink | Static syntax graph with `RUST_TOOLCHAIN_INVALID` and `RUST_HIR_TOOLCHAIN_UNSUPPORTED` | Fail-closed syntax fallback; never HIR-eligible |
 | Cargo preflight rejects the input, mirror/DTO validation fails, or frozen/offline Cargo is unavailable | `CARGO_METADATA_FALLBACK`; static manifest, syntax graph, and file ledger are retained | Syntax fallback with a stable coverage reason; raw Cargo stderr and temporary paths are not exposed |
-| Build script or proc macro is required | Unresolved site plus `BUILD_SCRIPT_NOT_EXECUTED` or `PROC_MACRO_NOT_EXECUTED` | Partial HIR only; never execute project code in safe mode |
-| Typed HIR semantic-extractor failure | The node/site/edge/file-ledger delta is discarded atomically and the syntax graph is preserved with `RUST_HIR_BACKEND_FAILURE` | Partial coverage; never `semantic-complete` |
-| HIR panic, timeout, or malformed internal result | Worker failure; it is not downgraded to syntax success | The core keeps other adapter results but does not relabel syntax as semantic success |
-| Release-owned backend/sysroot bytes are missing or changed | The final package/release gate is not complete yet | Once closed, security failure occurs before analysis with no project/system fallback |
+| A built-in attribute has no attribute-specific shape/value/placement validator | `unsupported_attribute` site plus `RUST_ATTRIBUTE_UNSUPPORTED`; nested expression-shaped macro arguments are still inventoried | Conservative incomplete ledger; generic `Meta` parsing never proves compiler validity |
+| An unqualified bang macro or derive identity cannot be proven built-in/non-procedural | Generic `macro_expansion` or `proc_macro_expansion` unresolved site; nested expression-shaped `include!` / `env!` arguments are inventoried recursively | Conservative incomplete ledger; names are not trusted because local/imported macros can shadow built-ins |
+| `OUT_DIR` include, build script, or proc macro is required | Unresolved site plus `RUST_HIR_OUT_DIR_UNAVAILABLE`, `BUILD_SCRIPT_NOT_EXECUTED`, or `PROC_MACRO_NOT_EXECUTED` | Ledgered partial HIR only; never execute or read generated project output in safe mode |
+| External definition is unavailable | Classified external or unresolved site plus stable coverage evidence | External alone is allowed; unresolved blocks `semantic-complete` |
+| Typed HIR semantic-extractor failure | The node/site/edge/file-ledger delta is discarded atomically and the syntax graph is preserved with `RUST_HIR_BACKEND_FAILURE` | Strict-policy failure; never `semantic-complete` |
+| HIR panic, timeout, cancellation, or malformed result | Worker failure; it is not downgraded to syntax success | Other adapter results remain, but the scan is partial with exit `3` |
+| Release-owned backend/sysroot bytes are missing or changed | Issue #30 package/release verification is unimplemented | No release-ready claim; after Issue #30 this must fail closed before analysis with no project/system fallback |
 
 `syntax-complete` means all supported syntax dependency sites were classified.
-It does not imply HIR resolution. A successfully emitted import/type/call graph
-is also insufficient for `semantic-complete`: the final fallback/coverage
-matrix must first be complete for the selected profile.
+It does not imply HIR resolution. The complete condition is the conjunction of
+`syntax-complete`, exact compatible HIR, `confined-cargo-metadata`, a `ready`
+project model, `import-type-call-graph-emitted`, semantic issue count `0`,
+`project_code_executed=false`, and zero skipped, unsupported, and unresolved
+counts. Candidate and external sites may remain. The resulting
+`release-gate-pending` value is deliberately not a release-ready assertion.
 
 ## Profile metadata
 
@@ -227,7 +253,7 @@ values are outcome-dependent; fallback paths retain the syntax-only values.
 | `rust_hir_status` | `import-type-call-graph-emitted`, `import-type-call-graph-partial`, `failed`, or `not-invoked` |
 | `rust_hir_scaffold` | `available` |
 | `rust_hir_project_model` | `ready` after deterministic construction; otherwise `not-invoked`, `unavailable`, or `unsupported` |
-| `rust_hir_enable_gate` | `fallback-and-release-gates-pending` after import/type/call emission; `semantic-backend-failure` on typed failure; otherwise `semantic-emission-pending`, `toolchain-unsupported`, `crate-graph-unavailable`, or `input-unsupported` |
+| `rust_hir_enable_gate` | `release-gate-pending` after successful import/type/call emission; `semantic-backend-failure` on typed failure; otherwise `semantic-emission-pending`, `toolchain-unsupported`, `crate-graph-unavailable`, or `input-unsupported`. `release-gate-pending` does not mean release-ready |
 | `rust_hir_project_file_count` | Number of admitted inventory files in the safe VFS; `0` when no model is available |
 | `rust_hir_project_crate_count` | Number of workspace/path local crates in the safe graph; `0` when no model is available |
 | `rust_hir_project_external_count` | Number of external/sysroot sidecar entries; `0` when no model is available |
@@ -253,6 +279,7 @@ values are outcome-dependent; fallback paths retain the syntax-only values.
 | `syntax_fallback` | `enabled` |
 | `build_script_policy` | `disabled` |
 | `proc_macro_policy` | `disabled` |
+| `proc_macro_expansion` | `disabled` |
 | `project_code_executed` | `false` |
 | `project_toolchain_executed` | `false` |
 | `build_scripts_executed` | `false` |
@@ -289,15 +316,24 @@ those outcomes. Each outcome remains checkout-independent and repeatable for
 the same inputs. The missing semantic delta must be explicit in profile
 properties, diagnostics, and coverage. Full HIR graph equality is required
 only when the confined dependency snapshot, toolchain, requested profile, and
-semantic capability are the same; the final cross-outcome fallback matrix is
-tracked by Issue #29.
+semantic capability are the same. Issue #29 fixed this cross-outcome fallback
+matrix and requires repeated scans and equivalent checkouts to produce the same
+profile, graph, diagnostics, ledger, and canonical ordering within each
+effective outcome.
+
+A typed recoverable HIR failure discards every semantic node, site, edge, and
+file-ledger delta atomically and records `rust-hir-backend-failure`; strict mode
+fails even if configured skipped/unsupported/unresolved thresholds would
+otherwise pass. Panic, timeout, cancellation, and malformed worker output are
+process/protocol failures instead and make the scan partial with exit `3`.
 
 Integrity failures are different: the current core already treats a missing or
-modified release-owned worker as a security error. Before the HIR semantic
-backend is declared release-ready, its release gate must additionally reject
-worker/backend version mismatches and release-root symlinks as security errors.
-None of these cases may fall back to a project binary, system rust-analyzer, or
-an unverified sysroot.
+modified release-owned worker as a security error. Issue #30 remains
+unimplemented and must additionally make the package/release verifier reject
+worker/backend version mismatches, release-root symlinks, and invalid data-tree
+components as security errors before the HIR backend can be declared
+release-ready. None of these cases may fall back to a project binary, system
+rust-analyzer, or an unverified sysroot.
 
 ## Release and upgrade gate
 
@@ -357,18 +393,21 @@ scan boundary:
    resolved/candidates/external/unresolved classification, canonical conditions,
    semantic/source evidence, syntax replacement keys, conservative source
    fallback, and an atomic file coverage ledger. Call sites and
-   `semantic-complete` remain out of scope.
+   `semantic-complete` were out of scope for this slice and were completed by
+   Issues #28 and #29.
 6. **Completed 2026-07-17 — resolve calls:** emit exact `calls` for statically
    unique function, associated-function, method, generic-instance, and closure
    targets; preserve complete finite closed-trait and immutable local
    function-pointer sets as candidate `may_call`; and retain external,
    unresolved, and call-bearing macro boundaries with canonical condition,
    span, evidence, provenance, and deterministic ordering.
-7. **Issue #29 — harden fallback and determinism (1–2 days):** test unsupported
-   toolchains, incomplete crate graphs, broken source, HIR failures, repeated
-   scans, and preservation of the static graph; only this final semantic slice
-   may establish the conditions for `semantic-complete`.
-8. **Close the release gate (2–3 days):** make worker/backend version mismatch
-   and release-root symlinks fail closed, add a data-tree component schema for
-   any sysroot input, and run the armed security fixture from extracted Tier 1
-   archives.
+7. **Completed 2026-07-17 — harden fallback and determinism (Issue #29):**
+   classify unsupported toolchains, incomplete crate graphs, broken source,
+   `OUT_DIR`, build/proc/external boundaries, and HIR failures; preserve the
+   static graph atomically; prove repeated-scan/checkout determinism; and permit
+   `semantic-complete` only under the exact zero-issue/zero-gap conditions.
+8. **Unimplemented — close the package/release gate (Issue #30, 2–3 days):**
+   make worker/backend version mismatch and release-root symlinks fail closed,
+   add a data-tree component schema/verifier for any sysroot input, and run the
+   armed security fixture from extracted Tier 1 archives. Until this completes,
+   `release-gate-pending` is not a release-ready claim.

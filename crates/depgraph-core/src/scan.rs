@@ -8,14 +8,14 @@ use depgraph_store::{CoverageRecord, DiagnosticRecord, Store};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tokio::task::{Id, JoinSet};
+use tokio::task::{Id, JoinError, JoinSet};
 use uuid::Uuid;
 
 use crate::{
     config::Config,
     worker::{
-        AdapterKind, WorkerOutput, detect_adapters, execute_worker, is_security_error,
-        locate_worker,
+        AdapterKind, WorkerFailureKind, WorkerOutput, detect_adapters, execute_worker,
+        is_security_error, locate_worker,
     },
 };
 
@@ -26,6 +26,42 @@ pub struct ScanOutcome {
     pub exit_code: u8,
     pub coverage: CoverageRecord,
     pub diagnostics: Vec<DiagnosticRecord>,
+}
+
+#[derive(Debug)]
+struct ScanFailure {
+    adapter: AdapterKind,
+    detail: String,
+    kind: WorkerFailureKind,
+    security_violation: bool,
+}
+
+impl ScanFailure {
+    fn with_kind(adapter: AdapterKind, detail: String, kind: WorkerFailureKind) -> Self {
+        Self::with_classification(adapter, detail, kind, false)
+    }
+
+    fn with_classification(
+        adapter: AdapterKind,
+        detail: String,
+        kind: WorkerFailureKind,
+        security_violation: bool,
+    ) -> Self {
+        Self {
+            adapter,
+            detail,
+            kind,
+            security_violation,
+        }
+    }
+
+    fn stable_identity(&self) -> String {
+        format!(
+            "worker-failure:{}:{}",
+            self.adapter.name(),
+            self.kind.as_str()
+        )
+    }
 }
 
 pub async fn run_scan(
@@ -54,6 +90,7 @@ pub async fn run_scan(
                 "error",
                 "workspace-detection-failed",
                 &format!("{error:#}"),
+                "workspace-detection-failed",
             )?;
             store.finish_scan(&scan_id, "failed", Some(&error.to_string()), false)?;
             return snapshot_outcome(store, &scan_id, 3);
@@ -78,7 +115,12 @@ pub async fn run_scan(
             Err(error) => {
                 let error = format!("{error:#}");
                 let security = is_security_error(&error);
-                failures.push((adapter, error, security));
+                failures.push(ScanFailure::with_classification(
+                    adapter,
+                    error,
+                    WorkerFailureKind::Other,
+                    security,
+                ));
             }
         }
     }
@@ -92,7 +134,12 @@ pub async fn run_scan(
             }
             Err(error) => {
                 let adapter = task_adapter(&mut task_adapters, error.id());
-                failures.push((adapter, format!("worker task failed: {error}"), false));
+                let kind = classify_worker_task_failure(&error);
+                failures.push(ScanFailure::with_kind(
+                    adapter,
+                    format!("worker task failed: {error}"),
+                    kind,
+                ));
             }
         }
     }
@@ -101,22 +148,37 @@ pub async fn run_scan(
     let mut global_upserts = BTreeMap::<(String, String), Value>::new();
     for output in outputs {
         let adapter = output.adapter;
+        let failure_kind = output.failure_kind;
         let security_violation = output.security_violation;
         if let Err(error) = ingest_worker_output(store, &scan_id, output, &mut global_upserts) {
-            failures.push((adapter, format!("{error:#}"), security_violation));
+            let detail = format!("{error:#}");
+            failures.push(match failure_kind {
+                Some(kind) => {
+                    ScanFailure::with_classification(adapter, detail, kind, security_violation)
+                }
+                None => ScanFailure::with_classification(
+                    adapter,
+                    detail,
+                    WorkerFailureKind::Other,
+                    security_violation,
+                ),
+            });
         }
     }
-    for (adapter, error, security_violation) in &failures {
+    failures.sort_by_key(|failure| (failure.adapter, failure.kind));
+    for failure in &failures {
+        let identity = failure.stable_identity();
         add_core_diagnostic(
             store,
             &scan_id,
             "error",
-            if *security_violation {
+            if failure.security_violation {
                 "security-policy"
             } else {
                 "worker-failure"
             },
-            &format!("{}: {error}", adapter.name()),
+            &identity,
+            &identity,
         )?;
     }
 
@@ -127,11 +189,13 @@ pub async fn run_scan(
     if !failures.is_empty() {
         let summary = failures
             .iter()
-            .map(|(adapter, error, _)| format!("{}: {error}", adapter.name()))
+            .map(|failure| format!("{}: {}", failure.adapter.name(), failure.detail))
             .collect::<Vec<_>>()
             .join("; ");
-        store.mark_coverage_incomplete(&scan_id, &format!("worker failure: {summary}"))?;
-        let security_violation = failures.iter().any(|(_, _, security)| *security);
+        for failure in &failures {
+            store.mark_coverage_incomplete(&scan_id, &failure.stable_identity())?;
+        }
+        let security_violation = failures.iter().any(|failure| failure.security_violation);
         store.finish_scan(
             &scan_id,
             if security_violation {
@@ -152,19 +216,18 @@ pub async fn run_scan(
             "error",
             "graph-validation-failed",
             &format!("{error:#}"),
+            "graph-validation-failed",
         )?;
         store.finish_scan(&scan_id, "failed", Some(&error.to_string()), false)?;
         return snapshot_outcome(store, &scan_id, 3);
     }
 
     let coverage = store.load_snapshot(&scan_id)?.coverage;
-    let strict_failure = strict
-        && (coverage.unresolved > config.strict.max_unresolved
-            || coverage.files_skipped > config.strict.max_skipped
-            || coverage.unsupported_syntax > config.strict.max_unsupported_syntax);
+    let rust_hir_backend_failure = has_rust_hir_backend_failure(&coverage);
+    let strict_failure = strict && violates_strict_policy(&coverage, config);
     if strict_failure {
         let message = format!(
-            "strict policy failed: unresolved={} (max {}), skipped={} (max {}), unsupported={} (max {})",
+            "strict policy failed: unresolved={} (max {}), skipped={} (max {}), unsupported={} (max {}), rust_hir_backend_failure={rust_hir_backend_failure}",
             coverage.unresolved,
             config.strict.max_unresolved,
             coverage.files_skipped,
@@ -172,7 +235,14 @@ pub async fn run_scan(
             coverage.unsupported_syntax,
             config.strict.max_unsupported_syntax
         );
-        add_core_diagnostic(store, &scan_id, "error", "strict-policy", &message)?;
+        add_core_diagnostic(
+            store,
+            &scan_id,
+            "error",
+            "strict-policy",
+            &message,
+            "strict-policy",
+        )?;
         store.finish_scan(&scan_id, "policy_failed", Some(&message), false)?;
         return snapshot_outcome(store, &scan_id, 1);
     }
@@ -185,6 +255,30 @@ fn task_adapter(task_adapters: &mut BTreeMap<Id, AdapterKind>, task_id: Id) -> A
     task_adapters
         .remove(&task_id)
         .expect("every spawned worker task must have a registered adapter")
+}
+
+fn classify_worker_task_failure(error: &JoinError) -> WorkerFailureKind {
+    if error.is_panic() {
+        WorkerFailureKind::TaskPanic
+    } else if error.is_cancelled() {
+        WorkerFailureKind::Cancelled
+    } else {
+        WorkerFailureKind::Other
+    }
+}
+
+fn has_rust_hir_backend_failure(coverage: &CoverageRecord) -> bool {
+    coverage
+        .reasons
+        .iter()
+        .any(|reason| reason == "rust-hir-backend-failure")
+}
+
+fn violates_strict_policy(coverage: &CoverageRecord, config: &Config) -> bool {
+    coverage.unresolved > config.strict.max_unresolved
+        || coverage.files_skipped > config.strict.max_skipped
+        || coverage.unsupported_syntax > config.strict.max_unsupported_syntax
+        || has_rust_hir_backend_failure(coverage)
 }
 
 fn ingest_worker_output(
@@ -284,11 +378,13 @@ fn add_core_diagnostic(
     severity: &str,
     code: &str,
     message: &str,
+    identity: &str,
 ) -> Result<()> {
     let mut hasher = Sha256::new();
-    hasher.update(scan_id.as_bytes());
+    hasher.update(b"depgraph-core-diagnostic-v1\0");
     hasher.update(code.as_bytes());
-    hasher.update(message.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(identity.as_bytes());
     let id = format!("diagnostic:{}", hex::encode(hasher.finalize()));
     store.ingest_event(&json!({
         "event":"diagnostic",
@@ -393,7 +489,21 @@ mod tests {
             task_adapter(&mut task_adapters, error.id()),
             AdapterKind::Web
         );
+        assert_eq!(
+            classify_worker_task_failure(&error),
+            WorkerFailureKind::TaskPanic
+        );
         assert!(task_adapters.is_empty());
+    }
+
+    #[test]
+    fn rust_hir_backend_failure_is_a_strict_policy_violation() {
+        let config = Config::default();
+        let mut coverage = CoverageRecord::default();
+        assert!(!violates_strict_policy(&coverage, &config));
+
+        coverage.reasons.push("rust-hir-backend-failure".into());
+        assert!(violates_strict_policy(&coverage, &config));
     }
 
     #[test]
@@ -436,6 +546,7 @@ mod tests {
             stderr: String::new(),
             stderr_truncated: false,
             error: Some("malformed NDJSON after valid prefix".to_owned()),
+            failure_kind: Some(WorkerFailureKind::MalformedProtocol),
             security_violation: false,
         };
 

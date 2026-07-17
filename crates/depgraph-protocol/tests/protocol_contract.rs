@@ -239,13 +239,171 @@ fn scan_coverage_completeness_must_equal_the_profile_intersection() {
 }
 
 #[test]
-fn safe_profile_cannot_hide_project_code_execution() {
-    let mut events = golden_values();
-    events[8]["coverage"]["project_code_executed"] = json!(true);
-    let error = validate_safe_ndjson(Cursor::new(values_to_ndjson(events))).unwrap_err();
+fn semantic_completeness_requires_syntax_completeness() {
+    let mut events = rust_semantic_complete_values();
+    for coverage_index in [8, 9] {
+        events[coverage_index]["coverage"]["completeness"] = json!(["semantic-complete"]);
+    }
+    let error = validate_ndjson(Cursor::new(values_to_ndjson(events))).unwrap_err();
     assert!(
-        matches!(error, ProtocolError::Invariant(message) if message.contains("safe-mode profile"))
+        matches!(error, ProtocolError::Invariant(message) if message.contains("must also report syntax-complete"))
     );
+}
+
+#[test]
+fn non_rust_semantic_completeness_remains_independent_from_syntax_completeness() {
+    let mut events = golden_values();
+    for coverage_index in [8, 9] {
+        events[coverage_index]["coverage"]["completeness"] = json!(["semantic-complete"]);
+    }
+    validate_ndjson(Cursor::new(values_to_ndjson(events)))
+        .expect("protocol 1.0 non-Rust profiles may report semantic completeness independently");
+}
+
+#[test]
+fn scan_coverage_must_preserve_rust_hir_backend_failure_reason() {
+    let mut events = rust_semantic_complete_values();
+    for coverage_index in [8, 9] {
+        events[coverage_index]["coverage"]["completeness"] = json!(["syntax-complete"]);
+    }
+    events[8]["coverage"]["reasons"] = json!(["rust-hir-backend-failure"]);
+    events[9]["coverage"]["reasons"] = json!([]);
+
+    let error = validate_ndjson(Cursor::new(values_to_ndjson(events))).unwrap_err();
+    assert!(
+        matches!(error, ProtocolError::Invariant(message) if message.contains("omits blocking profile reason rust-hir-backend-failure"))
+    );
+}
+
+#[test]
+fn rust_hir_backend_failure_cannot_claim_semantic_completeness() {
+    let mut events = rust_semantic_complete_values();
+    for coverage_index in [8, 9] {
+        events[coverage_index]["coverage"]["reasons"] = json!(["rust-hir-backend-failure"]);
+    }
+
+    let error = validate_ndjson(Cursor::new(values_to_ndjson(events))).unwrap_err();
+    assert!(
+        matches!(error, ProtocolError::Invariant(message) if message.contains("cannot report rust-hir-backend-failure"))
+    );
+}
+
+#[test]
+fn rust_semantic_completeness_accepts_resolved_candidate_and_external_sites() {
+    validate_ndjson(Cursor::new(values_to_ndjson(
+        rust_semantic_complete_values(),
+    )))
+    .expect("eligible Rust coverage may report semantic completeness");
+
+    let mut candidate = rust_semantic_complete_values();
+    for (event_index, key) in [(4, "edge"), (5, "site")] {
+        let payload = &mut candidate[event_index][key];
+        payload["resolution_status"] = json!("candidates");
+        payload["precision"] = json!("overapprox");
+    }
+    for coverage_index in [8, 9] {
+        candidate[coverage_index]["coverage"]["resolved"] = json!(0);
+        candidate[coverage_index]["coverage"]["candidates"] = json!(1);
+    }
+    validate_ndjson(Cursor::new(values_to_ndjson(candidate)))
+        .expect("candidate sites do not make an otherwise complete Rust profile incomplete");
+
+    let mut external = rust_semantic_complete_values();
+    external[3]["node"]["kind"] = json!("external_system");
+    for (event_index, key) in [(4, "edge"), (5, "site")] {
+        let payload = &mut external[event_index][key];
+        payload["resolution_status"] = json!("external");
+        payload["precision"] = json!("heuristic");
+    }
+    for coverage_index in [8, 9] {
+        external[coverage_index]["coverage"]["resolved"] = json!(0);
+        external[coverage_index]["coverage"]["external"] = json!(1);
+    }
+    validate_ndjson(Cursor::new(values_to_ndjson(external)))
+        .expect("external sites do not make an otherwise complete Rust profile incomplete");
+}
+
+#[test]
+fn rust_semantic_completeness_requires_zero_incomplete_coverage_counts() {
+    for (field, value) in [
+        ("files_skipped", 1),
+        ("unsupported_syntax", 1),
+        ("project_code_executed", 1),
+    ] {
+        let mut events = rust_semantic_complete_values();
+        if field == "files_skipped" {
+            events[8]["coverage"]["files_analyzed"] = json!(0);
+        }
+        events[8]["coverage"][field] = if field == "project_code_executed" {
+            json!(true)
+        } else {
+            json!(value)
+        };
+        let error = validate_ndjson(Cursor::new(values_to_ndjson(events))).unwrap_err();
+        assert!(
+            matches!(error, ProtocolError::Invariant(message) if message.contains(field)),
+            "Rust semantic completeness accepted {field}"
+        );
+    }
+
+    let mut unresolved = rust_semantic_complete_values();
+    unresolved[3]["node"]["kind"] = json!("unknown_target");
+    unresolved[5]["site"]["resolution_status"] = json!("unresolved");
+    unresolved[5]["site"]["precision"] = json!("heuristic");
+    unresolved[5]["site"]["reason"] = json!("target is unknown");
+    unresolved[4]["edge"]["resolution_status"] = json!("unresolved");
+    unresolved[4]["edge"]["precision"] = json!("heuristic");
+    unresolved[8]["coverage"]["resolved"] = json!(0);
+    unresolved[8]["coverage"]["unresolved"] = json!(1);
+    let error = validate_ndjson(Cursor::new(values_to_ndjson(unresolved))).unwrap_err();
+    assert!(matches!(error, ProtocolError::Invariant(message) if message.contains("unresolved")));
+}
+
+#[test]
+fn rust_semantic_completeness_requires_exact_backend_properties() {
+    let cases = [
+        ("analysis", json!("syntax")),
+        ("analysis_backend", json!("static-syntax")),
+        ("rust_hir_backend", json!("disabled")),
+        ("rust_hir_status", json!("import-type-call-graph-partial")),
+        ("rust_hir_project_model", json!("unavailable")),
+        (
+            "rust_hir_enable_gate",
+            json!("fallback-and-release-gates-pending"),
+        ),
+        ("crate_graph_source", json!("static-manifest-fallback")),
+        ("cargo_metadata_input", json!("project-cargo")),
+        ("rust_toolchain_probe_status", json!("unsupported")),
+        ("rust_hir_toolchain_status", json!("unsupported")),
+        ("proc_macro_expansion", json!("enabled")),
+        ("build_script_policy", json!("enabled")),
+        ("proc_macro_policy", json!("enabled")),
+        ("rust_hir_semantic_issue_count", json!(1)),
+        ("project_code_executed", json!(true)),
+        ("project_toolchain_executed", json!(true)),
+        ("build_scripts_executed", json!(true)),
+        ("proc_macros_executed", json!(true)),
+    ];
+    for (property, replacement) in cases {
+        let mut events = rust_semantic_complete_values();
+        events[1]["profile"]["properties"][property] = replacement;
+        let error = validate_ndjson(Cursor::new(values_to_ndjson(events))).unwrap_err();
+        assert!(
+            matches!(error, ProtocolError::Invariant(message) if message.contains(property)),
+            "Rust semantic completeness accepted invalid {property}"
+        );
+    }
+}
+
+#[test]
+fn safe_profile_cannot_hide_project_code_execution() {
+    for mut events in [golden_values(), rust_semantic_complete_values()] {
+        events[8]["coverage"]["project_code_executed"] = json!(true);
+        let error = validate_safe_ndjson(Cursor::new(values_to_ndjson(events))).unwrap_err();
+        assert!(
+            matches!(error, ProtocolError::Invariant(message) if message.contains("safe-mode profile"))
+        );
+    }
 }
 
 #[test]
@@ -512,6 +670,44 @@ fn golden_values() -> Vec<Value> {
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect()
+}
+
+fn rust_semantic_complete_values() -> Vec<Value> {
+    let mut events = golden_values();
+    for event in &mut events {
+        event["adapter"] = json!("rust");
+    }
+    events[1]["profile"]["id"] = json!("rust:test");
+    events[1]["profile"]["language"] = json!("rust");
+    events[1]["profile"]["properties"] = json!({
+        "analysis": "syntax+hir-imports-types-calls",
+        "analysis_backend": "static-syntax+rust-analyzer-hir",
+        "rust_hir_backend": "rust-analyzer-hir",
+        "rust_hir_status": "import-type-call-graph-emitted",
+        "rust_hir_project_model": "ready",
+        "rust_hir_enable_gate": "release-gate-pending",
+        "crate_graph_source": "confined-cargo-metadata",
+        "cargo_metadata_input": "confined-mirror",
+        "rust_toolchain_probe_status": "compatible",
+        "rust_hir_toolchain_status": "compatible",
+        "proc_macro_expansion": "disabled",
+        "build_script_policy": "disabled",
+        "proc_macro_policy": "disabled",
+        "rust_hir_semantic_issue_count": 0,
+        "project_code_executed": false,
+        "project_toolchain_executed": false,
+        "build_scripts_executed": false,
+        "proc_macros_executed": false
+    });
+    events[4]["edge"]["profile_id"] = json!("rust:test");
+    events[5]["site"]["profile_id"] = json!("rust:test");
+    events[6]["diagnostic"]["profile_id"] = json!("rust:test");
+    events[8]["profile_id"] = json!("rust:test");
+    for coverage_index in [8, 9] {
+        events[coverage_index]["coverage"]["completeness"] =
+            json!(["syntax-complete", "semantic-complete"]);
+    }
+    events
 }
 
 fn values_to_ndjson(values: Vec<Value>) -> String {
