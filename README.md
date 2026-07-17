@@ -8,14 +8,19 @@ The MVP implements the architecture described in [the system design](docs/40_arc
 
 ## Supported MVP graph
 
-- Cargo workspace/package/target/dependency and Rust file/module/import/re-export sites
+- Cargo workspace/package/target/dependency and Rust file/module/import/re-export,
+  HIR symbol/type/type-use, exact call, and conservative candidate call sites
 - Go workspace/module/package variant/file/import, symbol/type/direct call/candidate call, build constraint, test, embed, generated, vendor, and cgo sites
 - npm/pnpm/Yarn/Bun workspace/package/file and ESM/CJS/type-only/dynamic import sites
 - Next.js App/Pages filesystem routes
 - Astro pages/endpoints and frontmatter imports
 - TanStack file routes and existing generated route trees
 
-Rust and Web symbol/type/call analysis, code-based routes, server functions, build observation, runtime traces, incremental updates, snapshots, and architecture policies belong to later milestones.
+Rust final fallback/coverage and release gates, Web symbol/type/call analysis,
+code-based routes, server functions, build observation, runtime traces,
+incremental updates, snapshots, and architecture policies belong to later
+milestones. The current Rust HIR graph does not yet claim
+`semantic-complete`.
 
 ## Build
 

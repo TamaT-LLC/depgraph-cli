@@ -44,6 +44,23 @@ pub(crate) enum TypeUseContext {
     ConstStatic,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum CallSyntaxKind {
+    Function,
+    Method,
+    MacroBoundary,
+}
+
+impl CallSyntaxKind {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Function => "function",
+            Self::Method => "method",
+            Self::MacroBoundary => "macro_boundary",
+        }
+    }
+}
+
 impl TypeUseContext {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
@@ -128,6 +145,36 @@ impl TypeUseOccurrenceKey {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct CallOccurrenceKey {
+    pub relative_path: String,
+    pub span: SourceSpan,
+    pub specifier: String,
+    pub syntax_kind: CallSyntaxKind,
+    pub inline_ancestors: Vec<String>,
+    pub condition_key: String,
+}
+
+impl CallOccurrenceKey {
+    pub(crate) fn from_occurrence(
+        relative_path: &str,
+        specifier: &str,
+        syntax_kind: CallSyntaxKind,
+        inline_ancestors: &[String],
+        condition: &Condition,
+        span: SourceSpan,
+    ) -> Self {
+        Self {
+            relative_path: relative_path.into(),
+            span,
+            specifier: specifier.into(),
+            syntax_kind,
+            inline_ancestors: inline_ancestors.to_vec(),
+            condition_key: condition.render(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Occurrence {
     Use {
@@ -143,6 +190,13 @@ pub(crate) enum Occurrence {
     TypeUse {
         specifier: String,
         context: TypeUseContext,
+        inline_ancestors: Vec<String>,
+        condition: Condition,
+        span: SourceSpan,
+    },
+    Call {
+        specifier: String,
+        syntax_kind: CallSyntaxKind,
         inline_ancestors: Vec<String>,
         condition: Condition,
         span: SourceSpan,
@@ -218,6 +272,27 @@ impl Occurrence {
             *span,
         ))
     }
+
+    pub(crate) fn call_key(&self, relative_path: &str) -> Option<CallOccurrenceKey> {
+        let Self::Call {
+            specifier,
+            syntax_kind,
+            inline_ancestors,
+            condition,
+            span,
+        } = self
+        else {
+            return None;
+        };
+        Some(CallOccurrenceKey::from_occurrence(
+            relative_path,
+            specifier,
+            *syntax_kind,
+            inline_ancestors,
+            condition,
+            *span,
+        ))
+    }
 }
 
 pub(crate) fn collect_occurrences(file: &syn::File) -> Vec<Occurrence> {
@@ -262,6 +337,26 @@ impl Collector {
         let mut conditions = vec![parent.clone()];
         conditions.extend(cfg_conditions(attributes));
         Condition::All { conditions }.canonicalize()
+    }
+
+    fn inherited_condition(&self) -> Condition {
+        Condition::All {
+            conditions: self.inherited_conditions.clone(),
+        }
+        .canonicalize()
+    }
+
+    fn record_call(&mut self, specifier: String, syntax_kind: CallSyntaxKind, span: SourceSpan) {
+        if self.type_use_frames.is_empty() {
+            return;
+        }
+        self.occurrences.push(Occurrence::Call {
+            specifier,
+            syntax_kind,
+            inline_ancestors: self.inline_modules.clone(),
+            condition: self.inherited_condition(),
+            span,
+        });
     }
 
     fn collect_type(&mut self, ty: &syn::Type, context: TypeUseContext, condition: &Condition) {
@@ -715,6 +810,22 @@ impl<'ast> Visit<'ast> for Collector {
         self.inherited_conditions.pop();
     }
 
+    fn visit_arm(&mut self, node: &'ast syn::Arm) {
+        let Some(frame) = self.type_use_frames.last().cloned() else {
+            visit::visit_arm(self, node);
+            return;
+        };
+        let condition = self.child_condition(&frame.condition, &node.attrs);
+        self.inherited_conditions.push(condition.clone());
+        self.type_use_frames.push(TypeUseFrame {
+            context: frame.context,
+            condition,
+        });
+        visit::visit_arm(self, node);
+        self.type_use_frames.pop();
+        self.inherited_conditions.pop();
+    }
+
     fn visit_expr(&mut self, node: &'ast Expr) {
         let Some(frame) = self.type_use_frames.last().cloned() else {
             visit::visit_expr(self, node);
@@ -747,9 +858,42 @@ impl<'ast> Visit<'ast> for Collector {
             context: frame.context,
             condition,
         });
+        self.record_call(
+            format!("{}!", type_specifier(&node.mac.path)),
+            CallSyntaxKind::MacroBoundary,
+            SourceSpan::from_span(node.mac.span()),
+        );
         visit::visit_stmt_macro(self, node);
         self.type_use_frames.pop();
         self.inherited_conditions.pop();
+    }
+
+    fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
+        self.record_call(
+            callable_specifier(&node.func),
+            CallSyntaxKind::Function,
+            SourceSpan::from_span(node.span()),
+        );
+        visit::visit_expr_call(self, node);
+    }
+
+    fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
+        self.record_call(
+            node.method.to_string(),
+            CallSyntaxKind::Method,
+            SourceSpan::from_span(node.span()),
+        );
+        visit::visit_expr_method_call(self, node);
+    }
+
+    fn visit_expr_macro(&mut self, node: &'ast syn::ExprMacro) {
+        let specifier = format!("{}!", type_specifier(&node.mac.path));
+        self.record_call(
+            specifier,
+            CallSyntaxKind::MacroBoundary,
+            SourceSpan::from_span(node.span()),
+        );
+        visit::visit_expr_macro(self, node);
     }
 
     fn visit_type_path(&mut self, node: &'ast syn::TypePath) {
@@ -1130,6 +1274,20 @@ fn type_specifier(path: &syn::Path) -> String {
         format!("::{specifier}")
     } else {
         specifier
+    }
+}
+
+fn callable_specifier(expression: &Expr) -> String {
+    match expression {
+        Expr::Path(path) => type_specifier(&path.path),
+        Expr::Paren(paren) => callable_specifier(&paren.expr),
+        Expr::Group(group) => callable_specifier(&group.expr),
+        Expr::Field(field) => match &field.member {
+            syn::Member::Named(name) => name.to_string(),
+            syn::Member::Unnamed(index) => index.index.to_string(),
+        },
+        Expr::Closure(_) => "<closure>".into(),
+        _ => "<callable-expression>".into(),
     }
 }
 
@@ -1691,5 +1849,99 @@ mod tests {
             .collect();
         assert!(!first_type_keys.is_empty());
         assert_eq!(first_type_keys, second_type_keys);
+    }
+
+    #[test]
+    fn extracts_call_specifiers_spans_cfg_macro_boundaries_and_stable_keys() {
+        let source = concat!(
+            "#[cfg(feature = \"caller\")]\n",
+            "fn caller(mut value: Receiver) {\n",
+            "#[cfg(unix)] crate::direct(value);\n",
+            "value.method(2);\n",
+            "#[cfg(target_os = \"linux\")] generated!(3);\n",
+            "match value { #[cfg(target_arch = \"x86_64\")] _ => arm_call(), _ => () }\n",
+            "}\n",
+        );
+        let file = syn::parse_file(source).unwrap();
+        let first = collect_occurrences(&file);
+        let second = collect_occurrences(&file);
+        let calls: Vec<_> = first
+            .iter()
+            .filter_map(|occurrence| match occurrence {
+                Occurrence::Call {
+                    specifier,
+                    syntax_kind,
+                    condition,
+                    span,
+                    ..
+                } => Some((specifier.as_str(), *syntax_kind, condition, *span)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(calls.len(), 4);
+
+        let function = calls
+            .iter()
+            .find(|(specifier, ..)| *specifier == "crate::direct")
+            .expect("function call occurrence");
+        assert_eq!(function.1, CallSyntaxKind::Function);
+        assert_eq!(function.1.as_str(), "function");
+        assert_eq!(
+            text_at_span(source, function.3),
+            "#[cfg(unix)] crate::direct(value)"
+        );
+        let function_condition = function.2.render();
+        assert!(function_condition.contains("rust.feature"));
+        assert!(function_condition.contains("rust.cfg.unix"));
+
+        let method = calls
+            .iter()
+            .find(|(specifier, ..)| *specifier == "method")
+            .expect("method call occurrence");
+        assert_eq!(method.1, CallSyntaxKind::Method);
+        assert_eq!(method.1.as_str(), "method");
+        assert_eq!(text_at_span(source, method.3), "value.method(2)");
+        assert!(method.2.render().contains("rust.feature"));
+
+        let macro_boundary = calls
+            .iter()
+            .find(|(specifier, ..)| *specifier == "generated!")
+            .expect("macro call boundary occurrence");
+        assert_eq!(macro_boundary.1, CallSyntaxKind::MacroBoundary);
+        assert_eq!(macro_boundary.1.as_str(), "macro_boundary");
+        assert_eq!(text_at_span(source, macro_boundary.3), "generated!(3)");
+        let macro_condition = macro_boundary.2.render();
+        assert!(macro_condition.contains("rust.feature"));
+        assert!(macro_condition.contains("rust.cfg.target_os"));
+
+        let arm_call = calls
+            .iter()
+            .find(|(specifier, ..)| *specifier == "arm_call")
+            .expect("match-arm call occurrence");
+        assert_eq!(arm_call.1, CallSyntaxKind::Function);
+        assert_eq!(text_at_span(source, arm_call.3), "arm_call()");
+        let arm_condition = arm_call.2.render();
+        assert!(arm_condition.contains("rust.feature"));
+        assert!(arm_condition.contains("rust.cfg.target_arch"));
+
+        let first_keys: Vec<_> = first
+            .iter()
+            .filter_map(|occurrence| occurrence.call_key("src/lib.rs"))
+            .collect();
+        let second_keys: Vec<_> = second
+            .iter()
+            .filter_map(|occurrence| occurrence.call_key("src/lib.rs"))
+            .collect();
+        assert_eq!(first_keys, second_keys);
+        assert_eq!(first_keys.len(), calls.len());
+        let function_key = first_keys
+            .iter()
+            .find(|key| key.specifier == "crate::direct")
+            .expect("function call key");
+        assert_eq!(function_key.relative_path, "src/lib.rs");
+        assert_eq!(function_key.syntax_kind, CallSyntaxKind::Function);
+        assert_eq!(function_key.span, function.3);
+        assert!(function_key.inline_ancestors.is_empty());
+        assert_eq!(function_key.condition_key, function.2.render());
     }
 }

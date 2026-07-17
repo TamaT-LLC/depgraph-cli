@@ -1,15 +1,18 @@
-//! Deterministic Rust HIR definition graph extraction.
+//! Deterministic Rust HIR semantic graph extraction.
 //!
 //! This pass consumes only the already-confined [`SafeProjectModel`] and emits
-//! definitions, imports, re-exports, and type references. All output is
-//! accumulated in a delta so the scanner can validate and merge it atomically
-//! with the syntax graph. Call-site extraction remains a separate slice.
+//! definitions, imports, re-exports, type references, and exact or conservative
+//! candidate calls. All output is accumulated in a delta so the scanner can
+//! validate and merge it atomically with the syntax graph.
 
 use crate::{
     ADAPTER_VERSION, EXTRACTOR as SOURCE_EXTRACTOR, RUST_ANALYZER_CRATE_VERSION,
     RUST_ANALYZER_REVISION,
     hir_project::SafeProjectModel,
-    source::{Occurrence, SourceSpan, TypeUseContext, TypeUseOccurrenceKey, UseOccurrenceKey},
+    source::{
+        CallOccurrenceKey, CallSyntaxKind, Occurrence, SourceSpan, TypeUseContext,
+        TypeUseOccurrenceKey, UseOccurrenceKey,
+    },
 };
 use anyhow::{Result, bail};
 use depgraph_protocol::{
@@ -17,8 +20,9 @@ use depgraph_protocol::{
     Properties, ResolutionStatus, stable_id_from_value,
 };
 use ra_ap_hir::{
-    Adt, AsAssocItem, AssocItem, AssocItemContainer, Crate, GenericDef, GenericParam, Impl, InFile,
-    Module, ModuleDef, Mutability, PathResolution, PathResolutionPerNs, Semantics, Type, attach_db,
+    Adt, AsAssocItem, AssocItem, AssocItemContainer, CallableKind, Crate, GenericDef, GenericParam,
+    HasVisibility, Impl, InFile, Module, ModuleDef, Mutability, PathResolution,
+    PathResolutionPerNs, Semantics, Type, Visibility, attach_db,
 };
 use ra_ap_ide_db::{
     RootDatabase,
@@ -54,6 +58,7 @@ pub(crate) struct SemanticDelta {
     pub sites: Vec<DependencySite>,
     pub refined_use_keys: BTreeSet<UseOccurrenceKey>,
     pub refined_type_use_keys: BTreeSet<TypeUseOccurrenceKey>,
+    pub refined_call_keys: BTreeSet<CallOccurrenceKey>,
     pub issues: Vec<SemanticIssue>,
 }
 
@@ -103,12 +108,17 @@ struct Extractor<'a> {
     sites: BTreeMap<String, DependencySite>,
     refined_use_keys: BTreeSet<UseOccurrenceKey>,
     refined_type_use_keys: BTreeSet<TypeUseOccurrenceKey>,
+    refined_call_keys: BTreeSet<CallOccurrenceKey>,
     node_ids: HashMap<Definition, String>,
     resolvers: HashMap<Definition, String>,
     impl_ids: HashMap<Impl, String>,
     impl_resolvers: HashMap<Impl, String>,
     external_crates: BTreeMap<(String, String), String>,
     external_aliases: BTreeMap<(String, Vec<String>, String), BTreeSet<ExternalAlias>>,
+    closure_nodes_by_range: HashMap<(u32, TextRange), String>,
+    closure_nodes_by_callable: BTreeMap<String, String>,
+    generic_instances_by_range: HashMap<(u32, TextRange), String>,
+    fn_pointer_targets: HashMap<ra_ap_hir::Local, CallCandidateSet>,
     issues: BTreeMap<(String, Option<String>, String), SemanticIssue>,
 }
 
@@ -132,6 +142,31 @@ struct ExternalAlias {
     external_name: String,
     external_kind: String,
     condition_terms: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct CallCandidateSet {
+    target_ids: BTreeSet<String>,
+    complete: bool,
+}
+
+impl CallCandidateSet {
+    fn incomplete() -> Self {
+        Self::default()
+    }
+
+    fn exact(target_id: String) -> Self {
+        Self {
+            target_ids: BTreeSet::from([target_id]),
+            complete: true,
+        }
+    }
+
+    fn union(mut self, other: Self) -> Self {
+        self.target_ids.extend(other.target_ids);
+        self.complete &= other.complete;
+        self
+    }
 }
 
 pub(crate) fn extract_semantic_delta(
@@ -180,12 +215,17 @@ pub(crate) fn extract_semantic_delta(
         sites: BTreeMap::new(),
         refined_use_keys: BTreeSet::new(),
         refined_type_use_keys: BTreeSet::new(),
+        refined_call_keys: BTreeSet::new(),
         node_ids: HashMap::new(),
         resolvers: HashMap::new(),
         impl_ids: HashMap::new(),
         impl_resolvers: HashMap::new(),
         external_crates,
         external_aliases: BTreeMap::new(),
+        closure_nodes_by_range: HashMap::new(),
+        closure_nodes_by_callable: BTreeMap::new(),
+        generic_instances_by_range: HashMap::new(),
+        fn_pointer_targets: HashMap::new(),
         issues: BTreeMap::new(),
     };
     attach_db(db, || extractor.extract())?;
@@ -195,6 +235,7 @@ pub(crate) fn extract_semantic_delta(
         sites: extractor.sites.into_values().collect(),
         refined_use_keys: extractor.refined_use_keys,
         refined_type_use_keys: extractor.refined_type_use_keys,
+        refined_call_keys: extractor.refined_call_keys,
         issues: extractor.issues.into_values().collect(),
     })
 }
@@ -857,6 +898,7 @@ impl Extractor<'_> {
                 continue;
             };
             let parsed = self.sema.parse_guess_edition(file_id);
+            self.emit_closures(&crate_key, file_id, module, &parsed)?;
             let mut seen_locals = HashSet::new();
             for name in parsed.syntax().descendants().filter_map(ast::Name::cast) {
                 let Some(definition) =
@@ -867,7 +909,7 @@ impl Extractor<'_> {
                 if let Definition::Local(local) = definition
                     && seen_locals.insert(local)
                 {
-                    if self.has_anonymous_execution_ancestor(name.syntax()) {
+                    if self.has_unrepresented_anonymous_execution_ancestor(name.syntax()) {
                         self.issue(
                             "RUST_HIR_ANONYMOUS_BODY_DEFINITION_SKIPPED",
                             Some(path.clone()),
@@ -876,11 +918,11 @@ impl Extractor<'_> {
                         );
                         continue;
                     }
-                    self.emit_local(&crate_key, local)?;
+                    self.emit_local(&crate_key, file_id, local)?;
                 }
             }
             for name_ref in parsed.syntax().descendants().filter_map(ast::NameRef::cast) {
-                if self.has_anonymous_execution_ancestor(name_ref.syntax()) {
+                if self.has_unrepresented_anonymous_execution_ancestor(name_ref.syntax()) {
                     self.issue(
                         "RUST_HIR_ANONYMOUS_BODY_DEFINITION_SKIPPED",
                         Some(path.clone()),
@@ -891,6 +933,7 @@ impl Extractor<'_> {
                 }
                 self.emit_generic_reference(&crate_key, file_id, &name_ref)?;
             }
+            self.index_fn_pointer_targets(file_id, module, &parsed);
             let occurrences = self
                 .occurrences_by_path
                 .get(&path)
@@ -921,6 +964,7 @@ impl Extractor<'_> {
         for occurrence in occurrences {
             let use_key = occurrence.use_key(path);
             let type_use_key = occurrence.type_use_key(path);
+            let call_key = occurrence.call_key(path);
             match occurrence {
                 Occurrence::Use {
                     target_specifier,
@@ -969,10 +1013,328 @@ impl Extractor<'_> {
                         type_use_key.expect("type-use occurrence has a type-use key"),
                     )?;
                 }
+                Occurrence::Call {
+                    specifier,
+                    syntax_kind,
+                    inline_ancestors,
+                    condition,
+                    span,
+                } => {
+                    self.emit_call_occurrence(
+                        crate_key,
+                        file_id,
+                        path,
+                        module,
+                        parsed,
+                        &specifier,
+                        syntax_kind,
+                        &inline_ancestors,
+                        condition,
+                        span,
+                        call_key.expect("call occurrence has a call key"),
+                    )?;
+                }
                 _ => {}
             }
         }
         Ok(())
+    }
+
+    fn emit_closures(
+        &mut self,
+        crate_key: &str,
+        file_id: FileId,
+        module: Module,
+        parsed: &ast::SourceFile,
+    ) -> Result<()> {
+        let closures: Vec<_> = parsed
+            .syntax()
+            .descendants()
+            .filter_map(ast::ClosureExpr::cast)
+            .collect();
+        for closure in closures {
+            if closure
+                .syntax()
+                .ancestors()
+                .skip(1)
+                .any(|node| ast::MacroCall::can_cast(node.kind()))
+            {
+                continue;
+            }
+            let Some(owner_id) = self.semantic_call_owner_id(file_id, closure.syntax()) else {
+                let path = self.paths_by_file.get(&file_id.index()).cloned();
+                self.issue(
+                    "RUST_HIR_CLOSURE_OWNER_UNAVAILABLE",
+                    path,
+                    "closure was skipped because it has no exact enclosing symbol".into(),
+                );
+                continue;
+            };
+            let range = InFile::new(
+                ra_ap_hir::EditionedFileId::current_edition(self.db, file_id).into(),
+                closure.syntax().text_range(),
+            );
+            let Some(location) = self.location_from_range(range) else {
+                continue;
+            };
+            let context = self.context(crate_key)?;
+            let identity = json!({
+                "language": "rust",
+                "package_locator": context.package_locator,
+                "crate_identity": crate_key,
+                "symbol_kind": "closure",
+                "identity_kind": "anonymous",
+                "enclosing_symbol": owner_id,
+                "relative_path": location.path,
+                "span": location.as_value(),
+            });
+            let node_id = stable_id_from_value("symbol", &identity);
+            self.insert_node(GraphNode {
+                id: node_id.clone(),
+                kind: "symbol".into(),
+                locator: format!(
+                    "rust-closure:{}@{}:{}:{}",
+                    owner_id, location.path, location.start_line, location.start_column
+                ),
+                display_name: Some(format!(
+                    "closure@{}:{}:{}",
+                    location.path, location.start_line, location.start_column
+                )),
+                properties: properties(json!({
+                    "language": "rust",
+                    "package_locator": context.package_locator,
+                    "crate_identity": crate_key,
+                    "symbol_kind": "closure",
+                    "canonical_identity": identity,
+                    "profile_id": self.profile_id,
+                    "source_path": location.path,
+                    "source_span": location.as_value(),
+                    "hir_provenance": EXTRACTOR,
+                })),
+            })?;
+            self.closure_nodes_by_range.insert(
+                (file_id.index(), closure.syntax().text_range()),
+                node_id.clone(),
+            );
+
+            let expression: ast::Expr = closure.clone().into();
+            if let Some(callable) = self
+                .sema
+                .type_of_expr(&expression)
+                .map(|info| info.original)
+                .and_then(|ty| ty.as_callable(self.db))
+                && let CallableKind::Closure(closure) = callable.kind()
+            {
+                let key = closure
+                    .display_with_id(self.db, module.krate(self.db).to_display_target(self.db));
+                if let Some(existing) = self.closure_nodes_by_callable.get(&key)
+                    && existing != &node_id
+                {
+                    bail!("conflicting Rust HIR closure callable identity {key}");
+                }
+                self.closure_nodes_by_callable.insert(key, node_id.clone());
+            }
+            let evidence = self.evidence(crate_key, &location, "HIR closure definition", "closure");
+            self.add_relation(crate_key, "declares", &owner_id, &node_id, evidence)?;
+        }
+        Ok(())
+    }
+
+    fn semantic_call_owner_id(&self, file_id: FileId, node: &SyntaxNode) -> Option<String> {
+        for ancestor in node.ancestors().skip(1) {
+            if ast::ClosureExpr::can_cast(ancestor.kind())
+                && let Some(node_id) = self
+                    .closure_nodes_by_range
+                    .get(&(file_id.index(), ancestor.text_range()))
+            {
+                return Some(node_id.clone());
+            }
+        }
+        let definition = self.enclosing_semantic_definition(node)?;
+        let node_id = self.node_ids.get(&definition)?.clone();
+        self.nodes
+            .get(&node_id)
+            .is_some_and(|node| node.kind == "symbol")
+            .then_some(node_id)
+    }
+
+    fn index_fn_pointer_targets(
+        &mut self,
+        file_id: FileId,
+        module: Module,
+        parsed: &ast::SourceFile,
+    ) {
+        for statement in parsed.syntax().descendants().filter_map(ast::LetStmt::cast) {
+            let Some(pattern) = statement.pat() else {
+                continue;
+            };
+            let Some(initializer) = statement.initializer() else {
+                continue;
+            };
+            let candidates = self.callable_initializer_targets(file_id, module, &initializer);
+            let pattern_nodes =
+                std::iter::once(pattern.syntax().clone()).chain(pattern.syntax().descendants());
+            for ident in pattern_nodes.filter_map(ast::IdentPat::cast) {
+                if ident.mut_token().is_some() || ident.ref_token().is_some() {
+                    continue;
+                }
+                let Some(name) = ast::HasName::name(&ident) else {
+                    continue;
+                };
+                let Some(Definition::Local(local)) =
+                    NameClass::classify(&self.sema, &name).and_then(NameClass::defined)
+                else {
+                    continue;
+                };
+                self.fn_pointer_targets.insert(local, candidates.clone());
+            }
+        }
+    }
+
+    fn callable_initializer_targets(
+        &self,
+        file_id: FileId,
+        module: Module,
+        expression: &ast::Expr,
+    ) -> CallCandidateSet {
+        match expression {
+            ast::Expr::ParenExpr(paren) => paren
+                .expr()
+                .map(|expr| self.callable_initializer_targets(file_id, module, &expr))
+                .unwrap_or_else(CallCandidateSet::incomplete),
+            ast::Expr::CastExpr(cast) => cast
+                .expr()
+                .map(|expr| self.callable_initializer_targets(file_id, module, &expr))
+                .unwrap_or_else(CallCandidateSet::incomplete),
+            ast::Expr::BlockExpr(block) => block
+                .tail_expr()
+                .map(|expr| self.callable_initializer_targets(file_id, module, &expr))
+                .unwrap_or_else(CallCandidateSet::incomplete),
+            ast::Expr::IfExpr(if_expression) => {
+                let Some(then_expression) = if_expression
+                    .then_branch()
+                    .and_then(|block| block.tail_expr())
+                else {
+                    return CallCandidateSet::incomplete();
+                };
+                let Some(else_branch) = if_expression.else_branch() else {
+                    return CallCandidateSet::incomplete();
+                };
+                let then_targets =
+                    self.callable_initializer_targets(file_id, module, &then_expression);
+                let else_targets = match else_branch {
+                    ast::ElseBranch::Block(block) => block
+                        .tail_expr()
+                        .map(|expr| self.callable_initializer_targets(file_id, module, &expr))
+                        .unwrap_or_else(CallCandidateSet::incomplete),
+                    ast::ElseBranch::IfExpr(if_expression) => self.callable_initializer_targets(
+                        file_id,
+                        module,
+                        &ast::Expr::IfExpr(if_expression),
+                    ),
+                };
+                then_targets.union(else_targets)
+            }
+            ast::Expr::PathExpr(_) | ast::Expr::ClosureExpr(_) => {
+                self.local_callable_target(file_id, module, expression)
+            }
+            _ => CallCandidateSet::incomplete(),
+        }
+    }
+
+    fn local_callable_target(
+        &self,
+        file_id: FileId,
+        module: Module,
+        expression: &ast::Expr,
+    ) -> CallCandidateSet {
+        if let Some(instance) =
+            self.generic_function_instance_target(file_id, expression.syntax(), None)
+        {
+            return CallCandidateSet::exact(instance);
+        }
+        if let ast::Expr::ClosureExpr(closure) = expression
+            && let Some(target) = self
+                .closure_nodes_by_range
+                .get(&(file_id.index(), closure.syntax().text_range()))
+        {
+            return CallCandidateSet::exact(target.clone());
+        }
+        if let ast::Expr::PathExpr(path) = expression
+            && let Some(name_ref) = path
+                .syntax()
+                .descendants()
+                .filter_map(ast::NameRef::cast)
+                .last()
+            && let Some(NameRefClass::Definition(definition, _)) =
+                NameRefClass::classify(&self.sema, &name_ref)
+        {
+            return match definition {
+                Definition::Function(function) if !self.function_requires_instance(function) => {
+                    self.node_ids
+                        .get(&definition)
+                        .cloned()
+                        .map(CallCandidateSet::exact)
+                        .unwrap_or_else(CallCandidateSet::incomplete)
+                }
+                Definition::Local(local) => self
+                    .fn_pointer_targets
+                    .get(&local)
+                    .cloned()
+                    .unwrap_or_else(CallCandidateSet::incomplete),
+                _ => CallCandidateSet::incomplete(),
+            };
+        }
+        let Some(callable) = self.sema.resolve_expr_as_callable(expression) else {
+            return CallCandidateSet::incomplete();
+        };
+        match callable.kind() {
+            CallableKind::Function(function) => self
+                .node_ids
+                .get(&Definition::Function(function))
+                .cloned()
+                .map(CallCandidateSet::exact)
+                .unwrap_or_else(CallCandidateSet::incomplete),
+            CallableKind::Closure(closure) => {
+                let key = closure
+                    .display_with_id(self.db, module.krate(self.db).to_display_target(self.db));
+                self.closure_nodes_by_callable
+                    .get(&key)
+                    .cloned()
+                    .map(CallCandidateSet::exact)
+                    .unwrap_or_else(CallCandidateSet::incomplete)
+            }
+            CallableKind::FnPtr => self.fn_pointer_candidates(expression),
+            _ => CallCandidateSet::incomplete(),
+        }
+    }
+
+    fn generic_function_instance_target(
+        &self,
+        file_id: FileId,
+        node: &SyntaxNode,
+        function: Option<ra_ap_hir::Function>,
+    ) -> Option<String> {
+        let expected_origin = function
+            .and_then(|function| self.node_ids.get(&Definition::Function(function)))
+            .map(String::as_str);
+        node.descendants()
+            .filter_map(ast::NameRef::cast)
+            .filter_map(|name_ref| {
+                self.generic_instances_by_range
+                    .get(&(file_id.index(), name_ref.syntax().text_range()))
+            })
+            .filter(|node_id| {
+                self.nodes.get(*node_id).is_some_and(|node| {
+                    node.kind == "symbol"
+                        && node.properties["symbol_kind"] == "function_instance"
+                        && expected_origin.is_none_or(|origin| {
+                            node.properties["generic_origin_node"].as_str() == Some(origin)
+                        })
+                })
+            })
+            .last()
+            .cloned()
     }
 
     fn index_external_aliases(
@@ -1302,6 +1664,716 @@ impl Extractor<'_> {
         )?;
         self.refined_type_use_keys.insert(type_use_key);
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit_call_occurrence(
+        &mut self,
+        crate_key: &str,
+        file_id: FileId,
+        path: &str,
+        module: Module,
+        parsed: &ast::SourceFile,
+        specifier: &str,
+        syntax_kind: CallSyntaxKind,
+        inline_ancestors: &[String],
+        condition: Condition,
+        span: SourceSpan,
+        call_key: CallOccurrenceKey,
+    ) -> Result<()> {
+        let location = SourceLocation::from_span(path, span);
+        match syntax_kind {
+            CallSyntaxKind::MacroBoundary => {
+                let mut matches: Vec<_> = parsed
+                    .syntax()
+                    .descendants()
+                    .filter_map(ast::MacroCall::cast)
+                    .filter(|call| {
+                        self.range_matches_span(file_id, call.syntax().text_range(), span)
+                    })
+                    .collect();
+                if matches.len() != 1 {
+                    self.issue(
+                        "RUST_HIR_MACRO_CALL_SOURCE_UNAVAILABLE",
+                        Some(path.into()),
+                        format!(
+                            "macro call boundary {specifier:?} at {}:{} matched {} rust-analyzer syntax nodes",
+                            span.start_line,
+                            span.start_column,
+                            matches.len()
+                        ),
+                    );
+                    return Ok(());
+                }
+                let macro_call = matches.pop().expect("one macro call");
+                if self.has_unrepresented_anonymous_execution_ancestor(macro_call.syntax()) {
+                    self.issue(
+                        "RUST_HIR_ANONYMOUS_CALLER_UNREPRESENTED",
+                        Some(path.into()),
+                        format!(
+                            "macro call boundary {specifier:?} was skipped because its nearest caller is an async, const, or generator body without a canonical symbol identity"
+                        ),
+                    );
+                    return Ok(());
+                }
+                let Some(expansion) = self.sema.expand_macro_call(&macro_call) else {
+                    self.issue(
+                        "RUST_HIR_MACRO_CALL_EXPANSION_UNAVAILABLE",
+                        Some(path.into()),
+                        format!(
+                            "macro call boundary {specifier:?} could not be expanded without executing project code"
+                        ),
+                    );
+                    return Ok(());
+                };
+                let generated_call_count = expansion
+                    .value
+                    .descendants()
+                    .filter(|node| {
+                        ast::CallExpr::can_cast(node.kind())
+                            || ast::MethodCallExpr::can_cast(node.kind())
+                    })
+                    .count();
+                if generated_call_count == 0 {
+                    return Ok(());
+                }
+                let Some(source) = self.semantic_call_owner_id(file_id, macro_call.syntax()) else {
+                    self.issue(
+                        "RUST_HIR_CALL_OWNER_UNAVAILABLE",
+                        Some(path.into()),
+                        format!("macro call boundary {specifier:?} has no exact caller symbol"),
+                    );
+                    return Ok(());
+                };
+                let reason = format!(
+                    "macro expansion contains {generated_call_count} generated call(s) whose individual source provenance cannot be represented exactly"
+                );
+                let resolution =
+                    self.unresolved_resolution(crate_key, "call", specifier, &location, &reason)?;
+                let mut properties = Properties::new();
+                properties.insert("call_syntax".into(), json!(syntax_kind.as_str()));
+                properties.insert("dispatch".into(), json!("macro_boundary"));
+                properties.insert(
+                    "macro_provenance".into(),
+                    json!("declarative-expansion-boundary"),
+                );
+                properties.insert("generated_call_count".into(), json!(generated_call_count));
+                let mut generated_location = location.clone();
+                generated_location.generated = true;
+                self.add_dependency_site(
+                    crate_key,
+                    "call",
+                    "calls",
+                    &source,
+                    specifier,
+                    condition,
+                    resolution,
+                    &generated_location,
+                    "HIR macro-generated call boundary",
+                    "macro-call-boundary",
+                    properties,
+                )?;
+                self.refined_call_keys.insert(call_key);
+                return Ok(());
+            }
+            CallSyntaxKind::Function | CallSyntaxKind::Method => {}
+        }
+
+        let (syntax, resolution, dispatch, algorithm) = match syntax_kind {
+            CallSyntaxKind::Function => {
+                let mut matches: Vec<_> = parsed
+                    .syntax()
+                    .descendants()
+                    .filter_map(ast::CallExpr::cast)
+                    .filter(|call| {
+                        self.range_matches_span(file_id, call.syntax().text_range(), span)
+                    })
+                    .collect();
+                if matches.len() != 1 {
+                    self.issue(
+                        "RUST_HIR_CALL_SOURCE_UNAVAILABLE",
+                        Some(path.into()),
+                        format!(
+                            "function call {specifier:?} at {}:{} matched {} rust-analyzer syntax nodes",
+                            span.start_line,
+                            span.start_column,
+                            matches.len()
+                        ),
+                    );
+                    return Ok(());
+                }
+                let call = matches.pop().expect("one call expression");
+                if self.has_unrepresented_anonymous_execution_ancestor(call.syntax()) {
+                    self.issue(
+                        "RUST_HIR_ANONYMOUS_CALLER_UNREPRESENTED",
+                        Some(path.into()),
+                        format!(
+                            "function call {specifier:?} was skipped because its nearest caller is an async, const, or generator body without a canonical symbol identity"
+                        ),
+                    );
+                    return Ok(());
+                }
+                let Some(callee) = call.expr() else {
+                    return Ok(());
+                };
+                let Some((resolution, dispatch, algorithm)) = self.classify_function_call(
+                    crate_key,
+                    file_id,
+                    module,
+                    &callee,
+                    specifier,
+                    inline_ancestors,
+                    &condition,
+                    &location,
+                )?
+                else {
+                    // Tuple struct and tuple variant construction are not
+                    // function calls in the shared call graph vocabulary.
+                    return Ok(());
+                };
+                (call.syntax().clone(), resolution, dispatch, algorithm)
+            }
+            CallSyntaxKind::Method => {
+                let mut matches: Vec<_> = parsed
+                    .syntax()
+                    .descendants()
+                    .filter_map(ast::MethodCallExpr::cast)
+                    .filter(|call| {
+                        self.range_matches_span(file_id, call.syntax().text_range(), span)
+                    })
+                    .collect();
+                if matches.len() != 1 {
+                    self.issue(
+                        "RUST_HIR_METHOD_CALL_SOURCE_UNAVAILABLE",
+                        Some(path.into()),
+                        format!(
+                            "method call {specifier:?} at {}:{} matched {} rust-analyzer syntax nodes",
+                            span.start_line,
+                            span.start_column,
+                            matches.len()
+                        ),
+                    );
+                    return Ok(());
+                }
+                let call = matches.pop().expect("one method-call expression");
+                if self.has_unrepresented_anonymous_execution_ancestor(call.syntax()) {
+                    self.issue(
+                        "RUST_HIR_ANONYMOUS_CALLER_UNREPRESENTED",
+                        Some(path.into()),
+                        format!(
+                            "method call {specifier:?} was skipped because its nearest caller is an async, const, or generator body without a canonical symbol identity"
+                        ),
+                    );
+                    return Ok(());
+                }
+                let (resolution, dispatch, algorithm) = self.classify_method_call(
+                    crate_key,
+                    file_id,
+                    module,
+                    &call,
+                    specifier,
+                    inline_ancestors,
+                    &condition,
+                    &location,
+                )?;
+                (call.syntax().clone(), resolution, dispatch, algorithm)
+            }
+            CallSyntaxKind::MacroBoundary => unreachable!("macro calls returned above"),
+        };
+        let Some(source) = self.semantic_call_owner_id(file_id, &syntax) else {
+            self.issue(
+                "RUST_HIR_CALL_OWNER_UNAVAILABLE",
+                Some(path.into()),
+                format!("call {specifier:?} has no exact caller symbol"),
+            );
+            return Ok(());
+        };
+        let edge_kind = if resolution.status == ResolutionStatus::Candidates {
+            "may_call"
+        } else {
+            "calls"
+        };
+        let mut properties = Properties::new();
+        properties.insert("call_syntax".into(), json!(syntax_kind.as_str()));
+        properties.insert("dispatch".into(), json!(dispatch));
+        if let Some(algorithm) = algorithm {
+            properties.insert("algorithm".into(), json!(algorithm));
+        }
+        self.add_dependency_site(
+            crate_key,
+            "call",
+            edge_kind,
+            &source,
+            specifier,
+            condition,
+            resolution,
+            &location,
+            "HIR-resolved Rust call",
+            "call",
+            properties,
+        )?;
+        self.refined_call_keys.insert(call_key);
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn classify_function_call(
+        &mut self,
+        crate_key: &str,
+        file_id: FileId,
+        module: Module,
+        callee: &ast::Expr,
+        specifier: &str,
+        inline_ancestors: &[String],
+        condition: &Condition,
+        location: &SourceLocation,
+    ) -> Result<Option<(SemanticResolution, &'static str, Option<&'static str>)>> {
+        let Some(callable) = self.sema.resolve_expr_as_callable(callee) else {
+            let resolution = self.external_call_or_unresolved(
+                crate_key,
+                module,
+                specifier,
+                inline_ancestors,
+                condition,
+                location,
+                "rust-analyzer could not resolve the callable expression",
+            )?;
+            let dispatch = if resolution.status == ResolutionStatus::External {
+                "external"
+            } else {
+                "unresolved"
+            };
+            return Ok(Some((resolution, dispatch, None)));
+        };
+        match callable.kind() {
+            CallableKind::Function(function) => {
+                if let Some(AssocItemContainer::Trait(trait_)) = function
+                    .as_assoc_item(self.db)
+                    .map(|item| item.container(self.db))
+                {
+                    if let Some((resolution, dispatch)) = self.concrete_trait_function_resolution(
+                        crate_key, file_id, callee, function, specifier, location,
+                    )? {
+                        return Ok(Some((resolution, dispatch, None)));
+                    }
+                    let resolution = self.closed_trait_call_resolution(
+                        crate_key, trait_, function, specifier, location,
+                    )?;
+                    let algorithm = (resolution.status == ResolutionStatus::Candidates)
+                        .then_some("rust-analyzer-local-trait-impls-v1");
+                    return Ok(Some((resolution, "trait_associated", algorithm)));
+                }
+                let resolution = self.exact_function_resolution(
+                    crate_key,
+                    file_id,
+                    callee.syntax(),
+                    function,
+                    specifier,
+                    location,
+                )?;
+                let dispatch = if resolution.status == ResolutionStatus::External {
+                    "external"
+                } else {
+                    "static"
+                };
+                Ok(Some((resolution, dispatch, None)))
+            }
+            CallableKind::Closure(closure) => {
+                let key = closure
+                    .display_with_id(self.db, module.krate(self.db).to_display_target(self.db));
+                let resolution = if let Some(target) =
+                    self.closure_nodes_by_callable.get(&key).cloned()
+                {
+                    SemanticResolution {
+                        target_ids: vec![target],
+                        status: ResolutionStatus::Resolved,
+                        precision: Precision::Exact,
+                        reason: None,
+                    }
+                } else {
+                    self.unresolved_resolution(
+                        crate_key,
+                        "call",
+                        specifier,
+                        location,
+                        "rust-analyzer resolved a closure callable whose source identity is unavailable",
+                    )?
+                };
+                Ok(Some((resolution, "closure", None)))
+            }
+            CallableKind::FnPtr => {
+                let candidates = self.fn_pointer_candidates(callee);
+                let resolution = if candidates.complete && !candidates.target_ids.is_empty() {
+                    SemanticResolution {
+                        target_ids: candidates.target_ids.into_iter().collect(),
+                        status: ResolutionStatus::Candidates,
+                        precision: Precision::Overapprox,
+                        reason: Some(
+                            "immutable local function-pointer flow produced a closed candidate set"
+                                .into(),
+                        ),
+                    }
+                } else {
+                    self.unresolved_resolution(
+                        crate_key,
+                        "call",
+                        specifier,
+                        location,
+                        "function-pointer targets are not a complete immutable local points-to set",
+                    )?
+                };
+                let algorithm = (resolution.status == ResolutionStatus::Candidates)
+                    .then_some("rust-immutable-fn-pointer-flow-v1");
+                Ok(Some((resolution, "function_pointer", algorithm)))
+            }
+            CallableKind::FnImpl(_) => {
+                let resolution = self.unresolved_resolution(
+                    crate_key,
+                    "call",
+                    specifier,
+                    location,
+                    "Fn trait dispatch has no complete local points-to set",
+                )?;
+                Ok(Some((resolution, "fn_trait", None)))
+            }
+            CallableKind::TupleStruct(_) | CallableKind::TupleEnumVariant(_) => Ok(None),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn classify_method_call(
+        &mut self,
+        crate_key: &str,
+        file_id: FileId,
+        module: Module,
+        call: &ast::MethodCallExpr,
+        specifier: &str,
+        inline_ancestors: &[String],
+        condition: &Condition,
+        location: &SourceLocation,
+    ) -> Result<(SemanticResolution, &'static str, Option<&'static str>)> {
+        let Some(function) = self.sema.resolve_method_call(call) else {
+            let resolution = self.external_call_or_unresolved(
+                crate_key,
+                module,
+                specifier,
+                inline_ancestors,
+                condition,
+                location,
+                "rust-analyzer could not resolve the method call",
+            )?;
+            let dispatch = if resolution.status == ResolutionStatus::External {
+                "external"
+            } else {
+                "unresolved"
+            };
+            return Ok((resolution, dispatch, None));
+        };
+        if let Some(AssocItemContainer::Trait(trait_)) = function
+            .as_assoc_item(self.db)
+            .map(|item| item.container(self.db))
+        {
+            let concrete_receiver = call
+                .receiver()
+                .and_then(|receiver| self.sema.type_of_expr(&receiver))
+                .map(|info| info.adjusted.unwrap_or(info.original))
+                .is_some_and(|ty| self.is_concrete_call_receiver(ty));
+            if concrete_receiver && function.has_body(self.db) {
+                let anchor = call
+                    .name_ref()
+                    .map(|name_ref| name_ref.syntax().clone())
+                    .unwrap_or_else(|| call.syntax().clone());
+                let resolution = self.exact_function_resolution(
+                    crate_key, file_id, &anchor, function, specifier, location,
+                )?;
+                return Ok((resolution, "trait_default_static", None));
+            }
+            let resolution = self
+                .closed_trait_call_resolution(crate_key, trait_, function, specifier, location)?;
+            let algorithm = (resolution.status == ResolutionStatus::Candidates)
+                .then_some("rust-analyzer-local-trait-impls-v1");
+            return Ok((resolution, "trait_dynamic", algorithm));
+        }
+        let anchor = call
+            .name_ref()
+            .map(|name_ref| name_ref.syntax().clone())
+            .unwrap_or_else(|| call.syntax().clone());
+        let resolution = self.exact_function_resolution(
+            crate_key, file_id, &anchor, function, specifier, location,
+        )?;
+        Ok((resolution, "method_static", None))
+    }
+
+    fn exact_function_resolution(
+        &mut self,
+        crate_key: &str,
+        file_id: FileId,
+        anchor: &SyntaxNode,
+        function: ra_ap_hir::Function,
+        specifier: &str,
+        location: &SourceLocation,
+    ) -> Result<SemanticResolution> {
+        if let Some(instance) =
+            self.generic_function_instance_target(file_id, anchor, Some(function))
+        {
+            return Ok(SemanticResolution {
+                target_ids: vec![instance],
+                status: ResolutionStatus::Resolved,
+                precision: Precision::Exact,
+                reason: None,
+            });
+        }
+        let definition = Definition::Function(function);
+        if self.node_ids.contains_key(&definition) && self.function_requires_instance(function) {
+            return self.unresolved_resolution(
+                crate_key,
+                "call",
+                specifier,
+                location,
+                "generic function call could not be mapped to a complete canonical function instance",
+            );
+        }
+        match self.classify_definition_target(crate_key, specifier, "call", definition)? {
+            ClassifiedTarget::Concrete { node_id, external } => Ok(SemanticResolution {
+                target_ids: vec![node_id],
+                status: if external {
+                    ResolutionStatus::External
+                } else {
+                    ResolutionStatus::Resolved
+                },
+                precision: Precision::Exact,
+                reason: None,
+            }),
+            ClassifiedTarget::Unsupported(reason) => {
+                self.unresolved_resolution(crate_key, "call", specifier, location, &reason)
+            }
+        }
+    }
+
+    fn function_requires_instance(&self, function: ra_ap_hir::Function) -> bool {
+        if !GenericDef::Function(function).params(self.db).is_empty() {
+            return true;
+        }
+        function
+            .as_assoc_item(self.db)
+            .map(|item| item.container(self.db))
+            .is_some_and(|container| match container {
+                AssocItemContainer::Impl(impl_) => {
+                    !GenericDef::Impl(impl_).params(self.db).is_empty()
+                }
+                AssocItemContainer::Trait(trait_) => {
+                    !GenericDef::Trait(trait_).params(self.db).is_empty()
+                }
+            })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn concrete_trait_function_resolution(
+        &mut self,
+        crate_key: &str,
+        file_id: FileId,
+        callee: &ast::Expr,
+        trait_function: ra_ap_hir::Function,
+        specifier: &str,
+        location: &SourceLocation,
+    ) -> Result<Option<(SemanticResolution, &'static str)>> {
+        let Some(name_ref) = callee
+            .syntax()
+            .descendants()
+            .filter_map(ast::NameRef::cast)
+            .last()
+        else {
+            return Ok(None);
+        };
+        let Some(NameRefClass::Definition(Definition::Function(resolved), Some(substitution))) =
+            NameRefClass::classify(&self.sema, &name_ref)
+        else {
+            return Ok(None);
+        };
+        if resolved != trait_function
+            && matches!(
+                resolved
+                    .as_assoc_item(self.db)
+                    .map(|item| item.container(self.db)),
+                Some(AssocItemContainer::Impl(_))
+            )
+        {
+            let resolution = self.exact_function_resolution(
+                crate_key,
+                file_id,
+                callee.syntax(),
+                resolved,
+                specifier,
+                location,
+            )?;
+            return Ok(Some((resolution, "trait_associated_static")));
+        }
+        if resolved != trait_function {
+            return Ok(None);
+        }
+        let has_concrete_self = substitution
+            .types(self.db)
+            .into_iter()
+            .find(|(name, _)| name.as_str() == "Self")
+            .map(|(_, ty)| ty)
+            .filter(|ty| self.is_concrete_call_receiver(ty.clone()))
+            .is_some();
+        if !has_concrete_self {
+            return Ok(None);
+        }
+        if trait_function.has_body(self.db) {
+            let resolution = self.exact_function_resolution(
+                crate_key,
+                file_id,
+                callee.syntax(),
+                trait_function,
+                specifier,
+                location,
+            )?;
+            return Ok(Some((resolution, "trait_associated_default_static")));
+        }
+        Ok(None)
+    }
+
+    fn closed_trait_call_resolution(
+        &mut self,
+        crate_key: &str,
+        trait_: ra_ap_hir::Trait,
+        trait_function: ra_ap_hir::Function,
+        specifier: &str,
+        location: &SourceLocation,
+    ) -> Result<SemanticResolution> {
+        if matches!(trait_.visibility(self.db), Visibility::Public) {
+            return self.unresolved_resolution(
+                crate_key,
+                "call",
+                specifier,
+                location,
+                "public trait dispatch is open to implementations outside the confined crate graph",
+            );
+        }
+        let method_name = trait_function.name(self.db);
+        let mut targets = BTreeSet::new();
+        let mut complete = true;
+        let impls = Impl::all_for_trait(self.db, trait_);
+        for impl_ in impls
+            .iter()
+            .copied()
+            .filter(|impl_| !impl_.is_negative(self.db))
+        {
+            let implementation = impl_.items(self.db).into_iter().find_map(|item| {
+                let function = item.as_function()?;
+                (function.name(self.db) == method_name).then_some(function)
+            });
+            if let Some(function) = implementation {
+                if let Some(target) = self.node_ids.get(&Definition::Function(function)).cloned() {
+                    targets.insert(target);
+                } else {
+                    complete = false;
+                }
+            } else if trait_function.has_body(self.db) {
+                if let Some(target) = self
+                    .node_ids
+                    .get(&Definition::Function(trait_function))
+                    .cloned()
+                {
+                    targets.insert(target);
+                } else {
+                    complete = false;
+                }
+            } else {
+                complete = false;
+            }
+        }
+        if impls.is_empty() || !complete || targets.is_empty() {
+            return self.unresolved_resolution(
+                crate_key,
+                "call",
+                specifier,
+                location,
+                "trait dispatch candidates are not complete in the confined crate graph",
+            );
+        }
+        Ok(SemanticResolution {
+            target_ids: targets.into_iter().collect(),
+            status: ResolutionStatus::Candidates,
+            precision: Precision::Overapprox,
+            reason: Some("closed non-public trait implementation set".into()),
+        })
+    }
+
+    fn fn_pointer_candidates(&self, callee: &ast::Expr) -> CallCandidateSet {
+        let Some(name_ref) = callee
+            .syntax()
+            .descendants()
+            .filter_map(ast::NameRef::cast)
+            .last()
+        else {
+            return CallCandidateSet::incomplete();
+        };
+        let Some(NameRefClass::Definition(Definition::Local(local), _)) =
+            NameRefClass::classify(&self.sema, &name_ref)
+        else {
+            return CallCandidateSet::incomplete();
+        };
+        self.fn_pointer_targets
+            .get(&local)
+            .cloned()
+            .unwrap_or_else(CallCandidateSet::incomplete)
+    }
+
+    fn is_concrete_call_receiver(&self, ty: Type<'_>) -> bool {
+        if ty.as_adt().is_some() || ty.as_builtin().is_some() {
+            return true;
+        }
+        ty.as_reference()
+            .is_some_and(|(inner, _)| self.is_concrete_call_receiver(inner))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn external_call_or_unresolved(
+        &mut self,
+        crate_key: &str,
+        module: Module,
+        specifier: &str,
+        inline_ancestors: &[String],
+        condition: &Condition,
+        location: &SourceLocation,
+        unresolved_reason: &str,
+    ) -> Result<SemanticResolution> {
+        let mut module_path = self.module_path(module);
+        module_path.extend(inline_ancestors.iter().cloned());
+        let external = self
+            .external_metadata(crate_key, specifier)
+            .map(|(name, kind)| (name, kind, specifier.into()))
+            .or_else(|| {
+                self.external_alias_metadata(crate_key, &module_path, specifier, condition)
+            });
+        let Some((external_name, external_kind, target_specifier)) = external else {
+            return self.unresolved_resolution(
+                crate_key,
+                "call",
+                specifier,
+                location,
+                unresolved_reason,
+            );
+        };
+        let target = self.ensure_external_target(
+            crate_key,
+            &target_specifier,
+            "call",
+            &external_name,
+            &external_kind,
+            None,
+        )?;
+        Ok(SemanticResolution {
+            target_ids: vec![target],
+            status: ResolutionStatus::External,
+            precision: Precision::Heuristic,
+            reason: Some(format!(
+                "call target is rooted in external crate {external_name}, whose source is outside the confined rust-analyzer model"
+            )),
+        })
     }
 
     fn use_tree_alias(&self, tree: &ast::UseTree) -> Option<String> {
@@ -2013,7 +3085,8 @@ impl Extractor<'_> {
         primary.properties.extend(evidence_properties);
         primary
             .properties
-            .insert("macro_provenance".into(), json!("direct-source"));
+            .entry("macro_provenance".into())
+            .or_insert_with(|| json!("direct-source"));
         primary.properties.insert(
             "resolution_status".into(),
             serde_json::to_value(resolution.status)?,
@@ -2033,10 +3106,10 @@ impl Extractor<'_> {
             }
         }
         if resolution.status == ResolutionStatus::Candidates {
-            primary.properties.insert(
-                "algorithm".into(),
-                json!("rust-analyzer-path-resolution-per-namespace"),
-            );
+            primary
+                .properties
+                .entry("algorithm".into())
+                .or_insert_with(|| json!("rust-analyzer-path-resolution-per-namespace"));
         }
         let supporting = Evidence {
             kind: EvidenceKind::Source,
@@ -2121,7 +3194,12 @@ impl Extractor<'_> {
         Ok(())
     }
 
-    fn emit_local(&mut self, crate_key: &str, local: ra_ap_hir::Local) -> Result<()> {
+    fn emit_local(
+        &mut self,
+        crate_key: &str,
+        file_id: FileId,
+        local: ra_ap_hir::Local,
+    ) -> Result<()> {
         let primary_source = local.primary_source(self.db).source;
         let range = primary_source
             .as_ref()
@@ -2129,10 +3207,8 @@ impl Extractor<'_> {
         let Some(location) = self.location_from_range(range) else {
             return Ok(());
         };
-        let Ok(owner_definition) = Definition::try_from(local.parent(self.db)) else {
-            return Ok(());
-        };
-        let Some(owner_id) = self.node_ids.get(&owner_definition).cloned() else {
+        let Some(owner_id) = self.semantic_call_owner_id(file_id, primary_source.value.syntax())
+        else {
             return Ok(());
         };
         if self
@@ -2235,11 +3311,24 @@ impl Extractor<'_> {
             );
             return Ok(());
         }
-        let Some(owner) = self.enclosing_item(name_ref) else {
-            return Ok(());
-        };
-        let Some(owner_id) = self.node_ids.get(&owner).cloned() else {
-            return Ok(());
+        let owner_id = if name_ref
+            .syntax()
+            .ancestors()
+            .skip(1)
+            .any(|ancestor| ast::ClosureExpr::can_cast(ancestor.kind()))
+        {
+            let Some(owner_id) = self.semantic_call_owner_id(file_id, name_ref.syntax()) else {
+                return Ok(());
+            };
+            owner_id
+        } else {
+            let Some(owner) = self.enclosing_item(name_ref) else {
+                return Ok(());
+            };
+            let Some(owner_id) = self.node_ids.get(&owner).cloned() else {
+                return Ok(());
+            };
+            owner_id
         };
         let type_arguments: Vec<_> = substitution
             .types(self.db)
@@ -2362,6 +3451,10 @@ impl Extractor<'_> {
             display_name: Some(resolver.clone()),
             properties: node_properties,
         })?;
+        self.generic_instances_by_range.insert(
+            (file_id.index(), name_ref.syntax().text_range()),
+            node_id.clone(),
+        );
         let evidence = self.evidence(
             crate_key,
             &location,
@@ -2412,19 +3505,23 @@ impl Extractor<'_> {
         None
     }
 
-    fn has_anonymous_execution_ancestor(&self, node: &SyntaxNode) -> bool {
-        node.ancestors().skip(1).any(|ancestor| {
-            if ast::ClosureExpr::can_cast(ancestor.kind())
-                || ast::ConstArg::can_cast(ancestor.kind())
-            {
+    fn has_unrepresented_anonymous_execution_ancestor(&self, node: &SyntaxNode) -> bool {
+        for ancestor in node.ancestors().skip(1) {
+            if ast::ClosureExpr::can_cast(ancestor.kind()) {
+                return false;
+            }
+            if ast::ConstArg::can_cast(ancestor.kind()) {
                 return true;
             }
-            ast::BlockExpr::cast(ancestor).is_some_and(|block| {
+            if ast::BlockExpr::cast(ancestor).is_some_and(|block| {
                 block.async_token().is_some()
                     || block.const_token().is_some()
                     || block.gen_token().is_some()
-            })
-        })
+            }) {
+                return true;
+            }
+        }
+        false
     }
 
     #[allow(clippy::too_many_arguments)]

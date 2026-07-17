@@ -1154,6 +1154,12 @@ fn is_rust_semantic_dependency_site(site: &DependencySite, source: &GraphNode) -
     is_rust_import_site_kind(site.kind.as_str())
         || (site.kind == "type_use"
             && source.properties.get("language").and_then(Value::as_str) == Some("rust"))
+        || (site.kind == "call"
+            && (source.properties.get("language").and_then(Value::as_str) == Some("rust")
+                || site.evidence.first().is_some_and(|evidence| {
+                    evidence.kind == EvidenceKind::Semantic
+                        && evidence.extractor.starts_with("rust-analyzer")
+                })))
 }
 
 fn is_payload_event(event: &ProtocolEvent) -> bool {
