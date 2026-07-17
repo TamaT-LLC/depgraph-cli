@@ -1,9 +1,11 @@
 //! Safe, static Rust adapter for the depgraph v1 protocol.
 //!
 //! The scanner deliberately limits Cargo invocation to `cargo metadata
-//! --frozen --offline --no-deps`. Source, manifests, build scripts, and
-//! procedural macros from the scanned repository are never executed.
+//! --frozen --offline --no-deps` against a sanitized, worker-owned input
+//! mirror. Source, manifests, build scripts, and procedural macros from the
+//! scanned repository are never executed or passed directly to Cargo.
 
+mod cargo_mirror;
 mod emit;
 pub mod hir_scaffold;
 mod manifest;

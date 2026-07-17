@@ -1,25 +1,43 @@
 # Rust worker
 
 The Rust worker currently produces a deterministic static syntax graph. It
-reads confined Cargo manifests, lockfiles, and Rust source, attempts
-`cargo metadata --format-version 1 --no-deps --frozen --offline` from a neutral
-working directory, and falls back to its static manifest model when that
-command is unavailable. Rust source is parsed with `syn`. The worker now links
-an exact-pinned rust-analyzer library set and exposes an inventory-only HIR
-smoke scaffold, but the production scan does not invoke that scaffold or emit
-semantic graph events. Its profile therefore remains `analysis=syntax`,
+reads confined Cargo manifests, lockfiles, and Rust source, preflights every
+Cargo-visible path, and constructs a worker-owned mirror containing only
+admitted manifests, lockfiles, and target-discovery layout. It runs
+`cargo metadata --format-version 1 --no-deps --frozen --offline` against the
+mirror from a neutral working directory and falls back to its static manifest
+model when preflight, mirror construction, the command, or DTO validation
+fails. Rust source is parsed with `syn`. The worker links an exact-pinned
+rust-analyzer library set and exposes an inventory-only HIR smoke scaffold, but
+the production scan does not invoke that scaffold or emit semantic graph
+events. Its profile therefore remains `analysis=syntax`,
 `rust_hir_backend=disabled`, and `rust_hir_status=not-invoked`.
 
-The current Cargo path validates workspace members after Cargo returns. A
-manifest such as `members = ["../outside"]` can therefore make Cargo read an
-out-of-root manifest before the result is filtered. Current metadata remains a
-best-effort syntax-inventory input and is not eligible for HIR. HIR stays
-disabled until a preflight plus confined Cargo-visible input mirror prevents
-that read. The metadata command and neutral version probe set
-`RUSTUP_AUTO_INSTALL=0`; the probe also clears project environment, redirects
-writable homes to neutral temporary paths, and enforces timeout and output
-limits. The same no-download/no-project-write boundary remains mandatory for
-the future confined project model.
+Preflight rejects ambiguous globs, symlinks, out-of-root workspace members and
+path dependencies, and unknown Cargo path-bearing fields before Cargo starts.
+Known absolute paths must map to admitted inventory entries and are rewritten
+to the mirror; the original repository manifest path is never passed to Cargo.
+Standalone package roots receive an empty mirror-only workspace boundary so
+Cargo cannot discover a workspace manifest in temporary-directory ancestors.
+When the inventory root has no admitted manifest, the mirror project root owns
+a virtual guard workspace. Path dependencies outside a selected nested
+workspace therefore stop at worker-owned input, even when Cargo rejects them
+and the scanner uses its static fallback.
+Raw Cargo DTO paths are mapped back to repository-relative inventory IDs or
+original confined canonical paths before leaving the metadata boundary. Raw
+`path+file://` package IDs are used only to match DTO workspace members, and
+mirror paths, temporary Cargo homes, and target directories never participate
+in profile or graph identity, diagnostics, evidence, or coverage. This closes
+the Cargo read-confinement slice, but the DTO remains a syntax-inventory input:
+the multi-file HIR project model and semantic emission are still follow-up
+work.
+
+The metadata command uses `env_clear`, a sanitized absolute `PATH`, neutral
+worker-owned writable homes, Cargo home, temporary and target directories,
+empty compiler wrappers, offline/frozen mode, and `RUSTUP_AUTO_INSTALL=0`.
+Only a canonical Rustup home outside the scan root may be retained for a
+resolved system rustup proxy. The neutral version probe uses the same
+no-download/no-project-write boundary with timeout and output limits.
 
 ## Selected semantic backend
 
@@ -54,17 +72,25 @@ and [architecture overview](https://rust-analyzer.github.io/book/contributing/ar
 
 ## HIR safe scan boundary
 
-After the enable gates above are complete, HIR safe mode may:
+The current Cargo-facing phase may:
 
-- read regular files whose canonical paths remain inside the scan root;
-- after a path/symlink preflight, run the resolved system `cargo` only against
-  a confined mirror containing admitted manifests, lockfiles, and the source
-  layout needed for target discovery (or safe explicit target placeholders),
-  with known absolute paths rewritten to the mirror and unknown ones rejected;
-- probe resolved system Cargo and rustc versions for the HIR enable gate using
-  a neutral directory, cleared project environment, `RUSTUP_AUTO_INSTALL=0`,
-  timeout, and output limit;
-- parse manifests and source in the worker and build an in-memory crate graph;
+- read regular manifest, lockfile, and target-layout inputs whose canonical
+  paths remain inside the scan root;
+- reject unconfined path-bearing input before Cargo starts;
+- run the resolved system `cargo` only against the worker-owned admitted mirror
+  from a neutral environment;
+- map `workspace_root`, package manifests, target sources, and dependency paths
+  from the raw DTO to admitted inventory identities, rejecting the entire DTO
+  when any path is unknown, outside the mirror, or unregistered;
+- probe resolved system Cargo and rustc versions for the future HIR enable gate
+  using a neutral directory, cleared project environment,
+  `RUSTUP_AUTO_INSTALL=0`, timeout, and output limit.
+
+These implemented Cargo operations do not enable HIR. After the remaining safe
+project-model and release gates are complete, HIR safe mode may additionally:
+
+- consume the already-admitted manifests and source bytes to build an in-memory
+  multi-file VFS, cfg set, and crate graph;
 - expand declarative macros in memory when their input is completely known;
 - read a release-owned, checksum-verified sysroot snapshot after that component
   is introduced by the HIR implementation.
@@ -89,11 +115,12 @@ Their side effects are covered by the armed fixture under
 The current verified Rust baseline is `1.93.1`. Syntax inventory remains
 best-effort outside that baseline. The worker probes the resolved system
 `rustc` and Cargo pair from a neutral environment and records whether it
-matches the exact baseline. The rust-analyzer revision is selected and the
-smoke scaffold is available, but HIR stays disabled until compatible confined
-crate-graph inputs and the remaining release gates are complete. A verified
-sysroot is additionally required only when the profile claims standard-library
-resolution.
+matches the exact baseline. The rust-analyzer revision is selected, the smoke
+scaffold is available, and Cargo metadata input reads are confined. HIR
+nevertheless stays disabled until the confined DTO is translated into a
+compatible multi-file project model and the remaining semantic and release
+gates are complete. A verified sysroot is additionally required only when the
+profile claims standard-library resolution.
 
 | Project/toolchain state | Current result | HIR eligibility after the remaining gates |
 | --- | --- | --- |
@@ -101,7 +128,7 @@ resolution.
 | No project toolchain declaration | Static syntax graph using the worker baseline as metadata | Eligible only when every effective input is the verified baseline |
 | Older, newer, or nightly declaration | `RUST_TOOLCHAIN_BEST_EFFORT`; static syntax graph | Syntax fallback; never `semantic-complete` |
 | Custom or malformed declaration, unreadable file, or external symlink | Static syntax graph with `RUST_TOOLCHAIN_INVALID` and `RUST_HIR_TOOLCHAIN_UNSUPPORTED` | Fail-closed syntax fallback; never HIR-eligible |
-| Cargo missing or frozen/offline metadata fails | `CARGO_METADATA_FALLBACK`; static manifest and syntax graph | Syntax fallback with `cargo-metadata-fallback` coverage reason |
+| Cargo preflight rejects the input, mirror/DTO validation fails, or frozen/offline Cargo is unavailable | `CARGO_METADATA_FALLBACK`; static manifest, syntax graph, and file ledger are retained | Syntax fallback with a stable coverage reason; raw Cargo stderr and temporary paths are not exposed |
 | Build script or proc macro is required | Unresolved site plus `BUILD_SCRIPT_NOT_EXECUTED` or `PROC_MACRO_NOT_EXECUTED` | Partial HIR only; never execute project code in safe mode |
 | HIR panic, timeout, or malformed internal result | Not applicable while HIR is disabled | Worker failure; the core keeps other adapter results but does not relabel syntax as semantic success |
 | Release-owned backend/sysroot bytes are missing or changed | Not applicable while HIR is disabled | Security failure before analysis; no project/system fallback |
@@ -132,7 +159,8 @@ runtime facts, not a claim that the future backend already ran.
 | `rust_hir_toolchain_status` | Effective HIR gate after combining the raw probe and project declaration |
 | `rust_toolchain_declaration_status` | `absent`, `valid`, or fail-closed `invalid` |
 | `rust_toolchain_observed` | Sanitized observed `rustc` / Cargo versions, commits, and hosts, or a bounded failure reason |
-| `crate_graph_source_policy` | `cargo-metadata-or-static-manifest` |
+| `cargo_metadata_input` | `confined-mirror` |
+| `crate_graph_source_policy` | `confined-cargo-metadata-or-static-manifest` |
 | `syntax_fallback` | `enabled` |
 | `build_script_policy` | `disabled` |
 | `proc_macro_policy` | `disabled` |
@@ -148,12 +176,20 @@ crate-graph source, and completed HIR status. Backend and toolchain revisions
 that can change graph identity must also participate in the profile identity
 or evidence identity.
 
+The profile records only the stable confined-metadata policy and status. It
+never records the mirror root, mirror manifest path, temporary Cargo/Rustup
+home, or temporary target directory. Those paths are execution details rather
+than reproducibility inputs.
+
 ## Fallback contract
 
 A recoverable project compatibility failure preserves the static nodes, sites,
 edges, and file ledger. It emits a stable diagnostic, adds a stable coverage
 reason, retains `syntax-complete` only if the syntax ledger is complete, and
 omits `semantic-complete`. The scanner never silently drops a recognized site.
+Preflight and DTO failures use repository-relative inventory paths and bounded
+reason categories; raw Cargo stderr, mirror paths, and rejected external path
+values do not become diagnostic messages or identities.
 
 Integrity failures are different: the current core already treats a missing or
 modified release-owned worker as a security error. Before HIR is enabled, its
@@ -196,10 +232,12 @@ scan boundary:
    versions, upstream revision metadata, neutral Cargo/rustc version probes, a
    minimal in-memory HIR smoke test, SBOM/license assertions, and no project
    loading; prove absent toolchains cause no download or user/project write.
-2. **Confine Cargo input reads (1–2 days):** reject ambiguous/external
-   workspace, path, patch, replace, glob, symlink, and unknown absolute paths,
-   then run metadata only against a mirror of admitted manifests, lockfile, and
-   target-discovery layout while mapping temporary paths back to inventory IDs.
+2. **Completed 2026-07-17 — confine Cargo input reads:** reject
+   ambiguous/external workspace, path, patch, replace, glob, symlink, and
+   unknown path-bearing input before Cargo starts; run metadata only against a
+   neutral mirror of admitted manifests, lockfile, and target-discovery layout;
+   map raw DTO paths back to inventory IDs; and prove temporary paths do not
+   enter graph/profile/diagnostic identity. HIR remains disabled.
 3. **Build the safe project model (2–3 days):** translate the admitted Cargo
    DTO/static model, target, features, and cfg values into an in-memory VFS and
    `CrateGraph`; keep build scripts, proc macros, project config, and toolchain

@@ -855,12 +855,31 @@ fn workspace_package_values(documents: &[ManifestDocument]) -> BTreeMap<String, 
 }
 
 fn relative_to_root(document: &ManifestDocument, path: &str) -> String {
+    let raw = Path::new(path);
+    let bytes = path.as_bytes();
+    let portable_absolute = raw.is_absolute()
+        || path.starts_with("//")
+        || path.starts_with(r"\\")
+        || (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':');
+    if portable_absolute {
+        return "__depgraph_skipped__/cargo-path".into();
+    }
     let relative = if document.rel_dir == "." {
-        PathBuf::from(path)
+        PathBuf::from(raw)
     } else {
-        Path::new(&document.rel_dir).join(path)
+        Path::new(&document.rel_dir).join(raw)
     };
-    slash_path(&normalize_path(&relative))
+    let relative = normalize_path(&relative);
+    if relative.components().any(|component| {
+        matches!(
+            component,
+            Component::ParentDir | Component::Prefix(_) | Component::RootDir
+        )
+    }) {
+        "__depgraph_skipped__/cargo-path".into()
+    } else {
+        slash_path(&relative)
+    }
 }
 
 pub(crate) fn normalize_path(path: &Path) -> PathBuf {
@@ -919,7 +938,9 @@ pub(crate) fn workspace_identity(packages: &[Package], documents: &[ManifestDocu
 
 #[cfg(test)]
 mod tests {
-    use super::{ManifestDocument, expanded_features, parse_packages, wildcard_match};
+    use super::{
+        ManifestDocument, expanded_features, parse_packages, relative_to_root, wildcard_match,
+    };
     use depgraph_protocol::Condition;
     use serde_json::Value as JsonValue;
     use std::{collections::BTreeSet, path::PathBuf};
@@ -946,6 +967,26 @@ mod tests {
         assert!(wildcard_match("crates/*", "crates/member"));
         assert!(!wildcard_match("crates/*", "crates/group/member"));
         assert!(wildcard_match("crates/**", "crates/group/member"));
+    }
+
+    #[test]
+    fn static_target_paths_reject_portable_absolute_and_drive_relative_forms() {
+        let document = document("[package]\nname='app'\nversion='1.0.0'\n");
+        for path in [
+            "/outside/lib.rs",
+            "//server/share/lib.rs",
+            r"\\server\share\lib.rs",
+            "C:/outside/lib.rs",
+            r"C:\outside\lib.rs",
+            "C:drive-relative.rs",
+            "../outside/lib.rs",
+        ] {
+            assert_eq!(
+                relative_to_root(&document, path),
+                "__depgraph_skipped__/cargo-path",
+                "unsafe path was retained: {path}"
+            );
+        }
     }
 
     #[test]

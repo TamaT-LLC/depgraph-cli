@@ -118,23 +118,16 @@ pub fn scan(root: &Path) -> Result<ScanResult> {
         .find(|document| document.rel_path == "Cargo.toml")
         .or_else(|| documents.first())
         .cloned();
-    let metadata_lock_preflight = metadata_manifest
-        .as_ref()
-        .map(|document| LockIndex::read(&root, &document.dir));
     let metadata_result = metadata_manifest.as_ref().and_then(|document| {
-        if metadata_lock_preflight
-            .as_ref()
-            .is_some_and(|lock| lock.failure.is_some())
-        {
+        if cargo_ancestor_manifest_failed(&root, document, &discovery_failures) {
             return None;
         }
-        run_cargo_metadata(&root, &document.abs_path)
-            .and_then(|metadata| {
+        run_cargo_metadata(&root, &document.abs_path, &documents)
+            .and_then(|(metadata, lock)| {
                 let workspace_root = normalize_path(metadata.workspace_root());
                 if !workspace_root.starts_with(&root) {
                     bail!("cargo metadata workspace root is outside the scan root");
                 }
-                let lock = LockIndex::read(&root, &workspace_root);
                 metadata
                     .into_packages(&root, &lock, &documents)
                     .map(|(packages, active_documents)| (packages, active_documents, lock))
@@ -263,7 +256,7 @@ pub fn scan(root: &Path) -> Result<ScanResult> {
             state.add_diagnostic(
                 DiagnosticSeverity::Info,
                 "CARGO_METADATA_FROZEN",
-                "cargo metadata completed with frozen, offline, no-deps settings",
+                "cargo metadata completed against a confined input mirror with frozen, offline, no-deps settings",
                 Some(&document.rel_path),
                 None,
                 "cargo-metadata-success",
@@ -271,13 +264,24 @@ pub fn scan(root: &Path) -> Result<ScanResult> {
         }
         Some(document) => {
             state.reasons.insert("cargo-metadata-fallback".into());
+            state
+                .reasons
+                .insert("rust-hir-crate-graph-unavailable".into());
             state.add_diagnostic(
                 DiagnosticSeverity::Warning,
                 "CARGO_METADATA_FALLBACK",
-                "cargo metadata --frozen --offline was unavailable; static manifest parsing was used",
+                "confined cargo metadata --frozen --offline was unavailable; static manifest parsing was used",
                 Some(&document.rel_path),
                 None,
                 "cargo-metadata-fallback",
+            );
+            state.add_diagnostic(
+                DiagnosticSeverity::Warning,
+                "RUST_HIR_CRATE_GRAPH_UNAVAILABLE",
+                "a confined Cargo crate graph was unavailable; HIR remains disabled and syntax analysis continues",
+                Some(&document.rel_path),
+                None,
+                "rust-hir-crate-graph-unavailable",
             );
         }
         None => {
@@ -1800,6 +1804,13 @@ fn discover_manifests(root: &Path) -> Result<(Vec<ManifestDocument>, Vec<Discove
                     "Cargo manifest {lexical} is a symbolic link and was not followed in safe mode"
                 ),
             });
+        } else {
+            let path = entry.into_path();
+            let lexical = relative_path(root, &path);
+            failures.push(DiscoveryFailure {
+                path: lexical.clone(),
+                reason: format!("Cargo manifest {lexical} is not a regular file"),
+            });
         }
     }
     paths.sort();
@@ -1832,6 +1843,30 @@ fn discover_manifests(root: &Path) -> Result<(Vec<ManifestDocument>, Vec<Discove
         }
     }
     Ok((documents, failures))
+}
+
+fn cargo_ancestor_manifest_failed(
+    root: &Path,
+    entry: &ManifestDocument,
+    failures: &[DiscoveryFailure],
+) -> bool {
+    let mut directory = entry.dir.as_path();
+    loop {
+        let candidate = directory.join("Cargo.toml");
+        let relative = relative_path(root, &candidate);
+        if failures.iter().any(|failure| {
+            failure.path == relative || failure.path == skipped_ledger_path(&relative)
+        }) {
+            return true;
+        }
+        if directory == root {
+            return false;
+        }
+        let Some(parent) = directory.parent().filter(|parent| parent.starts_with(root)) else {
+            return false;
+        };
+        directory = parent;
+    }
 }
 
 fn rust_profile(
@@ -1921,7 +1956,8 @@ fn rust_profile(
             "rust_hir_toolchain_status": hir_toolchain_status.as_str(),
             "rust_toolchain_declaration_status": declared_toolchain_status,
             "rust_toolchain_observed": toolchain_probe.as_value(),
-            "crate_graph_source_policy": "cargo-metadata-or-static-manifest",
+            "cargo_metadata_input": "confined-mirror",
+            "crate_graph_source_policy": "confined-cargo-metadata-or-static-manifest",
             "syntax_fallback": "enabled",
             "effective_target": selected_target,
             "host_target": host_target,

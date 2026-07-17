@@ -16,9 +16,9 @@ updated: 2026-07-17
 
 2026-07-17 時点で Milestone 0〜1 の MVP に加え、Milestone 2 の Go semantic vertical sliceを実装済みである。Go workerは制限付き`go/packages`、`go/types`、serial SSAからsymbol/type/generic instance、`declares`、`extends`、`implements`、`instantiates`、`type_uses`、exact `calls`、RTA/CHA candidate `may_call`をprotocol semantic graphとして出力する。これらはSQLite evidence storeへ保存され、symbol/type selector、deps/dependents/why/cycles、JSON/DOT/Mermaid exportの対象となる。
 
-safe scanではcanonical root外へのsymlink readを拒否し、相対PATH・repository内toolchain・Node実行hookを除外する。Goは制限付き`go/packages`からparser fallbackへ移行し、Cargo metadataはneutral cwdから`--frozen --offline --no-deps`で実行する。配布物はworker/runtime checksumを検証し、manifestまたは同梱layout欠損時にfail closedとする。
+safe scanではcanonical root外へのsymlink readを拒否し、相対PATH・repository内toolchain・Node実行hookを除外する。Goは制限付き`go/packages`からparser fallbackへ移行する。Cargo metadataはpath-bearing inputのpreflight後、admitted manifest、lockfile、target discovery layoutだけを持つworker-owned confined mirrorに対してneutral cwdから`--frozen --offline --no-deps`で実行し、返却されたtemporary pathをinventory IDへ戻す。配布物はworker/runtime checksumを検証し、manifestまたは同梱layout欠損時にfail closedとする。
 
-Rust は rust-analyzer `0.0.330`、upstream revision `8954b66d43225e62c92e8bbcc8500191b5cceb1e`、Salsa `0.26.1` の exact pin、neutral toolchain probe、inventory bytes 専用の in-memory HIR smoke scaffold まで実装済みである。ただし production scan の Rust HIR semantic graph/backend は `disabled` / `not-invoked` のままである。TypeScript TypeChecker、frameworkのcomponent/server function semantic edge、build観測、incremental/watch、snapshot/diff/impact、architecture policy、runtime traceは本設計の後続Milestoneとして未実装である。Go VTAおよびreflection/native境界の追加refinementも未実装である。
+Rust は rust-analyzer `0.0.330`、upstream revision `8954b66d43225e62c92e8bbcc8500191b5cceb1e`、Salsa `0.26.1` の exact pin、neutral toolchain probe、inventory bytes 専用の in-memory HIR smoke scaffold、Cargo read-confinement preflight / mirrorまで実装済みである。ただし production scan の Rust HIR semantic graph/backend は `disabled` / `not-invoked` のままであり、confined Cargo DTOからmulti-file VFS / `CrateGraph`を構築するsafe project modelは次工程である。TypeScript TypeChecker、frameworkのcomponent/server function semantic edge、build観測、incremental/watch、snapshot/diff/impact、architecture policy、runtime traceは本設計の後続Milestoneとして未実装である。Go VTAおよびreflection/native境界の追加refinementも未実装である。
 
 ## 1. 目的
 
@@ -392,13 +392,13 @@ TypeScript の `type_target` と runtime / bundler の `runtime_target` は別 e
 
 ### 9.1 現状と採用 backend
 
-Milestone 1 の Rust worker は `syn` による syntax-only adapter である。`cargo metadata --format-version 1 --no-deps --frozen --offline` に成功した場合は workspace member、target、dependency declaration を利用し、失敗時は confined な manifest / lockfile の静的解析へ fallback する。`--no-deps` の出力は完全な resolve graph ではなく、現在の feature list も workspace 全体を決定的に近似した値である。この結果に `semantic-complete` を付与しない。
+Milestone 1 の Rust worker は `syn` による syntax-only adapter である。path-bearing Cargo inputのpreflightとconfined mirror構築に成功し、`cargo metadata --format-version 1 --no-deps --frozen --offline` がmirrorに対して完了した場合は、inventory identityへremap済みのworkspace member、target、dependency declarationを利用する。preflight、mirror構築、command、DTO検証のいずれかが失敗した場合は、confinedなmanifest / lockfileの静的解析へfallbackする。`--no-deps` の出力は完全なresolve graphではなく、現在のfeature listもworkspace全体を決定的に近似した値である。この結果に`semantic-complete`を付与しない。
 
-現行の Cargo metadata path は Cargo 起動後に workspace member / path dependency を scan root へ絞り込むため、`members = ["../outside"]` のような manifest が Cargo に scan root 外の manifest を読ませる可能性を起動前には排除できない。この DTO は syntax inventory の best-effort 補助情報に限定し、safe HIR の入力としては不適格とする。9.3節の preflight / confined mirror gate が実装されるまで、この点からも HIR を有効化しない。
+Cargoへ元repositoryのmanifest pathは渡さない。`members = ["../outside"]`、root外path dependency、ambiguous glob、symlink、未対応のpath-bearing field等をpreflightで一意にconfinedと証明できなければ、Cargoを起動しない。Cargoのraw DTOが含むmirror absolute pathと`path+file://` package IDはmetadata境界内だけで扱い、admitted inventory IDまたは元repository内のcanonical pathへ変換してからscannerへ渡す。temporary pathはprofile identity、node / site / edge、diagnostic、evidence、coverage ledgerへ残さない。このread-confinement gateは実装済みだが、safe HIRのmulti-file project modelとsemantic emissionは未実装であるため、DTOは引き続きsyntax inventoryの補助入力である。
 
 Milestone 2 の HIR backend には、ADR-007 に従い、version を exact pin した rust-analyzer library 群を `depgraph-rust-worker` へ静的 link する方式を採用する。Rust worker 自体は core から独立 process として timeout、cancel、process-tree 停止、stdout / stderr 上限の管理下にあるため、library 統合でも core と HIR の障害境界は維持される。
 
-2026-07-17 時点で rust-analyzer は `ra_ap_* = 0.0.330`、upstream revision `8954b66d43225e62c92e8bbcc8500191b5cceb1e`、Salsa dependency set `0.26.1` に exact pin 済みである。`0.0.331` は Rust `1.93.1` で `ra_ap_hir_ty` の unstable if-let guard をコンパイルできないため棄却した。worker には inventory 済み UTF-8 bytes を virtual `/lib.rs`、最小 `CrateGraph`、in-memory VFS へ投入する smoke scaffold と neutral toolchain probe を追加済みである。この scaffold は workspace discovery、repository file read、sysroot load、proc macro、子 process、protocol semantic graph emission を行わない。confined Cargo mirror と safe project model、semantic emission、release gate が未完了であるため、production profile は引き続き `analysis=syntax`、`rust_hir_backend=disabled`、`rust_hir_status=not-invoked` であり、enabled な supported HIR matrix はまだ空である。
+2026-07-17 時点で rust-analyzer は `ra_ap_* = 0.0.330`、upstream revision `8954b66d43225e62c92e8bbcc8500191b5cceb1e`、Salsa dependency set `0.26.1` に exact pin 済みである。`0.0.331` は Rust `1.93.1` で `ra_ap_hir_ty` の unstable if-let guard をコンパイルできないため棄却した。worker には inventory 済み UTF-8 bytes を virtual `/lib.rs`、最小 `CrateGraph`、in-memory VFS へ投入する smoke scaffold、neutral toolchain probe、confined Cargo mirrorを追加済みである。smoke scaffoldはworkspace discovery、repository file read、sysroot load、proc macro、子process、protocol semantic graph emissionを行わない。safe project model、semantic emission、release gateが未完了であるため、production profileは引き続き`analysis=syntax`、`rust_hir_backend=disabled`、`rust_hir_status=not-invoked`であり、enabledなsupported HIR matrixはまだ空である。
 
 ### 9.2 方式比較
 
@@ -416,13 +416,17 @@ HIR backend は rust-analyzer の workspace discovery、`load_cargo`、flycheck�
 現在実装済みの scaffold は、この最終 project model の前段にある単一 file smoke path である。呼出側が渡した inventory bytes だけを virtual path に登録し、file loader を公開せず、proc macro と sysroot dependency のない最小 crate を HIR へ lower する。production scanner からは呼び出さず、以下の multi-file project model が完成するまで graph event へ昇格しない。
 
 1. canonical scan root 内で inventory 済みの manifest、lockfile、Rust source bytes
-2. Cargo がたどり得る workspace member、path dependency、`patch` / `replace` manifest path を起動前に静的検証し、すべて scan root 内の admitted file と証明できる場合に限り、neutral cwd、`env_clear`、sanitized absolute `PATH`、`--frozen --offline --no-deps` で得た Cargo metadata DTO
+2. Cargo がたどり得る workspace member、path dependency、`patch` / `replace` manifest path を起動前に静的検証し、すべて scan root 内の admitted file と証明できる場合に限り、worker-owned mirror、neutral cwd、`env_clear`、sanitized absolute `PATH`、`--frozen --offline --no-deps` で得てinventory identityへremapした Cargo metadata DTO
 3. canonical sort / deduplicate 済みの profile target、crate ごとの edition、requested feature、worker-owned `cfg` table
 4. worker が発行した VFS file ID と canonical relative path
 
 crate graph には selected workspace target と scan root 内の path dependency だけを実 crate として追加する。registry / git dependency、`std` / `core` / `alloc`、scan root 外の path dependency は external sentinel とし、その定義が必要な resolution は `external` または `unresolved` にする。初期 HIR backend は system / project の sysroot source、Cargo registry source、`target/` artifact、`rust-project.json`、`.cargo/config*`、custom target JSON を load しない。current profile の workspace-global feature 展開を exact input とせず、package / crate ごとに feature `cfg` を再構築する。
 
-preflight が glob、symlink、外部 workspace member / path dependency、未知の Cargo path-bearing key を一意に confined と判定できない場合は Cargo metadata を起動せず、静的 manifest fallback と `RUST_HIR_CRATE_GRAPH_UNAVAILABLE` を選ぶ。Cargo の read set を OS sandbox で直接制限できない target でも同じ結果にする。実装時は admitted manifest / lockfile と target auto-discovery に必要な admitted source layout を worker-owned temporary directory へ複製した Cargo-visible input mirror で Cargo metadata を実行し、元 project tree の manifest path を Cargo に渡さない。source を複製しない場合は安全な placeholder と明示 target table で auto-discovery を無効化する。manifest / lockfile の absolute path-bearing field は mirror path へ rewrite できる既知 field に限定し、それ以外は reject する。Cargo が返す mirror absolute path は検証後に元の inventory ID へ写像し、graph identity に temporary path を入れない。
+Cargo read-confinement preflightとmirrorは実装済みである。preflightがglob、symlink、外部workspace member / path dependency、未知のCargo path-bearing keyを一意にconfinedと判定できない場合はCargo metadataを起動せず、静的manifest fallbackと`RUST_HIR_CRATE_GRAPH_UNAVAILABLE`を選ぶ。admitted manifest / lockfileとtarget auto-discoveryに必要なadmitted layoutまたはsafe placeholderだけをworker-owned temporary directoryへ複製し、Cargoにはmirror内のmanifest pathだけを渡す。既知のabsolute path-bearing fieldは対応するmirror pathへrewriteし、admitted inventoryへ一意に対応しない値はrejectする。standalone package rootにはmirror限定の空`[workspace]`境界を合成する。inventory rootにadmitted manifestがないmirrorではproject rootへvirtual guard workspaceを置き、nested workspace外のpath dependencyがCargoに拒否される場合も含め、temporary directory祖先のworkspace manifest探索をworker-owned inputで停止する。元projectの`.cargo/config*`、`rust-toolchain*`、build artifact、任意source contentsはCargo-visible inputへ追加しない。
+
+Cargo commandはneutral cwdと`env_clear`を使用し、`HOME`、`USERPROFILE`、`CARGO_HOME`、temporary directory、`CARGO_TARGET_DIR`をworker-owned directoryへ固定する。`PATH`はscan root外のcanonical absolute directoryだけにsanitizationし、rustup proxyに必要な`RUSTUP_HOME`もscan root外のcanonical directoryに限定する。`RUSTUP_AUTO_INSTALL=0`、offline / frozen、空のcompiler wrapperを強制し、project / user Cargo config、project toolchain override、network download、project directoryへのwriteを入力へ含めない。
+
+raw Cargo DTOはmetadata module外へ公開しない。`workspace_root`、package `manifest_path`、target `src_path`、dependency `path`はadmitted mapとの完全一致を検証してinventory IDまたは元repository内のcanonical pathへ戻す。mirror pathを含むpackage ID / workspace member IDはraw DTO内のmembership照合だけに使って破棄し、temporary `target_directory` / `build_directory`や任意metadata fieldをgraphへ伝播させない。未知、mirror外、未登録のDTO pathが1件でもあればDTO全体をrejectする。mirror directory名とabsolute pathはstable ID、profile、node / site / edge、diagnostic message / identity、evidence、file coverageの入力にしない。
 
 rust-analyzer 側に arbitrary path を読む file loader を渡さない。`include!` 等は inventory 済みの confined file に解決できる場合だけ展開し、`OUT_DIR`、project environment、wrapper / compiler hook を注入しない。declarative macro と rust-analyzer 内の builtin macro は、追加 I/O や process を起動しない純粋な token 展開に限って利用できる。rust-analyzer / HIR phase から proc-macro dynamic library、proc-macro server、build script、Cargo check、project compilation、`RUSTC_WRAPPER`、`RUSTC_WORKSPACE_WRAPPER` を起動しない。外部 command は前段の制限済み Cargo metadata と、HIR enable gate 専用の `cargo --version --verbose` / `rustc --version --verbose` probe だけを許可する。どちらも `RUSTUP_AUTO_INSTALL=0` を必須とし、toolchain / component の download や user / project directory への write を許可しない。
 
@@ -446,9 +450,9 @@ version probe は metadata と同じ system-command resolver、neutral cwd、`en
 
 | 状態 | 挙動 | diagnostic / coverage | 終了 |
 | --- | --- | --- | --- |
-| safe project model / semantic emission / release gate 完了前 | 現行 `syn` inventory だけを実行。exact-pinned HIR scaffold は production scan から呼び出さない | profile `analysis=syntax`、`rust_hir_backend=disabled`、`rust_hir_status=not-invoked` | syntax scan 自体の policy に従う |
+| safe project model / semantic emission / release gate 完了前 | confined Cargo DTOまたはstatic manifest modelを`src` inventoryと組み合わせた現行syntax scanだけを実行。exact-pinned HIR scaffoldはproduction scanから呼び出さない | profile `analysis=syntax`、`rust_hir_backend=disabled`、`rust_hir_status=not-invoked` | syntax scan自体のpolicyに従う |
 | toolchain / edition / target が matrix 外 | HIR を起動せず syntax graph を保持 | `RUST_HIR_TOOLCHAIN_UNSUPPORTED` または `RUST_HIR_INPUT_UNSUPPORTED`、reason `rust-hir-unsupported` | non-strict は継続。`semantic-complete` なし |
-| Cargo preflight 非適合 / safe Cargo metadata 失敗 / static manifest fallback | Cargo を起動しないか HIR crate graph を作らず、syntax graph を保持 | 既存 `CARGO_METADATA_FALLBACK` + `RUST_HIR_CRATE_GRAPH_UNAVAILABLE`、reason `rust-hir-crate-graph-unavailable` | non-strict は継続。`semantic-complete` なし |
+| Cargo preflight 非適合 / mirror構築失敗 / safe Cargo metadataまたはDTO remap失敗 / static manifest fallback | preflight非適合ではCargoを起動せず、それ以外もraw DTOを採用しない。HIR crate graphを作らず、static manifest inventory、syntax graph、file ledgerを保持 | `CARGO_METADATA_FALLBACK` + `RUST_HIR_CRATE_GRAPH_UNAVAILABLE`、reason `rust-hir-crate-graph-unavailable`。pathはinventory-relative、reasonはstable categoryとし、temporary pathやraw Cargo stderrを含めない | non-strictは継続。`semantic-complete`なし |
 | external crate / sysroot 定義が必要 | sentinel で `external` または unknown target で `unresolved` | `RUST_HIR_EXTERNAL_DEFINITION_UNAVAILABLE`、該当 site と reason を ledger へ記録 | 継続。unresolved があれば `semantic-complete` なし |
 | build script / proc macro が必要 | 実行 / dynamic library load をせず影響 site を unresolved にする | 既存 `BUILD_SCRIPT_NOT_EXECUTED` / `PROC_MACRO_NOT_EXECUTED`、`project_code_executed=false` | 継続。`semantic-complete` なし |
 | HIR が typed recoverable error を返す | その profile の semantic event を全破棄し、syntax graph を保持 | `RUST_HIR_BACKEND_FAILURE`、reason `rust-hir-backend-failure` | partial coverage。strict policy の対象 |
@@ -456,9 +460,9 @@ version probe は metadata と同じ system-command resolver、neutral cwd、`en
 | packaged Rust worker が missing / checksum不一致 | development worker、system / project rust-analyzer、syntax-only へ fallback しない | 現行 core `security-policy` | `security_failed`、exit `4` |
 | packaged Rust worker の protocol / adapter / backend version不一致、release-root 内 symlink | HIR enable 前の release gate では security policy として拒否する。現行 core は adapter mismatch を worker failure、release-root 内 symlinkを許容するため、そのまま HIR 対応済みとは申告しない | 後続 task で verifier / schema を強化し contract test を追加 | gate 完了後は `security_failed`、exit `4` |
 
-現在の syntax profile は `rust_hir_scaffold=available`、`rust_hir_enable_gate`、`rust_analyzer_version=0.0.330`、`rust_analyzer_revision=8954b66d43225e62c92e8bbcc8500191b5cceb1e`、`rust_analyzer_salsa_version=0.26.1`、raw system probe の `rust_toolchain_probe_status`、project declaration を合成した `rust_hir_toolchain_status`、`rust_toolchain_declaration_status`、sanitized な `rust_toolchain_observed` を machine-readable property として記録する。malformed、読取不能、scan root 外へ解決する `rust-toolchain*` は `invalid` として fail-closed に扱う。この metadata は backend 実行済みという意味ではない。
+現在の syntax profile は `rust_hir_scaffold=available`、`rust_hir_enable_gate`、`rust_analyzer_version=0.0.330`、`rust_analyzer_revision=8954b66d43225e62c92e8bbcc8500191b5cceb1e`、`rust_analyzer_salsa_version=0.26.1`、`cargo_metadata_input=confined-mirror`、`crate_graph_source_policy=confined-cargo-metadata-or-static-manifest`、raw system probe の `rust_toolchain_probe_status`、project declaration を合成した `rust_hir_toolchain_status`、`rust_toolchain_declaration_status`、sanitized な `rust_toolchain_observed` を machine-readable property として記録する。malformed、読取不能、scan root 外へ解決する `rust-toolchain*` は `invalid` として fail-closed に扱う。mirror root、mirror manifest path、temporary Cargo home / target directoryはprofile propertyまたはprofile IDへ含めない。この metadata は backend 実行済みという意味ではない。
 
-HIR enabled profile は少なくとも `analysis_backend=rust-analyzer-hir`、`rust_hir_backend=ra-library`、`rust_hir_status`、exact pin を示す `rust_analyzer_revision`、`rust_toolchain_baseline=1.93.1`、`rust_toolchain_observed`、`crate_graph_source=cargo-metadata`、`proc_macro_expansion=disabled`、`build_scripts_executed=false`、`proc_macros_executed=false` を machine-readable property として記録する。`rust_analyzer_revision` が未定のまま `ra-library` を申告してはならない。
+HIR enabled profile は少なくとも `analysis_backend=rust-analyzer-hir`、`rust_hir_backend=ra-library`、`rust_hir_status`、exact pin を示す `rust_analyzer_revision`、`rust_toolchain_baseline=1.93.1`、`rust_toolchain_observed`、`crate_graph_source=confined-cargo-metadata`、`proc_macro_expansion=disabled`、`build_scripts_executed=false`、`proc_macros_executed=false` を machine-readable property として記録する。`rust_analyzer_revision` が未定のまま `ra-library` を申告してはならない。
 
 ### 9.6 Version pin、更新、release 要件
 
@@ -481,7 +485,7 @@ library 群は Rust worker binary に静的 link するため、release archive 
 | 後続 task | 期間 | 主な完了条件 | 前提 |
 | --- | --- | --- | --- |
 | RA pin と toolchain probe / in-memory VFS scaffold（2026-07-17 完了） | 1〜2日 | `0.0.330` / revision `8954b66d43225e62c92e8bbcc8500191b5cceb1e` / Salsa `0.26.1` の exact dependency、backend metadata / handshake、neutral version probe、inventory bytes だけを読む smoke test。HIR は graph に昇格しない | なし |
-| Cargo read-confinement preflight / mirror | 1〜2日 | 外部 member / path / symlink fixture で Cargo を起動せず、manifest / lockfile / target layout の Cargo-visible mirror と absolute path rewrite / reject を検証する | なし |
+| Cargo read-confinement preflight / mirror（2026-07-17 完了） | 1〜2日 | 外部 member / path / symlink / glob / 未知fieldを起動前にrejectし、manifest / lockfile / target layoutのCargo-visible mirror、neutral environment、absolute path rewrite、raw DTOのinventory remap、temporary path非漏洩を検証する。HIRはgraphに昇格しない | なし |
 | Safe crate graph / per-crate `cfg` builder | 2〜3日 | workspace target、path dependency、edition、feature、supported target を analysis database へ投入。external / custom target / static fallback を ledger 化 | RA scaffold + Cargo confinement |
 | HIR symbol / type vertical slice | 2〜3日 | definition / reference / type / trait / impl の stable ID、source span、semantic contract fixture | crate graph builder |
 | HIR direct-call resolution | 2〜3日 | function / method call の `calls`、external / unresolved、macro provenance、candidate と exact の区別 | symbol / type slice |
@@ -838,6 +842,10 @@ policy result も evidence span を持ち、CI annotation へ変換できるよ�
 - module file、inline module、`#[path]`、glob / alias re-export
 - feature / `cfg` / target matrix
 - trait dispatch、function pointer、macro-generated item
+- 外部 workspace member / path dependency、`patch` / `replace`、glob、symlink、未知のpath-bearing fieldをpreflightでrejectし、armed Cargo markerが作成されないこと
+- admitted manifest / lockfile / target layoutだけを持つmirrorへ元repositoryではなくCargoを向け、project `.cargo/config*`、toolchain override、build script、proc macroを実行しないこと
+- raw Cargo DTOのworkspace / manifest / target / dependency pathをinventory identityへremapし、未知、mirror外、未登録pathをDTO全体としてrejectすること
+- 同一sourceを異なるmirror / checkoutからscanしてprofile、node / site / edge、diagnostic、coverage、出力順を比較し、temporary pathがgraph payloadへ存在しないこと
 
 ### 18.3 Go Fixture
 
@@ -877,6 +885,8 @@ policy result も evidence span を持ち、CI annotation へ変換できるよ�
 ### 19.1 決定性
 
 同一source、toolchain、adapter、profile、およびadapterが参照するdependency snapshotから同一stable ID、graph、coverage summaryを生成する。出力順はcanonical sortする。scan IDはattempt identityでありgraph identityには含めず、異なるscan ID間ではgraph payloadまたはexportを比較する。
+
+Rustのconfined Cargo mirrorのdirectory名、absolute path、temporary Cargo home / target directoryは決定性入力ではない。raw Cargo DTOはadmitted inventory identityへremapしてからgraph構築へ渡し、mirrorの`path+file://` package IDもstable package identityとして使用しない。同一source / toolchain / profileを異なるmirrorまたはcheckoutでscanした場合、profile ID、node / site / edge ID、diagnostic、evidence、coverage ledger、canonical outputは一致し、temporary pathを含まない。`scan_started.root`はscan attemptの元repository rootであり、graph identityには含めない。
 
 Go semantic scanではGOOS/GOARCH、build tags、強制されたcgo無効状態、offline dependency availabilityを決定性の入力に含める。offline module-cache snapshotは現状profile identityへfingerprintされないため、cache stateが異なるscanを同一決定性入力として扱わない。
 

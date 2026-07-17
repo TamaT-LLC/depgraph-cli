@@ -590,8 +590,9 @@ fn default_rust_profile_has_stable_hashed_host_identity() {
     assert_eq!(first.properties["rust_toolchain_baseline"], "1.93.1");
     assert_eq!(
         first.properties["crate_graph_source_policy"],
-        "cargo-metadata-or-static-manifest"
+        "confined-cargo-metadata-or-static-manifest"
     );
+    assert_eq!(first.properties["cargo_metadata_input"], "confined-mirror");
     assert_eq!(first.properties["syntax_fallback"], "enabled");
     assert_eq!(first.properties["build_script_policy"], "disabled");
     assert_eq!(first.properties["proc_macro_policy"], "disabled");

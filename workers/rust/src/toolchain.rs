@@ -195,11 +195,13 @@ fn configure_probe_environment(command: &mut Command, root: &Path, neutral: &Pat
         .as_deref()
         .and_then(|value| safe_external_directory(root, value))
         .or_else(|| {
-            std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .map(|home| home.join(".rustup"))
-                .filter(|path| path.is_dir())
-                .and_then(|path| safe_external_directory(root, path.as_os_str()))
+            ["HOME", "USERPROFILE"].into_iter().find_map(|key| {
+                std::env::var_os(key)
+                    .map(PathBuf::from)
+                    .map(|home| home.join(".rustup"))
+                    .filter(|path| path.is_dir())
+                    .and_then(|path| safe_external_directory(root, path.as_os_str()))
+            })
         })
         .unwrap_or_else(|| neutral.join("rustup-home"));
     fs::create_dir_all(&rustup_home).context("create neutral Rustup home")?;

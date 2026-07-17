@@ -127,6 +127,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 24.18.0
+      - run: cargo test -p depgraph-rust-worker --lib --locked
       - run: cargo xtask build
       - run: target\debug\depgraph.exe --version
       - run: target\debug\depgraph-rust-worker.exe --version
