@@ -97,6 +97,51 @@ fn extracts_cargo_targets_conditions_modules_and_safe_mode_sites() {
             .iter()
             .any(|diagnostic| diagnostic.code == "CARGO_METADATA_FROZEN")
     );
+    assert_eq!(result.profile.properties["rust_hir_project_model"], "ready");
+    assert_eq!(
+        result.profile.properties["rust_hir_enable_gate"],
+        "semantic-emission-pending"
+    );
+    assert_eq!(
+        result.profile.properties["crate_graph_source"],
+        "confined-cargo-metadata"
+    );
+    assert!(
+        result.profile.properties["rust_hir_project_file_count"]
+            .as_u64()
+            .is_some_and(|count| count > 0)
+    );
+    assert!(
+        result.profile.properties["rust_hir_project_crate_count"]
+            .as_u64()
+            .is_some_and(|count| count > 0)
+    );
+    assert!(
+        result.profile.properties["rust_hir_project_external_count"]
+            .as_u64()
+            .is_some_and(|count| count > 0)
+    );
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "RUST_HIR_PROJECT_MODEL_READY")
+    );
+    assert_eq!(
+        result
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| { diagnostic.code == "RUST_HIR_EXTERNAL_DEFINITION_UNAVAILABLE" })
+            .count(),
+        1
+    );
+    assert!(
+        result
+            .coverage
+            .reasons
+            .iter()
+            .any(|reason| reason == "rust-hir-external-definition-unavailable")
+    );
     assert!(result.nodes.iter().any(|node| {
         node.kind == "build_unit" && node.properties["target_kind"] == "custom-build"
     }));
@@ -312,6 +357,15 @@ fn missing_cargo_preserves_static_syntax_graph_without_semantic_completeness() {
     assert_eq!(profile.properties["analysis_backend"], "static-syntax");
     assert_eq!(profile.properties["rust_hir_backend"], "disabled");
     assert_eq!(profile.properties["rust_hir_status"], "not-invoked");
+    assert_eq!(profile.properties["rust_hir_project_model"], "not-invoked");
+    assert_eq!(
+        profile.properties["rust_hir_enable_gate"],
+        "toolchain-unsupported"
+    );
+    assert_eq!(
+        profile.properties["crate_graph_source"],
+        "static-manifest-fallback"
+    );
     assert_eq!(
         profile.properties["rust_toolchain_probe_status"],
         "unavailable"
@@ -368,6 +422,37 @@ fn missing_cargo_preserves_static_syntax_graph_without_semantic_completeness() {
 }
 
 #[test]
+fn ready_project_model_keeps_missing_modules_in_the_unresolved_ledger() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("missing-module");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname='missing-module'\nversion='0.1.0'\nedition='2024'\n",
+    )
+    .unwrap();
+    fs::write(root.join("src/lib.rs"), "pub mod missing;\n").unwrap();
+
+    let result = scan(&root).unwrap();
+    let site = result
+        .sites
+        .iter()
+        .find(|site| site.kind == "module_declaration" && site.specifier == "missing")
+        .unwrap();
+    assert_eq!(site.resolution_status, ResolutionStatus::Unresolved);
+    assert!(result.coverage.unresolved > 0);
+    assert!(
+        !result
+            .coverage
+            .completeness
+            .contains(&CompletenessLevel::SemanticComplete)
+    );
+    if result.profile.properties["rust_hir_toolchain_status"] == "compatible" {
+        assert_eq!(result.profile.properties["rust_hir_project_model"], "ready");
+    }
+}
+
+#[test]
 fn static_fallback_respects_members_exclude_and_lock_versions() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fallback");
     let result = scan(&root).unwrap();
@@ -376,6 +461,37 @@ fn static_fallback_respects_members_exclude_and_lock_versions() {
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.code == "CARGO_METADATA_FALLBACK")
+    );
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| { diagnostic.code == "RUST_HIR_CRATE_GRAPH_UNAVAILABLE" })
+    );
+    assert_eq!(
+        result.profile.properties["rust_hir_project_model"],
+        "unavailable"
+    );
+    assert_eq!(
+        result.profile.properties["rust_hir_enable_gate"],
+        "crate-graph-unavailable"
+    );
+    assert_eq!(
+        result.profile.properties["crate_graph_source"],
+        "static-manifest-fallback"
+    );
+    assert_eq!(result.profile.properties["rust_hir_project_file_count"], 0);
+    assert_eq!(result.profile.properties["rust_hir_project_crate_count"], 0);
+    assert_eq!(
+        result.profile.properties["rust_hir_project_external_count"],
+        0
+    );
+    assert!(
+        result
+            .coverage
+            .reasons
+            .iter()
+            .any(|reason| reason == "rust-hir-crate-graph-unavailable")
     );
     let package_names: BTreeSet<_> = result
         .nodes
@@ -525,11 +641,38 @@ fn configured_rust_profile_is_canonical() {
         first.target.as_deref(),
         Some("aarch64-apple-darwin,wasm32-unknown-unknown")
     );
+    if first.properties["rust_hir_toolchain_status"] == "compatible" {
+        assert_eq!(first.properties["rust_hir_project_model"], "unsupported");
+        assert_eq!(
+            first.properties["rust_hir_enable_gate"],
+            "input-unsupported"
+        );
+    }
 
     let different_target = worker_profile(
         r#"{"rust_features":["fast","serde"],"rust_targets":["x86_64-unknown-linux-gnu"]}"#,
     );
     assert_ne!(first.id, different_target.id);
+}
+
+#[test]
+fn configured_rust_mode_reaches_the_safe_project_builder() {
+    let check = worker_profile(r#"{"rust_mode":"check"}"#);
+    let test = worker_profile(r#"{"rust_mode":"test"}"#);
+
+    assert_eq!(check.command.as_deref(), Some("check"));
+    assert_eq!(test.command.as_deref(), Some("test"));
+    assert_eq!(test.properties["rust_mode"], "test");
+    assert_ne!(check.id, test.id);
+    if test.properties["rust_hir_toolchain_status"] == "compatible" {
+        assert_eq!(test.properties["rust_hir_project_model"], "ready");
+        assert!(
+            test.properties["rust_hir_project_crate_count"]
+                .as_u64()
+                .zip(check.properties["rust_hir_project_crate_count"].as_u64())
+                .is_some_and(|(test_count, check_count)| test_count > check_count)
+        );
+    }
 }
 
 #[test]
@@ -574,14 +717,34 @@ fn default_rust_profile_has_stable_hashed_host_identity() {
         probe_status
     );
     assert_eq!(first.properties["rust_hir_toolchain_status"], probe_status);
-    assert_eq!(
-        first.properties["rust_hir_enable_gate"],
-        if probe_status == "compatible" {
-            "safe-project-model-pending"
-        } else {
+    if probe_status == "compatible" {
+        assert_eq!(first.properties["rust_hir_project_model"], "ready");
+        assert_eq!(
+            first.properties["rust_hir_enable_gate"],
+            "semantic-emission-pending"
+        );
+        assert!(
+            first.properties["rust_hir_project_file_count"]
+                .as_u64()
+                .is_some_and(|count| count > 0)
+        );
+        assert!(
+            first.properties["rust_hir_project_crate_count"]
+                .as_u64()
+                .is_some_and(|count| count > 0)
+        );
+        assert!(
+            first.properties["rust_hir_project_external_count"]
+                .as_u64()
+                .is_some_and(|count| count > 0)
+        );
+    } else {
+        assert_eq!(first.properties["rust_hir_project_model"], "not-invoked");
+        assert_eq!(
+            first.properties["rust_hir_enable_gate"],
             "toolchain-unsupported"
-        }
-    );
+        );
+    }
     assert_eq!(
         first.properties["rust_toolchain_declaration_status"],
         "absent"
@@ -600,6 +763,57 @@ fn default_rust_profile_has_stable_hashed_host_identity() {
     assert_eq!(first.properties["project_toolchain_executed"], false);
     assert_eq!(first.properties["build_scripts_executed"], false);
     assert_eq!(first.properties["proc_macros_executed"], false);
+}
+
+#[test]
+fn unsupported_target_is_explicitly_ledgered_for_the_hir_project_model() {
+    let output = Command::new(env!("CARGO_BIN_EXE_depgraph-rust-worker"))
+        .arg("--root")
+        .arg(fixture())
+        .arg("--scan-id")
+        .arg("unsupported-hir-target")
+        .env(
+            "DEPGRAPH_PROFILE_CONFIG",
+            r#"{"rust_targets":["wasm32-unknown-unknown"]}"#,
+        )
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let validated = validate_ndjson(Cursor::new(output.stdout)).unwrap();
+    let profile = validated.profiles.values().next().unwrap();
+    if profile.properties["rust_hir_toolchain_status"] != "compatible" {
+        assert_eq!(profile.properties["rust_hir_project_model"], "not-invoked");
+        return;
+    }
+    assert_eq!(profile.properties["rust_hir_project_model"], "unsupported");
+    assert_eq!(
+        profile.properties["rust_hir_enable_gate"],
+        "input-unsupported"
+    );
+    assert_eq!(
+        profile.properties["crate_graph_source"],
+        "confined-cargo-metadata"
+    );
+    assert!(
+        validated
+            .diagnostics
+            .values()
+            .any(|diagnostic| diagnostic.code == "RUST_HIR_INPUT_UNSUPPORTED")
+    );
+    let coverage = validated
+        .events
+        .iter()
+        .find_map(|event| match event {
+            ProtocolEvent::ScanCompleted(completed) => Some(&completed.coverage),
+            _ => None,
+        })
+        .expect("scan coverage");
+    assert!(
+        coverage
+            .reasons
+            .iter()
+            .any(|reason| reason == "rust-hir-unsupported")
+    );
 }
 
 #[test]

@@ -1,6 +1,10 @@
 use crate::{
     ADAPTER_VERSION, EXTRACTOR, RUST_ANALYZER_CRATE_VERSION, RUST_ANALYZER_REVISION,
     RUST_ANALYZER_SALSA_VERSION, RUST_HIR_INTEGRATION_POLICY, RUST_TOOLCHAIN_BASELINE,
+    hir_project::{
+        HirProjectMode, HirProjectProfile, InventorySource, ProjectModelErrorKind,
+        build_safe_project_model,
+    },
     manifest::{
         Dependency, ManifestDocument, Package, expanded_features, normalize_path, parse_packages,
         select_static_documents, slash_path, workspace_identity,
@@ -50,6 +54,7 @@ pub struct ScanResult {
 struct SourceUnit {
     rel_path: String,
     package_index: Option<usize>,
+    text: Option<String>,
     syntax: Option<syn::File>,
 }
 
@@ -189,7 +194,7 @@ pub fn scan(root: &Path) -> Result<ScanResult> {
             DiagnosticSeverity::Info,
             "RUST_HIR_SCAFFOLD_READY",
             &format!(
-                "rust-analyzer {RUST_ANALYZER_CRATE_VERSION} ({RUST_ANALYZER_REVISION}) is pinned and the Rust {RUST_TOOLCHAIN_BASELINE} probe passed; semantic graph emission remains disabled until the safe project model is complete"
+                "rust-analyzer {RUST_ANALYZER_CRATE_VERSION} ({RUST_ANALYZER_REVISION}) is pinned and the Rust {RUST_TOOLCHAIN_BASELINE} probe passed; inventory-only safe project model construction is available while semantic graph emission remains disabled"
             ),
             None,
             None,
@@ -309,6 +314,13 @@ pub fn scan(root: &Path) -> Result<ScanResult> {
         .map(|document| document.dir.clone())
         .collect();
     let sources = state.discover_sources(&packages, &inactive_manifest_dirs)?;
+    state.build_hir_project_model(
+        &packages,
+        &sources,
+        metadata_succeeded,
+        metadata_manifest.is_some(),
+        hir_toolchain_status,
+    );
     state.add_targets(&packages)?;
     state.add_manifest_dependencies(&packages, lock.path.as_deref())?;
     state.add_unexecuted_build_capabilities(&packages)?;
@@ -423,8 +435,9 @@ impl State {
                     "name": package.name,
                     "version": package.version,
                     "edition": package.edition,
+                    "feature_resolver": package.feature_resolver,
                     "manifest_path": package.manifest_path,
-                    "workspace_member": true,
+                    "workspace_member": package.workspace_member,
                     "proc_macro": package.proc_macro,
                     "cargo_model": if package.from_metadata { "metadata" } else { "static-fallback" }
                 })),
@@ -505,7 +518,7 @@ impl State {
                 "rust-source",
             );
             let source = match source_result {
-                Ok(source) => source,
+                Ok(source) => Some(source),
                 Err(error) => {
                     let reason = format!(
                         "Rust source {original_rel_path} could not be safely read: {error:#}"
@@ -520,10 +533,12 @@ impl State {
                         None,
                         &original_rel_path,
                     );
-                    String::new()
+                    None
                 }
             };
             let generated = source
+                .as_deref()
+                .unwrap_or_default()
                 .lines()
                 .take(8)
                 .any(|line| line.contains("@generated") || line.contains("DO NOT EDIT"));
@@ -540,10 +555,9 @@ impl State {
             })?;
             self.file_nodes.insert(rel_path.clone(), file_id);
 
-            let syntax = if source.is_empty() && self.files[&rel_path].skipped {
-                None
-            } else {
-                match syn::parse_file(&source) {
+            let syntax = match source.as_deref() {
+                None => None,
+                Some(source) => match syn::parse_file(source) {
                     Ok(file) => Some(file),
                     Err(error) => {
                         self.mark_file_skipped(&rel_path, "Rust syntax could not be parsed");
@@ -558,15 +572,189 @@ impl State {
                         );
                         None
                     }
-                }
+                },
             };
             sources.push(SourceUnit {
                 rel_path,
                 package_index,
+                text: source,
                 syntax,
             });
         }
         Ok(sources)
+    }
+
+    fn build_hir_project_model(
+        &mut self,
+        packages: &[Package],
+        sources: &[SourceUnit],
+        metadata_succeeded: bool,
+        manifest_found: bool,
+        hir_toolchain_status: ToolchainProbeStatus,
+    ) {
+        let crate_graph_source = if metadata_succeeded {
+            "confined-cargo-metadata"
+        } else if manifest_found {
+            "static-manifest-fallback"
+        } else {
+            "none"
+        };
+        self.profile.properties.insert(
+            "crate_graph_source".into(),
+            Value::String(crate_graph_source.into()),
+        );
+
+        if hir_toolchain_status != ToolchainProbeStatus::Compatible {
+            self.profile.properties.insert(
+                "rust_hir_project_model".into(),
+                Value::String("not-invoked".into()),
+            );
+            self.profile.properties.insert(
+                "rust_hir_enable_gate".into(),
+                Value::String("toolchain-unsupported".into()),
+            );
+            return;
+        }
+        if !metadata_succeeded {
+            self.profile.properties.insert(
+                "rust_hir_project_model".into(),
+                Value::String("unavailable".into()),
+            );
+            self.profile.properties.insert(
+                "rust_hir_enable_gate".into(),
+                Value::String("crate-graph-unavailable".into()),
+            );
+            return;
+        }
+
+        let inventory: Vec<_> = sources
+            .iter()
+            .filter_map(|source| {
+                source.text.as_ref().map(|text| InventorySource {
+                    rel_path: source.rel_path.clone(),
+                    package_index: source.package_index,
+                    text: text.clone(),
+                })
+            })
+            .collect();
+        let requested_features = self
+            .profile
+            .properties
+            .get("requested_features")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect();
+        let mode = match self.profile.command.as_deref() {
+            Some("test") => HirProjectMode::Test,
+            Some("build") => HirProjectMode::Build,
+            Some("check") | None | Some(_) => HirProjectMode::Check,
+        };
+        let project_profile = HirProjectProfile {
+            target_triple: self.profile.target.clone().unwrap_or_default(),
+            mode,
+            requested_features,
+        };
+        match build_safe_project_model(packages, &inventory, &project_profile, Path::new("")) {
+            Ok(model) => {
+                let _ = model.database();
+                let snapshot = model.snapshot();
+                let file_count = snapshot.files.len() as u64;
+                let crate_count = snapshot.crates.len() as u64;
+                let external_count = snapshot.externals.len() as u64;
+                self.profile.properties.insert(
+                    "rust_hir_project_model".into(),
+                    Value::String("ready".into()),
+                );
+                self.profile.properties.insert(
+                    "rust_hir_enable_gate".into(),
+                    Value::String("semantic-emission-pending".into()),
+                );
+                self.profile.properties.insert(
+                    "rust_hir_project_file_count".into(),
+                    Value::from(file_count),
+                );
+                self.profile.properties.insert(
+                    "rust_hir_project_crate_count".into(),
+                    Value::from(crate_count),
+                );
+                self.profile.properties.insert(
+                    "rust_hir_project_external_count".into(),
+                    Value::from(external_count),
+                );
+                self.add_diagnostic(
+                    DiagnosticSeverity::Info,
+                    "RUST_HIR_PROJECT_MODEL_READY",
+                    &format!(
+                        "safe Rust project model admitted {file_count} inventory files and {crate_count} local crates from confined Cargo metadata"
+                    ),
+                    None,
+                    None,
+                    "rust-hir-project-model-ready",
+                );
+                if external_count != 0 {
+                    self.reasons
+                        .insert("rust-hir-external-definition-unavailable".into());
+                    self.add_diagnostic(
+                        DiagnosticSeverity::Warning,
+                        "RUST_HIR_EXTERNAL_DEFINITION_UNAVAILABLE",
+                        &format!(
+                            "{external_count} external crate definitions, including sysroot crates, were recorded as sentinels and were not loaded"
+                        ),
+                        None,
+                        None,
+                        "rust-hir-external-definition-unavailable",
+                    );
+                }
+            }
+            Err(error) => match error.kind {
+                ProjectModelErrorKind::UnsupportedInput => {
+                    self.profile.properties.insert(
+                        "rust_hir_project_model".into(),
+                        Value::String("unsupported".into()),
+                    );
+                    self.profile.properties.insert(
+                        "rust_hir_enable_gate".into(),
+                        Value::String("input-unsupported".into()),
+                    );
+                    self.reasons.insert("rust-hir-unsupported".into());
+                    self.add_diagnostic(
+                        DiagnosticSeverity::Warning,
+                        "RUST_HIR_INPUT_UNSUPPORTED",
+                        &error.reason,
+                        error.path.as_deref(),
+                        None,
+                        "rust-hir-input-unsupported",
+                    );
+                }
+                ProjectModelErrorKind::Incomplete => {
+                    self.record_hir_project_unavailable(error.path.as_deref(), &error.reason);
+                }
+            },
+        }
+    }
+
+    fn record_hir_project_unavailable(&mut self, path: Option<&str>, reason: &str) {
+        self.profile.properties.insert(
+            "rust_hir_project_model".into(),
+            Value::String("unavailable".into()),
+        );
+        self.profile.properties.insert(
+            "rust_hir_enable_gate".into(),
+            Value::String("crate-graph-unavailable".into()),
+        );
+        self.reasons
+            .insert("rust-hir-crate-graph-unavailable".into());
+        self.add_diagnostic(
+            DiagnosticSeverity::Warning,
+            "RUST_HIR_CRATE_GRAPH_UNAVAILABLE",
+            reason,
+            path,
+            None,
+            "rust-hir-project-model-unavailable",
+        );
     }
 
     fn add_targets(&mut self, packages: &[Package]) -> Result<()> {
@@ -597,6 +785,9 @@ impl State {
                         "target_name": target.name,
                         "target_kind": target.kind,
                         "src_path": target.src_path,
+                        "edition": target.edition,
+                        "required_features": target.required_features,
+                        "test": target.test,
                         "proc_macro": target.proc_macro,
                         "profile_id": self.profile.id,
                         "cargo_model": if package.from_metadata { "metadata" } else { "static-fallback" }
@@ -1771,6 +1962,7 @@ fn canonical_file_within(root: &Path, path: &Path) -> Result<PathBuf> {
 struct RustProfileSelection {
     rust_features: Vec<String>,
     rust_targets: Vec<String>,
+    rust_mode: String,
 }
 
 fn discover_manifests(root: &Path) -> Result<(Vec<ManifestDocument>, Vec<DiscoveryFailure>)> {
@@ -1896,6 +2088,12 @@ fn rust_profile(
     selection.rust_features.dedup();
     selection.rust_targets.sort();
     selection.rust_targets.dedup();
+    selection.rust_mode = match selection.rust_mode.trim() {
+        "build" => "build",
+        "test" => "test",
+        _ => "check",
+    }
+    .into();
     let features: Vec<_> = expanded_features(packages, &selection.rust_features)
         .into_iter()
         .collect();
@@ -1911,6 +2109,7 @@ fn rust_profile(
         &selection.rust_features,
         &features,
         &selection.rust_targets,
+        &selection.rust_mode,
     );
     let expanded_profile_features = features.clone();
     Profile {
@@ -1923,7 +2122,7 @@ fn rust_profile(
             "declared_toolchain": declared_toolchain,
             "declared_toolchain_status": declared_toolchain_status,
         })),
-        command: Some("check".into()),
+        command: Some(selection.rust_mode.clone()),
         target: Some(selected_target.clone()),
         features,
         environment: BTreeMap::from([
@@ -1942,11 +2141,20 @@ fn rust_profile(
             "rust_hir_backend": "disabled",
             "rust_hir_status": "not-invoked",
             "rust_hir_scaffold": "available",
+            "rust_hir_project_model": if hir_toolchain_status == ToolchainProbeStatus::Compatible {
+                "pending"
+            } else {
+                "not-invoked"
+            },
             "rust_hir_enable_gate": if hir_toolchain_status == ToolchainProbeStatus::Compatible {
-                "safe-project-model-pending"
+                "semantic-emission-pending"
             } else {
                 "toolchain-unsupported"
             },
+            "rust_hir_project_file_count": 0,
+            "rust_hir_project_crate_count": 0,
+            "rust_hir_project_external_count": 0,
+            "rust_hir_cfg_profile": "debug-unwind",
             "rust_hir_integration_policy": RUST_HIR_INTEGRATION_POLICY,
             "rust_analyzer_version": RUST_ANALYZER_CRATE_VERSION,
             "rust_analyzer_revision": RUST_ANALYZER_REVISION,
@@ -1964,6 +2172,7 @@ fn rust_profile(
             "requested_features": selection.rust_features,
             "expanded_features": expanded_profile_features,
             "configured_targets": selection.rust_targets,
+            "rust_mode": selection.rust_mode,
             "build_scripts_executed": false,
             "proc_macros_executed": false,
             "build_script_policy": "disabled",
@@ -1980,13 +2189,14 @@ fn rust_profile_id(
     requested_features: &[String],
     expanded_features: &[String],
     configured_targets: &[String],
+    rust_mode: &str,
 ) -> String {
     stable_id_from_value(
         "profile",
         &json!({
             "language": "rust",
             "analysis": "syntax",
-            "command": "check",
+            "command": rust_mode,
             "safe_mode": true,
             "host_target": host_target,
             "effective_target": effective_target,
@@ -2659,6 +2869,7 @@ mod tests {
             &no_values,
             &default_features,
             &no_values,
+            "check",
         );
         let same_linux = rust_profile_id(
             "x86_64-unknown-linux-gnu",
@@ -2666,6 +2877,7 @@ mod tests {
             &no_values,
             &default_features,
             &no_values,
+            "check",
         );
         let macos = rust_profile_id(
             "aarch64-apple-darwin",
@@ -2673,6 +2885,7 @@ mod tests {
             &no_values,
             &default_features,
             &no_values,
+            "check",
         );
         let requested = vec!["full".to_owned()];
         let expanded = vec!["default".to_owned(), "full".to_owned()];
@@ -2682,11 +2895,21 @@ mod tests {
             &requested,
             &expanded,
             &no_values,
+            "check",
+        );
+        let test_mode = rust_profile_id(
+            "x86_64-unknown-linux-gnu",
+            "x86_64-unknown-linux-gnu",
+            &no_values,
+            &default_features,
+            &no_values,
+            "test",
         );
 
         assert_eq!(linux, same_linux);
         assert_ne!(linux, macos);
         assert_ne!(linux, with_feature);
+        assert_ne!(linux, test_mode);
         assert!(linux.starts_with("profile:sha256:"));
     }
 }

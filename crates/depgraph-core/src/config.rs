@@ -40,6 +40,7 @@ pub struct StrictConfig {
 pub struct ProfileConfig {
     pub rust_features: Vec<String>,
     pub rust_targets: Vec<String>,
+    pub rust_mode: String,
     pub go_tags: Vec<String>,
     pub web_environments: Vec<String>,
 }
@@ -72,6 +73,7 @@ impl Default for ProfileConfig {
         Self {
             rust_features: Vec::new(),
             rust_targets: Vec::new(),
+            rust_mode: "check".to_owned(),
             go_tags: Vec::new(),
             web_environments: vec!["server".to_owned(), "browser".to_owned()],
         }
@@ -141,6 +143,9 @@ impl Config {
         if self.scan.follow_symlinks {
             bail!("scan.follow_symlinks=true is not permitted by the safe-scan policy");
         }
+        if !matches!(self.profiles.rust_mode.as_str(), "check" | "build" | "test") {
+            bail!("profiles.rust_mode must be check, build, or test");
+        }
         Ok(())
     }
 
@@ -207,6 +212,7 @@ mod tests {
         assert_eq!(parsed.schema_version, 1);
         assert_eq!(parsed.scan.worker_timeout_seconds, 300);
         assert_eq!(parsed.strict.max_unresolved, 0);
+        assert_eq!(parsed.profiles.rust_mode, "check");
         Ok(())
     }
 
@@ -221,6 +227,7 @@ mod tests {
             "schema_version = 1\n[scan]\nmax_protocol_bytes = 0\n",
             "schema_version = 1\n[scan]\nmax_stderr_bytes = 0\n",
             "schema_version = 1\n[scan]\nfollow_symlinks = true\n",
+            "schema_version = 1\n[profiles]\nrust_mode = 'release'\n",
         ] {
             std::fs::write(root.path().join(CONFIG_FILE), raw)?;
             assert!(Config::load(root.path()).is_err(), "accepted {raw:?}");

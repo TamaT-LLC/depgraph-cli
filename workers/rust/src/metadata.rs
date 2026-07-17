@@ -2,7 +2,8 @@ use crate::{
     cargo_mirror::CargoInputMirror,
     manifest::{
         Dependency, DependencyKind, ManifestDocument, Package, Target, dependency_condition,
-        normalize_feature_map, normalize_path, slash_path,
+        normalize_feature_map, normalize_path, package_feature_resolver, parse_packages,
+        slash_path, workspace_cfg_profile_overrides_at, workspace_feature_resolver_at,
     },
 };
 use anyhow::{Context, Result, bail};
@@ -252,8 +253,16 @@ struct MetadataDependency {
     kind: Option<String>,
     rename: Option<String>,
     optional: bool,
+    #[serde(default)]
+    features: Vec<String>,
+    #[serde(default = "default_true")]
+    uses_default_features: bool,
     target: Option<String>,
     path: Option<PathBuf>,
+}
+
+const fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Deserialize)]
@@ -262,6 +271,26 @@ struct MetadataTarget {
     kind: Vec<String>,
     crate_types: Vec<String>,
     src_path: PathBuf,
+    #[serde(default)]
+    edition: Option<String>,
+    #[serde(default, rename = "required-features")]
+    required_features: Vec<String>,
+    #[serde(default)]
+    test: Option<bool>,
+}
+
+fn canonical_target_kind(kind: &[String], crate_types: &[String]) -> String {
+    if kind.iter().any(|kind| kind == "custom-build") {
+        "custom-build".into()
+    } else if kind
+        .iter()
+        .chain(crate_types)
+        .any(|kind| matches!(kind.as_str(), "lib" | "rlib" | "dylib"))
+    {
+        "lib".into()
+    } else {
+        kind.first().cloned().unwrap_or_else(|| "unknown".into())
+    }
 }
 
 impl CargoMetadata {
@@ -324,6 +353,9 @@ impl CargoMetadata {
         lock: &LockIndex,
         documents: &[ManifestDocument],
     ) -> Result<(Vec<Package>, Vec<ManifestDocument>)> {
+        let workspace_resolver = workspace_feature_resolver_at(documents, &self.workspace_root);
+        let cfg_profile_overrides =
+            workspace_cfg_profile_overrides_at(documents, &self.workspace_root);
         let members: BTreeSet<_> = self.workspace_members.into_iter().collect();
         let documents_by_path: BTreeMap<_, _> = documents
             .iter()
@@ -361,6 +393,7 @@ impl CargoMetadata {
                 active_documents.push(document.clone());
             }
             let mut targets = Vec::new();
+            let package_edition = package.edition.clone();
             for target in package.targets {
                 let src_path = normalize_path(&target.src_path);
                 if !src_path.starts_with(root) {
@@ -369,19 +402,26 @@ impl CargoMetadata {
                         package.name
                     );
                 }
-                let kind = target
-                    .kind
-                    .iter()
-                    .find(|kind| kind.as_str() == "custom-build")
-                    .or_else(|| target.kind.first())
-                    .cloned()
-                    .unwrap_or_else(|| "unknown".into());
                 let proc_macro = target.kind.iter().any(|kind| kind == "proc-macro")
                     || target.crate_types.iter().any(|kind| kind == "proc-macro");
+                let kind = canonical_target_kind(&target.kind, &target.crate_types);
+                let mut required_features = if kind == "lib" {
+                    Vec::new()
+                } else {
+                    target.required_features
+                };
+                required_features.sort();
+                required_features.dedup();
+                let test = target
+                    .test
+                    .unwrap_or(matches!(kind.as_str(), "lib" | "bin" | "test"));
                 targets.push(Target {
                     name: target.name,
                     kind,
                     src_path: slash_path(src_path.strip_prefix(root).expect("path checked")),
+                    edition: target.edition.unwrap_or_else(|| package_edition.clone()),
+                    required_features,
+                    test,
                     proc_macro,
                 });
             }
@@ -417,11 +457,17 @@ impl CargoMetadata {
                             package.name
                         );
                     }
+                    let mut dependency_features = dependency.features;
+                    dependency_features.sort();
+                    dependency_features.dedup();
                     Ok(Dependency {
                         alias: alias.clone(),
                         package: dependency.name,
                         version: Some(locked_version.map(str::to_owned).unwrap_or(dependency.req)),
                         path,
+                        optional: dependency.optional,
+                        features: dependency_features,
+                        uses_default_features: dependency.uses_default_features,
                         kind,
                         condition: dependency_condition(
                             kind,
@@ -439,6 +485,11 @@ impl CargoMetadata {
             packages.push(Package {
                 name: package.name,
                 version: package.version,
+                feature_resolver: package_feature_resolver(
+                    document,
+                    &package.edition,
+                    workspace_resolver,
+                ),
                 edition: package.edition,
                 manifest_path: document.rel_path.clone(),
                 dir: document.dir.clone(),
@@ -448,9 +499,66 @@ impl CargoMetadata {
                 targets,
                 build_script,
                 proc_macro,
+                cfg_profile_overrides: cfg_profile_overrides.clone(),
+                workspace_member: true,
                 from_metadata: true,
             });
         }
+        // `cargo metadata --no-deps` omits path packages that are not workspace
+        // members. Complete only the transitive, root-confined path closure
+        // from manifests that passed the same admitted inventory preflight.
+        let static_packages = parse_packages(documents);
+        let static_by_dir: BTreeMap<_, _> = static_packages
+            .into_iter()
+            .map(|package| (normalize_path(&package.dir), package))
+            .collect();
+        loop {
+            let included_dirs: BTreeSet<_> = packages
+                .iter()
+                .map(|package| normalize_path(&package.dir))
+                .collect();
+            let required_paths: BTreeSet<_> = packages
+                .iter()
+                .flat_map(|package| package.dependencies.iter())
+                .filter_map(|dependency| dependency.path.as_ref())
+                .map(|path| normalize_path(path))
+                .filter(|path| !included_dirs.contains(path))
+                .collect();
+            if required_paths.is_empty() {
+                break;
+            }
+            let mut added = false;
+            for path in required_paths {
+                let mut package = static_by_dir.get(&path).cloned().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "admitted path dependency has no readable confined package manifest"
+                    )
+                })?;
+                if !path.starts_with(root) {
+                    bail!("admitted path dependency is outside the scan root");
+                }
+                package.from_metadata = false;
+                package.workspace_member = false;
+                if let Some(workspace_resolver) = workspace_resolver {
+                    package.feature_resolver = workspace_resolver;
+                }
+                if let Some(document) = documents
+                    .iter()
+                    .find(|document| document.rel_path == package.manifest_path)
+                    && !active_documents
+                        .iter()
+                        .any(|active| active.rel_path == document.rel_path)
+                {
+                    active_documents.push(document.clone());
+                }
+                packages.push(package);
+                added = true;
+            }
+            if !added {
+                break;
+            }
+        }
+        apply_lock_versions(&mut packages, lock);
         packages.sort_by(|left, right| left.rel_dir.cmp(&right.rel_dir));
         active_documents.sort_by(|left, right| left.rel_path.cmp(&right.rel_path));
         active_documents.dedup_by(|left, right| left.rel_path == right.rel_path);
@@ -696,13 +804,38 @@ pub(crate) fn apply_lock_versions(packages: &mut [Package], lock: &LockIndex) {
 #[cfg(test)]
 mod tests {
     use super::{
-        CargoMetadata, LockIndex, configure_cargo_safety_environment, configure_path_environment,
+        CargoMetadata, LockIndex, MetadataDependency, canonical_target_kind,
+        configure_cargo_safety_environment, configure_path_environment,
         neutral_cargo_working_directory, neutral_environment, safe_external_directory,
         validate_dependency_source,
     };
+
+    #[test]
+    fn metadata_canonicalizes_only_rust_linkable_library_crate_types() {
+        let strings = |values: &[&str]| {
+            values
+                .iter()
+                .map(|value| (*value).into())
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(canonical_target_kind(&strings(&["rlib"]), &[]), "lib");
+        assert_eq!(
+            canonical_target_kind(&strings(&["cdylib"]), &strings(&["cdylib", "rlib"])),
+            "lib"
+        );
+        assert_eq!(
+            canonical_target_kind(&strings(&["cdylib"]), &strings(&["cdylib"])),
+            "cdylib"
+        );
+        assert_eq!(
+            canonical_target_kind(&strings(&["staticlib"]), &strings(&["staticlib"])),
+            "staticlib"
+        );
+    }
     #[cfg(unix)]
     use super::{resolve_safe_tool_on_path, sanitized_path_from};
-    use crate::manifest::ManifestDocument;
+    use crate::manifest::{ManifestDocument, parse_packages};
     use depgraph_protocol::Condition;
     use serde_json::{Value, json};
     use std::{
@@ -722,6 +855,24 @@ mod tests {
             .find(|(key, _)| *key == OsStr::new("RUSTUP_AUTO_INSTALL"))
             .and_then(|(_, value)| value);
         assert_eq!(auto_install, Some(OsStr::new("0")));
+    }
+
+    #[test]
+    fn metadata_dependency_defaults_to_cargo_default_features() {
+        let dependency: MetadataDependency = serde_json::from_value(json!({
+            "name": "serde",
+            "source": null,
+            "req": "1",
+            "kind": null,
+            "rename": null,
+            "optional": false,
+            "target": null,
+            "path": null
+        }))
+        .expect("valid metadata dependency");
+
+        assert!(dependency.features.is_empty());
+        assert!(dependency.uses_default_features);
     }
 
     #[test]
@@ -949,6 +1100,327 @@ source = "git+file:///outside/repository#deadbeef"
     }
 
     #[test]
+    fn metadata_completes_the_admitted_nonmember_path_dependency_closure() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let root = temp.path().canonicalize().expect("canonical workspace");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("shared/src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub fn app() {}\n").unwrap();
+        std::fs::write(root.join("shared/src/lib.rs"), "pub fn shared() {}\n").unwrap();
+        std::fs::write(root.join("shared/src/main.rs"), "fn main() {}\n").unwrap();
+        let root_manifest = r#"
+            [package]
+            name = "member"
+            version = "0.1.0"
+            edition = "2018"
+            resolver = "2"
+
+            [workspace]
+            exclude = ["shared"]
+
+            [dependencies]
+            shared = { path = "shared", default-features = false }
+        "#;
+        let shared_manifest = r#"
+            [package]
+            name = "shared"
+            version = "0.2.0"
+            edition = "2024"
+            autolib = false
+            autobins = false
+
+            [[bin]]
+            name = "shared-tool"
+            path = "src/main.rs"
+
+            [features]
+            default = []
+        "#;
+        std::fs::write(root.join("Cargo.toml"), root_manifest).unwrap();
+        std::fs::write(root.join("shared/Cargo.toml"), shared_manifest).unwrap();
+        let documents = vec![
+            ManifestDocument {
+                abs_path: root.join("Cargo.toml"),
+                rel_path: "Cargo.toml".into(),
+                dir: root.clone(),
+                rel_dir: ".".into(),
+                value: toml::from_str(root_manifest).unwrap(),
+            },
+            ManifestDocument {
+                abs_path: root.join("shared/Cargo.toml"),
+                rel_path: "shared/Cargo.toml".into(),
+                dir: root.join("shared"),
+                rel_dir: "shared".into(),
+                value: toml::from_str(shared_manifest).unwrap(),
+            },
+        ];
+        let metadata: CargoMetadata = serde_json::from_value(json!({
+            "packages": [{
+                "id": "member-id",
+                "name": "member",
+                "version": "0.1.0",
+                "edition": "2018",
+                "manifest_path": root.join("Cargo.toml"),
+                "features": {},
+                "dependencies": [{
+                    "name": "shared",
+                    "source": null,
+                    "req": "*",
+                    "kind": null,
+                    "rename": "shared_alias",
+                    "optional": false,
+                    "features": [],
+                    "uses_default_features": false,
+                    "target": null,
+                    "path": root.join("shared")
+                }],
+                "targets": [{
+                    "name": "member",
+                    "kind": ["lib"],
+                    "crate_types": ["lib"],
+                    "src_path": root.join("src/lib.rs")
+                }]
+            }],
+            "workspace_members": ["member-id"],
+            "workspace_root": root
+        }))
+        .unwrap();
+
+        let (packages, active_documents) = metadata
+            .into_packages(&root, &LockIndex::default(), &documents)
+            .expect("confined path closure");
+
+        assert_eq!(
+            packages
+                .iter()
+                .map(|package| package.name.as_str())
+                .collect::<Vec<_>>(),
+            ["member", "shared"]
+        );
+        assert!(packages[0].from_metadata);
+        assert!(!packages[1].from_metadata);
+        assert_eq!(packages[0].feature_resolver, 2);
+        assert_eq!(packages[1].feature_resolver, 2);
+        assert_eq!(packages[1].targets.len(), 1);
+        assert_eq!(packages[1].targets[0].kind, "bin");
+        assert_eq!(packages[1].targets[0].name, "shared-tool");
+        assert!(
+            active_documents
+                .iter()
+                .any(|document| document.rel_path == "shared/Cargo.toml")
+        );
+    }
+
+    #[test]
+    fn metadata_conversion_matches_standalone_manifest_resolver_selection() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let root = temp.path().canonicalize().expect("canonical workspace");
+        let manifest_path = root.join("Cargo.toml");
+        let source_path = root.join("src/lib.rs");
+        let package_id = "path+file:///workspace#app@1.0.0";
+        let cases = [
+            ("2015", None, 1),
+            ("2018", None, 1),
+            ("2021", None, 2),
+            ("2024", None, 3),
+            ("2024", Some(1), 1),
+            ("2015", Some(2), 2),
+            ("2015", Some(3), 3),
+        ];
+
+        for (edition, explicit, expected) in cases {
+            let resolver = explicit
+                .map(|resolver| format!("resolver = '{resolver}'\n"))
+                .unwrap_or_default();
+            let manifest = format!(
+                "[package]\nname = 'app'\nversion = '1.0.0'\nedition = '{edition}'\n{resolver}"
+            );
+            let documents = [ManifestDocument {
+                abs_path: manifest_path.clone(),
+                rel_path: "Cargo.toml".into(),
+                dir: root.clone(),
+                rel_dir: ".".into(),
+                value: toml::from_str(&manifest).expect("valid manifest"),
+            }];
+            let metadata: CargoMetadata = serde_json::from_value(json!({
+                "packages": [{
+                    "id": package_id,
+                    "name": "app",
+                    "version": "1.0.0",
+                    "edition": edition,
+                    "manifest_path": manifest_path,
+                    "features": {},
+                    "dependencies": [],
+                    "targets": [{
+                        "name": "app",
+                        "kind": ["bin"],
+                        "crate_types": ["bin"],
+                        "src_path": source_path,
+                        "edition": "2018",
+                        "required-features": ["z", "a", "z"],
+                        "test": false
+                    }]
+                }],
+                "workspace_members": [package_id],
+                "workspace_root": root
+            }))
+            .expect("valid metadata DTO");
+            let fallback_resolver = parse_packages(&documents)[0].feature_resolver;
+
+            let (packages, _) = metadata
+                .into_packages(&root, &LockIndex::default(), &documents)
+                .expect("metadata conversion succeeds");
+
+            assert_eq!(fallback_resolver, expected);
+            assert_eq!(packages[0].feature_resolver, fallback_resolver);
+            assert_eq!(packages[0].targets[0].edition, "2018");
+            assert_eq!(packages[0].targets[0].required_features, ["a", "z"]);
+            assert!(!packages[0].targets[0].test);
+        }
+    }
+
+    #[test]
+    fn metadata_ignores_an_unrelated_nested_workspace_resolver() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let root = temp.path().canonicalize().expect("canonical workspace");
+        let manifest_path = root.join("Cargo.toml");
+        let source_path = root.join("src/lib.rs");
+        let package_id = "path+file:///workspace#app@1.0.0";
+        let documents = [
+            ManifestDocument {
+                abs_path: manifest_path.clone(),
+                rel_path: "Cargo.toml".into(),
+                dir: root.clone(),
+                rel_dir: ".".into(),
+                value: toml::from_str(
+                    "[package]\nname = 'app'\nversion = '1.0.0'\nedition = '2018'\nresolver = '2'\n\n[dependencies]\nshared = { path = 'shared' }\n",
+                )
+                .expect("valid root manifest"),
+            },
+            ManifestDocument {
+                abs_path: root.join("shared/Cargo.toml"),
+                rel_path: "shared/Cargo.toml".into(),
+                dir: root.join("shared"),
+                rel_dir: "shared".into(),
+                value: toml::from_str(
+                    "[package]\nname = 'shared'\nversion = '1.0.0'\nedition = '2024'\nresolver = '3'\n",
+                )
+                .expect("valid path dependency manifest"),
+            },
+            ManifestDocument {
+                abs_path: root.join("vendor/Cargo.toml"),
+                rel_path: "vendor/Cargo.toml".into(),
+                dir: root.join("vendor"),
+                rel_dir: "vendor".into(),
+                value: toml::from_str("[workspace]\nmembers = []\nresolver = '3'\n")
+                    .expect("valid nested workspace manifest"),
+            },
+        ];
+        let metadata: CargoMetadata = serde_json::from_value(json!({
+            "packages": [{
+                "id": package_id,
+                "name": "app",
+                "version": "1.0.0",
+                "edition": "2018",
+                "manifest_path": manifest_path,
+                "features": {},
+                "dependencies": [{
+                    "name": "shared",
+                    "source": null,
+                    "req": "*",
+                    "kind": null,
+                    "rename": null,
+                    "optional": false,
+                    "features": [],
+                    "uses_default_features": true,
+                    "target": null,
+                    "path": root.join("shared")
+                }],
+                "targets": [{
+                    "name": "app",
+                    "kind": ["lib"],
+                    "crate_types": ["lib"],
+                    "src_path": source_path
+                }]
+            }],
+            "workspace_members": [package_id],
+            "workspace_root": root
+        }))
+        .expect("valid metadata DTO");
+
+        let (packages, _) = metadata
+            .into_packages(&root, &LockIndex::default(), &documents)
+            .expect("metadata conversion succeeds");
+
+        assert_eq!(
+            packages
+                .iter()
+                .map(|package| (package.name.as_str(), package.feature_resolver))
+                .collect::<Vec<_>>(),
+            [("app", 2), ("shared", 2)]
+        );
+    }
+
+    #[test]
+    fn metadata_uses_its_reported_workspace_for_resolver_and_cfg_profile() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let root = temp.path().canonicalize().expect("canonical workspace");
+        let owner = root.join("owner");
+        let manifest_path = root.join("Cargo.toml");
+        let source_path = root.join("src/lib.rs");
+        let package_id = "path+file:///workspace#app@1.0.0";
+        let documents = [
+            ManifestDocument {
+                abs_path: manifest_path.clone(),
+                rel_path: "Cargo.toml".into(),
+                dir: root.clone(),
+                rel_dir: ".".into(),
+                value: toml::from_str(
+                    "[package]\nname='app'\nversion='1.0.0'\nedition='2018'\nresolver='1'\nworkspace='owner'\n",
+                )
+                .unwrap(),
+            },
+            ManifestDocument {
+                abs_path: owner.join("Cargo.toml"),
+                rel_path: "owner/Cargo.toml".into(),
+                dir: owner.clone(),
+                rel_dir: "owner".into(),
+                value: toml::from_str(
+                    "[workspace]\nmembers=['..']\nresolver='3'\n\n[profile.dev]\npanic='abort'\n",
+                )
+                .unwrap(),
+            },
+        ];
+        let metadata: CargoMetadata = serde_json::from_value(json!({
+            "packages": [{
+                "id": package_id,
+                "name": "app",
+                "version": "1.0.0",
+                "edition": "2018",
+                "manifest_path": manifest_path,
+                "features": {},
+                "dependencies": [],
+                "targets": [{
+                    "name": "app",
+                    "kind": ["lib"],
+                    "crate_types": ["lib"],
+                    "src_path": source_path
+                }]
+            }],
+            "workspace_members": [package_id],
+            "workspace_root": owner
+        }))
+        .unwrap();
+
+        let (packages, _) = metadata
+            .into_packages(&root, &LockIndex::default(), &documents)
+            .expect("metadata conversion succeeds");
+
+        assert_eq!(packages[0].feature_resolver, 3);
+        assert_eq!(packages[0].cfg_profile_overrides, ["dev".to_owned()].into());
+    }
+
+    #[test]
     fn metadata_rejects_a_path_that_is_not_in_the_mirror_inventory() {
         let package_id = "path+file:///neutral/mirror/member#0.1.0";
         let metadata: CargoMetadata = serde_json::from_value(json!({
@@ -1038,6 +1510,8 @@ source = "git+file:///outside/repository#deadbeef"
                     "kind": null,
                     "rename": null,
                     "optional": true,
+                    "features": ["derive", "alloc", "derive"],
+                    "uses_default_features": false,
                     "target": null,
                     "path": null
                 }],
@@ -1071,6 +1545,9 @@ source = "git+file:///outside/repository#deadbeef"
             .into_packages(&root, &LockIndex::default(), &documents)
             .expect("metadata conversion succeeds");
         assert_eq!(packages[0].features["json"], ["dep:serde"]);
+        assert!(packages[0].dependencies[0].optional);
+        assert_eq!(packages[0].dependencies[0].features, ["alloc", "derive"]);
+        assert!(!packages[0].dependencies[0].uses_default_features);
         assert_eq!(
             packages[0].dependencies[0].condition,
             Condition::Eq {

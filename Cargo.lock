@@ -480,6 +480,7 @@ dependencies = [
  "salsa-macros",
  "serde",
  "serde_json",
+ "sha2",
  "syn",
  "tempfile",
  "toml",

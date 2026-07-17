@@ -442,7 +442,8 @@ mod tests {
     use super::parse_verbose_version;
     #[cfg(unix)]
     use super::{
-        PROBE_OUTPUT_LIMIT, ToolchainProbeStatus, bounded_output, probe_resolved_toolchain,
+        PROBE_OUTPUT_LIMIT, PROBE_TIMEOUT, ToolchainProbeStatus, bounded_output,
+        probe_resolved_toolchain,
     };
     #[cfg(unix)]
     use std::{process::Command, time::Duration};
@@ -504,8 +505,7 @@ mod tests {
         permissions.set_mode(0o755);
         std::fs::set_permissions(&project_tool, permissions).unwrap();
 
-        let probe =
-            probe_resolved_toolchain(&root, &rustc, &cargo, Duration::from_secs(1)).unwrap();
+        let probe = probe_resolved_toolchain(&root, &rustc, &cargo, PROBE_TIMEOUT).unwrap();
         assert_eq!(probe.status(), ToolchainProbeStatus::Compatible);
         assert!(!marker.exists());
     }
