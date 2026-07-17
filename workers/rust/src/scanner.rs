@@ -3,8 +3,9 @@ use crate::{
     RUST_ANALYZER_SALSA_VERSION, RUST_HIR_INTEGRATION_POLICY, RUST_TOOLCHAIN_BASELINE,
     hir_project::{
         HirProjectMode, HirProjectProfile, InventorySource, ProjectModelErrorKind,
-        build_safe_project_model,
+        SafeProjectModel, build_safe_project_model,
     },
+    hir_semantic::{SemanticCrateContext, SemanticDelta, extract_semantic_delta},
     manifest::{
         Dependency, ManifestDocument, Package, expanded_features, normalize_path, parse_packages,
         select_static_documents, slash_path, workspace_identity,
@@ -17,8 +18,7 @@ use anyhow::{Context, Result, bail};
 use depgraph_protocol::{
     CompletenessLevel, Condition, Coverage, DependencySite, Diagnostic, DiagnosticSeverity,
     Evidence, EvidenceKind, GraphEdge, GraphNode, Phase, Precision, Profile, Properties,
-    ResolutionStatus, StableIdInput, stable_id, stable_id_from_value,
-    validate_site_edge_invariants,
+    ResolutionStatus, StableIdInput, stable_id, stable_id_from_value, validate_semantic_graph,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -194,7 +194,7 @@ pub fn scan(root: &Path) -> Result<ScanResult> {
             DiagnosticSeverity::Info,
             "RUST_HIR_SCAFFOLD_READY",
             &format!(
-                "rust-analyzer {RUST_ANALYZER_CRATE_VERSION} ({RUST_ANALYZER_REVISION}) is pinned and the Rust {RUST_TOOLCHAIN_BASELINE} probe passed; inventory-only safe project model construction is available while semantic graph emission remains disabled"
+                "rust-analyzer {RUST_ANALYZER_CRATE_VERSION} ({RUST_ANALYZER_REVISION}) is pinned and the Rust {RUST_TOOLCHAIN_BASELINE} probe passed; inventory-only HIR definition graph extraction is available"
             ),
             None,
             None,
@@ -314,17 +314,20 @@ pub fn scan(root: &Path) -> Result<ScanResult> {
         .map(|document| document.dir.clone())
         .collect();
     let sources = state.discover_sources(&packages, &inactive_manifest_dirs)?;
-    state.build_hir_project_model(
+    state.add_targets(&packages)?;
+    state.add_manifest_dependencies(&packages, lock.path.as_deref())?;
+    state.add_unexecuted_build_capabilities(&packages)?;
+    state.index_modules(&packages, &sources)?;
+    let hir_model = state.build_hir_project_model(
         &packages,
         &sources,
         metadata_succeeded,
         metadata_manifest.is_some(),
         hir_toolchain_status,
     );
-    state.add_targets(&packages)?;
-    state.add_manifest_dependencies(&packages, lock.path.as_deref())?;
-    state.add_unexecuted_build_capabilities(&packages)?;
-    state.index_modules(&packages, &sources)?;
+    if let Some(model) = hir_model {
+        state.extract_hir_semantics(&packages, &model);
+    }
     state.extract_source_dependencies(&packages, &sources)?;
     state.finish()
 }
@@ -354,8 +357,8 @@ impl State {
         let nodes: Vec<_> = self.nodes.into_values().collect();
         let edges: Vec<_> = self.edges.into_values().collect();
         let sites: Vec<_> = self.sites.into_values().collect();
-        validate_site_edge_invariants(&nodes, &edges, &sites)
-            .context("Rust worker graph invariants failed")?;
+        validate_semantic_graph(&nodes, &edges, &sites)
+            .context("Rust worker semantic graph invariants failed")?;
 
         let files: Vec<_> = self.files.into_values().collect();
         let files_skipped = files.iter().filter(|file| file.skipped).count() as u64;
@@ -591,7 +594,7 @@ impl State {
         metadata_succeeded: bool,
         manifest_found: bool,
         hir_toolchain_status: ToolchainProbeStatus,
-    ) {
+    ) -> Option<SafeProjectModel> {
         let crate_graph_source = if metadata_succeeded {
             "confined-cargo-metadata"
         } else if manifest_found {
@@ -613,7 +616,7 @@ impl State {
                 "rust_hir_enable_gate".into(),
                 Value::String("toolchain-unsupported".into()),
             );
-            return;
+            return None;
         }
         if !metadata_succeeded {
             self.profile.properties.insert(
@@ -624,7 +627,7 @@ impl State {
                 "rust_hir_enable_gate".into(),
                 Value::String("crate-graph-unavailable".into()),
             );
-            return;
+            return None;
         }
 
         let inventory: Vec<_> = sources
@@ -708,32 +711,219 @@ impl State {
                         "rust-hir-external-definition-unavailable",
                     );
                 }
+                Some(model)
             }
-            Err(error) => match error.kind {
-                ProjectModelErrorKind::UnsupportedInput => {
-                    self.profile.properties.insert(
-                        "rust_hir_project_model".into(),
-                        Value::String("unsupported".into()),
-                    );
-                    self.profile.properties.insert(
-                        "rust_hir_enable_gate".into(),
-                        Value::String("input-unsupported".into()),
-                    );
-                    self.reasons.insert("rust-hir-unsupported".into());
+            Err(error) => {
+                match error.kind {
+                    ProjectModelErrorKind::UnsupportedInput => {
+                        self.profile.properties.insert(
+                            "rust_hir_project_model".into(),
+                            Value::String("unsupported".into()),
+                        );
+                        self.profile.properties.insert(
+                            "rust_hir_enable_gate".into(),
+                            Value::String("input-unsupported".into()),
+                        );
+                        self.reasons.insert("rust-hir-unsupported".into());
+                        self.add_diagnostic(
+                            DiagnosticSeverity::Warning,
+                            "RUST_HIR_INPUT_UNSUPPORTED",
+                            &error.reason,
+                            error.path.as_deref(),
+                            None,
+                            "rust-hir-input-unsupported",
+                        );
+                    }
+                    ProjectModelErrorKind::Incomplete => {
+                        self.record_hir_project_unavailable(error.path.as_deref(), &error.reason);
+                    }
+                }
+                None
+            }
+        }
+    }
+
+    fn extract_hir_semantics(&mut self, packages: &[Package], model: &SafeProjectModel) {
+        let result = (|| -> Result<(SemanticDelta, BTreeMap<String, SemanticCrateContext>)> {
+            let contexts = self.semantic_crate_contexts(packages, model)?;
+            let delta = extract_semantic_delta(model, &contexts, &self.profile.id)?;
+            self.merge_semantic_delta(&delta)?;
+            Ok((delta, contexts))
+        })();
+
+        match result {
+            Ok((delta, _contexts)) => {
+                let node_count = delta.nodes.len() as u64;
+                let relation_count = delta.edges.len() as u64;
+                let issue_count = delta.issues.len() as u64;
+                self.profile.properties.insert(
+                    "analysis".into(),
+                    Value::String("syntax+hir-definitions".into()),
+                );
+                self.profile.properties.insert(
+                    "analysis_backend".into(),
+                    Value::String("static-syntax+rust-analyzer-hir".into()),
+                );
+                self.profile.properties.insert(
+                    "rust_hir_backend".into(),
+                    Value::String("rust-analyzer-hir".into()),
+                );
+                self.profile.properties.insert(
+                    "rust_hir_status".into(),
+                    Value::String(
+                        if issue_count == 0 {
+                            "definition-graph-emitted"
+                        } else {
+                            "definition-graph-partial"
+                        }
+                        .into(),
+                    ),
+                );
+                self.profile.properties.insert(
+                    "rust_hir_enable_gate".into(),
+                    Value::String("import-call-and-release-gates-pending".into()),
+                );
+                self.profile.properties.insert(
+                    "rust_hir_semantic_node_count".into(),
+                    Value::from(node_count),
+                );
+                self.profile.properties.insert(
+                    "rust_hir_semantic_relation_count".into(),
+                    Value::from(relation_count),
+                );
+                self.profile.properties.insert(
+                    "rust_hir_semantic_issue_count".into(),
+                    Value::from(issue_count),
+                );
+                self.add_diagnostic(
+                    DiagnosticSeverity::Info,
+                    "RUST_HIR_SEMANTIC_GRAPH_READY",
+                    &format!(
+                        "rust-analyzer emitted {node_count} exact definition nodes and {relation_count} semantic relations from the confined project model"
+                    ),
+                    None,
+                    None,
+                    "rust-hir-semantic-graph-ready",
+                );
+                for issue in delta.issues {
+                    self.reasons.insert("rust-hir-semantic-incomplete".into());
                     self.add_diagnostic(
                         DiagnosticSeverity::Warning,
-                        "RUST_HIR_INPUT_UNSUPPORTED",
-                        &error.reason,
-                        error.path.as_deref(),
+                        issue.code,
+                        &issue.reason,
+                        issue.path.as_deref(),
                         None,
-                        "rust-hir-input-unsupported",
+                        &format!("{}:{}", issue.code, issue.reason),
                     );
                 }
-                ProjectModelErrorKind::Incomplete => {
-                    self.record_hir_project_unavailable(error.path.as_deref(), &error.reason);
-                }
-            },
+            }
+            Err(error) => {
+                self.reasons.insert("rust-hir-backend-failure".into());
+                self.profile.properties.insert(
+                    "rust_hir_backend".into(),
+                    Value::String("rust-analyzer-hir".into()),
+                );
+                self.profile
+                    .properties
+                    .insert("rust_hir_status".into(), Value::String("failed".into()));
+                self.profile.properties.insert(
+                    "rust_hir_enable_gate".into(),
+                    Value::String("semantic-backend-failure".into()),
+                );
+                self.add_diagnostic(
+                    DiagnosticSeverity::Warning,
+                    "RUST_HIR_BACKEND_FAILURE",
+                    &format!(
+                        "Rust HIR definition graph was discarded atomically: {error}; syntax graph output was preserved"
+                    ),
+                    None,
+                    None,
+                    "rust-hir-backend-failure",
+                );
+            }
         }
+    }
+
+    fn semantic_crate_contexts(
+        &self,
+        packages: &[Package],
+        model: &SafeProjectModel,
+    ) -> Result<BTreeMap<String, SemanticCrateContext>> {
+        let mut contexts = BTreeMap::new();
+        for krate in &model.snapshot().crates {
+            let (package_index, package) = packages
+                .iter()
+                .enumerate()
+                .find(|(_, package)| {
+                    krate
+                        .key
+                        .strip_prefix(&package.manifest_path)
+                        .is_some_and(|suffix| suffix.starts_with('#'))
+                })
+                .with_context(|| format!("map semantic crate {} to Cargo package", krate.key))?;
+            let scope = format!("{}:{}", krate.target_kind, krate.target_name);
+            let mut module_nodes = BTreeMap::new();
+            let mut ambiguous_module_paths = BTreeSet::new();
+            for (key, node_ids) in &self.module_nodes {
+                if key.package_index != package_index || key.scope != scope {
+                    continue;
+                }
+                if node_ids.len() == 1 {
+                    module_nodes.insert(
+                        key.path.clone(),
+                        node_ids.iter().next().expect("one module node").clone(),
+                    );
+                } else if !node_ids.is_empty() {
+                    ambiguous_module_paths.insert(key.path.clone());
+                }
+            }
+            if !module_nodes.contains_key(&Vec::new())
+                && !ambiguous_module_paths.contains(&Vec::new())
+            {
+                bail!("semantic crate {} has no syntax root module", krate.key);
+            }
+            contexts.insert(
+                krate.key.clone(),
+                SemanticCrateContext {
+                    package_locator: package_locator(package),
+                    module_nodes,
+                    ambiguous_module_paths,
+                    cfg: krate.cfg.clone(),
+                },
+            );
+        }
+        Ok(contexts)
+    }
+
+    fn merge_semantic_delta(&mut self, delta: &SemanticDelta) -> Result<()> {
+        let mut nodes = self.nodes.clone();
+        let mut edges = self.edges.clone();
+        for node in &delta.nodes {
+            if let Some(existing) = nodes.get(&node.id) {
+                if existing != node {
+                    bail!("semantic delta conflicts with node {}", node.id);
+                }
+            } else {
+                nodes.insert(node.id.clone(), node.clone());
+            }
+        }
+        for edge in &delta.edges {
+            if let Some(existing) = edges.get(&edge.id) {
+                if existing != edge {
+                    bail!("semantic delta conflicts with edge {}", edge.id);
+                }
+            } else {
+                edges.insert(edge.id.clone(), edge.clone());
+            }
+        }
+        let nodes_vec: Vec<_> = nodes.values().cloned().collect();
+        let edges_vec: Vec<_> = edges.values().cloned().collect();
+        let sites_vec: Vec<_> = self.sites.values().cloned().collect();
+        validate_semantic_graph(&nodes_vec, &edges_vec, &sites_vec)
+            .context("validate Rust HIR semantic delta")?;
+        self.nodes = nodes;
+        self.edges = edges;
+        Ok(())
     }
 
     fn record_hir_project_unavailable(&mut self, path: Option<&str>, reason: &str) {
@@ -2154,6 +2344,9 @@ fn rust_profile(
             "rust_hir_project_file_count": 0,
             "rust_hir_project_crate_count": 0,
             "rust_hir_project_external_count": 0,
+            "rust_hir_semantic_node_count": 0,
+            "rust_hir_semantic_relation_count": 0,
+            "rust_hir_semantic_issue_count": 0,
             "rust_hir_cfg_profile": "debug-unwind",
             "rust_hir_integration_policy": RUST_HIR_INTEGRATION_POLICY,
             "rust_analyzer_version": RUST_ANALYZER_CRATE_VERSION,
@@ -2577,9 +2770,15 @@ mod tests {
     fn scan_result_satisfies_site_edge_invariants() {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/workspace");
         let result = scan(&fixture).unwrap();
-        validate_site_edge_invariants(&result.nodes, &result.edges, &result.sites).unwrap();
+        validate_semantic_graph(&result.nodes, &result.edges, &result.sites).unwrap();
         assert!(result.sites.iter().all(|site| !site.evidence.is_empty()));
-        assert!(result.edges.iter().all(|edge| edge.phase == Phase::Source));
+        assert!(result.edges.iter().any(|edge| edge.phase == Phase::Source));
+        assert!(
+            result
+                .edges
+                .iter()
+                .any(|edge| edge.phase == Phase::Semantic)
+        );
     }
 
     #[test]

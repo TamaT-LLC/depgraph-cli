@@ -10,6 +10,7 @@ use std::io::Cursor;
 
 const SOURCE_GOLDEN: &str = include_str!("fixtures/protocol-v1.golden.ndjson");
 const SEMANTIC_GOLDEN: &str = include_str!("fixtures/protocol-v1.semantic.golden.ndjson");
+const RUST_SEMANTIC_GOLDEN: &str = include_str!("fixtures/protocol-v1.rust-semantic.golden.ndjson");
 
 #[test]
 fn source_and_semantic_fixtures_remain_protocol_v1_compatible() {
@@ -38,6 +39,130 @@ fn source_and_semantic_fixtures_remain_protocol_v1_compatible() {
             assert_eq!(validated.edges.len(), 4);
             assert_eq!(validated.sites.len(), 3);
         }
+    }
+}
+
+#[test]
+fn rust_semantic_fixture_remains_protocol_v1_compatible() {
+    let schema: Value = serde_json::from_str(PROTOCOL_SCHEMA).expect("schema must be valid JSON");
+    let validator = jsonschema::draft202012::new(&schema).expect("schema must compile");
+
+    for line in RUST_SEMANTIC_GOLDEN.lines() {
+        let event: Value = serde_json::from_str(line).expect("Rust semantic fixture line");
+        assert!(
+            validator.is_valid(&event),
+            "schema rejected Rust semantic event: {event}"
+        );
+    }
+    validate_safe_ndjson(Cursor::new(RUST_SEMANTIC_GOLDEN))
+        .expect("base validator must accept the Rust semantic fixture");
+    assert!(
+        semantic_schema_accepts_stream(RUST_SEMANTIC_GOLDEN),
+        "semantic Schema definitions rejected the Rust semantic fixture"
+    );
+
+    let validated = rust_semantic_fixture();
+    assert_eq!(validated.events.len(), 16);
+    assert_eq!(validated.nodes.len(), 7);
+    assert_eq!(validated.edges.len(), 4);
+    assert!(validated.sites.is_empty());
+
+    let events = rust_semantic_values();
+    assert_sorted_event_ids(&events, "node_upsert", "node");
+    assert_sorted_event_ids(&events, "edge_upsert", "edge");
+    let completed_coverages: Vec<_> = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event["event"].as_str(),
+                Some("profile_completed" | "scan_completed")
+            )
+        })
+        .map(|event| &event["coverage"])
+        .collect();
+    assert_eq!(completed_coverages.len(), 2);
+    assert!(completed_coverages.iter().all(|coverage| {
+        coverage["completeness"] == json!(["syntax-complete"])
+            && !coverage["completeness"]
+                .as_array()
+                .expect("coverage completeness array")
+                .contains(&json!("semantic-complete"))
+    }));
+}
+
+#[test]
+fn rust_semantic_nodes_and_site_less_relations_follow_their_hash_contract() {
+    let validated = rust_semantic_fixture();
+    let semantic_nodes: Vec<_> = validated
+        .nodes
+        .values()
+        .filter(|node| matches!(node.kind.as_str(), "symbol" | "type"))
+        .collect();
+    assert_eq!(semantic_nodes.len(), 6);
+    assert!(
+        validated.nodes.values().any(|node| node.kind == "module"),
+        "the syntax module owner must survive the semantic union"
+    );
+
+    for node in semantic_nodes {
+        assert_eq!(node.properties["language"], "rust");
+        assert_eq!(
+            node.properties["crate_identity"],
+            "Cargo.toml#lib:rust_semantic_fixture:src/lib.rs"
+        );
+        let identity = &node.properties["canonical_identity"];
+        assert!(identity.is_object());
+        assert_eq!(node.id, stable_id_from_value(&node.kind, identity));
+        assert_eq!(identity["language"], node.properties["language"]);
+        assert_eq!(
+            identity["package_locator"],
+            node.properties["package_locator"]
+        );
+        let kind_property = if node.kind == "symbol" {
+            "symbol_kind"
+        } else {
+            "type_kind"
+        };
+        assert_eq!(identity[kind_property], node.properties[kind_property]);
+    }
+
+    let relation_kinds: BTreeSet<_> = validated
+        .edges
+        .values()
+        .map(|edge| edge.kind.as_str())
+        .collect();
+    assert_eq!(
+        relation_kinds,
+        BTreeSet::from(["declares", "extends", "implements", "instantiates"])
+    );
+    for edge in validated.edges.values() {
+        assert_eq!(edge.site_id, None, "{} must remain site-less", edge.kind);
+        assert_semantic_edge(edge, ResolutionStatus::Resolved, Precision::Exact);
+        assert_eq!(edge.environment.as_deref(), Some("any"));
+        let evidence = primary_semantic_evidence(&edge.evidence);
+        assert_eq!(evidence.extractor, "rust-analyzer-hir");
+        assert_eq!(evidence.extractor_version, "0.0.330");
+        assert_eq!(evidence.properties["backend"], "rust-analyzer-library");
+        assert_eq!(
+            evidence.properties["rust_analyzer_revision"],
+            "8954b66d43225e62c92e8bbcc8500191b5cceb1e"
+        );
+
+        let input = json!({
+            "condition": edge.condition.canonicalized(),
+            "kind": edge.kind,
+            "profile_id": edge.profile_id,
+            "source": edge.source,
+            "target": edge.target,
+            "path": evidence.path.as_deref().expect("semantic evidence path"),
+            "span": {
+                "start_line": evidence.start_line.expect("start line"),
+                "start_column": evidence.start_column.expect("start column"),
+                "end_line": evidence.end_line.expect("end line"),
+                "end_column": evidence.end_column.expect("end column"),
+            },
+        });
+        assert_eq!(edge.id, stable_id_from_value("edge", &input));
     }
 }
 
@@ -185,7 +310,7 @@ fn semantic_site_and_edge_ids_follow_the_documented_hash_inputs() {
 
 #[test]
 fn source_and_semantic_events_survive_typed_round_trips() {
-    for fixture in [SOURCE_GOLDEN, SEMANTIC_GOLDEN] {
+    for fixture in [SOURCE_GOLDEN, SEMANTIC_GOLDEN, RUST_SEMANTIC_GOLDEN] {
         for line in fixture.lines() {
             let event: ProtocolEvent = serde_json::from_str(line).expect("typed event");
             let encoded = serde_json::to_string(&event).expect("serialize typed event");
@@ -560,10 +685,23 @@ fn semantic_fixture() -> depgraph_protocol::ValidatedProtocol {
     validate_safe_semantic_ndjson(Cursor::new(SEMANTIC_GOLDEN))
         .expect("semantic fixture must validate")
 }
+
+fn rust_semantic_fixture() -> depgraph_protocol::ValidatedProtocol {
+    validate_safe_semantic_ndjson(Cursor::new(RUST_SEMANTIC_GOLDEN))
+        .expect("Rust semantic fixture must validate")
+}
+
 fn semantic_values() -> Vec<Value> {
     SEMANTIC_GOLDEN
         .lines()
         .map(|line| serde_json::from_str(line).expect("fixture JSON"))
+        .collect()
+}
+
+fn rust_semantic_values() -> Vec<Value> {
+    RUST_SEMANTIC_GOLDEN
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("Rust semantic fixture JSON"))
         .collect()
 }
 

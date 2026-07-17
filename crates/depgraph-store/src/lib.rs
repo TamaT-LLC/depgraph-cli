@@ -1733,6 +1733,10 @@ fn merge_coverage(mut left: Value, right: Value) -> Value {
 mod tests {
     use super::*;
 
+    const RUST_SEMANTIC_GOLDEN: &str = include_str!(
+        "../../depgraph-protocol/tests/fixtures/protocol-v1.rust-semantic.golden.ndjson"
+    );
+
     fn common(event: &str, seq: u64) -> Value {
         json!({
             "event": event,
@@ -1859,6 +1863,139 @@ mod tests {
                 .is_some_and(|coverage| coverage.profiles == 1)
         }));
         assert_eq!(snapshot.coverage.profiles, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn rust_semantic_graph_round_trips_canonical_identities_and_site_less_evidence() -> Result<()> {
+        let events: Vec<Value> = RUST_SEMANTIC_GOLDEN
+            .lines()
+            .map(serde_json::from_str)
+            .collect::<serde_json::Result<_>>()?;
+        let scan_id = "scan-rust-semantic-golden";
+        let mut store = Store::open_in_memory()?;
+        store.start_scan(scan_id, Path::new("/fixture"), false)?;
+        for event in &events {
+            store.ingest_event(event)?;
+        }
+        store.validate_scan(scan_id)?;
+        store.finish_scan(scan_id, "completed", None, true)?;
+
+        let snapshot = store.load_snapshot(scan_id)?;
+        assert_eq!(snapshot.coverage.completeness, vec!["syntax-complete"]);
+        assert_eq!(snapshot.profiles.len(), 1);
+        assert_eq!(
+            snapshot.profiles[0]
+                .coverage
+                .as_ref()
+                .expect("completed Rust profile coverage")
+                .completeness,
+            vec!["syntax-complete"]
+        );
+        assert!(
+            !snapshot
+                .coverage
+                .completeness
+                .iter()
+                .any(|level| level == "semantic-complete")
+        );
+        let expected_nodes: Vec<_> = events
+            .iter()
+            .filter(|event| event["event"] == "node_upsert")
+            .map(|event| &event["node"])
+            .collect();
+        assert_eq!(snapshot.nodes.len(), expected_nodes.len());
+        for expected in expected_nodes {
+            let id = expected["id"].as_str().expect("fixture node ID");
+            let loaded = snapshot
+                .nodes
+                .iter()
+                .find(|node| node.id == id)
+                .unwrap_or_else(|| panic!("missing stored node {id}"));
+            assert_eq!(loaded.kind, expected["kind"]);
+            assert_eq!(loaded.locator, expected["locator"]);
+            assert_eq!(loaded.display_name, expected["display_name"]);
+            assert_eq!(loaded.properties, expected["properties"]);
+            if matches!(loaded.kind.as_str(), "symbol" | "type") {
+                assert!(
+                    loaded.properties["canonical_identity"].is_object(),
+                    "semantic node {id} lost its canonical identity"
+                );
+                assert_eq!(loaded.properties["language"], "rust");
+                assert_eq!(
+                    loaded.properties["crate_identity"],
+                    "Cargo.toml#lib:rust_semantic_fixture:src/lib.rs"
+                );
+            }
+        }
+
+        assert!(snapshot.sites.is_empty());
+        let expected_edges: Vec<_> = events
+            .iter()
+            .filter(|event| event["event"] == "edge_upsert")
+            .map(|event| &event["edge"])
+            .collect();
+        assert_eq!(snapshot.edges.len(), expected_edges.len());
+        assert_eq!(snapshot.evidence.len(), expected_edges.len());
+        let relation_kinds: std::collections::BTreeSet<_> = snapshot
+            .edges
+            .iter()
+            .map(|edge| edge.kind.as_str())
+            .collect();
+        assert_eq!(
+            relation_kinds,
+            std::collections::BTreeSet::from(["declares", "extends", "implements", "instantiates"])
+        );
+
+        for expected in expected_edges {
+            let id = expected["id"].as_str().expect("fixture edge ID");
+            let loaded = snapshot
+                .edges
+                .iter()
+                .find(|edge| edge.id == id)
+                .unwrap_or_else(|| panic!("missing stored edge {id}"));
+            assert_eq!(
+                loaded.site_id, None,
+                "{} must remain site-less",
+                loaded.kind
+            );
+            assert_eq!(loaded.source, expected["source"]);
+            assert_eq!(loaded.target, expected["target"]);
+            assert_eq!(loaded.kind, expected["kind"]);
+            assert_eq!(loaded.phase, "semantic");
+            assert_eq!(loaded.environment, "any");
+            assert_eq!(loaded.profile_id, expected["profile_id"]);
+            assert_eq!(loaded.resolution_status, "resolved");
+            assert_eq!(loaded.precision, "exact");
+            assert_eq!(loaded.condition, expected["condition"]);
+            assert_eq!(loaded.generated, expected["generated"]);
+
+            let expected_evidence = &expected["evidence"][0];
+            let evidence = snapshot
+                .evidence
+                .iter()
+                .find(|item| item.owner_type == "edge" && item.owner_id == id)
+                .unwrap_or_else(|| panic!("missing stored semantic evidence for {id}"));
+            assert_eq!(evidence.ordinal, 0);
+            assert_eq!(evidence.kind, "semantic");
+            assert_eq!(evidence.extractor, "rust-analyzer-hir");
+            assert_eq!(evidence.extractor_version, "0.0.330");
+            assert_eq!(evidence.path, expected_evidence["path"]);
+            assert_eq!(evidence.start_line, expected_evidence["start_line"]);
+            assert_eq!(evidence.start_column, expected_evidence["start_column"]);
+            assert_eq!(evidence.end_line, expected_evidence["end_line"]);
+            assert_eq!(evidence.end_column, expected_evidence["end_column"]);
+            assert_eq!(
+                evidence.detail.as_deref(),
+                expected_evidence["detail"].as_str()
+            );
+            assert_eq!(evidence.properties, expected_evidence["properties"]);
+            assert_eq!(evidence.properties["backend"], "rust-analyzer-library");
+            assert_eq!(
+                evidence.properties["rust_analyzer_revision"],
+                "8954b66d43225e62c92e8bbcc8500191b5cceb1e"
+            );
+        }
         Ok(())
     }
 

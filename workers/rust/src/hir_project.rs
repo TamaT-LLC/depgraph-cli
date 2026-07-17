@@ -15,8 +15,8 @@ use ra_ap_hir::{CfgOptions, ChangeWithProcMacros, Symbol};
 use ra_ap_ide_db::{
     RootDatabase,
     base_db::{
-        CrateDisplayName, CrateGraphBuilder, CrateName, CrateOrigin, CrateWorkspaceData,
-        DependencyBuilder, Env, FileId, FileSet, SourceRoot, VfsPath,
+        Crate as BaseCrate, CrateDisplayName, CrateGraphBuilder, CrateName, CrateOrigin,
+        CrateWorkspaceData, DependencyBuilder, Env, FileId, FileSet, SourceRoot, VfsPath,
     },
     span::Edition,
 };
@@ -117,11 +117,12 @@ pub(crate) struct ProjectModelIssue {
     pub reason: String,
 }
 
-/// A future semantic pass consumes the database; the scanner currently keeps
-/// only the canonical audit snapshot and does not emit HIR graph events.
+/// The semantic definition pass consumes the database together with the
+/// canonical audit snapshot and stable crate-instance mapping.
 pub(crate) struct SafeProjectModel {
     database: RootDatabase,
     snapshot: ProjectModelSnapshot,
+    crate_instances: BTreeMap<String, BaseCrate>,
 }
 
 impl SafeProjectModel {
@@ -131,6 +132,13 @@ impl SafeProjectModel {
 
     pub(crate) fn snapshot(&self) -> &ProjectModelSnapshot {
         &self.snapshot
+    }
+
+    /// Stable crate keys paired with the exact rust-analyzer crate instances
+    /// created by this model. Root files are not unique in test mode, where a
+    /// normal crate and its cfg(test) harness intentionally share one file.
+    pub(crate) fn crate_instances(&self) -> &BTreeMap<String, BaseCrate> {
+        &self.crate_instances
     }
 }
 
@@ -701,8 +709,26 @@ pub(crate) fn build_safe_project_model(
     }
     change.set_crate_graph(graph);
     let mut database = RootDatabase::default();
-    database.apply_change(change);
-    Ok(SafeProjectModel { database, snapshot })
+    debug_assert!(change.proc_macros.is_none());
+    let crate_id_map = change
+        .source_change
+        .apply(&mut database)
+        .expect("safe project model always installs a crate graph");
+    let crate_instances = builder_ids
+        .into_iter()
+        .map(|(key, builder_id)| {
+            let krate = crate_id_map
+                .get(&builder_id)
+                .copied()
+                .expect("every safe crate builder ID is installed");
+            (key, krate)
+        })
+        .collect();
+    Ok(SafeProjectModel {
+        database,
+        snapshot,
+        crate_instances,
+    })
 }
 
 fn inert_proc_macro_cwd() -> Arc<AbsPathBuf> {
