@@ -8,8 +8,10 @@ admitted manifests, lockfiles, and target-discovery layout. It runs
 mirror from a neutral working directory and falls back to its static manifest
 model when preflight, mirror construction, the command, or DTO validation
 fails. Rust source is parsed with `syn`. The worker links an exact-pinned
-rust-analyzer library set and exposes an inventory-only HIR smoke scaffold, but
-the production scan does not invoke that scaffold or emit semantic graph
+rust-analyzer library set and, for a compatible toolchain/target and confined Cargo DTO,
+constructs an inventory-only multi-file VFS, local `CrateGraph`, per-crate cfg,
+and analysis database. The production scan records only canonical audit facts
+derived from the project model and does not run semantic queries or emit semantic graph
 events. Its profile therefore remains `analysis=syntax`,
 `rust_hir_backend=disabled`, and `rust_hir_status=not-invoked`.
 
@@ -27,10 +29,11 @@ Raw Cargo DTO paths are mapped back to repository-relative inventory IDs or
 original confined canonical paths before leaving the metadata boundary. Raw
 `path+file://` package IDs are used only to match DTO workspace members, and
 mirror paths, temporary Cargo homes, and target directories never participate
-in profile or graph identity, diagnostics, evidence, or coverage. This closes
-the Cargo read-confinement slice, but the DTO remains a syntax-inventory input:
-the multi-file HIR project model and semantic emission are still follow-up
-work.
+in profile or graph identity, diagnostics, evidence, or coverage. The remapped
+DTO now feeds the safe project model when the compatibility gates pass. Static
+Cargo fallback remains syntax-only and is recorded as a crate-graph-unavailable
+diagnostic and coverage reason; it is never silently treated as equivalent HIR
+input.
 
 The metadata command uses `env_clear`, a sanitized absolute `PATH`, neutral
 worker-owned writable homes, Cargo home, temporary and target directories,
@@ -48,14 +51,41 @@ set pinned to `0.26.1`. Version `0.0.331` was evaluated and rejected because
 its HIR type crate uses unstable if-let guards and does not compile with the
 verified Rust `1.93.1` baseline.
 
-The current scaffold lowers only caller-supplied, already-admitted UTF-8 bytes
-through a virtual `/lib.rs`, a minimal in-memory `CrateGraph`, and a worker-owned
-VFS. It does not discover a Cargo workspace, read repository files, load a
-sysroot, start a process, enable proc macros, or emit protocol graph events.
-The follow-up safe project model will construct the full rust-analyzer
-`CrateGraph`, cfg set, and VFS from bytes and confined Cargo DTOs that the safe
-scanner has already admitted. HIR results will then be emitted as semantic
-evidence alongside, rather than in place of, the static syntax graph.
+The original smoke scaffold lowers only caller-supplied bytes through virtual
+`/lib.rs`. The completed safe project-model slice generalizes that boundary to
+the admitted source inventory for selected workspace and active path packages.
+It assigns deterministic virtual file IDs, adds profile-selected workspace
+targets and active in-root path dependencies as local crates, and reconstructs
+edition plus feature, target, and test cfg per crate. Registry,
+git, unmodeled path, build, and sysroot dependencies stay in a deterministic
+sidecar sentinel ledger instead of being loaded into the database. Custom
+targets, build scripts, proc-macro targets, incomplete crate models, and static
+Cargo fallback remain explicit diagnostic/coverage entries.
+
+Neither path discovers a Cargo workspace or reads a repository file on demand.
+The project model does not load `rust-project.json`, `.cargo/config*`, sysroot
+or registry source, build output, or proc-macro libraries, and it does not run
+build scripts or child processes. Semantic extraction and protocol graph
+emission are the next implementation slice; when enabled, their evidence will
+be added alongside, rather than in place of, the static syntax graph.
+
+`profiles.rust_mode` accepts `check` (default), `build`, or `test`. Test mode
+adds separate `cfg(test)` lib/bin harness crates when Cargo enables them and
+applies each example/test/bench target's Cargo `test` flag. Dev dependencies
+are enabled only for workspace units that Cargo selects; dependency-only
+packages never load their own tests or dev dependencies. Target
+`required-features` and effective target editions are preserved. The current
+safe cfg profile is intentionally normalized to debug assertions plus unwind
+panic semantics; cfg-affecting Cargo `dev`/`test` profile overrides are
+classified as typed unsupported input. Direct `cfg`/`cfg_attr` and
+syntactically direct, unqualified `cfg!` predicates are conservatively
+validated. Name resolution and cfg created by declarative macro expansion
+remain part of the later semantic slice.
+
+`rust_hir_project_model=ready` means the atomic VFS, crate graph, and cfg input
+were constructed. It does not mean every module/import resolved or that a HIR
+semantic pass completed. Missing modules and includes remain unresolved syntax
+sites with coverage reasons, so the profile cannot claim `semantic-complete`.
 
 An external `rust-analyzer` LSP process is not selected. Its project-loading
 path can start Cargo, build-script, proc-macro, and flycheck services, while
@@ -86,11 +116,16 @@ The current Cargo-facing phase may:
   using a neutral directory, cleared project environment,
   `RUSTUP_AUTO_INSTALL=0`, timeout, and output limit.
 
-These implemented Cargo operations do not enable HIR. After the remaining safe
-project-model and release gates are complete, HIR safe mode may additionally:
+These implemented Cargo operations do not enable semantic HIR emission. The
+completed safe project-model slice now:
 
 - consume the already-admitted manifests and source bytes to build an in-memory
-  multi-file VFS, cfg set, and crate graph;
+  multi-file VFS, per-crate cfg set, and local crate graph;
+- retain external, sysroot, build, proc-macro, unsupported, and incomplete
+  inputs in a deterministic sidecar or diagnostic/coverage ledger.
+
+After the semantic and release gates are complete, HIR safe mode may also:
+
 - expand declarative macros in memory when their input is completely known;
 - read a release-owned, checksum-verified sysroot snapshot after that component
   is introduced by the HIR implementation.
@@ -116,15 +151,15 @@ The current verified Rust baseline is `1.93.1`. Syntax inventory remains
 best-effort outside that baseline. The worker probes the resolved system
 `rustc` and Cargo pair from a neutral environment and records whether it
 matches the exact baseline. The rust-analyzer revision is selected, the smoke
-scaffold is available, and Cargo metadata input reads are confined. HIR
-nevertheless stays disabled until the confined DTO is translated into a
-compatible multi-file project model and the remaining semantic and release
-gates are complete. A verified sysroot is additionally required only when the
-profile claims standard-library resolution.
+scaffold and deterministic multi-file project model are available, and Cargo
+metadata input reads are confined. Semantic HIR extraction nevertheless stays
+disabled until the semantic emission and release gates are complete. A
+verified sysroot is additionally required only when the profile claims
+standard-library resolution.
 
 | Project/toolchain state | Current result | HIR eligibility after the remaining gates |
 | --- | --- | --- |
-| Exact `1.93.1`, supported target, and complete confined crate graph; verified sysroot when standard-library resolution is claimed | Static syntax graph plus a ready scaffold diagnostic; HIR is not invoked | Eligible for rust-analyzer `0.0.330` after the safe project-model and release gates pass |
+| Exact `1.93.1`, supported target, and complete confined crate graph; verified sysroot when standard-library resolution is claimed | Static syntax graph plus a ready safe-project-model audit; semantic HIR is not invoked | Eligible for rust-analyzer `0.0.330` after the semantic and release gates pass |
 | No project toolchain declaration | Static syntax graph using the worker baseline as metadata | Eligible only when every effective input is the verified baseline |
 | Older, newer, or nightly declaration | `RUST_TOOLCHAIN_BEST_EFFORT`; static syntax graph | Syntax fallback; never `semantic-complete` |
 | Custom or malformed declaration, unreadable file, or external symlink | Static syntax graph with `RUST_TOOLCHAIN_INVALID` and `RUST_HIR_TOOLCHAIN_UNSUPPORTED` | Fail-closed syntax fallback; never HIR-eligible |
@@ -149,7 +184,13 @@ runtime facts, not a claim that the future backend already ran.
 | `rust_hir_backend` | `disabled` |
 | `rust_hir_status` | `not-invoked` |
 | `rust_hir_scaffold` | `available` |
-| `rust_hir_enable_gate` | `safe-project-model-pending` for a compatible effective HIR toolchain status; otherwise `toolchain-unsupported` |
+| `rust_hir_project_model` | `ready` after deterministic construction; otherwise `not-invoked`, `unavailable`, or `unsupported` |
+| `rust_hir_enable_gate` | `semantic-emission-pending` when the safe model is ready; otherwise `toolchain-unsupported`, `crate-graph-unavailable`, or `input-unsupported` |
+| `rust_hir_project_file_count` | Number of admitted inventory files in the safe VFS; `0` when no model is available |
+| `rust_hir_project_crate_count` | Number of workspace/path local crates in the safe graph; `0` when no model is available |
+| `rust_hir_project_external_count` | Number of external/sysroot sidecar entries; `0` when no model is available |
+| `rust_hir_cfg_profile` | `debug-unwind`; cfg-affecting custom Cargo profile overrides are typed unsupported input |
+| `rust_mode` | Selected safe project mode: `check`, `build`, or `test` |
 | `rust_hir_integration_policy` | `pinned-rust-analyzer-library` |
 | `rust_analyzer_version` | `0.0.330` |
 | `rust_analyzer_revision` | `8954b66d43225e62c92e8bbcc8500191b5cceb1e` |
@@ -161,6 +202,7 @@ runtime facts, not a claim that the future backend already ran.
 | `rust_toolchain_observed` | Sanitized observed `rustc` / Cargo versions, commits, and hosts, or a bounded failure reason |
 | `cargo_metadata_input` | `confined-mirror` |
 | `crate_graph_source_policy` | `confined-cargo-metadata-or-static-manifest` |
+| `crate_graph_source` | `confined-cargo-metadata`, `static-manifest-fallback`, or `none` |
 | `syntax_fallback` | `enabled` |
 | `build_script_policy` | `disabled` |
 | `proc_macro_policy` | `disabled` |
@@ -238,10 +280,12 @@ scan boundary:
    neutral mirror of admitted manifests, lockfile, and target-discovery layout;
    map raw DTO paths back to inventory IDs; and prove temporary paths do not
    enter graph/profile/diagnostic identity. HIR remains disabled.
-3. **Build the safe project model (2–3 days):** translate the admitted Cargo
-   DTO/static model, target, features, and cfg values into an in-memory VFS and
-   `CrateGraph`; keep build scripts, proc macros, project config, and toolchain
-   execution disabled.
+3. **Completed 2026-07-17 — build the safe project model:** translate the
+   admitted Cargo DTO, target, crate-scoped features, and target/test cfg values
+   into a deterministic inventory-only VFS, local `CrateGraph`, and analysis
+   database; retain external/sysroot and unsupported/incomplete inputs in the
+   sidecar/diagnostic ledger while keeping sysroot source, project config,
+   build scripts, and proc macros unloaded and unexecuted.
 4. **Emit semantic identities (2–3 days):** add canonical Rust symbol/type
    identities, nodes, source spans, semantic evidence, and protocol contract
    tests while retaining syntax nodes and edges.
