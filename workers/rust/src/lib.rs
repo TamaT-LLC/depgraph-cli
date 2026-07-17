@@ -5,10 +5,12 @@
 //! procedural macros from the scanned repository are never executed.
 
 mod emit;
+pub mod hir_scaffold;
 mod manifest;
 mod metadata;
 mod scanner;
 mod source;
+mod toolchain;
 
 pub use emit::build_events;
 pub use scanner::{FileCoverage, ScanResult, scan};
@@ -17,4 +19,9 @@ pub const ADAPTER: &str = "rust";
 pub const ADAPTER_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const EXTRACTOR: &str = "rust-static";
 pub const RUST_TOOLCHAIN_BASELINE: &str = "1.93.1";
+pub const RUSTC_BASELINE_COMMIT: &str = "01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf";
+pub const CARGO_BASELINE_COMMIT: &str = "083ac5135f967fd9dc906ab057a2315861c7a80d";
 pub const RUST_HIR_INTEGRATION_POLICY: &str = "pinned-rust-analyzer-library";
+pub const RUST_ANALYZER_CRATE_VERSION: &str = "0.0.330";
+pub const RUST_ANALYZER_REVISION: &str = "8954b66d43225e62c92e8bbcc8500191b5cceb1e";
+pub const RUST_ANALYZER_SALSA_VERSION: &str = "0.26.1";

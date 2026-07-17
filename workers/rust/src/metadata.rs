@@ -423,7 +423,7 @@ fn configure_cargo_safety_environment(command: &mut Command) {
         .env("RUSTC_WORKSPACE_WRAPPER", "");
 }
 
-fn neutral_environment(root: &Path) -> Result<TempDir> {
+pub(crate) fn neutral_environment(root: &Path) -> Result<TempDir> {
     let mut candidates = vec![std::env::temp_dir()];
     #[cfg(unix)]
     candidates.extend([PathBuf::from("/tmp"), PathBuf::from("/var/tmp")]);
@@ -476,7 +476,7 @@ fn configure_path_environment(command: &mut Command, root: &Path, neutral: &Path
     Ok(())
 }
 
-fn safe_external_directory(root: &Path, value: &OsStr) -> Option<PathBuf> {
+pub(crate) fn safe_external_directory(root: &Path, value: &OsStr) -> Option<PathBuf> {
     let path = Path::new(value);
     if !path.is_absolute() {
         return None;
@@ -485,10 +485,14 @@ fn safe_external_directory(root: &Path, value: &OsStr) -> Option<PathBuf> {
     (canonical.is_dir() && !canonical.starts_with(root)).then_some(canonical)
 }
 
-fn sanitized_path(root: &Path) -> Result<std::ffi::OsString> {
+pub(crate) fn sanitized_path(root: &Path) -> Result<std::ffi::OsString> {
     let raw = std::env::var_os("PATH").context("PATH is unavailable")?;
+    sanitized_path_from(root, &raw)
+}
+
+fn sanitized_path_from(root: &Path, raw: &OsStr) -> Result<std::ffi::OsString> {
     let mut paths = Vec::new();
-    for path in std::env::split_paths(&raw) {
+    for path in std::env::split_paths(raw) {
         if !path.is_absolute() {
             continue;
         }
@@ -505,8 +509,12 @@ fn sanitized_path(root: &Path) -> Result<std::ffi::OsString> {
     std::env::join_paths(paths).context("construct sanitized PATH")
 }
 
-fn resolve_safe_tool(name: &str, root: &Path) -> Result<PathBuf> {
+pub(crate) fn resolve_safe_tool(name: &str, root: &Path) -> Result<PathBuf> {
     let path = sanitized_path(root)?;
+    resolve_safe_tool_on_path(name, root, &path)
+}
+
+fn resolve_safe_tool_on_path(name: &str, root: &Path, path: &OsStr) -> Result<PathBuf> {
     for directory in std::env::split_paths(&path) {
         #[cfg(windows)]
         let candidate = directory.join(format!("{name}.exe"));
@@ -541,6 +549,8 @@ mod tests {
         CargoMetadata, LockIndex, configure_cargo_safety_environment, neutral_environment,
         safe_external_directory,
     };
+    #[cfg(unix)]
+    use super::{resolve_safe_tool_on_path, sanitized_path_from};
     use crate::manifest::ManifestDocument;
     use depgraph_protocol::Condition;
     use serde_json::{Value, json};
@@ -591,6 +601,39 @@ mod tests {
         symlink(&root, &link).expect("repository symlink");
 
         assert!(safe_external_directory(&root, link.as_os_str()).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tool_resolution_excludes_repository_and_relative_path_entries() {
+        let temp = tempfile::tempdir().expect("temporary parent");
+        let root = temp.path().join("repository");
+        let repository_bin = root.join("bin");
+        let external_bin = temp.path().join("external-bin");
+        std::fs::create_dir_all(&repository_bin).expect("repository bin");
+        std::fs::create_dir_all(&external_bin).expect("external bin");
+        std::fs::write(repository_bin.join("rustc"), b"project tool").expect("project tool");
+        std::fs::write(external_bin.join("rustc"), b"external tool").expect("external tool");
+        let root = root.canonicalize().expect("canonical repository");
+        let external_bin = external_bin.canonicalize().expect("canonical external bin");
+        let raw = std::env::join_paths([
+            Path::new("relative-bin"),
+            repository_bin.as_path(),
+            external_bin.as_path(),
+        ])
+        .expect("test PATH");
+
+        let sanitized = sanitized_path_from(&root, &raw).expect("sanitized PATH");
+        let entries = std::env::split_paths(&sanitized).collect::<Vec<_>>();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0], external_bin);
+        assert_eq!(
+            resolve_safe_tool_on_path("rustc", &root, &sanitized)
+                .expect("external rustc")
+                .canonicalize()
+                .expect("canonical rustc"),
+            external_bin.join("rustc").canonicalize().unwrap()
+        );
     }
 
     #[test]

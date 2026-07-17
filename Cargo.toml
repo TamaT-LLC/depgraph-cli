@@ -16,6 +16,11 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/TamaT-LLC/depgraph-cli"
 rust-version = "1.93"
 
+[workspace.metadata.depgraph.rust-analyzer]
+crate-version = "0.0.330"
+revision = "8954b66d43225e62c92e8bbcc8500191b5cceb1e"
+salsa-version = "0.26.1"
+
 [workspace.dependencies]
 anyhow = "1.0"
 assert_cmd = "2.0"
@@ -26,7 +31,14 @@ hex = "0.4"
 libc = "0.2"
 petgraph = "0.8"
 predicates = "3.1"
+ra_ap_hir = "=0.0.330"
+ra_ap_ide_db = "=0.0.330"
+ra_ap_syntax = "=0.0.330"
+ra_ap_vfs = "=0.0.330"
 rusqlite = { version = "0.37", features = ["bundled", "chrono"] }
+salsa = "=0.26.1"
+salsa-macro-rules = "=0.26.1"
+salsa-macros = "=0.26.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["preserve_order"] }
 sha2 = "0.10"
@@ -37,6 +49,7 @@ tokio = { version = "1.48", features = ["io-util", "macros", "process", "rt-mult
 toml = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+triomphe = { version = "0.1.14", default-features = false, features = ["std"] }
 uuid = { version = "1.18", features = ["v4", "serde"] }
 walkdir = "2.5"
 

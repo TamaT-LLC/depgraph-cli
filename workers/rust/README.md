@@ -4,23 +4,39 @@ The Rust worker currently produces a deterministic static syntax graph. It
 reads confined Cargo manifests, lockfiles, and Rust source, attempts
 `cargo metadata --format-version 1 --no-deps --frozen --offline` from a neutral
 working directory, and falls back to its static manifest model when that
-command is unavailable. Rust source is parsed with `syn`; rust-analyzer HIR is
-not loaded or invoked in the current release.
+command is unavailable. Rust source is parsed with `syn`. The worker now links
+an exact-pinned rust-analyzer library set and exposes an inventory-only HIR
+smoke scaffold, but the production scan does not invoke that scaffold or emit
+semantic graph events. Its profile therefore remains `analysis=syntax`,
+`rust_hir_backend=disabled`, and `rust_hir_status=not-invoked`.
 
 The current Cargo path validates workspace members after Cargo returns. A
 manifest such as `members = ["../outside"]` can therefore make Cargo read an
 out-of-root manifest before the result is filtered. Current metadata remains a
 best-effort syntax-inventory input and is not eligible for HIR. HIR stays
 disabled until a preflight plus confined Cargo-visible input mirror prevents
-that read. The current metadata command now sets `RUSTUP_AUTO_INSTALL=0`, but a
-no-download/no-write gate for all future probes remains required.
+that read. The metadata command and neutral version probe set
+`RUSTUP_AUTO_INSTALL=0`; the probe also clears project environment, redirects
+writable homes to neutral temporary paths, and enforces timeout and output
+limits. The same no-download/no-project-write boundary remains mandatory for
+the future confined project model.
 
 ## Selected semantic backend
 
-The planned semantic backend is an exact-pinned set of rust-analyzer library
-crates linked into `depgraph-rust-worker`. The worker will construct the
-rust-analyzer `CrateGraph`, cfg set, and VFS from bytes and Cargo DTOs that the
-safe scanner has already admitted. HIR results will be emitted as semantic
+The selected semantic backend is an exact-pinned set of rust-analyzer library
+crates linked into `depgraph-rust-worker`: `ra_ap_* = 0.0.330`, from upstream
+revision `8954b66d43225e62c92e8bbcc8500191b5cceb1e`, with the Salsa dependency
+set pinned to `0.26.1`. Version `0.0.331` was evaluated and rejected because
+its HIR type crate uses unstable if-let guards and does not compile with the
+verified Rust `1.93.1` baseline.
+
+The current scaffold lowers only caller-supplied, already-admitted UTF-8 bytes
+through a virtual `/lib.rs`, a minimal in-memory `CrateGraph`, and a worker-owned
+VFS. It does not discover a Cargo workspace, read repository files, load a
+sysroot, start a process, enable proc macros, or emit protocol graph events.
+The follow-up safe project model will construct the full rust-analyzer
+`CrateGraph`, cfg set, and VFS from bytes and confined Cargo DTOs that the safe
+scanner has already admitted. HIR results will then be emitted as semantic
 evidence alongside, rather than in place of, the static syntax graph.
 
 An external `rust-analyzer` LSP process is not selected. Its project-loading
@@ -71,17 +87,20 @@ Their side effects are covered by the armed fixture under
 ## Toolchain compatibility
 
 The current verified Rust baseline is `1.93.1`. Syntax inventory remains
-best-effort outside that baseline. HIR is disabled until an exact
-rust-analyzer revision and compatible crate-graph/toolchain inputs have passed
-the release gate. A verified sysroot is additionally required only when the
-profile claims standard-library resolution.
+best-effort outside that baseline. The worker probes the resolved system
+`rustc` and Cargo pair from a neutral environment and records whether it
+matches the exact baseline. The rust-analyzer revision is selected and the
+smoke scaffold is available, but HIR stays disabled until compatible confined
+crate-graph inputs and the remaining release gates are complete. A verified
+sysroot is additionally required only when the profile claims standard-library
+resolution.
 
-| Project/toolchain state | Current result | HIR eligibility after implementation |
+| Project/toolchain state | Current result | HIR eligibility after the remaining gates |
 | --- | --- | --- |
-| Exact `1.93.1`, supported target, and complete crate graph; verified sysroot when standard-library resolution is claimed | Static syntax graph | Eligible for the pinned HIR backend |
+| Exact `1.93.1`, supported target, and complete confined crate graph; verified sysroot when standard-library resolution is claimed | Static syntax graph plus a ready scaffold diagnostic; HIR is not invoked | Eligible for rust-analyzer `0.0.330` after the safe project-model and release gates pass |
 | No project toolchain declaration | Static syntax graph using the worker baseline as metadata | Eligible only when every effective input is the verified baseline |
 | Older, newer, or nightly declaration | `RUST_TOOLCHAIN_BEST_EFFORT`; static syntax graph | Syntax fallback; never `semantic-complete` |
-| Custom or malformed declaration | Static syntax graph; the current parser may not emit a toolchain diagnostic | The HIR gate must emit `RUST_HIR_INPUT_UNSUPPORTED` and use syntax fallback |
+| Custom or malformed declaration, unreadable file, or external symlink | Static syntax graph with `RUST_TOOLCHAIN_INVALID` and `RUST_HIR_TOOLCHAIN_UNSUPPORTED` | Fail-closed syntax fallback; never HIR-eligible |
 | Cargo missing or frozen/offline metadata fails | `CARGO_METADATA_FALLBACK`; static manifest and syntax graph | Syntax fallback with `cargo-metadata-fallback` coverage reason |
 | Build script or proc macro is required | Unresolved site plus `BUILD_SCRIPT_NOT_EXECUTED` or `PROC_MACRO_NOT_EXECUTED` | Partial HIR only; never execute project code in safe mode |
 | HIR panic, timeout, or malformed internal result | Not applicable while HIR is disabled | Worker failure; the core keeps other adapter results but does not relabel syntax as semantic success |
@@ -102,9 +121,17 @@ runtime facts, not a claim that the future backend already ran.
 | `analysis_backend` | `static-syntax` |
 | `rust_hir_backend` | `disabled` |
 | `rust_hir_status` | `not-invoked` |
+| `rust_hir_scaffold` | `available` |
+| `rust_hir_enable_gate` | `safe-project-model-pending` for a compatible effective HIR toolchain status; otherwise `toolchain-unsupported` |
 | `rust_hir_integration_policy` | `pinned-rust-analyzer-library` |
-| `rust_analyzer_revision` | `not-bundled` |
+| `rust_analyzer_version` | `0.0.330` |
+| `rust_analyzer_revision` | `8954b66d43225e62c92e8bbcc8500191b5cceb1e` |
+| `rust_analyzer_salsa_version` | `0.26.1` |
 | `rust_toolchain_baseline` | `1.93.1` |
+| `rust_toolchain_probe_status` | Raw neutral system probe: `compatible`, `unsupported`, or `unavailable` |
+| `rust_hir_toolchain_status` | Effective HIR gate after combining the raw probe and project declaration |
+| `rust_toolchain_declaration_status` | `absent`, `valid`, or fail-closed `invalid` |
+| `rust_toolchain_observed` | Sanitized observed `rustc` / Cargo versions, commits, and hosts, or a bounded failure reason |
 | `crate_graph_source_policy` | `cargo-metadata-or-static-manifest` |
 | `syntax_fallback` | `enabled` |
 | `build_script_policy` | `disabled` |
@@ -114,10 +141,12 @@ runtime facts, not a claim that the future backend already ran.
 | `build_scripts_executed` | `false` |
 | `proc_macros_executed` | `false` |
 
-When HIR is implemented, the profile must record the actual pinned
-rust-analyzer revision, effective Rust/sysroot version, crate-graph source, and
-HIR status. Backend and toolchain revisions that can change graph identity must
-also participate in the profile identity or evidence identity.
+The profile already records the selected rust-analyzer and Salsa versions,
+upstream revision, and neutral toolchain probe. When HIR graph emission is
+enabled, it must additionally record the effective sysroot version, confined
+crate-graph source, and completed HIR status. Backend and toolchain revisions
+that can change graph identity must also participate in the profile identity
+or evidence identity.
 
 ## Fallback contract
 
@@ -134,7 +163,7 @@ a project binary, system rust-analyzer, or an unverified sysroot.
 
 ## Release and upgrade gate
 
-The selected rust-analyzer libraries will be statically linked into
+The selected rust-analyzer libraries are statically linked into
 `depgraph-rust-worker`, so the existing worker SHA-256 in
 `release-manifest.json` is their executable integrity boundary. Exact
 `ra_ap_*` packages must also appear in `Cargo.lock`, the SPDX SBOM, and the
@@ -163,10 +192,10 @@ sysroot as one compatibility unit. Before merging it must:
 The follow-up can be delivered in dependency order without crossing the safe
 scan boundary:
 
-1. **Pin and smoke-test the backend (1 day):** add exact `ra_ap_*` versions,
-   upstream revision metadata, neutral Cargo/rustc version probes, a minimal
-   in-memory HIR smoke test, SBOM/license assertions, and no project loading;
-   prove absent toolchains cause no download or user/project write.
+1. **Completed 2026-07-17 — pin and smoke-test the backend:** exact `ra_ap_*`
+   versions, upstream revision metadata, neutral Cargo/rustc version probes, a
+   minimal in-memory HIR smoke test, SBOM/license assertions, and no project
+   loading; prove absent toolchains cause no download or user/project write.
 2. **Confine Cargo input reads (1–2 days):** reject ambiguous/external
    workspace, path, patch, replace, glob, symlink, and unknown absolute paths,
    then run metadata only against a mirror of admitted manifests, lockfile, and

@@ -2,7 +2,10 @@ use depgraph_protocol::{
     CompletenessLevel, EvidenceKind, Phase, Precision, ProtocolEvent, ResolutionStatus,
     validate_ndjson,
 };
-use depgraph_rust_worker::{ADAPTER_VERSION, build_events, scan};
+use depgraph_rust_worker::{
+    ADAPTER_VERSION, RUST_ANALYZER_CRATE_VERSION, RUST_ANALYZER_REVISION,
+    RUST_ANALYZER_SALSA_VERSION, build_events, scan,
+};
 use std::{
     collections::BTreeSet,
     fs,
@@ -164,6 +167,24 @@ fn armed_security_fixture_proves_safe_scan_does_not_execute_project_code() {
     assert!(!result.coverage.project_code_executed);
     assert_eq!(result.profile.properties["rust_hir_backend"], "disabled");
     assert_eq!(result.profile.properties["rust_hir_status"], "not-invoked");
+    assert_eq!(
+        result.profile.properties["rust_hir_toolchain_status"],
+        "unsupported"
+    );
+    assert_eq!(
+        result.profile.properties["rust_toolchain_declaration_status"],
+        "valid"
+    );
+    assert_eq!(
+        result.profile.properties["rust_toolchain_probe_status"],
+        result.profile.properties["rust_toolchain_observed"]["status"]
+    );
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "RUST_HIR_TOOLCHAIN_UNSUPPORTED")
+    );
     assert_eq!(result.profile.properties["build_script_policy"], "disabled");
     assert_eq!(result.profile.properties["proc_macro_policy"], "disabled");
     assert_eq!(result.profile.properties["project_code_executed"], false);
@@ -171,6 +192,7 @@ fn armed_security_fixture_proves_safe_scan_does_not_execute_project_code() {
         result.profile.properties["project_toolchain_executed"],
         false
     );
+    assert!(result.edges.iter().all(|edge| edge.phase == Phase::Source));
     for (site_kind, diagnostic_code, coverage_reason) in [
         (
             "build_script_execution",
@@ -290,6 +312,14 @@ fn missing_cargo_preserves_static_syntax_graph_without_semantic_completeness() {
     assert_eq!(profile.properties["analysis_backend"], "static-syntax");
     assert_eq!(profile.properties["rust_hir_backend"], "disabled");
     assert_eq!(profile.properties["rust_hir_status"], "not-invoked");
+    assert_eq!(
+        profile.properties["rust_toolchain_probe_status"],
+        "unavailable"
+    );
+    assert_eq!(
+        profile.properties["rust_hir_toolchain_status"],
+        "unavailable"
+    );
     assert_eq!(profile.properties["syntax_fallback"], "enabled");
     assert!(validated.nodes.values().any(|node| node.kind == "module"));
     assert!(validated.sites.values().any(|site| {
@@ -318,6 +348,12 @@ fn missing_cargo_preserves_static_syntax_graph_without_semantic_completeness() {
             .reasons
             .iter()
             .any(|reason| reason == "cargo-metadata-fallback")
+    );
+    assert!(
+        coverage
+            .reasons
+            .iter()
+            .any(|reason| reason == "rust-hir-unsupported")
     );
     assert!(
         coverage
@@ -514,7 +550,43 @@ fn default_rust_profile_has_stable_hashed_host_identity() {
         first.properties["rust_hir_integration_policy"],
         "pinned-rust-analyzer-library"
     );
-    assert_eq!(first.properties["rust_analyzer_revision"], "not-bundled");
+    assert_eq!(
+        first.properties["rust_analyzer_version"],
+        RUST_ANALYZER_CRATE_VERSION
+    );
+    assert_eq!(
+        first.properties["rust_analyzer_revision"],
+        RUST_ANALYZER_REVISION
+    );
+    assert_eq!(
+        first.properties["rust_analyzer_salsa_version"],
+        RUST_ANALYZER_SALSA_VERSION
+    );
+    let probe_status = first.properties["rust_toolchain_probe_status"]
+        .as_str()
+        .expect("toolchain probe status");
+    assert!(matches!(
+        probe_status,
+        "compatible" | "unsupported" | "unavailable"
+    ));
+    assert_eq!(
+        first.properties["rust_toolchain_observed"]["status"],
+        probe_status
+    );
+    assert_eq!(first.properties["rust_hir_toolchain_status"], probe_status);
+    assert_eq!(
+        first.properties["rust_hir_enable_gate"],
+        if probe_status == "compatible" {
+            "safe-project-model-pending"
+        } else {
+            "toolchain-unsupported"
+        }
+    );
+    assert_eq!(
+        first.properties["rust_toolchain_declaration_status"],
+        "absent"
+    );
+    assert_eq!(first.properties["rust_hir_scaffold"], "available");
     assert_eq!(first.properties["rust_toolchain_baseline"], "1.93.1");
     assert_eq!(
         first.properties["crate_graph_source_policy"],
@@ -849,7 +921,12 @@ fn binary_reports_protocol_version() {
         .unwrap();
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains("protocol 1.0"));
+    assert_eq!(
+        stdout.trim(),
+        format!(
+            "depgraph-rust-worker {ADAPTER_VERSION} (protocol 1.0; rust-analyzer {RUST_ANALYZER_CRATE_VERSION}; rust-analyzer-revision {RUST_ANALYZER_REVISION}; salsa {RUST_ANALYZER_SALSA_VERSION})"
+        )
+    );
 }
 
 fn worker_profile(profile_config: &str) -> depgraph_protocol::Profile {

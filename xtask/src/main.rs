@@ -16,6 +16,19 @@ mod go_semantic_e2e;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const SBOM_SCOPE: &str = "Scope: package-manager component boundary; system runtimes/toolchains and dependencies embedded inside upstream prebuilt packages are not recursively enumerated.";
+const RUST_ANALYZER_CRATE_VERSION: &str = "0.0.330";
+const RUST_ANALYZER_REVISION: &str = "8954b66d43225e62c92e8bbcc8500191b5cceb1e";
+const SALSA_VERSION: &str = "0.26.1";
+const RUST_ANALYZER_DIRECT_DEPENDENCIES: &[&str] =
+    &["ra_ap_hir", "ra_ap_ide_db", "ra_ap_syntax", "ra_ap_vfs"];
+const SALSA_DIRECT_DEPENDENCIES: &[&str] = &["salsa", "salsa-macro-rules", "salsa-macros"];
+const FORBIDDEN_RUST_ANALYZER_DEPENDENCIES: &[&str] = &[
+    "ra_ap_flycheck",
+    "ra_ap_load_cargo",
+    "ra_ap_load-cargo",
+    "ra_ap_proc_macro_srv",
+    "ra_ap_project_model",
+];
 
 #[derive(Parser)]
 struct Cli {
@@ -130,6 +143,8 @@ fn build(release: bool) -> Result<()> {
 }
 
 fn test() -> Result<()> {
+    let cargo = cargo_metadata(&["--features", "depgraph-cli/packaged"])?;
+    verify_rust_analyzer_dependencies(&cargo)?;
     run(Command::new("cargo").args(["fmt", "--all", "--", "--check"]))?;
     run(Command::new("cargo").args([
         "clippy",
@@ -466,6 +481,8 @@ fn normalized_spdx_license(reported: &str) -> Option<String> {
         return None;
     }
     let normalized = reported
+        .replace("MIT / Apache-2.0", "MIT OR Apache-2.0")
+        .replace("Apache-2.0 / MIT", "Apache-2.0 OR MIT")
         .replace("MIT/Apache-2.0", "MIT OR Apache-2.0")
         .replace("Apache-2.0/MIT", "Apache-2.0 OR MIT")
         .replace("Unlicense/MIT", "Unlicense OR MIT");
@@ -521,22 +538,13 @@ fn purl_encode_segment(value: &str) -> String {
 }
 
 fn dependency_inventory(target: &str) -> Result<Vec<DependencyPackage>> {
-    let cargo_output = Command::new("cargo")
-        .args([
-            "metadata",
-            "--format-version",
-            "1",
-            "--locked",
-            "--filter-platform",
-            target,
-            "--features",
-            "depgraph-cli/packaged",
-        ])
-        .output()?;
-    if !cargo_output.status.success() {
-        bail!("cargo metadata failed while generating dependency inventory");
-    }
-    let cargo: Value = serde_json::from_slice(&cargo_output.stdout)?;
+    let cargo = cargo_metadata(&[
+        "--filter-platform",
+        target,
+        "--features",
+        "depgraph-cli/packaged",
+    ])?;
+    verify_rust_analyzer_dependencies(&cargo)?;
     let mut packages = cargo_runtime_packages(&cargo)?;
 
     let go_output = Command::new("go")
@@ -589,6 +597,169 @@ fn dependency_inventory(target: &str) -> Result<Vec<DependencyPackage>> {
             && left.version == right.version
     });
     Ok(packages)
+}
+
+fn cargo_metadata(arguments: &[&str]) -> Result<Value> {
+    let output = Command::new("cargo")
+        .args(["metadata", "--format-version", "1", "--locked"])
+        .args(arguments)
+        .output()
+        .context("failed to start cargo metadata")?;
+    if !output.status.success() {
+        bail!(
+            "cargo metadata failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    serde_json::from_slice(&output.stdout).context("cargo metadata returned invalid JSON")
+}
+
+fn verify_rust_analyzer_dependencies(metadata: &Value) -> Result<()> {
+    let pin = &metadata["metadata"]["depgraph"]["rust-analyzer"];
+    let crate_version = pin["crate-version"]
+        .as_str()
+        .context("workspace rust-analyzer crate version is missing")?;
+    let revision = pin["revision"]
+        .as_str()
+        .context("workspace rust-analyzer revision is missing")?;
+    let salsa_version = pin["salsa-version"]
+        .as_str()
+        .context("workspace Salsa version is missing")?;
+    if revision.len() != 40
+        || !revision
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        bail!("workspace rust-analyzer revision must be a lowercase 40-character Git SHA");
+    }
+    if crate_version != RUST_ANALYZER_CRATE_VERSION
+        || revision != RUST_ANALYZER_REVISION
+        || salsa_version != SALSA_VERSION
+    {
+        bail!(
+            "workspace rust-analyzer pin must be crate {}, revision {}, Salsa {}",
+            RUST_ANALYZER_CRATE_VERSION,
+            RUST_ANALYZER_REVISION,
+            SALSA_VERSION
+        );
+    }
+
+    let packages = metadata["packages"]
+        .as_array()
+        .context("cargo metadata has no package inventory")?;
+    let workers = packages
+        .iter()
+        .filter(|package| package["name"] == "depgraph-rust-worker" && package["source"].is_null())
+        .collect::<Vec<_>>();
+    if workers.len() != 1 {
+        bail!(
+            "cargo metadata must contain exactly one local depgraph-rust-worker package, found {}",
+            workers.len()
+        );
+    }
+    let direct_dependencies = workers[0]["dependencies"]
+        .as_array()
+        .context("depgraph-rust-worker has no dependency inventory")?;
+    let expected_direct_dependencies = RUST_ANALYZER_DIRECT_DEPENDENCIES
+        .iter()
+        .chain(SALSA_DIRECT_DEPENDENCIES)
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let actual_direct_dependencies = direct_dependencies
+        .iter()
+        .filter_map(|dependency| dependency["name"].as_str())
+        .filter(|name| {
+            name.starts_with("ra_ap_")
+                || name.starts_with("ra-ap-")
+                || *name == "salsa"
+                || name.starts_with("salsa-")
+        })
+        .collect::<BTreeSet<_>>();
+    if actual_direct_dependencies != expected_direct_dependencies {
+        bail!(
+            "depgraph-rust-worker direct rust-analyzer/Salsa dependency set must be exactly {expected_direct_dependencies:?}, found {actual_direct_dependencies:?}"
+        );
+    }
+    for (name, version) in RUST_ANALYZER_DIRECT_DEPENDENCIES
+        .iter()
+        .map(|name| (*name, RUST_ANALYZER_CRATE_VERSION))
+        .chain(
+            SALSA_DIRECT_DEPENDENCIES
+                .iter()
+                .map(|name| (*name, SALSA_VERSION)),
+        )
+    {
+        let matches = direct_dependencies
+            .iter()
+            .filter(|dependency| dependency["name"] == name)
+            .collect::<Vec<_>>();
+        if matches.len() != 1 {
+            bail!(
+                "depgraph-rust-worker must declare exactly one direct {name} dependency, found {}",
+                matches.len()
+            );
+        }
+        let dependency = matches[0];
+        if dependency["req"] != format!("={version}")
+            || !dependency["kind"].is_null()
+            || !dependency["rename"].is_null()
+            || dependency["optional"] != Value::Bool(false)
+            || dependency["uses_default_features"] != Value::Bool(true)
+            || !dependency["features"].as_array().is_some_and(Vec::is_empty)
+            || !dependency["target"].is_null()
+            || !dependency["source"]
+                .as_str()
+                .is_some_and(|source| source.starts_with("registry+"))
+        {
+            bail!(
+                "depgraph-rust-worker dependency {name} must be an unconditional normal registry dependency pinned to ={version}"
+            );
+        }
+    }
+
+    let resolved_ra = packages
+        .iter()
+        .filter(|package| {
+            package["name"]
+                .as_str()
+                .is_some_and(|name| name.starts_with("ra_ap_"))
+        })
+        .collect::<Vec<_>>();
+    if resolved_ra.is_empty() {
+        bail!("cargo metadata resolved no ra_ap_* packages");
+    }
+    for package in resolved_ra {
+        let name = package["name"].as_str().unwrap_or("<unknown>");
+        if package["version"] != RUST_ANALYZER_CRATE_VERSION
+            || !package["source"]
+                .as_str()
+                .is_some_and(|source| source.starts_with("registry+"))
+        {
+            bail!(
+                "resolved rust-analyzer package {name} must be registry version {RUST_ANALYZER_CRATE_VERSION}"
+            );
+        }
+    }
+    for name in SALSA_DIRECT_DEPENDENCIES {
+        let matches = packages
+            .iter()
+            .filter(|package| package["name"] == *name)
+            .collect::<Vec<_>>();
+        if matches.len() != 1
+            || matches[0]["version"] != SALSA_VERSION
+            || !matches[0]["source"]
+                .as_str()
+                .is_some_and(|source| source.starts_with("registry+"))
+        {
+            bail!("resolved package {name} must be registry version {SALSA_VERSION}");
+        }
+    }
+    for forbidden in FORBIDDEN_RUST_ANALYZER_DEPENDENCIES {
+        if packages.iter().any(|package| package["name"] == *forbidden) {
+            bail!("forbidden rust-analyzer project-loading package resolved: {forbidden}");
+        }
+    }
+    Ok(())
 }
 
 fn cargo_runtime_packages(metadata: &Value) -> Result<Vec<DependencyPackage>> {
@@ -1232,7 +1403,14 @@ fn verify_release_metadata(extracted: &Path) -> Result<()> {
         "@astrojs/compiler",
         "typescript",
         "golang.org/x/tools",
+        "ra_ap_hir",
+        "ra_ap_ide_db",
+        "ra_ap_syntax",
+        "ra_ap_vfs",
         "rusqlite",
+        "salsa",
+        "salsa-macro-rules",
+        "salsa-macros",
         "syn",
     ] {
         if !package_names.contains(required) {
@@ -1312,6 +1490,34 @@ fn verify_release_metadata(extracted: &Path) -> Result<()> {
         bail!("release SBOM does not declare its package-manager component boundary");
     }
     let license_inventory = fs::read_to_string(extracted.join("THIRD_PARTY_LICENSES.txt"))?;
+    for (name, version, license) in RUST_ANALYZER_DIRECT_DEPENDENCIES
+        .iter()
+        .map(|name| (*name, RUST_ANALYZER_CRATE_VERSION, "MIT OR Apache-2.0"))
+        .chain(
+            SALSA_DIRECT_DEPENDENCIES
+                .iter()
+                .map(|name| (*name, SALSA_VERSION, "Apache-2.0 OR MIT")),
+        )
+    {
+        let matches = packages
+            .iter()
+            .filter(|package| package["name"] == name)
+            .collect::<Vec<_>>();
+        if matches.len() != 1 {
+            bail!(
+                "release SBOM must contain exactly one pinned package {name}, found {}",
+                matches.len()
+            );
+        }
+        let package = matches[0];
+        if package["versionInfo"] != version || package["licenseDeclared"] != license {
+            bail!("release SBOM must record cargo:{name} {version} with license {license}");
+        }
+        let expected = format!("cargo:{name} {version} — {license}");
+        if !license_inventory.lines().any(|line| line == expected) {
+            bail!("third-party license inventory is missing {expected}");
+        }
+    }
     for (label, content) in web_legal_documents()? {
         let section = legal_document_section(&label, &content);
         if !license_inventory.contains(&section) {
@@ -1527,7 +1733,7 @@ mod tests {
     use super::{
         ARCHIVE_MTIME, DependencyPackage, archive_entries, cargo_runtime_packages,
         create_tar_archive, create_zip_archive, extract_archive, normalized_spdx_license,
-        package_url, web_runtime_packages,
+        package_url, verify_rust_analyzer_dependencies, web_runtime_packages,
     };
 
     fn release_tree() -> Result<(tempfile::TempDir, String)> {
@@ -1554,6 +1760,38 @@ mod tests {
                 .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000_000)),
         )?;
         Ok(())
+    }
+
+    fn rust_analyzer_metadata() -> serde_json::Value {
+        json!({
+            "metadata": {"depgraph": {"rust-analyzer": {
+                "crate-version": "0.0.330",
+                "revision": "8954b66d43225e62c92e8bbcc8500191b5cceb1e",
+                "salsa-version": "0.26.1"
+            }}},
+            "packages": [
+                {
+                    "name": "depgraph-rust-worker",
+                    "source": null,
+                    "dependencies": [
+                        {"name":"ra_ap_hir","req":"=0.0.330","kind":null,"source":"registry+test","optional":false,"uses_default_features":true,"features":[]},
+                        {"name":"ra_ap_ide_db","req":"=0.0.330","kind":null,"source":"registry+test","optional":false,"uses_default_features":true,"features":[]},
+                        {"name":"ra_ap_syntax","req":"=0.0.330","kind":null,"source":"registry+test","optional":false,"uses_default_features":true,"features":[]},
+                        {"name":"ra_ap_vfs","req":"=0.0.330","kind":null,"source":"registry+test","optional":false,"uses_default_features":true,"features":[]},
+                        {"name":"salsa","req":"=0.26.1","kind":null,"source":"registry+test","optional":false,"uses_default_features":true,"features":[]},
+                        {"name":"salsa-macro-rules","req":"=0.26.1","kind":null,"source":"registry+test","optional":false,"uses_default_features":true,"features":[]},
+                        {"name":"salsa-macros","req":"=0.26.1","kind":null,"source":"registry+test","optional":false,"uses_default_features":true,"features":[]}
+                    ]
+                },
+                {"name":"ra_ap_hir","version":"0.0.330","source":"registry+test"},
+                {"name":"ra_ap_ide_db","version":"0.0.330","source":"registry+test"},
+                {"name":"ra_ap_syntax","version":"0.0.330","source":"registry+test"},
+                {"name":"ra_ap_vfs","version":"0.0.330","source":"registry+test"},
+                {"name":"salsa","version":"0.26.1","source":"registry+test"},
+                {"name":"salsa-macro-rules","version":"0.26.1","source":"registry+test"},
+                {"name":"salsa-macros","version":"0.26.1","source":"registry+test"}
+            ]
+        })
     }
 
     #[test]
@@ -1695,6 +1933,14 @@ mod tests {
     #[test]
     fn legacy_licenses_are_normalized_and_invalid_metadata_fails_safe() {
         assert_eq!(
+            normalized_spdx_license("MIT / Apache-2.0").as_deref(),
+            Some("MIT OR Apache-2.0")
+        );
+        assert_eq!(
+            normalized_spdx_license("Apache-2.0 / MIT").as_deref(),
+            Some("Apache-2.0 OR MIT")
+        );
+        assert_eq!(
             normalized_spdx_license("MIT/Apache-2.0").as_deref(),
             Some("MIT OR Apache-2.0")
         );
@@ -1715,6 +1961,76 @@ mod tests {
             normalized_spdx_license("license metadata unavailable"),
             None
         );
+    }
+
+    #[test]
+    fn rust_analyzer_dependency_gate_accepts_the_exact_lockstep_pin() -> Result<()> {
+        verify_rust_analyzer_dependencies(&rust_analyzer_metadata())
+    }
+
+    #[test]
+    fn rust_analyzer_dependency_gate_rejects_non_exact_direct_requirements() {
+        let mut metadata = rust_analyzer_metadata();
+        metadata["packages"][0]["dependencies"][0]["req"] = json!("^0.0.330");
+        let error = verify_rust_analyzer_dependencies(&metadata)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("pinned to =0.0.330"), "{error}");
+    }
+
+    #[test]
+    fn rust_analyzer_dependency_gate_rejects_extra_direct_backend_dependencies() {
+        let mut metadata = rust_analyzer_metadata();
+        metadata["packages"][0]["dependencies"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({
+                "name": "ra_ap_base_db",
+                "req": "=0.0.330",
+                "kind": null,
+                "source": "registry+test",
+                "optional": false,
+                "uses_default_features": true,
+                "features": []
+            }));
+        let error = verify_rust_analyzer_dependencies(&metadata)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("dependency set must be exactly"), "{error}");
+    }
+
+    #[test]
+    fn rust_analyzer_dependency_gate_rejects_mixed_resolved_versions() {
+        let mut metadata = rust_analyzer_metadata();
+        metadata["packages"][1]["version"] = json!("0.0.331");
+        let error = verify_rust_analyzer_dependencies(&metadata)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("registry version 0.0.330"), "{error}");
+    }
+
+    #[test]
+    fn rust_analyzer_dependency_gate_rejects_malformed_revision() {
+        let mut metadata = rust_analyzer_metadata();
+        metadata["metadata"]["depgraph"]["rust-analyzer"]["revision"] = json!("NOT-A-SHA");
+        let error = verify_rust_analyzer_dependencies(&metadata)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("lowercase 40-character Git SHA"), "{error}");
+    }
+
+    #[test]
+    fn rust_analyzer_dependency_gate_rejects_project_loading_crates() {
+        let mut metadata = rust_analyzer_metadata();
+        metadata["packages"].as_array_mut().unwrap().push(json!({
+            "name": "ra_ap_project_model",
+            "version": "0.0.330",
+            "source": "registry+test"
+        }));
+        let error = verify_rust_analyzer_dependencies(&metadata)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("project-loading package"), "{error}");
     }
 
     #[test]
