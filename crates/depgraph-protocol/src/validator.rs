@@ -826,6 +826,12 @@ fn validate_semantic_maps(
     edges: &BTreeMap<String, GraphEdge>,
     sites: &BTreeMap<String, DependencySite>,
 ) -> Result<(), ProtocolError> {
+    let strict_dependency_sites: BTreeSet<_> = sites
+        .values()
+        .filter(|site| is_evidence_driven_semantic_site(site))
+        .map(|site| site.id.as_str())
+        .collect();
+
     for node in nodes.values() {
         validate_semantic_node(node)?;
         if node.kind == "symbol"
@@ -851,38 +857,58 @@ fn validate_semantic_maps(
     }
 
     for edge in edges.values() {
-        validate_semantic_edge(edge)?;
-        if !matches!(edge.kind.as_str(), "type_uses" | "calls" | "may_call") {
-            continue;
-        }
-        let site_id = edge
+        let linked_site = edge
             .site_id
             .as_deref()
-            .expect("semantic edge validation requires a site ID");
-        let site = sites
-            .get(site_id)
-            .expect("base validation requires referenced sites to exist");
-        let expected_site_kind = match edge.kind.as_str() {
-            "calls" | "may_call" => "call",
-            "type_uses" => "type_use",
-            _ => unreachable!("semantic edge kind matched above"),
+            .and_then(|site_id| sites.get(site_id));
+        let linked_to_strict_site =
+            linked_site.is_some_and(|site| strict_dependency_sites.contains(site.id.as_str()));
+        if let Some(expected_kind) = linked_site.and_then(source_fallback_edge_kind_for_site) {
+            validate_source_fallback_edge(
+                linked_site.expect("source fallback edge has a linked site"),
+                edge,
+                expected_kind,
+            )?;
+            continue;
+        }
+        validate_semantic_edge(edge, linked_to_strict_site)?;
+
+        let Some(site) = linked_site else {
+            continue;
         };
-        if site.kind != expected_site_kind {
+        let expected_edge_kind = semantic_edge_kind_for_site(site, linked_to_strict_site);
+        if expected_edge_kind.is_none() {
+            if is_common_semantic_edge_kind(edge.kind.as_str()) {
+                return invariant(format!(
+                    "semantic edge {} of kind {} requires a call or type_use dependency site, found {}",
+                    edge.id, edge.kind, site.kind
+                ));
+            }
+            continue;
+        }
+        let expected_edge_kind = expected_edge_kind.expect("semantic site kind checked");
+        if edge.kind != expected_edge_kind {
             return invariant(format!(
-                "semantic edge {} of kind {} requires a {expected_site_kind} dependency site, found {}",
-                edge.id, edge.kind, site.kind
+                "semantic dependency site {} of kind {} requires {expected_edge_kind} edges, found {}",
+                site.id, site.kind, edge.kind
             ));
         }
     }
 
     for site in sites.values() {
-        validate_semantic_site(site)?;
-        if !matches!(site.kind.as_str(), "call" | "type_use") {
+        let strict_dependency_site = strict_dependency_sites.contains(site.id.as_str());
+        validate_semantic_site(site, strict_dependency_site)?;
+        if source_fallback_edge_kind_for_site(site).is_some() {
+            validate_source_fallback_site(site)?;
+            continue;
+        }
+        if semantic_edge_kind_for_site(site, strict_dependency_site).is_none() {
             continue;
         }
         let source_node = nodes
             .get(&site.source)
             .expect("base validation requires dependency-site sources to exist");
+        let rust_semantic_site = is_rust_semantic_dependency_site(site, source_node);
         match site.kind.as_str() {
             "call" if source_node.kind != "symbol" => {
                 return invariant(format!(
@@ -896,7 +922,31 @@ fn validate_semantic_maps(
                     site.id, source_node.id
                 ));
             }
+            "rust_use" if !matches!(source_node.kind.as_str(), "module" | "symbol") => {
+                return invariant(format!(
+                    "Rust semantic use site {} source {} must be a module or symbol node",
+                    site.id, source_node.id
+                ));
+            }
+            "rust_reexport" if source_node.kind != "module" => {
+                return invariant(format!(
+                    "Rust semantic re-export site {} source {} must be a module node",
+                    site.id, source_node.id
+                ));
+            }
             _ => {}
+        }
+        if rust_semantic_site
+            && source_node
+                .properties
+                .get("language")
+                .and_then(Value::as_str)
+                != Some("rust")
+        {
+            return invariant(format!(
+                "Rust semantic dependency site {} source {} must declare language=rust",
+                site.id, source_node.id
+            ));
         }
 
         if matches!(
@@ -920,17 +970,30 @@ fn validate_semantic_maps(
                             site.id, target.id
                         ));
                     }
+                    "rust_use" | "rust_reexport"
+                        if !matches!(target.kind.as_str(), "module" | "symbol" | "type") =>
+                    {
+                        return invariant(format!(
+                            "Rust semantic {} site {} concrete target {} must be a module, symbol, or type node",
+                            site.kind, site.id, target.id
+                        ));
+                    }
                     _ => {}
+                }
+                if rust_semantic_site
+                    && target.properties.get("language").and_then(Value::as_str) != Some("rust")
+                {
+                    return invariant(format!(
+                        "Rust semantic dependency site {} concrete target {} must declare language=rust",
+                        site.id, target.id
+                    ));
                 }
             }
         }
 
-        let expected_edge_kind = match site.kind.as_str() {
-            "call" if site.resolution_status == ResolutionStatus::Candidates => "may_call",
-            "call" => "calls",
-            "type_use" => "type_uses",
-            _ => unreachable!("semantic site kind matched above"),
-        };
+        let expected_edge_kind = semantic_edge_kind_for_site(site, strict_dependency_site)
+            .expect("semantic site kind matched above");
+        let require_same_condition = rust_semantic_site;
         for edge in edges
             .values()
             .filter(|edge| edge.site_id.as_deref() == Some(site.id.as_str()))
@@ -941,15 +1004,156 @@ fn validate_semantic_maps(
                     site.id, edge.kind
                 ));
             }
-            if evidence_span_key(&site.evidence[0]) != evidence_span_key(&edge.evidence[0]) {
+            if primary_evidence_anchor(&site.evidence[0])
+                != primary_evidence_anchor(&edge.evidence[0])
+            {
                 return invariant(format!(
-                    "semantic edge {} primary span does not match dependency site {}",
+                    "semantic edge {} primary evidence anchor does not match dependency site {}",
+                    edge.id, site.id
+                ));
+            }
+            if require_same_condition
+                && edge.condition.canonicalized() != site.condition.canonicalized()
+            {
+                return invariant(format!(
+                    "Rust semantic edge {} condition does not match dependency site {}",
                     edge.id, site.id
                 ));
             }
         }
     }
     Ok(())
+}
+
+fn is_common_semantic_edge_kind(kind: &str) -> bool {
+    matches!(kind, "type_uses" | "calls" | "may_call")
+}
+
+fn is_rust_import_site_kind(kind: &str) -> bool {
+    matches!(kind, "rust_use" | "rust_reexport")
+}
+
+fn is_evidence_driven_semantic_site(site: &DependencySite) -> bool {
+    matches!(
+        site.kind.as_str(),
+        "type_use" | "rust_use" | "rust_reexport"
+    ) && site
+        .evidence
+        .first()
+        .is_some_and(|evidence| evidence.kind == EvidenceKind::Semantic)
+}
+
+fn source_fallback_edge_kind_for_site(site: &DependencySite) -> Option<&'static str> {
+    if site
+        .evidence
+        .first()
+        .is_none_or(|evidence| evidence.kind != EvidenceKind::Source)
+    {
+        return None;
+    }
+    match site.kind.as_str() {
+        "type_use" => Some("type_uses"),
+        "rust_use" => Some("imports"),
+        "rust_reexport" => Some("reexports"),
+        _ => None,
+    }
+}
+
+fn validate_source_fallback_site(site: &DependencySite) -> Result<(), ProtocolError> {
+    validate_primary_source_evidence(
+        &format!("source fallback dependency site {}", site.id),
+        &site.evidence,
+    )?;
+    if site.kind == "type_use"
+        && (!matches!(
+            site.resolution_status,
+            ResolutionStatus::External | ResolutionStatus::Unresolved
+        ) || site.precision != Precision::Heuristic)
+    {
+        return invariant(format!(
+            "source fallback type-use site {} must use external or unresolved status with heuristic precision",
+            site.id
+        ));
+    }
+    Ok(())
+}
+
+fn validate_source_fallback_edge(
+    site: &DependencySite,
+    edge: &GraphEdge,
+    expected_kind: &str,
+) -> Result<(), ProtocolError> {
+    if edge.kind != expected_kind {
+        return invariant(format!(
+            "source dependency site requires {expected_kind} edges, found {}",
+            edge.kind
+        ));
+    }
+    if edge.phase != Phase::Source {
+        return invariant(format!(
+            "source fallback edge {} of kind {} must use phase=source",
+            edge.id, edge.kind
+        ));
+    }
+    let site_primary = validate_primary_source_evidence(
+        &format!("source fallback dependency site {}", site.id),
+        &site.evidence,
+    )?;
+    let edge_primary = validate_primary_source_evidence(
+        &format!("source fallback edge {}", edge.id),
+        &edge.evidence,
+    )?;
+    if primary_evidence_anchor(site_primary) != primary_evidence_anchor(edge_primary) {
+        return invariant(format!(
+            "source fallback edge {} primary evidence anchor does not match dependency site {}",
+            edge.id, site.id
+        ));
+    }
+    if edge.condition.canonicalized() != site.condition.canonicalized() {
+        return invariant(format!(
+            "source fallback edge {} condition does not match dependency site {}",
+            edge.id, site.id
+        ));
+    }
+    if edge.source != site.source {
+        return invariant(format!(
+            "source fallback edge {} source does not match dependency site {}",
+            edge.id, site.id
+        ));
+    }
+    if edge.resolution_status != site.resolution_status {
+        return invariant(format!(
+            "source fallback edge {} status does not match dependency site {}",
+            edge.id, site.id
+        ));
+    }
+    if edge.precision != site.precision {
+        return invariant(format!(
+            "source fallback edge {} precision does not match dependency site {}",
+            edge.id, site.id
+        ));
+    }
+    Ok(())
+}
+
+fn semantic_edge_kind_for_site(
+    site: &DependencySite,
+    strict_dependency_site: bool,
+) -> Option<&'static str> {
+    match site.kind.as_str() {
+        "call" if site.resolution_status == ResolutionStatus::Candidates => Some("may_call"),
+        "call" => Some("calls"),
+        "type_use" if strict_dependency_site => Some("type_uses"),
+        "rust_use" if strict_dependency_site => Some("imports"),
+        "rust_reexport" if strict_dependency_site => Some("reexports"),
+        _ => None,
+    }
+}
+
+fn is_rust_semantic_dependency_site(site: &DependencySite, source: &GraphNode) -> bool {
+    is_rust_import_site_kind(site.kind.as_str())
+        || (site.kind == "type_use"
+            && source.properties.get("language").and_then(Value::as_str) == Some("rust"))
 }
 
 fn is_payload_event(event: &ProtocolEvent) -> bool {
@@ -1181,8 +1385,11 @@ fn validate_identity_span(span: &Value, node_id: &str) -> Result<(), ProtocolErr
     Ok(())
 }
 
-fn validate_semantic_edge(edge: &GraphEdge) -> Result<(), ProtocolError> {
-    if !matches!(edge.kind.as_str(), "type_uses" | "calls" | "may_call") {
+fn validate_semantic_edge(
+    edge: &GraphEdge,
+    linked_to_strict_site: bool,
+) -> Result<(), ProtocolError> {
+    if !is_common_semantic_edge_kind(edge.kind.as_str()) && !linked_to_strict_site {
         return Ok(());
     }
     if edge.phase != Phase::Semantic {
@@ -1242,10 +1449,14 @@ fn validate_semantic_edge(edge: &GraphEdge) -> Result<(), ProtocolError> {
     Ok(())
 }
 
-fn validate_semantic_site(site: &DependencySite) -> Result<(), ProtocolError> {
-    if !matches!(site.kind.as_str(), "call" | "type_use") {
+fn validate_semantic_site(
+    site: &DependencySite,
+    strict_dependency_site: bool,
+) -> Result<(), ProtocolError> {
+    if semantic_edge_kind_for_site(site, strict_dependency_site).is_none() {
         return Ok(());
     }
+    require_non_empty("semantic dependency_site.specifier", &site.specifier)?;
     let primary = validate_primary_semantic_evidence(
         &format!("semantic dependency site {}", site.id),
         &site.evidence,
@@ -1335,6 +1546,28 @@ fn validate_primary_semantic_evidence<'a>(
     Ok(primary)
 }
 
+fn validate_primary_source_evidence<'a>(
+    owner: &str,
+    evidence: &'a [Evidence],
+) -> Result<&'a Evidence, ProtocolError> {
+    let primary = evidence.first().ok_or_else(|| {
+        ProtocolError::Invariant(format!("{owner} must include primary source evidence"))
+    })?;
+    if primary.kind != EvidenceKind::Source || !has_complete_span(primary) {
+        return invariant(format!(
+            "{owner} evidence[0] must be source evidence with a complete source span"
+        ));
+    }
+    validate_canonical_relative_path(
+        &format!("{owner} primary evidence path"),
+        primary
+            .path
+            .as_deref()
+            .expect("complete span includes path"),
+    )?;
+    Ok(primary)
+}
+
 fn validate_candidate_algorithm(owner: &str, primary: &Evidence) -> Result<(), ProtocolError> {
     if primary
         .properties
@@ -1410,24 +1643,24 @@ fn has_complete_span(evidence: &Evidence) -> bool {
         && evidence.end_column.is_some()
 }
 
-fn evidence_span_key(evidence: &Evidence) -> (&str, u32, u32, u32, u32) {
+fn primary_evidence_anchor(evidence: &Evidence) -> (&str, &str, &str, u32, u32, u32, u32) {
     (
+        &evidence.extractor,
+        &evidence.extractor_version,
         evidence
             .path
             .as_deref()
-            .expect("semantic primary evidence has a path"),
+            .expect("primary evidence has a path"),
         evidence
             .start_line
-            .expect("semantic primary evidence has a start line"),
+            .expect("primary evidence has a start line"),
         evidence
             .start_column
-            .expect("semantic primary evidence has a start column"),
-        evidence
-            .end_line
-            .expect("semantic primary evidence has an end line"),
+            .expect("primary evidence has a start column"),
+        evidence.end_line.expect("primary evidence has an end line"),
         evidence
             .end_column
-            .expect("semantic primary evidence has an end column"),
+            .expect("primary evidence has an end column"),
     )
 }
 

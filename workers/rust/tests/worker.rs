@@ -67,20 +67,27 @@ fn typed_output_validates_and_contains_all_nine_events() {
             .values()
             .any(|edge| edge.phase == Phase::Semantic)
     );
-    assert!(validated.edges.values().all(|edge| {
-        edge.evidence.iter().all(|evidence| match edge.phase {
-            Phase::Source => {
-                evidence.kind == EvidenceKind::Source
-                    && evidence.extractor == "rust-static"
-                    && evidence.extractor_version == ADAPTER_VERSION
-            }
-            Phase::Semantic => {
+    assert!(validated.edges.values().all(|edge| match edge.phase {
+        Phase::Source => edge.evidence.iter().all(|evidence| {
+            evidence.kind == EvidenceKind::Source
+                && evidence.extractor == "rust-static"
+                && evidence.extractor_version == ADAPTER_VERSION
+        }),
+        Phase::Semantic => {
+            edge.evidence.first().is_some_and(|evidence| {
                 evidence.kind == EvidenceKind::Semantic
                     && evidence.extractor == "rust-analyzer-hir"
                     && evidence.extractor_version == RUST_ANALYZER_CRATE_VERSION
-            }
-            Phase::Build | Phase::Runtime => false,
-        })
+            }) && edge.evidence.iter().skip(1).all(|evidence| {
+                (evidence.kind == EvidenceKind::Semantic
+                    && evidence.extractor == "rust-analyzer-hir"
+                    && evidence.extractor_version == RUST_ANALYZER_CRATE_VERSION)
+                    || (evidence.kind == EvidenceKind::Source
+                        && evidence.extractor == "rust-static"
+                        && evidence.extractor_version == ADAPTER_VERSION)
+            })
+        }
+        Phase::Build | Phase::Runtime => false,
     }));
     assert!(
         validated
@@ -93,7 +100,7 @@ fn typed_output_validates_and_contains_all_nine_events() {
 }
 
 #[test]
-fn hir_definition_graph_emits_exact_nodes_and_structural_relations() {
+fn hir_import_type_graph_emits_exact_nodes_sites_and_relations() {
     let result = scan(&semantic_fixture()).unwrap();
     let events = build_events("rust-semantic-fixture", &result).unwrap();
     let mut ndjson = Vec::new();
@@ -105,7 +112,7 @@ fn hir_definition_graph_emits_exact_nodes_and_structural_relations() {
 
     assert_eq!(
         result.profile.properties["analysis"],
-        "syntax+hir-definitions"
+        "syntax+hir-imports-types"
     );
     assert_eq!(
         result.profile.properties["analysis_backend"],
@@ -113,7 +120,7 @@ fn hir_definition_graph_emits_exact_nodes_and_structural_relations() {
     );
     assert_eq!(
         result.profile.properties["rust_hir_status"],
-        "definition-graph-emitted"
+        "import-type-graph-emitted"
     );
     assert_eq!(
         result.profile.properties["rust_hir_semantic_issue_count"],
@@ -218,7 +225,12 @@ fn hir_definition_graph_emits_exact_nodes_and_structural_relations() {
         .filter(|edge| edge.phase == Phase::Semantic)
         .collect();
     assert!(!semantic_edges.is_empty());
-    for edge in &semantic_edges {
+    let structural_edges: Vec<_> = semantic_edges
+        .iter()
+        .copied()
+        .filter(|edge| edge.site_id.is_none())
+        .collect();
+    for edge in &structural_edges {
         assert!(matches!(
             edge.kind.as_str(),
             "declares" | "extends" | "implements" | "instantiates"
@@ -298,16 +310,274 @@ fn hir_definition_graph_emits_exact_nodes_and_structural_relations() {
             .iter()
             .any(|edge| edge.kind == "instantiates")
     );
-    assert!(
-        !result
+    let dependency_sites: Vec<_> = result
+        .sites
+        .iter()
+        .filter(|site| {
+            matches!(
+                site.kind.as_str(),
+                "rust_use" | "rust_reexport" | "type_use"
+            ) && site
+                .evidence
+                .first()
+                .is_some_and(|evidence| evidence.kind == EvidenceKind::Semantic)
+        })
+        .collect();
+    assert!(!dependency_sites.is_empty());
+    assert_eq!(
+        result.profile.properties["rust_hir_semantic_site_count"],
+        dependency_sites.len() as u64
+    );
+    for site in &dependency_sites {
+        let primary = site.evidence.first().expect("semantic site evidence");
+        assert_eq!(primary.kind, EvidenceKind::Semantic);
+        assert_eq!(primary.extractor, "rust-analyzer-hir");
+        assert_eq!(primary.extractor_version, RUST_ANALYZER_CRATE_VERSION);
+        assert!(
+            primary
+                .path
+                .as_deref()
+                .is_some_and(|path| !Path::new(path).is_absolute())
+        );
+        assert!(primary.start_line.is_some_and(|line| line > 0));
+        assert!(primary.start_column.is_some_and(|column| column > 0));
+        assert!(primary.end_line.is_some_and(|line| line > 0));
+        assert!(primary.end_column.is_some_and(|column| column > 0));
+        assert_eq!(primary.properties["macro_provenance"], "direct-source");
+        assert!(site.target_ids.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(
+            site.id,
+            stable_id_from_value(
+                "site",
+                &serde_json::json!({
+                    "condition": site.condition,
+                    "kind": site.kind,
+                    "path": primary.path.as_deref().unwrap(),
+                    "profile_id": site.profile_id,
+                    "source": site.source,
+                    "span": {
+                        "start_line": primary.start_line.unwrap(),
+                        "start_column": primary.start_column.unwrap(),
+                        "end_line": primary.end_line.unwrap(),
+                        "end_column": primary.end_column.unwrap(),
+                    }
+                }),
+            )
+        );
+        let linked_edges: Vec<_> = semantic_edges
+            .iter()
+            .copied()
+            .filter(|edge| edge.site_id.as_deref() == Some(site.id.as_str()))
+            .collect();
+        assert_eq!(linked_edges.len(), site.target_ids.len());
+        for edge in linked_edges {
+            assert_eq!(edge.source, site.source);
+            assert_eq!(edge.resolution_status, site.resolution_status);
+            assert_eq!(edge.precision, site.precision);
+            assert_eq!(edge.condition, site.condition);
+            assert_eq!(edge.evidence[0], site.evidence[0]);
+            assert_eq!(
+                edge.id,
+                stable_id_from_value(
+                    "edge",
+                    &serde_json::json!({
+                        "kind": edge.kind,
+                        "site_id": site.id,
+                        "target": edge.target,
+                    }),
+                )
+            );
+        }
+    }
+
+    let import = dependency_sites
+        .iter()
+        .find(|site| site.kind == "rust_use" && site.specifier == "domain::Named as NameContract")
+        .expect("resolved alias import");
+    assert_eq!(import.resolution_status, ResolutionStatus::Resolved);
+    assert_eq!(import.precision, Precision::Exact);
+    assert_eq!(import.target_ids, [named]);
+    assert!(import.evidence.iter().skip(1).any(|evidence| {
+        evidence.kind == EvidenceKind::Source && evidence.extractor == "rust-static"
+    }));
+
+    let reexport = dependency_sites
+        .iter()
+        .find(|site| {
+            site.kind == "rust_reexport" && site.specifier == "domain::Envelope as PublicEnvelope"
+        })
+        .expect("resolved alias re-export");
+    assert_eq!(reexport.resolution_status, ResolutionStatus::Resolved);
+    assert!(dependency_sites.iter().any(|site| {
+        site.kind == "rust_reexport"
+            && site.specifier == "domain::*"
+            && site.resolution_status == ResolutionStatus::Resolved
+    }));
+    assert!(dependency_sites.iter().any(|site| {
+        site.kind == "rust_use"
+            && site.specifier == "std::path::PathBuf"
+            && site.resolution_status == ResolutionStatus::External
+            && site.precision == Precision::Heuristic
+    }));
+    assert!(dependency_sites.iter().any(|site| {
+        site.kind == "rust_use"
+            && site.specifier == "missing::BrokenImport as MissingImport"
+            && site.resolution_status == ResolutionStatus::Unresolved
+            && site.reason.is_some()
+    }));
+
+    let record_type_use = dependency_sites
+        .iter()
+        .find(|site| site.kind == "type_use" && site.specifier == "domain::Record")
+        .expect("resolved signature type use");
+    assert_eq!(
+        record_type_use.resolution_status,
+        ResolutionStatus::Resolved
+    );
+    assert_eq!(record_type_use.target_ids, [record]);
+    assert!(dependency_sites.iter().any(|site| {
+        site.kind == "type_use"
+            && site.specifier == "std::path::PathBuf"
+            && site.resolution_status == ResolutionStatus::External
+    }));
+    assert!(dependency_sites.iter().any(|site| {
+        site.kind == "type_use"
+            && site.specifier == "PathBuf"
+            && site.resolution_status == ResolutionStatus::External
+            && site.precision == Precision::Heuristic
+            && site.evidence[0].properties["heuristic_basis"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("std::path::PathBuf"))
+    }));
+    assert!(dependency_sites.iter().any(|site| {
+        site.kind == "type_use"
+            && site.specifier == "MissingImport"
+            && site.resolution_status == ResolutionStatus::Unresolved
+            && site.evidence[0].properties["type_use_context"] == "body"
+    }));
+    assert!(dependency_sites.iter().any(|site| {
+        site.kind == "type_use"
+            && site.specifier == "Sized"
+            && site.resolution_status == ResolutionStatus::Unresolved
+    }));
+    assert!(dependency_sites.iter().any(|site| {
+        site.kind == "type_use"
+            && site.specifier == "missing::Thing"
+            && site.resolution_status == ResolutionStatus::Unresolved
+            && site.reason.is_some()
+    }));
+    assert!(dependency_sites.iter().any(|site| {
+        site.kind == "type_use"
+            && site.specifier == "PublicEnvelope"
+            && site.condition.render().contains("rust.cfg")
+    }));
+}
+
+#[test]
+fn external_aliases_follow_lexical_module_paths_and_narrower_cfg() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("external-alias-scope");
+    write_minimal_crate(
+        &root,
+        "external-alias-scope",
+        r#"#[cfg(any(unix, windows))]
+use std::path::PathBuf;
+
+#[cfg(any(unix, windows))]
+mod nested {
+    use std::path::PathBuf as LocalBuf;
+
+    #[cfg(target_pointer_width = "64")]
+    pub fn accepts(_: super::PathBuf, _: self::LocalBuf) {}
+}
+"#,
+    );
+
+    let result = scan(&root).unwrap();
+    for specifier in ["super::PathBuf", "self::LocalBuf"] {
+        let site = result
             .sites
             .iter()
-            .any(|site| matches!(site.kind.as_str(), "call" | "type_use"))
+            .find(|site| site.kind == "type_use" && site.specifier == specifier)
+            .unwrap_or_else(|| panic!("missing type-use site {specifier}"));
+        assert_eq!(site.resolution_status, ResolutionStatus::External);
+        assert_eq!(site.precision, Precision::Heuristic);
+        assert_eq!(site.evidence[0].kind, EvidenceKind::Semantic);
+        assert!(site.condition.render().contains("rust.cfg"));
+        assert!(
+            site.evidence[0].properties["heuristic_basis"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("std::path::PathBuf"))
+        );
+    }
+}
+
+#[test]
+fn external_aliases_follow_cross_file_crate_and_super_paths() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("external-alias-cross-file");
+    write_minimal_crate(
+        &root,
+        "external-alias-cross-file",
+        "use std::path::PathBuf;\npub mod child;\n",
+    );
+    fs::write(
+        root.join("src/child.rs"),
+        "pub fn accepts(_: crate::PathBuf, _: super::PathBuf) {}\n",
+    )
+    .unwrap();
+
+    let result = scan(&root).unwrap();
+    for specifier in ["crate::PathBuf", "super::PathBuf"] {
+        let site = result
+            .sites
+            .iter()
+            .find(|site| site.kind == "type_use" && site.specifier == specifier)
+            .unwrap_or_else(|| panic!("missing type-use site {specifier}"));
+        assert_eq!(site.resolution_status, ResolutionStatus::External);
+        assert_eq!(site.precision, Precision::Heuristic);
+        assert_eq!(site.evidence[0].kind, EvidenceKind::Semantic);
+        assert!(
+            site.evidence[0].properties["heuristic_basis"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("std::path::PathBuf"))
+        );
+    }
+}
+
+#[test]
+fn extern_crate_alias_resolves_external_type_use() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("extern-crate-alias");
+    write_minimal_crate(
+        &root,
+        "extern-crate-alias",
+        "extern crate std as sys;\npub fn accepts(_: sys::path::PathBuf) {}\n",
+    );
+
+    let result = scan(&root).unwrap();
+    assert!(result.sites.iter().any(|site| {
+        site.kind == "extern_crate"
+            && site.specifier == "std as sys"
+            && site.resolution_status == ResolutionStatus::External
+    }));
+    let type_use = result
+        .sites
+        .iter()
+        .find(|site| site.kind == "type_use" && site.specifier == "sys::path::PathBuf")
+        .expect("extern crate alias type use");
+    assert_eq!(type_use.resolution_status, ResolutionStatus::External);
+    assert_eq!(type_use.precision, Precision::Heuristic);
+    assert_eq!(type_use.evidence[0].kind, EvidenceKind::Semantic);
+    assert!(
+        type_use.evidence[0].properties["heuristic_basis"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("std"))
     );
 }
 
 #[test]
-fn hir_definition_graph_is_repeatable_and_checkout_independent() {
+fn hir_import_type_graph_is_repeatable_and_checkout_independent() {
     let first_temp = tempfile::tempdir().unwrap();
     let second_temp = tempfile::tempdir().unwrap();
     let first_root = first_temp.path().join("one");
@@ -334,10 +604,176 @@ fn hir_definition_graph_is_repeatable_and_checkout_independent() {
             .cloned()
             .collect::<Vec<_>>()
     };
+    let semantic_sites = |result: &depgraph_rust_worker::ScanResult| {
+        result
+            .sites
+            .iter()
+            .filter(|site| {
+                site.evidence
+                    .first()
+                    .is_some_and(|evidence| evidence.kind == EvidenceKind::Semantic)
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+    };
     assert_eq!(semantic_nodes(&first), semantic_nodes(&repeated));
     assert_eq!(semantic_edges(&first), semantic_edges(&repeated));
+    assert_eq!(semantic_sites(&first), semantic_sites(&repeated));
+    assert_eq!(first.coverage, repeated.coverage);
+    assert_eq!(first.files, repeated.files);
     assert_eq!(semantic_nodes(&first), semantic_nodes(&second));
     assert_eq!(semantic_edges(&first), semantic_edges(&second));
+    assert_eq!(semantic_sites(&first), semantic_sites(&second));
+    assert_eq!(first.coverage, second.coverage);
+    assert_eq!(first.files, second.files);
+}
+
+#[test]
+fn ambiguous_shared_module_use_remains_one_candidate_site() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("candidate-use");
+    write_minimal_crate(
+        &root,
+        "candidate-use",
+        r#"#[path = "shared.rs"]
+pub mod left;
+#[path = "shared.rs"]
+pub mod right;
+"#,
+    );
+    fs::write(
+        root.join("src/shared.rs"),
+        "pub mod child { pub struct Item; }\nuse self::child::Item;\n",
+    )
+    .unwrap();
+
+    let result = scan(&root).unwrap();
+    let sites: Vec<_> = result
+        .sites
+        .iter()
+        .filter(|site| site.kind == "rust_use" && site.specifier == "self::child::Item")
+        .collect();
+    assert_eq!(sites.len(), 1);
+    let site = sites[0];
+    assert_eq!(site.resolution_status, ResolutionStatus::Candidates);
+    assert_eq!(site.precision, Precision::Overapprox);
+    assert_eq!(site.target_ids.len(), 2);
+    assert!(site.target_ids.windows(2).all(|pair| pair[0] < pair[1]));
+    let linked: Vec<_> = result
+        .edges
+        .iter()
+        .filter(|edge| edge.site_id.as_deref() == Some(site.id.as_str()))
+        .collect();
+    assert_eq!(linked.len(), 2);
+    assert!(linked.iter().all(|edge| {
+        edge.phase == Phase::Source
+            && edge.resolution_status == ResolutionStatus::Candidates
+            && edge.precision == Precision::Overapprox
+    }));
+    assert_eq!(result.coverage.candidates, 1);
+}
+
+#[test]
+fn hir_use_with_distinct_namespace_targets_is_semantic_candidates() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("namespace-candidates");
+    write_minimal_crate(
+        &root,
+        "namespace-candidates",
+        r#"pub mod defs {
+    pub mod dual {}
+    pub fn dual() {}
+}
+use defs::dual;
+"#,
+    );
+
+    let result = scan(&root).unwrap();
+    let sites: Vec<_> = result
+        .sites
+        .iter()
+        .filter(|site| site.kind == "rust_use" && site.specifier == "defs::dual")
+        .collect();
+    assert_eq!(sites.len(), 1);
+    let site = sites[0];
+    assert_eq!(site.resolution_status, ResolutionStatus::Candidates);
+    assert_eq!(site.precision, Precision::Overapprox);
+    assert_eq!(site.target_ids.len(), 2);
+    assert_eq!(site.evidence[0].kind, EvidenceKind::Semantic);
+    let linked: Vec<_> = result
+        .edges
+        .iter()
+        .filter(|edge| edge.site_id.as_deref() == Some(site.id.as_str()))
+        .collect();
+    assert_eq!(linked.len(), 2);
+    assert!(linked.iter().all(|edge| {
+        edge.phase == Phase::Semantic
+            && edge.kind == "imports"
+            && edge.resolution_status == ResolutionStatus::Candidates
+            && edge.precision == Precision::Overapprox
+    }));
+}
+
+#[test]
+fn ambiguous_type_use_is_preserved_once_as_source_fallback() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("ambiguous-type-fallback");
+    write_minimal_crate(
+        &root,
+        "ambiguous-type-fallback",
+        r#"#[path = "shared.rs"]
+pub mod left;
+#[path = "shared.rs"]
+pub mod right;
+"#,
+    );
+    fs::write(
+        root.join("src/shared.rs"),
+        "pub struct Local;\npub fn accepts(_: Local, _: std::path::PathBuf) {}\n",
+    )
+    .unwrap();
+
+    let result = scan(&root).unwrap();
+    let sites: Vec<_> = result
+        .sites
+        .iter()
+        .filter(|site| site.kind == "type_use" && site.specifier == "Local")
+        .collect();
+    assert_eq!(sites.len(), 1);
+    let site = sites[0];
+    assert_eq!(site.resolution_status, ResolutionStatus::Unresolved);
+    assert_eq!(site.precision, Precision::Heuristic);
+    assert_eq!(site.evidence[0].kind, EvidenceKind::Source);
+    assert_eq!(
+        site.evidence[0].properties["semantic_refinement"],
+        "unavailable"
+    );
+    assert_eq!(site.target_ids.len(), 1);
+    assert!(
+        result
+            .nodes
+            .iter()
+            .any(|node| { node.id == site.target_ids[0] && node.kind == "unknown_target" })
+    );
+    let linked: Vec<_> = result
+        .edges
+        .iter()
+        .filter(|edge| edge.site_id.as_deref() == Some(site.id.as_str()))
+        .collect();
+    assert_eq!(linked.len(), 1);
+    assert_eq!(linked[0].phase, Phase::Source);
+    assert_eq!(linked[0].kind, "type_uses");
+    let external = result
+        .sites
+        .iter()
+        .find(|site| site.kind == "type_use" && site.specifier == "std::path::PathBuf")
+        .expect("source fallback external type use");
+    assert_eq!(external.resolution_status, ResolutionStatus::External);
+    assert_eq!(external.precision, Precision::Heuristic);
+    assert_eq!(external.evidence[0].kind, EvidenceKind::Source);
+    assert!(result.files.iter().any(|file| {
+        file.path == "src/shared.rs" && file.discovered_sites == file.emitted_sites
+    }));
 }
 
 #[test]
@@ -359,7 +795,7 @@ fn test_mode_skips_ambiguous_source_bound_locals_and_instances() {
     let profile = validated.profiles.values().next().unwrap();
     assert_eq!(
         profile.properties["rust_hir_status"],
-        "definition-graph-partial"
+        "import-type-graph-partial"
     );
     assert_eq!(profile.properties["rust_hir_semantic_issue_count"], 2);
     assert_eq!(
@@ -491,7 +927,7 @@ impl LocalTrait for std::path::PathBuf {}
     );
     assert_eq!(
         result.profile.properties["rust_hir_status"],
-        "definition-graph-partial"
+        "import-type-graph-partial"
     );
 }
 
@@ -562,7 +998,7 @@ pub fn second(value: u8) -> Outer<Inner<u8, 2>> {
     );
     assert_eq!(
         result.profile.properties["rust_hir_status"],
-        "definition-graph-partial"
+        "import-type-graph-partial"
     );
 }
 
@@ -667,7 +1103,7 @@ pub fn borrowed<'a>(value: &'a u8) -> Borrowed<'a, u8> {
     );
     assert_eq!(
         result.profile.properties["rust_hir_status"],
-        "definition-graph-partial"
+        "import-type-graph-partial"
     );
 }
 
@@ -694,7 +1130,7 @@ fn extracts_cargo_targets_conditions_modules_and_safe_mode_sites() {
     assert_eq!(result.profile.properties["rust_hir_project_model"], "ready");
     assert_eq!(
         result.profile.properties["rust_hir_enable_gate"],
-        "import-call-and-release-gates-pending"
+        "call-and-release-gates-pending"
     );
     assert_eq!(
         result.profile.properties["rust_hir_backend"],
@@ -702,7 +1138,7 @@ fn extracts_cargo_targets_conditions_modules_and_safe_mode_sites() {
     );
     assert!(matches!(
         result.profile.properties["rust_hir_status"].as_str(),
-        Some("definition-graph-emitted" | "definition-graph-partial")
+        Some("import-type-graph-emitted" | "import-type-graph-partial")
     ));
     assert_eq!(
         result.profile.properties["crate_graph_source"],
@@ -1311,7 +1747,7 @@ fn default_rust_profile_has_stable_hashed_host_identity() {
         "compatible" | "unsupported" | "unavailable"
     ));
     if probe_status == "compatible" {
-        assert_eq!(first.properties["analysis"], "syntax+hir-definitions");
+        assert_eq!(first.properties["analysis"], "syntax+hir-imports-types");
         assert_eq!(
             first.properties["analysis_backend"],
             "static-syntax+rust-analyzer-hir"
@@ -1319,7 +1755,7 @@ fn default_rust_profile_has_stable_hashed_host_identity() {
         assert_eq!(first.properties["rust_hir_backend"], "rust-analyzer-hir");
         assert!(matches!(
             first.properties["rust_hir_status"].as_str(),
-            Some("definition-graph-emitted" | "definition-graph-partial")
+            Some("import-type-graph-emitted" | "import-type-graph-partial")
         ));
     } else {
         assert_eq!(first.properties["analysis"], "syntax");
@@ -1336,7 +1772,7 @@ fn default_rust_profile_has_stable_hashed_host_identity() {
         assert_eq!(first.properties["rust_hir_project_model"], "ready");
         assert_eq!(
             first.properties["rust_hir_enable_gate"],
-            "import-call-and-release-gates-pending"
+            "call-and-release-gates-pending"
         );
         assert!(
             first.properties["rust_hir_project_file_count"]
@@ -1490,48 +1926,58 @@ pub mod nested {
     .unwrap();
 
     let result = scan(&root).unwrap();
-    let module_path_for_site = |specifier: &str, evidence_path: &str| {
-        let site = result
-            .sites
-            .iter()
-            .find(|site| {
-                site.specifier == specifier
-                    && site
-                        .evidence
-                        .iter()
-                        .any(|evidence| evidence.path.as_deref() == Some(evidence_path))
-            })
-            .unwrap_or_else(|| panic!("missing {specifier} in {evidence_path}"));
-        assert_eq!(site.resolution_status, ResolutionStatus::Resolved);
-        assert_eq!(site.precision, Precision::Exact);
-        assert_eq!(site.target_ids.len(), 1);
-        result
-            .nodes
-            .iter()
-            .find(|node| node.id == site.target_ids[0])
-            .and_then(|node| node.properties["canonical_module_path"].as_str())
-            .unwrap()
-            .to_owned()
-    };
-    assert_eq!(
-        module_path_for_site("self::common::Left", "src/left.rs"),
-        "left::common"
+    let assert_target_path =
+        |specifier: &str, evidence_path: &str, module_path: &str, item: &str| {
+            let site = result
+                .sites
+                .iter()
+                .find(|site| {
+                    site.specifier == specifier
+                        && site
+                            .evidence
+                            .iter()
+                            .any(|evidence| evidence.path.as_deref() == Some(evidence_path))
+                })
+                .unwrap_or_else(|| panic!("missing {specifier} in {evidence_path}"));
+            assert_eq!(site.resolution_status, ResolutionStatus::Resolved);
+            assert_eq!(site.precision, Precision::Exact);
+            assert_eq!(site.target_ids.len(), 1);
+            let target = result
+                .nodes
+                .iter()
+                .find(|node| node.id == site.target_ids[0])
+                .expect("resolved import target");
+            if let Some(resolver) = target.properties["resolver_identity"].as_str() {
+                assert!(
+                    resolver.ends_with(&format!("::crate::{module_path}::{item}")),
+                    "unexpected semantic resolver {resolver}"
+                );
+            } else {
+                assert_eq!(
+                    target.properties["canonical_module_path"].as_str(),
+                    Some(module_path)
+                );
+            }
+        };
+    assert_target_path("self::common::Left", "src/left.rs", "left::common", "Left");
+    assert_target_path(
+        "self::common::Right",
+        "src/right.rs",
+        "right::common",
+        "Right",
     );
-    assert_eq!(
-        module_path_for_site("self::common::Right", "src/right.rs"),
-        "right::common"
+    assert_target_path("super::common::Left", "src/left.rs", "left::common", "Left");
+    assert_target_path(
+        "crate::left::common::Left",
+        "src/lib.rs",
+        "left::common",
+        "Left",
     );
-    assert_eq!(
-        module_path_for_site("super::common::Left", "src/left.rs"),
-        "left::common"
-    );
-    assert_eq!(
-        module_path_for_site("crate::left::common::Left", "src/lib.rs"),
-        "left::common"
-    );
-    assert_eq!(
-        module_path_for_site("crate::right::common::Right", "src/lib.rs"),
-        "right::common"
+    assert_target_path(
+        "crate::right::common::Right",
+        "src/lib.rs",
+        "right::common",
+        "Right",
     );
 
     let platform_sites: Vec<_> = result

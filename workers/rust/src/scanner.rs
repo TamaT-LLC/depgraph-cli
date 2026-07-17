@@ -11,7 +11,7 @@ use crate::{
         select_static_documents, slash_path, workspace_identity,
     },
     metadata::{LockIndex, apply_lock_versions, run_cargo_metadata},
-    source::{Occurrence, SourceSpan, collect_occurrences},
+    source::{Occurrence, SourceSpan, TypeUseOccurrenceKey, UseOccurrenceKey, collect_occurrences},
     toolchain::{RustToolchainProbe, ToolchainProbeStatus, probe_rust_toolchain},
 };
 use anyhow::{Context, Result, bail};
@@ -94,6 +94,8 @@ struct State {
     module_nodes: BTreeMap<ModuleKey, BTreeSet<String>>,
     source_module_contexts: BTreeMap<(usize, String), BTreeSet<ModuleContext>>,
     dependency_resolutions: BTreeMap<(usize, String), TargetResolution>,
+    semantic_use_occurrences: BTreeSet<UseOccurrenceKey>,
+    semantic_type_use_occurrences: BTreeSet<TypeUseOccurrenceKey>,
     unsupported_syntax: u64,
     reasons: BTreeSet<String>,
 }
@@ -326,7 +328,7 @@ pub fn scan(root: &Path) -> Result<ScanResult> {
         hir_toolchain_status,
     );
     if let Some(model) = hir_model {
-        state.extract_hir_semantics(&packages, &model);
+        state.extract_hir_semantics(&packages, &sources, &model);
     }
     state.extract_source_dependencies(&packages, &sources)?;
     state.finish()
@@ -348,6 +350,8 @@ impl State {
             module_nodes: BTreeMap::new(),
             source_module_contexts: BTreeMap::new(),
             dependency_resolutions: BTreeMap::new(),
+            semantic_use_occurrences: BTreeSet::new(),
+            semantic_type_use_occurrences: BTreeSet::new(),
             unsupported_syntax: 0,
             reasons: BTreeSet::new(),
         }
@@ -743,10 +747,25 @@ impl State {
         }
     }
 
-    fn extract_hir_semantics(&mut self, packages: &[Package], model: &SafeProjectModel) {
+    fn extract_hir_semantics(
+        &mut self,
+        packages: &[Package],
+        sources: &[SourceUnit],
+        model: &SafeProjectModel,
+    ) {
         let result = (|| -> Result<(SemanticDelta, BTreeMap<String, SemanticCrateContext>)> {
             let contexts = self.semantic_crate_contexts(packages, model)?;
-            let delta = extract_semantic_delta(model, &contexts, &self.profile.id)?;
+            let occurrences_by_path = sources
+                .iter()
+                .filter_map(|source| {
+                    source
+                        .syntax
+                        .as_ref()
+                        .map(|syntax| (source.rel_path.clone(), collect_occurrences(syntax)))
+                })
+                .collect();
+            let delta =
+                extract_semantic_delta(model, &contexts, &occurrences_by_path, &self.profile.id)?;
             self.merge_semantic_delta(&delta)?;
             Ok((delta, contexts))
         })();
@@ -755,10 +774,11 @@ impl State {
             Ok((delta, _contexts)) => {
                 let node_count = delta.nodes.len() as u64;
                 let relation_count = delta.edges.len() as u64;
+                let site_count = delta.sites.len() as u64;
                 let issue_count = delta.issues.len() as u64;
                 self.profile.properties.insert(
                     "analysis".into(),
-                    Value::String("syntax+hir-definitions".into()),
+                    Value::String("syntax+hir-imports-types".into()),
                 );
                 self.profile.properties.insert(
                     "analysis_backend".into(),
@@ -772,16 +792,16 @@ impl State {
                     "rust_hir_status".into(),
                     Value::String(
                         if issue_count == 0 {
-                            "definition-graph-emitted"
+                            "import-type-graph-emitted"
                         } else {
-                            "definition-graph-partial"
+                            "import-type-graph-partial"
                         }
                         .into(),
                     ),
                 );
                 self.profile.properties.insert(
                     "rust_hir_enable_gate".into(),
-                    Value::String("import-call-and-release-gates-pending".into()),
+                    Value::String("call-and-release-gates-pending".into()),
                 );
                 self.profile.properties.insert(
                     "rust_hir_semantic_node_count".into(),
@@ -792,6 +812,10 @@ impl State {
                     Value::from(relation_count),
                 );
                 self.profile.properties.insert(
+                    "rust_hir_semantic_site_count".into(),
+                    Value::from(site_count),
+                );
+                self.profile.properties.insert(
                     "rust_hir_semantic_issue_count".into(),
                     Value::from(issue_count),
                 );
@@ -799,7 +823,7 @@ impl State {
                     DiagnosticSeverity::Info,
                     "RUST_HIR_SEMANTIC_GRAPH_READY",
                     &format!(
-                        "rust-analyzer emitted {node_count} exact definition nodes and {relation_count} semantic relations from the confined project model"
+                        "rust-analyzer emitted {node_count} semantic nodes, {site_count} dependency sites, and {relation_count} relations from the confined project model"
                     ),
                     None,
                     None,
@@ -834,7 +858,7 @@ impl State {
                     DiagnosticSeverity::Warning,
                     "RUST_HIR_BACKEND_FAILURE",
                     &format!(
-                        "Rust HIR definition graph was discarded atomically: {error}; syntax graph output was preserved"
+                        "Rust HIR semantic graph was discarded atomically: {error}; syntax graph output was preserved"
                     ),
                     None,
                     None,
@@ -898,6 +922,8 @@ impl State {
     fn merge_semantic_delta(&mut self, delta: &SemanticDelta) -> Result<()> {
         let mut nodes = self.nodes.clone();
         let mut edges = self.edges.clone();
+        let mut sites = self.sites.clone();
+        let mut files = self.files.clone();
         for node in &delta.nodes {
             if let Some(existing) = nodes.get(&node.id) {
                 if existing != node {
@@ -906,6 +932,28 @@ impl State {
             } else {
                 nodes.insert(node.id.clone(), node.clone());
             }
+        }
+        for site in &delta.sites {
+            if let Some(existing) = sites.get(&site.id) {
+                if existing != site {
+                    bail!("semantic delta conflicts with site {}", site.id);
+                }
+                continue;
+            }
+            let primary = site
+                .evidence
+                .first()
+                .with_context(|| format!("semantic site {} has no evidence", site.id))?;
+            let path = primary
+                .path
+                .as_deref()
+                .with_context(|| format!("semantic site {} has no evidence path", site.id))?;
+            let file = files.get_mut(path).with_context(|| {
+                format!("semantic site {} references unknown file {path}", site.id)
+            })?;
+            file.discovered_sites += 1;
+            file.emitted_sites += 1;
+            sites.insert(site.id.clone(), site.clone());
         }
         for edge in &delta.edges {
             if let Some(existing) = edges.get(&edge.id) {
@@ -916,13 +964,41 @@ impl State {
                 edges.insert(edge.id.clone(), edge.clone());
             }
         }
+        let semantic_import_sites = delta
+            .sites
+            .iter()
+            .filter(|site| matches!(site.kind.as_str(), "rust_use" | "rust_reexport"))
+            .count();
+        if semantic_import_sites != delta.refined_use_keys.len() {
+            bail!(
+                "semantic import refinement ledger has {semantic_import_sites} sites but {} occurrence keys",
+                delta.refined_use_keys.len()
+            );
+        }
+        let semantic_type_use_sites = delta
+            .sites
+            .iter()
+            .filter(|site| site.kind == "type_use")
+            .count();
+        if semantic_type_use_sites != delta.refined_type_use_keys.len() {
+            bail!(
+                "semantic type-use refinement ledger has {semantic_type_use_sites} sites but {} occurrence keys",
+                delta.refined_type_use_keys.len()
+            );
+        }
         let nodes_vec: Vec<_> = nodes.values().cloned().collect();
         let edges_vec: Vec<_> = edges.values().cloned().collect();
-        let sites_vec: Vec<_> = self.sites.values().cloned().collect();
+        let sites_vec: Vec<_> = sites.values().cloned().collect();
         validate_semantic_graph(&nodes_vec, &edges_vec, &sites_vec)
             .context("validate Rust HIR semantic delta")?;
         self.nodes = nodes;
         self.edges = edges;
+        self.sites = sites;
+        self.files = files;
+        self.semantic_use_occurrences
+            .extend(delta.refined_use_keys.iter().cloned());
+        self.semantic_type_use_occurrences
+            .extend(delta.refined_type_use_keys.iter().cloned());
         Ok(())
     }
 
@@ -1459,16 +1535,32 @@ impl State {
             for occurrence in collect_occurrences(syntax) {
                 match occurrence {
                     Occurrence::Use {
-                        specifier,
+                        target_specifier,
+                        site_specifier,
+                        alias,
+                        glob,
                         reexport,
                         inline_ancestors,
                         condition,
                         span,
                     } => {
+                        let occurrence_key = UseOccurrenceKey::from_occurrence(
+                            &source.rel_path,
+                            &target_specifier,
+                            alias.as_deref(),
+                            glob,
+                            reexport,
+                            &inline_ancestors,
+                            &condition,
+                            span,
+                        );
+                        if self.semantic_use_occurrences.contains(&occurrence_key) {
+                            continue;
+                        }
                         let resolution = self.resolve_rust_path(
                             packages,
                             source.package_index,
-                            &specifier,
+                            &target_specifier,
                             &source.rel_path,
                             &inline_ancestors,
                             span,
@@ -1481,7 +1573,7 @@ impl State {
                         self.add_site(
                             &source_node,
                             site_kind,
-                            &specifier,
+                            &site_specifier,
                             edge_kind,
                             condition,
                             resolution,
@@ -1489,8 +1581,55 @@ impl State {
                         )?;
                         self.increment_file_site(&source.rel_path);
                     }
+                    Occurrence::TypeUse {
+                        specifier,
+                        context,
+                        inline_ancestors,
+                        condition,
+                        span,
+                    } => {
+                        let occurrence_key = TypeUseOccurrenceKey::from_occurrence(
+                            &source.rel_path,
+                            &specifier,
+                            context,
+                            &inline_ancestors,
+                            &condition,
+                            span,
+                        );
+                        if self.semantic_type_use_occurrences.contains(&occurrence_key) {
+                            continue;
+                        }
+                        let resolution = self.resolve_rust_type_fallback(
+                            packages,
+                            source.package_index,
+                            &specifier,
+                            &source.rel_path,
+                            span,
+                        )?;
+                        let mut evidence =
+                            source_evidence(&source.rel_path, span, "Rust type-use fallback");
+                        evidence.properties.insert(
+                            "type_use_context".into(),
+                            Value::String(context.as_str().into()),
+                        );
+                        evidence.properties.insert(
+                            "semantic_refinement".into(),
+                            Value::String("unavailable".into()),
+                        );
+                        self.add_site(
+                            &source_node,
+                            "type_use",
+                            &specifier,
+                            "type_uses",
+                            condition,
+                            resolution,
+                            evidence,
+                        )?;
+                        self.increment_file_site(&source.rel_path);
+                    }
                     Occurrence::ExternCrate {
                         specifier,
+                        alias,
                         inline_ancestors,
                         condition,
                         span,
@@ -1503,10 +1642,14 @@ impl State {
                             &inline_ancestors,
                             span,
                         )?;
+                        let site_specifier = alias
+                            .as_deref()
+                            .map(|alias| format!("{specifier} as {alias}"))
+                            .unwrap_or_else(|| specifier.clone());
                         self.add_site(
                             &source_node,
                             "extern_crate",
-                            &specifier,
+                            &site_specifier,
                             "imports",
                             condition,
                             resolution,
@@ -1575,6 +1718,55 @@ impl State {
             }
         }
         Ok(())
+    }
+
+    fn resolve_rust_type_fallback(
+        &mut self,
+        packages: &[Package],
+        package_index: Option<usize>,
+        specifier: &str,
+        path: &str,
+        span: SourceSpan,
+    ) -> Result<TargetResolution> {
+        let first = specifier
+            .split("::")
+            .find(|part| !part.is_empty())
+            .unwrap_or(specifier)
+            .trim_start_matches("r#");
+        if matches!(first, "std" | "core" | "alloc" | "proc_macro") {
+            let target = self.external_node(&format!("rust-sysroot:{first}"), first, None)?;
+            return Ok(TargetResolution {
+                target_ids: vec![target],
+                status: ResolutionStatus::External,
+                precision: Precision::Heuristic,
+                reason: Some(format!(
+                    "type use is rooted in external sysroot crate {first}, but exact HIR resolution was unavailable"
+                )),
+            });
+        }
+        if let Some(package_index) = package_index
+            && let Some(resolution) = self
+                .dependency_resolutions
+                .get(&(package_index, first.to_owned()))
+            && resolution.status == ResolutionStatus::External
+        {
+            let mut resolution = resolution.clone();
+            resolution.precision = Precision::Heuristic;
+            resolution.reason = Some(format!(
+                "type use is rooted in external dependency {first}, but exact HIR resolution was unavailable"
+            ));
+            return Ok(resolution);
+        }
+
+        let package_name = package_index
+            .and_then(|index| packages.get(index))
+            .map(|package| package.name.as_str())
+            .unwrap_or("unknown");
+        let reason = format!(
+            "type use was recognized in package {package_name}, but exact HIR resolution was unavailable"
+        );
+        let unknown = self.unknown_node("rust_type", specifier, path, span, &reason)?;
+        Ok(unresolved(unknown, &reason))
     }
 
     fn resolve_rust_path(
@@ -2346,6 +2538,7 @@ fn rust_profile(
             "rust_hir_project_external_count": 0,
             "rust_hir_semantic_node_count": 0,
             "rust_hir_semantic_relation_count": 0,
+            "rust_hir_semantic_site_count": 0,
             "rust_hir_semantic_issue_count": 0,
             "rust_hir_cfg_profile": "debug-unwind",
             "rust_hir_integration_policy": RUST_HIR_INTEGRATION_POLICY,
