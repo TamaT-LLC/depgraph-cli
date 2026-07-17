@@ -251,6 +251,18 @@ Preflight and DTO failures use repository-relative inventory paths and bounded
 reason categories; raw Cargo stderr, mirror paths, and rejected external path
 values do not become diagnostic messages or identities.
 
+The HIR definition graph requires a validated confined Cargo crate graph, so a
+real metadata fallback intentionally omits HIR `symbol` / `type` nodes and
+semantic relations. Metadata success and static fallback are different
+analysis outcomes: because their effective crate/target models differ, neither
+the full graph nor target/module syntax identities are required to match across
+those outcomes. Each outcome remains checkout-independent and repeatable for
+the same inputs. The missing semantic delta must be explicit in profile
+properties, diagnostics, and coverage. Full HIR graph equality is required
+only when the confined dependency snapshot, toolchain, requested profile, and
+semantic capability are the same; the final cross-outcome fallback matrix is
+tracked by Issue #29.
+
 Integrity failures are different: the current core already treats a missing or
 modified release-owned worker as a security error. Before the HIR definition
 backend is declared release-ready, its release gate must additionally reject

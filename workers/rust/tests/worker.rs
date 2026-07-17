@@ -1700,7 +1700,7 @@ version = "0.1.0"
 }
 
 #[test]
-fn graph_ids_are_independent_of_checkout_and_metadata_fallback() {
+fn graph_ids_are_independent_of_checkout_and_regenerated_lockfile() {
     let first_temp = tempfile::tempdir().unwrap();
     let second_temp = tempfile::tempdir().unwrap();
     let first_root = first_temp.path().join("one");
@@ -1710,6 +1710,22 @@ fn graph_ids_are_independent_of_checkout_and_metadata_fallback() {
     let first = scan(&first_root).unwrap();
     fs::remove_file(second_root.join("Cargo.lock")).unwrap();
     let second = scan(&second_root).unwrap();
+
+    assert_eq!(
+        first.profile.properties["crate_graph_source"],
+        "confined-cargo-metadata"
+    );
+    assert_eq!(
+        second.profile.properties["crate_graph_source"],
+        "confined-cargo-metadata"
+    );
+    assert!(first.edges.iter().any(|edge| edge.phase == Phase::Semantic));
+    assert!(
+        second
+            .edges
+            .iter()
+            .any(|edge| edge.phase == Phase::Semantic)
+    );
     assert_eq!(
         first.nodes.iter().map(|node| &node.id).collect::<Vec<_>>(),
         second.nodes.iter().map(|node| &node.id).collect::<Vec<_>>()
@@ -1722,6 +1738,89 @@ fn graph_ids_are_independent_of_checkout_and_metadata_fallback() {
         first.edges.iter().map(|edge| &edge.id).collect::<Vec<_>>(),
         second.edges.iter().map(|edge| &edge.id).collect::<Vec<_>>()
     );
+}
+
+#[test]
+fn metadata_fallback_is_explicit_and_checkout_stable() {
+    let metadata_temp = tempfile::tempdir().unwrap();
+    let first_temp = tempfile::tempdir().unwrap();
+    let second_temp = tempfile::tempdir().unwrap();
+    let metadata_root = metadata_temp.path().join("metadata");
+    let first_root = first_temp.path().join("fallback-one");
+    let second_root = second_temp.path().join("fallback-two");
+    copy_tree(&fixture(), &metadata_root);
+    copy_tree(&fixture(), &first_root);
+    copy_tree(&fixture(), &second_root);
+    fs::write(first_root.join("Cargo.lock"), "[[package").unwrap();
+    fs::write(second_root.join("Cargo.lock"), "[[package").unwrap();
+
+    let metadata = scan(&metadata_root).unwrap();
+    let first = scan(&first_root).unwrap();
+    let repeated = scan(&first_root).unwrap();
+    let second = scan(&second_root).unwrap();
+    assert!(
+        metadata
+            .edges
+            .iter()
+            .any(|edge| edge.phase == Phase::Semantic)
+    );
+
+    for fallback in [&first, &repeated, &second] {
+        assert_eq!(
+            fallback.profile.properties["crate_graph_source"],
+            "static-manifest-fallback"
+        );
+        assert_eq!(
+            fallback.profile.properties["rust_hir_status"],
+            "not-invoked"
+        );
+        assert!(
+            fallback
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "CARGO_METADATA_FALLBACK")
+        );
+        assert!(
+            fallback
+                .coverage
+                .reasons
+                .iter()
+                .any(|reason| reason == "rust-hir-crate-graph-unavailable")
+        );
+        assert!(
+            !fallback
+                .nodes
+                .iter()
+                .any(|node| matches!(node.kind.as_str(), "symbol" | "type"))
+        );
+        assert!(
+            !fallback
+                .edges
+                .iter()
+                .any(|edge| edge.phase == Phase::Semantic)
+        );
+    }
+
+    let graph_ids = |result: &depgraph_rust_worker::ScanResult| {
+        let node_ids = result
+            .nodes
+            .iter()
+            .map(|node| node.id.clone())
+            .collect::<BTreeSet<_>>();
+        let site_ids = result
+            .sites
+            .iter()
+            .map(|site| site.id.clone())
+            .collect::<BTreeSet<_>>();
+        let edge_ids = result
+            .edges
+            .iter()
+            .map(|edge| edge.id.clone())
+            .collect::<BTreeSet<_>>();
+        (node_ids, site_ids, edge_ids)
+    };
+    assert_eq!(graph_ids(&first), graph_ids(&repeated));
+    assert_eq!(graph_ids(&first), graph_ids(&second));
 }
 
 #[test]
