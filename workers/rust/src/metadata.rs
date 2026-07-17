@@ -1,6 +1,9 @@
-use crate::manifest::{
-    Dependency, DependencyKind, ManifestDocument, Package, Target, dependency_condition,
-    normalize_feature_map, normalize_path, slash_path,
+use crate::{
+    cargo_mirror::CargoInputMirror,
+    manifest::{
+        Dependency, DependencyKind, ManifestDocument, Package, Target, dependency_condition,
+        normalize_feature_map, normalize_path, slash_path,
+    },
 };
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -17,6 +20,7 @@ use tempfile::{Builder as TempDirBuilder, TempDir};
 pub(crate) struct LockIndex {
     versions_by_name: BTreeMap<String, BTreeSet<String>>,
     owner_dependencies: BTreeMap<(String, String, String), String>,
+    source: Option<Vec<u8>>,
     pub path: Option<String>,
     pub failure: Option<LockFailure>,
 }
@@ -89,21 +93,36 @@ impl LockIndex {
                 "Cargo.lock does not resolve to a regular file within the scan root",
             );
         }
-        let Ok(source) = std::fs::read_to_string(&canonical_path) else {
+        let Ok(source) = std::fs::read(&canonical_path) else {
             return Self::failed(
                 lexical_path,
                 "RUST_LOCKFILE_READ",
                 "Cargo.lock could not be read in safe mode",
             );
         };
-        let Ok(value) = toml::from_str::<toml::Value>(&source) else {
+        let Ok(source_text) = std::str::from_utf8(&source) else {
+            return Self::failed(
+                lexical_path,
+                "RUST_LOCKFILE_PARSE",
+                "Cargo.lock is not valid UTF-8 TOML",
+            );
+        };
+        let Ok(value) = toml::from_str::<toml::Value>(source_text) else {
             return Self::failed(
                 lexical_path,
                 "RUST_LOCKFILE_PARSE",
                 "Cargo.lock is not valid TOML",
             );
         };
+        if contains_local_file_url(&value) {
+            return Self::failed(
+                lexical_path,
+                "RUST_LOCKFILE_PATH_CONFINEMENT",
+                "Cargo.lock contains a local file URL source that is not admitted",
+            );
+        }
         let mut index = Self {
+            source: Some(source),
             path: Some(lexical_path),
             ..Self::default()
         };
@@ -117,11 +136,8 @@ impl LockIndex {
             ) else {
                 continue;
             };
-            if package
-                .get("source")
-                .and_then(toml::Value::as_str)
-                .is_some()
-            {
+            let source = package.get("source").and_then(toml::Value::as_str);
+            if source.is_some() {
                 index
                     .versions_by_name
                     .entry(name.into())
@@ -193,6 +209,19 @@ impl LockIndex {
                     .and_then(|versions| versions.first().map(String::as_str))
             })
     }
+
+    pub(crate) fn source(&self) -> Option<&[u8]> {
+        self.source.as_deref()
+    }
+}
+
+fn contains_local_file_url(value: &toml::Value) -> bool {
+    match value {
+        toml::Value::String(value) => value.to_ascii_lowercase().contains("file:"),
+        toml::Value::Array(values) => values.iter().any(contains_local_file_url),
+        toml::Value::Table(values) => values.values().any(contains_local_file_url),
+        _ => false,
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -238,6 +267,55 @@ struct MetadataTarget {
 impl CargoMetadata {
     pub fn workspace_root(&self) -> &Path {
         &self.workspace_root
+    }
+
+    fn remap_paths_with(mut self, mut remap: impl FnMut(&Path) -> Result<PathBuf>) -> Result<Self> {
+        self.workspace_root = remap(&self.workspace_root)
+            .context("remap cargo metadata workspace root to inventory")?;
+        for package in &mut self.packages {
+            package.manifest_path = remap(&package.manifest_path)
+                .context("remap cargo metadata manifest to inventory")?;
+            for dependency in &mut package.dependencies {
+                if let Some(path) = &dependency.path {
+                    dependency.path = Some(
+                        remap(path).context("remap cargo metadata path dependency to inventory")?,
+                    );
+                }
+            }
+            for target in &mut package.targets {
+                target.src_path =
+                    remap(&target.src_path).context("remap cargo metadata target to inventory")?;
+            }
+        }
+        Ok(self)
+    }
+
+    fn remap_from_mirror(mut self, mirror: &CargoInputMirror) -> Result<Self> {
+        let mut stable_ids = BTreeMap::new();
+        for package in &self.packages {
+            for dependency in &package.dependencies {
+                validate_dependency_source(dependency.source.as_deref(), mirror.project_root())?;
+            }
+            stable_ids.insert(
+                package.id.clone(),
+                mirror
+                    .stable_manifest_id(&package.manifest_path)
+                    .context("map cargo package identity to inventory")?,
+            );
+        }
+        for package in &mut self.packages {
+            package.id = stable_ids
+                .get(&package.id)
+                .cloned()
+                .context("cargo package identity is not admitted")?;
+        }
+        for member in &mut self.workspace_members {
+            *member = stable_ids
+                .get(member)
+                .cloned()
+                .context("cargo workspace member identity is not admitted")?;
+        }
+        self.remap_paths_with(|path| mirror.remap_path(path).map_err(anyhow::Error::from))
     }
 
     pub fn into_packages(
@@ -286,7 +364,10 @@ impl CargoMetadata {
             for target in package.targets {
                 let src_path = normalize_path(&target.src_path);
                 if !src_path.starts_with(root) {
-                    continue;
+                    bail!(
+                        "cargo metadata target for {} is outside the inventory",
+                        package.name
+                    );
                 }
                 let kind = target
                     .kind
@@ -320,7 +401,7 @@ impl CargoMetadata {
             let dependencies = package
                 .dependencies
                 .into_iter()
-                .map(|dependency| {
+                .map(|dependency| -> Result<Dependency> {
                     let kind = match dependency.kind.as_deref() {
                         Some("dev") => DependencyKind::Development,
                         Some("build") => DependencyKind::Build,
@@ -329,11 +410,18 @@ impl CargoMetadata {
                     let alias = dependency.rename.unwrap_or_else(|| dependency.name.clone());
                     let locked_version =
                         lock.resolve(&package.name, &package.version, &dependency.name);
-                    Dependency {
+                    let path = dependency.path.map(|path| normalize_path(&path));
+                    if path.as_ref().is_some_and(|path| !path.starts_with(root)) {
+                        bail!(
+                            "cargo metadata path dependency for {} is outside the inventory",
+                            package.name
+                        );
+                    }
+                    Ok(Dependency {
                         alias: alias.clone(),
                         package: dependency.name,
                         version: Some(locked_version.map(str::to_owned).unwrap_or(dependency.req)),
-                        path: dependency.path.map(|path| normalize_path(&path)),
+                        path,
                         kind,
                         condition: dependency_condition(
                             kind,
@@ -345,9 +433,9 @@ impl CargoMetadata {
                         target: dependency.target,
                         source: dependency.source,
                         locked: locked_version.is_some(),
-                    }
+                    })
                 })
-                .collect();
+                .collect::<Result<Vec<_>>>()?;
             packages.push(Package {
                 name: package.name,
                 version: package.version,
@@ -370,9 +458,35 @@ impl CargoMetadata {
     }
 }
 
-pub(crate) fn run_cargo_metadata(root: &Path, manifest_path: &Path) -> Result<CargoMetadata> {
+fn validate_dependency_source(source: Option<&str>, mirror_root: &Path) -> Result<()> {
+    let Some(source) = source else {
+        return Ok(());
+    };
+    if source.to_ascii_lowercase().contains("file:")
+        || source.contains(mirror_root.to_string_lossy().as_ref())
+    {
+        bail!("cargo metadata dependency source is not confined");
+    }
+    Ok(())
+}
+
+pub(crate) fn run_cargo_metadata(
+    root: &Path,
+    manifest_path: &Path,
+    documents: &[ManifestDocument],
+) -> Result<(CargoMetadata, LockIndex)> {
+    let workspace_directory = CargoInputMirror::workspace_directory(root, manifest_path, documents)
+        .context("resolve confined Cargo workspace inventory")?;
+    let lock = LockIndex::read(root, &workspace_directory);
+    if lock.failure.is_some() {
+        bail!("Cargo.lock failed safe metadata preflight");
+    }
+    // The mirror is materialized before tool resolution or process launch, so
+    // rejected path-bearing input cannot reach `cargo metadata`.
+    let mirror = CargoInputMirror::materialize(root, manifest_path, documents, lock.source())
+        .context("preflight and materialize confined Cargo input")?;
     let cargo = resolve_safe_tool("cargo", root)?;
-    let neutral = neutral_environment(root)?;
+    let cargo_cwd = neutral_cargo_working_directory(mirror.neutral_root())?;
     let mut command = Command::new(cargo);
     command
         .arg("metadata")
@@ -382,15 +496,15 @@ pub(crate) fn run_cargo_metadata(root: &Path, manifest_path: &Path) -> Result<Ca
         .arg("--frozen")
         .arg("--offline")
         .arg("--manifest-path")
-        .arg(manifest_path)
-        // Cargo and rustup discover .cargo/config.toml and rust-toolchain.toml
-        // by walking upward from cwd. The manifest path is absolute, so use a
-        // neutral cwd and never expose project configuration to the toolchain.
-        .current_dir(neutral.path());
+        .arg(mirror.manifest_path())
+        // Cargo and rustup discover configuration by walking upward from cwd.
+        // Start at a checked filesystem anchor so neither project nor
+        // temporary-directory ancestors can contribute configuration.
+        .current_dir(cargo_cwd);
     configure_cargo_safety_environment(&mut command);
     let safe_path = sanitized_path(root)?;
     command.env("PATH", safe_path);
-    configure_path_environment(&mut command, root, neutral.path())?;
+    configure_path_environment(&mut command, root, mirror.neutral_root())?;
     for key in ["LANG", "LC_ALL"] {
         if let Some(value) = std::env::var_os(key) {
             command.env(key, value);
@@ -407,7 +521,30 @@ pub(crate) fn run_cargo_metadata(root: &Path, manifest_path: &Path) -> Result<Ca
     if !output.status.success() {
         bail!("cargo metadata exited unsuccessfully");
     }
-    serde_json::from_slice(&output.stdout).context("decode cargo metadata JSON DTO")
+    let metadata: CargoMetadata =
+        serde_json::from_slice(&output.stdout).context("decode cargo metadata JSON DTO")?;
+    Ok((metadata.remap_from_mirror(&mirror)?, lock))
+}
+
+fn neutral_cargo_working_directory(neutral: &Path) -> Result<PathBuf> {
+    let anchor = neutral
+        .ancestors()
+        .last()
+        .filter(|path| path.is_absolute() && path.is_dir())
+        .context("neutral Cargo filesystem anchor is unavailable")?
+        .to_path_buf();
+    for candidate in [
+        anchor.join(".cargo"),
+        anchor.join("rust-toolchain"),
+        anchor.join("rust-toolchain.toml"),
+    ] {
+        match fs::symlink_metadata(&candidate) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => bail!("neutral Cargo filesystem anchor could not be inspected"),
+            Ok(_) => bail!("neutral Cargo filesystem anchor contains toolchain configuration"),
+        }
+    }
+    Ok(anchor)
 }
 
 fn configure_cargo_safety_environment(command: &mut Command) {
@@ -458,18 +595,31 @@ fn configure_path_environment(command: &mut Command, root: &Path, neutral: &Path
         ("TEMP", "tmp"),
         ("TMP", "tmp"),
         ("CARGO_HOME", "cargo-home"),
-        ("RUSTUP_HOME", "rustup-home"),
     ];
     for (key, fallback_name) in fallbacks {
         let fallback = neutral.join(fallback_name);
         fs::create_dir_all(&fallback)
             .with_context(|| format!("create neutral {fallback_name} directory"))?;
-        let value = std::env::var_os(key)
-            .as_deref()
-            .and_then(|value| safe_external_directory(root, value))
-            .unwrap_or(fallback);
-        command.env(key, value);
+        command.env(key, fallback);
     }
+    // A resolved Cargo executable may be a rustup proxy. Keep only the
+    // installed, root-external rustup toolchain store; Cargo configuration and
+    // every writable directory remain worker-owned and fresh.
+    let rustup_home = std::env::var_os("RUSTUP_HOME")
+        .as_deref()
+        .and_then(|value| safe_external_directory(root, value))
+        .or_else(|| {
+            ["HOME", "USERPROFILE"].into_iter().find_map(|key| {
+                std::env::var_os(key)
+                    .map(PathBuf::from)
+                    .map(|home| home.join(".rustup"))
+                    .filter(|path| path.is_dir())
+                    .and_then(|path| safe_external_directory(root, path.as_os_str()))
+            })
+        })
+        .unwrap_or_else(|| neutral.join("rustup-home"));
+    fs::create_dir_all(&rustup_home).context("create neutral Rustup home")?;
+    command.env("RUSTUP_HOME", rustup_home);
     let target = neutral.join("cargo-target");
     fs::create_dir_all(&target).context("create neutral Cargo target directory")?;
     command.env("CARGO_TARGET_DIR", target);
@@ -546,15 +696,21 @@ pub(crate) fn apply_lock_versions(packages: &mut [Package], lock: &LockIndex) {
 #[cfg(test)]
 mod tests {
     use super::{
-        CargoMetadata, LockIndex, configure_cargo_safety_environment, neutral_environment,
-        safe_external_directory,
+        CargoMetadata, LockIndex, configure_cargo_safety_environment, configure_path_environment,
+        neutral_cargo_working_directory, neutral_environment, safe_external_directory,
+        validate_dependency_source,
     };
     #[cfg(unix)]
     use super::{resolve_safe_tool_on_path, sanitized_path_from};
     use crate::manifest::ManifestDocument;
     use depgraph_protocol::Condition;
     use serde_json::{Value, json};
-    use std::{ffi::OsStr, path::Path, process::Command};
+    use std::{
+        collections::BTreeMap,
+        ffi::OsStr,
+        path::{Path, PathBuf},
+        process::Command,
+    };
 
     #[test]
     fn cargo_metadata_disables_rustup_auto_install() {
@@ -586,6 +742,83 @@ mod tests {
         );
         let neutral = neutral_environment(&root).expect("neutral environment");
         assert!(!neutral.path().starts_with(&root));
+    }
+
+    #[test]
+    fn cargo_configuration_and_writable_paths_are_always_worker_owned() {
+        let temp = tempfile::tempdir().expect("temporary parent");
+        let root = temp.path().join("repository");
+        let neutral = temp.path().join("neutral");
+        std::fs::create_dir_all(&root).expect("repository directory");
+        std::fs::create_dir_all(&neutral).expect("neutral directory");
+        let root = root.canonicalize().expect("canonical repository");
+        let neutral = neutral.canonicalize().expect("canonical neutral");
+        let mut command = Command::new("cargo");
+
+        configure_path_environment(&mut command, &root, &neutral)
+            .expect("neutral Cargo environment");
+
+        let environment = command
+            .get_envs()
+            .filter_map(|(key, value)| Some((key.to_owned(), value?.to_owned())))
+            .collect::<BTreeMap<_, _>>();
+        for (key, directory) in [
+            ("HOME", "home"),
+            ("USERPROFILE", "home"),
+            ("TMPDIR", "tmp"),
+            ("TEMP", "tmp"),
+            ("TMP", "tmp"),
+            ("CARGO_HOME", "cargo-home"),
+            ("CARGO_TARGET_DIR", "cargo-target"),
+        ] {
+            assert_eq!(
+                environment.get(OsStr::new(key)),
+                Some(&neutral.join(directory).into_os_string())
+            );
+        }
+    }
+
+    #[test]
+    fn cargo_cwd_does_not_inherit_temporary_directory_configuration() {
+        let temp = tempfile::tempdir().expect("temporary parent");
+        let neutral = temp.path().join("nested/neutral");
+        std::fs::create_dir_all(temp.path().join(".cargo")).expect("ancestor Cargo directory");
+        std::fs::create_dir_all(&neutral).expect("neutral directory");
+        std::fs::write(
+            temp.path().join(".cargo/config.toml"),
+            "[build]\nrustc-wrapper = '/must/not/run'\n",
+        )
+        .expect("ancestor Cargo config");
+
+        let cwd = neutral_cargo_working_directory(&neutral).expect("checked Cargo cwd");
+
+        assert!(cwd.is_absolute());
+        assert!(!cwd.starts_with(temp.path()));
+        assert_eq!(cwd.parent(), None);
+    }
+
+    #[test]
+    fn lockfile_local_file_sources_fail_closed_before_cargo() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().canonicalize().expect("canonical workspace");
+        std::fs::write(
+            root.join("Cargo.lock"),
+            r#"version = 4
+
+[[package]]
+name = "local-source"
+version = "1.0.0"
+source = "git+file:///outside/repository#deadbeef"
+"#,
+        )
+        .expect("test lockfile");
+
+        let lock = LockIndex::read(&root, &root);
+
+        let failure = lock.failure.expect("local file source must fail closed");
+        assert_eq!(failure.code, "RUST_LOCKFILE_PATH_CONFINEMENT");
+        assert_eq!(failure.path, "Cargo.lock");
+        assert!(!failure.reason.contains("/outside"));
     }
 
     #[cfg(unix)]
@@ -633,6 +866,150 @@ mod tests {
                 .canonicalize()
                 .expect("canonical rustc"),
             external_bin.join("rustc").canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn metadata_paths_are_remapped_before_the_dto_leaves_the_boundary() {
+        let mirror = Path::new("/neutral/mirror");
+        let original = Path::new("/inventory");
+        let package_id = "path+file:///neutral/mirror/member#0.1.0";
+        let metadata: CargoMetadata = serde_json::from_value(json!({
+            "packages": [{
+                "id": package_id,
+                "name": "member",
+                "version": "0.1.0",
+                "edition": "2024",
+                "manifest_path": mirror.join("member/Cargo.toml"),
+                "features": {},
+                "dependencies": [{
+                    "name": "local",
+                    "source": null,
+                    "req": "*",
+                    "kind": null,
+                    "rename": null,
+                    "optional": false,
+                    "target": null,
+                    "path": mirror.join("local")
+                }],
+                "targets": [{
+                    "name": "member",
+                    "kind": ["lib"],
+                    "crate_types": ["lib"],
+                    "src_path": mirror.join("member/src/lib.rs")
+                }]
+            }],
+            "workspace_members": [package_id],
+            "workspace_root": mirror
+        }))
+        .expect("valid metadata DTO");
+        let mappings = BTreeMap::from([
+            (mirror.to_path_buf(), original.to_path_buf()),
+            (
+                mirror.join("member/Cargo.toml"),
+                original.join("member/Cargo.toml"),
+            ),
+            (mirror.join("local"), original.join("local")),
+            (
+                mirror.join("member/src/lib.rs"),
+                original.join("member/src/lib.rs"),
+            ),
+        ]);
+
+        let remapped = metadata
+            .remap_paths_with(|path| {
+                mappings
+                    .get(path)
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("unknown mirror path"))
+            })
+            .expect("every returned path is admitted");
+
+        assert_eq!(remapped.workspace_root, original);
+        assert_eq!(
+            remapped.packages[0].manifest_path,
+            original.join("member/Cargo.toml")
+        );
+        assert_eq!(
+            remapped.packages[0].dependencies[0].path,
+            Some(original.join("local"))
+        );
+        assert_eq!(
+            remapped.packages[0].targets[0].src_path,
+            original.join("member/src/lib.rs")
+        );
+        let serialized = serde_json::to_string(&json!({
+            "workspace_root": &remapped.workspace_root,
+            "manifest": &remapped.packages[0].manifest_path,
+            "dependency": &remapped.packages[0].dependencies[0].path,
+            "target": &remapped.packages[0].targets[0].src_path,
+        }))
+        .unwrap();
+        assert!(!serialized.contains("/neutral/mirror"));
+    }
+
+    #[test]
+    fn metadata_rejects_a_path_that_is_not_in_the_mirror_inventory() {
+        let package_id = "path+file:///neutral/mirror/member#0.1.0";
+        let metadata: CargoMetadata = serde_json::from_value(json!({
+            "packages": [{
+                "id": package_id,
+                "name": "member",
+                "version": "0.1.0",
+                "edition": "2024",
+                "manifest_path": "/neutral/mirror/member/Cargo.toml",
+                "features": {},
+                "dependencies": [],
+                "targets": [{
+                    "name": "member",
+                    "kind": ["lib"],
+                    "crate_types": ["lib"],
+                    "src_path": "/outside/secret.rs"
+                }]
+            }],
+            "workspace_members": [package_id],
+            "workspace_root": "/neutral/mirror"
+        }))
+        .expect("valid metadata DTO");
+        let mappings = BTreeMap::from([
+            (
+                PathBuf::from("/neutral/mirror"),
+                PathBuf::from("/inventory"),
+            ),
+            (
+                PathBuf::from("/neutral/mirror/member/Cargo.toml"),
+                PathBuf::from("/inventory/member/Cargo.toml"),
+            ),
+        ]);
+
+        assert!(
+            metadata
+                .remap_paths_with(|path| {
+                    mappings
+                        .get(path)
+                        .cloned()
+                        .ok_or_else(|| anyhow::anyhow!("unknown mirror path"))
+                })
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn metadata_dependency_sources_cannot_name_local_or_mirror_files() {
+        let mirror = Path::new("/neutral/mirror");
+        assert!(validate_dependency_source(None, mirror).is_ok());
+        assert!(
+            validate_dependency_source(
+                Some("registry+https://github.com/rust-lang/crates.io-index"),
+                mirror,
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_dependency_source(Some("path+file:///neutral/mirror/local"), mirror).is_err()
+        );
+        assert!(
+            validate_dependency_source(Some("registry+/neutral/mirror/index"), mirror).is_err()
         );
     }
 
