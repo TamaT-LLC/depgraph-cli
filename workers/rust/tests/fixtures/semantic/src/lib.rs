@@ -1,3 +1,4 @@
+pub mod calls;
 pub mod domain;
 
 use domain::{Named as NameContract, Status};
@@ -29,7 +30,7 @@ where
 {
     let _ = (value, external, Status::Ready);
     let _ = std::mem::size_of::<Option<MissingImport>>();
-    todo!()
+    loop {}
 }
 
 pub fn exercise(input: u32) -> domain::Envelope<u32> {

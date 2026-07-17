@@ -190,6 +190,181 @@ fn rust_semantic_import_candidates_are_sorted_and_emit_one_edge_per_target() {
 }
 
 #[test]
+fn rust_semantic_direct_calls_enforce_language_condition_and_stable_mapping() {
+    let input = values_to_ndjson(rust_semantic_call_values());
+    assert!(schema_accepts_stream(&input));
+    assert!(semantic_schema_accepts_stream(&input));
+    let validated = validate_safe_semantic_ndjson(Cursor::new(input))
+        .expect("Rust semantic direct call must validate");
+    let site = validated
+        .sites
+        .values()
+        .find(|site| site.kind == "call")
+        .expect("Rust call site");
+    assert_eq!(site.resolution_status, ResolutionStatus::Resolved);
+    assert_eq!(site.precision, Precision::Exact);
+    assert_eq!(site.target_ids.len(), 1);
+    assert_eq!(validated.nodes[&site.source].properties["language"], "rust");
+    assert_eq!(
+        validated.nodes[&site.target_ids[0]].properties["language"],
+        "rust"
+    );
+    assert_eq!(
+        site.id,
+        stable_id_from_value("site", &site_identity(site, &site.evidence[0]))
+    );
+
+    let edge = validated
+        .edges
+        .values()
+        .find(|edge| edge.site_id.as_deref() == Some(site.id.as_str()))
+        .expect("Rust calls edge");
+    assert_eq!(edge.kind, "calls");
+    assert_eq!(edge.phase, Phase::Semantic);
+    assert_eq!(edge.condition, site.condition);
+    assert_eq!(edge.source, site.source);
+    assert_eq!(edge.target, site.target_ids[0]);
+    assert_eq!(
+        edge.id,
+        stable_id_from_value(
+            "edge",
+            &json!({
+                "kind": "calls",
+                "site_id": site.id,
+                "target": edge.target,
+            }),
+        )
+    );
+}
+
+#[test]
+fn rust_semantic_candidate_calls_require_algorithm_on_site_and_edges() {
+    let events = rust_semantic_candidate_call_values();
+    let input = values_to_ndjson(events.clone());
+    assert!(schema_accepts_stream(&input));
+    assert!(semantic_schema_accepts_stream(&input));
+    let validated = validate_safe_semantic_ndjson(Cursor::new(input))
+        .expect("Rust semantic candidate call must validate");
+    let site = validated
+        .sites
+        .values()
+        .find(|site| site.kind == "call")
+        .expect("Rust candidate call site");
+    assert_eq!(site.resolution_status, ResolutionStatus::Candidates);
+    assert_eq!(site.precision, Precision::Overapprox);
+    assert_eq!(
+        site.evidence[0].properties["algorithm"],
+        "rust-analyzer-local-trait-impls-v1"
+    );
+    let edge = validated
+        .edges
+        .values()
+        .find(|edge| edge.site_id.as_deref() == Some(site.id.as_str()))
+        .expect("Rust may_call edge");
+    assert_eq!(edge.kind, "may_call");
+    assert_eq!(
+        edge.evidence[0].properties["algorithm"],
+        "rust-analyzer-local-trait-impls-v1"
+    );
+
+    for owner in ["site", "edge"] {
+        let mut missing = events.clone();
+        let site_id = semantic_site_id(&missing, "call");
+        let properties = if owner == "site" {
+            &mut missing
+                .iter_mut()
+                .find(|event| event["event"] == "dependency_site" && event["site"]["id"] == site_id)
+                .expect("candidate call site")["site"]["evidence"][0]["properties"]
+        } else {
+            &mut linked_edge_mut(&mut missing, &site_id)["evidence"][0]["properties"]
+        };
+        properties
+            .as_object_mut()
+            .expect("semantic evidence properties")
+            .remove("algorithm");
+        let input = values_to_ndjson(missing);
+        assert!(schema_accepts_stream(&input), "{owner} algorithm case");
+        assert!(validate_safe_ndjson(Cursor::new(&input)).is_ok());
+        assert!(
+            validate_safe_semantic_ndjson(Cursor::new(input)).is_err(),
+            "Rust candidate call accepted without {owner} algorithm"
+        );
+    }
+}
+
+#[test]
+fn rust_semantic_call_contract_rejects_language_condition_and_mapping_drift() {
+    let mut cases = Vec::<(&str, Vec<Value>)>::new();
+
+    let mut wrong_source_language = rust_semantic_call_values();
+    let call_site_id = semantic_site_id(&wrong_source_language, "call");
+    let source_id = wrong_source_language
+        .iter()
+        .find(|event| event["event"] == "dependency_site" && event["site"]["id"] == call_site_id)
+        .expect("Rust call site")["site"]["source"]
+        .as_str()
+        .expect("call source")
+        .to_owned();
+    wrong_source_language
+        .iter_mut()
+        .find(|event| event["event"] == "node_upsert" && event["node"]["id"] == source_id)
+        .expect("call source node")["node"]["properties"]["language"] = json!("go");
+    cases.push(("source language", wrong_source_language));
+
+    let mut wrong_target_language = rust_semantic_call_values();
+    let call_site_id = semantic_site_id(&wrong_target_language, "call");
+    let target_id = wrong_target_language
+        .iter()
+        .find(|event| event["event"] == "dependency_site" && event["site"]["id"] == call_site_id)
+        .expect("Rust call site")["site"]["target_ids"][0]
+        .as_str()
+        .expect("call target")
+        .to_owned();
+    wrong_target_language
+        .iter_mut()
+        .find(|event| event["event"] == "node_upsert" && event["node"]["id"] == target_id)
+        .expect("call target node")["node"]["properties"]["language"] = json!("go");
+    cases.push(("target language", wrong_target_language));
+
+    let mut mismatched_condition = rust_semantic_call_values();
+    let call_site_id = semantic_site_id(&mismatched_condition, "call");
+    linked_edge_mut(&mut mismatched_condition, &call_site_id)["condition"] =
+        json!({"op":"eq","key":"rust.feature","value":"other"});
+    cases.push(("edge/site condition", mismatched_condition));
+
+    let mut wrong_mapping = rust_semantic_call_values();
+    let call_site_id = semantic_site_id(&wrong_mapping, "call");
+    let edge = linked_edge_mut(&mut wrong_mapping, &call_site_id);
+    edge["kind"] = json!("depends_on");
+    rehash_json_edge(edge);
+    cases.push(("call edge mapping", wrong_mapping));
+
+    let mut unstable_site_id = rust_semantic_call_values();
+    let old_site_id = semantic_site_id(&unstable_site_id, "call");
+    let edge = linked_edge_mut(&mut unstable_site_id, &old_site_id);
+    edge["site_id"] = json!("site:not-the-canonical-hash");
+    rehash_json_edge(edge);
+    unstable_site_id
+        .iter_mut()
+        .find(|event| event["event"] == "dependency_site" && event["site"]["id"] == old_site_id)
+        .expect("Rust call site")["site"]["id"] = json!("site:not-the-canonical-hash");
+    cases.push(("stable site mapping", unstable_site_id));
+
+    for (name, events) in cases {
+        let input = values_to_ndjson(events);
+        assert!(schema_accepts_stream(&input), "base Schema rejected {name}");
+        assert!(
+            validate_safe_ndjson(Cursor::new(&input)).is_ok(),
+            "base validator rejected open-vocabulary {name} case"
+        );
+        assert!(
+            validate_safe_semantic_ndjson(Cursor::new(input)).is_err(),
+            "strict validator accepted Rust call {name} drift"
+        );
+    }
+}
+
+#[test]
 fn rust_semantic_imports_use_the_documented_external_and_unresolved_sentinels() {
     for (status, precision, target_id, target_kind, reason) in [
         (
@@ -1439,6 +1614,207 @@ fn rust_semantic_candidate_values() -> Vec<Value> {
     events
 }
 
+fn rust_semantic_call_values() -> Vec<Value> {
+    let mut events = rust_semantic_dependency_values();
+    let source_id = node_id_by_display_name(&events, "exercise");
+    let source_index = events
+        .iter()
+        .position(|event| event["event"] == "node_upsert" && event["node"]["id"] == source_id)
+        .expect("Rust call source node");
+    let mut target_event = events[source_index].clone();
+    let resolver_identity = "Cargo.toml#lib:rust_semantic_fixture:src/lib.rs::crate::callee";
+    target_event["seq"] = json!(0);
+    target_event["node"]["locator"] =
+        json!("rust-symbol:Cargo.toml#lib:rust_semantic_fixture:src/lib.rs::crate::callee");
+    target_event["node"]["display_name"] = json!("callee");
+    target_event["node"]["properties"]["resolver_identity"] = json!(resolver_identity);
+    target_event["node"]["properties"]["canonical_identity"]["resolver_identity"] =
+        json!(resolver_identity);
+    target_event["node"]["properties"]["source_span"] = json!({
+        "start_line": 10,
+        "start_column": 1,
+        "end_line": 10,
+        "end_column": 16,
+    });
+    let target_id = stable_id_from_value(
+        "symbol",
+        &target_event["node"]["properties"]["canonical_identity"],
+    );
+    target_event["node"]["id"] = json!(target_id);
+
+    let first_site = events
+        .iter()
+        .position(|event| event["event"] == "dependency_site")
+        .expect("Rust dependency sites");
+    events.insert(first_site, target_event);
+    let first_node = events
+        .iter()
+        .position(|event| event["event"] == "node_upsert")
+        .expect("Rust nodes");
+    let last_node = events
+        .iter()
+        .rposition(|event| event["event"] == "node_upsert")
+        .expect("Rust nodes");
+    events[first_node..=last_node].sort_by(|left, right| {
+        left["node"]["id"]
+            .as_str()
+            .cmp(&right["node"]["id"].as_str())
+    });
+
+    let profile_id = "cargo:rust-semantic-fixture:debug:host";
+    let crate_identity = "Cargo.toml#lib:rust_semantic_fixture:src/lib.rs";
+    let condition = json!({
+        "op": "eq",
+        "key": "rust.crate_instance",
+        "value": crate_identity,
+    });
+    let primary = json!({
+        "kind": "semantic",
+        "extractor": "rust-analyzer-hir",
+        "extractor_version": "0.0.330",
+        "path": "src/lib.rs",
+        "start_line": 5,
+        "start_column": 5,
+        "end_line": 5,
+        "end_column": 13,
+        "detail": "HIR exact function call",
+        "properties": {
+            "backend": "rust-analyzer-library",
+            "rust_analyzer_revision": "8954b66d43225e62c92e8bbcc8500191b5cceb1e",
+            "crate_identity": crate_identity,
+            "active_cfg": ["debug_assertions", "unix"],
+            "hir_kind": "function-call",
+            "dispatch": "static",
+        },
+    });
+    let source_evidence = json!({
+        "kind": "source",
+        "extractor": "rust-syntax",
+        "extractor_version": "0.1.0",
+        "path": "src/lib.rs",
+        "start_line": 5,
+        "start_column": 5,
+        "end_line": 5,
+        "end_column": 13,
+        "detail": "syntax evidence for call",
+        "properties": {},
+    });
+    let mut site = json!({
+        "id": "pending",
+        "source": source_id,
+        "kind": "call",
+        "specifier": "callee",
+        "resolution_status": "resolved",
+        "target_ids": [target_id],
+        "profile_id": profile_id,
+        "condition": condition,
+        "precision": "exact",
+        "evidence": [primary, source_evidence],
+    });
+    let site_id = rehash_json_site(&mut site);
+    let mut edge = json!({
+        "id": "pending",
+        "source": source_id,
+        "target": target_id,
+        "kind": "calls",
+        "site_id": site_id,
+        "phase": "semantic",
+        "environment": "any",
+        "profile_id": profile_id,
+        "condition": condition,
+        "resolution_status": "resolved",
+        "precision": "exact",
+        "generated": false,
+        "evidence": site["evidence"].clone(),
+    });
+    rehash_json_edge(&mut edge);
+
+    let first_edge = events
+        .iter()
+        .position(|event| event["event"] == "edge_upsert")
+        .expect("Rust semantic edges");
+    events.insert(
+        first_edge,
+        json!({
+            "event": "dependency_site",
+            "protocol_version": "1.0",
+            "scan_id": "scan-rust-semantic-golden",
+            "adapter": "rust",
+            "adapter_version": "0.1.0",
+            "seq": 0,
+            "site": site,
+        }),
+    );
+    sort_site_events(&mut events);
+    let file_completed = events
+        .iter()
+        .position(|event| event["event"] == "file_completed")
+        .expect("Rust file completion");
+    events.insert(
+        file_completed,
+        json!({
+            "event": "edge_upsert",
+            "protocol_version": "1.0",
+            "scan_id": "scan-rust-semantic-golden",
+            "adapter": "rust",
+            "adapter_version": "0.1.0",
+            "seq": 0,
+            "edge": edge,
+        }),
+    );
+    sort_edge_events(&mut events);
+
+    let file = events
+        .iter_mut()
+        .find(|event| event["event"] == "file_completed")
+        .expect("Rust file completion");
+    file["discovered_sites"] = json!(4);
+    file["emitted_sites"] = json!(4);
+    for event in &mut events {
+        if matches!(
+            event["event"].as_str(),
+            Some("profile_completed" | "scan_completed")
+        ) {
+            event["coverage"]["dependency_sites"] = json!(4);
+            event["coverage"]["resolved"] = json!(4);
+        }
+    }
+    resequence(&mut events);
+    events
+}
+
+fn rust_semantic_candidate_call_values() -> Vec<Value> {
+    let mut events = rust_semantic_call_values();
+    let site_id = semantic_site_id(&events, "call");
+    let site = events
+        .iter_mut()
+        .find(|event| event["event"] == "dependency_site" && event["site"]["id"] == site_id)
+        .expect("Rust candidate call site");
+    site["site"]["resolution_status"] = json!("candidates");
+    site["site"]["precision"] = json!("overapprox");
+    site["site"]["evidence"][0]["properties"]["algorithm"] =
+        json!("rust-analyzer-local-trait-impls-v1");
+
+    let edge = linked_edge_mut(&mut events, &site_id);
+    edge["kind"] = json!("may_call");
+    edge["resolution_status"] = json!("candidates");
+    edge["precision"] = json!("overapprox");
+    edge["evidence"][0]["properties"]["algorithm"] = json!("rust-analyzer-local-trait-impls-v1");
+    rehash_json_edge(edge);
+    sort_edge_events(&mut events);
+    for event in &mut events {
+        if matches!(
+            event["event"].as_str(),
+            Some("profile_completed" | "scan_completed")
+        ) {
+            event["coverage"]["resolved"] = json!(3);
+            event["coverage"]["candidates"] = json!(1);
+        }
+    }
+    resequence(&mut events);
+    events
+}
+
 fn rust_source_dependency_values() -> Vec<Value> {
     let mut events = rust_semantic_dependency_values();
     for event in &mut events {
@@ -1683,6 +2059,22 @@ fn sort_edge_events(events: &mut [Value]) {
         left["edge"]["id"]
             .as_str()
             .cmp(&right["edge"]["id"].as_str())
+    });
+}
+
+fn sort_site_events(events: &mut [Value]) {
+    let first = events
+        .iter()
+        .position(|event| event["event"] == "dependency_site")
+        .expect("dependency-site events");
+    let last = events
+        .iter()
+        .rposition(|event| event["event"] == "dependency_site")
+        .expect("dependency-site events");
+    events[first..=last].sort_by(|left, right| {
+        left["site"]["id"]
+            .as_str()
+            .cmp(&right["site"]["id"].as_str())
     });
 }
 

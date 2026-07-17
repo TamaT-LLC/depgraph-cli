@@ -11,7 +11,10 @@ use crate::{
         select_static_documents, slash_path, workspace_identity,
     },
     metadata::{LockIndex, apply_lock_versions, run_cargo_metadata},
-    source::{Occurrence, SourceSpan, TypeUseOccurrenceKey, UseOccurrenceKey, collect_occurrences},
+    source::{
+        CallOccurrenceKey, Occurrence, SourceSpan, TypeUseOccurrenceKey, UseOccurrenceKey,
+        collect_occurrences,
+    },
     toolchain::{RustToolchainProbe, ToolchainProbeStatus, probe_rust_toolchain},
 };
 use anyhow::{Context, Result, bail};
@@ -96,6 +99,7 @@ struct State {
     dependency_resolutions: BTreeMap<(usize, String), TargetResolution>,
     semantic_use_occurrences: BTreeSet<UseOccurrenceKey>,
     semantic_type_use_occurrences: BTreeSet<TypeUseOccurrenceKey>,
+    semantic_call_occurrences: BTreeSet<CallOccurrenceKey>,
     unsupported_syntax: u64,
     reasons: BTreeSet<String>,
 }
@@ -352,6 +356,7 @@ impl State {
             dependency_resolutions: BTreeMap::new(),
             semantic_use_occurrences: BTreeSet::new(),
             semantic_type_use_occurrences: BTreeSet::new(),
+            semantic_call_occurrences: BTreeSet::new(),
             unsupported_syntax: 0,
             reasons: BTreeSet::new(),
         }
@@ -775,10 +780,15 @@ impl State {
                 let node_count = delta.nodes.len() as u64;
                 let relation_count = delta.edges.len() as u64;
                 let site_count = delta.sites.len() as u64;
+                let call_site_count = delta
+                    .sites
+                    .iter()
+                    .filter(|site| site.kind == "call")
+                    .count() as u64;
                 let issue_count = delta.issues.len() as u64;
                 self.profile.properties.insert(
                     "analysis".into(),
-                    Value::String("syntax+hir-imports-types".into()),
+                    Value::String("syntax+hir-imports-types-calls".into()),
                 );
                 self.profile.properties.insert(
                     "analysis_backend".into(),
@@ -792,16 +802,16 @@ impl State {
                     "rust_hir_status".into(),
                     Value::String(
                         if issue_count == 0 {
-                            "import-type-graph-emitted"
+                            "import-type-call-graph-emitted"
                         } else {
-                            "import-type-graph-partial"
+                            "import-type-call-graph-partial"
                         }
                         .into(),
                     ),
                 );
                 self.profile.properties.insert(
                     "rust_hir_enable_gate".into(),
-                    Value::String("call-and-release-gates-pending".into()),
+                    Value::String("fallback-and-release-gates-pending".into()),
                 );
                 self.profile.properties.insert(
                     "rust_hir_semantic_node_count".into(),
@@ -814,6 +824,10 @@ impl State {
                 self.profile.properties.insert(
                     "rust_hir_semantic_site_count".into(),
                     Value::from(site_count),
+                );
+                self.profile.properties.insert(
+                    "rust_hir_semantic_call_site_count".into(),
+                    Value::from(call_site_count),
                 );
                 self.profile.properties.insert(
                     "rust_hir_semantic_issue_count".into(),
@@ -986,6 +1000,17 @@ impl State {
                 delta.refined_type_use_keys.len()
             );
         }
+        let semantic_call_sites = delta
+            .sites
+            .iter()
+            .filter(|site| site.kind == "call")
+            .count();
+        if semantic_call_sites != delta.refined_call_keys.len() {
+            bail!(
+                "semantic call refinement ledger has {semantic_call_sites} sites but {} occurrence keys",
+                delta.refined_call_keys.len()
+            );
+        }
         let nodes_vec: Vec<_> = nodes.values().cloned().collect();
         let edges_vec: Vec<_> = edges.values().cloned().collect();
         let sites_vec: Vec<_> = sites.values().cloned().collect();
@@ -999,6 +1024,8 @@ impl State {
             .extend(delta.refined_use_keys.iter().cloned());
         self.semantic_type_use_occurrences
             .extend(delta.refined_type_use_keys.iter().cloned());
+        self.semantic_call_occurrences
+            .extend(delta.refined_call_keys.iter().cloned());
         Ok(())
     }
 
@@ -1713,6 +1740,7 @@ impl State {
                         )?;
                         self.increment_file_site(&source.rel_path);
                     }
+                    Occurrence::Call { .. } => {}
                     Occurrence::Module { inline: true, .. } => {}
                 }
             }
@@ -2539,6 +2567,7 @@ fn rust_profile(
             "rust_hir_semantic_node_count": 0,
             "rust_hir_semantic_relation_count": 0,
             "rust_hir_semantic_site_count": 0,
+            "rust_hir_semantic_call_site_count": 0,
             "rust_hir_semantic_issue_count": 0,
             "rust_hir_cfg_profile": "debug-unwind",
             "rust_hir_integration_policy": RUST_HIR_INTEGRATION_POLICY,

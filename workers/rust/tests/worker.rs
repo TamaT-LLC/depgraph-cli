@@ -100,7 +100,7 @@ fn typed_output_validates_and_contains_all_nine_events() {
 }
 
 #[test]
-fn hir_import_type_graph_emits_exact_nodes_sites_and_relations() {
+fn hir_import_type_call_graph_emits_exact_nodes_sites_and_relations() {
     let result = scan(&semantic_fixture()).unwrap();
     let events = build_events("rust-semantic-fixture", &result).unwrap();
     let mut ndjson = Vec::new();
@@ -112,7 +112,7 @@ fn hir_import_type_graph_emits_exact_nodes_sites_and_relations() {
 
     assert_eq!(
         result.profile.properties["analysis"],
-        "syntax+hir-imports-types"
+        "syntax+hir-imports-types-calls"
     );
     assert_eq!(
         result.profile.properties["analysis_backend"],
@@ -120,7 +120,7 @@ fn hir_import_type_graph_emits_exact_nodes_sites_and_relations() {
     );
     assert_eq!(
         result.profile.properties["rust_hir_status"],
-        "import-type-graph-emitted"
+        "import-type-call-graph-emitted"
     );
     assert_eq!(
         result.profile.properties["rust_hir_semantic_issue_count"],
@@ -316,7 +316,7 @@ fn hir_import_type_graph_emits_exact_nodes_sites_and_relations() {
         .filter(|site| {
             matches!(
                 site.kind.as_str(),
-                "rust_use" | "rust_reexport" | "type_use"
+                "rust_use" | "rust_reexport" | "type_use" | "call"
             ) && site
                 .evidence
                 .first()
@@ -343,7 +343,14 @@ fn hir_import_type_graph_emits_exact_nodes_sites_and_relations() {
         assert!(primary.start_column.is_some_and(|column| column > 0));
         assert!(primary.end_line.is_some_and(|line| line > 0));
         assert!(primary.end_column.is_some_and(|column| column > 0));
-        assert_eq!(primary.properties["macro_provenance"], "direct-source");
+        if site.kind == "call" && primary.properties["call_syntax"] == "macro_boundary" {
+            assert_eq!(
+                primary.properties["macro_provenance"],
+                "declarative-expansion-boundary"
+            );
+        } else {
+            assert_eq!(primary.properties["macro_provenance"], "direct-source");
+        }
         assert!(site.target_ids.windows(2).all(|pair| pair[0] < pair[1]));
         assert_eq!(
             site.id,
@@ -471,6 +478,320 @@ fn hir_import_type_graph_emits_exact_nodes_sites_and_relations() {
             && site.specifier == "PublicEnvelope"
             && site.condition.render().contains("rust.cfg")
     }));
+}
+
+#[test]
+fn hir_call_graph_classifies_exact_candidate_external_and_unresolved_dispatch() {
+    let result = scan(&semantic_fixture()).unwrap();
+    let call_sites: Vec<_> = result
+        .sites
+        .iter()
+        .filter(|site| {
+            site.kind == "call"
+                && site
+                    .evidence
+                    .first()
+                    .is_some_and(|evidence| evidence.path.as_deref() == Some("src/calls.rs"))
+        })
+        .collect();
+    assert_eq!(
+        result.profile.properties["rust_hir_semantic_call_site_count"],
+        result
+            .sites
+            .iter()
+            .filter(|site| site.kind == "call")
+            .count() as u64
+    );
+
+    let site_at = |line: u32, specifier: &str| {
+        call_sites
+            .iter()
+            .copied()
+            .find(|site| site.specifier == specifier && site.evidence[0].start_line == Some(line))
+            .unwrap_or_else(|| panic!("missing call site {specifier:?} at src/calls.rs:{line}"))
+    };
+    let node = |id: &str| {
+        result
+            .nodes
+            .iter()
+            .find(|node| node.id == id)
+            .unwrap_or_else(|| panic!("missing call target node {id}"))
+    };
+    let target = |line: u32, specifier: &str| {
+        let site = site_at(line, specifier);
+        assert_eq!(site.target_ids.len(), 1, "{specifier} at line {line}");
+        node(&site.target_ids[0])
+    };
+
+    let direct = site_at(91, "direct_target");
+    assert_eq!(direct.resolution_status, ResolutionStatus::Resolved);
+    assert_eq!(direct.precision, Precision::Exact);
+    assert_eq!(direct.evidence[0].properties["dispatch"], "static");
+    assert_eq!(
+        target(91, "direct_target").display_name.as_deref(),
+        Some("direct_target")
+    );
+
+    let generic = target(92, "generic_target");
+    assert_eq!(generic.properties["symbol_kind"], "function_instance");
+    assert!(
+        generic.properties["resolver_identity"]
+            .as_str()
+            .is_some_and(|identity| identity.ends_with("generic_target::<T=builtin:u32>"))
+    );
+    for (line, specifier) in [(102, "GenericWorker::create"), (103, "copied")] {
+        let generic_impl = target(line, specifier);
+        assert_eq!(generic_impl.properties["symbol_kind"], "function_instance");
+        assert_eq!(
+            generic_impl.properties["type_arguments"],
+            serde_json::json!(["T=builtin:u32"])
+        );
+    }
+
+    assert_eq!(
+        target(90, "Worker::new").properties["symbol_kind"],
+        "associated_function"
+    );
+    assert_eq!(target(94, "inherent").properties["symbol_kind"], "method");
+    assert_eq!(
+        site_at(94, "inherent").evidence[0].properties["dispatch"],
+        "method_static"
+    );
+    let concrete_trait = target(95, "dispatch");
+    assert!(
+        concrete_trait.properties["resolver_identity"]
+            .as_str()
+            .is_some_and(
+                |identity| identity.contains("Worker as") && identity.ends_with("::dispatch")
+            )
+    );
+    assert_eq!(
+        site_at(95, "dispatch").evidence[0].properties["dispatch"],
+        "method_static"
+    );
+    let default_method = target(96, "defaulted");
+    assert_eq!(
+        default_method.properties["symbol_kind"],
+        "function_instance"
+    );
+    assert_eq!(
+        site_at(96, "defaulted").evidence[0].properties["dispatch"],
+        "trait_default_static"
+    );
+    let associated = target(97, "ClosedDispatch::associated");
+    assert_eq!(associated.properties["symbol_kind"], "associated_function");
+    assert!(
+        associated.properties["resolver_identity"]
+            .as_str()
+            .is_some_and(
+                |identity| identity.contains("Worker as") && identity.ends_with("::associated")
+            )
+    );
+    let associated_default = target(98, "ClosedDispatch::associated_default");
+    assert_eq!(
+        associated_default.properties["symbol_kind"],
+        "function_instance"
+    );
+    assert_eq!(
+        site_at(98, "ClosedDispatch::associated_default").evidence[0].properties["dispatch"],
+        "trait_associated_default_static"
+    );
+
+    let dynamic = site_at(107, "dispatch");
+    let generic_dispatch = site_at(111, "dispatch");
+    for candidate_site in [dynamic, generic_dispatch] {
+        assert_eq!(
+            candidate_site.resolution_status,
+            ResolutionStatus::Candidates
+        );
+        assert_eq!(candidate_site.precision, Precision::Overapprox);
+        assert_eq!(candidate_site.target_ids.len(), 2);
+        assert_eq!(
+            candidate_site.evidence[0].properties["algorithm"],
+            "rust-analyzer-local-trait-impls-v1"
+        );
+        assert!(
+            candidate_site
+                .target_ids
+                .windows(2)
+                .all(|pair| pair[0] < pair[1])
+        );
+        let identities: Vec<_> = candidate_site
+            .target_ids
+            .iter()
+            .map(|id| node(id).properties["resolver_identity"].as_str().unwrap())
+            .collect();
+        assert!(
+            identities
+                .iter()
+                .any(|identity| identity.contains("Worker as"))
+        );
+        assert!(
+            identities
+                .iter()
+                .any(|identity| identity.contains("Backup as"))
+        );
+    }
+    assert_eq!(dynamic.target_ids, generic_dispatch.target_ids);
+    let dynamic_default = site_at(107, "defaulted");
+    assert_eq!(
+        dynamic_default.resolution_status,
+        ResolutionStatus::Candidates
+    );
+    assert_eq!(dynamic_default.precision, Precision::Overapprox);
+    assert_eq!(dynamic_default.target_ids.len(), 1);
+    assert_eq!(
+        dynamic_default.evidence[0].properties["algorithm"],
+        "rust-analyzer-local-trait-impls-v1"
+    );
+
+    let single_pointer = site_at(136, "single");
+    let multiple_pointers = site_at(136, "alias");
+    for candidate_site in [single_pointer, multiple_pointers] {
+        assert_eq!(
+            candidate_site.resolution_status,
+            ResolutionStatus::Candidates
+        );
+        assert_eq!(candidate_site.precision, Precision::Overapprox);
+        assert_eq!(
+            candidate_site.evidence[0].properties["algorithm"],
+            "rust-immutable-fn-pointer-flow-v1"
+        );
+        assert!(
+            candidate_site
+                .target_ids
+                .windows(2)
+                .all(|pair| pair[0] < pair[1])
+        );
+    }
+    assert_eq!(single_pointer.target_ids.len(), 1);
+    assert_eq!(multiple_pointers.target_ids.len(), 2);
+    assert!(
+        multiple_pointers
+            .target_ids
+            .contains(&single_pointer.target_ids[0])
+    );
+
+    let closure_call = site_at(125, "closure");
+    assert_eq!(
+        node(&closure_call.source).display_name.as_deref(),
+        Some("closure_calls")
+    );
+    assert_eq!(
+        node(&closure_call.target_ids[0]).properties["symbol_kind"],
+        "closure"
+    );
+    assert_eq!(closure_call.evidence[0].properties["dispatch"], "closure");
+    let closure_body_call = site_at(124, "direct_target");
+    assert_eq!(
+        node(&closure_body_call.source).properties["symbol_kind"],
+        "closure"
+    );
+    let inline_closure_call = site_at(125, "<closure>");
+    assert_eq!(
+        node(&inline_closure_call.target_ids[0]).properties["symbol_kind"],
+        "closure"
+    );
+    let inline_closure_body = site_at(125, "alternate_target");
+    assert_eq!(
+        inline_closure_body.source,
+        inline_closure_call.target_ids[0]
+    );
+
+    let external = site_at(144, "std::mem::size_of");
+    assert_eq!(external.resolution_status, ResolutionStatus::External);
+    assert_eq!(external.precision, Precision::Heuristic);
+    assert_eq!(node(&external.target_ids[0]).kind, "external_system");
+    let external_alias = site_at(148, "external_size");
+    assert_eq!(external_alias.resolution_status, ResolutionStatus::External);
+    assert_eq!(external_alias.precision, Precision::Heuristic);
+    assert_eq!(
+        external_alias.evidence[0].properties["dispatch"],
+        "external"
+    );
+    let unresolved = site_at(152, "missing_call");
+    assert_eq!(unresolved.resolution_status, ResolutionStatus::Unresolved);
+    assert_eq!(unresolved.precision, Precision::Heuristic);
+    assert_eq!(node(&unresolved.target_ids[0]).kind, "unknown_target");
+    assert!(
+        unresolved
+            .reason
+            .as_deref()
+            .is_some_and(|reason| !reason.is_empty())
+    );
+    let unknown_pointer = site_at(140, "callback");
+    assert_eq!(
+        unknown_pointer.resolution_status,
+        ResolutionStatus::Unresolved
+    );
+    assert_eq!(
+        unknown_pointer.evidence[0].properties["dispatch"],
+        "function_pointer"
+    );
+    let open_trait = site_at(120, "open_dispatch");
+    assert_eq!(open_trait.resolution_status, ResolutionStatus::Unresolved);
+    assert!(
+        open_trait
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("public trait"))
+    );
+
+    let macro_boundary = site_at(156, "generated_call!");
+    assert_eq!(
+        macro_boundary.resolution_status,
+        ResolutionStatus::Unresolved
+    );
+    assert_eq!(
+        macro_boundary.evidence[0].properties["dispatch"],
+        "macro_boundary"
+    );
+    assert_eq!(
+        macro_boundary.evidence[0].properties["macro_provenance"],
+        "declarative-expansion-boundary"
+    );
+    assert_eq!(
+        macro_boundary.evidence[0].properties["generated_call_count"],
+        1
+    );
+    let macro_edges: Vec<_> = result
+        .edges
+        .iter()
+        .filter(|edge| edge.site_id.as_deref() == Some(macro_boundary.id.as_str()))
+        .collect();
+    assert_eq!(macro_edges.len(), 1);
+    assert!(macro_edges[0].generated);
+
+    let conditioned = site_at(161, "direct_target");
+    let rendered_condition = conditioned.condition.render();
+    assert!(rendered_condition.contains("rust.cfg.unix"));
+    assert!(rendered_condition.contains("rust.cfg.windows"));
+    let match_arm_conditioned = site_at(174, "direct_target");
+    assert!(
+        match_arm_conditioned
+            .condition
+            .render()
+            .contains("rust.cfg.unix")
+    );
+    assert!(!call_sites.iter().any(|site| {
+        site.specifier == "TupleConstructor" || site.evidence[0].start_line == Some(167)
+    }));
+
+    for site in call_sites {
+        assert!(site.target_ids.windows(2).all(|pair| pair[0] < pair[1]));
+        let linked_edges: Vec<_> = result
+            .edges
+            .iter()
+            .filter(|edge| edge.site_id.as_deref() == Some(site.id.as_str()))
+            .collect();
+        assert_eq!(linked_edges.len(), site.target_ids.len());
+        let expected_kind = if site.resolution_status == ResolutionStatus::Candidates {
+            "may_call"
+        } else {
+            "calls"
+        };
+        assert!(linked_edges.iter().all(|edge| edge.kind == expected_kind));
+    }
 }
 
 #[test]
@@ -795,16 +1116,16 @@ fn test_mode_skips_ambiguous_source_bound_locals_and_instances() {
     let profile = validated.profiles.values().next().unwrap();
     assert_eq!(
         profile.properties["rust_hir_status"],
-        "import-type-graph-partial"
+        "import-type-call-graph-partial"
     );
-    assert_eq!(profile.properties["rust_hir_semantic_issue_count"], 2);
+    assert_eq!(profile.properties["rust_hir_semantic_issue_count"], 3);
     assert_eq!(
         validated
             .diagnostics
             .values()
             .filter(|diagnostic| diagnostic.code == "RUST_HIR_SOURCE_CONTEXT_AMBIGUOUS")
             .count(),
-        2
+        3
     );
     assert!(
         validated
@@ -927,7 +1248,7 @@ impl LocalTrait for std::path::PathBuf {}
     );
     assert_eq!(
         result.profile.properties["rust_hir_status"],
-        "import-type-graph-partial"
+        "import-type-call-graph-partial"
     );
 }
 
@@ -998,12 +1319,12 @@ pub fn second(value: u8) -> Outer<Inner<u8, 2>> {
     );
     assert_eq!(
         result.profile.properties["rust_hir_status"],
-        "import-type-graph-partial"
+        "import-type-call-graph-partial"
     );
 }
 
 #[test]
-fn ambiguous_locals_and_anonymous_bodies_are_skipped_without_losing_the_delta() {
+fn closure_bodies_have_exact_owners_while_unrepresented_anonymous_bodies_are_skipped() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("local-boundaries");
     write_minimal_crate(
@@ -1021,6 +1342,11 @@ pub fn patterns(value: Option<(u32, u32)>) {
         Boxed::<u32> { value: inside_closure }
     };
     let _ = (chosen, closure_value);
+}
+
+pub fn target() {}
+pub fn anonymous_future() {
+    let _future = async { target() };
 }
 "#,
     );
@@ -1048,13 +1374,54 @@ pub fn patterns(value: Option<(u32, u32)>) {
         node.kind == "symbol"
             && matches!(
                 node.display_name.as_deref(),
-                Some("closure_input" | "inside_closure" | "signature_local" | "signature_fn_local")
+                Some("signature_local" | "signature_fn_local")
             )
     }));
-    assert!(
-        !result.nodes.iter().any(|node| {
-            node.kind == "type" && node.properties["type_kind"] == "generic_instance"
+    let closure = result
+        .nodes
+        .iter()
+        .find(|node| node.kind == "symbol" && node.properties["symbol_kind"] == "closure")
+        .expect("closure node");
+    for name in ["closure_input", "inside_closure"] {
+        let local = result
+            .nodes
+            .iter()
+            .find(|node| node.kind == "symbol" && node.display_name.as_deref() == Some(name))
+            .unwrap_or_else(|| panic!("closure local {name}"));
+        assert_eq!(
+            local.properties["canonical_identity"]["enclosing_symbol"],
+            closure.id
+        );
+    }
+    let closure_instance = result
+        .nodes
+        .iter()
+        .find(|node| {
+            node.kind == "type"
+                && node.properties["type_kind"] == "generic_instance"
+                && node
+                    .properties
+                    .get("resolver_identity")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|resolver| resolver.contains("Boxed::<T=builtin:u32>"))
         })
+        .expect("generic instance inside closure");
+    assert!(result.edges.iter().any(|edge| {
+        edge.kind == "instantiates"
+            && edge.source == closure.id
+            && edge.target == closure_instance.id
+    }));
+    assert!(
+        !result
+            .sites
+            .iter()
+            .any(|site| { site.kind == "call" && site.specifier == "target" })
+    );
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| { diagnostic.code == "RUST_HIR_ANONYMOUS_CALLER_UNREPRESENTED" })
     );
     assert!(
         result
@@ -1103,7 +1470,7 @@ pub fn borrowed<'a>(value: &'a u8) -> Borrowed<'a, u8> {
     );
     assert_eq!(
         result.profile.properties["rust_hir_status"],
-        "import-type-graph-partial"
+        "import-type-call-graph-partial"
     );
 }
 
@@ -1130,7 +1497,7 @@ fn extracts_cargo_targets_conditions_modules_and_safe_mode_sites() {
     assert_eq!(result.profile.properties["rust_hir_project_model"], "ready");
     assert_eq!(
         result.profile.properties["rust_hir_enable_gate"],
-        "call-and-release-gates-pending"
+        "fallback-and-release-gates-pending"
     );
     assert_eq!(
         result.profile.properties["rust_hir_backend"],
@@ -1138,7 +1505,7 @@ fn extracts_cargo_targets_conditions_modules_and_safe_mode_sites() {
     );
     assert!(matches!(
         result.profile.properties["rust_hir_status"].as_str(),
-        Some("import-type-graph-emitted" | "import-type-graph-partial")
+        Some("import-type-call-graph-emitted" | "import-type-call-graph-partial")
     ));
     assert_eq!(
         result.profile.properties["crate_graph_source"],
@@ -1747,7 +2114,10 @@ fn default_rust_profile_has_stable_hashed_host_identity() {
         "compatible" | "unsupported" | "unavailable"
     ));
     if probe_status == "compatible" {
-        assert_eq!(first.properties["analysis"], "syntax+hir-imports-types");
+        assert_eq!(
+            first.properties["analysis"],
+            "syntax+hir-imports-types-calls"
+        );
         assert_eq!(
             first.properties["analysis_backend"],
             "static-syntax+rust-analyzer-hir"
@@ -1755,7 +2125,7 @@ fn default_rust_profile_has_stable_hashed_host_identity() {
         assert_eq!(first.properties["rust_hir_backend"], "rust-analyzer-hir");
         assert!(matches!(
             first.properties["rust_hir_status"].as_str(),
-            Some("import-type-graph-emitted" | "import-type-graph-partial")
+            Some("import-type-call-graph-emitted" | "import-type-call-graph-partial")
         ));
     } else {
         assert_eq!(first.properties["analysis"], "syntax");
@@ -1772,7 +2142,7 @@ fn default_rust_profile_has_stable_hashed_host_identity() {
         assert_eq!(first.properties["rust_hir_project_model"], "ready");
         assert_eq!(
             first.properties["rust_hir_enable_gate"],
-            "call-and-release-gates-pending"
+            "fallback-and-release-gates-pending"
         );
         assert!(
             first.properties["rust_hir_project_file_count"]
