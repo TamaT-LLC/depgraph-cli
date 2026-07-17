@@ -91,6 +91,355 @@ fn rust_semantic_fixture_remains_protocol_v1_compatible() {
 }
 
 #[test]
+fn rust_import_reexport_and_type_use_follow_the_strict_semantic_contract() {
+    let input = values_to_ndjson(rust_semantic_dependency_values());
+    assert!(schema_accepts_stream(&input));
+    assert!(semantic_schema_accepts_stream(&input));
+    let validated = validate_safe_semantic_ndjson(Cursor::new(input))
+        .expect("Rust semantic dependency fixture must validate");
+
+    for (site_kind, edge_kind, source_kinds, target_kinds) in [
+        (
+            "rust_use",
+            "imports",
+            &["module", "symbol"][..],
+            &["module", "symbol", "type"][..],
+        ),
+        (
+            "rust_reexport",
+            "reexports",
+            &["module"][..],
+            &["module", "symbol", "type"][..],
+        ),
+        (
+            "type_use",
+            "type_uses",
+            &["symbol", "type"][..],
+            &["type"][..],
+        ),
+    ] {
+        let site = validated
+            .sites
+            .values()
+            .find(|site| site.kind == site_kind)
+            .unwrap_or_else(|| panic!("missing {site_kind} site"));
+        assert!(!site.specifier.is_empty());
+        assert!(source_kinds.contains(&validated.nodes[&site.source].kind.as_str()));
+        assert_eq!(site.evidence[0].kind, EvidenceKind::Semantic);
+        assert_eq!(site.evidence[1].kind, EvidenceKind::Source);
+        assert_eq!(
+            site.id,
+            stable_id_from_value("site", &site_identity(site, &site.evidence[0]))
+        );
+
+        let linked: Vec<_> = validated
+            .edges
+            .values()
+            .filter(|edge| edge.site_id.as_deref() == Some(site.id.as_str()))
+            .collect();
+        assert_eq!(linked.len(), site.target_ids.len());
+        for edge in linked {
+            assert_eq!(edge.kind, edge_kind);
+            assert_eq!(edge.phase, Phase::Semantic);
+            assert_eq!(edge.condition, site.condition);
+            assert!(target_kinds.contains(&validated.nodes[&edge.target].kind.as_str()));
+            assert_eq!(edge.evidence[0].kind, EvidenceKind::Semantic);
+            assert_eq!(edge.evidence[1].kind, EvidenceKind::Source);
+            assert_eq!(
+                edge.id,
+                stable_id_from_value(
+                    "edge",
+                    &json!({
+                        "kind": edge.kind,
+                        "site_id": site.id,
+                        "target": edge.target,
+                    }),
+                )
+            );
+        }
+    }
+}
+
+#[test]
+fn rust_semantic_import_candidates_are_sorted_and_emit_one_edge_per_target() {
+    let input = values_to_ndjson(rust_semantic_candidate_values());
+    assert!(schema_accepts_stream(&input));
+    assert!(semantic_schema_accepts_stream(&input));
+    let validated = validate_safe_semantic_ndjson(Cursor::new(input))
+        .expect("sorted Rust semantic import candidates must validate");
+    let site = validated
+        .sites
+        .values()
+        .find(|site| site.kind == "rust_use")
+        .expect("Rust use site");
+    assert_eq!(site.resolution_status, ResolutionStatus::Candidates);
+    assert_eq!(site.precision, Precision::Overapprox);
+    assert_eq!(site.target_ids.len(), 2);
+    assert!(site.target_ids.windows(2).all(|pair| pair[0] < pair[1]));
+    let linked: Vec<_> = validated
+        .edges
+        .values()
+        .filter(|edge| edge.site_id.as_deref() == Some(site.id.as_str()))
+        .collect();
+    assert_eq!(linked.len(), 2);
+    assert!(linked.iter().all(|edge| {
+        edge.kind == "imports"
+            && edge.resolution_status == ResolutionStatus::Candidates
+            && edge.precision == Precision::Overapprox
+    }));
+}
+
+#[test]
+fn rust_semantic_imports_use_the_documented_external_and_unresolved_sentinels() {
+    for (status, precision, target_id, target_kind, reason) in [
+        (
+            "external",
+            "exact",
+            "external-system:rust:serde",
+            "external_system",
+            None,
+        ),
+        (
+            "unresolved",
+            "heuristic",
+            "unknown-target:rust:broken-use",
+            "unknown_target",
+            Some("HIR import target could not be resolved"),
+        ),
+    ] {
+        let mut events = rust_semantic_dependency_values();
+        insert_plain_node(&mut events, target_id, target_kind);
+        reassign_site_target(&mut events, "rust_use", target_id);
+        let site_id = semantic_site_id(&events, "rust_use");
+        let site = events
+            .iter_mut()
+            .find(|event| event["event"] == "dependency_site" && event["site"]["id"] == site_id)
+            .expect("Rust use site");
+        site["site"]["resolution_status"] = json!(status);
+        site["site"]["precision"] = json!(precision);
+        if let Some(reason) = reason {
+            site["site"]["reason"] = json!(reason);
+        }
+        let edge = linked_edge_mut(&mut events, &site_id);
+        edge["resolution_status"] = json!(status);
+        edge["precision"] = json!(precision);
+        for event in &mut events {
+            if matches!(
+                event["event"].as_str(),
+                Some("profile_completed" | "scan_completed")
+            ) {
+                event["coverage"]["resolved"] = json!(2);
+                event["coverage"][status] = json!(1);
+            }
+        }
+        let input = values_to_ndjson(events);
+        assert!(schema_accepts_stream(&input));
+        assert!(semantic_schema_accepts_stream(&input));
+        validate_safe_semantic_ndjson(Cursor::new(input)).unwrap_or_else(|error| {
+            panic!("Rust semantic import {status}/{precision} must validate: {error}")
+        });
+    }
+}
+
+#[test]
+fn semantic_dependency_recognition_is_primary_evidence_driven() {
+    validate_safe_semantic_ndjson(Cursor::new(SOURCE_GOLDEN))
+        .expect("source-phase imports on a non-semantic site remain protocol-v1 compatible");
+    let rust_source_dependencies = values_to_ndjson(rust_source_dependency_values());
+    assert!(semantic_schema_accepts_stream(&rust_source_dependencies));
+    let validated = validate_safe_semantic_ndjson(Cursor::new(rust_source_dependencies))
+        .expect("source-primary rust_use/rust_reexport/type_use sites remain backward compatible");
+    let type_use = validated
+        .sites
+        .values()
+        .find(|site| site.kind == "type_use")
+        .expect("source-primary type_use site");
+    assert_eq!(type_use.evidence[0].kind, EvidenceKind::Source);
+    assert_eq!(type_use.resolution_status, ResolutionStatus::External);
+    assert_eq!(type_use.precision, Precision::Heuristic);
+    let type_use_edge = validated
+        .edges
+        .values()
+        .find(|edge| edge.site_id.as_deref() == Some(type_use.id.as_str()))
+        .expect("source-primary type_use edge");
+    assert_eq!(type_use_edge.kind, "type_uses");
+    assert_eq!(type_use_edge.phase, Phase::Source);
+
+    let mut unresolved = rust_source_dependency_values();
+    set_source_type_use_resolution(
+        &mut unresolved,
+        "unresolved",
+        "heuristic",
+        "unknown-target:rust:source-type-use",
+        "unknown_target",
+        Some("semantic type resolution was unavailable"),
+    );
+    let unresolved = values_to_ndjson(unresolved);
+    assert!(semantic_schema_accepts_stream(&unresolved));
+    let validated = validate_safe_semantic_ndjson(Cursor::new(unresolved))
+        .expect("unresolved/heuristic source-primary type_use must validate");
+    let type_use = validated
+        .sites
+        .values()
+        .find(|site| site.kind == "type_use")
+        .expect("unresolved source-primary type_use site");
+    assert_eq!(type_use.resolution_status, ResolutionStatus::Unresolved);
+    assert_eq!(type_use.precision, Precision::Heuristic);
+}
+
+#[test]
+fn source_fallback_contract_rejects_mutated_primary_evidence_and_metadata() {
+    let mut cases = Vec::<(&str, Vec<Value>)>::new();
+
+    let mut resolved_type_use = rust_source_dependency_values();
+    let concrete_target = node_id_by_display_name(&resolved_type_use, "Envelope");
+    set_source_type_use_resolution(
+        &mut resolved_type_use,
+        "resolved",
+        "heuristic",
+        &concrete_target,
+        "type",
+        None,
+    );
+    cases.push((
+        "source-primary type_use uses resolved status",
+        resolved_type_use,
+    ));
+
+    let mut exact_type_use = rust_source_dependency_values();
+    let type_use_id = semantic_site_id(&exact_type_use, "type_use");
+    exact_type_use
+        .iter_mut()
+        .find(|event| event["event"] == "dependency_site" && event["site"]["id"] == type_use_id)
+        .expect("source type-use site")["site"]["precision"] = json!("exact");
+    linked_edge_mut(&mut exact_type_use, &type_use_id)["precision"] = json!("exact");
+    cases.push((
+        "source-primary type_use uses exact precision",
+        exact_type_use,
+    ));
+
+    let mut incomplete_site_primary = rust_source_dependency_values();
+    let type_use_id = semantic_site_id(&incomplete_site_primary, "type_use");
+    let site = incomplete_site_primary
+        .iter_mut()
+        .find(|event| event["event"] == "dependency_site" && event["site"]["id"] == type_use_id)
+        .expect("source type-use site");
+    let supporting = site["site"]["evidence"][0].clone();
+    site["site"]["evidence"]
+        .as_array_mut()
+        .expect("site evidence")
+        .push(supporting);
+    let primary = site["site"]["evidence"][0]
+        .as_object_mut()
+        .expect("primary site evidence");
+    for field in [
+        "path",
+        "start_line",
+        "start_column",
+        "end_line",
+        "end_column",
+    ] {
+        primary.remove(field);
+    }
+    cases.push((
+        "source fallback site primary evidence has an incomplete span",
+        incomplete_site_primary,
+    ));
+
+    let mut incomplete_edge_primary = rust_source_dependency_values();
+    let type_use_id = semantic_site_id(&incomplete_edge_primary, "type_use");
+    let edge = linked_edge_mut(&mut incomplete_edge_primary, &type_use_id);
+    let supporting = edge["evidence"][0].clone();
+    edge["evidence"]
+        .as_array_mut()
+        .expect("edge evidence")
+        .push(supporting);
+    let primary = edge["evidence"][0]
+        .as_object_mut()
+        .expect("primary edge evidence");
+    for field in [
+        "path",
+        "start_line",
+        "start_column",
+        "end_line",
+        "end_column",
+    ] {
+        primary.remove(field);
+    }
+    cases.push((
+        "source fallback edge primary evidence has an incomplete span",
+        incomplete_edge_primary,
+    ));
+
+    let mut mismatched_anchor = rust_source_dependency_values();
+    let type_use_id = semantic_site_id(&mismatched_anchor, "type_use");
+    linked_edge_mut(&mut mismatched_anchor, &type_use_id)["evidence"][0]["extractor"] =
+        json!("different-source-extractor");
+    cases.push((
+        "source fallback primary evidence anchors differ",
+        mismatched_anchor,
+    ));
+
+    let mut mismatched_condition = rust_source_dependency_values();
+    let type_use_id = semantic_site_id(&mismatched_condition, "type_use");
+    let site_condition = mismatched_condition
+        .iter()
+        .find(|event| event["event"] == "dependency_site" && event["site"]["id"] == type_use_id)
+        .expect("source type-use site")["site"]["condition"]
+        .clone();
+    linked_edge_mut(&mut mismatched_condition, &type_use_id)["condition"] = json!({
+        "op": "all",
+        "conditions": [
+            site_condition,
+            {"op": "eq", "key": "rust.feature", "value": "extra"}
+        ]
+    });
+    cases.push((
+        "source fallback edge condition narrows its site",
+        mismatched_condition,
+    ));
+
+    let mut mismatched_source = rust_source_dependency_values();
+    let type_use_id = semantic_site_id(&mismatched_source, "type_use");
+    let other_source = node_id_by_display_name(&mismatched_source, "crate");
+    linked_edge_mut(&mut mismatched_source, &type_use_id)["source"] = json!(other_source);
+    cases.push((
+        "source fallback edge source differs from its site",
+        mismatched_source,
+    ));
+
+    let mut mismatched_status = rust_source_dependency_values();
+    let type_use_id = semantic_site_id(&mismatched_status, "type_use");
+    linked_edge_mut(&mut mismatched_status, &type_use_id)["resolution_status"] =
+        json!("candidates");
+    cases.push((
+        "source fallback edge status differs from its site",
+        mismatched_status,
+    ));
+
+    let mut mismatched_precision = rust_source_dependency_values();
+    let type_use_id = semantic_site_id(&mismatched_precision, "type_use");
+    linked_edge_mut(&mut mismatched_precision, &type_use_id)["precision"] = json!("exact");
+    cases.push((
+        "source fallback edge precision differs from its site",
+        mismatched_precision,
+    ));
+
+    for (name, events) in cases {
+        let input = values_to_ndjson(events);
+        assert!(schema_accepts_stream(&input), "base Schema rejected {name}");
+        assert!(
+            semantic_schema_accepts_stream(&input),
+            "strict Schema unexpectedly rejected source fallback mutation {name}"
+        );
+        assert!(
+            validate_safe_semantic_ndjson(Cursor::new(input)).is_err(),
+            "strict Rust validator accepted {name}"
+        );
+    }
+}
+
+#[test]
 fn rust_semantic_nodes_and_site_less_relations_follow_their_hash_contract() {
     let validated = rust_semantic_fixture();
     let semantic_nodes: Vec<_> = validated
@@ -420,6 +769,162 @@ fn schema_and_rust_validator_reject_invalid_semantic_contract_values() {
 }
 
 #[test]
+fn rust_semantic_dependency_contract_rejects_wrong_mapping_and_invariants() {
+    let mut cases = Vec::<(&str, Vec<Value>, bool)>::new();
+
+    let mut wrong_edge_kind = rust_semantic_dependency_values();
+    let use_site_id = semantic_site_id(&wrong_edge_kind, "rust_use");
+    let edge = linked_edge_mut(&mut wrong_edge_kind, &use_site_id);
+    edge["kind"] = json!("reexports");
+    rehash_json_edge(edge);
+    cases.push(("rust_use mapped to reexports", wrong_edge_kind, true));
+
+    let mut unrelated_edge_kind = rust_semantic_dependency_values();
+    let use_site_id = semantic_site_id(&unrelated_edge_kind, "rust_use");
+    let edge = linked_edge_mut(&mut unrelated_edge_kind, &use_site_id);
+    edge["kind"] = json!("depends_on");
+    rehash_json_edge(edge);
+    cases.push((
+        "semantic rust_use site linked to an unrelated edge kind",
+        unrelated_edge_kind,
+        false,
+    ));
+
+    let mut mixed_phases = rust_semantic_candidate_values();
+    let use_site_id = semantic_site_id(&mixed_phases, "rust_use");
+    linked_edge_mut(&mut mixed_phases, &use_site_id)["phase"] = json!("source");
+    cases.push((
+        "semantic rust_use site mixes source and semantic edges",
+        mixed_phases,
+        false,
+    ));
+
+    for phase in ["build", "runtime"] {
+        let mut wrong_phase = rust_semantic_dependency_values();
+        let use_site_id = semantic_site_id(&wrong_phase, "rust_use");
+        linked_edge_mut(&mut wrong_phase, &use_site_id)["phase"] = json!(phase);
+        cases.push((
+            if phase == "build" {
+                "semantic rust_use site linked to a build edge"
+            } else {
+                "semantic rust_use site linked to a runtime edge"
+            },
+            wrong_phase,
+            false,
+        ));
+    }
+
+    let mut semantic_type_use_with_source_edge = rust_semantic_dependency_values();
+    let type_use_site_id = semantic_site_id(&semantic_type_use_with_source_edge, "type_use");
+    linked_edge_mut(&mut semantic_type_use_with_source_edge, &type_use_site_id)["phase"] =
+        json!("source");
+    cases.push((
+        "semantic-primary type_use site linked to a source edge",
+        semantic_type_use_with_source_edge,
+        false,
+    ));
+
+    let mut source_type_use_with_semantic_edge = rust_source_dependency_values();
+    let type_use_site_id = semantic_site_id(&source_type_use_with_semantic_edge, "type_use");
+    linked_edge_mut(&mut source_type_use_with_semantic_edge, &type_use_site_id)["phase"] =
+        json!("semantic");
+    cases.push((
+        "source-primary type_use fallback uses a semantic edge",
+        source_type_use_with_semantic_edge,
+        true,
+    ));
+
+    let mut wrong_reexport_source = rust_semantic_dependency_values();
+    let symbol_id = node_id_by_display_name(&wrong_reexport_source, "exercise");
+    reassign_site_source(&mut wrong_reexport_source, "rust_reexport", &symbol_id);
+    cases.push((
+        "rust_reexport source is not a module",
+        wrong_reexport_source,
+        true,
+    ));
+
+    let mut wrong_source_language = rust_semantic_dependency_values();
+    let module = wrong_source_language
+        .iter_mut()
+        .find(|event| event["event"] == "node_upsert" && event["node"]["display_name"] == "crate")
+        .expect("Rust module source");
+    module["node"]["properties"]["language"] = json!("go");
+    cases.push((
+        "Rust semantic source language is not rust",
+        wrong_source_language,
+        true,
+    ));
+
+    let mut wrong_import_target = rust_semantic_dependency_values();
+    insert_file_node(&mut wrong_import_target, "file:invalid-import-target");
+    reassign_site_target(
+        &mut wrong_import_target,
+        "rust_use",
+        "file:invalid-import-target",
+    );
+    cases.push((
+        "rust_use concrete target is not semantic",
+        wrong_import_target,
+        true,
+    ));
+
+    let mut mismatched_condition = rust_semantic_dependency_values();
+    let use_site_id = semantic_site_id(&mismatched_condition, "rust_use");
+    linked_edge_mut(&mut mismatched_condition, &use_site_id)["condition"] =
+        json!({"op":"eq","key":"rust.feature","value":"other"});
+    cases.push((
+        "Rust semantic edge condition differs from its site",
+        mismatched_condition,
+        true,
+    ));
+
+    let mut reversed_candidates = rust_semantic_candidate_values();
+    reversed_candidates
+        .iter_mut()
+        .find(|event| event["event"] == "dependency_site" && event["site"]["kind"] == "rust_use")
+        .expect("Rust use site")["site"]["target_ids"]
+        .as_array_mut()
+        .expect("candidate targets")
+        .reverse();
+    cases.push((
+        "Rust semantic candidates are not sorted",
+        reversed_candidates,
+        true,
+    ));
+
+    let mut mismatched_primary_extractor = rust_semantic_dependency_values();
+    let use_site_id = semantic_site_id(&mismatched_primary_extractor, "rust_use");
+    linked_edge_mut(&mut mismatched_primary_extractor, &use_site_id)["evidence"][0]["extractor"] =
+        json!("different-semantic-extractor");
+    cases.push((
+        "site and edge primary evidence anchors differ",
+        mismatched_primary_extractor,
+        true,
+    ));
+
+    let mut empty_specifier = rust_semantic_dependency_values();
+    empty_specifier
+        .iter_mut()
+        .find(|event| event["event"] == "dependency_site" && event["site"]["kind"] == "rust_use")
+        .expect("Rust use site")["site"]["specifier"] = json!("");
+    cases.push(("semantic site specifier is empty", empty_specifier, false));
+
+    for (name, events, semantic_schema_accepts) in cases {
+        let input = values_to_ndjson(events);
+        assert!(schema_accepts_stream(&input), "base Schema rejected {name}");
+        assert_eq!(
+            semantic_schema_accepts_stream(&input),
+            semantic_schema_accepts,
+            "unexpected strict Schema result for {name}"
+        );
+        assert!(
+            validate_safe_semantic_ndjson(Cursor::new(input)).is_err(),
+            "strict Rust validator accepted {name}"
+        );
+    }
+}
+
+#[test]
 fn rust_validator_recomputes_semantic_hashes_and_enforces_candidate_order() {
     let mut wrong_hash = semantic_values();
     let symbol = wrong_hash
@@ -705,12 +1210,480 @@ fn rust_semantic_values() -> Vec<Value> {
         .collect()
 }
 
+fn rust_semantic_dependency_values() -> Vec<Value> {
+    let mut events = rust_semantic_values();
+    let module_id = node_id_by_display_name(&events, "crate");
+    let function_id = node_id_by_display_name(&events, "exercise");
+    let envelope_id = node_id_by_display_name(&events, "Envelope");
+    let named_id = node_id_by_display_name(&events, "Named");
+    let profile_id = "cargo:rust-semantic-fixture:debug:host";
+    let crate_identity = "Cargo.toml#lib:rust_semantic_fixture:src/lib.rs";
+    let condition = json!({
+        "op": "eq",
+        "key": "rust.crate_instance",
+        "value": crate_identity,
+    });
+    let dependencies = [
+        (
+            "rust_use",
+            "imports",
+            module_id.as_str(),
+            envelope_id.as_str(),
+            "crate::domain::Envelope",
+            1_u64,
+            5_u64,
+            28_u64,
+            "use-tree-leaf",
+        ),
+        (
+            "rust_reexport",
+            "reexports",
+            module_id.as_str(),
+            named_id.as_str(),
+            "crate::domain::Named",
+            2_u64,
+            9_u64,
+            29_u64,
+            "reexport-tree-leaf",
+        ),
+        (
+            "type_use",
+            "type_uses",
+            function_id.as_str(),
+            envelope_id.as_str(),
+            "crate::domain::Envelope<u32>",
+            3_u64,
+            24_u64,
+            36_u64,
+            "signature-type-reference",
+        ),
+    ];
+
+    let mut site_events = Vec::new();
+    let mut edge_events = Vec::new();
+    for (
+        site_kind,
+        edge_kind,
+        source,
+        target,
+        specifier,
+        line,
+        start_column,
+        end_column,
+        hir_kind,
+    ) in dependencies
+    {
+        let primary = json!({
+            "kind": "semantic",
+            "extractor": "rust-analyzer-hir",
+            "extractor_version": "0.0.330",
+            "path": "src/lib.rs",
+            "start_line": line,
+            "start_column": start_column,
+            "end_line": line,
+            "end_column": end_column,
+            "detail": format!("HIR {site_kind} occurrence"),
+            "properties": {
+                "backend": "rust-analyzer-library",
+                "rust_analyzer_revision": "8954b66d43225e62c92e8bbcc8500191b5cceb1e",
+                "crate_identity": crate_identity,
+                "active_cfg": ["debug_assertions", "unix"],
+                "hir_kind": hir_kind,
+                "resolver": "rust-analyzer-hir",
+            },
+        });
+        let source_evidence = json!({
+            "kind": "source",
+            "extractor": "rust-syntax",
+            "extractor_version": "0.1.0",
+            "path": "src/lib.rs",
+            "start_line": line,
+            "start_column": start_column,
+            "end_line": line,
+            "end_column": end_column,
+            "detail": format!("syntax evidence for {site_kind}"),
+            "properties": {},
+        });
+        let mut site = json!({
+            "id": "pending",
+            "source": source,
+            "kind": site_kind,
+            "specifier": specifier,
+            "resolution_status": "resolved",
+            "target_ids": [target],
+            "profile_id": profile_id,
+            "condition": condition,
+            "precision": "exact",
+            "evidence": [primary, source_evidence],
+        });
+        let site_id = rehash_json_site(&mut site);
+        let mut edge = json!({
+            "id": "pending",
+            "source": source,
+            "target": target,
+            "kind": edge_kind,
+            "site_id": site_id,
+            "phase": "semantic",
+            "environment": "any",
+            "profile_id": profile_id,
+            "condition": condition,
+            "resolution_status": "resolved",
+            "precision": "exact",
+            "generated": false,
+            "evidence": site["evidence"].clone(),
+        });
+        rehash_json_edge(&mut edge);
+        site_events.push(json!({
+            "event": "dependency_site",
+            "protocol_version": "1.0",
+            "scan_id": "scan-rust-semantic-golden",
+            "adapter": "rust",
+            "adapter_version": "0.1.0",
+            "seq": 0,
+            "site": site,
+        }));
+        edge_events.push(json!({
+            "event": "edge_upsert",
+            "protocol_version": "1.0",
+            "scan_id": "scan-rust-semantic-golden",
+            "adapter": "rust",
+            "adapter_version": "0.1.0",
+            "seq": 0,
+            "edge": edge,
+        }));
+    }
+    site_events.sort_by(|left, right| {
+        left["site"]["id"]
+            .as_str()
+            .cmp(&right["site"]["id"].as_str())
+    });
+    let first_edge = events
+        .iter()
+        .position(|event| event["event"] == "edge_upsert")
+        .expect("Rust semantic edge events");
+    events.splice(first_edge..first_edge, site_events);
+    let file_completed = events
+        .iter()
+        .position(|event| event["event"] == "file_completed")
+        .expect("Rust file completion");
+    events.splice(file_completed..file_completed, edge_events);
+    sort_edge_events(&mut events);
+
+    let file = events
+        .iter_mut()
+        .find(|event| event["event"] == "file_completed")
+        .expect("Rust file completion");
+    file["discovered_sites"] = json!(3);
+    file["emitted_sites"] = json!(3);
+    for event in &mut events {
+        if matches!(
+            event["event"].as_str(),
+            Some("profile_completed" | "scan_completed")
+        ) {
+            event["coverage"]["dependency_sites"] = json!(3);
+            event["coverage"]["resolved"] = json!(3);
+        }
+    }
+    resequence(&mut events);
+    events
+}
+
+fn rust_semantic_candidate_values() -> Vec<Value> {
+    let mut events = rust_semantic_dependency_values();
+    let second_target = node_id_by_display_name(&events, "Named");
+    let site_index = events
+        .iter()
+        .position(|event| {
+            event["event"] == "dependency_site" && event["site"]["kind"] == "rust_use"
+        })
+        .expect("Rust use site");
+    let site_id = events[site_index]["site"]["id"]
+        .as_str()
+        .expect("Rust use site ID")
+        .to_owned();
+    let mut targets = events[site_index]["site"]["target_ids"]
+        .as_array()
+        .expect("Rust use targets")
+        .clone();
+    targets.push(json!(second_target));
+    targets.sort_by(|left, right| left.as_str().cmp(&right.as_str()));
+    events[site_index]["site"]["target_ids"] = Value::Array(targets);
+    events[site_index]["site"]["resolution_status"] = json!("candidates");
+    events[site_index]["site"]["precision"] = json!("overapprox");
+
+    let edge_index = events
+        .iter()
+        .position(|event| event["event"] == "edge_upsert" && event["edge"]["site_id"] == site_id)
+        .expect("Rust use edge");
+    events[edge_index]["edge"]["resolution_status"] = json!("candidates");
+    events[edge_index]["edge"]["precision"] = json!("overapprox");
+    let mut second_edge = events[edge_index].clone();
+    second_edge["edge"]["target"] = json!(second_target);
+    rehash_json_edge(&mut second_edge["edge"]);
+    let file_completed = events
+        .iter()
+        .position(|event| event["event"] == "file_completed")
+        .expect("Rust file completion");
+    events.insert(file_completed, second_edge);
+    sort_edge_events(&mut events);
+    for event in &mut events {
+        if matches!(
+            event["event"].as_str(),
+            Some("profile_completed" | "scan_completed")
+        ) {
+            event["coverage"]["resolved"] = json!(2);
+            event["coverage"]["candidates"] = json!(1);
+        }
+    }
+    resequence(&mut events);
+    events
+}
+
+fn rust_source_dependency_values() -> Vec<Value> {
+    let mut events = rust_semantic_dependency_values();
+    for event in &mut events {
+        match event["event"].as_str() {
+            Some("dependency_site")
+                if matches!(
+                    event["site"]["kind"].as_str(),
+                    Some("rust_use" | "rust_reexport" | "type_use")
+                ) =>
+            {
+                event["site"]["evidence"] = json!([event["site"]["evidence"][1].clone()]);
+            }
+            Some("edge_upsert")
+                if matches!(
+                    event["edge"]["kind"].as_str(),
+                    Some("imports" | "reexports" | "type_uses")
+                ) =>
+            {
+                event["edge"]["phase"] = json!("source");
+                event["edge"]["evidence"] = json!([event["edge"]["evidence"][1].clone()]);
+            }
+            _ => {}
+        }
+    }
+    set_source_type_use_resolution(
+        &mut events,
+        "external",
+        "heuristic",
+        "external-system:rust:source-type-use",
+        "external_system",
+        None,
+    );
+    resequence(&mut events);
+    events
+}
+
+fn set_source_type_use_resolution(
+    events: &mut Vec<Value>,
+    status: &str,
+    precision: &str,
+    target_id: &str,
+    target_kind: &str,
+    reason: Option<&str>,
+) {
+    let target_exists = events.iter().any(|event| {
+        event["event"] == "node_upsert" && event["node"]["id"].as_str() == Some(target_id)
+    });
+    if !target_exists {
+        insert_plain_node(events, target_id, target_kind);
+    }
+    reassign_site_target(events, "type_use", target_id);
+    let site_id = semantic_site_id(events, "type_use");
+    let site = events
+        .iter_mut()
+        .find(|event| event["event"] == "dependency_site" && event["site"]["id"] == site_id)
+        .expect("source fallback type-use site");
+    site["site"]["resolution_status"] = json!(status);
+    site["site"]["precision"] = json!(precision);
+    if let Some(reason) = reason {
+        site["site"]["reason"] = json!(reason);
+    } else {
+        site["site"]
+            .as_object_mut()
+            .expect("dependency site object")
+            .remove("reason");
+    }
+    let edge = linked_edge_mut(events, &site_id);
+    edge["resolution_status"] = json!(status);
+    edge["precision"] = json!(precision);
+
+    for event in events.iter_mut() {
+        if !matches!(
+            event["event"].as_str(),
+            Some("profile_completed" | "scan_completed")
+        ) {
+            continue;
+        }
+        event["coverage"]["resolved"] = json!(if status == "resolved" { 3 } else { 2 });
+        event["coverage"]["candidates"] = json!(if status == "candidates" { 1 } else { 0 });
+        event["coverage"]["external"] = json!(if status == "external" { 1 } else { 0 });
+        event["coverage"]["unresolved"] = json!(if status == "unresolved" { 1 } else { 0 });
+    }
+    resequence(events);
+}
+
 fn values_to_ndjson(events: Vec<Value>) -> String {
     events
         .into_iter()
         .map(|event| event.to_string())
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn node_id_by_display_name(events: &[Value], display_name: &str) -> String {
+    events
+        .iter()
+        .find(|event| {
+            event["event"] == "node_upsert"
+                && event["node"]["display_name"].as_str() == Some(display_name)
+        })
+        .unwrap_or_else(|| panic!("missing node {display_name}"))["node"]["id"]
+        .as_str()
+        .expect("node ID")
+        .to_owned()
+}
+
+fn semantic_site_id(events: &[Value], site_kind: &str) -> String {
+    events
+        .iter()
+        .find(|event| {
+            event["event"] == "dependency_site" && event["site"]["kind"].as_str() == Some(site_kind)
+        })
+        .unwrap_or_else(|| panic!("missing {site_kind} site"))["site"]["id"]
+        .as_str()
+        .expect("site ID")
+        .to_owned()
+}
+
+fn linked_edge_mut<'a>(events: &'a mut [Value], site_id: &str) -> &'a mut Value {
+    &mut events
+        .iter_mut()
+        .find(|event| {
+            event["event"] == "edge_upsert" && event["edge"]["site_id"].as_str() == Some(site_id)
+        })
+        .unwrap_or_else(|| panic!("missing edge for site {site_id}"))["edge"]
+}
+
+fn rehash_json_site(site: &mut Value) -> String {
+    let primary = &site["evidence"][0];
+    let id = stable_id_from_value(
+        "site",
+        &json!({
+            "condition": site["condition"],
+            "kind": site["kind"],
+            "path": primary["path"],
+            "profile_id": site["profile_id"],
+            "source": site["source"],
+            "span": {
+                "end_column": primary["end_column"],
+                "end_line": primary["end_line"],
+                "start_column": primary["start_column"],
+                "start_line": primary["start_line"],
+            },
+        }),
+    );
+    site["id"] = json!(id);
+    id
+}
+
+fn rehash_json_edge(edge: &mut Value) {
+    edge["id"] = json!(stable_id_from_value(
+        "edge",
+        &json!({
+            "kind": edge["kind"],
+            "site_id": edge["site_id"],
+            "target": edge["target"],
+        }),
+    ));
+}
+
+fn reassign_site_source(events: &mut [Value], site_kind: &str, source: &str) {
+    let site_index = events
+        .iter()
+        .position(|event| {
+            event["event"] == "dependency_site" && event["site"]["kind"].as_str() == Some(site_kind)
+        })
+        .unwrap_or_else(|| panic!("missing {site_kind} site"));
+    let old_id = events[site_index]["site"]["id"]
+        .as_str()
+        .expect("old site ID")
+        .to_owned();
+    events[site_index]["site"]["source"] = json!(source);
+    let new_id = rehash_json_site(&mut events[site_index]["site"]);
+    for event in events.iter_mut().filter(|event| {
+        event["event"] == "edge_upsert"
+            && event["edge"]["site_id"].as_str() == Some(old_id.as_str())
+    }) {
+        event["edge"]["source"] = json!(source);
+        event["edge"]["site_id"] = json!(new_id);
+        rehash_json_edge(&mut event["edge"]);
+    }
+    resequence(events);
+}
+
+fn reassign_site_target(events: &mut [Value], site_kind: &str, target: &str) {
+    let site_index = events
+        .iter()
+        .position(|event| {
+            event["event"] == "dependency_site" && event["site"]["kind"].as_str() == Some(site_kind)
+        })
+        .unwrap_or_else(|| panic!("missing {site_kind} site"));
+    let site_id = events[site_index]["site"]["id"]
+        .as_str()
+        .expect("site ID")
+        .to_owned();
+    events[site_index]["site"]["target_ids"] = json!([target]);
+    let edge = linked_edge_mut(events, &site_id);
+    edge["target"] = json!(target);
+    rehash_json_edge(edge);
+}
+
+fn insert_file_node(events: &mut Vec<Value>, id: &str) {
+    insert_plain_node(events, id, "file");
+}
+
+fn insert_plain_node(events: &mut Vec<Value>, id: &str, kind: &str) {
+    let first_site = events
+        .iter()
+        .position(|event| event["event"] == "dependency_site")
+        .expect("dependency sites");
+    events.insert(
+        first_site,
+        json!({
+            "event": "node_upsert",
+            "protocol_version": "1.0",
+            "scan_id": "scan-rust-semantic-golden",
+            "adapter": "rust",
+            "adapter_version": "0.1.0",
+            "seq": 0,
+            "node": {
+                "id": id,
+                "kind": kind,
+                "locator": format!("fixture:{kind}:{id}"),
+                "display_name": id,
+                "properties": {},
+            },
+        }),
+    );
+    resequence(events);
+}
+
+fn sort_edge_events(events: &mut [Value]) {
+    let first = events
+        .iter()
+        .position(|event| event["event"] == "edge_upsert")
+        .expect("edge events");
+    let last = events
+        .iter()
+        .rposition(|event| event["event"] == "edge_upsert")
+        .expect("edge events");
+    events[first..=last].sort_by(|left, right| {
+        left["edge"]["id"]
+            .as_str()
+            .cmp(&right["edge"]["id"].as_str())
+    });
 }
 
 fn schema_accepts_stream(input: &str) -> bool {
@@ -723,32 +1696,46 @@ fn schema_accepts_stream(input: &str) -> bool {
 
 fn semantic_schema_accepts_stream(input: &str) -> bool {
     let schema: Value = serde_json::from_str(PROTOCOL_SCHEMA).expect("schema JSON");
-    input.lines().all(|line| {
-        let event: Value = match serde_json::from_str(line) {
-            Ok(event) => event,
-            Err(_) => return false,
-        };
-        match event["event"].as_str() {
-            Some("node_upsert")
-                if matches!(event["node"]["kind"].as_str(), Some("symbol" | "type")) =>
-            {
-                semantic_definition_accepts(&schema, "semantic_node", &event["node"])
-            }
-            Some("edge_upsert")
-                if matches!(
-                    event["edge"]["kind"].as_str(),
-                    Some("type_uses" | "calls" | "may_call")
-                ) =>
-            {
-                semantic_definition_accepts(&schema, "semantic_edge", &event["edge"])
-            }
-            Some("dependency_site")
-                if matches!(event["site"]["kind"].as_str(), Some("call" | "type_use")) =>
-            {
-                semantic_definition_accepts(&schema, "semantic_site", &event["site"])
-            }
-            _ => true,
+    let events: Vec<Value> = match input.lines().map(serde_json::from_str).collect() {
+        Ok(events) => events,
+        Err(_) => return false,
+    };
+    let strict_dependency_site_ids: BTreeSet<_> = events
+        .iter()
+        .filter(|event| {
+            event["event"] == "dependency_site"
+                && matches!(
+                    event["site"]["kind"].as_str(),
+                    Some("type_use" | "rust_use" | "rust_reexport")
+                )
+                && event["site"]["evidence"][0]["kind"] == "semantic"
+        })
+        .filter_map(|event| event["site"]["id"].as_str())
+        .collect();
+
+    events.iter().all(|event| match event["event"].as_str() {
+        Some("node_upsert")
+            if matches!(event["node"]["kind"].as_str(), Some("symbol" | "type")) =>
+        {
+            semantic_definition_accepts(&schema, "semantic_node", &event["node"])
         }
+        Some("edge_upsert")
+            if matches!(event["edge"]["kind"].as_str(), Some("calls" | "may_call"))
+                || event["edge"]["site_id"]
+                    .as_str()
+                    .is_some_and(|site_id| strict_dependency_site_ids.contains(site_id)) =>
+        {
+            semantic_definition_accepts(&schema, "semantic_edge", &event["edge"])
+        }
+        Some("dependency_site")
+            if event["site"]["kind"] == "call"
+                || event["site"]["id"]
+                    .as_str()
+                    .is_some_and(|site_id| strict_dependency_site_ids.contains(site_id)) =>
+        {
+            semantic_definition_accepts(&schema, "semantic_site", &event["site"])
+        }
+        _ => true,
     })
 }
 

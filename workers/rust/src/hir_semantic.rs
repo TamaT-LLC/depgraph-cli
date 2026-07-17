@@ -1,19 +1,24 @@
 //! Deterministic Rust HIR definition graph extraction.
 //!
-//! This pass consumes only the already-confined [`SafeProjectModel`]. It does
-//! not perform import/type-use or call-site extraction; those are deliberately
-//! separate vertical slices. All output is accumulated in a delta so the
-//! scanner can validate and merge it atomically with the syntax graph.
+//! This pass consumes only the already-confined [`SafeProjectModel`] and emits
+//! definitions, imports, re-exports, and type references. All output is
+//! accumulated in a delta so the scanner can validate and merge it atomically
+//! with the syntax graph. Call-site extraction remains a separate slice.
 
-use crate::{RUST_ANALYZER_CRATE_VERSION, RUST_ANALYZER_REVISION, hir_project::SafeProjectModel};
+use crate::{
+    ADAPTER_VERSION, EXTRACTOR as SOURCE_EXTRACTOR, RUST_ANALYZER_CRATE_VERSION,
+    RUST_ANALYZER_REVISION,
+    hir_project::SafeProjectModel,
+    source::{Occurrence, SourceSpan, TypeUseContext, TypeUseOccurrenceKey, UseOccurrenceKey},
+};
 use anyhow::{Result, bail};
 use depgraph_protocol::{
-    Condition, Evidence, EvidenceKind, GraphEdge, GraphNode, Phase, Precision, Properties,
-    ResolutionStatus, stable_id_from_value,
+    Condition, DependencySite, Evidence, EvidenceKind, GraphEdge, GraphNode, Phase, Precision,
+    Properties, ResolutionStatus, stable_id_from_value,
 };
 use ra_ap_hir::{
     Adt, AsAssocItem, AssocItem, AssocItemContainer, Crate, GenericDef, GenericParam, Impl, InFile,
-    Module, ModuleDef, Mutability, Semantics, Type, attach_db,
+    Module, ModuleDef, Mutability, PathResolution, PathResolutionPerNs, Semantics, Type, attach_db,
 };
 use ra_ap_ide_db::{
     RootDatabase,
@@ -46,6 +51,9 @@ pub(crate) struct SemanticIssue {
 pub(crate) struct SemanticDelta {
     pub nodes: Vec<GraphNode>,
     pub edges: Vec<GraphEdge>,
+    pub sites: Vec<DependencySite>,
+    pub refined_use_keys: BTreeSet<UseOccurrenceKey>,
+    pub refined_type_use_keys: BTreeSet<TypeUseOccurrenceKey>,
     pub issues: Vec<SemanticIssue>,
 }
 
@@ -60,6 +68,17 @@ struct SourceLocation {
 }
 
 impl SourceLocation {
+    fn from_span(path: &str, span: SourceSpan) -> Self {
+        Self {
+            path: path.into(),
+            start_line: span.start_line,
+            start_column: span.start_column,
+            end_line: span.end_line,
+            end_column: span.end_column,
+            generated: false,
+        }
+    }
+
     fn as_value(&self) -> Value {
         json!({
             "start_line": self.start_line,
@@ -75,21 +94,50 @@ struct Extractor<'a> {
     db: &'a RootDatabase,
     sema: Semantics<'a, RootDatabase>,
     contexts: &'a BTreeMap<String, SemanticCrateContext>,
+    occurrences_by_path: &'a BTreeMap<String, Vec<Occurrence>>,
     profile_id: &'a str,
     paths_by_file: BTreeMap<u32, String>,
     crate_keys_by_base: HashMap<ra_ap_ide_db::base_db::Crate, String>,
     nodes: BTreeMap<String, GraphNode>,
     edges: BTreeMap<String, GraphEdge>,
+    sites: BTreeMap<String, DependencySite>,
+    refined_use_keys: BTreeSet<UseOccurrenceKey>,
+    refined_type_use_keys: BTreeSet<TypeUseOccurrenceKey>,
     node_ids: HashMap<Definition, String>,
     resolvers: HashMap<Definition, String>,
     impl_ids: HashMap<Impl, String>,
     impl_resolvers: HashMap<Impl, String>,
+    external_crates: BTreeMap<(String, String), String>,
+    external_aliases: BTreeMap<(String, Vec<String>, String), BTreeSet<ExternalAlias>>,
     issues: BTreeMap<(String, Option<String>, String), SemanticIssue>,
+}
+
+#[derive(Clone, Debug)]
+struct SemanticResolution {
+    target_ids: Vec<String>,
+    status: ResolutionStatus,
+    precision: Precision,
+    reason: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+enum ClassifiedTarget {
+    Concrete { node_id: String, external: bool },
+    Unsupported(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct ExternalAlias {
+    target_specifier: String,
+    external_name: String,
+    external_kind: String,
+    condition_terms: Vec<String>,
 }
 
 pub(crate) fn extract_semantic_delta(
     model: &SafeProjectModel,
     contexts: &BTreeMap<String, SemanticCrateContext>,
+    occurrences_by_path: &BTreeMap<String, Vec<Occurrence>>,
     profile_id: &str,
 ) -> Result<SemanticDelta> {
     let db = model.database();
@@ -104,26 +152,49 @@ pub(crate) fn extract_semantic_delta(
         .iter()
         .map(|file| (file.file_id, file.path.clone()))
         .collect();
+    let external_crates = model
+        .snapshot()
+        .externals
+        .iter()
+        .map(|external| {
+            (
+                (external.from_crate.clone(), external.name.clone()),
+                serde_json::to_value(external.kind)
+                    .ok()
+                    .and_then(|value| value.as_str().map(str::to_owned))
+                    .unwrap_or_else(|| format!("{:?}", external.kind)),
+            )
+        })
+        .collect();
     let mut extractor = Extractor {
         model,
         db,
         sema: Semantics::new(db),
         contexts,
+        occurrences_by_path,
         profile_id,
         paths_by_file,
         crate_keys_by_base,
         nodes: BTreeMap::new(),
         edges: BTreeMap::new(),
+        sites: BTreeMap::new(),
+        refined_use_keys: BTreeSet::new(),
+        refined_type_use_keys: BTreeSet::new(),
         node_ids: HashMap::new(),
         resolvers: HashMap::new(),
         impl_ids: HashMap::new(),
         impl_resolvers: HashMap::new(),
+        external_crates,
+        external_aliases: BTreeMap::new(),
         issues: BTreeMap::new(),
     };
     attach_db(db, || extractor.extract())?;
     Ok(SemanticDelta {
         nodes: extractor.nodes.into_values().collect(),
         edges: extractor.edges.into_values().collect(),
+        sites: extractor.sites.into_values().collect(),
+        refined_use_keys: extractor.refined_use_keys,
+        refined_type_use_keys: extractor.refined_type_use_keys,
         issues: extractor.issues.into_values().collect(),
     })
 }
@@ -200,6 +271,12 @@ impl Extractor<'_> {
 
         for module in modules {
             let module_path = self.module_path(module);
+            if let Some(module_id) = self.module_owner(crate_key, &module_path) {
+                let definition = Definition::Module(module);
+                self.node_ids.insert(definition, module_id);
+                self.resolvers
+                    .insert(definition, self.module_resolver(crate_key, &module_path));
+            }
             if !module.is_crate_root(self.db) {
                 self.emit_module_declaration(crate_key, module, &module_path)?;
             }
@@ -749,6 +826,7 @@ impl Extractor<'_> {
             .iter()
             .map(|file| (file.file_id, file.path.clone()))
             .collect();
+        let mut dependency_sources = Vec::new();
         for (raw_file_id, path) in files {
             let file_id = FileId::from_raw(raw_file_id);
             let modules: Vec<_> = self
@@ -813,6 +891,1232 @@ impl Extractor<'_> {
                 }
                 self.emit_generic_reference(&crate_key, file_id, &name_ref)?;
             }
+            let occurrences = self
+                .occurrences_by_path
+                .get(&path)
+                .cloned()
+                .unwrap_or_default();
+            self.index_external_aliases(&crate_key, file_id, module, &parsed, &occurrences);
+            dependency_sources.push((crate_key, file_id, path, module, parsed));
+        }
+        for (crate_key, file_id, path, module, parsed) in dependency_sources {
+            self.extract_dependency_occurrences(&crate_key, file_id, &path, module, &parsed)?;
+        }
+        Ok(())
+    }
+
+    fn extract_dependency_occurrences(
+        &mut self,
+        crate_key: &str,
+        file_id: FileId,
+        path: &str,
+        module: Module,
+        parsed: &ast::SourceFile,
+    ) -> Result<()> {
+        let occurrences = self
+            .occurrences_by_path
+            .get(path)
+            .cloned()
+            .unwrap_or_default();
+        for occurrence in occurrences {
+            let use_key = occurrence.use_key(path);
+            let type_use_key = occurrence.type_use_key(path);
+            match occurrence {
+                Occurrence::Use {
+                    target_specifier,
+                    site_specifier,
+                    alias,
+                    glob,
+                    reexport,
+                    condition,
+                    span,
+                    ..
+                } => {
+                    self.emit_use_occurrence(
+                        crate_key,
+                        file_id,
+                        path,
+                        module,
+                        parsed,
+                        &target_specifier,
+                        &site_specifier,
+                        alias.as_deref(),
+                        glob,
+                        reexport,
+                        condition,
+                        span,
+                        use_key.expect("use occurrence has a use key"),
+                    )?;
+                }
+                Occurrence::TypeUse {
+                    specifier,
+                    context,
+                    inline_ancestors,
+                    condition,
+                    span,
+                } => {
+                    self.emit_type_use_occurrence(
+                        crate_key,
+                        file_id,
+                        path,
+                        module,
+                        parsed,
+                        &specifier,
+                        context,
+                        &inline_ancestors,
+                        condition,
+                        span,
+                        type_use_key.expect("type-use occurrence has a type-use key"),
+                    )?;
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn index_external_aliases(
+        &mut self,
+        crate_key: &str,
+        file_id: FileId,
+        module: Module,
+        parsed: &ast::SourceFile,
+        occurrences: &[Occurrence],
+    ) {
+        for occurrence in occurrences {
+            let (target_specifier, alias, glob, inline_ancestors, condition, span, extern_crate) =
+                match occurrence {
+                    Occurrence::Use {
+                        target_specifier,
+                        alias,
+                        glob,
+                        inline_ancestors,
+                        condition,
+                        span,
+                        ..
+                    } => (
+                        target_specifier,
+                        alias,
+                        *glob,
+                        inline_ancestors,
+                        condition,
+                        *span,
+                        false,
+                    ),
+                    Occurrence::ExternCrate {
+                        specifier,
+                        alias,
+                        inline_ancestors,
+                        condition,
+                        span,
+                    } => (
+                        specifier,
+                        alias,
+                        false,
+                        inline_ancestors,
+                        condition,
+                        *span,
+                        true,
+                    ),
+                    _ => continue,
+                };
+            if glob || alias.as_deref() == Some("_") {
+                continue;
+            }
+            let Some((external_name, external_kind)) =
+                self.external_metadata(crate_key, target_specifier)
+            else {
+                continue;
+            };
+            let module_level = if extern_crate {
+                let mut matches = parsed
+                    .syntax()
+                    .descendants()
+                    .filter_map(ast::ExternCrate::cast)
+                    .filter(|item| {
+                        self.range_matches_span(file_id, item.syntax().text_range(), span)
+                    });
+                let Some(item) = matches.next() else {
+                    continue;
+                };
+                matches.next().is_none()
+                    && !item
+                        .syntax()
+                        .ancestors()
+                        .any(|node| ast::StmtList::can_cast(node.kind()))
+            } else {
+                let mut matches = parsed
+                    .syntax()
+                    .descendants()
+                    .filter_map(ast::UseTree::cast)
+                    .filter(|tree| tree.use_tree_list().is_none())
+                    .filter(|tree| {
+                        self.range_matches_span(file_id, tree.syntax().text_range(), span)
+                    })
+                    .filter(|tree| tree.star_token().is_some() == glob)
+                    .filter(|tree| self.use_tree_alias(tree).as_deref() == alias.as_deref());
+                let Some(tree) = matches.next() else {
+                    continue;
+                };
+                matches.next().is_none()
+                    && !tree
+                        .syntax()
+                        .ancestors()
+                        .any(|node| ast::StmtList::can_cast(node.kind()))
+            };
+            if !module_level {
+                // Block-local aliases require lexical scope ranges. Keep their
+                // downstream type uses unresolved rather than leaking a name
+                // into the surrounding module.
+                continue;
+            }
+            let visible_name = alias.as_deref().or_else(|| {
+                target_specifier
+                    .trim_start_matches("::")
+                    .rsplit("::")
+                    .next()
+            });
+            let Some(visible_name) = visible_name.filter(|name| !name.is_empty()) else {
+                continue;
+            };
+            let mut module_path = self.module_path(module);
+            module_path.extend(inline_ancestors.iter().cloned());
+            let key = (crate_key.into(), module_path, visible_name.into());
+            self.external_aliases
+                .entry(key)
+                .or_default()
+                .insert(ExternalAlias {
+                    target_specifier: target_specifier.clone(),
+                    external_name,
+                    external_kind,
+                    condition_terms: condition_conjuncts(condition),
+                });
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit_use_occurrence(
+        &mut self,
+        crate_key: &str,
+        file_id: FileId,
+        path: &str,
+        module: Module,
+        parsed: &ast::SourceFile,
+        target_specifier: &str,
+        site_specifier: &str,
+        alias: Option<&str>,
+        glob: bool,
+        reexport: bool,
+        condition: Condition,
+        span: SourceSpan,
+        use_key: UseOccurrenceKey,
+    ) -> Result<()> {
+        let mut matches: Vec<_> = parsed
+            .syntax()
+            .descendants()
+            .filter_map(ast::UseTree::cast)
+            .filter(|tree| tree.use_tree_list().is_none())
+            .filter(|tree| self.range_matches_span(file_id, tree.syntax().text_range(), span))
+            .filter(|tree| tree.star_token().is_some() == glob)
+            .filter(|tree| self.use_tree_alias(tree).as_deref() == alias)
+            .collect();
+        if matches.len() != 1 {
+            self.issue(
+                "RUST_HIR_USE_SOURCE_UNAVAILABLE",
+                Some(path.into()),
+                format!(
+                    "semantic use leaf {site_specifier:?} at {}:{} matched {} rust-analyzer syntax nodes",
+                    span.start_line,
+                    span.start_column,
+                    matches.len()
+                ),
+            );
+            return Ok(());
+        }
+        let tree = matches.pop().expect("one use tree");
+        if tree
+            .syntax()
+            .ancestors()
+            .any(|node| ast::MacroCall::can_cast(node.kind()))
+        {
+            self.issue(
+                "RUST_HIR_MACRO_USE_SKIPPED",
+                Some(path.into()),
+                format!(
+                    "use leaf {site_specifier:?} was skipped because exact macro provenance is unavailable"
+                ),
+            );
+            return Ok(());
+        }
+        let Some(source) = self.semantic_owner_id(tree.syntax(), module, false) else {
+            self.issue(
+                "RUST_HIR_USE_OWNER_UNAVAILABLE",
+                Some(path.into()),
+                format!("use leaf {site_specifier:?} has no exact semantic owner"),
+            );
+            return Ok(());
+        };
+        let resolution_path = tree.path().or_else(|| {
+            tree.syntax()
+                .ancestors()
+                .skip(1)
+                .filter_map(ast::UseTree::cast)
+                .find_map(|parent| parent.path())
+        });
+        let per_namespace = resolution_path
+            .as_ref()
+            .and_then(|resolution_path| self.sema.resolve_path_per_ns(resolution_path));
+        let location = SourceLocation::from_span(path, span);
+        let (site_kind, edge_kind) = if reexport {
+            ("rust_reexport", "reexports")
+        } else {
+            ("rust_use", "imports")
+        };
+        let (resolution, namespaces) = self.classify_import_resolution(
+            crate_key,
+            site_kind,
+            target_specifier,
+            &location,
+            per_namespace,
+        )?;
+        let mut evidence_properties = Properties::new();
+        evidence_properties.insert("target_specifier".into(), json!(target_specifier));
+        evidence_properties.insert("glob".into(), json!(glob));
+        evidence_properties.insert("reexport".into(), json!(reexport));
+        evidence_properties.insert("namespaces".into(), json!(namespaces));
+        if let Some(alias) = alias {
+            evidence_properties.insert("alias".into(), json!(alias));
+        }
+        self.add_dependency_site(
+            crate_key,
+            site_kind,
+            edge_kind,
+            &source,
+            site_specifier,
+            condition,
+            resolution,
+            &location,
+            "HIR-resolved Rust use",
+            "use",
+            evidence_properties,
+        )?;
+        self.refined_use_keys.insert(use_key);
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit_type_use_occurrence(
+        &mut self,
+        crate_key: &str,
+        file_id: FileId,
+        path: &str,
+        module: Module,
+        parsed: &ast::SourceFile,
+        specifier: &str,
+        context: TypeUseContext,
+        inline_ancestors: &[String],
+        condition: Condition,
+        span: SourceSpan,
+        type_use_key: TypeUseOccurrenceKey,
+    ) -> Result<()> {
+        let mut matches: Vec<_> = parsed
+            .syntax()
+            .descendants()
+            .filter_map(ast::PathType::cast)
+            .filter_map(|path_type| path_type.path().map(|path| (path_type, path)))
+            .filter(|(_, type_path)| {
+                self.range_matches_span(file_id, type_path.syntax().text_range(), span)
+            })
+            .collect();
+        if matches.len() != 1 {
+            // syn represents a receiver such as `&self` as a synthetic
+            // `Self` type. There is no explicit path for rust-analyzer to
+            // attach a PathType (and therefore no dependency site) to.
+            if specifier == "Self" && matches.is_empty() {
+                return Ok(());
+            }
+            self.issue(
+                "RUST_HIR_TYPE_USE_SOURCE_UNAVAILABLE",
+                Some(path.into()),
+                format!(
+                    "type reference {specifier:?} at {}:{} matched {} rust-analyzer path-type nodes",
+                    span.start_line,
+                    span.start_column,
+                    matches.len()
+                ),
+            );
+            return Ok(());
+        }
+        let (path_type, type_path) = matches.pop().expect("one type path");
+        if path_type
+            .syntax()
+            .ancestors()
+            .any(|node| ast::MacroCall::can_cast(node.kind()))
+        {
+            self.issue(
+                "RUST_HIR_MACRO_TYPE_USE_SKIPPED",
+                Some(path.into()),
+                format!(
+                    "type reference {specifier:?} was skipped because exact macro provenance is unavailable"
+                ),
+            );
+            return Ok(());
+        }
+        let Some(source) = self.semantic_owner_id(path_type.syntax(), module, true) else {
+            self.issue(
+                "RUST_HIR_TYPE_USE_OWNER_UNAVAILABLE",
+                Some(path.into()),
+                format!("type reference {specifier:?} has no exact symbol/type owner"),
+            );
+            return Ok(());
+        };
+        let type_resolution = self
+            .sema
+            .resolve_path_per_ns(&type_path)
+            .and_then(|resolution| resolution.type_ns);
+        let location = SourceLocation::from_span(path, span);
+        let mut lexical_module_path = self.module_path(module);
+        lexical_module_path.extend(inline_ancestors.iter().cloned());
+        let resolution = self.classify_type_resolution(
+            crate_key,
+            specifier,
+            &lexical_module_path,
+            &condition,
+            &location,
+            type_resolution,
+        )?;
+        let mut evidence_properties = Properties::new();
+        evidence_properties.insert("type_use_context".into(), json!(context.as_str()));
+        self.add_dependency_site(
+            crate_key,
+            "type_use",
+            "type_uses",
+            &source,
+            specifier,
+            condition,
+            resolution,
+            &location,
+            "HIR-resolved Rust type reference",
+            "type-use",
+            evidence_properties,
+        )?;
+        self.refined_type_use_keys.insert(type_use_key);
+        Ok(())
+    }
+
+    fn use_tree_alias(&self, tree: &ast::UseTree) -> Option<String> {
+        tree.rename().map(|rename| {
+            ast::HasName::name(&rename)
+                .map(|name| name.text().to_string())
+                .unwrap_or_else(|| "_".into())
+        })
+    }
+
+    fn range_matches_span(&self, file_id: FileId, range: TextRange, span: SourceSpan) -> bool {
+        let index = line_index(self.db, file_id);
+        let Some(start) = index.try_line_col(range.start()) else {
+            return false;
+        };
+        let Some(end) = index.try_line_col(range.end()) else {
+            return false;
+        };
+        start.line + 1 == span.start_line
+            && start.col + 1 == span.start_column
+            && end.line + 1 == span.end_line
+            && end.col + 1 == span.end_column
+    }
+
+    fn semantic_owner_id(
+        &self,
+        node: &SyntaxNode,
+        root_module: Module,
+        type_use: bool,
+    ) -> Option<String> {
+        let definition = self.enclosing_semantic_definition(node);
+        let node_id = definition
+            .and_then(|definition| self.node_ids.get(&definition).cloned())
+            .or_else(|| {
+                (!type_use)
+                    .then(|| self.node_ids.get(&Definition::Module(root_module)).cloned())
+                    .flatten()
+            })?;
+        if type_use
+            && self
+                .nodes
+                .get(&node_id)
+                .is_none_or(|owner| !matches!(owner.kind.as_str(), "symbol" | "type"))
+        {
+            return None;
+        }
+        Some(node_id)
+    }
+
+    fn enclosing_semantic_definition(&self, node: &SyntaxNode) -> Option<Definition> {
+        for ancestor in node.ancestors().skip(1) {
+            if let Some(parameter) = ast::TypeParam::cast(ancestor.clone()) {
+                return self
+                    .sema
+                    .to_def(&parameter)
+                    .map(GenericParam::TypeParam)
+                    .map(Definition::GenericParam);
+            }
+            if let Some(field) = ast::RecordField::cast(ancestor.clone()) {
+                return self.sema.to_def(&field).map(Definition::Field);
+            }
+            if let Some(field) = ast::TupleField::cast(ancestor.clone()) {
+                return self.sema.to_def(&field).map(Definition::Field);
+            }
+            if let Some(function) = ast::Fn::cast(ancestor.clone()) {
+                return self.sema.to_fn_def(&function).map(Definition::Function);
+            }
+            if let Some(constant) = ast::Const::cast(ancestor.clone()) {
+                return self.sema.to_def(&constant).map(Definition::Const);
+            }
+            if let Some(static_) = ast::Static::cast(ancestor.clone()) {
+                return self.sema.to_def(&static_).map(Definition::Static);
+            }
+            if let Some(alias) = ast::TypeAlias::cast(ancestor.clone()) {
+                return self.sema.to_def(&alias).map(Definition::TypeAlias);
+            }
+            if let Some(struct_) = ast::Struct::cast(ancestor.clone()) {
+                return self
+                    .sema
+                    .to_def(&struct_)
+                    .map(Adt::Struct)
+                    .map(Definition::Adt);
+            }
+            if let Some(enum_) = ast::Enum::cast(ancestor.clone()) {
+                return self.sema.to_def(&enum_).map(Adt::Enum).map(Definition::Adt);
+            }
+            if let Some(union) = ast::Union::cast(ancestor.clone()) {
+                return self
+                    .sema
+                    .to_def(&union)
+                    .map(Adt::Union)
+                    .map(Definition::Adt);
+            }
+            if let Some(trait_) = ast::Trait::cast(ancestor.clone()) {
+                return self.sema.to_def(&trait_).map(Definition::Trait);
+            }
+            if let Some(impl_) = ast::Impl::cast(ancestor.clone()) {
+                return self.sema.to_def(&impl_).map(Definition::SelfType);
+            }
+            if let Some(module) = ast::Module::cast(ancestor) {
+                return self.sema.to_module_def(&module).map(Definition::Module);
+            }
+        }
+        None
+    }
+
+    fn classify_import_resolution(
+        &mut self,
+        crate_key: &str,
+        site_kind: &str,
+        specifier: &str,
+        location: &SourceLocation,
+        per_namespace: Option<PathResolutionPerNs>,
+    ) -> Result<(SemanticResolution, Vec<String>)> {
+        let Some(per_namespace) = per_namespace else {
+            return Ok((
+                self.external_or_unresolved(
+                    crate_key,
+                    site_kind,
+                    "import",
+                    specifier,
+                    location,
+                    "rust-analyzer could not resolve the use path",
+                )?,
+                Vec::new(),
+            ));
+        };
+
+        let mut namespaces = Vec::new();
+        let mut targets = BTreeMap::<String, bool>::new();
+        let mut unsupported = Vec::new();
+        for (namespace, resolution) in [
+            ("type", per_namespace.type_ns),
+            ("value", per_namespace.value_ns),
+            ("macro", per_namespace.macro_ns),
+        ] {
+            let Some(resolution) = resolution else {
+                continue;
+            };
+            namespaces.push(namespace.to_owned());
+            match self.classify_import_target(crate_key, specifier, resolution)? {
+                ClassifiedTarget::Concrete { node_id, external } => {
+                    targets
+                        .entry(node_id)
+                        .and_modify(|seen_external| *seen_external &= external)
+                        .or_insert(external);
+                }
+                ClassifiedTarget::Unsupported(reason) => unsupported.push(reason),
+            }
+        }
+
+        if !unsupported.is_empty() {
+            let reason = format!(
+                "the HIR use target cannot be represented exactly: {}",
+                unsupported.join("; ")
+            );
+            self.issue(
+                "RUST_HIR_USE_TARGET_UNREPRESENTABLE",
+                Some(location.path.clone()),
+                reason.clone(),
+            );
+            return Ok((
+                self.unresolved_resolution(crate_key, site_kind, specifier, location, &reason)?,
+                namespaces,
+            ));
+        }
+
+        let target_ids: Vec<_> = targets.keys().cloned().collect();
+        let resolution = match target_ids.len() {
+            0 => self.external_or_unresolved(
+                crate_key,
+                site_kind,
+                "import",
+                specifier,
+                location,
+                "rust-analyzer returned no representable use target",
+            )?,
+            1 => {
+                let external = targets.values().next().copied().unwrap_or(false);
+                SemanticResolution {
+                    target_ids,
+                    status: if external {
+                        ResolutionStatus::External
+                    } else {
+                        ResolutionStatus::Resolved
+                    },
+                    precision: Precision::Exact,
+                    reason: None,
+                }
+            }
+            _ => SemanticResolution {
+                target_ids,
+                status: ResolutionStatus::Candidates,
+                precision: Precision::Overapprox,
+                reason: Some("the use path resolves to distinct Rust namespace targets".into()),
+            },
+        };
+        Ok((resolution, namespaces))
+    }
+
+    fn classify_import_target(
+        &mut self,
+        crate_key: &str,
+        specifier: &str,
+        resolution: PathResolution,
+    ) -> Result<ClassifiedTarget> {
+        match resolution {
+            PathResolution::Def(ModuleDef::BuiltinType(builtin)) => {
+                let node_id = self.ensure_external_target(
+                    crate_key,
+                    specifier,
+                    "import",
+                    "builtin",
+                    "rust-builtin",
+                    Some(builtin.name().as_str()),
+                )?;
+                Ok(ClassifiedTarget::Concrete {
+                    node_id,
+                    external: true,
+                })
+            }
+            PathResolution::Def(ModuleDef::Macro(_)) => Ok(ClassifiedTarget::Unsupported(
+                "macro namespace target has no exact non-expanded semantic node".into(),
+            )),
+            PathResolution::Def(definition) => {
+                self.classify_definition_target(crate_key, specifier, "import", definition.into())
+            }
+            PathResolution::TypeParam(parameter) => self.classify_definition_target(
+                crate_key,
+                specifier,
+                "import",
+                Definition::GenericParam(GenericParam::TypeParam(parameter)),
+            ),
+            PathResolution::Local(local) => self.classify_definition_target(
+                crate_key,
+                specifier,
+                "import",
+                Definition::Local(local),
+            ),
+            PathResolution::SelfType(_) => Ok(ClassifiedTarget::Unsupported(
+                "Self in a use path has no concrete import target".into(),
+            )),
+            PathResolution::ConstParam(_) => Ok(ClassifiedTarget::Unsupported(
+                "const parameter cannot be represented as an import target".into(),
+            )),
+            PathResolution::BuiltinAttr(_)
+            | PathResolution::ToolModule(_)
+            | PathResolution::DeriveHelper(_) => Ok(ClassifiedTarget::Unsupported(
+                "attribute/tool resolution is outside the import graph vocabulary".into(),
+            )),
+        }
+    }
+
+    fn classify_definition_target(
+        &mut self,
+        crate_key: &str,
+        specifier: &str,
+        target_kind: &str,
+        definition: Definition,
+    ) -> Result<ClassifiedTarget> {
+        if let Some(node_id) = self.node_ids.get(&definition).cloned() {
+            return Ok(ClassifiedTarget::Concrete {
+                node_id,
+                external: false,
+            });
+        }
+
+        let local_definition = definition
+            .krate(self.db)
+            .is_some_and(|krate| self.crate_keys_by_base.contains_key(&krate.base()));
+        if local_definition {
+            return Ok(ClassifiedTarget::Unsupported(format!(
+                "local definition {:?} was omitted from the exact HIR node graph",
+                definition
+            )));
+        }
+
+        let (external_name, external_kind) = self
+            .external_metadata(crate_key, specifier)
+            .unwrap_or_else(|| ("external".into(), "rust-analyzer-external".into()));
+        let display_name = self.definition_name(definition);
+        let node_id = self.ensure_external_target(
+            crate_key,
+            specifier,
+            target_kind,
+            &external_name,
+            &external_kind,
+            display_name.as_deref(),
+        )?;
+        Ok(ClassifiedTarget::Concrete {
+            node_id,
+            external: true,
+        })
+    }
+
+    fn classify_type_resolution(
+        &mut self,
+        crate_key: &str,
+        specifier: &str,
+        lexical_module_path: &[String],
+        condition: &Condition,
+        location: &SourceLocation,
+        resolution: Option<PathResolution>,
+    ) -> Result<SemanticResolution> {
+        let Some(resolution) = resolution else {
+            return self.external_type_or_unresolved(
+                crate_key,
+                specifier,
+                lexical_module_path,
+                condition,
+                location,
+                "rust-analyzer could not resolve the type path",
+            );
+        };
+
+        let target = match resolution {
+            PathResolution::Def(ModuleDef::BuiltinType(builtin)) => {
+                let node_id = self.ensure_external_target(
+                    crate_key,
+                    specifier,
+                    "type",
+                    "builtin",
+                    "rust-builtin",
+                    Some(builtin.name().as_str()),
+                )?;
+                ClassifiedTarget::Concrete {
+                    node_id,
+                    external: true,
+                }
+            }
+            PathResolution::Def(ModuleDef::Macro(_)) => ClassifiedTarget::Unsupported(
+                "macro resolution cannot be represented as a type target".into(),
+            ),
+            PathResolution::Def(definition) => {
+                self.classify_definition_target(crate_key, specifier, "type", definition.into())?
+            }
+            PathResolution::TypeParam(parameter) if !parameter.is_implicit(self.db) => self
+                .classify_definition_target(
+                    crate_key,
+                    specifier,
+                    "type",
+                    Definition::GenericParam(GenericParam::TypeParam(parameter)),
+                )?,
+            PathResolution::TypeParam(parameter) => match parameter.parent(self.db) {
+                GenericDef::Trait(trait_) => self.classify_definition_target(
+                    crate_key,
+                    specifier,
+                    "type",
+                    Definition::Trait(trait_),
+                )?,
+                _ => ClassifiedTarget::Unsupported(
+                    "implicit impl-Trait parameter has no exact type node".into(),
+                ),
+            },
+            PathResolution::SelfType(impl_) => {
+                if let Some(adt) = impl_.self_ty(self.db).as_adt() {
+                    self.classify_definition_target(
+                        crate_key,
+                        specifier,
+                        "type",
+                        Definition::Adt(adt),
+                    )?
+                } else {
+                    ClassifiedTarget::Unsupported(
+                        "impl Self type is not a concrete nominal type".into(),
+                    )
+                }
+            }
+            PathResolution::Local(_) | PathResolution::ConstParam(_) => {
+                ClassifiedTarget::Unsupported("value resolution is not a type target".into())
+            }
+            PathResolution::BuiltinAttr(_)
+            | PathResolution::ToolModule(_)
+            | PathResolution::DeriveHelper(_) => ClassifiedTarget::Unsupported(
+                "attribute/tool resolution is not a type target".into(),
+            ),
+        };
+
+        match target {
+            ClassifiedTarget::Concrete { node_id, external } => {
+                if !external
+                    && self
+                        .nodes
+                        .get(&node_id)
+                        .is_none_or(|node| node.kind != "type")
+                {
+                    let reason = "resolved HIR target is not represented by a semantic type node";
+                    return self
+                        .unresolved_resolution(crate_key, "type_use", specifier, location, reason);
+                }
+                Ok(SemanticResolution {
+                    target_ids: vec![node_id],
+                    status: if external {
+                        ResolutionStatus::External
+                    } else {
+                        ResolutionStatus::Resolved
+                    },
+                    precision: Precision::Exact,
+                    reason: None,
+                })
+            }
+            ClassifiedTarget::Unsupported(reason) => {
+                self.unresolved_resolution(crate_key, "type_use", specifier, location, &reason)
+            }
+        }
+    }
+
+    fn external_or_unresolved(
+        &mut self,
+        crate_key: &str,
+        site_kind: &str,
+        target_kind: &str,
+        specifier: &str,
+        location: &SourceLocation,
+        unresolved_reason: &str,
+    ) -> Result<SemanticResolution> {
+        if let Some((external_name, external_kind)) = self.external_metadata(crate_key, specifier) {
+            let node_id = self.ensure_external_target(
+                crate_key,
+                specifier,
+                target_kind,
+                &external_name,
+                &external_kind,
+                None,
+            )?;
+            return Ok(SemanticResolution {
+                target_ids: vec![node_id],
+                status: ResolutionStatus::External,
+                precision: Precision::Heuristic,
+                reason: Some(format!(
+                    "the {external_name} crate is outside the confined rust-analyzer source model"
+                )),
+            });
+        }
+        self.unresolved_resolution(crate_key, site_kind, specifier, location, unresolved_reason)
+    }
+
+    fn external_type_or_unresolved(
+        &mut self,
+        crate_key: &str,
+        specifier: &str,
+        lexical_module_path: &[String],
+        condition: &Condition,
+        location: &SourceLocation,
+        unresolved_reason: &str,
+    ) -> Result<SemanticResolution> {
+        let external = self
+            .external_metadata(crate_key, specifier)
+            .map(|(name, kind)| {
+                (
+                    name.clone(),
+                    kind,
+                    format!(
+                        "qualified path is rooted in external crate {name}, whose source is outside the confined rust-analyzer model"
+                    ),
+                )
+            })
+            .or_else(|| {
+                self.external_alias_metadata(
+                    crate_key,
+                    lexical_module_path,
+                    specifier,
+                    condition,
+                )
+                .map(|(name, kind, imported)| {
+                    (
+                        name.clone(),
+                        kind,
+                        format!(
+                            "module-level external import maps {specifier} to {imported} in crate {name}"
+                        ),
+                    )
+                })
+            });
+        let Some((external_name, external_kind, reason)) = external else {
+            return self.unresolved_resolution(
+                crate_key,
+                "type_use",
+                specifier,
+                location,
+                unresolved_reason,
+            );
+        };
+        let node_id = self.ensure_external_target(
+            crate_key,
+            specifier,
+            "type",
+            &external_name,
+            &external_kind,
+            None,
+        )?;
+        Ok(SemanticResolution {
+            target_ids: vec![node_id],
+            status: ResolutionStatus::External,
+            precision: Precision::Heuristic,
+            reason: Some(reason),
+        })
+    }
+
+    fn external_alias_metadata(
+        &self,
+        crate_key: &str,
+        lexical_module_path: &[String],
+        specifier: &str,
+        condition: &Condition,
+    ) -> Option<(String, String, String)> {
+        if specifier.starts_with("::") {
+            return None;
+        }
+        let segments: Vec<_> = specifier.split("::").collect();
+        let mut index = 0;
+        let mut lookup_module_path = lexical_module_path.to_vec();
+        match segments.first().copied()? {
+            "self" => index = 1,
+            "crate" => {
+                lookup_module_path.clear();
+                index = 1;
+            }
+            "super" => {
+                while segments.get(index).copied() == Some("super") {
+                    lookup_module_path.pop()?;
+                    index += 1;
+                }
+            }
+            _ => {}
+        }
+        let visible_name = *segments.get(index)?;
+        if visible_name.is_empty() {
+            return None;
+        }
+        let suffix = segments[index + 1..].join("::");
+        let key = (crate_key.into(), lookup_module_path, visible_name.into());
+        let site_condition_terms = condition_conjuncts(condition);
+        let candidates: BTreeSet<_> = self
+            .external_aliases
+            .get(&key)?
+            .iter()
+            .filter(|alias| {
+                alias
+                    .condition_terms
+                    .iter()
+                    .all(|term| site_condition_terms.binary_search(term).is_ok())
+            })
+            .map(|alias| {
+                let target = if suffix.is_empty() {
+                    alias.target_specifier.clone()
+                } else {
+                    format!("{}::{suffix}", alias.target_specifier)
+                };
+                (
+                    alias.external_name.clone(),
+                    alias.external_kind.clone(),
+                    target,
+                )
+            })
+            .collect();
+        (candidates.len() == 1)
+            .then(|| candidates.into_iter().next())
+            .flatten()
+    }
+
+    fn unresolved_resolution(
+        &mut self,
+        crate_key: &str,
+        site_kind: &str,
+        specifier: &str,
+        location: &SourceLocation,
+        reason: &str,
+    ) -> Result<SemanticResolution> {
+        let node_id =
+            self.ensure_unknown_target(crate_key, site_kind, specifier, location, reason)?;
+        Ok(SemanticResolution {
+            target_ids: vec![node_id],
+            status: ResolutionStatus::Unresolved,
+            precision: Precision::Heuristic,
+            reason: Some(reason.into()),
+        })
+    }
+
+    fn external_metadata(&self, crate_key: &str, specifier: &str) -> Option<(String, String)> {
+        let root = specifier
+            .trim_start_matches("::")
+            .split("::")
+            .next()?
+            .trim_start_matches("r#");
+        if root.is_empty() || matches!(root, "crate" | "self" | "super" | "Self") {
+            return None;
+        }
+        if let Some(kind) = self
+            .external_crates
+            .get(&(crate_key.into(), root.into()))
+            .cloned()
+        {
+            return Some((root.into(), kind));
+        }
+        let normalized: BTreeSet<_> = self
+            .external_crates
+            .iter()
+            .filter(|((from_crate, _), _)| from_crate == crate_key)
+            .filter(|((_, name), _)| name.replace('-', "_") == root)
+            .map(|((_, name), kind)| (name.clone(), kind.clone()))
+            .collect();
+        (normalized.len() == 1)
+            .then(|| normalized.into_iter().next())
+            .flatten()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn ensure_external_target(
+        &mut self,
+        crate_key: &str,
+        specifier: &str,
+        target_kind: &str,
+        external_name: &str,
+        external_kind: &str,
+        display_name: Option<&str>,
+    ) -> Result<String> {
+        let identity = json!({
+            "language": "rust",
+            "profile_id": self.profile_id,
+            "crate_identity": crate_key,
+            "target_kind": target_kind,
+            "specifier": specifier,
+            "external_name": external_name,
+            "external_kind": external_kind,
+        });
+        let node_id = stable_id_from_value("external_system", &identity);
+        self.insert_node(GraphNode {
+            id: node_id.clone(),
+            kind: "external_system".into(),
+            locator: format!("rust-external:{external_name}:{specifier}"),
+            display_name: Some(display_name.unwrap_or(specifier).into()),
+            properties: properties(json!({
+                "language": "rust",
+                "ecosystem": "cargo",
+                "external": true,
+                "profile_id": self.profile_id,
+                "crate_identity": crate_key,
+                "target_kind": target_kind,
+                "specifier": specifier,
+                "external_name": external_name,
+                "external_kind": external_kind,
+                "canonical_identity": identity,
+                "hir_provenance": EXTRACTOR,
+            })),
+        })?;
+        Ok(node_id)
+    }
+
+    fn ensure_unknown_target(
+        &mut self,
+        crate_key: &str,
+        site_kind: &str,
+        specifier: &str,
+        location: &SourceLocation,
+        reason: &str,
+    ) -> Result<String> {
+        let identity = json!({
+            "language": "rust",
+            "profile_id": self.profile_id,
+            "crate_identity": crate_key,
+            "site_kind": site_kind,
+            "specifier": specifier,
+            "relative_path": location.path,
+            "span": location.as_value(),
+        });
+        let node_id = stable_id_from_value("unknown_target", &identity);
+        self.insert_node(GraphNode {
+            id: node_id.clone(),
+            kind: "unknown_target".into(),
+            locator: format!(
+                "unknown:rust:{site_kind}:{specifier}@{}:{}:{}",
+                location.path, location.start_line, location.start_column
+            ),
+            display_name: Some(specifier.into()),
+            properties: properties(json!({
+                "language": "rust",
+                "profile_id": self.profile_id,
+                "crate_identity": crate_key,
+                "site_kind": site_kind,
+                "specifier": specifier,
+                "reason": reason,
+                "canonical_identity": identity,
+            })),
+        })?;
+        Ok(node_id)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn add_dependency_site(
+        &mut self,
+        crate_key: &str,
+        site_kind: &str,
+        edge_kind: &str,
+        source: &str,
+        specifier: &str,
+        condition: Condition,
+        mut resolution: SemanticResolution,
+        location: &SourceLocation,
+        detail: &str,
+        hir_kind: &str,
+        evidence_properties: Properties,
+    ) -> Result<()> {
+        let condition = condition.canonicalize();
+        resolution.target_ids.sort();
+        resolution.target_ids.dedup();
+
+        let mut primary = self.evidence(crate_key, location, detail, hir_kind);
+        primary.properties.extend(evidence_properties);
+        primary
+            .properties
+            .insert("macro_provenance".into(), json!("direct-source"));
+        primary.properties.insert(
+            "resolution_status".into(),
+            serde_json::to_value(resolution.status)?,
+        );
+        primary.properties.insert(
+            "precision".into(),
+            serde_json::to_value(resolution.precision)?,
+        );
+        if let Some(reason) = resolution.reason.as_deref() {
+            primary
+                .properties
+                .insert("resolution_reason".into(), json!(reason));
+            if resolution.precision == Precision::Heuristic {
+                primary
+                    .properties
+                    .insert("heuristic_basis".into(), json!(reason));
+            }
+        }
+        if resolution.status == ResolutionStatus::Candidates {
+            primary.properties.insert(
+                "algorithm".into(),
+                json!("rust-analyzer-path-resolution-per-namespace"),
+            );
+        }
+        let supporting = Evidence {
+            kind: EvidenceKind::Source,
+            extractor: SOURCE_EXTRACTOR.into(),
+            extractor_version: ADAPTER_VERSION.into(),
+            path: Some(location.path.clone()),
+            start_line: Some(location.start_line),
+            start_column: Some(location.start_column),
+            end_line: Some(location.end_line),
+            end_column: Some(location.end_column),
+            detail: Some(format!("Rust {site_kind} syntax")),
+            properties: Properties::new(),
+        };
+        let evidence = vec![primary, supporting];
+        let site_id = stable_id_from_value(
+            "site",
+            &json!({
+                "condition": condition,
+                "kind": site_kind,
+                "path": location.path,
+                "profile_id": self.profile_id,
+                "source": source,
+                "span": location.as_value(),
+            }),
+        );
+        let site = DependencySite {
+            id: site_id.clone(),
+            source: source.into(),
+            kind: site_kind.into(),
+            specifier: specifier.into(),
+            resolution_status: resolution.status,
+            target_ids: resolution.target_ids.clone(),
+            profile_id: self.profile_id.into(),
+            condition: condition.clone(),
+            precision: resolution.precision,
+            reason: resolution.reason.clone(),
+            evidence: evidence.clone(),
+        };
+        if let Some(existing) = self.sites.get(&site_id)
+            && existing != &site
+        {
+            bail!("conflicting Rust HIR dependency site {site_id}");
+        }
+
+        let mut edges = Vec::with_capacity(resolution.target_ids.len());
+        for target in &resolution.target_ids {
+            let edge_id = stable_id_from_value(
+                "edge",
+                &json!({
+                    "kind": edge_kind,
+                    "site_id": site_id,
+                    "target": target,
+                }),
+            );
+            let edge = GraphEdge {
+                id: edge_id.clone(),
+                source: source.into(),
+                target: target.clone(),
+                kind: edge_kind.into(),
+                site_id: Some(site_id.clone()),
+                phase: Phase::Semantic,
+                environment: Some("any".into()),
+                profile_id: self.profile_id.into(),
+                condition: condition.clone(),
+                resolution_status: resolution.status,
+                precision: resolution.precision,
+                generated: location.generated,
+                evidence: evidence.clone(),
+            };
+            if let Some(existing) = self.edges.get(&edge_id)
+                && existing != &edge
+            {
+                bail!("conflicting Rust HIR dependency edge {edge_id}");
+            }
+            edges.push(edge);
+        }
+
+        self.sites.entry(site_id).or_insert(site);
+        for edge in edges {
+            self.edges.entry(edge.id.clone()).or_insert(edge);
         }
         Ok(())
     }
@@ -1529,13 +2833,18 @@ impl Extractor<'_> {
     }
 
     fn item_resolver(&self, crate_key: &str, module_path: &[String], name: &str) -> String {
+        let mut resolver = self.module_resolver(crate_key, module_path);
+        resolver.push_str("::");
+        resolver.push_str(name);
+        resolver
+    }
+
+    fn module_resolver(&self, crate_key: &str, module_path: &[String]) -> String {
         let mut resolver = format!("{crate_key}::crate");
         for segment in module_path {
             resolver.push_str("::");
             resolver.push_str(segment);
         }
-        resolver.push_str("::");
-        resolver.push_str(name);
         resolver
     }
 
@@ -1589,6 +2898,21 @@ impl Extractor<'_> {
             SemanticIssue { code, path, reason },
         );
     }
+}
+
+fn condition_conjuncts(condition: &Condition) -> Vec<String> {
+    let canonical = condition.clone().canonicalize();
+    let mut terms = match canonical {
+        Condition::All { conditions } => conditions
+            .into_iter()
+            .map(|condition| condition.render())
+            .collect(),
+        condition if condition.render() == "true" => Vec::new(),
+        condition => vec![condition.render()],
+    };
+    terms.sort();
+    terms.dedup();
+    terms
 }
 
 fn source_range<Ast>(source: InFile<(TextRange, Option<Ast>)>) -> (InFile<TextRange>, bool) {

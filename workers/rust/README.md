@@ -11,11 +11,12 @@ fails. Rust source is parsed with `syn`. The worker links an exact-pinned
 rust-analyzer library set and, for a compatible toolchain/target and confined
 Cargo DTO, constructs an inventory-only multi-file VFS, local `CrateGraph`,
 per-crate cfg, and analysis database. The production scan now queries that
-database for the HIR definition-graph vertical slice: canonical `symbol` and
-`type` nodes plus site-less `declares`, `extends`, `implements`, and
-`instantiates` relations are validated and atomically unioned with the syntax
-graph. Import/re-export and `type_uses` resolution remain the next slice, call
-resolution follows it, and the worker does not yet claim `semantic-complete`.
+database for the HIR definition and dependency graph: canonical `symbol` and
+`type` nodes, site-less `declares`, `extends`, `implements`, and `instantiates`
+relations, HIR-refined import/re-export sites, and semantic `type_uses` are
+validated and atomically unioned with the syntax graph. Call resolution and the
+final fallback/release gates remain, so the worker does not yet claim
+`semantic-complete`.
 
 Preflight rejects ambiguous globs, symlinks, out-of-root workspace members and
 path dependencies, and unknown Cargo path-bearing fields before Cargo starts.
@@ -67,11 +68,16 @@ Cargo fallback remain explicit diagnostic/coverage entries.
 Neither path discovers a Cargo workspace or reads a repository file on demand.
 The project model does not load `rust-project.json`, `.cargo/config*`, sysroot
 or registry source, build output, or proc-macro libraries, and it does not run
-build scripts or child processes. The implemented definition pass emits stable
-named/local symbol and type identities, semantic source evidence, and
-definition relations into an isolated delta. The scanner validates that delta
-before unioning it with, rather than replacing, the static syntax graph. It
-does not yet emit HIR import, type-use, or call dependency sites.
+build scripts or child processes. The implemented semantic pass emits stable
+named/local symbol and type identities, definition relations, HIR-resolved
+import/re-export sites, and signature/field/bound/type-alias/body `type_uses`
+into an isolated delta. Each HIR-refined dependency keeps semantic primary
+evidence plus its supporting syntax evidence. The scanner validates nodes,
+sites, edges, and file coverage together before unioning the delta with the
+static syntax graph.
+Recognized type occurrences that cannot enter the exact delta remain once as
+source-phase external or unresolved fallback sites. It does not yet emit call
+dependency sites.
 
 `profiles.rust_mode` accepts `check` (default), `build`, or `test`. Test mode
 adds separate `cfg(test)` lib/bin harness crates when Cargo enables them and
@@ -87,10 +93,10 @@ validated. Name resolution and cfg created by declarative macro expansion
 remain part of the later semantic slice.
 
 `rust_hir_project_model=ready` means the atomic VFS, crate graph, and cfg input
-were constructed. Definition extraction success is reported separately as
-`rust_hir_status=definition-graph-emitted` or
-`definition-graph-partial`; neither means that imports, type uses, calls, or
-all fallback conditions were classified. Missing modules and includes remain
+were constructed. Semantic extraction success is reported separately as
+`rust_hir_status=import-type-graph-emitted` or
+`import-type-graph-partial`; neither means that calls or all fallback
+conditions were classified. Missing modules and includes remain
 unresolved syntax sites with coverage reasons, so the profile cannot yet claim
 `semantic-complete`.
 
@@ -123,7 +129,7 @@ The current Cargo-facing phase may:
   using a neutral directory, cleared project environment,
   `RUSTUP_AUTO_INSTALL=0`, timeout, and output limit.
 
-The completed safe project-model and definition-graph slices now:
+The completed safe project-model, definition, and dependency slices now:
 
 - consume the already-admitted manifests and source bytes to build an in-memory
   multi-file VFS, per-crate cfg set, and local crate graph;
@@ -131,12 +137,23 @@ The completed safe project-model and definition-graph slices now:
   inputs in a deterministic sidecar or diagnostic/coverage ledger;
 - query only that confined database for canonical `symbol` / `type` definitions
   and site-less `declares` / `extends` / `implements` / `instantiates`
-  relations, then atomically union a validated semantic delta with the syntax
-  graph.
+  relations;
+- resolve leaf-level module aliases (including `use` and `extern crate` aliases),
+  cross-file `self` / `crate` / `super` paths, globs, imports, re-exports, and
+  named declaration/body type uses;
+  classify every emitted site as resolved, candidates, external, or unresolved;
+  and replace the matching syntax import occurrence instead of duplicating it;
+- preserve canonical cfg/feature/target conditions, semantic primary evidence,
+  supporting source evidence, and direct-source macro provenance, then atomically
+  union the validated node/site/edge/file-ledger delta with the syntax graph.
+
+Block-local aliases whose external definition source is unavailable are kept
+as unresolved type-use sites; the worker does not leak those aliases into the
+surrounding module or infer unqualified prelude names without exact HIR proof.
 
 The remaining semantic and release slices may also:
 
-- resolve imports, re-exports, type-use sites, and exact/candidate call sites;
+- resolve exact/candidate call sites;
 - expand declarative macros in memory when their input is completely known;
 - read a release-owned, checksum-verified sysroot snapshot after that component
   is introduced by the HIR implementation.
@@ -164,49 +181,50 @@ best-effort outside that baseline. The worker probes the resolved system
 matches the exact baseline. The rust-analyzer revision is selected, the smoke
 scaffold and deterministic multi-file project model are available, and Cargo
 metadata input reads are confined. When those inputs are compatible, the HIR
-definition graph is emitted now; import/type-use resolution, call resolution,
+definition, import/re-export, and type-use graph is emitted now; call resolution,
 the final fallback/coverage matrix, and the release gate remain incomplete. A
 verified sysroot is additionally required only when the profile claims exact
 standard-library resolution.
 
 | Project/toolchain state | Current result | HIR eligibility after the remaining gates |
 | --- | --- | --- |
-| Exact `1.93.1`, supported target, and complete confined crate graph | Static syntax graph plus the HIR definition graph; status is `definition-graph-emitted` or `definition-graph-partial` | Import/type-use, call, final fallback, and release gates remain |
-| No project toolchain declaration | The neutral probe decides eligibility; an exact compatible pair may emit the definition graph | Eligible only when every effective input is the verified baseline |
+| Exact `1.93.1`, supported target, and complete confined crate graph | Static syntax graph plus HIR definitions, refined imports/re-exports, and `type_uses`; status is `import-type-graph-emitted` or `import-type-graph-partial` | Call, final fallback, and release gates remain |
+| No project toolchain declaration | The neutral probe decides eligibility; an exact compatible pair may emit the import/type graph | Eligible only when every effective input is the verified baseline |
 | Older, newer, or nightly declaration | `RUST_TOOLCHAIN_BEST_EFFORT`; static syntax graph | Syntax fallback; never `semantic-complete` |
 | Custom or malformed declaration, unreadable file, or external symlink | Static syntax graph with `RUST_TOOLCHAIN_INVALID` and `RUST_HIR_TOOLCHAIN_UNSUPPORTED` | Fail-closed syntax fallback; never HIR-eligible |
 | Cargo preflight rejects the input, mirror/DTO validation fails, or frozen/offline Cargo is unavailable | `CARGO_METADATA_FALLBACK`; static manifest, syntax graph, and file ledger are retained | Syntax fallback with a stable coverage reason; raw Cargo stderr and temporary paths are not exposed |
 | Build script or proc macro is required | Unresolved site plus `BUILD_SCRIPT_NOT_EXECUTED` or `PROC_MACRO_NOT_EXECUTED` | Partial HIR only; never execute project code in safe mode |
-| Typed HIR definition-extractor failure | The semantic delta is discarded atomically and the syntax graph is preserved with `RUST_HIR_BACKEND_FAILURE` | Partial coverage; never `semantic-complete` |
+| Typed HIR semantic-extractor failure | The node/site/edge/file-ledger delta is discarded atomically and the syntax graph is preserved with `RUST_HIR_BACKEND_FAILURE` | Partial coverage; never `semantic-complete` |
 | HIR panic, timeout, or malformed internal result | Worker failure; it is not downgraded to syntax success | The core keeps other adapter results but does not relabel syntax as semantic success |
 | Release-owned backend/sysroot bytes are missing or changed | The final package/release gate is not complete yet | Once closed, security failure occurs before analysis with no project/system fallback |
 
 `syntax-complete` means all supported syntax dependency sites were classified.
-It does not imply HIR resolution. A successfully emitted definition graph is
-also insufficient for `semantic-complete`: imports/type uses, calls, and the
-final fallback/coverage matrix must first be implemented and complete for the
-selected profile.
+It does not imply HIR resolution. A successfully emitted import/type graph is
+also insufficient for `semantic-complete`: calls and the final
+fallback/coverage matrix must first be implemented and complete for the selected
+profile.
 
 ## Profile metadata
 
-Every Rust profile records the following policy fields. Definition-backend
+Every Rust profile records the following policy fields. Semantic-backend
 values are outcome-dependent; fallback paths retain the syntax-only values.
 
 | Property | Current value |
 | --- | --- |
-| `analysis` | `syntax+hir-definitions` after successful definition extraction; otherwise `syntax` |
-| `analysis_backend` | `static-syntax+rust-analyzer-hir` after successful definition extraction; otherwise `static-syntax` |
+| `analysis` | `syntax+hir-imports-types` after successful semantic extraction; otherwise `syntax` |
+| `analysis_backend` | `static-syntax+rust-analyzer-hir` after successful semantic extraction; otherwise `static-syntax` |
 | `rust_hir_backend` | `rust-analyzer-hir` when invoked; otherwise `disabled` |
-| `rust_hir_status` | `definition-graph-emitted`, `definition-graph-partial`, `failed`, or `not-invoked` |
+| `rust_hir_status` | `import-type-graph-emitted`, `import-type-graph-partial`, `failed`, or `not-invoked` |
 | `rust_hir_scaffold` | `available` |
 | `rust_hir_project_model` | `ready` after deterministic construction; otherwise `not-invoked`, `unavailable`, or `unsupported` |
-| `rust_hir_enable_gate` | `import-call-and-release-gates-pending` after definition emission; `semantic-backend-failure` on typed failure; otherwise `semantic-emission-pending`, `toolchain-unsupported`, `crate-graph-unavailable`, or `input-unsupported` |
+| `rust_hir_enable_gate` | `call-and-release-gates-pending` after import/type emission; `semantic-backend-failure` on typed failure; otherwise `semantic-emission-pending`, `toolchain-unsupported`, `crate-graph-unavailable`, or `input-unsupported` |
 | `rust_hir_project_file_count` | Number of admitted inventory files in the safe VFS; `0` when no model is available |
 | `rust_hir_project_crate_count` | Number of workspace/path local crates in the safe graph; `0` when no model is available |
 | `rust_hir_project_external_count` | Number of external/sysroot sidecar entries; `0` when no model is available |
-| `rust_hir_semantic_node_count` | Number of exact HIR definition nodes emitted by the current slice |
-| `rust_hir_semantic_relation_count` | Number of semantic definition relations emitted by the current slice |
-| `rust_hir_semantic_issue_count` | Number of recoverable definition-extraction issues; nonzero yields `definition-graph-partial` |
+| `rust_hir_semantic_node_count` | Number of HIR nodes emitted by the current slice, including deterministic external/unresolved sentinels |
+| `rust_hir_semantic_relation_count` | Number of semantic structural and dependency edges emitted by the current slice |
+| `rust_hir_semantic_site_count` | Number of HIR-refined import/re-export and semantic type-use sites |
+| `rust_hir_semantic_issue_count` | Number of recoverable semantic-extraction issues; nonzero yields `import-type-graph-partial` |
 | `rust_hir_cfg_profile` | `debug-unwind`; cfg-affecting custom Cargo profile overrides are typed unsupported input |
 | `rust_mode` | Selected safe project mode: `check`, `build`, or `test` |
 | `rust_hir_integration_policy` | `pinned-rust-analyzer-library` |
@@ -230,7 +248,7 @@ values are outcome-dependent; fallback paths retain the syntax-only values.
 | `proc_macros_executed` | `false` |
 
 The profile records the selected rust-analyzer and Salsa versions, upstream
-revision, neutral toolchain probe, confined crate-graph source, and definition
+revision, neutral toolchain probe, confined crate-graph source, and semantic
 graph status/counts. A future profile that claims exact standard-library
 resolution must additionally record its effective sysroot version. Backend and
 toolchain revisions that can change graph identity must participate in the
@@ -251,10 +269,10 @@ Preflight and DTO failures use repository-relative inventory paths and bounded
 reason categories; raw Cargo stderr, mirror paths, and rejected external path
 values do not become diagnostic messages or identities.
 
-The HIR definition graph requires a validated confined Cargo crate graph, so a
+The HIR import/type graph requires a validated confined Cargo crate graph, so a
 real metadata fallback intentionally omits HIR `symbol` / `type` nodes and
-semantic relations. Metadata success and static fallback are different
-analysis outcomes: because their effective crate/target models differ, neither
+semantic nodes, sites, and relations. Metadata success and static fallback are
+different analysis outcomes: because their effective crate/target models differ, neither
 the full graph nor target/module syntax identities are required to match across
 those outcomes. Each outcome remains checkout-independent and repeatable for
 the same inputs. The missing semantic delta must be explicit in profile
@@ -264,7 +282,7 @@ semantic capability are the same; the final cross-outcome fallback matrix is
 tracked by Issue #29.
 
 Integrity failures are different: the current core already treats a missing or
-modified release-owned worker as a security error. Before the HIR definition
+modified release-owned worker as a security error. Before the HIR semantic
 backend is declared release-ready, its release gate must additionally reject
 worker/backend version mismatches and release-root symlinks as security errors.
 None of these cases may fall back to a project binary, system rust-analyzer, or
@@ -322,11 +340,13 @@ scan boundary:
    `symbol` / `type` identities and semantic source evidence, then emit
    site-less `declares`, `extends`, `implements`, and `instantiates` relations
    as a strictly validated delta that is atomically unioned with the syntax
-   graph. This slice does not emit import/type-use/call sites and does not claim
-   `semantic-complete`.
-5. **Issue #27 — resolve imports and type uses (2–3 days):** emit import,
-   re-export, and type-use sites/edges with exact/candidate/unresolved
-   classification and a complete ledger.
+   graph. This slice did not emit dependency sites or claim `semantic-complete`.
+5. **Completed 2026-07-17 — resolve imports and type uses:** emit leaf-level
+   import/re-export and declaration/body type-use sites/edges with
+   resolved/candidates/external/unresolved classification, canonical conditions,
+   semantic/source evidence, syntax replacement keys, conservative source
+   fallback, and an atomic file coverage ledger. Call sites and
+   `semantic-complete` remain out of scope.
 6. **Issue #28 — resolve calls (2–3 days):** add exact direct-call edges and
    conservative candidate calls for dynamic dispatch, trait methods, closures,
    and function pointers.
