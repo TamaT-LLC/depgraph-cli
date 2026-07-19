@@ -396,6 +396,16 @@ fn rust_semantic_completeness_requires_exact_backend_properties() {
 }
 
 #[test]
+fn rust_semantic_completeness_accepts_pending_and_verified_release_gates() {
+    for gate in ["release-gate-pending", "release-gate-verified"] {
+        let mut events = rust_semantic_complete_values();
+        events[1]["profile"]["properties"]["rust_hir_enable_gate"] = json!(gate);
+        validate_ndjson(Cursor::new(values_to_ndjson(events)))
+            .unwrap_or_else(|error| panic!("Rust semantic completeness rejected {gate}: {error}"));
+    }
+}
+
+#[test]
 fn safe_profile_cannot_hide_project_code_execution() {
     for mut events in [golden_values(), rust_semantic_complete_values()] {
         events[8]["coverage"]["project_code_executed"] = json!(true);

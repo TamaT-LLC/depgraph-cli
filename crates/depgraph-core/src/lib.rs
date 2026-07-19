@@ -14,7 +14,6 @@ use depgraph_store::{
     AdapterLogRecord, CoverageRecord, DiagnosticRecord, FileCoverageRecord, ProfileRecord, Store,
 };
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 pub use config::{Config, default_store_path, init_config};
 pub use depgraph_store::GraphSnapshot;
@@ -26,8 +25,10 @@ pub use query::{
 pub use scan::{ScanOutcome, run_scan};
 
 use worker::{
-    AdapterKind, locate_worker, probe_toolchain_version, probe_worker_version,
-    verify_release_runtime_component,
+    AdapterKind, RUST_BACKEND_KIND, RUST_BACKEND_REVISION, RUST_BACKEND_SALSA_VERSION,
+    RUST_BACKEND_VERSION, is_security_error, locate_worker, probe_toolchain_version,
+    probe_worker_version, verify_release_artifact, verify_release_runtime_component,
+    verify_rust_release_handshake,
 };
 
 #[derive(Debug, Clone, Serialize)]
@@ -78,12 +79,70 @@ pub struct ReleaseHealth {
     pub runtime_requirements: BTreeMap<String, String>,
 }
 
+#[derive(Debug)]
+enum DoctorWorkerLocation {
+    Ready(worker::WorkerSpec),
+    Unavailable(String),
+}
+
+#[derive(Debug)]
+struct DoctorWorkerPreflight {
+    locations: Vec<(AdapterKind, DoctorWorkerLocation)>,
+    suppress_probes: bool,
+}
+
+fn preflight_doctor_workers(
+    adapters: impl IntoIterator<Item = AdapterKind>,
+    mut locate: impl FnMut(AdapterKind) -> Result<worker::WorkerSpec>,
+) -> DoctorWorkerPreflight {
+    let mut locations = Vec::new();
+    let mut suppress_probes = false;
+
+    for adapter in adapters {
+        let location = match locate(adapter) {
+            Ok(spec) => DoctorWorkerLocation::Ready(spec),
+            Err(error) => {
+                let error = format!("{error:#}");
+                suppress_probes |= is_security_error(&error);
+                DoctorWorkerLocation::Unavailable(error)
+            }
+        };
+        locations.push((adapter, location));
+    }
+
+    DoctorWorkerPreflight {
+        locations,
+        suppress_probes,
+    }
+}
+
+fn suppressed_worker_health(adapter: AdapterKind, spec: worker::WorkerSpec) -> WorkerHealth {
+    WorkerHealth {
+        adapter: adapter.name().to_owned(),
+        available: false,
+        command: Some(spec.display),
+        version: None,
+        integrity: worker_integrity(adapter, &spec.artifact_path, None),
+        error: Some(
+            "worker probe suppressed because another adapter failed release security verification"
+                .to_owned(),
+        ),
+    }
+}
+
 pub async fn doctor(store: &Store) -> Result<DoctorReport> {
     let root = std::env::current_dir()?.canonicalize()?;
+    let preflight = preflight_doctor_workers(
+        [AdapterKind::Rust, AdapterKind::Go, AdapterKind::Web],
+        locate_worker,
+    );
     let mut workers = Vec::new();
-    for adapter in [AdapterKind::Rust, AdapterKind::Go, AdapterKind::Web] {
-        workers.push(match locate_worker(adapter) {
-            Ok(spec) => {
+    for (adapter, location) in preflight.locations {
+        workers.push(match location {
+            DoctorWorkerLocation::Ready(spec) if preflight.suppress_probes => {
+                suppressed_worker_health(adapter, spec)
+            }
+            DoctorWorkerLocation::Ready(spec) => {
                 let version = worker_version(&spec, &root).await;
                 let integrity =
                     worker_integrity(adapter, &spec.artifact_path, version.as_deref().ok());
@@ -101,13 +160,13 @@ pub async fn doctor(store: &Store) -> Result<DoctorReport> {
                     error,
                 }
             }
-            Err(error) => WorkerHealth {
+            DoctorWorkerLocation::Unavailable(error) => WorkerHealth {
                 adapter: adapter.name().to_owned(),
                 available: false,
                 command: None,
                 version: None,
                 integrity: "unavailable".to_owned(),
-                error: Some(error.to_string()),
+                error: Some(error),
             },
         });
     }
@@ -210,8 +269,9 @@ struct ReleaseArtifact {
 struct ReleaseRuntimeComponent {
     name: String,
     version: String,
+    kind: String,
     root: String,
-    entrypoint: String,
+    entrypoint: Option<String>,
     sha256: String,
 }
 
@@ -219,8 +279,18 @@ struct ReleaseRuntimeComponent {
 struct ReleaseWorker {
     adapter: String,
     version: String,
+    #[serde(default)]
+    backend: Option<ReleaseWorkerBackend>,
     path: String,
     sha256: String,
+}
+
+#[derive(Deserialize)]
+struct ReleaseWorkerBackend {
+    kind: String,
+    version: String,
+    revision: String,
+    salsa_version: String,
 }
 
 fn worker_integrity(
@@ -237,6 +307,13 @@ fn worker_integrity(
             manifest.protocol_version
         );
     }
+    if manifest.release_version != env!("CARGO_PKG_VERSION") {
+        return format!(
+            "error: release manifest version {} does not match core {}",
+            manifest.release_version,
+            env!("CARGO_PKG_VERSION")
+        );
+    }
     let Some(entry) = manifest
         .workers
         .iter()
@@ -244,6 +321,30 @@ fn worker_integrity(
     else {
         return format!("error: {} is absent from release manifest", adapter.name());
     };
+    if adapter == AdapterKind::Rust {
+        let Some(backend) = &entry.backend else {
+            return "error: Rust worker backend attestation is missing".to_owned();
+        };
+        if backend.kind != RUST_BACKEND_KIND
+            || backend.version != RUST_BACKEND_VERSION
+            || backend.revision != RUST_BACKEND_REVISION
+            || backend.salsa_version != RUST_BACKEND_SALSA_VERSION
+        {
+            return "error: Rust worker backend attestation does not match core".to_owned();
+        }
+        if let Some(reported) = reported_version
+            && let Err(error) = verify_rust_release_handshake(
+                reported,
+                &entry.version,
+                &backend.kind,
+                &backend.version,
+                &backend.revision,
+                &backend.salsa_version,
+            )
+        {
+            return format!("error: {error:#}");
+        }
+    }
     if let Some(reported) = reported_version {
         let actual = parse_worker_handshake(reported)
             .map(|(_, version, _)| version)
@@ -255,12 +356,16 @@ fn worker_integrity(
             );
         }
     }
-    let expected_path = manifest_path
-        .parent()
-        .unwrap_or(Path::new("."))
-        .join(&entry.path)
-        .canonicalize()
-        .unwrap_or_else(|_| PathBuf::from(&entry.path));
+    let root = manifest_path.parent().unwrap_or(Path::new("."));
+    let expected_path = match verify_release_artifact(
+        root,
+        &entry.path,
+        &entry.sha256,
+        &format!("{} worker", adapter.name()),
+    ) {
+        Ok(path) => path,
+        Err(error) => return format!("error: {error:#}"),
+    };
     let actual_path = artifact
         .canonicalize()
         .unwrap_or_else(|_| artifact.to_path_buf());
@@ -271,17 +376,7 @@ fn worker_integrity(
             actual_path.display()
         );
     }
-    match std::fs::read(&actual_path) {
-        Ok(bytes) => {
-            let digest = hex::encode(Sha256::digest(bytes));
-            if digest == entry.sha256 {
-                "verified".to_owned()
-            } else {
-                "error: worker checksum mismatch".to_owned()
-            }
-        }
-        Err(error) => format!("error: could not read worker for checksum: {error}"),
-    }
+    "verified".to_owned()
 }
 
 fn load_release_manifest() -> Option<(PathBuf, ReleaseManifest)> {
@@ -319,8 +414,10 @@ fn release_health() -> Option<ReleaseHealth> {
         let integrity = match verify_release_runtime_component(
             root,
             &component.name,
+            &component.version,
+            &component.kind,
             &component.root,
-            &component.entrypoint,
+            component.entrypoint.as_deref(),
             &component.sha256,
         ) {
             Ok(()) => "verified".to_owned(),
@@ -340,14 +437,10 @@ fn release_health() -> Option<ReleaseHealth> {
 }
 
 fn artifact_integrity(root: &Path, artifact: &ReleaseArtifact, expected: Option<&Path>) -> String {
-    let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    let path = canonical_root
-        .join(&artifact.path)
-        .canonicalize()
-        .unwrap_or_else(|_| canonical_root.join(&artifact.path));
-    if !path.starts_with(&canonical_root) {
-        return "error: artifact path escapes release root".to_owned();
-    }
+    let path = match verify_release_artifact(root, &artifact.path, &artifact.sha256, "artifact") {
+        Ok(path) => path,
+        Err(error) => return format!("error: {error:#}"),
+    };
     if let Some(expected) = expected {
         let expected = expected
             .canonicalize()
@@ -360,13 +453,7 @@ fn artifact_integrity(root: &Path, artifact: &ReleaseArtifact, expected: Option<
             );
         }
     }
-    match std::fs::read(path) {
-        Ok(bytes) if hex::encode(Sha256::digest(&bytes)) == artifact.sha256 => {
-            "verified".to_owned()
-        }
-        Ok(_) => "error: checksum mismatch".to_owned(),
-        Err(error) => format!("error: could not read artifact: {error}"),
-    }
+    "verified".to_owned()
 }
 
 async fn toolchain_versions(root: &Path) -> BTreeMap<String, String> {
@@ -391,7 +478,26 @@ pub fn open_store(path: &Path) -> Result<Store> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_worker_handshake;
+    use std::{ffi::OsString, path::PathBuf};
+
+    use super::{
+        AdapterKind, DoctorWorkerLocation, parse_worker_handshake, preflight_doctor_workers,
+        suppressed_worker_health, worker,
+    };
+
+    fn test_worker_spec(adapter: AdapterKind) -> worker::WorkerSpec {
+        let path = PathBuf::from(format!("/tmp/depgraph-{}-worker", adapter.name()));
+        worker::WorkerSpec {
+            adapter,
+            program: OsString::from(&path),
+            leading_args: Vec::new(),
+            display: path.display().to_string(),
+            artifact_path: path,
+            runtime_requirement: None,
+            expected_version: None,
+            release_attested: false,
+        }
+    }
 
     #[test]
     fn worker_handshake_requires_an_exact_protocol_token() {
@@ -404,5 +510,81 @@ mod tests {
             Some(("depgraph-go-worker", "0.1.0", "1.00"))
         );
         assert_eq!(parse_worker_handshake("depgraph-go-worker 0.1.0"), None);
+    }
+
+    #[test]
+    fn late_security_failure_suppresses_every_successful_doctor_probe() {
+        let mut visited = Vec::new();
+        let preflight = preflight_doctor_workers(
+            [AdapterKind::Rust, AdapterKind::Go, AdapterKind::Web],
+            |adapter| {
+                visited.push(adapter);
+                if adapter == AdapterKind::Web {
+                    anyhow::bail!("security policy violation: late Web release manifest mismatch");
+                }
+                Ok(test_worker_spec(adapter))
+            },
+        );
+
+        assert_eq!(
+            visited,
+            vec![AdapterKind::Rust, AdapterKind::Go, AdapterKind::Web]
+        );
+        assert!(preflight.suppress_probes);
+        assert_eq!(
+            preflight
+                .locations
+                .iter()
+                .filter(|(_, location)| matches!(location, DoctorWorkerLocation::Ready(_)))
+                .count(),
+            2
+        );
+
+        for (adapter, location) in preflight.locations {
+            if let DoctorWorkerLocation::Ready(spec) = location {
+                let health = suppressed_worker_health(adapter, spec);
+                assert!(!health.available);
+                assert!(health.command.is_some());
+                assert!(health.version.is_none());
+                assert!(
+                    health.integrity == "development-unverified"
+                        || health.integrity.starts_with("error: ")
+                );
+                assert!(
+                    health
+                        .error
+                        .as_deref()
+                        .is_some_and(|error| error.contains("probe suppressed"))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn non_security_unavailability_keeps_successful_doctor_probes_enabled() {
+        let preflight = preflight_doctor_workers(
+            [AdapterKind::Rust, AdapterKind::Go, AdapterKind::Web],
+            |adapter| {
+                if adapter == AdapterKind::Go {
+                    anyhow::bail!("Go worker is unavailable");
+                }
+                Ok(test_worker_spec(adapter))
+            },
+        );
+
+        assert!(!preflight.suppress_probes);
+        assert_eq!(
+            preflight
+                .locations
+                .iter()
+                .filter(|(_, location)| matches!(location, DoctorWorkerLocation::Ready(_)))
+                .count(),
+            2
+        );
+        assert!(matches!(
+            &preflight.locations[1],
+            (AdapterKind::Go, DoctorWorkerLocation::Unavailable(error))
+                if error == "Go worker is unavailable"
+        ));
     }
 }

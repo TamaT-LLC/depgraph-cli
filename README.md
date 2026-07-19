@@ -20,10 +20,13 @@ Rust HIR final fallback/coverage handling is complete. A profile claims
 `semantic-complete` only when syntax coverage is complete, the exact compatible
 HIR backend uses confined Cargo metadata with a ready project model and an
 emitted graph, the semantic issue count is zero, and skipped, unsupported, and
-unresolved counts are all zero. Candidate and external sites are allowed. The
-successful profile remains `rust_hir_enable_gate=release-gate-pending`: Issue
-#30 package/release verification is not implemented, so this is not a
-release-ready claim. Web symbol/type/call analysis, code-based routes, server
+unresolved counts are all zero. Candidate and external sites are allowed.
+Source/development builds intentionally report
+`rust_hir_enable_gate=release-gate-pending`. After the core verifies an
+extracted release archive, including its Rust backend attestation, it starts the
+packaged worker with `release-gate-verified`; only that attested path may emit a
+release-ready profile. Issue #30 package/release verification was completed on
+2026-07-19. Web symbol/type/call analysis, code-based routes, server
 functions, build observation, runtime traces, incremental updates, snapshots,
 and architecture policies belong to later milestones.
 
@@ -82,7 +85,7 @@ Selectors accept `id:`, `path:`, `package:`, `route:`, `symbol:`, and `type:` pr
 
 The default scan reads source, manifests, lockfiles, static JSON/JSONC configuration, and existing generated files. It does not execute project configuration, plugins, package managers, generators, build scripts, proc macros, or project-local TypeScript. The Web worker uses bundled TypeScript. Go requests typed syntax and type information through `go/packages` with networking, telemetry, external drivers, cgo, toolchain download, and repository writes disabled, then retains the standard-parser inventory as its fallback. Cargo metadata is attempted only in frozen/offline/no-deps mode against a preflighted, worker-owned input mirror from a neutral working directory.
 
-Worker and toolchain lookup uses a canonical absolute `PATH`: relative entries, the scan root, and symlink aliases into the scan root are removed. Child environments omit execution hooks such as `NODE_OPTIONS`; direct reads resolve symlinks and remain confined to the canonical repository root. Release workers and runtime assets are checksum verified, and packaged builds fail closed when their manifest or bundled layout is missing.
+Worker and toolchain lookup uses a canonical absolute `PATH`: relative entries, the scan root, and symlink aliases into the scan root are removed. Child environments omit execution hooks such as `NODE_OPTIONS`; direct reads resolve symlinks and remain confined to the canonical repository root. Release manifests, workers, schemas, runtime component trees, and every declared artifact are checksum verified; symlinks, missing entries, changed bytes, and undeclared tree contents fail closed before a packaged worker starts.
 
 Executable or unsupported configuration becomes a diagnostic or unresolved site. `project_code_executed` remains `false` in worker profiles, coverage, stored scans, and `doctor` output. Security fixtures contain configs/generators that would create marker files if they were executed.
 
@@ -113,7 +116,6 @@ Failed/partial scans and diagnostics remain stored, but only a complete policy-p
 - `workers/rust`, `workers/go`, `workers/web`: ecosystem-native safe static adapters
 - `xtask`: reproducible build, full quality checks, release archives, checksums, SBOM, and license inventory
 
-Run `cargo xtask package` to create a native archive under `dist/`. Release archives place `depgraph` under `bin/`, compatible workers under `libexec/`, and include a checksum-verified release manifest, protocol schema, SPDX SBOM, and third-party license inventory.
+Run `cargo xtask package` to create a native archive under `dist/`. Release archives place `depgraph` under `bin/`, compatible workers under `libexec/`, and include a checksum-verified release manifest, protocol schema, SPDX SBOM, and third-party license inventory. The release gate fixes Rust/Cargo `1.93.1`; the Rust worker manifest records the linked backend unit, rust-analyzer `0.0.330` at revision `8954b66d43225e62c92e8bbcc8500191b5cceb1e` with Salsa `0.26.1`.
 
-The Issue #30 Rust HIR package/release verifier remains unimplemented; package
-creation alone does not make the HIR backend release-ready.
+The package verifier extracts the archive and validates the manifest, every artifact and runtime component, the Rust backend manifest/handshake, semantic query/export/determinism E2E, and the complete rust-analyzer/Salsa SBOM and license closure. Runtime components distinguish an `executable-tree` with an executable entrypoint from a `data-tree` whose entrypoint is optional. No sysroot or `rust-src` is currently bundled, and packaged scans never fall back implicitly to project or system backend/sysroot bytes. Tier 1 Linux/macOS, Windows package smoke, and Rust HIR benchmark gates were completed with Issue #30 on 2026-07-19.

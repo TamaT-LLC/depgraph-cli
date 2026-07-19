@@ -2918,6 +2918,60 @@ fn binary_reports_protocol_version() {
     );
 }
 
+#[test]
+fn release_gate_environment_requires_the_exact_verified_value() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("release-gate");
+    write_minimal_crate(&root, "release-gate", "pub struct Thing;\n");
+
+    for (value, expected) in [
+        ("release-gate-verified", "release-gate-verified"),
+        ("verified", "release-gate-pending"),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_depgraph-rust-worker"))
+            .arg("--root")
+            .arg(&root)
+            .arg("--scan-id")
+            .arg(format!("release-gate-{value}"))
+            .env_remove("DEPGRAPH_PROFILE_CONFIG")
+            .env("DEPGRAPH_RUST_RELEASE_GATE", value)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "release-gate worker failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let validated = validate_safe_semantic_ndjson(Cursor::new(output.stdout)).unwrap();
+        let profile = validated.profiles.values().next().unwrap();
+        assert_eq!(profile.properties["rust_hir_enable_gate"], expected);
+        assert_eq!(
+            profile.properties["rust_analyzer_version"],
+            RUST_ANALYZER_CRATE_VERSION
+        );
+        assert_eq!(
+            profile.properties["rust_analyzer_revision"],
+            RUST_ANALYZER_REVISION
+        );
+        assert_eq!(
+            profile.properties["rust_analyzer_salsa_version"],
+            RUST_ANALYZER_SALSA_VERSION
+        );
+        assert!(
+            validated
+                .events
+                .iter()
+                .find_map(|event| match event {
+                    ProtocolEvent::ScanCompleted(completed) => Some(&completed.coverage),
+                    _ => None,
+                })
+                .is_some_and(|coverage| coverage
+                    .completeness
+                    .contains(&CompletenessLevel::SemanticComplete))
+        );
+    }
+}
+
 fn worker_profile(profile_config: &str) -> depgraph_protocol::Profile {
     let output = Command::new(env!("CARGO_BIN_EXE_depgraph-rust-worker"))
         .arg("--root")

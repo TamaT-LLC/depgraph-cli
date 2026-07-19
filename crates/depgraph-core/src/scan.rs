@@ -14,7 +14,7 @@ use uuid::Uuid;
 use crate::{
     config::Config,
     worker::{
-        AdapterKind, WorkerFailureKind, WorkerOutput, detect_adapters, execute_worker,
+        AdapterKind, WorkerFailureKind, WorkerOutput, WorkerSpec, detect_adapters, execute_worker,
         is_security_error, locate_worker,
     },
 };
@@ -64,6 +64,47 @@ impl ScanFailure {
     }
 }
 
+#[derive(Debug)]
+struct WorkerPreflight {
+    workers_to_run: Vec<(AdapterKind, WorkerSpec)>,
+    failures: Vec<ScanFailure>,
+}
+
+fn preflight_workers(
+    adapters: impl IntoIterator<Item = AdapterKind>,
+    mut locate: impl FnMut(AdapterKind) -> Result<WorkerSpec>,
+) -> WorkerPreflight {
+    let mut workers_to_run = Vec::new();
+    let mut failures = Vec::new();
+
+    for adapter in adapters {
+        match locate(adapter) {
+            Ok(spec) => workers_to_run.push((adapter, spec)),
+            Err(error) => {
+                let error = format!("{error:#}");
+                let security_violation = is_security_error(&error);
+                failures.push(ScanFailure::with_classification(
+                    adapter,
+                    error,
+                    WorkerFailureKind::Other,
+                    security_violation,
+                ));
+            }
+        }
+    }
+
+    // A packaged release is a single attested unit. If any adapter discovers
+    // a security failure, no successfully located worker may be launched.
+    if failures.iter().any(|failure| failure.security_violation) {
+        workers_to_run.clear();
+    }
+
+    WorkerPreflight {
+        workers_to_run,
+        failures,
+    }
+}
+
 pub async fn run_scan(
     store: &mut Store,
     root: PathBuf,
@@ -97,32 +138,20 @@ pub async fn run_scan(
         }
     };
 
-    let mut failures = Vec::new();
+    let WorkerPreflight {
+        workers_to_run,
+        mut failures,
+    } = preflight_workers(adapters, locate_worker);
     let mut join_set = JoinSet::new();
     let mut task_adapters = BTreeMap::new();
-    for adapter in adapters {
-        match locate_worker(adapter) {
-            Ok(spec) => {
-                let root = root.clone();
-                let scan_id = scan_id.clone();
-                let scan_config = config.scan.clone();
-                let profiles = config.profiles.clone();
-                let task = join_set.spawn(async move {
-                    execute_worker(spec, root, scan_id, scan_config, profiles).await
-                });
-                task_adapters.insert(task.id(), adapter);
-            }
-            Err(error) => {
-                let error = format!("{error:#}");
-                let security = is_security_error(&error);
-                failures.push(ScanFailure::with_classification(
-                    adapter,
-                    error,
-                    WorkerFailureKind::Other,
-                    security,
-                ));
-            }
-        }
+    for (adapter, spec) in workers_to_run {
+        let root = root.clone();
+        let scan_id = scan_id.clone();
+        let scan_config = config.scan.clone();
+        let profiles = config.profiles.clone();
+        let task = join_set
+            .spawn(async move { execute_worker(spec, root, scan_id, scan_config, profiles).await });
+        task_adapters.insert(task.id(), adapter);
     }
 
     let mut outputs = Vec::new();
@@ -442,6 +471,97 @@ fn snapshot_outcome(store: &Store, scan_id: &str, exit_code: u8) -> Result<ScanO
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_worker_spec(adapter: AdapterKind, program: PathBuf) -> WorkerSpec {
+        WorkerSpec {
+            adapter,
+            program: program.clone().into_os_string(),
+            leading_args: Vec::new(),
+            display: program.display().to_string(),
+            artifact_path: program,
+            runtime_requirement: None,
+            expected_version: None,
+            release_attested: false,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn late_security_preflight_failure_prevents_an_earlier_worker_launch() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir()?;
+        let marker = temp.path().join("rust-worker-started");
+        let worker = temp.path().join("rust-worker");
+        std::fs::write(&worker, "#!/bin/sh\ntouch \"$1\"\n")?;
+        let mut permissions = std::fs::metadata(&worker)?.permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&worker, permissions)?;
+
+        let mut preflight_order = Vec::new();
+        let preflight = preflight_workers([AdapterKind::Rust, AdapterKind::Web], |adapter| {
+            preflight_order.push(adapter);
+            match adapter {
+                AdapterKind::Rust => {
+                    let mut spec = test_worker_spec(adapter, worker.clone());
+                    spec.leading_args.push(marker.clone().into_os_string());
+                    Ok(spec)
+                }
+                AdapterKind::Web => {
+                    anyhow::bail!("security policy violation: late Web manifest mismatch")
+                }
+                AdapterKind::Go => unreachable!("Go was not detected by this fixture"),
+            }
+        });
+
+        assert_eq!(
+            preflight_order,
+            vec![AdapterKind::Rust, AdapterKind::Web],
+            "all adapters must be located before the launch decision"
+        );
+        assert!(
+            preflight.workers_to_run.is_empty(),
+            "a security failure must discard every successfully located worker"
+        );
+        assert_eq!(preflight.failures.len(), 1);
+        assert!(preflight.failures[0].security_violation);
+
+        for (_, spec) in preflight.workers_to_run {
+            std::process::Command::new(spec.program)
+                .args(spec.leading_args)
+                .status()?;
+        }
+        assert!(
+            !marker.exists(),
+            "the Rust worker must not start before late Web preflight completes"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn non_security_preflight_failure_preserves_partial_worker_execution() {
+        let preflight = preflight_workers(
+            [AdapterKind::Rust, AdapterKind::Go, AdapterKind::Web],
+            |adapter| match adapter {
+                AdapterKind::Go => anyhow::bail!("Go worker is unavailable"),
+                AdapterKind::Rust | AdapterKind::Web => {
+                    Ok(test_worker_spec(adapter, PathBuf::from(adapter.name())))
+                }
+            },
+        );
+
+        assert_eq!(
+            preflight
+                .workers_to_run
+                .iter()
+                .map(|(adapter, _)| *adapter)
+                .collect::<Vec<_>>(),
+            vec![AdapterKind::Rust, AdapterKind::Web]
+        );
+        assert_eq!(preflight.failures.len(), 1);
+        assert_eq!(preflight.failures[0].adapter, AdapterKind::Go);
+        assert!(!preflight.failures[0].security_violation);
+    }
 
     #[tokio::test]
     async fn empty_repository_produces_a_successful_scan() -> Result<()> {

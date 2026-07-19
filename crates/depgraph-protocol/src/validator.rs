@@ -1903,7 +1903,6 @@ fn validate_profile_completeness(
         ("rust_hir_backend", "rust-analyzer-hir"),
         ("rust_hir_status", "import-type-call-graph-emitted"),
         ("rust_hir_project_model", "ready"),
-        ("rust_hir_enable_gate", "release-gate-pending"),
         ("crate_graph_source", "confined-cargo-metadata"),
         ("cargo_metadata_input", "confined-mirror"),
         ("rust_toolchain_probe_status", "compatible"),
@@ -1919,6 +1918,19 @@ fn validate_profile_completeness(
                 profile.id
             ));
         }
+    }
+    let release_gate = profile
+        .properties
+        .get("rust_hir_enable_gate")
+        .and_then(Value::as_str);
+    if !matches!(
+        release_gate,
+        Some("release-gate-pending" | "release-gate-verified")
+    ) {
+        return invariant(format!(
+            "Rust semantic-complete profile {} requires properties.rust_hir_enable_gate to be release-gate-pending or release-gate-verified, found {release_gate:?}",
+            profile.id
+        ));
     }
     let semantic_issue_count = profile
         .properties
