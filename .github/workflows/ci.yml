@@ -109,6 +109,8 @@ jobs:
           test ! -e "$fixture/BUILD_SCRIPT_EXECUTED"
           test ! -e "$fixture/PROC_MACRO_EXECUTED"
           test ! -e "$fixture/CONFIG_EXECUTED"
+      - name: Rust HIR semantic query, export, and determinism gate
+        run: cargo xtask rust-semantic-e2e
 
   windows-smoke:
     needs: [rust, go, web]
@@ -134,3 +136,4 @@ jobs:
       - run: workers\go\bin\depgraph-go-worker.exe --version
       - run: node workers\web\dist\worker.mjs --version
       - run: cargo xtask go-semantic-e2e
+      - run: cargo xtask rust-semantic-e2e

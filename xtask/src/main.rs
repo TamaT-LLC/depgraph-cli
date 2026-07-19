@@ -13,6 +13,7 @@ use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
 mod go_semantic_e2e;
+mod rust_semantic_e2e;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const SBOM_SCOPE: &str = "Scope: package-manager component boundary; system runtimes/toolchains and dependencies embedded inside upstream prebuilt packages are not recursively enumerated.";
@@ -44,14 +45,15 @@ enum Task {
     },
     Test,
     GoSemanticE2e,
+    RustSemanticE2e,
     Package,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Debug, serde::Deserialize, Serialize)]
 struct ReleaseManifest {
-    release_version: &'static str,
-    protocol_version: &'static str,
-    schema_version: &'static str,
+    release_version: String,
+    protocol_version: String,
+    schema_version: String,
     target: String,
     core: Artifact,
     schema: Artifact,
@@ -61,27 +63,49 @@ struct ReleaseManifest {
     runtime_requirements: BTreeMap<String, String>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Debug, serde::Deserialize, Serialize)]
 struct Artifact {
     path: String,
     sha256: String,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Debug, serde::Deserialize, Serialize)]
 struct RuntimeComponent {
-    name: &'static str,
-    version: &'static str,
+    name: String,
+    kind: String,
+    version: String,
     root: String,
-    entrypoint: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    entrypoint: Option<String>,
     sha256: String,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Debug, serde::Deserialize, Serialize)]
 struct WorkerArtifact {
-    adapter: &'static str,
+    adapter: String,
     version: String,
     path: String,
     sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    backend: Option<WorkerBackend>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct WorkerBackend {
+    kind: String,
+    version: String,
+    revision: String,
+    salsa_version: String,
+}
+
+#[derive(Debug)]
+struct WorkerHandshake<'a> {
+    name: &'a str,
+    version: &'a str,
+    protocol: &'a str,
+    details: BTreeMap<&'a str, &'a str>,
+    detail_order: Vec<&'a str>,
 }
 
 #[derive(Clone, Debug)]
@@ -109,6 +133,9 @@ fn main() -> Result<()> {
         Task::Test => test(),
         Task::GoSemanticE2e => {
             go_semantic_e2e::run_development(&workspace_root(), &cargo_target_dir())
+        }
+        Task::RustSemanticE2e => {
+            rust_semantic_e2e::run_development(&workspace_root(), &cargo_target_dir())
         }
         Task::Package => package(),
     }
@@ -178,6 +205,7 @@ fn test() -> Result<()> {
         .env("GOFLAGS", "-mod=readonly")
         .current_dir("workers/go"))?;
     go_semantic_e2e::run_development(&workspace_root(), &cargo_target_dir())?;
+    rust_semantic_e2e::run_development(&workspace_root(), &cargo_target_dir())?;
     run(Command::new(pnpm_program())
         .args(["install", "--frozen-lockfile"])
         .current_dir("workers/web"))?;
@@ -279,9 +307,9 @@ fn package() -> Result<()> {
     ];
     let core_path = staging.join("bin").join(executable_name("depgraph"));
     let manifest = ReleaseManifest {
-        release_version: VERSION,
-        protocol_version: "1.0",
-        schema_version: "1.0",
+        release_version: VERSION.to_owned(),
+        protocol_version: "1.0".to_owned(),
+        schema_version: "1.0".to_owned(),
         target: target.clone(),
         core: Artifact {
             path: relative_slash(&staging, &core_path)?,
@@ -296,10 +324,11 @@ fn package() -> Result<()> {
             sha256: sha256_file(&staging.join("libexec/astro.wasm"))?,
         }],
         runtime_components: vec![RuntimeComponent {
-            name: "typescript-native-compiler",
-            version: "7.0.2",
+            name: "typescript-native-compiler".to_owned(),
+            kind: "executable-tree".to_owned(),
+            version: "7.0.2".to_owned(),
             root: "libexec/typescript/lib".to_owned(),
-            entrypoint: format!("libexec/typescript/lib/{}", executable_name("tsc")),
+            entrypoint: Some(format!("libexec/typescript/lib/{}", executable_name("tsc"))),
             sha256: sha256_tree(&staging.join("libexec/typescript/lib"))?,
         }],
         workers,
@@ -352,31 +381,78 @@ fn worker_artifact(adapter: &'static str, path: &Path, staging: &Path) -> Result
         );
     }
     let handshake = String::from_utf8(output.stdout)?.trim().to_owned();
-    let (name, version, protocol) = parse_worker_handshake(&handshake)
+    let parsed = parse_worker_handshake(&handshake)
         .with_context(|| format!("{adapter} worker reported a malformed handshake: {handshake}"))?;
     let expected_name = format!("depgraph-{adapter}-worker");
-    if name != expected_name || protocol != "1.0" {
+    if parsed.name != expected_name || parsed.protocol != "1.0" {
         bail!("{adapter} worker reported an incompatible handshake: {handshake}");
     }
+    let backend = if adapter == "rust" {
+        let backend = rust_backend_from_handshake(&parsed)?;
+        verify_rust_backend(&backend)?;
+        Some(backend)
+    } else {
+        None
+    };
     Ok(WorkerArtifact {
-        adapter,
-        version: version.to_owned(),
+        adapter: adapter.to_owned(),
+        version: parsed.version.to_owned(),
         path: relative_slash(staging, path)?,
         sha256: sha256_file(path)?,
+        backend,
     })
 }
 
-fn parse_worker_handshake(handshake: &str) -> Option<(&str, &str, &str)> {
+fn parse_worker_handshake(handshake: &str) -> Option<WorkerHandshake<'_>> {
     let (identity, details) = handshake.split_once(" (protocol ")?;
     let details = details.strip_suffix(')')?;
-    let protocol = details.split_once(';').map_or(details, |(value, _)| value);
+    let mut segments = details.split("; ");
+    let protocol = segments.next()?;
+    let mut parsed_details = BTreeMap::new();
+    let mut detail_order = Vec::new();
+    for detail in segments {
+        let (key, value) = detail.split_once(' ')?;
+        if key.is_empty() || value.is_empty() || parsed_details.insert(key, value).is_some() {
+            return None;
+        }
+        detail_order.push(key);
+    }
     let mut identity = identity.split_whitespace();
     let name = identity.next()?;
     let version = identity.next()?;
     if identity.next().is_some() || name.is_empty() || version.is_empty() || protocol.is_empty() {
         return None;
     }
-    Some((name, version, protocol))
+    Some(WorkerHandshake {
+        name,
+        version,
+        protocol,
+        details: parsed_details,
+        detail_order,
+    })
+}
+
+fn rust_backend_from_handshake(handshake: &WorkerHandshake<'_>) -> Result<WorkerBackend> {
+    if handshake.detail_order != ["rust-analyzer", "rust-analyzer-revision", "salsa"] {
+        bail!("Rust worker handshake has an incomplete or unknown backend compatibility unit");
+    }
+    Ok(WorkerBackend {
+        kind: "rust-analyzer-library".to_owned(),
+        version: handshake.details["rust-analyzer"].to_owned(),
+        revision: handshake.details["rust-analyzer-revision"].to_owned(),
+        salsa_version: handshake.details["salsa"].to_owned(),
+    })
+}
+
+fn verify_rust_backend(backend: &WorkerBackend) -> Result<()> {
+    if backend.kind != "rust-analyzer-library"
+        || backend.version != RUST_ANALYZER_CRATE_VERSION
+        || backend.revision != RUST_ANALYZER_REVISION
+        || backend.salsa_version != SALSA_VERSION
+    {
+        bail!("Rust worker backend does not match the verified compatibility unit: {backend:?}");
+    }
+    Ok(())
 }
 
 fn third_party_licenses(target: &str) -> Result<String> {
@@ -1157,6 +1233,22 @@ fn verify_archive(archive: &Path, name: &str) -> Result<()> {
     let extracted = verify_root.join(name);
     let executable = extracted.join("bin").join(executable_name("depgraph"));
     verify_release_metadata(&extracted)?;
+    #[cfg(unix)]
+    {
+        let symlinked_root = verify_root.join("symlinked-release-root");
+        std::os::unix::fs::symlink(&extracted, &symlinked_root)?;
+        let error = verify_release_metadata(&symlinked_root)
+            .expect_err("release metadata accepted a symlinked release root");
+        if !error
+            .to_string()
+            .contains("release root must not be a symlink")
+        {
+            bail!("release-root symlink gate returned the wrong error: {error:#}");
+        }
+        fs::remove_file(symlinked_root)?;
+    }
+    #[cfg(unix)]
+    verify_release_static_prelaunch_fails_closed(&extracted)?;
     let store = verify_root.join("gate.db");
     let doctor = Command::new(&executable)
         .arg("--store")
@@ -1232,11 +1324,405 @@ fn verify_archive(archive: &Path, name: &str) -> Result<()> {
             );
         }
     }
+    rust_semantic_e2e::verify(&workspace_root(), &executable, None)?;
+    verify_packaged_rust_release_fails_closed(
+        &executable,
+        &extracted,
+        &verify_root,
+        &rust_fixture,
+    )?;
 
     go_semantic_e2e::verify(&workspace_root(), &executable, None)?;
     let go_fixture = Path::new("workers/go/internal/worker/testdata/workspace").canonicalize()?;
     verify_packaged_layout_fails_closed(&executable, &extracted, &verify_root, &go_fixture)?;
     fs::remove_dir_all(verify_root)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn verify_release_static_prelaunch_fails_closed(extracted: &Path) -> Result<()> {
+    let manifest_path = extracted.join("release-manifest.json");
+    let original_manifest = fs::read(&manifest_path)?;
+    let original: ReleaseManifest = serde_json::from_slice(&original_manifest)?;
+    let worker_path = extracted
+        .join("libexec")
+        .join(executable_name("depgraph-rust-worker"));
+    let original_worker = fs::read(&worker_path)?;
+    let marker = extracted.join("libexec/rust-static-prelaunch-spawned");
+    let worker_script = format!(
+        "#!/bin/sh\nmarker=\"$(dirname \"$0\")/rust-static-prelaunch-spawned\"\n: > \"$marker\"\nprintf '%s\\n' 'depgraph-rust-worker {VERSION} (protocol 1.0; rust-analyzer {RUST_ANALYZER_CRATE_VERSION}; rust-analyzer-revision {RUST_ANALYZER_REVISION}; salsa {SALSA_VERSION})'\n"
+    );
+    fs::write(&worker_path, worker_script)?;
+    restore_executable_permissions(&worker_path)?;
+
+    let mut baseline = original.clone();
+    baseline
+        .workers
+        .iter_mut()
+        .find(|worker| worker.adapter == "rust")
+        .context("release manifest has no Rust worker")?
+        .sha256 = sha256_file(&worker_path)?;
+
+    let verification = (|| -> Result<()> {
+        let mut cases = Vec::new();
+
+        let mut manifest = baseline.clone();
+        manifest.core = manifest.schema.clone();
+        cases.push(("core path mismatch", manifest));
+
+        let mut manifest = baseline.clone();
+        manifest.schema = manifest.core.clone();
+        cases.push(("schema path mismatch", manifest));
+
+        let mut manifest = baseline.clone();
+        manifest
+            .runtime_artifacts
+            .retain(|artifact| artifact.path != "libexec/astro.wasm");
+        cases.push(("missing Astro runtime artifact", manifest));
+
+        let mut manifest = baseline.clone();
+        let duplicate = manifest
+            .runtime_artifacts
+            .first()
+            .cloned()
+            .context("release manifest has no runtime artifact")?;
+        manifest.runtime_artifacts.push(duplicate);
+        cases.push(("duplicate runtime artifact", manifest));
+
+        let mut manifest = baseline.clone();
+        manifest
+            .runtime_components
+            .iter_mut()
+            .find(|component| component.name == "typescript-native-compiler")
+            .context("release manifest has no TypeScript runtime component")?
+            .name = "renamed-typescript-compiler".to_owned();
+        cases.push(("missing named TypeScript compatibility unit", manifest));
+
+        let mut manifest = baseline.clone();
+        manifest
+            .runtime_components
+            .iter_mut()
+            .find(|component| component.name == "typescript-native-compiler")
+            .context("release manifest has no TypeScript runtime component")?
+            .version = "9.9.9".to_owned();
+        cases.push(("TypeScript compatibility mismatch", manifest));
+
+        let mut manifest = baseline.clone();
+        manifest.runtime_requirements.remove("web");
+        cases.push(("missing Web runtime requirement", manifest));
+
+        let mut manifest = baseline.clone();
+        manifest
+            .workers
+            .iter_mut()
+            .find(|worker| worker.adapter == "go")
+            .context("release manifest has no Go worker")?
+            .version = "9.9.9".to_owned();
+        cases.push(("Go worker version mismatch", manifest));
+
+        let mut manifest = baseline.clone();
+        let rust_worker = manifest
+            .workers
+            .iter()
+            .find(|worker| worker.adapter == "rust")
+            .cloned()
+            .context("release manifest has no Rust worker")?;
+        let go_worker = manifest
+            .workers
+            .iter_mut()
+            .find(|worker| worker.adapter == "go")
+            .context("release manifest has no Go worker")?;
+        go_worker.path = rust_worker.path;
+        go_worker.sha256 = rust_worker.sha256;
+        cases.push(("Go worker path identity mismatch", manifest));
+
+        for (scenario, manifest) in cases {
+            if marker.exists() {
+                fs::remove_file(&marker)?;
+            }
+            fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)?;
+            let result = verify_release_metadata(extracted);
+            if marker.exists() {
+                bail!("{scenario} launched the Rust worker before static release validation");
+            }
+            if result.is_ok() {
+                bail!("static release validation accepted {scenario}");
+            }
+        }
+        Ok(())
+    })();
+
+    fs::write(&manifest_path, original_manifest)?;
+    fs::write(&worker_path, original_worker)?;
+    restore_executable_permissions(&worker_path)?;
+    if marker.exists() {
+        fs::remove_file(marker)?;
+    }
+    verification
+}
+
+fn verify_packaged_rust_release_fails_closed(
+    executable: &Path,
+    extracted: &Path,
+    verify_root: &Path,
+    fixture: &Path,
+) -> Result<()> {
+    let manifest_path = extracted.join("release-manifest.json");
+    let original_manifest = fs::read(&manifest_path)?;
+    let worker_path = extracted
+        .join("libexec")
+        .join(executable_name("depgraph-rust-worker"));
+    let original_worker = fs::read(&worker_path)?;
+
+    #[cfg(unix)]
+    {
+        remove_executable_permissions(&worker_path)?;
+        let error = verify_release_metadata(extracted)
+            .expect_err("release metadata accepted a non-executable Rust worker");
+        if !error.to_string().contains("rust worker is not executable") {
+            bail!("non-executable Rust worker static gate returned the wrong error: {error:#}");
+        }
+        verify_packaged_security_failure(
+            executable,
+            &verify_root.join("rust-worker-non-executable.db"),
+            fixture,
+            "non-executable Rust worker",
+        )?;
+        restore_executable_permissions(&worker_path)?;
+    }
+
+    fs::remove_file(&worker_path)?;
+    verify_packaged_security_failure(
+        executable,
+        &verify_root.join("rust-worker-missing.db"),
+        fixture,
+        "missing Rust worker",
+    )?;
+    fs::write(&worker_path, &original_worker)?;
+    restore_executable_permissions(&worker_path)?;
+
+    let mut tampered_worker = original_worker.clone();
+    tampered_worker.extend_from_slice(b"depgraph-package-tamper");
+    fs::write(&worker_path, tampered_worker)?;
+    restore_executable_permissions(&worker_path)?;
+    verify_packaged_security_failure(
+        executable,
+        &verify_root.join("rust-worker-tampered.db"),
+        fixture,
+        "tampered Rust worker",
+    )?;
+    fs::write(&worker_path, &original_worker)?;
+    restore_executable_permissions(&worker_path)?;
+
+    #[cfg(unix)]
+    {
+        let real_worker = extracted
+            .join("libexec")
+            .join(format!("{}.real", executable_name("depgraph-rust-worker")));
+        fs::rename(&worker_path, &real_worker)?;
+        std::os::unix::fs::symlink(
+            real_worker
+                .file_name()
+                .context("real Rust worker has no file name")?,
+            &worker_path,
+        )?;
+        verify_packaged_security_failure(
+            executable,
+            &verify_root.join("rust-worker-symlink.db"),
+            fixture,
+            "symlinked Rust worker",
+        )?;
+        fs::remove_file(&worker_path)?;
+        fs::rename(real_worker, &worker_path)?;
+    }
+
+    let mut manifest: ReleaseManifest = serde_json::from_slice(&original_manifest)?;
+    let rust = manifest
+        .workers
+        .iter_mut()
+        .find(|worker| worker.adapter == "rust")
+        .context("release manifest has no Rust worker")?;
+    rust.backend
+        .as_mut()
+        .context("release manifest Rust worker has no backend")?
+        .revision = "0000000000000000000000000000000000000000".to_owned();
+    fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)?;
+    verify_packaged_security_failure(
+        executable,
+        &verify_root.join("rust-backend-mismatch.db"),
+        fixture,
+        "Rust backend revision mismatch",
+    )?;
+
+    let mut manifest: ReleaseManifest = serde_json::from_slice(&original_manifest)?;
+    manifest
+        .workers
+        .iter_mut()
+        .find(|worker| worker.adapter == "rust")
+        .context("release manifest has no Rust worker")?
+        .version = "9.9.9".to_owned();
+    fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)?;
+    verify_packaged_security_failure(
+        executable,
+        &verify_root.join("rust-adapter-mismatch.db"),
+        fixture,
+        "Rust adapter version mismatch",
+    )?;
+    fs::write(&manifest_path, &original_manifest)?;
+
+    #[cfg(unix)]
+    {
+        let real_manifest = extracted.join("release-manifest.real.json");
+        fs::rename(&manifest_path, &real_manifest)?;
+        std::os::unix::fs::symlink(
+            real_manifest
+                .file_name()
+                .context("real release manifest has no file name")?,
+            &manifest_path,
+        )?;
+        verify_packaged_security_failure(
+            executable,
+            &verify_root.join("manifest-symlink.db"),
+            fixture,
+            "symlinked release manifest",
+        )?;
+        fs::remove_file(&manifest_path)?;
+        fs::rename(real_manifest, &manifest_path)?;
+    }
+
+    let schema = extracted.join("schemas/depgraph-protocol-v1.schema.json");
+    let original_schema = fs::read(&schema)?;
+    fs::remove_file(&schema)?;
+    verify_packaged_security_failure(
+        executable,
+        &verify_root.join("schema-missing.db"),
+        fixture,
+        "missing protocol schema",
+    )?;
+    fs::write(&schema, &original_schema)?;
+    let mut tampered_schema = original_schema.clone();
+    tampered_schema.extend_from_slice(b"\n");
+    fs::write(&schema, tampered_schema)?;
+    verify_packaged_security_failure(
+        executable,
+        &verify_root.join("schema-tampered.db"),
+        fixture,
+        "tampered protocol schema",
+    )?;
+    fs::write(&schema, original_schema)?;
+
+    verify_packaged_data_tree_fails_closed(
+        executable,
+        extracted,
+        verify_root,
+        fixture,
+        &original_manifest,
+    )?;
+    fs::write(manifest_path, original_manifest)?;
+    Ok(())
+}
+
+fn verify_packaged_data_tree_fails_closed(
+    executable: &Path,
+    extracted: &Path,
+    verify_root: &Path,
+    fixture: &Path,
+    original_manifest: &[u8],
+) -> Result<()> {
+    let manifest_path = extracted.join("release-manifest.json");
+    let component_root = extracted.join("libexec/rust-release-data");
+    fs::create_dir_all(&component_root)?;
+    let payload = component_root.join("backend.txt");
+    fs::write(&payload, b"release-owned backend data\n")?;
+    let mut manifest: ReleaseManifest = serde_json::from_slice(original_manifest)?;
+    manifest.runtime_components.push(RuntimeComponent {
+        name: "rust-release-data-test".to_owned(),
+        kind: "data-tree".to_owned(),
+        version: "1".to_owned(),
+        root: "libexec/rust-release-data".to_owned(),
+        entrypoint: None,
+        sha256: sha256_tree(&component_root)?,
+    });
+    fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)?;
+    verify_packaged_scan(
+        executable,
+        &verify_root.join("data-tree-valid.db"),
+        fixture,
+        "Rust data-tree",
+    )?;
+
+    fs::remove_file(&payload)?;
+    verify_packaged_security_failure(
+        executable,
+        &verify_root.join("data-tree-missing.db"),
+        fixture,
+        "missing Rust data-tree input",
+    )?;
+    fs::write(&payload, b"release-owned backend data\n")?;
+
+    fs::write(&payload, b"tampered backend data\n")?;
+    verify_packaged_security_failure(
+        executable,
+        &verify_root.join("data-tree-tampered.db"),
+        fixture,
+        "tampered Rust data-tree",
+    )?;
+    fs::write(&payload, b"release-owned backend data\n")?;
+
+    let added = component_root.join("added.txt");
+    fs::write(&added, b"undeclared addition\n")?;
+    verify_packaged_security_failure(
+        executable,
+        &verify_root.join("data-tree-added.db"),
+        fixture,
+        "added Rust data-tree input",
+    )?;
+    fs::remove_file(added)?;
+
+    let added_directory = component_root.join("undeclared-empty-directory");
+    fs::create_dir(&added_directory)?;
+    verify_packaged_security_failure(
+        executable,
+        &verify_root.join("data-tree-added-directory.db"),
+        fixture,
+        "added empty Rust data-tree directory",
+    )?;
+    fs::remove_dir(added_directory)?;
+
+    #[cfg(unix)]
+    {
+        let symlink = component_root.join("backend-link.txt");
+        std::os::unix::fs::symlink("backend.txt", &symlink)?;
+        verify_packaged_security_failure(
+            executable,
+            &verify_root.join("data-tree-symlink.db"),
+            fixture,
+            "symlinked Rust data-tree input",
+        )?;
+        fs::remove_file(symlink)?;
+    }
+    fs::remove_dir_all(component_root)?;
+    fs::write(manifest_path, original_manifest)?;
+    Ok(())
+}
+
+fn restore_executable_permissions(_path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mut permissions = fs::metadata(_path)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(_path, permissions)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn remove_executable_permissions(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let mut permissions = fs::metadata(path)?.permissions();
+    permissions.set_mode(permissions.mode() & !0o111);
+    fs::set_permissions(path, permissions)?;
     Ok(())
 }
 
@@ -1278,6 +1764,26 @@ fn verify_packaged_typescript_fails_closed(
 ) -> Result<()> {
     let standard_library = extracted.join("libexec/typescript/lib/lib.d.ts");
     let original = fs::read(&standard_library)?;
+
+    #[cfg(unix)]
+    {
+        let compiler = extracted
+            .join("libexec/typescript/lib")
+            .join(executable_name("tsc"));
+        remove_executable_permissions(&compiler)?;
+        let error = verify_release_metadata(extracted)
+            .expect_err("release metadata accepted a non-executable TypeScript compiler");
+        if !error.to_string().contains("entrypoint is not executable") {
+            bail!("non-executable TypeScript static gate returned the wrong error: {error:#}");
+        }
+        verify_packaged_security_failure(
+            executable,
+            &verify_root.join("typescript-non-executable.db"),
+            fixture,
+            "non-executable TypeScript compiler",
+        )?;
+        restore_executable_permissions(&compiler)?;
+    }
 
     fs::remove_file(&standard_library)?;
     verify_packaged_security_failure(
@@ -1367,16 +1873,200 @@ fn verify_packaged_scan(
     Ok(())
 }
 
-fn verify_release_metadata(extracted: &Path) -> Result<()> {
+fn verify_release_metadata(extracted: &Path) -> Result<ReleaseManifest> {
+    if fs::symlink_metadata(extracted)?.file_type().is_symlink() {
+        bail!(
+            "release root must not be a symlink: {}",
+            extracted.display()
+        );
+    }
     for required in [
         "release-manifest.json",
         "THIRD_PARTY_LICENSES.txt",
         "sbom.spdx.json",
         "schemas/depgraph-protocol-v1.schema.json",
     ] {
-        if !extracted.join(required).is_file() {
+        let path = extracted.join(required);
+        if !path.is_file()
+            || fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_symlink())
+        {
             bail!("release archive is missing {required}");
         }
+    }
+    let manifest: ReleaseManifest =
+        serde_json::from_slice(&fs::read(extracted.join("release-manifest.json"))?)
+            .context("release manifest is invalid")?;
+    if manifest.release_version != VERSION
+        || manifest.protocol_version != "1.0"
+        || manifest.schema_version != "1.0"
+        || manifest.target.trim().is_empty()
+    {
+        bail!("release manifest has an incompatible release compatibility unit");
+    }
+    let expected_core_path = format!("bin/{}", executable_name("depgraph"));
+    if manifest.core.path != expected_core_path {
+        bail!("release manifest core path does not match {expected_core_path}");
+    }
+    let core = verify_release_artifact(extracted, &manifest.core, "core")?;
+    let expected_core = verified_release_path(extracted, &expected_core_path, "expected core")?;
+    if core != expected_core || !is_executable(&core)? {
+        bail!("release manifest core must be the packaged executable");
+    }
+    if manifest.schema.path != "schemas/depgraph-protocol-v1.schema.json" {
+        bail!("release manifest schema path does not match the packaged protocol schema");
+    }
+    verify_release_artifact(extracted, &manifest.schema, "schema")?;
+    let mut runtime_paths = BTreeSet::new();
+    for artifact in &manifest.runtime_artifacts {
+        if !runtime_paths.insert(artifact.path.as_str()) {
+            bail!(
+                "release manifest contains duplicate runtime artifact {}",
+                artifact.path
+            );
+        }
+        verify_release_artifact(extracted, artifact, "runtime artifact")?;
+    }
+    let mut components = BTreeMap::new();
+    for component in &manifest.runtime_components {
+        if component.name.trim().is_empty() || component.version.trim().is_empty() {
+            bail!("release manifest runtime component name and version must be non-empty");
+        }
+        if component.root.trim().is_empty() {
+            bail!("release manifest runtime component root must be non-empty");
+        }
+        if component
+            .entrypoint
+            .as_deref()
+            .is_some_and(|entrypoint| entrypoint.trim().is_empty())
+        {
+            bail!("release manifest runtime component entrypoint must be non-empty when present");
+        }
+        if components
+            .insert(component.name.as_str(), component)
+            .is_some()
+        {
+            bail!(
+                "release manifest contains duplicate runtime component {}",
+                component.name
+            );
+        }
+        match (component.kind.as_str(), component.entrypoint.as_deref()) {
+            ("executable-tree", Some(_)) | ("data-tree", _) => {}
+            ("executable-tree", None) => {
+                bail!(
+                    "executable runtime component {} has no entrypoint",
+                    component.name
+                );
+            }
+            (kind, _) => bail!(
+                "runtime component {} has unsupported kind {kind}",
+                component.name
+            ),
+        }
+        let root = verified_release_path(extracted, &component.root, "runtime component")?;
+        if !root.is_dir() || sha256_tree(&root)? != component.sha256 {
+            bail!(
+                "runtime component {} failed its whole-tree checksum",
+                component.name
+            );
+        }
+        if let Some(entrypoint) = &component.entrypoint {
+            let entrypoint = verified_release_path(extracted, entrypoint, "component entrypoint")?;
+            if !entrypoint.is_file() || !entrypoint.starts_with(&root) {
+                bail!(
+                    "runtime component {} entrypoint escapes its root",
+                    component.name
+                );
+            }
+            if component.kind == "executable-tree" && !is_executable(&entrypoint)? {
+                bail!(
+                    "executable runtime component {} entrypoint is not executable",
+                    component.name
+                );
+            }
+        }
+    }
+    if !runtime_paths.contains("libexec/astro.wasm") {
+        bail!("release manifest has no required Web runtime artifact libexec/astro.wasm");
+    }
+    let typescript = components.get("typescript-native-compiler").context(
+        "release manifest has no required Web runtime component typescript-native-compiler",
+    )?;
+    let expected_typescript_entrypoint =
+        format!("libexec/typescript/lib/{}", executable_name("tsc"));
+    if typescript.version != "7.0.2"
+        || typescript.kind != "executable-tree"
+        || typescript.root != "libexec/typescript/lib"
+        || typescript.entrypoint.as_deref() != Some(expected_typescript_entrypoint.as_str())
+    {
+        bail!(
+            "TypeScript runtime component does not match 7.0.2 at {expected_typescript_entrypoint}"
+        );
+    }
+    if manifest.runtime_requirements.get("web").map(String::as_str) != Some("Node.js >=24.0.0") {
+        bail!("release manifest Web runtime requirement must be Node.js >=24.0.0");
+    }
+    let mut worker_adapters = BTreeSet::new();
+    for worker in &manifest.workers {
+        if !matches!(worker.adapter.as_str(), "rust" | "go" | "web") {
+            bail!(
+                "release manifest contains unknown worker adapter {}",
+                worker.adapter
+            );
+        }
+        let expected_worker_path = if worker.adapter == "web" {
+            "libexec/depgraph-web-worker.mjs".to_owned()
+        } else {
+            format!(
+                "libexec/{}",
+                executable_name(&format!("depgraph-{}-worker", worker.adapter))
+            )
+        };
+        if worker.path != expected_worker_path {
+            bail!(
+                "{} worker path does not match {expected_worker_path}",
+                worker.adapter
+            );
+        }
+        if !worker_adapters.insert(worker.adapter.as_str()) {
+            bail!(
+                "release manifest contains duplicate {} worker",
+                worker.adapter
+            );
+        }
+        if worker.version != VERSION {
+            bail!(
+                "{} worker adapter version {} does not match release version {VERSION}",
+                worker.adapter,
+                worker.version
+            );
+        }
+        let artifact = verify_release_artifact(
+            extracted,
+            &Artifact {
+                path: worker.path.clone(),
+                sha256: worker.sha256.clone(),
+            },
+            "worker",
+        )?;
+        if worker.adapter != "web" && !is_executable(&artifact)? {
+            bail!("packaged {} worker is not executable", worker.adapter);
+        }
+        if worker.adapter == "rust" {
+            let backend = worker
+                .backend
+                .as_ref()
+                .context("release manifest Rust worker has no backend compatibility unit")?;
+            verify_rust_backend(backend)?;
+        } else if worker.backend.is_some() {
+            bail!(
+                "{} worker unexpectedly declares a Rust backend compatibility unit",
+                worker.adapter
+            );
+        }
+    }
+    if worker_adapters != BTreeSet::from(["go", "rust", "web"]) {
+        bail!("release manifest must contain exactly the Rust, Go, and Web workers");
     }
     let sbom: Value = serde_json::from_slice(&fs::read(extracted.join("sbom.spdx.json"))?)?;
     if sbom["spdxVersion"] != "SPDX-2.3" {
@@ -1518,14 +2208,147 @@ fn verify_release_metadata(extracted: &Path) -> Result<()> {
             bail!("third-party license inventory is missing {expected}");
         }
     }
+    let expected_backend_packages = dependency_inventory(&manifest.target)?
+        .into_iter()
+        .filter(|package| {
+            package.ecosystem == "cargo"
+                && (package.name.starts_with("ra_ap_") || package.name.starts_with("salsa"))
+        })
+        .map(|package| (package.name, package.version, package.license))
+        .collect::<BTreeSet<_>>();
+    let actual_backend_packages = packages
+        .iter()
+        .filter_map(|package| {
+            let name = package["name"].as_str()?;
+            (name.starts_with("ra_ap_") || name.starts_with("salsa")).then(|| {
+                (
+                    name.to_owned(),
+                    package["versionInfo"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_owned(),
+                    package["licenseDeclared"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_owned(),
+                )
+            })
+        })
+        .collect::<BTreeSet<_>>();
+    if actual_backend_packages != expected_backend_packages {
+        bail!(
+            "release SBOM Rust backend closure differs from Cargo metadata: expected {expected_backend_packages:?}, found {actual_backend_packages:?}"
+        );
+    }
+    for (name, version, license) in &expected_backend_packages {
+        let expected = format!("cargo:{name} {version} — {license}");
+        if !license_inventory.lines().any(|line| line == expected) {
+            bail!("third-party license inventory is missing {expected}");
+        }
+    }
     for (label, content) in web_legal_documents()? {
         let section = legal_document_section(&label, &content);
         if !license_inventory.contains(&section) {
             bail!("third-party license inventory is missing {label}");
         }
     }
+    if sbom != crate::sbom(&manifest.target)? {
+        bail!("release SBOM differs from the locked package dependency inventory");
+    }
+    if license_inventory != third_party_licenses(&manifest.target)? {
+        bail!("third-party license inventory differs from the locked package dependency inventory");
+    }
     verify_typescript_compiler(extracted)?;
+    let rust_worker = manifest
+        .workers
+        .iter()
+        .find(|worker| worker.adapter == "rust")
+        .context("release manifest has no Rust worker")?;
+    verify_packaged_rust_handshake(
+        extracted,
+        rust_worker,
+        rust_worker
+            .backend
+            .as_ref()
+            .context("release manifest Rust worker has no backend compatibility unit")?,
+    )?;
+    Ok(manifest)
+}
+
+fn verify_packaged_rust_handshake(
+    extracted: &Path,
+    worker: &WorkerArtifact,
+    backend: &WorkerBackend,
+) -> Result<()> {
+    let worker_path = verified_release_path(extracted, &worker.path, "Rust worker")?;
+    let output = Command::new(&worker_path).arg("--version").output()?;
+    if !output.status.success() || !output.stderr.is_empty() {
+        bail!("packaged Rust worker version handshake failed");
+    }
+    let raw = String::from_utf8(output.stdout)?;
+    let handshake = parse_worker_handshake(raw.trim())
+        .context("packaged Rust worker returned a malformed version handshake")?;
+    let actual_backend = rust_backend_from_handshake(&handshake)?;
+    if handshake.name != "depgraph-rust-worker"
+        || handshake.version != worker.version
+        || handshake.protocol != "1.0"
+        || &actual_backend != backend
+    {
+        bail!(
+            "packaged Rust worker handshake does not match its release manifest compatibility unit"
+        );
+    }
     Ok(())
+}
+
+fn verify_release_artifact(
+    extracted: &Path,
+    artifact: &Artifact,
+    description: &str,
+) -> Result<PathBuf> {
+    let path = verified_release_path(extracted, &artifact.path, description)?;
+    if !path.is_file() || sha256_file(&path)? != artifact.sha256 {
+        bail!(
+            "release {description} {} failed its checksum",
+            artifact.path
+        );
+    }
+    Ok(path)
+}
+
+fn verified_release_path(extracted: &Path, declared: &str, description: &str) -> Result<PathBuf> {
+    let declared = Path::new(declared);
+    if declared.is_absolute()
+        || declared
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        bail!(
+            "release {description} has an unsafe path {}",
+            declared.display()
+        );
+    }
+    let canonical_root = extracted.canonicalize()?;
+    let mut path = extracted.to_path_buf();
+    for component in declared.components() {
+        let std::path::Component::Normal(component) = component else {
+            unreachable!();
+        };
+        path.push(component);
+        if fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+            bail!(
+                "release {description} path contains a symlink: {}",
+                path.display()
+            );
+        }
+    }
+    let path = path
+        .canonicalize()
+        .with_context(|| format!("release {description} is missing: {}", declared.display()))?;
+    if !path.starts_with(canonical_root) {
+        bail!("release {description} escapes the release root");
+    }
+    Ok(path)
 }
 
 fn verify_typescript_compiler(release_root: &Path) -> Result<()> {
@@ -1671,7 +2494,7 @@ fn sha256_file(path: &Path) -> Result<String> {
 }
 
 fn sha256_tree(root: &Path) -> Result<String> {
-    let mut files = Vec::new();
+    let mut entries = Vec::new();
     for entry in WalkDir::new(root).follow_links(false).min_depth(1) {
         let entry = entry?;
         if entry.file_type().is_symlink() {
@@ -1681,30 +2504,42 @@ fn sha256_tree(root: &Path) -> Result<String> {
             );
         }
         if entry.file_type().is_file() {
-            files.push((
+            entries.push((
                 relative_slash(root, entry.path())?,
+                true,
                 entry.path().to_path_buf(),
             ));
-        } else if !entry.file_type().is_dir() {
+        } else if entry.file_type().is_dir() {
+            entries.push((
+                relative_slash(root, entry.path())?,
+                false,
+                entry.path().to_path_buf(),
+            ));
+        } else {
             bail!(
                 "unsupported runtime component entry: {}",
                 entry.path().display()
             );
         }
     }
-    files.sort_by(|left, right| left.0.cmp(&right.0));
-    if files.is_empty() {
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    if !entries.iter().any(|(_, is_file, _)| *is_file) {
         bail!("runtime component {} is empty", root.display());
     }
     let mut digest = Sha256::new();
-    digest.update(b"depgraph-runtime-tree-v1\0");
-    for (relative, file) in files {
+    digest.update(b"depgraph-runtime-tree-v2\0");
+    for (relative, is_file, path) in entries {
+        digest.update([if is_file { b'f' } else { b'd' }]);
         let relative = relative.as_bytes();
-        let content = fs::read(&file)?;
         digest.update((relative.len() as u64).to_be_bytes());
         digest.update(relative);
-        digest.update((content.len() as u64).to_be_bytes());
-        digest.update(content);
+        if is_file {
+            let content = fs::read(&path)?;
+            digest.update((content.len() as u64).to_be_bytes());
+            digest.update(content);
+        } else {
+            digest.update(0_u64.to_be_bytes());
+        }
     }
     Ok(hex::encode(digest.finalize()))
 }
@@ -1731,9 +2566,10 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        ARCHIVE_MTIME, DependencyPackage, archive_entries, cargo_runtime_packages,
+        ARCHIVE_MTIME, DependencyPackage, WorkerBackend, archive_entries, cargo_runtime_packages,
         create_tar_archive, create_zip_archive, extract_archive, normalized_spdx_license,
-        package_url, verify_rust_analyzer_dependencies, web_runtime_packages,
+        package_url, parse_worker_handshake, rust_backend_from_handshake,
+        verify_rust_analyzer_dependencies, verify_rust_backend, web_runtime_packages,
     };
 
     fn release_tree() -> Result<(tempfile::TempDir, String)> {
@@ -1760,6 +2596,54 @@ mod tests {
                 .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000_000)),
         )?;
         Ok(())
+    }
+
+    #[test]
+    fn rust_worker_handshake_captures_the_exact_backend_compatibility_unit() -> Result<()> {
+        let parsed = parse_worker_handshake(
+            "depgraph-rust-worker 0.1.0 (protocol 1.0; rust-analyzer 0.0.330; rust-analyzer-revision 8954b66d43225e62c92e8bbcc8500191b5cceb1e; salsa 0.26.1)",
+        )
+        .expect("valid Rust worker handshake");
+        assert_eq!(parsed.name, "depgraph-rust-worker");
+        assert_eq!(parsed.version, "0.1.0");
+        assert_eq!(parsed.protocol, "1.0");
+        let backend = rust_backend_from_handshake(&parsed)?;
+        verify_rust_backend(&backend)?;
+        assert_eq!(backend.kind, "rust-analyzer-library");
+        assert_eq!(backend.version, "0.0.330");
+        assert_eq!(backend.revision, "8954b66d43225e62c92e8bbcc8500191b5cceb1e");
+        assert_eq!(backend.salsa_version, "0.26.1");
+        Ok(())
+    }
+
+    #[test]
+    fn rust_worker_handshake_rejects_missing_duplicate_or_unknown_backend_fields() {
+        for handshake in [
+            "depgraph-rust-worker 0.1.0 (protocol 1.0; rust-analyzer 0.0.330; salsa 0.26.1)",
+            "depgraph-rust-worker 0.1.0 (protocol 1.0; rust-analyzer 0.0.330; rust-analyzer 0.0.330; rust-analyzer-revision rev; salsa 0.26.1)",
+            "depgraph-rust-worker 0.1.0 (protocol 1.0; rust-analyzer 0.0.330; rust-analyzer-revision rev; salsa 0.26.1; sysroot system)",
+            "depgraph-rust-worker 0.1.0 (protocol 1.0; rust-analyzer 0.0.330; salsa 0.26.1; rust-analyzer-revision rev)",
+        ] {
+            let parsed = parse_worker_handshake(handshake);
+            assert!(
+                parsed
+                    .as_ref()
+                    .is_none_or(|parsed| rust_backend_from_handshake(parsed).is_err()),
+                "{handshake}"
+            );
+        }
+    }
+
+    #[test]
+    fn rust_backend_manifest_rejects_unknown_compatibility_fields() {
+        let result = serde_json::from_value::<WorkerBackend>(json!({
+            "kind": "rust-analyzer-library",
+            "version": "0.0.330",
+            "revision": "8954b66d43225e62c92e8bbcc8500191b5cceb1e",
+            "salsa_version": "0.26.1",
+            "undeclared_backend_input": "system"
+        }));
+        assert!(result.is_err());
     }
 
     fn rust_analyzer_metadata() -> serde_json::Value {

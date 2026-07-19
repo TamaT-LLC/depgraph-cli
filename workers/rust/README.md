@@ -16,9 +16,11 @@ database for the HIR definition and dependency graph: canonical `symbol` and
 relations, HIR-refined import/re-export sites, semantic `type_uses`, and
 exact/candidate calls are validated and atomically unioned with the syntax
 graph. The final fallback/coverage matrix is complete, and an eligible profile
-can now claim `semantic-complete`. The package/release verifier remains Issue
-#30 and is not implemented; successful semantic profiles therefore retain
-`rust_hir_enable_gate=release-gate-pending` and are not release-ready.
+can now claim `semantic-complete`. Source/development execution intentionally
+retains `rust_hir_enable_gate=release-gate-pending`. The Issue #30
+package/release verifier was completed on 2026-07-19; after the core verifies
+the extracted archive and exact Rust backend attestation, the packaged worker
+receives and emits `release-gate-verified` as its release-ready claim.
 
 Preflight rejects ambiguous globs, symlinks, out-of-root workspace members and
 path dependencies, and unknown Cargo path-bearing fields before Cargo starts.
@@ -184,10 +186,12 @@ graph, and is a strict-policy failure. A panic, timeout, cancellation, or
 malformed worker result is a worker failure; the core preserves other adapter
 results and records the overall scan as partial with exit code `3`.
 
-The remaining Issue #30 release slice may introduce a release-owned,
-checksum-verified sysroot snapshot and must add its data-tree schema and
-package verifier first. That slice is unimplemented, and no current HIR result
-is a release-ready claim.
+Issue #30 deliberately ships no sysroot or `rust-src`. The implemented release
+schema supports whole-tree-checked `data-tree` components with an optional
+entrypoint if a future compatibility unit adds such data. Missing, added,
+modified, or symlinked content fails closed, and neither development nor
+packaged execution falls back implicitly to project or system backend/sysroot
+bytes.
 
 Safe mode must not:
 
@@ -213,13 +217,14 @@ matches the exact baseline. The rust-analyzer revision is selected, the smoke
 scaffold and deterministic multi-file project model are available, and Cargo
 metadata input reads are confined. When those inputs are compatible, the HIR
 definition, import/re-export, type-use, and call graph is emitted. The final
-fallback/coverage matrix is complete; only the Issue #30 package/release gate
-remains. A verified sysroot is additionally required only when a future
-profile claims exact standard-library resolution.
+fallback/coverage matrix and Issue #30 package/release gate are complete. A
+verified sysroot is additionally required only when a future profile claims
+exact standard-library resolution; the current compatibility unit bundles no
+sysroot and makes no implicit fallback.
 
 | Project/toolchain state | Current result | Semantic completeness / release status |
 | --- | --- | --- |
-| Exact `1.93.1`, supported target, and complete confined crate graph | Static syntax graph plus HIR definitions, refined imports/re-exports, `type_uses`, and exact/candidate calls | `semantic-complete` only with `syntax-complete`, exact compatible HIR, confined metadata, `ready` / `emitted`, issue count `0`, and skipped / unsupported / unresolved all `0`; gate remains `release-gate-pending` |
+| Exact `1.93.1`, supported target, and complete confined crate graph | Static syntax graph plus HIR definitions, refined imports/re-exports, `type_uses`, and exact/candidate calls | `semantic-complete` only with `syntax-complete`, exact compatible HIR, confined metadata, `ready` / `emitted`, issue count `0`, and skipped / unsupported / unresolved all `0`; source/development runs use `release-gate-pending`, while a core-attested packaged worker uses `release-gate-verified` |
 | No project toolchain declaration | The neutral probe decides eligibility; an exact compatible pair may emit the import/type/call graph | Eligible only when every effective input is the verified baseline and the completeness conditions hold |
 | Older, newer, or nightly declaration | `RUST_TOOLCHAIN_BEST_EFFORT`; static syntax graph | Syntax fallback; never `semantic-complete` |
 | Custom or malformed declaration, unreadable file, or external symlink | Static syntax graph with `RUST_TOOLCHAIN_INVALID` and `RUST_HIR_TOOLCHAIN_UNSUPPORTED` | Fail-closed syntax fallback; never HIR-eligible |
@@ -230,15 +235,16 @@ profile claims exact standard-library resolution.
 | External definition is unavailable | Classified external or unresolved site plus stable coverage evidence | External alone is allowed; unresolved blocks `semantic-complete` |
 | Typed HIR semantic-extractor failure | The node/site/edge/file-ledger delta is discarded atomically and the syntax graph is preserved with `RUST_HIR_BACKEND_FAILURE` | Strict-policy failure; never `semantic-complete` |
 | HIR panic, timeout, cancellation, or malformed result | Worker failure; it is not downgraded to syntax success | Other adapter results remain, but the scan is partial with exit `3` |
-| Release-owned backend/sysroot bytes are missing or changed | Issue #30 package/release verification is unimplemented | No release-ready claim; after Issue #30 this must fail closed before analysis with no project/system fallback |
+| A release artifact/component is missing, changed, added to a checked tree, or symlinked; or the Rust backend manifest/handshake differs | The package verifier and core attestation reject the archive before analysis | `security_failed`, exit `4`, and no development/project/system backend or sysroot fallback |
 
 `syntax-complete` means all supported syntax dependency sites were classified.
 It does not imply HIR resolution. The complete condition is the conjunction of
 `syntax-complete`, exact compatible HIR, `confined-cargo-metadata`, a `ready`
 project model, `import-type-call-graph-emitted`, semantic issue count `0`,
 `project_code_executed=false`, and zero skipped, unsupported, and unresolved
-counts. Candidate and external sites may remain. The resulting
-`release-gate-pending` value is deliberately not a release-ready assertion.
+counts. Candidate and external sites may remain. A source/development result is
+still `release-gate-pending` and deliberately not release-ready; only the same
+result from a core-attested packaged worker is `release-gate-verified`.
 
 ## Profile metadata
 
@@ -253,7 +259,7 @@ values are outcome-dependent; fallback paths retain the syntax-only values.
 | `rust_hir_status` | `import-type-call-graph-emitted`, `import-type-call-graph-partial`, `failed`, or `not-invoked` |
 | `rust_hir_scaffold` | `available` |
 | `rust_hir_project_model` | `ready` after deterministic construction; otherwise `not-invoked`, `unavailable`, or `unsupported` |
-| `rust_hir_enable_gate` | `release-gate-pending` after successful import/type/call emission; `semantic-backend-failure` on typed failure; otherwise `semantic-emission-pending`, `toolchain-unsupported`, `crate-graph-unavailable`, or `input-unsupported`. `release-gate-pending` does not mean release-ready |
+| `rust_hir_enable_gate` | `release-gate-pending` after successful source/development emission; `release-gate-verified` only when the core has verified the packaged manifest, artifacts, components, and exact backend attestation; `semantic-backend-failure` on typed failure; otherwise `semantic-emission-pending`, `toolchain-unsupported`, `crate-graph-unavailable`, or `input-unsupported` |
 | `rust_hir_project_file_count` | Number of admitted inventory files in the safe VFS; `0` when no model is available |
 | `rust_hir_project_crate_count` | Number of workspace/path local crates in the safe graph; `0` when no model is available |
 | `rust_hir_project_external_count` | Number of external/sysroot sidecar entries; `0` when no model is available |
@@ -327,13 +333,13 @@ fails even if configured skipped/unsupported/unresolved thresholds would
 otherwise pass. Panic, timeout, cancellation, and malformed worker output are
 process/protocol failures instead and make the scan partial with exit `3`.
 
-Integrity failures are different: the current core already treats a missing or
-modified release-owned worker as a security error. Issue #30 remains
-unimplemented and must additionally make the package/release verifier reject
-worker/backend version mismatches, release-root symlinks, and invalid data-tree
-components as security errors before the HIR backend can be declared
-release-ready. None of these cases may fall back to a project binary, system
-rust-analyzer, or an unverified sysroot.
+Integrity failures are different: the package verifier and core attestation
+treat a missing, added, modified, or symlinked release artifact/component,
+release-root symlink, and worker/backend manifest or handshake mismatch as a
+security error before analysis. The verified core alone injects the exact
+`release-gate-verified` value into the packaged Rust worker. None of these cases
+falls back to a development/project binary, system rust-analyzer, or an
+unverified sysroot.
 
 ## Release and upgrade gate
 
@@ -344,15 +350,16 @@ The selected rust-analyzer libraries are statically linked into
 third-party license inventory. Any non-linked sysroot or backend data must be a
 named data-tree release component with a canonical whole-tree checksum;
 missing, added, modified, or symlinked content must be rejected before the
-worker starts. The current runtime-component schema requires an executable
-entrypoint, so a `data-tree` kind with an optional entrypoint and matching
-verifier must be added before shipping rust-src.
+worker starts. The implemented runtime-component schema distinguishes an
+`executable-tree`, which requires an executable entrypoint, from a `data-tree`,
+whose entrypoint is optional. The current archive includes no sysroot or
+`rust-src`, and never searches for project or system replacements.
 
 An upgrade changes the Rust baseline, rust-analyzer revision, and any bundled
 sysroot as one compatibility unit. Before merging it must:
 
 1. pin exact dependency versions and record the upstream revision;
-2. build on every Tier 1 release target;
+2. build on every Tier 1 release target and the Windows package target;
 3. pass supported, older, newer, missing-toolchain, broken-source, cfg/feature,
    build-script, and proc-macro fixtures;
 4. prove two identical scans have identical profiles, nodes, sites, edges,
@@ -406,8 +413,10 @@ scan boundary:
    `OUT_DIR`, build/proc/external boundaries, and HIR failures; preserve the
    static graph atomically; prove repeated-scan/checkout determinism; and permit
    `semantic-complete` only under the exact zero-issue/zero-gap conditions.
-8. **Unimplemented — close the package/release gate (Issue #30, 2–3 days):**
-   make worker/backend version mismatch and release-root symlinks fail closed,
-   add a data-tree component schema/verifier for any sysroot input, and run the
-   armed security fixture from extracted Tier 1 archives. Until this completes,
-   `release-gate-pending` is not a release-ready claim.
+8. **Completed 2026-07-19 — close the package/release gate (Issue #30):**
+   fail closed on every artifact/component or backend attestation mismatch and
+   symlink; support executable-tree/data-tree components; verify extracted
+   archive query/export/determinism E2E and complete rust-analyzer/Salsa
+   SBOM/license closure; and run Tier 1, Windows, and benchmark gates. Source
+   builds remain `release-gate-pending`; only core-attested archives emit
+   `release-gate-verified`.

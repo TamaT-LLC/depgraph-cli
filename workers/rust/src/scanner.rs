@@ -89,6 +89,10 @@ type SemanticExtractor = fn(
     &str,
 ) -> Result<SemanticDelta>;
 
+const RUST_RELEASE_GATE_ENV: &str = "DEPGRAPH_RUST_RELEASE_GATE";
+const RELEASE_GATE_PENDING: &str = "release-gate-pending";
+const RELEASE_GATE_VERIFIED: &str = "release-gate-verified";
+
 #[derive(Debug)]
 struct State {
     root: PathBuf,
@@ -109,6 +113,7 @@ struct State {
     semantic_call_occurrences: BTreeSet<CallOccurrenceKey>,
     unsupported_syntax: u64,
     reasons: BTreeSet<String>,
+    rust_release_gate: &'static str,
 }
 
 pub fn scan(root: &Path) -> Result<ScanResult> {
@@ -373,6 +378,7 @@ impl State {
             semantic_call_occurrences: BTreeSet::new(),
             unsupported_syntax: 0,
             reasons: BTreeSet::new(),
+            rust_release_gate: configured_rust_release_gate(),
         }
     }
 
@@ -877,7 +883,7 @@ impl State {
                 );
                 self.profile.properties.insert(
                     "rust_hir_enable_gate".into(),
-                    Value::String("release-gate-pending".into()),
+                    Value::String(self.rust_release_gate.into()),
                 );
                 self.profile.properties.insert(
                     "rust_hir_semantic_node_count".into(),
@@ -2852,7 +2858,7 @@ fn rust_semantic_complete_eligible(profile: &Profile, coverage: &Coverage) -> bo
             .properties
             .get("rust_hir_enable_gate")
             .and_then(Value::as_str)
-            == Some("release-gate-pending")
+            .is_some_and(is_successful_release_gate)
         && profile
             .properties
             .get("crate_graph_source")
@@ -2913,6 +2919,22 @@ fn rust_semantic_complete_eligible(profile: &Profile, coverage: &Coverage) -> bo
             .get("proc_macros_executed")
             .and_then(Value::as_bool)
             == Some(false)
+}
+
+fn is_successful_release_gate(gate: &str) -> bool {
+    matches!(gate, RELEASE_GATE_PENDING | RELEASE_GATE_VERIFIED)
+}
+
+fn configured_rust_release_gate() -> &'static str {
+    rust_release_gate_from_env_value(std::env::var_os(RUST_RELEASE_GATE_ENV).as_deref())
+}
+
+fn rust_release_gate_from_env_value(value: Option<&OsStr>) -> &'static str {
+    if value == Some(OsStr::new(RELEASE_GATE_VERIFIED)) {
+        RELEASE_GATE_VERIFIED
+    } else {
+        RELEASE_GATE_PENDING
+    }
 }
 
 fn rust_profile(
