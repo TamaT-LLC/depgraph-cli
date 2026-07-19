@@ -2,7 +2,7 @@ import path from "node:path";
 import { parse as parseAstro } from "@astrojs/compiler/sync";
 import { createScanner, LanguageVariant, SyntaxKind } from "typescript/unstable/ast";
 import { isFile, isWithinRoot, normalizeRelative, readJson, readUtf8, resolveWithinRoot } from "./fs";
-import type { TypeOnlyDependencyRange } from "./typescript-compiler";
+import type { TypeOnlyDependencyRange, TypeScriptStaticConfig } from "./typescript-compiler";
 import { WEB_CONDITION, type Condition, type Evidence, type Precision, type ResolutionStatus } from "./types";
 import {
   selectPackageInstallCandidates,
@@ -41,12 +41,32 @@ export interface Resolution {
 interface AliasRule {
   pattern: string;
   replacements: string[];
+  virtualReplacements: string[];
   basePath: string;
 }
 
 export interface ResolverIssue {
   path: string;
   reason: string;
+}
+
+function portableRelativePath(value: string): string | null {
+  const portable = value.replaceAll("\\", "/");
+  if (
+    portable.includes("\0")
+    || path.posix.isAbsolute(portable)
+    || /^[A-Za-z]:/u.test(portable)
+  ) return null;
+  return portable;
+}
+
+function resolvePortableRepositoryPath(baseRelative: string, value: string): string | null {
+  const portable = portableRelativePath(value);
+  if (portable === null) return null;
+  const base = baseRelative === "." ? "" : baseRelative;
+  const resolved = path.posix.normalize(path.posix.join(base, portable));
+  if (resolved === ".." || resolved.startsWith("../") || path.posix.isAbsolute(resolved)) return null;
+  return resolved === "" ? "." : resolved;
 }
 
 function astroTokenizerSource(source: string): string {
@@ -679,40 +699,51 @@ export function extractDependencies(
   };
 }
 
-function parseJsonc(source: string): Record<string, unknown> | null {
-  let stripped = "";
-  let inString = false;
-  let escaped = false;
-  for (let index = 0; index < source.length; index += 1) {
-    const character = source[index]!;
-    const next = source[index + 1];
-    if (inString) {
-      stripped += character;
-      if (escaped) escaped = false;
-      else if (character === "\\") escaped = true;
-      else if (character === '"') inString = false;
-    } else if (character === '"') {
-      inString = true;
-      stripped += character;
-    } else if (character === "/" && next === "/") {
-      stripped += "  ";
-      index += 1;
-      while (index + 1 < source.length && source[index + 1] !== "\n") {
-        stripped += " ";
-        index += 1;
-      }
-    } else if (character === "/" && next === "*") {
-      stripped += "  ";
-      index += 1;
-      while (index + 1 < source.length && !(source[index] === "*" && source[index + 1] === "/")) {
-        stripped += source[index] === "\n" ? "\n" : " ";
-        index += 1;
-      }
-      stripped += " ";
-    } else stripped += character;
+export function parseStaticJsonc(source: string): Record<string, unknown> | null {
+  const input = source.charCodeAt(0) === 0xfeff ? source.slice(1) : source;
+  const scanner = createScanner(false, LanguageVariant.Standard, input);
+  const tokens: Array<{ kind: SyntaxKind; start: number; end: number }> = [];
+  for (;;) {
+    const kind = scanner.scan() as SyntaxKind;
+    if (kind === SyntaxKind.EndOfFile) break;
+    if (scanner.isUnterminated()) return null;
+    tokens.push({ kind, start: scanner.getTokenStart(), end: scanner.getTokenEnd() });
   }
+  const trivia = new Set([
+    SyntaxKind.WhitespaceTrivia,
+    SyntaxKind.NewLineTrivia,
+    SyntaxKind.SingleLineCommentTrivia,
+    SyntaxKind.MultiLineCommentTrivia,
+  ]);
+  const comments = new Set([
+    SyntaxKind.SingleLineCommentTrivia,
+    SyntaxKind.MultiLineCommentTrivia,
+  ]);
+  const nextNonTrivia = new Array<SyntaxKind | undefined>(tokens.length);
+  let followingKind: SyntaxKind | undefined;
+  for (let index = tokens.length - 1; index >= 0; index -= 1) {
+    const token = tokens[index]!;
+    nextNonTrivia[index] = followingKind;
+    if (!trivia.has(token.kind)) followingKind = token.kind;
+  }
+  const mask = (value: string): string => value.replace(/[^\r\n]/g, " ");
+  let stripped = "";
+  let cursor = 0;
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = tokens[index]!;
+    stripped += input.slice(cursor, token.start);
+    let remove = comments.has(token.kind);
+    if (token.kind === SyntaxKind.CommaToken) {
+      const next = nextNonTrivia[index];
+      remove = next === SyntaxKind.CloseBraceToken || next === SyntaxKind.CloseBracketToken;
+    }
+    const text = input.slice(token.start, token.end);
+    stripped += remove ? mask(text) : text;
+    cursor = token.end;
+  }
+  stripped += input.slice(cursor);
   try {
-    const parsed: unknown = JSON.parse(stripped.replace(/,\s*([}\]])/gu, "$1"));
+    const parsed: unknown = JSON.parse(stripped);
     return parsed !== null && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as Record<string, unknown> : null;
   } catch {
     return null;
@@ -871,6 +902,8 @@ export class ModuleResolver {
   readonly #workspace: Workspace;
   readonly #fileSet: Set<string>;
   readonly #aliasRules = new Map<string, AliasRule[]>();
+  readonly #staticConfigFiles = new Set<string>();
+  readonly #projectPathMappings = new Map<string, Set<string>>();
   readonly #externalPackages = new Map<string, Promise<ExternalPackageManifest[]>>();
   readonly issues: ResolverIssue[] = [];
 
@@ -886,6 +919,15 @@ export class ModuleResolver {
     return resolver;
   }
 
+  typeScriptStaticConfig(): TypeScriptStaticConfig {
+    return {
+      configFiles: this.#staticConfigFiles.size,
+      paths: Object.fromEntries([...this.#projectPathMappings.entries()]
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([pattern, replacements]) => [pattern, [...replacements].sort()])),
+    };
+  }
+
   async #loadAliases(record: PackageRecord): Promise<void> {
     for (const configName of ["tsconfig.json", "jsconfig.json"]) {
       const configPath = path.join(record.absolutePath, configName);
@@ -897,6 +939,12 @@ export class ModuleResolver {
         if (options === null || typeof options !== "object" || Array.isArray(options)) continue;
         const typed = options as Record<string, unknown>;
         const baseUrl = typeof typed.baseUrl === "string" ? typed.baseUrl : ".";
+        const sourceDirectory = normalizeRelative(path.relative(this.#root, path.dirname(sourcePath)));
+        const baseRelative = resolvePortableRepositoryPath(sourceDirectory, baseUrl);
+        if (baseRelative === null) {
+          this.issues.push({ path: normalizeRelative(path.relative(this.#root, sourcePath)), reason: "compilerOptions.baseUrl escaped the repository and was not loaded in safe mode" });
+          continue;
+        }
         const paths = typed.paths;
         if (paths === null || typeof paths !== "object" || Array.isArray(paths)) continue;
         for (const [pattern, replacements] of Object.entries(paths)) {
@@ -904,11 +952,42 @@ export class ModuleResolver {
             this.issues.push({ path: normalizeRelative(path.relative(this.#root, sourcePath)), reason: `invalid path alias replacements for ${pattern}` });
             continue;
           }
-          if (replacements.length > 0) ruleMap.set(pattern, { pattern, replacements, basePath: path.resolve(path.dirname(sourcePath), baseUrl) });
+          const admitted = replacements
+            .map((replacement) => ({
+              replacement: portableRelativePath(replacement),
+              virtual: resolvePortableRepositoryPath(baseRelative, replacement),
+            }))
+            .filter((entry): entry is { replacement: string; virtual: string } => (
+              entry.replacement !== null && entry.virtual !== null
+            ));
+          if (admitted.length !== replacements.length) {
+            this.issues.push({
+              path: normalizeRelative(path.relative(this.#root, sourcePath)),
+              reason: `path alias replacement escapes the repository: ${pattern}`,
+            });
+          }
+          if (admitted.length > 0) {
+            const normalizedPattern = pattern.replaceAll("\\", "/");
+            ruleMap.set(normalizedPattern, {
+              pattern: normalizedPattern,
+              replacements: admitted.map((entry) => entry.replacement),
+              virtualReplacements: admitted.map((entry) => entry.virtual),
+              basePath: path.join(this.#root, ...baseRelative.split("/")),
+            });
+          }
         }
       }
       const rules = [...ruleMap.values()].sort((left, right) => left.pattern.localeCompare(right.pattern));
-      if (rules.length > 0) this.#aliasRules.set(record.id, rules.sort((left, right) => left.pattern.localeCompare(right.pattern)));
+      if (rules.length > 0) {
+        this.#aliasRules.set(record.id, rules);
+        for (const rule of rules) {
+          for (const normalized of rule.virtualReplacements) {
+            const mappings = this.#projectPathMappings.get(rule.pattern) ?? new Set<string>();
+            mappings.add(normalized);
+            this.#projectPathMappings.set(rule.pattern, mappings);
+          }
+        }
+      }
       break;
     }
   }
@@ -926,22 +1005,34 @@ export class ModuleResolver {
     }
     seen.add(absolute);
     const source = await readUtf8(this.#root, absolute);
-    const config = source === null ? null : parseJsonc(source);
+    const config = source === null ? null : parseStaticJsonc(source);
     if (config === null) {
       this.issues.push({ path: relative, reason: "config is not valid static JSONC" });
       return [];
     }
+    this.#staticConfigFiles.add(relative);
     const parents: Array<{ configPath: string; config: Record<string, unknown> }> = [];
     const extended = typeof config.extends === "string"
       ? [config.extends]
       : Array.isArray(config.extends) ? config.extends.filter((item): item is string => typeof item === "string") : [];
     for (const parent of extended) {
-      if (!parent.startsWith(".") && !path.isAbsolute(parent)) {
+      const portableParent = portableRelativePath(parent);
+      if (portableParent === null) {
+        this.issues.push({ path: relative, reason: `absolute config extends was not loaded in safe mode: ${parent}` });
+        continue;
+      }
+      if (!portableParent.startsWith(".")) {
         this.issues.push({ path: relative, reason: `package-based config extends was not loaded in safe mode: ${parent}` });
         continue;
       }
-      let parentPath = path.resolve(path.dirname(absolute), parent);
-      if (path.extname(parentPath) === "") parentPath += ".json";
+      const configDirectory = normalizeRelative(path.relative(this.#root, path.dirname(absolute)));
+      let parentRelative = resolvePortableRepositoryPath(configDirectory, portableParent);
+      if (parentRelative === null) {
+        this.issues.push({ path: relative, reason: `extended config escapes the repository: ${parent}` });
+        continue;
+      }
+      if (path.posix.extname(parentRelative) === "") parentRelative += ".json";
+      const parentPath = path.join(this.#root, ...parentRelative.split("/"));
       parents.push(...await this.#loadConfigChain(parentPath, new Set(seen)));
     }
     parents.push({ configPath: absolute, config });

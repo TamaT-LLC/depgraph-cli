@@ -1082,7 +1082,7 @@ const common = {protocol_version:"1.0",scan_id:scan,adapter:"web",adapter_versio
 const coverage = {profiles:1,files_discovered:0,files_analyzed:0,files_skipped:0,dependency_sites:0,resolved:0,candidates:0,external:0,unresolved:0,unsupported_syntax:0,project_code_executed:false,completeness:["syntax-complete"],reasons:[]};
 const events = [
   {event:"scan_started",...common,seq:1,root,project_code_executed:false,safe_mode:true},
-  {event:"profile_declared",...common,seq:2,profile:{id:"web:test",language:"web",features:[],environment:{},properties:{}}},
+  {event:"profile_declared",...common,seq:2,profile:{id:"web:test",language:"web",features:[],environment:{},properties:{typescript_analysis_mode:"semantic-scaffold",typescript_semantic_graph_emission:"disabled",typescript_release_gate:"release-gate-pending"}}},
   {event:"profile_completed",...common,seq:3,profile_id:"web:test",coverage},
   {event:"scan_completed",...common,seq:4,coverage}
 ];

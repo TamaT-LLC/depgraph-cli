@@ -130,10 +130,30 @@ jobs:
         with:
           node-version: 24.18.0
       - run: cargo test -p depgraph-rust-worker --lib --locked
+      - run: cargo test -p depgraph-core --lib --locked web_worker_timeout_reaps_its_descendant_cross_platform
       - run: cargo xtask build
+      - name: TypeScript compiler failure lifecycle
+        working-directory: workers/web
+        run: pnpm exec tsx --test --test-name-pattern="cross-platform compiler lifecycle" test/typescript-compiler.test.ts
       - run: target\debug\depgraph.exe --version
       - run: target\debug\depgraph-rust-worker.exe --version
       - run: workers\go\bin\depgraph-go-worker.exe --version
       - run: node workers\web\dist\worker.mjs --version
+      - name: Web TypeChecker scaffold smoke
+        shell: pwsh
+        run: |
+          $lines = node workers\web\dist\worker.mjs --root workers\web\test\fixtures\polyglot --scan-id windows-web-typechecker
+          if ($LASTEXITCODE -ne 0) { throw "Web worker scan failed with exit $LASTEXITCODE" }
+          $events = @($lines | ForEach-Object { $_ | ConvertFrom-Json })
+          $profile = ($events | Where-Object event -eq 'profile_declared' | Select-Object -First 1).profile
+          if ($profile.properties.typescript_project_model_status -ne 'ready') { throw 'TypeScript project model was not ready' }
+          if ($profile.properties.typescript_typechecker_status -ne 'invoked-no-graph') { throw 'TypeChecker smoke did not run' }
+          if ($profile.properties.typescript_release_gate -ne 'release-gate-pending') { throw 'Direct worker spoofed release attestation' }
+          if ($profile.properties.typescript_semantic_graph_emission -ne 'disabled') { throw 'Semantic graph scaffold gate changed unexpectedly' }
+          if (@($events | Where-Object { $_.edge.phase -eq 'semantic' }).Count -ne 0) { throw 'Scaffold emitted semantic edges' }
+          $completed = ($events | Where-Object event -eq 'scan_completed' | Select-Object -Last 1).coverage
+          if ($completed.completeness -contains 'semantic-complete') { throw 'Scaffold claimed semantic completeness' }
+          if (Test-Path workers\web\test\fixtures\polyglot\apps\next-app\NEXT_CONFIG_EXECUTED) { throw 'Next config executed' }
+          if (Test-Path workers\web\test\fixtures\polyglot\apps\astro-app\ASTRO_CONFIG_EXECUTED) { throw 'Astro config executed' }
       - run: cargo xtask go-semantic-e2e
       - run: cargo xtask rust-semantic-e2e

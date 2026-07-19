@@ -2378,18 +2378,70 @@ fn verify_typescript_compiler(release_root: &Path) -> Result<()> {
         );
     }
     let fixture = tempfile::tempdir()?;
-    let source = fixture.path().join("syntax-smoke.ts");
-    fs::write(&source, "const value: string = \"safe\";\n")?;
+    let model = fixture.path().join("model.ts");
+    let source = fixture.path().join("semantic-smoke.ts");
+    let invalid = fixture.path().join("semantic-failure.ts");
+    let type_roots = fixture.path().join("empty-type-roots");
+    fs::create_dir(&type_roots)?;
+    fs::write(
+        &model,
+        "export interface Item { value: string }\nexport const items: Array<Item> = [];\n",
+    )?;
+    fs::write(
+        &source,
+        "import { items } from './model';\nexport const value: Promise<string> = Promise.resolve(items[0]?.value ?? 'safe');\n",
+    )?;
+    fs::write(&invalid, "const mismatch: string = 1;\n")?;
     let smoke = Command::new(&compiler)
-        .args(["--noEmit", "--noCheck", "--noResolve", "--target", "esnext"])
+        .args([
+            "--noEmit",
+            "--pretty",
+            "false",
+            "--module",
+            "preserve",
+            "--moduleResolution",
+            "bundler",
+            "--target",
+            "esnext",
+            "--strict",
+            "--skipLibCheck",
+            "--typeRoots",
+        ])
+        .arg(&type_roots)
         .arg(&source)
+        .arg(&model)
         .current_dir(fixture.path())
         .output()?;
     if !smoke.status.success() {
         bail!(
-            "bundled TypeScript compiler syntax smoke failed: {}{}",
+            "bundled TypeScript compiler semantic smoke failed: {}{}",
             String::from_utf8_lossy(&smoke.stdout),
             String::from_utf8_lossy(&smoke.stderr)
+        );
+    }
+    let semantic_failure = Command::new(&compiler)
+        .args([
+            "--noEmit",
+            "--pretty",
+            "false",
+            "--target",
+            "esnext",
+            "--strict",
+            "--skipLibCheck",
+            "--typeRoots",
+        ])
+        .arg(&type_roots)
+        .arg(&invalid)
+        .current_dir(fixture.path())
+        .output()?;
+    let failure_output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&semantic_failure.stdout),
+        String::from_utf8_lossy(&semantic_failure.stderr)
+    );
+    if semantic_failure.status.success() || !failure_output.contains("TS2322") {
+        bail!(
+            "bundled TypeScript compiler did not enforce its TypeChecker smoke: {failure_output}"
         );
     }
     Ok(())

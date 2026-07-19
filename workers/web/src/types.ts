@@ -170,6 +170,19 @@ export interface ScanModel {
   packageManager: string;
   lockfile: string | null;
   detectedFrameworks: string[];
+  typeScriptProject: TypeScriptProjectSummary;
+}
+
+export interface TypeScriptProjectSummary {
+  status: "ready";
+  rootFiles: number;
+  programFiles: number;
+  staticConfigFiles: number;
+  pathMappings: number;
+  standardLibraryFiles: number;
+  typeCheckerQueries: number;
+  semanticDiagnostics: number;
+  emittedSemanticDiagnostics: number;
 }
 
 export interface CommonEvent {

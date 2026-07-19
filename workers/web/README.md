@@ -14,7 +14,7 @@ The MVP is deliberately `bundled-only`. Project-local TypeScript is useful compa
 
 | Available input | Selection | Metadata and diagnostic | Fallback |
 | --- | --- | --- | --- |
-| Valid release-adjacent TypeScript 7.0.2 native compiler | Use the bundled compiler for syntax-only analysis | `source=bundled`, `version=7.0.2`, `selection=bundled-only` | Not needed |
+| Valid release-adjacent TypeScript 7.0.2 native compiler | Use the bundled compiler for syntax analysis plus the isolated Program / TypeChecker scaffold | `source=bundled`, `version=7.0.2`, `selection=bundled-only` | Not needed |
 | Build-produced pinned TypeScript 7.0.2 artifact in development | The build verifies package identity/version and copies the compiler to `dist/typescript`; source-mode tests use only that fixed path | Same bundled metadata | Not needed |
 | Project-local TypeScript declaration, lock entry, or in-root `node_modules/typescript/package.json` | Read and report the version as metadata only; continue with bundled 7.0.2 | `web.project_typescript_not_loaded` identifies the detected version and metadata source | Bundled compiler remains selected |
 | No project-local TypeScript | Continue with bundled 7.0.2 | No project-local diagnostic | Bundled compiler remains selected |
@@ -29,10 +29,16 @@ The `profile_declared` event records the decision using these stable properties:
 | `typescript_compiler_version` | `7.0.2` | Exact selected compiler version |
 | `typescript_compiler_selection` | `bundled-only` | Project-local and ambient compilers are not candidates |
 | `typescript_compiler_fallback` | `fail-closed` | Compiler failure cannot change the selected trust boundary |
-| `typescript_analysis_mode` | `syntax-only` | No TypeChecker or project module resolution is invoked |
+| `typescript_analysis_mode` | `semantic-scaffold` | Program / TypeChecker is invoked, but semantic graph emission remains disabled |
 | `typescript_project_local_policy` | `metadata-only` | Local version evidence may be read but local code may not be loaded |
 | `typescript_project_local_loaded` | `false` | The local TypeScript module was not imported or executed |
-| `typescript_typechecker_status` | `not-invoked` | Type checking is outside the MVP analysis mode |
+| `typescript_typechecker_status` | `invoked-no-graph` | The intrinsic smoke query and semantic diagnostics ran without graph promotion |
+| `typescript_project_model_status` | `ready` | The isolated project admitted only inventory roots and bundled standard-library files |
+| `typescript_project_config` | `worker-neutral-allowlist` | Static JSON/JSONC `baseUrl`/`paths` are normalized into worker-owned data; config code, plugins, transforms, and package-based extends are not loaded |
+| `typescript_static_config_files` / `typescript_path_mappings` | decimal counts | Auditable counts of admitted static config files and normalized alias patterns |
+| `typescript_module_resolution` | `inventory-only` | Relative and admitted static-alias resolution can see virtual inventory files but not the host or project package tree |
+| `typescript_semantic_graph_emission` | `disabled` | This scaffold cannot emit semantic edges or claim `semantic-complete` |
+| `typescript_release_gate` | `release-gate-pending` or `release-gate-verified` | Only a core-attested extracted archive receives the verified value |
 | `project_code_executed` | `false` | No project code, hook, plugin, script, or executable config ran |
 
 The legacy `bundled_typescript`, `typescript_syntax_compiler`, `typescript_compiler_processes`, and `typescript_project_filesystem` properties remain available for protocol compatibility.
@@ -47,7 +53,7 @@ Safe mode may read inventory-approved source files plus a narrow allowlist of me
 - JSON/JSONC TypeScript configuration and recognized framework configuration source needed for static literal extraction.
 - Existing generated evidence such as TanStack `routeTree.gen.*`.
 
-Out-of-root symlinks and unreadable files are rejected. Source inventory failures are explicit skipped coverage; unavailable optional metadata is treated as absent or produces a role-specific diagnostic and must never cause module loading. The native TypeScript compiler receives only inventory-approved source bytes through an isolated virtual filesystem and a neutral generated project (`noResolve`, `noLib`, `noCheck`, empty `plugins` and `types`). The repository root, its tsconfig files, and its `node_modules` tree are not visible to the compiler process.
+Out-of-root symlinks and unreadable files are rejected. Source inventory failures are explicit skipped coverage; unavailable optional metadata is treated as absent or produces a role-specific diagnostic and must never cause module loading. The native TypeScript compiler receives only inventory-approved source bytes, bundled standard-library declarations, and a worker-owned project through an isolated virtual filesystem. The project fixes `moduleResolution=bundler`, `module=preserve`, `target=esnext`, `noEmit`, empty `plugins`/`types`/`typeRoots`, and normalized repository-relative `baseUrl`/`paths` data admitted from static JSON/JSONC. Raw tsconfig files, the repository root, and its `node_modules` tree are not visible to the compiler process.
 
 Safe mode must never:
 
@@ -63,21 +69,21 @@ Framework configuration files may be read as text. Only supported literal fields
 
 | Condition | Safe-mode behavior | Reporting |
 | --- | --- | --- |
-| Project-local TypeScript is outside the verified bundled version, is a range, or cannot be selected safely | Continue syntax-only analysis with bundled 7.0.2; do not load the local package | `web.project_typescript_not_loaded` with the observed version/range and manifest or lockfile source |
+| Project-local TypeScript is outside the verified bundled version, is a range, or cannot be selected safely | Continue with the bundled isolated scaffold; do not load the local package | `web.project_typescript_not_loaded` with the observed version/range and manifest or lockfile source |
 | Bundled compiler is missing or fails artifact/identity checks | Abort before emitting a partial graph; do not use another compiler | Fatal stderr error and non-zero worker exit; release preflight can fail earlier |
-| Compiler crashes, its protocol fails, or its 30-second internal deadline expires | Close or kill the compiler, abort the scan, and emit no partial result | Fatal stderr error and non-zero worker exit; the core worker deadline remains an outer bound |
+| Compiler crashes, its protocol fails, or its 30-second internal deadline expires | Close or kill and reap the compiler, abort the scan, and emit no graph result | Bounded failed profile plus `web.typescript_project_model_failed`, stable `compiler_protocol_failure`/`compiler_timeout`, empty completeness, and non-zero worker exit; the core worker deadline remains an outer bound |
 | Configuration contains a supported static literal | Apply that literal without evaluating the module | `web.static_config_literal_applied` |
 | Configuration contains a dynamic value or executable hook | Ignore the value/hook; do not guess a resolved value | `web.static_config_unresolved` or `web.static_config_runtime_ignored`, plus `web.executable_config_not_executed`; unresolved input reduces completeness where applicable |
 | A required workspace manifest, supported lockfile, recognized config, or inventoried source cannot be read or parsed safely | Skip the affected interpretation instead of assuming success | A bounded file-specific diagnostic and incomplete coverage accounting |
 | Optional installed-package metadata is absent, malformed, unreadable, or outside the root | Treat the metadata as unavailable; never load package code to recover it | Resolution remains candidate/unresolved where applicable; no compiler selection change |
 
-The absence of a project-local compiler is normal, not an error. A detected local compiler never changes the selected source or version. Fatal compiler failures do not produce protocol diagnostics because the worker intentionally does not publish a partial event stream; callers must preserve stderr and the exit status.
+The absence of a project-local compiler is normal, not an error. A detected local compiler never changes the selected source or version. Fatal compiler or project-model failures publish a bounded failed profile and `web.typescript_project_model_failed` diagnostic, keep completeness empty, and exit non-zero. They never publish syntax-only success or a semantic graph.
 
-## Future TypeChecker acceptance matrix
+## TypeChecker graph-activation acceptance matrix
 
-TypeChecker support must remain disabled until its implementation passes the following matrix on every supported release platform. Adding it must not silently change the `bundled-only` compiler decision; any future project-local execution mode requires a separate threat-model decision and an explicit, non-safe profile.
+The isolated Program / TypeChecker scaffold now runs on every Web scan. Semantic node and edge emission must remain disabled until the following graph-activation matrix passes on every supported release platform. Adding graph output must not silently change the `bundled-only` compiler decision; any future project-local execution mode requires a separate threat-model decision and an explicit, non-safe profile.
 
-| Fixture | Required assertion before TypeChecker can be enabled |
+| Fixture | Required assertion before semantic graph activation |
 | --- | --- |
 | No local TypeScript and ordinary supported sources | The pinned bundled compiler is selected; types and module targets are deterministic; `project_code_executed=false` |
 | Local TypeScript exactly matches 7.0.2 | Version is reported as metadata only; the local module is not loaded; bundled compiler identity remains in the profile |
@@ -95,7 +101,7 @@ TypeChecker release acceptance additionally requires exact evidence spans, separ
 
 Static coverage includes npm/pnpm/Yarn/Bun workspace and lockfile discovery (including `.pnp.data.json` without loading `.pnp.cjs`), TypeScript/JavaScript ESM and CommonJS dependency sites, `tsconfig.json`/`jsconfig.json` path aliases, conditional workspace package exports, and filesystem routes for Next.js, Astro, TanStack Router, and TanStack Start. Existing TanStack `routeTree.gen.*` files are treated as generated evidence. Production package edges retain dependency/peer/optional kinds and exclude dev-only manifest declarations.
 
-The bundled TypeScript 7.0.2 lexical API is used for deterministic dependency inventory and context-aware import/require recognition. In addition, one pinned native TypeScript 7.0.2 compiler process parses every `.ts`, `.tsx`, `.mts`, `.cts`, `.js`, `.jsx`, `.mjs`, and `.cjs` file per scan. Only syntactic diagnostics are requested. Malformed source is therefore reported as unsupported syntax instead of being silently treated as complete.
+The bundled TypeScript 7.0.2 lexical API is used for deterministic dependency inventory and context-aware import/require recognition. In addition, one pinned native TypeScript 7.0.2 compiler process parses every `.ts`, `.tsx`, `.mts`, `.cts`, `.js`, `.jsx`, `.mjs`, and `.cjs` file per scan. Syntactic diagnostics drive unsupported-syntax coverage; bounded Program, global, and semantic diagnostics exercise the isolated TypeChecker without promoting semantic graph output.
 
 Release archives keep the native compiler and its standard library tree under `libexec/typescript/lib`. The release manifest pins the component version, entry point, and canonical whole-tree SHA-256, so the `depgraph` core launcher rejects missing, added, symlinked, or modified files before the Web worker starts. Direct worker execution trusts its adjacent installation and is intended for protocol development; the verified safe-scan integrity contract requires launching through `depgraph`.
 
@@ -103,4 +109,4 @@ Astro frontmatter is parsed by the bundled Astro compiler 4.0.0; the release dir
 
 `DEPGRAPH_PROFILE_CONFIG` accepts the core-provided JSON object `{ "web_environments": [...] }`. Values are normalized, deduplicated, and sorted into the stable profile identity and canonical edge/site conditions; the default is production browser + server.
 
-Type checking, plugin-defined virtual modules, and code-based route construction remain unresolved or diagnostic-only in safe mode.
+TypeChecker semantic diagnostics run in the isolated scaffold. Symbol/type/call graph promotion, plugin-defined virtual modules, and code-based route construction remain unresolved or diagnostic-only in safe mode.

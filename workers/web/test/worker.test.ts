@@ -54,6 +54,13 @@ test("worker emits deterministic protocol graph without executing project code",
       "typescript_project_local_policy",
       "typescript_project_local_loaded",
       "typescript_typechecker_status",
+      "typescript_project_model_status",
+      "typescript_project_config",
+      "typescript_module_resolution",
+      "typescript_standard_library_source",
+      "typescript_standard_library_integrity",
+      "typescript_release_gate",
+      "typescript_semantic_graph_emission",
       "project_code_executed",
     ].map((key) => [key, profile?.properties[key]])),
     {
@@ -61,18 +68,31 @@ test("worker emits deterministic protocol graph without executing project code",
       typescript_compiler_version: "7.0.2",
       typescript_compiler_selection: "bundled-only",
       typescript_compiler_fallback: "fail-closed",
-      typescript_analysis_mode: "syntax-only",
+      typescript_analysis_mode: "semantic-scaffold",
       typescript_project_local_policy: "metadata-only",
       typescript_project_local_loaded: "false",
-      typescript_typechecker_status: "not-invoked",
+      typescript_typechecker_status: "invoked-no-graph",
+      typescript_project_model_status: "ready",
+      typescript_project_config: "worker-neutral-allowlist",
+      typescript_module_resolution: "inventory-only",
+      typescript_standard_library_source: "bundled",
+      typescript_standard_library_integrity: "build-produced-pending-core-attestation",
+      typescript_release_gate: "release-gate-pending",
+      typescript_semantic_graph_emission: "disabled",
       project_code_executed: "false",
     },
   );
+  assert.equal(profile?.properties.typescript_static_config_files, "2");
+  assert.equal(profile?.properties.typescript_path_mappings, "3");
 
   const nodes = first.events.filter((event) => event.event === "node_upsert").map((event) => event.node);
   const sites = first.events.filter((event) => event.event === "dependency_site").map((event) => event.site);
   const edges = first.events.filter((event) => event.event === "edge_upsert").map((event) => event.edge);
   const diagnostics = first.events.filter((event) => event.event === "diagnostic").map((event) => event.diagnostic);
+  assert.ok(!diagnostics.some((diagnostic) => (
+    diagnostic.code === "web.typescript_semantic_scaffold_diagnostic"
+    && /TS2307.*@shared\/index/u.test(diagnostic.message)
+  )));
   const completedFiles = first.events.filter((event) => event.event === "file_completed");
   const completed = first.events.at(-1)?.coverage;
   assert.ok(nodes.some((node) => node.kind === "workspace"));
@@ -130,6 +150,11 @@ test("worker emits deterministic protocol graph without executing project code",
   assert.ok(diagnostics.some((diagnostic) => diagnostic.code === "web.static_config_runtime_ignored"));
   assert.ok(diagnostics.some((diagnostic) => diagnostic.code === "web.tanstack_route_tree_drift"));
   assert.equal(completed.project_code_executed, false);
+  assert.ok(Number(profile?.properties.typescript_project_root_files) > 0);
+  assert.ok(Number(profile?.properties.typescript_standard_library_files) > 0);
+  assert.equal(profile?.properties.typescript_typechecker_queries, "1");
+  assert.ok(!completed.completeness.includes("semantic-complete"));
+  assert.ok(!edges.some((edge) => edge.phase === "semantic"));
   assert.equal(completed.dependency_sites, sites.length);
   assert.equal(completed.dependency_sites, completed.resolved + completed.candidates + completed.external + completed.unresolved);
   assert.ok(completedFiles.length > 0);
@@ -756,7 +781,7 @@ test("balanced malformed TypeScript cannot report syntax-complete coverage", asy
   assert.deepEqual(result.events.at(-1)?.coverage.completeness, []);
 });
 
-test("native TypeScript 7 parser covers every TS and JS extension without loading project config", async (context) => {
+test("native TypeScript 7 parser covers every TS and JS extension without loading project config code", async (context) => {
   const root = await mkdtemp(path.join(os.tmpdir(), "depgraph-web-worker-native-syntax-"));
   context.after(async () => rm(root, { recursive: true, force: true }));
   const marker = path.join(root, "PROJECT_PLUGIN_EXECUTED");
@@ -773,6 +798,7 @@ test("native TypeScript 7 parser covers every TS and JS extension without loadin
   await Promise.all([
     writeFile(path.join(root, "package.json"), JSON.stringify({ name: "native-syntax", version: "1.0.0" })),
     writeFile(path.join(root, "tsconfig.json"), JSON.stringify({
+      extends: "dangerous-config-package",
       compilerOptions: { plugins: [{ name: "./dangerous-plugin.cjs" }] },
     })),
     writeFile(
@@ -795,7 +821,110 @@ test("native TypeScript 7 parser covers every TS and JS extension without loadin
   assert.ok(!diagnostics.some((diagnostic) => diagnostic.path === "semantic-only.ts"));
   assert.ok(result.events.at(-1)?.coverage.unsupported_syntax >= invalid.size);
   assert.deepEqual(result.events.at(-1)?.coverage.completeness, []);
+  assert.ok(result.events.some((event) => (
+    event.diagnostic?.code === "web.static_config_unresolved"
+    && /package-based config extends was not loaded/u.test(event.diagnostic.message)
+  )));
   await assert.rejects(import("node:fs/promises").then(({ stat }) => stat(marker)));
+});
+
+test("TypeChecker scaffold resolves inventory modules and bundled stdlib without reading project packages", async (context) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "depgraph-web-worker-typechecker-scaffold-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  const packageRoot = path.join(root, "node_modules", "ambient-secret");
+  const marker = path.join(root, "PROJECT_PACKAGE_EXECUTED");
+  await mkdir(packageRoot, { recursive: true });
+  await Promise.all([
+    writeFile(path.join(root, "package.json"), JSON.stringify({
+      name: "typechecker-scaffold",
+      version: "1.0.0",
+      dependencies: { "ambient-secret": "1.0.0" },
+    })),
+    writeFile(path.join(root, "tsconfig.json"), `{
+      // Only baseUrl and paths are admitted into the worker-owned config.
+      "compilerOptions": {
+        "baseUrl": ".",
+        "paths": { "@models/*": ["*"] },
+        "plugins": [{ "name": "ambient-secret" }]
+      }
+    }`),
+    writeFile(path.join(root, "model.ts"), [
+      "export interface User { name: string }",
+      "export const users: Array<User> = [];",
+      "",
+    ].join("\n")),
+    writeFile(path.join(root, "main.ts"), [
+      'import { users } from "@models/model";',
+      'import { secret } from "ambient-secret";',
+      'export const first: Promise<string> = Promise.resolve(users[0]?.name ?? secret);',
+      "const firstMismatch: string = 1;",
+      "const secondMismatch: string = 1;",
+      "",
+    ].join("\n")),
+    writeFile(path.join(packageRoot, "package.json"), JSON.stringify({
+      name: "ambient-secret",
+      version: "1.0.0",
+      types: "index.d.ts",
+      main: "index.cjs",
+    })),
+    writeFile(path.join(packageRoot, "index.d.ts"), "export declare const secret: string;\n"),
+    writeFile(
+      path.join(packageRoot, "index.cjs"),
+      `require("node:fs").writeFileSync(${JSON.stringify(marker)}, "executed");\n`,
+    ),
+  ]);
+
+  const result = await run("typechecker-scaffold", root);
+  const profile = result.events.find((event) => event.event === "profile_declared")?.profile;
+  const semanticDiagnostics = result.events
+    .filter((event) => event.diagnostic?.code === "web.typescript_semantic_scaffold_diagnostic")
+    .map((event) => event.diagnostic);
+  assert.equal(profile?.properties.typescript_project_model_status, "ready");
+  assert.equal(profile?.properties.typescript_typechecker_status, "invoked-no-graph");
+  assert.equal(profile?.properties.typescript_project_root_files, "2");
+  assert.equal(profile?.properties.typescript_typechecker_queries, "1");
+  assert.equal(profile?.properties.typescript_static_config_files, "1");
+  assert.equal(profile?.properties.typescript_path_mappings, "1");
+  assert.ok(Number(profile?.properties.typescript_standard_library_files) > 0);
+  assert.equal(
+    semanticDiagnostics.filter((diagnostic) => diagnostic.path === "main.ts" && /TS2322/u.test(diagnostic.message)).length,
+    2,
+  );
+  assert.equal(Number(profile?.properties.typescript_emitted_semantic_diagnostics), semanticDiagnostics.length);
+  assert.ok(semanticDiagnostics.some((diagnostic) => diagnostic.path === "main.ts" && /TS2307.*ambient-secret/u.test(diagnostic.message)));
+  assert.ok(!semanticDiagnostics.some((diagnostic) => /TS2307.*@models\/model/u.test(diagnostic.message)));
+  assert.ok(!semanticDiagnostics.some((diagnostic) => /Cannot find global type|Promise only refers to a type/u.test(diagnostic.message)));
+  assert.ok(semanticDiagnostics.every((diagnostic) => (
+    diagnostic.path === null || diagnostic.evidence?.[0]?.extractor === "typescript-native-typechecker"
+  )));
+  assert.ok(!result.events.some((event) => event.node?.kind === "symbol" || event.node?.kind === "type"));
+  assert.ok(!result.events.some((event) => event.edge?.phase === "semantic"));
+  assert.ok(!result.events.at(-1)?.coverage.completeness.includes("semantic-complete"));
+  await assert.rejects(import("node:fs/promises").then(({ stat }) => stat(marker)));
+});
+
+test("TypeScript path mappings normalize Windows separators before repository confinement", async (context) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "depgraph-web-worker-portable-paths-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  await Promise.all([
+    writeFile(path.join(root, "package.json"), JSON.stringify({ name: "portable-paths", version: "1.0.0" })),
+    writeFile(path.join(root, "tsconfig.json"), JSON.stringify({
+      compilerOptions: {
+        baseUrl: ".",
+        paths: { "@outside/*": ["..\\outside\\*"] },
+      },
+    })),
+    writeFile(path.join(root, "index.ts"), 'import value from "@outside/value";\nexport default value;\n'),
+  ]);
+
+  const result = await run("portable-paths", root);
+  const profile = result.events.find((event) => event.event === "profile_declared")?.profile;
+  assert.equal(profile?.properties.typescript_path_mappings, "0");
+  assert.ok(result.events.some((event) => (
+    event.diagnostic?.code === "web.static_config_unresolved"
+    && event.diagnostic?.path === "tsconfig.json"
+    && /path alias replacement escapes the repository/u.test(event.diagnostic.message)
+  )));
 });
 
 test("external package exports reject private and missing subpaths", async (context) => {
@@ -1188,8 +1317,22 @@ test("relocated packaged worker fails closed when its adjacent TypeScript compil
       const stderr = typeof error === "object" && error !== null && "stderr" in error
         ? String(error.stderr)
         : String(error);
+      const stdout = typeof error === "object" && error !== null && "stdout" in error
+        ? String(error.stdout)
+        : "";
+      const events = stdout.trim().split("\n").filter(Boolean).map((line) => JSON.parse(line) as Record<string, any>);
+      const profile = events.find((event) => event.event === "profile_declared")?.profile;
       assert.match(stderr, /bundled TypeScript 7\.0\.2 compiler is missing next to packaged worker/u);
       assert.doesNotMatch(stderr, /node_modules[\\/]@typescript/u);
+      assert.equal(profile?.properties.typescript_project_model_status, "failed");
+      assert.equal(profile?.properties.typescript_typechecker_status, "failed");
+      assert.equal(profile?.properties.typescript_project_model_failure_reason, "compiler_unavailable");
+      assert.ok(events.some((event) => (
+        event.diagnostic?.code === "web.typescript_project_model_failed"
+        && event.diagnostic?.message === "Bundled TypeScript project model failed: compiler_unavailable"
+      )));
+      assert.deepEqual(events.at(-1)?.coverage.completeness, []);
+      assert.ok(events.at(-1)?.coverage.reasons.includes("typescript_project_model_failure"));
       return true;
     },
   );

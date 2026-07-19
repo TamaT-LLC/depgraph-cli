@@ -1,10 +1,12 @@
 import { realpath, stat } from "node:fs/promises";
 import path from "node:path";
 import { inventoryFiles } from "./fs";
+import { stableId } from "./ids";
 import { scan } from "./scanner";
 import {
   TYPESCRIPT_COMPILER_PROFILE_PROPERTIES,
   TYPESCRIPT_COMPILER_VERSION,
+  TypeScriptProjectError,
 } from "./typescript-compiler";
 import {
   ADAPTER,
@@ -27,6 +29,40 @@ interface VersionOptions {
 }
 
 class UsageError extends Error {}
+
+function typeScriptProfileProperties(
+  project: ScanModel["typeScriptProject"] | null,
+  failure: TypeScriptProjectError | null = null,
+): Record<string, string> {
+  if (project === null) {
+    return {
+      ...TYPESCRIPT_COMPILER_PROFILE_PROPERTIES,
+      typescript_project_model_status: "failed",
+      typescript_typechecker_status: "failed",
+      typescript_project_model_failure_reason: failure?.reason ?? "compiler_protocol_failure",
+      typescript_project_root_files: "0",
+      typescript_program_files: "0",
+      typescript_static_config_files: "0",
+      typescript_path_mappings: "0",
+      typescript_standard_library_files: "0",
+      typescript_typechecker_queries: "0",
+      typescript_semantic_diagnostics: "0",
+      typescript_emitted_semantic_diagnostics: "0",
+    };
+  }
+  return {
+    ...TYPESCRIPT_COMPILER_PROFILE_PROPERTIES,
+    typescript_project_model_failure_reason: "none",
+    typescript_project_root_files: String(project.rootFiles),
+    typescript_program_files: String(project.programFiles),
+    typescript_static_config_files: String(project.staticConfigFiles),
+    typescript_path_mappings: String(project.pathMappings),
+    typescript_standard_library_files: String(project.standardLibraryFiles),
+    typescript_typechecker_queries: String(project.typeCheckerQueries),
+    typescript_semantic_diagnostics: String(project.semanticDiagnostics),
+    typescript_emitted_semantic_diagnostics: String(project.emittedSemanticDiagnostics),
+  };
+}
 
 function parseArgs(args: string[]): Options | VersionOptions {
   if (args.length === 1 && (args[0] === "--version" || args[0] === "-V")) return { version: true };
@@ -85,7 +121,7 @@ function eventsFor(model: ScanModel, root: string, scanId: string): ProtocolEven
         module_resolution: "static-safe",
         package_manager: model.packageManager,
         lockfile: model.lockfile ?? "",
-        ...TYPESCRIPT_COMPILER_PROFILE_PROPERTIES,
+        ...typeScriptProfileProperties(model.typeScriptProject),
         project_code_executed: "false",
       },
     },
@@ -108,6 +144,77 @@ function eventsFor(model: ScanModel, root: string, scanId: string): ProtocolEven
   events.push({ ...common("profile_completed"), profile_id: PROFILE_ID, coverage: model.coverage });
   events.push({ ...common("scan_completed"), coverage: model.coverage });
   return events;
+}
+
+function failureEventsFor(root: string, scanId: string, failure: TypeScriptProjectError): ProtocolEvent[] {
+  let seq = 0;
+  const common = (event: string): CommonEvent => ({
+    event,
+    protocol_version: PROTOCOL_VERSION,
+    scan_id: scanId,
+    adapter: ADAPTER,
+    adapter_version: ADAPTER_VERSION,
+    seq: ++seq,
+  });
+  const coverage = {
+    profiles: 1,
+    files_discovered: 0,
+    files_analyzed: 0,
+    files_skipped: 0,
+    dependency_sites: 0,
+    resolved: 0,
+    candidates: 0,
+    external: 0,
+    unresolved: 0,
+    unsupported_syntax: 0,
+    project_code_executed: false,
+    completeness: [],
+    reasons: ["typescript_project_model_failure", failure.reason],
+  };
+  return [
+    {
+      ...common("scan_started"),
+      root,
+      project_code_executed: false,
+      safe_mode: true,
+    },
+    {
+      ...common("profile_declared"),
+      profile: {
+        id: PROFILE_ID,
+        language: "web",
+        toolchain: `typescript ${TYPESCRIPT_COMPILER_VERSION}`,
+        command: "scan",
+        target: `web:${WEB_ENVIRONMENTS.join(",")}`,
+        features: [],
+        environment: { mode: "production", environments: WEB_ENVIRONMENTS },
+        properties: {
+          module_resolution: "static-safe",
+          package_manager: "unknown",
+          lockfile: "",
+          ...typeScriptProfileProperties(null, failure),
+          project_code_executed: "false",
+        },
+      },
+    },
+    {
+      ...common("diagnostic"),
+      diagnostic: {
+        id: stableId("diagnostic", {
+          profile: PROFILE_ID,
+          code: "web.typescript_project_model_failed",
+          reason: failure.reason,
+        }),
+        severity: "error",
+        code: "web.typescript_project_model_failed",
+        message: `Bundled TypeScript project model failed: ${failure.reason}`,
+        path: null,
+        profile_id: PROFILE_ID,
+      },
+    },
+    { ...common("profile_completed"), profile_id: PROFILE_ID, coverage },
+    { ...common("scan_completed"), coverage },
+  ];
 }
 
 async function writeEvents(events: ProtocolEvent[]): Promise<void> {
@@ -158,15 +265,21 @@ async function main(): Promise<void> {
     process.stdout.write(`depgraph-web-worker ${ADAPTER_VERSION} (protocol ${PROTOCOL_VERSION}; typescript ${TYPESCRIPT_COMPILER_VERSION})\n`);
     return;
   }
+  let root: string | null = null;
   try {
-    const root = await realpath(options.root);
+    root = await realpath(options.root);
     if (!(await stat(root)).isDirectory()) throw new Error(`root is not a directory: ${root}`);
     const inventory = await inventoryFiles(root);
     const model = await scan(root, inventory.files, inventory.issues);
     await writeEvents(eventsFor(model, root, options.scanId));
     process.stderr.write(`depgraph-web-worker: ${model.coverage.files_analyzed} files, ${model.coverage.dependency_sites} sites, project code executed=false\n`);
   } catch (error) {
-    process.stderr.write(`depgraph-web-worker: ${error instanceof Error ? error.stack ?? error.message : String(error)}\n`);
+    if (error instanceof TypeScriptProjectError && root !== null) {
+      await writeEvents(failureEventsFor(root, options.scanId, error)).catch(() => undefined);
+      process.stderr.write(`depgraph-web-worker: ${error.message}\n`);
+    } else {
+      process.stderr.write(`depgraph-web-worker: ${error instanceof Error ? error.stack ?? error.message : String(error)}\n`);
+    }
     process.exitCode = 3;
   }
 }

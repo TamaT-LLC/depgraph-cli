@@ -4,7 +4,7 @@ import { normalizeRelative, readJson, readUtf8, WEB_SOURCE_EXTENSIONS, type File
 import { compareById, stableId } from "./ids";
 import { extractDependencies, ModuleResolver, type RawDependency, type Resolution, type ResolvedTarget } from "./imports";
 import { discoverRoutes, type RouteEntry } from "./routes";
-import { collectTypeScriptSyntacticDiagnostics, TYPESCRIPT_SOURCE_EXTENSIONS } from "./typescript-compiler";
+import { analyzeTypeScriptProject, TYPESCRIPT_SOURCE_EXTENSIONS } from "./typescript-compiler";
 import {
   ADAPTER_VERSION,
   PROFILE_CONFIG_ISSUE,
@@ -86,6 +86,16 @@ class GraphBuilder {
       message: diagnostic.message,
       path: diagnostic.path,
       profile: diagnostic.profile_id,
+      evidence: (diagnostic.evidence ?? []).map((evidence) => ({
+        kind: evidence.kind,
+        extractor: evidence.extractor,
+        extractor_version: evidence.extractor_version,
+        path: evidence.path,
+        start_line: evidence.start_line,
+        start_column: evidence.start_column,
+        end_line: evidence.end_line,
+        end_column: evidence.end_column,
+      })),
     });
     this.diagnostics.set(id, { id, ...diagnostic });
   }
@@ -350,6 +360,15 @@ function syntaxEvidence(source: string, pathValue: string, startOffset: number, 
   };
 }
 
+function semanticEvidence(source: string, pathValue: string, startOffset: number, endOffset: number): Evidence {
+  const syntax = syntaxEvidence(source, pathValue, startOffset, endOffset);
+  return {
+    ...syntax,
+    kind: "semantic",
+    extractor: "typescript-native-typechecker",
+  };
+}
+
 function lineEvidence(source: string | null, pathValue: string, token: string, extractor: string, detail?: string, section?: string): Evidence {
   if (source === null) return sourceEvidence(pathValue, extractor, detail);
   const sectionIndex = section === undefined ? 0 : Math.max(0, source.indexOf(`"${section}"`));
@@ -600,9 +619,13 @@ export async function scan(root: string, allFiles: string[], inventoryIssues: Fi
   const sourceFiles = allFiles
     .filter((file) => PARSED_EXTENSIONS.has(path.extname(file).toLowerCase()) || routeFiles.has(path.resolve(file)))
     .sort();
+  // Parse repository-owned JSON/JSONC without executing it, retain only
+  // repository-relative baseUrl/paths mappings, and feed the normalized
+  // allowlist into the worker-owned compiler config.
+  const resolver = await ModuleResolver.create(workspace, allFiles);
   // Read every TS/JS input once, then expose only those bytes through the
   // compiler's virtual filesystem. The native compiler never receives the
-  // repository path, project tsconfig, node_modules, or package configuration.
+  // repository path, raw project config, node_modules, or package metadata.
   const sourceCache = new Map<string, string | null>();
   const compilerSources = new Map<string, string>();
   const compilerFiles = sourceFiles.filter((file) => TYPESCRIPT_SOURCE_EXTENSIONS.has(path.extname(file).toLowerCase()));
@@ -619,8 +642,7 @@ export async function scan(root: string, allFiles: string[], inventoryIssues: Fi
       if (source !== null) compilerSources.set(normalizeRelative(path.relative(root, file)), source);
     }
   }
-  const nativeSyntaxDiagnostics = await collectTypeScriptSyntacticDiagnostics(compilerSources);
-  const resolver = await ModuleResolver.create(workspace, allFiles);
+  const nativeTypeScript = await analyzeTypeScriptProject(compilerSources, resolver.typeScriptStaticConfig());
   for (const issue of resolver.issues) {
     recordSkippedInterpretation(graph, root, issue.path);
     graph.addDiagnostic({
@@ -691,7 +713,7 @@ export async function scan(root: string, allFiles: string[], inventoryIssues: Fi
       file,
       relative,
       source,
-      nativeSyntaxDiagnostics.typeOnlyDependencyRanges.get(relative),
+      nativeTypeScript.typeOnlyDependencyRanges.get(relative),
     );
     if (extraction.fallbackReason) {
       graph.addDiagnostic({
@@ -714,7 +736,7 @@ export async function scan(root: string, allFiles: string[], inventoryIssues: Fi
         evidence: [error.evidence],
       });
     }
-    for (const diagnostic of nativeSyntaxDiagnostics.get(relative) ?? []) {
+    for (const diagnostic of nativeTypeScript.get(relative) ?? []) {
       coverage.unsupported_syntax += 1;
       graph.addDiagnostic({
         severity: "warning",
@@ -832,6 +854,33 @@ export async function scan(root: string, allFiles: string[], inventoryIssues: Fi
       profile_id: PROFILE_ID,
     });
   }
+  for (const diagnostic of nativeTypeScript.semanticDiagnostics) {
+    const source = diagnostic.relativePath === null ? null : compilerSources.get(diagnostic.relativePath) ?? null;
+    graph.addDiagnostic({
+      severity: "info",
+      code: "web.typescript_semantic_scaffold_diagnostic",
+      message: `TypeScript TypeChecker scaffold TS${diagnostic.code}: ${diagnostic.message}`,
+      path: diagnostic.relativePath,
+      profile_id: PROFILE_ID,
+      ...(source === null || diagnostic.relativePath === null ? {} : {
+        evidence: [semanticEvidence(
+          source,
+          diagnostic.relativePath,
+          diagnostic.startOffset,
+          diagnostic.endOffset,
+        )],
+      }),
+    });
+  }
+  if (nativeTypeScript.project.semanticDiagnostics > nativeTypeScript.project.emittedSemanticDiagnostics) {
+    graph.addDiagnostic({
+      severity: "info",
+      code: "web.typescript_semantic_scaffold_diagnostics_truncated",
+      message: `TypeScript TypeChecker scaffold retained ${nativeTypeScript.project.emittedSemanticDiagnostics} of ${nativeTypeScript.project.semanticDiagnostics} deterministic diagnostics`,
+      path: null,
+      profile_id: PROFILE_ID,
+    });
+  }
 
   const files = [...graph.files.values()].sort((left, right) => left.path.localeCompare(right.path));
   const sites = [...graph.sites.values()].sort(compareById);
@@ -865,5 +914,6 @@ export async function scan(root: string, allFiles: string[], inventoryIssues: Fi
     packageManager: workspace.manager,
     lockfile: workspace.lockfile,
     detectedFrameworks: routeDiscovery.frameworks,
+    typeScriptProject: nativeTypeScript.project,
   };
 }

@@ -18,7 +18,7 @@ updated: 2026-07-19
 
 safe scanではcanonical root外へのsymlink readを拒否し、相対PATH・repository内toolchain・Node実行hookを除外する。Goは制限付き`go/packages`からparser fallbackへ移行する。Cargo metadataはpath-bearing inputのpreflight後、admitted manifest、lockfile、target discovery layoutだけを持つworker-owned confined mirrorに対してneutral cwdから`--frozen --offline --no-deps`で実行し、返却されたtemporary pathをinventory IDへ戻す。配布物はmanifest、core、schema、全worker/runtime artifact/component、backend attestationを検証し、欠損・変更・symlink・checked treeへの追加時にworker起動前にfail closedとする。
 
-Rust は rust-analyzer `0.0.330`、upstream revision `8954b66d43225e62c92e8bbcc8500191b5cceb1e`、Salsa `0.26.1` の exact pin、neutral toolchain probe、inventory bytes 専用の in-memory HIR smoke scaffold、Cargo read-confinement preflight / mirror、safe multi-file project modelに加え、HIR definition graph、import / re-export / type-use resolution、exact / candidate call graphのvertical sliceまで実装済みである。compatibleなexact toolchain / targetとconfined Cargo DTOでは、inventory-only databaseからcanonical `symbol` / `type` node、site-less `declares` / `extends` / `implements` / `instantiates` relation、canonical `rust_use` / `rust_reexport` / `type_use` / `call` dependency siteと`imports` / `reexports` / `type_uses` / `calls` / `may_call` edgeを抽出する。静的に一意なfunction、associated function、method、generic instance、closureはexact `calls`、完全かつ有限なclosed trait / immutable local function-pointer target集合はcandidate `may_call`とし、open / incomplete dispatch、external call、macro-generated call境界を過剰にexactへ昇格しない。dependency siteは`resolved`・`candidates`・`external`・`unresolved`へ分類し、rust-analyzerのsemantic evidenceをprimary、syntax source occurrenceをsupporting evidenceとして保持する。semantic deltaはstrict validation後にsyntax graphへatomicにunionし、曖昧なsource context等でdeltaへ昇格できない認識済みtype occurrenceはsource-phaseの`external`または`unresolved`として1回だけcoverage ledgerへ残す。Issue #29で最終fallback / coverage matrixと`semantic-complete`判定を実装済みである。`syntax-complete`、exact compatible HIR、`confined-cargo-metadata`、`ready` / `import-type-call-graph-emitted`、semantic issue count `0`、skipped / unsupported / unresolved `0`をすべて満たすprofileだけが`semantic-complete`となり、`candidates` / `external`は許容する。Issue #30のpackage/release verifierも2026-07-19に完了した。source/development workerは`rust_hir_enable_gate=release-gate-pending`を維持し、manifest・全artifact/component・Rust backend attestationをcoreが検証したarchiveだけが`release-gate-verified`をworkerへ注入してrelease-readyを申告する。TypeScript TypeChecker、frameworkのcomponent/server function semantic edge、build観測、incremental/watch、snapshot/diff/impact、architecture policy、runtime traceは本設計の後続Milestoneとして未実装である。Go VTAおよびreflection/native境界の追加refinementも未実装である。
+Rust は rust-analyzer `0.0.330`、upstream revision `8954b66d43225e62c92e8bbcc8500191b5cceb1e`、Salsa `0.26.1` の exact pin、neutral toolchain probe、inventory bytes 専用の in-memory HIR smoke scaffold、Cargo read-confinement preflight / mirror、safe multi-file project modelに加え、HIR definition graph、import / re-export / type-use resolution、exact / candidate call graphのvertical sliceまで実装済みである。compatibleなexact toolchain / targetとconfined Cargo DTOでは、inventory-only databaseからcanonical `symbol` / `type` node、site-less `declares` / `extends` / `implements` / `instantiates` relation、canonical `rust_use` / `rust_reexport` / `type_use` / `call` dependency siteと`imports` / `reexports` / `type_uses` / `calls` / `may_call` edgeを抽出する。静的に一意なfunction、associated function、method、generic instance、closureはexact `calls`、完全かつ有限なclosed trait / immutable local function-pointer target集合はcandidate `may_call`とし、open / incomplete dispatch、external call、macro-generated call境界を過剰にexactへ昇格しない。dependency siteは`resolved`・`candidates`・`external`・`unresolved`へ分類し、rust-analyzerのsemantic evidenceをprimary、syntax source occurrenceをsupporting evidenceとして保持する。semantic deltaはstrict validation後にsyntax graphへatomicにunionし、曖昧なsource context等でdeltaへ昇格できない認識済みtype occurrenceはsource-phaseの`external`または`unresolved`として1回だけcoverage ledgerへ残す。Issue #29で最終fallback / coverage matrixと`semantic-complete`判定を実装済みである。`syntax-complete`、exact compatible HIR、`confined-cargo-metadata`、`ready` / `import-type-call-graph-emitted`、semantic issue count `0`、skipped / unsupported / unresolved `0`をすべて満たすprofileだけが`semantic-complete`となり、`candidates` / `external`は許容する。Issue #30のpackage/release verifierも2026-07-19に完了した。source/development workerは`rust_hir_enable_gate=release-gate-pending`を維持し、manifest・全artifact/component・Rust backend attestationをcoreが検証したarchiveだけが`release-gate-verified`をworkerへ注入してrelease-readyを申告する。TypeScriptはIssue #39でbundled-onlyのisolated Program / TypeChecker scaffold、bundled stdlib、semantic diagnostic、failure profile、release attestationを実装済みだが、symbol / type / callおよびframeworkのcomponent / server function semantic edgeはまだgraphへ昇格しない。build観測、incremental/watch、snapshot/diff/impact、architecture policy、runtime trace、Go VTAおよびreflection/native境界の追加refinementも未実装である。
 
 ## 1. 目的
 
@@ -562,13 +562,13 @@ stable IDはcanonical JSONから生成し、module/package、node/site/edge、di
 
 ### 11.1 TypeScript / JavaScript Core
 
-Milestone 1 の safe scan は、ADR-006 に従い、depgraph に同梱された checksum 検証済み TypeScript のみを解析器として使用する。現在の固定 version は `7.0.2` である。project-local TypeScript は `package.json` と lockfile から version metadata を検出するだけで、module、native compiler、標準 library を load / execute しない。MVP は bundled lexical API と、隔離された native compiler process による syntactic diagnostics を使用し、`createProgram` / `TypeChecker` による意味解析はまだ実行しない。
+safe scan は、ADR-006 に従い、depgraph に同梱された checksum 検証済み TypeScript のみを解析器として使用する。現在の固定 version は `7.0.2` である。project-local TypeScript は `package.json` と lockfile から version metadata を検出するだけで、module、native compiler、標準 library を load / execute しない。Issue #39ではbundled lexical APIに加え、隔離されたnative compiler processへinventory済みsource、許可したstatic JSON/JSONCから正規化した`baseUrl` / `paths`、worker生成のneutral config、bundled stdlibだけを公開し、Program / TypeChecker smoke queryとbounded semantic diagnosticを実行するscaffoldを追加した。semantic resultはまだnode / site / edgeへ昇格せず、`semantic-complete`も付与しない。
 
 - import / export / re-export / type-only / `require` / literal dynamic import を抽出する
 - template / computed import は有限候補または unresolved site とする
 - workspace と lockfile から npm / pnpm / Yarn / Bun の package instance を生成する
 - pnpm peer dependency や Yarn PnP は `name@version` ではなく locator 単位で識別する
-- compiler へ渡す入力は inventory 済み source bytes と worker が生成した neutral project に限定し、`noResolve`、`noLib`、`noCheck`、空の `plugins` を指定した isolated virtual filesystem で解析する
+- compiler へ渡す入力は inventory 済み source bytes、bundled stdlib、worker生成projectに限定する。projectは`moduleResolution=bundler`、`module=preserve`、`target=esnext`、`noEmit`、空の`plugins` / `types` / `typeRoots`を固定し、static JSON/JSONCのrepository相対`baseUrl` / `paths`だけをvirtual-root相対mappingへ正規化する。`noResolve`、`noLib`、`noCheck`は使用しない
 
 #### Compiler 選択と fallback
 
@@ -600,12 +600,15 @@ Web profile は少なくとも次の properties を持つ。値は compiler 選�
 | `typescript_compiler_version` | `7.0.2` | 実際に使用した bundled compiler version |
 | `typescript_compiler_selection` | `bundled-only` | project metadata によって選択を変更しない |
 | `typescript_compiler_fallback` | `fail-closed` | compiler failureを別解析器の成功へ格下げしない |
-| `typescript_analysis_mode` | `syntax-only` | TypeChecker の意味解決結果ではない |
+| `typescript_analysis_mode` | `semantic-scaffold` | TypeCheckerを実行するがsemantic graphはまだ出力しない |
 | `typescript_project_local_policy` | `metadata-only` | project-local compiler は version inventory の対象に限定する |
 | `typescript_project_local_loaded` | `false` | project-local compiler module / binary / library を load していない |
-| `typescript_typechecker_status` | `not-invoked` | MVP では TypeChecker を呼び出していない |
+| `typescript_typechecker_status` | `invoked-no-graph` | intrinsic smoke queryとsemantic diagnosticを実行済み |
 | `typescript_project_filesystem` | `isolated-virtual` | compiler に repository filesystem を直接公開していない |
 | `project_code_executed` | `false` | project code、hook、plugin、script、executable config を実行していない |
+| `typescript_project_model_status` | `ready / failed` | inventory rootとbundled stdlibだけのproject model結果 |
+| `typescript_semantic_graph_emission` | `disabled` | scaffoldがsemantic edgeまたは`semantic-complete`を申告することをcoreも拒否する |
+| `typescript_release_gate` | `release-gate-pending / release-gate-verified` | verifiedはcoreがrelease whole-treeをattestしたarchive実行だけに注入する |
 
 #### Safe scan の read / execute 境界
 
@@ -623,9 +626,9 @@ Web profile は少なくとも次の properties を持つ。値は compiler 選�
 
 `scan_started`、profile、coverage の `project_code_executed=false` は単なる期待値ではなく safe scan の invariant である。この境界を証明できない入力や失敗を検出した場合、値を `false` のまま成功扱いせず fail closed とする。
 
-#### 将来 TypeChecker の導入 gate
+#### TypeChecker semantic graph の昇格 gate
 
-Milestone 2 の最初の TypeChecker backend も bundled-only を維持する。project-local compiler を opt-in で許可するには、compiler artifact identity と integrity、module/config/plugin 非実行、version compatibility、sandbox を扱う後続 ADR と security review を別途必須とする。
+Milestone 2 のTypeChecker scaffoldもbundled-onlyを維持し、Issue #39で安全なproject modelとfailure / attestation contractまで実装した。symbol / type / callおよびframework semantic graphへ昇格する前に、以下のmatrixを満たす。project-local compiler を opt-in で許可するには、compiler artifact identity と integrity、module/config/plugin 非実行、version compatibility、sandbox を扱う後続 ADR と security review を別途必須とする。
 
 導入前に、少なくとも次の matrix を release fixture と CI で検証する。
 
@@ -989,7 +992,7 @@ Go semantic scanではGOOS/GOARCH、build tags、強制されたcgo無効状態�
 - Rust HIR exact / candidate call resolution: 実装済み（Issue #28）
 - Rust HIR final fallback / coverage / `semantic-complete`判定: 実装済み（Issue #29、2026-07-17）
 - Rust HIR package/release verifier: 実装済み（Issue #30、2026-07-19）。source/developmentは`release-gate-pending`、core-attested archiveは`release-gate-verified`
-- TypeScript TypeChecker: 未実装
+- TypeScript isolated Program / TypeChecker scaffold: 実装済み（Issue #39、2026-07-19）。semantic graph emissionは未実装
 - 他adapterのsymbol / type / direct call / candidate call: 未実装
 - component / route / server function semantic edge: 未実装
 
@@ -1053,6 +1056,7 @@ Go semantic scanではGOOS/GOARCH、build tags、強制されたcgo無効状態�
 
 ## 26. 更新履歴
 
+- 2026-07-19: Issue #39としてbundled TypeScriptのsafe Program / TypeChecker scaffoldを実装。inventory source、許可したstatic JSON/JSONCの正規化済み`baseUrl` / `paths`、worker-owned neutral config、bundled stdlibだけをisolated VFSへ投入し、relative / static-alias module resolution、intrinsic TypeChecker query、bounded semantic diagnosticを追加した。project / system compiler、host filesystem、plugin / transformer / executable configへのfallbackを禁止し、compiler child / JSON-RPC lifecycle、internal timeout、strict closeを監視してfailure時はfailed profileとstable reasonを残してexit `3`とする。source/direct workerは`typescript_release_gate=release-gate-pending`、coreがrelease whole-treeをattestしたarchiveだけは`release-gate-verified`となる。coreもscaffold propertiesを必須化し、semantic node / edgeと`semantic-complete`を拒否する
 - 2026-07-19: Issue #30としてRust HIR package/release verifierを実装。release build baselineをRust/Cargo `1.93.1`へ固定し、manifestのlinked backend unitをrust-analyzer `0.0.330` / revision `8954b66d43225e62c92e8bbcc8500191b5cceb1e` / Salsa `0.26.1`としてcore attestationとworker handshakeに一致させた。全artifact/componentとsymlinkをfail closedに検証し、`executable-tree` / optional-entrypoint `data-tree` schema、抽出archiveのquery/export/determinism E2E、完全なrust-analyzer/Salsa SBOM・license closure、Tier 1 Linux/macOS、Windows package smoke、Rust HIR benchmark gateを追加。sysroot / `rust-src`は同梱せずimplicit fallbackを禁止し、source/developmentは`release-gate-pending`、core-attested archiveだけを`release-gate-verified`とした
 - 2026-07-17: Issue #29としてRust HIR final fallback / coverage matrixを実装。`syntax-complete` + exact compatible HIR + confined metadata + `ready` / `emitted` + semantic issue `0` + skipped / unsupported / unresolved `0`だけを`semantic-complete`とし、candidates / externalは許容する契約をprotocol validatorにも追加。unsupported toolchain / input、metadata / broken source、missing module/include、`OUT_DIR` / build / proc / external ledger、typed failureのatomic discardと`--strict`時exit `1`、worker panic / timeout / cancel / malformed outputのpartial exit `3`、反復scan / 別checkout決定性を固定。source/development成功gateは`release-gate-pending`とし、packaged release gateは後にIssue #30（2026-07-19）で完了
 - 2026-07-17: Issue #28としてRust HIR exact / candidate call graphを実装し、function / associated function / method / generic instance / closureのexact `calls`、closed trait / immutable local function pointerのcandidate `may_call`、external / unresolved、call-bearing macro invocation boundary、semantic primary + source supporting evidence、canonical condition / span / provenance / orderingを追加。後続のfinal fallback / `semantic-complete`判定はIssue #29として同日完了し、package/release verifierはIssue #30として2026-07-19に完了
