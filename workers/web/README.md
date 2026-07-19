@@ -14,7 +14,7 @@ The MVP is deliberately `bundled-only`. Project-local TypeScript is useful compa
 
 | Available input | Selection | Metadata and diagnostic | Fallback |
 | --- | --- | --- | --- |
-| Valid release-adjacent TypeScript 7.0.2 native compiler | Use the bundled compiler for syntax analysis plus the isolated Program / TypeChecker scaffold | `source=bundled`, `version=7.0.2`, `selection=bundled-only` | Not needed |
+| Valid release-adjacent TypeScript 7.0.2 native compiler | Use the bundled compiler for syntax analysis plus the isolated Program / TypeChecker definition graph | `source=bundled`, `version=7.0.2`, `selection=bundled-only` | Not needed |
 | Build-produced pinned TypeScript 7.0.2 artifact in development | The build verifies package identity/version and copies the compiler to `dist/typescript`; source-mode tests use only that fixed path | Same bundled metadata | Not needed |
 | Project-local TypeScript declaration, lock entry, or in-root `node_modules/typescript/package.json` | Read and report the version as metadata only; continue with bundled 7.0.2 | `web.project_typescript_not_loaded` identifies the detected version and metadata source | Bundled compiler remains selected |
 | No project-local TypeScript | Continue with bundled 7.0.2 | No project-local diagnostic | Bundled compiler remains selected |
@@ -29,15 +29,17 @@ The `profile_declared` event records the decision using these stable properties:
 | `typescript_compiler_version` | `7.0.2` | Exact selected compiler version |
 | `typescript_compiler_selection` | `bundled-only` | Project-local and ambient compilers are not candidates |
 | `typescript_compiler_fallback` | `fail-closed` | Compiler failure cannot change the selected trust boundary |
-| `typescript_analysis_mode` | `semantic-scaffold` | Program / TypeChecker is invoked, but semantic graph emission remains disabled |
+| `typescript_analysis_mode` | `semantic-definition-graph` | Program / TypeChecker emits only the versioned definition slice |
 | `typescript_project_local_policy` | `metadata-only` | Local version evidence may be read but local code may not be loaded |
 | `typescript_project_local_loaded` | `false` | The local TypeScript module was not imported or executed |
-| `typescript_typechecker_status` | `invoked-no-graph` | The intrinsic smoke query and semantic diagnostics ran without graph promotion |
+| `typescript_typechecker_status` | `definition-graph-emitted` or `definition-graph-discarded` | The validated definition delta was emitted, or a typed late failure discarded it atomically |
+| `typescript_definition_graph_status` | `ready` or `failed` | Whether the definition delta passed worker-side validation and atomic union |
 | `typescript_project_model_status` | `ready` | The isolated project admitted only inventory roots and bundled standard-library files |
 | `typescript_project_config` | `worker-neutral-allowlist` | Static JSON/JSONC `baseUrl`/`paths` are normalized into worker-owned data; config code, plugins, transforms, and package-based extends are not loaded |
 | `typescript_static_config_files` / `typescript_path_mappings` | decimal counts | Auditable counts of admitted static config files and normalized alias patterns |
 | `typescript_module_resolution` | `inventory-only` | Relative and admitted static-alias resolution can see virtual inventory files but not the host or project package tree |
-| `typescript_semantic_graph_emission` | `disabled` | This scaffold cannot emit semantic edges or claim `semantic-complete` |
+| `typescript_semantic_graph_emission` | `definition-graph-v1` | Only canonical symbol/type nodes and site-less `declares`/`extends`/`implements`/`instantiates` relations are allowed; `semantic-complete` remains forbidden |
+| `typescript_semantic_node_count` / `typescript_semantic_relation_count` / `typescript_semantic_issue_count` | decimal counts | Auditable definition-delta and bounded issue totals |
 | `typescript_release_gate` | `release-gate-pending` or `release-gate-verified` | Only a core-attested extracted archive receives the verified value |
 | `project_code_executed` | `false` | No project code, hook, plugin, script, or executable config ran |
 
@@ -81,9 +83,9 @@ The absence of a project-local compiler is normal, not an error. A detected loca
 
 ## TypeChecker graph-activation acceptance matrix
 
-The isolated Program / TypeChecker scaffold now runs on every Web scan. Semantic node and edge emission must remain disabled until the following graph-activation matrix passes on every supported release platform. Adding graph output must not silently change the `bundled-only` compiler decision; any future project-local execution mode requires a separate threat-model decision and an explicit, non-safe profile.
+The isolated Program / TypeChecker now emits the definition-only v1 slice on every successful Web scan. Type-use, import refinement, call edges, framework semantic edges, and `semantic-complete` remain disabled until their later activation gates pass. Definition output does not change the `bundled-only` compiler decision; any future project-local execution mode requires a separate threat-model decision and an explicit, non-safe profile.
 
-| Fixture | Required assertion before semantic graph activation |
+| Fixture | Required assertion before each later semantic slice activation |
 | --- | --- |
 | No local TypeScript and ordinary supported sources | The pinned bundled compiler is selected; types and module targets are deterministic; `project_code_executed=false` |
 | Local TypeScript exactly matches 7.0.2 | Version is reported as metadata only; the local module is not loaded; bundled compiler identity remains in the profile |
@@ -97,11 +99,13 @@ The isolated Program / TypeChecker scaffold now runs on every Web scan. Semantic
 
 TypeChecker release acceptance additionally requires exact evidence spans, separate type and runtime targets where they differ, bounded diagnostics, coverage conservation (`discovered = emitted + skipped`), resource deadlines, and regression tests proving that no project-controlled code executed.
 
+The definition slice rejects inventories above 50,000 source files before any remote `getSourceFile` AST transfer. The 1,000,000-node limit is enforced while traversing transferred trees because the async compiler API exposes each source AST as one remote object rather than a count-only preflight.
+
 ## Static coverage
 
 Static coverage includes npm/pnpm/Yarn/Bun workspace and lockfile discovery (including `.pnp.data.json` without loading `.pnp.cjs`), TypeScript/JavaScript ESM and CommonJS dependency sites, `tsconfig.json`/`jsconfig.json` path aliases, conditional workspace package exports, and filesystem routes for Next.js, Astro, TanStack Router, and TanStack Start. Existing TanStack `routeTree.gen.*` files are treated as generated evidence. Production package edges retain dependency/peer/optional kinds and exclude dev-only manifest declarations.
 
-The bundled TypeScript 7.0.2 lexical API is used for deterministic dependency inventory and context-aware import/require recognition. In addition, one pinned native TypeScript 7.0.2 compiler process parses every `.ts`, `.tsx`, `.mts`, `.cts`, `.js`, `.jsx`, `.mjs`, and `.cjs` file per scan. Syntactic diagnostics drive unsupported-syntax coverage; bounded Program, global, and semantic diagnostics exercise the isolated TypeChecker without promoting semantic graph output.
+The bundled TypeScript 7.0.2 lexical API is used for deterministic dependency inventory and context-aware import/require recognition. In addition, one pinned native TypeScript 7.0.2 compiler process parses every `.ts`, `.tsx`, `.mts`, `.cts`, `.js`, `.jsx`, `.mjs`, and `.cjs` file per scan. Syntactic diagnostics drive unsupported-syntax coverage; bounded Program, global, and semantic diagnostics accompany the isolated TypeChecker definition graph. Only repository-owned definition nodes and relations are promoted at this stage.
 
 Release archives keep the native compiler and its standard library tree under `libexec/typescript/lib`. The release manifest pins the component version, entry point, and canonical whole-tree SHA-256, so the `depgraph` core launcher rejects missing, added, symlinked, or modified files before the Web worker starts. Direct worker execution trusts its adjacent installation and is intended for protocol development; the verified safe-scan integrity contract requires launching through `depgraph`.
 
@@ -109,4 +113,4 @@ Astro frontmatter is parsed by the bundled Astro compiler 4.0.0; the release dir
 
 `DEPGRAPH_PROFILE_CONFIG` accepts the core-provided JSON object `{ "web_environments": [...] }`. Values are normalized, deduplicated, and sorted into the stable profile identity and canonical edge/site conditions; the default is production browser + server.
 
-TypeChecker semantic diagnostics run in the isolated scaffold. Symbol/type/call graph promotion, plugin-defined virtual modules, and code-based route construction remain unresolved or diagnostic-only in safe mode.
+TypeChecker semantic diagnostics and the definition-only symbol/type graph run inside the isolated compiler boundary. Type-use/import refinement, call graph promotion, plugin-defined virtual modules, and code-based route construction remain unresolved or diagnostic-only in safe mode.

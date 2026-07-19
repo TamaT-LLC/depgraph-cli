@@ -9,7 +9,7 @@
   },
   "scripts": {
     "build": "tsc --noEmit && node scripts/build.mjs",
-    "test": "pnpm run build && tsx --test test/*.test.ts",
+    "test": "pnpm run build && tsx --test --test-concurrency=1 test/*.test.ts",
     "check": "tsc --noEmit"
   },
   "dependencies": {

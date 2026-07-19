@@ -15,6 +15,11 @@ import {
 } from "typescript/unstable/ast";
 import type { FileSystem, FileSystemEntries } from "typescript/unstable/fs";
 import type { TypeScriptProjectSummary } from "./types";
+import {
+  extractTypeScriptRawDefinitionDelta,
+  TYPESCRIPT_SEMANTIC_MAX_SOURCE_FILES,
+  type TypeScriptRawDefinitionDelta,
+} from "./typescript-semantic";
 
 export const TYPESCRIPT_COMPILER_VERSION = ts.version;
 const TYPESCRIPT_RELEASE_GATE_VERIFIED = "release-gate-verified";
@@ -29,10 +34,10 @@ export const TYPESCRIPT_COMPILER_PROFILE_PROPERTIES = Object.freeze({
   typescript_compiler_version: TYPESCRIPT_COMPILER_VERSION,
   typescript_compiler_selection: "bundled-only",
   typescript_compiler_fallback: "fail-closed",
-  typescript_analysis_mode: "semantic-scaffold",
+  typescript_analysis_mode: "semantic-definition-graph",
   typescript_project_local_policy: "metadata-only",
   typescript_project_local_loaded: "false",
-  typescript_typechecker_status: "invoked-no-graph",
+  typescript_typechecker_status: "definition-graph-emitted",
   typescript_project_model_status: "ready",
   typescript_project_config: "worker-neutral-allowlist",
   typescript_module_resolution: "inventory-only",
@@ -41,7 +46,7 @@ export const TYPESCRIPT_COMPILER_PROFILE_PROPERTIES = Object.freeze({
     ? "core-attested-whole-tree"
     : "build-produced-pending-core-attestation",
   typescript_release_gate: TYPESCRIPT_RELEASE_GATE,
-  typescript_semantic_graph_emission: "disabled",
+  typescript_semantic_graph_emission: "definition-graph-v1",
   typescript_compiler_processes: "1",
   typescript_project_filesystem: "isolated-virtual",
 } as const);
@@ -102,6 +107,12 @@ export interface TypeOnlyDependencyRange {
 export class TypeScriptProjectAnalysis extends Map<string, TypeScriptSyntaxDiagnostic[]> {
   readonly typeOnlyDependencyRanges = new Map<string, TypeOnlyDependencyRange[]>();
   readonly semanticDiagnostics: TypeScriptSemanticDiagnostic[] = [];
+  definitionGraph: TypeScriptRawDefinitionDelta = {
+    definitions: [],
+    relations: [],
+    issues: [],
+    typeCheckerQueries: 0,
+  };
   project: TypeScriptProjectSummary = {
     status: "ready",
     rootFiles: 0,
@@ -112,6 +123,10 @@ export class TypeScriptProjectAnalysis extends Map<string, TypeScriptSyntaxDiagn
     typeCheckerQueries: 0,
     semanticDiagnostics: 0,
     emittedSemanticDiagnostics: 0,
+    definitionGraphStatus: "ready",
+    semanticNodes: 0,
+    semanticRelations: 0,
+    semanticIssues: 0,
   };
 }
 
@@ -143,8 +158,8 @@ export type TypeScriptProjectFailureReason =
 export class TypeScriptProjectError extends Error {
   readonly reason: TypeScriptProjectFailureReason;
 
-  constructor(reason: TypeScriptProjectFailureReason, message: string) {
-    super(message);
+  constructor(reason: TypeScriptProjectFailureReason, message: string, options?: ErrorOptions) {
+    super(message, options);
     this.name = "TypeScriptProjectError";
     this.reason = reason;
   }
@@ -694,21 +709,47 @@ async function analyzeTypeScriptProjectInner(
       if (projects.length !== 1) throw new Error(`TypeScript native project analysis opened ${projects.length} projects instead of one neutral project`);
       const project = projects[0]!;
       const actualRoots = new Set(project.rootFiles.map(pathKey));
+      const sourceFiles = new Map<string, SourceFile>();
+      const definitionSourceLimitExceeded = virtualToRelative.size > TYPESCRIPT_SEMANTIC_MAX_SOURCE_FILES;
+      if (definitionSourceLimitExceeded) {
+        result.definitionGraph = {
+          definitions: [],
+          relations: [],
+          issues: [{
+            code: "typescript_semantic_source_limit_exceeded",
+            message: `TypeScript semantic definition extraction received ${virtualToRelative.size} sources; limit=${TYPESCRIPT_SEMANTIC_MAX_SOURCE_FILES}`,
+            relativePath: null,
+            fatal: true,
+          }],
+          typeCheckerQueries: 0,
+        };
+      }
       for (const virtualPath of virtualToRelative.keys()) {
         if (!actualRoots.has(virtualPath)) throw new Error(`TypeScript native project analysis omitted ${virtualToRelative.get(virtualPath)}`);
+        // Source count can be rejected before transferring remote ASTs. The
+        // node-count guard necessarily runs after getSourceFile because the
+        // async compiler API transfers each syntax tree as one remote object.
+        if (definitionSourceLimitExceeded) continue;
         const relativePath = virtualToRelative.get(virtualPath)!;
-        // Fetching a remote AST transfers and decodes the full syntax tree. The
-        // lexical inventory already classifies import/export declarations, so
-        // only request trees that may contain the parser-ambiguous `import(...)`
-        // form (runtime CallExpression vs erased ImportType/JSDoc ImportType).
-        // This intentionally over-approximates with a linear native search.
-        // A comment-aware regular expression can catastrophically backtrack on
-        // untrusted repeated-comment input; false positives only transfer one
-        // additional isolated AST and cannot admit filesystem input.
-        if (!(sources.get(relativePath) ?? "").includes("import")) continue;
         const sourceFile = await project.program.getSourceFile(virtualPath);
         if (sourceFile === undefined) throw new Error(`TypeScript native project analysis could not read AST for ${relativePath}`);
-        result.typeOnlyDependencyRanges.set(relativePath, typeOnlyDependencyRanges(sourceFile));
+        const inventorySource = sources.get(relativePath);
+        const sourceMismatches = [
+          ...(inventorySource === undefined ? ["missing-inventory"] : []),
+          ...(pathKey(String(sourceFile.path)).toLowerCase() !== virtualPath.toLowerCase() ? ["path"] : []),
+          ...(pathKey(sourceFile.fileName) !== virtualPath ? ["fileName"] : []),
+          ...(sourceFile.text !== inventorySource ? ["text"] : []),
+        ];
+        if (sourceMismatches.length > 0) {
+          throw new Error(`TypeScript native project analysis returned an AST that disagrees with the confined inventory (${sourceMismatches.join(",")}) for ${relativePath}`);
+        }
+        sourceFiles.set(relativePath, sourceFile);
+        // The definition slice needs every inventory AST. Import-type ranges
+        // remain an independent lexical refinement and can avoid traversing a
+        // second time when the source has no possible import token.
+        if ((sources.get(relativePath) ?? "").includes("import")) {
+          result.typeOnlyDependencyRanges.set(relativePath, typeOnlyDependencyRanges(sourceFile));
+        }
       }
       const internalRootKey = pathKey(internalRoot);
       if (sources.size === 0 && !actualRoots.has(internalRootKey)) {
@@ -728,12 +769,14 @@ async function analyzeTypeScriptProjectInner(
       if (!loadedStandardLibraryFiles.some((file) => path.basename(file) === "lib.esnext.full.d.ts")) {
         throw new Error(`TypeScript native project analysis did not load bundled lib.esnext.full.d.ts from ${standardLibrary.root}`);
       }
+      const syntacticallyInvalidPaths = new Set<string>();
       for (const diagnostic of await project.program.getSyntacticDiagnostics()) {
         if (!diagnostic.fileName) throw new Error(`TypeScript native syntax diagnostic TS${diagnostic.code} has no source file`);
         const relativePath = virtualToRelative.get(pathKey(diagnostic.fileName));
         if (relativePath === undefined) throw new Error(`TypeScript native syntax diagnostic escaped the virtual input: ${diagnostic.fileName}`);
         const source = sources.get(relativePath);
         if (source === undefined) throw new Error(`TypeScript syntax input disappeared for ${relativePath}`);
+        syntacticallyInvalidPaths.add(relativePath);
         const startOffset = Math.max(0, Math.min(source.length, diagnostic.pos));
         const endOffset = Math.max(startOffset, Math.min(source.length, diagnostic.end));
         result.get(relativePath)!.push({
@@ -748,7 +791,21 @@ async function analyzeTypeScriptProjectInner(
       if (await project.checker.typeToString(intrinsicString) !== "string") {
         throw new Error("TypeScript native TypeChecker smoke query returned an unexpected intrinsic string type");
       }
-      const typeCheckerQueries = 1;
+      if (!definitionSourceLimitExceeded) {
+        result.definitionGraph = await extractTypeScriptRawDefinitionDelta(
+          project.checker,
+          [...sourceFiles.entries()]
+            .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)
+            .map(([relativePath, sourceFile]) => ({
+              relativePath,
+              compilerPath: sourceFile.fileName,
+              expectedText: sources.get(relativePath)!,
+              sourceFile,
+              syntacticallyValid: !syntacticallyInvalidPaths.has(relativePath),
+            })),
+        );
+      }
+      const typeCheckerQueries = 1 + result.definitionGraph.typeCheckerQueries;
       const diagnostics = [
         ...await project.program.getProgramDiagnostics(),
         ...await project.program.getGlobalDiagnostics(),
@@ -780,6 +837,10 @@ async function analyzeTypeScriptProjectInner(
         typeCheckerQueries,
         semanticDiagnostics: uniqueDiagnostics.length,
         emittedSemanticDiagnostics: result.semanticDiagnostics.length,
+        definitionGraphStatus: result.definitionGraph.issues.some((issue) => issue.fatal) ? "failed" : "ready",
+        semanticNodes: result.definitionGraph.definitions.length,
+        semanticRelations: result.definitionGraph.relations.length,
+        semanticIssues: result.definitionGraph.issues.length,
       };
     } finally {
       await snapshot.dispose();
@@ -818,7 +879,7 @@ function projectFailure(error: unknown): TypeScriptProjectError {
   const message = reason === "compiler_unavailable" && PACKAGED_WORKER
     ? `bundled TypeScript ${TYPESCRIPT_COMPILER_VERSION} compiler is missing next to packaged worker (${reason})`
     : `bundled TypeScript ${TYPESCRIPT_COMPILER_VERSION} project model failed (${reason})`;
-  return new TypeScriptProjectError(reason, message);
+  return new TypeScriptProjectError(reason, message, { cause: error });
 }
 
 /** @internal Cross-platform process lifecycle seam; the worker entrypoint never calls this. */

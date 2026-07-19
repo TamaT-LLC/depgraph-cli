@@ -878,6 +878,10 @@ fn validate_semantic_maps(
         }
         validate_semantic_edge(edge, linked_to_strict_site)?;
 
+        if is_semantic_definition_relation(edge) {
+            validate_definition_relation_endpoints(nodes, edge)?;
+        }
+
         let Some(site) = linked_site else {
             continue;
         };
@@ -1032,6 +1036,68 @@ fn validate_semantic_maps(
 
 fn is_common_semantic_edge_kind(kind: &str) -> bool {
     matches!(kind, "type_uses" | "calls" | "may_call")
+}
+
+fn is_definition_relation_kind(kind: &str) -> bool {
+    matches!(kind, "declares" | "extends" | "implements" | "instantiates")
+}
+
+fn is_semantic_definition_relation(edge: &GraphEdge) -> bool {
+    is_definition_relation_kind(edge.kind.as_str())
+        && (edge.phase == Phase::Semantic
+            || edge
+                .evidence
+                .first()
+                .is_some_and(|evidence| evidence.kind == EvidenceKind::Semantic))
+}
+
+fn validate_definition_relation_endpoints(
+    nodes: &BTreeMap<String, GraphNode>,
+    edge: &GraphEdge,
+) -> Result<(), ProtocolError> {
+    let source = nodes
+        .get(&edge.source)
+        .expect("base validation requires relation sources to exist");
+    let target = nodes
+        .get(&edge.target)
+        .expect("base validation requires relation targets to exist");
+
+    let valid = match edge.kind.as_str() {
+        "declares" => {
+            !matches!(source.kind.as_str(), "external_system" | "unknown_target")
+                && !matches!(target.kind.as_str(), "external_system" | "unknown_target")
+        }
+        "extends" | "implements" => {
+            source.kind == "type" && matches!(target.kind.as_str(), "type" | "external_system")
+        }
+        "instantiates" => {
+            matches!(source.kind.as_str(), "symbol" | "type")
+                && matches!(target.kind.as_str(), "symbol" | "type" | "external_system")
+        }
+        _ => true,
+    };
+    if !valid {
+        return invariant(format!(
+            "semantic definition relation {} of kind {} has incompatible endpoints {} ({}) -> {} ({})",
+            edge.id, edge.kind, source.id, source.kind, target.id, target.kind
+        ));
+    }
+
+    let source_language = source.properties.get("language").and_then(Value::as_str);
+    let target_language = target.properties.get("language").and_then(Value::as_str);
+    if let (Some(source_language), Some(target_language)) = (source_language, target_language)
+        && source_language != target_language
+        && !matches!(
+            (source_language, target_language),
+            ("typescript", "javascript") | ("javascript", "typescript")
+        )
+    {
+        return invariant(format!(
+            "semantic definition relation {} crosses languages from {source_language:?} to {target_language:?}",
+            edge.id
+        ));
+    }
+    Ok(())
 }
 
 fn is_rust_import_site_kind(kind: &str) -> bool {
@@ -1400,6 +1466,9 @@ fn validate_semantic_edge(
     edge: &GraphEdge,
     linked_to_strict_site: bool,
 ) -> Result<(), ProtocolError> {
+    if is_semantic_definition_relation(edge) {
+        return validate_semantic_definition_relation(edge);
+    }
     if !is_common_semantic_edge_kind(edge.kind.as_str()) && !linked_to_strict_site {
         return Ok(());
     }
@@ -1454,6 +1523,55 @@ fn validate_semantic_edge(
     if edge.id != expected_id {
         return invariant(format!(
             "semantic edge {} does not match its canonical identity; expected {}",
+            edge.id, expected_id
+        ));
+    }
+    Ok(())
+}
+
+fn validate_semantic_definition_relation(edge: &GraphEdge) -> Result<(), ProtocolError> {
+    if edge.phase != Phase::Semantic {
+        return invariant(format!(
+            "semantic definition relation {} of kind {} must use phase=semantic",
+            edge.id, edge.kind
+        ));
+    }
+    if edge.site_id.is_some() {
+        return invariant(format!(
+            "semantic definition relation {} of kind {} must remain site-less",
+            edge.id, edge.kind
+        ));
+    }
+    if edge.resolution_status != ResolutionStatus::Resolved || edge.precision != Precision::Exact {
+        return invariant(format!(
+            "semantic definition relation {} of kind {} must use resolved/exact",
+            edge.id, edge.kind
+        ));
+    }
+    let primary = validate_primary_semantic_evidence(
+        &format!("semantic definition relation {}", edge.id),
+        &edge.evidence,
+    )?;
+    let expected_id = stable_id_from_value(
+        "edge",
+        &json!({
+            "condition": edge.condition.canonicalized(),
+            "kind": edge.kind,
+            "path": primary.path.as_deref().expect("complete semantic evidence path"),
+            "profile_id": edge.profile_id,
+            "source": edge.source,
+            "span": {
+                "end_column": primary.end_column.expect("complete semantic evidence span"),
+                "end_line": primary.end_line.expect("complete semantic evidence span"),
+                "start_column": primary.start_column.expect("complete semantic evidence span"),
+                "start_line": primary.start_line.expect("complete semantic evidence span"),
+            },
+            "target": edge.target,
+        }),
+    );
+    if edge.id != expected_id {
+        return invariant(format!(
+            "semantic definition relation {} does not match its canonical identity; expected {}",
             edge.id, expected_id
         ));
     }
