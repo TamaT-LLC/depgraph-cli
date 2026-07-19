@@ -246,6 +246,7 @@ export interface TypeScriptProjectSummary {
   semanticNodes: number;
   semanticRelations: number;
   semanticSites: number;
+  semanticCallSites: number;
   semanticIssues: number;
 }
 

@@ -568,6 +568,14 @@ function declarationCandidate(
   }
 }
 
+function hasCanonicalMemberOwner(node: Node, owner: Candidate | null): owner is Candidate {
+  if (owner?.graphKind !== "type") return false;
+  if (owner.node === node.parent) return true;
+  return node.kind === SyntaxKind.MethodSignature
+    && owner.node.kind === SyntaxKind.TypeAliasDeclaration
+    && (owner.node as TypeAliasDeclaration).type === node.parent;
+}
+
 function collectSources(
   sources: readonly TypeScriptSemanticSource[],
   issues: IssueCollector,
@@ -618,10 +626,23 @@ function collectSources(
       return;
     }
 
+    // Members can only inherit a semantic owner when it represents their
+    // actual syntax container. A direct type-literal body is also the public
+    // member surface of its type alias. Other object/class/type literals do
+    // not have definition candidates, so inheriting an outer type would
+    // fabricate that outer type's member identity and can collide with a real
+    // member.
+    const candidateOwner = (
+      node.kind === SyntaxKind.MethodDeclaration
+      || node.kind === SyntaxKind.Constructor
+      || node.kind === SyntaxKind.MethodSignature
+    ) && !hasCanonicalMemberOwner(node, owner)
+      ? null
+      : owner;
     const candidate = declarationCandidate(
       node,
       source,
-      owner,
+      candidateOwner,
       lexicalPath,
       moduleScoped,
       collection.candidates.length,
@@ -783,8 +804,21 @@ function candidateResolver(candidate: Candidate): string | null {
       ])}`;
   }
 
-  if (candidate.node.kind === SyntaxKind.MethodDeclaration || candidate.node.kind === SyntaxKind.MethodSignature) {
-    if (candidate.owner?.graphKind !== "type") return null;
+  if (candidate.node.kind === SyntaxKind.MethodDeclaration) {
+    if (!hasCanonicalMemberOwner(candidate.node, candidate.owner)) return null;
+    const ownerResolver = candidateResolver(candidate.owner);
+    if (ownerResolver === null) return null;
+    const isStatic = ((candidate.node as MethodDeclaration).modifierFlags & ModifierFlags.Static) !== 0;
+    return `definition:${JSON.stringify([
+      "member",
+      candidate.graphKind,
+      ownerResolver,
+      isStatic ? "static" : "instance",
+      candidate.displayName,
+    ])}`;
+  }
+  if (candidate.node.kind === SyntaxKind.MethodSignature) {
+    if (!hasCanonicalMemberOwner(candidate.node, candidate.owner)) return null;
     const ownerResolver = candidateResolver(candidate.owner);
     if (ownerResolver === null) return null;
     const isStatic = ((candidate.node as MethodDeclaration).modifierFlags & ModifierFlags.Static) !== 0;
@@ -797,7 +831,7 @@ function candidateResolver(candidate: Candidate): string | null {
     ])}`;
   }
   if (candidate.node.kind === SyntaxKind.Constructor) {
-    if (candidate.owner?.graphKind !== "type") return null;
+    if (!hasCanonicalMemberOwner(candidate.node, candidate.owner)) return null;
     const ownerResolver = candidateResolver(candidate.owner);
     return ownerResolver === null
       ? null

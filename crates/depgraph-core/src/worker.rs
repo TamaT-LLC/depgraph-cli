@@ -39,10 +39,14 @@ const TYPESCRIPT_RELEASE_GATE_VERIFIED: &str = "release-gate-verified";
 const TYPESCRIPT_ANALYSIS_MODE_PROPERTY: &str = "typescript_analysis_mode";
 const TYPESCRIPT_ANALYSIS_MODE_DEFINITION_GRAPH: &str = "semantic-definition-graph";
 const TYPESCRIPT_ANALYSIS_MODE_IMPORT_TYPE_GRAPH: &str = "semantic-import-type-graph";
+const TYPESCRIPT_ANALYSIS_MODE_IMPORT_TYPE_CALL_GRAPH: &str = "semantic-import-type-call-graph";
 const TYPESCRIPT_SEMANTIC_EMISSION_PROPERTY: &str = "typescript_semantic_graph_emission";
 const TYPESCRIPT_SEMANTIC_EMISSION_DEFINITION_GRAPH_V1: &str = "definition-graph-v1";
 const TYPESCRIPT_SEMANTIC_EMISSION_IMPORT_TYPE_GRAPH_V1: &str = "definition-import-type-graph-v1";
+const TYPESCRIPT_SEMANTIC_EMISSION_IMPORT_TYPE_CALL_GRAPH_V1: &str =
+    "definition-import-type-call-graph-v1";
 const TYPESCRIPT_SEMANTIC_SITE_COUNT_PROPERTY: &str = "typescript_semantic_site_count";
+const TYPESCRIPT_SEMANTIC_CALL_SITE_COUNT_PROPERTY: &str = "typescript_semantic_call_site_count";
 const TYPESCRIPT_SEMANTIC_EXTRACTOR: &str = "typescript-native-typechecker";
 const TYPESCRIPT_SEMANTIC_BACKEND: &str = "typescript-native-compiler";
 const TYPESCRIPT_COMPILER_VERSION: &str = "7.0.2";
@@ -1700,11 +1704,11 @@ fn is_web_definition_relation_kind(kind: &str) -> bool {
 }
 
 fn is_web_semantic_dependency_site_kind(kind: &str) -> bool {
-    matches!(kind, "web_import" | "web_reexport" | "type_use")
+    matches!(kind, "web_import" | "web_reexport" | "type_use" | "call")
 }
 
 fn is_web_semantic_dependency_edge_kind(kind: &str) -> bool {
-    matches!(kind, "imports" | "reexports" | "type_uses")
+    matches!(kind, "imports" | "reexports" | "type_uses" | "calls")
 }
 
 fn web_semantic_edge_kind_for_site(kind: &str) -> Option<&'static str> {
@@ -1712,8 +1716,20 @@ fn web_semantic_edge_kind_for_site(kind: &str) -> Option<&'static str> {
         "web_import" => Some("imports"),
         "web_reexport" => Some("reexports"),
         "type_use" => Some("type_uses"),
+        "call" => Some("calls"),
         _ => None,
     }
+}
+
+fn is_web_callable_symbol_kind(symbol_kind: &str) -> bool {
+    matches!(
+        symbol_kind,
+        "function" | "method" | "constructor" | "anonymous_function" | "local_function"
+    )
+}
+
+fn is_web_call_source_symbol_kind(symbol_kind: &str) -> bool {
+    is_web_callable_symbol_kind(symbol_kind) || symbol_kind == "generated_module_initializer"
 }
 
 fn is_web_semantic_delta_event(event: &ProtocolEvent) -> bool {
@@ -1933,6 +1949,9 @@ fn discard_web_definition_delta(
             WebSemanticCapability::DefinitionImportTypeGraphV1 => {
                 "definition-import-type-graph-discarded"
             }
+            WebSemanticCapability::DefinitionImportTypeCallGraphV1 => {
+                "definition-import-type-call-graph-discarded"
+            }
         };
         let properties = &mut declared.profile.properties;
         properties.insert(
@@ -1954,13 +1973,25 @@ fn discard_web_definition_delta(
         ] {
             properties.insert(property.to_owned(), Value::String("0".to_owned()));
         }
-        if capability == WebSemanticCapability::DefinitionImportTypeGraphV1 {
+        if matches!(
+            capability,
+            WebSemanticCapability::DefinitionImportTypeGraphV1
+                | WebSemanticCapability::DefinitionImportTypeCallGraphV1
+        ) {
             properties.insert(
                 TYPESCRIPT_SEMANTIC_SITE_COUNT_PROPERTY.to_owned(),
                 Value::String("0".to_owned()),
             );
         } else {
             properties.remove(TYPESCRIPT_SEMANTIC_SITE_COUNT_PROPERTY);
+        }
+        if capability == WebSemanticCapability::DefinitionImportTypeCallGraphV1 {
+            properties.insert(
+                TYPESCRIPT_SEMANTIC_CALL_SITE_COUNT_PROPERTY.to_owned(),
+                Value::String("0".to_owned()),
+            );
+        } else {
+            properties.remove(TYPESCRIPT_SEMANTIC_CALL_SITE_COUNT_PROPERTY);
         }
     }
 }
@@ -1986,6 +2017,7 @@ fn record_web_rejected_site_closure(
 enum WebSemanticCapability {
     DefinitionGraphV1,
     DefinitionImportTypeGraphV1,
+    DefinitionImportTypeCallGraphV1,
 }
 
 fn web_semantic_capability(
@@ -2008,6 +2040,10 @@ fn web_semantic_capability(
             TYPESCRIPT_ANALYSIS_MODE_IMPORT_TYPE_GRAPH,
             TYPESCRIPT_SEMANTIC_EMISSION_IMPORT_TYPE_GRAPH_V1,
         ) => Ok(WebSemanticCapability::DefinitionImportTypeGraphV1),
+        (
+            TYPESCRIPT_ANALYSIS_MODE_IMPORT_TYPE_CALL_GRAPH,
+            TYPESCRIPT_SEMANTIC_EMISSION_IMPORT_TYPE_CALL_GRAPH_V1,
+        ) => Ok(WebSemanticCapability::DefinitionImportTypeCallGraphV1),
         _ => Err(format!(
             "Web worker reported unsupported or mismatched semantic capability {TYPESCRIPT_ANALYSIS_MODE_PROPERTY}={analysis_mode:?}, {TYPESCRIPT_SEMANTIC_EMISSION_PROPERTY}={emission:?}"
         )),
@@ -2036,6 +2072,10 @@ fn web_definition_profile_ready(
         WebSemanticCapability::DefinitionImportTypeGraphV1 => (
             "definition-import-type-graph-emitted",
             "definition-import-type-graph-discarded",
+        ),
+        WebSemanticCapability::DefinitionImportTypeCallGraphV1 => (
+            "definition-import-type-call-graph-emitted",
+            "definition-import-type-call-graph-discarded",
         ),
     };
     match state {
@@ -2127,6 +2167,10 @@ fn web_occurrence_kind_matches_site(site_kind: &str, occurrence_kind: &str) -> b
         "type_use" => matches!(
             occurrence_kind,
             "type_reference" | "heritage_type" | "jsdoc_type"
+        ),
+        "call" => matches!(
+            occurrence_kind,
+            "call_expression" | "new_expression" | "tagged_template"
         ),
         _ => false,
     }
@@ -2619,6 +2663,7 @@ fn validate_web_definition_graph(
     web_profiles: &BTreeSet<String>,
     definition_profiles: &BTreeSet<String>,
     import_type_profiles: &BTreeSet<String>,
+    call_profiles: &BTreeSet<String>,
 ) -> std::result::Result<(), String> {
     validate_semantic_contract(protocol).map_err(|error| error.to_string())?;
 
@@ -2742,6 +2787,8 @@ fn validate_web_definition_graph(
                     | "local_function_variable"
                     | "method"
             ) || (semantic_kind == "variable" && import_type_profiles.contains(profile_id))
+                || (semantic_kind == "generated_module_initializer"
+                    && call_profiles.contains(profile_id))
         } else {
             matches!(
                 semantic_kind,
@@ -2835,7 +2882,11 @@ fn validate_web_definition_graph(
         let allowed_dependency_edge = edge.phase == Phase::Semantic
             && is_web_semantic_dependency_edge_kind(&edge.kind)
             && edge.site_id.is_some()
-            && import_type_profiles.contains(&edge.profile_id);
+            && if edge.kind == "calls" {
+                call_profiles.contains(&edge.profile_id)
+            } else {
+                import_type_profiles.contains(&edge.profile_id)
+            };
         if incident_to_definition && !allowed_definition_relation && !allowed_dependency_edge {
             return Err(format!(
                 "Web edge {} incident to a semantic definition is outside its declared semantic capability",
@@ -2849,8 +2900,12 @@ fn validate_web_definition_graph(
                 .target_ids
                 .iter()
                 .any(|target| semantic_node_ids.contains(target.as_str())))
-            && !(import_type_profiles.contains(&site.profile_id)
-                && is_web_semantic_dependency_site_kind(&site.kind))
+            && !(is_web_semantic_dependency_site_kind(&site.kind)
+                && if site.kind == "call" {
+                    call_profiles.contains(&site.profile_id)
+                } else {
+                    import_type_profiles.contains(&site.profile_id)
+                })
         {
             return Err(format!(
                 "Web dependency site {} is incident to a semantic definition node outside the import/type-use capability",
@@ -2999,6 +3054,31 @@ fn validate_web_definition_graph(
                     }
                     Some("generated_from")
                 }
+                "generated" => {
+                    if node.properties.get("symbol_kind").and_then(Value::as_str)
+                        != Some("generated_module_initializer")
+                        || !call_profiles.contains(profile_id)
+                        || !web_json_object_has_exact_fields(
+                            identity,
+                            &[
+                                "language",
+                                "package_locator",
+                                "symbol_kind",
+                                "identity_kind",
+                                "generated_from",
+                                "relative_path",
+                                "span",
+                            ],
+                        )
+                        || node.properties.contains_key("resolver_identity")
+                    {
+                        return Err(format!(
+                            "Web generated symbol {} has an unsupported kind, capability, resolver, or canonical identity shape",
+                            node.id
+                        ));
+                    }
+                    Some("generated_from")
+                }
                 other => {
                     return Err(format!(
                         "Web semantic symbol {} has unsupported identity_kind {other:?}",
@@ -3032,10 +3112,10 @@ fn validate_web_definition_graph(
                         node.id
                     )
                 })?;
-                let origin_kind_is_valid = if identity_kind == "local" {
-                    origin.kind == "symbol"
-                } else {
-                    matches!(origin.kind.as_str(), "file" | "symbol" | "type")
+                let origin_kind_is_valid = match identity_kind {
+                    "local" => origin.kind == "symbol",
+                    "generated" => origin.kind == "file",
+                    _ => matches!(origin.kind.as_str(), "file" | "symbol" | "type"),
                 };
                 if !origin_kind_is_valid
                     || node_package_id(origin) != node_package_id(node)
@@ -3059,7 +3139,7 @@ fn validate_web_definition_graph(
                     != node.properties.get("source_path").and_then(Value::as_str)
                 {
                     return Err(format!(
-                        "Web anonymous symbol {} file origin {} does not anchor its source path",
+                        "Web {identity_kind} symbol {} file origin {} does not anchor its source path",
                         node.id, origin.id
                     ));
                 }
@@ -3460,23 +3540,39 @@ fn validate_web_definition_graph(
         })
         .collect::<Vec<_>>();
     let mut semantic_sites_by_profile = std::collections::BTreeMap::<&str, usize>::new();
+    let mut semantic_call_sites_by_profile = std::collections::BTreeMap::<&str, usize>::new();
     for site in protocol.sites.values().filter(|site| {
         site.evidence
             .first()
             .is_some_and(|evidence| evidence.kind == EvidenceKind::Semantic)
     }) {
-        if !import_type_profiles.contains(&site.profile_id) {
+        let authorized = if site.kind == "call" {
+            call_profiles.contains(&site.profile_id)
+        } else {
+            import_type_profiles.contains(&site.profile_id)
+        };
+        if !authorized {
             return Err(format!(
-                "Web semantic dependency site {} references profile {:?} without the definition-import-type-graph-v1 capability",
+                "Web semantic dependency site {} references profile {:?} without its required cumulative semantic capability",
                 site.id, site.profile_id
             ));
         }
         let expected_edge_kind = web_semantic_edge_kind_for_site(&site.kind).ok_or_else(|| {
             format!(
-                "Web definition-import-type-graph-v1 profile emitted forbidden semantic dependency site kind {:?}",
+                "Web cumulative semantic profile emitted forbidden semantic dependency site kind {:?}",
                 site.kind
             )
         })?;
+        if site.kind == "call"
+            && (site.resolution_status == ResolutionStatus::Candidates
+                || site.precision == Precision::Overapprox
+                || site.target_ids.len() != 1)
+        {
+            return Err(format!(
+                "Web semantic call site {} must have exactly one target and cannot use candidates/may_call",
+                site.id
+            ));
+        }
         let primary = site
             .evidence
             .first()
@@ -3502,32 +3598,6 @@ fn validate_web_definition_graph(
             .get("occurrence_kind")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        let type_only = primary
-            .properties
-            .get("type_only")
-            .and_then(Value::as_bool)
-            .ok_or_else(|| {
-                format!(
-                    "Web semantic dependency site {} primary evidence must declare boolean type_only",
-                    site.id
-                )
-            })?;
-        if (site.kind == "type_use" || occurrence_kind == "import_type") && !type_only {
-            return Err(format!(
-                "Web semantic dependency site {} occurrence_kind {occurrence_kind:?} must use type_only=true",
-                site.id
-            ));
-        }
-        if matches!(
-            occurrence_kind,
-            "side_effect_import" | "require_call" | "dynamic_import"
-        ) && type_only
-        {
-            return Err(format!(
-                "Web semantic dependency site {} occurrence_kind {occurrence_kind:?} must use type_only=false",
-                site.id
-            ));
-        }
         let module_specifier = web_optional_evidence_string(
             &primary.properties,
             "module_specifier",
@@ -3540,76 +3610,154 @@ fn validate_web_definition_graph(
                 site.id
             )
         })?;
-        let imported_name = web_optional_evidence_string(
-            &primary.properties,
-            "imported_name",
-            TYPESCRIPT_MAX_DISPLAY_NAME_CHARS,
-            true,
-        )
-        .map_err(|()| {
-            format!(
-                "Web semantic dependency site {} has invalid imported_name metadata",
-                site.id
-            )
-        })?;
-        let resolution_mode = match primary.properties.get("resolution_mode") {
-            None => None,
-            Some(value) => match value.as_str() {
-                Some(mode @ ("import" | "require")) => Some(mode),
-                _ => {
-                    return Err(format!(
-                        "Web semantic dependency site {} has invalid resolution_mode metadata",
-                        site.id
-                    ));
+        if site.kind == "call" {
+            let call_kind = primary
+                .properties
+                .get("call_kind")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let dispatch = primary
+                .properties
+                .get("dispatch")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let call_kind_is_valid = matches!(
+                call_kind,
+                "function" | "method" | "constructor" | "tagged_template"
+            ) && (occurrence_kind != "new_expression"
+                || call_kind == "constructor")
+                && (occurrence_kind != "tagged_template" || call_kind == "tagged_template");
+            let dispatch_is_valid = match site.resolution_status {
+                ResolutionStatus::Resolved => {
+                    site.precision == Precision::Exact
+                        && matches!(
+                            dispatch,
+                            "direct" | "static" | "private" | "fresh_instance" | "super"
+                        )
                 }
-            },
-        };
-        if resolution_mode.is_some() && (!type_only || module_specifier.is_none()) {
-            return Err(format!(
-                "Web semantic dependency site {} resolution_mode contradicts its occurrence",
-                site.id
-            ));
-        }
-        if resolution_mode.is_some() && occurrence_kind == "import_equals" {
-            return Err(format!(
-                "Web semantic dependency site {} import_equals occurrence cannot expose resolution_mode",
-                site.id
-            ));
-        }
-        let named_binding = matches!(
-            occurrence_kind,
-            "default_import" | "named_import" | "named_reexport"
-        );
-        let namespace_binding =
-            matches!(occurrence_kind, "namespace_import" | "namespace_reexport");
-        let module_only = matches!(
-            occurrence_kind,
-            "side_effect_import"
-                | "empty_import"
-                | "require_call"
-                | "dynamic_import"
-                | "import_type"
-                | "empty_reexport"
-                | "export_star"
-        );
-        let metadata_shape_is_valid = (site.kind == "type_use" || module_specifier.is_some())
-            && (site.kind != "type_use" || imported_name.is_some())
-            && (!named_binding || imported_name.is_some())
-            && (!namespace_binding || imported_name == Some("*"))
-            && (!module_only || imported_name.is_none())
-            && (occurrence_kind != "default_import" || imported_name == Some("default"))
-            && (occurrence_kind != "import_equals" || imported_name == Some("="))
-            && if site.kind == "type_use" {
-                imported_name == Some(site.specifier.as_str())
-            } else {
-                module_specifier == Some(site.specifier.as_str())
+                ResolutionStatus::External => {
+                    matches!(site.precision, Precision::Exact | Precision::Heuristic)
+                        && dispatch == "external"
+                }
+                ResolutionStatus::Unresolved => {
+                    site.precision == Precision::Heuristic && matches!(dispatch, "dynamic" | "open")
+                }
+                ResolutionStatus::Candidates => false,
             };
-        if !metadata_shape_is_valid {
-            return Err(format!(
-                "Web semantic dependency site {} binding metadata does not match occurrence_kind {:?} or specifier {:?}",
-                site.id, occurrence_kind, site.specifier
-            ));
+            if !call_kind_is_valid
+                || !dispatch_is_valid
+                || primary.properties.contains_key("type_only")
+                || primary.properties.contains_key("imported_name")
+                || primary.properties.contains_key("resolution_mode")
+            {
+                return Err(format!(
+                    "Web semantic call site {} has invalid call_kind {call_kind:?}, dispatch {dispatch:?}, or import-only metadata",
+                    site.id
+                ));
+            }
+        } else {
+            let type_only = primary
+                .properties
+                .get("type_only")
+                .and_then(Value::as_bool)
+                .ok_or_else(|| {
+                    format!(
+                        "Web semantic dependency site {} primary evidence must declare boolean type_only",
+                        site.id
+                    )
+                })?;
+            if (site.kind == "type_use" || occurrence_kind == "import_type") && !type_only {
+                return Err(format!(
+                    "Web semantic dependency site {} occurrence_kind {occurrence_kind:?} must use type_only=true",
+                    site.id
+                ));
+            }
+            if matches!(
+                occurrence_kind,
+                "side_effect_import" | "require_call" | "dynamic_import"
+            ) && type_only
+            {
+                return Err(format!(
+                    "Web semantic dependency site {} occurrence_kind {occurrence_kind:?} must use type_only=false",
+                    site.id
+                ));
+            }
+            let imported_name = web_optional_evidence_string(
+                &primary.properties,
+                "imported_name",
+                TYPESCRIPT_MAX_DISPLAY_NAME_CHARS,
+                true,
+            )
+            .map_err(|()| {
+                format!(
+                    "Web semantic dependency site {} has invalid imported_name metadata",
+                    site.id
+                )
+            })?;
+            let resolution_mode = match primary.properties.get("resolution_mode") {
+                None => None,
+                Some(value) => match value.as_str() {
+                    Some(mode @ ("import" | "require")) => Some(mode),
+                    _ => {
+                        return Err(format!(
+                            "Web semantic dependency site {} has invalid resolution_mode metadata",
+                            site.id
+                        ));
+                    }
+                },
+            };
+            if resolution_mode.is_some() && (!type_only || module_specifier.is_none()) {
+                return Err(format!(
+                    "Web semantic dependency site {} resolution_mode contradicts its occurrence",
+                    site.id
+                ));
+            }
+            if resolution_mode.is_some() && occurrence_kind == "import_equals" {
+                return Err(format!(
+                    "Web semantic dependency site {} import_equals occurrence cannot expose resolution_mode",
+                    site.id
+                ));
+            }
+            let named_binding = matches!(
+                occurrence_kind,
+                "default_import" | "named_import" | "named_reexport"
+            );
+            let namespace_binding =
+                matches!(occurrence_kind, "namespace_import" | "namespace_reexport");
+            let module_only = matches!(
+                occurrence_kind,
+                "side_effect_import"
+                    | "empty_import"
+                    | "require_call"
+                    | "dynamic_import"
+                    | "import_type"
+                    | "empty_reexport"
+                    | "export_star"
+            );
+            let metadata_shape_is_valid = (site.kind == "type_use" || module_specifier.is_some())
+                && (site.kind != "type_use" || imported_name.is_some())
+                && (!named_binding || imported_name.is_some())
+                && (!namespace_binding || imported_name == Some("*"))
+                && (!module_only || imported_name.is_none())
+                && (occurrence_kind != "default_import" || imported_name == Some("default"))
+                && (occurrence_kind != "import_equals" || imported_name == Some("="))
+                && if site.kind == "type_use" {
+                    imported_name == Some(site.specifier.as_str())
+                } else {
+                    module_specifier == Some(site.specifier.as_str())
+                };
+            if !metadata_shape_is_valid {
+                return Err(format!(
+                    "Web semantic dependency site {} binding metadata does not match occurrence_kind {:?} or specifier {:?}",
+                    site.id, occurrence_kind, site.specifier
+                ));
+            }
         }
+        let expected_analysis_mode = if call_profiles.contains(&site.profile_id) {
+            TYPESCRIPT_ANALYSIS_MODE_IMPORT_TYPE_CALL_GRAPH
+        } else {
+            TYPESCRIPT_ANALYSIS_MODE_IMPORT_TYPE_GRAPH
+        };
         if primary.properties.get("backend").and_then(Value::as_str)
             != Some(TYPESCRIPT_SEMANTIC_BACKEND)
             || primary
@@ -3626,7 +3774,7 @@ fn validate_web_definition_graph(
                 .properties
                 .get("analysis_mode")
                 .and_then(Value::as_str)
-                != Some(TYPESCRIPT_ANALYSIS_MODE_IMPORT_TYPE_GRAPH)
+                != Some(expected_analysis_mode)
             || primary
                 .properties
                 .get("project_code_executed")
@@ -3745,6 +3893,24 @@ fn validate_web_definition_graph(
                     ));
                 }
             },
+            "call" => {
+                if source.kind != "symbol"
+                    || source
+                        .properties
+                        .get("symbol_kind")
+                        .and_then(Value::as_str)
+                        .is_none_or(|symbol_kind| !is_web_call_source_symbol_kind(symbol_kind))
+                    || source.properties.get("profile_id").and_then(Value::as_str)
+                        != Some(site.profile_id.as_str())
+                    || source.properties.get("source_path").and_then(Value::as_str)
+                        != Some(evidence_path)
+                {
+                    return Err(format!(
+                        "Web semantic call site {} source {} must be a same-profile callable symbol anchored to its evidence file",
+                        site.id, source.id
+                    ));
+                }
+            }
             _ => unreachable!("Web semantic site kinds were checked above"),
         }
 
@@ -3782,12 +3948,25 @@ fn validate_web_definition_graph(
                     let valid_kind =
                         if web_occurrence_requires_repository_module(&site.kind, occurrence_kind) {
                             target.kind == "file"
+                        } else if site.kind == "call" {
+                            target.kind == "symbol"
+                                && target
+                                    .properties
+                                    .get("symbol_kind")
+                                    .and_then(Value::as_str)
+                                    .is_some_and(is_web_callable_symbol_kind)
                         } else if site.kind == "type_use" {
                             target.kind == "type"
                         } else {
                             matches!(target.kind.as_str(), "file" | "symbol" | "type")
                         };
                     if !valid_kind {
+                        if site.kind == "call" {
+                            return Err(format!(
+                                "Web semantic call site {} resolved target {} must be a canonical callable symbol",
+                                site.id, target.id
+                            ));
+                        }
                         return Err(format!(
                             "Web semantic dependency site {} concrete target {} has incompatible kind {}",
                             site.id, target.id, target.kind
@@ -3973,18 +4152,30 @@ fn validate_web_definition_graph(
                 linked_edges.len()
             ));
         }
-        let edge_condition_union = Condition::Any {
-            conditions: linked_edges
-                .iter()
-                .map(|edge| edge.condition.clone())
-                .collect(),
-        }
-        .canonicalized();
-        if edge_condition_union != site.condition.canonicalized() {
-            return Err(format!(
-                "Web semantic dependency site {} condition is not the union of its target edge conditions",
-                site.id
-            ));
+        if site.kind == "call" {
+            if linked_edges
+                .first()
+                .is_none_or(|edge| edge.condition.canonicalized() != site.condition.canonicalized())
+            {
+                return Err(format!(
+                    "Web semantic call edge condition does not match dependency site {}",
+                    site.id
+                ));
+            }
+        } else {
+            let edge_condition_union = Condition::Any {
+                conditions: linked_edges
+                    .iter()
+                    .map(|edge| edge.condition.clone())
+                    .collect(),
+            }
+            .canonicalized();
+            if edge_condition_union != site.condition.canonicalized() {
+                return Err(format!(
+                    "Web semantic dependency site {} condition is not the union of its target edge conditions",
+                    site.id
+                ));
+            }
         }
         for edge in linked_edges {
             if edge.kind != expected_edge_kind
@@ -4029,6 +4220,11 @@ fn validate_web_definition_graph(
         *semantic_sites_by_profile
             .entry(site.profile_id.as_str())
             .or_default() += 1;
+        if site.kind == "call" {
+            *semantic_call_sites_by_profile
+                .entry(site.profile_id.as_str())
+                .or_default() += 1;
+        }
     }
     for edge in semantic_dependency_edges {
         if edge.site_id.as_deref().is_none_or(|site_id| {
@@ -4122,10 +4318,13 @@ fn validate_web_definition_graph(
             .get(TYPESCRIPT_SEMANTIC_SITE_COUNT_PROPERTY)
             .and_then(Value::as_str)
             .and_then(|value| value.parse::<usize>().ok());
-        let declares_import_type_capability = web_semantic_capability(&profile.properties)
-            .is_ok_and(|capability| {
-                capability == WebSemanticCapability::DefinitionImportTypeGraphV1
-            });
+        let capability = web_semantic_capability(&profile.properties)
+            .expect("Web profiles were validated before graph validation");
+        let declares_import_type_capability = matches!(
+            capability,
+            WebSemanticCapability::DefinitionImportTypeGraphV1
+                | WebSemanticCapability::DefinitionImportTypeCallGraphV1
+        );
         if declares_import_type_capability {
             let declared = semantic_site_count.ok_or_else(|| {
                 format!(
@@ -4144,6 +4343,31 @@ fn validate_web_definition_graph(
         } else if semantic_site_count.is_some() {
             return Err(format!(
                 "Web definition-graph-v1 profile {profile_id:?} must not declare {TYPESCRIPT_SEMANTIC_SITE_COUNT_PROPERTY}"
+            ));
+        }
+        let semantic_call_site_count = profile
+            .properties
+            .get(TYPESCRIPT_SEMANTIC_CALL_SITE_COUNT_PROPERTY)
+            .and_then(Value::as_str)
+            .and_then(|value| value.parse::<usize>().ok());
+        if capability == WebSemanticCapability::DefinitionImportTypeCallGraphV1 {
+            let declared = semantic_call_site_count.ok_or_else(|| {
+                format!(
+                    "Web profile {profile_id:?} omitted or has invalid {TYPESCRIPT_SEMANTIC_CALL_SITE_COUNT_PROPERTY}"
+                )
+            })?;
+            let actual = semantic_call_sites_by_profile
+                .get(profile_id.as_str())
+                .copied()
+                .unwrap_or_default();
+            if declared != actual {
+                return Err(format!(
+                    "Web profile {profile_id:?} reports {TYPESCRIPT_SEMANTIC_CALL_SITE_COUNT_PROPERTY}={declared}, observed {actual}"
+                ));
+            }
+        } else if semantic_call_site_count.is_some() {
+            return Err(format!(
+                "Web profile {profile_id:?} without the call-graph capability must not declare {TYPESCRIPT_SEMANTIC_CALL_SITE_COUNT_PROPERTY}"
             ));
         }
     }
@@ -4168,6 +4392,7 @@ fn parse_events_preserving_prefix(
     let mut web_profiles = BTreeSet::new();
     let mut web_definition_profiles = BTreeSet::new();
     let mut web_import_type_profiles = BTreeSet::new();
+    let mut web_call_profiles = BTreeSet::new();
     let mut web_semantic_node_ids = BTreeSet::new();
     let mut web_semantic_node_candidate_ids = BTreeSet::new();
     let mut web_semantic_endpoint_ids = BTreeSet::new();
@@ -4433,8 +4658,19 @@ fn parse_events_preserving_prefix(
                 web_profiles.insert(declared.profile.id.clone());
                 if web_definition_ready {
                     web_definition_profiles.insert(declared.profile.id.clone());
-                    if web_capability == Some(WebSemanticCapability::DefinitionImportTypeGraphV1) {
+                    if matches!(
+                        web_capability,
+                        Some(
+                            WebSemanticCapability::DefinitionImportTypeGraphV1
+                                | WebSemanticCapability::DefinitionImportTypeCallGraphV1
+                        )
+                    ) {
                         web_import_type_profiles.insert(declared.profile.id.clone());
+                    }
+                    if web_capability
+                        == Some(WebSemanticCapability::DefinitionImportTypeCallGraphV1)
+                    {
+                        web_call_profiles.insert(declared.profile.id.clone());
                     }
                 }
             }
@@ -4504,9 +4740,14 @@ fn parse_events_preserving_prefix(
                             None
                         }
                     } else if is_web_semantic_dependency_edge_kind(&edge.kind) {
-                        if !web_import_type_profiles.contains(&edge.profile_id) {
+                        let authorized = if edge.kind == "calls" {
+                            web_call_profiles.contains(&edge.profile_id)
+                        } else {
+                            web_import_type_profiles.contains(&edge.profile_id)
+                        };
+                        if !authorized {
                             Some(format!(
-                                "Web semantic dependency edge {} is not authorized by a definition-import-type-graph-v1 profile",
+                                "Web semantic dependency edge {} is not authorized by its declared cumulative semantic capability",
                                 edge.id
                             ))
                         } else if edge.site_id.is_none() {
@@ -4537,7 +4778,12 @@ fn parse_events_preserving_prefix(
                             "call" | "type_use" | "rust_use" | "rust_reexport"
                         ) =>
                 {
-                    if web_import_type_profiles.contains(&site.site.profile_id)
+                    let authorized = if site.site.kind == "call" {
+                        web_call_profiles.contains(&site.site.profile_id)
+                    } else {
+                        web_import_type_profiles.contains(&site.site.profile_id)
+                    };
+                    if authorized
                         && is_web_semantic_dependency_site_kind(&site.site.kind)
                         && site
                             .site
@@ -4610,6 +4856,7 @@ fn parse_events_preserving_prefix(
                     &web_profiles,
                     &web_definition_profiles,
                     &web_import_type_profiles,
+                    &web_call_profiles,
                 ) {
                     parse_error = Some(format!(
                         "security policy violation: invalid Web semantic delta: {error}"
@@ -5372,6 +5619,389 @@ mod tests {
         }
         resequence_test_protocol(&mut events);
         serialize_test_protocol(events)
+    }
+
+    fn typescript_call_protocol(root: &Path, gate: &str) -> Result<Vec<u8>> {
+        let mut events =
+            test_protocol_values(typescript_definition_protocol(root, gate, "declares")?)?;
+        let profile_id = "web:default";
+        let profile = events
+            .iter_mut()
+            .find(|event| event["event"] == "profile_declared")
+            .expect("Web profile declaration");
+        let properties = &mut profile["profile"]["properties"];
+        properties[TYPESCRIPT_ANALYSIS_MODE_PROPERTY] =
+            serde_json::json!(TYPESCRIPT_ANALYSIS_MODE_IMPORT_TYPE_CALL_GRAPH);
+        properties[TYPESCRIPT_SEMANTIC_EMISSION_PROPERTY] =
+            serde_json::json!(TYPESCRIPT_SEMANTIC_EMISSION_IMPORT_TYPE_CALL_GRAPH_V1);
+        properties[TYPESCRIPT_TYPECHECKER_STATUS_PROPERTY] =
+            serde_json::json!("definition-import-type-call-graph-emitted");
+        properties[TYPESCRIPT_SEMANTIC_SITE_COUNT_PROPERTY] = serde_json::json!("1");
+        properties[TYPESCRIPT_SEMANTIC_CALL_SITE_COUNT_PROPERTY] = serde_json::json!("1");
+
+        let package = events
+            .iter()
+            .find(|event| event["node"]["kind"] == "package_instance")
+            .expect("package node");
+        let package_id = package["node"]["id"]
+            .as_str()
+            .expect("package ID")
+            .to_owned();
+        let package_locator = package["node"]["properties"]["locator"]
+            .as_str()
+            .expect("package locator")
+            .to_owned();
+        let source_file_id = events
+            .iter()
+            .find(|event| event["node"]["properties"]["path"] == "src/index.ts")
+            .expect("source file")["node"]["id"]
+            .as_str()
+            .expect("source file ID")
+            .to_owned();
+        let target_symbol_id = events
+            .iter()
+            .find(|event| event["node"]["properties"]["symbol_kind"] == "function")
+            .expect("target function")["node"]["id"]
+            .as_str()
+            .expect("target function ID")
+            .to_owned();
+        let initializer_span = serde_json::json!({
+            "start_line":1,
+            "start_column":1,
+            "end_line":1,
+            "end_column":9,
+        });
+        let variable_resolver_identity =
+            format!("{package_locator}::module:src/index.ts#callFixtureVariable");
+        let variable_identity = serde_json::json!({
+            "language":"typescript",
+            "package_locator":package_locator,
+            "symbol_kind":"variable",
+            "identity_kind":"named",
+            "resolver_identity":variable_resolver_identity,
+        });
+        let variable_symbol_id =
+            depgraph_protocol::stable_id_from_value("symbol", &variable_identity);
+        let variable_node = serde_json::json!({
+            "event":"node_upsert",
+            "node":{
+                "id":variable_symbol_id,
+                "kind":"symbol",
+                "locator":format!("typescript-symbol:{variable_symbol_id}"),
+                "display_name":"callFixtureVariable",
+                "properties":{
+                    "language":"typescript",
+                    "package_locator":package_locator,
+                    "package_id":package_id,
+                    "symbol_kind":"variable",
+                    "canonical_identity":variable_identity,
+                    "resolver_identity":variable_resolver_identity,
+                    "profile_id":profile_id,
+                    "source_path":"src/index.ts",
+                    "source_span":initializer_span,
+                },
+            },
+        });
+        let initializer_identity = serde_json::json!({
+            "language":"typescript",
+            "package_locator":package_locator,
+            "symbol_kind":"generated_module_initializer",
+            "identity_kind":"generated",
+            "generated_from":source_file_id,
+            "relative_path":"src/index.ts",
+            "span":initializer_span,
+        });
+        let initializer_id =
+            depgraph_protocol::stable_id_from_value("symbol", &initializer_identity);
+        let initializer_node = serde_json::json!({
+            "event":"node_upsert",
+            "node":{
+                "id":initializer_id,
+                "kind":"symbol",
+                "locator":format!("typescript-symbol:{initializer_id}"),
+                "display_name":"<module initializer>",
+                "properties":{
+                    "language":"typescript",
+                    "package_locator":package_locator,
+                    "package_id":package_id,
+                    "symbol_kind":"generated_module_initializer",
+                    "canonical_identity":initializer_identity,
+                    "profile_id":profile_id,
+                    "source_path":"src/index.ts",
+                    "source_span":initializer_span,
+                    "generated":true,
+                },
+            },
+        });
+        let condition = serde_json::json!({"op":"all","conditions":[]});
+        let definition_evidence = serde_json::json!({
+            "kind":"semantic",
+            "extractor":TYPESCRIPT_SEMANTIC_EXTRACTOR,
+            "extractor_version":TYPESCRIPT_COMPILER_VERSION,
+            "path":"src/index.ts",
+            "start_line":1,
+            "start_column":1,
+            "end_line":1,
+            "end_column":9,
+            "detail":"TypeChecker generated module initializer",
+            "properties":{"profile_id":profile_id},
+        });
+        let declares_id = depgraph_protocol::stable_id_from_value(
+            "edge",
+            &serde_json::json!({
+                "condition":condition,
+                "kind":"declares",
+                "path":"src/index.ts",
+                "profile_id":profile_id,
+                "source":source_file_id,
+                "span":initializer_span,
+                "target":initializer_id,
+            }),
+        );
+        let declares = serde_json::json!({
+            "event":"edge_upsert",
+            "edge":{
+                "id":declares_id,
+                "source":source_file_id,
+                "target":initializer_id,
+                "kind":"declares",
+                "phase":"semantic",
+                "environment":"any",
+                "profile_id":profile_id,
+                "condition":condition,
+                "resolution_status":"resolved",
+                "precision":"exact",
+                "generated":true,
+                "evidence":[definition_evidence],
+            },
+        });
+        let variable_definition_evidence = serde_json::json!({
+            "kind":"semantic",
+            "extractor":TYPESCRIPT_SEMANTIC_EXTRACTOR,
+            "extractor_version":TYPESCRIPT_COMPILER_VERSION,
+            "path":"src/index.ts",
+            "start_line":1,
+            "start_column":1,
+            "end_line":1,
+            "end_column":9,
+            "detail":"TypeChecker variable declaration",
+            "properties":{"profile_id":profile_id},
+        });
+        let variable_declares_id = depgraph_protocol::stable_id_from_value(
+            "edge",
+            &serde_json::json!({
+                "condition":condition,
+                "kind":"declares",
+                "path":"src/index.ts",
+                "profile_id":profile_id,
+                "source":source_file_id,
+                "span":initializer_span,
+                "target":variable_symbol_id,
+            }),
+        );
+        let variable_declares = serde_json::json!({
+            "event":"edge_upsert",
+            "edge":{
+                "id":variable_declares_id,
+                "source":source_file_id,
+                "target":variable_symbol_id,
+                "kind":"declares",
+                "phase":"semantic",
+                "environment":"any",
+                "profile_id":profile_id,
+                "condition":condition,
+                "resolution_status":"resolved",
+                "precision":"exact",
+                "generated":false,
+                "evidence":[variable_definition_evidence],
+            },
+        });
+        let call_evidence = serde_json::json!([{
+            "kind":"semantic",
+            "extractor":TYPESCRIPT_SEMANTIC_EXTRACTOR,
+            "extractor_version":TYPESCRIPT_COMPILER_VERSION,
+            "path":"src/index.ts",
+            "start_line":1,
+            "start_column":1,
+            "end_line":1,
+            "end_column":9,
+            "detail":"TypeChecker resolved-signature direct call occurrence",
+            "properties":{
+                "backend":TYPESCRIPT_SEMANTIC_BACKEND,
+                "compiler_source":"bundled",
+                "compiler_version":TYPESCRIPT_COMPILER_VERSION,
+                "analysis_mode":TYPESCRIPT_ANALYSIS_MODE_IMPORT_TYPE_CALL_GRAPH,
+                "profile_id":profile_id,
+                "project_code_executed":false,
+                "occurrence_kind":"call_expression",
+                "target_basis":"canonical_definition",
+                "call_kind":"function",
+                "dispatch":"direct",
+            },
+        }, {
+            "kind":"source",
+            "extractor":"typescript-native-syntax",
+            "extractor_version":TYPESCRIPT_COMPILER_VERSION,
+            "path":"src/index.ts",
+            "start_line":1,
+            "start_column":1,
+            "end_line":1,
+            "end_column":9,
+            "detail":"syntax call occurrence",
+            "properties":{
+                "profile_id":profile_id,
+                "occurrence_kind":"call_expression",
+            },
+        }]);
+        let call_site_id = depgraph_protocol::stable_id_from_value(
+            "site",
+            &serde_json::json!({
+                "condition":condition,
+                "kind":"call",
+                "path":"src/index.ts",
+                "profile_id":profile_id,
+                "source":initializer_id,
+                "span":initializer_span,
+            }),
+        );
+        let call_edge_id = depgraph_protocol::stable_id_from_value(
+            "edge",
+            &serde_json::json!({
+                "kind":"calls",
+                "site_id":call_site_id,
+                "target":target_symbol_id,
+            }),
+        );
+        let call_site = serde_json::json!({
+            "event":"dependency_site",
+            "site":{
+                "id":call_site_id,
+                "source":initializer_id,
+                "kind":"call",
+                "specifier":"Definition()",
+                "resolution_status":"resolved",
+                "target_ids":[target_symbol_id],
+                "profile_id":profile_id,
+                "condition":condition,
+                "precision":"exact",
+                "evidence":call_evidence,
+            },
+        });
+        let call_edge = serde_json::json!({
+            "event":"edge_upsert",
+            "edge":{
+                "id":call_edge_id,
+                "source":initializer_id,
+                "target":target_symbol_id,
+                "kind":"calls",
+                "site_id":call_site_id,
+                "phase":"semantic",
+                "environment":"any",
+                "profile_id":profile_id,
+                "condition":condition,
+                "resolution_status":"resolved",
+                "precision":"exact",
+                "generated":false,
+                "evidence":call_evidence,
+            },
+        });
+        let completion_index = events
+            .iter()
+            .position(|event| event["event"] == "profile_completed")
+            .expect("profile completion");
+        for item in [
+            initializer_node,
+            declares,
+            variable_node,
+            variable_declares,
+            call_site,
+            call_edge,
+        ]
+        .into_iter()
+        .rev()
+        {
+            events.insert(completion_index, item);
+        }
+        let profile = events
+            .iter_mut()
+            .find(|event| event["event"] == "profile_declared")
+            .expect("Web profile declaration");
+        profile["profile"]["properties"]["typescript_semantic_node_count"] = serde_json::json!("3");
+        profile["profile"]["properties"]["typescript_semantic_relation_count"] =
+            serde_json::json!("4");
+        for event in &mut events {
+            if matches!(
+                event["event"].as_str(),
+                Some("profile_completed" | "scan_completed")
+            ) {
+                event["coverage"]["dependency_sites"] = serde_json::json!(1);
+                event["coverage"]["resolved"] = serde_json::json!(1);
+            }
+            event["protocol_version"] = serde_json::json!("1.0");
+            event["scan_id"] = serde_json::json!("typescript-gate-scan");
+            event["adapter"] = serde_json::json!("web");
+            event["adapter_version"] = serde_json::json!(env!("CARGO_PKG_VERSION"));
+        }
+        resequence_test_protocol(&mut events);
+        serialize_test_protocol(events)
+    }
+
+    fn recanonicalize_typescript_call(events: &mut [Value]) {
+        let site_index = events
+            .iter()
+            .position(|event| {
+                event["event"] == "dependency_site" && event["site"]["kind"] == "call"
+            })
+            .expect("call site");
+        let source = events[site_index]["site"]["source"]
+            .as_str()
+            .expect("call source")
+            .to_owned();
+        let target = events[site_index]["site"]["target_ids"][0]
+            .as_str()
+            .expect("call target")
+            .to_owned();
+        let profile_id = events[site_index]["site"]["profile_id"]
+            .as_str()
+            .expect("call profile")
+            .to_owned();
+        let condition = events[site_index]["site"]["condition"].clone();
+        let primary = &events[site_index]["site"]["evidence"][0];
+        let path = primary["path"].as_str().expect("call evidence path");
+        let span = serde_json::json!({
+            "start_line":primary["start_line"],
+            "start_column":primary["start_column"],
+            "end_line":primary["end_line"],
+            "end_column":primary["end_column"],
+        });
+        let site_id = depgraph_protocol::stable_id_from_value(
+            "site",
+            &serde_json::json!({
+                "condition":condition,
+                "kind":"call",
+                "path":path,
+                "profile_id":profile_id,
+                "source":source,
+                "span":span,
+            }),
+        );
+        events[site_index]["site"]["id"] = serde_json::json!(site_id);
+
+        let edge = events
+            .iter_mut()
+            .find(|event| event["event"] == "edge_upsert" && event["edge"]["kind"] == "calls")
+            .expect("calls edge");
+        edge["edge"]["source"] = serde_json::json!(source);
+        edge["edge"]["target"] = serde_json::json!(target);
+        edge["edge"]["site_id"] = serde_json::json!(site_id);
+        edge["edge"]["id"] = serde_json::json!(depgraph_protocol::stable_id_from_value(
+            "edge",
+            &serde_json::json!({
+                "kind":"calls",
+                "site_id":site_id,
+                "target":target,
+            }),
+        ));
     }
 
     fn test_protocol_values(output: Vec<u8>) -> Result<Vec<Value>> {
@@ -6808,6 +7438,189 @@ mod tests {
         );
         assert_eq!(parsed.error, None, "discarded profile: {:?}", parsed.error);
         assert!(!parsed.security_violation);
+        Ok(())
+    }
+
+    #[test]
+    fn web_call_capability_accepts_generated_initializer_and_exact_direct_call() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let root = root.path().canonicalize()?;
+        for (gate, release_attested) in [
+            (TYPESCRIPT_RELEASE_GATE_PENDING, false),
+            (TYPESCRIPT_RELEASE_GATE_VERIFIED, true),
+        ] {
+            let parsed = parse_events_preserving_prefix(
+                &typescript_call_protocol(&root, gate)?,
+                "typescript-gate-scan",
+                "web",
+                &root,
+                64 * 1024,
+                Some(env!("CARGO_PKG_VERSION")),
+                Some(release_attested),
+            );
+            assert_eq!(parsed.error, None, "gate={gate:?}");
+            assert_eq!(parsed.failure_kind, None, "gate={gate:?}");
+            assert!(!parsed.security_violation, "gate={gate:?}");
+            assert!(parsed.events.iter().any(|event| {
+                event["event"] == "node_upsert"
+                    && event["node"]["properties"]["symbol_kind"] == "generated_module_initializer"
+                    && event["node"]["properties"]["canonical_identity"]["identity_kind"]
+                        == "generated"
+            }));
+            assert!(parsed.events.iter().any(|event| {
+                event["event"] == "dependency_site"
+                    && event["site"]["kind"] == "call"
+                    && event["site"]["resolution_status"] == "resolved"
+                    && event["site"]["precision"] == "exact"
+            }));
+            assert!(parsed.events.iter().any(|event| {
+                event["event"] == "edge_upsert"
+                    && event["edge"]["kind"] == "calls"
+                    && event["edge"]["phase"] == "semantic"
+            }));
+            assert!(!parsed.events.iter().any(|event| {
+                event["edge"]["kind"] == "may_call"
+                    || event["coverage"]["completeness"]
+                        .as_array()
+                        .is_some_and(|values| {
+                            values.iter().any(|value| value == "semantic-complete")
+                        })
+            }));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn web_call_capability_rejects_candidate_calls() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let root = root.path().canonicalize()?;
+        let mut events = test_protocol_values(typescript_call_protocol(
+            &root,
+            TYPESCRIPT_RELEASE_GATE_PENDING,
+        )?)?;
+        for event in &mut events {
+            if event["event"] == "dependency_site" && event["site"]["kind"] == "call" {
+                event["site"]["resolution_status"] = serde_json::json!("candidates");
+                event["site"]["precision"] = serde_json::json!("overapprox");
+            } else if event["event"] == "edge_upsert" && event["edge"]["kind"] == "calls" {
+                event["edge"]["resolution_status"] = serde_json::json!("candidates");
+                event["edge"]["precision"] = serde_json::json!("overapprox");
+            }
+            if matches!(
+                event["event"].as_str(),
+                Some("profile_completed" | "scan_completed")
+            ) {
+                event["coverage"]["resolved"] = serde_json::json!(0);
+                event["coverage"]["candidates"] = serde_json::json!(1);
+            }
+        }
+        let parsed = parse_events_preserving_prefix(
+            &serialize_test_protocol(events)?,
+            "typescript-gate-scan",
+            "web",
+            &root,
+            64 * 1024,
+            Some(env!("CARGO_PKG_VERSION")),
+            Some(false),
+        );
+        assert_eq!(
+            parsed.failure_kind,
+            Some(WorkerFailureKind::MalformedProtocol)
+        );
+        assert!(parsed.security_violation, "{:?}", parsed.error);
+        assert!(parsed.error.as_deref().is_some_and(|error| {
+            error.contains("cannot use candidates") || error.contains("direct calls edge")
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn web_call_capability_rejects_non_callable_symbol_source() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let root = root.path().canonicalize()?;
+        let mut events = test_protocol_values(typescript_call_protocol(
+            &root,
+            TYPESCRIPT_RELEASE_GATE_PENDING,
+        )?)?;
+        let variable_id = events
+            .iter()
+            .find(|event| {
+                event["event"] == "node_upsert"
+                    && event["node"]["properties"]["symbol_kind"] == "variable"
+            })
+            .expect("variable symbol")["node"]["id"]
+            .as_str()
+            .expect("variable symbol ID")
+            .to_owned();
+        let call_site = events
+            .iter_mut()
+            .find(|event| event["event"] == "dependency_site" && event["site"]["kind"] == "call")
+            .expect("call site");
+        call_site["site"]["source"] = serde_json::json!(variable_id);
+        recanonicalize_typescript_call(&mut events);
+
+        let parsed = parse_events_preserving_prefix(
+            &serialize_test_protocol(events)?,
+            "typescript-gate-scan",
+            "web",
+            &root,
+            64 * 1024,
+            Some(env!("CARGO_PKG_VERSION")),
+            Some(false),
+        );
+        assert_eq!(
+            parsed.failure_kind,
+            Some(WorkerFailureKind::MalformedProtocol)
+        );
+        assert!(parsed.security_violation, "{:?}", parsed.error);
+        assert!(parsed.error.as_deref().is_some_and(|error| {
+            error.contains("source") && error.contains("callable symbol")
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn web_call_capability_rejects_non_callable_symbol_target() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let root = root.path().canonicalize()?;
+        let mut events = test_protocol_values(typescript_call_protocol(
+            &root,
+            TYPESCRIPT_RELEASE_GATE_PENDING,
+        )?)?;
+        let variable_id = events
+            .iter()
+            .find(|event| {
+                event["event"] == "node_upsert"
+                    && event["node"]["properties"]["symbol_kind"] == "variable"
+            })
+            .expect("variable symbol")["node"]["id"]
+            .as_str()
+            .expect("variable symbol ID")
+            .to_owned();
+        let call_site = events
+            .iter_mut()
+            .find(|event| event["event"] == "dependency_site" && event["site"]["kind"] == "call")
+            .expect("call site");
+        call_site["site"]["target_ids"] = serde_json::json!([variable_id]);
+        recanonicalize_typescript_call(&mut events);
+
+        let parsed = parse_events_preserving_prefix(
+            &serialize_test_protocol(events)?,
+            "typescript-gate-scan",
+            "web",
+            &root,
+            64 * 1024,
+            Some(env!("CARGO_PKG_VERSION")),
+            Some(false),
+        );
+        assert_eq!(
+            parsed.failure_kind,
+            Some(WorkerFailureKind::MalformedProtocol)
+        );
+        assert!(parsed.security_violation, "{:?}", parsed.error);
+        assert!(parsed.error.as_deref().is_some_and(|error| {
+            error.contains("resolved target") && error.contains("canonical callable symbol")
+        }));
         Ok(())
     }
 

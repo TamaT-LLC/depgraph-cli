@@ -22,6 +22,7 @@ import {
   validateTypeScriptRawDefinitionDelta,
 } from "../src/typescript-semantic";
 import {
+  callValidationSpans,
   extractTypeScriptRawDependencyDelta,
   importTypeModuleValidationSpans,
   moduleCallValidationSpans,
@@ -225,6 +226,12 @@ async function extractDependencyFixture(
             dependencyValidationQueryBudget,
           )
           : [],
+        callSpans: await callValidationSpans(
+          project.checker,
+          source.sourceFile,
+          dependencyValidationQueryBudget,
+          source.syntacticallyValid,
+        ),
       });
     }
     return { definitions, dependencies, dependencyValidationSources };
@@ -1082,6 +1089,417 @@ export const View = () => <section>{props.value}</section>;
     && site.status === "unresolved"
     && site.targets[0]?.kind === "unknown"
   )), JSON.stringify(shadowedNamespaces));
+});
+
+test("exact direct-call ledger distinguishes closed dispatch from dynamic and external calls", async () => {
+  const sources = {
+    "src/defs.ts": `
+export function direct(): void {}
+export function tag(parts: TemplateStringsArray): void { void parts }
+export class Box {
+  constructor() {}
+  static create(): void {}
+  static staticTag(parts: TemplateStringsArray): void { void parts }
+  #hidden(): void {}
+  open(): void {}
+  openTag(parts: TemplateStringsArray): void { void parts }
+  invokePrivate(): void { this.#hidden() }
+  invokeOpen(): void { this.open() }
+}
+export class DerivedBox extends Box { constructor() { super() } }
+`,
+    "src/main.ts": `
+import { direct as alias, tag, Box } from "./defs";
+import { externalFn, ExternalClass } from "@fixture/external";
+alias();
+new Box();
+Box.create();
+new Box().open();
+Box.staticTag\`value\`;
+new Box().openTag\`value\`;
+const box = new Box();
+box.openTag\`value\`;
+tag\`value\`;
+const functionValue = alias;
+functionValue();
+const ConstructorValue = Box;
+new ConstructorValue();
+const StaticValue = Box;
+StaticValue.create();
+StaticValue.staticTag\`value\`;
+new ConstructorValue().open();
+new ConstructorValue().openTag\`value\`;
+interface Contract { run(): void }
+declare const contract: Contract;
+contract.run();
+declare const optionalCall: (() => void) | undefined;
+optionalCall?.();
+declare const unionCall: (() => void) | ((value: string) => void);
+unionCall();
+declare const intersectionCall: (() => void) & { readonly marker: true };
+intersectionCall();
+function overloaded(value: string): void;
+function overloaded(value: number): void;
+function overloaded(value: string | number): void { void value }
+overloaded("value");
+externalFn();
+new ExternalClass();
+`,
+    "src/legacy.js": `
+export function Legacy() {}
+new Legacy();
+`,
+  };
+  const first = await extractDependencyFixture(sources, "__depgraph_ts_call_complete_a__");
+  const second = await extractDependencyFixture(sources, "__depgraph_ts_call_complete_z__");
+  assert.deepEqual(first.dependencies, second.dependencies);
+  assert.deepEqual(first.dependencies.issues, []);
+  assert.doesNotThrow(() => validateTypeScriptRawDependencyDelta(
+    first.dependencies,
+    first.definitions,
+    first.dependencyValidationSources,
+  ));
+
+  const calls = first.dependencies.calls;
+  const definitions = new Map(first.definitions.definitions.map((definition) => [definition.key, definition]));
+  const bySpecifier = (specifier: string) => calls.filter((call) => call.specifier === specifier);
+  const targetKind = (call: (typeof calls)[number]): string | null => {
+    const target = call.targets[0];
+    return target?.kind === "definition" ? definitions.get(target.key)?.semanticKind ?? null : target?.kind ?? null;
+  };
+  const assertResolved = (
+    specifier: string,
+    dispatch: (typeof calls)[number]["dispatch"],
+    semanticKind: string,
+  ): void => {
+    const call = bySpecifier(specifier).find((candidate) => candidate.dispatch === dispatch);
+    assert.ok(call, `${specifier}/${dispatch}`);
+    assert.equal(call.status, "resolved");
+    assert.equal(call.precision, "exact");
+    assert.equal(call.reason, null);
+    assert.equal(targetKind(call), semanticKind);
+  };
+  assertResolved("alias", "direct", "function");
+  assertResolved("Box", "direct", "constructor");
+  assertResolved("Box.create", "static", "method");
+  assertResolved("new Box().open", "fresh_instance", "method");
+  assertResolved("Box.staticTag", "static", "method");
+  assertResolved("new Box().openTag", "fresh_instance", "method");
+  assertResolved("tag", "direct", "function");
+  assertResolved("Legacy", "direct", "function");
+  assertResolved("this.#hidden", "private", "method");
+  assertResolved("super", "super", "constructor");
+
+  for (const [specifier, reason] of [
+    ["functionValue", "function_value_dispatch"],
+    ["ConstructorValue", "function_value_dispatch"],
+    ["StaticValue.create", "function_value_dispatch"],
+    ["StaticValue.staticTag", "function_value_dispatch"],
+    ["new ConstructorValue().open", "function_value_dispatch"],
+    ["new ConstructorValue().openTag", "function_value_dispatch"],
+    ["contract.run", "interface_dispatch"],
+    ["optionalCall", "union_dispatch"],
+    ["unionCall", "union_dispatch"],
+    ["intersectionCall", "intersection_dispatch"],
+    ["overloaded", "overload_dispatch"],
+    ["this.open", "open_method_dispatch"],
+    ["box.openTag", "open_method_dispatch"],
+  ] as const) {
+    const call = bySpecifier(specifier)[0];
+    assert.ok(call, specifier);
+    assert.equal(call.status, "unresolved", specifier);
+    assert.equal(call.precision, "heuristic", specifier);
+    assert.equal(call.targets[0]?.kind, "unknown", specifier);
+    assert.equal(call.reason, reason, specifier);
+  }
+  assert.equal(bySpecifier("Box.staticTag")[0]?.callKind, "tagged_template");
+  assert.equal(bySpecifier("new Box().openTag")[0]?.callKind, "tagged_template");
+  assert.equal(bySpecifier("box.openTag")[0]?.callKind, "tagged_template");
+  assert.equal(bySpecifier("StaticValue.staticTag")[0]?.callKind, "tagged_template");
+  assert.equal(bySpecifier("new ConstructorValue().openTag")[0]?.callKind, "tagged_template");
+  assert.equal(bySpecifier("Legacy")[0]?.callKind, "constructor");
+  const externalFunction = bySpecifier("externalFn")[0];
+  assert.equal(externalFunction?.status, "external");
+  assert.equal(externalFunction?.precision, "heuristic");
+  assert.equal(externalFunction?.dispatch, "external");
+  const externalConstructor = bySpecifier("ExternalClass")[0];
+  assert.equal(externalConstructor?.callKind, "constructor");
+  assert.equal(externalConstructor?.status, "external");
+  assert.equal(externalConstructor?.dispatch, "external");
+  assert.ok(calls.every((call) => call.status !== ("candidates" as typeof call.status)));
+  assert.ok(calls.filter((call) => call.evidence.relativePath === "src/main.ts").every((call) => (
+    call.source.kind === "module_initializer"
+  )));
+  assert.ok(bySpecifier("this.#hidden").every((call) => call.source.kind === "definition"));
+});
+
+test("call ledger fails closed when a class field has no canonical callable owner", async () => {
+  const fixture = await extractDependencyFixture({
+    "src/main.ts": `
+export function target(): number { return 1 }
+export class FieldOwner {
+  readonly value = target();
+  static readonly staticValue = target();
+}
+const topLevelValue = target();
+void topLevelValue;
+`,
+  }, "__depgraph_ts_call_field_owner__");
+  assert.deepEqual(fixture.dependencies.issues, []);
+  assert.doesNotThrow(() => validateTypeScriptRawDependencyDelta(
+    fixture.dependencies,
+    fixture.definitions,
+    fixture.dependencyValidationSources,
+  ));
+  const targetCalls = fixture.dependencies.calls.filter((call) => call.specifier === "target");
+  assert.equal(targetCalls.length, 3, JSON.stringify(targetCalls));
+  const unresolved = targetCalls.filter((call) => call.reason === "caller_definition_unavailable");
+  assert.equal(unresolved.length, 2, JSON.stringify(targetCalls));
+  assert.ok(unresolved.every((call) => (
+    call.status === "unresolved"
+    && call.precision === "heuristic"
+    && call.dispatch === "dynamic"
+    && call.targets[0]?.kind === "unknown"
+  )), JSON.stringify(unresolved));
+  const topLevel = targetCalls.find((call) => call.status === "resolved");
+  assert.ok(topLevel, JSON.stringify(targetCalls));
+  assert.equal(topLevel.precision, "exact");
+  assert.equal(topLevel.dispatch, "direct");
+  assert.equal(topLevel.source.kind, "module_initializer");
+});
+
+test("call ledger does not attribute decorators or unrepresented callable bodies to an outer caller", async () => {
+  const fixture = await extractDependencyFixture({
+    "src/main.ts": `
+export function target(): string { return "" }
+function decorate(value: unknown): unknown { return value }
+class Decorated {
+  @decorate(target())
+  method(@decorate(target()) value = target()): void { target(); void value }
+}
+const object = {
+  [target()](): string { return target() },
+  get value(): string { return target() },
+  set value(value: string) { target(); void value },
+  regular(): string { return target() },
+};
+void object;
+`,
+  }, "__depgraph_ts_call_execution_owner__");
+  assert.doesNotThrow(() => validateTypeScriptRawDependencyDelta(
+    fixture.dependencies,
+    fixture.definitions,
+    fixture.dependencyValidationSources,
+  ));
+  const definitions = new Map(fixture.definitions.definitions.map((definition) => [definition.key, definition]));
+  const calls = fixture.dependencies.calls.filter((call) => call.specifier === "target");
+  const unresolved = calls.filter((call) => call.reason === "caller_definition_unavailable");
+  assert.equal(unresolved.length, 5, JSON.stringify(calls));
+  assert.ok(unresolved.every((call) => (
+    call.status === "unresolved"
+    && call.dispatch === "dynamic"
+    && call.source.kind === "module_initializer"
+  )), JSON.stringify(unresolved));
+  const methodCalls = calls.filter((call) => (
+    call.status === "resolved"
+    && call.source.kind === "definition"
+    && definitions.get(call.source.key)?.displayName === "method"
+  ));
+  assert.equal(methodCalls.length, 2, JSON.stringify(calls));
+  const moduleCalls = calls.filter((call) => call.status === "resolved" && call.source.kind === "module_initializer");
+  assert.equal(moduleCalls.length, 1, JSON.stringify(calls));
+  const regularCall = calls.find((call) => (
+    call.status === "resolved"
+    && call.source.kind === "definition"
+    && definitions.get(call.source.key)?.displayName === "regular"
+  ));
+  assert.ok(regularCall, JSON.stringify(calls));
+});
+
+test("call ledger fails closed for class-expression fields and static blocks", async () => {
+  const fixture = await extractDependencyFixture({
+    "src/main.ts": `
+function target(): string { return "" }
+const ExpressionOwner = class {
+  readonly field = target();
+  static readonly staticField = target();
+  static { target() }
+  method(): string { return target() }
+  readonly nested = (): string => target();
+};
+void ExpressionOwner;
+`,
+  }, "__depgraph_ts_call_class_expression_owner__");
+  assert.doesNotThrow(() => validateTypeScriptRawDependencyDelta(
+    fixture.dependencies,
+    fixture.definitions,
+    fixture.dependencyValidationSources,
+  ));
+  const definitions = new Map(fixture.definitions.definitions.map((definition) => [definition.key, definition]));
+  const calls = fixture.dependencies.calls.filter((call) => call.specifier === "target");
+  assert.equal(calls.length, 5, JSON.stringify(calls));
+  const unresolved = calls.filter((call) => call.reason === "caller_definition_unavailable");
+  assert.equal(unresolved.length, 3, JSON.stringify(calls));
+  assert.ok(unresolved.every((call) => call.status === "unresolved" && call.dispatch === "dynamic"));
+  const resolved = calls.filter((call) => call.status === "resolved" && call.source.kind === "definition");
+  assert.equal(resolved.length, 2, JSON.stringify(calls));
+  assert.ok(resolved.every((call) => (
+    call.source.kind === "definition"
+    && ["anonymous_function", "method"].includes(definitions.get(call.source.key)?.semanticKind ?? "")
+  )), JSON.stringify(calls));
+});
+
+test("nested object and class-expression callables do not inherit a containing class member identity", async () => {
+  const objectFixture = await extractDependencyFixture({
+    "src/main.ts": `
+function target(): void {}
+class Host {
+  nestedMethod(): void { target() }
+  holder = { nestedMethod(): void { target() } };
+}
+void Host;
+`,
+  }, "__depgraph_ts_nested_object_callable_owner__");
+  assert.ok(!objectFixture.definitions.issues.some((issue) => issue.fatal), JSON.stringify(objectFixture.definitions.issues));
+  assert.ok(!objectFixture.dependencies.issues.some((issue) => issue.fatal), JSON.stringify(objectFixture.dependencies.issues));
+  assert.doesNotThrow(() => validateTypeScriptRawDependencyDelta(
+    objectFixture.dependencies,
+    objectFixture.definitions,
+    objectFixture.dependencyValidationSources,
+  ));
+  const objectDefinitions = new Map(objectFixture.definitions.definitions.map((definition) => [definition.key, definition]));
+  const objectCalls = objectFixture.dependencies.calls.filter((call) => call.specifier === "target");
+  assert.equal(objectCalls.length, 2, JSON.stringify(objectCalls));
+  assert.ok(objectCalls.every((call) => call.status === "resolved" && call.source.kind === "definition"));
+  assert.equal(new Set(objectCalls.map((call) => call.source.kind === "definition" ? call.source.key : "")).size, 2);
+  assert.deepEqual(new Set(objectCalls.map((call) => (
+    call.source.kind === "definition" ? objectDefinitions.get(call.source.key)?.semanticKind : null
+  ))), new Set(["method", "anonymous_function"]));
+
+  const classFixture = await extractDependencyFixture({
+    "src/main.ts": `
+function target(): void {}
+class Host {
+  constructor() {}
+  holder = class { constructor() { target() } };
+}
+void Host;
+`,
+  }, "__depgraph_ts_nested_class_callable_owner__");
+  assert.ok(!classFixture.definitions.issues.some((issue) => issue.fatal), JSON.stringify(classFixture.definitions.issues));
+  assert.ok(!classFixture.dependencies.issues.some((issue) => issue.fatal), JSON.stringify(classFixture.dependencies.issues));
+  const host = classFixture.definitions.definitions.find((definition) => (
+    definition.graphKind === "type" && definition.semanticKind === "class" && definition.displayName === "Host"
+  ));
+  assert.ok(host);
+  const outerConstructor = classFixture.definitions.definitions.find((definition) => (
+    definition.semanticKind === "constructor"
+    && definition.owner.kind === "definition"
+    && definition.owner.key === host.key
+  ));
+  assert.ok(outerConstructor);
+  const innerCall = classFixture.dependencies.calls.find((call) => call.specifier === "target");
+  assert.ok(innerCall, JSON.stringify(classFixture.dependencies.calls));
+  assert.equal(innerCall.status, "unresolved");
+  assert.equal(innerCall.reason, "caller_definition_unavailable");
+  assert.equal(innerCall.dispatch, "dynamic");
+  assert.notEqual(innerCall.source.kind === "definition" ? innerCall.source.key : null, outerConstructor.key);
+});
+
+test("nested type-literal method signatures do not inherit a containing type identity", async () => {
+  const sources = {
+    "src/main.ts": `
+class Host {
+  nestedMethod(): void {}
+  holder!: { nestedMethod(): void };
+}
+interface Contract { direct(): void }
+type Alias = { directAlias(): void };
+void Host;
+`,
+  };
+  const delta = await extractFixture(sources, "__depgraph_ts_nested_type_literal_method_owner__");
+  assert.ok(!delta.issues.some((issue) => issue.fatal), JSON.stringify(delta.issues));
+  assert.doesNotThrow(() => validateTypeScriptRawDefinitionDelta(
+    delta,
+    validationSources(sources),
+  ));
+  const host = delta.definitions.find((definition) => definition.displayName === "Host");
+  const contract = delta.definitions.find((definition) => definition.displayName === "Contract");
+  const alias = delta.definitions.find((definition) => definition.displayName === "Alias");
+  assert.ok(host);
+  assert.ok(contract);
+  assert.ok(alias);
+  const methods = delta.definitions.filter((definition) => definition.semanticKind === "method");
+  assert.ok(methods.some((definition) => (
+    definition.displayName === "nestedMethod"
+    && definition.owner.kind === "definition"
+    && definition.owner.key === host.key
+  )), JSON.stringify(methods));
+  assert.ok(methods.some((definition) => (
+    definition.displayName === "direct"
+    && definition.owner.kind === "definition"
+    && definition.owner.key === contract.key
+  )), JSON.stringify(methods));
+  assert.ok(methods.some((definition) => (
+    definition.displayName === "directAlias"
+    && definition.owner.kind === "definition"
+    && definition.owner.key === alias.key
+  )), JSON.stringify(methods));
+  const nestedSignature = delta.definitions.find((definition) => (
+    definition.displayName === "nestedMethod"
+    && definition.owner.kind === "file"
+  ));
+  assert.ok(nestedSignature, JSON.stringify(delta.definitions));
+  assert.equal(nestedSignature.semanticKind, "anonymous_function");
+  assert.equal(nestedSignature.identityKind, "anonymous");
+  assert.equal(nestedSignature.resolverIdentity, null);
+});
+
+test("raw call validator rejects singleton candidates and coordinated call mutations", async () => {
+  const fixture = await extractDependencyFixture({
+    "src/main.ts": "export function target(): void {}\nexport const holder = 1;\ntarget();\n",
+  }, "__depgraph_ts_call_validation__");
+  assert.equal(fixture.dependencies.calls.length, 1);
+  const reject = (mutate: (delta: TypeScriptRawDependencyDelta) => void, pattern: RegExp): void => {
+    const delta = structuredClone(fixture.dependencies);
+    mutate(delta);
+    assert.throws(() => validateTypeScriptRawDependencyDelta(
+      delta,
+      fixture.definitions,
+      fixture.dependencyValidationSources,
+    ), pattern);
+  };
+  reject((delta) => {
+    const call = delta.calls[0]! as unknown as Record<string, unknown>;
+    call.status = "candidates";
+    call.precision = "overapprox";
+  }, /call status\/precision\/target contract/u);
+  reject((delta) => {
+    delta.calls[0]!.dispatch = "open";
+  }, /call status\/precision\/target contract/u);
+  reject((delta) => {
+    (delta.calls[0]! as unknown as { source: unknown }).source = { kind: "file", relativePath: "src/main.ts" };
+  }, /call source kind/u);
+  reject((delta) => {
+    const variable = fixture.definitions.definitions.find((definition) => definition.semanticKind === "variable");
+    assert.ok(variable);
+    const call = delta.calls[0]!;
+    call.source = { kind: "definition", key: variable.key };
+    call.key = `site:${JSON.stringify([
+      call.source,
+      "call",
+      call.evidence.relativePath,
+      call.evidence.startOffset,
+      call.evidence.endOffset,
+    ])}`;
+  }, /caller is not a canonical symbol definition/u);
+  reject((delta) => {
+    delta.calls[0]!.targetConditions[0] = { op: "eq", key: "mode", value: "test" };
+  }, /call site and target conditions disagree/u);
+  reject((delta) => {
+    delta.calls = [];
+  }, /call occurrence is missing/u);
 });
 
 test("import-equals and export-equals retain canonical type proof without resolving a bare namespace type", async () => {
@@ -2437,6 +2855,16 @@ test("dependency collector recovers safe unresolved sites from broken source wit
     && site.targets.length === 1
     && site.targets[0]?.kind === "unknown"
   )));
+  assert.ok(dependencies.calls.length > 0);
+  assert.ok(dependencies.calls.every((call) => (
+    call.status === "unresolved"
+    && call.precision === "heuristic"
+    && call.reason === "syntax_invalid"
+    && call.dispatch === "dynamic"
+    && call.targets.length === 1
+    && call.targets[0]?.kind === "unknown"
+    && call.source.kind === "module_initializer"
+  )));
 });
 
 test("broken local re-export recovery keeps import aliases scoped to their nearest namespace", async () => {
@@ -2949,8 +3377,8 @@ test("raw dependency source attestation rejects coordinated phase, re-export, mo
 
 test("dependency extraction atomically discards partial sites on TypeChecker batch or correlation spoof", async () => {
   const sources = {
-    "src/a.ts": "export interface A { readonly value: string }\n",
-    "src/b.ts": 'import type { A } from "./a";\ninterface B { readonly item: A }\n',
+    "src/a.ts": "export interface A { readonly value: string }\nexport function target(): void {}\n",
+    "src/b.ts": 'import type { A } from "./a";\nimport { target } from "./a";\ninterface B { readonly item: A }\ntarget();\n',
   };
   const cases: Array<{ name: string; transform: (checker: Checker) => Checker; message: RegExp }> = [
     {
@@ -2982,6 +3410,7 @@ test("dependency extraction atomically discards partial sites on TypeChecker bat
       fixtureCase.transform,
     );
     assert.deepEqual(dependencies.sites, [], fixtureCase.name);
+    assert.deepEqual(dependencies.calls, [], fixtureCase.name);
     assert.equal(dependencies.issues.length, 1, fixtureCase.name);
     assert.equal(dependencies.issues[0]?.fatal, true, fixtureCase.name);
     assert.match(dependencies.issues[0]?.message ?? "", fixtureCase.message, fixtureCase.name);

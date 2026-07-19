@@ -21,11 +21,13 @@ import {
   type TypeScriptRawDefinitionDelta,
 } from "./typescript-semantic";
 import {
+  callValidationSpans,
   extractTypeScriptRawDependencyDelta,
   importTypeModuleValidationSpans,
   moduleCallValidationSpans,
   nonLiteralModuleValidationSpans,
   typeUseValidationSpans,
+  type TypeScriptCallValidationSpan,
   type TypeScriptModuleCallValidationSpan,
   type TypeScriptNonLiteralModuleValidationSpan,
   type TypeScriptRawDependencyDelta,
@@ -45,10 +47,10 @@ export const TYPESCRIPT_COMPILER_PROFILE_PROPERTIES = Object.freeze({
   typescript_compiler_version: TYPESCRIPT_COMPILER_VERSION,
   typescript_compiler_selection: "bundled-only",
   typescript_compiler_fallback: "fail-closed",
-  typescript_analysis_mode: "semantic-import-type-graph",
+  typescript_analysis_mode: "semantic-import-type-call-graph",
   typescript_project_local_policy: "metadata-only",
   typescript_project_local_loaded: "false",
-  typescript_typechecker_status: "definition-import-type-graph-emitted",
+  typescript_typechecker_status: "definition-import-type-call-graph-emitted",
   typescript_project_model_status: "ready",
   typescript_project_config: "worker-neutral-allowlist",
   typescript_module_resolution: "inventory-only",
@@ -57,7 +59,7 @@ export const TYPESCRIPT_COMPILER_PROFILE_PROPERTIES = Object.freeze({
     ? "core-attested-whole-tree"
     : "build-produced-pending-core-attestation",
   typescript_release_gate: TYPESCRIPT_RELEASE_GATE,
-  typescript_semantic_graph_emission: "definition-import-type-graph-v1",
+  typescript_semantic_graph_emission: "definition-import-type-call-graph-v1",
   typescript_compiler_processes: "1",
   typescript_project_filesystem: "isolated-virtual",
 } as const);
@@ -123,6 +125,7 @@ export class TypeScriptProjectAnalysis extends Map<string, TypeScriptSyntaxDiagn
   readonly moduleCallSpans = new Map<string, TypeScriptModuleCallValidationSpan[]>();
   readonly nonLiteralModuleSpans = new Map<string, TypeScriptNonLiteralModuleValidationSpan[]>();
   readonly typeUseSpans = new Map<string, TypeScriptTypeUseValidationSpan[]>();
+  readonly callSpans = new Map<string, TypeScriptCallValidationSpan[]>();
   readonly semanticDiagnostics: TypeScriptSemanticDiagnostic[] = [];
   definitionGraph: TypeScriptRawDefinitionDelta = {
     definitions: [],
@@ -132,6 +135,7 @@ export class TypeScriptProjectAnalysis extends Map<string, TypeScriptSyntaxDiagn
   };
   dependencyGraph: TypeScriptRawDependencyDelta = {
     sites: [],
+    calls: [],
     moduleExports: [],
     issues: [],
     typeCheckerQueries: 0,
@@ -150,6 +154,7 @@ export class TypeScriptProjectAnalysis extends Map<string, TypeScriptSyntaxDiagn
     semanticNodes: 0,
     semanticRelations: 0,
     semanticSites: 0,
+    semanticCallSites: 0,
     semanticIssues: 0,
   };
 }
@@ -698,6 +703,7 @@ async function analyzeTypeScriptProjectInner(
     result.moduleCallSpans.set(portable, []);
     result.nonLiteralModuleSpans.set(portable, []);
     result.typeUseSpans.set(portable, []);
+    result.callSpans.set(portable, []);
   }
   const internalRoot = path.join(VIRTUAL_ROOT, "__depgraph_empty_project__.d.ts");
   if (configFiles.length === 0) {
@@ -780,6 +786,7 @@ async function analyzeTypeScriptProjectInner(
         result.nonLiteralModuleSpans.set(relativePath, []);
         result.moduleCallSpans.set(relativePath, []);
         result.typeUseSpans.set(relativePath, []);
+        result.callSpans.set(relativePath, []);
         // The definition slice needs every inventory AST. Import-type ranges
         // remain an independent lexical refinement and can avoid traversing a
         // second time when the source has no possible import token.
@@ -825,16 +832,26 @@ async function analyzeTypeScriptProjectInner(
       }
       for (const [relativePath, sourceFile] of [...sourceFiles.entries()]
         .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)) {
-        if (syntacticallyInvalidPaths.has(relativePath)) continue;
-        result.importTypeModuleSpans.set(relativePath, importTypeModuleValidationSpans(sourceFile));
-        result.nonLiteralModuleSpans.set(relativePath, nonLiteralModuleValidationSpans(sourceFile));
-        result.moduleCallSpans.set(
+        if (!syntacticallyInvalidPaths.has(relativePath)) {
+          result.importTypeModuleSpans.set(relativePath, importTypeModuleValidationSpans(sourceFile));
+          result.nonLiteralModuleSpans.set(relativePath, nonLiteralModuleValidationSpans(sourceFile));
+          result.moduleCallSpans.set(
+            relativePath,
+            await moduleCallValidationSpans(project.checker, sourceFile, dependencyValidationQueryBudget),
+          );
+          result.typeUseSpans.set(
+            relativePath,
+            await typeUseValidationSpans(project.checker, sourceFile, dependencyValidationQueryBudget),
+          );
+        }
+        result.callSpans.set(
           relativePath,
-          await moduleCallValidationSpans(project.checker, sourceFile, dependencyValidationQueryBudget),
-        );
-        result.typeUseSpans.set(
-          relativePath,
-          await typeUseValidationSpans(project.checker, sourceFile, dependencyValidationQueryBudget),
+          await callValidationSpans(
+            project.checker,
+            sourceFile,
+            dependencyValidationQueryBudget,
+            !syntacticallyInvalidPaths.has(relativePath),
+          ),
         );
       }
       const intrinsicString = await project.checker.getStringType();
@@ -902,7 +919,8 @@ async function analyzeTypeScriptProjectInner(
         definitionGraphStatus: [...result.definitionGraph.issues, ...result.dependencyGraph.issues].some((issue) => issue.fatal) ? "failed" : "ready",
         semanticNodes: result.definitionGraph.definitions.length,
         semanticRelations: result.definitionGraph.relations.length,
-        semanticSites: result.dependencyGraph.sites.length,
+        semanticSites: result.dependencyGraph.sites.length + result.dependencyGraph.calls.length,
+        semanticCallSites: result.dependencyGraph.calls.length,
         semanticIssues: result.definitionGraph.issues.length + result.dependencyGraph.issues.length,
       };
     } finally {

@@ -1879,12 +1879,12 @@ fn verify_packaged_scan(
         bail!("packaged {adapter} fixture scan failed its safety gate: {scan}");
     }
     if adapter == "web" {
-        verify_packaged_web_import_type_graph(executable, store)?;
+        verify_packaged_web_import_type_call_graph(executable, store)?;
     }
     Ok(())
 }
 
-fn verify_packaged_web_import_type_graph(executable: &Path, store: &Path) -> Result<()> {
+fn verify_packaged_web_import_type_call_graph(executable: &Path, store: &Path) -> Result<()> {
     let exported = packaged_web_export_json(executable, store)?;
     let graph = exported["graph"]
         .as_object()
@@ -1895,16 +1895,19 @@ fn verify_packaged_web_import_type_graph(executable: &Path, store: &Path) -> Res
         .context("packaged Web semantic export has no Web profile")?;
     let properties = &profile["properties"];
     for (property, expected) in [
-        ("typescript_analysis_mode", "semantic-import-type-graph"),
+        (
+            "typescript_analysis_mode",
+            "semantic-import-type-call-graph",
+        ),
         ("typescript_project_model_status", "ready"),
         (
             "typescript_typechecker_status",
-            "definition-import-type-graph-emitted",
+            "definition-import-type-call-graph-emitted",
         ),
         ("typescript_definition_graph_status", "ready"),
         (
             "typescript_semantic_graph_emission",
-            "definition-import-type-graph-v1",
+            "definition-import-type-call-graph-v1",
         ),
         ("typescript_semantic_issue_count", "0"),
         ("typescript_release_gate", "release-gate-verified"),
@@ -1972,7 +1975,7 @@ fn verify_packaged_web_import_type_graph(executable: &Path, store: &Path) -> Res
         })
         .collect();
     if semantic_sites.is_empty() || dependency_edges.is_empty() {
-        bail!("packaged Web export omitted semantic import/type-use sites or edges");
+        bail!("packaged Web export omitted semantic import/type/call sites or edges");
     }
 
     let definition_kinds: BTreeSet<_> = definition_edges
@@ -1992,8 +1995,8 @@ fn verify_packaged_web_import_type_graph(executable: &Path, store: &Path) -> Res
         .filter_map(|site| site["resolution_status"].as_str())
         .collect();
     if definition_kinds != BTreeSet::from(["declares", "extends", "implements", "instantiates"])
-        || dependency_kinds != BTreeSet::from(["imports", "reexports", "type_uses"])
-        || site_kinds != BTreeSet::from(["type_use", "web_import", "web_reexport"])
+        || dependency_kinds != BTreeSet::from(["calls", "imports", "reexports", "type_uses"])
+        || site_kinds != BTreeSet::from(["call", "type_use", "web_import", "web_reexport"])
         || !BTreeSet::from(["external", "resolved", "unresolved"]).is_subset(&statuses)
         || !statuses.is_subset(&BTreeSet::from([
             "candidates",
@@ -2005,7 +2008,7 @@ fn verify_packaged_web_import_type_graph(executable: &Path, store: &Path) -> Res
             .iter()
             .any(|edge| edge["resolution_status"] != "resolved" || edge["precision"] != "exact")
     {
-        bail!("packaged Web export violated the definition-import-type-graph-v1 vocabulary");
+        bail!("packaged Web export violated the definition-import-type-call-graph-v1 vocabulary");
     }
     for edge in &semantic_edges {
         if !evidence.iter().any(|item| {
@@ -2032,6 +2035,13 @@ fn verify_packaged_web_import_type_graph(executable: &Path, store: &Path) -> Res
     let mut saw_node_builtin = false;
     let mut saw_empty_import = false;
     let mut saw_empty_reexport = false;
+    let mut semantic_call_site_count = 0_usize;
+    let mut saw_exact_direct_function = false;
+    let mut saw_exact_constructor = false;
+    let mut saw_exact_method = false;
+    let mut saw_external_call = false;
+    let mut saw_dynamic_unresolved_call = false;
+    let mut saw_open_unresolved_call = false;
     for site in &semantic_sites {
         let site_id = site["id"]
             .as_str()
@@ -2075,12 +2085,15 @@ fn verify_packaged_web_import_type_graph(executable: &Path, store: &Path) -> Res
         let occurrence_kind = primary["properties"]["occurrence_kind"]
             .as_str()
             .context("packaged Web semantic site primary evidence omitted occurrence_kind")?;
-        let type_only = primary["properties"]["type_only"]
-            .as_bool()
-            .context("packaged Web semantic site primary evidence omitted boolean type_only")?;
         let evidence_properties = primary["properties"]
             .as_object()
             .context("packaged Web semantic site primary evidence properties are malformed")?;
+        let type_only = match evidence_properties.get("type_only") {
+            None => None,
+            Some(value) => Some(value.as_bool().with_context(|| {
+                format!("packaged Web semantic site {site_id} has non-boolean type_only")
+            })?),
+        };
         let module_specifier = match evidence_properties.get("module_specifier") {
             None => None,
             Some(value) => Some(value.as_str().with_context(|| {
@@ -2102,8 +2115,10 @@ fn verify_packaged_web_import_type_graph(executable: &Path, store: &Path) -> Res
         let specifier = site["specifier"]
             .as_str()
             .context("packaged Web semantic site omitted its specifier")?;
-        saw_type_only_true |= type_only;
-        saw_type_only_false |= !type_only;
+        if let Some(type_only) = type_only {
+            saw_type_only_true |= type_only;
+            saw_type_only_false |= !type_only;
+        }
         saw_empty_import |= occurrence_kind == "empty_import";
         saw_empty_reexport |= occurrence_kind == "empty_reexport";
         let occurrence_matches_site = match kind {
@@ -2127,6 +2142,10 @@ fn verify_packaged_web_import_type_graph(executable: &Path, store: &Path) -> Res
                 occurrence_kind,
                 "type_reference" | "heritage_type" | "jsdoc_type"
             ),
+            "call" => matches!(
+                occurrence_kind,
+                "call_expression" | "new_expression" | "tagged_template"
+            ),
             _ => false,
         };
         if !occurrence_matches_site {
@@ -2134,55 +2153,124 @@ fn verify_packaged_web_import_type_graph(executable: &Path, store: &Path) -> Res
                 "packaged Web semantic site {site_id} has occurrence_kind {occurrence_kind} incompatible with {kind}"
             );
         }
-        if (kind == "type_use" || occurrence_kind == "import_type") && !type_only {
-            bail!("packaged Web type-only semantic site {site_id} reported type_only=false");
-        }
-        if matches!(
-            occurrence_kind,
-            "side_effect_import" | "require_call" | "dynamic_import"
-        ) && type_only
-        {
-            bail!("packaged Web runtime semantic site {site_id} reported type_only=true");
-        }
-        if !matches!(resolution_mode, None | Some("import" | "require"))
-            || (resolution_mode.is_some() && (!type_only || module_specifier.is_none()))
-        {
-            bail!("packaged Web semantic site {site_id} has contradictory resolution_mode");
-        }
-        if resolution_mode.is_some() && occurrence_kind == "import_equals" {
-            bail!(
-                "packaged Web semantic site {site_id} import_equals occurrence exposed resolution_mode"
+        if kind == "call" {
+            semantic_call_site_count += 1;
+            let call_kind = evidence_properties
+                .get("call_kind")
+                .and_then(Value::as_str)
+                .context("packaged Web call site omitted call_kind")?;
+            let dispatch = evidence_properties
+                .get("dispatch")
+                .and_then(Value::as_str)
+                .context("packaged Web call site omitted dispatch")?;
+            if type_only.is_some()
+                || imported_name.is_some()
+                || resolution_mode.is_some()
+                || specifier.is_empty()
+                || !matches!(
+                    call_kind,
+                    "function" | "method" | "constructor" | "tagged_template"
+                )
+                || !matches!(
+                    dispatch,
+                    "direct"
+                        | "static"
+                        | "private"
+                        | "fresh_instance"
+                        | "super"
+                        | "external"
+                        | "dynamic"
+                        | "open"
+                )
+                || status == "candidates"
+            {
+                bail!("packaged Web call site {site_id} has invalid call metadata");
+            }
+            let acceptance_fixture = primary["path"] == "apps/shared/src/calls.ts";
+            saw_exact_direct_function |= acceptance_fixture
+                && specifier == "directTarget"
+                && call_kind == "function"
+                && dispatch == "direct"
+                && status == "resolved"
+                && precision == "exact";
+            saw_exact_constructor |= acceptance_fixture
+                && specifier == "DirectReceiver"
+                && call_kind == "constructor"
+                && dispatch == "direct"
+                && status == "resolved"
+                && precision == "exact";
+            saw_exact_method |= acceptance_fixture
+                && call_kind == "method"
+                && matches!(dispatch, "static" | "private" | "fresh_instance" | "super")
+                && status == "resolved"
+                && precision == "exact";
+            saw_external_call |= acceptance_fixture
+                && specifier == "value.trim"
+                && dispatch == "external"
+                && status == "external";
+            saw_dynamic_unresolved_call |= acceptance_fixture
+                && specifier == "dynamicTarget"
+                && dispatch == "dynamic"
+                && status == "unresolved"
+                && site["reason"] == "function_value_dispatch";
+            saw_open_unresolved_call |= acceptance_fixture
+                && specifier == "receiver.directMethod"
+                && dispatch == "open"
+                && status == "unresolved"
+                && site["reason"] == "open_method_dispatch";
+        } else {
+            let type_only = type_only
+                .context("packaged Web import/type semantic site omitted boolean type_only")?;
+            if (kind == "type_use" || occurrence_kind == "import_type") && !type_only {
+                bail!("packaged Web type-only semantic site {site_id} reported type_only=false");
+            }
+            if matches!(
+                occurrence_kind,
+                "side_effect_import" | "require_call" | "dynamic_import"
+            ) && type_only
+            {
+                bail!("packaged Web runtime semantic site {site_id} reported type_only=true");
+            }
+            if !matches!(resolution_mode, None | Some("import" | "require"))
+                || (resolution_mode.is_some() && (!type_only || module_specifier.is_none()))
+            {
+                bail!("packaged Web semantic site {site_id} has contradictory resolution_mode");
+            }
+            if resolution_mode.is_some() && occurrence_kind == "import_equals" {
+                bail!(
+                    "packaged Web semantic site {site_id} import_equals occurrence exposed resolution_mode"
+                );
+            }
+            let named_binding = matches!(
+                occurrence_kind,
+                "default_import" | "named_import" | "named_reexport"
             );
-        }
-        let named_binding = matches!(
-            occurrence_kind,
-            "default_import" | "named_import" | "named_reexport"
-        );
-        let namespace_binding =
-            matches!(occurrence_kind, "namespace_import" | "namespace_reexport");
-        let module_only = matches!(
-            occurrence_kind,
-            "side_effect_import"
-                | "empty_import"
-                | "require_call"
-                | "dynamic_import"
-                | "import_type"
-                | "empty_reexport"
-                | "export_star"
-        );
-        if (kind == "type_use" && imported_name != Some(specifier))
-            || (kind != "type_use" && module_specifier != Some(specifier))
-            || (named_binding && imported_name.is_none())
-            || (namespace_binding && imported_name != Some("*"))
-            || (module_only && imported_name.is_some())
-            || (occurrence_kind == "default_import" && imported_name != Some("default"))
-            || (occurrence_kind == "import_equals" && imported_name != Some("="))
-        {
-            bail!(
-                "packaged Web semantic site {site_id} has occurrence metadata inconsistent with its public specifier"
+            let namespace_binding =
+                matches!(occurrence_kind, "namespace_import" | "namespace_reexport");
+            let module_only = matches!(
+                occurrence_kind,
+                "side_effect_import"
+                    | "empty_import"
+                    | "require_call"
+                    | "dynamic_import"
+                    | "import_type"
+                    | "empty_reexport"
+                    | "export_star"
             );
+            if (kind == "type_use" && imported_name != Some(specifier))
+                || (kind != "type_use" && module_specifier != Some(specifier))
+                || (named_binding && imported_name.is_none())
+                || (namespace_binding && imported_name != Some("*"))
+                || (module_only && imported_name.is_some())
+                || (occurrence_kind == "default_import" && imported_name != Some("default"))
+                || (occurrence_kind == "import_equals" && imported_name != Some("="))
+            {
+                bail!(
+                    "packaged Web semantic site {site_id} has occurrence metadata inconsistent with its public specifier"
+                );
+            }
         }
-        if primary["properties"]["module_specifier"] == "node:fs" {
+        if kind == "web_import" && primary["properties"]["module_specifier"] == "node:fs" {
             saw_node_builtin = true;
             let target = target_ids
                 .first()
@@ -2190,7 +2278,7 @@ fn verify_packaged_web_import_type_graph(executable: &Path, store: &Path) -> Res
                 .context("packaged Web node:fs site target node is missing")?;
             if kind != "web_import"
                 || site["specifier"] != "node:fs"
-                || type_only
+                || type_only != Some(false)
                 || status != "external"
                 || precision != "exact"
                 || target_ids.len() != 1
@@ -2212,6 +2300,7 @@ fn verify_packaged_web_import_type_graph(executable: &Path, store: &Path) -> Res
             "web_import" => "imports",
             "web_reexport" => "reexports",
             "type_use" => "type_uses",
+            "call" => "calls",
             _ => bail!("packaged Web semantic site {site_id} has unsupported kind {kind}"),
         };
         let linked: Vec<_> = dependency_edges
@@ -2302,6 +2391,22 @@ fn verify_packaged_web_import_type_graph(executable: &Path, store: &Path) -> Res
         {
             bail!("packaged Web type-use site {site_id} has a non-type concrete target");
         }
+        if kind == "call" {
+            let source = site["source"]
+                .as_str()
+                .and_then(|source| nodes_by_id.get(source))
+                .context("packaged Web call site source symbol is missing")?;
+            if source["kind"] != "symbol"
+                || (status == "resolved"
+                    && (target_ids
+                        .first()
+                        .and_then(|target| nodes_by_id.get(target))
+                        .is_none_or(|target| target["kind"] != "symbol")
+                        || !site["reason"].is_null()))
+            {
+                bail!("packaged Web call site {site_id} has a non-canonical source or callee");
+            }
+        }
         if matches!(
             occurrence_kind,
             "namespace_import"
@@ -2354,10 +2459,25 @@ fn verify_packaged_web_import_type_graph(executable: &Path, store: &Path) -> Res
     if !saw_empty_import || !saw_empty_reexport {
         bail!("packaged Web semantic sites omitted empty import/re-export acceptance fixtures");
     }
+    if !saw_exact_direct_function
+        || !saw_exact_constructor
+        || !saw_exact_method
+        || !saw_external_call
+        || !saw_dynamic_unresolved_call
+        || !saw_open_unresolved_call
+    {
+        bail!(
+            "packaged Web call fixture did not cover exact direct/function/method/constructor, external, dynamic, and open-dispatch ledger cases"
+        );
+    }
     for (property, actual) in [
         ("typescript_semantic_node_count", semantic_nodes.len()),
         ("typescript_semantic_relation_count", semantic_edges.len()),
         ("typescript_semantic_site_count", semantic_sites.len()),
+        (
+            "typescript_semantic_call_site_count",
+            semantic_call_site_count,
+        ),
     ] {
         let declared = properties[property]
             .as_str()
@@ -2380,7 +2500,7 @@ fn verify_packaged_web_import_type_graph(executable: &Path, store: &Path) -> Res
         .as_array()
         .is_some_and(|levels| levels.iter().any(|level| level == "semantic-complete"))
     {
-        bail!("packaged Web import/type-use slice claimed semantic-complete");
+        bail!("packaged Web import/type/call slice claimed semantic-complete");
     }
     if !edges.iter().any(|edge| {
         edge["phase"] == "source" && matches!(edge["kind"].as_str(), Some("imports" | "reexports"))
@@ -2409,73 +2529,77 @@ fn verify_packaged_web_import_type_graph(executable: &Path, store: &Path) -> Res
         bail!("packaged Web definition query lost its exact relations or evidence: {deps}");
     }
 
-    let exact_type_use = dependency_edges
-        .iter()
-        .copied()
-        .find(|edge| edge["kind"] == "type_uses" && edge["resolution_status"] == "resolved")
-        .context("packaged Web graph has no exact type-use edge for query verification")?;
-    let edge_id = exact_type_use["id"]
-        .as_str()
-        .context("packaged Web exact type-use edge omitted its ID")?;
-    let source_selector = format!(
-        "id:{}",
-        exact_type_use["source"]
+    for (edge_kind, label) in [("type_uses", "type-use"), ("calls", "call")] {
+        let exact_edge = dependency_edges
+            .iter()
+            .copied()
+            .find(|edge| edge["kind"] == edge_kind && edge["resolution_status"] == "resolved")
+            .with_context(|| {
+                format!("packaged Web graph has no exact {label} edge for query verification")
+            })?;
+        let edge_id = exact_edge["id"]
             .as_str()
-            .context("packaged Web exact type-use edge omitted its source")?
-    );
-    let target_selector = format!(
-        "id:{}",
-        exact_type_use["target"]
-            .as_str()
-            .context("packaged Web exact type-use edge omitted its target")?
-    );
-    let query_contains_edge = |query: &Value| {
-        query["data"]["steps"].as_array().is_some_and(|steps| {
-            steps.iter().any(|step| {
-                step["edge"]["id"] == edge_id
-                    && step["edge"]["phase"] == "semantic"
-                    && step["evidence"].as_array().is_some_and(|items| {
-                        items.iter().any(|item| {
-                            item["kind"] == "semantic"
-                                && item["extractor"] == "typescript-native-typechecker"
+            .with_context(|| format!("packaged Web exact {label} edge omitted its ID"))?;
+        let source_selector = format!(
+            "id:{}",
+            exact_edge["source"]
+                .as_str()
+                .with_context(|| format!("packaged Web exact {label} edge omitted its source"))?
+        );
+        let target_selector = format!(
+            "id:{}",
+            exact_edge["target"]
+                .as_str()
+                .with_context(|| format!("packaged Web exact {label} edge omitted its target"))?
+        );
+        let query_contains_edge = |query: &Value| {
+            query["data"]["steps"].as_array().is_some_and(|steps| {
+                steps.iter().any(|step| {
+                    step["edge"]["id"] == edge_id
+                        && step["edge"]["phase"] == "semantic"
+                        && step["evidence"].as_array().is_some_and(|items| {
+                            items.iter().any(|item| {
+                                item["kind"] == "semantic"
+                                    && item["extractor"] == "typescript-native-typechecker"
+                            })
                         })
-                    })
+                })
             })
-        })
-    };
-    let semantic_deps = packaged_web_query(
-        executable,
-        store,
-        &["deps", &source_selector, "--json"],
-        "query packaged Web semantic dependencies",
-    )?;
-    let semantic_dependents = packaged_web_query(
-        executable,
-        store,
-        &["dependents", &target_selector, "--json"],
-        "query packaged Web semantic dependents",
-    )?;
-    let semantic_why = packaged_web_query(
-        executable,
-        store,
-        &["why", &source_selector, &target_selector, "--json"],
-        "explain a packaged Web semantic dependency",
-    )?;
-    if !query_contains_edge(&semantic_deps)
-        || !query_contains_edge(&semantic_dependents)
-        || semantic_why["data"]["path_found"] != true
-        || !query_contains_edge(&semantic_why)
-    {
-        bail!("packaged Web queries lost the exact type-use edge or its evidence");
+        };
+        let semantic_deps = packaged_web_query(
+            executable,
+            store,
+            &["deps", &source_selector, "--json"],
+            &format!("query packaged Web exact {label} dependencies"),
+        )?;
+        let semantic_dependents = packaged_web_query(
+            executable,
+            store,
+            &["dependents", &target_selector, "--json"],
+            &format!("query packaged Web exact {label} dependents"),
+        )?;
+        let semantic_why = packaged_web_query(
+            executable,
+            store,
+            &["why", &source_selector, &target_selector, "--json"],
+            &format!("explain a packaged Web exact {label} dependency"),
+        )?;
+        if !query_contains_edge(&semantic_deps)
+            || !query_contains_edge(&semantic_dependents)
+            || semantic_why["data"]["path_found"] != true
+            || !query_contains_edge(&semantic_why)
+        {
+            bail!("packaged Web queries lost the exact {label} edge or its evidence");
+        }
     }
 
     let unresolved_site = semantic_sites
         .iter()
-        .find(|site| site["resolution_status"] == "unresolved")
-        .context("packaged Web graph has no unresolved semantic site")?;
+        .find(|site| site["kind"] == "call" && site["resolution_status"] == "unresolved")
+        .context("packaged Web graph has no unresolved call site")?;
     let unresolved_id = unresolved_site["id"]
         .as_str()
-        .context("packaged Web unresolved semantic site omitted its ID")?;
+        .context("packaged Web unresolved call site omitted its ID")?;
     let unresolved = packaged_web_query(
         executable,
         store,
@@ -2496,7 +2620,7 @@ fn verify_packaged_web_import_type_graph(executable: &Path, store: &Path) -> Res
                 })
         })
     }) {
-        bail!("packaged Web unresolved query lost its semantic site, reason, or evidence");
+        bail!("packaged Web unresolved query lost its call site, reason, or evidence");
     }
     Ok(())
 }
@@ -2566,14 +2690,12 @@ fn verify_packaged_web_determinism(
         .and_then(|edges| {
             edges.iter().find(|edge| {
                 edge["phase"] == "semantic"
-                    && matches!(
-                        edge["kind"].as_str(),
-                        Some("imports" | "reexports" | "type_uses")
-                    )
+                    && edge["kind"] == "calls"
+                    && edge["resolution_status"] == "resolved"
             })
         })
         .and_then(|edge| edge["source"].as_str())
-        .context("packaged Web graph has no semantic dependency source")?;
+        .context("packaged Web graph has no exact call source")?;
     let source_selector = format!("id:{semantic_source}");
     let first_query = packaged_web_query(
         executable,
