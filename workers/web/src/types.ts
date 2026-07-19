@@ -44,13 +44,69 @@ export type Condition =
   | { op: "in"; key: string; values: JsonPrimitive[] }
   | { op: "defined"; key: string };
 
-export const WEB_CONDITION: Condition = {
+export function compareUtf8(left: string, right: string): number {
+  // Rust's protocol canonicalizer sorts serialized JSON as UTF-8 bytes.
+  // JavaScript's relational string order uses UTF-16 code units and differs
+  // for supplementary-plane characters, which would otherwise change IDs.
+  const bytes = Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8"));
+  return bytes || (left < right ? -1 : left > right ? 1 : 0);
+}
+
+function canonicalConditionList(conditions: readonly Condition[]): Condition[] {
+  return [...new Map(conditions
+    .map((condition) => [JSON.stringify(condition), condition] as const)
+    .sort(([left], [right]) => compareUtf8(left, right))).values()];
+}
+
+/** Mirrors the protocol's condition canonicalization before IDs are derived. */
+export function canonicalizeCondition(condition: Condition): Condition {
+  if (condition.op === "eq" || condition.op === "defined") return { ...condition };
+  if (condition.op === "in") {
+    const values = [...new Map(condition.values
+      .map((value) => [JSON.stringify(value), value] as const)
+      .sort(([left], [right]) => compareUtf8(left, right))).values()];
+    return values.length === 1
+      ? { op: "eq", key: condition.key, value: values[0]! }
+      : { op: "in", key: condition.key, values };
+  }
+  if (condition.op === "not") {
+    const child = canonicalizeCondition(condition.condition);
+    return child.op === "not" ? child.condition : { op: "not", condition: child };
+  }
+  const flattened: Condition[] = [];
+  for (const value of condition.conditions) {
+    const child = canonicalizeCondition(value);
+    if (condition.op === "all" && child.op === "all") {
+      flattened.push(...child.conditions);
+    } else if (condition.op === "any" && child.op === "all" && child.conditions.length === 0) {
+      return { op: "all", conditions: [] };
+    } else if (condition.op === "any" && child.op === "any") {
+      flattened.push(...child.conditions);
+    } else {
+      flattened.push(child);
+    }
+  }
+  const unique = canonicalConditionList(flattened);
+  if (condition.op === "all") {
+    if (unique.length === 0) return { op: "all", conditions: [] };
+    if (unique.length === 1) return unique[0]!;
+    return { op: "all", conditions: unique };
+  }
+  if (unique.length === 1) return unique[0]!;
+  return { op: "any", conditions: unique };
+}
+
+export function aggregateConditions(conditions: readonly Condition[]): Condition {
+  return canonicalizeCondition({ op: "any", conditions: [...conditions] });
+}
+
+export const WEB_CONDITION: Condition = canonicalizeCondition({
   op: "all",
   conditions: [
     { op: "eq", key: "mode", value: "production" },
     { op: "in", key: "environment", values: WEB_ENVIRONMENTS },
   ],
-};
+});
 
 export const WEB_UNIVERSAL_ENVIRONMENT = WEB_ENVIRONMENTS.join(",");
 
@@ -189,6 +245,7 @@ export interface TypeScriptProjectSummary {
   definitionGraphStatus: "ready" | "failed";
   semanticNodes: number;
   semanticRelations: number;
+  semanticSites: number;
   semanticIssues: number;
 }
 

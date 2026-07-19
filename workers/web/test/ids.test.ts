@@ -9,4 +9,8 @@ test("canonical JSON recursively sorts object keys and preserves array order", (
     stableId("file", { package: "pkg", path: "src/a.ts" }),
   );
   assert.match(stableId("file", { path: "src/a.ts" }), /^file:sha256:[0-9a-f]{64}$/u);
+  assert.equal(
+    canonicalJson({ ["\u{10000}"]: 2, ["\uE000"]: 1 }),
+    '{"\uE000":1,"\u{10000}":2}',
+  );
 });

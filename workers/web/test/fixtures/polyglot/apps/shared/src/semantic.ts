@@ -1,3 +1,6 @@
+import {} from "./index";
+export {} from "./index";
+
 export interface SharedEntity {
   id: string;
 }
