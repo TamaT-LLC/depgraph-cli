@@ -27,6 +27,7 @@ import type {
 } from "./typescript-semantic";
 import type {
   TypeScriptDependencyValidationSource,
+  TypeScriptRawCallSource,
   TypeScriptRawDependencyDelta,
   TypeScriptRawDependencySite,
   TypeScriptRawDependencyTarget,
@@ -173,7 +174,7 @@ class GraphBuilder {
     rawDelta: Pick<TypeScriptRawDefinitionDelta, "definitions" | "relations">,
     dependencyDelta: TypeScriptRawDependencyDelta,
     sources: ReadonlyMap<string, string>,
-  ): { nodes: number; relations: number; sites: number } {
+  ): { nodes: number; relations: number; sites: number; calls: number } {
     const definitions = new Map<string, TypeScriptRawDefinition>();
     const rawResolvers = new Map<string, string>();
     for (const definition of rawDelta.definitions) {
@@ -417,8 +418,8 @@ class GraphBuilder {
       }
     };
 
-    const nodes = rawDelta.definitions.map((definition) => materializeDefinition(definition.key));
-    const edges = rawDelta.relations.map((relation): GraphEdge => {
+    const definitionNodes = rawDelta.definitions.map((definition) => materializeDefinition(definition.key));
+    const definitionEdges = rawDelta.relations.map((relation): GraphEdge => {
       const source = resolveEndpoint(relation.source);
       const target = materializeDefinition(relation.target);
       const span = sourceSpan(
@@ -437,7 +438,7 @@ class GraphBuilder {
           backend: "typescript-native-compiler",
           compiler_source: "bundled",
           compiler_version: TYPESCRIPT_COMPILER_VERSION,
-          analysis_mode: "semantic-import-type-graph",
+          analysis_mode: "semantic-import-type-call-graph",
           profile_id: PROFILE_ID,
           project_code_executed: false,
           relation_kind: relation.kind,
@@ -468,6 +469,97 @@ class GraphBuilder {
         evidence: [evidence],
       };
     });
+    const moduleInitializers = new Map<string, GraphNode>();
+    const moduleInitializerNodes: GraphNode[] = [];
+    const moduleInitializerEdges: GraphEdge[] = [];
+    const moduleInitializerPathSet = new Set<string>();
+    for (const call of dependencyDelta.calls) {
+      if (call.source.kind === "module_initializer") moduleInitializerPathSet.add(call.source.relativePath);
+    }
+    const moduleInitializerPaths = [...moduleInitializerPathSet].sort(compareUtf8);
+    for (const relativePath of moduleInitializerPaths) {
+      const file = existingFile(relativePath);
+      const languageValue = file.properties.language;
+      if (languageValue !== "typescript" && languageValue !== "javascript") {
+        throw new Error(`TypeScript module initializer has unsupported source language ${String(languageValue)}`);
+      }
+      const sourceText = sources.get(relativePath);
+      if (sourceText === undefined) throw new Error(`TypeScript module initializer references missing source ${relativePath}`);
+      const ownerPackage = owningPackage(this.#workspace, path.join(this.#workspace.root, relativePath));
+      const span = sourceSpan(startsFor(relativePath), 0, sourceText.length);
+      const canonicalIdentity: Record<string, JsonValue> = {
+        language: languageValue,
+        package_locator: ownerPackage.locator,
+        symbol_kind: "generated_module_initializer",
+        identity_kind: "generated",
+        generated_from: file.id,
+        relative_path: relativePath,
+        span,
+      };
+      const id = stableId("symbol", canonicalIdentity);
+      const node: GraphNode = {
+        id,
+        kind: "symbol",
+        locator: `${languageValue}-symbol:${id}`,
+        display_name: `${relativePath} module initializer`,
+        properties: {
+          language: languageValue,
+          package_locator: ownerPackage.locator,
+          package_id: ownerPackage.id,
+          symbol_kind: "generated_module_initializer",
+          canonical_identity: canonicalIdentity,
+          profile_id: PROFILE_ID,
+          source_path: relativePath,
+          source_span: span,
+          generated: true,
+          typescript_provenance: "typescript-native-typechecker",
+        },
+      };
+      moduleInitializers.set(relativePath, node);
+      moduleInitializerNodes.push(node);
+      const evidence: Evidence = {
+        kind: "semantic",
+        extractor: "typescript-native-typechecker",
+        extractor_version: TYPESCRIPT_COMPILER_VERSION,
+        path: relativePath,
+        ...span,
+        detail: "TypeChecker module initializer execution scope",
+        properties: {
+          backend: "typescript-native-compiler",
+          compiler_source: "bundled",
+          compiler_version: TYPESCRIPT_COMPILER_VERSION,
+          analysis_mode: "semantic-import-type-call-graph",
+          profile_id: PROFILE_ID,
+          project_code_executed: false,
+          relation_kind: "declares",
+        },
+      };
+      moduleInitializerEdges.push({
+        id: stableId("edge", {
+          condition: WEB_CONDITION,
+          kind: "declares",
+          profile_id: PROFILE_ID,
+          source: file.id,
+          target: id,
+          path: relativePath,
+          span,
+        }),
+        source: file.id,
+        target: id,
+        kind: "declares",
+        site_id: null,
+        phase: "semantic",
+        environment: "any",
+        profile_id: PROFILE_ID,
+        condition: WEB_CONDITION,
+        resolution_status: "resolved",
+        precision: "exact",
+        generated: file.properties.generated === true,
+        evidence: [evidence],
+      });
+    }
+    const nodes = [...definitionNodes, ...moduleInitializerNodes];
+    const edges = [...definitionEdges, ...moduleInitializerEdges];
     const delta: TypeScriptDefinitionDelta = { nodes, edges };
     const merged = mergeTypeScriptDefinitionDelta(this.nodes, this.edges, delta, {
       profileId: PROFILE_ID,
@@ -533,6 +625,23 @@ class GraphBuilder {
         ? endpoint.relativePath
         : definitions.get(endpoint.key)?.relativePath ?? (() => { throw new Error(`dependency source definition is missing ${endpoint.key}`); })()
     );
+    const resolveCallSource = (endpoint: TypeScriptRawCallSource): GraphNode => {
+      if (endpoint.kind === "definition") return materializeDefinition(endpoint.key);
+      if (endpoint.kind === "module_initializer") {
+        const initializer = moduleInitializers.get(endpoint.relativePath);
+        if (initializer === undefined) throw new Error(`call source module initializer is missing ${endpoint.relativePath}`);
+        return initializer;
+      }
+      throw new Error("TypeScript call source must be a canonical symbol");
+    };
+    const callSourcePath = (endpoint: TypeScriptRawCallSource): string => {
+      if (endpoint.kind === "definition") {
+        return definitions.get(endpoint.key)?.relativePath
+          ?? (() => { throw new Error(`call source definition is missing ${endpoint.key}`); })();
+      }
+      if (endpoint.kind === "module_initializer") return endpoint.relativePath;
+      throw new Error("TypeScript call source must be a canonical symbol");
+    };
     const semanticSites: DependencySite[] = [];
     const semanticEdges: GraphEdge[] = [];
     let previousRawKey = "";
@@ -610,7 +719,7 @@ class GraphBuilder {
         backend: "typescript-native-compiler",
         compiler_source: "bundled",
         compiler_version: TYPESCRIPT_COMPILER_VERSION,
-        analysis_mode: "semantic-import-type-graph",
+        analysis_mode: "semantic-import-type-call-graph",
         profile_id: PROFILE_ID,
         project_code_executed: false,
         occurrence_kind: raw.evidence.occurrenceKind,
@@ -688,6 +797,147 @@ class GraphBuilder {
       counts[raw.status] += 1;
       coverageDeltas.set(raw.evidence.relativePath, counts);
     }
+    let previousCallKey = "";
+    const callSites: DependencySite[] = [];
+    for (const raw of dependencyDelta.calls) {
+      if (previousCallKey !== "" && compareUtf8(previousCallKey, raw.key) >= 0) {
+        throw new Error("TypeScript call sites are not in strict canonical order");
+      }
+      previousCallKey = raw.key;
+      if (
+        raw.specifier.length === 0
+        || raw.specifier.length > 2_048
+        || !["function", "method", "constructor", "tagged_template"].includes(raw.callKind)
+        || !["direct", "static", "private", "fresh_instance", "super", "external", "dynamic", "open"].includes(raw.dispatch)
+        || (raw.moduleSpecifier !== null && (raw.moduleSpecifier.length === 0 || raw.moduleSpecifier.length > 2_048))
+      ) throw new Error("TypeScript call site has invalid call metadata");
+      if (raw.targets.length !== 1 || raw.targetConditions.length !== 1) {
+        throw new Error("TypeScript call site must contain exactly one target and condition");
+      }
+      if (
+        JSON.stringify(raw.condition) !== JSON.stringify(canonicalizeCondition(raw.condition))
+        || JSON.stringify(raw.targetConditions[0]) !== JSON.stringify(canonicalizeCondition(raw.targetConditions[0]!))
+        || JSON.stringify(raw.condition) !== JSON.stringify(raw.targetConditions[0])
+      ) throw new Error("TypeScript call site and edge conditions disagree");
+      const source = resolveCallSource(raw.source);
+      if (source.kind !== "symbol") throw new Error("TypeScript call source is not a symbol");
+      const sourcePath = callSourcePath(raw.source);
+      if (sourcePath !== raw.evidence.relativePath) throw new Error("TypeScript call evidence is not anchored to its caller");
+      const evidenceSource = sources.get(raw.evidence.relativePath);
+      if (
+        evidenceSource === undefined
+        || !Number.isSafeInteger(raw.evidence.startOffset)
+        || !Number.isSafeInteger(raw.evidence.endOffset)
+        || raw.evidence.startOffset < 0
+        || raw.evidence.endOffset <= raw.evidence.startOffset
+        || raw.evidence.endOffset > evidenceSource.length
+      ) throw new Error("TypeScript call evidence has an invalid source span");
+      const target = dependencyTarget(raw.targets[0]!);
+      if (
+        (raw.status === "resolved" && (
+          raw.precision !== "exact"
+          || raw.reason !== null
+          || target.kind !== "symbol"
+          || !["direct", "static", "private", "fresh_instance", "super"].includes(raw.dispatch)
+        ))
+        || (raw.status === "external" && (
+          target.kind !== "external_system"
+          || raw.dispatch !== "external"
+          || (raw.precision !== "exact" && raw.precision !== "heuristic")
+          || (raw.precision === "exact" ? raw.reason !== null : !raw.reason)
+        ))
+        || (raw.status === "unresolved" && (
+          target.kind !== "unknown_target"
+          || raw.precision !== "heuristic"
+          || !raw.reason
+          || !["dynamic", "open"].includes(raw.dispatch)
+        ))
+      ) throw new Error("TypeScript call site has an invalid status/precision/target combination");
+      const span = sourceSpan(startsFor(raw.evidence.relativePath), raw.evidence.startOffset, raw.evidence.endOffset);
+      const evidenceProperties = {
+        backend: "typescript-native-compiler",
+        compiler_source: "bundled",
+        compiler_version: TYPESCRIPT_COMPILER_VERSION,
+        analysis_mode: "semantic-import-type-call-graph",
+        profile_id: PROFILE_ID,
+        project_code_executed: false,
+        occurrence_kind: raw.evidence.occurrenceKind,
+        target_basis: raw.evidence.targetBasis,
+        call_kind: raw.callKind,
+        dispatch: raw.dispatch,
+        ...(raw.moduleSpecifier === null ? {} : { module_specifier: raw.moduleSpecifier }),
+      } as const;
+      const primary: Evidence = {
+        kind: "semantic",
+        extractor: "typescript-native-typechecker",
+        extractor_version: TYPESCRIPT_COMPILER_VERSION,
+        path: raw.evidence.relativePath,
+        ...span,
+        detail: raw.evidence.detail,
+        properties: evidenceProperties,
+      };
+      const supporting: Evidence = {
+        kind: "source",
+        extractor: "typescript-native-syntax",
+        extractor_version: TYPESCRIPT_COMPILER_VERSION,
+        path: raw.evidence.relativePath,
+        ...span,
+        detail: `syntax occurrence for ${raw.evidence.occurrenceKind}`,
+        properties: { profile_id: PROFILE_ID, occurrence_kind: raw.evidence.occurrenceKind },
+      };
+      const siteId = stableId("site", {
+        source: source.id,
+        kind: "call",
+        profile_id: PROFILE_ID,
+        condition: raw.condition,
+        path: primary.path,
+        span,
+      });
+      const site: DependencySite = {
+        id: siteId,
+        source: source.id,
+        kind: "call",
+        specifier: raw.specifier,
+        resolution_status: raw.status,
+        target_ids: [target.id],
+        profile_id: PROFILE_ID,
+        condition: raw.condition,
+        precision: raw.precision,
+        reason: raw.reason,
+        evidence: [primary, supporting],
+      };
+      const existingSite = nextSites.get(site.id);
+      if (existingSite !== undefined && JSON.stringify(existingSite) !== JSON.stringify(site)) {
+        throw new Error(`TypeScript dependency delta conflicts with call site ${site.id}`);
+      }
+      nextSites.set(site.id, existingSite ?? site);
+      semanticSites.push(site);
+      callSites.push(site);
+      const edge: GraphEdge = {
+        id: stableId("edge", { site_id: siteId, kind: "calls", target: target.id }),
+        source: source.id,
+        target: target.id,
+        kind: "calls",
+        site_id: siteId,
+        phase: "semantic",
+        environment: "any",
+        profile_id: PROFILE_ID,
+        condition: canonicalizeCondition(raw.targetConditions[0]!),
+        resolution_status: raw.status,
+        precision: raw.precision,
+        generated: existingFile(raw.evidence.relativePath).properties.generated === true,
+        evidence: [primary, supporting],
+      };
+      const existingEdge = nextEdges.get(edge.id);
+      if (existingEdge !== undefined && JSON.stringify(existingEdge) !== JSON.stringify(edge)) {
+        throw new Error(`TypeScript dependency delta conflicts with call edge ${edge.id}`);
+      }
+      nextEdges.set(edge.id, existingEdge ?? edge);
+      semanticEdges.push(edge);
+      const counts = coverageDeltas.get(raw.evidence.relativePath) ?? { resolved: 0, candidates: 0, external: 0, unresolved: 0 };
+      counts[raw.status] += 1;
+      coverageDeltas.set(raw.evidence.relativePath, counts);
+    }
     const nextFiles = new Map([...this.files].map(([relativePath, coverage]) => [relativePath, { ...coverage }]));
     for (const [relativePath, counts] of coverageDeltas) {
       const coverage = nextFiles.get(relativePath);
@@ -709,7 +959,12 @@ class GraphBuilder {
     this.edges = nextEdges;
     this.files.clear();
     for (const [relativePath, coverage] of nextFiles) this.files.set(relativePath, coverage);
-    return { nodes: nodes.length, relations: edges.length + semanticEdges.length, sites: semanticSites.length };
+    return {
+      nodes: nodes.length,
+      relations: edges.length + semanticEdges.length,
+      sites: semanticSites.length,
+      calls: callSites.length,
+    };
   }
 
   addDiagnostic(diagnostic: Omit<Diagnostic, "id">): void {
@@ -1014,12 +1269,14 @@ export function buildTypeScriptDependencyValidationSources(
       const moduleCallSpans = analysis.moduleCallSpans.get(relativePath);
       const nonLiteralModuleSpans = analysis.nonLiteralModuleSpans.get(relativePath);
       const typeUseSpans = analysis.typeUseSpans.get(relativePath);
+      const callSpans = analysis.callSpans.get(relativePath);
       if (
         diagnostics === undefined
         || importTypeModuleSpans === undefined
         || moduleCallSpans === undefined
         || nonLiteralModuleSpans === undefined
         || typeUseSpans === undefined
+        || callSpans === undefined
       ) {
         throw new Error(`TypeScript dependency validation context is missing for ${relativePath}`);
       }
@@ -1035,6 +1292,7 @@ export function buildTypeScriptDependencyValidationSources(
           resolutionModeProof: spanValue.resolutionModeProof === null ? null : { ...spanValue.resolutionModeProof },
         })),
         typeUseSpans: typeUseSpans.map((spanValue) => ({ ...spanValue })),
+        callSpans: callSpans.map((spanValue) => ({ ...spanValue })),
       };
     });
 }
@@ -1775,11 +2033,13 @@ export async function scan(root: string, allFiles: string[], inventoryIssues: Fi
       nativeTypeScript.project.semanticNodes = counts.nodes;
       nativeTypeScript.project.semanticRelations = counts.relations;
       nativeTypeScript.project.semanticSites = counts.sites;
+      nativeTypeScript.project.semanticCallSites = counts.calls;
     } catch (error) {
       nativeTypeScript.project.definitionGraphStatus = "failed";
       nativeTypeScript.project.semanticNodes = 0;
       nativeTypeScript.project.semanticRelations = 0;
       nativeTypeScript.project.semanticSites = 0;
+      nativeTypeScript.project.semanticCallSites = 0;
       nativeTypeScript.project.semanticIssues += 1;
       graph.addDiagnostic({
         severity: "warning",
@@ -1794,6 +2054,7 @@ export async function scan(root: string, allFiles: string[], inventoryIssues: Fi
     nativeTypeScript.project.semanticNodes = 0;
     nativeTypeScript.project.semanticRelations = 0;
     nativeTypeScript.project.semanticSites = 0;
+    nativeTypeScript.project.semanticCallSites = 0;
   }
 
   const routeNodesByGroup = new Map<string, Map<string, { node: GraphNode; evidence: Evidence }>>();

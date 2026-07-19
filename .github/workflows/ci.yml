@@ -81,7 +81,7 @@ jobs:
         with:
           node-version: 24.18.0
       - run: cargo xtask build
-      - name: Web semantic import/type-use end-to-end and deterministic export
+      - name: Web semantic import/type/call end-to-end and deterministic export
         shell: bash
         run: |
           set -euo pipefail
@@ -96,25 +96,27 @@ jobs:
               )] as $semantic_site_evidence
             | [$semantic_site_evidence[].owner_id] | unique as $semantic_site_ids
             | [$graph.sites[] | select(.id as $id | $semantic_site_ids | index($id))] as $semantic_sites
+            | [$semantic_sites[] | select(.kind == "call")] as $call_sites
             | [$graph.edges[] | select(.phase == "semantic")] as $semantic_edges
             | [$semantic_edges[] | select(.site_id == null)] as $definition_edges
             | [$semantic_edges[] | select(.site_id != null)] as $dependency_edges
             | [$graph.nodes[] | select(.kind == "symbol" or .kind == "type")] as $semantic_nodes
-            | ($graph.profiles | any(.properties.typescript_analysis_mode == "semantic-import-type-graph"
+            | ($graph.profiles | any(.properties.typescript_analysis_mode == "semantic-import-type-call-graph"
               and .properties.typescript_project_model_status == "ready"
-              and .properties.typescript_typechecker_status == "definition-import-type-graph-emitted"
+              and .properties.typescript_typechecker_status == "definition-import-type-call-graph-emitted"
               and .properties.typescript_definition_graph_status == "ready"
-              and .properties.typescript_semantic_graph_emission == "definition-import-type-graph-v1"
+              and .properties.typescript_semantic_graph_emission == "definition-import-type-call-graph-v1"
               and .properties.typescript_semantic_issue_count == "0"
               and (.properties.typescript_semantic_node_count | tonumber) == ($semantic_nodes | length)
               and (.properties.typescript_semantic_relation_count | tonumber) == ($semantic_edges | length)
-              and (.properties.typescript_semantic_site_count | tonumber) == ($semantic_sites | length)))
+              and (.properties.typescript_semantic_site_count | tonumber) == ($semantic_sites | length)
+              and (.properties.typescript_semantic_call_site_count | tonumber) == ($call_sites | length)))
             and ($graph.nodes | any(.kind == "symbol"))
             and ($graph.nodes | any(.kind == "type" and .properties.type_kind == "generic_instance"))
             and ([$definition_edges[].kind] | unique | sort
               == ["declares", "extends", "implements", "instantiates"])
-            and ([$dependency_edges[].kind] | unique | sort == ["imports", "reexports", "type_uses"])
-            and ([$semantic_sites[].kind] | unique | sort == ["type_use", "web_import", "web_reexport"])
+            and ([$dependency_edges[].kind] | unique | sort == ["calls", "imports", "reexports", "type_uses"])
+            and ([$semantic_sites[].kind] | unique | sort == ["call", "type_use", "web_import", "web_reexport"])
             and ($semantic_sites | all(
               .resolution_status == "resolved" or .resolution_status == "candidates"
               or .resolution_status == "external" or .resolution_status == "unresolved"
@@ -133,50 +135,66 @@ jobs:
               | [$graph.edges[] | select(.site_id == $site.id)] as $linked
               | ([$linked[].condition] | unique_by(tojson) | sort_by(tojson)) as $edge_conditions
               | $primary != null
-                and ($primary.properties.type_only | type == "boolean")
-                and (if $site.kind == "web_import" then
-                  (["named_import", "default_import", "namespace_import", "side_effect_import", "empty_import",
-                    "import_equals", "require_call", "dynamic_import", "import_type"]
+                and (if $site.kind == "call" then
+                  (["call_expression", "new_expression", "tagged_template"]
                     | index($primary.properties.occurrence_kind))
-                elif $site.kind == "web_reexport" then
-                  (["named_reexport", "namespace_reexport", "empty_reexport", "export_star"]
-                    | index($primary.properties.occurrence_kind))
+                  and (["function", "method", "constructor", "tagged_template"]
+                    | index($primary.properties.call_kind))
+                  and (["direct", "static", "private", "fresh_instance", "super", "external", "dynamic", "open"]
+                    | index($primary.properties.dispatch))
+                  and ($primary.properties | has("type_only") | not)
+                  and ($primary.properties | has("imported_name") | not)
+                  and ($primary.properties | has("resolution_mode") | not)
+                  and (if ($primary.properties | has("module_specifier")) then
+                    ($primary.properties.module_specifier | type == "string")
+                  else true end)
+                  and $site.resolution_status != "candidates"
                 else
-                  (["type_reference", "heritage_type", "jsdoc_type"]
-                    | index($primary.properties.occurrence_kind))
+                  ($primary.properties.type_only | type == "boolean")
+                  and (if $site.kind == "web_import" then
+                    (["named_import", "default_import", "namespace_import", "side_effect_import", "empty_import",
+                      "import_equals", "require_call", "dynamic_import", "import_type"]
+                      | index($primary.properties.occurrence_kind))
+                  elif $site.kind == "web_reexport" then
+                    (["named_reexport", "namespace_reexport", "empty_reexport", "export_star"]
+                      | index($primary.properties.occurrence_kind))
+                  else
+                    (["type_reference", "heritage_type", "jsdoc_type"]
+                      | index($primary.properties.occurrence_kind))
+                  end)
+                  and (if $site.kind == "type_use"
+                      or $primary.properties.occurrence_kind == "import_type" then
+                    $primary.properties.type_only == true
+                  elif (["side_effect_import", "require_call", "dynamic_import"]
+                      | index($primary.properties.occurrence_kind)) then
+                    $primary.properties.type_only == false
+                  else true end)
+                  and (if $site.kind == "type_use" then
+                    ($primary.properties.imported_name | type == "string")
+                    and $primary.properties.imported_name == $site.specifier
+                  else
+                    ($primary.properties.module_specifier | type == "string")
+                    and $primary.properties.module_specifier == $site.specifier
+                  end)
+                  and (if $site.kind == "type_use" then
+                    ($primary.properties.imported_name | type == "string")
+                  elif (["default_import", "named_import", "named_reexport"]
+                      | index($primary.properties.occurrence_kind)) then
+                    ($primary.properties.imported_name | type == "string")
+                  elif (["namespace_import", "namespace_reexport"]
+                      | index($primary.properties.occurrence_kind)) then
+                    $primary.properties.imported_name == "*"
+                  elif $primary.properties.occurrence_kind == "import_equals" then
+                    $primary.properties.imported_name == "="
+                  else ($primary.properties | has("imported_name") | not) end)
+                  and (if ($primary.properties | has("resolution_mode")) then
+                    ($primary.properties.resolution_mode == "import"
+                      or $primary.properties.resolution_mode == "require")
+                    and $primary.properties.type_only == true
+                    and ($primary.properties.module_specifier | type == "string")
+                    and $primary.properties.occurrence_kind != "import_equals"
+                  else true end)
                 end)
-                and (if $site.kind == "type_use"
-                    or $primary.properties.occurrence_kind == "import_type" then
-                  $primary.properties.type_only == true
-                elif (["side_effect_import", "require_call", "dynamic_import"]
-                    | index($primary.properties.occurrence_kind)) then
-                  $primary.properties.type_only == false
-                else true end)
-                and (if $site.kind == "type_use" then
-                  ($primary.properties.imported_name | type == "string")
-                  and $primary.properties.imported_name == $site.specifier
-                else
-                  ($primary.properties.module_specifier | type == "string")
-                  and $primary.properties.module_specifier == $site.specifier
-                end)
-                and (if $site.kind == "type_use" then
-                  ($primary.properties.imported_name | type == "string")
-                elif (["default_import", "named_import", "named_reexport"]
-                    | index($primary.properties.occurrence_kind)) then
-                  ($primary.properties.imported_name | type == "string")
-                elif (["namespace_import", "namespace_reexport"]
-                    | index($primary.properties.occurrence_kind)) then
-                  $primary.properties.imported_name == "*"
-                elif $primary.properties.occurrence_kind == "import_equals" then
-                  $primary.properties.imported_name == "="
-                else ($primary.properties | has("imported_name") | not) end)
-                and (if ($primary.properties | has("resolution_mode")) then
-                  ($primary.properties.resolution_mode == "import"
-                    or $primary.properties.resolution_mode == "require")
-                  and $primary.properties.type_only == true
-                  and ($primary.properties.module_specifier | type == "string")
-                  and $primary.properties.occurrence_kind != "import_equals"
-                else true end)
                 and ($site.target_ids | length) > 0
                 and $site.target_ids == ($site.target_ids | sort)
                 and ($linked | length) == ($site.target_ids | length)
@@ -190,7 +208,8 @@ jobs:
                   and .precision == $site.precision
                   and (.target as $target | $site.target_ids | index($target))
                   and .kind == (if $site.kind == "web_import" then "imports"
-                    elif $site.kind == "web_reexport" then "reexports" else "type_uses" end)
+                    elif $site.kind == "web_reexport" then "reexports"
+                    elif $site.kind == "type_use" then "type_uses" else "calls" end)
                 ))
                 and (if $site.resolution_status == "resolved" then
                   ($site.target_ids | length) == 1 and $site.precision == "exact"
@@ -217,6 +236,9 @@ jobs:
                       and .properties.language == "web"
                       and .properties.profile_id == $site.profile_id
                     )))
+                elif $site.kind == "call" then
+                  ($site.target_ids | all(. as $target
+                    | $graph.nodes | any(.id == $target and .kind == "symbol")))
                 elif $site.kind == "type_use" then
                   ($site.target_ids | all(. as $target
                     | $graph.nodes | any(.id == $target and .kind == "type")))
@@ -247,6 +269,56 @@ jobs:
               + $graph.coverage.external + $graph.coverage.unresolved
             )
             and ($graph.coverage.completeness | index("semantic-complete") | not)
+          ' "$tmp/one.json"
+          jq -e '.graph as $graph
+            | [$graph.sites[] as $site
+              | select($site.kind == "call")
+              | ([$graph.evidence[] | select(
+                  .owner_type == "site" and .owner_id == $site.id and .ordinal == 0
+                  and .kind == "semantic" and .extractor == "typescript-native-typechecker"
+                )] | first) as $primary
+              | {site: $site, primary: $primary}
+            ] as $calls
+            | ($calls | all(.site.resolution_status != "candidates"))
+              and ($graph.edges | any(.kind == "may_call") | not)
+              and ($calls | any(
+                .primary.path == "apps/shared/src/calls.ts"
+                and .site.specifier == "directTarget"
+                and .site.resolution_status == "resolved" and .site.precision == "exact"
+                and .primary.properties.call_kind == "function"
+                and .primary.properties.dispatch == "direct"
+              ))
+              and ($calls | any(
+                .primary.path == "apps/shared/src/calls.ts"
+                and .site.specifier == "DirectReceiver"
+                and .site.resolution_status == "resolved" and .site.precision == "exact"
+                and .primary.properties.call_kind == "constructor"
+                and .primary.properties.dispatch == "direct"
+              ))
+              and ($calls | any(
+                .primary.path == "apps/shared/src/calls.ts"
+                and .site.resolution_status == "resolved" and .site.precision == "exact"
+                and .primary.properties.call_kind == "method"
+                and (.primary.properties.dispatch as $dispatch
+                  | ["static", "private", "fresh_instance", "super"] | index($dispatch))
+              ))
+              and ($calls | any(
+                .primary.path == "apps/shared/src/calls.ts"
+                and .site.specifier == "value.trim" and .site.resolution_status == "external"
+                and .primary.properties.dispatch == "external"
+              ))
+              and ($calls | any(
+                .primary.path == "apps/shared/src/calls.ts"
+                and .site.specifier == "dynamicTarget" and .site.resolution_status == "unresolved"
+                and .site.reason == "function_value_dispatch"
+                and .primary.properties.dispatch == "dynamic"
+              ))
+              and ($calls | any(
+                .primary.path == "apps/shared/src/calls.ts"
+                and .site.specifier == "receiver.directMethod" and .site.resolution_status == "unresolved"
+                and .site.reason == "open_method_dispatch"
+                and .primary.properties.dispatch == "open"
+              ))
           ' "$tmp/one.json"
           jq -e '.graph as $graph
             | [$graph.evidence[] | select(
@@ -282,19 +354,19 @@ jobs:
                 | all(. as $kind | $kinds | index($kind)))
               and ($steps | all(.edge.phase == "semantic" and .evidence[0].kind == "semantic"))' "$tmp/deps.json"
           semantic_source="$(jq -r '[.graph.edges[] | select(
-            .phase == "semantic" and (.kind == "imports" or .kind == "reexports" or .kind == "type_uses")
+            .phase == "semantic" and .kind == "calls" and .resolution_status == "resolved"
           )][0].source // empty' "$tmp/one.json")"
           test -n "$semantic_source"
           target/debug/depgraph --store "$tmp/one.db" deps "id:$semantic_source" --json > "$tmp/semantic-deps-one.json"
           jq -e '.data.steps | any(
             .edge.phase == "semantic"
-            and (.edge.kind == "imports" or .edge.kind == "reexports" or .edge.kind == "type_uses")
+            and .edge.kind == "calls" and .edge.resolution_status == "resolved"
             and (.evidence | any(.kind == "semantic" and .extractor == "typescript-native-typechecker"))
           )' "$tmp/semantic-deps-one.json"
           semantic_unresolved_id="$(jq -r '.graph as $graph
             | [$graph.evidence[] | select(.owner_type == "site" and .kind == "semantic") | .owner_id] as $semantic_ids
             | [$graph.sites[] | select(
-                .resolution_status == "unresolved"
+                .kind == "call" and .resolution_status == "unresolved"
                 and (.id as $id | $semantic_ids | index($id))
               )][0].id // empty' "$tmp/one.json")"
           test -n "$semantic_unresolved_id"
@@ -364,7 +436,7 @@ jobs:
       - run: target\debug\depgraph-rust-worker.exe --version
       - run: workers\go\bin\depgraph-go-worker.exe --version
       - run: node workers\web\dist\worker.mjs --version
-      - name: Web TypeChecker import and type-use graph smoke
+      - name: Web TypeChecker import, type-use, and exact-call graph smoke
         shell: pwsh
         run: |
           $lines = node workers\web\dist\worker.mjs --root workers\web\test\fixtures\polyglot --scan-id windows-web-typechecker
@@ -372,12 +444,12 @@ jobs:
           $events = @($lines | ForEach-Object { $_ | ConvertFrom-Json })
           $profile = ($events | Where-Object event -eq 'profile_declared' | Select-Object -First 1).profile
           if ($profile.properties.typescript_project_model_status -ne 'ready') { throw 'TypeScript project model was not ready' }
-          if ($profile.properties.typescript_analysis_mode -ne 'semantic-import-type-graph') { throw 'TypeChecker analysis capability changed unexpectedly' }
-          if ($profile.properties.typescript_typechecker_status -ne 'definition-import-type-graph-emitted') { throw 'TypeChecker import/type-use graph did not run' }
+          if ($profile.properties.typescript_analysis_mode -ne 'semantic-import-type-call-graph') { throw 'TypeChecker analysis capability changed unexpectedly' }
+          if ($profile.properties.typescript_typechecker_status -ne 'definition-import-type-call-graph-emitted') { throw 'TypeChecker import/type/call graph did not run' }
           if ($profile.properties.typescript_definition_graph_status -ne 'ready') { throw 'TypeChecker definition graph was not ready' }
-          if ($profile.properties.typescript_semantic_issue_count -ne '0') { throw 'TypeChecker import/type-use graph reported semantic issues' }
+          if ($profile.properties.typescript_semantic_issue_count -ne '0') { throw 'TypeChecker import/type/call graph reported semantic issues' }
           if ($profile.properties.typescript_release_gate -ne 'release-gate-pending') { throw 'Direct worker spoofed release attestation' }
-          if ($profile.properties.typescript_semantic_graph_emission -ne 'definition-import-type-graph-v1') { throw 'Semantic graph emission capability changed unexpectedly' }
+          if ($profile.properties.typescript_semantic_graph_emission -ne 'definition-import-type-call-graph-v1') { throw 'Semantic graph emission capability changed unexpectedly' }
           $semanticNodes = @($events | Where-Object { $_.node.kind -eq 'symbol' -or $_.node.kind -eq 'type' })
           $nodeKinds = @{}
           $nodesById = @{}
@@ -394,25 +466,27 @@ jobs:
             $_.site.evidence[0].extractor -eq 'typescript-native-typechecker' -and
             $_.site.evidence[0].extractor_version -eq '7.0.2'
           } | ForEach-Object { $_.site })
+          $callSites = @($semanticSites | Where-Object kind -eq 'call')
           if ($semanticNodes.Count -eq 0) { throw 'Definition graph emitted no semantic nodes' }
-          if ($semanticSites.Count -eq 0) { throw 'Import/type-use graph emitted no semantic sites' }
-          if ($dependencyEdges.Count -eq 0) { throw 'Import/type-use graph emitted no semantic dependency edges' }
+          if ($semanticSites.Count -eq 0) { throw 'Import/type/call graph emitted no semantic sites' }
+          if ($dependencyEdges.Count -eq 0) { throw 'Import/type/call graph emitted no semantic dependency edges' }
           if ([int]$profile.properties.typescript_semantic_node_count -ne $semanticNodes.Count) { throw 'Semantic node count drifted' }
           if ([int]$profile.properties.typescript_semantic_relation_count -ne $semanticEdges.Count) { throw 'Semantic relation count drifted' }
           if ([int]$profile.properties.typescript_semantic_site_count -ne $semanticSites.Count) { throw 'Semantic site count drifted' }
+          if ([int]$profile.properties.typescript_semantic_call_site_count -ne $callSites.Count) { throw 'Semantic call-site count drifted' }
           $definitionKinds = @($definitionEdges | ForEach-Object { $_.edge.kind } | Sort-Object -Unique)
           if (($definitionKinds -join ',') -ne 'declares,extends,implements,instantiates') { throw "Definition relation kinds drifted: $($definitionKinds -join ',')" }
           $dependencyKinds = @($dependencyEdges | ForEach-Object { $_.edge.kind } | Sort-Object -Unique)
-          if (($dependencyKinds -join ',') -ne 'imports,reexports,type_uses') { throw "Semantic dependency kinds drifted: $($dependencyKinds -join ',')" }
+          if (($dependencyKinds -join ',') -ne 'calls,imports,reexports,type_uses') { throw "Semantic dependency kinds drifted: $($dependencyKinds -join ',')" }
           $siteKinds = @($semanticSites | ForEach-Object { $_.kind } | Sort-Object -Unique)
-          if (($siteKinds -join ',') -ne 'type_use,web_import,web_reexport') { throw "Semantic site kinds drifted: $($siteKinds -join ',')" }
+          if (($siteKinds -join ',') -ne 'call,type_use,web_import,web_reexport') { throw "Semantic site kinds drifted: $($siteKinds -join ',')" }
           $statuses = @($semanticSites | ForEach-Object { $_.resolution_status } | Sort-Object -Unique)
           $unexpectedStatuses = @($statuses | Where-Object { $_ -notin @('resolved', 'candidates', 'external', 'unresolved') })
           if ($unexpectedStatuses.Count -ne 0 -or $statuses -notcontains 'resolved' -or
               $statuses -notcontains 'external' -or $statuses -notcontains 'unresolved') {
             throw "Semantic site statuses drifted: $($statuses -join ',')"
           }
-          $typeOnlyValues = @($semanticSites | ForEach-Object { $_.evidence[0].properties.type_only })
+          $typeOnlyValues = @($semanticSites | Where-Object kind -ne 'call' | ForEach-Object { $_.evidence[0].properties.type_only })
           if (($typeOnlyValues | Where-Object { $_ -isnot [bool] }).Count -ne 0 -or
               $typeOnlyValues -notcontains $true -or $typeOnlyValues -notcontains $false) {
             throw 'Semantic type_only evidence markers are missing or not boolean'
@@ -421,54 +495,68 @@ jobs:
             $linked = @($dependencyEdges | Where-Object { $_.edge.site_id -eq $site.id })
             if ($linked.Count -ne $site.target_ids.Count) { throw "Semantic site/edge cardinality drifted for $($site.id)" }
             if (($site.target_ids -join ',') -ne (($site.target_ids | Sort-Object) -join ',')) { throw "Semantic targets are not sorted for $($site.id)" }
-            $expectedKind = if ($site.kind -eq 'web_import') { 'imports' } elseif ($site.kind -eq 'web_reexport') { 'reexports' } else { 'type_uses' }
+            $expectedKind = if ($site.kind -eq 'web_import') { 'imports' } elseif ($site.kind -eq 'web_reexport') { 'reexports' } elseif ($site.kind -eq 'type_use') { 'type_uses' } else { 'calls' }
             $occurrenceKind = $site.evidence[0].properties.occurrence_kind
             $typeOnly = $site.evidence[0].properties.type_only
             $allowedOccurrences = switch ($site.kind) {
               'web_import' { @('named_import', 'default_import', 'namespace_import', 'side_effect_import', 'empty_import', 'import_equals', 'require_call', 'dynamic_import', 'import_type') }
               'web_reexport' { @('named_reexport', 'namespace_reexport', 'empty_reexport', 'export_star') }
               'type_use' { @('type_reference', 'heritage_type', 'jsdoc_type') }
+              'call' { @('call_expression', 'new_expression', 'tagged_template') }
               default { @() }
             }
             if ($occurrenceKind -notin $allowedOccurrences) {
               throw "Occurrence kind $occurrenceKind is incompatible with $($site.kind): $($site.id)"
             }
-            if (($site.kind -eq 'type_use' -or $occurrenceKind -eq 'import_type') -and -not $typeOnly) {
-              throw "Type-only semantic occurrence omitted type_only=true: $($site.id)"
-            }
-            if ($occurrenceKind -in @('side_effect_import', 'require_call', 'dynamic_import') -and $typeOnly) {
-              throw "Runtime semantic occurrence reported type_only=true: $($site.id)"
-            }
             $evidenceProperties = $site.evidence[0].properties
-            if ($site.kind -eq 'type_use') {
-              if ($evidenceProperties.imported_name -isnot [string] -or
-                  $evidenceProperties.imported_name -ne $site.specifier) {
-                throw "Type-use binding metadata drifted for $($site.id)"
+            $evidencePropertyNames = @($evidenceProperties.PSObject.Properties.Name)
+            if ($site.kind -eq 'call') {
+              if ($evidencePropertyNames -contains 'type_only' -or
+                  $evidencePropertyNames -contains 'imported_name' -or
+                  $evidencePropertyNames -contains 'resolution_mode' -or
+                  $evidenceProperties.call_kind -notin @('function', 'method', 'constructor', 'tagged_template') -or
+                  $evidenceProperties.dispatch -notin @('direct', 'static', 'private', 'fresh_instance', 'super', 'external', 'dynamic', 'open') -or
+                  ($evidencePropertyNames -contains 'module_specifier' -and $evidenceProperties.module_specifier -isnot [string]) -or
+                  $site.resolution_status -eq 'candidates' -or $nodeKinds[$site.source] -ne 'symbol') {
+                throw "Call metadata drifted for $($site.id)"
               }
-            } elseif ($evidenceProperties.module_specifier -isnot [string] -or
-                      $evidenceProperties.module_specifier -ne $site.specifier) {
-              throw "Import/re-export module metadata drifted for $($site.id)"
-            }
-            if ($site.kind -ne 'type_use' -and $occurrenceKind -in @('default_import', 'named_import', 'named_reexport') -and
-                $evidenceProperties.imported_name -isnot [string]) {
-              throw "Named binding metadata is missing for $($site.id)"
-            }
-            if ($occurrenceKind -in @('namespace_import', 'namespace_reexport') -and
-                $evidenceProperties.imported_name -ne '*') {
-              throw "Namespace binding metadata drifted for $($site.id)"
-            }
-            if ($occurrenceKind -eq 'import_equals' -and $evidenceProperties.imported_name -ne '=') {
-              throw "Import-equals binding metadata drifted for $($site.id)"
-            }
-            if ($occurrenceKind -in @('side_effect_import', 'empty_import', 'require_call', 'dynamic_import', 'import_type', 'empty_reexport', 'export_star') -and
-                $evidenceProperties.PSObject.Properties.Name -contains 'imported_name') {
-              throw "Module-only occurrence reported imported_name for $($site.id)"
-            }
-            if ($evidenceProperties.PSObject.Properties.Name -contains 'resolution_mode') {
-              if ($evidenceProperties.resolution_mode -notin @('import', 'require') -or
-                  -not $typeOnly -or $evidenceProperties.module_specifier -isnot [string] -or
-                  $occurrenceKind -eq 'import_equals') {
-                throw "Resolution-mode evidence metadata drifted for $($site.id)"
+            } else {
+              if (($site.kind -eq 'type_use' -or $occurrenceKind -eq 'import_type') -and -not $typeOnly) {
+                throw "Type-only semantic occurrence omitted type_only=true: $($site.id)"
+              }
+              if ($occurrenceKind -in @('side_effect_import', 'require_call', 'dynamic_import') -and $typeOnly) {
+                throw "Runtime semantic occurrence reported type_only=true: $($site.id)"
+              }
+              if ($site.kind -eq 'type_use') {
+                if ($evidenceProperties.imported_name -isnot [string] -or
+                    $evidenceProperties.imported_name -ne $site.specifier) {
+                  throw "Type-use binding metadata drifted for $($site.id)"
+                }
+              } elseif ($evidenceProperties.module_specifier -isnot [string] -or
+                        $evidenceProperties.module_specifier -ne $site.specifier) {
+                throw "Import/re-export module metadata drifted for $($site.id)"
+              }
+              if ($site.kind -ne 'type_use' -and $occurrenceKind -in @('default_import', 'named_import', 'named_reexport') -and
+                  $evidenceProperties.imported_name -isnot [string]) {
+                throw "Named binding metadata is missing for $($site.id)"
+              }
+              if ($occurrenceKind -in @('namespace_import', 'namespace_reexport') -and
+                  $evidenceProperties.imported_name -ne '*') {
+                throw "Namespace binding metadata drifted for $($site.id)"
+              }
+              if ($occurrenceKind -eq 'import_equals' -and $evidenceProperties.imported_name -ne '=') {
+                throw "Import-equals binding metadata drifted for $($site.id)"
+              }
+              if ($occurrenceKind -in @('side_effect_import', 'empty_import', 'require_call', 'dynamic_import', 'import_type', 'empty_reexport', 'export_star') -and
+                  $evidencePropertyNames -contains 'imported_name') {
+                throw "Module-only occurrence reported imported_name for $($site.id)"
+              }
+              if ($evidencePropertyNames -contains 'resolution_mode') {
+                if ($evidenceProperties.resolution_mode -notin @('import', 'require') -or
+                    -not $typeOnly -or $evidenceProperties.module_specifier -isnot [string] -or
+                    $occurrenceKind -eq 'import_equals') {
+                  throw "Resolution-mode evidence metadata drifted for $($site.id)"
+                }
               }
             }
             $siteCondition = $site.condition | ConvertTo-Json -Compress -Depth 32
@@ -530,6 +618,10 @@ jobs:
                   $nodeKinds[$target] -ne 'type') {
                 throw "Concrete type-use site targeted $($nodeKinds[$target])"
               }
+              if ($site.kind -eq 'call' -and $site.resolution_status -eq 'resolved' -and
+                  $nodeKinds[$target] -ne 'symbol') {
+                throw "Exact call site targeted $($nodeKinds[$target])"
+              }
               if ($occurrenceKind -in @(
                     'namespace_import', 'side_effect_import', 'empty_import', 'import_equals', 'require_call',
                     'dynamic_import', 'import_type', 'namespace_reexport', 'empty_reexport', 'export_star'
@@ -545,6 +637,35 @@ jobs:
                 throw "Named semantic binding was weakened to a file target: $($site.id)"
               }
             }
+          }
+          $fixtureCalls = @($callSites | Where-Object { $_.evidence[0].path -eq 'apps/shared/src/calls.ts' })
+          if (-not ($fixtureCalls | Where-Object {
+              $_.specifier -eq 'directTarget' -and $_.resolution_status -eq 'resolved' -and $_.precision -eq 'exact' -and
+              $_.evidence[0].properties.call_kind -eq 'function' -and $_.evidence[0].properties.dispatch -eq 'direct'
+            })) { throw 'Call fixture omitted exact direct function call' }
+          if (-not ($fixtureCalls | Where-Object {
+              $_.specifier -eq 'DirectReceiver' -and $_.resolution_status -eq 'resolved' -and $_.precision -eq 'exact' -and
+              $_.evidence[0].properties.call_kind -eq 'constructor' -and $_.evidence[0].properties.dispatch -eq 'direct'
+            })) { throw 'Call fixture omitted exact constructor call' }
+          if (-not ($fixtureCalls | Where-Object {
+              $_.resolution_status -eq 'resolved' -and $_.precision -eq 'exact' -and
+              $_.evidence[0].properties.call_kind -eq 'method' -and
+              $_.evidence[0].properties.dispatch -in @('static', 'private', 'fresh_instance', 'super')
+            })) { throw 'Call fixture omitted exact method call' }
+          if (-not ($fixtureCalls | Where-Object {
+              $_.specifier -eq 'value.trim' -and $_.resolution_status -eq 'external' -and
+              $_.evidence[0].properties.dispatch -eq 'external'
+            })) { throw 'Call fixture omitted external call ledger entry' }
+          if (-not ($fixtureCalls | Where-Object {
+              $_.specifier -eq 'dynamicTarget' -and $_.resolution_status -eq 'unresolved' -and
+              $_.reason -eq 'function_value_dispatch' -and $_.evidence[0].properties.dispatch -eq 'dynamic'
+            })) { throw 'Call fixture omitted dynamic unresolved ledger entry' }
+          if (-not ($fixtureCalls | Where-Object {
+              $_.specifier -eq 'receiver.directMethod' -and $_.resolution_status -eq 'unresolved' -and
+              $_.reason -eq 'open_method_dispatch' -and $_.evidence[0].properties.dispatch -eq 'open'
+            })) { throw 'Call fixture omitted open-dispatch unresolved ledger entry' }
+          if ($semanticEdges | Where-Object { $_.edge.kind -eq 'may_call' }) {
+            throw 'Web exact-call slice emitted forbidden may_call edges'
           }
           if (-not ($semanticSites | Where-Object { $_.evidence[0].properties.occurrence_kind -eq 'empty_import' })) {
             throw 'Semantic sites omitted empty_import acceptance fixture'
@@ -577,7 +698,7 @@ jobs:
           })
           if ($sourceDependencyEdges.Count -eq 0) { throw 'Semantic union overwrote the source import graph' }
           $completed = ($events | Where-Object event -eq 'scan_completed' | Select-Object -Last 1).coverage
-          if ($completed.completeness -contains 'semantic-complete') { throw 'Import/type-use slice claimed semantic completeness' }
+          if ($completed.completeness -contains 'semantic-complete') { throw 'Import/type/call slice claimed semantic completeness' }
           if (Test-Path workers\web\test\fixtures\polyglot\apps\next-app\NEXT_CONFIG_EXECUTED) { throw 'Next config executed' }
           if (Test-Path workers\web\test\fixtures\polyglot\apps\astro-app\ASTRO_CONFIG_EXECUTED) { throw 'Astro config executed' }
       - run: cargo xtask go-semantic-e2e

@@ -107,7 +107,7 @@ function validateSemanticNode(node: GraphNode, options: TypeScriptDefinitionDelt
     if (identityKind === "named") {
       const resolver = resolverValue(identity.resolver_identity, `${node.id}.canonical_identity.resolver_identity`);
       if (node.properties.resolver_identity !== resolver) throw new Error(`${node.id} resolver identity properties disagree`);
-    } else if (identityKind === "local" || identityKind === "anonymous") {
+    } else if (identityKind === "local" || identityKind === "anonymous" || identityKind === "generated") {
       const origin = identityKind === "local" ? identity.enclosing_symbol : identity.generated_from;
       stringValue(origin, `${node.id}.canonical_identity.${identityKind === "local" ? "enclosing_symbol" : "generated_from"}`);
       const relativePath = stringValue(identity.relative_path, `${node.id}.canonical_identity.relative_path`);

@@ -1,15 +1,24 @@
 import path from "node:path";
 import { isBuiltin } from "node:module";
 import {
+  ModifierFlags,
+  SignatureKind,
   SymbolFlags,
+  TypeFlags,
   type Checker,
+  type Signature,
   type Symbol as CompilerSymbol,
   type Type as CompilerType,
 } from "typescript/unstable/async";
 import {
+  type CallExpression,
   createScanner,
+  type Expression,
   LanguageVariant,
+  type MethodDeclaration,
+  type NewExpression,
   SyntaxKind,
+  type TaggedTemplateExpression,
   tokenIsIdentifierOrKeyword,
   type ExportAssignment,
   type ExportDeclaration,
@@ -55,12 +64,25 @@ export type TypeScriptRawDependencyStatus = "resolved" | "candidates" | "externa
 export type TypeScriptRawDependencyPrecision = "exact" | "overapprox" | "heuristic";
 export type TypeScriptResolutionMode = "import" | "require";
 export type TypeScriptBindingKind = "default" | "named" | "namespace" | "import_equals";
+export type TypeScriptRawCallKind = "function" | "method" | "constructor" | "tagged_template";
+export type TypeScriptRawCallDispatch =
+  | "direct"
+  | "static"
+  | "private"
+  | "fresh_instance"
+  | "super"
+  | "external"
+  | "dynamic"
+  | "open";
 
 export type TypeScriptRawDependencyTarget =
   | { kind: "definition"; key: string }
   | { kind: "file"; relativePath: string }
   | { kind: "external"; locator: string; displayName: string }
   | { kind: "unknown" };
+
+export type TypeScriptRawCallSource = Extract<TypeScriptRawDefinitionEndpoint, { kind: "definition" }>
+  | { kind: "module_initializer"; relativePath: string };
 
 export interface TypeScriptRawDependencyEvidence {
   relativePath: string;
@@ -120,8 +142,25 @@ export interface TypeScriptRawDependencySite {
   evidence: TypeScriptRawDependencyEvidence;
 }
 
+export interface TypeScriptRawCallSite {
+  key: string;
+  source: TypeScriptRawCallSource;
+  specifier: string;
+  callKind: TypeScriptRawCallKind;
+  dispatch: TypeScriptRawCallDispatch;
+  moduleSpecifier: string | null;
+  status: Exclude<TypeScriptRawDependencyStatus, "candidates">;
+  precision: "exact" | "heuristic";
+  reason: string | null;
+  condition: Condition;
+  targets: TypeScriptRawDependencyTarget[];
+  targetConditions: Condition[];
+  evidence: TypeScriptRawDependencyEvidence;
+}
+
 export interface TypeScriptRawDependencyDelta {
   sites: TypeScriptRawDependencySite[];
+  calls: TypeScriptRawCallSite[];
   moduleExports: TypeScriptRawModuleExport[];
   issues: TypeScriptSemanticIssue[];
   typeCheckerQueries: number;
@@ -140,6 +179,7 @@ interface QueryCounter { value: number; prior: number }
 interface DefinitionIndex {
   definitions: ReadonlyMap<string, TypeScriptRawDefinition>;
   byDeclaration: ReadonlyMap<string, readonly string[]>;
+  declarationLocationsByDefinition: ReadonlyMap<string, readonly string[]>;
   heritageBySource: ReadonlyMap<string, readonly {
     startOffset: number;
     endOffset: number;
@@ -678,8 +718,8 @@ function structuredBindingSpecifier(
 }
 
 function siteKey(
-  source: TypeScriptRawDefinitionEndpoint,
-  kind: TypeScriptRawDependencySiteKind,
+  source: TypeScriptRawDefinitionEndpoint | TypeScriptRawCallSource,
+  kind: TypeScriptRawDependencySiteKind | "call",
   relativePath: string,
   startOffset: number,
   endOffset: number,
@@ -715,12 +755,16 @@ function typeUseTargets(
 function definitionIndex(delta: TypeScriptRawDefinitionDelta): DefinitionIndex {
   const definitions = new Map(delta.definitions.map((definition) => [definition.key, definition]));
   const byDeclarationMutable = new Map<string, Set<string>>();
+  const declarationLocationsByDefinitionMutable = new Map<string, Set<string>>();
   const heritageBySourceMutable = new Map<string, Array<{ startOffset: number; endOffset: number; target: string }>>();
   const add = (relativePath: string, startOffset: number, endOffset: number, key: string): void => {
     const location = declarationKey(relativePath, startOffset, endOffset);
     const keys = byDeclarationMutable.get(location) ?? new Set<string>();
     keys.add(key);
     byDeclarationMutable.set(location, keys);
+    const locations = declarationLocationsByDefinitionMutable.get(key) ?? new Set<string>();
+    locations.add(location);
+    declarationLocationsByDefinitionMutable.set(key, locations);
   };
   for (const definition of delta.definitions) {
     if (definition.semanticKind !== "generic_instance") {
@@ -747,6 +791,10 @@ function definitionIndex(delta: TypeScriptRawDefinitionDelta): DefinitionIndex {
   return {
     definitions,
     byDeclaration: new Map([...byDeclarationMutable].map(([location, keys]) => [location, [...keys].sort(compareStrings)])),
+    declarationLocationsByDefinition: new Map([...declarationLocationsByDefinitionMutable].map(([key, locations]) => [
+      key,
+      [...locations].sort(compareStrings),
+    ])),
     heritageBySource: new Map([...heritageBySourceMutable].map(([relativePath, entries]) => [
       relativePath,
       entries.sort((left, right) => left.startOffset - right.startOffset
@@ -813,19 +861,21 @@ async function compilerSymbolTargets(
   sourcesByPath: ReadonlyMap<string, TypeScriptSemanticSource>,
   preferType: boolean,
   allowCrossSourceDeclaration = false,
-): Promise<{ targets: TypeScriptRawDependencyTarget[]; external: boolean }> {
+): Promise<{ targets: TypeScriptRawDependencyTarget[]; external: boolean; repositoryDeclarations: boolean }> {
   const unwrapped = await unwrapAlias(checker, symbol, counter);
-  if (unwrapped === null) return { targets: [], external: false };
+  if (unwrapped === null) return { targets: [], external: false, repositoryDeclarations: false };
   if (unwrapped.declarations.length > MAX_SYMBOL_DECLARATIONS) throw new DependencyContractError("dependency symbol declaration limit exceeded");
   const definitions: TypeScriptRawDependencyTarget[] = [];
   const files: TypeScriptRawDependencyTarget[] = [];
   let external = false;
+  let repositoryDeclarations = false;
   for (const declaration of unwrapped.declarations) {
     const declaredSource = sourcesByPath.get(compilerPathKey(String(declaration.path)));
     if (declaredSource === undefined) {
       external = true;
       continue;
     }
+    repositoryDeclarations = true;
     beginQuery(counter);
     const resolved = await declaration.resolve();
     if (resolved === undefined) continue;
@@ -856,7 +906,7 @@ async function compilerSymbolTargets(
   const preferred = canonicalDefinitions.filter((target) => index.definitions.get(target.key)?.graphKind === (preferType ? "type" : "symbol"));
   const alternate = canonicalDefinitions.filter((target) => index.definitions.get(target.key)?.graphKind === (preferType ? "symbol" : "type"));
   const selected = preferred.length > 0 ? preferred : alternate.length > 0 ? alternate : canonicalDefinitions;
-  return { targets: selected.length > 0 ? selected : deduplicateTargets(files), external };
+  return { targets: selected.length > 0 ? selected : deduplicateTargets(files), external, repositoryDeclarations };
 }
 
 async function collectModuleExportProofs(
@@ -2073,6 +2123,649 @@ async function collectCallImport(
     `TypeChecker ${expressionText} module occurrence`)];
 }
 
+function transparentCallExpression(expression: Expression): Expression {
+  let current = expression;
+  for (let depth = 0; depth < MAX_AST_DEPTH; depth += 1) {
+    if (![
+      SyntaxKind.ParenthesizedExpression,
+      SyntaxKind.NonNullExpression,
+      SyntaxKind.AsExpression,
+      SyntaxKind.TypeAssertionExpression,
+      SyntaxKind.SatisfiesExpression,
+    ].includes(current.kind)) return current;
+    current = (current as Expression & { readonly expression: Expression }).expression;
+  }
+  throw new DependencyContractError("call callee wrapper depth limit exceeded");
+}
+
+function callCallee(node: CallExpression | NewExpression | TaggedTemplateExpression): Expression {
+  return node.kind === SyntaxKind.TaggedTemplateExpression
+    ? (node as TaggedTemplateExpression).tag
+    : (node as CallExpression | NewExpression).expression;
+}
+
+function callOccurrenceKind(node: CallExpression | NewExpression | TaggedTemplateExpression): string {
+  switch (node.kind) {
+    case SyntaxKind.CallExpression: return "call_expression";
+    case SyntaxKind.NewExpression: return "new_expression";
+    case SyntaxKind.TaggedTemplateExpression: return "tagged_template";
+    default: throw new DependencyContractError("unsupported call-like occurrence");
+  }
+}
+
+function callSpecifier(node: CallExpression | NewExpression | TaggedTemplateExpression, sourceFile: SourceFile): string {
+  const text = callCallee(node).getText(sourceFile);
+  return (text.length === 0 ? "<call>" : text).slice(0, MAX_SPECIFIER_CHARS);
+}
+
+function defaultCallKind(
+  node: CallExpression | NewExpression | TaggedTemplateExpression,
+): TypeScriptRawCallKind {
+  return node.kind === SyntaxKind.NewExpression
+    ? "constructor"
+    : node.kind === SyntaxKind.TaggedTemplateExpression
+      ? "tagged_template"
+      : "function";
+}
+
+function callKindForDefinition(
+  node: CallExpression | NewExpression | TaggedTemplateExpression,
+  semanticKind: string,
+): TypeScriptRawCallKind {
+  if (node.kind === SyntaxKind.NewExpression || node.kind === SyntaxKind.TaggedTemplateExpression) {
+    return defaultCallKind(node);
+  }
+  if (semanticKind === "method") return "method";
+  if (semanticKind === "constructor") return "constructor";
+  return "function";
+}
+
+async function queryResolvedSignature(
+  checker: Checker,
+  node: CallExpression | NewExpression | TaggedTemplateExpression,
+  counter: QueryCounter,
+): Promise<Signature | undefined> {
+  beginQuery(counter);
+  const first = await checker.getResolvedSignature(node);
+  beginQuery(counter);
+  const second = await checker.getResolvedSignature(node);
+  if (first?.id !== second?.id) {
+    throw new DependencyContractError("resolved signature response correlation mismatch");
+  }
+  return first;
+}
+
+async function resolvedSignatureDeclaration(
+  signature: Signature,
+  counter: QueryCounter,
+  index: DefinitionIndex,
+  sourcesByPath: ReadonlyMap<string, TypeScriptSemanticSource>,
+): Promise<{
+  declaration: Node | null;
+  definitionKeys: string[];
+  external: boolean;
+}> {
+  const handle = signature.declaration;
+  if (handle === undefined) return { declaration: null, definitionKeys: [], external: false };
+  const declaredSource = sourcesByPath.get(compilerPathKey(String(handle.path)));
+  if (declaredSource === undefined) return { declaration: null, definitionKeys: [], external: true };
+  beginQuery(counter);
+  const declaration = await handle.resolve();
+  if (declaration === undefined) return { declaration: null, definitionKeys: [], external: false };
+  const sourceFile = declaration.getSourceFile();
+  const source = sourcesByPath.get(compilerPathKey(String(sourceFile.path)))
+    ?? sourcesByPath.get(compilerPathKey(sourceFile.fileName));
+  if (source === undefined) return { declaration: null, definitionKeys: [], external: true };
+  if (source.relativePath !== declaredSource.relativePath) {
+    throw new DependencyContractError("resolved signature declaration source correlation mismatch");
+  }
+  const { startOffset, endOffset } = nodeSpan(declaration, source.sourceFile);
+  const definitionKeys = (index.byDeclaration.get(declarationKey(
+    source.relativePath,
+    startOffset,
+    endOffset,
+  )) ?? []).filter((key) => index.definitions.get(key)?.graphKind === "symbol");
+  return { declaration, definitionKeys: [...definitionKeys], external: false };
+}
+
+function callTargetNode(expression: Expression): Node {
+  const callee = transparentCallExpression(expression);
+  if (callee.kind === SyntaxKind.PropertyAccessExpression) {
+    return (callee as Expression & { readonly name: Node }).name;
+  }
+  return callee;
+}
+
+function callRootIdentifier(expression: Expression): Identifier | null {
+  const callee = transparentCallExpression(expression);
+  if (callee.kind === SyntaxKind.Identifier) return callee as Identifier;
+  if (callee.kind === SyntaxKind.PropertyAccessExpression) {
+    return leftmostIdentifier(callee);
+  }
+  if (callee.kind === SyntaxKind.ElementAccessExpression) {
+    return leftmostIdentifier((callee as Expression & { readonly expression: Node }).expression);
+  }
+  return null;
+}
+
+async function callBindingProvenance(
+  expression: Expression,
+  context: CollectionContext,
+  checker: Checker,
+  counter: QueryCounter,
+): Promise<BindingProvenance | undefined> {
+  const root = callRootIdentifier(expression);
+  if (root === null || isLexicallyShadowedBinding(root, root.text)) return undefined;
+  const symbol = await querySymbol(checker, root, counter, "call binding provenance");
+  if (symbol !== undefined && context.externalBindings.isAmbiguous(symbol.id)) return undefined;
+  return (symbol === undefined ? undefined : context.externalBindings.get(symbol.id))
+    ?? context.bindingProvenance.get(root.text);
+}
+
+function directCallDispatch(
+  node: CallExpression | NewExpression | TaggedTemplateExpression,
+  declaration: Node,
+): { callKind: TypeScriptRawCallKind; dispatch: TypeScriptRawCallDispatch; reason: string | null } {
+  const callee = transparentCallExpression(callCallee(node));
+  if (
+    node.kind === SyntaxKind.CallExpression
+    && (
+      (node as CallExpression).questionDotToken !== undefined
+      || (
+        (callee.kind === SyntaxKind.PropertyAccessExpression || callee.kind === SyntaxKind.ElementAccessExpression)
+        && (callee as Expression & { readonly questionDotToken?: Node }).questionDotToken !== undefined
+      )
+    )
+  ) return { callKind: "function", dispatch: "dynamic", reason: "optional_call_dispatch" };
+
+  if (declaration.kind === SyntaxKind.MethodSignature) {
+    return { callKind: "method", dispatch: "open", reason: "interface_dispatch" };
+  }
+  if (declaration.kind === SyntaxKind.MethodDeclaration) {
+    const method = declaration as MethodDeclaration;
+    if ((method.modifierFlags & ModifierFlags.Static) !== 0) {
+      return { callKind: "method", dispatch: "static", reason: null };
+    }
+    if ((method.modifierFlags & ModifierFlags.Private) !== 0 || method.name.kind === SyntaxKind.PrivateIdentifier) {
+      return { callKind: "method", dispatch: "private", reason: null };
+    }
+    if (callee.kind === SyntaxKind.PropertyAccessExpression || callee.kind === SyntaxKind.ElementAccessExpression) {
+      const receiver = transparentCallExpression((callee as Expression & { readonly expression: Expression }).expression);
+      if (receiver.kind === SyntaxKind.NewExpression) {
+        return { callKind: "method", dispatch: "fresh_instance", reason: null };
+      }
+      if (receiver.kind === SyntaxKind.SuperKeyword) {
+        return { callKind: "method", dispatch: "super", reason: null };
+      }
+    }
+    return { callKind: "method", dispatch: "open", reason: "open_method_dispatch" };
+  }
+  if (declaration.kind === SyntaxKind.Constructor) {
+    const directConstructor = node.kind === SyntaxKind.NewExpression || callee.kind === SyntaxKind.SuperKeyword;
+    return directConstructor
+      ? { callKind: "constructor", dispatch: callee.kind === SyntaxKind.SuperKeyword ? "super" : "direct", reason: null }
+      : { callKind: "constructor", dispatch: "dynamic", reason: "constructor_value_dispatch" };
+  }
+  const directlySpelledCallable = [
+    SyntaxKind.Identifier,
+    SyntaxKind.PropertyAccessExpression,
+    SyntaxKind.ElementAccessExpression,
+    SyntaxKind.FunctionExpression,
+    SyntaxKind.ArrowFunction,
+  ].includes(callee.kind);
+  if (!directlySpelledCallable) {
+    return {
+      callKind: node.kind === SyntaxKind.TaggedTemplateExpression ? "tagged_template" : "function",
+      dispatch: "dynamic",
+      reason: "function_value_dispatch",
+    };
+  }
+  return {
+    callKind: node.kind === SyntaxKind.TaggedTemplateExpression ? "tagged_template" : "function",
+    dispatch: "direct",
+    reason: null,
+  };
+}
+
+const CALLABLE_EXECUTION_SYNTAX_KINDS = new Set<SyntaxKind>([
+  SyntaxKind.FunctionDeclaration,
+  SyntaxKind.FunctionExpression,
+  SyntaxKind.ArrowFunction,
+  SyntaxKind.MethodDeclaration,
+  SyntaxKind.Constructor,
+  SyntaxKind.GetAccessor,
+  SyntaxKind.SetAccessor,
+]);
+
+const CANONICAL_CALLER_SEMANTIC_KINDS = new Set([
+  "function",
+  "method",
+  "constructor",
+  "anonymous_function",
+  "local_function",
+]);
+
+function callExecutionOwner(
+  context: CollectionContext,
+  index: DefinitionIndex,
+  node: CallExpression | NewExpression | TaggedTemplateExpression,
+): { source: TypeScriptRawCallSource; unavailable: boolean } {
+  let branch: Node = node;
+  let insideDecorator = false;
+  for (let current = node.parent, depth = 0; current !== undefined && depth < MAX_AST_DEPTH; current = current.parent, depth += 1) {
+    if (current.kind === SyntaxKind.Decorator) insideDecorator = true;
+    if (current.kind === SyntaxKind.PropertyDeclaration) {
+      const name = (current as Node & { readonly name?: Node }).name;
+      if (name === branch) {
+        // A computed field name belongs to the surrounding class-evaluation
+        // scope. Its initializer, however, may run for each instance and has
+        // no canonical caller until field-initializer scopes are represented.
+        branch = current;
+        continue;
+      }
+      return {
+        source: { kind: "module_initializer", relativePath: context.source.relativePath },
+        unavailable: true,
+      };
+    }
+    if (current.kind === SyntaxKind.ClassStaticBlockDeclaration) {
+      return {
+        source: { kind: "module_initializer", relativePath: context.source.relativePath },
+        unavailable: true,
+      };
+    }
+    if (!CALLABLE_EXECUTION_SYNTAX_KINDS.has(current.kind)) {
+      branch = current;
+      continue;
+    }
+    const name = (current as Node & { readonly name?: Node }).name;
+    if (name === branch) {
+      // A computed callable name executes in the surrounding scope, not when
+      // the callable body is invoked. Continue looking for that outer scope.
+      branch = current;
+      continue;
+    }
+    if (insideDecorator) {
+      // Decorator expressions execute while the surrounding declaration is
+      // evaluated. Until that execution scope is represented explicitly, do
+      // not attribute them to the decorated member or constructor.
+      return {
+        source: { kind: "module_initializer", relativePath: context.source.relativePath },
+        unavailable: true,
+      };
+    }
+    const endpoint = ownerAtNode(index, context.source, current);
+    const definition = endpoint?.kind === "definition" ? index.definitions.get(endpoint.key) : undefined;
+    if (
+      endpoint?.kind === "definition"
+      && definition?.graphKind === "symbol"
+      && CANONICAL_CALLER_SEMANTIC_KINDS.has(definition.semanticKind)
+    ) return { source: endpoint, unavailable: false };
+    return {
+      source: { kind: "module_initializer", relativePath: context.source.relativePath },
+      unavailable: true,
+    };
+  }
+  if (insideDecorator) {
+    return {
+      source: { kind: "module_initializer", relativePath: context.source.relativePath },
+      unavailable: true,
+    };
+  }
+  const owner = context.owner.kind === "definition"
+    ? index.definitions.get(context.owner.key)
+    : undefined;
+  const hasCanonicalCaller = owner?.graphKind === "symbol"
+    && CANONICAL_CALLER_SEMANTIC_KINDS.has(owner.semanticKind);
+  const moduleInitializerOwner = owner === undefined || (
+    owner.graphKind === "symbol"
+    && ["variable", "function_variable", "local_function_variable"].includes(owner.semanticKind)
+  );
+  return {
+    source: context.owner.kind === "definition" && hasCanonicalCaller
+      ? context.owner
+      : { kind: "module_initializer", relativePath: context.source.relativePath },
+    unavailable: context.owner.kind === "definition" && !hasCanonicalCaller && !moduleInitializerOwner,
+  };
+}
+
+function createCallSite(
+  context: CollectionContext,
+  index: DefinitionIndex,
+  node: CallExpression | NewExpression | TaggedTemplateExpression,
+  callKind: TypeScriptRawCallKind,
+  dispatch: TypeScriptRawCallDispatch,
+  targetsValue: readonly TypeScriptRawDependencyTarget[],
+  statusValue: Exclude<TypeScriptRawDependencyStatus, "candidates">,
+  precisionValue: "exact" | "heuristic",
+  reasonValue: string | null,
+  moduleSpecifier: string | null,
+): TypeScriptRawCallSite {
+  const { startOffset, endOffset } = nodeSpan(node, context.source.sourceFile);
+  const executionOwner = callExecutionOwner(context, index, node);
+  const source = executionOwner.source;
+  const callerDefinitionUnavailable = executionOwner.unavailable;
+  let targets = deduplicateTargets(targetsValue);
+  let status = statusValue;
+  let precision = precisionValue;
+  let reason = reasonValue;
+  let finalDispatch = dispatch;
+  if (!context.syntacticallyValid) {
+    targets = [{ kind: "unknown" }];
+    status = "unresolved";
+    precision = "heuristic";
+    reason = "syntax_invalid";
+    finalDispatch = "dynamic";
+  }
+  if (context.syntacticallyValid && callerDefinitionUnavailable) {
+    // Calls in execution scopes which do not yet have a canonical callable
+    // definition (for example, instance field initializers) remain in the
+    // ledger, but must not be attributed to the module initializer as exact.
+    targets = [{ kind: "unknown" }];
+    status = "unresolved";
+    precision = "heuristic";
+    reason = "caller_definition_unavailable";
+    finalDispatch = "dynamic";
+  }
+  if (targets.length !== 1) {
+    targets = [{ kind: "unknown" }];
+    status = "unresolved";
+    precision = "heuristic";
+    reason ??= "call_target_not_unique";
+    finalDispatch = "dynamic";
+  }
+  const condition = WEB_CONDITION;
+  return {
+    key: siteKey(source, "call", context.source.relativePath, startOffset, endOffset),
+    source,
+    specifier: callSpecifier(node, context.source.sourceFile),
+    callKind,
+    dispatch: finalDispatch,
+    moduleSpecifier,
+    status,
+    precision,
+    reason,
+    condition,
+    targets,
+    targetConditions: [condition],
+    evidence: {
+      relativePath: context.source.relativePath,
+      startOffset,
+      endOffset,
+      detail: status === "resolved"
+        ? "TypeChecker resolved-signature direct call occurrence"
+        : status === "external"
+          ? "TypeChecker external call boundary occurrence"
+          : "TypeChecker unresolved call occurrence",
+      occurrenceKind: callOccurrenceKind(node),
+      targetBasis: basisForTargets(targets),
+    },
+  };
+}
+
+async function isModuleLoaderCall(
+  node: CallExpression,
+  checker: Checker,
+  counter: QueryCounter,
+): Promise<boolean> {
+  if (node.expression.kind === SyntaxKind.ImportKeyword) return true;
+  if (
+    node.expression.kind !== SyntaxKind.Identifier
+    || (node.expression as Identifier).text !== "require"
+    || isLexicallyShadowedBinding(node.expression, "require", true)
+  ) return false;
+  const symbol = await querySymbol(checker, node.expression, counter, "call-graph require callee");
+  return symbol === undefined || await isAmbientRequireSymbol(symbol, counter);
+}
+
+async function collectSemanticCall(
+  node: CallExpression | NewExpression | TaggedTemplateExpression,
+  context: CollectionContext,
+  checker: Checker,
+  counter: QueryCounter,
+  index: DefinitionIndex,
+  sourcesByPath: ReadonlyMap<string, TypeScriptSemanticSource>,
+): Promise<TypeScriptRawCallSite[]> {
+  if (node.kind === SyntaxKind.CallExpression) {
+    const call = node as CallExpression;
+    const lexicalModuleLoader = call.expression.kind === SyntaxKind.ImportKeyword
+      || (
+        call.expression.kind === SyntaxKind.Identifier
+        && (call.expression as Identifier).text === "require"
+        && !isLexicallyShadowedBinding(call.expression, "require", true)
+      );
+    if (
+      (!context.syntacticallyValid && lexicalModuleLoader)
+      || (context.syntacticallyValid && await isModuleLoaderCall(call, checker, counter))
+    ) return [];
+  }
+  if (!context.syntacticallyValid) {
+    return [createCallSite(
+      context,
+      index,
+      node,
+      defaultCallKind(node),
+      "dynamic",
+      [{ kind: "unknown" }],
+      "unresolved",
+      "heuristic",
+      "syntax_invalid",
+      null,
+    )];
+  }
+
+  const callee = callCallee(node);
+  const provenance = await callBindingProvenance(callee, context, checker, counter);
+  const externalFromBinding = provenance?.targets.find(
+    (target): target is Extract<TypeScriptRawDependencyTarget, { kind: "external" }> => target.kind === "external",
+  ) ?? (provenance !== undefined && isExternalModuleSpecifier(provenance.moduleSpecifier)
+    ? externalTarget(provenance.moduleSpecifier, provenance.importedName)
+    : undefined);
+  const calleeType = await queryTypeAtLocation(checker, callee, counter, "call callee");
+  if (calleeType !== undefined && (calleeType.flags & (TypeFlags.Union | TypeFlags.Intersection)) !== 0) {
+    return [createCallSite(context, index, node, defaultCallKind(node), "dynamic",
+      [{ kind: "unknown" }], "unresolved", "heuristic",
+      (calleeType.flags & TypeFlags.Intersection) !== 0 ? "intersection_dispatch" : "union_dispatch", null)];
+  }
+  const signature = await queryResolvedSignature(checker, node, counter);
+  if (signature === undefined) {
+    if (externalFromBinding !== undefined) {
+      return [createCallSite(context, index, node, defaultCallKind(node), "external", [externalFromBinding], "external", "heuristic",
+        "external_package_instance_unavailable", provenance?.moduleSpecifier ?? null)];
+    }
+    return [createCallSite(context, index, node, defaultCallKind(node), "dynamic",
+      [{ kind: "unknown" }], "unresolved", "heuristic", "resolved_signature_unavailable", null)];
+  }
+
+  const resolved = await resolvedSignatureDeclaration(signature, counter, index, sourcesByPath);
+  if (resolved.external) {
+    const target = externalFromBinding ?? externalTarget(`typescript:stdlib:${callSpecifier(node, context.source.sourceFile)}`);
+    const canonical = target.kind === "external" && (
+      target.locator.startsWith("typescript:stdlib:") || target.locator.startsWith("node:")
+    );
+    return [createCallSite(context, index, node, defaultCallKind(node), "external",
+      [target], "external", canonical ? "exact" : "heuristic",
+      canonical ? null : "external_package_instance_unavailable", provenance?.moduleSpecifier ?? null)];
+  }
+  if (resolved.declaration === null && externalFromBinding !== undefined) {
+    return [createCallSite(context, index, node, defaultCallKind(node), "external", [externalFromBinding], "external", "heuristic",
+      "external_package_instance_unavailable", provenance?.moduleSpecifier ?? null)];
+  }
+  const targetNode = callTargetNode(callee);
+  const targetSymbol = await querySymbol(checker, targetNode, counter, "direct call target");
+  const compilerTargetResolution = targetSymbol === undefined
+    ? { targets: [] as TypeScriptRawDependencyTarget[], external: false, repositoryDeclarations: false }
+    : await compilerSymbolTargets(targetSymbol, checker, counter, index, sourcesByPath, false);
+  const rootIdentifier = callRootIdentifier(callee);
+  const rootSymbol = rootIdentifier === null || rootIdentifier === targetNode
+    ? targetSymbol
+    : await querySymbol(checker, rootIdentifier, counter, "direct call root");
+  const compilerRootResolution = rootSymbol === undefined || rootSymbol === targetSymbol
+    ? compilerTargetResolution
+    : await compilerSymbolTargets(rootSymbol, checker, counter, index, sourcesByPath, false);
+  const compilerTargets = compilerTargetResolution.targets
+    .filter((target): target is Extract<TypeScriptRawDependencyTarget, { kind: "definition" }> => target.kind === "definition")
+    .map((target) => target.key);
+  const compilerGlobalBoundary = resolved.declaration === null
+    && rootIdentifier !== null
+    && !isLexicallyShadowedBinding(rootIdentifier, rootIdentifier.text)
+    && !compilerTargetResolution.repositoryDeclarations
+    && !compilerRootResolution.repositoryDeclarations
+    && calleeType !== undefined
+    && !calleeType.isErrorType();
+  if (
+    resolved.declaration === null
+    && (compilerTargetResolution.external || compilerRootResolution.external || compilerGlobalBoundary)
+  ) {
+    return [createCallSite(
+      context,
+      index,
+      node,
+      defaultCallKind(node),
+      "external",
+      [externalTarget(`typescript:stdlib:${callSpecifier(node, context.source.sourceFile)}`)],
+      "external",
+      "exact",
+      null,
+      null,
+    )];
+  }
+  if (calleeType !== undefined) {
+    beginQuery(counter);
+    const firstSignatures = await checker.getSignaturesOfType(
+      calleeType,
+      node.kind === SyntaxKind.NewExpression ? SignatureKind.Construct : SignatureKind.Call,
+    );
+    beginQuery(counter);
+    const secondSignatures = await checker.getSignaturesOfType(
+      calleeType,
+      node.kind === SyntaxKind.NewExpression ? SignatureKind.Construct : SignatureKind.Call,
+    );
+    if (
+      !Array.isArray(firstSignatures)
+      || !Array.isArray(secondSignatures)
+      || firstSignatures.length > MAX_SYMBOL_DECLARATIONS
+      || secondSignatures.length > MAX_SYMBOL_DECLARATIONS
+    ) {
+      throw new DependencyContractError("call signature response exceeds its bounded cardinality");
+    }
+    if (
+      JSON.stringify(firstSignatures.map((candidate) => candidate.id))
+      !== JSON.stringify(secondSignatures.map((candidate) => candidate.id))
+    ) {
+      throw new DependencyContractError("call signature response correlation mismatch");
+    }
+    if (firstSignatures.length > 1) {
+      return [createCallSite(context, index, node, defaultCallKind(node), "dynamic",
+        [{ kind: "unknown" }], "unresolved", "heuristic", "overload_dispatch", null)];
+    }
+  }
+  if (resolved.declaration === null || resolved.definitionKeys.length !== 1) {
+    return [createCallSite(context, index, node, defaultCallKind(node), "dynamic",
+      [{ kind: "unknown" }], "unresolved", "heuristic",
+      resolved.declaration === null ? "resolved_signature_declaration_missing" : "resolved_signature_not_canonical", null)];
+  }
+
+  const targetKey = resolved.definitionKeys[0]!;
+  const definition = index.definitions.get(targetKey);
+  if (definition === undefined || definition.graphKind !== "symbol") {
+    return [createCallSite(context, index, node, defaultCallKind(node), "dynamic", [{ kind: "unknown" }], "unresolved", "heuristic",
+      "resolved_signature_not_canonical", null)];
+  }
+  if ((index.declarationLocationsByDefinition.get(targetKey)?.length ?? 0) > 1) {
+    return [createCallSite(context, index, node, callKindForDefinition(node, definition.semanticKind), "dynamic",
+      [{ kind: "unknown" }], "unresolved", "heuristic", "overload_dispatch", null)];
+  }
+  if (definition.semanticKind === "function_variable" || definition.semanticKind === "local_function_variable" || definition.semanticKind === "variable") {
+    return [createCallSite(context, index, node, defaultCallKind(node), "dynamic", [{ kind: "unknown" }], "unresolved", "heuristic",
+      "function_value_dispatch", null)];
+  }
+
+  const transparent = transparentCallExpression(callee);
+  const directExpressionDeclaration = [SyntaxKind.FunctionExpression, SyntaxKind.ArrowFunction].includes(transparent.kind);
+  const superCall = transparent.kind === SyntaxKind.SuperKeyword;
+  const constructorOwner = definition.semanticKind === "constructor" && definition.owner.kind === "definition"
+    ? definition.owner.key
+    : null;
+  const compilerTargetMatches = compilerTargets.length === 1 && (
+    compilerTargets[0] === targetKey
+    || (
+      node.kind === SyntaxKind.NewExpression
+      && constructorOwner !== null
+      && compilerTargets[0] === constructorOwner
+    )
+  );
+  if (
+    !directExpressionDeclaration
+    && !superCall
+    && !compilerTargetMatches
+  ) {
+    return [createCallSite(context, index, node, callKindForDefinition(node, definition.semanticKind), "dynamic", [{ kind: "unknown" }], "unresolved", "heuristic",
+      "function_value_dispatch", null)];
+  }
+
+  if (
+    resolved.declaration.kind === SyntaxKind.MethodDeclaration
+    && ((resolved.declaration as MethodDeclaration).modifierFlags & ModifierFlags.Static) !== 0
+    && (transparent.kind === SyntaxKind.PropertyAccessExpression || transparent.kind === SyntaxKind.ElementAccessExpression)
+  ) {
+    const receiver = transparentCallExpression(
+      (transparent as Expression & { readonly expression: Expression }).expression,
+    );
+    if (receiver.kind !== SyntaxKind.SuperKeyword) {
+      const receiverSymbol = await querySymbol(checker, receiver, counter, "static call receiver");
+      const receiverTargets = receiverSymbol === undefined
+        ? []
+        : (await compilerSymbolTargets(receiverSymbol, checker, counter, index, sourcesByPath, true)).targets
+          .filter((target): target is Extract<TypeScriptRawDependencyTarget, { kind: "definition" }> => target.kind === "definition")
+          .map((target) => target.key);
+      const ownerKey = definition.owner.kind === "definition" ? definition.owner.key : null;
+      if (ownerKey === null || receiverTargets.length !== 1 || receiverTargets[0] !== ownerKey) {
+        return [createCallSite(context, index, node, callKindForDefinition(node, definition.semanticKind), "dynamic", [{ kind: "unknown" }], "unresolved", "heuristic",
+          "function_value_dispatch", null)];
+      }
+    }
+  }
+  if (
+    resolved.declaration.kind === SyntaxKind.MethodDeclaration
+    && ((resolved.declaration as MethodDeclaration).modifierFlags & (ModifierFlags.Static | ModifierFlags.Private)) === 0
+    && (resolved.declaration as MethodDeclaration).name.kind !== SyntaxKind.PrivateIdentifier
+    && (transparent.kind === SyntaxKind.PropertyAccessExpression || transparent.kind === SyntaxKind.ElementAccessExpression)
+  ) {
+    const receiver = transparentCallExpression(
+      (transparent as Expression & { readonly expression: Expression }).expression,
+    );
+    if (receiver.kind === SyntaxKind.NewExpression) {
+      const constructorExpression = callCallee(receiver as NewExpression);
+      const constructorSymbol = await querySymbol(checker, callTargetNode(constructorExpression), counter, "fresh call receiver");
+      const constructorTargets = constructorSymbol === undefined
+        ? []
+        : (await compilerSymbolTargets(constructorSymbol, checker, counter, index, sourcesByPath, true)).targets
+          .filter((target): target is Extract<TypeScriptRawDependencyTarget, { kind: "definition" }> => target.kind === "definition")
+          .map((target) => target.key);
+      const ownerKey = definition.owner.kind === "definition" ? definition.owner.key : null;
+      if (ownerKey === null || constructorTargets.length !== 1 || constructorTargets[0] !== ownerKey) {
+        return [createCallSite(context, index, node, callKindForDefinition(node, definition.semanticKind), "dynamic", [{ kind: "unknown" }], "unresolved", "heuristic",
+          "function_value_dispatch", null)];
+      }
+    }
+  }
+
+  const direct = directCallDispatch(node, resolved.declaration);
+  // New/tagged syntax is part of the protocol contract even when the resolved
+  // declaration is a function or method. Dispatch remains semantic, while the
+  // occurrence determines these two call kinds.
+  const directCallKind = node.kind === SyntaxKind.CallExpression
+    ? direct.callKind
+    : defaultCallKind(node);
+  if (direct.reason !== null) {
+    return [createCallSite(context, index, node, directCallKind, direct.dispatch, [{ kind: "unknown" }], "unresolved", "heuristic",
+      direct.reason, null)];
+  }
+  return [createCallSite(context, index, node, directCallKind, direct.dispatch, [{ kind: "definition", key: targetKey }],
+    "resolved", "exact", null, provenance?.moduleSpecifier ?? null)];
+}
+
 async function collectImportType(
   node: ImportTypeNode,
   context: CollectionContext,
@@ -2579,6 +3272,12 @@ function sortSites(left: TypeScriptRawDependencySite, right: TypeScriptRawDepend
     || compareStrings(JSON.stringify(left.targets), JSON.stringify(right.targets));
 }
 
+function sortCallSites(left: TypeScriptRawCallSite, right: TypeScriptRawCallSite): number {
+  return compareStrings(left.key, right.key)
+    || compareStrings(left.specifier, right.specifier)
+    || compareStrings(JSON.stringify(left.targets), JSON.stringify(right.targets));
+}
+
 function occurrenceIdentity(site: TypeScriptRawDependencySite): string {
   return JSON.stringify([
     site.kind,
@@ -2612,6 +3311,15 @@ export interface TypeScriptDependencyValidationSource {
   nonLiteralModuleSpans: readonly TypeScriptNonLiteralModuleValidationSpan[];
   /** Parser-confirmed named type-use terminal spans and occurrence kinds. */
   typeUseSpans: readonly TypeScriptTypeUseValidationSpan[];
+  /** Parser/TypeChecker-confirmed non-module call-like occurrences. */
+  callSpans: readonly TypeScriptCallValidationSpan[];
+}
+
+export interface TypeScriptCallValidationSpan {
+  startOffset: number;
+  endOffset: number;
+  occurrenceKind: "call_expression" | "new_expression" | "tagged_template";
+  specifier: string;
 }
 
 export interface TypeScriptModuleCallValidationSpan {
@@ -2921,6 +3629,74 @@ export async function moduleCallValidationSpans(
     budget.value = counter.value;
   }
   return sortModuleCallValidationSpans(spans);
+}
+
+export async function callValidationSpans(
+  checker: Checker,
+  sourceFile: SourceFile,
+  budget: TypeScriptValidationQueryBudget = { value: 0 },
+  syntacticallyValid = true,
+): Promise<TypeScriptCallValidationSpan[]> {
+  const spans = new Map<string, TypeScriptCallValidationSpan>();
+  const visited = new Set<string>();
+  const counter: QueryCounter = { value: budget.value, prior: 0 };
+  let count = 0;
+  const visit = async (node: Node, depth: number): Promise<void> => {
+    if (depth > MAX_AST_DEPTH) throw new DependencyContractError("call validation AST depth limit exceeded");
+    const key = childTraversalKey(node, sourceFile);
+    if (visited.has(key)) return;
+    visited.add(key);
+    count += 1;
+    if (count > MAX_AST_NODES) throw new DependencyContractError("call validation AST node limit exceeded");
+    if (
+      node.kind === SyntaxKind.CallExpression
+      || node.kind === SyntaxKind.NewExpression
+      || node.kind === SyntaxKind.TaggedTemplateExpression
+    ) {
+      const call = node as CallExpression | NewExpression | TaggedTemplateExpression;
+      const callExpression = call.kind === SyntaxKind.CallExpression ? call as CallExpression : null;
+      const lexicalModuleLoader = callExpression !== null && (
+        callExpression.expression.kind === SyntaxKind.ImportKeyword
+        || (
+          callExpression.expression.kind === SyntaxKind.Identifier
+          && (callExpression.expression as Identifier).text === "require"
+          && !isLexicallyShadowedBinding(callExpression.expression, "require", true)
+        )
+      );
+      const moduleLoader = callExpression !== null && (
+        syntacticallyValid
+          ? await isModuleLoaderCall(callExpression, checker, counter)
+          : lexicalModuleLoader
+      );
+      if (!moduleLoader) {
+        const spanValue = nodeSpan(call, sourceFile);
+        const occurrence: TypeScriptCallValidationSpan = {
+          ...spanValue,
+          occurrenceKind: callOccurrenceKind(call) as TypeScriptCallValidationSpan["occurrenceKind"],
+          specifier: callSpecifier(call, sourceFile),
+        };
+        spans.set(JSON.stringify(occurrence), occurrence);
+      }
+    }
+    const children = new Map<string, Node>();
+    node.forEachChild((child) => {
+      const childKey = childTraversalKey(child, sourceFile);
+      if (!children.has(childKey)) children.set(childKey, child);
+      return undefined;
+    });
+    for (const child of children.values()) await visit(child, depth + 1);
+  };
+  try {
+    await visit(sourceFile, 0);
+  } finally {
+    budget.value = counter.value;
+  }
+  return [...spans.values()].sort((left, right) => (
+    left.startOffset - right.startOffset
+    || left.endOffset - right.endOffset
+    || compareStrings(left.occurrenceKind, right.occurrenceKind)
+    || compareStrings(left.specifier, right.specifier)
+  ));
 }
 
 async function typeUseValidationSpansWithCounter(
@@ -4154,7 +4930,8 @@ export function validateTypeScriptRawDependencyDelta(
   definitionsDelta: Pick<TypeScriptRawDefinitionDelta, "definitions">,
   sources: readonly TypeScriptDependencyValidationSource[],
 ): void {
-  if (delta.sites.length > MAX_SITES) throw new DependencyContractError("raw dependency site limit exceeded");
+  if (!Array.isArray(delta.calls)) throw new DependencyContractError("raw dependency call ledger is missing");
+  if (delta.sites.length + delta.calls.length > MAX_SITES) throw new DependencyContractError("raw dependency site limit exceeded");
   const sourceLengths = new Map<string, number>();
   const sourceTexts = new Map<string, string>();
   const sourceSyntaxValidity = new Map<string, boolean>();
@@ -4162,6 +4939,7 @@ export function validateTypeScriptRawDependencyDelta(
   const moduleCallSpans = new Map<string, ReadonlyMap<string, string>>();
   const nonLiteralModuleSpans = new Map<string, ReadonlyMap<string, TypeScriptNonLiteralModuleValidationSpan>>();
   const typeUseSpans = new Map<string, ReadonlyMap<string, TypeScriptTypeUseValidationSpan>>();
+  const callSpans = new Map<string, ReadonlyMap<string, TypeScriptCallValidationSpan>>();
   for (const source of sources) {
     if (!isCanonicalRelativePath(source.relativePath)) throw new DependencyContractError("raw dependency source path is not canonical");
     if (sourceLengths.has(source.relativePath)) throw new DependencyContractError("raw dependency source path is duplicated");
@@ -4309,6 +5087,28 @@ export function validateTypeScriptRawDependencyDelta(
       typeUses.set(key, { ...spanValue });
     }
     typeUseSpans.set(source.relativePath, typeUses);
+    if (!Array.isArray(source.callSpans)) {
+      throw new DependencyContractError("raw dependency call validation spans are missing");
+    }
+    const sourceCalls = new Map<string, TypeScriptCallValidationSpan>();
+    for (const spanValue of source.callSpans) {
+      if (
+        !Number.isSafeInteger(spanValue.startOffset)
+        || !Number.isSafeInteger(spanValue.endOffset)
+        || spanValue.startOffset < 0
+        || spanValue.endOffset <= spanValue.startOffset
+        || spanValue.endOffset > source.text.length
+        || !["call_expression", "new_expression", "tagged_template"].includes(spanValue.occurrenceKind)
+        || typeof spanValue.specifier !== "string"
+        || spanValue.specifier.length === 0
+        || spanValue.specifier.length > MAX_SPECIFIER_CHARS
+        || hasUnpairedSurrogate(spanValue.specifier)
+      ) throw new DependencyContractError("raw dependency call validation span is invalid");
+      const key = `${spanValue.startOffset}\0${spanValue.endOffset}\0${spanValue.occurrenceKind}`;
+      if (sourceCalls.has(key)) throw new DependencyContractError("raw dependency call validation span is duplicated");
+      sourceCalls.set(key, { ...spanValue });
+    }
+    callSpans.set(source.relativePath, sourceCalls);
   }
   const sitesByKey = new Map(delta.sites.map((site) => [site.key, site]));
   const definitions = new Map(definitionsDelta.definitions.map((definition) => [definition.key, definition]));
@@ -5010,13 +5810,159 @@ export function validateTypeScriptRawDependencyDelta(
     const expectedBasis = basisForTargets(site.targets);
     if (site.evidence.targetBasis !== expectedBasis) throw new DependencyContractError("raw dependency target basis is invalid");
   }
+
+  const seenCallSpans = new Set<string>();
+  let previousCallKey = "";
+  for (const call of delta.calls) {
+    if (previousCallKey !== "" && compareStrings(previousCallKey, call.key) >= 0) {
+      throw new DependencyContractError("raw call sites are not strictly sorted");
+    }
+    previousCallKey = call.key;
+    const sourceLength = sourceLengths.get(call.evidence.relativePath);
+    if (
+      sourceLength === undefined
+      || !Number.isSafeInteger(call.evidence.startOffset)
+      || !Number.isSafeInteger(call.evidence.endOffset)
+      || call.evidence.startOffset < 0
+      || call.evidence.endOffset <= call.evidence.startOffset
+      || call.evidence.endOffset > sourceLength
+      || call.evidence.detail.length === 0
+      || call.evidence.detail.length > MAX_SPECIFIER_CHARS
+      || hasUnpairedSurrogate(call.evidence.detail)
+      || !["call_expression", "new_expression", "tagged_template"].includes(call.evidence.occurrenceKind)
+    ) throw new DependencyContractError("raw call evidence is invalid");
+    const validationKey = `${call.evidence.startOffset}\0${call.evidence.endOffset}\0${call.evidence.occurrenceKind}`;
+    const validationSpan = callSpans.get(call.evidence.relativePath)?.get(validationKey);
+    if (validationSpan === undefined || validationSpan.specifier !== call.specifier) {
+      throw new DependencyContractError("raw call site does not correlate with its parser occurrence");
+    }
+    const globalValidationKey = `${call.evidence.relativePath}\0${validationKey}`;
+    if (!seenCallSpans.add(globalValidationKey)) {
+      throw new DependencyContractError("raw call occurrence is duplicated");
+    }
+    if (
+      call.specifier.length === 0
+      || call.specifier.length > MAX_SPECIFIER_CHARS
+      || hasUnpairedSurrogate(call.specifier)
+      || !["function", "method", "constructor", "tagged_template"].includes(call.callKind)
+      || !["direct", "static", "private", "fresh_instance", "super", "external", "dynamic", "open"].includes(call.dispatch)
+      || (call.evidence.occurrenceKind === "new_expression" && call.callKind !== "constructor")
+      || (call.evidence.occurrenceKind === "tagged_template" && call.callKind !== "tagged_template")
+      || (call.moduleSpecifier !== null && (
+        call.moduleSpecifier.length === 0
+        || call.moduleSpecifier.length > MAX_SPECIFIER_CHARS
+        || hasUnpairedSurrogate(call.moduleSpecifier)
+      ))
+    ) throw new DependencyContractError("raw call metadata is invalid");
+    let sourcePath: string;
+    if (call.source.kind === "definition") {
+      const source = definitions.get(call.source.key);
+      if (
+        source === undefined
+        || source.graphKind !== "symbol"
+        || ![
+          "function",
+          "method",
+          "constructor",
+          "anonymous_function",
+          "local_function",
+        ].includes(source.semanticKind)
+      ) {
+        throw new DependencyContractError("raw call caller is not a canonical symbol definition");
+      }
+      sourcePath = source.relativePath;
+    } else if (call.source.kind === "module_initializer") {
+      sourcePath = call.source.relativePath;
+      if (!isCanonicalRelativePath(sourcePath) || !sourceLengths.has(sourcePath)) {
+        throw new DependencyContractError("raw call module initializer source is invalid");
+      }
+    } else {
+      throw new DependencyContractError("raw call source kind is invalid");
+    }
+    if (sourcePath !== call.evidence.relativePath) {
+      throw new DependencyContractError("raw call caller and evidence paths disagree");
+    }
+    const expectedKey = siteKey(call.source, "call", call.evidence.relativePath, call.evidence.startOffset, call.evidence.endOffset);
+    if (call.key !== expectedKey) throw new DependencyContractError("raw call site key is not canonical");
+    if (call.targets.length !== 1 || call.targetConditions.length !== 1) {
+      throw new DependencyContractError("raw call site must contain exactly one target and condition");
+    }
+    validateCanonicalRawCondition(call.condition);
+    validateCanonicalRawCondition(call.targetConditions[0]!);
+    if (JSON.stringify(call.condition) !== JSON.stringify(call.targetConditions[0])) {
+      throw new DependencyContractError("raw call site and target conditions disagree");
+    }
+    const target = call.targets[0]!;
+    if (target.kind === "definition") {
+      const definition = definitions.get(target.key);
+      if (
+        definition === undefined
+        || definition.graphKind !== "symbol"
+        || ![
+          "function",
+          "local_function",
+          "anonymous_function",
+          "method",
+          "constructor",
+        ].includes(definition.semanticKind)
+      ) throw new DependencyContractError("raw exact call target is not a canonical callable symbol");
+    } else if (target.kind === "external") {
+      if (
+        target.locator.length === 0
+        || target.locator.length > MAX_SPECIFIER_CHARS
+        || target.displayName.length === 0
+        || target.displayName.length > MAX_SPECIFIER_CHARS
+        || hasUnpairedSurrogate(target.locator)
+        || hasUnpairedSurrogate(target.displayName)
+      ) throw new DependencyContractError("raw call external target is invalid");
+    } else if (target.kind !== "unknown") {
+      throw new DependencyContractError("raw call target kind is invalid");
+    }
+    if (
+      (!["resolved", "external", "unresolved"].includes(call.status)
+        || !["exact", "heuristic"].includes(call.precision))
+      || (call.status === "resolved" && (
+        call.precision !== "exact"
+        || call.reason !== null
+        || target.kind !== "definition"
+        || !["direct", "static", "private", "fresh_instance", "super"].includes(call.dispatch)
+      ))
+      || (call.status === "external" && (
+        target.kind !== "external"
+        || call.dispatch !== "external"
+        || (call.precision !== "exact" && call.precision !== "heuristic")
+        || (call.precision === "exact" ? call.reason !== null : !call.reason)
+      ))
+      || (call.status === "unresolved" && (
+        target.kind !== "unknown"
+        || call.precision !== "heuristic"
+        || !call.reason
+        || !["dynamic", "open"].includes(call.dispatch)
+      ))
+    ) throw new DependencyContractError("raw call status/precision/target contract is invalid");
+    if (call.reason !== null && (
+      call.reason.length === 0
+      || call.reason.length > MAX_SPECIFIER_CHARS
+      || hasUnpairedSurrogate(call.reason)
+    )) throw new DependencyContractError("raw call reason is invalid");
+    if (call.evidence.targetBasis !== basisForTargets(call.targets)) {
+      throw new DependencyContractError("raw call target basis is invalid");
+    }
+  }
+  for (const [relativePath, spans] of callSpans) {
+    for (const key of spans.keys()) {
+      if (!seenCallSpans.has(`${relativePath}\0${key}`)) {
+        throw new DependencyContractError("parser-confirmed call occurrence is missing from the raw ledger");
+      }
+    }
+  }
 }
 
 /**
- * Extract import, re-export and named type occurrences from the same confined
- * Program/TypeChecker snapshot used by the definition graph. The DTO carries
- * no protocol IDs or package locators; scanner-side code adds those only after
- * the entire semantic delta passes validation.
+ * Extract import, re-export, named type, and non-module-loader call
+ * occurrences from the same confined Program/TypeChecker snapshot used by the
+ * definition graph. The DTO carries no protocol IDs; scanner-side code adds
+ * canonical graph IDs only after the entire semantic delta passes validation.
  */
 export async function extractTypeScriptRawDependencyDelta(
   checker: Checker,
@@ -5026,6 +5972,7 @@ export async function extractTypeScriptRawDependencyDelta(
 ): Promise<TypeScriptRawDependencyDelta> {
   const counter: QueryCounter = { value: 0, prior: priorTypeCheckerQueries };
   const sites: TypeScriptRawDependencySite[] = [];
+  const calls: TypeScriptRawCallSite[] = [];
   const issues: TypeScriptSemanticIssue[] = [];
   let astNodes = 0;
   try {
@@ -5059,6 +6006,18 @@ export async function extractTypeScriptRawDependencyDelta(
       const childContext = semanticOwner === null ? context : { ...context, owner: semanticOwner };
       if (!childContext.syntacticallyValid) {
         sites.push(...collectInvalidOccurrences(node, childContext));
+        if (
+          node.kind === SyntaxKind.CallExpression
+          || node.kind === SyntaxKind.NewExpression
+          || node.kind === SyntaxKind.TaggedTemplateExpression
+        ) calls.push(...await collectSemanticCall(
+          node as CallExpression | NewExpression | TaggedTemplateExpression,
+          childContext,
+          checker,
+          counter,
+          index,
+          sourcesByPath,
+        ));
       } else if (node.kind === SyntaxKind.ImportDeclaration) {
         sites.push(...await collectImportDeclaration(node as ImportDeclaration, childContext, checker, counter, index, sourcesByPath));
       } else if (node.kind === SyntaxKind.JSDocImportTag) {
@@ -5071,6 +6030,23 @@ export async function extractTypeScriptRawDependencyDelta(
         sites.push(...await collectCallImport(
           node as Node & { readonly expression: Node; readonly arguments: readonly Node[] },
           childContext, checker, counter, index, sourcesByPath,
+        ));
+        calls.push(...await collectSemanticCall(
+          node as CallExpression,
+          childContext,
+          checker,
+          counter,
+          index,
+          sourcesByPath,
+        ));
+      } else if (node.kind === SyntaxKind.NewExpression || node.kind === SyntaxKind.TaggedTemplateExpression) {
+        calls.push(...await collectSemanticCall(
+          node as NewExpression | TaggedTemplateExpression,
+          childContext,
+          checker,
+          counter,
+          index,
+          sourcesByPath,
         ));
       } else if (node.kind === SyntaxKind.ImportType) {
         sites.push(...await collectImportType(node as ImportTypeNode, childContext, checker, counter, index, sourcesByPath));
@@ -5120,7 +6096,7 @@ export async function extractTypeScriptRawDependencyDelta(
           : new Map<string, BindingProvenance>(),
       }, 0);
     }
-    if (sites.length > MAX_SITES) throw new DependencyContractError(`dependency site limit ${MAX_SITES} exceeded`);
+    if (sites.length + calls.length > MAX_SITES) throw new DependencyContractError(`dependency site limit ${MAX_SITES} exceeded`);
     const occurrences = new Map<string, TypeScriptRawDependencySite>();
     for (const site of sites.sort(sortSites)) {
       const occurrence = occurrenceIdentity(site);
@@ -5151,6 +6127,15 @@ export async function extractTypeScriptRawDependencyDelta(
       unique.set(site.key, site);
     }
     const uniqueSites = [...unique.values()].sort(sortSites);
+    const uniqueCallsByKey = new Map<string, TypeScriptRawCallSite>();
+    for (const call of calls.sort(sortCallSites)) {
+      const existing = uniqueCallsByKey.get(call.key);
+      if (existing !== undefined && JSON.stringify(existing) !== JSON.stringify(call)) {
+        throw new DependencyContractError(`call site identity collision ${call.key}`);
+      }
+      uniqueCallsByKey.set(call.key, existing ?? call);
+    }
+    const uniqueCalls = [...uniqueCallsByKey.values()].sort(sortCallSites);
     const moduleExports = await collectModuleExportProofs(
       checker,
       counter,
@@ -5172,6 +6157,14 @@ export async function extractTypeScriptRawDependencyDelta(
     );
     const validationSources: TypeScriptDependencyValidationSource[] = [];
     for (const source of sources) {
+      const callQueryBudget = { value: counter.prior + counter.value };
+      const callSpans = await callValidationSpans(
+        checker,
+        source.sourceFile,
+        callQueryBudget,
+        source.syntacticallyValid,
+      );
+      counter.value = callQueryBudget.value - counter.prior;
       validationSources.push({
         relativePath: source.relativePath,
         text: source.expectedText,
@@ -5188,10 +6181,12 @@ export async function extractTypeScriptRawDependencyDelta(
         typeUseSpans: source.syntacticallyValid
           ? await typeUseValidationSpansWithCounter(checker, source.sourceFile, counter)
           : [],
+        callSpans,
       });
     }
     const result = {
       sites: uniqueSites,
+      calls: uniqueCalls,
       moduleExports,
       issues,
       typeCheckerQueries: counter.value,
@@ -5205,6 +6200,7 @@ export async function extractTypeScriptRawDependencyDelta(
   } catch (error) {
     return {
       sites: [],
+      calls: [],
       moduleExports: [],
       issues: [{
         code: "typescript_semantic_dependency_contract_violation",

@@ -919,6 +919,15 @@ fn validate_semantic_maps(
             .expect("base validation requires dependency-site sources to exist");
         let rust_semantic_site = is_rust_semantic_dependency_site(site, source_node);
         let web_semantic_site = is_web_semantic_dependency_site(site, source_node);
+        if web_semantic_site
+            && site.kind == "call"
+            && site.resolution_status == ResolutionStatus::Candidates
+        {
+            return invariant(format!(
+                "Web semantic call site {} cannot use candidates/may_call",
+                site.id
+            ));
+        }
         match site.kind.as_str() {
             "call" if source_node.kind != "symbol" => {
                 return invariant(format!(
@@ -1048,7 +1057,8 @@ fn validate_semantic_maps(
         // Rust HIR sites currently use one condition for every target. Web
         // conditional exports may narrow each candidate edge to its own
         // browser/server/package branch while the site carries their union.
-        let require_same_condition = rust_semantic_site;
+        let require_same_condition =
+            rust_semantic_site || (web_semantic_site && site.kind == "call");
         for edge in edges
             .values()
             .filter(|edge| edge.site_id.as_deref() == Some(site.id.as_str()))
@@ -1153,7 +1163,7 @@ fn is_rust_import_site_kind(kind: &str) -> bool {
 fn is_evidence_driven_semantic_site(site: &DependencySite) -> bool {
     matches!(
         site.kind.as_str(),
-        "type_use" | "rust_use" | "rust_reexport" | "web_import" | "web_reexport"
+        "call" | "type_use" | "rust_use" | "rust_reexport" | "web_import" | "web_reexport"
     ) && site
         .evidence
         .first()
@@ -1283,7 +1293,7 @@ fn is_rust_semantic_dependency_site(site: &DependencySite, source: &GraphNode) -
 
 fn is_web_semantic_dependency_site(site: &DependencySite, source: &GraphNode) -> bool {
     matches!(site.kind.as_str(), "web_import" | "web_reexport")
-        || (site.kind == "type_use"
+        || (matches!(site.kind.as_str(), "call" | "type_use")
             && matches!(
                 source.properties.get("language").and_then(Value::as_str),
                 Some("typescript" | "javascript")

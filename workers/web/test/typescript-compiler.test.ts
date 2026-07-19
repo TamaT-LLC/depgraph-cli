@@ -8,6 +8,7 @@ import {
   analyzeTypeScriptProjectWithRuntimeForTest,
   exerciseTypeScriptCompilerLifecycleForTest,
   isConfinedTypeScriptInputPath,
+  TYPESCRIPT_COMPILER_PROFILE_PROPERTIES,
   TypeScriptProjectError,
   type TypeScriptAnalysisTestRuntime,
 } from "../src/typescript-compiler";
@@ -84,6 +85,47 @@ test("TypeChecker smoke remains valid for empty and declaration-free projects", 
     assert.ok(analysis.project.standardLibraryFiles > 0);
     assert.equal(analysis.project.emittedSemanticDiagnostics, analysis.semanticDiagnostics.length);
   }
+});
+
+test("project analysis carries the cumulative exact-call capability and call validation ledger", async () => {
+  const analysis = await analyzeTypeScriptProject(new Map([
+    ["valid.ts", [
+      "export function direct(): void {}",
+      "direct();",
+      "class Constructed {}",
+      "new Constructed();",
+      "function tag(strings: TemplateStringsArray): string { return strings[0] ?? \"\"; }",
+      "tag`value`;",
+      "const require = (value: string): string => value;",
+      "require(\"./shadowed\");",
+      "void import(\"./module\");",
+      "",
+    ].join("\n")],
+    ["broken.ts", "export function broken(): void { broken( }\n"],
+  ]));
+
+  assert.equal(TYPESCRIPT_COMPILER_PROFILE_PROPERTIES.typescript_analysis_mode, "semantic-import-type-call-graph");
+  assert.equal(TYPESCRIPT_COMPILER_PROFILE_PROPERTIES.typescript_typechecker_status, "definition-import-type-call-graph-emitted");
+  assert.equal(TYPESCRIPT_COMPILER_PROFILE_PROPERTIES.typescript_semantic_graph_emission, "definition-import-type-call-graph-v1");
+  assert.deepEqual(
+    analysis.callSpans.get("valid.ts")?.map(({ occurrenceKind, specifier }) => ({ occurrenceKind, specifier })),
+    [
+      { occurrenceKind: "call_expression", specifier: "direct" },
+      { occurrenceKind: "new_expression", specifier: "Constructed" },
+      { occurrenceKind: "tagged_template", specifier: "tag" },
+      { occurrenceKind: "call_expression", specifier: "require" },
+    ],
+  );
+  assert.deepEqual(
+    analysis.callSpans.get("broken.ts")?.map(({ occurrenceKind, specifier }) => ({ occurrenceKind, specifier })),
+    [{ occurrenceKind: "call_expression", specifier: "broken" }],
+  );
+  assert.ok((analysis.get("broken.ts")?.length ?? 0) > 0);
+  assert.equal(analysis.project.semanticCallSites, analysis.dependencyGraph.calls.length);
+  assert.equal(
+    analysis.project.semanticSites,
+    analysis.dependencyGraph.sites.length + analysis.dependencyGraph.calls.length,
+  );
 });
 
 test("import-type candidate detection stays bounded on repeated comments", { timeout: 3_000 }, async () => {

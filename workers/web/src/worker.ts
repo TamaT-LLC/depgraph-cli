@@ -52,14 +52,15 @@ function typeScriptProfileProperties(
       typescript_semantic_node_count: "0",
       typescript_semantic_relation_count: "0",
       typescript_semantic_site_count: "0",
+      typescript_semantic_call_site_count: "0",
       typescript_semantic_issue_count: "0",
     };
   }
   return {
     ...TYPESCRIPT_COMPILER_PROFILE_PROPERTIES,
     typescript_typechecker_status: project.definitionGraphStatus === "ready"
-      ? "definition-import-type-graph-emitted"
-      : "definition-import-type-graph-discarded",
+      ? "definition-import-type-call-graph-emitted"
+      : "definition-import-type-call-graph-discarded",
     typescript_definition_graph_status: project.definitionGraphStatus,
     typescript_project_model_failure_reason: "none",
     typescript_project_root_files: String(project.rootFiles),
@@ -73,6 +74,7 @@ function typeScriptProfileProperties(
     typescript_semantic_node_count: String(project.semanticNodes),
     typescript_semantic_relation_count: String(project.semanticRelations),
     typescript_semantic_site_count: String(project.semanticSites),
+    typescript_semantic_call_site_count: String(project.semanticCallSites),
     typescript_semantic_issue_count: String(project.semanticIssues),
   };
 }

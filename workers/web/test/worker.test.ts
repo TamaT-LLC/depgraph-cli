@@ -69,10 +69,10 @@ test("worker emits deterministic protocol graph without executing project code",
       typescript_compiler_version: "7.0.2",
       typescript_compiler_selection: "bundled-only",
       typescript_compiler_fallback: "fail-closed",
-      typescript_analysis_mode: "semantic-import-type-graph",
+      typescript_analysis_mode: "semantic-import-type-call-graph",
       typescript_project_local_policy: "metadata-only",
       typescript_project_local_loaded: "false",
-      typescript_typechecker_status: "definition-import-type-graph-emitted",
+      typescript_typechecker_status: "definition-import-type-call-graph-emitted",
       typescript_definition_graph_status: "ready",
       typescript_project_model_status: "ready",
       typescript_project_config: "worker-neutral-allowlist",
@@ -80,7 +80,7 @@ test("worker emits deterministic protocol graph without executing project code",
       typescript_standard_library_source: "bundled",
       typescript_standard_library_integrity: "build-produced-pending-core-attestation",
       typescript_release_gate: "release-gate-pending",
-      typescript_semantic_graph_emission: "definition-import-type-graph-v1",
+      typescript_semantic_graph_emission: "definition-import-type-call-graph-v1",
       project_code_executed: "false",
     },
   );
@@ -166,19 +166,57 @@ test("worker emits deterministic protocol graph without executing project code",
   const semanticNodes = nodes.filter((node) => node.kind === "symbol" || node.kind === "type");
   const semanticEdges = edges.filter((edge) => edge.phase === "semantic");
   const semanticSites = sites.filter((site) => site.evidence[0]?.kind === "semantic");
+  const semanticCallSites = semanticSites.filter((site) => site.kind === "call");
+  const moduleInitializers = semanticNodes.filter((node) => (
+    node.kind === "symbol" && node.properties.symbol_kind === "generated_module_initializer"
+  ));
   const definitionEdges = semanticEdges.filter((edge) => edge.site_id === null);
   const dependencySemanticEdges = semanticEdges.filter((edge) => edge.site_id !== null);
   assert.equal(Number(profile?.properties.typescript_semantic_node_count), semanticNodes.length);
   assert.equal(Number(profile?.properties.typescript_semantic_relation_count), semanticEdges.length);
   assert.equal(Number(profile?.properties.typescript_semantic_site_count), semanticSites.length);
+  assert.equal(Number(profile?.properties.typescript_semantic_call_site_count), semanticCallSites.length);
   assert.equal(profile?.properties.typescript_semantic_issue_count, "0");
   assert.ok(semanticNodes.some((node) => node.kind === "symbol" && node.properties.symbol_kind === "function"));
   assert.ok(semanticNodes.some((node) => node.kind === "symbol" && node.properties.symbol_kind === "variable"));
   assert.ok(semanticNodes.some((node) => node.kind === "type" && node.properties.type_kind === "class"));
   assert.ok(semanticNodes.some((node) => node.kind === "type" && node.properties.type_kind === "generic_instance"));
   assert.deepEqual([...new Set(definitionEdges.map((edge) => edge.kind))].sort(), ["declares", "extends", "implements", "instantiates"]);
-  assert.deepEqual([...new Set(semanticSites.map((site) => site.kind))].sort(), ["type_use", "web_import", "web_reexport"]);
-  assert.deepEqual([...new Set(dependencySemanticEdges.map((edge) => edge.kind))].sort(), ["imports", "reexports", "type_uses"]);
+  assert.deepEqual([...new Set(semanticSites.map((site) => site.kind))].sort(), ["call", "type_use", "web_import", "web_reexport"]);
+  assert.deepEqual([...new Set(dependencySemanticEdges.map((edge) => edge.kind))].sort(), ["calls", "imports", "reexports", "type_uses"]);
+  assert.ok(moduleInitializers.length > 0);
+  assert.ok(moduleInitializers.every((node) => (
+    node.properties.generated === true
+    && node.properties.canonical_identity?.identity_kind === "generated"
+    && node.properties.canonical_identity?.generated_from === definitionEdges
+      .find((edge) => edge.kind === "declares" && edge.target === node.id)?.source
+  )));
+  assert.deepEqual(
+    [...new Set(semanticCallSites.map((site) => site.resolution_status))].sort(),
+    ["external", "resolved", "unresolved"],
+  );
+  assert.ok(semanticCallSites.every((site) => (
+    site.target_ids.length === 1
+    && site.resolution_status !== "candidates"
+    && site.precision !== "overapprox"
+    && nodeById.get(site.source)?.kind === "symbol"
+    && site.evidence[0]?.properties.analysis_mode === "semantic-import-type-call-graph"
+    && typeof site.evidence[0]?.properties.call_kind === "string"
+    && typeof site.evidence[0]?.properties.dispatch === "string"
+  )));
+  for (const site of semanticCallSites) {
+    const target = nodeById.get(site.target_ids[0]);
+    assert.equal(target?.kind, site.resolution_status === "resolved"
+      ? "symbol"
+      : site.resolution_status === "external"
+        ? "external_system"
+        : "unknown_target");
+    const callEdges = dependencySemanticEdges.filter((edge) => edge.site_id === site.id);
+    assert.equal(callEdges.length, 1);
+    assert.equal(callEdges[0]?.kind, "calls");
+    assert.deepEqual(callEdges[0]?.condition, site.condition);
+  }
+  assert.ok(!edges.some((edge) => edge.kind === "may_call"));
   assert.ok(definitionEdges.every((edge) => edge.resolution_status === "resolved" && edge.precision === "exact"));
   assert.ok(semanticEdges.every((edge) => edge.evidence[0]?.kind === "semantic" && edge.evidence[0]?.properties.profile_id === profile.id));
   assert.ok(semanticSites.every((site) => site.evidence[1]?.kind === "source"));
@@ -868,6 +906,7 @@ test("malformed TypeScript source increments unsupported syntax coverage", async
   assert.equal(profile?.properties.typescript_semantic_node_count, "0");
   assert.equal(profile?.properties.typescript_semantic_relation_count, "1");
   assert.equal(profile?.properties.typescript_semantic_site_count, "1");
+  assert.equal(profile?.properties.typescript_semantic_call_site_count, "0");
   assert.equal(profile?.properties.typescript_semantic_issue_count, "1");
   const recovered = result.events.find((event) => (
     event.site?.evidence[0]?.kind === "semantic"
@@ -1004,9 +1043,9 @@ test("TypeChecker definition graph resolves inventory modules and bundled stdlib
     .filter((event) => event.edge?.phase === "semantic")
     .map((event) => event.edge);
   assert.equal(profile?.properties.typescript_project_model_status, "ready");
-  assert.equal(profile?.properties.typescript_typechecker_status, "definition-import-type-graph-emitted");
+  assert.equal(profile?.properties.typescript_typechecker_status, "definition-import-type-call-graph-emitted");
   assert.equal(profile?.properties.typescript_definition_graph_status, "ready");
-  assert.equal(profile?.properties.typescript_semantic_graph_emission, "definition-import-type-graph-v1");
+  assert.equal(profile?.properties.typescript_semantic_graph_emission, "definition-import-type-call-graph-v1");
   assert.equal(profile?.properties.typescript_project_root_files, "2");
   assert.ok(Number(profile?.properties.typescript_typechecker_queries) > 1);
   assert.equal(profile?.properties.typescript_static_config_files, "1");
@@ -2408,6 +2447,8 @@ test("relocated packaged worker fails closed when its adjacent TypeScript compil
       assert.equal(profile?.properties.typescript_definition_graph_status, "failed");
       assert.equal(profile?.properties.typescript_semantic_node_count, "0");
       assert.equal(profile?.properties.typescript_semantic_relation_count, "0");
+      assert.equal(profile?.properties.typescript_semantic_site_count, "0");
+      assert.equal(profile?.properties.typescript_semantic_call_site_count, "0");
       assert.equal(profile?.properties.typescript_semantic_issue_count, "0");
       assert.equal(profile?.properties.typescript_project_model_failure_reason, "compiler_unavailable");
       assert.ok(events.some((event) => (
