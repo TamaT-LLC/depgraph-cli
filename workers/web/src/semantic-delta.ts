@@ -1,6 +1,6 @@
 import path from "node:path";
 import { stableId } from "./ids";
-import type { GraphEdge, GraphNode, JsonValue } from "./types";
+import { compareUtf8, type GraphEdge, type GraphNode, type JsonValue } from "./types";
 
 const DEFINITION_RELATIONS = new Set(["declares", "extends", "implements", "instantiates"]);
 const SEMANTIC_NODE_KINDS = new Set(["symbol", "type"]);
@@ -193,7 +193,7 @@ export function mergeTypeScriptDefinitionDelta(
   const edges = new Map(baseEdges);
   const deltaNodeIds = new Set<string>();
   const deltaResolvers = new Map<string, string>();
-  for (const node of [...delta.nodes].sort((left, right) => left.id.localeCompare(right.id))) {
+  for (const node of [...delta.nodes].sort((left, right) => compareUtf8(left.id, right.id))) {
     if (deltaNodeIds.has(node.id)) throw new Error(`definition delta repeats node ${node.id}`);
     deltaNodeIds.add(node.id);
     validateSemanticNode(node, options);
@@ -210,7 +210,7 @@ export function mergeTypeScriptDefinitionDelta(
     nodes.set(node.id, existing ?? node);
   }
   const deltaEdgeIds = new Set<string>();
-  for (const edge of [...delta.edges].sort((left, right) => left.id.localeCompare(right.id))) {
+  for (const edge of [...delta.edges].sort((left, right) => compareUtf8(left.id, right.id))) {
     if (deltaEdgeIds.has(edge.id)) throw new Error(`definition delta repeats edge ${edge.id}`);
     deltaEdgeIds.add(edge.id);
     const existing = edges.get(edge.id);

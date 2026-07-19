@@ -69,10 +69,10 @@ test("worker emits deterministic protocol graph without executing project code",
       typescript_compiler_version: "7.0.2",
       typescript_compiler_selection: "bundled-only",
       typescript_compiler_fallback: "fail-closed",
-      typescript_analysis_mode: "semantic-definition-graph",
+      typescript_analysis_mode: "semantic-import-type-graph",
       typescript_project_local_policy: "metadata-only",
       typescript_project_local_loaded: "false",
-      typescript_typechecker_status: "definition-graph-emitted",
+      typescript_typechecker_status: "definition-import-type-graph-emitted",
       typescript_definition_graph_status: "ready",
       typescript_project_model_status: "ready",
       typescript_project_config: "worker-neutral-allowlist",
@@ -80,7 +80,7 @@ test("worker emits deterministic protocol graph without executing project code",
       typescript_standard_library_source: "bundled",
       typescript_standard_library_integrity: "build-produced-pending-core-attestation",
       typescript_release_gate: "release-gate-pending",
-      typescript_semantic_graph_emission: "definition-graph-v1",
+      typescript_semantic_graph_emission: "definition-import-type-graph-v1",
       project_code_executed: "false",
     },
   );
@@ -91,10 +91,10 @@ test("worker emits deterministic protocol graph without executing project code",
   const sites = first.events.filter((event) => event.event === "dependency_site").map((event) => event.site);
   const edges = first.events.filter((event) => event.event === "edge_upsert").map((event) => event.edge);
   const diagnostics = first.events.filter((event) => event.event === "diagnostic").map((event) => event.diagnostic);
-  assert.ok(!diagnostics.some((diagnostic) => (
+  assert.ok(diagnostics.filter((diagnostic) => (
     diagnostic.code === "web.typescript_semantic_scaffold_diagnostic"
     && /TS2307.*@shared\/index/u.test(diagnostic.message)
-  )));
+  )).every((diagnostic) => diagnostic.severity === "info"));
   const completedFiles = first.events.filter((event) => event.event === "file_completed");
   const completed = first.events.at(-1)?.coverage;
   assert.ok(nodes.some((node) => node.kind === "workspace"));
@@ -109,11 +109,19 @@ test("worker emits deterministic protocol graph without executing project code",
   assert.ok(nodes.some((node) => node.kind === "route" && node.locator.endsWith("/shop/docs/$parts*?")));
   assert.deepEqual([...new Set(sites.map((site) => site.resolution_status))].sort(), ["candidates", "external", "resolved", "unresolved"]);
   assert.ok(sites.some((site) => site.kind === "type_import"));
-  assert.ok(sites.some((site) => site.specifier === "@shared/index" && site.resolution_status === "resolved"));
+  const sharedSemanticImport = sites.find((site) => (
+    site.kind === "web_import"
+    && site.specifier === "@shared/index"
+    && site.evidence[0]?.kind === "semantic"
+    && site.evidence[0]?.properties.occurrence_kind === "named_import"
+  ));
+  assert.equal(sharedSemanticImport?.resolution_status, "resolved");
+  assert.equal(sharedSemanticImport?.precision, "exact");
+  assert.equal(sharedSemanticImport?.target_ids.length, 1);
   const conditionalExport = sites.find((site) => site.specifier === "@fixture/shared" && site.kind === "import");
   assert.equal(conditionalExport?.resolution_status, "candidates");
-  assert.match(conditionalExport?.reason ?? "", /package_exports_conditions=browser,default,node/u);
-  assert.match(JSON.stringify(conditionalExport?.condition), /package\.exports\.condition/u);
+  assert.match(conditionalExport?.reason ?? "", /package_exports_conditions=browser,node/u);
+  assert.doesNotMatch(JSON.stringify(conditionalExport?.condition), /package\.exports\.condition/u);
   const conditionalEdges = edges.filter((edge) => edge.site_id === conditionalExport?.id);
   const nodeById = new Map(nodes.map((node) => [node.id, node]));
   for (const site of sites) {
@@ -157,16 +165,23 @@ test("worker emits deterministic protocol graph without executing project code",
   assert.ok(Number(profile?.properties.typescript_typechecker_queries) > 1);
   const semanticNodes = nodes.filter((node) => node.kind === "symbol" || node.kind === "type");
   const semanticEdges = edges.filter((edge) => edge.phase === "semantic");
+  const semanticSites = sites.filter((site) => site.evidence[0]?.kind === "semantic");
+  const definitionEdges = semanticEdges.filter((edge) => edge.site_id === null);
+  const dependencySemanticEdges = semanticEdges.filter((edge) => edge.site_id !== null);
   assert.equal(Number(profile?.properties.typescript_semantic_node_count), semanticNodes.length);
   assert.equal(Number(profile?.properties.typescript_semantic_relation_count), semanticEdges.length);
+  assert.equal(Number(profile?.properties.typescript_semantic_site_count), semanticSites.length);
   assert.equal(profile?.properties.typescript_semantic_issue_count, "0");
   assert.ok(semanticNodes.some((node) => node.kind === "symbol" && node.properties.symbol_kind === "function"));
+  assert.ok(semanticNodes.some((node) => node.kind === "symbol" && node.properties.symbol_kind === "variable"));
   assert.ok(semanticNodes.some((node) => node.kind === "type" && node.properties.type_kind === "class"));
   assert.ok(semanticNodes.some((node) => node.kind === "type" && node.properties.type_kind === "generic_instance"));
-  assert.deepEqual([...new Set(semanticEdges.map((edge) => edge.kind))].sort(), ["declares", "extends", "implements", "instantiates"]);
-  assert.ok(semanticEdges.every((edge) => edge.site_id === null && edge.resolution_status === "resolved" && edge.precision === "exact"));
+  assert.deepEqual([...new Set(definitionEdges.map((edge) => edge.kind))].sort(), ["declares", "extends", "implements", "instantiates"]);
+  assert.deepEqual([...new Set(semanticSites.map((site) => site.kind))].sort(), ["type_use", "web_import", "web_reexport"]);
+  assert.deepEqual([...new Set(dependencySemanticEdges.map((edge) => edge.kind))].sort(), ["imports", "reexports", "type_uses"]);
+  assert.ok(definitionEdges.every((edge) => edge.resolution_status === "resolved" && edge.precision === "exact"));
   assert.ok(semanticEdges.every((edge) => edge.evidence[0]?.kind === "semantic" && edge.evidence[0]?.properties.profile_id === profile.id));
-  assert.ok(!sites.some((site) => site.evidence[0]?.kind === "semantic"));
+  assert.ok(semanticSites.every((site) => site.evidence[1]?.kind === "source"));
   assert.ok(!completed.completeness.includes("semantic-complete"));
   assert.equal(completed.dependency_sites, sites.length);
   assert.equal(completed.dependency_sites, completed.resolved + completed.candidates + completed.external + completed.unresolved);
@@ -422,6 +437,77 @@ test("workspace package selection respects explicit local references and incompa
   }
 });
 
+test("external owner resolution overrides neutral workspace compiler definitions", async (context) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "depgraph-web-external-over-workspace-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  await Promise.all([
+    mkdir(path.join(root, "packages", "app", "src"), { recursive: true }),
+    mkdir(path.join(root, "packages", "shared", "src"), { recursive: true }),
+  ]);
+  await Promise.all([
+    writeFile(path.join(root, "package.json"), JSON.stringify({
+      name: "external-over-workspace",
+      private: true,
+      packageManager: "npm@11.0.0",
+      workspaces: ["packages/*"],
+    })),
+    writeFile(path.join(root, "package-lock.json"), JSON.stringify({
+      name: "external-over-workspace",
+      lockfileVersion: 3,
+      packages: {
+        "": { name: "external-over-workspace" },
+        "node_modules/shared": { version: "2.0.0" },
+      },
+    })),
+    writeFile(path.join(root, "packages", "app", "package.json"), JSON.stringify({
+      name: "external-over-workspace-app",
+      version: "1.0.0",
+      dependencies: { shared: "2.0.0" },
+    })),
+    writeFile(path.join(root, "packages", "app", "src", "index.ts"), [
+      'import type { ExternalType } from "shared";',
+      "export interface UsesExternal { readonly value: ExternalType }",
+      "",
+    ].join("\n")),
+    writeFile(path.join(root, "packages", "shared", "package.json"), JSON.stringify({
+      name: "shared",
+      version: "1.0.0",
+      exports: "./src/index.ts",
+    })),
+    writeFile(
+      path.join(root, "packages", "shared", "src", "index.ts"),
+      "export interface ExternalType { readonly source: 'local-workspace' }\n",
+    ),
+  ]);
+
+  const result = await run("external-over-workspace", root);
+  const nodes = new Map(result.events.filter((event) => event.node).map((event) => [event.node.id, event.node]));
+  const sites = result.events
+    .filter((event) => event.site?.evidence[0]?.kind === "semantic")
+    .map((event) => event.site);
+  const namedImport = sites.find((site) => (
+    site.kind === "web_import"
+    && site.specifier === "shared"
+    && site.evidence[0]?.properties.imported_name === "ExternalType"
+  ));
+  const typeUse = sites.find((site) => (
+    site.kind === "type_use"
+    && site.specifier === "ExternalType"
+    && site.evidence[0]?.properties.module_specifier === "shared"
+  ));
+  for (const site of [namedImport, typeUse]) {
+    assert.equal(site?.resolution_status, "external");
+    assert.ok(site?.precision === "exact" || site?.precision === "heuristic");
+    if (site?.precision === "exact") assert.equal(site.reason, null);
+    else assert.ok(site?.reason);
+    assert.equal(site?.target_ids.length, 1);
+    const target = nodes.get(site?.target_ids[0]);
+    assert.equal(target?.kind, "external_system");
+    assert.match(JSON.stringify(target), /2\.0\.0/u);
+    assert.notEqual(target?.properties.source_path, "packages/shared/src/index.ts");
+  }
+});
+
 test("missing explicit workspace, file, link, and portal targets remain unresolved", async (context) => {
   const root = await mkdtemp(path.join(os.tmpdir(), "depgraph-web-missing-explicit-local-"));
   context.after(async () => rm(root, { recursive: true, force: true }));
@@ -441,7 +527,7 @@ test("missing explicit workspace, file, link, and portal targets remain unresolv
     const sites = result.events
       .filter((event) => event.site?.specifier === name)
       .map((event) => event.site);
-    assert.deepEqual(sites.map((site) => site.kind).sort(), ["package_dependency", "side_effect_import"]);
+    assert.deepEqual(sites.map((site) => site.kind).sort(), ["package_dependency", "side_effect_import", "web_import"]);
     assert.ok(sites.every((site) => site.resolution_status === "unresolved"), name);
     assert.ok(sites.every((site) => site.reason === "explicit_local_package_target_not_found"), name);
     assert.ok(sites.every((site) => site.target_ids.length === 1), name);
@@ -780,8 +866,17 @@ test("malformed TypeScript source increments unsupported syntax coverage", async
   const profile = result.events.find((event) => event.event === "profile_declared")?.profile;
   assert.equal(profile?.properties.typescript_definition_graph_status, "ready");
   assert.equal(profile?.properties.typescript_semantic_node_count, "0");
-  assert.equal(profile?.properties.typescript_semantic_relation_count, "0");
+  assert.equal(profile?.properties.typescript_semantic_relation_count, "1");
+  assert.equal(profile?.properties.typescript_semantic_site_count, "1");
   assert.equal(profile?.properties.typescript_semantic_issue_count, "1");
+  const recovered = result.events.find((event) => (
+    event.site?.evidence[0]?.kind === "semantic"
+    && event.site?.evidence[0]?.properties.occurrence_kind === "empty_import"
+  ))?.site;
+  assert.equal(recovered?.resolution_status, "unresolved");
+  assert.equal(recovered?.reason, "syntax_invalid");
+  assert.equal(recovered?.target_ids.length, 1);
+  assert.equal(result.events.find((event) => event.node?.id === recovered?.target_ids[0])?.node.kind, "unknown_target");
   assert.ok(result.events.at(-1)?.coverage.unsupported_syntax > 0);
   assert.deepEqual(result.events.at(-1)?.coverage.completeness, []);
   assert.ok(result.events.at(-1)?.coverage.reasons.includes("unsupported_syntax"));
@@ -864,7 +959,7 @@ test("TypeChecker definition graph resolves inventory modules and bundled stdlib
       dependencies: { "ambient-secret": "1.0.0" },
     })),
     writeFile(path.join(root, "tsconfig.json"), `{
-      // Only baseUrl and paths are admitted into the worker-owned config.
+      // Only paths are admitted into the worker-owned config; baseUrl is ignored.
       "compilerOptions": {
         "baseUrl": ".",
         "paths": { "@models/*": ["*"] },
@@ -909,9 +1004,9 @@ test("TypeChecker definition graph resolves inventory modules and bundled stdlib
     .filter((event) => event.edge?.phase === "semantic")
     .map((event) => event.edge);
   assert.equal(profile?.properties.typescript_project_model_status, "ready");
-  assert.equal(profile?.properties.typescript_typechecker_status, "definition-graph-emitted");
+  assert.equal(profile?.properties.typescript_typechecker_status, "definition-import-type-graph-emitted");
   assert.equal(profile?.properties.typescript_definition_graph_status, "ready");
-  assert.equal(profile?.properties.typescript_semantic_graph_emission, "definition-graph-v1");
+  assert.equal(profile?.properties.typescript_semantic_graph_emission, "definition-import-type-graph-v1");
   assert.equal(profile?.properties.typescript_project_root_files, "2");
   assert.ok(Number(profile?.properties.typescript_typechecker_queries) > 1);
   assert.equal(profile?.properties.typescript_static_config_files, "1");
@@ -933,7 +1028,7 @@ test("TypeChecker definition graph resolves inventory modules and bundled stdlib
   assert.equal(Number(profile?.properties.typescript_semantic_node_count), semanticNodes.length);
   assert.equal(Number(profile?.properties.typescript_semantic_relation_count), semanticEdges.length);
   assert.equal(profile?.properties.typescript_semantic_issue_count, "0");
-  assert.ok(semanticEdges.every((edge) => edge.site_id === null && edge.precision === "exact"));
+  assert.ok(semanticEdges.filter((edge) => edge.site_id === null).every((edge) => edge.precision === "exact"));
   assert.ok(!result.events.at(-1)?.coverage.completeness.includes("semantic-complete"));
   await assert.rejects(import("node:fs/promises").then(({ stat }) => stat(marker)));
 });
@@ -1063,7 +1158,7 @@ test("external package exports reject private and missing subpaths", async (cont
   assert.match(missingSite?.reason ?? "", /package_export_target_not_found/u);
 });
 
-test("external subpath resolution retains lock candidates whose files are unavailable", async (context) => {
+test("external subpath resolution is bound to the nearest installed package", async (context) => {
   const root = await mkdtemp(path.join(os.tmpdir(), "depgraph-web-external-lock-candidates-"));
   context.after(async () => rm(root, { recursive: true, force: true }));
   const packageRoot = path.join(root, "node_modules", "multi-export");
@@ -1096,13 +1191,10 @@ test("external subpath resolution retains lock candidates whose files are unavai
   const sites = result.events.filter((event) => event.site?.kind === "side_effect_import").map((event) => event.site);
   const publicSite = sites.find((site) => site.specifier === "multi-export/public");
   const privateSite = sites.find((site) => site.specifier === "multi-export/private");
-  assert.equal(publicSite?.resolution_status, "candidates");
-  assert.deepEqual(publicSite?.target_ids.map((id: string) => nodes.get(id)?.properties.version).sort(), ["1.0.0", "2.0.0"]);
-  assert.match(publicSite?.reason ?? "", /external_package_exports_unavailable/u);
-  assert.equal(privateSite?.resolution_status, "candidates");
-  assert.deepEqual(privateSite?.target_ids.map((id: string) => nodes.get(id)?.properties.version), ["2.0.0"]);
+  assert.equal(publicSite?.resolution_status, "external");
+  assert.deepEqual(publicSite?.target_ids.map((id: string) => nodes.get(id)?.properties.version), ["1.0.0"]);
+  assert.equal(privateSite?.resolution_status, "unresolved");
   assert.match(privateSite?.reason ?? "", /package_subpath_not_exported/u);
-  assert.match(privateSite?.reason ?? "", /external_package_exports_unavailable/u);
 });
 
 test("workspace package exports do not fall back to private files", async (context) => {
@@ -1132,6 +1224,900 @@ test("workspace package exports do not fall back to private files", async (conte
   const privateSite = sites.find((site) => site.specifier === "shared-package/private");
   assert.equal(privateSite?.resolution_status, "unresolved");
   assert.match(privateSite?.reason ?? "", /package_subpath_not_exported/u);
+});
+
+test("semantic Node builtins are exact for known prefixed and bare module names only", async (context) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "depgraph-web-worker-node-builtins-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  await mkdir(path.join(root, "src"), { recursive: true });
+  await Promise.all([
+    writeFile(path.join(root, "package.json"), JSON.stringify({ name: "node-builtins", version: "1.0.0" })),
+    writeFile(path.join(root, "tsconfig.json"), JSON.stringify({
+      compilerOptions: { paths: { "node:*": ["src/*"] } },
+    })),
+    writeFile(path.join(root, "src", "fs.ts"), "export const readFile = 'shadowed';\n"),
+    writeFile(path.join(root, "src", "not-a-real-builtin.ts"), "export const nonexistent = 'shadowed';\n"),
+    writeFile(path.join(root, "index.ts"), [
+      'import { readFile } from "node:fs";',
+      'import { join } from "path";',
+      'import { readFile as readFilePromise } from "fs/promises";',
+      'import { nonexistent } from "node:not-a-real-builtin";',
+      'const bareFs = require("fs");',
+      "void readFile;",
+      "void join;",
+      "void readFilePromise;",
+      "void bareFs;",
+      "void nonexistent;",
+      "",
+    ].join("\n")),
+  ]);
+
+  const result = await run("node-builtins", root);
+  const nodes = new Map(result.events.filter((event) => event.node).map((event) => [event.node.id, event.node]));
+  const semanticImports = result.events
+    .filter((event) => event.site?.kind === "web_import" && event.site.evidence[0]?.kind === "semantic")
+    .map((event) => event.site);
+  const known = semanticImports.find((site) => site.specifier === "node:fs");
+  assert.equal(known?.resolution_status, "external");
+  assert.equal(known?.precision, "exact");
+  assert.equal(known?.reason, null);
+  assert.equal(known?.evidence[0]?.properties.occurrence_kind, "named_import");
+  assert.equal(known?.evidence[0]?.properties.imported_name, "readFile");
+  const knownTarget = nodes.get(known?.target_ids[0]);
+  assert.equal(knownTarget?.kind, "external_system");
+  assert.equal(knownTarget?.locator, "external://typescript/node%3Afs");
+  assert.deepEqual(knownTarget?.properties.canonical_identity, {
+    language: "typescript",
+    compiler_version: "7.0.2",
+    locator: "node:fs",
+  });
+
+  const bareImport = semanticImports.find((site) => site.specifier === "path");
+  assert.equal(bareImport?.resolution_status, "external");
+  assert.equal(bareImport?.precision, "exact");
+  assert.equal(bareImport?.reason, null);
+  assert.equal(bareImport?.evidence[0]?.properties.occurrence_kind, "named_import");
+  assert.equal(nodes.get(bareImport?.target_ids[0])?.locator, "external://typescript/node%3Apath");
+
+  const bareRequire = semanticImports.find((site) => (
+    site.specifier === "fs" && site.evidence[0]?.properties.occurrence_kind === "require_call"
+  ));
+  assert.equal(bareRequire?.resolution_status, "external");
+  assert.equal(bareRequire?.precision, "exact");
+  assert.equal(bareRequire?.reason, null);
+  assert.equal(nodes.get(bareRequire?.target_ids[0])?.locator, "external://typescript/node%3Afs");
+  assert.equal(bareRequire?.target_ids[0], known?.target_ids[0]);
+
+  const bareSubpath = semanticImports.find((site) => site.specifier === "fs/promises");
+  assert.equal(bareSubpath?.resolution_status, "external");
+  assert.equal(bareSubpath?.precision, "exact");
+  assert.equal(bareSubpath?.reason, null);
+  assert.equal(nodes.get(bareSubpath?.target_ids[0])?.locator, "external://typescript/node%3Afs%2Fpromises");
+
+  const unknown = semanticImports.find((site) => site.specifier === "node:not-a-real-builtin");
+  assert.equal(unknown?.resolution_status, "unresolved");
+  assert.equal(unknown?.precision, "heuristic");
+  assert.equal(unknown?.reason, "unknown_node_builtin");
+  assert.equal(nodes.get(unknown?.target_ids[0])?.kind, "unknown_target");
+  assert.notEqual(nodes.get(known?.target_ids[0])?.properties.path, "src/fs.ts");
+  assert.notEqual(nodes.get(unknown?.target_ids[0])?.properties.path, "src/not-a-real-builtin.ts");
+});
+
+test("semantic package resolution uses TypeScript's neutral Bundler conditions", async (context) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "depgraph-web-worker-phase-exports-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  const packageRoot = path.join(root, "packages", "phase-package");
+  await mkdir(path.join(packageRoot, "src"), { recursive: true });
+  await Promise.all([
+    writeFile(path.join(root, "package.json"), JSON.stringify({
+      name: "phase-exports",
+      workspaces: ["packages/*"],
+      dependencies: { "phase-package": "workspace:*" },
+    })),
+    writeFile(path.join(root, "index.ts"), [
+      'import type { Branch as BranchType } from "phase-package";',
+      'import { Branch as RuntimeBranch } from "phase-package";',
+      'import { RuntimeBranch as ImportBranch } from "phase-package/runtime";',
+      'const requiredBranch = require("phase-package/runtime");',
+      "export interface UsesBranch { readonly branch: BranchType }",
+      "export const runtimeBranch = new RuntimeBranch();",
+      "export const importBranch = new ImportBranch();",
+      "void requiredBranch;",
+      "",
+    ].join("\n")),
+    writeFile(path.join(packageRoot, "package.json"), JSON.stringify({
+      name: "phase-package",
+      version: "1.0.0",
+      exports: {
+        ".": {
+          types: "./src/types.d.ts",
+          browser: "./src/browser.ts",
+          node: "./src/node.ts",
+          import: "./src/import.ts",
+          require: "./src/require.ts",
+          default: "./src/default.ts",
+        },
+        "./runtime": {
+          browser: "./src/browser-runtime.ts",
+          node: "./src/node-runtime.ts",
+          import: "./src/import.ts",
+          require: "./src/require.ts",
+          default: "./src/default.ts",
+        },
+      },
+    })),
+    writeFile(path.join(packageRoot, "src", "types.d.ts"), "export declare class Branch { readonly declared: true }\n"),
+    writeFile(path.join(packageRoot, "src", "browser.ts"), "export class Branch { browser = true; }\n"),
+    writeFile(path.join(packageRoot, "src", "node.ts"), "export class Branch { node = true; }\n"),
+    writeFile(path.join(packageRoot, "src", "browser-runtime.ts"), "export class RuntimeBranch { browser = true; }\n"),
+    writeFile(path.join(packageRoot, "src", "node-runtime.ts"), "export class RuntimeBranch { node = true; }\n"),
+    writeFile(path.join(packageRoot, "src", "import.ts"), "export class RuntimeBranch { imported = true; }\n"),
+    writeFile(path.join(packageRoot, "src", "require.ts"), "export const requiredBranch = 'require';\n"),
+    writeFile(path.join(packageRoot, "src", "default.ts"), "export class RuntimeBranch { fallback = true; }\n"),
+  ]);
+
+  const result = await run("phase-exports", root);
+  const nodes = new Map(result.events.filter((event) => event.node).map((event) => [event.node.id, event.node]));
+  const sites = result.events
+    .filter((event) => event.site?.kind === "web_import" && event.site.evidence[0]?.kind === "semantic")
+    .map((event) => event.site)
+    .filter((site) => site.specifier === "phase-package" || site.specifier === "phase-package/runtime");
+  const edges = result.events.filter((event) => event.edge?.phase === "semantic").map((event) => event.edge);
+  const typeImport = sites.find((site) => (
+    site.evidence[0]?.properties.occurrence_kind === "named_import"
+    && site.evidence[0]?.properties.imported_name === "Branch"
+    && site.evidence[0]?.properties.type_only === true
+  ));
+  const runtimeImport = sites.find((site) => (
+    site.specifier === "phase-package"
+    && site.evidence[0]?.properties.occurrence_kind === "named_import"
+    && site.evidence[0]?.properties.imported_name === "Branch"
+    && site.evidence[0]?.properties.type_only === false
+  ));
+  const importBranch = sites.find((site) => (
+    site.specifier === "phase-package/runtime"
+    && site.evidence[0]?.properties.occurrence_kind === "named_import"
+    && site.evidence[0]?.properties.imported_name === "RuntimeBranch"
+    && site.evidence[0]?.properties.type_only === false
+  ));
+  const requireImport = sites.find((site) => (
+    site.specifier === "phase-package/runtime"
+    && site.evidence[0]?.properties.occurrence_kind === "require_call"
+  ));
+  const targetPath = (targetId: string): string => (
+    nodes.get(targetId)?.properties.source_path ?? nodes.get(targetId)?.display_name
+  );
+  const neutralCondition = {
+    op: "all",
+    conditions: [
+      { op: "eq", key: "mode", value: "production" },
+      { op: "in", key: "environment", values: ["browser", "server"] },
+    ],
+  };
+  for (const site of [typeImport, runtimeImport, importBranch, requireImport]) {
+    assert.equal(site?.resolution_status, "resolved");
+    assert.equal(site?.precision, "exact");
+    assert.equal(site?.target_ids.length, 1);
+    const linked = edges.filter((edge) => edge.site_id === site?.id);
+    assert.equal(linked.length, 1);
+    assert.deepEqual(linked[0]?.condition, site?.condition);
+    assert.deepEqual(site?.condition, neutralCondition);
+    assert.doesNotMatch(JSON.stringify(site?.condition), /package\.exports\.condition/u);
+  }
+  assert.equal(targetPath(typeImport?.target_ids[0]), "packages/phase-package/src/types.d.ts");
+  assert.equal(targetPath(runtimeImport?.target_ids[0]), "packages/phase-package/src/types.d.ts");
+  assert.equal(targetPath(importBranch?.target_ids[0]), "packages/phase-package/src/import.ts");
+  assert.equal(targetPath(requireImport?.target_ids[0]), "packages/phase-package/src/require.ts");
+});
+
+test("overlapping TypeScript paths preserve declaration-order ties within the owning workspace", async (context) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "depgraph-web-worker-owned-paths-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  const packages = ["a", "b"];
+  await Promise.all(packages.flatMap((owner) => [
+    mkdir(path.join(root, "packages", owner, "src", "special"), { recursive: true }),
+    mkdir(path.join(root, "packages", owner, "src", "general"), { recursive: true }),
+  ]));
+  await Promise.all([
+    writeFile(path.join(root, "package.json"), JSON.stringify({
+      name: "owned-paths",
+      workspaces: ["packages/*"],
+    })),
+    ...packages.flatMap((owner) => [
+      writeFile(path.join(root, "packages", owner, "package.json"), JSON.stringify({
+        name: `owned-paths-${owner}`,
+        version: "1.0.0",
+      })),
+      writeFile(path.join(root, "packages", owner, "tsconfig.json"), JSON.stringify({
+        compilerOptions: {
+          baseUrl: ".",
+          paths: {
+            "@owned/*ä": ["src/general/*"],
+            "@owned/*zä": ["src/special/*"],
+          },
+        },
+      })),
+      writeFile(
+        path.join(root, "packages", owner, "src", "special", "z.ts"),
+        `export interface Selected { readonly owner: '${owner}-special' }\n`,
+      ),
+      writeFile(
+        path.join(root, "packages", owner, "src", "general", "zz.ts"),
+        `export interface Selected { readonly owner: '${owner}-general' }\n`,
+      ),
+    ]),
+    writeFile(path.join(root, "packages", "b", "src", "index.ts"), [
+      'import type { Selected } from "@owned/zzä";',
+      "export interface UsesSelected { readonly selected: Selected }",
+      "",
+    ].join("\n")),
+  ]);
+
+  const result = await run("owned-paths", root);
+  const nodes = new Map(result.events.filter((event) => event.node).map((event) => [event.node.id, event.node]));
+  const sites = result.events.filter((event) => event.site?.evidence[0]?.kind === "semantic").map((event) => event.site);
+  const ownedImport = sites.find((site) => (
+    site.kind === "web_import"
+    && site.specifier === "@owned/zzä"
+    && site.evidence[0]?.properties.occurrence_kind === "named_import"
+  ));
+  const ownedTypeUse = sites.find((site) => (
+    site.kind === "type_use"
+    && site.specifier === "Selected"
+    && site.evidence[0]?.properties.module_specifier === "@owned/zzä"
+  ));
+  for (const site of [ownedImport, ownedTypeUse]) {
+    assert.equal(site?.resolution_status, "resolved");
+    assert.equal(site?.precision, "exact");
+    assert.equal(site?.target_ids.length, 1);
+    assert.equal(nodes.get(site?.target_ids[0])?.properties.source_path, "packages/b/src/general/zz.ts");
+  }
+});
+
+test("neutral TypeScript paths fail closed when owners reverse equal-prefix pattern order", async (context) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "depgraph-web-worker-neutral-path-order-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  await Promise.all([
+    mkdir(path.join(root, "packages", "a", "src"), { recursive: true }),
+    mkdir(path.join(root, "packages", "a", "shared"), { recursive: true }),
+    mkdir(path.join(root, "packages", "b", "src"), { recursive: true }),
+  ]);
+  await Promise.all([
+    writeFile(path.join(root, "package.json"), JSON.stringify({
+      name: "neutral-path-order",
+      workspaces: ["packages/*"],
+    })),
+    writeFile(path.join(root, "packages", "a", "package.json"), JSON.stringify({
+      name: "neutral-path-order-a",
+      version: "1.0.0",
+    })),
+    writeFile(path.join(root, "packages", "a", "tsconfig.json"), JSON.stringify({
+      compilerOptions: {
+        paths: {
+          "@/*suffix": ["shared/*"],
+          "@/*": ["shared/*"],
+        },
+      },
+    })),
+    writeFile(path.join(root, "packages", "a", "src", "index.ts"), [
+      'import Alias = require("@/valuesuffix");',
+      "export type UsesAlias = Alias;",
+      "",
+    ].join("\n")),
+    writeFile(path.join(root, "packages", "a", "shared", "value.ts"), [
+      "class Specific { readonly selected = 'specific' }",
+      "export = Specific;",
+      "",
+    ].join("\n")),
+    writeFile(path.join(root, "packages", "a", "shared", "valuesuffix.ts"), [
+      "class Broad { readonly selected = 'broad' }",
+      "export = Broad;",
+      "",
+    ].join("\n")),
+    writeFile(path.join(root, "packages", "b", "package.json"), JSON.stringify({
+      name: "neutral-path-order-b",
+      version: "1.0.0",
+    })),
+    writeFile(path.join(root, "packages", "b", "tsconfig.json"), JSON.stringify({
+      compilerOptions: {
+        paths: {
+          "@/*": ["../a/shared/*"],
+          "@/*suffix": ["../a/shared/*"],
+        },
+      },
+    })),
+    writeFile(path.join(root, "packages", "b", "src", "index.ts"), [
+      'import Alias = require("@/valuesuffix");',
+      "export type UsesAlias = Alias;",
+      "",
+    ].join("\n")),
+  ]);
+
+  const result = await run("neutral-path-order", root);
+  const nodes = new Map(result.events.filter((event) => event.node).map((event) => [event.node.id, event.node]));
+  const sites = result.events
+    .filter((event) => event.site?.evidence[0]?.kind === "semantic")
+    .map((event) => event.site);
+  const expectedTargets = new Map([
+    ["packages/a/src/index.ts", "packages/a/shared/value.ts"],
+    ["packages/b/src/index.ts", "packages/a/shared/valuesuffix.ts"],
+  ]);
+  for (const [sourcePath, expectedTarget] of expectedTargets) {
+    const moduleImport = sites.find((site) => (
+      site.kind === "web_import"
+      && site.specifier === "@/valuesuffix"
+      && site.evidence[0]?.path === sourcePath
+      && site.evidence[0]?.properties.occurrence_kind === "import_equals"
+    ));
+    assert.equal(moduleImport?.resolution_status, "resolved");
+    assert.equal(moduleImport?.precision, "exact");
+    assert.equal(moduleImport?.target_ids.length, 1);
+    assert.equal(nodes.get(moduleImport?.target_ids[0])?.properties.path, expectedTarget);
+
+    const rootTypeUse = sites.find((site) => (
+      site.kind === "type_use"
+      && site.specifier === "="
+      && site.evidence[0]?.path === sourcePath
+      && site.evidence[0]?.properties.module_specifier === "@/valuesuffix"
+    ));
+    assert.equal(rootTypeUse?.resolution_status, "resolved");
+    assert.equal(rootTypeUse?.precision, "exact");
+    assert.equal(rootTypeUse?.reason, null);
+    assert.equal(nodes.get(rootTypeUse?.target_ids[0])?.kind, "type");
+    assert.equal(nodes.get(rootTypeUse?.target_ids[0])?.properties.source_path, expectedTarget);
+  }
+  const unresolvedCompilerPaths = result.events
+    .filter((event) => (
+      event.diagnostic?.code === "web.typescript_semantic_scaffold_diagnostic"
+      && /TS2307.*@\/valuesuffix/u.test(event.diagnostic.message)
+    ))
+    .map((event) => event.diagnostic.path)
+    .sort();
+  assert.deepEqual(unresolvedCompilerPaths, ["packages/a/src/index.ts", "packages/b/src/index.ts"]);
+});
+
+test("workspace hints overlapping owner aliases stay out of the neutral import-equals program", async (context) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "depgraph-web-worker-path-workspace-overlap-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  await Promise.all([
+    mkdir(path.join(root, "packages", "a", "src"), { recursive: true }),
+    mkdir(path.join(root, "packages", "a", "local"), { recursive: true }),
+    mkdir(path.join(root, "packages", "b", "src"), { recursive: true }),
+    mkdir(path.join(root, "packages", "shared"), { recursive: true }),
+  ]);
+  await Promise.all([
+    writeFile(path.join(root, "package.json"), JSON.stringify({
+      name: "path-workspace-overlap",
+      workspaces: ["packages/*"],
+    })),
+    writeFile(path.join(root, "packages", "a", "package.json"), JSON.stringify({
+      name: "path-workspace-overlap-a",
+      version: "1.0.0",
+      dependencies: { shared: "workspace:*" },
+    })),
+    writeFile(path.join(root, "packages", "a", "tsconfig.json"), JSON.stringify({
+      compilerOptions: { paths: { "*": ["./local/*"] } },
+    })),
+    writeFile(path.join(root, "packages", "a", "src", "index.ts"), [
+      'import Shared = require("shared");',
+      "export type UsesShared = Shared;",
+      "",
+    ].join("\n")),
+    writeFile(path.join(root, "packages", "a", "local", "shared.ts"), [
+      "class LocalShared { readonly owner = 'local' }",
+      "export = LocalShared;",
+      "",
+    ].join("\n")),
+    writeFile(path.join(root, "packages", "b", "package.json"), JSON.stringify({
+      name: "path-workspace-overlap-b",
+      version: "1.0.0",
+      dependencies: { shared: "workspace:*" },
+    })),
+    writeFile(path.join(root, "packages", "b", "src", "index.ts"), [
+      'import Shared = require("shared");',
+      "export type UsesShared = Shared;",
+      "",
+    ].join("\n")),
+    writeFile(path.join(root, "packages", "shared", "package.json"), JSON.stringify({
+      name: "shared",
+      version: "1.0.0",
+      exports: "./index.ts",
+    })),
+    writeFile(path.join(root, "packages", "shared", "index.ts"), [
+      "class WorkspaceShared { readonly owner = 'workspace' }",
+      "export = WorkspaceShared;",
+      "",
+    ].join("\n")),
+  ]);
+
+  const result = await run("path-workspace-overlap", root);
+  const nodes = new Map(result.events.filter((event) => event.node).map((event) => [event.node.id, event.node]));
+  const sites = result.events
+    .filter((event) => event.site?.evidence[0]?.kind === "semantic")
+    .map((event) => event.site);
+  const expectedTargets = new Map([
+    ["packages/a/src/index.ts", "packages/a/local/shared.ts"],
+    ["packages/b/src/index.ts", "packages/shared/index.ts"],
+  ]);
+  for (const [sourcePath, expectedTarget] of expectedTargets) {
+    const moduleImport = sites.find((site) => (
+      site.kind === "web_import"
+      && site.specifier === "shared"
+      && site.evidence[0]?.path === sourcePath
+      && site.evidence[0]?.properties.occurrence_kind === "import_equals"
+    ));
+    assert.equal(moduleImport?.resolution_status, "resolved");
+    assert.equal(moduleImport?.precision, "exact");
+    assert.equal(nodes.get(moduleImport?.target_ids[0])?.properties.path, expectedTarget);
+    const rootTypeUse = sites.find((site) => (
+      site.kind === "type_use"
+      && site.specifier === "="
+      && site.evidence[0]?.path === sourcePath
+      && site.evidence[0]?.properties.module_specifier === "shared"
+    ));
+    assert.equal(rootTypeUse?.resolution_status, "resolved");
+    assert.equal(rootTypeUse?.precision, "exact");
+    assert.equal(rootTypeUse?.reason, null);
+    assert.equal(nodes.get(rootTypeUse?.target_ids[0])?.kind, "type");
+    assert.equal(nodes.get(rootTypeUse?.target_ids[0])?.properties.source_path, expectedTarget);
+  }
+  const unresolvedCompilerPaths = result.events
+    .filter((event) => (
+      event.diagnostic?.code === "web.typescript_semantic_scaffold_diagnostic"
+      && /TS2307.*shared/u.test(event.diagnostic.message)
+    ))
+    .map((event) => event.diagnostic.path)
+    .sort();
+  assert.deepEqual(unresolvedCompilerPaths, ["packages/a/src/index.ts", "packages/b/src/index.ts"]);
+});
+
+test("phase-specific workspace type exports stay out of the neutral import-equals program", async (context) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "depgraph-web-worker-workspace-phase-hint-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  await Promise.all([
+    mkdir(path.join(root, "packages", "consumer", "src"), { recursive: true }),
+    mkdir(path.join(root, "packages", "phase-split"), { recursive: true }),
+  ]);
+  await Promise.all([
+    writeFile(path.join(root, "package.json"), JSON.stringify({
+      name: "workspace-phase-hint",
+      workspaces: ["packages/*"],
+    })),
+    writeFile(path.join(root, "packages", "consumer", "package.json"), JSON.stringify({
+      name: "workspace-phase-consumer",
+      version: "1.0.0",
+      dependencies: { "phase-split": "workspace:*" },
+    })),
+    writeFile(path.join(root, "packages", "consumer", "src", "index.ts"), [
+      'import Phase = require("phase-split");',
+      "export type UsesPhase = Phase;",
+      "export type UsesMember = Phase.Member;",
+      "",
+    ].join("\n")),
+    writeFile(path.join(root, "packages", "phase-split", "package.json"), JSON.stringify({
+      name: "phase-split",
+      version: "1.0.0",
+      exports: {
+        import: { types: "./import.ts", default: "./import.ts" },
+        require: { types: "./require.ts", default: "./require.ts" },
+      },
+    })),
+    writeFile(path.join(root, "packages", "phase-split", "import.ts"), [
+      "class ImportPhase { readonly phase = 'import' }",
+      "namespace ImportPhase { export interface Member { readonly phase: 'import' } }",
+      "export = ImportPhase;",
+      "",
+    ].join("\n")),
+    writeFile(path.join(root, "packages", "phase-split", "require.ts"), [
+      "class RequirePhase { readonly phase = 'require' }",
+      "namespace RequirePhase { export interface Member { readonly phase: 'require' } }",
+      "export = RequirePhase;",
+      "",
+    ].join("\n")),
+  ]);
+
+  const result = await run("workspace-phase-hint", root);
+  const nodes = new Map(result.events.filter((event) => event.node).map((event) => [event.node.id, event.node]));
+  const sites = result.events
+    .filter((event) => event.site?.evidence[0]?.kind === "semantic")
+    .map((event) => event.site);
+  const moduleImport = sites.find((site) => (
+    site.kind === "web_import"
+    && site.specifier === "phase-split"
+    && site.evidence[0]?.properties.occurrence_kind === "import_equals"
+  ));
+  assert.equal(moduleImport?.resolution_status, "resolved");
+  assert.equal(moduleImport?.precision, "exact");
+  assert.equal(nodes.get(moduleImport?.target_ids[0])?.properties.path, "packages/phase-split/require.ts");
+  const rootTypeUse = sites.find((site) => (
+    site.kind === "type_use"
+    && site.specifier === "="
+    && site.evidence[0]?.properties.module_specifier === "phase-split"
+  ));
+  assert.equal(rootTypeUse?.resolution_status, "resolved");
+  assert.equal(rootTypeUse?.precision, "exact");
+  assert.equal(rootTypeUse?.reason, null);
+  assert.equal(nodes.get(rootTypeUse?.target_ids[0])?.kind, "type");
+  assert.equal(nodes.get(rootTypeUse?.target_ids[0])?.properties.source_path, "packages/phase-split/require.ts");
+  const qualifiedTypeUse = sites.find((site) => (
+    site.kind === "type_use"
+    && site.specifier === "Member"
+    && site.evidence[0]?.properties.module_specifier === "phase-split"
+  ));
+  assert.equal(qualifiedTypeUse?.resolution_status, "resolved");
+  assert.equal(qualifiedTypeUse?.precision, "exact");
+  assert.equal(qualifiedTypeUse?.reason, null);
+  assert.ok(!Object.hasOwn(qualifiedTypeUse?.evidence[0]?.properties ?? {}, "resolution_mode"));
+  assert.equal(nodes.get(qualifiedTypeUse?.target_ids[0])?.kind, "type");
+  assert.equal(nodes.get(qualifiedTypeUse?.target_ids[0])?.display_name, "Member");
+  assert.equal(nodes.get(qualifiedTypeUse?.target_ids[0])?.properties.source_path, "packages/phase-split/require.ts");
+  assert.ok(result.events.some((event) => (
+    event.diagnostic?.code === "web.typescript_semantic_scaffold_diagnostic"
+    && event.diagnostic.path === "packages/consumer/src/index.ts"
+    && /TS2307.*phase-split/u.test(event.diagnostic.message)
+  )));
+});
+
+test("export-equals object properties and forwarding aliases retain exact qualified type proof", async (context) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "depgraph-web-worker-export-equals-properties-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  await mkdir(path.join(root, "src"), { recursive: true });
+  await Promise.all([
+    writeFile(path.join(root, "package.json"), JSON.stringify({
+      name: "export-equals-properties",
+      version: "1.0.0",
+    })),
+    writeFile(path.join(root, "src", "api.ts"), [
+      "class PropertyMember { readonly value = 1 }",
+      "const API = { PropertyMember };",
+      "export = API;",
+      "",
+    ].join("\n")),
+    writeFile(path.join(root, "src", "bridge.ts"), [
+      'import API = require("./api");',
+      "export = API;",
+      "",
+    ].join("\n")),
+    writeFile(path.join(root, "src", "factory.ts"), [
+      "class FactoryMember { readonly value = 2 }",
+      "function makeAPI() { return { FactoryMember }; }",
+      "export = makeAPI();",
+      "",
+    ].join("\n")),
+    writeFile(path.join(root, "src", "wrapped.ts"), [
+      "class Wrapped { readonly value = 3 }",
+      "export = (Wrapped);",
+      "",
+    ].join("\n")),
+    writeFile(path.join(root, "src", "consumer.ts"), [
+      'import Direct = require("./api");',
+      'import Forwarded = require("./bridge");',
+      'import Factory = require("./factory");',
+      'import Wrapped = require("./wrapped");',
+      "export type DirectUse = typeof Direct.PropertyMember;",
+      "export type ForwardedUse = typeof Forwarded.PropertyMember;",
+      "export type FactoryUse = typeof Factory.FactoryMember;",
+      "export type WrappedUse = Wrapped;",
+      "",
+    ].join("\n")),
+  ]);
+
+  const result = await run("export-equals-properties", root);
+  const nodes = new Map(result.events.filter((event) => event.node).map((event) => [event.node.id, event.node]));
+  const propertyUses = result.events
+    .filter((event) => (
+      event.site?.kind === "type_use"
+      && event.site.specifier === "PropertyMember"
+      && event.site.evidence[0]?.path === "src/consumer.ts"
+    ))
+    .map((event) => event.site);
+  assert.equal(propertyUses.length, 2, JSON.stringify(propertyUses));
+  for (const site of propertyUses) {
+    assert.equal(site.resolution_status, "resolved");
+    assert.equal(site.precision, "exact");
+    assert.equal(site.reason, null);
+    assert.equal(site.target_ids.length, 1);
+    assert.equal(nodes.get(site.target_ids[0])?.kind, "type");
+    assert.equal(nodes.get(site.target_ids[0])?.display_name, "PropertyMember");
+    assert.equal(nodes.get(site.target_ids[0])?.properties.source_path, "src/api.ts");
+    assert.ok(!Object.hasOwn(site.evidence[0]?.properties ?? {}, "resolution_mode"));
+    assert.ok(!Object.hasOwn(site.evidence[0]?.properties ?? {}, "binding_origin"));
+  }
+  const factoryUse = result.events.find((event) => (
+    event.site?.kind === "type_use"
+    && event.site.specifier === "FactoryMember"
+    && event.site.evidence[0]?.path === "src/consumer.ts"
+  ))?.site;
+  assert.equal(factoryUse?.resolution_status, "resolved");
+  assert.equal(factoryUse?.precision, "exact");
+  assert.equal(factoryUse?.reason, null);
+  assert.equal(factoryUse?.target_ids.length, 1);
+  assert.equal(nodes.get(factoryUse?.target_ids[0])?.kind, "type");
+  assert.equal(nodes.get(factoryUse?.target_ids[0])?.display_name, "FactoryMember");
+  assert.equal(nodes.get(factoryUse?.target_ids[0])?.properties.source_path, "src/factory.ts");
+  const wrappedUse = result.events.find((event) => (
+    event.site?.kind === "type_use"
+    && event.site.specifier === "="
+    && event.site.evidence[0]?.properties.module_specifier === "./wrapped"
+  ))?.site;
+  assert.equal(wrappedUse?.resolution_status, "resolved");
+  assert.equal(wrappedUse?.precision, "exact");
+  assert.equal(wrappedUse?.reason, null);
+  assert.equal(wrappedUse?.target_ids.length, 1);
+  assert.equal(nodes.get(wrappedUse?.target_ids[0])?.kind, "type");
+  assert.equal(nodes.get(wrappedUse?.target_ids[0])?.display_name, "Wrapped");
+  assert.equal(nodes.get(wrappedUse?.target_ids[0])?.properties.source_path, "src/wrapped.ts");
+});
+
+test("foreign-owner JSDoc requests prevent owner alias exact hints", async (context) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "depgraph-web-worker-foreign-jsdoc-alias-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  await Promise.all([
+    mkdir(path.join(root, "packages", "a", "src"), { recursive: true }),
+    mkdir(path.join(root, "packages", "b", "src"), { recursive: true }),
+  ]);
+  await Promise.all([
+    writeFile(path.join(root, "package.json"), JSON.stringify({
+      name: "foreign-jsdoc-alias",
+      private: true,
+      packageManager: "npm@11.0.0",
+      workspaces: ["packages/*"],
+    })),
+    writeFile(path.join(root, "package-lock.json"), JSON.stringify({
+      name: "foreign-jsdoc-alias",
+      lockfileVersion: 3,
+      packages: {
+        "": { name: "foreign-jsdoc-alias" },
+        "node_modules/@private/value": { version: "1.0.0" },
+      },
+    })),
+    writeFile(path.join(root, "packages", "a", "package.json"), JSON.stringify({
+      name: "foreign-jsdoc-alias-a",
+      version: "1.0.0",
+    })),
+    writeFile(path.join(root, "packages", "a", "tsconfig.json"), JSON.stringify({
+      compilerOptions: { paths: { "@private/*": ["src/*"] } },
+    })),
+    writeFile(path.join(root, "packages", "a", "src", "index.ts"), [
+      'import type { Value } from "@private/value";',
+      "export type LocalUse = Value;",
+      "",
+    ].join("\n")),
+    writeFile(
+      path.join(root, "packages", "a", "src", "value.ts"),
+      "export interface Value { readonly owner: 'a' }\n",
+    ),
+    writeFile(path.join(root, "packages", "b", "package.json"), JSON.stringify({
+      name: "foreign-jsdoc-alias-b",
+      version: "1.0.0",
+      dependencies: { "@private/value": "1.0.0" },
+    })),
+    writeFile(path.join(root, "packages", "b", "src", "index.js"), [
+      "// @ts-check",
+      '/** @type {import("@private/value").Value} */',
+      "export const foreign = {};",
+      "",
+    ].join("\n")),
+  ]);
+
+  const result = await run("foreign-jsdoc-alias", root);
+  const unresolvedCompilerPaths = result.events
+    .filter((event) => (
+      event.diagnostic?.code === "web.typescript_semantic_scaffold_diagnostic"
+      && /TS2307.*@private\/value/u.test(event.diagnostic.message)
+    ))
+    .map((event) => event.diagnostic.path)
+    .sort();
+  assert.deepEqual(unresolvedCompilerPaths, ["packages/a/src/index.ts", "packages/b/src/index.js"]);
+  const nodes = new Map(result.events.filter((event) => event.node).map((event) => [event.node.id, event.node]));
+  const foreignTypeUse = result.events
+    .filter((event) => event.site?.kind === "type_use" && event.site.evidence[0]?.kind === "semantic")
+    .map((event) => event.site)
+    .find((site) => (
+      site.evidence[0]?.path === "packages/b/src/index.js"
+      && site.evidence[0]?.properties.module_specifier === "@private/value"
+  ));
+  assert.equal(foreignTypeUse?.resolution_status, "external");
+  assert.ok(foreignTypeUse?.precision === "exact" || foreignTypeUse?.precision === "heuristic");
+  assert.equal(nodes.get(foreignTypeUse?.target_ids[0])?.kind, "external_system");
+  assert.match(JSON.stringify(nodes.get(foreignTypeUse?.target_ids[0])), /1\.0\.0/u);
+  assert.notEqual(nodes.get(foreignTypeUse?.target_ids[0])?.properties.source_path, "packages/a/src/value.ts");
+});
+
+test("a package-scoped TypeScript path cannot resolve imports from a different workspace", async (context) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "depgraph-web-worker-path-isolation-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  await Promise.all([
+    mkdir(path.join(root, "packages", "a", "src"), { recursive: true }),
+    mkdir(path.join(root, "packages", "b", "src"), { recursive: true }),
+  ]);
+  await Promise.all([
+    writeFile(path.join(root, "package.json"), JSON.stringify({
+      name: "worker-path-isolation",
+      workspaces: ["packages/*"],
+    })),
+    writeFile(path.join(root, "packages", "a", "package.json"), JSON.stringify({
+      name: "worker-path-isolation-a",
+      version: "1.0.0",
+    })),
+    writeFile(path.join(root, "packages", "a", "tsconfig.json"), JSON.stringify({
+      compilerOptions: { paths: { "@private/*": ["src/*"] } },
+    })),
+    writeFile(
+      path.join(root, "packages", "a", "src", "private.ts"),
+      "export interface PrivateType { readonly owner: 'a' }\n",
+    ),
+    writeFile(path.join(root, "packages", "b", "package.json"), JSON.stringify({
+      name: "worker-path-isolation-b",
+      version: "1.0.0",
+      dependencies: { "@private/private": "1.0.0" },
+    })),
+    writeFile(path.join(root, "packages", "b", "src", "index.ts"), [
+      'import type { PrivateType } from "@private/private";',
+      "export interface UsesPrivate { readonly value: PrivateType }",
+      "",
+    ].join("\n")),
+  ]);
+
+  const result = await run("path-isolation", root);
+  const nodes = new Map(result.events.filter((event) => event.node).map((event) => [event.node.id, event.node]));
+  const sites = result.events
+    .filter((event) => event.site?.evidence[0]?.kind === "semantic")
+    .map((event) => event.site);
+  const foreignSites = sites.filter((site) => (
+    site.specifier === "@private/private"
+    || site.evidence[0]?.properties.module_specifier === "@private/private"
+  ));
+  assert.ok(foreignSites.some((site) => (
+    site.kind === "web_import"
+    && site.evidence[0]?.properties.occurrence_kind === "named_import"
+  )));
+  for (const site of foreignSites) {
+    assert.equal(site.resolution_status, "external");
+    assert.equal(site.target_ids.length, 1);
+    assert.equal(nodes.get(site.target_ids[0])?.kind, "external_system");
+    assert.notEqual(nodes.get(site.target_ids[0])?.properties.source_path, "packages/a/src/private.ts");
+  }
+});
+
+test("quoted star and equals exports and binding-scheme modules survive semantic refinement", async (context) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "depgraph-web-worker-quoted-bindings-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  await Promise.all([
+    writeFile(path.join(root, "package.json"), JSON.stringify({
+      name: "quoted-bindings",
+      version: "1.0.0",
+    })),
+    writeFile(path.join(root, "dep.ts"), [
+      "interface StarType { readonly star: true }",
+      "interface EqualsType { readonly equals: true }",
+      'export { StarType as "*", EqualsType as "=" };',
+      "",
+    ].join("\n")),
+    writeFile(path.join(root, "index.ts"), [
+      'import type { "*" as LocalStar, "=" as LocalEquals } from "./dep";',
+      'export type { "*" as ForwardStar, "=" as ForwardEquals } from "./dep";',
+      'import \'binding:["pkg","X"]\';',
+      "export interface UsesQuoted { readonly star: LocalStar; readonly equals: LocalEquals }",
+      "",
+    ].join("\n")),
+  ]);
+
+  const result = await run("quoted-bindings", root);
+  const profile = result.events.find((event) => event.event === "profile_declared")?.profile;
+  assert.equal(profile?.properties.typescript_definition_graph_status, "ready");
+  assert.ok(!result.events.some((event) => event.diagnostic?.code === "web.typescript_semantic_delta_discarded"));
+  const sites = result.events
+    .filter((event) => event.site?.evidence[0]?.kind === "semantic")
+    .map((event) => event.site);
+  for (const remoteName of ["*", "="]) {
+    const quotedImport = sites.find((site) => (
+      site.kind === "web_import"
+      && site.evidence[0]?.properties.occurrence_kind === "named_import"
+      && site.evidence[0]?.properties.imported_name === remoteName
+    ));
+    assert.equal(quotedImport?.resolution_status, "resolved");
+    assert.equal(quotedImport?.precision, "exact");
+    const quotedReexport = sites.find((site) => (
+      site.kind === "web_reexport"
+      && site.evidence[0]?.properties.occurrence_kind === "named_reexport"
+      && site.evidence[0]?.properties.imported_name === remoteName
+    ));
+    assert.equal(quotedReexport?.resolution_status, "resolved");
+    assert.equal(quotedReexport?.precision, "exact");
+    const quotedUse = sites.find((site) => (
+      site.kind === "type_use"
+      && site.evidence[0]?.properties.imported_name === remoteName
+    ));
+    assert.equal(quotedUse?.resolution_status, "resolved");
+    assert.equal(quotedUse?.precision, "exact");
+    assert.ok(!Object.hasOwn(quotedUse?.evidence[0]?.properties ?? {}, "resolution_mode"));
+  }
+  const bindingScheme = sites.find((site) => (
+    site.kind === "web_import"
+    && site.specifier === 'binding:["pkg","X"]'
+    && site.evidence[0]?.properties.occurrence_kind === "side_effect_import"
+  ));
+  assert.equal(bindingScheme?.evidence[0]?.properties.module_specifier, 'binding:["pkg","X"]');
+  assert.equal(bindingScheme?.resolution_status, "external");
+});
+
+test("qualified namespace and import-type references resolve the same canonical nested type", async (context) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "depgraph-web-worker-qualified-types-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  await Promise.all([
+    writeFile(path.join(root, "package.json"), JSON.stringify({ name: "qualified-types", version: "1.0.0" })),
+    writeFile(path.join(root, "models.ts"), [
+      "export namespace Nested {",
+      "  export interface User { readonly id: string }",
+      "}",
+      "",
+    ].join("\n")),
+    writeFile(path.join(root, "index.ts"), [
+      'import type * as Models from "./models";',
+      "export interface NamespaceUse { readonly user: Models.Nested.User }",
+      "export interface ImportTypeUse { readonly user: import('./models').Nested.User }",
+      "",
+    ].join("\n")),
+  ]);
+
+  const result = await run("qualified-types", root);
+  const nodes = new Map(result.events.filter((event) => event.node).map((event) => [event.node.id, event.node]));
+  const userSites = result.events
+    .filter((event) => (
+      event.site?.kind === "type_use"
+      && event.site.evidence[0]?.kind === "semantic"
+      && event.site.specifier === "User"
+      && event.site.evidence[0]?.properties.module_specifier === "./models"
+      && event.site.evidence[0]?.properties.imported_name === "User"
+    ))
+    .map((event) => event.site)
+    .sort((left, right) => left.evidence[0].start_line - right.evidence[0].start_line);
+  assert.equal(userSites.length, 2);
+  assert.deepEqual(userSites.map((site) => site.evidence[0].start_line), [2, 3]);
+  assert.ok(userSites.every((site) => (
+    site.resolution_status === "resolved"
+    && site.precision === "exact"
+    && site.reason === null
+    && site.target_ids.length === 1
+  )));
+  assert.equal(userSites[0]?.target_ids[0], userSites[1]?.target_ids[0]);
+  const userType = nodes.get(userSites[0]?.target_ids[0]);
+  assert.equal(userType?.kind, "type");
+  assert.equal(userType?.display_name, "User");
+  assert.equal(userType?.properties.source_path, "models.ts");
+});
+
+test("TypeScript paths replacements retain declaration-order fallback semantics", async (context) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "depgraph-web-worker-path-order-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  await mkdir(path.join(root, "src"), { recursive: true });
+  await Promise.all([
+    writeFile(path.join(root, "package.json"), JSON.stringify({ name: "path-order", version: "1.0.0" })),
+    writeFile(path.join(root, "tsconfig.json"), JSON.stringify({
+      compilerOptions: {
+        baseUrl: ".",
+        paths: { "@pick": ["src/z-first.ts", "src/a-second.ts"] },
+      },
+    })),
+    writeFile(path.join(root, "index.ts"), [
+      'import type { Picked } from "@pick";',
+      "export interface UsesPicked { readonly value: Picked }",
+      "",
+    ].join("\n")),
+    writeFile(path.join(root, "src", "z-first.ts"), "export interface Picked { readonly selected: 'first' }\n"),
+    writeFile(path.join(root, "src", "a-second.ts"), "export interface Picked { readonly selected: 'second' }\n"),
+  ]);
+
+  const result = await run("path-order", root);
+  const nodes = new Map(result.events.filter((event) => event.node).map((event) => [event.node.id, event.node]));
+  const site = result.events
+    .filter((event) => event.site?.kind === "web_import" && event.site.evidence[0]?.kind === "semantic")
+    .map((event) => event.site)
+    .find((candidate) => candidate.specifier === "@pick");
+  assert.equal(site?.resolution_status, "resolved");
+  assert.equal(site?.precision, "exact");
+  assert.equal(nodes.get(site?.target_ids[0])?.properties.source_path, "src/z-first.ts");
 });
 
 test("Next intercepting routes move to parent/root and root special files become sites", async (context) => {

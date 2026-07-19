@@ -1,7 +1,7 @@
 import path from "node:path";
 import { readUtf8, normalizeRelative } from "./fs";
 import { stableId } from "./ids";
-import type { GraphNode, JsonValue } from "./types";
+import { compareUtf8, type GraphNode, type JsonValue } from "./types";
 
 export interface PackageRecord {
   absolutePath: string;
@@ -98,7 +98,7 @@ function compareSemver(left: Semver, right: Semver): number {
   if (left.prerelease === right.prerelease) return 0;
   if (left.prerelease === null) return 1;
   if (right.prerelease === null) return -1;
-  return left.prerelease.localeCompare(right.prerelease);
+  return compareUtf8(left.prerelease, right.prerelease);
 }
 
 /**
@@ -190,8 +190,10 @@ export function selectPackageInstallCandidates(
   owner: PackageRecord,
   name: string,
   declared: string | null = owner.dependencies.get(name)?.range ?? null,
+  excludedWorkspacePackageIds: ReadonlySet<string> = new Set(),
 ): PackageInstallSelection {
-  const local = workspace.packageByName.get(name) ?? [];
+  const local = (workspace.packageByName.get(name) ?? [])
+    .filter((record) => !excludedWorkspacePackageIds.has(record.id));
   if (declared !== null) {
     const explicit = explicitLocalPackages(owner, declared, local, workspace.packages);
     if (explicit !== null) {
@@ -363,7 +365,10 @@ async function repositoryIdentity(
   const manifests: Array<{ path: string; name: string | null }> = [];
   for (const file of allFiles
     .filter((candidate) => path.basename(candidate) === "package.json")
-    .sort((left, right) => normalizeRelative(path.relative(root, left)).localeCompare(normalizeRelative(path.relative(root, right))))) {
+    .sort((left, right) => compareUtf8(
+      normalizeRelative(path.relative(root, left)),
+      normalizeRelative(path.relative(root, right)),
+    ))) {
     const relative = normalizeRelative(path.relative(root, file));
     let parsed = relative === "package.json" ? manifest : null;
     if (parsed === null && relative !== "package.json") {
@@ -419,7 +424,10 @@ function addLockInstance(result: Map<string, LockInstance[]>, name: string, vers
   if (name.length === 0 || version.length === 0 || locator.length === 0) return;
   const instances = result.get(name) ?? [];
   if (!instances.some((instance) => instance.locator === locator)) instances.push({ version, locator });
-  instances.sort((left, right) => `${left.locator}\0${left.version}`.localeCompare(`${right.locator}\0${right.version}`));
+  instances.sort((left, right) => compareUtf8(
+    `${left.locator}\0${left.version}`,
+    `${right.locator}\0${right.version}`,
+  ));
   result.set(name, instances);
 }
 
@@ -679,7 +687,7 @@ export async function discoverWorkspace(root: string, allFiles: string[]): Promi
     manifests.unshift({ file: path.join(root, "package.json"), relative: "." });
   }
   const packages: PackageRecord[] = [];
-  for (const { file, relative } of manifests.sort((left, right) => left.relative.localeCompare(right.relative))) {
+  for (const { file, relative } of manifests.sort((left, right) => compareUtf8(left.relative, right.relative))) {
     const loaded = relative === "." ? { manifest: rootManifest } : await loadManifest(root, file);
     if (loaded.issue) issues.push(loaded.issue);
     const manifest = loaded.manifest;
@@ -739,7 +747,7 @@ export async function discoverWorkspace(root: string, allFiles: string[]): Promi
     lockfile,
     lockInstances,
     workspaceNode,
-    issues: issues.sort((left, right) => `${left.path}\0${left.code}`.localeCompare(`${right.path}\0${right.code}`)),
+    issues: issues.sort((left, right) => compareUtf8(`${left.path}\0${left.code}`, `${right.path}\0${right.code}`)),
     ignoredManifestPaths,
   };
 }

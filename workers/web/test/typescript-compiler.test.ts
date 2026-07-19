@@ -78,6 +78,8 @@ test("TypeChecker smoke remains valid for empty and declaration-free projects", 
     const analysis = await analyzeTypeScriptProject(sources);
     assert.equal(analysis.project.status, "ready");
     assert.equal(analysis.project.rootFiles, sources.size);
+    // Declaration-free projects need only the intrinsic TypeChecker smoke
+    // query; export-proof reads are demand-driven by dependency occurrences.
     assert.equal(analysis.project.typeCheckerQueries, 1);
     assert.ok(analysis.project.standardLibraryFiles > 0);
     assert.equal(analysis.project.emittedSemanticDiagnostics, analysis.semanticDiagnostics.length);

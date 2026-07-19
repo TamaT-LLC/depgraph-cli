@@ -1,5 +1,6 @@
 import { readdir, readFile, realpath, stat } from "node:fs/promises";
 import path from "node:path";
+import { compareUtf8 } from "./types";
 
 const IGNORED_DIRECTORIES = new Set([
   ".git",
@@ -120,7 +121,7 @@ export async function inventoryFiles(root: string): Promise<FileInventory> {
       issue(directory, "unreadable_path", "directory could not be read during source inventory");
       return;
     }
-    entries.sort((left, right) => left.name.localeCompare(right.name));
+    entries.sort((left, right) => compareUtf8(left.name, right.name));
     for (const entry of entries) {
       const absolute = path.join(directory, entry.name);
       if (IGNORED_DIRECTORIES.has(entry.name)) continue;
@@ -166,7 +167,10 @@ export async function inventoryFiles(root: string): Promise<FileInventory> {
     }
   }
   await visit(root);
-  issues.sort((left, right) => `${left.path}\0${left.reason}\0${left.detail}`.localeCompare(`${right.path}\0${right.reason}\0${right.detail}`));
+  issues.sort((left, right) => compareUtf8(
+    `${left.path}\0${left.reason}\0${left.detail}`,
+    `${right.path}\0${right.reason}\0${right.detail}`,
+  ));
   return { files: result, issues };
 }
 

@@ -1,6 +1,6 @@
 import path from "node:path";
 import { isWithinRoot, normalizeRelative, readUtf8 } from "./fs";
-import type { Evidence } from "./types";
+import { compareUtf8, type Evidence } from "./types";
 import type { PackageRecord, Workspace } from "./workspace";
 
 export interface RouteEntry {
@@ -337,7 +337,7 @@ function nextPageExtension(filename: string, configured: Set<string> | null): st
     .map((extension) => extension.startsWith(".") ? extension : `.${extension}`)
     // A compound suffix such as `.page.tsx` must win over `.tsx` when both are
     // configured, otherwise the route stem would incorrectly retain `.page`.
-    .sort((left, right) => right.length - left.length || left.localeCompare(right));
+    .sort((left, right) => right.length - left.length || compareUtf8(left, right));
   return extensions.find((extension) => filename.length > extension.length && filename.endsWith(extension)) ?? null;
 }
 
@@ -567,7 +567,13 @@ export async function discoverRoutes(workspace: Workspace, allFiles: string[]): 
     entries.push(...next, ...astro, ...tanstack.entries);
     if (tanstack.drift && (tanstack.drift.missingFromGenerated.length > 0 || tanstack.drift.onlyGenerated.length > 0)) drifts.push(tanstack.drift);
   }
-  entries.sort((left, right) => `${left.framework}\0${left.pattern}\0${left.relativeFile}`.localeCompare(`${right.framework}\0${right.pattern}\0${right.relativeFile}`));
-  configDiagnostics.sort((left, right) => `${left.path}\0${left.code}\0${left.message}`.localeCompare(`${right.path}\0${right.code}\0${right.message}`));
+  entries.sort((left, right) => compareUtf8(
+    `${left.framework}\0${left.pattern}\0${left.relativeFile}`,
+    `${right.framework}\0${right.pattern}\0${right.relativeFile}`,
+  ));
+  configDiagnostics.sort((left, right) => compareUtf8(
+    `${left.path}\0${left.code}\0${left.message}`,
+    `${right.path}\0${right.code}\0${right.message}`,
+  ));
   return { entries, drifts, frameworks: [...frameworks].sort(), configDiagnostics };
 }

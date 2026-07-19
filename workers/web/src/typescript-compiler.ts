@@ -14,12 +14,23 @@ import {
   type SourceFile,
 } from "typescript/unstable/ast";
 import type { FileSystem, FileSystemEntries } from "typescript/unstable/fs";
-import type { TypeScriptProjectSummary } from "./types";
+import { compareUtf8, type TypeScriptProjectSummary } from "./types";
 import {
   extractTypeScriptRawDefinitionDelta,
   TYPESCRIPT_SEMANTIC_MAX_SOURCE_FILES,
   type TypeScriptRawDefinitionDelta,
 } from "./typescript-semantic";
+import {
+  extractTypeScriptRawDependencyDelta,
+  importTypeModuleValidationSpans,
+  moduleCallValidationSpans,
+  nonLiteralModuleValidationSpans,
+  typeUseValidationSpans,
+  type TypeScriptModuleCallValidationSpan,
+  type TypeScriptNonLiteralModuleValidationSpan,
+  type TypeScriptRawDependencyDelta,
+  type TypeScriptTypeUseValidationSpan,
+} from "./typescript-dependencies";
 
 export const TYPESCRIPT_COMPILER_VERSION = ts.version;
 const TYPESCRIPT_RELEASE_GATE_VERIFIED = "release-gate-verified";
@@ -34,10 +45,10 @@ export const TYPESCRIPT_COMPILER_PROFILE_PROPERTIES = Object.freeze({
   typescript_compiler_version: TYPESCRIPT_COMPILER_VERSION,
   typescript_compiler_selection: "bundled-only",
   typescript_compiler_fallback: "fail-closed",
-  typescript_analysis_mode: "semantic-definition-graph",
+  typescript_analysis_mode: "semantic-import-type-graph",
   typescript_project_local_policy: "metadata-only",
   typescript_project_local_loaded: "false",
-  typescript_typechecker_status: "definition-graph-emitted",
+  typescript_typechecker_status: "definition-import-type-graph-emitted",
   typescript_project_model_status: "ready",
   typescript_project_config: "worker-neutral-allowlist",
   typescript_module_resolution: "inventory-only",
@@ -46,7 +57,7 @@ export const TYPESCRIPT_COMPILER_PROFILE_PROPERTIES = Object.freeze({
     ? "core-attested-whole-tree"
     : "build-produced-pending-core-attestation",
   typescript_release_gate: TYPESCRIPT_RELEASE_GATE,
-  typescript_semantic_graph_emission: "definition-graph-v1",
+  typescript_semantic_graph_emission: "definition-import-type-graph-v1",
   typescript_compiler_processes: "1",
   typescript_project_filesystem: "isolated-virtual",
 } as const);
@@ -91,6 +102,8 @@ export interface TypeScriptSemanticDiagnostic {
 export interface TypeScriptStaticConfig {
   configFiles: number;
   paths: Readonly<Record<string, readonly string[]>>;
+  /** User-declared safe path patterns; worker-internal package mappings excluded. */
+  pathMappings?: number;
 }
 
 /**
@@ -106,10 +119,20 @@ export interface TypeOnlyDependencyRange {
 
 export class TypeScriptProjectAnalysis extends Map<string, TypeScriptSyntaxDiagnostic[]> {
   readonly typeOnlyDependencyRanges = new Map<string, TypeOnlyDependencyRange[]>();
+  readonly importTypeModuleSpans = new Map<string, Array<{ startOffset: number; endOffset: number }>>();
+  readonly moduleCallSpans = new Map<string, TypeScriptModuleCallValidationSpan[]>();
+  readonly nonLiteralModuleSpans = new Map<string, TypeScriptNonLiteralModuleValidationSpan[]>();
+  readonly typeUseSpans = new Map<string, TypeScriptTypeUseValidationSpan[]>();
   readonly semanticDiagnostics: TypeScriptSemanticDiagnostic[] = [];
   definitionGraph: TypeScriptRawDefinitionDelta = {
     definitions: [],
     relations: [],
+    issues: [],
+    typeCheckerQueries: 0,
+  };
+  dependencyGraph: TypeScriptRawDependencyDelta = {
+    sites: [],
+    moduleExports: [],
     issues: [],
     typeCheckerQueries: 0,
   };
@@ -126,6 +149,7 @@ export class TypeScriptProjectAnalysis extends Map<string, TypeScriptSyntaxDiagn
     definitionGraphStatus: "ready",
     semanticNodes: 0,
     semanticRelations: 0,
+    semanticSites: 0,
     semanticIssues: 0,
   };
 }
@@ -243,7 +267,7 @@ async function loadBundledStandardLibrary(
   const root = await realpath(standardLibraryRoot);
   const entries = (await readdir(root, { withFileTypes: true }))
     .filter((entry) => /^lib(?:\.[a-z0-9_-]+)*\.d\.ts$/iu.test(entry.name))
-    .sort((left, right) => left.name.localeCompare(right.name));
+    .sort((left, right) => compareUtf8(left.name, right.name));
   if (entries.length === 0) {
     throw new Error(`bundled TypeScript ${TYPESCRIPT_COMPILER_VERSION} standard library is missing beside ${compiler}`);
   }
@@ -428,7 +452,7 @@ function typeOnlyDependencyRanges(sourceFile: SourceFile): TypeOnlyDependencyRan
       && candidate.endOffset === range.endOffset
       && candidate.syntax === range.syntax
     )) === index)
-    .sort((left, right) => left.startOffset - right.startOffset || left.endOffset - right.endOffset || left.syntax.localeCompare(right.syntax));
+    .sort((left, right) => left.startOffset - right.startOffset || left.endOffset - right.endOffset || compareUtf8(left.syntax, right.syntax));
 }
 
 function compilerProcess(api: API): ChildProcess | undefined {
@@ -659,7 +683,7 @@ async function analyzeTypeScriptProjectInner(
   const virtualToRelative = new Map<string, string>();
   const configFiles: string[] = [];
   for (const [file, source] of standardLibrary.files) virtualFiles.set(file, source);
-  for (const [relativePath, source] of [...sources].sort(([left], [right]) => left.localeCompare(right))) {
+  for (const [relativePath, source] of [...sources].sort(([left], [right]) => compareUtf8(left, right))) {
     if (!isConfinedTypeScriptInputPath(relativePath) || !TYPESCRIPT_SOURCE_EXTENSIONS.has(path.extname(relativePath).toLowerCase())) {
       throw new Error(`refusing unsafe or unsupported TypeScript project input path: ${relativePath}`);
     }
@@ -670,6 +694,10 @@ async function analyzeTypeScriptProjectInner(
     configFiles.push(portable);
     result.set(portable, []);
     result.typeOnlyDependencyRanges.set(portable, []);
+    result.importTypeModuleSpans.set(portable, []);
+    result.moduleCallSpans.set(portable, []);
+    result.nonLiteralModuleSpans.set(portable, []);
+    result.typeUseSpans.set(portable, []);
   }
   const internalRoot = path.join(VIRTUAL_ROOT, "__depgraph_empty_project__.d.ts");
   if (configFiles.length === 0) {
@@ -686,7 +714,10 @@ async function analyzeTypeScriptProjectInner(
       moduleDetection: "force",
       moduleResolution: "bundler",
       noEmit: true,
-      paths: staticConfig.paths,
+      paths: Object.fromEntries(Object.entries(staticConfig.paths).map(([pattern, replacements]) => [
+        pattern,
+        replacements.map((replacement) => replacement.startsWith(".") ? replacement : `./${replacement}`),
+      ])),
       plugins: [],
       skipLibCheck: true,
       target: "esnext",
@@ -710,6 +741,7 @@ async function analyzeTypeScriptProjectInner(
       const project = projects[0]!;
       const actualRoots = new Set(project.rootFiles.map(pathKey));
       const sourceFiles = new Map<string, SourceFile>();
+      const dependencyValidationQueryBudget = { value: 0 };
       const definitionSourceLimitExceeded = virtualToRelative.size > TYPESCRIPT_SEMANTIC_MAX_SOURCE_FILES;
       if (definitionSourceLimitExceeded) {
         result.definitionGraph = {
@@ -744,6 +776,10 @@ async function analyzeTypeScriptProjectInner(
           throw new Error(`TypeScript native project analysis returned an AST that disagrees with the confined inventory (${sourceMismatches.join(",")}) for ${relativePath}`);
         }
         sourceFiles.set(relativePath, sourceFile);
+        result.importTypeModuleSpans.set(relativePath, []);
+        result.nonLiteralModuleSpans.set(relativePath, []);
+        result.moduleCallSpans.set(relativePath, []);
+        result.typeUseSpans.set(relativePath, []);
         // The definition slice needs every inventory AST. Import-type ranges
         // remain an independent lexical refinement and can avoid traversing a
         // second time when the source has no possible import token.
@@ -787,25 +823,51 @@ async function analyzeTypeScriptProjectInner(
           endOffset,
         });
       }
+      for (const [relativePath, sourceFile] of [...sourceFiles.entries()]
+        .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)) {
+        if (syntacticallyInvalidPaths.has(relativePath)) continue;
+        result.importTypeModuleSpans.set(relativePath, importTypeModuleValidationSpans(sourceFile));
+        result.nonLiteralModuleSpans.set(relativePath, nonLiteralModuleValidationSpans(sourceFile));
+        result.moduleCallSpans.set(
+          relativePath,
+          await moduleCallValidationSpans(project.checker, sourceFile, dependencyValidationQueryBudget),
+        );
+        result.typeUseSpans.set(
+          relativePath,
+          await typeUseValidationSpans(project.checker, sourceFile, dependencyValidationQueryBudget),
+        );
+      }
       const intrinsicString = await project.checker.getStringType();
       if (await project.checker.typeToString(intrinsicString) !== "string") {
         throw new Error("TypeScript native TypeChecker smoke query returned an unexpected intrinsic string type");
       }
       if (!definitionSourceLimitExceeded) {
+        const semanticSources = [...sourceFiles.entries()]
+          .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)
+          .map(([relativePath, sourceFile]) => ({
+            relativePath,
+            compilerPath: sourceFile.fileName,
+            expectedText: sources.get(relativePath)!,
+            sourceFile,
+            syntacticallyValid: !syntacticallyInvalidPaths.has(relativePath),
+          }));
         result.definitionGraph = await extractTypeScriptRawDefinitionDelta(
           project.checker,
-          [...sourceFiles.entries()]
-            .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)
-            .map(([relativePath, sourceFile]) => ({
-              relativePath,
-              compilerPath: sourceFile.fileName,
-              expectedText: sources.get(relativePath)!,
-              sourceFile,
-              syntacticallyValid: !syntacticallyInvalidPaths.has(relativePath),
-            })),
+          semanticSources,
         );
+        if (!result.definitionGraph.issues.some((issue) => issue.fatal)) {
+          result.dependencyGraph = await extractTypeScriptRawDependencyDelta(
+            project.checker,
+            semanticSources,
+            result.definitionGraph,
+            result.definitionGraph.typeCheckerQueries,
+          );
+        }
       }
-      const typeCheckerQueries = 1 + result.definitionGraph.typeCheckerQueries;
+      const typeCheckerQueries = 1
+        + result.definitionGraph.typeCheckerQueries
+        + result.dependencyGraph.typeCheckerQueries
+        + dependencyValidationQueryBudget.value;
       const diagnostics = [
         ...await project.program.getProgramDiagnostics(),
         ...await project.program.getGlobalDiagnostics(),
@@ -821,10 +883,10 @@ async function analyzeTypeScriptProjectInner(
         JSON.stringify(diagnostic),
         diagnostic,
       ])).values()].sort((left, right) => (
-        (left.relativePath ?? "").localeCompare(right.relativePath ?? "")
+        compareUtf8(left.relativePath ?? "", right.relativePath ?? "")
         || left.startOffset - right.startOffset
         || left.code - right.code
-        || left.message.localeCompare(right.message)
+        || compareUtf8(left.message, right.message)
       ));
       result.semanticDiagnostics.push(...uniqueDiagnostics.slice(0, MAX_SEMANTIC_DIAGNOSTICS));
       result.project = {
@@ -832,15 +894,16 @@ async function analyzeTypeScriptProjectInner(
         rootFiles: sources.size,
         programFiles: programFiles.filter((file) => !workerOwnedKeys.has(pathKey(file))).length,
         staticConfigFiles: staticConfig.configFiles,
-        pathMappings: Object.keys(staticConfig.paths).length,
+        pathMappings: staticConfig.pathMappings ?? Object.keys(staticConfig.paths).length,
         standardLibraryFiles: loadedStandardLibraryFiles.length,
         typeCheckerQueries,
         semanticDiagnostics: uniqueDiagnostics.length,
         emittedSemanticDiagnostics: result.semanticDiagnostics.length,
-        definitionGraphStatus: result.definitionGraph.issues.some((issue) => issue.fatal) ? "failed" : "ready",
+        definitionGraphStatus: [...result.definitionGraph.issues, ...result.dependencyGraph.issues].some((issue) => issue.fatal) ? "failed" : "ready",
         semanticNodes: result.definitionGraph.definitions.length,
         semanticRelations: result.definitionGraph.relations.length,
-        semanticIssues: result.definitionGraph.issues.length,
+        semanticSites: result.dependencyGraph.sites.length,
+        semanticIssues: result.definitionGraph.issues.length + result.dependencyGraph.issues.length,
       };
     } finally {
       await snapshot.dispose();
@@ -848,7 +911,7 @@ async function analyzeTypeScriptProjectInner(
   })();
   await runCompilerOperation(api, operation, testRuntime?.timeoutMs ?? COMPILER_TIMEOUT_MS);
   for (const diagnostics of result.values()) {
-    diagnostics.sort((left, right) => left.startOffset - right.startOffset || left.code - right.code || left.message.localeCompare(right.message));
+    diagnostics.sort((left, right) => left.startOffset - right.startOffset || left.code - right.code || compareUtf8(left.message, right.message));
   }
   return result;
 }

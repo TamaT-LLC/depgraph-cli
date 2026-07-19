@@ -918,6 +918,7 @@ fn validate_semantic_maps(
             .get(&site.source)
             .expect("base validation requires dependency-site sources to exist");
         let rust_semantic_site = is_rust_semantic_dependency_site(site, source_node);
+        let web_semantic_site = is_web_semantic_dependency_site(site, source_node);
         match site.kind.as_str() {
             "call" if source_node.kind != "symbol" => {
                 return invariant(format!(
@@ -925,9 +926,12 @@ fn validate_semantic_maps(
                     site.id, source_node.id
                 ));
             }
-            "type_use" if !matches!(source_node.kind.as_str(), "symbol" | "type") => {
+            "type_use"
+                if !(matches!(source_node.kind.as_str(), "symbol" | "type")
+                    || web_semantic_site && source_node.kind == "file") =>
+            {
                 return invariant(format!(
-                    "semantic type-use site {} source {} must be a symbol or type node",
+                    "semantic type-use site {} source {} must be a symbol/type node (or a Web file fallback)",
                     site.id, source_node.id
                 ));
             }
@@ -943,6 +947,12 @@ fn validate_semantic_maps(
                     site.id, source_node.id
                 ));
             }
+            "web_import" | "web_reexport" if source_node.kind != "file" => {
+                return invariant(format!(
+                    "Web semantic {} site {} source {} must be a file node",
+                    site.kind, site.id, source_node.id
+                ));
+            }
             _ => {}
         }
         if rust_semantic_site
@@ -954,6 +964,20 @@ fn validate_semantic_maps(
         {
             return invariant(format!(
                 "Rust semantic dependency site {} source {} must declare language=rust",
+                site.id, source_node.id
+            ));
+        }
+        if web_semantic_site
+            && !matches!(
+                source_node
+                    .properties
+                    .get("language")
+                    .and_then(Value::as_str),
+                Some("typescript" | "javascript")
+            )
+        {
+            return invariant(format!(
+                "Web semantic dependency site {} source {} must declare language=typescript or javascript",
                 site.id, source_node.id
             ));
         }
@@ -987,6 +1011,14 @@ fn validate_semantic_maps(
                             site.kind, site.id, target.id
                         ));
                     }
+                    "web_import" | "web_reexport"
+                        if !matches!(target.kind.as_str(), "file" | "symbol" | "type") =>
+                    {
+                        return invariant(format!(
+                            "Web semantic {} site {} concrete target {} must be a file, symbol, or type node",
+                            site.kind, site.id, target.id
+                        ));
+                    }
                     _ => {}
                 }
                 if rust_semantic_site
@@ -997,11 +1029,25 @@ fn validate_semantic_maps(
                         site.id, target.id
                     ));
                 }
+                if web_semantic_site
+                    && !matches!(
+                        target.properties.get("language").and_then(Value::as_str),
+                        Some("typescript" | "javascript")
+                    )
+                {
+                    return invariant(format!(
+                        "Web semantic dependency site {} concrete target {} must declare language=typescript or javascript",
+                        site.id, target.id
+                    ));
+                }
             }
         }
 
         let expected_edge_kind = semantic_edge_kind_for_site(site, strict_dependency_site)
             .expect("semantic site kind matched above");
+        // Rust HIR sites currently use one condition for every target. Web
+        // conditional exports may narrow each candidate edge to its own
+        // browser/server/package branch while the site carries their union.
         let require_same_condition = rust_semantic_site;
         for edge in edges
             .values()
@@ -1025,7 +1071,7 @@ fn validate_semantic_maps(
                 && edge.condition.canonicalized() != site.condition.canonicalized()
             {
                 return invariant(format!(
-                    "Rust semantic edge {} condition does not match dependency site {}",
+                    "semantic edge {} condition does not match dependency site {}",
                     edge.id, site.id
                 ));
             }
@@ -1107,7 +1153,7 @@ fn is_rust_import_site_kind(kind: &str) -> bool {
 fn is_evidence_driven_semantic_site(site: &DependencySite) -> bool {
     matches!(
         site.kind.as_str(),
-        "type_use" | "rust_use" | "rust_reexport"
+        "type_use" | "rust_use" | "rust_reexport" | "web_import" | "web_reexport"
     ) && site
         .evidence
         .first()
@@ -1217,6 +1263,8 @@ fn semantic_edge_kind_for_site(
         "type_use" if strict_dependency_site => Some("type_uses"),
         "rust_use" if strict_dependency_site => Some("imports"),
         "rust_reexport" if strict_dependency_site => Some("reexports"),
+        "web_import" if strict_dependency_site => Some("imports"),
+        "web_reexport" if strict_dependency_site => Some("reexports"),
         _ => None,
     }
 }
@@ -1231,6 +1279,15 @@ fn is_rust_semantic_dependency_site(site: &DependencySite, source: &GraphNode) -
                     evidence.kind == EvidenceKind::Semantic
                         && evidence.extractor.starts_with("rust-analyzer")
                 })))
+}
+
+fn is_web_semantic_dependency_site(site: &DependencySite, source: &GraphNode) -> bool {
+    matches!(site.kind.as_str(), "web_import" | "web_reexport")
+        || (site.kind == "type_use"
+            && matches!(
+                source.properties.get("language").and_then(Value::as_str),
+                Some("typescript" | "javascript")
+            ))
 }
 
 fn is_payload_event(event: &ProtocolEvent) -> bool {
@@ -1585,7 +1642,9 @@ fn validate_semantic_site(
     if semantic_edge_kind_for_site(site, strict_dependency_site).is_none() {
         return Ok(());
     }
-    require_non_empty("semantic dependency_site.specifier", &site.specifier)?;
+    if site.specifier.is_empty() && !matches!(site.kind.as_str(), "web_import" | "web_reexport") {
+        return invariant("semantic dependency_site.specifier must not be empty".into());
+    }
     let primary = validate_primary_semantic_evidence(
         &format!("semantic dependency site {}", site.id),
         &site.evidence,

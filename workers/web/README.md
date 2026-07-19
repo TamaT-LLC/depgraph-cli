@@ -14,7 +14,7 @@ The MVP is deliberately `bundled-only`. Project-local TypeScript is useful compa
 
 | Available input | Selection | Metadata and diagnostic | Fallback |
 | --- | --- | --- | --- |
-| Valid release-adjacent TypeScript 7.0.2 native compiler | Use the bundled compiler for syntax analysis plus the isolated Program / TypeChecker definition graph | `source=bundled`, `version=7.0.2`, `selection=bundled-only` | Not needed |
+| Valid release-adjacent TypeScript 7.0.2 native compiler | Use the bundled compiler for syntax analysis plus the isolated Program / TypeChecker definition, import, re-export, and type-use graph | `source=bundled`, `version=7.0.2`, `selection=bundled-only` | Not needed |
 | Build-produced pinned TypeScript 7.0.2 artifact in development | The build verifies package identity/version and copies the compiler to `dist/typescript`; source-mode tests use only that fixed path | Same bundled metadata | Not needed |
 | Project-local TypeScript declaration, lock entry, or in-root `node_modules/typescript/package.json` | Read and report the version as metadata only; continue with bundled 7.0.2 | `web.project_typescript_not_loaded` identifies the detected version and metadata source | Bundled compiler remains selected |
 | No project-local TypeScript | Continue with bundled 7.0.2 | No project-local diagnostic | Bundled compiler remains selected |
@@ -29,17 +29,20 @@ The `profile_declared` event records the decision using these stable properties:
 | `typescript_compiler_version` | `7.0.2` | Exact selected compiler version |
 | `typescript_compiler_selection` | `bundled-only` | Project-local and ambient compilers are not candidates |
 | `typescript_compiler_fallback` | `fail-closed` | Compiler failure cannot change the selected trust boundary |
-| `typescript_analysis_mode` | `semantic-definition-graph` | Program / TypeChecker emits only the versioned definition slice |
+| `typescript_analysis_mode` | `semantic-import-type-graph` | Program / TypeChecker emits the versioned definition + import/re-export/type-use slice |
 | `typescript_project_local_policy` | `metadata-only` | Local version evidence may be read but local code may not be loaded |
 | `typescript_project_local_loaded` | `false` | The local TypeScript module was not imported or executed |
-| `typescript_typechecker_status` | `definition-graph-emitted` or `definition-graph-discarded` | The validated definition delta was emitted, or a typed late failure discarded it atomically |
+| `typescript_typechecker_status` | `definition-import-type-graph-emitted` or `definition-import-type-graph-discarded` | The validated definition/dependency delta was emitted, or a typed late failure discarded it atomically |
 | `typescript_definition_graph_status` | `ready` or `failed` | Whether the definition delta passed worker-side validation and atomic union |
 | `typescript_project_model_status` | `ready` | The isolated project admitted only inventory roots and bundled standard-library files |
-| `typescript_project_config` | `worker-neutral-allowlist` | Static JSON/JSONC `baseUrl`/`paths` are normalized into worker-owned data; config code, plugins, transforms, and package-based extends are not loaded |
+| `typescript_project_config` | `worker-neutral-allowlist` | Static JSON/JSONC `paths` are normalized into worker-owned data using TypeScript 7 declaration-site semantics; `baseUrl`, config code, plugins, transforms, and package-based extends are not loaded |
 | `typescript_static_config_files` / `typescript_path_mappings` | decimal counts | Auditable counts of admitted static config files and normalized alias patterns |
 | `typescript_module_resolution` | `inventory-only` | Relative and admitted static-alias resolution can see virtual inventory files but not the host or project package tree |
-| `typescript_semantic_graph_emission` | `definition-graph-v1` | Only canonical symbol/type nodes and site-less `declares`/`extends`/`implements`/`instantiates` relations are allowed; `semantic-complete` remains forbidden |
-| `typescript_semantic_node_count` / `typescript_semantic_relation_count` / `typescript_semantic_issue_count` | decimal counts | Auditable definition-delta and bounded issue totals |
+| `typescript_semantic_graph_emission` | `definition-import-type-graph-v1` | Canonical definitions plus `web_import`/`web_reexport`/`type_use` sites and `imports`/`reexports`/`type_uses` edges are allowed; calls and `semantic-complete` remain forbidden |
+| `typescript_semantic_node_count` | decimal count | Auditable total of repository-owned `symbol` and `type` nodes; external/unknown sentinels are excluded |
+| `typescript_semantic_relation_count` | decimal count | Auditable total of definition relations plus semantic dependency edges |
+| `typescript_semantic_site_count` | decimal count | Auditable total of semantic-primary import, re-export, and type-use sites |
+| `typescript_semantic_issue_count` | decimal count | Auditable bounded semantic issue total |
 | `typescript_release_gate` | `release-gate-pending` or `release-gate-verified` | Only a core-attested extracted archive receives the verified value |
 | `project_code_executed` | `false` | No project code, hook, plugin, script, or executable config ran |
 
@@ -55,7 +58,7 @@ Safe mode may read inventory-approved source files plus a narrow allowlist of me
 - JSON/JSONC TypeScript configuration and recognized framework configuration source needed for static literal extraction.
 - Existing generated evidence such as TanStack `routeTree.gen.*`.
 
-Out-of-root symlinks and unreadable files are rejected. Source inventory failures are explicit skipped coverage; unavailable optional metadata is treated as absent or produces a role-specific diagnostic and must never cause module loading. The native TypeScript compiler receives only inventory-approved source bytes, bundled standard-library declarations, and a worker-owned project through an isolated virtual filesystem. The project fixes `moduleResolution=bundler`, `module=preserve`, `target=esnext`, `noEmit`, empty `plugins`/`types`/`typeRoots`, and normalized repository-relative `baseUrl`/`paths` data admitted from static JSON/JSONC. Raw tsconfig files, the repository root, and its `node_modules` tree are not visible to the compiler process.
+Out-of-root symlinks and unreadable files are rejected. Source inventory failures are explicit skipped coverage; unavailable optional metadata is treated as absent or produces a role-specific diagnostic and must never cause module loading. The native TypeScript compiler receives only inventory-approved source bytes, bundled standard-library declarations, and a worker-owned project through an isolated virtual filesystem. The project fixes `moduleResolution=bundler`, `module=preserve`, `target=esnext`, `noEmit`, empty `plugins`/`types`/`typeRoots`, and normalized repository-relative `paths` data admitted from static JSON/JSONC. A child `paths` declaration replaces the complete parent option, substitutions are relative to the config that declared it, and deprecated `baseUrl` is deliberately ignored. Raw tsconfig files, the repository root, and its `node_modules` tree are not visible to the compiler process.
 
 Safe mode must never:
 
@@ -83,7 +86,17 @@ The absence of a project-local compiler is normal, not an error. A detected loca
 
 ## TypeChecker graph-activation acceptance matrix
 
-The isolated Program / TypeChecker now emits the definition-only v1 slice on every successful Web scan. Type-use, import refinement, call edges, framework semantic edges, and `semantic-complete` remain disabled until their later activation gates pass. Definition output does not change the `bundled-only` compiler decision; any future project-local execution mode requires a separate threat-model decision and an explicit, non-safe profile.
+The isolated Program / TypeChecker now emits the `definition-import-type-graph-v1` slice on every successful Web scan. It classifies every admitted import, re-export, and named type occurrence as `resolved`, `candidates`, `external`, or `unresolved`, with a reason on unresolved sites. Call edges, framework semantic edges, and `semantic-complete` remain disabled until their later activation gates pass. Semantic output does not change the `bundled-only` compiler decision; any future project-local execution mode requires a separate threat-model decision and an explicit, non-safe profile.
+
+Named repository bindings resolve to canonical `symbol` or `type` nodes. The module-level occurrence kinds `namespace_import`, `side_effect_import`, `empty_import`, `import_equals`, `require_call`, `dynamic_import`, `import_type`, `namespace_reexport`, `empty_reexport`, and `export_star` use a repository `file` as their concrete repository target; no other occurrence may weaken a named binding to its containing file. Empty import/export clauses are preserved as their own module-level occurrences so that `type_only` remains truthful. When the current definition vocabulary cannot represent a repository export, the worker records an explicit fallback reason instead of fabricating exact symbol resolution. Existing source-phase import/re-export sites and edges remain in the graph alongside the semantic sites and are never overwritten.
+
+Every `web_import` and `web_reexport` site uses its evidence file as the source node. A `type_use` site uses its enclosing canonical `symbol` or `type`; only an occurrence without a representable enclosing declaration may fall back to that same evidence `file`. This Web-only fallback does not weaken the Rust semantic source contract.
+
+Known Node.js builtin specifiers use canonical `node:*` external identities with `external` status and `exact` precision. Explicit forms such as `node:fs` retain that locator, while valid bare forms such as `fs`, `fs/promises`, and `path` normalize to `node:fs`, `node:fs/promises`, and `node:path`. Unknown `node:*` names fail closed as unresolved and builtins are never synthesized as unknown-version npm packages.
+
+Every TypeChecker-primary site/edge evidence object carries a boolean `properties.type_only`. It is always `true` for `type_use` and `import_type`, always `false` for runtime-only side-effect imports, `require()` calls, and dynamic imports, and follows the syntax marker for named/default/namespace imports, `import = require()`, and re-exports. Missing, non-boolean, or contradictory markers discard the semantic delta atomically.
+
+The same evidence carries `module_specifier` for every import/re-export occurrence and `imported_name` for named/default/namespace bindings, `import = require()`, and type uses. Valid quoted empty module/export names remain empty strings rather than being conflated with missing or computed syntax; quoted `"*"` and `"="` names likewise remain ordinary named bindings. Module specifiers have no reserved `binding:` prefix. Their occurrences are retained as unresolved when they cannot resolve. The public site specifier must equal `module_specifier` for import/re-export sites and `imported_name` for type-use sites. A TypeScript `resolution-mode` attribute is preserved as `resolution_mode=import|require` only when it is the declaration's sole attribute and the complete declaration is type-only, including JSDoc import attributes. The implicit CommonJS phase of `import = require()` is internal resolver state and is never exposed as `resolution_mode`. Legacy `assert` syntax is retained only as an explicit `syntax_invalid` occurrence because the pinned compiler reports TS2880. The worker and core independently attest these shapes; malformed or contradictory metadata discards the semantic delta.
 
 | Fixture | Required assertion before each later semantic slice activation |
 | --- | --- |
@@ -99,13 +112,13 @@ The isolated Program / TypeChecker now emits the definition-only v1 slice on eve
 
 TypeChecker release acceptance additionally requires exact evidence spans, separate type and runtime targets where they differ, bounded diagnostics, coverage conservation (`discovered = emitted + skipped`), resource deadlines, and regression tests proving that no project-controlled code executed.
 
-The definition slice rejects inventories above 50,000 source files before any remote `getSourceFile` AST transfer. The 1,000,000-node limit is enforced while traversing transferred trees because the async compiler API exposes each source AST as one remote object rather than a count-only preflight.
+The semantic slice rejects inventories above 50,000 source files before any remote `getSourceFile` AST transfer. The 1,000,000-node limit is enforced while traversing transferred trees because the async compiler API exposes each source AST as one remote object rather than a count-only preflight.
 
 ## Static coverage
 
 Static coverage includes npm/pnpm/Yarn/Bun workspace and lockfile discovery (including `.pnp.data.json` without loading `.pnp.cjs`), TypeScript/JavaScript ESM and CommonJS dependency sites, `tsconfig.json`/`jsconfig.json` path aliases, conditional workspace package exports, and filesystem routes for Next.js, Astro, TanStack Router, and TanStack Start. Existing TanStack `routeTree.gen.*` files are treated as generated evidence. Production package edges retain dependency/peer/optional kinds and exclude dev-only manifest declarations.
 
-The bundled TypeScript 7.0.2 lexical API is used for deterministic dependency inventory and context-aware import/require recognition. In addition, one pinned native TypeScript 7.0.2 compiler process parses every `.ts`, `.tsx`, `.mts`, `.cts`, `.js`, `.jsx`, `.mjs`, and `.cjs` file per scan. Syntactic diagnostics drive unsupported-syntax coverage; bounded Program, global, and semantic diagnostics accompany the isolated TypeChecker definition graph. Only repository-owned definition nodes and relations are promoted at this stage.
+The bundled TypeScript 7.0.2 lexical API is used for deterministic dependency inventory and context-aware import/require recognition. In addition, one pinned native TypeScript 7.0.2 compiler process parses every `.ts`, `.tsx`, `.mts`, `.cts`, `.js`, `.jsx`, `.mjs`, and `.cjs` file per scan. Syntactic diagnostics drive unsupported-syntax coverage; bounded Program, global, and semantic diagnostics accompany the isolated TypeChecker definition/import/type-use graph. Semantic primary evidence and source supporting evidence retain the canonical source span, profile, and compiler version; candidates and all emitted events use canonical ordering.
 
 Release archives keep the native compiler and its standard library tree under `libexec/typescript/lib`. The release manifest pins the component version, entry point, and canonical whole-tree SHA-256, so the `depgraph` core launcher rejects missing, added, symlinked, or modified files before the Web worker starts. Direct worker execution trusts its adjacent installation and is intended for protocol development; the verified safe-scan integrity contract requires launching through `depgraph`.
 
@@ -113,4 +126,6 @@ Astro frontmatter is parsed by the bundled Astro compiler 4.0.0; the release dir
 
 `DEPGRAPH_PROFILE_CONFIG` accepts the core-provided JSON object `{ "web_environments": [...] }`. Values are normalized, deduplicated, and sorted into the stable profile identity and canonical edge/site conditions; the default is production browser + server.
 
-TypeChecker semantic diagnostics and the definition-only symbol/type graph run inside the isolated compiler boundary. Type-use/import refinement, call graph promotion, plugin-defined virtual modules, and code-based route construction remain unresolved or diagnostic-only in safe mode.
+TypeChecker semantic diagnostics and the definition/import/re-export/type-use graph run inside the isolated compiler boundary. Call graph promotion, plugin-defined virtual modules, and code-based route construction remain unresolved or diagnostic-only in safe mode. A late validation failure discards the complete semantic delta, including its sites, edges, and semantic-only sentinels, while retaining the source dependency graph.
+
+Source-phase runtime syntax resolution retains target-specific browser/server/package branches: each candidate edge carries its branch condition, while the dependency site carries their canonical union. TypeChecker semantic refinement instead mirrors the pinned TypeScript Bundler resolver's neutral condition set. It selects `import` or `require` from the actual occurrence (or an accepted resolution-mode attribute), enables `types` and applicable `types@` selectors for value and type-only occurrences alike, accepts `default`, and does not activate browser, node, mode, or arbitrary custom conditions. A semantic site therefore does not become a browser/server candidate merely because both environments are present in the scan profile. Condition objects use declaration-order first-match semantics, so an active `default` shadows later keys. Missing type probes and malformed or nonmatching `types@` selectors continue as the pinned compiler does; terminal invalid or blocked runtime branches, incomplete runtime profile results, and traversal-budget exhaustion fail closed instead of selecting a later runtime condition.

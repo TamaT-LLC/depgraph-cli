@@ -1,6 +1,6 @@
 use depgraph_protocol::{
-    DependencySite, Evidence, EvidenceKind, GraphEdge, PROTOCOL_SCHEMA, Phase, Precision,
-    ProtocolEvent, ResolutionStatus, stable_id_from_value, validate_safe_ndjson,
+    Condition, DependencySite, Evidence, EvidenceKind, GraphEdge, PROTOCOL_SCHEMA, Phase,
+    Precision, ProtocolEvent, ResolutionStatus, stable_id_from_value, validate_safe_ndjson,
     validate_safe_semantic_ndjson,
 };
 use pretty_assertions::assert_eq;
@@ -158,6 +158,273 @@ fn rust_import_reexport_and_type_use_follow_the_strict_semantic_contract() {
             );
         }
     }
+}
+
+#[test]
+fn web_import_reexport_and_type_use_follow_the_strict_semantic_contract() {
+    let input = values_to_ndjson(web_semantic_dependency_values());
+    assert!(schema_accepts_stream(&input));
+    assert!(semantic_schema_accepts_stream(&input));
+    let validated = validate_safe_semantic_ndjson(Cursor::new(input))
+        .expect("Web semantic dependency fixture must validate");
+
+    for (site_kind, edge_kind, target_kind) in [
+        ("web_import", "imports", "type"),
+        ("web_reexport", "reexports", "type"),
+        ("type_use", "type_uses", "type"),
+    ] {
+        let site = validated
+            .sites
+            .values()
+            .find(|site| site.kind == site_kind)
+            .unwrap_or_else(|| panic!("missing {site_kind} site"));
+        let source = &validated.nodes[&site.source];
+        assert_eq!(source.kind, "file");
+        assert_eq!(
+            source.properties.get("language").and_then(Value::as_str),
+            Some("typescript")
+        );
+        assert_eq!(site.evidence[0].kind, EvidenceKind::Semantic);
+        assert_eq!(site.evidence[1].kind, EvidenceKind::Source);
+        assert_eq!(
+            site.id,
+            stable_id_from_value("site", &site_identity(site, &site.evidence[0]))
+        );
+        let linked = validated
+            .edges
+            .values()
+            .filter(|edge| edge.site_id.as_deref() == Some(site.id.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(linked.len(), site.target_ids.len());
+        for edge in linked {
+            assert_eq!(edge.kind, edge_kind);
+            assert_eq!(edge.phase, Phase::Semantic);
+            assert_eq!(edge.source, site.source);
+            assert_eq!(edge.profile_id, site.profile_id);
+            assert_eq!(edge.condition, site.condition);
+            assert_eq!(edge.resolution_status, site.resolution_status);
+            assert_eq!(edge.precision, site.precision);
+            assert_eq!(validated.nodes[&edge.target].kind, target_kind);
+            assert_eq!(edge.evidence[0].kind, EvidenceKind::Semantic);
+            assert_eq!(edge.evidence[1].kind, EvidenceKind::Source);
+        }
+    }
+}
+
+#[test]
+fn web_import_and_reexport_preserve_valid_empty_module_specifiers() {
+    for site_kind in ["web_import", "web_reexport"] {
+        let mut events = web_semantic_dependency_values();
+        events
+            .iter_mut()
+            .find(|event| event["event"] == "dependency_site" && event["site"]["kind"] == site_kind)
+            .unwrap_or_else(|| panic!("missing {site_kind} site"))["site"]["specifier"] = json!("");
+        let input = values_to_ndjson(events);
+        assert!(schema_accepts_stream(&input));
+        assert!(semantic_schema_accepts_stream(&input));
+        let validated = validate_safe_semantic_ndjson(Cursor::new(input))
+            .unwrap_or_else(|error| panic!("empty {site_kind} specifier must validate: {error}"));
+        assert!(
+            validated
+                .sites
+                .values()
+                .any(|site| site.kind == site_kind && site.specifier.is_empty())
+        );
+    }
+}
+
+#[test]
+fn web_semantic_edge_may_narrow_its_site_condition() {
+    let mut events = web_semantic_dependency_values();
+    let site_index = events
+        .iter()
+        .position(|event| {
+            event["event"] == "dependency_site" && event["site"]["kind"] == "web_import"
+        })
+        .expect("Web import site");
+    let old_id = events[site_index]["site"]["id"]
+        .as_str()
+        .expect("Web import site ID")
+        .to_owned();
+    let edge_condition: Condition =
+        serde_json::from_value(events[site_index]["site"]["condition"].clone())
+            .expect("Web condition");
+    events[site_index]["site"]["condition"] = serde_json::to_value(
+        Condition::Any {
+            conditions: vec![
+                edge_condition,
+                Condition::Eq {
+                    key: "environment".into(),
+                    value: json!("worker"),
+                },
+            ],
+        }
+        .canonicalized(),
+    )
+    .expect("canonical Web condition");
+    let new_id = rehash_json_site(&mut events[site_index]["site"]);
+    for event in events.iter_mut().filter(|event| {
+        event["event"] == "edge_upsert"
+            && event["edge"]["site_id"].as_str() == Some(old_id.as_str())
+    }) {
+        event["edge"]["site_id"] = json!(new_id);
+        rehash_json_edge(&mut event["edge"]);
+    }
+    sort_site_events(&mut events);
+    sort_edge_events(&mut events);
+    resequence(&mut events);
+
+    let validated = validate_safe_semantic_ndjson(Cursor::new(values_to_ndjson(events)))
+        .expect("Web target edge may narrow its multi-environment site condition");
+    let site = &validated.sites[&new_id];
+    let edge = validated
+        .edges
+        .values()
+        .find(|edge| edge.site_id.as_deref() == Some(new_id.as_str()))
+        .expect("linked Web import edge");
+    assert_ne!(edge.condition, site.condition);
+}
+
+#[test]
+fn web_semantic_candidates_and_sentinels_are_strict() {
+    let mut candidates = web_semantic_dependency_values();
+    let second_target = node_id_by_display_name(&candidates, "WebTargetB");
+    let site_index = candidates
+        .iter()
+        .position(|event| {
+            event["event"] == "dependency_site" && event["site"]["kind"] == "web_import"
+        })
+        .expect("Web import site");
+    let site_id = candidates[site_index]["site"]["id"]
+        .as_str()
+        .expect("Web import site ID")
+        .to_owned();
+    let mut targets = candidates[site_index]["site"]["target_ids"]
+        .as_array()
+        .expect("Web import targets")
+        .clone();
+    targets.push(json!(second_target));
+    targets.sort_by(|left, right| left.as_str().cmp(&right.as_str()));
+    candidates[site_index]["site"]["target_ids"] = Value::Array(targets);
+    candidates[site_index]["site"]["resolution_status"] = json!("candidates");
+    candidates[site_index]["site"]["precision"] = json!("overapprox");
+    let edge_index = candidates
+        .iter()
+        .position(|event| event["event"] == "edge_upsert" && event["edge"]["site_id"] == site_id)
+        .expect("Web import edge");
+    candidates[edge_index]["edge"]["resolution_status"] = json!("candidates");
+    candidates[edge_index]["edge"]["precision"] = json!("overapprox");
+    let mut second_edge = candidates[edge_index].clone();
+    second_edge["edge"]["target"] = json!(second_target);
+    rehash_json_edge(&mut second_edge["edge"]);
+    let file_completed = candidates
+        .iter()
+        .position(|event| event["event"] == "file_completed")
+        .expect("file completion");
+    candidates.insert(file_completed, second_edge);
+    sort_edge_events(&mut candidates);
+    for event in &mut candidates {
+        if matches!(
+            event["event"].as_str(),
+            Some("profile_completed" | "scan_completed")
+        ) {
+            event["coverage"]["resolved"] = json!(2);
+            event["coverage"]["candidates"] = json!(1);
+        }
+    }
+    resequence(&mut candidates);
+    validate_safe_semantic_ndjson(Cursor::new(values_to_ndjson(candidates.clone())))
+        .expect("sorted Web semantic candidates must validate");
+    let target_ids = candidates[site_index]["site"]["target_ids"]
+        .as_array_mut()
+        .expect("candidate targets");
+    target_ids.swap(0, 1);
+    let error = validate_safe_semantic_ndjson(Cursor::new(values_to_ndjson(candidates)))
+        .expect_err("unsorted Web candidates must fail");
+    assert!(
+        error
+            .to_string()
+            .contains("target IDs must be unique and sorted")
+    );
+
+    for (status, precision, target_id, target_kind, reason) in [
+        (
+            "external",
+            "exact",
+            "external-system:web:package",
+            "external_system",
+            None,
+        ),
+        (
+            "unresolved",
+            "heuristic",
+            "unknown:web:dependency",
+            "unknown_target",
+            Some("TypeChecker could not resolve the module"),
+        ),
+    ] {
+        let mut events = web_semantic_dependency_values();
+        insert_plain_node(&mut events, target_id, target_kind);
+        reassign_site_target(&mut events, "web_import", target_id);
+        let site_id = semantic_site_id(&events, "web_import");
+        let site = events
+            .iter_mut()
+            .find(|event| event["event"] == "dependency_site" && event["site"]["id"] == site_id)
+            .expect("Web import site");
+        site["site"]["resolution_status"] = json!(status);
+        site["site"]["precision"] = json!(precision);
+        if let Some(reason) = reason {
+            site["site"]["reason"] = json!(reason);
+        }
+        let edge = linked_edge_mut(&mut events, &site_id);
+        edge["resolution_status"] = json!(status);
+        edge["precision"] = json!(precision);
+        for event in &mut events {
+            if matches!(
+                event["event"].as_str(),
+                Some("profile_completed" | "scan_completed")
+            ) {
+                event["coverage"]["resolved"] = json!(2);
+                event["coverage"][status] = json!(1);
+            }
+        }
+        resequence(&mut events);
+        validate_safe_semantic_ndjson(Cursor::new(values_to_ndjson(events)))
+            .unwrap_or_else(|error| panic!("Web {status} sentinel must validate: {error}"));
+    }
+}
+
+#[test]
+fn web_sites_require_web_sources_without_weakening_rust_type_use_sources() {
+    let mut wrong_web_language = web_semantic_dependency_values();
+    wrong_web_language
+        .iter_mut()
+        .find(|event| event["node"]["display_name"] == "src/index.ts")
+        .expect("Web source file")["node"]["properties"]["language"] = json!("rust");
+    let error = validate_safe_semantic_ndjson(Cursor::new(values_to_ndjson(wrong_web_language)))
+        .expect_err("Web sites with a Rust source must fail");
+    assert!(
+        error
+            .to_string()
+            .contains("must declare language=typescript or javascript")
+    );
+
+    let mut rust_file_source = rust_semantic_dependency_values();
+    let source_id = "file:rust-semantic-type-use-source";
+    insert_plain_node(&mut rust_file_source, source_id, "file");
+    rust_file_source
+        .iter_mut()
+        .find(|event| event["node"]["id"] == source_id)
+        .expect("Rust source file")["node"]["properties"] = json!({"language":"rust"});
+    reassign_site_source(&mut rust_file_source, "type_use", source_id);
+    let error = validate_safe_semantic_ndjson(Cursor::new(values_to_ndjson(rust_file_source)))
+        .expect_err("Rust semantic type-use with a file source must fail");
+    assert!(
+        error
+            .to_string()
+            .contains("symbol/type node (or a Web file fallback)"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -1648,6 +1915,103 @@ fn rust_semantic_dependency_values() -> Vec<Value> {
     events
 }
 
+fn web_semantic_dependency_values() -> Vec<Value> {
+    let mut events = rust_semantic_dependency_values();
+    let source_id = node_id_by_display_name(&events, "crate");
+    let source = events
+        .iter_mut()
+        .find(|event| event["node"]["id"] == source_id)
+        .expect("module source node");
+    source["node"]["kind"] = json!("file");
+    source["node"]["locator"] = json!("file://src/index.ts");
+    source["node"]["display_name"] = json!("src/index.ts");
+    source["node"]["properties"] = json!({
+        "language":"typescript",
+        "path":"src/index.ts",
+    });
+    let web_type_node = |display_name: &str| {
+        let identity = json!({
+            "language":"typescript",
+            "package_locator":"npm:workspace:web-semantic-fixture@1.0.0#.",
+            "type_kind":"interface",
+            "resolver_identity":format!("npm:workspace:web-semantic-fixture@1.0.0#.::module:src/target.ts#{display_name}"),
+        });
+        let id = stable_id_from_value("type", &identity);
+        json!({
+            "event":"node_upsert",
+            "protocol_version":"1.0",
+            "scan_id":"scan-rust-semantic-golden",
+            "adapter":"rust",
+            "adapter_version":"0.1.0",
+            "seq":0,
+            "node":{
+                "id":id,
+                "kind":"type",
+                "locator":format!("typescript-type:{id}"),
+                "display_name":display_name,
+                "properties":{
+                    "language":"typescript",
+                    "package_locator":"npm:workspace:web-semantic-fixture@1.0.0#.",
+                    "type_kind":"interface",
+                    "canonical_identity":identity,
+                },
+            },
+        })
+    };
+    let target_a = web_type_node("WebTargetA");
+    let target_b = web_type_node("WebTargetB");
+    let target_id = target_a["node"]["id"]
+        .as_str()
+        .expect("Web target ID")
+        .to_owned();
+    let first_site = events
+        .iter()
+        .position(|event| event["event"] == "dependency_site")
+        .expect("dependency sites");
+    events.insert(first_site, target_a);
+    events.insert(first_site + 1, target_b);
+    events.retain(|event| {
+        event["event"] != "edge_upsert" || event["edge"]["site_id"].as_str().is_some()
+    });
+
+    for (old_kind, site_kind, edge_kind) in [
+        ("rust_use", "web_import", "imports"),
+        ("rust_reexport", "web_reexport", "reexports"),
+        ("type_use", "type_use", "type_uses"),
+    ] {
+        let site_index = events
+            .iter()
+            .position(|event| {
+                event["event"] == "dependency_site"
+                    && event["site"]["kind"].as_str() == Some(old_kind)
+            })
+            .unwrap_or_else(|| panic!("missing {old_kind} site"));
+        let old_site_id = events[site_index]["site"]["id"]
+            .as_str()
+            .expect("old site ID")
+            .to_owned();
+        events[site_index]["site"]["kind"] = json!(site_kind);
+        events[site_index]["site"]["source"] = json!(source_id);
+        events[site_index]["site"]["target_ids"] = json!([target_id]);
+        let new_site_id = rehash_json_site(&mut events[site_index]["site"]);
+        let edge = events
+            .iter_mut()
+            .find(|event| {
+                event["event"] == "edge_upsert"
+                    && event["edge"]["site_id"].as_str() == Some(old_site_id.as_str())
+            })
+            .unwrap_or_else(|| panic!("missing {old_kind} edge"));
+        edge["edge"]["source"] = json!(source_id);
+        edge["edge"]["kind"] = json!(edge_kind);
+        edge["edge"]["site_id"] = json!(new_site_id);
+        edge["edge"]["target"] = json!(target_id);
+        rehash_json_edge(&mut edge["edge"]);
+    }
+    sort_edge_events(&mut events);
+    resequence(&mut events);
+    events
+}
+
 fn rust_semantic_candidate_values() -> Vec<Value> {
     let mut events = rust_semantic_dependency_values();
     let second_target = node_id_by_display_name(&events, "Named");
@@ -2183,7 +2547,7 @@ fn semantic_schema_accepts_stream(input: &str) -> bool {
             event["event"] == "dependency_site"
                 && matches!(
                     event["site"]["kind"].as_str(),
-                    Some("type_use" | "rust_use" | "rust_reexport")
+                    Some("type_use" | "rust_use" | "rust_reexport" | "web_import" | "web_reexport")
                 )
                 && event["site"]["evidence"][0]["kind"] == "semantic"
         })

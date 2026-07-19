@@ -9,6 +9,7 @@ publish = false
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+depgraph-protocol = { path = "../crates/depgraph-protocol" }
 flate2 = "1.1"
 hex.workspace = true
 serde.workspace = true

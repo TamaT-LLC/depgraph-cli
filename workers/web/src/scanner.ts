@@ -2,23 +2,47 @@ import path from "node:path";
 import ts from "typescript";
 import { normalizeRelative, readJson, readUtf8, WEB_SOURCE_EXTENSIONS, type FileInventoryIssue } from "./fs";
 import { compareById, stableId } from "./ids";
-import { extractDependencies, ModuleResolver, type RawDependency, type Resolution, type ResolvedTarget } from "./imports";
+import {
+  extractDependencies,
+  extractPotentialTypeScriptModuleSpecifiers,
+  ModuleResolver,
+  type RawDependency,
+  type Resolution,
+  type ResolvedTarget,
+  type TypeScriptPathRequest,
+} from "./imports";
 import { discoverRoutes, type RouteEntry } from "./routes";
 import { mergeTypeScriptDefinitionDelta, type TypeScriptDefinitionDelta } from "./semantic-delta";
-import { analyzeTypeScriptProject, TYPESCRIPT_COMPILER_VERSION, TYPESCRIPT_SOURCE_EXTENSIONS } from "./typescript-compiler";
+import {
+  analyzeTypeScriptProject,
+  TYPESCRIPT_COMPILER_VERSION,
+  TYPESCRIPT_SOURCE_EXTENSIONS,
+  type TypeScriptProjectAnalysis,
+} from "./typescript-compiler";
 import type {
   TypeScriptRawDefinition,
   TypeScriptRawDefinitionDelta,
   TypeScriptRawDefinitionEndpoint,
   TypeScriptRawTypeArgumentDescriptor,
 } from "./typescript-semantic";
+import type {
+  TypeScriptDependencyValidationSource,
+  TypeScriptRawDependencyDelta,
+  TypeScriptRawDependencySite,
+  TypeScriptRawDependencyTarget,
+} from "./typescript-dependencies";
+import { validateTypeScriptRawDependencyDelta } from "./typescript-dependencies";
 import {
   ADAPTER_VERSION,
+  aggregateConditions,
+  canonicalizeCondition,
+  compareUtf8,
   PROFILE_CONFIG_ISSUE,
   PROFILE_ID,
   WEB_CONDITION,
   WEB_UNIVERSAL_ENVIRONMENT,
   preferredWebEnvironment,
+  type Condition,
   type DependencySite,
   type Diagnostic,
   type Evidence,
@@ -45,6 +69,7 @@ const MAX_SEMANTIC_TYPE_DESCRIPTOR_DEPTH = 64;
 const MAX_SEMANTIC_TYPE_DESCRIPTOR_NODES = 2_048;
 const MAX_SEMANTIC_RESOLVER_CHARS = 4_096;
 const MAX_SEMANTIC_TYPE_DESCRIPTOR_CHARS = 2_048;
+const MAX_TYPESCRIPT_REFINEMENT_TARGETS_PER_SITE = 4_096;
 
 type SourceSpan = {
   start_line: number;
@@ -52,6 +77,21 @@ type SourceSpan = {
   end_line: number;
   end_column: number;
 };
+
+function rawDependencyTargetKey(target: TypeScriptRawDependencyTarget): string {
+  switch (target.kind) {
+    case "definition": return `definition:${target.key}`;
+    case "file": return `file:${target.relativePath}`;
+    case "external": return `external:${target.locator}:${target.displayName}`;
+    case "unknown": return "unknown";
+  }
+}
+
+function appendTargetCondition(map: Map<string, Condition[]>, key: string, condition: Condition): void {
+  const values = map.get(key) ?? [];
+  values.push(canonicalizeCondition(condition));
+  map.set(key, values);
+}
 
 function sourceLineStarts(source: string): number[] {
   const starts = [0];
@@ -125,14 +165,15 @@ class GraphBuilder {
     ) throw new Error(`conflicting edge upsert for ${edge.id}`);
     const evidence = [...existing.evidence, ...edge.evidence]
       .filter((item, index, array) => array.findIndex((candidate) => JSON.stringify(candidate) === JSON.stringify(item)) === index)
-      .sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right)));
+      .sort((left, right) => compareUtf8(JSON.stringify(left), JSON.stringify(right)));
     this.edges.set(edge.id, { ...existing, evidence });
   }
 
-  mergeTypeScriptDefinitions(
+  mergeTypeScriptSemanticGraph(
     rawDelta: Pick<TypeScriptRawDefinitionDelta, "definitions" | "relations">,
+    dependencyDelta: TypeScriptRawDependencyDelta,
     sources: ReadonlyMap<string, string>,
-  ): { nodes: number; relations: number } {
+  ): { nodes: number; relations: number; sites: number } {
     const definitions = new Map<string, TypeScriptRawDefinition>();
     const rawResolvers = new Map<string, string>();
     for (const definition of rawDelta.definitions) {
@@ -396,7 +437,7 @@ class GraphBuilder {
           backend: "typescript-native-compiler",
           compiler_source: "bundled",
           compiler_version: TYPESCRIPT_COMPILER_VERSION,
-          analysis_mode: "semantic-definition-graph",
+          analysis_mode: "semantic-import-type-graph",
           profile_id: PROFILE_ID,
           project_code_executed: false,
           relation_kind: relation.kind,
@@ -432,9 +473,243 @@ class GraphBuilder {
       profileId: PROFILE_ID,
       compilerVersion: TYPESCRIPT_COMPILER_VERSION,
     });
-    this.nodes = merged.nodes;
-    this.edges = merged.edges;
-    return { nodes: nodes.length, relations: edges.length };
+    const nextNodes = new Map(merged.nodes);
+    const nextSites = new Map(this.sites);
+    const nextEdges = new Map(merged.edges);
+    const coverageDeltas = new Map<string, Record<"resolved" | "candidates" | "external" | "unresolved", number>>();
+    const unknownTarget = (): GraphNode => ({
+      id: stableId("unknown", {
+        repository: this.#workspace.repositoryIdentity,
+        profile: PROFILE_ID,
+        language: "web",
+        identity: "unresolved_dependency_target",
+      }),
+      kind: "unknown_target",
+      locator: "unknown://web/unresolved-dependency",
+      display_name: "Unresolved web dependency",
+      properties: { language: "web", profile_id: PROFILE_ID },
+    });
+    const externalTarget = (target: Extract<TypeScriptRawDependencyTarget, { kind: "external" }>): GraphNode => {
+      const canonicalIdentity = {
+        language: "typescript",
+        compiler_version: TYPESCRIPT_COMPILER_VERSION,
+        locator: target.locator,
+      };
+      const id = stableId("external", canonicalIdentity);
+      return {
+        id,
+        kind: "external_system",
+        locator: `external://typescript/${encodeURIComponent(target.locator)}`,
+        // Node identity is package/compiler boundary scoped, not binding
+        // scoped. Keep display stable when several imported names share it.
+        display_name: target.locator,
+        properties: {
+          language: "typescript",
+          external: true,
+          canonical_identity: canonicalIdentity,
+          profile_id: PROFILE_ID,
+          compiler_version: TYPESCRIPT_COMPILER_VERSION,
+        },
+      };
+    };
+    const insertNode = (node: GraphNode): GraphNode => {
+      const existing = nextNodes.get(node.id);
+      if (existing !== undefined && JSON.stringify(existing) !== JSON.stringify(node)) {
+        throw new Error(`TypeScript dependency delta conflicts with node ${node.id}`);
+      }
+      nextNodes.set(node.id, existing ?? node);
+      return existing ?? node;
+    };
+    const dependencyTarget = (target: TypeScriptRawDependencyTarget): GraphNode => {
+      switch (target.kind) {
+        case "definition": return materializeDefinition(target.key);
+        case "file": return existingFile(target.relativePath);
+        case "external": return insertNode(externalTarget(target));
+        case "unknown": return insertNode(unknownTarget());
+      }
+    };
+    const endpointPath = (endpoint: TypeScriptRawDefinitionEndpoint): string => (
+      endpoint.kind === "file"
+        ? endpoint.relativePath
+        : definitions.get(endpoint.key)?.relativePath ?? (() => { throw new Error(`dependency source definition is missing ${endpoint.key}`); })()
+    );
+    const semanticSites: DependencySite[] = [];
+    const semanticEdges: GraphEdge[] = [];
+    let previousRawKey = "";
+    for (const raw of dependencyDelta.sites) {
+      if (previousRawKey !== "" && previousRawKey >= raw.key) throw new Error("TypeScript dependency sites are not in strict canonical order");
+      previousRawKey = raw.key;
+      const emptyModuleSpecifier = raw.moduleSpecifier === ""
+        && raw.kind !== "type_use"
+        && raw.specifier === "";
+      if ((raw.specifier.length === 0 && !emptyModuleSpecifier) || raw.specifier.length > 2_048) {
+        throw new Error("TypeScript dependency site has an invalid specifier");
+      }
+      if (typeof raw.typeOnly !== "boolean") throw new Error("TypeScript dependency site has an invalid type-only marker");
+      if (raw.resolutionMode !== null && raw.resolutionMode !== "import" && raw.resolutionMode !== "require") {
+        throw new Error("TypeScript dependency site has an invalid resolution mode");
+      }
+      if (raw.resolutionMode !== null && (!raw.typeOnly || raw.moduleSpecifier === null)) {
+        throw new Error("TypeScript dependency site resolution mode contradicts its occurrence");
+      }
+      if (raw.resolutionMode !== null && raw.evidence.occurrenceKind === "import_equals") {
+        throw new Error("TypeScript import-equals dependency site cannot expose a resolution mode");
+      }
+      const emptyModuleExportName = raw.importedName === ""
+        && raw.exportPath?.length === 1
+        && raw.exportPath[0] === ""
+        && ["default_import", "named_import", "named_reexport"].includes(raw.evidence.occurrenceKind);
+      if (
+        (raw.moduleSpecifier !== null && raw.moduleSpecifier.length > 2_048)
+        || (raw.importedName !== null && (
+          (raw.importedName.length === 0 && !emptyModuleExportName)
+          || raw.importedName.length > 512
+        ))
+      ) throw new Error("TypeScript dependency binding metadata is invalid");
+      if (raw.targets.length === 0) throw new Error("TypeScript dependency site has no target");
+      if (raw.targetConditions.length !== raw.targets.length) {
+        throw new Error("TypeScript dependency target conditions do not align with targets");
+      }
+      if (
+        JSON.stringify(raw.condition) !== JSON.stringify(canonicalizeCondition(raw.condition))
+        || JSON.stringify(raw.condition) !== JSON.stringify(aggregateConditions(raw.targetConditions))
+      ) throw new Error("TypeScript dependency site condition is not its canonical target-condition aggregate");
+      const expectedEdgeKind = raw.kind === "web_import" ? "imports" : raw.kind === "web_reexport" ? "reexports" : "type_uses";
+      if (raw.edgeKind !== expectedEdgeKind) throw new Error("TypeScript dependency site kind and edge kind disagree");
+      const source = resolveEndpoint(raw.source);
+      const sourcePath = endpointPath(raw.source);
+      if (sourcePath !== raw.evidence.relativePath) throw new Error("TypeScript dependency evidence is not anchored to its source endpoint");
+      const evidenceSource = sources.get(raw.evidence.relativePath);
+      if (
+        evidenceSource === undefined
+        || !Number.isSafeInteger(raw.evidence.startOffset)
+        || !Number.isSafeInteger(raw.evidence.endOffset)
+        || raw.evidence.startOffset < 0
+        || raw.evidence.endOffset <= raw.evidence.startOffset
+        || raw.evidence.endOffset > evidenceSource.length
+      ) throw new Error("TypeScript dependency evidence has an invalid source span");
+      const concreteTargets = raw.targets.map((target, index) => ({
+        node: dependencyTarget(target),
+        condition: canonicalizeCondition(raw.targetConditions[index]!),
+      })).sort((left, right) => compareById(left.node, right.node));
+      for (let index = 1; index < concreteTargets.length; index += 1) {
+        if (concreteTargets[index - 1]!.node.id === concreteTargets[index]!.node.id) throw new Error("TypeScript dependency site repeats a target");
+      }
+      const targetKinds = new Set(concreteTargets.map(({ node }) => node.kind));
+      if (
+        (raw.status === "resolved" && (raw.precision !== "exact" || concreteTargets.length !== 1 || targetKinds.has("external_system") || targetKinds.has("unknown_target")))
+        || (raw.status === "candidates" && (raw.precision !== "overapprox" || concreteTargets.length < 1 || targetKinds.has("external_system") || targetKinds.has("unknown_target")))
+        || (raw.status === "external" && (concreteTargets.length !== 1 || !targetKinds.has("external_system") || (raw.precision !== "exact" && raw.precision !== "heuristic")))
+        || (raw.status === "unresolved" && (raw.precision !== "heuristic" || concreteTargets.length !== 1 || !targetKinds.has("unknown_target") || !raw.reason))
+      ) throw new Error("TypeScript dependency site has an invalid status/precision/target combination");
+      if (raw.kind === "type_use" && concreteTargets.some(({ node }) => node.kind !== "type" && node.kind !== "external_system" && node.kind !== "unknown_target")) {
+        throw new Error("TypeScript type-use target is not a type or sentinel");
+      }
+      const span = sourceSpan(startsFor(raw.evidence.relativePath), raw.evidence.startOffset, raw.evidence.endOffset);
+      const evidenceProperties = {
+        backend: "typescript-native-compiler",
+        compiler_source: "bundled",
+        compiler_version: TYPESCRIPT_COMPILER_VERSION,
+        analysis_mode: "semantic-import-type-graph",
+        profile_id: PROFILE_ID,
+        project_code_executed: false,
+        occurrence_kind: raw.evidence.occurrenceKind,
+        target_basis: raw.evidence.targetBasis,
+        type_only: raw.typeOnly,
+        ...(raw.resolutionMode === null ? {} : { resolution_mode: raw.resolutionMode }),
+        ...(raw.moduleSpecifier === null ? {} : { module_specifier: raw.moduleSpecifier }),
+        ...(raw.importedName === null ? {} : { imported_name: raw.importedName }),
+      } as const;
+      const primary: Evidence = {
+        kind: "semantic",
+        extractor: "typescript-native-typechecker",
+        extractor_version: TYPESCRIPT_COMPILER_VERSION,
+        path: raw.evidence.relativePath,
+        ...span,
+        detail: raw.evidence.detail,
+        properties: evidenceProperties,
+      };
+      const supporting: Evidence = {
+        kind: "source",
+        extractor: "typescript-native-syntax",
+        extractor_version: TYPESCRIPT_COMPILER_VERSION,
+        path: raw.evidence.relativePath,
+        ...span,
+        detail: `syntax occurrence for ${raw.evidence.occurrenceKind}`,
+        properties: { profile_id: PROFILE_ID, occurrence_kind: raw.evidence.occurrenceKind },
+      };
+      const siteId = stableId("site", {
+        source: source.id,
+        kind: raw.kind,
+        profile_id: PROFILE_ID,
+        condition: raw.condition,
+        path: primary.path,
+        span,
+      });
+      const site: DependencySite = {
+        id: siteId,
+        source: source.id,
+        kind: raw.kind,
+        specifier: raw.specifier,
+        resolution_status: raw.status,
+        target_ids: concreteTargets.map(({ node }) => node.id),
+        profile_id: PROFILE_ID,
+        condition: raw.condition,
+        precision: raw.precision,
+        reason: raw.reason,
+        evidence: [primary, supporting],
+      };
+      const existingSite = nextSites.get(site.id);
+      if (existingSite !== undefined && JSON.stringify(existingSite) !== JSON.stringify(site)) throw new Error(`TypeScript dependency delta conflicts with site ${site.id}`);
+      nextSites.set(site.id, existingSite ?? site);
+      semanticSites.push(site);
+      for (const { node: target, condition } of concreteTargets) {
+        const edge: GraphEdge = {
+          id: stableId("edge", { site_id: siteId, kind: raw.edgeKind, target: target.id }),
+          source: source.id,
+          target: target.id,
+          kind: raw.edgeKind,
+          site_id: siteId,
+          phase: "semantic",
+          environment: "any",
+          profile_id: PROFILE_ID,
+          condition,
+          resolution_status: raw.status,
+          precision: raw.precision,
+          generated: existingFile(raw.evidence.relativePath).properties.generated === true,
+          evidence: [primary, supporting],
+        };
+        const existingEdge = nextEdges.get(edge.id);
+        if (existingEdge !== undefined && JSON.stringify(existingEdge) !== JSON.stringify(edge)) throw new Error(`TypeScript dependency delta conflicts with edge ${edge.id}`);
+        nextEdges.set(edge.id, existingEdge ?? edge);
+        semanticEdges.push(edge);
+      }
+      const counts = coverageDeltas.get(raw.evidence.relativePath) ?? { resolved: 0, candidates: 0, external: 0, unresolved: 0 };
+      counts[raw.status] += 1;
+      coverageDeltas.set(raw.evidence.relativePath, counts);
+    }
+    const nextFiles = new Map([...this.files].map(([relativePath, coverage]) => [relativePath, { ...coverage }]));
+    for (const [relativePath, counts] of coverageDeltas) {
+      const coverage = nextFiles.get(relativePath);
+      if (!coverage) throw new Error(`semantic coverage missing for ${relativePath}`);
+      const total = counts.resolved + counts.candidates + counts.external + counts.unresolved;
+      coverage.expected_sites += total;
+      coverage.produced_sites += total;
+      coverage.resolved += counts.resolved;
+      coverage.candidates += counts.candidates;
+      coverage.external += counts.external;
+      coverage.unresolved += counts.unresolved;
+    }
+    // Swap all graph maps and coverage counters only after every node/site/edge
+    // has passed validation. A late dependency failure therefore preserves the
+    // complete pre-existing syntax graph and ledger.
+    this.nodes = nextNodes;
+    this.sites.clear();
+    for (const [id, site] of nextSites) this.sites.set(id, site);
+    this.edges = nextEdges;
+    this.files.clear();
+    for (const [relativePath, coverage] of nextFiles) this.files.set(relativePath, coverage);
+    return { nodes: nodes.length, relations: edges.length + semanticEdges.length, sites: semanticSites.length };
   }
 
   addDiagnostic(diagnostic: Omit<Diagnostic, "id">): void {
@@ -727,6 +1002,326 @@ function semanticEvidence(source: string, pathValue: string, startOffset: number
   };
 }
 
+export function buildTypeScriptDependencyValidationSources(
+  sources: ReadonlyMap<string, string>,
+  analysis: TypeScriptProjectAnalysis,
+): TypeScriptDependencyValidationSource[] {
+  return [...sources]
+    .sort(([left], [right]) => compareUtf8(left, right))
+    .map(([relativePath, text]) => {
+      const diagnostics = analysis.get(relativePath);
+      const importTypeModuleSpans = analysis.importTypeModuleSpans.get(relativePath);
+      const moduleCallSpans = analysis.moduleCallSpans.get(relativePath);
+      const nonLiteralModuleSpans = analysis.nonLiteralModuleSpans.get(relativePath);
+      const typeUseSpans = analysis.typeUseSpans.get(relativePath);
+      if (
+        diagnostics === undefined
+        || importTypeModuleSpans === undefined
+        || moduleCallSpans === undefined
+        || nonLiteralModuleSpans === undefined
+        || typeUseSpans === undefined
+      ) {
+        throw new Error(`TypeScript dependency validation context is missing for ${relativePath}`);
+      }
+      return {
+        relativePath,
+        text,
+        syntacticallyValid: diagnostics.length === 0,
+        importTypeModuleSpans: importTypeModuleSpans.map((spanValue) => ({ ...spanValue })),
+        moduleCallSpans: moduleCallSpans.map((spanValue) => ({ ...spanValue })),
+        nonLiteralModuleSpans: nonLiteralModuleSpans.map((spanValue) => ({
+          ...spanValue,
+          bindingScope: spanValue.bindingScope === null ? null : { ...spanValue.bindingScope },
+          resolutionModeProof: spanValue.resolutionModeProof === null ? null : { ...spanValue.resolutionModeProof },
+        })),
+        typeUseSpans: typeUseSpans.map((spanValue) => ({ ...spanValue })),
+      };
+    });
+}
+
+async function refineTypeScriptDependencyDelta(
+  delta: TypeScriptRawDependencyDelta,
+  definitions: TypeScriptRawDefinitionDelta,
+  resolver: ModuleResolver,
+  workspace: Workspace,
+  root: string,
+  sources: ReadonlyMap<string, string>,
+  validationSources: readonly TypeScriptDependencyValidationSource[],
+): Promise<TypeScriptRawDependencyDelta> {
+  const definitionByKey = new Map(definitions.definitions.map((definition) => [definition.key, definition]));
+  const moduleExportProofs = new Map(delta.moduleExports.map((proof) => [
+    JSON.stringify([proof.relativePath, proof.exportPath]),
+    proof.definitionKeys,
+  ]));
+  const refined: TypeScriptRawDependencySite[] = [];
+  for (const site of delta.sites) {
+    const source = sources.get(site.evidence.relativePath);
+    if (source === undefined || !site.evidence.occurrenceKind) {
+      refined.push(site);
+      continue;
+    }
+    const moduleSpecifier = site.moduleSpecifier ?? site.specifier;
+    const imported = site.importedName;
+    const importEqualsOrigin = site.bindingKind === "import_equals"
+      && (
+        site.evidence.occurrenceKind === "import_equals"
+        || site.bindingOrigin !== null
+      );
+    // Public resolutionMode records only an explicit resolution-mode
+    // attribute. Import-equals still requires the CommonJS resolver phase,
+    // so retain that implicit syntax fact only inside refinement.
+    const effectiveResolutionMode = importEqualsOrigin ? "require" : site.resolutionMode;
+    if (
+      site.reason === "syntax_invalid"
+      || site.reason === "invalid_resolution_mode"
+      || site.reason === "duplicate_resolution_mode"
+      || site.reason === "invalid_resolution_mode_syntax"
+      || site.reason === "resolution_mode_attribute_required"
+      || site.reason === "resolution_mode_requires_single_attribute"
+      || site.reason === "resolution_mode_requires_type_only"
+      || site.reason === "ambiguous_binding_provenance"
+      || site.reason === "missing_module_specifier"
+    ) {
+      refined.push(site);
+      continue;
+    }
+    if (site.kind === "type_use" && site.moduleSpecifier === null) {
+      refined.push(site);
+      continue;
+    }
+    if (moduleSpecifier.length === 0 || site.reason === "computed_module_specifier" || site.reason === "non_literal_module_specifier") {
+      refined.push(site);
+      continue;
+    }
+    const absoluteSource = path.join(root, ...site.evidence.relativePath.split("/"));
+    const owner = owningPackage(workspace, absoluteSource);
+    const resolution = await resolver.resolve({
+      kind: site.evidence.occurrenceKind,
+      edgeKind: site.kind === "web_reexport" ? "reexports" : "imports",
+      specifier: moduleSpecifier,
+      literal: true,
+      typeOnly: site.typeOnly,
+      // TypeScript's semantic module resolver always enables `types` unless
+      // noDtsResolution is set; occurrence type-only-ness remains separate.
+      useTypesCondition: true,
+      ...(effectiveResolutionMode === null ? {} : { resolutionMode: effectiveResolutionMode }),
+      evidence: syntaxEvidence(source, site.evidence.relativePath, site.evidence.startOffset, site.evidence.endOffset),
+    }, absoluteSource, owner);
+    if (resolution.targetConditions !== undefined && resolution.targetConditions.length !== resolution.targets.length) {
+      throw new Error("TypeScript module resolution target conditions do not align with targets");
+    }
+    const resolutionTargetConditions = resolution.targets.map((_, index) => canonicalizeCondition(
+      resolution.targetConditions?.[index] ?? resolution.condition ?? site.condition,
+    ));
+    const resolutionCondition = resolutionTargetConditions.length === 0
+      ? canonicalizeCondition(resolution.condition ?? site.condition)
+      : aggregateConditions(resolutionTargetConditions);
+    const unresolvedCondition = canonicalizeCondition(site.condition);
+    const unresolvedSite = (reason: string): TypeScriptRawDependencySite => ({
+      ...site,
+      status: "unresolved",
+      precision: "heuristic",
+      reason,
+      condition: unresolvedCondition,
+      targets: [{ kind: "unknown" }],
+      targetConditions: [unresolvedCondition],
+      evidence: { ...site.evidence, targetBasis: "unresolved" },
+    });
+    if (resolution.status === "unresolved") {
+      refined.push(unresolvedSite(resolution.reason ?? site.reason ?? "module_target_unresolved"));
+      continue;
+    }
+    if (resolution.precision === "heuristic" && resolution.status !== "external") {
+      // A concrete repository target for only part of the active profile is
+      // not a complete candidate set. The semantic contract has no mixed
+      // concrete+unknown target shape, so fail the whole occurrence closed
+      // instead of re-promoting the surviving branch to resolved/exact.
+      refined.push(unresolvedSite(resolution.reason ?? "repository_resolution_incomplete"));
+      continue;
+    }
+    const fileTargetConditions = new Map<string, Condition[]>();
+    const externalTargetMap = new Map<string, {
+      target: Extract<TypeScriptRawDependencyTarget, { kind: "external" }>;
+      conditions: Condition[];
+    }>();
+    let targetLimitExceeded = false;
+    for (const [index, target] of resolution.targets.entries()) {
+      const targetCondition = resolutionTargetConditions[index]!;
+      if (target.kind === "file") {
+        const relativePath = normalizeRelative(path.relative(root, target.absolutePath));
+        if (!fileTargetConditions.has(relativePath) && fileTargetConditions.size >= MAX_TYPESCRIPT_REFINEMENT_TARGETS_PER_SITE) {
+          targetLimitExceeded = true;
+          break;
+        }
+        appendTargetCondition(fileTargetConditions, relativePath, targetCondition);
+      } else if (target.kind === "external_package") {
+        const locator = target.locator.startsWith("node:") ? target.locator : `package:${target.locator}`;
+        if (!externalTargetMap.has(locator) && externalTargetMap.size >= MAX_TYPESCRIPT_REFINEMENT_TARGETS_PER_SITE) {
+          targetLimitExceeded = true;
+          break;
+        }
+        const existing = externalTargetMap.get(locator);
+        if (existing === undefined) {
+          externalTargetMap.set(locator, {
+            target: { kind: "external", locator, displayName: target.locator },
+            conditions: [targetCondition],
+          });
+        } else {
+          existing.conditions.push(targetCondition);
+        }
+      }
+    }
+    if (targetLimitExceeded) {
+      refined.push(unresolvedSite("typescript_refinement_target_limit_exceeded"));
+      continue;
+    }
+    const fileTargets = [...fileTargetConditions.keys()].sort(compareUtf8);
+    const externalTargets = [...externalTargetMap.values()]
+      .sort((left, right) => compareUtf8(left.target.locator, right.target.locator));
+    let conditionedTargets: Array<{ target: TypeScriptRawDependencyTarget; condition: Condition }>;
+    let emptyTargetReason = "repository_binding_not_canonical";
+    const moduleLevel = site.kind !== "type_use" && (
+      imported === null
+      || ["namespace_import", "side_effect_import", "empty_import", "import_equals", "namespace_reexport", "empty_reexport", "export_star", "require_call", "dynamic_import", "import_type"]
+        .includes(site.evidence.occurrenceKind)
+    );
+    if (moduleLevel) {
+      conditionedTargets = [
+        ...fileTargets.map((relativePath) => ({
+          target: { kind: "file" as const, relativePath },
+          condition: aggregateConditions(fileTargetConditions.get(relativePath)!),
+        })),
+        ...externalTargets.map(({ target, conditions }) => ({
+          target,
+          condition: aggregateConditions(conditions),
+        })),
+      ];
+    } else {
+      const compilerGraphKind = site.targets
+        .filter((target): target is Extract<TypeScriptRawDependencyTarget, { kind: "definition" }> => target.kind === "definition")
+        .map((target) => definitionByKey.get(target.key)?.graphKind)
+        .find((value): value is "symbol" | "type" => value !== undefined);
+      const compilerDefinitions = [...new Map(site.targets
+        .filter((target): target is Extract<TypeScriptRawDependencyTarget, { kind: "definition" }> => target.kind === "definition")
+        .map((target) => [target.key, target])).values()];
+      const canonicalImportEqualsRoot = site.exportPath?.length === 0
+        && imported === "="
+        && site.bindingKind === "import_equals"
+        && site.bindingOrigin !== null
+        && effectiveResolutionMode === "require"
+        && (site.kind === "type_use" || site.evidence.occurrenceKind === "named_reexport");
+      if (externalTargets.length > 0) {
+        if (fileTargets.length > 0 || externalTargets.length > 1) {
+          conditionedTargets = [];
+          emptyTargetReason = "mixed_or_multiple_external_targets";
+        } else {
+          conditionedTargets = externalTargets.map(({ target, conditions }) => ({
+            target,
+            condition: aggregateConditions(conditions),
+          }));
+        }
+      } else if (fileTargets.length > 0 && canonicalImportEqualsRoot) {
+        const conditionsByDefinition = new Map<string, Condition[]>();
+        let completeProof = true;
+        const preferredGraphKind = site.kind === "type_use" || site.typeOnly ? "type" : "symbol";
+        for (const relativePath of fileTargets) {
+          const allKeys = moduleExportProofs.get(JSON.stringify([relativePath, []])) ?? [];
+          const preferredKeys = allKeys.filter((key) => definitionByKey.get(key)?.graphKind === preferredGraphKind);
+          const keys = preferredKeys.length > 0
+            ? preferredKeys
+            : site.kind === "type_use" ? [] : allKeys;
+          if (keys.length === 0) completeProof = false;
+          for (const key of keys) {
+            for (const condition of fileTargetConditions.get(relativePath) ?? []) {
+              appendTargetCondition(conditionsByDefinition, key, condition);
+            }
+          }
+        }
+        conditionedTargets = completeProof
+          ? [...conditionsByDefinition].sort(([left], [right]) => compareUtf8(left, right)).map(([key, conditions]) => ({
+            target: { kind: "definition" as const, key },
+            condition: aggregateConditions(conditions),
+          }))
+          : [];
+        if (!completeProof) emptyTargetReason = "import_equals_target_not_correlated";
+      } else if (fileTargets.length > 0 && site.exportPath !== null && site.exportPath.length > 0) {
+        const provenByFile: string[][] = [];
+        const conditionsByDefinition = new Map<string, Condition[]>();
+        let completeProof = true;
+        const preferredGraphKind = compilerGraphKind ?? (site.kind === "type_use" || site.typeOnly ? "type" : "symbol");
+        for (const relativePath of fileTargets) {
+          const allKeys = moduleExportProofs.get(JSON.stringify([relativePath, site.exportPath])) ?? [];
+          const preferredKeys = allKeys.filter((key) => definitionByKey.get(key)?.graphKind === preferredGraphKind);
+          const keys = preferredKeys.length > 0
+            ? preferredKeys
+            : site.kind === "type_use" ? [] : allKeys;
+          if (keys.length === 0) completeProof = false;
+          provenByFile.push(keys);
+          for (const key of keys) {
+            for (const condition of fileTargetConditions.get(relativePath) ?? []) {
+              appendTargetCondition(conditionsByDefinition, key, condition);
+            }
+          }
+        }
+        const provenKeys = [...new Set(provenByFile.flat())].sort(compareUtf8);
+        if (completeProof) {
+          conditionedTargets = provenKeys.map((key) => ({
+            target: { kind: "definition" as const, key },
+            condition: aggregateConditions(conditionsByDefinition.get(key)!),
+          }));
+        } else {
+          conditionedTargets = [];
+          emptyTargetReason = "module_export_not_proven";
+        }
+      } else {
+        conditionedTargets = [];
+        emptyTargetReason = site.exportPath === null || site.exportPath.length === 0
+          ? "repository_binding_not_canonical"
+          : "module_export_not_proven";
+      }
+    }
+    conditionedTargets.sort((left, right) => compareUtf8(
+      rawDependencyTargetKey(left.target),
+      rawDependencyTargetKey(right.target),
+    ));
+    const targets = conditionedTargets.map(({ target }) => target);
+    const targetConditions = conditionedTargets.map(({ condition }) => canonicalizeCondition(condition));
+    const hasRepository = targets.some((target) => target.kind === "definition" || target.kind === "file");
+    const hasExternal = targets.some((target) => target.kind === "external");
+    if (targets.length === 0 || (hasRepository && hasExternal) || (hasExternal && targets.length !== 1)) {
+      refined.push(unresolvedSite(targets.length === 0 ? emptyTargetReason : "mixed_or_multiple_external_targets"));
+      continue;
+    }
+    const condition = aggregateConditions(targetConditions);
+    const status = hasExternal ? "external" : targets.length > 1 ? "candidates" : "resolved";
+    const precision = hasExternal
+      ? resolution.precision === "exact" ? "exact" : "heuristic"
+      : targets.length > 1 ? "overapprox" : "exact";
+    refined.push({
+      ...site,
+      status,
+      precision,
+      reason: status === "resolved" || (status === "external" && precision === "exact")
+        ? null
+        : resolution.reason ?? site.reason,
+      condition,
+      targets,
+      targetConditions,
+      evidence: {
+        ...site.evidence,
+        targetBasis: hasExternal ? "external_boundary" : targets[0]?.kind === "definition" ? "canonical_definition" : "repository_module",
+      },
+    });
+  }
+  const result = { ...delta, sites: refined };
+  validateTypeScriptRawDependencyDelta(
+    result,
+    definitions,
+    validationSources,
+  );
+  return result;
+}
+
 function lineEvidence(source: string | null, pathValue: string, token: string, extractor: string, detail?: string, section?: string): Evidence {
   if (source === null) return sourceEvidence(pathValue, extractor, detail);
   const sectionIndex = section === undefined ? 0 : Math.max(0, source.indexOf(`"${section}"`));
@@ -941,7 +1536,7 @@ export async function scan(root: string, allFiles: string[], inventoryIssues: Fi
     graph.ensureCoverage(manifestNode, record.manifestPath);
     graph.structureEdge(packageNode, manifestNode, "contains", sourceEvidence(record.manifestPath, "workspace-manifest"));
     const manifestSource = await readUtf8(root, path.join(record.absolutePath, "package.json"));
-    for (const [name, dependency] of [...record.dependencies.entries()].sort(([left], [right]) => left.localeCompare(right))) {
+    for (const [name, dependency] of [...record.dependencies.entries()].sort(([left], [right]) => compareUtf8(left, right))) {
       if (dependency.section === "devDependencies") continue;
       const evidence = {
         ...lineEvidence(manifestSource, record.manifestPath, name, "package-manifest", `section=${dependency.section}`, dependency.section),
@@ -978,8 +1573,9 @@ export async function scan(root: string, allFiles: string[], inventoryIssues: Fi
     .filter((file) => PARSED_EXTENSIONS.has(path.extname(file).toLowerCase()) || routeFiles.has(path.resolve(file)))
     .sort();
   // Parse repository-owned JSON/JSONC without executing it, retain only
-  // repository-relative baseUrl/paths mappings, and feed the normalized
-  // allowlist into the worker-owned compiler config.
+  // repository-relative TypeScript 7 `paths` mappings, and feed the normalized
+  // allowlist into the worker-owned compiler config. Deprecated `baseUrl` is
+  // intentionally not applied.
   const resolver = await ModuleResolver.create(workspace, allFiles);
   // Read every TS/JS input once, then expose only those bytes through the
   // compiler's virtual filesystem. The native compiler never receives the
@@ -1000,7 +1596,20 @@ export async function scan(root: string, allFiles: string[], inventoryIssues: Fi
       if (source !== null) compilerSources.set(normalizeRelative(path.relative(root, file)), source);
     }
   }
-  const nativeTypeScript = await analyzeTypeScriptProject(compilerSources, resolver.typeScriptStaticConfig());
+  const precompilerExtractions = new Map<string, ReturnType<typeof extractDependencies>>();
+  const typeScriptPathRequests: TypeScriptPathRequest[] = [];
+  for (const [relative, source] of compilerSources) {
+    const absolute = path.join(root, ...relative.split("/"));
+    const extraction = extractDependencies(absolute, relative, source);
+    precompilerExtractions.set(relative, extraction);
+    for (const specifier of extractPotentialTypeScriptModuleSpecifiers(absolute, source)) {
+      typeScriptPathRequests.push({ sourceFile: absolute, specifier });
+    }
+  }
+  const nativeTypeScript = await analyzeTypeScriptProject(
+    compilerSources,
+    resolver.typeScriptStaticConfig(typeScriptPathRequests),
+  );
   for (const issue of resolver.issues) {
     recordSkippedInterpretation(graph, root, issue.path);
     graph.addDiagnostic({
@@ -1067,12 +1676,10 @@ export async function scan(root: string, allFiles: string[], inventoryIssues: Fi
       });
       continue;
     }
-    const extraction = extractDependencies(
-      file,
-      relative,
-      source,
-      nativeTypeScript.typeOnlyDependencyRanges.get(relative),
-    );
+    const typeOnlyRanges = nativeTypeScript.typeOnlyDependencyRanges.get(relative) ?? [];
+    const extraction = typeOnlyRanges.length === 0
+      ? precompilerExtractions.get(relative) ?? extractDependencies(file, relative, source)
+      : extractDependencies(file, relative, source, typeOnlyRanges);
     if (extraction.fallbackReason) {
       graph.addDiagnostic({
         severity: "warning",
@@ -1132,20 +1739,52 @@ export async function scan(root: string, allFiles: string[], inventoryIssues: Fi
       }),
     });
   }
+  for (const issue of nativeTypeScript.dependencyGraph.issues) {
+    graph.addDiagnostic({
+      severity: "warning",
+      code: `web.${issue.code}`,
+      message: issue.message.length <= 2_048 ? issue.message : `${issue.message.slice(0, 2_047)}…`,
+      path: issue.relativePath,
+      profile_id: PROFILE_ID,
+      properties: { typescript_dependency_issue: true },
+      ...(issue.relativePath === null ? {} : {
+        evidence: [sourceEvidence(
+          issue.relativePath,
+          "typescript-native-typechecker",
+          `dependency_graph_issue=${issue.code};fatal=${String(issue.fatal)}`,
+        )],
+      }),
+    });
+  }
   if (nativeTypeScript.project.definitionGraphStatus === "ready") {
     try {
-      const counts = graph.mergeTypeScriptDefinitions(nativeTypeScript.definitionGraph, compilerSources);
+      nativeTypeScript.dependencyGraph = await refineTypeScriptDependencyDelta(
+        nativeTypeScript.dependencyGraph,
+        nativeTypeScript.definitionGraph,
+        resolver,
+        workspace,
+        root,
+        compilerSources,
+        buildTypeScriptDependencyValidationSources(compilerSources, nativeTypeScript),
+      );
+      const counts = graph.mergeTypeScriptSemanticGraph(
+        nativeTypeScript.definitionGraph,
+        nativeTypeScript.dependencyGraph,
+        compilerSources,
+      );
       nativeTypeScript.project.semanticNodes = counts.nodes;
       nativeTypeScript.project.semanticRelations = counts.relations;
-    } catch {
+      nativeTypeScript.project.semanticSites = counts.sites;
+    } catch (error) {
       nativeTypeScript.project.definitionGraphStatus = "failed";
       nativeTypeScript.project.semanticNodes = 0;
       nativeTypeScript.project.semanticRelations = 0;
+      nativeTypeScript.project.semanticSites = 0;
       nativeTypeScript.project.semanticIssues += 1;
       graph.addDiagnostic({
         severity: "warning",
         code: "web.typescript_semantic_delta_discarded",
-        message: "TypeScript definition graph was discarded atomically after semantic contract validation failed; syntax graph output was preserved",
+        message: `TypeScript semantic graph was discarded atomically after contract validation failed; syntax graph output was preserved: ${error instanceof Error ? error.message : String(error)}`.slice(0, 2_048),
         path: null,
         profile_id: PROFILE_ID,
         properties: { typescript_definition_issue: true },
@@ -1154,6 +1793,7 @@ export async function scan(root: string, allFiles: string[], inventoryIssues: Fi
   } else {
     nativeTypeScript.project.semanticNodes = 0;
     nativeTypeScript.project.semanticRelations = 0;
+    nativeTypeScript.project.semanticSites = 0;
   }
 
   const routeNodesByGroup = new Map<string, Map<string, { node: GraphNode; evidence: Evidence }>>();
@@ -1281,7 +1921,7 @@ export async function scan(root: string, allFiles: string[], inventoryIssues: Fi
     });
   }
 
-  const files = [...graph.files.values()].sort((left, right) => left.path.localeCompare(right.path));
+  const files = [...graph.files.values()].sort((left, right) => compareUtf8(left.path, right.path));
   const sites = [...graph.sites.values()].sort(compareById);
   const counts = { resolved: 0, candidates: 0, external: 0, unresolved: 0 };
   for (const site of sites) counts[site.resolution_status] += 1;

@@ -76,6 +76,7 @@ const SYMBOL_SEMANTIC_IDENTITIES = new Map<string, TypeScriptRawSymbolIdentityKi
   ["local_function", "local"],
   ["local_function_variable", "local"],
   ["method", "named"],
+  ["variable", "named"],
 ]);
 const RELATION_KINDS = new Set<TypeScriptRawDefinitionRelationKind>([
   "declares",
@@ -525,16 +526,19 @@ function declarationCandidate(
       };
     case SyntaxKind.VariableDeclaration: {
       const declaration = node as VariableDeclaration;
-      if (
-        declaration.name.kind !== SyntaxKind.Identifier
-        || (declaration.initializer?.kind !== SyntaxKind.ArrowFunction
-          && declaration.initializer?.kind !== SyntaxKind.FunctionExpression)
-      ) return null;
+      if (declaration.name.kind !== SyntaxKind.Identifier) return null;
+      const callable = declaration.initializer?.kind === SyntaxKind.ArrowFunction
+        || declaration.initializer?.kind === SyntaxKind.FunctionExpression;
+      // Ordinary variables are promoted only at module scope. This gives an
+      // imported/re-exported value a canonical endpoint without turning every
+      // block-local temporary into a graph node. Callable variables retain the
+      // more specific function identity at either module or local scope.
+      if (!callable && !moduleScoped) return null;
       return {
         ...common,
         graphKind: "symbol",
-        initialSemanticKind: "function_variable",
-        semanticKind: "function_variable",
+        initialSemanticKind: callable ? "function_variable" : "variable",
+        semanticKind: callable ? "function_variable" : "variable",
         displayName: declaration.name.text,
         nameNode: declaration.name,
       };
@@ -626,7 +630,7 @@ function collectSources(
     let childOwner = owner;
     if (candidate !== null) {
       collection.candidates.push(candidate);
-      childOwner = candidate;
+      if (candidate.initialSemanticKind !== "variable") childOwner = candidate;
       if (collection.candidates.length > MAX_DEFINITION_CANDIDATES) {
         collection.limitIssue = issue(
           "typescript_semantic_definition_limit_exceeded",
@@ -990,11 +994,13 @@ function createGroups(
   const grouped = new Map<string, Candidate[]>();
   for (const candidate of candidates) {
     if (candidate.type === null || candidate.type.isErrorType()) {
-      addIssue(issues, issue(
-        "typescript_semantic_error_type_skipped",
-        `TypeChecker did not produce a usable type for ${candidate.displayName}`,
-        candidate.source.relativePath,
-      ));
+      if (candidate.initialSemanticKind !== "variable") {
+        addIssue(issues, issue(
+          "typescript_semantic_error_type_skipped",
+          `TypeChecker did not produce a usable type for ${candidate.displayName}`,
+          candidate.source.relativePath,
+        ));
+      }
       continue;
     }
     if (candidate.symbol !== null && !ownedSymbol(candidate.symbol, sourceByCompilerPath)) {
@@ -1820,7 +1826,15 @@ async function extractTypeScriptRawDefinitionDeltaUnchecked(
 
   for (const candidate of namedCandidates) {
     if (
-      candidate.initialSemanticKind === "function_variable"
+      (
+        candidate.initialSemanticKind === "function_variable"
+        || candidate.initialSemanticKind === "variable"
+        // getTypeAtLocation on a type-alias declaration can legitimately
+        // expose the aliased target's symbol (not the declaration symbol),
+        // especially through qualified or cyclic namespace aliases. The
+        // separately correlated name-symbol query remains the ownership proof.
+        || candidate.initialSemanticKind === "type_alias"
+      )
       || candidate.symbol === null
       || candidate.type === null
       || candidate.type.isErrorType()
