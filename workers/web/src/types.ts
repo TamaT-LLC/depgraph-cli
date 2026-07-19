@@ -83,6 +83,8 @@ export interface GraphNode {
     | "module"
     | "file"
     | "route"
+    | "symbol"
+    | "type"
     | "external_system"
     | "unknown_target";
   locator: string;
@@ -128,6 +130,7 @@ export interface Diagnostic {
   path: string | null;
   profile_id: string;
   evidence?: Evidence[];
+  properties?: Record<string, JsonValue>;
 }
 
 export interface FileCoverage {
@@ -183,6 +186,10 @@ export interface TypeScriptProjectSummary {
   typeCheckerQueries: number;
   semanticDiagnostics: number;
   emittedSemanticDiagnostics: number;
+  definitionGraphStatus: "ready" | "failed";
+  semanticNodes: number;
+  semanticRelations: number;
+  semanticIssues: number;
 }
 
 export interface CommonEvent {

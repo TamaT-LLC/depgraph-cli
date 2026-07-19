@@ -23,6 +23,7 @@ const SALSA_VERSION: &str = "0.26.1";
 const RUST_ANALYZER_DIRECT_DEPENDENCIES: &[&str] =
     &["ra_ap_hir", "ra_ap_ide_db", "ra_ap_syntax", "ra_ap_vfs"];
 const SALSA_DIRECT_DEPENDENCIES: &[&str] = &["salsa", "salsa-macro-rules", "salsa-macros"];
+const WEB_DEFINITION_SELECTOR: &str = r#"type:definition:["package","npm:workspace:@fixture/shared@1.0.0#apps/shared","definition:[\"module\",\"type\",\"apps/shared/src/semantic.ts\",[\"SharedStringCollection\"]]"]"#;
 const FORBIDDEN_RUST_ANALYZER_DEPENDENCIES: &[&str] = &[
     "ra_ap_flycheck",
     "ra_ap_load_cargo",
@@ -1869,6 +1870,144 @@ fn verify_packaged_scan(
         || scan["coverage"]["dependency_sites"].as_u64().unwrap_or(0) == 0
     {
         bail!("packaged {adapter} fixture scan failed its safety gate: {scan}");
+    }
+    if adapter == "web" {
+        verify_packaged_web_definition_graph(executable, store)?;
+    }
+    Ok(())
+}
+
+fn verify_packaged_web_definition_graph(executable: &Path, store: &Path) -> Result<()> {
+    let export = Command::new(executable)
+        .arg("--store")
+        .arg(store)
+        .args(["export", "--format", "json"])
+        .output()
+        .context("failed to export the packaged Web definition graph")?;
+    if !export.status.success() {
+        bail!(
+            "packaged Web definition export failed: {}\n{}",
+            String::from_utf8_lossy(&export.stdout),
+            String::from_utf8_lossy(&export.stderr)
+        );
+    }
+    let exported: Value = serde_json::from_slice(&export.stdout)
+        .context("packaged Web definition export was not valid JSON")?;
+    let graph = exported["graph"]
+        .as_object()
+        .context("packaged Web definition export has no graph")?;
+    let profile = graph["profiles"]
+        .as_array()
+        .and_then(|profiles| profiles.iter().find(|profile| profile["language"] == "web"))
+        .context("packaged Web definition export has no Web profile")?;
+    let properties = &profile["properties"];
+    for (property, expected) in [
+        ("typescript_analysis_mode", "semantic-definition-graph"),
+        ("typescript_project_model_status", "ready"),
+        ("typescript_typechecker_status", "definition-graph-emitted"),
+        ("typescript_definition_graph_status", "ready"),
+        ("typescript_semantic_graph_emission", "definition-graph-v1"),
+        ("typescript_semantic_issue_count", "0"),
+        ("typescript_release_gate", "release-gate-verified"),
+    ] {
+        if properties[property] != expected {
+            bail!("packaged Web profile property {property} must be {expected:?}: {properties}");
+        }
+    }
+
+    let nodes = graph["nodes"]
+        .as_array()
+        .context("packaged Web definition export has no nodes")?;
+    let semantic_nodes: Vec<_> = nodes
+        .iter()
+        .filter(|node| matches!(node["kind"].as_str(), Some("symbol" | "type")))
+        .collect();
+    if semantic_nodes.is_empty()
+        || !semantic_nodes.iter().any(|node| {
+            node["kind"] == "type" && node["properties"]["type_kind"] == "generic_instance"
+        })
+    {
+        bail!("packaged Web export omitted its semantic or generic-instance nodes");
+    }
+
+    let edges = graph["edges"]
+        .as_array()
+        .context("packaged Web definition export has no edges")?;
+    let semantic_edges: Vec<_> = edges
+        .iter()
+        .filter(|edge| edge["phase"] == "semantic")
+        .collect();
+    let evidence = graph["evidence"]
+        .as_array()
+        .context("packaged Web definition export has no evidence")?;
+    let kinds: BTreeSet<_> = semantic_edges
+        .iter()
+        .filter_map(|edge| edge["kind"].as_str())
+        .collect();
+    if kinds != BTreeSet::from(["declares", "extends", "implements", "instantiates"])
+        || semantic_edges.iter().any(|edge| {
+            !edge["site_id"].is_null()
+                || edge["resolution_status"] != "resolved"
+                || edge["precision"] != "exact"
+                || !evidence.iter().any(|item| {
+                    item["owner_type"] == "edge"
+                        && item["owner_id"] == edge["id"]
+                        && item["kind"] == "semantic"
+                        && item["extractor"] == "typescript-native-typechecker"
+                        && item["extractor_version"] == "7.0.2"
+                })
+        })
+    {
+        bail!("packaged Web export violated the definition-graph-v1 edge contract");
+    }
+    for (property, actual) in [
+        ("typescript_semantic_node_count", semantic_nodes.len()),
+        ("typescript_semantic_relation_count", semantic_edges.len()),
+    ] {
+        let declared = properties[property]
+            .as_str()
+            .and_then(|value| value.parse::<usize>().ok());
+        if declared != Some(actual) {
+            bail!("packaged Web profile reports {property}={declared:?}, observed {actual}");
+        }
+    }
+    if graph["coverage"]["completeness"]
+        .as_array()
+        .is_some_and(|levels| levels.iter().any(|level| level == "semantic-complete"))
+    {
+        bail!("packaged Web definition-only graph claimed semantic-complete");
+    }
+
+    let deps = Command::new(executable)
+        .arg("--store")
+        .arg(store)
+        .arg("deps")
+        .arg(WEB_DEFINITION_SELECTOR)
+        .arg("--json")
+        .output()
+        .context("failed to query the packaged Web definition graph")?;
+    if !deps.status.success() {
+        bail!(
+            "packaged Web definition query failed: {}\n{}",
+            String::from_utf8_lossy(&deps.stdout),
+            String::from_utf8_lossy(&deps.stderr)
+        );
+    }
+    let deps: Value = serde_json::from_slice(&deps.stdout)
+        .context("packaged Web definition query was not valid JSON")?;
+    let steps = deps["data"]["steps"]
+        .as_array()
+        .context("packaged Web definition query has no steps")?;
+    let query_kinds: BTreeSet<_> = steps
+        .iter()
+        .filter_map(|step| step["edge"]["kind"].as_str())
+        .collect();
+    if query_kinds != BTreeSet::from(["extends", "implements", "instantiates"])
+        || steps.iter().any(|step| {
+            step["edge"]["phase"] != "semantic" || step["evidence"][0]["kind"] != "semantic"
+        })
+    {
+        bail!("packaged Web definition query lost its exact relations or evidence: {deps}");
     }
     Ok(())
 }

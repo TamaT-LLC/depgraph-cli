@@ -9,7 +9,9 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use depgraph_protocol::{
-    CompletenessLevel, MAX_EVENT_LINE_BYTES, Phase, ProtocolError, ProtocolEvent, ProtocolValidator,
+    CompletenessLevel, EvidenceKind, MAX_EVENT_LINE_BYTES, Phase, Precision, ProtocolError,
+    ProtocolEvent, ProtocolValidator, ResolutionStatus, ValidatedProtocol,
+    validate_semantic_contract,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -34,6 +36,22 @@ const TYPESCRIPT_RELEASE_GATE_ENV: &str = "DEPGRAPH_TYPESCRIPT_RELEASE_GATE";
 const TYPESCRIPT_RELEASE_GATE_PROPERTY: &str = "typescript_release_gate";
 const TYPESCRIPT_RELEASE_GATE_PENDING: &str = "release-gate-pending";
 const TYPESCRIPT_RELEASE_GATE_VERIFIED: &str = "release-gate-verified";
+const TYPESCRIPT_ANALYSIS_MODE_PROPERTY: &str = "typescript_analysis_mode";
+const TYPESCRIPT_ANALYSIS_MODE_DEFINITION_GRAPH: &str = "semantic-definition-graph";
+const TYPESCRIPT_SEMANTIC_EMISSION_PROPERTY: &str = "typescript_semantic_graph_emission";
+const TYPESCRIPT_SEMANTIC_EMISSION_DEFINITION_GRAPH_V1: &str = "definition-graph-v1";
+const TYPESCRIPT_SEMANTIC_EXTRACTOR: &str = "typescript-native-typechecker";
+const TYPESCRIPT_COMPILER_VERSION: &str = "7.0.2";
+const TYPESCRIPT_PROJECT_STATUS_PROPERTY: &str = "typescript_project_model_status";
+const TYPESCRIPT_TYPECHECKER_STATUS_PROPERTY: &str = "typescript_typechecker_status";
+const TYPESCRIPT_DEFINITION_STATUS_PROPERTY: &str = "typescript_definition_graph_status";
+const TYPESCRIPT_DEFINITION_ISSUE_PROPERTY: &str = "typescript_definition_issue";
+const TYPESCRIPT_MAX_TYPE_ARGUMENTS: usize = 64;
+const TYPESCRIPT_MAX_TYPE_DESCRIPTOR_DEPTH: usize = 64;
+const TYPESCRIPT_MAX_TYPE_DESCRIPTOR_MEMBERS: usize = 256;
+const TYPESCRIPT_MAX_TYPE_DESCRIPTOR_CHARS: usize = 2_048;
+const TYPESCRIPT_MAX_DISPLAY_NAME_CHARS: usize = 512;
+const TYPESCRIPT_MAX_RESOLVER_IDENTITY_CHARS: usize = 4_096;
 const WEB_RUNTIME_REQUIREMENT: &str = "Node.js >=24.0.0";
 const PROTOCOL_SCHEMA_PATH: &str = "schemas/depgraph-protocol-v1.schema.json";
 
@@ -1672,6 +1690,1472 @@ fn protocol_error_is_security(error: &ProtocolError) -> bool {
     }
 }
 
+fn is_web_definition_relation_kind(kind: &str) -> bool {
+    matches!(kind, "declares" | "extends" | "implements" | "instantiates")
+}
+
+fn is_web_semantic_delta_event(event: &ProtocolEvent) -> bool {
+    match event {
+        ProtocolEvent::NodeUpsert(upsert) => {
+            matches!(upsert.node.kind.as_str(), "symbol" | "type")
+        }
+        ProtocolEvent::EdgeUpsert(upsert) => {
+            upsert.edge.phase == Phase::Semantic
+                || is_web_definition_relation_kind(upsert.edge.kind.as_str())
+        }
+        ProtocolEvent::DependencySite(site) => {
+            matches!(
+                site.site.kind.as_str(),
+                "call" | "type_use" | "rust_use" | "rust_reexport"
+            ) || site
+                .site
+                .evidence
+                .first()
+                .is_some_and(|evidence| evidence.kind == EvidenceKind::Semantic)
+        }
+        _ => false,
+    }
+}
+
+fn discard_web_definition_delta(
+    events: &mut Vec<ProtocolEvent>,
+    extra_semantic_node_ids: &BTreeSet<String>,
+    extra_discarded_site_ids: &BTreeSet<String>,
+) {
+    let mut semantic_node_ids = extra_semantic_node_ids.clone();
+    semantic_node_ids.extend(events.iter().filter_map(|event| match event {
+        ProtocolEvent::NodeUpsert(upsert)
+            if matches!(upsert.node.kind.as_str(), "symbol" | "type") =>
+        {
+            Some(upsert.node.id.clone())
+        }
+        _ => None,
+    }));
+    let mut discarded_site_ids = extra_discarded_site_ids.clone();
+    discarded_site_ids.extend(events.iter().filter_map(|event| {
+        match event {
+            ProtocolEvent::DependencySite(site)
+                if semantic_node_ids.contains(&site.site.source)
+                    || site
+                        .site
+                        .target_ids
+                        .iter()
+                        .any(|target| semantic_node_ids.contains(target))
+                    || is_web_semantic_delta_event(event) =>
+            {
+                Some(site.site.id.clone())
+            }
+            _ => None,
+        }
+    }));
+    discarded_site_ids.extend(events.iter().filter_map(|event| match event {
+        ProtocolEvent::EdgeUpsert(upsert)
+            if semantic_node_ids.contains(upsert.edge.source.as_str())
+                || semantic_node_ids.contains(upsert.edge.target.as_str())
+                || is_web_semantic_delta_event(event) =>
+        {
+            upsert.edge.site_id.clone()
+        }
+        _ => None,
+    }));
+    let retained_site_ids = events
+        .iter()
+        .filter_map(|event| match event {
+            ProtocolEvent::DependencySite(site)
+                if !discarded_site_ids.contains(site.site.id.as_str()) =>
+            {
+                Some(site.site.id.clone())
+            }
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    events.retain(|event| match event {
+        ProtocolEvent::NodeUpsert(upsert) => !semantic_node_ids.contains(upsert.node.id.as_str()),
+        ProtocolEvent::EdgeUpsert(upsert) => {
+            !semantic_node_ids.contains(upsert.edge.source.as_str())
+                && !semantic_node_ids.contains(upsert.edge.target.as_str())
+                && upsert
+                    .edge
+                    .site_id
+                    .as_deref()
+                    .is_none_or(|site_id| retained_site_ids.contains(site_id))
+                && !is_web_semantic_delta_event(event)
+        }
+        ProtocolEvent::DependencySite(site) => !discarded_site_ids.contains(&site.site.id),
+        _ => true,
+    });
+}
+
+fn record_web_rejected_site_closure(
+    event: &ProtocolEvent,
+    discarded_site_ids: &mut BTreeSet<String>,
+) {
+    match event {
+        ProtocolEvent::EdgeUpsert(upsert) => {
+            if let Some(site_id) = &upsert.edge.site_id {
+                discarded_site_ids.insert(site_id.clone());
+            }
+        }
+        ProtocolEvent::DependencySite(site) => {
+            discarded_site_ids.insert(site.site.id.clone());
+        }
+        _ => {}
+    }
+}
+
+fn web_definition_profile_ready(
+    properties: &depgraph_protocol::Properties,
+) -> std::result::Result<bool, String> {
+    let value = |property: &str| {
+        properties
+            .get(property)
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("Web worker omitted {property}"))
+    };
+    let state = (
+        value(TYPESCRIPT_PROJECT_STATUS_PROPERTY)?,
+        value(TYPESCRIPT_TYPECHECKER_STATUS_PROPERTY)?,
+        value(TYPESCRIPT_DEFINITION_STATUS_PROPERTY)?,
+    );
+    match state {
+        ("ready", "definition-graph-emitted", "ready") => Ok(true),
+        ("ready", "definition-graph-discarded", "failed") | ("failed", "failed", "failed") => {
+            Ok(false)
+        }
+        (project, checker, definition) => Err(format!(
+            "Web worker reported inconsistent TypeScript definition state project={project:?}, typechecker={checker:?}, definition={definition:?}"
+        )),
+    }
+}
+
+fn path_belongs_to_workspace(path: &str, workspace_path: &str) -> bool {
+    workspace_path == "."
+        || path == workspace_path
+        || path
+            .strip_prefix(workspace_path)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn node_package_id(node: &depgraph_protocol::GraphNode) -> Option<&str> {
+    node.properties.get("package_id").and_then(Value::as_str)
+}
+
+fn web_evidence_matches_source_span(evidence: &depgraph_protocol::Evidence, span: &Value) -> bool {
+    [
+        ("start_line", evidence.start_line),
+        ("start_column", evidence.start_column),
+        ("end_line", evidence.end_line),
+        ("end_column", evidence.end_column),
+    ]
+    .into_iter()
+    .all(|(field, coordinate)| span.get(field).and_then(Value::as_u64) == coordinate.map(u64::from))
+}
+
+fn web_source_span_is_canonical(span: Option<&Value>) -> bool {
+    let Some(object) = span.and_then(Value::as_object) else {
+        return false;
+    };
+    if object.len() != 4
+        || !["start_line", "start_column", "end_line", "end_column"]
+            .iter()
+            .all(|field| object.contains_key(*field))
+    {
+        return false;
+    }
+    let coordinate = |field: &str| {
+        object
+            .get(field)
+            .and_then(Value::as_u64)
+            .filter(|coordinate| *coordinate > 0 && *coordinate <= u64::from(u32::MAX))
+    };
+    let (Some(start_line), Some(start_column), Some(end_line), Some(end_column)) = (
+        coordinate("start_line"),
+        coordinate("start_column"),
+        coordinate("end_line"),
+        coordinate("end_column"),
+    ) else {
+        return false;
+    };
+    (start_line, start_column) <= (end_line, end_column)
+}
+
+fn resolve_web_semantic_reference<'a>(
+    reference: &str,
+    protocol: &'a ValidatedProtocol,
+    nodes_by_resolver: &std::collections::BTreeMap<&str, &'a depgraph_protocol::GraphNode>,
+) -> Option<&'a depgraph_protocol::GraphNode> {
+    if let Some(node_id) = reference.strip_prefix("node:") {
+        protocol.nodes.get(node_id)
+    } else {
+        nodes_by_resolver.get(reference).copied()
+    }
+}
+
+fn web_json_object_has_exact_fields(
+    object: &serde_json::Map<String, Value>,
+    fields: &[&str],
+) -> bool {
+    object.len() == fields.len() && fields.iter().all(|field| object.contains_key(*field))
+}
+
+fn canonical_javascript_number(value: f64) -> Option<String> {
+    if !value.is_finite() {
+        return None;
+    }
+    if value == 0.0 {
+        return Some("0".to_owned());
+    }
+
+    let negative = value.is_sign_negative();
+    let representation = format!("{:?}", value.abs());
+    let (mantissa, exponent) = representation.split_once(['e', 'E']).map_or(
+        (representation.as_str(), 0),
+        |(mantissa, exponent)| {
+            (
+                mantissa,
+                exponent
+                    .parse::<i32>()
+                    .expect("finite f64 debug exponents are valid integers"),
+            )
+        },
+    );
+    let (integer, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    let (mut digits, decimal_position) = if integer == "0" {
+        let first_significant = fraction
+            .find(|character: char| character != '0')
+            .unwrap_or(fraction.len());
+        (
+            fraction[first_significant..].to_owned(),
+            -(first_significant as i32),
+        )
+    } else {
+        (
+            format!("{integer}{fraction}"),
+            integer.len() as i32 + exponent,
+        )
+    };
+    while digits.len() > 1 && digits.ends_with('0') && !fraction.is_empty() {
+        digits.pop();
+    }
+    if digits.is_empty() {
+        return Some("0".to_owned());
+    }
+
+    let body = if decimal_position > 0 && decimal_position <= 21 {
+        let decimal_position = decimal_position as usize;
+        if digits.len() <= decimal_position {
+            format!("{digits}{}", "0".repeat(decimal_position - digits.len()))
+        } else {
+            format!(
+                "{}.{}",
+                &digits[..decimal_position],
+                &digits[decimal_position..]
+            )
+        }
+    } else if decimal_position <= 0 && decimal_position > -6 {
+        format!("0.{}{digits}", "0".repeat((-decimal_position) as usize))
+    } else {
+        let exponent = decimal_position - 1;
+        let mantissa = if digits.len() == 1 {
+            digits
+        } else {
+            format!("{}.{}", &digits[..1], &digits[1..])
+        };
+        format!(
+            "{mantissa}e{}{exponent}",
+            if exponent >= 0 { "+" } else { "" }
+        )
+    };
+    Some(if negative { format!("-{body}") } else { body })
+}
+
+fn web_literal_value_is_canonical(value_kind: &str, value: &str) -> bool {
+    match value_kind {
+        "string" => true,
+        "boolean" => matches!(value, "true" | "false"),
+        "bigint" => {
+            value == "0"
+                || value
+                    .strip_prefix('-')
+                    .unwrap_or(value)
+                    .as_bytes()
+                    .split_first()
+                    .is_some_and(|(first, rest)| {
+                        first.is_ascii_digit()
+                            && *first != b'0'
+                            && rest.iter().all(u8::is_ascii_digit)
+                    })
+        }
+        "number" if value == "-0" => true,
+        "number" => value
+            .parse::<f64>()
+            .ok()
+            .and_then(canonical_javascript_number)
+            .is_some_and(|canonical| canonical == value),
+        _ => false,
+    }
+}
+
+fn compare_javascript_strings(left: &str, right: &str) -> std::cmp::Ordering {
+    left.encode_utf16().cmp(right.encode_utf16())
+}
+
+fn web_resolver_identity_is_portable(resolver: &str) -> bool {
+    let bytes = resolver.as_bytes();
+    let drive_absolute = bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'/' | b'\\');
+    !resolver.is_empty()
+        && resolver.encode_utf16().count() <= TYPESCRIPT_MAX_RESOLVER_IDENTITY_CHARS
+        && !resolver.contains('\0')
+        && !resolver.starts_with('/')
+        && !resolver.starts_with("\\\\")
+        && !drive_absolute
+        && !resolver.to_ascii_lowercase().starts_with("file://")
+}
+
+fn validate_web_type_argument_references(
+    descriptor: &Value,
+    protocol: &ValidatedProtocol,
+    nodes_by_resolver: &std::collections::BTreeMap<&str, &depgraph_protocol::GraphNode>,
+    profile_id: &str,
+    instance_id: &str,
+    depth: usize,
+) -> std::result::Result<Value, String> {
+    if depth > TYPESCRIPT_MAX_TYPE_DESCRIPTOR_DEPTH {
+        return Err(format!(
+            "Web generic instance {instance_id} type argument nesting exceeds {TYPESCRIPT_MAX_TYPE_DESCRIPTOR_DEPTH}"
+        ));
+    }
+    let object = descriptor.as_object().ok_or_else(|| {
+        format!("Web generic instance {instance_id} has a non-object type argument")
+    })?;
+    let kind = object
+        .get("kind")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("Web generic instance {instance_id} type argument omitted kind"))?;
+    let require_reference = |field: &str| -> std::result::Result<_, String> {
+        let reference = object.get(field).and_then(Value::as_str).ok_or_else(|| {
+            format!("Web generic instance {instance_id} {kind} type argument omitted {field}")
+        })?;
+        let target = resolve_web_semantic_reference(reference, protocol, nodes_by_resolver)
+            .ok_or_else(|| {
+                format!(
+                    "Web generic instance {instance_id} type argument references missing semantic definition {reference:?}"
+                )
+            })?;
+        if !matches!(target.kind.as_str(), "symbol" | "type")
+            || target.properties.get("profile_id").and_then(Value::as_str) != Some(profile_id)
+        {
+            return Err(format!(
+                "Web generic instance {instance_id} type argument reference {reference:?} belongs to another profile or is not semantic"
+            ));
+        }
+        Ok(target)
+    };
+
+    let canonical = match kind {
+        "intrinsic" => {
+            if !web_json_object_has_exact_fields(object, &["kind", "name"]) {
+                return Err(format!(
+                    "Web generic instance {instance_id} intrinsic type argument has a non-canonical shape"
+                ));
+            }
+            let name = object.get("name").and_then(Value::as_str).ok_or_else(|| {
+                format!("Web generic instance {instance_id} intrinsic type argument omitted name")
+            })?;
+            if !matches!(
+                name,
+                "any"
+                    | "unknown"
+                    | "string"
+                    | "number"
+                    | "boolean"
+                    | "bigint"
+                    | "symbol"
+                    | "void"
+                    | "undefined"
+                    | "null"
+                    | "never"
+            ) {
+                return Err(format!(
+                    "Web generic instance {instance_id} has unknown intrinsic type argument {name:?}"
+                ));
+            }
+            serde_json::json!({"kind": "intrinsic", "name": name})
+        }
+        "literal" => {
+            if !web_json_object_has_exact_fields(object, &["kind", "value_kind", "value"]) {
+                return Err(format!(
+                    "Web generic instance {instance_id} literal type argument has a non-canonical shape"
+                ));
+            }
+            let value_kind = object
+                .get("value_kind")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    format!(
+                        "Web generic instance {instance_id} literal type argument omitted value_kind"
+                    )
+                })?;
+            let value = object.get("value").and_then(Value::as_str).ok_or_else(|| {
+                format!("Web generic instance {instance_id} literal type argument omitted value")
+            })?;
+            if !web_literal_value_is_canonical(value_kind, value) {
+                return Err(format!(
+                    "Web generic instance {instance_id} has a non-canonical {value_kind:?} literal {value:?}"
+                ));
+            }
+            serde_json::json!({"kind": "literal", "value_kind": value_kind, "value": value})
+        }
+        "definition" => {
+            if !web_json_object_has_exact_fields(object, &["kind", "resolver_identity"]) {
+                return Err(format!(
+                    "Web generic instance {instance_id} definition type argument has a non-canonical shape"
+                ));
+            }
+            let target = require_reference("resolver_identity")?;
+            if target.kind != "type"
+                || target.properties.get("type_kind").and_then(Value::as_str)
+                    == Some("generic_instance")
+            {
+                return Err(format!(
+                    "Web generic instance {instance_id} definition argument must reference a concrete type"
+                ));
+            }
+            serde_json::json!({
+                "kind": "definition",
+                "resolver_identity": object["resolver_identity"].clone(),
+            })
+        }
+        "type_parameter" => {
+            if !web_json_object_has_exact_fields(object, &["kind", "owner", "index", "name"]) {
+                return Err(format!(
+                    "Web generic instance {instance_id} type parameter has a non-canonical shape"
+                ));
+            }
+            require_reference("owner")?;
+            let index = object
+                .get("index")
+                .and_then(Value::as_u64)
+                .filter(|index| *index <= 9_007_199_254_740_991)
+                .ok_or_else(|| {
+                    format!(
+                        "Web generic instance {instance_id} type parameter has an invalid index"
+                    )
+                })?;
+            let name = object
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|name| {
+                    !name.is_empty()
+                        && name.encode_utf16().count() <= TYPESCRIPT_MAX_DISPLAY_NAME_CHARS
+                })
+                .ok_or_else(|| {
+                    format!("Web generic instance {instance_id} type parameter has an invalid name")
+                })?;
+            serde_json::json!({
+                "kind": "type_parameter",
+                "owner": object["owner"].clone(),
+                "index": index,
+                "name": name,
+            })
+        }
+        "application" => {
+            if !web_json_object_has_exact_fields(object, &["kind", "target", "type_arguments"]) {
+                return Err(format!(
+                    "Web generic instance {instance_id} application argument has a non-canonical shape"
+                ));
+            }
+            let target = object.get("target").ok_or_else(|| {
+                format!("Web generic instance {instance_id} application argument omitted target")
+            })?;
+            if !matches!(
+                target.get("kind").and_then(Value::as_str),
+                Some("definition" | "type_parameter")
+            ) {
+                return Err(format!(
+                    "Web generic instance {instance_id} application target is not a definition or type parameter"
+                ));
+            }
+            let target = validate_web_type_argument_references(
+                target,
+                protocol,
+                nodes_by_resolver,
+                profile_id,
+                instance_id,
+                depth + 1,
+            )?;
+            let arguments = object
+                .get("type_arguments")
+                .and_then(Value::as_array)
+                .filter(|arguments| {
+                    !arguments.is_empty() && arguments.len() <= TYPESCRIPT_MAX_TYPE_ARGUMENTS
+                })
+                .ok_or_else(|| {
+                    format!(
+                        "Web generic instance {instance_id} application has invalid type arguments"
+                    )
+                })?;
+            let mut canonical_arguments = Vec::with_capacity(arguments.len());
+            for argument in arguments {
+                canonical_arguments.push(validate_web_type_argument_references(
+                    argument,
+                    protocol,
+                    nodes_by_resolver,
+                    profile_id,
+                    instance_id,
+                    depth + 1,
+                )?);
+            }
+            serde_json::json!({
+                "kind": "application",
+                "target": target,
+                "type_arguments": canonical_arguments,
+            })
+        }
+        "union" | "intersection" => {
+            if !web_json_object_has_exact_fields(object, &["kind", "members"]) {
+                return Err(format!(
+                    "Web generic instance {instance_id} {kind} has a non-canonical shape"
+                ));
+            }
+            let members = object
+                .get("members")
+                .and_then(Value::as_array)
+                .filter(|members| {
+                    !members.is_empty() && members.len() <= TYPESCRIPT_MAX_TYPE_DESCRIPTOR_MEMBERS
+                })
+                .ok_or_else(|| {
+                    format!("Web generic instance {instance_id} {kind} has invalid members")
+                })?;
+            let mut canonical_members = Vec::with_capacity(members.len());
+            let mut previous = None::<String>;
+            for member in members {
+                let canonical_member = validate_web_type_argument_references(
+                    member,
+                    protocol,
+                    nodes_by_resolver,
+                    profile_id,
+                    instance_id,
+                    depth + 1,
+                )?;
+                let serialized = serde_json::to_string(&canonical_member)
+                    .expect("canonical TypeScript type descriptors always serialize");
+                if previous.as_deref().is_some_and(|previous| {
+                    compare_javascript_strings(previous, &serialized) != std::cmp::Ordering::Less
+                }) {
+                    return Err(format!(
+                        "Web generic instance {instance_id} {kind} members are not in strict canonical order"
+                    ));
+                }
+                previous = Some(serialized);
+                canonical_members.push(canonical_member);
+            }
+            serde_json::json!({"kind": kind, "members": canonical_members})
+        }
+        other => {
+            return Err(format!(
+                "Web generic instance {instance_id} has unsupported type argument kind {other:?}"
+            ));
+        }
+    };
+    if descriptor != &canonical {
+        return Err(format!(
+            "Web generic instance {instance_id} has a non-canonical {kind} type argument"
+        ));
+    }
+    let serialized = serde_json::to_string(&canonical)
+        .expect("canonical TypeScript type descriptors always serialize");
+    if serialized.encode_utf16().count() > TYPESCRIPT_MAX_TYPE_DESCRIPTOR_CHARS {
+        return Err(format!(
+            "Web generic instance {instance_id} {kind} type argument exceeds {TYPESCRIPT_MAX_TYPE_DESCRIPTOR_CHARS} characters"
+        ));
+    }
+    Ok(canonical)
+}
+
+fn validate_web_definition_graph(
+    protocol: &ValidatedProtocol,
+    web_profiles: &BTreeSet<String>,
+    definition_profiles: &BTreeSet<String>,
+) -> std::result::Result<(), String> {
+    validate_semantic_contract(protocol).map_err(|error| error.to_string())?;
+
+    let mut repository_packages = std::collections::BTreeMap::<String, (String, String)>::new();
+    for node in protocol
+        .nodes
+        .values()
+        .filter(|node| node.kind == "package_instance")
+    {
+        if node.properties.get("workspace").and_then(Value::as_bool) != Some(true) {
+            continue;
+        }
+        let Some(locator) = node.properties.get("locator").and_then(Value::as_str) else {
+            continue;
+        };
+        let workspace_path = node
+            .properties
+            .get("workspace_path")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                format!(
+                    "repository package {} omitted properties.workspace_path",
+                    node.id
+                )
+            })?;
+        if repository_packages
+            .insert(
+                locator.to_owned(),
+                (node.id.clone(), workspace_path.to_owned()),
+            )
+            .is_some()
+        {
+            return Err(format!(
+                "multiple repository package nodes claim locator {locator:?}"
+            ));
+        }
+    }
+    let mut files_by_path =
+        std::collections::BTreeMap::<String, &depgraph_protocol::GraphNode>::new();
+    for node in protocol.nodes.values().filter(|node| node.kind == "file") {
+        let Some(path) = node.properties.get("path").and_then(Value::as_str) else {
+            continue;
+        };
+        if files_by_path.insert(path.to_owned(), node).is_some() {
+            return Err(format!(
+                "multiple file nodes claim repository path {path:?}"
+            ));
+        }
+    }
+    let mut semantic_nodes_by_profile = std::collections::BTreeMap::<&str, usize>::new();
+    for node in protocol
+        .nodes
+        .values()
+        .filter(|node| matches!(node.kind.as_str(), "symbol" | "type"))
+    {
+        let profile_id = node
+            .properties
+            .get("profile_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                format!(
+                    "Web semantic node {} must declare properties.profile_id",
+                    node.id
+                )
+            })?;
+        if !definition_profiles.contains(profile_id) {
+            return Err(format!(
+                "Web semantic node {} references profile {profile_id:?} without the definition-graph-v1 capability",
+                node.id
+            ));
+        }
+        let language = node.properties.get("language").and_then(Value::as_str);
+        if !matches!(language, Some("typescript" | "javascript")) {
+            return Err(format!(
+                "Web semantic node {} must declare language=typescript or javascript",
+                node.id
+            ));
+        }
+        if node.display_name.as_deref().is_none_or(|display_name| {
+            display_name.is_empty()
+                || display_name.encode_utf16().count() > TYPESCRIPT_MAX_DISPLAY_NAME_CHARS
+        }) {
+            return Err(format!(
+                "Web semantic node {} has an invalid display name",
+                node.id
+            ));
+        }
+        let semantic_kind = node
+            .properties
+            .get(if node.kind == "symbol" {
+                "symbol_kind"
+            } else {
+                "type_kind"
+            })
+            .and_then(Value::as_str)
+            .expect("the semantic contract requires semantic kinds");
+        let semantic_kind_is_supported = if node.kind == "symbol" {
+            matches!(
+                semantic_kind,
+                "anonymous_function"
+                    | "constructor"
+                    | "function"
+                    | "function_variable"
+                    | "local_function"
+                    | "local_function_variable"
+                    | "method"
+            )
+        } else {
+            matches!(
+                semantic_kind,
+                "class" | "enum" | "generic_instance" | "interface" | "type_alias"
+            )
+        };
+        if !semantic_kind_is_supported {
+            return Err(format!(
+                "Web semantic node {} has unsupported {} {semantic_kind:?}",
+                node.id, node.kind
+            ));
+        }
+        if !web_source_span_is_canonical(node.properties.get("source_span")) {
+            return Err(format!(
+                "Web semantic node {} has an invalid source_span",
+                node.id
+            ));
+        }
+        let package_locator = node
+            .properties
+            .get("package_locator")
+            .and_then(Value::as_str)
+            .expect("the semantic contract requires package_locator");
+        let (package_id, workspace_path) = repository_packages.get(package_locator).ok_or_else(|| {
+            format!(
+                "Web semantic node {} package locator {package_locator:?} is not a repository workspace package",
+                node.id
+            )
+        })?;
+        if node.properties.get("package_id").and_then(Value::as_str) != Some(package_id) {
+            return Err(format!(
+                "Web semantic node {} package_id does not match workspace package {}",
+                node.id, package_id
+            ));
+        }
+        let source_path = node
+            .properties
+            .get("source_path")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("Web semantic node {} omitted source_path", node.id))?;
+        if !path_belongs_to_workspace(source_path, workspace_path) {
+            return Err(format!(
+                "Web semantic node {} source_path {source_path:?} escapes workspace path {workspace_path:?}",
+                node.id
+            ));
+        }
+        let source_file = files_by_path.get(source_path).ok_or_else(|| {
+            format!(
+                "Web semantic node {} source_path {source_path:?} has no repository file node",
+                node.id
+            )
+        })?;
+        if source_file
+            .properties
+            .get("package_id")
+            .and_then(Value::as_str)
+            != Some(package_id)
+        {
+            return Err(format!(
+                "Web semantic node {} and source file {} disagree on package ownership",
+                node.id, source_file.id
+            ));
+        }
+        if source_file
+            .properties
+            .get("language")
+            .and_then(Value::as_str)
+            != language
+        {
+            return Err(format!(
+                "Web semantic node {} and source file {} disagree on language",
+                node.id, source_file.id
+            ));
+        }
+        *semantic_nodes_by_profile.entry(profile_id).or_default() += 1;
+    }
+
+    let semantic_node_ids = protocol
+        .nodes
+        .values()
+        .filter(|node| matches!(node.kind.as_str(), "symbol" | "type"))
+        .map(|node| node.id.as_str())
+        .collect::<BTreeSet<_>>();
+    for edge in protocol.edges.values() {
+        let incident_to_definition = semantic_node_ids.contains(edge.source.as_str())
+            || semantic_node_ids.contains(edge.target.as_str());
+        if incident_to_definition
+            && (edge.phase != Phase::Semantic
+                || !is_web_definition_relation_kind(&edge.kind)
+                || edge.site_id.is_some())
+        {
+            return Err(format!(
+                "Web edge {} incident to a semantic definition is not an allowed site-less definition relation",
+                edge.id
+            ));
+        }
+    }
+    for site in protocol.sites.values() {
+        if semantic_node_ids.contains(site.source.as_str())
+            || site
+                .target_ids
+                .iter()
+                .any(|target| semantic_node_ids.contains(target.as_str()))
+        {
+            return Err(format!(
+                "Web dependency site {} is incident to a semantic definition node",
+                site.id
+            ));
+        }
+    }
+
+    let mut nodes_by_resolver =
+        std::collections::BTreeMap::<&str, &depgraph_protocol::GraphNode>::new();
+    for node in protocol
+        .nodes
+        .values()
+        .filter(|node| matches!(node.kind.as_str(), "symbol" | "type"))
+    {
+        let identity = node
+            .properties
+            .get("canonical_identity")
+            .and_then(Value::as_object)
+            .expect("the semantic contract requires canonical_identity objects");
+        if let Some(resolver) = identity.get("resolver_identity").and_then(Value::as_str)
+            && let Some(existing) = nodes_by_resolver.insert(resolver, node)
+        {
+            return Err(format!(
+                "Web semantic nodes {} and {} claim the same resolver identity {resolver:?}",
+                existing.id, node.id
+            ));
+        }
+    }
+
+    let mut expected_symbol_origins = std::collections::BTreeMap::<&str, &str>::new();
+    for node in protocol
+        .nodes
+        .values()
+        .filter(|node| matches!(node.kind.as_str(), "symbol" | "type"))
+    {
+        let identity = node
+            .properties
+            .get("canonical_identity")
+            .and_then(Value::as_object)
+            .expect("the semantic contract requires canonical_identity objects");
+        let profile_id = node
+            .properties
+            .get("profile_id")
+            .and_then(Value::as_str)
+            .expect("Web semantic nodes were checked above");
+        let language = node
+            .properties
+            .get("language")
+            .and_then(Value::as_str)
+            .expect("Web semantic nodes were checked above");
+
+        if node.kind == "symbol" {
+            if identity.contains_key("generic_origin")
+                || identity.contains_key("type_arguments")
+                || node.properties.contains_key("generic_origin")
+                || node.properties.contains_key("type_arguments")
+            {
+                return Err(format!(
+                    "Web semantic symbol {} contains generic type metadata",
+                    node.id
+                ));
+            }
+            let identity_kind = identity
+                .get("identity_kind")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    format!(
+                        "Web semantic symbol {} omitted canonical_identity.identity_kind",
+                        node.id
+                    )
+                })?;
+            let canonical_resolver = identity.get("resolver_identity").and_then(Value::as_str);
+            let top_level_resolver = node
+                .properties
+                .get("resolver_identity")
+                .and_then(Value::as_str);
+            let origin_field = match identity_kind {
+                "named" => {
+                    let canonical_resolver = canonical_resolver
+                        .filter(|value| !value.is_empty())
+                        .ok_or_else(|| {
+                        format!(
+                            "Web named symbol {} omitted canonical_identity.resolver_identity",
+                            node.id
+                        )
+                    })?;
+                    if !web_json_object_has_exact_fields(
+                        identity,
+                        &[
+                            "language",
+                            "package_locator",
+                            "symbol_kind",
+                            "identity_kind",
+                            "resolver_identity",
+                        ],
+                    ) || !web_resolver_identity_is_portable(canonical_resolver)
+                        || top_level_resolver != Some(canonical_resolver)
+                    {
+                        return Err(format!(
+                            "Web named symbol {} top-level resolver or canonical identity shape is inconsistent",
+                            node.id
+                        ));
+                    }
+                    None
+                }
+                "local" => {
+                    if !web_json_object_has_exact_fields(
+                        identity,
+                        &[
+                            "language",
+                            "package_locator",
+                            "symbol_kind",
+                            "identity_kind",
+                            "enclosing_symbol",
+                            "relative_path",
+                            "span",
+                        ],
+                    ) || node.properties.contains_key("resolver_identity")
+                    {
+                        return Err(format!(
+                            "Web local symbol {} has a resolver or the wrong canonical origin field",
+                            node.id
+                        ));
+                    }
+                    Some("enclosing_symbol")
+                }
+                "anonymous" => {
+                    if !web_json_object_has_exact_fields(
+                        identity,
+                        &[
+                            "language",
+                            "package_locator",
+                            "symbol_kind",
+                            "identity_kind",
+                            "generated_from",
+                            "relative_path",
+                            "span",
+                        ],
+                    ) || node.properties.contains_key("resolver_identity")
+                    {
+                        return Err(format!(
+                            "Web anonymous symbol {} has a resolver or the wrong canonical origin field",
+                            node.id
+                        ));
+                    }
+                    Some("generated_from")
+                }
+                other => {
+                    return Err(format!(
+                        "Web semantic symbol {} has unsupported identity_kind {other:?}",
+                        node.id
+                    ));
+                }
+            };
+            if let Some(origin_field) = origin_field {
+                let origin_id = identity
+                    .get(origin_field)
+                    .and_then(Value::as_str)
+                    .filter(|origin_id| !origin_id.is_empty())
+                    .ok_or_else(|| {
+                        format!(
+                            "Web {identity_kind} symbol {} omitted canonical_identity.{origin_field}",
+                            node.id
+                        )
+                    })?;
+                if identity.get("relative_path").and_then(Value::as_str)
+                    != node.properties.get("source_path").and_then(Value::as_str)
+                    || identity.get("span") != node.properties.get("source_span")
+                {
+                    return Err(format!(
+                        "Web {identity_kind} symbol {} canonical source anchor disagrees with its top-level source",
+                        node.id
+                    ));
+                }
+                let origin = protocol.nodes.get(origin_id).ok_or_else(|| {
+                    format!(
+                        "Web semantic symbol {} references missing canonical origin {origin_id}",
+                        node.id
+                    )
+                })?;
+                let origin_kind_is_valid = if identity_kind == "local" {
+                    origin.kind == "symbol"
+                } else {
+                    matches!(origin.kind.as_str(), "file" | "symbol" | "type")
+                };
+                if !origin_kind_is_valid
+                    || node_package_id(origin) != node_package_id(node)
+                    || origin.properties.get("language").and_then(Value::as_str) != Some(language)
+                {
+                    return Err(format!(
+                        "Web semantic symbol {} canonical origin {} has incompatible kind, package, or language",
+                        node.id, origin.id
+                    ));
+                }
+                if matches!(origin.kind.as_str(), "symbol" | "type") {
+                    if origin.properties.get("profile_id").and_then(Value::as_str)
+                        != Some(profile_id)
+                    {
+                        return Err(format!(
+                            "Web semantic symbol {} canonical origin {} belongs to another profile",
+                            node.id, origin.id
+                        ));
+                    }
+                } else if origin.properties.get("path").and_then(Value::as_str)
+                    != node.properties.get("source_path").and_then(Value::as_str)
+                {
+                    return Err(format!(
+                        "Web anonymous symbol {} file origin {} does not anchor its source path",
+                        node.id, origin.id
+                    ));
+                }
+                expected_symbol_origins.insert(node.id.as_str(), origin_id);
+            }
+        } else {
+            let type_kind = node
+                .properties
+                .get("type_kind")
+                .and_then(Value::as_str)
+                .expect("the semantic contract requires type_kind");
+            let canonical_resolver = identity
+                .get("resolver_identity")
+                .and_then(Value::as_str)
+                .filter(|resolver| !resolver.is_empty())
+                .expect("the semantic contract requires type resolver identities");
+            let is_generic_instance = type_kind == "generic_instance";
+            let has_canonical_generic_metadata =
+                identity.contains_key("generic_origin") || identity.contains_key("type_arguments");
+            let has_top_level_generic_metadata = node.properties.contains_key("generic_origin")
+                || node.properties.contains_key("type_arguments");
+            if !is_generic_instance
+                && (has_canonical_generic_metadata || has_top_level_generic_metadata)
+            {
+                return Err(format!(
+                    "Web non-generic type {} contains generic origin or type argument metadata",
+                    node.id
+                ));
+            }
+            let expected_identity_fields: &[&str] = if is_generic_instance {
+                &[
+                    "language",
+                    "package_locator",
+                    "type_kind",
+                    "resolver_identity",
+                    "generic_origin",
+                    "type_arguments",
+                ]
+            } else {
+                &[
+                    "language",
+                    "package_locator",
+                    "type_kind",
+                    "resolver_identity",
+                ]
+            };
+            if !web_json_object_has_exact_fields(identity, expected_identity_fields)
+                || canonical_resolver.encode_utf16().count()
+                    > TYPESCRIPT_MAX_RESOLVER_IDENTITY_CHARS
+                || (!is_generic_instance && !web_resolver_identity_is_portable(canonical_resolver))
+                || node
+                    .properties
+                    .get("resolver_identity")
+                    .and_then(Value::as_str)
+                    != Some(canonical_resolver)
+            {
+                return Err(format!(
+                    "Web type {} top-level resolver identity disagrees with its canonical identity",
+                    node.id
+                ));
+            }
+            if !is_generic_instance {
+                continue;
+            }
+            let generic_origin = identity
+                .get("generic_origin")
+                .and_then(Value::as_str)
+                .filter(|origin| !origin.is_empty())
+                .ok_or_else(|| {
+                    format!(
+                        "Web generic instance {} omitted canonical_identity.generic_origin",
+                        node.id
+                    )
+                })?;
+            let type_arguments = identity
+                .get("type_arguments")
+                .filter(|arguments| {
+                    arguments.as_array().is_some_and(|arguments| {
+                        !arguments.is_empty() && arguments.len() <= TYPESCRIPT_MAX_TYPE_ARGUMENTS
+                    })
+                })
+                .ok_or_else(|| {
+                    format!(
+                        "Web generic instance {} omitted canonical_identity.type_arguments",
+                        node.id
+                    )
+                })?;
+            let mut canonical_type_arguments = Vec::with_capacity(
+                type_arguments
+                    .as_array()
+                    .expect("generic type arguments were checked above")
+                    .len(),
+            );
+            for argument in type_arguments
+                .as_array()
+                .expect("generic type arguments were checked above")
+            {
+                canonical_type_arguments.push(validate_web_type_argument_references(
+                    argument,
+                    protocol,
+                    &nodes_by_resolver,
+                    profile_id,
+                    &node.id,
+                    0,
+                )?);
+            }
+            let canonical_type_arguments = Value::Array(canonical_type_arguments);
+            if type_arguments != &canonical_type_arguments {
+                return Err(format!(
+                    "Web generic instance {} type arguments are not in canonical materialized form",
+                    node.id
+                ));
+            }
+            if node
+                .properties
+                .get("generic_origin")
+                .and_then(Value::as_str)
+                != Some(generic_origin)
+                || node.properties.get("type_arguments") != Some(&canonical_type_arguments)
+            {
+                return Err(format!(
+                    "Web generic instance {} top-level origin/type arguments disagree with its canonical identity",
+                    node.id
+                ));
+            }
+            let resolver_input = Value::Array(vec![
+                Value::String(generic_origin.to_owned()),
+                canonical_type_arguments,
+            ]);
+            let expected_resolver = format!(
+                "generic:{}",
+                serde_json::to_string(&resolver_input)
+                    .expect("canonical generic resolver input always serializes")
+            );
+            if identity.get("resolver_identity").and_then(Value::as_str)
+                != Some(expected_resolver.as_str())
+                || node
+                    .properties
+                    .get("resolver_identity")
+                    .and_then(Value::as_str)
+                    != Some(expected_resolver.as_str())
+            {
+                return Err(format!(
+                    "Web generic instance {} resolver identity does not match its origin and type arguments",
+                    node.id
+                ));
+            }
+            let origin = nodes_by_resolver.get(generic_origin).copied().ok_or_else(|| {
+                format!(
+                    "Web generic instance {} references missing generic origin {generic_origin:?}",
+                    node.id
+                )
+            })?;
+            if origin.kind != "type"
+                || origin.properties.get("type_kind").and_then(Value::as_str)
+                    == Some("generic_instance")
+                || origin.properties.get("profile_id").and_then(Value::as_str) != Some(profile_id)
+                || node_package_id(origin) != node_package_id(node)
+                || origin
+                    .properties
+                    .get("package_locator")
+                    .and_then(Value::as_str)
+                    != node
+                        .properties
+                        .get("package_locator")
+                        .and_then(Value::as_str)
+                || origin.properties.get("language").and_then(Value::as_str) != Some(language)
+                || origin.properties.get("source_path") != node.properties.get("source_path")
+                || origin.properties.get("source_span") != node.properties.get("source_span")
+            {
+                return Err(format!(
+                    "Web generic instance {} origin {} is not a same-profile/package/language/source concrete type",
+                    node.id, origin.id
+                ));
+            }
+        }
+    }
+
+    let mut semantic_relations_by_profile = std::collections::BTreeMap::<&str, usize>::new();
+    let mut declared_targets = BTreeSet::<&str>::new();
+    let mut declaration_sources_by_target =
+        std::collections::BTreeMap::<&str, BTreeSet<&str>>::new();
+    let mut canonically_anchored_declaration_targets = BTreeSet::<&str>::new();
+    let mut instantiated_targets = BTreeSet::<&str>::new();
+    for edge in protocol
+        .edges
+        .values()
+        .filter(|edge| edge.phase == Phase::Semantic)
+    {
+        if !definition_profiles.contains(&edge.profile_id) {
+            return Err(format!(
+                "Web semantic edge {} references profile {:?} without the definition-graph-v1 capability",
+                edge.id, edge.profile_id
+            ));
+        }
+        if !is_web_definition_relation_kind(&edge.kind) {
+            return Err(format!(
+                "Web definition-graph-v1 profile emitted forbidden semantic edge kind {:?}",
+                edge.kind
+            ));
+        }
+        let primary = edge
+            .evidence
+            .first()
+            .expect("the semantic contract requires primary evidence");
+        if primary.extractor != TYPESCRIPT_SEMANTIC_EXTRACTOR
+            || primary.extractor_version != TYPESCRIPT_COMPILER_VERSION
+        {
+            return Err(format!(
+                "Web semantic edge {} must use {}@{} primary evidence",
+                edge.id, TYPESCRIPT_SEMANTIC_EXTRACTOR, TYPESCRIPT_COMPILER_VERSION
+            ));
+        }
+        if primary.properties.get("profile_id").and_then(Value::as_str)
+            != Some(edge.profile_id.as_str())
+        {
+            return Err(format!(
+                "Web semantic edge {} primary evidence must declare profile_id={:?}",
+                edge.id, edge.profile_id
+            ));
+        }
+        if edge.environment.as_deref() != Some("any") {
+            return Err(format!(
+                "Web semantic definition relation {} must use environment=any",
+                edge.id
+            ));
+        }
+        let source = protocol
+            .nodes
+            .get(&edge.source)
+            .expect("the base protocol requires relation sources");
+        let target = protocol
+            .nodes
+            .get(&edge.target)
+            .expect("the base protocol requires relation targets");
+        for endpoint in [source, target]
+            .into_iter()
+            .filter(|node| matches!(node.kind.as_str(), "symbol" | "type"))
+        {
+            if endpoint
+                .properties
+                .get("profile_id")
+                .and_then(Value::as_str)
+                != Some(edge.profile_id.as_str())
+            {
+                return Err(format!(
+                    "Web semantic relation {} endpoint {} belongs to another profile",
+                    edge.id, endpoint.id
+                ));
+            }
+        }
+        let endpoints_are_valid = match edge.kind.as_str() {
+            "declares" => {
+                matches!(source.kind.as_str(), "file" | "symbol" | "type")
+                    && matches!(target.kind.as_str(), "symbol" | "type")
+            }
+            "extends" | "implements" => source.kind == "type" && target.kind == "type",
+            "instantiates" => {
+                matches!(source.kind.as_str(), "symbol" | "type")
+                    && target.kind == "type"
+                    && target.properties.get("type_kind").and_then(Value::as_str)
+                        == Some("generic_instance")
+            }
+            _ => false,
+        };
+        if !endpoints_are_valid {
+            return Err(format!(
+                "Web semantic definition relation {} of kind {} has incompatible or non-repository endpoints {} ({}) -> {} ({})",
+                edge.id, edge.kind, source.id, source.kind, target.id, target.kind
+            ));
+        }
+        let evidence_file = files_by_path
+            .get(primary.path.as_deref().unwrap_or_default())
+            .ok_or_else(|| {
+                format!(
+                    "Web semantic relation {} evidence path {:?} has no repository file node",
+                    edge.id, primary.path
+                )
+            })?;
+        let evidence_package = evidence_file
+            .properties
+            .get("package_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("Web evidence file {} omitted package_id", evidence_file.id))?;
+        match edge.kind.as_str() {
+            "declares" => {
+                if node_package_id(target) != Some(evidence_package) {
+                    return Err(format!(
+                        "Web declares relation {} target and evidence file disagree on package ownership",
+                        edge.id
+                    ));
+                }
+                if target.properties.get("source_path").and_then(Value::as_str)
+                    != primary.path.as_deref()
+                {
+                    return Err(format!(
+                        "Web declares relation {} target does not anchor its evidence path",
+                        edge.id
+                    ));
+                }
+                if source.kind == "file" {
+                    if source.id != evidence_file.id {
+                        return Err(format!(
+                            "Web declares relation {} source file does not anchor its evidence",
+                            edge.id
+                        ));
+                    }
+                } else if node_package_id(source) != Some(evidence_package)
+                    || source.properties.get("source_path").and_then(Value::as_str)
+                        != primary.path.as_deref()
+                {
+                    return Err(format!(
+                        "Web declares relation {} semantic owner does not anchor its evidence",
+                        edge.id
+                    ));
+                }
+                declared_targets.insert(target.id.as_str());
+                declaration_sources_by_target
+                    .entry(target.id.as_str())
+                    .or_default()
+                    .insert(source.id.as_str());
+                if target
+                    .properties
+                    .get("source_span")
+                    .is_some_and(|span| web_evidence_matches_source_span(primary, span))
+                {
+                    canonically_anchored_declaration_targets.insert(target.id.as_str());
+                }
+            }
+            "extends" | "implements" | "instantiates" => {
+                if node_package_id(source) != Some(evidence_package)
+                    || source.properties.get("source_path").and_then(Value::as_str)
+                        != primary.path.as_deref()
+                {
+                    return Err(format!(
+                        "Web {} relation {} source does not anchor its evidence",
+                        edge.kind, edge.id
+                    ));
+                }
+                if edge.kind == "instantiates" {
+                    instantiated_targets.insert(target.id.as_str());
+                }
+            }
+            _ => unreachable!("definition relation kinds were checked above"),
+        }
+        *semantic_relations_by_profile
+            .entry(edge.profile_id.as_str())
+            .or_default() += 1;
+    }
+
+    for node in protocol
+        .nodes
+        .values()
+        .filter(|node| matches!(node.kind.as_str(), "symbol" | "type"))
+    {
+        let instance = node.kind == "type"
+            && node.properties.get("type_kind").and_then(Value::as_str) == Some("generic_instance");
+        let owned = if instance {
+            instantiated_targets.contains(node.id.as_str())
+        } else {
+            declared_targets.contains(node.id.as_str())
+        };
+        if !owned {
+            return Err(format!(
+                "Web semantic node {} has no canonical {} owner relation",
+                node.id,
+                if instance { "instantiates" } else { "declares" }
+            ));
+        }
+        if !instance && !canonically_anchored_declaration_targets.contains(node.id.as_str()) {
+            return Err(format!(
+                "Web semantic node {} has no declares evidence matching its canonical source span",
+                node.id
+            ));
+        }
+        if let Some(expected_origin) = expected_symbol_origins.get(node.id.as_str()) {
+            let declaration_sources = declaration_sources_by_target
+                .get(node.id.as_str())
+                .expect("owned local/anonymous symbols have declares relations");
+            if declaration_sources.len() != 1 || !declaration_sources.contains(*expected_origin) {
+                return Err(format!(
+                    "Web semantic symbol {} declares owner does not match canonical origin {}",
+                    node.id, expected_origin
+                ));
+            }
+        }
+    }
+
+    let mut semantic_issues_by_profile = std::collections::BTreeMap::<&str, usize>::new();
+    for diagnostic in protocol.diagnostics.values().filter(|diagnostic| {
+        diagnostic
+            .properties
+            .get(TYPESCRIPT_DEFINITION_ISSUE_PROPERTY)
+            .and_then(Value::as_bool)
+            == Some(true)
+    }) {
+        let profile_id = diagnostic.profile_id.as_deref().ok_or_else(|| {
+            format!(
+                "TypeScript definition issue diagnostic {} omitted profile_id",
+                diagnostic.id
+            )
+        })?;
+        if !web_profiles.contains(profile_id) {
+            return Err(format!(
+                "TypeScript definition issue diagnostic {} references unknown profile {profile_id:?}",
+                diagnostic.id
+            ));
+        }
+        *semantic_issues_by_profile.entry(profile_id).or_default() += 1;
+    }
+
+    for profile_id in web_profiles {
+        let profile = protocol
+            .profiles
+            .get(profile_id)
+            .expect("Web capability was recorded from a declared profile");
+        for (property, actual) in [
+            (
+                "typescript_semantic_node_count",
+                semantic_nodes_by_profile
+                    .get(profile_id.as_str())
+                    .copied()
+                    .unwrap_or_default(),
+            ),
+            (
+                "typescript_semantic_relation_count",
+                semantic_relations_by_profile
+                    .get(profile_id.as_str())
+                    .copied()
+                    .unwrap_or_default(),
+            ),
+            (
+                "typescript_semantic_issue_count",
+                semantic_issues_by_profile
+                    .get(profile_id.as_str())
+                    .copied()
+                    .unwrap_or_default(),
+            ),
+        ] {
+            let declared = profile
+                .properties
+                .get(property)
+                .and_then(Value::as_str)
+                .and_then(|value| value.parse::<usize>().ok())
+                .ok_or_else(|| {
+                    format!("Web profile {profile_id:?} omitted or has invalid {property}")
+                })?;
+            if declared != actual {
+                return Err(format!(
+                    "Web profile {profile_id:?} reports {property}={declared}, observed {actual}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn parse_events_preserving_prefix(
     stdout: &[u8],
     expected_scan_id: &str,
@@ -1686,7 +3170,12 @@ fn parse_events_preserving_prefix(
     let mut parse_error = None;
     let mut failure_kind = None;
     let mut security_violation = false;
-    let enforce_web_semantic_scaffold = release_attested.is_some() && expected_adapter == "web";
+    let enforce_web_definition_graph = release_attested.is_some() && expected_adapter == "web";
+    let mut web_profiles = BTreeSet::new();
+    let mut web_definition_profiles = BTreeSet::new();
+    let mut web_semantic_node_ids = BTreeSet::new();
+    let mut web_discarded_site_ids = BTreeSet::new();
+    let mut saw_web_semantic_delta = false;
     for (line_index, mut line) in stdout.split(|byte| *byte == b'\n').enumerate() {
         if line.last() == Some(&b'\r') {
             line = &line[..line.len() - 1];
@@ -1713,12 +3202,33 @@ fn parse_events_preserving_prefix(
                 break;
             }
         };
+        if enforce_web_definition_graph
+            && let ProtocolEvent::NodeUpsert(upsert) = &event
+            && matches!(upsert.node.kind.as_str(), "symbol" | "type")
+        {
+            web_semantic_node_ids.insert(upsert.node.id.clone());
+        }
+        let current_site_closure = if enforce_web_definition_graph {
+            match &event {
+                ProtocolEvent::EdgeUpsert(upsert) => upsert.edge.site_id.clone(),
+                ProtocolEvent::DependencySite(site) => Some(site.site.id.clone()),
+                _ => None,
+            }
+        } else {
+            None
+        };
         if event.common().scan_id != expected_scan_id {
+            if let Some(site_id) = &current_site_closure {
+                web_discarded_site_ids.insert(site_id.clone());
+            }
             parse_error = Some(format!("scan_id mismatch at line {}", line_index + 1));
             failure_kind = Some(WorkerFailureKind::MalformedProtocol);
             break;
         }
         if expected_adapter_version.is_some() && event.common().protocol_version != "1.0" {
+            if let Some(site_id) = &current_site_closure {
+                web_discarded_site_ids.insert(site_id.clone());
+            }
             parse_error = Some(format!(
                 "security policy violation at line {}: protocol_version mismatch: expected 1.0, received {}",
                 line_index + 1,
@@ -1729,6 +3239,9 @@ fn parse_events_preserving_prefix(
             break;
         }
         if event.common().adapter != expected_adapter {
+            if let Some(site_id) = &current_site_closure {
+                web_discarded_site_ids.insert(site_id.clone());
+            }
             if expected_adapter_version.is_some() {
                 parse_error = Some(format!(
                     "security policy violation at line {}: adapter mismatch: expected {}, received {}",
@@ -1746,6 +3259,9 @@ fn parse_events_preserving_prefix(
         if expected_adapter_version
             .is_some_and(|expected| event.common().adapter_version != expected)
         {
+            if let Some(site_id) = &current_site_closure {
+                web_discarded_site_ids.insert(site_id.clone());
+            }
             parse_error = Some(format!(
                 "security policy violation at line {}: adapter_version mismatch: expected {}, received {}",
                 line_index + 1,
@@ -1783,16 +3299,18 @@ fn parse_events_preserving_prefix(
             (release_attested, &event)
         {
             let properties = &declared.profile.properties;
-            let web_scaffold = expected_adapter == "web"
+            let web_profile_language =
+                expected_adapter != "web" || declared.profile.language == "web";
+            let web_definition_mode = expected_adapter == "web"
                 && properties
-                    .get("typescript_analysis_mode")
+                    .get(TYPESCRIPT_ANALYSIS_MODE_PROPERTY)
                     .and_then(Value::as_str)
-                    == Some("semantic-scaffold");
-            let web_emission_disabled = expected_adapter == "web"
+                    == Some(TYPESCRIPT_ANALYSIS_MODE_DEFINITION_GRAPH);
+            let web_definition_emission = expected_adapter == "web"
                 && properties
-                    .get("typescript_semantic_graph_emission")
+                    .get(TYPESCRIPT_SEMANTIC_EMISSION_PROPERTY)
                     .and_then(Value::as_str)
-                    == Some("disabled");
+                    == Some(TYPESCRIPT_SEMANTIC_EMISSION_DEFINITION_GRAPH_V1);
             let expected_gate = match expected_adapter {
                 "rust" => Some((
                     "rust_hir_enable_gate",
@@ -1802,13 +3320,16 @@ fn parse_events_preserving_prefix(
                 )),
                 _ => None,
             };
-            let mut violation = if expected_adapter == "web" && !web_scaffold {
-                Some("Web worker omitted typescript_analysis_mode=semantic-scaffold".to_owned())
-            } else if expected_adapter == "web" && !web_emission_disabled {
-                Some(
-                    "Web TypeChecker scaffold omitted typescript_semantic_graph_emission=disabled"
-                        .to_owned(),
-                )
+            let mut violation = if !web_profile_language {
+                Some("Web worker profile language must be web".to_owned())
+            } else if expected_adapter == "web" && !web_definition_mode {
+                Some(format!(
+                    "Web worker omitted {TYPESCRIPT_ANALYSIS_MODE_PROPERTY}={TYPESCRIPT_ANALYSIS_MODE_DEFINITION_GRAPH}"
+                ))
+            } else if expected_adapter == "web" && !web_definition_emission {
+                Some(format!(
+                    "Web worker omitted {TYPESCRIPT_SEMANTIC_EMISSION_PROPERTY}={TYPESCRIPT_SEMANTIC_EMISSION_DEFINITION_GRAPH_V1}"
+                ))
             } else if expected_adapter == "web" {
                 let gate = properties
                     .get(TYPESCRIPT_RELEASE_GATE_PROPERTY)
@@ -1882,6 +3403,13 @@ fn parse_events_preserving_prefix(
                     break;
                 }
             }
+            let mut web_definition_ready = false;
+            if violation.is_none() && expected_adapter == "web" {
+                match web_definition_profile_ready(properties) {
+                    Ok(ready) => web_definition_ready = ready,
+                    Err(error) => violation = Some(error),
+                }
+            }
             if let Some(violation) = violation {
                 parse_error = Some(format!(
                     "security policy violation at line {}: {violation}",
@@ -1891,28 +3419,107 @@ fn parse_events_preserving_prefix(
                 security_violation = true;
                 break;
             }
+            if expected_adapter == "web" {
+                web_profiles.insert(declared.profile.id.clone());
+                if web_definition_ready {
+                    web_definition_profiles.insert(declared.profile.id.clone());
+                }
+            }
         }
-        if enforce_web_semantic_scaffold {
+        if enforce_web_definition_graph {
             let violation = match &event {
                 ProtocolEvent::NodeUpsert(upsert)
                     if matches!(upsert.node.kind.as_str(), "symbol" | "type") =>
                 {
-                    Some(
-                        "Web TypeChecker scaffold emitted a semantic node while semantic graph emission is disabled",
-                    )
+                    let profile_id = upsert
+                        .node
+                        .properties
+                        .get("profile_id")
+                        .and_then(Value::as_str);
+                    let language = upsert
+                        .node
+                        .properties
+                        .get("language")
+                        .and_then(Value::as_str);
+                    if profile_id
+                        .is_none_or(|profile_id| !web_definition_profiles.contains(profile_id))
+                    {
+                        Some(format!(
+                            "Web semantic node {} is not authorized by a definition-graph-v1 profile",
+                            upsert.node.id
+                        ))
+                    } else if !matches!(language, Some("typescript" | "javascript")) {
+                        Some(format!(
+                            "Web semantic node {} must declare language=typescript or javascript",
+                            upsert.node.id
+                        ))
+                    } else {
+                        None
+                    }
                 }
-                ProtocolEvent::EdgeUpsert(upsert) if upsert.edge.phase == Phase::Semantic => Some(
-                    "Web TypeChecker scaffold emitted a semantic edge while semantic graph emission is disabled",
-                ),
+                ProtocolEvent::EdgeUpsert(upsert)
+                    if upsert.edge.phase == Phase::Semantic
+                        || is_web_definition_relation_kind(&upsert.edge.kind)
+                        || web_semantic_node_ids.contains(&upsert.edge.source)
+                        || web_semantic_node_ids.contains(&upsert.edge.target) =>
+                {
+                    let edge = &upsert.edge;
+                    if edge.phase != Phase::Semantic {
+                        Some(format!(
+                            "Web definition relation {} must use phase=semantic",
+                            edge.id
+                        ))
+                    } else if !is_web_definition_relation_kind(&edge.kind) {
+                        Some(format!(
+                            "Web definition-graph-v1 profile emitted forbidden semantic edge kind {:?}",
+                            edge.kind
+                        ))
+                    } else if !web_definition_profiles.contains(&edge.profile_id) {
+                        Some(format!(
+                            "Web semantic edge {} is not authorized by profile {:?}",
+                            edge.id, edge.profile_id
+                        ))
+                    } else if edge.site_id.is_some() {
+                        Some(format!(
+                            "Web semantic definition relation {} must remain site-less",
+                            edge.id
+                        ))
+                    } else if edge.resolution_status != ResolutionStatus::Resolved
+                        || edge.precision != Precision::Exact
+                    {
+                        Some(format!(
+                            "Web semantic definition relation {} must use resolved/exact",
+                            edge.id
+                        ))
+                    } else {
+                        None
+                    }
+                }
+                ProtocolEvent::DependencySite(site)
+                    if is_web_semantic_delta_event(&event)
+                        || web_semantic_node_ids.contains(&site.site.source)
+                        || site
+                            .site
+                            .target_ids
+                            .iter()
+                            .any(|target| web_semantic_node_ids.contains(target))
+                        || matches!(
+                            site.site.kind.as_str(),
+                            "call" | "type_use" | "rust_use" | "rust_reexport"
+                        ) =>
+                {
+                    Some(format!(
+                        "Web definition-graph-v1 profile emitted forbidden semantic dependency site {}",
+                        site.site.id
+                    ))
+                }
                 ProtocolEvent::ProfileCompleted(completed)
                     if completed
                         .coverage
                         .completeness
                         .contains(&CompletenessLevel::SemanticComplete) =>
                 {
-                    Some(
-                        "Web TypeChecker scaffold reported semantic-complete while semantic graph emission is disabled",
-                    )
+                    Some("Web definition-graph-v1 profile reported semantic-complete".to_owned())
                 }
                 ProtocolEvent::ScanCompleted(completed)
                     if completed
@@ -1920,13 +3527,12 @@ fn parse_events_preserving_prefix(
                         .completeness
                         .contains(&CompletenessLevel::SemanticComplete) =>
                 {
-                    Some(
-                        "Web TypeChecker scaffold reported semantic-complete while semantic graph emission is disabled",
-                    )
+                    Some("Web definition-graph-v1 profile reported semantic-complete".to_owned())
                 }
                 _ => None,
             };
             if let Some(violation) = violation {
+                record_web_rejected_site_closure(&event, &mut web_discarded_site_ids);
                 parse_error = Some(format!(
                     "security policy violation at line {}: {violation}",
                     line_index + 1
@@ -1936,8 +3542,14 @@ fn parse_events_preserving_prefix(
                 break;
             }
         }
+        let current_web_semantic_delta =
+            enforce_web_definition_graph && is_web_semantic_delta_event(&event);
+        saw_web_semantic_delta |= current_web_semantic_delta;
         if let Err(error) = validator.push(event) {
-            security_violation = protocol_error_is_security(&error);
+            if let Some(site_id) = current_site_closure {
+                web_discarded_site_ids.insert(site_id);
+            }
+            security_violation = protocol_error_is_security(&error) || current_web_semantic_delta;
             parse_error = Some(format!(
                 "protocol validation failed at line {}: {error}",
                 line_index + 1
@@ -1946,12 +3558,42 @@ fn parse_events_preserving_prefix(
             break;
         }
     }
-    let prefix = validator.validated_events().to_vec();
-    if parse_error.is_none()
-        && let Err(error) = validator.finish()
-    {
-        parse_error = Some(format!("incomplete protocol stream: {error}"));
-        failure_kind = Some(WorkerFailureKind::IncompleteProtocol);
+    let mut prefix = validator.validated_events().to_vec();
+    if parse_error.is_none() {
+        match validator.finish() {
+            Ok(protocol) if enforce_web_definition_graph => {
+                if let Err(error) = validate_web_definition_graph(
+                    &protocol,
+                    &web_profiles,
+                    &web_definition_profiles,
+                ) {
+                    parse_error = Some(format!(
+                        "security policy violation: invalid Web definition-graph-v1 delta: {error}"
+                    ));
+                    failure_kind = Some(WorkerFailureKind::MalformedProtocol);
+                    security_violation = true;
+                }
+            }
+            Ok(_) => {}
+            Err(error) => {
+                if enforce_web_definition_graph
+                    && saw_web_semantic_delta
+                    && matches!(error, ProtocolError::Invariant(_))
+                {
+                    parse_error = Some(format!(
+                        "security policy violation: invalid Web definition-graph-v1 protocol: {error}"
+                    ));
+                    failure_kind = Some(WorkerFailureKind::MalformedProtocol);
+                    security_violation = true;
+                } else {
+                    parse_error = Some(format!("incomplete protocol stream: {error}"));
+                    failure_kind = Some(WorkerFailureKind::IncompleteProtocol);
+                }
+            }
+        }
+    }
+    if enforce_web_definition_graph && parse_error.is_some() {
+        discard_web_definition_delta(&mut prefix, &web_semantic_node_ids, &web_discarded_site_ids);
     }
     let events = prefix
         .into_iter()
@@ -2135,10 +3777,409 @@ mod tests {
             "web",
             serde_json::json!({
                 TYPESCRIPT_RELEASE_GATE_PROPERTY: gate,
-                "typescript_analysis_mode": "semantic-scaffold",
-                "typescript_semantic_graph_emission": "disabled",
+                TYPESCRIPT_ANALYSIS_MODE_PROPERTY: TYPESCRIPT_ANALYSIS_MODE_DEFINITION_GRAPH,
+                TYPESCRIPT_SEMANTIC_EMISSION_PROPERTY: TYPESCRIPT_SEMANTIC_EMISSION_DEFINITION_GRAPH_V1,
+                TYPESCRIPT_PROJECT_STATUS_PROPERTY: "ready",
+                TYPESCRIPT_TYPECHECKER_STATUS_PROPERTY: "definition-graph-emitted",
+                TYPESCRIPT_DEFINITION_STATUS_PROPERTY: "ready",
+                "typescript_semantic_node_count": "0",
+                "typescript_semantic_relation_count": "0",
+                "typescript_semantic_issue_count": "0",
             }),
         )
+    }
+
+    fn typescript_definition_protocol(
+        root: &Path,
+        gate: &str,
+        relation_kind: &str,
+    ) -> Result<Vec<u8>> {
+        std::fs::create_dir_all(root.join("src"))?;
+        std::fs::write(
+            root.join("package.json"),
+            br#"{"name":"definition-fixture","version":"1.0.0"}"#,
+        )?;
+        std::fs::write(root.join("src/index.ts"), b"export class Definition {}\n")?;
+        let output = typescript_gate_protocol(root, gate)?;
+        let mut events = String::from_utf8(output)?
+            .lines()
+            .map(serde_json::from_str::<Value>)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let profile_id = "web:default";
+        let package_locator = "npm:workspace:definition-fixture@1.0.0#.";
+        let package_id = depgraph_protocol::stable_id_from_value(
+            "package",
+            &serde_json::json!({"locator": package_locator}),
+        );
+        let file_id = depgraph_protocol::stable_id_from_value(
+            "file",
+            &serde_json::json!({"package": package_locator, "path": "src/index.ts"}),
+        );
+        let named_identity = |namespace: &str,
+                              semantic_kind: &str,
+                              resolver_suffix: &str,
+                              generic_origin: Option<&str>| {
+            let kind_property = if namespace == "symbol" {
+                "symbol_kind"
+            } else {
+                "type_kind"
+            };
+            let mut identity = serde_json::json!({
+                "language": "typescript",
+                "package_locator": package_locator,
+                "resolver_identity": format!("{package_locator}::module:src/index.ts#{resolver_suffix}"),
+            });
+            identity[kind_property] = serde_json::json!(semantic_kind);
+            if namespace == "symbol" {
+                identity["identity_kind"] = serde_json::json!("named");
+            }
+            if let Some(generic_origin) = generic_origin {
+                let type_arguments = serde_json::json!([{"kind":"intrinsic","name":"string"}]);
+                identity["resolver_identity"] = serde_json::json!(format!(
+                    "generic:{}",
+                    serde_json::to_string(&serde_json::json!([
+                        generic_origin,
+                        type_arguments.clone()
+                    ]))
+                    .expect("test generic resolver input serializes")
+                ));
+                identity["generic_origin"] = serde_json::json!(generic_origin);
+                identity["type_arguments"] = type_arguments;
+            }
+            identity
+        };
+        let semantic_node = |namespace: &str,
+                             semantic_kind: &str,
+                             resolver_suffix: &str,
+                             generic_origin: Option<&str>| {
+            let identity =
+                named_identity(namespace, semantic_kind, resolver_suffix, generic_origin);
+            let kind_property = if namespace == "symbol" {
+                "symbol_kind"
+            } else {
+                "type_kind"
+            };
+            let id = depgraph_protocol::stable_id_from_value(namespace, &identity);
+            let mut properties = serde_json::json!({
+                "language": "typescript",
+                "package_locator": package_locator,
+                "package_id": package_id,
+                "canonical_identity": identity.clone(),
+                "profile_id": profile_id,
+                "source_path": "src/index.ts",
+                "source_span": {
+                    "start_line": 1,
+                    "start_column": 1,
+                    "end_line": 1,
+                    "end_column": 9,
+                },
+            });
+            properties[kind_property] = serde_json::json!(semantic_kind);
+            properties["resolver_identity"] = identity["resolver_identity"].clone();
+            if generic_origin.is_some() {
+                properties["generic_origin"] = identity["generic_origin"].clone();
+                properties["type_arguments"] = identity["type_arguments"].clone();
+            }
+            serde_json::json!({
+                "id": id,
+                "kind": namespace,
+                "locator": format!("typescript-{namespace}:{id}"),
+                "display_name": semantic_kind,
+                "properties": properties,
+            })
+        };
+        let condition = serde_json::json!({"op":"all","conditions":[]});
+        let relation = |kind: &str, source: &str, target: &str| {
+            let evidence = serde_json::json!({
+                "kind": "semantic",
+                "extractor": TYPESCRIPT_SEMANTIC_EXTRACTOR,
+                "extractor_version": TYPESCRIPT_COMPILER_VERSION,
+                "path": "src/index.ts",
+                "start_line": 1,
+                "start_column": 1,
+                "end_line": 1,
+                "end_column": 9,
+                "detail": "TypeChecker definition relation",
+                "properties": {"profile_id": profile_id},
+            });
+            let edge_id = depgraph_protocol::stable_id_from_value(
+                "edge",
+                &serde_json::json!({
+                    "condition": condition,
+                    "kind": kind,
+                    "path": evidence["path"],
+                    "profile_id": profile_id,
+                    "source": source,
+                    "span": {
+                        "end_column": evidence["end_column"],
+                        "end_line": evidence["end_line"],
+                        "start_column": evidence["start_column"],
+                        "start_line": evidence["start_line"],
+                    },
+                    "target": target,
+                }),
+            );
+            serde_json::json!({
+                "event":"edge_upsert",
+                "edge": {
+                    "id":edge_id,
+                    "source":source,
+                    "target":target,
+                    "kind":kind,
+                    "phase":"semantic",
+                    "environment":"any",
+                    "profile_id":profile_id,
+                    "condition":condition,
+                    "resolution_status":"resolved",
+                    "precision":"exact",
+                    "generated":false,
+                    "evidence":[evidence],
+                },
+            })
+        };
+        let mut semantic_nodes = Vec::new();
+        let mut semantic_edges = Vec::new();
+        match relation_kind {
+            "declares" => {
+                let symbol = semantic_node("symbol", "function", "definition", None);
+                semantic_edges.push(relation(
+                    "declares",
+                    &file_id,
+                    symbol["id"].as_str().expect("symbol ID"),
+                ));
+                semantic_nodes.push(symbol);
+            }
+            "extends" | "implements" => {
+                let left = semantic_node("type", "class", "left", None);
+                let right = semantic_node("type", "interface", "right", None);
+                for node in [&left, &right] {
+                    semantic_edges.push(relation(
+                        "declares",
+                        &file_id,
+                        node["id"].as_str().expect("type ID"),
+                    ));
+                }
+                semantic_edges.push(relation(
+                    relation_kind,
+                    left["id"].as_str().expect("left type ID"),
+                    right["id"].as_str().expect("right type ID"),
+                ));
+                semantic_nodes.extend([left, right]);
+            }
+            "instantiates" => {
+                let source = semantic_node("type", "class", "source", None);
+                let origin = semantic_node("type", "class", "origin", None);
+                let origin_resolver =
+                    origin["properties"]["canonical_identity"]["resolver_identity"]
+                        .as_str()
+                        .expect("origin resolver");
+                let instance = semantic_node(
+                    "type",
+                    "generic_instance",
+                    "origin<string>",
+                    Some(origin_resolver),
+                );
+                for node in [&source, &origin] {
+                    semantic_edges.push(relation(
+                        "declares",
+                        &file_id,
+                        node["id"].as_str().expect("type ID"),
+                    ));
+                }
+                semantic_edges.push(relation(
+                    "instantiates",
+                    source["id"].as_str().expect("source type ID"),
+                    instance["id"].as_str().expect("instance type ID"),
+                ));
+                semantic_nodes.extend([source, origin, instance]);
+            }
+            other => bail!("unsupported test relation {other}"),
+        }
+        events[1]["profile"]["properties"]["typescript_semantic_node_count"] =
+            serde_json::json!(semantic_nodes.len().to_string());
+        events[1]["profile"]["properties"]["typescript_semantic_relation_count"] =
+            serde_json::json!(semantic_edges.len().to_string());
+        let mut payload = vec![
+            serde_json::json!({
+                "event":"node_upsert",
+                "node": {
+                    "id":package_id,
+                    "kind":"package_instance",
+                    "locator":format!("package://{package_locator}"),
+                    "display_name":"definition-fixture",
+                    "properties":{
+                        "locator":package_locator,
+                        "manifest_path":"package.json",
+                        "workspace":true,
+                        "workspace_path":".",
+                    },
+                },
+            }),
+            serde_json::json!({
+                "event":"node_upsert",
+                "node": {
+                    "id":file_id,
+                    "kind":"file",
+                    "locator":"file://src/index.ts",
+                    "display_name":"src/index.ts",
+                    "properties":{
+                        "path":"src/index.ts",
+                        "package_id":package_id,
+                        "language":"typescript",
+                        "generated":false,
+                    },
+                },
+            }),
+        ];
+        payload.extend(
+            semantic_nodes
+                .into_iter()
+                .map(|node| serde_json::json!({"event":"node_upsert","node":node})),
+        );
+        payload.extend(semantic_edges);
+        for item in payload.into_iter().rev() {
+            events.insert(2, item);
+        }
+        for (index, event) in events.iter_mut().enumerate() {
+            event["protocol_version"] = serde_json::json!("1.0");
+            event["scan_id"] = serde_json::json!("typescript-gate-scan");
+            event["adapter"] = serde_json::json!("web");
+            event["adapter_version"] = serde_json::json!(env!("CARGO_PKG_VERSION"));
+            event["seq"] = serde_json::json!(index + 1);
+        }
+        let mut protocol = Vec::new();
+        for event in events {
+            serde_json::to_writer(&mut protocol, &event)?;
+            protocol.push(b'\n');
+        }
+        Ok(protocol)
+    }
+
+    fn test_protocol_values(output: Vec<u8>) -> Result<Vec<Value>> {
+        Ok(String::from_utf8(output)?
+            .lines()
+            .map(serde_json::from_str)
+            .collect::<std::result::Result<_, _>>()?)
+    }
+
+    fn serialize_test_protocol(events: Vec<Value>) -> Result<Vec<u8>> {
+        let mut output = Vec::new();
+        for event in events {
+            serde_json::to_writer(&mut output, &event)?;
+            output.push(b'\n');
+        }
+        Ok(output)
+    }
+
+    fn rehash_test_definition_edge(edge: &mut Value) {
+        let evidence = edge["evidence"][0].clone();
+        let identity = serde_json::json!({
+            "condition": edge["condition"].clone(),
+            "kind": edge["kind"].clone(),
+            "path": evidence["path"].clone(),
+            "profile_id": edge["profile_id"].clone(),
+            "source": edge["source"].clone(),
+            "span": {
+                "end_column": evidence["end_column"].clone(),
+                "end_line": evidence["end_line"].clone(),
+                "start_column": evidence["start_column"].clone(),
+                "start_line": evidence["start_line"].clone(),
+            },
+            "target": edge["target"].clone(),
+        });
+        edge["id"] = serde_json::json!(depgraph_protocol::stable_id_from_value("edge", &identity));
+    }
+
+    fn refresh_test_semantic_node_id(events: &mut [Value], node_index: usize) -> String {
+        let (old_id, new_id) = {
+            let node = &mut events[node_index]["node"];
+            let old_id = node["id"].as_str().expect("semantic node ID").to_owned();
+            let kind = node["kind"]
+                .as_str()
+                .expect("semantic node kind")
+                .to_owned();
+            let language = node["properties"]["language"]
+                .as_str()
+                .expect("semantic node language")
+                .to_owned();
+            let new_id = depgraph_protocol::stable_id_from_value(
+                &kind,
+                &node["properties"]["canonical_identity"],
+            );
+            node["id"] = serde_json::json!(new_id);
+            node["locator"] = serde_json::json!(format!("{language}-{kind}:{new_id}"));
+            (old_id, new_id)
+        };
+        for event in events {
+            if event["event"] != "edge_upsert" {
+                continue;
+            }
+            let edge = &mut event["edge"];
+            let mut changed = false;
+            for endpoint in ["source", "target"] {
+                if edge[endpoint].as_str() == Some(old_id.as_str()) {
+                    edge[endpoint] = serde_json::json!(new_id);
+                    changed = true;
+                }
+            }
+            if changed {
+                rehash_test_definition_edge(edge);
+            }
+        }
+        new_id
+    }
+
+    fn rewrite_test_generic_instance(
+        events: &mut [Value],
+        type_arguments: Value,
+        resolver_override: Option<String>,
+    ) -> String {
+        let node_index = events
+            .iter()
+            .position(|event| event["node"]["properties"]["type_kind"] == "generic_instance")
+            .expect("generic instance node");
+        let node = &mut events[node_index]["node"];
+        let generic_origin = node["properties"]["canonical_identity"]["generic_origin"]
+            .as_str()
+            .expect("generic origin resolver")
+            .to_owned();
+        let resolver = resolver_override.unwrap_or_else(|| {
+            format!(
+                "generic:{}",
+                serde_json::to_string(&serde_json::json!([generic_origin, type_arguments.clone()]))
+                    .expect("test generic resolver input serializes")
+            )
+        });
+        node["properties"]["canonical_identity"]["type_arguments"] = type_arguments.clone();
+        node["properties"]["canonical_identity"]["resolver_identity"] = serde_json::json!(resolver);
+        node["properties"]["type_arguments"] = type_arguments;
+        node["properties"]["resolver_identity"] = serde_json::json!(resolver);
+        refresh_test_semantic_node_id(events, node_index)
+    }
+
+    fn resequence_test_protocol(events: &mut [Value]) {
+        for (index, event) in events.iter_mut().enumerate() {
+            event["seq"] = serde_json::json!(index + 1);
+        }
+    }
+
+    fn sync_test_semantic_counts(events: &mut [Value]) {
+        let node_count = events
+            .iter()
+            .filter(|event| matches!(event["node"]["kind"].as_str(), Some("symbol" | "type")))
+            .count();
+        let relation_count = events
+            .iter()
+            .filter(|event| event["event"] == "edge_upsert" && event["edge"]["phase"] == "semantic")
+            .count();
+        let profile = events
+            .iter_mut()
+            .find(|event| event["event"] == "profile_declared")
+            .expect("Web profile declaration");
+        profile["profile"]["properties"]["typescript_semantic_node_count"] =
+            serde_json::json!(node_count.to_string());
+        profile["profile"]["properties"]["typescript_semantic_relation_count"] =
+            serde_json::json!(relation_count.to_string());
     }
 
     fn profile_protocol(
@@ -3217,29 +5258,1418 @@ mod tests {
     }
 
     #[test]
-    fn web_worker_cannot_omit_the_semantic_scaffold_boundary() -> Result<()> {
+    fn web_worker_requires_the_exact_definition_graph_capability() -> Result<()> {
         let root = tempfile::tempdir()?;
         let root = root.path().canonicalize()?;
         for property in [
-            "typescript_analysis_mode",
-            "typescript_semantic_graph_emission",
+            TYPESCRIPT_ANALYSIS_MODE_PROPERTY,
+            TYPESCRIPT_SEMANTIC_EMISSION_PROPERTY,
+        ] {
+            for value in [None, Some("unknown-capability")] {
+                let output = typescript_gate_protocol(&root, TYPESCRIPT_RELEASE_GATE_PENDING)?;
+                let mut events = String::from_utf8(output)?
+                    .lines()
+                    .map(serde_json::from_str::<Value>)
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                if let Some(value) = value {
+                    events[1]["profile"]["properties"][property] = serde_json::json!(value);
+                } else {
+                    events[1]["profile"]["properties"]
+                        .as_object_mut()
+                        .context("profile properties must be an object")?
+                        .remove(property);
+                }
+                let mut spoofed = Vec::new();
+                for event in events {
+                    serde_json::to_writer(&mut spoofed, &event)?;
+                    spoofed.push(b'\n');
+                }
+                let parsed = parse_events_preserving_prefix(
+                    &spoofed,
+                    "typescript-gate-scan",
+                    "web",
+                    &root,
+                    4096,
+                    Some(env!("CARGO_PKG_VERSION")),
+                    Some(false),
+                );
+                assert_eq!(
+                    parsed.events.len(),
+                    1,
+                    "{property}={value:?}: {:?}",
+                    parsed.error
+                );
+                assert_eq!(
+                    parsed.failure_kind,
+                    Some(WorkerFailureKind::MalformedProtocol)
+                );
+                assert!(parsed.security_violation);
+                assert!(
+                    parsed
+                        .error
+                        .as_deref()
+                        .is_some_and(|error| error.contains(property)),
+                    "{property}={value:?}: {:?}",
+                    parsed.error
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn web_definition_graph_capability_accepts_only_the_definition_slice() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let root = root.path().canonicalize()?;
+        for (gate, release_attested) in [
+            (TYPESCRIPT_RELEASE_GATE_PENDING, false),
+            (TYPESCRIPT_RELEASE_GATE_VERIFIED, true),
+        ] {
+            for relation_kind in ["declares", "extends", "implements", "instantiates"] {
+                let output = typescript_definition_protocol(&root, gate, relation_kind)?;
+                let parsed = parse_events_preserving_prefix(
+                    &output,
+                    "typescript-gate-scan",
+                    "web",
+                    &root,
+                    16 * 1024,
+                    Some(env!("CARGO_PKG_VERSION")),
+                    Some(release_attested),
+                );
+                assert_eq!(parsed.error, None, "{gate}/{relation_kind}");
+                assert_eq!(parsed.failure_kind, None, "{gate}/{relation_kind}");
+                assert!(!parsed.security_violation, "{gate}/{relation_kind}");
+                assert!(parsed.events.iter().any(|event| {
+                    event["event"] == "edge_upsert"
+                        && event["edge"]["kind"] == relation_kind
+                        && event["edge"]["phase"] == "semantic"
+                        && event["edge"]["site_id"].is_null()
+                }));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn web_definition_graph_rejects_and_discards_out_of_capability_delta() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let root = root.path().canonicalize()?;
+        let serialized = |events: Vec<Value>| -> Result<Vec<u8>> {
+            let mut output = Vec::new();
+            for event in events {
+                serde_json::to_writer(&mut output, &event)?;
+                output.push(b'\n');
+            }
+            Ok(output)
+        };
+        let parsed_values = |output: Vec<u8>| -> Result<Vec<Value>> {
+            Ok(String::from_utf8(output)?
+                .lines()
+                .map(serde_json::from_str)
+                .collect::<std::result::Result<_, _>>()?)
+        };
+
+        let mut forbidden_call = parsed_values(typescript_definition_protocol(
+            &root,
+            TYPESCRIPT_RELEASE_GATE_PENDING,
+            "declares",
+        )?)?;
+        forbidden_call
+            .iter_mut()
+            .find(|event| event["event"] == "edge_upsert")
+            .expect("definition edge")["edge"]["kind"] = serde_json::json!("calls");
+
+        let mut wrong_hash = parsed_values(typescript_definition_protocol(
+            &root,
+            TYPESCRIPT_RELEASE_GATE_PENDING,
+            "declares",
+        )?)?;
+        wrong_hash
+            .iter_mut()
+            .find(|event| event["event"] == "edge_upsert")
+            .expect("definition edge")["edge"]["id"] =
+            serde_json::json!(format!("edge:sha256:{}", "0".repeat(64)));
+
+        let mut wrong_extractor = parsed_values(typescript_definition_protocol(
+            &root,
+            TYPESCRIPT_RELEASE_GATE_PENDING,
+            "declares",
+        )?)?;
+        wrong_extractor
+            .iter_mut()
+            .find(|event| event["event"] == "edge_upsert")
+            .expect("definition edge")["edge"]["evidence"][0]["extractor"] =
+            serde_json::json!("typescript-static");
+
+        let mut wrong_count = parsed_values(typescript_definition_protocol(
+            &root,
+            TYPESCRIPT_RELEASE_GATE_PENDING,
+            "declares",
+        )?)?;
+        wrong_count[1]["profile"]["properties"]["typescript_semantic_node_count"] =
+            serde_json::json!("99");
+
+        let mut linked_relation = parsed_values(typescript_definition_protocol(
+            &root,
+            TYPESCRIPT_RELEASE_GATE_PENDING,
+            "declares",
+        )?)?;
+        linked_relation
+            .iter_mut()
+            .find(|event| event["event"] == "edge_upsert")
+            .expect("definition edge")["edge"]["site_id"] =
+            serde_json::json!("site:sha256:forbidden");
+
+        let mut candidate_relation = parsed_values(typescript_definition_protocol(
+            &root,
+            TYPESCRIPT_RELEASE_GATE_PENDING,
+            "declares",
+        )?)?;
+        let candidate = candidate_relation
+            .iter_mut()
+            .find(|event| event["event"] == "edge_upsert")
+            .expect("definition edge");
+        candidate["edge"]["resolution_status"] = serde_json::json!("candidates");
+        candidate["edge"]["precision"] = serde_json::json!("overapprox");
+
+        let mut semantic_site = parsed_values(typescript_definition_protocol(
+            &root,
+            TYPESCRIPT_RELEASE_GATE_PENDING,
+            "declares",
+        )?)?;
+        let edge_index = semantic_site
+            .iter()
+            .position(|event| event["event"] == "edge_upsert")
+            .expect("definition edge index");
+        semantic_site.insert(
+            edge_index,
+            serde_json::json!({
+                "event":"dependency_site",
+                "protocol_version":"1.0",
+                "scan_id":"typescript-gate-scan",
+                "adapter":"web",
+                "adapter_version":env!("CARGO_PKG_VERSION"),
+                "seq":0,
+                "site":{
+                    "id":"site:sha256:forbidden",
+                    "source":"package:sha256:definition-fixture",
+                    "kind":"call",
+                    "specifier":"forbidden",
+                    "resolution_status":"resolved",
+                    "target_ids":["package:sha256:definition-fixture"],
+                    "profile_id":"web:default",
+                    "condition":{"op":"all","conditions":[]},
+                    "precision":"exact",
+                    "evidence":[{
+                        "kind":"semantic",
+                        "extractor":TYPESCRIPT_SEMANTIC_EXTRACTOR,
+                        "extractor_version":TYPESCRIPT_COMPILER_VERSION,
+                        "path":"src/index.ts",
+                        "start_line":1,
+                        "start_column":1,
+                        "end_line":1,
+                        "end_column":9
+                    }]
+                }
+            }),
+        );
+        for (index, event) in semantic_site.iter_mut().enumerate() {
+            event["seq"] = serde_json::json!(index + 1);
+        }
+
+        let mut external_package = parsed_values(typescript_definition_protocol(
+            &root,
+            TYPESCRIPT_RELEASE_GATE_PENDING,
+            "declares",
+        )?)?;
+        external_package
+            .iter_mut()
+            .find(|event| event["node"]["kind"] == "package_instance")
+            .expect("workspace package")["node"]["properties"]["workspace"] =
+            serde_json::json!(false);
+
+        let mut wrong_package_id = parsed_values(typescript_definition_protocol(
+            &root,
+            TYPESCRIPT_RELEASE_GATE_PENDING,
+            "declares",
+        )?)?;
+        wrong_package_id
+            .iter_mut()
+            .find(|event| matches!(event["node"]["kind"].as_str(), Some("symbol" | "type")))
+            .expect("semantic node")["node"]["properties"]["package_id"] =
+            serde_json::json!(format!("package:sha256:{}", "f".repeat(64)));
+
+        let mut ghost_evidence = parsed_values(typescript_definition_protocol(
+            &root,
+            TYPESCRIPT_RELEASE_GATE_PENDING,
+            "declares",
+        )?)?;
+        let ghost_edge = &mut ghost_evidence
+            .iter_mut()
+            .find(|event| event["event"] == "edge_upsert")
+            .expect("definition edge")["edge"];
+        ghost_edge["evidence"][0]["path"] = serde_json::json!("src/ghost.ts");
+        let ghost_identity = serde_json::json!({
+            "condition": ghost_edge["condition"].clone(),
+            "kind": ghost_edge["kind"].clone(),
+            "path": ghost_edge["evidence"][0]["path"].clone(),
+            "profile_id": ghost_edge["profile_id"].clone(),
+            "source": ghost_edge["source"].clone(),
+            "span": {
+                "end_column": ghost_edge["evidence"][0]["end_column"].clone(),
+                "end_line": ghost_edge["evidence"][0]["end_line"].clone(),
+                "start_column": ghost_edge["evidence"][0]["start_column"].clone(),
+                "start_line": ghost_edge["evidence"][0]["start_line"].clone(),
+            },
+            "target": ghost_edge["target"].clone(),
+        });
+        ghost_edge["id"] = serde_json::json!(depgraph_protocol::stable_id_from_value(
+            "edge",
+            &ghost_identity,
+        ));
+
+        let mut orphan_node = parsed_values(typescript_definition_protocol(
+            &root,
+            TYPESCRIPT_RELEASE_GATE_PENDING,
+            "declares",
+        )?)?;
+        orphan_node.retain(|event| event["event"] != "edge_upsert");
+        orphan_node[1]["profile"]["properties"]["typescript_semantic_relation_count"] =
+            serde_json::json!("0");
+        for (index, event) in orphan_node.iter_mut().enumerate() {
+            event["seq"] = serde_json::json!(index + 1);
+        }
+
+        let mut wrong_issue_count = parsed_values(typescript_definition_protocol(
+            &root,
+            TYPESCRIPT_RELEASE_GATE_PENDING,
+            "declares",
+        )?)?;
+        wrong_issue_count[1]["profile"]["properties"]["typescript_semantic_issue_count"] =
+            serde_json::json!("1");
+
+        let mut invalid_node_shape = parsed_values(typescript_definition_protocol(
+            &root,
+            TYPESCRIPT_RELEASE_GATE_PENDING,
+            "declares",
+        )?)?;
+        invalid_node_shape
+            .iter_mut()
+            .find(|event| matches!(event["node"]["kind"].as_str(), Some("symbol" | "type")))
+            .expect("semantic node")["node"]["locator"] = serde_json::json!("");
+
+        let mut discarded_profile = parsed_values(typescript_definition_protocol(
+            &root,
+            TYPESCRIPT_RELEASE_GATE_PENDING,
+            "declares",
+        )?)?;
+        discarded_profile[1]["profile"]["properties"][TYPESCRIPT_TYPECHECKER_STATUS_PROPERTY] =
+            serde_json::json!("definition-graph-discarded");
+        discarded_profile[1]["profile"]["properties"][TYPESCRIPT_DEFINITION_STATUS_PROPERTY] =
+            serde_json::json!("failed");
+
+        for (name, events) in [
+            ("forbidden call", forbidden_call),
+            ("wrong canonical hash", wrong_hash),
+            ("wrong semantic extractor", wrong_extractor),
+            ("wrong semantic count", wrong_count),
+            ("linked definition relation", linked_relation),
+            ("candidate definition relation", candidate_relation),
+            ("semantic dependency site", semantic_site),
+            ("external package ownership", external_package),
+            ("wrong package ID", wrong_package_id),
+            ("ghost evidence file", ghost_evidence),
+            ("orphan semantic node", orphan_node),
+            ("wrong semantic issue count", wrong_issue_count),
+            ("invalid semantic node shape", invalid_node_shape),
+            ("discarded profile emitted a delta", discarded_profile),
+        ] {
+            let output = serialized(events)?;
+            let parsed = parse_events_preserving_prefix(
+                &output,
+                "typescript-gate-scan",
+                "web",
+                &root,
+                16 * 1024,
+                Some(env!("CARGO_PKG_VERSION")),
+                Some(false),
+            );
+            assert_eq!(
+                parsed.failure_kind,
+                Some(WorkerFailureKind::MalformedProtocol),
+                "{name}: {:?}",
+                parsed.error
+            );
+            assert!(parsed.security_violation, "{name}: {:?}", parsed.error);
+            assert!(parsed.error.is_some(), "{name}");
+            assert!(
+                !parsed.events.iter().any(|event| {
+                    matches!(event["node"]["kind"].as_str(), Some("symbol" | "type"))
+                        || event["edge"]["phase"] == "semantic"
+                }),
+                "{name}: semantic delta survived an atomic rejection"
+            );
+            assert!(
+                parsed.events.iter().any(|event| {
+                    event["event"] == "node_upsert" && event["node"]["kind"] == "package_instance"
+                }),
+                "{name}: syntax/package graph was not retained"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn web_definition_graph_rejects_compromised_canonical_references_and_shapes() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let root = root.path().canonicalize()?;
+        let protocol = |relation_kind| {
+            test_protocol_values(typescript_definition_protocol(
+                &root,
+                TYPESCRIPT_RELEASE_GATE_PENDING,
+                relation_kind,
+            )?)
+        };
+        let mut cases = Vec::<(&str, Vec<Value>, &str)>::new();
+
+        let mut dangling_origin = protocol("instantiates")?;
+        let origin_resolver = dangling_origin
+            .iter()
+            .find(|event| {
+                event["node"]["properties"]["type_kind"] == "generic_instance"
+            })
+            .expect("generic instance")["node"]["properties"]["canonical_identity"]
+            ["generic_origin"]
+            .as_str()
+            .expect("generic origin resolver")
+            .to_owned();
+        let origin_id = dangling_origin
+            .iter()
+            .find(|event| {
+                event["node"]["properties"]["canonical_identity"]["resolver_identity"].as_str()
+                    == Some(origin_resolver.as_str())
+            })
+            .expect("generic origin node")["node"]["id"]
+            .as_str()
+            .expect("generic origin ID")
+            .to_owned();
+        dangling_origin.retain(|event| {
+            event["node"]["id"].as_str() != Some(origin_id.as_str())
+                && event["edge"]["target"].as_str() != Some(origin_id.as_str())
+        });
+        sync_test_semantic_counts(&mut dangling_origin);
+        resequence_test_protocol(&mut dangling_origin);
+        cases.push((
+            "dangling generic origin",
+            dangling_origin,
+            "missing generic origin",
+        ));
+
+        let mut dangling_argument = protocol("instantiates")?;
+        rewrite_test_generic_instance(
+            &mut dangling_argument,
+            serde_json::json!([{
+                "kind": "definition",
+                "resolver_identity": "npm:missing::type",
+            }]),
+            None,
+        );
+        cases.push((
+            "dangling generic type argument",
+            dangling_argument,
+            "references missing semantic definition",
+        ));
+
+        let mut mismatched_resolver = protocol("instantiates")?;
+        rewrite_test_generic_instance(
+            &mut mismatched_resolver,
+            serde_json::json!([{"kind": "intrinsic", "name": "string"}]),
+            Some("generic:[\"spoofed\",[]]".to_owned()),
+        );
+        cases.push((
+            "mismatched reconstructed resolver",
+            mismatched_resolver,
+            "resolver identity does not match",
+        ));
+
+        let mut missing_intrinsic_name = protocol("instantiates")?;
+        rewrite_test_generic_instance(
+            &mut missing_intrinsic_name,
+            serde_json::json!([{"kind": "intrinsic"}]),
+            None,
+        );
+        cases.push((
+            "missing intrinsic name",
+            missing_intrinsic_name,
+            "non-canonical shape",
+        ));
+
+        let mut non_canonical_bigint = protocol("instantiates")?;
+        rewrite_test_generic_instance(
+            &mut non_canonical_bigint,
+            serde_json::json!([{
+                "kind": "literal",
+                "value_kind": "bigint",
+                "value": "00",
+            }]),
+            None,
+        );
+        cases.push((
+            "non-canonical bigint literal",
+            non_canonical_bigint,
+            "non-canonical \"bigint\" literal",
+        ));
+
+        let mut oversized_descriptor = protocol("instantiates")?;
+        rewrite_test_generic_instance(
+            &mut oversized_descriptor,
+            serde_json::json!([{
+                "kind": "literal",
+                "value_kind": "string",
+                "value": "x".repeat(TYPESCRIPT_MAX_TYPE_DESCRIPTOR_CHARS + 1),
+            }]),
+            None,
+        );
+        cases.push((
+            "oversized descriptor",
+            oversized_descriptor,
+            "exceeds 2048 characters",
+        ));
+
+        let mut reordered_descriptor = protocol("instantiates")?;
+        let mut reordered_intrinsic = serde_json::Map::new();
+        reordered_intrinsic.insert("name".to_owned(), serde_json::json!("string"));
+        reordered_intrinsic.insert("kind".to_owned(), serde_json::json!("intrinsic"));
+        rewrite_test_generic_instance(
+            &mut reordered_descriptor,
+            Value::Array(vec![Value::Object(reordered_intrinsic)]),
+            None,
+        );
+        cases.push((
+            "reordered descriptor resolver",
+            reordered_descriptor,
+            "resolver identity does not match",
+        ));
+
+        let mut non_generic_metadata = protocol("extends")?;
+        let non_generic_index = non_generic_metadata
+            .iter()
+            .position(|event| event["node"]["properties"]["type_kind"] == "class")
+            .expect("non-generic class");
+        non_generic_metadata[non_generic_index]["node"]["properties"]["canonical_identity"]["generic_origin"] =
+            serde_json::json!("spoofed-origin");
+        non_generic_metadata[non_generic_index]["node"]["properties"]["canonical_identity"]["type_arguments"] =
+            serde_json::json!([{"kind": "intrinsic", "name": "string"}]);
+        non_generic_metadata[non_generic_index]["node"]["properties"]["generic_origin"] =
+            serde_json::json!("spoofed-origin");
+        non_generic_metadata[non_generic_index]["node"]["properties"]["type_arguments"] =
+            serde_json::json!([{"kind": "intrinsic", "name": "string"}]);
+        refresh_test_semantic_node_id(&mut non_generic_metadata, non_generic_index);
+        cases.push((
+            "non-generic type metadata",
+            non_generic_metadata,
+            "non-generic type",
+        ));
+
+        let mut mismatched_top_resolver = protocol("declares")?;
+        let named_index = mismatched_top_resolver
+            .iter()
+            .position(|event| event["node"]["kind"] == "symbol")
+            .expect("named symbol");
+        mismatched_top_resolver[named_index]["node"]["properties"]["resolver_identity"] =
+            serde_json::json!("spoofed-resolver");
+        cases.push((
+            "mismatched named resolver",
+            mismatched_top_resolver,
+            "top-level resolver",
+        ));
+
+        let mut extra_identity_field = protocol("declares")?;
+        let extra_identity_index = extra_identity_field
+            .iter()
+            .position(|event| event["node"]["kind"] == "symbol")
+            .expect("named symbol");
+        extra_identity_field[extra_identity_index]["node"]["properties"]["canonical_identity"]["nonce"] =
+            serde_json::json!(true);
+        refresh_test_semantic_node_id(&mut extra_identity_field, extra_identity_index);
+        cases.push((
+            "extra canonical identity field",
+            extra_identity_field,
+            "canonical identity shape",
+        ));
+
+        let mut absolute_resolver = protocol("declares")?;
+        let absolute_resolver_index = absolute_resolver
+            .iter()
+            .position(|event| event["node"]["kind"] == "symbol")
+            .expect("named symbol");
+        let resolver = "/Users/alice/project/src/index.ts#Definition";
+        absolute_resolver[absolute_resolver_index]["node"]["properties"]["canonical_identity"]["resolver_identity"] =
+            serde_json::json!(resolver);
+        absolute_resolver[absolute_resolver_index]["node"]["properties"]["resolver_identity"] =
+            serde_json::json!(resolver);
+        refresh_test_semantic_node_id(&mut absolute_resolver, absolute_resolver_index);
+        cases.push((
+            "absolute path resolver",
+            absolute_resolver,
+            "canonical identity shape",
+        ));
+
+        let mut wrong_local_origin_field = protocol("declares")?;
+        let file_id = wrong_local_origin_field
+            .iter()
+            .find(|event| event["node"]["kind"] == "file")
+            .expect("source file")["node"]["id"]
+            .as_str()
+            .expect("source file ID")
+            .to_owned();
+        let local_index = wrong_local_origin_field
+            .iter()
+            .position(|event| event["node"]["kind"] == "symbol")
+            .expect("symbol node");
+        {
+            let node = &mut wrong_local_origin_field[local_index]["node"];
+            let source_span = node["properties"]["source_span"].clone();
+            node["properties"]["symbol_kind"] = serde_json::json!("local_function");
+            node["properties"]
+                .as_object_mut()
+                .expect("symbol properties")
+                .remove("resolver_identity");
+            let identity = node["properties"]["canonical_identity"]
+                .as_object_mut()
+                .expect("symbol identity");
+            identity.insert(
+                "symbol_kind".to_owned(),
+                serde_json::json!("local_function"),
+            );
+            identity.insert("identity_kind".to_owned(), serde_json::json!("local"));
+            identity.remove("resolver_identity");
+            identity.insert("generated_from".to_owned(), serde_json::json!(file_id));
+            identity.insert(
+                "relative_path".to_owned(),
+                serde_json::json!("src/index.ts"),
+            );
+            identity.insert("span".to_owned(), source_span);
+        }
+        refresh_test_semantic_node_id(&mut wrong_local_origin_field, local_index);
+        cases.push((
+            "local symbol with anonymous origin field",
+            wrong_local_origin_field,
+            "wrong canonical origin field",
+        ));
+
+        let mut incompatible_anonymous_origin = protocol("declares")?;
+        let package_id = incompatible_anonymous_origin
+            .iter()
+            .find(|event| event["node"]["kind"] == "package_instance")
+            .expect("package node")["node"]["id"]
+            .as_str()
+            .expect("package ID")
+            .to_owned();
+        let anonymous_index = incompatible_anonymous_origin
+            .iter()
+            .position(|event| event["node"]["kind"] == "symbol")
+            .expect("symbol node");
+        {
+            let node = &mut incompatible_anonymous_origin[anonymous_index]["node"];
+            let source_span = node["properties"]["source_span"].clone();
+            node["properties"]["symbol_kind"] = serde_json::json!("anonymous_function");
+            node["properties"]
+                .as_object_mut()
+                .expect("symbol properties")
+                .remove("resolver_identity");
+            let identity = node["properties"]["canonical_identity"]
+                .as_object_mut()
+                .expect("symbol identity");
+            identity.insert(
+                "symbol_kind".to_owned(),
+                serde_json::json!("anonymous_function"),
+            );
+            identity.insert("identity_kind".to_owned(), serde_json::json!("anonymous"));
+            identity.remove("resolver_identity");
+            identity.insert("generated_from".to_owned(), serde_json::json!(package_id));
+            identity.insert(
+                "relative_path".to_owned(),
+                serde_json::json!("src/index.ts"),
+            );
+            identity.insert("span".to_owned(), source_span);
+        }
+        refresh_test_semantic_node_id(&mut incompatible_anonymous_origin, anonymous_index);
+        cases.push((
+            "anonymous symbol with incompatible origin",
+            incompatible_anonymous_origin,
+            "incompatible kind, package, or language",
+        ));
+
+        let mut unknown_kind = protocol("declares")?;
+        let unknown_index = unknown_kind
+            .iter()
+            .position(|event| event["node"]["kind"] == "symbol")
+            .expect("symbol node");
+        unknown_kind[unknown_index]["node"]["properties"]["symbol_kind"] =
+            serde_json::json!("namespace");
+        unknown_kind[unknown_index]["node"]["properties"]["canonical_identity"]["symbol_kind"] =
+            serde_json::json!("namespace");
+        refresh_test_semantic_node_id(&mut unknown_kind, unknown_index);
+        cases.push((
+            "unsupported semantic kind",
+            unknown_kind,
+            "unsupported symbol",
+        ));
+
+        let mut source_edge = protocol("declares")?;
+        let edge = &mut source_edge
+            .iter_mut()
+            .find(|event| event["event"] == "edge_upsert")
+            .expect("definition edge")["edge"];
+        edge["kind"] = serde_json::json!("imports");
+        edge["phase"] = serde_json::json!("source");
+        edge["evidence"][0]["kind"] = serde_json::json!("source");
+        rehash_test_definition_edge(edge);
+        cases.push((
+            "source edge incident to a definition",
+            source_edge,
+            "must use phase=semantic",
+        ));
+
+        let mut incident_site = protocol("declares")?;
+        let site_source = incident_site
+            .iter()
+            .find(|event| event["node"]["kind"] == "file")
+            .expect("source file")["node"]["id"]
+            .clone();
+        let site_target = incident_site
+            .iter()
+            .find(|event| event["node"]["kind"] == "symbol")
+            .expect("semantic symbol")["node"]["id"]
+            .clone();
+        let edge_index = incident_site
+            .iter()
+            .position(|event| event["event"] == "edge_upsert")
+            .expect("definition edge");
+        incident_site.insert(
+            edge_index,
+            serde_json::json!({
+                "event": "dependency_site",
+                "protocol_version": "1.0",
+                "scan_id": "typescript-gate-scan",
+                "adapter": "web",
+                "adapter_version": env!("CARGO_PKG_VERSION"),
+                "seq": 0,
+                "site": {
+                    "id": format!("site:sha256:{}", "1".repeat(64)),
+                    "source": site_source,
+                    "kind": "import",
+                    "specifier": "./semantic",
+                    "resolution_status": "resolved",
+                    "target_ids": [site_target],
+                    "profile_id": "web:default",
+                    "condition": {"op": "all", "conditions": []},
+                    "precision": "exact",
+                    "evidence": [{
+                        "kind": "source",
+                        "extractor": "typescript-static",
+                        "extractor_version": "1",
+                        "path": "src/index.ts",
+                        "start_line": 1,
+                        "start_column": 1,
+                        "end_line": 1,
+                        "end_column": 9
+                    }]
+                }
+            }),
+        );
+        resequence_test_protocol(&mut incident_site);
+        cases.push((
+            "dependency site incident to a definition",
+            incident_site,
+            "forbidden semantic dependency site",
+        ));
+
+        let mut semantic_source_site = protocol("declares")?;
+        let site_source = semantic_source_site
+            .iter()
+            .find(|event| event["node"]["kind"] == "symbol")
+            .expect("semantic symbol")["node"]["id"]
+            .clone();
+        let site_target = semantic_source_site
+            .iter()
+            .find(|event| event["node"]["kind"] == "file")
+            .expect("source file")["node"]["id"]
+            .clone();
+        let edge_index = semantic_source_site
+            .iter()
+            .position(|event| event["event"] == "edge_upsert")
+            .expect("definition edge");
+        semantic_source_site.insert(
+            edge_index,
+            serde_json::json!({
+                "event": "dependency_site",
+                "protocol_version": "1.0",
+                "scan_id": "typescript-gate-scan",
+                "adapter": "web",
+                "adapter_version": env!("CARGO_PKG_VERSION"),
+                "seq": 0,
+                "site": {
+                    "id": format!("site:sha256:{}", "4".repeat(64)),
+                    "source": site_source,
+                    "kind": "import",
+                    "specifier": "./syntax",
+                    "resolution_status": "resolved",
+                    "target_ids": [site_target],
+                    "profile_id": "web:default",
+                    "condition": {"op": "all", "conditions": []},
+                    "precision": "exact",
+                    "evidence": [{
+                        "kind": "source",
+                        "extractor": "typescript-static",
+                        "extractor_version": "1",
+                        "path": "src/index.ts",
+                        "start_line": 1,
+                        "start_column": 1,
+                        "end_line": 1,
+                        "end_column": 9
+                    }]
+                }
+            }),
+        );
+        resequence_test_protocol(&mut semantic_source_site);
+        cases.push((
+            "dependency site sourced by a definition",
+            semantic_source_site,
+            "forbidden semantic dependency site",
+        ));
+
+        for (name, events, expected_error) in cases {
+            let semantic_ids = events
+                .iter()
+                .filter_map(|event| {
+                    matches!(event["node"]["kind"].as_str(), Some("symbol" | "type"))
+                        .then(|| event["node"]["id"].as_str().map(str::to_owned))
+                        .flatten()
+                })
+                .collect::<BTreeSet<_>>();
+            let output = serialize_test_protocol(events)?;
+            let parsed = parse_events_preserving_prefix(
+                &output,
+                "typescript-gate-scan",
+                "web",
+                &root,
+                64 * 1024,
+                Some(env!("CARGO_PKG_VERSION")),
+                Some(false),
+            );
+            assert_eq!(
+                parsed.failure_kind,
+                Some(WorkerFailureKind::MalformedProtocol),
+                "{name}: {:?}",
+                parsed.error
+            );
+            assert!(parsed.security_violation, "{name}: {:?}", parsed.error);
+            assert!(
+                parsed
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.contains(expected_error)),
+                "{name}: {:?}",
+                parsed.error
+            );
+            assert!(
+                !parsed.events.iter().any(|event| {
+                    matches!(event["node"]["kind"].as_str(), Some("symbol" | "type"))
+                        || event["edge"]["source"]
+                            .as_str()
+                            .is_some_and(|id| semantic_ids.contains(id))
+                        || event["edge"]["target"]
+                            .as_str()
+                            .is_some_and(|id| semantic_ids.contains(id))
+                        || event["site"]["source"]
+                            .as_str()
+                            .is_some_and(|id| semantic_ids.contains(id))
+                        || event["site"]["target_ids"]
+                            .as_array()
+                            .is_some_and(|targets| {
+                                targets.iter().any(|target| {
+                                    target.as_str().is_some_and(|id| semantic_ids.contains(id))
+                                })
+                            })
+                }),
+                "{name}: definition incident survived atomic cleanup"
+            );
+            assert!(parsed.events.iter().any(|event| {
+                event["event"] == "node_upsert" && event["node"]["kind"] == "package_instance"
+            }));
+            assert!(parsed.events.iter().any(|event| {
+                event["event"] == "node_upsert" && event["node"]["kind"] == "file"
+            }));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn web_definition_cleanup_tracks_forward_references_to_rejected_events() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let root = root.path().canonicalize()?;
+
+        let mut forward_definition = test_protocol_values(typescript_definition_protocol(
+            &root,
+            TYPESCRIPT_RELEASE_GATE_PENDING,
+            "declares",
+        )?)?;
+        let semantic_index = forward_definition
+            .iter()
+            .position(|event| event["node"]["kind"] == "symbol")
+            .expect("semantic symbol");
+        forward_definition[semantic_index]["node"]["properties"]["language"] =
+            serde_json::json!("rust");
+        let semantic_event = forward_definition.remove(semantic_index);
+        let semantic_id = semantic_event["node"]["id"].clone();
+        let edge_index = forward_definition
+            .iter()
+            .position(|event| event["event"] == "edge_upsert")
+            .expect("definition edge");
+        let mut forward_edge = forward_definition.remove(edge_index);
+        let forward_site_id = format!("site:sha256:{}", "5".repeat(64));
+        forward_edge["edge"]["kind"] = serde_json::json!("imports");
+        forward_edge["edge"]["phase"] = serde_json::json!("source");
+        forward_edge["edge"]["site_id"] = serde_json::json!(forward_site_id);
+        forward_edge["edge"]["evidence"][0]["kind"] = serde_json::json!("source");
+        rehash_test_definition_edge(&mut forward_edge["edge"]);
+        let file_id = forward_definition
+            .iter()
+            .find(|event| event["node"]["kind"] == "file")
+            .expect("source file")["node"]["id"]
+            .clone();
+        let insert_at = forward_definition
+            .iter()
+            .position(|event| event["node"]["kind"] == "file")
+            .expect("source file")
+            + 1;
+        forward_definition.insert(insert_at, forward_edge);
+        forward_definition.insert(
+            insert_at + 1,
+            serde_json::json!({
+                "event": "dependency_site",
+                "protocol_version": "1.0",
+                "scan_id": "typescript-gate-scan",
+                "adapter": "web",
+                "adapter_version": env!("CARGO_PKG_VERSION"),
+                "seq": 0,
+                "site": {
+                    "id": forward_site_id,
+                    "source": semantic_id,
+                    "kind": "import",
+                    "specifier": "./forward",
+                    "resolution_status": "resolved",
+                    "target_ids": [file_id],
+                    "profile_id": "web:default",
+                    "condition": {"op": "all", "conditions": []},
+                    "precision": "exact",
+                    "evidence": [{
+                        "kind": "source",
+                        "extractor": "typescript-static",
+                        "extractor_version": "1",
+                        "path": "src/index.ts",
+                        "start_line": 1,
+                        "start_column": 1,
+                        "end_line": 1,
+                        "end_column": 9
+                    }]
+                }
+            }),
+        );
+        forward_definition.insert(insert_at + 2, semantic_event);
+        resequence_test_protocol(&mut forward_definition);
+        let parsed = parse_events_preserving_prefix(
+            &serialize_test_protocol(forward_definition)?,
+            "typescript-gate-scan",
+            "web",
+            &root,
+            64 * 1024,
+            Some(env!("CARGO_PKG_VERSION")),
+            Some(false),
+        );
+        assert_eq!(
+            parsed.failure_kind,
+            Some(WorkerFailureKind::MalformedProtocol)
+        );
+        assert!(parsed.security_violation, "{:?}", parsed.error);
+        assert!(
+            parsed
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("language=typescript or javascript")),
+            "{:?}",
+            parsed.error
+        );
+        assert!(!parsed.events.iter().any(|event| {
+            event["node"]["id"] == semantic_id
+                || event["edge"]["site_id"] == forward_site_id
+                || event["site"]["id"] == forward_site_id
+        }));
+        assert!(
+            parsed
+                .events
+                .iter()
+                .any(|event| event["node"]["kind"] == "package_instance")
+        );
+        assert!(
+            parsed
+                .events
+                .iter()
+                .any(|event| event["node"]["kind"] == "file")
+        );
+
+        let mut rejected_site = test_protocol_values(typescript_definition_protocol(
+            &root,
+            TYPESCRIPT_RELEASE_GATE_PENDING,
+            "declares",
+        )?)?;
+        let mut linked_edge = rejected_site
+            .iter()
+            .find(|event| event["event"] == "edge_upsert")
+            .expect("definition edge")
+            .clone();
+        rejected_site.retain(|event| {
+            !matches!(event["node"]["kind"].as_str(), Some("symbol" | "type"))
+                && event["event"] != "edge_upsert"
+        });
+        sync_test_semantic_counts(&mut rejected_site);
+        let package_id = rejected_site
+            .iter()
+            .find(|event| event["node"]["kind"] == "package_instance")
+            .expect("package node")["node"]["id"]
+            .clone();
+        let file_id = rejected_site
+            .iter()
+            .find(|event| event["node"]["kind"] == "file")
+            .expect("source file")["node"]["id"]
+            .clone();
+        let rejected_site_id = format!("site:sha256:{}", "6".repeat(64));
+        linked_edge["edge"]["source"] = package_id.clone();
+        linked_edge["edge"]["target"] = file_id.clone();
+        linked_edge["edge"]["kind"] = serde_json::json!("imports");
+        linked_edge["edge"]["phase"] = serde_json::json!("source");
+        linked_edge["edge"]["site_id"] = serde_json::json!(rejected_site_id);
+        linked_edge["edge"]["evidence"][0]["kind"] = serde_json::json!("source");
+        rehash_test_definition_edge(&mut linked_edge["edge"]);
+        let insert_at = rejected_site
+            .iter()
+            .position(|event| event["node"]["kind"] == "file")
+            .expect("source file")
+            + 1;
+        rejected_site.insert(insert_at, linked_edge);
+        rejected_site.insert(
+            insert_at + 1,
+            serde_json::json!({
+                "event": "dependency_site",
+                "protocol_version": "1.0",
+                "scan_id": "typescript-gate-scan",
+                "adapter": "web",
+                "adapter_version": env!("CARGO_PKG_VERSION"),
+                "seq": 0,
+                "site": {
+                    "id": rejected_site_id,
+                    "source": file_id,
+                    "kind": "call",
+                    "specifier": "forbidden",
+                    "resolution_status": "resolved",
+                    "target_ids": [package_id],
+                    "profile_id": "web:default",
+                    "condition": {"op": "all", "conditions": []},
+                    "precision": "exact",
+                    "evidence": [{
+                        "kind": "source",
+                        "extractor": "typescript-static",
+                        "extractor_version": "1",
+                        "path": "src/index.ts",
+                        "start_line": 1,
+                        "start_column": 1,
+                        "end_line": 1,
+                        "end_column": 9
+                    }]
+                }
+            }),
+        );
+        resequence_test_protocol(&mut rejected_site);
+        let mut metadata_invalid_site = rejected_site.clone();
+        let invalid_site = metadata_invalid_site
+            .iter_mut()
+            .find(|event| event["event"] == "dependency_site")
+            .expect("forward dependency site");
+        invalid_site["adapter_version"] = serde_json::json!("spoofed-version");
+        invalid_site["site"]["kind"] = serde_json::json!("import");
+        let parsed = parse_events_preserving_prefix(
+            &serialize_test_protocol(rejected_site)?,
+            "typescript-gate-scan",
+            "web",
+            &root,
+            64 * 1024,
+            Some(env!("CARGO_PKG_VERSION")),
+            Some(false),
+        );
+        assert_eq!(
+            parsed.failure_kind,
+            Some(WorkerFailureKind::MalformedProtocol)
+        );
+        assert!(parsed.security_violation, "{:?}", parsed.error);
+        assert!(!parsed.events.iter().any(|event| {
+            event["edge"]["site_id"] == rejected_site_id || event["site"]["id"] == rejected_site_id
+        }));
+        assert!(
+            parsed
+                .events
+                .iter()
+                .any(|event| event["node"]["kind"] == "package_instance")
+        );
+        assert!(
+            parsed
+                .events
+                .iter()
+                .any(|event| event["node"]["kind"] == "file")
+        );
+
+        let parsed = parse_events_preserving_prefix(
+            &serialize_test_protocol(metadata_invalid_site)?,
+            "typescript-gate-scan",
+            "web",
+            &root,
+            64 * 1024,
+            Some(env!("CARGO_PKG_VERSION")),
+            Some(false),
+        );
+        assert_eq!(
+            parsed.failure_kind,
+            Some(WorkerFailureKind::MalformedProtocol)
+        );
+        assert!(parsed.security_violation, "{:?}", parsed.error);
+        assert!(
+            parsed
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("adapter_version mismatch")),
+            "{:?}",
+            parsed.error
+        );
+        assert!(!parsed.events.iter().any(|event| {
+            event["edge"]["site_id"] == rejected_site_id || event["site"]["id"] == rejected_site_id
+        }));
+        assert!(
+            parsed
+                .events
+                .iter()
+                .any(|event| event["node"]["kind"] == "package_instance")
+        );
+        assert!(
+            parsed
+                .events
+                .iter()
+                .any(|event| event["node"]["kind"] == "file")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn web_definition_delta_cleanup_closes_over_incident_edge_sites() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let root = root.path().canonicalize()?;
+        let mut events = test_protocol_values(typescript_definition_protocol(
+            &root,
+            TYPESCRIPT_RELEASE_GATE_PENDING,
+            "declares",
+        )?)?;
+        let semantic_id = events
+            .iter()
+            .find(|event| event["node"]["kind"] == "symbol")
+            .expect("semantic symbol")["node"]["id"]
+            .clone();
+        let file_id = events
+            .iter()
+            .find(|event| event["node"]["kind"] == "file")
+            .expect("source file")["node"]["id"]
+            .clone();
+        let package_id = events
+            .iter()
+            .find(|event| event["node"]["kind"] == "package_instance")
+            .expect("package node")["node"]["id"]
+            .clone();
+        let site_id = format!("site:sha256:{}", "2".repeat(64));
+        let edge_index = events
+            .iter()
+            .position(|event| event["event"] == "edge_upsert")
+            .expect("definition edge");
+        events[edge_index]["edge"]["site_id"] = serde_json::json!(site_id);
+
+        let mut linked_syntax_edge = events[edge_index].clone();
+        linked_syntax_edge["edge"]["id"] =
+            serde_json::json!(format!("edge:sha256:{}", "3".repeat(64)));
+        linked_syntax_edge["edge"]["source"] = package_id.clone();
+        linked_syntax_edge["edge"]["target"] = file_id.clone();
+        linked_syntax_edge["edge"]["kind"] = serde_json::json!("imports");
+        linked_syntax_edge["edge"]["phase"] = serde_json::json!("source");
+        linked_syntax_edge["edge"]["evidence"][0]["kind"] = serde_json::json!("source");
+        let missing_site_id = format!("site:sha256:{}", "7".repeat(64));
+        let mut missing_site_edge = linked_syntax_edge.clone();
+        missing_site_edge["edge"]["id"] =
+            serde_json::json!(format!("edge:sha256:{}", "8".repeat(64)));
+        missing_site_edge["edge"]["site_id"] = serde_json::json!(missing_site_id);
+        events.insert(edge_index + 1, linked_syntax_edge);
+        events.insert(edge_index + 2, missing_site_edge);
+        events.insert(
+            edge_index,
+            serde_json::json!({
+                "event": "dependency_site",
+                "protocol_version": "1.0",
+                "scan_id": "typescript-gate-scan",
+                "adapter": "web",
+                "adapter_version": env!("CARGO_PKG_VERSION"),
+                "seq": 0,
+                "site": {
+                    "id": site_id,
+                    "source": file_id,
+                    "kind": "import",
+                    "specifier": "./syntax-only",
+                    "resolution_status": "resolved",
+                    "target_ids": [package_id],
+                    "profile_id": "web:default",
+                    "condition": {"op": "all", "conditions": []},
+                    "precision": "exact",
+                    "evidence": [{
+                        "kind": "source",
+                        "extractor": "typescript-static",
+                        "extractor_version": "1",
+                        "path": "src/index.ts",
+                        "start_line": 1,
+                        "start_column": 1,
+                        "end_line": 1,
+                        "end_column": 9
+                    }]
+                }
+            }),
+        );
+        let mut typed = events
+            .into_iter()
+            .map(serde_json::from_value::<ProtocolEvent>)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        discard_web_definition_delta(&mut typed, &BTreeSet::new(), &BTreeSet::new());
+
+        let values = typed
+            .into_iter()
+            .map(serde_json::to_value)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        assert!(!values.iter().any(|event| {
+            event["node"]["id"] == semantic_id
+                || event["site"]["id"] == site_id
+                || event["edge"]["site_id"] == site_id
+                || event["edge"]["site_id"] == missing_site_id
+        }));
+        assert!(values.iter().any(|event| event["node"]["id"] == file_id));
+        assert!(values.iter().any(|event| event["node"]["id"] == package_id));
+        Ok(())
+    }
+
+    #[test]
+    fn web_definition_graph_accepts_canonical_generic_type_argument_shapes() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let root = root.path().canonicalize()?;
+        let template = test_protocol_values(typescript_definition_protocol(
+            &root,
+            TYPESCRIPT_RELEASE_GATE_PENDING,
+            "instantiates",
+        )?)?;
+        let origin_resolver = template
+            .iter()
+            .find(|event| event["node"]["properties"]["type_kind"] == "generic_instance")
+            .expect("generic instance")["node"]["properties"]["generic_origin"]
+            .as_str()
+            .expect("generic origin resolver")
+            .to_owned();
+        let descriptors = vec![
+            (
+                "string literal",
+                serde_json::json!([{
+                    "kind": "literal",
+                    "value_kind": "string",
+                    "value": "a,b",
+                }]),
+            ),
+            (
+                "small exponent number",
+                serde_json::json!([{
+                    "kind": "literal",
+                    "value_kind": "number",
+                    "value": "1e-7",
+                }]),
+            ),
+            (
+                "large exponent number",
+                serde_json::json!([{
+                    "kind": "literal",
+                    "value_kind": "number",
+                    "value": "1e+21",
+                }]),
+            ),
+            (
+                "canonical union",
+                serde_json::json!([{
+                    "kind": "union",
+                    "members": [
+                        {"kind": "intrinsic", "name": "number"},
+                        {"kind": "intrinsic", "name": "string"},
+                    ],
+                }]),
+            ),
+            (
+                "type parameter",
+                serde_json::json!([{
+                    "kind": "type_parameter",
+                    "owner": origin_resolver,
+                    "index": 0,
+                    "name": "T",
+                }]),
+            ),
+            (
+                "generic application",
+                serde_json::json!([{
+                    "kind": "application",
+                    "target": {
+                        "kind": "definition",
+                        "resolver_identity": origin_resolver,
+                    },
+                    "type_arguments": [
+                        {"kind": "intrinsic", "name": "string"},
+                    ],
+                }]),
+            ),
+        ];
+
+        for (name, descriptor) in descriptors {
+            let mut events = test_protocol_values(typescript_definition_protocol(
+                &root,
+                TYPESCRIPT_RELEASE_GATE_PENDING,
+                "instantiates",
+            )?)?;
+            rewrite_test_generic_instance(&mut events, descriptor, None);
+            let output = serialize_test_protocol(events)?;
+            let parsed = parse_events_preserving_prefix(
+                &output,
+                "typescript-gate-scan",
+                "web",
+                &root,
+                64 * 1024,
+                Some(env!("CARGO_PKG_VERSION")),
+                Some(false),
+            );
+            assert_eq!(parsed.error, None, "{name}: {:?}", parsed.error);
+            assert_eq!(parsed.failure_kind, None, "{name}");
+            assert!(!parsed.security_violation, "{name}");
+            assert!(
+                parsed.events.iter().any(|event| {
+                    event["node"]["properties"]["type_kind"] == "generic_instance"
+                })
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn web_definition_failure_profiles_preserve_the_syntax_delta() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let root = root.path().canonicalize()?;
+
+        for (project, typechecker, definition) in [
+            ("ready", "definition-graph-discarded", "failed"),
+            ("failed", "failed", "failed"),
+        ] {
+            let output =
+                typescript_definition_protocol(&root, TYPESCRIPT_RELEASE_GATE_PENDING, "declares")?;
+            let mut events = String::from_utf8(output)?
+                .lines()
+                .map(serde_json::from_str::<Value>)
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            events.retain(|event| {
+                !matches!(event["node"]["kind"].as_str(), Some("symbol" | "type"))
+                    && event["edge"]["phase"] != "semantic"
+            });
+            events[1]["profile"]["properties"][TYPESCRIPT_PROJECT_STATUS_PROPERTY] =
+                serde_json::json!(project);
+            events[1]["profile"]["properties"][TYPESCRIPT_TYPECHECKER_STATUS_PROPERTY] =
+                serde_json::json!(typechecker);
+            events[1]["profile"]["properties"][TYPESCRIPT_DEFINITION_STATUS_PROPERTY] =
+                serde_json::json!(definition);
+            events[1]["profile"]["properties"]["typescript_semantic_node_count"] =
+                serde_json::json!("0");
+            events[1]["profile"]["properties"]["typescript_semantic_relation_count"] =
+                serde_json::json!("0");
+            for (index, event) in events.iter_mut().enumerate() {
+                event["seq"] = serde_json::json!(index + 1);
+            }
+            let mut protocol = Vec::new();
+            for event in events {
+                serde_json::to_writer(&mut protocol, &event)?;
+                protocol.push(b'\n');
+            }
+
+            let parsed = parse_events_preserving_prefix(
+                &protocol,
+                "typescript-gate-scan",
+                "web",
+                &root,
+                16 * 1024,
+                Some(env!("CARGO_PKG_VERSION")),
+                Some(false),
+            );
+            assert_eq!(
+                parsed.error, None,
+                "state={project}/{typechecker}/{definition}"
+            );
+            assert_eq!(parsed.failure_kind, None);
+            assert!(!parsed.security_violation);
+            assert!(parsed.events.iter().any(|event| {
+                event["event"] == "node_upsert" && event["node"]["kind"] == "package_instance"
+            }));
+            assert!(parsed.events.iter().any(|event| {
+                event["event"] == "node_upsert" && event["node"]["kind"] == "file"
+            }));
+            assert!(!parsed.events.iter().any(|event| {
+                matches!(event["node"]["kind"].as_str(), Some("symbol" | "type"))
+                    || event["edge"]["phase"] == "semantic"
+            }));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn web_definition_profile_rejects_inconsistent_state_and_language() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let root = root.path().canonicalize()?;
+
+        for (name, property, value) in [
+            (
+                "inconsistent state",
+                TYPESCRIPT_TYPECHECKER_STATUS_PROPERTY,
+                "failed",
+            ),
+            ("wrong profile language", "language", "typescript"),
         ] {
             let output = typescript_gate_protocol(&root, TYPESCRIPT_RELEASE_GATE_PENDING)?;
             let mut events = String::from_utf8(output)?
                 .lines()
                 .map(serde_json::from_str::<Value>)
                 .collect::<std::result::Result<Vec<_>, _>>()?;
-            events[1]["profile"]["properties"]
-                .as_object_mut()
-                .context("profile properties must be an object")?
-                .remove(property);
-            let mut spoofed = Vec::new();
-            for event in events {
-                serde_json::to_writer(&mut spoofed, &event)?;
-                spoofed.push(b'\n');
+            if property == "language" {
+                events[1]["profile"]["language"] = serde_json::json!(value);
+            } else {
+                events[1]["profile"]["properties"][property] = serde_json::json!(value);
             }
+            let mut protocol = Vec::new();
+            for event in events {
+                serde_json::to_writer(&mut protocol, &event)?;
+                protocol.push(b'\n');
+            }
+
             let parsed = parse_events_preserving_prefix(
-                &spoofed,
+                &protocol,
                 "typescript-gate-scan",
                 "web",
                 &root,
@@ -3247,96 +6677,36 @@ mod tests {
                 Some(env!("CARGO_PKG_VERSION")),
                 Some(false),
             );
-            assert_eq!(parsed.events.len(), 1, "{property}: {:?}", parsed.error);
+            assert_eq!(parsed.events.len(), 1, "{name}: {:?}", parsed.error);
             assert_eq!(
                 parsed.failure_kind,
-                Some(WorkerFailureKind::MalformedProtocol)
-            );
-            assert!(parsed.security_violation);
-            assert!(
-                parsed
-                    .error
-                    .as_deref()
-                    .is_some_and(|error| error.contains(property)),
-                "{property}: {:?}",
+                Some(WorkerFailureKind::MalformedProtocol),
+                "{name}: {:?}",
                 parsed.error
             );
+            assert!(parsed.security_violation, "{name}: {:?}", parsed.error);
         }
         Ok(())
     }
 
     #[test]
-    fn web_typechecker_scaffold_cannot_emit_semantic_nodes() -> Result<()> {
-        let root = tempfile::tempdir()?;
-        let root = root.path().canonicalize()?;
-        for insert_at in [1_usize, 2] {
-            let output = typescript_gate_protocol(&root, TYPESCRIPT_RELEASE_GATE_PENDING)?;
-            let mut events = String::from_utf8(output)?
-                .lines()
-                .map(serde_json::from_str::<Value>)
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            for event in events.iter_mut().skip(insert_at) {
-                event["seq"] = serde_json::json!(event["seq"].as_u64().unwrap_or(0) + 1);
-            }
-            events.insert(
-                insert_at,
-                serde_json::json!({
-                    "event": "node_upsert",
-                    "protocol_version": "1.0",
-                    "scan_id": "typescript-gate-scan",
-                    "adapter": "web",
-                    "adapter_version": env!("CARGO_PKG_VERSION"),
-                    "seq": insert_at + 1,
-                    "node": {
-                        "id": "symbol:sha256:scaffold-must-not-emit",
-                        "kind": "symbol",
-                        "locator": "symbol://forbidden",
-                        "properties": {},
-                    },
-                }),
-            );
-            let mut spoofed = Vec::new();
-            for event in events {
-                serde_json::to_writer(&mut spoofed, &event)?;
-                spoofed.push(b'\n');
-            }
-            let parsed = parse_events_preserving_prefix(
-                &spoofed,
-                "typescript-gate-scan",
-                "web",
-                &root,
-                4096,
-                Some(env!("CARGO_PKG_VERSION")),
-                Some(false),
-            );
-            assert_eq!(parsed.events.len(), insert_at);
-            assert_eq!(
-                parsed.failure_kind,
-                Some(WorkerFailureKind::MalformedProtocol)
-            );
-            assert!(parsed.security_violation);
-            assert!(
-                parsed
-                    .error
-                    .as_deref()
-                    .is_some_and(|error| error.contains("semantic node"))
-            );
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn web_typechecker_scaffold_cannot_claim_semantic_complete() -> Result<()> {
+    fn web_definition_graph_cannot_claim_semantic_complete() -> Result<()> {
         let root = tempfile::tempdir()?;
         let root = root.path().canonicalize()?;
         let output = profile_protocol(
             &root,
-            "web-scaffold-invariant-scan",
+            "web-definition-invariant-scan",
             "web",
             serde_json::json!({
                 TYPESCRIPT_RELEASE_GATE_PROPERTY: TYPESCRIPT_RELEASE_GATE_PENDING,
-                "typescript_analysis_mode": "semantic-scaffold",
-                "typescript_semantic_graph_emission": "disabled",
+                TYPESCRIPT_ANALYSIS_MODE_PROPERTY: TYPESCRIPT_ANALYSIS_MODE_DEFINITION_GRAPH,
+                TYPESCRIPT_SEMANTIC_EMISSION_PROPERTY: TYPESCRIPT_SEMANTIC_EMISSION_DEFINITION_GRAPH_V1,
+                TYPESCRIPT_PROJECT_STATUS_PROPERTY: "ready",
+                TYPESCRIPT_TYPECHECKER_STATUS_PROPERTY: "definition-graph-emitted",
+                TYPESCRIPT_DEFINITION_STATUS_PROPERTY: "ready",
+                "typescript_semantic_node_count": "0",
+                "typescript_semantic_relation_count": "0",
+                "typescript_semantic_issue_count": "0",
             }),
         )?;
         let mut events = String::from_utf8(output)?
@@ -3359,7 +6729,7 @@ mod tests {
         }
         let parsed = parse_events_preserving_prefix(
             &spoofed,
-            "web-scaffold-invariant-scan",
+            "web-definition-invariant-scan",
             "web",
             &root,
             4096,

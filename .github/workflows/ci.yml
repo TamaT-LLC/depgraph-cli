@@ -89,10 +89,34 @@ jobs:
           target/debug/depgraph --store "$tmp/one.db" scan workers/web/test/fixtures/polyglot --json > "$tmp/scan.json"
           jq -e '.status == "completed" and .coverage.project_code_executed == false' "$tmp/scan.json"
           target/debug/depgraph --store "$tmp/one.db" export --format json > "$tmp/one.json"
+          jq -e '.graph as $graph
+            | [$graph.edges[] | select(.phase == "semantic")] as $semantic_edges
+            | [$graph.nodes[] | select(.kind == "symbol" or .kind == "type")] as $semantic_nodes
+            | ($graph.profiles | any(.properties.typescript_analysis_mode == "semantic-definition-graph"
+              and .properties.typescript_project_model_status == "ready"
+              and .properties.typescript_typechecker_status == "definition-graph-emitted"
+              and .properties.typescript_definition_graph_status == "ready"
+              and .properties.typescript_semantic_graph_emission == "definition-graph-v1"
+              and .properties.typescript_semantic_issue_count == "0"
+              and (.properties.typescript_semantic_node_count | tonumber) == ($semantic_nodes | length)
+              and (.properties.typescript_semantic_relation_count | tonumber) == ($semantic_edges | length)))
+            and ($graph.nodes | any(.kind == "symbol"))
+            and ($graph.nodes | any(.kind == "type" and .properties.type_kind == "generic_instance"))
+            and ([$semantic_edges[].kind] | unique | sort
+              == ["declares", "extends", "implements", "instantiates"])
+            and ($semantic_edges | all(.site_id == null and .resolution_status == "resolved" and .precision == "exact"))
+            and ($semantic_edges | all(. as $edge | $graph.evidence | any(
+              .owner_type == "edge" and .owner_id == $edge.id and .kind == "semantic"
+              and .extractor == "typescript-native-typechecker" and .extractor_version == "7.0.2")))
+            and ($graph.coverage.completeness | index("semantic-complete") | not)
+          ' "$tmp/one.json"
+          target/debug/depgraph --store "$tmp/one.db" deps 'type:definition:["package","npm:workspace:@fixture/shared@1.0.0#apps/shared","definition:[\"module\",\"type\",\"apps/shared/src/semantic.ts\",[\"SharedStringCollection\"]]"]' --json > "$tmp/deps.json"
+          jq -e '([.data.steps[].edge.kind] | unique | sort) == ["extends", "implements", "instantiates"]
+            and ([.data.steps[]] | all(.edge.phase == "semantic" and .evidence[0].kind == "semantic"))' "$tmp/deps.json"
           target/debug/depgraph --store "$tmp/two.db" scan workers/web/test/fixtures/polyglot --json > /dev/null
           target/debug/depgraph --store "$tmp/two.db" export --format json > "$tmp/two.json"
-          jq -S '.graph | {nodes, sites, edges, coverage}' "$tmp/one.json" > "$tmp/one.graph.json"
-          jq -S '.graph | {nodes, sites, edges, coverage}' "$tmp/two.json" > "$tmp/two.graph.json"
+          jq -S '.graph' "$tmp/one.json" > "$tmp/one.graph.json"
+          jq -S '.graph' "$tmp/two.json" > "$tmp/two.graph.json"
           diff -u "$tmp/one.graph.json" "$tmp/two.graph.json"
           test ! -e workers/web/test/fixtures/polyglot/apps/next-app/NEXT_CONFIG_EXECUTED
           test ! -e workers/web/test/fixtures/polyglot/apps/astro-app/ASTRO_CONFIG_EXECUTED
@@ -139,7 +163,7 @@ jobs:
       - run: target\debug\depgraph-rust-worker.exe --version
       - run: workers\go\bin\depgraph-go-worker.exe --version
       - run: node workers\web\dist\worker.mjs --version
-      - name: Web TypeChecker scaffold smoke
+      - name: Web TypeChecker definition graph smoke
         shell: pwsh
         run: |
           $lines = node workers\web\dist\worker.mjs --root workers\web\test\fixtures\polyglot --scan-id windows-web-typechecker
@@ -147,12 +171,21 @@ jobs:
           $events = @($lines | ForEach-Object { $_ | ConvertFrom-Json })
           $profile = ($events | Where-Object event -eq 'profile_declared' | Select-Object -First 1).profile
           if ($profile.properties.typescript_project_model_status -ne 'ready') { throw 'TypeScript project model was not ready' }
-          if ($profile.properties.typescript_typechecker_status -ne 'invoked-no-graph') { throw 'TypeChecker smoke did not run' }
+          if ($profile.properties.typescript_typechecker_status -ne 'definition-graph-emitted') { throw 'TypeChecker definition graph did not run' }
+          if ($profile.properties.typescript_definition_graph_status -ne 'ready') { throw 'TypeChecker definition graph was not ready' }
+          if ($profile.properties.typescript_semantic_issue_count -ne '0') { throw 'TypeChecker definition graph reported semantic issues' }
           if ($profile.properties.typescript_release_gate -ne 'release-gate-pending') { throw 'Direct worker spoofed release attestation' }
-          if ($profile.properties.typescript_semantic_graph_emission -ne 'disabled') { throw 'Semantic graph scaffold gate changed unexpectedly' }
-          if (@($events | Where-Object { $_.edge.phase -eq 'semantic' }).Count -ne 0) { throw 'Scaffold emitted semantic edges' }
+          if ($profile.properties.typescript_semantic_graph_emission -ne 'definition-graph-v1') { throw 'Definition graph capability changed unexpectedly' }
+          $semanticNodes = @($events | Where-Object { $_.node.kind -eq 'symbol' -or $_.node.kind -eq 'type' })
+          $semanticEdges = @($events | Where-Object { $_.edge.phase -eq 'semantic' })
+          if ($semanticNodes.Count -eq 0) { throw 'Definition graph emitted no semantic nodes' }
+          if ($semanticEdges.Count -eq 0) { throw 'Definition graph emitted no semantic edges' }
+          if ([int]$profile.properties.typescript_semantic_node_count -ne $semanticNodes.Count) { throw 'Semantic node count drifted' }
+          if ([int]$profile.properties.typescript_semantic_relation_count -ne $semanticEdges.Count) { throw 'Semantic relation count drifted' }
+          $kinds = @($semanticEdges | ForEach-Object { $_.edge.kind } | Sort-Object -Unique)
+          if (($kinds -join ',') -ne 'declares,extends,implements,instantiates') { throw "Definition relation kinds drifted: $($kinds -join ',')" }
           $completed = ($events | Where-Object event -eq 'scan_completed' | Select-Object -Last 1).coverage
-          if ($completed.completeness -contains 'semantic-complete') { throw 'Scaffold claimed semantic completeness' }
+          if ($completed.completeness -contains 'semantic-complete') { throw 'Definition-only graph claimed semantic completeness' }
           if (Test-Path workers\web\test\fixtures\polyglot\apps\next-app\NEXT_CONFIG_EXECUTED) { throw 'Next config executed' }
           if (Test-Path workers\web\test\fixtures\polyglot\apps\astro-app\ASTRO_CONFIG_EXECUTED) { throw 'Astro config executed' }
       - run: cargo xtask go-semantic-e2e

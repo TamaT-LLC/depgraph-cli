@@ -4,7 +4,14 @@ import { normalizeRelative, readJson, readUtf8, WEB_SOURCE_EXTENSIONS, type File
 import { compareById, stableId } from "./ids";
 import { extractDependencies, ModuleResolver, type RawDependency, type Resolution, type ResolvedTarget } from "./imports";
 import { discoverRoutes, type RouteEntry } from "./routes";
-import { analyzeTypeScriptProject, TYPESCRIPT_SOURCE_EXTENSIONS } from "./typescript-compiler";
+import { mergeTypeScriptDefinitionDelta, type TypeScriptDefinitionDelta } from "./semantic-delta";
+import { analyzeTypeScriptProject, TYPESCRIPT_COMPILER_VERSION, TYPESCRIPT_SOURCE_EXTENSIONS } from "./typescript-compiler";
+import type {
+  TypeScriptRawDefinition,
+  TypeScriptRawDefinitionDelta,
+  TypeScriptRawDefinitionEndpoint,
+  TypeScriptRawTypeArgumentDescriptor,
+} from "./typescript-semantic";
 import {
   ADAPTER_VERSION,
   PROFILE_CONFIG_ISSUE,
@@ -18,6 +25,7 @@ import {
   type FileCoverage,
   type GraphEdge,
   type GraphNode,
+  type JsonValue,
   type ScanModel,
 } from "./types";
 import {
@@ -32,11 +40,53 @@ import {
 
 const PARSED_EXTENSIONS = new Set([".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs", ".astro"]);
 const SOURCE_READ_CONCURRENCY = 64;
+const MAX_SEMANTIC_OWNERSHIP_DEPTH = 512;
+const MAX_SEMANTIC_TYPE_DESCRIPTOR_DEPTH = 64;
+const MAX_SEMANTIC_TYPE_DESCRIPTOR_NODES = 2_048;
+const MAX_SEMANTIC_RESOLVER_CHARS = 4_096;
+const MAX_SEMANTIC_TYPE_DESCRIPTOR_CHARS = 2_048;
+
+type SourceSpan = {
+  start_line: number;
+  start_column: number;
+  end_line: number;
+  end_column: number;
+};
+
+function sourceLineStarts(source: string): number[] {
+  const starts = [0];
+  for (let index = 0; index < source.length; index += 1) {
+    if (source.charCodeAt(index) === 10) starts.push(index + 1);
+  }
+  return starts;
+}
+
+function sourcePosition(starts: readonly number[], offset: number): { line: number; column: number } {
+  let low = 0;
+  let high = starts.length;
+  while (low + 1 < high) {
+    const middle = low + Math.floor((high - low) / 2);
+    if (starts[middle]! <= offset) low = middle;
+    else high = middle;
+  }
+  return { line: low + 1, column: offset - starts[low]! + 1 };
+}
+
+function sourceSpan(starts: readonly number[], startOffset: number, endOffset: number): SourceSpan {
+  const start = sourcePosition(starts, startOffset);
+  const end = sourcePosition(starts, endOffset);
+  return {
+    start_line: start.line,
+    start_column: start.column,
+    end_line: end.line,
+    end_column: end.column,
+  };
+}
 
 class GraphBuilder {
-  readonly nodes = new Map<string, GraphNode>();
+  nodes = new Map<string, GraphNode>();
   readonly sites = new Map<string, DependencySite>();
-  readonly edges = new Map<string, GraphEdge>();
+  edges = new Map<string, GraphEdge>();
   readonly diagnostics = new Map<string, Diagnostic>();
   readonly files = new Map<string, FileCoverage>();
   readonly #fileNodesByPath = new Map<string, GraphNode>();
@@ -77,6 +127,314 @@ class GraphBuilder {
       .filter((item, index, array) => array.findIndex((candidate) => JSON.stringify(candidate) === JSON.stringify(item)) === index)
       .sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right)));
     this.edges.set(edge.id, { ...existing, evidence });
+  }
+
+  mergeTypeScriptDefinitions(
+    rawDelta: Pick<TypeScriptRawDefinitionDelta, "definitions" | "relations">,
+    sources: ReadonlyMap<string, string>,
+  ): { nodes: number; relations: number } {
+    const definitions = new Map<string, TypeScriptRawDefinition>();
+    const rawResolvers = new Map<string, string>();
+    for (const definition of rawDelta.definitions) {
+      if (definitions.has(definition.key)) throw new Error(`duplicate TypeScript semantic definition key ${definition.key}`);
+      definitions.set(definition.key, definition);
+      if (definition.resolverIdentity !== null) {
+        const existing = rawResolvers.get(definition.resolverIdentity);
+        if (existing !== undefined && existing !== definition.key) {
+          throw new Error("duplicate TypeScript semantic canonical resolver");
+        }
+        rawResolvers.set(definition.resolverIdentity, definition.key);
+      }
+    }
+    const materialized = new Map<string, GraphNode>();
+    const materializedIds = new Map<string, string>();
+    const visiting = new Set<string>();
+    const lineStarts = new Map<string, number[]>();
+    const startsFor = (relativePath: string): number[] => {
+      const existing = lineStarts.get(relativePath);
+      if (existing) return existing;
+      const source = sources.get(relativePath);
+      if (source === undefined) throw new Error(`TypeScript semantic definition references missing source ${relativePath}`);
+      const starts = sourceLineStarts(source);
+      lineStarts.set(relativePath, starts);
+      return starts;
+    };
+    const existingFile = (relativePath: string): GraphNode => {
+      const node = this.#fileNodesByPath.get(path.resolve(this.#workspace.root, relativePath));
+      if (!node) throw new Error(`TypeScript semantic definition references unknown file ${relativePath}`);
+      return node;
+    };
+    const identityPackage = (
+      definition: TypeScriptRawDefinition,
+      seen = new Set<string>(),
+      depth = 0,
+    ): PackageRecord => {
+      if (depth > MAX_SEMANTIC_OWNERSHIP_DEPTH || !seen.add(definition.key)) {
+        throw new Error("TypeScript generic origin cycle or depth limit exceeded");
+      }
+      if (definition.genericOrigin !== undefined) {
+        const origin = definitions.get(definition.genericOrigin);
+        if (!origin) throw new Error(`generic TypeScript definition ${definition.key} has no origin`);
+        return identityPackage(origin, seen, depth + 1);
+      }
+      return owningPackage(this.#workspace, path.join(this.#workspace.root, definition.relativePath));
+    };
+    const canonicalResolver = (
+      definition: TypeScriptRawDefinition,
+      active = new Set<string>(),
+      depth = 0,
+    ): string => {
+      if (depth > MAX_SEMANTIC_OWNERSHIP_DEPTH || active.has(definition.key)) {
+        throw new Error("TypeScript canonical resolver cycle or depth limit exceeded");
+      }
+      active.add(definition.key);
+      try {
+        if (definition.resolverIdentity === null) throw new Error(`named TypeScript definition ${definition.key} has no resolver identity`);
+        let resolver: string;
+        if (definition.genericOrigin !== undefined) {
+          const origin = definitions.get(definition.genericOrigin);
+          if (!origin) throw new Error(`generic TypeScript definition ${definition.key} has no origin`);
+          resolver = `generic:${JSON.stringify([
+            canonicalResolver(origin, active, depth + 1),
+            (definition.typeArguments ?? []).map((argument) => canonicalTypeArgument(argument, {
+              nodes: 0,
+              activeResolvers: active,
+            })),
+          ])}`;
+        } else {
+          const owner = identityPackage(definition);
+          resolver = `definition:${JSON.stringify(["package", owner.locator, definition.resolverIdentity])}`;
+        }
+        if (resolver.length > MAX_SEMANTIC_RESOLVER_CHARS) {
+          throw new Error("TypeScript canonical resolver exceeds its UTF-16 length limit");
+        }
+        return resolver;
+      } finally {
+        active.delete(definition.key);
+      }
+    };
+    const canonicalDefinitionReference = (key: string, activeResolvers = new Set<string>()): string => {
+      const definition = definitions.get(key);
+      if (!definition) throw new Error(`TypeScript type argument references missing definition ${key}`);
+      return definition.resolverIdentity === null
+        ? `node:${materializeDefinition(key).id}`
+        : canonicalResolver(definition, activeResolvers);
+    };
+    const canonicalTypeArgument = (
+      descriptor: TypeScriptRawTypeArgumentDescriptor,
+      budget: { nodes: number; activeResolvers: Set<string> },
+      depth = 0,
+    ): JsonValue => {
+      budget.nodes += 1;
+      if (
+        depth > MAX_SEMANTIC_TYPE_DESCRIPTOR_DEPTH
+        || budget.nodes > MAX_SEMANTIC_TYPE_DESCRIPTOR_NODES
+      ) throw new Error("TypeScript semantic type descriptor depth or node limit exceeded");
+      let result: JsonValue;
+      switch (descriptor.kind) {
+        case "intrinsic":
+          result = { kind: "intrinsic", name: descriptor.name };
+          break;
+        case "literal":
+          result = { kind: "literal", value_kind: descriptor.valueKind, value: descriptor.value };
+          break;
+        case "definition":
+          result = {
+            kind: "definition",
+            resolver_identity: canonicalDefinitionReference(descriptor.key, budget.activeResolvers),
+          };
+          break;
+        case "type_parameter":
+          result = {
+            kind: "type_parameter",
+            owner: canonicalDefinitionReference(descriptor.owner, budget.activeResolvers),
+            index: descriptor.index,
+            name: descriptor.name,
+          };
+          break;
+        case "application":
+          result = {
+            kind: "application",
+            target: canonicalTypeArgument(descriptor.target, budget, depth + 1),
+            type_arguments: descriptor.typeArguments.map((argument) => canonicalTypeArgument(argument, budget, depth + 1)),
+          };
+          break;
+        case "union":
+        case "intersection":
+          result = {
+            kind: descriptor.kind,
+            members: descriptor.members
+              .map((member) => canonicalTypeArgument(member, budget, depth + 1))
+              .sort((left, right) => {
+                const leftKey = JSON.stringify(left);
+                const rightKey = JSON.stringify(right);
+                return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0;
+              }),
+          };
+          break;
+      }
+      if (JSON.stringify(result).length > MAX_SEMANTIC_TYPE_DESCRIPTOR_CHARS) {
+        throw new Error("TypeScript canonical type descriptor exceeds its UTF-16 length limit");
+      }
+      return result;
+    };
+    const resolveEndpoint = (endpoint: TypeScriptRawDefinitionEndpoint, depth = 0): GraphNode => (
+      endpoint.kind === "file" ? existingFile(endpoint.relativePath) : materializeDefinition(endpoint.key, depth + 1)
+    );
+    const materializeDefinition = (key: string, depth = 0): GraphNode => {
+      if (depth > MAX_SEMANTIC_OWNERSHIP_DEPTH) {
+        throw new Error("TypeScript semantic definition ownership depth limit exceeded");
+      }
+      const existing = materialized.get(key);
+      if (existing) return existing;
+      if (visiting.has(key)) throw new Error(`TypeScript semantic definition ownership cycle at ${key}`);
+      const definition = definitions.get(key);
+      if (!definition) throw new Error(`TypeScript semantic definition is missing ${key}`);
+      visiting.add(key);
+      try {
+        const ownerPackage = identityPackage(definition);
+        const span = sourceSpan(startsFor(definition.relativePath), definition.startOffset, definition.endOffset);
+        let canonicalIdentity: Record<string, JsonValue>;
+        let resolverIdentity: string | null = null;
+        if (definition.graphKind === "type") {
+          resolverIdentity = canonicalResolver(definition);
+          canonicalIdentity = {
+            language: definition.language,
+            package_locator: ownerPackage.locator,
+            type_kind: definition.semanticKind,
+            resolver_identity: resolverIdentity,
+          };
+          if (definition.genericOrigin !== undefined) {
+            const origin = definitions.get(definition.genericOrigin);
+            if (!origin) throw new Error(`generic TypeScript definition ${key} has no origin`);
+            canonicalIdentity.generic_origin = canonicalResolver(origin);
+            canonicalIdentity.type_arguments = (definition.typeArguments ?? []).map((argument) => canonicalTypeArgument(argument, {
+              nodes: 0,
+              activeResolvers: new Set(),
+            }));
+          }
+        } else if (definition.identityKind === "named") {
+          resolverIdentity = canonicalResolver(definition);
+          canonicalIdentity = {
+            language: definition.language,
+            package_locator: ownerPackage.locator,
+            symbol_kind: definition.semanticKind,
+            identity_kind: "named",
+            resolver_identity: resolverIdentity,
+          };
+        } else if (definition.identityKind === "local" || definition.identityKind === "anonymous") {
+          const origin = resolveEndpoint(definition.owner, depth);
+          if (definition.identityKind === "local" && origin.kind !== "symbol") {
+            throw new Error(`local TypeScript definition ${key} has a non-symbol enclosing owner`);
+          }
+          canonicalIdentity = {
+            language: definition.language,
+            package_locator: ownerPackage.locator,
+            symbol_kind: definition.semanticKind,
+            identity_kind: definition.identityKind,
+            ...(definition.identityKind === "local" ? { enclosing_symbol: origin.id } : { generated_from: origin.id }),
+            relative_path: definition.relativePath,
+            span,
+          };
+        } else {
+          throw new Error(`TypeScript symbol ${key} has an invalid identity kind`);
+        }
+        const id = stableId(definition.graphKind, canonicalIdentity);
+        const file = existingFile(definition.relativePath);
+        const node: GraphNode = {
+          id,
+          kind: definition.graphKind,
+          locator: `${definition.language}-${definition.graphKind}:${id}`,
+          display_name: definition.displayName,
+          properties: {
+            language: definition.language,
+            package_locator: ownerPackage.locator,
+            package_id: ownerPackage.id,
+            [definition.graphKind === "symbol" ? "symbol_kind" : "type_kind"]: definition.semanticKind,
+            canonical_identity: canonicalIdentity,
+            profile_id: PROFILE_ID,
+            source_path: definition.relativePath,
+            source_span: span,
+            generated: file.properties.generated === true,
+            typescript_provenance: "typescript-native-typechecker",
+            ...(resolverIdentity === null ? {} : { resolver_identity: resolverIdentity }),
+            ...(definition.genericOrigin === undefined ? {} : {
+              generic_origin: canonicalIdentity.generic_origin!,
+              type_arguments: canonicalIdentity.type_arguments!,
+            }),
+          },
+        };
+        const existingKey = materializedIds.get(node.id);
+        if (existingKey !== undefined && existingKey !== key) {
+          throw new Error("TypeScript semantic definitions collided on a canonical node ID");
+        }
+        materializedIds.set(node.id, key);
+        materialized.set(key, node);
+        return node;
+      } finally {
+        visiting.delete(key);
+      }
+    };
+
+    const nodes = rawDelta.definitions.map((definition) => materializeDefinition(definition.key));
+    const edges = rawDelta.relations.map((relation): GraphEdge => {
+      const source = resolveEndpoint(relation.source);
+      const target = materializeDefinition(relation.target);
+      const span = sourceSpan(
+        startsFor(relation.evidence.relativePath),
+        relation.evidence.startOffset,
+        relation.evidence.endOffset,
+      );
+      const evidence: Evidence = {
+        kind: "semantic",
+        extractor: "typescript-native-typechecker",
+        extractor_version: TYPESCRIPT_COMPILER_VERSION,
+        path: relation.evidence.relativePath,
+        ...span,
+        detail: relation.evidence.detail,
+        properties: {
+          backend: "typescript-native-compiler",
+          compiler_source: "bundled",
+          compiler_version: TYPESCRIPT_COMPILER_VERSION,
+          analysis_mode: "semantic-definition-graph",
+          profile_id: PROFILE_ID,
+          project_code_executed: false,
+          relation_kind: relation.kind,
+        },
+      };
+      const id = stableId("edge", {
+        condition: WEB_CONDITION,
+        kind: relation.kind,
+        profile_id: PROFILE_ID,
+        source: source.id,
+        target: target.id,
+        path: evidence.path,
+        span,
+      });
+      return {
+        id,
+        source: source.id,
+        target: target.id,
+        kind: relation.kind,
+        site_id: null,
+        phase: "semantic",
+        environment: "any",
+        profile_id: PROFILE_ID,
+        condition: WEB_CONDITION,
+        resolution_status: "resolved",
+        precision: "exact",
+        generated: existingFile(relation.evidence.relativePath).properties.generated === true,
+        evidence: [evidence],
+      };
+    });
+    const delta: TypeScriptDefinitionDelta = { nodes, edges };
+    const merged = mergeTypeScriptDefinitionDelta(this.nodes, this.edges, delta, {
+      profileId: PROFILE_ID,
+      compilerVersion: TYPESCRIPT_COMPILER_VERSION,
+    });
+    this.nodes = merged.nodes;
+    this.edges = merged.edges;
+    return { nodes: nodes.length, relations: edges.length };
   }
 
   addDiagnostic(diagnostic: Omit<Diagnostic, "id">): void {
@@ -757,6 +1115,47 @@ export async function scan(root: string, allFiles: string[], inventoryIssues: Fi
     }
   }
 
+  for (const issue of nativeTypeScript.definitionGraph.issues) {
+    graph.addDiagnostic({
+      severity: "warning",
+      code: `web.${issue.code}`,
+      message: issue.message.length <= 2_048 ? issue.message : `${issue.message.slice(0, 2_047)}…`,
+      path: issue.relativePath,
+      profile_id: PROFILE_ID,
+      properties: { typescript_definition_issue: true },
+      ...(issue.relativePath === null ? {} : {
+        evidence: [sourceEvidence(
+          issue.relativePath,
+          "typescript-native-typechecker",
+          `definition_graph_issue=${issue.code};fatal=${String(issue.fatal)}`,
+        )],
+      }),
+    });
+  }
+  if (nativeTypeScript.project.definitionGraphStatus === "ready") {
+    try {
+      const counts = graph.mergeTypeScriptDefinitions(nativeTypeScript.definitionGraph, compilerSources);
+      nativeTypeScript.project.semanticNodes = counts.nodes;
+      nativeTypeScript.project.semanticRelations = counts.relations;
+    } catch {
+      nativeTypeScript.project.definitionGraphStatus = "failed";
+      nativeTypeScript.project.semanticNodes = 0;
+      nativeTypeScript.project.semanticRelations = 0;
+      nativeTypeScript.project.semanticIssues += 1;
+      graph.addDiagnostic({
+        severity: "warning",
+        code: "web.typescript_semantic_delta_discarded",
+        message: "TypeScript definition graph was discarded atomically after semantic contract validation failed; syntax graph output was preserved",
+        path: null,
+        profile_id: PROFILE_ID,
+        properties: { typescript_definition_issue: true },
+      });
+    }
+  } else {
+    nativeTypeScript.project.semanticNodes = 0;
+    nativeTypeScript.project.semanticRelations = 0;
+  }
+
   const routeNodesByGroup = new Map<string, Map<string, { node: GraphNode; evidence: Evidence }>>();
   for (const entry of routeDiscovery.entries) {
     const fileNode = graph.fileNode(entry.absoluteFile, entry.generated);
@@ -859,7 +1258,7 @@ export async function scan(root: string, allFiles: string[], inventoryIssues: Fi
     graph.addDiagnostic({
       severity: "info",
       code: "web.typescript_semantic_scaffold_diagnostic",
-      message: `TypeScript TypeChecker scaffold TS${diagnostic.code}: ${diagnostic.message}`,
+      message: `TypeScript TypeChecker TS${diagnostic.code}: ${diagnostic.message}`,
       path: diagnostic.relativePath,
       profile_id: PROFILE_ID,
       ...(source === null || diagnostic.relativePath === null ? {} : {
@@ -876,7 +1275,7 @@ export async function scan(root: string, allFiles: string[], inventoryIssues: Fi
     graph.addDiagnostic({
       severity: "info",
       code: "web.typescript_semantic_scaffold_diagnostics_truncated",
-      message: `TypeScript TypeChecker scaffold retained ${nativeTypeScript.project.emittedSemanticDiagnostics} of ${nativeTypeScript.project.semanticDiagnostics} deterministic diagnostics`,
+      message: `TypeScript TypeChecker retained ${nativeTypeScript.project.emittedSemanticDiagnostics} of ${nativeTypeScript.project.semanticDiagnostics} deterministic diagnostics`,
       path: null,
       profile_id: PROFILE_ID,
     });
@@ -892,6 +1291,8 @@ export async function scan(root: string, allFiles: string[], inventoryIssues: Fi
   if (counts.unresolved > 0) reasons.push("unresolved_dependency_sites");
   if (unsupportedSyntax > 0) reasons.push("unsupported_syntax");
   if (skipped > 0) reasons.push("skipped_sites");
+  if (nativeTypeScript.project.definitionGraphStatus === "failed") reasons.push("typescript_definition_graph_failure");
+  else if (nativeTypeScript.project.semanticIssues > 0) reasons.push("typescript_definition_graph_incomplete");
   return {
     nodes: [...graph.nodes.values()].sort(compareById),
     sites,

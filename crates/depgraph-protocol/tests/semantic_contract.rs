@@ -691,6 +691,70 @@ fn rust_semantic_nodes_and_site_less_relations_follow_their_hash_contract() {
 }
 
 #[test]
+fn site_less_definition_relations_are_strictly_validated() {
+    let mutate_edge = |events: &mut [Value], kind: &str, update: &dyn Fn(&mut Value)| {
+        let edge = events
+            .iter_mut()
+            .find(|event| event["event"] == "edge_upsert" && event["edge"]["kind"] == kind)
+            .unwrap_or_else(|| panic!("missing {kind} definition relation"));
+        update(&mut edge["edge"]);
+    };
+
+    let mut bad_hash = rust_semantic_values();
+    mutate_edge(&mut bad_hash, "declares", &|edge| {
+        edge["id"] = json!(format!("edge:sha256:{}", "0".repeat(64)));
+    });
+
+    let mut wrong_phase = rust_semantic_values();
+    mutate_edge(&mut wrong_phase, "extends", &|edge| {
+        edge["phase"] = json!("source");
+    });
+
+    let mut wrong_resolution = rust_semantic_values();
+    mutate_edge(&mut wrong_resolution, "implements", &|edge| {
+        edge["resolution_status"] = json!("external");
+    });
+
+    let mut wrong_precision = rust_semantic_values();
+    mutate_edge(&mut wrong_precision, "instantiates", &|edge| {
+        edge["precision"] = json!("heuristic");
+    });
+
+    let mut source_primary = rust_semantic_values();
+    mutate_edge(&mut source_primary, "declares", &|edge| {
+        edge["evidence"][0]["kind"] = json!("source");
+    });
+
+    let mut linked_to_site = rust_semantic_values();
+    mutate_edge(&mut linked_to_site, "extends", &|edge| {
+        edge["site_id"] = json!("site:sha256:forbidden");
+    });
+
+    let mut wrong_endpoint = rust_semantic_values();
+    let module_id = node_id_by_display_name(&wrong_endpoint, "crate");
+    mutate_edge(&mut wrong_endpoint, "implements", &|edge| {
+        edge["target"] = json!(module_id);
+        rehash_definition_edge(edge);
+    });
+
+    for (name, events) in [
+        ("canonical edge ID", bad_hash),
+        ("semantic phase", wrong_phase),
+        ("resolved status", wrong_resolution),
+        ("exact precision", wrong_precision),
+        ("semantic primary evidence", source_primary),
+        ("site-less relation", linked_to_site),
+        ("compatible endpoints", wrong_endpoint),
+    ] {
+        let input = values_to_ndjson(events);
+        assert!(
+            validate_safe_semantic_ndjson(Cursor::new(input)).is_err(),
+            "strict semantic validator accepted definition relation with invalid {name}"
+        );
+    }
+}
+
+#[test]
 fn semantic_symbol_and_type_nodes_use_their_canonical_identity_hash() {
     let validated = semantic_fixture();
     assert_eq!(validated.nodes.len(), 6);
@@ -1225,6 +1289,27 @@ fn base_protocol_keeps_semantic_kind_strings_open_for_legacy_v1_events() {
         .expect("base protocol-v1 validator must preserve its open vocabulary");
     assert!(!semantic_schema_accepts_stream(&input));
     assert!(validate_safe_semantic_ndjson(Cursor::new(input)).is_err());
+}
+
+#[test]
+fn source_phase_definition_vocabulary_remains_strictly_compatible() {
+    let mut events: Vec<Value> = SOURCE_GOLDEN
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("source fixture JSON"))
+        .collect();
+    let edge = events
+        .iter_mut()
+        .find(|event| event["event"] == "edge_upsert")
+        .expect("source edge");
+    edge["edge"]["kind"] = json!("declares");
+    edge["edge"]["phase"] = json!("source");
+    edge["edge"]["evidence"][0]["kind"] = json!("source");
+
+    let input = values_to_ndjson(events);
+    assert!(schema_accepts_stream(&input));
+    assert!(semantic_schema_accepts_stream(&input));
+    validate_safe_semantic_ndjson(Cursor::new(input))
+        .expect("source-phase vocabulary must not be mistaken for a semantic definition relation");
 }
 
 #[test]
@@ -2113,6 +2198,11 @@ fn semantic_schema_accepts_stream(input: &str) -> bool {
         }
         Some("edge_upsert")
             if matches!(event["edge"]["kind"].as_str(), Some("calls" | "may_call"))
+                || (matches!(
+                    event["edge"]["kind"].as_str(),
+                    Some("declares" | "extends" | "implements" | "instantiates")
+                ) && (event["edge"]["phase"] == "semantic"
+                    || event["edge"]["evidence"][0]["kind"] == "semantic"))
                 || event["edge"]["site_id"]
                     .as_str()
                     .is_some_and(|site_id| strict_dependency_site_ids.contains(site_id)) =>
@@ -2324,4 +2414,25 @@ fn site_identity(site: &DependencySite, evidence: &Evidence) -> Value {
             "start_line": evidence.start_line.expect("start line"),
         }
     })
+}
+
+fn rehash_definition_edge(edge: &mut Value) {
+    let evidence = &edge["evidence"][0];
+    edge["id"] = json!(stable_id_from_value(
+        "edge",
+        &json!({
+            "condition": edge["condition"],
+            "kind": edge["kind"],
+            "path": evidence["path"],
+            "profile_id": edge["profile_id"],
+            "source": edge["source"],
+            "span": {
+                "end_column": evidence["end_column"],
+                "end_line": evidence["end_line"],
+                "start_column": evidence["start_column"],
+                "start_line": evidence["start_line"],
+            },
+            "target": edge["target"],
+        }),
+    ));
 }

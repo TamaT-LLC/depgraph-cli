@@ -327,6 +327,43 @@
       },
       "required": ["site_id"]
     },
+    "semantic_definition_edge": {
+      "allOf": [
+        { "$ref": "#/$defs/edge" },
+        {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string",
+              "pattern": "^edge:sha256:[0-9a-f]{64}$"
+            },
+            "kind": {
+              "enum": ["declares", "extends", "implements", "instantiates"]
+            },
+            "site_id": { "type": "null" },
+            "phase": { "const": "semantic" },
+            "resolution_status": { "const": "resolved" },
+            "precision": { "const": "exact" },
+            "evidence": {
+              "type": "array",
+              "minItems": 1,
+              "prefixItems": [
+                { "$ref": "#/$defs/semantic_spanned_evidence" }
+              ],
+              "items": { "$ref": "#/$defs/evidence" }
+            }
+          },
+          "required": [
+            "id",
+            "kind",
+            "phase",
+            "resolution_status",
+            "precision",
+            "evidence"
+          ]
+        }
+      ]
+    },
     "semantic_site_base": {
       "type": "object",
       "properties": {
@@ -515,54 +552,59 @@
       "additionalProperties": true
     },
     "semantic_edge": {
-      "allOf": [
-        { "$ref": "#/$defs/edge" },
-        { "$ref": "#/$defs/semantic_edge_base" },
-        { "$ref": "#/$defs/semantic_resolution" },
+      "oneOf": [
         {
-          "oneOf": [
+          "allOf": [
+            { "$ref": "#/$defs/edge" },
+            { "$ref": "#/$defs/semantic_edge_base" },
+            { "$ref": "#/$defs/semantic_resolution" },
             {
-              "type": "object",
-              "properties": { "kind": { "const": "type_uses" } },
-              "required": ["kind"]
-            },
-            {
-              "type": "object",
-              "properties": { "kind": { "const": "imports" } },
-              "required": ["kind"]
-            },
-            {
-              "type": "object",
-              "properties": { "kind": { "const": "reexports" } },
-              "required": ["kind"]
-            },
-            {
-              "type": "object",
-              "properties": {
-                "kind": { "const": "calls" },
-                "resolution_status": {
-                  "enum": ["resolved", "external", "unresolved"]
+              "oneOf": [
+                {
+                  "type": "object",
+                  "properties": { "kind": { "const": "type_uses" } },
+                  "required": ["kind"]
+                },
+                {
+                  "type": "object",
+                  "properties": { "kind": { "const": "imports" } },
+                  "required": ["kind"]
+                },
+                {
+                  "type": "object",
+                  "properties": { "kind": { "const": "reexports" } },
+                  "required": ["kind"]
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "kind": { "const": "calls" },
+                    "resolution_status": {
+                      "enum": ["resolved", "external", "unresolved"]
+                    }
+                  },
+                  "required": ["kind"]
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "kind": { "const": "may_call" },
+                    "resolution_status": { "const": "candidates" },
+                    "precision": { "const": "overapprox" },
+                    "evidence": {
+                      "type": "array",
+                      "prefixItems": [
+                        { "$ref": "#/$defs/candidate_semantic_evidence" }
+                      ]
+                    }
+                  },
+                  "required": ["kind"]
                 }
-              },
-              "required": ["kind"]
-            },
-            {
-              "type": "object",
-              "properties": {
-                "kind": { "const": "may_call" },
-                "resolution_status": { "const": "candidates" },
-                "precision": { "const": "overapprox" },
-                "evidence": {
-                  "type": "array",
-                  "prefixItems": [
-                    { "$ref": "#/$defs/candidate_semantic_evidence" }
-                  ]
-                }
-              },
-              "required": ["kind"]
+              ]
             }
           ]
-        }
+        },
+        { "$ref": "#/$defs/semantic_definition_edge" }
       ]
     },
     "dependency_site": {

@@ -39,6 +39,7 @@ function typeScriptProfileProperties(
       ...TYPESCRIPT_COMPILER_PROFILE_PROPERTIES,
       typescript_project_model_status: "failed",
       typescript_typechecker_status: "failed",
+      typescript_definition_graph_status: "failed",
       typescript_project_model_failure_reason: failure?.reason ?? "compiler_protocol_failure",
       typescript_project_root_files: "0",
       typescript_program_files: "0",
@@ -48,10 +49,17 @@ function typeScriptProfileProperties(
       typescript_typechecker_queries: "0",
       typescript_semantic_diagnostics: "0",
       typescript_emitted_semantic_diagnostics: "0",
+      typescript_semantic_node_count: "0",
+      typescript_semantic_relation_count: "0",
+      typescript_semantic_issue_count: "0",
     };
   }
   return {
     ...TYPESCRIPT_COMPILER_PROFILE_PROPERTIES,
+    typescript_typechecker_status: project.definitionGraphStatus === "ready"
+      ? "definition-graph-emitted"
+      : "definition-graph-discarded",
+    typescript_definition_graph_status: project.definitionGraphStatus,
     typescript_project_model_failure_reason: "none",
     typescript_project_root_files: String(project.rootFiles),
     typescript_program_files: String(project.programFiles),
@@ -61,6 +69,9 @@ function typeScriptProfileProperties(
     typescript_typechecker_queries: String(project.typeCheckerQueries),
     typescript_semantic_diagnostics: String(project.semanticDiagnostics),
     typescript_emitted_semantic_diagnostics: String(project.emittedSemanticDiagnostics),
+    typescript_semantic_node_count: String(project.semanticNodes),
+    typescript_semantic_relation_count: String(project.semanticRelations),
+    typescript_semantic_issue_count: String(project.semanticIssues),
   };
 }
 

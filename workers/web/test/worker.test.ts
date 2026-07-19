@@ -54,6 +54,7 @@ test("worker emits deterministic protocol graph without executing project code",
       "typescript_project_local_policy",
       "typescript_project_local_loaded",
       "typescript_typechecker_status",
+      "typescript_definition_graph_status",
       "typescript_project_model_status",
       "typescript_project_config",
       "typescript_module_resolution",
@@ -68,17 +69,18 @@ test("worker emits deterministic protocol graph without executing project code",
       typescript_compiler_version: "7.0.2",
       typescript_compiler_selection: "bundled-only",
       typescript_compiler_fallback: "fail-closed",
-      typescript_analysis_mode: "semantic-scaffold",
+      typescript_analysis_mode: "semantic-definition-graph",
       typescript_project_local_policy: "metadata-only",
       typescript_project_local_loaded: "false",
-      typescript_typechecker_status: "invoked-no-graph",
+      typescript_typechecker_status: "definition-graph-emitted",
+      typescript_definition_graph_status: "ready",
       typescript_project_model_status: "ready",
       typescript_project_config: "worker-neutral-allowlist",
       typescript_module_resolution: "inventory-only",
       typescript_standard_library_source: "bundled",
       typescript_standard_library_integrity: "build-produced-pending-core-attestation",
       typescript_release_gate: "release-gate-pending",
-      typescript_semantic_graph_emission: "disabled",
+      typescript_semantic_graph_emission: "definition-graph-v1",
       project_code_executed: "false",
     },
   );
@@ -152,9 +154,20 @@ test("worker emits deterministic protocol graph without executing project code",
   assert.equal(completed.project_code_executed, false);
   assert.ok(Number(profile?.properties.typescript_project_root_files) > 0);
   assert.ok(Number(profile?.properties.typescript_standard_library_files) > 0);
-  assert.equal(profile?.properties.typescript_typechecker_queries, "1");
+  assert.ok(Number(profile?.properties.typescript_typechecker_queries) > 1);
+  const semanticNodes = nodes.filter((node) => node.kind === "symbol" || node.kind === "type");
+  const semanticEdges = edges.filter((edge) => edge.phase === "semantic");
+  assert.equal(Number(profile?.properties.typescript_semantic_node_count), semanticNodes.length);
+  assert.equal(Number(profile?.properties.typescript_semantic_relation_count), semanticEdges.length);
+  assert.equal(profile?.properties.typescript_semantic_issue_count, "0");
+  assert.ok(semanticNodes.some((node) => node.kind === "symbol" && node.properties.symbol_kind === "function"));
+  assert.ok(semanticNodes.some((node) => node.kind === "type" && node.properties.type_kind === "class"));
+  assert.ok(semanticNodes.some((node) => node.kind === "type" && node.properties.type_kind === "generic_instance"));
+  assert.deepEqual([...new Set(semanticEdges.map((edge) => edge.kind))].sort(), ["declares", "extends", "implements", "instantiates"]);
+  assert.ok(semanticEdges.every((edge) => edge.site_id === null && edge.resolution_status === "resolved" && edge.precision === "exact"));
+  assert.ok(semanticEdges.every((edge) => edge.evidence[0]?.kind === "semantic" && edge.evidence[0]?.properties.profile_id === profile.id));
+  assert.ok(!sites.some((site) => site.evidence[0]?.kind === "semantic"));
   assert.ok(!completed.completeness.includes("semantic-complete"));
-  assert.ok(!edges.some((edge) => edge.phase === "semantic"));
   assert.equal(completed.dependency_sites, sites.length);
   assert.equal(completed.dependency_sites, completed.resolved + completed.candidates + completed.external + completed.unresolved);
   assert.ok(completedFiles.length > 0);
@@ -760,9 +773,19 @@ test("malformed TypeScript source increments unsupported syntax coverage", async
 
   const result = await run("broken-source", root);
   assert.ok(result.events.some((event) => event.diagnostic?.code === "web.unsupported_syntax" && event.diagnostic?.path === "broken.ts"));
+  const semanticIssue = result.events.find((event) => (
+    event.diagnostic?.code === "web.typescript_semantic_syntax_invalid"
+  ))?.diagnostic;
+  assert.equal(semanticIssue?.properties?.typescript_definition_issue, true);
+  const profile = result.events.find((event) => event.event === "profile_declared")?.profile;
+  assert.equal(profile?.properties.typescript_definition_graph_status, "ready");
+  assert.equal(profile?.properties.typescript_semantic_node_count, "0");
+  assert.equal(profile?.properties.typescript_semantic_relation_count, "0");
+  assert.equal(profile?.properties.typescript_semantic_issue_count, "1");
   assert.ok(result.events.at(-1)?.coverage.unsupported_syntax > 0);
   assert.deepEqual(result.events.at(-1)?.coverage.completeness, []);
   assert.ok(result.events.at(-1)?.coverage.reasons.includes("unsupported_syntax"));
+  assert.ok(result.events.at(-1)?.coverage.reasons.includes("typescript_definition_graph_incomplete"));
 });
 
 test("balanced malformed TypeScript cannot report syntax-complete coverage", async (context) => {
@@ -828,7 +851,7 @@ test("native TypeScript 7 parser covers every TS and JS extension without loadin
   await assert.rejects(import("node:fs/promises").then(({ stat }) => stat(marker)));
 });
 
-test("TypeChecker scaffold resolves inventory modules and bundled stdlib without reading project packages", async (context) => {
+test("TypeChecker definition graph resolves inventory modules and bundled stdlib without reading project packages", async (context) => {
   const root = await mkdtemp(path.join(os.tmpdir(), "depgraph-web-worker-typechecker-scaffold-"));
   context.after(async () => rm(root, { recursive: true, force: true }));
   const packageRoot = path.join(root, "node_modules", "ambient-secret");
@@ -879,10 +902,18 @@ test("TypeChecker scaffold resolves inventory modules and bundled stdlib without
   const semanticDiagnostics = result.events
     .filter((event) => event.diagnostic?.code === "web.typescript_semantic_scaffold_diagnostic")
     .map((event) => event.diagnostic);
+  const semanticNodes = result.events
+    .filter((event) => event.node?.kind === "symbol" || event.node?.kind === "type")
+    .map((event) => event.node);
+  const semanticEdges = result.events
+    .filter((event) => event.edge?.phase === "semantic")
+    .map((event) => event.edge);
   assert.equal(profile?.properties.typescript_project_model_status, "ready");
-  assert.equal(profile?.properties.typescript_typechecker_status, "invoked-no-graph");
+  assert.equal(profile?.properties.typescript_typechecker_status, "definition-graph-emitted");
+  assert.equal(profile?.properties.typescript_definition_graph_status, "ready");
+  assert.equal(profile?.properties.typescript_semantic_graph_emission, "definition-graph-v1");
   assert.equal(profile?.properties.typescript_project_root_files, "2");
-  assert.equal(profile?.properties.typescript_typechecker_queries, "1");
+  assert.ok(Number(profile?.properties.typescript_typechecker_queries) > 1);
   assert.equal(profile?.properties.typescript_static_config_files, "1");
   assert.equal(profile?.properties.typescript_path_mappings, "1");
   assert.ok(Number(profile?.properties.typescript_standard_library_files) > 0);
@@ -897,10 +928,72 @@ test("TypeChecker scaffold resolves inventory modules and bundled stdlib without
   assert.ok(semanticDiagnostics.every((diagnostic) => (
     diagnostic.path === null || diagnostic.evidence?.[0]?.extractor === "typescript-native-typechecker"
   )));
-  assert.ok(!result.events.some((event) => event.node?.kind === "symbol" || event.node?.kind === "type"));
-  assert.ok(!result.events.some((event) => event.edge?.phase === "semantic"));
+  assert.ok(semanticNodes.some((node) => node.kind === "type" && node.display_name === "User"));
+  assert.ok(semanticEdges.some((edge) => edge.kind === "declares"));
+  assert.equal(Number(profile?.properties.typescript_semantic_node_count), semanticNodes.length);
+  assert.equal(Number(profile?.properties.typescript_semantic_relation_count), semanticEdges.length);
+  assert.equal(profile?.properties.typescript_semantic_issue_count, "0");
+  assert.ok(semanticEdges.every((edge) => edge.site_id === null && edge.precision === "exact"));
   assert.ok(!result.events.at(-1)?.coverage.completeness.includes("semantic-complete"));
   await assert.rejects(import("node:fs/promises").then(({ stat }) => stat(marker)));
+});
+
+test("generic type arguments use the referenced workspace package identity", async (context) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "depgraph-web-worker-generic-package-identity-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  const baseRoot = path.join(root, "packages", "base");
+  const argumentRoot = path.join(root, "packages", "argument");
+  const appRoot = path.join(root, "packages", "app");
+  await Promise.all([
+    mkdir(path.join(baseRoot, "src"), { recursive: true }),
+    mkdir(path.join(argumentRoot, "src"), { recursive: true }),
+    mkdir(path.join(appRoot, "src"), { recursive: true }),
+  ]);
+  await Promise.all([
+    writeFile(path.join(root, "package.json"), JSON.stringify({
+      name: "generic-package-workspace",
+      private: true,
+      version: "1.0.0",
+      workspaces: ["packages/*"],
+    })),
+    writeFile(path.join(baseRoot, "package.json"), JSON.stringify({ name: "generic-base", version: "1.0.0" })),
+    writeFile(path.join(argumentRoot, "package.json"), JSON.stringify({ name: "generic-argument", version: "1.0.0" })),
+    writeFile(path.join(appRoot, "package.json"), JSON.stringify({ name: "generic-app", version: "1.0.0" })),
+    writeFile(path.join(baseRoot, "src", "base.ts"), "export class Base<T> {}\n"),
+    writeFile(path.join(argumentRoot, "src", "argument.ts"), "export class Argument {}\n"),
+    writeFile(path.join(appRoot, "src", "app.ts"), [
+      "import { Base } from '../../base/src/base';",
+      "import { Argument } from '../../argument/src/argument';",
+      "export class App extends Base<Argument> {}",
+      "",
+    ].join("\n")),
+  ]);
+
+  const semanticTypes = (events: Array<Record<string, any>>): Array<Record<string, any>> => events
+    .filter((event) => event.node?.kind === "type")
+    .map((event) => event.node);
+  const first = await run("generic-package-identity-v1", root);
+  const firstTypes = semanticTypes(first.events);
+  const firstArgument = firstTypes.find((node) => node.display_name === "Argument");
+  const firstInstance = firstTypes.find((node) => node.properties.type_kind === "generic_instance");
+  assert.ok(firstArgument);
+  assert.ok(firstInstance);
+  assert.equal(
+    firstInstance.properties.canonical_identity.type_arguments[0].resolver_identity,
+    firstArgument.properties.resolver_identity,
+  );
+  assert.match(firstArgument.properties.resolver_identity, /generic-argument@1\.0\.0/u);
+
+  await writeFile(path.join(argumentRoot, "package.json"), JSON.stringify({ name: "generic-argument", version: "2.0.0" }));
+  const second = await run("generic-package-identity-v2", root);
+  const secondTypes = semanticTypes(second.events);
+  const secondArgument = secondTypes.find((node) => node.display_name === "Argument");
+  const secondInstance = secondTypes.find((node) => node.properties.type_kind === "generic_instance");
+  assert.ok(secondArgument);
+  assert.ok(secondInstance);
+  assert.match(secondArgument.properties.resolver_identity, /generic-argument@2\.0\.0/u);
+  assert.notEqual(secondArgument.id, firstArgument.id);
+  assert.notEqual(secondInstance.id, firstInstance.id);
 });
 
 test("TypeScript path mappings normalize Windows separators before repository confinement", async (context) => {
@@ -1326,6 +1419,10 @@ test("relocated packaged worker fails closed when its adjacent TypeScript compil
       assert.doesNotMatch(stderr, /node_modules[\\/]@typescript/u);
       assert.equal(profile?.properties.typescript_project_model_status, "failed");
       assert.equal(profile?.properties.typescript_typechecker_status, "failed");
+      assert.equal(profile?.properties.typescript_definition_graph_status, "failed");
+      assert.equal(profile?.properties.typescript_semantic_node_count, "0");
+      assert.equal(profile?.properties.typescript_semantic_relation_count, "0");
+      assert.equal(profile?.properties.typescript_semantic_issue_count, "0");
       assert.equal(profile?.properties.typescript_project_model_failure_reason, "compiler_unavailable");
       assert.ok(events.some((event) => (
         event.diagnostic?.code === "web.typescript_project_model_failed"
