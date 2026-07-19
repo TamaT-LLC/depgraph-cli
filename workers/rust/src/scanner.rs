@@ -82,6 +82,13 @@ struct TargetResolution {
     reason: Option<String>,
 }
 
+type SemanticExtractor = fn(
+    &SafeProjectModel,
+    &BTreeMap<String, SemanticCrateContext>,
+    &BTreeMap<String, Vec<Occurrence>>,
+    &str,
+) -> Result<SemanticDelta>;
+
 #[derive(Debug)]
 struct State {
     root: PathBuf,
@@ -105,6 +112,13 @@ struct State {
 }
 
 pub fn scan(root: &Path) -> Result<ScanResult> {
+    scan_with_semantic_extractor(root, extract_semantic_delta)
+}
+
+fn scan_with_semantic_extractor(
+    root: &Path,
+    semantic_extractor: SemanticExtractor,
+) -> Result<ScanResult> {
     let root = root
         .canonicalize()
         .with_context(|| format!("canonicalize scan root {}", root.display()))?;
@@ -332,7 +346,7 @@ pub fn scan(root: &Path) -> Result<ScanResult> {
         hir_toolchain_status,
     );
     if let Some(model) = hir_model {
-        state.extract_hir_semantics(&packages, &sources, &model);
+        state.extract_hir_semantics(&packages, &sources, &model, semantic_extractor);
     }
     state.extract_source_dependencies(&packages, &sources)?;
     state.finish()
@@ -371,11 +385,6 @@ impl State {
 
         let files: Vec<_> = self.files.into_values().collect();
         let files_skipped = files.iter().filter(|file| file.skipped).count() as u64;
-        let completeness = if files_skipped == 0 && self.unsupported_syntax == 0 {
-            vec![CompletenessLevel::SyntaxComplete]
-        } else {
-            Vec::new()
-        };
         let mut coverage = Coverage {
             profiles: 1,
             files_discovered: files.len() as u64,
@@ -384,7 +393,7 @@ impl State {
             dependency_sites: sites.len() as u64,
             unsupported_syntax: self.unsupported_syntax,
             project_code_executed: false,
-            completeness,
+            completeness: Vec::new(),
             reasons: self.reasons.into_iter().collect(),
             ..Coverage::default()
         };
@@ -395,6 +404,32 @@ impl State {
                 ResolutionStatus::External => coverage.external += 1,
                 ResolutionStatus::Unresolved => coverage.unresolved += 1,
             }
+        }
+        if coverage.files_skipped != 0 {
+            coverage.reasons.push("files-skipped".into());
+        }
+        if coverage.unsupported_syntax != 0 {
+            coverage.reasons.push("unsupported-syntax".into());
+        }
+        if coverage.unresolved != 0 {
+            coverage.reasons.push("unresolved-sites".into());
+        }
+        coverage.reasons.sort();
+        coverage.reasons.dedup();
+
+        let syntax_complete = coverage.files_skipped == 0 && coverage.unsupported_syntax == 0;
+        if syntax_complete {
+            coverage
+                .completeness
+                .push(CompletenessLevel::SyntaxComplete);
+        }
+        if syntax_complete
+            && coverage.unresolved == 0
+            && rust_semantic_complete_eligible(&self.profile, &coverage)
+        {
+            coverage
+                .completeness
+                .push(CompletenessLevel::SemanticComplete);
         }
         Ok(ScanResult {
             root: slash_path(&self.root),
@@ -627,6 +662,36 @@ impl State {
             );
             return None;
         }
+        if let Some((path, edition)) = packages.iter().find_map(|package| {
+            package
+                .targets
+                .iter()
+                .find(|target| !supported_rust_edition(&target.edition))
+                .map(|target| (target.src_path.as_str(), target.edition.as_str()))
+                .or_else(|| {
+                    (!supported_rust_edition(&package.edition))
+                        .then_some((package.manifest_path.as_str(), package.edition.as_str()))
+                })
+        }) {
+            self.profile.properties.insert(
+                "rust_hir_project_model".into(),
+                Value::String("unsupported".into()),
+            );
+            self.profile.properties.insert(
+                "rust_hir_enable_gate".into(),
+                Value::String("input-unsupported".into()),
+            );
+            self.reasons.insert("rust-hir-unsupported".into());
+            self.add_diagnostic(
+                DiagnosticSeverity::Warning,
+                "RUST_HIR_INPUT_UNSUPPORTED",
+                &format!("Rust edition {edition} is outside the verified HIR compatibility matrix; syntax analysis continues"),
+                Some(path),
+                None,
+                &format!("unsupported-edition:{edition}"),
+            );
+            return None;
+        }
         if !metadata_succeeded {
             self.profile.properties.insert(
                 "rust_hir_project_model".into(),
@@ -757,6 +822,7 @@ impl State {
         packages: &[Package],
         sources: &[SourceUnit],
         model: &SafeProjectModel,
+        semantic_extractor: SemanticExtractor,
     ) {
         let result = (|| -> Result<(SemanticDelta, BTreeMap<String, SemanticCrateContext>)> {
             let contexts = self.semantic_crate_contexts(packages, model)?;
@@ -770,7 +836,7 @@ impl State {
                 })
                 .collect();
             let delta =
-                extract_semantic_delta(model, &contexts, &occurrences_by_path, &self.profile.id)?;
+                semantic_extractor(model, &contexts, &occurrences_by_path, &self.profile.id)?;
             self.merge_semantic_delta(&delta)?;
             Ok((delta, contexts))
         })();
@@ -811,7 +877,7 @@ impl State {
                 );
                 self.profile.properties.insert(
                     "rust_hir_enable_gate".into(),
-                    Value::String("fallback-and-release-gates-pending".into()),
+                    Value::String("release-gate-pending".into()),
                 );
                 self.profile.properties.insert(
                     "rust_hir_semantic_node_count".into(),
@@ -855,7 +921,7 @@ impl State {
                     );
                 }
             }
-            Err(error) => {
+            Err(_error) => {
                 self.reasons.insert("rust-hir-backend-failure".into());
                 self.profile.properties.insert(
                     "rust_hir_backend".into(),
@@ -868,12 +934,18 @@ impl State {
                     "rust_hir_enable_gate".into(),
                     Value::String("semantic-backend-failure".into()),
                 );
+                self.profile.properties.insert(
+                    "rust_hir_failure_kind".into(),
+                    Value::String("typed-recoverable".into()),
+                );
+                self.profile.properties.insert(
+                    "rust_hir_failure_stage".into(),
+                    Value::String("semantic-extraction-or-validation".into()),
+                );
                 self.add_diagnostic(
                     DiagnosticSeverity::Warning,
                     "RUST_HIR_BACKEND_FAILURE",
-                    &format!(
-                        "Rust HIR semantic graph was discarded atomically: {error}; syntax graph output was preserved"
-                    ),
+                    "Rust HIR semantic graph was discarded atomically after a typed backend failure; syntax graph output was preserved",
                     None,
                     None,
                     "rust-hir-backend-failure",
@@ -1740,6 +1812,254 @@ impl State {
                         )?;
                         self.increment_file_site(&source.rel_path);
                     }
+                    Occurrence::MacroExpansionBoundary {
+                        specifier,
+                        boundary_kind,
+                        condition,
+                        span,
+                    } => {
+                        let (
+                            node_kind,
+                            site_kind,
+                            diagnostic_code,
+                            coverage_reason,
+                            reason,
+                            message,
+                        ) = if boundary_kind == crate::source::MacroExpansionBoundaryKind::Bang {
+                            (
+                                "macro_expansion",
+                                "macro_expansion",
+                                "MACRO_EXPANSION_NOT_EVALUATED",
+                                "macro-expansion-not-evaluated",
+                                "macro expansion identity could not be proven safe in static scan",
+                                "A bang macro boundary was preserved without assuming that its unqualified name denotes a built-in macro",
+                            )
+                        } else {
+                            (
+                                "proc_macro_expansion",
+                                "proc_macro_expansion",
+                                "PROC_MACRO_EXPANSION_NOT_EXECUTED",
+                                "proc-macro-expansion-not-executed",
+                                "macro expansion was not executed or loaded in safe scan",
+                                "A derive or attribute macro boundary was preserved without executing project or external macro code",
+                            )
+                        };
+                        let unknown = self.unknown_node(
+                            node_kind,
+                            &specifier,
+                            &source.rel_path,
+                            span,
+                            reason,
+                        )?;
+                        let mut evidence = source_evidence(
+                            &source.rel_path,
+                            span,
+                            "safe macro expansion boundary",
+                        );
+                        evidence.properties.insert(
+                            "macro_boundary_kind".into(),
+                            Value::String(boundary_kind.as_str().into()),
+                        );
+                        self.add_site(
+                            &source_node,
+                            site_kind,
+                            &specifier,
+                            "expands",
+                            condition,
+                            unresolved(unknown, reason),
+                            evidence.clone(),
+                        )?;
+                        self.increment_file_site(&source.rel_path);
+                        self.reasons.insert(coverage_reason.into());
+                        self.add_diagnostic(
+                            DiagnosticSeverity::Warning,
+                            diagnostic_code,
+                            message,
+                            Some(&source.rel_path),
+                            Some(evidence),
+                            &format!(
+                                "{}:{}:{}:{}:{}:{}:{}",
+                                source.rel_path,
+                                span.start_line,
+                                span.start_column,
+                                span.end_line,
+                                span.end_column,
+                                boundary_kind.as_str(),
+                                specifier
+                            ),
+                        );
+                    }
+                    Occurrence::BuildEnvironmentMacro {
+                        macro_name,
+                        variable,
+                        raw_argument,
+                        condition,
+                        span,
+                    } => {
+                        let out_dir = variable.as_deref() == Some("OUT_DIR");
+                        let specifier = variable.as_deref().unwrap_or(&raw_argument);
+                        let (node_kind, diagnostic_code, coverage_reason, reason, message) =
+                            if out_dir {
+                                (
+                                    "build_script_output",
+                                    "RUST_HIR_OUT_DIR_UNAVAILABLE",
+                                    "rust-hir-out-dir-unavailable",
+                                    "build-script OUT_DIR output is unavailable in safe scan",
+                                    "env! depends on build-script OUT_DIR output, which safe scan does not execute or read",
+                                )
+                            } else {
+                                (
+                                    "build_environment",
+                                    "BUILD_ENVIRONMENT_NOT_EVALUATED",
+                                    "build-environment-not-evaluated",
+                                    "compile-time build environment was not evaluated in safe scan",
+                                    "A compile-time env!/option_env! boundary was preserved without evaluating project build environment",
+                                )
+                            };
+                        let unknown = self.unknown_node(
+                            node_kind,
+                            specifier,
+                            &source.rel_path,
+                            span,
+                            reason,
+                        )?;
+                        let mut evidence = source_evidence(
+                            &source.rel_path,
+                            span,
+                            "safe build environment boundary",
+                        );
+                        evidence
+                            .properties
+                            .insert("macro_name".into(), Value::String(macro_name.clone()));
+                        if let Some(variable) = &variable {
+                            evidence.properties.insert(
+                                "environment_variable".into(),
+                                Value::String(variable.clone()),
+                            );
+                        }
+                        self.add_site(
+                            &source_node,
+                            "build_environment",
+                            specifier,
+                            "reads_build_environment",
+                            condition,
+                            unresolved(unknown, reason),
+                            evidence.clone(),
+                        )?;
+                        self.increment_file_site(&source.rel_path);
+                        self.reasons.insert(coverage_reason.into());
+                        self.add_diagnostic(
+                            DiagnosticSeverity::Warning,
+                            diagnostic_code,
+                            message,
+                            Some(&source.rel_path),
+                            Some(evidence),
+                            &format!(
+                                "{}:{}:{}:{}:{}:{}:{}",
+                                source.rel_path,
+                                span.start_line,
+                                span.start_column,
+                                span.end_line,
+                                span.end_column,
+                                macro_name,
+                                specifier
+                            ),
+                        );
+                    }
+                    Occurrence::UnsupportedAttribute {
+                        specifier,
+                        reason,
+                        condition,
+                        span,
+                    } => {
+                        self.unsupported_syntax += 1;
+                        self.reasons.insert("unsupported-attribute".into());
+                        let unknown = self.unknown_node(
+                            "rust_attribute",
+                            &specifier,
+                            &source.rel_path,
+                            span,
+                            &reason,
+                        )?;
+                        let evidence = source_evidence(
+                            &source.rel_path,
+                            span,
+                            "unsupported Rust attribute payload",
+                        );
+                        self.add_site(
+                            &source_node,
+                            "unsupported_attribute",
+                            &specifier,
+                            "requires",
+                            condition,
+                            unresolved(unknown, &reason),
+                            evidence.clone(),
+                        )?;
+                        self.increment_file_site(&source.rel_path);
+                        self.add_diagnostic(
+                            DiagnosticSeverity::Warning,
+                            "RUST_ATTRIBUTE_UNSUPPORTED",
+                            "A Rust attribute payload could not be parsed and was preserved as an unresolved boundary",
+                            Some(&source.rel_path),
+                            Some(evidence),
+                            &format!(
+                                "{}:{}:{}:{}:{}:{}",
+                                source.rel_path,
+                                span.start_line,
+                                span.start_column,
+                                span.end_line,
+                                span.end_column,
+                                specifier
+                            ),
+                        );
+                    }
+                    Occurrence::UnsupportedMacroArguments {
+                        specifier,
+                        condition,
+                        span,
+                    } => {
+                        self.unsupported_syntax += 1;
+                        self.reasons.insert("unsupported-macro-arguments".into());
+                        let reason = "built-in macro arguments could not be inspected in safe scan";
+                        let unknown = self.unknown_node(
+                            "rust_macro_arguments",
+                            &specifier,
+                            &source.rel_path,
+                            span,
+                            reason,
+                        )?;
+                        let evidence = source_evidence(
+                            &source.rel_path,
+                            span,
+                            "unsupported built-in macro arguments",
+                        );
+                        self.add_site(
+                            &source_node,
+                            "unsupported_macro_arguments",
+                            &specifier,
+                            "requires",
+                            condition,
+                            unresolved(unknown, reason),
+                            evidence.clone(),
+                        )?;
+                        self.increment_file_site(&source.rel_path);
+                        self.add_diagnostic(
+                            DiagnosticSeverity::Warning,
+                            "RUST_MACRO_ARGUMENTS_UNSUPPORTED",
+                            "Built-in macro arguments could not be parsed recursively; completeness was withheld",
+                            Some(&source.rel_path),
+                            Some(evidence),
+                            &format!(
+                                "{}:{}:{}:{}:{}:{}",
+                                source.rel_path,
+                                span.start_line,
+                                span.start_column,
+                                span.end_line,
+                                span.end_column,
+                                specifier
+                            ),
+                        );
+                    }
                     Occurrence::Call { .. } => {}
                     Occurrence::Module { inline: true, .. } => {}
                 }
@@ -1958,26 +2278,44 @@ impl State {
     ) -> Result<(String, TargetResolution)> {
         let Some(argument) = argument else {
             self.unsupported_syntax += 1;
-            self.reasons.insert("dynamic-include".into());
+            let out_dir_boundary = raw_argument.contains("OUT_DIR");
+            let (diagnostic_code, coverage_reason, message, unresolved_reason) = if out_dir_boundary
+            {
+                (
+                    "RUST_HIR_OUT_DIR_UNAVAILABLE",
+                    "rust-hir-out-dir-unavailable",
+                    "include! depends on build-script OUT_DIR output, which safe scan does not execute or read",
+                    "build-script OUT_DIR output is unavailable in safe scan",
+                )
+            } else {
+                (
+                    "DYNAMIC_INCLUDE_UNRESOLVED",
+                    "dynamic-include",
+                    "include macro argument is not a string literal",
+                    "include argument is not a string literal",
+                )
+            };
+            self.reasons.insert(coverage_reason.into());
+            let evidence = source_evidence(source_path, span, "dynamic include boundary");
             self.add_diagnostic(
                 DiagnosticSeverity::Warning,
-                "DYNAMIC_INCLUDE_UNRESOLVED",
-                &format!("{macro_name}! argument is not a string literal"),
+                diagnostic_code,
+                message,
                 Some(source_path),
-                Some(source_evidence(source_path, span, "dynamic include")),
-                &format!("{source_path}:{}:{raw_argument}", span.start_line),
+                Some(evidence),
+                &format!(
+                    "{source_path}:{}:{}:{}:{}:{macro_name}",
+                    span.start_line, span.start_column, span.end_line, span.end_column
+                ),
             );
             let unknown = self.unknown_node(
                 "include",
                 raw_argument,
                 source_path,
                 span,
-                "include argument is not a string literal",
+                unresolved_reason,
             )?;
-            return Ok((
-                raw_argument.into(),
-                unresolved(unknown, "include argument is not a string literal"),
-            ));
+            return Ok((raw_argument.into(), unresolved(unknown, unresolved_reason)));
         };
         let argument_path = Path::new(&argument);
         let relative = if argument_path.is_absolute() {
@@ -2024,17 +2362,25 @@ impl State {
                 return Ok((argument, resolved(id)));
             }
         }
-        let unknown = self.unknown_node(
-            "include",
-            &argument,
-            source_path,
-            span,
-            "included path is missing or outside the scan root",
-        )?;
-        Ok((
-            argument,
-            unresolved(unknown, "included path is missing or outside the scan root"),
-        ))
+        let reason = "included path is missing or outside the scan root";
+        self.reasons.insert("include-path-unavailable".into());
+        self.add_diagnostic(
+            DiagnosticSeverity::Warning,
+            "RUST_INCLUDE_PATH_UNAVAILABLE",
+            reason,
+            Some(source_path),
+            Some(source_evidence(
+                source_path,
+                span,
+                "confined include boundary",
+            )),
+            &format!(
+                "{source_path}:{}:{}:{}:{}:{macro_name}",
+                span.start_line, span.start_column, span.end_line, span.end_column
+            ),
+        );
+        let unknown = self.unknown_node("include", &argument, source_path, span, reason)?;
+        Ok((argument, unresolved(unknown, reason)))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2471,6 +2817,104 @@ fn cargo_ancestor_manifest_failed(
     }
 }
 
+fn supported_rust_edition(edition: &str) -> bool {
+    matches!(edition, "2015" | "2018" | "2021" | "2024")
+}
+
+fn rust_semantic_complete_eligible(profile: &Profile, coverage: &Coverage) -> bool {
+    coverage.files_skipped == 0
+        && coverage.unsupported_syntax == 0
+        && coverage.unresolved == 0
+        && !coverage.project_code_executed
+        && profile.properties.get("analysis").and_then(Value::as_str)
+            == Some("syntax+hir-imports-types-calls")
+        && profile
+            .properties
+            .get("analysis_backend")
+            .and_then(Value::as_str)
+            == Some("static-syntax+rust-analyzer-hir")
+        && profile
+            .properties
+            .get("rust_hir_backend")
+            .and_then(Value::as_str)
+            == Some("rust-analyzer-hir")
+        && profile
+            .properties
+            .get("rust_hir_status")
+            .and_then(Value::as_str)
+            == Some("import-type-call-graph-emitted")
+        && profile
+            .properties
+            .get("rust_hir_project_model")
+            .and_then(Value::as_str)
+            == Some("ready")
+        && profile
+            .properties
+            .get("rust_hir_enable_gate")
+            .and_then(Value::as_str)
+            == Some("release-gate-pending")
+        && profile
+            .properties
+            .get("crate_graph_source")
+            .and_then(Value::as_str)
+            == Some("confined-cargo-metadata")
+        && profile
+            .properties
+            .get("cargo_metadata_input")
+            .and_then(Value::as_str)
+            == Some("confined-mirror")
+        && profile
+            .properties
+            .get("rust_toolchain_probe_status")
+            .and_then(Value::as_str)
+            == Some("compatible")
+        && profile
+            .properties
+            .get("rust_hir_toolchain_status")
+            .and_then(Value::as_str)
+            == Some("compatible")
+        && profile
+            .properties
+            .get("proc_macro_expansion")
+            .and_then(Value::as_str)
+            == Some("disabled")
+        && profile
+            .properties
+            .get("build_script_policy")
+            .and_then(Value::as_str)
+            == Some("disabled")
+        && profile
+            .properties
+            .get("proc_macro_policy")
+            .and_then(Value::as_str)
+            == Some("disabled")
+        && profile
+            .properties
+            .get("rust_hir_semantic_issue_count")
+            .and_then(Value::as_u64)
+            == Some(0)
+        && profile
+            .properties
+            .get("project_code_executed")
+            .and_then(Value::as_bool)
+            == Some(false)
+        && profile
+            .properties
+            .get("project_toolchain_executed")
+            .and_then(Value::as_bool)
+            == Some(false)
+        && profile
+            .properties
+            .get("build_scripts_executed")
+            .and_then(Value::as_bool)
+            == Some(false)
+        && profile
+            .properties
+            .get("proc_macros_executed")
+            .and_then(Value::as_bool)
+            == Some(false)
+}
+
 fn rust_profile(
     packages: &[Package],
     toolchain_probe: &RustToolchainProbe,
@@ -2592,6 +3036,7 @@ fn rust_profile(
             "proc_macros_executed": false,
             "build_script_policy": "disabled",
             "proc_macro_policy": "disabled",
+            "proc_macro_expansion": "disabled",
             "project_code_executed": false,
             "project_toolchain_executed": false
         })),
@@ -2988,6 +3433,190 @@ fn scannable_entry(entry: &DirEntry) -> bool {
 mod tests {
     use super::*;
 
+    fn write_complete_semantic_fixture(root: &Path) {
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname='complete'\nversion='0.1.0'\nedition='2024'\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("Cargo.lock"),
+            "version = 4\n\n[[package]]\nname = \"complete\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(root.join("src/lib.rs"), "pub mod model;\n").unwrap();
+        fs::write(root.join("src/model.rs"), "pub struct Thing;\n").unwrap();
+    }
+
+    fn forced_semantic_failure(
+        _model: &SafeProjectModel,
+        _contexts: &BTreeMap<String, SemanticCrateContext>,
+        _occurrences_by_path: &BTreeMap<String, Vec<Occurrence>>,
+        _profile_id: &str,
+    ) -> Result<SemanticDelta> {
+        bail!("forced typed semantic backend failure")
+    }
+
+    fn invalid_semantic_delta(
+        model: &SafeProjectModel,
+        contexts: &BTreeMap<String, SemanticCrateContext>,
+        occurrences_by_path: &BTreeMap<String, Vec<Occurrence>>,
+        profile_id: &str,
+    ) -> Result<SemanticDelta> {
+        let mut delta = extract_semantic_delta(model, contexts, occurrences_by_path, profile_id)?;
+        let site = delta
+            .sites
+            .first_mut()
+            .context("fixture must emit a semantic import site")?;
+        site.evidence
+            .first_mut()
+            .context("semantic fixture site must have evidence")?
+            .path = Some("__missing_semantic_input__.rs".into());
+        Ok(delta)
+    }
+
+    #[test]
+    fn complete_hir_profile_reports_semantic_complete() {
+        let temp = tempfile::tempdir().unwrap();
+        write_complete_semantic_fixture(temp.path());
+
+        let result = scan(temp.path()).unwrap();
+
+        assert_eq!(result.coverage.files_skipped, 0);
+        assert_eq!(result.coverage.unsupported_syntax, 0);
+        assert_eq!(result.coverage.unresolved, 0);
+        assert!(
+            result
+                .coverage
+                .completeness
+                .contains(&CompletenessLevel::SyntaxComplete)
+        );
+        assert!(
+            result
+                .coverage
+                .completeness
+                .contains(&CompletenessLevel::SemanticComplete)
+        );
+        assert_eq!(
+            result.profile.properties["rust_hir_enable_gate"],
+            "release-gate-pending"
+        );
+        crate::emit::build_events("semantic-complete-contract", &result).unwrap();
+    }
+
+    #[test]
+    fn nested_cfg_attr_conditions_are_preserved_in_semantic_complete_graphs() {
+        let temp = tempfile::tempdir().unwrap();
+        write_complete_semantic_fixture(temp.path());
+        fs::write(
+            temp.path().join("src/lib.rs"),
+            r#"pub struct Local;
+
+#[cfg_attr(feature = "p", cfg_attr(feature = "q", cfg(unix)))]
+pub fn consume(_: Local) {}
+"#,
+        )
+        .unwrap();
+
+        let result = scan(temp.path()).unwrap();
+
+        assert!(
+            result
+                .coverage
+                .completeness
+                .contains(&CompletenessLevel::SemanticComplete)
+        );
+        let condition = result
+            .sites
+            .iter()
+            .filter(|site| site.kind == "type_use")
+            .map(|site| site.condition.render())
+            .find(|condition| condition.contains("\"p\"") && condition.contains("\"q\""))
+            .expect("nested cfg_attr type-use condition");
+        assert!(condition.contains("rust.cfg.unix"));
+        assert!(condition.matches('!').count() >= 2);
+    }
+
+    #[test]
+    fn typed_hir_failure_preserves_syntax_and_discards_semantic_output() {
+        let temp = tempfile::tempdir().unwrap();
+        write_complete_semantic_fixture(temp.path());
+
+        let result = scan_with_semantic_extractor(temp.path(), forced_semantic_failure).unwrap();
+
+        assert_eq!(result.profile.properties["rust_hir_status"], "failed");
+        assert_eq!(
+            result.profile.properties["rust_hir_enable_gate"],
+            "semantic-backend-failure"
+        );
+        assert!(
+            result
+                .coverage
+                .reasons
+                .iter()
+                .any(|reason| reason == "rust-hir-backend-failure")
+        );
+        assert!(
+            !result
+                .coverage
+                .completeness
+                .contains(&CompletenessLevel::SemanticComplete)
+        );
+        assert!(result.nodes.iter().any(|node| node.kind == "module"));
+        assert!(
+            result
+                .nodes
+                .iter()
+                .all(|node| !matches!(node.kind.as_str(), "symbol" | "type"))
+        );
+        assert!(
+            result
+                .edges
+                .iter()
+                .all(|edge| edge.phase != Phase::Semantic)
+        );
+        assert!(result.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "RUST_HIR_BACKEND_FAILURE"
+                && !diagnostic
+                    .message
+                    .contains(temp.path().to_string_lossy().as_ref())
+        }));
+    }
+
+    #[test]
+    fn late_semantic_validation_failure_is_atomic() {
+        let temp = tempfile::tempdir().unwrap();
+        write_complete_semantic_fixture(temp.path());
+
+        let result = scan_with_semantic_extractor(temp.path(), invalid_semantic_delta).unwrap();
+
+        assert_eq!(result.profile.properties["rust_hir_status"], "failed");
+        assert!(
+            result
+                .nodes
+                .iter()
+                .all(|node| !matches!(node.kind.as_str(), "symbol" | "type"))
+        );
+        assert!(result.sites.iter().all(|site| {
+            site.evidence
+                .iter()
+                .all(|evidence| evidence.kind != EvidenceKind::Semantic)
+        }));
+        assert!(
+            result
+                .edges
+                .iter()
+                .all(|edge| edge.phase != Phase::Semantic)
+        );
+        assert!(
+            result
+                .files
+                .iter()
+                .all(|file| file.discovered_sites == file.emitted_sites)
+        );
+    }
+
     #[test]
     fn scan_result_satisfies_site_edge_invariants() {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/workspace");
@@ -3017,6 +3646,75 @@ mod tests {
         assert_eq!(result.coverage.files_skipped, 1);
         assert!(result.coverage.unsupported_syntax > 0);
         assert!(result.coverage.completeness.is_empty());
+    }
+
+    #[test]
+    fn invalid_nested_attribute_payload_is_not_reported_as_semantic_complete() {
+        let temp = tempfile::tempdir().unwrap();
+        write_complete_semantic_fixture(temp.path());
+        fs::write(
+            temp.path().join("src/lib.rs"),
+            "#[repr(align(env!(\"OUT_DIR\")))]\npub struct Broken(u8);\n",
+        )
+        .unwrap();
+
+        let result = scan(temp.path()).unwrap();
+
+        assert!(result.coverage.unsupported_syntax > 0);
+        assert!(
+            !result
+                .coverage
+                .completeness
+                .contains(&CompletenessLevel::SemanticComplete)
+        );
+        assert!(
+            result
+                .coverage
+                .reasons
+                .iter()
+                .any(|reason| reason == "unsupported-attribute")
+        );
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "RUST_ATTRIBUTE_UNSUPPORTED")
+        );
+    }
+
+    #[test]
+    fn unverified_builtin_attribute_forms_are_not_reported_as_semantic_complete() {
+        for source in [
+            "#[repr = \"C\"]\npub struct Broken(u8);\n",
+            "#[inline(foo)]\npub fn broken() {}\n",
+            "#[repr(C, Rust)]\npub struct Broken(u8);\n",
+            "#[cfg(not(unix, windows))]\npub fn broken() {}\n",
+            "#[cfg(foo::bar)]\npub fn broken() {}\n",
+            "#[cfg(foo::bar = \"x\")]\npub fn broken() {}\n",
+            "#[cfg_attr(foo::bar, cfg(unix))]\npub fn broken() {}\n",
+            "#[cfg_attr(unix, cfg(not(a, b)))]\npub fn broken() {}\n",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            write_complete_semantic_fixture(temp.path());
+            fs::write(temp.path().join("src/lib.rs"), source).unwrap();
+
+            let result = scan(temp.path()).unwrap();
+
+            assert!(result.coverage.unsupported_syntax > 0, "source: {source}");
+            assert!(
+                !result
+                    .coverage
+                    .completeness
+                    .contains(&CompletenessLevel::SemanticComplete),
+                "source: {source}"
+            );
+            assert!(
+                result
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| { diagnostic.code == "RUST_ATTRIBUTE_UNSUPPORTED" })
+            );
+        }
     }
 
     #[cfg(unix)]

@@ -576,6 +576,116 @@ fn scan_with_worker(
 }
 
 #[cfg(unix)]
+fn rust_fixture_root(worker_timeout_seconds: u64) -> tempfile::TempDir {
+    let root = tempfile::tempdir().unwrap();
+    fs::write(
+        root.path().join("Cargo.toml"),
+        "[package]\nname='rust-failure-fixture'\nversion='0.1.0'\nedition='2024'\n",
+    )
+    .unwrap();
+    fs::write(
+        root.path().join(".depgraph.toml"),
+        format!("schema_version = 1\n[scan]\nworker_timeout_seconds = {worker_timeout_seconds}\n"),
+    )
+    .unwrap();
+    root
+}
+
+#[cfg(unix)]
+fn rust_common_event(event: &str, seq: u64, payload: &str, extra_arguments: &str) -> String {
+    format!(
+        r#"printf '{{"event":"{event}","protocol_version":"1.0","scan_id":"%s","adapter":"rust","adapter_version":"0.1.0","seq":{seq}{payload}}}\n' "$scan"{extra_arguments}"#
+    )
+}
+
+#[cfg(unix)]
+fn rust_failure_worker(action: &str, stderr: &str) -> String {
+    [
+        PARSE_ARGS.to_owned(),
+        rust_common_event(
+            "scan_started",
+            1,
+            r#", "root":"%s","project_code_executed":false,"safe_mode":true"#,
+            r#" "$root""#,
+        ),
+        rust_common_event(
+            "profile_declared",
+            2,
+            r#", "profile":{"id":"rust:test","language":"rust","features":[],"environment":{},"properties":{}}"#,
+            "",
+        ),
+        rust_common_event(
+            "node_upsert",
+            3,
+            r#", "node":{"id":"file:rust-prefix","kind":"file","locator":"file://Cargo.toml","properties":{}}"#,
+            "",
+        ),
+        format!("printf '%s' {stderr:?} >&2"),
+        action.to_owned(),
+    ]
+    .join("\n")
+}
+
+#[cfg(unix)]
+fn rust_typed_backend_failure_worker() -> String {
+    let coverage = r#"{"profiles":1,"files_discovered":1,"files_analyzed":1,"files_skipped":0,"dependency_sites":0,"resolved":0,"candidates":0,"external":0,"unresolved":0,"unsupported_syntax":0,"project_code_executed":false,"completeness":["syntax-complete"],"reasons":["rust-hir-backend-failure"]}"#;
+    [
+        PARSE_ARGS.to_owned(),
+        rust_common_event(
+            "scan_started",
+            1,
+            r#", "root":"%s","project_code_executed":false,"safe_mode":true"#,
+            r#" "$root""#,
+        ),
+        rust_common_event(
+            "profile_declared",
+            2,
+            r#", "profile":{"id":"rust:test","language":"rust","features":[],"environment":{},"properties":{"analysis":"syntax","rust_hir_status":"failed"}}"#,
+            "",
+        ),
+        rust_common_event(
+            "file_completed",
+            3,
+            r#", "path":"Cargo.toml","discovered_sites":0,"emitted_sites":0,"skipped_sites":0,"skipped":false"#,
+            "",
+        ),
+        rust_common_event(
+            "profile_completed",
+            4,
+            &format!(r#", "profile_id":"rust:test","coverage":{coverage}"#),
+            "",
+        ),
+        rust_common_event(
+            "scan_completed",
+            5,
+            &format!(r#", "coverage":{coverage}"#),
+            "",
+        ),
+    ]
+    .join("\n")
+}
+
+#[cfg(unix)]
+fn scan_with_rust_worker(
+    root: &std::path::Path,
+    store: &std::path::Path,
+    worker: &std::path::Path,
+) -> std::process::Output {
+    Command::cargo_bin("depgraph")
+        .unwrap()
+        .env("DEPGRAPH_RUST_WORKER", worker)
+        .args([
+            "--store",
+            store.to_str().unwrap(),
+            "scan",
+            root.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap()
+}
+
+#[cfg(unix)]
 #[test]
 fn failed_attempt_keeps_partial_graph_without_replacing_latest_success() {
     let root = fixture_root();
@@ -691,6 +801,164 @@ fn failed_attempt_keeps_partial_graph_without_replacing_latest_success() {
 
 #[cfg(unix)]
 #[test]
+fn rust_worker_failures_are_partial_exit_three_and_canonically_stable() {
+    let root = rust_fixture_root(10);
+    let timeout_root = rust_fixture_root(1);
+    let temp = tempfile::tempdir().unwrap();
+    let scenarios = [
+        ("panic", "exit 101", "volatile-panic-stderr", "nonzero-exit"),
+        (
+            "stderr-spoof",
+            "exit 101",
+            "timed out; security policy; volatile stderr",
+            "nonzero-exit",
+        ),
+        ("path-spoof", "exit 101", "ordinary stderr", "nonzero-exit"),
+        (
+            "timeout",
+            "exec sleep 10",
+            "volatile-timeout-stderr",
+            "timeout",
+        ),
+        (
+            "malformed",
+            "printf 'not-json\\n'",
+            "volatile-malformed-stderr",
+            "malformed-protocol",
+        ),
+        (
+            "nonzero-malformed",
+            "printf 'not-json\\n'; exit 101",
+            "volatile-nonzero-malformed-stderr",
+            "nonzero-exit",
+        ),
+    ];
+    let mut first_nonzero = None;
+
+    for (name, action, raw_stderr, expected_kind) in scenarios {
+        let worker = if name == "path-spoof" {
+            let directory = temp.path().join("timed out security policy");
+            fs::create_dir(&directory).unwrap();
+            directory.join("worker.sh")
+        } else {
+            temp.path().join(format!("{name}-worker.sh"))
+        };
+        write_worker(&worker, &rust_failure_worker(action, raw_stderr));
+        let store = temp.path().join(format!("{name}.db"));
+        let scan_root = if name == "timeout" {
+            timeout_root.path()
+        } else {
+            root.path()
+        };
+        let output = scan_with_rust_worker(scan_root, &store, &worker);
+        assert_eq!(
+            output.status.code(),
+            Some(3),
+            "scenario={name}\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["status"], "partial", "scenario={name}");
+        assert!(
+            !report["coverage"]["completeness"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("semantic-complete")),
+            "scenario={name}"
+        );
+        let stable_reason = format!("worker-failure:rust:{expected_kind}");
+        assert!(
+            report["coverage"]["reasons"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::Value::String(stable_reason.clone())),
+            "scenario={name}: {}",
+            report["coverage"]
+        );
+        let failure = report["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|diagnostic| diagnostic["code"] == "worker-failure")
+            .unwrap();
+        assert_eq!(failure["message"], stable_reason);
+        let canonical = serde_json::json!({
+            "coverage": report["coverage"],
+            "diagnostics": report["diagnostics"],
+        });
+        let serialized = serde_json::to_string(&canonical).unwrap();
+        assert!(!serialized.contains(worker.to_string_lossy().as_ref()));
+        assert!(!serialized.contains(raw_stderr));
+
+        if name == "panic" {
+            first_nonzero = Some(canonical);
+        }
+    }
+
+    let worker = temp.path().join("other-checkout-panic-worker.sh");
+    write_worker(
+        &worker,
+        &rust_failure_worker("exit 101", "different-volatile-stderr"),
+    );
+    let repeated =
+        scan_with_rust_worker(root.path(), &temp.path().join("panic-repeated.db"), &worker);
+    assert_eq!(repeated.status.code(), Some(3));
+    let repeated: serde_json::Value = serde_json::from_slice(&repeated.stdout).unwrap();
+    assert_eq!(
+        first_nonzero.unwrap(),
+        serde_json::json!({
+            "coverage": repeated["coverage"],
+            "diagnostics": repeated["diagnostics"],
+        })
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn strict_rust_hir_backend_failure_is_policy_failed_exit_one() {
+    let root = rust_fixture_root(10);
+    let temp = tempfile::tempdir().unwrap();
+    let worker = temp.path().join("typed-backend-failure.sh");
+    write_worker(&worker, &rust_typed_backend_failure_worker());
+    let output = Command::cargo_bin("depgraph")
+        .unwrap()
+        .env("DEPGRAPH_RUST_WORKER", &worker)
+        .args([
+            "--store",
+            temp.path().join("strict.db").to_str().unwrap(),
+            "scan",
+            root.path().to_str().unwrap(),
+            "--strict",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["status"], "policy_failed");
+    assert!(
+        report["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| {
+                diagnostic["code"] == "strict-policy"
+                    && diagnostic["message"]
+                        .as_str()
+                        .is_some_and(|message| message.contains("rust_hir_backend_failure=true"))
+            })
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn unsafe_worker_is_a_security_exit() {
     let root = fixture_root();
     let temp = tempfile::tempdir().unwrap();
@@ -712,6 +980,45 @@ fn unsafe_worker_is_a_security_exit() {
         .args([
             "--store",
             temp.path().join("graph.db").to_str().unwrap(),
+            "scan",
+            root.path().to_str().unwrap(),
+            "--json",
+        ])
+        .assert()
+        .code(4)
+        .stdout(predicate::str::contains("security_failed"));
+
+    let worker = temp.path().join("unsafe-profile.sh");
+    let unsafe_coverage = r#"{"profiles":1,"files_discovered":0,"files_analyzed":0,"files_skipped":0,"dependency_sites":0,"resolved":0,"candidates":0,"external":0,"unresolved":0,"unsupported_syntax":0,"project_code_executed":true,"completeness":[],"reasons":[]}"#;
+    let body = [
+        PARSE_ARGS.to_owned(),
+        common_event(
+            "scan_started",
+            1,
+            r#", "root":"%s","project_code_executed":false,"safe_mode":true"#,
+            r#" "$root""#,
+        ),
+        common_event(
+            "profile_declared",
+            2,
+            r#", "profile":{"id":"go:test","language":"go","features":[],"environment":{},"properties":{}}"#,
+            "",
+        ),
+        common_event(
+            "profile_completed",
+            3,
+            &format!(r#", "profile_id":"go:test","coverage":{unsafe_coverage}"#),
+            "",
+        ),
+    ]
+    .join("\n");
+    write_worker(&worker, &body);
+    Command::cargo_bin("depgraph")
+        .unwrap()
+        .env("DEPGRAPH_GO_WORKER", &worker)
+        .args([
+            "--store",
+            temp.path().join("profile.db").to_str().unwrap(),
             "scan",
             root.path().to_str().unwrap(),
             "--json",
@@ -1037,7 +1344,7 @@ fn nonzero_worker_exit_is_exit_three_and_keeps_its_valid_prefix() {
                 diagnostic["code"] == "worker-failure"
                     && diagnostic["message"]
                         .as_str()
-                        .is_some_and(|message| message.contains("exited with exit status: 17"))
+                        .is_some_and(|message| message == "worker-failure:go:nonzero-exit")
             })
     );
 

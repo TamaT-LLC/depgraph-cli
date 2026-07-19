@@ -51,6 +51,23 @@ pub(crate) enum CallSyntaxKind {
     MacroBoundary,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum MacroExpansionBoundaryKind {
+    Bang,
+    Attribute,
+    Derive,
+}
+
+impl MacroExpansionBoundaryKind {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Bang => "bang",
+            Self::Attribute => "attribute",
+            Self::Derive => "derive",
+        }
+    }
+}
+
 impl CallSyntaxKind {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
@@ -223,6 +240,30 @@ pub(crate) enum Occurrence {
         condition: Condition,
         span: SourceSpan,
     },
+    MacroExpansionBoundary {
+        specifier: String,
+        boundary_kind: MacroExpansionBoundaryKind,
+        condition: Condition,
+        span: SourceSpan,
+    },
+    BuildEnvironmentMacro {
+        macro_name: String,
+        variable: Option<String>,
+        raw_argument: String,
+        condition: Condition,
+        span: SourceSpan,
+    },
+    UnsupportedAttribute {
+        specifier: String,
+        reason: String,
+        condition: Condition,
+        span: SourceSpan,
+    },
+    UnsupportedMacroArguments {
+        specifier: String,
+        condition: Condition,
+        span: SourceSpan,
+    },
 }
 
 impl Occurrence {
@@ -333,10 +374,12 @@ impl Collector {
         Condition::All { conditions }.canonicalize()
     }
 
-    fn child_condition(&self, parent: &Condition, attributes: &[Attribute]) -> Condition {
+    fn child_condition(&mut self, parent: &Condition, attributes: &[Attribute]) -> Condition {
         let mut conditions = vec![parent.clone()];
         conditions.extend(cfg_conditions(attributes));
-        Condition::All { conditions }.canonicalize()
+        let condition = Condition::All { conditions }.canonicalize();
+        self.collect_attribute_boundaries(attributes, &condition);
+        condition
     }
 
     fn inherited_condition(&self) -> Condition {
@@ -344,6 +387,13 @@ impl Collector {
             conditions: self.inherited_conditions.clone(),
         }
         .canonicalize()
+    }
+
+    fn active_condition(&self) -> Condition {
+        self.type_use_frames
+            .last()
+            .map(|frame| frame.condition.clone())
+            .unwrap_or_else(|| self.inherited_condition())
     }
 
     fn record_call(&mut self, specifier: String, syntax_kind: CallSyntaxKind, span: SourceSpan) {
@@ -411,8 +461,13 @@ impl Collector {
                 syn::GenericParam::Const(parameter) => {
                     let condition = self.child_condition(condition, &parameter.attrs);
                     self.collect_type(&parameter.ty, TypeUseContext::GenericBound, &condition);
+                    if let Some(default) = &parameter.default {
+                        self.visit_body_expr(default, &condition);
+                    }
                 }
-                syn::GenericParam::Lifetime(_) => {}
+                syn::GenericParam::Lifetime(parameter) => {
+                    self.child_condition(condition, &parameter.attrs);
+                }
             }
         }
         let Some(where_clause) = &generics.where_clause else {
@@ -436,8 +491,8 @@ impl Collector {
         for input in &signature.inputs {
             match input {
                 syn::FnArg::Receiver(receiver) => {
+                    let input_condition = self.child_condition(condition, &receiver.attrs);
                     if receiver.colon_token.is_some() {
-                        let input_condition = self.child_condition(condition, &receiver.attrs);
                         self.collect_type(
                             &receiver.ty,
                             TypeUseContext::Signature,
@@ -447,9 +502,20 @@ impl Collector {
                 }
                 syn::FnArg::Typed(input) => {
                     let input_condition = self.child_condition(condition, &input.attrs);
+                    self.inherited_conditions.push(input_condition.clone());
+                    self.type_use_frames.push(TypeUseFrame {
+                        context: TypeUseContext::Signature,
+                        condition: input_condition.clone(),
+                    });
+                    self.visit_pat(&input.pat);
+                    self.type_use_frames.pop();
+                    self.inherited_conditions.pop();
                     self.collect_type(&input.ty, TypeUseContext::Signature, &input_condition);
                 }
             }
+        }
+        if let Some(variadic) = &signature.variadic {
+            self.child_condition(condition, &variadic.attrs);
         }
         if let syn::ReturnType::Type(_, output) = &signature.output {
             self.collect_type(output, TypeUseContext::Signature, condition);
@@ -505,31 +571,449 @@ impl Collector {
         });
     }
 
+    fn record_macro_expansion_boundary(
+        &mut self,
+        specifier: String,
+        boundary_kind: MacroExpansionBoundaryKind,
+        condition: Condition,
+        span: SourceSpan,
+    ) {
+        let condition = condition.canonicalize();
+        if self.occurrences.iter().any(|occurrence| {
+            matches!(
+                occurrence,
+                Occurrence::MacroExpansionBoundary {
+                    specifier: existing_specifier,
+                    boundary_kind: existing_kind,
+                    condition: existing_condition,
+                    span: existing_span,
+                } if existing_specifier == &specifier
+                    && *existing_kind == boundary_kind
+                    && existing_condition == &condition
+                    && *existing_span == span
+            )
+        }) {
+            return;
+        }
+        self.occurrences.push(Occurrence::MacroExpansionBoundary {
+            specifier,
+            boundary_kind,
+            condition,
+            span,
+        });
+    }
+
+    fn record_build_environment_macro(
+        &mut self,
+        macro_name: String,
+        variable: Option<String>,
+        raw_argument: String,
+        condition: Condition,
+        span: SourceSpan,
+    ) {
+        let condition = condition.canonicalize();
+        if self.occurrences.iter().any(|occurrence| {
+            matches!(
+                occurrence,
+                Occurrence::BuildEnvironmentMacro {
+                    macro_name: existing_name,
+                    variable: existing_variable,
+                    raw_argument: existing_raw,
+                    condition: existing_condition,
+                    span: existing_span,
+                } if existing_name == &macro_name
+                    && existing_variable == &variable
+                    && existing_raw == &raw_argument
+                    && existing_condition == &condition
+                    && *existing_span == span
+            )
+        }) {
+            return;
+        }
+        self.occurrences.push(Occurrence::BuildEnvironmentMacro {
+            macro_name,
+            variable,
+            raw_argument,
+            condition,
+            span,
+        });
+    }
+
+    fn record_unsupported_attribute(
+        &mut self,
+        specifier: String,
+        reason: &'static str,
+        condition: Condition,
+        span: SourceSpan,
+    ) {
+        let condition = condition.canonicalize();
+        if self.occurrences.iter().any(|occurrence| {
+            matches!(
+                occurrence,
+                Occurrence::UnsupportedAttribute {
+                    specifier: existing_specifier,
+                    reason: existing_reason,
+                    condition: existing_condition,
+                    span: existing_span,
+                } if existing_specifier == &specifier
+                    && existing_reason == reason
+                    && existing_condition == &condition
+                    && *existing_span == span
+            )
+        }) {
+            return;
+        }
+        self.occurrences.push(Occurrence::UnsupportedAttribute {
+            specifier,
+            reason: reason.into(),
+            condition,
+            span,
+        });
+    }
+
+    fn record_unsupported_macro_arguments(
+        &mut self,
+        specifier: String,
+        condition: Condition,
+        span: SourceSpan,
+    ) {
+        let condition = condition.canonicalize();
+        if self.occurrences.iter().any(|occurrence| {
+            matches!(
+                occurrence,
+                Occurrence::UnsupportedMacroArguments {
+                    specifier: existing_specifier,
+                    condition: existing_condition,
+                    span: existing_span,
+                } if existing_specifier == &specifier
+                    && existing_condition == &condition
+                    && *existing_span == span
+            )
+        }) {
+            return;
+        }
+        self.occurrences
+            .push(Occurrence::UnsupportedMacroArguments {
+                specifier,
+                condition,
+                span,
+            });
+    }
+
+    fn collect_attribute_boundaries(&mut self, attributes: &[Attribute], condition: &Condition) {
+        for attribute in attributes {
+            self.collect_attribute_meta(&attribute.meta, condition, attribute.span());
+        }
+    }
+
+    fn collect_attribute_meta(&mut self, meta: &Meta, condition: &Condition, span: Span) {
+        if let Meta::NameValue(name_value) = meta {
+            self.collect_attribute_expression_macros(&name_value.value, condition);
+        }
+
+        if meta.path().is_ident("derive") {
+            let Meta::List(list) = meta else {
+                self.record_unsupported_attribute(
+                    "derive".into(),
+                    "derive attribute payload is not a trait path list",
+                    condition.clone(),
+                    SourceSpan::from_span(span),
+                );
+                return;
+            };
+            let derives = match Punctuated::<syn::Path, Token![,]>::parse_terminated
+                .parse2(list.tokens.clone())
+            {
+                Ok(derives) => derives,
+                Err(_) => {
+                    self.record_unsupported_attribute(
+                        format!("derive({})", list.tokens),
+                        "derive attribute payload could not be parsed",
+                        condition.clone(),
+                        SourceSpan::from_span(span),
+                    );
+                    return;
+                }
+            };
+            for derive in derives {
+                self.record_macro_expansion_boundary(
+                    type_specifier(&derive),
+                    MacroExpansionBoundaryKind::Derive,
+                    condition.clone(),
+                    SourceSpan::from_span(derive.span()),
+                );
+            }
+            return;
+        }
+
+        if meta.path().is_ident("cfg") {
+            let valid = match meta {
+                Meta::List(list) => try_parse_meta_list(&list.tokens)
+                    .is_ok_and(|items| items.len() == 1 && valid_cfg_predicate(&items[0])),
+                _ => false,
+            };
+            if !valid {
+                let specifier = match meta {
+                    Meta::List(list) => format!("cfg({})", list.tokens),
+                    Meta::NameValue(_) => "cfg=<value>".into(),
+                    Meta::Path(_) => "cfg".into(),
+                };
+                self.record_unsupported_attribute(
+                    specifier,
+                    "cfg attribute payload could not be parsed",
+                    condition.clone(),
+                    SourceSpan::from_span(span),
+                );
+            }
+            return;
+        }
+
+        if meta.path().is_ident("cfg_attr") {
+            let Meta::List(list) = meta else {
+                self.record_unsupported_attribute(
+                    "cfg_attr".into(),
+                    "cfg_attr payload is not a predicate and attribute list",
+                    condition.clone(),
+                    SourceSpan::from_span(span),
+                );
+                return;
+            };
+            let Ok(items) = try_parse_meta_list(&list.tokens) else {
+                self.record_unsupported_attribute(
+                    format!("cfg_attr({})", list.tokens),
+                    "cfg_attr payload could not be parsed",
+                    condition.clone(),
+                    SourceSpan::from_span(span),
+                );
+                return;
+            };
+            let Some(predicate) = items.first().filter(|_| items.len() >= 2) else {
+                self.record_unsupported_attribute(
+                    format!("cfg_attr({})", list.tokens),
+                    "cfg_attr payload could not be parsed",
+                    condition.clone(),
+                    SourceSpan::from_span(span),
+                );
+                return;
+            };
+            if !valid_cfg_predicate(predicate) {
+                self.record_unsupported_attribute(
+                    format!("cfg_attr({})", list.tokens),
+                    "cfg_attr predicate is not a supported cfg expression",
+                    condition.clone(),
+                    SourceSpan::from_span(span),
+                );
+                for nested in items.iter().skip(1) {
+                    self.collect_attribute_meta(nested, condition, nested.span());
+                }
+                return;
+            }
+            let nested_condition = Condition::All {
+                conditions: vec![condition.clone(), condition_from_meta(predicate)],
+            }
+            .canonicalize();
+            for nested in items.iter().skip(1) {
+                self.collect_attribute_meta(nested, &nested_condition, nested.span());
+            }
+            return;
+        }
+
+        if let Meta::List(list) = meta {
+            let nested = try_parse_meta_list(&list.tokens).unwrap_or_default();
+            for nested_meta in &nested {
+                self.collect_nested_meta_expression_macros(nested_meta, condition);
+            }
+        }
+
+        if is_builtin_attribute(meta.path()) {
+            self.record_unsupported_attribute(
+                attribute_specifier(meta),
+                "built-in attribute semantics are not statically verified",
+                condition.clone(),
+                SourceSpan::from_span(span),
+            );
+            return;
+        }
+        self.record_macro_expansion_boundary(
+            type_specifier(meta.path()),
+            MacroExpansionBoundaryKind::Attribute,
+            condition.clone(),
+            SourceSpan::from_span(span),
+        );
+    }
+
+    fn collect_nested_meta_expression_macros(&mut self, meta: &Meta, condition: &Condition) {
+        match meta {
+            Meta::NameValue(name_value) => {
+                self.collect_attribute_expression_macros(&name_value.value, condition);
+            }
+            Meta::List(list) => match try_parse_meta_list(&list.tokens) {
+                Ok(nested) => {
+                    for nested in nested {
+                        self.collect_nested_meta_expression_macros(&nested, condition);
+                    }
+                }
+                Err(_) => {
+                    self.collect_expression_macros_from_tokens(&list.tokens, condition);
+                    self.record_unsupported_attribute(
+                        format!("{}({})", type_specifier(&list.path), list.tokens),
+                        "nested attribute payload could not be parsed",
+                        condition.clone(),
+                        SourceSpan::from_span(list.span()),
+                    );
+                }
+            },
+            Meta::Path(_) => {}
+        }
+    }
+
+    fn collect_expression_macros_from_tokens(
+        &mut self,
+        tokens: &proc_macro2::TokenStream,
+        condition: &Condition,
+    ) {
+        let Ok(expressions) =
+            Punctuated::<Expr, Token![,]>::parse_terminated.parse2(tokens.clone())
+        else {
+            return;
+        };
+        for expression in expressions {
+            self.collect_attribute_expression_macros(&expression, condition);
+        }
+    }
+
+    fn collect_attribute_expression_macros(&mut self, expression: &Expr, condition: &Condition) {
+        struct ExpressionMacroCollector<'collector> {
+            collector: &'collector mut Collector,
+            condition: &'collector Condition,
+        }
+
+        impl<'ast> Visit<'ast> for ExpressionMacroCollector<'_> {
+            fn visit_expr_macro(&mut self, node: &'ast syn::ExprMacro) {
+                self.collector
+                    .collect_macro(&node.mac, self.condition.clone());
+            }
+        }
+
+        let mut collector = ExpressionMacroCollector {
+            collector: self,
+            condition,
+        };
+        collector.visit_expr(expression);
+    }
+
     fn collect_macro(&mut self, mac: &Macro, condition: Condition) {
+        if mac.path.is_ident("macro_rules") {
+            return;
+        }
+        // syn keeps macro arguments as opaque tokens. Recursively parse the
+        // expression-shaped subset so safety boundaries nested inside benign
+        // built-ins (for example concat!(env!("OUT_DIR"), ...)) are not lost.
+        let arguments = Punctuated::<Expr, Token![,]>::parse_terminated.parse2(mac.tokens.clone());
+        if let Ok(arguments) = &arguments {
+            for argument in arguments {
+                self.collect_attribute_expression_macros(argument, &condition);
+            }
+        }
         let Some(segment) = mac.path.segments.last() else {
             return;
         };
         let macro_name = segment.ident.to_string();
-        if !matches!(
-            macro_name.as_str(),
-            "include" | "include_str" | "include_bytes"
-        ) {
+        if mac.path.is_ident("include")
+            || mac.path.is_ident("include_str")
+            || mac.path.is_ident("include_bytes")
+        {
+            let argument = syn::parse2::<syn::LitStr>(mac.tokens.clone())
+                .ok()
+                .map(|literal| literal.value());
+            let occurrence = Occurrence::Include {
+                macro_name: macro_name.clone(),
+                argument,
+                raw_argument: mac.tokens.to_string(),
+                condition: condition.clone(),
+                span: SourceSpan::from_span(mac.span()),
+            };
+            if !self.occurrences.contains(&occurrence) {
+                self.occurrences.push(occurrence);
+            }
+            self.record_macro_expansion_boundary(
+                format!("{macro_name}!"),
+                MacroExpansionBoundaryKind::Bang,
+                condition,
+                SourceSpan::from_span(mac.span()),
+            );
             return;
         }
-        let argument = syn::parse2::<syn::LitStr>(mac.tokens.clone())
-            .ok()
-            .map(|literal| literal.value());
-        self.occurrences.push(Occurrence::Include {
-            macro_name,
-            argument,
-            raw_argument: mac.tokens.to_string(),
+
+        if mac.path.is_ident("env") || mac.path.is_ident("option_env") {
+            self.record_build_environment_macro(
+                macro_name,
+                first_string_literal_argument(&mac.tokens),
+                mac.tokens.to_string(),
+                condition,
+                SourceSpan::from_span(mac.span()),
+            );
+            return;
+        }
+
+        if is_builtin_macro(&mac.path) && arguments.is_err() && !mac.tokens.is_empty() {
+            self.record_unsupported_macro_arguments(
+                format!("{}!", type_specifier(&mac.path)),
+                condition.clone(),
+                SourceSpan::from_span(mac.span()),
+            );
+        }
+        self.record_macro_expansion_boundary(
+            format!("{}!", type_specifier(&mac.path)),
+            MacroExpansionBoundaryKind::Bang,
             condition,
-            span: SourceSpan::from_span(mac.span()),
-        });
+            SourceSpan::from_span(mac.span()),
+        );
     }
 }
 
 impl<'ast> Visit<'ast> for Collector {
+    fn visit_attribute(&mut self, node: &'ast Attribute) {
+        let condition = self.active_condition();
+        self.collect_attribute_meta(&node.meta, &condition, node.span());
+    }
+
+    fn visit_file(&mut self, node: &'ast syn::File) {
+        let condition = self.condition(&node.attrs);
+        self.collect_attribute_boundaries(&node.attrs, &condition);
+        for item in &node.items {
+            self.visit_item(item);
+        }
+    }
+
+    fn visit_item(&mut self, node: &'ast syn::Item) {
+        let attributes = item_attributes(node);
+        let condition = self.condition(attributes);
+        self.collect_attribute_boundaries(attributes, &condition);
+        visit::visit_item(self, node);
+    }
+
+    fn visit_trait_item(&mut self, node: &'ast syn::TraitItem) {
+        let attributes = trait_item_attributes(node);
+        let condition = self.condition(attributes);
+        self.collect_attribute_boundaries(attributes, &condition);
+        visit::visit_trait_item(self, node);
+    }
+
+    fn visit_impl_item(&mut self, node: &'ast syn::ImplItem) {
+        let attributes = impl_item_attributes(node);
+        let condition = self.condition(attributes);
+        self.collect_attribute_boundaries(attributes, &condition);
+        visit::visit_impl_item(self, node);
+    }
+
+    fn visit_foreign_item(&mut self, node: &'ast syn::ForeignItem) {
+        let attributes = foreign_item_attributes(node);
+        let condition = self.condition(attributes);
+        self.collect_attribute_boundaries(attributes, &condition);
+        visit::visit_foreign_item(self, node);
+    }
+
     fn visit_item_use(&mut self, node: &'ast ItemUse) {
         let mut leaves = Vec::new();
         flatten_use_tree(
@@ -789,8 +1273,21 @@ impl<'ast> Visit<'ast> for Collector {
         self.collect_macro(&node.mac, self.condition(&node.attrs));
     }
 
+    fn visit_trait_item_macro(&mut self, node: &'ast syn::TraitItemMacro) {
+        self.collect_macro(&node.mac, self.condition(&node.attrs));
+    }
+
+    fn visit_impl_item_macro(&mut self, node: &'ast syn::ImplItemMacro) {
+        self.collect_macro(&node.mac, self.condition(&node.attrs));
+    }
+
+    fn visit_foreign_item_macro(&mut self, node: &'ast syn::ForeignItemMacro) {
+        self.collect_macro(&node.mac, self.condition(&node.attrs));
+    }
+
     fn visit_macro(&mut self, node: &'ast Macro) {
-        self.collect_macro(node, self.condition(&[]));
+        let condition = self.active_condition();
+        self.collect_macro(node, condition);
         visit::visit_macro(self, node);
     }
 
@@ -822,6 +1319,75 @@ impl<'ast> Visit<'ast> for Collector {
             condition,
         });
         visit::visit_arm(self, node);
+        self.type_use_frames.pop();
+        self.inherited_conditions.pop();
+    }
+
+    fn visit_bare_fn_arg(&mut self, node: &'ast syn::BareFnArg) {
+        let Some(frame) = self.type_use_frames.last().cloned() else {
+            visit::visit_bare_fn_arg(self, node);
+            return;
+        };
+        let condition = self.child_condition(&frame.condition, &node.attrs);
+        self.inherited_conditions.push(condition.clone());
+        self.type_use_frames.push(TypeUseFrame {
+            context: frame.context,
+            condition,
+        });
+        visit::visit_bare_fn_arg(self, node);
+        self.type_use_frames.pop();
+        self.inherited_conditions.pop();
+    }
+
+    fn visit_field_pat(&mut self, node: &'ast syn::FieldPat) {
+        let Some(frame) = self.type_use_frames.last().cloned() else {
+            visit::visit_field_pat(self, node);
+            return;
+        };
+        let condition = self.child_condition(&frame.condition, &node.attrs);
+        self.inherited_conditions.push(condition.clone());
+        self.type_use_frames.push(TypeUseFrame {
+            context: frame.context,
+            condition,
+        });
+        visit::visit_field_pat(self, node);
+        self.type_use_frames.pop();
+        self.inherited_conditions.pop();
+    }
+
+    fn visit_field_value(&mut self, node: &'ast syn::FieldValue) {
+        let Some(frame) = self.type_use_frames.last().cloned() else {
+            visit::visit_field_value(self, node);
+            return;
+        };
+        let condition = self.child_condition(&frame.condition, &node.attrs);
+        self.inherited_conditions.push(condition.clone());
+        self.type_use_frames.push(TypeUseFrame {
+            context: frame.context,
+            condition,
+        });
+        visit::visit_field_value(self, node);
+        self.type_use_frames.pop();
+        self.inherited_conditions.pop();
+    }
+
+    fn visit_pat(&mut self, node: &'ast syn::Pat) {
+        let Some(frame) = self.type_use_frames.last().cloned() else {
+            visit::visit_pat(self, node);
+            return;
+        };
+        let attrs = pat_attributes(node);
+        if attrs.is_empty() {
+            visit::visit_pat(self, node);
+            return;
+        }
+        let condition = self.child_condition(&frame.condition, attrs);
+        self.inherited_conditions.push(condition.clone());
+        self.type_use_frames.push(TypeUseFrame {
+            context: frame.context,
+            condition,
+        });
+        visit::visit_pat(self, node);
         self.type_use_frames.pop();
         self.inherited_conditions.pop();
     }
@@ -1004,6 +1570,198 @@ fn flatten_use_tree(
     }
 }
 
+fn first_string_literal_argument(tokens: &proc_macro2::TokenStream) -> Option<String> {
+    let arguments = Punctuated::<Expr, Token![,]>::parse_terminated
+        .parse2(tokens.clone())
+        .ok()?;
+    let Expr::Lit(ExprLit {
+        lit: Lit::Str(variable),
+        ..
+    }) = arguments.first()?
+    else {
+        return None;
+    };
+    Some(variable.value())
+}
+
+fn is_builtin_macro(path: &syn::Path) -> bool {
+    if path.leading_colon.is_some() || path.segments.len() != 1 {
+        return false;
+    }
+    matches!(
+        path.segments[0].ident.to_string().as_str(),
+        "asm"
+            | "cfg"
+            | "column"
+            | "compile_error"
+            | "concat"
+            | "concat_bytes"
+            | "assert"
+            | "assert_eq"
+            | "assert_ne"
+            | "dbg"
+            | "debug_assert"
+            | "debug_assert_eq"
+            | "debug_assert_ne"
+            | "eprint"
+            | "eprintln"
+            | "file"
+            | "format"
+            | "format_args"
+            | "format_args_nl"
+            | "global_asm"
+            | "line"
+            | "log_syntax"
+            | "matches"
+            | "module_path"
+            | "offset_of"
+            | "panic"
+            | "print"
+            | "println"
+            | "stringify"
+            | "thread_local"
+            | "todo"
+            | "trace_macros"
+            | "unimplemented"
+            | "unreachable"
+            | "vec"
+            | "write"
+            | "writeln"
+    )
+}
+
+fn is_builtin_attribute(path: &syn::Path) -> bool {
+    if path.leading_colon.is_some() || path.segments.len() != 1 {
+        return false;
+    }
+    let name = path.segments[0].ident.to_string();
+    name.starts_with("rustc_")
+        || matches!(
+            name.as_str(),
+            "alloc_error_handler"
+                | "allow"
+                | "automatically_derived"
+                | "bench"
+                | "cfg"
+                | "cfg_attr"
+                | "cold"
+                | "collapse_debuginfo"
+                | "coverage"
+                | "crate_name"
+                | "crate_type"
+                | "debugger_visualizer"
+                | "deny"
+                | "deprecated"
+                | "derive"
+                | "diagnostic"
+                | "doc"
+                | "expect"
+                | "export_name"
+                | "feature"
+                | "ffi_const"
+                | "ffi_pure"
+                | "forbid"
+                | "fundamental"
+                | "global_allocator"
+                | "ignore"
+                | "inline"
+                | "instruction_set"
+                | "lang"
+                | "link"
+                | "link_name"
+                | "link_ordinal"
+                | "link_section"
+                | "lint_reasons"
+                | "macro_export"
+                | "macro_use"
+                | "marker"
+                | "must_use"
+                | "naked"
+                | "no_builtins"
+                | "no_implicit_prelude"
+                | "no_link"
+                | "no_main"
+                | "no_mangle"
+                | "no_std"
+                | "non_exhaustive"
+                | "optimize"
+                | "panic_handler"
+                | "path"
+                | "prelude_import"
+                | "proc_macro"
+                | "proc_macro_attribute"
+                | "proc_macro_derive"
+                | "recursion_limit"
+                | "register_attr"
+                | "register_tool"
+                | "repr"
+                | "should_panic"
+                | "stable"
+                | "start"
+                | "target_feature"
+                | "test"
+                | "thread_local"
+                | "track_caller"
+                | "type_length_limit"
+                | "unsafe"
+                | "unstable"
+                | "used"
+                | "warn"
+                | "windows_subsystem"
+        )
+}
+
+fn item_attributes(item: &syn::Item) -> &[Attribute] {
+    match item {
+        syn::Item::Const(item) => &item.attrs,
+        syn::Item::Enum(item) => &item.attrs,
+        syn::Item::ExternCrate(item) => &item.attrs,
+        syn::Item::Fn(item) => &item.attrs,
+        syn::Item::ForeignMod(item) => &item.attrs,
+        syn::Item::Impl(item) => &item.attrs,
+        syn::Item::Macro(item) => &item.attrs,
+        syn::Item::Mod(item) => &item.attrs,
+        syn::Item::Static(item) => &item.attrs,
+        syn::Item::Struct(item) => &item.attrs,
+        syn::Item::Trait(item) => &item.attrs,
+        syn::Item::TraitAlias(item) => &item.attrs,
+        syn::Item::Type(item) => &item.attrs,
+        syn::Item::Union(item) => &item.attrs,
+        syn::Item::Use(item) => &item.attrs,
+        _ => &[],
+    }
+}
+
+fn trait_item_attributes(item: &syn::TraitItem) -> &[Attribute] {
+    match item {
+        syn::TraitItem::Const(item) => &item.attrs,
+        syn::TraitItem::Fn(item) => &item.attrs,
+        syn::TraitItem::Macro(item) => &item.attrs,
+        syn::TraitItem::Type(item) => &item.attrs,
+        _ => &[],
+    }
+}
+
+fn impl_item_attributes(item: &syn::ImplItem) -> &[Attribute] {
+    match item {
+        syn::ImplItem::Const(item) => &item.attrs,
+        syn::ImplItem::Fn(item) => &item.attrs,
+        syn::ImplItem::Macro(item) => &item.attrs,
+        syn::ImplItem::Type(item) => &item.attrs,
+        _ => &[],
+    }
+}
+
+fn foreign_item_attributes(item: &syn::ForeignItem) -> &[Attribute] {
+    match item {
+        syn::ForeignItem::Fn(item) => &item.attrs,
+        syn::ForeignItem::Macro(item) => &item.attrs,
+        syn::ForeignItem::Static(item) => &item.attrs,
+        syn::ForeignItem::Type(item) => &item.attrs,
+        _ => &[],
+    }
+}
+
 fn type_reference_span(path: &syn::Path) -> SourceSpan {
     SourceSpan::from_span(path.span())
 }
@@ -1049,6 +1807,28 @@ fn expr_attributes(expression: &Expr) -> &[Attribute] {
         Expr::Unsafe(expression) => &expression.attrs,
         Expr::While(expression) => &expression.attrs,
         Expr::Yield(expression) => &expression.attrs,
+        _ => &[],
+    }
+}
+
+fn pat_attributes(pattern: &syn::Pat) -> &[Attribute] {
+    match pattern {
+        syn::Pat::Const(pattern) => &pattern.attrs,
+        syn::Pat::Ident(pattern) => &pattern.attrs,
+        syn::Pat::Lit(pattern) => &pattern.attrs,
+        syn::Pat::Macro(pattern) => &pattern.attrs,
+        syn::Pat::Or(pattern) => &pattern.attrs,
+        syn::Pat::Paren(pattern) => &pattern.attrs,
+        syn::Pat::Path(pattern) => &pattern.attrs,
+        syn::Pat::Range(pattern) => &pattern.attrs,
+        syn::Pat::Reference(pattern) => &pattern.attrs,
+        syn::Pat::Rest(pattern) => &pattern.attrs,
+        syn::Pat::Slice(pattern) => &pattern.attrs,
+        syn::Pat::Struct(pattern) => &pattern.attrs,
+        syn::Pat::Tuple(pattern) => &pattern.attrs,
+        syn::Pat::TupleStruct(pattern) => &pattern.attrs,
+        syn::Pat::Type(pattern) => &pattern.attrs,
+        syn::Pat::Wild(pattern) => &pattern.attrs,
         _ => &[],
     }
 }
@@ -1108,8 +1888,13 @@ fn conditional_path_overrides(attributes: &[Attribute]) -> Vec<(Condition, Strin
         let Meta::List(list) = &attribute.meta else {
             continue;
         };
-        let items = parse_meta_list(&list.tokens);
-        let Some(predicate) = items.first() else {
+        let Ok(items) = try_parse_meta_list(&list.tokens) else {
+            continue;
+        };
+        let Some(predicate) = items
+            .first()
+            .filter(|predicate| items.len() >= 2 && valid_cfg_predicate(predicate))
+        else {
             continue;
         };
         let condition = condition_from_meta(predicate).canonicalize();
@@ -1135,59 +1920,110 @@ fn conditional_path_overrides(attributes: &[Attribute]) -> Vec<(Condition, Strin
 fn cfg_conditions(attributes: &[Attribute]) -> Vec<Condition> {
     let mut conditions = Vec::new();
     for attribute in attributes {
-        if attribute.path().is_ident("cfg") {
-            if let Meta::List(list) = &attribute.meta
-                && let Some(meta) = parse_meta_list(&list.tokens).into_iter().next()
-            {
-                conditions.push(condition_from_meta(&meta));
-            }
-            continue;
+        if let Ok(attribute_conditions) = cfg_conditions_from_meta(&attribute.meta) {
+            conditions.extend(attribute_conditions);
         }
-        if !attribute.path().is_ident("cfg_attr") {
-            continue;
-        }
-        let Meta::List(list) = &attribute.meta else {
-            continue;
-        };
-        let items = parse_meta_list(&list.tokens);
-        let Some(predicate) = items.first() else {
-            continue;
-        };
-        let gated_cfg: Vec<_> = items
-            .iter()
-            .skip(1)
-            .filter(|meta| meta.path().is_ident("cfg"))
-            .filter_map(|meta| match meta {
-                Meta::List(list) => parse_meta_list(&list.tokens).into_iter().next(),
-                _ => None,
-            })
-            .map(|meta| condition_from_meta(&meta))
-            .collect();
-        if gated_cfg.is_empty() {
-            continue;
-        }
-        conditions.push(
-            Condition::Any {
-                conditions: vec![
-                    Condition::Not {
-                        condition: Box::new(condition_from_meta(predicate)),
-                    },
-                    Condition::All {
-                        conditions: gated_cfg,
-                    },
-                ],
-            }
-            .canonicalize(),
-        );
     }
     conditions
 }
 
+fn cfg_conditions_from_meta(meta: &Meta) -> Result<Vec<Condition>, ()> {
+    if meta.path().is_ident("cfg") {
+        let Meta::List(list) = meta else {
+            return Err(());
+        };
+        let items = try_parse_meta_list(&list.tokens).map_err(|_| ())?;
+        if items.len() != 1 || !valid_cfg_predicate(&items[0]) {
+            return Err(());
+        }
+        return Ok(vec![condition_from_meta(&items[0])]);
+    }
+
+    if !meta.path().is_ident("cfg_attr") {
+        return Ok(Vec::new());
+    }
+    let Meta::List(list) = meta else {
+        return Err(());
+    };
+    let items = try_parse_meta_list(&list.tokens).map_err(|_| ())?;
+    let Some(predicate) = items
+        .first()
+        .filter(|predicate| items.len() >= 2 && valid_cfg_predicate(predicate))
+    else {
+        return Err(());
+    };
+    let mut gated_conditions = Vec::new();
+    for nested in items.iter().skip(1) {
+        gated_conditions.extend(cfg_conditions_from_meta(nested)?);
+    }
+    if gated_conditions.is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(vec![
+        Condition::Any {
+            conditions: vec![
+                Condition::Not {
+                    condition: Box::new(condition_from_meta(predicate)),
+                },
+                Condition::All {
+                    conditions: gated_conditions,
+                },
+            ],
+        }
+        .canonicalize(),
+    ])
+}
+
 fn parse_meta_list(tokens: &proc_macro2::TokenStream) -> Vec<Meta> {
+    try_parse_meta_list(tokens).unwrap_or_default()
+}
+
+fn try_parse_meta_list(tokens: &proc_macro2::TokenStream) -> syn::Result<Vec<Meta>> {
     Punctuated::<Meta, Token![,]>::parse_terminated
         .parse2(tokens.clone())
         .map(|items| items.into_iter().collect())
-        .unwrap_or_default()
+}
+
+fn valid_cfg_predicate(meta: &Meta) -> bool {
+    match meta {
+        Meta::Path(path) => is_plain_cfg_key(path),
+        Meta::NameValue(name_value) => {
+            is_plain_cfg_key(&name_value.path)
+                && matches!(
+                    &name_value.value,
+                    Expr::Lit(ExprLit {
+                        lit: Lit::Str(_),
+                        ..
+                    })
+                )
+        }
+        Meta::List(list) => {
+            let Ok(items) = try_parse_meta_list(&list.tokens) else {
+                return false;
+            };
+            if list.path.is_ident("not") {
+                return items.len() == 1 && valid_cfg_predicate(&items[0]);
+            }
+            if list.path.is_ident("all") || list.path.is_ident("any") {
+                return items.iter().all(valid_cfg_predicate);
+            }
+            false
+        }
+    }
+}
+
+fn is_plain_cfg_key(path: &syn::Path) -> bool {
+    path.leading_colon.is_none()
+        && path.segments.len() == 1
+        && matches!(path.segments[0].arguments, syn::PathArguments::None)
+}
+
+fn attribute_specifier(meta: &Meta) -> String {
+    match meta {
+        Meta::Path(path) => type_specifier(path),
+        Meta::NameValue(name_value) => format!("{}=<value>", type_specifier(&name_value.path)),
+        Meta::List(list) => format!("{}({})", type_specifier(&list.path), list.tokens),
+    }
 }
 
 pub(crate) fn condition_from_meta(meta: &Meta) -> Condition {
@@ -1581,6 +2417,8 @@ mod tests {
         let source = concat!(
             "#[cfg_attr(feature = \"gate\", cfg(unix))]\n",
             "type Conditional = Target;\n",
+            "#[cfg_attr(feature = \"p\", cfg_attr(feature = \"q\", cfg(unix)))]\n",
+            "type NestedConditional = NestedTarget;\n",
         );
         let occurrences = collect_occurrences(&syn::parse_file(source).unwrap());
         let (condition, _) = find_type_use(&occurrences, "Target", TypeUseContext::TypeAlias);
@@ -1588,6 +2426,19 @@ mod tests {
         assert!(rendered.contains("rust.feature"));
         assert!(rendered.contains("rust.cfg.unix"));
         assert!(rendered.contains('!'));
+
+        let (nested_condition, _) =
+            find_type_use(&occurrences, "NestedTarget", TypeUseContext::TypeAlias);
+        let nested_rendered = nested_condition.render();
+        assert!(nested_rendered.contains("\"p\""));
+        assert!(nested_rendered.contains("\"q\""));
+        assert!(nested_rendered.contains("rust.cfg.unix"));
+        assert!(nested_rendered.matches('!').count() >= 2);
+        assert!(
+            !occurrences
+                .iter()
+                .any(|occurrence| matches!(occurrence, Occurrence::UnsupportedAttribute { .. }))
+        );
     }
 
     #[test]
@@ -1943,5 +2794,436 @@ mod tests {
         assert_eq!(function_key.span, function.3);
         assert!(function_key.inline_ancestors.is_empty());
         assert_eq!(function_key.condition_key, function.2.render());
+    }
+
+    #[test]
+    fn collects_expansion_and_build_environment_boundaries_once_in_source_order() {
+        let source = concat!(
+            "#![allow(dead_code)]\n",
+            "#[cfg(test)]\n",
+            "#[derive(Debug, Clone, serde::Serialize, ExternalDerive)]\n",
+            "#[tokio::main]\n",
+            "struct Job;\n",
+            "#[cfg_attr(feature = \"serde\", serde::container)]\n",
+            "#[cfg_attr(feature = \"serde\", derive(serde::Deserialize, Debug))]\n",
+            "struct Config;\n",
+            "macro_rules! local { () => {} }\n",
+            "#[cfg(feature = \"inventory\")]\n",
+            "inventory::submit! { Job }\n",
+            "#[test]\n",
+            "fn run() {\n",
+            "#[cfg(target_arch = \"x86_64\")] let _ = env!(\"BUILD_TARGET\", \"missing build target\");\n",
+            "let _ = option_env!(DYNAMIC_NAME);\n",
+            "let _ = cfg!(unix);\n",
+            "let _ = concat!(\"a\", \"b\");\n",
+            "external::expand!();\n",
+            "custom!();\n",
+            "external::env!(\"NOT_A_BUILTIN_PATH\");\n",
+            "}\n",
+        );
+        let file = syn::parse_file(source).unwrap();
+        let first = collect_occurrences(&file);
+        let second = collect_occurrences(&file);
+        assert_eq!(first, second, "boundary inventory must be deterministic");
+
+        let boundaries: Vec<_> = first
+            .iter()
+            .filter_map(|occurrence| match occurrence {
+                Occurrence::MacroExpansionBoundary {
+                    specifier,
+                    boundary_kind,
+                    condition,
+                    span,
+                } => Some((specifier.as_str(), *boundary_kind, condition, *span)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            boundaries
+                .iter()
+                .map(|(specifier, kind, ..)| (*specifier, *kind))
+                .collect::<Vec<_>>(),
+            [
+                ("Debug", MacroExpansionBoundaryKind::Derive),
+                ("Clone", MacroExpansionBoundaryKind::Derive),
+                ("serde::Serialize", MacroExpansionBoundaryKind::Derive),
+                ("ExternalDerive", MacroExpansionBoundaryKind::Derive),
+                ("tokio::main", MacroExpansionBoundaryKind::Attribute),
+                ("serde::container", MacroExpansionBoundaryKind::Attribute),
+                ("serde::Deserialize", MacroExpansionBoundaryKind::Derive,),
+                ("Debug", MacroExpansionBoundaryKind::Derive),
+                ("inventory::submit!", MacroExpansionBoundaryKind::Bang),
+                ("cfg!", MacroExpansionBoundaryKind::Bang),
+                ("concat!", MacroExpansionBoundaryKind::Bang),
+                ("external::expand!", MacroExpansionBoundaryKind::Bang),
+                ("custom!", MacroExpansionBoundaryKind::Bang),
+                ("external::env!", MacroExpansionBoundaryKind::Bang),
+            ],
+            "each expansion boundary must appear exactly once in source order",
+        );
+        assert_eq!(MacroExpansionBoundaryKind::Bang.as_str(), "bang");
+        assert_eq!(MacroExpansionBoundaryKind::Attribute.as_str(), "attribute");
+        assert_eq!(MacroExpansionBoundaryKind::Derive.as_str(), "derive");
+
+        let external_derive = boundaries
+            .iter()
+            .find(|(specifier, ..)| *specifier == "serde::Serialize")
+            .expect("external derive boundary");
+        assert!(external_derive.2.render().contains("rust.cfg.test"));
+        assert_eq!(text_at_span(source, external_derive.3), "serde::Serialize");
+
+        let cfg_attr_boundary = boundaries
+            .iter()
+            .find(|(specifier, ..)| *specifier == "serde::container")
+            .expect("cfg_attr boundary");
+        assert!(cfg_attr_boundary.2.render().contains("rust.feature"));
+        assert_eq!(
+            text_at_span(source, cfg_attr_boundary.3),
+            "serde::container"
+        );
+
+        let item_macro = boundaries
+            .iter()
+            .find(|(specifier, ..)| *specifier == "inventory::submit!")
+            .expect("item macro boundary");
+        assert!(item_macro.2.render().contains("rust.feature"));
+
+        let environments: Vec<_> = first
+            .iter()
+            .filter_map(|occurrence| match occurrence {
+                Occurrence::BuildEnvironmentMacro {
+                    macro_name,
+                    variable,
+                    raw_argument,
+                    condition,
+                    span,
+                } => Some((
+                    macro_name.as_str(),
+                    variable.as_deref(),
+                    raw_argument.as_str(),
+                    condition,
+                    *span,
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(environments.len(), 2);
+        assert_eq!(environments[0].0, "env");
+        assert_eq!(environments[0].1, Some("BUILD_TARGET"));
+        assert!(environments[0].2.contains("missing build target"));
+        assert!(environments[0].3.render().contains("rust.cfg.target_arch"));
+        assert_eq!(
+            text_at_span(source, environments[0].4),
+            "env!(\"BUILD_TARGET\", \"missing build target\")"
+        );
+        assert_eq!(environments[1].0, "option_env");
+        assert_eq!(environments[1].1, None);
+        assert_eq!(environments[1].2, "DYNAMIC_NAME");
+
+        assert!(
+            !boundaries
+                .iter()
+                .any(|(specifier, ..)| *specifier == "macro_rules!"),
+            "a macro definition must not become an invocation boundary",
+        );
+    }
+
+    #[test]
+    fn inventories_nested_attribute_generic_and_builtin_macro_boundaries() {
+        let source = r#"#![doc = include_str!(concat!(env!("OUT_DIR"), "/crate.md"))]
+pub struct Docs<const N: usize = { include_bytes!(concat!(env!("OUT_DIR"), "/blob")).len() }> {
+    #[cfg(feature = "field-doc")]
+    #[doc = include_str!(concat!(env!("OUT_DIR"), "/field.md"))]
+    value: [u8; N],
+}
+
+#[unsafe(export_name = env!("SYM"))]
+pub extern "C" fn exported() {}
+
+pub const GENERATED: &str = concat!(env!("OUT_DIR"), "/generated");
+global_asm!(include_str!("boot.s"), options(att_syntax));
+
+#[cfg(feature = "typed-macro")]
+pub type Generated = custom_type!();
+"#;
+        let occurrences = collect_occurrences(&syn::parse_file(source).unwrap());
+
+        let includes: Vec<_> = occurrences
+            .iter()
+            .filter_map(|occurrence| match occurrence {
+                Occurrence::Include {
+                    macro_name,
+                    raw_argument,
+                    condition,
+                    ..
+                } => Some((macro_name.as_str(), raw_argument.as_str(), condition)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(includes.len(), 4, "includes: {includes:?}");
+        assert!(
+            includes
+                .iter()
+                .any(|(name, raw, _)| { *name == "include_str" && raw.contains("/crate.md") })
+        );
+        assert!(includes.iter().any(|(name, raw, condition)| {
+            *name == "include_str"
+                && raw.contains("/field.md")
+                && condition.render().contains("rust.feature")
+        }));
+        assert!(
+            includes
+                .iter()
+                .any(|(name, raw, _)| { *name == "include_bytes" && raw.contains("/blob") })
+        );
+        assert!(
+            includes
+                .iter()
+                .any(|(name, raw, _)| { *name == "include_str" && raw.contains("boot.s") })
+        );
+
+        let environment_variables: Vec<_> = occurrences
+            .iter()
+            .filter_map(|occurrence| match occurrence {
+                Occurrence::BuildEnvironmentMacro { variable, .. } => variable.as_deref(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            environment_variables
+                .iter()
+                .filter(|variable| **variable == "OUT_DIR")
+                .count(),
+            4
+        );
+        assert!(environment_variables.contains(&"SYM"));
+
+        let typed_macro = occurrences
+            .iter()
+            .find_map(|occurrence| match occurrence {
+                Occurrence::MacroExpansionBoundary {
+                    specifier,
+                    condition,
+                    ..
+                } if specifier == "custom_type!" => Some(condition),
+                _ => None,
+            })
+            .expect("typed macro boundary");
+        assert!(typed_macro.render().contains("rust.feature"));
+    }
+
+    #[test]
+    fn invalid_attributes_and_uninspectable_builtin_macros_block_completeness() {
+        let source = r#"#[derive(Foo + Bar)]
+pub struct Invalid;
+
+#[repr = "C"]
+pub struct InvalidReprShape(u8);
+
+#[repr(C, Rust)]
+pub struct ConflictingRepr(u8);
+
+#[inline(foo)]
+pub fn InvalidInline() {}
+
+#[cfg(not(unix, windows))]
+pub fn InvalidCfg() {}
+
+pub fn assembly(value: usize) {
+    asm!("", in(reg) value);
+    println!("{value}");
+    let _ = vec![1, 2, 3];
+}
+
+macro_rules! concat { () => { env!("OUT_DIR") } }
+pub const SHADOWED: &str = concat!();
+macro_rules! include_str { ($path:literal) => { "shadowed" } }
+pub const SHADOWED_INCLUDE: &str = include_str!("safe.txt");
+"#;
+        let occurrences = collect_occurrences(&syn::parse_file(source).unwrap());
+
+        assert!(occurrences.iter().any(|occurrence| matches!(
+            occurrence,
+            Occurrence::UnsupportedAttribute { specifier, .. }
+                if specifier.starts_with("derive(")
+        )));
+        for expected in ["repr=<value>", "repr(C , Rust)", "inline(foo)", "cfg(not"] {
+            assert!(
+                occurrences.iter().any(|occurrence| matches!(
+                    occurrence,
+                    Occurrence::UnsupportedAttribute { specifier, .. }
+                        if specifier.starts_with(expected)
+                )),
+                "missing unsupported attribute {expected}"
+            );
+        }
+        assert!(occurrences.iter().any(|occurrence| matches!(
+            occurrence,
+            Occurrence::UnsupportedMacroArguments { specifier, .. }
+                if specifier == "asm!"
+        )));
+        for expected in ["println!", "vec!", "concat!"] {
+            assert!(occurrences.iter().any(|occurrence| matches!(
+                occurrence,
+                Occurrence::MacroExpansionBoundary {
+                    specifier: actual,
+                    ..
+                } if actual == expected
+            )));
+        }
+        assert!(occurrences.iter().any(|occurrence| matches!(
+            occurrence,
+            Occurrence::Include {
+                argument: Some(argument),
+                ..
+            } if argument == "safe.txt"
+        )));
+        assert!(occurrences.iter().any(|occurrence| matches!(
+            occurrence,
+            Occurrence::MacroExpansionBoundary { specifier, .. }
+                if specifier == "include_str!"
+        )));
+    }
+
+    #[test]
+    fn invalid_nested_builtin_attribute_payload_is_never_silently_complete() {
+        let source = "#[repr(align(env!(\"OUT_DIR\")))]\npub struct Broken(u8);\n";
+        let occurrences = collect_occurrences(&syn::parse_file(source).unwrap());
+
+        assert!(occurrences.iter().any(|occurrence| matches!(
+            occurrence,
+            Occurrence::UnsupportedAttribute { specifier, .. }
+                if specifier.starts_with("align(")
+        )));
+        assert!(occurrences.iter().any(|occurrence| matches!(
+            occurrence,
+            Occurrence::BuildEnvironmentMacro {
+                variable: Some(variable),
+                ..
+            } if variable == "OUT_DIR"
+        )));
+    }
+
+    #[test]
+    fn invalid_cfg_predicates_are_unsupported_without_narrowing_sites() {
+        let source = r#"#[cfg(foo::bar)]
+pub type Qualified = external::Qualified;
+
+#[cfg(foo::bar = "x")]
+pub type QualifiedValue = external::QualifiedValue;
+
+#[cfg_attr(foo::bar, cfg(unix))]
+pub type QualifiedCfgAttr = external::QualifiedCfgAttr;
+
+#[cfg_attr(unix, cfg(not(a, b)))]
+pub type InvalidNestedCfg = external::InvalidNestedCfg;
+
+#[cfg_attr(foo::bar, doc = include_str!("generated.md"))]
+pub struct InvalidPredicateWithNestedMacro;
+"#;
+        let occurrences = collect_occurrences(&syn::parse_file(source).unwrap());
+
+        for specifier in [
+            "external::Qualified",
+            "external::QualifiedValue",
+            "external::QualifiedCfgAttr",
+            "external::InvalidNestedCfg",
+        ] {
+            let (condition, _) = find_type_use(&occurrences, specifier, TypeUseContext::TypeAlias);
+            assert_eq!(condition.render(), "true", "specifier: {specifier}");
+        }
+        assert!(
+            occurrences
+                .iter()
+                .filter(|occurrence| matches!(occurrence, Occurrence::UnsupportedAttribute { .. }))
+                .count()
+                >= 5
+        );
+        let include_condition = find_include_condition(&occurrences, "generated.md");
+        assert_eq!(include_condition.render(), "true");
+    }
+
+    #[test]
+    fn cfg_on_expression_pattern_fields_and_bare_fn_args_is_inherited() {
+        let source = r#"pub struct Record { pub value: usize }
+
+pub fn make() -> Record {
+    Record {
+        #[cfg(feature = "generated")]
+        value: env!("OUT_DIR").len(),
+    }
+}
+
+pub fn inspect(record: Record) {
+    let Record {
+        #[cfg(feature = "pattern")]
+        value: generated!(),
+    } = record;
+}
+
+pub type Callback = extern "C" fn(
+    #[cfg(feature = "argument")]
+    external::Argument,
+);
+
+pub fn parameter(
+    Record {
+        #[cfg(feature = "parameter-pattern")]
+        value: parameter_pattern!(),
+    }: Record,
+) {}
+
+"#;
+        let occurrences = collect_occurrences(&syn::parse_file(source).unwrap());
+
+        let environment_condition = occurrences
+            .iter()
+            .find_map(|occurrence| match occurrence {
+                Occurrence::BuildEnvironmentMacro {
+                    variable: Some(variable),
+                    condition,
+                    ..
+                } if variable == "OUT_DIR" => Some(condition),
+                _ => None,
+            })
+            .expect("field-value environment boundary");
+        assert!(environment_condition.render().contains("generated"));
+
+        let pattern_condition = occurrences
+            .iter()
+            .find_map(|occurrence| match occurrence {
+                Occurrence::MacroExpansionBoundary {
+                    specifier,
+                    condition,
+                    ..
+                } if specifier == "generated!" => Some(condition),
+                _ => None,
+            })
+            .expect("field-pattern macro boundary");
+        assert!(pattern_condition.render().contains("pattern"));
+
+        let (argument_condition, _) = find_type_use(
+            &occurrences,
+            "external::Argument",
+            TypeUseContext::TypeAlias,
+        );
+        assert!(argument_condition.render().contains("argument"));
+
+        let parameter_pattern_condition = occurrences
+            .iter()
+            .find_map(|occurrence| match occurrence {
+                Occurrence::MacroExpansionBoundary {
+                    specifier,
+                    condition,
+                    ..
+                } if specifier == "parameter_pattern!" => Some(condition),
+                _ => None,
+            })
+            .expect("parameter pattern macro boundary");
+        assert!(
+            parameter_pattern_condition
+                .render()
+                .contains("parameter-pattern")
+        );
     }
 }
