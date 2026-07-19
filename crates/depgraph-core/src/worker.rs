@@ -8,7 +8,9 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use depgraph_protocol::{MAX_EVENT_LINE_BYTES, ProtocolError, ProtocolEvent, ProtocolValidator};
+use depgraph_protocol::{
+    CompletenessLevel, MAX_EVENT_LINE_BYTES, Phase, ProtocolError, ProtocolEvent, ProtocolValidator,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -28,6 +30,10 @@ pub(crate) const RUST_BACKEND_SALSA_VERSION: &str = "0.26.1";
 const RUST_RELEASE_GATE_ENV: &str = "DEPGRAPH_RUST_RELEASE_GATE";
 const RUST_RELEASE_GATE_PENDING: &str = "release-gate-pending";
 const RUST_RELEASE_GATE_VERIFIED: &str = "release-gate-verified";
+const TYPESCRIPT_RELEASE_GATE_ENV: &str = "DEPGRAPH_TYPESCRIPT_RELEASE_GATE";
+const TYPESCRIPT_RELEASE_GATE_PROPERTY: &str = "typescript_release_gate";
+const TYPESCRIPT_RELEASE_GATE_PENDING: &str = "release-gate-pending";
+const TYPESCRIPT_RELEASE_GATE_VERIFIED: &str = "release-gate-verified";
 const WEB_RUNTIME_REQUIREMENT: &str = "Node.js >=24.0.0";
 const PROTOCOL_SCHEMA_PATH: &str = "schemas/depgraph-protocol-v1.schema.json";
 
@@ -513,7 +519,7 @@ fn locate_verified_bundled_worker_for_executable(
         (adapter == AdapterKind::Web).then(|| WEB_RUNTIME_REQUIREMENT.to_owned());
     let mut spec = worker_spec_from_path(adapter, artifact.clone(), runtime_requirement);
     spec.expected_version = Some(entry.version.clone());
-    spec.release_attested = adapter == AdapterKind::Rust;
+    spec.release_attested = matches!(adapter, AdapterKind::Rust | AdapterKind::Web);
     Ok(spec)
 }
 
@@ -1086,6 +1092,12 @@ where
         .env("CARGO_REGISTRY_GLOBAL_CREDENTIAL_PROVIDERS", "cargo:token");
     if spec.adapter == AdapterKind::Rust && spec.release_attested {
         command.env(RUST_RELEASE_GATE_ENV, RUST_RELEASE_GATE_VERIFIED);
+    }
+    if spec.adapter == AdapterKind::Web && spec.release_attested {
+        command.env(
+            TYPESCRIPT_RELEASE_GATE_ENV,
+            TYPESCRIPT_RELEASE_GATE_VERIFIED,
+        );
     }
 
     let mut child = command
@@ -1674,6 +1686,7 @@ fn parse_events_preserving_prefix(
     let mut parse_error = None;
     let mut failure_kind = None;
     let mut security_violation = false;
+    let enforce_web_semantic_scaffold = release_attested.is_some() && expected_adapter == "web";
     for (line_index, mut line) in stdout.split(|byte| *byte == b'\n').enumerate() {
         if line.last() == Some(&b'\r') {
             line = &line[..line.len() - 1];
@@ -1768,19 +1781,149 @@ fn parse_events_preserving_prefix(
         }
         if let (Some(release_attested), ProtocolEvent::ProfileDeclared(declared)) =
             (release_attested, &event)
-            && let Some(gate) = declared
-                .profile
-                .properties
-                .get("rust_hir_enable_gate")
-                .and_then(Value::as_str)
         {
-            let violation = match (release_attested, gate) {
-                (true, RUST_RELEASE_GATE_PENDING) => {
-                    Some("verified Rust release worker reported release-gate-pending")
+            let properties = &declared.profile.properties;
+            let web_scaffold = expected_adapter == "web"
+                && properties
+                    .get("typescript_analysis_mode")
+                    .and_then(Value::as_str)
+                    == Some("semantic-scaffold");
+            let web_emission_disabled = expected_adapter == "web"
+                && properties
+                    .get("typescript_semantic_graph_emission")
+                    .and_then(Value::as_str)
+                    == Some("disabled");
+            let expected_gate = match expected_adapter {
+                "rust" => Some((
+                    "rust_hir_enable_gate",
+                    RUST_RELEASE_GATE_PENDING,
+                    RUST_RELEASE_GATE_VERIFIED,
+                    "Rust",
+                )),
+                _ => None,
+            };
+            let mut violation = if expected_adapter == "web" && !web_scaffold {
+                Some("Web worker omitted typescript_analysis_mode=semantic-scaffold".to_owned())
+            } else if expected_adapter == "web" && !web_emission_disabled {
+                Some(
+                    "Web TypeChecker scaffold omitted typescript_semantic_graph_emission=disabled"
+                        .to_owned(),
+                )
+            } else if expected_adapter == "web" {
+                let gate = properties
+                    .get(TYPESCRIPT_RELEASE_GATE_PROPERTY)
+                    .and_then(Value::as_str);
+                match (release_attested, gate) {
+                    (true, Some(TYPESCRIPT_RELEASE_GATE_VERIFIED))
+                    | (false, Some(TYPESCRIPT_RELEASE_GATE_PENDING)) => None,
+                    (true, Some(TYPESCRIPT_RELEASE_GATE_PENDING)) => Some(
+                        "verified TypeScript release worker reported release-gate-pending"
+                            .to_owned(),
+                    ),
+                    (false, Some(TYPESCRIPT_RELEASE_GATE_VERIFIED)) => Some(
+                        "worker reported release-gate-verified without a verified TypeScript release attestation"
+                            .to_owned(),
+                    ),
+                    (true, None) => Some(
+                        "verified TypeScript release worker omitted its release gate".to_owned(),
+                    ),
+                    (false, None) => Some(
+                        "development TypeScript worker omitted its release-gate-pending declaration"
+                            .to_owned(),
+                    ),
+                    (attested, Some(value)) => Some(format!(
+                        "TypeScript worker reported invalid release gate {value:?}; expected {}",
+                        if attested {
+                            TYPESCRIPT_RELEASE_GATE_VERIFIED
+                        } else {
+                            TYPESCRIPT_RELEASE_GATE_PENDING
+                        }
+                    )),
                 }
-                (false, RUST_RELEASE_GATE_VERIFIED) => Some(
-                    "worker reported release-gate-verified without a verified Rust release attestation",
+            } else {
+                None
+            };
+            if violation.is_none() {
+                violation = expected_gate.and_then(|(property, pending, verified, label)| {
+                    properties
+                        .get(property)
+                        .and_then(Value::as_str)
+                        .and_then(|gate| match (release_attested, gate) {
+                            (true, value) if value == pending => Some(format!(
+                                "verified {label} release worker reported release-gate-pending"
+                            )),
+                            (false, value) if value == verified => Some(format!(
+                                "worker reported release-gate-verified without a verified {label} release attestation"
+                            )),
+                            _ => None,
+                        })
+                });
+            }
+            for (adapter, property, verified, label) in [
+                (
+                    "rust",
+                    "rust_hir_enable_gate",
+                    RUST_RELEASE_GATE_VERIFIED,
+                    "Rust",
                 ),
+                (
+                    "web",
+                    TYPESCRIPT_RELEASE_GATE_PROPERTY,
+                    TYPESCRIPT_RELEASE_GATE_VERIFIED,
+                    "TypeScript",
+                ),
+            ] {
+                if adapter != expected_adapter
+                    && properties.get(property).and_then(Value::as_str) == Some(verified)
+                {
+                    violation = Some(format!(
+                        "worker reported release-gate-verified without a verified {label} release attestation"
+                    ));
+                    break;
+                }
+            }
+            if let Some(violation) = violation {
+                parse_error = Some(format!(
+                    "security policy violation at line {}: {violation}",
+                    line_index + 1
+                ));
+                failure_kind = Some(WorkerFailureKind::MalformedProtocol);
+                security_violation = true;
+                break;
+            }
+        }
+        if enforce_web_semantic_scaffold {
+            let violation = match &event {
+                ProtocolEvent::NodeUpsert(upsert)
+                    if matches!(upsert.node.kind.as_str(), "symbol" | "type") =>
+                {
+                    Some(
+                        "Web TypeChecker scaffold emitted a semantic node while semantic graph emission is disabled",
+                    )
+                }
+                ProtocolEvent::EdgeUpsert(upsert) if upsert.edge.phase == Phase::Semantic => Some(
+                    "Web TypeChecker scaffold emitted a semantic edge while semantic graph emission is disabled",
+                ),
+                ProtocolEvent::ProfileCompleted(completed)
+                    if completed
+                        .coverage
+                        .completeness
+                        .contains(&CompletenessLevel::SemanticComplete) =>
+                {
+                    Some(
+                        "Web TypeChecker scaffold reported semantic-complete while semantic graph emission is disabled",
+                    )
+                }
+                ProtocolEvent::ScanCompleted(completed)
+                    if completed
+                        .coverage
+                        .completeness
+                        .contains(&CompletenessLevel::SemanticComplete) =>
+                {
+                    Some(
+                        "Web TypeChecker scaffold reported semantic-complete while semantic graph emission is disabled",
+                    )
+                }
                 _ => None,
             };
             if let Some(violation) = violation {
@@ -1982,6 +2125,19 @@ mod tests {
             "rust-gate-scan",
             "rust",
             serde_json::json!({"rust_hir_enable_gate": gate}),
+        )
+    }
+
+    fn typescript_gate_protocol(root: &Path, gate: &str) -> Result<Vec<u8>> {
+        profile_protocol(
+            root,
+            "typescript-gate-scan",
+            "web",
+            serde_json::json!({
+                TYPESCRIPT_RELEASE_GATE_PROPERTY: gate,
+                "typescript_analysis_mode": "semantic-scaffold",
+                "typescript_semantic_graph_emission": "disabled",
+            }),
         )
     }
 
@@ -2506,6 +2662,31 @@ mod tests {
                 .is_some_and(|error| error.contains("verified Rust release attestation"))
         );
 
+        write_protocol_script(serde_json::json!({
+            TYPESCRIPT_RELEASE_GATE_PROPERTY: TYPESCRIPT_RELEASE_GATE_VERIFIED,
+        }))?;
+        let typescript_spoofed = execute_worker_inner_with_cancellation(
+            &spec,
+            &root,
+            scan_id,
+            &ScanConfig::default(),
+            &ProfileConfig::default(),
+            std::future::pending::<std::io::Result<()>>(),
+        )
+        .await?;
+        assert_eq!(typescript_spoofed.events.len(), 1);
+        assert_eq!(
+            typescript_spoofed.failure_kind,
+            Some(WorkerFailureKind::MalformedProtocol)
+        );
+        assert!(typescript_spoofed.security_violation);
+        assert!(
+            typescript_spoofed
+                .error
+                .as_deref()
+                .is_some_and(|error| { error.contains("verified TypeScript release attestation") })
+        );
+
         write_protocol_script(serde_json::json!({"go_list_mode": "safe"}))?;
         let normal = execute_worker_inner_with_cancellation(
             &spec,
@@ -2555,7 +2736,8 @@ mod tests {
         });
         let test_release =
             write_test_release_manifest(&release, vec![astro_artifact], vec![component])?;
-        locate_verified_bundled_worker(AdapterKind::Web, &test_release.manifest)?;
+        let web_spec = locate_verified_bundled_worker(AdapterKind::Web, &test_release.manifest)?;
+        assert!(web_spec.release_attested);
 
         #[cfg(unix)]
         {
@@ -2903,6 +3085,303 @@ mod tests {
     }
 
     #[test]
+    fn development_web_worker_cannot_spoof_the_verified_typescript_release_gate() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let root = root.path().canonicalize()?;
+        let output = typescript_gate_protocol(&root, TYPESCRIPT_RELEASE_GATE_VERIFIED)?;
+        let parsed = parse_events_preserving_prefix(
+            &output,
+            "typescript-gate-scan",
+            "web",
+            &root,
+            4096,
+            Some(env!("CARGO_PKG_VERSION")),
+            Some(false),
+        );
+
+        assert_eq!(parsed.events.len(), 1);
+        assert_eq!(
+            parsed.failure_kind,
+            Some(WorkerFailureKind::MalformedProtocol)
+        );
+        assert!(parsed.security_violation);
+        assert!(parsed.error.as_deref().is_some_and(|error| {
+            error.contains("without a verified TypeScript release attestation")
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn attested_web_worker_must_report_the_verified_typescript_release_gate() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let root = root.path().canonicalize()?;
+        let output = typescript_gate_protocol(&root, TYPESCRIPT_RELEASE_GATE_PENDING)?;
+        let parsed = parse_events_preserving_prefix(
+            &output,
+            "typescript-gate-scan",
+            "web",
+            &root,
+            4096,
+            Some(env!("CARGO_PKG_VERSION")),
+            Some(true),
+        );
+
+        assert_eq!(parsed.events.len(), 1);
+        assert_eq!(
+            parsed.failure_kind,
+            Some(WorkerFailureKind::MalformedProtocol)
+        );
+        assert!(parsed.security_violation);
+        assert!(
+            parsed
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("verified TypeScript release worker"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn typescript_release_gate_allows_matching_profile_values() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let root = root.path().canonicalize()?;
+        for (gate, release_attested) in [
+            (TYPESCRIPT_RELEASE_GATE_PENDING, false),
+            (TYPESCRIPT_RELEASE_GATE_VERIFIED, true),
+        ] {
+            let output = typescript_gate_protocol(&root, gate)?;
+            let parsed = parse_events_preserving_prefix(
+                &output,
+                "typescript-gate-scan",
+                "web",
+                &root,
+                4096,
+                Some(env!("CARGO_PKG_VERSION")),
+                Some(release_attested),
+            );
+            assert!(
+                parsed.error.is_none(),
+                "gate {gate:?}, release_attested={release_attested}: {:?}",
+                parsed.error
+            );
+            assert_eq!(parsed.events.len(), 4);
+            assert!(!parsed.security_violation);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn typescript_release_gate_rejects_missing_and_unknown_values() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let root = root.path().canonicalize()?;
+        for (gate, release_attested) in [
+            (None, false),
+            (Some("unknown-gate"), false),
+            (Some("unknown-gate"), true),
+        ] {
+            let output =
+                typescript_gate_protocol(&root, gate.unwrap_or(TYPESCRIPT_RELEASE_GATE_PENDING))?;
+            let mut events = String::from_utf8(output)?
+                .lines()
+                .map(serde_json::from_str::<Value>)
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            if gate.is_none() {
+                events[1]["profile"]["properties"]
+                    .as_object_mut()
+                    .context("profile properties must be an object")?
+                    .remove(TYPESCRIPT_RELEASE_GATE_PROPERTY);
+            }
+            let mut invalid = Vec::new();
+            for event in events {
+                serde_json::to_writer(&mut invalid, &event)?;
+                invalid.push(b'\n');
+            }
+            let parsed = parse_events_preserving_prefix(
+                &invalid,
+                "typescript-gate-scan",
+                "web",
+                &root,
+                4096,
+                Some(env!("CARGO_PKG_VERSION")),
+                Some(release_attested),
+            );
+            assert_eq!(parsed.events.len(), 1, "gate={gate:?}: {:?}", parsed.error);
+            assert_eq!(
+                parsed.failure_kind,
+                Some(WorkerFailureKind::MalformedProtocol)
+            );
+            assert!(parsed.security_violation);
+            assert!(parsed.error.is_some());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn web_worker_cannot_omit_the_semantic_scaffold_boundary() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let root = root.path().canonicalize()?;
+        for property in [
+            "typescript_analysis_mode",
+            "typescript_semantic_graph_emission",
+        ] {
+            let output = typescript_gate_protocol(&root, TYPESCRIPT_RELEASE_GATE_PENDING)?;
+            let mut events = String::from_utf8(output)?
+                .lines()
+                .map(serde_json::from_str::<Value>)
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            events[1]["profile"]["properties"]
+                .as_object_mut()
+                .context("profile properties must be an object")?
+                .remove(property);
+            let mut spoofed = Vec::new();
+            for event in events {
+                serde_json::to_writer(&mut spoofed, &event)?;
+                spoofed.push(b'\n');
+            }
+            let parsed = parse_events_preserving_prefix(
+                &spoofed,
+                "typescript-gate-scan",
+                "web",
+                &root,
+                4096,
+                Some(env!("CARGO_PKG_VERSION")),
+                Some(false),
+            );
+            assert_eq!(parsed.events.len(), 1, "{property}: {:?}", parsed.error);
+            assert_eq!(
+                parsed.failure_kind,
+                Some(WorkerFailureKind::MalformedProtocol)
+            );
+            assert!(parsed.security_violation);
+            assert!(
+                parsed
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.contains(property)),
+                "{property}: {:?}",
+                parsed.error
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn web_typechecker_scaffold_cannot_emit_semantic_nodes() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let root = root.path().canonicalize()?;
+        for insert_at in [1_usize, 2] {
+            let output = typescript_gate_protocol(&root, TYPESCRIPT_RELEASE_GATE_PENDING)?;
+            let mut events = String::from_utf8(output)?
+                .lines()
+                .map(serde_json::from_str::<Value>)
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            for event in events.iter_mut().skip(insert_at) {
+                event["seq"] = serde_json::json!(event["seq"].as_u64().unwrap_or(0) + 1);
+            }
+            events.insert(
+                insert_at,
+                serde_json::json!({
+                    "event": "node_upsert",
+                    "protocol_version": "1.0",
+                    "scan_id": "typescript-gate-scan",
+                    "adapter": "web",
+                    "adapter_version": env!("CARGO_PKG_VERSION"),
+                    "seq": insert_at + 1,
+                    "node": {
+                        "id": "symbol:sha256:scaffold-must-not-emit",
+                        "kind": "symbol",
+                        "locator": "symbol://forbidden",
+                        "properties": {},
+                    },
+                }),
+            );
+            let mut spoofed = Vec::new();
+            for event in events {
+                serde_json::to_writer(&mut spoofed, &event)?;
+                spoofed.push(b'\n');
+            }
+            let parsed = parse_events_preserving_prefix(
+                &spoofed,
+                "typescript-gate-scan",
+                "web",
+                &root,
+                4096,
+                Some(env!("CARGO_PKG_VERSION")),
+                Some(false),
+            );
+            assert_eq!(parsed.events.len(), insert_at);
+            assert_eq!(
+                parsed.failure_kind,
+                Some(WorkerFailureKind::MalformedProtocol)
+            );
+            assert!(parsed.security_violation);
+            assert!(
+                parsed
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("semantic node"))
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn web_typechecker_scaffold_cannot_claim_semantic_complete() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let root = root.path().canonicalize()?;
+        let output = profile_protocol(
+            &root,
+            "web-scaffold-invariant-scan",
+            "web",
+            serde_json::json!({
+                TYPESCRIPT_RELEASE_GATE_PROPERTY: TYPESCRIPT_RELEASE_GATE_PENDING,
+                "typescript_analysis_mode": "semantic-scaffold",
+                "typescript_semantic_graph_emission": "disabled",
+            }),
+        )?;
+        let mut events = String::from_utf8(output)?
+            .lines()
+            .map(serde_json::from_str::<Value>)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        for event in &mut events {
+            if matches!(
+                event.get("event").and_then(Value::as_str),
+                Some("profile_completed" | "scan_completed")
+            ) {
+                event["coverage"]["completeness"] =
+                    serde_json::json!(["syntax-complete", "semantic-complete"]);
+            }
+        }
+        let mut spoofed = Vec::new();
+        for event in events {
+            serde_json::to_writer(&mut spoofed, &event)?;
+            spoofed.push(b'\n');
+        }
+        let parsed = parse_events_preserving_prefix(
+            &spoofed,
+            "web-scaffold-invariant-scan",
+            "web",
+            &root,
+            4096,
+            Some(env!("CARGO_PKG_VERSION")),
+            Some(false),
+        );
+        assert_eq!(parsed.events.len(), 2);
+        assert_eq!(
+            parsed.failure_kind,
+            Some(WorkerFailureKind::MalformedProtocol)
+        );
+        assert!(parsed.security_violation);
+        assert!(
+            parsed
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("semantic-complete"))
+        );
+        Ok(())
+    }
+
+    #[test]
     fn rust_release_handshake_covers_the_backend_compatibility_unit() -> Result<()> {
         let handshake = format!(
             "depgraph-rust-worker {} (protocol 1.0; rust-analyzer {}; rust-analyzer-revision {}; salsa {})",
@@ -3070,6 +3549,63 @@ printf '{"event":"scan_completed","protocol_version":"1.0","scan_id":"%s","adapt
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn verified_web_release_worker_receives_the_typescript_release_gate() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root)?;
+        let root = root.canonicalize()?;
+        let script = temp.path().join("web-release-worker.mjs");
+        let protocol = String::from_utf8(typescript_gate_protocol(
+            &root,
+            TYPESCRIPT_RELEASE_GATE_VERIFIED,
+        )?)?;
+        let script_contents = format!(
+            "if (process.env.DEPGRAPH_TYPESCRIPT_RELEASE_GATE !== \"release-gate-verified\") process.exit(9);\nprocess.stdout.write({});\n",
+            serde_json::to_string(&protocol)?,
+        );
+        std::fs::write(&script, script_contents)?;
+        let mut spec = worker_spec_from_path(AdapterKind::Web, script, None);
+        spec.expected_version = Some(env!("CARGO_PKG_VERSION").to_owned());
+        spec.release_attested = true;
+        let execution = execute_worker_inner_with_cancellation(
+            &spec,
+            &root,
+            "typescript-gate-scan",
+            &ScanConfig::default(),
+            &ProfileConfig::default(),
+            std::future::pending::<std::io::Result<()>>(),
+        )
+        .await?;
+        assert_eq!(
+            execution.events.len(),
+            4,
+            "error={:?}, stderr={:?}, failure_kind={:?}",
+            execution.error,
+            execution.stderr,
+            execution.failure_kind
+        );
+        assert!(execution.error.is_none(), "{:?}", execution.error);
+
+        spec.release_attested = false;
+        let unverified = execute_worker_inner_with_cancellation(
+            &spec,
+            &root,
+            "typescript-gate-scan",
+            &ScanConfig::default(),
+            &ProfileConfig::default(),
+            std::future::pending::<std::io::Result<()>>(),
+        )
+        .await?;
+        assert_eq!(
+            unverified.failure_kind,
+            Some(WorkerFailureKind::NonzeroExit)
+        );
+        assert!(unverified.error.is_some());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn timeout_keeps_the_worker_prefix_and_caps_stderr() -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
 
@@ -3134,6 +3670,69 @@ exec sleep 10
         assert!(execution.stderr_truncated);
         assert_eq!(execution.failure_kind, Some(WorkerFailureKind::Timeout));
         assert!(!execution.security_violation);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn web_worker_timeout_reaps_its_descendant_cross_platform() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root)?;
+        let root = root.canonicalize()?;
+        let marker = temp.path().join("descendant-survived");
+        let script = temp.path().join("timeout-worker.mjs");
+        let script_contents = format!(
+            r#"import {{ spawn }} from "node:child_process";
+const args = process.argv.slice(2);
+const value = (name) => args[args.indexOf(name) + 1];
+const root = value("--root");
+const scanId = value("--scan-id");
+process.stdout.write(JSON.stringify({{
+  event: "scan_started",
+  protocol_version: "1.0",
+  scan_id: scanId,
+  adapter: "web",
+  adapter_version: "0.1.0",
+  seq: 1,
+  root,
+  project_code_executed: false,
+  safe_mode: true,
+}}) + "\n");
+spawn(process.execPath, ["-e", {}], {{ stdio: "ignore" }});
+setInterval(() => undefined, 1_000);
+"#,
+            serde_json::to_string(&format!(
+                "setTimeout(() => require('node:fs').writeFileSync({}, 'survived'), 1500); setInterval(() => undefined, 1000);",
+                serde_json::to_string(&marker.to_string_lossy())?,
+            ))?,
+        );
+        std::fs::write(&script, script_contents)?;
+        let spec = worker_spec_from_path(AdapterKind::Web, script, None);
+        let execution = execute_worker_inner_with_cancellation(
+            &spec,
+            &root,
+            "web-timeout-scan",
+            &ScanConfig {
+                worker_timeout_seconds: 1,
+                max_protocol_line_bytes: 4096,
+                max_protocol_bytes: 64 * 1024,
+                max_stderr_bytes: 4096,
+                follow_symlinks: false,
+            },
+            &ProfileConfig::default(),
+            std::future::pending::<std::io::Result<()>>(),
+        )
+        .await?;
+        assert_eq!(execution.events.len(), 1);
+        assert_eq!(execution.failure_kind, Some(WorkerFailureKind::Timeout));
+        assert!(
+            execution
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("timed out"))
+        );
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(!marker.exists(), "timed-out Web worker descendant survived");
         Ok(())
     }
 

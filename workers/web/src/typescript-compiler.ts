@@ -1,6 +1,6 @@
 import type { ChildProcess } from "node:child_process";
 import { constants as fsConstants } from "node:fs";
-import { access, realpath, stat } from "node:fs/promises";
+import { access, readFile, readdir, realpath, stat } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import ts from "typescript";
@@ -14,8 +14,14 @@ import {
   type SourceFile,
 } from "typescript/unstable/ast";
 import type { FileSystem, FileSystemEntries } from "typescript/unstable/fs";
+import type { TypeScriptProjectSummary } from "./types";
 
 export const TYPESCRIPT_COMPILER_VERSION = ts.version;
+const TYPESCRIPT_RELEASE_GATE_VERIFIED = "release-gate-verified";
+const TYPESCRIPT_RELEASE_GATE_PENDING = "release-gate-pending";
+export const TYPESCRIPT_RELEASE_GATE = process.env.DEPGRAPH_TYPESCRIPT_RELEASE_GATE === TYPESCRIPT_RELEASE_GATE_VERIFIED
+  ? TYPESCRIPT_RELEASE_GATE_VERIFIED
+  : TYPESCRIPT_RELEASE_GATE_PENDING;
 export const TYPESCRIPT_COMPILER_PROFILE_PROPERTIES = Object.freeze({
   bundled_typescript: "true",
   typescript_syntax_compiler: `native-${TYPESCRIPT_COMPILER_VERSION}`,
@@ -23,21 +29,32 @@ export const TYPESCRIPT_COMPILER_PROFILE_PROPERTIES = Object.freeze({
   typescript_compiler_version: TYPESCRIPT_COMPILER_VERSION,
   typescript_compiler_selection: "bundled-only",
   typescript_compiler_fallback: "fail-closed",
-  typescript_analysis_mode: "syntax-only",
+  typescript_analysis_mode: "semantic-scaffold",
   typescript_project_local_policy: "metadata-only",
   typescript_project_local_loaded: "false",
-  typescript_typechecker_status: "not-invoked",
+  typescript_typechecker_status: "invoked-no-graph",
+  typescript_project_model_status: "ready",
+  typescript_project_config: "worker-neutral-allowlist",
+  typescript_module_resolution: "inventory-only",
+  typescript_standard_library_source: "bundled",
+  typescript_standard_library_integrity: TYPESCRIPT_RELEASE_GATE === TYPESCRIPT_RELEASE_GATE_VERIFIED
+    ? "core-attested-whole-tree"
+    : "build-produced-pending-core-attestation",
+  typescript_release_gate: TYPESCRIPT_RELEASE_GATE,
+  typescript_semantic_graph_emission: "disabled",
   typescript_compiler_processes: "1",
   typescript_project_filesystem: "isolated-virtual",
 } as const);
 const COMPILER_TIMEOUT_MS = 30_000;
+const MAX_SEMANTIC_DIAGNOSTICS = 256;
+const MAX_DIAGNOSTIC_MESSAGE_CHARS = 2_048;
+const MAX_STANDARD_LIBRARY_BYTES = 64 * 1024 * 1024;
 const COMPILER_BASENAME = process.platform === "win32" ? "tsc.exe" : "tsc";
 declare const __DEPGRAPH_PACKAGED_WORKER__: boolean;
 const PACKAGED_WORKER = typeof __DEPGRAPH_PACKAGED_WORKER__ !== "undefined" && __DEPGRAPH_PACKAGED_WORKER__;
-const VIRTUAL_ROOT = path.join(path.parse(process.execPath).root, "__depgraph_typescript_syntax__");
+const VIRTUAL_ROOT = path.join(path.parse(process.execPath).root, "__depgraph_typescript_project__");
 const VIRTUAL_CONFIG = path.join(VIRTUAL_ROOT, "tsconfig.json");
 const NEUTRAL_CWD = path.parse(process.execPath).root;
-const MAY_CONTAIN_IMPORT_TYPE = /\bimport(?:\s|\/\*[\s\S]*?\*\/|\/\/[^\r\n]*(?:\r?\n|$))*\(/u;
 
 export const TYPESCRIPT_SOURCE_EXTENSIONS = new Set([
   ".ts",
@@ -58,6 +75,19 @@ export interface TypeScriptSyntaxDiagnostic {
   endOffset: number;
 }
 
+export interface TypeScriptSemanticDiagnostic {
+  relativePath: string | null;
+  code: number;
+  message: string;
+  startOffset: number;
+  endOffset: number;
+}
+
+export interface TypeScriptStaticConfig {
+  configFiles: number;
+  paths: Readonly<Record<string, readonly string[]>>;
+}
+
 /**
  * A parser-confirmed source range whose dependency is erased from runtime
  * JavaScript. `import_type` also covers ImportType nodes attached to JSDoc,
@@ -69,15 +99,56 @@ export interface TypeOnlyDependencyRange {
   syntax: "declaration" | "import_type";
 }
 
-export class TypeScriptSyntaxDiagnostics extends Map<string, TypeScriptSyntaxDiagnostic[]> {
+export class TypeScriptProjectAnalysis extends Map<string, TypeScriptSyntaxDiagnostic[]> {
   readonly typeOnlyDependencyRanges = new Map<string, TypeOnlyDependencyRange[]>();
+  readonly semanticDiagnostics: TypeScriptSemanticDiagnostic[] = [];
+  project: TypeScriptProjectSummary = {
+    status: "ready",
+    rootFiles: 0,
+    programFiles: 0,
+    staticConfigFiles: 0,
+    pathMappings: 0,
+    standardLibraryFiles: 0,
+    typeCheckerQueries: 0,
+    semanticDiagnostics: 0,
+    emittedSemanticDiagnostics: 0,
+  };
+}
+
+interface CompilerConnection {
+  onError(listener: (error: Error) => void): { dispose(): void };
+  onClose(listener: () => void): { dispose(): void };
 }
 
 interface CompilerClientInternals {
-  client?: { process?: ChildProcess };
+  client?: {
+    process?: ChildProcess;
+    connection?: CompilerConnection;
+  };
 }
 
 class CompilerTimeoutError extends Error {}
+class CompilerProtocolError extends Error {}
+
+export type TypeScriptProjectFailureReason =
+  | "compiler_unavailable"
+  | "stdlib_unavailable"
+  | "project_count_mismatch"
+  | "root_file_mismatch"
+  | "unexpected_program_input"
+  | "typechecker_smoke_failed"
+  | "compiler_timeout"
+  | "compiler_protocol_failure";
+
+export class TypeScriptProjectError extends Error {
+  readonly reason: TypeScriptProjectFailureReason;
+
+  constructor(reason: TypeScriptProjectFailureReason, message: string) {
+    super(message);
+    this.name = "TypeScriptProjectError";
+    this.reason = reason;
+  }
+}
 
 function pathKey(value: string): string {
   const normalized = path.normalize(path.resolve(value));
@@ -124,6 +195,68 @@ export async function resolveTypeScriptCompiler(): Promise<string> {
   const developmentCompiler = await usableCompiler(developmentArtifact);
   if (developmentCompiler !== null) return developmentCompiler;
   throw new Error(`bundled TypeScript ${TYPESCRIPT_COMPILER_VERSION} development compiler is unavailable; run pnpm build: ${developmentArtifact}`);
+}
+
+interface BundledStandardLibrary {
+  files: Map<string, string>;
+  root: string;
+}
+
+export interface TypeScriptAnalysisTestRuntime {
+  compiler: string;
+  standardLibraryRoot: string;
+  timeoutMs: number;
+}
+
+export type TypeScriptLifecycleTestMode = "crash" | "protocol-error" | "timeout" | "strict-close";
+
+export interface TypeScriptLifecycleTestResult {
+  reason: TypeScriptProjectFailureReason;
+  reaped: boolean;
+  listenersDisposed: boolean;
+}
+
+/**
+ * Load only the declaration files shipped beside the already selected native
+ * compiler. Release scans reach this point after the core has verified the
+ * component's whole-tree digest; source scans use the build-produced copy.
+ */
+async function loadBundledStandardLibrary(
+  compiler: string,
+  standardLibraryRoot = path.dirname(compiler),
+): Promise<BundledStandardLibrary> {
+  const root = await realpath(standardLibraryRoot);
+  const entries = (await readdir(root, { withFileTypes: true }))
+    .filter((entry) => /^lib(?:\.[a-z0-9_-]+)*\.d\.ts$/iu.test(entry.name))
+    .sort((left, right) => left.name.localeCompare(right.name));
+  if (entries.length === 0) {
+    throw new Error(`bundled TypeScript ${TYPESCRIPT_COMPILER_VERSION} standard library is missing beside ${compiler}`);
+  }
+  const files = new Map<string, string>();
+  let totalBytes = 0;
+  for (const entry of entries) {
+    if (!entry.isFile() || entry.isSymbolicLink()) {
+      throw new Error(`bundled TypeScript standard library entry is not a regular file: ${path.join(root, entry.name)}`);
+    }
+    const candidate = path.join(root, entry.name);
+    const resolved = await realpath(candidate);
+    if (pathKey(path.dirname(resolved)) !== pathKey(root)) {
+      throw new Error(`bundled TypeScript standard library escaped its component root: ${candidate}`);
+    }
+    const metadata = await stat(resolved);
+    if (!metadata.isFile()) throw new Error(`bundled TypeScript standard library entry is not a file: ${candidate}`);
+    totalBytes += metadata.size;
+    if (totalBytes > MAX_STANDARD_LIBRARY_BYTES) {
+      throw new Error(`bundled TypeScript standard library exceeds ${MAX_STANDARD_LIBRARY_BYTES} bytes`);
+    }
+    files.set(resolved, await readFile(resolved, "utf8"));
+  }
+  for (const required of ["lib.esnext.full.d.ts", "lib.es5.d.ts"]) {
+    if (![...files.keys()].some((file) => path.basename(file) === required)) {
+      throw new Error(`bundled TypeScript standard library is incomplete: ${required} is missing`);
+    }
+  }
+  return { files, root };
 }
 
 function addDirectory(
@@ -215,6 +348,16 @@ function flattenDiagnosticMessage(diagnostic: CompilerDiagnostic): string {
   return [diagnostic.text, ...nested].filter(Boolean).join(" ");
 }
 
+function boundedDiagnosticMessage(diagnostic: CompilerDiagnostic, redactions: readonly string[]): string {
+  let message = flattenDiagnosticMessage(diagnostic).replace(/[\r\n\t]+/gu, " ");
+  for (const value of redactions.filter(Boolean).sort((left, right) => right.length - left.length)) {
+    message = message.replaceAll(value, "<trusted-typescript>");
+    message = message.replaceAll(value.replaceAll("\\", "/"), "<trusted-typescript>");
+  }
+  if (message.length <= MAX_DIAGNOSTIC_MESSAGE_CHARS) return message;
+  return `${message.slice(0, MAX_DIAGNOSTIC_MESSAGE_CHARS - 1)}…`;
+}
+
 function isEntirelyTypeOnlyImport(node: ImportDeclaration): boolean {
   const clause = node.importClause;
   if (clause === undefined) return false;
@@ -293,23 +436,123 @@ async function waitForExit(child: ChildProcess, timeoutMs: number): Promise<bool
   });
 }
 
-async function closeCompiler(api: API, force: boolean): Promise<void> {
-  const child = compilerProcess(api);
-  if (force) child?.kill("SIGKILL");
-  await Promise.race([
-    api.close().catch(() => undefined),
-    new Promise<void>((resolve) => {
-      const timer = setTimeout(resolve, 1_000);
-      timer.unref();
+async function closeCompiler(
+  api: API,
+  force: boolean,
+  retainedChild: ChildProcess | undefined = compilerProcess(api),
+): Promise<void> {
+  const child = retainedChild;
+  if (force) {
+    child?.kill("SIGKILL");
+    let closeTimer: NodeJS.Timeout | undefined;
+    await Promise.race([
+      api.close().catch(() => undefined),
+      new Promise<void>((resolve) => {
+        closeTimer = setTimeout(resolve, 1_000);
+      }),
+    ]);
+    if (closeTimer) clearTimeout(closeTimer);
+    if (child && !(await waitForExit(child, 1_000))) {
+      child.kill("SIGKILL");
+      if (!(await waitForExit(child, 1_000))) {
+        throw new CompilerProtocolError("TypeScript native compiler could not be reaped after forced close");
+      }
+    }
+    return;
+  }
+
+  let closeTimer: NodeJS.Timeout | undefined;
+  const closeResult = await Promise.race([
+    api.close().then(
+      () => ({ status: "closed" as const }),
+      () => ({ status: "failed" as const }),
+    ),
+    new Promise<{ status: "timeout" }>((resolve) => {
+      closeTimer = setTimeout(() => resolve({ status: "timeout" }), 1_000);
     }),
   ]);
-  if (child && !(await waitForExit(child, 1_000))) child.kill("SIGKILL");
+  if (closeTimer) clearTimeout(closeTimer);
+  if (closeResult.status !== "closed") {
+    child?.kill("SIGKILL");
+    if (child) await waitForExit(child, 1_000);
+    throw new CompilerProtocolError(`TypeScript native compiler close ${closeResult.status}`);
+  }
+  if (child && !(await waitForExit(child, 1_000))) {
+    child.kill("SIGKILL");
+    if (!(await waitForExit(child, 1_000))) {
+      child.kill("SIGKILL");
+      if (!(await waitForExit(child, 1_000))) {
+        throw new CompilerProtocolError("TypeScript native compiler could not be reaped after strict close");
+      }
+    }
+    throw new CompilerProtocolError("TypeScript native compiler did not exit after close");
+  }
+  if (child && (child.signalCode !== null || child.exitCode !== 0)) {
+    throw new CompilerProtocolError("TypeScript native compiler exited unsuccessfully during close");
+  }
+}
+
+function monitorCompilerLifecycle(api: API): { failure: Promise<never>; stop(): void } {
+  const client = (api as unknown as CompilerClientInternals).client;
+  let child: ChildProcess | undefined;
+  let connection: CompilerConnection | undefined;
+  let stopped = false;
+  let rejectFailure: (error: CompilerProtocolError) => void = () => undefined;
+  const disposables: Array<{ dispose(): void }> = [];
+  const failure = new Promise<never>((_resolve, reject) => {
+    rejectFailure = reject;
+  });
+  const childExited = (code: number | null, signal: NodeJS.Signals | null): void => {
+    fail(`TypeScript native compiler exited during analysis (code=${code ?? "none"}, signal=${signal ?? "none"})`);
+  };
+  const childErrored = (): void => {
+    fail("TypeScript native compiler process failed during analysis");
+  };
+  const cleanup = (): void => {
+    clearInterval(poll);
+    child?.off("exit", childExited);
+    child?.off("error", childErrored);
+    for (const disposable of disposables.splice(0)) disposable.dispose();
+  };
+  const fail = (message: string): void => {
+    if (stopped) return;
+    stopped = true;
+    cleanup();
+    rejectFailure(new CompilerProtocolError(message));
+  };
+  const attach = (): void => {
+    if (stopped) return;
+    if (!child && client?.process) {
+      child = client.process;
+      if (child.exitCode !== null || child.signalCode !== null) {
+        childExited(child.exitCode, child.signalCode);
+        return;
+      }
+      child.once("exit", childExited);
+      child.once("error", childErrored);
+    }
+    if (!connection && client?.connection) {
+      connection = client.connection;
+      disposables.push(connection.onError(() => fail("TypeScript native compiler protocol failed during analysis")));
+      disposables.push(connection.onClose(() => fail("TypeScript native compiler protocol closed during analysis")));
+    }
+    if (child && connection) clearInterval(poll);
+  };
+  const poll = setInterval(attach, 2);
+  attach();
+  return {
+    failure,
+    stop: () => {
+      if (stopped) return;
+      stopped = true;
+      cleanup();
+    },
+  };
 }
 
 function withTimeout<T>(operation: Promise<T>, timeoutMs: number): Promise<T> {
   return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new CompilerTimeoutError(`TypeScript native syntax analysis timed out after ${timeoutMs}ms`)), timeoutMs);
-    timer.unref();
+    const timer = setTimeout(() => reject(new CompilerTimeoutError(`TypeScript native project analysis timed out after ${timeoutMs}ms`)), timeoutMs);
     operation.then(
       (value) => {
         clearTimeout(timer);
@@ -323,23 +566,87 @@ function withTimeout<T>(operation: Promise<T>, timeoutMs: number): Promise<T> {
   });
 }
 
-/** Run exactly one trusted native TypeScript compiler process for one scan. */
-export async function collectTypeScriptSyntacticDiagnostics(
+async function runCompilerOperation<T>(api: API, operation: Promise<T>, timeoutMs: number): Promise<T> {
+  const lifecycle = monitorCompilerLifecycle(api);
+  let retainedChild: ChildProcess | undefined;
+  try {
+    const result = await withTimeout(Promise.race([operation, lifecycle.failure]), timeoutMs);
+    lifecycle.stop();
+    retainedChild = compilerProcess(api);
+    await closeCompiler(api, false, retainedChild);
+    return result;
+  } catch (error) {
+    lifecycle.stop();
+    void operation.catch(() => undefined);
+    retainedChild ??= compilerProcess(api);
+    await closeCompiler(api, true, retainedChild);
+    throw error;
+  }
+}
+
+function semanticDiagnostic(
+  diagnostic: CompilerDiagnostic,
   sources: ReadonlyMap<string, string>,
-): Promise<TypeScriptSyntaxDiagnostics> {
+  virtualToRelative: ReadonlyMap<string, string>,
+  allowedCompilerFiles: ReadonlySet<string>,
+  trustedRoot: string,
+): TypeScriptSemanticDiagnostic {
+  if (!diagnostic.fileName) {
+    return {
+      relativePath: null,
+      code: diagnostic.code,
+      message: boundedDiagnosticMessage(diagnostic, [VIRTUAL_ROOT, trustedRoot]),
+      startOffset: 0,
+      endOffset: 0,
+    };
+  }
+  const fileKey = pathKey(diagnostic.fileName);
+  const relativePath = virtualToRelative.get(fileKey) ?? null;
+  if (relativePath === null && !allowedCompilerFiles.has(fileKey)) {
+    throw new Error(`TypeScript native semantic diagnostic escaped the isolated project: ${diagnostic.fileName}`);
+  }
+  const source = relativePath === null ? "" : sources.get(relativePath);
+  if (source === undefined) throw new Error(`TypeScript semantic input disappeared for ${relativePath}`);
+  const startOffset = Math.max(0, Math.min(source.length, diagnostic.pos));
+  const endOffset = Math.max(startOffset, Math.min(source.length, diagnostic.end));
+  return {
+    relativePath,
+    code: diagnostic.code,
+    message: boundedDiagnosticMessage(diagnostic, [VIRTUAL_ROOT, trustedRoot]),
+    startOffset,
+    endOffset,
+  };
+}
+
+/** Run one trusted native TypeScript Program and TypeChecker for one scan. */
+async function analyzeTypeScriptProjectInner(
+  sources: ReadonlyMap<string, string>,
+  staticConfig: TypeScriptStaticConfig,
+  testRuntime?: TypeScriptAnalysisTestRuntime,
+): Promise<TypeScriptProjectAnalysis> {
   // Validate the selected compiler even for repositories with no TS/JS
   // sources. The profile must not attest to a bundled, fail-closed compiler
   // that was never resolved.
-  const compiler = await resolveTypeScriptCompiler();
-  const result = new TypeScriptSyntaxDiagnostics();
-  if (sources.size === 0) return result;
+  const compiler = testRuntime?.compiler ?? await resolveTypeScriptCompiler();
+  let standardLibrary: BundledStandardLibrary;
+  try {
+    standardLibrary = await loadBundledStandardLibrary(
+      compiler,
+      testRuntime?.standardLibraryRoot,
+    );
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(`bundled TypeScript standard library is unavailable: ${detail}`, { cause: error });
+  }
+  const result = new TypeScriptProjectAnalysis();
 
   const virtualFiles = new Map<string, string>();
   const virtualToRelative = new Map<string, string>();
   const configFiles: string[] = [];
+  for (const [file, source] of standardLibrary.files) virtualFiles.set(file, source);
   for (const [relativePath, source] of [...sources].sort(([left], [right]) => left.localeCompare(right))) {
     if (!isConfinedTypeScriptInputPath(relativePath) || !TYPESCRIPT_SOURCE_EXTENSIONS.has(path.extname(relativePath).toLowerCase())) {
-      throw new Error(`refusing unsafe or unsupported TypeScript syntax input path: ${relativePath}`);
+      throw new Error(`refusing unsafe or unsupported TypeScript project input path: ${relativePath}`);
     }
     const portable = relativePath.replaceAll("\\", "/");
     const virtualPath = path.join(VIRTUAL_ROOT, ...portable.split("/"));
@@ -349,20 +656,28 @@ export async function collectTypeScriptSyntacticDiagnostics(
     result.set(portable, []);
     result.typeOnlyDependencyRanges.set(portable, []);
   }
+  const internalRoot = path.join(VIRTUAL_ROOT, "__depgraph_empty_project__.d.ts");
+  if (configFiles.length === 0) {
+    virtualFiles.set(internalRoot, "declare const __depgraph_empty_project__: unique symbol;\n");
+    configFiles.push(path.basename(internalRoot));
+  }
   virtualFiles.set(VIRTUAL_CONFIG, `${JSON.stringify({
     compilerOptions: {
       allowJs: true,
+      allowImportingTsExtensions: true,
       checkJs: false,
       jsx: "preserve",
       module: "preserve",
-      noCheck: true,
+      moduleDetection: "force",
+      moduleResolution: "bundler",
       noEmit: true,
-      noLib: true,
-      noResolve: true,
+      paths: staticConfig.paths,
       plugins: [],
       skipLibCheck: true,
       target: "esnext",
+      typeRoots: [],
       types: [],
+      verbatimModuleSyntax: true,
     },
     files: configFiles,
   })}\n`);
@@ -374,51 +689,213 @@ export async function collectTypeScriptSyntacticDiagnostics(
   });
   const operation = (async (): Promise<void> => {
     const snapshot = await withNeutralEnvironment(() => api.updateSnapshot({ openProjects: [VIRTUAL_CONFIG] }));
-    const projects = snapshot.getProjects();
-    if (projects.length !== 1) throw new Error(`TypeScript native syntax analysis opened ${projects.length} projects instead of one neutral project`);
-    const project = projects[0]!;
-    const actualRoots = new Set(project.rootFiles.map(pathKey));
-    for (const virtualPath of virtualToRelative.keys()) {
-      if (!actualRoots.has(virtualPath)) throw new Error(`TypeScript native syntax analysis omitted ${virtualToRelative.get(virtualPath)}`);
-      const relativePath = virtualToRelative.get(virtualPath)!;
-      // Fetching a remote AST transfers and decodes the full syntax tree. The
-      // lexical inventory already classifies import/export declarations, so
-      // only request trees that may contain the parser-ambiguous `import(...)`
-      // form (runtime CallExpression vs erased ImportType/JSDoc ImportType).
-      if (!MAY_CONTAIN_IMPORT_TYPE.test(sources.get(relativePath) ?? "")) continue;
-      const sourceFile = await project.program.getSourceFile(virtualPath);
-      if (sourceFile === undefined) throw new Error(`TypeScript native syntax analysis could not read AST for ${relativePath}`);
-      result.typeOnlyDependencyRanges.set(relativePath, typeOnlyDependencyRanges(sourceFile));
-    }
-    for (const diagnostic of await project.program.getSyntacticDiagnostics()) {
-      if (!diagnostic.fileName) throw new Error(`TypeScript native syntax diagnostic TS${diagnostic.code} has no source file`);
-      const relativePath = virtualToRelative.get(pathKey(diagnostic.fileName));
-      if (relativePath === undefined) throw new Error(`TypeScript native syntax diagnostic escaped the virtual input: ${diagnostic.fileName}`);
-      const source = sources.get(relativePath);
-      if (source === undefined) throw new Error(`TypeScript syntax input disappeared for ${relativePath}`);
-      const startOffset = Math.max(0, Math.min(source.length, diagnostic.pos));
-      const endOffset = Math.max(startOffset, Math.min(source.length, diagnostic.end));
-      result.get(relativePath)!.push({
-        relativePath,
-        code: diagnostic.code,
-        message: flattenDiagnosticMessage(diagnostic),
-        startOffset,
-        endOffset,
-      });
+    try {
+      const projects = snapshot.getProjects();
+      if (projects.length !== 1) throw new Error(`TypeScript native project analysis opened ${projects.length} projects instead of one neutral project`);
+      const project = projects[0]!;
+      const actualRoots = new Set(project.rootFiles.map(pathKey));
+      for (const virtualPath of virtualToRelative.keys()) {
+        if (!actualRoots.has(virtualPath)) throw new Error(`TypeScript native project analysis omitted ${virtualToRelative.get(virtualPath)}`);
+        const relativePath = virtualToRelative.get(virtualPath)!;
+        // Fetching a remote AST transfers and decodes the full syntax tree. The
+        // lexical inventory already classifies import/export declarations, so
+        // only request trees that may contain the parser-ambiguous `import(...)`
+        // form (runtime CallExpression vs erased ImportType/JSDoc ImportType).
+        // This intentionally over-approximates with a linear native search.
+        // A comment-aware regular expression can catastrophically backtrack on
+        // untrusted repeated-comment input; false positives only transfer one
+        // additional isolated AST and cannot admit filesystem input.
+        if (!(sources.get(relativePath) ?? "").includes("import")) continue;
+        const sourceFile = await project.program.getSourceFile(virtualPath);
+        if (sourceFile === undefined) throw new Error(`TypeScript native project analysis could not read AST for ${relativePath}`);
+        result.typeOnlyDependencyRanges.set(relativePath, typeOnlyDependencyRanges(sourceFile));
+      }
+      const internalRootKey = pathKey(internalRoot);
+      if (sources.size === 0 && !actualRoots.has(internalRootKey)) {
+        throw new Error("TypeScript native project analysis omitted its worker-owned empty root");
+      }
+      const standardLibraryKeys = new Set([...standardLibrary.files.keys()].map(pathKey));
+      const workerOwnedKeys = new Set([internalRootKey, pathKey(VIRTUAL_CONFIG)]);
+      const allowedCompilerFiles = new Set([...standardLibraryKeys, ...workerOwnedKeys]);
+      const programFiles = await project.program.getSourceFileNames();
+      for (const file of programFiles) {
+        const key = pathKey(file);
+        if (!virtualToRelative.has(key) && !allowedCompilerFiles.has(key)) {
+          throw new Error(`TypeScript native project analysis loaded a file outside its isolated VFS: ${file}`);
+        }
+      }
+      const loadedStandardLibraryFiles = programFiles.filter((file) => standardLibraryKeys.has(pathKey(file)));
+      if (!loadedStandardLibraryFiles.some((file) => path.basename(file) === "lib.esnext.full.d.ts")) {
+        throw new Error(`TypeScript native project analysis did not load bundled lib.esnext.full.d.ts from ${standardLibrary.root}`);
+      }
+      for (const diagnostic of await project.program.getSyntacticDiagnostics()) {
+        if (!diagnostic.fileName) throw new Error(`TypeScript native syntax diagnostic TS${diagnostic.code} has no source file`);
+        const relativePath = virtualToRelative.get(pathKey(diagnostic.fileName));
+        if (relativePath === undefined) throw new Error(`TypeScript native syntax diagnostic escaped the virtual input: ${diagnostic.fileName}`);
+        const source = sources.get(relativePath);
+        if (source === undefined) throw new Error(`TypeScript syntax input disappeared for ${relativePath}`);
+        const startOffset = Math.max(0, Math.min(source.length, diagnostic.pos));
+        const endOffset = Math.max(startOffset, Math.min(source.length, diagnostic.end));
+        result.get(relativePath)!.push({
+          relativePath,
+          code: diagnostic.code,
+          message: boundedDiagnosticMessage(diagnostic, [VIRTUAL_ROOT, standardLibrary.root]),
+          startOffset,
+          endOffset,
+        });
+      }
+      const intrinsicString = await project.checker.getStringType();
+      if (await project.checker.typeToString(intrinsicString) !== "string") {
+        throw new Error("TypeScript native TypeChecker smoke query returned an unexpected intrinsic string type");
+      }
+      const typeCheckerQueries = 1;
+      const diagnostics = [
+        ...await project.program.getProgramDiagnostics(),
+        ...await project.program.getGlobalDiagnostics(),
+        ...await project.program.getSemanticDiagnostics(),
+      ].map((diagnostic) => semanticDiagnostic(
+        diagnostic,
+        sources,
+        virtualToRelative,
+        allowedCompilerFiles,
+        standardLibrary.root,
+      ));
+      const uniqueDiagnostics = [...new Map(diagnostics.map((diagnostic) => [
+        JSON.stringify(diagnostic),
+        diagnostic,
+      ])).values()].sort((left, right) => (
+        (left.relativePath ?? "").localeCompare(right.relativePath ?? "")
+        || left.startOffset - right.startOffset
+        || left.code - right.code
+        || left.message.localeCompare(right.message)
+      ));
+      result.semanticDiagnostics.push(...uniqueDiagnostics.slice(0, MAX_SEMANTIC_DIAGNOSTICS));
+      result.project = {
+        status: "ready",
+        rootFiles: sources.size,
+        programFiles: programFiles.filter((file) => !workerOwnedKeys.has(pathKey(file))).length,
+        staticConfigFiles: staticConfig.configFiles,
+        pathMappings: Object.keys(staticConfig.paths).length,
+        standardLibraryFiles: loadedStandardLibraryFiles.length,
+        typeCheckerQueries,
+        semanticDiagnostics: uniqueDiagnostics.length,
+        emittedSemanticDiagnostics: result.semanticDiagnostics.length,
+      };
+    } finally {
+      await snapshot.dispose();
     }
   })();
-
-  try {
-    await withTimeout(operation, COMPILER_TIMEOUT_MS);
-  } catch (error) {
-    const timedOut = error instanceof CompilerTimeoutError;
-    if (timedOut) void operation.catch(() => undefined);
-    await closeCompiler(api, timedOut);
-    throw error;
-  }
-  await closeCompiler(api, false);
+  await runCompilerOperation(api, operation, testRuntime?.timeoutMs ?? COMPILER_TIMEOUT_MS);
   for (const diagnostics of result.values()) {
     diagnostics.sort((left, right) => left.startOffset - right.startOffset || left.code - right.code || left.message.localeCompare(right.message));
   }
   return result;
+}
+
+function projectFailure(error: unknown): TypeScriptProjectError {
+  if (error instanceof TypeScriptProjectError) return error;
+  const detail = error instanceof Error ? error.message : String(error);
+  let reason: TypeScriptProjectFailureReason;
+  if (error instanceof CompilerTimeoutError || /timed out/iu.test(detail)) {
+    reason = "compiler_timeout";
+  } else if (error instanceof CompilerProtocolError) {
+    reason = "compiler_protocol_failure";
+  } else if (/compiler is missing next to packaged worker|development compiler is unavailable/iu.test(detail)) {
+    reason = "compiler_unavailable";
+  } else if (/standard library/iu.test(detail)) {
+    reason = "stdlib_unavailable";
+  } else if (/opened \d+ projects/iu.test(detail)) {
+    reason = "project_count_mismatch";
+  } else if (/omitted/iu.test(detail)) {
+    reason = "root_file_mismatch";
+  } else if (/outside its isolated VFS|escaped the isolated project/iu.test(detail)) {
+    reason = "unexpected_program_input";
+  } else if (/TypeChecker smoke query/iu.test(detail)) {
+    reason = "typechecker_smoke_failed";
+  } else {
+    reason = "compiler_protocol_failure";
+  }
+  const message = reason === "compiler_unavailable" && PACKAGED_WORKER
+    ? `bundled TypeScript ${TYPESCRIPT_COMPILER_VERSION} compiler is missing next to packaged worker (${reason})`
+    : `bundled TypeScript ${TYPESCRIPT_COMPILER_VERSION} project model failed (${reason})`;
+  return new TypeScriptProjectError(reason, message);
+}
+
+/** @internal Cross-platform process lifecycle seam; the worker entrypoint never calls this. */
+export async function exerciseTypeScriptCompilerLifecycleForTest(
+  mode: TypeScriptLifecycleTestMode,
+): Promise<TypeScriptLifecycleTestResult> {
+  const { spawn } = await import("node:child_process");
+  const errorListeners = new Set<(error: Error) => void>();
+  const closeListeners = new Set<() => void>();
+  const connection: CompilerConnection = {
+    onError: (listener) => {
+      errorListeners.add(listener);
+      return { dispose: () => { errorListeners.delete(listener); } };
+    },
+    onClose: (listener) => {
+      closeListeners.add(listener);
+      return { dispose: () => { closeListeners.delete(listener); } };
+    },
+  };
+  const child = spawn(
+    process.execPath,
+    ["-e", mode === "crash" ? "process.exit(17)" : "setInterval(() => undefined, 1000)"],
+    { stdio: "ignore", windowsHide: true },
+  );
+  const client: { process?: ChildProcess; connection: CompilerConnection } = { process: child, connection };
+  const api = {
+    client,
+    close: async (): Promise<void> => {
+      if (mode === "strict-close") delete client.process;
+    },
+  } as unknown as API;
+  let protocolTimer: NodeJS.Timeout | undefined;
+  let failure: unknown;
+  try {
+    if (mode === "protocol-error") {
+      protocolTimer = setTimeout(() => {
+        for (const listener of [...errorListeners]) listener(new Error("injected protocol failure"));
+      }, 10);
+    }
+    await runCompilerOperation(
+      api,
+      mode === "strict-close" ? Promise.resolve() : new Promise<never>(() => undefined),
+      mode === "timeout" ? 100 : 2_000,
+    );
+  } catch (error) {
+    failure = error;
+  } finally {
+    if (protocolTimer) clearTimeout(protocolTimer);
+    await closeCompiler(api, true, child);
+  }
+  if (failure === undefined) throw new Error(`TypeScript compiler lifecycle test ${mode} did not fail`);
+  return {
+    reason: projectFailure(failure).reason,
+    reaped: child.exitCode !== null || child.signalCode !== null,
+    listenersDisposed: errorListeners.size === 0 && closeListeners.size === 0,
+  };
+}
+
+export async function analyzeTypeScriptProject(
+  sources: ReadonlyMap<string, string>,
+  staticConfig: TypeScriptStaticConfig = { configFiles: 0, paths: {} },
+): Promise<TypeScriptProjectAnalysis> {
+  try {
+    return await analyzeTypeScriptProjectInner(sources, staticConfig);
+  } catch (error) {
+    throw projectFailure(error);
+  }
+}
+
+/** @internal Test-only failure-injection seam; the worker entrypoint never calls this. */
+export async function analyzeTypeScriptProjectWithRuntimeForTest(
+  sources: ReadonlyMap<string, string>,
+  runtime: TypeScriptAnalysisTestRuntime,
+): Promise<TypeScriptProjectAnalysis> {
+  try {
+    return await analyzeTypeScriptProjectInner(sources, { configFiles: 0, paths: {} }, runtime);
+  } catch (error) {
+    throw projectFailure(error);
+  }
 }

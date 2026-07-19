@@ -1,7 +1,25 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { extractDependencies } from "../src/imports";
-import { collectTypeScriptSyntacticDiagnostics } from "../src/typescript-compiler";
+import { extractDependencies, parseStaticJsonc } from "../src/imports";
+import { analyzeTypeScriptProject } from "../src/typescript-compiler";
+
+test("static JSONC parsing preserves string content and rejects unterminated comments", () => {
+  assert.deepEqual(
+    parseStaticJsonc('\uFEFF{/* leading */"compilerOptions":{"paths":{"literal":[",}",],},},}'),
+    { compilerOptions: { paths: { literal: [",}"] } } },
+  );
+  assert.equal(parseStaticJsonc('{"compilerOptions": {}} /* unterminated'), null);
+  assert.equal(parseStaticJsonc('["top-level arrays are not configs"]'), null);
+});
+
+test("static JSONC trailing-comma normalization stays bounded for large configs", { timeout: 3_000 }, () => {
+  const values = Array.from({ length: 100_000 }, (_, index) => index).join(",");
+  const parsed = parseStaticJsonc(`{"values":[${values},],}`);
+  const result = parsed?.values;
+  assert.ok(Array.isArray(result));
+  assert.equal(result.length, 100_000);
+  assert.equal(result.at(-1), 99_999);
+});
 
 test("extracts ESM, CJS, re-export, type-only, literal and computed imports", () => {
   const source = `
@@ -49,7 +67,7 @@ test("import.meta expressions are not dependency declarations", async () => {
 const metadata = (import.meta, { from: "ghost" });
 const resolved = import.meta.resolve("also-not-a-static-import");
 `;
-  const analysis = await collectTypeScriptSyntacticDiagnostics(new Map([["meta.ts", source]]));
+  const analysis = await analyzeTypeScriptProject(new Map([["meta.ts", source]]));
   assert.deepEqual(analysis.get("meta.ts"), []);
   const result = extractDependencies("/repo/meta.ts", "meta.ts", source, analysis.typeOnlyDependencyRanges.get("meta.ts"));
   assert.deepEqual(result.dependencies, []);
@@ -92,7 +110,7 @@ let fromJsDoc;
 function returnedFromJsDoc() {}
 // Prose mentioning import("./not-a-site") is not a JSDoc type dependency.
 `;
-  const analysis = await collectTypeScriptSyntacticDiagnostics(new Map([
+  const analysis = await analyzeTypeScriptProject(new Map([
     ["source.ts", typescript],
     ["source.js", javascript],
   ]));
