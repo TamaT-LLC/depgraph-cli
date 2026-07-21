@@ -45,10 +45,15 @@ const TYPESCRIPT_SEMANTIC_EMISSION_DEFINITION_GRAPH_V1: &str = "definition-graph
 const TYPESCRIPT_SEMANTIC_EMISSION_IMPORT_TYPE_GRAPH_V1: &str = "definition-import-type-graph-v1";
 const TYPESCRIPT_SEMANTIC_EMISSION_IMPORT_TYPE_CALL_GRAPH_V1: &str =
     "definition-import-type-call-graph-v1";
+const TYPESCRIPT_SEMANTIC_EMISSION_IMPORT_TYPE_CALL_GRAPH_V2: &str =
+    "definition-import-type-call-graph-v2";
 const TYPESCRIPT_SEMANTIC_SITE_COUNT_PROPERTY: &str = "typescript_semantic_site_count";
 const TYPESCRIPT_SEMANTIC_CALL_SITE_COUNT_PROPERTY: &str = "typescript_semantic_call_site_count";
 const TYPESCRIPT_SEMANTIC_EXTRACTOR: &str = "typescript-native-typechecker";
 const TYPESCRIPT_SEMANTIC_BACKEND: &str = "typescript-native-compiler";
+const TYPESCRIPT_CLOSED_LOCAL_CALL_FLOW_ALGORITHM: &str = "typescript-closed-local-call-flow-v1";
+const TYPESCRIPT_CLOSED_LOCAL_FRESH_INSTANCE_FLOW_ALGORITHM: &str =
+    "typescript-closed-local-fresh-instance-flow-v1";
 const TYPESCRIPT_COMPILER_VERSION: &str = "7.0.2";
 const TYPESCRIPT_PROJECT_STATUS_PROPERTY: &str = "typescript_project_model_status";
 const TYPESCRIPT_TYPECHECKER_STATUS_PROPERTY: &str = "typescript_typechecker_status";
@@ -1708,14 +1713,21 @@ fn is_web_semantic_dependency_site_kind(kind: &str) -> bool {
 }
 
 fn is_web_semantic_dependency_edge_kind(kind: &str) -> bool {
-    matches!(kind, "imports" | "reexports" | "type_uses" | "calls")
+    matches!(
+        kind,
+        "imports" | "reexports" | "type_uses" | "calls" | "may_call"
+    )
 }
 
-fn web_semantic_edge_kind_for_site(kind: &str) -> Option<&'static str> {
+fn web_semantic_edge_kind_for_site(
+    kind: &str,
+    resolution_status: ResolutionStatus,
+) -> Option<&'static str> {
     match kind {
         "web_import" => Some("imports"),
         "web_reexport" => Some("reexports"),
         "type_use" => Some("type_uses"),
+        "call" if resolution_status == ResolutionStatus::Candidates => Some("may_call"),
         "call" => Some("calls"),
         _ => None,
     }
@@ -1949,7 +1961,8 @@ fn discard_web_definition_delta(
             WebSemanticCapability::DefinitionImportTypeGraphV1 => {
                 "definition-import-type-graph-discarded"
             }
-            WebSemanticCapability::DefinitionImportTypeCallGraphV1 => {
+            WebSemanticCapability::DefinitionImportTypeCallGraphV1
+            | WebSemanticCapability::DefinitionImportTypeCallGraphV2 => {
                 "definition-import-type-call-graph-discarded"
             }
         };
@@ -1977,6 +1990,7 @@ fn discard_web_definition_delta(
             capability,
             WebSemanticCapability::DefinitionImportTypeGraphV1
                 | WebSemanticCapability::DefinitionImportTypeCallGraphV1
+                | WebSemanticCapability::DefinitionImportTypeCallGraphV2
         ) {
             properties.insert(
                 TYPESCRIPT_SEMANTIC_SITE_COUNT_PROPERTY.to_owned(),
@@ -1985,7 +1999,11 @@ fn discard_web_definition_delta(
         } else {
             properties.remove(TYPESCRIPT_SEMANTIC_SITE_COUNT_PROPERTY);
         }
-        if capability == WebSemanticCapability::DefinitionImportTypeCallGraphV1 {
+        if matches!(
+            capability,
+            WebSemanticCapability::DefinitionImportTypeCallGraphV1
+                | WebSemanticCapability::DefinitionImportTypeCallGraphV2
+        ) {
             properties.insert(
                 TYPESCRIPT_SEMANTIC_CALL_SITE_COUNT_PROPERTY.to_owned(),
                 Value::String("0".to_owned()),
@@ -2018,6 +2036,7 @@ enum WebSemanticCapability {
     DefinitionGraphV1,
     DefinitionImportTypeGraphV1,
     DefinitionImportTypeCallGraphV1,
+    DefinitionImportTypeCallGraphV2,
 }
 
 fn web_semantic_capability(
@@ -2044,6 +2063,10 @@ fn web_semantic_capability(
             TYPESCRIPT_ANALYSIS_MODE_IMPORT_TYPE_CALL_GRAPH,
             TYPESCRIPT_SEMANTIC_EMISSION_IMPORT_TYPE_CALL_GRAPH_V1,
         ) => Ok(WebSemanticCapability::DefinitionImportTypeCallGraphV1),
+        (
+            TYPESCRIPT_ANALYSIS_MODE_IMPORT_TYPE_CALL_GRAPH,
+            TYPESCRIPT_SEMANTIC_EMISSION_IMPORT_TYPE_CALL_GRAPH_V2,
+        ) => Ok(WebSemanticCapability::DefinitionImportTypeCallGraphV2),
         _ => Err(format!(
             "Web worker reported unsupported or mismatched semantic capability {TYPESCRIPT_ANALYSIS_MODE_PROPERTY}={analysis_mode:?}, {TYPESCRIPT_SEMANTIC_EMISSION_PROPERTY}={emission:?}"
         )),
@@ -2073,7 +2096,8 @@ fn web_definition_profile_ready(
             "definition-import-type-graph-emitted",
             "definition-import-type-graph-discarded",
         ),
-        WebSemanticCapability::DefinitionImportTypeCallGraphV1 => (
+        WebSemanticCapability::DefinitionImportTypeCallGraphV1
+        | WebSemanticCapability::DefinitionImportTypeCallGraphV2 => (
             "definition-import-type-call-graph-emitted",
             "definition-import-type-call-graph-discarded",
         ),
@@ -2664,6 +2688,7 @@ fn validate_web_definition_graph(
     definition_profiles: &BTreeSet<String>,
     import_type_profiles: &BTreeSet<String>,
     call_profiles: &BTreeSet<String>,
+    candidate_call_profiles: &BTreeSet<String>,
 ) -> std::result::Result<(), String> {
     validate_semantic_contract(protocol).map_err(|error| error.to_string())?;
 
@@ -2884,6 +2909,8 @@ fn validate_web_definition_graph(
             && edge.site_id.is_some()
             && if edge.kind == "calls" {
                 call_profiles.contains(&edge.profile_id)
+            } else if edge.kind == "may_call" {
+                candidate_call_profiles.contains(&edge.profile_id)
             } else {
                 import_type_profiles.contains(&edge.profile_id)
             };
@@ -2902,7 +2929,11 @@ fn validate_web_definition_graph(
                 .any(|target| semantic_node_ids.contains(target.as_str())))
             && !(is_web_semantic_dependency_site_kind(&site.kind)
                 && if site.kind == "call" {
-                    call_profiles.contains(&site.profile_id)
+                    if site.resolution_status == ResolutionStatus::Candidates {
+                        candidate_call_profiles.contains(&site.profile_id)
+                    } else {
+                        call_profiles.contains(&site.profile_id)
+                    }
                 } else {
                     import_type_profiles.contains(&site.profile_id)
                 })
@@ -3547,7 +3578,11 @@ fn validate_web_definition_graph(
             .is_some_and(|evidence| evidence.kind == EvidenceKind::Semantic)
     }) {
         let authorized = if site.kind == "call" {
-            call_profiles.contains(&site.profile_id)
+            if site.resolution_status == ResolutionStatus::Candidates {
+                candidate_call_profiles.contains(&site.profile_id)
+            } else {
+                call_profiles.contains(&site.profile_id)
+            }
         } else {
             import_type_profiles.contains(&site.profile_id)
         };
@@ -3557,19 +3592,20 @@ fn validate_web_definition_graph(
                 site.id, site.profile_id
             ));
         }
-        let expected_edge_kind = web_semantic_edge_kind_for_site(&site.kind).ok_or_else(|| {
+        let expected_edge_kind = web_semantic_edge_kind_for_site(&site.kind, site.resolution_status).ok_or_else(|| {
             format!(
                 "Web cumulative semantic profile emitted forbidden semantic dependency site kind {:?}",
                 site.kind
             )
         })?;
         if site.kind == "call"
-            && (site.resolution_status == ResolutionStatus::Candidates
-                || site.precision == Precision::Overapprox
-                || site.target_ids.len() != 1)
+            && ((site.resolution_status == ResolutionStatus::Candidates
+                && (site.precision != Precision::Overapprox || site.target_ids.is_empty()))
+                || (site.resolution_status != ResolutionStatus::Candidates
+                    && (site.precision == Precision::Overapprox || site.target_ids.len() != 1)))
         {
             return Err(format!(
-                "Web semantic call site {} must have exactly one target and cannot use candidates/may_call",
+                "Web semantic call site {} has an invalid candidate target or precision shape",
                 site.id
             ));
         }
@@ -3621,6 +3657,7 @@ fn validate_web_definition_graph(
                 .get("dispatch")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
+            let algorithm = primary.properties.get("algorithm").and_then(Value::as_str);
             let call_kind_is_valid = matches!(
                 call_kind,
                 "function" | "method" | "constructor" | "tagged_template"
@@ -3642,16 +3679,33 @@ fn validate_web_definition_graph(
                 ResolutionStatus::Unresolved => {
                     site.precision == Precision::Heuristic && matches!(dispatch, "dynamic" | "open")
                 }
-                ResolutionStatus::Candidates => false,
+                ResolutionStatus::Candidates => {
+                    site.precision == Precision::Overapprox
+                        && site.reason.is_none()
+                        && match dispatch {
+                            "dynamic" => {
+                                algorithm == Some(TYPESCRIPT_CLOSED_LOCAL_CALL_FLOW_ALGORITHM)
+                            }
+                            "fresh_instance" => {
+                                algorithm
+                                    == Some(TYPESCRIPT_CLOSED_LOCAL_FRESH_INSTANCE_FLOW_ALGORITHM)
+                                    && matches!(call_kind, "method" | "tagged_template")
+                                    && occurrence_kind != "new_expression"
+                            }
+                            _ => false,
+                        }
+                }
             };
             if !call_kind_is_valid
                 || !dispatch_is_valid
+                || (site.resolution_status != ResolutionStatus::Candidates
+                    && primary.properties.contains_key("algorithm"))
                 || primary.properties.contains_key("type_only")
                 || primary.properties.contains_key("imported_name")
                 || primary.properties.contains_key("resolution_mode")
             {
                 return Err(format!(
-                    "Web semantic call site {} has invalid call_kind {call_kind:?}, dispatch {dispatch:?}, or import-only metadata",
+                    "Web semantic call site {} has invalid call_kind {call_kind:?}, dispatch {dispatch:?}, algorithm {algorithm:?}, or import-only metadata",
                     site.id
                 ));
             }
@@ -4154,8 +4208,8 @@ fn validate_web_definition_graph(
         }
         if site.kind == "call" {
             if linked_edges
-                .first()
-                .is_none_or(|edge| edge.condition.canonicalized() != site.condition.canonicalized())
+                .iter()
+                .any(|edge| edge.condition.canonicalized() != site.condition.canonicalized())
             {
                 return Err(format!(
                     "Web semantic call edge condition does not match dependency site {}",
@@ -4324,6 +4378,7 @@ fn validate_web_definition_graph(
             capability,
             WebSemanticCapability::DefinitionImportTypeGraphV1
                 | WebSemanticCapability::DefinitionImportTypeCallGraphV1
+                | WebSemanticCapability::DefinitionImportTypeCallGraphV2
         );
         if declares_import_type_capability {
             let declared = semantic_site_count.ok_or_else(|| {
@@ -4350,7 +4405,11 @@ fn validate_web_definition_graph(
             .get(TYPESCRIPT_SEMANTIC_CALL_SITE_COUNT_PROPERTY)
             .and_then(Value::as_str)
             .and_then(|value| value.parse::<usize>().ok());
-        if capability == WebSemanticCapability::DefinitionImportTypeCallGraphV1 {
+        if matches!(
+            capability,
+            WebSemanticCapability::DefinitionImportTypeCallGraphV1
+                | WebSemanticCapability::DefinitionImportTypeCallGraphV2
+        ) {
             let declared = semantic_call_site_count.ok_or_else(|| {
                 format!(
                     "Web profile {profile_id:?} omitted or has invalid {TYPESCRIPT_SEMANTIC_CALL_SITE_COUNT_PROPERTY}"
@@ -4393,6 +4452,7 @@ fn parse_events_preserving_prefix(
     let mut web_definition_profiles = BTreeSet::new();
     let mut web_import_type_profiles = BTreeSet::new();
     let mut web_call_profiles = BTreeSet::new();
+    let mut web_candidate_call_profiles = BTreeSet::new();
     let mut web_semantic_node_ids = BTreeSet::new();
     let mut web_semantic_node_candidate_ids = BTreeSet::new();
     let mut web_semantic_endpoint_ids = BTreeSet::new();
@@ -4663,14 +4723,24 @@ fn parse_events_preserving_prefix(
                         Some(
                             WebSemanticCapability::DefinitionImportTypeGraphV1
                                 | WebSemanticCapability::DefinitionImportTypeCallGraphV1
+                                | WebSemanticCapability::DefinitionImportTypeCallGraphV2
                         )
                     ) {
                         web_import_type_profiles.insert(declared.profile.id.clone());
                     }
-                    if web_capability
-                        == Some(WebSemanticCapability::DefinitionImportTypeCallGraphV1)
-                    {
+                    if matches!(
+                        web_capability,
+                        Some(
+                            WebSemanticCapability::DefinitionImportTypeCallGraphV1
+                                | WebSemanticCapability::DefinitionImportTypeCallGraphV2
+                        )
+                    ) {
                         web_call_profiles.insert(declared.profile.id.clone());
+                    }
+                    if web_capability
+                        == Some(WebSemanticCapability::DefinitionImportTypeCallGraphV2)
+                    {
+                        web_candidate_call_profiles.insert(declared.profile.id.clone());
                     }
                 }
             }
@@ -4742,6 +4812,8 @@ fn parse_events_preserving_prefix(
                     } else if is_web_semantic_dependency_edge_kind(&edge.kind) {
                         let authorized = if edge.kind == "calls" {
                             web_call_profiles.contains(&edge.profile_id)
+                        } else if edge.kind == "may_call" {
+                            web_candidate_call_profiles.contains(&edge.profile_id)
                         } else {
                             web_import_type_profiles.contains(&edge.profile_id)
                         };
@@ -4779,7 +4851,11 @@ fn parse_events_preserving_prefix(
                         ) =>
                 {
                     let authorized = if site.site.kind == "call" {
-                        web_call_profiles.contains(&site.site.profile_id)
+                        if site.site.resolution_status == ResolutionStatus::Candidates {
+                            web_candidate_call_profiles.contains(&site.site.profile_id)
+                        } else {
+                            web_call_profiles.contains(&site.site.profile_id)
+                        }
                     } else {
                         web_import_type_profiles.contains(&site.site.profile_id)
                     };
@@ -4857,6 +4933,7 @@ fn parse_events_preserving_prefix(
                     &web_definition_profiles,
                     &web_import_type_profiles,
                     &web_call_profiles,
+                    &web_candidate_call_profiles,
                 ) {
                     parse_error = Some(format!(
                         "security policy violation: invalid Web semantic delta: {error}"
@@ -5989,19 +6066,226 @@ mod tests {
 
         let edge = events
             .iter_mut()
-            .find(|event| event["event"] == "edge_upsert" && event["edge"]["kind"] == "calls")
-            .expect("calls edge");
+            .find(|event| {
+                event["event"] == "edge_upsert"
+                    && matches!(event["edge"]["kind"].as_str(), Some("calls" | "may_call"))
+            })
+            .expect("call edge");
+        let edge_kind = edge["edge"]["kind"]
+            .as_str()
+            .expect("call edge kind")
+            .to_owned();
         edge["edge"]["source"] = serde_json::json!(source);
         edge["edge"]["target"] = serde_json::json!(target);
         edge["edge"]["site_id"] = serde_json::json!(site_id);
         edge["edge"]["id"] = serde_json::json!(depgraph_protocol::stable_id_from_value(
             "edge",
             &serde_json::json!({
-                "kind":"calls",
+                "kind":edge_kind,
                 "site_id":site_id,
                 "target":target,
             }),
         ));
+    }
+
+    fn configure_typescript_candidate_call(events: &mut Vec<Value>, emission: &str) {
+        let profile = events
+            .iter_mut()
+            .find(|event| event["event"] == "profile_declared")
+            .expect("Web profile declaration");
+        profile["profile"]["properties"][TYPESCRIPT_SEMANTIC_EMISSION_PROPERTY] =
+            serde_json::json!(emission);
+
+        let package = events
+            .iter()
+            .find(|event| {
+                event["event"] == "node_upsert" && event["node"]["kind"] == "package_instance"
+            })
+            .expect("package node");
+        let package_id = package["node"]["id"]
+            .as_str()
+            .expect("package ID")
+            .to_owned();
+        let package_locator = package["node"]["properties"]["locator"]
+            .as_str()
+            .expect("package locator")
+            .to_owned();
+        let source_file_id = events
+            .iter()
+            .find(|event| event["node"]["properties"]["path"] == "src/index.ts")
+            .expect("source file")["node"]["id"]
+            .as_str()
+            .expect("source file ID")
+            .to_owned();
+        let candidate_span = serde_json::json!({
+            "start_line": 1,
+            "start_column": 10,
+            "end_line": 1,
+            "end_column": 25,
+        });
+        let candidate_resolver = format!("{package_locator}::module:src/index.ts#candidateTarget");
+        let candidate_identity = serde_json::json!({
+            "language": "typescript",
+            "package_locator": package_locator,
+            "symbol_kind": "function",
+            "identity_kind": "named",
+            "resolver_identity": candidate_resolver,
+        });
+        let candidate_target_id =
+            depgraph_protocol::stable_id_from_value("symbol", &candidate_identity);
+        let candidate_node = serde_json::json!({
+            "protocol_version": "1.0",
+            "scan_id": "typescript-gate-scan",
+            "adapter": "web",
+            "adapter_version": env!("CARGO_PKG_VERSION"),
+            "event": "node_upsert",
+            "node": {
+                "id": candidate_target_id,
+                "kind": "symbol",
+                "locator": format!("typescript-symbol:{candidate_target_id}"),
+                "display_name": "candidateTarget",
+                "properties": {
+                    "language": "typescript",
+                    "package_locator": package_locator,
+                    "package_id": package_id,
+                    "symbol_kind": "function",
+                    "canonical_identity": candidate_identity,
+                    "resolver_identity": candidate_resolver,
+                    "profile_id": "web:default",
+                    "source_path": "src/index.ts",
+                    "source_span": candidate_span,
+                },
+            },
+        });
+        let candidate_declaration_evidence = serde_json::json!({
+            "kind": "semantic",
+            "extractor": TYPESCRIPT_SEMANTIC_EXTRACTOR,
+            "extractor_version": TYPESCRIPT_COMPILER_VERSION,
+            "path": "src/index.ts",
+            "start_line": 1,
+            "start_column": 10,
+            "end_line": 1,
+            "end_column": 25,
+            "detail": "TypeChecker candidate function declaration",
+            "properties": {"profile_id": "web:default"},
+        });
+        let candidate_declaration_id = depgraph_protocol::stable_id_from_value(
+            "edge",
+            &serde_json::json!({
+                "condition": {"op":"all","conditions":[]},
+                "kind": "declares",
+                "path": "src/index.ts",
+                "profile_id": "web:default",
+                "source": source_file_id,
+                "span": candidate_span,
+                "target": candidate_target_id,
+            }),
+        );
+        let candidate_declaration = serde_json::json!({
+            "protocol_version": "1.0",
+            "scan_id": "typescript-gate-scan",
+            "adapter": "web",
+            "adapter_version": env!("CARGO_PKG_VERSION"),
+            "event": "edge_upsert",
+            "edge": {
+                "id": candidate_declaration_id,
+                "source": source_file_id,
+                "target": candidate_target_id,
+                "kind": "declares",
+                "phase": "semantic",
+                "environment": "any",
+                "profile_id": "web:default",
+                "condition": {"op":"all","conditions":[]},
+                "resolution_status": "resolved",
+                "precision": "exact",
+                "generated": false,
+                "evidence": [candidate_declaration_evidence],
+            },
+        });
+        let call_site_index = events
+            .iter()
+            .position(|event| {
+                event["event"] == "dependency_site" && event["site"]["kind"] == "call"
+            })
+            .expect("call site");
+        events.insert(call_site_index, candidate_node);
+        events.insert(call_site_index + 1, candidate_declaration);
+
+        let call_site_index = events
+            .iter()
+            .position(|event| {
+                event["event"] == "dependency_site" && event["site"]["kind"] == "call"
+            })
+            .expect("call site");
+        let existing_target_id = events[call_site_index]["site"]["target_ids"][0]
+            .as_str()
+            .expect("existing candidate target")
+            .to_owned();
+        let mut target_ids = vec![existing_target_id, candidate_target_id];
+        target_ids.sort();
+        events[call_site_index]["site"]["target_ids"] = serde_json::json!(target_ids);
+        events[call_site_index]["site"]["resolution_status"] = serde_json::json!("candidates");
+        events[call_site_index]["site"]["precision"] = serde_json::json!("overapprox");
+        let call_site_id = events[call_site_index]["site"]["id"]
+            .as_str()
+            .expect("call site ID")
+            .to_owned();
+        mutate_semantic_primary_properties(events, "call", |properties| {
+            properties["dispatch"] = serde_json::json!("dynamic");
+            properties["algorithm"] =
+                serde_json::json!(TYPESCRIPT_CLOSED_LOCAL_CALL_FLOW_ALGORITHM);
+        });
+        let call_edge_index = events
+            .iter()
+            .position(|event| {
+                event["event"] == "edge_upsert"
+                    && event["edge"]["site_id"] == call_site_id
+                    && event["edge"]["kind"] == "calls"
+            })
+            .expect("calls edge");
+        events[call_edge_index]["edge"]["kind"] = serde_json::json!("may_call");
+        events[call_edge_index]["edge"]["resolution_status"] = serde_json::json!("candidates");
+        events[call_edge_index]["edge"]["precision"] = serde_json::json!("overapprox");
+        recanonicalize_typescript_call(events);
+
+        let call_edge_index = events
+            .iter()
+            .position(|event| {
+                event["event"] == "edge_upsert"
+                    && event["edge"]["site_id"] == call_site_id
+                    && event["edge"]["kind"] == "may_call"
+            })
+            .expect("first may_call edge");
+        let mut additional_edge = events[call_edge_index].clone();
+        let second_target_id = events[call_site_index]["site"]["target_ids"][1]
+            .as_str()
+            .expect("second candidate target")
+            .to_owned();
+        additional_edge["edge"]["target"] = serde_json::json!(second_target_id);
+        additional_edge["edge"]["id"] = serde_json::json!(depgraph_protocol::stable_id_from_value(
+            "edge",
+            &serde_json::json!({
+                "kind": "may_call",
+                "site_id": call_site_id,
+                "target": second_target_id,
+            }),
+        ));
+        events.insert(call_edge_index + 1, additional_edge);
+
+        for event in events.iter_mut() {
+            if matches!(
+                event["event"].as_str(),
+                Some("profile_completed" | "scan_completed")
+            ) {
+                event["coverage"]["dependency_sites"] = serde_json::json!(1);
+                event["coverage"]["resolved"] = serde_json::json!(0);
+                event["coverage"]["candidates"] = serde_json::json!(1);
+                event["coverage"]["external"] = serde_json::json!(0);
+                event["coverage"]["unresolved"] = serde_json::json!(0);
+            }
+        }
+        sync_test_semantic_counts(events);
+        resequence_test_protocol(events);
     }
 
     fn test_protocol_values(output: Vec<u8>) -> Result<Vec<Value>> {
@@ -7491,29 +7775,96 @@ mod tests {
     }
 
     #[test]
-    fn web_call_capability_rejects_candidate_calls() -> Result<()> {
+    fn web_call_capability_v2_accepts_well_formed_candidate_calls() -> Result<()> {
         let root = tempfile::tempdir()?;
         let root = root.path().canonicalize()?;
         let mut events = test_protocol_values(typescript_call_protocol(
             &root,
             TYPESCRIPT_RELEASE_GATE_PENDING,
         )?)?;
-        for event in &mut events {
-            if event["event"] == "dependency_site" && event["site"]["kind"] == "call" {
-                event["site"]["resolution_status"] = serde_json::json!("candidates");
-                event["site"]["precision"] = serde_json::json!("overapprox");
-            } else if event["event"] == "edge_upsert" && event["edge"]["kind"] == "calls" {
-                event["edge"]["resolution_status"] = serde_json::json!("candidates");
-                event["edge"]["precision"] = serde_json::json!("overapprox");
-            }
-            if matches!(
-                event["event"].as_str(),
-                Some("profile_completed" | "scan_completed")
-            ) {
-                event["coverage"]["resolved"] = serde_json::json!(0);
-                event["coverage"]["candidates"] = serde_json::json!(1);
-            }
-        }
+        configure_typescript_candidate_call(
+            &mut events,
+            TYPESCRIPT_SEMANTIC_EMISSION_IMPORT_TYPE_CALL_GRAPH_V2,
+        );
+
+        let parsed = parse_events_preserving_prefix(
+            &serialize_test_protocol(events)?,
+            "typescript-gate-scan",
+            "web",
+            &root,
+            64 * 1024,
+            Some(env!("CARGO_PKG_VERSION")),
+            Some(false),
+        );
+        assert_eq!(parsed.error, None, "{:?}", parsed.error);
+        assert_eq!(parsed.failure_kind, None, "{:?}", parsed.failure_kind);
+        assert!(!parsed.security_violation);
+        let candidate_site = parsed
+            .events
+            .iter()
+            .find(|event| {
+                event["event"] == "dependency_site"
+                    && event["site"]["kind"] == "call"
+                    && event["site"]["resolution_status"] == "candidates"
+            })
+            .expect("candidate call site");
+        let target_ids = candidate_site["site"]["target_ids"]
+            .as_array()
+            .expect("candidate call targets");
+        assert_eq!(target_ids.len(), 2);
+        assert!(
+            candidate_site["site"]["evidence"][0]["properties"]["algorithm"]
+                .as_str()
+                .is_some_and(|algorithm| !algorithm.is_empty())
+        );
+        let site_id = candidate_site["site"]["id"]
+            .as_str()
+            .expect("candidate call site ID");
+        assert_eq!(
+            parsed
+                .events
+                .iter()
+                .filter(|event| {
+                    event["event"] == "edge_upsert"
+                        && event["edge"]["kind"] == "may_call"
+                        && event["edge"]["site_id"] == site_id
+                        && event["edge"]["resolution_status"] == "candidates"
+                        && event["edge"]["precision"] == "overapprox"
+                })
+                .count(),
+            2
+        );
+        assert!(
+            parsed
+                .events
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        event["event"].as_str(),
+                        Some("profile_completed" | "scan_completed")
+                    )
+                })
+                .all(|event| {
+                    event["coverage"]["dependency_sites"] == 1
+                        && event["coverage"]["resolved"] == 0
+                        && event["coverage"]["candidates"] == 1
+                })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn web_call_capability_v1_rejects_candidate_calls() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let root = root.path().canonicalize()?;
+        let mut events = test_protocol_values(typescript_call_protocol(
+            &root,
+            TYPESCRIPT_RELEASE_GATE_PENDING,
+        )?)?;
+        configure_typescript_candidate_call(
+            &mut events,
+            TYPESCRIPT_SEMANTIC_EMISSION_IMPORT_TYPE_CALL_GRAPH_V1,
+        );
         let parsed = parse_events_preserving_prefix(
             &serialize_test_protocol(events)?,
             "typescript-gate-scan",
@@ -7528,9 +7879,254 @@ mod tests {
             Some(WorkerFailureKind::MalformedProtocol)
         );
         assert!(parsed.security_violation, "{:?}", parsed.error);
-        assert!(parsed.error.as_deref().is_some_and(|error| {
-            error.contains("cannot use candidates") || error.contains("direct calls edge")
-        }));
+        assert!(
+            parsed
+                .error
+                .as_deref()
+                .is_some_and(|error| { error.contains("forbidden semantic dependency site") })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn web_call_capability_v2_rejects_candidate_call_without_algorithm() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let root = root.path().canonicalize()?;
+        let mut events = test_protocol_values(typescript_call_protocol(
+            &root,
+            TYPESCRIPT_RELEASE_GATE_PENDING,
+        )?)?;
+        configure_typescript_candidate_call(
+            &mut events,
+            TYPESCRIPT_SEMANTIC_EMISSION_IMPORT_TYPE_CALL_GRAPH_V2,
+        );
+        mutate_semantic_primary_properties(&mut events, "call", |properties| {
+            properties
+                .as_object_mut()
+                .expect("primary properties")
+                .remove("algorithm");
+        });
+
+        let parsed = parse_events_preserving_prefix(
+            &serialize_test_protocol(events)?,
+            "typescript-gate-scan",
+            "web",
+            &root,
+            64 * 1024,
+            Some(env!("CARGO_PKG_VERSION")),
+            Some(false),
+        );
+        assert_eq!(
+            parsed.failure_kind,
+            Some(WorkerFailureKind::MalformedProtocol)
+        );
+        assert!(parsed.security_violation, "{:?}", parsed.error);
+        assert!(
+            parsed.error.as_deref().is_some_and(|error| {
+                error.contains("may_call edge") && error.contains("algorithm")
+            }),
+            "{:?}",
+            parsed.error
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn web_call_capability_v2_rejects_candidate_call_with_reason() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let root = root.path().canonicalize()?;
+        let mut events = test_protocol_values(typescript_call_protocol(
+            &root,
+            TYPESCRIPT_RELEASE_GATE_PENDING,
+        )?)?;
+        configure_typescript_candidate_call(
+            &mut events,
+            TYPESCRIPT_SEMANTIC_EMISSION_IMPORT_TYPE_CALL_GRAPH_V2,
+        );
+        let call_site = events
+            .iter_mut()
+            .find(|event| event["event"] == "dependency_site" && event["site"]["kind"] == "call")
+            .expect("candidate call site");
+        call_site["site"]["reason"] = serde_json::json!("spoofed_candidate_reason");
+
+        let parsed = parse_events_preserving_prefix(
+            &serialize_test_protocol(events)?,
+            "typescript-gate-scan",
+            "web",
+            &root,
+            64 * 1024,
+            Some(env!("CARGO_PKG_VERSION")),
+            Some(false),
+        );
+        assert_eq!(
+            parsed.failure_kind,
+            Some(WorkerFailureKind::MalformedProtocol)
+        );
+        assert!(parsed.security_violation, "{:?}", parsed.error);
+        assert!(
+            parsed.error.as_deref().is_some_and(|error| {
+                error.contains("candidate call site") && error.contains("reason")
+            }),
+            "{:?}",
+            parsed.error
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn web_call_capability_v2_rejects_spoofed_candidate_algorithm() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let root = root.path().canonicalize()?;
+        let mut events = test_protocol_values(typescript_call_protocol(
+            &root,
+            TYPESCRIPT_RELEASE_GATE_PENDING,
+        )?)?;
+        configure_typescript_candidate_call(
+            &mut events,
+            TYPESCRIPT_SEMANTIC_EMISSION_IMPORT_TYPE_CALL_GRAPH_V2,
+        );
+        mutate_semantic_primary_properties(&mut events, "call", |properties| {
+            properties["algorithm"] =
+                serde_json::json!(TYPESCRIPT_CLOSED_LOCAL_FRESH_INSTANCE_FLOW_ALGORITHM);
+        });
+
+        let parsed = parse_events_preserving_prefix(
+            &serialize_test_protocol(events)?,
+            "typescript-gate-scan",
+            "web",
+            &root,
+            64 * 1024,
+            Some(env!("CARGO_PKG_VERSION")),
+            Some(false),
+        );
+        assert_eq!(
+            parsed.failure_kind,
+            Some(WorkerFailureKind::MalformedProtocol)
+        );
+        assert!(parsed.security_violation, "{:?}", parsed.error);
+        assert!(
+            parsed.error.as_deref().is_some_and(|error| {
+                error.contains("dispatch \"dynamic\"") && error.contains("algorithm")
+            }),
+            "{:?}",
+            parsed.error
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn web_call_capability_v2_accepts_fresh_instance_method_candidate() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let root = root.path().canonicalize()?;
+        let mut events = test_protocol_values(typescript_call_protocol(
+            &root,
+            TYPESCRIPT_RELEASE_GATE_PENDING,
+        )?)?;
+        configure_typescript_candidate_call(
+            &mut events,
+            TYPESCRIPT_SEMANTIC_EMISSION_IMPORT_TYPE_CALL_GRAPH_V2,
+        );
+        mutate_semantic_primary_properties(&mut events, "call", |properties| {
+            properties["dispatch"] = serde_json::json!("fresh_instance");
+            properties["algorithm"] =
+                serde_json::json!(TYPESCRIPT_CLOSED_LOCAL_FRESH_INSTANCE_FLOW_ALGORITHM);
+            properties["call_kind"] = serde_json::json!("method");
+        });
+
+        let parsed = parse_events_preserving_prefix(
+            &serialize_test_protocol(events)?,
+            "typescript-gate-scan",
+            "web",
+            &root,
+            64 * 1024,
+            Some(env!("CARGO_PKG_VERSION")),
+            Some(false),
+        );
+        assert_eq!(parsed.error, None, "{:?}", parsed.error);
+        assert_eq!(parsed.failure_kind, None, "{:?}", parsed.failure_kind);
+        assert!(!parsed.security_violation);
+        Ok(())
+    }
+
+    #[test]
+    fn web_call_capability_v2_rejects_fresh_instance_constructor_candidate() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let root = root.path().canonicalize()?;
+        let mut events = test_protocol_values(typescript_call_protocol(
+            &root,
+            TYPESCRIPT_RELEASE_GATE_PENDING,
+        )?)?;
+        configure_typescript_candidate_call(
+            &mut events,
+            TYPESCRIPT_SEMANTIC_EMISSION_IMPORT_TYPE_CALL_GRAPH_V2,
+        );
+        mutate_semantic_primary_properties(&mut events, "call", |properties| {
+            properties["dispatch"] = serde_json::json!("fresh_instance");
+            properties["algorithm"] =
+                serde_json::json!(TYPESCRIPT_CLOSED_LOCAL_FRESH_INSTANCE_FLOW_ALGORITHM);
+            properties["call_kind"] = serde_json::json!("constructor");
+            properties["occurrence_kind"] = serde_json::json!("new_expression");
+        });
+
+        let parsed = parse_events_preserving_prefix(
+            &serialize_test_protocol(events)?,
+            "typescript-gate-scan",
+            "web",
+            &root,
+            64 * 1024,
+            Some(env!("CARGO_PKG_VERSION")),
+            Some(false),
+        );
+        assert_eq!(
+            parsed.failure_kind,
+            Some(WorkerFailureKind::MalformedProtocol)
+        );
+        assert!(parsed.security_violation, "{:?}", parsed.error);
+        assert!(
+            parsed.error.as_deref().is_some_and(|error| {
+                error.contains("call_kind \"constructor\"")
+                    && error.contains("dispatch \"fresh_instance\"")
+            }),
+            "{:?}",
+            parsed.error
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn web_call_capability_rejects_algorithm_on_non_candidate_call() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let root = root.path().canonicalize()?;
+        let mut events = test_protocol_values(typescript_call_protocol(
+            &root,
+            TYPESCRIPT_RELEASE_GATE_PENDING,
+        )?)?;
+        mutate_semantic_primary_properties(&mut events, "call", |properties| {
+            properties["algorithm"] =
+                serde_json::json!(TYPESCRIPT_CLOSED_LOCAL_CALL_FLOW_ALGORITHM);
+        });
+
+        let parsed = parse_events_preserving_prefix(
+            &serialize_test_protocol(events)?,
+            "typescript-gate-scan",
+            "web",
+            &root,
+            64 * 1024,
+            Some(env!("CARGO_PKG_VERSION")),
+            Some(false),
+        );
+        assert_eq!(
+            parsed.failure_kind,
+            Some(WorkerFailureKind::MalformedProtocol)
+        );
+        assert!(parsed.security_violation, "{:?}", parsed.error);
+        assert!(
+            parsed.error.as_deref().is_some_and(|error| {
+                error.contains("dispatch \"direct\"") && error.contains("algorithm")
+            }),
+            "{:?}",
+            parsed.error
+        );
         Ok(())
     }
 

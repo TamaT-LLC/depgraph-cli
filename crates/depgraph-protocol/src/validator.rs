@@ -919,15 +919,6 @@ fn validate_semantic_maps(
             .expect("base validation requires dependency-site sources to exist");
         let rust_semantic_site = is_rust_semantic_dependency_site(site, source_node);
         let web_semantic_site = is_web_semantic_dependency_site(site, source_node);
-        if web_semantic_site
-            && site.kind == "call"
-            && site.resolution_status == ResolutionStatus::Candidates
-        {
-            return invariant(format!(
-                "Web semantic call site {} cannot use candidates/may_call",
-                site.id
-            ));
-        }
         match site.kind.as_str() {
             "call" if source_node.kind != "symbol" => {
                 return invariant(format!(
@@ -1665,6 +1656,12 @@ fn validate_semantic_site(
         site.precision,
     )?;
     if site.kind == "call" && site.resolution_status == ResolutionStatus::Candidates {
+        if site.reason.is_some() {
+            return invariant(format!(
+                "candidate call site {} must not include a reason",
+                site.id
+            ));
+        }
         validate_candidate_algorithm(&format!("candidate call site {}", site.id), primary)?;
     }
     if site.target_ids.windows(2).any(|pair| pair[0] >= pair[1]) {

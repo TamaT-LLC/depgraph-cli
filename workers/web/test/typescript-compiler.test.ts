@@ -106,7 +106,7 @@ test("project analysis carries the cumulative exact-call capability and call val
 
   assert.equal(TYPESCRIPT_COMPILER_PROFILE_PROPERTIES.typescript_analysis_mode, "semantic-import-type-call-graph");
   assert.equal(TYPESCRIPT_COMPILER_PROFILE_PROPERTIES.typescript_typechecker_status, "definition-import-type-call-graph-emitted");
-  assert.equal(TYPESCRIPT_COMPILER_PROFILE_PROPERTIES.typescript_semantic_graph_emission, "definition-import-type-call-graph-v1");
+  assert.equal(TYPESCRIPT_COMPILER_PROFILE_PROPERTIES.typescript_semantic_graph_emission, "definition-import-type-call-graph-v2");
   assert.deepEqual(
     analysis.callSpans.get("valid.ts")?.map(({ occurrenceKind, specifier }) => ({ occurrenceKind, specifier })),
     [

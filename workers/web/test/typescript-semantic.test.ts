@@ -1106,10 +1106,13 @@ export class Box {
   invokePrivate(): void { this.#hidden() }
   invokeOpen(): void { this.open() }
 }
+export class ClosedBox {
+  openTag(parts: TemplateStringsArray): void { void parts }
+}
 export class DerivedBox extends Box { constructor() { super() } }
 `,
     "src/main.ts": `
-import { direct as alias, tag, Box } from "./defs";
+import { direct as alias, tag, Box, ClosedBox } from "./defs";
 import { externalFn, ExternalClass } from "@fixture/external";
 alias();
 new Box();
@@ -1119,6 +1122,8 @@ Box.staticTag\`value\`;
 new Box().openTag\`value\`;
 const box = new Box();
 box.openTag\`value\`;
+const closedBox = new ClosedBox();
+closedBox.openTag\`value\`;
 tag\`value\`;
 const functionValue = alias;
 functionValue();
@@ -1191,19 +1196,18 @@ new Legacy();
   assertResolved("super", "super", "constructor");
 
   for (const [specifier, reason] of [
-    ["functionValue", "function_value_dispatch"],
     ["ConstructorValue", "function_value_dispatch"],
     ["StaticValue.create", "function_value_dispatch"],
     ["StaticValue.staticTag", "function_value_dispatch"],
     ["new ConstructorValue().open", "function_value_dispatch"],
     ["new ConstructorValue().openTag", "function_value_dispatch"],
+    ["box.openTag", "open_method_dispatch"],
     ["contract.run", "interface_dispatch"],
     ["optionalCall", "union_dispatch"],
     ["unionCall", "union_dispatch"],
     ["intersectionCall", "intersection_dispatch"],
     ["overloaded", "overload_dispatch"],
     ["this.open", "open_method_dispatch"],
-    ["box.openTag", "open_method_dispatch"],
   ] as const) {
     const call = bySpecifier(specifier)[0];
     assert.ok(call, specifier);
@@ -1212,9 +1216,25 @@ new Legacy();
     assert.equal(call.targets[0]?.kind, "unknown", specifier);
     assert.equal(call.reason, reason, specifier);
   }
+  for (const [specifier, dispatch, semanticKind, algorithm] of [
+    ["functionValue", "dynamic", "function", "typescript-closed-local-call-flow-v1"],
+    ["closedBox.openTag", "fresh_instance", "method", "typescript-closed-local-fresh-instance-flow-v1"],
+  ] as const) {
+    const call = bySpecifier(specifier)[0];
+    assert.ok(call, specifier);
+    assert.equal(call.status, "candidates", specifier);
+    assert.equal(call.precision, "overapprox", specifier);
+    assert.equal(call.dispatch, dispatch, specifier);
+    assert.equal(call.reason, null, specifier);
+    assert.equal(call.algorithm, algorithm, specifier);
+    assert.ok(call.targets.length >= 1, specifier);
+    assert.ok(call.targets.every((target) => (
+      target.kind === "definition" && definitions.get(target.key)?.semanticKind === semanticKind
+    )), specifier);
+  }
   assert.equal(bySpecifier("Box.staticTag")[0]?.callKind, "tagged_template");
   assert.equal(bySpecifier("new Box().openTag")[0]?.callKind, "tagged_template");
-  assert.equal(bySpecifier("box.openTag")[0]?.callKind, "tagged_template");
+  assert.equal(bySpecifier("closedBox.openTag")[0]?.callKind, "tagged_template");
   assert.equal(bySpecifier("StaticValue.staticTag")[0]?.callKind, "tagged_template");
   assert.equal(bySpecifier("new ConstructorValue().openTag")[0]?.callKind, "tagged_template");
   assert.equal(bySpecifier("Legacy")[0]?.callKind, "constructor");
@@ -1226,11 +1246,144 @@ new Legacy();
   assert.equal(externalConstructor?.callKind, "constructor");
   assert.equal(externalConstructor?.status, "external");
   assert.equal(externalConstructor?.dispatch, "external");
-  assert.ok(calls.every((call) => call.status !== ("candidates" as typeof call.status)));
+  assert.ok(calls.some((call) => call.status === "candidates"));
   assert.ok(calls.filter((call) => call.evidence.relativePath === "src/main.ts").every((call) => (
     call.source.kind === "module_initializer"
   )));
   assert.ok(bySpecifier("this.#hidden").every((call) => call.source.kind === "definition"));
+});
+
+test("closed local function and fresh-instance flows emit complete candidate calls", async () => {
+  const fixture = await extractDependencyFixture({
+    "src/defs.ts": `
+export function alpha(): void {}
+export function beta(): void {}
+export class FirstReceiver { run(): void {} }
+export class SecondReceiver { run(): void {} }
+export class ConstructorOverride {
+  constructor() { this.run = () => {} }
+  run(): void {}
+}
+export class FieldOverride { run = (): void => {} }
+`,
+    "src/main.ts": `
+import { alpha, beta, FirstReceiver, SecondReceiver } from "./defs";
+const singleton = alpha;
+singleton();
+const choice = true ? alpha : beta;
+choice();
+const choiceAlias = choice;
+choiceAlias();
+const receiver = true ? new FirstReceiver() : new SecondReceiver();
+receiver.run();
+const aliasedReceiver = new FirstReceiver();
+const receiverAlias = aliasedReceiver;
+receiverAlias.run();
+let mutable = alpha;
+mutable();
+function reassignableFunction(): void {}
+const functionDeclarationValue = reassignableFunction;
+reassignableFunction = beta;
+functionDeclarationValue();
+declare const unknownCallable: () => void;
+const partial = true ? alpha : unknownCallable;
+partial();
+function invoke(parameter: () => void): void { parameter(); }
+invoke(alpha);
+const field = { run: alpha };
+field.run();
+function factory(): FirstReceiver { return new FirstReceiver(); }
+factory().run();
+const writtenReceiver = new FirstReceiver();
+writtenReceiver.run = alpha;
+writtenReceiver.run();
+function escape(value: FirstReceiver): void { void value; }
+const escapedReceiver = new FirstReceiver();
+escape(escapedReceiver);
+escapedReceiver.run();
+const constructorOverride = new ConstructorOverride();
+constructorOverride.run();
+const fieldOverride = new FieldOverride();
+fieldOverride.run();
+const constructReceiver = new FirstReceiver();
+new constructReceiver.run();
+`,
+  }, "__depgraph_ts_closed_local_candidates__");
+  assert.deepEqual(fixture.dependencies.issues, []);
+  assert.doesNotThrow(() => validateTypeScriptRawDependencyDelta(
+    fixture.dependencies,
+    fixture.definitions,
+    fixture.dependencyValidationSources,
+  ));
+
+  const definitions = new Map(fixture.definitions.definitions.map((definition) => [definition.key, definition]));
+  const bySpecifier = (specifier: string) => fixture.dependencies.calls.filter((call) => call.specifier === specifier);
+  const candidate = (specifier: string) => {
+    const call = bySpecifier(specifier).find((value) => value.status === "candidates");
+    assert.ok(call, `expected candidate call for ${specifier}: ${JSON.stringify(bySpecifier(specifier))}`);
+    assert.equal(call.precision, "overapprox");
+    assert.equal(call.reason, null);
+    assert.equal(call.targets.length, call.targetConditions.length);
+    assert.ok(call.targets.length >= 1);
+    assert.ok(call.targets.every((target) => target.kind === "definition"));
+    assert.ok(call.targets.every((target, index) => (
+      index === 0 || JSON.stringify(call.targets[index - 1]) < JSON.stringify(target)
+    )));
+    assert.ok(typeof call.algorithm === "string" && call.algorithm.length > 0);
+    return call;
+  };
+  const singleton = candidate("singleton");
+  assert.equal(singleton.targets.length, 1);
+  assert.equal(definitions.get((singleton.targets[0] as { key: string }).key)?.displayName, "alpha");
+
+  for (const specifier of ["choice", "choiceAlias"]) {
+    const call = candidate(specifier);
+    assert.equal(call.dispatch, "dynamic");
+    assert.deepEqual(
+      call.targets.map((target) => definitions.get((target as { key: string }).key)?.displayName),
+      ["alpha", "beta"],
+    );
+  }
+  for (const specifier of ["receiver.run"]) {
+    const call = candidate(specifier);
+    assert.equal(call.dispatch, "fresh_instance");
+    assert.equal(call.algorithm, "typescript-closed-local-fresh-instance-flow-v1");
+    assert.deepEqual(
+      call.targets.map((target) => {
+        const method = definitions.get((target as { key: string }).key);
+        return method?.owner.kind === "definition"
+          ? definitions.get(method.owner.key)?.displayName
+          : null;
+      }),
+      ["FirstReceiver", "SecondReceiver"],
+    );
+  }
+  const assertUnresolved = (specifier: string, reason: string): void => {
+    const calls = bySpecifier(specifier);
+    assert.equal(calls.length, 1, `expected one call for ${specifier}: ${JSON.stringify(calls)}`);
+    const call = calls[0]!;
+    assert.equal(call.status, "unresolved", specifier);
+    assert.equal(call.precision, "heuristic", specifier);
+    assert.equal(call.targets[0]?.kind, "unknown", specifier);
+    assert.equal(call.reason, reason, specifier);
+    assert.notEqual(call.status, "candidates", specifier);
+  };
+  for (const [specifier, reason] of [
+    ["receiverAlias.run", "open_method_dispatch"],
+    ["mutable", "function_value_dispatch"],
+    ["functionDeclarationValue", "reassignable_function_declaration"],
+    ["partial", "function_value_dispatch"],
+    ["parameter", "resolved_signature_not_canonical"],
+    ["field.run", "function_value_dispatch"],
+    ["factory().run", "open_method_dispatch"],
+    ["writtenReceiver.run", "open_method_dispatch"],
+    ["escapedReceiver.run", "open_method_dispatch"],
+    ["constructorOverride.run", "resolved_signature_declaration_missing"],
+    ["fieldOverride.run", "resolved_signature_declaration_missing"],
+    ["constructReceiver.run", "open_method_dispatch"],
+  ] as const) {
+    assertUnresolved(specifier, reason);
+  }
 });
 
 test("call ledger fails closed when a class field has no canonical callable owner", async () => {
@@ -1456,7 +1609,7 @@ void Host;
   assert.equal(nestedSignature.resolverIdentity, null);
 });
 
-test("raw call validator rejects singleton candidates and coordinated call mutations", async () => {
+test("raw call validator accepts closed candidates and rejects malformed call mutations", async () => {
   const fixture = await extractDependencyFixture({
     "src/main.ts": "export function target(): void {}\nexport const holder = 1;\ntarget();\n",
   }, "__depgraph_ts_call_validation__");
@@ -1470,14 +1623,59 @@ test("raw call validator rejects singleton candidates and coordinated call mutat
       fixture.dependencyValidationSources,
     ), pattern);
   };
+  const singletonCandidate = structuredClone(fixture.dependencies);
+  singletonCandidate.calls[0]!.status = "candidates";
+  singletonCandidate.calls[0]!.precision = "overapprox";
+  singletonCandidate.calls[0]!.dispatch = "dynamic";
+  singletonCandidate.calls[0]!.algorithm = "typescript-closed-local-call-flow-v1";
+  assert.doesNotThrow(() => validateTypeScriptRawDependencyDelta(
+    singletonCandidate,
+    fixture.definitions,
+    fixture.dependencyValidationSources,
+  ));
   reject((delta) => {
     const call = delta.calls[0]! as unknown as Record<string, unknown>;
     call.status = "candidates";
     call.precision = "overapprox";
+    call.dispatch = "dynamic";
+  }, /call status\/precision\/target contract/u);
+  reject((delta) => {
+    const call = delta.calls[0]!;
+    call.status = "candidates";
+    call.precision = "overapprox";
+    call.dispatch = "dynamic";
+    call.algorithm = "typescript-closed-local-fresh-instance-flow-v1";
   }, /call status\/precision\/target contract/u);
   reject((delta) => {
     delta.calls[0]!.dispatch = "open";
   }, /call status\/precision\/target contract/u);
+  reject((delta) => {
+    const call = delta.calls[0]!;
+    call.status = "candidates";
+    call.precision = "overapprox";
+    call.dispatch = "fresh_instance";
+    call.algorithm = "typescript-closed-local-fresh-instance-flow-v1";
+    call.callKind = "constructor";
+  }, /call status\/precision\/target contract/u);
+  const freshFixture = await extractDependencyFixture({
+    "src/fresh.ts": [
+      "export class Receiver { run(): void {} }",
+      "const receiver = new Receiver();",
+      "receiver.run();",
+      "",
+    ].join("\n"),
+  }, "__depgraph_ts_fresh_call_validation__");
+  const malformedFresh = structuredClone(freshFixture.dependencies);
+  const freshCall = malformedFresh.calls.find((call) => call.specifier === "receiver.run");
+  assert.ok(freshCall);
+  assert.equal(freshCall.status, "candidates");
+  assert.equal(freshCall.dispatch, "fresh_instance");
+  freshCall.callKind = "constructor";
+  assert.throws(() => validateTypeScriptRawDependencyDelta(
+    malformedFresh,
+    freshFixture.definitions,
+    freshFixture.dependencyValidationSources,
+  ), /call status\/precision\/target contract/u);
   reject((delta) => {
     (delta.calls[0]! as unknown as { source: unknown }).source = { kind: "file", relativePath: "src/main.ts" };
   }, /call source kind/u);

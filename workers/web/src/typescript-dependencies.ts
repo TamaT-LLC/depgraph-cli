@@ -17,6 +17,7 @@ import {
   LanguageVariant,
   type MethodDeclaration,
   type NewExpression,
+  NodeFlags,
   SyntaxKind,
   type TaggedTemplateExpression,
   tokenIsIdentifierOrKeyword,
@@ -34,6 +35,7 @@ import {
   type SourceFile,
   type TypeReferenceNode,
   type TypeQueryNode,
+  type VariableDeclaration,
 } from "typescript/unstable/ast";
 import type {
   TypeScriptRawDefinition,
@@ -57,6 +59,9 @@ const MAX_CONDITION_DEPTH = 64;
 const MAX_CONDITION_NODES = 65_536;
 const MAX_CONDITION_VALUES = 4_096;
 const MAX_EXPORT_PATH_DEPTH = 64;
+const MAX_CLOSED_CALL_FLOW_DEPTH = 64;
+export const TYPESCRIPT_CLOSED_LOCAL_CALL_FLOW_ALGORITHM = "typescript-closed-local-call-flow-v1";
+export const TYPESCRIPT_CLOSED_LOCAL_FRESH_INSTANCE_FLOW_ALGORITHM = "typescript-closed-local-fresh-instance-flow-v1";
 
 export type TypeScriptRawDependencySiteKind = "web_import" | "web_reexport" | "type_use";
 export type TypeScriptRawDependencyEdgeKind = "imports" | "reexports" | "type_uses";
@@ -149,9 +154,11 @@ export interface TypeScriptRawCallSite {
   callKind: TypeScriptRawCallKind;
   dispatch: TypeScriptRawCallDispatch;
   moduleSpecifier: string | null;
-  status: Exclude<TypeScriptRawDependencyStatus, "candidates">;
-  precision: "exact" | "heuristic";
+  status: TypeScriptRawDependencyStatus;
+  precision: TypeScriptRawDependencyPrecision;
   reason: string | null;
+  /** Required for closed candidate calls; never emitted for exact/fallback calls. */
+  algorithm: string | null;
   condition: Condition;
   targets: TypeScriptRawDependencyTarget[];
   targetConditions: Condition[];
@@ -187,12 +194,19 @@ interface DefinitionIndex {
   }[]>;
 }
 
+interface FreshReceiverProofState {
+  identifierIndex: ReadonlyMap<string, readonly Identifier[]> | null;
+  indexFailed: boolean;
+  useProofs: Map<string, boolean>;
+}
+
 interface CollectionContext {
   source: TypeScriptSemanticSource;
   owner: TypeScriptRawDefinitionEndpoint;
   syntacticallyValid: boolean;
   externalBindings: BindingProvenanceMap;
   bindingProvenance: ReadonlyMap<string, BindingProvenance>;
+  freshReceiverProof: FreshReceiverProofState;
 }
 
 type BindingKind = TypeScriptBindingKind;
@@ -2436,10 +2450,11 @@ function createCallSite(
   callKind: TypeScriptRawCallKind,
   dispatch: TypeScriptRawCallDispatch,
   targetsValue: readonly TypeScriptRawDependencyTarget[],
-  statusValue: Exclude<TypeScriptRawDependencyStatus, "candidates">,
-  precisionValue: "exact" | "heuristic",
+  statusValue: TypeScriptRawDependencyStatus,
+  precisionValue: TypeScriptRawDependencyPrecision,
   reasonValue: string | null,
   moduleSpecifier: string | null,
+  algorithmValue: string | null = null,
 ): TypeScriptRawCallSite {
   const { startOffset, endOffset } = nodeSpan(node, context.source.sourceFile);
   const executionOwner = callExecutionOwner(context, index, node);
@@ -2449,12 +2464,14 @@ function createCallSite(
   let status = statusValue;
   let precision = precisionValue;
   let reason = reasonValue;
+  let algorithm = algorithmValue;
   let finalDispatch = dispatch;
   if (!context.syntacticallyValid) {
     targets = [{ kind: "unknown" }];
     status = "unresolved";
     precision = "heuristic";
     reason = "syntax_invalid";
+    algorithm = null;
     finalDispatch = "dynamic";
   }
   if (context.syntacticallyValid && callerDefinitionUnavailable) {
@@ -2465,13 +2482,22 @@ function createCallSite(
     status = "unresolved";
     precision = "heuristic";
     reason = "caller_definition_unavailable";
+    algorithm = null;
     finalDispatch = "dynamic";
   }
-  if (targets.length !== 1) {
+  if (
+    (status === "candidates" && (
+      targets.length === 0
+      || targets.some((target) => target.kind !== "definition")
+      || algorithm === null
+    ))
+    || (status !== "candidates" && targets.length !== 1)
+  ) {
     targets = [{ kind: "unknown" }];
     status = "unresolved";
     precision = "heuristic";
     reason ??= "call_target_not_unique";
+    algorithm = null;
     finalDispatch = "dynamic";
   }
   const condition = WEB_CONDITION;
@@ -2485,15 +2511,18 @@ function createCallSite(
     status,
     precision,
     reason,
+    algorithm,
     condition,
     targets,
-    targetConditions: [condition],
+    targetConditions: targets.map(() => condition),
     evidence: {
       relativePath: context.source.relativePath,
       startOffset,
       endOffset,
       detail: status === "resolved"
         ? "TypeChecker resolved-signature direct call occurrence"
+        : status === "candidates"
+          ? "TypeChecker closed local candidate call occurrence"
         : status === "external"
           ? "TypeChecker external call boundary occurrence"
           : "TypeChecker unresolved call occurrence",
@@ -2501,6 +2530,510 @@ function createCallSite(
       targetBasis: basisForTargets(targets),
     },
   };
+}
+
+const CALLABLE_TARGET_SEMANTIC_KINDS = new Set([
+  "function",
+  "local_function",
+  "anonymous_function",
+  "method",
+  "constructor",
+]);
+
+interface ClosedLocalCallTargets {
+  targets: TypeScriptRawDependencyTarget[];
+}
+
+type ClosedLocalCallableResolution =
+  | { kind: "targets"; value: ClosedLocalCallTargets }
+  | { kind: "blocked"; reason: "reassignable_function_declaration" }
+  | null;
+
+type LocalConstBinding =
+  | { kind: "local"; declaration: VariableDeclaration; initializer: Expression }
+  | { kind: "not_variable" }
+  | { kind: "unsupported" };
+
+function canonicalCallableTargets(
+  targets: readonly TypeScriptRawDependencyTarget[],
+  index: DefinitionIndex,
+): TypeScriptRawDependencyTarget[] | null {
+  const canonical = deduplicateTargets(targets);
+  if (
+    canonical.length === 0
+    || canonical.some((target) => (
+      target.kind !== "definition"
+      || !CALLABLE_TARGET_SEMANTIC_KINDS.has(index.definitions.get(target.key)?.semanticKind ?? "")
+    ))
+  ) return null;
+  return canonical;
+}
+
+function directDefinitionTargetsAtNode(
+  index: DefinitionIndex,
+  source: TypeScriptSemanticSource,
+  node: Node,
+): TypeScriptRawDependencyTarget[] | null {
+  const { startOffset, endOffset } = nodeSpan(node, source.sourceFile);
+  return canonicalCallableTargets(
+    (index.byDeclaration.get(declarationKey(source.relativePath, startOffset, endOffset)) ?? [])
+      .map((key) => ({ kind: "definition" as const, key })),
+    index,
+  );
+}
+
+function localConstBindingKey(
+  declaration: VariableDeclaration,
+  source: TypeScriptSemanticSource,
+): string {
+  const { startOffset, endOffset } = nodeSpan(declaration, source.sourceFile);
+  return declarationKey(source.relativePath, startOffset, endOffset);
+}
+
+async function localConstBindingForIdentifier(
+  identifier: Identifier,
+  context: CollectionContext,
+  checker: Checker,
+  counter: QueryCounter,
+  sourcesByPath: ReadonlyMap<string, TypeScriptSemanticSource>,
+): Promise<LocalConstBinding> {
+  const symbol = await querySymbol(checker, identifier, counter, "closed local call binding");
+  if (symbol === undefined) return { kind: "not_variable" };
+  const unwrapped = await unwrapAlias(checker, symbol, counter);
+  if (unwrapped === null || unwrapped.declarations.length !== 1) return { kind: "unsupported" };
+  const handle = unwrapped.declarations[0]!;
+  const declaredSource = sourcesByPath.get(compilerPathKey(String(handle.path)));
+  if (declaredSource === undefined) return { kind: "unsupported" };
+  beginQuery(counter);
+  const declaration = await handle.resolve();
+  if (declaration === undefined) return { kind: "unsupported" };
+  const sourceFile = declaration.getSourceFile();
+  const source = sourcesByPath.get(compilerPathKey(String(sourceFile.path)))
+    ?? sourcesByPath.get(compilerPathKey(sourceFile.fileName));
+  if (
+    source === undefined
+    || source.relativePath !== declaredSource.relativePath
+    || source.relativePath !== context.source.relativePath
+  ) return declaration.kind === SyntaxKind.VariableDeclaration
+    ? { kind: "unsupported" }
+    : { kind: "not_variable" };
+  if (declaration.kind !== SyntaxKind.VariableDeclaration) return { kind: "not_variable" };
+  const variable = declaration as VariableDeclaration;
+  const list = variable.parent;
+  const isConst = list.kind === SyntaxKind.VariableDeclarationList
+    && (((list as Node & { readonly flags: number }).flags & NodeFlags.Const) !== 0);
+  if (
+    !isConst
+    || variable.name.kind !== SyntaxKind.Identifier
+    || variable.initializer === undefined
+  ) return { kind: "unsupported" };
+  const declarationSpan = nodeSpan(variable, source.sourceFile);
+  const referenceSpan = nodeSpan(identifier, context.source.sourceFile);
+  if (declarationSpan.startOffset >= referenceSpan.startOffset) return { kind: "unsupported" };
+  return { kind: "local", declaration: variable, initializer: variable.initializer };
+}
+
+async function directCallableTargetsForIdentifier(
+  identifier: Identifier,
+  checker: Checker,
+  counter: QueryCounter,
+  index: DefinitionIndex,
+  sourcesByPath: ReadonlyMap<string, TypeScriptSemanticSource>,
+): Promise<TypeScriptRawDependencyTarget[] | "reassignable_function_declaration" | null> {
+  // A FunctionDeclaration is a mutable lexical binding. The checker can keep
+  // pointing a value alias at its declaration even after a write, so never use
+  // that declaration as a closed-flow leaf without a write proof.
+  const leafSymbol = await querySymbol(checker, identifier, counter, "closed local call leaf");
+  if (leafSymbol === undefined) return null;
+  if ((leafSymbol.flags & SymbolFlags.Alias) === 0) {
+    if (leafSymbol.declarations.length === 0 || leafSymbol.declarations.length > MAX_SYMBOL_DECLARATIONS) {
+      return "reassignable_function_declaration";
+    }
+    for (const handle of leafSymbol.declarations) {
+      beginQuery(counter);
+      const declaration = await handle.resolve();
+      if (declaration === undefined || declaration.kind === SyntaxKind.FunctionDeclaration) {
+        return "reassignable_function_declaration";
+      }
+    }
+  }
+  const symbol = await querySymbol(checker, identifier, counter, "closed local call target");
+  if (symbol === undefined) return null;
+  const resolved = await compilerSymbolTargets(symbol, checker, counter, index, sourcesByPath, false);
+  const targets = canonicalCallableTargets(resolved.targets, index);
+  return targets?.length === 1 ? targets : null;
+}
+
+function mergeClosedLocalTargets(
+  left: ClosedLocalCallTargets,
+  right: ClosedLocalCallTargets,
+): ClosedLocalCallTargets {
+  return {
+    targets: deduplicateTargets([...left.targets, ...right.targets]),
+  };
+}
+
+async function closedLocalCallableTargets(
+  expression: Expression,
+  context: CollectionContext,
+  checker: Checker,
+  counter: QueryCounter,
+  index: DefinitionIndex,
+  sourcesByPath: ReadonlyMap<string, TypeScriptSemanticSource>,
+  visiting: Set<string>,
+  depth: number,
+): Promise<ClosedLocalCallableResolution> {
+  if (depth > MAX_CLOSED_CALL_FLOW_DEPTH) return null;
+  const current = transparentCallExpression(expression);
+  if (current.kind === SyntaxKind.ConditionalExpression) {
+    const conditional = current as Expression & {
+      readonly whenTrue: Expression;
+      readonly whenFalse: Expression;
+    };
+    const whenTrue = await closedLocalCallableTargets(
+      conditional.whenTrue, context, checker, counter, index, sourcesByPath, visiting, depth + 1,
+    );
+    const whenFalse = await closedLocalCallableTargets(
+      conditional.whenFalse, context, checker, counter, index, sourcesByPath, visiting, depth + 1,
+    );
+    if (whenTrue?.kind === "blocked" || whenFalse?.kind === "blocked") {
+      return { kind: "blocked", reason: "reassignable_function_declaration" };
+    }
+    if (whenTrue === null || whenFalse === null) return null;
+    return { kind: "targets", value: mergeClosedLocalTargets(whenTrue.value, whenFalse.value) };
+  }
+  if (current.kind === SyntaxKind.ArrowFunction || current.kind === SyntaxKind.FunctionExpression) {
+    const targets = directDefinitionTargetsAtNode(index, context.source, current);
+    return targets?.length === 1 ? { kind: "targets", value: { targets } } : null;
+  }
+  if (current.kind !== SyntaxKind.Identifier) return null;
+  const identifier = current as Identifier;
+  const binding = await localConstBindingForIdentifier(identifier, context, checker, counter, sourcesByPath);
+  if (binding.kind === "unsupported") return null;
+  if (binding.kind === "not_variable") {
+    const targets = await directCallableTargetsForIdentifier(identifier, checker, counter, index, sourcesByPath);
+    if (targets === "reassignable_function_declaration") {
+      return { kind: "blocked", reason: "reassignable_function_declaration" };
+    }
+    return targets === null ? null : { kind: "targets", value: { targets } };
+  }
+  const key = localConstBindingKey(binding.declaration, context.source);
+  if (visiting.has(key)) return null;
+  visiting.add(key);
+  try {
+    return await closedLocalCallableTargets(
+      binding.initializer, context, checker, counter, index, sourcesByPath, visiting, depth + 1,
+    );
+  } finally {
+    visiting.delete(key);
+  }
+}
+
+async function closedLocalFunctionCallTargets(
+  callee: Expression,
+  context: CollectionContext,
+  checker: Checker,
+  counter: QueryCounter,
+  index: DefinitionIndex,
+  sourcesByPath: ReadonlyMap<string, TypeScriptSemanticSource>,
+): Promise<ClosedLocalCallableResolution> {
+  const current = transparentCallExpression(callee);
+  if (current.kind !== SyntaxKind.Identifier) return null;
+  const binding = await localConstBindingForIdentifier(
+    current as Identifier,
+    context,
+    checker,
+    counter,
+    sourcesByPath,
+  );
+  if (binding.kind !== "local") return null;
+  const result = await closedLocalCallableTargets(
+    binding.initializer,
+    context,
+    checker,
+    counter,
+    index,
+    sourcesByPath,
+    new Set([localConstBindingKey(binding.declaration, context.source)]),
+    0,
+  );
+  return result?.kind === "targets" && result.value.targets.length === 0 ? null : result;
+}
+
+async function queryPropertyOfType(
+  checker: Checker,
+  type: CompilerType,
+  name: string,
+  counter: QueryCounter,
+): Promise<CompilerSymbol | undefined> {
+  beginQuery(counter);
+  const first = await checker.getPropertyOfType(type, name);
+  beginQuery(counter);
+  const second = await checker.getPropertyOfType(type, name);
+  if (first?.id !== second?.id) {
+    throw new DependencyContractError("closed fresh-instance property response correlation mismatch");
+  }
+  return first;
+}
+
+function hasDecoratorModifier(node: Node): boolean {
+  return ((node as Node & { readonly modifiers?: readonly Node[] }).modifiers ?? [])
+    .some((modifier) => modifier.kind === SyntaxKind.Decorator);
+}
+
+function hasConservativelySafeFreshInstanceClassShape(node: Node): boolean {
+  if (node.kind !== SyntaxKind.ClassDeclaration || hasDecoratorModifier(node)) return false;
+  const declaration = node as Node & {
+    readonly heritageClauses?: readonly Node[];
+    readonly members?: readonly Node[];
+  };
+  // Constructors, fields, accessors, inheritance, and decorators can replace
+  // the method selected from the instance type before the observed call. A
+  // class containing only undecorated own methods has no such construction-
+  // time hook in the modeled source.
+  if ((declaration.heritageClauses?.length ?? 0) !== 0) return false;
+  return (declaration.members ?? []).every((member) => (
+    member.kind === SyntaxKind.MethodDeclaration && !hasDecoratorModifier(member)
+  ));
+}
+
+async function hasConservativelySafeFreshInstanceClass(
+  constructorSymbol: CompilerSymbol,
+  checker: Checker,
+  counter: QueryCounter,
+): Promise<boolean> {
+  const unwrapped = await unwrapAlias(checker, constructorSymbol, counter);
+  if (
+    unwrapped === null
+    || unwrapped.declarations.length !== 1
+    || unwrapped.declarations.length > MAX_SYMBOL_DECLARATIONS
+  ) return false;
+  beginQuery(counter);
+  const declaration = await unwrapped.declarations[0]!.resolve();
+  return declaration !== undefined && hasConservativelySafeFreshInstanceClassShape(declaration);
+}
+
+function isSimpleConstBinding(declaration: VariableDeclaration): boolean {
+  const list = declaration.parent;
+  return list.kind === SyntaxKind.VariableDeclarationList
+    && (((list as Node & { readonly flags: number }).flags & NodeFlags.Const) !== 0)
+    && declaration.name.kind === SyntaxKind.Identifier
+    && declaration.initializer !== undefined;
+}
+
+function isDirectClosedFreshInstanceCallUse(identifier: Identifier, methodName: string): boolean {
+  const access = identifier.parent;
+  if (access.kind !== SyntaxKind.PropertyAccessExpression) return false;
+  const property = access as Expression & {
+    readonly expression: Expression;
+    readonly name: Node;
+    readonly questionDotToken?: Node;
+  };
+  if (
+    property.expression !== identifier
+    || property.questionDotToken !== undefined
+    || property.name.kind !== SyntaxKind.Identifier
+    || (property.name as Identifier).text !== methodName
+  ) return false;
+  const invocation = access.parent;
+  if (invocation.kind === SyntaxKind.CallExpression) {
+    return (invocation as CallExpression).expression === access
+      && (invocation as CallExpression).questionDotToken === undefined;
+  }
+  return invocation.kind === SyntaxKind.TaggedTemplateExpression
+    && (invocation as TaggedTemplateExpression).tag === access;
+}
+
+function freshReceiverIdentifierIndex(
+  sourceFile: SourceFile,
+  state: FreshReceiverProofState,
+): ReadonlyMap<string, readonly Identifier[]> | null {
+  if (state.indexFailed) return null;
+  if (state.identifierIndex !== null) return state.identifierIndex;
+  const identifiers = new Map<string, Identifier[]>();
+  let visited = 0;
+  let failed = false;
+  const visit = (node: Node, depth: number): void => {
+    if (failed) return;
+    if (depth > MAX_AST_DEPTH || visited >= MAX_AST_NODES) {
+      failed = true;
+      return;
+    }
+    visited += 1;
+    if (node.kind === SyntaxKind.Identifier) {
+      const identifier = node as Identifier;
+      const entries = identifiers.get(identifier.text) ?? [];
+      entries.push(identifier);
+      identifiers.set(identifier.text, entries);
+    }
+    node.forEachChild((child) => {
+      visit(child, depth + 1);
+      return undefined;
+    });
+  };
+  visit(sourceFile, 0);
+  if (failed) {
+    state.indexFailed = true;
+    return null;
+  }
+  state.identifierIndex = identifiers;
+  return identifiers;
+}
+
+function hasConservativelyClosedFreshReceiverUses(
+  declaration: VariableDeclaration,
+  methodName: string,
+  sourceFile: SourceFile,
+  state: FreshReceiverProofState,
+): boolean {
+  if (!isSimpleConstBinding(declaration)) return false;
+  const name = declaration.name as Identifier;
+  const { startOffset, endOffset } = nodeSpan(declaration, sourceFile);
+  const proofKey = `${startOffset}:${endOffset}:${methodName}`;
+  const cached = state.useProofs.get(proofKey);
+  if (cached !== undefined) return cached;
+  const identifiers = freshReceiverIdentifierIndex(sourceFile, state);
+  if (identifiers === null) return false;
+  let directCallCount = 0;
+  for (const identifier of identifiers.get(name.text) ?? []) {
+    if (identifier === name) continue;
+    if (!isDirectClosedFreshInstanceCallUse(identifier, methodName)) {
+      // Any alias, property read/write, argument/return, capture, or other
+      // use could expose or replace the receiver's method. Do not infer a
+      // candidate without a complete alias/effect proof.
+      state.useProofs.set(proofKey, false);
+      return false;
+    }
+    directCallCount += 1;
+  }
+  // One call avoids underapproximating a later invocation after the first
+  // method body mutates its own receiver.
+  const result = directCallCount === 1;
+  state.useProofs.set(proofKey, result);
+  return result;
+}
+
+async function closedFreshInstanceMethodTargets(
+  expression: Expression,
+  methodName: string,
+  context: CollectionContext,
+  checker: Checker,
+  counter: QueryCounter,
+  index: DefinitionIndex,
+  sourcesByPath: ReadonlyMap<string, TypeScriptSemanticSource>,
+  visiting: Set<string>,
+  depth: number,
+): Promise<ClosedLocalCallTargets | null> {
+  if (depth > MAX_CLOSED_CALL_FLOW_DEPTH) return null;
+  const current = transparentCallExpression(expression);
+  if (current.kind === SyntaxKind.ConditionalExpression) {
+    const conditional = current as Expression & {
+      readonly whenTrue: Expression;
+      readonly whenFalse: Expression;
+    };
+    const whenTrue = await closedFreshInstanceMethodTargets(
+      conditional.whenTrue, methodName, context, checker, counter, index, sourcesByPath, visiting, depth + 1,
+    );
+    const whenFalse = await closedFreshInstanceMethodTargets(
+      conditional.whenFalse, methodName, context, checker, counter, index, sourcesByPath, visiting, depth + 1,
+    );
+    return whenTrue === null || whenFalse === null ? null : mergeClosedLocalTargets(whenTrue, whenFalse);
+  }
+  if (current.kind === SyntaxKind.Identifier) {
+    const binding = await localConstBindingForIdentifier(
+      current as Identifier, context, checker, counter, sourcesByPath,
+    );
+    if (binding.kind !== "local") return null;
+    if (!hasConservativelyClosedFreshReceiverUses(
+      binding.declaration,
+      methodName,
+      context.source.sourceFile,
+      context.freshReceiverProof,
+    )) return null;
+    const key = localConstBindingKey(binding.declaration, context.source);
+    if (visiting.has(key)) return null;
+    visiting.add(key);
+    try {
+      return await closedFreshInstanceMethodTargets(
+        binding.initializer, methodName, context, checker, counter, index, sourcesByPath, visiting, depth + 1,
+      );
+    } finally {
+      visiting.delete(key);
+    }
+  }
+  if (current.kind !== SyntaxKind.NewExpression) return null;
+  if (((current as NewExpression).arguments?.length ?? 0) !== 0) return null;
+  const constructor = transparentCallExpression(callCallee(current as NewExpression));
+  if (constructor.kind !== SyntaxKind.Identifier) return null;
+  const constructorSymbol = await querySymbol(checker, constructor, counter, "closed fresh-instance constructor");
+  if (constructorSymbol === undefined) return null;
+  if (!await hasConservativelySafeFreshInstanceClass(constructorSymbol, checker, counter)) return null;
+  const constructorTargets = (await compilerSymbolTargets(
+    constructorSymbol, checker, counter, index, sourcesByPath, true,
+  )).targets;
+  if (
+    constructorTargets.length !== 1
+    || constructorTargets[0]?.kind !== "definition"
+    || index.definitions.get(constructorTargets[0].key)?.semanticKind !== "class"
+  ) return null;
+  const instanceType = await queryTypeAtLocation(checker, current, counter, "closed fresh-instance receiver");
+  if (instanceType === undefined) return null;
+  const property = await queryPropertyOfType(checker, instanceType, methodName, counter);
+  if (property === undefined) return null;
+  const methodTargets = canonicalCallableTargets(
+    (await compilerSymbolTargets(property, checker, counter, index, sourcesByPath, false)).targets,
+    index,
+  );
+  if (methodTargets?.length !== 1 || methodTargets[0]?.kind !== "definition") return null;
+  const method = index.definitions.get(methodTargets[0].key);
+  if (
+    method?.semanticKind !== "method"
+    || method.owner.kind !== "definition"
+    || method.owner.key !== constructorTargets[0]!.key
+    || (index.declarationLocationsByDefinition.get(methodTargets[0].key)?.length ?? 0) !== 1
+  ) return null;
+  return { targets: methodTargets };
+}
+
+async function closedLocalFreshInstanceCallTargets(
+  callee: Expression,
+  context: CollectionContext,
+  checker: Checker,
+  counter: QueryCounter,
+  index: DefinitionIndex,
+  sourcesByPath: ReadonlyMap<string, TypeScriptSemanticSource>,
+): Promise<ClosedLocalCallTargets | null> {
+  const current = transparentCallExpression(callee);
+  if (current.kind !== SyntaxKind.PropertyAccessExpression) return null;
+  const access = current as Expression & {
+    readonly expression: Expression;
+    readonly name: Node;
+    readonly questionDotToken?: Node;
+  };
+  if (access.questionDotToken !== undefined || access.name.kind !== SyntaxKind.Identifier) return null;
+  const receiver = transparentCallExpression(access.expression);
+  if (receiver.kind !== SyntaxKind.Identifier) return null;
+  const binding = await localConstBindingForIdentifier(
+    receiver as Identifier, context, checker, counter, sourcesByPath,
+  );
+  if (binding.kind !== "local") return null;
+  if (!hasConservativelyClosedFreshReceiverUses(
+    binding.declaration,
+    (access.name as Identifier).text,
+    context.source.sourceFile,
+    context.freshReceiverProof,
+  )) return null;
+  return await closedFreshInstanceMethodTargets(
+    binding.initializer,
+    (access.name as Identifier).text,
+    context,
+    checker,
+    counter,
+    index,
+    sourcesByPath,
+    new Set([localConstBindingKey(binding.declaration, context.source)]),
+    0,
+  );
 }
 
 async function isModuleLoaderCall(
@@ -2555,6 +3088,71 @@ async function collectSemanticCall(
   }
 
   const callee = callCallee(node);
+  // Candidate flows model invocations only. A NewExpression has a construct
+  // signature and must stay on the exact/unresolved constructor path; in
+  // particular, `new receiver.run()` is not a fresh-instance method call.
+  if (node.kind !== SyntaxKind.NewExpression) {
+    const closedFunctionTargets = await closedLocalFunctionCallTargets(
+      callee,
+      context,
+      checker,
+      counter,
+      index,
+      sourcesByPath,
+    );
+    if (closedFunctionTargets?.kind === "targets") {
+      return [createCallSite(
+        context,
+        index,
+        node,
+        defaultCallKind(node),
+        "dynamic",
+        closedFunctionTargets.value.targets,
+        "candidates",
+        "overapprox",
+        null,
+        null,
+        TYPESCRIPT_CLOSED_LOCAL_CALL_FLOW_ALGORITHM,
+      )];
+    }
+    if (closedFunctionTargets?.kind === "blocked") {
+      return [createCallSite(
+        context,
+        index,
+        node,
+        defaultCallKind(node),
+        "dynamic",
+        [{ kind: "unknown" }],
+        "unresolved",
+        "heuristic",
+        closedFunctionTargets.reason,
+        null,
+      )];
+    }
+    const closedFreshInstanceTargets = await closedLocalFreshInstanceCallTargets(
+      callee,
+      context,
+      checker,
+      counter,
+      index,
+      sourcesByPath,
+    );
+    if (closedFreshInstanceTargets !== null) {
+      return [createCallSite(
+        context,
+        index,
+        node,
+        node.kind === SyntaxKind.TaggedTemplateExpression ? "tagged_template" : "method",
+        "fresh_instance",
+        closedFreshInstanceTargets.targets,
+        "candidates",
+        "overapprox",
+        null,
+        null,
+        TYPESCRIPT_CLOSED_LOCAL_FRESH_INSTANCE_FLOW_ALGORITHM,
+      )];
+    }
+  }
   const provenance = await callBindingProvenance(callee, context, checker, counter);
   const externalFromBinding = provenance?.targets.find(
     (target): target is Extract<TypeScriptRawDependencyTarget, { kind: "external" }> => target.kind === "external",
@@ -5884,57 +6482,94 @@ export function validateTypeScriptRawDependencyDelta(
     }
     const expectedKey = siteKey(call.source, "call", call.evidence.relativePath, call.evidence.startOffset, call.evidence.endOffset);
     if (call.key !== expectedKey) throw new DependencyContractError("raw call site key is not canonical");
-    if (call.targets.length !== 1 || call.targetConditions.length !== 1) {
-      throw new DependencyContractError("raw call site must contain exactly one target and condition");
+    if (call.targets.length === 0 || call.targetConditions.length !== call.targets.length) {
+      throw new DependencyContractError("raw call site has no target or unaligned target conditions");
     }
     validateCanonicalRawCondition(call.condition);
-    validateCanonicalRawCondition(call.targetConditions[0]!);
-    if (JSON.stringify(call.condition) !== JSON.stringify(call.targetConditions[0])) {
-      throw new DependencyContractError("raw call site and target conditions disagree");
+    for (const targetCondition of call.targetConditions) {
+      validateCanonicalRawCondition(targetCondition);
+      if (JSON.stringify(call.condition) !== JSON.stringify(targetCondition)) {
+        throw new DependencyContractError("raw call site and target conditions disagree");
+      }
     }
-    const target = call.targets[0]!;
-    if (target.kind === "definition") {
-      const definition = definitions.get(target.key);
-      if (
-        definition === undefined
-        || definition.graphKind !== "symbol"
-        || ![
-          "function",
-          "local_function",
-          "anonymous_function",
-          "method",
-          "constructor",
-        ].includes(definition.semanticKind)
-      ) throw new DependencyContractError("raw exact call target is not a canonical callable symbol");
-    } else if (target.kind === "external") {
-      if (
-        target.locator.length === 0
-        || target.locator.length > MAX_SPECIFIER_CHARS
-        || target.displayName.length === 0
-        || target.displayName.length > MAX_SPECIFIER_CHARS
-        || hasUnpairedSurrogate(target.locator)
-        || hasUnpairedSurrogate(target.displayName)
-      ) throw new DependencyContractError("raw call external target is invalid");
-    } else if (target.kind !== "unknown") {
-      throw new DependencyContractError("raw call target kind is invalid");
+    for (const target of call.targets) {
+      if (target.kind === "definition") {
+        const definition = definitions.get(target.key);
+        if (
+          definition === undefined
+          || definition.graphKind !== "symbol"
+          || ![
+            "function",
+            "local_function",
+            "anonymous_function",
+            "method",
+            "constructor",
+          ].includes(definition.semanticKind)
+        ) throw new DependencyContractError("raw call target is not a canonical callable symbol");
+      } else if (target.kind === "external") {
+        if (
+          target.locator.length === 0
+          || target.locator.length > MAX_SPECIFIER_CHARS
+          || target.displayName.length === 0
+          || target.displayName.length > MAX_SPECIFIER_CHARS
+          || hasUnpairedSurrogate(target.locator)
+          || hasUnpairedSurrogate(target.displayName)
+        ) throw new DependencyContractError("raw call external target is invalid");
+      } else if (target.kind !== "unknown") {
+        throw new DependencyContractError("raw call target kind is invalid");
+      }
+    }
+    const targetKinds = new Set(call.targets.map((target) => target.kind));
+    const targetKeys = call.targets.map(targetSortKey);
+    if (targetKeys.some((key, index) => index > 0 && targetKeys[index - 1]! >= key)) {
+      throw new DependencyContractError("raw call targets are not unique and canonical-sorted");
     }
     if (
-      (!["resolved", "external", "unresolved"].includes(call.status)
-        || !["exact", "heuristic"].includes(call.precision))
+      (!["resolved", "candidates", "external", "unresolved"].includes(call.status)
+        || !["exact", "overapprox", "heuristic"].includes(call.precision))
       || (call.status === "resolved" && (
         call.precision !== "exact"
         || call.reason !== null
-        || target.kind !== "definition"
+        || call.algorithm !== null
+        || call.targets.length !== 1
+        || !targetKinds.has("definition")
         || !["direct", "static", "private", "fresh_instance", "super"].includes(call.dispatch)
       ))
+      || (call.status === "candidates" && (
+        call.precision !== "overapprox"
+        || call.reason !== null
+        || typeof call.algorithm !== "string"
+        || call.algorithm.length === 0
+        || call.algorithm.length > MAX_SPECIFIER_CHARS
+        || hasUnpairedSurrogate(call.algorithm)
+        || targetKinds.size !== 1
+        || !targetKinds.has("definition")
+        || !["dynamic", "fresh_instance"].includes(call.dispatch)
+        || call.evidence.occurrenceKind === "new_expression"
+        || (call.dispatch === "dynamic" && (
+          call.algorithm !== TYPESCRIPT_CLOSED_LOCAL_CALL_FLOW_ALGORITHM
+        ))
+        || (call.dispatch === "fresh_instance" && (
+          call.algorithm !== TYPESCRIPT_CLOSED_LOCAL_FRESH_INSTANCE_FLOW_ALGORITHM
+          || !["method", "tagged_template"].includes(call.callKind)
+          || !["call_expression", "tagged_template"].includes(call.evidence.occurrenceKind)
+          || call.targets.some((target) => (
+            target.kind !== "definition" || definitions.get(target.key)?.semanticKind !== "method"
+          ))
+        ))
+      ))
       || (call.status === "external" && (
-        target.kind !== "external"
+        call.algorithm !== null
+        || call.targets.length !== 1
+        || !targetKinds.has("external")
         || call.dispatch !== "external"
         || (call.precision !== "exact" && call.precision !== "heuristic")
         || (call.precision === "exact" ? call.reason !== null : !call.reason)
       ))
       || (call.status === "unresolved" && (
-        target.kind !== "unknown"
+        call.algorithm !== null
+        || call.targets.length !== 1
+        || !targetKinds.has("unknown")
         || call.precision !== "heuristic"
         || !call.reason
         || !["dynamic", "open"].includes(call.dispatch)
@@ -6094,6 +6729,11 @@ export async function extractTypeScriptRawDependencyDelta(
         bindingProvenance: source.syntacticallyValid
           ? sourceBindingProvenance(source.sourceFile)
           : new Map<string, BindingProvenance>(),
+        freshReceiverProof: {
+          identifierIndex: null,
+          indexFailed: false,
+          useProofs: new Map<string, boolean>(),
+        },
       }, 0);
     }
     if (sites.length + calls.length > MAX_SITES) throw new DependencyContractError(`dependency site limit ${MAX_SITES} exceeded`);
