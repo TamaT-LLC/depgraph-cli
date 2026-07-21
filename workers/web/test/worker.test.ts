@@ -631,19 +631,11 @@ test("worker emits deterministic protocol graph without executing project code",
   for (const marker of markers) await assert.rejects(import("node:fs/promises").then(({ stat }) => stat(marker)));
 });
 
-test("unsupported TanStack Start versions remain explicit and do not fabricate server functions", async (context) => {
+test("TanStack Start version ranges are classified without crossing the v1 boundary", async (context) => {
   const root = await mkdtemp(path.join(os.tmpdir(), "depgraph-web-start-version-"));
   context.after(async () => rm(root, { recursive: true, force: true }));
   await mkdir(path.join(root, "src", "routes"), { recursive: true });
   await Promise.all([
-    writeFile(path.join(root, "package.json"), JSON.stringify({
-      name: "unsupported-start",
-      version: "1.0.0",
-      dependencies: {
-        "@tanstack/react-router": "1.170.18",
-        "@tanstack/react-start": "2.0.0",
-      },
-    })),
     writeFile(path.join(root, "src", "routes", "index.tsx"), [
       'import { createFileRoute } from "@tanstack/react-router";',
       'export const Route = createFileRoute("/")({});',
@@ -655,14 +647,34 @@ test("unsupported TanStack Start versions remain explicit and do not fabricate s
       "",
     ].join("\n")),
   ]);
-  const result = await run("unsupported-start", root);
-  const nodes = result.events.filter((event) => event.event === "node_upsert").map((event) => event.node);
-  const diagnostics = result.events.filter((event) => event.event === "diagnostic").map((event) => event.diagnostic);
-  assert.ok(diagnostics.some((diagnostic) => (
-    diagnostic.code === "web.tanstack_start_version_unsupported"
-    && diagnostic.message.includes("2.0.0")
-  )));
-  assert.ok(!nodes.some((node) => node.kind === "server_function" && node.properties.framework === "tanstack-start"));
+  const scanRange = async (range: string, index: number) => {
+    await writeFile(path.join(root, "package.json"), JSON.stringify({
+      name: "start-version-range",
+      version: "1.0.0",
+      dependencies: {
+        "@tanstack/react-router": "1.170.18",
+        "@tanstack/react-start": range,
+      },
+    }));
+    return await run(`start-version-range-${index}`, root);
+  };
+  for (const [index, range] of [">=1.0.0", "1", "^1", "~1", "1.x", ">=1 <2"].entries()) {
+    const result = await scanRange(range, index);
+    const nodes = result.events.filter((event) => event.event === "node_upsert").map((event) => event.node);
+    const diagnostics = result.events.filter((event) => event.event === "diagnostic").map((event) => event.diagnostic);
+    assert.ok(nodes.some((node) => node.kind === "server_function" && node.properties.framework === "tanstack-start"), range);
+    assert.ok(!diagnostics.some((diagnostic) => diagnostic.code === "web.tanstack_start_version_unsupported"), range);
+  }
+  for (const [index, range] of ["2.0.0", "1.0.0 - 2.0.0", "^1 || ^2"].entries()) {
+    const result = await scanRange(range, index + 10);
+    const nodes = result.events.filter((event) => event.event === "node_upsert").map((event) => event.node);
+    const diagnostics = result.events.filter((event) => event.event === "diagnostic").map((event) => event.diagnostic);
+    assert.ok(diagnostics.some((diagnostic) => (
+      diagnostic.code === "web.tanstack_start_version_unsupported"
+      && diagnostic.message.includes(range)
+    )), range);
+    assert.ok(!nodes.some((node) => node.kind === "server_function" && node.properties.framework === "tanstack-start"), range);
+  }
 });
 
 test("pure TypeScript semantic profiles allow candidate and external calls", async (context) => {

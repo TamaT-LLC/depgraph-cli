@@ -408,10 +408,52 @@ function resolveRelativeModule(
   return candidates.find((candidate) => sources.has(candidate)) ?? null;
 }
 
+function targetsSupportedMajor(range: string): boolean {
+  const versionPattern = "v?\\d+(?:\\.(?:\\d+|x|\\*)){0,2}(?:-[0-9A-Za-z.-]+)?";
+  const parseAlternative = (value: string): Array<{ operator: string | null; version: string }> | null => {
+    const normalized = value
+      .replace(/^([~^=])\s+/u, "$1")
+      .replace(/(>=|<=|>|<)\s+/gu, "$1")
+      .trim();
+    const simple = normalized.match(new RegExp(`^([~^=])?(${versionPattern})$`, "iu"));
+    if (simple?.[2]) return [{ operator: simple[1] ?? null, version: simple[2] }];
+    const hyphen = normalized.match(new RegExp(`^(${versionPattern})\\s+-\\s+(${versionPattern})$`, "iu"));
+    if (hyphen?.[1] && hyphen[2]) return [
+      { operator: null, version: hyphen[1] },
+      { operator: null, version: hyphen[2] },
+    ];
+    const comparators = normalized.split(/[\s,]+/u).filter(Boolean).map((part) => (
+      part.match(new RegExp(`^(>=|<=|>|<)(${versionPattern})$`, "iu"))
+    ));
+    if (comparators.length === 0 || comparators.some((token) => !token?.[1] || !token[2])) return null;
+    return comparators.map((token) => ({ operator: token![1]!, version: token![2]! }));
+  };
+  const alternatives = range.trim().split("||").map((value) => value.trim()).filter(Boolean);
+  if (alternatives.length === 0) return false;
+  return alternatives.every((alternative) => {
+    const tokens = parseAlternative(alternative);
+    if (!tokens) return false;
+    let includesVersionOne = false;
+    for (const token of tokens) {
+      const version = token.version.replace(/^v/iu, "");
+      const major = Number(version.match(/^\d+/u)?.[0]);
+      if (major === 1) {
+        includesVersionOne = true;
+        continue;
+      }
+      const exclusiveVersionTwoUpperBound = major === 2
+        && token.operator === "<"
+        && /^2(?:\.0){0,2}$/u.test(version);
+      if (!exclusiveVersionTwoUpperBound) return false;
+    }
+    return includesVersionOne;
+  });
+}
+
 function supportedVersion(owner: PackageRecord): boolean {
   const range = owner.dependencies.get("@tanstack/react-start")?.range
     ?? owner.dependencies.get("@tanstack/start")?.range;
-  return typeof range === "string" && /^(?:[~^=]\s*)?1\./u.test(range.trim());
+  return typeof range === "string" && targetsSupportedMajor(range);
 }
 
 export function collectTanStackStartSemanticDelta(
