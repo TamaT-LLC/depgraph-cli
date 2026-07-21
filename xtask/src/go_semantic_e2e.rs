@@ -300,6 +300,10 @@ fn verify_semantic_graph(runner: &Runner<'_>, temp: &Path, fixture: &Path) -> Re
         "two CLI scans of the Go semantic fixture produced different nodes/sites/edges/coverage"
     );
     ensure!(
+        first_export["graph"] == second_export["graph"],
+        "two CLI scans produced different Go profiles/evidence/diagnostics"
+    );
+    ensure!(
         first_scan["coverage"] == first_export["graph"]["coverage"],
         "scan and exported semantic coverage disagree"
     );
@@ -314,6 +318,7 @@ fn verify_semantic_graph(runner: &Runner<'_>, temp: &Path, fixture: &Path) -> Re
     let sites = graph_array(graph, "sites")?;
     let edges = graph_array(graph, "edges")?;
     let evidence = graph_array(graph, "evidence")?;
+    verify_call_graph_boundaries(runner, &first_store, graph)?;
 
     let build_id = require_node(nodes, "symbol", BUILD, "function")?;
     let cycle_left_id = require_node(nodes, "symbol", CYCLE_LEFT, "function")?;
@@ -420,6 +425,129 @@ fn verify_semantic_graph(runner: &Runner<'_>, temp: &Path, fixture: &Path) -> Re
         &first_dot,
         &first_mermaid,
     )?;
+    Ok(())
+}
+
+fn verify_call_graph_boundaries(runner: &Runner<'_>, store: &Path, graph: &Value) -> Result<()> {
+    let nodes = graph_array(graph, "nodes")?;
+    let sites = graph_array(graph, "sites")?;
+    let evidence = graph_array(graph, "evidence")?;
+    let diagnostics = graph_array(graph, "diagnostics")?;
+    let expected = BTreeMap::from([
+        ("assembly_declaration", 2_u64),
+        ("assembly_implementation", 1),
+        ("cgo_import", 1),
+        ("go_linkname", 1),
+        ("native_callback", 1),
+        ("native_header", 1),
+        ("native_library", 1),
+        ("plugin", 1),
+        ("reflection_call", 2),
+        ("reflection_call_slice", 1),
+        ("reflection_field_lookup", 2),
+        ("reflection_make_func", 1),
+        ("reflection_method_lookup", 2),
+        ("unsafe", 1),
+    ]);
+    let mut counts = BTreeMap::<&str, u64>::new();
+    let mut unresolved_boundary_ids = Vec::<String>::new();
+    for primary in evidence.iter().filter(|item| {
+        item["owner_type"] == "site" && item["properties"]["callgraph_boundary"].as_str().is_some()
+    }) {
+        let boundary = required_str(
+            primary
+                .get("properties")
+                .context("boundary evidence has no properties")?,
+            "callgraph_boundary",
+            "boundary evidence",
+        )?;
+        *counts.entry(boundary).or_default() += 1;
+        let site_id = required_str(primary, "owner_id", "boundary evidence")?;
+        let site = sites
+            .iter()
+            .find(|site| site["id"] == site_id)
+            .with_context(|| format!("boundary evidence has no site {site_id}"))?;
+        let reason = primary["properties"]["boundary_reason"]
+            .as_str()
+            .context("boundary evidence has no dedicated reason")?;
+        ensure!(
+            !reason.is_empty() && site["profile_id"].as_str().is_some(),
+            "boundary site lost reason/profile identity: site={site} evidence={primary}"
+        );
+        let diagnostic = diagnostics
+            .iter()
+            .find(|diagnostic| {
+                diagnostic["code"] == "go_callgraph_limit"
+                    && diagnostic["properties"]["site_id"] == site_id
+            })
+            .with_context(|| format!("boundary site {site_id} has no correlated diagnostic"))?;
+        ensure!(
+            diagnostic["properties"]["boundary"] == boundary
+                && diagnostic["properties"]["reason"] == reason
+                && diagnostic["path"] == primary["path"]
+                && diagnostic["start_line"] == primary["start_line"]
+                && diagnostic["start_column"] == primary["start_column"]
+                && diagnostic["end_line"] == primary["end_line"]
+                && diagnostic["end_column"] == primary["end_column"],
+            "boundary diagnostic and site evidence disagree: diagnostic={diagnostic} evidence={primary}"
+        );
+        if site["resolution_status"] == "unresolved" {
+            unresolved_boundary_ids.push(site_id.to_owned());
+            ensure!(
+                site["precision"] == "heuristic"
+                    && site["reason"] == reason
+                    && site["target_ids"].as_array().is_some_and(|targets| {
+                        targets.len() == 1
+                            && nodes.iter().any(|node| {
+                                node["id"] == targets[0] && node["kind"] == "unknown_target"
+                            })
+                    }),
+                "unresolved boundary invented an exact/candidate target: {site}"
+            );
+        }
+    }
+    ensure!(
+        counts == expected,
+        "Go boundary fixture counts changed: {counts:?}"
+    );
+    let profile = graph_array(graph, "profiles")?
+        .iter()
+        .find(|profile| profile["language"] == "go")
+        .context("boundary export has no Go profile")?;
+    let expected_total = expected.values().sum::<u64>();
+    ensure!(
+        profile["properties"]["go_callgraph_boundary_status"] == "observed"
+            && profile["properties"]["go_callgraph_boundary_site_count"]
+                .as_str()
+                .and_then(|value| value.parse::<u64>().ok())
+                == Some(expected_total)
+            && profile["properties"]["go_callgraph_boundary_completeness_policy"]
+                == "semantic-complete-allowed-with-explicit-boundaries"
+            && string_array_contains(&graph["coverage"]["completeness"], "semantic-complete"),
+        "Go profile lost boundary/completeness metadata: {profile}"
+    );
+
+    let unresolved = runner.query(store, &["unresolved", "--json"])?;
+    let unresolved_items = unresolved["data"]
+        .as_array()
+        .context("Go unresolved query has no data array")?;
+    for site_id in unresolved_boundary_ids {
+        ensure!(
+            unresolved_items.iter().any(|item| {
+                item["site"]["id"] == site_id
+                    && item["site"]["reason"]
+                        .as_str()
+                        .is_some_and(|reason| !reason.is_empty())
+                    && item["evidence"].as_array().is_some_and(|items| {
+                        items.iter().any(|item| {
+                            item["properties"]["callgraph_boundary"].as_str().is_some()
+                                && item["properties"]["boundary_reason"].as_str().is_some()
+                        })
+                    })
+            }),
+            "unresolved query omitted boundary site {site_id} or its reason/evidence"
+        );
+    }
     Ok(())
 }
 

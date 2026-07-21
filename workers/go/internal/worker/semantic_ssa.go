@@ -4,8 +4,6 @@ import (
 	"fmt"
 	"go/token"
 	"go/types"
-	"io/fs"
-	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -56,7 +54,6 @@ func (e *goSemanticExtractor) emitSSACalls() {
 		pendingSites: len(e.pendingCalls), algorithms: map[string]bool{}, fallbackReasons: map[string]bool{},
 	}
 	defer e.recordSSAOutcome(outcome)
-	e.emitCallGraphLimitDiagnostics()
 	if len(e.pendingCalls) == 0 {
 		return
 	}
@@ -320,131 +317,6 @@ func (e *goSemanticExtractor) recordSSAOutcome(outcome *goSSAOutcome) {
 	e.state.profile.Properties["go_call_graph_vta_site_count"] = strconv.Itoa(outcome.vtaSelections)
 	e.state.profile.Properties["go_call_graph_vta_fallback_site_count"] = strconv.Itoa(outcome.fallbackSelections)
 	e.state.profile.Properties["go_call_graph_vta_fallback_reasons"] = strings.Join(reasons, ",")
-}
-
-func (e *goSemanticExtractor) emitCallGraphLimitDiagnostics() {
-	paths := make([]string, 0, len(e.sources))
-	for path := range e.sources {
-		paths = append(paths, path)
-	}
-	sort.Strings(paths)
-	for _, path := range paths {
-		source := e.sources[path]
-		if source == nil || source.AST == nil || source.FileSet == nil {
-			continue
-		}
-		for _, importSpec := range source.AST.Imports {
-			importPath, err := strconv.Unquote(importSpec.Path.Value)
-			if err != nil {
-				continue
-			}
-			var category, message string
-			switch importPath {
-			case "unsafe":
-				category = "unsafe"
-				message = "unsafe operations can cross the statically modeled Go call graph boundary"
-			case "plugin":
-				category = "plugin"
-				message = "plugin loading and symbol lookup cannot be resolved by the closed-world Go call graph"
-			case "C":
-				category = "native_callback"
-				message = "cgo and native callbacks are outside the Go SSA call graph"
-			}
-			if category != "" {
-				e.addCallGraphLimitDiagnostic(
-					source.RelPath,
-					category,
-					message,
-					goCallGraphLimitEvidence(source, importSpec.Pos(), importSpec.End(), importPath, category),
-				)
-			}
-		}
-		for _, group := range source.AST.Comments {
-			for _, comment := range group.List {
-				text := strings.TrimSpace(comment.Text)
-				category, message := "", ""
-				switch {
-				case strings.HasPrefix(text, "//go:linkname"):
-					category = "go_linkname"
-					message = "go:linkname can introduce call targets that are not represented by typed source"
-				case strings.HasPrefix(text, "//export "):
-					category = "native_callback"
-					message = "exported cgo callbacks are outside the Go SSA call graph"
-				}
-				if category != "" {
-					e.addCallGraphLimitDiagnostic(
-						source.RelPath,
-						category,
-						message,
-						goCallGraphLimitEvidence(source, comment.Pos(), comment.End(), text, category),
-					)
-				}
-			}
-		}
-	}
-
-	_ = filepath.WalkDir(e.state.root, func(path string, entry fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return nil
-		}
-		if entry.IsDir() {
-			if path != e.state.root && shouldSkipDirectory(entry.Name()) {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if entry.Type()&os.ModeSymlink != 0 || !strings.HasSuffix(strings.ToLower(entry.Name()), ".s") ||
-			strings.HasPrefix(entry.Name(), ".") || strings.HasPrefix(entry.Name(), "_") {
-			return nil
-		}
-		relative := relativePath(e.state.root, path)
-		e.addCallGraphLimitDiagnostic(
-			relative,
-			"assembly",
-			"assembly functions and native callbacks are outside the Go SSA call graph",
-			nil,
-		)
-		return nil
-	})
-}
-
-func goCallGraphLimitEvidence(source *sourceFile, startPos, endPos token.Pos, detail, category string) []Evidence {
-	if source == nil || source.FileSet == nil {
-		return nil
-	}
-	start := source.FileSet.PositionFor(startPos, false)
-	end := source.FileSet.PositionFor(endPos, false)
-	evidence := sourceEvidence(source.RelPath, start.Line, start.Column, end.Line, end.Column, detail)
-	if len(evidence) > 0 {
-		evidence[0].Properties = map[string]any{"boundary": category}
-	}
-	return evidence
-}
-
-func (e *goSemanticExtractor) addCallGraphLimitDiagnostic(path, category, message string, evidence []Evidence) {
-	identity := map[string]any{
-		"code": "go_callgraph_limit", "path": path, "profile_id": e.state.profile.ID, "boundary": category,
-	}
-	diagnostic := Diagnostic{
-		Code: "go_callgraph_limit", Severity: "warning", Message: message,
-		ProfileID: e.state.profile.ID, Path: path,
-		Properties: map[string]any{"boundary": category}, Recoverable: true,
-	}
-	if len(evidence) > 0 {
-		primary := evidence[0]
-		identity["span"] = goSemanticSpan(primary)
-		diagnostic.StartLine = primary.StartLine
-		diagnostic.StartColumn = primary.StartColumn
-		diagnostic.EndLine = primary.EndLine
-		diagnostic.EndColumn = primary.EndColumn
-		diagnostic.Evidence = append([]Evidence(nil), evidence...)
-	}
-	diagnostic.ID = stableIDFromValue("diagnostic", identity)
-	if e.diagnosticIDs[diagnostic.ID] {
-		return
-	}
-	e.diagnosticIDs[diagnostic.ID] = true
-	e.state.diagnostics = append(e.state.diagnostics, diagnostic)
 }
 
 func buildGoSSA(input *goSSAInput) (build goSSABuild, err error) {

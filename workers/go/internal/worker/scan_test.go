@@ -61,6 +61,7 @@ func TestScanWorkspaceFixture(t *testing.T) {
 	generatedFound := false
 	variants := map[string]bool{}
 	nodesByID := map[string]Node{}
+	sitesByID := map[string]Site{}
 	for _, node := range result.Nodes {
 		nodesByID[node.ID] = node
 		if !strings.Contains(node.ID, ":sha256:") {
@@ -74,12 +75,29 @@ func TestScanWorkspaceFixture(t *testing.T) {
 		}
 	}
 	for _, site := range result.Sites {
+		sitesByID[site.ID] = site
 		if !strings.Contains(site.ID, ":sha256:") {
 			t.Fatalf("site ID does not use canonical sha256 format: %s", site.ID)
 		}
 		if site.ResolutionStatus == "external" {
 			if target := nodesByID[site.TargetIDs[0]]; target.Kind != "external_system" {
 				t.Fatalf("external site targets %q instead of external_system: %+v", target.Kind, site)
+			}
+		}
+		wantNativeLocator := ""
+		switch site.Kind {
+		case "cgo_import":
+			wantNativeLocator = "native-toolchain:c"
+		case "cgo_library":
+			wantNativeLocator = "native-library:m"
+		case "cgo_header":
+			wantNativeLocator = "native-header:<stdlib.h>"
+		}
+		if wantNativeLocator != "" {
+			target := nodesByID[site.TargetIDs[0]]
+			if target.Locator != wantNativeLocator || target.Properties["native_kind"] == "" ||
+				site.Evidence[0].Properties["callgraph_boundary"] == "" {
+				t.Fatalf("native boundary identity was not normalized: want=%q site=%+v target=%+v", wantNativeLocator, site, target)
 			}
 		}
 		for _, evidence := range site.Evidence {
@@ -91,6 +109,23 @@ func TestScanWorkspaceFixture(t *testing.T) {
 				t.Fatalf("site evidence lacks extractor identity: %+v", evidence)
 			}
 		}
+	}
+	if got := result.Profile.Properties["go_callgraph_boundary_site_count"]; got != "3" {
+		t.Fatalf("workspace native boundary count = %q, want 3: %+v", got, result.Profile.Properties)
+	}
+	boundaryDiagnostics := 0
+	for _, diagnostic := range result.Diagnostics {
+		if diagnostic.Code != "go_callgraph_limit" {
+			continue
+		}
+		boundaryDiagnostics++
+		siteID, _ := diagnostic.Properties["site_id"].(string)
+		if _, ok := sitesByID[siteID]; !ok {
+			t.Fatalf("native boundary diagnostic has no site: %+v", diagnostic)
+		}
+	}
+	if boundaryDiagnostics != 3 {
+		t.Fatalf("workspace native boundary diagnostics = %d, want 3: %+v", boundaryDiagnostics, result.Diagnostics)
 	}
 	for _, edge := range result.Edges {
 		if edge.Environment != "any" {

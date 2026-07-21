@@ -375,6 +375,11 @@ func Scan(root string) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
+	assemblyFiles, err := state.addAssemblyBoundaries(modules, moduleNodes, groups)
+	if err != nil {
+		return Result{}, err
+	}
+	discoveredFiles += assemblyFiles
 	state.addModuleRequirements(modules, work, moduleNodes)
 	state.addManifestCompletions(modules, work)
 	for _, source := range sources {
@@ -651,6 +656,144 @@ func (s *scannerState) addPackagesAndFiles(sources []*sourceFile, moduleNodes ma
 	return groupsByImport, nil
 }
 
+func (s *scannerState) addAssemblyBoundaries(
+	modules []Module,
+	moduleNodes map[string]Node,
+	groups map[string][]*packageGroup,
+) (int, error) {
+	var paths []string
+	discovered := 0
+	groupsByDir := map[string]*packageGroup{}
+	for _, candidates := range groups {
+		for _, group := range candidates {
+			groupsByDir[filepath.Clean(group.Dir)] = group
+		}
+	}
+	err := filepath.WalkDir(s.root, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() && path != s.root && shouldSkipDirectory(entry.Name()) {
+			return filepath.SkipDir
+		}
+		if entry.IsDir() || !strings.HasSuffix(strings.ToLower(entry.Name()), ".s") ||
+			strings.HasPrefix(entry.Name(), ".") || strings.HasPrefix(entry.Name(), "_") {
+			return nil
+		}
+		discovered++
+		relative := relativePath(s.root, path)
+		if entry.Type()&os.ModeSymlink != 0 {
+			reason := "Go assembly symlink was not followed in safe mode"
+			s.diagnostics = append(s.diagnostics, Diagnostic{
+				Code: "go_assembly_symlink_skipped", Severity: "warning", Message: reason,
+				Path: relative, Recoverable: true,
+			})
+			s.files = append(s.files, FileCompletion{
+				Path: relative, DiscoveredSites: 1, SkippedSites: 1, Skipped: true, Reason: reason,
+			})
+			return nil
+		}
+		paths = append(paths, path)
+		return nil
+	})
+	if err != nil {
+		return discovered, fmt.Errorf("discover Go assembly files: %w", err)
+	}
+	sort.Strings(paths)
+	for _, path := range paths {
+		sourceBytes, readErr := readRegularFileWithinRoot(s.root, path)
+		relative := relativePath(s.root, path)
+		if readErr != nil {
+			reason := fmt.Sprintf("Go assembly %s could not be read: %v", relative, readErr)
+			s.diagnostics = append(s.diagnostics, Diagnostic{
+				Code: "go_assembly_read", Severity: "warning", Message: reason, Path: relative, Recoverable: true,
+			})
+			s.files = append(s.files, FileCompletion{
+				Path: relative, DiscoveredSites: 1, SkippedSites: 1, Skipped: true, Reason: reason,
+			})
+			continue
+		}
+		module := moduleForPath(modules, path)
+		if module == nil {
+			module = &modules[0]
+		}
+		condition, conditionText, conditionErr := parseBuildCondition(sourceBytes)
+		if conditionErr != nil {
+			s.unsupported++
+			s.diagnostics = append(s.diagnostics, Diagnostic{
+				Code: "go_build_constraint", Severity: "warning", Message: conditionErr.Error(), Path: relative, Recoverable: true,
+			})
+		}
+		if filenameCondition, filenameText, ok := buildConditionFromFilename(filepath.Base(path)); ok {
+			condition = combineConditions(condition, filenameCondition)
+			conditionText = joinConditionText(conditionText, filenameText)
+		}
+		fileNodeID := s.scopedID("file", module.Path, relative)
+		fileNode := Node{
+			ID: fileNodeID, Kind: "file", Locator: "file:" + relative, DisplayName: relative,
+			Properties: map[string]any{
+				"language": "go", "package_path": packageImportPath(s.root, *module, filepath.Dir(path)),
+				"assembly": true, "generated": false, "build_constraint": conditionText,
+			},
+		}
+		if err := addNode(s.nodes, fileNode); err != nil {
+			return discovered, err
+		}
+		assemblyEvidence := sourceEvidence(relative, 1, 1, 1, 1, "Go assembly source")
+		if group := groupsByDir[filepath.Clean(filepath.Dir(path))]; group != nil {
+			variants := make([]string, 0, len(group.Variants))
+			for variant := range group.Variants {
+				variants = append(variants, variant)
+			}
+			sort.Strings(variants)
+			for _, variant := range variants {
+				s.addStructuralEdge(group.Variants[variant].ID, fileNodeID, "contains", condition, assemblyEvidence)
+			}
+		} else if moduleNode, ok := moduleNodes[module.Dir]; ok {
+			s.addStructuralEdge(
+				moduleNode.ID, fileNodeID, "contains", condition, assemblyEvidence,
+			)
+		}
+		source := &sourceFile{
+			AbsPath: path, RelPath: relative, Dir: filepath.Dir(path), Module: module,
+			ImportPath: packageImportPath(s.root, *module, filepath.Dir(path)), Condition: condition,
+			ConditionText: conditionText, Source: sourceBytes, FileNodeID: fileNodeID,
+		}
+		emitted := 0
+		scanner := bufio.NewScanner(bytes.NewReader(sourceBytes))
+		for lineNumber := 1; scanner.Scan(); lineNumber++ {
+			line := scanner.Text()
+			fields := strings.Fields(strings.TrimSpace(line))
+			if len(fields) < 2 || fields[0] != "TEXT" {
+				continue
+			}
+			symbol := strings.TrimSuffix(fields[1], ",")
+			symbol = strings.TrimSuffix(symbol, "(SB)")
+			symbol = strings.TrimPrefix(symbol, "·")
+			if symbol == "" {
+				continue
+			}
+			column := strings.Index(line, fields[0]) + 1
+			endColumn := len(line) + 1
+			evidence := sourceEvidence(relative, lineNumber, column, lineNumber, endColumn, strings.TrimSpace(line))
+			s.addUnresolvedCallGraphBoundary(
+				source, symbol, "assembly_implementation", "assembly_implementation_boundary",
+				"Go assembly implementation is outside the SSA call graph", evidence,
+			)
+			emitted++
+		}
+		completion := FileCompletion{Path: relative, DiscoveredSites: emitted, EmittedSites: emitted}
+		if scanErr := scanner.Err(); scanErr != nil {
+			completion.DiscoveredSites++
+			completion.SkippedSites = 1
+			completion.Skipped = true
+			completion.Reason = "Go assembly could not be fully read"
+		}
+		s.files = append(s.files, completion)
+	}
+	return discovered, nil
+}
+
 func (s *scannerState) addModuleRequirements(modules []Module, work WorkFile, moduleNodes map[string]Node) {
 	workReplacements := map[string]Replacement{}
 	for _, replacement := range work.Replacements {
@@ -770,8 +913,28 @@ func (s *scannerState) extractFileDependencies(source *sourceFile, groups map[st
 			s.addUnresolvedSite(source, "import", spec.Path.Value, "invalid import path literal", evidence)
 			continue
 		}
+		switch value {
+		case "unsafe":
+			s.addUnresolvedCallGraphBoundary(
+				source, value, "unsafe", "unsafe_callgraph_boundary",
+				"unsafe operations can cross the statically modeled Go call graph boundary", evidence,
+			)
+		case "plugin":
+			s.addUnresolvedCallGraphBoundary(
+				source, value, "plugin", "plugin_dynamic_symbol_boundary",
+				"plugin loading and symbol lookup can introduce runtime-only call targets", evidence,
+			)
+		}
 		if value == "C" {
-			s.addExternalSite(source, "cgo_import", value, "links", "native_library", "cgo:C", "C toolchain", evidence, map[string]any{"language": "c", "cgo": true})
+			boundaryEvidence := goCallGraphBoundaryEvidence(evidence, "cgo_import", "cgo_native_boundary")
+			siteID := s.addExternalSite(
+				source, "cgo_import", value, "links", "native_library", "native-toolchain:c", "C toolchain",
+				boundaryEvidence, map[string]any{"language": "c", "cgo": true, "native_kind": "toolchain"},
+			)
+			s.addCallGraphLimitDiagnostic(
+				siteID, "cgo_import", "cgo_native_boundary",
+				"cgo calls and native callbacks are outside the closed-world Go call graph",
+			)
 			continue
 		}
 		if strings.HasPrefix(value, ".") || strings.Contains(value, "\\") {
@@ -802,6 +965,7 @@ func (s *scannerState) extractFileDependencies(source *sourceFile, groups map[st
 
 	s.extractEmbedDirectives(source)
 	s.extractGenerateDirectives(source)
+	s.extractCallGraphBoundaryDirectives(source)
 	if hasCgoImport(source.AST) {
 		s.extractCgoDirectives(source)
 	}
@@ -819,7 +983,7 @@ func (s *scannerState) extractFileDependencies(source *sourceFile, groups map[st
 	s.files = append(s.files, completion)
 }
 
-func (s *scannerState) addUnresolvedSite(source *sourceFile, kind, specifier, reason string, evidence []Evidence) {
+func (s *scannerState) addUnresolvedSite(source *sourceFile, kind, specifier, reason string, evidence []Evidence) string {
 	unknownID := s.ensureUnknownNode()
 	line := 0
 	column := 0
@@ -833,13 +997,14 @@ func (s *scannerState) addUnresolvedSite(source *sourceFile, kind, specifier, re
 		ProfileID: s.profile.ID, Condition: source.Condition, Precision: "heuristic", Evidence: evidence, Reason: reason,
 	}
 	s.addSiteWithEdges(site, edgeKindForSite(kind))
+	return site.ID
 }
 
-func (s *scannerState) addExternalSite(source *sourceFile, kind, specifier, edgeKind, nodeKind, locator, display string, evidence []Evidence, properties map[string]any) {
-	s.addExternalSiteWithCondition(source, kind, specifier, edgeKind, nodeKind, locator, display, source.Condition, evidence, properties)
+func (s *scannerState) addExternalSite(source *sourceFile, kind, specifier, edgeKind, nodeKind, locator, display string, evidence []Evidence, properties map[string]any) string {
+	return s.addExternalSiteWithCondition(source, kind, specifier, edgeKind, nodeKind, locator, display, source.Condition, evidence, properties)
 }
 
-func (s *scannerState) addExternalSiteWithCondition(source *sourceFile, kind, specifier, edgeKind, nodeKind, locator, display string, condition Condition, evidence []Evidence, properties map[string]any) {
+func (s *scannerState) addExternalSiteWithCondition(source *sourceFile, kind, specifier, edgeKind, nodeKind, locator, display string, condition Condition, evidence []Evidence, properties map[string]any) string {
 	targetID := s.scopedID("external_system", locator)
 	properties["external"] = true
 	properties["target_kind"] = nodeKind
@@ -858,6 +1023,63 @@ func (s *scannerState) addExternalSiteWithCondition(source *sourceFile, kind, sp
 		ProfileID: s.profile.ID, Condition: canonicalCondition(condition), Precision: "exact", Evidence: evidence,
 	}
 	s.addSiteWithEdges(site, edgeKind)
+	return site.ID
+}
+
+func goCallGraphBoundaryEvidence(evidence []Evidence, boundary, reason string) []Evidence {
+	result := append([]Evidence(nil), evidence...)
+	if len(result) == 0 {
+		return result
+	}
+	primary := result[0]
+	properties := make(map[string]any, len(primary.Properties)+2)
+	for key, value := range primary.Properties {
+		properties[key] = value
+	}
+	properties["callgraph_boundary"] = boundary
+	properties["boundary_reason"] = reason
+	primary.Properties = properties
+	result[0] = primary
+	return result
+}
+
+func (s *scannerState) addUnresolvedCallGraphBoundary(
+	source *sourceFile,
+	specifier, boundary, reason, message string,
+	evidence []Evidence,
+) string {
+	evidence = goCallGraphBoundaryEvidence(evidence, boundary, reason)
+	siteID := s.addUnresolvedSite(source, "callgraph_boundary", specifier, reason, evidence)
+	s.addCallGraphLimitDiagnostic(siteID, boundary, reason, message)
+	return siteID
+}
+
+func (s *scannerState) addCallGraphLimitDiagnostic(siteID, boundary, reason, message string) {
+	site, ok := s.sites[siteID]
+	if !ok || len(site.Evidence) == 0 {
+		return
+	}
+	primary := site.Evidence[0]
+	identity := map[string]any{
+		"code": "go_callgraph_limit", "profile_id": s.profile.ID, "site_id": siteID,
+		"boundary": boundary, "reason": reason,
+	}
+	diagnostic := Diagnostic{
+		ID: stableIDFromValue("diagnostic", identity), Code: "go_callgraph_limit", Severity: "warning",
+		Message: message, ProfileID: s.profile.ID, Path: primary.Path,
+		StartLine: primary.StartLine, StartColumn: primary.StartColumn,
+		EndLine: primary.EndLine, EndColumn: primary.EndColumn,
+		Evidence: append([]Evidence(nil), site.Evidence...), Recoverable: true,
+		Properties: map[string]any{
+			"boundary": boundary, "reason": reason, "site_id": siteID,
+		},
+	}
+	for _, existing := range s.diagnostics {
+		if existing.ID == diagnostic.ID {
+			return
+		}
+	}
+	s.diagnostics = append(s.diagnostics, diagnostic)
 }
 
 func (s *scannerState) addSiteWithEdges(site Site, edgeKind string) {
@@ -924,6 +1146,7 @@ func (s *scannerState) ensureUnknownNode() string {
 }
 
 func (s *scannerState) result(discoveredFiles int) Result {
+	s.recordCallGraphBoundaryProfile()
 	result := Result{Root: s.root, Profile: s.profile, Diagnostics: s.diagnostics, Files: s.files}
 	for _, node := range s.nodes {
 		result.Nodes = append(result.Nodes, node)
@@ -987,6 +1210,40 @@ func (s *scannerState) result(discoveredFiles int) Result {
 	}
 	sortResult(&result)
 	return result
+}
+
+func (s *scannerState) recordCallGraphBoundaryProfile() {
+	if s.profile.Properties == nil {
+		s.profile.Properties = map[string]string{}
+	}
+	counts := map[string]int{}
+	for _, site := range s.sites {
+		if len(site.Evidence) == 0 {
+			continue
+		}
+		boundary, _ := site.Evidence[0].Properties["callgraph_boundary"].(string)
+		if boundary != "" {
+			counts[boundary]++
+		}
+	}
+	boundaries := make([]string, 0, len(counts))
+	encodedCounts := make([]string, 0, len(counts))
+	total := 0
+	for boundary, count := range counts {
+		boundaries = append(boundaries, boundary)
+		encodedCounts = append(encodedCounts, boundary+"="+strconv.Itoa(count))
+		total += count
+	}
+	sort.Strings(boundaries)
+	sort.Strings(encodedCounts)
+	s.profile.Properties["go_callgraph_boundary_status"] = "none"
+	if total > 0 {
+		s.profile.Properties["go_callgraph_boundary_status"] = "observed"
+	}
+	s.profile.Properties["go_callgraph_boundary_site_count"] = strconv.Itoa(total)
+	s.profile.Properties["go_callgraph_boundary_kinds"] = strings.Join(boundaries, ",")
+	s.profile.Properties["go_callgraph_boundary_counts"] = strings.Join(encodedCounts, ",")
+	s.profile.Properties["go_callgraph_boundary_completeness_policy"] = "semantic-complete-allowed-with-explicit-boundaries"
 }
 
 func (s *scannerState) extractEmbedDirectives(source *sourceFile) {
@@ -1133,6 +1390,63 @@ func (s *scannerState) extractGenerateDirectives(source *sourceFile) {
 	}
 }
 
+func (s *scannerState) extractCallGraphBoundaryDirectives(source *sourceFile) {
+	for _, declaration := range source.AST.Decls {
+		function, ok := declaration.(*ast.FuncDecl)
+		if !ok || function.Body != nil || function.Name == nil {
+			continue
+		}
+		start := source.FileSet.PositionFor(function.Pos(), false)
+		end := source.FileSet.PositionFor(function.End(), false)
+		resolver := strings.TrimSuffix(source.ImportPath, "/") + "." + function.Name.Name
+		evidence := sourceEvidence(source.RelPath, start.Line, start.Column, end.Line, end.Column, resolver)
+		s.addUnresolvedCallGraphBoundary(
+			source, resolver, "assembly_declaration", "assembly_or_external_implementation_boundary",
+			"bodyless Go declaration may be implemented by assembly or native code outside the SSA call graph", evidence,
+		)
+	}
+
+	for _, group := range source.AST.Comments {
+		for _, comment := range group.List {
+			text := strings.TrimSpace(comment.Text)
+			start := source.FileSet.PositionFor(comment.Pos(), false)
+			end := source.FileSet.PositionFor(comment.End(), false)
+			evidence := sourceEvidence(source.RelPath, start.Line, start.Column, end.Line, end.Column, text)
+			switch {
+			case strings.HasPrefix(text, "//go:linkname"):
+				fields := strings.Fields(text)
+				specifier := strings.TrimSpace(strings.TrimPrefix(text, "//go:linkname"))
+				if len(fields) >= 3 {
+					specifier = fields[1] + "->" + fields[2]
+				}
+				if specifier == "" {
+					specifier = "go:linkname"
+				}
+				s.addUnresolvedCallGraphBoundary(
+					source, specifier, "go_linkname", "linkname_target_boundary",
+					"go:linkname can redirect calls to symbols outside the repository call graph", evidence,
+				)
+			case strings.HasPrefix(text, "//export "):
+				name := strings.TrimSpace(strings.TrimPrefix(text, "//export "))
+				if name == "" {
+					continue
+				}
+				boundaryEvidence := goCallGraphBoundaryEvidence(evidence, "native_callback", "cgo_exported_callback_boundary")
+				siteID := s.addExternalSite(
+					source, "native_callback", name, "exports_to", "native_callback", "native-callback:"+name, name,
+					boundaryEvidence, map[string]any{
+						"language": "c", "cgo": true, "native_kind": "callback", "callback_name": name,
+					},
+				)
+				s.addCallGraphLimitDiagnostic(
+					siteID, "native_callback", "cgo_exported_callback_boundary",
+					"exported cgo callback can be entered from native code outside the Go call graph",
+				)
+			}
+		}
+	}
+}
+
 func (s *scannerState) extractCgoDirectives(source *sourceFile) {
 	for _, preamble := range cgoPreambleLines(source) {
 		line := preamble.Text
@@ -1141,17 +1455,30 @@ func (s *scannerState) extractCgoDirectives(source *sourceFile) {
 			condition := combineConditions(source.Condition, directiveCondition)
 			libraries := cgoLibraries(arguments)
 			for _, library := range libraries {
-				s.addExternalSiteWithCondition(
+				boundaryEvidence := goCallGraphBoundaryEvidence(evidence, "native_library", "cgo_native_library_boundary")
+				siteID := s.addExternalSiteWithCondition(
 					source, "cgo_library", library, "links", "native_library", "native-library:"+library, library,
-					condition, evidence, map[string]any{"directive": directive, "arguments": arguments, "link_flag": "-l" + library, "cgo": true},
+					condition, boundaryEvidence, map[string]any{
+						"directive": directive, "arguments": arguments, "link_flag": "-l" + library,
+						"cgo": true, "native_kind": "library",
+					},
+				)
+				s.addCallGraphLimitDiagnostic(
+					siteID, "native_library", "cgo_native_library_boundary",
+					"native library calls are outside the closed-world Go call graph",
 				)
 			}
 			if len(libraries) == 0 {
 				specifier := directive + ":" + arguments
-				s.addExternalSiteWithCondition(
+				boundaryEvidence := goCallGraphBoundaryEvidence(evidence, "cgo_directive", "cgo_native_boundary")
+				siteID := s.addExternalSiteWithCondition(
 					source, "cgo_directive", specifier, "build_depends_on", "external_system",
-					"cgo-directive:"+strings.ToLower(directive), directive, condition, evidence,
-					map[string]any{"directive": directive, "arguments": arguments, "cgo": true},
+					"cgo-directive:"+strings.ToLower(directive), directive, condition, boundaryEvidence,
+					map[string]any{"directive": directive, "arguments": arguments, "cgo": true, "native_kind": "directive"},
+				)
+				s.addCallGraphLimitDiagnostic(
+					siteID, "cgo_directive", "cgo_native_boundary",
+					"cgo compiler and linker directives can introduce native call graph boundaries",
 				)
 			}
 			continue
@@ -1159,7 +1486,15 @@ func (s *scannerState) extractCgoDirectives(source *sourceFile) {
 		if strings.HasPrefix(line, "#include") {
 			header := strings.TrimSpace(strings.TrimPrefix(line, "#include"))
 			if header != "" {
-				s.addExternalSite(source, "cgo_header", header, "build_depends_on", "external_system", "c-header:"+header, header, evidence, map[string]any{"language": "c", "cgo": true})
+				boundaryEvidence := goCallGraphBoundaryEvidence(evidence, "native_header", "cgo_native_header_boundary")
+				siteID := s.addExternalSite(
+					source, "cgo_header", header, "build_depends_on", "native_header", "native-header:"+header, header,
+					boundaryEvidence, map[string]any{"language": "c", "cgo": true, "native_kind": "header", "header": header},
+				)
+				s.addCallGraphLimitDiagnostic(
+					siteID, "native_header", "cgo_native_header_boundary",
+					"native declarations from cgo headers are outside the closed-world Go call graph",
+				)
 			}
 		}
 	}
@@ -1515,7 +1850,7 @@ func variantsForGroup(group *packageGroup) []string {
 }
 
 func buildConditionFromFilename(name string) (Condition, string, bool) {
-	base := strings.TrimSuffix(name, ".go")
+	base := strings.TrimSuffix(name, filepath.Ext(name))
 	base = strings.TrimSuffix(base, "_test")
 	parts := strings.Split(base, "_")
 	if len(parts) < 2 {
@@ -1633,6 +1968,10 @@ func edgeKindForSite(kind string) string {
 		return "links"
 	case "cgo_header":
 		return "build_depends_on"
+	case "callgraph_boundary":
+		return "bounded_by"
+	case "native_callback":
+		return "exports_to"
 	case "module_requirement":
 		return "depends_on"
 	case "side_effect_import":
