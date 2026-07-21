@@ -800,9 +800,9 @@ export function collectTanStackStartSemanticDelta(
         if (!isIdentifier(declaration.name) || !declaration.initializer || !isCallExpression(declaration.initializer)) continue;
         const chain = callChain(declaration.initializer, routerBindings);
         if (!chain || !["createFileRoute", "createRootRoute", "createRootRouteWithContext"].includes(chain.factory)) continue;
-        const optionsExpression = chain.factory === "createFileRoute"
-          ? chain.steps.at(-1)?.arguments[0]
-          : chain.factoryCall.arguments[0];
+        const optionsExpression = chain.factory === "createRootRoute"
+          ? chain.factoryCall.arguments[0]
+          : chain.steps.at(-1)?.arguments[0];
         const options = optionsExpression && isObjectLiteralExpression(optionsExpression) ? optionsExpression : null;
         const server = propertyExpression(options, "server");
         const serverOptions = server && isObjectLiteralExpression(server) ? server : null;
