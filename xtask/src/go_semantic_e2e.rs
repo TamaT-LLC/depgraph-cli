@@ -77,6 +77,8 @@ pub(crate) fn verify(
     let semantic_root = root.path().join("semantic");
     let vta_root = root.path().join("semantic-vta");
     let fallback_root = root.path().join("fallback-workspace");
+    let dependency_root_a = root.path().join("dependency-snapshot-a");
+    let dependency_root_b = root.path().join("nested/dependency-snapshot-b");
     copy_tree(
         &workspace_root.join("workers/go/internal/worker/testdata/semantic"),
         &semantic_root,
@@ -93,6 +95,12 @@ pub(crate) fn verify(
         &workspace_root.join("workers/go/internal/worker/testdata/workspace"),
         &fallback_root,
     )?;
+    for destination in [&dependency_root_a, &dependency_root_b] {
+        copy_tree(
+            &workspace_root.join("workers/go/internal/worker/testdata/dependency_snapshot"),
+            destination,
+        )?;
+    }
 
     let module_cache = root.path().join("empty-module-cache");
     let go_path = root.path().join("empty-gopath");
@@ -108,7 +116,96 @@ pub(crate) fn verify(
     verify_semantic_graph(&runner, root.path(), &semantic_root)?;
     verify_vta_graph(&runner, root.path(), &vta_root)?;
     verify_fallback_safety(&runner, root.path(), &fallback_root)?;
+    verify_dependency_snapshot(&runner, root.path(), &dependency_root_a, &dependency_root_b)?;
     println!("Go semantic CLI end-to-end gate passed");
+    Ok(())
+}
+
+fn verify_dependency_snapshot(
+    runner: &Runner<'_>,
+    temp: &Path,
+    first_fixture: &Path,
+    second_fixture: &Path,
+) -> Result<()> {
+    let first_store = temp.join("dependency-snapshot-a.db");
+    let second_store = temp.join("dependency-snapshot-b.db");
+    let changed_store = temp.join("dependency-snapshot-changed.db");
+    let first_scan = runner.scan(&first_store, first_fixture)?;
+    let second_scan = runner.scan(&second_store, second_fixture)?;
+    ensure!(
+        first_scan["status"] == "completed" && second_scan["status"] == "completed",
+        "dependency snapshot fixture scans did not complete: first={first_scan} second={second_scan}"
+    );
+    let first_export = runner.export_json(&first_store)?;
+    let second_export = runner.export_json(&second_store)?;
+    let first_profile = graph_array(
+        first_export
+            .get("graph")
+            .context("first dependency snapshot export has no graph")?,
+        "profiles",
+    )?
+    .iter()
+    .find(|profile| profile["language"] == "go")
+    .context("first dependency snapshot export has no Go profile")?;
+    let second_profile = graph_array(
+        second_export
+            .get("graph")
+            .context("second dependency snapshot export has no graph")?,
+        "profiles",
+    )?
+    .iter()
+    .find(|profile| profile["language"] == "go")
+    .context("second dependency snapshot export has no Go profile")?;
+    ensure!(
+        first_profile["properties"]["go_dependency_snapshot_status"] == "complete"
+            && first_profile["properties"]["go_dependency_snapshot_schema"]
+                == "go-offline-dependency-snapshot-v1"
+            && first_profile["properties"]["go_dependency_snapshot_files"]
+                .as_str()
+                .is_some_and(|count| count.parse::<u64>().is_ok_and(|count| count > 0)),
+        "dependency snapshot profile omitted its complete fingerprint metadata: {first_profile}"
+    );
+    ensure!(
+        first_profile["id"] == second_profile["id"]
+            && first_profile["properties"]["go_dependency_snapshot_fingerprint"]
+                == second_profile["properties"]["go_dependency_snapshot_fingerprint"],
+        "equivalent dependency snapshots changed identity across checkout roots: first={first_profile} second={second_profile}"
+    );
+
+    fs::write(
+        second_fixture.join("dep/value.go"),
+        "package dep\n\nfunc Value() string { return \"changed\" }\n",
+    )?;
+    let changed_scan = runner.scan(&changed_store, second_fixture)?;
+    ensure!(
+        changed_scan["status"] == "completed",
+        "changed dependency snapshot scan did not complete: {changed_scan}"
+    );
+    let changed_export = runner.export_json(&changed_store)?;
+    let changed_profile = graph_array(
+        changed_export
+            .get("graph")
+            .context("changed dependency snapshot export has no graph")?,
+        "profiles",
+    )?
+    .iter()
+    .find(|profile| profile["language"] == "go")
+    .context("changed dependency snapshot export has no Go profile")?;
+    ensure!(
+        first_profile["id"] != changed_profile["id"]
+            && first_profile["properties"]["go_dependency_snapshot_fingerprint"]
+                != changed_profile["properties"]["go_dependency_snapshot_fingerprint"],
+        "dependency source content changed without invalidating profile identity: first={first_profile} changed={changed_profile}"
+    );
+    for profile in [first_profile, second_profile, changed_profile] {
+        let encoded = serde_json::to_string(profile)?;
+        ensure!(
+            !encoded.contains(&first_fixture.display().to_string())
+                && !encoded.contains(&second_fixture.display().to_string())
+                && !encoded.contains(&runner.module_cache.display().to_string()),
+            "dependency snapshot profile leaked a checkout/cache path: {encoded}"
+        );
+    }
     Ok(())
 }
 

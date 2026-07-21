@@ -65,6 +65,7 @@ type goCommandEnvironment struct {
 	Values            []string
 	NeutralRoot       string
 	TelemetryModePath string
+	ModuleCache       string
 	cleanup           func()
 }
 
@@ -77,24 +78,29 @@ type goModulePreflight struct {
 // data. The standard-library parser remains authoritative for dependency sites,
 // spans, and syntax coverage so an incomplete typed load cannot erase source.
 type goPackagesInventory struct {
-	Status            string
-	ModuleCount       int
-	PackageCount      int
-	ActiveFileCount   int
-	CompiledFileCount int
-	EmbedFileCount    int
-	TestVariantCount  int
-	TypedPackages     []goTypedPackage
-	Fallback          bool
-	Diagnostics       []Diagnostic
+	Status             string
+	ModuleCount        int
+	PackageCount       int
+	ActiveFileCount    int
+	CompiledFileCount  int
+	EmbedFileCount     int
+	TestVariantCount   int
+	TypedPackages      []goTypedPackage
+	Fallback           bool
+	Diagnostics        []Diagnostic
+	DependencySnapshot goDependencySnapshot
 }
 
 func loadGoPackagesInventory(root string, modules []Module, work WorkFile, tags []string) goPackagesInventory {
 	return loadGoPackagesInventoryWith(root, modules, work, tags, packages.Load, goPackagesLoadTimeout)
 }
 
-func loadGoPackagesInventoryWith(root string, modules []Module, work WorkFile, tags []string, loader goPackagesLoadFunc, timeout time.Duration) goPackagesInventory {
-	inventory := goPackagesInventory{Status: "fallback", Fallback: true}
+func loadGoPackagesInventoryWith(root string, modules []Module, work WorkFile, tags []string, loader goPackagesLoadFunc, timeout time.Duration) (inventory goPackagesInventory) {
+	inventory = goPackagesInventory{Status: "fallback", Fallback: true}
+	dependencySnapshot := newGoDependencySnapshotBuilder(root, modules, work)
+	defer func() {
+		inventory.DependencySnapshot = dependencySnapshot.finalize(inventory.Status)
+	}()
 	if len(modules) == 0 || (len(modules) == 1 && modules[0].ManifestPath == "") {
 		inventory.Diagnostics = append(inventory.Diagnostics, goPackagesDiagnostic(
 			root,
@@ -142,6 +148,7 @@ func loadGoPackagesInventoryWith(root string, modules []Module, work WorkFile, t
 	}
 	defer commandEnvironment.cleanup()
 	baseEnvironment := commandEnvironment.Values
+	dependencySnapshot.setModuleCache(commandEnvironment.ModuleCache)
 
 	workPath, workSafe, workReason := confinedWorkFile(root, work)
 	sourceWorkPath := workPath
@@ -430,6 +437,16 @@ func loadGoPackagesInventoryWith(root string, modules []Module, work WorkFile, t
 					})
 				}
 			}
+		}
+		if reasons := dependencySnapshot.observeModuleLoad(module, loaded); len(reasons) > 0 {
+			moduleIncomplete = true
+			inventory.Diagnostics = append(inventory.Diagnostics, Diagnostic{
+				Code:        "go_dependency_snapshot_incomplete",
+				Severity:    "warning",
+				Message:     "offline dependency source snapshot was incomplete (" + strings.Join(reasons, ",") + "); typed packages for this module were discarded",
+				Path:        relativePath(root, module.ManifestPath),
+				Recoverable: true,
+			})
 		}
 		if moduleIncomplete {
 			failedModules++
@@ -738,7 +755,7 @@ func constrainedGoEnvironment(root, pathValue string) (goCommandEnvironment, err
 		}
 	}
 	return goCommandEnvironment{
-		Values: environment, NeutralRoot: neutralRoot, TelemetryModePath: telemetryModePath, cleanup: cleanup,
+		Values: environment, NeutralRoot: neutralRoot, TelemetryModePath: telemetryModePath, ModuleCache: gomodcache, cleanup: cleanup,
 	}, nil
 }
 
@@ -1374,17 +1391,27 @@ func inventoryProperties(inventory goPackagesInventory) map[string]string {
 	for _, pkg := range inventory.TypedPackages {
 		typedFileCount += len(pkg.Files)
 	}
-	return map[string]string{
-		"go_packages_status":         inventory.Status,
-		"go_packages_modules":        strconv.Itoa(inventory.ModuleCount),
-		"go_packages_packages":       strconv.Itoa(inventory.PackageCount),
-		"go_packages_active_files":   strconv.Itoa(inventory.ActiveFileCount),
-		"go_packages_compiled_files": strconv.Itoa(inventory.CompiledFileCount),
-		"go_packages_embed_files":    strconv.Itoa(inventory.EmbedFileCount),
-		"go_packages_test_variants":  strconv.Itoa(inventory.TestVariantCount),
-		"go_packages_typed_packages": strconv.Itoa(len(inventory.TypedPackages)),
-		"go_packages_typed_files":    strconv.Itoa(typedFileCount),
-		"go_packages_query":          "syntax-types-types-info",
-		"go_packages_safe_mode":      "offline,readonly,no-external-driver,cgo-disabled,telemetry-disabled",
+	properties := map[string]string{
+		"go_packages_status":                 inventory.Status,
+		"go_packages_modules":                strconv.Itoa(inventory.ModuleCount),
+		"go_packages_packages":               strconv.Itoa(inventory.PackageCount),
+		"go_packages_active_files":           strconv.Itoa(inventory.ActiveFileCount),
+		"go_packages_compiled_files":         strconv.Itoa(inventory.CompiledFileCount),
+		"go_packages_embed_files":            strconv.Itoa(inventory.EmbedFileCount),
+		"go_packages_test_variants":          strconv.Itoa(inventory.TestVariantCount),
+		"go_packages_typed_packages":         strconv.Itoa(len(inventory.TypedPackages)),
+		"go_packages_typed_files":            strconv.Itoa(typedFileCount),
+		"go_packages_query":                  "syntax-types-types-info",
+		"go_packages_safe_mode":              "offline,readonly,no-external-driver,cgo-disabled,telemetry-disabled",
+		"go_dependency_snapshot_schema":      goDependencySnapshotSchema,
+		"go_dependency_snapshot_status":      inventory.DependencySnapshot.Status,
+		"go_dependency_snapshot_fingerprint": inventory.DependencySnapshot.Fingerprint,
+		"go_dependency_snapshot_modules":     strconv.Itoa(inventory.DependencySnapshot.ModuleCount),
+		"go_dependency_snapshot_packages":    strconv.Itoa(inventory.DependencySnapshot.PackageCount),
+		"go_dependency_snapshot_files":       strconv.Itoa(inventory.DependencySnapshot.FileCount),
 	}
+	if len(inventory.DependencySnapshot.Reasons) > 0 {
+		properties["go_dependency_snapshot_reasons"] = strings.Join(inventory.DependencySnapshot.Reasons, ",")
+	}
+	return properties
 }

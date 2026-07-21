@@ -289,14 +289,14 @@ func TestProfileConfigurationIsReflectedWithoutExecutingTools(t *testing.T) {
 }
 
 func TestProfileIdentityIncludesHostAndEffectiveCgoAxes(t *testing.T) {
-	linux := goProfileID("linux", "amd64", "0", nil, "rta-cha")
-	darwin := goProfileID("darwin", "amd64", "0", nil, "rta-cha")
-	linuxCgo := goProfileID("linux", "amd64", "1", nil, "rta-cha")
+	linux := goProfileID("linux", "amd64", "0", nil, "rta-cha", "complete", "snapshot-a")
+	darwin := goProfileID("darwin", "amd64", "0", nil, "rta-cha", "complete", "snapshot-a")
+	linuxCgo := goProfileID("linux", "amd64", "1", nil, "rta-cha", "complete", "snapshot-a")
 	if linux == darwin || linux == linuxCgo || darwin == linuxCgo {
 		t.Fatalf("distinct effective Go profiles collided: linux=%s darwin=%s cgo=%s", linux, darwin, linuxCgo)
 	}
-	first := goProfileID("linux", "amd64", "0", []string{" integration ", "linux", "integration"}, "rta-cha")
-	second := goProfileID("linux", "amd64", "0", []string{"linux", "integration"}, "rta-cha")
+	first := goProfileID("linux", "amd64", "0", []string{" integration ", "linux", "integration"}, "rta-cha", "complete", "snapshot-a")
+	second := goProfileID("linux", "amd64", "0", []string{"linux", "integration"}, "rta-cha", "complete", "snapshot-a")
 	if first != second {
 		t.Fatalf("equivalent Go tag sets changed profile identity: first=%s second=%s", first, second)
 	}
@@ -305,7 +305,7 @@ func TestProfileIdentityIncludesHostAndEffectiveCgoAxes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Scan() error = %v", err)
 	}
-	if result.Profile.ID != goProfileID(runtime.GOOS, runtime.GOARCH, "0", nil, "rta-cha") {
+	if result.Profile.ID != goProfileID(runtime.GOOS, runtime.GOARCH, "0", nil, "rta-cha", result.Profile.Properties["go_dependency_snapshot_status"], result.Profile.Properties["go_dependency_snapshot_fingerprint"]) {
 		t.Fatalf("default profile omitted an effective host axis: %+v", result.Profile)
 	}
 	if result.Profile.Environment["CGO_ENABLED"] != "0" {
@@ -329,7 +329,7 @@ func TestVTAProfileIsExplicitAndIdentityScoped(t *testing.T) {
 		t.Fatalf("VTA Scan() error = %v", err)
 	}
 	if vtaResult.Profile.Properties["go_call_graph_requested"] != "vta" ||
-		vtaResult.Profile.ID != goProfileID(runtime.GOOS, runtime.GOARCH, "0", nil, "vta") ||
+		vtaResult.Profile.ID != goProfileID(runtime.GOOS, runtime.GOARCH, "0", nil, "vta", vtaResult.Profile.Properties["go_dependency_snapshot_status"], vtaResult.Profile.Properties["go_dependency_snapshot_fingerprint"]) ||
 		vtaResult.Profile.ID == defaultResult.Profile.ID {
 		t.Fatalf("VTA profile was not explicitly identity-scoped: default=%+v vta=%+v", defaultResult.Profile, vtaResult.Profile)
 	}
@@ -607,8 +607,8 @@ func TestProfileScopedGraphIDsChangeWithEffectiveProfile(t *testing.T) {
 		}
 	}
 
-	linuxProfile := goProfileID("linux", "amd64", "0", []string{"alpha"}, "rta-cha")
-	darwinProfile := goProfileID("darwin", "amd64", "0", []string{"alpha"}, "rta-cha")
+	linuxProfile := goProfileID("linux", "amd64", "0", []string{"alpha"}, "rta-cha", "complete", "snapshot-a")
+	darwinProfile := goProfileID("darwin", "amd64", "0", []string{"alpha"}, "rta-cha", "complete", "snapshot-a")
 	if profileScopedID("file", "workspace", linuxProfile, "example.com/profiled", "main.go") == profileScopedID("file", "workspace", darwinProfile, "example.com/profiled", "main.go") {
 		t.Fatal("host target changes did not affect a profile-scoped file ID")
 	}
