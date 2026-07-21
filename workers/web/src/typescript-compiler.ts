@@ -59,7 +59,7 @@ export const TYPESCRIPT_COMPILER_PROFILE_PROPERTIES = Object.freeze({
     ? "core-attested-whole-tree"
     : "build-produced-pending-core-attestation",
   typescript_release_gate: TYPESCRIPT_RELEASE_GATE,
-  typescript_semantic_graph_emission: "definition-import-type-call-graph-v1",
+  typescript_semantic_graph_emission: "definition-import-type-call-graph-v2",
   typescript_compiler_processes: "1",
   typescript_project_filesystem: "isolated-virtual",
 } as const);

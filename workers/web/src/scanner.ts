@@ -32,7 +32,11 @@ import type {
   TypeScriptRawDependencySite,
   TypeScriptRawDependencyTarget,
 } from "./typescript-dependencies";
-import { validateTypeScriptRawDependencyDelta } from "./typescript-dependencies";
+import {
+  TYPESCRIPT_CLOSED_LOCAL_CALL_FLOW_ALGORITHM,
+  TYPESCRIPT_CLOSED_LOCAL_FRESH_INSTANCE_FLOW_ALGORITHM,
+  validateTypeScriptRawDependencyDelta,
+} from "./typescript-dependencies";
 import {
   ADAPTER_VERSION,
   aggregateConditions,
@@ -811,14 +815,18 @@ class GraphBuilder {
         || !["direct", "static", "private", "fresh_instance", "super", "external", "dynamic", "open"].includes(raw.dispatch)
         || (raw.moduleSpecifier !== null && (raw.moduleSpecifier.length === 0 || raw.moduleSpecifier.length > 2_048))
       ) throw new Error("TypeScript call site has invalid call metadata");
-      if (raw.targets.length !== 1 || raw.targetConditions.length !== 1) {
-        throw new Error("TypeScript call site must contain exactly one target and condition");
+      if (raw.targets.length === 0 || raw.targetConditions.length !== raw.targets.length) {
+        throw new Error("TypeScript call site has no target or unaligned target conditions");
       }
-      if (
-        JSON.stringify(raw.condition) !== JSON.stringify(canonicalizeCondition(raw.condition))
-        || JSON.stringify(raw.targetConditions[0]) !== JSON.stringify(canonicalizeCondition(raw.targetConditions[0]!))
-        || JSON.stringify(raw.condition) !== JSON.stringify(raw.targetConditions[0])
-      ) throw new Error("TypeScript call site and edge conditions disagree");
+      if (JSON.stringify(raw.condition) !== JSON.stringify(canonicalizeCondition(raw.condition))) {
+        throw new Error("TypeScript call site condition is not canonical");
+      }
+      for (const condition of raw.targetConditions) {
+        if (
+          JSON.stringify(condition) !== JSON.stringify(canonicalizeCondition(condition))
+          || JSON.stringify(raw.condition) !== JSON.stringify(condition)
+        ) throw new Error("TypeScript call site and edge conditions disagree");
+      }
       const source = resolveCallSource(raw.source);
       if (source.kind !== "symbol") throw new Error("TypeScript call source is not a symbol");
       const sourcePath = callSourcePath(raw.source);
@@ -832,22 +840,55 @@ class GraphBuilder {
         || raw.evidence.endOffset <= raw.evidence.startOffset
         || raw.evidence.endOffset > evidenceSource.length
       ) throw new Error("TypeScript call evidence has an invalid source span");
-      const target = dependencyTarget(raw.targets[0]!);
+      const concreteTargets = raw.targets.map((target, index) => ({
+        node: dependencyTarget(target),
+        condition: canonicalizeCondition(raw.targetConditions[index]!),
+      })).sort((left, right) => compareById(left.node, right.node));
+      for (let index = 1; index < concreteTargets.length; index += 1) {
+        if (concreteTargets[index - 1]!.node.id === concreteTargets[index]!.node.id) {
+          throw new Error("TypeScript call site repeats a target");
+        }
+      }
+      const targetKinds = new Set(concreteTargets.map(({ node }) => node.kind));
       if (
         (raw.status === "resolved" && (
           raw.precision !== "exact"
           || raw.reason !== null
-          || target.kind !== "symbol"
+          || raw.algorithm !== null
+          || concreteTargets.length !== 1
+          || !targetKinds.has("symbol")
           || !["direct", "static", "private", "fresh_instance", "super"].includes(raw.dispatch)
         ))
+        || (raw.status === "candidates" && (
+          raw.precision !== "overapprox"
+          || raw.reason !== null
+          || typeof raw.algorithm !== "string"
+          || raw.algorithm.length === 0
+          || raw.algorithm.length > 2_048
+          || targetKinds.size !== 1
+          || !targetKinds.has("symbol")
+          || !["dynamic", "fresh_instance"].includes(raw.dispatch)
+          || (raw.dispatch === "dynamic" && (
+            raw.algorithm !== TYPESCRIPT_CLOSED_LOCAL_CALL_FLOW_ALGORITHM
+          ))
+          || (raw.dispatch === "fresh_instance" && (
+            raw.algorithm !== TYPESCRIPT_CLOSED_LOCAL_FRESH_INSTANCE_FLOW_ALGORITHM
+            || !["method", "tagged_template"].includes(raw.callKind)
+            || !["call_expression", "tagged_template"].includes(raw.evidence.occurrenceKind)
+          ))
+        ))
         || (raw.status === "external" && (
-          target.kind !== "external_system"
+          raw.algorithm !== null
+          || concreteTargets.length !== 1
+          || !targetKinds.has("external_system")
           || raw.dispatch !== "external"
           || (raw.precision !== "exact" && raw.precision !== "heuristic")
           || (raw.precision === "exact" ? raw.reason !== null : !raw.reason)
         ))
         || (raw.status === "unresolved" && (
-          target.kind !== "unknown_target"
+          raw.algorithm !== null
+          || concreteTargets.length !== 1
+          || !targetKinds.has("unknown_target")
           || raw.precision !== "heuristic"
           || !raw.reason
           || !["dynamic", "open"].includes(raw.dispatch)
@@ -865,6 +906,7 @@ class GraphBuilder {
         target_basis: raw.evidence.targetBasis,
         call_kind: raw.callKind,
         dispatch: raw.dispatch,
+        ...(raw.algorithm === null ? {} : { algorithm: raw.algorithm }),
         ...(raw.moduleSpecifier === null ? {} : { module_specifier: raw.moduleSpecifier }),
       } as const;
       const primary: Evidence = {
@@ -899,7 +941,7 @@ class GraphBuilder {
         kind: "call",
         specifier: raw.specifier,
         resolution_status: raw.status,
-        target_ids: [target.id],
+        target_ids: concreteTargets.map(({ node }) => node.id),
         profile_id: PROFILE_ID,
         condition: raw.condition,
         precision: raw.precision,
@@ -913,27 +955,30 @@ class GraphBuilder {
       nextSites.set(site.id, existingSite ?? site);
       semanticSites.push(site);
       callSites.push(site);
-      const edge: GraphEdge = {
-        id: stableId("edge", { site_id: siteId, kind: "calls", target: target.id }),
-        source: source.id,
-        target: target.id,
-        kind: "calls",
-        site_id: siteId,
-        phase: "semantic",
-        environment: "any",
-        profile_id: PROFILE_ID,
-        condition: canonicalizeCondition(raw.targetConditions[0]!),
-        resolution_status: raw.status,
-        precision: raw.precision,
-        generated: existingFile(raw.evidence.relativePath).properties.generated === true,
-        evidence: [primary, supporting],
-      };
-      const existingEdge = nextEdges.get(edge.id);
-      if (existingEdge !== undefined && JSON.stringify(existingEdge) !== JSON.stringify(edge)) {
-        throw new Error(`TypeScript dependency delta conflicts with call edge ${edge.id}`);
+      const edgeKind = raw.status === "candidates" ? "may_call" : "calls";
+      for (const { node: target, condition } of concreteTargets) {
+        const edge: GraphEdge = {
+          id: stableId("edge", { site_id: siteId, kind: edgeKind, target: target.id }),
+          source: source.id,
+          target: target.id,
+          kind: edgeKind,
+          site_id: siteId,
+          phase: "semantic",
+          environment: "any",
+          profile_id: PROFILE_ID,
+          condition,
+          resolution_status: raw.status,
+          precision: raw.precision,
+          generated: existingFile(raw.evidence.relativePath).properties.generated === true,
+          evidence: [primary, supporting],
+        };
+        const existingEdge = nextEdges.get(edge.id);
+        if (existingEdge !== undefined && JSON.stringify(existingEdge) !== JSON.stringify(edge)) {
+          throw new Error(`TypeScript dependency delta conflicts with call edge ${edge.id}`);
+        }
+        nextEdges.set(edge.id, existingEdge ?? edge);
+        semanticEdges.push(edge);
       }
-      nextEdges.set(edge.id, existingEdge ?? edge);
-      semanticEdges.push(edge);
       const counts = coverageDeltas.get(raw.evidence.relativePath) ?? { resolved: 0, candidates: 0, external: 0, unresolved: 0 };
       counts[raw.status] += 1;
       coverageDeltas.set(raw.evidence.relativePath, counts);

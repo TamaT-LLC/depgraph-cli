@@ -80,7 +80,7 @@ test("worker emits deterministic protocol graph without executing project code",
       typescript_standard_library_source: "bundled",
       typescript_standard_library_integrity: "build-produced-pending-core-attestation",
       typescript_release_gate: "release-gate-pending",
-      typescript_semantic_graph_emission: "definition-import-type-call-graph-v1",
+      typescript_semantic_graph_emission: "definition-import-type-call-graph-v2",
       project_code_executed: "false",
     },
   );
@@ -183,7 +183,7 @@ test("worker emits deterministic protocol graph without executing project code",
   assert.ok(semanticNodes.some((node) => node.kind === "type" && node.properties.type_kind === "generic_instance"));
   assert.deepEqual([...new Set(definitionEdges.map((edge) => edge.kind))].sort(), ["declares", "extends", "implements", "instantiates"]);
   assert.deepEqual([...new Set(semanticSites.map((site) => site.kind))].sort(), ["call", "type_use", "web_import", "web_reexport"]);
-  assert.deepEqual([...new Set(dependencySemanticEdges.map((edge) => edge.kind))].sort(), ["calls", "imports", "reexports", "type_uses"]);
+  assert.deepEqual([...new Set(dependencySemanticEdges.map((edge) => edge.kind))].sort(), ["calls", "imports", "may_call", "reexports", "type_uses"]);
   assert.ok(moduleInitializers.length > 0);
   assert.ok(moduleInitializers.every((node) => (
     node.properties.generated === true
@@ -193,30 +193,38 @@ test("worker emits deterministic protocol graph without executing project code",
   )));
   assert.deepEqual(
     [...new Set(semanticCallSites.map((site) => site.resolution_status))].sort(),
-    ["external", "resolved", "unresolved"],
+    ["candidates", "external", "resolved", "unresolved"],
   );
   assert.ok(semanticCallSites.every((site) => (
-    site.target_ids.length === 1
-    && site.resolution_status !== "candidates"
-    && site.precision !== "overapprox"
+    site.target_ids.length >= 1
     && nodeById.get(site.source)?.kind === "symbol"
     && site.evidence[0]?.properties.analysis_mode === "semantic-import-type-call-graph"
     && typeof site.evidence[0]?.properties.call_kind === "string"
     && typeof site.evidence[0]?.properties.dispatch === "string"
+    && (site.resolution_status !== "candidates" || (
+      site.precision === "overapprox"
+      && typeof site.evidence[0]?.properties.algorithm === "string"
+    ))
   )));
   for (const site of semanticCallSites) {
-    const target = nodeById.get(site.target_ids[0]);
-    assert.equal(target?.kind, site.resolution_status === "resolved"
-      ? "symbol"
-      : site.resolution_status === "external"
-        ? "external_system"
-        : "unknown_target");
+    const targets = (site.target_ids as string[]).map((targetId: string) => nodeById.get(targetId));
+    if (site.resolution_status === "candidates") {
+      assert.ok(targets.every((target: { kind?: string } | undefined) => target?.kind === "symbol"));
+    } else {
+      assert.equal(targets[0]?.kind, site.resolution_status === "resolved"
+        ? "symbol"
+        : site.resolution_status === "external"
+          ? "external_system"
+          : "unknown_target");
+    }
     const callEdges = dependencySemanticEdges.filter((edge) => edge.site_id === site.id);
-    assert.equal(callEdges.length, 1);
-    assert.equal(callEdges[0]?.kind, "calls");
-    assert.deepEqual(callEdges[0]?.condition, site.condition);
+    assert.equal(callEdges.length, site.target_ids.length);
+    assert.ok(callEdges.every((edge) => (
+      edge.kind === (site.resolution_status === "candidates" ? "may_call" : "calls")
+      && JSON.stringify(edge.condition) === JSON.stringify(site.condition)
+    )));
   }
-  assert.ok(!edges.some((edge) => edge.kind === "may_call"));
+  assert.ok(edges.some((edge) => edge.kind === "may_call"));
   assert.ok(definitionEdges.every((edge) => edge.resolution_status === "resolved" && edge.precision === "exact"));
   assert.ok(semanticEdges.every((edge) => edge.evidence[0]?.kind === "semantic" && edge.evidence[0]?.properties.profile_id === profile.id));
   assert.ok(semanticSites.every((site) => site.evidence[1]?.kind === "source"));
@@ -1045,7 +1053,7 @@ test("TypeChecker definition graph resolves inventory modules and bundled stdlib
   assert.equal(profile?.properties.typescript_project_model_status, "ready");
   assert.equal(profile?.properties.typescript_typechecker_status, "definition-import-type-call-graph-emitted");
   assert.equal(profile?.properties.typescript_definition_graph_status, "ready");
-  assert.equal(profile?.properties.typescript_semantic_graph_emission, "definition-import-type-call-graph-v1");
+  assert.equal(profile?.properties.typescript_semantic_graph_emission, "definition-import-type-call-graph-v2");
   assert.equal(profile?.properties.typescript_project_root_files, "2");
   assert.ok(Number(profile?.properties.typescript_typechecker_queries) > 1);
   assert.equal(profile?.properties.typescript_static_config_files, "1");

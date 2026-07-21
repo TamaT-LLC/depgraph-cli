@@ -1907,7 +1907,7 @@ fn verify_packaged_web_import_type_call_graph(executable: &Path, store: &Path) -
         ("typescript_definition_graph_status", "ready"),
         (
             "typescript_semantic_graph_emission",
-            "definition-import-type-call-graph-v1",
+            "definition-import-type-call-graph-v2",
         ),
         ("typescript_semantic_issue_count", "0"),
         ("typescript_release_gate", "release-gate-verified"),
@@ -1995,9 +1995,11 @@ fn verify_packaged_web_import_type_call_graph(executable: &Path, store: &Path) -
         .filter_map(|site| site["resolution_status"].as_str())
         .collect();
     if definition_kinds != BTreeSet::from(["declares", "extends", "implements", "instantiates"])
-        || dependency_kinds != BTreeSet::from(["calls", "imports", "reexports", "type_uses"])
+        || dependency_kinds
+            != BTreeSet::from(["calls", "imports", "may_call", "reexports", "type_uses"])
         || site_kinds != BTreeSet::from(["call", "type_use", "web_import", "web_reexport"])
-        || !BTreeSet::from(["external", "resolved", "unresolved"]).is_subset(&statuses)
+        || !BTreeSet::from(["candidates", "external", "resolved", "unresolved"])
+            .is_subset(&statuses)
         || !statuses.is_subset(&BTreeSet::from([
             "candidates",
             "external",
@@ -2008,7 +2010,7 @@ fn verify_packaged_web_import_type_call_graph(executable: &Path, store: &Path) -
             .iter()
             .any(|edge| edge["resolution_status"] != "resolved" || edge["precision"] != "exact")
     {
-        bail!("packaged Web export violated the definition-import-type-call-graph-v1 vocabulary");
+        bail!("packaged Web export violated the definition-import-type-call-graph-v2 vocabulary");
     }
     for edge in &semantic_edges {
         if !evidence.iter().any(|item| {
@@ -2040,8 +2042,9 @@ fn verify_packaged_web_import_type_call_graph(executable: &Path, store: &Path) -
     let mut saw_exact_constructor = false;
     let mut saw_exact_method = false;
     let mut saw_external_call = false;
-    let mut saw_dynamic_unresolved_call = false;
-    let mut saw_open_unresolved_call = false;
+    let mut saw_closed_local_function_candidate = false;
+    let mut saw_multiple_closed_local_function_candidate = false;
+    let mut saw_closed_fresh_instance_candidate = false;
     for site in &semantic_sites {
         let site_id = site["id"]
             .as_str()
@@ -2163,6 +2166,7 @@ fn verify_packaged_web_import_type_call_graph(executable: &Path, store: &Path) -
                 .get("dispatch")
                 .and_then(Value::as_str)
                 .context("packaged Web call site omitted dispatch")?;
+            let algorithm = evidence_properties.get("algorithm").and_then(Value::as_str);
             if type_only.is_some()
                 || imported_name.is_some()
                 || resolution_mode.is_some()
@@ -2182,7 +2186,18 @@ fn verify_packaged_web_import_type_call_graph(executable: &Path, store: &Path) -
                         | "dynamic"
                         | "open"
                 )
-                || status == "candidates"
+                || (status == "candidates"
+                    && (precision != "overapprox"
+                        || !site["reason"].is_null()
+                        || !matches!(
+                            (dispatch, algorithm),
+                            ("dynamic", Some("typescript-closed-local-call-flow-v1"))
+                                | (
+                                    "fresh_instance",
+                                    Some("typescript-closed-local-fresh-instance-flow-v1")
+                                )
+                        )))
+                || (status != "candidates" && algorithm.is_some())
             {
                 bail!("packaged Web call site {site_id} has invalid call metadata");
             }
@@ -2208,16 +2223,25 @@ fn verify_packaged_web_import_type_call_graph(executable: &Path, store: &Path) -
                 && specifier == "value.trim"
                 && dispatch == "external"
                 && status == "external";
-            saw_dynamic_unresolved_call |= acceptance_fixture
+            saw_closed_local_function_candidate |= acceptance_fixture
                 && specifier == "dynamicTarget"
                 && dispatch == "dynamic"
-                && status == "unresolved"
-                && site["reason"] == "function_value_dispatch";
-            saw_open_unresolved_call |= acceptance_fixture
-                && specifier == "receiver.directMethod"
-                && dispatch == "open"
-                && status == "unresolved"
-                && site["reason"] == "open_method_dispatch";
+                && status == "candidates"
+                && precision == "overapprox"
+                && algorithm == Some("typescript-closed-local-call-flow-v1");
+            saw_multiple_closed_local_function_candidate |= acceptance_fixture
+                && specifier == "conditionalTarget"
+                && dispatch == "dynamic"
+                && status == "candidates"
+                && precision == "overapprox"
+                && target_ids.len() == 2
+                && algorithm == Some("typescript-closed-local-call-flow-v1");
+            saw_closed_fresh_instance_candidate |= acceptance_fixture
+                && specifier == "candidateReceiver.closedMethod"
+                && dispatch == "fresh_instance"
+                && status == "candidates"
+                && precision == "overapprox"
+                && algorithm == Some("typescript-closed-local-fresh-instance-flow-v1");
         } else {
             let type_only = type_only
                 .context("packaged Web import/type semantic site omitted boolean type_only")?;
@@ -2300,6 +2324,7 @@ fn verify_packaged_web_import_type_call_graph(executable: &Path, store: &Path) -
             "web_import" => "imports",
             "web_reexport" => "reexports",
             "type_use" => "type_uses",
+            "call" if status == "candidates" => "may_call",
             "call" => "calls",
             _ => bail!("packaged Web semantic site {site_id} has unsupported kind {kind}"),
         };
@@ -2397,12 +2422,13 @@ fn verify_packaged_web_import_type_call_graph(executable: &Path, store: &Path) -
                 .and_then(|source| nodes_by_id.get(source))
                 .context("packaged Web call site source symbol is missing")?;
             if source["kind"] != "symbol"
-                || (status == "resolved"
-                    && (target_ids
-                        .first()
-                        .and_then(|target| nodes_by_id.get(target))
-                        .is_none_or(|target| target["kind"] != "symbol")
-                        || !site["reason"].is_null()))
+                || (matches!(status, "resolved" | "candidates")
+                    && target_ids.iter().any(|target| {
+                        nodes_by_id
+                            .get(target)
+                            .is_none_or(|target| target["kind"] != "symbol")
+                    }))
+                || ((status == "resolved" || status == "candidates") && !site["reason"].is_null())
             {
                 bail!("packaged Web call site {site_id} has a non-canonical source or callee");
             }
@@ -2463,11 +2489,12 @@ fn verify_packaged_web_import_type_call_graph(executable: &Path, store: &Path) -
         || !saw_exact_constructor
         || !saw_exact_method
         || !saw_external_call
-        || !saw_dynamic_unresolved_call
-        || !saw_open_unresolved_call
+        || !saw_closed_local_function_candidate
+        || !saw_multiple_closed_local_function_candidate
+        || !saw_closed_fresh_instance_candidate
     {
         bail!(
-            "packaged Web call fixture did not cover exact direct/function/method/constructor, external, dynamic, and open-dispatch ledger cases"
+            "packaged Web call fixture did not cover exact direct/function/method/constructor, external, or closed local single/multiple-target candidate call cases"
         );
     }
     for (property, actual) in [
@@ -2590,6 +2617,103 @@ fn verify_packaged_web_import_type_call_graph(executable: &Path, store: &Path) -
             || !query_contains_edge(&semantic_why)
         {
             bail!("packaged Web queries lost the exact {label} edge or its evidence");
+        }
+    }
+
+    let multiple_candidate_site = semantic_sites
+        .iter()
+        .find(|site| {
+            site["kind"] == "call"
+                && site["specifier"] == "conditionalTarget"
+                && site["resolution_status"] == "candidates"
+                && site["precision"] == "overapprox"
+                && site["target_ids"]
+                    .as_array()
+                    .is_some_and(|targets| targets.len() == 2)
+        })
+        .context("packaged Web graph has no two-target closed local call candidate")?;
+    let multiple_candidate_site_id = multiple_candidate_site["id"]
+        .as_str()
+        .context("packaged Web two-target candidate omitted its site ID")?;
+    let multiple_candidate_edges: Vec<_> = dependency_edges
+        .iter()
+        .copied()
+        .filter(|edge| edge["site_id"] == multiple_candidate_site_id)
+        .collect();
+    if multiple_candidate_edges.len() != 2
+        || multiple_candidate_edges.iter().any(|edge| {
+            edge["kind"] != "may_call"
+                || edge["resolution_status"] != "candidates"
+                || edge["precision"] != "overapprox"
+        })
+    {
+        bail!("packaged Web two-target candidate lost its per-target may_call edges");
+    }
+    let multiple_candidate_source_selector = format!(
+        "id:{}",
+        multiple_candidate_site["source"]
+            .as_str()
+            .context("packaged Web two-target candidate omitted its source")?
+    );
+    let multiple_candidate_deps = packaged_web_query(
+        executable,
+        store,
+        &["deps", &multiple_candidate_source_selector, "--json"],
+        "query packaged Web two-target candidate dependencies",
+    )?;
+    let candidate_query_contains_edge = |query: &Value, edge_id: &str| {
+        query["data"]["steps"].as_array().is_some_and(|steps| {
+            steps.iter().any(|step| {
+                step["edge"]["id"] == edge_id
+                    && step["edge"]["kind"] == "may_call"
+                    && step["edge"]["phase"] == "semantic"
+                    && step["edge"]["resolution_status"] == "candidates"
+                    && step["evidence"].as_array().is_some_and(|items| {
+                        items.iter().any(|item| {
+                            item["kind"] == "semantic"
+                                && item["extractor"] == "typescript-native-typechecker"
+                                && item["properties"]["algorithm"]
+                                    == "typescript-closed-local-call-flow-v1"
+                        })
+                    })
+            })
+        })
+    };
+    for candidate_edge in multiple_candidate_edges {
+        let candidate_edge_id = candidate_edge["id"]
+            .as_str()
+            .context("packaged Web two-target candidate edge omitted its ID")?;
+        let candidate_target_selector = format!(
+            "id:{}",
+            candidate_edge["target"]
+                .as_str()
+                .context("packaged Web two-target candidate edge omitted its target")?
+        );
+        let candidate_dependents = packaged_web_query(
+            executable,
+            store,
+            &["dependents", &candidate_target_selector, "--json"],
+            "query packaged Web two-target candidate dependents",
+        )?;
+        let candidate_why = packaged_web_query(
+            executable,
+            store,
+            &[
+                "why",
+                &multiple_candidate_source_selector,
+                &candidate_target_selector,
+                "--json",
+            ],
+            "explain a packaged Web two-target candidate dependency",
+        )?;
+        if !candidate_query_contains_edge(&multiple_candidate_deps, candidate_edge_id)
+            || !candidate_query_contains_edge(&candidate_dependents, candidate_edge_id)
+            || candidate_why["data"]["path_found"] != true
+            || !candidate_query_contains_edge(&candidate_why, candidate_edge_id)
+        {
+            bail!(
+                "packaged Web queries lost a two-target may_call candidate edge or its algorithm evidence"
+            );
         }
     }
 

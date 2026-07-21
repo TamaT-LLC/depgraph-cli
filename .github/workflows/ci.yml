@@ -105,7 +105,7 @@ jobs:
               and .properties.typescript_project_model_status == "ready"
               and .properties.typescript_typechecker_status == "definition-import-type-call-graph-emitted"
               and .properties.typescript_definition_graph_status == "ready"
-              and .properties.typescript_semantic_graph_emission == "definition-import-type-call-graph-v1"
+              and .properties.typescript_semantic_graph_emission == "definition-import-type-call-graph-v2"
               and .properties.typescript_semantic_issue_count == "0"
               and (.properties.typescript_semantic_node_count | tonumber) == ($semantic_nodes | length)
               and (.properties.typescript_semantic_relation_count | tonumber) == ($semantic_edges | length)
@@ -115,13 +115,14 @@ jobs:
             and ($graph.nodes | any(.kind == "type" and .properties.type_kind == "generic_instance"))
             and ([$definition_edges[].kind] | unique | sort
               == ["declares", "extends", "implements", "instantiates"])
-            and ([$dependency_edges[].kind] | unique | sort == ["calls", "imports", "reexports", "type_uses"])
+            and ([$dependency_edges[].kind] | unique | sort == ["calls", "imports", "may_call", "reexports", "type_uses"])
             and ([$semantic_sites[].kind] | unique | sort == ["call", "type_use", "web_import", "web_reexport"])
             and ($semantic_sites | all(
               .resolution_status == "resolved" or .resolution_status == "candidates"
               or .resolution_status == "external" or .resolution_status == "unresolved"
             ))
             and ($semantic_sites | any(.resolution_status == "resolved"))
+            and ($semantic_sites | any(.resolution_status == "candidates"))
             and ($semantic_sites | any(.resolution_status == "external"))
             and ($semantic_sites | any(.resolution_status == "unresolved"))
             and ($semantic_site_evidence | any(.properties.type_only == true))
@@ -148,7 +149,16 @@ jobs:
                   and (if ($primary.properties | has("module_specifier")) then
                     ($primary.properties.module_specifier | type == "string")
                   else true end)
-                  and $site.resolution_status != "candidates"
+                  and (if $site.resolution_status == "candidates" then
+                    $site.precision == "overapprox"
+                    and $site.reason == null
+                    and (($primary.properties.dispatch == "dynamic"
+                          and $primary.properties.algorithm == "typescript-closed-local-call-flow-v1")
+                      or ($primary.properties.dispatch == "fresh_instance"
+                          and $primary.properties.algorithm == "typescript-closed-local-fresh-instance-flow-v1"))
+                  else
+                    ($primary.properties | has("algorithm") | not)
+                  end)
                 else
                   ($primary.properties.type_only | type == "boolean")
                   and (if $site.kind == "web_import" then
@@ -209,7 +219,8 @@ jobs:
                   and (.target as $target | $site.target_ids | index($target))
                   and .kind == (if $site.kind == "web_import" then "imports"
                     elif $site.kind == "web_reexport" then "reexports"
-                    elif $site.kind == "type_use" then "type_uses" else "calls" end)
+                    elif $site.kind == "type_use" then "type_uses"
+                    elif $site.resolution_status == "candidates" then "may_call" else "calls" end)
                 ))
                 and (if $site.resolution_status == "resolved" then
                   ($site.target_ids | length) == 1 and $site.precision == "exact"
@@ -277,10 +288,9 @@ jobs:
                   .owner_type == "site" and .owner_id == $site.id and .ordinal == 0
                   and .kind == "semantic" and .extractor == "typescript-native-typechecker"
                 )] | first) as $primary
-              | {site: $site, primary: $primary}
+              | {site: $site, primary: $primary, linked: [$graph.edges[] | select(.site_id == $site.id)]}
             ] as $calls
-            | ($calls | all(.site.resolution_status != "candidates"))
-              and ($graph.edges | any(.kind == "may_call") | not)
+            | ($graph.edges | any(.phase == "semantic" and .kind == "may_call"))
               and ($calls | any(
                 .primary.path == "apps/shared/src/calls.ts"
                 and .site.specifier == "directTarget"
@@ -309,15 +319,39 @@ jobs:
               ))
               and ($calls | any(
                 .primary.path == "apps/shared/src/calls.ts"
-                and .site.specifier == "dynamicTarget" and .site.resolution_status == "unresolved"
-                and .site.reason == "function_value_dispatch"
+                and .site.specifier == "dynamicTarget" and .site.resolution_status == "candidates"
+                and .site.precision == "overapprox" and .site.reason == null
                 and .primary.properties.dispatch == "dynamic"
+                and .primary.properties.algorithm == "typescript-closed-local-call-flow-v1"
               ))
               and ($calls | any(
                 .primary.path == "apps/shared/src/calls.ts"
-                and .site.specifier == "receiver.directMethod" and .site.resolution_status == "unresolved"
-                and .site.reason == "open_method_dispatch"
-                and .primary.properties.dispatch == "open"
+                and .site.specifier == "candidateReceiver.closedMethod" and .site.resolution_status == "candidates"
+                and .site.precision == "overapprox" and .site.reason == null
+                and .primary.properties.dispatch == "fresh_instance"
+                and .primary.properties.algorithm == "typescript-closed-local-fresh-instance-flow-v1"
+              ))
+              and ($calls | any(
+                . as $call
+                | .primary.path == "apps/shared/src/calls.ts"
+                and .site.specifier == "conditionalTarget" and .site.resolution_status == "candidates"
+                and .site.precision == "overapprox" and .site.reason == null
+                and (.site.target_ids | length) == 2
+                and .site.target_ids == (.site.target_ids | sort)
+                and .primary.properties.dispatch == "dynamic"
+                and .primary.properties.algorithm == "typescript-closed-local-call-flow-v1"
+                and ($call.linked | length) == 2
+                and ($call.linked | all(
+                  . as $edge
+                  | .kind == "may_call" and .site_id == $call.site.id
+                    and .resolution_status == "candidates" and .precision == "overapprox"
+                    and (.target as $target | $call.site.target_ids | index($target))
+                    and ($graph.evidence | any(
+                      .owner_type == "edge" and .owner_id == $edge.id and .ordinal == 0
+                      and .kind == "semantic" and .extractor == "typescript-native-typechecker"
+                      and .properties.algorithm == "typescript-closed-local-call-flow-v1"
+                    ))
+                ))
               ))
           ' "$tmp/one.json"
           jq -e '.graph as $graph
@@ -449,7 +483,7 @@ jobs:
           if ($profile.properties.typescript_definition_graph_status -ne 'ready') { throw 'TypeChecker definition graph was not ready' }
           if ($profile.properties.typescript_semantic_issue_count -ne '0') { throw 'TypeChecker import/type/call graph reported semantic issues' }
           if ($profile.properties.typescript_release_gate -ne 'release-gate-pending') { throw 'Direct worker spoofed release attestation' }
-          if ($profile.properties.typescript_semantic_graph_emission -ne 'definition-import-type-call-graph-v1') { throw 'Semantic graph emission capability changed unexpectedly' }
+          if ($profile.properties.typescript_semantic_graph_emission -ne 'definition-import-type-call-graph-v2') { throw 'Semantic graph emission capability changed unexpectedly' }
           $semanticNodes = @($events | Where-Object { $_.node.kind -eq 'symbol' -or $_.node.kind -eq 'type' })
           $nodeKinds = @{}
           $nodesById = @{}
@@ -477,12 +511,12 @@ jobs:
           $definitionKinds = @($definitionEdges | ForEach-Object { $_.edge.kind } | Sort-Object -Unique)
           if (($definitionKinds -join ',') -ne 'declares,extends,implements,instantiates') { throw "Definition relation kinds drifted: $($definitionKinds -join ',')" }
           $dependencyKinds = @($dependencyEdges | ForEach-Object { $_.edge.kind } | Sort-Object -Unique)
-          if (($dependencyKinds -join ',') -ne 'calls,imports,reexports,type_uses') { throw "Semantic dependency kinds drifted: $($dependencyKinds -join ',')" }
+          if (($dependencyKinds -join ',') -ne 'calls,imports,may_call,reexports,type_uses') { throw "Semantic dependency kinds drifted: $($dependencyKinds -join ',')" }
           $siteKinds = @($semanticSites | ForEach-Object { $_.kind } | Sort-Object -Unique)
           if (($siteKinds -join ',') -ne 'call,type_use,web_import,web_reexport') { throw "Semantic site kinds drifted: $($siteKinds -join ',')" }
           $statuses = @($semanticSites | ForEach-Object { $_.resolution_status } | Sort-Object -Unique)
           $unexpectedStatuses = @($statuses | Where-Object { $_ -notin @('resolved', 'candidates', 'external', 'unresolved') })
-          if ($unexpectedStatuses.Count -ne 0 -or $statuses -notcontains 'resolved' -or
+          if ($unexpectedStatuses.Count -ne 0 -or $statuses -notcontains 'resolved' -or $statuses -notcontains 'candidates' -or
               $statuses -notcontains 'external' -or $statuses -notcontains 'unresolved') {
             throw "Semantic site statuses drifted: $($statuses -join ',')"
           }
@@ -495,7 +529,7 @@ jobs:
             $linked = @($dependencyEdges | Where-Object { $_.edge.site_id -eq $site.id })
             if ($linked.Count -ne $site.target_ids.Count) { throw "Semantic site/edge cardinality drifted for $($site.id)" }
             if (($site.target_ids -join ',') -ne (($site.target_ids | Sort-Object) -join ',')) { throw "Semantic targets are not sorted for $($site.id)" }
-            $expectedKind = if ($site.kind -eq 'web_import') { 'imports' } elseif ($site.kind -eq 'web_reexport') { 'reexports' } elseif ($site.kind -eq 'type_use') { 'type_uses' } else { 'calls' }
+            $expectedKind = if ($site.kind -eq 'web_import') { 'imports' } elseif ($site.kind -eq 'web_reexport') { 'reexports' } elseif ($site.kind -eq 'type_use') { 'type_uses' } elseif ($site.resolution_status -eq 'candidates') { 'may_call' } else { 'calls' }
             $occurrenceKind = $site.evidence[0].properties.occurrence_kind
             $typeOnly = $site.evidence[0].properties.type_only
             $allowedOccurrences = switch ($site.kind) {
@@ -517,7 +551,13 @@ jobs:
                   $evidenceProperties.call_kind -notin @('function', 'method', 'constructor', 'tagged_template') -or
                   $evidenceProperties.dispatch -notin @('direct', 'static', 'private', 'fresh_instance', 'super', 'external', 'dynamic', 'open') -or
                   ($evidencePropertyNames -contains 'module_specifier' -and $evidenceProperties.module_specifier -isnot [string]) -or
-                  $site.resolution_status -eq 'candidates' -or $nodeKinds[$site.source] -ne 'symbol') {
+                  ($site.resolution_status -eq 'candidates' -and (
+                    $site.precision -ne 'overapprox' -or $null -ne $site.reason -or
+                    -not (($evidenceProperties.dispatch -eq 'dynamic' -and $evidenceProperties.algorithm -eq 'typescript-closed-local-call-flow-v1') -or
+                          ($evidenceProperties.dispatch -eq 'fresh_instance' -and $evidenceProperties.algorithm -eq 'typescript-closed-local-fresh-instance-flow-v1'))
+                  )) -or
+                  ($site.resolution_status -ne 'candidates' -and $evidencePropertyNames -contains 'algorithm') -or
+                  $nodeKinds[$site.source] -ne 'symbol') {
                 throw "Call metadata drifted for $($site.id)"
               }
             } else {
@@ -618,9 +658,9 @@ jobs:
                   $nodeKinds[$target] -ne 'type') {
                 throw "Concrete type-use site targeted $($nodeKinds[$target])"
               }
-              if ($site.kind -eq 'call' -and $site.resolution_status -eq 'resolved' -and
+              if ($site.kind -eq 'call' -and $site.resolution_status -in @('resolved', 'candidates') -and
                   $nodeKinds[$target] -ne 'symbol') {
-                throw "Exact call site targeted $($nodeKinds[$target])"
+                throw "Concrete call site targeted $($nodeKinds[$target])"
               }
               if ($occurrenceKind -in @(
                     'namespace_import', 'side_effect_import', 'empty_import', 'import_equals', 'require_call',
@@ -657,15 +697,39 @@ jobs:
               $_.evidence[0].properties.dispatch -eq 'external'
             })) { throw 'Call fixture omitted external call ledger entry' }
           if (-not ($fixtureCalls | Where-Object {
-              $_.specifier -eq 'dynamicTarget' -and $_.resolution_status -eq 'unresolved' -and
-              $_.reason -eq 'function_value_dispatch' -and $_.evidence[0].properties.dispatch -eq 'dynamic'
-            })) { throw 'Call fixture omitted dynamic unresolved ledger entry' }
+              $_.specifier -eq 'dynamicTarget' -and $_.resolution_status -eq 'candidates' -and
+              $_.precision -eq 'overapprox' -and $null -eq $_.reason -and
+              $_.evidence[0].properties.dispatch -eq 'dynamic' -and
+              $_.evidence[0].properties.algorithm -eq 'typescript-closed-local-call-flow-v1'
+            })) { throw 'Call fixture omitted closed local function candidate' }
           if (-not ($fixtureCalls | Where-Object {
-              $_.specifier -eq 'receiver.directMethod' -and $_.resolution_status -eq 'unresolved' -and
-              $_.reason -eq 'open_method_dispatch' -and $_.evidence[0].properties.dispatch -eq 'open'
-            })) { throw 'Call fixture omitted open-dispatch unresolved ledger entry' }
-          if ($semanticEdges | Where-Object { $_.edge.kind -eq 'may_call' }) {
-            throw 'Web exact-call slice emitted forbidden may_call edges'
+              $_.specifier -eq 'candidateReceiver.closedMethod' -and $_.resolution_status -eq 'candidates' -and
+              $_.precision -eq 'overapprox' -and $null -eq $_.reason -and
+              $_.evidence[0].properties.dispatch -eq 'fresh_instance' -and
+              $_.evidence[0].properties.algorithm -eq 'typescript-closed-local-fresh-instance-flow-v1'
+            })) { throw 'Call fixture omitted closed fresh-instance candidate' }
+          $multipleCandidateCalls = @($fixtureCalls | Where-Object {
+              $_.specifier -eq 'conditionalTarget' -and $_.resolution_status -eq 'candidates' -and
+              $_.precision -eq 'overapprox' -and $null -eq $_.reason -and $_.target_ids.Count -eq 2 -and
+              $_.evidence[0].properties.dispatch -eq 'dynamic' -and
+              $_.evidence[0].properties.algorithm -eq 'typescript-closed-local-call-flow-v1'
+            })
+          if ($multipleCandidateCalls.Count -ne 1) { throw 'Call fixture omitted two-target closed local candidate' }
+          $multipleCandidate = $multipleCandidateCalls[0]
+          if (($multipleCandidate.target_ids -join ',') -ne (($multipleCandidate.target_ids | Sort-Object) -join ',')) {
+            throw 'Two-target candidate targets were not sorted'
+          }
+          $multipleCandidateEdges = @($dependencyEdges | Where-Object { $_.edge.site_id -eq $multipleCandidate.id })
+          if ($multipleCandidateEdges.Count -ne 2 -or ($multipleCandidateEdges | Where-Object {
+                $_.edge.kind -ne 'may_call' -or $_.edge.site_id -ne $multipleCandidate.id -or
+                $_.edge.resolution_status -ne 'candidates' -or $_.edge.precision -ne 'overapprox' -or
+                $_.edge.target -notin $multipleCandidate.target_ids -or
+                $_.edge.evidence[0].properties.algorithm -ne 'typescript-closed-local-call-flow-v1'
+              })) {
+            throw 'Two-target candidate lost same-site may_call edges or algorithm provenance'
+          }
+          if (-not ($semanticEdges | Where-Object { $_.edge.kind -eq 'may_call' })) {
+            throw 'Web candidate-call slice omitted may_call edges'
           }
           if (-not ($semanticSites | Where-Object { $_.evidence[0].properties.occurrence_kind -eq 'empty_import' })) {
             throw 'Semantic sites omitted empty_import acceptance fixture'
