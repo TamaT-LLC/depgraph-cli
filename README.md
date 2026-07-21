@@ -11,10 +11,11 @@ The MVP implements the architecture described in [the system design](docs/40_arc
 - Cargo workspace/package/target/dependency and Rust file/module/import/re-export,
   HIR symbol/type/type-use, exact call, and conservative candidate call sites
 - Go workspace/module/package variant/file/import, symbol/type/direct call/candidate call, build constraint, test, embed, generated, vendor, and cgo sites
-- npm/pnpm/Yarn/Bun workspace/package/file and ESM/CJS/type-only/dynamic import sites
-- Next.js App/Pages filesystem routes
-- Astro pages/endpoints and frontmatter imports
-- TanStack file routes and existing generated route trees
+- npm/pnpm/Yarn/Bun workspace/package/file plus TypeScript/JavaScript symbol/type/import/re-export/type-use, exact call, and conservative candidate call sites
+- Next.js App/Pages routes, route components, render and parent-route relations, client/server boundaries, and statically resolvable dynamic components
+- Astro pages/endpoints, component render relations, hydration boundaries, frontmatter imports, content collections, and assets
+- TanStack Router file/code/virtual routes, generated route trees, loaders, `beforeLoad`, lazy routes, context, and route masks
+- TanStack Start server functions, RPC relations, server routes, and middleware chains
 
 Rust HIR final fallback/coverage handling is complete. A profile claims
 `semantic-complete` only when syntax coverage is complete, the exact compatible
@@ -122,6 +123,12 @@ Failed/partial scans and diagnostics remain stored, but only a complete policy-p
 - `workers/rust`, `workers/go`, `workers/web`: ecosystem-native safe static adapters
 - `xtask`: reproducible build, full quality checks, release archives, checksums, SBOM, and license inventory
 
-Run `cargo xtask package` to create a native archive under `dist/`. Release archives place `depgraph` under `bin/`, compatible workers under `libexec/`, and include a checksum-verified release manifest, protocol schema, SPDX SBOM, and third-party license inventory. The release gate fixes Rust/Cargo `1.93.1`; the Rust worker manifest records the linked backend unit, rust-analyzer `0.0.330` at revision `8954b66d43225e62c92e8bbcc8500191b5cceb1e` with Salsa `0.26.1`. The Web worker manifest records the exact TypeScript version, the complete Web semantic capability set, and its Astro and TypeScript runtime components.
+Run `cargo xtask package` to create a native archive under `dist/`. Release archives place `depgraph` under `bin/`, compatible workers under `libexec/`, and include the project's complete `LICENSE-MIT` and `LICENSE-APACHE` texts, a checksum-verified release manifest, protocol schema, SPDX SBOM, and a separate third-party license inventory. The release manifest declares `MIT OR Apache-2.0` and attests both project license files independently from `THIRD_PARTY_LICENSES.txt`. The release gate fixes Rust/Cargo `1.93.1`; the Rust worker manifest records the linked backend unit, rust-analyzer `0.0.330` at revision `8954b66d43225e62c92e8bbcc8500191b5cceb1e` with Salsa `0.26.1`. The Web worker manifest records the exact TypeScript version, the complete Web semantic capability set, and its Astro and TypeScript runtime components.
 
-The package verifier extracts the archive and validates the manifest, every artifact and runtime component, Rust and Web worker handshakes, per-framework scan/query/export E2E, cross-checkout JSON/DOT/Mermaid determinism, and the complete runtime SBOM and license closure. Missing, added, modified, symlinked, or version-mismatched Web worker, Astro parser, TypeScript compiler, or schema input fails before worker launch. Runtime components distinguish an `executable-tree` with an executable entrypoint from a `data-tree` whose entrypoint is optional. No sysroot or `rust-src` is currently bundled, and packaged scans never fall back implicitly to project or system backend/sysroot bytes. Tier 1 Linux/macOS package gates and Windows safety/determinism smoke cover the Web semantic archive contract.
+The package verifier extracts the archive and validates the manifest, both project licenses, every artifact and runtime component, Rust and Web worker handshakes, per-framework scan/query/export E2E, cross-checkout JSON/DOT/Mermaid determinism, and the complete runtime SBOM and third-party license closure. Missing, added, modified, symlinked, or version-mismatched license, Web worker, Astro parser, TypeScript compiler, or schema input fails before worker launch. Runtime components distinguish an `executable-tree` with an executable entrypoint from a `data-tree` whose entrypoint is optional. No sysroot or `rust-src` is currently bundled, and packaged scans never fall back implicitly to project or system backend/sysroot bytes. Tier 1 Linux/macOS package gates and Windows safety/determinism smoke cover the Web semantic archive contract.
+
+## License
+
+Licensed under either [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE) at your option.
+
+Copyright (c) 2026 TamaT LLC.

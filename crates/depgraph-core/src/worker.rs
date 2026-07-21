@@ -84,6 +84,8 @@ const TYPESCRIPT_MAX_DISPLAY_NAME_CHARS: usize = 512;
 const TYPESCRIPT_MAX_RESOLVER_IDENTITY_CHARS: usize = 4_096;
 const WEB_RUNTIME_REQUIREMENT: &str = "Node.js >=24.0.0";
 const PROTOCOL_SCHEMA_PATH: &str = "schemas/depgraph-protocol-v1.schema.json";
+const PROJECT_LICENSE_EXPRESSION: &str = "MIT OR Apache-2.0";
+const PROJECT_LICENSE_PATHS: [&str; 2] = ["LICENSE-APACHE", "LICENSE-MIT"];
 const WEB_SEMANTIC_CAPABILITIES: &[&str] = &[
     "astro-component-render-hydration-v1",
     "framework-semantic-completeness-v1",
@@ -310,6 +312,8 @@ struct BundledManifest {
     protocol_version: String,
     schema_version: String,
     target: String,
+    license_expression: String,
+    project_licenses: Vec<BundledArtifact>,
     core: BundledArtifact,
     schema: BundledArtifact,
     #[serde(default)]
@@ -441,6 +445,32 @@ fn locate_verified_bundled_worker_for_executable(
         bail!(
             "security policy violation: release manifest has an incompatible schema or empty target"
         );
+    }
+    if manifest.license_expression != PROJECT_LICENSE_EXPRESSION {
+        bail!(
+            "security policy violation: release manifest project license expression must be {PROJECT_LICENSE_EXPRESSION}"
+        );
+    }
+    if manifest.project_licenses.len() != PROJECT_LICENSE_PATHS.len() {
+        bail!(
+            "security policy violation: release manifest must contain exactly the project license files"
+        );
+    }
+    let project_licenses = manifest
+        .project_licenses
+        .iter()
+        .map(|artifact| (artifact.path.as_str(), artifact))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    if project_licenses.len() != PROJECT_LICENSE_PATHS.len() {
+        bail!(
+            "security policy violation: release manifest contains a duplicate project license path"
+        );
+    }
+    for path in PROJECT_LICENSE_PATHS {
+        let artifact = project_licenses.get(path).with_context(|| {
+            format!("security policy violation: release manifest is missing project license {path}")
+        })?;
+        verify_bundled_artifact(&release_root, artifact, "project license")?;
     }
 
     let expected_core_path = format!("bin/{}", executable_name("depgraph"));
@@ -6040,6 +6070,9 @@ mod tests {
         let web_worker_path = "libexec/depgraph-web-worker.mjs";
         let core = write_manifest_artifact(release, &core_path, b"verified core")?;
         let schema = write_manifest_artifact(release, PROTOCOL_SCHEMA_PATH, b"verified schema")?;
+        let apache_license =
+            write_manifest_artifact(release, "LICENSE-APACHE", b"test Apache-2.0 license")?;
+        let mit_license = write_manifest_artifact(release, "LICENSE-MIT", b"test MIT license")?;
         let rust_worker =
             write_manifest_artifact(release, &rust_worker_path, b"verified rust worker")?;
         let go_worker = write_manifest_artifact(release, &go_worker_path, b"verified go worker")?;
@@ -6055,6 +6088,8 @@ mod tests {
                 "protocol_version": "1.0",
                 "schema_version": "1.0",
                 "target": "test-target",
+                "license_expression": PROJECT_LICENSE_EXPRESSION,
+                "project_licenses": [apache_license, mit_license],
                 "core": core,
                 "schema": schema,
                 "runtime_artifacts": runtime_artifacts,
@@ -7905,6 +7940,41 @@ mod tests {
                 .to_string()
                 .contains("checksum mismatch")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn bundled_workers_require_exact_project_license_metadata_and_files() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        for mutation in ["expression", "declaration", "missing", "tampered"] {
+            let release = temp.path().join(mutation);
+            let test_release = write_test_release_manifest(&release, Vec::new(), Vec::new())?;
+            match mutation {
+                "expression" => update_test_manifest(&test_release.manifest, |manifest| {
+                    manifest["license_expression"] = Value::String("MIT".to_owned());
+                    Ok(())
+                })?,
+                "declaration" => update_test_manifest(&test_release.manifest, |manifest| {
+                    manifest["project_licenses"]
+                        .as_array_mut()
+                        .context("test manifest has no project licenses")?
+                        .pop();
+                    Ok(())
+                })?,
+                "missing" => std::fs::remove_file(release.join("LICENSE-MIT"))?,
+                "tampered" => std::fs::write(release.join("LICENSE-APACHE"), b"tampered")?,
+                _ => unreachable!(),
+            }
+
+            let error = locate_verified_bundled_worker(AdapterKind::Go, &test_release.manifest)
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("project license")
+                    || error.to_string().contains("checksum mismatch"),
+                "{mutation}: {error:#}"
+            );
+            assert!(is_security_error(&error.to_string()));
+        }
         Ok(())
     }
 

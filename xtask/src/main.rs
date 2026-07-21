@@ -17,6 +17,11 @@ mod go_semantic_e2e;
 mod rust_semantic_e2e;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+const PROJECT_LICENSE_EXPRESSION: &str = "MIT OR Apache-2.0";
+const PROJECT_LICENSES: &[(&str, &[u8])] = &[
+    ("LICENSE-APACHE", include_bytes!("../../LICENSE-APACHE")),
+    ("LICENSE-MIT", include_bytes!("../../LICENSE-MIT")),
+];
 const SBOM_SCOPE: &str = "Scope: package-manager component boundary; system runtimes/toolchains and dependencies embedded inside upstream prebuilt packages are not recursively enumerated.";
 const RUST_ANALYZER_CRATE_VERSION: &str = "0.0.330";
 const RUST_ANALYZER_REVISION: &str = "8954b66d43225e62c92e8bbcc8500191b5cceb1e";
@@ -72,6 +77,8 @@ struct ReleaseManifest {
     protocol_version: String,
     schema_version: String,
     target: String,
+    license_expression: String,
+    project_licenses: Vec<Artifact>,
     core: Artifact,
     schema: Artifact,
     runtime_artifacts: Vec<Artifact>,
@@ -197,7 +204,97 @@ fn build(release: bool) -> Result<()> {
     Ok(())
 }
 
+fn verify_project_metadata(root: &Path) -> Result<()> {
+    let web_package: Value =
+        serde_json::from_slice(&fs::read(root.join("workers/web/package.json"))?)?;
+    if web_package["name"] != "@depgraph/web-worker"
+        || web_package["version"] != VERSION
+        || web_package["packageManager"] != "pnpm@10.33.0"
+        || web_package["engines"]["node"] != ">=24.0.0"
+    {
+        bail!("Web package version/runtime metadata is not synchronized with release {VERSION}");
+    }
+
+    let go_model = fs::read_to_string(root.join("workers/go/internal/worker/model.go"))?;
+    let web_types = fs::read_to_string(root.join("workers/web/src/types.ts"))?;
+    if quoted_assignment(&go_model, "AdapterVersion").as_deref() != Some(VERSION)
+        || quoted_assignment(&web_types, "ADAPTER_VERSION").as_deref() != Some(VERSION)
+    {
+        bail!("Go/Web adapter versions must match Cargo release version {VERSION}");
+    }
+
+    let go_mod = fs::read_to_string(root.join("workers/go/go.mod"))?;
+    let rust_toolchain = fs::read_to_string(root.join("rust-toolchain.toml"))?;
+    let rust_worker = fs::read_to_string(root.join("workers/rust/Cargo.toml"))?;
+    if !go_mod.lines().any(|line| line.trim() == "go 1.26.1")
+        || !rust_toolchain
+            .lines()
+            .any(|line| line.trim() == "channel = \"1.93.1\"")
+        || !rust_worker
+            .lines()
+            .any(|line| line.trim() == "version.workspace = true")
+    {
+        bail!("Rust/Go worker baseline or workspace version metadata is not synchronized");
+    }
+
+    let readme = fs::read_to_string(root.join("README.md"))?;
+    let design = fs::read_to_string(
+        root.join("docs/40_arch_design/arch-dependency-graph-cli-system-design.md"),
+    )?;
+    for required in [
+        "Rust 1.93.1, Go 1.26.1, Node.js 24.18.0, and pnpm 10.33.0",
+        "TypeScript/JavaScript symbol/type/import/re-export/type-use",
+        "[the system design](docs/40_arch_design/arch-dependency-graph-cli-system-design.md)",
+        "[MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE)",
+    ] {
+        if !readme.contains(required) {
+            bail!("README release metadata is missing {required:?}");
+        }
+    }
+    for required in [
+        "updated: 2026-07-22",
+        "| Product / Rust / Go / Web adapter | `0.1.0` |",
+        "Issue #55ではこのWeb semantic compatibility unitをrelease manifest",
+    ] {
+        if !design.contains(required) {
+            bail!("system design release metadata is missing {required:?}");
+        }
+    }
+    for (path, expected) in PROJECT_LICENSES {
+        let actual = fs::read(root.join(path))?;
+        if actual != *expected {
+            bail!("project license source {path} differs from its compiled release input");
+        }
+    }
+    for link in [
+        "docs/40_arch_design/arch-dependency-graph-cli-system-design.md",
+        "LICENSE-MIT",
+        "LICENSE-APACHE",
+    ] {
+        if !root.join(link).is_file() {
+            bail!("README local documentation link does not resolve: {link}");
+        }
+    }
+    Ok(())
+}
+
+fn quoted_assignment(source: &str, name: &str) -> Option<String> {
+    source.lines().find_map(|line| {
+        let (left, right) = line.split_once('=')?;
+        left.split_whitespace().any(|token| token == name).then(|| {
+            right
+                .trim()
+                .trim_end_matches(';')
+                .trim_end_matches("as const")
+                .trim()
+                .trim_matches('"')
+                .to_owned()
+        })
+    })
+}
+
 fn test() -> Result<()> {
+    verify_project_metadata(&workspace_root())?;
     let cargo = cargo_metadata(&["--features", "depgraph-cli/packaged"])?;
     verify_rust_analyzer_dependencies(&cargo)?;
     run(Command::new("cargo").args(["fmt", "--all", "--", "--check"]))?;
@@ -248,6 +345,7 @@ fn test() -> Result<()> {
 
 fn package() -> Result<()> {
     verify_release_tag()?;
+    verify_project_metadata(&workspace_root())?;
     build(true)?;
     // The distributed CLI must never fall back to development worker
     // overrides when its signed layout is incomplete.
@@ -275,6 +373,15 @@ fn package() -> Result<()> {
     fs::create_dir_all(staging.join("bin"))?;
     fs::create_dir_all(staging.join("libexec"))?;
     fs::create_dir_all(staging.join("schemas"))?;
+
+    let mut project_licenses = Vec::new();
+    for (path, _) in PROJECT_LICENSES {
+        copy(Path::new(path), &staging.join(path))?;
+        project_licenses.push(Artifact {
+            path: (*path).to_owned(),
+            sha256: sha256_file(&staging.join(path))?,
+        });
+    }
 
     let release_dir = cargo_target_dir().join("release");
     copy(
@@ -339,6 +446,8 @@ fn package() -> Result<()> {
         protocol_version: "1.0".to_owned(),
         schema_version: "1.0".to_owned(),
         target: target.clone(),
+        license_expression: PROJECT_LICENSE_EXPRESSION.to_owned(),
+        project_licenses,
         core: Artifact {
             path: relative_slash(&staging, &core_path)?,
             sha256: sha256_file(&core_path)?,
@@ -1383,6 +1492,7 @@ fn verify_archive(archive: &Path, name: &str) -> Result<()> {
     let fixture = Path::new("workers/web/test/fixtures/polyglot").canonicalize()?;
     let first_web_store = verify_root.join("web.db");
     verify_packaged_scan(&executable, &first_web_store, &fixture, "web")?;
+    verify_packaged_project_licenses_fail_closed(&executable, &extracted, &verify_root, &fixture)?;
     for marker in [
         fixture.join("apps/next-app/NEXT_CONFIG_EXECUTED"),
         fixture.join("apps/astro-app/ASTRO_CONFIG_EXECUTED"),
@@ -1449,6 +1559,37 @@ fn verify_archive(archive: &Path, name: &str) -> Result<()> {
     Ok(())
 }
 
+fn verify_packaged_project_licenses_fail_closed(
+    executable: &Path,
+    extracted: &Path,
+    verify_root: &Path,
+    fixture: &Path,
+) -> Result<()> {
+    for (name, original) in PROJECT_LICENSES {
+        let path = extracted.join(name);
+        fs::remove_file(&path)?;
+        verify_packaged_security_failure(
+            executable,
+            &verify_root.join(format!("project-license-missing-{name}.db")),
+            fixture,
+            &format!("missing project license {name}"),
+        )?;
+        fs::write(&path, original)?;
+
+        let mut tampered = original.to_vec();
+        tampered.extend_from_slice(b"\ntampered\n");
+        fs::write(&path, tampered)?;
+        verify_packaged_security_failure(
+            executable,
+            &verify_root.join(format!("project-license-tampered-{name}.db")),
+            fixture,
+            &format!("tampered project license {name}"),
+        )?;
+        fs::write(&path, original)?;
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 fn verify_release_static_prelaunch_fails_closed(extracted: &Path) -> Result<()> {
     let manifest_path = extracted.join("release-manifest.json");
@@ -1483,6 +1624,23 @@ fn verify_release_static_prelaunch_fails_closed(extracted: &Path) -> Result<()> 
         let mut manifest = baseline.clone();
         manifest.schema = manifest.core.clone();
         cases.push(("schema path mismatch", manifest));
+
+        let mut manifest = baseline.clone();
+        manifest.license_expression = "MIT".to_owned();
+        cases.push(("project license expression mismatch", manifest));
+
+        let mut manifest = baseline.clone();
+        manifest.project_licenses.pop();
+        cases.push(("missing project license declaration", manifest));
+
+        let mut manifest = baseline.clone();
+        let duplicate = manifest
+            .project_licenses
+            .first()
+            .cloned()
+            .context("release manifest has no project license")?;
+        manifest.project_licenses.push(duplicate);
+        cases.push(("duplicate project license declaration", manifest));
 
         let mut manifest = baseline.clone();
         manifest
@@ -4729,6 +4887,8 @@ fn verify_release_metadata(extracted: &Path) -> Result<ReleaseManifest> {
     }
     for required in [
         "release-manifest.json",
+        "LICENSE-APACHE",
+        "LICENSE-MIT",
         "THIRD_PARTY_LICENSES.txt",
         "sbom.spdx.json",
         "schemas/depgraph-protocol-v1.schema.json",
@@ -4749,6 +4909,29 @@ fn verify_release_metadata(extracted: &Path) -> Result<ReleaseManifest> {
         || manifest.target.trim().is_empty()
     {
         bail!("release manifest has an incompatible release compatibility unit");
+    }
+    if manifest.license_expression != PROJECT_LICENSE_EXPRESSION {
+        bail!("release manifest project license expression must be {PROJECT_LICENSE_EXPRESSION}");
+    }
+    if manifest.project_licenses.len() != PROJECT_LICENSES.len() {
+        bail!("release manifest must contain exactly the project license files");
+    }
+    let project_licenses = manifest
+        .project_licenses
+        .iter()
+        .map(|artifact| (artifact.path.as_str(), artifact))
+        .collect::<BTreeMap<_, _>>();
+    if project_licenses.len() != PROJECT_LICENSES.len() {
+        bail!("release manifest contains a duplicate project license path");
+    }
+    for (path, expected) in PROJECT_LICENSES {
+        let artifact = project_licenses
+            .get(path)
+            .with_context(|| format!("release manifest is missing project license {path}"))?;
+        let verified = verify_release_artifact(extracted, artifact, "project license")?;
+        if fs::read(&verified)? != *expected {
+            bail!("release project license {path} differs from the declared source text");
+        }
     }
     let expected_core_path = format!("bin/{}", executable_name("depgraph"));
     if manifest.core.path != expected_core_path {
@@ -5564,9 +5747,10 @@ mod tests {
         WEB_SEMANTIC_RUNTIME_ARTIFACTS, WEB_SEMANTIC_RUNTIME_COMPONENTS, WebSemanticAttestation,
         WorkerBackend, archive_entries, cargo_runtime_packages, create_tar_archive,
         create_zip_archive, extract_archive, normalized_spdx_license, package_url,
-        parse_worker_handshake, rust_backend_from_handshake, verify_release_tag_values,
-        verify_rust_analyzer_dependencies, verify_rust_backend, verify_web_semantic_attestation,
-        web_runtime_packages, web_semantic_from_handshake,
+        parse_worker_handshake, rust_backend_from_handshake, verify_project_metadata,
+        verify_release_tag_values, verify_rust_analyzer_dependencies, verify_rust_backend,
+        verify_web_semantic_attestation, web_runtime_packages, web_semantic_from_handshake,
+        workspace_root,
     };
 
     fn release_tree() -> Result<(tempfile::TempDir, String)> {
@@ -5584,6 +5768,11 @@ mod tests {
             fs::set_permissions(&executable, fs::Permissions::from_mode(0o751))?;
         }
         Ok((temp, name))
+    }
+
+    #[test]
+    fn repository_release_metadata_is_synchronized() -> Result<()> {
+        verify_project_metadata(&workspace_root())
     }
 
     #[test]
