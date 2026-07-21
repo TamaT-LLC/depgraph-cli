@@ -559,6 +559,7 @@ test("worker emits deterministic protocol graph without executing project code",
   const authMiddleware = startNodes.find((node) => node.kind === "middleware" && node.display_name === "authMiddleware");
   const auditMiddleware = startNodes.find((node) => node.kind === "middleware" && node.display_name === "auditMiddleware");
   const accountMiddleware = startNodes.find((node) => node.kind === "middleware" && node.display_name === "accountRouteMiddleware");
+  const adminMiddleware = startNodes.find((node) => node.kind === "middleware" && node.display_name === "adminMiddleware");
   const rootMiddleware = startNodes.find((node) => node.kind === "middleware" && node.display_name === "rootMiddleware");
   const breakoutMiddleware = startNodes.find((node) => node.kind === "middleware" && node.properties.middleware_inheritance === "break-out");
   assert.equal(getAccount?.properties.http_method, "GET");
@@ -581,6 +582,7 @@ test("worker emits deterministic protocol graph without executing project code",
     middlewareTargets(accountRoute?.id),
     new Set([accountMiddleware?.id, authMiddleware?.id, rootMiddleware?.id]),
   );
+  assert.ok(!middlewareTargets(accountRoute?.id).has(adminMiddleware?.id));
   assert.deepEqual(middlewareTargets(publicRoute?.id), new Set([breakoutMiddleware?.id, rootMiddleware?.id]));
   assert.ok(startSites.some((site) => (
     site.kind === "uses_middleware"

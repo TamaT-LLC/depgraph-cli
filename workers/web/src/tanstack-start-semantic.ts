@@ -860,6 +860,8 @@ export function collectTanStackStartSemanticDelta(
     const sourceFile = input.sourceFiles.get(record.relativePath);
     const anchor = sourceFile ?? null;
     if (!anchor) continue;
+    const recordOwner = input.ownerForPath(record.relativePath).locator;
+    const recordDirectory = path.posix.dirname(record.relativePath);
     for (const root of rootRoutes) {
       if (root.relativePath === record.relativePath || root.node.properties.package_locator !== record.node.properties.package_locator) continue;
       for (const target of directMiddlewareByPath.get(root.relativePath) ?? []) addRelation(
@@ -894,6 +896,8 @@ export function collectTanStackStartSemanticDelta(
       continue;
     }
     for (const [layoutPath, targets] of directMiddlewareByPath) {
+      if (input.ownerForPath(layoutPath).locator !== recordOwner
+        || path.posix.dirname(layoutPath) !== recordDirectory) continue;
       const layoutStem = path.posix.basename(layoutPath).replace(/\.[^.]+$/u, "");
       if (!layoutStem.startsWith("_") || layoutStem.endsWith("_") || !basename.startsWith(`${layoutStem}.`)) continue;
       for (const target of targets) addRelation(
