@@ -184,7 +184,8 @@ function validSourceKind(kind: string, source: GraphNode): boolean {
   if (kind === "renders") return source.kind === "component" || source.kind === "route";
   if (["hydrates", "client_boundary", "server_boundary"].includes(kind)) return source.kind === "component";
   if (kind === "route_entry") return ["file", "symbol", "component", "server_function"].includes(source.kind);
-  if (["parent_route", "loads", "before_load"].includes(kind)) return source.kind === "route";
+  if (kind === "loads") return source.kind === "component" || source.kind === "route";
+  if (["parent_route", "before_load"].includes(kind)) return source.kind === "route";
   if (["navigates_to", "masks_to", "rpc_call"].includes(kind)) return ["component", "route", "symbol"].includes(source.kind);
   if (kind === "client_stub_for") return source.kind === "symbol";
   if (kind === "handled_by" || kind === "uses_middleware") return source.kind === "route" || source.kind === "server_function";
@@ -194,7 +195,8 @@ function validSourceKind(kind: string, source: GraphNode): boolean {
 function validTargetKind(kind: string, target: GraphNode): boolean {
   if (["renders", "hydrates", "client_boundary", "server_boundary"].includes(kind)) return target.kind === "component";
   if (["route_entry", "parent_route", "navigates_to", "masks_to"].includes(kind)) return target.kind === "route";
-  if (kind === "loads" || kind === "before_load") return target.kind === "symbol" || target.kind === "server_function";
+  if (kind === "loads") return target.kind === "file" || target.kind === "symbol" || target.kind === "server_function";
+  if (kind === "before_load") return target.kind === "symbol" || target.kind === "server_function";
   if (kind === "rpc_call" || kind === "client_stub_for") return target.kind === "server_function";
   if (kind === "handled_by") return target.kind === "symbol";
   if (kind === "uses_middleware") return target.kind === "middleware";

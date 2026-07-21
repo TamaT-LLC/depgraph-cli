@@ -373,7 +373,8 @@ framework dependency siteとedgeは同じkindを使用し、semantic site 1件�
 | `hydrates`, `client_boundary`, `server_boundary` | `component` | `component` | 不可 |
 | `route_entry` | `file` / `symbol` / `component` / `server_function` | `route` | 不可 |
 | `parent_route` | `route` | `route` | 可 |
-| `loads`, `before_load` | `route` | `symbol` / `server_function` | 可 |
+| `loads` | `component` / `route` | `file` / `symbol` / `server_function` | 可 |
+| `before_load` | `route` | `symbol` / `server_function` | 可 |
 | `navigates_to`, `masks_to` | `component` / `route` / `symbol` | `route` | 可 |
 | `rpc_call` | `component` / `route` / `symbol` | `server_function` | 可 |
 | `client_stub_for` | `symbol` | `server_function` | 不可 |
@@ -739,11 +740,13 @@ build scan では Next Adapter API を observer として利用し、final confi
 
 ### 11.3 Astro
 
-- `@astrojs/compiler` で `.astro` AST を取得する
-- frontmatter は TypeScript adapter へ渡す
-- template tag を import symbol へ結び `renders` edge を生成する
-- `client:*`、`client:only`、`server:defer` を environment edge として保持する
-- filesystem route、endpoint、content collection、asset を解析する
+Issue #51でAstroのsafe-scan sliceを実装済みである。`@astrojs/compiler` 4.0.0のASTとinventory済みbytesだけを使用し、project-local compiler、integration、configをload / executeせず次のgraphを生成する。
+
+- `.astro` fileをcanonical server `component`へ昇格し、filesystem pageをcanonical `route`と双方向の`route_entry` / `renders`で結ぶ。`.ts` / `.js` endpointはbundled TypeScript TypeCheckerのmodule export proofからHTTP method symbolを選び、`handled_by`へ結ぶ。source-phase filesystem route graphは互換性のため別に保持する。
+- frontmatter importは既存source import graphへ一度だけ保持する。template component tagはfrontmatterのdefault / named / namespace bindingと相関し、`.astro` / Markdown componentまたはTypeChecker-confirmed TS / JS exportをcanonical component targetにする。immutable `const`の静的なternary、`||`、`??`だけは有限な`candidates`としてalgorithm付きで保持し、open / missing / computed flowはreason付き`unresolved`とdiagnosticへ残す。
+- `client:load`、`client:idle`、`client:visible`、`client:media`、`client:only`をbrowser condition付き`hydrates` / `client_boundary`として保持する。`client:only`のrender自体もbrowser environmentとし、`server:defer`はserver condition付き`server_boundary`にする。複数environment directiveや候補集合をexact hydrationへ昇格しない。
+- static asset importをcomponent-to-file `loads`として保持する。`getCollection` / `getEntry`のliteral collection / entryを`src/content` inventoryへ結び、collectionは有限なfile candidate集合、entryはexact fileとする。非literal、unsafe path、missing entryはunknown targetとreasonを持つ`unresolved`にする。このためframework semantic graph v1の`loads`は`component` / `route` sourceと`file` / `symbol` / `server_function` targetを許可する。
+- Astro compiler diagnostic、frontmatter parser failure、component resolution failureをcoverage / diagnostic ledgerから落とさない。collector delta全体をframework semantic graph v1 validatorへ通してからsource / TypeScript graphへatomic unionし、profileのnode / site / edge countはNext.jsを含む全emitted frameworkの実測合計を申告する。
 
 build scan では observer integration と Vite plugin を用い、resolved config、injected route、client / SSR module graph、emitted asset を取得する。
 

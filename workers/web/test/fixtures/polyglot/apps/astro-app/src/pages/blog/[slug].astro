@@ -1,5 +1,22 @@
 ---
-import Card from "../../components/Card.astro";
+import Card from "../../components/Card.astro"
+import Alternative from "../../components/Alternative.astro"
+import Deferred from "../../components/Deferred.astro"
+import Interactive from "../../components/Interactive.tsx"
+import Missing from "../../components/Missing.astro"
+import hero from "../../assets/hero.svg"
+import { getCollection, getEntry } from "astro:content"
 const title = "Astro";
+const Dynamic = title ? Card : Alternative
+const posts = await getCollection("posts");
+const firstPost = await getEntry("posts", "one");
 ---
 <Card>{title}</Card>
+<Interactive client:load />
+<Interactive client:media="(min-width: 40rem)" />
+<Interactive client:only="react" />
+<Interactive client:load server:defer />
+<Deferred server:defer />
+<Dynamic />
+<Missing />
+<img src={hero.src} alt={firstPost?.data.title ?? `${posts.length} posts`} />

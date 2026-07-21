@@ -123,6 +123,44 @@ test("validated framework semantic delta is merged into cloned syntax maps", () 
   assert.equal(merged.edges.size, 1);
 });
 
+test("Astro resource loads accept component-to-file endpoints", () => {
+  const resource: GraphNode = {
+    id: "file:astro-resource",
+    kind: "file",
+    locator: "file://src/assets/hero.svg",
+    display_name: "src/assets/hero.svg",
+    properties: { path: "src/assets/hero.svg" },
+  };
+  const delta = fixture();
+  const site = delta.sites[0]!;
+  const edge = delta.edges[0]!;
+  site.kind = "loads";
+  site.specifier = "../assets/hero.svg";
+  site.target_ids = [resource.id];
+  site.id = stableId("site", {
+    condition: site.condition,
+    kind: site.kind,
+    path: site.evidence[0]!.path,
+    profile_id: profileId,
+    source: site.source,
+    span: { start_line: 1, start_column: 1, end_line: 1, end_column: 32 },
+  });
+  edge.kind = site.kind;
+  edge.target = resource.id;
+  edge.site_id = site.id;
+  edge.id = stableId("edge", { kind: edge.kind, site_id: site.id, target: resource.id });
+
+  const merged = mergeFrameworkSemanticDelta(
+    new Map([[resource.id, resource]]),
+    new Map(),
+    new Map(),
+    delta,
+    { profileId, capability: WEB_FRAMEWORK_SEMANTIC_CAPABILITY },
+  );
+  assert.equal(merged.sites.get(site.id)?.target_ids[0], resource.id);
+  assert.equal(merged.edges.get(edge.id)?.target, resource.id);
+});
+
 test("unapproved capability and invalid endpoints fail atomically", () => {
   const syntaxNode: GraphNode = {
     id: "file:syntax", kind: "file", locator: "file://app.tsx", display_name: "app.tsx", properties: {},

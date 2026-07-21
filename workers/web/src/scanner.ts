@@ -18,6 +18,7 @@ import {
   WEB_FRAMEWORK_SEMANTIC_CAPABILITY,
   type FrameworkSemanticDelta,
 } from "./framework-semantic";
+import { collectAstroSemanticDelta } from "./astro-semantic";
 import { collectNextSemanticDelta } from "./next-semantic";
 import {
   analyzeTypeScriptProject,
@@ -1928,6 +1929,7 @@ export async function scan(root: string, allFiles: string[], inventoryIssues: Fi
   // repository path, raw project config, node_modules, or package metadata.
   const sourceCache = new Map<string, string | null>();
   const compilerSources = new Map<string, string>();
+  const astroSources = new Map<string, string>();
   const compilerFiles = sourceFiles.filter((file) => TYPESCRIPT_SOURCE_EXTENSIONS.has(path.extname(file).toLowerCase()));
   // Each confined read performs a realpath check followed by the actual file
   // read. Bound the fan-out so large repositories do not serialize tens of
@@ -2022,6 +2024,7 @@ export async function scan(root: string, allFiles: string[], inventoryIssues: Fi
       });
       continue;
     }
+    if (extension === ".astro") astroSources.set(relative, source);
     const typeOnlyRanges = nativeTypeScript.typeOnlyDependencyRanges.get(relative) ?? [];
     const extraction = typeOnlyRanges.length === 0
       ? precompilerExtractions.get(relative) ?? extractDependencies(file, relative, source)
@@ -2147,16 +2150,23 @@ export async function scan(root: string, allFiles: string[], inventoryIssues: Fi
     nativeTypeScript.project.semanticCallSites = 0;
   }
 
-  let frameworkSemantic: ScanModel["frameworkSemantic"] = {
-    status: "not-emitted",
-    nodes: 0,
-    sites: 0,
-    edges: 0,
-    emittedFrameworks: [],
-    pendingFrameworks: routeDiscovery.frameworks,
+  const frameworkCounts = { nodes: 0, sites: 0, edges: 0 };
+  const emittedFrameworks = new Set<string>();
+  let frameworkAttempted = false;
+  const mergeFrameworkResult = (
+    framework: string,
+    result: { delta: FrameworkSemanticDelta; diagnostics: Array<Omit<Diagnostic, "id">> },
+  ): void => {
+    const counts = graph.mergeFrameworkSemanticGraph(result.delta);
+    frameworkCounts.nodes += counts.nodes;
+    frameworkCounts.sites += counts.sites;
+    frameworkCounts.edges += counts.edges;
+    for (const diagnostic of result.diagnostics) graph.addDiagnostic(diagnostic);
+    emittedFrameworks.add(framework);
   };
   const nextEntries = routeDiscovery.entries.filter((entry) => entry.framework === "next");
   if (nextEntries.length > 0) {
+    frameworkAttempted = true;
     if (semanticGraphEmitted && nativeTypeScript.project.definitionGraphStatus === "ready") {
       try {
         const result = collectNextSemanticDelta({
@@ -2170,23 +2180,8 @@ export async function scan(root: string, allFiles: string[], inventoryIssues: Fi
           owner: (entry) => owningPackage(workspace, entry.absoluteFile),
           unknownTarget: () => graph.unknownNode(),
         });
-        const counts = graph.mergeFrameworkSemanticGraph(result.delta);
-        for (const diagnostic of result.diagnostics) graph.addDiagnostic(diagnostic);
-        frameworkSemantic = {
-          status: "emitted",
-          ...counts,
-          emittedFrameworks: ["next"],
-          pendingFrameworks: routeDiscovery.frameworks.filter((framework) => framework !== "next"),
-        };
+        mergeFrameworkResult("next", result);
       } catch (error) {
-        frameworkSemantic = {
-          status: "discarded",
-          nodes: 0,
-          sites: 0,
-          edges: 0,
-          emittedFrameworks: [],
-          pendingFrameworks: routeDiscovery.frameworks,
-        };
         graph.addDiagnostic({
           severity: "warning",
           code: "web.next_semantic_delta_discarded",
@@ -2197,14 +2192,6 @@ export async function scan(root: string, allFiles: string[], inventoryIssues: Fi
         });
       }
     } else {
-      frameworkSemantic = {
-        status: "discarded",
-        nodes: 0,
-        sites: 0,
-        edges: 0,
-        emittedFrameworks: [],
-        pendingFrameworks: routeDiscovery.frameworks,
-      };
       graph.addDiagnostic({
         severity: "warning",
         code: "web.next_semantic_typechecker_unavailable",
@@ -2215,6 +2202,47 @@ export async function scan(root: string, allFiles: string[], inventoryIssues: Fi
       });
     }
   }
+  const astroEntries = routeDiscovery.entries.filter((entry) => entry.framework === "astro");
+  if (astroEntries.length > 0) {
+    frameworkAttempted = true;
+    try {
+      const result = await collectAstroSemanticDelta({
+        root,
+        entries: astroEntries,
+        sources: astroSources,
+        inventoryFiles: allFiles.map((file) => normalizeRelative(path.relative(root, file))).sort(compareUtf8),
+        definitions: nativeTypeScript.definitionGraph,
+        dependencies: nativeTypeScript.dependencyGraph,
+        definitionNode: (key) => graph.typeScriptDefinitionNode(key),
+        fileNode: (relativePath) => graph.fileNode(path.resolve(root, relativePath)),
+        owner: (entry) => owningPackage(workspace, entry.absoluteFile),
+        ownerForPath: (relativePath) => owningPackage(workspace, path.resolve(root, relativePath)),
+        resolveImport: async (relativePath, dependency) => {
+          const absoluteFile = path.resolve(root, relativePath);
+          return await resolver.resolve(dependency, absoluteFile, owningPackage(workspace, absoluteFile));
+        },
+        targetNode: (target) => graph.targetNode(target),
+        unknownTarget: () => graph.unknownNode(),
+      });
+      mergeFrameworkResult("astro", result);
+    } catch (error) {
+      graph.addDiagnostic({
+        severity: "warning",
+        code: "web.astro_semantic_delta_discarded",
+        message: `Astro framework semantic graph was discarded atomically after contract validation failed; syntax and TypeScript semantic graphs were preserved: ${error instanceof Error ? error.message : String(error)}`.slice(0, 2_048),
+        path: null,
+        profile_id: PROFILE_ID,
+        properties: { framework_semantic_issue: true },
+      });
+    }
+  }
+  const emitted = [...emittedFrameworks].sort(compareUtf8);
+  const frameworkSemantic: ScanModel["frameworkSemantic"] = {
+    status: emitted.length > 0 ? "emitted" : frameworkAttempted ? "discarded" : "not-emitted",
+    ...frameworkCounts,
+    emittedFrameworks: emitted,
+    pendingFrameworks: routeDiscovery.frameworks.filter((framework) => !emittedFrameworks.has(framework)),
+  };
 
   const routeNodesByGroup = new Map<string, Map<string, { node: GraphNode; evidence: Evidence }>>();
   for (const entry of routeDiscovery.entries) {

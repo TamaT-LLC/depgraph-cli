@@ -241,21 +241,31 @@ test("worker emits deterministic protocol graph without executing project code",
   assert.ok(semanticEdges.every((edge) => edge.evidence[0]?.kind === "semantic" && edge.evidence[0]?.properties.profile_id === profile.id));
   assert.ok(semanticSites.every((site) => site.evidence[1]?.kind === "source"));
 
-  const frameworkNodes = nodes.filter((node) => (
+  const allFrameworkNodes = nodes.filter((node) => (
+    node.properties.canonical_identity?.framework === "next"
+    || node.properties.canonical_identity?.framework === "astro"
+  ));
+  const allFrameworkSites = sites.filter((site) => (
+    site.evidence[0]?.properties?.contract_version === "framework-semantic-graph-v1"
+  ));
+  const allFrameworkEdges = edges.filter((edge) => (
+    edge.evidence[0]?.properties?.contract_version === "framework-semantic-graph-v1"
+  ));
+  const frameworkNodes = allFrameworkNodes.filter((node) => (
     node.properties.framework === "next"
     && node.properties.canonical_identity?.framework === "next"
   ));
-  const frameworkSites = sites.filter((site) => (
+  const frameworkSites = allFrameworkSites.filter((site) => (
     site.evidence[0]?.properties?.contract_version === "framework-semantic-graph-v1"
     && site.evidence[0]?.properties?.framework === "next"
   ));
-  const frameworkEdges = edges.filter((edge) => (
+  const frameworkEdges = allFrameworkEdges.filter((edge) => (
     edge.evidence[0]?.properties?.contract_version === "framework-semantic-graph-v1"
     && edge.evidence[0]?.properties?.framework === "next"
   ));
-  assert.equal(Number(profile?.properties.web_framework_semantic_node_count), frameworkNodes.length);
-  assert.equal(Number(profile?.properties.web_framework_semantic_site_count), frameworkSites.length);
-  assert.equal(Number(profile?.properties.web_framework_semantic_edge_count), frameworkEdges.length);
+  assert.equal(Number(profile?.properties.web_framework_semantic_node_count), allFrameworkNodes.length);
+  assert.equal(Number(profile?.properties.web_framework_semantic_site_count), allFrameworkSites.length);
+  assert.equal(Number(profile?.properties.web_framework_semantic_edge_count), allFrameworkEdges.length);
   assert.deepEqual(
     [...new Set(frameworkNodes.map((node) => node.kind))].sort(),
     ["component", "route"],
@@ -361,6 +371,113 @@ test("worker emits deterministic protocol graph without executing project code",
   assert.ok(diagnostics.some((diagnostic) => (
     diagnostic.code === "web.next_dynamic_import_unresolved"
     && /supported direct/u.test(diagnostic.message)
+  )));
+
+  const astroNodes = allFrameworkNodes.filter((node) => node.properties.canonical_identity?.framework === "astro");
+  const astroSites = allFrameworkSites.filter((site) => site.evidence[0]?.properties?.framework === "astro");
+  const astroEdges = allFrameworkEdges.filter((edge) => edge.evidence[0]?.properties?.framework === "astro");
+  assert.deepEqual([...new Set(astroNodes.map((node) => node.kind))].sort(), ["component", "route"]);
+  assert.deepEqual(
+    [...new Set(astroEdges.map((edge) => edge.kind))].sort(),
+    ["client_boundary", "handled_by", "hydrates", "loads", "renders", "route_entry", "server_boundary"],
+  );
+  const astroPage = astroNodes.find((node) => (
+    node.kind === "component"
+    && node.properties.source_path === "apps/astro-app/src/pages/blog/[slug].astro"
+  ));
+  const astroCard = astroNodes.find((node) => (
+    node.kind === "component"
+    && node.properties.source_path === "apps/astro-app/src/components/Card.astro"
+  ));
+  const astroAlternative = astroNodes.find((node) => (
+    node.kind === "component"
+    && node.properties.source_path === "apps/astro-app/src/components/Alternative.astro"
+  ));
+  const astroInteractiveServer = astroNodes.find((node) => (
+    node.kind === "component"
+    && node.display_name === "Interactive"
+    && node.properties.environment === "server"
+  ));
+  const astroInteractiveBrowser = astroNodes.find((node) => (
+    node.kind === "component"
+    && node.display_name === "Interactive"
+    && node.properties.environment === "browser"
+  ));
+  assert.equal(astroInteractiveServer?.properties.component_kind, "astro-imported-script-component");
+  assert.equal(typeof astroInteractiveServer?.properties.typescript_definition_id, "string");
+  const exactCardRender = astroEdges.find((edge) => (
+    edge.kind === "renders"
+    && edge.source === astroPage?.id
+    && edge.target === astroCard?.id
+    && edge.evidence[0]?.properties.occurrence_kind === "astro_component_render"
+  ));
+  assert.equal(exactCardRender?.resolution_status, "resolved");
+  assert.equal(exactCardRender?.precision, "exact");
+  assert.equal(exactCardRender?.evidence[0]?.properties.occurrence_kind, "astro_component_render");
+  assert.equal(exactCardRender?.evidence[1]?.kind, "source");
+
+  const hydrationSites = astroSites.filter((site) => site.kind === "hydrates");
+  assert.deepEqual(
+    hydrationSites.map((site) => site.evidence[0]?.properties.directive).sort(),
+    ["client:load", "client:media", "client:only"],
+  );
+  assert.ok(hydrationSites.every((site) => (
+    site.resolution_status === "resolved"
+    && site.precision === "exact"
+    && site.target_ids.length === 1
+    && site.target_ids[0] === astroInteractiveBrowser?.id
+    && /"environment","value":"browser"/u.test(JSON.stringify(site.condition))
+    && /"astro\.directive","value":"client:/u.test(JSON.stringify(site.condition))
+  )));
+  assert.equal(astroEdges.filter((edge) => edge.kind === "client_boundary").length, 3);
+  const deferredBoundary = astroEdges.find((edge) => edge.kind === "server_boundary" && edge.source === astroPage?.id);
+  assert.equal(deferredBoundary?.resolution_status, "resolved");
+  assert.match(JSON.stringify(deferredBoundary?.condition), /"astro\.directive","value":"server:defer"/u);
+
+  const dynamicRender = astroSites.find((site) => site.kind === "renders" && site.specifier === "Dynamic");
+  assert.equal(dynamicRender?.resolution_status, "candidates");
+  assert.equal(dynamicRender?.precision, "overapprox");
+  assert.equal(dynamicRender?.reason, "multiple_closed_frontmatter_component_targets");
+  assert.equal(dynamicRender?.evidence[0]?.properties.algorithm, "astro-closed-frontmatter-component-flow-v1");
+  assert.deepEqual(new Set(dynamicRender?.target_ids), new Set([astroCard?.id, astroAlternative?.id]));
+  const missingRender = astroSites.find((site) => site.kind === "renders" && site.specifier === "Missing");
+  assert.equal(missingRender?.resolution_status, "unresolved");
+  assert.equal(nodeById.get(missingRender?.target_ids[0])?.kind, "unknown_target");
+  assert.equal(missingRender?.reason, "relative_target_not_found");
+  const brokenDirective = astroSites.find((site) => (
+    site.kind === "renders" && site.reason === "multiple_astro_environment_directives"
+  ));
+  assert.equal(brokenDirective?.resolution_status, "unresolved");
+  assert.equal(nodeById.get(brokenDirective?.target_ids[0])?.kind, "unknown_target");
+
+  const assetLoad = astroSites.find((site) => site.kind === "loads" && site.specifier.endsWith("hero.svg"));
+  assert.equal(assetLoad?.resolution_status, "resolved");
+  assert.equal(nodeById.get(assetLoad?.target_ids[0])?.kind, "file");
+  assert.equal(nodeById.get(assetLoad?.target_ids[0])?.properties.path, "apps/astro-app/src/assets/hero.svg");
+  const collectionLoad = astroSites.find((site) => site.kind === "loads" && site.specifier === "astro:content/posts");
+  const entryLoad = astroSites.find((site) => site.kind === "loads" && site.specifier === "astro:content/posts/one");
+  assert.equal(collectionLoad?.resolution_status, "candidates");
+  assert.equal(collectionLoad?.target_ids.length, 2);
+  assert.equal(collectionLoad?.evidence[0]?.properties.algorithm, "astro-static-content-collection-v1");
+  assert.equal(entryLoad?.resolution_status, "resolved");
+  assert.equal(nodeById.get(entryLoad?.target_ids[0])?.properties.path, "apps/astro-app/src/content/posts/one.md");
+
+  const endpointHandler = astroEdges.find((edge) => edge.kind === "handled_by");
+  assert.equal(nodeById.get(endpointHandler?.target)?.kind, "symbol");
+  assert.match(JSON.stringify(endpointHandler?.condition), /"astro\.method","value":"GET"/u);
+  const cardFrontmatterImports = sites.filter((site) => (
+    site.specifier === "../../components/Card.astro"
+    && site.evidence.some((item: Record<string, any>) => item.extractor === "astro-compiler-frontmatter")
+    && site.evidence[0]?.properties?.contract_version !== "framework-semantic-graph-v1"
+  ));
+  assert.equal(cardFrontmatterImports.length, 1);
+  assert.ok(diagnostics.some((diagnostic) => (
+    diagnostic.code === "web.unsupported_syntax"
+    && diagnostic.path === "apps/astro-app/src/components/Broken.astro"
+  )));
+  assert.ok(diagnostics.some((diagnostic) => (
+    diagnostic.code === "web.astro_component_unresolved"
+    && diagnostic.path === "apps/astro-app/src/pages/blog/[slug].astro"
   )));
   assert.ok(!completed.completeness.includes("semantic-complete"));
   assert.ok(completed.reasons.includes("framework_semantic_capability_pending"));

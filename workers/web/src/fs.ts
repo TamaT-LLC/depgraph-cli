@@ -43,8 +43,15 @@ export const WEB_SOURCE_EXTENSIONS = new Set([
   ".html",
 ]);
 
+const WEB_RESOURCE_EXTENSIONS = new Set([
+  ".avif", ".bmp", ".css", ".gif", ".ico", ".jpeg", ".jpg", ".json", ".less",
+  ".png", ".sass", ".scss", ".svg", ".tiff", ".ttf", ".webp", ".woff", ".woff2",
+  ".yaml", ".yml",
+]);
+
 function isRelevantFileName(name: string): boolean {
   return WEB_SOURCE_EXTENSIONS.has(path.extname(name).toLowerCase())
+    || WEB_RESOURCE_EXTENSIONS.has(path.extname(name).toLowerCase())
     || /^(?:package\.json|pnpm-workspace\.yaml|pnpm-lock\.yaml|yarn\.lock|bun\.lock|bun\.lockb|package-lock\.json|npm-shrinkwrap\.json|\.pnp\.data\.json)$/u.test(name)
     || /^(?:tsconfig|jsconfig)(?:\.[^.]+)*\.json$/u.test(name)
     || /^(?:next|astro|vite|tanstack|router|webpack|rollup)\.config\./u.test(name)
