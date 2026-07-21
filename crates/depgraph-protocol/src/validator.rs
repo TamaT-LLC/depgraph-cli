@@ -2904,7 +2904,7 @@ fn validate_web_framework_semantic_completeness(profile: &Profile) -> Result<(),
                 .is_none_or(|values| values.len() != required.as_ref().map_or(0, Vec::len))
             || required
                 .as_ref()
-                .is_none_or(|values| values.windows(2).all(|pair| pair[0] < pair[1]))
+                .is_none_or(|values| !values.windows(2).all(|pair| pair[0] < pair[1]))
         {
             return invariant(format!(
                 "Web semantic-complete profile {} did not emit every required capability for {framework}",

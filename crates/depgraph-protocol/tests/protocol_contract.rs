@@ -469,6 +469,31 @@ fn web_semantic_completeness_requires_framework_ledger_and_zero_coverage_gaps() 
         );
     }
 
+    let mut unsorted = web_semantic_complete_values();
+    promote_web_framework_semantic_complete(&mut unsorted, "next");
+    unsorted[1]["profile"]["properties"]["web_framework_completeness_ledger"] = json!(
+        json!([{
+            "framework": "next",
+            "required_capabilities": [
+                "typescript-definition-import-type-call-graph-v2",
+                "next-route-component-boundary-v1",
+                "framework-semantic-graph-v1"
+            ],
+            "emitted_capabilities": [
+                "typescript-definition-import-type-call-graph-v2",
+                "next-route-component-boundary-v1",
+                "framework-semantic-graph-v1"
+            ],
+            "status": "complete",
+            "reasons": []
+        }])
+        .to_string()
+    );
+    let error = validate_ndjson(Cursor::new(values_to_ndjson(unsorted))).unwrap_err();
+    assert!(
+        matches!(error, ProtocolError::Invariant(message) if message.contains("did not emit every required capability"))
+    );
+
     for (field, value) in [
         ("files_skipped", json!(1)),
         ("unsupported_syntax", json!(1)),
