@@ -84,7 +84,25 @@ Interface and function-value dispatch is analyzed with serial SSA using
 site is reachable. Libraries, incomplete programs, and RTA-unreachable sites
 use conservative CHA. Candidate sites retain `resolution_status=candidates`
 and `precision=overapprox`, with one sorted `may_call` edge per candidate. A
-singleton candidate is not promoted to an exact call. VTA is not implemented.
+singleton candidate is not promoted to an exact call.
+
+VTA refinement is available only through an explicit repository profile:
+
+```toml
+[profiles]
+go_call_graph = "vta"
+```
+
+The default `rta-cha` profile and its candidate topology remain unchanged. VTA
+uses the worker-pinned `golang.org/x/tools/go/callgraph/vta@v0.48.0` and
+requires a complete dependency-body closure plus an `InstantiateGenerics`
+serial SSA program. It refines a fresh sound CHA graph;
+construction failure, incomplete input, a missing site, or an empty refined set
+falls back to the existing RTA/CHA selection instead of emitting a partial or
+unsound set. Profile properties expose the requested mode, effective
+algorithms, prerequisite contract, status, and bounded fallback reasons. VTA
+site and edge evidence records the requested/effective algorithm, fallback
+reason, and canonical candidate count.
 
 `reflect.Value.Call` and `reflect.Value.CallSlice` remain unresolved. `unsafe`,
 `go:linkname`, assembly, plugins, cgo/native callbacks, missing offline

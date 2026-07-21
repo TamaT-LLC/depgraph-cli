@@ -14,10 +14,13 @@ import (
 	"golang.org/x/tools/go/callgraph"
 	"golang.org/x/tools/go/callgraph/cha"
 	"golang.org/x/tools/go/callgraph/rta"
+	"golang.org/x/tools/go/callgraph/vta"
 	"golang.org/x/tools/go/packages"
 	"golang.org/x/tools/go/ssa"
 	"golang.org/x/tools/go/ssa/ssautil"
 )
+
+const goVTACallGraphEngine = "golang.org/x/tools/go/callgraph/vta@v0.48.0"
 
 type goSSACallKey struct {
 	input       *goSSAInput
@@ -37,8 +40,22 @@ type goSSABuild struct {
 	reason   string
 }
 
+type goSSAOutcome struct {
+	requestedVTA       bool
+	pendingSites       int
+	vtaSelections      int
+	fallbackSelections int
+	algorithms         map[string]bool
+	fallbackReasons    map[string]bool
+}
+
 func (e *goSemanticExtractor) emitSSACalls() {
 	e.recordSSAPolicy()
+	outcome := &goSSAOutcome{
+		requestedVTA: e.state.profile.Properties["go_call_graph_requested"] == "vta",
+		pendingSites: len(e.pendingCalls), algorithms: map[string]bool{}, fallbackReasons: map[string]bool{},
+	}
+	defer e.recordSSAOutcome(outcome)
 	e.emitCallGraphLimitDiagnostics()
 	if len(e.pendingCalls) == 0 {
 		return
@@ -63,12 +80,17 @@ func (e *goSemanticExtractor) emitSSACalls() {
 
 	chaByInput := map[*goSSAInput]goSSAGraphIndex{}
 	rtaByInput := map[*goSSAInput]goSSAGraphIndex{}
+	vtaByInput := map[*goSSAInput]goSSAGraphIndex{}
+	vtaFallbackByInput := map[*goSSAInput]string{}
 	completeByInput := map[*goSSAInput]bool{}
 	buildFailures := map[*goSSAInput]bool{}
 	for _, input := range inputs {
 		build, err := buildGoSSA(input)
 		if err != nil {
 			buildFailures[input] = true
+			if outcome.requestedVTA {
+				outcome.fallbackReasons["ssa_build_failed_unresolved"] = true
+			}
 			e.complete = false
 			e.addSSABuildDiagnostic(input, err)
 			continue
@@ -76,7 +98,11 @@ func (e *goSemanticExtractor) emitSSACalls() {
 		completeByInput[input] = build.complete
 		if !build.complete {
 			e.complete = false
-			e.addSSAPartialDiagnostic(input, build.reason)
+			e.addSSAPartialDiagnostic(input, build.reason, outcome.requestedVTA)
+			if outcome.requestedVTA {
+				vtaFallbackByInput[input] = "vta_incomplete_program_fallback"
+				outcome.fallbackReasons[vtaFallbackByInput[input]] = true
+			}
 		}
 
 		chaGraph, err := buildGoCHAGraph(build.program)
@@ -87,6 +113,17 @@ func (e *goSemanticExtractor) emitSSACalls() {
 			continue
 		}
 		chaByInput[input] = indexGoSSAGraph(input, chaGraph)
+
+		if outcome.requestedVTA && build.complete {
+			vtaGraph, vtaErr := buildGoVTAGraph(build.program)
+			if vtaErr != nil {
+				vtaFallbackByInput[input] = "vta_construction_failed_fallback"
+				outcome.fallbackReasons[vtaFallbackByInput[input]] = true
+				e.addSSAVTAFallbackDiagnostic(input, vtaErr)
+			} else {
+				vtaByInput[input] = indexGoSSAGraph(input, vtaGraph)
+			}
+		}
 
 		rtaIndex := newGoSSAGraphIndex()
 		if build.complete {
@@ -118,9 +155,18 @@ func (e *goSemanticExtractor) emitSSACalls() {
 			continue
 		}
 		key := goSSACallKey{input: input, callerTypes: pending.context.typed.Types, position: pending.call.Lparen}
-		algorithm, selectionReason, index := e.selectGoSSAIndex(
+		algorithm, selectionReason, fallbackReason, index := e.selectGoSSAIndex(
 			pending, key, completeByInput[input], chaByInput[input], rtaByInput[input],
+			outcome.requestedVTA, vtaByInput[input], vtaFallbackByInput[input],
 		)
+		outcome.algorithms[algorithm] = true
+		if algorithm == "vta" {
+			outcome.vtaSelections++
+		}
+		if fallbackReason != "none" && fallbackReason != "not_requested" {
+			outcome.fallbackSelections++
+			outcome.fallbackReasons[fallbackReason] = true
+		}
 		functions := index.targets[key]
 		if len(functions) == 0 {
 			e.emitPendingUnresolved(pending)
@@ -170,7 +216,9 @@ func (e *goSemanticExtractor) emitSSACalls() {
 			targetIDs = append(targetIDs, targetID)
 		}
 		sort.Strings(targetIDs)
-		evidence := goSSACandidateEvidence(pending, algorithm, selectionReason)
+		evidence := goSSACandidateEvidence(
+			pending, algorithm, selectionReason, fallbackReason, len(targetIDs), outcome.requestedVTA,
+		)
 		if !e.addCandidateCall(pending, targetIDs, evidence) {
 			siteID := goSSAPendingSiteID(e.state.profile.ID, pending, evidence)
 			if _, exists := e.state.sites[siteID]; !exists {
@@ -230,9 +278,48 @@ func (e *goSemanticExtractor) recordSSAPolicy() {
 	if e.state.profile.Properties == nil {
 		e.state.profile.Properties = map[string]string{}
 	}
+	if e.state.profile.Properties["go_call_graph_requested"] == "" {
+		e.state.profile.Properties["go_call_graph_requested"] = "rta-cha"
+	}
 	e.state.profile.Properties["go_ssa_builder_mode"] = "instantiate-generics,serial"
 	e.state.profile.Properties["go_call_graph_main_test"] = "rta"
 	e.state.profile.Properties["go_call_graph_library_partial"] = "cha"
+	e.state.profile.Properties["go_call_graph_vta_prerequisites"] = "complete-program,instantiate-generics,serial-ssa"
+	e.state.profile.Properties["go_call_graph_vta_engine"] = goVTACallGraphEngine
+}
+
+func (e *goSemanticExtractor) recordSSAOutcome(outcome *goSSAOutcome) {
+	if outcome == nil {
+		return
+	}
+	algorithms := make([]string, 0, len(outcome.algorithms))
+	for algorithm := range outcome.algorithms {
+		algorithms = append(algorithms, algorithm)
+	}
+	sort.Strings(algorithms)
+	reasons := make([]string, 0, len(outcome.fallbackReasons))
+	for reason := range outcome.fallbackReasons {
+		reasons = append(reasons, reason)
+	}
+	sort.Strings(reasons)
+	e.state.profile.Properties["go_call_graph_effective_algorithms"] = strings.Join(algorithms, ",")
+	if !outcome.requestedVTA {
+		e.state.profile.Properties["go_call_graph_vta_status"] = "not-requested"
+		return
+	}
+	status := "fallback"
+	switch {
+	case outcome.pendingSites == 0:
+		status = "not-applicable"
+	case outcome.vtaSelections > 0 && len(reasons) == 0:
+		status = "applied"
+	case outcome.vtaSelections > 0:
+		status = "partial"
+	}
+	e.state.profile.Properties["go_call_graph_vta_status"] = status
+	e.state.profile.Properties["go_call_graph_vta_site_count"] = strconv.Itoa(outcome.vtaSelections)
+	e.state.profile.Properties["go_call_graph_vta_fallback_site_count"] = strconv.Itoa(outcome.fallbackSelections)
+	e.state.profile.Properties["go_call_graph_vta_fallback_reasons"] = strings.Join(reasons, ",")
 }
 
 func (e *goSemanticExtractor) emitCallGraphLimitDiagnostics() {
@@ -482,6 +569,30 @@ func buildGoRTAGraph(roots []*ssa.Function) (graph *callgraph.Graph, err error) 
 	return result.CallGraph, nil
 }
 
+func buildGoVTAGraph(program *ssa.Program) (graph *callgraph.Graph, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("%v", recovered)
+			graph = nil
+		}
+	}()
+	if program == nil {
+		return nil, fmt.Errorf("SSA program is unavailable")
+	}
+	functions := ssautil.AllFunctions(program)
+	if len(functions) == 0 {
+		return nil, fmt.Errorf("SSA program contains no functions")
+	}
+	// VTA uses the sound CHA graph as its refinement boundary. Construct a
+	// fresh graph here because the export-oriented CHA index inlines wrappers.
+	graph = vta.CallGraph(functions, cha.CallGraph(program))
+	if graph == nil {
+		return nil, fmt.Errorf("VTA returned no call graph")
+	}
+	inlineGoSSASyntheticWrappers(graph)
+	return graph, nil
+}
+
 // inlineGoSSASyntheticWrappers applies the reachability-preserving part of
 // callgraph.Graph.DeleteSyntheticNodes, but deliberately keeps synthetic leaf
 // functions. Deleting a leaf would silently remove an unknown candidate; by
@@ -652,6 +763,33 @@ func goSSAFunctionPackage(function *ssa.Function) *types.Package {
 }
 
 func (e *goSemanticExtractor) selectGoSSAIndex(
+	pending goSemanticPendingCall,
+	key goSSACallKey,
+	complete bool,
+	chaIndex goSSAGraphIndex,
+	rtaIndex goSSAGraphIndex,
+	vtaRequested bool,
+	vtaIndex goSSAGraphIndex,
+	vtaFallback string,
+) (string, string, string, goSSAGraphIndex) {
+	if vtaRequested && vtaFallback == "" {
+		if len(vtaIndex.targets[key]) > 0 {
+			return "vta", "explicit_vta_profile", "none", vtaIndex
+		}
+		if vtaIndex.sites[key] {
+			vtaFallback = "vta_empty_candidate_set_fallback"
+		} else {
+			vtaFallback = "vta_site_unavailable_fallback"
+		}
+	}
+	algorithm, reason, index := e.selectDefaultGoSSAIndex(pending, key, complete, chaIndex, rtaIndex)
+	if !vtaRequested {
+		return algorithm, reason, "not_requested", index
+	}
+	return algorithm, reason, vtaFallback, index
+}
+
+func (e *goSemanticExtractor) selectDefaultGoSSAIndex(
 	pending goSemanticPendingCall,
 	key goSSACallKey,
 	complete bool,
@@ -874,19 +1012,33 @@ func (p *goSemanticPackage) ssaSymbolVisible(nodeID string, object *types.Func) 
 	return p.symbolNodeVisible(nodeID, object.Pkg().Path())
 }
 
-func goSSACandidateEvidence(pending goSemanticPendingCall, algorithm, selectionReason string) []Evidence {
+func goSSACandidateEvidence(
+	pending goSemanticPendingCall,
+	algorithm, selectionReason, fallbackReason string,
+	candidateCount int,
+	vtaRequested bool,
+) []Evidence {
 	evidence := append([]Evidence(nil), pending.evidence...)
 	if len(evidence) == 0 {
 		return evidence
 	}
 	primary := evidence[0]
-	properties := make(map[string]any, len(primary.Properties)+4)
+	properties := make(map[string]any, len(primary.Properties)+7)
 	for key, value := range primary.Properties {
 		properties[key] = value
 	}
 	properties["algorithm"] = algorithm
 	properties["selection_reason"] = selectionReason
-	properties["analysis_scope"] = map[string]string{"rta": "complete_program", "cha": "partial_program"}[algorithm]
+	properties["analysis_scope"] = map[string]string{
+		"rta": "complete_program", "cha": "partial_program", "vta": "complete_program",
+	}[algorithm]
+	properties["candidate_count"] = candidateCount
+	properties["fallback_reason"] = fallbackReason
+	if vtaRequested {
+		properties["requested_algorithm"] = "vta"
+	} else {
+		properties["requested_algorithm"] = "rta-cha"
+	}
 	primary.Extractor = "go-ssa"
 	primary.ExtractorVersion = AdapterVersion
 	primary.Properties = properties
@@ -912,12 +1064,18 @@ func (e *goSemanticExtractor) addSSABuildDiagnostic(input *goSSAInput, err error
 	}
 }
 
-func (e *goSemanticExtractor) addSSAPartialDiagnostic(input *goSSAInput, reason string) {
+func (e *goSemanticExtractor) addSSAPartialDiagnostic(input *goSSAInput, reason string, vtaRequested bool) {
 	path := "go.mod"
 	if input != nil && input.ModuleRelativeDir != "" && input.ModuleRelativeDir != "." {
 		path = filepath.ToSlash(filepath.Join(input.ModuleRelativeDir, "go.mod"))
 	}
-	message := "Go SSA dependency bodies are incomplete; CHA is used instead of RTA: " + normalizeGoPackagesMessage(e.state.root, reason)
+	requested := "RTA"
+	fallbackReason := "incomplete_program_fallback"
+	if vtaRequested {
+		requested = "VTA/RTA"
+		fallbackReason = "vta_incomplete_program_fallback"
+	}
+	message := "Go SSA dependency bodies are incomplete; CHA is used instead of " + requested + ": " + normalizeGoPackagesMessage(e.state.root, reason)
 	identity := map[string]any{
 		"code": "go_ssa_partial_program", "path": path, "profile_id": e.state.profile.ID,
 		"reason": reason,
@@ -925,7 +1083,34 @@ func (e *goSemanticExtractor) addSSAPartialDiagnostic(input *goSSAInput, reason 
 	diagnostic := Diagnostic{
 		ID: stableIDFromValue("diagnostic", identity), Code: "go_ssa_partial_program", Severity: "warning",
 		Message: message, ProfileID: e.state.profile.ID, Path: path,
-		Properties: map[string]any{"algorithm": "cha", "reason": "incomplete_program"}, Recoverable: true,
+		Properties: map[string]any{
+			"algorithm": "cha", "reason": "incomplete_program", "fallback_reason": fallbackReason,
+		}, Recoverable: true,
+	}
+	if !e.diagnosticIDs[diagnostic.ID] {
+		e.diagnosticIDs[diagnostic.ID] = true
+		e.state.diagnostics = append(e.state.diagnostics, diagnostic)
+	}
+}
+
+func (e *goSemanticExtractor) addSSAVTAFallbackDiagnostic(input *goSSAInput, err error) {
+	path := "go.mod"
+	if input != nil && input.ModuleRelativeDir != "" && input.ModuleRelativeDir != "." {
+		path = filepath.ToSlash(filepath.Join(input.ModuleRelativeDir, "go.mod"))
+	}
+	detail := normalizeGoPackagesMessage(e.state.root, err.Error())
+	message := "Go VTA construction failed; the default RTA/CHA policy is used: " + detail
+	identity := map[string]any{
+		"code": "go_ssa_vta_fallback", "path": path, "profile_id": e.state.profile.ID,
+		"reason": "vta_construction_failed_fallback", "message": message,
+	}
+	diagnostic := Diagnostic{
+		ID: stableIDFromValue("diagnostic", identity), Code: "go_ssa_vta_fallback", Severity: "warning",
+		Message: message, ProfileID: e.state.profile.ID, Path: path, Recoverable: true,
+		Properties: map[string]any{
+			"requested_algorithm": "vta", "fallback_algorithm": "rta-cha",
+			"fallback_reason": "vta_construction_failed_fallback",
+		},
 	}
 	if !e.diagnosticIDs[diagnostic.ID] {
 		e.diagnosticIDs[diagnostic.ID] = true

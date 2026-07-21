@@ -42,6 +42,7 @@ pub struct ProfileConfig {
     pub rust_targets: Vec<String>,
     pub rust_mode: String,
     pub go_tags: Vec<String>,
+    pub go_call_graph: String,
     pub web_environments: Vec<String>,
 }
 
@@ -75,6 +76,7 @@ impl Default for ProfileConfig {
             rust_targets: Vec::new(),
             rust_mode: "check".to_owned(),
             go_tags: Vec::new(),
+            go_call_graph: "rta-cha".to_owned(),
             web_environments: vec!["server".to_owned(), "browser".to_owned()],
         }
     }
@@ -146,6 +148,9 @@ impl Config {
         if !matches!(self.profiles.rust_mode.as_str(), "check" | "build" | "test") {
             bail!("profiles.rust_mode must be check, build, or test");
         }
+        if !matches!(self.profiles.go_call_graph.as_str(), "rta-cha" | "vta") {
+            bail!("profiles.go_call_graph must be rta-cha or vta");
+        }
         Ok(())
     }
 
@@ -213,6 +218,7 @@ mod tests {
         assert_eq!(parsed.scan.worker_timeout_seconds, 300);
         assert_eq!(parsed.strict.max_unresolved, 0);
         assert_eq!(parsed.profiles.rust_mode, "check");
+        assert_eq!(parsed.profiles.go_call_graph, "rta-cha");
         Ok(())
     }
 
@@ -228,6 +234,7 @@ mod tests {
             "schema_version = 1\n[scan]\nmax_stderr_bytes = 0\n",
             "schema_version = 1\n[scan]\nfollow_symlinks = true\n",
             "schema_version = 1\n[profiles]\nrust_mode = 'release'\n",
+            "schema_version = 1\n[profiles]\ngo_call_graph = 'pta'\n",
         ] {
             std::fs::write(root.path().join(CONFIG_FILE), raw)?;
             assert!(Config::load(root.path()).is_err(), "accepted {raw:?}");
