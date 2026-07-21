@@ -3609,6 +3609,15 @@ fn validate_web_definition_graph(
                 site.id
             ));
         }
+        if site.kind == "call"
+            && site.resolution_status == ResolutionStatus::Candidates
+            && site.reason.is_some()
+        {
+            return Err(format!(
+                "Web candidate call site {} must not include a reason",
+                site.id
+            ));
+        }
         let primary = site
             .evidence
             .first()
@@ -3681,7 +3690,6 @@ fn validate_web_definition_graph(
                 }
                 ResolutionStatus::Candidates => {
                     site.precision == Precision::Overapprox
-                        && site.reason.is_none()
                         && match dispatch {
                             "dynamic" => {
                                 algorithm == Some(TYPESCRIPT_CLOSED_LOCAL_CALL_FLOW_ALGORITHM)

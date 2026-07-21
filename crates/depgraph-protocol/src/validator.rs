@@ -1656,12 +1656,6 @@ fn validate_semantic_site(
         site.precision,
     )?;
     if site.kind == "call" && site.resolution_status == ResolutionStatus::Candidates {
-        if site.reason.is_some() {
-            return invariant(format!(
-                "candidate call site {} must not include a reason",
-                site.id
-            ));
-        }
         validate_candidate_algorithm(&format!("candidate call site {}", site.id), primary)?;
     }
     if site.target_ids.windows(2).any(|pair| pair[0] >= pair[1]) {
