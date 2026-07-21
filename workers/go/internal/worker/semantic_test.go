@@ -552,6 +552,54 @@ func Enabled() bool {
 	}
 }
 
+func TestGoSemanticValueReferenceKindsMatchLocalTargets(t *testing.T) {
+	root := t.TempDir()
+	writeTestFile(t, filepath.Join(root, "go.mod"), "module example.com/reference-kinds\n\ngo 1.26.1\n")
+	writeTestFile(t, filepath.Join(root, "kinds.go"), `package referencekinds
+
+func Use(parameter int) int {
+	localVariable := parameter
+	const localConstant = 1
+	return localVariable + localConstant
+}
+`)
+
+	result, err := Scan(root)
+	if err != nil {
+		t.Fatalf("Scan() error = %v", err)
+	}
+	semanticFindNamedNode(t, result, "symbol", "function", "example.com/reference-kinds.Use")
+	wantKinds := map[string]string{
+		"parameter":     "parameter",
+		"localVariable": "local_variable",
+		"localConstant": "local_constant",
+	}
+	for displayName, wantKind := range wantKinds {
+		var matches []Site
+		for _, site := range result.Sites {
+			if site.Kind != "value_reference" || len(site.TargetIDs) != 1 {
+				continue
+			}
+			target := semanticNodeByID(t, result, site.TargetIDs[0])
+			if target.DisplayName == displayName {
+				matches = append(matches, site)
+			}
+		}
+		if len(matches) != 1 {
+			t.Fatalf("value reference to %q matches = %d, want 1: matches=%+v sites=%+v", displayName, len(matches), matches, result.Sites)
+		}
+		site := matches[0]
+		gotKind, _ := site.Evidence[0].Properties["object_kind"].(string)
+		if gotKind != wantKind {
+			t.Fatalf("value reference to %q object_kind = %q, want %q: %+v", displayName, gotKind, wantKind, site)
+		}
+		target := semanticNodeByID(t, result, site.TargetIDs[0])
+		if semanticNodeKind(target) != wantKind {
+			t.Fatalf("value reference to %q target kind = %q, want %q: %+v", displayName, semanticNodeKind(target), wantKind, target)
+		}
+	}
+}
+
 func TestGoSemanticValueReferenceAcrossPackages(t *testing.T) {
 	root := t.TempDir()
 	writeTestFile(t, filepath.Join(root, "go.mod"), "module example.com/references\n\ngo 1.26.1\n")

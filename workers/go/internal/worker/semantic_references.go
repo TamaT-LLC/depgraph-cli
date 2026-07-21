@@ -278,6 +278,17 @@ func goSemanticUnaliasAndDereference(value types.Type) types.Type {
 }
 
 func (p *goSemanticPackage) valueReferenceObjectKind(object types.Object, identifier *ast.Ident) string {
+	// Declarations have already established canonical symbol nodes. Reuse the
+	// declared kind so use-site AST shape cannot turn parameters into ordinary
+	// local variables (or otherwise diverge from the referenced target).
+	if nodeID := p.objectNodes[object]; nodeID != "" {
+		node := p.extractor.state.nodes[nodeID]
+		if node.Kind == "symbol" {
+			if kind, ok := node.Properties["symbol_kind"].(string); ok && kind != "" {
+				return kind
+			}
+		}
+	}
 	if function, ok := object.(*types.Func); ok {
 		if signature, ok := function.Type().(*types.Signature); ok && signature.Recv() != nil {
 			return "method"
