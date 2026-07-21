@@ -54,8 +54,7 @@ import {
 } from "./types";
 import type { PackageRecord } from "./workspace";
 
-const FRAMEWORK = "tanstack-router" as const;
-const EXTRACTOR = "tanstack-router-static-adapter";
+type TanStackRouteFramework = "tanstack-router" | "tanstack-start";
 const ROUTER_MODULES = new Set(["@tanstack/react-router", "@tanstack/router-core"]);
 const FACTORIES = new Set([
   "createRootRoute", "createRootRouteWithContext", "createRoute",
@@ -134,20 +133,21 @@ function spanFor(source: string, node: Node): Span {
 }
 
 function evidence(
+  framework: TanStackRouteFramework,
   relativePath: string,
   span: Span,
   occurrenceKind: string,
   properties: Record<string, JsonValue> = {},
 ): Evidence[] {
   const common = {
-    extractor: EXTRACTOR,
+    extractor: `${framework}-static-adapter`,
     extractor_version: WEB_FRAMEWORK_SEMANTIC_EXTRACTOR_VERSION,
     path: relativePath,
     ...span,
   };
   const shared: Record<string, JsonValue> = {
     profile_id: PROFILE_ID,
-    framework: FRAMEWORK,
+    framework,
     occurrence_kind: occurrenceKind,
     ...properties,
   };
@@ -294,6 +294,7 @@ function condition(environment: "server" | "browser", properties: Record<string,
 }
 
 function routeNode(
+  framework: TanStackRouteFramework,
   owner: PackageRecord,
   pattern: string,
   routeKind: string,
@@ -303,7 +304,7 @@ function routeNode(
 ): GraphNode {
   const environment = preferredWebEnvironment("server");
   const canonicalIdentity: Record<string, JsonValue> = {
-    framework: FRAMEWORK,
+    framework,
     package_locator: owner.locator,
     route_kind: routeKind,
     environment,
@@ -314,10 +315,10 @@ function routeNode(
   return {
     id,
     kind: "route",
-    locator: `route://tanstack-router/${encodeURIComponent(owner.locator)}${pattern}#${encodeURIComponent(routeKind)}`,
-    display_name: `tanstack-router:${routeKind}:${pattern}`,
+    locator: `route://${framework}/${encodeURIComponent(owner.locator)}${pattern}#${encodeURIComponent(routeKind)}`,
+    display_name: `${framework}:${routeKind}:${pattern}`,
     properties: {
-      framework: FRAMEWORK,
+      framework,
       package_locator: owner.locator,
       route_kind: routeKind,
       environment,
@@ -331,14 +332,14 @@ function routeNode(
   };
 }
 
-function componentNode(symbol: GraphNode, componentKind: string): GraphNode | null {
+function componentNode(framework: TanStackRouteFramework, symbol: GraphNode, componentKind: string): GraphNode | null {
   const resolverIdentity = symbol.properties.resolver_identity;
   const packageLocator = symbol.properties.package_locator;
   const sourcePath = symbol.properties.source_path;
   if (typeof resolverIdentity !== "string" || typeof packageLocator !== "string" || typeof sourcePath !== "string") return null;
   const environment = preferredWebEnvironment("browser");
   const canonicalIdentity: Record<string, JsonValue> = {
-    framework: FRAMEWORK,
+    framework,
     package_locator: packageLocator,
     component_kind: componentKind,
     environment,
@@ -348,10 +349,10 @@ function componentNode(symbol: GraphNode, componentKind: string): GraphNode | nu
   return {
     id,
     kind: "component",
-    locator: `component://tanstack-router/${encodeURIComponent(packageLocator)}/${id}`,
+    locator: `component://${framework}/${encodeURIComponent(packageLocator)}/${id}`,
     display_name: symbol.display_name,
     properties: {
-      framework: FRAMEWORK,
+      framework,
       package_locator: packageLocator,
       component_kind: componentKind,
       environment,
@@ -372,6 +373,17 @@ export function collectTanStackRouterSemanticDelta(
   const sites = new Map<string, DependencySite>();
   const edges = new Map<string, GraphEdge>();
   const diagnostics: Array<Omit<Diagnostic, "id">> = [];
+  const framework: TanStackRouteFramework = input.entries.some((entry) => entry.framework === "tanstack-start")
+    ? "tanstack-start"
+    : "tanstack-router";
+  const packageScope = new Set(input.entries.map((entry) => input.ownerForPath(entry.relativeFile).locator));
+  const inPackageScope = (relativePath: string): boolean => packageScope.has(input.ownerForPath(relativePath).locator);
+  const semanticEvidence = (
+    relativePath: string,
+    span: Span,
+    occurrenceKind: string,
+    properties: Record<string, JsonValue> = {},
+  ): Evidence[] => evidence(framework, relativePath, span, occurrenceKind, properties);
   const definitionsByPath = new Map<string, TypeScriptRawDefinitionDelta["definitions"]>();
   for (const definition of input.definitions.definitions) {
     if (definition.graphKind !== "symbol") continue;
@@ -413,7 +425,7 @@ export function collectTanStackRouterSemanticDelta(
     const targets = [...targetsValue].sort((left, right) => compareUtf8(left.id, right.id));
     const precision: Precision = status === "candidates" ? "overapprox" : status === "unresolved" ? "heuristic" : "exact";
     const canonicalCondition = canonicalizeCondition(relationCondition);
-    const relationEvidence = evidence(relativePath, span, occurrenceKind, {
+    const relationEvidence = semanticEvidence(relativePath, span, occurrenceKind, {
       ...properties,
       ...(algorithm ? { algorithm } : {}),
     });
@@ -495,6 +507,7 @@ export function collectTanStackRouterSemanticDelta(
   const navigationCalls: Array<{ relativePath: string; node: Node; options: ObjectLiteralExpression; occurrence: string }> = [];
 
   for (const [relativePath, sourceFile] of input.sourceFiles) {
+    if (!inPackageScope(relativePath)) continue;
     const bindings = importBindings(sourceFile);
     if (bindings.size === 0) continue;
     const localDeclarations = new Set<string>();
@@ -666,10 +679,11 @@ export function collectTanStackRouterSemanticDelta(
       : declaration?.kind === "root" ? "tanstack-file-root-route"
         : "tanstack-file-route";
     const node = addNode(routeNode(
+      framework,
       owner,
       entry.pattern,
       routeKind,
-      `tanstack-router:${owner.locator}:file`,
+      `${framework}:${owner.locator}:file`,
       entry.relativeFile,
       { generated_tree_corroborated: generatedByPattern.has(entry.pattern) },
     ));
@@ -702,10 +716,11 @@ export function collectTanStackRouterSemanticDelta(
   for (const entry of input.entries.filter((candidate) => candidate.generated && !sourceEntries.some((source) => source.pattern === candidate.pattern))) {
     const owner = input.ownerForPath(entry.relativeFile);
     const node = addNode(routeNode(
+      framework,
       owner,
       entry.pattern,
       "tanstack-generated-route",
-      `tanstack-router:${owner.locator}:file`,
+      `${framework}:${owner.locator}:file`,
       entry.relativeFile,
       { generated_only: true },
     ));
@@ -752,17 +767,18 @@ export function collectTanStackRouterSemanticDelta(
         message: `TanStack Router declaration ${declaration.name} has no statically closed parent/path identity`,
         path: declaration.relativePath,
         profile_id: PROFILE_ID,
-        evidence: evidence(declaration.relativePath, spanFor(input.sources.get(declaration.relativePath) ?? "", declaration.node), "tanstack_route_pattern_unresolved"),
+        evidence: semanticEvidence(declaration.relativePath, spanFor(input.sources.get(declaration.relativePath) ?? "", declaration.node), "tanstack_route_pattern_unresolved"),
         properties: { framework_semantic_issue: true },
       });
       continue;
     }
     const owner = input.ownerForPath(declaration.relativePath);
     const node = addNode(routeNode(
+      framework,
       owner,
       pattern,
       declaration.kind === "root" ? "tanstack-code-root-route" : "tanstack-code-route",
-      `tanstack-router:${owner.locator}:code:${rootNameFor(declaration)}`,
+      `${framework}:${owner.locator}:code:${rootNameFor(declaration)}`,
       declaration.relativePath,
       { registration_status: registered.get(key)! },
     ));
@@ -791,7 +807,7 @@ export function collectTanStackRouterSemanticDelta(
       message: `TanStack Router declaration ${declaration.name} is not reachable from a statically closed addChildren registration and was not emitted as an actual route`,
       path: declaration.relativePath,
       profile_id: PROFILE_ID,
-      evidence: evidence(declaration.relativePath, spanFor(input.sources.get(declaration.relativePath) ?? "", declaration.node), "tanstack_unregistered_declaration"),
+      evidence: semanticEvidence(declaration.relativePath, spanFor(input.sources.get(declaration.relativePath) ?? "", declaration.node), "tanstack_unregistered_declaration"),
       properties: { framework_semantic_issue: true },
     });
   }
@@ -824,7 +840,7 @@ export function collectTanStackRouterSemanticDelta(
         message: "TanStack Router addChildren uses a loop or runtime-derived collection; registration was retained as unresolved",
         path: registration.relativePath,
         profile_id: PROFILE_ID,
-        evidence: evidence(registration.relativePath, registrationSpan, "tanstack_add_children_unresolved"),
+        evidence: semanticEvidence(registration.relativePath, registrationSpan, "tanstack_add_children_unresolved"),
         properties: { framework_semantic_issue: true },
       });
       continue;
@@ -902,7 +918,7 @@ export function collectTanStackRouterSemanticDelta(
     const cacheKey = `${symbol.id}\0${kind}`;
     const cached = componentCache.get(cacheKey);
     if (cached) return cached;
-    const component = componentNode(symbol, kind);
+    const component = componentNode(framework, symbol, kind);
     if (!component) return null;
     componentCache.set(cacheKey, component);
     return addNode(component);
@@ -960,6 +976,7 @@ export function collectTanStackRouterSemanticDelta(
     const type = literal(propertyExpression(object, "type"));
     const pattern = parent === null ? packageBaseFor(relativePath) : configuredPath === null ? parent.pattern : joinUrl(parent.pattern, configuredPath);
     const virtual = addNode(routeNode(
+      framework,
       owner,
       pattern,
       type === "root" || parent === null ? "tanstack-virtual-root-route" : "tanstack-virtual-route",
@@ -1014,10 +1031,11 @@ export function collectTanStackRouterSemanticDelta(
     }
   };
   for (const [relativePath, sourceFile] of input.sourceFiles) {
+    if (!inPackageScope(relativePath)) continue;
     visit(sourceFile, (node) => {
       if (!isPropertyAssignment(node) || propertyName(node.name) !== "virtualRouteConfig" || !isObjectLiteralExpression(node.initializer)) return;
       const owner = input.ownerForPath(relativePath);
-      addVirtualChildren(relativePath, node.initializer, null, `tanstack-router:${owner.locator}:virtual`);
+      addVirtualChildren(relativePath, node.initializer, null, `${framework}:${owner.locator}:virtual`);
     });
   }
 
@@ -1090,6 +1108,7 @@ export function collectTanStackRouterSemanticDelta(
     if (source && to) addNavigation(mask.relativePath, source.declaration?.node ?? mask.call, to, "masks_to", "tanstack_route_mask");
   }
   for (const [relativePath, sourceFile] of input.sourceFiles) {
+    if (!inPackageScope(relativePath)) continue;
     const bindings = importBindings(sourceFile);
     const linkNames = new Set([...bindings].filter(([, imported]) => imported === "Link" || imported === "Navigate").map(([local]) => local));
     if (linkNames.size === 0) continue;
