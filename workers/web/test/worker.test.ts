@@ -65,9 +65,6 @@ test("worker emits deterministic protocol graph without executing project code",
       "web_framework_semantic_capability",
       "web_framework_semantic_status",
       "web_framework_semantic_extractor_version",
-      "web_framework_semantic_node_count",
-      "web_framework_semantic_site_count",
-      "web_framework_semantic_edge_count",
       "project_code_executed",
     ].map((key) => [key, profile?.properties[key]])),
     {
@@ -88,11 +85,8 @@ test("worker emits deterministic protocol graph without executing project code",
       typescript_release_gate: "release-gate-pending",
       typescript_semantic_graph_emission: "definition-import-type-call-graph-v2",
       web_framework_semantic_capability: "framework-semantic-graph-v1",
-      web_framework_semantic_status: "not-emitted",
+      web_framework_semantic_status: "emitted",
       web_framework_semantic_extractor_version: "0.1.0",
-      web_framework_semantic_node_count: "0",
-      web_framework_semantic_site_count: "0",
-      web_framework_semantic_edge_count: "0",
       project_code_executed: "false",
     },
   );
@@ -176,8 +170,14 @@ test("worker emits deterministic protocol graph without executing project code",
   assert.ok(Number(profile?.properties.typescript_standard_library_files) > 0);
   assert.ok(Number(profile?.properties.typescript_typechecker_queries) > 1);
   const semanticNodes = nodes.filter((node) => node.kind === "symbol" || node.kind === "type");
-  const semanticEdges = edges.filter((edge) => edge.phase === "semantic");
-  const semanticSites = sites.filter((site) => site.evidence[0]?.kind === "semantic");
+  const semanticEdges = edges.filter((edge) => (
+    edge.phase === "semantic"
+    && edge.evidence[0]?.properties?.analysis_mode === "semantic-import-type-call-graph"
+  ));
+  const semanticSites = sites.filter((site) => (
+    site.evidence[0]?.kind === "semantic"
+    && site.evidence[0]?.properties?.analysis_mode === "semantic-import-type-call-graph"
+  ));
   const semanticCallSites = semanticSites.filter((site) => site.kind === "call");
   const moduleInitializers = semanticNodes.filter((node) => (
     node.kind === "symbol" && node.properties.symbol_kind === "generated_module_initializer"
@@ -240,6 +240,128 @@ test("worker emits deterministic protocol graph without executing project code",
   assert.ok(definitionEdges.every((edge) => edge.resolution_status === "resolved" && edge.precision === "exact"));
   assert.ok(semanticEdges.every((edge) => edge.evidence[0]?.kind === "semantic" && edge.evidence[0]?.properties.profile_id === profile.id));
   assert.ok(semanticSites.every((site) => site.evidence[1]?.kind === "source"));
+
+  const frameworkNodes = nodes.filter((node) => (
+    node.properties.framework === "next"
+    && node.properties.canonical_identity?.framework === "next"
+  ));
+  const frameworkSites = sites.filter((site) => (
+    site.evidence[0]?.properties?.contract_version === "framework-semantic-graph-v1"
+    && site.evidence[0]?.properties?.framework === "next"
+  ));
+  const frameworkEdges = edges.filter((edge) => (
+    edge.evidence[0]?.properties?.contract_version === "framework-semantic-graph-v1"
+    && edge.evidence[0]?.properties?.framework === "next"
+  ));
+  assert.equal(Number(profile?.properties.web_framework_semantic_node_count), frameworkNodes.length);
+  assert.equal(Number(profile?.properties.web_framework_semantic_site_count), frameworkSites.length);
+  assert.equal(Number(profile?.properties.web_framework_semantic_edge_count), frameworkEdges.length);
+  assert.deepEqual(
+    [...new Set(frameworkNodes.map((node) => node.kind))].sort(),
+    ["component", "route"],
+  );
+  assert.deepEqual(
+    [...new Set(frameworkEdges.map((edge) => edge.kind))].sort(),
+    ["client_boundary", "parent_route", "renders", "route_entry", "server_boundary"],
+  );
+  const productRoute = frameworkNodes.find((node) => (
+    node.kind === "route"
+    && node.properties.canonical_identity?.router_instance?.endsWith(":app")
+    && node.properties.canonical_identity?.route_pattern === "/shop/products/$id"
+    && node.properties.canonical_identity?.route_kind === "next-app-page"
+  ));
+  const interceptedRoute = frameworkNodes.find((node) => (
+    node.kind === "route"
+    && node.properties.canonical_identity?.route_pattern === "/shop/photo/$slug*"
+  ));
+  assert.deepEqual(productRoute?.properties.route_groups, ["(shop)"]);
+  assert.deepEqual(productRoute?.properties.canonical_identity?.route_groups, ["(shop)"]);
+  assert.deepEqual(interceptedRoute?.properties.parallel_slots, ["@modal"]);
+  assert.deepEqual(interceptedRoute?.properties.canonical_identity?.parallel_slots, ["@modal"]);
+  assert.deepEqual(interceptedRoute?.properties.intercepting_segments, ["(.)photo"]);
+  assert.deepEqual(interceptedRoute?.properties.canonical_identity?.intercepting_segments, ["(.)photo"]);
+
+  const productComponent = frameworkNodes.find((node) => node.kind === "component" && node.display_name === "Product");
+  const clientComponent = frameworkNodes.find((node) => node.kind === "component" && node.display_name === "ClientPanel");
+  const lazyComponent = frameworkNodes.find((node) => node.kind === "component" && node.display_name === "LazyPanel");
+  const getComponent = frameworkNodes.find((node) => node.kind === "component" && node.display_name === "GET");
+  const sharedHandlerRoute = frameworkNodes.find((node) => (
+    node.kind === "route"
+    && node.properties.canonical_identity?.route_pattern === "/shop/api/shared"
+  ));
+  const sharedHandlerComponents = frameworkNodes.filter((node) => (
+    node.kind === "component"
+    && node.properties.source_path === "apps/next-app/src/app/api/shared/route.ts"
+  ));
+  assert.deepEqual(productComponent?.properties.directives, ["use cache"]);
+  assert.equal(productComponent?.properties.runtime, "edge");
+  assert.equal(clientComponent?.properties.environment, "browser");
+  assert.deepEqual(clientComponent?.properties.directives, ["use client"]);
+  assert.deepEqual(getComponent?.properties.directives, ["use server"]);
+  assert.deepEqual(
+    sharedHandlerComponents.map((node) => node.properties.component_kind).sort(),
+    ["next-app-route-handler-get", "next-app-route-handler-post"],
+  );
+  assert.equal(new Set(sharedHandlerComponents.map((node) => JSON.stringify(node.properties.source_span))).size, 1);
+
+  const frameworkEdge = (kind: string, sourceId: string | undefined, targetId: string | undefined) => frameworkEdges.find((edge) => (
+    edge.kind === kind && edge.source === sourceId && edge.target === targetId
+  ));
+  const clientBoundary = frameworkEdge("client_boundary", productComponent?.id, clientComponent?.id);
+  const serverBoundary = frameworkEdge("server_boundary", getComponent?.id, getComponent?.id);
+  const literalDynamicRender = frameworkEdge("renders", productComponent?.id, lazyComponent?.id);
+  const sharedHandlerIds = new Set(sharedHandlerComponents.map((node) => node.id));
+  const sharedHandlerRenders = frameworkEdges.filter((edge) => (
+    edge.kind === "renders"
+    && edge.source === sharedHandlerRoute?.id
+    && sharedHandlerIds.has(edge.target)
+  ));
+  const unresolvedDynamicRender = frameworkEdges.find((edge) => (
+    edge.kind === "renders"
+    && edge.source === productComponent?.id
+    && edge.resolution_status === "unresolved"
+  ));
+  const unresolvedDynamicSites = frameworkSites.filter((site) => (
+    site.kind === "renders"
+    && site.source === productComponent?.id
+    && site.resolution_status === "unresolved"
+  ));
+  assert.equal(clientBoundary?.precision, "exact");
+  assert.match(JSON.stringify(clientBoundary?.condition), /"next\.boundary","value":"use client"/u);
+  assert.equal(serverBoundary?.precision, "exact");
+  assert.match(JSON.stringify(serverBoundary?.condition), /"next\.boundary","value":"use server"/u);
+  assert.equal(literalDynamicRender?.resolution_status, "resolved");
+  assert.equal(literalDynamicRender?.evidence[0]?.properties.occurrence_kind, "next_dynamic_render");
+  assert.equal(sharedHandlerRenders.length, 2);
+  assert.equal(new Set(sharedHandlerRenders.map((edge) => edge.site_id)).size, 2);
+  assert.deepEqual(
+    sharedHandlerRenders.map((edge) => (
+      edge.condition.conditions?.find((condition: Record<string, any>) => condition.key === "next.method")?.value
+    )).sort(),
+    ["GET", "POST"],
+  );
+  assert.ok(sharedHandlerRenders.every((edge) => frameworkSites.some((site) => (
+    site.id === edge.site_id
+    && site.source === sharedHandlerRoute?.id
+    && site.target_ids.length === 1
+    && site.target_ids[0] === edge.target
+  ))));
+  assert.equal(unresolvedDynamicRender?.precision, "heuristic");
+  assert.equal(nodeById.get(unresolvedDynamicRender?.target)?.kind, "unknown_target");
+  assert.deepEqual(
+    unresolvedDynamicSites.map((site) => site.reason).sort(),
+    ["next_dynamic_import_shape_unsupported", "next_dynamic_non_literal_import"],
+  );
+  assert.match(JSON.stringify(frameworkEdge("renders", productRoute?.id, productComponent?.id)?.condition), /"next\.runtime","value":"edge"/u);
+  assert.match(JSON.stringify(frameworkEdge("renders", productRoute?.id, productComponent?.id)?.condition), /"next\.cache","value":"use cache"/u);
+  assert.ok(diagnostics.some((diagnostic) => (
+    diagnostic.code === "web.next_dynamic_import_unresolved"
+    && diagnostic.path === "apps/next-app/src/app/(shop)/products/[id]/page.tsx"
+  )));
+  assert.ok(diagnostics.some((diagnostic) => (
+    diagnostic.code === "web.next_dynamic_import_unresolved"
+    && /supported direct/u.test(diagnostic.message)
+  )));
   assert.ok(!completed.completeness.includes("semantic-complete"));
   assert.ok(completed.reasons.includes("framework_semantic_capability_pending"));
   assert.equal(completed.dependency_sites, sites.length);
@@ -293,6 +415,51 @@ test("pure TypeScript semantic profiles allow candidate and external calls", asy
   assert.ok(!completed.reasons.includes("typescript_emitted_semantic_diagnostics_present"));
   assert.ok(semanticCalls.some((site) => site.resolution_status === "candidates"));
   assert.ok(semanticCalls.some((site) => site.resolution_status === "external"));
+});
+
+test("Next JSX import correlation preserves CRLF offsets", async (context) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "depgraph-web-next-crlf-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  const app = path.join(root, "app");
+  await mkdir(app, { recursive: true });
+  const pageSource = [
+    'import { Widget as FirstWidget } from "./Widget";',
+    'import { Widget as SecondWidget } from "./Widget";',
+    "export default function Page(): unknown {",
+    "  return <SecondWidget />;",
+    "}",
+    "",
+  ].join("\r\n");
+  await Promise.all([
+    writeFile(path.join(root, "package.json"), JSON.stringify({
+      name: "next-crlf",
+      version: "1.0.0",
+      type: "module",
+      dependencies: { next: "16.2.10" },
+    })),
+    writeFile(path.join(app, "page.tsx"), pageSource),
+    writeFile(path.join(app, "Widget.tsx"), "export function Widget(): unknown { return null; }\r\n"),
+  ]);
+
+  const result = await run("next-crlf", root);
+  const profile = result.events.find((event) => event.event === "profile_declared")?.profile;
+  const nodes = result.events.filter((event) => event.event === "node_upsert").map((event) => event.node);
+  const edges = result.events.filter((event) => event.event === "edge_upsert").map((event) => event.edge);
+  const page = nodes.find((node) => node.kind === "component" && node.display_name === "Page");
+  const widget = nodes.find((node) => node.kind === "component" && node.display_name === "Widget");
+  const render = edges.find((edge) => (
+    edge.kind === "renders"
+    && edge.source === page?.id
+    && edge.target === widget?.id
+    && edge.evidence[0]?.properties.occurrence_kind === "next_import_render"
+  ));
+  const rawSiteKey = render?.evidence[0]?.properties.typescript_site_key;
+
+  assert.equal(profile?.properties.web_framework_semantic_status, "emitted");
+  assert.equal(typeof rawSiteKey, "string");
+  const rawSiteIdentity = JSON.parse(rawSiteKey.slice("site:".length)) as unknown[];
+  assert.equal(rawSiteIdentity[2], "app/page.tsx");
+  assert.equal(rawSiteIdentity[3], pageSource.indexOf("SecondWidget"));
 });
 
 test("stable IDs and events are independent of checkout directory", async (context) => {
@@ -375,7 +542,13 @@ test("web environments are canonicalized into profile identity and every conditi
   assert.deepEqual(firstProfile.environment.environments, ["browser", "server", "worker"]);
   assert.equal(firstProfile.id, secondProfile.id);
   for (const event of first.events.filter((candidate) => candidate.site || candidate.edge)) {
-    assert.match(JSON.stringify(event.site?.condition ?? event.edge?.condition), /"values":\["browser","server","worker"\]/u);
+    const record = event.site ?? event.edge;
+    const serialized = JSON.stringify(record.condition);
+    if (record.evidence[0]?.properties?.contract_version === "framework-semantic-graph-v1") {
+      assert.match(serialized, /"key":"environment","value":"(?:browser|server|worker)"/u);
+    } else {
+      assert.match(serialized, /"values":\["browser","server","worker"\]/u);
+    }
   }
 });
 

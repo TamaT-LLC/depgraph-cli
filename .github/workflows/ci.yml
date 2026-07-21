@@ -95,9 +95,13 @@ jobs:
                 and .extractor == "typescript-native-typechecker" and .extractor_version == "7.0.2"
               )] as $semantic_site_evidence
             | [$semantic_site_evidence[].owner_id] | unique as $semantic_site_ids
+            | [$graph.evidence[] | select(
+                .owner_type == "edge" and .ordinal == 0 and .kind == "semantic"
+                and .extractor == "typescript-native-typechecker" and .extractor_version == "7.0.2"
+              ) | .owner_id] | unique as $semantic_edge_ids
             | [$graph.sites[] | select(.id as $id | $semantic_site_ids | index($id))] as $semantic_sites
             | [$semantic_sites[] | select(.kind == "call")] as $call_sites
-            | [$graph.edges[] | select(.phase == "semantic")] as $semantic_edges
+            | [$graph.edges[] | select(.id as $id | $semantic_edge_ids | index($id))] as $semantic_edges
             | [$semantic_edges[] | select(.site_id == null)] as $definition_edges
             | [$semantic_edges[] | select(.site_id != null)] as $dependency_edges
             | [$graph.nodes[] | select(.kind == "symbol" or .kind == "type")] as $semantic_nodes
@@ -516,7 +520,12 @@ jobs:
             $nodeKinds[$_.node.id] = $_.node.kind
             $nodesById[$_.node.id] = $_.node
           }
-          $semanticEdges = @($events | Where-Object { $_.edge.phase -eq 'semantic' })
+          $semanticEdges = @($events | Where-Object {
+            $_.edge.phase -eq 'semantic' -and
+            $_.edge.evidence[0].kind -eq 'semantic' -and
+            $_.edge.evidence[0].extractor -eq 'typescript-native-typechecker' -and
+            $_.edge.evidence[0].extractor_version -eq '7.0.2'
+          })
           $definitionEdges = @($semanticEdges | Where-Object { $null -eq $_.edge.site_id })
           $dependencyEdges = @($semanticEdges | Where-Object { $null -ne $_.edge.site_id })
           $semanticSites = @($events | Where-Object {

@@ -7,6 +7,7 @@ import {
   type Evidence,
   type GraphEdge,
   type GraphNode,
+  type FrameworkSemanticSummary,
   type JsonValue,
 } from "./types";
 
@@ -20,6 +21,19 @@ export const WEB_FRAMEWORK_SEMANTIC_PROFILE_PROPERTIES = Object.freeze({
   web_framework_semantic_site_count: "0",
   web_framework_semantic_edge_count: "0",
 } as const);
+
+export function frameworkSemanticProfileProperties(
+  summary: FrameworkSemanticSummary,
+): Record<string, string> {
+  return {
+    web_framework_semantic_capability: WEB_FRAMEWORK_SEMANTIC_CAPABILITY,
+    web_framework_semantic_status: summary.status,
+    web_framework_semantic_extractor_version: WEB_FRAMEWORK_SEMANTIC_EXTRACTOR_VERSION,
+    web_framework_semantic_node_count: String(summary.nodes),
+    web_framework_semantic_site_count: String(summary.sites),
+    web_framework_semantic_edge_count: String(summary.edges),
+  };
+}
 
 const FRAMEWORK_NODE_KINDS = new Set(["component", "route", "server_function", "middleware"]);
 const FRAMEWORK_SITE_KINDS = new Set([

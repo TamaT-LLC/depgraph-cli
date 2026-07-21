@@ -233,6 +233,16 @@ export interface ScanModel {
   lockfile: string | null;
   detectedFrameworks: string[];
   typeScriptProject: TypeScriptProjectSummary;
+  frameworkSemantic: FrameworkSemanticSummary;
+}
+
+export interface FrameworkSemanticSummary {
+  status: "not-emitted" | "emitted" | "discarded";
+  nodes: number;
+  sites: number;
+  edges: number;
+  emittedFrameworks: string[];
+  pendingFrameworks: string[];
 }
 
 export interface TypeScriptProjectSummary {
