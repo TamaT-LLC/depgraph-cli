@@ -12915,7 +12915,7 @@ spawn(process.execPath, ["-e", {}], {{ stdio: "ignore" }});
 setInterval(() => undefined, 1_000);
 "#,
             serde_json::to_string(&format!(
-                "setTimeout(() => require('node:fs').writeFileSync({}, 'survived'), 1500); setInterval(() => undefined, 1000);",
+                "setTimeout(() => require('node:fs').writeFileSync({}, 'survived'), 3500); setInterval(() => undefined, 1000);",
                 serde_json::to_string(&marker.to_string_lossy())?,
             ))?,
         );
@@ -12926,7 +12926,10 @@ setInterval(() => undefined, 1_000);
             &root,
             "web-timeout-scan",
             &ScanConfig {
-                worker_timeout_seconds: 1,
+                // A cold Windows runner can take over a second to start Node.
+                // Keep the descendant marker beyond this timeout so the test
+                // still proves that the complete process tree was reaped.
+                worker_timeout_seconds: 3,
                 max_protocol_line_bytes: 4096,
                 max_protocol_bytes: 64 * 1024,
                 max_stderr_bytes: 4096,

@@ -331,7 +331,15 @@ func Scan(root string) (Result, error) {
 	// effective cgo state are profile axes even when no custom build tags were
 	// requested; otherwise host scans on different platforms would share IDs.
 	const cgoEnabled = "0"
-	profileID := goProfileID(runtime.GOOS, runtime.GOARCH, cgoEnabled, configuredTags, configuredProfile.CallGraph)
+	profileID := goProfileID(
+		runtime.GOOS,
+		runtime.GOARCH,
+		cgoEnabled,
+		configuredTags,
+		configuredProfile.CallGraph,
+		goPackages.DependencySnapshot.Status,
+		goPackages.DependencySnapshot.Fingerprint,
+	)
 	profileProperties := map[string]string{
 		"variants": "normal,internal_test,external_test", "safe_scan": "true", "configured_tags": strings.Join(configuredTags, ","),
 		"go_call_graph_requested": configuredProfile.CallGraph,
@@ -2063,7 +2071,7 @@ func configuredGoProfile() goProfileConfig {
 	return goProfileConfig{Tags: tags, CallGraph: callGraph}
 }
 
-func goProfileID(goos, goarch, cgo string, tags []string, callGraph string) string {
+func goProfileID(goos, goarch, cgo string, tags []string, callGraph, dependencyStatus, dependencyFingerprint string) string {
 	seen := map[string]bool{}
 	canonicalTags := make([]string, 0, len(tags))
 	for _, tag := range tags {
@@ -2080,6 +2088,8 @@ func goProfileID(goos, goarch, cgo string, tags []string, callGraph string) stri
 		"target=" + strings.TrimSpace(goos) + "-" + strings.TrimSpace(goarch),
 		"cgo=" + strings.TrimSpace(cgo),
 		"variants=normal,internal_test,external_test",
+		"dependency_snapshot_status=" + strings.TrimSpace(dependencyStatus),
+		"dependency_snapshot_fingerprint=" + strings.TrimSpace(dependencyFingerprint),
 	}
 	for _, tag := range canonicalTags {
 		parts = append(parts, "tag="+tag)
@@ -2087,5 +2097,5 @@ func goProfileID(goos, goarch, cgo string, tags []string, callGraph string) stri
 	if strings.TrimSpace(callGraph) == "vta" {
 		parts = append(parts, "call_graph=vta")
 	}
-	return stableID("profile", "go-profile-v1", parts...)
+	return stableID("profile", "go-profile-v2", parts...)
 }

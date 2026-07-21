@@ -622,7 +622,22 @@ parser inventoryはtyped loadの成否にかかわらず保持する。typed pac
 
 partial/fallback時は`go-packages-parser-fallback`、loaded後のextractor失敗時は`go-semantic-incomplete`をcoverage reasonへ記録する。safe scanでは全経路で`project_code_executed=false`を維持する。
 
-stable IDはcanonical JSONから生成し、module/package、node/site/edge、diagnostic、file coverage、candidate target、conditionをcanonical sortする。SSAはserialにbuildする。同一source、Go toolchain、GOOS/GOARCH、build tags、およびoffline dependency availabilityを決定性の入力とする。offline module-cache snapshotは現時点でprofile identityへfingerprintされないため、cache availabilityが異なるrunは同一入力として扱わない。
+stable IDはcanonical JSONから生成し、module/package、node/site/edge、diagnostic、file coverage、candidate target、conditionをcanonical sortする。SSAはserialにbuildする。同一source、Go toolchain、GOOS/GOARCH、build tags、およびoffline dependency snapshotを決定性の入力とする。Go profile ID v2は`go_dependency_snapshot_status`と`go_dependency_snapshot_fingerprint`を入力に含める。
+
+offline dependency snapshotはADR-008に従う。canonical fingerprintへ含める入力は、module requirement / replace / workspace replaceのlocator、`go.sum` / `go.work.sum`のchecksum entry、存在する`vendor/modules.txt`のdigest、および実際にtyped loadが参照したdependency packageのactive / compiled / other / embed file contentである。dependency sourceはadmitted module-cache、repository内local replacement、またはmoduleごとの`vendor`配下だけを読む。module-cache / checkoutのabsolute prefixは、module path + version、`repo:`相対path、package import path、module root相対file pathへ正規化してからcanonical sortする。
+
+標準library、build cache、temporary directory、VCS metadata、未参照のmodule-cache entry、ignored source、host absolute pathはfingerprint payloadへ含めない。読取はregular fileに限定し、symlink、admitted root外、欠損・非regular fileを拒否する。上限はdependency source 100,000 files、合計512 MiB、1 file 64 MiB、checksum/vendor manifest 1 file 8 MiBであり、上限超過を含む失敗理由は固定enumとしてprofileへ記録し、raw pathやerror textをfingerprint/profileへ保存しない。network、package manager、generator、project codeはfingerprint計算のために実行しない。
+
+availability / fallback matrixは次のとおりとする。
+
+| `go_dependency_snapshot_status` | 条件 | typed semantic outcome / cache規則 |
+| --- | --- | --- |
+| `not-applicable` | dependency declaration、checksum、vendor、参照dependency sourceがない | 空snapshotもschema付きfingerprintを持つ |
+| `complete` | dependency入力をすべて安全に読み、全moduleのtyped loadが成功 | typed packageを採用し、fingerprint一致時だけ同一profileとして再利用可能 |
+| `partial` | 一部moduleだけ成功、または安全に読めないsnapshot入力がある | 読取不能dependencyを観測したmoduleのtyped packageをatomicに破棄し、成功module/parser inventoryを保持する。status/reasonをfingerprintへ含める |
+| `unavailable` | dependency入力はあるがtyped moduleを1件も採用できない | parser inventoryへfallbackし、availability reasonをfingerprintへ含める |
+
+fingerprint payloadはschema、status、固定reason集合、sorted declaration、sorted observed package/file digestから生成する。同じdependency bytes / locator / availabilityならcheckoutやcacheの配置が異なっても同じfingerprintとなる。module content、checksum、vendor/replace状態、availability、fallback reasonのいずれかが変わればfingerprintとGo profile IDが変わるため、異なるcache stateを同じsemantic cache keyとして再利用しない。
 
 ## 11. Web Adapter
 
@@ -1000,7 +1015,7 @@ Rustのconfined Cargo mirrorのdirectory名、absolute path、temporary Cargo ho
 
 Rustのconfined Cargo metadata成功とstatic manifest fallbackは、同じrequested profile IDを維持しても同一のeffective analysis outcomeではない。validated crate graphを持つ前者だけがHIR definition / import / re-export / type-use / call graphを出力し、両者のeffective crate / target modelも異なり得るため、success / fallback間ではfull graphだけでなくtarget / module syntax identityの一致も要求しない。各outcomeは同一入力での反復scanおよび別checkout間でそれぞれ決定的でなければならず、fallbackで欠落するsemantic deltaはprofile property、diagnostic、coverage reasonで明示する。HIRを含むfull graphの決定性比較は、confined dependency snapshot、toolchain、requested profile、semantic capabilityが同一のscan間で行う。Issue #29でcross-outcome fallback matrixの最終契約を固定済みであり、同じeffective outcomeの反復scanと別checkoutではprofile、node / site / edge、diagnostic、evidence、coverage ledger、canonical output順が一致する。
 
-Go semantic scanではGOOS/GOARCH、build tags、強制されたcgo無効状態、offline dependency availabilityを決定性の入力に含める。offline module-cache snapshotは現状profile identityへfingerprintされないため、cache stateが異なるscanを同一決定性入力として扱わない。
+Go semantic scanではGOOS/GOARCH、build tags、強制されたcgo無効状態、ADR-008のoffline dependency snapshot status / fingerprintをprofile identityへ含める。module-cache / checkout absolute pathはidentity入力から除外し、同じcanonical snapshotは配置に依存せず同じprofile IDとなる。dependency content、checksum、vendor/replace状態、availability/fallbackが変化した場合は別profile IDとなる。
 
 ### 19.2 性能目標
 
@@ -1049,6 +1064,10 @@ Go semantic scanではGOOS/GOARCH、build tags、強制されたcgo無効状態�
 
 **採用。** Rust HIR は、単一 exact version / revision へ固定した rust-analyzer library 群を既存の `depgraph-rust-worker` へ静的 link し、worker-owned crate graph / `cfg` / confined in-memory VFS で実行する。bundled 外部 rust-analyzer process は安定した bulk HIR export contract を持たず、config / Cargo / proc-macro 起動と別 artifact の監督を増やすため棄却する。system / project-local rust-analyzer は version、integrity、`project_code_executed=false` を保証できないため safe scan で禁止する。library の panic / timeout は既存の worker process 境界で隔離し、同一 process 内で syntax success へ格下げない。現在は `ra_ap_* = 0.0.330`、revision `8954b66d43225e62c92e8bbcc8500191b5cceb1e`、Salsa `0.26.1` を選定し、安全な単一file scaffold、inventory-only multi-file project model、canonical definition graphに加え、canonical `rust_use` / `rust_reexport` / `type_use` / `call` siteと`imports` / `reexports` / `type_uses` / `calls` / `may_call` edgeを出力するimport / type / call vertical sliceまで実装済みである。exact callは静的に一意なtargetへ限定し、closed trait / immutable local function pointerは完全な有限集合だけをcandidateとして保持し、external / unresolved / macro boundaryを無言で欠落させない。Issue #29でfinal fallback / coverageと`semantic-complete`判定を完了し、exact条件を満たすprofileだけを昇格する。Issue #30でpackage/release verifierも完了し、manifest、全artifact/component、backend attestation、query/export/determinism、SBOM/license closure、Tier 1 / Windows、benchmark gateを検証する。source/developmentは`release-gate-pending`を維持し、core-attested archiveだけが`release-gate-verified`でrelease-readyを申告する。規範的な安全境界、fallback、配布、更新手順は9節に定める。
 
+### ADR-008: Canonical Go Offline Dependency Snapshot
+
+**採用。** Go safe scanが実際に参照したoffline dependency sourceと静的resolution inputを、absolute pathを除いたcanonical snapshotとしてfingerprintし、availability statusとともにGo profile ID v2へ含める。admitted inputはmodule-cache、moduleの`vendor`、repository内local replacement、module/work checksumとmanifestに限定する。stdlib、build cache、temporary/VCS/unused cache、symlinkまたはadmitted root外のsourceは除外する。部分読取moduleのtyped deltaはatomicに破棄し、固定reason付き`partial` / `unavailable` outcomeへfallbackする。この方式により、cache配置だけの差はidentityへ影響させず、dependency bytes / locator / checksum / vendor / replace / availabilityの差だけをsemantic cache invalidationへ反映する。
+
 ## 21. Roadmap
 
 ### Milestone 0: Schema and Contract
@@ -1073,6 +1092,7 @@ Go semantic scanではGOOS/GOARCH、build tags、強制されたcgo無効状態�
 - Go symbol / type / value reference / direct call / RTA・CHA candidate callとCLI query/export E2E: 実装済み（value referenceはIssue #58、2026-07-21）
 - Go opt-in VTA refinement: 実装済み（Issue #56、2026-07-22）
 - Go reflection / unsafe / go:linkname / assembly / plugin / cgo/native callback境界台帳: 実装済み（Issue #57、2026-07-22）
+- Go offline dependency snapshot fingerprint / availability profile identity: 実装済み（Issue #59、2026-07-22）
 - Rust HIR exact pin / neutral probe / inventory-only scaffold: 実装済み
 - Rust HIR inventory-only multi-file VFS / local crate graph / per-crate cfg: 実装済み
 - Rust HIR definition graph（`symbol` / `type`、`declares` / `extends` / `implements` / `instantiates`）: 実装済み（Issue #26）
@@ -1120,7 +1140,6 @@ Go semantic scanではGOOS/GOARCH、build tags、強制されたcgo無効状態�
 ## 23. Open Questions
 
 - binary / product の最終名称を `depgraph` とするか
-- Goのoffline dependency source / module-cache snapshotをprofile identityへどうfingerprintするか
 - Next.js の既存 adapter と observer を安全に chain する方法
 - default profile matrix の範囲と組合せ爆発の抑制方法
 - Rust compiler-precise MIR backend をどの opt-in toolchain channel で提供するか（safe HIR backend の方式は ADR-007 で決定済み）
@@ -1147,6 +1166,7 @@ Go semantic scanではGOOS/GOARCH、build tags、強制されたcgo無効状態�
 
 ## 26. 更新履歴
 
+- 2026-07-22: Issue #59としてADR-008のGo offline dependency snapshotを実装。module requirement / replace、go.sum/go.work.sum checksum、vendor manifest、実際に参照したmodule-cache/vendor/local replacement sourceをcanonical fingerprintへまとめ、`complete / partial / unavailable / not-applicable` statusとともにGo profile ID v2へ組み込んだ。absolute cache/checkout path、stdlib、build/temp/VCS/unused cacheを除外し、regular file・admitted root・file/byte上限をfail closedに検証する。読取不能dependencyを観測したmoduleのtyped deltaはatomicに破棄し、固定reasonでparser fallback/cache invalidationを明示する。別checkout/cache同一性、content/availability差分、symlink拒否、path非漏洩、race、CLI E2Eで検証する。
 - 2026-07-22: Issue #57としてGoのclosed-world call graph境界を強化。`reflect.Value.Call` / `CallSlice`を専用reason付きunknown targetへ、`MethodByName` / `FieldByName` / `MakeFunc`をexact external API callとruntime boundary evidenceの併存へ分類した。parser inventoryからunsafe / plugin import、`go:linkname`、bodyless declaration、assembly `TEXT`、cgo import/directive/library/header、`//export` callbackをsource-spanned siteへ昇格し、native identityをtyped sentinelへ正規化した。全boundary siteを同一span/profile/reason/`site_id`の`go_callgraph_limit`と相関し、profileへkind/count/completeness policyを集約する。semantic-completeとの併存、broken/partial module、coverage conservation、反復scan、race、CLI export/unresolved E2Eで検証する。
 - 2026-07-22: Issue #56としてGo SSAへopt-in VTA refinementを実装。`profiles.go_call_graph = "vta"`だけがcomplete dependency bodyと`InstantiateGenerics | BuildSerially`のSSAへVTAを適用し、既定`rta-cha` profileのidentity/candidate topologyを維持する。VTA profileは別identityとし、soundなCHA初期graphからrefineする。construction失敗、不完全program、site欠落、空集合はRTA/CHAへ理由付きfallbackし、canonical化不能targetが1件でもあれば部分候補を出さない。profileとsite/edge evidenceへrequested/effective algorithm、fallback、candidate countを記録し、CHA/RTA/VTA比較、singleton overapprox、反復scan、race、CLI E2Eで検証する。
 - 2026-07-22: Issue #55としてWeb semantic graphのpackage/release verifierを完成。Web worker manifestへTypeScript `7.0.2`、7つのversioned capability、`astro-parser-wasm@4.0.0` / `typescript-native-compiler@7.0.2` component identityをattestし、worker handshakeとcore/doctorでexact照合する。Astro WASMを`libexec/astro/astro.wasm` whole-tree componentへ移し、Web worker、Astro、TypeScript、schema/manifestのmissing / tamper / added entry / symlink / version・capability mismatchをworker起動前にexit `4`で拒否する。抽出archiveでpure TypeScript、各framework、mixed profileのscan/query/export、別checkout JSON/DOT/Mermaid決定性を検証し、Linux/macOS package gate、Windows安全性/決定性smoke、Web runtimeのSPDX SBOM/license closureをCIへ追加した。
