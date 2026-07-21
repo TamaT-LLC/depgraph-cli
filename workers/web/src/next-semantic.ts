@@ -193,7 +193,12 @@ function environmentFor(metadata: SourceMetadata | null): string {
   return preferredWebEnvironment("server");
 }
 
-function nextCondition(environment: string, metadata: SourceMetadata | null, kind: RouteContext["routerKind"]): Condition {
+function nextCondition(
+  environment: string,
+  metadata: SourceMetadata | null,
+  kind: RouteContext["routerKind"],
+  httpMethod: typeof NEXT_HTTP_METHODS[number] | null = null,
+): Condition {
   const conditions: Condition[] = [
     { op: "eq", key: "mode", value: "production" },
     { op: "eq", key: "environment", value: environment },
@@ -204,7 +209,14 @@ function nextCondition(environment: string, metadata: SourceMetadata | null, kin
   if (boundary) conditions.push({ op: "eq", key: "next.boundary", value: boundary.value });
   const cache = cacheDirective(metadata);
   if (cache) conditions.push({ op: "eq", key: "next.cache", value: cache });
+  if (httpMethod) conditions.push({ op: "eq", key: "next.method", value: httpMethod });
   return canonicalizeCondition({ op: "all", conditions });
+}
+
+function componentHttpMethod(component: GraphNode): typeof NEXT_HTTP_METHODS[number] | null {
+  const componentKind = component.properties.component_kind;
+  if (typeof componentKind !== "string") return null;
+  return NEXT_HTTP_METHODS.find((method) => componentKind.endsWith(`-${method.toLowerCase()}`)) ?? null;
 }
 
 function evidence(
@@ -614,7 +626,12 @@ export function collectNextSemanticDelta(input: NextSemanticInput): NextSemantic
     if (uniqueComponents.length === 1 || (routeHandler && uniqueComponents.length > 0)) {
       for (const component of uniqueComponents) {
         const componentSpan = spanFromNode(component) ?? defaultEntrySpan(entry);
-        const componentCondition = nextCondition(component.properties.environment as string, entryMetadata, kind);
+        const componentCondition = nextCondition(
+          component.properties.environment as string,
+          entryMetadata,
+          kind,
+          routeHandler ? componentHttpMethod(component) : null,
+        );
         addRelation(
           component,
           [route],

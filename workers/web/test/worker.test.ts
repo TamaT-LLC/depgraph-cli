@@ -285,11 +285,24 @@ test("worker emits deterministic protocol graph without executing project code",
   const clientComponent = frameworkNodes.find((node) => node.kind === "component" && node.display_name === "ClientPanel");
   const lazyComponent = frameworkNodes.find((node) => node.kind === "component" && node.display_name === "LazyPanel");
   const getComponent = frameworkNodes.find((node) => node.kind === "component" && node.display_name === "GET");
+  const sharedHandlerRoute = frameworkNodes.find((node) => (
+    node.kind === "route"
+    && node.properties.canonical_identity?.route_pattern === "/shop/api/shared"
+  ));
+  const sharedHandlerComponents = frameworkNodes.filter((node) => (
+    node.kind === "component"
+    && node.properties.source_path === "apps/next-app/src/app/api/shared/route.ts"
+  ));
   assert.deepEqual(productComponent?.properties.directives, ["use cache"]);
   assert.equal(productComponent?.properties.runtime, "edge");
   assert.equal(clientComponent?.properties.environment, "browser");
   assert.deepEqual(clientComponent?.properties.directives, ["use client"]);
   assert.deepEqual(getComponent?.properties.directives, ["use server"]);
+  assert.deepEqual(
+    sharedHandlerComponents.map((node) => node.properties.component_kind).sort(),
+    ["next-app-route-handler-get", "next-app-route-handler-post"],
+  );
+  assert.equal(new Set(sharedHandlerComponents.map((node) => JSON.stringify(node.properties.source_span))).size, 1);
 
   const frameworkEdge = (kind: string, sourceId: string | undefined, targetId: string | undefined) => frameworkEdges.find((edge) => (
     edge.kind === kind && edge.source === sourceId && edge.target === targetId
@@ -297,6 +310,12 @@ test("worker emits deterministic protocol graph without executing project code",
   const clientBoundary = frameworkEdge("client_boundary", productComponent?.id, clientComponent?.id);
   const serverBoundary = frameworkEdge("server_boundary", getComponent?.id, getComponent?.id);
   const literalDynamicRender = frameworkEdge("renders", productComponent?.id, lazyComponent?.id);
+  const sharedHandlerIds = new Set(sharedHandlerComponents.map((node) => node.id));
+  const sharedHandlerRenders = frameworkEdges.filter((edge) => (
+    edge.kind === "renders"
+    && edge.source === sharedHandlerRoute?.id
+    && sharedHandlerIds.has(edge.target)
+  ));
   const unresolvedDynamicRender = frameworkEdges.find((edge) => (
     edge.kind === "renders"
     && edge.source === productComponent?.id
@@ -313,6 +332,20 @@ test("worker emits deterministic protocol graph without executing project code",
   assert.match(JSON.stringify(serverBoundary?.condition), /"next\.boundary","value":"use server"/u);
   assert.equal(literalDynamicRender?.resolution_status, "resolved");
   assert.equal(literalDynamicRender?.evidence[0]?.properties.occurrence_kind, "next_dynamic_render");
+  assert.equal(sharedHandlerRenders.length, 2);
+  assert.equal(new Set(sharedHandlerRenders.map((edge) => edge.site_id)).size, 2);
+  assert.deepEqual(
+    sharedHandlerRenders.map((edge) => (
+      edge.condition.conditions?.find((condition: Record<string, any>) => condition.key === "next.method")?.value
+    )).sort(),
+    ["GET", "POST"],
+  );
+  assert.ok(sharedHandlerRenders.every((edge) => frameworkSites.some((site) => (
+    site.id === edge.site_id
+    && site.source === sharedHandlerRoute?.id
+    && site.target_ids.length === 1
+    && site.target_ids[0] === edge.target
+  ))));
   assert.equal(unresolvedDynamicRender?.precision, "heuristic");
   assert.equal(nodeById.get(unresolvedDynamicRender?.target)?.kind, "unknown_target");
   assert.deepEqual(
