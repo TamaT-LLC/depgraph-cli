@@ -887,9 +887,10 @@ fn validate_semantic_maps(
         };
         let expected_edge_kind = semantic_edge_kind_for_site(site, linked_to_strict_site);
         if expected_edge_kind.is_none() {
-            if is_common_semantic_edge_kind(edge.kind.as_str()) {
+            if is_common_semantic_edge_kind(edge.kind.as_str()) || is_framework_semantic_edge(edge)
+            {
                 return invariant(format!(
-                    "semantic edge {} of kind {} requires a call, type_use, or value_reference dependency site, found {}",
+                    "semantic edge {} of kind {} requires a compatible semantic dependency site, found {}",
                     edge.id, edge.kind, site.kind
                 ));
             }
@@ -920,6 +921,10 @@ fn validate_semantic_maps(
         let rust_semantic_site = is_rust_semantic_dependency_site(site, source_node);
         let web_semantic_site = is_web_semantic_dependency_site(site, source_node);
         let go_semantic_site = is_go_semantic_dependency_site(site, source_node);
+        let framework_semantic_site = is_framework_semantic_site_kind(&site.kind);
+        if framework_semantic_site {
+            validate_framework_site_endpoints(nodes, site)?;
+        }
         match site.kind.as_str() {
             "call" if source_node.kind != "symbol" => {
                 return invariant(format!(
@@ -1086,8 +1091,10 @@ fn validate_semantic_maps(
         // Rust HIR sites currently use one condition for every target. Web
         // conditional exports may narrow each candidate edge to its own
         // browser/server/package branch while the site carries their union.
-        let require_same_condition =
-            rust_semantic_site || go_semantic_site || (web_semantic_site && site.kind == "call");
+        let require_same_condition = rust_semantic_site
+            || go_semantic_site
+            || framework_semantic_site
+            || (web_semantic_site && site.kind == "call");
         for edge in edges
             .values()
             .filter(|edge| edge.site_id.as_deref() == Some(site.id.as_str()))
@@ -1114,6 +1121,9 @@ fn validate_semantic_maps(
                     edge.id, site.id
                 ));
             }
+            if framework_semantic_site {
+                validate_framework_edge_contract(nodes, site, edge)?;
+            }
         }
     }
     Ok(())
@@ -1121,6 +1131,42 @@ fn validate_semantic_maps(
 
 fn is_common_semantic_edge_kind(kind: &str) -> bool {
     matches!(kind, "type_uses" | "references" | "calls" | "may_call")
+}
+
+fn is_framework_semantic_node_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "component" | "route" | "server_function" | "middleware"
+    )
+}
+
+fn is_framework_semantic_site_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "renders"
+            | "hydrates"
+            | "client_boundary"
+            | "server_boundary"
+            | "route_entry"
+            | "parent_route"
+            | "loads"
+            | "before_load"
+            | "navigates_to"
+            | "masks_to"
+            | "rpc_call"
+            | "client_stub_for"
+            | "handled_by"
+            | "uses_middleware"
+    )
+}
+
+fn is_framework_semantic_edge(edge: &GraphEdge) -> bool {
+    is_framework_semantic_site_kind(&edge.kind)
+        && (edge.phase == Phase::Semantic
+            || edge
+                .evidence
+                .first()
+                .is_some_and(|evidence| evidence.kind == EvidenceKind::Semantic))
 }
 
 fn is_definition_relation_kind(kind: &str) -> bool {
@@ -1190,7 +1236,7 @@ fn is_rust_import_site_kind(kind: &str) -> bool {
 }
 
 fn is_evidence_driven_semantic_site(site: &DependencySite) -> bool {
-    matches!(
+    (matches!(
         site.kind.as_str(),
         "call"
             | "type_use"
@@ -1199,10 +1245,11 @@ fn is_evidence_driven_semantic_site(site: &DependencySite) -> bool {
             | "rust_reexport"
             | "web_import"
             | "web_reexport"
-    ) && site
-        .evidence
-        .first()
-        .is_some_and(|evidence| evidence.kind == EvidenceKind::Semantic)
+    ) || is_framework_semantic_site_kind(&site.kind))
+        && site
+            .evidence
+            .first()
+            .is_some_and(|evidence| evidence.kind == EvidenceKind::Semantic)
 }
 
 fn source_fallback_edge_kind_for_site(site: &DependencySite) -> Option<&'static str> {
@@ -1311,6 +1358,25 @@ fn semantic_edge_kind_for_site(
         "rust_reexport" if strict_dependency_site => Some("reexports"),
         "web_import" if strict_dependency_site => Some("imports"),
         "web_reexport" if strict_dependency_site => Some("reexports"),
+        kind if strict_dependency_site && is_framework_semantic_site_kind(kind) => {
+            Some(match kind {
+                "renders" => "renders",
+                "hydrates" => "hydrates",
+                "client_boundary" => "client_boundary",
+                "server_boundary" => "server_boundary",
+                "route_entry" => "route_entry",
+                "parent_route" => "parent_route",
+                "loads" => "loads",
+                "before_load" => "before_load",
+                "navigates_to" => "navigates_to",
+                "masks_to" => "masks_to",
+                "rpc_call" => "rpc_call",
+                "client_stub_for" => "client_stub_for",
+                "handled_by" => "handled_by",
+                "uses_middleware" => "uses_middleware",
+                _ => unreachable!("framework site kind checked above"),
+            })
+        }
         _ => None,
     }
 }
@@ -1406,12 +1472,23 @@ fn validate_site(site: &DependencySite) -> Result<(), ProtocolError> {
 }
 
 fn validate_semantic_node(node: &GraphNode) -> Result<(), ProtocolError> {
+    // `route` existed in the protocol-v1 source graph before the framework
+    // semantic contract. It opts into the strict identity only by carrying the
+    // canonical identity; semantic framework edges require that opt-in below.
+    if is_framework_semantic_node_kind(&node.kind)
+        && !node.properties.contains_key("canonical_identity")
+    {
+        return Ok(());
+    }
     let kind_property = match node.kind.as_str() {
         "symbol" => "symbol_kind",
         "type" => "type_kind",
+        "component" => "component_kind",
+        "route" => "route_kind",
+        "server_function" => "server_function_kind",
+        "middleware" => "middleware_kind",
         _ => return Ok(()),
     };
-    let language = required_node_property(node, "language")?;
     let package_locator = required_node_property(node, "package_locator")?;
     let semantic_kind = required_node_property(node, kind_property)?;
     let identity = node.properties.get("canonical_identity").ok_or_else(|| {
@@ -1426,11 +1503,18 @@ fn validate_semantic_node(node: &GraphNode) -> Result<(), ProtocolError> {
             node.kind, node.id
         ));
     }
-    for (field, expected) in [
-        ("language", language),
+    let mut mirrored = vec![
         ("package_locator", package_locator),
         (kind_property, semantic_kind),
-    ] {
+    ];
+    if matches!(node.kind.as_str(), "symbol" | "type") {
+        mirrored.insert(0, ("language", required_node_property(node, "language")?));
+    } else {
+        mirrored.insert(0, ("framework", required_node_property(node, "framework")?));
+        mirrored.push(("environment", required_node_property(node, "environment")?));
+        required_node_property(node, "profile_id")?;
+    }
+    for (field, expected) in mirrored {
         let found = required_identity_string(identity, field, &node.id)?;
         if found != expected {
             return invariant(format!(
@@ -1445,6 +1529,26 @@ fn validate_semantic_node(node: &GraphNode) -> Result<(), ProtocolError> {
         "type" => {
             required_identity_string(identity, "resolver_identity", &node.id)?;
         }
+        "component" | "server_function" => {
+            validate_framework_identity_base(identity, &node.id)?;
+            required_identity_string(identity, "resolver_identity", &node.id)?;
+        }
+        "route" => {
+            validate_framework_identity_base(identity, &node.id)?;
+            required_identity_string(identity, "router_instance", &node.id)?;
+            let pattern = required_identity_string(identity, "route_pattern", &node.id)?;
+            if !pattern.starts_with('/') {
+                return invariant(format!(
+                    "route node {} canonical_identity.route_pattern must start with /",
+                    node.id
+                ));
+            }
+        }
+        "middleware" => {
+            validate_framework_identity_base(identity, &node.id)?;
+            required_identity_string(identity, "resolver_identity", &node.id)?;
+            required_identity_string(identity, "scope", &node.id)?;
+        }
         _ => unreachable!("semantic node kind matched above"),
     }
 
@@ -1455,6 +1559,20 @@ fn validate_semantic_node(node: &GraphNode) -> Result<(), ProtocolError> {
             node.kind, node.id, expected_id
         ));
     }
+    Ok(())
+}
+
+fn validate_framework_identity_base(identity: &Value, node_id: &str) -> Result<(), ProtocolError> {
+    let framework = required_identity_string(identity, "framework", node_id)?;
+    if !matches!(
+        framework,
+        "next" | "astro" | "tanstack-router" | "tanstack-start"
+    ) {
+        return invariant(format!(
+            "framework semantic node {node_id} has unsupported framework {framework:?}"
+        ));
+    }
+    required_identity_string(identity, "environment", node_id)?;
     Ok(())
 }
 
@@ -1580,7 +1698,10 @@ fn validate_semantic_edge(
     if is_semantic_definition_relation(edge) {
         return validate_semantic_definition_relation(edge);
     }
-    if !is_common_semantic_edge_kind(edge.kind.as_str()) && !linked_to_strict_site {
+    if !is_common_semantic_edge_kind(edge.kind.as_str())
+        && !linked_to_strict_site
+        && !is_framework_semantic_edge(edge)
+    {
         return Ok(());
     }
     if edge.phase != Phase::Semantic {
@@ -1717,6 +1838,31 @@ fn validate_semantic_site(
     if site.kind == "call" && site.resolution_status == ResolutionStatus::Candidates {
         validate_candidate_algorithm(&format!("candidate call site {}", site.id), primary)?;
     }
+    if is_framework_semantic_site_kind(&site.kind) {
+        validate_framework_semantic_evidence(
+            &format!("framework semantic dependency site {}", site.id),
+            &site.profile_id,
+            &site.evidence,
+        )?;
+        if !condition_has_environment_predicate(&site.condition) {
+            return invariant(format!(
+                "framework semantic dependency site {} condition must include an environment predicate",
+                site.id
+            ));
+        }
+        if site.resolution_status == ResolutionStatus::Candidates {
+            if !framework_site_allows_candidates(&site.kind) {
+                return invariant(format!(
+                    "framework semantic dependency site {} of kind {} cannot use candidates",
+                    site.id, site.kind
+                ));
+            }
+            validate_candidate_algorithm(
+                &format!("candidate framework dependency site {}", site.id),
+                primary,
+            )?;
+        }
+    }
     if site.kind == "value_reference" {
         if site.resolution_status == ResolutionStatus::Candidates {
             return invariant(format!(
@@ -1782,6 +1928,265 @@ fn validate_semantic_site(
             "semantic dependency site {} does not match its canonical identity; expected {}",
             site.id, expected_id
         ));
+    }
+    Ok(())
+}
+
+fn framework_site_allows_candidates(kind: &str) -> bool {
+    matches!(
+        kind,
+        "renders"
+            | "parent_route"
+            | "loads"
+            | "before_load"
+            | "navigates_to"
+            | "masks_to"
+            | "rpc_call"
+            | "handled_by"
+            | "uses_middleware"
+    )
+}
+
+fn validate_framework_semantic_evidence(
+    owner: &str,
+    profile_id: &str,
+    evidence: &[Evidence],
+) -> Result<(), ProtocolError> {
+    let primary = evidence
+        .first()
+        .expect("semantic framework evidence was validated as non-empty");
+    let framework = primary
+        .properties
+        .get("framework")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            ProtocolError::Invariant(format!(
+                "{owner} primary evidence must include non-empty properties.framework"
+            ))
+        })?;
+    let expected_extractor = match framework {
+        "next" => "next-static-adapter",
+        "astro" => "astro-static-adapter",
+        "tanstack-router" => "tanstack-router-static-adapter",
+        "tanstack-start" => "tanstack-start-static-adapter",
+        other => {
+            return invariant(format!(
+                "{owner} primary evidence has unsupported framework {other:?}"
+            ));
+        }
+    };
+    if primary.extractor != expected_extractor || primary.extractor_version != "0.1.0" {
+        return invariant(format!(
+            "{owner} primary evidence must use {expected_extractor}@0.1.0"
+        ));
+    }
+    for (property, expected) in [
+        ("profile_id", profile_id),
+        ("contract_version", "framework-semantic-graph-v1"),
+    ] {
+        if primary.properties.get(property).and_then(Value::as_str) != Some(expected) {
+            return invariant(format!(
+                "{owner} primary evidence must include properties.{property}={expected:?}"
+            ));
+        }
+    }
+    let occurrence_kind = primary
+        .properties
+        .get("occurrence_kind")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            ProtocolError::Invariant(format!(
+                "{owner} primary evidence must include non-empty properties.occurrence_kind"
+            ))
+        })?;
+    let supporting = evidence.iter().skip(1).any(|support| {
+        support.kind == EvidenceKind::Source
+            && has_complete_span(support)
+            && primary_evidence_anchor(support) == primary_evidence_anchor(primary)
+            && support.properties.get("profile_id").and_then(Value::as_str) == Some(profile_id)
+            && support.properties.get("framework").and_then(Value::as_str) == Some(framework)
+            && support
+                .properties
+                .get("occurrence_kind")
+                .and_then(Value::as_str)
+                == Some(occurrence_kind)
+    });
+    if !supporting {
+        return invariant(format!(
+            "{owner} must include matching source supporting evidence"
+        ));
+    }
+    Ok(())
+}
+
+fn condition_has_environment_predicate(condition: &Condition) -> bool {
+    match condition {
+        Condition::Eq { key, value } => {
+            key == "environment" && value.as_str().is_some_and(|value| !value.is_empty())
+        }
+        Condition::In { key, values } => {
+            key == "environment"
+                && !values.is_empty()
+                && values
+                    .iter()
+                    .all(|value| value.as_str().is_some_and(|value| !value.is_empty()))
+        }
+        Condition::All { conditions } | Condition::Any { conditions } => {
+            conditions.iter().any(condition_has_environment_predicate)
+        }
+        Condition::Not { .. } | Condition::Defined { .. } => false,
+    }
+}
+
+fn condition_allows_environment(condition: &Condition, environment: &str) -> bool {
+    match condition {
+        Condition::Eq { key, value } if key == "environment" => value.as_str() == Some(environment),
+        Condition::In { key, values } if key == "environment" => values
+            .iter()
+            .any(|value| value.as_str() == Some(environment)),
+        Condition::All { conditions } | Condition::Any { conditions } => conditions
+            .iter()
+            .filter(|condition| condition_has_environment_predicate(condition))
+            .any(|condition| condition_allows_environment(condition, environment)),
+        _ => false,
+    }
+}
+
+fn validate_framework_site_endpoints(
+    nodes: &BTreeMap<String, GraphNode>,
+    site: &DependencySite,
+) -> Result<(), ProtocolError> {
+    let source = nodes
+        .get(&site.source)
+        .expect("base validation requires framework site sources");
+    let valid_source = match site.kind.as_str() {
+        "renders" => matches!(source.kind.as_str(), "component" | "route"),
+        "hydrates" | "client_boundary" | "server_boundary" => source.kind == "component",
+        "route_entry" => matches!(
+            source.kind.as_str(),
+            "file" | "symbol" | "component" | "server_function"
+        ),
+        "parent_route" | "loads" | "before_load" => source.kind == "route",
+        "navigates_to" | "masks_to" => {
+            matches!(source.kind.as_str(), "component" | "route" | "symbol")
+        }
+        "rpc_call" => matches!(source.kind.as_str(), "component" | "route" | "symbol"),
+        "client_stub_for" => source.kind == "symbol",
+        "handled_by" => matches!(source.kind.as_str(), "route" | "server_function"),
+        "uses_middleware" => matches!(source.kind.as_str(), "route" | "server_function"),
+        _ => false,
+    };
+    if !valid_source {
+        return invariant(format!(
+            "framework semantic site {} of kind {} has incompatible source {} ({})",
+            site.id, site.kind, source.id, source.kind
+        ));
+    }
+
+    if matches!(
+        site.resolution_status,
+        ResolutionStatus::External | ResolutionStatus::Unresolved
+    ) {
+        return Ok(());
+    }
+    for target_id in &site.target_ids {
+        let target = nodes
+            .get(target_id)
+            .expect("base validation requires framework site targets");
+        let valid_target = match site.kind.as_str() {
+            "renders" | "hydrates" | "client_boundary" | "server_boundary" => {
+                target.kind == "component"
+            }
+            "route_entry" | "parent_route" | "navigates_to" | "masks_to" => target.kind == "route",
+            "loads" | "before_load" => {
+                matches!(target.kind.as_str(), "symbol" | "server_function")
+            }
+            "rpc_call" | "client_stub_for" => target.kind == "server_function",
+            "handled_by" => target.kind == "symbol",
+            "uses_middleware" => target.kind == "middleware",
+            _ => false,
+        };
+        if !valid_target {
+            return invariant(format!(
+                "framework semantic site {} of kind {} has incompatible target {} ({})",
+                site.id, site.kind, target.id, target.kind
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_framework_edge_contract(
+    nodes: &BTreeMap<String, GraphNode>,
+    site: &DependencySite,
+    edge: &GraphEdge,
+) -> Result<(), ProtocolError> {
+    let environment = edge
+        .environment
+        .as_deref()
+        .filter(|value| !value.is_empty() && *value != "any")
+        .ok_or_else(|| {
+            ProtocolError::Invariant(format!(
+                "framework semantic edge {} must declare a concrete environment",
+                edge.id
+            ))
+        })?;
+    if !condition_allows_environment(&edge.condition, environment) {
+        return invariant(format!(
+            "framework semantic edge {} environment {environment:?} is not allowed by its condition",
+            edge.id
+        ));
+    }
+    if edge.evidence != site.evidence {
+        return invariant(format!(
+            "framework semantic edge {} evidence must match dependency site {}",
+            edge.id, site.id
+        ));
+    }
+    validate_framework_semantic_evidence(
+        &format!("framework semantic edge {}", edge.id),
+        &edge.profile_id,
+        &edge.evidence,
+    )?;
+    let framework = edge.evidence[0]
+        .properties
+        .get("framework")
+        .and_then(Value::as_str)
+        .expect("framework evidence validation requires framework");
+    for endpoint_id in [&edge.source, &edge.target] {
+        let endpoint = nodes
+            .get(endpoint_id)
+            .expect("base validation requires framework edge endpoints");
+        if is_framework_semantic_node_kind(&endpoint.kind)
+            && !endpoint.properties.contains_key("canonical_identity")
+        {
+            return invariant(format!(
+                "framework semantic edge {} endpoint {} did not opt into the canonical framework identity",
+                edge.id, endpoint.id
+            ));
+        }
+        if is_framework_semantic_node_kind(&endpoint.kind)
+            && endpoint.properties.get("framework").and_then(Value::as_str) != Some(framework)
+        {
+            return invariant(format!(
+                "framework semantic edge {} endpoint {} belongs to another framework",
+                edge.id, endpoint.id
+            ));
+        }
+        if is_framework_semantic_node_kind(&endpoint.kind)
+            && endpoint
+                .properties
+                .get("profile_id")
+                .and_then(Value::as_str)
+                != Some(edge.profile_id.as_str())
+        {
+            return invariant(format!(
+                "framework semantic edge {} endpoint {} belongs to another profile",
+                edge.id, endpoint.id
+            ));
+        }
     }
     Ok(())
 }
