@@ -6,6 +6,8 @@ Every recognized dependency site is retained as `resolved`, `candidates`, `exter
 
 The MVP implements the architecture described in [the system design](docs/40_arch_design/arch-dependency-graph-cli-system-design.md): a Rust core, isolated Rust/Go/Web workers using protocol `1.0` NDJSON, an immutable SQLite evidence store, graph queries, and deterministic JSON/DOT/Mermaid export.
 
+The current Milestone 2 prerelease is [`v0.2.0-rc.1`](docs/releases/v0.2.0-rc.1.md).
+
 ## Supported MVP graph
 
 - Cargo workspace/package/target/dependency and Rust file/module/import/re-export,

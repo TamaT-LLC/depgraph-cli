@@ -89,14 +89,44 @@ jobs:
             dist/*.sha256
           if-no-files-found: error
 
-  publish:
+  verify-assets:
     needs: [package, benchmark]
     runs-on: ubuntu-24.04
     steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install 1.93.1 --profile minimal
+      - run: rustup default 1.93.1
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
           merge-multiple: true
-      - env:
+      - name: Verify five-target release asset closure
+        run: cargo xtask verify-release-assets artifacts
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-verification
+          path: artifacts/release-verification.json
+          if-no-files-found: error
+
+  publish:
+    needs: verify-assets
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Publish verified release candidate
+        shell: bash
+        env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "${GITHUB_REF_NAME}" artifacts/* --repo "${GITHUB_REPOSITORY}" --generate-notes --verify-tag
+        run: |
+          set -euo pipefail
+          notes="docs/releases/${GITHUB_REF_NAME}.md"
+          test -f "$notes"
+          args=(release create "${GITHUB_REF_NAME}" artifacts/* --repo "${GITHUB_REPOSITORY}" --notes-file "$notes" --verify-tag)
+          if [[ "${GITHUB_REF_NAME}" == *-* ]]; then
+            args+=(--prerelease)
+          fi
+          gh "${args[@]}"
