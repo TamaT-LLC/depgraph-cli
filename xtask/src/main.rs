@@ -314,7 +314,18 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
             bail!("system design release metadata is missing {required:?}");
         }
     }
+    let git_attributes = fs::read_to_string(root.join(".gitattributes"))?;
     for (path, expected) in PROJECT_LICENSES {
+        let required_attribute = format!("{path} text eol=lf");
+        if !git_attributes
+            .lines()
+            .any(|line| line.trim() == required_attribute)
+        {
+            bail!("project license {path} is not pinned to LF in .gitattributes");
+        }
+        if expected.contains(&b'\r') {
+            bail!("project license source {path} is not LF-normalized");
+        }
         let actual = fs::read(root.join(path))?;
         if actual != *expected {
             bail!("project license source {path} differs from its compiled release input");

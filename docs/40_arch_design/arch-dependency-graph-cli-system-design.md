@@ -1179,6 +1179,7 @@ Go semantic scanではGOOS/GOARCH、build tags、強制されたcgo無効状態�
 
 ## 26. 更新履歴
 
+- 2026-07-22: `v0.2.0-rc.1` aggregate verifierがWindows checkout由来のCRLF project licenseを検出したため、`LICENSE-APACHE` / `LICENSE-MIT`を`.gitattributes`でLFへ固定した。xtask metadata gateもattributeとcompiled bytesのCR不在を検証し、全targetでchecksumだけでなくproject license bytesそのものを一致させる。
 - 2026-07-22: `v0.2.0-rc.1`初回tag runのhosted runner性能差を記録し、開発機の暫定target 30秒/500msを維持したまま、共有Linux runnerのrelease ceilingを60秒/1.5秒として明示した。benchmark fixture、10,000 files、semantic completeness検証、raw timing出力は変更せず、runner差を閾値へ隠さない。
 - 2026-07-22: Issue #61としてMilestone 2 Semantic Graph release candidate `v0.2.0-rc.1`を確定。Cargo product crates、Rust/Go/Web adapter handshake、manifest、SBOM、archive名を同期し、protocol/schema互換性は`1.0`を維持する。Go/Rust/Web/framework semantic scope、安全境界、完全性条件、既知制約をrelease noteへ整理した。release workflowはquality/benchmark後にLinux x64/arm64、macOS x64/arm64、Windows x64のnative package gateを実行し、公開前のaggregate gateで全checksum、archive layout、artifact/component digest、worker attestation、SBOM、project/third-party license分離を再検証してmachine-readable reportを添付する。
 - 2026-07-22: Issue #60としてproject license・README・release metadataを整備。`LICENSE-MIT` / `LICENSE-APACHE`の全文とTamaT LLCのcopyrightを明示し、release manifestの`MIT OR Apache-2.0`宣言と両licenseの独立checksum attestationを追加した。archiveのlicense欠損・改ざん・重複・宣言不一致をworker起動前にfail closedとし、third-party inventoryと区別してdoctorへintegrityを公開する。READMEのTypeScript/JavaScriptおよびNext.js / Astro / TanStackの現行semantic graph対応範囲、未実装境界、worker/runtime versionを実装と同期し、package gateでmetadata driftを回帰検証する。
