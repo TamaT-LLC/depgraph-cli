@@ -49,6 +49,15 @@ const TYPESCRIPT_SEMANTIC_EMISSION_IMPORT_TYPE_CALL_GRAPH_V2: &str =
     "definition-import-type-call-graph-v2";
 const TYPESCRIPT_SEMANTIC_SITE_COUNT_PROPERTY: &str = "typescript_semantic_site_count";
 const TYPESCRIPT_SEMANTIC_CALL_SITE_COUNT_PROPERTY: &str = "typescript_semantic_call_site_count";
+const WEB_FRAMEWORK_SEMANTIC_CAPABILITY_PROPERTY: &str = "web_framework_semantic_capability";
+const WEB_FRAMEWORK_SEMANTIC_CAPABILITY_V1: &str = "framework-semantic-graph-v1";
+const WEB_FRAMEWORK_SEMANTIC_STATUS_PROPERTY: &str = "web_framework_semantic_status";
+const WEB_FRAMEWORK_SEMANTIC_EXTRACTOR_VERSION_PROPERTY: &str =
+    "web_framework_semantic_extractor_version";
+const WEB_FRAMEWORK_SEMANTIC_EXTRACTOR_VERSION: &str = "0.1.0";
+const WEB_FRAMEWORK_SEMANTIC_NODE_COUNT_PROPERTY: &str = "web_framework_semantic_node_count";
+const WEB_FRAMEWORK_SEMANTIC_SITE_COUNT_PROPERTY: &str = "web_framework_semantic_site_count";
+const WEB_FRAMEWORK_SEMANTIC_EDGE_COUNT_PROPERTY: &str = "web_framework_semantic_edge_count";
 const TYPESCRIPT_SEMANTIC_EXTRACTOR: &str = "typescript-native-typechecker";
 const TYPESCRIPT_SEMANTIC_BACKEND: &str = "typescript-native-compiler";
 const TYPESCRIPT_CLOSED_LOCAL_CALL_FLOW_ALGORITHM: &str = "typescript-closed-local-call-flow-v1";
@@ -1719,6 +1728,57 @@ fn is_web_semantic_dependency_edge_kind(kind: &str) -> bool {
     )
 }
 
+fn is_web_framework_semantic_node(node: &depgraph_protocol::GraphNode) -> bool {
+    matches!(
+        node.kind.as_str(),
+        "component" | "route" | "server_function" | "middleware"
+    ) && node.properties.contains_key("canonical_identity")
+}
+
+fn is_web_framework_semantic_site_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "renders"
+            | "hydrates"
+            | "client_boundary"
+            | "server_boundary"
+            | "route_entry"
+            | "parent_route"
+            | "loads"
+            | "before_load"
+            | "navigates_to"
+            | "masks_to"
+            | "rpc_call"
+            | "client_stub_for"
+            | "handled_by"
+            | "uses_middleware"
+    )
+}
+
+fn is_web_framework_semantic_delta_event(event: &ProtocolEvent) -> bool {
+    match event {
+        ProtocolEvent::NodeUpsert(upsert) => is_web_framework_semantic_node(&upsert.node),
+        ProtocolEvent::EdgeUpsert(upsert) => {
+            is_web_framework_semantic_site_kind(&upsert.edge.kind)
+                && (upsert.edge.phase == Phase::Semantic
+                    || upsert
+                        .edge
+                        .evidence
+                        .first()
+                        .is_some_and(|evidence| evidence.kind == EvidenceKind::Semantic))
+        }
+        ProtocolEvent::DependencySite(site) => {
+            is_web_framework_semantic_site_kind(&site.site.kind)
+                && site
+                    .site
+                    .evidence
+                    .first()
+                    .is_some_and(|evidence| evidence.kind == EvidenceKind::Semantic)
+        }
+        _ => false,
+    }
+}
+
 fn web_semantic_edge_kind_for_site(
     kind: &str,
     resolution_status: ResolutionStatus,
@@ -1750,21 +1810,106 @@ fn is_web_semantic_delta_event(event: &ProtocolEvent) -> bool {
             matches!(upsert.node.kind.as_str(), "symbol" | "type")
         }
         ProtocolEvent::EdgeUpsert(upsert) => {
-            upsert.edge.phase == Phase::Semantic
-                || is_web_definition_relation_kind(upsert.edge.kind.as_str())
+            !is_web_framework_semantic_site_kind(&upsert.edge.kind)
+                && (upsert.edge.phase == Phase::Semantic
+                    || is_web_definition_relation_kind(upsert.edge.kind.as_str()))
         }
         ProtocolEvent::DependencySite(site) => {
-            matches!(
-                site.site.kind.as_str(),
-                "call" | "type_use" | "rust_use" | "rust_reexport" | "web_import" | "web_reexport"
-            ) || site
-                .site
-                .evidence
-                .first()
-                .is_some_and(|evidence| evidence.kind == EvidenceKind::Semantic)
+            !is_web_framework_semantic_site_kind(&site.site.kind)
+                && (matches!(
+                    site.site.kind.as_str(),
+                    "call"
+                        | "type_use"
+                        | "rust_use"
+                        | "rust_reexport"
+                        | "web_import"
+                        | "web_reexport"
+                ) || site
+                    .site
+                    .evidence
+                    .first()
+                    .is_some_and(|evidence| evidence.kind == EvidenceKind::Semantic))
         }
         _ => false,
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WebFrameworkSemanticState {
+    Legacy,
+    NotEmitted,
+    Emitted,
+    Discarded,
+}
+
+fn web_framework_semantic_state(
+    properties: &depgraph_protocol::Properties,
+) -> std::result::Result<WebFrameworkSemanticState, String> {
+    let tracked = [
+        WEB_FRAMEWORK_SEMANTIC_CAPABILITY_PROPERTY,
+        WEB_FRAMEWORK_SEMANTIC_STATUS_PROPERTY,
+        WEB_FRAMEWORK_SEMANTIC_EXTRACTOR_VERSION_PROPERTY,
+        WEB_FRAMEWORK_SEMANTIC_NODE_COUNT_PROPERTY,
+        WEB_FRAMEWORK_SEMANTIC_SITE_COUNT_PROPERTY,
+        WEB_FRAMEWORK_SEMANTIC_EDGE_COUNT_PROPERTY,
+    ];
+    let present = tracked
+        .iter()
+        .filter(|property| properties.contains_key(**property))
+        .count();
+    if present == 0 {
+        return Ok(WebFrameworkSemanticState::Legacy);
+    }
+    if present != tracked.len() {
+        return Err(
+            "Web worker reported a partial framework semantic capability declaration".into(),
+        );
+    }
+    if properties
+        .get(WEB_FRAMEWORK_SEMANTIC_CAPABILITY_PROPERTY)
+        .and_then(Value::as_str)
+        != Some(WEB_FRAMEWORK_SEMANTIC_CAPABILITY_V1)
+    {
+        return Err("Web worker reported an unapproved framework semantic capability".into());
+    }
+    if properties
+        .get(WEB_FRAMEWORK_SEMANTIC_EXTRACTOR_VERSION_PROPERTY)
+        .and_then(Value::as_str)
+        != Some(WEB_FRAMEWORK_SEMANTIC_EXTRACTOR_VERSION)
+    {
+        return Err(
+            "Web worker reported an unapproved framework semantic extractor version".into(),
+        );
+    }
+    let counts = [
+        WEB_FRAMEWORK_SEMANTIC_NODE_COUNT_PROPERTY,
+        WEB_FRAMEWORK_SEMANTIC_SITE_COUNT_PROPERTY,
+        WEB_FRAMEWORK_SEMANTIC_EDGE_COUNT_PROPERTY,
+    ]
+    .map(|property| {
+        properties
+            .get(property)
+            .and_then(Value::as_str)
+            .and_then(|value| value.parse::<usize>().ok())
+            .ok_or_else(|| format!("Web worker omitted or has invalid {property}"))
+    });
+    let [nodes, sites, edges] = counts;
+    let (nodes, sites, edges) = (nodes?, sites?, edges?);
+    let state = match properties
+        .get(WEB_FRAMEWORK_SEMANTIC_STATUS_PROPERTY)
+        .and_then(Value::as_str)
+    {
+        Some("not-emitted") => WebFrameworkSemanticState::NotEmitted,
+        Some("emitted") => WebFrameworkSemanticState::Emitted,
+        Some("discarded") => WebFrameworkSemanticState::Discarded,
+        _ => return Err("Web worker reported an invalid framework semantic status".into()),
+    };
+    if state != WebFrameworkSemanticState::Emitted && (nodes != 0 || sites != 0 || edges != 0) {
+        return Err(format!(
+            "Web worker reported framework semantic status {state:?} with non-zero counts"
+        ));
+    }
+    Ok(state)
 }
 
 fn is_web_semantic_sentinel_node(node: &depgraph_protocol::GraphNode) -> bool {
@@ -2012,6 +2157,75 @@ fn discard_web_definition_delta(
             );
         } else {
             properties.remove(TYPESCRIPT_SEMANTIC_CALL_SITE_COUNT_PROPERTY);
+        }
+    }
+}
+
+fn discard_web_framework_delta(events: &mut Vec<ProtocolEvent>) {
+    let framework_node_ids = events
+        .iter()
+        .filter_map(|event| match event {
+            ProtocolEvent::NodeUpsert(upsert) if is_web_framework_semantic_node(&upsert.node) => {
+                Some(upsert.node.id.clone())
+            }
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    let framework_site_ids = events
+        .iter()
+        .filter_map(|event| match event {
+            ProtocolEvent::DependencySite(site)
+                if is_web_framework_semantic_delta_event(event)
+                    || framework_node_ids.contains(&site.site.source)
+                    || site
+                        .site
+                        .target_ids
+                        .iter()
+                        .any(|target| framework_node_ids.contains(target)) =>
+            {
+                Some(site.site.id.clone())
+            }
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    events.retain(|event| match event {
+        ProtocolEvent::NodeUpsert(upsert) => !framework_node_ids.contains(&upsert.node.id),
+        ProtocolEvent::DependencySite(site) => !framework_site_ids.contains(&site.site.id),
+        ProtocolEvent::EdgeUpsert(upsert) => {
+            !is_web_framework_semantic_delta_event(event)
+                && !framework_node_ids.contains(&upsert.edge.source)
+                && !framework_node_ids.contains(&upsert.edge.target)
+                && upsert
+                    .edge
+                    .site_id
+                    .as_ref()
+                    .is_none_or(|site_id| !framework_site_ids.contains(site_id))
+        }
+        ProtocolEvent::FileCompleted(_)
+        | ProtocolEvent::ProfileCompleted(_)
+        | ProtocolEvent::ScanCompleted(_) => false,
+        _ => true,
+    });
+    for event in events {
+        let ProtocolEvent::ProfileDeclared(declared) = event else {
+            continue;
+        };
+        if web_framework_semantic_state(&declared.profile.properties)
+            != Ok(WebFrameworkSemanticState::Emitted)
+        {
+            continue;
+        }
+        let properties = &mut declared.profile.properties;
+        properties.insert(
+            WEB_FRAMEWORK_SEMANTIC_STATUS_PROPERTY.to_owned(),
+            Value::String("discarded".to_owned()),
+        );
+        for property in [
+            WEB_FRAMEWORK_SEMANTIC_NODE_COUNT_PROPERTY,
+            WEB_FRAMEWORK_SEMANTIC_SITE_COUNT_PROPERTY,
+            WEB_FRAMEWORK_SEMANTIC_EDGE_COUNT_PROPERTY,
+        ] {
+            properties.insert(property.to_owned(), Value::String("0".to_owned()));
         }
     }
 }
@@ -2692,8 +2906,6 @@ fn validate_web_definition_graph(
     call_profiles: &BTreeSet<String>,
     candidate_call_profiles: &BTreeSet<String>,
 ) -> std::result::Result<(), String> {
-    validate_semantic_contract(protocol).map_err(|error| error.to_string())?;
-
     let repository_identities = protocol
         .nodes
         .values()
@@ -2916,7 +3128,14 @@ fn validate_web_definition_graph(
             } else {
                 import_type_profiles.contains(&edge.profile_id)
             };
-        if incident_to_definition && !allowed_definition_relation && !allowed_dependency_edge {
+        let allowed_framework_edge = edge.phase == Phase::Semantic
+            && is_web_framework_semantic_site_kind(&edge.kind)
+            && edge.site_id.is_some();
+        if incident_to_definition
+            && !allowed_definition_relation
+            && !allowed_dependency_edge
+            && !allowed_framework_edge
+        {
             return Err(format!(
                 "Web edge {} incident to a semantic definition is outside its declared semantic capability",
                 edge.id
@@ -2929,6 +3148,11 @@ fn validate_web_definition_graph(
                 .target_ids
                 .iter()
                 .any(|target| semantic_node_ids.contains(target.as_str())))
+            && !(is_web_framework_semantic_site_kind(&site.kind)
+                && site
+                    .evidence
+                    .first()
+                    .is_some_and(|evidence| evidence.kind == EvidenceKind::Semantic))
             && !(is_web_semantic_dependency_site_kind(&site.kind)
                 && if site.kind == "call" {
                     if site.resolution_status == ResolutionStatus::Candidates {
@@ -3575,9 +3799,11 @@ fn validate_web_definition_graph(
     let mut semantic_sites_by_profile = std::collections::BTreeMap::<&str, usize>::new();
     let mut semantic_call_sites_by_profile = std::collections::BTreeMap::<&str, usize>::new();
     for site in protocol.sites.values().filter(|site| {
-        site.evidence
-            .first()
-            .is_some_and(|evidence| evidence.kind == EvidenceKind::Semantic)
+        is_web_semantic_dependency_site_kind(&site.kind)
+            && site
+                .evidence
+                .first()
+                .is_some_and(|evidence| evidence.kind == EvidenceKind::Semantic)
     }) {
         let authorized = if site.kind == "call" {
             if site.resolution_status == ResolutionStatus::Candidates {
@@ -4443,6 +4669,165 @@ fn validate_web_definition_graph(
     Ok(())
 }
 
+fn validate_web_framework_semantic_graph(
+    protocol: &ValidatedProtocol,
+    states: &std::collections::BTreeMap<String, WebFrameworkSemanticState>,
+) -> std::result::Result<(), String> {
+    let mut node_counts = std::collections::BTreeMap::<&str, usize>::new();
+    let mut site_counts = std::collections::BTreeMap::<&str, usize>::new();
+    let mut edge_counts = std::collections::BTreeMap::<&str, usize>::new();
+    for node in protocol
+        .nodes
+        .values()
+        .filter(|node| is_web_framework_semantic_node(node))
+    {
+        let profile_id = node
+            .properties
+            .get("profile_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("Web framework semantic node {} omitted profile_id", node.id))?;
+        if states.get(profile_id) != Some(&WebFrameworkSemanticState::Emitted) {
+            return Err(format!(
+                "Web framework semantic node {} is not authorized by an emitted v1 capability",
+                node.id
+            ));
+        }
+        *node_counts.entry(profile_id).or_default() += 1;
+    }
+    for site in protocol.sites.values().filter(|site| {
+        is_web_framework_semantic_site_kind(&site.kind)
+            && site
+                .evidence
+                .first()
+                .is_some_and(|evidence| evidence.kind == EvidenceKind::Semantic)
+    }) {
+        if states.get(&site.profile_id) != Some(&WebFrameworkSemanticState::Emitted) {
+            return Err(format!(
+                "Web framework semantic site {} is not authorized by an emitted v1 capability",
+                site.id
+            ));
+        }
+        let primary = site
+            .evidence
+            .first()
+            .expect("framework semantic contract requires primary evidence");
+        if primary.extractor_version != WEB_FRAMEWORK_SEMANTIC_EXTRACTOR_VERSION
+            || primary.properties.get("profile_id").and_then(Value::as_str)
+                != Some(site.profile_id.as_str())
+            || primary
+                .properties
+                .get("contract_version")
+                .and_then(Value::as_str)
+                != Some(WEB_FRAMEWORK_SEMANTIC_CAPABILITY_V1)
+        {
+            return Err(format!(
+                "Web framework semantic site {} has invalid capability provenance",
+                site.id
+            ));
+        }
+        *site_counts.entry(site.profile_id.as_str()).or_default() += 1;
+    }
+    for edge in protocol.edges.values().filter(|edge| {
+        edge.phase == Phase::Semantic && is_web_framework_semantic_site_kind(&edge.kind)
+    }) {
+        if states.get(&edge.profile_id) != Some(&WebFrameworkSemanticState::Emitted) {
+            return Err(format!(
+                "Web framework semantic edge {} is not authorized by an emitted v1 capability",
+                edge.id
+            ));
+        }
+        *edge_counts.entry(edge.profile_id.as_str()).or_default() += 1;
+    }
+    for (profile_id, state) in states {
+        if *state == WebFrameworkSemanticState::Legacy {
+            continue;
+        }
+        let profile = protocol
+            .profiles
+            .get(profile_id)
+            .expect("framework semantic state comes from a declared profile");
+        for (property, actual) in [
+            (
+                WEB_FRAMEWORK_SEMANTIC_NODE_COUNT_PROPERTY,
+                node_counts
+                    .get(profile_id.as_str())
+                    .copied()
+                    .unwrap_or_default(),
+            ),
+            (
+                WEB_FRAMEWORK_SEMANTIC_SITE_COUNT_PROPERTY,
+                site_counts
+                    .get(profile_id.as_str())
+                    .copied()
+                    .unwrap_or_default(),
+            ),
+            (
+                WEB_FRAMEWORK_SEMANTIC_EDGE_COUNT_PROPERTY,
+                edge_counts
+                    .get(profile_id.as_str())
+                    .copied()
+                    .unwrap_or_default(),
+            ),
+        ] {
+            let declared = profile
+                .properties
+                .get(property)
+                .and_then(Value::as_str)
+                .and_then(|value| value.parse::<usize>().ok())
+                .expect("framework semantic profile state validates counts");
+            if declared != actual {
+                return Err(format!(
+                    "Web profile {profile_id:?} reports {property}={declared}, observed {actual}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn semantic_contract_failure_is_framework(protocol: &ValidatedProtocol) -> bool {
+    let mut without_framework = protocol.clone();
+    let framework_node_ids = without_framework
+        .nodes
+        .values()
+        .filter(|node| is_web_framework_semantic_node(node))
+        .map(|node| node.id.clone())
+        .collect::<BTreeSet<_>>();
+    let framework_site_ids = without_framework
+        .sites
+        .values()
+        .filter(|site| {
+            (is_web_framework_semantic_site_kind(&site.kind)
+                && site
+                    .evidence
+                    .first()
+                    .is_some_and(|evidence| evidence.kind == EvidenceKind::Semantic))
+                || framework_node_ids.contains(&site.source)
+                || site
+                    .target_ids
+                    .iter()
+                    .any(|target| framework_node_ids.contains(target))
+        })
+        .map(|site| site.id.clone())
+        .collect::<BTreeSet<_>>();
+    without_framework
+        .nodes
+        .retain(|node_id, _| !framework_node_ids.contains(node_id));
+    without_framework
+        .sites
+        .retain(|site_id, _| !framework_site_ids.contains(site_id));
+    without_framework.edges.retain(|_, edge| {
+        !(framework_node_ids.contains(&edge.source)
+            || framework_node_ids.contains(&edge.target)
+            || edge
+                .site_id
+                .as_ref()
+                .is_some_and(|site_id| framework_site_ids.contains(site_id))
+            || edge.phase == Phase::Semantic && is_web_framework_semantic_site_kind(&edge.kind))
+    });
+    validate_semantic_contract(&without_framework).is_ok()
+}
+
 fn parse_events_preserving_prefix(
     stdout: &[u8],
     expected_scan_id: &str,
@@ -4463,12 +4848,16 @@ fn parse_events_preserving_prefix(
     let mut web_import_type_profiles = BTreeSet::new();
     let mut web_call_profiles = BTreeSet::new();
     let mut web_candidate_call_profiles = BTreeSet::new();
+    let mut web_framework_states = std::collections::BTreeMap::new();
+    let mut web_framework_node_ids = BTreeSet::new();
     let mut web_semantic_node_ids = BTreeSet::new();
     let mut web_semantic_node_candidate_ids = BTreeSet::new();
     let mut web_semantic_endpoint_ids = BTreeSet::new();
     let mut web_discarded_site_ids = BTreeSet::new();
     let mut saw_web_semantic_delta = false;
+    let mut saw_web_framework_semantic_delta = false;
     let mut saw_web_semantic_complete = false;
+    let mut web_framework_failure = false;
     for (line_index, mut line) in stdout.split(|byte| *byte == b'\n').enumerate() {
         if line.last() == Some(&b'\r') {
             line = &line[..line.len() - 1];
@@ -4506,6 +4895,14 @@ fn parse_events_preserving_prefix(
         if let Some(node_id) = &current_web_semantic_node_id {
             web_semantic_node_candidate_ids.insert(node_id.clone());
         }
+        let current_web_framework_node_id = if enforce_web_definition_graph
+            && let ProtocolEvent::NodeUpsert(upsert) = &event
+            && is_web_framework_semantic_node(&upsert.node)
+        {
+            Some(upsert.node.id.clone())
+        } else {
+            None
+        };
         if enforce_web_definition_graph && is_web_semantic_delta_event(&event) {
             match &event {
                 ProtocolEvent::EdgeUpsert(upsert) => {
@@ -4632,6 +5029,14 @@ fn parse_events_preserving_prefix(
             } else {
                 (None, None)
             };
+            let (web_framework_state, web_framework_violation) = if expected_adapter == "web" {
+                match web_framework_semantic_state(properties) {
+                    Ok(state) => (Some(state), None),
+                    Err(error) => (None, Some(error)),
+                }
+            } else {
+                (None, None)
+            };
             let expected_gate = match expected_adapter {
                 "rust" => Some((
                     "rust_hir_enable_gate",
@@ -4645,6 +5050,9 @@ fn parse_events_preserving_prefix(
                 Some("Web worker profile language must be web".to_owned())
             } else if web_capability_violation.is_some() {
                 web_capability_violation
+            } else if web_framework_violation.is_some() {
+                web_framework_failure = true;
+                web_framework_violation
             } else if expected_adapter == "web" {
                 let gate = properties
                     .get(TYPESCRIPT_RELEASE_GATE_PROPERTY)
@@ -4738,6 +5146,10 @@ fn parse_events_preserving_prefix(
                 break;
             }
             if expected_adapter == "web" {
+                web_framework_states.insert(
+                    declared.profile.id.clone(),
+                    web_framework_state.expect("validated framework semantic state"),
+                );
                 web_profiles.insert(declared.profile.id.clone());
                 if web_definition_ready {
                     web_definition_profiles.insert(declared.profile.id.clone());
@@ -4800,8 +5212,7 @@ fn parse_events_preserving_prefix(
                     }
                 }
                 ProtocolEvent::EdgeUpsert(upsert)
-                    if upsert.edge.phase == Phase::Semantic
-                        || is_web_definition_relation_kind(&upsert.edge.kind)
+                    if is_web_semantic_delta_event(&event)
                         || web_semantic_node_ids.contains(&upsert.edge.source)
                         || web_semantic_node_ids.contains(&upsert.edge.target) =>
                 {
@@ -4811,6 +5222,8 @@ fn parse_events_preserving_prefix(
                             "Web semantic relation {} must use phase=semantic",
                             edge.id
                         ))
+                    } else if is_web_framework_semantic_delta_event(&event) {
+                        None
                     } else if is_web_definition_relation_kind(&edge.kind) {
                         if !web_definition_profiles.contains(&edge.profile_id) {
                             Some(format!(
@@ -4873,29 +5286,33 @@ fn parse_events_preserving_prefix(
                             "call" | "type_use" | "rust_use" | "rust_reexport"
                         ) =>
                 {
-                    let authorized = if site.site.kind == "call" {
-                        if site.site.resolution_status == ResolutionStatus::Candidates {
-                            web_candidate_call_profiles.contains(&site.site.profile_id)
-                        } else {
-                            web_call_profiles.contains(&site.site.profile_id)
-                        }
-                    } else {
-                        web_import_type_profiles.contains(&site.site.profile_id)
-                    };
-                    if authorized
-                        && is_web_semantic_dependency_site_kind(&site.site.kind)
-                        && site
-                            .site
-                            .evidence
-                            .first()
-                            .is_some_and(|evidence| evidence.kind == EvidenceKind::Semantic)
-                    {
+                    if is_web_framework_semantic_delta_event(&event) {
                         None
                     } else {
-                        Some(format!(
-                            "Web semantic profile emitted forbidden semantic dependency site {}",
-                            site.site.id
-                        ))
+                        let authorized = if site.site.kind == "call" {
+                            if site.site.resolution_status == ResolutionStatus::Candidates {
+                                web_candidate_call_profiles.contains(&site.site.profile_id)
+                            } else {
+                                web_call_profiles.contains(&site.site.profile_id)
+                            }
+                        } else {
+                            web_import_type_profiles.contains(&site.site.profile_id)
+                        };
+                        if authorized
+                            && is_web_semantic_dependency_site_kind(&site.site.kind)
+                            && site
+                                .site
+                                .evidence
+                                .first()
+                                .is_some_and(|evidence| evidence.kind == EvidenceKind::Semantic)
+                        {
+                            None
+                        } else {
+                            Some(format!(
+                                "Web semantic profile emitted forbidden semantic dependency site {}",
+                                site.site.id
+                            ))
+                        }
                     }
                 }
                 _ => None,
@@ -4911,9 +5328,87 @@ fn parse_events_preserving_prefix(
                 break;
             }
         }
+        if enforce_web_definition_graph {
+            let violation = match &event {
+                ProtocolEvent::NodeUpsert(upsert)
+                    if is_web_framework_semantic_node(&upsert.node) =>
+                {
+                    let profile_id = upsert
+                        .node
+                        .properties
+                        .get("profile_id")
+                        .and_then(Value::as_str);
+                    if profile_id.is_none_or(|profile_id| {
+                        web_framework_states.get(profile_id)
+                            != Some(&WebFrameworkSemanticState::Emitted)
+                    }) {
+                        Some(format!(
+                            "Web framework semantic node {} is not authorized by an emitted v1 capability",
+                            upsert.node.id
+                        ))
+                    } else {
+                        None
+                    }
+                }
+                ProtocolEvent::DependencySite(site)
+                    if is_web_framework_semantic_delta_event(&event)
+                        || web_framework_node_ids.contains(&site.site.source)
+                        || site
+                            .site
+                            .target_ids
+                            .iter()
+                            .any(|target| web_framework_node_ids.contains(target)) =>
+                {
+                    if web_framework_states.get(&site.site.profile_id)
+                        != Some(&WebFrameworkSemanticState::Emitted)
+                        || !is_web_framework_semantic_site_kind(&site.site.kind)
+                    {
+                        Some(format!(
+                            "Web framework semantic site {} is not authorized by an emitted v1 capability",
+                            site.site.id
+                        ))
+                    } else {
+                        None
+                    }
+                }
+                ProtocolEvent::EdgeUpsert(upsert)
+                    if is_web_framework_semantic_delta_event(&event)
+                        || web_framework_node_ids.contains(&upsert.edge.source)
+                        || web_framework_node_ids.contains(&upsert.edge.target) =>
+                {
+                    if web_framework_states.get(&upsert.edge.profile_id)
+                        != Some(&WebFrameworkSemanticState::Emitted)
+                        || upsert.edge.phase != Phase::Semantic
+                        || !is_web_framework_semantic_site_kind(&upsert.edge.kind)
+                    {
+                        Some(format!(
+                            "Web framework semantic edge {} is not authorized by an emitted v1 capability",
+                            upsert.edge.id
+                        ))
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+            if let Some(violation) = violation {
+                record_web_rejected_site_closure(&event, &mut web_discarded_site_ids);
+                parse_error = Some(format!(
+                    "security policy violation at line {}: {violation}",
+                    line_index + 1
+                ));
+                failure_kind = Some(WorkerFailureKind::MalformedProtocol);
+                security_violation = true;
+                web_framework_failure = true;
+                break;
+            }
+        }
         let current_web_semantic_delta =
             enforce_web_definition_graph && is_web_semantic_delta_event(&event);
+        let current_web_framework_semantic_delta =
+            enforce_web_definition_graph && is_web_framework_semantic_delta_event(&event);
         saw_web_semantic_delta |= current_web_semantic_delta;
+        saw_web_framework_semantic_delta |= current_web_framework_semantic_delta;
         saw_web_semantic_complete |= current_web_semantic_complete;
         if let Err(error) = validator.push(event) {
             if let Some(site_id) = current_site_closure {
@@ -4921,7 +5416,9 @@ fn parse_events_preserving_prefix(
             }
             security_violation = protocol_error_is_security(&error)
                 || current_web_semantic_delta
+                || current_web_framework_semantic_delta
                 || current_web_semantic_complete;
+            web_framework_failure |= current_web_framework_semantic_delta;
             parse_error = Some(format!(
                 "protocol validation failed at line {}: {error}",
                 line_index + 1
@@ -4932,12 +5429,21 @@ fn parse_events_preserving_prefix(
         if let Some(node_id) = current_web_semantic_node_id {
             web_semantic_node_ids.insert(node_id);
         }
+        if let Some(node_id) = current_web_framework_node_id {
+            web_framework_node_ids.insert(node_id);
+        }
     }
     let mut prefix = validator.validated_events().to_vec();
     if parse_error.is_none() {
         match validator.finish() {
             Ok(protocol) if enforce_web_definition_graph => {
-                if let Err(error) = validate_web_definition_graph(
+                if let Err(error) = validate_semantic_contract(&protocol) {
+                    web_framework_failure = saw_web_framework_semantic_delta
+                        && semantic_contract_failure_is_framework(&protocol);
+                    parse_error = Some(format!(
+                        "security policy violation: invalid Web semantic protocol: {error}"
+                    ));
+                } else if let Err(error) = validate_web_definition_graph(
                     &protocol,
                     &web_profiles,
                     &web_definition_profiles,
@@ -4946,8 +5452,17 @@ fn parse_events_preserving_prefix(
                     &web_candidate_call_profiles,
                 ) {
                     parse_error = Some(format!(
-                        "security policy violation: invalid Web semantic delta: {error}"
+                        "security policy violation: invalid Web TypeScript semantic delta: {error}"
                     ));
+                } else if let Err(error) =
+                    validate_web_framework_semantic_graph(&protocol, &web_framework_states)
+                {
+                    web_framework_failure = true;
+                    parse_error = Some(format!(
+                        "security policy violation: invalid Web framework semantic delta: {error}"
+                    ));
+                }
+                if parse_error.is_some() {
                     failure_kind = Some(WorkerFailureKind::MalformedProtocol);
                     security_violation = true;
                 }
@@ -4955,9 +5470,12 @@ fn parse_events_preserving_prefix(
             Ok(_) => {}
             Err(error) => {
                 if enforce_web_definition_graph
-                    && (saw_web_semantic_delta || saw_web_semantic_complete)
+                    && (saw_web_semantic_delta
+                        || saw_web_framework_semantic_delta
+                        || saw_web_semantic_complete)
                     && matches!(error, ProtocolError::Invariant(_))
                 {
+                    web_framework_failure = saw_web_framework_semantic_delta;
                     parse_error = Some(format!(
                         "security policy violation: invalid Web semantic protocol: {error}"
                     ));
@@ -4971,13 +5489,17 @@ fn parse_events_preserving_prefix(
         }
     }
     if enforce_web_definition_graph && parse_error.is_some() {
-        discard_web_definition_delta(
-            &mut prefix,
-            &web_semantic_node_ids,
-            &web_semantic_node_candidate_ids,
-            &web_discarded_site_ids,
-            &web_semantic_endpoint_ids,
-        );
+        if web_framework_failure {
+            discard_web_framework_delta(&mut prefix);
+        } else {
+            discard_web_definition_delta(
+                &mut prefix,
+                &web_semantic_node_ids,
+                &web_semantic_node_candidate_ids,
+                &web_discarded_site_ids,
+                &web_semantic_endpoint_ids,
+            );
+        }
     }
     let events = prefix
         .into_iter()
@@ -5171,6 +5693,177 @@ mod tests {
                 "typescript_semantic_issue_count": "0",
             }),
         )
+    }
+
+    fn add_framework_semantic_delta(
+        events: &mut Vec<Value>,
+        valid_target: bool,
+        status: &str,
+        capability: &str,
+    ) {
+        let profile_id = "web:default";
+        let package_locator = "npm:workspace:definition-fixture@1.0.0#.";
+        let component_identity = serde_json::json!({
+            "framework":"next",
+            "package_locator":package_locator,
+            "component_kind":"page",
+            "environment":"server",
+            "resolver_identity":format!("{package_locator}::app/products/page.tsx#default"),
+        });
+        let route_identity = serde_json::json!({
+            "framework":"next",
+            "package_locator":package_locator,
+            "route_kind":"page",
+            "environment":"server",
+            "router_instance":"next-app:app",
+            "route_pattern":"/products",
+        });
+        let component_id =
+            depgraph_protocol::stable_id_from_value("component", &component_identity);
+        let route_id = depgraph_protocol::stable_id_from_value("route", &route_identity);
+        let target_id = if valid_target {
+            route_id.as_str()
+        } else {
+            component_id.as_str()
+        };
+        let condition = serde_json::json!({
+            "op":"all",
+            "conditions":[
+                {"op":"eq","key":"environment","value":"server"},
+                {"op":"eq","key":"mode","value":"production"}
+            ],
+        });
+        let semantic_evidence = serde_json::json!({
+            "kind":"semantic",
+            "extractor":"next-static-adapter",
+            "extractor_version":WEB_FRAMEWORK_SEMANTIC_EXTRACTOR_VERSION,
+            "path":"app/products/page.tsx",
+            "start_line":1,
+            "start_column":1,
+            "end_line":1,
+            "end_column":32,
+            "properties":{
+                "profile_id":profile_id,
+                "framework":"next",
+                "contract_version":WEB_FRAMEWORK_SEMANTIC_CAPABILITY_V1,
+                "occurrence_kind":"page_route_entry",
+            },
+        });
+        let source_evidence = serde_json::json!({
+            "kind":"source",
+            "extractor":"next-static-adapter",
+            "extractor_version":WEB_FRAMEWORK_SEMANTIC_EXTRACTOR_VERSION,
+            "path":"app/products/page.tsx",
+            "start_line":1,
+            "start_column":1,
+            "end_line":1,
+            "end_column":32,
+            "properties":{
+                "profile_id":profile_id,
+                "framework":"next",
+                "occurrence_kind":"page_route_entry",
+            },
+        });
+        let site_id = depgraph_protocol::stable_id_from_value(
+            "site",
+            &serde_json::json!({
+                "condition":condition,
+                "kind":"route_entry",
+                "path":"app/products/page.tsx",
+                "profile_id":profile_id,
+                "source":component_id,
+                "span":{"start_line":1,"start_column":1,"end_line":1,"end_column":32},
+            }),
+        );
+        let edge_id = depgraph_protocol::stable_id_from_value(
+            "edge",
+            &serde_json::json!({"kind":"route_entry","site_id":site_id,"target":target_id}),
+        );
+        let profile = events
+            .iter_mut()
+            .find(|event| event["event"] == "profile_declared")
+            .expect("Web profile declaration");
+        let properties = &mut profile["profile"]["properties"];
+        properties[WEB_FRAMEWORK_SEMANTIC_CAPABILITY_PROPERTY] = serde_json::json!(capability);
+        properties[WEB_FRAMEWORK_SEMANTIC_STATUS_PROPERTY] = serde_json::json!(status);
+        properties[WEB_FRAMEWORK_SEMANTIC_EXTRACTOR_VERSION_PROPERTY] =
+            serde_json::json!(WEB_FRAMEWORK_SEMANTIC_EXTRACTOR_VERSION);
+        properties[WEB_FRAMEWORK_SEMANTIC_NODE_COUNT_PROPERTY] = serde_json::json!("2");
+        properties[WEB_FRAMEWORK_SEMANTIC_SITE_COUNT_PROPERTY] = serde_json::json!("1");
+        properties[WEB_FRAMEWORK_SEMANTIC_EDGE_COUNT_PROPERTY] = serde_json::json!("1");
+        let insert_at = events
+            .iter()
+            .position(|event| event["event"] == "profile_completed")
+            .expect("profile completion");
+        let payload = vec![
+            serde_json::json!({
+                "event":"node_upsert",
+                "node":{
+                    "id":component_id,
+                    "kind":"component",
+                    "locator":format!("framework-component:{component_id}"),
+                    "display_name":"ProductsPage",
+                    "properties":{
+                        "framework":"next","package_locator":package_locator,
+                        "component_kind":"page","environment":"server",
+                        "profile_id":profile_id,"canonical_identity":component_identity,
+                    },
+                },
+            }),
+            serde_json::json!({
+                "event":"node_upsert",
+                "node":{
+                    "id":route_id,
+                    "kind":"route",
+                    "locator":format!("framework-route:{route_id}"),
+                    "display_name":"/products",
+                    "properties":{
+                        "framework":"next","package_locator":package_locator,
+                        "route_kind":"page","environment":"server",
+                        "profile_id":profile_id,"canonical_identity":route_identity,
+                    },
+                },
+            }),
+            serde_json::json!({
+                "event":"dependency_site",
+                "site":{
+                    "id":site_id,"source":component_id,"kind":"route_entry",
+                    "specifier":"/products","resolution_status":"resolved",
+                    "target_ids":[target_id],"profile_id":profile_id,
+                    "condition":condition,"precision":"exact","reason":null,
+                    "evidence":[semantic_evidence,source_evidence],
+                },
+            }),
+            serde_json::json!({
+                "event":"edge_upsert",
+                "edge":{
+                    "id":edge_id,"source":component_id,"target":target_id,
+                    "kind":"route_entry","site_id":site_id,"phase":"semantic",
+                    "environment":"server","profile_id":profile_id,"condition":condition,
+                    "resolution_status":"resolved","precision":"exact","generated":false,
+                    "evidence":[semantic_evidence,source_evidence],
+                },
+            }),
+        ];
+        for event in payload.into_iter().rev() {
+            events.insert(insert_at, event);
+        }
+        for event in events.iter_mut().filter(|event| {
+            matches!(
+                event["event"].as_str(),
+                Some("profile_completed" | "scan_completed")
+            )
+        }) {
+            event["coverage"]["dependency_sites"] = serde_json::json!(1);
+            event["coverage"]["resolved"] = serde_json::json!(1);
+        }
+        resequence_test_protocol(events);
+        for event in events {
+            event["protocol_version"] = serde_json::json!("1.0");
+            event["scan_id"] = serde_json::json!("typescript-gate-scan");
+            event["adapter"] = serde_json::json!("web");
+            event["adapter_version"] = serde_json::json!(env!("CARGO_PKG_VERSION"));
+        }
     }
 
     fn typescript_definition_protocol(
@@ -7694,6 +8387,128 @@ mod tests {
                 }));
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn web_framework_semantic_capability_accepts_only_the_versioned_contract() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let root = root.path().canonicalize()?;
+        let mut valid = test_protocol_values(typescript_definition_protocol(
+            &root,
+            TYPESCRIPT_RELEASE_GATE_PENDING,
+            "declares",
+        )?)?;
+        add_framework_semantic_delta(
+            &mut valid,
+            true,
+            "emitted",
+            WEB_FRAMEWORK_SEMANTIC_CAPABILITY_V1,
+        );
+        let parsed = parse_events_preserving_prefix(
+            &serialize_test_protocol(valid)?,
+            "typescript-gate-scan",
+            "web",
+            &root,
+            64 * 1024,
+            Some(env!("CARGO_PKG_VERSION")),
+            Some(false),
+        );
+        assert_eq!(parsed.error, None);
+        assert!(!parsed.security_violation);
+        assert!(parsed.events.iter().any(|event| {
+            event["event"] == "edge_upsert"
+                && event["edge"]["kind"] == "route_entry"
+                && event["edge"]["phase"] == "semantic"
+        }));
+
+        for capability in ["framework-semantic-graph-v2", ""] {
+            let mut invalid = test_protocol_values(typescript_gate_protocol(
+                &root,
+                TYPESCRIPT_RELEASE_GATE_PENDING,
+            )?)?;
+            let profile = invalid
+                .iter_mut()
+                .find(|event| event["event"] == "profile_declared")
+                .expect("Web profile");
+            let properties = &mut profile["profile"]["properties"];
+            properties[WEB_FRAMEWORK_SEMANTIC_CAPABILITY_PROPERTY] = serde_json::json!(capability);
+            properties[WEB_FRAMEWORK_SEMANTIC_STATUS_PROPERTY] = serde_json::json!("not-emitted");
+            properties[WEB_FRAMEWORK_SEMANTIC_EXTRACTOR_VERSION_PROPERTY] =
+                serde_json::json!(WEB_FRAMEWORK_SEMANTIC_EXTRACTOR_VERSION);
+            properties[WEB_FRAMEWORK_SEMANTIC_NODE_COUNT_PROPERTY] = serde_json::json!("0");
+            properties[WEB_FRAMEWORK_SEMANTIC_SITE_COUNT_PROPERTY] = serde_json::json!("0");
+            properties[WEB_FRAMEWORK_SEMANTIC_EDGE_COUNT_PROPERTY] = serde_json::json!("0");
+            let parsed = parse_events_preserving_prefix(
+                &serialize_test_protocol(invalid)?,
+                "typescript-gate-scan",
+                "web",
+                &root,
+                64 * 1024,
+                Some(env!("CARGO_PKG_VERSION")),
+                Some(false),
+            );
+            assert_eq!(
+                parsed.failure_kind,
+                Some(WorkerFailureKind::MalformedProtocol)
+            );
+            assert!(parsed.security_violation);
+            assert!(parsed.error.as_deref().is_some_and(|error| {
+                error.contains("unapproved framework semantic capability")
+            }));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn web_framework_failure_preserves_syntax_and_typescript_semantic_graph() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let root = root.path().canonicalize()?;
+        let mut invalid = test_protocol_values(typescript_definition_protocol(
+            &root,
+            TYPESCRIPT_RELEASE_GATE_PENDING,
+            "declares",
+        )?)?;
+        add_framework_semantic_delta(
+            &mut invalid,
+            false,
+            "emitted",
+            WEB_FRAMEWORK_SEMANTIC_CAPABILITY_V1,
+        );
+        let parsed = parse_events_preserving_prefix(
+            &serialize_test_protocol(invalid)?,
+            "typescript-gate-scan",
+            "web",
+            &root,
+            64 * 1024,
+            Some(env!("CARGO_PKG_VERSION")),
+            Some(false),
+        );
+        assert_eq!(
+            parsed.failure_kind,
+            Some(WorkerFailureKind::MalformedProtocol)
+        );
+        assert!(parsed.security_violation);
+        assert!(parsed.error.as_deref().is_some_and(|error| {
+            error.contains("invalid Web semantic protocol") && error.contains("incompatible target")
+        }));
+        assert!(parsed.events.iter().any(|event| {
+            event["event"] == "node_upsert"
+                && matches!(event["node"]["kind"].as_str(), Some("file" | "symbol"))
+        }));
+        assert!(parsed.events.iter().any(|event| {
+            event["event"] == "edge_upsert" && event["edge"]["kind"] == "declares"
+        }));
+        assert!(!parsed.events.iter().any(|event| {
+            event["event"] == "node_upsert"
+                && matches!(
+                    event["node"]["kind"].as_str(),
+                    Some("component" | "route" | "server_function" | "middleware")
+                )
+        }));
+        assert!(!parsed.events.iter().any(|event| {
+            event["event"] == "dependency_site" && event["site"]["kind"] == "route_entry"
+        }));
         Ok(())
     }
 

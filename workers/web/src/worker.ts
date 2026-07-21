@@ -2,6 +2,7 @@ import { realpath, stat } from "node:fs/promises";
 import path from "node:path";
 import { inventoryFiles } from "./fs";
 import { stableId } from "./ids";
+import { WEB_FRAMEWORK_SEMANTIC_PROFILE_PROPERTIES } from "./framework-semantic";
 import { scan } from "./scanner";
 import {
   TYPESCRIPT_COMPILER_PROFILE_PROPERTIES,
@@ -136,6 +137,7 @@ function eventsFor(model: ScanModel, root: string, scanId: string): ProtocolEven
         module_resolution: "static-safe",
         package_manager: model.packageManager,
         lockfile: model.lockfile ?? "",
+        ...WEB_FRAMEWORK_SEMANTIC_PROFILE_PROPERTIES,
         ...typeScriptProfileProperties(model.typeScriptProject),
         project_code_executed: "false",
       },
@@ -207,6 +209,7 @@ function failureEventsFor(root: string, scanId: string, failure: TypeScriptProje
           module_resolution: "static-safe",
           package_manager: "unknown",
           lockfile: "",
+          ...WEB_FRAMEWORK_SEMANTIC_PROFILE_PROPERTIES,
           ...typeScriptProfileProperties(null, failure),
           project_code_executed: "false",
         },

@@ -11,6 +11,8 @@ use std::io::Cursor;
 const SOURCE_GOLDEN: &str = include_str!("fixtures/protocol-v1.golden.ndjson");
 const SEMANTIC_GOLDEN: &str = include_str!("fixtures/protocol-v1.semantic.golden.ndjson");
 const RUST_SEMANTIC_GOLDEN: &str = include_str!("fixtures/protocol-v1.rust-semantic.golden.ndjson");
+const FRAMEWORK_SEMANTIC_GOLDEN: &str =
+    include_str!("fixtures/protocol-v1.framework-semantic.golden.ndjson");
 
 #[test]
 fn source_and_semantic_fixtures_remain_protocol_v1_compatible() {
@@ -40,6 +42,130 @@ fn source_and_semantic_fixtures_remain_protocol_v1_compatible() {
             assert_eq!(validated.sites.len(), 3);
         }
     }
+}
+
+#[test]
+fn framework_semantic_fixture_is_strict_and_protocol_v1_compatible() {
+    assert!(schema_accepts_stream(FRAMEWORK_SEMANTIC_GOLDEN));
+    assert!(semantic_schema_accepts_stream(FRAMEWORK_SEMANTIC_GOLDEN));
+    validate_safe_ndjson(Cursor::new(FRAMEWORK_SEMANTIC_GOLDEN))
+        .expect("base protocol 1.0 validator must remain compatible");
+    let validated = validate_safe_semantic_ndjson(Cursor::new(FRAMEWORK_SEMANTIC_GOLDEN))
+        .expect("framework semantic golden fixture must validate");
+    assert_eq!(validated.nodes.len(), 2);
+    assert_eq!(validated.sites.len(), 1);
+    assert_eq!(validated.edges.len(), 1);
+    assert_eq!(validated.sites.values().next().unwrap().kind, "route_entry");
+}
+
+#[test]
+fn all_framework_semantic_node_kinds_use_canonical_identity_hashes() {
+    let mut events = framework_semantic_values();
+    let profile_id = "profile:web-framework-golden";
+    let package_locator = "npm:workspace:web-app@1.0.0#.";
+    let extra = [
+        (
+            "server_function",
+            "server_function_kind",
+            "loader",
+            json!({
+                "framework":"tanstack-start",
+                "package_locator":package_locator,
+                "server_function_kind":"loader",
+                "environment":"server",
+                "resolver_identity":"npm:workspace:web-app@1.0.0#.::src/server.ts#loadProducts",
+            }),
+        ),
+        (
+            "middleware",
+            "middleware_kind",
+            "request",
+            json!({
+                "framework":"tanstack-start",
+                "package_locator":package_locator,
+                "middleware_kind":"request",
+                "environment":"server",
+                "resolver_identity":"npm:workspace:web-app@1.0.0#.::src/middleware.ts#auth",
+                "scope":"/products",
+            }),
+        ),
+    ];
+    let insert_at = events
+        .iter()
+        .position(|event| event["event"] == "dependency_site")
+        .expect("framework dependency site");
+    for (offset, (kind, kind_property, kind_value, identity)) in extra.into_iter().enumerate() {
+        let node_id = stable_id_from_value(kind, &identity);
+        let mut properties = json!({
+            "framework":"tanstack-start",
+            "package_locator":package_locator,
+            "environment":"server",
+            "profile_id":profile_id,
+            "canonical_identity":identity,
+        });
+        properties[kind_property] = json!(kind_value);
+        events.insert(
+            insert_at + offset,
+            json!({
+                "event":"node_upsert",
+                "protocol_version":"1.0",
+                "scan_id":"scan-framework-semantic-golden",
+                "adapter":"web",
+                "adapter_version":"0.1.0",
+                "seq":0,
+                "node":{
+                    "id":node_id,
+                    "kind":kind,
+                    "locator":format!("framework-{kind}:{node_id}"),
+                    "display_name":kind_value,
+                    "properties":properties,
+                },
+            }),
+        );
+    }
+    resequence(&mut events);
+    let input = values_to_ndjson(events);
+    assert!(semantic_schema_accepts_stream(&input));
+    validate_safe_semantic_ndjson(Cursor::new(input))
+        .expect("all four framework semantic node kinds must validate");
+}
+
+#[test]
+fn framework_semantic_contract_rejects_invalid_endpoints_and_provenance() {
+    let mut invalid_endpoint = framework_semantic_values();
+    let component_id = node_id_by_display_name(&invalid_endpoint, "ProductsPage");
+    reassign_site_target(&mut invalid_endpoint, "route_entry", &component_id);
+    let error = validate_safe_semantic_ndjson(Cursor::new(values_to_ndjson(invalid_endpoint)))
+        .expect_err("route_entry must target a route");
+    assert!(error.to_string().contains("incompatible target"));
+
+    let mut invalid_version = framework_semantic_values();
+    for event in &mut invalid_version {
+        if matches!(
+            event["event"].as_str(),
+            Some("dependency_site" | "edge_upsert")
+        ) {
+            let payload = if event["event"] == "dependency_site" {
+                "site"
+            } else {
+                "edge"
+            };
+            event[payload]["evidence"][0]["extractor_version"] = json!("0.2.0");
+        }
+    }
+    let error = validate_safe_semantic_ndjson(Cursor::new(values_to_ndjson(invalid_version)))
+        .expect_err("unapproved framework extractor version must fail");
+    assert!(error.to_string().contains("next-static-adapter@0.1.0"));
+
+    let mut invalid_condition = framework_semantic_values();
+    let edge = invalid_condition
+        .iter_mut()
+        .find(|event| event["event"] == "edge_upsert")
+        .expect("framework edge");
+    edge["edge"]["environment"] = json!("browser");
+    let error = validate_safe_semantic_ndjson(Cursor::new(values_to_ndjson(invalid_condition)))
+        .expect_err("edge environment must be represented by the condition");
+    assert!(error.to_string().contains("not allowed by its condition"));
 }
 
 #[test]
@@ -2089,6 +2215,13 @@ fn web_semantic_dependency_values() -> Vec<Value> {
     events
 }
 
+fn framework_semantic_values() -> Vec<Value> {
+    FRAMEWORK_SEMANTIC_GOLDEN
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("framework semantic golden line"))
+        .collect()
+}
+
 fn rust_semantic_candidate_values() -> Vec<Value> {
     let mut events = rust_semantic_dependency_values();
     let second_target = node_id_by_display_name(&events, "Named");
@@ -2631,6 +2764,20 @@ fn semantic_schema_accepts_stream(input: &str) -> bool {
                             | "rust_reexport"
                             | "web_import"
                             | "web_reexport"
+                            | "renders"
+                            | "hydrates"
+                            | "client_boundary"
+                            | "server_boundary"
+                            | "route_entry"
+                            | "parent_route"
+                            | "loads"
+                            | "before_load"
+                            | "navigates_to"
+                            | "masks_to"
+                            | "rpc_call"
+                            | "client_stub_for"
+                            | "handled_by"
+                            | "uses_middleware"
                     )
                 )
                 && event["site"]["evidence"][0]["kind"] == "semantic"
@@ -2640,14 +2787,36 @@ fn semantic_schema_accepts_stream(input: &str) -> bool {
 
     events.iter().all(|event| match event["event"].as_str() {
         Some("node_upsert")
-            if matches!(event["node"]["kind"].as_str(), Some("symbol" | "type")) =>
+            if matches!(event["node"]["kind"].as_str(), Some("symbol" | "type"))
+                || (matches!(
+                    event["node"]["kind"].as_str(),
+                    Some("component" | "route" | "server_function" | "middleware")
+                ) && event["node"]["properties"]["canonical_identity"].is_object()) =>
         {
             semantic_definition_accepts(&schema, "semantic_node", &event["node"])
         }
         Some("edge_upsert")
             if matches!(
                 event["edge"]["kind"].as_str(),
-                Some("calls" | "may_call" | "references")
+                Some(
+                    "calls"
+                        | "may_call"
+                        | "references"
+                        | "renders"
+                        | "hydrates"
+                        | "client_boundary"
+                        | "server_boundary"
+                        | "route_entry"
+                        | "parent_route"
+                        | "loads"
+                        | "before_load"
+                        | "navigates_to"
+                        | "masks_to"
+                        | "rpc_call"
+                        | "client_stub_for"
+                        | "handled_by"
+                        | "uses_middleware"
+                )
             ) || (matches!(
                 event["edge"]["kind"].as_str(),
                 Some("declares" | "extends" | "implements" | "instantiates")

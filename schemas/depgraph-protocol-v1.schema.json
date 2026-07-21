@@ -304,6 +304,72 @@
         }
       ]
     },
+    "framework_identity_base": {
+      "type": "object",
+      "properties": {
+        "framework": {
+          "enum": ["next", "astro", "tanstack-router", "tanstack-start"]
+        },
+        "package_locator": { "$ref": "#/$defs/non_empty_string" },
+        "environment": { "$ref": "#/$defs/non_empty_string" }
+      },
+      "required": ["framework", "package_locator", "environment"],
+      "additionalProperties": true
+    },
+    "component_identity": {
+      "allOf": [
+        { "$ref": "#/$defs/framework_identity_base" },
+        {
+          "type": "object",
+          "properties": {
+            "component_kind": { "$ref": "#/$defs/non_empty_string" },
+            "resolver_identity": { "$ref": "#/$defs/non_empty_string" }
+          },
+          "required": ["component_kind", "resolver_identity"]
+        }
+      ]
+    },
+    "route_identity": {
+      "allOf": [
+        { "$ref": "#/$defs/framework_identity_base" },
+        {
+          "type": "object",
+          "properties": {
+            "route_kind": { "$ref": "#/$defs/non_empty_string" },
+            "router_instance": { "$ref": "#/$defs/non_empty_string" },
+            "route_pattern": { "type": "string", "pattern": "^/" }
+          },
+          "required": ["route_kind", "router_instance", "route_pattern"]
+        }
+      ]
+    },
+    "server_function_identity": {
+      "allOf": [
+        { "$ref": "#/$defs/framework_identity_base" },
+        {
+          "type": "object",
+          "properties": {
+            "server_function_kind": { "$ref": "#/$defs/non_empty_string" },
+            "resolver_identity": { "$ref": "#/$defs/non_empty_string" }
+          },
+          "required": ["server_function_kind", "resolver_identity"]
+        }
+      ]
+    },
+    "middleware_identity": {
+      "allOf": [
+        { "$ref": "#/$defs/framework_identity_base" },
+        {
+          "type": "object",
+          "properties": {
+            "middleware_kind": { "$ref": "#/$defs/non_empty_string" },
+            "resolver_identity": { "$ref": "#/$defs/non_empty_string" },
+            "scope": { "$ref": "#/$defs/non_empty_string" }
+          },
+          "required": ["middleware_kind", "resolver_identity", "scope"]
+        }
+      ]
+    },
     "semantic_edge_base": {
       "type": "object",
       "properties": {
@@ -506,6 +572,98 @@
                 }
               },
               "required": ["kind"]
+            },
+            {
+              "type": "object",
+              "properties": {
+                "kind": { "const": "component" },
+                "id": {
+                  "type": "string",
+                  "pattern": "^component:sha256:[0-9a-f]{64}$"
+                },
+                "properties": {
+                  "type": "object",
+                  "properties": {
+                    "framework": { "$ref": "#/$defs/non_empty_string" },
+                    "package_locator": { "$ref": "#/$defs/non_empty_string" },
+                    "component_kind": { "$ref": "#/$defs/non_empty_string" },
+                    "environment": { "$ref": "#/$defs/non_empty_string" },
+                    "profile_id": { "$ref": "#/$defs/non_empty_string" },
+                    "canonical_identity": { "$ref": "#/$defs/component_identity" }
+                  },
+                  "required": ["framework", "package_locator", "component_kind", "environment", "profile_id", "canonical_identity"]
+                }
+              },
+              "required": ["kind"]
+            },
+            {
+              "type": "object",
+              "properties": {
+                "kind": { "const": "route" },
+                "id": {
+                  "type": "string",
+                  "pattern": "^route:sha256:[0-9a-f]{64}$"
+                },
+                "properties": {
+                  "type": "object",
+                  "properties": {
+                    "framework": { "$ref": "#/$defs/non_empty_string" },
+                    "package_locator": { "$ref": "#/$defs/non_empty_string" },
+                    "route_kind": { "$ref": "#/$defs/non_empty_string" },
+                    "environment": { "$ref": "#/$defs/non_empty_string" },
+                    "profile_id": { "$ref": "#/$defs/non_empty_string" },
+                    "canonical_identity": { "$ref": "#/$defs/route_identity" }
+                  },
+                  "required": ["framework", "package_locator", "route_kind", "environment", "profile_id", "canonical_identity"]
+                }
+              },
+              "required": ["kind"]
+            },
+            {
+              "type": "object",
+              "properties": {
+                "kind": { "const": "server_function" },
+                "id": {
+                  "type": "string",
+                  "pattern": "^server_function:sha256:[0-9a-f]{64}$"
+                },
+                "properties": {
+                  "type": "object",
+                  "properties": {
+                    "framework": { "$ref": "#/$defs/non_empty_string" },
+                    "package_locator": { "$ref": "#/$defs/non_empty_string" },
+                    "server_function_kind": { "$ref": "#/$defs/non_empty_string" },
+                    "environment": { "$ref": "#/$defs/non_empty_string" },
+                    "profile_id": { "$ref": "#/$defs/non_empty_string" },
+                    "canonical_identity": { "$ref": "#/$defs/server_function_identity" }
+                  },
+                  "required": ["framework", "package_locator", "server_function_kind", "environment", "profile_id", "canonical_identity"]
+                }
+              },
+              "required": ["kind"]
+            },
+            {
+              "type": "object",
+              "properties": {
+                "kind": { "const": "middleware" },
+                "id": {
+                  "type": "string",
+                  "pattern": "^middleware:sha256:[0-9a-f]{64}$"
+                },
+                "properties": {
+                  "type": "object",
+                  "properties": {
+                    "framework": { "$ref": "#/$defs/non_empty_string" },
+                    "package_locator": { "$ref": "#/$defs/non_empty_string" },
+                    "middleware_kind": { "$ref": "#/$defs/non_empty_string" },
+                    "environment": { "$ref": "#/$defs/non_empty_string" },
+                    "profile_id": { "$ref": "#/$defs/non_empty_string" },
+                    "canonical_identity": { "$ref": "#/$defs/middleware_identity" }
+                  },
+                  "required": ["framework", "package_locator", "middleware_kind", "environment", "profile_id", "canonical_identity"]
+                }
+              },
+              "required": ["kind"]
             }
           ]
         }
@@ -623,6 +781,20 @@
                     }
                   },
                   "required": ["kind"]
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "kind": {
+                      "enum": [
+                        "renders", "hydrates", "client_boundary", "server_boundary",
+                        "route_entry", "parent_route", "loads", "before_load",
+                        "navigates_to", "masks_to", "rpc_call", "client_stub_for",
+                        "handled_by", "uses_middleware"
+                      ]
+                    }
+                  },
+                  "required": ["kind"]
                 }
               ]
             }
@@ -686,7 +858,21 @@
                 "rust_use",
                 "rust_reexport",
                 "web_import",
-                "web_reexport"
+                "web_reexport",
+                "renders",
+                "hydrates",
+                "client_boundary",
+                "server_boundary",
+                "route_entry",
+                "parent_route",
+                "loads",
+                "before_load",
+                "navigates_to",
+                "masks_to",
+                "rpc_call",
+                "client_stub_for",
+                "handled_by",
+                "uses_middleware"
               ]
             },
             "target_ids": { "type": "array", "minItems": 1 }
@@ -732,6 +918,25 @@
                 "prefixItems": [
                   { "$ref": "#/$defs/candidate_semantic_evidence" }
                 ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "enum": [
+                  "hydrates", "client_boundary", "server_boundary", "route_entry", "client_stub_for"
+                ]
+              }
+            },
+            "required": ["kind"]
+          },
+          "then": {
+            "properties": {
+              "resolution_status": {
+                "enum": ["resolved", "external", "unresolved"]
               }
             }
           }
