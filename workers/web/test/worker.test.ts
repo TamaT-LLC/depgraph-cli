@@ -229,6 +229,7 @@ test("worker emits deterministic protocol graph without executing project code",
   assert.ok(semanticEdges.every((edge) => edge.evidence[0]?.kind === "semantic" && edge.evidence[0]?.properties.profile_id === profile.id));
   assert.ok(semanticSites.every((site) => site.evidence[1]?.kind === "source"));
   assert.ok(!completed.completeness.includes("semantic-complete"));
+  assert.ok(completed.reasons.includes("framework_semantic_capability_pending"));
   assert.equal(completed.dependency_sites, sites.length);
   assert.equal(completed.dependency_sites, completed.resolved + completed.candidates + completed.external + completed.unresolved);
   assert.ok(completedFiles.length > 0);
@@ -244,6 +245,42 @@ test("worker emits deterministic protocol graph without executing project code",
   });
   assert.deepEqual(normalize(first.events), normalize(second.events));
   for (const marker of markers) await assert.rejects(import("node:fs/promises").then(({ stat }) => stat(marker)));
+});
+
+test("pure TypeScript semantic profiles allow candidate and external calls", async (context) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "depgraph-web-semantic-complete-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  await Promise.all([
+    writeFile(path.join(root, "package.json"), JSON.stringify({ name: "semantic-complete", version: "1.0.0", type: "module" })),
+    writeFile(path.join(root, "index.ts"), [
+      "const exact = (): void => {};",
+      "const first = (): void => {};",
+      "const second = (): void => {};",
+      "exact();",
+      "const selected = Math.random() > 0.5 ? first : second;",
+      "selected();",
+      "",
+    ].join("\n")),
+  ]);
+
+  const result = await run("semantic-complete", root);
+  const profile = result.events.find((event) => event.event === "profile_declared")?.profile;
+  const completed = result.events.at(-1)?.coverage;
+  const semanticCalls = result.events
+    .filter((event) => event.site?.kind === "call" && event.site?.evidence[0]?.kind === "semantic")
+    .map((event) => event.site);
+
+  assert.deepEqual(profile?.features, []);
+  assert.equal(profile?.properties.project_code_executed, "false");
+  assert.equal(completed.project_code_executed, false);
+  assert.equal(completed.unresolved, 0);
+  assert.equal(completed.unsupported_syntax, 0);
+  assert.deepEqual(completed.completeness, ["syntax-complete", "semantic-complete"]);
+  assert.ok(!completed.reasons.includes("framework_semantic_capability_pending"));
+  assert.ok(!completed.reasons.includes("typescript_semantic_diagnostics_present"));
+  assert.ok(!completed.reasons.includes("typescript_emitted_semantic_diagnostics_present"));
+  assert.ok(semanticCalls.some((site) => site.resolution_status === "candidates"));
+  assert.ok(semanticCalls.some((site) => site.resolution_status === "external"));
 });
 
 test("stable IDs and events are independent of checkout directory", async (context) => {
@@ -1077,6 +1114,8 @@ test("TypeChecker definition graph resolves inventory modules and bundled stdlib
   assert.equal(profile?.properties.typescript_semantic_issue_count, "0");
   assert.ok(semanticEdges.filter((edge) => edge.site_id === null).every((edge) => edge.precision === "exact"));
   assert.ok(!result.events.at(-1)?.coverage.completeness.includes("semantic-complete"));
+  assert.ok(result.events.at(-1)?.coverage.reasons.includes("typescript_semantic_diagnostics_present"));
+  assert.ok(result.events.at(-1)?.coverage.reasons.includes("typescript_emitted_semantic_diagnostics_present"));
   await assert.rejects(import("node:fs/promises").then(({ stat }) => stat(marker)));
 });
 

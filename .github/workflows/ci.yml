@@ -280,6 +280,8 @@ jobs:
               + $graph.coverage.external + $graph.coverage.unresolved
             )
             and ($graph.coverage.completeness | index("semantic-complete") | not)
+            and ($graph.profiles | any((.features | length) > 0))
+            and ($graph.coverage.reasons | index("framework_semantic_capability_pending"))
           ' "$tmp/one.json"
           jq -e '.graph as $graph
             | [$graph.sites[] as $site
@@ -410,6 +412,29 @@ jobs:
             and (.site.reason | type == "string" and length > 0)
             and (.evidence | any(.kind == "semantic" and .extractor == "typescript-native-typechecker"))
           )' "$tmp/unresolved.json"
+          target/debug/depgraph --store "$tmp/semantic-complete.db" scan workers/web/test/fixtures/semantic-complete --json > "$tmp/semantic-complete-scan.json"
+          jq -e '.status == "completed"
+            and .coverage.project_code_executed == false
+            and (.coverage.completeness | index("syntax-complete"))
+            and (.coverage.completeness | index("semantic-complete"))
+            and .coverage.unresolved == 0
+            and (.coverage.reasons | length == 0)
+            and .coverage.candidates > 0
+            and .coverage.external > 0' "$tmp/semantic-complete-scan.json"
+          target/debug/depgraph --store "$tmp/semantic-complete.db" export --format json > "$tmp/semantic-complete.json"
+          jq -e '.graph as $graph
+            | ($graph.profiles | any(
+                (.features | length) == 0
+                and .properties.typescript_typechecker_status == "definition-import-type-call-graph-emitted"
+                and .properties.typescript_definition_graph_status == "ready"
+                and .properties.typescript_semantic_graph_emission == "definition-import-type-call-graph-v2"
+                and .properties.typescript_semantic_diagnostics == "0"
+                and .properties.typescript_emitted_semantic_diagnostics == "0"
+                and .properties.typescript_semantic_issue_count == "0"
+                and .properties.project_code_executed == "false"
+              ))
+            and ($graph.sites | any(.resolution_status == "candidates"))
+            and ($graph.sites | any(.resolution_status == "external"))' "$tmp/semantic-complete.json"
           cp -R workers/web/test/fixtures/polyglot "$tmp/checkout-two"
           target/debug/depgraph --store "$tmp/two.db" scan "$tmp/checkout-two" --json > /dev/null
           target/debug/depgraph --store "$tmp/two.db" export --format json > "$tmp/two.json"
@@ -763,6 +788,28 @@ jobs:
           if ($sourceDependencyEdges.Count -eq 0) { throw 'Semantic union overwrote the source import graph' }
           $completed = ($events | Where-Object event -eq 'scan_completed' | Select-Object -Last 1).coverage
           if ($completed.completeness -contains 'semantic-complete') { throw 'Import/type/call slice claimed semantic completeness' }
+          $frameworkReasons = @($completed.reasons)
+          if ($profile.features.Count -eq 0 -or $frameworkReasons -notcontains 'framework_semantic_capability_pending') {
+            throw 'Framework fixture lost its semantic-completeness blocker'
+          }
+          $semanticCompleteLines = node workers\web\dist\worker.mjs --root workers\web\test\fixtures\semantic-complete --scan-id windows-web-semantic-complete
+          if ($LASTEXITCODE -ne 0) { throw "Pure TypeScript worker scan failed with exit $LASTEXITCODE" }
+          $semanticCompleteEvents = @($semanticCompleteLines | ForEach-Object { $_ | ConvertFrom-Json })
+          $semanticCompleteProfile = ($semanticCompleteEvents | Where-Object event -eq 'profile_declared' | Select-Object -First 1).profile
+          $semanticCompleteCoverage = ($semanticCompleteEvents | Where-Object event -eq 'scan_completed' | Select-Object -Last 1).coverage
+          $semanticCompleteStatuses = @($semanticCompleteEvents | Where-Object event -eq 'dependency_site' | ForEach-Object { $_.site.resolution_status })
+          if ($semanticCompleteCoverage.completeness -notcontains 'syntax-complete' -or
+              $semanticCompleteCoverage.completeness -notcontains 'semantic-complete' -or
+              $semanticCompleteCoverage.project_code_executed -ne $false -or
+              $semanticCompleteCoverage.unresolved -ne 0 -or
+              @($semanticCompleteCoverage.reasons).Count -ne 0 -or
+              $semanticCompleteProfile.features.Count -ne 0 -or
+              $semanticCompleteProfile.properties.typescript_semantic_diagnostics -ne '0' -or
+              $semanticCompleteProfile.properties.typescript_emitted_semantic_diagnostics -ne '0' -or
+              $semanticCompleteStatuses -notcontains 'candidates' -or
+              $semanticCompleteStatuses -notcontains 'external') {
+            throw 'Pure TypeScript fixture did not satisfy the semantic-complete contract'
+          }
           if (Test-Path workers\web\test\fixtures\polyglot\apps\next-app\NEXT_CONFIG_EXECUTED) { throw 'Next config executed' }
           if (Test-Path workers\web\test\fixtures\polyglot\apps\astro-app\ASTRO_CONFIG_EXECUTED) { throw 'Astro config executed' }
       - run: cargo xtask go-semantic-e2e

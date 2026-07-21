@@ -26,9 +26,14 @@ Source/development builds intentionally report
 extracted release archive, including its Rust backend attestation, it starts the
 packaged worker with `release-gate-verified`; only that attested path may emit a
 release-ready profile. Issue #30 package/release verification was completed on
-2026-07-19. Web symbol/type/call analysis, code-based routes, server
-functions, build observation, runtime traces, incremental updates, snapshots,
-and architecture policies belong to later milestones.
+2026-07-19. A pure TypeScript/JavaScript Web profile can likewise claim
+`semantic-complete` only with the bundled isolated compiler, a ready/emitted
+v2 graph, zero skipped, unsupported, unresolved, semantic-issue, and compiler
+diagnostic counts, `project_code_executed=false`, and no detected framework.
+Candidate and external Web sites are allowed. Framework semantic edges,
+code-based routes, server functions, build observation, runtime traces,
+incremental updates, snapshots, and architecture policies remain later
+milestones.
 
 ## Build
 

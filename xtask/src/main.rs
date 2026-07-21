@@ -1312,6 +1312,13 @@ fn verify_archive(archive: &Path, name: &str) -> Result<()> {
     verify_packaged_scan(&executable, &second_web_store, &second_fixture, "web")?;
     verify_packaged_web_determinism(&executable, &first_web_store, &second_web_store)?;
     verify_packaged_typescript_fails_closed(&executable, &extracted, &verify_root, &fixture)?;
+    let semantic_complete_fixture =
+        Path::new("workers/web/test/fixtures/semantic-complete").canonicalize()?;
+    verify_packaged_web_semantic_complete(
+        &executable,
+        &verify_root.join("web-semantic-complete.db"),
+        &semantic_complete_fixture,
+    )?;
 
     let rust_fixture = Path::new("workers/rust/tests/fixtures/security").canonicalize()?;
     verify_packaged_scan(
@@ -2529,6 +2536,19 @@ fn verify_packaged_web_import_type_call_graph(executable: &Path, store: &Path) -
     {
         bail!("packaged Web import/type/call slice claimed semantic-complete");
     }
+    if profile["features"]
+        .as_array()
+        .is_none_or(|features| features.is_empty())
+        || !graph["coverage"]["reasons"]
+            .as_array()
+            .is_some_and(|reasons| {
+                reasons
+                    .iter()
+                    .any(|reason| reason == "framework_semantic_capability_pending")
+            })
+    {
+        bail!("packaged Web framework fixture lost its semantic-completeness blocker");
+    }
     if !edges.iter().any(|edge| {
         edge["phase"] == "source" && matches!(edge["kind"].as_str(), Some("imports" | "reexports"))
     }) {
@@ -2745,6 +2765,102 @@ fn verify_packaged_web_import_type_call_graph(executable: &Path, store: &Path) -
         })
     }) {
         bail!("packaged Web unresolved query lost its call site, reason, or evidence");
+    }
+    Ok(())
+}
+
+fn verify_packaged_web_semantic_complete(
+    executable: &Path,
+    store: &Path,
+    fixture: &Path,
+) -> Result<()> {
+    let scan = Command::new(executable)
+        .arg("--store")
+        .arg(store)
+        .arg("scan")
+        .arg(fixture)
+        .arg("--json")
+        .output()
+        .context("failed to scan the packaged pure TypeScript semantic-complete fixture")?;
+    if !scan.status.success() {
+        bail!(
+            "packaged pure TypeScript semantic-complete scan failed: {}\n{}",
+            String::from_utf8_lossy(&scan.stdout),
+            String::from_utf8_lossy(&scan.stderr)
+        );
+    }
+    let scan: Value = serde_json::from_slice(&scan.stdout)
+        .context("packaged pure TypeScript semantic-complete scan returned invalid JSON")?;
+    let coverage = &scan["coverage"];
+    if scan["status"] != "completed"
+        || coverage["project_code_executed"] != Value::Bool(false)
+        || coverage["completeness"].as_array().is_none_or(|levels| {
+            !levels.iter().any(|level| level == "syntax-complete")
+                || !levels.iter().any(|level| level == "semantic-complete")
+        })
+        || coverage["reasons"].as_array().is_none_or(Vec::is_empty)
+        || coverage["unresolved"].as_u64() != Some(0)
+        || coverage["candidates"].as_u64().unwrap_or_default() == 0
+        || coverage["external"].as_u64().unwrap_or_default() == 0
+    {
+        bail!("packaged pure TypeScript fixture did not satisfy semantic completeness: {scan}");
+    }
+
+    let exported = packaged_web_export_json(executable, store)?;
+    let graph = exported["graph"]
+        .as_object()
+        .context("packaged pure TypeScript semantic-complete export has no graph")?;
+    let profile = graph["profiles"]
+        .as_array()
+        .and_then(|profiles| profiles.iter().find(|profile| profile["language"] == "web"))
+        .context("packaged pure TypeScript semantic-complete export has no Web profile")?;
+    let properties = &profile["properties"];
+    if !profile["features"].as_array().is_some_and(Vec::is_empty)
+        || !matches!(
+            properties["typescript_release_gate"].as_str(),
+            Some("release-gate-pending" | "release-gate-verified")
+        )
+        || properties["typescript_typechecker_status"]
+            != "definition-import-type-call-graph-emitted"
+        || properties["typescript_definition_graph_status"] != "ready"
+        || properties["typescript_semantic_graph_emission"]
+            != "definition-import-type-call-graph-v2"
+        || properties["typescript_semantic_diagnostics"] != "0"
+        || properties["typescript_emitted_semantic_diagnostics"] != "0"
+        || properties["typescript_semantic_issue_count"] != "0"
+        || properties["project_code_executed"] != "false"
+    {
+        bail!(
+            "packaged pure TypeScript fixture lost its semantic-completeness profile contract: {profile}"
+        );
+    }
+
+    let semantic_site_ids: BTreeSet<_> = graph["evidence"]
+        .as_array()
+        .context("packaged pure TypeScript semantic-complete export has no evidence")?
+        .iter()
+        .filter(|evidence| {
+            evidence["owner_type"] == "site"
+                && evidence["ordinal"].as_u64() == Some(0)
+                && evidence["kind"] == "semantic"
+        })
+        .filter_map(|evidence| evidence["owner_id"].as_str())
+        .collect();
+    let semantic_statuses: BTreeSet<_> = graph["sites"]
+        .as_array()
+        .context("packaged pure TypeScript semantic-complete export has no sites")?
+        .iter()
+        .filter(|site| {
+            site["id"]
+                .as_str()
+                .is_some_and(|id| semantic_site_ids.contains(id))
+        })
+        .filter_map(|site| site["resolution_status"].as_str())
+        .collect();
+    if !semantic_statuses.contains("candidates") || !semantic_statuses.contains("external") {
+        bail!(
+            "packaged pure TypeScript semantic-complete fixture lost its allowed candidate/external sites"
+        );
     }
     Ok(())
 }

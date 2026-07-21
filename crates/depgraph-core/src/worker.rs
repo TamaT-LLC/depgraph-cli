@@ -1982,6 +1982,8 @@ fn discard_web_definition_delta(
         for property in [
             "typescript_semantic_node_count",
             "typescript_semantic_relation_count",
+            "typescript_semantic_diagnostics",
+            "typescript_emitted_semantic_diagnostics",
             "typescript_semantic_issue_count",
         ] {
             properties.insert(property.to_owned(), Value::String("0".to_owned()));
@@ -4466,6 +4468,7 @@ fn parse_events_preserving_prefix(
     let mut web_semantic_endpoint_ids = BTreeSet::new();
     let mut web_discarded_site_ids = BTreeSet::new();
     let mut saw_web_semantic_delta = false;
+    let mut saw_web_semantic_complete = false;
     for (line_index, mut line) in stdout.split(|byte| *byte == b'\n').enumerate() {
         if line.last() == Some(&b'\r') {
             line = &line[..line.len() - 1];
@@ -4525,6 +4528,18 @@ fn parse_events_preserving_prefix(
         } else {
             None
         };
+        let current_web_semantic_complete = enforce_web_definition_graph
+            && match &event {
+                ProtocolEvent::ProfileCompleted(completed) => completed
+                    .coverage
+                    .completeness
+                    .contains(&CompletenessLevel::SemanticComplete),
+                ProtocolEvent::ScanCompleted(completed) => completed
+                    .coverage
+                    .completeness
+                    .contains(&CompletenessLevel::SemanticComplete),
+                _ => false,
+            };
         if event.common().scan_id != expected_scan_id {
             if let Some(site_id) = &current_site_closure {
                 web_discarded_site_ids.insert(site_id.clone());
@@ -4883,22 +4898,6 @@ fn parse_events_preserving_prefix(
                         ))
                     }
                 }
-                ProtocolEvent::ProfileCompleted(completed)
-                    if completed
-                        .coverage
-                        .completeness
-                        .contains(&CompletenessLevel::SemanticComplete) =>
-                {
-                    Some("Web semantic profile reported semantic-complete".to_owned())
-                }
-                ProtocolEvent::ScanCompleted(completed)
-                    if completed
-                        .coverage
-                        .completeness
-                        .contains(&CompletenessLevel::SemanticComplete) =>
-                {
-                    Some("Web semantic profile reported semantic-complete".to_owned())
-                }
                 _ => None,
             };
             if let Some(violation) = violation {
@@ -4915,11 +4914,14 @@ fn parse_events_preserving_prefix(
         let current_web_semantic_delta =
             enforce_web_definition_graph && is_web_semantic_delta_event(&event);
         saw_web_semantic_delta |= current_web_semantic_delta;
+        saw_web_semantic_complete |= current_web_semantic_complete;
         if let Err(error) = validator.push(event) {
             if let Some(site_id) = current_site_closure {
                 web_discarded_site_ids.insert(site_id);
             }
-            security_violation = protocol_error_is_security(&error) || current_web_semantic_delta;
+            security_violation = protocol_error_is_security(&error)
+                || current_web_semantic_delta
+                || current_web_semantic_complete;
             parse_error = Some(format!(
                 "protocol validation failed at line {}: {error}",
                 line_index + 1
@@ -4953,7 +4955,7 @@ fn parse_events_preserving_prefix(
             Ok(_) => {}
             Err(error) => {
                 if enforce_web_definition_graph
-                    && saw_web_semantic_delta
+                    && (saw_web_semantic_delta || saw_web_semantic_complete)
                     && matches!(error, ProtocolError::Invariant(_))
                 {
                     parse_error = Some(format!(
@@ -6029,6 +6031,89 @@ mod tests {
         }
         resequence_test_protocol(&mut events);
         serialize_test_protocol(events)
+    }
+
+    fn promote_typescript_semantic_complete(events: &mut [Value], gate: &str) {
+        let standard_library_integrity = match gate {
+            TYPESCRIPT_RELEASE_GATE_PENDING => "build-produced-pending-core-attestation",
+            TYPESCRIPT_RELEASE_GATE_VERIFIED => "core-attested-whole-tree",
+            unexpected => panic!("unsupported TypeScript release gate {unexpected:?}"),
+        };
+        {
+            let profile = events
+                .iter_mut()
+                .find(|event| event["event"] == "profile_declared")
+                .expect("Web profile declaration");
+            profile["profile"]["features"] = serde_json::json!([]);
+            let properties = &mut profile["profile"]["properties"];
+            for (property, value) in [
+                ("bundled_typescript", "true"),
+                ("typescript_syntax_compiler", "native-7.0.2"),
+                ("typescript_compiler_source", "bundled"),
+                ("typescript_compiler_version", TYPESCRIPT_COMPILER_VERSION),
+                ("typescript_compiler_selection", "bundled-only"),
+                ("typescript_compiler_fallback", "fail-closed"),
+                (
+                    TYPESCRIPT_ANALYSIS_MODE_PROPERTY,
+                    TYPESCRIPT_ANALYSIS_MODE_IMPORT_TYPE_CALL_GRAPH,
+                ),
+                ("typescript_project_local_policy", "metadata-only"),
+                ("typescript_project_local_loaded", "false"),
+                (
+                    TYPESCRIPT_TYPECHECKER_STATUS_PROPERTY,
+                    "definition-import-type-call-graph-emitted",
+                ),
+                (TYPESCRIPT_PROJECT_STATUS_PROPERTY, "ready"),
+                ("typescript_project_model_failure_reason", "none"),
+                ("typescript_project_config", "worker-neutral-allowlist"),
+                ("typescript_module_resolution", "inventory-only"),
+                ("typescript_standard_library_source", "bundled"),
+                (
+                    "typescript_standard_library_integrity",
+                    standard_library_integrity,
+                ),
+                (TYPESCRIPT_RELEASE_GATE_PROPERTY, gate),
+                (
+                    TYPESCRIPT_SEMANTIC_EMISSION_PROPERTY,
+                    TYPESCRIPT_SEMANTIC_EMISSION_IMPORT_TYPE_CALL_GRAPH_V2,
+                ),
+                ("typescript_compiler_processes", "1"),
+                ("typescript_project_filesystem", "isolated-virtual"),
+                (TYPESCRIPT_DEFINITION_STATUS_PROPERTY, "ready"),
+                ("typescript_semantic_diagnostics", "0"),
+                ("typescript_emitted_semantic_diagnostics", "0"),
+                ("typescript_semantic_issue_count", "0"),
+                ("project_code_executed", "false"),
+            ] {
+                properties[property] = serde_json::json!(value);
+            }
+            if properties
+                .get(TYPESCRIPT_SEMANTIC_SITE_COUNT_PROPERTY)
+                .is_none()
+            {
+                properties[TYPESCRIPT_SEMANTIC_SITE_COUNT_PROPERTY] = serde_json::json!("0");
+            }
+            if properties
+                .get(TYPESCRIPT_SEMANTIC_CALL_SITE_COUNT_PROPERTY)
+                .is_none()
+            {
+                properties[TYPESCRIPT_SEMANTIC_CALL_SITE_COUNT_PROPERTY] = serde_json::json!("0");
+            }
+        }
+        for event in events {
+            if matches!(
+                event["event"].as_str(),
+                Some("profile_completed" | "scan_completed")
+            ) {
+                event["coverage"]["completeness"] =
+                    serde_json::json!(["syntax-complete", "semantic-complete"]);
+                event["coverage"]["files_skipped"] = serde_json::json!(0);
+                event["coverage"]["unsupported_syntax"] = serde_json::json!(0);
+                event["coverage"]["unresolved"] = serde_json::json!(0);
+                event["coverage"]["project_code_executed"] = serde_json::json!(false);
+                event["coverage"]["reasons"] = serde_json::json!([]);
+            }
+        }
     }
 
     fn recanonicalize_typescript_call(events: &mut [Value]) {
@@ -7794,6 +7879,7 @@ mod tests {
             &mut events,
             TYPESCRIPT_SEMANTIC_EMISSION_IMPORT_TYPE_CALL_GRAPH_V2,
         );
+        promote_typescript_semantic_complete(&mut events, TYPESCRIPT_RELEASE_GATE_PENDING);
 
         let parsed = parse_events_preserving_prefix(
             &serialize_test_protocol(events)?,
@@ -7856,8 +7942,66 @@ mod tests {
                     event["coverage"]["dependency_sites"] == 1
                         && event["coverage"]["resolved"] == 0
                         && event["coverage"]["candidates"] == 1
+                        && event["coverage"]["completeness"]
+                            .as_array()
+                            .is_some_and(|values| {
+                                values.iter().any(|value| value == "semantic-complete")
+                            })
                 })
         );
+        Ok(())
+    }
+
+    #[test]
+    fn web_semantic_complete_rejects_compiler_diagnostics() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let root = root.path().canonicalize()?;
+        for property in [
+            "typescript_semantic_diagnostics",
+            "typescript_emitted_semantic_diagnostics",
+        ] {
+            let mut events = test_protocol_values(typescript_call_protocol(
+                &root,
+                TYPESCRIPT_RELEASE_GATE_PENDING,
+            )?)?;
+            promote_typescript_semantic_complete(&mut events, TYPESCRIPT_RELEASE_GATE_PENDING);
+            events
+                .iter_mut()
+                .find(|event| event["event"] == "profile_declared")
+                .expect("Web profile declaration")["profile"]["properties"][property] =
+                serde_json::json!("1");
+            resequence_test_protocol(&mut events);
+
+            let parsed = parse_events_preserving_prefix(
+                &serialize_test_protocol(events)?,
+                "typescript-gate-scan",
+                "web",
+                &root,
+                64 * 1024,
+                Some(env!("CARGO_PKG_VERSION")),
+                Some(false),
+            );
+            assert_eq!(
+                parsed.failure_kind,
+                Some(WorkerFailureKind::MalformedProtocol),
+                "{property}: {:?}",
+                parsed.error
+            );
+            assert!(parsed.security_violation, "{property}: {:?}", parsed.error);
+            assert!(
+                parsed
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.contains(property)),
+                "{property}: {:?}",
+                parsed.error
+            );
+            assert!(!parsed.events.iter().any(|event| {
+                event["coverage"]["completeness"]
+                    .as_array()
+                    .is_some_and(|values| values.iter().any(|value| value == "semantic-complete"))
+            }));
+        }
         Ok(())
     }
 
@@ -9277,6 +9421,7 @@ mod tests {
                 event["coverage"]["external"] = serde_json::json!(1);
             }
         }
+        promote_typescript_semantic_complete(&mut events, TYPESCRIPT_RELEASE_GATE_PENDING);
         events
             .iter_mut()
             .find(|event| event["event"] == "profile_declared")
@@ -9311,14 +9456,17 @@ mod tests {
         let properties = &discarded_profile["profile"]["properties"];
         assert_eq!(
             properties[TYPESCRIPT_TYPECHECKER_STATUS_PROPERTY],
-            "definition-import-type-graph-discarded"
+            "definition-import-type-call-graph-discarded"
         );
         assert_eq!(properties[TYPESCRIPT_DEFINITION_STATUS_PROPERTY], "failed");
         for property in [
             "typescript_semantic_node_count",
             "typescript_semantic_relation_count",
+            "typescript_semantic_diagnostics",
+            "typescript_emitted_semantic_diagnostics",
             "typescript_semantic_issue_count",
             TYPESCRIPT_SEMANTIC_SITE_COUNT_PROPERTY,
+            TYPESCRIPT_SEMANTIC_CALL_SITE_COUNT_PROPERTY,
         ] {
             assert_eq!(properties[property], "0", "{property}");
         }
@@ -9327,6 +9475,11 @@ mod tests {
                 event["event"].as_str(),
                 Some("file_completed" | "profile_completed" | "scan_completed")
             )
+        }));
+        assert!(!parsed.events.iter().any(|event| {
+            event["coverage"]["completeness"]
+                .as_array()
+                .is_some_and(|values| values.iter().any(|value| value == "semantic-complete"))
         }));
         assert!(parsed.events.iter().any(|event| {
             event["event"] == "dependency_site" && event["site"]["id"] == source_site_id
@@ -10924,53 +11077,30 @@ mod tests {
     }
 
     #[test]
-    fn web_definition_graph_cannot_claim_semantic_complete() -> Result<()> {
+    fn web_semantic_complete_requires_call_graph_v2_capability() -> Result<()> {
         let root = tempfile::tempdir()?;
         let root = root.path().canonicalize()?;
-        let output = profile_protocol(
+        let mut events = test_protocol_values(typescript_call_protocol(
             &root,
-            "web-definition-invariant-scan",
-            "web",
-            serde_json::json!({
-                TYPESCRIPT_RELEASE_GATE_PROPERTY: TYPESCRIPT_RELEASE_GATE_PENDING,
-                TYPESCRIPT_ANALYSIS_MODE_PROPERTY: TYPESCRIPT_ANALYSIS_MODE_DEFINITION_GRAPH,
-                TYPESCRIPT_SEMANTIC_EMISSION_PROPERTY: TYPESCRIPT_SEMANTIC_EMISSION_DEFINITION_GRAPH_V1,
-                TYPESCRIPT_PROJECT_STATUS_PROPERTY: "ready",
-                TYPESCRIPT_TYPECHECKER_STATUS_PROPERTY: "definition-graph-emitted",
-                TYPESCRIPT_DEFINITION_STATUS_PROPERTY: "ready",
-                "typescript_semantic_node_count": "0",
-                "typescript_semantic_relation_count": "0",
-                "typescript_semantic_issue_count": "0",
-            }),
-        )?;
-        let mut events = String::from_utf8(output)?
-            .lines()
-            .map(serde_json::from_str::<Value>)
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        for event in &mut events {
-            if matches!(
-                event.get("event").and_then(Value::as_str),
-                Some("profile_completed" | "scan_completed")
-            ) {
-                event["coverage"]["completeness"] =
-                    serde_json::json!(["syntax-complete", "semantic-complete"]);
-            }
-        }
-        let mut spoofed = Vec::new();
-        for event in events {
-            serde_json::to_writer(&mut spoofed, &event)?;
-            spoofed.push(b'\n');
-        }
+            TYPESCRIPT_RELEASE_GATE_PENDING,
+        )?)?;
+        promote_typescript_semantic_complete(&mut events, TYPESCRIPT_RELEASE_GATE_PENDING);
+        events
+            .iter_mut()
+            .find(|event| event["event"] == "profile_declared")
+            .expect("Web profile declaration")["profile"]["properties"]
+            [TYPESCRIPT_SEMANTIC_EMISSION_PROPERTY] =
+            serde_json::json!(TYPESCRIPT_SEMANTIC_EMISSION_IMPORT_TYPE_CALL_GRAPH_V1);
+        resequence_test_protocol(&mut events);
         let parsed = parse_events_preserving_prefix(
-            &spoofed,
-            "web-definition-invariant-scan",
+            &serialize_test_protocol(events)?,
+            "typescript-gate-scan",
             "web",
             &root,
-            4096,
+            64 * 1024,
             Some(env!("CARGO_PKG_VERSION")),
             Some(false),
         );
-        assert_eq!(parsed.events.len(), 2);
         assert_eq!(
             parsed.failure_kind,
             Some(WorkerFailureKind::MalformedProtocol)
@@ -10980,7 +11110,7 @@ mod tests {
             parsed
                 .error
                 .as_deref()
-                .is_some_and(|error| error.contains("semantic-complete"))
+                .is_some_and(|error| error.contains(TYPESCRIPT_SEMANTIC_EMISSION_PROPERTY))
         );
         Ok(())
     }
