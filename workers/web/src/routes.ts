@@ -17,6 +17,7 @@ export interface RouteDrift {
   package: PackageRecord;
   missingFromGenerated: string[];
   onlyGenerated: string[];
+  evidence: Evidence[];
 }
 
 export interface RouteDiscovery {
@@ -499,6 +500,8 @@ async function discoverTanStack(record: PackageRecord, allFiles: string[], root:
   const entries: RouteEntry[] = [];
   const staticPatterns = new Set<string>();
   const generatedPatterns = new Set<string>();
+  const staticEvidence = new Map<string, Evidence>();
+  const generatedEvidence = new Map<string, Evidence>();
   const routeRoots = config.tanstackRouteRoots;
   for (const file of allFiles) {
     if (!TANSTACK_EXTENSIONS.has(path.extname(file))) continue;
@@ -512,7 +515,11 @@ async function discoverTanStack(record: PackageRecord, allFiles: string[], root:
     const patterns = explicit.length > 0 ? explicit : [{ pattern: tanstackFilesystemPattern(rootMatch), evidence: evidence(relativeFile, "tanstack-filesystem-routes") }];
     for (const item of patterns) {
       const pattern = withBasePath(config.tanstackBasePath, item.pattern);
+      const routeEvidence = item.evidence.kind === "build"
+        ? { ...item.evidence, kind: "source" as const, extractor: "tanstack-file-route-literal" }
+        : item.evidence;
       staticPatterns.add(pattern);
+      staticEvidence.set(pattern, routeEvidence);
       entries.push({
         framework,
         pattern,
@@ -520,7 +527,7 @@ async function discoverTanStack(record: PackageRecord, allFiles: string[], root:
         relativeFile,
         entryKind: "file-route",
         generated: false,
-        evidence: item.evidence.kind === "build" ? { ...item.evidence, kind: "source", extractor: "tanstack-file-route-literal" } : item.evidence,
+        evidence: routeEvidence,
       });
     }
   }
@@ -531,6 +538,7 @@ async function discoverTanStack(record: PackageRecord, allFiles: string[], root:
     for (const item of literalGeneratedRoutes(source, relativeFile).filter((value) => value.evidence.detail === "generated_full_path")) {
       const pattern = withBasePath(config.tanstackBasePath, item.pattern);
       generatedPatterns.add(pattern);
+      generatedEvidence.set(pattern, item.evidence);
       entries.push({
         framework,
         pattern,
@@ -542,10 +550,16 @@ async function discoverTanStack(record: PackageRecord, allFiles: string[], root:
       });
     }
   }
+  const missingFromGenerated = [...staticPatterns].filter((pattern) => !generatedPatterns.has(pattern)).sort();
+  const onlyGenerated = [...generatedPatterns].filter((pattern) => !staticPatterns.has(pattern)).sort();
   const drift = generatedPatterns.size === 0 ? null : {
     package: record,
-    missingFromGenerated: [...staticPatterns].filter((pattern) => !generatedPatterns.has(pattern)).sort(),
-    onlyGenerated: [...generatedPatterns].filter((pattern) => !staticPatterns.has(pattern)).sort(),
+    missingFromGenerated,
+    onlyGenerated,
+    evidence: [
+      ...missingFromGenerated.map((pattern) => staticEvidence.get(pattern)),
+      ...onlyGenerated.map((pattern) => generatedEvidence.get(pattern)),
+    ].filter((item): item is Evidence => item !== undefined),
   };
   return { entries, drift };
 }

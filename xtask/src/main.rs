@@ -2543,7 +2543,7 @@ fn verify_packaged_web_import_type_call_graph(executable: &Path, store: &Path) -
             matches!(node["kind"].as_str(), Some("component" | "route"))
                 && matches!(
                     node["properties"]["canonical_identity"]["framework"].as_str(),
-                    Some("next" | "astro")
+                    Some("next" | "astro" | "tanstack-router")
                 )
                 && node["properties"]["framework"]
                     == node["properties"]["canonical_identity"]["framework"]
@@ -3189,6 +3189,168 @@ fn verify_packaged_web_import_type_call_graph(executable: &Path, store: &Path) -
         || !astro_query_contains_edge(&astro_why)
     {
         bail!("packaged Web queries lost the Astro render edge or its evidence");
+    }
+
+    let tanstack_nodes: Vec<_> = all_framework_nodes
+        .iter()
+        .copied()
+        .filter(|node| node["properties"]["framework"] == "tanstack-router")
+        .collect();
+    let tanstack_site_ids: BTreeSet<_> = evidence
+        .iter()
+        .filter(|item| {
+            item["owner_type"] == "site"
+                && item["ordinal"].as_u64() == Some(0)
+                && item["kind"] == "semantic"
+                && item["extractor"] == "tanstack-router-static-adapter"
+                && item["extractor_version"] == "0.1.0"
+                && item["properties"]["framework"] == "tanstack-router"
+                && item["properties"]["contract_version"] == "framework-semantic-graph-v1"
+        })
+        .filter_map(|item| item["owner_id"].as_str())
+        .collect();
+    let tanstack_edge_ids: BTreeSet<_> = evidence
+        .iter()
+        .filter(|item| {
+            item["owner_type"] == "edge"
+                && item["ordinal"].as_u64() == Some(0)
+                && item["kind"] == "semantic"
+                && item["extractor"] == "tanstack-router-static-adapter"
+                && item["extractor_version"] == "0.1.0"
+                && item["properties"]["framework"] == "tanstack-router"
+                && item["properties"]["contract_version"] == "framework-semantic-graph-v1"
+        })
+        .filter_map(|item| item["owner_id"].as_str())
+        .collect();
+    let tanstack_sites: Vec<_> = all_framework_sites
+        .iter()
+        .copied()
+        .filter(|site| {
+            site["id"]
+                .as_str()
+                .is_some_and(|id| tanstack_site_ids.contains(id))
+        })
+        .collect();
+    let tanstack_edges: Vec<_> = all_framework_edges
+        .iter()
+        .copied()
+        .filter(|edge| {
+            edge["id"]
+                .as_str()
+                .is_some_and(|id| tanstack_edge_ids.contains(id))
+        })
+        .collect();
+    let tanstack_kinds: BTreeSet<_> = tanstack_edges
+        .iter()
+        .filter_map(|edge| edge["kind"].as_str())
+        .collect();
+    if tanstack_kinds
+        != BTreeSet::from([
+            "before_load",
+            "loads",
+            "masks_to",
+            "navigates_to",
+            "parent_route",
+            "renders",
+            "route_entry",
+        ])
+    {
+        bail!("packaged TanStack Router graph lost its typed route vocabulary");
+    }
+    let tanstack_route = |pattern: &str, route_kind: &str| {
+        tanstack_nodes.iter().copied().find(|node| {
+            node["kind"] == "route"
+                && node["properties"]["route_pattern"] == pattern
+                && node["properties"]["route_kind"] == route_kind
+        })
+    };
+    let tanstack_code_root = tanstack_nodes
+        .iter()
+        .copied()
+        .find(|node| {
+            node["kind"] == "route"
+                && node["properties"]["route_pattern"] == "/router"
+                && node["properties"]["route_kind"] == "tanstack-code-root-route"
+                && node["properties"]["source_path"] == "apps/router/src/code-routes.tsx"
+        })
+        .context("packaged TanStack Router graph omitted its code root")?;
+    let tanstack_code_child = tanstack_route("/router/code", "tanstack-code-route")
+        .context("packaged TanStack Router graph omitted its registered code child")?;
+    tanstack_route("/router", "tanstack-file-root-route")
+        .context("packaged TanStack Router graph omitted its file root")?;
+    tanstack_route("/router/posts", "tanstack-lazy-file-route")
+        .context("packaged TanStack Router graph omitted its lazy file route")?;
+    tanstack_route("/router/virtual", "tanstack-virtual-route")
+        .context("packaged TanStack Router graph omitted its virtual route")?;
+    if tanstack_nodes.iter().any(|node| {
+        node["kind"] == "route" && node["properties"]["route_pattern"] == "/router/orphan"
+    }) {
+        bail!("packaged TanStack Router graph promoted an unregistered declaration");
+    }
+    let tanstack_code_root_id = tanstack_code_root["id"]
+        .as_str()
+        .context("packaged TanStack Router code root omitted its ID")?;
+    let tanstack_code_child_id = tanstack_code_child["id"]
+        .as_str()
+        .context("packaged TanStack Router code child omitted its ID")?;
+    let code_parent_edges: Vec<_> = tanstack_edges
+        .iter()
+        .copied()
+        .filter(|edge| {
+            edge["kind"] == "parent_route"
+                && edge["source"] == tanstack_code_child_id
+                && edge["target"] == tanstack_code_root_id
+        })
+        .collect();
+    let code_parent_occurrences: BTreeSet<_> = code_parent_edges
+        .iter()
+        .filter_map(|edge| {
+            evidence.iter().find(|item| {
+                item["owner_type"] == "edge"
+                    && item["owner_id"] == edge["id"]
+                    && item["ordinal"].as_u64() == Some(0)
+            })
+        })
+        .filter_map(|item| item["properties"]["occurrence_kind"].as_str())
+        .collect();
+    if code_parent_occurrences
+        != BTreeSet::from([
+            "tanstack_add_children_registration",
+            "tanstack_declared_parent",
+        ])
+        || !tanstack_sites
+            .iter()
+            .any(|site| site["kind"] == "parent_route" && site["resolution_status"] == "candidates")
+        || !tanstack_sites.iter().any(|site| {
+            site["kind"] == "parent_route"
+                && site["resolution_status"] == "unresolved"
+                && site["reason"] == "tanstack_runtime_child_registration"
+        })
+        || tanstack_sites.iter().any(|site| {
+            matches!(site["kind"].as_str(), Some("navigates_to" | "masks_to"))
+                && site["resolution_status"] != "resolved"
+        })
+    {
+        bail!(
+            "packaged TanStack Router graph lost registration, candidate, unresolved, or navigation evidence"
+        );
+    }
+    let tanstack_source_selector = format!("id:{tanstack_code_child_id}");
+    let tanstack_deps = packaged_web_query(
+        executable,
+        store,
+        &["deps", &tanstack_source_selector, "--json"],
+        "query packaged TanStack Router parent dependencies",
+    )?;
+    let queried_parent_edges: BTreeSet<_> = tanstack_deps["data"]["steps"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|step| step["edge"]["id"].as_str())
+        .filter(|id| code_parent_edges.iter().any(|edge| edge["id"] == *id))
+        .collect();
+    if queried_parent_edges.len() != 2 {
+        bail!("packaged Web queries lost TanStack Router declared/registered parent evidence");
     }
     let coverage = &graph["coverage"];
     let classified_sites = ["resolved", "candidates", "external", "unresolved"]
