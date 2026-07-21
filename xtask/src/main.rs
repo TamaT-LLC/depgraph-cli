@@ -5410,8 +5410,21 @@ fn pnpm_program() -> &'static str {
 }
 
 fn verify_release_tag() -> Result<()> {
-    let Some(tag) = std::env::var_os("GITHUB_REF_NAME") else {
+    verify_release_tag_values(
+        std::env::var_os("GITHUB_REF_TYPE").as_deref(),
+        std::env::var_os("GITHUB_REF_NAME").as_deref(),
+    )
+}
+
+fn verify_release_tag_values(
+    ref_type: Option<&std::ffi::OsStr>,
+    tag: Option<&std::ffi::OsStr>,
+) -> Result<()> {
+    if ref_type != Some(std::ffi::OsStr::new("tag")) {
         return Ok(());
+    }
+    let Some(tag) = tag else {
+        bail!("release tag workflow did not expose GITHUB_REF_NAME");
     };
     let tag = tag.to_string_lossy();
     let expected = format!("v{VERSION}");
@@ -5551,9 +5564,9 @@ mod tests {
         WEB_SEMANTIC_RUNTIME_ARTIFACTS, WEB_SEMANTIC_RUNTIME_COMPONENTS, WebSemanticAttestation,
         WorkerBackend, archive_entries, cargo_runtime_packages, create_tar_archive,
         create_zip_archive, extract_archive, normalized_spdx_license, package_url,
-        parse_worker_handshake, rust_backend_from_handshake, verify_rust_analyzer_dependencies,
-        verify_rust_backend, verify_web_semantic_attestation, web_runtime_packages,
-        web_semantic_from_handshake,
+        parse_worker_handshake, rust_backend_from_handshake, verify_release_tag_values,
+        verify_rust_analyzer_dependencies, verify_rust_backend, verify_web_semantic_attestation,
+        web_runtime_packages, web_semantic_from_handshake,
     };
 
     fn release_tree() -> Result<(tempfile::TempDir, String)> {
@@ -5571,6 +5584,23 @@ mod tests {
             fs::set_permissions(&executable, fs::Permissions::from_mode(0o751))?;
         }
         Ok((temp, name))
+    }
+
+    #[test]
+    fn release_tag_gate_ignores_non_tag_github_refs() {
+        use std::ffi::OsStr;
+
+        verify_release_tag_values(Some(OsStr::new("branch")), Some(OsStr::new("97/merge")))
+            .expect("pull-request merge refs are not release tags");
+        assert!(verify_release_tag_values(Some(OsStr::new("tag")), None).is_err());
+        assert!(
+            verify_release_tag_values(Some(OsStr::new("tag")), Some(OsStr::new("v9.9.9"))).is_err()
+        );
+        verify_release_tag_values(
+            Some(OsStr::new("tag")),
+            Some(OsStr::new(concat!("v", env!("CARGO_PKG_VERSION")))),
+        )
+        .expect("the workspace release tag must remain valid");
     }
 
     fn change_source_mtime(path: &std::path::Path) -> Result<()> {
