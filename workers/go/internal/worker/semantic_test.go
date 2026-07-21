@@ -515,6 +515,43 @@ func Local() {
 	}
 }
 
+func TestGoSemanticValueReferencesSkipUniverseScopeValues(t *testing.T) {
+	root := t.TempDir()
+	writeTestFile(t, filepath.Join(root, "go.mod"), "module example.com/predeclared-values\n\ngo 1.26.1\n")
+	writeTestFile(t, filepath.Join(root, "values.go"), `package values
+
+const (
+	First = iota
+	Second
+)
+
+func Enabled() bool {
+	_ = false
+	return true
+}
+`)
+
+	result, err := Scan(root)
+	if err != nil {
+		t.Fatalf("Scan() error = %v", err)
+	}
+	if !containsString(result.Coverage.Completeness, "semantic-complete") {
+		t.Fatalf("universe-scope values degraded semantic completeness: coverage=%+v diagnostics=%+v", result.Coverage, result.Diagnostics)
+	}
+	if hasDiagnostic(result.Diagnostics, "go_value_reference_unresolved") {
+		t.Fatalf("universe-scope values emitted unresolved diagnostics: %+v", result.Diagnostics)
+	}
+	for _, site := range result.Sites {
+		if site.Kind != "value_reference" || len(site.Evidence) == 0 {
+			continue
+		}
+		switch site.Specifier {
+		case "true", "false", "iota":
+			t.Fatalf("universe-scope value emitted a reference site: %+v", site)
+		}
+	}
+}
+
 func TestGoSemanticValueReferenceAcrossPackages(t *testing.T) {
 	root := t.TempDir()
 	writeTestFile(t, filepath.Join(root, "go.mod"), "module example.com/references\n\ngo 1.26.1\n")

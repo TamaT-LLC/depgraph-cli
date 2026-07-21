@@ -103,6 +103,11 @@ func (p *goSemanticPackage) callOwnedIdentifiers() map[*ast.Ident]bool {
 }
 
 func goSemanticIsValueObject(object types.Object) bool {
+	// Universe-scope values such as true, false, and iota do not have a
+	// package-backed identity and must not become unresolved graph targets.
+	if object == nil || object.Pkg() == nil {
+		return false
+	}
 	switch object.(type) {
 	case *types.Var, *types.Const, *types.Func:
 		return true
