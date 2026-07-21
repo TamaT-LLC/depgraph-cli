@@ -73,6 +73,7 @@ pub struct ReleaseHealth {
     pub version: String,
     pub target: String,
     pub schema_version: String,
+    pub license_expression: String,
     pub core_integrity: String,
     pub schema_integrity: String,
     pub runtime_integrity: BTreeMap<String, String>,
@@ -248,6 +249,8 @@ struct ReleaseManifest {
     protocol_version: String,
     schema_version: String,
     target: String,
+    license_expression: String,
+    project_licenses: Vec<ReleaseArtifact>,
     core: ReleaseArtifact,
     schema: ReleaseArtifact,
     #[serde(default)]
@@ -444,14 +447,20 @@ fn release_health() -> Option<ReleaseHealth> {
     let root = manifest_path.parent().unwrap_or(Path::new("."));
     let executable = std::env::current_exe().ok()?;
     let mut runtime_integrity: BTreeMap<String, String> = manifest
-        .runtime_artifacts
+        .project_licenses
         .iter()
         .map(|artifact| {
+            (
+                format!("project-license:{}", artifact.path),
+                artifact_integrity(root, artifact, None),
+            )
+        })
+        .chain(manifest.runtime_artifacts.iter().map(|artifact| {
             (
                 artifact.path.clone(),
                 artifact_integrity(root, artifact, None),
             )
-        })
+        }))
         .collect();
     for component in &manifest.runtime_components {
         let key = format!("component:{}@{}", component.name, component.version);
@@ -473,6 +482,7 @@ fn release_health() -> Option<ReleaseHealth> {
         version: manifest.release_version,
         target: manifest.target,
         schema_version: manifest.schema_version,
+        license_expression: manifest.license_expression,
         core_integrity: artifact_integrity(root, &manifest.core, Some(&executable)),
         schema_integrity: artifact_integrity(root, &manifest.schema, None),
         runtime_integrity,
