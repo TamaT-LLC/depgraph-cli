@@ -20,6 +20,7 @@ import {
 } from "./framework-semantic";
 import { collectAstroSemanticDelta } from "./astro-semantic";
 import { collectNextSemanticDelta } from "./next-semantic";
+import { collectTanStackRouterSemanticDelta } from "./tanstack-router-semantic";
 import {
   analyzeTypeScriptProject,
   TYPESCRIPT_COMPILER_VERSION,
@@ -2236,6 +2237,43 @@ export async function scan(root: string, allFiles: string[], inventoryIssues: Fi
       });
     }
   }
+  const tanstackRouterEntries = routeDiscovery.entries.filter((entry) => entry.framework === "tanstack-router");
+  if (tanstackRouterEntries.length > 0) {
+    frameworkAttempted = true;
+    if (semanticGraphEmitted && nativeTypeScript.project.definitionGraphStatus === "ready") {
+      try {
+        const result = collectTanStackRouterSemanticDelta({
+          entries: tanstackRouterEntries,
+          sources: compilerSources,
+          sourceFiles: nativeTypeScript.semanticSourceFiles,
+          definitions: nativeTypeScript.definitionGraph,
+          definitionNode: (key) => graph.typeScriptDefinitionNode(key),
+          fileNode: (relativePath) => graph.fileNodeByRelativePath(relativePath),
+          ownerForPath: (relativePath) => owningPackage(workspace, path.resolve(root, relativePath)),
+          unknownTarget: () => graph.unknownNode(),
+        });
+        mergeFrameworkResult("tanstack-router", result);
+      } catch (error) {
+        graph.addDiagnostic({
+          severity: "warning",
+          code: "web.tanstack_router_semantic_delta_discarded",
+          message: `TanStack Router framework semantic graph was discarded atomically after contract validation failed; syntax and TypeScript semantic graphs were preserved: ${error instanceof Error ? error.message : String(error)}`.slice(0, 2_048),
+          path: null,
+          profile_id: PROFILE_ID,
+          properties: { framework_semantic_issue: true },
+        });
+      }
+    } else {
+      graph.addDiagnostic({
+        severity: "warning",
+        code: "web.tanstack_router_semantic_typechecker_unavailable",
+        message: "TanStack Router framework semantic graph was not emitted because the canonical TypeScript definition graph was unavailable",
+        path: null,
+        profile_id: PROFILE_ID,
+        properties: { framework_semantic_issue: true },
+      });
+    }
+  }
   const emitted = [...emittedFrameworks].sort(compareUtf8);
   const frameworkSemantic: ScanModel["frameworkSemantic"] = {
     status: emitted.length > 0 ? "emitted" : frameworkAttempted ? "discarded" : "not-emitted",
@@ -2319,8 +2357,9 @@ export async function scan(root: string, allFiles: string[], inventoryIssues: Fi
       severity: "warning",
       code: "web.tanstack_route_tree_drift",
       message: `Generated route tree drift in ${drift.package.name}; missing=[${drift.missingFromGenerated.join(", ")}], generated-only=[${drift.onlyGenerated.join(", ")}]`,
-      path: drift.package.relativePath,
+      path: drift.evidence[0]?.path ?? drift.package.relativePath,
       profile_id: PROFILE_ID,
+      evidence: drift.evidence,
     });
   }
   for (const config of configFiles(allFiles, root)) {

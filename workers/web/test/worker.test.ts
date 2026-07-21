@@ -244,6 +244,7 @@ test("worker emits deterministic protocol graph without executing project code",
   const allFrameworkNodes = nodes.filter((node) => (
     node.properties.canonical_identity?.framework === "next"
     || node.properties.canonical_identity?.framework === "astro"
+    || node.properties.canonical_identity?.framework === "tanstack-router"
   ));
   const allFrameworkSites = sites.filter((site) => (
     site.evidence[0]?.properties?.contract_version === "framework-semantic-graph-v1"
@@ -478,6 +479,67 @@ test("worker emits deterministic protocol graph without executing project code",
   assert.ok(diagnostics.some((diagnostic) => (
     diagnostic.code === "web.astro_component_unresolved"
     && diagnostic.path === "apps/astro-app/src/pages/blog/[slug].astro"
+  )));
+
+  const tanstackNodes = allFrameworkNodes.filter((node) => node.properties.canonical_identity?.framework === "tanstack-router");
+  const tanstackSites = allFrameworkSites.filter((site) => site.evidence[0]?.properties?.framework === "tanstack-router");
+  const tanstackEdges = allFrameworkEdges.filter((edge) => edge.evidence[0]?.properties?.framework === "tanstack-router");
+  assert.deepEqual([...new Set(tanstackNodes.map((node) => node.kind))].sort(), ["component", "route"]);
+  assert.deepEqual(
+    [...new Set(tanstackEdges.map((edge) => edge.kind))].sort(),
+    ["before_load", "loads", "masks_to", "navigates_to", "parent_route", "renders", "route_entry"],
+  );
+  const tanstackRoute = (pattern: string, routeKind: string) => tanstackNodes.find((node) => (
+    node.kind === "route"
+    && node.properties.route_pattern === pattern
+    && node.properties.route_kind === routeKind
+  ));
+  const fileRoot = tanstackRoute("/router", "tanstack-file-root-route");
+  const codeRoot = tanstackNodes.find((node) => (
+    node.kind === "route"
+    && node.properties.route_pattern === "/router"
+    && node.properties.route_kind === "tanstack-code-root-route"
+    && node.properties.source_path === "apps/router/src/code-routes.tsx"
+  ));
+  const codeChild = tanstackRoute("/router/code", "tanstack-code-route");
+  const lazyPosts = tanstackRoute("/router/posts", "tanstack-lazy-file-route");
+  const virtualRoute = tanstackRoute("/router/virtual", "tanstack-virtual-route");
+  assert.ok(fileRoot && codeRoot && codeChild && lazyPosts && virtualRoute);
+  assert.ok(!tanstackNodes.some((node) => node.kind === "route" && node.properties.route_pattern === "/router/orphan"));
+  const codeParentSites = tanstackSites.filter((site) => (
+    site.kind === "parent_route"
+    && site.source === codeChild?.id
+    && site.target_ids[0] === codeRoot?.id
+  ));
+  assert.deepEqual(
+    codeParentSites.map((site) => site.evidence[0]?.properties.occurrence_kind).sort(),
+    ["tanstack_add_children_registration", "tanstack_declared_parent"],
+  );
+  assert.ok(tanstackSites.some((site) => (
+    site.kind === "parent_route"
+    && site.resolution_status === "candidates"
+    && site.evidence[0]?.properties.algorithm === "finite-conditional-route-reference-set-v1"
+  )));
+  assert.ok(tanstackSites.some((site) => (
+    site.kind === "parent_route"
+    && site.resolution_status === "unresolved"
+    && site.reason === "tanstack_runtime_child_registration"
+  )));
+  assert.ok(tanstackEdges.some((edge) => edge.kind === "renders" && edge.source === lazyPosts?.id));
+  assert.ok(tanstackSites.filter((site) => site.kind === "navigates_to" || site.kind === "masks_to")
+    .every((site) => site.resolution_status === "resolved"));
+  assert.ok(diagnostics.some((diagnostic) => (
+    diagnostic.code === "web.tanstack_route_declaration_unregistered"
+    && diagnostic.message.includes("orphanRoute")
+  )));
+  assert.ok(diagnostics.some((diagnostic) => (
+    diagnostic.code === "web.tanstack_route_registration_unresolved"
+    && diagnostic.path === "apps/router/src/dynamic-routes.tsx"
+  )));
+  const tanstackDrift = diagnostics.find((diagnostic) => diagnostic.code === "web.tanstack_route_tree_drift");
+  assert.equal(tanstackDrift?.path, "apps/router/src/routes/posts.lazy.tsx");
+  assert.ok(tanstackDrift?.evidence.some((item: Record<string, any>) => (
+    item.kind === "source" && item.start_line > 1
   )));
   assert.ok(!completed.completeness.includes("semantic-complete"));
   assert.ok(completed.reasons.includes("framework_semantic_capability_pending"));
