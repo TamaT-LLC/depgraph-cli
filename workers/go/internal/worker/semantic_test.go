@@ -488,6 +488,33 @@ func TestGoSemanticValueReferencesAreStrictAndDoNotDuplicateCallsOrTypes(t *test
 	}
 }
 
+func TestGoSemanticValueReferencesSkipConstantsOwnedByArrayTypes(t *testing.T) {
+	root := t.TempDir()
+	writeTestFile(t, filepath.Join(root, "go.mod"), "module example.com/array-owner\n\ngo 1.26.1\n")
+	writeTestFile(t, filepath.Join(root, "array.go"), `package arrayowner
+
+const Size = 4
+
+type Buffer [Size]byte
+
+func Local() {
+	type LocalBuffer [Size]byte
+	var _ LocalBuffer
+}
+`)
+
+	result, err := Scan(root)
+	if err != nil {
+		t.Fatalf("Scan() error = %v", err)
+	}
+	if !containsString(result.Coverage.Completeness, "semantic-complete") {
+		t.Fatalf("array type constant degraded semantic completeness: coverage=%+v diagnostics=%+v", result.Coverage, result.Diagnostics)
+	}
+	if hasDiagnostic(result.Diagnostics, "go_semantic_owner") {
+		t.Fatalf("array type constant emitted a spurious owner diagnostic: %+v", result.Diagnostics)
+	}
+}
+
 func TestGoSemanticValueReferenceAcrossPackages(t *testing.T) {
 	root := t.TempDir()
 	writeTestFile(t, filepath.Join(root, "go.mod"), "module example.com/references\n\ngo 1.26.1\n")

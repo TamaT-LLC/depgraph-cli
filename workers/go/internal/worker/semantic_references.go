@@ -32,8 +32,20 @@ func (p *goSemanticPackage) emitValueReferences() {
 				return true
 			}
 			ownerID := p.nearestOwner(identifier)
-			if ownerID == "" || p.extractor.state.nodes[ownerID].Kind != "symbol" {
+			if ownerID == "" {
 				p.extractor.fail("go_semantic_owner", file.Path, fmt.Sprintf("value reference %q has no semantic symbol owner", identifier.Name))
+				return true
+			}
+			owner, exists := p.extractor.state.nodes[ownerID]
+			if !exists {
+				p.extractor.fail("go_semantic_owner", file.Path, fmt.Sprintf("value reference %q has an unknown semantic owner", identifier.Name))
+				return true
+			}
+			// A value can legitimately occur inside a type declaration (for
+			// example, a named constant used as an array length). The strict
+			// value-reference contract requires a symbol source, so leave these
+			// occurrences unrepresented without degrading semantic completeness.
+			if owner.Kind != "symbol" {
 				return true
 			}
 
@@ -58,7 +70,7 @@ func (p *goSemanticPackage) emitValueReferences() {
 				p.extractor.failValueReference(file.Path, specifier, target.reason, evidence)
 			}
 			p.extractor.addValueReference(
-				ownerID,
+				owner.ID,
 				target.nodeID,
 				specifier,
 				target.status,
