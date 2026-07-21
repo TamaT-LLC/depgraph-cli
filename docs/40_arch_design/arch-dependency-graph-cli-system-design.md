@@ -16,7 +16,7 @@ updated: 2026-07-22
 
 | Compatibility unit | Version |
 | --- | --- |
-| Product / Rust / Go / Web adapter | `0.1.0` |
+| Product / Rust / Go / Web adapter | `0.2.0-rc.1` |
 | NDJSON protocol / graph schema | `1.0` |
 | Rust / Cargo baseline | `1.93.1` |
 | Go baseline | `1.26.1` |
@@ -24,6 +24,8 @@ updated: 2026-07-22
 | Bundled TypeScript compiler | `7.0.2` |
 
 2026-07-22 時点で Milestone 0〜1 の MVP に加え、Milestone 2 の Go semantic vertical sliceを実装済みである。Go workerは制限付き`go/packages`、`go/types`、serial SSAからsymbol/type/generic instance、`declares`、`extends`、`implements`、`instantiates`、`type_uses`、value `references`、exact `calls`、RTA/CHA candidate `may_call`と明示profileのVTA refinementをprotocol semantic graphとして出力する。reflection、unsafe、go:linkname、assembly、plugin、cgo/native callbackは専用reason・source span・profileを持つcall-graph boundary siteと相関diagnosticへ保持し、exact/candidate targetを捏造しない。これらはSQLite evidence storeへ保存され、symbol/type selector、deps/dependents/why/cycles/unresolved、JSON/DOT/Mermaid exportの対象となる。
+
+Milestone 2のrelease candidateは`v0.2.0-rc.1`とする。5 targetのnative package gateに加え、公開直前に全archive/checksumを再取得してmanifest、SBOM、project/third-party license、worker/runtime attestationを集約検証し、結果を`release-verification.json`としてGitHub prereleaseへ添付する。機能範囲、安全境界、完全性条件、既知制約は[release note](../releases/v0.2.0-rc.1.md)をcanonicalな配布時説明とする。
 
 safe scanではcanonical root外へのsymlink readを拒否し、相対PATH・repository内toolchain・Node実行hookを除外する。Goは制限付き`go/packages`からparser fallbackへ移行する。Cargo metadataはpath-bearing inputのpreflight後、admitted manifest、lockfile、target discovery layoutだけを持つworker-owned confined mirrorに対してneutral cwdから`--frozen --offline --no-deps`で実行し、返却されたtemporary pathをinventory IDへ戻す。配布物はmanifest、MIT / Apache-2.0のproject license全文、core、schema、全worker/runtime artifact/component、backend attestationを検証し、欠損・変更・symlink・checked treeへの追加時にworker起動前にfail closedとする。project licenseはrelease manifestで個別にchecksum attestし、依存componentの権利情報を列挙する`THIRD_PARTY_LICENSES.txt`とは明確に分離する。
 
@@ -1175,6 +1177,7 @@ Go semantic scanではGOOS/GOARCH、build tags、強制されたcgo無効状態�
 
 ## 26. 更新履歴
 
+- 2026-07-22: Issue #61としてMilestone 2 Semantic Graph release candidate `v0.2.0-rc.1`を確定。Cargo product crates、Rust/Go/Web adapter handshake、manifest、SBOM、archive名を同期し、protocol/schema互換性は`1.0`を維持する。Go/Rust/Web/framework semantic scope、安全境界、完全性条件、既知制約をrelease noteへ整理した。release workflowはquality/benchmark後にLinux x64/arm64、macOS x64/arm64、Windows x64のnative package gateを実行し、公開前のaggregate gateで全checksum、archive layout、artifact/component digest、worker attestation、SBOM、project/third-party license分離を再検証してmachine-readable reportを添付する。
 - 2026-07-22: Issue #60としてproject license・README・release metadataを整備。`LICENSE-MIT` / `LICENSE-APACHE`の全文とTamaT LLCのcopyrightを明示し、release manifestの`MIT OR Apache-2.0`宣言と両licenseの独立checksum attestationを追加した。archiveのlicense欠損・改ざん・重複・宣言不一致をworker起動前にfail closedとし、third-party inventoryと区別してdoctorへintegrityを公開する。READMEのTypeScript/JavaScriptおよびNext.js / Astro / TanStackの現行semantic graph対応範囲、未実装境界、worker/runtime versionを実装と同期し、package gateでmetadata driftを回帰検証する。
 - 2026-07-22: Issue #59としてADR-008のGo offline dependency snapshotを実装。module requirement / replace、go.sum/go.work.sum checksum、vendor manifest、実際に参照したmodule-cache/vendor/local replacement sourceをcanonical fingerprintへまとめ、`complete / partial / unavailable / not-applicable` statusとともにGo profile ID v2へ組み込んだ。absolute cache/checkout path、stdlib、build/temp/VCS/unused cacheを除外し、regular file・admitted root・file/byte上限をfail closedに検証する。読取不能dependencyを観測したmoduleのtyped deltaはatomicに破棄し、固定reasonでparser fallback/cache invalidationを明示する。別checkout/cache同一性、content/availability差分、symlink拒否、path非漏洩、race、CLI E2Eで検証する。
 - 2026-07-22: Issue #57としてGoのclosed-world call graph境界を強化。`reflect.Value.Call` / `CallSlice`を専用reason付きunknown targetへ、`MethodByName` / `FieldByName` / `MakeFunc`をexact external API callとruntime boundary evidenceの併存へ分類した。parser inventoryからunsafe / plugin import、`go:linkname`、bodyless declaration、assembly `TEXT`、cgo import/directive/library/header、`//export` callbackをsource-spanned siteへ昇格し、native identityをtyped sentinelへ正規化した。全boundary siteを同一span/profile/reason/`site_id`の`go_callgraph_limit`と相関し、profileへkind/count/completeness policyを集約する。semantic-completeとの併存、broken/partial module、coverage conservation、反復scan、race、CLI export/unresolved E2Eで検証する。

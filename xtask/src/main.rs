@@ -22,6 +22,13 @@ const PROJECT_LICENSES: &[(&str, &[u8])] = &[
     ("LICENSE-APACHE", include_bytes!("../../LICENSE-APACHE")),
     ("LICENSE-MIT", include_bytes!("../../LICENSE-MIT")),
 ];
+const RELEASE_TARGETS: &[(&str, &str)] = &[
+    ("x86_64-unknown-linux-gnu", "tar.gz"),
+    ("aarch64-unknown-linux-gnu", "tar.gz"),
+    ("x86_64-apple-darwin", "tar.gz"),
+    ("aarch64-apple-darwin", "tar.gz"),
+    ("x86_64-pc-windows-msvc", "zip"),
+];
 const SBOM_SCOPE: &str = "Scope: package-manager component boundary; system runtimes/toolchains and dependencies embedded inside upstream prebuilt packages are not recursively enumerated.";
 const RUST_ANALYZER_CRATE_VERSION: &str = "0.0.330";
 const RUST_ANALYZER_REVISION: &str = "8954b66d43225e62c92e8bbcc8500191b5cceb1e";
@@ -69,6 +76,11 @@ enum Task {
     GoSemanticE2e,
     RustSemanticE2e,
     Package,
+    VerifyReleaseAssets {
+        directory: PathBuf,
+        #[arg(long)]
+        target: Vec<String>,
+    },
 }
 
 #[derive(Clone, Debug, serde::Deserialize, Serialize)]
@@ -159,6 +171,28 @@ struct ArchiveEntry {
     mode: u32,
 }
 
+#[derive(Serialize)]
+struct ReleaseVerificationReport {
+    schema_version: u32,
+    release_version: String,
+    tag: String,
+    protocol_version: String,
+    schema_compatibility_version: String,
+    license_expression: String,
+    targets: Vec<TargetVerificationReport>,
+}
+
+#[derive(Serialize)]
+struct TargetVerificationReport {
+    target: String,
+    archive: String,
+    archive_sha256: String,
+    release_manifest_sha256: String,
+    sbom_sha256: String,
+    project_licenses: BTreeMap<String, String>,
+    workers: BTreeMap<String, String>,
+}
+
 #[cfg(any(not(windows), test))]
 const ARCHIVE_MTIME: u64 = 1_234_567_890;
 
@@ -173,6 +207,9 @@ fn main() -> Result<()> {
             rust_semantic_e2e::run_development(&workspace_root(), &cargo_target_dir())
         }
         Task::Package => package(),
+        Task::VerifyReleaseAssets { directory, target } => {
+            verify_release_assets(&directory, &target)
+        }
     }
 }
 
@@ -205,6 +242,13 @@ fn build(release: bool) -> Result<()> {
 }
 
 fn verify_project_metadata(root: &Path) -> Result<()> {
+    let cargo_manifest = fs::read_to_string(root.join("Cargo.toml"))?;
+    if !cargo_manifest
+        .lines()
+        .any(|line| line.trim() == format!("version = \"{VERSION}\""))
+    {
+        bail!("Cargo workspace version does not match release version {VERSION}");
+    }
     let web_package: Value =
         serde_json::from_slice(&fs::read(root.join("workers/web/package.json"))?)?;
     if web_package["name"] != "@depgraph/web-worker"
@@ -226,11 +270,15 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
     let go_mod = fs::read_to_string(root.join("workers/go/go.mod"))?;
     let rust_toolchain = fs::read_to_string(root.join("rust-toolchain.toml"))?;
     let rust_worker = fs::read_to_string(root.join("workers/rust/Cargo.toml"))?;
+    let protocol_crate = fs::read_to_string(root.join("crates/depgraph-protocol/Cargo.toml"))?;
     if !go_mod.lines().any(|line| line.trim() == "go 1.26.1")
         || !rust_toolchain
             .lines()
             .any(|line| line.trim() == "channel = \"1.93.1\"")
         || !rust_worker
+            .lines()
+            .any(|line| line.trim() == "version.workspace = true")
+        || !protocol_crate
             .lines()
             .any(|line| line.trim() == "version.workspace = true")
     {
@@ -245,15 +293,21 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "Rust 1.93.1, Go 1.26.1, Node.js 24.18.0, and pnpm 10.33.0",
         "TypeScript/JavaScript symbol/type/import/re-export/type-use",
         "[the system design](docs/40_arch_design/arch-dependency-graph-cli-system-design.md)",
+        "[`v0.2.0-rc.1`](docs/releases/v0.2.0-rc.1.md)",
         "[MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE)",
     ] {
         if !readme.contains(required) {
             bail!("README release metadata is missing {required:?}");
         }
     }
+    let release_note = format!("docs/releases/v{VERSION}.md");
+    let release_link = format!("[`v{VERSION}`]({release_note})");
+    if !readme.contains(&release_link) || !root.join(&release_note).is_file() {
+        bail!("README release note link is not synchronized with {VERSION}");
+    }
     for required in [
         "updated: 2026-07-22",
-        "| Product / Rust / Go / Web adapter | `0.1.0` |",
+        "| Product / Rust / Go / Web adapter | `0.2.0-rc.1` |",
         "Issue #55ではこのWeb semantic compatibility unitをrelease manifest",
     ] {
         if !design.contains(required) {
@@ -268,11 +322,35 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
     }
     for link in [
         "docs/40_arch_design/arch-dependency-graph-cli-system-design.md",
+        "docs/releases/v0.2.0-rc.1.md",
         "LICENSE-MIT",
         "LICENSE-APACHE",
     ] {
         if !root.join(link).is_file() {
             bail!("README local documentation link does not resolve: {link}");
+        }
+    }
+    let schema: Value = serde_json::from_slice(&fs::read(
+        root.join("schemas/depgraph-protocol-v1.schema.json"),
+    )?)?;
+    if schema["title"] != "depgraph worker protocol v1.0"
+        || schema["$defs"]["common"]["properties"]["protocol_version"]["const"] != "1.0"
+    {
+        bail!("protocol schema compatibility reference is not synchronized with 1.0");
+    }
+    let release_workflow = fs::read_to_string(root.join(".github/workflows/release.yml"))?;
+    for (target, _) in RELEASE_TARGETS {
+        if !release_workflow.contains(target) {
+            bail!("release workflow is missing target {target}");
+        }
+    }
+    for required in [
+        "cargo xtask verify-release-assets artifacts",
+        "docs/releases/${GITHUB_REF_NAME}.md",
+        "artifacts/release-verification.json",
+    ] {
+        if !release_workflow.contains(required) {
+            bail!("release workflow is missing {required:?}");
         }
     }
     Ok(())
@@ -1415,6 +1493,440 @@ fn extract_archive(archive: &Path, destination: &Path) -> Result<()> {
         tar::Archive::new(decoder).unpack(destination)?;
     }
     Ok(())
+}
+
+fn verify_release_assets(directory: &Path, requested_targets: &[String]) -> Result<()> {
+    verify_project_metadata(&workspace_root())?;
+    if !directory.is_dir()
+        || fs::symlink_metadata(directory).is_ok_and(|metadata| metadata.file_type().is_symlink())
+    {
+        bail!(
+            "release asset directory is missing or symlinked: {}",
+            directory.display()
+        );
+    }
+
+    let requested_target_count = requested_targets.len();
+    let requested_targets = requested_targets
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    if requested_targets.len() != requested_target_count
+        || requested_targets.iter().any(|requested| {
+            !RELEASE_TARGETS
+                .iter()
+                .any(|(target, _)| target == requested)
+        })
+    {
+        bail!("release verification requested an unknown or duplicate target");
+    }
+    let selected_targets = RELEASE_TARGETS
+        .iter()
+        .copied()
+        .filter(|(target, _)| requested_targets.is_empty() || requested_targets.contains(target))
+        .collect::<Vec<_>>();
+    let expected_files = selected_targets
+        .iter()
+        .flat_map(|(target, extension)| {
+            let archive = format!("depgraph-{VERSION}-{target}.{extension}");
+            [archive.clone(), format!("{archive}.sha256")]
+        })
+        .collect::<BTreeSet<_>>();
+    let actual_files = fs::read_dir(directory)?
+        .map(|entry| {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                bail!(
+                    "release asset directory contains a non-file entry: {}",
+                    entry.path().display()
+                );
+            }
+            Ok(entry.file_name().to_string_lossy().into_owned())
+        })
+        .collect::<Result<BTreeSet<_>>>()?;
+    let mut permitted_files = expected_files.clone();
+    permitted_files.insert("release-verification.json".to_owned());
+    if !expected_files.is_subset(&actual_files) || !actual_files.is_subset(&permitted_files) {
+        bail!(
+            "release asset set differs from the five-target contract: expected {expected_files:?}, found {actual_files:?}"
+        );
+    }
+
+    let mut targets = Vec::new();
+    for (target, extension) in &selected_targets {
+        let archive_name = format!("depgraph-{VERSION}-{target}.{extension}");
+        let archive = directory.join(&archive_name);
+        let checksum = directory.join(format!("{archive_name}.sha256"));
+        let archive_sha256 = verify_checksum_sidecar(&archive, &checksum)?;
+        let temp = tempfile::tempdir()?;
+        extract_archive(&archive, temp.path())?;
+        let release_name = format!("depgraph-{VERSION}-{target}");
+        let top_level = fs::read_dir(temp.path())?
+            .map(|entry| Ok(entry?.file_name().to_string_lossy().into_owned()))
+            .collect::<Result<BTreeSet<_>>>()?;
+        if top_level != BTreeSet::from([release_name.clone()]) {
+            bail!("archive {archive_name} has an unexpected top-level layout: {top_level:?}");
+        }
+        let extracted = temp.path().join(release_name);
+        targets.push(verify_published_release_tree(
+            &extracted,
+            target,
+            archive_name,
+            archive_sha256,
+        )?);
+    }
+
+    fs::write(
+        directory.join("release-verification.json"),
+        serde_json::to_vec_pretty(&ReleaseVerificationReport {
+            schema_version: 1,
+            release_version: VERSION.to_owned(),
+            tag: format!("v{VERSION}"),
+            protocol_version: "1.0".to_owned(),
+            schema_compatibility_version: "1.0".to_owned(),
+            license_expression: PROJECT_LICENSE_EXPRESSION.to_owned(),
+            targets,
+        })?,
+    )?;
+    println!(
+        "verified {} release targets in {}",
+        selected_targets.len(),
+        directory.display()
+    );
+    Ok(())
+}
+
+fn verify_checksum_sidecar(archive: &Path, checksum: &Path) -> Result<String> {
+    let digest = sha256_file(archive)?;
+    let archive_name = archive
+        .file_name()
+        .context("release archive has no file name")?
+        .to_string_lossy();
+    let expected = format!("{digest}  {archive_name}\n");
+    let actual = fs::read_to_string(checksum)
+        .with_context(|| format!("release checksum is missing: {}", checksum.display()))?;
+    if actual != expected {
+        bail!(
+            "release checksum sidecar {} does not attest {}",
+            checksum.display(),
+            archive.display()
+        );
+    }
+    Ok(digest)
+}
+
+fn verify_published_release_tree(
+    extracted: &Path,
+    expected_target: &str,
+    archive: String,
+    archive_sha256: String,
+) -> Result<TargetVerificationReport> {
+    if fs::symlink_metadata(extracted)?.file_type().is_symlink() {
+        bail!("published release root must not be a symlink");
+    }
+    for entry in WalkDir::new(extracted).follow_links(false) {
+        let entry = entry?;
+        if entry.file_type().is_symlink() {
+            bail!(
+                "published release contains a symlink: {}",
+                entry.path().display()
+            );
+        }
+    }
+    for required in [
+        "release-manifest.json",
+        "LICENSE-APACHE",
+        "LICENSE-MIT",
+        "THIRD_PARTY_LICENSES.txt",
+        "sbom.spdx.json",
+        "schemas/depgraph-protocol-v1.schema.json",
+    ] {
+        if !extracted.join(required).is_file() {
+            bail!("published release is missing {required}");
+        }
+    }
+
+    let manifest_path = extracted.join("release-manifest.json");
+    let manifest: ReleaseManifest = serde_json::from_slice(&fs::read(&manifest_path)?)
+        .context("published release manifest is invalid")?;
+    if manifest.release_version != VERSION
+        || manifest.protocol_version != "1.0"
+        || manifest.schema_version != "1.0"
+        || manifest.target != expected_target
+        || manifest.license_expression != PROJECT_LICENSE_EXPRESSION
+    {
+        bail!(
+            "published release compatibility metadata does not match {VERSION}/{expected_target}"
+        );
+    }
+
+    let mut artifact_paths = BTreeSet::new();
+    let expected_core = format!(
+        "bin/{}",
+        executable_name_for_target("depgraph", expected_target)
+    );
+    if manifest.core.path != expected_core {
+        bail!("published release core path does not match {expected_core}");
+    }
+    artifact_paths.insert(manifest.core.path.as_str());
+    let core = verify_release_artifact(extracted, &manifest.core, "core")?;
+    if !expected_target.contains("windows") && !is_executable(&core)? {
+        bail!("published release core is not executable");
+    }
+    if manifest.schema.path != "schemas/depgraph-protocol-v1.schema.json" {
+        bail!("published release schema path is not the protocol 1.0 schema");
+    }
+    artifact_paths.insert(manifest.schema.path.as_str());
+    verify_release_artifact(extracted, &manifest.schema, "schema")?;
+
+    if manifest.project_licenses.len() != PROJECT_LICENSES.len() {
+        bail!("published release must attest exactly both project licenses");
+    }
+    let project_licenses = manifest
+        .project_licenses
+        .iter()
+        .map(|artifact| (artifact.path.as_str(), artifact))
+        .collect::<BTreeMap<_, _>>();
+    if project_licenses.len() != PROJECT_LICENSES.len() {
+        bail!("published release contains duplicate project license paths");
+    }
+    let mut verified_licenses = BTreeMap::new();
+    for (path, expected) in PROJECT_LICENSES {
+        let artifact = project_licenses
+            .get(path)
+            .with_context(|| format!("published release is missing project license {path}"))?;
+        if !artifact_paths.insert(artifact.path.as_str()) {
+            bail!("published release reuses artifact path {}", artifact.path);
+        }
+        let verified = verify_release_artifact(extracted, artifact, "project license")?;
+        if fs::read(verified)? != *expected {
+            bail!("published project license {path} differs from the repository source");
+        }
+        verified_licenses.insert((*path).to_owned(), artifact.sha256.clone());
+    }
+
+    for artifact in &manifest.runtime_artifacts {
+        if !artifact_paths.insert(artifact.path.as_str()) {
+            bail!("published release reuses artifact path {}", artifact.path);
+        }
+        verify_release_artifact(extracted, artifact, "runtime artifact")?;
+    }
+    let mut components = BTreeMap::new();
+    for component in &manifest.runtime_components {
+        if components
+            .insert(component.name.as_str(), component)
+            .is_some()
+        {
+            bail!(
+                "published release contains duplicate runtime component {}",
+                component.name
+            );
+        }
+        let root = verified_release_path(extracted, &component.root, "runtime component")?;
+        if !root.is_dir() || sha256_tree(&root)? != component.sha256 {
+            bail!(
+                "published runtime component {} failed its whole-tree checksum",
+                component.name
+            );
+        }
+        if let Some(entrypoint) = &component.entrypoint {
+            let entrypoint = verified_release_path(extracted, entrypoint, "component entrypoint")?;
+            if !entrypoint.is_file() || !entrypoint.starts_with(&root) {
+                bail!(
+                    "published runtime component {} has an invalid entrypoint",
+                    component.name
+                );
+            }
+            if component.kind == "executable-tree"
+                && !expected_target.contains("windows")
+                && !is_executable(&entrypoint)?
+            {
+                bail!(
+                    "published runtime component {} entrypoint is not executable",
+                    component.name
+                );
+            }
+        } else if component.kind == "executable-tree" {
+            bail!(
+                "published executable runtime component {} has no entrypoint",
+                component.name
+            );
+        }
+        if !matches!(component.kind.as_str(), "executable-tree" | "data-tree") {
+            bail!(
+                "published runtime component {} has unsupported kind {}",
+                component.name,
+                component.kind
+            );
+        }
+    }
+    let astro = components
+        .get("astro-parser-wasm")
+        .context("published release has no Astro runtime component")?;
+    if astro.version != "4.0.0"
+        || astro.kind != "data-tree"
+        || astro.root != "libexec/astro"
+        || astro.entrypoint.as_deref() != Some("libexec/astro/astro.wasm")
+    {
+        bail!("published Astro compatibility unit is invalid");
+    }
+    let typescript = components
+        .get("typescript-native-compiler")
+        .context("published release has no TypeScript runtime component")?;
+    let expected_typescript_entrypoint = format!(
+        "libexec/typescript/lib/{}",
+        executable_name_for_target("tsc", expected_target)
+    );
+    if typescript.version != TYPESCRIPT_VERSION
+        || typescript.kind != "executable-tree"
+        || typescript.root != "libexec/typescript/lib"
+        || typescript.entrypoint.as_deref() != Some(expected_typescript_entrypoint.as_str())
+    {
+        bail!("published TypeScript compatibility unit is invalid");
+    }
+
+    let mut workers = BTreeMap::new();
+    for worker in &manifest.workers {
+        let expected_path = if worker.adapter == "web" {
+            "libexec/depgraph-web-worker.mjs".to_owned()
+        } else {
+            format!(
+                "libexec/{}",
+                executable_name_for_target(
+                    &format!("depgraph-{}-worker", worker.adapter),
+                    expected_target,
+                )
+            )
+        };
+        if !matches!(worker.adapter.as_str(), "rust" | "go" | "web")
+            || worker.version != VERSION
+            || worker.path != expected_path
+            || workers
+                .insert(worker.adapter.clone(), worker.sha256.clone())
+                .is_some()
+        {
+            bail!(
+                "published worker metadata is invalid for {}",
+                worker.adapter
+            );
+        }
+        if !artifact_paths.insert(worker.path.as_str()) {
+            bail!("published release reuses artifact path {}", worker.path);
+        }
+        let artifact = verify_release_artifact(
+            extracted,
+            &Artifact {
+                path: worker.path.clone(),
+                sha256: worker.sha256.clone(),
+            },
+            "worker",
+        )?;
+        if worker.adapter != "web"
+            && !expected_target.contains("windows")
+            && !is_executable(&artifact)?
+        {
+            bail!("published {} worker is not executable", worker.adapter);
+        }
+        if worker.adapter == "rust" {
+            verify_rust_backend(
+                worker
+                    .backend
+                    .as_ref()
+                    .context("published Rust worker has no backend attestation")?,
+            )?;
+        } else if worker.backend.is_some() {
+            bail!("published non-Rust worker has a Rust backend attestation");
+        }
+        if worker.adapter == "web" {
+            verify_web_semantic_attestation(
+                worker
+                    .semantic
+                    .as_ref()
+                    .context("published Web worker has no semantic attestation")?,
+            )?;
+        } else if worker.semantic.is_some() {
+            bail!("published non-Web worker has a Web semantic attestation");
+        }
+    }
+    if workers.keys().map(String::as_str).collect::<BTreeSet<_>>()
+        != BTreeSet::from(["go", "rust", "web"])
+        || manifest.runtime_requirements.get("web").map(String::as_str) != Some("Node.js >=24.0.0")
+    {
+        bail!("published release worker/runtime closure is incomplete");
+    }
+
+    let sbom_path = extracted.join("sbom.spdx.json");
+    let sbom: Value = serde_json::from_slice(&fs::read(&sbom_path)?)?;
+    let packages = sbom["packages"]
+        .as_array()
+        .context("published release SBOM has no packages")?;
+    let root_package = packages
+        .iter()
+        .find(|package| package["SPDXID"] == "SPDXRef-Package-depgraph")
+        .context("published release SBOM has no depgraph package")?;
+    if sbom["spdxVersion"] != "SPDX-2.3"
+        || sbom["name"] != format!("depgraph-{VERSION}-{expected_target}")
+        || root_package["versionInfo"] != VERSION
+        || root_package["licenseDeclared"] != PROJECT_LICENSE_EXPRESSION
+        || root_package["comment"] != SBOM_SCOPE
+    {
+        bail!("published release SBOM root metadata is incompatible");
+    }
+    let package_names = packages
+        .iter()
+        .filter_map(|package| package["name"].as_str())
+        .collect::<BTreeSet<_>>();
+    for required in [
+        "@astrojs/compiler",
+        "typescript",
+        "golang.org/x/tools",
+        "ra_ap_hir",
+        "ra_ap_ide_db",
+        "ra_ap_syntax",
+        "ra_ap_vfs",
+        "salsa",
+    ] {
+        if !package_names.contains(required) {
+            bail!("published release SBOM is missing {required}");
+        }
+    }
+    if package_names
+        .iter()
+        .filter(|name| name.starts_with("@typescript/typescript-"))
+        .count()
+        != 1
+    {
+        bail!("published release SBOM must contain one target TypeScript compiler");
+    }
+    let third_party = fs::read_to_string(extracted.join("THIRD_PARTY_LICENSES.txt"))?;
+    if !third_party.starts_with("depgraph third-party license inventory\n")
+        || PROJECT_LICENSES.iter().any(|(_, project_text)| {
+            third_party
+                .as_bytes()
+                .windows(project_text.len())
+                .any(|window| window == *project_text)
+        })
+    {
+        bail!("published third-party license inventory is missing or mixes project licenses");
+    }
+
+    Ok(TargetVerificationReport {
+        target: expected_target.to_owned(),
+        archive,
+        archive_sha256,
+        release_manifest_sha256: sha256_file(&manifest_path)?,
+        sbom_sha256: sha256_file(&sbom_path)?,
+        project_licenses: verified_licenses,
+        workers,
+    })
+}
+
+fn executable_name_for_target(name: &str, target: &str) -> String {
+    if target.contains("windows") {
+        format!("{name}.exe")
+    } else {
+        name.to_owned()
+    }
 }
 
 fn verify_archive(archive: &Path, name: &str) -> Result<()> {
@@ -5743,14 +6255,14 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        ARCHIVE_MTIME, DependencyPackage, TYPESCRIPT_VERSION, WEB_SEMANTIC_CAPABILITIES,
-        WEB_SEMANTIC_RUNTIME_ARTIFACTS, WEB_SEMANTIC_RUNTIME_COMPONENTS, WebSemanticAttestation,
-        WorkerBackend, archive_entries, cargo_runtime_packages, create_tar_archive,
-        create_zip_archive, extract_archive, normalized_spdx_license, package_url,
-        parse_worker_handshake, rust_backend_from_handshake, verify_project_metadata,
-        verify_release_tag_values, verify_rust_analyzer_dependencies, verify_rust_backend,
-        verify_web_semantic_attestation, web_runtime_packages, web_semantic_from_handshake,
-        workspace_root,
+        ARCHIVE_MTIME, DependencyPackage, RELEASE_TARGETS, TYPESCRIPT_VERSION,
+        WEB_SEMANTIC_CAPABILITIES, WEB_SEMANTIC_RUNTIME_ARTIFACTS, WEB_SEMANTIC_RUNTIME_COMPONENTS,
+        WebSemanticAttestation, WorkerBackend, archive_entries, cargo_runtime_packages,
+        create_tar_archive, create_zip_archive, executable_name_for_target, extract_archive,
+        normalized_spdx_license, package_url, parse_worker_handshake, rust_backend_from_handshake,
+        verify_checksum_sidecar, verify_project_metadata, verify_release_tag_values,
+        verify_rust_analyzer_dependencies, verify_rust_backend, verify_web_semantic_attestation,
+        web_runtime_packages, web_semantic_from_handshake, workspace_root,
     };
 
     fn release_tree() -> Result<(tempfile::TempDir, String)> {
@@ -5773,6 +6285,47 @@ mod tests {
     #[test]
     fn repository_release_metadata_is_synchronized() -> Result<()> {
         verify_project_metadata(&workspace_root())
+    }
+
+    #[test]
+    fn release_target_matrix_and_executable_names_are_exact() {
+        assert_eq!(RELEASE_TARGETS.len(), 5);
+        assert_eq!(
+            RELEASE_TARGETS
+                .iter()
+                .map(|(target, _)| *target)
+                .collect::<Vec<_>>(),
+            vec![
+                "x86_64-unknown-linux-gnu",
+                "aarch64-unknown-linux-gnu",
+                "x86_64-apple-darwin",
+                "aarch64-apple-darwin",
+                "x86_64-pc-windows-msvc",
+            ]
+        );
+        assert_eq!(
+            executable_name_for_target("depgraph", "x86_64-pc-windows-msvc"),
+            "depgraph.exe"
+        );
+        assert_eq!(
+            executable_name_for_target("depgraph", "aarch64-apple-darwin"),
+            "depgraph"
+        );
+    }
+
+    #[test]
+    fn release_checksum_sidecar_is_filename_and_content_bound() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let archive = temp.path().join("depgraph-test.tar.gz");
+        let checksum = temp.path().join("depgraph-test.tar.gz.sha256");
+        fs::write(&archive, b"release archive")?;
+        let digest = super::sha256_file(&archive)?;
+        fs::write(&checksum, format!("{digest}  depgraph-test.tar.gz\n"))?;
+        assert_eq!(verify_checksum_sidecar(&archive, &checksum)?, digest);
+
+        fs::write(&checksum, format!("{digest}  renamed.tar.gz\n"))?;
+        assert!(verify_checksum_sidecar(&archive, &checksum).is_err());
+        Ok(())
     }
 
     #[test]
@@ -5804,11 +6357,11 @@ mod tests {
     #[test]
     fn rust_worker_handshake_captures_the_exact_backend_compatibility_unit() -> Result<()> {
         let parsed = parse_worker_handshake(
-            "depgraph-rust-worker 0.1.0 (protocol 1.0; rust-analyzer 0.0.330; rust-analyzer-revision 8954b66d43225e62c92e8bbcc8500191b5cceb1e; salsa 0.26.1)",
+            "depgraph-rust-worker 0.2.0-rc.1 (protocol 1.0; rust-analyzer 0.0.330; rust-analyzer-revision 8954b66d43225e62c92e8bbcc8500191b5cceb1e; salsa 0.26.1)",
         )
         .expect("valid Rust worker handshake");
         assert_eq!(parsed.name, "depgraph-rust-worker");
-        assert_eq!(parsed.version, "0.1.0");
+        assert_eq!(parsed.version, "0.2.0-rc.1");
         assert_eq!(parsed.protocol, "1.0");
         let backend = rust_backend_from_handshake(&parsed)?;
         verify_rust_backend(&backend)?;
@@ -5840,7 +6393,7 @@ mod tests {
     #[test]
     fn web_worker_handshake_captures_the_release_semantic_compatibility_unit() -> Result<()> {
         let parsed = parse_worker_handshake(
-            "depgraph-web-worker 0.1.0 (protocol 1.0; typescript 7.0.2; capabilities astro-component-render-hydration-v1,framework-semantic-completeness-v1,framework-semantic-graph-v1,next-route-component-boundary-v1,tanstack-router-typed-route-v1,tanstack-start-rpc-middleware-v1,typescript-definition-import-type-call-graph-v2)",
+            "depgraph-web-worker 0.2.0-rc.1 (protocol 1.0; typescript 7.0.2; capabilities astro-component-render-hydration-v1,framework-semantic-completeness-v1,framework-semantic-graph-v1,next-route-component-boundary-v1,tanstack-router-typed-route-v1,tanstack-start-rpc-middleware-v1,typescript-definition-import-type-call-graph-v2)",
         )
         .expect("valid Web worker handshake");
         let semantic = web_semantic_from_handshake(&parsed)?;
