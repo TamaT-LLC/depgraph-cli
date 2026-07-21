@@ -581,6 +581,16 @@
                 },
                 {
                   "type": "object",
+                  "properties": {
+                    "kind": { "const": "references" },
+                    "resolution_status": {
+                      "enum": ["resolved", "external", "unresolved"]
+                    }
+                  },
+                  "required": ["kind"]
+                },
+                {
+                  "type": "object",
                   "properties": { "kind": { "const": "imports" } },
                   "required": ["kind"]
                 },
@@ -672,6 +682,7 @@
               "enum": [
                 "call",
                 "type_use",
+                "value_reference",
                 "rust_use",
                 "rust_reexport",
                 "web_import",

@@ -15,6 +15,7 @@ const CYCLE_RIGHT: &str = "example.com/semantic/model.CycleRight";
 const DIRECT_CALL_MATRIX: &str = "example.com/semantic/model.DirectCallMatrix";
 const EXTERNAL_CALL: &str = "example.com/semantic/model.ExternalCall";
 const INPUT: &str = "example.com/semantic/model.Input";
+const OUTPUT_TO_INPUT: &str = "example.com/semantic/model.outputToInput";
 const WORKER: &str = "example.com/semantic/model.Worker";
 
 pub(crate) fn run_development(workspace_root: &Path, target_dir: &Path) -> Result<()> {
@@ -213,6 +214,7 @@ fn verify_semantic_graph(runner: &Runner<'_>, temp: &Path, fixture: &Path) -> Re
     let cycle_right_id = require_node(nodes, "symbol", CYCLE_RIGHT, "function")?;
     let direct_id = require_node(nodes, "symbol", DIRECT_CALL_MATRIX, "function")?;
     let external_call_id = require_node(nodes, "symbol", EXTERNAL_CALL, "function")?;
+    let output_to_input_id = require_node(nodes, "symbol", OUTPUT_TO_INPUT, "function")?;
     let input_id = require_node(nodes, "type", INPUT, "struct")?;
     require_node(nodes, "type", WORKER, "interface")?;
 
@@ -256,8 +258,16 @@ fn verify_semantic_graph(runner: &Runner<'_>, temp: &Path, fixture: &Path) -> Re
         "candidates",
         "overapprox",
     )?;
+    let value_reference = require_edge(
+        edges,
+        &build_id,
+        &output_to_input_id,
+        "references",
+        "resolved",
+        "exact",
+    )?;
 
-    for edge in [build_type_use, direct_call] {
+    for edge in [build_type_use, direct_call, value_reference] {
         require_edge_evidence(evidence, edge, "go-types")?;
     }
     require_edge_evidence(evidence, candidate_call, "go-ssa")?;
@@ -278,11 +288,13 @@ fn verify_semantic_graph(runner: &Runner<'_>, temp: &Path, fixture: &Path) -> Re
     let ids = SemanticFixtureIds {
         build: build_id,
         input: input_id,
+        output_to_input: output_to_input_id,
         direct: direct_id,
         direct_edge: required_str(direct_call, "id", "direct call edge")?.to_owned(),
         candidate_edge: required_str(candidate_call, "id", "candidate call edge")?.to_owned(),
         cycle_left: cycle_left_id,
         cycle_right: cycle_right_id,
+        reference_edge: required_str(value_reference, "id", "value-reference edge")?.to_owned(),
     };
     verify_queries(runner, &first_store, &second_store, &ids)?;
 
@@ -308,11 +320,13 @@ fn verify_semantic_graph(runner: &Runner<'_>, temp: &Path, fixture: &Path) -> Re
 struct SemanticFixtureIds {
     build: String,
     input: String,
+    output_to_input: String,
     direct: String,
     direct_edge: String,
     candidate_edge: String,
     cycle_left: String,
     cycle_right: String,
+    reference_edge: String,
 }
 
 fn verify_queries(
@@ -415,6 +429,34 @@ fn verify_queries(
             && why_steps[0]["evidence"][0]["kind"] == "semantic"
             && why_steps[0]["evidence"][0]["extractor"] == "go-types",
         "why did not retain the semantic type relation and its evidence: {why}"
+    );
+
+    let reference_why = runner.query(
+        first_store,
+        &[
+            "why",
+            &format!("symbol:{BUILD}"),
+            &format!("symbol:{OUTPUT_TO_INPUT}"),
+            "--json",
+        ],
+    )?;
+    ensure!(
+        reference_why["data"]["path_found"] == true
+            && reference_why["data"]["from"]["id"] == ids.build
+            && reference_why["data"]["to"]["id"] == ids.output_to_input
+            && reference_why["data"]["steps"]
+                .as_array()
+                .is_some_and(|steps| {
+                    steps.len() == 1
+                        && steps[0]["edge"]["id"] == ids.reference_edge
+                        && steps[0]["edge"]["kind"] == "references"
+                        && steps[0]["evidence"].as_array().is_some_and(|items| {
+                            items.iter().any(|item| {
+                                item["kind"] == "semantic" && item["extractor"] == "go-types"
+                            })
+                        })
+                }),
+        "why did not retain the Go value reference and its evidence: {reference_why}"
     );
 
     let first_cycles = runner.query(first_store, &["cycles", "--level", "symbol", "--json"])?;
