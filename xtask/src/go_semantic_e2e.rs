@@ -75,10 +75,19 @@ pub(crate) fn verify(
 
     let root = tempfile::tempdir().context("create the Go semantic E2E directory")?;
     let semantic_root = root.path().join("semantic");
+    let vta_root = root.path().join("semantic-vta");
     let fallback_root = root.path().join("fallback-workspace");
     copy_tree(
         &workspace_root.join("workers/go/internal/worker/testdata/semantic"),
         &semantic_root,
+    )?;
+    copy_tree(
+        &workspace_root.join("workers/go/internal/worker/testdata/semantic"),
+        &vta_root,
+    )?;
+    fs::write(
+        vta_root.join(".depgraph.toml"),
+        "schema_version = 1\n\n[profiles]\ngo_call_graph = \"vta\"\n",
     )?;
     copy_tree(
         &workspace_root.join("workers/go/internal/worker/testdata/workspace"),
@@ -97,8 +106,105 @@ pub(crate) fn verify(
     };
 
     verify_semantic_graph(&runner, root.path(), &semantic_root)?;
+    verify_vta_graph(&runner, root.path(), &vta_root)?;
     verify_fallback_safety(&runner, root.path(), &fallback_root)?;
     println!("Go semantic CLI end-to-end gate passed");
+    Ok(())
+}
+
+fn verify_vta_graph(runner: &Runner<'_>, temp: &Path, fixture: &Path) -> Result<()> {
+    let first_store = temp.join("semantic-vta-one.db");
+    let second_store = temp.join("semantic-vta-two.db");
+    let first_scan = runner.scan(&first_store, fixture)?;
+    let second_scan = runner.scan(&second_store, fixture)?;
+    assert_semantic_scan(&first_scan)?;
+    assert_semantic_scan(&second_scan)?;
+    let first_export = runner.export_json(&first_store)?;
+    let second_export = runner.export_json(&second_store)?;
+    ensure!(
+        graph_projection(&first_export)? == graph_projection(&second_export)?,
+        "two opt-in VTA scans produced different nodes/sites/edges/coverage"
+    );
+
+    let graph = first_export
+        .get("graph")
+        .context("VTA JSON export has no graph")?;
+    let profile = graph_array(graph, "profiles")?
+        .iter()
+        .find(|profile| profile["language"] == "go")
+        .context("VTA export has no Go profile")?;
+    ensure!(
+        profile["properties"]["go_call_graph_requested"] == "vta"
+            && matches!(
+                profile["properties"]["go_call_graph_vta_status"].as_str(),
+                Some("applied" | "partial")
+            ),
+        "VTA profile lost its requested/effective outcome: {profile}"
+    );
+
+    let sites = graph_array(graph, "sites")?;
+    let edges = graph_array(graph, "edges")?;
+    let evidence = graph_array(graph, "evidence")?;
+    let mut vta_sites = 0_u64;
+    let mut singleton_sites = 0_u64;
+    for site in sites
+        .iter()
+        .filter(|site| site["kind"] == "call" && site["resolution_status"] == "candidates")
+    {
+        let site_id = required_str(site, "id", "VTA candidate site")?;
+        let targets = site["target_ids"]
+            .as_array()
+            .context("VTA candidate site has no target_ids")?;
+        let primary = evidence
+            .iter()
+            .find(|item| item["owner_type"] == "site" && item["owner_id"] == site_id)
+            .with_context(|| format!("VTA candidate site {site_id} has no stored evidence"))?;
+        let algorithm = primary["properties"]["algorithm"]
+            .as_str()
+            .unwrap_or_default();
+        if algorithm == "vta" {
+            vta_sites += 1;
+            ensure!(
+                primary["properties"]["fallback_reason"] == "none",
+                "applied VTA site reported a fallback: {primary}"
+            );
+        } else {
+            ensure!(
+                matches!(algorithm, "rta" | "cha")
+                    && primary["properties"]["fallback_reason"] != "none",
+                "VTA fallback did not name its effective algorithm/reason: {primary}"
+            );
+        }
+        ensure!(
+            primary["properties"]["requested_algorithm"] == "vta"
+                && primary["properties"]["candidate_count"].as_u64() == Some(targets.len() as u64),
+            "VTA candidate evidence lost requested algorithm or candidate count: {primary}"
+        );
+        if targets.len() == 1 {
+            singleton_sites += 1;
+            ensure!(
+                site["precision"] == "overapprox",
+                "VTA singleton candidate was promoted to exact: {site}"
+            );
+        }
+        for edge in edges.iter().filter(|edge| edge["site_id"] == site_id) {
+            let edge_id = required_str(edge, "id", "VTA candidate edge")?;
+            let edge_primary = evidence
+                .iter()
+                .find(|item| item["owner_type"] == "edge" && item["owner_id"] == edge_id)
+                .with_context(|| format!("VTA candidate edge {edge_id} has no stored evidence"))?;
+            ensure!(
+                edge["kind"] == "may_call"
+                    && edge["precision"] == "overapprox"
+                    && edge_primary["properties"] == primary["properties"],
+                "VTA edge and site evidence disagree: site={primary} edge={edge_primary}"
+            );
+        }
+    }
+    ensure!(
+        vta_sites > 0 && singleton_sites > 0,
+        "VTA E2E did not exercise an applied singleton refinement"
+    );
     Ok(())
 }
 

@@ -69,6 +69,22 @@ func main() {
 }
 `
 
+const ssaVTARefinementSource = `package candidate
+
+type Token struct{}
+type Runner interface{ Run(Token) int }
+
+type Live struct{}
+func (Live) Run(Token) int { return 1 }
+type Dead struct{}
+func (Dead) Run(Token) int { return 2 }
+
+func RefinedCall(value Token) int {
+	var runner Runner = Live{}
+	return runner.Run(value)
+}
+`
+
 func TestGoSSALibraryCHACandidates(t *testing.T) {
 	root := ssaTestModule(t, "example.com/ssalibrary", map[string]string{
 		"candidate/candidate.go": ssaLibrarySource,
@@ -119,6 +135,84 @@ func TestGoSSAMainRTACandidatesOnlyReachableTargets(t *testing.T) {
 		t.Fatalf("main/test call graph policy = %q, want rta", got)
 	}
 	semanticAssertCoverageLedger(t, result)
+}
+
+func TestGoSSAVTAOptInRefinesCHAAndIsDeterministic(t *testing.T) {
+	root := ssaTestModule(t, "example.com/ssavta", map[string]string{
+		"candidate/candidate.go": ssaVTARefinementSource,
+	})
+	defaultResult := ssaTestScan(t, root)
+	caller := semanticFindNamedNode(t, defaultResult, "symbol", "function", "example.com/ssavta/candidate.RefinedCall")
+	live := semanticFindNamedNode(t, defaultResult, "symbol", "method", "example.com/ssavta/candidate.(Live).Run")
+	dead := semanticFindNamedNode(t, defaultResult, "symbol", "method", "example.com/ssavta/candidate.(Dead).Run")
+	defaultSite := ssaTestCandidateSite(t, defaultResult, caller.ID, "candidate/candidate.go", 13)
+	ssaTestRequireCandidateContract(t, defaultResult, defaultSite, "cha", "interface", []string{live.ID, dead.ID})
+	if defaultResult.Profile.Properties["go_call_graph_requested"] != "rta-cha" ||
+		defaultResult.Profile.Properties["go_call_graph_vta_status"] != "not-requested" {
+		t.Fatalf("default profile unexpectedly enabled VTA: %+v", defaultResult.Profile)
+	}
+
+	t.Setenv("DEPGRAPH_PROFILE_CONFIG", `{"go_call_graph":"vta"}`)
+	first := ssaTestScan(t, root)
+	second := ssaTestScan(t, root)
+	if !reflect.DeepEqual(first, second) {
+		t.Fatal("two VTA scans of the same root differ")
+	}
+	if first.Profile.ID == defaultResult.Profile.ID {
+		t.Fatal("VTA opt-in reused the default profile identity")
+	}
+	vtaCaller := semanticFindNamedNode(t, first, "symbol", "function", "example.com/ssavta/candidate.RefinedCall")
+	vtaLive := semanticFindNamedNode(t, first, "symbol", "method", "example.com/ssavta/candidate.(Live).Run")
+	vtaSite := ssaTestCandidateSite(t, first, vtaCaller.ID, "candidate/candidate.go", 13)
+	ssaTestRequireCandidateContract(t, first, vtaSite, "vta", "interface", []string{vtaLive.ID})
+	if vtaSite.ResolutionStatus != "candidates" || vtaSite.Precision != "overapprox" {
+		t.Fatalf("VTA singleton was promoted to exact: %+v", vtaSite)
+	}
+	for key, want := range map[string]string{
+		"go_call_graph_requested": "vta", "go_call_graph_vta_status": "applied",
+		"go_call_graph_effective_algorithms": "vta", "go_call_graph_vta_site_count": "1",
+		"go_call_graph_vta_fallback_site_count": "0", "go_call_graph_vta_fallback_reasons": "",
+	} {
+		if got := first.Profile.Properties[key]; got != want {
+			t.Fatalf("VTA profile property %s=%q, want %q: %+v", key, got, want, first.Profile.Properties)
+		}
+	}
+}
+
+func TestGoSSAVTAConstructionAndSelectionFailClosed(t *testing.T) {
+	if graph, err := buildGoVTAGraph(nil); err == nil || graph != nil {
+		t.Fatalf("buildGoVTAGraph(nil) = (%v, %v), want explicit failure", graph, err)
+	}
+	key := goSSACallKey{}
+	rtaIndex := newGoSSAGraphIndex()
+	rtaIndex.sites[key] = true
+	pending := goSemanticPendingCall{context: &goSemanticPackage{typed: goTypedPackage{Name: "main"}}}
+	algorithm, reason, fallback, _ := (*goSemanticExtractor)(nil).selectGoSSAIndex(
+		pending, key, true, newGoSSAGraphIndex(), rtaIndex, true, newGoSSAGraphIndex(),
+		"vta_construction_failed_fallback",
+	)
+	if algorithm != "rta" || reason != "main_or_test_program" || fallback != "vta_construction_failed_fallback" {
+		t.Fatalf("VTA failure selection = (%q, %q, %q), want explicit RTA fallback", algorithm, reason, fallback)
+	}
+	evidence := goSSACandidateEvidence(goSemanticPendingCall{evidence: []Evidence{{
+		Kind: "semantic", Properties: map[string]any{"dispatch": "interface"},
+	}}}, algorithm, reason, fallback, 2, true)
+	if len(evidence) != 1 || evidence[0].Properties["requested_algorithm"] != "vta" ||
+		evidence[0].Properties["algorithm"] != "rta" || evidence[0].Properties["fallback_reason"] != fallback ||
+		evidence[0].Properties["candidate_count"] != 2 {
+		t.Fatalf("VTA fallback evidence is incomplete: %+v", evidence)
+	}
+	state := &scannerState{profile: Profile{Properties: map[string]string{}}}
+	extractor := &goSemanticExtractor{state: state}
+	extractor.recordSSAOutcome(&goSSAOutcome{
+		requestedVTA: true, pendingSites: 1, fallbackSelections: 1,
+		algorithms: map[string]bool{"rta": true}, fallbackReasons: map[string]bool{fallback: true},
+	})
+	if state.profile.Properties["go_call_graph_vta_status"] != "fallback" ||
+		state.profile.Properties["go_call_graph_vta_fallback_site_count"] != "1" ||
+		state.profile.Properties["go_call_graph_vta_fallback_reasons"] != fallback {
+		t.Fatalf("VTA fallback profile outcome is incomplete: %+v", state.profile.Properties)
+	}
 }
 
 func TestGoSSAInternalTestUsesRTA(t *testing.T) {
@@ -559,6 +653,9 @@ func ssaTestScan(t *testing.T, root string) Result {
 	if got := result.Profile.Properties["go_ssa_builder_mode"]; got != "instantiate-generics,serial" {
 		t.Fatalf("SSA builder mode = %q, want instantiate-generics,serial", got)
 	}
+	if got := result.Profile.Properties["go_call_graph_vta_engine"]; got != goVTACallGraphEngine {
+		t.Fatalf("VTA engine = %q, want %q", got, goVTACallGraphEngine)
+	}
 	return result
 }
 
@@ -633,8 +730,25 @@ func ssaTestRequireCandidateContract(t *testing.T, result Result, site Site, alg
 		}
 	}
 	wantScope := map[string]string{"rta": "complete_program", "cha": "partial_program"}[algorithm]
+	if algorithm == "vta" {
+		wantScope = "complete_program"
+	}
 	if got, _ := primary.Properties["analysis_scope"].(string); got != wantScope {
 		t.Fatalf("candidate analysis scope = %q, want %q: %+v", got, wantScope, primary)
+	}
+	if got, ok := primary.Properties["candidate_count"].(int); !ok || got != len(site.TargetIDs) {
+		t.Fatalf("candidate evidence count = %v, want %d: %+v", primary.Properties["candidate_count"], len(site.TargetIDs), primary)
+	}
+	wantRequested, wantFallback := "rta-cha", "not_requested"
+	if result.Profile.Properties["go_call_graph_requested"] == "vta" {
+		wantRequested = "vta"
+		wantFallback = "none"
+	}
+	if got, _ := primary.Properties["requested_algorithm"].(string); got != wantRequested {
+		t.Fatalf("candidate requested algorithm = %q, want %q: %+v", got, wantRequested, primary)
+	}
+	if got, _ := primary.Properties["fallback_reason"].(string); got != wantFallback {
+		t.Fatalf("candidate fallback reason = %q, want %q: %+v", got, wantFallback, primary)
 	}
 	wantSiteID := semanticCanonicalValueID("site", map[string]any{
 		"condition": site.Condition, "kind": "call", "path": primary.Path,

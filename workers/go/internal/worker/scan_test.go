@@ -254,14 +254,14 @@ func TestProfileConfigurationIsReflectedWithoutExecutingTools(t *testing.T) {
 }
 
 func TestProfileIdentityIncludesHostAndEffectiveCgoAxes(t *testing.T) {
-	linux := goProfileID("linux", "amd64", "0", nil)
-	darwin := goProfileID("darwin", "amd64", "0", nil)
-	linuxCgo := goProfileID("linux", "amd64", "1", nil)
+	linux := goProfileID("linux", "amd64", "0", nil, "rta-cha")
+	darwin := goProfileID("darwin", "amd64", "0", nil, "rta-cha")
+	linuxCgo := goProfileID("linux", "amd64", "1", nil, "rta-cha")
 	if linux == darwin || linux == linuxCgo || darwin == linuxCgo {
 		t.Fatalf("distinct effective Go profiles collided: linux=%s darwin=%s cgo=%s", linux, darwin, linuxCgo)
 	}
-	first := goProfileID("linux", "amd64", "0", []string{" integration ", "linux", "integration"})
-	second := goProfileID("linux", "amd64", "0", []string{"linux", "integration"})
+	first := goProfileID("linux", "amd64", "0", []string{" integration ", "linux", "integration"}, "rta-cha")
+	second := goProfileID("linux", "amd64", "0", []string{"linux", "integration"}, "rta-cha")
 	if first != second {
 		t.Fatalf("equivalent Go tag sets changed profile identity: first=%s second=%s", first, second)
 	}
@@ -270,11 +270,44 @@ func TestProfileIdentityIncludesHostAndEffectiveCgoAxes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Scan() error = %v", err)
 	}
-	if result.Profile.ID != goProfileID(runtime.GOOS, runtime.GOARCH, "0", nil) {
+	if result.Profile.ID != goProfileID(runtime.GOOS, runtime.GOARCH, "0", nil, "rta-cha") {
 		t.Fatalf("default profile omitted an effective host axis: %+v", result.Profile)
 	}
 	if result.Profile.Environment["CGO_ENABLED"] != "0" {
 		t.Fatalf("profile did not report constrained cgo state: %+v", result.Profile.Environment)
+	}
+}
+
+func TestVTAProfileIsExplicitAndIdentityScoped(t *testing.T) {
+	root := fixtureRoot(t)
+	defaultResult, err := Scan(root)
+	if err != nil {
+		t.Fatalf("default Scan() error = %v", err)
+	}
+	if defaultResult.Profile.Properties["go_call_graph_requested"] != "rta-cha" {
+		t.Fatalf("default call graph mode = %q, want rta-cha", defaultResult.Profile.Properties["go_call_graph_requested"])
+	}
+
+	t.Setenv("DEPGRAPH_PROFILE_CONFIG", `{"go_call_graph":"vta"}`)
+	vtaResult, err := Scan(root)
+	if err != nil {
+		t.Fatalf("VTA Scan() error = %v", err)
+	}
+	if vtaResult.Profile.Properties["go_call_graph_requested"] != "vta" ||
+		vtaResult.Profile.ID != goProfileID(runtime.GOOS, runtime.GOARCH, "0", nil, "vta") ||
+		vtaResult.Profile.ID == defaultResult.Profile.ID {
+		t.Fatalf("VTA profile was not explicitly identity-scoped: default=%+v vta=%+v", defaultResult.Profile, vtaResult.Profile)
+	}
+
+	// Direct worker invocation is fail-closed even if it bypasses core config
+	// validation: an unknown analysis mode cannot silently enable VTA.
+	t.Setenv("DEPGRAPH_PROFILE_CONFIG", `{"go_call_graph":"pta"}`)
+	invalidResult, err := Scan(root)
+	if err != nil {
+		t.Fatalf("invalid direct worker profile Scan() error = %v", err)
+	}
+	if invalidResult.Profile.Properties["go_call_graph_requested"] != "rta-cha" || invalidResult.Profile.ID != defaultResult.Profile.ID {
+		t.Fatalf("unknown direct worker mode did not fall back to the default profile: %+v", invalidResult.Profile)
 	}
 }
 
@@ -539,8 +572,8 @@ func TestProfileScopedGraphIDsChangeWithEffectiveProfile(t *testing.T) {
 		}
 	}
 
-	linuxProfile := goProfileID("linux", "amd64", "0", []string{"alpha"})
-	darwinProfile := goProfileID("darwin", "amd64", "0", []string{"alpha"})
+	linuxProfile := goProfileID("linux", "amd64", "0", []string{"alpha"}, "rta-cha")
+	darwinProfile := goProfileID("darwin", "amd64", "0", []string{"alpha"}, "rta-cha")
 	if profileScopedID("file", "workspace", linuxProfile, "example.com/profiled", "main.go") == profileScopedID("file", "workspace", darwinProfile, "example.com/profiled", "main.go") {
 		t.Fatal("host target changes did not affect a profile-scoped file ID")
 	}
