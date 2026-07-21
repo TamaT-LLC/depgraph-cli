@@ -43,6 +43,17 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Observe a project build only after explicit project-code consent.
+    Resolve {
+        /// Select build observation mode. No other resolve mode is available yet.
+        #[arg(long, required = true)]
+        build: bool,
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Acknowledge that untrusted project code may execute for this invocation.
+        #[arg(long)]
+        allow_project_code: bool,
+    },
     /// Report worker, toolchain, coverage, and protocol health.
     Doctor {
         #[arg(long)]
@@ -197,6 +208,16 @@ async fn run(cli: Cli) -> Result<u8> {
                 println!("store: {}", store_path.display());
             }
             Ok(outcome.exit_code)
+        }
+        Commands::Resolve {
+            build,
+            path,
+            allow_project_code,
+        } => {
+            debug_assert!(build, "clap requires --build");
+            require_build_consent(allow_project_code)?;
+            let _root = canonical_directory(path)?;
+            anyhow::bail!(BUILD_SUPERVISOR_UNAVAILABLE);
         }
         Commands::Doctor { json } => {
             let root = std::env::current_dir()?;
@@ -417,6 +438,17 @@ async fn run(cli: Cli) -> Result<u8> {
     }
 }
 
+const BUILD_CONSENT_REQUIRED: &str = "project code execution permission denied: `resolve --build` may execute untrusted build tools, configuration, plugins, build scripts, and proc macros; rerun this invocation with `--allow-project-code` only after reviewing the target repository";
+const BUILD_SUPERVISOR_UNAVAILABLE: &str =
+    "build observation supervisor is not available in this milestone; no child process was started";
+
+fn require_build_consent(allow_project_code: bool) -> Result<()> {
+    if !allow_project_code {
+        anyhow::bail!(BUILD_CONSENT_REQUIRED);
+    }
+    Ok(())
+}
+
 fn canonical_directory(path: PathBuf) -> Result<PathBuf> {
     let path = path
         .canonicalize()
@@ -519,7 +551,7 @@ fn print_evidence(evidence: &[depgraph_store::EvidenceRecord], indent: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::error_exit_code;
+    use super::{BUILD_SUPERVISOR_UNAVAILABLE, error_exit_code, require_build_consent};
 
     #[test]
     fn classifies_cli_errors_without_hiding_internal_failures_as_usage() {
@@ -539,5 +571,17 @@ mod tests {
             error_exit_code(&anyhow::anyhow!("database disk image is malformed")),
             3
         );
+        assert_eq!(
+            error_exit_code(&anyhow::anyhow!(BUILD_SUPERVISOR_UNAVAILABLE)),
+            3
+        );
+    }
+
+    #[test]
+    fn build_consent_is_an_explicit_per_invocation_gate() {
+        let error = require_build_consent(false).unwrap_err();
+        assert_eq!(error_exit_code(&error), 4);
+        assert!(format!("{error:#}").contains("--allow-project-code"));
+        require_build_consent(true).expect("the explicit CLI flag grants consent");
     }
 }

@@ -65,6 +65,9 @@ depgraph init .
 depgraph scan /path/to/repository
 depgraph scan /path/to/repository --strict
 
+# Privileged build-observation consent form. The supervisor currently fails closed.
+depgraph resolve --build /path/to/repository --allow-project-code
+
 depgraph doctor --json
 depgraph deps path:src/app.ts --transitive
 depgraph dependents package:example
@@ -97,6 +100,12 @@ The default scan reads source, manifests, lockfiles, static JSON/JSONC configura
 Worker and toolchain lookup uses a canonical absolute `PATH`: relative entries, the scan root, and symlink aliases into the scan root are removed. Child environments omit execution hooks such as `NODE_OPTIONS`; direct reads resolve symlinks and remain confined to the canonical repository root. Release manifests, workers, schemas, runtime component trees, and every declared artifact are checksum verified; symlinks, missing entries, changed bytes, and undeclared tree contents fail closed before a packaged worker starts.
 
 Executable or unsupported configuration becomes a diagnostic or unresolved site. `project_code_executed` remains `false` in worker profiles, coverage, stored scans, and `doctor` output. Security fixtures contain configs/generators that would create marker files if they were executed.
+
+## Build-mode consent boundary
+
+`depgraph resolve --build [PATH]` is a separate, privileged mode because build tools, executable configuration, plugins, lifecycle scripts, Rust build scripts, and proc macros may run arbitrary project code. It never prompts. Each invocation must include `--allow-project-code`; configuration, environment variables, `CI=true`, TTY state, and previous consent cannot grant permission. Missing consent is rejected before path/config/store/toolchain processing with exit code `4`.
+
+The explicit-consent CLI guard and threat model are implemented. The supervised child-process runner is the next milestone task, so a consented invocation currently fails closed with exit code `3` and `no child process was started`. It does not create a store or report a successful no-op. The supervisor contract requires a temporary staged workspace, cleared allowlisted environment, process-tree timeout/cancellation, network-policy audit, secret-free command/cwd/toolchain/environment-key audit, untrusted-output validation, and atomic `phase=build` / `precision=observed` union. Failed or partial attempts must preserve the previous completed snapshot.
 
 ## Strict policy and exit codes
 

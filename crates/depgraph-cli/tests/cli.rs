@@ -38,6 +38,125 @@ fn empty_safe_scan_uses_external_store_and_reports_json() {
     assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
 }
 
+#[test]
+fn build_mode_refuses_implicit_or_missing_consent_without_executing_project_code() {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let marker = root.path().join("PROJECT_BUILD_EXECUTED");
+    let package_json = format!(
+        r#"{{"scripts":{{"build":"node -e \"require('fs').writeFileSync('{}','unsafe')\""}}}}"#,
+        marker.display()
+    );
+    serde_json::from_str::<serde_json::Value>(&package_json).unwrap();
+    fs::write(root.path().join("package.json"), package_json).unwrap();
+
+    for ci in ["false", "true"] {
+        Command::cargo_bin("depgraph")
+            .unwrap()
+            .env("CI", ci)
+            .env("DEPGRAPH_ALLOW_PROJECT_CODE", "1")
+            .args([
+                "--store",
+                cache.path().join(format!("{ci}.db")).to_str().unwrap(),
+                "resolve",
+                "--build",
+                root.path().to_str().unwrap(),
+            ])
+            .assert()
+            .code(4)
+            .stdout(predicate::str::is_empty())
+            .stderr(predicate::str::contains("permission denied"))
+            .stderr(predicate::str::contains("--allow-project-code"));
+    }
+
+    assert!(!marker.exists());
+    assert!(!cache.path().join("false.db").exists());
+    assert!(!cache.path().join("true.db").exists());
+
+    Command::cargo_bin("depgraph")
+        .unwrap()
+        .args([
+            "resolve",
+            "--build",
+            root.path().join("missing").to_str().unwrap(),
+        ])
+        .assert()
+        .code(4)
+        .stderr(predicate::str::contains("permission denied"));
+}
+
+#[test]
+fn consented_build_mode_fails_closed_until_the_supervisor_is_available() {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let marker = root.path().join("PROJECT_BUILD_EXECUTED");
+    fs::write(
+        root.path().join("build.rs"),
+        format!(
+            "fn main() {{ std::fs::write({:?}, b\"unsafe\").unwrap(); }}\n",
+            marker
+        ),
+    )
+    .unwrap();
+
+    Command::cargo_bin("depgraph")
+        .unwrap()
+        .args([
+            "--store",
+            cache.path().join("graph.db").to_str().unwrap(),
+            "resolve",
+            "--build",
+            root.path().to_str().unwrap(),
+            "--allow-project-code",
+        ])
+        .assert()
+        .code(3)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains(
+            "build observation supervisor is not available",
+        ))
+        .stderr(predicate::str::contains("no child process was started"));
+
+    assert!(!marker.exists());
+    assert!(!cache.path().join("graph.db").exists());
+
+    Command::cargo_bin("depgraph")
+        .unwrap()
+        .args([
+            "resolve",
+            "--build",
+            root.path().join("missing").to_str().unwrap(),
+            "--allow-project-code",
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("does not exist"));
+}
+
+#[test]
+fn resolve_requires_the_explicit_build_mode_selector() {
+    let root = tempfile::tempdir().unwrap();
+    Command::cargo_bin("depgraph")
+        .unwrap()
+        .args([
+            "resolve",
+            root.path().to_str().unwrap(),
+            "--allow-project-code",
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("--build"));
+
+    Command::cargo_bin("depgraph")
+        .unwrap()
+        .args(["resolve", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--build"))
+        .stdout(predicate::str::contains("--allow-project-code"))
+        .stdout(predicate::str::contains("untrusted project code"));
+}
+
 #[cfg(unix)]
 fn write_worker(path: &std::path::Path, body: &str) {
     use std::os::unix::fs::PermissionsExt;
