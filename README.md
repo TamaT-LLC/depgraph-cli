@@ -26,12 +26,13 @@ Source/development builds intentionally report
 extracted release archive, including its Rust backend attestation, it starts the
 packaged worker with `release-gate-verified`; only that attested path may emit a
 release-ready profile. Issue #30 package/release verification was completed on
-2026-07-19. A pure TypeScript/JavaScript Web profile can likewise claim
-`semantic-complete` only with the bundled isolated compiler, a ready/emitted
-v2 graph, zero skipped, unsupported, unresolved, semantic-issue, and compiler
-diagnostic counts, `project_code_executed=false`, and no detected framework.
-Candidate and external Web sites are allowed. Framework semantic edges,
-code-based routes, server functions, build observation, runtime traces,
+2026-07-19. A Web profile can likewise claim `semantic-complete` only with the
+bundled isolated compiler, a ready/emitted v2 graph, zero skipped, unsupported,
+unresolved, semantic-issue, and compiler diagnostic counts, and
+`project_code_executed=false`. Candidate and external Web sites are allowed.
+Detected Next.js, Astro, TanStack Router, and TanStack Start profiles must also
+complete their versioned framework semantic capability ledger. Code-based
+routes beyond the safe static boundary, build observation, runtime traces,
 incremental updates, snapshots, and architecture policies remain later
 milestones.
 
@@ -121,6 +122,6 @@ Failed/partial scans and diagnostics remain stored, but only a complete policy-p
 - `workers/rust`, `workers/go`, `workers/web`: ecosystem-native safe static adapters
 - `xtask`: reproducible build, full quality checks, release archives, checksums, SBOM, and license inventory
 
-Run `cargo xtask package` to create a native archive under `dist/`. Release archives place `depgraph` under `bin/`, compatible workers under `libexec/`, and include a checksum-verified release manifest, protocol schema, SPDX SBOM, and third-party license inventory. The release gate fixes Rust/Cargo `1.93.1`; the Rust worker manifest records the linked backend unit, rust-analyzer `0.0.330` at revision `8954b66d43225e62c92e8bbcc8500191b5cceb1e` with Salsa `0.26.1`.
+Run `cargo xtask package` to create a native archive under `dist/`. Release archives place `depgraph` under `bin/`, compatible workers under `libexec/`, and include a checksum-verified release manifest, protocol schema, SPDX SBOM, and third-party license inventory. The release gate fixes Rust/Cargo `1.93.1`; the Rust worker manifest records the linked backend unit, rust-analyzer `0.0.330` at revision `8954b66d43225e62c92e8bbcc8500191b5cceb1e` with Salsa `0.26.1`. The Web worker manifest records the exact TypeScript version, the complete Web semantic capability set, and its Astro and TypeScript runtime components.
 
-The package verifier extracts the archive and validates the manifest, every artifact and runtime component, the Rust backend manifest/handshake, semantic query/export/determinism E2E, and the complete rust-analyzer/Salsa SBOM and license closure. Runtime components distinguish an `executable-tree` with an executable entrypoint from a `data-tree` whose entrypoint is optional. No sysroot or `rust-src` is currently bundled, and packaged scans never fall back implicitly to project or system backend/sysroot bytes. Tier 1 Linux/macOS, Windows package smoke, and Rust HIR benchmark gates were completed with Issue #30 on 2026-07-19.
+The package verifier extracts the archive and validates the manifest, every artifact and runtime component, Rust and Web worker handshakes, per-framework scan/query/export E2E, cross-checkout JSON/DOT/Mermaid determinism, and the complete runtime SBOM and license closure. Missing, added, modified, symlinked, or version-mismatched Web worker, Astro parser, TypeScript compiler, or schema input fails before worker launch. Runtime components distinguish an `executable-tree` with an executable entrypoint from a `data-tree` whose entrypoint is optional. No sysroot or `rust-src` is currently bundled, and packaged scans never fall back implicitly to project or system backend/sysroot bytes. Tier 1 Linux/macOS package gates and Windows safety/determinism smoke cover the Web semantic archive contract.

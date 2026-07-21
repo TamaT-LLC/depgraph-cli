@@ -24,6 +24,21 @@ const SALSA_VERSION: &str = "0.26.1";
 const RUST_ANALYZER_DIRECT_DEPENDENCIES: &[&str] =
     &["ra_ap_hir", "ra_ap_ide_db", "ra_ap_syntax", "ra_ap_vfs"];
 const SALSA_DIRECT_DEPENDENCIES: &[&str] = &["salsa", "salsa-macro-rules", "salsa-macros"];
+const TYPESCRIPT_VERSION: &str = "7.0.2";
+const WEB_SEMANTIC_CAPABILITIES: &[&str] = &[
+    "astro-component-render-hydration-v1",
+    "framework-semantic-completeness-v1",
+    "framework-semantic-graph-v1",
+    "next-route-component-boundary-v1",
+    "tanstack-router-typed-route-v1",
+    "tanstack-start-rpc-middleware-v1",
+    "typescript-definition-import-type-call-graph-v2",
+];
+const WEB_SEMANTIC_RUNTIME_COMPONENTS: &[&str] = &[
+    "astro-parser-wasm@4.0.0",
+    "typescript-native-compiler@7.0.2",
+];
+const WEB_SEMANTIC_RUNTIME_ARTIFACTS: &[&str] = &[];
 const WEB_DEFINITION_SELECTOR: &str = r#"type:definition:["package","npm:workspace:@fixture/shared@1.0.0#apps/shared","definition:[\"module\",\"type\",\"apps/shared/src/semantic.ts\",[\"SharedStringCollection\"]]"]"#;
 const FORBIDDEN_RUST_ANALYZER_DEPENDENCIES: &[&str] = &[
     "ra_ap_flycheck",
@@ -90,6 +105,8 @@ struct WorkerArtifact {
     sha256: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     backend: Option<WorkerBackend>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    semantic: Option<WebSemanticAttestation>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, Serialize)]
@@ -99,6 +116,15 @@ struct WorkerBackend {
     version: String,
     revision: String,
     salsa_version: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct WebSemanticAttestation {
+    typescript_version: String,
+    capabilities: Vec<String>,
+    runtime_components: Vec<String>,
+    runtime_artifacts: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -271,9 +297,9 @@ fn package() -> Result<()> {
         Path::new("workers/web/dist/worker.mjs"),
         &staging.join("libexec/depgraph-web-worker.mjs"),
     )?;
-    copy(
-        Path::new("workers/web/dist/astro.wasm"),
-        &staging.join("libexec/astro.wasm"),
+    copy_directory(
+        Path::new("workers/web/dist/astro"),
+        &staging.join("libexec/astro"),
     )?;
     copy_directory(
         Path::new("workers/web/dist/typescript"),
@@ -321,18 +347,25 @@ fn package() -> Result<()> {
             path: relative_slash(&staging, &schema_path)?,
             sha256: sha256_file(&schema_path)?,
         },
-        runtime_artifacts: vec![Artifact {
-            path: "libexec/astro.wasm".to_owned(),
-            sha256: sha256_file(&staging.join("libexec/astro.wasm"))?,
-        }],
-        runtime_components: vec![RuntimeComponent {
-            name: "typescript-native-compiler".to_owned(),
-            kind: "executable-tree".to_owned(),
-            version: "7.0.2".to_owned(),
-            root: "libexec/typescript/lib".to_owned(),
-            entrypoint: Some(format!("libexec/typescript/lib/{}", executable_name("tsc"))),
-            sha256: sha256_tree(&staging.join("libexec/typescript/lib"))?,
-        }],
+        runtime_artifacts: Vec::new(),
+        runtime_components: vec![
+            RuntimeComponent {
+                name: "astro-parser-wasm".to_owned(),
+                kind: "data-tree".to_owned(),
+                version: "4.0.0".to_owned(),
+                root: "libexec/astro".to_owned(),
+                entrypoint: Some("libexec/astro/astro.wasm".to_owned()),
+                sha256: sha256_tree(&staging.join("libexec/astro"))?,
+            },
+            RuntimeComponent {
+                name: "typescript-native-compiler".to_owned(),
+                kind: "executable-tree".to_owned(),
+                version: TYPESCRIPT_VERSION.to_owned(),
+                root: "libexec/typescript/lib".to_owned(),
+                entrypoint: Some(format!("libexec/typescript/lib/{}", executable_name("tsc"))),
+                sha256: sha256_tree(&staging.join("libexec/typescript/lib"))?,
+            },
+        ],
         workers,
         runtime_requirements: BTreeMap::from([("web".to_owned(), "Node.js >=24.0.0".to_owned())]),
     };
@@ -396,12 +429,20 @@ fn worker_artifact(adapter: &'static str, path: &Path, staging: &Path) -> Result
     } else {
         None
     };
+    let semantic = if adapter == "web" {
+        let semantic = web_semantic_from_handshake(&parsed)?;
+        verify_web_semantic_attestation(&semantic)?;
+        Some(semantic)
+    } else {
+        None
+    };
     Ok(WorkerArtifact {
         adapter: adapter.to_owned(),
         version: parsed.version.to_owned(),
         path: relative_slash(staging, path)?,
         sha256: sha256_file(path)?,
         backend,
+        semantic,
     })
 }
 
@@ -453,6 +494,53 @@ fn verify_rust_backend(backend: &WorkerBackend) -> Result<()> {
         || backend.salsa_version != SALSA_VERSION
     {
         bail!("Rust worker backend does not match the verified compatibility unit: {backend:?}");
+    }
+    Ok(())
+}
+
+fn web_semantic_from_handshake(handshake: &WorkerHandshake<'_>) -> Result<WebSemanticAttestation> {
+    if handshake.detail_order != ["typescript", "capabilities"] {
+        bail!("Web worker handshake has an incomplete or unknown semantic compatibility unit");
+    }
+    let capabilities = handshake.details["capabilities"]
+        .split(',')
+        .map(str::to_owned)
+        .collect();
+    Ok(WebSemanticAttestation {
+        typescript_version: handshake.details["typescript"].to_owned(),
+        capabilities,
+        runtime_components: WEB_SEMANTIC_RUNTIME_COMPONENTS
+            .iter()
+            .map(|value| (*value).to_owned())
+            .collect(),
+        runtime_artifacts: WEB_SEMANTIC_RUNTIME_ARTIFACTS
+            .iter()
+            .map(|value| (*value).to_owned())
+            .collect(),
+    })
+}
+
+fn verify_web_semantic_attestation(attestation: &WebSemanticAttestation) -> Result<()> {
+    let expected_capabilities = WEB_SEMANTIC_CAPABILITIES
+        .iter()
+        .map(|value| (*value).to_owned())
+        .collect::<Vec<_>>();
+    let expected_components = WEB_SEMANTIC_RUNTIME_COMPONENTS
+        .iter()
+        .map(|value| (*value).to_owned())
+        .collect::<Vec<_>>();
+    let expected_artifacts = WEB_SEMANTIC_RUNTIME_ARTIFACTS
+        .iter()
+        .map(|value| (*value).to_owned())
+        .collect::<Vec<_>>();
+    if attestation.typescript_version != TYPESCRIPT_VERSION
+        || attestation.capabilities != expected_capabilities
+        || attestation.runtime_components != expected_components
+        || attestation.runtime_artifacts != expected_artifacts
+    {
+        bail!(
+            "Web worker semantic attestation does not match the verified compatibility unit: {attestation:?}"
+        );
     }
     Ok(())
 }
@@ -1311,7 +1399,7 @@ fn verify_archive(archive: &Path, name: &str) -> Result<()> {
     let second_web_store = verify_root.join("web-two.db");
     verify_packaged_scan(&executable, &second_web_store, &second_fixture, "web")?;
     verify_packaged_web_determinism(&executable, &first_web_store, &second_web_store)?;
-    verify_packaged_typescript_fails_closed(&executable, &extracted, &verify_root, &fixture)?;
+    verify_packaged_web_runtime_fails_closed(&executable, &extracted, &verify_root, &fixture)?;
     let semantic_complete_fixture =
         Path::new("workers/web/test/fixtures/semantic-complete").canonicalize()?;
     verify_packaged_web_semantic_complete(
@@ -1323,7 +1411,7 @@ fn verify_archive(archive: &Path, name: &str) -> Result<()> {
         Path::new("workers/web/test/fixtures/framework-complete").canonicalize()?;
     verify_packaged_web_framework_completeness(
         &executable,
-        &verify_root.join("web-framework-complete.db"),
+        &verify_root,
         &framework_complete_fixture,
     )?;
 
@@ -1398,18 +1486,18 @@ fn verify_release_static_prelaunch_fails_closed(extracted: &Path) -> Result<()> 
 
         let mut manifest = baseline.clone();
         manifest
-            .runtime_artifacts
-            .retain(|artifact| artifact.path != "libexec/astro.wasm");
-        cases.push(("missing Astro runtime artifact", manifest));
+            .runtime_components
+            .retain(|component| component.name != "astro-parser-wasm");
+        cases.push(("missing Astro runtime component", manifest));
 
         let mut manifest = baseline.clone();
         let duplicate = manifest
-            .runtime_artifacts
+            .runtime_components
             .first()
             .cloned()
-            .context("release manifest has no runtime artifact")?;
-        manifest.runtime_artifacts.push(duplicate);
-        cases.push(("duplicate runtime artifact", manifest));
+            .context("release manifest has no runtime component")?;
+        manifest.runtime_components.push(duplicate);
+        cases.push(("duplicate runtime component", manifest));
 
         let mut manifest = baseline.clone();
         manifest
@@ -1437,10 +1525,56 @@ fn verify_release_static_prelaunch_fails_closed(extracted: &Path) -> Result<()> 
         manifest
             .workers
             .iter_mut()
+            .find(|worker| worker.adapter == "web")
+            .context("release manifest has no Web worker")?
+            .semantic = None;
+        cases.push(("missing Web semantic attestation", manifest));
+
+        for (scenario, mutate) in [
+            (
+                "Web TypeScript semantic version mismatch",
+                "typescript_version",
+            ),
+            ("Web semantic capability mismatch", "capabilities"),
+            ("Web semantic runtime component mismatch", "component"),
+            ("Web semantic runtime artifact mismatch", "artifact"),
+        ] {
+            let mut manifest = baseline.clone();
+            let semantic = manifest
+                .workers
+                .iter_mut()
+                .find(|worker| worker.adapter == "web")
+                .context("release manifest has no Web worker")?
+                .semantic
+                .as_mut()
+                .context("release manifest Web worker has no semantic attestation")?;
+            match mutate {
+                "typescript_version" => semantic.typescript_version = "9.9.9".to_owned(),
+                "capabilities" => semantic.capabilities.reverse(),
+                "component" => semantic.runtime_components = vec!["system-typescript".to_owned()],
+                "artifact" => semantic.runtime_artifacts = vec!["system-astro.wasm".to_owned()],
+                _ => unreachable!(),
+            }
+            cases.push((scenario, manifest));
+        }
+
+        let mut manifest = baseline.clone();
+        manifest
+            .workers
+            .iter_mut()
             .find(|worker| worker.adapter == "go")
             .context("release manifest has no Go worker")?
             .version = "9.9.9".to_owned();
         cases.push(("Go worker version mismatch", manifest));
+
+        let mut manifest = baseline.clone();
+        manifest
+            .workers
+            .iter_mut()
+            .find(|worker| worker.adapter == "web")
+            .context("release manifest has no Web worker")?
+            .version = "9.9.9".to_owned();
+        cases.push(("Web worker version mismatch", manifest));
 
         let mut manifest = baseline.clone();
         let rust_worker = manifest
@@ -1778,12 +1912,15 @@ fn verify_packaged_layout_fails_closed(
     Ok(())
 }
 
-fn verify_packaged_typescript_fails_closed(
+fn verify_packaged_web_runtime_fails_closed(
     executable: &Path,
     extracted: &Path,
     verify_root: &Path,
     fixture: &Path,
 ) -> Result<()> {
+    let manifest_path = extracted.join("release-manifest.json");
+    let original_manifest = fs::read(&manifest_path)?;
+    let typescript_root = extracted.join("libexec/typescript/lib");
     let standard_library = extracted.join("libexec/typescript/lib/lib.d.ts");
     let original = fs::read(&standard_library)?;
 
@@ -1840,6 +1977,184 @@ fn verify_packaged_typescript_fails_closed(
         bail!("doctor did not report the tampered TypeScript component: {report}");
     }
     fs::write(&standard_library, original)?;
+
+    let added = typescript_root.join("undeclared-runtime.js");
+    fs::write(&added, b"undeclared runtime input\n")?;
+    verify_packaged_security_failure(
+        executable,
+        &verify_root.join("typescript-added.db"),
+        fixture,
+        "added TypeScript runtime file",
+    )?;
+    fs::remove_file(added)?;
+
+    let added_directory = typescript_root.join("undeclared-empty-directory");
+    fs::create_dir(&added_directory)?;
+    verify_packaged_security_failure(
+        executable,
+        &verify_root.join("typescript-added-directory.db"),
+        fixture,
+        "added TypeScript runtime directory",
+    )?;
+    fs::remove_dir(added_directory)?;
+
+    #[cfg(unix)]
+    {
+        let symlink = typescript_root.join("lib-link.d.ts");
+        std::os::unix::fs::symlink("lib.d.ts", &symlink)?;
+        verify_packaged_security_failure(
+            executable,
+            &verify_root.join("typescript-symlink.db"),
+            fixture,
+            "symlinked TypeScript runtime file",
+        )?;
+        fs::remove_file(symlink)?;
+    }
+
+    let mut manifest: ReleaseManifest = serde_json::from_slice(&original_manifest)?;
+    manifest
+        .runtime_components
+        .iter_mut()
+        .find(|component| component.name == "typescript-native-compiler")
+        .context("release manifest has no TypeScript component")?
+        .version = "9.9.9".to_owned();
+    fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)?;
+    verify_packaged_security_failure(
+        executable,
+        &verify_root.join("typescript-version.db"),
+        fixture,
+        "TypeScript runtime version mismatch",
+    )?;
+    fs::write(&manifest_path, &original_manifest)?;
+
+    let astro_root = extracted.join("libexec/astro");
+    let astro_wasm = astro_root.join("astro.wasm");
+    let original_astro = fs::read(&astro_wasm)?;
+    fs::remove_file(&astro_wasm)?;
+    verify_packaged_security_failure(
+        executable,
+        &verify_root.join("astro-missing.db"),
+        fixture,
+        "missing Astro parser runtime",
+    )?;
+    fs::write(&astro_wasm, &original_astro)?;
+
+    let mut tampered_astro = original_astro.clone();
+    tampered_astro.extend_from_slice(b"tampered");
+    fs::write(&astro_wasm, tampered_astro)?;
+    verify_packaged_security_failure(
+        executable,
+        &verify_root.join("astro-tampered.db"),
+        fixture,
+        "tampered Astro parser runtime",
+    )?;
+    let doctor = Command::new(executable)
+        .arg("--store")
+        .arg(verify_root.join("astro-tampered-doctor.db"))
+        .arg("doctor")
+        .arg("--json")
+        .output()?;
+    let report: Value = serde_json::from_slice(&doctor.stdout)?;
+    let component_integrity =
+        report["release"]["runtime_integrity"]["component:astro-parser-wasm@4.0.0"]
+            .as_str()
+            .unwrap_or_default();
+    if !component_integrity.contains("checksum mismatch") {
+        bail!("doctor did not report the tampered Astro component: {report}");
+    }
+    fs::write(&astro_wasm, &original_astro)?;
+
+    let astro_added = astro_root.join("undeclared.wasm");
+    fs::write(&astro_added, b"undeclared")?;
+    verify_packaged_security_failure(
+        executable,
+        &verify_root.join("astro-added.db"),
+        fixture,
+        "added Astro parser runtime",
+    )?;
+    fs::remove_file(astro_added)?;
+
+    let astro_added_directory = astro_root.join("undeclared-empty-directory");
+    fs::create_dir(&astro_added_directory)?;
+    verify_packaged_security_failure(
+        executable,
+        &verify_root.join("astro-added-directory.db"),
+        fixture,
+        "added Astro parser runtime directory",
+    )?;
+    fs::remove_dir(astro_added_directory)?;
+
+    #[cfg(unix)]
+    {
+        let symlink = astro_root.join("astro-link.wasm");
+        std::os::unix::fs::symlink("astro.wasm", &symlink)?;
+        verify_packaged_security_failure(
+            executable,
+            &verify_root.join("astro-symlink.db"),
+            fixture,
+            "symlinked Astro parser runtime",
+        )?;
+        fs::remove_file(symlink)?;
+    }
+
+    let mut manifest: ReleaseManifest = serde_json::from_slice(&original_manifest)?;
+    manifest
+        .runtime_components
+        .iter_mut()
+        .find(|component| component.name == "astro-parser-wasm")
+        .context("release manifest has no Astro parser component")?
+        .version = "9.9.9".to_owned();
+    fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)?;
+    verify_packaged_security_failure(
+        executable,
+        &verify_root.join("astro-version.db"),
+        fixture,
+        "Astro parser runtime version mismatch",
+    )?;
+    fs::write(&manifest_path, &original_manifest)?;
+
+    let web_worker = extracted.join("libexec/depgraph-web-worker.mjs");
+    let original_worker = fs::read(&web_worker)?;
+    fs::remove_file(&web_worker)?;
+    verify_packaged_security_failure(
+        executable,
+        &verify_root.join("web-worker-missing.db"),
+        fixture,
+        "missing Web worker artifact",
+    )?;
+    fs::write(&web_worker, &original_worker)?;
+    let mut tampered_worker = original_worker.clone();
+    tampered_worker.extend_from_slice(b"\n// tampered\n");
+    fs::write(&web_worker, tampered_worker)?;
+    verify_packaged_security_failure(
+        executable,
+        &verify_root.join("web-worker-tampered.db"),
+        fixture,
+        "tampered Web worker artifact",
+    )?;
+    fs::write(&web_worker, &original_worker)?;
+
+    #[cfg(unix)]
+    {
+        let real_worker = extracted.join("libexec/depgraph-web-worker.real.mjs");
+        fs::rename(&web_worker, &real_worker)?;
+        std::os::unix::fs::symlink(
+            real_worker
+                .file_name()
+                .context("real Web worker has no file name")?,
+            &web_worker,
+        )?;
+        verify_packaged_security_failure(
+            executable,
+            &verify_root.join("web-worker-symlink.db"),
+            fixture,
+            "symlinked Web worker artifact",
+        )?;
+        fs::remove_file(&web_worker)?;
+        fs::rename(real_worker, &web_worker)?;
+    }
+
+    fs::write(manifest_path, original_manifest)?;
     Ok(())
 }
 
@@ -4029,8 +4344,59 @@ fn verify_packaged_web_semantic_complete(
 
 fn verify_packaged_web_framework_completeness(
     executable: &Path,
+    verify_root: &Path,
+    fixture: &Path,
+) -> Result<()> {
+    let framework_apps = [
+        ("astro", "astro"),
+        ("next", "next"),
+        ("tanstack-router", "router"),
+        ("tanstack-start", "start"),
+    ];
+    for (framework, selected_app) in framework_apps {
+        let isolated_fixture = verify_root.join(format!("web-framework-{selected_app}"));
+        copy_directory(fixture, &isolated_fixture)?;
+        for (_, app) in framework_apps {
+            if app != selected_app {
+                fs::remove_dir_all(isolated_fixture.join("apps").join(app)).with_context(|| {
+                    format!("failed to isolate the packaged {framework} fixture")
+                })?;
+            }
+        }
+        if matches!(framework, "astro" | "next") {
+            fs::remove_dir_all(isolated_fixture.join("packages")).with_context(|| {
+                format!("failed to isolate the packaged {framework} fixture dependencies")
+            })?;
+        }
+        let store = verify_root.join(format!("web-framework-{selected_app}.db"));
+        verify_packaged_web_framework_profile(executable, &store, &isolated_fixture, &[framework])?;
+    }
+
+    let store = verify_root.join("web-framework-complete.db");
+    verify_packaged_web_framework_profile(
+        executable,
+        &store,
+        fixture,
+        &["astro", "next", "tanstack-router", "tanstack-start"],
+    )?;
+
+    let second_fixture = verify_root.join("web-framework-checkout-two");
+    copy_directory(fixture, &second_fixture)?;
+    let second_store = verify_root.join("web-framework-complete-two.db");
+    verify_packaged_web_framework_profile(
+        executable,
+        &second_store,
+        &second_fixture,
+        &["astro", "next", "tanstack-router", "tanstack-start"],
+    )?;
+    verify_packaged_web_graph_exports_deterministic(executable, &store, &second_store)
+}
+
+fn verify_packaged_web_framework_profile(
+    executable: &Path,
     store: &Path,
     fixture: &Path,
+    expected_frameworks: &[&str],
 ) -> Result<()> {
     let scan = Command::new(executable)
         .arg("--store")
@@ -4050,19 +4416,24 @@ fn verify_packaged_web_framework_completeness(
     let scan: Value = serde_json::from_slice(&scan.stdout)
         .context("packaged Web framework-complete scan returned invalid JSON")?;
     let coverage = &scan["coverage"];
+    let semantic_complete = expected_frameworks
+        .iter()
+        .all(|framework| matches!(*framework, "astro" | "next"));
     if scan["status"] != "completed"
         || coverage["project_code_executed"] != Value::Bool(false)
         || coverage["completeness"].as_array().is_none_or(|levels| {
             !levels.iter().any(|level| level == "syntax-complete")
-                || levels.iter().any(|level| level == "semantic-complete")
+                || levels.iter().any(|level| level == "semantic-complete") != semantic_complete
         })
         || coverage["reasons"].as_array().is_none_or(|reasons| {
-            !reasons
+            reasons
                 .iter()
-                .any(|reason| reason == "unresolved_dependency_sites")
-                || reasons
-                    .iter()
-                    .any(|reason| reason == "framework_semantic_incomplete")
+                .any(|reason| reason == "framework_semantic_incomplete")
+                || (semantic_complete && !reasons.is_empty())
+                || (!semantic_complete
+                    && !reasons
+                        .iter()
+                        .any(|reason| reason == "unresolved_dependency_sites"))
         })
     {
         bail!("packaged Web framework fixture lost its completion gate: {scan}");
@@ -4076,7 +4447,6 @@ fn verify_packaged_web_framework_completeness(
         .as_array()
         .and_then(|profiles| profiles.iter().find(|profile| profile["language"] == "web"))
         .context("packaged Web framework-complete export has no Web profile")?;
-    let expected_frameworks = ["astro", "next", "tanstack-router", "tanstack-start"];
     if profile["features"].as_array().is_none_or(|features| {
         features
             != &expected_frameworks
@@ -4099,7 +4469,7 @@ fn verify_packaged_web_framework_completeness(
     {
         bail!("packaged Web framework fixture lost its complete capability ledger: {profile}");
     }
-    for (entry, framework) in ledger.iter().zip(expected_frameworks) {
+    for (entry, &framework) in ledger.iter().zip(expected_frameworks) {
         let specific = match framework {
             "astro" => "astro-component-render-hydration-v1",
             "next" => "next-route-component-boundary-v1",
@@ -4130,12 +4500,105 @@ fn verify_packaged_web_framework_completeness(
             bail!("packaged Web framework ledger entry is incomplete: {entry}");
         }
     }
-    if !graph["sites"].as_array().is_some_and(|sites| {
-        sites.iter().any(|site| {
-            site["resolution_status"] == "unresolved" && site["reason"] == "function_value_dispatch"
+    if !semantic_complete
+        && !graph["sites"].as_array().is_some_and(|sites| {
+            sites.iter().any(|site| {
+                site["resolution_status"] == "unresolved"
+                    && site["reason"] == "function_value_dispatch"
+            })
         })
-    }) {
+    {
         bail!("packaged Web framework fixture lost its bounded dynamic-call reason");
+    }
+    for &framework in expected_frameworks {
+        verify_packaged_web_framework_query(executable, store, graph, framework)?;
+    }
+    Ok(())
+}
+
+fn verify_packaged_web_framework_query(
+    executable: &Path,
+    store: &Path,
+    graph: &serde_json::Map<String, Value>,
+    framework: &str,
+) -> Result<()> {
+    let evidence = graph["evidence"]
+        .as_array()
+        .context("packaged Web framework graph has no evidence")?;
+    let edge_ids: BTreeSet<_> = evidence
+        .iter()
+        .filter(|item| {
+            item["owner_type"] == "edge"
+                && item["kind"] == "semantic"
+                && item["properties"]["framework"] == framework
+                && item["properties"]["contract_version"] == "framework-semantic-graph-v1"
+        })
+        .filter_map(|item| item["owner_id"].as_str())
+        .collect();
+    let edge = graph["edges"]
+        .as_array()
+        .context("packaged Web framework graph has no edges")?
+        .iter()
+        .find(|edge| {
+            edge["id"].as_str().is_some_and(|id| edge_ids.contains(id))
+                && edge["phase"] == "semantic"
+                && edge["resolution_status"] == "resolved"
+        })
+        .with_context(|| format!("packaged {framework} graph has no exact semantic edge"))?;
+    let edge_id = edge["id"]
+        .as_str()
+        .context("packaged Web framework edge omitted its ID")?;
+    let source_selector = format!(
+        "id:{}",
+        edge["source"]
+            .as_str()
+            .context("packaged Web framework edge omitted its source")?
+    );
+    let target_selector = format!(
+        "id:{}",
+        edge["target"]
+            .as_str()
+            .context("packaged Web framework edge omitted its target")?
+    );
+    let contains_edge = |query: &Value| {
+        query["data"]["steps"].as_array().is_some_and(|steps| {
+            steps.iter().any(|step| {
+                step["edge"]["id"] == edge_id
+                    && step["evidence"].as_array().is_some_and(|items| {
+                        items.iter().any(|item| {
+                            item["kind"] == "semantic"
+                                && item["properties"]["framework"] == framework
+                                && item["properties"]["contract_version"]
+                                    == "framework-semantic-graph-v1"
+                        })
+                    })
+            })
+        })
+    };
+    let deps = packaged_web_query(
+        executable,
+        store,
+        &["deps", &source_selector, "--json"],
+        &format!("query packaged {framework} dependencies"),
+    )?;
+    let dependents = packaged_web_query(
+        executable,
+        store,
+        &["dependents", &target_selector, "--json"],
+        &format!("query packaged {framework} dependents"),
+    )?;
+    let why = packaged_web_query(
+        executable,
+        store,
+        &["why", &source_selector, &target_selector, "--json"],
+        &format!("explain a packaged {framework} dependency"),
+    )?;
+    if !contains_edge(&deps)
+        || !contains_edge(&dependents)
+        || why["data"]["path_found"] != true
+        || !contains_edge(&why)
+    {
+        bail!("packaged Web queries lost the {framework} semantic edge or its evidence");
     }
     Ok(())
 }
@@ -4188,6 +4651,26 @@ fn packaged_web_export_text(executable: &Path, store: &Path, format: &str) -> Re
     }
     String::from_utf8(output.stdout)
         .with_context(|| format!("packaged Web {format} export returned non-UTF-8 output"))
+}
+
+fn verify_packaged_web_graph_exports_deterministic(
+    executable: &Path,
+    first_store: &Path,
+    second_store: &Path,
+) -> Result<()> {
+    let first = packaged_web_export_json(executable, first_store)?;
+    let second = packaged_web_export_json(executable, second_store)?;
+    if first["graph"] != second["graph"] {
+        bail!("packaged Web semantic graph changed across checkout-equivalent roots");
+    }
+    for format in ["dot", "mermaid"] {
+        let first = packaged_web_export_text(executable, first_store, format)?;
+        let second = packaged_web_export_text(executable, second_store, format)?;
+        if first != second {
+            bail!("packaged Web {format} export changed across checkout-equivalent roots");
+        }
+    }
+    Ok(())
 }
 
 fn verify_packaged_web_determinism(
@@ -4350,21 +4833,28 @@ fn verify_release_metadata(extracted: &Path) -> Result<ReleaseManifest> {
             }
         }
     }
-    if !runtime_paths.contains("libexec/astro.wasm") {
-        bail!("release manifest has no required Web runtime artifact libexec/astro.wasm");
+    let astro = components
+        .get("astro-parser-wasm")
+        .context("release manifest has no required Web runtime component astro-parser-wasm")?;
+    if astro.version != "4.0.0"
+        || astro.kind != "data-tree"
+        || astro.root != "libexec/astro"
+        || astro.entrypoint.as_deref() != Some("libexec/astro/astro.wasm")
+    {
+        bail!("Astro parser runtime component does not match 4.0.0 at libexec/astro/astro.wasm");
     }
     let typescript = components.get("typescript-native-compiler").context(
         "release manifest has no required Web runtime component typescript-native-compiler",
     )?;
     let expected_typescript_entrypoint =
         format!("libexec/typescript/lib/{}", executable_name("tsc"));
-    if typescript.version != "7.0.2"
+    if typescript.version != TYPESCRIPT_VERSION
         || typescript.kind != "executable-tree"
         || typescript.root != "libexec/typescript/lib"
         || typescript.entrypoint.as_deref() != Some(expected_typescript_entrypoint.as_str())
     {
         bail!(
-            "TypeScript runtime component does not match 7.0.2 at {expected_typescript_entrypoint}"
+            "TypeScript runtime component does not match {TYPESCRIPT_VERSION} at {expected_typescript_entrypoint}"
         );
     }
     if manifest.runtime_requirements.get("web").map(String::as_str) != Some("Node.js >=24.0.0") {
@@ -4425,6 +4915,18 @@ fn verify_release_metadata(extracted: &Path) -> Result<ReleaseManifest> {
         } else if worker.backend.is_some() {
             bail!(
                 "{} worker unexpectedly declares a Rust backend compatibility unit",
+                worker.adapter
+            );
+        }
+        if worker.adapter == "web" {
+            let semantic = worker
+                .semantic
+                .as_ref()
+                .context("release manifest Web worker has no semantic compatibility unit")?;
+            verify_web_semantic_attestation(semantic)?;
+        } else if worker.semantic.is_some() {
+            bail!(
+                "{} worker unexpectedly declares a Web semantic compatibility unit",
                 worker.adapter
             );
         }
@@ -4544,6 +5046,27 @@ fn verify_release_metadata(extracted: &Path) -> Result<ReleaseManifest> {
         bail!("release SBOM does not declare its package-manager component boundary");
     }
     let license_inventory = fs::read_to_string(extracted.join("THIRD_PARTY_LICENSES.txt"))?;
+    for (name, version, license) in [
+        ("@astrojs/compiler", "4.0.0", "MIT"),
+        ("typescript", TYPESCRIPT_VERSION, "Apache-2.0"),
+    ] {
+        let matches = packages
+            .iter()
+            .filter(|package| package["name"] == name)
+            .collect::<Vec<_>>();
+        if matches.len() != 1
+            || matches[0]["versionInfo"] != version
+            || matches[0]["licenseDeclared"] != license
+        {
+            bail!(
+                "release SBOM must contain exactly one npm:{name} {version} with license {license}"
+            );
+        }
+        let expected = format!("npm:{name} {version} — {license}");
+        if !license_inventory.lines().any(|line| line == expected) {
+            bail!("third-party license inventory is missing {expected}");
+        }
+    }
     for (name, version, license) in RUST_ANALYZER_DIRECT_DEPENDENCIES
         .iter()
         .map(|name| (*name, RUST_ANALYZER_CRATE_VERSION, "MIT OR Apache-2.0"))
@@ -4636,6 +5159,19 @@ fn verify_release_metadata(extracted: &Path) -> Result<ReleaseManifest> {
             .as_ref()
             .context("release manifest Rust worker has no backend compatibility unit")?,
     )?;
+    let web_worker = manifest
+        .workers
+        .iter()
+        .find(|worker| worker.adapter == "web")
+        .context("release manifest has no Web worker")?;
+    verify_packaged_web_handshake(
+        extracted,
+        web_worker,
+        web_worker
+            .semantic
+            .as_ref()
+            .context("release manifest Web worker has no semantic compatibility unit")?,
+    )?;
     Ok(manifest)
 }
 
@@ -4660,6 +5196,35 @@ fn verify_packaged_rust_handshake(
     {
         bail!(
             "packaged Rust worker handshake does not match its release manifest compatibility unit"
+        );
+    }
+    Ok(())
+}
+
+fn verify_packaged_web_handshake(
+    extracted: &Path,
+    worker: &WorkerArtifact,
+    semantic: &WebSemanticAttestation,
+) -> Result<()> {
+    let worker_path = verified_release_path(extracted, &worker.path, "Web worker")?;
+    let output = Command::new("node")
+        .arg(&worker_path)
+        .arg("--version")
+        .output()?;
+    if !output.status.success() || !output.stderr.is_empty() {
+        bail!("packaged Web worker version handshake failed");
+    }
+    let raw = String::from_utf8(output.stdout)?;
+    let handshake = parse_worker_handshake(raw.trim())
+        .context("packaged Web worker returned a malformed version handshake")?;
+    let actual_semantic = web_semantic_from_handshake(&handshake)?;
+    if handshake.name != "depgraph-web-worker"
+        || handshake.version != worker.version
+        || handshake.protocol != "1.0"
+        || &actual_semantic != semantic
+    {
+        bail!(
+            "packaged Web worker handshake does not match its release manifest compatibility unit"
         );
     }
     Ok(())
@@ -4845,8 +5410,21 @@ fn pnpm_program() -> &'static str {
 }
 
 fn verify_release_tag() -> Result<()> {
-    let Some(tag) = std::env::var_os("GITHUB_REF_NAME") else {
+    verify_release_tag_values(
+        std::env::var_os("GITHUB_REF_TYPE").as_deref(),
+        std::env::var_os("GITHUB_REF_NAME").as_deref(),
+    )
+}
+
+fn verify_release_tag_values(
+    ref_type: Option<&std::ffi::OsStr>,
+    tag: Option<&std::ffi::OsStr>,
+) -> Result<()> {
+    if ref_type != Some(std::ffi::OsStr::new("tag")) {
         return Ok(());
+    }
+    let Some(tag) = tag else {
+        bail!("release tag workflow did not expose GITHUB_REF_NAME");
     };
     let tag = tag.to_string_lossy();
     let expected = format!("v{VERSION}");
@@ -4982,10 +5560,13 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        ARCHIVE_MTIME, DependencyPackage, WorkerBackend, archive_entries, cargo_runtime_packages,
-        create_tar_archive, create_zip_archive, extract_archive, normalized_spdx_license,
-        package_url, parse_worker_handshake, rust_backend_from_handshake,
-        verify_rust_analyzer_dependencies, verify_rust_backend, web_runtime_packages,
+        ARCHIVE_MTIME, DependencyPackage, TYPESCRIPT_VERSION, WEB_SEMANTIC_CAPABILITIES,
+        WEB_SEMANTIC_RUNTIME_ARTIFACTS, WEB_SEMANTIC_RUNTIME_COMPONENTS, WebSemanticAttestation,
+        WorkerBackend, archive_entries, cargo_runtime_packages, create_tar_archive,
+        create_zip_archive, extract_archive, normalized_spdx_license, package_url,
+        parse_worker_handshake, rust_backend_from_handshake, verify_release_tag_values,
+        verify_rust_analyzer_dependencies, verify_rust_backend, verify_web_semantic_attestation,
+        web_runtime_packages, web_semantic_from_handshake,
     };
 
     fn release_tree() -> Result<(tempfile::TempDir, String)> {
@@ -5003,6 +5584,23 @@ mod tests {
             fs::set_permissions(&executable, fs::Permissions::from_mode(0o751))?;
         }
         Ok((temp, name))
+    }
+
+    #[test]
+    fn release_tag_gate_ignores_non_tag_github_refs() {
+        use std::ffi::OsStr;
+
+        verify_release_tag_values(Some(OsStr::new("branch")), Some(OsStr::new("97/merge")))
+            .expect("pull-request merge refs are not release tags");
+        assert!(verify_release_tag_values(Some(OsStr::new("tag")), None).is_err());
+        assert!(
+            verify_release_tag_values(Some(OsStr::new("tag")), Some(OsStr::new("v9.9.9"))).is_err()
+        );
+        verify_release_tag_values(
+            Some(OsStr::new("tag")),
+            Some(OsStr::new(concat!("v", env!("CARGO_PKG_VERSION")))),
+        )
+        .expect("the workspace release tag must remain valid");
     }
 
     fn change_source_mtime(path: &std::path::Path) -> Result<()> {
@@ -5048,6 +5646,57 @@ mod tests {
                 "{handshake}"
             );
         }
+    }
+
+    #[test]
+    fn web_worker_handshake_captures_the_release_semantic_compatibility_unit() -> Result<()> {
+        let parsed = parse_worker_handshake(
+            "depgraph-web-worker 0.1.0 (protocol 1.0; typescript 7.0.2; capabilities astro-component-render-hydration-v1,framework-semantic-completeness-v1,framework-semantic-graph-v1,next-route-component-boundary-v1,tanstack-router-typed-route-v1,tanstack-start-rpc-middleware-v1,typescript-definition-import-type-call-graph-v2)",
+        )
+        .expect("valid Web worker handshake");
+        let semantic = web_semantic_from_handshake(&parsed)?;
+        verify_web_semantic_attestation(&semantic)?;
+        assert_eq!(semantic.capabilities.len(), WEB_SEMANTIC_CAPABILITIES.len());
+        assert_eq!(
+            semantic.runtime_components,
+            vec![
+                "astro-parser-wasm@4.0.0",
+                "typescript-native-compiler@7.0.2"
+            ]
+        );
+        assert!(semantic.runtime_artifacts.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn web_worker_handshake_rejects_missing_unknown_or_unsorted_capabilities() {
+        for handshake in [
+            "depgraph-web-worker 0.1.0 (protocol 1.0; typescript 7.0.2)",
+            "depgraph-web-worker 0.1.0 (protocol 1.0; capabilities framework-semantic-graph-v1; typescript 7.0.2)",
+            "depgraph-web-worker 0.1.0 (protocol 1.0; typescript 7.0.2; capabilities framework-semantic-graph-v1)",
+        ] {
+            let parsed = parse_worker_handshake(handshake);
+            assert!(
+                parsed.as_ref().is_none_or(|parsed| {
+                    web_semantic_from_handshake(parsed)
+                        .and_then(|semantic| verify_web_semantic_attestation(&semantic))
+                        .is_err()
+                }),
+                "{handshake}"
+            );
+        }
+    }
+
+    #[test]
+    fn web_semantic_manifest_rejects_unknown_compatibility_fields() {
+        let result = serde_json::from_value::<WebSemanticAttestation>(json!({
+            "typescript_version": TYPESCRIPT_VERSION,
+            "capabilities": WEB_SEMANTIC_CAPABILITIES,
+            "runtime_components": WEB_SEMANTIC_RUNTIME_COMPONENTS,
+            "runtime_artifacts": WEB_SEMANTIC_RUNTIME_ARTIFACTS,
+            "project_typescript": "allowed"
+        }));
+        assert!(result.is_err());
     }
 
     #[test]

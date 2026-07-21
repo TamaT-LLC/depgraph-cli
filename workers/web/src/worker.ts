@@ -5,6 +5,7 @@ import { stableId } from "./ids";
 import {
   frameworkSemanticProfileProperties,
   WEB_FRAMEWORK_SEMANTIC_PROFILE_PROPERTIES,
+  WEB_SEMANTIC_RELEASE_CAPABILITIES,
 } from "./framework-semantic";
 import { scan } from "./scanner";
 import {
@@ -283,7 +284,9 @@ async function main(): Promise<void> {
     return;
   }
   if ("version" in options) {
-    process.stdout.write(`depgraph-web-worker ${ADAPTER_VERSION} (protocol ${PROTOCOL_VERSION}; typescript ${TYPESCRIPT_COMPILER_VERSION})\n`);
+    process.stdout.write(
+      `depgraph-web-worker ${ADAPTER_VERSION} (protocol ${PROTOCOL_VERSION}; typescript ${TYPESCRIPT_COMPILER_VERSION}; capabilities ${WEB_SEMANTIC_RELEASE_CAPABILITIES.join(",")})\n`,
+    );
     return;
   }
   let root: string | null = null;

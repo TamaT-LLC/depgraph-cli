@@ -84,6 +84,20 @@ const TYPESCRIPT_MAX_DISPLAY_NAME_CHARS: usize = 512;
 const TYPESCRIPT_MAX_RESOLVER_IDENTITY_CHARS: usize = 4_096;
 const WEB_RUNTIME_REQUIREMENT: &str = "Node.js >=24.0.0";
 const PROTOCOL_SCHEMA_PATH: &str = "schemas/depgraph-protocol-v1.schema.json";
+const WEB_SEMANTIC_CAPABILITIES: &[&str] = &[
+    "astro-component-render-hydration-v1",
+    "framework-semantic-completeness-v1",
+    "framework-semantic-graph-v1",
+    "next-route-component-boundary-v1",
+    "tanstack-router-typed-route-v1",
+    "tanstack-start-rpc-middleware-v1",
+    "typescript-definition-import-type-call-graph-v2",
+];
+const WEB_SEMANTIC_RUNTIME_COMPONENTS: &[&str] = &[
+    "astro-parser-wasm@4.0.0",
+    "typescript-native-compiler@7.0.2",
+];
+const WEB_SEMANTIC_RUNTIME_ARTIFACTS: &[&str] = &[];
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub enum AdapterKind {
@@ -346,6 +360,8 @@ struct BundledWorker {
     version: String,
     #[serde(default)]
     backend: Option<BundledWorkerBackend>,
+    #[serde(default)]
+    semantic: Option<BundledWebSemanticAttestation>,
     #[serde(flatten)]
     artifact: BundledArtifact,
 }
@@ -357,6 +373,15 @@ struct BundledWorkerBackend {
     version: String,
     revision: String,
     salsa_version: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BundledWebSemanticAttestation {
+    typescript_version: String,
+    capabilities: Vec<String>,
+    runtime_components: Vec<String>,
+    runtime_artifacts: Vec<String>,
 }
 
 fn release_manifest_path(executable_dir: &Path) -> Option<PathBuf> {
@@ -466,9 +491,16 @@ fn locate_verified_bundled_worker_for_executable(
         verify_bundled_runtime_component(&release_root, component)?;
     }
 
-    if !runtime_paths.contains("libexec/astro.wasm") {
+    let astro = runtime_components.get("astro-parser-wasm").context(
+        "security policy violation: release manifest has no required Web runtime component astro-parser-wasm",
+    )?;
+    if astro.version != "4.0.0"
+        || astro.kind != BundledRuntimeComponentKind::DataTree
+        || astro.root != "libexec/astro"
+        || astro.entrypoint.as_deref() != Some("libexec/astro/astro.wasm")
+    {
         bail!(
-            "security policy violation: release manifest has no required Web runtime artifact libexec/astro.wasm"
+            "security policy violation: Astro parser runtime component does not match 4.0.0 at libexec/astro/astro.wasm"
         );
     }
     let typescript = runtime_components
@@ -511,6 +543,14 @@ fn locate_verified_bundled_worker_for_executable(
         if worker.adapter != "rust" && worker.backend.is_some() {
             bail!(
                 "security policy violation: {} worker cannot declare a Rust backend attestation",
+                worker.adapter
+            );
+        }
+        if worker.adapter == "web" {
+            verify_web_worker_manifest(worker)?;
+        } else if worker.semantic.is_some() {
+            bail!(
+                "security policy violation: {} worker cannot declare a Web semantic attestation",
                 worker.adapter
             );
         }
@@ -619,6 +659,49 @@ fn verify_rust_worker_manifest(worker: &BundledWorker) -> Result<()> {
     Ok(())
 }
 
+fn verify_web_worker_manifest(worker: &BundledWorker) -> Result<()> {
+    let semantic = worker
+        .semantic
+        .as_ref()
+        .context("security policy violation: Web worker has no semantic compatibility unit")?;
+    verify_web_semantic_compatibility(
+        &semantic.typescript_version,
+        &semantic.capabilities,
+        &semantic.runtime_components,
+        &semantic.runtime_artifacts,
+    )
+}
+
+pub(crate) fn verify_web_semantic_compatibility(
+    typescript_version: &str,
+    capabilities: &[String],
+    runtime_components: &[String],
+    runtime_artifacts: &[String],
+) -> Result<()> {
+    let expected_capabilities = WEB_SEMANTIC_CAPABILITIES
+        .iter()
+        .map(|value| (*value).to_owned())
+        .collect::<Vec<_>>();
+    let expected_components = WEB_SEMANTIC_RUNTIME_COMPONENTS
+        .iter()
+        .map(|value| (*value).to_owned())
+        .collect::<Vec<_>>();
+    let expected_artifacts = WEB_SEMANTIC_RUNTIME_ARTIFACTS
+        .iter()
+        .map(|value| (*value).to_owned())
+        .collect::<Vec<_>>();
+    if typescript_version != TYPESCRIPT_COMPILER_VERSION
+        || capabilities != expected_capabilities
+        || runtime_components != expected_components
+        || runtime_artifacts != expected_artifacts
+    {
+        bail!(
+            "security policy violation: Web worker semantic attestation does not match the core compatibility unit"
+        );
+    }
+    Ok(())
+}
+
 fn verify_node_version(requirement: &str, version: &str) -> Result<()> {
     let minimum = requirement
         .strip_prefix("Node.js >=")
@@ -692,6 +775,49 @@ pub(crate) fn verify_rust_release_handshake(
         || salsa_version != expected_salsa_version
     {
         bail!("security policy violation: Rust worker backend handshake mismatch");
+    }
+    Ok(())
+}
+
+pub(crate) fn verify_web_release_handshake(
+    handshake: &str,
+    expected_adapter_version: &str,
+    expected_typescript_version: &str,
+    expected_capabilities: &[String],
+) -> Result<()> {
+    let (identity, details) = handshake
+        .split_once(" (protocol ")
+        .context("security policy violation: malformed Web worker handshake")?;
+    let details = details
+        .strip_suffix(')')
+        .context("security policy violation: malformed Web worker handshake")?;
+    let mut identity = identity.split_whitespace();
+    let name = identity.next().unwrap_or_default();
+    let adapter_version = identity.next().unwrap_or_default();
+    if identity.next().is_some()
+        || name != "depgraph-web-worker"
+        || adapter_version != expected_adapter_version
+    {
+        bail!("security policy violation: Web worker adapter handshake mismatch");
+    }
+
+    let mut fields = details.split("; ");
+    let protocol = fields.next().unwrap_or_default();
+    let typescript_version = fields
+        .next()
+        .and_then(|field| field.strip_prefix("typescript "))
+        .unwrap_or_default();
+    let capabilities = fields
+        .next()
+        .and_then(|field| field.strip_prefix("capabilities "))
+        .map(|value| value.split(',').map(str::to_owned).collect::<Vec<_>>())
+        .unwrap_or_default();
+    if fields.next().is_some()
+        || protocol != "1.0"
+        || typescript_version != expected_typescript_version
+        || capabilities != expected_capabilities
+    {
+        bail!("security policy violation: Web worker semantic handshake mismatch");
     }
     Ok(())
 }
@@ -5862,18 +5988,24 @@ mod tests {
 
     fn write_test_release_manifest(
         release: &Path,
-        mut runtime_artifacts: Vec<Value>,
+        runtime_artifacts: Vec<Value>,
         mut runtime_components: Vec<Value>,
     ) -> Result<TestRelease> {
-        if !runtime_artifacts
+        if !runtime_components
             .iter()
-            .any(|artifact| artifact["path"] == "libexec/astro.wasm")
+            .any(|component| component["name"] == "astro-parser-wasm")
         {
-            runtime_artifacts.push(write_manifest_artifact(
-                release,
-                "libexec/astro.wasm",
-                b"verified wasm",
-            )?);
+            let astro = release.join("libexec/astro");
+            std::fs::create_dir_all(&astro)?;
+            std::fs::write(astro.join("astro.wasm"), b"verified wasm")?;
+            runtime_components.push(serde_json::json!({
+                "name": "astro-parser-wasm",
+                "version": "4.0.0",
+                "kind": "data-tree",
+                "root": "libexec/astro",
+                "entrypoint": "libexec/astro/astro.wasm",
+                "sha256": runtime_tree_digest(&astro)?,
+            }));
         }
         if !runtime_components
             .iter()
@@ -5950,6 +6082,12 @@ mod tests {
                     {
                         "adapter": "web",
                         "version": env!("CARGO_PKG_VERSION"),
+                        "semantic": {
+                            "typescript_version": TYPESCRIPT_COMPILER_VERSION,
+                            "capabilities": WEB_SEMANTIC_CAPABILITIES,
+                            "runtime_components": WEB_SEMANTIC_RUNTIME_COMPONENTS,
+                            "runtime_artifacts": WEB_SEMANTIC_RUNTIME_ARTIFACTS,
+                        },
                         "path": web_worker["path"],
                         "sha256": web_worker["sha256"],
                     },
@@ -7833,13 +7971,20 @@ mod tests {
     }
 
     #[test]
-    fn packaged_web_worker_requires_the_declared_runtime_artifact() -> Result<()> {
+    fn packaged_web_worker_requires_the_astro_runtime_component() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let release = temp.path().join("release");
-        let test_release = write_test_release_manifest_exact(&release, Vec::new(), Vec::new())?;
+        let test_release = write_test_release_manifest(&release, Vec::new(), Vec::new())?;
+        update_test_manifest(&test_release.manifest, |manifest| {
+            manifest["runtime_components"]
+                .as_array_mut()
+                .context("test manifest has no runtime components")?
+                .retain(|component| component["name"] != "astro-parser-wasm");
+            Ok(())
+        })?;
         let error =
             locate_verified_bundled_worker(AdapterKind::Rust, &test_release.manifest).unwrap_err();
-        assert!(error.to_string().contains("required Web runtime artifact"));
+        assert!(error.to_string().contains("astro-parser-wasm"));
         assert!(is_security_error(&error.to_string()));
         Ok(())
     }
@@ -7848,12 +7993,74 @@ mod tests {
     fn packaged_web_worker_requires_the_typescript_runtime_component() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let release = temp.path().join("release");
-        let astro = write_manifest_artifact(&release, "libexec/astro.wasm", b"verified wasm")?;
-        let test_release = write_test_release_manifest_exact(&release, vec![astro], Vec::new())?;
+        let test_release = write_test_release_manifest(&release, Vec::new(), Vec::new())?;
+        update_test_manifest(&test_release.manifest, |manifest| {
+            manifest["runtime_components"]
+                .as_array_mut()
+                .context("test manifest has no runtime components")?
+                .retain(|component| component["name"] != "typescript-native-compiler");
+            Ok(())
+        })?;
         let error =
             locate_verified_bundled_worker(AdapterKind::Rust, &test_release.manifest).unwrap_err();
         assert!(error.to_string().contains("typescript-native-compiler"));
         assert!(is_security_error(&error.to_string()));
+        Ok(())
+    }
+
+    #[test]
+    fn packaged_web_worker_requires_the_exact_semantic_attestation() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        for mutation in [
+            "missing",
+            "capability",
+            "component",
+            "artifact",
+            "typescript",
+        ] {
+            let release = temp.path().join(mutation);
+            let test_release = write_test_release_manifest(&release, Vec::new(), Vec::new())?;
+            update_test_manifest(&test_release.manifest, |manifest| {
+                let web = manifest["workers"]
+                    .as_array_mut()
+                    .context("test manifest has no workers array")?
+                    .iter_mut()
+                    .find(|worker| worker["adapter"] == "web")
+                    .context("test manifest has no Web worker")?;
+                match mutation {
+                    "missing" => {
+                        web.as_object_mut()
+                            .context("Web worker is not an object")?
+                            .remove("semantic");
+                    }
+                    "capability" => {
+                        web["semantic"]["capabilities"][0] =
+                            serde_json::json!("unknown-capability-v1")
+                    }
+                    "component" => {
+                        web["semantic"]["runtime_components"][0] =
+                            serde_json::json!("system-typescript")
+                    }
+                    "artifact" => {
+                        web["semantic"]["runtime_artifacts"] =
+                            serde_json::json!(["system-astro.wasm"])
+                    }
+                    "typescript" => {
+                        web["semantic"]["typescript_version"] = serde_json::json!("9.9.9")
+                    }
+                    _ => unreachable!(),
+                }
+                Ok(())
+            })?;
+
+            let error = locate_verified_bundled_worker(AdapterKind::Web, &test_release.manifest)
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("semantic"),
+                "{mutation}: {error:#}"
+            );
+            assert!(is_security_error(&error.to_string()));
+        }
         Ok(())
     }
 
@@ -7931,7 +8138,7 @@ mod tests {
                 "go",
                 format!("libexec/{}", executable_name("depgraph-rust-worker")),
             ),
-            ("web", "libexec/astro.wasm".to_owned()),
+            ("web", "libexec/astro/astro.wasm".to_owned()),
         ] {
             let release = temp.path().join(adapter);
             let test_release = write_test_release_manifest(&release, Vec::new(), Vec::new())?;
@@ -8113,11 +8320,9 @@ mod tests {
         let typescript = release.join("libexec/typescript/lib");
         std::fs::create_dir_all(&typescript)?;
         let worker = release.join("libexec/depgraph-web-worker.mjs");
-        let astro = release.join("libexec/astro.wasm");
         let compiler = typescript.join(executable_name("tsc"));
         let standard_library = typescript.join("lib.d.ts");
         std::fs::write(&worker, b"verified worker")?;
-        std::fs::write(&astro, b"verified wasm")?;
         std::fs::write(&compiler, b"verified compiler")?;
         #[cfg(unix)]
         {
@@ -8128,7 +8333,6 @@ mod tests {
         }
         std::fs::write(&standard_library, b"verified standard library")?;
         let digest = runtime_tree_digest(&typescript)?;
-        let astro_artifact = manifest_artifact("libexec/astro.wasm", b"verified wasm");
         let component = serde_json::json!({
             "name":"typescript-native-compiler",
             "version":"7.0.2",
@@ -8137,8 +8341,7 @@ mod tests {
             "entrypoint":format!("libexec/typescript/lib/{}", executable_name("tsc")),
             "sha256":digest
         });
-        let test_release =
-            write_test_release_manifest(&release, vec![astro_artifact], vec![component])?;
+        let test_release = write_test_release_manifest(&release, Vec::new(), vec![component])?;
         let web_spec = locate_verified_bundled_worker(AdapterKind::Web, &test_release.manifest)?;
         assert!(web_spec.release_attested);
 
@@ -12382,6 +12585,45 @@ mod tests {
         .unwrap_err();
         assert!(error.to_string().contains("backend handshake mismatch"));
         assert!(is_security_error(&error.to_string()));
+        Ok(())
+    }
+
+    #[test]
+    fn web_release_handshake_covers_the_semantic_compatibility_unit() -> Result<()> {
+        let capabilities = WEB_SEMANTIC_CAPABILITIES
+            .iter()
+            .map(|value| (*value).to_owned())
+            .collect::<Vec<_>>();
+        let handshake = format!(
+            "depgraph-web-worker {} (protocol 1.0; typescript {}; capabilities {})",
+            env!("CARGO_PKG_VERSION"),
+            TYPESCRIPT_COMPILER_VERSION,
+            capabilities.join(","),
+        );
+        verify_web_release_handshake(
+            &handshake,
+            env!("CARGO_PKG_VERSION"),
+            TYPESCRIPT_COMPILER_VERSION,
+            &capabilities,
+        )?;
+
+        for mismatch in [
+            handshake.replace(TYPESCRIPT_COMPILER_VERSION, "9.9.9"),
+            handshake.replace("capabilities astro", "unknown astro"),
+            handshake.replace(
+                "astro-component-render-hydration-v1,framework-semantic-completeness-v1",
+                "framework-semantic-completeness-v1,astro-component-render-hydration-v1",
+            ),
+        ] {
+            let error = verify_web_release_handshake(
+                &mismatch,
+                env!("CARGO_PKG_VERSION"),
+                TYPESCRIPT_COMPILER_VERSION,
+                &capabilities,
+            )
+            .unwrap_err();
+            assert!(is_security_error(&error.to_string()));
+        }
         Ok(())
     }
 

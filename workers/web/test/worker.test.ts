@@ -3030,12 +3030,16 @@ test("relocated packaged worker fails closed when its adjacent TypeScript compil
   const fakeCompiler = path.join(projectPlatformRoot, "lib", process.platform === "win32" ? "tsc.exe" : "tsc");
   await Promise.all([
     mkdir(path.dirname(relocatedWorker), { recursive: true }),
+    mkdir(path.join(path.dirname(relocatedWorker), "astro"), { recursive: true }),
     mkdir(path.dirname(fakeCompiler), { recursive: true }),
     mkdir(path.join(root, "node_modules", "typescript"), { recursive: true }),
   ]);
   await Promise.all([
     cp(worker, relocatedWorker),
-    cp(fileURLToPath(new URL("../dist/astro.wasm", import.meta.url)), path.join(path.dirname(relocatedWorker), "astro.wasm")),
+    cp(
+      fileURLToPath(new URL("../dist/astro/astro.wasm", import.meta.url)),
+      path.join(path.dirname(relocatedWorker), "astro", "astro.wasm"),
+    ),
     writeFile(path.join(root, "package.json"), JSON.stringify({ name: "missing-compiler-fixture", version: "1.0.0" })),
     writeFile(path.join(root, "node_modules", "typescript", "package.json"), JSON.stringify({
       name: "typescript",
@@ -3182,6 +3186,9 @@ test("worker reports usage errors on stderr without protocol output", async () =
 
 test("worker exposes the release and protocol handshake", async () => {
   const result = await execute(process.execPath, [worker, "--version"]);
-  assert.equal(result.stdout, "depgraph-web-worker 0.1.0 (protocol 1.0; typescript 7.0.2)\n");
+  assert.equal(
+    result.stdout,
+    "depgraph-web-worker 0.1.0 (protocol 1.0; typescript 7.0.2; capabilities astro-component-render-hydration-v1,framework-semantic-completeness-v1,framework-semantic-graph-v1,next-route-component-boundary-v1,tanstack-router-typed-route-v1,tanstack-start-rpc-middleware-v1,typescript-definition-import-type-call-graph-v2)\n",
+  );
   assert.equal(result.stderr, "");
 });

@@ -35,7 +35,7 @@ const bundle = await build({
     name: "astro-compiler-wasm-location",
     setup(context) {
       context.onLoad({ filter: /@astrojs[+\\/]compiler.*[\\/]dist[\\/]node[\\/]sync\.js$/ }, async ({ path }) => ({
-        contents: (await readFile(path, "utf8")).replaceAll("../astro.wasm", "./astro.wasm"),
+        contents: (await readFile(path, "utf8")).replaceAll("../astro.wasm", "./astro/astro.wasm"),
         loader: "js",
       }));
     },
@@ -47,9 +47,10 @@ const astroMetadata = JSON.parse(await readFile(astroManifest, "utf8"));
 if (astroMetadata.name !== "@astrojs/compiler" || astroMetadata.version !== "4.0.0") {
   throw new Error(`expected @astrojs/compiler@4.0.0, received ${astroMetadata.name ?? "unknown"}@${astroMetadata.version ?? "unknown"}`);
 }
+await mkdir(new URL("../dist/astro", import.meta.url), { recursive: true });
 await copyFile(
   fileURLToPath(import.meta.resolve("@astrojs/compiler/astro.wasm")),
-  new URL("../dist/astro.wasm", import.meta.url),
+  new URL("../dist/astro/astro.wasm", import.meta.url),
 );
 
 // TypeScript 7 ships its parser/typechecker as a platform package. Resolve it
