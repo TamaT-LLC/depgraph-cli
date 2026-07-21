@@ -592,7 +592,10 @@ fn package() -> Result<()> {
 
 fn worker_artifact(adapter: &'static str, path: &Path, staging: &Path) -> Result<WorkerArtifact> {
     let output = if adapter == "web" {
-        Command::new("node").arg(path).arg("--version").output()?
+        Command::new("node")
+            .arg(process_argument_path(path))
+            .arg("--version")
+            .output()?
     } else {
         Command::new(path).arg("--version").output()?
     };
@@ -1926,6 +1929,49 @@ fn executable_name_for_target(name: &str, target: &str) -> String {
         format!("{name}.exe")
     } else {
         name.to_owned()
+    }
+}
+
+// Windows canonicalization returns a verbatim path (`\\\\?\\...`). Node.js
+// cannot use that form as its entry-script argument, even though it is the
+// correct form for the integrity and confinement checks above. Normalize only
+// the argument passed to the external runtime.
+#[cfg(windows)]
+fn process_argument_path(path: &Path) -> std::ffi::OsString {
+    use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
+
+    let wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    std::ffi::OsString::from_wide(&without_windows_verbatim_prefix(&wide))
+}
+
+#[cfg(not(windows))]
+fn process_argument_path(path: &Path) -> std::ffi::OsString {
+    path.as_os_str().to_owned()
+}
+
+#[cfg(any(windows, test))]
+fn without_windows_verbatim_prefix(path: &[u16]) -> Vec<u16> {
+    const VERBATIM: &[u16] = &[b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16];
+    const VERBATIM_UNC: &[u16] = &[
+        b'\\' as u16,
+        b'\\' as u16,
+        b'?' as u16,
+        b'\\' as u16,
+        b'U' as u16,
+        b'N' as u16,
+        b'C' as u16,
+        b'\\' as u16,
+    ];
+
+    if let Some(rest) = path.strip_prefix(VERBATIM_UNC) {
+        [b'\\' as u16, b'\\' as u16]
+            .into_iter()
+            .chain(rest.iter().copied())
+            .collect()
+    } else if let Some(rest) = path.strip_prefix(VERBATIM) {
+        rest.to_vec()
+    } else {
+        path.to_vec()
     }
 }
 
@@ -5903,11 +5949,16 @@ fn verify_packaged_web_handshake(
 ) -> Result<()> {
     let worker_path = verified_release_path(extracted, &worker.path, "Web worker")?;
     let output = Command::new("node")
-        .arg(&worker_path)
+        .arg(process_argument_path(&worker_path))
         .arg("--version")
         .output()?;
     if !output.status.success() || !output.stderr.is_empty() {
-        bail!("packaged Web worker version handshake failed");
+        bail!(
+            "packaged Web worker version handshake failed (status {}; stdout {:?}; stderr {:?})",
+            output.status,
+            String::from_utf8_lossy(&output.stdout).trim(),
+            String::from_utf8_lossy(&output.stderr).trim(),
+        );
     }
     let raw = String::from_utf8(output.stdout)?;
     let handshake = parse_worker_handshake(raw.trim())
@@ -6262,7 +6313,8 @@ mod tests {
         normalized_spdx_license, package_url, parse_worker_handshake, rust_backend_from_handshake,
         verify_checksum_sidecar, verify_project_metadata, verify_release_tag_values,
         verify_rust_analyzer_dependencies, verify_rust_backend, verify_web_semantic_attestation,
-        web_runtime_packages, web_semantic_from_handshake, workspace_root,
+        web_runtime_packages, web_semantic_from_handshake, without_windows_verbatim_prefix,
+        workspace_root,
     };
 
     fn release_tree() -> Result<(tempfile::TempDir, String)> {
@@ -6310,6 +6362,31 @@ mod tests {
         assert_eq!(
             executable_name_for_target("depgraph", "aarch64-apple-darwin"),
             "depgraph"
+        );
+    }
+
+    #[test]
+    fn normalizes_windows_verbatim_paths_for_packaged_external_runtimes() {
+        let wide = |value: &str| value.encode_utf16().collect::<Vec<_>>();
+        let text = |value: Vec<u16>| String::from_utf16(&value).unwrap();
+
+        assert_eq!(
+            text(without_windows_verbatim_prefix(&wide(
+                r"\\?\C:\release\libexec\worker.mjs"
+            ))),
+            r"C:\release\libexec\worker.mjs"
+        );
+        assert_eq!(
+            text(without_windows_verbatim_prefix(&wide(
+                r"\\?\UNC\server\share\worker.mjs"
+            ))),
+            r"\\server\share\worker.mjs"
+        );
+        assert_eq!(
+            text(without_windows_verbatim_prefix(&wide(
+                r"C:\release\libexec\worker.mjs"
+            ))),
+            r"C:\release\libexec\worker.mjs"
         );
     }
 
