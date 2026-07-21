@@ -284,8 +284,15 @@ jobs:
               + $graph.coverage.external + $graph.coverage.unresolved
             )
             and ($graph.coverage.completeness | index("semantic-complete") | not)
-            and ($graph.profiles | any((.features | length) > 0))
-            and ($graph.coverage.reasons | index("framework_semantic_capability_pending"))
+            and ($graph.profiles | any(
+              (.features | length) > 0
+              and .properties.web_framework_completeness_capability == "framework-semantic-completeness-v1"
+              and .properties.web_framework_completeness_status == "incomplete"
+              and ((.properties.web_framework_completeness_ledger | fromjson) as $ledger
+                | ($ledger | length) == (.features | length)
+                and ($ledger | all(.status == "incomplete" and (.reasons | length) > 0)))
+            ))
+            and ($graph.coverage.reasons | index("framework_semantic_incomplete"))
           ' "$tmp/one.json"
           jq -e '.graph as $graph
             | [$graph.sites[] as $site
@@ -798,8 +805,14 @@ jobs:
           $completed = ($events | Where-Object event -eq 'scan_completed' | Select-Object -Last 1).coverage
           if ($completed.completeness -contains 'semantic-complete') { throw 'Import/type/call slice claimed semantic completeness' }
           $frameworkReasons = @($completed.reasons)
-          if ($profile.features.Count -eq 0 -or $frameworkReasons -notcontains 'framework_semantic_capability_pending') {
-            throw 'Framework fixture lost its semantic-completeness blocker'
+          $frameworkLedger = @($profile.properties.web_framework_completeness_ledger | ConvertFrom-Json)
+          if ($profile.features.Count -eq 0 -or
+              $profile.properties.web_framework_completeness_capability -ne 'framework-semantic-completeness-v1' -or
+              $profile.properties.web_framework_completeness_status -ne 'incomplete' -or
+              $frameworkLedger.Count -ne $profile.features.Count -or
+              @($frameworkLedger | Where-Object { $_.status -ne 'incomplete' -or @($_.reasons).Count -eq 0 }).Count -ne 0 -or
+              $frameworkReasons -notcontains 'framework_semantic_incomplete') {
+            throw 'Framework fixture lost its bounded completeness ledger'
           }
           $semanticCompleteLines = node workers\web\dist\worker.mjs --root workers\web\test\fixtures\semantic-complete --scan-id windows-web-semantic-complete
           if ($LASTEXITCODE -ne 0) { throw "Pure TypeScript worker scan failed with exit $LASTEXITCODE" }
@@ -818,6 +831,25 @@ jobs:
               $semanticCompleteStatuses -notcontains 'candidates' -or
               $semanticCompleteStatuses -notcontains 'external') {
             throw 'Pure TypeScript fixture did not satisfy the semantic-complete contract'
+          }
+          $frameworkCompleteLines = node workers\web\dist\worker.mjs --root workers\web\test\fixtures\framework-complete --scan-id windows-web-framework-complete
+          if ($LASTEXITCODE -ne 0) { throw "Framework-complete worker scan failed with exit $LASTEXITCODE" }
+          $frameworkCompleteEvents = @($frameworkCompleteLines | ForEach-Object { $_ | ConvertFrom-Json })
+          $frameworkCompleteProfile = ($frameworkCompleteEvents | Where-Object event -eq 'profile_declared' | Select-Object -First 1).profile
+          $frameworkCompleteCoverage = ($frameworkCompleteEvents | Where-Object event -eq 'scan_completed' | Select-Object -Last 1).coverage
+          $frameworkCompleteLedger = @($frameworkCompleteProfile.properties.web_framework_completeness_ledger | ConvertFrom-Json)
+          $dynamicFrameworkSites = @($frameworkCompleteEvents | Where-Object {
+            $_.event -eq 'dependency_site' -and $_.site.resolution_status -eq 'unresolved' -and $_.site.reason -eq 'function_value_dispatch'
+          })
+          if (($frameworkCompleteProfile.features -join ',') -ne 'astro,next,tanstack-router,tanstack-start' -or
+              $frameworkCompleteProfile.properties.web_framework_completeness_status -ne 'complete' -or
+              $frameworkCompleteProfile.properties.web_framework_completeness_issue_count -ne '0' -or
+              $frameworkCompleteLedger.Count -ne 4 -or
+              @($frameworkCompleteLedger | Where-Object { $_.status -ne 'complete' -or @($_.reasons).Count -ne 0 }).Count -ne 0 -or
+              $frameworkCompleteCoverage.completeness -contains 'semantic-complete' -or
+              @($frameworkCompleteCoverage.reasons) -contains 'framework_semantic_incomplete' -or
+              $dynamicFrameworkSites.Count -eq 0) {
+            throw 'Mixed framework fixture lost its complete ledger or dynamic-boundary gate'
           }
           if (Test-Path workers\web\test\fixtures\polyglot\apps\next-app\NEXT_CONFIG_EXECUTED) { throw 'Next config executed' }
           if (Test-Path workers\web\test\fixtures\polyglot\apps\astro-app\ASTRO_CONFIG_EXECUTED) { throw 'Astro config executed' }

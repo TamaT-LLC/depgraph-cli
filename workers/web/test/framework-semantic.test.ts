@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  buildFrameworkCompleteness,
   mergeFrameworkSemanticDelta,
   WEB_FRAMEWORK_SEMANTIC_CAPABILITY,
   WEB_FRAMEWORK_SEMANTIC_PROFILE_PROPERTIES,
@@ -101,7 +102,44 @@ test("framework semantic capability is versioned and starts without an emitted d
     web_framework_semantic_node_count: "0",
     web_framework_semantic_site_count: "0",
     web_framework_semantic_edge_count: "0",
+    web_framework_completeness_capability: "framework-semantic-completeness-v1",
+    web_framework_completeness_status: "not-detected",
+    web_framework_completeness_issue_count: "0",
+    web_framework_completeness_ledger: "[]",
   });
+});
+
+test("framework completeness requires only detected slices and preserves partial failures", () => {
+  assert.deepEqual(buildFrameworkCompleteness([], new Set(), new Map(), true), {
+    completionStatus: "not-detected",
+    completionIssueCount: 0,
+    completionLedger: [],
+  });
+
+  const mixed = buildFrameworkCompleteness(
+    ["next", "astro"],
+    new Set(["astro", "next"]),
+    new Map([["next", new Set(["unresolved:next_dynamic_non_literal_import"])]]),
+    true,
+  );
+  assert.equal(mixed.completionStatus, "incomplete");
+  assert.equal(mixed.completionIssueCount, 1);
+  assert.deepEqual(mixed.completionLedger.map((entry) => [entry.framework, entry.status]), [
+    ["astro", "complete"],
+    ["next", "incomplete"],
+  ]);
+  assert.deepEqual(mixed.completionLedger[0]?.reasons, []);
+  assert.deepEqual(mixed.completionLedger[1]?.reasons, ["unresolved:next_dynamic_non_literal_import"]);
+
+  const missingPrerequisite = buildFrameworkCompleteness(
+    ["next"],
+    new Set(["next"]),
+    new Map(),
+    false,
+  );
+  assert.deepEqual(missingPrerequisite.completionLedger[0]?.reasons, [
+    "typescript_semantic_prerequisite_incomplete",
+  ]);
 });
 
 test("validated framework semantic delta is merged into cloned syntax maps", () => {

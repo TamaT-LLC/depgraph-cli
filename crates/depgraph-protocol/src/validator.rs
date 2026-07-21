@@ -2648,12 +2648,7 @@ fn validate_web_semantic_completeness(
     profile: &Profile,
     coverage: &crate::Coverage,
 ) -> Result<(), ProtocolError> {
-    if !profile.features.is_empty() {
-        return invariant(format!(
-            "Web semantic-complete profile {} requires no detected framework features, found {:?}",
-            profile.id, profile.features
-        ));
-    }
+    validate_web_framework_semantic_completeness(profile)?;
     if !coverage
         .completeness
         .contains(&CompletenessLevel::SyntaxComplete)
@@ -2751,6 +2746,176 @@ fn validate_web_semantic_completeness(
     ) {
         return invariant(format!(
             "Web semantic-complete profile {} requires a matching TypeScript release gate and standard-library integrity, found gate={release_gate:?}, integrity={standard_library_integrity:?}",
+            profile.id
+        ));
+    }
+    Ok(())
+}
+
+fn validate_web_framework_semantic_completeness(profile: &Profile) -> Result<(), ProtocolError> {
+    let tracked = [
+        "web_framework_completeness_capability",
+        "web_framework_completeness_status",
+        "web_framework_completeness_issue_count",
+        "web_framework_completeness_ledger",
+    ];
+    let present = tracked
+        .iter()
+        .filter(|property| profile.properties.contains_key(**property))
+        .count();
+    if present == 0 {
+        if profile.features.is_empty() {
+            return Ok(());
+        }
+        return invariant(format!(
+            "Web semantic-complete framework profile {} omitted its framework completeness ledger",
+            profile.id
+        ));
+    }
+    if present != tracked.len() {
+        return invariant(format!(
+            "Web semantic-complete profile {} has a partial framework completeness declaration",
+            profile.id
+        ));
+    }
+    if profile
+        .properties
+        .get("web_framework_completeness_capability")
+        .and_then(Value::as_str)
+        != Some("framework-semantic-completeness-v1")
+    {
+        return invariant(format!(
+            "Web semantic-complete profile {} has an unsupported framework completeness capability",
+            profile.id
+        ));
+    }
+    let status = profile
+        .properties
+        .get("web_framework_completeness_status")
+        .and_then(Value::as_str);
+    let issue_count = profile
+        .properties
+        .get("web_framework_completeness_issue_count")
+        .and_then(Value::as_str)
+        .and_then(|value| value.parse::<usize>().ok());
+    let ledger = profile
+        .properties
+        .get("web_framework_completeness_ledger")
+        .and_then(Value::as_str)
+        .and_then(|value| serde_json::from_str::<Vec<Value>>(value).ok())
+        .ok_or_else(|| {
+            ProtocolError::Invariant(format!(
+                "Web semantic-complete profile {} has an invalid framework completeness ledger",
+                profile.id
+            ))
+        })?;
+    if profile.features.is_empty() {
+        if status != Some("not-detected") || issue_count != Some(0) || !ledger.is_empty() {
+            return invariant(format!(
+                "Web semantic-complete profile {} without framework features must report an empty not-detected ledger",
+                profile.id
+            ));
+        }
+        return Ok(());
+    }
+    if status != Some("complete") || issue_count != Some(0) {
+        return invariant(format!(
+            "Web semantic-complete framework profile {} must report complete with zero issues",
+            profile.id
+        ));
+    }
+    let expected_frameworks = profile.features.iter().cloned().collect::<BTreeSet<_>>();
+    if expected_frameworks.len() != profile.features.len()
+        || ledger.len() != expected_frameworks.len()
+    {
+        return invariant(format!(
+            "Web semantic-complete profile {} framework features and ledger cardinality disagree",
+            profile.id
+        ));
+    }
+    let mut observed_frameworks = BTreeSet::new();
+    let mut previous = None::<String>;
+    for entry in ledger {
+        let object = entry.as_object().ok_or_else(|| {
+            ProtocolError::Invariant(format!(
+                "Web semantic-complete profile {} has a non-object framework ledger entry",
+                profile.id
+            ))
+        })?;
+        let framework = object
+            .get("framework")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                ProtocolError::Invariant(format!(
+                    "Web semantic-complete profile {} has a framework ledger entry without a name",
+                    profile.id
+                ))
+            })?;
+        if previous.as_deref().is_some_and(|value| value >= framework) {
+            return invariant(format!(
+                "Web semantic-complete profile {} framework ledger is not strictly sorted",
+                profile.id
+            ));
+        }
+        previous = Some(framework.to_owned());
+        if object.get("status").and_then(Value::as_str) != Some("complete")
+            || object
+                .get("reasons")
+                .and_then(Value::as_array)
+                .is_none_or(|reasons| !reasons.is_empty())
+        {
+            return invariant(format!(
+                "Web semantic-complete profile {} has an incomplete framework ledger entry for {framework}",
+                profile.id
+            ));
+        }
+        let capabilities = |field: &str| {
+            object
+                .get(field)
+                .and_then(Value::as_array)
+                .and_then(|values| values.iter().map(Value::as_str).collect::<Option<Vec<_>>>())
+        };
+        let required = capabilities("required_capabilities");
+        let emitted = capabilities("emitted_capabilities");
+        let framework_capability = match framework {
+            "next" => "next-route-component-boundary-v1",
+            "astro" => "astro-component-render-hydration-v1",
+            "tanstack-router" => "tanstack-router-typed-route-v1",
+            "tanstack-start" => "tanstack-start-rpc-middleware-v1",
+            _ => {
+                return invariant(format!(
+                    "Web semantic-complete profile {} named unsupported framework {framework}",
+                    profile.id
+                ));
+            }
+        };
+        let expected_capabilities = BTreeSet::from([
+            "framework-semantic-graph-v1",
+            framework_capability,
+            "typescript-definition-import-type-call-graph-v2",
+        ]);
+        let required_set = required
+            .as_ref()
+            .map(|values| values.iter().copied().collect::<BTreeSet<_>>());
+        if required != emitted
+            || required_set.as_ref() != Some(&expected_capabilities)
+            || required_set
+                .as_ref()
+                .is_none_or(|values| values.len() != required.as_ref().map_or(0, Vec::len))
+            || required
+                .as_ref()
+                .is_none_or(|values| !values.windows(2).all(|pair| pair[0] < pair[1]))
+        {
+            return invariant(format!(
+                "Web semantic-complete profile {} did not emit every required capability for {framework}",
+                profile.id
+            ));
+        }
+        observed_frameworks.insert(framework.to_owned());
+    }
+    if observed_frameworks != expected_frameworks {
+        return invariant(format!(
+            "Web semantic-complete profile {} framework features and ledger names disagree",
             profile.id
         ));
     }

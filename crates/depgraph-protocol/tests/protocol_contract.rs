@@ -442,12 +442,56 @@ fn web_semantic_completeness_accepts_candidate_and_external_sites() {
 }
 
 #[test]
-fn web_semantic_completeness_requires_pure_profile_and_zero_coverage_gaps() {
+fn web_semantic_completeness_requires_framework_ledger_and_zero_coverage_gaps() {
     let mut framework = web_semantic_complete_values();
     framework[1]["profile"]["features"] = json!(["next"]);
     let error = validate_ndjson(Cursor::new(values_to_ndjson(framework))).unwrap_err();
     assert!(
-        matches!(error, ProtocolError::Invariant(message) if message.contains("detected framework features"))
+        matches!(error, ProtocolError::Invariant(message) if message.contains("omitted its framework completeness ledger"))
+    );
+
+    let mut complete_framework = web_semantic_complete_values();
+    promote_web_framework_semantic_complete(&mut complete_framework, "next");
+    validate_ndjson(Cursor::new(values_to_ndjson(complete_framework)))
+        .expect("a framework profile with a complete capability ledger may be semantic-complete");
+
+    for (property, replacement) in [
+        ("web_framework_completeness_status", json!("incomplete")),
+        ("web_framework_completeness_issue_count", json!("1")),
+    ] {
+        let mut events = web_semantic_complete_values();
+        promote_web_framework_semantic_complete(&mut events, "next");
+        events[1]["profile"]["properties"][property] = replacement;
+        let error = validate_ndjson(Cursor::new(values_to_ndjson(events))).unwrap_err();
+        assert!(
+            matches!(error, ProtocolError::Invariant(message) if message.contains("complete with zero issues")),
+            "Web semantic completeness accepted invalid {property}"
+        );
+    }
+
+    let mut unsorted = web_semantic_complete_values();
+    promote_web_framework_semantic_complete(&mut unsorted, "next");
+    unsorted[1]["profile"]["properties"]["web_framework_completeness_ledger"] = json!(
+        json!([{
+            "framework": "next",
+            "required_capabilities": [
+                "typescript-definition-import-type-call-graph-v2",
+                "next-route-component-boundary-v1",
+                "framework-semantic-graph-v1"
+            ],
+            "emitted_capabilities": [
+                "typescript-definition-import-type-call-graph-v2",
+                "next-route-component-boundary-v1",
+                "framework-semantic-graph-v1"
+            ],
+            "status": "complete",
+            "reasons": []
+        }])
+        .to_string()
+    );
+    let error = validate_ndjson(Cursor::new(values_to_ndjson(unsorted))).unwrap_err();
+    assert!(
+        matches!(error, ProtocolError::Invariant(message) if message.contains("did not emit every required capability"))
     );
 
     for (field, value) in [
@@ -925,6 +969,36 @@ fn web_semantic_complete_values() -> Vec<Value> {
             json!(["syntax-complete", "semantic-complete"]);
     }
     events
+}
+
+fn promote_web_framework_semantic_complete(events: &mut [Value], framework: &str) {
+    let framework_capability = match framework {
+        "next" => "next-route-component-boundary-v1",
+        "astro" => "astro-component-render-hydration-v1",
+        "tanstack-router" => "tanstack-router-typed-route-v1",
+        "tanstack-start" => "tanstack-start-rpc-middleware-v1",
+        _ => panic!("unsupported framework test fixture: {framework}"),
+    };
+    let required_capabilities = json!([
+        "framework-semantic-graph-v1",
+        framework_capability,
+        "typescript-definition-import-type-call-graph-v2"
+    ]);
+    events[1]["profile"]["features"] = json!([framework]);
+    events[1]["profile"]["properties"]["web_framework_completeness_capability"] =
+        json!("framework-semantic-completeness-v1");
+    events[1]["profile"]["properties"]["web_framework_completeness_status"] = json!("complete");
+    events[1]["profile"]["properties"]["web_framework_completeness_issue_count"] = json!("0");
+    events[1]["profile"]["properties"]["web_framework_completeness_ledger"] = json!(
+        json!([{
+            "framework": framework,
+            "required_capabilities": required_capabilities,
+            "emitted_capabilities": required_capabilities,
+            "status": "complete",
+            "reasons": []
+        }])
+        .to_string()
+    );
 }
 
 fn values_to_ndjson(values: Vec<Value>) -> String {

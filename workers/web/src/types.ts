@@ -243,6 +243,17 @@ export interface FrameworkSemanticSummary {
   edges: number;
   emittedFrameworks: string[];
   pendingFrameworks: string[];
+  completionStatus: "not-detected" | "complete" | "incomplete";
+  completionIssueCount: number;
+  completionLedger: FrameworkCompletenessEntry[];
+}
+
+export interface FrameworkCompletenessEntry {
+  framework: string;
+  required_capabilities: string[];
+  emitted_capabilities: string[];
+  status: "complete" | "incomplete";
+  reasons: string[];
 }
 
 export interface TypeScriptProjectSummary {

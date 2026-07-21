@@ -9,6 +9,7 @@ import { test } from "node:test";
 
 const execute = promisify(execFile);
 const fixture = fileURLToPath(new URL("./fixtures/polyglot", import.meta.url));
+const frameworkCompleteFixture = fileURLToPath(new URL("./fixtures/framework-complete", import.meta.url));
 const managerFixtures = fileURLToPath(new URL("./fixtures/managers", import.meta.url));
 const worker = fileURLToPath(new URL("../dist/worker.mjs", import.meta.url));
 
@@ -65,6 +66,8 @@ test("worker emits deterministic protocol graph without executing project code",
       "web_framework_semantic_capability",
       "web_framework_semantic_status",
       "web_framework_semantic_extractor_version",
+      "web_framework_completeness_capability",
+      "web_framework_completeness_status",
       "project_code_executed",
     ].map((key) => [key, profile?.properties[key]])),
     {
@@ -87,6 +90,8 @@ test("worker emits deterministic protocol graph without executing project code",
       web_framework_semantic_capability: "framework-semantic-graph-v1",
       web_framework_semantic_status: "emitted",
       web_framework_semantic_extractor_version: "0.1.0",
+      web_framework_completeness_capability: "framework-semantic-completeness-v1",
+      web_framework_completeness_status: "incomplete",
       project_code_executed: "false",
     },
   );
@@ -613,7 +618,19 @@ test("worker emits deterministic protocol graph without executing project code",
   )));
   assert.ok(!diagnostics.some((diagnostic) => diagnostic.code === "web.tanstack_start_semantic_delta_discarded"));
   assert.ok(!completed.completeness.includes("semantic-complete"));
-  assert.ok(completed.reasons.includes("framework_semantic_capability_pending"));
+  assert.ok(completed.reasons.includes("framework_semantic_incomplete"));
+  assert.equal(profile?.properties.web_framework_completeness_status, "incomplete");
+  const frameworkLedger = JSON.parse(profile?.properties.web_framework_completeness_ledger ?? "null");
+  assert.deepEqual(frameworkLedger.map((entry: Record<string, any>) => entry.framework), [
+    "astro", "next", "tanstack-router", "tanstack-start",
+  ]);
+  assert.equal(Number(profile?.properties.web_framework_completeness_issue_count), frameworkLedger
+    .reduce((sum: number, entry: Record<string, any>) => sum + entry.reasons.length, 0));
+  assert.ok(frameworkLedger.every((entry: Record<string, any>) => entry.status === "incomplete"));
+  assert.ok(frameworkLedger.find((entry: Record<string, any>) => entry.framework === "next")
+    ?.reasons.includes("unresolved:next_dynamic_non_literal_import"));
+  assert.ok(frameworkLedger.find((entry: Record<string, any>) => entry.framework === "tanstack-start")
+    ?.reasons.includes("diagnostic:web.tanstack_start_build_rpc_id_unobserved"));
   assert.equal(completed.dependency_sites, sites.length);
   assert.equal(completed.dependency_sites, completed.resolved + completed.candidates + completed.external + completed.unresolved);
   assert.ok(completedFiles.length > 0);
@@ -629,6 +646,78 @@ test("worker emits deterministic protocol graph without executing project code",
   });
   assert.deepEqual(normalize(first.events), normalize(second.events));
   for (const marker of markers) await assert.rejects(import("node:fs/promises").then(({ stat }) => stat(marker)));
+});
+
+test("framework completeness ledger covers each framework and mixed profiles deterministically", async (context) => {
+  const frameworkCapability = new Map([
+    ["astro", "astro-component-render-hydration-v1"],
+    ["next", "next-route-component-boundary-v1"],
+    ["tanstack-router", "tanstack-router-typed-route-v1"],
+    ["tanstack-start", "tanstack-start-rpc-middleware-v1"],
+  ]);
+  const verify = async (result: Awaited<ReturnType<typeof run>>, expectedFrameworks: string[]) => {
+    const profile = result.events.find((event) => event.event === "profile_declared")?.profile;
+    const completed = result.events.at(-1)?.coverage;
+    const ledger = JSON.parse(profile?.properties.web_framework_completeness_ledger ?? "null");
+    assert.deepEqual(profile?.features, expectedFrameworks);
+    assert.equal(profile?.properties.web_framework_completeness_capability, "framework-semantic-completeness-v1");
+    assert.equal(profile?.properties.web_framework_completeness_status, "complete");
+    assert.equal(profile?.properties.web_framework_completeness_issue_count, "0");
+    assert.deepEqual(ledger.map((entry: Record<string, any>) => entry.framework), expectedFrameworks);
+    for (const entry of ledger) {
+      assert.equal(entry.status, "complete");
+      assert.deepEqual(entry.reasons, []);
+      assert.deepEqual(entry.emitted_capabilities, entry.required_capabilities);
+      assert.deepEqual(new Set(entry.required_capabilities), new Set([
+        "framework-semantic-graph-v1",
+        frameworkCapability.get(entry.framework),
+        "typescript-definition-import-type-call-graph-v2",
+      ]));
+    }
+    assert.ok(!completed.reasons.includes("framework_semantic_incomplete"));
+    return { profile, completed };
+  };
+
+  for (const framework of ["astro", "next", "tanstack-router", "tanstack-start"]) {
+    const parent = await mkdtemp(path.join(os.tmpdir(), `depgraph-web-${framework}-complete-`));
+    context.after(async () => rm(parent, { recursive: true, force: true }));
+    const root = path.join(parent, "fixture");
+    await cp(frameworkCompleteFixture, root, { recursive: true });
+    for (const other of ["astro", "next", "router", "start"]) {
+      const selected = framework === "tanstack-router" ? "router"
+        : framework === "tanstack-start" ? "start"
+          : framework;
+      if (other !== selected) await rm(path.join(root, "apps", other), { recursive: true, force: true });
+    }
+    if (framework === "astro" || framework === "next") {
+      await rm(path.join(root, "packages"), { recursive: true, force: true });
+    }
+    const result = await run(`${framework}-complete`, root);
+    const { completed } = await verify(result, [framework]);
+    if (framework === "astro" || framework === "next") {
+      assert.deepEqual(completed.completeness, ["syntax-complete", "semantic-complete"]);
+    } else {
+      assert.ok(!completed.completeness.includes("semantic-complete"));
+      assert.ok(completed.reasons.includes("unresolved_dependency_sites"));
+      assert.ok(result.events.some((event) => (
+        event.event === "dependency_site"
+        && event.site.resolution_status === "unresolved"
+        && event.site.reason === "function_value_dispatch"
+      )));
+    }
+  }
+
+  const first = await run("framework-mixed-one", frameworkCompleteFixture);
+  const second = await run("framework-mixed-two", frameworkCompleteFixture);
+  await verify(first, ["astro", "next", "tanstack-router", "tanstack-start"]);
+  const normalize = (events: Array<Record<string, any>>) => events.map(({ scan_id: _scanId, ...event }) => {
+    if (event.event === "scan_started") {
+      const { root: _root, ...portable } = event;
+      return portable;
+    }
+    return event;
+  });
+  assert.deepEqual(normalize(first.events), normalize(second.events));
 });
 
 test("TanStack Start version ranges are classified without crossing the v1 boundary", async (context) => {
@@ -667,6 +756,8 @@ test("TanStack Start version ranges are classified without crossing the v1 bound
   }
   for (const [index, range] of ["2.0.0", "1.0.0 - 2.0.0", "^1 || ^2"].entries()) {
     const result = await scanRange(range, index + 10);
+    const profile = result.events.find((event) => event.event === "profile_declared")?.profile;
+    const ledger = JSON.parse(profile?.properties.web_framework_completeness_ledger ?? "null");
     const nodes = result.events.filter((event) => event.event === "node_upsert").map((event) => event.node);
     const diagnostics = result.events.filter((event) => event.event === "diagnostic").map((event) => event.diagnostic);
     assert.ok(diagnostics.some((diagnostic) => (
@@ -674,6 +765,9 @@ test("TanStack Start version ranges are classified without crossing the v1 bound
       && diagnostic.message.includes(range)
     )), range);
     assert.ok(!nodes.some((node) => node.kind === "server_function" && node.properties.framework === "tanstack-start"), range);
+    assert.equal(profile?.properties.web_framework_completeness_status, "incomplete");
+    assert.ok(ledger.find((entry: Record<string, any>) => entry.framework === "tanstack-start")
+      ?.reasons.includes("diagnostic:web.tanstack_start_version_unsupported"), range);
   }
 });
 
@@ -706,7 +800,10 @@ test("pure TypeScript semantic profiles allow candidate and external calls", asy
   assert.equal(completed.unresolved, 0);
   assert.equal(completed.unsupported_syntax, 0);
   assert.deepEqual(completed.completeness, ["syntax-complete", "semantic-complete"]);
-  assert.ok(!completed.reasons.includes("framework_semantic_capability_pending"));
+  assert.equal(profile?.properties.web_framework_completeness_status, "not-detected");
+  assert.equal(profile?.properties.web_framework_completeness_issue_count, "0");
+  assert.equal(profile?.properties.web_framework_completeness_ledger, "[]");
+  assert.ok(!completed.reasons.includes("framework_semantic_incomplete"));
   assert.ok(!completed.reasons.includes("typescript_semantic_diagnostics_present"));
   assert.ok(!completed.reasons.includes("typescript_emitted_semantic_diagnostics_present"));
   assert.ok(semanticCalls.some((site) => site.resolution_status === "candidates"));

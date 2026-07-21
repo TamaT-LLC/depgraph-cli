@@ -1319,6 +1319,13 @@ fn verify_archive(archive: &Path, name: &str) -> Result<()> {
         &verify_root.join("web-semantic-complete.db"),
         &semantic_complete_fixture,
     )?;
+    let framework_complete_fixture =
+        Path::new("workers/web/test/fixtures/framework-complete").canonicalize()?;
+    verify_packaged_web_framework_completeness(
+        &executable,
+        &verify_root.join("web-framework-complete.db"),
+        &framework_complete_fixture,
+    )?;
 
     let rust_fixture = Path::new("workers/rust/tests/fixtures/security").canonicalize()?;
     verify_packaged_scan(
@@ -3663,18 +3670,39 @@ fn verify_packaged_web_import_type_call_graph(executable: &Path, store: &Path) -
     {
         bail!("packaged Web import/type/call slice claimed semantic-complete");
     }
-    if profile["features"]
+    let framework_features = profile["features"]
         .as_array()
-        .is_none_or(|features| features.is_empty())
+        .filter(|features| !features.is_empty())
+        .context("packaged Web framework fixture lost its detected features")?;
+    let framework_ledger: Vec<Value> = serde_json::from_str(
+        profile["properties"]["web_framework_completeness_ledger"]
+            .as_str()
+            .context("packaged Web framework fixture omitted its completeness ledger")?,
+    )?;
+    let framework_issue_count = framework_ledger
+        .iter()
+        .map(|entry| entry["reasons"].as_array().map_or(0, Vec::len))
+        .sum::<usize>();
+    if profile["properties"]["web_framework_completeness_capability"]
+        != "framework-semantic-completeness-v1"
+        || profile["properties"]["web_framework_completeness_status"] != "incomplete"
+        || profile["properties"]["web_framework_completeness_issue_count"]
+            .as_str()
+            .and_then(|value| value.parse::<usize>().ok())
+            != Some(framework_issue_count)
+        || framework_ledger.len() != framework_features.len()
+        || framework_ledger.iter().any(|entry| {
+            entry["status"] != "incomplete" || entry["reasons"].as_array().is_none_or(Vec::is_empty)
+        })
         || !graph["coverage"]["reasons"]
             .as_array()
             .is_some_and(|reasons| {
                 reasons
                     .iter()
-                    .any(|reason| reason == "framework_semantic_capability_pending")
+                    .any(|reason| reason == "framework_semantic_incomplete")
             })
     {
-        bail!("packaged Web framework fixture lost its semantic-completeness blocker");
+        bail!("packaged Web framework fixture lost its bounded completeness ledger");
     }
     if !edges.iter().any(|edge| {
         edge["phase"] == "source" && matches!(edge["kind"].as_str(), Some("imports" | "reexports"))
@@ -3957,6 +3985,11 @@ fn verify_packaged_web_semantic_complete(
         || properties["typescript_semantic_diagnostics"] != "0"
         || properties["typescript_emitted_semantic_diagnostics"] != "0"
         || properties["typescript_semantic_issue_count"] != "0"
+        || properties["web_framework_completeness_capability"]
+            != "framework-semantic-completeness-v1"
+        || properties["web_framework_completeness_status"] != "not-detected"
+        || properties["web_framework_completeness_issue_count"] != "0"
+        || properties["web_framework_completeness_ledger"] != "[]"
         || properties["project_code_executed"] != "false"
     {
         bail!(
@@ -3990,6 +4023,119 @@ fn verify_packaged_web_semantic_complete(
         bail!(
             "packaged pure TypeScript semantic-complete fixture lost its allowed candidate/external sites"
         );
+    }
+    Ok(())
+}
+
+fn verify_packaged_web_framework_completeness(
+    executable: &Path,
+    store: &Path,
+    fixture: &Path,
+) -> Result<()> {
+    let scan = Command::new(executable)
+        .arg("--store")
+        .arg(store)
+        .arg("scan")
+        .arg(fixture)
+        .arg("--json")
+        .output()
+        .context("failed to scan the packaged Web framework-complete fixture")?;
+    if !scan.status.success() {
+        bail!(
+            "packaged Web framework-complete scan failed: {}\n{}",
+            String::from_utf8_lossy(&scan.stdout),
+            String::from_utf8_lossy(&scan.stderr)
+        );
+    }
+    let scan: Value = serde_json::from_slice(&scan.stdout)
+        .context("packaged Web framework-complete scan returned invalid JSON")?;
+    let coverage = &scan["coverage"];
+    if scan["status"] != "completed"
+        || coverage["project_code_executed"] != Value::Bool(false)
+        || coverage["completeness"].as_array().is_none_or(|levels| {
+            !levels.iter().any(|level| level == "syntax-complete")
+                || levels.iter().any(|level| level == "semantic-complete")
+        })
+        || coverage["reasons"].as_array().is_none_or(|reasons| {
+            !reasons
+                .iter()
+                .any(|reason| reason == "unresolved_dependency_sites")
+                || reasons
+                    .iter()
+                    .any(|reason| reason == "framework_semantic_incomplete")
+        })
+    {
+        bail!("packaged Web framework fixture lost its completion gate: {scan}");
+    }
+
+    let exported = packaged_web_export_json(executable, store)?;
+    let graph = exported["graph"]
+        .as_object()
+        .context("packaged Web framework-complete export has no graph")?;
+    let profile = graph["profiles"]
+        .as_array()
+        .and_then(|profiles| profiles.iter().find(|profile| profile["language"] == "web"))
+        .context("packaged Web framework-complete export has no Web profile")?;
+    let expected_frameworks = ["astro", "next", "tanstack-router", "tanstack-start"];
+    if profile["features"].as_array().is_none_or(|features| {
+        features
+            != &expected_frameworks
+                .iter()
+                .map(|framework| Value::String((*framework).to_owned()))
+                .collect::<Vec<_>>()
+    }) {
+        bail!("packaged Web framework fixture lost detected framework order: {profile}");
+    }
+    let properties = &profile["properties"];
+    let ledger: Vec<Value> = serde_json::from_str(
+        properties["web_framework_completeness_ledger"]
+            .as_str()
+            .context("packaged Web framework fixture omitted its completeness ledger")?,
+    )?;
+    if properties["web_framework_completeness_capability"] != "framework-semantic-completeness-v1"
+        || properties["web_framework_completeness_status"] != "complete"
+        || properties["web_framework_completeness_issue_count"] != "0"
+        || ledger.len() != expected_frameworks.len()
+    {
+        bail!("packaged Web framework fixture lost its complete capability ledger: {profile}");
+    }
+    for (entry, framework) in ledger.iter().zip(expected_frameworks) {
+        let specific = match framework {
+            "astro" => "astro-component-render-hydration-v1",
+            "next" => "next-route-component-boundary-v1",
+            "tanstack-router" => "tanstack-router-typed-route-v1",
+            "tanstack-start" => "tanstack-start-rpc-middleware-v1",
+            _ => unreachable!(),
+        };
+        let required = entry["required_capabilities"]
+            .as_array()
+            .context("packaged Web framework ledger omitted required capabilities")?;
+        let required_set = required
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<BTreeSet<_>>();
+        if entry["framework"] != framework
+            || entry["status"] != "complete"
+            || entry["reasons"]
+                .as_array()
+                .is_none_or(|reasons| !reasons.is_empty())
+            || entry["emitted_capabilities"] != entry["required_capabilities"]
+            || required_set
+                != BTreeSet::from([
+                    "framework-semantic-graph-v1",
+                    specific,
+                    "typescript-definition-import-type-call-graph-v2",
+                ])
+        {
+            bail!("packaged Web framework ledger entry is incomplete: {entry}");
+        }
+    }
+    if !graph["sites"].as_array().is_some_and(|sites| {
+        sites.iter().any(|site| {
+            site["resolution_status"] == "unresolved" && site["reason"] == "function_value_dispatch"
+        })
+    }) {
+        bail!("packaged Web framework fixture lost its bounded dynamic-call reason");
     }
     Ok(())
 }
