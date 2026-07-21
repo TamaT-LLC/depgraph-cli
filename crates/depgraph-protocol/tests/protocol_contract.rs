@@ -251,13 +251,14 @@ fn semantic_completeness_requires_syntax_completeness() {
 }
 
 #[test]
-fn non_rust_semantic_completeness_remains_independent_from_syntax_completeness() {
+fn other_adapter_semantic_completeness_remains_independent_from_syntax_completeness() {
     let mut events = golden_values();
+    events[1]["profile"]["language"] = json!("go");
     for coverage_index in [8, 9] {
         events[coverage_index]["coverage"]["completeness"] = json!(["semantic-complete"]);
     }
     validate_ndjson(Cursor::new(values_to_ndjson(events)))
-        .expect("protocol 1.0 non-Rust profiles may report semantic completeness independently");
+        .expect("protocol 1.0 profiles without a semantic-completeness contract may report it independently");
 }
 
 #[test]
@@ -402,6 +403,175 @@ fn rust_semantic_completeness_accepts_pending_and_verified_release_gates() {
         events[1]["profile"]["properties"]["rust_hir_enable_gate"] = json!(gate);
         validate_ndjson(Cursor::new(values_to_ndjson(events)))
             .unwrap_or_else(|error| panic!("Rust semantic completeness rejected {gate}: {error}"));
+    }
+}
+
+#[test]
+fn web_semantic_completeness_accepts_candidate_and_external_sites() {
+    validate_ndjson(Cursor::new(
+        values_to_ndjson(web_semantic_complete_values()),
+    ))
+    .expect("eligible pure Web coverage may report semantic completeness");
+
+    let mut candidate = web_semantic_complete_values();
+    for (event_index, key) in [(4, "edge"), (5, "site")] {
+        let payload = &mut candidate[event_index][key];
+        payload["resolution_status"] = json!("candidates");
+        payload["precision"] = json!("overapprox");
+    }
+    for coverage_index in [8, 9] {
+        candidate[coverage_index]["coverage"]["resolved"] = json!(0);
+        candidate[coverage_index]["coverage"]["candidates"] = json!(1);
+    }
+    validate_ndjson(Cursor::new(values_to_ndjson(candidate)))
+        .expect("candidate sites do not make an otherwise complete Web profile incomplete");
+
+    let mut external = web_semantic_complete_values();
+    external[3]["node"]["kind"] = json!("external_system");
+    for (event_index, key) in [(4, "edge"), (5, "site")] {
+        let payload = &mut external[event_index][key];
+        payload["resolution_status"] = json!("external");
+        payload["precision"] = json!("heuristic");
+    }
+    for coverage_index in [8, 9] {
+        external[coverage_index]["coverage"]["resolved"] = json!(0);
+        external[coverage_index]["coverage"]["external"] = json!(1);
+    }
+    validate_ndjson(Cursor::new(values_to_ndjson(external)))
+        .expect("external sites do not make an otherwise complete Web profile incomplete");
+}
+
+#[test]
+fn web_semantic_completeness_requires_pure_profile_and_zero_coverage_gaps() {
+    let mut framework = web_semantic_complete_values();
+    framework[1]["profile"]["features"] = json!(["next"]);
+    let error = validate_ndjson(Cursor::new(values_to_ndjson(framework))).unwrap_err();
+    assert!(
+        matches!(error, ProtocolError::Invariant(message) if message.contains("detected framework features"))
+    );
+
+    for (field, value) in [
+        ("files_skipped", json!(1)),
+        ("unsupported_syntax", json!(1)),
+        ("project_code_executed", json!(true)),
+    ] {
+        let mut events = web_semantic_complete_values();
+        if field == "files_skipped" {
+            events[8]["coverage"]["files_analyzed"] = json!(0);
+        }
+        events[8]["coverage"][field] = value;
+        let error = validate_ndjson(Cursor::new(values_to_ndjson(events))).unwrap_err();
+        assert!(
+            matches!(error, ProtocolError::Invariant(message) if message.contains(field)),
+            "Web semantic completeness accepted {field}"
+        );
+    }
+
+    let mut unresolved = web_semantic_complete_values();
+    unresolved[3]["node"]["kind"] = json!("unknown_target");
+    unresolved[5]["site"]["resolution_status"] = json!("unresolved");
+    unresolved[5]["site"]["precision"] = json!("heuristic");
+    unresolved[5]["site"]["reason"] = json!("target is unknown");
+    unresolved[4]["edge"]["resolution_status"] = json!("unresolved");
+    unresolved[4]["edge"]["precision"] = json!("heuristic");
+    unresolved[8]["coverage"]["resolved"] = json!(0);
+    unresolved[8]["coverage"]["unresolved"] = json!(1);
+    let error = validate_ndjson(Cursor::new(values_to_ndjson(unresolved))).unwrap_err();
+    assert!(matches!(error, ProtocolError::Invariant(message) if message.contains("unresolved")));
+
+    let mut reason = web_semantic_complete_values();
+    reason[8]["coverage"]["reasons"] = json!(["typescript_project_model_failure"]);
+    let error = validate_ndjson(Cursor::new(values_to_ndjson(reason))).unwrap_err();
+    assert!(
+        matches!(error, ProtocolError::Invariant(message) if message.contains("coverage reasons"))
+    );
+}
+
+#[test]
+fn web_semantic_completeness_requires_exact_safe_compiler_properties() {
+    let cases = [
+        ("bundled_typescript", json!("false")),
+        ("typescript_syntax_compiler", json!("native-7.0.3")),
+        ("typescript_compiler_source", json!("project-local")),
+        ("typescript_compiler_version", json!("7.0.3")),
+        ("typescript_compiler_selection", json!("best-effort")),
+        ("typescript_compiler_fallback", json!("syntax-only")),
+        ("typescript_analysis_mode", json!("syntax")),
+        ("typescript_project_local_policy", json!("load")),
+        ("typescript_project_local_loaded", json!("true")),
+        (
+            "typescript_typechecker_status",
+            json!("definition-import-type-call-graph-discarded"),
+        ),
+        ("typescript_project_model_status", json!("failed")),
+        (
+            "typescript_project_model_failure_reason",
+            json!("compiler_timeout"),
+        ),
+        ("typescript_project_config", json!("project-tsconfig")),
+        ("typescript_module_resolution", json!("host-filesystem")),
+        ("typescript_standard_library_source", json!("project")),
+        (
+            "typescript_semantic_graph_emission",
+            json!("definition-import-type-call-graph-v1"),
+        ),
+        ("typescript_compiler_processes", json!("2")),
+        ("typescript_project_filesystem", json!("host")),
+        ("typescript_definition_graph_status", json!("failed")),
+        ("typescript_semantic_diagnostics", json!("1")),
+        ("typescript_emitted_semantic_diagnostics", json!("1")),
+        ("typescript_semantic_issue_count", json!("1")),
+        ("project_code_executed", json!("true")),
+    ];
+    for (property, replacement) in cases {
+        let mut events = web_semantic_complete_values();
+        events[1]["profile"]["properties"][property] = replacement;
+        let error = validate_ndjson(Cursor::new(values_to_ndjson(events))).unwrap_err();
+        assert!(
+            matches!(error, ProtocolError::Invariant(message) if message.contains(property)),
+            "Web semantic completeness accepted invalid {property}"
+        );
+    }
+
+    let mut mismatched_integrity = web_semantic_complete_values();
+    mismatched_integrity[1]["profile"]["properties"]["typescript_standard_library_integrity"] =
+        json!("core-attested-whole-tree");
+    let error = validate_ndjson(Cursor::new(values_to_ndjson(mismatched_integrity))).unwrap_err();
+    assert!(matches!(error, ProtocolError::Invariant(message) if message.contains("release gate")));
+}
+
+#[test]
+fn web_semantic_completeness_accepts_pending_and_verified_release_gates() {
+    for (gate, integrity) in [
+        (
+            "release-gate-pending",
+            "build-produced-pending-core-attestation",
+        ),
+        ("release-gate-verified", "core-attested-whole-tree"),
+    ] {
+        let mut events = web_semantic_complete_values();
+        events[1]["profile"]["properties"]["typescript_release_gate"] = json!(gate);
+        events[1]["profile"]["properties"]["typescript_standard_library_integrity"] =
+            json!(integrity);
+        validate_ndjson(Cursor::new(values_to_ndjson(events)))
+            .unwrap_or_else(|error| panic!("Web semantic completeness rejected {gate}: {error}"));
+    }
+}
+
+#[test]
+fn typescript_and_javascript_semantic_completeness_use_the_web_contract() {
+    for language in ["typescript", "javascript"] {
+        let mut events = web_semantic_complete_values();
+        events[1]["profile"]["language"] = json!(language);
+        validate_ndjson(Cursor::new(values_to_ndjson(events.clone())))
+            .unwrap_or_else(|error| panic!("{language} semantic completeness rejected: {error}"));
+
+        events[1]["profile"]["properties"]["typescript_semantic_diagnostics"] = json!("1");
+        let error = validate_ndjson(Cursor::new(values_to_ndjson(events))).unwrap_err();
+        assert!(
+            matches!(error, ProtocolError::Invariant(message) if message.contains("typescript_semantic_diagnostics")),
+            "{language} semantic completeness bypassed the Web property contract"
+        );
     }
 }
 
@@ -713,6 +883,43 @@ fn rust_semantic_complete_values() -> Vec<Value> {
     events[5]["site"]["profile_id"] = json!("rust:test");
     events[6]["diagnostic"]["profile_id"] = json!("rust:test");
     events[8]["profile_id"] = json!("rust:test");
+    for coverage_index in [8, 9] {
+        events[coverage_index]["coverage"]["completeness"] =
+            json!(["syntax-complete", "semantic-complete"]);
+    }
+    events
+}
+
+fn web_semantic_complete_values() -> Vec<Value> {
+    let mut events = golden_values();
+    events[1]["profile"]["language"] = json!("web");
+    events[1]["profile"]["properties"] = json!({
+        "bundled_typescript": "true",
+        "typescript_syntax_compiler": "native-7.0.2",
+        "typescript_compiler_source": "bundled",
+        "typescript_compiler_version": "7.0.2",
+        "typescript_compiler_selection": "bundled-only",
+        "typescript_compiler_fallback": "fail-closed",
+        "typescript_analysis_mode": "semantic-import-type-call-graph",
+        "typescript_project_local_policy": "metadata-only",
+        "typescript_project_local_loaded": "false",
+        "typescript_typechecker_status": "definition-import-type-call-graph-emitted",
+        "typescript_project_model_status": "ready",
+        "typescript_project_model_failure_reason": "none",
+        "typescript_project_config": "worker-neutral-allowlist",
+        "typescript_module_resolution": "inventory-only",
+        "typescript_standard_library_source": "bundled",
+        "typescript_standard_library_integrity": "build-produced-pending-core-attestation",
+        "typescript_release_gate": "release-gate-pending",
+        "typescript_semantic_graph_emission": "definition-import-type-call-graph-v2",
+        "typescript_compiler_processes": "1",
+        "typescript_project_filesystem": "isolated-virtual",
+        "typescript_definition_graph_status": "ready",
+        "typescript_semantic_diagnostics": "0",
+        "typescript_emitted_semantic_diagnostics": "0",
+        "typescript_semantic_issue_count": "0",
+        "project_code_executed": "false"
+    });
     for coverage_index in [8, 9] {
         events[coverage_index]["coverage"]["completeness"] =
             json!(["syntax-complete", "semantic-complete"]);

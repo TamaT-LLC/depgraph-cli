@@ -2059,6 +2059,7 @@ export async function scan(root: string, allFiles: string[], inventoryIssues: Fi
       }),
     });
   }
+  let semanticGraphEmitted = false;
   if (nativeTypeScript.project.definitionGraphStatus === "ready") {
     try {
       nativeTypeScript.dependencyGraph = await refineTypeScriptDependencyDelta(
@@ -2079,6 +2080,7 @@ export async function scan(root: string, allFiles: string[], inventoryIssues: Fi
       nativeTypeScript.project.semanticRelations = counts.relations;
       nativeTypeScript.project.semanticSites = counts.sites;
       nativeTypeScript.project.semanticCallSites = counts.calls;
+      semanticGraphEmitted = true;
     } catch (error) {
       nativeTypeScript.project.definitionGraphStatus = "failed";
       nativeTypeScript.project.semanticNodes = 0;
@@ -2233,12 +2235,27 @@ export async function scan(root: string, allFiles: string[], inventoryIssues: Fi
   for (const site of sites) counts[site.resolution_status] += 1;
   const unsupportedSyntax = files.reduce((sum, file) => sum + file.unsupported_syntax, 0);
   const skipped = files.reduce((sum, file) => sum + file.skipped_sites, 0);
+  const projectCodeExecuted = false;
   const reasons: string[] = [];
   if (counts.unresolved > 0) reasons.push("unresolved_dependency_sites");
   if (unsupportedSyntax > 0) reasons.push("unsupported_syntax");
   if (skipped > 0) reasons.push("skipped_sites");
   if (nativeTypeScript.project.definitionGraphStatus === "failed") reasons.push("typescript_definition_graph_failure");
   else if (nativeTypeScript.project.semanticIssues > 0) reasons.push("typescript_definition_graph_incomplete");
+  if (!semanticGraphEmitted) reasons.push("typescript_semantic_graph_not_emitted");
+  if (nativeTypeScript.project.semanticDiagnostics > 0) reasons.push("typescript_semantic_diagnostics_present");
+  if (nativeTypeScript.project.emittedSemanticDiagnostics > 0) reasons.push("typescript_emitted_semantic_diagnostics_present");
+  if (routeDiscovery.frameworks.length > 0) reasons.push("framework_semantic_capability_pending");
+  const syntaxComplete = unsupportedSyntax === 0 && skipped === 0;
+  const semanticComplete = syntaxComplete
+    && counts.unresolved === 0
+    && !projectCodeExecuted
+    && semanticGraphEmitted
+    && nativeTypeScript.project.definitionGraphStatus === "ready"
+    && nativeTypeScript.project.semanticIssues === 0
+    && nativeTypeScript.project.semanticDiagnostics === 0
+    && nativeTypeScript.project.emittedSemanticDiagnostics === 0
+    && routeDiscovery.frameworks.length === 0;
   return {
     nodes: [...graph.nodes.values()].sort(compareById),
     sites,
@@ -2253,8 +2270,11 @@ export async function scan(root: string, allFiles: string[], inventoryIssues: Fi
       dependency_sites: sites.length,
       ...counts,
       unsupported_syntax: unsupportedSyntax,
-      project_code_executed: false,
-      completeness: unsupportedSyntax === 0 && skipped === 0 ? ["syntax-complete"] : [],
+      project_code_executed: projectCodeExecuted,
+      completeness: [
+        ...(syntaxComplete ? ["syntax-complete"] : []),
+        ...(semanticComplete ? ["semantic-complete"] : []),
+      ],
       reasons,
     },
     repositoryIdentity: workspace.repositoryIdentity,

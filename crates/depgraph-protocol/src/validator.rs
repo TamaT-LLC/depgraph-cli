@@ -2028,14 +2028,26 @@ fn validate_profile_completeness(
     profile: &Profile,
     coverage: &crate::Coverage,
 ) -> Result<(), ProtocolError> {
-    if profile.language != "rust"
-        || !coverage
-            .completeness
-            .contains(&CompletenessLevel::SemanticComplete)
+    if !coverage
+        .completeness
+        .contains(&CompletenessLevel::SemanticComplete)
     {
         return Ok(());
     }
 
+    match profile.language.as_str() {
+        "rust" => validate_rust_semantic_completeness(profile, coverage),
+        "web" | "typescript" | "javascript" => {
+            validate_web_semantic_completeness(profile, coverage)
+        }
+        _ => Ok(()),
+    }
+}
+
+fn validate_rust_semantic_completeness(
+    profile: &Profile,
+    coverage: &crate::Coverage,
+) -> Result<(), ProtocolError> {
     if !coverage
         .completeness
         .contains(&CompletenessLevel::SyntaxComplete)
@@ -2133,6 +2145,119 @@ fn validate_profile_completeness(
                 profile.id
             ));
         }
+    }
+    Ok(())
+}
+
+fn validate_web_semantic_completeness(
+    profile: &Profile,
+    coverage: &crate::Coverage,
+) -> Result<(), ProtocolError> {
+    if !profile.features.is_empty() {
+        return invariant(format!(
+            "Web semantic-complete profile {} requires no detected framework features, found {:?}",
+            profile.id, profile.features
+        ));
+    }
+    if !coverage
+        .completeness
+        .contains(&CompletenessLevel::SyntaxComplete)
+    {
+        return invariant(format!(
+            "Web semantic-complete profile {} must also report syntax-complete",
+            profile.id
+        ));
+    }
+    for (field, actual) in [
+        ("files_skipped", coverage.files_skipped),
+        ("unsupported_syntax", coverage.unsupported_syntax),
+        ("unresolved", coverage.unresolved),
+    ] {
+        if actual != 0 {
+            return invariant(format!(
+                "Web semantic-complete profile {} requires {field}=0, found {actual}",
+                profile.id
+            ));
+        }
+    }
+    if coverage.project_code_executed {
+        return invariant(format!(
+            "Web semantic-complete profile {} requires coverage project_code_executed=false",
+            profile.id
+        ));
+    }
+    if !coverage.reasons.is_empty() {
+        return invariant(format!(
+            "Web semantic-complete profile {} requires no coverage reasons, found {:?}",
+            profile.id, coverage.reasons
+        ));
+    }
+
+    for (property, expected) in [
+        ("bundled_typescript", "true"),
+        ("typescript_syntax_compiler", "native-7.0.2"),
+        ("typescript_compiler_source", "bundled"),
+        ("typescript_compiler_version", "7.0.2"),
+        ("typescript_compiler_selection", "bundled-only"),
+        ("typescript_compiler_fallback", "fail-closed"),
+        (
+            "typescript_analysis_mode",
+            "semantic-import-type-call-graph",
+        ),
+        ("typescript_project_local_policy", "metadata-only"),
+        ("typescript_project_local_loaded", "false"),
+        (
+            "typescript_typechecker_status",
+            "definition-import-type-call-graph-emitted",
+        ),
+        ("typescript_project_model_status", "ready"),
+        ("typescript_project_model_failure_reason", "none"),
+        ("typescript_project_config", "worker-neutral-allowlist"),
+        ("typescript_module_resolution", "inventory-only"),
+        ("typescript_standard_library_source", "bundled"),
+        (
+            "typescript_semantic_graph_emission",
+            "definition-import-type-call-graph-v2",
+        ),
+        ("typescript_compiler_processes", "1"),
+        ("typescript_project_filesystem", "isolated-virtual"),
+        ("typescript_definition_graph_status", "ready"),
+        ("typescript_semantic_diagnostics", "0"),
+        ("typescript_emitted_semantic_diagnostics", "0"),
+        ("typescript_semantic_issue_count", "0"),
+        ("project_code_executed", "false"),
+    ] {
+        let actual = profile.properties.get(property).and_then(Value::as_str);
+        if actual != Some(expected) {
+            return invariant(format!(
+                "Web semantic-complete profile {} requires properties.{property}={expected:?}, found {actual:?}",
+                profile.id
+            ));
+        }
+    }
+
+    let release_gate = profile
+        .properties
+        .get("typescript_release_gate")
+        .and_then(Value::as_str);
+    let standard_library_integrity = profile
+        .properties
+        .get("typescript_standard_library_integrity")
+        .and_then(Value::as_str);
+    if !matches!(
+        (release_gate, standard_library_integrity),
+        (
+            Some("release-gate-pending"),
+            Some("build-produced-pending-core-attestation")
+        ) | (
+            Some("release-gate-verified"),
+            Some("core-attested-whole-tree")
+        )
+    ) {
+        return invariant(format!(
+            "Web semantic-complete profile {} requires a matching TypeScript release gate and standard-library integrity, found gate={release_gate:?}, integrity={standard_library_integrity:?}",
+            profile.id
+        ));
     }
     Ok(())
 }
