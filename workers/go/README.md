@@ -104,11 +104,27 @@ algorithms, prerequisite contract, status, and bounded fallback reasons. VTA
 site and edge evidence records the requested/effective algorithm, fallback
 reason, and canonical candidate count.
 
-`reflect.Value.Call` and `reflect.Value.CallSlice` remain unresolved. `unsafe`,
-`go:linkname`, assembly, plugins, cgo/native callbacks, missing offline
-dependency bodies, and unmappable SSA functions are reported through
-`go_packages_*`, `go_callgraph_limit`, `go_ssa_*`, or `go_call_unresolved`
-diagnostics rather than being silently promoted to exact calls.
+Closed-world call-graph boundaries are retained as typed, source-spanned sites;
+they are never silently dropped or promoted to invented exact/candidate calls.
+`reflect.Value.Call` and `CallSlice` target the shared `unknown_target` with
+dedicated `reflection_call_target_boundary` and
+`reflection_call_slice_target_boundary` reasons. Representative reflective
+lookup/construction APIs (`MethodByName`, `FieldByName`, and `MakeFunc`) keep
+their exact external API call while carrying a `callgraph_boundary` and
+`boundary_reason` in primary evidence.
+
+The parser inventory also emits boundaries for `unsafe` and `plugin` imports,
+`go:linkname`, bodyless Go declarations, Plan 9 assembly `TEXT` declarations,
+cgo imports/directives/libraries/headers, and `//export` callbacks. Native
+identities use `native-toolchain:`, `native-library:`, `native-header:`, and
+`native-callback:` sentinels. Every boundary site has one correlated
+`go_callgraph_limit` diagnostic with the same profile, source span, reason, and
+`site_id`. Profile properties `go_callgraph_boundary_status`,
+`go_callgraph_boundary_site_count`, `go_callgraph_boundary_kinds`, and
+`go_callgraph_boundary_counts` summarize that ledger. Missing offline
+dependency bodies, SSA failures, and unmappable SSA functions continue to use
+the corresponding `go_packages_*`, `go_ssa_*`, or `go_call_unresolved`
+diagnostics.
 
 ## Completeness and fallback
 
@@ -130,7 +146,8 @@ ledger. Only `loaded` plus a successful semantic/SSA pass adds
 `go-semantic-incomplete`. `semantic-complete` means that retained typed input
 was processed without an extractor failure. It does not mean every dynamic or
 native call was resolved, so it may coexist with `unresolved-sites` or
-`go_callgraph_limit` diagnostics.
+`go_callgraph_limit` diagnostics. The profile records this policy as
+`go_callgraph_boundary_completeness_policy=semantic-complete-allowed-with-explicit-boundaries`.
 
 Safe scans always report `project_code_executed=false`.
 

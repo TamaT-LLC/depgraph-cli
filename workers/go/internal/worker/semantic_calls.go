@@ -15,13 +15,16 @@ type goSemanticSymbolOrigin struct {
 }
 
 type goSemanticCallTarget struct {
-	nodeID    string
-	resolver  string
-	status    string
-	precision string
-	reason    string
-	dispatch  string
-	callKind  string
+	nodeID          string
+	resolver        string
+	status          string
+	precision       string
+	reason          string
+	dispatch        string
+	callKind        string
+	boundary        string
+	boundaryReason  string
+	boundaryMessage string
 }
 
 type goSemanticPendingCall struct {
@@ -67,6 +70,10 @@ func (p *goSemanticPackage) emitCalls() {
 			if target.resolver != "" {
 				properties["resolver_identity"] = target.resolver
 			}
+			if target.boundary != "" {
+				properties["callgraph_boundary"] = target.boundary
+				properties["boundary_reason"] = target.boundaryReason
+			}
 			evidence := p.evidence(file, call, specifier, properties)
 			if target.status == "unresolved" {
 				if target.reason == "interface_dispatch" || target.reason == "function_value_dispatch" {
@@ -79,7 +86,7 @@ func (p *goSemanticPackage) emitCalls() {
 				}
 				p.extractor.failCall(file.Path, specifier, target.reason, evidence)
 			}
-			p.extractor.addCall(
+			siteID := p.extractor.addCall(
 				callerID,
 				target.nodeID,
 				specifier,
@@ -90,6 +97,11 @@ func (p *goSemanticPackage) emitCalls() {
 				evidence,
 				p.generated(file.Path),
 			)
+			if target.boundary != "" {
+				p.extractor.state.addCallGraphLimitDiagnostic(
+					siteID, target.boundary, target.boundaryReason, target.boundaryMessage,
+				)
+			}
 			return true
 		})
 	}
@@ -155,6 +167,9 @@ func (p *goSemanticPackage) callTarget(expression ast.Expr) (goSemanticCallTarge
 			if !ok {
 				return p.unresolvedCall(goSemanticCallName(base), "function_value_dispatch", "function_value")
 			}
+			if boundary, _, _, _ := goSemanticReflectionBoundary(goSemanticFunctionResolver(function)); boundary != "" {
+				return p.callTargetForFunction(function, "method")
+			}
 			if goSemanticSelectionIsDynamic(selection, function) {
 				return p.unresolvedCall(goSemanticFunctionResolver(function), "interface_dispatch", "interface")
 			}
@@ -205,8 +220,13 @@ func (p *goSemanticPackage) unresolvedCall(resolver, reason, dispatch string) (g
 
 func (p *goSemanticPackage) callTargetForFunction(function *types.Func, callKind string) (goSemanticCallTarget, bool) {
 	resolver := goSemanticFunctionResolver(function)
-	if goSemanticReflectiveCall(resolver) {
-		return p.unresolvedCall(resolver, "reflection_dispatch", "reflection")
+	boundary, reason, message, unresolved := goSemanticReflectionBoundary(resolver)
+	if unresolved {
+		target, ok := p.unresolvedCall(resolver, reason, "reflection")
+		target.boundary = boundary
+		target.boundaryReason = reason
+		target.boundaryMessage = message
+		return target, ok
 	}
 	packagePath := goSemanticFunctionPackagePath(function)
 	nodeID := p.objectNodes[function]
@@ -221,6 +241,9 @@ func (p *goSemanticPackage) callTargetForFunction(function *types.Func, callKind
 		if ok && target.resolver == "" {
 			target.resolver = resolver
 		}
+		target.boundary = boundary
+		target.boundaryReason = reason
+		target.boundaryMessage = message
 		return target, ok
 	}
 	nodeID = p.extractor.ensureExternalSymbol(resolver, function.Name(), goSemanticExternalSymbolKind(function))
@@ -229,6 +252,7 @@ func (p *goSemanticPackage) callTargetForFunction(function *types.Func, callKind
 	}
 	return goSemanticCallTarget{
 		nodeID: nodeID, resolver: resolver, status: "external", precision: "exact", dispatch: "static", callKind: callKind,
+		boundary: boundary, boundaryReason: reason, boundaryMessage: message,
 	}, true
 }
 
@@ -383,8 +407,21 @@ func goSemanticSelectionIsDynamic(selection *types.Selection, function *types.Fu
 	return signature != nil && signature.Recv() != nil && goSemanticDynamicReceiver(signature.Recv().Type())
 }
 
-func goSemanticReflectiveCall(resolver string) bool {
-	return resolver == "reflect.(Value).Call" || resolver == "reflect.(Value).CallSlice"
+func goSemanticReflectionBoundary(resolver string) (boundary, reason, message string, unresolved bool) {
+	switch resolver {
+	case "reflect.(Value).Call":
+		return "reflection_call", "reflection_call_target_boundary", "reflect.Value.Call target is determined at runtime", true
+	case "reflect.(Value).CallSlice":
+		return "reflection_call_slice", "reflection_call_slice_target_boundary", "reflect.Value.CallSlice target is determined at runtime", true
+	case "reflect.(Value).MethodByName", "reflect.(Type).MethodByName":
+		return "reflection_method_lookup", "reflection_method_lookup_boundary", "reflective method lookup can introduce runtime-only call targets", false
+	case "reflect.(Value).FieldByName", "reflect.(Type).FieldByName":
+		return "reflection_field_lookup", "reflection_field_lookup_boundary", "reflective field lookup can expose runtime-only function values", false
+	case "reflect.MakeFunc":
+		return "reflection_make_func", "reflection_function_construction_boundary", "reflect.MakeFunc constructs a runtime function outside static call-target analysis", false
+	default:
+		return "", "", "", false
+	}
 }
 
 func goSemanticFunctionPackagePath(function *types.Func) string {
@@ -455,9 +492,9 @@ func (e *goSemanticExtractor) addCall(
 	condition Condition,
 	evidence []Evidence,
 	generated bool,
-) {
+) string {
 	if sourceID == "" || targetID == "" || len(evidence) == 0 {
-		return
+		return ""
 	}
 	condition = canonicalCondition(condition)
 	primary := evidence[0]
@@ -476,7 +513,7 @@ func (e *goSemanticExtractor) addCall(
 		if !goSemanticEqual(old, site) {
 			e.fail("go_semantic_identity_conflict", primary.Path, "conflicting semantic call site "+site.ID)
 		}
-		return
+		return site.ID
 	}
 	e.state.sites[site.ID] = site
 	edgeIdentity := map[string]any{"kind": "calls", "site_id": site.ID, "target": targetID}
@@ -488,9 +525,10 @@ func (e *goSemanticExtractor) addCall(
 	}
 	if old, ok := e.state.edges[edge.ID]; ok && !goSemanticEqual(old, edge) {
 		e.fail("go_semantic_identity_conflict", primary.Path, "conflicting semantic calls edge "+edge.ID)
-		return
+		return site.ID
 	}
 	e.state.edges[edge.ID] = edge
+	return site.ID
 }
 
 func (e *goSemanticExtractor) addCandidateCall(pending goSemanticPendingCall, targetIDs []string, evidence []Evidence) bool {

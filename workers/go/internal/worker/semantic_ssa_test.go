@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"sort"
+	"strings"
 	"testing"
 
 	"golang.org/x/tools/go/packages"
@@ -269,16 +270,17 @@ func UsePlugin() {
 	_, _ = plugin.Open("missing.so")
 }
 `,
-		"bridge.s": "// assembly boundary\n",
+		"bridge.s": "// assembly boundary\nTEXT ·bridge(SB),$0-0\n\tRET\n",
 	})
 	result := ssaTestScan(t, root)
 
 	want := map[string]string{
-		"unsafe":          "limits.go",
-		"plugin":          "limits.go",
-		"go_linkname":     "limits.go",
-		"native_callback": "limits.go",
-		"assembly":        "bridge.s",
+		"unsafe":                  "limits.go",
+		"plugin":                  "limits.go",
+		"go_linkname":             "limits.go",
+		"assembly_declaration":    "limits.go",
+		"native_callback":         "limits.go",
+		"assembly_implementation": "bridge.s",
 	}
 	seen := map[string]int{}
 	for _, diagnostic := range result.Diagnostics {
@@ -293,10 +295,22 @@ func UsePlugin() {
 		if wantPath, ok := want[boundary]; !ok || diagnostic.Path != wantPath {
 			t.Fatalf("unexpected call graph limit diagnostic: %+v", diagnostic)
 		}
-		if boundary != "assembly" {
-			if len(diagnostic.Evidence) == 0 || diagnostic.StartLine == 0 || diagnostic.StartColumn == 0 {
-				t.Fatalf("source-backed limit lacks evidence/span: %+v", diagnostic)
-			}
+		if len(diagnostic.Evidence) == 0 || diagnostic.StartLine == 0 || diagnostic.StartColumn == 0 {
+			t.Fatalf("source-backed limit lacks evidence/span: %+v", diagnostic)
+		}
+		siteID, _ := diagnostic.Properties["site_id"].(string)
+		site := semanticSiteByID(t, result, siteID)
+		if diagnostic.ProfileID != site.ProfileID || diagnostic.Path != site.Evidence[0].Path ||
+			diagnostic.StartLine != site.Evidence[0].StartLine || diagnostic.StartColumn != site.Evidence[0].StartColumn ||
+			diagnostic.EndLine != site.Evidence[0].EndLine || diagnostic.EndColumn != site.Evidence[0].EndColumn ||
+			!reflect.DeepEqual(diagnostic.Evidence, site.Evidence) {
+			t.Fatalf("call graph diagnostic is not correlated with its site: diagnostic=%+v site=%+v", diagnostic, site)
+		}
+		if got, _ := site.Evidence[0].Properties["callgraph_boundary"].(string); got != boundary {
+			t.Fatalf("site boundary = %q, want %q: %+v", got, boundary, site)
+		}
+		if reason, _ := diagnostic.Properties["reason"].(string); reason == "" || site.Reason != reason && site.ResolutionStatus == "unresolved" {
+			t.Fatalf("boundary reason was not preserved: diagnostic=%+v site=%+v", diagnostic, site)
 		}
 	}
 	for boundary := range want {
@@ -307,6 +321,163 @@ func UsePlugin() {
 	if result.Coverage.ProjectCodeExecuted {
 		t.Fatal("limit scan reported project-code execution")
 	}
+	if got := result.Profile.Properties["go_callgraph_boundary_site_count"]; got != "6" {
+		t.Fatalf("profile boundary site count = %q, want 6: %+v", got, result.Profile.Properties)
+	}
+	if !containsString(result.Coverage.Completeness, "semantic-complete") {
+		t.Fatalf("explicit call graph boundaries prevented semantic completeness: %+v", result.Coverage)
+	}
+	for _, site := range result.Sites {
+		if site.Kind != "native_callback" {
+			continue
+		}
+		target := semanticNodeByID(t, result, site.TargetIDs[0])
+		if target.Kind != "external_system" || target.Locator != "native-callback:NativeCallback" ||
+			target.Properties["native_kind"] != "callback" {
+			t.Fatalf("native callback identity was not normalized: site=%+v target=%+v", site, target)
+		}
+	}
+	assemblyFileID := ""
+	for _, node := range result.Nodes {
+		if node.Kind == "file" && node.Locator == "file:bridge.s" {
+			assemblyFileID = node.ID
+		}
+	}
+	assemblyOwned := false
+	for _, edge := range result.Edges {
+		if edge.Kind == "contains" && edge.Target == assemblyFileID &&
+			semanticNodeByID(t, result, edge.Source).Kind == "build_unit" {
+			assemblyOwned = true
+		}
+	}
+	if assemblyFileID == "" || !assemblyOwned {
+		t.Fatalf("assembly file is not owned by its package build unit: file=%q edges=%+v", assemblyFileID, result.Edges)
+	}
+	var events bytes.Buffer
+	if err := Emit(&events, "callgraph-boundaries", result); err != nil {
+		t.Fatalf("boundary graph violates the worker protocol: %v", err)
+	}
+}
+
+func TestGoReflectionBoundariesRetainDedicatedSitesWithoutInventingTargets(t *testing.T) {
+	root := ssaTestModule(t, "example.com/reflectionlimits", map[string]string{
+		"reflection.go": `package reflectionlimits
+
+import "reflect"
+
+func Boundaries(value reflect.Value, typ reflect.Type) {
+	value.Call(nil)
+	value.CallSlice(nil)
+	_ = value.MethodByName("Run")
+	_, _ = typ.MethodByName("Run")
+	_ = value.FieldByName("Fn")
+	_, _ = typ.FieldByName("Fn")
+	_ = reflect.MakeFunc(reflect.TypeOf(func() {}), func([]reflect.Value) []reflect.Value { return nil })
+}
+`,
+	})
+	result := ssaTestScan(t, root)
+	want := map[string]struct {
+		count  int
+		status string
+		reason string
+	}{
+		"reflection_call":          {count: 1, status: "unresolved", reason: "reflection_call_target_boundary"},
+		"reflection_call_slice":    {count: 1, status: "unresolved", reason: "reflection_call_slice_target_boundary"},
+		"reflection_method_lookup": {count: 2, status: "external", reason: "reflection_method_lookup_boundary"},
+		"reflection_field_lookup":  {count: 2, status: "external", reason: "reflection_field_lookup_boundary"},
+		"reflection_make_func":     {count: 1, status: "external", reason: "reflection_function_construction_boundary"},
+	}
+	seen := map[string]int{}
+	diagnosticsBySite := map[string]Diagnostic{}
+	for _, diagnostic := range result.Diagnostics {
+		if diagnostic.Code == "go_callgraph_limit" {
+			siteID, _ := diagnostic.Properties["site_id"].(string)
+			diagnosticsBySite[siteID] = diagnostic
+		}
+	}
+	for _, site := range result.Sites {
+		if len(site.Evidence) == 0 {
+			continue
+		}
+		boundary, _ := site.Evidence[0].Properties["callgraph_boundary"].(string)
+		if !strings.HasPrefix(boundary, "reflection_") {
+			continue
+		}
+		contract, ok := want[boundary]
+		if !ok {
+			t.Fatalf("unexpected reflection boundary %q: %+v", boundary, site)
+		}
+		seen[boundary]++
+		if site.Kind != "call" || site.ResolutionStatus != contract.status ||
+			site.Evidence[0].Properties["boundary_reason"] != contract.reason {
+			t.Fatalf("reflection boundary lost its site contract: boundary=%s site=%+v", boundary, site)
+		}
+		if contract.status == "unresolved" {
+			if site.Reason != contract.reason || len(site.TargetIDs) != 1 ||
+				semanticNodeByID(t, result, site.TargetIDs[0]).Kind != "unknown_target" {
+				t.Fatalf("runtime-only reflection call invented a target: %+v", site)
+			}
+		} else if site.Reason != "" || site.Precision != "exact" {
+			t.Fatalf("known reflection API call lost exact external resolution: %+v", site)
+		}
+		diagnostic, ok := diagnosticsBySite[site.ID]
+		if !ok || diagnostic.Properties["boundary"] != boundary || diagnostic.Properties["reason"] != contract.reason ||
+			!reflect.DeepEqual(diagnostic.Evidence, site.Evidence) {
+			t.Fatalf("reflection boundary diagnostic is not correlated: boundary=%s site=%+v diagnostic=%+v", boundary, site, diagnostic)
+		}
+	}
+	for boundary, contract := range want {
+		if seen[boundary] != contract.count {
+			t.Fatalf("reflection boundary %q count = %d, want %d; sites=%+v", boundary, seen[boundary], contract.count, result.Sites)
+		}
+	}
+	if got := result.Profile.Properties["go_callgraph_boundary_site_count"]; got != "7" {
+		t.Fatalf("reflection boundary profile count = %q, want 7: %+v", got, result.Profile.Properties)
+	}
+	if !containsString(result.Coverage.Completeness, "semantic-complete") {
+		t.Fatalf("reflection boundary ledger prevented semantic completeness: %+v", result.Coverage)
+	}
+	semanticAssertCoverageLedger(t, result)
+}
+
+func TestGoCallGraphBoundariesSurvivePartialSyntax(t *testing.T) {
+	root := ssaTestModule(t, "example.com/partiallimits", map[string]string{
+		"broken.go": `package partiallimits
+
+import _ "unsafe"
+
+//go:linkname linked runtime.nanotime
+func linked() int64
+
+var broken =
+`,
+	})
+	result := ssaTestScan(t, root)
+	seen := map[string]bool{}
+	for _, site := range result.Sites {
+		if len(site.Evidence) == 0 || site.Evidence[0].Path != "broken.go" {
+			continue
+		}
+		boundary, _ := site.Evidence[0].Properties["callgraph_boundary"].(string)
+		if boundary != "" {
+			seen[boundary] = true
+		}
+	}
+	for _, boundary := range []string{"unsafe", "go_linkname", "assembly_declaration"} {
+		if !seen[boundary] {
+			t.Fatalf("partial syntax lost %q boundary: sites=%+v diagnostics=%+v", boundary, result.Sites, result.Diagnostics)
+		}
+	}
+	if containsString(result.Coverage.Completeness, "semantic-complete") ||
+		!containsString(result.Coverage.Reasons, "go-packages-parser-fallback") {
+		t.Fatalf("partial syntax claimed complete semantic coverage: %+v", result.Coverage)
+	}
+	completion := semanticFileCompletion(t, result, "broken.go")
+	if !completion.Skipped || completion.SkippedSites != 1 {
+		t.Fatalf("partial syntax file ledger lost its skipped item: %+v", completion)
+	}
+	semanticAssertCoverageLedger(t, result)
 }
 
 func TestGoSSACandidateOutputIsDeterministic(t *testing.T) {

@@ -390,7 +390,7 @@ func TestGoSemanticDirectCallsAreStrictAndConservative(t *testing.T) {
 		t.Fatal("type conversion was emitted as a call site")
 	}
 	if !reflect.DeepEqual(callFileUnresolved, map[string]int{
-		"function_value_dispatch": 3, "reflection_dispatch": 1,
+		"function_value_dispatch": 3, "reflection_call_target_boundary": 1,
 	}) {
 		t.Fatalf("calls.go unresolved classifications = %v", callFileUnresolved)
 	}
