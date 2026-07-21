@@ -2540,13 +2540,11 @@ fn verify_packaged_web_import_type_call_graph(executable: &Path, store: &Path) -
     let all_framework_node_ids: BTreeSet<_> = nodes
         .iter()
         .filter(|node| {
-            matches!(node["kind"].as_str(), Some("component" | "route"))
-                && matches!(
-                    node["properties"]["canonical_identity"]["framework"].as_str(),
-                    Some("next" | "astro" | "tanstack-router")
-                )
-                && node["properties"]["framework"]
-                    == node["properties"]["canonical_identity"]["framework"]
+            matches!(
+                node["properties"]["canonical_identity"]["framework"].as_str(),
+                Some("next" | "astro" | "tanstack-router" | "tanstack-start")
+            ) && node["properties"]["framework"]
+                == node["properties"]["canonical_identity"]["framework"]
         })
         .filter_map(|node| node["id"].as_str())
         .collect();
@@ -3351,6 +3349,287 @@ fn verify_packaged_web_import_type_call_graph(executable: &Path, store: &Path) -
         .collect();
     if queried_parent_edges.len() != 2 {
         bail!("packaged Web queries lost TanStack Router declared/registered parent evidence");
+    }
+
+    let start_nodes: Vec<_> = all_framework_nodes
+        .iter()
+        .copied()
+        .filter(|node| node["properties"]["framework"] == "tanstack-start")
+        .collect();
+    let start_site_ids: BTreeSet<_> = evidence
+        .iter()
+        .filter(|item| {
+            item["owner_type"] == "site"
+                && item["ordinal"].as_u64() == Some(0)
+                && item["kind"] == "semantic"
+                && item["extractor"] == "tanstack-start-static-adapter"
+                && item["extractor_version"] == "0.1.0"
+                && item["properties"]["framework"] == "tanstack-start"
+                && item["properties"]["contract_version"] == "framework-semantic-graph-v1"
+        })
+        .filter_map(|item| item["owner_id"].as_str())
+        .collect();
+    let start_edge_ids: BTreeSet<_> = evidence
+        .iter()
+        .filter(|item| {
+            item["owner_type"] == "edge"
+                && item["ordinal"].as_u64() == Some(0)
+                && item["kind"] == "semantic"
+                && item["extractor"] == "tanstack-start-static-adapter"
+                && item["extractor_version"] == "0.1.0"
+                && item["properties"]["framework"] == "tanstack-start"
+                && item["properties"]["contract_version"] == "framework-semantic-graph-v1"
+        })
+        .filter_map(|item| item["owner_id"].as_str())
+        .collect();
+    let start_sites: Vec<_> = all_framework_sites
+        .iter()
+        .copied()
+        .filter(|site| {
+            site["id"]
+                .as_str()
+                .is_some_and(|id| start_site_ids.contains(id))
+        })
+        .collect();
+    let start_edges: Vec<_> = all_framework_edges
+        .iter()
+        .copied()
+        .filter(|edge| {
+            edge["id"]
+                .as_str()
+                .is_some_and(|id| start_edge_ids.contains(id))
+        })
+        .collect();
+    let start_node_kinds: BTreeSet<_> = start_nodes
+        .iter()
+        .filter_map(|node| node["kind"].as_str())
+        .collect();
+    if start_node_kinds != BTreeSet::from(["component", "middleware", "route", "server_function"]) {
+        bail!("packaged TanStack Start graph lost its route/RPC/middleware vocabulary");
+    }
+
+    let start_server_function = start_nodes
+        .iter()
+        .copied()
+        .find(|node| node["kind"] == "server_function" && node["display_name"] == "getAccount")
+        .context("packaged TanStack Start graph omitted getAccount")?;
+    let start_account_route = start_nodes
+        .iter()
+        .copied()
+        .find(|node| {
+            node["kind"] == "route" && node["properties"]["route_pattern"] == "/account/$accountId"
+        })
+        .context("packaged TanStack Start graph omitted the account route")?;
+    let start_public_route = start_nodes
+        .iter()
+        .copied()
+        .find(|node| node["kind"] == "route" && node["properties"]["route_pattern"] == "/public")
+        .context("packaged TanStack Start graph omitted the break-out route")?;
+    let start_account_component = start_nodes
+        .iter()
+        .copied()
+        .find(|node| node["kind"] == "component" && node["display_name"] == "AccountPage")
+        .context("packaged TanStack Start graph omitted AccountPage")?;
+    let start_middleware = |name: &str| {
+        start_nodes
+            .iter()
+            .copied()
+            .find(|node| node["kind"] == "middleware" && node["display_name"] == name)
+    };
+    let auth_middleware = start_middleware("authMiddleware")
+        .context("packaged TanStack Start graph omitted authMiddleware")?;
+    let audit_middleware = start_middleware("auditMiddleware")
+        .context("packaged TanStack Start graph omitted auditMiddleware")?;
+    let account_middleware = start_middleware("accountRouteMiddleware")
+        .context("packaged TanStack Start graph omitted accountRouteMiddleware")?;
+    let root_middleware = start_middleware("rootMiddleware")
+        .context("packaged TanStack Start graph omitted rootMiddleware")?;
+    let breakout_middleware = start_nodes
+        .iter()
+        .copied()
+        .find(|node| {
+            node["kind"] == "middleware"
+                && node["properties"]["middleware_inheritance"] == "break-out"
+        })
+        .context("packaged TanStack Start graph omitted its middleware break-out boundary")?;
+    if start_server_function["properties"]["http_method"] != "GET"
+        || !start_server_function["properties"]["production_rpc_id"].is_null()
+        || start_server_function["properties"]["production_rpc_id_status"] != "build-unobserved"
+        || start_server_function["properties"]["build_boundary_reason"]
+            != "tanstack_start_internal_virtual_module_unobserved"
+        || start_server_function["properties"]["handler_definition_id"]
+            .as_str()
+            .is_none_or(str::is_empty)
+        || start_server_function["properties"]["validator_definition_id"]
+            .as_str()
+            .is_none_or(str::is_empty)
+    {
+        bail!("packaged TanStack Start server function guessed or lost RPC metadata");
+    }
+
+    let start_server_function_id = start_server_function["id"]
+        .as_str()
+        .context("packaged TanStack Start server function omitted its ID")?;
+    let start_account_route_id = start_account_route["id"]
+        .as_str()
+        .context("packaged TanStack Start account route omitted its ID")?;
+    let start_public_route_id = start_public_route["id"]
+        .as_str()
+        .context("packaged TanStack Start public route omitted its ID")?;
+    let start_account_component_id = start_account_component["id"]
+        .as_str()
+        .context("packaged TanStack Start account component omitted its ID")?;
+    let handled_by = start_edges
+        .iter()
+        .copied()
+        .find(|edge| edge["kind"] == "handled_by" && edge["source"] == start_server_function_id)
+        .context("packaged TanStack Start graph omitted its server handler")?;
+    let start_handler_id = handled_by["target"]
+        .as_str()
+        .context("packaged TanStack Start handler edge omitted its target")?;
+    if nodes_by_id
+        .get(start_handler_id)
+        .is_none_or(|node| node["display_name"] != "accountHandler")
+    {
+        bail!("packaged TanStack Start server handler lost its TypeScript definition")
+    }
+
+    let rpc_sources: BTreeSet<_> = start_edges
+        .iter()
+        .filter(|edge| edge["kind"] == "rpc_call" && edge["target"] == start_server_function_id)
+        .filter_map(|edge| edge["source"].as_str())
+        .collect();
+    if rpc_sources != BTreeSet::from([start_account_route_id, start_account_component_id]) {
+        bail!("packaged TanStack Start graph lost route/component RPC calls");
+    }
+    let middleware_targets = |source: &str| -> BTreeSet<&str> {
+        start_edges
+            .iter()
+            .filter(|edge| edge["kind"] == "uses_middleware" && edge["source"] == source)
+            .filter_map(|edge| edge["target"].as_str())
+            .collect()
+    };
+    let auth_middleware_id = auth_middleware["id"]
+        .as_str()
+        .context("packaged TanStack Start auth middleware omitted its ID")?;
+    let audit_middleware_id = audit_middleware["id"]
+        .as_str()
+        .context("packaged TanStack Start audit middleware omitted its ID")?;
+    let account_middleware_id = account_middleware["id"]
+        .as_str()
+        .context("packaged TanStack Start account middleware omitted its ID")?;
+    let root_middleware_id = root_middleware["id"]
+        .as_str()
+        .context("packaged TanStack Start root middleware omitted its ID")?;
+    let breakout_middleware_id = breakout_middleware["id"]
+        .as_str()
+        .context("packaged TanStack Start break-out middleware omitted its ID")?;
+    if middleware_targets(start_server_function_id)
+        != BTreeSet::from([auth_middleware_id, audit_middleware_id])
+        || middleware_targets(start_account_route_id)
+            != BTreeSet::from([
+                account_middleware_id,
+                auth_middleware_id,
+                root_middleware_id,
+            ])
+        || middleware_targets(start_public_route_id)
+            != BTreeSet::from([breakout_middleware_id, root_middleware_id])
+    {
+        bail!("packaged TanStack Start graph lost direct, inherited, or break-out middleware");
+    }
+    let start_occurrence = |site: &&Value| {
+        site["id"]
+            .as_str()
+            .and_then(|site_id| {
+                evidence.iter().find(|item| {
+                    item["owner_type"] == "site"
+                        && item["owner_id"] == site_id
+                        && item["ordinal"].as_u64() == Some(0)
+                })
+            })
+            .and_then(|item| item["properties"]["occurrence_kind"].as_str())
+    };
+    if !start_sites.iter().any(|site| {
+        site["kind"] == "uses_middleware"
+            && site["source"] == start_account_route_id
+            && start_occurrence(site) == Some("tanstack_start_inherited_pathless_middleware")
+            && site["condition"].to_string().contains("_authenticated")
+    }) || !start_sites.iter().any(|site| {
+        site["kind"] == "uses_middleware"
+            && site["source"] == start_public_route_id
+            && start_occurrence(site) == Some("tanstack_start_middleware_breakout")
+            && site["condition"].to_string().contains("break-out")
+    }) {
+        bail!("packaged TanStack Start graph lost pathless or break-out occurrence evidence");
+    }
+    if !graph["diagnostics"].as_array().is_some_and(|diagnostics| {
+        diagnostics.iter().any(|diagnostic| {
+            diagnostic["code"] == "web.tanstack_start_build_rpc_id_unobserved"
+                && diagnostic["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("were not guessed"))
+        })
+    }) {
+        bail!("packaged TanStack Start graph did not expose its build-only RPC ID boundary");
+    }
+
+    let start_component_selector = format!("id:{start_account_component_id}");
+    let start_handler_selector = format!("id:{start_handler_id}");
+    let start_why = packaged_web_query(
+        executable,
+        store,
+        &[
+            "why",
+            &start_component_selector,
+            &start_handler_selector,
+            "--json",
+        ],
+        "explain packaged TanStack Start client-to-handler RPC path",
+    )?;
+    let why_steps = start_why["data"]["steps"]
+        .as_array()
+        .context("packaged TanStack Start why query omitted its steps")?;
+    let why_kinds: BTreeSet<_> = why_steps
+        .iter()
+        .filter_map(|step| step["edge"]["kind"].as_str())
+        .collect();
+    if start_why["data"]["path_found"] != true
+        || !why_kinds.contains("rpc_call")
+        || !why_kinds.contains("handled_by")
+        || !why_steps.iter().all(|step| {
+            step["evidence"].as_array().is_some_and(|items| {
+                items.iter().any(|item| {
+                    item["kind"] == "semantic"
+                        && item["extractor"] == "tanstack-start-static-adapter"
+                })
+            })
+        })
+    {
+        bail!("packaged Web queries lost the TanStack Start client-to-handler explanation");
+    }
+    let start_auth_selector = format!("id:{auth_middleware_id}");
+    let middleware_why = packaged_web_query(
+        executable,
+        store,
+        &[
+            "why",
+            &start_component_selector,
+            &start_auth_selector,
+            "--json",
+        ],
+        "explain packaged TanStack Start client-to-middleware RPC path",
+    )?;
+    let middleware_why_kinds: BTreeSet<_> = middleware_why["data"]["steps"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|step| step["edge"]["kind"].as_str())
+        .collect();
+    if middleware_why["data"]["path_found"] != true
+        || !middleware_why_kinds.contains("rpc_call")
+        || !middleware_why_kinds.contains("uses_middleware")
+    {
+        bail!("packaged Web queries lost the TanStack Start client-to-middleware explanation");
     }
     let coverage = &graph["coverage"];
     let classified_sites = ["resolved", "candidates", "external", "unresolved"]

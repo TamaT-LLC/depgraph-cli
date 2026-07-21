@@ -245,6 +245,7 @@ test("worker emits deterministic protocol graph without executing project code",
     node.properties.canonical_identity?.framework === "next"
     || node.properties.canonical_identity?.framework === "astro"
     || node.properties.canonical_identity?.framework === "tanstack-router"
+    || node.properties.canonical_identity?.framework === "tanstack-start"
   ));
   const allFrameworkSites = sites.filter((site) => (
     site.evidence[0]?.properties?.contract_version === "framework-semantic-graph-v1"
@@ -541,6 +542,63 @@ test("worker emits deterministic protocol graph without executing project code",
   assert.ok(tanstackDrift?.evidence.some((item: Record<string, any>) => (
     item.kind === "source" && item.start_line > 1
   )));
+
+  const startNodes = allFrameworkNodes.filter((node) => node.properties.canonical_identity?.framework === "tanstack-start");
+  const startSites = allFrameworkSites.filter((site) => site.evidence[0]?.properties?.framework === "tanstack-start");
+  const startEdges = allFrameworkEdges.filter((edge) => edge.evidence[0]?.properties?.framework === "tanstack-start");
+  assert.deepEqual(
+    [...new Set(startNodes.map((node) => node.kind))].sort(),
+    ["component", "middleware", "route", "server_function"],
+  );
+  const getAccount = startNodes.find((node) => node.kind === "server_function" && node.display_name === "getAccount");
+  const accountRoute = startNodes.find((node) => (
+    node.kind === "route" && node.properties.route_pattern === "/account/$accountId"
+  ));
+  const publicRoute = startNodes.find((node) => node.kind === "route" && node.properties.route_pattern === "/public");
+  const accountComponent = startNodes.find((node) => node.kind === "component" && node.display_name === "AccountPage");
+  const authMiddleware = startNodes.find((node) => node.kind === "middleware" && node.display_name === "authMiddleware");
+  const auditMiddleware = startNodes.find((node) => node.kind === "middleware" && node.display_name === "auditMiddleware");
+  const accountMiddleware = startNodes.find((node) => node.kind === "middleware" && node.display_name === "accountRouteMiddleware");
+  const rootMiddleware = startNodes.find((node) => node.kind === "middleware" && node.display_name === "rootMiddleware");
+  const breakoutMiddleware = startNodes.find((node) => node.kind === "middleware" && node.properties.middleware_inheritance === "break-out");
+  assert.equal(getAccount?.properties.http_method, "GET");
+  assert.equal(getAccount?.properties.production_rpc_id, null);
+  assert.equal(getAccount?.properties.production_rpc_id_status, "build-unobserved");
+  assert.equal(getAccount?.properties.build_boundary_reason, "tanstack_start_internal_virtual_module_unobserved");
+  assert.equal(typeof getAccount?.properties.handler_definition_id, "string");
+  assert.equal(typeof getAccount?.properties.validator_definition_id, "string");
+  const handledBy = startEdges.find((edge) => edge.kind === "handled_by" && edge.source === getAccount?.id);
+  assert.equal(nodeById.get(handledBy?.target)?.display_name, "accountHandler");
+  assert.deepEqual(
+    new Set(startEdges.filter((edge) => edge.kind === "rpc_call" && edge.target === getAccount?.id).map((edge) => edge.source)),
+    new Set([accountRoute?.id, accountComponent?.id]),
+  );
+  const middlewareTargets = (sourceId: string | undefined) => new Set(startEdges
+    .filter((edge) => edge.kind === "uses_middleware" && edge.source === sourceId)
+    .map((edge) => edge.target));
+  assert.deepEqual(middlewareTargets(getAccount?.id), new Set([authMiddleware?.id, auditMiddleware?.id]));
+  assert.deepEqual(
+    middlewareTargets(accountRoute?.id),
+    new Set([accountMiddleware?.id, authMiddleware?.id, rootMiddleware?.id]),
+  );
+  assert.deepEqual(middlewareTargets(publicRoute?.id), new Set([breakoutMiddleware?.id, rootMiddleware?.id]));
+  assert.ok(startSites.some((site) => (
+    site.kind === "uses_middleware"
+    && site.source === accountRoute?.id
+    && site.evidence[0]?.properties.occurrence_kind === "tanstack_start_inherited_pathless_middleware"
+    && JSON.stringify(site.condition).includes("_authenticated")
+  )));
+  assert.ok(startSites.some((site) => (
+    site.kind === "uses_middleware"
+    && site.source === publicRoute?.id
+    && site.evidence[0]?.properties.occurrence_kind === "tanstack_start_middleware_breakout"
+    && JSON.stringify(site.condition).includes("break-out")
+  )));
+  assert.ok(diagnostics.some((diagnostic) => (
+    diagnostic.code === "web.tanstack_start_build_rpc_id_unobserved"
+    && diagnostic.message.includes("were not guessed")
+  )));
+  assert.ok(!diagnostics.some((diagnostic) => diagnostic.code === "web.tanstack_start_semantic_delta_discarded"));
   assert.ok(!completed.completeness.includes("semantic-complete"));
   assert.ok(completed.reasons.includes("framework_semantic_capability_pending"));
   assert.equal(completed.dependency_sites, sites.length);
@@ -558,6 +616,40 @@ test("worker emits deterministic protocol graph without executing project code",
   });
   assert.deepEqual(normalize(first.events), normalize(second.events));
   for (const marker of markers) await assert.rejects(import("node:fs/promises").then(({ stat }) => stat(marker)));
+});
+
+test("unsupported TanStack Start versions remain explicit and do not fabricate server functions", async (context) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "depgraph-web-start-version-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  await mkdir(path.join(root, "src", "routes"), { recursive: true });
+  await Promise.all([
+    writeFile(path.join(root, "package.json"), JSON.stringify({
+      name: "unsupported-start",
+      version: "1.0.0",
+      dependencies: {
+        "@tanstack/react-router": "1.170.18",
+        "@tanstack/react-start": "2.0.0",
+      },
+    })),
+    writeFile(path.join(root, "src", "routes", "index.tsx"), [
+      'import { createFileRoute } from "@tanstack/react-router";',
+      'export const Route = createFileRoute("/")({});',
+      "",
+    ].join("\n")),
+    writeFile(path.join(root, "src", "server.ts"), [
+      'import { createServerFn } from "@tanstack/react-start";',
+      'export const unsupported = createServerFn({ method: "GET" }).handler(() => null);',
+      "",
+    ].join("\n")),
+  ]);
+  const result = await run("unsupported-start", root);
+  const nodes = result.events.filter((event) => event.event === "node_upsert").map((event) => event.node);
+  const diagnostics = result.events.filter((event) => event.event === "diagnostic").map((event) => event.diagnostic);
+  assert.ok(diagnostics.some((diagnostic) => (
+    diagnostic.code === "web.tanstack_start_version_unsupported"
+    && diagnostic.message.includes("2.0.0")
+  )));
+  assert.ok(!nodes.some((node) => node.kind === "server_function" && node.properties.framework === "tanstack-start"));
 });
 
 test("pure TypeScript semantic profiles allow candidate and external calls", async (context) => {

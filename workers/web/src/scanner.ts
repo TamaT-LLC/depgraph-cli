@@ -21,6 +21,7 @@ import {
 import { collectAstroSemanticDelta } from "./astro-semantic";
 import { collectNextSemanticDelta } from "./next-semantic";
 import { collectTanStackRouterSemanticDelta } from "./tanstack-router-semantic";
+import { collectTanStackStartSemanticDelta } from "./tanstack-start-semantic";
 import {
   analyzeTypeScriptProject,
   TYPESCRIPT_COMPILER_VERSION,
@@ -2268,6 +2269,44 @@ export async function scan(root: string, allFiles: string[], inventoryIssues: Fi
         severity: "warning",
         code: "web.tanstack_router_semantic_typechecker_unavailable",
         message: "TanStack Router framework semantic graph was not emitted because the canonical TypeScript definition graph was unavailable",
+        path: null,
+        profile_id: PROFILE_ID,
+        properties: { framework_semantic_issue: true },
+      });
+    }
+  }
+  const tanstackStartEntries = routeDiscovery.entries.filter((entry) => entry.framework === "tanstack-start");
+  if (tanstackStartEntries.length > 0) {
+    frameworkAttempted = true;
+    if (semanticGraphEmitted && nativeTypeScript.project.definitionGraphStatus === "ready") {
+      try {
+        const result = collectTanStackStartSemanticDelta({
+          entries: tanstackStartEntries,
+          sources: compilerSources,
+          sourceFiles: nativeTypeScript.semanticSourceFiles,
+          definitions: nativeTypeScript.definitionGraph,
+          dependencies: nativeTypeScript.dependencyGraph,
+          definitionNode: (key) => graph.typeScriptDefinitionNode(key),
+          fileNode: (relativePath) => graph.fileNodeByRelativePath(relativePath),
+          ownerForPath: (relativePath) => owningPackage(workspace, path.resolve(root, relativePath)),
+          unknownTarget: () => graph.unknownNode(),
+        });
+        mergeFrameworkResult("tanstack-start", result);
+      } catch (error) {
+        graph.addDiagnostic({
+          severity: "warning",
+          code: "web.tanstack_start_semantic_delta_discarded",
+          message: `TanStack Start framework semantic graph was discarded atomically after contract validation failed; syntax and TypeScript semantic graphs were preserved: ${error instanceof Error ? error.message : String(error)}`.slice(0, 2_048),
+          path: null,
+          profile_id: PROFILE_ID,
+          properties: { framework_semantic_issue: true },
+        });
+      }
+    } else {
+      graph.addDiagnostic({
+        severity: "warning",
+        code: "web.tanstack_start_semantic_typechecker_unavailable",
+        message: "TanStack Start framework semantic graph was not emitted because the canonical TypeScript definition graph was unavailable",
         path: null,
         profile_id: PROFILE_ID,
         properties: { framework_semantic_issue: true },
