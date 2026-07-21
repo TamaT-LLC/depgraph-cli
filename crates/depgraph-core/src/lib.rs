@@ -28,7 +28,7 @@ use worker::{
     AdapterKind, RUST_BACKEND_KIND, RUST_BACKEND_REVISION, RUST_BACKEND_SALSA_VERSION,
     RUST_BACKEND_VERSION, is_security_error, locate_worker, probe_toolchain_version,
     probe_worker_version, verify_release_artifact, verify_release_runtime_component,
-    verify_rust_release_handshake,
+    verify_rust_release_handshake, verify_web_release_handshake, verify_web_semantic_compatibility,
 };
 
 #[derive(Debug, Clone, Serialize)]
@@ -281,6 +281,8 @@ struct ReleaseWorker {
     version: String,
     #[serde(default)]
     backend: Option<ReleaseWorkerBackend>,
+    #[serde(default)]
+    semantic: Option<ReleaseWebSemanticAttestation>,
     path: String,
     sha256: String,
 }
@@ -291,6 +293,15 @@ struct ReleaseWorkerBackend {
     version: String,
     revision: String,
     salsa_version: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReleaseWebSemanticAttestation {
+    typescript_version: String,
+    capabilities: Vec<String>,
+    runtime_components: Vec<String>,
+    runtime_artifacts: Vec<String>,
 }
 
 fn worker_integrity(
@@ -344,6 +355,39 @@ fn worker_integrity(
         {
             return format!("error: {error:#}");
         }
+    } else if entry.backend.is_some() {
+        return format!(
+            "error: {} worker unexpectedly declares a Rust backend attestation",
+            adapter.name()
+        );
+    }
+    if adapter == AdapterKind::Web {
+        let Some(semantic) = &entry.semantic else {
+            return "error: Web worker semantic attestation is missing".to_owned();
+        };
+        if let Err(error) = verify_web_semantic_compatibility(
+            &semantic.typescript_version,
+            &semantic.capabilities,
+            &semantic.runtime_components,
+            &semantic.runtime_artifacts,
+        ) {
+            return format!("error: {error:#}");
+        }
+        if let Some(reported) = reported_version
+            && let Err(error) = verify_web_release_handshake(
+                reported,
+                &entry.version,
+                &semantic.typescript_version,
+                &semantic.capabilities,
+            )
+        {
+            return format!("error: {error:#}");
+        }
+    } else if entry.semantic.is_some() {
+        return format!(
+            "error: {} worker unexpectedly declares a Web semantic attestation",
+            adapter.name()
+        );
     }
     if let Some(reported) = reported_version {
         let actual = parse_worker_handshake(reported)

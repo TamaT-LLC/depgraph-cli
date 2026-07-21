@@ -204,7 +204,7 @@ test("native compiler internal timeout fails closed and reaps the child", {
   const { runtime, marker } = await fakeCompilerRuntime(
     context,
     "setInterval(() => undefined, 1_000);",
-    500,
+    1_500,
   );
   await assert.rejects(
     analyzeTypeScriptProjectWithRuntimeForTest(new Map([["index.ts", "export const value = 1;\n"]]), runtime),

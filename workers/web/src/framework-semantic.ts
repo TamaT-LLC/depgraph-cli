@@ -15,7 +15,16 @@ import {
 export const WEB_FRAMEWORK_SEMANTIC_CAPABILITY = "framework-semantic-graph-v1" as const;
 export const WEB_FRAMEWORK_SEMANTIC_EXTRACTOR_VERSION = "0.1.0" as const;
 export const WEB_FRAMEWORK_COMPLETENESS_CAPABILITY = "framework-semantic-completeness-v1" as const;
-const TYPESCRIPT_SEMANTIC_CAPABILITY = "typescript-definition-import-type-call-graph-v2";
+export const TYPESCRIPT_SEMANTIC_CAPABILITY = "typescript-definition-import-type-call-graph-v2" as const;
+export const WEB_SEMANTIC_RELEASE_CAPABILITIES = Object.freeze([
+  "astro-component-render-hydration-v1",
+  WEB_FRAMEWORK_COMPLETENESS_CAPABILITY,
+  WEB_FRAMEWORK_SEMANTIC_CAPABILITY,
+  "next-route-component-boundary-v1",
+  "tanstack-router-typed-route-v1",
+  "tanstack-start-rpc-middleware-v1",
+  TYPESCRIPT_SEMANTIC_CAPABILITY,
+] as const);
 const REQUIRED_CAPABILITY_BY_FRAMEWORK = new Map([
   ["next", "next-route-component-boundary-v1"],
   ["astro", "astro-component-render-hydration-v1"],

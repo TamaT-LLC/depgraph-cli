@@ -64,7 +64,11 @@ jobs:
     needs: [rust, go, web]
     strategy:
       matrix:
-        os: [ubuntu-24.04, macos-15]
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - os: macos-15
+            target: aarch64-apple-darwin
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -478,6 +482,10 @@ jobs:
           test ! -e "$fixture/CONFIG_EXECUTED"
       - name: Rust HIR semantic query, export, and determinism gate
         run: cargo xtask rust-semantic-e2e
+      - name: Packaged Web semantic archive gate
+        env:
+          DEPGRAPH_TARGET: ${{ matrix.target }}
+        run: cargo xtask package
 
   windows-smoke:
     needs: [rust, go, web]
@@ -850,6 +858,65 @@ jobs:
               @($frameworkCompleteCoverage.reasons) -contains 'framework_semantic_incomplete' -or
               $dynamicFrameworkSites.Count -eq 0) {
             throw 'Mixed framework fixture lost its complete ledger or dynamic-boundary gate'
+          }
+          $isolatedParent = Join-Path $env:RUNNER_TEMP "depgraph-web-framework-$([guid]::NewGuid())"
+          New-Item -ItemType Directory -Path $isolatedParent | Out-Null
+          $frameworkCases = @(
+            [pscustomobject]@{ Framework = 'astro'; App = 'astro'; SemanticComplete = $true },
+            [pscustomobject]@{ Framework = 'next'; App = 'next'; SemanticComplete = $true },
+            [pscustomobject]@{ Framework = 'tanstack-router'; App = 'router'; SemanticComplete = $false },
+            [pscustomobject]@{ Framework = 'tanstack-start'; App = 'start'; SemanticComplete = $false }
+          )
+          foreach ($case in $frameworkCases) {
+            $isolatedRoot = Join-Path $isolatedParent $case.App
+            Copy-Item workers\web\test\fixtures\framework-complete $isolatedRoot -Recurse
+            Get-ChildItem (Join-Path $isolatedRoot 'apps') -Directory |
+              Where-Object Name -ne $case.App |
+              Remove-Item -Recurse -Force
+            if ($case.Framework -in @('astro', 'next')) {
+              Remove-Item (Join-Path $isolatedRoot 'packages') -Recurse -Force
+            }
+            $caseLines = node workers\web\dist\worker.mjs --root $isolatedRoot --scan-id "windows-$($case.App)-complete"
+            if ($LASTEXITCODE -ne 0) { throw "$($case.Framework) worker scan failed with exit $LASTEXITCODE" }
+            $caseEvents = @($caseLines | ForEach-Object { $_ | ConvertFrom-Json })
+            $caseProfile = ($caseEvents | Where-Object event -eq 'profile_declared' | Select-Object -First 1).profile
+            $caseCoverage = ($caseEvents | Where-Object event -eq 'scan_completed' | Select-Object -Last 1).coverage
+            $caseLedger = @($caseProfile.properties.web_framework_completeness_ledger | ConvertFrom-Json)
+            $caseEdges = @($caseEvents | Where-Object {
+              $_.edge.phase -eq 'semantic' -and
+              $_.edge.evidence[0].kind -eq 'semantic' -and
+              $_.edge.evidence[0].properties.framework -eq $case.Framework -and
+              $_.edge.evidence[0].properties.contract_version -eq 'framework-semantic-graph-v1'
+            })
+            $hasSemanticComplete = @($caseCoverage.completeness) -contains 'semantic-complete'
+            if (($caseProfile.features -join ',') -ne $case.Framework -or
+                $caseProfile.properties.web_framework_completeness_status -ne 'complete' -or
+                $caseLedger.Count -ne 1 -or $caseLedger[0].framework -ne $case.Framework -or
+                $caseLedger[0].status -ne 'complete' -or @($caseLedger[0].reasons).Count -ne 0 -or
+                $caseCoverage.project_code_executed -ne $false -or
+                $hasSemanticComplete -ne $case.SemanticComplete -or
+                @($caseCoverage.reasons) -contains 'framework_semantic_incomplete' -or
+                $caseEdges.Count -eq 0) {
+              throw "$($case.Framework) fixture lost its isolated semantic capability or safety gate"
+            }
+          }
+          $secondRoot = Join-Path $isolatedParent 'mixed-checkout-two'
+          Copy-Item workers\web\test\fixtures\framework-complete $secondRoot -Recurse
+          $frameworkCompleteLinesTwo = node workers\web\dist\worker.mjs --root $secondRoot --scan-id windows-web-framework-complete-two
+          if ($LASTEXITCODE -ne 0) { throw "Second framework-complete worker scan failed with exit $LASTEXITCODE" }
+          $normalizeEvents = {
+            param([object[]]$eventLines)
+            @($eventLines | ForEach-Object {
+              $eventObject = $_ | ConvertFrom-Json
+              $eventObject.PSObject.Properties.Remove('scan_id')
+              if ($eventObject.event -eq 'scan_started') {
+                $eventObject.PSObject.Properties.Remove('root')
+              }
+              $eventObject | ConvertTo-Json -Compress -Depth 100
+            }) -join "`n"
+          }
+          if ((& $normalizeEvents $frameworkCompleteLines) -cne (& $normalizeEvents $frameworkCompleteLinesTwo)) {
+            throw 'Mixed framework events changed across checkout-equivalent roots'
           }
           if (Test-Path workers\web\test\fixtures\polyglot\apps\next-app\NEXT_CONFIG_EXECUTED) { throw 'Next config executed' }
           if (Test-Path workers\web\test\fixtures\polyglot\apps\astro-app\ASTRO_CONFIG_EXECUTED) { throw 'Astro config executed' }
