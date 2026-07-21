@@ -2068,7 +2068,8 @@ fn validate_framework_site_endpoints(
             source.kind.as_str(),
             "file" | "symbol" | "component" | "server_function"
         ),
-        "parent_route" | "loads" | "before_load" => source.kind == "route",
+        "loads" => matches!(source.kind.as_str(), "component" | "route"),
+        "parent_route" | "before_load" => source.kind == "route",
         "navigates_to" | "masks_to" => {
             matches!(source.kind.as_str(), "component" | "route" | "symbol")
         }
@@ -2100,7 +2101,10 @@ fn validate_framework_site_endpoints(
                 target.kind == "component"
             }
             "route_entry" | "parent_route" | "navigates_to" | "masks_to" => target.kind == "route",
-            "loads" | "before_load" => {
+            "loads" => {
+                matches!(target.kind.as_str(), "file" | "symbol" | "server_function")
+            }
+            "before_load" => {
                 matches!(target.kind.as_str(), "symbol" | "server_function")
             }
             "rpc_call" | "client_stub_for" => target.kind == "server_function",

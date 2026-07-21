@@ -2537,6 +2537,66 @@ fn verify_packaged_web_import_type_call_graph(executable: &Path, store: &Path) -
         }
     }
 
+    let all_framework_node_ids: BTreeSet<_> = nodes
+        .iter()
+        .filter(|node| {
+            matches!(node["kind"].as_str(), Some("component" | "route"))
+                && matches!(
+                    node["properties"]["canonical_identity"]["framework"].as_str(),
+                    Some("next" | "astro")
+                )
+                && node["properties"]["framework"]
+                    == node["properties"]["canonical_identity"]["framework"]
+        })
+        .filter_map(|node| node["id"].as_str())
+        .collect();
+    let all_framework_nodes: Vec<_> = nodes
+        .iter()
+        .filter(|node| {
+            node["id"]
+                .as_str()
+                .is_some_and(|id| all_framework_node_ids.contains(id))
+        })
+        .collect();
+    let all_framework_site_ids: BTreeSet<_> = evidence
+        .iter()
+        .filter(|item| {
+            item["owner_type"] == "site"
+                && item["ordinal"].as_u64() == Some(0)
+                && item["kind"] == "semantic"
+                && item["extractor_version"] == "0.1.0"
+                && item["properties"]["contract_version"] == "framework-semantic-graph-v1"
+        })
+        .filter_map(|item| item["owner_id"].as_str())
+        .collect();
+    let all_framework_edge_ids: BTreeSet<_> = evidence
+        .iter()
+        .filter(|item| {
+            item["owner_type"] == "edge"
+                && item["ordinal"].as_u64() == Some(0)
+                && item["kind"] == "semantic"
+                && item["extractor_version"] == "0.1.0"
+                && item["properties"]["contract_version"] == "framework-semantic-graph-v1"
+        })
+        .filter_map(|item| item["owner_id"].as_str())
+        .collect();
+    let all_framework_sites: Vec<_> = sites
+        .iter()
+        .filter(|site| {
+            site["id"]
+                .as_str()
+                .is_some_and(|id| all_framework_site_ids.contains(id))
+        })
+        .collect();
+    let all_framework_edges: Vec<_> = edges
+        .iter()
+        .filter(|edge| {
+            edge["id"]
+                .as_str()
+                .is_some_and(|id| all_framework_edge_ids.contains(id))
+        })
+        .collect();
+
     let framework_node_ids: BTreeSet<_> = nodes
         .iter()
         .filter(|node| {
@@ -2603,9 +2663,18 @@ fn verify_packaged_web_import_type_call_graph(executable: &Path, store: &Path) -
         bail!("packaged Web profile did not emit the Next.js semantic graph: {properties}");
     }
     for (property, actual) in [
-        ("web_framework_semantic_node_count", framework_nodes.len()),
-        ("web_framework_semantic_site_count", framework_sites.len()),
-        ("web_framework_semantic_edge_count", framework_edges.len()),
+        (
+            "web_framework_semantic_node_count",
+            all_framework_nodes.len(),
+        ),
+        (
+            "web_framework_semantic_site_count",
+            all_framework_sites.len(),
+        ),
+        (
+            "web_framework_semantic_edge_count",
+            all_framework_edges.len(),
+        ),
     ] {
         let declared = properties[property]
             .as_str()
@@ -2819,6 +2888,307 @@ fn verify_packaged_web_import_type_call_graph(executable: &Path, store: &Path) -
         {
             bail!("packaged Web queries lost the Next.js {label} edge or its evidence");
         }
+    }
+
+    let astro_nodes: Vec<_> = all_framework_nodes
+        .iter()
+        .copied()
+        .filter(|node| node["properties"]["framework"] == "astro")
+        .collect();
+    let astro_site_ids: BTreeSet<_> = evidence
+        .iter()
+        .filter(|item| {
+            item["owner_type"] == "site"
+                && item["ordinal"].as_u64() == Some(0)
+                && item["kind"] == "semantic"
+                && item["extractor"] == "astro-static-adapter"
+                && item["extractor_version"] == "0.1.0"
+                && item["properties"]["framework"] == "astro"
+                && item["properties"]["contract_version"] == "framework-semantic-graph-v1"
+        })
+        .filter_map(|item| item["owner_id"].as_str())
+        .collect();
+    let astro_edge_ids: BTreeSet<_> = evidence
+        .iter()
+        .filter(|item| {
+            item["owner_type"] == "edge"
+                && item["ordinal"].as_u64() == Some(0)
+                && item["kind"] == "semantic"
+                && item["extractor"] == "astro-static-adapter"
+                && item["extractor_version"] == "0.1.0"
+                && item["properties"]["framework"] == "astro"
+                && item["properties"]["contract_version"] == "framework-semantic-graph-v1"
+        })
+        .filter_map(|item| item["owner_id"].as_str())
+        .collect();
+    let astro_sites: Vec<_> = all_framework_sites
+        .iter()
+        .copied()
+        .filter(|site| {
+            site["id"]
+                .as_str()
+                .is_some_and(|id| astro_site_ids.contains(id))
+        })
+        .collect();
+    let astro_edges: Vec<_> = all_framework_edges
+        .iter()
+        .copied()
+        .filter(|edge| {
+            edge["id"]
+                .as_str()
+                .is_some_and(|id| astro_edge_ids.contains(id))
+        })
+        .collect();
+    let astro_kinds: BTreeSet<_> = astro_edges
+        .iter()
+        .filter_map(|edge| edge["kind"].as_str())
+        .collect();
+    if astro_kinds
+        != BTreeSet::from([
+            "client_boundary",
+            "handled_by",
+            "hydrates",
+            "loads",
+            "renders",
+            "route_entry",
+            "server_boundary",
+        ])
+    {
+        bail!("packaged Astro graph lost its route/render/hydration/resource vocabulary");
+    }
+    let astro_component = |source_path: &str, environment: &str| {
+        astro_nodes.iter().copied().find(|node| {
+            node["kind"] == "component"
+                && node["properties"]["source_path"] == source_path
+                && node["properties"]["environment"] == environment
+        })
+    };
+    let astro_page = astro_component("apps/astro-app/src/pages/blog/[slug].astro", "server")
+        .context("packaged Astro graph omitted its page component")?;
+    let astro_card = astro_component("apps/astro-app/src/components/Card.astro", "server")
+        .context("packaged Astro graph omitted its imported local component")?;
+    let astro_alternative =
+        astro_component("apps/astro-app/src/components/Alternative.astro", "server")
+            .context("packaged Astro graph omitted its dynamic alternative component")?;
+    let astro_interactive_browser =
+        astro_component("apps/astro-app/src/components/Interactive.tsx", "browser")
+            .context("packaged Astro graph omitted its browser component identity")?;
+    let astro_route = astro_nodes
+        .iter()
+        .copied()
+        .find(|node| {
+            node["kind"] == "route"
+                && node["properties"]["canonical_identity"]["route_pattern"] == "/docs/blog/$slug"
+        })
+        .context("packaged Astro graph omitted its filesystem page route")?;
+    let astro_page_id = astro_page["id"]
+        .as_str()
+        .context("packaged Astro page omitted its ID")?;
+    let astro_card_id = astro_card["id"]
+        .as_str()
+        .context("packaged Astro card omitted its ID")?;
+    let astro_alternative_id = astro_alternative["id"]
+        .as_str()
+        .context("packaged Astro alternative omitted its ID")?;
+    let astro_interactive_browser_id = astro_interactive_browser["id"]
+        .as_str()
+        .context("packaged Astro browser component omitted its ID")?;
+    let astro_route_id = astro_route["id"]
+        .as_str()
+        .context("packaged Astro route omitted its ID")?;
+    let astro_card_render = astro_edges
+        .iter()
+        .copied()
+        .find(|edge| {
+            edge["kind"] == "renders"
+                && edge["source"] == astro_page_id
+                && edge["target"] == astro_card_id
+                && evidence.iter().any(|item| {
+                    item["owner_type"] == "edge"
+                        && item["owner_id"] == edge["id"]
+                        && item["ordinal"].as_u64() == Some(0)
+                        && item["properties"]["occurrence_kind"] == "astro_component_render"
+                })
+        })
+        .context("packaged Astro graph omitted its exact imported component render")?;
+    if astro_card_render["resolution_status"] != "resolved"
+        || astro_card_render["precision"] != "exact"
+    {
+        bail!("packaged Astro imported component render is not exact");
+    }
+    let astro_route_render = astro_edges
+        .iter()
+        .copied()
+        .find(|edge| {
+            edge["kind"] == "renders"
+                && edge["source"] == astro_route_id
+                && edge["target"] == astro_page_id
+                && evidence.iter().any(|item| {
+                    item["owner_type"] == "edge"
+                        && item["owner_id"] == edge["id"]
+                        && item["ordinal"].as_u64() == Some(0)
+                        && item["properties"]["occurrence_kind"] == "astro_route_render"
+                })
+        })
+        .context("packaged Astro graph omitted its route-to-page render")?;
+    let hydration_sites: Vec<_> = astro_sites
+        .iter()
+        .copied()
+        .filter(|site| site["kind"] == "hydrates")
+        .collect();
+    if hydration_sites.len() != 3
+        || hydration_sites.iter().any(|site| {
+            site["resolution_status"] != "resolved"
+                || site["precision"] != "exact"
+                || site["target_ids"] != json!([astro_interactive_browser_id])
+                || !site["condition"].to_string().contains("client:")
+                || !site["condition"].to_string().contains("browser")
+        })
+        || astro_edges
+            .iter()
+            .filter(|edge| edge["kind"] == "client_boundary")
+            .count()
+            != 3
+        || !astro_edges.iter().any(|edge| {
+            edge["kind"] == "server_boundary"
+                && edge["source"] == astro_page_id
+                && edge["condition"].to_string().contains("server:defer")
+        })
+    {
+        bail!("packaged Astro graph lost directive-backed hydration or defer boundaries");
+    }
+    let dynamic_astro = astro_sites
+        .iter()
+        .copied()
+        .find(|site| site["kind"] == "renders" && site["specifier"] == "Dynamic")
+        .context("packaged Astro graph omitted its closed dynamic component flow")?;
+    let dynamic_targets: BTreeSet<_> = dynamic_astro["target_ids"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
+    if dynamic_astro["resolution_status"] != "candidates"
+        || dynamic_astro["precision"] != "overapprox"
+        || dynamic_targets != BTreeSet::from([astro_card_id, astro_alternative_id])
+    {
+        bail!("packaged Astro dynamic component flow lost its closed candidate set");
+    }
+    let missing_astro = astro_sites
+        .iter()
+        .copied()
+        .find(|site| site["kind"] == "renders" && site["specifier"] == "Missing")
+        .context("packaged Astro graph silently omitted a missing component import")?;
+    if missing_astro["resolution_status"] != "unresolved"
+        || missing_astro["reason"].as_str().is_none_or(str::is_empty)
+        || missing_astro["target_ids"]
+            .as_array()
+            .and_then(|targets| targets.first())
+            .and_then(Value::as_str)
+            .and_then(|target| nodes_by_id.get(target))
+            .is_none_or(|target| target["kind"] != "unknown_target")
+    {
+        bail!("packaged Astro missing component did not remain unresolved");
+    }
+    let broken_directive = astro_sites
+        .iter()
+        .copied()
+        .find(|site| site["reason"] == "multiple_astro_environment_directives")
+        .context("packaged Astro graph silently omitted conflicting environment directives")?;
+    if broken_directive["resolution_status"] != "unresolved"
+        || broken_directive["target_ids"]
+            .as_array()
+            .and_then(|targets| targets.first())
+            .and_then(Value::as_str)
+            .and_then(|target| nodes_by_id.get(target))
+            .is_none_or(|target| target["kind"] != "unknown_target")
+    {
+        bail!("packaged Astro conflicting directives did not remain unresolved");
+    }
+    let asset_load = astro_sites
+        .iter()
+        .copied()
+        .find(|site| site["kind"] == "loads" && site["specifier"] == "../../assets/hero.svg")
+        .context("packaged Astro graph omitted its static asset load")?;
+    let asset_target = asset_load["target_ids"]
+        .as_array()
+        .and_then(|targets| targets.first())
+        .and_then(Value::as_str)
+        .and_then(|target| nodes_by_id.get(target))
+        .context("packaged Astro asset load target is missing")?;
+    let collection_load = astro_sites
+        .iter()
+        .copied()
+        .find(|site| site["kind"] == "loads" && site["specifier"] == "astro:content/posts")
+        .context("packaged Astro graph omitted getCollection")?;
+    let entry_load = astro_sites
+        .iter()
+        .copied()
+        .find(|site| site["kind"] == "loads" && site["specifier"] == "astro:content/posts/one")
+        .context("packaged Astro graph omitted getEntry")?;
+    if asset_target["kind"] != "file"
+        || asset_target["properties"]["path"] != "apps/astro-app/src/assets/hero.svg"
+        || collection_load["resolution_status"] != "candidates"
+        || collection_load["target_ids"].as_array().map(Vec::len) != Some(2)
+        || entry_load["resolution_status"] != "resolved"
+    {
+        bail!("packaged Astro resource graph lost static asset or content targets");
+    }
+    let astro_handler = astro_edges
+        .iter()
+        .copied()
+        .find(|edge| edge["kind"] == "handled_by")
+        .context("packaged Astro graph omitted its endpoint handler")?;
+    if astro_handler["target"]
+        .as_str()
+        .and_then(|target| nodes_by_id.get(target))
+        .is_none_or(|target| target["kind"] != "symbol")
+        || !astro_handler["condition"].to_string().contains("GET")
+    {
+        bail!("packaged Astro endpoint handler lost its exact method symbol");
+    }
+
+    let astro_edge_id = astro_route_render["id"]
+        .as_str()
+        .context("packaged Astro render edge omitted its ID")?;
+    let astro_source_selector = format!("id:{astro_route_id}");
+    let astro_target_selector = format!("id:{astro_page_id}");
+    let astro_query_contains_edge = |query: &Value| {
+        query["data"]["steps"].as_array().is_some_and(|steps| {
+            steps.iter().any(|step| {
+                step["edge"]["id"] == astro_edge_id
+                    && step["edge"]["phase"] == "semantic"
+                    && step["evidence"].as_array().is_some_and(|items| {
+                        items.iter().any(|item| {
+                            item["kind"] == "semantic"
+                                && item["extractor"] == "astro-static-adapter"
+                        })
+                    })
+            })
+        })
+    };
+    let astro_deps = packaged_web_query(
+        executable,
+        store,
+        &["deps", &astro_source_selector, "--json"],
+        "query packaged Astro render dependencies",
+    )?;
+    let astro_why = packaged_web_query(
+        executable,
+        store,
+        &[
+            "why",
+            &astro_source_selector,
+            &astro_target_selector,
+            "--json",
+        ],
+        "explain packaged Astro render",
+    )?;
+    if !astro_query_contains_edge(&astro_deps)
+        || astro_why["data"]["path_found"] != true
+        || !astro_query_contains_edge(&astro_why)
+    {
+        bail!("packaged Web queries lost the Astro render edge or its evidence");
     }
     let coverage = &graph["coverage"];
     let classified_sites = ["resolved", "candidates", "external", "unresolved"]
