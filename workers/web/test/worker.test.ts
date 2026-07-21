@@ -557,10 +557,12 @@ test("worker emits deterministic protocol graph without executing project code",
   const publicRoute = startNodes.find((node) => node.kind === "route" && node.properties.route_pattern === "/public");
   const accountComponent = startNodes.find((node) => node.kind === "component" && node.display_name === "AccountPage");
   const authMiddleware = startNodes.find((node) => node.kind === "middleware" && node.display_name === "authMiddleware");
+  const pathlessAuditMiddleware = startNodes.find((node) => node.kind === "middleware" && node.display_name === "pathlessAuditMiddleware");
   const auditMiddleware = startNodes.find((node) => node.kind === "middleware" && node.display_name === "auditMiddleware");
   const accountMiddleware = startNodes.find((node) => node.kind === "middleware" && node.display_name === "accountRouteMiddleware");
   const adminMiddleware = startNodes.find((node) => node.kind === "middleware" && node.display_name === "adminMiddleware");
   const rootMiddleware = startNodes.find((node) => node.kind === "middleware" && node.display_name === "rootMiddleware");
+  const rootAuditMiddleware = startNodes.find((node) => node.kind === "middleware" && node.display_name === "rootAuditMiddleware");
   const breakoutMiddleware = startNodes.find((node) => node.kind === "middleware" && node.properties.middleware_inheritance === "break-out");
   assert.equal(getAccount?.properties.http_method, "GET");
   assert.equal(getAccount?.properties.production_rpc_id, null);
@@ -580,10 +582,19 @@ test("worker emits deterministic protocol graph without executing project code",
   assert.deepEqual(middlewareTargets(getAccount?.id), new Set([authMiddleware?.id, auditMiddleware?.id]));
   assert.deepEqual(
     middlewareTargets(accountRoute?.id),
-    new Set([accountMiddleware?.id, authMiddleware?.id, rootMiddleware?.id]),
+    new Set([
+      accountMiddleware?.id,
+      authMiddleware?.id,
+      pathlessAuditMiddleware?.id,
+      rootMiddleware?.id,
+      rootAuditMiddleware?.id,
+    ]),
   );
   assert.ok(!middlewareTargets(accountRoute?.id).has(adminMiddleware?.id));
-  assert.deepEqual(middlewareTargets(publicRoute?.id), new Set([breakoutMiddleware?.id, rootMiddleware?.id]));
+  assert.deepEqual(
+    middlewareTargets(publicRoute?.id),
+    new Set([breakoutMiddleware?.id, rootMiddleware?.id, rootAuditMiddleware?.id]),
+  );
   assert.ok(startSites.some((site) => (
     site.kind === "uses_middleware"
     && site.source === accountRoute?.id

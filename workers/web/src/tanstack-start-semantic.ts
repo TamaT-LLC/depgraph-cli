@@ -842,7 +842,10 @@ export function collectTanStackStartSemanticDelta(
   }
 
   const routeRecords = [...routeNodesByPath].flatMap(([relativePath, routeNodes]) => routeNodes.map((node) => ({ relativePath, node })));
-  const directMiddlewareByPath = new Map<string, MiddlewareDeclaration[]>();
+  const directMiddlewareByPath = new Map<string, Array<{
+    declaration: MiddlewareDeclaration;
+    span: Span;
+  }>>();
   for (const site of sites.values()) {
     if (site.kind !== "uses_middleware" || site.evidence[0]?.properties?.framework !== FRAMEWORK
       || site.evidence[0]?.properties?.occurrence_kind !== "tanstack_start_route_middleware") continue;
@@ -850,8 +853,17 @@ export function collectTanStackStartSemanticDelta(
     if (!target) continue;
     const declaration = [...middleware.values()].find((item) => item.node.id === target.id);
     if (!declaration) continue;
+    const primary = site.evidence[0]!;
     const values = directMiddlewareByPath.get(site.evidence[0]!.path) ?? [];
-    values.push(declaration);
+    values.push({
+      declaration,
+      span: {
+        start_line: primary.start_line!,
+        start_column: primary.start_column!,
+        end_line: primary.end_line!,
+        end_column: primary.end_column!,
+      },
+    });
     directMiddlewareByPath.set(site.evidence[0]!.path, values);
   }
   const rootRoutes = routeRecords.filter((record) => record.node.properties.route_pattern === "/");
@@ -864,13 +876,13 @@ export function collectTanStackStartSemanticDelta(
     const recordDirectory = path.posix.dirname(record.relativePath);
     for (const root of rootRoutes) {
       if (root.relativePath === record.relativePath || root.node.properties.package_locator !== record.node.properties.package_locator) continue;
-      for (const target of directMiddlewareByPath.get(root.relativePath) ?? []) addRelation(
+      for (const inherited of directMiddlewareByPath.get(root.relativePath) ?? []) addRelation(
         record.node,
-        [target.node],
+        [inherited.declaration.node],
         "uses_middleware",
-        target.name,
-        record.relativePath,
-        spanFor(source, anchor),
+        inherited.declaration.name,
+        root.relativePath,
+        inherited.span,
         condition("server", { "tanstack.start.middleware_scope": "route-inherited-root" }),
         "server",
         "tanstack_start_inherited_root_middleware",
@@ -895,18 +907,18 @@ export function collectTanStackStartSemanticDelta(
       );
       continue;
     }
-    for (const [layoutPath, targets] of directMiddlewareByPath) {
+    for (const [layoutPath, inheritedMiddleware] of directMiddlewareByPath) {
       if (input.ownerForPath(layoutPath).locator !== recordOwner
         || path.posix.dirname(layoutPath) !== recordDirectory) continue;
       const layoutStem = path.posix.basename(layoutPath).replace(/\.[^.]+$/u, "");
       if (!layoutStem.startsWith("_") || layoutStem.endsWith("_") || !basename.startsWith(`${layoutStem}.`)) continue;
-      for (const target of targets) addRelation(
+      for (const inherited of inheritedMiddleware) addRelation(
         record.node,
-        [target.node],
+        [inherited.declaration.node],
         "uses_middleware",
-        target.name,
-        record.relativePath,
-        spanFor(source, anchor),
+        inherited.declaration.name,
+        layoutPath,
+        inherited.span,
         condition("server", { "tanstack.start.middleware_scope": "route-inherited-pathless", "tanstack.start.pathless_layout": layoutStem }),
         "server",
         "tanstack_start_inherited_pathless_middleware",

@@ -1,5 +1,5 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { rootMiddleware } from "../server/middleware";
+import { rootAuditMiddleware, rootMiddleware } from "../server/middleware";
 
 export function StartHome() {
   return null;
@@ -7,5 +7,5 @@ export function StartHome() {
 
 export const Route = createFileRoute("/")({
   component: StartHome,
-  server: { middleware: [rootMiddleware] },
+  server: { middleware: [rootMiddleware, rootAuditMiddleware] },
 });

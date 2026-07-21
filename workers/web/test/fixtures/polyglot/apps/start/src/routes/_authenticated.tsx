@@ -1,6 +1,6 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { authMiddleware } from "../server/middleware";
+import { authMiddleware, pathlessAuditMiddleware } from "../server/middleware";
 
 export const Route = createFileRoute("/_authenticated")({
-  server: { middleware: [authMiddleware] },
+  server: { middleware: [authMiddleware, pathlessAuditMiddleware] },
 });

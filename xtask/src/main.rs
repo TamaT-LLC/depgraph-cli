@@ -3444,6 +3444,10 @@ fn verify_packaged_web_import_type_call_graph(executable: &Path, store: &Path) -
         .context("packaged TanStack Start graph omitted accountRouteMiddleware")?;
     let root_middleware = start_middleware("rootMiddleware")
         .context("packaged TanStack Start graph omitted rootMiddleware")?;
+    let root_audit_middleware = start_middleware("rootAuditMiddleware")
+        .context("packaged TanStack Start graph omitted rootAuditMiddleware")?;
+    let pathless_audit_middleware = start_middleware("pathlessAuditMiddleware")
+        .context("packaged TanStack Start graph omitted pathlessAuditMiddleware")?;
     let breakout_middleware = start_nodes
         .iter()
         .copied()
@@ -3521,6 +3525,12 @@ fn verify_packaged_web_import_type_call_graph(executable: &Path, store: &Path) -
     let root_middleware_id = root_middleware["id"]
         .as_str()
         .context("packaged TanStack Start root middleware omitted its ID")?;
+    let root_audit_middleware_id = root_audit_middleware["id"]
+        .as_str()
+        .context("packaged TanStack Start root audit middleware omitted its ID")?;
+    let pathless_audit_middleware_id = pathless_audit_middleware["id"]
+        .as_str()
+        .context("packaged TanStack Start pathless audit middleware omitted its ID")?;
     let breakout_middleware_id = breakout_middleware["id"]
         .as_str()
         .context("packaged TanStack Start break-out middleware omitted its ID")?;
@@ -3530,10 +3540,16 @@ fn verify_packaged_web_import_type_call_graph(executable: &Path, store: &Path) -
             != BTreeSet::from([
                 account_middleware_id,
                 auth_middleware_id,
+                pathless_audit_middleware_id,
                 root_middleware_id,
+                root_audit_middleware_id,
             ])
         || middleware_targets(start_public_route_id)
-            != BTreeSet::from([breakout_middleware_id, root_middleware_id])
+            != BTreeSet::from([
+                breakout_middleware_id,
+                root_middleware_id,
+                root_audit_middleware_id,
+            ])
     {
         bail!("packaged TanStack Start graph lost direct, inherited, or break-out middleware");
     }
