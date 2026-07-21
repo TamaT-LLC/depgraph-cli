@@ -1,0 +1,8 @@
+{
+  "name": "@fixture/complete-astro",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "astro": "5.12.0"
+  }
+}

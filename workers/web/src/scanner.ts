@@ -14,6 +14,7 @@ import {
 import { discoverRoutes, type RouteEntry } from "./routes";
 import { mergeTypeScriptDefinitionDelta, type TypeScriptDefinitionDelta } from "./semantic-delta";
 import {
+  buildFrameworkCompleteness,
   mergeFrameworkSemanticDelta,
   WEB_FRAMEWORK_SEMANTIC_CAPABILITY,
   type FrameworkSemanticDelta,
@@ -2154,7 +2155,13 @@ export async function scan(root: string, allFiles: string[], inventoryIssues: Fi
 
   const frameworkCounts = { nodes: 0, sites: 0, edges: 0 };
   const emittedFrameworks = new Set<string>();
+  const frameworkIssues = new Map<string, Set<string>>();
   let frameworkAttempted = false;
+  const markFrameworkIssue = (framework: string, reason: string): void => {
+    const reasons = frameworkIssues.get(framework) ?? new Set<string>();
+    reasons.add(reason.slice(0, 512));
+    frameworkIssues.set(framework, reasons);
+  };
   const mergeFrameworkResult = (
     framework: string,
     result: { delta: FrameworkSemanticDelta; diagnostics: Array<Omit<Diagnostic, "id">> },
@@ -2163,7 +2170,17 @@ export async function scan(root: string, allFiles: string[], inventoryIssues: Fi
     frameworkCounts.nodes += counts.nodes;
     frameworkCounts.sites += counts.sites;
     frameworkCounts.edges += counts.edges;
-    for (const diagnostic of result.diagnostics) graph.addDiagnostic(diagnostic);
+    for (const site of result.delta.sites) {
+      if (site.resolution_status === "unresolved") {
+        markFrameworkIssue(framework, `unresolved:${site.reason ?? "framework_target_unresolved"}`);
+      }
+    }
+    for (const diagnostic of result.diagnostics) {
+      graph.addDiagnostic(diagnostic);
+      if (diagnostic.properties?.framework_semantic_issue === true) {
+        markFrameworkIssue(framework, `diagnostic:${diagnostic.code}`);
+      }
+    }
     emittedFrameworks.add(framework);
   };
   const nextEntries = routeDiscovery.entries.filter((entry) => entry.framework === "next");
@@ -2184,6 +2201,7 @@ export async function scan(root: string, allFiles: string[], inventoryIssues: Fi
         });
         mergeFrameworkResult("next", result);
       } catch (error) {
+        markFrameworkIssue("next", "collector_delta_discarded");
         graph.addDiagnostic({
           severity: "warning",
           code: "web.next_semantic_delta_discarded",
@@ -2194,6 +2212,7 @@ export async function scan(root: string, allFiles: string[], inventoryIssues: Fi
         });
       }
     } else {
+      markFrameworkIssue("next", "typescript_definition_graph_unavailable");
       graph.addDiagnostic({
         severity: "warning",
         code: "web.next_semantic_typechecker_unavailable",
@@ -2228,6 +2247,7 @@ export async function scan(root: string, allFiles: string[], inventoryIssues: Fi
       });
       mergeFrameworkResult("astro", result);
     } catch (error) {
+      markFrameworkIssue("astro", "collector_delta_discarded");
       graph.addDiagnostic({
         severity: "warning",
         code: "web.astro_semantic_delta_discarded",
@@ -2255,6 +2275,7 @@ export async function scan(root: string, allFiles: string[], inventoryIssues: Fi
         });
         mergeFrameworkResult("tanstack-router", result);
       } catch (error) {
+        markFrameworkIssue("tanstack-router", "collector_delta_discarded");
         graph.addDiagnostic({
           severity: "warning",
           code: "web.tanstack_router_semantic_delta_discarded",
@@ -2265,6 +2286,7 @@ export async function scan(root: string, allFiles: string[], inventoryIssues: Fi
         });
       }
     } else {
+      markFrameworkIssue("tanstack-router", "typescript_definition_graph_unavailable");
       graph.addDiagnostic({
         severity: "warning",
         code: "web.tanstack_router_semantic_typechecker_unavailable",
@@ -2293,6 +2315,7 @@ export async function scan(root: string, allFiles: string[], inventoryIssues: Fi
         });
         mergeFrameworkResult("tanstack-start", result);
       } catch (error) {
+        markFrameworkIssue("tanstack-start", "collector_delta_discarded");
         graph.addDiagnostic({
           severity: "warning",
           code: "web.tanstack_start_semantic_delta_discarded",
@@ -2303,6 +2326,7 @@ export async function scan(root: string, allFiles: string[], inventoryIssues: Fi
         });
       }
     } else {
+      markFrameworkIssue("tanstack-start", "typescript_definition_graph_unavailable");
       graph.addDiagnostic({
         severity: "warning",
         code: "web.tanstack_start_semantic_typechecker_unavailable",
@@ -2314,11 +2338,22 @@ export async function scan(root: string, allFiles: string[], inventoryIssues: Fi
     }
   }
   const emitted = [...emittedFrameworks].sort(compareUtf8);
+  const typeScriptPrerequisiteReady = semanticGraphEmitted
+    && nativeTypeScript.project.definitionGraphStatus === "ready"
+    && nativeTypeScript.project.semanticIssues === 0
+    && nativeTypeScript.project.semanticDiagnostics === 0
+    && nativeTypeScript.project.emittedSemanticDiagnostics === 0;
   const frameworkSemantic: ScanModel["frameworkSemantic"] = {
     status: emitted.length > 0 ? "emitted" : frameworkAttempted ? "discarded" : "not-emitted",
     ...frameworkCounts,
     emittedFrameworks: emitted,
     pendingFrameworks: routeDiscovery.frameworks.filter((framework) => !emittedFrameworks.has(framework)),
+    ...buildFrameworkCompleteness(
+      routeDiscovery.frameworks,
+      emittedFrameworks,
+      frameworkIssues,
+      typeScriptPrerequisiteReady,
+    ),
   };
 
   const routeNodesByGroup = new Map<string, Map<string, { node: GraphNode; evidence: Evidence }>>();
@@ -2463,7 +2498,7 @@ export async function scan(root: string, allFiles: string[], inventoryIssues: Fi
   if (!semanticGraphEmitted) reasons.push("typescript_semantic_graph_not_emitted");
   if (nativeTypeScript.project.semanticDiagnostics > 0) reasons.push("typescript_semantic_diagnostics_present");
   if (nativeTypeScript.project.emittedSemanticDiagnostics > 0) reasons.push("typescript_emitted_semantic_diagnostics_present");
-  if (routeDiscovery.frameworks.length > 0) reasons.push("framework_semantic_capability_pending");
+  if (frameworkSemantic.completionStatus === "incomplete") reasons.push("framework_semantic_incomplete");
   const syntaxComplete = unsupportedSyntax === 0 && skipped === 0;
   const semanticComplete = syntaxComplete
     && counts.unresolved === 0
@@ -2473,7 +2508,7 @@ export async function scan(root: string, allFiles: string[], inventoryIssues: Fi
     && nativeTypeScript.project.semanticIssues === 0
     && nativeTypeScript.project.semanticDiagnostics === 0
     && nativeTypeScript.project.emittedSemanticDiagnostics === 0
-    && routeDiscovery.frameworks.length === 0;
+    && frameworkSemantic.completionStatus !== "incomplete";
   return {
     nodes: [...graph.nodes.values()].sort(compareById),
     sites,

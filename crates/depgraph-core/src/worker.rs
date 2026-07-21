@@ -58,6 +58,13 @@ const WEB_FRAMEWORK_SEMANTIC_EXTRACTOR_VERSION: &str = "0.1.0";
 const WEB_FRAMEWORK_SEMANTIC_NODE_COUNT_PROPERTY: &str = "web_framework_semantic_node_count";
 const WEB_FRAMEWORK_SEMANTIC_SITE_COUNT_PROPERTY: &str = "web_framework_semantic_site_count";
 const WEB_FRAMEWORK_SEMANTIC_EDGE_COUNT_PROPERTY: &str = "web_framework_semantic_edge_count";
+const WEB_FRAMEWORK_COMPLETENESS_CAPABILITY_PROPERTY: &str =
+    "web_framework_completeness_capability";
+const WEB_FRAMEWORK_COMPLETENESS_CAPABILITY_V1: &str = "framework-semantic-completeness-v1";
+const WEB_FRAMEWORK_COMPLETENESS_STATUS_PROPERTY: &str = "web_framework_completeness_status";
+const WEB_FRAMEWORK_COMPLETENESS_ISSUE_COUNT_PROPERTY: &str =
+    "web_framework_completeness_issue_count";
+const WEB_FRAMEWORK_COMPLETENESS_LEDGER_PROPERTY: &str = "web_framework_completeness_ledger";
 const TYPESCRIPT_SEMANTIC_EXTRACTOR: &str = "typescript-native-typechecker";
 const TYPESCRIPT_SEMANTIC_BACKEND: &str = "typescript-native-compiler";
 const TYPESCRIPT_CLOSED_LOCAL_CALL_FLOW_ALGORITHM: &str = "typescript-closed-local-call-flow-v1";
@@ -1842,6 +1849,192 @@ enum WebFrameworkSemanticState {
     Discarded,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WebFrameworkCompletenessState {
+    Legacy,
+    NotDetected,
+    Complete,
+    Incomplete,
+}
+
+fn web_framework_completeness_state(
+    properties: &depgraph_protocol::Properties,
+    features: &[String],
+) -> std::result::Result<WebFrameworkCompletenessState, String> {
+    let tracked = [
+        WEB_FRAMEWORK_COMPLETENESS_CAPABILITY_PROPERTY,
+        WEB_FRAMEWORK_COMPLETENESS_STATUS_PROPERTY,
+        WEB_FRAMEWORK_COMPLETENESS_ISSUE_COUNT_PROPERTY,
+        WEB_FRAMEWORK_COMPLETENESS_LEDGER_PROPERTY,
+    ];
+    let present = tracked
+        .iter()
+        .filter(|property| properties.contains_key(**property))
+        .count();
+    if present == 0 {
+        return if features.is_empty() {
+            Ok(WebFrameworkCompletenessState::Legacy)
+        } else {
+            Err("Web framework profile omitted its completeness ledger".into())
+        };
+    }
+    if present != tracked.len() {
+        return Err("Web worker reported a partial framework completeness declaration".into());
+    }
+    if properties
+        .get(WEB_FRAMEWORK_COMPLETENESS_CAPABILITY_PROPERTY)
+        .and_then(Value::as_str)
+        != Some(WEB_FRAMEWORK_COMPLETENESS_CAPABILITY_V1)
+    {
+        return Err("Web worker reported an unapproved framework completeness capability".into());
+    }
+    let issue_count = properties
+        .get(WEB_FRAMEWORK_COMPLETENESS_ISSUE_COUNT_PROPERTY)
+        .and_then(Value::as_str)
+        .and_then(|value| value.parse::<usize>().ok())
+        .ok_or_else(|| {
+            "Web worker reported an invalid framework completeness issue count".to_owned()
+        })?;
+    let ledger_text = properties
+        .get(WEB_FRAMEWORK_COMPLETENESS_LEDGER_PROPERTY)
+        .and_then(Value::as_str)
+        .ok_or_else(|| "Web worker omitted its framework completeness ledger".to_owned())?;
+    if ledger_text.len() > 64 * 1024 {
+        return Err("Web worker framework completeness ledger exceeded its bound".into());
+    }
+    let ledger = serde_json::from_str::<Vec<Value>>(ledger_text)
+        .map_err(|_| "Web worker reported malformed framework completeness JSON".to_owned())?;
+    let state = match properties
+        .get(WEB_FRAMEWORK_COMPLETENESS_STATUS_PROPERTY)
+        .and_then(Value::as_str)
+    {
+        Some("not-detected") => WebFrameworkCompletenessState::NotDetected,
+        Some("complete") => WebFrameworkCompletenessState::Complete,
+        Some("incomplete") => WebFrameworkCompletenessState::Incomplete,
+        _ => return Err("Web worker reported an invalid framework completeness status".into()),
+    };
+    if features.is_empty() {
+        return if state == WebFrameworkCompletenessState::NotDetected
+            && issue_count == 0
+            && ledger.is_empty()
+        {
+            Ok(state)
+        } else {
+            Err(
+                "Web worker without framework features reported a non-empty completeness ledger"
+                    .into(),
+            )
+        };
+    }
+    if state == WebFrameworkCompletenessState::NotDetected {
+        return Err("Web worker detected framework features but reported not-detected".into());
+    }
+    let expected_frameworks = features.iter().cloned().collect::<BTreeSet<_>>();
+    if expected_frameworks.len() != features.len() || ledger.len() != expected_frameworks.len() {
+        return Err("Web framework features and completeness ledger cardinality disagree".into());
+    }
+    let specific_capability = |framework: &str| match framework {
+        "next" => Some("next-route-component-boundary-v1"),
+        "astro" => Some("astro-component-render-hydration-v1"),
+        "tanstack-router" => Some("tanstack-router-typed-route-v1"),
+        "tanstack-start" => Some("tanstack-start-rpc-middleware-v1"),
+        _ => None,
+    };
+    let mut observed_frameworks = BTreeSet::new();
+    let mut observed_issue_count = 0usize;
+    let mut all_complete = true;
+    let mut previous = None::<String>;
+    for entry in ledger {
+        let object = entry
+            .as_object()
+            .ok_or_else(|| "Web framework completeness ledger entry is not an object".to_owned())?;
+        let framework = object
+            .get("framework")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                "Web framework completeness ledger entry omitted framework".to_owned()
+            })?;
+        if previous.as_deref().is_some_and(|value| value >= framework) {
+            return Err("Web framework completeness ledger is not strictly sorted".into());
+        }
+        previous = Some(framework.to_owned());
+        let specific = specific_capability(framework).ok_or_else(|| {
+            format!("Web framework completeness ledger named unsupported framework {framework}")
+        })?;
+        let strings = |field: &str| -> std::result::Result<Vec<String>, String> {
+            object
+                .get(field)
+                .and_then(Value::as_array)
+                .ok_or_else(|| format!("Web framework completeness entry omitted {field}"))?
+                .iter()
+                .map(|value| {
+                    value
+                        .as_str()
+                        .filter(|value| !value.is_empty() && value.len() <= 512)
+                        .map(str::to_owned)
+                        .ok_or_else(|| {
+                            format!("Web framework completeness entry has invalid {field}")
+                        })
+                })
+                .collect()
+        };
+        let required = strings("required_capabilities")?;
+        let emitted = strings("emitted_capabilities")?;
+        let reasons = strings("reasons")?;
+        let expected_required = BTreeSet::from([
+            "typescript-definition-import-type-call-graph-v2".to_owned(),
+            WEB_FRAMEWORK_SEMANTIC_CAPABILITY_V1.to_owned(),
+            specific.to_owned(),
+        ]);
+        let required_set = required.iter().cloned().collect::<BTreeSet<_>>();
+        let emitted_set = emitted.iter().cloned().collect::<BTreeSet<_>>();
+        let reason_set = reasons.iter().cloned().collect::<BTreeSet<_>>();
+        let strictly_sorted = |values: &[String]| values.windows(2).all(|pair| pair[0] < pair[1]);
+        if required_set != expected_required
+            || required_set.len() != required.len()
+            || emitted_set.len() != emitted.len()
+            || reason_set.len() != reasons.len()
+            || !strictly_sorted(&required)
+            || !strictly_sorted(&emitted)
+            || !strictly_sorted(&reasons)
+            || !emitted_set.is_subset(&required_set)
+        {
+            return Err(format!(
+                "Web framework completeness entry for {framework} has invalid capabilities or reasons"
+            ));
+        }
+        let entry_complete = match object.get("status").and_then(Value::as_str) {
+            Some("complete") => true,
+            Some("incomplete") => false,
+            _ => {
+                return Err(format!(
+                    "Web framework completeness entry for {framework} has invalid status"
+                ));
+            }
+        };
+        if entry_complete != (reasons.is_empty() && emitted_set == required_set) {
+            return Err(format!(
+                "Web framework completeness entry for {framework} contradicts its capability/reason ledger"
+            ));
+        }
+        all_complete &= entry_complete;
+        observed_issue_count += reasons.len();
+        observed_frameworks.insert(framework.to_owned());
+    }
+    if observed_frameworks != expected_frameworks || observed_issue_count != issue_count {
+        return Err(
+            "Web framework completeness ledger does not match features or issue count".into(),
+        );
+    }
+    if (state == WebFrameworkCompletenessState::Complete) != all_complete {
+        return Err("Web framework completeness aggregate status contradicts its ledger".into());
+    }
+    if state == WebFrameworkCompletenessState::Incomplete && issue_count == 0 {
+        return Err("Web incomplete framework profile reported zero issues".into());
+    }
+    Ok(state)
+}
+
 fn web_framework_semantic_state(
     properties: &depgraph_protocol::Properties,
 ) -> std::result::Result<WebFrameworkSemanticState, String> {
@@ -2226,6 +2419,65 @@ fn discard_web_framework_delta(events: &mut Vec<ProtocolEvent>) {
             WEB_FRAMEWORK_SEMANTIC_EDGE_COUNT_PROPERTY,
         ] {
             properties.insert(property.to_owned(), Value::String("0".to_owned()));
+        }
+        let Some(ledger_text) = properties
+            .get(WEB_FRAMEWORK_COMPLETENESS_LEDGER_PROPERTY)
+            .and_then(Value::as_str)
+        else {
+            continue;
+        };
+        let Ok(mut ledger) = serde_json::from_str::<Vec<Value>>(ledger_text) else {
+            continue;
+        };
+        let mut issue_count = 0usize;
+        for entry in &mut ledger {
+            let Some(object) = entry.as_object_mut() else {
+                continue;
+            };
+            object.insert("status".to_owned(), Value::String("incomplete".to_owned()));
+            let retained_capabilities = object
+                .get("emitted_capabilities")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .filter(|capability| {
+                    *capability == "typescript-definition-import-type-call-graph-v2"
+                })
+                .map(|capability| Value::String(capability.to_owned()))
+                .collect::<Vec<_>>();
+            object.insert(
+                "emitted_capabilities".to_owned(),
+                Value::Array(retained_capabilities),
+            );
+            let mut reasons = object
+                .get("reasons")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect::<BTreeSet<_>>();
+            reasons.insert("core_framework_delta_discarded".to_owned());
+            issue_count += reasons.len();
+            object.insert(
+                "reasons".to_owned(),
+                Value::Array(reasons.into_iter().map(Value::String).collect()),
+            );
+        }
+        properties.insert(
+            WEB_FRAMEWORK_COMPLETENESS_STATUS_PROPERTY.to_owned(),
+            Value::String("incomplete".to_owned()),
+        );
+        properties.insert(
+            WEB_FRAMEWORK_COMPLETENESS_ISSUE_COUNT_PROPERTY.to_owned(),
+            Value::String(issue_count.to_string()),
+        );
+        if let Ok(serialized) = serde_json::to_string(&ledger) {
+            properties.insert(
+                WEB_FRAMEWORK_COMPLETENESS_LEDGER_PROPERTY.to_owned(),
+                Value::String(serialized),
+            );
         }
     }
 }
@@ -5037,6 +5289,15 @@ fn parse_events_preserving_prefix(
             } else {
                 (None, None)
             };
+            let (web_framework_completeness_state, web_framework_completeness_violation) =
+                if expected_adapter == "web" {
+                    match web_framework_completeness_state(properties, &declared.profile.features) {
+                        Ok(state) => (Some(state), None),
+                        Err(error) => (None, Some(error)),
+                    }
+                } else {
+                    (None, None)
+                };
             let expected_gate = match expected_adapter {
                 "rust" => Some((
                     "rust_hir_enable_gate",
@@ -5053,6 +5314,51 @@ fn parse_events_preserving_prefix(
             } else if web_framework_violation.is_some() {
                 web_framework_failure = true;
                 web_framework_violation
+            } else if web_framework_completeness_violation.is_some() {
+                web_framework_failure = true;
+                web_framework_completeness_violation
+            } else if expected_adapter == "web"
+                && matches!(
+                    web_framework_completeness_state,
+                    Some(
+                        WebFrameworkCompletenessState::Complete
+                            | WebFrameworkCompletenessState::Incomplete
+                    )
+                )
+                && web_capability != Some(WebSemanticCapability::DefinitionImportTypeCallGraphV2)
+            {
+                web_framework_failure = true;
+                Some(
+                    "Web framework completeness ledger requires the TypeScript v2 import/type/call capability"
+                        .to_owned(),
+                )
+            } else if expected_adapter == "web"
+                && matches!(
+                    web_framework_completeness_state,
+                    Some(WebFrameworkCompletenessState::Complete)
+                )
+                && web_framework_state != Some(WebFrameworkSemanticState::Emitted)
+            {
+                web_framework_failure = true;
+                Some(
+                    "Web worker claimed complete framework semantics without an emitted framework graph"
+                        .to_owned(),
+                )
+            } else if expected_adapter == "web"
+                && web_framework_state == Some(WebFrameworkSemanticState::Emitted)
+                && matches!(
+                    web_framework_completeness_state,
+                    Some(
+                        WebFrameworkCompletenessState::Legacy
+                            | WebFrameworkCompletenessState::NotDetected
+                    )
+                )
+            {
+                web_framework_failure = true;
+                Some(
+                    "Web worker emitted a framework graph without a matching completeness ledger"
+                        .to_owned(),
+                )
             } else if expected_adapter == "web" {
                 let gate = properties
                     .get(TYPESCRIPT_RELEASE_GATE_PROPERTY)
@@ -5783,7 +6089,16 @@ mod tests {
             .iter_mut()
             .find(|event| event["event"] == "profile_declared")
             .expect("Web profile declaration");
+        profile["profile"]["features"] = serde_json::json!(["next"]);
         let properties = &mut profile["profile"]["properties"];
+        properties[TYPESCRIPT_ANALYSIS_MODE_PROPERTY] =
+            serde_json::json!(TYPESCRIPT_ANALYSIS_MODE_IMPORT_TYPE_CALL_GRAPH);
+        properties[TYPESCRIPT_SEMANTIC_EMISSION_PROPERTY] =
+            serde_json::json!(TYPESCRIPT_SEMANTIC_EMISSION_IMPORT_TYPE_CALL_GRAPH_V2);
+        properties[TYPESCRIPT_TYPECHECKER_STATUS_PROPERTY] =
+            serde_json::json!("definition-import-type-call-graph-emitted");
+        properties[TYPESCRIPT_SEMANTIC_SITE_COUNT_PROPERTY] = serde_json::json!("0");
+        properties[TYPESCRIPT_SEMANTIC_CALL_SITE_COUNT_PROPERTY] = serde_json::json!("0");
         properties[WEB_FRAMEWORK_SEMANTIC_CAPABILITY_PROPERTY] = serde_json::json!(capability);
         properties[WEB_FRAMEWORK_SEMANTIC_STATUS_PROPERTY] = serde_json::json!(status);
         properties[WEB_FRAMEWORK_SEMANTIC_EXTRACTOR_VERSION_PROPERTY] =
@@ -5791,6 +6106,13 @@ mod tests {
         properties[WEB_FRAMEWORK_SEMANTIC_NODE_COUNT_PROPERTY] = serde_json::json!("2");
         properties[WEB_FRAMEWORK_SEMANTIC_SITE_COUNT_PROPERTY] = serde_json::json!("1");
         properties[WEB_FRAMEWORK_SEMANTIC_EDGE_COUNT_PROPERTY] = serde_json::json!("1");
+        properties[WEB_FRAMEWORK_COMPLETENESS_CAPABILITY_PROPERTY] =
+            serde_json::json!(WEB_FRAMEWORK_COMPLETENESS_CAPABILITY_V1);
+        properties[WEB_FRAMEWORK_COMPLETENESS_STATUS_PROPERTY] = serde_json::json!("complete");
+        properties[WEB_FRAMEWORK_COMPLETENESS_ISSUE_COUNT_PROPERTY] = serde_json::json!("0");
+        properties[WEB_FRAMEWORK_COMPLETENESS_LEDGER_PROPERTY] = serde_json::json!(
+            "[{\"framework\":\"next\",\"required_capabilities\":[\"framework-semantic-graph-v1\",\"next-route-component-boundary-v1\",\"typescript-definition-import-type-call-graph-v2\"],\"emitted_capabilities\":[\"framework-semantic-graph-v1\",\"next-route-component-boundary-v1\",\"typescript-definition-import-type-call-graph-v2\"],\"status\":\"complete\",\"reasons\":[]}]"
+        );
         let insert_at = events
             .iter()
             .position(|event| event["event"] == "profile_completed")
@@ -8509,6 +8831,106 @@ mod tests {
         assert!(!parsed.events.iter().any(|event| {
             event["event"] == "dependency_site" && event["site"]["kind"] == "route_entry"
         }));
+        let properties = &parsed
+            .events
+            .iter()
+            .find(|event| event["event"] == "profile_declared")
+            .expect("preserved Web profile")["profile"]["properties"];
+        assert_eq!(
+            properties[WEB_FRAMEWORK_COMPLETENESS_STATUS_PROPERTY],
+            "incomplete"
+        );
+        let ledger: Vec<Value> = serde_json::from_str(
+            properties[WEB_FRAMEWORK_COMPLETENESS_LEDGER_PROPERTY]
+                .as_str()
+                .expect("framework completeness ledger"),
+        )?;
+        assert_eq!(ledger[0]["status"], "incomplete");
+        assert_eq!(
+            ledger[0]["emitted_capabilities"],
+            serde_json::json!(["typescript-definition-import-type-call-graph-v2"])
+        );
+        assert!(ledger[0]["reasons"].as_array().is_some_and(|reasons| {
+            reasons
+                .iter()
+                .any(|reason| reason == "core_framework_delta_discarded")
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn web_framework_completeness_ledger_rejects_claimed_or_mismatched_capabilities() -> Result<()>
+    {
+        let root = tempfile::tempdir()?;
+        let root = root.path().canonicalize()?;
+        let mutations = [
+            serde_json::json!([{
+                "framework":"next",
+                "required_capabilities":["framework-semantic-graph-v1","typescript-definition-import-type-call-graph-v2"],
+                "emitted_capabilities":["framework-semantic-graph-v1","typescript-definition-import-type-call-graph-v2"],
+                "status":"complete",
+                "reasons":[]
+            }]),
+            serde_json::json!([{
+                "framework":"next",
+                "required_capabilities":["framework-semantic-graph-v1","next-route-component-boundary-v1","typescript-definition-import-type-call-graph-v2"],
+                "emitted_capabilities":["framework-semantic-graph-v1","next-route-component-boundary-v1","typescript-definition-import-type-call-graph-v2"],
+                "status":"complete",
+                "reasons":["collector_delta_discarded"]
+            }]),
+            serde_json::json!([{
+                "framework":"astro",
+                "required_capabilities":["astro-component-render-hydration-v1","framework-semantic-graph-v1","typescript-definition-import-type-call-graph-v2"],
+                "emitted_capabilities":["astro-component-render-hydration-v1","framework-semantic-graph-v1","typescript-definition-import-type-call-graph-v2"],
+                "status":"complete",
+                "reasons":[]
+            }]),
+            serde_json::json!([{
+                "framework":"next",
+                "required_capabilities":["typescript-definition-import-type-call-graph-v2","next-route-component-boundary-v1","framework-semantic-graph-v1"],
+                "emitted_capabilities":["typescript-definition-import-type-call-graph-v2","next-route-component-boundary-v1","framework-semantic-graph-v1"],
+                "status":"complete",
+                "reasons":[]
+            }]),
+        ];
+        for mutation in mutations {
+            let mut events = test_protocol_values(typescript_definition_protocol(
+                &root,
+                TYPESCRIPT_RELEASE_GATE_PENDING,
+                "declares",
+            )?)?;
+            add_framework_semantic_delta(
+                &mut events,
+                true,
+                "emitted",
+                WEB_FRAMEWORK_SEMANTIC_CAPABILITY_V1,
+            );
+            let properties = &mut events
+                .iter_mut()
+                .find(|event| event["event"] == "profile_declared")
+                .expect("Web profile")["profile"]["properties"];
+            properties[WEB_FRAMEWORK_COMPLETENESS_LEDGER_PROPERTY] =
+                serde_json::json!(mutation.to_string());
+            let parsed = parse_events_preserving_prefix(
+                &serialize_test_protocol(events)?,
+                "typescript-gate-scan",
+                "web",
+                &root,
+                64 * 1024,
+                Some(env!("CARGO_PKG_VERSION")),
+                Some(false),
+            );
+            assert_eq!(
+                parsed.failure_kind,
+                Some(WorkerFailureKind::MalformedProtocol),
+                "{mutation}"
+            );
+            assert!(parsed.security_violation, "{mutation}: {:?}", parsed.error);
+            assert!(!parsed.events.iter().any(|event| {
+                event["event"] == "node_upsert"
+                    && matches!(event["node"]["kind"].as_str(), Some("component" | "route"))
+            }));
+        }
         Ok(())
     }
 
