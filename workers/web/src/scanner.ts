@@ -14,6 +14,12 @@ import {
 import { discoverRoutes, type RouteEntry } from "./routes";
 import { mergeTypeScriptDefinitionDelta, type TypeScriptDefinitionDelta } from "./semantic-delta";
 import {
+  mergeFrameworkSemanticDelta,
+  WEB_FRAMEWORK_SEMANTIC_CAPABILITY,
+  type FrameworkSemanticDelta,
+} from "./framework-semantic";
+import { collectNextSemanticDelta } from "./next-semantic";
+import {
   analyzeTypeScriptProject,
   TYPESCRIPT_COMPILER_VERSION,
   TYPESCRIPT_SOURCE_EXTENSIONS,
@@ -135,6 +141,7 @@ class GraphBuilder {
   readonly diagnostics = new Map<string, Diagnostic>();
   readonly files = new Map<string, FileCoverage>();
   readonly #fileNodesByPath = new Map<string, GraphNode>();
+  readonly #typeScriptNodesByDefinitionKey = new Map<string, GraphNode>();
   readonly #workspace: Workspace;
 
   constructor(workspace: Workspace) {
@@ -1004,12 +1011,48 @@ class GraphBuilder {
     this.edges = nextEdges;
     this.files.clear();
     for (const [relativePath, coverage] of nextFiles) this.files.set(relativePath, coverage);
+    this.#typeScriptNodesByDefinitionKey.clear();
+    for (const [key, node] of materialized) this.#typeScriptNodesByDefinitionKey.set(key, node);
     return {
       nodes: nodes.length,
       relations: edges.length + semanticEdges.length,
       sites: semanticSites.length,
       calls: callSites.length,
     };
+  }
+
+  typeScriptDefinitionNode(key: string): GraphNode | null {
+    return this.#typeScriptNodesByDefinitionKey.get(key) ?? null;
+  }
+
+  fileNodeByRelativePath(relativePath: string): GraphNode | null {
+    return this.#fileNodesByPath.get(path.resolve(this.#workspace.root, relativePath)) ?? null;
+  }
+
+  mergeFrameworkSemanticGraph(delta: FrameworkSemanticDelta): { nodes: number; sites: number; edges: number } {
+    const merged = mergeFrameworkSemanticDelta(
+      this.nodes,
+      this.sites,
+      this.edges,
+      delta,
+      { profileId: PROFILE_ID, capability: WEB_FRAMEWORK_SEMANTIC_CAPABILITY },
+    );
+    const nextFiles = new Map([...this.files].map(([relativePath, coverage]) => [relativePath, { ...coverage }]));
+    for (const site of delta.sites) {
+      const relativePath = site.evidence[0]?.path;
+      const coverage = relativePath ? nextFiles.get(relativePath) : undefined;
+      if (!coverage) throw new Error(`framework semantic coverage missing for ${relativePath ?? "<missing>"}`);
+      coverage.expected_sites += 1;
+      coverage.produced_sites += 1;
+      coverage[site.resolution_status] += 1;
+    }
+    this.nodes = merged.nodes;
+    this.sites.clear();
+    for (const [id, site] of merged.sites) this.sites.set(id, site);
+    this.edges = merged.edges;
+    this.files.clear();
+    for (const [relativePath, coverage] of nextFiles) this.files.set(relativePath, coverage);
+    return { nodes: delta.nodes.length, sites: delta.sites.length, edges: delta.edges.length };
   }
 
   addDiagnostic(diagnostic: Omit<Diagnostic, "id">): void {
@@ -2104,6 +2147,75 @@ export async function scan(root: string, allFiles: string[], inventoryIssues: Fi
     nativeTypeScript.project.semanticCallSites = 0;
   }
 
+  let frameworkSemantic: ScanModel["frameworkSemantic"] = {
+    status: "not-emitted",
+    nodes: 0,
+    sites: 0,
+    edges: 0,
+    emittedFrameworks: [],
+    pendingFrameworks: routeDiscovery.frameworks,
+  };
+  const nextEntries = routeDiscovery.entries.filter((entry) => entry.framework === "next");
+  if (nextEntries.length > 0) {
+    if (semanticGraphEmitted && nativeTypeScript.project.definitionGraphStatus === "ready") {
+      try {
+        const result = collectNextSemanticDelta({
+          entries: nextEntries,
+          sources: compilerSources,
+          sourceFiles: nativeTypeScript.semanticSourceFiles,
+          definitions: nativeTypeScript.definitionGraph,
+          dependencies: nativeTypeScript.dependencyGraph,
+          definitionNode: (key) => graph.typeScriptDefinitionNode(key),
+          fileNode: (relativePath) => graph.fileNodeByRelativePath(relativePath),
+          owner: (entry) => owningPackage(workspace, entry.absoluteFile),
+          unknownTarget: () => graph.unknownNode(),
+        });
+        const counts = graph.mergeFrameworkSemanticGraph(result.delta);
+        for (const diagnostic of result.diagnostics) graph.addDiagnostic(diagnostic);
+        frameworkSemantic = {
+          status: "emitted",
+          ...counts,
+          emittedFrameworks: ["next"],
+          pendingFrameworks: routeDiscovery.frameworks.filter((framework) => framework !== "next"),
+        };
+      } catch (error) {
+        frameworkSemantic = {
+          status: "discarded",
+          nodes: 0,
+          sites: 0,
+          edges: 0,
+          emittedFrameworks: [],
+          pendingFrameworks: routeDiscovery.frameworks,
+        };
+        graph.addDiagnostic({
+          severity: "warning",
+          code: "web.next_semantic_delta_discarded",
+          message: `Next.js framework semantic graph was discarded atomically after contract validation failed; syntax and TypeScript semantic graphs were preserved: ${error instanceof Error ? error.message : String(error)}`.slice(0, 2_048),
+          path: null,
+          profile_id: PROFILE_ID,
+          properties: { framework_semantic_issue: true },
+        });
+      }
+    } else {
+      frameworkSemantic = {
+        status: "discarded",
+        nodes: 0,
+        sites: 0,
+        edges: 0,
+        emittedFrameworks: [],
+        pendingFrameworks: routeDiscovery.frameworks,
+      };
+      graph.addDiagnostic({
+        severity: "warning",
+        code: "web.next_semantic_typechecker_unavailable",
+        message: "Next.js framework semantic graph was not emitted because the canonical TypeScript definition graph was unavailable",
+        path: null,
+        profile_id: PROFILE_ID,
+        properties: { framework_semantic_issue: true },
+      });
+    }
+  }
+
   const routeNodesByGroup = new Map<string, Map<string, { node: GraphNode; evidence: Evidence }>>();
   for (const entry of routeDiscovery.entries) {
     const fileNode = graph.fileNode(entry.absoluteFile, entry.generated);
@@ -2282,5 +2394,6 @@ export async function scan(root: string, allFiles: string[], inventoryIssues: Fi
     lockfile: workspace.lockfile,
     detectedFrameworks: routeDiscovery.frameworks,
     typeScriptProject: nativeTypeScript.project,
+    frameworkSemantic,
   };
 }

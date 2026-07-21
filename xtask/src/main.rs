@@ -1945,9 +1945,28 @@ fn verify_packaged_web_import_type_call_graph(executable: &Path, store: &Path) -
     let edges = graph["edges"]
         .as_array()
         .context("packaged Web semantic export has no edges")?;
+    let evidence = graph["evidence"]
+        .as_array()
+        .context("packaged Web semantic export has no evidence")?;
+    let semantic_edge_ids: BTreeSet<_> = evidence
+        .iter()
+        .filter(|item| {
+            item["owner_type"] == "edge"
+                && item["ordinal"].as_u64() == Some(0)
+                && item["kind"] == "semantic"
+                && item["extractor"] == "typescript-native-typechecker"
+                && item["extractor_version"] == "7.0.2"
+        })
+        .filter_map(|item| item["owner_id"].as_str())
+        .collect();
     let semantic_edges: Vec<_> = edges
         .iter()
-        .filter(|edge| edge["phase"] == "semantic")
+        .filter(|edge| {
+            edge["phase"] == "semantic"
+                && edge["id"]
+                    .as_str()
+                    .is_some_and(|id| semantic_edge_ids.contains(id))
+        })
         .collect();
     let definition_edges: Vec<_> = semantic_edges
         .iter()
@@ -1959,9 +1978,6 @@ fn verify_packaged_web_import_type_call_graph(executable: &Path, store: &Path) -
         .copied()
         .filter(|edge| !edge["site_id"].is_null())
         .collect();
-    let evidence = graph["evidence"]
-        .as_array()
-        .context("packaged Web semantic export has no evidence")?;
     let semantic_site_ids: BTreeSet<_> = evidence
         .iter()
         .filter(|item| {
@@ -2520,6 +2536,290 @@ fn verify_packaged_web_import_type_call_graph(executable: &Path, store: &Path) -
             bail!("packaged Web profile reports {property}={declared:?}, observed {actual}");
         }
     }
+
+    let framework_node_ids: BTreeSet<_> = nodes
+        .iter()
+        .filter(|node| {
+            matches!(node["kind"].as_str(), Some("component" | "route"))
+                && node["properties"]["framework"] == "next"
+                && node["properties"]["canonical_identity"]["framework"] == "next"
+        })
+        .filter_map(|node| node["id"].as_str())
+        .collect();
+    let framework_nodes: Vec<_> = nodes
+        .iter()
+        .filter(|node| {
+            node["id"]
+                .as_str()
+                .is_some_and(|id| framework_node_ids.contains(id))
+        })
+        .collect();
+    let framework_site_ids: BTreeSet<_> = evidence
+        .iter()
+        .filter(|item| {
+            item["owner_type"] == "site"
+                && item["ordinal"].as_u64() == Some(0)
+                && item["kind"] == "semantic"
+                && item["extractor"] == "next-static-adapter"
+                && item["extractor_version"] == "0.1.0"
+                && item["properties"]["framework"] == "next"
+                && item["properties"]["contract_version"] == "framework-semantic-graph-v1"
+        })
+        .filter_map(|item| item["owner_id"].as_str())
+        .collect();
+    let framework_edge_ids: BTreeSet<_> = evidence
+        .iter()
+        .filter(|item| {
+            item["owner_type"] == "edge"
+                && item["ordinal"].as_u64() == Some(0)
+                && item["kind"] == "semantic"
+                && item["extractor"] == "next-static-adapter"
+                && item["extractor_version"] == "0.1.0"
+                && item["properties"]["framework"] == "next"
+                && item["properties"]["contract_version"] == "framework-semantic-graph-v1"
+        })
+        .filter_map(|item| item["owner_id"].as_str())
+        .collect();
+    let framework_sites: Vec<_> = sites
+        .iter()
+        .filter(|site| {
+            site["id"]
+                .as_str()
+                .is_some_and(|id| framework_site_ids.contains(id))
+        })
+        .collect();
+    let framework_edges: Vec<_> = edges
+        .iter()
+        .filter(|edge| {
+            edge["id"]
+                .as_str()
+                .is_some_and(|id| framework_edge_ids.contains(id))
+        })
+        .collect();
+    if properties["web_framework_semantic_status"] != "emitted"
+        || properties["web_framework_semantic_capability"] != "framework-semantic-graph-v1"
+        || properties["web_framework_semantic_extractor_version"] != "0.1.0"
+    {
+        bail!("packaged Web profile did not emit the Next.js semantic graph: {properties}");
+    }
+    for (property, actual) in [
+        ("web_framework_semantic_node_count", framework_nodes.len()),
+        ("web_framework_semantic_site_count", framework_sites.len()),
+        ("web_framework_semantic_edge_count", framework_edges.len()),
+    ] {
+        let declared = properties[property]
+            .as_str()
+            .and_then(|value| value.parse::<usize>().ok());
+        if declared != Some(actual) || actual == 0 {
+            bail!("packaged Web profile reports {property}={declared:?}, observed {actual}");
+        }
+    }
+    let framework_kinds: BTreeSet<_> = framework_edges
+        .iter()
+        .filter_map(|edge| edge["kind"].as_str())
+        .collect();
+    if framework_kinds
+        != BTreeSet::from([
+            "client_boundary",
+            "parent_route",
+            "renders",
+            "route_entry",
+            "server_boundary",
+        ])
+    {
+        bail!("packaged Next.js graph lost its route/component/boundary vocabulary");
+    }
+
+    let product_route = framework_nodes
+        .iter()
+        .copied()
+        .find(|node| {
+            node["kind"] == "route"
+                && node["properties"]["canonical_identity"]["route_kind"] == "next-app-page"
+                && node["properties"]["canonical_identity"]["route_pattern"] == "/shop/products/$id"
+        })
+        .context("packaged Next.js graph omitted the App Router product route")?;
+    if product_route["properties"]["canonical_identity"]["route_groups"] != json!(["(shop)"]) {
+        bail!("packaged Next.js product route lost its route-group identity");
+    }
+    let intercepted_route = framework_nodes
+        .iter()
+        .copied()
+        .find(|node| {
+            node["kind"] == "route"
+                && node["properties"]["canonical_identity"]["route_pattern"] == "/shop/photo/$slug*"
+        })
+        .context("packaged Next.js graph omitted the intercepting route")?;
+    if intercepted_route["properties"]["canonical_identity"]["parallel_slots"] != json!(["@modal"])
+        || intercepted_route["properties"]["canonical_identity"]["intercepting_segments"]
+            != json!(["(.)photo"])
+    {
+        bail!("packaged Next.js intercepting route lost its parallel/intercept identity");
+    }
+    let framework_component = |name: &str| {
+        framework_nodes
+            .iter()
+            .copied()
+            .find(|node| node["kind"] == "component" && node["display_name"] == name)
+    };
+    let product_component = framework_component("Product")
+        .context("packaged Next.js graph omitted the product component")?;
+    let client_component = framework_component("ClientPanel")
+        .context("packaged Next.js graph omitted the client component")?;
+    let lazy_component = framework_component("LazyPanel")
+        .context("packaged Next.js graph omitted the dynamic component")?;
+    let get_component =
+        framework_component("GET").context("packaged Next.js graph omitted the route handler")?;
+    let product_route_id = product_route["id"]
+        .as_str()
+        .context("packaged Next.js product route omitted its ID")?
+        .to_owned();
+    let product_component_id = product_component["id"]
+        .as_str()
+        .context("packaged Next.js product component omitted its ID")?
+        .to_owned();
+    let client_component_id = client_component["id"]
+        .as_str()
+        .context("packaged Next.js client component omitted its ID")?
+        .to_owned();
+    let lazy_component_id = lazy_component["id"]
+        .as_str()
+        .context("packaged Next.js dynamic component omitted its ID")?
+        .to_owned();
+    let get_component_id = get_component["id"]
+        .as_str()
+        .context("packaged Next.js route handler omitted its ID")?
+        .to_owned();
+    let framework_edge = |kind: &str, source: &str, target: &str| {
+        framework_edges.iter().copied().find(|edge| {
+            edge["kind"] == kind && edge["source"] == source && edge["target"] == target
+        })
+    };
+    let route_render = framework_edge("renders", &product_route_id, &product_component_id)
+        .context("packaged Next.js graph omitted route-to-component rendering")?;
+    let client_boundary = framework_edge(
+        "client_boundary",
+        &product_component_id,
+        &client_component_id,
+    )
+    .context("packaged Next.js graph omitted its directive-backed client boundary")?;
+    let server_boundary =
+        framework_edge("server_boundary", &get_component_id, &get_component_id)
+            .context("packaged Next.js graph omitted its directive-backed server boundary")?;
+    let dynamic_render = framework_edge("renders", &product_component_id, &lazy_component_id)
+        .context("packaged Next.js graph omitted its literal next/dynamic dependency")?;
+    let dynamic_occurrence = |edge: &Value| {
+        evidence.iter().find(|item| {
+            item["owner_type"] == "edge"
+                && item["owner_id"] == edge["id"]
+                && item["ordinal"].as_u64() == Some(0)
+        })
+    };
+    if !route_render["condition"]
+        .to_string()
+        .contains("next.runtime")
+        || !route_render["condition"].to_string().contains("next.cache")
+        || !client_boundary["condition"]
+            .to_string()
+            .contains("use client")
+        || !server_boundary["condition"]
+            .to_string()
+            .contains("use server")
+        || dynamic_occurrence(dynamic_render)
+            .is_none_or(|item| item["properties"]["occurrence_kind"] != "next_dynamic_render")
+    {
+        bail!("packaged Next.js graph lost directive, runtime, cache, or dynamic evidence");
+    }
+    let unresolved_dynamic = framework_edges
+        .iter()
+        .copied()
+        .find(|edge| {
+            edge["kind"] == "renders"
+                && edge["source"] == product_component_id
+                && edge["resolution_status"] == "unresolved"
+        })
+        .context("packaged Next.js graph silently omitted computed next/dynamic")?;
+    let unresolved_target = unresolved_dynamic["target"]
+        .as_str()
+        .and_then(|target| nodes_by_id.get(target))
+        .context("packaged Next.js computed dynamic target is missing")?;
+    let unresolved_site = unresolved_dynamic["site_id"]
+        .as_str()
+        .and_then(|site_id| {
+            framework_sites
+                .iter()
+                .copied()
+                .find(|site| site["id"] == site_id)
+        })
+        .context("packaged Next.js computed dynamic site is missing")?;
+    if unresolved_dynamic["precision"] != "heuristic"
+        || unresolved_site["reason"]
+            .as_str()
+            .is_none_or(|reason| reason.is_empty())
+        || unresolved_target["kind"] != "unknown_target"
+    {
+        bail!("packaged Next.js computed dynamic target was not retained as unresolved");
+    }
+
+    for (edge, label, require_exact_why_edge) in [
+        (route_render, "route render", true),
+        (client_boundary, "client boundary", false),
+    ] {
+        let edge_id = edge["id"]
+            .as_str()
+            .with_context(|| format!("packaged Next.js {label} edge omitted its ID"))?;
+        let source_selector = format!(
+            "id:{}",
+            edge["source"]
+                .as_str()
+                .with_context(|| format!("packaged Next.js {label} edge omitted its source"))?
+        );
+        let target_selector = format!(
+            "id:{}",
+            edge["target"]
+                .as_str()
+                .with_context(|| format!("packaged Next.js {label} edge omitted its target"))?
+        );
+        let query_contains_edge = |query: &Value| {
+            query["data"]["steps"].as_array().is_some_and(|steps| {
+                steps.iter().any(|step| {
+                    step["edge"]["id"] == edge_id
+                        && step["edge"]["phase"] == "semantic"
+                        && step["evidence"].as_array().is_some_and(|items| {
+                            items.iter().any(|item| {
+                                item["kind"] == "semantic"
+                                    && item["extractor"] == "next-static-adapter"
+                            })
+                        })
+                })
+            })
+        };
+        let deps = packaged_web_query(
+            executable,
+            store,
+            &["deps", &source_selector, "--json"],
+            &format!("query packaged Next.js {label} dependencies"),
+        )?;
+        let dependents = packaged_web_query(
+            executable,
+            store,
+            &["dependents", &target_selector, "--json"],
+            &format!("query packaged Next.js {label} dependents"),
+        )?;
+        let why = packaged_web_query(
+            executable,
+            store,
+            &["why", &source_selector, &target_selector, "--json"],
+            &format!("explain packaged Next.js {label}"),
+        )?;
+        if !query_contains_edge(&deps)
+            || !query_contains_edge(&dependents)
+            || why["data"]["path_found"] != true
+            || (require_exact_why_edge && !query_contains_edge(&why))
+        {
+            bail!("packaged Web queries lost the Next.js {label} edge or its evidence");
+        }
+    }
     let coverage = &graph["coverage"];
     let classified_sites = ["resolved", "candidates", "external", "unresolved"]
         .iter()
@@ -2798,7 +3098,9 @@ fn verify_packaged_web_semantic_complete(
             !levels.iter().any(|level| level == "syntax-complete")
                 || !levels.iter().any(|level| level == "semantic-complete")
         })
-        || coverage["reasons"].as_array().is_none_or(Vec::is_empty)
+        || coverage["reasons"]
+            .as_array()
+            .is_none_or(|reasons| !reasons.is_empty())
         || coverage["unresolved"].as_u64() != Some(0)
         || coverage["candidates"].as_u64().unwrap_or_default() == 0
         || coverage["external"].as_u64().unwrap_or_default() == 0

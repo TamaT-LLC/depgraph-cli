@@ -120,6 +120,7 @@ export interface TypeOnlyDependencyRange {
 }
 
 export class TypeScriptProjectAnalysis extends Map<string, TypeScriptSyntaxDiagnostic[]> {
+  readonly semanticSourceFiles = new Map<string, SourceFile>();
   readonly typeOnlyDependencyRanges = new Map<string, TypeOnlyDependencyRange[]>();
   readonly importTypeModuleSpans = new Map<string, Array<{ startOffset: number; endOffset: number }>>();
   readonly moduleCallSpans = new Map<string, TypeScriptModuleCallValidationSpan[]>();
@@ -782,6 +783,7 @@ async function analyzeTypeScriptProjectInner(
           throw new Error(`TypeScript native project analysis returned an AST that disagrees with the confined inventory (${sourceMismatches.join(",")}) for ${relativePath}`);
         }
         sourceFiles.set(relativePath, sourceFile);
+        result.semanticSourceFiles.set(relativePath, sourceFile);
         result.importTypeModuleSpans.set(relativePath, []);
         result.nonLiteralModuleSpans.set(relativePath, []);
         result.moduleCallSpans.set(relativePath, []);
