@@ -520,7 +520,12 @@ jobs:
             $nodeKinds[$_.node.id] = $_.node.kind
             $nodesById[$_.node.id] = $_.node
           }
-          $semanticEdges = @($events | Where-Object { $_.edge.phase -eq 'semantic' })
+          $semanticEdges = @($events | Where-Object {
+            $_.edge.phase -eq 'semantic' -and
+            $_.edge.evidence[0].kind -eq 'semantic' -and
+            $_.edge.evidence[0].extractor -eq 'typescript-native-typechecker' -and
+            $_.edge.evidence[0].extractor_version -eq '7.0.2'
+          })
           $definitionEdges = @($semanticEdges | Where-Object { $null -eq $_.edge.site_id })
           $dependencyEdges = @($semanticEdges | Where-Object { $null -ne $_.edge.site_id })
           $semanticSites = @($events | Where-Object {
