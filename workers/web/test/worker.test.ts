@@ -417,6 +417,51 @@ test("pure TypeScript semantic profiles allow candidate and external calls", asy
   assert.ok(semanticCalls.some((site) => site.resolution_status === "external"));
 });
 
+test("Next JSX import correlation preserves CRLF offsets", async (context) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "depgraph-web-next-crlf-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  const app = path.join(root, "app");
+  await mkdir(app, { recursive: true });
+  const pageSource = [
+    'import { Widget as FirstWidget } from "./Widget";',
+    'import { Widget as SecondWidget } from "./Widget";',
+    "export default function Page(): unknown {",
+    "  return <SecondWidget />;",
+    "}",
+    "",
+  ].join("\r\n");
+  await Promise.all([
+    writeFile(path.join(root, "package.json"), JSON.stringify({
+      name: "next-crlf",
+      version: "1.0.0",
+      type: "module",
+      dependencies: { next: "16.2.10" },
+    })),
+    writeFile(path.join(app, "page.tsx"), pageSource),
+    writeFile(path.join(app, "Widget.tsx"), "export function Widget(): unknown { return null; }\r\n"),
+  ]);
+
+  const result = await run("next-crlf", root);
+  const profile = result.events.find((event) => event.event === "profile_declared")?.profile;
+  const nodes = result.events.filter((event) => event.event === "node_upsert").map((event) => event.node);
+  const edges = result.events.filter((event) => event.event === "edge_upsert").map((event) => event.edge);
+  const page = nodes.find((node) => node.kind === "component" && node.display_name === "Page");
+  const widget = nodes.find((node) => node.kind === "component" && node.display_name === "Widget");
+  const render = edges.find((edge) => (
+    edge.kind === "renders"
+    && edge.source === page?.id
+    && edge.target === widget?.id
+    && edge.evidence[0]?.properties.occurrence_kind === "next_import_render"
+  ));
+  const rawSiteKey = render?.evidence[0]?.properties.typescript_site_key;
+
+  assert.equal(profile?.properties.web_framework_semantic_status, "emitted");
+  assert.equal(typeof rawSiteKey, "string");
+  const rawSiteIdentity = JSON.parse(rawSiteKey.slice("site:".length)) as unknown[];
+  assert.equal(rawSiteIdentity[2], "app/page.tsx");
+  assert.equal(rawSiteIdentity[3], pageSource.indexOf("SecondWidget"));
+});
+
 test("stable IDs and events are independent of checkout directory", async (context) => {
   const temp = await mkdtemp(path.join(os.tmpdir(), "depgraph-web-checkouts-"));
   context.after(async () => rm(temp, { recursive: true, force: true }));

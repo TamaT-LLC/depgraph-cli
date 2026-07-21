@@ -1067,8 +1067,11 @@ export function collectNextSemanticDelta(input: NextSemanticInput): NextSemantic
 }
 
 function positionOffset(source: string, line: number, column: number): number {
-  const lines = source.split(/\r?\n/u);
   let offset = 0;
-  for (let index = 0; index < line - 1; index += 1) offset += (lines[index]?.length ?? 0) + 1;
-  return offset + column - 1;
+  for (let currentLine = 1; currentLine < line; currentLine += 1) {
+    const newline = source.indexOf("\n", offset);
+    if (newline === -1) return source.length;
+    offset = newline + 1;
+  }
+  return Math.min(source.length, offset + Math.max(0, column - 1));
 }
