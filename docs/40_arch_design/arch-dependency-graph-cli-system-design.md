@@ -821,19 +821,90 @@ build scanではobserver integrationからclient / SSR / server module graphとi
 
 ### 12.2 `resolve --build`
 
-明示 opt-in。対象 project の build tool、config、plugin、build script、proc macro が実行され得る。
+明示 opt-in。対象 project の build tool、executable config、plugin、lifecycle script、Rust build script、proc macro、compiler / bundler extensionと、それらが起動するdescendantは任意のnative codeとして扱う。build modeはsafe scanの精度向上optionではなく、別の権限・実行・完全性境界を持つ観測modeである。
 
-最低限、次を実施する。
+#### 12.2.1 脅威モデルと信頼境界
 
-- child process 分離
-- timeout と cancel
-- environment allowlist
-- secret value 非保存と既知 key の redaction
-- command、cwd、toolchain、environment key 名の audit log
-- 一時 output directory
-- 可能な環境では network 無効化を推奨
+| Zone / input | Trust | 規範的な扱い |
+| --- | --- | --- |
+| `depgraph` parent、versioned protocol / schema | trusted product boundary | project moduleやdynamic libraryをparent processへloadしない |
+| repository source、manifest、lockfile、config、plugin、script | untrusted input | parsing対象であると同時に、build modeでは攻撃者制御codeになり得る |
+| selected system toolchain / package manager | conditionally trusted executable | canonical executable identityとversionをpreflightし、project-local wrapperやPATH shadowingを許可しない |
+| supervised childと全descendant | untrusted process tree | process group / Windows Job Object相当へ閉じ、timeout / cancel / cleanupをtree全体へ適用する |
+| staged build output、observer event、stdout / stderr | untrusted output | size / path / schema / identityを検証するまでgraphやstoreへ投入しない |
+| SQLiteの直前completed snapshot | trusted committed state | build attemptの成否にかかわらずtransaction外で保持する |
 
-build 結果は semantic graph を上書きせず、`phase=build` / `precision=observed` の evidence として union する。
+攻撃面には、secret environmentの読取、repository / user directoryの改変、network exfiltration、descendantの残留、pipe保持、resource exhaustion、symlink / path traversal、observer event偽装、terminal escape、stdout / stderrへのsecret出力、toolchain / wrapper差し替えを含む。明示consentはこれらのriskを消去するsandbox guaranteeではない。何を制限でき、何を観測したかをauditへ残し、保証できない境界をcompleteとして申告しない。
+
+#### 12.2.2 CLI consentと非対話UX
+
+規範的な構文は次である。
+
+```text
+depgraph resolve --build [PATH] --allow-project-code
+```
+
+- `--build`はmode selectorであり必須。`resolve`だけ、または将来modeの暗黙選択はusage errorのexit `2`とする。
+- `--allow-project-code`は呼出しごとの明示flagだけをconsent sourceとする。config、environment、`CI=true`、TTY有無、以前の同意、cache、storeから継承しない。
+- flag欠落時はpathのcanonicalize、config読取、store作成、toolchain probe、child起動より先に拒否する。promptを出さず、stderrにriskと再実行方法を示しexit `4`とする。
+- flagがあってもpreflight / supervisor / security policyを通過しなければ実行しない。consentは特定commandを必ず実行する指示でも、policy bypassでもない。
+- safe `scan`からbuild modeへ自動昇格しない。`scan --strict`、unresolved build-only site、CI環境もimplicit executionの理由にならない。
+- Issue #62時点ではconsent guardだけを有効化する。flagありでもsupervisor未実装をoperational exit `3`として返し、child / storeを作らない。Issue #63がこのfail-closed stubをsupervised executionへ置換する。
+
+#### 12.2.3 Supervisor実行policy
+
+Issue #63以降のsupervisorは次を満たさなければならない。
+
+- shell文字列を評価せず、adapterがversioned planとして選んだcanonical programとargv配列だけを起動する。project-local wrapper、alias、relative PATH entryを拒否する。
+- repository inventoryをrun固有のtemporary workspaceへstageし、original checkoutを観測output先にしない。build output、home、cache、temporary directoryもrun固有directoryへ向け、終了時にprocess treeを停止してからcleanupする。
+- environmentは`env_clear`を基点に、adapter / toolchainごとのversioned allowlistだけを注入する。user / project environment、execution hook、credential helper、proxy、wrapper、telemetry、auto-installを暗黙継承しない。
+- adapterごとのtimeoutを持ち、既定15分、hard cap 60分とする。cancelまたはtimeout時はgraceful terminationを最大5秒待ち、その後process treeを強制停止する。結果はexit `3`で、観測deltaを昇格しない。
+- network policyの既定はoffline tool flag、proxy / credential除去、telemetry / download禁止を組み合わせた`deny`である。OS levelで遮断できた場合は`enforced`、platform上で保証できない場合は`best-effort`をauditする。後者をsandbox済みと表示してはならず、強制遮断が必要なCIはnetwork namespace / containerを外側の境界として要求する。
+- staged outputはregular file、run root confinement、symlink不在、entry / byte上限、schema、content digest、producer identityを検証する。検証前output、raw stdout / stderr、terminal control sequenceをstoreへ入れない。
+
+#### 12.2.4 Auditとsecret非保存
+
+各attemptは成功 / failure / cancelのいずれでも次のmetadataをcanonical auditとして持つ。
+
+| Field | Persisted value |
+| --- | --- |
+| run / adapter / profile | stable run ID、observer / adapter identityとversion、profile ID |
+| command | canonical executable identity、redaction後argv、command-plan digest。shell-expanded stringは保存しない |
+| cwd | staged workspace内のlogical cwdとsource-root digest。host absolute pathはportable graph identityへ入れない |
+| toolchain | canonical executable digest、normalized version、target |
+| environment | allowlisted non-secret key名をsortした集合とkey-set digest。valueは保存しない |
+| limits / isolation | timeout、cancel outcome、network policyと`enforced` / `best-effort`、output limit |
+| outcome | start / finish / duration、exit / signal / timeout / cancel、validated output digest |
+
+environment valueはkey種別にかかわらず永続化しない。key名がcase-insensitiveで`TOKEN`、`SECRET`、`PASSWORD`、`PASSWD`、`API_KEY`、`PRIVATE_KEY`、`CREDENTIAL`、`AUTH`、`COOKIE`、`SESSION`を含む場合、そのkey自体も保存せず`redacted_secret_key_count`だけを記録する。argvの`--token` / `--password`等と、structured diagnostic propertyのsecret-like keyも同じ分類でredactする。raw stdout / stderrはboundedなephemeral bufferとしてfailure分類にだけ使い、store、graph、audit、通常JSON outputへ保存しない。observerがsecret-like propertyまたは非allowlist fieldを返した場合はevent全体を拒否する。
+
+#### 12.2.5 Build evidence contract
+
+validated build observationはsource / semantic graphを上書きせずunionする。build dependency siteとそれに対応するedgeは次を同時に満たす。
+
+- edge `phase=build`
+- site / edge `precision=observed`
+- primary evidence `kind=build`、versioned observer / extractor identity、build run ID、profile ID、command-plan / toolchain / environment-key / output digestを持つ
+- `resolved` targetはそのrunで実際にobserverが対応付けたcanonical targetだけ。観測していない候補、別profile、別toolchain、別revisionへ一般化しない
+- generated outputにsource spanがないことは許容するが、producer、logical artifact path、digestを必須とする。source spanを持つsupporting evidenceがある場合もprimary build evidenceを置換しない
+- `build-observed` completenessは計画した全observer、output validation、coverage conservationが成功したprofileだけへ付与する。`semantic-complete`とは独立で、build成功だけでsource / semanticのunresolvedを黙って消さない
+- source / semanticと矛盾する観測は片方を削除せず、両edgeと相関diagnosticを保持する
+
+#### 12.2.6 Failure、snapshot、受け入れmatrix
+
+build attemptは新しいstaging transactionへ書き、全observerとprotocol / store validationが完了するまで既存snapshotへunionしない。tool failure、timeout、cancel、malformed / forged event、output escape、secret policy違反ではbuild deltaをatomicに破棄し、auditとbounded diagnosticだけをfailed attemptへ残す。直前のcompleted / latest-successful snapshotとそのdefault query selectionを保持する。partial attemptを調査する場合は明示attempt IDを要求し、completed snapshotとして昇格しない。
+
+| Scenario | Project code / child | Exit | Snapshot / audit |
+| --- | --- | ---: | --- |
+| flagなし、TTY / CIいずれも | 起動しない | `4` | storeを作らず、stderrに明示consent方法 |
+| env / configだけで許可を主張 | 起動しない | `4` | implicit consentを無視 |
+| flagあり、path / config usage不正 | 起動しない | `2` | completed snapshotを保持 |
+| flagあり、supervisor / toolchain operational failure | 起動前または管理下で停止 | `3` | failed audit、build deltaなし |
+| child非0、timeout、cancel、descendant残留 | tree全体を停止 | `3` | failed audit、直前completedを保持 |
+| forged event、path escape、secret policy違反 | tree全体を停止 | `4` | unsafe outputを保存せずsecurity diagnostic |
+| 全observer / validation成功 | 管理下で完了 | `0` | atomic union、build attemptをcompletedへ昇格 |
+
+Issue #62のunit testはconsent / exit分類を、CLI integration / E2Eは通常環境・`CI=true`・implicit env・armed JavaScript / Rust fixture・supervisor未実装時のchild / store不在を検証する。Issue #63以降はprocess tree、timeout、cancel、environment、network audit、temporary output、secret redaction、成功 / failure snapshotのmatrixを実processで追加する。
 
 ### 12.3 Runtime Trace
 
@@ -1081,6 +1152,10 @@ Go semantic scanではGOOS/GOARCH、build tags、強制されたcgo無効状態�
 
 **採用。** Go safe scanが実際に参照したoffline dependency sourceと静的resolution inputを、absolute pathを除いたcanonical snapshotとしてfingerprintし、availability statusとともにGo profile ID v2へ含める。admitted inputはmodule-cache、moduleの`vendor`、repository内local replacement、module/work checksumとmanifestに限定する。stdlib、build cache、temporary/VCS/unused cache、symlinkまたはadmitted root外のsourceは除外する。部分読取moduleのtyped deltaはatomicに破棄し、固定reason付き`partial` / `unavailable` outcomeへfallbackする。この方式により、cache配置だけの差はidentityへ影響させず、dependency bytes / locator / checksum / vendor / replace / availabilityの差だけをsemantic cache invalidationへ反映する。
 
+### ADR-009: Explicit-consent Supervised Build Observation
+
+**採用。** build tool、config、plugin、build script、proc macroはrepository-controlled arbitrary codeであり、safe scanと同じworker trust boundaryでは扱わない。`resolve --build`は呼出しごとの`--allow-project-code`だけをconsentとし、prompt、CI、environment、config、過去の同意から推測しない。child tree、cleared environment、timeout / cancel、temporary workspace、network policy、secret-free audit、untrusted output validationをsupervisorの必須境界とする。validated resultだけを`phase=build` / `precision=observed`としてatomic unionし、failure / partialでは直前completed snapshotを保持する。Issue #62ではこのcontractとCLI refusalを実装し、実行supervisorはIssue #63へ分離する。
+
 ## 21. Roadmap
 
 ### Milestone 0: Schema and Contract
@@ -1122,7 +1197,8 @@ Go semantic scanではGOOS/GOARCH、build tags、強制されたcgo無効状態�
 
 ### Milestone 3: Build Evidence
 
-- safe execution boundary
+- safe execution boundary / explicit consent contract: Issue #62で実装済み（2026-07-22）
+- opt-in child-process supervisor: Issue #63
 - Next Adapter observer
 - Astro integration / Vite observer
 - TanStack Start build observer
@@ -1179,6 +1255,7 @@ Go semantic scanではGOOS/GOARCH、build tags、強制されたcgo無効状態�
 
 ## 26. 更新履歴
 
+- 2026-07-22: Issue #62としてADR-009と`resolve --build --allow-project-code`契約を確定。build tool / config / plugin / build script / proc macroとdescendantをuntrusted codeとして分離し、呼出しごとのflag以外のimplicit consentとpromptを禁止した。flag欠落はpath/config/store/tool probe前にexit `4`、supervisor未実装中はflagありでもchildを起動せずexit `3`とする。command / logical cwd / toolchain / environment key / isolation / outcome audit、secret value非保存とsecret-like key redaction、timeout / cancel / network / temporary output、failure時のatomic discardと直前completed snapshot保持、`phase=build` / `precision=observed` union、受け入れmatrixを定義し、通常/CI/implicit env/armed fixtureのunit・CLI E2Eでguardを固定した。
 - 2026-07-22: `v0.2.0-rc.1` aggregate verifierがWindows checkout由来のCRLF project licenseを検出したため、`LICENSE-APACHE` / `LICENSE-MIT`を`.gitattributes`でLFへ固定した。xtask metadata gateもattributeとcompiled bytesのCR不在を検証し、全targetでchecksumだけでなくproject license bytesそのものを一致させる。
 - 2026-07-22: `v0.2.0-rc.1`初回tag runのhosted runner性能差を記録し、開発機の暫定target 30秒/500msを維持したまま、共有Linux runnerのrelease ceilingを60秒/1.5秒として明示した。benchmark fixture、10,000 files、semantic completeness検証、raw timing出力は変更せず、runner差を閾値へ隠さない。
 - 2026-07-22: Issue #61としてMilestone 2 Semantic Graph release candidate `v0.2.0-rc.1`を確定。Cargo product crates、Rust/Go/Web adapter handshake、manifest、SBOM、archive名を同期し、protocol/schema互換性は`1.0`を維持する。Go/Rust/Web/framework semantic scope、安全境界、完全性条件、既知制約をrelease noteへ整理した。release workflowはquality/benchmark後にLinux x64/arm64、macOS x64/arm64、Windows x64のnative package gateを実行し、公開前のaggregate gateで全checksum、archive layout、artifact/component digest、worker attestation、SBOM、project/third-party license分離を再検証してmachine-readable reportを添付する。
