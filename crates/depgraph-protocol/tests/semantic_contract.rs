@@ -1115,6 +1115,47 @@ fn semantic_type_use_and_direct_call_are_resolved_exact_dependencies() {
 }
 
 #[test]
+fn go_value_references_are_strict_symbol_dependencies() {
+    let events = go_value_reference_values();
+    let input = values_to_ndjson(events.clone());
+    assert!(schema_accepts_stream(&input));
+    assert!(semantic_schema_accepts_stream(&input));
+    let validated = validate_safe_semantic_ndjson(Cursor::new(input))
+        .expect("Go value-reference fixture must validate");
+
+    let reference = edge_by_kind(&validated.edges, "references");
+    assert_semantic_edge(reference, ResolutionStatus::Resolved, Precision::Exact);
+    assert_eq!(validated.nodes[&reference.source].kind, "symbol");
+    assert_eq!(validated.nodes[&reference.target].kind, "symbol");
+    let site = site_for_edge(&validated.sites, reference);
+    assert_eq!(site.kind, "value_reference");
+    assert_eq!(
+        site.target_ids.as_slice(),
+        std::slice::from_ref(&reference.target)
+    );
+    assert_eq!(site.evidence[0].extractor, "go-types");
+
+    let mut wrong_target = events;
+    let type_id = wrong_target
+        .iter()
+        .find(|event| event["event"] == "node_upsert" && event["node"]["kind"] == "type")
+        .expect("semantic type node")["node"]["id"]
+        .as_str()
+        .expect("type ID")
+        .to_owned();
+    reassign_site_target(&mut wrong_target, "value_reference", &type_id);
+    let input = values_to_ndjson(wrong_target);
+    assert!(schema_accepts_stream(&input));
+    assert!(semantic_schema_accepts_stream(&input));
+    assert!(
+        validate_safe_semantic_ndjson(Cursor::new(input))
+            .expect_err("value reference to a type must be rejected")
+            .to_string()
+            .contains("must be a symbol node")
+    );
+}
+
+#[test]
 fn candidate_calls_share_one_stable_site_and_have_one_edge_per_target() {
     let validated = semantic_fixture();
     let site = validated
@@ -1728,6 +1769,42 @@ fn semantic_values() -> Vec<Value> {
         .lines()
         .map(|line| serde_json::from_str(line).expect("fixture JSON"))
         .collect()
+}
+
+fn go_value_reference_values() -> Vec<Value> {
+    let mut events = semantic_values();
+    let site_index = events
+        .iter()
+        .position(|event| {
+            event["event"] == "dependency_site"
+                && event["site"]["kind"] == "call"
+                && event["site"]["specifier"] == "service.Start"
+        })
+        .expect("direct Go call site");
+    let old_id = events[site_index]["site"]["id"]
+        .as_str()
+        .expect("call site ID")
+        .to_owned();
+    events[site_index]["site"]["kind"] = json!("value_reference");
+    events[site_index]["site"]["evidence"][0]["extractor"] = json!("go-types");
+    events[site_index]["site"]["evidence"][0]["extractor_version"] = json!("0.1.0");
+    events[site_index]["site"]["evidence"][0]["detail"] = json!("first-class function reference");
+    events[site_index]["site"]["evidence"][0]["properties"] = json!({
+        "object_kind": "function",
+        "occurrence_kind": "identifier",
+        "resolver_identity": "example.com/acme/service.Start",
+    });
+    let new_id = rehash_json_site(&mut events[site_index]["site"]);
+    let evidence = events[site_index]["site"]["evidence"].clone();
+    let edge = linked_edge_mut(&mut events, &old_id);
+    edge["kind"] = json!("references");
+    edge["site_id"] = json!(new_id);
+    edge["evidence"] = evidence;
+    rehash_json_edge(edge);
+    sort_site_events(&mut events);
+    sort_edge_events(&mut events);
+    resequence(&mut events);
+    events
 }
 
 fn rust_semantic_values() -> Vec<Value> {
@@ -2547,7 +2624,14 @@ fn semantic_schema_accepts_stream(input: &str) -> bool {
             event["event"] == "dependency_site"
                 && matches!(
                     event["site"]["kind"].as_str(),
-                    Some("type_use" | "rust_use" | "rust_reexport" | "web_import" | "web_reexport")
+                    Some(
+                        "type_use"
+                            | "value_reference"
+                            | "rust_use"
+                            | "rust_reexport"
+                            | "web_import"
+                            | "web_reexport"
+                    )
                 )
                 && event["site"]["evidence"][0]["kind"] == "semantic"
         })
@@ -2561,12 +2645,14 @@ fn semantic_schema_accepts_stream(input: &str) -> bool {
             semantic_definition_accepts(&schema, "semantic_node", &event["node"])
         }
         Some("edge_upsert")
-            if matches!(event["edge"]["kind"].as_str(), Some("calls" | "may_call"))
-                || (matches!(
-                    event["edge"]["kind"].as_str(),
-                    Some("declares" | "extends" | "implements" | "instantiates")
-                ) && (event["edge"]["phase"] == "semantic"
-                    || event["edge"]["evidence"][0]["kind"] == "semantic"))
+            if matches!(
+                event["edge"]["kind"].as_str(),
+                Some("calls" | "may_call" | "references")
+            ) || (matches!(
+                event["edge"]["kind"].as_str(),
+                Some("declares" | "extends" | "implements" | "instantiates")
+            ) && (event["edge"]["phase"] == "semantic"
+                || event["edge"]["evidence"][0]["kind"] == "semantic"))
                 || event["edge"]["site_id"]
                     .as_str()
                     .is_some_and(|site_id| strict_dependency_site_ids.contains(site_id)) =>

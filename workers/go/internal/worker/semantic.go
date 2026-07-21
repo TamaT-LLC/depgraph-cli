@@ -122,6 +122,7 @@ func (s *scannerState) extractGoSemanticGraph(sources []*sourceFile) {
 		context.emitExtends()
 		context.emitSelections()
 		context.emitTypeUsesAndInstances()
+		context.emitValueReferences()
 	}
 	for _, context := range extractor.contexts {
 		context.emitCalls()

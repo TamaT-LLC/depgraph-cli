@@ -61,3 +61,5 @@ func CycleLeft() {
 func CycleRight() {
 	CycleLeft()
 }
+
+var ExternalKind = reflect.Invalid

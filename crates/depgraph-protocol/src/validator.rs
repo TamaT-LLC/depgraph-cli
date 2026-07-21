@@ -889,7 +889,7 @@ fn validate_semantic_maps(
         if expected_edge_kind.is_none() {
             if is_common_semantic_edge_kind(edge.kind.as_str()) {
                 return invariant(format!(
-                    "semantic edge {} of kind {} requires a call or type_use dependency site, found {}",
+                    "semantic edge {} of kind {} requires a call, type_use, or value_reference dependency site, found {}",
                     edge.id, edge.kind, site.kind
                 ));
             }
@@ -919,10 +919,17 @@ fn validate_semantic_maps(
             .expect("base validation requires dependency-site sources to exist");
         let rust_semantic_site = is_rust_semantic_dependency_site(site, source_node);
         let web_semantic_site = is_web_semantic_dependency_site(site, source_node);
+        let go_semantic_site = is_go_semantic_dependency_site(site, source_node);
         match site.kind.as_str() {
             "call" if source_node.kind != "symbol" => {
                 return invariant(format!(
                     "semantic call site {} source {} must be a symbol node",
+                    site.id, source_node.id
+                ));
+            }
+            "value_reference" if source_node.kind != "symbol" => {
+                return invariant(format!(
+                    "semantic value-reference site {} source {} must be a symbol node",
                     site.id, source_node.id
                 ));
             }
@@ -981,6 +988,31 @@ fn validate_semantic_maps(
                 site.id, source_node.id
             ));
         }
+        if go_semantic_site
+            && source_node
+                .properties
+                .get("language")
+                .and_then(Value::as_str)
+                != Some("go")
+        {
+            return invariant(format!(
+                "Go semantic dependency site {} source {} must declare language=go",
+                site.id, source_node.id
+            ));
+        }
+        if go_semantic_site {
+            for target_id in &site.target_ids {
+                let target = nodes
+                    .get(target_id)
+                    .expect("base validation requires dependency-site targets to exist");
+                if target.properties.get("language").and_then(Value::as_str) != Some("go") {
+                    return invariant(format!(
+                        "Go semantic dependency site {} target {} must declare language=go",
+                        site.id, target.id
+                    ));
+                }
+            }
+        }
 
         if matches!(
             site.resolution_status,
@@ -1000,6 +1032,12 @@ fn validate_semantic_maps(
                     "type_use" if target.kind != "type" => {
                         return invariant(format!(
                             "semantic type-use site {} concrete target {} must be a type node",
+                            site.id, target.id
+                        ));
+                    }
+                    "value_reference" if target.kind != "symbol" => {
+                        return invariant(format!(
+                            "semantic value-reference site {} concrete target {} must be a symbol node",
                             site.id, target.id
                         ));
                     }
@@ -1049,7 +1087,7 @@ fn validate_semantic_maps(
         // conditional exports may narrow each candidate edge to its own
         // browser/server/package branch while the site carries their union.
         let require_same_condition =
-            rust_semantic_site || (web_semantic_site && site.kind == "call");
+            rust_semantic_site || go_semantic_site || (web_semantic_site && site.kind == "call");
         for edge in edges
             .values()
             .filter(|edge| edge.site_id.as_deref() == Some(site.id.as_str()))
@@ -1082,7 +1120,7 @@ fn validate_semantic_maps(
 }
 
 fn is_common_semantic_edge_kind(kind: &str) -> bool {
-    matches!(kind, "type_uses" | "calls" | "may_call")
+    matches!(kind, "type_uses" | "references" | "calls" | "may_call")
 }
 
 fn is_definition_relation_kind(kind: &str) -> bool {
@@ -1154,7 +1192,13 @@ fn is_rust_import_site_kind(kind: &str) -> bool {
 fn is_evidence_driven_semantic_site(site: &DependencySite) -> bool {
     matches!(
         site.kind.as_str(),
-        "call" | "type_use" | "rust_use" | "rust_reexport" | "web_import" | "web_reexport"
+        "call"
+            | "type_use"
+            | "value_reference"
+            | "rust_use"
+            | "rust_reexport"
+            | "web_import"
+            | "web_reexport"
     ) && site
         .evidence
         .first()
@@ -1262,12 +1306,21 @@ fn semantic_edge_kind_for_site(
         "call" if site.resolution_status == ResolutionStatus::Candidates => Some("may_call"),
         "call" => Some("calls"),
         "type_use" if strict_dependency_site => Some("type_uses"),
+        "value_reference" if strict_dependency_site => Some("references"),
         "rust_use" if strict_dependency_site => Some("imports"),
         "rust_reexport" if strict_dependency_site => Some("reexports"),
         "web_import" if strict_dependency_site => Some("imports"),
         "web_reexport" if strict_dependency_site => Some("reexports"),
         _ => None,
     }
+}
+
+fn is_go_semantic_dependency_site(site: &DependencySite, source: &GraphNode) -> bool {
+    site.kind == "value_reference"
+        && (source.properties.get("language").and_then(Value::as_str) == Some("go")
+            || site.evidence.first().is_some_and(|evidence| {
+                evidence.kind == EvidenceKind::Semantic && evidence.extractor == "go-types"
+            }))
 }
 
 fn is_rust_semantic_dependency_site(site: &DependencySite, source: &GraphNode) -> bool {
@@ -1556,6 +1609,12 @@ fn validate_semantic_edge(
                 edge.id
             ));
         }
+        "references" if edge.resolution_status == ResolutionStatus::Candidates => {
+            return invariant(format!(
+                "value-reference edge {} cannot use candidates",
+                edge.id
+            ));
+        }
         "may_call"
             if edge.resolution_status != ResolutionStatus::Candidates
                 || edge.precision != Precision::Overapprox =>
@@ -1657,6 +1716,33 @@ fn validate_semantic_site(
     )?;
     if site.kind == "call" && site.resolution_status == ResolutionStatus::Candidates {
         validate_candidate_algorithm(&format!("candidate call site {}", site.id), primary)?;
+    }
+    if site.kind == "value_reference" {
+        if site.resolution_status == ResolutionStatus::Candidates {
+            return invariant(format!(
+                "value-reference dependency site {} cannot use candidates",
+                site.id
+            ));
+        }
+        if primary.extractor != "go-types" {
+            return invariant(format!(
+                "Go value-reference dependency site {} must use go-types primary evidence",
+                site.id
+            ));
+        }
+        for property in ["object_kind", "occurrence_kind"] {
+            if primary
+                .properties
+                .get(property)
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+            {
+                return invariant(format!(
+                    "Go value-reference dependency site {} primary evidence must include non-empty {property}",
+                    site.id
+                ));
+            }
+        }
     }
     if site.target_ids.windows(2).any(|pair| pair[0] >= pair[1]) {
         return invariant(format!(

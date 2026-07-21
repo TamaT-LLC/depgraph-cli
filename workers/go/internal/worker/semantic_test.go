@@ -5,6 +5,9 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"go/ast"
+	"go/token"
+	"go/types"
 	"io"
 	"os"
 	"path/filepath"
@@ -446,6 +449,137 @@ func TestGoSemanticDirectCallsAreStrictAndConservative(t *testing.T) {
 	externalVariantCall := semanticRequireStrictCall(t, result, externalTest.ID, build.ID)
 	if goSemanticConditionValue(externalVariantCall.Condition, "go.package_variant") != "external_test" {
 		t.Fatalf("external test direct call lost its variant: %+v", externalVariantCall)
+	}
+}
+
+func TestGoSemanticValueReferencesAreStrictAndDoNotDuplicateCallsOrTypes(t *testing.T) {
+	result := semanticScanFixture(t)
+	semanticAssertAllStrictValueReferences(t, result)
+
+	build := semanticFindNamedNode(t, result, "symbol", "function", semanticPackagePath+".Build")
+	outputToInput := semanticFindNamedNode(t, result, "symbol", "function", semanticPackagePath+".outputToInput")
+	semanticRequireStrictValueReference(t, result, build.ID, outputToInput.ID)
+
+	outputValue := semanticFindNamedNode(t, result, "symbol", "field", semanticPackagePath+".Output.Value")
+	semanticRequireStrictValueReference(t, result, outputToInput.ID, outputValue.ID)
+
+	direct := semanticFindNamedNode(t, result, "symbol", "function", semanticPackagePath+".DirectCallMatrix")
+	externalCall := semanticFindNamedNode(t, result, "symbol", "function", semanticPackagePath+".ExternalCall")
+	lines := []int{}
+	for _, edge := range result.Edges {
+		if edge.Kind != "references" || edge.Source != direct.ID || edge.Target != externalCall.ID {
+			continue
+		}
+		lines = append(lines, semanticSiteByID(t, result, edge.SiteID).Evidence[0].StartLine)
+	}
+	sort.Ints(lines)
+	if !reflect.DeepEqual(lines, []int{41, 43}) {
+		t.Fatalf("ExternalCall value references occur on lines %v, want only first-class uses [41 43]", lines)
+	}
+
+	externalKind := semanticFindNamedNode(t, result, "symbol", "variable", semanticPackagePath+".ExternalKind")
+	externalReference := semanticReferenceAt(t, result, externalKind.ID, "model/calls.go", 65)
+	if externalReference.ResolutionStatus != "external" || externalReference.Precision != "exact" {
+		t.Fatalf("external value reference lost exact classification: %+v", externalReference)
+	}
+	target := semanticNodeByID(t, result, externalReference.TargetIDs[0])
+	if target.Kind != "external_system" || target.Locator != "go-symbol:reflect.Invalid" {
+		t.Fatalf("external constant target is not canonical: %+v", target)
+	}
+}
+
+func TestGoSemanticValueReferenceAcrossPackages(t *testing.T) {
+	root := t.TempDir()
+	writeTestFile(t, filepath.Join(root, "go.mod"), "module example.com/references\n\ngo 1.26.1\n")
+	writeTestFile(t, filepath.Join(root, "lib", "lib.go"), "package lib\n\nvar Value = 1\n")
+	writeTestFile(t, filepath.Join(root, "app", "app.go"), "package app\n\nimport \"example.com/references/lib\"\n\nfunc Read() int { return lib.Value }\n")
+
+	result, err := Scan(root)
+	if err != nil {
+		t.Fatalf("Scan() error = %v", err)
+	}
+	read := semanticFindNamedNode(t, result, "symbol", "function", "example.com/references/app.Read")
+	value := semanticFindNamedNode(t, result, "symbol", "variable", "example.com/references/lib.Value")
+	edge := semanticRequireStrictValueReference(t, result, read.ID, value.ID)
+	if edge.Evidence[0].Properties["occurrence_kind"] != "qualified_identifier" {
+		t.Fatalf("cross-package reference lost qualified occurrence: %+v", edge.Evidence[0])
+	}
+	semanticAssertAllStrictValueReferences(t, result)
+}
+
+func TestGoSemanticValueReferenceAcrossWorkspaceReplacement(t *testing.T) {
+	root := t.TempDir()
+	writeTestFile(t, filepath.Join(root, "go.work"), "go 1.26.1\n\nuse (\n\t./app\n\t./lib\n)\n")
+	writeTestFile(t, filepath.Join(root, "lib", "go.mod"), "module example.com/reference-new\n\ngo 1.26.1\n")
+	writeTestFile(t, filepath.Join(root, "lib", "lib.go"), "package reference\n\nvar Value = 1\n")
+	writeTestFile(t, filepath.Join(root, "app", "go.mod"), "module example.com/reference-app\n\ngo 1.26.1\n\nrequire example.com/reference-old v0.0.0\nreplace example.com/reference-old => ../lib\n")
+	writeTestFile(t, filepath.Join(root, "app", "app.go"), "package app\n\nimport reference \"example.com/reference-old\"\n\nfunc Read() int { return reference.Value }\n")
+
+	result, err := Scan(root)
+	if err != nil {
+		t.Fatalf("Scan() error = %v", err)
+	}
+	read := semanticFindNamedNode(t, result, "symbol", "function", "example.com/reference-app.Read")
+	value := semanticFindNamedNode(t, result, "symbol", "variable", "example.com/reference-new.Value")
+	edge := semanticRequireStrictValueReference(t, result, read.ID, value.ID)
+	if edge.Evidence[0].Properties["resolver_identity"] != "example.com/reference-new.Value" {
+		t.Fatalf("replacement value reference did not retain canonical target resolver: %+v", edge.Evidence[0])
+	}
+}
+
+func TestGoSemanticExternalGenericFunctionValueReference(t *testing.T) {
+	root := t.TempDir()
+	writeTestFile(t, filepath.Join(root, "go.mod"), "module example.com/external-reference\n\ngo 1.26.1\n")
+	writeTestFile(t, filepath.Join(root, "reference.go"), "package reference\n\nimport \"slices\"\n\nfunc Ref() { clone := slices.Clone[[]int]; _ = clone }\n")
+
+	result, err := Scan(root)
+	if err != nil {
+		t.Fatalf("Scan() error = %v", err)
+	}
+	ref := semanticFindNamedNode(t, result, "symbol", "function", "example.com/external-reference.Ref")
+	var externalSites []Site
+	for _, site := range result.Sites {
+		if site.Kind == "value_reference" && site.Source == ref.ID && site.ResolutionStatus == "external" {
+			externalSites = append(externalSites, site)
+		}
+	}
+	if len(externalSites) != 1 {
+		t.Fatalf("external generic function value-reference sites = %d, want 1: %+v", len(externalSites), externalSites)
+	}
+	site := externalSites[0]
+	if site.ResolutionStatus != "external" || site.Precision != "exact" || site.Reason != "" {
+		t.Fatalf("external generic function reference has invalid classification: %+v", site)
+	}
+	target := semanticNodeByID(t, result, site.TargetIDs[0])
+	if target.Kind != "external_system" || target.Properties["target_kind"] != "generic_instance" ||
+		target.Properties["resolver_identity"] != "slices.Clone[[]int,int]" {
+		t.Fatalf("external generic function reference target is not canonical: %+v", target)
+	}
+	semanticAssertAllStrictValueReferences(t, result)
+}
+
+func TestGoSemanticUnresolvedValueReferenceUsesUnknownSentinelAndReason(t *testing.T) {
+	state := &scannerState{
+		workspaceIdentity: "unresolved-value-reference",
+		profile:           Profile{ID: "go:test", Language: "go"},
+		nodes:             map[string]Node{},
+		sites:             map[string]Site{},
+		edges:             map[string]Edge{},
+	}
+	extractor := &goSemanticExtractor{state: state, diagnosticIDs: map[string]bool{}, complete: true}
+	context := &goSemanticPackage{
+		extractor: extractor,
+		parents:   map[ast.Node]ast.Node{},
+	}
+	identifier := &ast.Ident{Name: "missing"}
+	object := types.NewVar(token.NoPos, nil, identifier.Name, types.Typ[types.Int])
+	target := context.valueReferenceTarget(identifier, object, nil)
+	if target.status != "unresolved" || target.precision != "heuristic" || target.reason != "object_identity_unavailable" {
+		t.Fatalf("unresolved value target classification = %+v", target)
+	}
+	unknown := state.nodes[target.nodeID]
+	if unknown.Kind != "unknown_target" || unknown.Properties["language"] != "go" {
+		t.Fatalf("unresolved value target is not the Go unknown sentinel: %+v", unknown)
 	}
 }
 
@@ -1136,6 +1270,110 @@ func semanticAssertAllStrictTypeUses(t *testing.T, result Result) {
 			t.Fatalf("type_uses edge disagrees with site: edge=%+v site=%+v", edge, site)
 		}
 	}
+}
+
+func semanticRequireStrictValueReference(t *testing.T, result Result, sourceID, targetID string) Edge {
+	t.Helper()
+	for _, edge := range result.Edges {
+		if edge.Kind != "references" || edge.Source != sourceID || edge.Target != targetID {
+			continue
+		}
+		semanticAssertSemanticEdge(t, result, edge, true)
+		site := semanticSiteByID(t, result, edge.SiteID)
+		if site.Source != sourceID || site.Kind != "value_reference" ||
+			!reflect.DeepEqual(site.TargetIDs, []string{targetID}) {
+			t.Fatalf("references edge points at an invalid site: edge=%+v site=%+v", edge, site)
+		}
+		return edge
+	}
+	t.Fatalf("missing strict references edge %s -> %s; semantic edges:\n%s", sourceID, targetID, semanticEdgeSummary(result))
+	return Edge{}
+}
+
+func semanticAssertAllStrictValueReferences(t *testing.T, result Result) {
+	t.Helper()
+	nodes := make(map[string]Node, len(result.Nodes))
+	sites := make(map[string]Site, len(result.Sites))
+	for _, node := range result.Nodes {
+		nodes[node.ID] = node
+	}
+	for _, site := range result.Sites {
+		sites[site.ID] = site
+		if site.Kind != "value_reference" {
+			continue
+		}
+		semanticAssertEvidence(t, site.Evidence)
+		primary := site.Evidence[0]
+		wantID := semanticCanonicalValueID("site", map[string]any{
+			"condition": site.Condition, "kind": site.Kind, "path": primary.Path,
+			"profile_id": site.ProfileID, "source": site.Source,
+			"span": map[string]any{
+				"start_line": primary.StartLine, "start_column": primary.StartColumn,
+				"end_line": primary.EndLine, "end_column": primary.EndColumn,
+			},
+		})
+		if site.ID != wantID {
+			t.Fatalf("value_reference site ID = %q, want %q: %+v", site.ID, wantID, site)
+		}
+		if nodes[site.Source].Kind != "symbol" || len(site.TargetIDs) != 1 || site.Specifier == "" {
+			t.Fatalf("value_reference has invalid source/target/specifier: site=%+v source=%+v", site, nodes[site.Source])
+		}
+		objectKind, _ := primary.Properties["object_kind"].(string)
+		occurrenceKind, _ := primary.Properties["occurrence_kind"].(string)
+		if objectKind == "" || occurrenceKind == "" {
+			t.Fatalf("value_reference evidence lacks occurrence classification: %+v", primary)
+		}
+		target := nodes[site.TargetIDs[0]]
+		switch site.ResolutionStatus {
+		case "resolved":
+			if target.Kind != "symbol" || site.Precision != "exact" || site.Reason != "" {
+				t.Fatalf("resolved value_reference has invalid target/precision/reason: site=%+v target=%+v", site, target)
+			}
+		case "external":
+			if target.Kind != "external_system" || site.Precision != "exact" || site.Reason != "" {
+				t.Fatalf("external value_reference has invalid target/precision/reason: site=%+v target=%+v", site, target)
+			}
+		case "unresolved":
+			if target.Kind != "unknown_target" || site.Precision != "heuristic" || site.Reason == "" {
+				t.Fatalf("unresolved value_reference lost sentinel/reason: site=%+v target=%+v", site, target)
+			}
+		default:
+			t.Fatalf("value_reference has invalid status: %+v", site)
+		}
+	}
+	for _, edge := range result.Edges {
+		if edge.Kind != "references" {
+			continue
+		}
+		site, ok := sites[edge.SiteID]
+		if !ok || site.Kind != "value_reference" {
+			t.Fatalf("references edge lacks value_reference site: %+v", edge)
+		}
+		wantID := semanticCanonicalValueID("edge", map[string]any{
+			"kind": edge.Kind, "site_id": edge.SiteID, "target": edge.Target,
+		})
+		if edge.ID != wantID || edge.Source != site.Source || edge.Target != site.TargetIDs[0] ||
+			edge.Phase != "semantic" || edge.Environment != "any" || edge.ProfileID != site.ProfileID ||
+			edge.ResolutionStatus != site.ResolutionStatus || edge.Precision != site.Precision ||
+			!reflect.DeepEqual(edge.Condition, site.Condition) || !reflect.DeepEqual(edge.Evidence, site.Evidence) {
+			t.Fatalf("references edge disagrees with its site or canonical identity: edge=%+v site=%+v want_id=%s", edge, site, wantID)
+		}
+	}
+}
+
+func semanticReferenceAt(t *testing.T, result Result, sourceID, path string, line int) Site {
+	t.Helper()
+	var matches []Site
+	for _, site := range result.Sites {
+		if site.Kind == "value_reference" && site.Source == sourceID && len(site.Evidence) > 0 &&
+			site.Evidence[0].Path == path && site.Evidence[0].StartLine == line {
+			matches = append(matches, site)
+		}
+	}
+	if len(matches) != 1 {
+		t.Fatalf("value_reference at %s:%d from %s matches = %d, want 1: %+v", path, line, sourceID, len(matches), matches)
+	}
+	return matches[0]
 }
 
 func semanticRequireStrictCall(t *testing.T, result Result, sourceID, targetID string) Edge {

@@ -63,13 +63,21 @@ For each confined module whose complete `go/packages` load succeeds, the worker
 emits `symbol` and `type` nodes for retained declarations, local definitions,
 methods, closures, package initializers, named types, and generic function/type
 instances. `go/types` evidence backs `declares`, `extends`, `implements`,
-`instantiates`, and `type_uses` relations.
+`instantiates`, `type_uses`, and value-reference relations.
+
+Variables, constants, fields, and first-class function/method uses emit a
+source-spanned `value_reference` site and `references` edge. Repository objects
+target their canonical `symbol`; objects outside the repository target an exact
+`external_system` sentinel, and objects without a canonical identity retain an
+`unknown_target` plus a stable reason. Call callee identifiers, type names, and
+package qualifiers remain owned by call, type-use, and import occurrences so a
+single identifier occurrence is not counted twice.
 
 Statically resolved functions, methods, closures, and generic instances emit
 `calls` edges with `resolution_status=resolved` and `precision=exact`. Builtins
 and functions outside the scanned workspace emit exact `calls` edges with
 `resolution_status=external`. Go conversions are treated as type uses rather
-than calls. General value/reference-use edges are not currently emitted.
+than calls.
 
 Interface and function-value dispatch is analyzed with serial SSA using
 `InstantiateGenerics`. A complete main or test program uses RTA when the call

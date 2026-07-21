@@ -28,6 +28,11 @@
       "semantic_kind": "function"
     },
     {
+      "locator": "go-symbol:example.com/semantic/model.outputToInput",
+      "kind": "symbol",
+      "semantic_kind": "function"
+    },
+    {
       "locator": "go-symbol:example.com/semantic/model.(MethodExpressionTarget).Execute",
       "kind": "symbol",
       "semantic_kind": "method"
@@ -44,6 +49,30 @@
     }
   ],
   "relations": [
+    {
+      "source_locator": "go-symbol:example.com/semantic/model.Build",
+      "target_locator": "go-symbol:example.com/semantic/model.outputToInput",
+      "site_kind": "value_reference",
+      "kind": "references",
+      "phase": "semantic",
+      "resolution_status": "resolved",
+      "precision": "exact",
+      "evidence": {
+        "kind": "semantic",
+        "extractor": "go-types",
+        "extractor_version": "0.1.0",
+        "path": "model/model.go",
+        "start_line": 45,
+        "start_column": 46,
+        "end_line": 45,
+        "end_column": 59,
+        "properties": {
+          "object_kind": "function",
+          "occurrence_kind": "identifier",
+          "resolver_identity": "example.com/semantic/model.outputToInput"
+        }
+      }
+    },
     {
       "source_locator": "go-symbol:example.com/semantic/model.Build",
       "target_locator": "go-type:example.com/semantic/model.Input",
