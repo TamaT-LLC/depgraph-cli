@@ -23,7 +23,7 @@ pub use profile_matrix::{
     declared_effective_input_id, declared_parent_profile_id, phase_coverage_for_effective_profile,
 };
 
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ScanRecord {
@@ -64,6 +64,20 @@ pub struct SnapshotIntegrityRecord {
     pub expected_id: String,
     pub observed_id: String,
     pub reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SnapshotNameRecord {
+    pub name: String,
+    pub snapshot_id: String,
+    pub named_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CompletedSnapshotDetails {
+    pub snapshot: CompletedSnapshotRecord,
+    pub names: Vec<String>,
+    pub coverage: CoverageRecord,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -584,6 +598,26 @@ impl Store {
             tx.execute_batch("PRAGMA user_version = 8;")?;
             tx.commit()?;
         }
+        if current < 9 {
+            let tx = self.connection.transaction()?;
+            tx.execute_batch(
+                "CREATE TABLE snapshot_names (
+                    name TEXT PRIMARY KEY COLLATE NOCASE,
+                    snapshot_id TEXT NOT NULL REFERENCES completed_snapshots(id),
+                    named_at TEXT NOT NULL
+                 );
+                 CREATE INDEX snapshot_names_snapshot
+                    ON snapshot_names(snapshot_id, name);
+                 CREATE TRIGGER snapshot_names_immutable_update
+                    BEFORE UPDATE ON snapshot_names
+                    BEGIN SELECT RAISE(ABORT, 'snapshot names are immutable'); END;
+                 CREATE TRIGGER snapshot_names_immutable_delete
+                    BEFORE DELETE ON snapshot_names
+                    BEGIN SELECT RAISE(ABORT, 'snapshot names are immutable'); END;
+                 PRAGMA user_version = 9;",
+            )?;
+            tx.commit()?;
+        }
         Ok(())
     }
 
@@ -971,8 +1005,144 @@ impl Store {
             .context("failed to resolve completed snapshot source")
     }
 
+    pub fn snapshot_id_for_scan_selection(&self, scan_id: &str) -> Result<Option<String>> {
+        if let Some(build_attempt_id) = self.current_build_attempt_id(scan_id)?
+            && let Some(snapshot_id) = self.snapshot_id_for_source("build", &build_attempt_id)?
+        {
+            return Ok(Some(snapshot_id));
+        }
+        self.snapshot_id_for_source("scan", scan_id)
+    }
+
     pub fn completed_snapshot(&self, snapshot_id: &str) -> Result<Option<CompletedSnapshotRecord>> {
         load_completed_snapshot_record(&self.connection, snapshot_id)
+    }
+
+    pub fn create_snapshot_name(
+        &mut self,
+        name: &str,
+        snapshot_id: &str,
+    ) -> Result<SnapshotNameRecord> {
+        validate_snapshot_name(name)?;
+        let snapshot = self
+            .completed_snapshot(snapshot_id)?
+            .with_context(|| format!("completed snapshot {snapshot_id} was not found"))?;
+        if snapshot.status != "completed" {
+            bail!("snapshot {snapshot_id} is not completed");
+        }
+        let integrity = self.verify_snapshot_integrity(snapshot_id)?;
+        if !integrity.valid {
+            bail!(
+                "completed snapshot {snapshot_id} failed integrity validation: {}",
+                integrity.reasons.join(",")
+            );
+        }
+        let named_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+        let tx = self.connection.transaction()?;
+        let inserted = tx.execute(
+            "INSERT OR IGNORE INTO snapshot_names(name, snapshot_id, named_at)
+             VALUES (?1, ?2, ?3)",
+            params![name, snapshot_id, named_at],
+        )?;
+        if inserted == 0 {
+            let existing = tx.query_row(
+                "SELECT name, snapshot_id FROM snapshot_names WHERE name=?1 COLLATE NOCASE",
+                [name],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )?;
+            bail!(
+                "snapshot name {:?} already exists for {}; choose another name",
+                existing.0,
+                existing.1
+            );
+        }
+        tx.commit()?;
+        Ok(SnapshotNameRecord {
+            name: name.to_owned(),
+            snapshot_id: snapshot_id.to_owned(),
+            named_at,
+        })
+    }
+
+    pub fn snapshot_names(&self) -> Result<Vec<SnapshotNameRecord>> {
+        let mut statement = self.connection.prepare(
+            "SELECT name, snapshot_id, named_at
+               FROM snapshot_names
+              ORDER BY name COLLATE BINARY, snapshot_id",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok(SnapshotNameRecord {
+                    name: row.get(0)?,
+                    snapshot_id: row.get(1)?,
+                    named_at: row.get(2)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .context("failed to list snapshot names")
+    }
+
+    pub fn resolve_completed_snapshot_selector(&self, selector: &str) -> Result<String> {
+        if selector.trim().is_empty() {
+            bail!("snapshot selector must not be empty");
+        }
+        if selector.eq_ignore_ascii_case("current") {
+            return self
+                .current_snapshot_id()?
+                .context("no current completed snapshot is available");
+        }
+        if selector.eq_ignore_ascii_case("latest") {
+            bail!(
+                "snapshot selector \"latest\" is reserved; use current, a snapshot name, or a stable ID"
+            );
+        }
+        let by_id = self
+            .completed_snapshot(selector)?
+            .map(|snapshot| snapshot.id);
+        let by_name = self
+            .connection
+            .query_row(
+                "SELECT snapshot_id FROM snapshot_names WHERE name=?1 COLLATE NOCASE",
+                [selector],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        match (by_id, by_name) {
+            (Some(id), Some(named_id)) if id != named_id => bail!(
+                "snapshot selector {selector:?} is ambiguous between stable ID {id} and named snapshot {named_id}"
+            ),
+            (Some(id), _) | (_, Some(id)) => Ok(id),
+            (None, None) => bail!("snapshot selector {selector:?} was not found"),
+        }
+    }
+
+    pub fn completed_snapshot_details(
+        &self,
+        snapshot_id: &str,
+    ) -> Result<CompletedSnapshotDetails> {
+        let snapshot = self
+            .completed_snapshot(snapshot_id)?
+            .with_context(|| format!("completed snapshot {snapshot_id} was not found"))?;
+        let mut names = {
+            let mut statement = self.connection.prepare(
+                "SELECT name FROM snapshot_names
+                  WHERE snapshot_id=?1 ORDER BY name COLLATE BINARY",
+            )?;
+            statement
+                .query_map([snapshot_id], |row| row.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        names.sort();
+        let mut coverage = self.load_completed_snapshot(snapshot_id)?.coverage;
+        coverage.completeness.sort();
+        coverage.completeness.dedup();
+        coverage.reasons.sort();
+        coverage.reasons.dedup();
+        Ok(CompletedSnapshotDetails {
+            snapshot,
+            names,
+            coverage,
+        })
     }
 
     pub fn verify_snapshot_integrity(&self, snapshot_id: &str) -> Result<SnapshotIntegrityRecord> {
@@ -2568,6 +2738,37 @@ fn is_sha256_hex(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+fn validate_snapshot_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        bail!("snapshot name must not be empty");
+    }
+    if name.len() > 64 {
+        bail!("snapshot name must be at most 64 ASCII characters");
+    }
+    if !name.is_ascii() {
+        bail!("snapshot name must contain only ASCII characters");
+    }
+    if name.eq_ignore_ascii_case("current") || name.eq_ignore_ascii_case("latest") {
+        bail!("snapshot name {name:?} is reserved");
+    }
+    if name
+        .get(.."snapshot:".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("snapshot:"))
+    {
+        bail!("snapshot name must not use the stable ID prefix \"snapshot:\"");
+    }
+    let mut bytes = name.bytes();
+    let first = bytes.next().expect("empty snapshot names were rejected");
+    if !first.is_ascii_alphanumeric()
+        || !bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        bail!(
+            "snapshot name must start with an ASCII letter or digit and contain only letters, digits, '.', '_', or '-'"
+        );
+    }
+    Ok(())
+}
+
 fn ingest_event_in_transaction(tx: &Transaction<'_>, event: &Value) -> Result<()> {
     let scan_id = required_str(event, "scan_id")?;
     let event_type = required_str(event, "event")?;
@@ -3469,6 +3670,123 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_names_are_immutable_and_resolve_canonical_completed_details() -> Result<()> {
+        let mut store = Store::open_in_memory()?;
+        ingest_protocol_fixture(
+            &mut store,
+            include_str!("../../depgraph-protocol/tests/fixtures/protocol-v1.golden.ndjson"),
+        )?;
+        let snapshot_id = store.current_snapshot_id()?.context("current snapshot")?;
+
+        store.create_snapshot_name("zeta", &snapshot_id)?;
+        store.create_snapshot_name("alpha-1", &snapshot_id)?;
+        assert_eq!(
+            store
+                .snapshot_names()?
+                .into_iter()
+                .map(|record| record.name)
+                .collect::<Vec<_>>(),
+            vec!["alpha-1", "zeta"]
+        );
+        assert_eq!(
+            store.resolve_completed_snapshot_selector("ALPHA-1")?,
+            snapshot_id
+        );
+        assert_eq!(
+            store.resolve_completed_snapshot_selector(&snapshot_id)?,
+            snapshot_id
+        );
+        assert_eq!(
+            store.resolve_completed_snapshot_selector("current")?,
+            snapshot_id
+        );
+
+        let details = store.completed_snapshot_details(&snapshot_id)?;
+        assert_eq!(details.snapshot.status, "completed");
+        assert_eq!(
+            details.snapshot.source_revision.as_deref(),
+            Some("fixture-revision")
+        );
+        assert_eq!(details.snapshot.profile_ids, vec!["web:production:server"]);
+        assert_eq!(details.names, vec!["alpha-1", "zeta"]);
+        assert_eq!(details.coverage.profiles, 1);
+        assert_eq!(details.coverage.completeness, vec!["syntax-complete"]);
+
+        for invalid in [
+            "",
+            "current",
+            "LATEST",
+            "snapshot:short",
+            "-leading",
+            "contains space",
+            "日本語",
+        ] {
+            let error = store
+                .create_snapshot_name(invalid, &snapshot_id)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("snapshot name"), "{invalid:?}: {error}");
+        }
+        let too_long = "a".repeat(65);
+        assert!(
+            store
+                .create_snapshot_name(&too_long, &snapshot_id)
+                .unwrap_err()
+                .to_string()
+                .contains("snapshot name")
+        );
+        assert!(
+            store
+                .create_snapshot_name("ALPHA-1", &snapshot_id)
+                .unwrap_err()
+                .to_string()
+                .contains("already exists")
+        );
+        assert!(
+            store
+                .resolve_completed_snapshot_selector("latest")
+                .unwrap_err()
+                .to_string()
+                .contains("reserved")
+        );
+        assert!(
+            store
+                .resolve_completed_snapshot_selector("missing")
+                .unwrap_err()
+                .to_string()
+                .contains("was not found")
+        );
+
+        let update_error = store
+            .connection
+            .execute(
+                "UPDATE snapshot_names SET name='renamed' WHERE name='alpha-1'",
+                [],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(update_error.contains("snapshot names are immutable"));
+        let delete_error = store
+            .connection
+            .execute("DELETE FROM snapshot_names WHERE name='alpha-1'", [])
+            .unwrap_err()
+            .to_string();
+        assert!(delete_error.contains("snapshot names are immutable"));
+
+        store.start_scan("failed-scan", Path::new("/tmp/failed"), false)?;
+        store.finish_scan("failed-scan", "failed", Some("worker failed"), false)?;
+        assert_eq!(store.snapshot_id_for_scan_selection("failed-scan")?, None);
+        assert!(
+            store
+                .create_snapshot_name("failed", "failed-scan")
+                .unwrap_err()
+                .to_string()
+                .contains("completed snapshot")
+        );
+        Ok(())
+    }
+
+    #[test]
     fn completed_snapshot_identity_is_stable_across_attempt_timestamps_and_stores() -> Result<()> {
         let fixture =
             include_str!("../../depgraph-protocol/tests/fixtures/protocol-v1.golden.ndjson");
@@ -3991,7 +4309,7 @@ mod tests {
         drop(connection);
 
         let store = Store::open(&path)?;
-        assert_eq!(store.schema_version()?, 8);
+        assert_eq!(store.schema_version()?, 9);
         let site_not_null: i64 = store.connection.query_row(
             "SELECT [notnull] FROM pragma_table_info('edges') WHERE name='site_id'",
             [],
@@ -4086,6 +4404,7 @@ mod tests {
         let connection = Connection::open(&path)?;
         connection.execute_batch(
             "PRAGMA foreign_keys=OFF;
+             DROP TABLE snapshot_names;
              DROP TABLE current_completed_snapshot;
              DROP TABLE snapshot_sources;
              DROP TABLE completed_snapshots;
@@ -4099,7 +4418,7 @@ mod tests {
         expected.scan.source_revision = None;
 
         let store = Store::open(&path)?;
-        assert_eq!(store.schema_version()?, 8);
+        assert_eq!(store.schema_version()?, 9);
         let current_id = store
             .current_snapshot_id()?
             .context("migrated current snapshot")?;
@@ -4112,6 +4431,41 @@ mod tests {
         assert_eq!(store.load_completed_snapshot(&current_id)?, expected);
         assert_eq!(store.load_snapshot("scan-golden")?, expected);
         assert!(store.verify_snapshot_integrity(&current_id)?.valid);
+        Ok(())
+    }
+
+    #[test]
+    fn migrates_v8_completed_snapshots_without_losing_graphs() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("v8.db");
+        let snapshot_id = {
+            let mut store = Store::open(&path)?;
+            ingest_protocol_fixture(
+                &mut store,
+                include_str!("../../depgraph-protocol/tests/fixtures/protocol-v1.golden.ndjson"),
+            )?;
+            store.current_snapshot_id()?.context("v8 snapshot")?
+        };
+        let connection = Connection::open(&path)?;
+        connection.execute_batch(
+            "DROP TABLE snapshot_names;
+             PRAGMA user_version=8;",
+        )?;
+        drop(connection);
+
+        let mut store = Store::open(&path)?;
+        assert_eq!(store.schema_version()?, 9);
+        assert_eq!(
+            store.current_snapshot_id()?.as_deref(),
+            Some(snapshot_id.as_str())
+        );
+        assert!(store.verify_snapshot_integrity(&snapshot_id)?.valid);
+        assert!(store.snapshot_names()?.is_empty());
+        store.create_snapshot_name("migrated", &snapshot_id)?;
+        assert_eq!(
+            store.resolve_completed_snapshot_selector("migrated")?,
+            snapshot_id
+        );
         Ok(())
     }
 

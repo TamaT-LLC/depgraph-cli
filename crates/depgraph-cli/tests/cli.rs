@@ -105,6 +105,224 @@ fn init_writes_only_the_versioned_config() {
 }
 
 #[test]
+fn snapshot_create_list_and_show_are_canonical_and_scriptable() {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let store_path = cache.path().join("graph.db");
+    seed_safe_rust_scan(&store_path, root.path(), "Cargo.toml");
+
+    let created = Command::cargo_bin("depgraph")
+        .unwrap()
+        .args([
+            "--store",
+            store_path.to_str().unwrap(),
+            "snapshot",
+            "create",
+            "baseline",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(created.status.success(), "{:?}", created.stderr);
+    let created: serde_json::Value = serde_json::from_slice(&created.stdout).unwrap();
+    assert_eq!(created["schema_version"], "1.0");
+    assert_eq!(created["command"], "snapshot.create");
+    assert_eq!(created["data"]["name"], "baseline");
+    assert_eq!(created["data"]["snapshot"]["status"], "completed");
+    let snapshot_id = created["data"]["snapshot"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(snapshot_id.starts_with("snapshot:sha256:"));
+
+    Command::cargo_bin("depgraph")
+        .unwrap()
+        .args([
+            "--store",
+            store_path.to_str().unwrap(),
+            "snapshot",
+            "create",
+            "alpha",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("created snapshot name: alpha"));
+
+    let list = || {
+        Command::cargo_bin("depgraph")
+            .unwrap()
+            .args([
+                "--store",
+                store_path.to_str().unwrap(),
+                "snapshot",
+                "list",
+                "--json",
+            ])
+            .output()
+            .unwrap()
+    };
+    let first_list = list();
+    let second_list = list();
+    assert!(first_list.status.success(), "{:?}", first_list.stderr);
+    assert_eq!(first_list.stdout, second_list.stdout);
+    let listed: serde_json::Value = serde_json::from_slice(&first_list.stdout).unwrap();
+    assert_eq!(listed["command"], "snapshot.list");
+    assert_eq!(listed["data"][0]["name"], "alpha");
+    assert_eq!(listed["data"][1]["name"], "baseline");
+    assert_eq!(listed["data"][0]["id"], snapshot_id);
+    assert_eq!(listed["data"][0]["status"], "completed");
+    assert_eq!(
+        listed["data"][0]["source_revision"],
+        serde_json::Value::Null
+    );
+    assert_eq!(listed["data"][0]["profile_ids"], json!(["rust:safe"]));
+    assert_eq!(
+        listed["data"][0]["coverage"]["completeness"],
+        json!(["syntax-complete"])
+    );
+
+    let show = |selector: &str| {
+        Command::cargo_bin("depgraph")
+            .unwrap()
+            .args([
+                "--store",
+                store_path.to_str().unwrap(),
+                "snapshot",
+                "show",
+                selector,
+                "--json",
+            ])
+            .output()
+            .unwrap()
+    };
+    let by_name = show("BASELINE");
+    let by_id = show(&snapshot_id);
+    assert!(by_name.status.success(), "{:?}", by_name.stderr);
+    assert!(by_id.status.success(), "{:?}", by_id.stderr);
+    let by_name: serde_json::Value = serde_json::from_slice(&by_name.stdout).unwrap();
+    let by_id: serde_json::Value = serde_json::from_slice(&by_id.stdout).unwrap();
+    assert_eq!(by_name["data"], by_id["data"]);
+    assert_eq!(by_name["data"]["names"], json!(["alpha", "baseline"]));
+    assert_eq!(by_name["data"]["scan_id"], "safe-rust-scan");
+
+    Command::cargo_bin("depgraph")
+        .unwrap()
+        .args([
+            "--store",
+            store_path.to_str().unwrap(),
+            "snapshot",
+            "show",
+            "current",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!("snapshot: {snapshot_id}")))
+        .stdout(predicate::str::contains("names: alpha,baseline"))
+        .stdout(predicate::str::contains("status: completed"))
+        .stdout(predicate::str::contains("revision: unknown"))
+        .stdout(predicate::str::contains("profiles: rust:safe"))
+        .stdout(predicate::str::contains("coverage:"));
+}
+
+#[test]
+fn snapshot_commands_reject_duplicates_reserved_names_missing_snapshots_and_failed_attempts() {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let store_path = cache.path().join("graph.db");
+    seed_safe_rust_scan(&store_path, root.path(), "Cargo.toml");
+
+    Command::cargo_bin("depgraph")
+        .unwrap()
+        .args([
+            "--store",
+            store_path.to_str().unwrap(),
+            "snapshot",
+            "create",
+            "baseline",
+        ])
+        .assert()
+        .success();
+    Command::cargo_bin("depgraph")
+        .unwrap()
+        .args([
+            "--store",
+            store_path.to_str().unwrap(),
+            "snapshot",
+            "create",
+            "BASELINE",
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("already exists"));
+    for invalid in ["current", "latest", "snapshot:short", "contains space"] {
+        Command::cargo_bin("depgraph")
+            .unwrap()
+            .args([
+                "--store",
+                store_path.to_str().unwrap(),
+                "snapshot",
+                "create",
+                invalid,
+            ])
+            .assert()
+            .code(2)
+            .stderr(predicate::str::contains("snapshot name"));
+    }
+    Command::cargo_bin("depgraph")
+        .unwrap()
+        .args([
+            "--store",
+            store_path.to_str().unwrap(),
+            "snapshot",
+            "show",
+            "missing",
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("was not found"));
+
+    {
+        let mut store = depgraph_store::Store::open(&store_path).unwrap();
+        store
+            .start_scan("failed-attempt", root.path(), false)
+            .unwrap();
+        store
+            .finish_scan("failed-attempt", "failed", Some("worker failed"), false)
+            .unwrap();
+    }
+    Command::cargo_bin("depgraph")
+        .unwrap()
+        .args([
+            "--store",
+            store_path.to_str().unwrap(),
+            "--scan-id",
+            "failed-attempt",
+            "snapshot",
+            "create",
+            "failed-name",
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("has no completed snapshot"));
+
+    let empty_store = cache.path().join("empty.db");
+    Command::cargo_bin("depgraph")
+        .unwrap()
+        .args([
+            "--store",
+            empty_store.to_str().unwrap(),
+            "snapshot",
+            "create",
+            "first",
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains(
+            "no current completed snapshot is available",
+        ));
+}
+
+#[test]
 fn empty_safe_scan_uses_external_store_and_reports_json() {
     let root = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();
