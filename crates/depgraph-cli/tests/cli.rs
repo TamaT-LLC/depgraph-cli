@@ -1564,7 +1564,7 @@ fn project_local_worker_override_is_rejected_before_execution() {
 
 #[cfg(unix)]
 #[test]
-fn safe_scan_does_not_resolve_node_or_node_options_from_the_repository() {
+fn safe_scan_does_not_resolve_node_git_or_node_options_from_the_repository() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("project");
     fs::create_dir(&root).unwrap();
@@ -1574,6 +1574,7 @@ fn safe_scan_does_not_resolve_node_or_node_options_from_the_repository() {
     )
     .unwrap();
     write_worker(&root.join("node"), "printf unsafe > NODE_EXECUTED\nexit 91");
+    write_worker(&root.join("git"), "printf unsafe > GIT_EXECUTED\nexit 91");
     fs::write(
         root.join("project-hook.cjs"),
         "require('node:fs').writeFileSync('NODE_OPTIONS_EXECUTED', 'unsafe')\n",
@@ -1619,6 +1620,7 @@ for (const event of events) console.log(JSON.stringify(event));
         .success()
         .stdout(predicate::str::contains("\"status\": \"completed\""));
     assert!(!root.join("NODE_EXECUTED").exists());
+    assert!(!root.join("GIT_EXECUTED").exists());
     assert!(!root.join("NODE_OPTIONS_EXECUTED").exists());
 }
 

@@ -198,6 +198,8 @@ mod tests {
                 completed_at: Some("now".to_owned()),
                 project_code_executed: false,
                 error: None,
+                parent_snapshot_id: None,
+                source_revision: None,
             },
             profiles: Vec::new(),
             nodes: Vec::new(),

@@ -6,7 +6,8 @@ use std::{
 use anyhow::{Context, Result, bail};
 use chrono::{SecondsFormat, Utc};
 use depgraph_protocol::{
-    Coverage, Diagnostic, Evidence, ProtocolEvent, ValidatedProtocol, validate_build_contract,
+    Coverage, Diagnostic, Evidence, ProtocolEvent, ValidatedProtocol, stable_id_from_value,
+    validate_build_contract,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
@@ -22,7 +23,7 @@ pub use profile_matrix::{
     declared_effective_input_id, declared_parent_profile_id, phase_coverage_for_effective_profile,
 };
 
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ScanRecord {
@@ -34,6 +35,42 @@ pub struct ScanRecord {
     pub completed_at: Option<String>,
     pub project_code_executed: bool,
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_snapshot_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_revision: Option<String>,
+}
+
+pub type ScanAttemptRecord = ScanRecord;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CompletedSnapshotRecord {
+    pub id: String,
+    pub source_kind: String,
+    pub source_attempt_id: String,
+    pub scan_id: String,
+    pub build_attempt_id: Option<String>,
+    pub parent_snapshot_id: Option<String>,
+    pub source_revision: Option<String>,
+    pub profile_ids: Vec<String>,
+    pub status: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SnapshotIntegrityRecord {
+    pub snapshot_id: String,
+    pub valid: bool,
+    pub expected_id: String,
+    pub observed_id: String,
+    pub reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct GarbageCollectionReport {
+    pub scan_attempts_deleted: u64,
+    pub build_attempts_deleted: u64,
+    pub build_audits_deleted: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -54,6 +91,8 @@ pub struct ProfileRecord {
     pub target: Option<String>,
     pub features: Vec<String>,
     pub environment: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_revision: Option<String>,
     pub properties: Value,
     pub coverage: Option<CoverageRecord>,
 }
@@ -169,6 +208,7 @@ pub struct BuildAuditRecord {
 pub struct BuildAttemptRecord {
     pub id: String,
     pub base_scan_id: String,
+    pub base_snapshot_id: Option<String>,
     pub audit_run_id: String,
     pub status: String,
     pub observer: String,
@@ -501,6 +541,49 @@ impl Store {
             )?;
             tx.commit()?;
         }
+        if current < 8 {
+            let tx = self.connection.transaction()?;
+            tx.execute_batch(
+                "ALTER TABLE scans ADD COLUMN parent_snapshot_id TEXT;
+                 ALTER TABLE scans ADD COLUMN source_revision TEXT;
+                 ALTER TABLE scans ADD COLUMN mutation_count INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE build_attempts ADD COLUMN base_snapshot_id TEXT;
+                 CREATE TABLE completed_snapshots (
+                    id TEXT PRIMARY KEY,
+                    source_kind TEXT NOT NULL CHECK (source_kind IN ('scan', 'build')),
+                    source_attempt_id TEXT NOT NULL,
+                    scan_id TEXT NOT NULL REFERENCES scans(id),
+                    build_attempt_id TEXT REFERENCES build_attempts(id),
+                    parent_snapshot_id TEXT REFERENCES completed_snapshots(id),
+                    source_revision TEXT,
+                    profile_set_json TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK (status = 'completed'),
+                    created_at TEXT NOT NULL,
+                    CHECK ((source_kind = 'scan' AND build_attempt_id IS NULL)
+                        OR (source_kind = 'build' AND build_attempt_id IS NOT NULL))
+                 );
+                 CREATE INDEX completed_snapshots_scan_created
+                    ON completed_snapshots(scan_id, created_at, id);
+                 CREATE INDEX completed_snapshots_parent
+                    ON completed_snapshots(parent_snapshot_id, id);
+                 CREATE TABLE snapshot_sources (
+                    source_kind TEXT NOT NULL CHECK (source_kind IN ('scan', 'build')),
+                    source_attempt_id TEXT NOT NULL,
+                    snapshot_id TEXT NOT NULL REFERENCES completed_snapshots(id) ON DELETE CASCADE,
+                    promoted_at TEXT NOT NULL,
+                    PRIMARY KEY (source_kind, source_attempt_id)
+                 );
+                 CREATE INDEX snapshot_sources_snapshot
+                    ON snapshot_sources(snapshot_id, source_kind, source_attempt_id);
+                 CREATE TABLE current_completed_snapshot (
+                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                    snapshot_id TEXT NOT NULL REFERENCES completed_snapshots(id)
+                 );",
+            )?;
+            backfill_completed_snapshots(&tx)?;
+            tx.execute_batch("PRAGMA user_version = 8;")?;
+            tx.commit()?;
+        }
         Ok(())
     }
 
@@ -649,16 +732,20 @@ impl Store {
         if base_status != "completed" {
             bail!("build evidence requires a completed base scan");
         }
+        let base_snapshot_id = self
+            .snapshot_id_for_source("scan", base_scan_id)?
+            .with_context(|| format!("base scan {base_scan_id} has no completed snapshot"))?;
         let tx = self.connection.transaction()?;
         tx.execute(
             "INSERT INTO build_attempts(
-                id, base_scan_id, audit_run_id, status, observer, observer_version,
+                id, base_scan_id, base_snapshot_id, audit_run_id, status, observer, observer_version,
                 profile_id, command_plan_digest, toolchain_executable_digest,
                 environment_key_set_digest, validated_output_digest, started_at
-             ) VALUES (?1, ?2, ?3, 'staging', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+             ) VALUES (?1, ?2, ?3, ?4, 'staging', ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 run_id,
                 base_scan_id,
+                base_snapshot_id,
                 run_id,
                 required_str(audit, "adapter")?,
                 required_str(audit, "adapter_version")?,
@@ -699,7 +786,14 @@ impl Store {
             bail!("only a completed supervisor attempt can stage build evidence");
         }
         validate_delta_attempt_metadata(&delta, &attempt)?;
-        let base = self.load_base_snapshot(&attempt.base_scan_id)?;
+        let base_snapshot_id = attempt
+            .base_snapshot_id
+            .as_deref()
+            .context("build attempt has no completed base snapshot")?;
+        if !self.verify_snapshot_integrity(base_snapshot_id)?.valid {
+            bail!("build attempt base snapshot {base_snapshot_id} failed integrity validation");
+        }
+        let base = self.load_completed_snapshot(base_snapshot_id)?;
         validate_build_union(&base, &delta, &attempt)?;
         let encoded = serde_json::to_string(&delta)?;
         let tx = self.connection.transaction()?;
@@ -730,12 +824,17 @@ impl Store {
         }
         let tx = self.connection.transaction()?;
         ensure_build_staging(&tx, attempt_id)?;
-        let (base_scan_id, has_delta, audit_outcome): (String, bool, String) = tx.query_row(
-            "SELECT a.base_scan_id, a.delta_json IS NOT NULL, b.outcome
+        let (base_scan_id, base_snapshot_id, has_delta, audit_outcome): (
+            String,
+            Option<String>,
+            bool,
+            String,
+        ) = tx.query_row(
+            "SELECT a.base_scan_id, a.base_snapshot_id, a.delta_json IS NOT NULL, b.outcome
                FROM build_attempts a JOIN build_audits b ON b.run_id=a.audit_run_id
               WHERE a.id=?1",
             [attempt_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )?;
         if status == "completed" && !has_delta {
             bail!("completed build attempt {attempt_id} has no validated delta");
@@ -748,24 +847,51 @@ impl Store {
                 "build attempt status {status} does not match supervisor outcome {audit_outcome}"
             );
         }
+        let completed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
         tx.execute(
             "UPDATE build_attempts
                 SET status=?2, completed_at=?3, error=?4,
                     delta_json=CASE WHEN ?2='completed' THEN delta_json ELSE NULL END
               WHERE id=?1",
-            params![
-                attempt_id,
-                status,
-                Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
-                error,
-            ],
+            params![attempt_id, status, completed_at, error],
         )?;
+        let completed_snapshot_id = if status == "completed" {
+            let parent_snapshot_id = base_snapshot_id.with_context(|| {
+                format!("build attempt {attempt_id} has no base completed snapshot")
+            })?;
+            let source_revision = tx
+                .query_row(
+                    "SELECT source_revision FROM completed_snapshots WHERE id=?1",
+                    [&parent_snapshot_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()?
+                .flatten();
+            Some(create_completed_snapshot(
+                &tx,
+                SnapshotSource {
+                    source_kind: "build",
+                    source_attempt_id: attempt_id,
+                    scan_id: &base_scan_id,
+                    build_attempt_id: Some(attempt_id),
+                    parent_snapshot_id: Some(&parent_snapshot_id),
+                    source_revision: source_revision.as_deref(),
+                    created_at: &completed_at,
+                },
+            )?)
+        } else {
+            None
+        };
         if promote {
+            let snapshot_id = completed_snapshot_id
+                .as_deref()
+                .context("completed build attempt did not create a snapshot")?;
             tx.execute(
                 "INSERT INTO current_build_successful(base_scan_id, attempt_id) VALUES (?1, ?2)
                  ON CONFLICT(base_scan_id) DO UPDATE SET attempt_id=excluded.attempt_id",
                 params![base_scan_id, attempt_id],
             )?;
+            promote_completed_snapshot(&tx, snapshot_id)?;
         }
         tx.commit()?;
         Ok(())
@@ -774,7 +900,7 @@ impl Store {
     pub fn build_attempt(&self, attempt_id: &str) -> Result<Option<BuildAttemptRecord>> {
         self.connection
             .query_row(
-                "SELECT id, base_scan_id, audit_run_id, status, observer, observer_version,
+                "SELECT id, base_scan_id, base_snapshot_id, audit_run_id, status, observer, observer_version,
                         profile_id, command_plan_digest, toolchain_executable_digest,
                         environment_key_set_digest, validated_output_digest, started_at,
                         completed_at, error
@@ -784,18 +910,19 @@ impl Store {
                     Ok(BuildAttemptRecord {
                         id: row.get(0)?,
                         base_scan_id: row.get(1)?,
-                        audit_run_id: row.get(2)?,
-                        status: row.get(3)?,
-                        observer: row.get(4)?,
-                        observer_version: row.get(5)?,
-                        profile_id: row.get(6)?,
-                        command_plan_digest: row.get(7)?,
-                        toolchain_executable_digest: row.get(8)?,
-                        environment_key_set_digest: row.get(9)?,
-                        validated_output_digest: row.get(10)?,
-                        started_at: row.get(11)?,
-                        completed_at: row.get(12)?,
-                        error: row.get(13)?,
+                        base_snapshot_id: row.get(2)?,
+                        audit_run_id: row.get(3)?,
+                        status: row.get(4)?,
+                        observer: row.get(5)?,
+                        observer_version: row.get(6)?,
+                        profile_id: row.get(7)?,
+                        command_plan_digest: row.get(8)?,
+                        toolchain_executable_digest: row.get(9)?,
+                        environment_key_set_digest: row.get(10)?,
+                        validated_output_digest: row.get(11)?,
+                        started_at: row.get(12)?,
+                        completed_at: row.get(13)?,
+                        error: row.get(14)?,
                     })
                 },
             )
@@ -814,16 +941,146 @@ impl Store {
             .context("failed to load current build attempt")
     }
 
+    pub fn current_snapshot_id(&self) -> Result<Option<String>> {
+        self.connection
+            .query_row(
+                "SELECT snapshot_id FROM current_completed_snapshot WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("failed to load current completed snapshot")
+    }
+
+    pub fn snapshot_id_for_source(
+        &self,
+        source_kind: &str,
+        source_attempt_id: &str,
+    ) -> Result<Option<String>> {
+        if !matches!(source_kind, "scan" | "build") {
+            bail!("invalid snapshot source kind {source_kind}");
+        }
+        self.connection
+            .query_row(
+                "SELECT snapshot_id FROM snapshot_sources
+                  WHERE source_kind=?1 AND source_attempt_id=?2",
+                params![source_kind, source_attempt_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("failed to resolve completed snapshot source")
+    }
+
+    pub fn completed_snapshot(&self, snapshot_id: &str) -> Result<Option<CompletedSnapshotRecord>> {
+        load_completed_snapshot_record(&self.connection, snapshot_id)
+    }
+
+    pub fn verify_snapshot_integrity(&self, snapshot_id: &str) -> Result<SnapshotIntegrityRecord> {
+        let record = self
+            .completed_snapshot(snapshot_id)?
+            .with_context(|| format!("completed snapshot {snapshot_id} was not found"))?;
+        let (observed_id, observed_profiles) = completed_snapshot_identity(
+            &self.connection,
+            &record.scan_id,
+            record.build_attempt_id.as_deref(),
+            record.parent_snapshot_id.as_deref(),
+            record.source_revision.as_deref(),
+        )?;
+        let mut reasons = Vec::new();
+        if observed_id != record.id {
+            reasons.push("content_digest_mismatch".to_owned());
+        }
+        if observed_profiles != record.profile_ids {
+            reasons.push("profile_set_mismatch".to_owned());
+        }
+        if record.status != "completed" {
+            reasons.push("snapshot_not_completed".to_owned());
+        }
+        Ok(SnapshotIntegrityRecord {
+            snapshot_id: record.id.clone(),
+            valid: reasons.is_empty(),
+            expected_id: record.id,
+            observed_id,
+            reasons,
+        })
+    }
+
+    /// Explicitly removes terminal attempts that never produced a completed
+    /// snapshot. Completed snapshot payloads, their source attempts, staging
+    /// attempts, and the current pointer are always retained.
+    pub fn garbage_collect_unreferenced_attempts(&mut self) -> Result<GarbageCollectionReport> {
+        let tx = self.connection.transaction()?;
+        let build_attempts_deleted = tx.execute(
+            "DELETE FROM build_attempts
+              WHERE status!='staging'
+                AND NOT EXISTS (
+                    SELECT 1 FROM snapshot_sources ss
+                     WHERE ss.source_kind='build' AND ss.source_attempt_id=build_attempts.id
+                )
+                AND NOT EXISTS (
+                    SELECT 1 FROM current_build_successful cb
+                     WHERE cb.attempt_id=build_attempts.id
+                )",
+            [],
+        )? as u64;
+        let build_audits_deleted = tx.execute(
+            "DELETE FROM build_audits
+              WHERE NOT EXISTS (
+                    SELECT 1 FROM build_attempts ba WHERE ba.audit_run_id=build_audits.run_id
+              )",
+            [],
+        )? as u64;
+        let scan_attempts_deleted = tx.execute(
+            "DELETE FROM scans
+              WHERE status!='staging'
+                AND NOT EXISTS (
+                    SELECT 1 FROM snapshot_sources ss
+                     WHERE ss.source_kind='scan' AND ss.source_attempt_id=scans.id
+                )
+                AND NOT EXISTS (
+                    SELECT 1 FROM build_attempts ba WHERE ba.base_scan_id=scans.id
+                )
+                AND NOT EXISTS (
+                    SELECT 1 FROM current_successful cs WHERE cs.scan_id=scans.id
+                )",
+            [],
+        )? as u64;
+        tx.commit()?;
+        Ok(GarbageCollectionReport {
+            scan_attempts_deleted,
+            build_attempts_deleted,
+            build_audits_deleted,
+        })
+    }
+
     pub fn start_scan(&mut self, scan_id: &str, root: &Path, strict: bool) -> Result<()> {
+        self.start_scan_with_revision(scan_id, root, strict, None)
+    }
+
+    pub fn start_scan_with_revision(
+        &mut self,
+        scan_id: &str,
+        root: &Path,
+        strict: bool,
+        source_revision: Option<&str>,
+    ) -> Result<()> {
+        if source_revision.is_some_and(|revision| revision.trim().is_empty()) {
+            bail!("source revision must not be empty");
+        }
+        let parent_snapshot_id = self.current_snapshot_id()?;
         let tx = self.connection.transaction()?;
         tx.execute(
-            "INSERT INTO scans(id, root, status, strict, started_at, protocol_version)
-             VALUES (?1, ?2, 'staging', ?3, ?4, '1.0')",
+            "INSERT INTO scans(
+                id, root, status, strict, started_at, protocol_version,
+                parent_snapshot_id, source_revision
+             ) VALUES (?1, ?2, 'staging', ?3, ?4, '1.0', ?5, ?6)",
             params![
                 scan_id,
                 root.to_string_lossy(),
                 strict,
-                Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
+                Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+                parent_snapshot_id,
+                source_revision,
             ],
         )?;
         tx.commit()?;
@@ -847,6 +1104,10 @@ impl Store {
             }
             ingest_event_in_transaction(&tx, event)?;
         }
+        tx.execute(
+            "UPDATE scans SET mutation_count=mutation_count+1 WHERE id=?1",
+            [scan_id],
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -864,6 +1125,10 @@ impl Store {
             "INSERT INTO adapter_logs(scan_id, adapter, stderr, truncated) VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(scan_id, adapter) DO UPDATE SET stderr = excluded.stderr, truncated = excluded.truncated",
             params![scan_id, adapter, stderr, truncated],
+        )?;
+        tx.execute(
+            "UPDATE scans SET mutation_count=mutation_count+1 WHERE id=?1",
+            [scan_id],
         )?;
         tx.commit()?;
         Ok(())
@@ -1199,19 +1464,21 @@ impl Store {
     ) -> Result<()> {
         if !matches!(
             status,
-            "completed" | "partial" | "failed" | "policy_failed" | "security_failed"
+            "completed" | "partial" | "failed" | "cancelled" | "policy_failed" | "security_failed"
         ) {
             bail!("invalid terminal scan status {status}");
         }
         if promote && status != "completed" {
             bail!("only completed scans can become the current successful scan");
         }
-        if promote {
-            let current = self
+        let validated_mutation_count = if status == "completed" {
+            let (current, mutation_count) = self
                 .connection
-                .query_row("SELECT status FROM scans WHERE id=?1", [scan_id], |row| {
-                    row.get::<_, String>(0)
-                })
+                .query_row(
+                    "SELECT status, mutation_count FROM scans WHERE id=?1",
+                    [scan_id],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                )
                 .optional()?
                 .with_context(|| format!("scan {scan_id} was not started"))?;
             if current != "staging" {
@@ -1219,9 +1486,22 @@ impl Store {
             }
             self.validate_scan(scan_id)
                 .with_context(|| format!("scan {scan_id} cannot be promoted before validation"))?;
-        }
+            Some(mutation_count)
+        } else {
+            None
+        };
         let tx = self.connection.transaction()?;
         ensure_scan_staging(&tx, scan_id)?;
+        if let Some(validated_mutation_count) = validated_mutation_count {
+            let observed_mutation_count: i64 = tx.query_row(
+                "SELECT mutation_count FROM scans WHERE id=?1",
+                [scan_id],
+                |row| row.get(0),
+            )?;
+            if observed_mutation_count != validated_mutation_count {
+                bail!("scan {scan_id} changed concurrently after validation; retry promotion");
+            }
+        }
         if promote {
             let project_code_executed: bool = tx.query_row(
                 "SELECT project_code_executed FROM scans WHERE id=?1",
@@ -1232,21 +1512,43 @@ impl Store {
                 bail!("a scan that executed project code cannot be promoted in safe mode");
             }
         }
+        let completed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
         tx.execute(
             "UPDATE scans SET status = ?2, completed_at = ?3, error = ?4 WHERE id = ?1",
-            params![
-                scan_id,
-                status,
-                Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
-                error
-            ],
+            params![scan_id, status, completed_at, error],
         )?;
+        let completed_snapshot_id = if status == "completed" {
+            let (parent_snapshot_id, source_revision): (Option<String>, Option<String>) = tx
+                .query_row(
+                    "SELECT parent_snapshot_id, source_revision FROM scans WHERE id=?1",
+                    [scan_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?;
+            Some(create_completed_snapshot(
+                &tx,
+                SnapshotSource {
+                    source_kind: "scan",
+                    source_attempt_id: scan_id,
+                    scan_id,
+                    build_attempt_id: None,
+                    parent_snapshot_id: parent_snapshot_id.as_deref(),
+                    source_revision: source_revision.as_deref(),
+                    created_at: &completed_at,
+                },
+            )?)
+        } else {
+            None
+        };
         if promote {
+            let snapshot_id = completed_snapshot_id
+                .as_deref()
+                .context("completed scan did not create a snapshot")?;
             tx.execute(
                 "INSERT INTO current_successful(singleton, scan_id) VALUES (1, ?1)
                  ON CONFLICT(singleton) DO UPDATE SET scan_id = excluded.scan_id",
                 [scan_id],
             )?;
+            promote_completed_snapshot(&tx, snapshot_id)?;
         }
         tx.commit()?;
         Ok(())
@@ -1278,7 +1580,7 @@ impl Store {
         self.connection
             .query_row(
                 "SELECT id, root, status, strict, started_at, completed_at,
-                        project_code_executed, error
+                        project_code_executed, error, parent_snapshot_id, source_revision
                  FROM scans WHERE id = ?1",
                 [scan_id],
                 |row| {
@@ -1291,6 +1593,8 @@ impl Store {
                         completed_at: row.get(5)?,
                         project_code_executed: row.get(6)?,
                         error: row.get(7)?,
+                        parent_snapshot_id: row.get(8)?,
+                        source_revision: row.get(9)?,
                     })
                 },
             )
@@ -1299,6 +1603,9 @@ impl Store {
     }
 
     pub fn load_snapshot(&self, scan_id: &str) -> Result<GraphSnapshot> {
+        if self.completed_snapshot(scan_id)?.is_some() {
+            return self.load_completed_snapshot(scan_id);
+        }
         let mut snapshot = self.load_base_snapshot(scan_id)?;
         let Some(attempt_id) = self.current_build_attempt_id(scan_id)? else {
             return Ok(snapshot);
@@ -1321,50 +1628,33 @@ impl Store {
         Ok(snapshot)
     }
 
-    fn load_base_snapshot(&self, scan_id: &str) -> Result<GraphSnapshot> {
-        let scan = self
-            .scan(scan_id)?
-            .with_context(|| format!("scan {scan_id} was not found"))?;
-        let profiles = load_profiles(&self.connection, scan_id)?;
-        let nodes = load_nodes(&self.connection, scan_id)?;
-        let sites = load_sites(&self.connection, scan_id)?;
-        let edges = load_edges(&self.connection, scan_id)?;
-        let evidence = load_evidence(&self.connection, scan_id)?;
-        let diagnostics = load_diagnostics(&self.connection, scan_id)?;
-        let file_coverage = load_file_coverage(&self.connection, scan_id)?;
-        let adapter_logs = load_adapter_logs(&self.connection, scan_id)?;
-        let stored_coverage = self
-            .connection
-            .query_row(
-                "SELECT json FROM coverage WHERE scan_id = ?1",
-                [scan_id],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?
-            .map(|raw| serde_json::from_str(&raw))
-            .transpose()?;
-        let coverage = observed_coverage(
-            &self.connection,
-            scan_id,
-            &sites,
-            scan.project_code_executed,
-            stored_coverage,
-        )?;
-        let mut snapshot = GraphSnapshot {
-            scan,
-            profiles,
-            nodes,
-            sites,
-            edges,
-            evidence,
-            diagnostics,
-            file_coverage,
-            adapter_logs,
-            coverage,
-            profile_matrix: ProfileMatrixRecord::default(),
-        };
-        refresh_profile_matrix(&mut snapshot, false);
+    pub fn load_completed_snapshot(&self, snapshot_id: &str) -> Result<GraphSnapshot> {
+        let record = self
+            .completed_snapshot(snapshot_id)?
+            .with_context(|| format!("completed snapshot {snapshot_id} was not found"))?;
+        let mut snapshot = self.load_base_snapshot(&record.scan_id)?;
+        if let Some(attempt_id) = &record.build_attempt_id {
+            let raw = self
+                .connection
+                .query_row(
+                    "SELECT delta_json FROM build_attempts
+                      WHERE id=?1 AND base_scan_id=?2 AND status='completed'",
+                    params![attempt_id, record.scan_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()?
+                .flatten()
+                .with_context(|| {
+                    format!("snapshot {snapshot_id} build attempt {attempt_id} has no delta")
+                })?;
+            let delta: BuildGraphDelta = serde_json::from_str(&raw)?;
+            merge_build_delta(&mut snapshot, delta, attempt_id)?;
+        }
         Ok(snapshot)
+    }
+
+    fn load_base_snapshot(&self, scan_id: &str) -> Result<GraphSnapshot> {
+        load_base_snapshot_from_connection(&self.connection, scan_id)
     }
 
     pub fn resolve_scan_id(&self, requested: Option<&str>, latest_attempt: bool) -> Result<String> {
@@ -1405,9 +1695,380 @@ impl Store {
              ON CONFLICT(scan_id) DO UPDATE SET json=excluded.json",
             params![scan_id, serde_json::to_string(&coverage)?],
         )?;
+        tx.execute(
+            "UPDATE scans SET mutation_count=mutation_count+1 WHERE id=?1",
+            [scan_id],
+        )?;
         tx.commit()?;
         Ok(())
     }
+}
+
+#[derive(Clone, Copy)]
+struct SnapshotSource<'a> {
+    source_kind: &'a str,
+    source_attempt_id: &'a str,
+    scan_id: &'a str,
+    build_attempt_id: Option<&'a str>,
+    parent_snapshot_id: Option<&'a str>,
+    source_revision: Option<&'a str>,
+    created_at: &'a str,
+}
+
+fn load_completed_snapshot_record(
+    connection: &Connection,
+    snapshot_id: &str,
+) -> Result<Option<CompletedSnapshotRecord>> {
+    connection
+        .query_row(
+            "SELECT id, source_kind, source_attempt_id, scan_id, build_attempt_id,
+                    parent_snapshot_id, source_revision, profile_set_json, status, created_at
+               FROM completed_snapshots WHERE id=?1",
+            [snapshot_id],
+            |row| {
+                let raw_profiles = row.get::<_, String>(7)?;
+                let profile_ids = serde_json::from_str(&raw_profiles).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        raw_profiles.len(),
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?;
+                Ok(CompletedSnapshotRecord {
+                    id: row.get(0)?,
+                    source_kind: row.get(1)?,
+                    source_attempt_id: row.get(2)?,
+                    scan_id: row.get(3)?,
+                    build_attempt_id: row.get(4)?,
+                    parent_snapshot_id: row.get(5)?,
+                    source_revision: row.get(6)?,
+                    profile_ids,
+                    status: row.get(8)?,
+                    created_at: row.get(9)?,
+                })
+            },
+        )
+        .optional()
+        .context("failed to load completed snapshot metadata")
+}
+
+fn load_base_snapshot_from_connection(
+    connection: &Connection,
+    scan_id: &str,
+) -> Result<GraphSnapshot> {
+    let scan = connection
+        .query_row(
+            "SELECT id, root, status, strict, started_at, completed_at,
+                    project_code_executed, error, parent_snapshot_id, source_revision
+               FROM scans WHERE id=?1",
+            [scan_id],
+            |row| {
+                Ok(ScanRecord {
+                    id: row.get(0)?,
+                    root: row.get(1)?,
+                    status: row.get(2)?,
+                    strict: row.get(3)?,
+                    started_at: row.get(4)?,
+                    completed_at: row.get(5)?,
+                    project_code_executed: row.get(6)?,
+                    error: row.get(7)?,
+                    parent_snapshot_id: row.get(8)?,
+                    source_revision: row.get(9)?,
+                })
+            },
+        )
+        .optional()?
+        .with_context(|| format!("scan {scan_id} was not found"))?;
+    let profiles = load_profiles(connection, scan_id)?;
+    let nodes = load_nodes(connection, scan_id)?;
+    let sites = load_sites(connection, scan_id)?;
+    let edges = load_edges(connection, scan_id)?;
+    let evidence = load_evidence(connection, scan_id)?;
+    let diagnostics = load_diagnostics(connection, scan_id)?;
+    let file_coverage = load_file_coverage(connection, scan_id)?;
+    let adapter_logs = load_adapter_logs(connection, scan_id)?;
+    let stored_coverage = connection
+        .query_row(
+            "SELECT json FROM coverage WHERE scan_id=?1",
+            [scan_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .map(|raw| serde_json::from_str(&raw))
+        .transpose()?;
+    let coverage = observed_coverage(
+        connection,
+        scan_id,
+        &sites,
+        scan.project_code_executed,
+        stored_coverage,
+    )?;
+    let mut snapshot = GraphSnapshot {
+        scan,
+        profiles,
+        nodes,
+        sites,
+        edges,
+        evidence,
+        diagnostics,
+        file_coverage,
+        adapter_logs,
+        coverage,
+        profile_matrix: ProfileMatrixRecord::default(),
+    };
+    refresh_profile_matrix(&mut snapshot, false);
+    Ok(snapshot)
+}
+
+fn completed_snapshot_identity(
+    connection: &Connection,
+    scan_id: &str,
+    build_attempt_id: Option<&str>,
+    parent_snapshot_id: Option<&str>,
+    source_revision: Option<&str>,
+) -> Result<(String, Vec<String>)> {
+    let mut snapshot = load_base_snapshot_from_connection(connection, scan_id)?;
+    if let Some(attempt_id) = build_attempt_id {
+        let raw = connection
+            .query_row(
+                "SELECT delta_json FROM build_attempts
+                  WHERE id=?1 AND base_scan_id=?2 AND status='completed'",
+                params![attempt_id, scan_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten()
+            .with_context(|| format!("completed build attempt {attempt_id} has no graph delta"))?;
+        merge_build_delta(&mut snapshot, serde_json::from_str(&raw)?, attempt_id)?;
+    }
+    let mut profile_ids = snapshot
+        .profiles
+        .iter()
+        .map(|profile| profile.id.clone())
+        .collect::<Vec<_>>();
+    profile_ids.sort();
+    profile_ids.dedup();
+    let identity = json!({
+        "schema": "completed-snapshot-v1",
+        "parent_snapshot_id": parent_snapshot_id,
+        "source_revision": source_revision,
+        "profile_ids": profile_ids,
+        "graph": {
+            "profiles": snapshot.profiles,
+            "nodes": snapshot.nodes,
+            "sites": snapshot.sites,
+            "edges": snapshot.edges,
+            "evidence": snapshot.evidence,
+            "diagnostics": snapshot.diagnostics,
+            "file_coverage": snapshot.file_coverage,
+            "coverage": snapshot.coverage,
+        },
+    });
+    Ok((stable_id_from_value("snapshot", &identity), profile_ids))
+}
+
+fn create_completed_snapshot(
+    connection: &Connection,
+    source: SnapshotSource<'_>,
+) -> Result<String> {
+    let (snapshot_id, profile_ids) = completed_snapshot_identity(
+        connection,
+        source.scan_id,
+        source.build_attempt_id,
+        source.parent_snapshot_id,
+        source.source_revision,
+    )?;
+    let profile_set_json = serde_json::to_string(&profile_ids)?;
+    connection.execute(
+        "INSERT INTO completed_snapshots(
+            id, source_kind, source_attempt_id, scan_id, build_attempt_id,
+            parent_snapshot_id, source_revision, profile_set_json, status, created_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'completed', ?9)
+         ON CONFLICT(id) DO NOTHING",
+        params![
+            snapshot_id,
+            source.source_kind,
+            source.source_attempt_id,
+            source.scan_id,
+            source.build_attempt_id,
+            source.parent_snapshot_id,
+            source.source_revision,
+            profile_set_json,
+            source.created_at,
+        ],
+    )?;
+    let stored = load_completed_snapshot_record(connection, &snapshot_id)?
+        .context("completed snapshot insert was not visible")?;
+    if stored.parent_snapshot_id.as_deref() != source.parent_snapshot_id
+        || stored.source_revision.as_deref() != source.source_revision
+        || stored.profile_ids != profile_ids
+        || stored.status != "completed"
+    {
+        bail!("completed snapshot identity collision for {snapshot_id}");
+    }
+    connection.execute(
+        "INSERT INTO snapshot_sources(source_kind, source_attempt_id, snapshot_id, promoted_at)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![
+            source.source_kind,
+            source.source_attempt_id,
+            snapshot_id,
+            source.created_at
+        ],
+    )?;
+    Ok(snapshot_id)
+}
+
+fn promote_completed_snapshot(connection: &Connection, snapshot_id: &str) -> Result<()> {
+    let status = connection
+        .query_row(
+            "SELECT status FROM completed_snapshots WHERE id=?1",
+            [snapshot_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .with_context(|| format!("completed snapshot {snapshot_id} was not found"))?;
+    if status != "completed" {
+        bail!("snapshot {snapshot_id} cannot be promoted from status {status}");
+    }
+    connection.execute(
+        "INSERT INTO current_completed_snapshot(singleton, snapshot_id) VALUES (1, ?1)
+         ON CONFLICT(singleton) DO UPDATE SET snapshot_id=excluded.snapshot_id",
+        [snapshot_id],
+    )?;
+    Ok(())
+}
+
+fn backfill_completed_snapshots(connection: &Connection) -> Result<()> {
+    // Early development fixtures used a deliberately reduced v1 `scans`
+    // table. Real v1 stores have these columns, but an empty reduced store can
+    // still be upgraded safely because it has no graph attempts to backfill.
+    if !table_has_column(connection, "scans", "status")?
+        || !table_has_column(connection, "scans", "started_at")?
+        || !table_has_column(connection, "scans", "completed_at")?
+    {
+        return Ok(());
+    }
+    let scans = {
+        let mut statement = connection.prepare(
+            "SELECT id, COALESCE(completed_at, started_at), parent_snapshot_id, source_revision
+               FROM scans WHERE status='completed' ORDER BY started_at, rowid",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    for (scan_id, created_at, parent_snapshot_id, source_revision) in scans {
+        create_completed_snapshot(
+            connection,
+            SnapshotSource {
+                source_kind: "scan",
+                source_attempt_id: &scan_id,
+                scan_id: &scan_id,
+                build_attempt_id: None,
+                parent_snapshot_id: parent_snapshot_id.as_deref(),
+                source_revision: source_revision.as_deref(),
+                created_at: &created_at,
+            },
+        )?;
+    }
+
+    let build_attempts = {
+        let mut statement = connection.prepare(
+            "SELECT id, base_scan_id, COALESCE(completed_at, started_at)
+               FROM build_attempts
+              WHERE status='completed' AND delta_json IS NOT NULL
+              ORDER BY started_at, rowid",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    for (attempt_id, scan_id, created_at) in build_attempts {
+        let base_snapshot_id = connection
+            .query_row(
+                "SELECT snapshot_id FROM snapshot_sources
+                  WHERE source_kind='scan' AND source_attempt_id=?1",
+                [&scan_id],
+                |row| row.get::<_, String>(0),
+            )
+            .with_context(|| format!("completed base scan {scan_id} has no migrated snapshot"))?;
+        connection.execute(
+            "UPDATE build_attempts SET base_snapshot_id=?2 WHERE id=?1",
+            params![attempt_id, base_snapshot_id],
+        )?;
+        let source_revision = connection.query_row(
+            "SELECT source_revision FROM completed_snapshots WHERE id=?1",
+            [&base_snapshot_id],
+            |row| row.get::<_, Option<String>>(0),
+        )?;
+        create_completed_snapshot(
+            connection,
+            SnapshotSource {
+                source_kind: "build",
+                source_attempt_id: &attempt_id,
+                scan_id: &scan_id,
+                build_attempt_id: Some(&attempt_id),
+                parent_snapshot_id: Some(&base_snapshot_id),
+                source_revision: source_revision.as_deref(),
+                created_at: &created_at,
+            },
+        )?;
+    }
+
+    let current_scan_id = connection
+        .query_row(
+            "SELECT scan_id FROM current_successful WHERE singleton=1",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if let Some(scan_id) = current_scan_id {
+        let current_build_id = connection
+            .query_row(
+                "SELECT attempt_id FROM current_build_successful WHERE base_scan_id=?1",
+                [&scan_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let (source_kind, source_attempt_id) = current_build_id
+            .as_deref()
+            .map_or(("scan", scan_id.as_str()), |attempt_id| {
+                ("build", attempt_id)
+            });
+        let snapshot_id = connection.query_row(
+            "SELECT snapshot_id FROM snapshot_sources
+              WHERE source_kind=?1 AND source_attempt_id=?2",
+            params![source_kind, source_attempt_id],
+            |row| row.get::<_, String>(0),
+        )?;
+        promote_completed_snapshot(connection, &snapshot_id)?;
+    }
+    Ok(())
+}
+
+fn table_has_column(connection: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+    for candidate in columns {
+        if candidate? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn build_delta_from_protocol(protocol: &ValidatedProtocol) -> Result<BuildGraphDelta> {
@@ -1442,6 +2103,7 @@ fn build_delta_from_protocol(protocol: &ValidatedProtocol) -> Result<BuildGraphD
             target: profile.target.clone(),
             features: profile.features.clone(),
             environment: serde_json::to_value(&profile.environment).unwrap_or_else(|_| json!({})),
+            source_revision: profile.source_revision.clone(),
             properties: serde_json::to_value(&profile.properties).unwrap_or_else(|_| json!({})),
             coverage: profile_coverage.get(&profile.id).cloned(),
         })
@@ -1687,7 +2349,8 @@ fn validate_build_union(
                 || existing.command != profile.command
                 || existing.target != profile.target
                 || existing.features != profile.features
-                || existing.environment != profile.environment)
+                || existing.environment != profile.environment
+                || existing.source_revision != profile.source_revision)
         {
             bail!("build profile {} conflicts with the base graph", profile.id);
         }
@@ -2283,6 +2946,10 @@ fn load_profiles(connection: &Connection, scan_id: &str) -> Result<Vec<ProfileRe
                 .get("environment")
                 .cloned()
                 .unwrap_or_else(|| json!({})),
+            source_revision: value
+                .get("source_revision")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned),
             properties: value
                 .get("properties")
                 .cloned()
@@ -2707,6 +3374,121 @@ mod tests {
         store.finish_scan("scan-1", "failed", Some("worker crashed"), false)?;
         assert_eq!(store.latest_attempt_id()?.as_deref(), Some("scan-1"));
         assert_eq!(store.latest_successful_id()?, None);
+        assert_eq!(store.current_snapshot_id()?, None);
+        assert_eq!(store.snapshot_id_for_source("scan", "scan-1")?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn failed_scan_retains_the_previous_completed_snapshot() -> Result<()> {
+        let mut store = Store::open_in_memory()?;
+        ingest_protocol_fixture(
+            &mut store,
+            include_str!("../../depgraph-protocol/tests/fixtures/protocol-v1.golden.ndjson"),
+        )?;
+        let completed_id = store.current_snapshot_id()?.context("current snapshot")?;
+        let completed = store.load_completed_snapshot(&completed_id)?;
+
+        store.start_scan("failed-scan", Path::new("/fixture"), false)?;
+        let mut diagnostic = common("diagnostic", 1);
+        diagnostic["scan_id"] = json!("failed-scan");
+        diagnostic["diagnostic"] = json!({
+            "id":"diagnostic:failed-scan","severity":"error",
+            "code":"fixture-failure","message":"worker crashed"
+        });
+        store.ingest_event(&diagnostic)?;
+        store.finish_scan("failed-scan", "failed", Some("worker crashed"), false)?;
+
+        assert_eq!(
+            store.current_snapshot_id()?.as_deref(),
+            Some(completed_id.as_str())
+        );
+        assert_eq!(store.load_completed_snapshot(&completed_id)?, completed);
+        assert_eq!(store.snapshot_id_for_source("scan", "failed-scan")?, None);
+        assert_eq!(store.latest_attempt_id()?.as_deref(), Some("failed-scan"));
+        assert_eq!(
+            store.latest_successful_id()?.as_deref(),
+            Some("scan-golden")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn interrupted_promotion_rolls_back_attempt_and_snapshot_publication() -> Result<()> {
+        let mut store = Store::open_in_memory()?;
+        stage_protocol_fixture(
+            &mut store,
+            include_str!("../../depgraph-protocol/tests/fixtures/protocol-v1.golden.ndjson"),
+            Some("revision-rollback"),
+        )?;
+        store.connection.execute_batch(
+            "CREATE TRIGGER reject_snapshot_source
+             BEFORE INSERT ON snapshot_sources
+             BEGIN SELECT RAISE(ABORT, 'simulated interruption'); END;",
+        )?;
+
+        let error = store
+            .finish_scan("scan-golden", "completed", None, true)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("simulated interruption"));
+        assert_eq!(store.scan("scan-golden")?.unwrap().status, "staging");
+        assert_eq!(store.current_snapshot_id()?, None);
+        let count: i64 =
+            store
+                .connection
+                .query_row("SELECT COUNT(*) FROM completed_snapshots", [], |row| {
+                    row.get(0)
+                })?;
+        assert_eq!(count, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_integrity_detects_persisted_graph_tampering() -> Result<()> {
+        let mut store = Store::open_in_memory()?;
+        ingest_protocol_fixture(
+            &mut store,
+            include_str!("../../depgraph-protocol/tests/fixtures/protocol-v1.golden.ndjson"),
+        )?;
+        let snapshot_id = store.current_snapshot_id()?.context("current snapshot")?;
+        assert!(store.verify_snapshot_integrity(&snapshot_id)?.valid);
+
+        store.connection.execute(
+            r#"UPDATE nodes SET properties_json='{"tampered":true}'
+              WHERE scan_id='scan-golden' AND id=(
+                SELECT id FROM nodes WHERE scan_id='scan-golden' ORDER BY id LIMIT 1
+              )"#,
+            [],
+        )?;
+        let integrity = store.verify_snapshot_integrity(&snapshot_id)?;
+        assert!(!integrity.valid);
+        assert_eq!(integrity.reasons, ["content_digest_mismatch"]);
+        assert_ne!(integrity.expected_id, integrity.observed_id);
+        Ok(())
+    }
+
+    #[test]
+    fn completed_snapshot_identity_is_stable_across_attempt_timestamps_and_stores() -> Result<()> {
+        let fixture =
+            include_str!("../../depgraph-protocol/tests/fixtures/protocol-v1.golden.ndjson");
+        let mut first = Store::open_in_memory()?;
+        ingest_protocol_fixture(&mut first, fixture)?;
+        let first_id = first.current_snapshot_id()?.context("first snapshot")?;
+
+        let mut second = Store::open_in_memory()?;
+        ingest_protocol_fixture(&mut second, fixture)?;
+        second.connection.execute(
+            "UPDATE scans SET started_at='2099-01-01T00:00:00.000Z',
+                              completed_at='2099-01-01T00:00:01.000Z'
+              WHERE id='scan-golden'",
+            [],
+        )?;
+        let second_id = second.current_snapshot_id()?.context("second snapshot")?;
+
+        assert_eq!(first_id, second_id);
+        assert!(first_id.starts_with("snapshot:sha256:"));
+        assert!(second.verify_snapshot_integrity(&second_id)?.valid);
         Ok(())
     }
 
@@ -3209,7 +3991,7 @@ mod tests {
         drop(connection);
 
         let store = Store::open(&path)?;
-        assert_eq!(store.schema_version()?, 7);
+        assert_eq!(store.schema_version()?, 8);
         let site_not_null: i64 = store.connection.query_row(
             "SELECT [notnull] FROM pragma_table_info('edges') WHERE name='site_id'",
             [],
@@ -3252,6 +4034,126 @@ mod tests {
             |row| row.get(0),
         )?;
         assert_eq!(build_attempts_table, 1);
+        for table in [
+            "completed_snapshots",
+            "snapshot_sources",
+            "current_completed_snapshot",
+        ] {
+            let count: i64 = store.connection.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                [table],
+                |row| row.get(0),
+            )?;
+            assert_eq!(count, 1, "missing migrated table {table}");
+        }
+        assert!(table_has_column(
+            &store.connection,
+            "scans",
+            "mutation_count"
+        )?);
+        assert!(table_has_column(
+            &store.connection,
+            "build_attempts",
+            "base_snapshot_id"
+        )?);
+        Ok(())
+    }
+
+    #[test]
+    fn migrates_v7_current_graph_into_an_immutable_completed_snapshot() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("v7.db");
+        let mut expected = {
+            let mut store = Store::open(&path)?;
+            ingest_protocol_fixture(
+                &mut store,
+                include_str!("../../depgraph-protocol/tests/fixtures/protocol-v1.golden.ndjson"),
+            )?;
+            let base = store.load_snapshot("scan-golden")?;
+            let audit = build_attempt_audit("migrated-build");
+            store.save_build_audit(&audit)?;
+            store.start_build_attempt("scan-golden", &audit)?;
+            let protocol = validate_build_ndjson(Cursor::new(build_protocol(
+                "migrated-build",
+                false,
+                "production",
+                &canonical_effective_input_id(&base.profiles[0]),
+            )))?;
+            store.save_build_delta("migrated-build", &protocol)?;
+            store.finish_build_attempt("migrated-build", "completed", None, true)?;
+            store.load_snapshot("scan-golden")?
+        };
+        let connection = Connection::open(&path)?;
+        connection.execute_batch(
+            "PRAGMA foreign_keys=OFF;
+             DROP TABLE current_completed_snapshot;
+             DROP TABLE snapshot_sources;
+             DROP TABLE completed_snapshots;
+             ALTER TABLE build_attempts DROP COLUMN base_snapshot_id;
+             ALTER TABLE scans DROP COLUMN mutation_count;
+             ALTER TABLE scans DROP COLUMN source_revision;
+             ALTER TABLE scans DROP COLUMN parent_snapshot_id;
+             PRAGMA user_version=7;",
+        )?;
+        drop(connection);
+        expected.scan.source_revision = None;
+
+        let store = Store::open(&path)?;
+        assert_eq!(store.schema_version()?, 8);
+        let current_id = store
+            .current_snapshot_id()?
+            .context("migrated current snapshot")?;
+        let metadata = store
+            .completed_snapshot(&current_id)?
+            .context("migrated snapshot metadata")?;
+        assert_eq!(metadata.source_kind, "build");
+        assert_eq!(metadata.source_attempt_id, "migrated-build");
+        assert!(metadata.parent_snapshot_id.is_some());
+        assert_eq!(store.load_completed_snapshot(&current_id)?, expected);
+        assert_eq!(store.load_snapshot("scan-golden")?, expected);
+        assert!(store.verify_snapshot_integrity(&current_id)?.valid);
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_garbage_collection_removes_only_unreferenced_terminal_attempts() -> Result<()> {
+        let mut store = Store::open_in_memory()?;
+        ingest_protocol_fixture(
+            &mut store,
+            include_str!("../../depgraph-protocol/tests/fixtures/protocol-v1.golden.ndjson"),
+        )?;
+        let current_id = store.current_snapshot_id()?.context("current snapshot")?;
+        let current = store.load_completed_snapshot(&current_id)?;
+
+        store.start_scan("failed-scan", Path::new("/fixture"), false)?;
+        store.finish_scan("failed-scan", "cancelled", Some("cancelled"), false)?;
+        let mut failed_audit = build_attempt_audit("failed-build");
+        failed_audit["outcome"] = json!("failed");
+        failed_audit["validated_output_digest"] = Value::Null;
+        store.save_build_audit(&failed_audit)?;
+        store.start_build_attempt("scan-golden", &failed_audit)?;
+        store.finish_build_attempt("failed-build", "failed", Some("observer failed"), false)?;
+
+        assert!(store.scan("failed-scan")?.is_some());
+        assert!(store.build_attempt("failed-build")?.is_some());
+        assert!(store.build_audit("failed-build")?.is_some());
+        let report = store.garbage_collect_unreferenced_attempts()?;
+        assert_eq!(
+            report,
+            GarbageCollectionReport {
+                scan_attempts_deleted: 1,
+                build_attempts_deleted: 1,
+                build_audits_deleted: 1,
+            }
+        );
+        assert!(store.scan("failed-scan")?.is_none());
+        assert!(store.build_attempt("failed-build")?.is_none());
+        assert!(store.build_audit("failed-build")?.is_none());
+        assert_eq!(
+            store.current_snapshot_id()?.as_deref(),
+            Some(current_id.as_str())
+        );
+        assert_eq!(store.load_completed_snapshot(&current_id)?, current);
         Ok(())
     }
 
@@ -3289,6 +4191,19 @@ mod tests {
             include_str!("../../depgraph-protocol/tests/fixtures/protocol-v1.golden.ndjson"),
         )?;
         let base = store.load_snapshot("scan-golden")?;
+        let base_snapshot_id = store.current_snapshot_id()?.context("base snapshot")?;
+        let base_metadata = store
+            .completed_snapshot(&base_snapshot_id)?
+            .context("base snapshot metadata")?;
+        assert_eq!(base_metadata.source_kind, "scan");
+        assert_eq!(base_metadata.source_attempt_id, "scan-golden");
+        assert_eq!(
+            base_metadata.source_revision.as_deref(),
+            Some("fixture-revision")
+        );
+        assert_eq!(base_metadata.profile_ids, ["web:production:server"]);
+        assert!(store.verify_snapshot_integrity(&base_snapshot_id)?.valid);
+        assert_eq!(base.profiles[0].source_revision.as_deref(), Some("fixture"));
         assert_eq!(base.edges.len(), 1);
         assert_eq!(base.edges[0].phase, "source");
 
@@ -3305,7 +4220,25 @@ mod tests {
         store.save_build_delta("build-run-1", &protocol)?;
         store.finish_build_attempt("build-run-1", "completed", None, true)?;
 
+        let build_snapshot_id = store.current_snapshot_id()?.context("build snapshot")?;
+        assert_ne!(build_snapshot_id, base_snapshot_id);
+        let build_metadata = store
+            .completed_snapshot(&build_snapshot_id)?
+            .context("build snapshot metadata")?;
+        assert_eq!(build_metadata.source_kind, "build");
+        assert_eq!(build_metadata.source_attempt_id, "build-run-1");
+        assert_eq!(
+            build_metadata.parent_snapshot_id.as_deref(),
+            Some(base_snapshot_id.as_str())
+        );
+        assert_eq!(
+            build_metadata.profile_ids,
+            ["web:build", "web:production:server"]
+        );
+        assert_eq!(store.load_completed_snapshot(&base_snapshot_id)?, base);
+        assert!(store.verify_snapshot_integrity(&build_snapshot_id)?.valid);
         let union = store.load_snapshot("scan-golden")?;
+        assert_eq!(store.load_completed_snapshot(&build_snapshot_id)?, union);
         assert_eq!(union.edges.len(), 2);
         assert_eq!(
             union
@@ -3386,6 +4319,11 @@ mod tests {
             |row| row.get(0),
         )?;
         assert!(retained_delta.is_none());
+        assert_eq!(
+            store.current_snapshot_id()?.as_deref(),
+            Some(build_snapshot_id.as_str())
+        );
+        assert_eq!(store.snapshot_id_for_source("build", "build-run-2")?, None);
 
         let mut supervisor_failure = build_attempt_audit("build-run-supervisor-failed");
         supervisor_failure["outcome"] = json!("timed_out");
@@ -3608,9 +4546,19 @@ mod tests {
     }
 
     fn ingest_protocol_fixture(store: &mut Store, fixture: &str) -> Result<()> {
+        let scan_id = stage_protocol_fixture(store, fixture, Some("fixture-revision"))?;
+        store.finish_scan(&scan_id, "completed", None, true)?;
+        Ok(())
+    }
+
+    fn stage_protocol_fixture(
+        store: &mut Store,
+        fixture: &str,
+        source_revision: Option<&str>,
+    ) -> Result<String> {
         let first: Value = serde_json::from_str(fixture.lines().next().context("fixture")?)?;
-        let scan_id = required_str(&first, "scan_id")?;
-        store.start_scan(scan_id, Path::new("/fixture"), false)?;
+        let scan_id = required_str(&first, "scan_id")?.to_owned();
+        store.start_scan_with_revision(&scan_id, Path::new("/fixture"), false, source_revision)?;
         let mut events = fixture
             .lines()
             .map(serde_json::from_str::<Value>)
@@ -3619,8 +4567,7 @@ mod tests {
         for event in events {
             store.ingest_event(&event)?;
         }
-        store.finish_scan(scan_id, "completed", None, true)?;
-        Ok(())
+        Ok(scan_id)
     }
 
     fn build_attempt_audit(run_id: &str) -> Value {

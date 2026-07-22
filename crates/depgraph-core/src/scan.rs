@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result};
@@ -15,7 +15,7 @@ use crate::{
     config::Config,
     worker::{
         AdapterKind, WorkerFailureKind, WorkerOutput, WorkerSpec, detect_adapters, execute_worker,
-        is_security_error, locate_worker,
+        is_security_error, locate_worker, resolve_safe_executable,
     },
 };
 
@@ -120,7 +120,8 @@ pub async fn run_scan(
         );
     }
     let scan_id = Uuid::new_v4().to_string();
-    store.start_scan(&scan_id, &root, strict)?;
+    let source_revision = git_source_revision(&root);
+    store.start_scan_with_revision(&scan_id, &root, strict, source_revision.as_deref())?;
 
     let adapters = match detect_adapters(&root, config.scan.follow_symlinks) {
         Ok(adapters) => adapters,
@@ -278,6 +279,28 @@ pub async fn run_scan(
 
     store.finish_scan(&scan_id, "completed", None, true)?;
     snapshot_outcome(store, &scan_id, 0)
+}
+
+fn git_source_revision(root: &Path) -> Option<String> {
+    let git = resolve_safe_executable("git", root).ok()?;
+    let output = std::process::Command::new(git)
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "--verify", "HEAD"])
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let revision = std::str::from_utf8(&output.stdout).ok()?.trim();
+    if !(40..=64).contains(&revision.len())
+        || !revision.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    Some(revision.to_ascii_lowercase())
 }
 
 fn task_adapter(task_adapters: &mut BTreeMap<Id, AdapterKind>, task_id: Id) -> AdapterKind {
