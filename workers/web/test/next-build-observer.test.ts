@@ -352,6 +352,28 @@ test("observer keeps only allowlisted final config, route, runtime, output, and 
   }
 });
 
+test("prerenders without a fallback artifact use deterministic synthetic metadata", async () => {
+  const context = buildContext();
+  context.outputs.appPages = [];
+  context.outputs.prerenders = [{
+    id: "private-prerender-output-id",
+    type: "PRERENDER",
+    pathname: "/docs/prerendered",
+    config: {},
+  }];
+  let artifactReads = 0;
+  const observed = await collectNextBuildObservation(context, () => {
+    artifactReads += 1;
+    return digest("a");
+  });
+
+  assert.equal(artifactReads, 0);
+  assert.equal(observed.outputs.length, 1);
+  assert.match(observed.outputs[0]!.logical_artifact_path, /^\.next\/observed\/[a-f0-9]{64}\.metadata$/u);
+  assert.match(observed.outputs[0]!.artifact_digest, /^[a-f0-9]{64}$/u);
+  assert.equal(JSON.stringify(observed).includes("private-prerender-output-id"), false);
+});
+
 test("unsafe artifact paths and unsupported output contracts fail without a partial observation", async () => {
   const escaped = buildContext();
   (escaped.outputs.appPages as Array<Record<string, unknown>>)[0]!.filePath = "/outside/page.js";

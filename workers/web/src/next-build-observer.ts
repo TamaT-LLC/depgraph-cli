@@ -455,9 +455,6 @@ async function sanitizeOutput(
   if (output.sourcePage !== undefined && sourcePage === null) fail("web.next_build_source_page_unsafe");
   let mainPath: unknown = output.filePath;
   if (expectedType === "PRERENDER") mainPath = record(output.fallback)?.filePath;
-  if (mainPath === undefined && expectedType === "PRERENDER") {
-    mainPath = path.join(repoRoot, ".next", "prerender", `${sha256(pathname)}.metadata`);
-  }
   const main = mainPath === undefined
     ? { logicalPath: `.next/observed/${sha256(`${expectedType}\0${pathname}`)}.metadata`, digest: sha256(canonicalJson({ expectedType, pathname })) }
     : await digestArtifact(repoRoot, mainPath, undefined, readArtifact);
