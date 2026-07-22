@@ -8016,13 +8016,15 @@ mod tests {
         let safe = temp.path().join("safe-bin");
         std::fs::create_dir(&root)?;
         std::fs::create_dir(&safe)?;
-        let mut entries = vec![PathBuf::from("."), root.clone(), safe.clone()];
+        let entries = vec![PathBuf::from("."), root.clone(), safe.clone()];
         #[cfg(unix)]
-        {
+        let entries = {
+            let mut entries = entries;
             let alias = temp.path().join("project-alias");
             std::os::unix::fs::symlink(&root, &alias)?;
             entries.push(alias);
-        }
+            entries
+        };
         let raw = std::env::join_paths(entries)?;
         let sanitized = sanitize_path_value(&raw, &root)?;
         let paths = std::env::split_paths(&sanitized).collect::<Vec<_>>();

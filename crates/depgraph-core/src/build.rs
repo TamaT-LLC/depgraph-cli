@@ -393,13 +393,23 @@ where
 }
 
 async fn terminate_build_tree(child: &mut tokio::process::Child, guard: &ProcessTreeGuard) {
-    guard.request_graceful_termination();
-    if timeout(Duration::from_secs(5), child.wait()).await.is_err() {
+    #[cfg(unix)]
+    {
+        guard.request_graceful_termination();
+        if timeout(Duration::from_secs(5), child.wait()).await.is_err() {
+            terminate_worker(child, guard).await;
+        } else {
+            // The direct child may exit before descendants. Always close the whole
+            // process tree before readers and temporary directories are released.
+            guard.terminate();
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows Job Objects have no tree-wide graceful signal. Waiting before
+        // TerminateJobObject would let descendants keep running during the grace
+        // period, so enforce the bounded tree stop immediately on this platform.
         terminate_worker(child, guard).await;
-    } else {
-        // The direct child may exit before descendants. Always close the whole
-        // process tree before readers and temporary directories are released.
-        guard.terminate();
     }
 }
 
