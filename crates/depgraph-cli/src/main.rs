@@ -7,10 +7,10 @@ use std::{
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use depgraph_core::{
-    BuildOutcomeKind, Config, CycleLevel, ExportFormat, ImpactFilters, ImpactResult,
-    create_build_execution_request, default_store_path, doctor,
+    BuildOutcomeKind, Config, CycleLevel, ExportFormat, ImpactFilters, ImpactResult, ScanCacheMode,
+    build_cache_key, create_build_execution_request, default_store_path, doctor,
     execute_build_request_with_cancellation, export, impact, init_config, open_store,
-    read_git_changed_set, render_condition, run_scan, rust_build_protocol_ndjson,
+    read_git_changed_set, render_condition, run_scan_with_cache_mode, rust_build_protocol_ndjson,
     stage_build_evidence, traverse, unresolved, web_build_protocol_ndjson, why,
 };
 use depgraph_store::{CompletedSnapshotDetails, CoverageRecord};
@@ -54,6 +54,9 @@ enum Commands {
         strict: bool,
         #[arg(long)]
         json: bool,
+        /// Bypass cache lookup and storage for this scan.
+        #[arg(long)]
+        no_cache: bool,
     },
     /// Observe a project build only after explicit project-code consent.
     Resolve {
@@ -322,12 +325,28 @@ async fn run(cli: Cli) -> Result<u8> {
             println!("initialized {}", path.display());
             Ok(0)
         }
-        Commands::Scan { path, strict, json } => {
+        Commands::Scan {
+            path,
+            strict,
+            json,
+            no_cache,
+        } => {
             let root = canonical_directory(path)?;
             let config = Config::load(&root)?;
             let store_path = store_path(cli.store, &root)?;
             let mut store = open_store(&store_path)?;
-            let outcome = run_scan(&mut store, root, &config, strict).await?;
+            let outcome = run_scan_with_cache_mode(
+                &mut store,
+                root,
+                &config,
+                strict,
+                if no_cache {
+                    ScanCacheMode::Disabled
+                } else {
+                    ScanCacheMode::Enabled
+                },
+            )
+            .await?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&outcome)?);
             } else {
@@ -352,6 +371,14 @@ async fn run(cli: Cli) -> Result<u8> {
                         diagnostic.severity, diagnostic.code, diagnostic.message
                     );
                 }
+                for event in &outcome.cache_events {
+                    println!(
+                        "cache {}: {} ({})",
+                        event.layer.as_str(),
+                        event.outcome,
+                        event.reason
+                    );
+                }
                 println!("store: {}", store_path.display());
             }
             Ok(outcome.exit_code)
@@ -373,6 +400,7 @@ async fn run(cli: Cli) -> Result<u8> {
             .await?;
             store.save_build_audit(&serde_json::to_value(&outcome.audit)?)?;
             let mut evidence_status = "audit-only (no completed base scan)";
+            let mut build_cache_status = "not stored";
             if let Some(base_scan_id) = store.latest_successful_id()? {
                 evidence_status = "not promoted";
                 store.start_build_attempt(&base_scan_id, &serde_json::to_value(&outcome.audit)?)?;
@@ -427,6 +455,22 @@ async fn run(cli: Cli) -> Result<u8> {
                             true,
                         )?;
                         evidence_status = "promoted";
+                        if let Some(cache_key) = build_cache_key(&outcome.audit) {
+                            let snapshot_id = store
+                                .snapshot_id_for_source("build", &outcome.audit.run_id)?
+                                .context("promoted build did not expose its completed snapshot")?;
+                            let cache = store.store_snapshot_cache(
+                                &cache_key,
+                                &snapshot_id,
+                                None,
+                                Some(&outcome.audit.run_id),
+                            )?;
+                            build_cache_status = if cache.outcome == "stored" {
+                                "stored"
+                            } else {
+                                "rejected"
+                            };
+                        }
                     }
                     BuildOutcomeKind::Failed => store.finish_build_attempt(
                         &outcome.audit.run_id,
@@ -458,6 +502,7 @@ async fn run(cli: Cli) -> Result<u8> {
             println!("status: {:?}", outcome.audit.outcome);
             println!("project code executed: {}", outcome.project_code_executed);
             println!("build evidence: {evidence_status}");
+            println!("build cache: {build_cache_status}");
             println!("network isolation: {:?}", outcome.audit.network_isolation);
             if let Some(diagnostic) = &outcome.audit.isolation_diagnostic {
                 eprintln!("warning: {diagnostic}");
@@ -482,6 +527,13 @@ async fn run(cli: Cli) -> Result<u8> {
                 println!("protocol: {}", report.protocol_version);
                 println!("graph schema: {}", report.graph_schema_version);
                 println!("store schema: {}", report.store_schema_version);
+                println!("cache contract: {}", report.cache_contract_version);
+                println!(
+                    "cache entries: {} syntax, {} semantic, {} build",
+                    report.cache_entries.syntax,
+                    report.cache_entries.semantic,
+                    report.cache_entries.build
+                );
                 if let Some(release) = &report.release {
                     println!(
                         "release: {} ({}, schema {}; core {}; schema {})",
@@ -606,9 +658,27 @@ async fn run(cli: Cli) -> Result<u8> {
                     for log in scan.adapter_logs.iter().filter(|log| log.truncated) {
                         println!("worker {} stderr: truncated", log.adapter);
                     }
+                    for event in scan.cache_events {
+                        println!(
+                            "cache {}: {} ({})",
+                            event.layer.as_str(),
+                            event.outcome,
+                            event.reason
+                        );
+                    }
                     println!("project code executed: {}", scan.project_code_executed);
                 } else {
                     println!("latest attempt: none");
+                }
+                for event in report.recent_cache_events {
+                    if event.layer == depgraph_store::CacheLayer::Build {
+                        println!(
+                            "recent cache {}: {} ({})",
+                            event.layer.as_str(),
+                            event.outcome,
+                            event.reason
+                        );
+                    }
                 }
             }
             Ok(0)

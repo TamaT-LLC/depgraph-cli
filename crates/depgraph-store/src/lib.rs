@@ -13,9 +13,14 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+mod cache;
 mod diff;
 mod profile_matrix;
 
+pub use cache::{
+    CACHE_CONTRACT_VERSION, CacheEntryCounts, CacheEventRecord, CacheKey, CacheLayer,
+    CacheLookupResult,
+};
 pub use diff::{
     ChangedRecord, GraphSnapshotDiff, NodeRename, NodeRenameEvidence, RecordDiff, RenameConfidence,
     SNAPSHOT_DIFF_SCHEMA_VERSION, diff_graph_snapshots,
@@ -28,7 +33,7 @@ pub use profile_matrix::{
     declared_effective_input_id, declared_parent_profile_id, phase_coverage_for_effective_profile,
 };
 
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 10;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ScanRecord {
@@ -620,6 +625,59 @@ impl Store {
                     BEFORE DELETE ON snapshot_names
                     BEGIN SELECT RAISE(ABORT, 'snapshot names are immutable'); END;
                  PRAGMA user_version = 9;",
+            )?;
+            tx.commit()?;
+        }
+        if current < 10 {
+            let tx = self.connection.transaction()?;
+            tx.execute_batch(
+                "CREATE TABLE syntax_cache (
+                    key TEXT PRIMARY KEY,
+                    contract_version INTEGER NOT NULL,
+                    dimensions_json TEXT NOT NULL,
+                    snapshot_id TEXT NOT NULL REFERENCES completed_snapshots(id) ON DELETE CASCADE,
+                    payload_digest TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    last_used_at TEXT NOT NULL,
+                    hit_count INTEGER NOT NULL DEFAULT 0
+                 );
+                 CREATE TABLE semantic_cache (
+                    key TEXT PRIMARY KEY,
+                    contract_version INTEGER NOT NULL,
+                    dimensions_json TEXT NOT NULL,
+                    snapshot_id TEXT NOT NULL REFERENCES completed_snapshots(id) ON DELETE CASCADE,
+                    payload_digest TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    last_used_at TEXT NOT NULL,
+                    hit_count INTEGER NOT NULL DEFAULT 0
+                 );
+                 CREATE TABLE build_cache (
+                    key TEXT PRIMARY KEY,
+                    contract_version INTEGER NOT NULL,
+                    dimensions_json TEXT NOT NULL,
+                    snapshot_id TEXT NOT NULL REFERENCES completed_snapshots(id) ON DELETE CASCADE,
+                    payload_digest TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    last_used_at TEXT NOT NULL,
+                    hit_count INTEGER NOT NULL DEFAULT 0
+                 );
+                 CREATE TABLE cache_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    scan_id TEXT REFERENCES scans(id) ON DELETE CASCADE,
+                    build_attempt_id TEXT REFERENCES build_attempts(id) ON DELETE CASCADE,
+                    layer TEXT NOT NULL CHECK (layer IN ('syntax', 'semantic', 'build')),
+                    cache_key TEXT,
+                    outcome TEXT NOT NULL CHECK (outcome IN ('hit', 'miss', 'reject', 'stored')),
+                    reason TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    CHECK ((scan_id IS NOT NULL AND build_attempt_id IS NULL)
+                        OR (scan_id IS NULL AND build_attempt_id IS NOT NULL))
+                 );
+                 CREATE INDEX cache_events_scan_created
+                    ON cache_events(scan_id, created_at, id);
+                 CREATE INDEX cache_events_build_created
+                    ON cache_events(build_attempt_id, created_at, id);
+                 PRAGMA user_version = 10;",
             )?;
             tx.commit()?;
         }
@@ -4314,7 +4372,7 @@ mod tests {
         drop(connection);
 
         let store = Store::open(&path)?;
-        assert_eq!(store.schema_version()?, 9);
+        assert_eq!(store.schema_version()?, 10);
         let site_not_null: i64 = store.connection.query_row(
             "SELECT [notnull] FROM pragma_table_info('edges') WHERE name='site_id'",
             [],
@@ -4361,6 +4419,10 @@ mod tests {
             "completed_snapshots",
             "snapshot_sources",
             "current_completed_snapshot",
+            "syntax_cache",
+            "semantic_cache",
+            "build_cache",
+            "cache_events",
         ] {
             let count: i64 = store.connection.query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
@@ -4409,6 +4471,10 @@ mod tests {
         let connection = Connection::open(&path)?;
         connection.execute_batch(
             "PRAGMA foreign_keys=OFF;
+             DROP TABLE cache_events;
+             DROP TABLE syntax_cache;
+             DROP TABLE semantic_cache;
+             DROP TABLE build_cache;
              DROP TABLE snapshot_names;
              DROP TABLE current_completed_snapshot;
              DROP TABLE snapshot_sources;
@@ -4423,7 +4489,7 @@ mod tests {
         expected.scan.source_revision = None;
 
         let store = Store::open(&path)?;
-        assert_eq!(store.schema_version()?, 9);
+        assert_eq!(store.schema_version()?, 10);
         let current_id = store
             .current_snapshot_id()?
             .context("migrated current snapshot")?;
@@ -4453,13 +4519,17 @@ mod tests {
         };
         let connection = Connection::open(&path)?;
         connection.execute_batch(
-            "DROP TABLE snapshot_names;
+            "DROP TABLE cache_events;
+             DROP TABLE syntax_cache;
+             DROP TABLE semantic_cache;
+             DROP TABLE build_cache;
+             DROP TABLE snapshot_names;
              PRAGMA user_version=8;",
         )?;
         drop(connection);
 
         let mut store = Store::open(&path)?;
-        assert_eq!(store.schema_version()?, 9);
+        assert_eq!(store.schema_version()?, 10);
         assert_eq!(
             store.current_snapshot_id()?.as_deref(),
             Some(snapshot_id.as_str())
