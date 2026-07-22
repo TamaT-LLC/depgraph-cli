@@ -577,6 +577,135 @@ pub fn validate_safe_semantic_ndjson(
     Ok(protocol)
 }
 
+/// Validates a supervised build-observer stream. Build streams are deliberately
+/// stricter than compatible protocol-v1 streams: they must declare project-code
+/// execution, contain only observed build dependency payload, and complete every
+/// declared profile with `build-observed` coverage.
+pub fn validate_build_ndjson(reader: impl BufRead) -> Result<ValidatedProtocol, ProtocolError> {
+    let protocol = validate_ndjson(reader)?;
+    validate_build_contract(&protocol)?;
+    Ok(protocol)
+}
+
+/// Validates the build-observation contract on an already validated stream.
+pub fn validate_build_contract(protocol: &ValidatedProtocol) -> Result<(), ProtocolError> {
+    let started = protocol.events.first().and_then(|event| match event {
+        ProtocolEvent::ScanStarted(started) => Some(started),
+        _ => None,
+    });
+    if started.is_none_or(|started| started.safe_mode || !started.project_code_executed) {
+        return invariant(
+            "build observation must declare safe_mode=false and project_code_executed=true".into(),
+        );
+    }
+
+    if protocol.sites.values().any(|site| {
+        site.evidence
+            .first()
+            .is_none_or(|evidence| evidence.kind != EvidenceKind::Build)
+    }) {
+        return invariant("build observation contains a non-build dependency site".into());
+    }
+    if protocol
+        .edges
+        .values()
+        .any(|edge| edge.phase != Phase::Build)
+    {
+        return invariant("build observation contains a non-build edge".into());
+    }
+    if protocol.profiles.is_empty() {
+        return invariant("build observation must declare at least one profile".into());
+    }
+    for profile in protocol.profiles.values() {
+        reject_secret_like_properties(
+            &format!("build profile {} properties", profile.id),
+            &profile.properties,
+        )?;
+        reject_secret_like_properties(
+            &format!("build profile {} environment", profile.id),
+            &profile.environment,
+        )?;
+    }
+    for node in protocol.nodes.values() {
+        reject_secret_like_properties(&format!("build node {}", node.id), &node.properties)?;
+    }
+    for diagnostic in protocol.diagnostics.values() {
+        reject_secret_like_properties(
+            &format!("build diagnostic {}", diagnostic.id),
+            &diagnostic.properties,
+        )?;
+        for evidence in &diagnostic.evidence {
+            reject_secret_like_properties(
+                &format!("build diagnostic {} evidence", diagnostic.id),
+                &evidence.properties,
+            )?;
+        }
+    }
+
+    let profile_coverage = protocol.events.iter().filter_map(|event| match event {
+        ProtocolEvent::ProfileCompleted(completed) => {
+            Some((completed.profile_id.as_str(), &completed.coverage))
+        }
+        _ => None,
+    });
+    for (profile_id, coverage) in profile_coverage {
+        if !coverage.project_code_executed
+            || !coverage
+                .completeness
+                .contains(&CompletenessLevel::BuildObserved)
+        {
+            return invariant(format!(
+                "build profile {profile_id} must report project_code_executed=true and build-observed"
+            ));
+        }
+    }
+    let completed = protocol.events.last().and_then(|event| match event {
+        ProtocolEvent::ScanCompleted(completed) => Some(completed),
+        _ => None,
+    });
+    if completed.is_none_or(|completed| {
+        !completed.coverage.project_code_executed
+            || !completed
+                .coverage
+                .completeness
+                .contains(&CompletenessLevel::BuildObserved)
+    }) {
+        return invariant(
+            "build observation must complete with project_code_executed=true and build-observed"
+                .into(),
+        );
+    }
+
+    let mut provenance: Option<BuildProvenance<'_>> = None;
+    for site in protocol.sites.values() {
+        let current = build_provenance(
+            &format!("build dependency site {}", site.id),
+            &site.profile_id,
+            &site.evidence,
+        )?;
+        if let Some(expected) = provenance
+            && !expected.same_attempt(current)
+        {
+            return invariant("build observation mixes attempt provenance".into());
+        }
+        provenance = Some(current);
+    }
+    for edge in protocol.edges.values() {
+        let current = build_provenance(
+            &format!("build edge {}", edge.id),
+            &edge.profile_id,
+            &edge.evidence,
+        )?;
+        if let Some(expected) = provenance
+            && !expected.same_attempt(current)
+        {
+            return invariant("build observation mixes attempt provenance".into());
+        }
+        provenance = Some(current);
+    }
+    Ok(())
+}
+
 /// Validates the opt-in Milestone 2 semantic graph contract on an already
 /// validated protocol stream.
 pub fn validate_semantic_contract(protocol: &ValidatedProtocol) -> Result<(), ProtocolError> {
@@ -814,6 +943,48 @@ fn validate_site_edge_maps(
                     "edge {} precision does not match dependency site {}",
                     edge.id, site.id
                 ));
+            }
+            if site
+                .evidence
+                .first()
+                .is_some_and(is_observed_build_evidence)
+            {
+                if edge.phase != Phase::Build {
+                    return invariant(format!(
+                        "build dependency site {} is linked to non-build edge {}",
+                        site.id, edge.id
+                    ));
+                }
+                let site_provenance = build_provenance(
+                    &format!("build dependency site {}", site.id),
+                    &site.profile_id,
+                    &site.evidence,
+                )?;
+                let edge_provenance = build_provenance(
+                    &format!("build edge {}", edge.id),
+                    &edge.profile_id,
+                    &edge.evidence,
+                )?;
+                if !site_provenance.same_attempt(edge_provenance) {
+                    return invariant(format!(
+                        "build edge {} provenance does not match dependency site {}",
+                        edge.id, site.id
+                    ));
+                }
+                let expected_site_id = build_site_stable_id(site)?;
+                if site.id != expected_site_id {
+                    return invariant(format!(
+                        "build dependency site {} does not match its stable identity; expected {}",
+                        site.id, expected_site_id
+                    ));
+                }
+                let expected_edge_id = build_edge_stable_id(edge)?;
+                if edge.id != expected_edge_id {
+                    return invariant(format!(
+                        "build edge {} does not match its stable identity; expected {}",
+                        edge.id, expected_edge_id
+                    ));
+                }
             }
             // A site condition describes when the syntax site participates at
             // all. Each concrete candidate edge may further narrow that site
@@ -1436,7 +1607,84 @@ fn validate_profile(profile: &Profile) -> Result<(), ProtocolError> {
 fn validate_node(node: &GraphNode) -> Result<(), ProtocolError> {
     require_non_empty("node.id", &node.id)?;
     require_non_empty("node.kind", &node.kind)?;
-    require_non_empty("node.locator", &node.locator)
+    require_non_empty("node.locator", &node.locator)?;
+    if node
+        .properties
+        .get("build_generated")
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        reject_secret_like_properties(
+            &format!("build-generated node {}", node.id),
+            &node.properties,
+        )?;
+        let provenance = node
+            .properties
+            .get("build_provenance")
+            .and_then(Value::as_object)
+            .ok_or_else(|| {
+                ProtocolError::Invariant(format!(
+                    "build-generated node {} must include properties.build_provenance",
+                    node.id
+                ))
+            })?;
+        let identity = node
+            .properties
+            .get("build_identity")
+            .filter(|identity| identity.is_object())
+            .ok_or_else(|| {
+                ProtocolError::Invariant(format!(
+                    "build-generated node {} must include object properties.build_identity",
+                    node.id
+                ))
+            })?;
+        let expected_id = stable_id_from_value(&node.kind, identity);
+        if node.id != expected_id {
+            return invariant(format!(
+                "build-generated node {} does not match its stable identity; expected {}",
+                node.id, expected_id
+            ));
+        }
+        for field in ["build_run_id", "profile_id", "observer", "observer_version"] {
+            if provenance
+                .get(field)
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+            {
+                return invariant(format!(
+                    "build-generated node {} must include non-empty build_provenance.{field}",
+                    node.id
+                ));
+            }
+        }
+        for field in [
+            "command_plan_digest",
+            "toolchain_executable_digest",
+            "environment_key_set_digest",
+            "validated_output_digest",
+            "artifact_digest",
+        ] {
+            if provenance
+                .get(field)
+                .and_then(Value::as_str)
+                .is_none_or(|value| !is_sha256_hex(value))
+            {
+                return invariant(format!(
+                    "build-generated node {} build_provenance.{field} must be a lowercase SHA-256 digest",
+                    node.id
+                ));
+            }
+        }
+        let path = provenance
+            .get("logical_artifact_path")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        validate_canonical_relative_path(
+            &format!("build-generated node {} logical artifact", node.id),
+            path,
+        )?;
+    }
+    Ok(())
 }
 
 fn validate_edge(edge: &GraphEdge) -> Result<(), ProtocolError> {
@@ -1453,7 +1701,30 @@ fn validate_edge(edge: &GraphEdge) -> Result<(), ProtocolError> {
         "edge",
         &edge.evidence,
         matches!(edge.phase, Phase::Source | Phase::Semantic),
-    )
+    )?;
+    if edge.phase == Phase::Build {
+        if edge.precision != Precision::Observed {
+            return invariant(format!(
+                "build edge {} must use precision=observed",
+                edge.id
+            ));
+        }
+        build_provenance(
+            &format!("build edge {}", edge.id),
+            &edge.profile_id,
+            &edge.evidence,
+        )?;
+    } else if edge
+        .evidence
+        .first()
+        .is_some_and(is_observed_build_evidence)
+    {
+        return invariant(format!(
+            "edge {} with primary build evidence must use phase=build",
+            edge.id
+        ));
+    }
+    Ok(())
 }
 
 fn validate_site(site: &DependencySite) -> Result<(), ProtocolError> {
@@ -1468,7 +1739,252 @@ fn validate_site(site: &DependencySite) -> Result<(), ProtocolError> {
         require_non_empty("dependency_site.reason", reason)?;
     }
     validate_condition(&site.condition)?;
-    validate_dependency_evidence("dependency_site", &site.evidence, true)
+    let build = site
+        .evidence
+        .first()
+        .is_some_and(is_observed_build_evidence);
+    validate_dependency_evidence("dependency_site", &site.evidence, !build)?;
+    if build {
+        if site.precision != Precision::Observed {
+            return invariant(format!(
+                "build dependency site {} must use precision=observed",
+                site.id
+            ));
+        }
+        build_provenance(
+            &format!("build dependency site {}", site.id),
+            &site.profile_id,
+            &site.evidence,
+        )?;
+    } else if site.evidence.iter().any(is_observed_build_evidence) {
+        return invariant(format!(
+            "dependency site {} must place build evidence first",
+            site.id
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct BuildProvenance<'a> {
+    run_id: &'a str,
+    profile_id: &'a str,
+    command_plan_digest: &'a str,
+    toolchain_executable_digest: &'a str,
+    environment_key_set_digest: &'a str,
+    validated_output_digest: &'a str,
+    extractor: &'a str,
+    extractor_version: &'a str,
+}
+
+impl BuildProvenance<'_> {
+    fn same_attempt(self, other: Self) -> bool {
+        self.run_id == other.run_id
+            && self.profile_id == other.profile_id
+            && self.command_plan_digest == other.command_plan_digest
+            && self.toolchain_executable_digest == other.toolchain_executable_digest
+            && self.environment_key_set_digest == other.environment_key_set_digest
+            && self.validated_output_digest == other.validated_output_digest
+            && self.extractor == other.extractor
+            && self.extractor_version == other.extractor_version
+    }
+}
+
+fn build_provenance<'a>(
+    owner: &str,
+    profile_id: &str,
+    evidence: &'a [Evidence],
+) -> Result<BuildProvenance<'a>, ProtocolError> {
+    let primary = evidence
+        .first()
+        .ok_or_else(|| ProtocolError::Invariant(format!("{owner} has no primary evidence")))?;
+    if primary.kind != EvidenceKind::Build {
+        return invariant(format!("{owner} primary evidence must use kind=build"));
+    }
+    for item in evidence {
+        reject_secret_like_properties(owner, &item.properties)?;
+    }
+    let required = |field: &str| {
+        primary
+            .properties
+            .get(field)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                ProtocolError::Invariant(format!(
+                    "{owner} primary evidence must include non-empty properties.{field}"
+                ))
+            })
+    };
+    let provenance = BuildProvenance {
+        run_id: required("build_run_id")?,
+        profile_id: required("profile_id")?,
+        command_plan_digest: required("command_plan_digest")?,
+        toolchain_executable_digest: required("toolchain_executable_digest")?,
+        environment_key_set_digest: required("environment_key_set_digest")?,
+        validated_output_digest: required("validated_output_digest")?,
+        extractor: &primary.extractor,
+        extractor_version: &primary.extractor_version,
+    };
+    if provenance.profile_id != profile_id {
+        return invariant(format!(
+            "{owner} profile {profile_id:?} disagrees with build evidence profile {:?}",
+            provenance.profile_id
+        ));
+    }
+    for (field, digest) in [
+        ("command_plan_digest", provenance.command_plan_digest),
+        (
+            "toolchain_executable_digest",
+            provenance.toolchain_executable_digest,
+        ),
+        (
+            "environment_key_set_digest",
+            provenance.environment_key_set_digest,
+        ),
+        (
+            "validated_output_digest",
+            provenance.validated_output_digest,
+        ),
+    ] {
+        if !is_sha256_hex(digest) {
+            return invariant(format!(
+                "{owner} properties.{field} must be a lowercase SHA-256 digest"
+            ));
+        }
+    }
+    if !has_complete_span(primary) {
+        let logical_path = required("logical_artifact_path")?;
+        validate_canonical_relative_path(
+            &format!("{owner} properties.logical_artifact_path"),
+            logical_path,
+        )?;
+        if !is_sha256_hex(required("artifact_digest")?) {
+            return invariant(format!(
+                "{owner} properties.artifact_digest must be a lowercase SHA-256 digest"
+            ));
+        }
+    }
+    Ok(provenance)
+}
+
+/// Computes the stable ID for one observed build dependency site. Attempt IDs
+/// are deliberately excluded so identical validated output keeps graph
+/// identity across repeated supervised runs.
+pub fn build_site_stable_id(site: &DependencySite) -> Result<String, ProtocolError> {
+    let primary = site
+        .evidence
+        .first()
+        .ok_or_else(|| ProtocolError::Invariant("build site has no evidence".into()))?;
+    build_provenance(
+        &format!("build dependency site {}", site.id),
+        &site.profile_id,
+        &site.evidence,
+    )?;
+    let properties = &primary.properties;
+    let anchor = if has_complete_span(primary) {
+        json!({
+            "path": primary.path,
+            "start_line": primary.start_line,
+            "start_column": primary.start_column,
+            "end_line": primary.end_line,
+            "end_column": primary.end_column,
+        })
+    } else {
+        json!({
+            "logical_artifact_path": properties.get("logical_artifact_path"),
+            "artifact_digest": properties.get("artifact_digest"),
+        })
+    };
+    Ok(stable_id_from_value(
+        "site",
+        &json!({
+            "kind": site.kind,
+            "source": site.source,
+            "specifier": site.specifier,
+            "profile_id": site.profile_id,
+            "condition": site.condition.canonicalized(),
+            "resolution_status": site.resolution_status,
+            "precision": "observed",
+            "observer": primary.extractor,
+            "observer_version": primary.extractor_version,
+            "validated_output_digest": properties.get("validated_output_digest"),
+            "anchor": anchor,
+        }),
+    ))
+}
+
+/// Computes the stable ID for an observed build edge. Its phase is included so
+/// a matching source/semantic relationship remains a separate evidence layer.
+pub fn build_edge_stable_id(edge: &GraphEdge) -> Result<String, ProtocolError> {
+    if edge.phase != Phase::Build {
+        return invariant("build edge stable ID requires phase=build".into());
+    }
+    let site_id = edge.site_id.as_deref().ok_or_else(|| {
+        ProtocolError::Invariant(format!("build edge {} must reference a site", edge.id))
+    })?;
+    Ok(stable_id_from_value(
+        "edge",
+        &json!({
+            "kind": edge.kind,
+            "site_id": site_id,
+            "target": edge.target,
+            "phase": "build",
+        }),
+    ))
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn reject_secret_like_properties(
+    owner: &str,
+    properties: &crate::Properties,
+) -> Result<(), ProtocolError> {
+    fn visit(owner: &str, value: &Value) -> Result<(), ProtocolError> {
+        match value {
+            Value::Object(object) => {
+                for (key, value) in object {
+                    let upper = key.to_ascii_uppercase();
+                    if [
+                        "TOKEN",
+                        "SECRET",
+                        "PASSWORD",
+                        "PASSWD",
+                        "API_KEY",
+                        "PRIVATE_KEY",
+                        "CREDENTIAL",
+                        "AUTH",
+                        "COOKIE",
+                        "SESSION",
+                    ]
+                    .iter()
+                    .any(|part| upper.contains(part))
+                    {
+                        return invariant(format!(
+                            "{owner} contains forbidden secret-like property key"
+                        ));
+                    }
+                    visit(owner, value)?;
+                }
+            }
+            Value::Array(values) => {
+                for value in values {
+                    visit(owner, value)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+    visit(
+        owner,
+        &Value::Object(properties.clone().into_iter().collect()),
+    )
 }
 
 fn validate_semantic_node(node: &GraphNode) -> Result<(), ProtocolError> {
@@ -2325,6 +2841,13 @@ fn has_complete_span(evidence: &Evidence) -> bool {
         && evidence.start_column.is_some()
         && evidence.end_line.is_some()
         && evidence.end_column.is_some()
+}
+
+/// `kind=build` also represents generated artifacts discovered by a safe scan.
+/// Only evidence carrying supervisor attempt provenance is an opt-in build
+/// observation and therefore subject to the stricter build-union contract.
+fn is_observed_build_evidence(evidence: &Evidence) -> bool {
+    evidence.kind == EvidenceKind::Build && evidence.properties.contains_key("build_run_id")
 }
 
 fn primary_evidence_anchor(evidence: &Evidence) -> (&str, &str, &str, u32, u32, u32, u32) {

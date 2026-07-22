@@ -1773,13 +1773,13 @@ fn semantic_selectors_cycles_and_query_evidence_are_exposed() {
         if arguments[0] == "why" {
             assert!(stdout.starts_with("go://example.test/fixture.Alpha\n"));
             assert!(stdout.contains(&format!(
-                "  --calls [resolved; exact; go:test]--> {}",
+                "  --calls [semantic; resolved; exact; go:test]--> {}",
                 fixture.beta_id
             )));
             assert!(stdout.contains("      condition: true"));
         } else {
             assert!(stdout.contains(&format!(
-                "{} --calls [resolved; exact; go:test]--> {}",
+                "{} --calls [semantic; resolved; exact; go:test]--> {}",
                 fixture.alpha_id, fixture.beta_id
             )));
             assert!(stdout.contains("    condition: true"));

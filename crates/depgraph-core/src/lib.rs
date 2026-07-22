@@ -1,4 +1,5 @@
 pub mod build;
+pub mod build_evidence;
 pub mod config;
 pub mod export;
 pub mod query;
@@ -22,6 +23,7 @@ pub use build::{
     execute_build_request, execute_build_request_with_cancellation, supervise_build,
     supervise_build_with_cancellation,
 };
+pub use build_evidence::{stage_build_evidence, validate_build_evidence};
 pub use config::{Config, default_store_path, init_config};
 pub use depgraph_store::GraphSnapshot;
 pub use export::{ExportFormat, export};

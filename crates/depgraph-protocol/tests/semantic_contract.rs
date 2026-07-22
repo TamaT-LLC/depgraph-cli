@@ -1475,7 +1475,23 @@ fn rust_semantic_dependency_contract_rejects_wrong_mapping_and_invariants() {
     for phase in ["build", "runtime"] {
         let mut wrong_phase = rust_semantic_dependency_values();
         let use_site_id = semantic_site_id(&wrong_phase, "rust_use");
-        linked_edge_mut(&mut wrong_phase, &use_site_id)["phase"] = json!(phase);
+        let edge = linked_edge_mut(&mut wrong_phase, &use_site_id);
+        edge["phase"] = json!(phase);
+        if phase == "build" {
+            edge["precision"] = json!("observed");
+            edge["evidence"] = json!([{
+                "kind":"build","extractor":"build-observer","extractor_version":"0.1.0",
+                "properties":{
+                    "build_run_id":"build-1","profile_id":edge["profile_id"],
+                    "command_plan_digest":"a".repeat(64),
+                    "toolchain_executable_digest":"b".repeat(64),
+                    "environment_key_set_digest":"c".repeat(64),
+                    "validated_output_digest":"d".repeat(64),
+                    "logical_artifact_path":"target/observation.json",
+                    "artifact_digest":"e".repeat(64)
+                }
+            }]);
+        }
         cases.push((
             if phase == "build" {
                 "semantic rust_use site linked to a build edge"
