@@ -233,16 +233,36 @@ async fn run(cli: Cli) -> Result<u8> {
                 store.start_build_attempt(&base_scan_id, &serde_json::to_value(&outcome.audit)?)?;
                 match outcome.audit.outcome {
                     BuildOutcomeKind::Completed => {
-                        let observation = outcome.rust_observation.as_ref().context(
-                            "security policy violation: completed Rust build produced no validated observation",
-                        )?;
+                        let Some(observation) = outcome.rust_observation.as_ref() else {
+                            store.finish_build_attempt(
+                                &outcome.audit.run_id,
+                                "security_failed",
+                                Some("rust-build-observation-missing"),
+                                false,
+                            )?;
+                            anyhow::bail!(
+                                "security policy violation: completed Rust build produced no validated observation"
+                            );
+                        };
                         let snapshot = store.load_snapshot(&base_scan_id)?;
-                        let ndjson = rust_build_protocol_ndjson(
+                        let ndjson = match rust_build_protocol_ndjson(
                             &snapshot,
                             &outcome.audit,
                             observation,
-                        )
-                        .context("security policy violation: Rust build observation could not be correlated")?;
+                        ) {
+                            Ok(ndjson) => ndjson,
+                            Err(error) => {
+                                store.finish_build_attempt(
+                                    &outcome.audit.run_id,
+                                    "security_failed",
+                                    Some("rust-build-correlation-failed"),
+                                    false,
+                                )?;
+                                anyhow::bail!(
+                                    "security policy violation: Rust build observation could not be correlated: {error:#}"
+                                );
+                            }
+                        };
                         if let Err(error) = stage_build_evidence(
                             &mut store,
                             &outcome.audit.run_id,

@@ -4,7 +4,11 @@ use assert_cmd::Command;
 use predicates::prelude::*;
 use serde_json::json;
 
-fn seed_safe_rust_scan(store_path: &std::path::Path, root: &std::path::Path) {
+fn seed_safe_rust_scan(
+    store_path: &std::path::Path,
+    root: &std::path::Path,
+    app_manifest_path: &str,
+) {
     let mut store = depgraph_store::Store::open(store_path).unwrap();
     store.start_scan("safe-rust-scan", root, false).unwrap();
     let coverage = json!({
@@ -53,7 +57,7 @@ fn seed_safe_rust_scan(store_path: &std::path::Path, root: &std::path::Path) {
             "display_name": "supervisor-fixture",
             "properties": {
                 "ecosystem": "cargo", "name": "supervisor-fixture", "version": "0.1.0",
-                "manifest_path": "Cargo.toml", "safe_marker": "preserved"
+                "manifest_path": app_manifest_path, "safe_marker": "preserved"
             }
         }),
         json!({
@@ -225,7 +229,7 @@ fn consented_build_mode_runs_project_code_only_in_the_supervised_staging_area() 
     .unwrap();
 
     let store_path = cache.path().join("graph.db");
-    seed_safe_rust_scan(&store_path, root.path());
+    seed_safe_rust_scan(&store_path, root.path(), "Cargo.toml");
 
     Command::cargo_bin("depgraph")
         .unwrap()
@@ -329,6 +333,67 @@ fn consented_build_mode_runs_project_code_only_in_the_supervised_staging_area() 
         .assert()
         .code(2)
         .stderr(predicate::str::contains("does not exist"));
+}
+
+#[test]
+fn failed_rust_build_correlation_finalizes_the_attempt_without_promoting_a_delta() {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let store_path = cache.path().join("graph.db");
+    fs::write(
+        root.path().join("Cargo.toml"),
+        "[package]\nname='correlation-fixture'\nversion='0.1.0'\nedition='2024'\n",
+    )
+    .unwrap();
+    fs::write(
+        root.path().join("Cargo.lock"),
+        "version = 4\n\n[[package]]\nname = \"correlation-fixture\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    fs::create_dir(root.path().join("src")).unwrap();
+    fs::write(root.path().join("src/lib.rs"), "pub fn fixture() {}\n").unwrap();
+    fs::write(
+        root.path().join("build.rs"),
+        "fn main() { let out = std::path::PathBuf::from(std::env::var_os(\"OUT_DIR\").unwrap()); std::fs::write(out.join(\"observed.txt\"), b\"observed\").unwrap(); }\n",
+    )
+    .unwrap();
+    seed_safe_rust_scan(&store_path, root.path(), "unrelated/Cargo.toml");
+
+    Command::cargo_bin("depgraph")
+        .unwrap()
+        .args([
+            "--store",
+            store_path.to_str().unwrap(),
+            "resolve",
+            "--build",
+            root.path().to_str().unwrap(),
+            "--allow-project-code",
+        ])
+        .assert()
+        .code(4)
+        .stderr(predicate::str::contains(
+            "Rust build observation could not be correlated",
+        ));
+
+    let store = depgraph_store::Store::open(&store_path).unwrap();
+    let audit = store.latest_build_audit().unwrap().unwrap();
+    let attempt = store.build_attempt(&audit.run_id).unwrap().unwrap();
+    assert_eq!(attempt.status, "security_failed");
+    assert_eq!(
+        attempt.error.as_deref(),
+        Some("rust-build-correlation-failed")
+    );
+    assert_eq!(
+        store.current_build_attempt_id("safe-rust-scan").unwrap(),
+        None
+    );
+    let snapshot = store.load_snapshot("safe-rust-scan").unwrap();
+    assert!(
+        snapshot
+            .nodes
+            .iter()
+            .all(|node| node.properties["build_generated"] != true)
+    );
 }
 
 #[test]
