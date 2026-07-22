@@ -1153,6 +1153,27 @@ mod tests {
 
         let request = create_build_execution_request(root.path())?;
         let outcome = supervise_build(&request.source_root, &request.plan).await?;
+        if outcome.audit.outcome != BuildOutcomeKind::Completed {
+            // This fixture contains no credentials. Re-run only its Cargo command
+            // without the supervisor so cross-platform CI can expose the native
+            // toolchain diagnostic instead of the intentionally generic audit code.
+            let (cargo, rustc) = resolve_active_rust_toolchain(root.path()).await?;
+            let run = BuildRunDirectories::create()?;
+            stage_workspace(root.path(), &run.workspace)?;
+            let environment = supervisor_environment(root.path(), &run, "cargo", Some(&rustc))?;
+            let diagnostic = std::process::Command::new(cargo)
+                .args(&request.plan.arguments)
+                .current_dir(&run.workspace)
+                .env_clear()
+                .envs(environment)
+                .output()?;
+            panic!(
+                "isolated Rust build failed: {:?}\nCargo stdout:\n{}\nCargo stderr:\n{}",
+                outcome.audit,
+                String::from_utf8_lossy(&diagnostic.stdout),
+                String::from_utf8_lossy(&diagnostic.stderr)
+            );
+        }
         assert_eq!(
             outcome.audit.outcome,
             BuildOutcomeKind::Completed,
