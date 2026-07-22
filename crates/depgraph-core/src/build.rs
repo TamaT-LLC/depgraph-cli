@@ -328,18 +328,17 @@ where
     let (_stderr, stderr_truncated) =
         finish_reader(stderr_task, "build stderr", &mut reader_errors).await?;
     let output_limit_exceeded = stdout_truncated || stderr_truncated;
-    let mut outcome = if reader_errors.is_empty() && !output_limit_exceeded {
-        outcome
-    } else {
-        BuildOutcomeKind::Failed
-    };
-    let mut diagnostic_code = if !reader_errors.is_empty() {
-        Some("build-output-reader-failed".to_owned())
-    } else if output_limit_exceeded {
-        Some("build-output-limit".to_owned())
-    } else {
-        diagnostic_code
-    };
+    let mut outcome = outcome;
+    let mut diagnostic_code = diagnostic_code;
+    if matches!(outcome, BuildOutcomeKind::Completed) {
+        if !reader_errors.is_empty() {
+            outcome = BuildOutcomeKind::Failed;
+            diagnostic_code = Some("build-output-reader-failed".to_owned());
+        } else if output_limit_exceeded {
+            outcome = BuildOutcomeKind::Failed;
+            diagnostic_code = Some("build-output-limit".to_owned());
+        }
+    }
     let validated_output_digest = if matches!(outcome, BuildOutcomeKind::Completed) {
         match digest_output_tree(&run.output, &stdout) {
             Ok(digest) => Some(digest),
@@ -858,19 +857,30 @@ mod tests {
         fs::write(
             root.path().join("hang.mjs"),
             format!(
-                "import {{ spawn }} from 'node:child_process'; spawn(process.execPath, ['-e', {escaped_descendant}], {{ stdio: 'ignore' }}); setInterval(() => {{}}, 1000);\n"
+                "import {{ spawn }} from 'node:child_process'; process.stdout.write('verbose output'); spawn(process.execPath, ['-e', {escaped_descendant}], {{ stdio: 'ignore' }}); setInterval(() => {{}}, 1000);\n"
             ),
         )?;
         let mut plan = node_plan(vec!["hang.mjs".to_owned()]);
         plan.timeout_seconds = 1;
+        plan.stdout_limit_bytes = 1;
         let timed_out = supervise_build(root.path(), &plan).await?;
         assert_eq!(timed_out.audit.outcome, BuildOutcomeKind::TimedOut);
+        assert!(timed_out.audit.stdout_truncated);
+        assert_eq!(
+            timed_out.audit.diagnostic_code.as_deref(),
+            Some("build-timeout")
+        );
 
         let cancelled = supervise_build_with_cancellation(root.path(), &plan, async {
             tokio::time::sleep(Duration::from_millis(100)).await;
         })
         .await?;
         assert_eq!(cancelled.audit.outcome, BuildOutcomeKind::Cancelled);
+        assert!(cancelled.audit.stdout_truncated);
+        assert_eq!(
+            cancelled.audit.diagnostic_code.as_deref(),
+            Some("build-cancelled")
+        );
         tokio::time::sleep(Duration::from_secs(2)).await;
         assert!(!root.path().join("DESCENDANT_SURVIVED").exists());
         Ok(())
