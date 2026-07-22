@@ -33,3 +33,10 @@ func TestAlwaysConditionUsesCanonicalBooleanAST(t *testing.T) {
 		t.Fatalf("unsupported true operator leaked: %s", encoded)
 	}
 }
+
+func TestContentHashUsesRawBytesAndExplicitAlgorithmPrefix(t *testing.T) {
+	const want = "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+	if got := contentHash([]byte("abc")); got != want {
+		t.Fatalf("contentHash(abc) = %q, want %q", got, want)
+	}
+}

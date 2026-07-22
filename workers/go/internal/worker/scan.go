@@ -649,6 +649,7 @@ func (s *scannerState) addPackagesAndFiles(sources []*sourceFile, moduleNodes ma
 				Properties: map[string]any{
 					"language": "go", "package_path": group.ImportPath, "package_name": source.PackageName,
 					"generated": source.Generated, "test": source.IsTest, "build_constraint": source.ConditionText,
+					"content_hash": contentHash(source.Source),
 				},
 			}
 			if err := addNode(s.nodes, fileNode); err != nil {
@@ -742,6 +743,7 @@ func (s *scannerState) addAssemblyBoundaries(
 			Properties: map[string]any{
 				"language": "go", "package_path": packageImportPath(s.root, *module, filepath.Dir(path)),
 				"assembly": true, "generated": false, "build_constraint": conditionText,
+				"content_hash": contentHash(sourceBytes),
 			},
 		}
 		if err := addNode(s.nodes, fileNode); err != nil {

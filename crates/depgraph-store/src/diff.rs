@@ -1,7 +1,12 @@
-use std::{cmp::Ordering, collections::BTreeSet};
+use std::{
+    cmp::Ordering,
+    collections::{BTreeMap, BTreeSet},
+};
 
 use anyhow::{Context, Result};
+use depgraph_protocol::canonical_json;
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 
 use crate::{
     CoverageRecord, EdgeRecord, EvidenceRecord, GraphSnapshot, NodeRecord, ProfileRecord,
@@ -23,6 +28,50 @@ pub struct RecordDiff<T> {
     pub added: Vec<T>,
     pub removed: Vec<T>,
     pub changed: Vec<ChangedRecord<T>>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum RenameConfidence {
+    Ambiguous,
+    Medium,
+    High,
+    Exact,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct NodeRenameEvidence {
+    pub node_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub package_owner: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_content_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub semantic_fingerprint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub canonical_identity: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_span: Option<Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub records: Vec<EvidenceRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct NodeRename {
+    pub kind: String,
+    pub old_id: String,
+    pub new_id: String,
+    pub confidence: RenameConfidence,
+    pub reasons: Vec<String>,
+    pub changed_fields: Vec<String>,
+    pub before: NodeRecord,
+    pub after: NodeRecord,
+    pub old_evidence: NodeRenameEvidence,
+    pub new_evidence: NodeRenameEvidence,
 }
 
 impl<T> Default for RecordDiff<T> {
@@ -53,6 +102,10 @@ pub struct GraphSnapshotDiff {
     pub profiles: RecordDiff<ProfileRecord>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub coverage: Option<ChangedRecord<CoverageRecord>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub renames: Vec<NodeRename>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rename_candidates: Vec<NodeRename>,
 }
 
 impl GraphSnapshotDiff {
@@ -67,6 +120,8 @@ impl GraphSnapshotDiff {
             evidence: RecordDiff::default(),
             profiles: RecordDiff::default(),
             coverage: None,
+            renames: Vec::new(),
+            rename_candidates: Vec::new(),
         }
     }
 
@@ -77,6 +132,8 @@ impl GraphSnapshotDiff {
             && self.evidence.is_empty()
             && self.profiles.is_empty()
             && self.coverage.is_none()
+            && self.renames.is_empty()
+            && self.rename_candidates.is_empty()
     }
 }
 
@@ -105,7 +162,18 @@ pub fn diff_graph_snapshots(
     from: GraphSnapshot,
     to: GraphSnapshot,
 ) -> Result<GraphSnapshotDiff> {
-    let nodes = diff_records(from.nodes, to.nodes, |record| record.id.clone())?;
+    let from_node_evidence = node_source_evidence(&from);
+    let to_node_evidence = node_source_evidence(&to);
+    let from_source_hashes = source_file_content_hashes(&from);
+    let to_source_hashes = source_file_content_hashes(&to);
+    let mut nodes = diff_records(from.nodes, to.nodes, |record| record.id.clone())?;
+    let (renames, rename_candidates) = detect_node_renames(
+        &mut nodes,
+        &from_node_evidence,
+        &to_node_evidence,
+        &from_source_hashes,
+        &to_source_hashes,
+    )?;
     let sites = diff_records(from.sites, to.sites, |record| record.id.clone())?;
     let edges = diff_records(from.edges, to.edges, |record| record.id.clone())?;
     let evidence = diff_records(from.evidence, to.evidence, evidence_identity)?;
@@ -130,6 +198,456 @@ pub fn diff_graph_snapshots(
         evidence,
         profiles,
         coverage,
+        renames,
+        rename_candidates,
+    })
+}
+
+const MAX_RENAME_CANDIDATE_PAIRS_PER_KEY: usize = 4_096;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum MatchStrength {
+    Medium,
+    High,
+    Exact,
+}
+
+#[derive(Debug, Default)]
+struct MatchSignals {
+    strength: Option<MatchStrength>,
+    reasons: BTreeSet<String>,
+}
+
+struct RenameSides<'a> {
+    removed: &'a [NodeRecord],
+    removed_evidence: &'a [NodeRenameEvidence],
+    added: &'a [NodeRecord],
+    added_evidence: &'a [NodeRenameEvidence],
+}
+
+impl MatchSignals {
+    fn add(&mut self, strength: MatchStrength, reason: &str) {
+        self.strength = Some(
+            self.strength
+                .map_or(strength, |current| current.max(strength)),
+        );
+        self.reasons.insert(reason.to_owned());
+    }
+}
+
+fn detect_node_renames(
+    nodes: &mut RecordDiff<NodeRecord>,
+    from_records: &BTreeMap<String, Vec<EvidenceRecord>>,
+    to_records: &BTreeMap<String, Vec<EvidenceRecord>>,
+    from_source_hashes: &BTreeMap<String, String>,
+    to_source_hashes: &BTreeMap<String, String>,
+) -> Result<(Vec<NodeRename>, Vec<NodeRename>)> {
+    let removed_evidence = nodes
+        .removed
+        .iter()
+        .map(|node| rename_evidence(node, from_records.get(&node.id), from_source_hashes))
+        .collect::<Vec<_>>();
+    let added_evidence = nodes
+        .added
+        .iter()
+        .map(|node| rename_evidence(node, to_records.get(&node.id), to_source_hashes))
+        .collect::<Vec<_>>();
+    let sides = RenameSides {
+        removed: &nodes.removed,
+        removed_evidence: &removed_evidence,
+        added: &nodes.added,
+        added_evidence: &added_evidence,
+    };
+    let mut signals = BTreeMap::<(usize, usize), MatchSignals>::new();
+
+    add_match_signal(
+        &sides,
+        &mut signals,
+        file_content_key,
+        MatchStrength::Exact,
+        "same_file_content_hash_and_package",
+    );
+    add_match_signal(
+        &sides,
+        &mut signals,
+        semantic_fingerprint_key,
+        MatchStrength::Exact,
+        "same_semantic_fingerprint_identity_shape_and_package",
+    );
+    add_match_signal(
+        &sides,
+        &mut signals,
+        semantic_source_content_key,
+        MatchStrength::Exact,
+        "same_source_content_semantic_identity_shape_name_and_package",
+    );
+    add_match_signal(
+        &sides,
+        &mut signals,
+        semantic_source_anchor_key,
+        MatchStrength::High,
+        "same_source_anchor_semantic_identity_shape_and_package",
+    );
+    add_match_signal(
+        &sides,
+        &mut signals,
+        local_or_anonymous_span_key,
+        MatchStrength::Medium,
+        "same_local_or_anonymous_origin_source_and_package",
+    );
+
+    let mut removed_degree = vec![0_usize; nodes.removed.len()];
+    let mut added_degree = vec![0_usize; nodes.added.len()];
+    for &(removed_index, added_index) in signals.keys() {
+        removed_degree[removed_index] += 1;
+        added_degree[added_index] += 1;
+    }
+
+    let mut renamed_removed = BTreeSet::new();
+    let mut renamed_added = BTreeSet::new();
+    let mut renames = Vec::new();
+    let mut candidates = Vec::new();
+    for ((removed_index, added_index), signal) in signals {
+        let before = &nodes.removed[removed_index];
+        let after = &nodes.added[added_index];
+        let unique = removed_degree[removed_index] == 1 && added_degree[added_index] == 1;
+        let strength = signal
+            .strength
+            .expect("a rename match always contains a signal");
+        let promoted = unique && strength >= MatchStrength::High;
+        let mut reasons = signal.reasons;
+        if removed_evidence[removed_index].source_span != added_evidence[added_index].source_span
+            && is_local_or_anonymous(before)
+            && is_local_or_anonymous(after)
+        {
+            reasons.insert("local_or_anonymous_source_span_changed".to_owned());
+        }
+        if !unique {
+            reasons.insert(
+                match (
+                    removed_degree[removed_index] > 1,
+                    added_degree[added_index] > 1,
+                ) {
+                    (true, true) => "ambiguous_many_to_many",
+                    (true, false) => "ambiguous_one_to_many",
+                    (false, true) => "ambiguous_many_to_one",
+                    (false, false) => unreachable!("non-unique match must have a branching side"),
+                }
+                .to_owned(),
+            );
+        }
+        let confidence = if unique {
+            match strength {
+                MatchStrength::Medium => RenameConfidence::Medium,
+                MatchStrength::High => RenameConfidence::High,
+                MatchStrength::Exact => RenameConfidence::Exact,
+            }
+        } else {
+            RenameConfidence::Ambiguous
+        };
+        let record = NodeRename {
+            kind: before.kind.clone(),
+            old_id: before.id.clone(),
+            new_id: after.id.clone(),
+            confidence,
+            reasons: reasons.into_iter().collect(),
+            changed_fields: changed_fields(before, after)?,
+            before: before.clone(),
+            after: after.clone(),
+            old_evidence: removed_evidence[removed_index].clone(),
+            new_evidence: added_evidence[added_index].clone(),
+        };
+        if promoted {
+            renamed_removed.insert(before.id.clone());
+            renamed_added.insert(after.id.clone());
+            renames.push(record);
+        } else {
+            candidates.push(record);
+        }
+    }
+    nodes
+        .removed
+        .retain(|node| !renamed_removed.contains(&node.id));
+    nodes.added.retain(|node| !renamed_added.contains(&node.id));
+    Ok((renames, candidates))
+}
+
+fn add_match_signal<F>(
+    sides: &RenameSides<'_>,
+    signals: &mut BTreeMap<(usize, usize), MatchSignals>,
+    key: F,
+    strength: MatchStrength,
+    reason: &str,
+) where
+    F: Fn(&NodeRecord, &NodeRenameEvidence) -> Option<String>,
+{
+    let mut removed_by_key = BTreeMap::<String, Vec<usize>>::new();
+    let mut added_by_key = BTreeMap::<String, Vec<usize>>::new();
+    for (index, node) in sides.removed.iter().enumerate() {
+        if let Some(key) = key(node, &sides.removed_evidence[index]) {
+            removed_by_key.entry(key).or_default().push(index);
+        }
+    }
+    for (index, node) in sides.added.iter().enumerate() {
+        if let Some(key) = key(node, &sides.added_evidence[index]) {
+            added_by_key.entry(key).or_default().push(index);
+        }
+    }
+    for (key, removed_indices) in removed_by_key {
+        let Some(added_indices) = added_by_key.get(&key) else {
+            continue;
+        };
+        if removed_indices
+            .len()
+            .checked_mul(added_indices.len())
+            .is_none_or(|pairs| pairs > MAX_RENAME_CANDIDATE_PAIRS_PER_KEY)
+        {
+            continue;
+        }
+        for removed_index in &removed_indices {
+            for added_index in added_indices {
+                signals
+                    .entry((*removed_index, *added_index))
+                    .or_default()
+                    .add(strength, reason);
+            }
+        }
+    }
+}
+
+fn file_content_key(node: &NodeRecord, evidence: &NodeRenameEvidence) -> Option<String> {
+    if node.kind != "file" {
+        return None;
+    }
+    Some(canonical_json(&json!({
+        "kind": node.kind,
+        "package_owner": evidence.package_owner.as_ref()?,
+        "content_hash": evidence.content_hash.as_ref()?,
+    })))
+}
+
+fn semantic_fingerprint_key(node: &NodeRecord, evidence: &NodeRenameEvidence) -> Option<String> {
+    if !is_semantic_rename_kind(node) {
+        return None;
+    }
+    Some(canonical_json(&json!({
+        "kind": node.kind,
+        "package_owner": evidence.package_owner.as_ref()?,
+        "semantic_fingerprint": evidence.semantic_fingerprint.as_ref()?,
+        "identity_shape": semantic_identity_shape(evidence.canonical_identity.as_ref()?)?,
+    })))
+}
+
+fn semantic_source_content_key(node: &NodeRecord, evidence: &NodeRenameEvidence) -> Option<String> {
+    if !is_semantic_rename_kind(node) {
+        return None;
+    }
+    let display_name = (node.kind != "route").then_some(node.display_name.as_str());
+    Some(canonical_json(&json!({
+        "kind": node.kind,
+        "display_name": display_name,
+        "package_owner": evidence.package_owner.as_ref()?,
+        "source_content_hash": evidence.source_content_hash.as_ref()?,
+        "identity_shape": semantic_identity_shape(evidence.canonical_identity.as_ref()?)?,
+    })))
+}
+
+fn semantic_source_anchor_key(node: &NodeRecord, evidence: &NodeRenameEvidence) -> Option<String> {
+    if !is_semantic_rename_kind(node) || is_local_or_anonymous(node) {
+        return None;
+    }
+    let span = evidence.source_span.as_ref()?.as_object()?;
+    Some(canonical_json(&json!({
+        "kind": node.kind,
+        "package_owner": evidence.package_owner.as_ref()?,
+        "identity_shape": semantic_identity_shape(evidence.canonical_identity.as_ref()?)?,
+        "source_path": evidence.source_path.as_ref()?,
+        "start_line": span.get("start_line")?,
+        "start_column": span.get("start_column")?,
+    })))
+}
+
+fn local_or_anonymous_span_key(node: &NodeRecord, evidence: &NodeRenameEvidence) -> Option<String> {
+    if !is_local_or_anonymous(node) {
+        return None;
+    }
+    Some(canonical_json(&json!({
+        "kind": node.kind,
+        "display_name": node.display_name,
+        "package_owner": evidence.package_owner.as_ref()?,
+        "identity_shape": semantic_identity_shape(evidence.canonical_identity.as_ref()?)?,
+        "source_path": evidence.source_path.as_ref()?,
+    })))
+}
+
+fn is_semantic_rename_kind(node: &NodeRecord) -> bool {
+    matches!(node.kind.as_str(), "symbol" | "type" | "route")
+}
+
+fn is_local_or_anonymous(node: &NodeRecord) -> bool {
+    node.kind == "symbol"
+        && node
+            .properties
+            .get("canonical_identity")
+            .and_then(|identity| identity.get("identity_kind"))
+            .and_then(Value::as_str)
+            .is_some_and(|kind| matches!(kind, "local" | "anonymous"))
+}
+
+fn semantic_identity_shape(identity: &Value) -> Option<Value> {
+    let mut shape = identity.as_object()?.clone();
+    for volatile in [
+        "resolver_identity",
+        "relative_path",
+        "route_pattern",
+        "span",
+    ] {
+        shape.remove(volatile);
+    }
+    Some(Value::Object(shape))
+}
+
+fn node_source_evidence(snapshot: &GraphSnapshot) -> BTreeMap<String, Vec<EvidenceRecord>> {
+    let mut owner_targets = BTreeMap::<(&str, &str), &str>::new();
+    for edge in &snapshot.edges {
+        if matches!(edge.kind.as_str(), "declares" | "contains") {
+            owner_targets.insert(("edge", edge.id.as_str()), edge.target.as_str());
+        }
+    }
+    let mut output = BTreeMap::<String, Vec<EvidenceRecord>>::new();
+    for record in &snapshot.evidence {
+        if let Some(target) =
+            owner_targets.get(&(record.owner_type.as_str(), record.owner_id.as_str()))
+        {
+            output
+                .entry((*target).to_owned())
+                .or_default()
+                .push(record.clone());
+        }
+    }
+    for records in output.values_mut() {
+        records.sort_by_key(evidence_identity);
+    }
+    output
+}
+
+fn source_file_content_hashes(snapshot: &GraphSnapshot) -> BTreeMap<String, String> {
+    let mut by_path = BTreeMap::<String, Option<String>>::new();
+    for node in snapshot.nodes.iter().filter(|node| node.kind == "file") {
+        let candidate = (|| {
+            let path = string_property(&node.properties, &["source_path", "path"])
+                .or_else(|| node.locator.strip_prefix("file://").map(str::to_owned))
+                .or_else(|| node.locator.strip_prefix("file:").map(str::to_owned))?;
+            let hash = fingerprint_property(&node.properties, &["content_hash", "content_digest"])?;
+            Some((path, hash))
+        })();
+        let Some((path, hash)) = candidate else {
+            continue;
+        };
+        match by_path.get_mut(&path) {
+            None => {
+                by_path.insert(path, Some(hash));
+            }
+            Some(existing) if existing.as_ref() == Some(&hash) => {}
+            Some(existing) => *existing = None,
+        }
+    }
+    by_path
+        .into_iter()
+        .filter_map(|(path, hash)| hash.map(|hash| (path, hash)))
+        .collect()
+}
+
+fn rename_evidence(
+    node: &NodeRecord,
+    records: Option<&Vec<EvidenceRecord>>,
+    source_hashes: &BTreeMap<String, String>,
+) -> NodeRenameEvidence {
+    let records = records.cloned().unwrap_or_default();
+    let canonical_identity = node.properties.get("canonical_identity").cloned();
+    let source_record = records.first();
+    let source_path = string_property(&node.properties, &["source_path", "path"])
+        .or_else(|| {
+            canonical_identity
+                .as_ref()
+                .and_then(|identity| string_property(identity, &["relative_path"]))
+        })
+        .or_else(|| source_record.map(|record| record.path.clone()));
+    let source_span = node
+        .properties
+        .get("source_span")
+        .cloned()
+        .or_else(|| {
+            canonical_identity
+                .as_ref()
+                .and_then(|identity| identity.get("span"))
+                .cloned()
+        })
+        .or_else(|| {
+            source_record.map(|record| {
+                json!({
+                    "start_line": record.start_line,
+                    "start_column": record.start_column,
+                    "end_line": record.end_line,
+                    "end_column": record.end_column,
+                })
+            })
+        });
+    NodeRenameEvidence {
+        node_id: node.id.clone(),
+        package_owner: package_owner(node),
+        content_hash: fingerprint_property(&node.properties, &["content_hash", "content_digest"]),
+        source_content_hash: source_path
+            .as_ref()
+            .and_then(|path| source_hashes.get(path))
+            .cloned(),
+        semantic_fingerprint: fingerprint_property(
+            &node.properties,
+            &["semantic_hash", "declaration_hash"],
+        ),
+        canonical_identity,
+        source_path,
+        source_span,
+        records,
+    }
+}
+
+fn fingerprint_property(value: &Value, fields: &[&str]) -> Option<String> {
+    string_property(value, fields).filter(|value| is_sha256_fingerprint(value))
+}
+
+fn is_sha256_fingerprint(value: &str) -> bool {
+    value.strip_prefix("sha256:").is_some_and(|digest| {
+        digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
+}
+
+fn package_owner(node: &NodeRecord) -> Option<String> {
+    for field in ["package_locator", "package_id", "package_path", "package"] {
+        if let Some(value) = node.properties.get(field).and_then(Value::as_str)
+            && !value.is_empty()
+        {
+            return Some(format!("{field}:{value}"));
+        }
+    }
+    node.properties
+        .get("canonical_identity")
+        .and_then(|identity| identity.get("package_locator"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(|value| format!("package_locator:{value}"))
+}
+
+fn string_property(value: &Value, fields: &[&str]) -> Option<String> {
+    fields.iter().find_map(|field| {
+        value
+            .get(*field)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
     })
 }
 
@@ -242,6 +760,11 @@ mod tests {
     use serde_json::json;
     use std::path::Path;
 
+    const HASH_A: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const HASH_B: &str = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const HASH_C: &str = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    const HASH_D: &str = "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+
     fn empty_snapshot(root: &str) -> GraphSnapshot {
         GraphSnapshot {
             scan: ScanRecord {
@@ -276,6 +799,65 @@ mod tests {
             locator: format!("src/{id}.ts"),
             display_name: id.to_owned(),
             properties: json!({"version": version}),
+        }
+    }
+
+    fn file_node(id: &str, path: &str, package: &str, content_hash: &str) -> NodeRecord {
+        NodeRecord {
+            id: id.to_owned(),
+            kind: "file".to_owned(),
+            locator: format!("file:{path}"),
+            display_name: path.to_owned(),
+            properties: json!({
+                "path": path,
+                "package_locator": package,
+                "content_hash": content_hash,
+            }),
+        }
+    }
+
+    fn semantic_node(
+        id: &str,
+        kind: &str,
+        display_name: &str,
+        canonical_identity: Value,
+        source_path: &str,
+        source_span: Value,
+        semantic_hash: Option<&str>,
+    ) -> NodeRecord {
+        let package_locator = canonical_identity["package_locator"].clone();
+        let mut properties = json!({
+            "package_locator": package_locator,
+            "canonical_identity": canonical_identity,
+            "source_path": source_path,
+            "source_span": source_span,
+        });
+        if let Some(semantic_hash) = semantic_hash {
+            properties["semantic_hash"] = json!(semantic_hash);
+        }
+        NodeRecord {
+            id: id.to_owned(),
+            kind: kind.to_owned(),
+            locator: format!("{kind}:{id}"),
+            display_name: display_name.to_owned(),
+            properties,
+        }
+    }
+
+    fn declaration_edge(id: &str, target: &str) -> EdgeRecord {
+        EdgeRecord {
+            id: id.to_owned(),
+            site_id: None,
+            source: "package:fixture".to_owned(),
+            target: target.to_owned(),
+            kind: "declares".to_owned(),
+            phase: "semantic".to_owned(),
+            environment: "any".to_owned(),
+            profile_id: "fixture:safe".to_owned(),
+            resolution_status: "resolved".to_owned(),
+            precision: "exact".to_owned(),
+            condition: json!({"op":"all","conditions":[]}),
+            generated: false,
         }
     }
 
@@ -423,6 +1005,26 @@ mod tests {
     }
 
     #[test]
+    fn rename_fingerprints_require_prefixed_lowercase_sha256() {
+        assert!(is_sha256_fingerprint(HASH_A));
+        assert!(!is_sha256_fingerprint(&HASH_A.to_uppercase()));
+        assert!(!is_sha256_fingerprint("sha256:short"));
+        assert!(!is_sha256_fingerprint(&"a".repeat(64)));
+    }
+
+    #[test]
+    fn conflicting_file_hashes_for_one_source_path_fail_closed_independent_of_order() {
+        let first = file_node("file:first", "src/shared.ts", "npm:fixture", HASH_A);
+        let second = file_node("file:second", "src/shared.ts", "npm:fixture", HASH_B);
+        let mut forward = empty_snapshot("/checkout/one");
+        forward.nodes = vec![first.clone(), second.clone()];
+        let mut reverse = empty_snapshot("/checkout/two");
+        reverse.nodes = vec![second, first];
+        assert!(source_file_content_hashes(&forward).is_empty());
+        assert!(source_file_content_hashes(&reverse).is_empty());
+    }
+
+    #[test]
     fn classifies_added_removed_and_structured_property_changes_canonically() -> Result<()> {
         let mut from = empty_snapshot("/checkout/one");
         from.nodes = vec![node("removed", 1), node("shared", 1)];
@@ -521,6 +1123,321 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("completed snapshot failed-attempt was not found"));
+        Ok(())
+    }
+
+    #[test]
+    fn promotes_a_unique_file_move_and_preserves_old_and_new_evidence() -> Result<()> {
+        let mut from = empty_snapshot("/checkout/one");
+        from.nodes = vec![file_node("file:old", "src/old.ts", "npm:fixture", HASH_A)];
+        from.edges = vec![declaration_edge("edge:old", "file:old")];
+        from.evidence = vec![evidence("edge:old", 0, "source", "old declaration")];
+        from.evidence[0].path = "src/old.ts".to_owned();
+
+        let mut to = empty_snapshot("/checkout/two");
+        to.nodes = vec![file_node("file:new", "src/new.ts", "npm:fixture", HASH_A)];
+        to.edges = vec![declaration_edge("edge:new", "file:new")];
+        to.evidence = vec![evidence("edge:new", 0, "source", "new declaration")];
+        to.evidence[0].path = "src/new.ts".to_owned();
+
+        let diff = diff_graph_snapshots("snapshot:from", "snapshot:to", from, to)?;
+        assert!(diff.nodes.added.is_empty());
+        assert!(diff.nodes.removed.is_empty());
+        assert_eq!(diff.renames.len(), 1);
+        assert_eq!(diff.renames[0].old_id, "file:old");
+        assert_eq!(diff.renames[0].new_id, "file:new");
+        assert_eq!(diff.renames[0].confidence, RenameConfidence::Exact);
+        assert_eq!(
+            diff.renames[0].reasons,
+            ["same_file_content_hash_and_package"]
+        );
+        assert_eq!(diff.renames[0].old_evidence.records[0].path, "src/old.ts");
+        assert_eq!(diff.renames[0].new_evidence.records[0].path, "src/new.ts");
+        Ok(())
+    }
+
+    #[test]
+    fn detects_symbol_type_and_route_renames_with_canonical_confidence() -> Result<()> {
+        let package = "npm:fixture";
+        let symbol = |id: &str, name: &str| {
+            semantic_node(
+                id,
+                "symbol",
+                name,
+                json!({
+                    "language":"typescript",
+                    "package_locator":package,
+                    "symbol_kind":"function",
+                    "identity_kind":"named",
+                    "resolver_identity":format!("{package}#{name}"),
+                }),
+                "src/service.ts",
+                json!({"start_line":10,"start_column":1,"end_line":12,"end_column":2}),
+                None,
+            )
+        };
+        let type_node = |id: &str, name: &str, path: &str| {
+            semantic_node(
+                id,
+                "type",
+                name,
+                json!({
+                    "language":"typescript",
+                    "package_locator":package,
+                    "type_kind":"interface",
+                    "resolver_identity":format!("{package}#{name}"),
+                }),
+                path,
+                json!({"start_line":1,"start_column":1,"end_line":3,"end_column":2}),
+                Some(HASH_B),
+            )
+        };
+        let route = |id: &str, pattern: &str| {
+            semantic_node(
+                id,
+                "route",
+                pattern,
+                json!({
+                    "framework":"next",
+                    "package_locator":package,
+                    "route_kind":"page",
+                    "environment":"server",
+                    "router_instance":"app",
+                    "route_pattern":pattern,
+                }),
+                "src/app/page.tsx",
+                json!({"start_line":1,"start_column":1,"end_line":20,"end_column":2}),
+                None,
+            )
+        };
+        let mut from = empty_snapshot("/checkout/one");
+        from.nodes = vec![
+            type_node("old:type", "Before", "src/types.ts"),
+            route("old:route", "/before"),
+            symbol("old:symbol", "before"),
+        ];
+        let mut to = empty_snapshot("/checkout/two");
+        to.nodes = vec![
+            symbol("new:symbol", "after"),
+            route("new:route", "/after"),
+            type_node("new:type", "After", "src/moved/types.ts"),
+        ];
+
+        let first = diff_graph_snapshots("snapshot:from", "snapshot:to", from.clone(), to.clone())?;
+        let second = diff_graph_snapshots("snapshot:from", "snapshot:to", from, to)?;
+        assert_eq!(first, second);
+        assert!(first.nodes.added.is_empty());
+        assert!(first.nodes.removed.is_empty());
+        assert_eq!(
+            first
+                .renames
+                .iter()
+                .map(|rename| (rename.kind.as_str(), rename.confidence))
+                .collect::<Vec<_>>(),
+            [
+                ("route", RenameConfidence::High),
+                ("symbol", RenameConfidence::High),
+                ("type", RenameConfidence::Exact),
+            ]
+        );
+        assert_eq!(
+            first.renames[2].reasons,
+            ["same_semantic_fingerprint_identity_shape_and_package"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn detects_semantic_moves_from_their_snapshot_source_file_hash() -> Result<()> {
+        let symbol = |id: &str, path: &str| {
+            semantic_node(
+                id,
+                "symbol",
+                "service",
+                json!({
+                    "language":"typescript",
+                    "package_locator":"npm:fixture",
+                    "symbol_kind":"function",
+                    "identity_kind":"named",
+                    "resolver_identity":format!("npm:fixture::{path}#service"),
+                }),
+                path,
+                json!({"start_line":1,"start_column":1,"end_line":3,"end_column":2}),
+                None,
+            )
+        };
+        let route = |id: &str, path: &str, pattern: &str| {
+            semantic_node(
+                id,
+                "route",
+                pattern,
+                json!({
+                    "framework":"next",
+                    "package_locator":"npm:fixture",
+                    "route_kind":"page",
+                    "environment":"server",
+                    "router_instance":"app",
+                    "route_pattern":pattern,
+                }),
+                path,
+                json!({"start_line":1,"start_column":1,"end_line":3,"end_column":2}),
+                None,
+            )
+        };
+        let mut from = empty_snapshot("/checkout/one");
+        from.nodes = vec![
+            file_node("file:old", "src/old.ts", "npm:fixture", HASH_A),
+            route("route:old", "src/old.ts", "/old"),
+            symbol("symbol:old", "src/old.ts"),
+        ];
+        let mut to = empty_snapshot("/checkout/two");
+        to.nodes = vec![
+            file_node("file:new", "src/new.ts", "npm:fixture", HASH_A),
+            route("route:new", "src/new.ts", "/new"),
+            symbol("symbol:new", "src/new.ts"),
+        ];
+
+        let diff = diff_graph_snapshots("snapshot:from", "snapshot:to", from, to)?;
+        assert!(diff.nodes.added.is_empty());
+        assert!(diff.nodes.removed.is_empty());
+        assert_eq!(diff.renames.len(), 3);
+        assert_eq!(diff.renames[1].kind, "route");
+        assert_eq!(diff.renames[2].kind, "symbol");
+        assert_eq!(diff.renames[2].confidence, RenameConfidence::Exact);
+        assert_eq!(
+            diff.renames[2].reasons,
+            ["same_source_content_semantic_identity_shape_name_and_package"]
+        );
+        assert_eq!(
+            diff.renames[2].old_evidence.source_content_hash.as_deref(),
+            Some(HASH_A)
+        );
+        assert_eq!(
+            diff.renames[2].new_evidence.source_content_hash.as_deref(),
+            Some(HASH_A)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn keeps_local_span_changes_as_reasoned_candidates() -> Result<()> {
+        let local = |id: &str, line: u64| {
+            semantic_node(
+                id,
+                "symbol",
+                "handler",
+                json!({
+                    "language":"typescript",
+                    "package_locator":"npm:fixture",
+                    "symbol_kind":"local_function",
+                    "identity_kind":"local",
+                    "enclosing_symbol":"symbol:owner",
+                    "relative_path":"src/service.ts",
+                    "span":{
+                        "start_line":line,"start_column":3,"end_line":line + 2,"end_column":4
+                    },
+                }),
+                "src/service.ts",
+                json!({"start_line":line,"start_column":3,"end_line":line + 2,"end_column":4}),
+                None,
+            )
+        };
+        let mut from = empty_snapshot("/checkout/one");
+        from.nodes = vec![local("local:old", 10)];
+        let mut to = empty_snapshot("/checkout/two");
+        to.nodes = vec![local("local:new", 20)];
+
+        let diff = diff_graph_snapshots("snapshot:from", "snapshot:to", from, to)?;
+        assert_eq!(diff.nodes.removed.len(), 1);
+        assert_eq!(diff.nodes.added.len(), 1);
+        assert!(diff.renames.is_empty());
+        assert_eq!(diff.rename_candidates.len(), 1);
+        assert_eq!(
+            diff.rename_candidates[0].confidence,
+            RenameConfidence::Medium
+        );
+        assert_eq!(
+            diff.rename_candidates[0].reasons,
+            [
+                "local_or_anonymous_source_span_changed",
+                "same_local_or_anonymous_origin_source_and_package",
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn copy_delete_add_and_ambiguous_fixtures_fail_closed() -> Result<()> {
+        let old = file_node("file:old", "old.ts", "npm:fixture", HASH_A);
+        let copy = file_node("file:copy", "copy.ts", "npm:fixture", HASH_A);
+        let mut copy_from = empty_snapshot("/checkout/one");
+        copy_from.nodes = vec![old.clone()];
+        let mut copy_to = empty_snapshot("/checkout/two");
+        copy_to.nodes = vec![old.clone(), copy];
+        let copy_diff =
+            diff_graph_snapshots("snapshot:copy-from", "snapshot:copy-to", copy_from, copy_to)?;
+        assert_eq!(copy_diff.nodes.added[0].id, "file:copy");
+        assert!(copy_diff.renames.is_empty());
+        assert!(copy_diff.rename_candidates.is_empty());
+
+        let mut delete_add_from = empty_snapshot("/checkout/one");
+        delete_add_from.nodes = vec![file_node(
+            "file:deleted",
+            "deleted.ts",
+            "npm:fixture",
+            HASH_B,
+        )];
+        let mut delete_add_to = empty_snapshot("/checkout/two");
+        delete_add_to.nodes = vec![file_node("file:added", "added.ts", "npm:fixture", HASH_C)];
+        let delete_add = diff_graph_snapshots(
+            "snapshot:delete",
+            "snapshot:add",
+            delete_add_from,
+            delete_add_to,
+        )?;
+        assert_eq!(delete_add.nodes.removed.len(), 1);
+        assert_eq!(delete_add.nodes.added.len(), 1);
+        assert!(delete_add.renames.is_empty());
+        assert!(delete_add.rename_candidates.is_empty());
+
+        let mut ambiguous_from = empty_snapshot("/checkout/one");
+        ambiguous_from.nodes = vec![
+            file_node("old:a", "a.ts", "npm:fixture", HASH_C),
+            file_node("old:b", "b.ts", "npm:fixture", HASH_D),
+            file_node("old:c", "c.ts", "npm:fixture", HASH_D),
+        ];
+        let mut ambiguous_to = empty_snapshot("/checkout/two");
+        ambiguous_to.nodes = vec![
+            file_node("new:a", "a1.ts", "npm:fixture", HASH_C),
+            file_node("new:b", "a2.ts", "npm:fixture", HASH_C),
+            file_node("new:c", "c.ts", "npm:fixture", HASH_D),
+        ];
+        let ambiguous = diff_graph_snapshots(
+            "snapshot:ambiguous-from",
+            "snapshot:ambiguous-to",
+            ambiguous_from,
+            ambiguous_to,
+        )?;
+        assert!(ambiguous.renames.is_empty());
+        assert_eq!(ambiguous.nodes.removed.len(), 3);
+        assert_eq!(ambiguous.nodes.added.len(), 3);
+        assert_eq!(ambiguous.rename_candidates.len(), 4);
+        assert!(
+            ambiguous
+                .rename_candidates
+                .iter()
+                .all(|candidate| candidate.confidence == RenameConfidence::Ambiguous)
+        );
+        assert!(ambiguous.rename_candidates.iter().any(|candidate| {
+            candidate
+                .reasons
+                .contains(&"ambiguous_one_to_many".to_owned())
+        }));
+        assert!(ambiguous.rename_candidates.iter().any(|candidate| {
+            candidate
+                .reasons
+                .contains(&"ambiguous_many_to_one".to_owned())
+        }));
         Ok(())
     }
 

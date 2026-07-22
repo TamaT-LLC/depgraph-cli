@@ -24,6 +24,10 @@ export function stableId(namespace: string, identity: JsonValue): string {
   return `${namespace}:sha256:${digest}`;
 }
 
+export function contentHash(contents: string | Uint8Array): string {
+  return `sha256:${createHash("sha256").update(contents).digest("hex")}`;
+}
+
 export function compareById<T extends { id: string }>(left: T, right: T): number {
   return compareUtf8(left.id, right.id);
 }

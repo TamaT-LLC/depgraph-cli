@@ -110,6 +110,11 @@ test("worker emits deterministic protocol graph without executing project code",
   const completed = first.events.at(-1)?.coverage;
   assert.ok(nodes.some((node) => node.kind === "workspace"));
   assert.ok(nodes.some((node) => node.kind === "unknown_target"));
+  assert.ok(nodes.some((node) => (
+    node.kind === "file"
+    && typeof node.properties.package_locator === "string"
+    && /^sha256:[0-9a-f]{64}$/u.test(node.properties.content_hash)
+  )));
   assert.ok(nodes.some((node) => node.kind === "route" && node.locator.includes("next") && node.locator.endsWith("/shop/products/$id")));
   assert.ok(nodes.some((node) => node.kind === "route" && node.locator.includes("astro") && node.locator.endsWith("/docs/blog/$slug")));
   assert.ok(nodes.some((node) => node.kind === "route" && node.locator.includes("tanstack-router") && node.locator.endsWith("/router/posts/$postId")));

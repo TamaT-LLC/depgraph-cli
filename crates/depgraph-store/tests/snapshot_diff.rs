@@ -5,11 +5,31 @@ use depgraph_store::Store;
 use serde_json::json;
 
 fn persist_snapshot(store: &mut Store, scan_id: &str, version: u64) -> Result<String> {
+    persist_snapshot_with_node(
+        store,
+        scan_id,
+        &format!("revision-{version}"),
+        json!({
+            "id": "node:shared",
+            "kind": "file",
+            "locator": "src/shared.ts",
+            "display_name": "shared",
+            "properties": {"version": version}
+        }),
+    )
+}
+
+fn persist_snapshot_with_node(
+    store: &mut Store,
+    scan_id: &str,
+    revision: &str,
+    node_record: serde_json::Value,
+) -> Result<String> {
     store.start_scan_with_revision(
         scan_id,
         Path::new("/portable/project"),
         false,
-        Some(&format!("revision-{version}")),
+        Some(revision),
     )?;
     let common = |event: &str, seq: u64| {
         json!({
@@ -49,13 +69,7 @@ fn persist_snapshot(store: &mut Store, scan_id: &str, version: u64) -> Result<St
         "properties": {}
     });
     let mut node = common("node_upsert", 3);
-    node["node"] = json!({
-        "id": "node:shared",
-        "kind": "file",
-        "locator": "src/shared.ts",
-        "display_name": "shared",
-        "properties": {"version": version}
-    });
+    node["node"] = node_record;
     let mut profile_completed = common("profile_completed", 4);
     profile_completed["profile_id"] = json!("fixture:safe");
     profile_completed["coverage"] = coverage.clone();
@@ -97,5 +111,56 @@ fn sqlite_completed_snapshot_diff_is_deterministic_and_rejects_failed_attempt_id
             .to_string()
             .contains("completed snapshot failed-attempt was not found")
     );
+    Ok(())
+}
+
+#[test]
+fn sqlite_completed_snapshot_file_rename_is_canonical_and_not_delete_add() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let store_path = temp.path().join("graph.db");
+    let mut store = Store::open(&store_path)?;
+    let first_id = persist_snapshot_with_node(
+        &mut store,
+        "rename-first",
+        "revision-rename-first",
+        json!({
+            "id": "file:old",
+            "kind": "file",
+            "locator": "file:src/old.ts",
+            "display_name": "src/old.ts",
+            "properties": {
+                "path": "src/old.ts",
+                "package_locator": "npm:fixture",
+                "content_hash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            }
+        }),
+    )?;
+    let second_id = persist_snapshot_with_node(
+        &mut store,
+        "rename-second",
+        "revision-rename-second",
+        json!({
+            "id": "file:new",
+            "kind": "file",
+            "locator": "file:src/new.ts",
+            "display_name": "src/new.ts",
+            "properties": {
+                "path": "src/new.ts",
+                "package_locator": "npm:fixture",
+                "content_hash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            }
+        }),
+    )?;
+
+    let first = serde_json::to_vec(&store.diff_completed_snapshots(&first_id, &second_id)?)?;
+    let second = serde_json::to_vec(&store.diff_completed_snapshots(&first_id, &second_id)?)?;
+    assert_eq!(first, second);
+    let diff: serde_json::Value = serde_json::from_slice(&first)?;
+    assert_eq!(diff["nodes"]["added"], json!([]));
+    assert_eq!(diff["nodes"]["removed"], json!([]));
+    assert_eq!(diff["renames"][0]["old_id"], "file:old");
+    assert_eq!(diff["renames"][0]["new_id"], "file:new");
+    assert_eq!(diff["renames"][0]["confidence"], "exact");
+    assert!(diff.get("rename_candidates").is_none());
     Ok(())
 }
