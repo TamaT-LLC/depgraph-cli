@@ -11,7 +11,9 @@ use depgraph_protocol::{
     Profile, ProfileCompleted, ProfileDeclared, ProtocolEvent, ResolutionStatus, ScanCompleted,
     ScanStarted, build_edge_stable_id, build_site_stable_id, stable_id_from_value,
 };
-use depgraph_store::{GraphSnapshot, NodeRecord, SiteRecord};
+use depgraph_store::{
+    GraphSnapshot, NodeRecord, ProfileRecord, SiteRecord, canonical_effective_input_id,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
@@ -877,6 +879,33 @@ fn node_package_name(node: &NodeRecord) -> Option<&str> {
     node.properties.get("package").and_then(Value::as_str)
 }
 
+fn rust_build_parent_profile<'a>(
+    snapshot: &'a GraphSnapshot,
+    audit: &BuildAudit,
+) -> Result<&'a ProfileRecord> {
+    let mut candidates = snapshot
+        .profiles
+        .iter()
+        .filter(|profile| profile.language == "rust" && profile.id != audit.profile_id)
+        .filter(|profile| {
+            profile
+                .properties
+                .get("profile_phase")
+                .and_then(Value::as_str)
+                != Some("build")
+        })
+        .collect::<Vec<_>>();
+    if let Some(target) = audit.target.as_deref() {
+        candidates.retain(|profile| profile.target.as_deref() == Some(target));
+    }
+    candidates.sort_by(|left, right| left.id.cmp(&right.id));
+    match candidates.as_slice() {
+        [profile] => Ok(*profile),
+        [] => bail!("Rust build observation has no compatible safe parent profile"),
+        _ => bail!("Rust build observation has multiple compatible safe parent profiles"),
+    }
+}
+
 pub fn rust_build_protocol_events(
     snapshot: &GraphSnapshot,
     audit: &BuildAudit,
@@ -892,6 +921,8 @@ pub fn rust_build_protocol_events(
     {
         bail!("Rust build observation contract is invalid");
     }
+    let parent_profile = rust_build_parent_profile(snapshot, audit)?;
+    let effective_input_id = canonical_effective_input_id(parent_profile);
     let validated_output_digest = audit_output_digest(audit)?.to_owned();
     let observed_digest = observation_digest(observation)?;
     let observation_path = format!(".depgraph/rust-build/{observed_digest}.json");
@@ -1327,16 +1358,35 @@ pub fn rust_build_protocol_events(
         )?;
     }
 
+    let mut environment = parent_profile
+        .environment
+        .as_object()
+        .cloned()
+        .context("Rust safe parent profile environment must be an object")?
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+    environment.insert("phase".to_owned(), json!("build"));
     let profile = Profile {
         id: audit.profile_id.clone(),
         language: "rust".to_owned(),
         toolchain: audit.toolchain_version.clone().map(Value::String),
         command: Some(audit.command_arguments.join(" ")),
-        target: audit.target.clone(),
-        features: vec![RUST_BUILD_CAPABILITY.to_owned()],
-        environment: BTreeMap::from([("mode".to_owned(), json!("build"))]),
+        target: audit
+            .target
+            .clone()
+            .or_else(|| parent_profile.target.clone()),
+        features: parent_profile.features.clone(),
+        environment,
         source_revision: None,
         properties: BTreeMap::from([
+            (
+                "profile_contract".to_owned(),
+                json!("phase-parent-effective-v1"),
+            ),
+            ("profile_phase".to_owned(), json!("build")),
+            ("parent_profile_id".to_owned(), json!(parent_profile.id)),
+            ("effective_input_id".to_owned(), json!(effective_input_id)),
+            ("build_capability".to_owned(), json!(RUST_BUILD_CAPABILITY)),
             ("observer".to_owned(), json!(RUST_BUILD_OBSERVER)),
             (
                 "observer_version".to_owned(),
@@ -1644,7 +1694,21 @@ mod tests {
                 project_code_executed: false,
                 error: None,
             },
-            profiles: Vec::new(),
+            profiles: vec![ProfileRecord {
+                id: "rust:safe".to_owned(),
+                language: "rust".to_owned(),
+                toolchain: Some(json!({"adapter":"rust-safe"})),
+                command: Some("check".to_owned()),
+                target: Some("x86_64-unknown-linux-gnu".to_owned()),
+                features: vec!["default".to_owned()],
+                environment: json!({"safe_mode":true}),
+                properties: json!({"effective_target":"x86_64-unknown-linux-gnu"}),
+                coverage: Some(CoverageRecord {
+                    profiles: 1,
+                    completeness: vec!["syntax-complete".to_owned()],
+                    ..CoverageRecord::default()
+                }),
+            }],
             nodes: vec![
                 base_node(
                     "package:app",
@@ -1728,6 +1792,7 @@ mod tests {
                 project_code_executed: false,
                 ..CoverageRecord::default()
             },
+            profile_matrix: depgraph_store::ProfileMatrixRecord::default(),
         }
     }
 

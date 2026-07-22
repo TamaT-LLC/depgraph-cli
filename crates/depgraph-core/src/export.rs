@@ -1,4 +1,4 @@
-use std::fmt::Write;
+use std::{collections::BTreeMap, fmt::Write};
 
 use anyhow::Result;
 use depgraph_store::GraphSnapshot;
@@ -58,12 +58,14 @@ fn export_json(snapshot: &GraphSnapshot) -> Result<String> {
             "diagnostics":snapshot.diagnostics,
             "file_coverage":snapshot.file_coverage,
             "coverage":snapshot.coverage,
+            "profile_matrix":snapshot.profile_matrix,
         }
     }))?)
 }
 
 fn export_dot(snapshot: &GraphSnapshot) -> String {
     let mut output = String::from("digraph depgraph {\n  rankdir=LR;\n");
+    let observation_status = edge_observation_status(snapshot);
     for node in &snapshot.nodes {
         let _ = writeln!(
             output,
@@ -74,14 +76,19 @@ fn export_dot(snapshot: &GraphSnapshot) -> String {
         );
     }
     for edge in &snapshot.edges {
+        let observed = observation_status
+            .get(edge.id.as_str())
+            .map(|status| format!("; observed={status}"))
+            .unwrap_or_default();
         let label = format!(
-            "{} [{}; {}; {}; {}; {}]",
+            "{} [{}; {}; {}; {}; {}{}]",
             edge.kind,
             edge.phase,
             edge.resolution_status,
             edge.precision,
             edge.profile_id,
-            render_condition(&edge.condition)
+            render_condition(&edge.condition),
+            observed,
         );
         let _ = writeln!(
             output,
@@ -97,6 +104,7 @@ fn export_dot(snapshot: &GraphSnapshot) -> String {
 
 fn export_mermaid(snapshot: &GraphSnapshot) -> String {
     let mut output = String::from("flowchart LR\n");
+    let observation_status = edge_observation_status(snapshot);
     for (index, node) in snapshot.nodes.iter().enumerate() {
         let _ = writeln!(
             output,
@@ -116,19 +124,39 @@ fn export_mermaid(snapshot: &GraphSnapshot) -> String {
             indexes.get(edge.source.as_str()),
             indexes.get(edge.target.as_str()),
         ) {
+            let observed = observation_status
+                .get(edge.id.as_str())
+                .map(|status| format!("; observed={status}"))
+                .unwrap_or_default();
             let _ = writeln!(
                 output,
-                "  n{source} -->|\"{} [{}; {}; {}; {}; {}]\"| n{target}",
+                "  n{source} -->|\"{} [{}; {}; {}; {}; {}{}]\"| n{target}",
                 mermaid_escape(&edge.kind),
                 mermaid_escape(&edge.phase),
                 mermaid_escape(&edge.resolution_status),
                 mermaid_escape(&edge.precision),
                 mermaid_escape(&edge.profile_id),
-                mermaid_escape(&render_condition(&edge.condition))
+                mermaid_escape(&render_condition(&edge.condition)),
+                mermaid_escape(&observed)
             );
         }
     }
     output
+}
+
+fn edge_observation_status(snapshot: &GraphSnapshot) -> BTreeMap<&str, &str> {
+    snapshot
+        .profile_matrix
+        .correlations
+        .iter()
+        .flat_map(|correlation| {
+            correlation
+                .edge_ids_by_phase
+                .values()
+                .flatten()
+                .map(move |edge_id| (edge_id.as_str(), correlation.status.as_str()))
+        })
+        .collect()
 }
 
 fn dot_escape(value: &str) -> String {
@@ -177,6 +205,7 @@ mod tests {
             file_coverage: Vec::new(),
             adapter_logs: Vec::new(),
             coverage: CoverageRecord::default(),
+            profile_matrix: depgraph_store::ProfileMatrixRecord::default(),
         };
         assert_eq!(
             export(&snapshot, ExportFormat::Dot)?,

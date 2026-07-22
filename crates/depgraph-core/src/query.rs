@@ -2,7 +2,11 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
 use anyhow::{Context, Result, bail};
 use depgraph_protocol::Condition;
-use depgraph_store::{EdgeRecord, EvidenceRecord, GraphSnapshot, NodeRecord, SiteRecord};
+use depgraph_store::{
+    EdgeRecord, EvidenceRecord, GraphSnapshot, NodeRecord, PhaseCoverageRecord,
+    ProfileCorrelationRecord, ProfileMatrixRecord, SiteRecord,
+    phase_coverage_for_effective_profile,
+};
 use petgraph::{algo::tarjan_scc, graph::DiGraph};
 use serde::Serialize;
 
@@ -38,6 +42,10 @@ pub struct PathStep {
     pub edge: EdgeRecord,
     pub condition_text: String,
     pub evidence: Vec<EvidenceRecord>,
+    pub effective_profile_id: Option<String>,
+    pub correlation_status: Option<String>,
+    pub observed_difference_reasons: Vec<String>,
+    pub phase_coverage: BTreeMap<String, PhaseCoverageRecord>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -58,6 +66,10 @@ pub struct CycleResult {
 pub struct UnresolvedResult {
     pub site: SiteRecord,
     pub evidence: Vec<EvidenceRecord>,
+    pub effective_profile_id: Option<String>,
+    pub correlation_status: Option<String>,
+    pub observed_difference_reasons: Vec<String>,
+    pub phase_coverage: BTreeMap<String, PhaseCoverageRecord>,
 }
 
 pub fn resolve_selector(snapshot: &GraphSnapshot, selector: &str) -> Result<NodeRecord> {
@@ -180,12 +192,16 @@ pub fn traverse(
         .collect();
     let edges: Vec<_> = selected_edges.into_values().collect();
     let evidence = edge_evidence_map(snapshot);
+    let correlations = edge_correlation_map(&snapshot.profile_matrix);
     let steps = edges
         .iter()
-        .map(|edge| PathStep {
-            edge: edge.clone(),
-            condition_text: render_condition(&edge.condition),
-            evidence: evidence.get(&edge.id).cloned().unwrap_or_default(),
+        .map(|edge| {
+            path_step(
+                snapshot,
+                edge,
+                &evidence,
+                correlations.get(edge.id.as_str()).copied(),
+            )
         })
         .collect();
     Ok(TraversalResult {
@@ -234,17 +250,19 @@ pub fn why(snapshot: &GraphSnapshot, from: &str, to: &str) -> Result<WhyResult> 
         });
     }
     let evidence_map = edge_evidence_map(snapshot);
+    let correlations = edge_correlation_map(&snapshot.profile_matrix);
     let mut current = to.id.clone();
     let mut reversed = Vec::new();
     while current != from.id {
         let edge = predecessor
             .get(&current)
             .with_context(|| format!("path reconstruction failed at {current}"))?;
-        reversed.push(PathStep {
-            edge: (*edge).clone(),
-            condition_text: render_condition(&edge.condition),
-            evidence: evidence_map.get(&edge.id).cloned().unwrap_or_default(),
-        });
+        reversed.push(path_step(
+            snapshot,
+            edge,
+            &evidence_map,
+            correlations.get(edge.id.as_str()).copied(),
+        ));
         current = edge.source.clone();
     }
     reversed.reverse();
@@ -368,15 +386,88 @@ pub fn unresolved(snapshot: &GraphSnapshot) -> Vec<UnresolvedResult> {
                 map
             },
         );
+    let correlations = site_correlation_map(&snapshot.profile_matrix);
     snapshot
         .sites
         .iter()
         .filter(|site| site.resolution_status == "unresolved")
-        .map(|site| UnresolvedResult {
-            site: site.clone(),
-            evidence: evidence.get(&site.id).cloned().unwrap_or_default(),
+        .map(|site| {
+            let correlation = correlations.get(site.id.as_str()).copied();
+            UnresolvedResult {
+                site: site.clone(),
+                evidence: evidence.get(&site.id).cloned().unwrap_or_default(),
+                effective_profile_id: correlation
+                    .map(|correlation| correlation.effective_profile_id.clone()),
+                correlation_status: correlation.map(|correlation| correlation.status.clone()),
+                observed_difference_reasons: correlation
+                    .map(|correlation| correlation.difference_reasons.clone())
+                    .unwrap_or_default(),
+                phase_coverage: correlation
+                    .map(|correlation| {
+                        phase_coverage_for_effective_profile(
+                            &snapshot.profile_matrix,
+                            &correlation.effective_profile_id,
+                        )
+                    })
+                    .unwrap_or_default(),
+            }
         })
         .collect()
+}
+
+fn edge_correlation_map(matrix: &ProfileMatrixRecord) -> BTreeMap<&str, &ProfileCorrelationRecord> {
+    matrix
+        .correlations
+        .iter()
+        .flat_map(|correlation| {
+            correlation
+                .edge_ids_by_phase
+                .values()
+                .flatten()
+                .map(move |edge_id| (edge_id.as_str(), correlation))
+        })
+        .collect()
+}
+
+fn site_correlation_map(matrix: &ProfileMatrixRecord) -> BTreeMap<&str, &ProfileCorrelationRecord> {
+    matrix
+        .correlations
+        .iter()
+        .flat_map(|correlation| {
+            correlation
+                .site_ids_by_phase
+                .values()
+                .flatten()
+                .map(move |site_id| (site_id.as_str(), correlation))
+        })
+        .collect()
+}
+
+fn path_step(
+    snapshot: &GraphSnapshot,
+    edge: &EdgeRecord,
+    evidence: &BTreeMap<String, Vec<EvidenceRecord>>,
+    correlation: Option<&ProfileCorrelationRecord>,
+) -> PathStep {
+    PathStep {
+        edge: edge.clone(),
+        condition_text: render_condition(&edge.condition),
+        evidence: evidence.get(&edge.id).cloned().unwrap_or_default(),
+        effective_profile_id: correlation
+            .map(|correlation| correlation.effective_profile_id.clone()),
+        correlation_status: correlation.map(|correlation| correlation.status.clone()),
+        observed_difference_reasons: correlation
+            .map(|correlation| correlation.difference_reasons.clone())
+            .unwrap_or_default(),
+        phase_coverage: correlation
+            .map(|correlation| {
+                phase_coverage_for_effective_profile(
+                    &snapshot.profile_matrix,
+                    &correlation.effective_profile_id,
+                )
+            })
+            .unwrap_or_default(),
+    }
 }
 
 pub fn render_condition(value: &serde_json::Value) -> String {
@@ -533,6 +624,7 @@ mod tests {
             file_coverage: Vec::new(),
             adapter_logs: Vec::new(),
             coverage: CoverageRecord::default(),
+            profile_matrix: depgraph_store::ProfileMatrixRecord::default(),
         }
     }
 

@@ -395,6 +395,43 @@ async fn run(cli: Cli) -> Result<u8> {
                         scan.coverage.files_skipped,
                         scan.coverage.unsupported_syntax
                     );
+                    println!(
+                        "profile matrix: {} effective profiles ({} matched, {} additional, {} conflicts, {} unobserved)",
+                        scan.profile_matrix.entries.len(),
+                        scan.profile_matrix
+                            .difference_counts
+                            .get("matched")
+                            .copied()
+                            .unwrap_or(0),
+                        scan.profile_matrix
+                            .difference_counts
+                            .get("additional")
+                            .copied()
+                            .unwrap_or(0),
+                        scan.profile_matrix
+                            .difference_counts
+                            .get("conflict")
+                            .copied()
+                            .unwrap_or(0),
+                        scan.profile_matrix
+                            .difference_counts
+                            .get("unobserved")
+                            .copied()
+                            .unwrap_or(0),
+                    );
+                    for (phase, coverage) in &scan.profile_matrix.phase_coverage {
+                        println!(
+                            "phase {phase}: {} profiles, {} sites, {} edges, {} evidence ({} resolved, {} candidates, {} external, {} unresolved)",
+                            coverage.profile_ids.len(),
+                            coverage.sites,
+                            coverage.edges,
+                            coverage.evidence,
+                            coverage.resolved,
+                            coverage.candidates,
+                            coverage.external,
+                            coverage.unresolved,
+                        );
+                    }
                     for profile in scan.profiles {
                         let profile_coverage = profile
                             .coverage
@@ -503,6 +540,19 @@ async fn run(cli: Cli) -> Result<u8> {
             print_structured("unresolved", scan_id, &result, json)?;
             if !json {
                 for unresolved in result {
+                    let effective_profile = unresolved
+                        .effective_profile_id
+                        .as_deref()
+                        .unwrap_or("unavailable");
+                    let observed_status = unresolved
+                        .correlation_status
+                        .as_deref()
+                        .unwrap_or("unavailable");
+                    let difference_reasons = if unresolved.observed_difference_reasons.is_empty() {
+                        "none".to_owned()
+                    } else {
+                        unresolved.observed_difference_reasons.join(",")
+                    };
                     let site = unresolved.site;
                     let span = unresolved.evidence.first().map(|evidence| {
                         format!(
@@ -515,11 +565,14 @@ async fn run(cli: Cli) -> Result<u8> {
                         )
                     });
                     println!(
-                        "{} {} at {} profile={} condition={} span={} ({})",
+                        "{} {} at {} profile={} effective_profile={} observed={} differences={} condition={} span={} ({})",
                         site.kind,
                         site.specifier.unwrap_or_default(),
                         site.source,
                         site.profile_id,
+                        effective_profile,
+                        observed_status,
+                        difference_reasons,
                         render_condition(&site.condition),
                         span.unwrap_or_else(|| "unknown".to_owned()),
                         site.reason
@@ -618,6 +671,7 @@ fn print_path_steps(steps: &[depgraph_core::query::PathStep]) {
             edge.target
         );
         println!("    condition: {}", step.condition_text);
+        print_profile_correlation(step, "    ");
         print_evidence(&step.evidence, "    ");
     }
 }
@@ -634,7 +688,30 @@ fn print_why_steps(steps: &[depgraph_core::query::PathStep]) {
             step.edge.target
         );
         println!("      condition: {}", step.condition_text);
+        print_profile_correlation(step, "      ");
         print_evidence(&step.evidence, "      ");
+    }
+}
+
+fn print_profile_correlation(step: &depgraph_core::query::PathStep, indent: &str) {
+    if let (Some(effective_profile), Some(status)) = (
+        step.effective_profile_id.as_deref(),
+        step.correlation_status.as_deref(),
+    ) {
+        let differences = if step.observed_difference_reasons.is_empty() {
+            "none".to_owned()
+        } else {
+            step.observed_difference_reasons.join(",")
+        };
+        println!(
+            "{indent}effective profile {effective_profile}: observed={status}; differences={differences}"
+        );
+        for (phase, coverage) in &step.phase_coverage {
+            println!(
+                "{indent}phase {phase}: {} sites/{} edges/{} evidence",
+                coverage.sites, coverage.edges, coverage.evidence
+            );
+        }
     }
 }
 

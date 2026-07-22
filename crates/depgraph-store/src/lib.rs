@@ -12,6 +12,16 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+mod profile_matrix;
+
+use profile_matrix::refresh_profile_matrix;
+pub use profile_matrix::{
+    PROFILE_MATRIX_SCHEMA_VERSION, PhaseCoverageRecord, ProfileAxisConflictRecord,
+    ProfileCorrelationRecord, ProfileMatrixEntryRecord, ProfileMatrixRecord,
+    canonical_effective_input_id, correlation_for_edge, correlation_for_site,
+    declared_effective_input_id, declared_parent_profile_id, phase_coverage_for_effective_profile,
+};
+
 const SCHEMA_VERSION: i64 = 7;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -196,6 +206,7 @@ pub struct GraphSnapshot {
     pub file_coverage: Vec<FileCoverageRecord>,
     pub adapter_logs: Vec<AdapterLogRecord>,
     pub coverage: CoverageRecord,
+    pub profile_matrix: ProfileMatrixRecord,
 }
 
 pub struct Store {
@@ -1339,7 +1350,7 @@ impl Store {
             scan.project_code_executed,
             stored_coverage,
         )?;
-        Ok(GraphSnapshot {
+        let mut snapshot = GraphSnapshot {
             scan,
             profiles,
             nodes,
@@ -1350,7 +1361,10 @@ impl Store {
             file_coverage,
             adapter_logs,
             coverage,
-        })
+            profile_matrix: ProfileMatrixRecord::default(),
+        };
+        refresh_profile_matrix(&mut snapshot);
+        Ok(snapshot)
     }
 
     pub fn resolve_scan_id(&self, requested: Option<&str>, latest_attempt: bool) -> Result<String> {
@@ -1629,6 +1643,44 @@ fn validate_build_union(
         .map(|profile| (&profile.id, profile))
         .collect::<BTreeMap<_, _>>();
     for profile in &delta.profiles {
+        if profile
+            .properties
+            .get("profile_phase")
+            .and_then(Value::as_str)
+            != Some("build")
+        {
+            bail!(
+                "build profile {} must declare profile_phase=build",
+                profile.id
+            );
+        }
+        let parent_id = declared_parent_profile_id(profile)
+            .with_context(|| format!("build profile {} has no parent profile", profile.id))?;
+        let parent = base
+            .profiles
+            .iter()
+            .find(|candidate| candidate.id == parent_id)
+            .with_context(|| {
+                format!(
+                    "build profile {} parent {parent_id} is not in the base graph",
+                    profile.id
+                )
+            })?;
+        let declared_effective = declared_effective_input_id(profile).with_context(|| {
+            format!(
+                "build profile {} has no canonical effective input identity",
+                profile.id
+            )
+        })?;
+        if declared_effective != canonical_effective_input_id(parent)
+            || canonical_profile_language(&profile.language)
+                != canonical_profile_language(&parent.language)
+        {
+            bail!(
+                "build profile {} effective parent contract is invalid",
+                profile.id
+            );
+        }
         if let Some(existing) = base_profiles.get(&profile.id)
             && (existing.language != profile.language
                 || existing.toolchain != profile.toolchain
@@ -1759,13 +1811,18 @@ fn validate_build_union(
     Ok(())
 }
 
+fn canonical_profile_language(language: &str) -> &str {
+    match language {
+        "typescript" | "javascript" | "web" => "web",
+        other => other,
+    }
+}
+
 fn merge_build_delta(
     snapshot: &mut GraphSnapshot,
     delta: BuildGraphDelta,
-    attempt_id: &str,
+    _attempt_id: &str,
 ) -> Result<()> {
-    let base_sites = snapshot.sites.clone();
-    let build_evidence = delta.evidence.clone();
     for profile in delta.profiles {
         if let Some(existing) = snapshot
             .profiles
@@ -1791,14 +1848,6 @@ fn merge_build_delta(
     snapshot.edges.extend(delta.edges);
     snapshot.evidence.extend(delta.evidence);
     snapshot.diagnostics.extend(delta.diagnostics);
-    append_build_conflicts(
-        &mut snapshot.diagnostics,
-        &mut snapshot.evidence,
-        &base_sites,
-        &delta.sites,
-        &build_evidence,
-        attempt_id,
-    );
     union_coverage(&mut snapshot.coverage, &delta.coverage);
     snapshot.coverage.profiles = snapshot.profiles.len() as u64;
     snapshot.scan.project_code_executed = true;
@@ -1808,18 +1857,7 @@ fn merge_build_delta(
     snapshot.nodes.sort_by(|left, right| left.id.cmp(&right.id));
     snapshot.sites.sort_by(|left, right| left.id.cmp(&right.id));
     snapshot.edges.sort_by(|left, right| left.id.cmp(&right.id));
-    snapshot.evidence.sort_by(|left, right| {
-        left.owner_type
-            .cmp(&right.owner_type)
-            .then(left.owner_id.cmp(&right.owner_id))
-            .then(left.ordinal.cmp(&right.ordinal))
-    });
-    snapshot
-        .diagnostics
-        .sort_by(|left, right| left.id.cmp(&right.id));
-    for (ordinal, diagnostic) in snapshot.diagnostics.iter_mut().enumerate() {
-        diagnostic.ordinal = ordinal as i64;
-    }
+    refresh_profile_matrix(snapshot);
     Ok(())
 }
 
@@ -1843,66 +1881,6 @@ fn union_coverage(target: &mut CoverageRecord, delta: &CoverageRecord) {
     target.reasons.extend(delta.reasons.iter().cloned());
     target.reasons.sort();
     target.reasons.dedup();
-}
-
-fn append_build_conflicts(
-    diagnostics: &mut Vec<DiagnosticRecord>,
-    evidence: &mut Vec<EvidenceRecord>,
-    base_sites: &[SiteRecord],
-    build_sites: &[SiteRecord],
-    build_evidence: &[EvidenceRecord],
-    attempt_id: &str,
-) {
-    for build in build_sites {
-        for base in base_sites.iter().filter(|base| {
-            base.source == build.source
-                && base.kind == build.kind
-                && base.specifier == build.specifier
-                && base.profile_id == build.profile_id
-                && base.condition == build.condition
-                && base.target_ids != build.target_ids
-        }) {
-            let id = format!("diagnostic:build-conflict:{}:{}", base.id, build.id);
-            diagnostics.push(DiagnosticRecord {
-                ordinal: 0,
-                id: id.clone(),
-                severity: "warning".to_owned(),
-                code: "BUILD_EVIDENCE_CONFLICT".to_owned(),
-                message: "build observation conflicts with an existing dependency target"
-                    .to_owned(),
-                path: None,
-                adapter: None,
-                start_line: None,
-                start_column: None,
-                end_line: None,
-                end_column: None,
-                properties: json!({
-                    "build_run_id": attempt_id,
-                    "source_site_id": base.id,
-                    "build_site_id": build.id,
-                    "source_targets": base.target_ids,
-                    "build_targets": build.target_ids,
-                    "phases": ["source_or_semantic", "build"]
-                }),
-            });
-            let conflict_evidence = evidence
-                .iter()
-                .filter(|item| item.owner_type == "site" && item.owner_id == base.id)
-                .chain(
-                    build_evidence
-                        .iter()
-                        .filter(|item| item.owner_type == "site" && item.owner_id == build.id),
-                )
-                .cloned()
-                .collect::<Vec<_>>();
-            for (ordinal, mut item) in conflict_evidence.into_iter().enumerate() {
-                item.owner_type = "diagnostic".to_owned();
-                item.owner_id.clone_from(&id);
-                item.ordinal = ordinal as i64;
-                evidence.push(item);
-            }
-        }
-    }
 }
 
 fn ensure_build_staging(tx: &Transaction<'_>, attempt_id: &str) -> Result<()> {
@@ -3317,7 +3295,13 @@ mod tests {
         let audit = build_attempt_audit("build-run-1");
         store.save_build_audit(&audit)?;
         store.start_build_attempt("scan-golden", &audit)?;
-        let protocol = validate_build_ndjson(Cursor::new(build_protocol("build-run-1", false)))?;
+        let effective_input_id = canonical_effective_input_id(&base.profiles[0]);
+        let protocol = validate_build_ndjson(Cursor::new(build_protocol(
+            "build-run-1",
+            false,
+            "production",
+            &effective_input_id,
+        )))?;
         store.save_build_delta("build-run-1", &protocol)?;
         store.finish_build_attempt("build-run-1", "completed", None, true)?;
 
@@ -3339,6 +3323,36 @@ mod tests {
                 .contains(&"build-observed".to_owned())
         );
         assert!(union.scan.project_code_executed);
+        assert_eq!(union.profile_matrix.entries.len(), 1);
+        let matrix_entry = &union.profile_matrix.entries[0];
+        assert_eq!(
+            matrix_entry.profile_ids,
+            ["web:build", "web:production:server"]
+        );
+        assert_eq!(matrix_entry.parent_profile_ids, ["web:production:server"]);
+        assert_eq!(matrix_entry.phases, ["build", "static"]);
+        assert_eq!(
+            matrix_entry.selection_reasons,
+            ["direct-effective-input", "parent-effective-input"]
+        );
+        assert_eq!(matrix_entry.phase_coverage["static"].sites, 1);
+        assert_eq!(matrix_entry.phase_coverage["static"].edges, 1);
+        assert_eq!(matrix_entry.phase_coverage["build"].sites, 1);
+        assert_eq!(matrix_entry.phase_coverage["build"].edges, 1);
+        assert_eq!(union.profile_matrix.correlations.len(), 1);
+        let correlation = &union.profile_matrix.correlations[0];
+        assert_eq!(correlation.status, "matched");
+        assert!(correlation.difference_reasons.is_empty());
+        assert_eq!(
+            correlation.conditions_by_phase["static"], correlation.conditions_by_phase["build"],
+            "canonical condition union must deduplicate reordered conditions"
+        );
+        assert_eq!(
+            correlation.condition_union,
+            correlation.conditions_by_phase["static"]
+        );
+        assert_eq!(union.profile_matrix.difference_counts["matched"], 1);
+        assert_eq!(union.profile_matrix.difference_counts["conflict"], 0);
         assert_eq!(
             store.current_build_attempt_id("scan-golden")?.as_deref(),
             Some("build-run-1")
@@ -3348,8 +3362,12 @@ mod tests {
         let failed_audit = build_attempt_audit("build-run-2");
         store.save_build_audit(&failed_audit)?;
         store.start_build_attempt("scan-golden", &failed_audit)?;
-        let failed_protocol =
-            validate_build_ndjson(Cursor::new(build_protocol("build-run-2", true)))?;
+        let failed_protocol = validate_build_ndjson(Cursor::new(build_protocol(
+            "build-run-2",
+            true,
+            "production",
+            &effective_input_id,
+        )))?;
         store.save_build_delta("build-run-2", &failed_protocol)?;
         store.finish_build_attempt(
             "build-run-2",
@@ -3404,8 +3422,12 @@ mod tests {
         let audit = build_attempt_audit("build-run-conflict");
         store.save_build_audit(&audit)?;
         store.start_build_attempt("scan-golden", &audit)?;
-        let protocol =
-            validate_build_ndjson(Cursor::new(build_protocol("build-run-conflict", true)))?;
+        let protocol = validate_build_ndjson(Cursor::new(build_protocol(
+            "build-run-conflict",
+            true,
+            "production",
+            &canonical_effective_input_id(&store.load_snapshot("scan-golden")?.profiles[0]),
+        )))?;
         store.save_build_delta("build-run-conflict", &protocol)?;
         store.finish_build_attempt("build-run-conflict", "completed", None, true)?;
 
@@ -3417,6 +3439,25 @@ mod tests {
             .find(|diagnostic| diagnostic.code == "BUILD_EVIDENCE_CONFLICT")
             .expect("conflict diagnostic");
         assert_eq!(conflict.properties["build_run_id"], "build-run-conflict");
+        assert_eq!(
+            conflict.properties["profile_matrix_schema"],
+            "profile-matrix-v1"
+        );
+        let correlation = snapshot
+            .profile_matrix
+            .correlations
+            .iter()
+            .find(|correlation| correlation.status == "conflict")
+            .expect("conflicting correlation");
+        assert_eq!(correlation.difference_reasons, ["target_mismatch"]);
+        assert_eq!(
+            correlation.targets_by_phase["static"],
+            ["file:sha256:target"]
+        );
+        assert_eq!(
+            correlation.targets_by_phase["build"],
+            ["file:sha256:source"]
+        );
         let kinds = snapshot
             .evidence
             .iter()
@@ -3426,6 +3467,143 @@ mod tests {
             .map(|evidence| evidence.kind.as_str())
             .collect::<BTreeSet<_>>();
         assert_eq!(kinds, BTreeSet::from(["build", "source"]));
+        Ok(())
+    }
+
+    #[test]
+    fn build_condition_conflict_preserves_both_conditions_and_evidence() -> Result<()> {
+        let mut store = Store::open_in_memory()?;
+        ingest_protocol_fixture(
+            &mut store,
+            include_str!("../../depgraph-protocol/tests/fixtures/protocol-v1.golden.ndjson"),
+        )?;
+        let effective_input_id =
+            canonical_effective_input_id(&store.load_snapshot("scan-golden")?.profiles[0]);
+        let audit = build_attempt_audit("build-run-condition-conflict");
+        store.save_build_audit(&audit)?;
+        store.start_build_attempt("scan-golden", &audit)?;
+        let protocol = validate_build_ndjson(Cursor::new(build_protocol(
+            "build-run-condition-conflict",
+            false,
+            "development",
+            &effective_input_id,
+        )))?;
+        store.save_build_delta("build-run-condition-conflict", &protocol)?;
+        store.finish_build_attempt("build-run-condition-conflict", "completed", None, true)?;
+
+        let snapshot = store.load_snapshot("scan-golden")?;
+        let correlation = snapshot
+            .profile_matrix
+            .correlations
+            .iter()
+            .find(|correlation| correlation.status == "conflict")
+            .context("condition conflict correlation")?;
+        assert_eq!(correlation.difference_reasons, ["condition_mismatch"]);
+        assert_ne!(
+            correlation.conditions_by_phase["static"],
+            correlation.conditions_by_phase["build"]
+        );
+        assert_eq!(
+            correlation.condition_union["op"], "any",
+            "both canonical conditions must remain queryable"
+        );
+        let diagnostic_id = correlation
+            .diagnostic_id
+            .as_deref()
+            .context("condition conflict diagnostic")?;
+        let kinds = snapshot
+            .evidence
+            .iter()
+            .filter(|evidence| {
+                evidence.owner_type == "diagnostic" && evidence.owner_id == diagnostic_id
+            })
+            .map(|evidence| evidence.kind.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(kinds, BTreeSet::from(["build", "source"]));
+        Ok(())
+    }
+
+    #[test]
+    fn repeated_build_of_same_effective_input_keeps_profile_and_graph_identity() -> Result<()> {
+        let mut store = Store::open_in_memory()?;
+        ingest_protocol_fixture(
+            &mut store,
+            include_str!("../../depgraph-protocol/tests/fixtures/protocol-v1.golden.ndjson"),
+        )?;
+        let effective_input_id =
+            canonical_effective_input_id(&store.load_snapshot("scan-golden")?.profiles[0]);
+        let mut first_identity = None;
+
+        for run_id in ["build-run-repeat-1", "build-run-repeat-2"] {
+            let audit = build_attempt_audit(run_id);
+            store.save_build_audit(&audit)?;
+            store.start_build_attempt("scan-golden", &audit)?;
+            let protocol = validate_build_ndjson(Cursor::new(build_protocol(
+                run_id,
+                false,
+                "production",
+                &effective_input_id,
+            )))?;
+            store.save_build_delta(run_id, &protocol)?;
+            store.finish_build_attempt(run_id, "completed", None, true)?;
+
+            let snapshot = store.load_snapshot("scan-golden")?;
+            let identity = json!({
+                "profiles": snapshot.profiles.iter().map(|item| &item.id).collect::<Vec<_>>(),
+                "nodes": snapshot.nodes.iter().map(|item| &item.id).collect::<Vec<_>>(),
+                "sites": snapshot.sites.iter().map(|item| &item.id).collect::<Vec<_>>(),
+                "edges": snapshot.edges.iter().map(|item| &item.id).collect::<Vec<_>>(),
+                "effective_profiles": snapshot.profile_matrix.entries.iter().map(|item| &item.id).collect::<Vec<_>>(),
+                "correlations": snapshot.profile_matrix.correlations.iter().map(|item| &item.id).collect::<Vec<_>>(),
+            });
+            if let Some(first_identity) = &first_identity {
+                assert_eq!(&identity, first_identity);
+            } else {
+                first_identity = Some(identity);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn build_delta_rejects_forged_effective_input_identity() -> Result<()> {
+        let mut store = Store::open_in_memory()?;
+        ingest_protocol_fixture(
+            &mut store,
+            include_str!("../../depgraph-protocol/tests/fixtures/protocol-v1.golden.ndjson"),
+        )?;
+        let mut root = store.load_snapshot("scan-golden")?.profiles[0].clone();
+        let canonical = canonical_effective_input_id(&root);
+        root.properties["effective_input_id"] =
+            json!(format!("effective-input:sha256:{}", "f".repeat(64)));
+        assert_eq!(
+            canonical_effective_input_id(&root),
+            canonical,
+            "a root profile cannot self-declare a different effective identity"
+        );
+
+        let run_id = "build-run-forged-effective-input";
+        let audit = build_attempt_audit(run_id);
+        store.save_build_audit(&audit)?;
+        store.start_build_attempt("scan-golden", &audit)?;
+        let forged = format!("effective-input:sha256:{}", "f".repeat(64));
+        let protocol = validate_build_ndjson(Cursor::new(build_protocol(
+            run_id,
+            false,
+            "production",
+            &forged,
+        )))?;
+        let error = store
+            .save_build_delta(run_id, &protocol)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("effective parent contract is invalid"));
+        let delta: Option<String> = store.connection.query_row(
+            "SELECT delta_json FROM build_attempts WHERE id=?1",
+            [run_id],
+            |row| row.get(0),
+        )?;
+        assert!(delta.is_none());
         Ok(())
     }
 
@@ -3451,7 +3629,7 @@ mod tests {
             "run_id":run_id,
             "adapter":"build-observer",
             "adapter_version":"0.1.0",
-            "profile_id":"web:production:server",
+            "profile_id":"web:build",
             "command_plan_digest":"a".repeat(64),
             "toolchain_executable_digest":"b".repeat(64),
             "environment_key_set_digest":"c".repeat(64),
@@ -3463,10 +3641,15 @@ mod tests {
         })
     }
 
-    fn build_protocol(run_id: &str, conflicting_target: bool) -> String {
+    fn build_protocol(
+        run_id: &str,
+        conflicting_target: bool,
+        mode: &str,
+        effective_input_id: &str,
+    ) -> String {
         let provenance = json!({
             "build_run_id":run_id,
-            "profile_id":"web:production:server",
+            "profile_id":"web:build",
             "command_plan_digest":"a".repeat(64),
             "toolchain_executable_digest":"b".repeat(64),
             "environment_key_set_digest":"c".repeat(64),
@@ -3493,10 +3676,15 @@ mod tests {
         events.push(started);
         let mut profile = common("profile_declared", 2);
         profile["profile"] = json!({
-            "id":"web:production:server","language":"typescript",
+            "id":"web:build","language":"typescript",
             "toolchain":"typescript 7.0.2","command":"scan","target":"server",
             "features":[],"environment":{"mode":"production"},
-            "source_revision":"fixture","properties":{}
+            "source_revision":"fixture","properties":{
+                "profile_contract":"phase-parent-effective-v1",
+                "profile_phase":"build",
+                "parent_profile_id":"web:production:server",
+                "effective_input_id":effective_input_id
+            }
         });
         events.push(profile);
         for (seq, id, locator) in [
@@ -3514,10 +3702,10 @@ mod tests {
         edge["edge"] = json!({
             "id":format!("edge:build:{run_id}"),"source":"file:sha256:source",
             "target":target,"kind":"imports","site_id":format!("site:build:{run_id}"),
-            "phase":"build","environment":"server","profile_id":"web:production:server",
+            "phase":"build","environment":"server","profile_id":"web:build",
             "condition":{"op":"all","conditions":[
                 {"op":"eq","key":"runtime","value":"server"},
-                {"op":"eq","key":"mode","value":"production"}
+                {"op":"eq","key":"mode","value":mode}
             ]},"resolution_status":"resolved","precision":"observed","generated":true,
             "evidence":[{"kind":"build","extractor":"build-observer",
                 "extractor_version":"0.1.0","properties":provenance.clone()}]
@@ -3527,9 +3715,9 @@ mod tests {
         site["site"] = json!({
             "id":format!("site:build:{run_id}"),"source":"file:sha256:source",
             "kind":"import","specifier":"./lib","resolution_status":"resolved",
-            "target_ids":[target],"profile_id":"web:production:server",
+            "target_ids":[target],"profile_id":"web:build",
             "condition":{"op":"all","conditions":[
-                {"op":"eq","key":"mode","value":"production"},
+                {"op":"eq","key":"mode","value":mode},
                 {"op":"eq","key":"runtime","value":"server"}
             ]},"precision":"observed","evidence":[{"kind":"build",
                 "extractor":"build-observer","extractor_version":"0.1.0",
@@ -3549,7 +3737,7 @@ mod tests {
             "completeness":["build-observed"],"reasons":[]
         });
         let mut profile_completed = common("profile_completed", 7);
-        profile_completed["profile_id"] = json!("web:production:server");
+        profile_completed["profile_id"] = json!("web:build");
         profile_completed["coverage"] = coverage.clone();
         events.push(profile_completed);
         let mut completed = common("scan_completed", 8);

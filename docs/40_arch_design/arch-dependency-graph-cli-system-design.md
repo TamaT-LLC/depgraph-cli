@@ -896,7 +896,24 @@ Issue #68のRust observerは、supervisorが選んだ`cargo build --frozen --off
 
 build script run / OUT_DIR / generated artifact / cfg / environment / native link / proc-macro binaryはprovenance付きgenerated nodeとなり、safe sourceでledger済みの`OUT_DIR` occurrenceと一意なdirect proc-macro dependencyだけを`reads_build_output` / `expands_with_proc_macro`の`phase=build` evidenceへ相関する。safe nodeは完全一致upsertだけを許し、source / HIR siteを置換しない。Cargo failure、timeout、cancel、出力上限、missing / duplicate completion、source / output escape、不正cfg / environment / link、proc-macro binary欠損、protocol / store rejectionではattemptを`failed`または`security_failed`で閉じ、deltaを昇格しない。
 
-#### 12.2.6 Failure、snapshot、受け入れmatrix
+#### 12.2.6 Phase-cross profile matrix
+
+static / semantic / build / runtimeの各layerは個別のprofileとevidenceを保持しつつ、同じeffective inputから得られた観測を1つのprofile matrix entryへまとめる。source / semanticのroot profileはprofile IDから`effective_input_id`を決定的に導出し、build / runtimeのchild profileは`profile_phase`、base snapshot内の`parent_profile_id`、parentから導出したcanonical `effective_input_id`を宣言する。childが自己申告した別identity、存在しないparent、異なるlanguage familyはstoreでrejectする。profile ID、effective profile ID、site / edge / correlation IDはattempt IDを含めず、同じeffective inputと同じ観測の反復buildで変化しない。
+
+matrixは宣言済みまたは実際に観測したprofileだけをentryへ追加し、phase axisのCartesian productを生成しない。parentを共有するchildは同じentryへ集約し、選択理由を`direct-effective-input` / `parent-effective-input`として公開する。target、feature、phaseを除いたenvironmentなどのeffective axisがparentと矛盾する場合はprofileを消さず、`PROFILE_MATRIX_PROFILE_CONFLICT`と両provenanceを保持する。
+
+dependency correlation keyはeffective profile、source、dependency kind、specifierから生成する。同じkeyについてstatic prediction、semantic refinement、build observation、runtime observationをphase別に保持し、conditionはcanonical化・sort・deduplicateしたlogical ORとしてunionする。build / runtimeとの比較にはsemanticが存在すればsemanticを、なければstaticを予測layerとして選ぶ。statusは次の固定集合とする。
+
+| Status | 意味 |
+| --- | --- |
+| `matched` | observed target、condition、resolutionが選択した予測と一致 |
+| `additional` | build / runtimeでのみ観測したdependency |
+| `conflict` | target、condition、resolutionのいずれかが予測と不一致 |
+| `unobserved` | static / semantic予測だけがあり、build / runtimeでは未観測 |
+
+`conflict`は`BUILD_EVIDENCE_CONFLICT`として予測と観測のsite / edge、condition、target、difference reason、両evidenceを保持する。`unobserved`はbuild coverage外や未実行をabsenceとして断定せず、negative evidenceには昇格しない。matrixはSQLite schemaを複製する永続tableではなく、canonical snapshotとpromoted build deltaから決定的に再構築するsnapshot viewである。`doctor`はphase別site / edge / evidence / completenessとstatus件数を、deps / dependents / why / unresolvedはeffective profile、correlation status、difference reason、phase coverageを、JSON exportはmatrix全体を公開する。DOT / Mermaidは相関が存在するedgeへobserved statusを注記する。
+
+#### 12.2.7 Failure、snapshot、受け入れmatrix
 
 build attemptは新しいstaging transactionへ書き、全observerとprotocol / store validationが完了するまで既存snapshotへunionしない。tool failure、timeout、cancel、malformed / forged event、output escape、secret policy違反ではbuild deltaをatomicに破棄し、auditとbounded diagnosticだけをfailed attemptへ残す。直前のcompleted / latest-successful snapshotとそのdefault query selectionを保持する。partial attemptを調査する場合は明示attempt IDを要求し、completed snapshotとして昇格しない。
 
@@ -980,6 +997,7 @@ selector は path、stable ID、package、symbol、route pattern を受け付け
 - unresolved / candidates / external counts
 - build code 実行有無
 - profile coverage
+- phase-cross profile matrix、phase coverage、observed difference
 - generated source drift
 - protocol / cache schema version
 
@@ -1092,6 +1110,7 @@ policy result も evidence span を持ち、CI annotation へ変換できるよ�
 - adapter crash / timeout / malformed output
 - broken source と部分解析
 - secret redaction
+- static / semantic / build profile matrixのdeduplicate、condition union、conflict provenance、反復identity
 
 ## 19. 非機能要件
 
@@ -1208,8 +1227,8 @@ Go semantic scanではGOOS/GOARCH、build tags、強制されたcgo無効状態�
 - Next Adapter observer: Issue #65で実装済み（2026-07-22）
 - Astro integration / Vite observer: Issue #66で実装済み（2026-07-22）
 - TanStack Start build observer: Issue #67で実装済み（2026-07-22）
-- Rust build script / proc macro opt-in
-- profile matrix union
+- Rust build script / proc macro opt-in: Issue #68で実装済み（2026-07-22）
+- profile matrix union: Issue #69で実装済み（2026-07-22）
 
 ### Milestone 4: Incremental and CI
 
@@ -1260,6 +1279,7 @@ Go semantic scanではGOOS/GOARCH、build tags、強制されたcgo無効状態�
 
 ## 26. 更新履歴
 
+- 2026-07-22: Issue #69としてstatic / semantic / build / runtimeのphase-cross profile matrixを実装。root profile IDからcanonical effective inputを導出し、build childのparent / effective identity / language familyをstoreで照合する。宣言・観測済みprofileだけを同一entryへ集約して組合せ積を作らず、conditionをcanonical ORへunionする。同一effective profile・source・kind・specifierを`matched / additional / conflict / unobserved`へ相関し、semanticをstaticより優先してbuild / runtimeと比較する。target / condition / resolution差とprofile axis差は両layerのevidence付きdiagnosticとして保持し、反復buildのprofile / graph / correlation identityを固定した。doctor、deps / dependents / why / unresolved、JSON / DOT / Mermaid exportへeffective profile、phase coverage、observed differenceを公開し、store unitとsupervised Rust build CLI E2Eで検証した。
 - 2026-07-22: Issue #68としてRust Cargo build observerを実装。明示consent下のsupervisor requestをCargo JSON message modeへ固定し、build script output、OUT_DIR regular artifact、generated cfg / environment key、native library / search path、proc-macro dynamic libraryをbounded canonical observationへ変換する。environment value、secret-like key、cfg raw value、absolute path、artifact bytes、raw outputは保存しない。safe package / source nodeを上書きせず、build script run / output / configuration / native link / proc-macro binary nodeと`phase=build`・`precision=observed` edgeを生成し、safe `OUT_DIR` / proc-macro occurrenceへ一意な場合だけ相関する。Cargo / observer / protocol / storeの全検証成功時だけschema v7 build attemptをatomic promotionし、failure / timeout / cancel / tamper時はauditだけを残す。cross-platform build.rs + proc-macro + native link fixtureでoriginal checkout非変更、secret / temporary path非漏洩、safe scan状態保持を検証した。
 - 2026-07-22: Issue #67としてTanStack Start v1 / Vite 7 build observerを実装。公式compilerが変換後に生成する`createClientRpc` / `createSsrRpc` / `createServerRpc`とserver-function resolver virtual moduleを固定internal contractとして観測し、production RPC IDとcollision suffixを自前計算せず保存する。client / SSR / provider module、chunk / assetをenvironment role別に正規化し、project code、artifact bytes、repository外path、raw crashを保存しない。generated client/SSR stubをobserved server function、safe server-function definition、handlerへ`client_stub_for` / `observes_definition` / `handled_by`で結び、route / middleware / server functionをemitted artifactへ相関する。既存Vite plugin順、Start core plugin、Vite environment、resolver virtual module、stub/provider ID closureをfail closedで検証し、version / conflict / crash / timeout / missing virtual module / failed buildはpartial targetを捏造せず固定diagnosticへ変換する。
 - 2026-07-22: Issue #66としてAstro `5.x`〜`7.x` Integration APIとVite `6.x`〜`7.x` build observerを実装。`astro:routes:resolved` / `astro:config:done` / `astro:build:setup` / `astro:build:ssr` / `astro:build:done`とpost build pluginをversion / hook capability gate下でchainし、既存integration / Vite pluginを置換せず保持する。client / SSR別のresolved config、module import graph、chunk / asset digest、injected route、route assetをallowlist metadataへ正規化し、module source、artifact bytes、secret値、repository外absolute path、raw crash textを保存しない。safe Astro route / component / content / assetとの相関、injected / static-only / conflict / dynamic-config diagnostic、environment別`imports` / `dynamic_imports` / `renders` / `emits` / `loads` build evidenceとprotocol eventを決定的に生成する。unsupported version / hook、chain衝突、observer crash / timeoutをpartial graphへ昇格せず固定診断へfail closedする。
