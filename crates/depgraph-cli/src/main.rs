@@ -1,12 +1,17 @@
-use std::{io::Cursor, path::PathBuf, process::ExitCode};
+use std::{
+    io::Cursor,
+    path::{Path, PathBuf},
+    process::ExitCode,
+};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use depgraph_core::{
-    BuildOutcomeKind, Config, CycleLevel, ExportFormat, create_build_execution_request,
-    default_store_path, doctor, execute_build_request_with_cancellation, export, init_config,
-    open_store, render_condition, run_scan, rust_build_protocol_ndjson, stage_build_evidence,
-    traverse, unresolved, web_build_protocol_ndjson, why,
+    BuildOutcomeKind, Config, CycleLevel, ExportFormat, ImpactFilters, ImpactResult,
+    create_build_execution_request, default_store_path, doctor,
+    execute_build_request_with_cancellation, export, impact, init_config, open_store,
+    read_git_changed_set, render_condition, run_scan, rust_build_protocol_ndjson,
+    stage_build_evidence, traverse, unresolved, web_build_protocol_ndjson, why,
 };
 use depgraph_store::{CompletedSnapshotDetails, CoverageRecord};
 use serde::Serialize;
@@ -86,6 +91,30 @@ enum Commands {
     Why {
         from: String,
         to: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show reverse dependency impact for a selector or Git changed set.
+    Impact {
+        selector: String,
+        /// Read committed and dirty worktree changes since the merge-base with this Git ref.
+        #[arg(long, value_name = "GIT_REF")]
+        changed: Option<String>,
+        /// Limit reverse traversal depth from the selected graph node.
+        #[arg(long)]
+        depth: Option<usize>,
+        /// Traverse edges belonging to one of these exact profile IDs.
+        #[arg(long, value_name = "PROFILE_ID")]
+        profile: Vec<String>,
+        /// Traverse edges whose rendered condition exactly matches one of these values.
+        #[arg(long, value_name = "CONDITION")]
+        condition: Vec<String>,
+        /// Stop with an explicit incomplete diagnostic after this many unique nodes.
+        #[arg(long, default_value_t = 10_000)]
+        max_nodes: usize,
+        /// Stop with an explicit incomplete diagnostic after this many unique edges.
+        #[arg(long, default_value_t = 50_000)]
+        max_edges: usize,
         #[arg(long)]
         json: bool,
     },
@@ -261,6 +290,9 @@ fn error_exit_code(error: &anyhow::Error) -> u8 {
     if (message.contains("scan ") && message.contains(" was not found"))
         || (message.contains("completed snapshot") && message.contains(" was not found"))
         || (message.contains("diff ") && message.contains(" filter must"))
+        || (message.contains("impact ")
+            && (message.contains(" filter must") || message.contains("must be greater")))
+        || message.contains("git ref")
         || [
             "selector",
             "snapshot name",
@@ -624,6 +656,29 @@ async fn run(cli: Cli) -> Result<u8> {
             }
             Ok(0)
         }
+        Commands::Impact {
+            selector,
+            changed,
+            depth,
+            profile,
+            condition,
+            max_nodes,
+            max_edges,
+            json,
+        } => {
+            let filters = ImpactFilters::new(depth, profile, condition, max_nodes, max_edges)?;
+            let (snapshot, scan_id) = load_snapshot(cli.store, cli.scan_id.as_deref(), false)?;
+            let changed_set = changed
+                .as_deref()
+                .map(|git_ref| read_git_changed_set(Path::new(&snapshot.scan.root), git_ref))
+                .transpose()?;
+            let result = impact(&snapshot, &selector, changed_set.as_ref(), filters)?;
+            print_structured("impact", scan_id, &result, json)?;
+            if !json {
+                print_human_impact(&result);
+            }
+            Ok(0)
+        }
         Commands::Cycles { level, json } => {
             let (snapshot, scan_id) = load_snapshot(cli.store, cli.scan_id.as_deref(), false)?;
             let level = match level {
@@ -974,6 +1029,76 @@ fn print_why_steps(steps: &[depgraph_core::query::PathStep]) {
     }
 }
 
+fn print_human_impact(result: &ImpactResult) {
+    println!(
+        "impact focus: {} ({}, id:{})",
+        result.root.locator, result.root.kind, result.root.id
+    );
+    if let Some(changed_set) = &result.changed_set {
+        println!(
+            "git changed set: ref={} resolved={} merge_base={} head={} paths={} mapped_nodes={}",
+            changed_set.requested_ref,
+            changed_set.resolved_ref,
+            changed_set.merge_base,
+            changed_set.head,
+            changed_set.changes.len(),
+            result.changed_nodes.len()
+        );
+        for mapping in &result.mappings {
+            let path = match (
+                mapping.change.old_path.as_deref(),
+                mapping.change.new_path.as_deref(),
+            ) {
+                (Some(old), Some(new)) => format!("{old} -> {new}"),
+                (Some(old), None) => old.to_owned(),
+                (None, Some(new)) => new.to_owned(),
+                (None, None) => "unknown".to_owned(),
+            };
+            println!(
+                "  {} {} sources={} old_nodes={} new_nodes={} correlated_nodes={}",
+                mapping.change.status,
+                path,
+                display_list(&mapping.change.sources),
+                display_list(&mapping.old_node_ids),
+                display_list(&mapping.new_node_ids),
+                display_list(&mapping.correlated_node_ids),
+            );
+        }
+    } else {
+        println!("change root: selected node");
+    }
+    println!(
+        "result: impacted={} complete={} impacts={} depth={} profiles={} conditions={}",
+        result.root_impacted,
+        result.complete,
+        result.impacts.len(),
+        result
+            .filters
+            .depth
+            .map(|depth| depth.to_string())
+            .unwrap_or_else(|| "unbounded".to_owned()),
+        display_list(&result.filters.profiles),
+        display_list(&result.filters.conditions),
+    );
+    if !result.root_impacted {
+        println!("selected node is not affected by the mapped changed set");
+    }
+    for impact in &result.impacts {
+        println!(
+            "{} ({}, id:{}) depth={} changed_node={}",
+            impact.node.locator,
+            impact.node.kind,
+            impact.node.id,
+            impact.depth,
+            impact.changed_node_id,
+        );
+        print_why_steps(&impact.dependency_path);
+    }
+    for diagnostic in &result.diagnostics {
+        println!("diagnostic [{}] {}", diagnostic.code, diagnostic.message);
+    }
+}
+
 fn print_profile_correlation(step: &depgraph_core::query::PathStep, indent: &str) {
     if let (Some(effective_profile), Some(status)) = (
         step.effective_profile_id.as_deref(),
@@ -1035,6 +1160,13 @@ mod tests {
             error_exit_code(&anyhow::anyhow!("diff kind filter must not be empty")),
             2
         );
+        assert_eq!(
+            error_exit_code(&anyhow::anyhow!(
+                "impact max-nodes must be greater than zero"
+            )),
+            2
+        );
+        assert_eq!(error_exit_code(&anyhow::anyhow!("Git ref is invalid")), 2);
         assert_eq!(
             error_exit_code(&anyhow::anyhow!("security policy violation")),
             4

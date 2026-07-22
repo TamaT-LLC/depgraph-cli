@@ -36,9 +36,9 @@ unresolved, semantic-issue, and compiler diagnostic counts, and
 Detected Next.js, Astro, TanStack Router, and TanStack Start profiles must also
 complete their versioned framework semantic capability ledger. Code-based
 routes beyond the safe static boundary, framework-specific build observers,
-runtime traces, incremental updates, Git changed-set impact, and architecture policies
-remain later milestones. The supervised build protocol and atomic evidence
-union foundation are available separately under the explicit-consent boundary.
+runtime traces, incremental updates, and architecture policies remain later
+milestones. The supervised build protocol and atomic evidence union foundation
+are available separately under the explicit-consent boundary.
 
 ## Build
 
@@ -73,6 +73,9 @@ depgraph doctor --json
 depgraph deps path:src/app.ts --transitive
 depgraph dependents package:example
 depgraph why path:src/app.ts route:/products/$id
+depgraph impact path:src/app.ts
+depgraph impact package:example --changed origin/main --depth 4
+depgraph impact route:/products/$id --changed HEAD~1 --profile web:production:server --json
 depgraph cycles --level file
 
 # Go semantic graph queries use canonical resolver identities.
@@ -108,6 +111,8 @@ SQLite is stored under the operating system cache directory, keyed by the canoni
 `snapshot create` names the current completed snapshot; global `--scan-id ID` may instead select the completed snapshot produced by that scan and its latest promoted build. Failed or incomplete attempts cannot be named. Names are immutable, case-insensitively unique, 1–64 ASCII characters, begin with a letter or digit, and otherwise use letters, digits, `.`, `_`, or `-`. `current` and `latest` are reserved, and existing names are never overwritten. `snapshot show` accepts a name, a `snapshot:sha256:...` stable ID, or `current`. List and detail JSON are emitted in canonical order.
 
 `diff` accepts two completed snapshot names, stable IDs, or `current`; failed and incomplete attempt IDs are rejected with exit code `2`. Human output starts with node/site/edge/evidence/profile/coverage/rename counts and follows with canonical change details plus primary source evidence. `--json` emits the versioned `diff` command envelope with normalized filters, a summary, and the canonical before/after records. Repeatable `--kind`, `--profile`, `--phase`, and `--status` filters use exact matching and AND semantics; a record type that does not expose a selected dimension is excluded rather than guessed through an implicit graph join.
+
+`impact <SELECTOR>` follows incoming dependencies from the selected node and reports a deterministic dependency path, rendered condition, profile correlation, and source evidence for every result. With `--changed <GIT_REF>`, depgraph reads both committed changes from `merge-base(GIT_REF, HEAD)..HEAD` and staged, unstaged, and untracked worktree changes without taking Git locks or invoking external diff/textconv helpers. Changed and renamed paths are correlated to file and semantic node identities through canonical node properties and stored evidence. The selector is the focus: it must depend on a mapped changed node, then reverse traversal reports the focus and its dependents. Repeatable `--profile` and `--condition` filters are exact; `--depth`, `--max-nodes`, and `--max-edges` bound traversal, and a reached safety limit is returned as `complete=false` with an explicit diagnostic rather than silently truncating results.
 
 Selectors accept `id:`, `path:`, `package:`, `route:`, `symbol:`, and `type:` prefixes. `symbol:` and `type:` only match their respective node kind. A bare or prefixed selector must resolve unambiguously; when candidates are reported, copy the complete stable ID (for example `symbol:sha256:...`) and retry as `id:<stable-id>`.
 

@@ -2,6 +2,7 @@ pub mod build;
 pub mod build_evidence;
 pub mod config;
 pub mod export;
+pub mod impact;
 pub mod query;
 pub mod rust_build_observer;
 pub mod scan;
@@ -32,6 +33,10 @@ pub use build_evidence::{
 pub use config::{Config, default_store_path, init_config};
 pub use depgraph_store::GraphSnapshot;
 pub use export::{ExportFormat, export};
+pub use impact::{
+    ChangedNodeMapping, GitChange, GitChangedSet, ImpactDiagnostic, ImpactFilters, ImpactNode,
+    ImpactResult, impact, map_changed_set, read_git_changed_set,
+};
 pub use query::{
     CycleLevel, CycleResult, TraversalResult, UnresolvedResult, WhyResult, cycles,
     render_condition, resolve_selector, traverse, unresolved, why,

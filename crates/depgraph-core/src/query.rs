@@ -470,6 +470,25 @@ fn path_step(
     }
 }
 
+pub(crate) fn path_steps_for_edges(
+    snapshot: &GraphSnapshot,
+    edges: &[EdgeRecord],
+) -> Vec<PathStep> {
+    let evidence = edge_evidence_map(snapshot);
+    let correlations = edge_correlation_map(&snapshot.profile_matrix);
+    edges
+        .iter()
+        .map(|edge| {
+            path_step(
+                snapshot,
+                edge,
+                &evidence,
+                correlations.get(edge.id.as_str()).copied(),
+            )
+        })
+        .collect()
+}
+
 pub fn render_condition(value: &serde_json::Value) -> String {
     serde_json::from_value::<Condition>(value.clone())
         .map(|condition| condition.render())
