@@ -689,10 +689,11 @@ fn admit_stage_entry(entry: &DirEntry) -> bool {
     if entry.depth() == 0 || !entry.file_type().is_dir() {
         return true;
     }
-    !matches!(
-        entry.file_name().to_string_lossy().as_ref(),
-        ".git" | ".depgraph" | "target" | ".next" | "dist" | "build" | "coverage"
-    )
+    let name = entry.file_name().to_string_lossy();
+    if matches!(name.as_ref(), ".git" | ".depgraph") {
+        return false;
+    }
+    entry.depth() != 1 || !matches!(name.as_ref(), "target" | ".next")
 }
 
 fn digest_output_tree(output: &Path, stdout: &[u8]) -> Result<String> {
@@ -899,5 +900,32 @@ mod tests {
         plan.environment
             .insert("API_TOKEN".to_owned(), "secret".to_owned());
         assert!(plan.validate().is_err());
+    }
+
+    #[test]
+    fn staging_preserves_source_directories_named_like_common_outputs() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        for path in [
+            "build/member/src/lib.rs",
+            "src/dist/module.rs",
+            "src/coverage/report.rs",
+            "target/debug/generated",
+            ".next/generated",
+            "nested/.git/config",
+        ] {
+            let path = root.path().join(path);
+            fs::create_dir_all(path.parent().expect("fixture path has a parent"))?;
+            fs::write(path, "fixture")?;
+        }
+        let destination = tempfile::tempdir()?;
+        stage_workspace(root.path(), destination.path())?;
+
+        assert!(destination.path().join("build/member/src/lib.rs").is_file());
+        assert!(destination.path().join("src/dist/module.rs").is_file());
+        assert!(destination.path().join("src/coverage/report.rs").is_file());
+        assert!(!destination.path().join("target").exists());
+        assert!(!destination.path().join(".next").exists());
+        assert!(!destination.path().join("nested/.git").exists());
+        Ok(())
     }
 }
