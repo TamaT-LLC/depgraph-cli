@@ -1363,7 +1363,7 @@ impl Store {
             coverage,
             profile_matrix: ProfileMatrixRecord::default(),
         };
-        refresh_profile_matrix(&mut snapshot);
+        refresh_profile_matrix(&mut snapshot, false);
         Ok(snapshot)
     }
 
@@ -1857,7 +1857,7 @@ fn merge_build_delta(
     snapshot.nodes.sort_by(|left, right| left.id.cmp(&right.id));
     snapshot.sites.sort_by(|left, right| left.id.cmp(&right.id));
     snapshot.edges.sort_by(|left, right| left.id.cmp(&right.id));
-    refresh_profile_matrix(snapshot);
+    refresh_profile_matrix(snapshot, true);
     Ok(())
 }
 

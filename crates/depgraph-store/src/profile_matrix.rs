@@ -190,7 +190,7 @@ fn valid_effective_input_id(value: &str) -> bool {
         })
 }
 
-pub(crate) fn refresh_profile_matrix(snapshot: &mut GraphSnapshot) {
+pub(crate) fn refresh_profile_matrix(snapshot: &mut GraphSnapshot, canonicalize_diagnostics: bool) {
     snapshot.diagnostics.retain(|diagnostic| {
         diagnostic
             .properties
@@ -207,15 +207,34 @@ pub(crate) fn refresh_profile_matrix(snapshot: &mut GraphSnapshot) {
         evidence.owner_type != "diagnostic"
             || retained_diagnostic_ids.contains(evidence.owner_id.as_str())
     });
+    let retained_diagnostic_count = snapshot.diagnostics.len();
+    let next_diagnostic_ordinal = snapshot
+        .diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.ordinal)
+        .max()
+        .unwrap_or(-1)
+        .saturating_add(1);
 
     let matrix = build_profile_matrix(snapshot);
     append_matrix_diagnostics(snapshot, &matrix);
     snapshot.profile_matrix = matrix;
-    snapshot
-        .diagnostics
-        .sort_by(|left, right| left.id.cmp(&right.id));
-    for (ordinal, diagnostic) in snapshot.diagnostics.iter_mut().enumerate() {
-        diagnostic.ordinal = ordinal as i64;
+    if canonicalize_diagnostics {
+        snapshot
+            .diagnostics
+            .sort_by(|left, right| left.id.cmp(&right.id));
+        for (ordinal, diagnostic) in snapshot.diagnostics.iter_mut().enumerate() {
+            diagnostic.ordinal = ordinal as i64;
+        }
+    } else {
+        for (offset, diagnostic) in snapshot
+            .diagnostics
+            .iter_mut()
+            .skip(retained_diagnostic_count)
+            .enumerate()
+        {
+            diagnostic.ordinal = next_diagnostic_ordinal.saturating_add(offset as i64);
+        }
     }
     snapshot.evidence.sort_by(|left, right| {
         left.owner_type
@@ -955,4 +974,70 @@ pub fn phase_coverage_for_effective_profile(
         .find(|entry| entry.id == effective_profile_id)
         .map(|entry| entry.phase_coverage.clone())
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{CoverageRecord, ScanRecord};
+
+    #[test]
+    fn base_refresh_preserves_diagnostic_emission_order_and_ordinals() {
+        let diagnostic = |ordinal, id: &str| DiagnosticRecord {
+            ordinal,
+            id: id.to_owned(),
+            severity: "warning".to_owned(),
+            code: "FIXTURE".to_owned(),
+            message: id.to_owned(),
+            path: None,
+            adapter: None,
+            start_line: None,
+            start_column: None,
+            end_line: None,
+            end_column: None,
+            properties: json!({}),
+        };
+        let mut snapshot = GraphSnapshot {
+            scan: ScanRecord {
+                id: "scan".to_owned(),
+                root: "/fixture".to_owned(),
+                status: "completed".to_owned(),
+                strict: false,
+                started_at: "now".to_owned(),
+                completed_at: Some("now".to_owned()),
+                project_code_executed: false,
+                error: None,
+            },
+            profiles: Vec::new(),
+            nodes: Vec::new(),
+            sites: Vec::new(),
+            edges: Vec::new(),
+            evidence: Vec::new(),
+            diagnostics: vec![diagnostic(4, "diagnostic:z"), diagnostic(9, "diagnostic:a")],
+            file_coverage: Vec::new(),
+            adapter_logs: Vec::new(),
+            coverage: CoverageRecord::default(),
+            profile_matrix: ProfileMatrixRecord::default(),
+        };
+
+        refresh_profile_matrix(&mut snapshot, false);
+        assert_eq!(
+            snapshot
+                .diagnostics
+                .iter()
+                .map(|item| (item.id.as_str(), item.ordinal))
+                .collect::<Vec<_>>(),
+            [("diagnostic:z", 4), ("diagnostic:a", 9)]
+        );
+
+        refresh_profile_matrix(&mut snapshot, true);
+        assert_eq!(
+            snapshot
+                .diagnostics
+                .iter()
+                .map(|item| (item.id.as_str(), item.ordinal))
+                .collect::<Vec<_>>(),
+            [("diagnostic:a", 0), ("diagnostic:z", 1)]
+        );
+    }
 }
