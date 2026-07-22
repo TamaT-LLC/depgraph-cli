@@ -36,7 +36,7 @@ unresolved, semantic-issue, and compiler diagnostic counts, and
 Detected Next.js, Astro, TanStack Router, and TanStack Start profiles must also
 complete their versioned framework semantic capability ledger. Code-based
 routes beyond the safe static boundary, framework-specific build observers,
-runtime traces, incremental updates, snapshot diff/impact, and architecture policies
+runtime traces, incremental updates, snapshot rename/diff CLI/impact, and architecture policies
 remain later milestones. The supervised build protocol and atomic evidence
 union foundation are available separately under the explicit-consent boundary.
 
