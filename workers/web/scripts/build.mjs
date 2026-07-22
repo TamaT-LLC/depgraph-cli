@@ -64,6 +64,17 @@ await build({
   legalComments: "external",
 });
 
+await build({
+  entryPoints: [fileURLToPath(new URL("../src/tanstack-start-build-observer-entry.ts", import.meta.url))],
+  outfile: fileURLToPath(new URL("../dist/tanstack-start-build-observer.mjs", import.meta.url)),
+  bundle: true,
+  platform: "node",
+  format: "esm",
+  target: "node24",
+  sourcemap: false,
+  legalComments: "external",
+});
+
 const astroManifest = fileURLToPath(import.meta.resolve("@astrojs/compiler/package.json"));
 const astroMetadata = JSON.parse(await readFile(astroManifest, "utf8"));
 if (astroMetadata.name !== "@astrojs/compiler" || astroMetadata.version !== "4.0.0") {

@@ -551,6 +551,7 @@ fn is_allowed_environment_key(key: &str) -> bool {
         "DEPGRAPH_OBSERVER"
             | "DEPGRAPH_ASTRO_VERSION"
             | "DEPGRAPH_NEXT_EXISTING_ADAPTER"
+            | "DEPGRAPH_TANSTACK_START_VERSION"
             | "DEPGRAPH_PROFILE"
             | "DEPGRAPH_TARGET"
             | "NEXT_ADAPTER_PATH"
@@ -936,6 +937,10 @@ mod tests {
         );
         plan.environment
             .insert("DEPGRAPH_ASTRO_VERSION".to_owned(), "5.12.0".to_owned());
+        plan.environment.insert(
+            "DEPGRAPH_TANSTACK_START_VERSION".to_owned(),
+            "1.168.28".to_owned(),
+        );
         assert!(plan.validate().is_ok());
     }
 
