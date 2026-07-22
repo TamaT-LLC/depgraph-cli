@@ -549,6 +549,7 @@ fn is_allowed_environment_key(key: &str) -> bool {
     matches!(
         key,
         "DEPGRAPH_OBSERVER"
+            | "DEPGRAPH_ASTRO_VERSION"
             | "DEPGRAPH_NEXT_EXISTING_ADAPTER"
             | "DEPGRAPH_PROFILE"
             | "DEPGRAPH_TARGET"
@@ -933,6 +934,8 @@ mod tests {
             "DEPGRAPH_NEXT_EXISTING_ADAPTER".to_owned(),
             "existing-platform-adapter".to_owned(),
         );
+        plan.environment
+            .insert("DEPGRAPH_ASTRO_VERSION".to_owned(), "5.12.0".to_owned());
         assert!(plan.validate().is_ok());
     }
 

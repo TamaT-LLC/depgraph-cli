@@ -1200,9 +1200,9 @@ Go semantic scanではGOOS/GOARCH、build tags、強制されたcgo無効状態�
 ### Milestone 3: Build Evidence
 
 - safe execution boundary / explicit consent contract: Issue #62で実装済み（2026-07-22）
-- opt-in child-process supervisor: Issue #63
-- Next Adapter observer
-- Astro integration / Vite observer
+- opt-in child-process supervisor: Issue #63で実装済み（2026-07-22）
+- Next Adapter observer: Issue #65で実装済み（2026-07-22）
+- Astro integration / Vite observer: Issue #66で実装済み（2026-07-22）
 - TanStack Start build observer
 - Rust build script / proc macro opt-in
 - profile matrix union
@@ -1231,7 +1231,6 @@ Go semantic scanではGOOS/GOARCH、build tags、強制されたcgo無効状態�
 ## 23. Open Questions
 
 - binary / product の最終名称を `depgraph` とするか
-- Next.js の既存 adapter と observer を安全に chain する方法
 - default profile matrix の範囲と組合せ爆発の抑制方法
 - Rust compiler-precise MIR backend をどの opt-in toolchain channel で提供するか（safe HIR backend の方式は ADR-007 で決定済み）
 - GraphQL / OpenAPI / Protocol Buffers / FFI adapter の優先順位
@@ -1257,6 +1256,7 @@ Go semantic scanではGOOS/GOARCH、build tags、強制されたcgo無効状態�
 
 ## 26. 更新履歴
 
+- 2026-07-22: Issue #66としてAstro `5.x`〜`7.x` Integration APIとVite `6.x`〜`7.x` build observerを実装。`astro:routes:resolved` / `astro:config:done` / `astro:build:setup` / `astro:build:ssr` / `astro:build:done`とpost build pluginをversion / hook capability gate下でchainし、既存integration / Vite pluginを置換せず保持する。client / SSR別のresolved config、module import graph、chunk / asset digest、injected route、route assetをallowlist metadataへ正規化し、module source、artifact bytes、secret値、repository外absolute path、raw crash textを保存しない。safe Astro route / component / content / assetとの相関、injected / static-only / conflict / dynamic-config diagnostic、environment別`imports` / `dynamic_imports` / `renders` / `emits` / `loads` build evidenceとprotocol eventを決定的に生成する。unsupported version / hook、chain衝突、observer crash / timeoutをpartial graphへ昇格せず固定診断へfail closedする。
 - 2026-07-22: Issue #65としてNext `16.2.x`以降の16系Adapter API observerを実装。version / hook shape / existing adapter loadをbuild前にfail closedで判定し、既存`modifyConfig` / `onBuildComplete`を保持する明示chainだけを許可する。final config、routing phase、route、runtime、output、asset / WASMをallowlist metadataとconfined artifact digestへ正規化し、config / environment / header value、regex、absolute path、raw crash textを保存しない。safe routeとのcanonical相関、observed-only route、runtime / multi-match drift diagnostic、`emits` / `loads` / `routes_in_phase`のbuild site / edge、supervisor provenanceを持つgenerated nodeとprotocol eventを決定的に生成する。bundled adapter fixtureは実artifactを観測してsecret非漏洩とportable pathを検証する。
 - 2026-07-22: Issue #64としてbuild evidence protocolとschema v7 store unionを実装。build site / edgeは`precision=observed`、edgeは`phase=build`、primary evidenceは`kind=build`とし、run / profile / observer、command-plan / toolchain / environment-key / validated-output digestをsupervisor auditと照合する。spanなしevidenceはlogical artifact path / digestを必須にし、secret-like property、混在attempt、非canonical stable ID、未承認generated nodeをrejectする。build attemptはcompleted base scanとauditへ外部キーで結び、delta全体を単一transactionで検証・保存し、completed promotionだけをquery時にunionする。source / semanticのnode・site・edgeは上書きせず、同一targetの複数phaseを保持し、target矛盾は両provenance付きdiagnosticとして公開する。failed / partial / timeout / cancel / security failureはdeltaを破棄して直前completed unionを維持し、CLI textとJSON / DOT / Mermaidはphaseを明示する。
 - 2026-07-22: Issue #62としてADR-009と`resolve --build --allow-project-code`契約を確定。build tool / config / plugin / build script / proc macroとdescendantをuntrusted codeとして分離し、呼出しごとのflag以外のimplicit consentとpromptを禁止した。flag欠落はpath/config/store/tool probe前にexit `4`、supervisor未実装中はflagありでもchildを起動せずexit `3`とする。command / logical cwd / toolchain / environment key / isolation / outcome audit、secret value非保存とsecret-like key redaction、timeout / cancel / network / temporary output、failure時のatomic discardと直前completed snapshot保持、`phase=build` / `precision=observed` union、受け入れmatrixを定義し、通常/CI/implicit env/armed fixtureのunit・CLI E2Eでguardを固定した。
