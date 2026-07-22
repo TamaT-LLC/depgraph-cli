@@ -1,7 +1,7 @@
 import path from "node:path";
 import ts from "typescript";
 import { normalizeRelative, readJson, readUtf8, WEB_SOURCE_EXTENSIONS, type FileInventoryIssue } from "./fs";
-import { compareById, stableId } from "./ids";
+import { compareById, contentHash, stableId } from "./ids";
 import {
   extractDependencies,
   extractPotentialTypeScriptModuleSpecifiers,
@@ -1105,6 +1105,7 @@ class GraphBuilder {
         extension,
         language: extension === ".astro" ? "astro" : [".ts", ".tsx", ".mts", ".cts"].includes(extension) ? "typescript" : [".js", ".jsx", ".mjs", ".cjs"].includes(extension) ? "javascript" : "data",
         package_id: owner.id,
+        package_locator: owner.locator,
         generated,
       },
     };
@@ -2027,6 +2028,7 @@ export async function scan(root: string, allFiles: string[], inventoryIssues: Fi
       });
       continue;
     }
+    node.properties.content_hash = contentHash(source);
     if (extension === ".astro") astroSources.set(relative, source);
     const typeOnlyRanges = nativeTypeScript.typeOnlyDependencyRanges.get(relative) ?? [];
     const extraction = typeOnlyRanges.length === 0

@@ -25,6 +25,7 @@ use depgraph_protocol::{
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::OsStr,
@@ -59,6 +60,17 @@ struct SourceUnit {
     package_index: Option<usize>,
     text: Option<String>,
     syntax: Option<syn::File>,
+}
+
+fn source_content_hash(source: &str) -> String {
+    use std::fmt::Write as _;
+
+    let digest = Sha256::digest(source.as_bytes());
+    let mut output = String::from("sha256:");
+    for byte in digest {
+        write!(&mut output, "{byte:02x}").expect("writing a digest to String cannot fail");
+    }
+    output
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -595,6 +607,7 @@ impl State {
                 .lines()
                 .take(8)
                 .any(|line| line.contains("@generated") || line.contains("DO NOT EDIT"));
+            let content_hash = source.as_deref().map(source_content_hash);
             self.insert_node(GraphNode {
                 id: file_id.clone(),
                 kind: "file".into(),
@@ -603,7 +616,9 @@ impl State {
                 properties: properties(json!({
                     "language": "rust",
                     "generated": generated,
-                    "package": package_index.map(|index| packages[index].name.clone())
+                    "package": package_index.map(|index| packages[index].name.clone()),
+                    "package_locator": package_locator,
+                    "content_hash": content_hash
                 })),
             })?;
             self.file_nodes.insert(rel_path.clone(), file_id);
@@ -3454,6 +3469,14 @@ fn scannable_entry(entry: &DirEntry) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_hash_uses_raw_utf8_bytes_and_explicit_algorithm_prefix() {
+        assert_eq!(
+            source_content_hash("abc"),
+            "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
 
     fn write_complete_semantic_fixture(root: &Path) {
         fs::create_dir_all(root.join("src")).unwrap();

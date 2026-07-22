@@ -238,6 +238,11 @@ func stableID(kind, workspace string, parts ...string) string {
 	return kind + ":sha256:" + hex.EncodeToString(sum[:])
 }
 
+func contentHash(contents []byte) string {
+	sum := sha256.Sum256(contents)
+	return "sha256:" + hex.EncodeToString(sum[:])
+}
+
 func profileScopedID(kind, workspace, profileID string, parts ...string) string {
 	canonicalParts := make([]string, 0, len(parts)+2)
 	canonicalParts = append(canonicalParts, "profile", profileID)
