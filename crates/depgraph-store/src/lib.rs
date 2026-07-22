@@ -13,8 +13,13 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+mod diff;
 mod profile_matrix;
 
+pub use diff::{
+    ChangedRecord, GraphSnapshotDiff, RecordDiff, SNAPSHOT_DIFF_SCHEMA_VERSION,
+    diff_graph_snapshots,
+};
 use profile_matrix::refresh_profile_matrix;
 pub use profile_matrix::{
     PROFILE_MATRIX_SCHEMA_VERSION, PhaseCoverageRecord, ProfileAxisConflictRecord,
