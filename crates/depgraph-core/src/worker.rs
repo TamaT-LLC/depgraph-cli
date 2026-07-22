@@ -1581,7 +1581,7 @@ pub(crate) fn sanitized_path(root: &Path) -> Result<OsString> {
     sanitize_path_value(&raw, root)
 }
 
-fn sanitize_path_value(raw: &OsStr, root: &Path) -> Result<OsString> {
+pub(crate) fn sanitize_path_value(raw: &OsStr, root: &Path) -> Result<OsString> {
     let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let mut paths = Vec::new();
     for path in std::env::split_paths(raw) {

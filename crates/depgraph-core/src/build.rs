@@ -21,6 +21,8 @@ use crate::rust_build_observer::{
     RUST_BUILD_OBSERVER, RUST_BUILD_OBSERVER_VERSION, RustBuildObservation,
     collect_rust_build_observation,
 };
+#[cfg(windows)]
+use crate::worker::sanitize_path_value;
 use crate::worker::{
     ProcessTreeGuard, finish_reader, locate_web_build_runtime, process_argument_path, read_capped,
     resolve_safe_executable, run_probe, sanitized_path, terminate_worker,
@@ -741,6 +743,19 @@ fn supervisor_environment(
             })
         }) {
             environment.insert("RUSTUP_HOME".to_owned(), value);
+        }
+        #[cfg(windows)]
+        for key in ["INCLUDE", "LIB", "LIBPATH"] {
+            let Some(value) = std::env::var_os(key) else {
+                continue;
+            };
+            // MSVC's compiler and linker require these path lists even when
+            // rustc itself is resolved by absolute path. Preserve only existing
+            // directories outside the project root so the isolated build cannot
+            // inherit project-controlled search paths.
+            if let Ok(value) = sanitize_path_value(&value, root) {
+                environment.insert(key.to_owned(), value.to_string_lossy().into_owned());
+            }
         }
     }
     if let Some(system_root) = std::env::var_os("SystemRoot") {
