@@ -35,10 +35,10 @@ unresolved, semantic-issue, and compiler diagnostic counts, and
 `project_code_executed=false`. Candidate and external Web sites are allowed.
 Detected Next.js, Astro, TanStack Router, and TanStack Start profiles must also
 complete their versioned framework semantic capability ledger. Code-based
-routes beyond the safe static boundary, framework-specific build observers,
-runtime traces, incremental updates, and architecture policies remain later
-milestones. The supervised build protocol and atomic evidence union foundation
-are available separately under the explicit-consent boundary.
+routes beyond the safe static boundary, runtime traces, watcher-driven
+incremental invalidation, and architecture policies remain later milestones.
+The supervised build protocol, atomic evidence union foundation, and validated
+syntax/semantic/build cache storage are available separately.
 
 ## Build
 
@@ -65,6 +65,7 @@ depgraph init .
 # Safe static scan. The target repository is not modified.
 depgraph scan /path/to/repository
 depgraph scan /path/to/repository --strict
+depgraph scan /path/to/repository --no-cache
 
 # Privileged build-observation consent form.
 depgraph resolve --build /path/to/repository --allow-project-code
@@ -107,6 +108,8 @@ depgraph export --format mermaid > graph.mmd
 ```
 
 SQLite is stored under the operating system cache directory, keyed by the canonical repository root. Use global `--store PATH` for a specific database and global `--scan-id ID` to inspect a retained partial scan. Queries default to the latest successful scan; `doctor` reports the latest attempt.
+
+Store schema v10 separates profile-independent `syntax`, profile-dependent `semantic`, and observed `build` cache entries. Keys use contract v1 canonical digests of repository-relative file bytes, manifest/lock/config inputs, adapter/protocol artifacts, toolchain/framework identities, profiles, and generated artifact fingerprints; checkout, cache, and temporary absolute paths are not key dimensions. A semantic hit is reused only after key, contract, completed-snapshot, and canonical payload integrity checks, then copied into a fresh scan attempt and validated before promotion. Unknown versions, corruption, symlinks, unsafe inventory bounds, and dependency snapshots that cannot be re-derived before scanning are explicit misses/rejections. `scan --no-cache` bypasses lookup and storage. Scan JSON/text and `doctor` expose cache hit/miss/reject reasons without adding cache bookkeeping to the canonical graph.
 
 `snapshot create` names the current completed snapshot; global `--scan-id ID` may instead select the completed snapshot produced by that scan and its latest promoted build. Failed or incomplete attempts cannot be named. Names are immutable, case-insensitively unique, 1–64 ASCII characters, begin with a letter or digit, and otherwise use letters, digits, `.`, `_`, or `-`. `current` and `latest` are reserved, and existing names are never overwritten. `snapshot show` accepts a name, a `snapshot:sha256:...` stable ID, or `current`. List and detail JSON are emitted in canonical order.
 

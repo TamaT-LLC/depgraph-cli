@@ -4,7 +4,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use depgraph_store::{CoverageRecord, DiagnosticRecord, Store};
+use depgraph_store::{CacheEventRecord, CacheLayer, CoverageRecord, DiagnosticRecord, Store};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -12,6 +12,7 @@ use tokio::task::{Id, JoinError, JoinSet};
 use uuid::Uuid;
 
 use crate::{
+    cache::{ScanCachePlan, ScanCachePreparation, prepare_scan_cache},
     config::Config,
     worker::{
         AdapterKind, WorkerFailureKind, WorkerOutput, WorkerSpec, detect_adapters, execute_worker,
@@ -26,6 +27,13 @@ pub struct ScanOutcome {
     pub exit_code: u8,
     pub coverage: CoverageRecord,
     pub diagnostics: Vec<DiagnosticRecord>,
+    pub cache_events: Vec<CacheEventRecord>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanCacheMode {
+    Enabled,
+    Disabled,
 }
 
 #[derive(Debug)]
@@ -111,6 +119,16 @@ pub async fn run_scan(
     config: &Config,
     strict: bool,
 ) -> Result<ScanOutcome> {
+    run_scan_with_cache_mode(store, root, config, strict, ScanCacheMode::Enabled).await
+}
+
+pub async fn run_scan_with_cache_mode(
+    store: &mut Store,
+    root: PathBuf,
+    config: &Config,
+    strict: bool,
+    cache_mode: ScanCacheMode,
+) -> Result<ScanOutcome> {
     let root = root
         .canonicalize()
         .with_context(|| format!("failed to canonicalize {}", root.display()))?;
@@ -126,6 +144,7 @@ pub async fn run_scan(
     let adapters = match detect_adapters(&root, config.scan.follow_symlinks) {
         Ok(adapters) => adapters,
         Err(error) => {
+            record_cache_rejection(store, &scan_id, "workspace-detection-failed")?;
             add_core_diagnostic(
                 store,
                 &scan_id,
@@ -143,8 +162,63 @@ pub async fn run_scan(
         workers_to_run,
         mut failures,
     } = preflight_workers(adapters, locate_worker);
+    let mut cache_plan = None;
+    if cache_mode == ScanCacheMode::Disabled {
+        record_cache_rejection(store, &scan_id, "disabled-by-request")?;
+    } else if !failures.is_empty() {
+        record_cache_rejection(store, &scan_id, "worker-preflight-failed")?;
+    } else {
+        match prepare_scan_cache(
+            &root,
+            config,
+            &workers_to_run,
+            store.database_path().as_deref(),
+        ) {
+            ScanCachePreparation::Rejected(reason) => {
+                record_cache_rejection(store, &scan_id, reason)?;
+            }
+            ScanCachePreparation::Ready(plan) => {
+                let _ = store.lookup_snapshot_cache(&plan.syntax, Some(&scan_id), None)?;
+                if let Some(semantic_key) = &plan.semantic {
+                    let semantic =
+                        store.lookup_snapshot_cache(semantic_key, Some(&scan_id), None)?;
+                    if semantic.outcome == "hit"
+                        && let Some(snapshot_id) = semantic.snapshot_id
+                    {
+                        match store.clone_completed_scan_into_staging(&snapshot_id, &scan_id) {
+                            Ok(()) => {
+                                return complete_scan(store, &scan_id, strict, config, None);
+                            }
+                            Err(_) => {
+                                store.record_cache_event(
+                                    Some(&scan_id),
+                                    None,
+                                    CacheLayer::Semantic,
+                                    Some(&semantic_key.key),
+                                    "reject",
+                                    "clone-validation-failed",
+                                )?;
+                            }
+                        }
+                    }
+                } else {
+                    store.record_cache_event(
+                        Some(&scan_id),
+                        None,
+                        CacheLayer::Semantic,
+                        None,
+                        "reject",
+                        plan.semantic_reject_reason
+                            .unwrap_or("semantic-identity-unavailable"),
+                    )?;
+                }
+                cache_plan = Some(plan);
+            }
+        }
+    }
     let mut join_set = JoinSet::new();
     let mut task_adapters = BTreeMap::new();
+    let cache_workers = cache_plan.as_ref().map(|_| workers_to_run.clone());
     for (adapter, spec) in workers_to_run {
         let root = root.clone();
         let scan_id = scan_id.clone();
@@ -239,20 +313,45 @@ pub async fn run_scan(
         return snapshot_outcome(store, &scan_id, if security_violation { 4 } else { 3 });
     }
 
-    if let Err(error) = store.validate_scan(&scan_id) {
+    if let (Some(expected), Some(workers)) = (cache_plan.take(), cache_workers.as_deref()) {
+        match prepare_scan_cache(&root, config, workers, store.database_path().as_deref()) {
+            ScanCachePreparation::Ready(observed)
+                if observed.syntax == expected.syntax
+                    && observed.semantic == expected.semantic
+                    && observed.semantic_reject_reason == expected.semantic_reject_reason =>
+            {
+                cache_plan = Some(expected);
+            }
+            _ => {
+                record_cache_rejection(store, &scan_id, "input-or-toolchain-changed-during-scan")?;
+            }
+        }
+    }
+
+    complete_scan(store, &scan_id, strict, config, cache_plan.as_ref())
+}
+
+fn complete_scan(
+    store: &mut Store,
+    scan_id: &str,
+    strict: bool,
+    config: &Config,
+    cache_plan: Option<&ScanCachePlan>,
+) -> Result<ScanOutcome> {
+    if let Err(error) = store.validate_scan(scan_id) {
         add_core_diagnostic(
             store,
-            &scan_id,
+            scan_id,
             "error",
             "graph-validation-failed",
             &format!("{error:#}"),
             "graph-validation-failed",
         )?;
-        store.finish_scan(&scan_id, "failed", Some(&error.to_string()), false)?;
-        return snapshot_outcome(store, &scan_id, 3);
+        store.finish_scan(scan_id, "failed", Some(&error.to_string()), false)?;
+        return snapshot_outcome(store, scan_id, 3);
     }
 
-    let coverage = store.load_snapshot(&scan_id)?.coverage;
+    let coverage = store.load_snapshot(scan_id)?.coverage;
     let rust_hir_backend_failure = has_rust_hir_backend_failure(&coverage);
     let strict_failure = strict && violates_strict_policy(&coverage, config);
     if strict_failure {
@@ -267,18 +366,34 @@ pub async fn run_scan(
         );
         add_core_diagnostic(
             store,
-            &scan_id,
+            scan_id,
             "error",
             "strict-policy",
             &message,
             "strict-policy",
         )?;
-        store.finish_scan(&scan_id, "policy_failed", Some(&message), false)?;
-        return snapshot_outcome(store, &scan_id, 1);
+        store.finish_scan(scan_id, "policy_failed", Some(&message), false)?;
+        return snapshot_outcome(store, scan_id, 1);
     }
 
-    store.finish_scan(&scan_id, "completed", None, true)?;
-    snapshot_outcome(store, &scan_id, 0)
+    store.finish_scan(scan_id, "completed", None, true)?;
+    if let Some(plan) = cache_plan {
+        let snapshot_id = store
+            .snapshot_id_for_source("scan", scan_id)?
+            .context("completed scan did not expose its snapshot")?;
+        let _ = store.store_snapshot_cache(&plan.syntax, &snapshot_id, Some(scan_id), None)?;
+        if let Some(semantic) = &plan.semantic {
+            let _ = store.store_snapshot_cache(semantic, &snapshot_id, Some(scan_id), None)?;
+        }
+    }
+    snapshot_outcome(store, scan_id, 0)
+}
+
+fn record_cache_rejection(store: &Store, scan_id: &str, reason: &str) -> Result<()> {
+    for layer in [CacheLayer::Syntax, CacheLayer::Semantic] {
+        store.record_cache_event(Some(scan_id), None, layer, None, "reject", reason)?;
+    }
+    Ok(())
 }
 
 fn git_source_revision(root: &Path) -> Option<String> {
@@ -488,6 +603,7 @@ fn snapshot_outcome(store: &Store, scan_id: &str, exit_code: u8) -> Result<ScanO
         exit_code,
         coverage: snapshot.coverage,
         diagnostics: snapshot.diagnostics,
+        cache_events: store.cache_events_for_scan(scan_id)?,
     })
 }
 
@@ -600,6 +716,78 @@ mod tests {
         assert_eq!(outcome.exit_code, 0);
         assert_eq!(outcome.status, "completed");
         assert_eq!(outcome.coverage.dependency_sites, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn repeated_and_cross_checkout_scans_use_validated_semantic_cache() -> Result<()> {
+        let first_root = tempfile::tempdir()?;
+        let second_root = tempfile::tempdir()?;
+        let mut store = Store::open_in_memory()?;
+        let first = run_scan(
+            &mut store,
+            first_root.path().to_path_buf(),
+            &Config::default(),
+            false,
+        )
+        .await?;
+        assert!(
+            first
+                .cache_events
+                .iter()
+                .any(|event| { event.layer == CacheLayer::Semantic && event.outcome == "miss" })
+        );
+        assert!(
+            first
+                .cache_events
+                .iter()
+                .any(|event| { event.layer == CacheLayer::Semantic && event.outcome == "stored" })
+        );
+
+        let second = run_scan(
+            &mut store,
+            second_root.path().to_path_buf(),
+            &Config::default(),
+            false,
+        )
+        .await?;
+        assert!(second.cache_events.iter().any(|event| {
+            event.layer == CacheLayer::Semantic
+                && event.outcome == "hit"
+                && event.reason == "validated"
+        }));
+
+        let uncached = run_scan_with_cache_mode(
+            &mut store,
+            second_root.path().to_path_buf(),
+            &Config::default(),
+            false,
+            ScanCacheMode::Disabled,
+        )
+        .await?;
+        assert!(uncached.cache_events.iter().any(|event| {
+            event.layer == CacheLayer::Semantic
+                && event.outcome == "reject"
+                && event.reason == "disabled-by-request"
+        }));
+
+        let first_graph = store.load_snapshot(&first.scan_id)?;
+        let second_graph = store.load_snapshot(&second.scan_id)?;
+        let uncached_graph = store.load_snapshot(&uncached.scan_id)?;
+        assert_eq!(first_graph.profiles, second_graph.profiles);
+        assert_eq!(first_graph.nodes, second_graph.nodes);
+        assert_eq!(first_graph.sites, second_graph.sites);
+        assert_eq!(first_graph.edges, second_graph.edges);
+        assert_eq!(first_graph.evidence, second_graph.evidence);
+        assert_eq!(first_graph.diagnostics, second_graph.diagnostics);
+        assert_eq!(first_graph.coverage, second_graph.coverage);
+        assert_eq!(first_graph.profiles, uncached_graph.profiles);
+        assert_eq!(first_graph.nodes, uncached_graph.nodes);
+        assert_eq!(first_graph.sites, uncached_graph.sites);
+        assert_eq!(first_graph.edges, uncached_graph.edges);
+        assert_eq!(first_graph.evidence, uncached_graph.evidence);
+        assert_eq!(first_graph.diagnostics, uncached_graph.diagnostics);
+        assert_eq!(first_graph.coverage, uncached_graph.coverage);
         Ok(())
     }
 

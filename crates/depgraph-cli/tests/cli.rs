@@ -997,6 +997,45 @@ fn empty_safe_scan_uses_external_store_and_reports_json() {
         .success()
         .stdout(predicate::str::contains("\"status\": \"completed\""))
         .stdout(predicate::str::contains("\"project_code_executed\": false"));
+    Command::cargo_bin("depgraph")
+        .unwrap()
+        .args([
+            "--store",
+            store.to_str().unwrap(),
+            "scan",
+            root.path().to_str().unwrap(),
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"layer\": \"semantic\""))
+        .stdout(predicate::str::contains("\"outcome\": \"hit\""))
+        .stdout(predicate::str::contains("\"reason\": \"validated\""));
+    Command::cargo_bin("depgraph")
+        .unwrap()
+        .args([
+            "--store",
+            store.to_str().unwrap(),
+            "scan",
+            root.path().to_str().unwrap(),
+            "--no-cache",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"outcome\": \"reject\""))
+        .stdout(predicate::str::contains(
+            "\"reason\": \"disabled-by-request\"",
+        ));
+    Command::cargo_bin("depgraph")
+        .unwrap()
+        .current_dir(root.path())
+        .args(["--store", store.to_str().unwrap(), "doctor", "--json"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"store_schema_version\": 10"))
+        .stdout(predicate::str::contains("\"cache_contract_version\": 1"))
+        .stdout(predicate::str::contains("\"semantic\": 1"));
     assert!(store.exists());
     assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
 }
@@ -1121,11 +1160,21 @@ fn consented_build_mode_runs_project_code_only_in_the_supervised_staging_area() 
         .stdout(predicate::str::contains("status: Completed"))
         .stdout(predicate::str::contains("project code executed: true"))
         .stdout(predicate::str::contains("build evidence: promoted"))
+        .stdout(predicate::str::contains("build cache: stored"))
         .stderr(predicate::str::contains("network isolation"));
 
     assert!(!marker.exists());
     assert!(store_path.exists());
     let store = depgraph_store::Store::open(&store_path).unwrap();
+    assert_eq!(store.cache_entry_counts().unwrap().build, 1);
+    assert!(
+        store
+            .recent_cache_events(20)
+            .unwrap()
+            .iter()
+            .any(|event| event.layer == depgraph_store::CacheLayer::Build
+                && event.outcome == "stored")
+    );
     let audit = store.latest_build_audit().unwrap().unwrap().audit;
     let serialized = serde_json::to_string(&audit).unwrap();
     assert_eq!(audit["outcome"], "completed");

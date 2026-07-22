@@ -1,5 +1,6 @@
 pub mod build;
 pub mod build_evidence;
+pub mod cache;
 pub mod config;
 pub mod export;
 pub mod impact;
@@ -15,8 +16,8 @@ use std::{
 
 use anyhow::Result;
 use depgraph_store::{
-    AdapterLogRecord, CoverageRecord, DiagnosticRecord, FileCoverageRecord, ProfileMatrixRecord,
-    ProfileRecord, Store,
+    AdapterLogRecord, CACHE_CONTRACT_VERSION, CacheEntryCounts, CacheEventRecord, CoverageRecord,
+    DiagnosticRecord, FileCoverageRecord, ProfileMatrixRecord, ProfileRecord, Store,
 };
 use serde::{Deserialize, Serialize};
 
@@ -30,6 +31,7 @@ pub use build::{
 pub use build_evidence::{
     stage_build_evidence, validate_build_evidence, web_build_protocol_ndjson,
 };
+pub use cache::build_cache_key;
 pub use config::{Config, default_store_path, init_config};
 pub use depgraph_store::GraphSnapshot;
 pub use export::{ExportFormat, export};
@@ -46,7 +48,7 @@ pub use rust_build_observer::{
     RUST_BUILD_OBSERVER_VERSION, RustBuildObservation, rust_build_protocol_events,
     rust_build_protocol_ndjson,
 };
-pub use scan::{ScanOutcome, run_scan};
+pub use scan::{ScanCacheMode, ScanOutcome, run_scan, run_scan_with_cache_mode};
 
 use worker::{
     AdapterKind, RUST_BACKEND_KIND, RUST_BACKEND_REVISION, RUST_BACKEND_SALSA_VERSION,
@@ -78,6 +80,7 @@ pub struct ScanHealth {
     pub detected_packages: BTreeMap<String, String>,
     pub diagnostics: Vec<DiagnosticRecord>,
     pub profile_matrix: ProfileMatrixRecord,
+    pub cache_events: Vec<CacheEventRecord>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -85,6 +88,9 @@ pub struct DoctorReport {
     pub protocol_version: &'static str,
     pub graph_schema_version: &'static str,
     pub store_schema_version: i64,
+    pub cache_contract_version: u32,
+    pub cache_entries: CacheEntryCounts,
+    pub recent_cache_events: Vec<CacheEventRecord>,
     pub toolchains: BTreeMap<String, String>,
     pub supported_baselines: BTreeMap<String, String>,
     pub workers: Vec<WorkerHealth>,
@@ -211,7 +217,7 @@ pub async fn doctor(store: &Store) -> Result<DoctorReport> {
                 })
                 .collect();
             Ok::<_, anyhow::Error>(ScanHealth {
-                scan_id,
+                scan_id: scan_id.clone(),
                 status: snapshot.scan.status,
                 root: snapshot.scan.root,
                 project_code_executed: snapshot.scan.project_code_executed,
@@ -222,6 +228,7 @@ pub async fn doctor(store: &Store) -> Result<DoctorReport> {
                 detected_packages,
                 diagnostics: snapshot.diagnostics,
                 profile_matrix: snapshot.profile_matrix,
+                cache_events: store.cache_events_for_scan(&scan_id)?,
             })
         })
         .transpose()?;
@@ -229,6 +236,9 @@ pub async fn doctor(store: &Store) -> Result<DoctorReport> {
         protocol_version: "1.0",
         graph_schema_version: "1.0",
         store_schema_version: store.schema_version()?,
+        cache_contract_version: CACHE_CONTRACT_VERSION,
+        cache_entries: store.cache_entry_counts()?,
+        recent_cache_events: store.recent_cache_events(20)?,
         toolchains: toolchain_versions(&root).await,
         supported_baselines: BTreeMap::from([
             ("rust".to_owned(), "1.93.1".to_owned()),
