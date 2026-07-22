@@ -91,6 +91,286 @@ fn seed_safe_rust_scan(
         .unwrap();
 }
 
+fn seed_cli_diff_snapshot(
+    store_path: &std::path::Path,
+    root: &std::path::Path,
+    scan_id: &str,
+    name: &str,
+    target: bool,
+) -> String {
+    let mut store = depgraph_store::Store::open(store_path).unwrap();
+    store
+        .start_scan_with_revision(
+            scan_id,
+            root,
+            false,
+            Some(if target { "revision-2" } else { "revision-1" }),
+        )
+        .unwrap();
+    let coverage = json!({
+        "profiles": 1,
+        "files_discovered": 0,
+        "files_analyzed": 0,
+        "files_skipped": 0,
+        "dependency_sites": 1,
+        "resolved": if target { 0 } else { 1 },
+        "candidates": 0,
+        "external": 0,
+        "unresolved": if target { 1 } else { 0 },
+        "unsupported_syntax": 0,
+        "project_code_executed": false,
+        "completeness": ["syntax-complete"],
+        "reasons": []
+    });
+    let common = |event: &str, seq: u64| {
+        json!({
+            "event": event,
+            "protocol_version": "1.0",
+            "scan_id": scan_id,
+            "adapter": "fixture",
+            "adapter_version": "1.0",
+            "seq": seq
+        })
+    };
+    let mut events = Vec::new();
+    let mut started = common("scan_started", 1);
+    started["root"] = json!(root.to_string_lossy());
+    started["project_code_executed"] = json!(false);
+    started["safe_mode"] = json!(true);
+    events.push(started);
+    let mut profile = common("profile_declared", 2);
+    profile["profile"] = json!({
+        "id": "fixture:safe",
+        "language": "go",
+        "features": [],
+        "environment": {"version": if target { 2 } else { 1 }},
+        "properties": {}
+    });
+    events.push(profile);
+    let shared = json!({
+        "id": "file:shared",
+        "kind": "file",
+        "locator": "file:src/shared.go",
+        "display_name": "src/shared.go",
+        "properties": {"path": "src/shared.go", "version": if target { 2 } else { 1 }}
+    });
+    let moved = if target {
+        json!({
+            "id": "file:new",
+            "kind": "file",
+            "locator": "file:src/new.go",
+            "display_name": "src/new.go",
+            "properties": {
+                "path": "src/new.go",
+                "package_locator": "go:example.test/fixture",
+                "content_hash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            }
+        })
+    } else {
+        json!({
+            "id": "file:old",
+            "kind": "file",
+            "locator": "file:src/old.go",
+            "display_name": "src/old.go",
+            "properties": {
+                "path": "src/old.go",
+                "package_locator": "go:example.test/fixture",
+                "content_hash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            }
+        })
+    };
+    let symbol = if target {
+        json!({
+            "id": "symbol:added",
+            "kind": "symbol",
+            "locator": "go:fixture#Added",
+            "display_name": "Added",
+            "properties": {}
+        })
+    } else {
+        json!({
+            "id": "symbol:removed",
+            "kind": "symbol",
+            "locator": "go:fixture#Removed",
+            "display_name": "Removed",
+            "properties": {}
+        })
+    };
+    let unknown = json!({
+        "id": "unknown:missing",
+        "kind": "unknown_target",
+        "locator": "unknown:example.test/dependency",
+        "display_name": "example.test/dependency",
+        "properties": {}
+    });
+    for (offset, node) in [shared, moved, symbol, unknown].into_iter().enumerate() {
+        let mut event = common("node_upsert", offset as u64 + 3);
+        event["node"] = node;
+        events.push(event);
+    }
+    let (site_id, edge_id, phase, status, target_id, path, line) = if target {
+        (
+            "site:new",
+            "edge:new",
+            "semantic",
+            "unresolved",
+            "unknown:missing",
+            "src/new.go",
+            7,
+        )
+    } else {
+        (
+            "site:old",
+            "edge:old",
+            "source",
+            "resolved",
+            "file:shared",
+            "src/old.go",
+            3,
+        )
+    };
+    let evidence = json!([{
+        "kind": if target { "semantic" } else { "source" },
+        "extractor": "fixture",
+        "extractor_version": "1.0",
+        "path": path,
+        "start_line": line,
+        "start_column": 1,
+        "end_line": line,
+        "end_column": 8,
+        "detail": if target { "unresolved import" } else { "resolved import" },
+        "properties": {}
+    }]);
+    let mut site = common("dependency_site", 7);
+    site["site"] = json!({
+        "id": site_id,
+        "source": if target { "file:new" } else { "file:old" },
+        "kind": "import",
+        "specifier": "example.test/dependency",
+        "resolution_status": status,
+        "target_ids": [target_id],
+        "profile_id": "fixture:safe",
+        "condition": {"op": "all", "conditions": []},
+        "precision": "exact",
+        "reason": if target { Some("package_not_found") } else { None::<&str> },
+        "evidence": evidence
+    });
+    events.push(site);
+    let mut edge = common("edge_upsert", 8);
+    edge["edge"] = json!({
+        "id": edge_id,
+        "source": if target { "file:new" } else { "file:old" },
+        "target": target_id,
+        "kind": "imports",
+        "site_id": site_id,
+        "phase": phase,
+        "environment": "host",
+        "profile_id": "fixture:safe",
+        "condition": {"op": "all", "conditions": []},
+        "resolution_status": status,
+        "precision": "exact",
+        "generated": false,
+        "evidence": evidence
+    });
+    events.push(edge);
+    let mut profile_completed = common("profile_completed", 9);
+    profile_completed["profile_id"] = json!("fixture:safe");
+    profile_completed["coverage"] = coverage.clone();
+    events.push(profile_completed);
+    let mut completed = common("scan_completed", 10);
+    completed["coverage"] = coverage;
+    events.push(completed);
+    for event in events {
+        store.ingest_event(&event).unwrap();
+    }
+    store.finish_scan(scan_id, "completed", None, true).unwrap();
+    let snapshot_id = store
+        .snapshot_id_for_source("scan", scan_id)
+        .unwrap()
+        .unwrap();
+    store.create_snapshot_name(name, &snapshot_id).unwrap();
+    snapshot_id
+}
+
+fn seed_large_cli_diff_snapshot(
+    store: &mut depgraph_store::Store,
+    root: &std::path::Path,
+    scan_id: &str,
+    version: u64,
+    node_count: usize,
+) -> String {
+    store
+        .start_scan_with_revision(
+            scan_id,
+            root,
+            false,
+            Some(&format!("large-revision-{version}")),
+        )
+        .unwrap();
+    let common = |event: &str, seq: u64| {
+        json!({
+            "event": event,
+            "protocol_version": "1.0",
+            "scan_id": scan_id,
+            "adapter": "fixture",
+            "adapter_version": "1.0",
+            "seq": seq
+        })
+    };
+    let mut started = common("scan_started", 1);
+    started["root"] = json!(root.to_string_lossy());
+    started["project_code_executed"] = json!(false);
+    started["safe_mode"] = json!(true);
+    store.ingest_event(&started).unwrap();
+    let coverage = json!({
+        "profiles": 1,
+        "files_discovered": 0,
+        "files_analyzed": 0,
+        "files_skipped": 0,
+        "dependency_sites": 0,
+        "resolved": 0,
+        "candidates": 0,
+        "external": 0,
+        "unresolved": 0,
+        "unsupported_syntax": 0,
+        "project_code_executed": false,
+        "completeness": ["syntax-complete"],
+        "reasons": []
+    });
+    let mut profile = common("profile_declared", 2);
+    profile["profile"] = json!({
+        "id": "fixture:large",
+        "language": "go",
+        "features": [],
+        "environment": {},
+        "properties": {}
+    });
+    store.ingest_event(&profile).unwrap();
+    for index in (0..node_count).rev() {
+        let mut node = common("node_upsert", (node_count - index) as u64 + 2);
+        node["node"] = json!({
+            "id": format!("file:{index:05}"),
+            "kind": "file",
+            "locator": format!("file:src/{index:05}.go"),
+            "display_name": format!("src/{index:05}.go"),
+            "properties": {"version": version}
+        });
+        store.ingest_event(&node).unwrap();
+    }
+    let mut profile_completed = common("profile_completed", node_count as u64 + 3);
+    profile_completed["profile_id"] = json!("fixture:large");
+    profile_completed["coverage"] = coverage.clone();
+    store.ingest_event(&profile_completed).unwrap();
+    let mut completed = common("scan_completed", node_count as u64 + 4);
+    completed["coverage"] = coverage;
+    store.ingest_event(&completed).unwrap();
+    store.finish_scan(scan_id, "completed", None, true).unwrap();
+    store
+        .snapshot_id_for_source("scan", scan_id)
+        .unwrap()
+        .unwrap()
+}
+
 #[test]
 fn init_writes_only_the_versioned_config() {
     let root = tempfile::tempdir().unwrap();
@@ -320,6 +600,243 @@ fn snapshot_commands_reject_duplicates_reserved_names_missing_snapshots_and_fail
         .stderr(predicate::str::contains(
             "no current completed snapshot is available",
         ));
+}
+
+#[test]
+fn diff_is_canonical_filterable_and_exposes_human_evidence() {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let store_path = cache.path().join("graph.db");
+    let baseline_id =
+        seed_cli_diff_snapshot(&store_path, root.path(), "diff-baseline", "baseline", false);
+    let target_id = seed_cli_diff_snapshot(&store_path, root.path(), "diff-target", "target", true);
+
+    let run_json = |extra: &[&str]| {
+        let mut arguments = vec![
+            "--store",
+            store_path.to_str().unwrap(),
+            "diff",
+            "BASELINE",
+            target_id.as_str(),
+            "--json",
+        ];
+        arguments.extend_from_slice(extra);
+        Command::cargo_bin("depgraph")
+            .unwrap()
+            .args(arguments)
+            .output()
+            .unwrap()
+    };
+    let first = run_json(&[]);
+    let second = run_json(&[]);
+    assert!(first.status.success(), "{:?}", first.stderr);
+    assert_eq!(first.stdout, second.stdout);
+    let output: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert_eq!(output["schema_version"], "1.0");
+    assert_eq!(output["command"], "diff");
+    assert_eq!(output["data"]["from_snapshot_id"], baseline_id);
+    assert_eq!(output["data"]["to_snapshot_id"], target_id);
+    assert_eq!(output["data"]["filters"]["kind"], json!([]));
+    assert_eq!(
+        output["data"]["summary"]["nodes"],
+        json!({
+            "added": 1,
+            "removed": 1,
+            "changed": 1
+        })
+    );
+    assert_eq!(output["data"]["summary"]["renames"]["confirmed"], 1);
+    assert_eq!(output["data"]["renames"][0]["old_id"], "file:old");
+    assert_eq!(output["data"]["renames"][0]["new_id"], "file:new");
+    assert_eq!(output["data"]["sites"]["added"][0]["id"], "site:new");
+    assert_eq!(output["data"]["edges"]["added"][0]["id"], "edge:new");
+    assert_eq!(
+        output["data"]["evidence"]["added"][0]["owner_id"],
+        "edge:new"
+    );
+
+    let symbol = run_json(&["--kind", "symbol"]);
+    assert!(symbol.status.success(), "{:?}", symbol.stderr);
+    let symbol: serde_json::Value = serde_json::from_slice(&symbol.stdout).unwrap();
+    assert_eq!(symbol["data"]["nodes"]["added"][0]["id"], "symbol:added");
+    assert_eq!(
+        symbol["data"]["nodes"]["removed"][0]["id"],
+        "symbol:removed"
+    );
+    assert_eq!(symbol["data"]["sites"]["added"], json!([]));
+    assert!(symbol["data"].get("coverage").is_none());
+
+    Command::cargo_bin("depgraph")
+        .unwrap()
+        .args([
+            "--store",
+            store_path.to_str().unwrap(),
+            "diff",
+            "baseline",
+            "target",
+            "--kind",
+            "symbol",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("coverage: excluded by filters"));
+
+    let profile = run_json(&["--profile", "fixture:safe"]);
+    assert!(profile.status.success(), "{:?}", profile.stderr);
+    let profile: serde_json::Value = serde_json::from_slice(&profile.stdout).unwrap();
+    assert_eq!(
+        profile["data"]["profiles"]["changed"][0]["id"],
+        "fixture:safe"
+    );
+    assert_eq!(profile["data"]["sites"]["added"][0]["id"], "site:new");
+    assert_eq!(profile["data"]["nodes"]["added"], json!([]));
+
+    let phase = run_json(&["--phase", "semantic"]);
+    assert!(phase.status.success(), "{:?}", phase.stderr);
+    let phase: serde_json::Value = serde_json::from_slice(&phase.stdout).unwrap();
+    assert_eq!(phase["data"]["edges"]["added"][0]["id"], "edge:new");
+    assert_eq!(phase["data"]["sites"]["added"], json!([]));
+
+    let status = run_json(&["--status", "unresolved"]);
+    assert!(status.status.success(), "{:?}", status.stderr);
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status["data"]["sites"]["added"][0]["id"], "site:new");
+    assert_eq!(status["data"]["edges"]["added"][0]["id"], "edge:new");
+    assert_eq!(
+        status["data"]["evidence"]["added"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+
+    Command::cargo_bin("depgraph")
+        .unwrap()
+        .args([
+            "--store",
+            store_path.to_str().unwrap(),
+            "diff",
+            "baseline",
+            "target",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("total changes:"))
+        .stdout(predicate::str::contains(
+            "R [file; exact] file:old -> file:new",
+        ))
+        .stdout(predicate::str::contains(
+            "evidence: edge:edge:new#0 [semantic fixture@1.0] src/new.go:7:1-7:8",
+        ));
+}
+
+#[test]
+fn diff_empty_and_selector_errors_have_stable_exit_codes() {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let store_path = cache.path().join("graph.db");
+    let snapshot_id =
+        seed_cli_diff_snapshot(&store_path, root.path(), "diff-empty", "baseline", false);
+    let output = Command::cargo_bin("depgraph")
+        .unwrap()
+        .args([
+            "--store",
+            store_path.to_str().unwrap(),
+            "diff",
+            "baseline",
+            snapshot_id.as_str(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{:?}", output.stderr);
+    let output: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(output["data"]["summary"]["empty"], true);
+    assert_eq!(output["data"]["summary"]["total_changes"], 0);
+    assert_eq!(output["data"]["from_snapshot_id"], snapshot_id);
+    assert_eq!(output["data"]["to_snapshot_id"], snapshot_id);
+
+    {
+        let mut store = depgraph_store::Store::open(&store_path).unwrap();
+        store
+            .start_scan("failed-diff-attempt", root.path(), false)
+            .unwrap();
+        store
+            .finish_scan(
+                "failed-diff-attempt",
+                "failed",
+                Some("worker failed"),
+                false,
+            )
+            .unwrap();
+    }
+    for selector in ["missing", "failed-diff-attempt"] {
+        Command::cargo_bin("depgraph")
+            .unwrap()
+            .args([
+                "--store",
+                store_path.to_str().unwrap(),
+                "diff",
+                selector,
+                "baseline",
+            ])
+            .assert()
+            .code(2)
+            .stderr(predicate::str::contains("snapshot selector"));
+    }
+    Command::cargo_bin("depgraph")
+        .unwrap()
+        .args([
+            "--store",
+            store_path.to_str().unwrap(),
+            "diff",
+            "baseline",
+            "baseline",
+            "--kind",
+            "",
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains(
+            "diff kind filter must not be empty",
+        ));
+}
+
+#[test]
+fn large_diff_json_is_complete_sorted_and_repeatable() {
+    const NODE_COUNT: usize = 2_048;
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let store_path = cache.path().join("graph.db");
+    let mut store = depgraph_store::Store::open(&store_path).unwrap();
+    let from_id =
+        seed_large_cli_diff_snapshot(&mut store, root.path(), "large-from", 1, NODE_COUNT);
+    let to_id = seed_large_cli_diff_snapshot(&mut store, root.path(), "large-to", 2, NODE_COUNT);
+    drop(store);
+    let run = || {
+        Command::cargo_bin("depgraph")
+            .unwrap()
+            .args([
+                "--store",
+                store_path.to_str().unwrap(),
+                "diff",
+                from_id.as_str(),
+                to_id.as_str(),
+                "--json",
+            ])
+            .output()
+            .unwrap()
+    };
+    let first = run();
+    let second = run();
+    assert!(first.status.success(), "{:?}", first.stderr);
+    assert_eq!(first.stdout, second.stdout);
+    let output: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
+    let changed = output["data"]["nodes"]["changed"].as_array().unwrap();
+    assert_eq!(changed.len(), NODE_COUNT);
+    assert_eq!(changed.first().unwrap()["id"], "file:00000");
+    assert_eq!(changed.last().unwrap()["id"], "file:02047");
+    assert_eq!(output["data"]["summary"]["nodes"]["changed"], NODE_COUNT);
 }
 
 #[test]
