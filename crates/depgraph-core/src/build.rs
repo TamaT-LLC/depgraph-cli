@@ -549,8 +549,10 @@ fn is_allowed_environment_key(key: &str) -> bool {
     matches!(
         key,
         "DEPGRAPH_OBSERVER"
+            | "DEPGRAPH_NEXT_EXISTING_ADAPTER"
             | "DEPGRAPH_PROFILE"
             | "DEPGRAPH_TARGET"
+            | "NEXT_ADAPTER_PATH"
             | "NODE_OPTIONS"
             | "RUSTFLAGS"
             | "CARGO_BUILD_TARGET"
@@ -921,6 +923,17 @@ mod tests {
         plan.environment
             .insert("API_TOKEN".to_owned(), "secret".to_owned());
         assert!(plan.validate().is_err());
+
+        plan.environment.clear();
+        plan.environment.insert(
+            "NEXT_ADAPTER_PATH".to_owned(),
+            "/trusted/depgraph-next-build-adapter.mjs".to_owned(),
+        );
+        plan.environment.insert(
+            "DEPGRAPH_NEXT_EXISTING_ADAPTER".to_owned(),
+            "existing-platform-adapter".to_owned(),
+        );
+        assert!(plan.validate().is_ok());
     }
 
     #[test]
