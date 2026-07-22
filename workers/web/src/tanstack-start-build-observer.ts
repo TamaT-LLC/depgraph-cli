@@ -1132,6 +1132,7 @@ export function buildTanStackStartObservedGraph(
 
   for (const build of observation.builds) {
     const moduleNodes = new Map<string, GraphNode>();
+    const observedModulesById = new Map(build.modules.map((module) => [module.module_id, module]));
     const outputNodes = new Map<string, GraphNode>();
     for (const module of build.modules) {
       const matching = module.source_path === null ? [] : (baseByPath.get(module.source_path) ?? [])
@@ -1182,7 +1183,7 @@ export function buildTanStackStartObservedGraph(
           sites, edges, module.id, node.id, "emits", output.file_name, output.environment,
           observedCondition(output.environment), evidence, input.provenance.profile_id,
         );
-        const observedModuleValue = build.modules.find((item) => item.module_id === moduleId);
+        const observedModuleValue = observedModulesById.get(moduleId);
         if (observedModuleValue?.source_path === null || observedModuleValue?.source_path === undefined) continue;
         for (const base of baseByPath.get(observedModuleValue.source_path) ?? []) {
           if (!(["route", "middleware", "server_function"] as GraphNode["kind"][]).includes(base.kind)
