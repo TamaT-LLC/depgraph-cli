@@ -3,8 +3,9 @@ use std::{path::PathBuf, process::ExitCode};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use depgraph_core::{
-    Config, CycleLevel, ExportFormat, default_store_path, doctor, export, init_config, open_store,
-    render_condition, run_scan, traverse, unresolved, why,
+    BuildOutcomeKind, Config, CycleLevel, ExportFormat, create_build_execution_request,
+    default_store_path, doctor, execute_build_request_with_cancellation, export, init_config,
+    open_store, render_condition, run_scan, traverse, unresolved, why,
 };
 use serde::Serialize;
 
@@ -216,8 +217,30 @@ async fn run(cli: Cli) -> Result<u8> {
         } => {
             debug_assert!(build, "clap requires --build");
             require_build_consent(allow_project_code)?;
-            let _root = canonical_directory(path)?;
-            anyhow::bail!(BUILD_SUPERVISOR_UNAVAILABLE);
+            let root = canonical_directory(path)?;
+            let request = create_build_execution_request(&root)?;
+            let store_path = store_path(cli.store, &root)?;
+            let mut store = open_store(&store_path)?;
+            let outcome = execute_build_request_with_cancellation(&request, async {
+                let _ = tokio::signal::ctrl_c().await;
+            })
+            .await?;
+            store.save_build_audit(&serde_json::to_value(&outcome.audit)?)?;
+            println!("build run: {}", outcome.audit.run_id);
+            println!("status: {:?}", outcome.audit.outcome);
+            println!("project code executed: {}", outcome.project_code_executed);
+            println!("network isolation: {:?}", outcome.audit.network_isolation);
+            if let Some(diagnostic) = &outcome.audit.isolation_diagnostic {
+                eprintln!("warning: {diagnostic}");
+            }
+            println!("store: {}", store_path.display());
+            Ok(match outcome.audit.outcome {
+                BuildOutcomeKind::Completed => 0,
+                BuildOutcomeKind::SecurityFailed => 4,
+                BuildOutcomeKind::Failed
+                | BuildOutcomeKind::TimedOut
+                | BuildOutcomeKind::Cancelled => 3,
+            })
         }
         Commands::Doctor { json } => {
             let root = std::env::current_dir()?;
@@ -439,8 +462,6 @@ async fn run(cli: Cli) -> Result<u8> {
 }
 
 const BUILD_CONSENT_REQUIRED: &str = "project code execution permission denied: `resolve --build` may execute untrusted build tools, configuration, plugins, build scripts, and proc macros; rerun this invocation with `--allow-project-code` only after reviewing the target repository";
-const BUILD_SUPERVISOR_UNAVAILABLE: &str =
-    "build observation supervisor is not available in this milestone; no child process was started";
 
 fn require_build_consent(allow_project_code: bool) -> Result<()> {
     if !allow_project_code {
@@ -551,7 +572,7 @@ fn print_evidence(evidence: &[depgraph_store::EvidenceRecord], indent: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{BUILD_SUPERVISOR_UNAVAILABLE, error_exit_code, require_build_consent};
+    use super::{error_exit_code, require_build_consent};
 
     #[test]
     fn classifies_cli_errors_without_hiding_internal_failures_as_usage() {
@@ -571,10 +592,7 @@ mod tests {
             error_exit_code(&anyhow::anyhow!("database disk image is malformed")),
             3
         );
-        assert_eq!(
-            error_exit_code(&anyhow::anyhow!(BUILD_SUPERVISOR_UNAVAILABLE)),
-            3
-        );
+        assert_eq!(error_exit_code(&anyhow::anyhow!("build child failed")), 3);
     }
 
     #[test]

@@ -86,16 +86,25 @@ fn build_mode_refuses_implicit_or_missing_consent_without_executing_project_code
 }
 
 #[test]
-fn consented_build_mode_fails_closed_until_the_supervisor_is_available() {
+fn consented_build_mode_runs_project_code_only_in_the_supervised_staging_area() {
     let root = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();
     let marker = root.path().join("PROJECT_BUILD_EXECUTED");
     fs::write(
+        root.path().join("Cargo.toml"),
+        "[package]\nname='supervisor-fixture'\nversion='0.1.0'\nedition='2024'\n",
+    )
+    .unwrap();
+    fs::write(
+        root.path().join("Cargo.lock"),
+        "version = 4\n\n[[package]]\nname = \"supervisor-fixture\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    fs::create_dir(root.path().join("src")).unwrap();
+    fs::write(root.path().join("src/lib.rs"), "pub fn fixture() {}\n").unwrap();
+    fs::write(
         root.path().join("build.rs"),
-        format!(
-            "fn main() {{ std::fs::write({:?}, b\"unsafe\").unwrap(); }}\n",
-            marker
-        ),
+        "fn main() { let out = std::env::var_os(\"DEPGRAPH_OUTPUT_DIR\").unwrap(); std::fs::write(std::path::PathBuf::from(out).join(\"PROJECT_BUILD_EXECUTED\"), b\"yes\").unwrap(); }\n",
     )
     .unwrap();
 
@@ -110,15 +119,30 @@ fn consented_build_mode_fails_closed_until_the_supervisor_is_available() {
             "--allow-project-code",
         ])
         .assert()
-        .code(3)
-        .stdout(predicate::str::is_empty())
-        .stderr(predicate::str::contains(
-            "build observation supervisor is not available",
-        ))
-        .stderr(predicate::str::contains("no child process was started"));
+        .success()
+        .stdout(predicate::str::contains("status: Completed"))
+        .stdout(predicate::str::contains("project code executed: true"))
+        .stderr(predicate::str::contains("network isolation"));
 
     assert!(!marker.exists());
-    assert!(!cache.path().join("graph.db").exists());
+    assert!(cache.path().join("graph.db").exists());
+    let store = depgraph_store::Store::open(cache.path().join("graph.db")).unwrap();
+    let audit = store.latest_build_audit().unwrap().unwrap().audit;
+    let serialized = serde_json::to_string(&audit).unwrap();
+    assert_eq!(audit["outcome"], "completed");
+    assert_eq!(
+        audit["toolchain_version"]
+            .as_str()
+            .unwrap()
+            .split(' ')
+            .next(),
+        Some("cargo")
+    );
+    assert!(!serialized.contains(&root.path().to_string_lossy().to_string()));
+    if let Some(home) = std::env::var_os("HOME") {
+        assert!(!serialized.contains(&home.to_string_lossy().to_string()));
+    }
+    assert!(!serialized.contains("depgraph-build-"));
 
     Command::cargo_bin("depgraph")
         .unwrap()

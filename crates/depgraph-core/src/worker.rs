@@ -1429,7 +1429,7 @@ where
     })
 }
 
-async fn read_capped(
+pub(crate) async fn read_capped(
     mut reader: impl AsyncRead + Unpin,
     limit: usize,
 ) -> std::io::Result<(Vec<u8>, bool)> {
@@ -1449,7 +1449,7 @@ async fn read_capped(
     Ok((stored, truncated))
 }
 
-async fn finish_reader(
+pub(crate) async fn finish_reader(
     mut task: tokio::task::JoinHandle<std::io::Result<(Vec<u8>, bool)>>,
     stream: &str,
     errors: &mut Vec<String>,
@@ -1469,7 +1469,7 @@ async fn finish_reader(
     }
 }
 
-async fn terminate_worker(child: &mut tokio::process::Child, guard: &ProcessTreeGuard) {
+pub(crate) async fn terminate_worker(child: &mut tokio::process::Child, guard: &ProcessTreeGuard) {
     guard.terminate();
     let _ = child.kill().await;
     let _ = child.wait().await;
@@ -1606,7 +1606,7 @@ fn is_executable_file(path: &Path) -> bool {
             .is_some_and(|extension| extension.eq_ignore_ascii_case("exe"))
 }
 
-struct ProcessTreeGuard {
+pub(crate) struct ProcessTreeGuard {
     #[cfg(unix)]
     process_group: i32,
     #[cfg(windows)]
@@ -1614,7 +1614,7 @@ struct ProcessTreeGuard {
 }
 
 impl ProcessTreeGuard {
-    fn attach(child: &tokio::process::Child) -> Result<Self> {
+    pub(crate) fn attach(child: &tokio::process::Child) -> Result<Self> {
         #[cfg(unix)]
         {
             let process_group = child.id().context("worker has no process id")? as i32;
@@ -1664,7 +1664,7 @@ impl ProcessTreeGuard {
         }
     }
 
-    fn terminate(&self) {
+    pub(crate) fn terminate(&self) {
         #[cfg(unix)]
         unsafe {
             libc::kill(-self.process_group, libc::SIGKILL);
@@ -1672,6 +1672,18 @@ impl ProcessTreeGuard {
         #[cfg(windows)]
         unsafe {
             windows_sys::Win32::System::JobObjects::TerminateJobObject(self.job as _, 1);
+        }
+    }
+
+    pub(crate) fn request_graceful_termination(&self) {
+        #[cfg(unix)]
+        unsafe {
+            libc::kill(-self.process_group, libc::SIGTERM);
+        }
+        #[cfg(not(unix))]
+        {
+            // Windows Job Objects do not provide a tree-wide graceful signal.
+            // The hard termination path remains bounded by the same grace period.
         }
     }
 }
@@ -1685,7 +1697,7 @@ impl Drop for ProcessTreeGuard {
     }
 }
 
-async fn run_probe(
+pub(crate) async fn run_probe(
     program: &OsStr,
     arguments: &[OsString],
     root: &Path,
@@ -8004,13 +8016,15 @@ mod tests {
         let safe = temp.path().join("safe-bin");
         std::fs::create_dir(&root)?;
         std::fs::create_dir(&safe)?;
-        let mut entries = vec![PathBuf::from("."), root.clone(), safe.clone()];
+        let entries = vec![PathBuf::from("."), root.clone(), safe.clone()];
         #[cfg(unix)]
-        {
+        let entries = {
+            let mut entries = entries;
             let alias = temp.path().join("project-alias");
             std::os::unix::fs::symlink(&root, &alias)?;
             entries.push(alias);
-        }
+            entries
+        };
         let raw = std::env::join_paths(entries)?;
         let sanitized = sanitize_path_value(&raw, &root)?;
         let paths = std::env::split_paths(&sanitized).collect::<Vec<_>>();

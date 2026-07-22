@@ -1,3 +1,4 @@
+pub mod build;
 pub mod config;
 pub mod export;
 pub mod query;
@@ -15,6 +16,12 @@ use depgraph_store::{
 };
 use serde::{Deserialize, Serialize};
 
+pub use build::{
+    BUILD_SUPERVISOR_VERSION, BuildAudit, BuildExecutionOutcome, BuildExecutionPlan,
+    BuildExecutionRequest, BuildOutcomeKind, NetworkIsolation, create_build_execution_request,
+    execute_build_request, execute_build_request_with_cancellation, supervise_build,
+    supervise_build_with_cancellation,
+};
 pub use config::{Config, default_store_path, init_config};
 pub use depgraph_store::GraphSnapshot;
 pub use export::{ExportFormat, export};
