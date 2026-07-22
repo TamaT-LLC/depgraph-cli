@@ -4,6 +4,23 @@ use assert_cmd::Command;
 use predicates::prelude::*;
 use serde_json::json;
 
+fn run_git(root: &std::path::Path, arguments: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(arguments)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {:?}: {}",
+        arguments,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
 fn seed_safe_rust_scan(
     store_path: &std::path::Path,
     root: &std::path::Path,
@@ -837,6 +854,129 @@ fn large_diff_json_is_complete_sorted_and_repeatable() {
     assert_eq!(changed.first().unwrap()["id"], "file:00000");
     assert_eq!(changed.last().unwrap()["id"], "file:02047");
     assert_eq!(output["data"]["summary"]["nodes"]["changed"], NODE_COUNT);
+}
+
+#[test]
+fn impact_changed_set_is_read_only_deterministic_and_maps_renames() {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let store_path = cache.path().join("graph.db");
+    let git_trace_path = cache.path().join("git-trace.log");
+    run_git(root.path(), &["init", "--quiet"]);
+    run_git(
+        root.path(),
+        &["config", "user.email", "test@example.invalid"],
+    );
+    run_git(root.path(), &["config", "user.name", "Test"]);
+    fs::create_dir(root.path().join("src")).unwrap();
+    fs::write(root.path().join("src/old.go"), "package fixture\n").unwrap();
+    run_git(root.path(), &["add", "src/old.go"]);
+    run_git(root.path(), &["commit", "--quiet", "-m", "base"]);
+    let base = run_git(root.path(), &["rev-parse", "HEAD"]);
+    run_git(root.path(), &["mv", "src/old.go", "src/new.go"]);
+    run_git(root.path(), &["commit", "--quiet", "-m", "rename"]);
+    fs::write(
+        root.path().join("src/new.go"),
+        "package fixture\n// dirty\n",
+    )
+    .unwrap();
+    fs::write(root.path().join("src/untracked.go"), "package fixture\n").unwrap();
+    let status_before = run_git(root.path(), &["status", "--porcelain=v1"]);
+
+    seed_cli_diff_snapshot(
+        &store_path,
+        root.path(),
+        "impact-baseline",
+        "impact-baseline",
+        false,
+    );
+    seed_cli_diff_snapshot(
+        &store_path,
+        root.path(),
+        "impact-target",
+        "impact-target",
+        true,
+    );
+
+    let run_json = || {
+        Command::cargo_bin("depgraph")
+            .unwrap()
+            .env("GIT_TRACE", &git_trace_path)
+            .args([
+                "--store",
+                store_path.to_str().unwrap(),
+                "--scan-id",
+                "impact-target",
+                "impact",
+                "path:src/new.go",
+                "--changed",
+                base.as_str(),
+                "--json",
+            ])
+            .output()
+            .unwrap()
+    };
+    let first = run_json();
+    let second = run_json();
+    assert!(first.status.success(), "{:?}", first.stderr);
+    assert_eq!(first.stdout, second.stdout);
+    let output: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert_eq!(output["schema_version"], "1.0");
+    assert_eq!(output["command"], "impact");
+    assert_eq!(output["scan_id"], "impact-target");
+    assert_eq!(output["data"]["root"]["id"], "file:new");
+    assert_eq!(output["data"]["root_impacted"], true);
+    assert_eq!(output["data"]["complete"], true);
+    assert!(
+        output["data"]["changed_set"]["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|change| {
+                change["status"] == "renamed"
+                    && change["old_path"] == "src/old.go"
+                    && change["new_path"] == "src/new.go"
+            })
+    );
+    assert!(
+        output["data"]["mappings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|mapping| {
+                mapping["change"]["status"] == "renamed"
+                    && mapping["new_node_ids"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|id| id == "file:new")
+            })
+    );
+    assert_eq!(
+        run_git(root.path(), &["status", "--porcelain=v1"]),
+        status_before
+    );
+    assert!(!root.path().join(".git/index.lock").exists());
+    assert!(!git_trace_path.exists());
+
+    Command::cargo_bin("depgraph")
+        .unwrap()
+        .args([
+            "--store",
+            store_path.to_str().unwrap(),
+            "--scan-id",
+            "impact-target",
+            "impact",
+            "path:src/new.go",
+            "--changed",
+            base.as_str(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("renamed src/old.go -> src/new.go"))
+        .stdout(predicate::str::contains(
+            "result: impacted=true complete=true",
+        ));
 }
 
 #[test]
