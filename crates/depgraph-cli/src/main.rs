@@ -1,11 +1,12 @@
-use std::{path::PathBuf, process::ExitCode};
+use std::{io::Cursor, path::PathBuf, process::ExitCode};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use depgraph_core::{
     BuildOutcomeKind, Config, CycleLevel, ExportFormat, create_build_execution_request,
     default_store_path, doctor, execute_build_request_with_cancellation, export, init_config,
-    open_store, render_condition, run_scan, traverse, unresolved, why,
+    open_store, render_condition, run_scan, rust_build_protocol_ndjson, stage_build_evidence,
+    traverse, unresolved, why,
 };
 use serde::Serialize;
 
@@ -226,9 +227,75 @@ async fn run(cli: Cli) -> Result<u8> {
             })
             .await?;
             store.save_build_audit(&serde_json::to_value(&outcome.audit)?)?;
+            let mut evidence_status = "audit-only (no completed base scan)";
+            if let Some(base_scan_id) = store.latest_successful_id()? {
+                evidence_status = "not promoted";
+                store.start_build_attempt(&base_scan_id, &serde_json::to_value(&outcome.audit)?)?;
+                match outcome.audit.outcome {
+                    BuildOutcomeKind::Completed => {
+                        let observation = outcome.rust_observation.as_ref().context(
+                            "security policy violation: completed Rust build produced no validated observation",
+                        )?;
+                        let snapshot = store.load_snapshot(&base_scan_id)?;
+                        let ndjson = rust_build_protocol_ndjson(
+                            &snapshot,
+                            &outcome.audit,
+                            observation,
+                        )
+                        .context("security policy violation: Rust build observation could not be correlated")?;
+                        if let Err(error) = stage_build_evidence(
+                            &mut store,
+                            &outcome.audit.run_id,
+                            Cursor::new(ndjson),
+                        ) {
+                            store.finish_build_attempt(
+                                &outcome.audit.run_id,
+                                "security_failed",
+                                Some("rust-build-evidence-rejected"),
+                                false,
+                            )?;
+                            anyhow::bail!(
+                                "security policy violation: Rust build evidence was rejected: {error:#}"
+                            );
+                        }
+                        store.finish_build_attempt(
+                            &outcome.audit.run_id,
+                            "completed",
+                            None,
+                            true,
+                        )?;
+                        evidence_status = "promoted";
+                    }
+                    BuildOutcomeKind::Failed => store.finish_build_attempt(
+                        &outcome.audit.run_id,
+                        "failed",
+                        outcome.audit.diagnostic_code.as_deref(),
+                        false,
+                    )?,
+                    BuildOutcomeKind::TimedOut => store.finish_build_attempt(
+                        &outcome.audit.run_id,
+                        "timed_out",
+                        outcome.audit.diagnostic_code.as_deref(),
+                        false,
+                    )?,
+                    BuildOutcomeKind::Cancelled => store.finish_build_attempt(
+                        &outcome.audit.run_id,
+                        "cancelled",
+                        outcome.audit.diagnostic_code.as_deref(),
+                        false,
+                    )?,
+                    BuildOutcomeKind::SecurityFailed => store.finish_build_attempt(
+                        &outcome.audit.run_id,
+                        "security_failed",
+                        outcome.audit.diagnostic_code.as_deref(),
+                        false,
+                    )?,
+                }
+            }
             println!("build run: {}", outcome.audit.run_id);
             println!("status: {:?}", outcome.audit.outcome);
             println!("project code executed: {}", outcome.project_code_executed);
+            println!("build evidence: {evidence_status}");
             println!("network isolation: {:?}", outcome.audit.network_isolation);
             if let Some(diagnostic) = &outcome.audit.isolation_diagnostic {
                 eprintln!("warning: {diagnostic}");
