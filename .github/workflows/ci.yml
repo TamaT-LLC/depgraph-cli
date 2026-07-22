@@ -84,6 +84,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 24.18.0
+      - name: Build supervisor staging, redaction, timeout, cancellation, and descendant reap
+        run: cargo test -p depgraph-core --lib --locked build::tests
       - run: cargo xtask build
       - name: Web semantic import/type/call end-to-end and deterministic export
         shell: bash
@@ -504,6 +506,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 24.18.0
+      - name: Build supervisor staging, redaction, timeout, cancellation, and descendant reap
+        run: cargo test -p depgraph-core --lib --locked build::tests
       - run: cargo test -p depgraph-rust-worker --lib --locked
       - run: cargo test -p depgraph-core --lib --locked web_worker_timeout_reaps_its_descendant_cross_platform
       - run: cargo xtask build
