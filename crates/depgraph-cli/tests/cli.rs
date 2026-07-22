@@ -384,6 +384,83 @@ fn consented_build_mode_runs_project_code_only_in_the_supervised_staging_area() 
         .stderr(predicate::str::contains("does not exist"));
 }
 
+#[cfg(unix)]
+#[test]
+fn cli_cancellation_stops_the_supervised_build_and_retains_the_safe_snapshot() {
+    use std::{process::Stdio, thread, time::Duration};
+
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let store_path = cache.path().join("graph.db");
+    let ready = root.path().join("BUILD_READY");
+    fs::write(
+        root.path().join("Cargo.toml"),
+        "[package]\nname='cancel-fixture'\nversion='0.1.0'\nedition='2024'\n",
+    )
+    .unwrap();
+    fs::write(
+        root.path().join("Cargo.lock"),
+        "version = 4\n\n[[package]]\nname = \"cancel-fixture\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    fs::create_dir(root.path().join("src")).unwrap();
+    fs::write(root.path().join("src/lib.rs"), "pub fn fixture() {}\n").unwrap();
+    fs::write(
+        root.path().join("build.rs"),
+        format!(
+            "fn main() {{ std::fs::write({:?}, b\"ready\").unwrap(); std::thread::sleep(std::time::Duration::from_secs(60)); }}\n",
+            ready.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    seed_safe_rust_scan(&store_path, root.path(), "Cargo.toml");
+
+    let child = std::process::Command::new(env!("CARGO_BIN_EXE_depgraph"))
+        .args([
+            "--store",
+            store_path.to_str().unwrap(),
+            "resolve",
+            "--build",
+            root.path().to_str().unwrap(),
+            "--allow-project-code",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    for _ in 0..1_000 {
+        if ready.exists() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        ready.exists(),
+        "supervised build never reached its cancellation fixture"
+    );
+    let signal = std::process::Command::new("kill")
+        .args(["-INT", &child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(signal.success());
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(3));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("status: Cancelled"));
+
+    let store = depgraph_store::Store::open(&store_path).unwrap();
+    let audit = store.latest_build_audit().unwrap().unwrap();
+    assert_eq!(audit.audit["outcome"], "cancelled");
+    let attempt = store.build_attempt(&audit.run_id).unwrap().unwrap();
+    assert_eq!(attempt.status, "cancelled");
+    let snapshot = store.load_snapshot("safe-rust-scan").unwrap();
+    assert!(
+        snapshot
+            .nodes
+            .iter()
+            .all(|node| node.properties["build_generated"] != true)
+    );
+}
+
 #[test]
 fn failed_rust_build_correlation_finalizes_the_attempt_without_promoting_a_delta() {
     let root = tempfile::tempdir().unwrap();
@@ -421,7 +498,7 @@ fn failed_rust_build_correlation_finalizes_the_attempt_without_promoting_a_delta
         .assert()
         .code(4)
         .stderr(predicate::str::contains(
-            "Rust build observation could not be correlated",
+            "build observation could not be correlated",
         ));
 
     let store = depgraph_store::Store::open(&store_path).unwrap();
@@ -430,7 +507,7 @@ fn failed_rust_build_correlation_finalizes_the_attempt_without_promoting_a_delta
     assert_eq!(attempt.status, "security_failed");
     assert_eq!(
         attempt.error.as_deref(),
-        Some("rust-build-correlation-failed")
+        Some("build-observation-correlation-failed")
     );
     assert_eq!(
         store.current_build_attempt_id("safe-rust-scan").unwrap(),

@@ -51,6 +51,12 @@ const WEB_SEMANTIC_RUNTIME_COMPONENTS: &[&str] = &[
     "typescript-native-compiler@7.0.2",
 ];
 const WEB_SEMANTIC_RUNTIME_ARTIFACTS: &[&str] = &[];
+const WEB_BUILD_RUNTIME_ARTIFACTS: &[&str] = &[
+    "next-build-adapter.mjs",
+    "astro-build-integration.mjs",
+    "tanstack-start-build-observer.mjs",
+    "depgraph-web-build-evidence.mjs",
+];
 const WEB_DEFINITION_SELECTOR: &str = r#"type:definition:["package","npm:workspace:@fixture/shared@1.0.0#apps/shared","definition:[\"module\",\"type\",\"apps/shared/src/semantic.ts\",[\"SharedStringCollection\"]]"]"#;
 const FORBIDDEN_RUST_ANALYZER_DEPENDENCIES: &[&str] = &[
     "ra_ap_flycheck",
@@ -493,6 +499,12 @@ fn package() -> Result<()> {
         Path::new("workers/web/dist/worker.mjs"),
         &staging.join("libexec/depgraph-web-worker.mjs"),
     )?;
+    for artifact in WEB_BUILD_RUNTIME_ARTIFACTS {
+        copy(
+            &Path::new("workers/web/dist").join(artifact),
+            &staging.join("libexec").join(artifact),
+        )?;
+    }
     copy_directory(
         Path::new("workers/web/dist/astro"),
         &staging.join("libexec/astro"),
@@ -545,7 +557,16 @@ fn package() -> Result<()> {
             path: relative_slash(&staging, &schema_path)?,
             sha256: sha256_file(&schema_path)?,
         },
-        runtime_artifacts: Vec::new(),
+        runtime_artifacts: WEB_BUILD_RUNTIME_ARTIFACTS
+            .iter()
+            .map(|name| {
+                let path = staging.join("libexec").join(name);
+                Ok(Artifact {
+                    path: relative_slash(&staging, &path)?,
+                    sha256: sha256_file(&path)?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?,
         runtime_components: vec![
             RuntimeComponent {
                 name: "astro-parser-wasm".to_owned(),
@@ -1719,6 +1740,20 @@ fn verify_published_release_tree(
         verified_licenses.insert((*path).to_owned(), artifact.sha256.clone());
     }
 
+    let expected_runtime_paths = WEB_BUILD_RUNTIME_ARTIFACTS
+        .iter()
+        .map(|name| format!("libexec/{name}"))
+        .collect::<BTreeSet<_>>();
+    let declared_runtime_paths = manifest
+        .runtime_artifacts
+        .iter()
+        .map(|artifact| artifact.path.clone())
+        .collect::<BTreeSet<_>>();
+    if declared_runtime_paths != expected_runtime_paths
+        || manifest.runtime_artifacts.len() != WEB_BUILD_RUNTIME_ARTIFACTS.len()
+    {
+        bail!("published release Web build runtime attestation is incomplete or unknown");
+    }
     for artifact in &manifest.runtime_artifacts {
         if !artifact_paths.insert(artifact.path.as_str()) {
             bail!("published release reuses artifact path {}", artifact.path);
@@ -2061,6 +2096,13 @@ fn verify_archive(archive: &Path, name: &str) -> Result<()> {
     let fixture = Path::new("workers/web/test/fixtures/polyglot").canonicalize()?;
     let first_web_store = verify_root.join("web.db");
     verify_packaged_scan(&executable, &first_web_store, &fixture, "web")?;
+    verify_packaged_build_evidence(
+        &executable,
+        &extracted,
+        &verify_root,
+        &fixture,
+        &first_web_store,
+    )?;
     verify_packaged_project_licenses_fail_closed(&executable, &extracted, &verify_root, &fixture)?;
     for marker in [
         fixture.join("apps/next-app/NEXT_CONFIG_EXECUTED"),
@@ -2126,6 +2168,312 @@ fn verify_archive(archive: &Path, name: &str) -> Result<()> {
     verify_packaged_layout_fails_closed(&executable, &extracted, &verify_root, &go_fixture)?;
     fs::remove_dir_all(verify_root)?;
     Ok(())
+}
+
+fn verify_packaged_build_evidence(
+    executable: &Path,
+    release_root: &Path,
+    verify_root: &Path,
+    fixture: &Path,
+    base_store: &Path,
+) -> Result<()> {
+    let adapters = [
+        (
+            "next",
+            "next-app",
+            "web:build:next",
+            "next-adapter-observer",
+            "NEXT_BUILD_FIXTURE_SECRET",
+        ),
+        (
+            "astro",
+            "astro-app",
+            "web:build:astro",
+            "astro-vite-build-observer",
+            "ASTRO_BUILD_FIXTURE_SECRET",
+        ),
+        (
+            "tanstack-start",
+            "start",
+            "web:build:tanstack-start",
+            "tanstack-start-vite-build-observer",
+            "START_BUILD_FIXTURE_SECRET",
+        ),
+        (
+            "rust",
+            "rust-app",
+            "rust:build",
+            "rust-cargo-build-observer",
+            "RUST_BUILD_FIXTURE_SECRET",
+        ),
+    ];
+    for (adapter, app, profile_id, observer, secret) in adapters {
+        let store = verify_root.join(format!("build-{adapter}.db"));
+        fs::copy(base_store, &store)?;
+        let project = fixture.join("apps").join(app);
+        let denied = Command::new(executable)
+            .arg("--store")
+            .arg(&store)
+            .arg("resolve")
+            .arg("--build")
+            .arg(&project)
+            .output()
+            .with_context(|| format!("failed to run packaged {adapter} consent gate"))?;
+        if denied.status.code() != Some(4)
+            || !denied.stdout.is_empty()
+            || !String::from_utf8_lossy(&denied.stderr)
+                .contains("project code execution permission denied")
+        {
+            bail!("packaged {adapter} build ran without explicit consent");
+        }
+
+        let allowed = Command::new(executable)
+            .arg("--store")
+            .arg(&store)
+            .arg("resolve")
+            .arg("--build")
+            .arg(&project)
+            .arg("--allow-project-code")
+            .output()
+            .with_context(|| format!("failed to run packaged {adapter} build"))?;
+        let allowed_stdout = String::from_utf8_lossy(&allowed.stdout);
+        let allowed_stderr = String::from_utf8_lossy(&allowed.stderr);
+        if !allowed.status.success()
+            || !allowed_stdout.contains("status: Completed")
+            || !allowed_stdout.contains("project code executed: true")
+            || !allowed_stdout.contains("build evidence: promoted")
+            || !allowed_stdout.contains("network isolation:")
+        {
+            bail!(
+                "packaged {adapter} build evidence gate failed:\n{allowed_stdout}\n{allowed_stderr}"
+            );
+        }
+
+        let doctor = Command::new(executable)
+            .arg("--store")
+            .arg(&store)
+            .arg("doctor")
+            .arg("--json")
+            .output()?;
+        if !doctor.status.success() {
+            bail!("packaged {adapter} doctor failed after build observation");
+        }
+        let doctor_json: Value = serde_json::from_slice(&doctor.stdout)?;
+        let latest = &doctor_json["latest_attempt"];
+        let phases = &latest["profile_matrix"]["phase_coverage"];
+        if latest["project_code_executed"] != Value::Bool(true)
+            || !phases["static"].is_object()
+            || !phases["semantic"].is_object()
+            || !phases["build"].is_object()
+            || !latest["profiles"].as_array().is_some_and(|profiles| {
+                profiles.iter().any(|profile| {
+                    profile["id"] == profile_id
+                        && profile["properties"]["profile_phase"] == "build"
+                        && profile["properties"]["project_code_executed"] == Value::Bool(true)
+                })
+            })
+        {
+            bail!("packaged {adapter} doctor lost the static/semantic/build profile union");
+        }
+        let runtime_integrity = doctor_json["release"]["runtime_integrity"]
+            .as_object()
+            .context("packaged build doctor omitted runtime integrity")?;
+        if WEB_BUILD_RUNTIME_ARTIFACTS.iter().any(|name| {
+            runtime_integrity
+                .get(&format!("libexec/{name}"))
+                .and_then(Value::as_str)
+                != Some("verified")
+        }) {
+            bail!("packaged {adapter} doctor did not verify all build runtimes");
+        }
+
+        let exported = Command::new(executable)
+            .arg("--store")
+            .arg(&store)
+            .arg("export")
+            .arg("--format")
+            .arg("json")
+            .output()?;
+        if !exported.status.success() {
+            bail!("packaged {adapter} export failed after build observation");
+        }
+        let export_json: Value = serde_json::from_slice(&exported.stdout)?;
+        let graph = &export_json["graph"];
+        let edge = graph["edges"]
+            .as_array()
+            .and_then(|edges| {
+                edges.iter().find(|edge| {
+                    edge["phase"] == "build"
+                        && edge["precision"] == "observed"
+                        && edge["profile_id"] == profile_id
+                })
+            })
+            .with_context(|| format!("packaged {adapter} export has no observed build edge"))?;
+        if !graph["evidence"].as_array().is_some_and(|evidence| {
+            evidence.iter().any(|item| {
+                item["kind"] == "build"
+                    && item["extractor"] == observer
+                    && item["properties"]["build_run_id"].is_string()
+                    && item["properties"]["validated_output_digest"].is_string()
+            })
+        }) {
+            bail!("packaged {adapter} export omitted audited build evidence");
+        }
+
+        let why = Command::new(executable)
+            .arg("--store")
+            .arg(&store)
+            .arg("why")
+            .arg(format!(
+                "id:{}",
+                edge["source"].as_str().context("build edge source")?
+            ))
+            .arg(format!(
+                "id:{}",
+                edge["target"].as_str().context("build edge target")?
+            ))
+            .arg("--json")
+            .output()?;
+        if !why.status.success()
+            || serde_json::from_slice::<Value>(&why.stdout)?["data"]["steps"]
+                .as_array()
+                .is_none_or(|steps| steps.is_empty())
+        {
+            bail!("packaged {adapter} why query could not traverse observed build evidence");
+        }
+
+        let secret_bytes = secret.as_bytes();
+        if bytes_contain(&allowed.stdout, secret_bytes)
+            || bytes_contain(&allowed.stderr, secret_bytes)
+            || bytes_contain(&doctor.stdout, secret_bytes)
+            || bytes_contain(&exported.stdout, secret_bytes)
+            || bytes_contain(&fs::read(&store)?, secret_bytes)
+        {
+            bail!("packaged {adapter} build leaked its fixture secret");
+        }
+
+        let completed_graph = graph.clone();
+        let failed_project = verify_root.join(format!("failed-build-{adapter}"));
+        copy_directory(&project, &failed_project)?;
+        let failure_entrypoint = if adapter == "rust" {
+            failed_project.join("build.rs")
+        } else {
+            failed_project.join("depgraph-build.mjs")
+        };
+        fs::write(
+            &failure_entrypoint,
+            if adapter == "rust" {
+                "fn main() { panic!(\"normalized fixture crash\"); }\n"
+            } else {
+                "process.exit(19);\n"
+            },
+        )?;
+        let failed = Command::new(executable)
+            .arg("--store")
+            .arg(&store)
+            .arg("resolve")
+            .arg("--build")
+            .arg(&failed_project)
+            .arg("--allow-project-code")
+            .output()?;
+        if failed.status.code() != Some(3) {
+            bail!("packaged {adapter} crash gate did not report a failed build");
+        }
+        let retained = Command::new(executable)
+            .arg("--store")
+            .arg(&store)
+            .arg("export")
+            .arg("--format")
+            .arg("json")
+            .output()?;
+        let retained: Value = serde_json::from_slice(&retained.stdout)?;
+        if retained["graph"] != completed_graph {
+            bail!("packaged {adapter} failed build replaced the last completed graph");
+        }
+    }
+
+    let timeout_store = verify_root.join("build-timeout.db");
+    fs::copy(base_store, &timeout_store)?;
+    let timeout_project = verify_root.join("timed-out-build-next");
+    copy_directory(&fixture.join("apps/next-app"), &timeout_project)?;
+    let package_path = timeout_project.join("package.json");
+    let mut package: Value = serde_json::from_slice(&fs::read(&package_path)?)?;
+    package["depgraph"]["build"]["timeout_seconds"] = json!(1);
+    fs::write(&package_path, serde_json::to_vec_pretty(&package)?)?;
+    fs::write(
+        timeout_project.join("depgraph-build.mjs"),
+        "setInterval(() => undefined, 1000);\n",
+    )?;
+    let timed_out = Command::new(executable)
+        .arg("--store")
+        .arg(&timeout_store)
+        .arg("resolve")
+        .arg("--build")
+        .arg(&timeout_project)
+        .arg("--allow-project-code")
+        .output()?;
+    if timed_out.status.code() != Some(3)
+        || !String::from_utf8_lossy(&timed_out.stdout).contains("status: TimedOut")
+    {
+        bail!("packaged build timeout gate did not stop the supervised process tree");
+    }
+
+    for secret in [
+        "NEXT_BUILD_FIXTURE_SECRET",
+        "ASTRO_BUILD_FIXTURE_SECRET",
+        "START_BUILD_FIXTURE_SECRET",
+        "RUST_BUILD_FIXTURE_SECRET",
+    ] {
+        for entry in WalkDir::new(release_root).follow_links(false) {
+            let entry = entry?;
+            if entry.file_type().is_file()
+                && bytes_contain(&fs::read(entry.path())?, secret.as_bytes())
+            {
+                bail!(
+                    "release artifact {} contains a build fixture secret",
+                    entry.path().display()
+                );
+            }
+        }
+    }
+    verify_packaged_build_runtime_fails_closed(executable, release_root, verify_root, fixture)?;
+    Ok(())
+}
+
+fn verify_packaged_build_runtime_fails_closed(
+    executable: &Path,
+    release_root: &Path,
+    verify_root: &Path,
+    fixture: &Path,
+) -> Result<()> {
+    let project = fixture.join("apps/next-app");
+    for name in WEB_BUILD_RUNTIME_ARTIFACTS {
+        let path = release_root.join("libexec").join(name);
+        let original = fs::read(&path)?;
+        fs::write(&path, b"tampered-build-runtime")?;
+        let output = Command::new(executable)
+            .arg("--store")
+            .arg(verify_root.join(format!("tampered-{name}.db")))
+            .arg("resolve")
+            .arg("--build")
+            .arg(&project)
+            .arg("--allow-project-code")
+            .output()?;
+        fs::write(&path, original)?;
+        if output.status.code() != Some(4)
+            || !String::from_utf8_lossy(&output.stderr).contains("security policy violation")
+        {
+            bail!("packaged build runtime {name} tamper did not fail closed before execution");
+        }
+    }
+    Ok(())
+}
+
+fn bytes_contain(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty()
+        && haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
 }
 
 fn verify_packaged_project_licenses_fail_closed(
@@ -5515,6 +5863,20 @@ fn verify_release_metadata(extracted: &Path) -> Result<ReleaseManifest> {
         bail!("release manifest schema path does not match the packaged protocol schema");
     }
     verify_release_artifact(extracted, &manifest.schema, "schema")?;
+    let expected_runtime_paths = WEB_BUILD_RUNTIME_ARTIFACTS
+        .iter()
+        .map(|name| format!("libexec/{name}"))
+        .collect::<BTreeSet<_>>();
+    let declared_runtime_paths = manifest
+        .runtime_artifacts
+        .iter()
+        .map(|artifact| artifact.path.clone())
+        .collect::<BTreeSet<_>>();
+    if declared_runtime_paths != expected_runtime_paths
+        || manifest.runtime_artifacts.len() != WEB_BUILD_RUNTIME_ARTIFACTS.len()
+    {
+        bail!("release manifest Web build runtime attestation is incomplete or unknown");
+    }
     let mut runtime_paths = BTreeSet::new();
     for artifact in &manifest.runtime_artifacts {
         if !runtime_paths.insert(artifact.path.as_str()) {

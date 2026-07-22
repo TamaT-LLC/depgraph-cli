@@ -1,6 +1,13 @@
 {
   "name": "@fixture/astro-app",
   "version": "1.0.0",
+  "depgraph": {
+    "build": {
+      "adapter": "astro",
+      "entrypoint": "depgraph-build.mjs",
+      "version": "7.0.9"
+    }
+  },
   "dependencies": {
     "astro": "7.0.9"
   }

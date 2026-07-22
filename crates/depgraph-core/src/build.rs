@@ -21,9 +21,11 @@ use crate::rust_build_observer::{
     RUST_BUILD_OBSERVER, RUST_BUILD_OBSERVER_VERSION, RustBuildObservation,
     collect_rust_build_observation,
 };
+#[cfg(all(windows, target_env = "msvc"))]
+use crate::worker::sanitize_path_value;
 use crate::worker::{
-    ProcessTreeGuard, finish_reader, read_capped, resolve_safe_executable, run_probe,
-    sanitized_path, terminate_worker,
+    ProcessTreeGuard, finish_reader, locate_web_build_runtime, process_argument_path, read_capped,
+    resolve_safe_executable, run_probe, sanitized_path, terminate_worker,
 };
 
 pub const BUILD_SUPERVISOR_VERSION: &str = "1.0";
@@ -32,6 +34,88 @@ pub const MAX_BUILD_TIMEOUT_SECONDS: u64 = 60 * 60;
 pub const DEFAULT_OUTPUT_LIMIT_BYTES: usize = 10 * 1024 * 1024;
 const MAX_STAGED_FILES: usize = 250_000;
 const MAX_STAGED_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+const MAX_OBSERVATION_BYTES: u64 = 16 * 1024 * 1024;
+
+pub const NEXT_BUILD_OBSERVER: &str = "next-adapter-observer";
+pub const ASTRO_BUILD_OBSERVER: &str = "astro-vite-build-observer";
+pub const TANSTACK_START_BUILD_OBSERVER: &str = "tanstack-start-vite-build-observer";
+pub const WEB_BUILD_OBSERVER_VERSION: &str = "0.1.0";
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum WebBuildAdapter {
+    Next,
+    Astro,
+    TanstackStart,
+}
+
+impl WebBuildAdapter {
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Next => "next",
+            Self::Astro => "astro",
+            Self::TanstackStart => "tanstack-start",
+        }
+    }
+
+    pub(crate) fn observer(self) -> &'static str {
+        match self {
+            Self::Next => NEXT_BUILD_OBSERVER,
+            Self::Astro => ASTRO_BUILD_OBSERVER,
+            Self::TanstackStart => TANSTACK_START_BUILD_OBSERVER,
+        }
+    }
+
+    fn runtime_artifact(self) -> &'static str {
+        match self {
+            Self::Next => "next-build-adapter.mjs",
+            Self::Astro => "astro-build-integration.mjs",
+            Self::TanstackStart => "tanstack-start-build-observer.mjs",
+        }
+    }
+
+    fn observation_file(self) -> &'static str {
+        match self {
+            Self::Next => "next-build-observation.json",
+            Self::Astro => "astro-build-observation.json",
+            Self::TanstackStart => "tanstack-start-build-observation.json",
+        }
+    }
+
+    fn observation_schema(self) -> &'static str {
+        match self {
+            Self::Next => "next-build-observation-v1",
+            Self::Astro => "astro-build-observation-v1",
+            Self::TanstackStart => "tanstack-start-build-observation-v1",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WebBuildObservation {
+    pub adapter: WebBuildAdapter,
+    pub observation: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct WebBuildPackageConfig {
+    depgraph: Option<WebDepgraphConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WebDepgraphConfig {
+    build: WebBuildConfig,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WebBuildConfig {
+    adapter: WebBuildAdapter,
+    entrypoint: PathBuf,
+    version: String,
+    #[serde(default)]
+    timeout_seconds: Option<u64>,
+}
 
 #[derive(Debug, Clone)]
 pub struct BuildExecutionPlan {
@@ -83,6 +167,66 @@ pub fn create_build_execution_request(source_root: &Path) -> Result<BuildExecuti
                 stdout_limit_bytes: DEFAULT_OUTPUT_LIMIT_BYTES,
                 stderr_limit_bytes: DEFAULT_OUTPUT_LIMIT_BYTES,
                 target: None,
+            },
+        });
+    }
+    let package_path = source_root.join("package.json");
+    if package_path.is_file() {
+        let package: WebBuildPackageConfig = serde_json::from_slice(&fs::read(&package_path)?)
+            .context("package.json has an invalid depgraph build configuration")?;
+        let config = package
+            .depgraph
+            .context("package.json has no versioned depgraph.build execution plan")?
+            .build;
+        validate_logical_path(&config.entrypoint, false)?;
+        if !source_root.join(&config.entrypoint).is_file() {
+            bail!(
+                "depgraph.build entrypoint {} is unavailable",
+                display_logical(&config.entrypoint)
+            );
+        }
+        if config.version.trim().is_empty()
+            || config.version.len() > 128
+            || config.version.chars().any(char::is_control)
+        {
+            bail!("depgraph.build version is invalid");
+        }
+        let observer = locate_web_build_runtime(config.adapter.runtime_artifact(), &source_root)?;
+        let observer_argument = process_argument_path(&observer)
+            .to_string_lossy()
+            .into_owned();
+        let mut environment =
+            BTreeMap::from([("DEPGRAPH_OBSERVER".to_owned(), observer_argument.clone())]);
+        match config.adapter {
+            WebBuildAdapter::Next => {
+                environment.insert("NEXT_ADAPTER_PATH".to_owned(), observer_argument);
+            }
+            WebBuildAdapter::Astro => {
+                environment.insert("DEPGRAPH_ASTRO_VERSION".to_owned(), config.version.clone());
+            }
+            WebBuildAdapter::TanstackStart => {
+                environment.insert(
+                    "DEPGRAPH_TANSTACK_START_VERSION".to_owned(),
+                    config.version.clone(),
+                );
+            }
+        }
+        return Ok(BuildExecutionRequest {
+            source_root,
+            plan: BuildExecutionPlan {
+                adapter: config.adapter.observer().to_owned(),
+                adapter_version: WEB_BUILD_OBSERVER_VERSION.to_owned(),
+                profile_id: format!("web:build:{}", config.adapter.key()),
+                program: "node".to_owned(),
+                arguments: vec![display_logical(&config.entrypoint)],
+                logical_cwd: PathBuf::from("."),
+                environment,
+                timeout_seconds: config
+                    .timeout_seconds
+                    .unwrap_or(DEFAULT_BUILD_TIMEOUT_SECONDS),
+                stdout_limit_bytes: DEFAULT_OUTPUT_LIMIT_BYTES,
+                stderr_limit_bytes: DEFAULT_OUTPUT_LIMIT_BYTES,
+                target: Some("production".to_owned()),
             },
         });
     }
@@ -200,6 +344,8 @@ pub struct BuildExecutionOutcome {
     pub project_code_executed: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rust_observation: Option<RustBuildObservation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub web_observation: Option<WebBuildObservation>,
 }
 
 pub async fn supervise_build(
@@ -224,7 +370,12 @@ where
     if !source_root.is_dir() {
         bail!("build source root is not a directory");
     }
-    let program = resolve_safe_executable(&plan.program, &source_root)?;
+    let (program, rustc) = if plan.program == "cargo" {
+        let (cargo, rustc) = resolve_active_rust_toolchain(&source_root).await?;
+        (cargo, Some(rustc))
+    } else {
+        (resolve_safe_executable(&plan.program, &source_root)?, None)
+    };
     let executable_digest = digest_file(&program)?;
     let toolchain_version = probe_build_tool_version(&program, &source_root).await?;
     let run = BuildRunDirectories::create()?;
@@ -256,7 +407,8 @@ where
         use std::os::unix::process::CommandExt as _;
         command.as_std_mut().process_group(0);
     }
-    let mut effective_environment = supervisor_environment(&source_root, &run, &plan.program)?;
+    let mut effective_environment =
+        supervisor_environment(&source_root, &run, &plan.program, rustc.as_deref())?;
     for (key, value) in &plan.environment {
         effective_environment.insert(key.clone(), value.clone());
     }
@@ -347,12 +499,24 @@ where
         }
     }
     let mut rust_observation = None;
+    let mut web_observation = None;
     if matches!(outcome, BuildOutcomeKind::Completed) && plan.adapter == RUST_BUILD_OBSERVER {
         match collect_rust_build_observation(&stdout, &run.workspace, &run.output) {
             Ok(observation) => rust_observation = Some(observation),
             Err(_) => {
                 outcome = BuildOutcomeKind::SecurityFailed;
                 diagnostic_code = Some("rust-build-observation-invalid".to_owned());
+            }
+        }
+    }
+    if matches!(outcome, BuildOutcomeKind::Completed)
+        && let Some(adapter) = web_adapter_for_observer(&plan.adapter)
+    {
+        match collect_web_build_observation(adapter, &run.output) {
+            Ok(observation) => web_observation = Some(observation),
+            Err(_) => {
+                outcome = BuildOutcomeKind::SecurityFailed;
+                diagnostic_code = Some("web-build-observation-invalid".to_owned());
             }
         }
     }
@@ -363,6 +527,7 @@ where
                 outcome = BuildOutcomeKind::SecurityFailed;
                 diagnostic_code = Some("build-output-security-policy".to_owned());
                 rust_observation = None;
+                web_observation = None;
                 None
             }
         }
@@ -407,6 +572,53 @@ where
         audit,
         project_code_executed: true,
         rust_observation,
+        web_observation,
+    })
+}
+
+fn web_adapter_for_observer(observer: &str) -> Option<WebBuildAdapter> {
+    match observer {
+        NEXT_BUILD_OBSERVER => Some(WebBuildAdapter::Next),
+        ASTRO_BUILD_OBSERVER => Some(WebBuildAdapter::Astro),
+        TANSTACK_START_BUILD_OBSERVER => Some(WebBuildAdapter::TanstackStart),
+        _ => None,
+    }
+}
+
+fn collect_web_build_observation(
+    adapter: WebBuildAdapter,
+    output: &Path,
+) -> Result<WebBuildObservation> {
+    let path = output.join(adapter.observation_file());
+    let metadata = fs::symlink_metadata(&path)
+        .context("Web build observer did not produce its observation artifact")?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() == 0
+        || metadata.len() > MAX_OBSERVATION_BYTES
+    {
+        bail!("Web build observation artifact violates the output policy");
+    }
+    let observation: serde_json::Value = serde_json::from_slice(&fs::read(path)?)
+        .context("Web build observation is invalid JSON")?;
+    let object = observation
+        .as_object()
+        .context("Web build observation must be an object")?;
+    if object
+        .get("schema_version")
+        .and_then(serde_json::Value::as_str)
+        != Some(adapter.observation_schema())
+        || object.get("observer").and_then(serde_json::Value::as_str) != Some(adapter.observer())
+        || object
+            .get("observer_version")
+            .and_then(serde_json::Value::as_str)
+            != Some(WEB_BUILD_OBSERVER_VERSION)
+    {
+        bail!("Web build observation identity does not match its execution plan");
+    }
+    Ok(WebBuildObservation {
+        adapter,
+        observation,
     })
 }
 
@@ -468,6 +680,7 @@ fn supervisor_environment(
     root: &Path,
     run: &BuildRunDirectories,
     program: &str,
+    rustc: Option<&Path>,
 ) -> Result<BTreeMap<String, String>> {
     let mut environment = BTreeMap::new();
     environment.insert(
@@ -525,7 +738,7 @@ fn supervisor_environment(
             "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER".to_owned(),
             String::new(),
         );
-        let rustc = resolve_safe_executable("rustc", root)?;
+        let rustc = rustc.context("active Rust toolchain compiler is unavailable")?;
         environment.insert("RUSTC".to_owned(), rustc.to_string_lossy().into_owned());
         environment.insert(
             "CARGO_BUILD_RUSTC".to_owned(),
@@ -538,6 +751,8 @@ fn supervisor_environment(
         }) {
             environment.insert("RUSTUP_HOME".to_owned(), value);
         }
+        #[cfg(all(windows, target_env = "msvc"))]
+        copy_safe_msvc_environment(&mut environment, root)?;
     }
     if let Some(system_root) = std::env::var_os("SystemRoot") {
         environment.insert(
@@ -551,6 +766,83 @@ fn supervisor_environment(
         }
     }
     Ok(environment)
+}
+
+#[cfg(all(windows, target_env = "msvc"))]
+fn copy_safe_msvc_environment(
+    environment: &mut BTreeMap<String, String>,
+    root: &Path,
+) -> Result<()> {
+    let tool = find_msvc_tools::find_tool(std::env::consts::ARCH, "link.exe")
+        .context("Visual Studio MSVC linker is unavailable")?;
+    let linker = tool
+        .path()
+        .canonicalize()
+        .context("Visual Studio MSVC linker is unavailable")?;
+    if !linker.is_file() || linker.starts_with(root) {
+        bail!("security policy violation: MSVC linker is not a trusted host executable");
+    }
+    let linker_directory = linker
+        .parent()
+        .context("Visual Studio MSVC linker directory is unavailable")?;
+
+    let mut has_linker_path = false;
+    let mut has_library_path = false;
+    for (key, value) in tool.env() {
+        let Some(key) = key.to_str() else {
+            continue;
+        };
+        if !matches!(key, "PATH" | "INCLUDE" | "LIB" | "LIBPATH") {
+            continue;
+        }
+        let value = sanitize_path_value(value, root)?;
+        if key == "PATH" {
+            has_linker_path = std::env::split_paths(&value).any(|path| path == linker_directory);
+        } else if key == "LIB" {
+            has_library_path = true;
+        }
+        environment.insert(key.to_owned(), value.to_string_lossy().into_owned());
+    }
+    if !has_linker_path || !has_library_path {
+        bail!("Visual Studio MSVC linker environment is incomplete");
+    }
+    Ok(())
+}
+
+async fn resolve_active_rust_toolchain(root: &Path) -> Result<(PathBuf, PathBuf)> {
+    let rustc_proxy = resolve_safe_executable("rustc", root)?;
+    let output = run_probe(
+        rustc_proxy.as_os_str(),
+        &[OsString::from("--print"), OsString::from("sysroot")],
+        root,
+    )
+    .await?;
+    if !output.status.success() {
+        bail!("active Rust toolchain sysroot probe failed");
+    }
+    let sysroot =
+        String::from_utf8(output.stdout).context("active Rust toolchain sysroot is not UTF-8")?;
+    let sysroot = PathBuf::from(sysroot.trim())
+        .canonicalize()
+        .context("active Rust toolchain sysroot is unavailable")?;
+    if sysroot.starts_with(root) || !sysroot.is_dir() {
+        bail!("security policy violation: active Rust toolchain is inside the project root");
+    }
+    let cargo = rust_toolchain_executable(&sysroot, "cargo")?;
+    let rustc = rust_toolchain_executable(&sysroot, "rustc")?;
+    Ok((cargo, rustc))
+}
+
+fn rust_toolchain_executable(sysroot: &Path, name: &str) -> Result<PathBuf> {
+    let executable = sysroot
+        .join("bin")
+        .join(format!("{name}{}", std::env::consts::EXE_SUFFIX))
+        .canonicalize()
+        .with_context(|| format!("active Rust toolchain {name} is unavailable"))?;
+    if !executable.is_file() || !executable.starts_with(sysroot) {
+        bail!("active Rust toolchain {name} is not a trusted executable");
+    }
+    Ok(executable)
 }
 
 fn safe_host_directory(key: &str, root: &Path) -> Option<String> {
@@ -865,6 +1157,40 @@ mod tests {
             assert!(!serialized.contains(&home.to_string_lossy().to_string()));
         }
         assert!(!serialized.contains("depgraph-build-"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rust_build_uses_real_active_toolchain_with_isolated_cargo_home() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        fs::create_dir(root.path().join("src"))?;
+        fs::write(
+            root.path().join("Cargo.toml"),
+            "[package]\nname = \"depgraph-isolated-rust-build\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[workspace]\n",
+        )?;
+        fs::write(
+            root.path().join("Cargo.lock"),
+            "# This file is automatically @generated by Cargo.\n# It is not intended for manual editing.\nversion = 4\n\n[[package]]\nname = \"depgraph-isolated-rust-build\"\nversion = \"0.1.0\"\n",
+        )?;
+        fs::write(
+            root.path().join("build.rs"),
+            "fn main() { let out = std::env::var_os(\"OUT_DIR\").unwrap(); std::fs::write(std::path::Path::new(&out).join(\"observed.rs\"), b\"pub const OBSERVED: bool = true;\\n\").unwrap(); }\n",
+        )?;
+        fs::write(
+            root.path().join("src/lib.rs"),
+            "include!(concat!(env!(\"OUT_DIR\"), \"/observed.rs\"));\n",
+        )?;
+
+        let request = create_build_execution_request(root.path())?;
+        let outcome = supervise_build(&request.source_root, &request.plan).await?;
+        assert_eq!(
+            outcome.audit.outcome,
+            BuildOutcomeKind::Completed,
+            "isolated Rust build failed: {:?}",
+            outcome.audit
+        );
+        assert!(outcome.rust_observation.is_some());
+        assert!(outcome.audit.validated_output_digest.is_some());
         Ok(())
     }
 
