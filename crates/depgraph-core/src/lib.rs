@@ -3,6 +3,7 @@ pub mod build_evidence;
 pub mod config;
 pub mod export;
 pub mod query;
+pub mod rust_build_observer;
 pub mod scan;
 pub mod worker;
 
@@ -30,6 +31,11 @@ pub use export::{ExportFormat, export};
 pub use query::{
     CycleLevel, CycleResult, TraversalResult, UnresolvedResult, WhyResult, cycles,
     render_condition, resolve_selector, traverse, unresolved, why,
+};
+pub use rust_build_observer::{
+    RUST_BUILD_CAPABILITY, RUST_BUILD_OBSERVATION_SCHEMA, RUST_BUILD_OBSERVER,
+    RUST_BUILD_OBSERVER_VERSION, RustBuildObservation, rust_build_protocol_events,
+    rust_build_protocol_ndjson,
 };
 pub use scan::{ScanOutcome, run_scan};
 

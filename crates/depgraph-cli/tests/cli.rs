@@ -2,6 +2,94 @@ use std::fs;
 
 use assert_cmd::Command;
 use predicates::prelude::*;
+use serde_json::json;
+
+fn seed_safe_rust_scan(
+    store_path: &std::path::Path,
+    root: &std::path::Path,
+    app_manifest_path: &str,
+) {
+    let mut store = depgraph_store::Store::open(store_path).unwrap();
+    store.start_scan("safe-rust-scan", root, false).unwrap();
+    let coverage = json!({
+        "profiles": 1,
+        "files_discovered": 0,
+        "files_analyzed": 0,
+        "files_skipped": 0,
+        "dependency_sites": 0,
+        "resolved": 0,
+        "candidates": 0,
+        "external": 0,
+        "unresolved": 0,
+        "unsupported_syntax": 0,
+        "project_code_executed": false,
+        "completeness": ["syntax-complete"],
+        "reasons": []
+    });
+    let common = |event: &str, seq: u64| {
+        json!({
+            "event": event,
+            "protocol_version": "1.0",
+            "scan_id": "safe-rust-scan",
+            "adapter": "rust",
+            "adapter_version": "0.1.0",
+            "seq": seq
+        })
+    };
+    let mut events = Vec::new();
+    let mut started = common("scan_started", 1);
+    started["root"] = json!(root.to_string_lossy());
+    started["project_code_executed"] = json!(false);
+    started["safe_mode"] = json!(true);
+    events.push(started);
+    let mut profile = common("profile_declared", 2);
+    profile["profile"] = json!({
+        "id": "rust:safe",
+        "language": "rust",
+        "features": [],
+        "environment": {},
+        "properties": {"project_code_executed": false}
+    });
+    events.push(profile);
+    for (seq, node) in [
+        json!({
+            "id": "package:app", "kind": "package_instance", "locator": "cargo:app@0.1.0",
+            "display_name": "supervisor-fixture",
+            "properties": {
+                "ecosystem": "cargo", "name": "supervisor-fixture", "version": "0.1.0",
+                "manifest_path": app_manifest_path, "safe_marker": "preserved"
+            }
+        }),
+        json!({
+            "id": "package:macro", "kind": "package_instance", "locator": "cargo:fixture-macro@0.1.0",
+            "display_name": "fixture-macro",
+            "properties": {
+                "ecosystem": "cargo", "name": "fixture-macro", "version": "0.1.0",
+                "manifest_path": "macro/Cargo.toml"
+            }
+        }),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut event = common("node_upsert", seq as u64 + 3);
+        event["node"] = node;
+        events.push(event);
+    }
+    let mut profile_completed = common("profile_completed", 5);
+    profile_completed["profile_id"] = json!("rust:safe");
+    profile_completed["coverage"] = coverage.clone();
+    events.push(profile_completed);
+    let mut completed = common("scan_completed", 6);
+    completed["coverage"] = coverage;
+    events.push(completed);
+    for event in &events {
+        store.ingest_event(event).unwrap();
+    }
+    store
+        .finish_scan("safe-rust-scan", "completed", None, true)
+        .unwrap();
+}
 
 #[test]
 fn init_writes_only_the_versioned_config() {
@@ -92,27 +180,62 @@ fn consented_build_mode_runs_project_code_only_in_the_supervised_staging_area() 
     let marker = root.path().join("PROJECT_BUILD_EXECUTED");
     fs::write(
         root.path().join("Cargo.toml"),
-        "[package]\nname='supervisor-fixture'\nversion='0.1.0'\nedition='2024'\n",
+        "[workspace]\nmembers=['macro']\nresolver='2'\n\n[package]\nname='supervisor-fixture'\nversion='0.1.0'\nedition='2024'\n\n[dependencies]\nfixture-macro={path='macro'}\n",
     )
     .unwrap();
     fs::write(
         root.path().join("Cargo.lock"),
-        "version = 4\n\n[[package]]\nname = \"supervisor-fixture\"\nversion = \"0.1.0\"\n",
+        "version = 4\n\n[[package]]\nname = \"fixture-macro\"\nversion = \"0.1.0\"\n\n[[package]]\nname = \"supervisor-fixture\"\nversion = \"0.1.0\"\ndependencies = [\n \"fixture-macro\",\n]\n",
     )
     .unwrap();
     fs::create_dir(root.path().join("src")).unwrap();
-    fs::write(root.path().join("src/lib.rs"), "pub fn fixture() {}\n").unwrap();
     fs::write(
-        root.path().join("build.rs"),
-        "fn main() { let out = std::env::var_os(\"DEPGRAPH_OUTPUT_DIR\").unwrap(); std::fs::write(std::path::PathBuf::from(out).join(\"PROJECT_BUILD_EXECUTED\"), b\"yes\").unwrap(); }\n",
+        root.path().join("src/lib.rs"),
+        "use fixture_macro::Observed;\n#[derive(Observed)]\npub struct Fixture;\ninclude!(concat!(env!(\"OUT_DIR\"), \"/generated.rs\"));\n",
     )
     .unwrap();
+    fs::create_dir_all(root.path().join("macro/src")).unwrap();
+    fs::write(
+        root.path().join("macro/Cargo.toml"),
+        "[package]\nname='fixture-macro'\nversion='0.1.0'\nedition='2024'\n\n[lib]\nproc-macro=true\n",
+    )
+    .unwrap();
+    fs::write(
+        root.path().join("macro/src/lib.rs"),
+        "extern crate proc_macro;\nuse proc_macro::TokenStream;\n#[proc_macro_derive(Observed)]\npub fn observed(_: TokenStream) -> TokenStream { TokenStream::new() }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.path().join("build.rs"),
+        r#"fn main() {
+    let supervised = std::path::PathBuf::from(std::env::var_os("DEPGRAPH_OUTPUT_DIR").unwrap());
+    std::fs::write(supervised.join("PROJECT_BUILD_EXECUTED"), b"yes").unwrap();
+    let out = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+    std::fs::write(out.join("generated.rs"), b"pub const GENERATED: bool = true;\n").unwrap();
+    println!("cargo:rustc-cfg=observed_cfg");
+    println!("cargo:rustc-env=OBSERVED_ENV=hidden-env-value");
+    println!("cargo:rustc-env=API_TOKEN=super-secret-token");
+    println!("cargo:rustc-link-search=native={}", out.display());
+    if cfg!(target_os = "windows") {
+        println!("cargo:rustc-link-lib=dylib=kernel32");
+    } else if cfg!(target_os = "macos") {
+        println!("cargo:rustc-link-lib=framework=CoreFoundation");
+    } else {
+        println!("cargo:rustc-link-lib=dylib=dl");
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    let store_path = cache.path().join("graph.db");
+    seed_safe_rust_scan(&store_path, root.path(), "Cargo.toml");
 
     Command::cargo_bin("depgraph")
         .unwrap()
         .args([
             "--store",
-            cache.path().join("graph.db").to_str().unwrap(),
+            store_path.to_str().unwrap(),
             "resolve",
             "--build",
             root.path().to_str().unwrap(),
@@ -122,11 +245,12 @@ fn consented_build_mode_runs_project_code_only_in_the_supervised_staging_area() 
         .success()
         .stdout(predicate::str::contains("status: Completed"))
         .stdout(predicate::str::contains("project code executed: true"))
+        .stdout(predicate::str::contains("build evidence: promoted"))
         .stderr(predicate::str::contains("network isolation"));
 
     assert!(!marker.exists());
-    assert!(cache.path().join("graph.db").exists());
-    let store = depgraph_store::Store::open(cache.path().join("graph.db")).unwrap();
+    assert!(store_path.exists());
+    let store = depgraph_store::Store::open(&store_path).unwrap();
     let audit = store.latest_build_audit().unwrap().unwrap().audit;
     let serialized = serde_json::to_string(&audit).unwrap();
     assert_eq!(audit["outcome"], "completed");
@@ -139,10 +263,64 @@ fn consented_build_mode_runs_project_code_only_in_the_supervised_staging_area() 
         Some("cargo")
     );
     assert!(!serialized.contains(&root.path().to_string_lossy().to_string()));
+    assert!(!serialized.contains("hidden-env-value"));
+    assert!(!serialized.contains("super-secret-token"));
     if let Some(home) = std::env::var_os("HOME") {
         assert!(!serialized.contains(&home.to_string_lossy().to_string()));
     }
     assert!(!serialized.contains("depgraph-build-"));
+    let snapshot = store.load_snapshot("safe-rust-scan").unwrap();
+    assert!(
+        !store
+            .scan("safe-rust-scan")
+            .unwrap()
+            .unwrap()
+            .project_code_executed
+    );
+    assert!(snapshot.nodes.iter().any(|node| {
+        node.kind == "package_instance" && node.properties["safe_marker"] == "preserved"
+    }));
+    for kind in [
+        "build_script_run",
+        "build_output_directory",
+        "proc_macro_binary",
+        "native_library",
+    ] {
+        assert!(
+            snapshot.nodes.iter().any(|node| node.kind == kind),
+            "missing {kind}"
+        );
+    }
+    for kind in [
+        "executes_build_script",
+        "generates_out_dir",
+        "compiles_proc_macro",
+        "links_native_library",
+    ] {
+        assert!(
+            snapshot.edges.iter().any(|edge| edge.kind == kind),
+            "missing {kind}"
+        );
+    }
+    assert!(snapshot.coverage.project_code_executed);
+    assert!(
+        snapshot
+            .coverage
+            .completeness
+            .iter()
+            .any(|level| level == "build-observed")
+    );
+    let build_nodes_json = serde_json::to_string(
+        &snapshot
+            .nodes
+            .iter()
+            .filter(|node| node.properties["build_generated"] == true)
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    assert!(!build_nodes_json.contains("hidden-env-value"));
+    assert!(!build_nodes_json.contains("super-secret-token"));
+    assert!(!build_nodes_json.contains(&root.path().to_string_lossy().to_string()));
 
     Command::cargo_bin("depgraph")
         .unwrap()
@@ -155,6 +333,67 @@ fn consented_build_mode_runs_project_code_only_in_the_supervised_staging_area() 
         .assert()
         .code(2)
         .stderr(predicate::str::contains("does not exist"));
+}
+
+#[test]
+fn failed_rust_build_correlation_finalizes_the_attempt_without_promoting_a_delta() {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let store_path = cache.path().join("graph.db");
+    fs::write(
+        root.path().join("Cargo.toml"),
+        "[package]\nname='correlation-fixture'\nversion='0.1.0'\nedition='2024'\n",
+    )
+    .unwrap();
+    fs::write(
+        root.path().join("Cargo.lock"),
+        "version = 4\n\n[[package]]\nname = \"correlation-fixture\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    fs::create_dir(root.path().join("src")).unwrap();
+    fs::write(root.path().join("src/lib.rs"), "pub fn fixture() {}\n").unwrap();
+    fs::write(
+        root.path().join("build.rs"),
+        "fn main() { let out = std::path::PathBuf::from(std::env::var_os(\"OUT_DIR\").unwrap()); std::fs::write(out.join(\"observed.txt\"), b\"observed\").unwrap(); }\n",
+    )
+    .unwrap();
+    seed_safe_rust_scan(&store_path, root.path(), "unrelated/Cargo.toml");
+
+    Command::cargo_bin("depgraph")
+        .unwrap()
+        .args([
+            "--store",
+            store_path.to_str().unwrap(),
+            "resolve",
+            "--build",
+            root.path().to_str().unwrap(),
+            "--allow-project-code",
+        ])
+        .assert()
+        .code(4)
+        .stderr(predicate::str::contains(
+            "Rust build observation could not be correlated",
+        ));
+
+    let store = depgraph_store::Store::open(&store_path).unwrap();
+    let audit = store.latest_build_audit().unwrap().unwrap();
+    let attempt = store.build_attempt(&audit.run_id).unwrap().unwrap();
+    assert_eq!(attempt.status, "security_failed");
+    assert_eq!(
+        attempt.error.as_deref(),
+        Some("rust-build-correlation-failed")
+    );
+    assert_eq!(
+        store.current_build_attempt_id("safe-rust-scan").unwrap(),
+        None
+    );
+    let snapshot = store.load_snapshot("safe-rust-scan").unwrap();
+    assert!(
+        snapshot
+            .nodes
+            .iter()
+            .all(|node| node.properties["build_generated"] != true)
+    );
 }
 
 #[test]

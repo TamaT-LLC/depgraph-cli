@@ -17,6 +17,10 @@ use tokio::{process::Command, time::timeout};
 use uuid::Uuid;
 use walkdir::{DirEntry, WalkDir};
 
+use crate::rust_build_observer::{
+    RUST_BUILD_OBSERVER, RUST_BUILD_OBSERVER_VERSION, RustBuildObservation,
+    collect_rust_build_observation,
+};
 use crate::worker::{
     ProcessTreeGuard, finish_reader, read_capped, resolve_safe_executable, run_probe,
     sanitized_path, terminate_worker,
@@ -63,14 +67,15 @@ pub fn create_build_execution_request(source_root: &Path) -> Result<BuildExecuti
         return Ok(BuildExecutionRequest {
             source_root,
             plan: BuildExecutionPlan {
-                adapter: "rust-build-bootstrap".to_owned(),
-                adapter_version: BUILD_SUPERVISOR_VERSION.to_owned(),
+                adapter: RUST_BUILD_OBSERVER.to_owned(),
+                adapter_version: RUST_BUILD_OBSERVER_VERSION.to_owned(),
                 profile_id: "rust:build".to_owned(),
                 program: "cargo".to_owned(),
                 arguments: vec![
                     "build".to_owned(),
                     "--frozen".to_owned(),
                     "--offline".to_owned(),
+                    "--message-format=json-render-diagnostics".to_owned(),
                 ],
                 logical_cwd: PathBuf::from("."),
                 environment: BTreeMap::new(),
@@ -193,6 +198,8 @@ pub struct BuildAudit {
 pub struct BuildExecutionOutcome {
     pub audit: BuildAudit,
     pub project_code_executed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rust_observation: Option<RustBuildObservation>,
 }
 
 pub async fn supervise_build(
@@ -339,12 +346,23 @@ where
             diagnostic_code = Some("build-output-limit".to_owned());
         }
     }
+    let mut rust_observation = None;
+    if matches!(outcome, BuildOutcomeKind::Completed) && plan.adapter == RUST_BUILD_OBSERVER {
+        match collect_rust_build_observation(&stdout, &run.workspace, &run.output) {
+            Ok(observation) => rust_observation = Some(observation),
+            Err(_) => {
+                outcome = BuildOutcomeKind::SecurityFailed;
+                diagnostic_code = Some("rust-build-observation-invalid".to_owned());
+            }
+        }
+    }
     let validated_output_digest = if matches!(outcome, BuildOutcomeKind::Completed) {
         match digest_output_tree(&run.output, &stdout) {
             Ok(digest) => Some(digest),
             Err(_) => {
                 outcome = BuildOutcomeKind::SecurityFailed;
                 diagnostic_code = Some("build-output-security-policy".to_owned());
+                rust_observation = None;
                 None
             }
         }
@@ -388,6 +406,7 @@ where
     Ok(BuildExecutionOutcome {
         audit,
         project_code_executed: true,
+        rust_observation,
     })
 }
 
