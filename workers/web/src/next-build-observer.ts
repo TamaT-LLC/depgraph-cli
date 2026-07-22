@@ -768,13 +768,17 @@ function routePatternWithoutBasePath(pathname: string, basePath: string): string
   return pathname.startsWith(`${basePath}/`) ? pathname.slice(basePath.length) : pathname;
 }
 
+function routePatternWithBasePath(pathname: string, basePath: string): string {
+  if (basePath === "" || pathname === basePath || pathname.startsWith(`${basePath}/`)) return pathname;
+  return pathname === "/" ? basePath : `${basePath}${pathname}`;
+}
+
 interface NextRouteCorrelationIndex {
   byPattern: Map<string, GraphNode[]>;
-  bySourcePath: Map<string, GraphNode[]>;
 }
 
 function indexNextRoutes(baseNodes: readonly GraphNode[]): NextRouteCorrelationIndex {
-  const index: NextRouteCorrelationIndex = { byPattern: new Map(), bySourcePath: new Map() };
+  const index: NextRouteCorrelationIndex = { byPattern: new Map() };
   const add = (map: Map<string, GraphNode[]>, key: JsonValue | undefined, node: GraphNode): void => {
     if (typeof key !== "string") return;
     const values = map.get(key) ?? [];
@@ -785,7 +789,6 @@ function indexNextRoutes(baseNodes: readonly GraphNode[]): NextRouteCorrelationI
     if (node.kind !== "route" || node.properties.framework !== "next") continue;
     add(index.byPattern, node.properties.route_pattern, node);
     add(index.byPattern, node.properties.pattern, node);
-    add(index.bySourcePath, node.properties.source_path, node);
   }
   return index;
 }
@@ -796,12 +799,14 @@ function routeCandidates(
   basePath: string,
 ): GraphNode[] {
   const patterns = new Set([output.pathname, routePatternWithoutBasePath(output.pathname, basePath)]);
+  if (output.source_page !== null) {
+    patterns.add(output.source_page);
+    patterns.add(routePatternWithoutBasePath(output.source_page, basePath));
+    patterns.add(routePatternWithBasePath(output.source_page, basePath));
+  }
   const matches = new Map<string, GraphNode>();
   for (const pattern of patterns) {
     for (const node of index.byPattern.get(pattern) ?? []) matches.set(node.id, node);
-  }
-  if (output.source_page !== null) {
-    for (const node of index.bySourcePath.get(output.source_page) ?? []) matches.set(node.id, node);
   }
   const sortedMatches = [...matches.values()].sort((left, right) => compareUtf8(left.id, right.id));
   const semantic = sortedMatches.filter((node) => node.properties.canonical_identity !== undefined);

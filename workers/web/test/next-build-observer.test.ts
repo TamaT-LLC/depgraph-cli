@@ -437,6 +437,16 @@ test("observed outputs correlate to canonical safe routes and become determinist
   assert.ok(sourceFallback.edges.some((edge) => edge.kind === "emits" && edge.source === sourceRoute().id));
   assert.equal(sourceFallback.diagnostics.some((item) => item.code === "web.next_build_route_static_missing"), false);
 
+  const sourcePageObservation = await observation();
+  sourcePageObservation.outputs[0]!.pathname = "/docs/rendered-products/[id]";
+  const sourcePageFallback = buildNextObservedGraph({
+    observation: sourcePageObservation,
+    provenance,
+    baseNodes: [route],
+  });
+  assert.ok(sourcePageFallback.edges.some((edge) => edge.kind === "emits" && edge.source === route.id));
+  assert.equal(sourcePageFallback.diagnostics.some((item) => item.code === "web.next_build_route_static_missing"), false);
+
   const events = nextBuildProtocolEvents("/repo", first, provenance, "revision-1");
   assert.equal(events[0]?.event, "scan_started");
   assert.equal(events.at(-1)?.event, "scan_completed");
