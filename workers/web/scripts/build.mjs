@@ -42,6 +42,17 @@ const bundle = await build({
   }],
 });
 
+await build({
+  entryPoints: [fileURLToPath(new URL("../src/next-build-adapter-entry.ts", import.meta.url))],
+  outfile: fileURLToPath(new URL("../dist/next-build-adapter.mjs", import.meta.url)),
+  bundle: true,
+  platform: "node",
+  format: "esm",
+  target: "node24",
+  sourcemap: false,
+  legalComments: "external",
+});
+
 const astroManifest = fileURLToPath(import.meta.resolve("@astrojs/compiler/package.json"));
 const astroMetadata = JSON.parse(await readFile(astroManifest, "utf8"));
 if (astroMetadata.name !== "@astrojs/compiler" || astroMetadata.version !== "4.0.0") {
