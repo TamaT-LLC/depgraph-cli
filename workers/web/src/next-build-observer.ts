@@ -1027,7 +1027,8 @@ export function buildNextObservedGraph(input: NextBuildGraphInput): NextBuildGra
   const observationPath = `.next/depgraph/${observationDigest}.json`;
   for (const routing of input.observation.routing) {
     const evidence = buildEvidence(input.provenance, observationPath, observationDigest);
-    const routePattern = routing.source ?? `observed:${digestIdentity(routing as unknown as JsonValue)}`;
+    const routingEntryDigest = digestIdentity(routing as unknown as JsonValue);
+    const routePattern = routing.source ?? `observed:${routingEntryDigest}`;
     const route = buildNode(
       "route",
       {
@@ -1035,6 +1036,7 @@ export function buildNextObservedGraph(input: NextBuildGraphInput): NextBuildGra
         route_pattern: routePattern,
         routing_phase: routing.phase,
         source_regex_digest: routing.source_regex_digest,
+        routing_entry_digest: routingEntryDigest,
         profile_id: input.provenance.profile_id,
       },
       routing.source ?? "observed Next routing entry",
@@ -1047,6 +1049,7 @@ export function buildNextObservedGraph(input: NextBuildGraphInput): NextBuildGra
         priority: routing.priority,
         header_count: routing.header_count,
         predicate_count: routing.predicate_count,
+        routing_entry_digest: routingEntryDigest,
         profile_id: input.provenance.profile_id,
       },
       input.provenance,

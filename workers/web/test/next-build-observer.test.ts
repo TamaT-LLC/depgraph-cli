@@ -470,6 +470,29 @@ test("static ambiguity and runtime drift retain observed evidence with bounded d
   assert.equal(JSON.stringify(drift).includes("private-build-id"), false);
 });
 
+test("same-source conditional routing entries remain distinct while exact duplicates deduplicate", async () => {
+  const observed = await observation();
+  const first = observed.routing[0]!;
+  const second = {
+    ...first,
+    destination: "/docs/conditional",
+    predicate_count: 1,
+  };
+  observed.routing = [first, second, { ...first }];
+
+  const graph = buildNextObservedGraph({ observation: observed, provenance, baseNodes: [] });
+  const routes = graph.nodes.filter((node) => (
+    node.kind === "route" && node.properties.routing_phase === "beforeFiles"
+  ));
+  assert.equal(routes.length, 2);
+  assert.equal(new Set(routes.map((node) => node.id)).size, 2);
+  assert.deepEqual(
+    routes.map((node) => node.properties.destination).sort(),
+    ["/docs", "/docs/conditional"],
+  );
+  assert.equal(graph.edges.filter((edge) => edge.kind === "routes_in_phase").length, 2);
+});
+
 test("observer identity remains aligned across build evidence and adapter metadata", () => {
   assert.equal(NEXT_BUILD_OBSERVER, "next-adapter-observer");
   assert.equal(NEXT_BUILD_OBSERVER_VERSION, "0.1.0");
