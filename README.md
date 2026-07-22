@@ -36,7 +36,7 @@ unresolved, semantic-issue, and compiler diagnostic counts, and
 Detected Next.js, Astro, TanStack Router, and TanStack Start profiles must also
 complete their versioned framework semantic capability ledger. Code-based
 routes beyond the safe static boundary, framework-specific build observers,
-runtime traces, incremental updates, snapshot diff CLI/impact, and architecture policies
+runtime traces, incremental updates, Git changed-set impact, and architecture policies
 remain later milestones. The supervised build protocol and atomic evidence
 union foundation are available separately under the explicit-consent boundary.
 
@@ -92,6 +92,12 @@ depgraph snapshot list --json
 depgraph snapshot show baseline
 depgraph snapshot show snapshot:sha256:... --json
 
+# Compare completed snapshots by name or stable ID.
+depgraph diff baseline current
+depgraph diff baseline current --json
+depgraph diff baseline current --kind symbol --profile web:production:server
+depgraph diff baseline current --phase semantic --status unresolved
+
 depgraph export --format json --output graph.json
 depgraph export --format dot > graph.dot
 depgraph export --format mermaid > graph.mmd
@@ -100,6 +106,8 @@ depgraph export --format mermaid > graph.mmd
 SQLite is stored under the operating system cache directory, keyed by the canonical repository root. Use global `--store PATH` for a specific database and global `--scan-id ID` to inspect a retained partial scan. Queries default to the latest successful scan; `doctor` reports the latest attempt.
 
 `snapshot create` names the current completed snapshot; global `--scan-id ID` may instead select the completed snapshot produced by that scan and its latest promoted build. Failed or incomplete attempts cannot be named. Names are immutable, case-insensitively unique, 1–64 ASCII characters, begin with a letter or digit, and otherwise use letters, digits, `.`, `_`, or `-`. `current` and `latest` are reserved, and existing names are never overwritten. `snapshot show` accepts a name, a `snapshot:sha256:...` stable ID, or `current`. List and detail JSON are emitted in canonical order.
+
+`diff` accepts two completed snapshot names, stable IDs, or `current`; failed and incomplete attempt IDs are rejected with exit code `2`. Human output starts with node/site/edge/evidence/profile/coverage/rename counts and follows with canonical change details plus primary source evidence. `--json` emits the versioned `diff` command envelope with normalized filters, a summary, and the canonical before/after records. Repeatable `--kind`, `--profile`, `--phase`, and `--status` filters use exact matching and AND semantics; a record type that does not expose a selected dimension is excluded rather than guessed through an implicit graph join.
 
 Selectors accept `id:`, `path:`, `package:`, `route:`, `symbol:`, and `type:` prefixes. `symbol:` and `type:` only match their respective node kind. A bare or prefixed selector must resolve unambiguously; when candidates are reported, copy the complete stable ID (for example `symbol:sha256:...`) and retry as `id:<stable-id>`.
 

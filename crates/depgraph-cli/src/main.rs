@@ -11,6 +11,10 @@ use depgraph_core::{
 use depgraph_store::{CompletedSnapshotDetails, CoverageRecord};
 use serde::Serialize;
 
+mod snapshot_diff;
+
+use snapshot_diff::{DiffCommandData, DiffFilters, render_human_diff};
+
 #[derive(Debug, Parser)]
 #[command(
     name = "depgraph",
@@ -101,6 +105,25 @@ enum Commands {
     Snapshot {
         #[command(subcommand)]
         command: SnapshotCommands,
+    },
+    /// Compare two immutable completed snapshots by name or stable ID.
+    Diff {
+        from: String,
+        to: String,
+        #[arg(long)]
+        json: bool,
+        /// Retain records with one of these node, site, edge, or rename kinds.
+        #[arg(long, value_name = "KIND")]
+        kind: Vec<String>,
+        /// Retain records belonging to one of these exact profile IDs.
+        #[arg(long, value_name = "PROFILE_ID")]
+        profile: Vec<String>,
+        /// Retain edges in one of these phases.
+        #[arg(long, value_name = "PHASE")]
+        phase: Vec<String>,
+        /// Retain sites or edges with one of these resolution statuses.
+        #[arg(long, value_name = "STATUS")]
+        status: Vec<String>,
     },
     /// Export the selected scan in a deterministic format.
     Export {
@@ -237,6 +260,7 @@ fn error_exit_code(error: &anyhow::Error) -> u8 {
     }
     if (message.contains("scan ") && message.contains(" was not found"))
         || (message.contains("completed snapshot") && message.contains(" was not found"))
+        || (message.contains("diff ") && message.contains(" filter must"))
         || [
             "selector",
             "snapshot name",
@@ -740,6 +764,38 @@ async fn run(cli: Cli) -> Result<u8> {
             }
             Ok(0)
         }
+        Commands::Diff {
+            from,
+            to,
+            json,
+            kind,
+            profile,
+            phase,
+            status,
+        } => {
+            let filters = DiffFilters::new(kind, profile, phase, status)?;
+            let root = std::env::current_dir()?;
+            let store_path = store_path(cli.store, &root)?;
+            let store = open_store(&store_path)?;
+            let from_snapshot_id = store.resolve_completed_snapshot_selector(&from)?;
+            let to_snapshot_id = store.resolve_completed_snapshot_selector(&to)?;
+            let diff =
+                filters.apply(store.diff_completed_snapshots(&from_snapshot_id, &to_snapshot_id)?);
+            if json {
+                let output = DiffCommandData::new(&diff, &filters);
+                print_snapshot_json("diff", &output)?;
+            } else if diff.is_empty() {
+                print!("{}", render_human_diff(&diff, &filters, None, None));
+            } else {
+                let from_snapshot = store.load_completed_snapshot(&from_snapshot_id)?;
+                let to_snapshot = store.load_completed_snapshot(&to_snapshot_id)?;
+                print!(
+                    "{}",
+                    render_human_diff(&diff, &filters, Some(&from_snapshot), Some(&to_snapshot),)
+                );
+            }
+            Ok(0)
+        }
         Commands::Export { format, output } => {
             let (snapshot, _) = load_snapshot(cli.store, cli.scan_id.as_deref(), false)?;
             let format = match format {
@@ -973,6 +1029,10 @@ mod tests {
         );
         assert_eq!(
             error_exit_code(&anyhow::anyhow!("unsupported config schema_version 2")),
+            2
+        );
+        assert_eq!(
+            error_exit_code(&anyhow::anyhow!("diff kind filter must not be empty")),
             2
         );
         assert_eq!(
