@@ -752,6 +752,17 @@ fn supervisor_environment(
             environment.insert("RUSTUP_HOME".to_owned(), value);
         }
         #[cfg(windows)]
+        for key in ["ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"] {
+            // rustc's MSVC discovery falls back to vswhere.exe beneath the
+            // system Program Files directory when the COM registration is not
+            // available (as on GitHub-hosted runners). Without these trusted
+            // roots it can accidentally resolve Git's unrelated GNU link.exe
+            // from PATH instead of Visual Studio's linker.
+            if let Some(value) = safe_host_directory(key, root) {
+                environment.insert(key.to_owned(), value);
+            }
+        }
+        #[cfg(windows)]
         for key in ["INCLUDE", "LIB", "LIBPATH"] {
             let Some(value) = std::env::var_os(key) else {
                 continue;
@@ -1153,27 +1164,6 @@ mod tests {
 
         let request = create_build_execution_request(root.path())?;
         let outcome = supervise_build(&request.source_root, &request.plan).await?;
-        if outcome.audit.outcome != BuildOutcomeKind::Completed {
-            // This fixture contains no credentials. Re-run only its Cargo command
-            // without the supervisor so cross-platform CI can expose the native
-            // toolchain diagnostic instead of the intentionally generic audit code.
-            let (cargo, rustc) = resolve_active_rust_toolchain(root.path()).await?;
-            let run = BuildRunDirectories::create()?;
-            stage_workspace(root.path(), &run.workspace)?;
-            let environment = supervisor_environment(root.path(), &run, "cargo", Some(&rustc))?;
-            let diagnostic = std::process::Command::new(cargo)
-                .args(&request.plan.arguments)
-                .current_dir(&run.workspace)
-                .env_clear()
-                .envs(environment)
-                .output()?;
-            panic!(
-                "isolated Rust build failed: {:?}\nCargo stdout:\n{}\nCargo stderr:\n{}",
-                outcome.audit,
-                String::from_utf8_lossy(&diagnostic.stdout),
-                String::from_utf8_lossy(&diagnostic.stderr)
-            );
-        }
         assert_eq!(
             outcome.audit.outcome,
             BuildOutcomeKind::Completed,
