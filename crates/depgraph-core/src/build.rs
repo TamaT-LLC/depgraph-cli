@@ -21,7 +21,7 @@ use crate::rust_build_observer::{
     RUST_BUILD_OBSERVER, RUST_BUILD_OBSERVER_VERSION, RustBuildObservation,
     collect_rust_build_observation,
 };
-#[cfg(windows)]
+#[cfg(all(windows, target_env = "msvc"))]
 use crate::worker::sanitize_path_value;
 use crate::worker::{
     ProcessTreeGuard, finish_reader, locate_web_build_runtime, process_argument_path, read_capped,
@@ -751,30 +751,8 @@ fn supervisor_environment(
         }) {
             environment.insert("RUSTUP_HOME".to_owned(), value);
         }
-        #[cfg(windows)]
-        for key in ["ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"] {
-            // rustc's MSVC discovery falls back to vswhere.exe beneath the
-            // system Program Files directory when the COM registration is not
-            // available (as on GitHub-hosted runners). Without these trusted
-            // roots it can accidentally resolve Git's unrelated GNU link.exe
-            // from PATH instead of Visual Studio's linker.
-            if let Some(value) = safe_host_directory(key, root) {
-                environment.insert(key.to_owned(), value);
-            }
-        }
-        #[cfg(windows)]
-        for key in ["INCLUDE", "LIB", "LIBPATH"] {
-            let Some(value) = std::env::var_os(key) else {
-                continue;
-            };
-            // MSVC's compiler and linker require these path lists even when
-            // rustc itself is resolved by absolute path. Preserve only existing
-            // directories outside the project root so the isolated build cannot
-            // inherit project-controlled search paths.
-            if let Ok(value) = sanitize_path_value(&value, root) {
-                environment.insert(key.to_owned(), value.to_string_lossy().into_owned());
-            }
-        }
+        #[cfg(all(windows, target_env = "msvc"))]
+        copy_safe_msvc_environment(&mut environment, root)?;
     }
     if let Some(system_root) = std::env::var_os("SystemRoot") {
         environment.insert(
@@ -788,6 +766,47 @@ fn supervisor_environment(
         }
     }
     Ok(environment)
+}
+
+#[cfg(all(windows, target_env = "msvc"))]
+fn copy_safe_msvc_environment(
+    environment: &mut BTreeMap<String, String>,
+    root: &Path,
+) -> Result<()> {
+    let tool = find_msvc_tools::find_tool(std::env::consts::ARCH, "link.exe")
+        .context("Visual Studio MSVC linker is unavailable")?;
+    let linker = tool
+        .path()
+        .canonicalize()
+        .context("Visual Studio MSVC linker is unavailable")?;
+    if !linker.is_file() || linker.starts_with(root) {
+        bail!("security policy violation: MSVC linker is not a trusted host executable");
+    }
+    let linker_directory = linker
+        .parent()
+        .context("Visual Studio MSVC linker directory is unavailable")?;
+
+    let mut has_linker_path = false;
+    let mut has_library_path = false;
+    for (key, value) in tool.env() {
+        let Some(key) = key.to_str() else {
+            continue;
+        };
+        if !matches!(key, "PATH" | "INCLUDE" | "LIB" | "LIBPATH") {
+            continue;
+        }
+        let value = sanitize_path_value(value, root)?;
+        if key == "PATH" {
+            has_linker_path = std::env::split_paths(&value).any(|path| path == linker_directory);
+        } else if key == "LIB" {
+            has_library_path = true;
+        }
+        environment.insert(key.to_owned(), value.to_string_lossy().into_owned());
+    }
+    if !has_linker_path || !has_library_path {
+        bail!("Visual Studio MSVC linker environment is incomplete");
+    }
+    Ok(())
 }
 
 async fn resolve_active_rust_toolchain(root: &Path) -> Result<(PathBuf, PathBuf)> {

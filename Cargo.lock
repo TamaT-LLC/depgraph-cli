@@ -433,6 +433,7 @@ dependencies = [
  "depgraph-protocol",
  "depgraph-store",
  "directories",
+ "find-msvc-tools",
  "hex",
  "libc",
  "petgraph",
