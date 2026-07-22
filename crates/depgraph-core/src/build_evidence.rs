@@ -79,7 +79,7 @@ pub async fn web_build_protocol_ndjson(
     let input = serde_json::to_vec(&json!({
         "adapter": observation.adapter.key(),
         "root": ".",
-        "source_revision": snapshot.scan.id,
+        "source_revision": snapshot.scan.source_revision.as_deref().unwrap_or("unknown"),
         "observation": observation.observation,
         "provenance": {
             "build_run_id": audit.run_id,

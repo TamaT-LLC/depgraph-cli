@@ -1693,6 +1693,8 @@ mod tests {
                 completed_at: Some("2026-07-22T00:00:01.000Z".to_owned()),
                 project_code_executed: false,
                 error: None,
+                parent_snapshot_id: None,
+                source_revision: None,
             },
             profiles: vec![ProfileRecord {
                 id: "rust:safe".to_owned(),
@@ -1702,6 +1704,7 @@ mod tests {
                 target: Some("x86_64-unknown-linux-gnu".to_owned()),
                 features: vec!["default".to_owned()],
                 environment: json!({"safe_mode":true}),
+                source_revision: None,
                 properties: json!({"effective_target":"x86_64-unknown-linux-gnu"}),
                 coverage: Some(CoverageRecord {
                     profiles: 1,
