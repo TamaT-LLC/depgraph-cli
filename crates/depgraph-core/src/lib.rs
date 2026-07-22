@@ -14,7 +14,8 @@ use std::{
 
 use anyhow::Result;
 use depgraph_store::{
-    AdapterLogRecord, CoverageRecord, DiagnosticRecord, FileCoverageRecord, ProfileRecord, Store,
+    AdapterLogRecord, CoverageRecord, DiagnosticRecord, FileCoverageRecord, ProfileMatrixRecord,
+    ProfileRecord, Store,
 };
 use serde::{Deserialize, Serialize};
 
@@ -68,6 +69,7 @@ pub struct ScanHealth {
     pub adapter_logs: Vec<AdapterLogRecord>,
     pub detected_packages: BTreeMap<String, String>,
     pub diagnostics: Vec<DiagnosticRecord>,
+    pub profile_matrix: ProfileMatrixRecord,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -211,6 +213,7 @@ pub async fn doctor(store: &Store) -> Result<DoctorReport> {
                 adapter_logs: snapshot.adapter_logs,
                 detected_packages,
                 diagnostics: snapshot.diagnostics,
+                profile_matrix: snapshot.profile_matrix,
             })
         })
         .transpose()?;

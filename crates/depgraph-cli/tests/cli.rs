@@ -321,6 +321,55 @@ fn consented_build_mode_runs_project_code_only_in_the_supervised_staging_area() 
     assert!(!build_nodes_json.contains("hidden-env-value"));
     assert!(!build_nodes_json.contains("super-secret-token"));
     assert!(!build_nodes_json.contains(&root.path().to_string_lossy().to_string()));
+    drop(store);
+
+    let run_json = |arguments: &[&str]| {
+        let output = Command::cargo_bin("depgraph")
+            .unwrap()
+            .args(["--store", store_path.to_str().unwrap()])
+            .args(arguments)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "args={arguments:?}\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+    };
+    let doctor = run_json(&["doctor", "--json"]);
+    assert_eq!(
+        doctor["latest_attempt"]["profile_matrix"]["entries"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(doctor["latest_attempt"]["profile_matrix"]["phase_coverage"]["static"].is_object());
+    assert!(doctor["latest_attempt"]["profile_matrix"]["phase_coverage"]["build"].is_object());
+
+    let exported = run_json(&["export", "--format", "json"]);
+    assert_eq!(
+        exported["graph"]["profile_matrix"]["schema_version"],
+        "profile-matrix-v1"
+    );
+    assert!(
+        exported["graph"]["profile_matrix"]["correlations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|correlation| correlation["status"] == "additional")
+    );
+
+    let deps = run_json(&["deps", "id:package:app", "--json"]);
+    let steps = deps["data"]["steps"].as_array().unwrap();
+    assert!(!steps.is_empty());
+    assert!(steps.iter().all(|step| {
+        step["effective_profile_id"].is_string()
+            && step["correlation_status"] == "additional"
+            && step["phase_coverage"]["build"].is_object()
+    }));
 
     Command::cargo_bin("depgraph")
         .unwrap()
