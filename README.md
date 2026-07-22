@@ -65,7 +65,7 @@ depgraph init .
 depgraph scan /path/to/repository
 depgraph scan /path/to/repository --strict
 
-# Privileged build-observation consent form. The supervisor currently fails closed.
+# Privileged build-observation consent form.
 depgraph resolve --build /path/to/repository --allow-project-code
 
 depgraph doctor --json
@@ -105,7 +105,7 @@ Executable or unsupported configuration becomes a diagnostic or unresolved site.
 
 `depgraph resolve --build [PATH]` is a separate, privileged mode because build tools, executable configuration, plugins, lifecycle scripts, Rust build scripts, and proc macros may run arbitrary project code. It never prompts. Each invocation must include `--allow-project-code`; configuration, environment variables, `CI=true`, TTY state, and previous consent cannot grant permission. Missing consent is rejected before path/config/store/toolchain processing with exit code `4`.
 
-The explicit-consent CLI guard and threat model are implemented. The supervised child-process runner is the next milestone task, so a consented invocation currently fails closed with exit code `3` and `no child process was started`. It does not create a store or report a successful no-op. The supervisor contract requires a temporary staged workspace, cleared allowlisted environment, process-tree timeout/cancellation, network-policy audit, secret-free command/cwd/toolchain/environment-key audit, untrusted-output validation, and atomic `phase=build` / `precision=observed` union. Failed or partial attempts must preserve the previous completed snapshot.
+The explicit-consent guard is enforced before path, configuration, store, or tool processing. A consented Rust workspace with `Cargo.toml` and `Cargo.lock` is executed by the versioned build supervisor in a temporary staged workspace using a canonical system Cargo executable, cleared allowlisted environment, temporary HOME/cache/output, bounded output, timeout/cancellation, and cross-platform process-tree cleanup. Every launched attempt saves a secret-free audit containing command metadata, logical paths, environment key names, limits, isolation capability, and outcome; raw stdout/stderr and temporary or host paths are not persisted. Network isolation is reported as `best-effort` unless an outer namespace/container enforces it. Framework-specific observers and atomic `phase=build` evidence union are subsequent milestones.
 
 ## Strict policy and exit codes
 

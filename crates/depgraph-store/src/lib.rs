@@ -9,7 +9,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ScanRecord {
@@ -141,6 +141,15 @@ pub struct AdapterLogRecord {
     pub adapter: String,
     pub stderr: String,
     pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BuildAuditRecord {
+    pub run_id: String,
+    pub outcome: String,
+    pub started_at: String,
+    pub finished_at: String,
+    pub audit: Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -403,7 +412,119 @@ impl Store {
             )?;
             tx.commit()?;
         }
+        if current < 6 {
+            let tx = self.connection.transaction()?;
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS build_audits (
+                    run_id TEXT PRIMARY KEY,
+                    outcome TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    finished_at TEXT NOT NULL,
+                    audit_json TEXT NOT NULL
+                 );
+                 CREATE INDEX IF NOT EXISTS build_audits_started_at
+                    ON build_audits(started_at, run_id);
+                 PRAGMA user_version = 6;",
+            )?;
+            tx.commit()?;
+        }
         Ok(())
+    }
+
+    pub fn save_build_audit(&mut self, audit: &Value) -> Result<()> {
+        let object = audit
+            .as_object()
+            .context("build audit must be a JSON object")?;
+        let run_id = required_str(audit, "run_id")?;
+        let outcome = required_str(audit, "outcome")?;
+        let started_at = required_str(audit, "started_at")?;
+        let finished_at = required_str(audit, "finished_at")?;
+        if run_id.trim().is_empty() {
+            bail!("build audit run_id must not be empty");
+        }
+        if !matches!(
+            outcome,
+            "completed" | "failed" | "timed_out" | "cancelled" | "security_failed"
+        ) {
+            bail!("invalid build audit outcome {outcome}");
+        }
+        let environment_keys = object
+            .get("environment_keys")
+            .and_then(Value::as_array)
+            .context("build audit environment_keys must be an array")?;
+        for key in environment_keys {
+            let key = key
+                .as_str()
+                .context("build audit environment key must be a string")?;
+            if is_secret_like_key(key) {
+                bail!("build audit contains a secret-like environment key");
+            }
+        }
+        let raw = serde_json::to_string(audit)?;
+        let tx = self.connection.transaction()?;
+        tx.execute(
+            "INSERT INTO build_audits(run_id, outcome, started_at, finished_at, audit_json)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![run_id, outcome, started_at, finished_at, raw],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn build_audit(&self, run_id: &str) -> Result<Option<BuildAuditRecord>> {
+        self.connection
+            .query_row(
+                "SELECT run_id, outcome, started_at, finished_at, audit_json
+                   FROM build_audits WHERE run_id=?1",
+                [run_id],
+                |row| {
+                    let raw = row.get::<_, String>(4)?;
+                    let audit = serde_json::from_str(&raw).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            raw.len(),
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?;
+                    Ok(BuildAuditRecord {
+                        run_id: row.get(0)?,
+                        outcome: row.get(1)?,
+                        started_at: row.get(2)?,
+                        finished_at: row.get(3)?,
+                        audit,
+                    })
+                },
+            )
+            .optional()
+            .context("failed to load build audit")
+    }
+
+    pub fn latest_build_audit(&self) -> Result<Option<BuildAuditRecord>> {
+        self.connection
+            .query_row(
+                "SELECT run_id, outcome, started_at, finished_at, audit_json
+                   FROM build_audits ORDER BY started_at DESC, rowid DESC LIMIT 1",
+                [],
+                |row| {
+                    let raw = row.get::<_, String>(4)?;
+                    let audit = serde_json::from_str(&raw).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            raw.len(),
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?;
+                    Ok(BuildAuditRecord {
+                        run_id: row.get(0)?,
+                        outcome: row.get(1)?,
+                        started_at: row.get(2)?,
+                        finished_at: row.get(3)?,
+                        audit,
+                    })
+                },
+            )
+            .optional()
+            .context("failed to load latest build audit")
     }
 
     pub fn start_scan(&mut self, scan_id: &str, root: &Path, strict: bool) -> Result<()> {
@@ -1054,6 +1175,24 @@ fn required_str<'a>(value: &'a Value, field: &str) -> Result<&'a str> {
         .get(field)
         .and_then(Value::as_str)
         .with_context(|| format!("event is missing string field {field}"))
+}
+
+fn is_secret_like_key(key: &str) -> bool {
+    let upper = key.to_ascii_uppercase();
+    [
+        "TOKEN",
+        "SECRET",
+        "PASSWORD",
+        "PASSWD",
+        "API_KEY",
+        "PRIVATE_KEY",
+        "CREDENTIAL",
+        "AUTH",
+        "COOKIE",
+        "SESSION",
+    ]
+    .iter()
+    .any(|part| upper.contains(part))
 }
 
 fn required_object<'a>(value: &'a Value, field: &str) -> Result<&'a Value> {
@@ -2257,7 +2396,7 @@ mod tests {
         drop(connection);
 
         let store = Store::open(&path)?;
-        assert_eq!(store.schema_version()?, 5);
+        assert_eq!(store.schema_version()?, 6);
         let site_not_null: i64 = store.connection.query_row(
             "SELECT [notnull] FROM pragma_table_info('edges') WHERE name='site_id'",
             [],
@@ -2288,6 +2427,37 @@ mod tests {
             |row| row.get(0),
         )?;
         assert_eq!(profile_coverage_table, 1);
+        let build_audits_table: i64 = store.connection.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='build_audits'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(build_audits_table, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn build_audit_round_trips_without_secret_environment_keys() -> Result<()> {
+        let mut store = Store::open_in_memory()?;
+        let audit = json!({
+            "run_id":"build-1",
+            "outcome":"completed",
+            "started_at":"2026-07-22T00:00:00.000Z",
+            "finished_at":"2026-07-22T00:00:01.000Z",
+            "environment_keys":["CI","PATH"],
+            "redacted_secret_key_count":1
+        });
+        store.save_build_audit(&audit)?;
+        assert_eq!(store.build_audit("build-1")?.unwrap().audit, audit);
+
+        let unsafe_audit = json!({
+            "run_id":"build-2",
+            "outcome":"failed",
+            "started_at":"2026-07-22T00:00:00.000Z",
+            "finished_at":"2026-07-22T00:00:01.000Z",
+            "environment_keys":["API_TOKEN"]
+        });
+        assert!(store.save_build_audit(&unsafe_audit).is_err());
         Ok(())
     }
 }
