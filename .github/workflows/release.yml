@@ -34,6 +34,7 @@ jobs:
       # targets. Keep an explicit release ceiling while reporting the raw timings.
       DEPGRAPH_SCAN_LIMIT_MS: "60000"
       DEPGRAPH_QUERY_LIMIT_MS: "1500"
+      DEPGRAPH_BUILD_OBSERVATION_LIMIT_MS: "60000"
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install 1.93.1 --profile minimal
@@ -81,7 +82,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 24.18.0
-      - name: Build archive, checksums, SBOM, and license inventory
+      - name: Build archive and verify cross-adapter Build Evidence release gate
         env:
           DEPGRAPH_TARGET: ${{ matrix.target }}
         run: cargo xtask package

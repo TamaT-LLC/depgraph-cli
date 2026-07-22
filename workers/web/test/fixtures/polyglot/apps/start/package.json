@@ -1,6 +1,13 @@
 {
   "name": "@fixture/start",
   "version": "1.0.0",
+  "depgraph": {
+    "build": {
+      "adapter": "tanstack-start",
+      "entrypoint": "depgraph-build.mjs",
+      "version": "1.168.28"
+    }
+  },
   "dependencies": {
     "@tanstack/react-router": "1.170.18",
     "@tanstack/react-start": "1.168.28"

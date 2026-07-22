@@ -6,7 +6,7 @@ use depgraph_core::{
     BuildOutcomeKind, Config, CycleLevel, ExportFormat, create_build_execution_request,
     default_store_path, doctor, execute_build_request_with_cancellation, export, init_config,
     open_store, render_condition, run_scan, rust_build_protocol_ndjson, stage_build_evidence,
-    traverse, unresolved, why,
+    traverse, unresolved, web_build_protocol_ndjson, why,
 };
 use serde::Serialize;
 
@@ -233,33 +233,30 @@ async fn run(cli: Cli) -> Result<u8> {
                 store.start_build_attempt(&base_scan_id, &serde_json::to_value(&outcome.audit)?)?;
                 match outcome.audit.outcome {
                     BuildOutcomeKind::Completed => {
-                        let Some(observation) = outcome.rust_observation.as_ref() else {
-                            store.finish_build_attempt(
-                                &outcome.audit.run_id,
-                                "security_failed",
-                                Some("rust-build-observation-missing"),
-                                false,
-                            )?;
-                            anyhow::bail!(
-                                "security policy violation: completed Rust build produced no validated observation"
-                            );
-                        };
                         let snapshot = store.load_snapshot(&base_scan_id)?;
-                        let ndjson = match rust_build_protocol_ndjson(
-                            &snapshot,
-                            &outcome.audit,
-                            observation,
-                        ) {
-                            Ok(ndjson) => ndjson,
+                        let ndjson = if let Some(observation) = outcome.rust_observation.as_ref() {
+                            rust_build_protocol_ndjson(&snapshot, &outcome.audit, observation)
+                                .context("Rust build observation could not be correlated")
+                        } else if let Some(observation) = outcome.web_observation.as_ref() {
+                            web_build_protocol_ndjson(&snapshot, &outcome.audit, observation)
+                                .await
+                                .context("Web build observation could not be correlated")
+                        } else {
+                            Err(anyhow::anyhow!(
+                                "completed build produced no validated observation"
+                            ))
+                        };
+                        let ndjson = match ndjson {
+                            Ok(value) => value,
                             Err(error) => {
                                 store.finish_build_attempt(
                                     &outcome.audit.run_id,
                                     "security_failed",
-                                    Some("rust-build-correlation-failed"),
+                                    Some("build-observation-correlation-failed"),
                                     false,
                                 )?;
                                 anyhow::bail!(
-                                    "security policy violation: Rust build observation could not be correlated: {error:#}"
+                                    "security policy violation: build observation could not be correlated: {error:#}"
                                 );
                             }
                         };
@@ -271,11 +268,11 @@ async fn run(cli: Cli) -> Result<u8> {
                             store.finish_build_attempt(
                                 &outcome.audit.run_id,
                                 "security_failed",
-                                Some("rust-build-evidence-rejected"),
+                                Some("build-evidence-rejected"),
                                 false,
                             )?;
                             anyhow::bail!(
-                                "security policy violation: Rust build evidence was rejected: {error:#}"
+                                "security policy violation: build evidence was rejected: {error:#}"
                             );
                         }
                         store.finish_build_attempt(

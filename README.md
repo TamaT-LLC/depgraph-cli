@@ -106,9 +106,24 @@ Executable or unsupported configuration becomes a diagnostic or unresolved site.
 
 `depgraph resolve --build [PATH]` is a separate, privileged mode because build tools, executable configuration, plugins, lifecycle scripts, Rust build scripts, and proc macros may run arbitrary project code. It never prompts. Each invocation must include `--allow-project-code`; configuration, environment variables, `CI=true`, TTY state, and previous consent cannot grant permission. Missing consent is rejected before path/config/store/toolchain processing with exit code `4`.
 
-The explicit-consent guard is enforced before path, configuration, store, or tool processing. A consented Rust workspace with `Cargo.toml` and `Cargo.lock` is executed by the versioned build supervisor in a temporary staged workspace using a canonical system Cargo executable, cleared allowlisted environment, temporary HOME/cache/output, bounded output, timeout/cancellation, and cross-platform process-tree cleanup. Every launched attempt saves a secret-free audit containing command metadata, logical paths, environment key names, limits, isolation capability, and outcome; raw stdout/stderr and temporary or host paths are not persisted. Network isolation is reported as `best-effort` unless an outer namespace/container enforces it.
+The explicit-consent guard is enforced before path, configuration, store, or tool processing. A consented Rust workspace with `Cargo.toml` and `Cargo.lock` is executed by the versioned build supervisor using Cargo. Next.js, Astro, and TanStack Start projects declare a direct Node entrypoint and pinned observer contract in `package.json`; shell commands and package-manager lifecycle resolution are not accepted:
 
-Validated observer output uses `phase=build`, `precision=observed`, and primary `kind=build` evidence tied to the supervisor audit digests. Schema-v7 stores the delta in an attempt transaction and exposes it to `deps`, `dependents`, `why`, and exports only after completed promotion. Source and semantic rows remain immutable; matching and conflicting build observations coexist as separate layers, with conflicts carrying both provenance sets. Failed, partial, timed-out, cancelled, malformed, or unauthorized deltas are discarded and never replace the current completed graph. Framework-specific observers are implemented in subsequent milestones.
+```json
+{
+  "depgraph": {
+    "build": {
+      "adapter": "next",
+      "entrypoint": "depgraph-build.mjs",
+      "version": "16.2.10",
+      "timeout_seconds": 900
+    }
+  }
+}
+```
+
+The allowed Web adapter values are `next`, `astro`, and `tanstack-start`. The relative entrypoint must integrate the release-provided observer named by `DEPGRAPH_OBSERVER` (and `NEXT_ADAPTER_PATH` for Next) into the real build lifecycle. It runs in a temporary staged workspace using canonical system Node, a cleared allowlisted environment, temporary HOME/cache/output, bounded output, timeout/cancellation, and cross-platform process-tree cleanup. Every launched attempt saves a secret-free audit containing command metadata, logical paths, environment key names, limits, isolation capability, and outcome; raw stdout/stderr and temporary or host paths are not persisted. Network isolation is reported as `best-effort` unless an outer namespace/container enforces it.
+
+Validated observer output uses `phase=build`, `precision=observed`, and primary `kind=build` evidence tied to the supervisor audit digests. The Next/Astro/TanStack Start observer entrypoints and their observation-to-protocol converter are separate checksum-attested release artifacts; missing, undeclared, or changed bytes fail closed before project code starts. Schema-v7 stores the delta in an attempt transaction and exposes it to `deps`, `dependents`, `why`, and exports only after completed promotion. Source and semantic rows remain immutable; matching and conflicting build observations coexist as separate layers, with conflicts carrying both provenance sets. Failed, partial, timed-out, cancelled, malformed, or unauthorized deltas are discarded and never replace the current completed graph.
 
 ## Strict policy and exit codes
 

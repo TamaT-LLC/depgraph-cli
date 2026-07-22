@@ -22,8 +22,8 @@ use crate::rust_build_observer::{
     collect_rust_build_observation,
 };
 use crate::worker::{
-    ProcessTreeGuard, finish_reader, read_capped, resolve_safe_executable, run_probe,
-    sanitized_path, terminate_worker,
+    ProcessTreeGuard, finish_reader, locate_web_build_runtime, process_argument_path, read_capped,
+    resolve_safe_executable, run_probe, sanitized_path, terminate_worker,
 };
 
 pub const BUILD_SUPERVISOR_VERSION: &str = "1.0";
@@ -32,6 +32,88 @@ pub const MAX_BUILD_TIMEOUT_SECONDS: u64 = 60 * 60;
 pub const DEFAULT_OUTPUT_LIMIT_BYTES: usize = 10 * 1024 * 1024;
 const MAX_STAGED_FILES: usize = 250_000;
 const MAX_STAGED_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+const MAX_OBSERVATION_BYTES: u64 = 16 * 1024 * 1024;
+
+pub const NEXT_BUILD_OBSERVER: &str = "next-adapter-observer";
+pub const ASTRO_BUILD_OBSERVER: &str = "astro-vite-build-observer";
+pub const TANSTACK_START_BUILD_OBSERVER: &str = "tanstack-start-vite-build-observer";
+pub const WEB_BUILD_OBSERVER_VERSION: &str = "0.1.0";
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum WebBuildAdapter {
+    Next,
+    Astro,
+    TanstackStart,
+}
+
+impl WebBuildAdapter {
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Next => "next",
+            Self::Astro => "astro",
+            Self::TanstackStart => "tanstack-start",
+        }
+    }
+
+    pub(crate) fn observer(self) -> &'static str {
+        match self {
+            Self::Next => NEXT_BUILD_OBSERVER,
+            Self::Astro => ASTRO_BUILD_OBSERVER,
+            Self::TanstackStart => TANSTACK_START_BUILD_OBSERVER,
+        }
+    }
+
+    fn runtime_artifact(self) -> &'static str {
+        match self {
+            Self::Next => "next-build-adapter.mjs",
+            Self::Astro => "astro-build-integration.mjs",
+            Self::TanstackStart => "tanstack-start-build-observer.mjs",
+        }
+    }
+
+    fn observation_file(self) -> &'static str {
+        match self {
+            Self::Next => "next-build-observation.json",
+            Self::Astro => "astro-build-observation.json",
+            Self::TanstackStart => "tanstack-start-build-observation.json",
+        }
+    }
+
+    fn observation_schema(self) -> &'static str {
+        match self {
+            Self::Next => "next-build-observation-v1",
+            Self::Astro => "astro-build-observation-v1",
+            Self::TanstackStart => "tanstack-start-build-observation-v1",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WebBuildObservation {
+    pub adapter: WebBuildAdapter,
+    pub observation: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct WebBuildPackageConfig {
+    depgraph: Option<WebDepgraphConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WebDepgraphConfig {
+    build: WebBuildConfig,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WebBuildConfig {
+    adapter: WebBuildAdapter,
+    entrypoint: PathBuf,
+    version: String,
+    #[serde(default)]
+    timeout_seconds: Option<u64>,
+}
 
 #[derive(Debug, Clone)]
 pub struct BuildExecutionPlan {
@@ -83,6 +165,66 @@ pub fn create_build_execution_request(source_root: &Path) -> Result<BuildExecuti
                 stdout_limit_bytes: DEFAULT_OUTPUT_LIMIT_BYTES,
                 stderr_limit_bytes: DEFAULT_OUTPUT_LIMIT_BYTES,
                 target: None,
+            },
+        });
+    }
+    let package_path = source_root.join("package.json");
+    if package_path.is_file() {
+        let package: WebBuildPackageConfig = serde_json::from_slice(&fs::read(&package_path)?)
+            .context("package.json has an invalid depgraph build configuration")?;
+        let config = package
+            .depgraph
+            .context("package.json has no versioned depgraph.build execution plan")?
+            .build;
+        validate_logical_path(&config.entrypoint, false)?;
+        if !source_root.join(&config.entrypoint).is_file() {
+            bail!(
+                "depgraph.build entrypoint {} is unavailable",
+                display_logical(&config.entrypoint)
+            );
+        }
+        if config.version.trim().is_empty()
+            || config.version.len() > 128
+            || config.version.chars().any(char::is_control)
+        {
+            bail!("depgraph.build version is invalid");
+        }
+        let observer = locate_web_build_runtime(config.adapter.runtime_artifact(), &source_root)?;
+        let observer_argument = process_argument_path(&observer)
+            .to_string_lossy()
+            .into_owned();
+        let mut environment =
+            BTreeMap::from([("DEPGRAPH_OBSERVER".to_owned(), observer_argument.clone())]);
+        match config.adapter {
+            WebBuildAdapter::Next => {
+                environment.insert("NEXT_ADAPTER_PATH".to_owned(), observer_argument);
+            }
+            WebBuildAdapter::Astro => {
+                environment.insert("DEPGRAPH_ASTRO_VERSION".to_owned(), config.version.clone());
+            }
+            WebBuildAdapter::TanstackStart => {
+                environment.insert(
+                    "DEPGRAPH_TANSTACK_START_VERSION".to_owned(),
+                    config.version.clone(),
+                );
+            }
+        }
+        return Ok(BuildExecutionRequest {
+            source_root,
+            plan: BuildExecutionPlan {
+                adapter: config.adapter.observer().to_owned(),
+                adapter_version: WEB_BUILD_OBSERVER_VERSION.to_owned(),
+                profile_id: format!("web:build:{}", config.adapter.key()),
+                program: "node".to_owned(),
+                arguments: vec![display_logical(&config.entrypoint)],
+                logical_cwd: PathBuf::from("."),
+                environment,
+                timeout_seconds: config
+                    .timeout_seconds
+                    .unwrap_or(DEFAULT_BUILD_TIMEOUT_SECONDS),
+                stdout_limit_bytes: DEFAULT_OUTPUT_LIMIT_BYTES,
+                stderr_limit_bytes: DEFAULT_OUTPUT_LIMIT_BYTES,
+                target: Some("production".to_owned()),
             },
         });
     }
@@ -200,6 +342,8 @@ pub struct BuildExecutionOutcome {
     pub project_code_executed: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rust_observation: Option<RustBuildObservation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub web_observation: Option<WebBuildObservation>,
 }
 
 pub async fn supervise_build(
@@ -347,12 +491,24 @@ where
         }
     }
     let mut rust_observation = None;
+    let mut web_observation = None;
     if matches!(outcome, BuildOutcomeKind::Completed) && plan.adapter == RUST_BUILD_OBSERVER {
         match collect_rust_build_observation(&stdout, &run.workspace, &run.output) {
             Ok(observation) => rust_observation = Some(observation),
             Err(_) => {
                 outcome = BuildOutcomeKind::SecurityFailed;
                 diagnostic_code = Some("rust-build-observation-invalid".to_owned());
+            }
+        }
+    }
+    if matches!(outcome, BuildOutcomeKind::Completed)
+        && let Some(adapter) = web_adapter_for_observer(&plan.adapter)
+    {
+        match collect_web_build_observation(adapter, &run.output) {
+            Ok(observation) => web_observation = Some(observation),
+            Err(_) => {
+                outcome = BuildOutcomeKind::SecurityFailed;
+                diagnostic_code = Some("web-build-observation-invalid".to_owned());
             }
         }
     }
@@ -363,6 +519,7 @@ where
                 outcome = BuildOutcomeKind::SecurityFailed;
                 diagnostic_code = Some("build-output-security-policy".to_owned());
                 rust_observation = None;
+                web_observation = None;
                 None
             }
         }
@@ -407,6 +564,53 @@ where
         audit,
         project_code_executed: true,
         rust_observation,
+        web_observation,
+    })
+}
+
+fn web_adapter_for_observer(observer: &str) -> Option<WebBuildAdapter> {
+    match observer {
+        NEXT_BUILD_OBSERVER => Some(WebBuildAdapter::Next),
+        ASTRO_BUILD_OBSERVER => Some(WebBuildAdapter::Astro),
+        TANSTACK_START_BUILD_OBSERVER => Some(WebBuildAdapter::TanstackStart),
+        _ => None,
+    }
+}
+
+fn collect_web_build_observation(
+    adapter: WebBuildAdapter,
+    output: &Path,
+) -> Result<WebBuildObservation> {
+    let path = output.join(adapter.observation_file());
+    let metadata = fs::symlink_metadata(&path)
+        .context("Web build observer did not produce its observation artifact")?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() == 0
+        || metadata.len() > MAX_OBSERVATION_BYTES
+    {
+        bail!("Web build observation artifact violates the output policy");
+    }
+    let observation: serde_json::Value = serde_json::from_slice(&fs::read(path)?)
+        .context("Web build observation is invalid JSON")?;
+    let object = observation
+        .as_object()
+        .context("Web build observation must be an object")?;
+    if object
+        .get("schema_version")
+        .and_then(serde_json::Value::as_str)
+        != Some(adapter.observation_schema())
+        || object.get("observer").and_then(serde_json::Value::as_str) != Some(adapter.observer())
+        || object
+            .get("observer_version")
+            .and_then(serde_json::Value::as_str)
+            != Some(WEB_BUILD_OBSERVER_VERSION)
+    {
+        bail!("Web build observation identity does not match its execution plan");
+    }
+    Ok(WebBuildObservation {
+        adapter,
+        observation,
     })
 }
 

@@ -306,6 +306,71 @@ pub fn locate_worker(adapter: AdapterKind) -> Result<WorkerSpec> {
     )
 }
 
+pub(crate) fn locate_web_build_runtime(file_name: &str, root: &Path) -> Result<PathBuf> {
+    if file_name.contains('/') || file_name.contains('\\') || !file_name.ends_with(".mjs") {
+        bail!("security policy violation: invalid Web build runtime artifact name");
+    }
+    let executable = std::env::current_exe().context("failed to locate depgraph executable")?;
+    let executable_dir = executable.parent().unwrap_or(Path::new("."));
+    if let Some(manifest_path) = release_manifest_path(executable_dir) {
+        // Verify the complete compatibility unit and the running core before
+        // selecting a build-only runtime artifact from the same manifest.
+        locate_verified_bundled_worker_for_executable(
+            AdapterKind::Web,
+            &manifest_path,
+            Some(&executable),
+        )
+        .context("security policy violation: bundled release verification failed")?;
+        let release_root = verified_release_root(&manifest_path)?;
+        let manifest: BundledManifest = serde_json::from_slice(&std::fs::read(&manifest_path)?)
+            .context("security policy violation: invalid release manifest")?;
+        let expected_runtime_paths = [
+            "libexec/next-build-adapter.mjs",
+            "libexec/astro-build-integration.mjs",
+            "libexec/tanstack-start-build-observer.mjs",
+            "libexec/depgraph-web-build-evidence.mjs",
+        ]
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+        let declared_runtime_paths = manifest
+            .runtime_artifacts
+            .iter()
+            .map(|artifact| artifact.path.as_str())
+            .collect::<BTreeSet<_>>();
+        if declared_runtime_paths != expected_runtime_paths
+            || manifest.runtime_artifacts.len() != expected_runtime_paths.len()
+        {
+            bail!(
+                "security policy violation: Web build runtime attestation is incomplete or unknown"
+            );
+        }
+        let expected_path = format!("libexec/{file_name}");
+        let artifact = manifest
+            .runtime_artifacts
+            .iter()
+            .find(|artifact| artifact.path == expected_path)
+            .with_context(|| {
+                format!(
+                    "security policy violation: release manifest has no required Web build runtime {expected_path}"
+                )
+            })?;
+        return verify_bundled_artifact(&release_root, artifact, "Web build runtime artifact");
+    }
+    if cfg!(feature = "packaged") || looks_like_packaged_layout(executable_dir) {
+        bail!("security policy violation: packaged installation is missing release-manifest.json");
+    }
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let candidate = repo_root.join("workers/web/dist").join(file_name);
+    let candidate = candidate.canonicalize().with_context(|| {
+        format!("Web build runtime {file_name} is unavailable; build the Web worker")
+    })?;
+    let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    if candidate.starts_with(canonical_root) || !candidate.is_file() {
+        bail!("security policy violation: Web build runtime is inside the project root");
+    }
+    Ok(candidate)
+}
+
 #[derive(Debug, Deserialize)]
 struct BundledManifest {
     release_version: String,
@@ -1132,7 +1197,7 @@ fn worker_spec_from_path(
 // EISDIR. Preserve the canonical artifact path on WorkerSpec and normalize
 // only the argument handed to the external runtime.
 #[cfg(windows)]
-fn process_argument_path(path: &Path) -> OsString {
+pub(crate) fn process_argument_path(path: &Path) -> OsString {
     use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
 
     let wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
@@ -1140,7 +1205,7 @@ fn process_argument_path(path: &Path) -> OsString {
 }
 
 #[cfg(not(windows))]
-fn process_argument_path(path: &Path) -> OsString {
+pub(crate) fn process_argument_path(path: &Path) -> OsString {
     path.as_os_str().to_owned()
 }
 

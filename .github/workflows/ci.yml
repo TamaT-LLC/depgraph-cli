@@ -484,7 +484,7 @@ jobs:
           test ! -e "$fixture/CONFIG_EXECUTED"
       - name: Rust HIR semantic query, export, and determinism gate
         run: cargo xtask rust-semantic-e2e
-      - name: Packaged Web semantic archive gate
+      - name: Packaged semantic and cross-adapter Build Evidence archive gate
         env:
           DEPGRAPH_TARGET: ${{ matrix.target }}
         run: cargo xtask package
@@ -520,6 +520,10 @@ jobs:
       - run: target\debug\depgraph-rust-worker.exe --version
       - run: workers\go\bin\depgraph-go-worker.exe --version
       - run: node workers\web\dist\worker.mjs --version
+      - name: Packaged cross-adapter Build Evidence archive gate
+        env:
+          DEPGRAPH_TARGET: x86_64-pc-windows-msvc
+        run: cargo xtask package
       - name: Web TypeChecker import, type-use, and exact-call graph smoke
         shell: pwsh
         run: |

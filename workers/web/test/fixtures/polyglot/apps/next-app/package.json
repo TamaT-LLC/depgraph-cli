@@ -1,6 +1,13 @@
 {
   "name": "@fixture/next-app",
   "version": "1.0.0",
+  "depgraph": {
+    "build": {
+      "adapter": "next",
+      "entrypoint": "depgraph-build.mjs",
+      "version": "16.2.10"
+    }
+  },
   "dependencies": {
     "@fixture/shared": "workspace:*",
     "lodash": "^4.17.0",
