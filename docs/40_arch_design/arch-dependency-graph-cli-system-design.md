@@ -911,7 +911,7 @@ dependency correlation keyはeffective profile、source、dependency kind、spec
 | `conflict` | target、condition、resolutionのいずれかが予測と不一致 |
 | `unobserved` | static / semantic予測だけがあり、build / runtimeでは未観測 |
 
-`conflict`は`BUILD_EVIDENCE_CONFLICT`として予測と観測のsite / edge、condition、target、difference reason、両evidenceを保持する。`unobserved`はbuild coverage外や未実行をabsenceとして断定せず、negative evidenceには昇格しない。matrixはSQLite schemaを複製する永続tableではなく、canonical snapshotとpromoted build deltaから決定的に再構築するsnapshot viewである。`doctor`はphase別site / edge / evidence / completenessとstatus件数を、deps / dependents / why / unresolvedはeffective profile、correlation status、difference reason、phase coverageを、JSON exportはmatrix全体を公開する。DOT / Mermaidは相関が存在するedgeへobserved statusを注記する。
+`conflict`は`BUILD_EVIDENCE_CONFLICT`として予測と観測のsite / edge、condition、target、difference reason、両evidenceを保持する。`unobserved`はbuild coverage外や未実行をabsenceとして断定せず、negative evidenceには昇格しない。matrixはSQLite schemaを複製する永続tableではなく、canonical snapshotとpromoted build deltaから決定的に再構築するsnapshot viewである。`doctor`はphase別site / edge / evidence / completenessとstatus件数を、deps / dependents / why / unresolvedはeffective profile、correlation status、difference reason、phase coverageを、JSON exportはmatrix全体を公開する。DOT / Mermaidは実観測を含む`matched / additional / conflict`のedgeへobserved statusを注記し、未実行をabsenceに見せないため`unobserved`はJSON matrixだけで公開する。
 
 #### 12.2.7 Failure、snapshot、受け入れmatrix
 

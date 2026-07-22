@@ -149,6 +149,7 @@ fn edge_observation_status(snapshot: &GraphSnapshot) -> BTreeMap<&str, &str> {
         .profile_matrix
         .correlations
         .iter()
+        .filter(|correlation| correlation.status != "unobserved")
         .flat_map(|correlation| {
             correlation
                 .edge_ids_by_phase
@@ -180,7 +181,9 @@ fn mermaid_escape(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use depgraph_store::{CoverageRecord, EdgeRecord, GraphSnapshot, NodeRecord, ScanRecord};
+    use depgraph_store::{
+        CoverageRecord, EdgeRecord, GraphSnapshot, NodeRecord, ProfileCorrelationRecord, ScanRecord,
+    };
     use serde_json::json;
 
     #[test]
@@ -262,6 +265,33 @@ mod tests {
         assert!(dot.contains("imports [source; resolved; exact; web:server; true]"));
         assert!(mermaid.contains("imports [build; resolved; observed; web:server; true]"));
         assert!(mermaid.contains("imports [source; resolved; exact; web:server; true]"));
+        layered.profile_matrix.correlations = vec![ProfileCorrelationRecord {
+            id: "correlation".to_owned(),
+            effective_profile_id: "effective-profile".to_owned(),
+            source: "a".to_owned(),
+            kind: "import".to_owned(),
+            specifier: "./b".to_owned(),
+            status: "matched".to_owned(),
+            condition_union: json!({"op":"all","conditions":[]}),
+            conditions_by_phase: BTreeMap::new(),
+            targets_by_phase: BTreeMap::new(),
+            resolutions_by_phase: BTreeMap::new(),
+            site_ids_by_phase: BTreeMap::new(),
+            edge_ids_by_phase: BTreeMap::from([
+                ("build".to_owned(), vec!["edge:build".to_owned()]),
+                ("static".to_owned(), vec!["edge:source".to_owned()]),
+            ]),
+            difference_reasons: Vec::new(),
+            diagnostic_id: None,
+        }];
+        let observed_dot = export(&layered, ExportFormat::Dot)?;
+        let observed_mermaid = export(&layered, ExportFormat::Mermaid)?;
+        assert_eq!(observed_dot.matches("observed=matched").count(), 2);
+        assert_eq!(observed_mermaid.matches("observed=matched").count(), 2);
+
+        layered.profile_matrix.correlations[0].status = "unobserved".to_owned();
+        assert!(!export(&layered, ExportFormat::Dot)?.contains("observed="));
+        assert!(!export(&layered, ExportFormat::Mermaid)?.contains("observed="));
         let first = export(&layered, ExportFormat::Json)?;
         layered.edges.reverse();
         layered.edges.sort_by(|left, right| left.id.cmp(&right.id));
