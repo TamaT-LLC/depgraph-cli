@@ -8,7 +8,10 @@ use tokio::{io::AsyncWriteExt, process::Command, time::timeout};
 
 use crate::{
     BuildAudit, BuildOutcomeKind, WebBuildObservation,
-    worker::{locate_web_build_runtime, process_argument_path, resolve_safe_executable},
+    worker::{
+        copy_safe_environment, locate_web_build_runtime, process_argument_path,
+        resolve_safe_executable,
+    },
 };
 
 const BUILD_EVIDENCE_CONVERTER: &str = "depgraph-web-build-evidence.mjs";
@@ -101,14 +104,17 @@ pub async fn web_build_protocol_ndjson(
     let project_root = Path::new(&snapshot.scan.root);
     let converter = locate_web_build_runtime(BUILD_EVIDENCE_CONVERTER, project_root)?;
     let node = resolve_safe_executable("node", project_root)?;
-    let mut child = Command::new(node)
+    let mut command = Command::new(node);
+    command
         .arg(process_argument_path(&converter))
         .current_dir(project_root)
         .env_clear()
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
+        .kill_on_drop(true);
+    copy_safe_environment(&mut command, project_root)?;
+    let mut child = command
         .spawn()
         .context("failed to start Web build evidence converter")?;
     let mut stdin = child

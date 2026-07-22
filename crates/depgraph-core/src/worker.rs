@@ -1540,7 +1540,7 @@ pub(crate) async fn terminate_worker(child: &mut tokio::process::Child, guard: &
     let _ = child.wait().await;
 }
 
-fn copy_safe_environment(command: &mut Command, root: &Path) -> Result<()> {
+pub(crate) fn copy_safe_environment(command: &mut Command, root: &Path) -> Result<()> {
     command.env("PATH", sanitized_path(root)?);
     const PATH_KEYS: &[&str] = &[
         "HOME",
