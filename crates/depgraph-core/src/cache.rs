@@ -371,22 +371,12 @@ fn copy_safe_tool_environment(command: &mut Command, root: &Path) -> Result<(), 
 }
 
 fn is_cache_scannable_entry(entry: &DirEntry) -> bool {
-    if !entry.file_type().is_dir() {
+    if entry.depth() == 0 || !entry.file_type().is_dir() {
         return true;
     }
     !matches!(
         entry.file_name().to_string_lossy().as_ref(),
-        ".git"
-            | ".hg"
-            | ".svn"
-            | "node_modules"
-            | "target"
-            | "dist"
-            | "build"
-            | ".next"
-            | ".astro"
-            | ".turbo"
-            | ".cache"
+        ".git" | ".hg" | ".svn"
     )
 }
 
@@ -499,6 +489,28 @@ mod tests {
         let changed = fingerprint_inventory(second.path(), None).unwrap();
         assert_ne!(first_fingerprint.all, changed.all);
         assert_eq!(first_fingerprint.manifests, changed.manifests);
+    }
+
+    #[test]
+    fn inventory_tracks_output_named_directories_and_scan_roots() {
+        let checkout = tempfile::tempdir().unwrap();
+        fs::create_dir(checkout.path().join("build")).unwrap();
+        let source = checkout.path().join("build/main.go");
+        fs::write(&source, "package build\n\nconst value = 1\n").unwrap();
+        let before = fingerprint_inventory(checkout.path(), None).unwrap();
+        fs::write(&source, "package build\n\nconst value = 2\n").unwrap();
+        let after = fingerprint_inventory(checkout.path(), None).unwrap();
+        assert_ne!(before.all, after.all);
+
+        let parent = tempfile::tempdir().unwrap();
+        let named_root = parent.path().join("target");
+        fs::create_dir(&named_root).unwrap();
+        let root_source = named_root.join("lib.rs");
+        fs::write(&root_source, "pub const VALUE: u8 = 1;\n").unwrap();
+        let before = fingerprint_inventory(&named_root, None).unwrap();
+        fs::write(&root_source, "pub const VALUE: u8 = 2;\n").unwrap();
+        let after = fingerprint_inventory(&named_root, None).unwrap();
+        assert_ne!(before.all, after.all);
     }
 
     #[test]
