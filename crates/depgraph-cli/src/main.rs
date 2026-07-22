@@ -8,6 +8,7 @@ use depgraph_core::{
     open_store, render_condition, run_scan, rust_build_protocol_ndjson, stage_build_evidence,
     traverse, unresolved, web_build_protocol_ndjson, why,
 };
+use depgraph_store::{CompletedSnapshotDetails, CoverageRecord};
 use serde::Serialize;
 
 #[derive(Debug, Parser)]
@@ -96,12 +97,38 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Name, list, or inspect immutable completed snapshots.
+    Snapshot {
+        #[command(subcommand)]
+        command: SnapshotCommands,
+    },
     /// Export the selected scan in a deterministic format.
     Export {
         #[arg(long, value_enum)]
         format: ExportFormatArg,
         #[arg(short, long)]
         output: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum SnapshotCommands {
+    /// Attach an immutable human-readable name to a completed snapshot.
+    Create {
+        name: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// List named completed snapshots in canonical name order.
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show a completed snapshot by name, stable ID, or `current`.
+    Show {
+        selector: String,
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -128,6 +155,64 @@ struct CommandEnvelope<'a, T: Serialize> {
     data: &'a T,
 }
 
+#[derive(Serialize)]
+struct SnapshotCommandEnvelope<'a, T: Serialize> {
+    schema_version: &'static str,
+    command: &'static str,
+    data: &'a T,
+}
+
+#[derive(Serialize)]
+struct SnapshotView {
+    id: String,
+    names: Vec<String>,
+    status: String,
+    source_kind: String,
+    source_attempt_id: String,
+    scan_id: String,
+    build_attempt_id: Option<String>,
+    parent_snapshot_id: Option<String>,
+    source_revision: Option<String>,
+    profile_ids: Vec<String>,
+    created_at: String,
+    coverage: CoverageRecord,
+}
+
+impl From<CompletedSnapshotDetails> for SnapshotView {
+    fn from(details: CompletedSnapshotDetails) -> Self {
+        let snapshot = details.snapshot;
+        Self {
+            id: snapshot.id,
+            names: details.names,
+            status: snapshot.status,
+            source_kind: snapshot.source_kind,
+            source_attempt_id: snapshot.source_attempt_id,
+            scan_id: snapshot.scan_id,
+            build_attempt_id: snapshot.build_attempt_id,
+            parent_snapshot_id: snapshot.parent_snapshot_id,
+            source_revision: snapshot.source_revision,
+            profile_ids: snapshot.profile_ids,
+            created_at: snapshot.created_at,
+            coverage: details.coverage,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct SnapshotCreatedOutput {
+    name: String,
+    named_at: String,
+    snapshot: SnapshotView,
+}
+
+#[derive(Serialize)]
+struct SnapshotListItem {
+    name: String,
+    named_at: String,
+    #[serde(flatten)]
+    snapshot: SnapshotView,
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     tracing_subscriber::fmt()
@@ -151,8 +236,12 @@ fn error_exit_code(error: &anyhow::Error) -> u8 {
         return 4;
     }
     if (message.contains("scan ") && message.contains(" was not found"))
+        || (message.contains("completed snapshot") && message.contains(" was not found"))
         || [
             "selector",
+            "snapshot name",
+            "no current completed snapshot",
+            "has no completed snapshot",
             ".depgraph.toml",
             "config schema_version",
             "does not exist",
@@ -579,6 +668,78 @@ async fn run(cli: Cli) -> Result<u8> {
             }
             Ok(0)
         }
+        Commands::Snapshot { command } => {
+            let root = std::env::current_dir()?;
+            let store_path = store_path(cli.store, &root)?;
+            let mut store = open_store(&store_path)?;
+            match command {
+                SnapshotCommands::Create { name, json } => {
+                    let snapshot_id = if let Some(scan_id) = cli.scan_id.as_deref() {
+                        store
+                            .snapshot_id_for_scan_selection(scan_id)?
+                            .with_context(|| {
+                                format!("scan attempt {scan_id} has no completed snapshot")
+                            })?
+                    } else {
+                        store
+                            .current_snapshot_id()?
+                            .context("no current completed snapshot is available")?
+                    };
+                    let named = store.create_snapshot_name(&name, &snapshot_id)?;
+                    let output = SnapshotCreatedOutput {
+                        name: named.name,
+                        named_at: named.named_at,
+                        snapshot: store.completed_snapshot_details(&snapshot_id)?.into(),
+                    };
+                    if json {
+                        print_snapshot_json("snapshot.create", &output)?;
+                    } else {
+                        println!("created snapshot name: {}", output.name);
+                        println!("named at: {}", output.named_at);
+                        print_snapshot_view(&output.snapshot);
+                    }
+                }
+                SnapshotCommands::List { json } => {
+                    let mut output = Vec::new();
+                    for named in store.snapshot_names()? {
+                        output.push(SnapshotListItem {
+                            name: named.name,
+                            named_at: named.named_at,
+                            snapshot: store.completed_snapshot_details(&named.snapshot_id)?.into(),
+                        });
+                    }
+                    if json {
+                        print_snapshot_json("snapshot.list", &output)?;
+                    } else if output.is_empty() {
+                        println!("no named snapshots");
+                    } else {
+                        for item in &output {
+                            println!(
+                                "{} {} status={} revision={} profiles={} named_at={}",
+                                item.name,
+                                item.snapshot.id,
+                                item.snapshot.status,
+                                display_revision(item.snapshot.source_revision.as_deref()),
+                                display_list(&item.snapshot.profile_ids),
+                                item.named_at,
+                            );
+                            println!("    {}", coverage_summary(&item.snapshot.coverage));
+                        }
+                    }
+                }
+                SnapshotCommands::Show { selector, json } => {
+                    let snapshot_id = store.resolve_completed_snapshot_selector(&selector)?;
+                    let output: SnapshotView =
+                        store.completed_snapshot_details(&snapshot_id)?.into();
+                    if json {
+                        print_snapshot_json("snapshot.show", &output)?;
+                    } else {
+                        print_snapshot_view(&output);
+                    }
+                }
+            }
+            Ok(0)
+        }
         Commands::Export { format, output } => {
             let (snapshot, _) = load_snapshot(cli.store, cli.scan_id.as_deref(), false)?;
             let format = match format {
@@ -652,6 +813,73 @@ fn print_structured<T: Serialize>(
         );
     }
     Ok(())
+}
+
+fn print_snapshot_json<T: Serialize>(command: &'static str, data: &T) -> Result<()> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&SnapshotCommandEnvelope {
+            schema_version: "1.0",
+            command,
+            data,
+        })?
+    );
+    Ok(())
+}
+
+fn print_snapshot_view(snapshot: &SnapshotView) {
+    println!("snapshot: {}", snapshot.id);
+    println!("names: {}", display_list(&snapshot.names));
+    println!("status: {}", snapshot.status);
+    println!(
+        "source: {} {}",
+        snapshot.source_kind, snapshot.source_attempt_id
+    );
+    println!("scan: {}", snapshot.scan_id);
+    if let Some(build_attempt_id) = &snapshot.build_attempt_id {
+        println!("build attempt: {build_attempt_id}");
+    }
+    println!(
+        "parent: {}",
+        snapshot.parent_snapshot_id.as_deref().unwrap_or("none")
+    );
+    println!(
+        "revision: {}",
+        display_revision(snapshot.source_revision.as_deref())
+    );
+    println!("profiles: {}", display_list(&snapshot.profile_ids));
+    println!("created at: {}", snapshot.created_at);
+    println!("{}", coverage_summary(&snapshot.coverage));
+}
+
+fn display_revision(revision: Option<&str>) -> &str {
+    revision.unwrap_or("unknown")
+}
+
+fn display_list(values: &[String]) -> String {
+    if values.is_empty() {
+        "none".to_owned()
+    } else {
+        values.join(",")
+    }
+}
+
+fn coverage_summary(coverage: &CoverageRecord) -> String {
+    format!(
+        "coverage: {}/{} files analyzed ({} skipped), {} sites ({} resolved, {} candidates, {} external, {} unresolved), {} unsupported; completeness={}; reasons={}; project_code_executed={}",
+        coverage.files_analyzed,
+        coverage.files_discovered,
+        coverage.files_skipped,
+        coverage.dependency_sites,
+        coverage.resolved,
+        coverage.candidates,
+        coverage.external,
+        coverage.unresolved,
+        coverage.unsupported_syntax,
+        display_list(&coverage.completeness),
+        display_list(&coverage.reasons),
+        coverage.project_code_executed,
+    )
 }
 
 fn print_path_steps(steps: &[depgraph_core::query::PathStep]) {
