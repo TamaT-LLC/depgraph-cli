@@ -521,9 +521,10 @@ fn print_path_steps(steps: &[depgraph_core::query::PathStep]) {
     for step in steps {
         let edge = &step.edge;
         println!(
-            "{} --{} [{}; {}; {}]--> {}",
+            "{} --{} [{}; {}; {}; {}]--> {}",
             edge.source,
             edge.kind,
+            edge.phase,
             edge.resolution_status,
             edge.precision,
             edge.profile_id,
@@ -537,8 +538,9 @@ fn print_path_steps(steps: &[depgraph_core::query::PathStep]) {
 fn print_why_steps(steps: &[depgraph_core::query::PathStep]) {
     for step in steps {
         println!(
-            "  --{} [{}; {}; {}]--> {}",
+            "  --{} [{}; {}; {}; {}]--> {}",
             step.edge.kind,
+            step.edge.phase,
             step.edge.resolution_status,
             step.edge.precision,
             step.edge.profile_id,

@@ -1,5 +1,6 @@
 use depgraph_protocol::{
-    MAX_EVENT_LINE_BYTES, PROTOCOL_SCHEMA, ProtocolError, ProtocolEvent, ProtocolValidator,
+    DependencySite, GraphEdge, MAX_EVENT_LINE_BYTES, PROTOCOL_SCHEMA, ProtocolError, ProtocolEvent,
+    ProtocolValidator, build_edge_stable_id, build_site_stable_id, validate_build_ndjson,
     validate_ndjson, validate_safe_ndjson,
 };
 use pretty_assertions::assert_eq;
@@ -737,17 +738,101 @@ fn dependency_sites_and_edges_require_explainable_evidence() {
 
 #[test]
 fn build_and_runtime_edges_may_use_non_source_evidence_without_a_span() {
+    let input = values_to_ndjson(build_values());
+    assert!(schema_accepts_stream(&input));
+    validate_build_ndjson(Cursor::new(input)).expect("build evidence may use an artifact anchor");
+
+    let mut runtime = golden_values();
+    runtime[4]["edge"]["phase"] = json!("runtime");
+    runtime[4]["edge"]["evidence"] = json!([{
+        "kind": "runtime",
+        "extractor": "runtime-import",
+        "extractor_version": "0.1.0",
+        "properties": {}
+    }]);
+    validate_ndjson(Cursor::new(values_to_ndjson(runtime)))
+        .expect("runtime evidence remains protocol-compatible");
+}
+
+#[test]
+fn strict_build_contract_accepts_observed_union_and_rejects_unauthorized_or_malformed_delta() {
+    let events = build_values();
+    let input = values_to_ndjson(events.clone());
+    assert!(schema_accepts_stream(&input));
+    validate_build_ndjson(Cursor::new(&input)).expect("valid build delta");
+
+    let mut unauthorized = events.clone();
+    unauthorized[0]["safe_mode"] = json!(true);
+    assert!(validate_build_ndjson(Cursor::new(values_to_ndjson(unauthorized))).is_err());
+
+    let mut wrong_phase = events.clone();
+    wrong_phase[4]["edge"]["phase"] = json!("semantic");
+    assert!(validate_ndjson(Cursor::new(values_to_ndjson(wrong_phase))).is_err());
+
+    let mut missing_digest = events.clone();
+    missing_digest[5]["site"]["evidence"][0]["properties"]
+        .as_object_mut()
+        .unwrap()
+        .remove("validated_output_digest");
+    let malformed = values_to_ndjson(missing_digest);
+    assert!(!schema_accepts_stream(&malformed));
+    assert!(validate_ndjson(Cursor::new(malformed)).is_err());
+
+    let mut secret = events;
+    secret[4]["edge"]["evidence"][0]["properties"]["api_token"] = json!("forbidden");
+    assert!(validate_ndjson(Cursor::new(values_to_ndjson(secret))).is_err());
+
+    let mut diagnostic_secret = build_values();
+    diagnostic_secret[6]["diagnostic"]["properties"]["session_cookie"] = json!("forbidden");
+    assert!(
+        validate_build_ndjson(Cursor::new(values_to_ndjson(diagnostic_secret))).is_err(),
+        "secret-like keys anywhere in observer output must be rejected"
+    );
+}
+
+fn build_values() -> Vec<Value> {
     let mut events = golden_values();
+    events[0]["safe_mode"] = json!(false);
+    events[0]["project_code_executed"] = json!(true);
     events[4]["edge"]["phase"] = json!("build");
+    events[4]["edge"]["precision"] = json!("observed");
     events[4]["edge"]["evidence"] = json!([{
         "kind": "build",
         "extractor": "build-observer",
         "extractor_version": "0.1.0",
-        "properties": {}
+        "properties": build_provenance()
     }]);
-    let input = values_to_ndjson(events);
-    assert!(schema_accepts_stream(&input));
-    validate_ndjson(Cursor::new(input)).expect("non-source evidence remains protocol-compatible");
+    events[5]["site"]["precision"] = json!("observed");
+    events[5]["site"]["evidence"] = json!([{
+        "kind": "build",
+        "extractor": "build-observer",
+        "extractor_version": "0.1.0",
+        "properties": build_provenance()
+    }]);
+    for index in [8, 9] {
+        events[index]["coverage"]["project_code_executed"] = json!(true);
+        events[index]["coverage"]["completeness"] = json!(["build-observed"]);
+    }
+    let site: DependencySite = serde_json::from_value(events[5]["site"].clone()).unwrap();
+    let site_id = build_site_stable_id(&site).unwrap();
+    events[5]["site"]["id"] = json!(site_id);
+    events[4]["edge"]["site_id"] = events[5]["site"]["id"].clone();
+    let edge: GraphEdge = serde_json::from_value(events[4]["edge"].clone()).unwrap();
+    events[4]["edge"]["id"] = json!(build_edge_stable_id(&edge).unwrap());
+    events
+}
+
+fn build_provenance() -> Value {
+    json!({
+        "build_run_id": "build-run-1",
+        "profile_id": "web:production:server",
+        "command_plan_digest": "a".repeat(64),
+        "toolchain_executable_digest": "b".repeat(64),
+        "environment_key_set_digest": "c".repeat(64),
+        "validated_output_digest": "d".repeat(64),
+        "logical_artifact_path": "dist/manifest.json",
+        "artifact_digest": "e".repeat(64)
+    })
 }
 
 #[test]

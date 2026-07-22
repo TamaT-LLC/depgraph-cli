@@ -850,6 +850,8 @@ mod tests {
         let root = tempfile::tempdir()?;
         let escaped_marker =
             serde_json::to_string(&root.path().join("DESCENDANT_SURVIVED").to_string_lossy())?;
+        let ready_marker = root.path().join("CANCELLATION_READY");
+        let escaped_ready = serde_json::to_string(&ready_marker.to_string_lossy())?;
         let descendant = format!(
             "setTimeout(() => require('node:fs').writeFileSync({escaped_marker}, 'unsafe'), 1500); setInterval(() => {{}}, 1000);"
         );
@@ -857,7 +859,7 @@ mod tests {
         fs::write(
             root.path().join("hang.mjs"),
             format!(
-                "import {{ spawn }} from 'node:child_process'; process.stdout.write('verbose output'); spawn(process.execPath, ['-e', {escaped_descendant}], {{ stdio: 'ignore' }}); setInterval(() => {{}}, 1000);\n"
+                "import {{ spawn }} from 'node:child_process'; import {{ writeFileSync }} from 'node:fs'; process.stdout.write('verbose output'); spawn(process.execPath, ['-e', {escaped_descendant}], {{ stdio: 'ignore' }}); writeFileSync({escaped_ready}, 'ready'); setInterval(() => {{}}, 1000);\n"
             ),
         )?;
         let mut plan = node_plan(vec!["hang.mjs".to_owned()]);
@@ -870,11 +872,20 @@ mod tests {
             timed_out.audit.diagnostic_code.as_deref(),
             Some("build-timeout")
         );
+        fs::remove_file(&ready_marker)?;
 
-        let cancelled = supervise_build_with_cancellation(root.path(), &plan, async {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        })
-        .await?;
+        let mut cancellation_plan = plan.clone();
+        cancellation_plan.timeout_seconds = 30;
+        let cancelled =
+            supervise_build_with_cancellation(root.path(), &cancellation_plan, async move {
+                for _ in 0..3_000 {
+                    if ready_marker.exists() {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await?;
         assert_eq!(cancelled.audit.outcome, BuildOutcomeKind::Cancelled);
         assert!(cancelled.audit.stdout_truncated);
         assert_eq!(

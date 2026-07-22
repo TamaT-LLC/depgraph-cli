@@ -5,11 +5,14 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use chrono::{SecondsFormat, Utc};
+use depgraph_protocol::{
+    Coverage, Diagnostic, Evidence, ProtocolEvent, ValidatedProtocol, validate_build_contract,
+};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ScanRecord {
@@ -23,7 +26,7 @@ pub struct ScanRecord {
     pub error: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct NodeRecord {
     pub id: String,
     pub kind: String,
@@ -32,7 +35,7 @@ pub struct NodeRecord {
     pub properties: Value,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProfileRecord {
     pub id: String,
     pub language: String,
@@ -45,7 +48,7 @@ pub struct ProfileRecord {
     pub coverage: Option<CoverageRecord>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SiteRecord {
     pub id: String,
     pub source: String,
@@ -59,7 +62,7 @@ pub struct SiteRecord {
     pub reason: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct EdgeRecord {
     pub id: String,
     pub site_id: Option<String>,
@@ -75,7 +78,7 @@ pub struct EdgeRecord {
     pub generated: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct CoverageRecord {
     pub profiles: u64,
     pub files_discovered: u64,
@@ -92,7 +95,7 @@ pub struct CoverageRecord {
     pub reasons: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DiagnosticRecord {
     pub ordinal: i64,
     pub id: String,
@@ -108,7 +111,7 @@ pub struct DiagnosticRecord {
     pub properties: Value,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct EvidenceRecord {
     pub owner_type: String,
     pub owner_id: String,
@@ -125,7 +128,7 @@ pub struct EvidenceRecord {
     pub properties: Value,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FileCoverageRecord {
     pub adapter: String,
     pub path: String,
@@ -136,7 +139,7 @@ pub struct FileCoverageRecord {
     pub reason: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AdapterLogRecord {
     pub adapter: String,
     pub stderr: String,
@@ -152,7 +155,36 @@ pub struct BuildAuditRecord {
     pub audit: Value,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BuildAttemptRecord {
+    pub id: String,
+    pub base_scan_id: String,
+    pub audit_run_id: String,
+    pub status: String,
+    pub observer: String,
+    pub observer_version: String,
+    pub profile_id: String,
+    pub command_plan_digest: String,
+    pub toolchain_executable_digest: String,
+    pub environment_key_set_digest: String,
+    pub validated_output_digest: Option<String>,
+    pub started_at: String,
+    pub completed_at: Option<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+struct BuildGraphDelta {
+    profiles: Vec<ProfileRecord>,
+    nodes: Vec<NodeRecord>,
+    sites: Vec<SiteRecord>,
+    edges: Vec<EdgeRecord>,
+    evidence: Vec<EvidenceRecord>,
+    diagnostics: Vec<DiagnosticRecord>,
+    coverage: CoverageRecord,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct GraphSnapshot {
     pub scan: ScanRecord,
     pub profiles: Vec<ProfileRecord>,
@@ -428,6 +460,36 @@ impl Store {
             )?;
             tx.commit()?;
         }
+        if current < 7 {
+            let tx = self.connection.transaction()?;
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS build_attempts (
+                    id TEXT PRIMARY KEY,
+                    base_scan_id TEXT NOT NULL REFERENCES scans(id),
+                    audit_run_id TEXT NOT NULL UNIQUE REFERENCES build_audits(run_id),
+                    status TEXT NOT NULL,
+                    observer TEXT NOT NULL,
+                    observer_version TEXT NOT NULL,
+                    profile_id TEXT NOT NULL,
+                    command_plan_digest TEXT NOT NULL,
+                    toolchain_executable_digest TEXT NOT NULL,
+                    environment_key_set_digest TEXT NOT NULL,
+                    validated_output_digest TEXT,
+                    started_at TEXT NOT NULL,
+                    completed_at TEXT,
+                    error TEXT,
+                    delta_json TEXT
+                 );
+                 CREATE INDEX IF NOT EXISTS build_attempts_base_status
+                    ON build_attempts(base_scan_id, status, started_at, id);
+                 CREATE TABLE IF NOT EXISTS current_build_successful (
+                    base_scan_id TEXT PRIMARY KEY REFERENCES scans(id),
+                    attempt_id TEXT NOT NULL UNIQUE REFERENCES build_attempts(id)
+                 );
+                 PRAGMA user_version = 7;",
+            )?;
+            tx.commit()?;
+        }
         Ok(())
     }
 
@@ -525,6 +587,220 @@ impl Store {
             )
             .optional()
             .context("failed to load latest build audit")
+    }
+
+    /// Starts an immutable build-evidence attempt tied to one completed base
+    /// scan and one supervisor audit. Only completed audits may later stage a
+    /// graph delta; failed audits remain queryable attempt metadata.
+    pub fn start_build_attempt(&mut self, base_scan_id: &str, audit: &Value) -> Result<String> {
+        let run_id = required_str(audit, "run_id")?;
+        let outcome = required_str(audit, "outcome")?;
+        let output_digest = audit
+            .get("validated_output_digest")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty());
+        if outcome == "completed" && output_digest.is_none() {
+            bail!("completed build audit must include validated_output_digest");
+        }
+        for (field, digest) in [
+            (
+                "command_plan_digest",
+                required_str(audit, "command_plan_digest")?,
+            ),
+            (
+                "toolchain_executable_digest",
+                required_str(audit, "toolchain_executable_digest")?,
+            ),
+            (
+                "environment_key_set_digest",
+                required_str(audit, "environment_key_set_digest")?,
+            ),
+        ] {
+            if !is_sha256_hex(digest) {
+                bail!("build audit {field} must be a lowercase SHA-256 digest");
+            }
+        }
+        if let Some(output_digest) = output_digest
+            && !is_sha256_hex(output_digest)
+        {
+            bail!("build audit validated_output_digest must be a lowercase SHA-256 digest");
+        }
+        let stored_audit = self
+            .build_audit(run_id)?
+            .with_context(|| format!("build audit {run_id} must be saved before its attempt"))?;
+        if stored_audit.audit != *audit {
+            bail!("build attempt audit does not match the saved audit");
+        }
+        let base_status = self
+            .scan(base_scan_id)?
+            .with_context(|| format!("base scan {base_scan_id} was not found"))?
+            .status;
+        if base_status != "completed" {
+            bail!("build evidence requires a completed base scan");
+        }
+        let tx = self.connection.transaction()?;
+        tx.execute(
+            "INSERT INTO build_attempts(
+                id, base_scan_id, audit_run_id, status, observer, observer_version,
+                profile_id, command_plan_digest, toolchain_executable_digest,
+                environment_key_set_digest, validated_output_digest, started_at
+             ) VALUES (?1, ?2, ?3, 'staging', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                run_id,
+                base_scan_id,
+                run_id,
+                required_str(audit, "adapter")?,
+                required_str(audit, "adapter_version")?,
+                required_str(audit, "profile_id")?,
+                required_str(audit, "command_plan_digest")?,
+                required_str(audit, "toolchain_executable_digest")?,
+                required_str(audit, "environment_key_set_digest")?,
+                output_digest,
+                required_str(audit, "started_at")?,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(run_id.to_owned())
+    }
+
+    /// Atomically validates and stages a complete build delta. A rejected
+    /// protocol leaves the attempt without any partial graph payload.
+    pub fn save_build_delta(
+        &mut self,
+        attempt_id: &str,
+        protocol: &ValidatedProtocol,
+    ) -> Result<()> {
+        validate_build_contract(protocol).context("invalid build evidence protocol")?;
+        let attempt = self
+            .build_attempt(attempt_id)?
+            .with_context(|| format!("build attempt {attempt_id} was not found"))?;
+        if attempt.status != "staging" {
+            bail!(
+                "build attempt {attempt_id} is immutable after reaching {}",
+                attempt.status
+            );
+        }
+        let delta = build_delta_from_protocol(protocol)?;
+        let audit = self
+            .build_audit(&attempt.audit_run_id)?
+            .context("build attempt audit is missing")?;
+        if audit.outcome != "completed" || attempt.validated_output_digest.is_none() {
+            bail!("only a completed supervisor attempt can stage build evidence");
+        }
+        validate_delta_attempt_metadata(&delta, &attempt)?;
+        let base = self.load_base_snapshot(&attempt.base_scan_id)?;
+        validate_build_union(&base, &delta, &attempt)?;
+        let encoded = serde_json::to_string(&delta)?;
+        let tx = self.connection.transaction()?;
+        ensure_build_staging(&tx, attempt_id)?;
+        tx.execute(
+            "UPDATE build_attempts SET delta_json=?2 WHERE id=?1",
+            params![attempt_id, encoded],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn finish_build_attempt(
+        &mut self,
+        attempt_id: &str,
+        status: &str,
+        error: Option<&str>,
+        promote: bool,
+    ) -> Result<()> {
+        if !matches!(
+            status,
+            "completed" | "partial" | "failed" | "timed_out" | "cancelled" | "security_failed"
+        ) {
+            bail!("invalid terminal build attempt status {status}");
+        }
+        if promote && status != "completed" {
+            bail!("only completed build attempts can be promoted");
+        }
+        let tx = self.connection.transaction()?;
+        ensure_build_staging(&tx, attempt_id)?;
+        let (base_scan_id, has_delta, audit_outcome): (String, bool, String) = tx.query_row(
+            "SELECT a.base_scan_id, a.delta_json IS NOT NULL, b.outcome
+               FROM build_attempts a JOIN build_audits b ON b.run_id=a.audit_run_id
+              WHERE a.id=?1",
+            [attempt_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        if status == "completed" && !has_delta {
+            bail!("completed build attempt {attempt_id} has no validated delta");
+        }
+        if status == "completed" && audit_outcome != "completed" {
+            bail!("completed build attempt requires a completed supervisor audit");
+        }
+        if audit_outcome != "completed" && status != audit_outcome {
+            bail!(
+                "build attempt status {status} does not match supervisor outcome {audit_outcome}"
+            );
+        }
+        tx.execute(
+            "UPDATE build_attempts
+                SET status=?2, completed_at=?3, error=?4,
+                    delta_json=CASE WHEN ?2='completed' THEN delta_json ELSE NULL END
+              WHERE id=?1",
+            params![
+                attempt_id,
+                status,
+                Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+                error,
+            ],
+        )?;
+        if promote {
+            tx.execute(
+                "INSERT INTO current_build_successful(base_scan_id, attempt_id) VALUES (?1, ?2)
+                 ON CONFLICT(base_scan_id) DO UPDATE SET attempt_id=excluded.attempt_id",
+                params![base_scan_id, attempt_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn build_attempt(&self, attempt_id: &str) -> Result<Option<BuildAttemptRecord>> {
+        self.connection
+            .query_row(
+                "SELECT id, base_scan_id, audit_run_id, status, observer, observer_version,
+                        profile_id, command_plan_digest, toolchain_executable_digest,
+                        environment_key_set_digest, validated_output_digest, started_at,
+                        completed_at, error
+                   FROM build_attempts WHERE id=?1",
+                [attempt_id],
+                |row| {
+                    Ok(BuildAttemptRecord {
+                        id: row.get(0)?,
+                        base_scan_id: row.get(1)?,
+                        audit_run_id: row.get(2)?,
+                        status: row.get(3)?,
+                        observer: row.get(4)?,
+                        observer_version: row.get(5)?,
+                        profile_id: row.get(6)?,
+                        command_plan_digest: row.get(7)?,
+                        toolchain_executable_digest: row.get(8)?,
+                        environment_key_set_digest: row.get(9)?,
+                        validated_output_digest: row.get(10)?,
+                        started_at: row.get(11)?,
+                        completed_at: row.get(12)?,
+                        error: row.get(13)?,
+                    })
+                },
+            )
+            .optional()
+            .context("failed to load build attempt")
+    }
+
+    pub fn current_build_attempt_id(&self, base_scan_id: &str) -> Result<Option<String>> {
+        self.connection
+            .query_row(
+                "SELECT attempt_id FROM current_build_successful WHERE base_scan_id=?1",
+                [base_scan_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("failed to load current build attempt")
     }
 
     pub fn start_scan(&mut self, scan_id: &str, root: &Path, strict: bool) -> Result<()> {
@@ -1012,6 +1288,29 @@ impl Store {
     }
 
     pub fn load_snapshot(&self, scan_id: &str) -> Result<GraphSnapshot> {
+        let mut snapshot = self.load_base_snapshot(scan_id)?;
+        let Some(attempt_id) = self.current_build_attempt_id(scan_id)? else {
+            return Ok(snapshot);
+        };
+        let raw = self
+            .connection
+            .query_row(
+                "SELECT delta_json FROM build_attempts
+                  WHERE id=?1 AND base_scan_id=?2 AND status='completed'",
+                params![attempt_id, scan_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten()
+            .with_context(|| {
+                format!("promoted build attempt {attempt_id} has no completed delta")
+            })?;
+        let delta: BuildGraphDelta = serde_json::from_str(&raw)?;
+        merge_build_delta(&mut snapshot, delta, &attempt_id)?;
+        Ok(snapshot)
+    }
+
+    fn load_base_snapshot(&self, scan_id: &str) -> Result<GraphSnapshot> {
         let scan = self
             .scan(scan_id)?
             .with_context(|| format!("scan {scan_id} was not found"))?;
@@ -1095,6 +1394,537 @@ impl Store {
         tx.commit()?;
         Ok(())
     }
+}
+
+fn build_delta_from_protocol(protocol: &ValidatedProtocol) -> Result<BuildGraphDelta> {
+    let profile_coverage = protocol
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            ProtocolEvent::ProfileCompleted(completed) => Some((
+                completed.profile_id.clone(),
+                coverage_record(&completed.coverage),
+            )),
+            _ => None,
+        })
+        .collect::<BTreeMap<_, _>>();
+    let coverage = protocol
+        .events
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            ProtocolEvent::ScanCompleted(completed) => Some(coverage_record(&completed.coverage)),
+            _ => None,
+        })
+        .context("build protocol has no final coverage")?;
+    let profiles = protocol
+        .profiles
+        .values()
+        .map(|profile| ProfileRecord {
+            id: profile.id.clone(),
+            language: profile.language.clone(),
+            toolchain: profile.toolchain.clone(),
+            command: profile.command.clone(),
+            target: profile.target.clone(),
+            features: profile.features.clone(),
+            environment: serde_json::to_value(&profile.environment).unwrap_or_else(|_| json!({})),
+            properties: serde_json::to_value(&profile.properties).unwrap_or_else(|_| json!({})),
+            coverage: profile_coverage.get(&profile.id).cloned(),
+        })
+        .collect();
+    let nodes = protocol
+        .nodes
+        .values()
+        .map(|node| NodeRecord {
+            id: node.id.clone(),
+            kind: node.kind.clone(),
+            locator: node.locator.clone(),
+            display_name: node
+                .display_name
+                .clone()
+                .unwrap_or_else(|| node.locator.clone()),
+            properties: serde_json::to_value(&node.properties).unwrap_or_else(|_| json!({})),
+        })
+        .collect();
+    let sites = protocol
+        .sites
+        .values()
+        .map(|site| SiteRecord {
+            id: site.id.clone(),
+            source: site.source.clone(),
+            kind: site.kind.clone(),
+            specifier: Some(site.specifier.clone()),
+            profile_id: site.profile_id.clone(),
+            resolution_status: enum_json(&site.resolution_status),
+            precision: enum_json(&site.precision),
+            condition: serde_json::to_value(&site.condition).unwrap_or_else(|_| json!({})),
+            target_ids: site.target_ids.clone(),
+            reason: site.reason.clone(),
+        })
+        .collect();
+    let edges = protocol
+        .edges
+        .values()
+        .map(|edge| EdgeRecord {
+            id: edge.id.clone(),
+            site_id: edge.site_id.clone(),
+            source: edge.source.clone(),
+            target: edge.target.clone(),
+            kind: edge.kind.clone(),
+            phase: enum_json(&edge.phase),
+            environment: edge.environment.clone().unwrap_or_else(|| "any".to_owned()),
+            profile_id: edge.profile_id.clone(),
+            resolution_status: enum_json(&edge.resolution_status),
+            precision: enum_json(&edge.precision),
+            condition: serde_json::to_value(&edge.condition).unwrap_or_else(|_| json!({})),
+            generated: edge.generated,
+        })
+        .collect();
+    let mut evidence = Vec::new();
+    for site in protocol.sites.values() {
+        append_evidence_records(&mut evidence, "site", &site.id, &site.evidence)?;
+    }
+    for edge in protocol.edges.values() {
+        append_evidence_records(&mut evidence, "edge", &edge.id, &edge.evidence)?;
+    }
+    let mut diagnostics = Vec::new();
+    for (ordinal, diagnostic) in protocol.diagnostics.values().enumerate() {
+        diagnostics.push(diagnostic_record(ordinal as i64, diagnostic));
+        append_evidence_records(
+            &mut evidence,
+            "diagnostic",
+            &diagnostic.id,
+            &diagnostic.evidence,
+        )?;
+    }
+    Ok(BuildGraphDelta {
+        profiles,
+        nodes,
+        sites,
+        edges,
+        evidence,
+        diagnostics,
+        coverage,
+    })
+}
+
+fn enum_json<T: Serialize>(value: &T) -> String {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|value| value.as_str().map(ToOwned::to_owned))
+        .unwrap_or_default()
+}
+
+fn coverage_record(coverage: &Coverage) -> CoverageRecord {
+    CoverageRecord {
+        profiles: coverage.profiles,
+        files_discovered: coverage.files_discovered,
+        files_analyzed: coverage.files_analyzed,
+        files_skipped: coverage.files_skipped,
+        dependency_sites: coverage.dependency_sites,
+        resolved: coverage.resolved,
+        candidates: coverage.candidates,
+        external: coverage.external,
+        unresolved: coverage.unresolved,
+        unsupported_syntax: coverage.unsupported_syntax,
+        project_code_executed: coverage.project_code_executed,
+        completeness: coverage.completeness.iter().map(enum_json).collect(),
+        reasons: coverage.reasons.clone(),
+    }
+}
+
+fn append_evidence_records(
+    output: &mut Vec<EvidenceRecord>,
+    owner_type: &str,
+    owner_id: &str,
+    evidence: &[Evidence],
+) -> Result<()> {
+    for (ordinal, item) in evidence.iter().enumerate() {
+        output.push(EvidenceRecord {
+            owner_type: owner_type.to_owned(),
+            owner_id: owner_id.to_owned(),
+            ordinal: ordinal as i64,
+            kind: enum_json(&item.kind),
+            extractor: item.extractor.clone(),
+            extractor_version: item.extractor_version.clone(),
+            path: item.path.clone().unwrap_or_default(),
+            start_line: item.start_line.unwrap_or(1).into(),
+            start_column: item.start_column.unwrap_or(1).into(),
+            end_line: item.end_line.unwrap_or(1).into(),
+            end_column: item.end_column.unwrap_or(1).into(),
+            detail: item.detail.clone(),
+            properties: serde_json::to_value(&item.properties)?,
+        });
+    }
+    Ok(())
+}
+
+fn diagnostic_record(ordinal: i64, diagnostic: &Diagnostic) -> DiagnosticRecord {
+    DiagnosticRecord {
+        ordinal,
+        id: diagnostic.id.clone(),
+        severity: enum_json(&diagnostic.severity),
+        code: diagnostic.code.clone(),
+        message: diagnostic.message.clone(),
+        path: diagnostic.path.clone(),
+        adapter: None,
+        start_line: diagnostic.start_line.map(Into::into),
+        start_column: diagnostic.start_column.map(Into::into),
+        end_line: diagnostic.end_line.map(Into::into),
+        end_column: diagnostic.end_column.map(Into::into),
+        properties: serde_json::to_value(&diagnostic.properties).unwrap_or_else(|_| json!({})),
+    }
+}
+
+fn validate_delta_attempt_metadata(
+    delta: &BuildGraphDelta,
+    attempt: &BuildAttemptRecord,
+) -> Result<()> {
+    let output_digest = attempt
+        .validated_output_digest
+        .as_deref()
+        .context("build attempt has no validated output digest")?;
+    for evidence in delta.evidence.iter().filter(|evidence| {
+        matches!(evidence.owner_type.as_str(), "site" | "edge") && evidence.ordinal == 0
+    }) {
+        if evidence.kind != "build"
+            || evidence.extractor != attempt.observer
+            || evidence.extractor_version != attempt.observer_version
+        {
+            bail!("build evidence producer does not match its attempt audit");
+        }
+        for (field, expected) in [
+            ("build_run_id", attempt.id.as_str()),
+            ("profile_id", attempt.profile_id.as_str()),
+            ("command_plan_digest", attempt.command_plan_digest.as_str()),
+            (
+                "toolchain_executable_digest",
+                attempt.toolchain_executable_digest.as_str(),
+            ),
+            (
+                "environment_key_set_digest",
+                attempt.environment_key_set_digest.as_str(),
+            ),
+            ("validated_output_digest", output_digest),
+        ] {
+            if evidence.properties.get(field).and_then(Value::as_str) != Some(expected) {
+                bail!("build evidence {field} does not match its attempt audit");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_build_union(
+    base: &GraphSnapshot,
+    delta: &BuildGraphDelta,
+    attempt: &BuildAttemptRecord,
+) -> Result<()> {
+    if delta.profiles.len() != 1 || delta.profiles[0].id != attempt.profile_id {
+        bail!("build delta must contain exactly its audited profile");
+    }
+    let base_profiles = base
+        .profiles
+        .iter()
+        .map(|profile| (&profile.id, profile))
+        .collect::<BTreeMap<_, _>>();
+    for profile in &delta.profiles {
+        if let Some(existing) = base_profiles.get(&profile.id)
+            && (existing.language != profile.language
+                || existing.toolchain != profile.toolchain
+                || existing.command != profile.command
+                || existing.target != profile.target
+                || existing.features != profile.features
+                || existing.environment != profile.environment)
+        {
+            bail!("build profile {} conflicts with the base graph", profile.id);
+        }
+    }
+
+    let base_nodes = base
+        .nodes
+        .iter()
+        .map(|node| (&node.id, node))
+        .collect::<BTreeMap<_, _>>();
+    for node in &delta.nodes {
+        if let Some(existing) = base_nodes.get(&node.id) {
+            if *existing != node {
+                bail!("build node {} would overwrite the base graph", node.id);
+            }
+        } else {
+            let provenance = node
+                .properties
+                .get("build_provenance")
+                .and_then(Value::as_object)
+                .with_context(|| format!("new build node {} lacks build provenance", node.id))?;
+            if node
+                .properties
+                .get("build_generated")
+                .and_then(Value::as_bool)
+                != Some(true)
+                || provenance.get("build_run_id").and_then(Value::as_str)
+                    != Some(attempt.id.as_str())
+                || provenance.get("profile_id").and_then(Value::as_str)
+                    != Some(attempt.profile_id.as_str())
+                || provenance.get("observer").and_then(Value::as_str)
+                    != Some(attempt.observer.as_str())
+                || provenance.get("observer_version").and_then(Value::as_str)
+                    != Some(attempt.observer_version.as_str())
+                || provenance
+                    .get("command_plan_digest")
+                    .and_then(Value::as_str)
+                    != Some(attempt.command_plan_digest.as_str())
+                || provenance
+                    .get("toolchain_executable_digest")
+                    .and_then(Value::as_str)
+                    != Some(attempt.toolchain_executable_digest.as_str())
+                || provenance
+                    .get("environment_key_set_digest")
+                    .and_then(Value::as_str)
+                    != Some(attempt.environment_key_set_digest.as_str())
+                || provenance
+                    .get("validated_output_digest")
+                    .and_then(Value::as_str)
+                    != attempt.validated_output_digest.as_deref()
+            {
+                bail!("new build node {} has unauthorized provenance", node.id);
+            }
+        }
+    }
+    let node_ids = base
+        .nodes
+        .iter()
+        .chain(delta.nodes.iter())
+        .map(|node| node.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let profile_ids = base
+        .profiles
+        .iter()
+        .chain(delta.profiles.iter())
+        .map(|profile| profile.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let base_site_ids = base
+        .sites
+        .iter()
+        .map(|site| site.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let base_edge_ids = base
+        .edges
+        .iter()
+        .map(|edge| edge.id.as_str())
+        .collect::<BTreeSet<_>>();
+    for site in &delta.sites {
+        if base_site_ids.contains(site.id.as_str()) {
+            bail!(
+                "build site {} would overwrite an existing evidence layer",
+                site.id
+            );
+        }
+        if site.precision != "observed"
+            || !node_ids.contains(site.source.as_str())
+            || site
+                .target_ids
+                .iter()
+                .any(|target| !node_ids.contains(target.as_str()))
+            || !profile_ids.contains(site.profile_id.as_str())
+        {
+            bail!("build site {} is not authorized by the base graph", site.id);
+        }
+    }
+    let delta_site_ids = delta
+        .sites
+        .iter()
+        .map(|site| site.id.as_str())
+        .collect::<BTreeSet<_>>();
+    for edge in &delta.edges {
+        if base_edge_ids.contains(edge.id.as_str()) {
+            bail!(
+                "build edge {} would overwrite an existing evidence layer",
+                edge.id
+            );
+        }
+        if edge.phase != "build"
+            || edge.precision != "observed"
+            || !node_ids.contains(edge.source.as_str())
+            || !node_ids.contains(edge.target.as_str())
+            || !profile_ids.contains(edge.profile_id.as_str())
+            || edge
+                .site_id
+                .as_deref()
+                .is_some_and(|site_id| !delta_site_ids.contains(site_id))
+        {
+            bail!("build edge {} is not authorized by the base graph", edge.id);
+        }
+    }
+    Ok(())
+}
+
+fn merge_build_delta(
+    snapshot: &mut GraphSnapshot,
+    delta: BuildGraphDelta,
+    attempt_id: &str,
+) -> Result<()> {
+    let base_sites = snapshot.sites.clone();
+    let build_evidence = delta.evidence.clone();
+    for profile in delta.profiles {
+        if let Some(existing) = snapshot
+            .profiles
+            .iter_mut()
+            .find(|item| item.id == profile.id)
+        {
+            if let Some(build_coverage) = profile.coverage {
+                let coverage = existing
+                    .coverage
+                    .get_or_insert_with(CoverageRecord::default);
+                union_coverage(coverage, &build_coverage);
+            }
+        } else {
+            snapshot.profiles.push(profile);
+        }
+    }
+    for node in delta.nodes {
+        if !snapshot.nodes.iter().any(|item| item.id == node.id) {
+            snapshot.nodes.push(node);
+        }
+    }
+    snapshot.sites.extend(delta.sites.iter().cloned());
+    snapshot.edges.extend(delta.edges);
+    snapshot.evidence.extend(delta.evidence);
+    snapshot.diagnostics.extend(delta.diagnostics);
+    append_build_conflicts(
+        &mut snapshot.diagnostics,
+        &mut snapshot.evidence,
+        &base_sites,
+        &delta.sites,
+        &build_evidence,
+        attempt_id,
+    );
+    union_coverage(&mut snapshot.coverage, &delta.coverage);
+    snapshot.coverage.profiles = snapshot.profiles.len() as u64;
+    snapshot.scan.project_code_executed = true;
+    snapshot
+        .profiles
+        .sort_by(|left, right| left.id.cmp(&right.id));
+    snapshot.nodes.sort_by(|left, right| left.id.cmp(&right.id));
+    snapshot.sites.sort_by(|left, right| left.id.cmp(&right.id));
+    snapshot.edges.sort_by(|left, right| left.id.cmp(&right.id));
+    snapshot.evidence.sort_by(|left, right| {
+        left.owner_type
+            .cmp(&right.owner_type)
+            .then(left.owner_id.cmp(&right.owner_id))
+            .then(left.ordinal.cmp(&right.ordinal))
+    });
+    snapshot
+        .diagnostics
+        .sort_by(|left, right| left.id.cmp(&right.id));
+    for (ordinal, diagnostic) in snapshot.diagnostics.iter_mut().enumerate() {
+        diagnostic.ordinal = ordinal as i64;
+    }
+    Ok(())
+}
+
+fn union_coverage(target: &mut CoverageRecord, delta: &CoverageRecord) {
+    target.dependency_sites = target
+        .dependency_sites
+        .saturating_add(delta.dependency_sites);
+    target.resolved = target.resolved.saturating_add(delta.resolved);
+    target.candidates = target.candidates.saturating_add(delta.candidates);
+    target.external = target.external.saturating_add(delta.external);
+    target.unresolved = target.unresolved.saturating_add(delta.unresolved);
+    target.unsupported_syntax = target
+        .unsupported_syntax
+        .saturating_add(delta.unsupported_syntax);
+    target.project_code_executed |= delta.project_code_executed;
+    target
+        .completeness
+        .extend(delta.completeness.iter().cloned());
+    target.completeness.sort();
+    target.completeness.dedup();
+    target.reasons.extend(delta.reasons.iter().cloned());
+    target.reasons.sort();
+    target.reasons.dedup();
+}
+
+fn append_build_conflicts(
+    diagnostics: &mut Vec<DiagnosticRecord>,
+    evidence: &mut Vec<EvidenceRecord>,
+    base_sites: &[SiteRecord],
+    build_sites: &[SiteRecord],
+    build_evidence: &[EvidenceRecord],
+    attempt_id: &str,
+) {
+    for build in build_sites {
+        for base in base_sites.iter().filter(|base| {
+            base.source == build.source
+                && base.kind == build.kind
+                && base.specifier == build.specifier
+                && base.profile_id == build.profile_id
+                && base.condition == build.condition
+                && base.target_ids != build.target_ids
+        }) {
+            let id = format!("diagnostic:build-conflict:{}:{}", base.id, build.id);
+            diagnostics.push(DiagnosticRecord {
+                ordinal: 0,
+                id: id.clone(),
+                severity: "warning".to_owned(),
+                code: "BUILD_EVIDENCE_CONFLICT".to_owned(),
+                message: "build observation conflicts with an existing dependency target"
+                    .to_owned(),
+                path: None,
+                adapter: None,
+                start_line: None,
+                start_column: None,
+                end_line: None,
+                end_column: None,
+                properties: json!({
+                    "build_run_id": attempt_id,
+                    "source_site_id": base.id,
+                    "build_site_id": build.id,
+                    "source_targets": base.target_ids,
+                    "build_targets": build.target_ids,
+                    "phases": ["source_or_semantic", "build"]
+                }),
+            });
+            let conflict_evidence = evidence
+                .iter()
+                .filter(|item| item.owner_type == "site" && item.owner_id == base.id)
+                .chain(
+                    build_evidence
+                        .iter()
+                        .filter(|item| item.owner_type == "site" && item.owner_id == build.id),
+                )
+                .cloned()
+                .collect::<Vec<_>>();
+            for (ordinal, mut item) in conflict_evidence.into_iter().enumerate() {
+                item.owner_type = "diagnostic".to_owned();
+                item.owner_id.clone_from(&id);
+                item.ordinal = ordinal as i64;
+                evidence.push(item);
+            }
+        }
+    }
+}
+
+fn ensure_build_staging(tx: &Transaction<'_>, attempt_id: &str) -> Result<()> {
+    let status = tx
+        .query_row(
+            "SELECT status FROM build_attempts WHERE id=?1",
+            [attempt_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .with_context(|| format!("build attempt {attempt_id} was not found"))?;
+    if status != "staging" {
+        bail!("build attempt {attempt_id} is immutable after reaching status {status}");
+    }
+    Ok(())
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn ingest_event_in_transaction(tx: &Transaction<'_>, event: &Value) -> Result<()> {
@@ -1871,6 +2701,11 @@ fn merge_coverage(mut left: Value, right: Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use depgraph_protocol::{
+        DependencySite, GraphEdge, build_edge_stable_id, build_site_stable_id,
+        validate_build_ndjson,
+    };
+    use std::io::Cursor;
 
     const RUST_SEMANTIC_GOLDEN: &str = include_str!(
         "../../depgraph-protocol/tests/fixtures/protocol-v1.rust-semantic.golden.ndjson"
@@ -2396,7 +3231,7 @@ mod tests {
         drop(connection);
 
         let store = Store::open(&path)?;
-        assert_eq!(store.schema_version()?, 6);
+        assert_eq!(store.schema_version()?, 7);
         let site_not_null: i64 = store.connection.query_row(
             "SELECT [notnull] FROM pragma_table_info('edges') WHERE name='site_id'",
             [],
@@ -2433,6 +3268,12 @@ mod tests {
             |row| row.get(0),
         )?;
         assert_eq!(build_audits_table, 1);
+        let build_attempts_table: i64 = store.connection.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='build_attempts'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(build_attempts_table, 1);
         Ok(())
     }
 
@@ -2459,5 +3300,265 @@ mod tests {
         });
         assert!(store.save_build_audit(&unsafe_audit).is_err());
         Ok(())
+    }
+
+    #[test]
+    fn completed_build_delta_unions_layers_without_overwriting_base_and_failed_delta_is_discarded()
+    -> Result<()> {
+        let mut store = Store::open_in_memory()?;
+        ingest_protocol_fixture(
+            &mut store,
+            include_str!("../../depgraph-protocol/tests/fixtures/protocol-v1.golden.ndjson"),
+        )?;
+        let base = store.load_snapshot("scan-golden")?;
+        assert_eq!(base.edges.len(), 1);
+        assert_eq!(base.edges[0].phase, "source");
+
+        let audit = build_attempt_audit("build-run-1");
+        store.save_build_audit(&audit)?;
+        store.start_build_attempt("scan-golden", &audit)?;
+        let protocol = validate_build_ndjson(Cursor::new(build_protocol("build-run-1", false)))?;
+        store.save_build_delta("build-run-1", &protocol)?;
+        store.finish_build_attempt("build-run-1", "completed", None, true)?;
+
+        let union = store.load_snapshot("scan-golden")?;
+        assert_eq!(union.edges.len(), 2);
+        assert_eq!(
+            union
+                .edges
+                .iter()
+                .map(|edge| edge.phase.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["build", "source"])
+        );
+        assert_eq!(union.nodes, base.nodes, "base node identity must be reused");
+        assert!(
+            union
+                .coverage
+                .completeness
+                .contains(&"build-observed".to_owned())
+        );
+        assert!(union.scan.project_code_executed);
+        assert_eq!(
+            store.current_build_attempt_id("scan-golden")?.as_deref(),
+            Some("build-run-1")
+        );
+        assert_eq!(store.load_snapshot("scan-golden")?, union);
+
+        let failed_audit = build_attempt_audit("build-run-2");
+        store.save_build_audit(&failed_audit)?;
+        store.start_build_attempt("scan-golden", &failed_audit)?;
+        let failed_protocol =
+            validate_build_ndjson(Cursor::new(build_protocol("build-run-2", true)))?;
+        store.save_build_delta("build-run-2", &failed_protocol)?;
+        store.finish_build_attempt(
+            "build-run-2",
+            "failed",
+            Some("observer failed after validation"),
+            false,
+        )?;
+        let retained = store.load_snapshot("scan-golden")?;
+        assert_eq!(
+            retained, union,
+            "failed attempt must not replace current union"
+        );
+        let retained_delta: Option<String> = store.connection.query_row(
+            "SELECT delta_json FROM build_attempts WHERE id='build-run-2'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert!(retained_delta.is_none());
+
+        let mut supervisor_failure = build_attempt_audit("build-run-supervisor-failed");
+        supervisor_failure["outcome"] = json!("timed_out");
+        supervisor_failure["validated_output_digest"] = Value::Null;
+        store.save_build_audit(&supervisor_failure)?;
+        store.start_build_attempt("scan-golden", &supervisor_failure)?;
+        store.finish_build_attempt(
+            "build-run-supervisor-failed",
+            "timed_out",
+            Some("build-timeout"),
+            false,
+        )?;
+        assert_eq!(
+            store
+                .build_attempt("build-run-supervisor-failed")?
+                .unwrap()
+                .status,
+            "timed_out"
+        );
+        assert_eq!(
+            store.current_build_attempt_id("scan-golden")?.as_deref(),
+            Some("build-run-1")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn build_target_conflict_keeps_both_layers_and_emits_provenance_diagnostic() -> Result<()> {
+        let mut store = Store::open_in_memory()?;
+        ingest_protocol_fixture(
+            &mut store,
+            include_str!("../../depgraph-protocol/tests/fixtures/protocol-v1.golden.ndjson"),
+        )?;
+        let audit = build_attempt_audit("build-run-conflict");
+        store.save_build_audit(&audit)?;
+        store.start_build_attempt("scan-golden", &audit)?;
+        let protocol =
+            validate_build_ndjson(Cursor::new(build_protocol("build-run-conflict", true)))?;
+        store.save_build_delta("build-run-conflict", &protocol)?;
+        store.finish_build_attempt("build-run-conflict", "completed", None, true)?;
+
+        let snapshot = store.load_snapshot("scan-golden")?;
+        assert_eq!(snapshot.edges.len(), 2);
+        let conflict = snapshot
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "BUILD_EVIDENCE_CONFLICT")
+            .expect("conflict diagnostic");
+        assert_eq!(conflict.properties["build_run_id"], "build-run-conflict");
+        let kinds = snapshot
+            .evidence
+            .iter()
+            .filter(|evidence| {
+                evidence.owner_type == "diagnostic" && evidence.owner_id == conflict.id
+            })
+            .map(|evidence| evidence.kind.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(kinds, BTreeSet::from(["build", "source"]));
+        Ok(())
+    }
+
+    fn ingest_protocol_fixture(store: &mut Store, fixture: &str) -> Result<()> {
+        let first: Value = serde_json::from_str(fixture.lines().next().context("fixture")?)?;
+        let scan_id = required_str(&first, "scan_id")?;
+        store.start_scan(scan_id, Path::new("/fixture"), false)?;
+        let mut events = fixture
+            .lines()
+            .map(serde_json::from_str::<Value>)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        events.sort_by_key(|event| (event["event"] == "edge_upsert") as u8);
+        for event in events {
+            store.ingest_event(&event)?;
+        }
+        store.finish_scan(scan_id, "completed", None, true)?;
+        Ok(())
+    }
+
+    fn build_attempt_audit(run_id: &str) -> Value {
+        json!({
+            "schema_version":"1.0",
+            "run_id":run_id,
+            "adapter":"build-observer",
+            "adapter_version":"0.1.0",
+            "profile_id":"web:production:server",
+            "command_plan_digest":"a".repeat(64),
+            "toolchain_executable_digest":"b".repeat(64),
+            "environment_key_set_digest":"c".repeat(64),
+            "validated_output_digest":"d".repeat(64),
+            "outcome":"completed",
+            "started_at":"2026-07-22T00:00:00.000Z",
+            "finished_at":"2026-07-22T00:00:01.000Z",
+            "environment_keys":["CI","PATH"]
+        })
+    }
+
+    fn build_protocol(run_id: &str, conflicting_target: bool) -> String {
+        let provenance = json!({
+            "build_run_id":run_id,
+            "profile_id":"web:production:server",
+            "command_plan_digest":"a".repeat(64),
+            "toolchain_executable_digest":"b".repeat(64),
+            "environment_key_set_digest":"c".repeat(64),
+            "validated_output_digest":"d".repeat(64),
+            "logical_artifact_path":"dist/manifest.json",
+            "artifact_digest":"e".repeat(64)
+        });
+        let common = |event: &str, seq: u64| {
+            json!({
+                "event":event,"protocol_version":"1.0","scan_id":run_id,
+                "adapter":"build-observer","adapter_version":"0.1.0","seq":seq
+            })
+        };
+        let target = if conflicting_target {
+            "file:sha256:source"
+        } else {
+            "file:sha256:target"
+        };
+        let mut events = Vec::new();
+        let mut started = common("scan_started", 1);
+        started["root"] = json!("/fixture");
+        started["safe_mode"] = json!(false);
+        started["project_code_executed"] = json!(true);
+        events.push(started);
+        let mut profile = common("profile_declared", 2);
+        profile["profile"] = json!({
+            "id":"web:production:server","language":"typescript",
+            "toolchain":"typescript 7.0.2","command":"scan","target":"server",
+            "features":[],"environment":{"mode":"production"},
+            "source_revision":"fixture","properties":{}
+        });
+        events.push(profile);
+        for (seq, id, locator) in [
+            (3, "file:sha256:source", "src/index.ts"),
+            (4, "file:sha256:target", "src/lib.ts"),
+        ] {
+            let mut node = common("node_upsert", seq);
+            node["node"] = json!({
+                "id":id,"kind":"file","locator":locator,"display_name":locator,
+                "properties":{"language":"typescript"}
+            });
+            events.push(node);
+        }
+        let mut edge = common("edge_upsert", 5);
+        edge["edge"] = json!({
+            "id":format!("edge:build:{run_id}"),"source":"file:sha256:source",
+            "target":target,"kind":"imports","site_id":format!("site:build:{run_id}"),
+            "phase":"build","environment":"server","profile_id":"web:production:server",
+            "condition":{"op":"all","conditions":[
+                {"op":"eq","key":"runtime","value":"server"},
+                {"op":"eq","key":"mode","value":"production"}
+            ]},"resolution_status":"resolved","precision":"observed","generated":true,
+            "evidence":[{"kind":"build","extractor":"build-observer",
+                "extractor_version":"0.1.0","properties":provenance.clone()}]
+        });
+        events.push(edge);
+        let mut site = common("dependency_site", 6);
+        site["site"] = json!({
+            "id":format!("site:build:{run_id}"),"source":"file:sha256:source",
+            "kind":"import","specifier":"./lib","resolution_status":"resolved",
+            "target_ids":[target],"profile_id":"web:production:server",
+            "condition":{"op":"all","conditions":[
+                {"op":"eq","key":"mode","value":"production"},
+                {"op":"eq","key":"runtime","value":"server"}
+            ]},"precision":"observed","evidence":[{"kind":"build",
+                "extractor":"build-observer","extractor_version":"0.1.0",
+                "properties":provenance}]
+        });
+        events.push(site);
+        let typed_site: DependencySite = serde_json::from_value(events[5]["site"].clone()).unwrap();
+        let site_id = build_site_stable_id(&typed_site).unwrap();
+        events[5]["site"]["id"] = json!(site_id);
+        events[4]["edge"]["site_id"] = events[5]["site"]["id"].clone();
+        let typed_edge: GraphEdge = serde_json::from_value(events[4]["edge"].clone()).unwrap();
+        events[4]["edge"]["id"] = json!(build_edge_stable_id(&typed_edge).unwrap());
+        let coverage = json!({
+            "profiles":1,"files_discovered":0,"files_analyzed":0,"files_skipped":0,
+            "dependency_sites":1,"resolved":1,"candidates":0,"external":0,
+            "unresolved":0,"unsupported_syntax":0,"project_code_executed":true,
+            "completeness":["build-observed"],"reasons":[]
+        });
+        let mut profile_completed = common("profile_completed", 7);
+        profile_completed["profile_id"] = json!("web:production:server");
+        profile_completed["coverage"] = coverage.clone();
+        events.push(profile_completed);
+        let mut completed = common("scan_completed", 8);
+        completed["coverage"] = coverage;
+        events.push(completed);
+        events
+            .into_iter()
+            .map(|event| serde_json::to_string(&event).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 }

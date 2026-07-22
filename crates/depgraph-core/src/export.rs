@@ -75,8 +75,9 @@ fn export_dot(snapshot: &GraphSnapshot) -> String {
     }
     for edge in &snapshot.edges {
         let label = format!(
-            "{} [{}; {}; {}; {}]",
+            "{} [{}; {}; {}; {}; {}]",
             edge.kind,
+            edge.phase,
             edge.resolution_status,
             edge.precision,
             edge.profile_id,
@@ -117,8 +118,9 @@ fn export_mermaid(snapshot: &GraphSnapshot) -> String {
         ) {
             let _ = writeln!(
                 output,
-                "  n{source} -->|\"{} [{}; {}; {}; {}]\"| n{target}",
+                "  n{source} -->|\"{} [{}; {}; {}; {}; {}]\"| n{target}",
                 mermaid_escape(&edge.kind),
+                mermaid_escape(&edge.phase),
                 mermaid_escape(&edge.resolution_status),
                 mermaid_escape(&edge.precision),
                 mermaid_escape(&edge.profile_id),
@@ -150,7 +152,8 @@ fn mermaid_escape(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use depgraph_store::{CoverageRecord, GraphSnapshot, ScanRecord};
+    use depgraph_store::{CoverageRecord, EdgeRecord, GraphSnapshot, NodeRecord, ScanRecord};
+    use serde_json::json;
 
     #[test]
     fn empty_exports_are_stable() -> Result<()> {
@@ -190,6 +193,50 @@ mod tests {
         assert!(!first.contains("another-scan"));
         assert!(!first.contains("/tmp"));
         assert_eq!(mermaid_escape("a|`<b>"), "a&#124;&#96;&lt;b&gt;");
+
+        let mut layered = snapshot;
+        layered.nodes = ["a", "b"]
+            .into_iter()
+            .map(|id| NodeRecord {
+                id: id.to_owned(),
+                kind: "file".to_owned(),
+                locator: id.to_owned(),
+                display_name: id.to_owned(),
+                properties: json!({}),
+            })
+            .collect();
+        layered.edges = ["build", "source"]
+            .into_iter()
+            .map(|phase| EdgeRecord {
+                id: format!("edge:{phase}"),
+                site_id: Some(format!("site:{phase}")),
+                source: "a".to_owned(),
+                target: "b".to_owned(),
+                kind: "imports".to_owned(),
+                phase: phase.to_owned(),
+                environment: "server".to_owned(),
+                profile_id: "web:server".to_owned(),
+                resolution_status: "resolved".to_owned(),
+                precision: if phase == "build" {
+                    "observed"
+                } else {
+                    "exact"
+                }
+                .to_owned(),
+                condition: json!({"op":"all","conditions":[]}),
+                generated: phase == "build",
+            })
+            .collect();
+        let dot = export(&layered, ExportFormat::Dot)?;
+        let mermaid = export(&layered, ExportFormat::Mermaid)?;
+        assert!(dot.contains("imports [build; resolved; observed; web:server; true]"));
+        assert!(dot.contains("imports [source; resolved; exact; web:server; true]"));
+        assert!(mermaid.contains("imports [build; resolved; observed; web:server; true]"));
+        assert!(mermaid.contains("imports [source; resolved; exact; web:server; true]"));
+        let first = export(&layered, ExportFormat::Json)?;
+        layered.edges.reverse();
+        layered.edges.sort_by(|left, right| left.id.cmp(&right.id));
+        assert_eq!(first, export(&layered, ExportFormat::Json)?);
         Ok(())
     }
 }
