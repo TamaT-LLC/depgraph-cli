@@ -909,8 +909,14 @@
                 "prefixItems": [
                   {
                     "type": "object",
-                    "properties": { "kind": { "const": "build" } },
-                    "required": ["kind"]
+                    "properties": {
+                      "kind": { "const": "build" },
+                      "properties": {
+                        "type": "object",
+                        "required": ["build_run_id"]
+                      }
+                    },
+                    "required": ["kind", "properties"]
                   }
                 ]
               }

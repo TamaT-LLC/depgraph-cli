@@ -809,8 +809,9 @@ fn assert_visual_exports(graph: &Value, ids: &FixtureIds, dot: &str, mermaid: &s
 
 fn visual_edge_label(edge: &Value) -> Result<String> {
     Ok(format!(
-        "{} [{}; {}; {}; {}]",
+        "{} [{}; {}; {}; {}; {}]",
         required_str(edge, "kind", "visual export edge")?,
+        required_str(edge, "phase", "visual export edge")?,
         required_str(edge, "resolution_status", "visual export edge")?,
         required_str(edge, "precision", "visual export edge")?,
         required_str(edge, "profile_id", "visual export edge")?,

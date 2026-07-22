@@ -755,6 +755,29 @@ fn build_and_runtime_edges_may_use_non_source_evidence_without_a_span() {
 }
 
 #[test]
+fn safe_scan_may_use_spanned_build_evidence_for_existing_generated_artifacts() {
+    let mut events = golden_values();
+    let generated_artifact = json!({
+        "kind": "build",
+        "extractor": "generated-artifact-reader",
+        "extractor_version": "0.1.0",
+        "path": "generated/routes.ts",
+        "start_line": 1,
+        "start_column": 1,
+        "end_line": 1,
+        "end_column": 12,
+        "properties": {}
+    });
+    events[4]["edge"]["evidence"] = json!([generated_artifact.clone()]);
+    events[5]["site"]["evidence"] = json!([generated_artifact]);
+    let input = values_to_ndjson(events);
+
+    assert!(schema_accepts_stream(&input));
+    validate_safe_ndjson(Cursor::new(input))
+        .expect("pre-existing generated artifacts are not supervised build observations");
+}
+
+#[test]
 fn strict_build_contract_accepts_observed_union_and_rejects_unauthorized_or_malformed_delta() {
     let events = build_values();
     let input = values_to_ndjson(events.clone());

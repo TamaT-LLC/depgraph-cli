@@ -1391,8 +1391,9 @@ fn assert_expected_visual_exports(
 
 fn visual_edge_label(edge: &Value) -> Result<String> {
     Ok(format!(
-        "{} [{}; {}; {}; {}]",
+        "{} [{}; {}; {}; {}; {}]",
         required_str(edge, "kind", "semantic edge")?,
+        required_str(edge, "phase", "semantic edge")?,
         required_str(edge, "resolution_status", "semantic edge")?,
         required_str(edge, "precision", "semantic edge")?,
         required_str(edge, "profile_id", "semantic edge")?,

@@ -947,7 +947,7 @@ fn validate_site_edge_maps(
             if site
                 .evidence
                 .first()
-                .is_some_and(|evidence| evidence.kind == EvidenceKind::Build)
+                .is_some_and(is_observed_build_evidence)
             {
                 if edge.phase != Phase::Build {
                     return invariant(format!(
@@ -1717,7 +1717,7 @@ fn validate_edge(edge: &GraphEdge) -> Result<(), ProtocolError> {
     } else if edge
         .evidence
         .first()
-        .is_some_and(|evidence| evidence.kind == EvidenceKind::Build)
+        .is_some_and(is_observed_build_evidence)
     {
         return invariant(format!(
             "edge {} with primary build evidence must use phase=build",
@@ -1742,7 +1742,7 @@ fn validate_site(site: &DependencySite) -> Result<(), ProtocolError> {
     let build = site
         .evidence
         .first()
-        .is_some_and(|evidence| evidence.kind == EvidenceKind::Build);
+        .is_some_and(is_observed_build_evidence);
     validate_dependency_evidence("dependency_site", &site.evidence, !build)?;
     if build {
         if site.precision != Precision::Observed {
@@ -1756,11 +1756,7 @@ fn validate_site(site: &DependencySite) -> Result<(), ProtocolError> {
             &site.profile_id,
             &site.evidence,
         )?;
-    } else if site
-        .evidence
-        .iter()
-        .any(|evidence| evidence.kind == EvidenceKind::Build)
-    {
+    } else if site.evidence.iter().any(is_observed_build_evidence) {
         return invariant(format!(
             "dependency site {} must place build evidence first",
             site.id
@@ -2845,6 +2841,13 @@ fn has_complete_span(evidence: &Evidence) -> bool {
         && evidence.start_column.is_some()
         && evidence.end_line.is_some()
         && evidence.end_column.is_some()
+}
+
+/// `kind=build` also represents generated artifacts discovered by a safe scan.
+/// Only evidence carrying supervisor attempt provenance is an opt-in build
+/// observation and therefore subject to the stricter build-union contract.
+fn is_observed_build_evidence(evidence: &Evidence) -> bool {
+    evidence.kind == EvidenceKind::Build && evidence.properties.contains_key("build_run_id")
 }
 
 fn primary_evidence_anchor(evidence: &Evidence) -> (&str, &str, &str, u32, u32, u32, u32) {
