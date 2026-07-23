@@ -1,0 +1,91 @@
+{
+  "schema_version": "1.0",
+  "repository": {
+    "identity": "workspace://repository:test",
+    "revision": "abc123"
+  },
+  "session": {
+    "id": "session-001",
+    "started_at": "2026-07-23T00:00:00Z",
+    "ended_at": "2026-07-23T00:05:00Z",
+    "profile": {
+      "language": "typescript",
+      "target": "server",
+      "features": ["next"],
+      "parent_profile_id": "profile:web"
+    },
+    "environment": {
+      "name": "production",
+      "runtime": "nodejs-24",
+      "region": "test-region-1",
+      "environment_keys": ["NODE_ENV", "SERVICE_NAME"]
+    },
+    "redaction": {
+      "environment_keys": ["API_TOKEN", "DATABASE_URL"],
+      "header_names": ["authorization", "cookie"],
+      "secret_names": ["api_token"],
+      "redacted_value_count": 3
+    }
+  },
+  "events": [
+    {
+      "sequence": 1,
+      "timestamp": "2026-07-23T00:00:01Z",
+      "dependency_kind": "calls",
+      "source": {
+        "kind": "repository_path",
+        "path": "src/server.ts",
+        "node_kind": "file"
+      },
+      "target": {
+        "kind": "graph_locator",
+        "locator": "framework-route:/api/users",
+        "node_kind": "route"
+      },
+      "count": 2,
+      "duration_ns": 1500,
+      "redaction": {
+        "environment_keys": [],
+        "header_names": ["authorization"],
+        "secret_names": [],
+        "redacted_value_count": 1
+      }
+    },
+    {
+      "sequence": 2,
+      "timestamp": "2026-07-23T00:00:02Z",
+      "dependency_kind": "requests",
+      "source": {
+        "kind": "node",
+        "node_id": "route:users"
+      },
+      "target": {
+        "kind": "external",
+        "namespace": "http",
+        "name": "api.example.test"
+      },
+      "count": 1,
+      "redaction": {
+        "environment_keys": [],
+        "header_names": ["cookie"],
+        "secret_names": [],
+        "redacted_value_count": 1
+      }
+    },
+    {
+      "sequence": 3,
+      "timestamp": "2026-07-23T00:00:03Z",
+      "dependency_kind": "calls",
+      "source": {
+        "kind": "node",
+        "node_id": "route:users"
+      },
+      "target": {
+        "kind": "graph_locator",
+        "locator": "typescript-symbol:missing",
+        "node_kind": "symbol"
+      },
+      "count": 1
+    }
+  ]
+}

@@ -14,7 +14,8 @@ use depgraph_core::{
     execute_build_request_with_cancellation, export, impact, init_config, open_store,
     policy_annotations, read_git_changed_set, render_condition, render_github_annotations,
     run_scan_with_cache_mode, rust_build_protocol_ndjson, stage_build_evidence,
-    start_repository_daemon, traverse, unresolved, web_build_protocol_ndjson, why,
+    start_repository_daemon, traverse, unresolved, validate_runtime_trace,
+    web_build_protocol_ndjson, why,
 };
 use depgraph_store::{CompletedSnapshotDetails, CoverageRecord};
 use serde::Serialize;
@@ -141,6 +142,11 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Validate and match an external runtime trace without changing the store.
+    Runtime {
+        #[command(subcommand)]
+        command: RuntimeCommands,
+    },
     /// Name, list, or inspect immutable completed snapshots.
     Snapshot {
         #[command(subcommand)]
@@ -227,6 +233,16 @@ enum SnapshotCommands {
     /// Show a completed snapshot by name, stable ID, or `current`.
     Show {
         selector: String,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum RuntimeCommands {
+    /// Validate a versioned trace and match its locators to the selected snapshot.
+    Validate {
+        trace: PathBuf,
         #[arg(long)]
         json: bool,
     },
@@ -362,6 +378,7 @@ fn error_exit_code(error: &anyhow::Error) -> u8 {
             "scan id must not be empty",
             "no matching scan is available",
             "daemon status",
+            "runtime trace",
         ]
         .iter()
         .any(|needle| message.contains(needle))
@@ -967,6 +984,42 @@ async fn run(cli: Cli) -> Result<u8> {
             }
             Ok(0)
         }
+        Commands::Runtime { command } => match command {
+            RuntimeCommands::Validate { trace, json } => {
+                let metadata = std::fs::symlink_metadata(&trace)
+                    .with_context(|| "runtime trace input was not found".to_owned())?;
+                if !metadata.file_type().is_file() {
+                    anyhow::bail!("runtime trace input must be a regular file");
+                }
+                let input =
+                    std::fs::File::open(&trace).context("failed to open runtime trace input")?;
+                let (snapshot, scan_id) = load_snapshot(cli.store, cli.scan_id.as_deref(), false)?;
+                let result = validate_runtime_trace(input, &snapshot)?;
+                print_structured("runtime.validate", scan_id, &result, json)?;
+                if !json {
+                    println!("runtime trace: valid");
+                    println!("schema: {}", result.schema_version);
+                    println!("session: {}", result.session.id);
+                    println!(
+                        "profile: {}",
+                        result
+                            .profile_match
+                            .parent_profile_id
+                            .as_deref()
+                            .unwrap_or("unresolved")
+                    );
+                    println!(
+                        "events: {} ({} resolved, {} external, {} unresolved)",
+                        result.summary.events,
+                        result.summary.resolved_targets,
+                        result.summary.external_targets,
+                        result.summary.unresolved_targets
+                    );
+                    println!("redacted values: {}", result.summary.redacted_values);
+                }
+                Ok(0)
+            }
+        },
         Commands::Snapshot { command } => {
             let root = std::env::current_dir()?;
             let store_path = store_path(cli.store, &root)?;

@@ -108,6 +108,96 @@ fn seed_safe_rust_scan(
         .unwrap();
 }
 
+fn seed_runtime_trace_snapshot(store_path: &Path, root: &Path) {
+    let mut store = depgraph_store::Store::open(store_path).unwrap();
+    store
+        .start_scan_with_revision("runtime-base", root, false, Some("abc123"))
+        .unwrap();
+    let coverage = json!({
+        "profiles": 1,
+        "files_discovered": 0,
+        "files_analyzed": 0,
+        "files_skipped": 0,
+        "dependency_sites": 0,
+        "resolved": 0,
+        "candidates": 0,
+        "external": 0,
+        "unresolved": 0,
+        "unsupported_syntax": 0,
+        "project_code_executed": false,
+        "completeness": ["syntax-complete"],
+        "reasons": []
+    });
+    let common = |event: &str, seq: u64| {
+        json!({
+            "event": event,
+            "protocol_version": "1.0",
+            "scan_id": "runtime-base",
+            "adapter": "fixture",
+            "adapter_version": "1.0",
+            "seq": seq
+        })
+    };
+    let mut started = common("scan_started", 1);
+    started["root"] = json!(root.to_string_lossy());
+    started["project_code_executed"] = json!(false);
+    started["safe_mode"] = json!(true);
+    store.ingest_event(&started).unwrap();
+
+    let mut profile = common("profile_declared", 2);
+    profile["profile"] = json!({
+        "id": "profile:web",
+        "language": "typescript",
+        "target": "server",
+        "features": ["next"],
+        "environment": {"mode":"production"},
+        "source_revision": "abc123",
+        "properties": {}
+    });
+    store.ingest_event(&profile).unwrap();
+
+    for (offset, node) in [
+        json!({
+            "id":"workspace:web",
+            "kind":"workspace",
+            "locator":"workspace://repository:test",
+            "display_name":"fixture",
+            "properties":{"repository_identity":"repository:test"}
+        }),
+        json!({
+            "id":"file:server",
+            "kind":"file",
+            "locator":"file://src/server.ts",
+            "display_name":"server.ts",
+            "properties":{"path":"src/server.ts"}
+        }),
+        json!({
+            "id":"route:users",
+            "kind":"route",
+            "locator":"framework-route:/api/users",
+            "display_name":"/api/users",
+            "properties":{}
+        }),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut event = common("node_upsert", offset as u64 + 3);
+        event["node"] = node;
+        store.ingest_event(&event).unwrap();
+    }
+    let mut profile_completed = common("profile_completed", 6);
+    profile_completed["profile_id"] = json!("profile:web");
+    profile_completed["coverage"] = coverage.clone();
+    store.ingest_event(&profile_completed).unwrap();
+    let mut completed = common("scan_completed", 7);
+    completed["coverage"] = coverage;
+    store.ingest_event(&completed).unwrap();
+    store
+        .finish_scan("runtime-base", "completed", None, true)
+        .unwrap();
+}
+
 fn seed_cli_diff_snapshot(
     store_path: &std::path::Path,
     root: &std::path::Path,
@@ -565,6 +655,114 @@ fn init_writes_only_the_versioned_config() {
     let config = fs::read_to_string(root.path().join(".depgraph.toml")).unwrap();
     assert!(config.contains("schema_version = 1"));
     assert!(!root.path().join(".depgraph").exists());
+}
+
+#[test]
+fn runtime_validate_matches_golden_trace_without_mutating_the_store() {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let store_path = cache.path().join("graph.db");
+    seed_runtime_trace_snapshot(&store_path, root.path());
+    let trace = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../depgraph-core/tests/fixtures/runtime-trace-v1.golden.json");
+
+    let run = || {
+        Command::cargo_bin("depgraph")
+            .unwrap()
+            .args([
+                "--store",
+                store_path.to_str().unwrap(),
+                "runtime",
+                "validate",
+                trace.to_str().unwrap(),
+                "--json",
+            ])
+            .output()
+            .unwrap()
+    };
+    let first = run();
+    let second = run();
+    assert!(first.status.success(), "{:?}", first.stderr);
+    assert_eq!(first.stdout, second.stdout);
+    let output: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert_eq!(output["schema_version"], "1.0");
+    assert_eq!(output["command"], "runtime.validate");
+    assert_eq!(output["scan_id"], "runtime-base");
+    assert_eq!(output["data"]["profile_match"]["status"], "resolved");
+    assert_eq!(
+        output["data"]["profile_match"]["parent_profile_id"],
+        "profile:web"
+    );
+    assert_eq!(output["data"]["summary"]["events"], 3);
+    assert_eq!(output["data"]["summary"]["resolved_targets"], 1);
+    assert_eq!(output["data"]["summary"]["external_targets"], 1);
+    assert_eq!(output["data"]["summary"]["unresolved_targets"], 1);
+    assert_eq!(
+        output["data"]["events"][0]["source"]["node_id"],
+        "file:server"
+    );
+    assert_eq!(
+        output["data"]["events"][0]["target"]["node_id"],
+        "route:users"
+    );
+    assert!(
+        output["data"]["events"][0]["id"]
+            .as_str()
+            .unwrap()
+            .starts_with("runtime-event:sha256:")
+    );
+    assert!(
+        !String::from_utf8(first.stdout)
+            .unwrap()
+            .contains(root.path().to_str().unwrap())
+    );
+
+    let store = depgraph_store::Store::open(&store_path).unwrap();
+    assert_eq!(
+        store.latest_successful_id().unwrap().as_deref(),
+        Some("runtime-base")
+    );
+}
+
+#[test]
+fn runtime_validate_rejects_malformed_and_secret_input_with_bounded_errors() {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let store_path = cache.path().join("graph.db");
+    seed_runtime_trace_snapshot(&store_path, root.path());
+    let fixture = |name: &str| {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../depgraph-core/tests/fixtures")
+            .join(name)
+    };
+
+    Command::cargo_bin("depgraph")
+        .unwrap()
+        .args([
+            "--store",
+            store_path.to_str().unwrap(),
+            "runtime",
+            "validate",
+            fixture("runtime-trace-v1.malformed.json").to_str().unwrap(),
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("repository-relative path"))
+        .stderr(predicate::str::contains("../outside.ts").not());
+
+    Command::cargo_bin("depgraph")
+        .unwrap()
+        .args([
+            "--store",
+            store_path.to_str().unwrap(),
+            "runtime",
+            "validate",
+            fixture("runtime-trace-v1.secret.json").to_str().unwrap(),
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("secret"))
+        .stderr(predicate::str::contains("fixture-secret-value").not());
 }
 
 #[test]
