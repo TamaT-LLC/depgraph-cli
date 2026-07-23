@@ -278,7 +278,7 @@ fn evaluate_cycles(
 ) -> Result<Vec<PolicyViolation>> {
     let level = cycle_level(rule.source.kind)
         .with_context(|| format!("cycle rule {:?} uses an unsupported selector kind", rule.id))?;
-    let cycle_nodes: BTreeSet<_> = source_ids.intersection(target_ids).copied().collect();
+    let cycle_nodes: BTreeSet<_> = source_ids.union(target_ids).copied().collect();
     let mut by_profile: BTreeMap<&str, Vec<&AdmittedEdge<'_>>> = BTreeMap::new();
     for item in admitted {
         if cycle_nodes.contains(item.edge.source.as_str())
@@ -297,7 +297,16 @@ fn evaluate_cycles(
         filtered.edges = edges.iter().map(|item| item.edge.clone()).collect();
         for cycle in cycles(&filtered, level) {
             let ring = &cycle.node_ids[..cycle.node_ids.len() - 1];
-            let Some(start) = ring.iter().min() else {
+            if !ring.iter().any(|node| source_ids.contains(node.as_str()))
+                || !ring.iter().any(|node| target_ids.contains(node.as_str()))
+            {
+                continue;
+            }
+            let Some(start) = ring
+                .iter()
+                .filter(|node| source_ids.contains(node.as_str()))
+                .min()
+            else {
                 continue;
             };
             let start_index = ring
@@ -577,9 +586,7 @@ fn make_violation(
         .collect();
     canonicalize_evidence(&mut evidence);
     let condition = combined_condition(&path_edges)?;
-    let context = path_edges
-        .first()
-        .map_or_else(BTreeMap::new, |item| item.context.clone());
+    let context = combined_context(&path_edges);
     let suppression = applied_suppression(
         suppressions,
         &rule.id,
@@ -644,6 +651,26 @@ fn applied_suppression(
             id: resolved.suppression.id.clone(),
             reason: resolved.suppression.reason.clone(),
         })
+}
+
+fn combined_context(edges: &[&AdmittedEdge<'_>]) -> BTreeMap<String, Value> {
+    let mut combined: BTreeMap<String, Option<Value>> = BTreeMap::new();
+    for edge in edges {
+        for (key, value) in &edge.context {
+            combined
+                .entry(key.clone())
+                .and_modify(|current| {
+                    if current.as_ref().is_some_and(|existing| existing != value) {
+                        *current = None;
+                    }
+                })
+                .or_insert_with(|| Some(value.clone()));
+        }
+    }
+    combined
+        .into_iter()
+        .filter_map(|(key, value)| value.map(|value| (key, value)))
+        .collect()
 }
 
 fn resolve_selector<'a>(
@@ -1488,6 +1515,41 @@ mod tests {
     }
 
     #[test]
+    fn asymmetric_cycle_selectors_evaluate_their_union_subgraph() -> Result<()> {
+        let graph = snapshot(vec![
+            edge("e2", "b", "a", "profile:production"),
+            edge("e1", "a", "b", "profile:production"),
+        ]);
+        let mut cycle_rule = rule(PolicyRuleKind::Cycle);
+        cycle_rule.condition = PolicyCondition::default();
+        cycle_rule.source = PolicySelector {
+            match_kind: PolicyMatchKind::Exact,
+            value: "src/ui/a.ts".to_owned(),
+            cardinality: PolicySelectorCardinality::One,
+            ..selector("unused")
+        };
+        cycle_rule.target = PolicySelector {
+            match_kind: PolicyMatchKind::Exact,
+            value: "src/data/b.ts".to_owned(),
+            cardinality: PolicySelectorCardinality::One,
+            ..selector("unused")
+        };
+
+        let result = evaluate_policy("snapshot:fixture", &graph, &config(cycle_rule))?;
+
+        assert_eq!(result.violations.len(), 1);
+        assert_eq!(
+            result.violations[0]
+                .dependency_path
+                .iter()
+                .map(|step| step.edge_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["e1", "e2"]
+        );
+        Ok(())
+    }
+
+    #[test]
     fn candidate_heuristic_edges_are_included_only_when_declared() -> Result<()> {
         let mut candidate = edge("candidate", "a", "b", "profile:production");
         candidate.precision = "heuristic".to_owned();
@@ -1545,6 +1607,60 @@ mod tests {
             PolicySelectorKind::Package
         );
         assert_eq!(result.violations[0].target.locator, "pkg:data");
+        Ok(())
+    }
+
+    #[test]
+    fn multi_hop_suppression_can_match_later_path_context() -> Result<()> {
+        let mut later = edge("e2", "b", "c", "profile:production");
+        later.condition = json!({
+            "op":"all",
+            "conditions":[
+                {"op":"eq","key":"mode","value":"production"},
+                {"op":"eq","key":"boundary","value":"legacy"}
+            ]
+        });
+        let graph = snapshot(vec![edge("e1", "a", "b", "profile:production"), later]);
+        let mut depth = rule(PolicyRuleKind::DependencyDepth);
+        depth.source = PolicySelector {
+            match_kind: PolicyMatchKind::Exact,
+            value: "src/ui/a.ts".to_owned(),
+            cardinality: PolicySelectorCardinality::One,
+            ..selector("unused")
+        };
+        depth.target = PolicySelector {
+            match_kind: PolicyMatchKind::Exact,
+            value: "src/data/c.ts".to_owned(),
+            cardinality: PolicySelectorCardinality::One,
+            ..selector("unused")
+        };
+        depth.threshold = Some(PolicyThreshold { max: 1 });
+        let mut policy = config(depth);
+        policy.suppressions.push(PolicySuppression {
+            id: "legacy-path".to_owned(),
+            rule_id: "fixture-rule".to_owned(),
+            reason: "later hop is an approved legacy boundary".to_owned(),
+            scope: PolicySuppressionScope {
+                condition: Some(PolicyCondition::Eq {
+                    key: "boundary".to_owned(),
+                    value: json!("legacy"),
+                }),
+                ..PolicySuppressionScope::default()
+            },
+        });
+
+        let result = evaluate_policy("snapshot:fixture", &graph, &policy)?;
+
+        assert_eq!(result.violations.len(), 1);
+        assert_eq!(result.summary.suppressed, 1);
+        assert_eq!(
+            result.violations[0]
+                .suppression
+                .as_ref()
+                .map(|suppression| suppression.id.as_str()),
+            Some("legacy-path")
+        );
+        assert_eq!(result.exit_code, 0);
         Ok(())
     }
 
