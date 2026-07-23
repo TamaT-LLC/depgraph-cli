@@ -11,10 +11,11 @@ use depgraph_core::{
     BuildOutcomeKind, Config, CycleLevel, DaemonStatus, ExportFormat, ImpactFilters, ImpactResult,
     PolicyAnnotation, PolicyResult, ScanCacheMode, acquire_store_writer_lock, build_cache_key,
     create_build_execution_request, default_store_path, doctor, evaluate_policy_diff,
-    execute_build_request_with_cancellation, export, impact, init_config, open_store,
-    policy_annotations, read_git_changed_set, render_condition, render_github_annotations,
-    run_scan_with_cache_mode, rust_build_protocol_ndjson, stage_build_evidence,
-    start_repository_daemon, traverse, unresolved, web_build_protocol_ndjson, why,
+    execute_build_request_with_cancellation, export, impact, init_config, match_runtime_trace,
+    open_store, open_store_read_only, policy_annotations, read_git_changed_set, read_runtime_trace,
+    render_condition, render_github_annotations, run_scan_with_cache_mode,
+    rust_build_protocol_ndjson, stage_build_evidence, start_repository_daemon, traverse,
+    unresolved, web_build_protocol_ndjson, why,
 };
 use depgraph_store::{CompletedSnapshotDetails, CoverageRecord};
 use serde::Serialize;
@@ -141,6 +142,11 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Validate and match an external runtime trace without changing the store.
+    Runtime {
+        #[command(subcommand)]
+        command: RuntimeCommands,
+    },
     /// Name, list, or inspect immutable completed snapshots.
     Snapshot {
         #[command(subcommand)]
@@ -227,6 +233,16 @@ enum SnapshotCommands {
     /// Show a completed snapshot by name, stable ID, or `current`.
     Show {
         selector: String,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum RuntimeCommands {
+    /// Validate a versioned trace and match its locators to the selected snapshot.
+    Validate {
+        trace: PathBuf,
         #[arg(long)]
         json: bool,
     },
@@ -362,6 +378,7 @@ fn error_exit_code(error: &anyhow::Error) -> u8 {
             "scan id must not be empty",
             "no matching scan is available",
             "daemon status",
+            "runtime trace",
         ]
         .iter()
         .any(|needle| message.contains(needle))
@@ -967,6 +984,43 @@ async fn run(cli: Cli) -> Result<u8> {
             }
             Ok(0)
         }
+        Commands::Runtime { command } => match command {
+            RuntimeCommands::Validate { trace, json } => {
+                let metadata = inspect_runtime_trace_input(&trace)?;
+                if !metadata.file_type().is_file() {
+                    anyhow::bail!("runtime trace input must be a regular file");
+                }
+                let input =
+                    std::fs::File::open(&trace).context("failed to open runtime trace input")?;
+                let trace = read_runtime_trace(input)?;
+                let (snapshot, scan_id) =
+                    load_snapshot_read_only(cli.store, cli.scan_id.as_deref(), false)?;
+                let result = match_runtime_trace(trace, &snapshot)?;
+                print_structured("runtime.validate", scan_id, &result, json)?;
+                if !json {
+                    println!("runtime trace: valid");
+                    println!("schema: {}", result.schema_version);
+                    println!("session: {}", result.session.id);
+                    println!(
+                        "profile: {}",
+                        result
+                            .profile_match
+                            .parent_profile_id
+                            .as_deref()
+                            .unwrap_or("unresolved")
+                    );
+                    println!(
+                        "events: {} ({} resolved, {} external, {} unresolved)",
+                        result.summary.events,
+                        result.summary.resolved_targets,
+                        result.summary.external_targets,
+                        result.summary.unresolved_targets
+                    );
+                    println!("redacted values: {}", result.summary.redacted_values);
+                }
+                Ok(0)
+            }
+        },
         Commands::Snapshot { command } => {
             let root = std::env::current_dir()?;
             let store_path = store_path(cli.store, &root)?;
@@ -1411,6 +1465,34 @@ fn load_snapshot(
     Ok((snapshot, scan_id))
 }
 
+fn load_snapshot_read_only(
+    explicit_store: Option<PathBuf>,
+    requested_scan_id: Option<&str>,
+    latest_attempt: bool,
+) -> Result<(depgraph_core::GraphSnapshot, String)> {
+    let root = std::env::current_dir()?;
+    let store_path = store_path(explicit_store, &root)?;
+    let store = open_store_read_only(&store_path)?;
+    let scan_id = store.resolve_scan_id(requested_scan_id, latest_attempt)?;
+    let snapshot = store.load_snapshot(&scan_id)?;
+    Ok((snapshot, scan_id))
+}
+
+fn inspect_runtime_trace_input(path: &Path) -> Result<std::fs::Metadata> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(metadata),
+        Err(error) => Err(runtime_trace_metadata_error(error)),
+    }
+}
+
+fn runtime_trace_metadata_error(error: std::io::Error) -> anyhow::Error {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        anyhow::Error::new(error).context("runtime trace input was not found")
+    } else {
+        anyhow::Error::new(error).context("failed to inspect runtime trace input")
+    }
+}
+
 fn print_structured<T: Serialize>(
     command: &'static str,
     scan_id: String,
@@ -1649,7 +1731,10 @@ fn print_evidence(evidence: &[depgraph_store::EvidenceRecord], indent: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{error_exit_code, require_build_consent};
+    use super::{
+        error_exit_code, inspect_runtime_trace_input, require_build_consent,
+        runtime_trace_metadata_error,
+    };
 
     #[test]
     fn classifies_cli_errors_without_hiding_internal_failures_as_usage() {
@@ -1695,5 +1780,20 @@ mod tests {
         assert_eq!(error_exit_code(&error), 4);
         assert!(format!("{error:#}").contains("--allow-project-code"));
         require_build_consent(true).expect("the explicit CLI flag grants consent");
+    }
+
+    #[test]
+    fn runtime_trace_metadata_distinguishes_missing_input() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("missing.json");
+        let error = inspect_runtime_trace_input(&missing).unwrap_err();
+        assert!(error.to_string().contains("was not found"));
+
+        let denied = runtime_trace_metadata_error(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "fixture denial",
+        ));
+        assert!(denied.to_string().contains("failed to inspect"));
+        assert!(!denied.to_string().contains("was not found"));
     }
 }

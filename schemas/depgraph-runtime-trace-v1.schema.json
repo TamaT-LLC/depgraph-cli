@@ -1,0 +1,225 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tamat.dev/depgraph/schemas/depgraph-runtime-trace-v1.schema.json",
+  "title": "depgraph runtime trace import v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "repository", "session", "events"],
+  "properties": {
+    "schema_version": { "const": "1.0" },
+    "repository": { "$ref": "#/$defs/repository" },
+    "session": { "$ref": "#/$defs/session" },
+    "events": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 100000,
+      "items": { "$ref": "#/$defs/event" }
+    }
+  },
+  "$defs": {
+    "boundedString": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096,
+      "pattern": "^[^\\u0000-\\u001F\\u007F]+$"
+    },
+    "idString": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "pattern": "^[^\\u0000-\\u001F\\u007F]+$"
+    },
+    "identifier": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "pattern": "^[A-Za-z0-9_.:/-]+$"
+    },
+    "uint64": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 18446744073709551615
+    },
+    "nameList": {
+      "type": "array",
+      "maxItems": 256,
+      "items": { "$ref": "#/$defs/idString" }
+    },
+    "repository": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["identity"],
+      "properties": {
+        "identity": { "$ref": "#/$defs/idString" },
+        "revision": { "$ref": "#/$defs/idString" }
+      }
+    },
+    "profile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["language"],
+      "properties": {
+        "language": { "$ref": "#/$defs/identifier" },
+        "target": { "$ref": "#/$defs/idString" },
+        "features": {
+          "type": "array",
+          "maxItems": 256,
+          "items": { "$ref": "#/$defs/idString" }
+        },
+        "parent_profile_id": { "$ref": "#/$defs/idString" }
+      }
+    },
+    "environment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name"],
+      "properties": {
+        "name": { "$ref": "#/$defs/idString" },
+        "runtime": { "$ref": "#/$defs/idString" },
+        "region": { "$ref": "#/$defs/idString" },
+        "environment_keys": { "$ref": "#/$defs/nameList" }
+      }
+    },
+    "redaction": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "environment_keys": { "$ref": "#/$defs/nameList" },
+        "header_names": { "$ref": "#/$defs/nameList" },
+        "secret_names": { "$ref": "#/$defs/nameList" },
+        "redacted_value_count": {
+          "$ref": "#/$defs/uint64"
+        }
+      }
+    },
+    "session": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "started_at", "profile", "environment"],
+      "properties": {
+        "id": { "$ref": "#/$defs/idString" },
+        "started_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "ended_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "profile": { "$ref": "#/$defs/profile" },
+        "environment": { "$ref": "#/$defs/environment" },
+        "redaction": { "$ref": "#/$defs/redaction" }
+      }
+    },
+    "locator": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "node_id"],
+          "properties": {
+            "kind": { "const": "node" },
+            "node_id": { "$ref": "#/$defs/idString" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "locator"],
+          "properties": {
+            "kind": { "const": "graph_locator" },
+            "locator": {
+              "allOf": [
+                { "$ref": "#/$defs/boundedString" },
+                { "not": { "pattern": "\\s" } },
+                { "not": { "pattern": "\\\\" } },
+                {
+                  "anyOf": [
+                    { "not": { "pattern": "^[Ff][Ii][Ll][Ee]:" } },
+                    { "pattern": "^file:" }
+                  ]
+                },
+                {
+                  "not": {
+                    "pattern": "(^file://(?:$|[Ll][Oo][Cc][Aa][Ll][Hh][Oo][Ss][Tt](?:/|$)|/|\\\\|.*:|\\.{1,2}(/|$)|.*//|.*/\\.{1,2}(/|$)|.*/$))|(^file:(?!//)(?:$|/|\\\\|.*:|\\.{1,2}(/|$)|.*//|.*/\\.{1,2}(/|$)|.*/$))"
+                  }
+                }
+              ]
+            },
+            "node_kind": { "$ref": "#/$defs/identifier" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "path"],
+          "properties": {
+            "kind": { "const": "repository_path" },
+            "path": {
+              "allOf": [
+                { "$ref": "#/$defs/boundedString" },
+                { "not": { "pattern": "(^/|\\\\|:|(^|/)(\\.|\\.\\.)(/|$)|//|/$)" } }
+              ]
+            },
+            "node_kind": { "$ref": "#/$defs/identifier" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "namespace", "name"],
+          "properties": {
+            "kind": { "const": "external" },
+            "namespace": { "$ref": "#/$defs/identifier" },
+            "name": { "$ref": "#/$defs/boundedString" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "reason"],
+          "properties": {
+            "kind": { "const": "unresolved" },
+            "reason": { "$ref": "#/$defs/identifier" }
+          }
+        }
+      ]
+    },
+    "event": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sequence",
+        "timestamp",
+        "dependency_kind",
+        "source",
+        "target"
+      ],
+      "properties": {
+        "sequence": {
+          "allOf": [
+            { "$ref": "#/$defs/uint64" },
+            { "minimum": 1 }
+          ]
+        },
+        "timestamp": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "dependency_kind": { "$ref": "#/$defs/identifier" },
+        "source": { "$ref": "#/$defs/locator" },
+        "target": { "$ref": "#/$defs/locator" },
+        "count": {
+          "allOf": [
+            { "$ref": "#/$defs/uint64" },
+            { "minimum": 1 }
+          ]
+        },
+        "duration_ns": {
+          "$ref": "#/$defs/uint64"
+        },
+        "redaction": { "$ref": "#/$defs/redaction" }
+      }
+    }
+  }
+}

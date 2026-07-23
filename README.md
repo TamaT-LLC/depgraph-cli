@@ -34,12 +34,12 @@ bundled isolated compiler, a ready/emitted v2 graph, zero skipped, unsupported,
 unresolved, semantic-issue, and compiler diagnostic counts, and
 `project_code_executed=false`. Candidate and external Web sites are allowed.
 Detected Next.js, Astro, TanStack Router, and TanStack Start profiles must also
-complete their versioned framework semantic capability ledger. Code-based
-routes beyond the safe static boundary, runtime traces, and architecture
-policies remain later milestones. The supervised
-build protocol, atomic evidence union foundation, validated syntax/semantic/build
-cache storage, transactional incremental invalidation planner, and cross-platform
-watcher daemon are available.
+complete their versioned framework semantic capability ledger. Architecture
+policy evaluation and collector-independent runtime trace validation are
+available; persistent runtime evidence union remains a later milestone. The
+supervised build protocol, atomic evidence union foundation, validated
+syntax/semantic/build cache storage, transactional incremental invalidation
+planner, and cross-platform watcher daemon are available.
 
 ## Build
 
@@ -95,6 +95,10 @@ depgraph cycles --level symbol
 depgraph deps "id:$STABLE_ID" --json
 
 depgraph unresolved --json
+
+# Validate and match an external runtime trace without changing the store.
+depgraph runtime validate runtime-trace.json
+depgraph runtime validate runtime-trace.json --json
 
 # Name and inspect immutable completed snapshots.
 depgraph snapshot create baseline
@@ -205,6 +209,35 @@ suppressed-only results return `0`.
 
 The matching JSON Schema is
 [`schemas/depgraph-policy-v1.schema.json`](schemas/depgraph-policy-v1.schema.json).
+
+## Runtime trace import contract
+
+`depgraph runtime validate TRACE` reads the versioned `1.0` JSON contract,
+matches it against the selected completed snapshot, and produces deterministic
+`runtime-event:sha256:...` identities. Validation is read-only: Issue #84 adds
+atomic persistence and runtime-phase query union.
+
+The document identifies a repository, session, profile, environment, and an
+ordered event stream. Each source and target uses one explicit locator form:
+stable node ID, exact graph locator, canonical repository-relative path,
+external identity, or an unresolved reason. Repository identity must match a
+workspace node ID, locator, or `repository_identity` property in the selected
+snapshot. Revision is checked when both sides provide it. Node ID and locator
+matches must be unique; missing or ambiguous locators remain `unresolved`, and
+collector-declared external targets remain `external`. Validation never
+invents a repository node.
+
+Input is bounded to 16 MiB, 100,000 events, 4,096-character strings, and 32 JSON
+levels. UTF-8, exact version, strict fields, RFC 3339 session bounds, increasing
+sequence numbers, and portable paths are required. Absolute paths, `..`, file
+URI hosts, drive-like `:` segments, backslashes, unknown properties,
+secret-bearing fields, and common raw credential forms fail closed with bounded
+errors. Environment variables, headers, and secrets are represented only by
+sorted/deduplicated names and redaction counts; their values are not part of the
+contract or output.
+
+The matching JSON Schema is
+[`schemas/depgraph-runtime-trace-v1.schema.json`](schemas/depgraph-runtime-trace-v1.schema.json).
 
 Store schema v10 separates profile-independent `syntax`, profile-dependent `semantic`, and observed `build` cache entries. Keys use contract v1 canonical digests of repository-relative file bytes, manifest/lock/config inputs, adapter/protocol artifacts, toolchain/framework identities, profiles, and generated artifact fingerprints; checkout, cache, and temporary absolute paths are not key dimensions. A semantic hit is reused only after key, contract, completed-snapshot, and canonical payload integrity checks, then copied into a fresh scan attempt and validated before promotion. Unknown versions, corruption, symlinks, unsafe inventory bounds, and dependency snapshots that cannot be re-derived before scanning are explicit misses/rejections. `scan --no-cache` bypasses lookup and storage. Scan JSON/text and `doctor` expose cache hit/miss/reject reasons without adding cache bookkeeping to the canonical graph.
 

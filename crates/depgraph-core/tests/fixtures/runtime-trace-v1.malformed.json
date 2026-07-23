@@ -1,0 +1,31 @@
+{
+  "schema_version": "1.0",
+  "repository": {
+    "identity": "workspace://repository:test"
+  },
+  "session": {
+    "id": "session-malformed",
+    "started_at": "2026-07-23T00:00:00Z",
+    "profile": {
+      "language": "typescript"
+    },
+    "environment": {
+      "name": "test"
+    }
+  },
+  "events": [
+    {
+      "sequence": 1,
+      "timestamp": "2026-07-23T00:00:01Z",
+      "dependency_kind": "calls",
+      "source": {
+        "kind": "repository_path",
+        "path": "../outside.ts"
+      },
+      "target": {
+        "kind": "unresolved",
+        "reason": "dynamic_dispatch"
+      }
+    }
+  ]
+}

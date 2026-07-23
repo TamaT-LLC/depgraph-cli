@@ -10,6 +10,7 @@ pub mod incremental;
 pub mod policy;
 mod policy_engine;
 pub mod query;
+pub mod runtime_trace;
 pub mod rust_build_observer;
 pub mod scan;
 pub mod worker;
@@ -70,6 +71,14 @@ pub use policy_engine::{evaluate_policy, evaluate_policy_diff};
 pub use query::{
     CycleLevel, CycleResult, TraversalResult, UnresolvedResult, WhyResult, cycles,
     render_condition, resolve_selector, traverse, unresolved, why,
+};
+pub use runtime_trace::{
+    MatchedRuntimeTraceLocator, RUNTIME_TRACE_MAX_BYTES, RUNTIME_TRACE_MAX_EVENTS,
+    RUNTIME_TRACE_SCHEMA, RUNTIME_TRACE_SCHEMA_VERSION, RuntimeTrace, RuntimeTraceEnvironment,
+    RuntimeTraceEvent, RuntimeTraceLocator, RuntimeTraceMatchStatus, RuntimeTraceProfile,
+    RuntimeTraceProfileMatch, RuntimeTraceRedaction, RuntimeTraceRepository, RuntimeTraceSession,
+    RuntimeTraceSummary, ValidatedRuntimeTrace, ValidatedRuntimeTraceEvent, match_runtime_trace,
+    read_runtime_trace, validate_runtime_trace,
 };
 pub use rust_build_observer::{
     RUST_BUILD_CAPABILITY, RUST_BUILD_OBSERVATION_SCHEMA, RUST_BUILD_OBSERVER,
@@ -595,6 +604,10 @@ async fn toolchain_versions(root: &Path) -> BTreeMap<String, String> {
 
 pub fn open_store(path: &Path) -> Result<Store> {
     Store::open(path)
+}
+
+pub fn open_store_read_only(path: &Path) -> Result<Store> {
+    Store::open_read_only(path)
 }
 
 #[cfg(test)]

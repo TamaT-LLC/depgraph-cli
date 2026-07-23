@@ -9,3 +9,10 @@ contract after conversion to JSON. The Rust validator and the JSON Schema share 
 golden fixture in `crates/depgraph-core/tests/fixtures/policy-v1.golden.json`.
 Suppressions must be bounded by source, target, profile, or a non-vacuous condition;
 statically always-true condition-only suppressions are rejected by both validators.
+
+`depgraph-runtime-trace-v1.schema.json` describes the collector-independent
+runtime trace import contract. The contract stores environment, header, and
+secret names plus redaction counts, never their values. Repository paths are
+portable relative paths; absolute/root-escaping paths, unknown fields,
+unsupported versions, and unbounded documents fail closed before matching or
+store access.

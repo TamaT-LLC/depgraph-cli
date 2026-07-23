@@ -9,7 +9,7 @@ use depgraph_protocol::{
     Coverage, Diagnostic, Evidence, ProtocolEvent, ValidatedProtocol, stable_id_from_value,
     validate_build_contract,
 };
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -296,6 +296,27 @@ impl Store {
             .with_context(|| format!("failed to open SQLite store {}", path.as_ref().display()))?;
         let mut store = Self { connection };
         store.migrate()?;
+        Ok(store)
+    }
+
+    pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
+        let connection = Connection::open_with_flags(
+            path.as_ref(),
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .with_context(|| {
+            format!(
+                "failed to open SQLite store read-only {}",
+                path.as_ref().display()
+            )
+        })?;
+        let store = Self { connection };
+        let current = store.schema_version()?;
+        if current != SCHEMA_VERSION {
+            bail!(
+                "store schema {current} does not match supported read-only schema {SCHEMA_VERSION}"
+            );
+        }
         Ok(store)
     }
 
@@ -3710,6 +3731,15 @@ mod tests {
             "adapter_version": "0.1.0",
             "seq": seq
         })
+    }
+
+    #[test]
+    fn read_only_open_never_creates_a_missing_store() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("missing.db");
+        let error = Store::open_read_only(&path).err().expect("missing store");
+        assert!(error.to_string().contains("read-only"));
+        assert!(!path.exists());
     }
 
     #[test]
