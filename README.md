@@ -57,6 +57,21 @@ To run every formatting, lint, contract, worker, and fixture test:
 cargo xtask test
 ```
 
+To run the reproducible performance gate with the pinned toolchains:
+
+```sh
+scripts/benchmark-mvp.sh
+```
+
+The benchmark generates a deterministic 10,000-source-file fixture and writes
+`dist/benchmark-report.json`. It records cold safe initial scans, watcher-driven
+one-file incremental scans, cold and warm file/package impact queries, platform
+and toolchain metadata, every raw sample, and the configured regression/noise
+policy. The gate also proves that the changed file was observed while graph
+topology, dependency sites, evidence, and coverage were conserved. CI and tag
+release workflows upload the same versioned report as an artifact; release
+publication verifies it before publishing.
+
 ## Usage
 
 ```sh

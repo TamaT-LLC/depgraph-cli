@@ -1284,13 +1284,56 @@ Go semantic scanではGOOS/GOARCH、build tags、強制されたcgo無効状態�
 
 ### 19.2 性能目標
 
-目標値は benchmark fixture を作成後に確定する。暫定目標は次のとおり。
+Issue #86の`depgraph-benchmark-fixture-v1`は、1 package内にcanonical pathと
+import chainを持つ10,000 TypeScript source fileを決定的に生成する。同じ
+generatorは任意の一意revision commentで中央の1 fileだけを変更し、fixture
+manifestへsource count、期待dependency site数、変更path、boundedな
+1-dependent impact query path、全入力byteの
+SHA-256を記録する。benchmarkはfresh SQLite storeのsafe initial scan、
+completed base snapshotとwarm analysis cacheを持つwatcher daemon経由の
+1-file incremental scan、別storeに対する最初のcold file/package impact、
+priming後のwarm file/package impactを個別に計測する。
+
+開発機のproduct targetは次のとおり。
 
 - 10,000 source files の safe initial scan: 開発機で 30 秒以内
 - 1 file 変更の incremental semantic scan: build を除き 2 秒以内
 - query latency: warm cache の file / package impact で 500 ms 以内
 
-上記は開発機での暫定product targetであり、共有GitHub hosted Linux runnerのrelease gateは、runner contentionとprocess起動を含むraw timingを記録したうえで、10,000 files initial scanを60秒、warm queryを1.5秒のceilingとする。`v0.2.0-rc.1`の初回tag runでは同じcommitが開発機で23.127秒/481ms、hosted runnerで50.008秒/1.124秒となったためであり、機能fixture・件数・semantic completeness条件は緩和しない。Milestone 4のperformance taskで固定runner、複数sample、initial/incremental/query別のbaselineへ更新する。
+2026-07-24の10,000-file local baselineはinitial median 29.774秒、
+watcher incremental median 31.983秒、warm file/package impact median
+1.185秒/1.105秒であった。incremental executorは現在workerの
+repository-complete protocolを安全にfull atomic replacementするため、2秒の
+product targetには未達である。この差を隠さずreportの`product_target_ms`へ
+残し、現実装の明確な回帰を検出するlocal ceilingをinitial 30秒、
+incremental 40秒、warm impact 1.5秒とする。
+
+共有GitHub hosted Linux runnerのCI/release ceilingは、runner contentionと
+process起動を含め、initial 80秒、incremental 105秒、warm query 4.0秒とする。
+2026-07-24のPR実測は1回目がinitial median 68.530秒、incremental median
+83.891秒、warm file/package impact median 2.979秒/2.748秒、2回目が
+initial median 71.751秒、incremental median 96.210秒、warm file/package
+impact median 3.603秒/3.179秒であった。2回分のrunner分散をhosted baseline
+として記録し、2回目のmedianから約9〜11%の余裕を持つceilingを設定する。
+initial / incrementalは3 sample、warm queryは5 sampleを採り、medianがceiling
+以内、ceiling超過sampleは最大1件、全sampleはceiling + 20%以内というnoise
+allowanceを同時に満たした場合だけpassする。cold queryは継続取得するが、
+product targetがwarm cacheであるためgateには使わない。report
+`depgraph-benchmark-report-v1`はraw sample、median / max、cache条件、
+platform / architecture / GitHub runner、depgraph / Rust / Cargo / Go / Node /
+pnpm version、commit、threshold、allowance、判定を保持する。
+
+incremental前後ではprofile、node identity/property（意図した変更fileの
+`content_hash`だけを除く）、dependency site、edge、evidence、file/profile/
+aggregate coverage、profile matrixのcanonical digest一致を要求し、変更fileの
+content hashが実際に変化したことも要求する。macOS FSEventsが既存fileへの
+in-place writeを`Create`と分類する場合があるため、daemonの単一change kindは
+`added`または`modified`を許容するが、同一pathのpre-existing nodeと変更前後の
+content hashによって実体が1-file editであることを検証する。従来のRust HIR semantic-complete
+とcross-adapter build evidence gateも同じreportで維持する。pull request CIと
+tag releaseは同じ10,000-file reportをartifact化し、release asset検証jobが
+schema、commit、全必須metric、conservation、総合passを再検証してから公開へ
+進む。fixture件数やdependency site / coverageを性能のために緩和しない。
 
 性能のために dependency site を省略してはならない。
 
@@ -1403,6 +1446,8 @@ Go semantic scanではGOOS/GOARCH、build tags、強制されたcgo無効状態�
 - public API / runtime boundary policy・CI annotations: Issue #82で実装済み（2026-07-23）
 - runtime trace v1 format / redaction / bounded validation / snapshot matching: Issue #83で実装済み（2026-07-23）
 - runtime trace schema v11 store union / query / export: Issue #84で実装済み（2026-07-24）
+- deterministic GraphML exporter: Issue #85で実装済み（2026-07-24）
+- initial / incremental / impact benchmarkとCI/release gate: Issue #86で実装済み（2026-07-24）
 
 ## 22. MVP 受け入れ基準
 
@@ -1445,6 +1490,7 @@ Go semantic scanではGOOS/GOARCH、build tags、強制されたcgo無効状態�
 
 ## 26. 更新履歴
 
+- 2026-07-24: Issue #86として決定的な10,000 source-file fixtureと`depgraph-benchmark-report-v1`を実装。fresh-store initial、watcher daemon経由の1-file incremental、cold/warm file/package impactを複数sampleで分離し、platform / runner / toolchain / cache条件とraw timingを記録する。median ceiling、1 bounded outlier、20% hard noise allowanceで明確な回帰だけをfailさせる。変更fileのcontent hash更新を要求しつつ、それ以外のgraph topology、dependency site、edge、evidence、coverage digest保存を検証する。PR CIとreleaseで同じreportをartifact化し、release asset検証前にschema / commit / metric / conservationを再検証する。
 - 2026-07-24: Issue #85として決定的なGraphML 1.0 exporterを実装。node / edgeのstable ID、kind、phase、profile、condition、precision、resolutionをtyped keyへ、完全なprofile / dependency site / evidenceと所有参照をcanonical JSONへ保持し、GraphML単体で再構成可能にした。XML-safeなgenerated element ID、XML 1.0特殊文字escape、Unicode保持、invalid control fail-closed、stable sort、record/text単位のbounded streaming writer、成功後だけdestinationを置換するatomic file outputを追加し、golden、round-trip、入力順非依存決定性、大容量chunk、runtime filter、CLI stdout / file E2Eで固定した。既存JSON / DOT / Mermaid出力は変更していない。
 - 2026-07-24: Issue #84としてruntime evidenceのschema v11 store unionを実装。validated traceをruntime child profile、observed site/edge、per-session evidence、runtime-only sentinel、partial/conflict/unmatched diagnosticへ変換し、session/graph/import/completed snapshot/current pointerを単一transactionでpromotionする。同一session再importのidempotence、複数sessionのgraph dedupとcount/time range集約、static/semantic/build非上書き、失敗promotion全rollbackを固定した。deps/dependents/why/impact/exportへphase/profile/session/environment filter、diffのruntime phase比較、snapshot metadataのruntime source/sessionを追加し、JSON/DOT/Mermaidとsession-filtered evidenceを決定的に出力する。v1/v7/v8→v11 migration、promotion failure、multi-session、malformed input、query/export/diff repeatabilityをstore/core/CLI testで検証した。
 - 2026-07-23: Issue #82としてpublic API change / runtime boundary policyとCI annotationを実装。`depgraph policy <FROM> <TO>`がcompleted snapshot差分のpublic `symbol / type / route`をadded / removed / changedへ分類し、breakingなremoved / changedをbaselineのcanonical impact path、change ID、profile / condition、宣言source evidenceへ関連付ける。scan側の`runtime_boundary`はroute / componentから明示的な`client_boundary / server_boundary`への同一profile pathだけを評価し、framework conditionとedge runtimeを保持する。JSON reportとGitHub Actions warning/error annotationは同じcanonical resultから生成し、repository-relative path / 1-origin spanだけを出力する。warning / error / suppressionのexit挙動、schema parity、runtime unit、snapshot diff integration、secret / absolute path非漏洩を含むCLI E2Eを追加した。

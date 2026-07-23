@@ -365,9 +365,22 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "cargo xtask verify-release-assets artifacts",
         "docs/releases/${GITHUB_REF_NAME}.md",
         "artifacts/release-verification.json",
+        "benchmark-report-${{ github.sha }}",
+        "node scripts/benchmark-report.mjs verify benchmark/benchmark-report.json",
     ] {
         if !release_workflow.contains(required) {
             bail!("release workflow is missing {required:?}");
+        }
+    }
+    let ci_workflow = fs::read_to_string(root.join(".github/workflows/ci.yml"))?;
+    for required in [
+        "needs: [rust, go, web]",
+        "node --test scripts/tests/benchmark.test.mjs",
+        "scripts/benchmark-mvp.sh",
+        "benchmark-report-${{ github.sha }}",
+    ] {
+        if !ci_workflow.contains(required) {
+            bail!("CI workflow is missing {required:?}");
         }
     }
     Ok(())
@@ -403,6 +416,7 @@ fn test() -> Result<()> {
         "warnings",
     ]))?;
     run(Command::new("cargo").args(["test", "--workspace", "--locked"]))?;
+    run(Command::new("node").args(["--test", "scripts/tests/benchmark.test.mjs"]))?;
     let gofmt = Command::new("gofmt")
         .arg("-l")
         .arg(".")
