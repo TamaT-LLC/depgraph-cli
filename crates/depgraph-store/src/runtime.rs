@@ -1190,4 +1190,56 @@ mod tests {
         assert_eq!(runtime_snapshots, 0);
         Ok(())
     }
+
+    #[test]
+    fn later_build_promotion_preserves_imported_runtime_sessions() -> Result<()> {
+        let (mut store, base_snapshot_id, base) = seeded_store()?;
+        let imported = store
+            .import_runtime_session(&base_snapshot_id, valid_delta(&base_snapshot_id, &base))?;
+        let audit = json!({
+            "schema_version":"1.0",
+            "run_id":"build-after-runtime",
+            "adapter":"build-observer",
+            "adapter_version":"0.1.0",
+            "profile_id":"profile:build",
+            "command_plan_digest":"a".repeat(64),
+            "toolchain_executable_digest":"b".repeat(64),
+            "environment_key_set_digest":"c".repeat(64),
+            "validated_output_digest":"d".repeat(64),
+            "outcome":"completed",
+            "started_at":"2026-07-23T00:00:04.000Z",
+            "finished_at":"2026-07-23T00:00:05.000Z",
+            "environment_keys":["CI","PATH"]
+        });
+        store.save_build_audit(&audit)?;
+        store.start_build_attempt("runtime-atomic", &audit)?;
+        store.connection.execute(
+            "UPDATE build_attempts SET delta_json=?2 WHERE id=?1",
+            params![
+                "build-after-runtime",
+                serde_json::to_string(&super::super::BuildGraphDelta::default())?
+            ],
+        )?;
+
+        store.finish_build_attempt("build-after-runtime", "completed", None, true)?;
+
+        let current_id = store.current_snapshot_id()?.context("build snapshot")?;
+        let metadata = store
+            .completed_snapshot(&current_id)?
+            .context("build snapshot metadata")?;
+        assert_eq!(metadata.source_kind, "build");
+        assert_eq!(
+            metadata.build_attempt_id.as_deref(),
+            Some("build-after-runtime")
+        );
+        assert_eq!(metadata.runtime_session_ids, [imported.session_id]);
+        assert_eq!(
+            metadata.parent_snapshot_id.as_deref(),
+            Some(imported.snapshot_id.as_str())
+        );
+        let snapshot = store.load_completed_snapshot(&current_id)?;
+        assert!(snapshot.edges.iter().any(|edge| edge.id == "edge:runtime"));
+        assert!(store.verify_snapshot_integrity(&current_id)?.valid);
+        Ok(())
+    }
 }

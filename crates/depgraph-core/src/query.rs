@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use anyhow::{Context, Result, bail};
 use depgraph_protocol::Condition;
 use depgraph_store::{
-    EdgeRecord, EvidenceRecord, GraphSnapshot, NodeRecord, PhaseCoverageRecord,
+    DiagnosticRecord, EdgeRecord, EvidenceRecord, GraphSnapshot, NodeRecord, PhaseCoverageRecord,
     ProfileCorrelationRecord, ProfileMatrixRecord, SiteRecord,
     phase_coverage_for_effective_profile, runtime_context_for_edge,
 };
@@ -156,6 +156,41 @@ impl GraphQueryFilter {
                     })
                 });
         session_matches && environment_matches
+    }
+
+    pub fn matches_diagnostic(&self, diagnostic: &DiagnosticRecord) -> bool {
+        let string_property_matches = |key: &str, values: &[String]| {
+            values.is_empty()
+                || diagnostic
+                    .properties
+                    .get(key)
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|value| values.iter().any(|item| item == value))
+        };
+        let phase_matches = string_property_matches("phase", &self.phases);
+        let profile_matches = string_property_matches("profile_id", &self.profiles);
+        let session_matches = self.sessions.is_empty()
+            || ["session_id", "source_session_id"].iter().any(|key| {
+                diagnostic
+                    .properties
+                    .get(key)
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|value| self.sessions.iter().any(|item| item == value))
+            });
+        let environment_matches = self.environments.is_empty()
+            || diagnostic
+                .properties
+                .get("environment")
+                .and_then(serde_json::Value::as_object)
+                .is_some_and(|environment| {
+                    ["name", "runtime", "region"].iter().any(|key| {
+                        environment
+                            .get(*key)
+                            .and_then(serde_json::Value::as_str)
+                            .is_some_and(|value| self.environments.iter().any(|item| item == value))
+                    })
+                });
+        phase_matches && profile_matches && session_matches && environment_matches
     }
 }
 
@@ -977,6 +1012,55 @@ mod tests {
         assert_eq!(dependents.steps.len(), 1);
         assert_eq!(dependents.steps[0].edge.id, "e0");
         assert_eq!(dependents.steps[0].evidence.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn diagnostic_filters_match_source_session_phase_profile_and_environment() -> Result<()> {
+        let diagnostic = DiagnosticRecord {
+            ordinal: 0,
+            id: "diagnostic:runtime".to_owned(),
+            severity: "warning".to_owned(),
+            code: "RUNTIME_TARGET_UNMATCHED".to_owned(),
+            message: "unmatched".to_owned(),
+            path: None,
+            adapter: Some("runtime-trace".to_owned()),
+            start_line: None,
+            start_column: None,
+            end_line: None,
+            end_column: None,
+            properties: json!({
+                "session_id":"runtime-session:stable",
+                "source_session_id":"collector-session",
+                "phase":"runtime",
+                "profile_id":"profile:runtime",
+                "environment":{
+                    "name":"production",
+                    "runtime":"nodejs-24",
+                    "region":"test-region-1"
+                }
+            }),
+        };
+        let matching = GraphQueryFilter::new(
+            vec!["runtime".to_owned()],
+            vec!["profile:runtime".to_owned()],
+            vec!["collector-session".to_owned()],
+            vec!["nodejs-24".to_owned()],
+        )?;
+        assert!(matching.matches_diagnostic(&diagnostic));
+        assert!(
+            !GraphQueryFilter::new(vec!["build".to_owned()], Vec::new(), Vec::new(), Vec::new())?
+                .matches_diagnostic(&diagnostic)
+        );
+        assert!(
+            !GraphQueryFilter::new(
+                Vec::new(),
+                Vec::new(),
+                vec!["another-session".to_owned()],
+                Vec::new()
+            )?
+            .matches_diagnostic(&diagnostic)
+        );
         Ok(())
     }
 

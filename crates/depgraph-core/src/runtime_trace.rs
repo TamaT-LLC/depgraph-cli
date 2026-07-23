@@ -381,19 +381,25 @@ pub fn runtime_session_delta(
     let mut grouped = BTreeMap::<RuntimeEdgeKey, RuntimeObservation>::new();
     let mut resolution_sets = BTreeMap::<(String, String), BTreeSet<String>>::new();
     let mut diagnostics = Vec::new();
+    let diagnostic_context = RuntimeDiagnosticContext {
+        session_id: &session_id,
+        source_session_id: &validated.session.id,
+        profile_id: &runtime_profile_id,
+        environment: &validated.session.environment,
+    };
     for event in &validated.events {
         let source = runtime_node_id(&event.source, &mut nodes)?;
         let target = runtime_node_id(&event.target, &mut nodes)?;
         append_locator_diagnostic(
             &mut diagnostics,
-            &session_id,
+            &diagnostic_context,
             event,
             "source",
             &event.source,
         );
         append_locator_diagnostic(
             &mut diagnostics,
-            &session_id,
+            &diagnostic_context,
             event,
             "target",
             &event.target,
@@ -423,6 +429,9 @@ pub fn runtime_session_delta(
                 json!({
                     "session_id":session_id,
                     "source_session_id":validated.session.id,
+                    "phase":"runtime",
+                    "profile_id":runtime_profile_id,
+                    "environment":validated.session.environment,
                     "source":source,
                     "dependency_kind":dependency_kind,
                     "resolution_statuses":statuses,
@@ -446,6 +455,9 @@ pub fn runtime_session_delta(
             json!({
                 "session_id":session_id,
                 "source_session_id":validated.session.id,
+                "phase":"runtime",
+                "profile_id":runtime_profile_id,
+                "environment":validated.session.environment,
                 "reason":validated.profile_match.reason,
             }),
         ));
@@ -757,9 +769,16 @@ fn locator_label(locator: &RuntimeTraceLocator) -> String {
     }
 }
 
+struct RuntimeDiagnosticContext<'a> {
+    session_id: &'a str,
+    source_session_id: &'a str,
+    profile_id: &'a str,
+    environment: &'a RuntimeTraceEnvironment,
+}
+
 fn append_locator_diagnostic(
     diagnostics: &mut Vec<DiagnosticRecord>,
-    session_id: &str,
+    context: &RuntimeDiagnosticContext<'_>,
     event: &ValidatedRuntimeTraceEvent,
     role: &str,
     locator: &MatchedRuntimeTraceLocator,
@@ -773,7 +792,7 @@ fn append_locator_diagnostic(
         "RUNTIME_SOURCE_UNMATCHED"
     };
     diagnostics.push(runtime_diagnostic(
-        session_id,
+        context.session_id,
         code,
         format!(
             "runtime {role} was retained as a {} sentinel: {}",
@@ -789,7 +808,11 @@ fn append_locator_diagnostic(
         ),
         Some(event.id.as_str()),
         json!({
-            "session_id":session_id,
+            "session_id":context.session_id,
+            "source_session_id":context.source_session_id,
+            "phase":"runtime",
+            "profile_id":context.profile_id,
+            "environment":context.environment,
             "event_id":event.id,
             "sequence":event.sequence,
             "role":role,
@@ -1485,6 +1508,30 @@ mod tests {
         let serialized = serde_json::to_string(&first)?;
         assert!(!serialized.contains("fixture-secret-value"));
         assert!(!serialized.contains("/fixture"));
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_diagnostics_keep_all_query_dimensions() -> Result<()> {
+        let snapshot = snapshot();
+        let validated = validate_runtime_trace(Cursor::new(GOLDEN), &snapshot)?;
+        let delta = runtime_session_delta(validated, "snapshot:base", &snapshot)?;
+        assert!(!delta.diagnostics.is_empty());
+        for diagnostic in &delta.diagnostics {
+            assert_eq!(
+                diagnostic.properties["source_session_id"],
+                json!("session-001")
+            );
+            assert_eq!(diagnostic.properties["phase"], json!("runtime"));
+            assert_eq!(
+                diagnostic.properties["profile_id"],
+                json!(delta.session.profile_id)
+            );
+            assert_eq!(
+                diagnostic.properties["environment"]["name"],
+                json!("production")
+            );
+        }
         Ok(())
     }
 

@@ -93,14 +93,9 @@ pub fn filter_snapshot(snapshot: &GraphSnapshot, filter: &GraphQueryFilter) -> G
             || (evidence.owner_type == "site" && site_ids.contains(evidence.owner_id.as_str())))
             && filter.matches_evidence(evidence)
     });
-    filtered.diagnostics.retain(|diagnostic| {
-        filter.sessions.is_empty()
-            || diagnostic
-                .properties
-                .get("session_id")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|id| filter.sessions.iter().any(|item| item == id))
-    });
+    filtered
+        .diagnostics
+        .retain(|diagnostic| filter.matches_diagnostic(diagnostic));
     filtered.coverage.profiles = filtered.profiles.len() as u64;
     filtered.coverage.dependency_sites = filtered.sites.len() as u64;
     filtered.coverage.resolved = filtered

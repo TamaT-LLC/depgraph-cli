@@ -632,8 +632,7 @@ impl Store {
                             AND runtime_session_set_json = '[]')
                         OR (source_kind = 'build'
                             AND build_attempt_id IS NOT NULL
-                            AND runtime_import_id IS NULL
-                            AND runtime_session_set_json = '[]')
+                            AND runtime_import_id IS NULL)
                         OR (source_kind = 'runtime'
                             AND runtime_import_id IS NOT NULL
                             AND runtime_session_set_json != '[]')
@@ -762,8 +761,7 @@ impl Store {
                                 AND runtime_session_set_json = '[]')
                             OR (source_kind = 'build'
                                 AND build_attempt_id IS NOT NULL
-                                AND runtime_import_id IS NULL
-                                AND runtime_session_set_json = '[]')
+                                AND runtime_import_id IS NULL)
                             OR (source_kind = 'runtime'
                                 AND runtime_import_id IS NOT NULL
                                 AND runtime_session_set_json != '[]')
@@ -1178,17 +1176,41 @@ impl Store {
             params![attempt_id, status, completed_at, error],
         )?;
         let completed_snapshot_id = if status == "completed" {
-            let parent_snapshot_id = base_snapshot_id.with_context(|| {
+            let attempt_base_snapshot_id = base_snapshot_id.with_context(|| {
                 format!("build attempt {attempt_id} has no base completed snapshot")
             })?;
-            let source_revision = tx
+            let latest_snapshot_id = tx
                 .query_row(
-                    "SELECT source_revision FROM completed_snapshots WHERE id=?1",
-                    [&parent_snapshot_id],
-                    |row| row.get::<_, Option<String>>(0),
+                    "SELECT id FROM completed_snapshots
+                      WHERE scan_id=?1 AND status='completed'
+                      ORDER BY julianday(created_at) DESC, rowid DESC LIMIT 1",
+                    [&base_scan_id],
+                    |row| row.get::<_, String>(0),
                 )
                 .optional()?
-                .flatten();
+                .with_context(|| format!("base scan {base_scan_id} has no completed snapshot"))?;
+            let latest_snapshot = load_completed_snapshot_record(&tx, &latest_snapshot_id)?
+                .context("latest completed snapshot metadata was not found")?;
+            let preserve_runtime = !latest_snapshot.runtime_session_ids.is_empty();
+            let parent_snapshot_id = if preserve_runtime {
+                latest_snapshot.id.as_str()
+            } else {
+                attempt_base_snapshot_id.as_str()
+            };
+            let source_revision = if preserve_runtime {
+                latest_snapshot.source_revision.clone()
+            } else {
+                tx.query_row(
+                    "SELECT source_revision FROM completed_snapshots WHERE id=?1",
+                    [parent_snapshot_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )?
+            };
+            let runtime_session_ids = if preserve_runtime {
+                latest_snapshot.runtime_session_ids.as_slice()
+            } else {
+                &[]
+            };
             Some(create_completed_snapshot(
                 &tx,
                 SnapshotSource {
@@ -1197,8 +1219,8 @@ impl Store {
                     scan_id: &base_scan_id,
                     build_attempt_id: Some(attempt_id),
                     runtime_import_id: None,
-                    runtime_session_ids: &[],
-                    parent_snapshot_id: Some(&parent_snapshot_id),
+                    runtime_session_ids,
+                    parent_snapshot_id: Some(parent_snapshot_id),
                     source_revision: source_revision.as_deref(),
                     created_at: &completed_at,
                 },
