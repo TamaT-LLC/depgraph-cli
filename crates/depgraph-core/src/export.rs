@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, fmt::Write};
+use std::{collections::BTreeMap, fmt::Write, io};
 
 use anyhow::Result;
 use depgraph_store::{GraphSnapshot, refresh_profile_matrix_view};
@@ -10,6 +10,7 @@ pub enum ExportFormat {
     Json,
     Dot,
     Mermaid,
+    Graphml,
 }
 
 pub fn export(snapshot: &GraphSnapshot, format: ExportFormat) -> Result<String> {
@@ -17,6 +18,11 @@ pub fn export(snapshot: &GraphSnapshot, format: ExportFormat) -> Result<String> 
         ExportFormat::Json => export_json(snapshot),
         ExportFormat::Dot => Ok(export_dot(snapshot)),
         ExportFormat::Mermaid => Ok(export_mermaid(snapshot)),
+        ExportFormat::Graphml => {
+            let mut output = Vec::new();
+            crate::graphml::write_graphml(snapshot, &mut output)?;
+            Ok(String::from_utf8(output)?)
+        }
     }
 }
 
@@ -30,6 +36,18 @@ pub fn export_filtered(
     }
     let filtered = filter_snapshot(snapshot, filter);
     export(&filtered, format)
+}
+
+pub fn export_graphml_filtered_to_writer<W: io::Write>(
+    snapshot: &GraphSnapshot,
+    filter: &GraphQueryFilter,
+    writer: &mut W,
+) -> Result<()> {
+    if filter.is_empty() {
+        return crate::graphml::write_graphml(snapshot, writer);
+    }
+    let filtered = filter_snapshot(snapshot, filter);
+    crate::graphml::write_graphml(&filtered, writer)
 }
 
 pub fn filter_snapshot(snapshot: &GraphSnapshot, filter: &GraphQueryFilter) -> GraphSnapshot {

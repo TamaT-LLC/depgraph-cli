@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<graphml xmlns="http://graphml.graphdrawing.org/xmlns"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://graphml.graphdrawing.org/xmlns http://graphml.graphdrawing.org/xmlns/1.0/graphml.xsd">
+  <key id="g_schema_version" for="graph" attr.name="depgraph.schema_version" attr.type="string"/>
+  <key id="g_profiles_json" for="graph" attr.name="depgraph.profiles" attr.type="string">
+    <desc>Canonical JSON array of complete profile records.</desc>
+  </key>
+  <key id="g_sites_json" for="graph" attr.name="depgraph.sites" attr.type="string">
+    <desc>Canonical JSON array of dependency site records and their evidence references.</desc>
+  </key>
+  <key id="g_evidence_json" for="graph" attr.name="depgraph.evidence" attr.type="string">
+    <desc>Canonical JSON array of evidence records keyed by owner type, owner stable ID, and ordinal.</desc>
+  </key>
+  <key id="n_stable_id" for="node" attr.name="depgraph.node.id" attr.type="string"/>
+  <key id="n_kind" for="node" attr.name="depgraph.node.kind" attr.type="string"/>
+  <key id="n_locator" for="node" attr.name="depgraph.node.locator" attr.type="string"/>
+  <key id="n_display_name" for="node" attr.name="depgraph.node.display_name" attr.type="string"/>
+  <key id="n_properties_json" for="node" attr.name="depgraph.node.properties" attr.type="string">
+    <desc>Canonical JSON object containing all additional node properties.</desc>
+  </key>
+  <key id="n_evidence_refs_json" for="node" attr.name="depgraph.node.evidence_refs" attr.type="string">
+    <desc>Canonical JSON array of evidence references owned by this node.</desc>
+  </key>
+  <key id="e_stable_id" for="edge" attr.name="depgraph.edge.id" attr.type="string"/>
+  <key id="e_site_id" for="edge" attr.name="depgraph.edge.site_id" attr.type="string"/>
+  <key id="e_kind" for="edge" attr.name="depgraph.edge.kind" attr.type="string"/>
+  <key id="e_phase" for="edge" attr.name="depgraph.edge.phase" attr.type="string"/>
+  <key id="e_environment" for="edge" attr.name="depgraph.edge.environment" attr.type="string"/>
+  <key id="e_profile_id" for="edge" attr.name="depgraph.edge.profile_id" attr.type="string"/>
+  <key id="e_resolution_status" for="edge" attr.name="depgraph.edge.resolution_status" attr.type="string"/>
+  <key id="e_precision" for="edge" attr.name="depgraph.edge.precision" attr.type="string"/>
+  <key id="e_condition_json" for="edge" attr.name="depgraph.edge.condition" attr.type="string">
+    <desc>Canonical JSON representation of the complete edge condition.</desc>
+  </key>
+  <key id="e_condition_text" for="edge" attr.name="depgraph.edge.condition_text" attr.type="string"/>
+  <key id="e_generated" for="edge" attr.name="depgraph.edge.generated" attr.type="boolean"/>
+  <key id="e_evidence_refs_json" for="edge" attr.name="depgraph.edge.evidence_refs" attr.type="string">
+    <desc>Canonical JSON array of evidence references owned by this edge.</desc>
+  </key>
+  <graph id="depgraph" edgedefault="directed">
+    <data key="g_schema_version">1.0</data>
+    <data key="g_profiles_json">[{&quot;command&quot;:null,&quot;coverage&quot;:null,&quot;environment&quot;:{&quot;runtime&quot;:&quot;server&lt;&amp;\&quot;&quot;},&quot;features&quot;:[&quot;雪&lt;&amp;\&quot;&quot;],&quot;id&quot;:&quot;profile:&lt;&amp;\&quot;東京&quot;,&quot;language&quot;:&quot;rust&quot;,&quot;properties&quot;:{&quot;a&quot;:&quot;雪&lt;&amp;\&quot;&quot;,&quot;z&quot;:1},&quot;target&quot;:&quot;aarch64-apple-darwin&quot;,&quot;toolchain&quot;:{&quot;channel&quot;:&quot;stable&quot;,&quot;version&quot;:&quot;1.93&lt;&amp;\&quot;&quot;}}]</data>
+    <data key="g_sites_json">[{&quot;evidence_refs&quot;:[{&quot;ordinal&quot;:0,&quot;owner_id&quot;:&quot;site:雪&lt;&amp;\&quot;&quot;,&quot;owner_type&quot;:&quot;site&quot;}],&quot;record&quot;:{&quot;condition&quot;:{&quot;name&quot;:&quot;feature&quot;,&quot;op&quot;:&quot;profile&quot;,&quot;value&quot;:&quot;雪&lt;&amp;\&quot;&quot;},&quot;id&quot;:&quot;site:雪&lt;&amp;\&quot;&quot;,&quot;kind&quot;:&quot;rust_use&quot;,&quot;precision&quot;:&quot;exact&quot;,&quot;profile_id&quot;:&quot;profile:&lt;&amp;\&quot;東京&quot;,&quot;reason&quot;:null,&quot;resolution_status&quot;:&quot;resolved&quot;,&quot;source&quot;:&quot;node:a&lt;&amp;\&quot;雪&quot;,&quot;specifier&quot;:&quot;crate::&lt;雪&gt;&amp;\&quot;&quot;,&quot;target_ids&quot;:[&quot;node:b&quot;]}}]</data>
+    <data key="g_evidence_json">[{&quot;record&quot;:{&quot;detail&quot;:&quot;edge &lt;&amp; \&quot;雪\&quot;&quot;,&quot;end_column&quot;:9,&quot;end_line&quot;:1,&quot;extractor&quot;:&quot;rust&lt;&amp;\&quot;&quot;,&quot;extractor_version&quot;:&quot;1.0&quot;,&quot;kind&quot;:&quot;semantic&quot;,&quot;ordinal&quot;:0,&quot;owner_id&quot;:&quot;edge:雪&lt;&amp;\&quot;&quot;,&quot;owner_type&quot;:&quot;edge&quot;,&quot;path&quot;:&quot;src/a&lt;&amp;\&quot;雪.rs&quot;,&quot;properties&quot;:{&quot;a&quot;:&quot;雪&lt;&amp;\&quot;&quot;,&quot;z&quot;:true},&quot;start_column&quot;:2,&quot;start_line&quot;:1},&quot;reference&quot;:{&quot;ordinal&quot;:0,&quot;owner_id&quot;:&quot;edge:雪&lt;&amp;\&quot;&quot;,&quot;owner_type&quot;:&quot;edge&quot;}},{&quot;record&quot;:{&quot;detail&quot;:&quot;site &lt;&amp; \&quot;雪\&quot;&quot;,&quot;end_column&quot;:9,&quot;end_line&quot;:1,&quot;extractor&quot;:&quot;rust&lt;&amp;\&quot;&quot;,&quot;extractor_version&quot;:&quot;1.0&quot;,&quot;kind&quot;:&quot;semantic&quot;,&quot;ordinal&quot;:0,&quot;owner_id&quot;:&quot;site:雪&lt;&amp;\&quot;&quot;,&quot;owner_type&quot;:&quot;site&quot;,&quot;path&quot;:&quot;src/a&lt;&amp;\&quot;雪.rs&quot;,&quot;properties&quot;:{&quot;a&quot;:&quot;雪&lt;&amp;\&quot;&quot;,&quot;z&quot;:true},&quot;start_column&quot;:2,&quot;start_line&quot;:1},&quot;reference&quot;:{&quot;ordinal&quot;:0,&quot;owner_id&quot;:&quot;site:雪&lt;&amp;\&quot;&quot;,&quot;owner_type&quot;:&quot;site&quot;}}]</data>
+    <node id="n0">
+      <data key="n_stable_id">node:a&lt;&amp;&quot;雪</data>
+      <data key="n_kind">file</data>
+      <data key="n_locator">src/a&lt;&amp;&quot;雪.rs</data>
+      <data key="n_display_name">A &lt;&amp; &quot;雪&quot; &apos;雪&apos;&#13;line</data>
+      <data key="n_properties_json">{&quot;a&quot;:&quot;&lt;&amp;\&quot;&quot;,&quot;z&quot;:&quot;雪&quot;}</data>
+      <data key="n_evidence_refs_json">[]</data>
+    </node>
+    <node id="n1">
+      <data key="n_stable_id">node:b</data>
+      <data key="n_kind">module</data>
+      <data key="n_locator">crate::雪</data>
+      <data key="n_display_name">雪</data>
+      <data key="n_properties_json">{}</data>
+      <data key="n_evidence_refs_json">[]</data>
+    </node>
+    <edge id="e0" source="n0" target="n1">
+      <data key="e_stable_id">edge:雪&lt;&amp;&quot;</data>
+      <data key="e_site_id">site:雪&lt;&amp;&quot;</data>
+      <data key="e_kind">imports</data>
+      <data key="e_phase">semantic</data>
+      <data key="e_environment">server&lt;&amp;&quot;</data>
+      <data key="e_profile_id">profile:&lt;&amp;&quot;東京</data>
+      <data key="e_resolution_status">resolved</data>
+      <data key="e_precision">exact</data>
+      <data key="e_condition_json">{&quot;name&quot;:&quot;feature&quot;,&quot;op&quot;:&quot;profile&quot;,&quot;value&quot;:&quot;雪&lt;&amp;\&quot;&quot;}</data>
+      <data key="e_condition_text">{&quot;name&quot;:&quot;feature&quot;,&quot;op&quot;:&quot;profile&quot;,&quot;value&quot;:&quot;雪&lt;&amp;\&quot;&quot;}</data>
+      <data key="e_generated">false</data>
+      <data key="e_evidence_refs_json">[{&quot;ordinal&quot;:0,&quot;owner_id&quot;:&quot;edge:雪&lt;&amp;\&quot;&quot;,&quot;owner_type&quot;:&quot;edge&quot;}]</data>
+    </edge>
+  </graph>
+</graphml>

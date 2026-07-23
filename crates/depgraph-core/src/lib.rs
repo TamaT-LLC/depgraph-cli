@@ -5,6 +5,7 @@ pub mod cancellation;
 pub mod config;
 pub mod daemon;
 pub mod export;
+mod graphml;
 pub mod impact;
 pub mod incremental;
 pub mod policy;
@@ -47,7 +48,9 @@ pub use daemon::{
     coalesce_incremental_changes, start_daemon_with_runner, start_repository_daemon,
 };
 pub use depgraph_store::GraphSnapshot;
-pub use export::{ExportFormat, export, export_filtered, filter_snapshot};
+pub use export::{
+    ExportFormat, export, export_filtered, export_graphml_filtered_to_writer, filter_snapshot,
+};
 pub use impact::{
     ChangedNodeMapping, GitChange, GitChangedSet, ImpactDiagnostic, ImpactFilters, ImpactNode,
     ImpactResult, impact, map_changed_set, read_git_changed_set,

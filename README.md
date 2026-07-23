@@ -4,7 +4,7 @@
 
 Every recognized dependency site is retained as `resolved`, `candidates`, `external`, or `unresolved`. Edges carry their profile, canonical condition, precision, and source evidence; condition-specific package targets retain their own edge condition. Skipped and unsupported input is reported through the coverage ledger rather than silently dropped.
 
-The MVP implements the architecture described in [the system design](docs/40_arch_design/arch-dependency-graph-cli-system-design.md): a Rust core, isolated Rust/Go/Web workers using protocol `1.0` NDJSON, an immutable SQLite evidence store, graph queries, and deterministic JSON/DOT/Mermaid export.
+The MVP implements the architecture described in [the system design](docs/40_arch_design/arch-dependency-graph-cli-system-design.md): a Rust core, isolated Rust/Go/Web workers using protocol `1.0` NDJSON, an immutable SQLite evidence store, graph queries, and deterministic JSON/DOT/Mermaid/GraphML export.
 
 The current Milestone 2 prerelease is [`v0.2.0-rc.1`](docs/releases/v0.2.0-rc.1.md).
 
@@ -115,9 +115,18 @@ depgraph diff baseline current --phase semantic --status unresolved
 depgraph export --format json --output graph.json
 depgraph export --format dot > graph.dot
 depgraph export --format mermaid > graph.mmd
+depgraph export --format graphml --output graph.graphml
 ```
 
 SQLite is stored under the operating system cache directory, keyed by the canonical repository root. Use global `--store PATH` for a specific database and global `--scan-id ID` to inspect a retained partial scan. Queries default to the latest successful scan; `doctor` reports the latest attempt.
+
+GraphML exports use standard directed `node` and `edge` elements with generated
+XML-safe element IDs. The original stable IDs, kinds, phase, profile,
+condition, precision, resolution, and environment remain available through
+typed GraphML keys. Complete profile, dependency-site, and evidence records use
+canonical JSON graph properties, with explicit owner references that allow the
+records to be reconstructed without source-store access. `--output` writes
+GraphML incrementally through a bounded buffer for large graphs.
 
 ## Architecture policy contract
 
@@ -225,6 +234,7 @@ depgraph dependents id:route:users --phase runtime --environment production
 depgraph why id:file:server id:route:users --phase runtime
 depgraph impact id:route:users --phase runtime --profile profile:sha256:...
 depgraph export --format json --phase runtime --session session-001
+depgraph export --format graphml --phase runtime --session session-001
 depgraph diff baseline current --phase runtime --json
 ```
 

@@ -11,12 +11,12 @@ use depgraph_core::{
     BuildOutcomeKind, Config, CycleLevel, DaemonStatus, ExportFormat, GraphQueryFilter,
     ImpactFilters, ImpactResult, PolicyAnnotation, PolicyResult, ScanCacheMode,
     acquire_store_writer_lock, build_cache_key, create_build_execution_request, default_store_path,
-    doctor, evaluate_policy_diff, execute_build_request_with_cancellation, export_filtered, impact,
-    init_config, match_runtime_trace, open_store, open_store_read_only, policy_annotations,
-    read_git_changed_set, read_runtime_trace, render_condition, render_github_annotations,
-    run_scan_with_cache_mode, runtime_session_delta, rust_build_protocol_ndjson,
-    stage_build_evidence, start_repository_daemon, traverse_filtered, unresolved,
-    web_build_protocol_ndjson, why_filtered,
+    doctor, evaluate_policy_diff, execute_build_request_with_cancellation, export_filtered,
+    export_graphml_filtered_to_writer, impact, init_config, match_runtime_trace, open_store,
+    open_store_read_only, policy_annotations, read_git_changed_set, read_runtime_trace,
+    render_condition, render_github_annotations, run_scan_with_cache_mode, runtime_session_delta,
+    rust_build_protocol_ndjson, stage_build_evidence, start_repository_daemon, traverse_filtered,
+    unresolved, web_build_protocol_ndjson, why_filtered,
 };
 use depgraph_store::{CompletedSnapshotDetails, CoverageRecord};
 use serde::Serialize;
@@ -309,6 +309,7 @@ enum ExportFormatArg {
     Json,
     Dot,
     Mermaid,
+    Graphml,
 }
 
 #[derive(Serialize)]
@@ -1334,7 +1335,27 @@ async fn run(cli: Cli) -> Result<u8> {
                 ExportFormatArg::Json => ExportFormat::Json,
                 ExportFormatArg::Dot => ExportFormat::Dot,
                 ExportFormatArg::Mermaid => ExportFormat::Mermaid,
+                ExportFormatArg::Graphml => ExportFormat::Graphml,
             };
+            if format == ExportFormat::Graphml {
+                if let Some(path) = output {
+                    let file = std::fs::File::create(&path)
+                        .with_context(|| format!("failed to create {}", path.display()))?;
+                    let mut writer = std::io::BufWriter::new(file);
+                    export_graphml_filtered_to_writer(&snapshot, &filter, &mut writer)?;
+                    writer
+                        .flush()
+                        .with_context(|| format!("failed to write {}", path.display()))?;
+                } else {
+                    let stdout = std::io::stdout();
+                    let mut writer = stdout.lock();
+                    export_graphml_filtered_to_writer(&snapshot, &filter, &mut writer)?;
+                    writer
+                        .flush()
+                        .context("failed to write GraphML to stdout")?;
+                }
+                return Ok(0);
+            }
             let rendered = export_filtered(&snapshot, format, &filter)?;
             if let Some(path) = output {
                 std::fs::write(&path, rendered)
