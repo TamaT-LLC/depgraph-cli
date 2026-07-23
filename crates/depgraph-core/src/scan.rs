@@ -461,22 +461,51 @@ fn complete_scan(
         return snapshot_outcome(store, scan_id, 1);
     }
 
+    // Load everything required for the successful outcome before promotion. Once
+    // finish_scan promotes the graph, optional cache maintenance must not turn an
+    // already-visible completed snapshot into a retryable daemon failure.
+    let mut outcome = snapshot_outcome(store, scan_id, 0)?;
+    outcome.status = "completed".to_owned();
+
     let Some(promotion) =
         cancellation.run_if_active(|| store.finish_scan(scan_id, "completed", None, true))
     else {
         return cancel_scan(store, scan_id);
     };
     promotion?;
-    if let Some(plan) = cache_plan {
-        let snapshot_id = store
-            .snapshot_id_for_source("scan", scan_id)?
-            .context("completed scan did not expose its snapshot")?;
-        let _ = store.store_snapshot_cache(&plan.syntax, &snapshot_id, Some(scan_id), None)?;
-        if let Some(semantic) = &plan.semantic {
-            let _ = store.store_snapshot_cache(semantic, &snapshot_id, Some(scan_id), None)?;
-        }
+    if let Some(plan) = cache_plan
+        && let Err(error) = store_completed_scan_cache(store, scan_id, plan)
+    {
+        tracing::warn!(
+            scan_id,
+            error = %error,
+            "completed scan cache population failed"
+        );
     }
-    snapshot_outcome(store, scan_id, 0)
+    match store.cache_events_for_scan(scan_id) {
+        Ok(cache_events) => outcome.cache_events = cache_events,
+        Err(error) => tracing::warn!(
+            scan_id,
+            error = %error,
+            "failed to refresh cache events for completed scan outcome"
+        ),
+    }
+    Ok(outcome)
+}
+
+fn store_completed_scan_cache(
+    store: &mut Store,
+    scan_id: &str,
+    plan: &ScanCachePlan,
+) -> Result<()> {
+    let snapshot_id = store
+        .snapshot_id_for_source("scan", scan_id)?
+        .context("completed scan did not expose its snapshot")?;
+    let _ = store.store_snapshot_cache(&plan.syntax, &snapshot_id, Some(scan_id), None)?;
+    if let Some(semantic) = &plan.semantic {
+        let _ = store.store_snapshot_cache(semantic, &snapshot_id, Some(scan_id), None)?;
+    }
+    Ok(())
 }
 
 fn record_cache_rejection(store: &Store, scan_id: &str, reason: &str) -> Result<()> {
@@ -700,6 +729,7 @@ fn snapshot_outcome(store: &Store, scan_id: &str, exit_code: u8) -> Result<ScanO
 #[cfg(test)]
 mod tests {
     use super::*;
+    use depgraph_store::{CACHE_CONTRACT_VERSION, CacheKey};
 
     fn test_worker_spec(adapter: AdapterKind, program: PathBuf) -> WorkerSpec {
         WorkerSpec {
@@ -712,6 +742,41 @@ mod tests {
             expected_version: None,
             release_attested: false,
         }
+    }
+
+    #[test]
+    fn promoted_scan_remains_successful_when_cache_population_fails() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let mut store = Store::open_in_memory()?;
+        let scan_id = "cache-write-failure";
+        store.start_scan(scan_id, root.path(), false)?;
+        ingest_empty_coverage(&mut store, scan_id)?;
+        let invalid_key = CacheKey {
+            layer: CacheLayer::Syntax,
+            contract_version: CACHE_CONTRACT_VERSION + 1,
+            key: "invalid-cache-contract".to_owned(),
+            dimensions: BTreeMap::from([("fixture".to_owned(), "failure".to_owned())]),
+        };
+        let plan = ScanCachePlan {
+            syntax: invalid_key,
+            semantic: None,
+            semantic_reject_reason: None,
+        };
+
+        let outcome = complete_scan(
+            &mut store,
+            scan_id,
+            false,
+            &Config::default(),
+            Some(&plan),
+            &CancellationToken::new(),
+        )?;
+
+        assert_eq!(outcome.status, "completed");
+        assert_eq!(outcome.exit_code, 0);
+        assert_eq!(store.scan(scan_id)?.unwrap().status, "completed");
+        assert!(store.snapshot_id_for_source("scan", scan_id)?.is_some());
+        Ok(())
     }
 
     #[cfg(unix)]

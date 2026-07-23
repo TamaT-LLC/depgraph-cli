@@ -9,11 +9,11 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use depgraph_core::{
     BuildOutcomeKind, Config, CycleLevel, DaemonStatus, ExportFormat, ImpactFilters, ImpactResult,
-    ScanCacheMode, build_cache_key, create_build_execution_request, default_store_path, doctor,
-    execute_build_request_with_cancellation, export, impact, init_config, open_store,
-    read_git_changed_set, render_condition, run_scan_with_cache_mode, rust_build_protocol_ndjson,
-    stage_build_evidence, start_repository_daemon, traverse, unresolved, web_build_protocol_ndjson,
-    why,
+    ScanCacheMode, acquire_store_writer_lock, build_cache_key, create_build_execution_request,
+    default_store_path, doctor, execute_build_request_with_cancellation, export, impact,
+    init_config, open_store, read_git_changed_set, render_condition, run_scan_with_cache_mode,
+    rust_build_protocol_ndjson, stage_build_evidence, start_repository_daemon, traverse,
+    unresolved, web_build_protocol_ndjson, why,
 };
 use depgraph_store::{CompletedSnapshotDetails, CoverageRecord};
 use serde::Serialize;
@@ -369,6 +369,7 @@ async fn run(cli: Cli) -> Result<u8> {
             let root = canonical_directory(path)?;
             let config = Config::load(&root)?;
             let store_path = store_path(cli.store, &root)?;
+            let _store_writer_lock = acquire_store_writer_lock(&store_path)?;
             let mut store = open_store(&store_path)?;
             let outcome = run_scan_with_cache_mode(
                 &mut store,

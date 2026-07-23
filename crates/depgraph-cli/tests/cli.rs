@@ -1041,6 +1041,28 @@ fn empty_safe_scan_uses_external_store_and_reports_json() {
 }
 
 #[test]
+fn foreground_scan_respects_the_store_writer_lock() {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let store = cache.path().join("graph.db");
+    let _store_writer_lock = depgraph_core::acquire_store_writer_lock(&store).unwrap();
+
+    Command::cargo_bin("depgraph")
+        .unwrap()
+        .args([
+            "--store",
+            store.to_str().unwrap(),
+            "scan",
+            root.path().to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "a daemon or scan is already running for store",
+        ));
+}
+
+#[test]
 fn build_mode_refuses_implicit_or_missing_consent_without_executing_project_code() {
     let root = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();

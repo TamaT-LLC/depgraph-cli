@@ -694,7 +694,7 @@ pub fn start_repository_daemon(
         .canonicalize()
         .with_context(|| format!("failed to canonicalize daemon root {}", root.display()))?;
     let store_path = absolute_normalized_path(store_path)?;
-    let lock = acquire_daemon_lock(&store_path)?;
+    let lock = acquire_store_writer_lock(&store_path)?;
     let mut store = open_store(&store_path)?;
     let recovered = store.recover_interrupted_attempts(&root)?;
     let runner = Arc::new(RepositoryScanRunner::new(
@@ -721,7 +721,10 @@ pub fn start_daemon_with_runner(
     runner: Arc<dyn DaemonScanRunner>,
 ) -> Result<DaemonHandle> {
     let store_path = store_path.map(absolute_normalized_path).transpose()?;
-    let lock = store_path.as_deref().map(acquire_daemon_lock).transpose()?;
+    let lock = store_path
+        .as_deref()
+        .map(acquire_store_writer_lock)
+        .transpose()?;
     start_daemon_with_runner_and_lock(root, config, store_path, recovered_attempts, runner, lock)
 }
 
@@ -777,7 +780,10 @@ fn start_daemon_with_runner_and_lock(
     })
 }
 
-fn acquire_daemon_lock(store_path: &Path) -> Result<std::fs::File> {
+/// Acquires the per-store writer lock shared by daemon and foreground scans.
+///
+/// The returned file must remain alive for the full duration of the writer.
+pub fn acquire_store_writer_lock(store_path: &Path) -> Result<std::fs::File> {
     let lock_path = with_path_suffix(store_path, ".daemon-lock");
     let parent = lock_path
         .parent()
@@ -805,7 +811,7 @@ fn acquire_daemon_lock(store_path: &Path) -> Result<std::fs::File> {
         .with_context(|| format!("failed to open daemon lock {}", lock_path.display()))?;
     file.try_lock().with_context(|| {
         format!(
-            "a daemon is already running for store {}",
+            "a daemon or scan is already running for store {}",
             store_path.display()
         )
     })?;
