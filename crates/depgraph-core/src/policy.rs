@@ -367,10 +367,14 @@ pub struct PolicySuppressionScope {
 
 impl PolicySuppressionScope {
     fn validate(&self) -> Result<()> {
+        let condition_restricts_scope = self
+            .condition
+            .as_ref()
+            .is_some_and(|condition| condition.constant_truth() != Some(true));
         if self.source.is_none()
             && self.target.is_none()
             && self.profiles == PolicyProfileFilter::default()
-            && self.condition.is_none()
+            && !condition_restricts_scope
         {
             bail!("suppression scope must restrict source, target, profile, or condition");
         }
@@ -447,6 +451,35 @@ impl PolicyCondition {
     fn validate(&self) -> Result<()> {
         let mut count = 0_u32;
         self.validate_inner(0, &mut count)
+    }
+
+    fn constant_truth(&self) -> Option<bool> {
+        match self {
+            Self::All { conditions } => {
+                let mut has_dynamic = false;
+                for condition in conditions {
+                    match condition.constant_truth() {
+                        Some(false) => return Some(false),
+                        Some(true) => {}
+                        None => has_dynamic = true,
+                    }
+                }
+                (!has_dynamic).then_some(true)
+            }
+            Self::Any { conditions } => {
+                let mut has_dynamic = false;
+                for condition in conditions {
+                    match condition.constant_truth() {
+                        Some(true) => return Some(true),
+                        Some(false) => {}
+                        None => has_dynamic = true,
+                    }
+                }
+                (!has_dynamic).then_some(false)
+            }
+            Self::Not { condition } => condition.constant_truth().map(|value| !value),
+            Self::Eq { .. } | Self::In { .. } | Self::Defined { .. } => None,
+        }
     }
 
     fn validate_inner(&self, depth: u32, count: &mut u32) -> Result<()> {
@@ -1054,7 +1087,7 @@ mod tests {
                 .contains("unsupported policy schema_version")
         );
 
-        let mut unbounded = value;
+        let mut unbounded = value.clone();
         unbounded["suppressions"][0]["scope"] = json!({});
         let unbounded: PolicyConfig = serde_json::from_value(unbounded)?;
         assert!(
@@ -1064,6 +1097,38 @@ mod tests {
                 .to_string()
                 .contains("suppression scope")
         );
+
+        let schema: Value = serde_json::from_str(POLICY_SCHEMA)?;
+        let validator = jsonschema::validator_for(&schema)?;
+        for condition in [
+            json!({"op": "all", "conditions": []}),
+            json!({
+                "op": "any",
+                "conditions": [
+                    {"op": "defined", "key": "target"},
+                    {"op": "all", "conditions": []}
+                ]
+            }),
+            json!({
+                "op": "not",
+                "condition": {"op": "any", "conditions": []}
+            }),
+        ] {
+            let mut vacuous = value.clone();
+            vacuous["suppressions"][0]["scope"] = json!({"condition": condition});
+            let policy: PolicyConfig = serde_json::from_value(vacuous.clone())?;
+            assert!(
+                policy
+                    .validate()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("suppression scope")
+            );
+            assert!(
+                validator.validate(&vacuous).is_err(),
+                "JSON Schema accepted a vacuous suppression condition"
+            );
+        }
         Ok(())
     }
 

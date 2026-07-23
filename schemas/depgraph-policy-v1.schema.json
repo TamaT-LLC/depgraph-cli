@@ -315,6 +315,110 @@
         }
       ]
     },
+    "tautological_condition": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["op", "conditions"],
+          "properties": {
+            "op": {
+              "const": "all"
+            },
+            "conditions": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/tautological_condition"
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["op", "conditions"],
+          "properties": {
+            "op": {
+              "const": "any"
+            },
+            "conditions": {
+              "type": "array",
+              "contains": {
+                "$ref": "#/$defs/tautological_condition"
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["op", "condition"],
+          "properties": {
+            "op": {
+              "const": "not"
+            },
+            "condition": {
+              "$ref": "#/$defs/contradictory_condition"
+            }
+          }
+        }
+      ]
+    },
+    "contradictory_condition": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["op", "conditions"],
+          "properties": {
+            "op": {
+              "const": "any"
+            },
+            "conditions": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/contradictory_condition"
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["op", "conditions"],
+          "properties": {
+            "op": {
+              "const": "all"
+            },
+            "conditions": {
+              "type": "array",
+              "contains": {
+                "$ref": "#/$defs/contradictory_condition"
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["op", "condition"],
+          "properties": {
+            "op": {
+              "const": "not"
+            },
+            "condition": {
+              "$ref": "#/$defs/tautological_condition"
+            }
+          }
+        }
+      ]
+    },
+    "restrictive_condition": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/condition"
+        },
+        {
+          "not": {
+            "$ref": "#/$defs/tautological_condition"
+          }
+        }
+      ]
+    },
     "evidence_requirement": {
       "type": "object",
       "additionalProperties": false,
@@ -463,7 +567,12 @@
           "required": ["target"]
         },
         {
-          "required": ["condition"]
+          "required": ["condition"],
+          "properties": {
+            "condition": {
+              "$ref": "#/$defs/restrictive_condition"
+            }
+          }
         },
         {
           "required": ["profiles"],
