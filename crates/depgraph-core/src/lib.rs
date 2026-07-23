@@ -606,6 +606,10 @@ pub fn open_store(path: &Path) -> Result<Store> {
     Store::open(path)
 }
 
+pub fn open_store_read_only(path: &Path) -> Result<Store> {
+    Store::open_read_only(path)
+}
+
 #[cfg(test)]
 mod tests {
     use std::{ffi::OsString, path::PathBuf};

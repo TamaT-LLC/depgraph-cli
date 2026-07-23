@@ -766,6 +766,20 @@ fn runtime_validate_rejects_malformed_and_secret_input_with_bounded_errors() {
         .stderr(predicate::str::contains("secret"))
         .stderr(predicate::str::contains("fixture-secret-value").not());
     assert!(!unopened_store_path.exists());
+
+    Command::cargo_bin("depgraph")
+        .unwrap()
+        .args([
+            "--store",
+            unopened_store_path.to_str().unwrap(),
+            "runtime",
+            "validate",
+            fixture("runtime-trace-v1.golden.json").to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("read-only"));
+    assert!(!unopened_store_path.exists());
 }
 
 #[test]

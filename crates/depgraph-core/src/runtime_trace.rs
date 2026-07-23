@@ -1,4 +1,7 @@
-use std::{collections::BTreeSet, io::Read};
+use std::{
+    collections::{BTreeSet, HashMap},
+    io::Read,
+};
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -234,6 +237,7 @@ pub fn match_runtime_trace(
 ) -> Result<ValidatedRuntimeTrace> {
     validate_repository(&trace.repository, snapshot)?;
     let profile_match = match_profile(&trace.session.profile, &snapshot.profiles);
+    let node_index = RuntimeTraceNodeIndex::new(&snapshot.nodes);
     let mut events = Vec::with_capacity(trace.events.len());
     let mut summary = RuntimeTraceSummary {
         events: trace.events.len() as u64,
@@ -248,8 +252,8 @@ pub fn match_runtime_trace(
     };
 
     for event in &trace.events {
-        let source = match_locator(&event.source, &snapshot.nodes);
-        let target = match_locator(&event.target, &snapshot.nodes);
+        let source = match_locator(&event.source, &node_index);
+        let target = match_locator(&event.target, &node_index);
         match target.status {
             RuntimeTraceMatchStatus::Resolved => summary.resolved_targets += 1,
             RuntimeTraceMatchStatus::External => summary.external_targets += 1,
@@ -447,9 +451,16 @@ fn validate_graph_locator(locator: &str, field: &str) -> Result<()> {
     if strip_ascii_case_prefix(locator, "file:").is_some() && !locator.starts_with("file:") {
         bail!("runtime trace {field} uses a non-canonical file URI scheme");
     }
-    if let Some(path) = strip_ascii_case_prefix(locator, "file://")
-        .or_else(|| strip_ascii_case_prefix(locator, "file:"))
-    {
+    if let Some(path) = strip_ascii_case_prefix(locator, "file://") {
+        if path
+            .split('/')
+            .next()
+            .is_some_and(|segment| segment.eq_ignore_ascii_case("localhost"))
+        {
+            bail!("runtime trace {field} must not contain a file URI host");
+        }
+        validate_repository_path(path, field)?;
+    } else if let Some(path) = strip_ascii_case_prefix(locator, "file:") {
         validate_repository_path(path, field)?;
     }
     Ok(())
@@ -467,7 +478,7 @@ fn validate_repository_path(path: &str, field: &str) -> Result<()> {
     if path.starts_with('/')
         || path.starts_with('\\')
         || path.contains('\\')
-        || is_windows_drive_path(path)
+        || path.contains(':')
         || path
             .split('/')
             .any(|part| part.is_empty() || part == "." || part == "..")
@@ -597,12 +608,14 @@ fn looks_like_secret(value: &str) -> bool {
 }
 
 fn looks_like_absolute_path(value: &str) -> bool {
+    let lowercase = value.to_ascii_lowercase();
     value.starts_with('/')
         || value.starts_with("\\\\")
         || is_windows_drive_path(value)
-        || value.to_ascii_lowercase().starts_with("file:///")
-        || (value.to_ascii_lowercase().starts_with("file:/")
-            && !value.to_ascii_lowercase().starts_with("file://"))
+        || lowercase.starts_with("file:///")
+        || lowercase == "file://localhost"
+        || lowercase.starts_with("file://localhost/")
+        || (lowercase.starts_with("file:/") && !lowercase.starts_with("file://"))
 }
 
 fn is_windows_drive_path(value: &str) -> bool {
@@ -693,37 +706,61 @@ fn profile_matches_requested_axes(
                 == requested.features.iter().collect::<BTreeSet<_>>())
 }
 
+struct RuntimeTraceNodeIndex<'a> {
+    by_id: HashMap<&'a str, Vec<&'a NodeRecord>>,
+    by_locator: HashMap<&'a str, Vec<&'a NodeRecord>>,
+    by_repository_path: HashMap<&'a str, Vec<&'a NodeRecord>>,
+}
+
+impl<'a> RuntimeTraceNodeIndex<'a> {
+    fn new(nodes: &'a [NodeRecord]) -> Self {
+        let mut index = Self {
+            by_id: HashMap::with_capacity(nodes.len()),
+            by_locator: HashMap::with_capacity(nodes.len()),
+            by_repository_path: HashMap::with_capacity(nodes.len()),
+        };
+        for node in nodes {
+            push_indexed_node(&mut index.by_id, &node.id, node);
+            push_indexed_node(&mut index.by_locator, &node.locator, node);
+            if let Some(path) = node.properties.get("path").and_then(Value::as_str) {
+                push_indexed_node(&mut index.by_repository_path, path, node);
+            }
+            if let Some(path) = node
+                .locator
+                .strip_prefix("file://")
+                .or_else(|| node.locator.strip_prefix("file:"))
+            {
+                push_indexed_node(&mut index.by_repository_path, path, node);
+            }
+        }
+        index
+    }
+}
+
+fn push_indexed_node<'a>(
+    index: &mut HashMap<&'a str, Vec<&'a NodeRecord>>,
+    key: &'a str,
+    node: &'a NodeRecord,
+) {
+    let matches = index.entry(key).or_default();
+    if !matches.iter().any(|existing| existing.id == node.id) {
+        matches.push(node);
+    }
+}
+
 fn match_locator(
     locator: &RuntimeTraceLocator,
-    nodes: &[NodeRecord],
+    index: &RuntimeTraceNodeIndex<'_>,
 ) -> MatchedRuntimeTraceLocator {
-    let matches = match locator {
-        RuntimeTraceLocator::Node { node_id } => nodes
-            .iter()
-            .filter(|node| node.id == *node_id)
-            .collect::<Vec<_>>(),
-        RuntimeTraceLocator::GraphLocator { locator, node_kind } => nodes
-            .iter()
-            .filter(|node| node.locator == *locator)
-            .filter(|node| {
-                node_kind
-                    .as_deref()
-                    .is_none_or(|node_kind| node.kind == node_kind)
-            })
-            .collect::<Vec<_>>(),
-        RuntimeTraceLocator::RepositoryPath { path, node_kind } => nodes
-            .iter()
-            .filter(|node| {
-                node.properties.get("path").and_then(Value::as_str) == Some(path.as_str())
-                    || node.locator == format!("file://{path}")
-                    || node.locator == format!("file:{path}")
-            })
-            .filter(|node| {
-                node_kind
-                    .as_deref()
-                    .is_none_or(|node_kind| node.kind == node_kind)
-            })
-            .collect::<Vec<_>>(),
+    let (matches, node_kind) = match locator {
+        RuntimeTraceLocator::Node { node_id } => (index.by_id.get(node_id.as_str()), None),
+        RuntimeTraceLocator::GraphLocator { locator, node_kind } => {
+            (index.by_locator.get(locator.as_str()), node_kind.as_deref())
+        }
+        RuntimeTraceLocator::RepositoryPath { path, node_kind } => (
+            index.by_repository_path.get(path.as_str()),
+            node_kind.as_deref(),
+        ),
         RuntimeTraceLocator::External { .. } => {
             return MatchedRuntimeTraceLocator {
                 status: RuntimeTraceMatchStatus::External,
@@ -742,20 +779,26 @@ fn match_locator(
         }
     };
 
-    match matches.as_slice() {
-        [node] => MatchedRuntimeTraceLocator {
+    let mut matches = matches
+        .into_iter()
+        .flat_map(|matches| matches.iter().copied())
+        .filter(|node| node_kind.is_none_or(|node_kind| node.kind == node_kind));
+    let first = matches.next();
+    let ambiguous = matches.next().is_some();
+    match (first, ambiguous) {
+        (Some(node), false) => MatchedRuntimeTraceLocator {
             status: RuntimeTraceMatchStatus::Resolved,
             node_id: Some(node.id.clone()),
             reason: None,
             input: locator.clone(),
         },
-        [] => MatchedRuntimeTraceLocator {
+        (None, _) => MatchedRuntimeTraceLocator {
             status: RuntimeTraceMatchStatus::Unresolved,
             node_id: None,
             reason: Some("node_not_found".to_owned()),
             input: locator.clone(),
         },
-        _ => MatchedRuntimeTraceLocator {
+        (Some(_), true) => MatchedRuntimeTraceLocator {
             status: RuntimeTraceMatchStatus::Unresolved,
             node_id: None,
             reason: Some("node_ambiguous".to_owned()),
@@ -1009,7 +1052,13 @@ mod tests {
                 .contains("repository-relative path")
         );
 
-        for unsafe_path in ["C:/outside.ts", "C:outside.ts", "a//b.ts", "a/"] {
+        for unsafe_path in [
+            "C:/outside.ts",
+            "C:outside.ts",
+            "src/C:/outside.ts",
+            "a//b.ts",
+            "a/",
+        ] {
             value = serde_json::from_str(GOLDEN)?;
             value["events"][0]["source"]["path"] = json!(unsafe_path);
             assert!(
@@ -1044,7 +1093,33 @@ mod tests {
                 "schema accepted a non-canonical file URI scheme"
             );
         }
+
+        for unsafe_locator in [
+            "file://localhost/C:/Windows",
+            "file://localhost/etc/passwd",
+            "file://src/C:/Windows",
+        ] {
+            value = serde_json::from_str(GOLDEN)?;
+            value["events"][0]["target"] = json!({
+                "kind":"graph_locator",
+                "locator":unsafe_locator,
+                "node_kind":"file"
+            });
+            assert!(read_runtime_trace(Cursor::new(serde_json::to_vec(&value)?)).is_err());
+            let schema: Value = serde_json::from_str(RUNTIME_TRACE_SCHEMA)?;
+            assert!(
+                !jsonschema::validator_for(&schema)?.is_valid(&value),
+                "schema accepted a file host or embedded drive path"
+            );
+        }
         Ok(())
+    }
+
+    #[test]
+    fn node_index_deduplicates_equivalent_path_keys() {
+        let snapshot = snapshot();
+        let index = RuntimeTraceNodeIndex::new(&snapshot.nodes);
+        assert_eq!(index.by_repository_path["src/server.ts"].len(), 1);
     }
 
     #[test]

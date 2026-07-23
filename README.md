@@ -229,11 +229,12 @@ invents a repository node.
 
 Input is bounded to 16 MiB, 100,000 events, 4,096-character strings, and 32 JSON
 levels. UTF-8, exact version, strict fields, RFC 3339 session bounds, increasing
-sequence numbers, and portable paths are required. Absolute paths, `..`,
-backslashes, unknown properties, secret-bearing fields, and common raw
-credential forms fail closed with bounded errors. Environment variables,
-headers, and secrets are represented only by sorted/deduplicated names and
-redaction counts; their values are not part of the contract or output.
+sequence numbers, and portable paths are required. Absolute paths, `..`, file
+URI hosts, drive-like `:` segments, backslashes, unknown properties,
+secret-bearing fields, and common raw credential forms fail closed with bounded
+errors. Environment variables, headers, and secrets are represented only by
+sorted/deduplicated names and redaction counts; their values are not part of the
+contract or output.
 
 The matching JSON Schema is
 [`schemas/depgraph-runtime-trace-v1.schema.json`](schemas/depgraph-runtime-trace-v1.schema.json).
