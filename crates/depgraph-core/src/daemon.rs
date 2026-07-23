@@ -923,7 +923,7 @@ async fn run_daemon_loop(
                 } else {
                     watcher.next().await
                 }
-            }, if watcher_open => {
+            }, if watcher_open || pending_watcher_event.is_some() => {
                 match event {
                     Some(Ok(event)) => {
                         let revision_before = coalescer.revision();
