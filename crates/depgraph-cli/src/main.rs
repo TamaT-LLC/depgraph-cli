@@ -482,7 +482,7 @@ async fn run(cli: Cli) -> Result<u8> {
                 if status.phase != depgraph_core::DaemonPhase::Stopped {
                     if !daemon_lock_is_held(&store_path)? {
                         anyhow::bail!(
-                            "daemon status at {} is stale because no daemon process owns the store lock",
+                            "daemon status at {} is stale because no daemon process owns the lifecycle lock",
                             status_path.display()
                         );
                     }
@@ -1139,6 +1139,10 @@ fn write_daemon_status(path: &Path, status: &DaemonStatus) -> Result<()> {
     file.write_all(b"\n")?;
     file.sync_all()?;
     drop(file);
+    // Unix rename atomically replaces the prior status snapshot. Windows
+    // requires the destination to be removed first, so readers retry across
+    // that platform-specific publication gap.
+    #[cfg(windows)]
     remove_control_file(path)?;
     std::fs::rename(&temporary, path).with_context(|| {
         format!(
@@ -1157,36 +1161,41 @@ fn with_path_suffix(path: &Path, suffix: &str) -> PathBuf {
 }
 
 fn read_daemon_status(path: &Path) -> Result<DaemonStatus> {
-    let metadata = read_daemon_status_metadata(path)?;
-    if !metadata.file_type().is_file() {
-        anyhow::bail!(
-            "daemon status path {} is not a regular file",
-            path.display()
-        );
-    }
-    let raw = std::fs::read(path)
-        .with_context(|| format!("failed to read daemon status {}", path.display()))?;
-    serde_json::from_slice(&raw)
-        .with_context(|| format!("failed to parse daemon status {}", path.display()))
-}
-
-fn read_daemon_status_metadata(path: &Path) -> Result<std::fs::Metadata> {
     for attempt in 0..5 {
-        match std::fs::symlink_metadata(path) {
-            Ok(metadata) => return Ok(metadata),
+        let metadata = match std::fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound && attempt < 4 => {
-                // Windows cannot replace an open destination with rename, so
-                // publication removes the old snapshot just before renaming
-                // the fully-synced temporary file. Retry across that tiny gap.
                 std::thread::sleep(std::time::Duration::from_millis(5));
+                continue;
             }
             Err(error) => {
                 return Err(error)
                     .with_context(|| format!("daemon status was not found at {}", path.display()));
             }
+        };
+        if !metadata.file_type().is_file() {
+            anyhow::bail!(
+                "daemon status path {} is not a regular file",
+                path.display()
+            );
+        }
+        match std::fs::read(path) {
+            Ok(raw) => {
+                return serde_json::from_slice(&raw)
+                    .with_context(|| format!("failed to parse daemon status {}", path.display()));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && attempt < 4 => {
+                // The file may have been atomically replaced after metadata was
+                // read, or removed briefly by Windows before a replacement.
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to read daemon status {}", path.display()));
+            }
         }
     }
-    unreachable!("the final metadata attempt always returns")
+    unreachable!("the final daemon status read attempt always returns")
 }
 
 fn write_stop_request(path: &Path) -> Result<()> {
