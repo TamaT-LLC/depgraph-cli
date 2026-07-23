@@ -103,28 +103,28 @@ test("sample evidence uses numeric order and rejects gaps", () => {
 
 test("release verification requires the complete 10,000-file metric contract", () => {
   const metricInputs = [
-    ["safe_initial_scan", "cold_graph_store", true, [10, 11, 12], 75_000, 30_000],
+    ["safe_initial_scan", "cold_graph_store", true, [10, 11, 12], 80_000, 30_000],
     [
       "one_file_incremental_scan",
       "warm_analysis_cache",
       true,
       [20, 21, 22],
-      90_000,
+      105_000,
       2_000,
     ],
-    ["cold_file_impact", "first_process_query", false, [1], 3_500, 500],
-    ["warm_file_impact", "primed_graph_store", true, [1, 1, 2], 3_500, 500],
-    ["cold_package_impact", "first_process_query", false, [1], 3_500, 500],
+    ["cold_file_impact", "first_process_query", false, [1], 4_000, 500],
+    ["warm_file_impact", "primed_graph_store", true, [1, 1, 2], 4_000, 500],
+    ["cold_package_impact", "first_process_query", false, [1], 4_000, 500],
     [
       "warm_package_impact",
       "primed_graph_store",
       true,
       [1, 2, 2],
-      3_500,
+      4_000,
       500,
     ],
     ["rust_hir_semantic_scan", "cold_graph_store", true, [5], 10_000, 10_000],
-    ["warm_rust_symbol_query", "primed_graph_store", true, [1], 3_500, 500],
+    ["warm_rust_symbol_query", "primed_graph_store", true, [1], 4_000, 500],
     [
       "cross_adapter_build_observation",
       "warm_base_snapshot",

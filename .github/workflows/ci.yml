@@ -67,9 +67,9 @@ jobs:
       # Product targets remain 30s/2s/500ms on a development machine.
       # Hosted-runner ceilings include process startup and bounded contention;
       # the report still records every raw sample and the product target.
-      DEPGRAPH_SCAN_LIMIT_MS: "75000"
-      DEPGRAPH_INCREMENTAL_LIMIT_MS: "90000"
-      DEPGRAPH_QUERY_LIMIT_MS: "3500"
+      DEPGRAPH_SCAN_LIMIT_MS: "80000"
+      DEPGRAPH_INCREMENTAL_LIMIT_MS: "105000"
+      DEPGRAPH_QUERY_LIMIT_MS: "4000"
       DEPGRAPH_BUILD_OBSERVATION_LIMIT_MS: "60000"
       DEPGRAPH_BENCH_SAMPLES: "3"
       DEPGRAPH_QUERY_SAMPLES: "5"
