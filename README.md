@@ -147,7 +147,7 @@ scope = { source = { kind = "file", field = "path", match = "exact", value = "sr
 Selectors support `package`, `file`, `symbol`, `type`, and `route` nodes.
 `field` chooses stable ID, normalized repository path, locator, or display-name
 matching; `match` is `exact`, `prefix`, or the bounded `*` / `**` / `?` glob
-grammar.
+grammar. The normalized `path` field is available only for `file` selectors.
 `cardinality = "one"` rejects both zero and multiple matches rather than
 silently choosing the first; `"many"` evaluates every match in canonical
 order. Repository/package scope is applied before exclusions, and neither can
