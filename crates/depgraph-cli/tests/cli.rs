@@ -2841,6 +2841,29 @@ fn usage_and_invalid_config_are_exit_two() {
         .stderr(predicate::str::contains(
             "worker_timeout_seconds must be at least 1",
         ));
+
+    fs::write(
+        root.path().join(".depgraph.toml"),
+        "schema_version = 1\n[policy]\nschema_version = '2.0'\n",
+    )
+    .unwrap();
+    Command::cargo_bin("depgraph")
+        .unwrap()
+        .args([
+            "--store",
+            cache
+                .path()
+                .join("graph-policy-version.db")
+                .to_str()
+                .unwrap(),
+            "scan",
+            root.path().to_str().unwrap(),
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains(
+            "unsupported policy schema_version 2.0",
+        ));
 }
 
 #[test]

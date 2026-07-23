@@ -6,6 +6,8 @@ use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::policy::PolicyConfig;
+
 pub const CONFIG_FILE: &str = ".depgraph.toml";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -16,6 +18,7 @@ pub struct Config {
     pub daemon: DaemonConfig,
     pub strict: StrictConfig,
     pub profiles: ProfileConfig,
+    pub policy: PolicyConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,6 +65,7 @@ impl Default for Config {
             daemon: DaemonConfig::default(),
             strict: StrictConfig::default(),
             profiles: ProfileConfig::default(),
+            policy: PolicyConfig::default(),
         }
     }
 }
@@ -181,6 +185,7 @@ impl Config {
         if !matches!(self.profiles.go_call_graph.as_str(), "rta-cha" | "vta") {
             bail!("profiles.go_call_graph must be rta-cha or vta");
         }
+        self.policy.validate()?;
         Ok(())
     }
 
@@ -265,6 +270,27 @@ mod tests {
         assert_eq!(parsed.strict.max_unresolved, 0);
         assert_eq!(parsed.profiles.rust_mode, "check");
         assert_eq!(parsed.profiles.go_call_graph, "rta-cha");
+        assert_eq!(parsed.policy.schema_version, "1.0");
+        Ok(())
+    }
+
+    #[test]
+    fn versioned_policy_round_trips_through_toml_and_loads() -> Result<()> {
+        let policy: PolicyConfig =
+            serde_json::from_str(include_str!("../tests/fixtures/policy-v1.golden.json"))?;
+        let config = Config {
+            policy,
+            ..Config::default()
+        };
+        let root = tempfile::tempdir()?;
+        std::fs::write(
+            root.path().join(CONFIG_FILE),
+            toml::to_string_pretty(&config)?,
+        )?;
+
+        let loaded = Config::load(root.path())?;
+        assert_eq!(loaded.policy.rules.len(), 2);
+        assert_eq!(loaded.policy.suppressions.len(), 1);
         Ok(())
     }
 
@@ -284,6 +310,8 @@ mod tests {
             "schema_version = 1\n[daemon]\nignored_paths = ['vendor', 'vendor']\n",
             "schema_version = 1\n[profiles]\nrust_mode = 'release'\n",
             "schema_version = 1\n[profiles]\ngo_call_graph = 'pta'\n",
+            "schema_version = 1\n[policy]\nschema_version = '2.0'\n",
+            "schema_version = 1\n[policy]\nschema_version = '1.0'\nunknown = true\n",
         ] {
             std::fs::write(root.path().join(CONFIG_FILE), raw)?;
             assert!(Config::load(root.path()).is_err(), "accepted {raw:?}");

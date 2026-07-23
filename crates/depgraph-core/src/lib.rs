@@ -7,6 +7,7 @@ pub mod daemon;
 pub mod export;
 pub mod impact;
 pub mod incremental;
+pub mod policy;
 pub mod query;
 pub mod rust_build_observer;
 pub mod scan;
@@ -53,6 +54,14 @@ pub use incremental::{
     INCREMENTAL_PLAN_SCHEMA_VERSION, IncrementalChangeKind, IncrementalFileChange,
     IncrementalInvalidationMode, IncrementalInvalidationPlan, IncrementalInvalidationReason,
     plan_incremental_invalidation,
+};
+pub use policy::{
+    AppliedPolicySuppression, POLICY_RESULT_SCHEMA_VERSION, POLICY_SCHEMA, POLICY_SCHEMA_VERSION,
+    PolicyCondition, PolicyConfig, PolicyEntity, PolicyEvidenceRequirement, PolicyEvidenceSpan,
+    PolicyMatchKind, PolicyPathStep, PolicyPattern, PolicyProfileFilter, PolicyResult,
+    PolicyResultSummary, PolicyRule, PolicyRuleKind, PolicySelector, PolicySelectorCardinality,
+    PolicySelectorField, PolicySelectorKind, PolicySelectorPattern, PolicySelectorScope,
+    PolicySeverity, PolicySuppression, PolicySuppressionScope, PolicyThreshold, PolicyViolation,
 };
 pub use query::{
     CycleLevel, CycleResult, TraversalResult, UnresolvedResult, WhyResult, cycles,

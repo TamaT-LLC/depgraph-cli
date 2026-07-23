@@ -1119,6 +1119,31 @@ MVP では専用 subcommand を優先し、独自 query language は導入しな
 
 policy result も evidence span を持ち、CI annotation へ変換できるようにする。
 
+Issue #80 のpolicy contract v1は`.depgraph.toml`の`[policy]`を独立した
+`schema_version = "1.0"`でversioningする。各ruleは重複しないstable
+rule ID、rule kind、`warning / error` severity、source / target selector、
+profile / canonical condition、採用するprecision / resolution status、
+必要evidence kindと最小span数を必須とする。depth / fan-in / fan-outだけが
+非負の`threshold.max`を持ち、それ以外のruleにthresholdがあればconfig
+errorとする。
+
+selectorは`package / file / symbol / type / route`、照合field
+`id / path / locator / display_name`、`exact / prefix / glob`、cardinality
+`one / many`を明示する。`one`は0件と複数件をともに曖昧性errorとし、
+暗黙の先頭選択を禁止する。repository path / package scopeを適用してから
+excludeし、scope / excludeが元selectorを広げてはならない。suppressionは
+stable ID、既存rule ID、理由、source / target / profile / conditionの
+少なくとも1つへ限定したscopeを必須とする。
+
+policy result v1はcanonical orderのstable violation ID、rule ID、
+source / target、profile / condition、dependency path、
+repository-relativeな1-origin evidence span、適用suppression、summaryを
+保持する。unsuppressed `error`が1件以上ならexit `1`、warningまたは
+suppressed violationだけならexit `0`とする。unknown schema version /
+rule / property、重複ID、unbounded suppressionはfail closedなconfig error
+（exit `2`）であり、JSON SchemaとRust validatorの両方で同じgolden
+fixtureを検証する。
+
 ## 18. Testing Strategy
 
 ### 18.1 Golden Fixture

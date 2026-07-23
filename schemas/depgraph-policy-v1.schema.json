@@ -1,0 +1,1973 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/TamaT-LLC/depgraph-cli/schemas/depgraph-policy-v1.schema.json",
+  "title": "depgraph architecture policy configuration v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "rules",
+    "suppressions"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "1.0"
+    },
+    "rules": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/rule"
+      }
+    },
+    "suppressions": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/suppression"
+      }
+    }
+  },
+  "$defs": {
+    "contract_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+    },
+    "match_kind": {
+      "enum": [
+        "exact",
+        "prefix",
+        "glob"
+      ]
+    },
+    "match_value": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1024,
+      "pattern": "^[^\\u0000-\\u001F\\u007F-\\u009F]+$"
+    },
+    "normalized_path_value": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/match_value"
+        },
+        {
+          "pattern": "^[^/\\\\]+(?:/[^/\\\\]+)*$"
+        },
+        {
+          "not": {
+            "pattern": "(^|/)\\.\\.?($|/)"
+          }
+        },
+        {
+          "not": {
+            "pattern": "^.:"
+          }
+        }
+      ]
+    },
+    "match_constraints": {
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "match": {
+                "enum": [
+                  "exact",
+                  "prefix"
+                ]
+              }
+            },
+            "required": [
+              "match"
+            ]
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "pattern": "^[^*?\\\\]+$"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "match": {
+                "const": "glob"
+              }
+            },
+            "required": [
+              "match"
+            ]
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "pattern": "^[^\\\\\\[\\]\\{\\}]+$"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "pattern": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "match",
+        "value"
+      ],
+      "properties": {
+        "match": {
+          "$ref": "#/$defs/match_kind"
+        },
+        "value": {
+          "$ref": "#/$defs/match_value"
+        }
+      },
+      "allOf": [
+        {
+          "$ref": "#/$defs/match_constraints"
+        }
+      ]
+    },
+    "path_pattern": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/pattern"
+        },
+        {
+          "properties": {
+            "value": {
+              "$ref": "#/$defs/normalized_path_value"
+            }
+          }
+        }
+      ]
+    },
+    "selector_pattern": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "field",
+        "match",
+        "value"
+      ],
+      "properties": {
+        "field": {
+          "enum": [
+            "id",
+            "path",
+            "locator",
+            "display_name"
+          ]
+        },
+        "match": {
+          "$ref": "#/$defs/match_kind"
+        },
+        "value": {
+          "$ref": "#/$defs/match_value"
+        }
+      },
+      "allOf": [
+        {
+          "$ref": "#/$defs/match_constraints"
+        },
+        {
+          "if": {
+            "properties": {
+              "field": {
+                "const": "id"
+              }
+            },
+            "required": [
+              "field"
+            ]
+          },
+          "then": {
+            "properties": {
+              "match": {
+                "const": "exact"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "field": {
+                "const": "path"
+              }
+            },
+            "required": [
+              "field"
+            ]
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "$ref": "#/$defs/normalized_path_value"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "selector_scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "paths": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/path_pattern"
+          }
+        },
+        "packages": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/pattern"
+          }
+        }
+      }
+    },
+    "selector": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "field",
+        "match",
+        "value",
+        "cardinality"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "package",
+            "file",
+            "symbol",
+            "type",
+            "route"
+          ]
+        },
+        "field": {
+          "enum": [
+            "id",
+            "path",
+            "locator",
+            "display_name"
+          ]
+        },
+        "match": {
+          "$ref": "#/$defs/match_kind"
+        },
+        "value": {
+          "$ref": "#/$defs/match_value"
+        },
+        "cardinality": {
+          "enum": [
+            "one",
+            "many"
+          ]
+        },
+        "exclude": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/selector_pattern"
+          }
+        },
+        "scope": {
+          "$ref": "#/$defs/selector_scope"
+        }
+      },
+      "allOf": [
+        {
+          "$ref": "#/$defs/match_constraints"
+        },
+        {
+          "if": {
+            "properties": {
+              "field": {
+                "const": "id"
+              }
+            },
+            "required": [
+              "field"
+            ]
+          },
+          "then": {
+            "properties": {
+              "match": {
+                "const": "exact"
+              },
+              "cardinality": {
+                "const": "one"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "field": {
+                "const": "path"
+              }
+            },
+            "required": [
+              "field"
+            ]
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "$ref": "#/$defs/normalized_path_value"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "not": {
+                  "const": "file"
+                }
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "field": {
+                "not": {
+                  "const": "path"
+                }
+              },
+              "exclude": {
+                "items": {
+                  "properties": {
+                    "field": {
+                      "not": {
+                        "const": "path"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "profile_filter": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "include": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/pattern"
+          }
+        },
+        "exclude": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/pattern"
+          }
+        }
+      }
+    },
+    "condition_value": {
+      "oneOf": [
+        {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024,
+          "pattern": "^[^\\u0000-\\u001F\\u007F-\\u009F]+$"
+        },
+        {
+          "type": [
+            "number",
+            "boolean",
+            "null"
+          ]
+        }
+      ]
+    },
+    "condition_leaf": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "op",
+            "key",
+            "value"
+          ],
+          "properties": {
+            "op": {
+              "const": "eq"
+            },
+            "key": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9_.:-]{1,128}$"
+            },
+            "value": {
+              "$ref": "#/$defs/condition_value"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "op",
+            "key",
+            "values"
+          ],
+          "properties": {
+            "op": {
+              "const": "in"
+            },
+            "key": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9_.:-]{1,128}$"
+            },
+            "values": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 128,
+              "uniqueItems": true,
+              "items": {
+                "$ref": "#/$defs/condition_value"
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "op",
+            "key"
+          ],
+          "properties": {
+            "op": {
+              "const": "defined"
+            },
+            "key": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9_.:-]{1,128}$"
+            }
+          }
+        }
+      ]
+    },
+    "condition_0": {
+      "$ref": "#/$defs/condition_leaf"
+    },
+    "condition_1": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/condition_leaf"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "op",
+            "conditions"
+          ],
+          "properties": {
+            "op": {
+              "const": "all"
+            },
+            "conditions": {
+              "type": "array",
+              "maxItems": 255,
+              "items": {
+                "$ref": "#/$defs/condition_0"
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "op",
+            "conditions"
+          ],
+          "properties": {
+            "op": {
+              "const": "any"
+            },
+            "conditions": {
+              "type": "array",
+              "maxItems": 255,
+              "items": {
+                "$ref": "#/$defs/condition_0"
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "op",
+            "condition"
+          ],
+          "properties": {
+            "op": {
+              "const": "not"
+            },
+            "condition": {
+              "$ref": "#/$defs/condition_0"
+            }
+          }
+        }
+      ]
+    },
+    "condition_2": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/condition_leaf"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "op",
+            "conditions"
+          ],
+          "properties": {
+            "op": {
+              "const": "all"
+            },
+            "conditions": {
+              "type": "array",
+              "maxItems": 255,
+              "items": {
+                "$ref": "#/$defs/condition_1"
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "op",
+            "conditions"
+          ],
+          "properties": {
+            "op": {
+              "const": "any"
+            },
+            "conditions": {
+              "type": "array",
+              "maxItems": 255,
+              "items": {
+                "$ref": "#/$defs/condition_1"
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "op",
+            "condition"
+          ],
+          "properties": {
+            "op": {
+              "const": "not"
+            },
+            "condition": {
+              "$ref": "#/$defs/condition_1"
+            }
+          }
+        }
+      ]
+    },
+    "condition_3": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/condition_leaf"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "op",
+            "conditions"
+          ],
+          "properties": {
+            "op": {
+              "const": "all"
+            },
+            "conditions": {
+              "type": "array",
+              "maxItems": 255,
+              "items": {
+                "$ref": "#/$defs/condition_2"
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "op",
+            "conditions"
+          ],
+          "properties": {
+            "op": {
+              "const": "any"
+            },
+            "conditions": {
+              "type": "array",
+              "maxItems": 255,
+              "items": {
+                "$ref": "#/$defs/condition_2"
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "op",
+            "condition"
+          ],
+          "properties": {
+            "op": {
+              "const": "not"
+            },
+            "condition": {
+              "$ref": "#/$defs/condition_2"
+            }
+          }
+        }
+      ]
+    },
+    "condition_4": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/condition_leaf"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "op",
+            "conditions"
+          ],
+          "properties": {
+            "op": {
+              "const": "all"
+            },
+            "conditions": {
+              "type": "array",
+              "maxItems": 255,
+              "items": {
+                "$ref": "#/$defs/condition_3"
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "op",
+            "conditions"
+          ],
+          "properties": {
+            "op": {
+              "const": "any"
+            },
+            "conditions": {
+              "type": "array",
+              "maxItems": 255,
+              "items": {
+                "$ref": "#/$defs/condition_3"
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "op",
+            "condition"
+          ],
+          "properties": {
+            "op": {
+              "const": "not"
+            },
+            "condition": {
+              "$ref": "#/$defs/condition_3"
+            }
+          }
+        }
+      ]
+    },
+    "condition_5": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/condition_leaf"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "op",
+            "conditions"
+          ],
+          "properties": {
+            "op": {
+              "const": "all"
+            },
+            "conditions": {
+              "type": "array",
+              "maxItems": 255,
+              "items": {
+                "$ref": "#/$defs/condition_4"
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "op",
+            "conditions"
+          ],
+          "properties": {
+            "op": {
+              "const": "any"
+            },
+            "conditions": {
+              "type": "array",
+              "maxItems": 255,
+              "items": {
+                "$ref": "#/$defs/condition_4"
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "op",
+            "condition"
+          ],
+          "properties": {
+            "op": {
+              "const": "not"
+            },
+            "condition": {
+              "$ref": "#/$defs/condition_4"
+            }
+          }
+        }
+      ]
+    },
+    "condition_6": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/condition_leaf"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "op",
+            "conditions"
+          ],
+          "properties": {
+            "op": {
+              "const": "all"
+            },
+            "conditions": {
+              "type": "array",
+              "maxItems": 255,
+              "items": {
+                "$ref": "#/$defs/condition_5"
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "op",
+            "conditions"
+          ],
+          "properties": {
+            "op": {
+              "const": "any"
+            },
+            "conditions": {
+              "type": "array",
+              "maxItems": 255,
+              "items": {
+                "$ref": "#/$defs/condition_5"
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "op",
+            "condition"
+          ],
+          "properties": {
+            "op": {
+              "const": "not"
+            },
+            "condition": {
+              "$ref": "#/$defs/condition_5"
+            }
+          }
+        }
+      ]
+    },
+    "condition_7": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/condition_leaf"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "op",
+            "conditions"
+          ],
+          "properties": {
+            "op": {
+              "const": "all"
+            },
+            "conditions": {
+              "type": "array",
+              "maxItems": 255,
+              "items": {
+                "$ref": "#/$defs/condition_6"
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "op",
+            "conditions"
+          ],
+          "properties": {
+            "op": {
+              "const": "any"
+            },
+            "conditions": {
+              "type": "array",
+              "maxItems": 255,
+              "items": {
+                "$ref": "#/$defs/condition_6"
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "op",
+            "condition"
+          ],
+          "properties": {
+            "op": {
+              "const": "not"
+            },
+            "condition": {
+              "$ref": "#/$defs/condition_6"
+            }
+          }
+        }
+      ]
+    },
+    "condition_8": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/condition_leaf"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "op",
+            "conditions"
+          ],
+          "properties": {
+            "op": {
+              "const": "all"
+            },
+            "conditions": {
+              "type": "array",
+              "maxItems": 255,
+              "items": {
+                "$ref": "#/$defs/condition_7"
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "op",
+            "conditions"
+          ],
+          "properties": {
+            "op": {
+              "const": "any"
+            },
+            "conditions": {
+              "type": "array",
+              "maxItems": 255,
+              "items": {
+                "$ref": "#/$defs/condition_7"
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "op",
+            "condition"
+          ],
+          "properties": {
+            "op": {
+              "const": "not"
+            },
+            "condition": {
+              "$ref": "#/$defs/condition_7"
+            }
+          }
+        }
+      ]
+    },
+    "condition_9": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/condition_leaf"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "op",
+            "conditions"
+          ],
+          "properties": {
+            "op": {
+              "const": "all"
+            },
+            "conditions": {
+              "type": "array",
+              "maxItems": 255,
+              "items": {
+                "$ref": "#/$defs/condition_8"
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "op",
+            "conditions"
+          ],
+          "properties": {
+            "op": {
+              "const": "any"
+            },
+            "conditions": {
+              "type": "array",
+              "maxItems": 255,
+              "items": {
+                "$ref": "#/$defs/condition_8"
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "op",
+            "condition"
+          ],
+          "properties": {
+            "op": {
+              "const": "not"
+            },
+            "condition": {
+              "$ref": "#/$defs/condition_8"
+            }
+          }
+        }
+      ]
+    },
+    "condition_10": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/condition_leaf"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "op",
+            "conditions"
+          ],
+          "properties": {
+            "op": {
+              "const": "all"
+            },
+            "conditions": {
+              "type": "array",
+              "maxItems": 255,
+              "items": {
+                "$ref": "#/$defs/condition_9"
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "op",
+            "conditions"
+          ],
+          "properties": {
+            "op": {
+              "const": "any"
+            },
+            "conditions": {
+              "type": "array",
+              "maxItems": 255,
+              "items": {
+                "$ref": "#/$defs/condition_9"
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "op",
+            "condition"
+          ],
+          "properties": {
+            "op": {
+              "const": "not"
+            },
+            "condition": {
+              "$ref": "#/$defs/condition_9"
+            }
+          }
+        }
+      ]
+    },
+    "condition_11": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/condition_leaf"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "op",
+            "conditions"
+          ],
+          "properties": {
+            "op": {
+              "const": "all"
+            },
+            "conditions": {
+              "type": "array",
+              "maxItems": 255,
+              "items": {
+                "$ref": "#/$defs/condition_10"
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "op",
+            "conditions"
+          ],
+          "properties": {
+            "op": {
+              "const": "any"
+            },
+            "conditions": {
+              "type": "array",
+              "maxItems": 255,
+              "items": {
+                "$ref": "#/$defs/condition_10"
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "op",
+            "condition"
+          ],
+          "properties": {
+            "op": {
+              "const": "not"
+            },
+            "condition": {
+              "$ref": "#/$defs/condition_10"
+            }
+          }
+        }
+      ]
+    },
+    "condition_12": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/condition_leaf"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "op",
+            "conditions"
+          ],
+          "properties": {
+            "op": {
+              "const": "all"
+            },
+            "conditions": {
+              "type": "array",
+              "maxItems": 255,
+              "items": {
+                "$ref": "#/$defs/condition_11"
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "op",
+            "conditions"
+          ],
+          "properties": {
+            "op": {
+              "const": "any"
+            },
+            "conditions": {
+              "type": "array",
+              "maxItems": 255,
+              "items": {
+                "$ref": "#/$defs/condition_11"
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "op",
+            "condition"
+          ],
+          "properties": {
+            "op": {
+              "const": "not"
+            },
+            "condition": {
+              "$ref": "#/$defs/condition_11"
+            }
+          }
+        }
+      ]
+    },
+    "condition_13": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/condition_leaf"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "op",
+            "conditions"
+          ],
+          "properties": {
+            "op": {
+              "const": "all"
+            },
+            "conditions": {
+              "type": "array",
+              "maxItems": 255,
+              "items": {
+                "$ref": "#/$defs/condition_12"
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "op",
+            "conditions"
+          ],
+          "properties": {
+            "op": {
+              "const": "any"
+            },
+            "conditions": {
+              "type": "array",
+              "maxItems": 255,
+              "items": {
+                "$ref": "#/$defs/condition_12"
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "op",
+            "condition"
+          ],
+          "properties": {
+            "op": {
+              "const": "not"
+            },
+            "condition": {
+              "$ref": "#/$defs/condition_12"
+            }
+          }
+        }
+      ]
+    },
+    "condition_14": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/condition_leaf"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "op",
+            "conditions"
+          ],
+          "properties": {
+            "op": {
+              "const": "all"
+            },
+            "conditions": {
+              "type": "array",
+              "maxItems": 255,
+              "items": {
+                "$ref": "#/$defs/condition_13"
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "op",
+            "conditions"
+          ],
+          "properties": {
+            "op": {
+              "const": "any"
+            },
+            "conditions": {
+              "type": "array",
+              "maxItems": 255,
+              "items": {
+                "$ref": "#/$defs/condition_13"
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "op",
+            "condition"
+          ],
+          "properties": {
+            "op": {
+              "const": "not"
+            },
+            "condition": {
+              "$ref": "#/$defs/condition_13"
+            }
+          }
+        }
+      ]
+    },
+    "condition_15": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/condition_leaf"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "op",
+            "conditions"
+          ],
+          "properties": {
+            "op": {
+              "const": "all"
+            },
+            "conditions": {
+              "type": "array",
+              "maxItems": 255,
+              "items": {
+                "$ref": "#/$defs/condition_14"
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "op",
+            "conditions"
+          ],
+          "properties": {
+            "op": {
+              "const": "any"
+            },
+            "conditions": {
+              "type": "array",
+              "maxItems": 255,
+              "items": {
+                "$ref": "#/$defs/condition_14"
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "op",
+            "condition"
+          ],
+          "properties": {
+            "op": {
+              "const": "not"
+            },
+            "condition": {
+              "$ref": "#/$defs/condition_14"
+            }
+          }
+        }
+      ]
+    },
+    "condition_16": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/condition_leaf"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "op",
+            "conditions"
+          ],
+          "properties": {
+            "op": {
+              "const": "all"
+            },
+            "conditions": {
+              "type": "array",
+              "maxItems": 255,
+              "items": {
+                "$ref": "#/$defs/condition_15"
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "op",
+            "conditions"
+          ],
+          "properties": {
+            "op": {
+              "const": "any"
+            },
+            "conditions": {
+              "type": "array",
+              "maxItems": 255,
+              "items": {
+                "$ref": "#/$defs/condition_15"
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "op",
+            "condition"
+          ],
+          "properties": {
+            "op": {
+              "const": "not"
+            },
+            "condition": {
+              "$ref": "#/$defs/condition_15"
+            }
+          }
+        }
+      ]
+    },
+    "condition": {
+      "$ref": "#/$defs/condition_16"
+    },
+    "tautological_condition": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "op",
+            "conditions"
+          ],
+          "properties": {
+            "op": {
+              "const": "all"
+            },
+            "conditions": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/tautological_condition"
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "op",
+            "conditions"
+          ],
+          "properties": {
+            "op": {
+              "const": "any"
+            },
+            "conditions": {
+              "type": "array",
+              "contains": {
+                "$ref": "#/$defs/tautological_condition"
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "op",
+            "condition"
+          ],
+          "properties": {
+            "op": {
+              "const": "not"
+            },
+            "condition": {
+              "$ref": "#/$defs/contradictory_condition"
+            }
+          }
+        }
+      ]
+    },
+    "contradictory_condition": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "op",
+            "conditions"
+          ],
+          "properties": {
+            "op": {
+              "const": "any"
+            },
+            "conditions": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/contradictory_condition"
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "op",
+            "conditions"
+          ],
+          "properties": {
+            "op": {
+              "const": "all"
+            },
+            "conditions": {
+              "type": "array",
+              "contains": {
+                "$ref": "#/$defs/contradictory_condition"
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "op",
+            "condition"
+          ],
+          "properties": {
+            "op": {
+              "const": "not"
+            },
+            "condition": {
+              "$ref": "#/$defs/tautological_condition"
+            }
+          }
+        }
+      ]
+    },
+    "restrictive_condition": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/condition"
+        },
+        {
+          "not": {
+            "$ref": "#/$defs/tautological_condition"
+          }
+        }
+      ]
+    },
+    "evidence_requirement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kinds",
+        "minimum_spans",
+        "primary_only"
+      ],
+      "properties": {
+        "kinds": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "source",
+              "semantic",
+              "build",
+              "runtime"
+            ]
+          }
+        },
+        "minimum_spans": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295
+        },
+        "primary_only": {
+          "type": "boolean"
+        }
+      }
+    },
+    "threshold": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "max"
+      ],
+      "properties": {
+        "max": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        }
+      }
+    },
+    "rule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "kind",
+        "severity",
+        "source",
+        "target",
+        "profiles",
+        "condition",
+        "precisions",
+        "resolution_statuses",
+        "evidence"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/contract_id"
+        },
+        "kind": {
+          "enum": [
+            "layer_boundary",
+            "forbidden_dependency",
+            "cycle",
+            "dependency_depth",
+            "fan_in",
+            "fan_out",
+            "public_api_change",
+            "runtime_boundary"
+          ]
+        },
+        "severity": {
+          "enum": [
+            "warning",
+            "error"
+          ]
+        },
+        "source": {
+          "$ref": "#/$defs/selector"
+        },
+        "target": {
+          "$ref": "#/$defs/selector"
+        },
+        "profiles": {
+          "$ref": "#/$defs/profile_filter"
+        },
+        "condition": {
+          "$ref": "#/$defs/condition"
+        },
+        "precisions": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "exact",
+              "overapprox",
+              "heuristic",
+              "observed"
+            ]
+          }
+        },
+        "resolution_statuses": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "resolved",
+              "candidates",
+              "external",
+              "unresolved"
+            ]
+          }
+        },
+        "evidence": {
+          "$ref": "#/$defs/evidence_requirement"
+        },
+        "threshold": {
+          "$ref": "#/$defs/threshold"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "enum": [
+                  "dependency_depth",
+                  "fan_in",
+                  "fan_out"
+                ]
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "required": [
+              "threshold"
+            ]
+          },
+          "else": {
+            "not": {
+              "required": [
+                "threshold"
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "cycle"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "oneOf": [
+              {
+                "properties": {
+                  "source": {
+                    "properties": {
+                      "kind": {
+                        "const": "package"
+                      }
+                    }
+                  },
+                  "target": {
+                    "properties": {
+                      "kind": {
+                        "const": "package"
+                      }
+                    }
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "source": {
+                    "properties": {
+                      "kind": {
+                        "const": "file"
+                      }
+                    }
+                  },
+                  "target": {
+                    "properties": {
+                      "kind": {
+                        "const": "file"
+                      }
+                    }
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "source": {
+                    "properties": {
+                      "kind": {
+                        "const": "symbol"
+                      }
+                    }
+                  },
+                  "target": {
+                    "properties": {
+                      "kind": {
+                        "const": "symbol"
+                      }
+                    }
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "source": {
+                    "properties": {
+                      "kind": {
+                        "const": "type"
+                      }
+                    }
+                  },
+                  "target": {
+                    "properties": {
+                      "kind": {
+                        "const": "type"
+                      }
+                    }
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "source": {
+                    "properties": {
+                      "kind": {
+                        "const": "route"
+                      }
+                    }
+                  },
+                  "target": {
+                    "properties": {
+                      "kind": {
+                        "const": "route"
+                      }
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        }
+      ]
+    },
+    "suppression_scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "source": {
+          "$ref": "#/$defs/selector"
+        },
+        "target": {
+          "$ref": "#/$defs/selector"
+        },
+        "profiles": {
+          "$ref": "#/$defs/profile_filter"
+        },
+        "condition": {
+          "$ref": "#/$defs/condition"
+        }
+      },
+      "anyOf": [
+        {
+          "required": [
+            "source"
+          ]
+        },
+        {
+          "required": [
+            "target"
+          ]
+        },
+        {
+          "required": [
+            "condition"
+          ],
+          "properties": {
+            "condition": {
+              "$ref": "#/$defs/restrictive_condition"
+            }
+          }
+        },
+        {
+          "required": [
+            "profiles"
+          ],
+          "properties": {
+            "profiles": {
+              "anyOf": [
+                {
+                  "required": [
+                    "include"
+                  ],
+                  "properties": {
+                    "include": {
+                      "minItems": 1
+                    }
+                  }
+                },
+                {
+                  "required": [
+                    "exclude"
+                  ],
+                  "properties": {
+                    "exclude": {
+                      "minItems": 1
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "suppression": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "rule_id",
+        "reason",
+        "scope"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/contract_id"
+        },
+        "rule_id": {
+          "$ref": "#/$defs/contract_id"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024,
+          "pattern": "^[^\\u0000-\\u001F\\u007F-\\u009F]+$"
+        },
+        "scope": {
+          "$ref": "#/$defs/suppression_scope"
+        }
+      }
+    }
+  }
+}
