@@ -526,6 +526,7 @@ pub struct DaemonScanOutcome {
     pub completed_snapshot_id: Option<String>,
     pub base_snapshot_id: Option<String>,
     pub invalidation_plan: Option<IncrementalInvalidationPlan>,
+    pub invalidation_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -539,6 +540,7 @@ pub struct DaemonAttempt {
     pub base_snapshot_id: Option<String>,
     pub completed_snapshot_id: Option<String>,
     pub invalidation_plan: Option<IncrementalInvalidationPlan>,
+    pub invalidation_error: Option<String>,
     pub error: Option<String>,
 }
 
@@ -599,19 +601,26 @@ impl DaemonScanRunner for RepositoryScanRunner {
                     completed_snapshot_id: None,
                     base_snapshot_id: None,
                     invalidation_plan: None,
+                    invalidation_error: None,
                 });
             }
             let mut store = open_store(&store_path)?;
             let base_snapshot_id = store.current_snapshot_id()?;
-            let invalidation_plan = if let Some(base_snapshot_id) = base_snapshot_id.as_deref() {
+            let (invalidation_plan, invalidation_error) = if let Some(base_snapshot_id) =
+                base_snapshot_id.as_deref()
+            {
                 let snapshot = store.load_completed_snapshot(base_snapshot_id)?;
-                Some(plan_incremental_invalidation(
-                    base_snapshot_id,
-                    &snapshot,
-                    &request.changes,
-                )?)
+                match plan_incremental_invalidation(base_snapshot_id, &snapshot, &request.changes) {
+                    Ok(plan) => (Some(plan), None),
+                    Err(error) => (
+                        None,
+                        Some(format!(
+                            "incremental planner failed; full scan used: {error:#}"
+                        )),
+                    ),
+                }
             } else {
-                None
+                (None, None)
             };
             // Workers currently emit repository-complete protocols. The daemon
             // still feeds every coalesced batch through the incremental planner,
@@ -636,6 +645,7 @@ impl DaemonScanRunner for RepositoryScanRunner {
                 completed_snapshot_id,
                 base_snapshot_id,
                 invalidation_plan,
+                invalidation_error,
             })
         })
     }
@@ -995,6 +1005,7 @@ fn record_attempt(
             base_snapshot_id: outcome.base_snapshot_id,
             completed_snapshot_id: outcome.completed_snapshot_id,
             invalidation_plan: outcome.invalidation_plan,
+            invalidation_error: outcome.invalidation_error,
             error: None,
         },
         Err(error) => DaemonAttempt {
@@ -1007,6 +1018,7 @@ fn record_attempt(
             base_snapshot_id: None,
             completed_snapshot_id: None,
             invalidation_plan: None,
+            invalidation_error: None,
             error: Some(format!("{error:#}")),
         },
     };
@@ -1052,6 +1064,7 @@ mod tests {
                     completed_snapshot_id: Some("fixture-snapshot".to_owned()),
                     base_snapshot_id: None,
                     invalidation_plan: None,
+                    invalidation_error: None,
                 })
             })
         }
@@ -1080,6 +1093,7 @@ mod tests {
                     completed_snapshot_id: None,
                     base_snapshot_id: Some("stable-snapshot".to_owned()),
                     invalidation_plan: None,
+                    invalidation_error: None,
                 })
             })
         }
@@ -1181,6 +1195,44 @@ mod tests {
                 relative_path: "src/lib.rs".to_owned(),
                 kind: WatchPathKind::Source,
             })
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn planner_failure_is_reported_without_skipping_the_full_scan_fallback() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let store_path = root.path().join("graph.db");
+        let config = Config::default();
+        let mut store = open_store(&store_path)?;
+        crate::run_scan(&mut store, root.path().to_path_buf(), &config, false).await?;
+        drop(store);
+
+        let runner =
+            RepositoryScanRunner::new(root.path().to_path_buf(), store_path, config, false);
+        let outcome = runner
+            .run(
+                DaemonScanRequest {
+                    attempt_id: "planner-fallback".to_owned(),
+                    changes: vec![IncrementalFileChange {
+                        kind: crate::IncrementalChangeKind::Added,
+                        old_path: Some("invalid-shape.rs".to_owned()),
+                        new_path: None,
+                    }],
+                    started_at: timestamp(),
+                },
+                CancellationToken::new(),
+            )
+            .await?;
+
+        assert_eq!(outcome.status, "completed");
+        assert!(outcome.completed_snapshot_id.is_some());
+        assert!(outcome.invalidation_plan.is_none());
+        assert!(
+            outcome
+                .invalidation_error
+                .as_deref()
+                .is_some_and(|error| error.contains("incremental planner failed"))
         );
         Ok(())
     }

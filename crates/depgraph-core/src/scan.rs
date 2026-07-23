@@ -226,7 +226,14 @@ pub async fn run_scan_with_cache_mode_and_cancellation(
                                 if cancellation.is_cancelled() {
                                     return cancel_scan(store, &scan_id);
                                 }
-                                return complete_scan(store, &scan_id, strict, config, None);
+                                return complete_scan(
+                                    store,
+                                    &scan_id,
+                                    strict,
+                                    config,
+                                    None,
+                                    &cancellation,
+                                );
                             }
                             Err(_) => {
                                 store.record_cache_event(
@@ -385,7 +392,14 @@ pub async fn run_scan_with_cache_mode_and_cancellation(
         return cancel_scan(store, &scan_id);
     }
 
-    complete_scan(store, &scan_id, strict, config, cache_plan.as_ref())
+    complete_scan(
+        store,
+        &scan_id,
+        strict,
+        config,
+        cache_plan.as_ref(),
+        &cancellation,
+    )
 }
 
 fn cancel_scan(store: &mut Store, scan_id: &str) -> Result<ScanOutcome> {
@@ -399,6 +413,7 @@ fn complete_scan(
     strict: bool,
     config: &Config,
     cache_plan: Option<&ScanCachePlan>,
+    cancellation: &CancellationToken,
 ) -> Result<ScanOutcome> {
     if let Err(error) = store.validate_scan(scan_id) {
         add_core_diagnostic(
@@ -438,7 +453,12 @@ fn complete_scan(
         return snapshot_outcome(store, scan_id, 1);
     }
 
-    store.finish_scan(scan_id, "completed", None, true)?;
+    let Some(promotion) =
+        cancellation.run_if_active(|| store.finish_scan(scan_id, "completed", None, true))
+    else {
+        return cancel_scan(store, scan_id);
+    };
+    promotion?;
     if let Some(plan) = cache_plan {
         let snapshot_id = store
             .snapshot_id_for_source("scan", scan_id)?

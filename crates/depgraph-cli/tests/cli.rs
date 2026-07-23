@@ -1477,6 +1477,51 @@ fn daemon_cli_reports_completed_attempt_and_stops_cleanly() {
 }
 
 #[test]
+fn daemon_stop_rejects_stale_status_without_waiting_for_the_timeout() {
+    use std::{process::Stdio, thread, time::Duration};
+
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let store_path = cache.path().join("graph.db");
+    let status_path = cache.path().join("graph.db.daemon-status.json");
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_depgraph"))
+        .args([
+            "--store",
+            store_path.to_str().unwrap(),
+            "daemon",
+            "start",
+            root.path().to_str().unwrap(),
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    for _ in 0..1_000 {
+        if status_path.exists() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(status_path.exists(), "daemon did not publish its status");
+    child.kill().unwrap();
+    child.wait().unwrap();
+
+    Command::cargo_bin("depgraph")
+        .unwrap()
+        .args([
+            "--store",
+            store_path.to_str().unwrap(),
+            "daemon",
+            "stop",
+            root.path().to_str().unwrap(),
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("daemon status").and(predicate::str::contains("stale")));
+}
+
+#[test]
 fn failed_rust_build_correlation_finalizes_the_attempt_without_promoting_a_delta() {
     let root = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();

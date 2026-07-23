@@ -1,5 +1,5 @@
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
 
@@ -14,6 +14,7 @@ pub struct CancellationToken {
 struct CancellationState {
     cancelled: AtomicBool,
     changed: watch::Sender<bool>,
+    completion: Mutex<()>,
 }
 
 impl Default for CancellationState {
@@ -22,6 +23,7 @@ impl Default for CancellationState {
         Self {
             cancelled: AtomicBool::new(false),
             changed,
+            completion: Mutex::new(()),
         }
     }
 }
@@ -32,6 +34,11 @@ impl CancellationToken {
     }
 
     pub fn cancel(&self) -> bool {
+        let _completion = self
+            .inner
+            .completion
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let was_cancelled = self.inner.cancelled.swap(true, Ordering::AcqRel);
         if !was_cancelled {
             self.inner.changed.send_replace(true);
@@ -52,6 +59,15 @@ impl CancellationToken {
                 .expect("cancellation sender is retained by the token");
         }
     }
+
+    pub(crate) fn run_if_active<T>(&self, operation: impl FnOnce() -> T) -> Option<T> {
+        let _completion = self
+            .inner
+            .completion
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (!self.is_cancelled()).then(operation)
+    }
 }
 
 #[cfg(test)]
@@ -71,5 +87,13 @@ mod tests {
         waiter.await.unwrap();
         token.cancelled().await;
         assert!(token.is_cancelled());
+    }
+
+    #[test]
+    fn completion_and_cancellation_have_one_linearization_point() {
+        let token = CancellationToken::new();
+        assert_eq!(token.run_if_active(|| "promoted"), Some("promoted"));
+        assert!(token.cancel());
+        assert_eq!(token.run_if_active(|| "too late"), None);
     }
 }
