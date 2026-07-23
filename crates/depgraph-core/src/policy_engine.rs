@@ -141,6 +141,11 @@ pub fn evaluate_policy_diff(
         return Ok(current);
     }
     let diff = diff_graph_snapshots(from_snapshot_id, to_snapshot_id, from.clone(), to.clone())?;
+    let rename_pairs: Vec<_> = diff
+        .renames
+        .iter()
+        .map(|rename| (rename.old_id.as_str(), rename.new_id.as_str()))
+        .collect();
     let mut violations: BTreeMap<_, _> = current
         .violations
         .into_iter()
@@ -156,7 +161,7 @@ pub fn evaluate_policy_diff(
         .filter(|rule| rule.kind == PolicyRuleKind::PublicApiChange)
     {
         validate_diff_selector(from, to, &rule.target, &rule.id)?;
-        let suppressions = resolve_diff_suppressions(from, to, config, &rule.id)?;
+        let suppressions = resolve_diff_suppressions(from, to, &rename_pairs, config, &rule.id)?;
         let admitted = admitted_edges_with_options(from, rule, false, false)?;
         let mut rule_changes = Vec::new();
 
@@ -297,6 +302,7 @@ fn validate_diff_selector(
 fn resolve_diff_suppressions<'a>(
     from: &GraphSnapshot,
     to: &GraphSnapshot,
+    rename_pairs: &[(&str, &str)],
     config: &'a PolicyConfig,
     rule_id: &str,
 ) -> Result<Vec<ResolvedSuppression<'a>>> {
@@ -314,6 +320,7 @@ fn resolve_diff_suppressions<'a>(
                 resolve_diff_scope_selector(
                     from,
                     to,
+                    rename_pairs,
                     selector,
                     &format!("suppression {:?} source", suppression.id),
                 )
@@ -327,6 +334,7 @@ fn resolve_diff_suppressions<'a>(
                 resolve_diff_scope_selector(
                     from,
                     to,
+                    rename_pairs,
                     selector,
                     &format!("suppression {:?} target", suppression.id),
                 )
@@ -345,6 +353,7 @@ fn resolve_diff_suppressions<'a>(
 fn resolve_diff_scope_selector(
     from: &GraphSnapshot,
     to: &GraphSnapshot,
+    rename_pairs: &[(&str, &str)],
     selector: &PolicySelector,
     description: &str,
 ) -> Result<BTreeSet<String>> {
@@ -367,11 +376,18 @@ fn resolve_diff_scope_selector(
             after.len()
         );
     }
-    Ok(before
+    let mut ids: BTreeSet<_> = before
         .into_iter()
         .chain(after)
         .map(|node| node.id.clone())
-        .collect())
+        .collect();
+    for (old_id, new_id) in rename_pairs {
+        if ids.contains(*old_id) || ids.contains(*new_id) {
+            ids.insert((*old_id).to_owned());
+            ids.insert((*new_id).to_owned());
+        }
+    }
+    Ok(ids)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -476,13 +492,10 @@ fn evaluate_public_api_impact(
     from: &GraphSnapshot,
     to: &GraphSnapshot,
 ) -> Result<Vec<PolicyViolation>> {
+    let baseline_profile_id = node_profile_id(before);
     let mut by_profile: BTreeMap<&str, Vec<&AdmittedEdge<'_>>> = BTreeMap::new();
     for item in admitted {
-        if change
-            .profile_id
-            .as_deref()
-            .is_none_or(|profile_id| item.edge.profile_id == profile_id)
-        {
+        if baseline_profile_id.is_none_or(|profile_id| item.edge.profile_id == profile_id) {
             by_profile
                 .entry(item.edge.profile_id.as_str())
                 .or_default()
@@ -532,7 +545,7 @@ fn evaluate_public_api_impact(
             change,
             source,
             before,
-            change.profile_id.as_deref(),
+            baseline_profile_id,
             Vec::new(),
             nodes,
             suppressions,
@@ -577,6 +590,7 @@ fn make_public_api_violation(
             .flat_map(|item| item.evidence.iter().cloned())
             .collect(),
     );
+    canonicalize_evidence(&mut evidence);
     let mut conditions = vec![change.condition.clone()];
     if !path_edges.is_empty() {
         conditions.push(combined_condition(&path_edges)?);
@@ -1527,11 +1541,8 @@ fn public_api_change_context(
         context.insert("profile".to_owned(), Value::String(profile.id.clone()));
         context.insert("profile_id".to_owned(), Value::String(profile.id.clone()));
     }
-    if let Some(after) = after {
-        merge_object(&mut context, &after.properties);
-    }
-    if let Some(before) = before {
-        merge_object(&mut context, &before.properties);
+    if let Some(node) = after.or(before) {
+        merge_object(&mut context, &node.properties);
     }
     context.insert(
         "change".to_owned(),
@@ -2592,6 +2603,145 @@ mod tests {
         )?;
         assert_eq!(suppressed.summary.suppressed, 1);
         assert_eq!(suppressed.exit_code, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn public_api_diff_uses_baseline_profile_and_current_properties() -> Result<()> {
+        let consumer = semantic_node(
+            "consumer",
+            "symbol",
+            "src/consumer.ts",
+            json!({"signature":"consumer-v1"}),
+        );
+        let api_v1 = semantic_node(
+            "public-api",
+            "symbol",
+            "z/public.ts",
+            json!({"signature":"v1","legacy_only":true}),
+        );
+        let api_v2 = semantic_node(
+            "public-api",
+            "symbol",
+            "z/public.ts",
+            json!({"signature":"v2","profile_id":"profile:development"}),
+        );
+        let dependency = edge(
+            "consumer-imports-api",
+            "consumer",
+            "public-api",
+            "profile:production",
+        );
+        let mut baseline = snapshot(vec![dependency.clone()]);
+        baseline.nodes = vec![api_v1, consumer.clone()];
+        let mut changed = snapshot(vec![dependency]);
+        changed.nodes = vec![api_v2, consumer];
+
+        let mut public_rule = rule(PolicyRuleKind::PublicApiChange);
+        public_rule.id = "stable-public-api".to_owned();
+        public_rule.source = PolicySelector {
+            kind: PolicySelectorKind::Symbol,
+            field: PolicySelectorField::Id,
+            match_kind: PolicyMatchKind::Exact,
+            value: "consumer".to_owned(),
+            cardinality: PolicySelectorCardinality::One,
+            exclude: Vec::new(),
+            scope: PolicySelectorScope::default(),
+        };
+        public_rule.target = PolicySelector {
+            kind: PolicySelectorKind::Symbol,
+            field: PolicySelectorField::Id,
+            match_kind: PolicyMatchKind::Exact,
+            value: "public-api".to_owned(),
+            cardinality: PolicySelectorCardinality::One,
+            exclude: Vec::new(),
+            scope: PolicySelectorScope::default(),
+        };
+        public_rule.profiles = PolicyProfileFilter::default();
+        public_rule.condition = PolicyCondition::Not {
+            condition: Box::new(PolicyCondition::Defined {
+                key: "legacy_only".to_owned(),
+            }),
+        };
+
+        let result = evaluate_policy_diff(
+            "baseline",
+            &baseline,
+            "changed-profile",
+            &changed,
+            &config(public_rule),
+        )?;
+
+        assert_eq!(result.api_changes.len(), 1);
+        assert_eq!(result.violations.len(), 1);
+        assert_eq!(
+            result.violations[0].profile_id.as_deref(),
+            Some("profile:production")
+        );
+        assert_eq!(
+            result.violations[0]
+                .evidence
+                .iter()
+                .map(|span| span.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["src/source.ts", "z/public.ts"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn diff_suppression_follows_confirmed_rename_identity() -> Result<()> {
+        let old_api = semantic_node(
+            "public-api-v1",
+            "symbol",
+            "src/public.ts",
+            json!({"signature":"v1"}),
+        );
+        let new_api = semantic_node(
+            "public-api-v2",
+            "symbol",
+            "src/public.ts",
+            json!({"signature":"v2"}),
+        );
+        let mut from = snapshot(Vec::new());
+        from.nodes = vec![old_api];
+        let mut to = snapshot(Vec::new());
+        to.nodes = vec![new_api];
+        let mut policy = config(rule(PolicyRuleKind::PublicApiChange));
+        policy.suppressions.push(PolicySuppression {
+            id: "allow-renamed-api".to_owned(),
+            rule_id: "fixture-rule".to_owned(),
+            reason: "versioned migration".to_owned(),
+            scope: PolicySuppressionScope {
+                target: Some(PolicySelector {
+                    kind: PolicySelectorKind::Symbol,
+                    field: PolicySelectorField::Id,
+                    match_kind: PolicyMatchKind::Exact,
+                    value: "public-api-v2".to_owned(),
+                    cardinality: PolicySelectorCardinality::One,
+                    exclude: Vec::new(),
+                    scope: PolicySelectorScope::default(),
+                }),
+                ..PolicySuppressionScope::default()
+            },
+        });
+        let rename_pairs = [("public-api-v1", "public-api-v2")];
+
+        let suppressions =
+            resolve_diff_suppressions(&from, &to, &rename_pairs, &policy, "fixture-rule")?;
+        let applied = applied_suppression(
+            &suppressions,
+            "fixture-rule",
+            "consumer",
+            "public-api-v1",
+            Some("profile:production"),
+            &BTreeMap::new(),
+        );
+
+        assert_eq!(
+            applied.as_ref().map(|value| value.id.as_str()),
+            Some("allow-renamed-api")
+        );
         Ok(())
     }
 

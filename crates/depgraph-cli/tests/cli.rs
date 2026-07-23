@@ -1077,8 +1077,13 @@ evidence = { kinds = ["source"], minimum_spans = 1, primary_only = true }
         "edge:consumer-public-api"
     );
     assert_eq!(
-        report["data"]["result"]["violations"][0]["evidence"][0]["path"],
-        "src/public.go"
+        report["data"]["result"]["violations"][0]["evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|span| span["path"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["src/consumer.go", "src/public.go"]
     );
     assert_eq!(report["data"]["result"]["exit_code"], 1);
 
@@ -1086,7 +1091,7 @@ evidence = { kinds = ["source"], minimum_spans = 1, primary_only = true }
     assert_eq!(annotations.status.code(), Some(1));
     let annotations = String::from_utf8(annotations.stdout).unwrap();
     assert!(annotations.starts_with(
-        "::error file=src/public.go,line=5,col=1,endLine=5,endColumn=24,title=depgraph policy stable-public-api::"
+        "::error file=src/consumer.go,line=3,col=1,endLine=3,endColumn=20,title=depgraph policy stable-public-api::"
     ));
     assert!(!annotations.contains(&root.path().to_string_lossy().to_string()));
     assert!(!annotations.contains("super-secret-value"));
