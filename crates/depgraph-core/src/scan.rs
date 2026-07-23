@@ -186,8 +186,14 @@ pub async fn run_scan_with_cache_mode_and_cancellation(
                 &format!("{error:#}"),
                 "workspace-detection-failed",
             )?;
-            store.finish_scan(&scan_id, "failed", Some(&error.to_string()), false)?;
-            return snapshot_outcome(store, &scan_id, 3);
+            return finish_non_promoted_scan(
+                store,
+                &scan_id,
+                "failed",
+                Some(&error.to_string()),
+                3,
+                &cancellation,
+            );
         }
     };
     if cancellation.is_cancelled() {
@@ -368,7 +374,8 @@ pub async fn run_scan_with_cache_mode_and_cancellation(
             store.mark_coverage_incomplete(&scan_id, &failure.stable_identity())?;
         }
         let security_violation = failures.iter().any(|failure| failure.security_violation);
-        store.finish_scan(
+        return finish_non_promoted_scan(
+            store,
             &scan_id,
             if security_violation {
                 "security_failed"
@@ -376,9 +383,9 @@ pub async fn run_scan_with_cache_mode_and_cancellation(
                 "partial"
             },
             Some(&summary),
-            false,
-        )?;
-        return snapshot_outcome(store, &scan_id, if security_violation { 4 } else { 3 });
+            if security_violation { 4 } else { 3 },
+            &cancellation,
+        );
     }
 
     if let (Some(expected), Some(workers)) = (cache_plan.take(), cache_workers.as_deref()) {
@@ -423,6 +430,9 @@ fn complete_scan(
     cache_plan: Option<&ScanCachePlan>,
     cancellation: &CancellationToken,
 ) -> Result<ScanOutcome> {
+    if cancellation.is_cancelled() {
+        return cancel_scan(store, scan_id);
+    }
     if let Err(error) = store.validate_scan(scan_id) {
         add_core_diagnostic(
             store,
@@ -432,8 +442,14 @@ fn complete_scan(
             &format!("{error:#}"),
             "graph-validation-failed",
         )?;
-        store.finish_scan(scan_id, "failed", Some(&error.to_string()), false)?;
-        return snapshot_outcome(store, scan_id, 3);
+        return finish_non_promoted_scan(
+            store,
+            scan_id,
+            "failed",
+            Some(&error.to_string()),
+            3,
+            cancellation,
+        );
     }
 
     let coverage = store.load_snapshot(scan_id)?.coverage;
@@ -457,8 +473,14 @@ fn complete_scan(
             &message,
             "strict-policy",
         )?;
-        store.finish_scan(scan_id, "policy_failed", Some(&message), false)?;
-        return snapshot_outcome(store, scan_id, 1);
+        return finish_non_promoted_scan(
+            store,
+            scan_id,
+            "policy_failed",
+            Some(&message),
+            1,
+            cancellation,
+        );
     }
 
     // Load everything required for the successful outcome before promotion. Once
@@ -491,6 +513,23 @@ fn complete_scan(
         ),
     }
     Ok(outcome)
+}
+
+fn finish_non_promoted_scan(
+    store: &mut Store,
+    scan_id: &str,
+    status: &str,
+    error: Option<&str>,
+    exit_code: u8,
+    cancellation: &CancellationToken,
+) -> Result<ScanOutcome> {
+    let Some(completion) =
+        cancellation.run_if_active(|| store.finish_scan(scan_id, status, error, false))
+    else {
+        return cancel_scan(store, scan_id);
+    };
+    completion?;
+    snapshot_outcome(store, scan_id, exit_code)
 }
 
 fn store_completed_scan_cache(
@@ -776,6 +815,30 @@ mod tests {
         assert_eq!(outcome.exit_code, 0);
         assert_eq!(store.scan(scan_id)?.unwrap().status, "completed");
         assert!(store.snapshot_id_for_source("scan", scan_id)?.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn cancellation_preempts_validation_failure_finalization() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let mut store = Store::open_in_memory()?;
+        let scan_id = "cancelled-invalid-scan";
+        store.start_scan(scan_id, root.path(), false)?;
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+
+        let outcome = complete_scan(
+            &mut store,
+            scan_id,
+            false,
+            &Config::default(),
+            None,
+            &cancellation,
+        )?;
+
+        assert_eq!(outcome.status, "cancelled");
+        assert_eq!(outcome.exit_code, 3);
+        assert_eq!(store.scan(scan_id)?.unwrap().status, "cancelled");
         Ok(())
     }
 
