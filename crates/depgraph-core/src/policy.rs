@@ -515,7 +515,7 @@ impl PolicyCondition {
                 for value in values {
                     validate_condition_value(value)?;
                 }
-                validate_unique("in condition values", values)?;
+                validate_unique_condition_values(values)?;
             }
             Self::Defined { key } => validate_condition_key(key)?,
         }
@@ -1037,6 +1037,34 @@ fn validate_condition_value(value: &Value) -> Result<()> {
     Ok(())
 }
 
+fn validate_unique_condition_values(values: &[Value]) -> Result<()> {
+    for (index, value) in values.iter().enumerate() {
+        if values[..index]
+            .iter()
+            .any(|existing| condition_values_equal(existing, value))
+        {
+            bail!("in condition values must not contain duplicates");
+        }
+    }
+    Ok(())
+}
+
+fn condition_values_equal(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Number(left), Value::Number(right)) => match (left.as_i128(), right.as_i128()) {
+            (Some(left), Some(right)) => left == right,
+            (Some(integer), None) => right
+                .as_f64()
+                .is_some_and(|float| float.fract() == 0.0 && integer == float as i128),
+            (None, Some(integer)) => left
+                .as_f64()
+                .is_some_and(|float| float.fract() == 0.0 && float as i128 == integer),
+            (None, None) => left.as_f64() == right.as_f64(),
+        },
+        _ => left == right,
+    }
+}
+
 fn validate_unique<T>(name: &str, values: &[T]) -> Result<()>
 where
     T: Serialize,
@@ -1236,6 +1264,16 @@ mod tests {
                 "JSON Schema accepted an invalid condition string"
             );
         }
+
+        let mut duplicate_numeric_values = value.clone();
+        duplicate_numeric_values["rules"][0]["condition"] =
+            json!({"op": "in", "key": "feature", "values": [1, 1.0]});
+        let policy: PolicyConfig = serde_json::from_value(duplicate_numeric_values.clone())?;
+        assert!(policy.validate().is_err());
+        assert!(
+            validator.validate(&duplicate_numeric_values).is_err(),
+            "JSON Schema accepted mathematically equal numeric condition values"
+        );
 
         let mut unsafe_reason = value.clone();
         unsafe_reason["suppressions"][0]["reason"] = json!("annotation\nbreak");
