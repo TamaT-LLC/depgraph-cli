@@ -991,7 +991,7 @@ fn validate_repository_path(name: &str, value: &str) -> Result<()> {
     if value.starts_with('/')
         || value.ends_with('/')
         || value.contains('\\')
-        || value.as_bytes().get(1) == Some(&b':')
+        || value.chars().nth(1) == Some(':')
         || value
             .split('/')
             .any(|component| component.is_empty() || matches!(component, "." | ".."))
@@ -1188,6 +1188,7 @@ mod tests {
             json!({"match": "exact", "value": "src/*.ts"}),
             json!({"match": "exact", "value": "src\\secret.ts"}),
             json!({"match": "exact", "value": "C:/src/app.ts"}),
+            json!({"match": "exact", "value": "é:/src/app.ts"}),
         ] {
             let mut invalid = value.clone();
             invalid["rules"][0]["source"]["match"] = invalid_path["match"].clone();
