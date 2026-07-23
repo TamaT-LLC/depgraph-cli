@@ -35,10 +35,11 @@ unresolved, semantic-issue, and compiler diagnostic counts, and
 `project_code_executed=false`. Candidate and external Web sites are allowed.
 Detected Next.js, Astro, TanStack Router, and TanStack Start profiles must also
 complete their versioned framework semantic capability ledger. Code-based
-routes beyond the safe static boundary, runtime traces, watcher-driven
-incremental invalidation, and architecture policies remain later milestones.
-The supervised build protocol, atomic evidence union foundation, and validated
-syntax/semantic/build cache storage are available separately.
+routes beyond the safe static boundary, runtime traces, the watcher/daemon
+frontend, and architecture policies remain later milestones. The supervised
+build protocol, atomic evidence union foundation, validated syntax/semantic/build
+cache storage, and transactional incremental invalidation planner are available
+separately.
 
 ## Build
 

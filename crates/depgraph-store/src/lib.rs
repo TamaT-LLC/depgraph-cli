@@ -15,6 +15,7 @@ use serde_json::{Value, json};
 
 mod cache;
 mod diff;
+mod incremental;
 mod profile_matrix;
 
 pub use cache::{
@@ -25,6 +26,7 @@ pub use diff::{
     ChangedRecord, GraphSnapshotDiff, NodeRename, NodeRenameEvidence, RecordDiff, RenameConfidence,
     SNAPSHOT_DIFF_SCHEMA_VERSION, diff_graph_snapshots,
 };
+pub use incremental::IncrementalReplacementScope;
 use profile_matrix::refresh_profile_matrix;
 pub use profile_matrix::{
     PROFILE_MATRIX_SCHEMA_VERSION, PhaseCoverageRecord, ProfileAxisConflictRecord,

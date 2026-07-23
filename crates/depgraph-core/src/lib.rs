@@ -4,6 +4,7 @@ pub mod cache;
 pub mod config;
 pub mod export;
 pub mod impact;
+pub mod incremental;
 pub mod query;
 pub mod rust_build_observer;
 pub mod scan;
@@ -38,6 +39,11 @@ pub use export::{ExportFormat, export};
 pub use impact::{
     ChangedNodeMapping, GitChange, GitChangedSet, ImpactDiagnostic, ImpactFilters, ImpactNode,
     ImpactResult, impact, map_changed_set, read_git_changed_set,
+};
+pub use incremental::{
+    INCREMENTAL_PLAN_SCHEMA_VERSION, IncrementalChangeKind, IncrementalFileChange,
+    IncrementalInvalidationMode, IncrementalInvalidationPlan, IncrementalInvalidationReason,
+    plan_incremental_invalidation,
 };
 pub use query::{
     CycleLevel, CycleResult, TraversalResult, UnresolvedResult, WhyResult, cycles,
