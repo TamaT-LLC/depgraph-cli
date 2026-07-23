@@ -118,8 +118,8 @@ fn seed_runtime_trace_snapshot(store_path: &Path, root: &Path) {
         "files_discovered": 0,
         "files_analyzed": 0,
         "files_skipped": 0,
-        "dependency_sites": 0,
-        "resolved": 0,
+        "dependency_sites": 1,
+        "resolved": 1,
         "candidates": 0,
         "external": 0,
         "unresolved": 0,
@@ -186,11 +186,34 @@ fn seed_runtime_trace_snapshot(store_path: &Path, root: &Path) {
         event["node"] = node;
         store.ingest_event(&event).unwrap();
     }
-    let mut profile_completed = common("profile_completed", 6);
+    let evidence = json!([{
+        "kind":"source","extractor":"fixture","extractor_version":"1.0",
+        "path":"src/server.ts","start_line":1,"start_column":1,
+        "end_line":1,"end_column":8,"detail":"static dependency","properties":{}
+    }]);
+    let mut site = common("dependency_site", 6);
+    site["site"] = json!({
+        "id":"site:static","source":"file:server","kind":"import",
+        "specifier":"framework-route:/api/users","resolution_status":"resolved",
+        "target_ids":["route:users"],"profile_id":"profile:web",
+        "condition":{"op":"true"},"precision":"exact","reason":null,
+        "evidence":evidence
+    });
+    store.ingest_event(&site).unwrap();
+    let mut edge = common("edge_upsert", 7);
+    edge["edge"] = json!({
+        "id":"edge:static","source":"file:server","target":"route:users",
+        "kind":"imports","site_id":"site:static","phase":"source",
+        "environment":"production","profile_id":"profile:web",
+        "condition":{"op":"true"},"resolution_status":"resolved",
+        "precision":"exact","generated":false,"evidence":evidence
+    });
+    store.ingest_event(&edge).unwrap();
+    let mut profile_completed = common("profile_completed", 8);
     profile_completed["profile_id"] = json!("profile:web");
     profile_completed["coverage"] = coverage.clone();
     store.ingest_event(&profile_completed).unwrap();
-    let mut completed = common("scan_completed", 7);
+    let mut completed = common("scan_completed", 9);
     completed["coverage"] = coverage;
     store.ingest_event(&completed).unwrap();
     store
@@ -721,6 +744,452 @@ fn runtime_validate_matches_golden_trace_without_mutating_the_store() {
     assert_eq!(
         store.latest_successful_id().unwrap().as_deref(),
         Some("runtime-base")
+    );
+}
+
+#[test]
+fn runtime_import_is_atomic_deduplicated_queryable_and_deterministic() {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let store_path = cache.path().join("graph.db");
+    seed_runtime_trace_snapshot(&store_path, root.path());
+    let trace = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../depgraph-core/tests/fixtures/runtime-trace-v1.golden.json");
+    let base_snapshot_id = depgraph_store::Store::open(&store_path)
+        .unwrap()
+        .current_snapshot_id()
+        .unwrap()
+        .unwrap();
+
+    let import = || {
+        Command::cargo_bin("depgraph")
+            .unwrap()
+            .args([
+                "--store",
+                store_path.to_str().unwrap(),
+                "runtime",
+                "import",
+                trace.to_str().unwrap(),
+                "--json",
+            ])
+            .output()
+            .unwrap()
+    };
+    let first = import();
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first_json: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert_eq!(first_json["command"], "runtime.import");
+    assert_eq!(first_json["scan_id"], "runtime-base");
+    assert_eq!(first_json["data"]["status"], "partial");
+    assert_eq!(first_json["data"]["deduplicated"], false);
+    let runtime_snapshot_id = first_json["data"]["snapshot_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let runtime_session_id = first_json["data"]["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_ne!(runtime_snapshot_id, base_snapshot_id);
+
+    let store = depgraph_store::Store::open(&store_path).unwrap();
+    assert_eq!(
+        store.current_snapshot_id().unwrap().as_deref(),
+        Some(runtime_snapshot_id.as_str())
+    );
+    let metadata = store
+        .completed_snapshot(&runtime_snapshot_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(metadata.source_kind, "runtime");
+    assert_eq!(
+        metadata.runtime_session_ids.as_slice(),
+        std::slice::from_ref(&runtime_session_id)
+    );
+    let snapshot = store.load_completed_snapshot(&runtime_snapshot_id).unwrap();
+    assert!(snapshot.edges.iter().any(|edge| {
+        edge.id == "edge:static" && edge.phase == "source" && edge.precision == "exact"
+    }));
+    assert_eq!(
+        store
+            .load_completed_snapshot(&base_snapshot_id)
+            .unwrap()
+            .edges
+            .iter()
+            .map(|edge| edge.id.as_str())
+            .collect::<Vec<_>>(),
+        ["edge:static"]
+    );
+    assert_eq!(
+        snapshot
+            .edges
+            .iter()
+            .filter(|edge| edge.phase == "runtime")
+            .count(),
+        3
+    );
+    assert_eq!(
+        snapshot
+            .nodes
+            .iter()
+            .filter(|node| {
+                node.properties
+                    .get("runtime_only")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true)
+            })
+            .count(),
+        2
+    );
+    assert!(snapshot.profiles.iter().any(|profile| {
+        profile
+            .properties
+            .get("profile_phase")
+            .and_then(serde_json::Value::as_str)
+            == Some("runtime")
+    }));
+    let runtime_profile_id = snapshot
+        .profiles
+        .iter()
+        .find(|profile| {
+            profile
+                .properties
+                .get("profile_phase")
+                .and_then(serde_json::Value::as_str)
+                == Some("runtime")
+        })
+        .unwrap()
+        .id
+        .clone();
+    assert!(
+        snapshot
+            .diagnostics
+            .iter()
+            .any(|diagnostic| { diagnostic.code == "RUNTIME_TARGET_UNMATCHED" })
+    );
+    drop(store);
+
+    let second = import();
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let second_json: serde_json::Value = serde_json::from_slice(&second.stdout).unwrap();
+    assert_eq!(second_json["data"]["snapshot_id"], runtime_snapshot_id);
+    assert_eq!(second_json["data"]["session_id"], runtime_session_id);
+    assert_eq!(second_json["data"]["deduplicated"], true);
+
+    let mut second_trace: serde_json::Value =
+        serde_json::from_slice(&fs::read(&trace).unwrap()).unwrap();
+    second_trace["session"]["id"] = json!("session-002");
+    second_trace["session"]["started_at"] = json!("2026-07-23T01:00:00Z");
+    second_trace["session"]["ended_at"] = json!("2026-07-23T01:00:04Z");
+    second_trace["events"][0]["source"] = json!({"kind":"node","node_id":"file:server"});
+    second_trace["events"][0]["target"] = json!({"kind":"node","node_id":"route:users"});
+    for (index, event) in second_trace["events"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .enumerate()
+    {
+        event["timestamp"] = json!(format!("2026-07-23T01:00:0{}Z", index + 1));
+    }
+    let second_trace_path = cache.path().join("runtime-session-002.json");
+    fs::write(
+        &second_trace_path,
+        serde_json::to_vec_pretty(&second_trace).unwrap(),
+    )
+    .unwrap();
+    let second_import = Command::cargo_bin("depgraph")
+        .unwrap()
+        .args([
+            "--store",
+            store_path.to_str().unwrap(),
+            "runtime",
+            "import",
+            second_trace_path.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        second_import.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second_import.stderr)
+    );
+    let second_import: serde_json::Value = serde_json::from_slice(&second_import.stdout).unwrap();
+    assert_eq!(second_import["data"]["deduplicated"], false);
+    let two_session_snapshot_id = second_import["data"]["snapshot_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let store = depgraph_store::Store::open(&store_path).unwrap();
+    let two_session_snapshot = store
+        .load_completed_snapshot(&two_session_snapshot_id)
+        .unwrap();
+    assert_eq!(
+        store
+            .runtime_sessions_for_snapshot(&two_session_snapshot_id)
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        two_session_snapshot
+            .edges
+            .iter()
+            .filter(|edge| edge.phase == "runtime")
+            .count(),
+        3,
+        "sessions must deduplicate graph edges"
+    );
+    assert_eq!(
+        two_session_snapshot
+            .evidence
+            .iter()
+            .filter(|evidence| evidence.kind == "runtime")
+            .count(),
+        12
+    );
+    let calls = two_session_snapshot
+        .edges
+        .iter()
+        .find(|edge| {
+            edge.phase == "runtime" && edge.kind == "calls" && edge.source == "file:server"
+        })
+        .unwrap();
+    let context = depgraph_store::runtime_context_for_edge(&two_session_snapshot, calls);
+    assert_eq!(context.source_session_ids, ["session-001", "session-002"]);
+    assert_eq!(context.observation_count, 4);
+    assert_eq!(
+        context.first_observed_at.as_deref(),
+        Some("2026-07-23T00:00:01Z")
+    );
+    assert_eq!(
+        context.last_observed_at.as_deref(),
+        Some("2026-07-23T01:00:01Z")
+    );
+    drop(store);
+
+    let deps = Command::cargo_bin("depgraph")
+        .unwrap()
+        .args([
+            "--store",
+            store_path.to_str().unwrap(),
+            "deps",
+            "id:file:server",
+            "--phase",
+            "runtime",
+            "--profile",
+            runtime_profile_id.as_str(),
+            "--session",
+            "session-001",
+            "--environment",
+            "production",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        deps.status.success(),
+        "{}",
+        String::from_utf8_lossy(&deps.stderr)
+    );
+    let deps: serde_json::Value = serde_json::from_slice(&deps.stdout).unwrap();
+    assert_eq!(deps["data"]["edges"].as_array().unwrap().len(), 1);
+    assert!(
+        deps["data"]["edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|edge| edge["phase"] == "runtime")
+    );
+
+    let why = Command::cargo_bin("depgraph")
+        .unwrap()
+        .args([
+            "--store",
+            store_path.to_str().unwrap(),
+            "why",
+            "id:file:server",
+            "id:route:users",
+            "--phase",
+            "runtime",
+            "--session",
+            "session-002",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(why.status.success());
+    let why: serde_json::Value = serde_json::from_slice(&why.stdout).unwrap();
+    assert_eq!(why["data"]["path_found"], true);
+    assert_eq!(
+        why["data"]["steps"][0]["evidence"][0]["properties"]["source_session_id"],
+        "session-002"
+    );
+
+    let dependents = Command::cargo_bin("depgraph")
+        .unwrap()
+        .args([
+            "--store",
+            store_path.to_str().unwrap(),
+            "dependents",
+            "id:route:users",
+            "--phase",
+            "runtime",
+            "--environment",
+            "nodejs-24",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(dependents.status.success());
+    let dependents: serde_json::Value = serde_json::from_slice(&dependents.stdout).unwrap();
+    assert_eq!(dependents["data"]["edges"].as_array().unwrap().len(), 1);
+
+    let impact = Command::cargo_bin("depgraph")
+        .unwrap()
+        .args([
+            "--store",
+            store_path.to_str().unwrap(),
+            "impact",
+            "id:route:users",
+            "--phase",
+            "runtime",
+            "--session",
+            "session-001",
+            "--environment",
+            "test-region-1",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(impact.status.success());
+    let impact: serde_json::Value = serde_json::from_slice(&impact.stdout).unwrap();
+    assert_eq!(impact["data"]["filters"]["phases"], json!(["runtime"]));
+    assert_eq!(
+        impact["data"]["filters"]["sessions"],
+        json!(["session-001"])
+    );
+
+    let export = || {
+        Command::cargo_bin("depgraph")
+            .unwrap()
+            .args([
+                "--store",
+                store_path.to_str().unwrap(),
+                "export",
+                "--format",
+                "json",
+                "--phase",
+                "runtime",
+                "--session",
+                "session-001",
+            ])
+            .output()
+            .unwrap()
+    };
+    let export_first = export();
+    let export_second = export();
+    assert!(export_first.status.success());
+    assert_eq!(export_first.stdout, export_second.stdout);
+    let exported: serde_json::Value = serde_json::from_slice(&export_first.stdout).unwrap();
+    assert_eq!(exported["graph"]["edges"].as_array().unwrap().len(), 3);
+    assert_eq!(exported["graph"]["evidence"].as_array().unwrap().len(), 6);
+    assert!(
+        exported["graph"]["edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|edge| edge["phase"] == "runtime")
+    );
+    for format in ["dot", "mermaid"] {
+        let render = || {
+            Command::cargo_bin("depgraph")
+                .unwrap()
+                .args([
+                    "--store",
+                    store_path.to_str().unwrap(),
+                    "export",
+                    "--format",
+                    format,
+                    "--phase",
+                    "runtime",
+                    "--session",
+                    "session-001",
+                ])
+                .output()
+                .unwrap()
+        };
+        let rendered_first = render();
+        let rendered_second = render();
+        assert!(rendered_first.status.success());
+        assert_eq!(rendered_first.stdout, rendered_second.stdout);
+        assert!(
+            String::from_utf8(rendered_first.stdout)
+                .unwrap()
+                .contains("[runtime;")
+        );
+    }
+
+    let diff = || {
+        Command::cargo_bin("depgraph")
+            .unwrap()
+            .args([
+                "--store",
+                store_path.to_str().unwrap(),
+                "diff",
+                base_snapshot_id.as_str(),
+                two_session_snapshot_id.as_str(),
+                "--phase",
+                "runtime",
+                "--json",
+            ])
+            .output()
+            .unwrap()
+    };
+    let diff_first = diff();
+    let diff_second = diff();
+    assert!(
+        diff_first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&diff_first.stderr)
+    );
+    assert_eq!(diff_first.stdout, diff_second.stdout);
+    let diff: serde_json::Value = serde_json::from_slice(&diff_first.stdout).unwrap();
+    assert_eq!(diff["data"]["edges"]["added"].as_array().unwrap().len(), 3);
+
+    let current_before_failure = depgraph_store::Store::open(&store_path)
+        .unwrap()
+        .current_snapshot_id()
+        .unwrap();
+    let malformed = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../depgraph-core/tests/fixtures/runtime-trace-v1.malformed.json");
+    Command::cargo_bin("depgraph")
+        .unwrap()
+        .args([
+            "--store",
+            store_path.to_str().unwrap(),
+            "runtime",
+            "import",
+            malformed.to_str().unwrap(),
+        ])
+        .assert()
+        .failure();
+    let store = depgraph_store::Store::open(&store_path).unwrap();
+    assert_eq!(store.current_snapshot_id().unwrap(), current_before_failure);
+    assert_eq!(
+        store
+            .runtime_sessions_for_snapshot(&two_session_snapshot_id)
+            .unwrap()
+            .len(),
+        2
     );
 }
 
@@ -1544,7 +2013,7 @@ fn empty_safe_scan_uses_external_store_and_reports_json() {
         .args(["--store", store.to_str().unwrap(), "doctor", "--json"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("\"store_schema_version\": 10"))
+        .stdout(predicate::str::contains("\"store_schema_version\": 11"))
         .stdout(predicate::str::contains("\"cache_contract_version\": 1"))
         .stdout(predicate::str::contains("\"semantic\": 1"));
     assert!(store.exists());

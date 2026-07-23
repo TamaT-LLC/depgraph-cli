@@ -214,8 +214,28 @@ The matching JSON Schema is
 
 `depgraph runtime validate TRACE` reads the versioned `1.0` JSON contract,
 matches it against the selected completed snapshot, and produces deterministic
-`runtime-event:sha256:...` identities. Validation is read-only: Issue #84 adds
-atomic persistence and runtime-phase query union.
+`runtime-event:sha256:...` identities without changing the store.
+`depgraph runtime import TRACE` performs the same validation and atomically
+publishes a new immutable runtime snapshot:
+
+```sh
+depgraph runtime import runtime-trace.json --json
+depgraph deps id:file:server --phase runtime --session session-001
+depgraph dependents id:route:users --phase runtime --environment production
+depgraph why id:file:server id:route:users --phase runtime
+depgraph impact id:route:users --phase runtime --profile profile:sha256:...
+depgraph export --format json --phase runtime --session session-001
+depgraph diff baseline current --phase runtime --json
+```
+
+Runtime child profiles declare their static/semantic parent and canonical
+effective input. Matching observations from multiple sessions reuse the same
+runtime-only sentinel, site, and edge identities; evidence remains per session
+with source session/environment, observation count, duration, first/last
+timestamp, event IDs, and redaction count. External and unresolved locators are
+retained as explicit `runtime_only` sentinel nodes with fixed reasons rather
+than being forged into repository nodes. Reimporting the same validated session
+is idempotent.
 
 The document identifies a repository, session, profile, environment, and an
 ordered event stream. Each source and target uses one explicit locator form:
@@ -239,13 +259,31 @@ contract or output.
 The matching JSON Schema is
 [`schemas/depgraph-runtime-trace-v1.schema.json`](schemas/depgraph-runtime-trace-v1.schema.json).
 
-Store schema v10 separates profile-independent `syntax`, profile-dependent `semantic`, and observed `build` cache entries. Keys use contract v1 canonical digests of repository-relative file bytes, manifest/lock/config inputs, adapter/protocol artifacts, toolchain/framework identities, profiles, and generated artifact fingerprints; checkout, cache, and temporary absolute paths are not key dimensions. A semantic hit is reused only after key, contract, completed-snapshot, and canonical payload integrity checks, then copied into a fresh scan attempt and validated before promotion. Unknown versions, corruption, symlinks, unsafe inventory bounds, and dependency snapshots that cannot be re-derived before scanning are explicit misses/rejections. `scan --no-cache` bypasses lookup and storage. Scan JSON/text and `doctor` expose cache hit/miss/reject reasons without adding cache bookkeeping to the canonical graph.
+Store schema v11 retains the v10 profile-independent `syntax`,
+profile-dependent `semantic`, and observed `build` cache tables and adds
+normalized runtime session/node/site/edge/evidence/diagnostic/import tables.
+Runtime rows, the completed snapshot, its source mapping, and the current
+pointer are committed in one SQLite transaction; any failure rolls back the
+entire session and leaves the previous completed snapshot queryable. Existing
+source/semantic/build graph records are immutable and runtime union only adds
+`phase=runtime`, `precision=observed` records. Cache keys continue to use
+contract v1 canonical digests of repository-relative file bytes,
+manifest/lock/config inputs, adapter/protocol artifacts, toolchain/framework
+identities, profiles, and generated artifact fingerprints; checkout, cache,
+and temporary absolute paths are not key dimensions. A semantic hit is reused
+only after key, contract, completed-snapshot, and canonical payload integrity
+checks, then copied into a fresh scan attempt and validated before promotion.
+Unknown versions, corruption, symlinks, unsafe inventory bounds, and
+dependency snapshots that cannot be re-derived before scanning are explicit
+misses/rejections. `scan --no-cache` bypasses lookup and storage. Scan
+JSON/text and `doctor` expose cache hit/miss/reject reasons without adding
+cache bookkeeping to the canonical graph.
 
 `snapshot create` names the current completed snapshot; global `--scan-id ID` may instead select the completed snapshot produced by that scan and its latest promoted build. Failed or incomplete attempts cannot be named. Names are immutable, case-insensitively unique, 1–64 ASCII characters, begin with a letter or digit, and otherwise use letters, digits, `.`, `_`, or `-`. `current` and `latest` are reserved, and existing names are never overwritten. `snapshot show` accepts a name, a `snapshot:sha256:...` stable ID, or `current`. List and detail JSON are emitted in canonical order.
 
 `diff` accepts two completed snapshot names, stable IDs, or `current`; failed and incomplete attempt IDs are rejected with exit code `2`. Human output starts with node/site/edge/evidence/profile/coverage/rename counts and follows with canonical change details plus primary source evidence. `--json` emits the versioned `diff` command envelope with normalized filters, a summary, and the canonical before/after records. Repeatable `--kind`, `--profile`, `--phase`, and `--status` filters use exact matching and AND semantics; a record type that does not expose a selected dimension is excluded rather than guessed through an implicit graph join.
 
-`impact <SELECTOR>` follows incoming dependencies from the selected node and reports a deterministic dependency path, rendered condition, profile correlation, and source evidence for every result. With `--changed <GIT_REF>`, depgraph reads both committed changes from `merge-base(GIT_REF, HEAD)..HEAD` and staged, unstaged, and untracked worktree changes without taking Git locks or invoking external diff/textconv helpers. Changed and renamed paths are correlated to file and semantic node identities through canonical node properties and stored evidence. The selector is the focus: it must depend on a mapped changed node, then reverse traversal reports the focus and its dependents. Repeatable `--profile` and `--condition` filters are exact; `--depth`, `--max-nodes`, and `--max-edges` bound traversal, and a reached safety limit is returned as `complete=false` with an explicit diagnostic rather than silently truncating results.
+`impact <SELECTOR>` follows incoming dependencies from the selected node and reports a deterministic dependency path, rendered condition, profile correlation, and source evidence for every result. With `--changed <GIT_REF>`, depgraph reads both committed changes from `merge-base(GIT_REF, HEAD)..HEAD` and staged, unstaged, and untracked worktree changes without taking Git locks or invoking external diff/textconv helpers. Changed and renamed paths are correlated to file and semantic node identities through canonical node properties and stored evidence. The selector is the focus: it must depend on a mapped changed node, then reverse traversal reports the focus and its dependents. Repeatable `--profile`, `--condition`, `--phase`, `--session`, and `--environment` filters are exact; runtime environment matching includes its name, runtime, and region. `--depth`, `--max-nodes`, and `--max-edges` bound traversal, and a reached safety limit is returned as `complete=false` with an explicit diagnostic rather than silently truncating results.
 
 `daemon start` uses the platform-recommended recursive filesystem watcher and a configurable `[daemon].debounce_milliseconds` (default `200`). VCS metadata, dependency/build output directories, the graph store, and daemon control files are ignored; tracked generated source such as `generated`, `*.generated.*`, `*.g.rs`, and `routeTree.gen.ts` remains observable. A burst is normalized into deterministic added/modified/deleted/renamed changes and passed to `incremental-plan-v1`. A newer burst cancels the active scan and requeues its changes; failed batches retry with bounded backoff. Shutdown cancels an active scan, performs one final pending-batch flush, waits for worker process-tree cleanup, and never promotes the cancelled attempt. Status uses schema `daemon-status-v1` and exposes active, last completed, last failed, last cancelled, watcher-error, and crash-recovery state. `[daemon].ignored_paths` accepts normalized repository-relative path prefixes.
 

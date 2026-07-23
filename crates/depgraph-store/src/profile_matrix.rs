@@ -244,6 +244,12 @@ pub(crate) fn refresh_profile_matrix(snapshot: &mut GraphSnapshot, canonicalize_
     });
 }
 
+/// Rebuilds the derived profile-matrix view after a caller has selected a
+/// deterministic graph subset for presentation or export.
+pub fn refresh_profile_matrix_view(snapshot: &mut GraphSnapshot) {
+    refresh_profile_matrix(snapshot, true);
+}
+
 fn build_profile_matrix(snapshot: &GraphSnapshot) -> ProfileMatrixRecord {
     let profiles = snapshot
         .profiles

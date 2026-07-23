@@ -5,10 +5,10 @@ use depgraph_protocol::Condition;
 use depgraph_store::{
     EdgeRecord, EvidenceRecord, GraphSnapshot, NodeRecord, PhaseCoverageRecord,
     ProfileCorrelationRecord, ProfileMatrixRecord, SiteRecord,
-    phase_coverage_for_effective_profile,
+    phase_coverage_for_effective_profile, runtime_context_for_edge,
 };
 use petgraph::{algo::tarjan_scc, graph::DiGraph};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CycleLevel {
@@ -72,6 +72,105 @@ pub struct UnresolvedResult {
     pub correlation_status: Option<String>,
     pub observed_difference_reasons: Vec<String>,
     pub phase_coverage: BTreeMap<String, PhaseCoverageRecord>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GraphQueryFilter {
+    pub phases: Vec<String>,
+    pub profiles: Vec<String>,
+    pub sessions: Vec<String>,
+    pub environments: Vec<String>,
+}
+
+impl GraphQueryFilter {
+    pub fn new(
+        phases: Vec<String>,
+        profiles: Vec<String>,
+        sessions: Vec<String>,
+        environments: Vec<String>,
+    ) -> Result<Self> {
+        Ok(Self {
+            phases: normalize_query_filter("phase", phases)?,
+            profiles: normalize_query_filter("profile", profiles)?,
+            sessions: normalize_query_filter("session", sessions)?,
+            environments: normalize_query_filter("environment", environments)?,
+        })
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.phases.is_empty()
+            && self.profiles.is_empty()
+            && self.sessions.is_empty()
+            && self.environments.is_empty()
+    }
+
+    pub fn matches_edge(&self, snapshot: &GraphSnapshot, edge: &EdgeRecord) -> bool {
+        if !self.phases.is_empty() && self.phases.binary_search(&edge.phase).is_err() {
+            return false;
+        }
+        if !self.profiles.is_empty() && self.profiles.binary_search(&edge.profile_id).is_err() {
+            return false;
+        }
+        if self.sessions.is_empty() && self.environments.is_empty() {
+            return true;
+        }
+        let context = runtime_context_for_edge(snapshot, edge);
+        let session_matches = self.sessions.is_empty()
+            || context
+                .session_ids
+                .iter()
+                .chain(context.source_session_ids.iter())
+                .any(|value| self.sessions.binary_search(value).is_ok());
+        let environment_matches = self.environments.is_empty()
+            || std::iter::once(&edge.environment)
+                .chain(context.environment_names.iter())
+                .chain(context.runtimes.iter())
+                .chain(context.regions.iter())
+                .any(|value| self.environments.binary_search(value).is_ok());
+        session_matches && environment_matches
+    }
+
+    pub fn matches_evidence(&self, evidence: &EvidenceRecord) -> bool {
+        if evidence.kind != "runtime" {
+            return self.sessions.is_empty();
+        }
+        let session_matches = self.sessions.is_empty()
+            || ["session_id", "source_session_id"].iter().any(|key| {
+                evidence
+                    .properties
+                    .get(key)
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|value| self.sessions.iter().any(|item| item == value))
+            });
+        let environment_matches = self.environments.is_empty()
+            || evidence
+                .properties
+                .get("environment")
+                .and_then(serde_json::Value::as_object)
+                .is_some_and(|environment| {
+                    ["name", "runtime", "region"].iter().any(|key| {
+                        environment
+                            .get(*key)
+                            .and_then(serde_json::Value::as_str)
+                            .is_some_and(|value| self.environments.iter().any(|item| item == value))
+                    })
+                });
+        session_matches && environment_matches
+    }
+}
+
+fn normalize_query_filter(name: &str, values: Vec<String>) -> Result<Vec<String>> {
+    let mut normalized = Vec::with_capacity(values.len());
+    for value in values {
+        let value = value.trim();
+        if value.is_empty() {
+            bail!("{name} filter must not be empty");
+        }
+        normalized.push(value.to_owned());
+    }
+    normalized.sort();
+    normalized.dedup();
+    Ok(normalized)
 }
 
 pub fn resolve_selector(snapshot: &GraphSnapshot, selector: &str) -> Result<NodeRecord> {
@@ -165,9 +264,25 @@ pub fn traverse(
     transitive: bool,
     reverse: bool,
 ) -> Result<TraversalResult> {
+    traverse_filtered(
+        snapshot,
+        selector,
+        transitive,
+        reverse,
+        &GraphQueryFilter::default(),
+    )
+}
+
+pub fn traverse_filtered(
+    snapshot: &GraphSnapshot,
+    selector: &str,
+    transitive: bool,
+    reverse: bool,
+    filter: &GraphQueryFilter,
+) -> Result<TraversalResult> {
     let root = resolve_selector(snapshot, selector)?;
     let node_map = node_map(snapshot);
-    let adjacency = adjacency(snapshot, reverse);
+    let adjacency = adjacency(snapshot, reverse, filter);
     let mut queue = VecDeque::from([root.id.clone()]);
     let mut visited = BTreeSet::from([root.id.clone()]);
     let mut selected_edges = BTreeMap::new();
@@ -193,7 +308,7 @@ pub fn traverse(
         .filter_map(|id| node_map.get(id).cloned())
         .collect();
     let edges: Vec<_> = selected_edges.into_values().collect();
-    let evidence = edge_evidence_map(snapshot);
+    let evidence = edge_evidence_map_filtered(snapshot, filter);
     let correlations = edge_correlation_map(&snapshot.profile_matrix);
     let steps = edges
         .iter()
@@ -215,6 +330,15 @@ pub fn traverse(
 }
 
 pub fn why(snapshot: &GraphSnapshot, from: &str, to: &str) -> Result<WhyResult> {
+    why_filtered(snapshot, from, to, &GraphQueryFilter::default())
+}
+
+pub fn why_filtered(
+    snapshot: &GraphSnapshot,
+    from: &str,
+    to: &str,
+    filter: &GraphQueryFilter,
+) -> Result<WhyResult> {
     let from = resolve_selector(snapshot, from)?;
     let to = resolve_selector(snapshot, to)?;
     if from.id == to.id {
@@ -225,7 +349,7 @@ pub fn why(snapshot: &GraphSnapshot, from: &str, to: &str) -> Result<WhyResult> 
             steps: Vec::new(),
         });
     }
-    let adjacency = adjacency(snapshot, false);
+    let adjacency = adjacency(snapshot, false, filter);
     let mut queue = VecDeque::from([from.id.clone()]);
     let mut seen = BTreeSet::from([from.id.clone()]);
     let mut predecessor: HashMap<String, &EdgeRecord> = HashMap::new();
@@ -251,7 +375,7 @@ pub fn why(snapshot: &GraphSnapshot, from: &str, to: &str) -> Result<WhyResult> 
             steps: Vec::new(),
         });
     }
-    let evidence_map = edge_evidence_map(snapshot);
+    let evidence_map = edge_evidence_map_filtered(snapshot, filter);
     let correlations = edge_correlation_map(&snapshot.profile_matrix);
     let mut current = to.id.clone();
     let mut reversed = Vec::new();
@@ -506,10 +630,17 @@ fn node_map(snapshot: &GraphSnapshot) -> BTreeMap<String, NodeRecord> {
 }
 
 fn edge_evidence_map(snapshot: &GraphSnapshot) -> BTreeMap<String, Vec<EvidenceRecord>> {
+    edge_evidence_map_filtered(snapshot, &GraphQueryFilter::default())
+}
+
+fn edge_evidence_map_filtered(
+    snapshot: &GraphSnapshot,
+    filter: &GraphQueryFilter,
+) -> BTreeMap<String, Vec<EvidenceRecord>> {
     let mut evidence = snapshot
         .evidence
         .iter()
-        .filter(|item| item.owner_type == "edge")
+        .filter(|item| item.owner_type == "edge" && filter.matches_evidence(item))
         .fold(
             BTreeMap::<String, Vec<EvidenceRecord>>::new(),
             |mut map, item| {
@@ -542,9 +673,17 @@ fn edge_evidence_map(snapshot: &GraphSnapshot) -> BTreeMap<String, Vec<EvidenceR
     evidence
 }
 
-fn adjacency(snapshot: &GraphSnapshot, reverse: bool) -> BTreeMap<String, Vec<&EdgeRecord>> {
+fn adjacency<'a>(
+    snapshot: &'a GraphSnapshot,
+    reverse: bool,
+    filter: &GraphQueryFilter,
+) -> BTreeMap<String, Vec<&'a EdgeRecord>> {
     let mut adjacency = BTreeMap::<String, Vec<&EdgeRecord>>::new();
-    for edge in &snapshot.edges {
+    for edge in snapshot
+        .edges
+        .iter()
+        .filter(|edge| filter.matches_edge(snapshot, edge))
+    {
         let key = if reverse { &edge.target } else { &edge.source };
         adjacency.entry(key.clone()).or_default().push(edge);
     }

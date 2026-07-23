@@ -8,14 +8,15 @@ use std::{
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use depgraph_core::{
-    BuildOutcomeKind, Config, CycleLevel, DaemonStatus, ExportFormat, ImpactFilters, ImpactResult,
-    PolicyAnnotation, PolicyResult, ScanCacheMode, acquire_store_writer_lock, build_cache_key,
-    create_build_execution_request, default_store_path, doctor, evaluate_policy_diff,
-    execute_build_request_with_cancellation, export, impact, init_config, match_runtime_trace,
-    open_store, open_store_read_only, policy_annotations, read_git_changed_set, read_runtime_trace,
-    render_condition, render_github_annotations, run_scan_with_cache_mode,
-    rust_build_protocol_ndjson, stage_build_evidence, start_repository_daemon, traverse,
-    unresolved, web_build_protocol_ndjson, why,
+    BuildOutcomeKind, Config, CycleLevel, DaemonStatus, ExportFormat, GraphQueryFilter,
+    ImpactFilters, ImpactResult, PolicyAnnotation, PolicyResult, ScanCacheMode,
+    acquire_store_writer_lock, build_cache_key, create_build_execution_request, default_store_path,
+    doctor, evaluate_policy_diff, execute_build_request_with_cancellation, export_filtered, impact,
+    init_config, match_runtime_trace, open_store, open_store_read_only, policy_annotations,
+    read_git_changed_set, read_runtime_trace, render_condition, render_github_annotations,
+    run_scan_with_cache_mode, runtime_session_delta, rust_build_protocol_ndjson,
+    stage_build_evidence, start_repository_daemon, traverse_filtered, unresolved,
+    web_build_protocol_ndjson, why_filtered,
 };
 use depgraph_store::{CompletedSnapshotDetails, CoverageRecord};
 use serde::Serialize;
@@ -88,6 +89,14 @@ enum Commands {
         selector: String,
         #[arg(long)]
         transitive: bool,
+        #[arg(long, value_name = "PHASE")]
+        phase: Vec<String>,
+        #[arg(long, value_name = "PROFILE_ID")]
+        profile: Vec<String>,
+        #[arg(long, value_name = "SESSION_ID")]
+        session: Vec<String>,
+        #[arg(long, value_name = "ENVIRONMENT")]
+        environment: Vec<String>,
         #[arg(long)]
         json: bool,
     },
@@ -96,6 +105,14 @@ enum Commands {
         selector: String,
         #[arg(long)]
         transitive: bool,
+        #[arg(long, value_name = "PHASE")]
+        phase: Vec<String>,
+        #[arg(long, value_name = "PROFILE_ID")]
+        profile: Vec<String>,
+        #[arg(long, value_name = "SESSION_ID")]
+        session: Vec<String>,
+        #[arg(long, value_name = "ENVIRONMENT")]
+        environment: Vec<String>,
         #[arg(long)]
         json: bool,
     },
@@ -103,6 +120,14 @@ enum Commands {
     Why {
         from: String,
         to: String,
+        #[arg(long, value_name = "PHASE")]
+        phase: Vec<String>,
+        #[arg(long, value_name = "PROFILE_ID")]
+        profile: Vec<String>,
+        #[arg(long, value_name = "SESSION_ID")]
+        session: Vec<String>,
+        #[arg(long, value_name = "ENVIRONMENT")]
+        environment: Vec<String>,
         #[arg(long)]
         json: bool,
     },
@@ -121,6 +146,15 @@ enum Commands {
         /// Traverse edges whose rendered condition exactly matches one of these values.
         #[arg(long, value_name = "CONDITION")]
         condition: Vec<String>,
+        /// Traverse edges in one of these graph phases, including `runtime`.
+        #[arg(long, value_name = "PHASE")]
+        phase: Vec<String>,
+        /// Traverse runtime evidence from one of these imported session IDs.
+        #[arg(long, value_name = "SESSION_ID")]
+        session: Vec<String>,
+        /// Traverse runtime evidence observed in this environment, runtime, or region.
+        #[arg(long, value_name = "ENVIRONMENT")]
+        environment: Vec<String>,
         /// Stop with an explicit incomplete diagnostic after this many unique nodes.
         #[arg(long, default_value_t = 10_000)]
         max_nodes: usize,
@@ -187,6 +221,14 @@ enum Commands {
         format: ExportFormatArg,
         #[arg(short, long)]
         output: Option<PathBuf>,
+        #[arg(long, value_name = "PHASE")]
+        phase: Vec<String>,
+        #[arg(long, value_name = "PROFILE_ID")]
+        profile: Vec<String>,
+        #[arg(long, value_name = "SESSION_ID")]
+        session: Vec<String>,
+        #[arg(long, value_name = "ENVIRONMENT")]
+        environment: Vec<String>,
     },
 }
 
@@ -246,6 +288,12 @@ enum RuntimeCommands {
         #[arg(long)]
         json: bool,
     },
+    /// Atomically union a validated trace into a new immutable snapshot.
+    Import {
+        trace: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -287,6 +335,8 @@ struct SnapshotView {
     source_attempt_id: String,
     scan_id: String,
     build_attempt_id: Option<String>,
+    runtime_import_id: Option<String>,
+    runtime_session_ids: Vec<String>,
     parent_snapshot_id: Option<String>,
     source_revision: Option<String>,
     profile_ids: Vec<String>,
@@ -313,6 +363,8 @@ impl From<CompletedSnapshotDetails> for SnapshotView {
             source_attempt_id: snapshot.source_attempt_id,
             scan_id: snapshot.scan_id,
             build_attempt_id: snapshot.build_attempt_id,
+            runtime_import_id: snapshot.runtime_import_id,
+            runtime_session_ids: snapshot.runtime_session_ids,
             parent_snapshot_id: snapshot.parent_snapshot_id,
             source_revision: snapshot.source_revision,
             profile_ids: snapshot.profile_ids,
@@ -853,10 +905,15 @@ async fn run(cli: Cli) -> Result<u8> {
         Commands::Deps {
             selector,
             transitive,
+            phase,
+            profile,
+            session,
+            environment,
             json,
         } => {
+            let filter = GraphQueryFilter::new(phase, profile, session, environment)?;
             let (snapshot, scan_id) = load_snapshot(cli.store, cli.scan_id.as_deref(), false)?;
-            let result = traverse(&snapshot, &selector, transitive, false)?;
+            let result = traverse_filtered(&snapshot, &selector, transitive, false, &filter)?;
             print_structured("deps", scan_id, &result, json)?;
             if !json {
                 print_path_steps(&result.steps);
@@ -866,19 +923,33 @@ async fn run(cli: Cli) -> Result<u8> {
         Commands::Dependents {
             selector,
             transitive,
+            phase,
+            profile,
+            session,
+            environment,
             json,
         } => {
+            let filter = GraphQueryFilter::new(phase, profile, session, environment)?;
             let (snapshot, scan_id) = load_snapshot(cli.store, cli.scan_id.as_deref(), false)?;
-            let result = traverse(&snapshot, &selector, transitive, true)?;
+            let result = traverse_filtered(&snapshot, &selector, transitive, true, &filter)?;
             print_structured("dependents", scan_id, &result, json)?;
             if !json {
                 print_path_steps(&result.steps);
             }
             Ok(0)
         }
-        Commands::Why { from, to, json } => {
+        Commands::Why {
+            from,
+            to,
+            phase,
+            profile,
+            session,
+            environment,
+            json,
+        } => {
+            let filter = GraphQueryFilter::new(phase, profile, session, environment)?;
             let (snapshot, scan_id) = load_snapshot(cli.store, cli.scan_id.as_deref(), false)?;
-            let result = why(&snapshot, &from, &to)?;
+            let result = why_filtered(&snapshot, &from, &to, &filter)?;
             print_structured("why", scan_id, &result, json)?;
             if !json {
                 if result.path_found {
@@ -899,11 +970,15 @@ async fn run(cli: Cli) -> Result<u8> {
             depth,
             profile,
             condition,
+            phase,
+            session,
+            environment,
             max_nodes,
             max_edges,
             json,
         } => {
-            let filters = ImpactFilters::new(depth, profile, condition, max_nodes, max_edges)?;
+            let filters = ImpactFilters::new(depth, profile, condition, max_nodes, max_edges)?
+                .with_runtime_filters(phase, session, environment)?;
             let (snapshot, scan_id) = load_snapshot(cli.store, cli.scan_id.as_deref(), false)?;
             let changed_set = changed
                 .as_deref()
@@ -1017,6 +1092,49 @@ async fn run(cli: Cli) -> Result<u8> {
                         result.summary.unresolved_targets
                     );
                     println!("redacted values: {}", result.summary.redacted_values);
+                }
+                Ok(0)
+            }
+            RuntimeCommands::Import { trace, json } => {
+                let metadata = inspect_runtime_trace_input(&trace)?;
+                if !metadata.file_type().is_file() {
+                    anyhow::bail!("runtime trace input must be a regular file");
+                }
+                let input =
+                    std::fs::File::open(&trace).context("failed to open runtime trace input")?;
+                // Parse and bound untrusted input before acquiring the writer
+                // lock or opening a mutable store.
+                let trace = read_runtime_trace(input)?;
+                let root = std::env::current_dir()?;
+                let store_path = store_path(cli.store, &root)?;
+                let _store_writer_lock = acquire_store_writer_lock(&store_path)?;
+                let mut store = open_store(&store_path)?;
+                let base_snapshot_id = if let Some(scan_id) = cli.scan_id.as_deref() {
+                    store
+                        .snapshot_id_for_scan_selection(scan_id)?
+                        .with_context(|| {
+                            format!("scan attempt {scan_id} has no completed snapshot")
+                        })?
+                } else {
+                    store
+                        .current_snapshot_id()?
+                        .context("no current completed snapshot is available")?
+                };
+                let base = store
+                    .completed_snapshot(&base_snapshot_id)?
+                    .with_context(|| {
+                        format!("completed snapshot {base_snapshot_id} was not found")
+                    })?;
+                let snapshot = store.load_completed_snapshot(&base_snapshot_id)?;
+                let validated = match_runtime_trace(trace, &snapshot)?;
+                let delta = runtime_session_delta(validated, &base_snapshot_id, &snapshot)?;
+                let result = store.import_runtime_session(&base_snapshot_id, delta)?;
+                print_structured("runtime.import", base.scan_id, &result, json)?;
+                if !json {
+                    println!("runtime session: {}", result.session_id);
+                    println!("snapshot: {}", result.snapshot_id);
+                    println!("status: {}", result.status);
+                    println!("deduplicated: {}", result.deduplicated);
                 }
                 Ok(0)
             }
@@ -1202,14 +1320,22 @@ async fn run(cli: Cli) -> Result<u8> {
             }
             Ok(result.exit_code)
         }
-        Commands::Export { format, output } => {
+        Commands::Export {
+            format,
+            output,
+            phase,
+            profile,
+            session,
+            environment,
+        } => {
             let (snapshot, _) = load_snapshot(cli.store, cli.scan_id.as_deref(), false)?;
+            let filter = GraphQueryFilter::new(phase, profile, session, environment)?;
             let format = match format {
                 ExportFormatArg::Json => ExportFormat::Json,
                 ExportFormatArg::Dot => ExportFormat::Dot,
                 ExportFormatArg::Mermaid => ExportFormat::Mermaid,
             };
-            let rendered = export(&snapshot, format)?;
+            let rendered = export_filtered(&snapshot, format, &filter)?;
             if let Some(path) = output {
                 std::fs::write(&path, rendered)
                     .with_context(|| format!("failed to write {}", path.display()))?;
@@ -1536,6 +1662,15 @@ fn print_snapshot_view(snapshot: &SnapshotView) {
     println!("scan: {}", snapshot.scan_id);
     if let Some(build_attempt_id) = &snapshot.build_attempt_id {
         println!("build attempt: {build_attempt_id}");
+    }
+    if let Some(runtime_import_id) = &snapshot.runtime_import_id {
+        println!("runtime import: {runtime_import_id}");
+    }
+    if !snapshot.runtime_session_ids.is_empty() {
+        println!(
+            "runtime sessions: {}",
+            display_list(&snapshot.runtime_session_ids)
+        );
     }
     println!(
         "parent: {}",

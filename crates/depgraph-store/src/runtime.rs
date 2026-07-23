@@ -1,0 +1,1193 @@
+use std::collections::{BTreeMap, BTreeSet};
+
+use anyhow::{Context, Result, bail};
+use chrono::{SecondsFormat, Utc};
+use depgraph_protocol::stable_id_from_value;
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+
+use super::{
+    CoverageRecord, DiagnosticRecord, EdgeRecord, EvidenceRecord, GraphSnapshot, NodeRecord,
+    ProfileRecord, SiteRecord, SnapshotSource, Store, canonical_effective_input_id,
+    create_completed_snapshot, declared_effective_input_id, declared_parent_profile_id,
+    promote_completed_snapshot, refresh_profile_matrix, union_coverage,
+};
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RuntimeSessionRecord {
+    pub id: String,
+    pub base_snapshot_id: String,
+    pub source_session_id: String,
+    pub schema_version: String,
+    pub status: String,
+    pub trace_digest: String,
+    pub profile_id: String,
+    pub parent_profile_id: Option<String>,
+    pub profile_status: String,
+    pub profile_reason: Option<String>,
+    pub profile: ProfileRecord,
+    pub environment: Value,
+    pub redaction: Value,
+    pub started_at: String,
+    pub ended_at: Option<String>,
+    pub first_observed_at: String,
+    pub last_observed_at: String,
+    pub event_count: u64,
+    pub observation_count: u64,
+    pub resolved_targets: u64,
+    pub external_targets: u64,
+    pub unresolved_targets: u64,
+    pub redacted_values: u64,
+    pub coverage: CoverageRecord,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RuntimeSessionDelta {
+    pub session: RuntimeSessionRecord,
+    pub nodes: Vec<NodeRecord>,
+    pub sites: Vec<SiteRecord>,
+    pub edges: Vec<EdgeRecord>,
+    pub evidence: Vec<EvidenceRecord>,
+    pub diagnostics: Vec<DiagnosticRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeImportResult {
+    pub import_id: String,
+    pub session_id: String,
+    pub snapshot_id: String,
+    pub status: String,
+    pub deduplicated: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeEdgeContext {
+    pub session_ids: Vec<String>,
+    pub source_session_ids: Vec<String>,
+    pub environment_names: Vec<String>,
+    pub runtimes: Vec<String>,
+    pub regions: Vec<String>,
+    pub observation_count: u64,
+    pub first_observed_at: Option<String>,
+    pub last_observed_at: Option<String>,
+}
+
+impl Store {
+    /// Atomically publishes one validated runtime session as a new immutable
+    /// completed snapshot. The graph rows and current pointer are committed in
+    /// the same transaction, so a failed import cannot expose a partial
+    /// session.
+    pub fn import_runtime_session(
+        &mut self,
+        base_snapshot_id: &str,
+        mut delta: RuntimeSessionDelta,
+    ) -> Result<RuntimeImportResult> {
+        normalize_runtime_delta(&mut delta);
+        if delta.session.base_snapshot_id != base_snapshot_id {
+            bail!("runtime session base snapshot does not match the selected snapshot");
+        }
+        let base_record = self
+            .completed_snapshot(base_snapshot_id)?
+            .with_context(|| format!("completed snapshot {base_snapshot_id} was not found"))?;
+        if !self.verify_snapshot_integrity(base_snapshot_id)?.valid {
+            bail!("runtime session base snapshot {base_snapshot_id} failed integrity validation");
+        }
+        if base_record
+            .runtime_session_ids
+            .binary_search(&delta.session.id)
+            .is_ok()
+        {
+            let existing = load_runtime_session_record(&self.connection, &delta.session.id)?
+                .with_context(|| {
+                    format!(
+                        "runtime session {} referenced by snapshot was not found",
+                        delta.session.id
+                    )
+                })?;
+            if existing.trace_digest != delta.session.trace_digest
+                || existing.source_session_id != delta.session.source_session_id
+            {
+                bail!(
+                    "runtime session identity collision for {}",
+                    delta.session.id
+                );
+            }
+            return Ok(RuntimeImportResult {
+                import_id: base_record
+                    .runtime_import_id
+                    .unwrap_or_else(|| "runtime-import:deduplicated".to_owned()),
+                session_id: delta.session.id,
+                snapshot_id: base_snapshot_id.to_owned(),
+                status: existing.status,
+                deduplicated: true,
+            });
+        }
+        let base = self.load_completed_snapshot(base_snapshot_id)?;
+        validate_runtime_union(&base, &delta)?;
+
+        let mut runtime_session_ids = base_record.runtime_session_ids.clone();
+        runtime_session_ids.push(delta.session.id.clone());
+        runtime_session_ids.sort();
+        runtime_session_ids.dedup();
+        let import_id = stable_id_from_value(
+            "runtime-import",
+            &json!({
+                "parent_snapshot_id": base_snapshot_id,
+                "session_id": delta.session.id,
+                "runtime_session_ids": runtime_session_ids,
+            }),
+        );
+        let created_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+        let tx = self.connection.transaction()?;
+        store_runtime_session(&tx, &delta)?;
+        tx.execute(
+            "INSERT INTO runtime_imports(
+                id, parent_snapshot_id, session_id, status, created_at
+             ) VALUES (?1, ?2, ?3, 'staging', ?4)",
+            params![import_id, base_snapshot_id, delta.session.id, created_at],
+        )?;
+        let snapshot_id = create_completed_snapshot(
+            &tx,
+            SnapshotSource {
+                source_kind: "runtime",
+                source_attempt_id: &import_id,
+                scan_id: &base_record.scan_id,
+                build_attempt_id: base_record.build_attempt_id.as_deref(),
+                runtime_import_id: Some(&import_id),
+                runtime_session_ids: &runtime_session_ids,
+                parent_snapshot_id: Some(base_snapshot_id),
+                source_revision: base_record.source_revision.as_deref(),
+                created_at: &created_at,
+            },
+        )?;
+        tx.execute(
+            "UPDATE runtime_imports
+                SET status='completed', result_snapshot_id=?2, completed_at=?3
+              WHERE id=?1 AND status='staging'",
+            params![import_id, snapshot_id, created_at],
+        )?;
+        promote_completed_snapshot(&tx, &snapshot_id)?;
+        tx.commit()?;
+        Ok(RuntimeImportResult {
+            import_id,
+            session_id: delta.session.id,
+            snapshot_id,
+            status: delta.session.status,
+            deduplicated: false,
+        })
+    }
+
+    pub fn runtime_session(&self, session_id: &str) -> Result<Option<RuntimeSessionRecord>> {
+        load_runtime_session_record(&self.connection, session_id)
+    }
+
+    pub fn runtime_sessions_for_snapshot(
+        &self,
+        snapshot_id: &str,
+    ) -> Result<Vec<RuntimeSessionRecord>> {
+        let snapshot = self
+            .completed_snapshot(snapshot_id)?
+            .with_context(|| format!("completed snapshot {snapshot_id} was not found"))?;
+        snapshot
+            .runtime_session_ids
+            .iter()
+            .map(|session_id| {
+                load_runtime_session_record(&self.connection, session_id)?.with_context(|| {
+                    format!("runtime session {session_id} referenced by snapshot was not found")
+                })
+            })
+            .collect()
+    }
+}
+
+fn normalize_runtime_delta(delta: &mut RuntimeSessionDelta) {
+    delta.nodes.sort_by(|left, right| left.id.cmp(&right.id));
+    delta.sites.sort_by(|left, right| left.id.cmp(&right.id));
+    delta.edges.sort_by(|left, right| left.id.cmp(&right.id));
+    delta.evidence.sort_by(|left, right| {
+        left.owner_type
+            .cmp(&right.owner_type)
+            .then(left.owner_id.cmp(&right.owner_id))
+            .then(left.ordinal.cmp(&right.ordinal))
+    });
+    delta.diagnostics.sort_by(|left, right| {
+        left.ordinal
+            .cmp(&right.ordinal)
+            .then(left.id.cmp(&right.id))
+    });
+    delta.session.coverage.completeness.sort();
+    delta.session.coverage.completeness.dedup();
+    delta.session.coverage.reasons.sort();
+    delta.session.coverage.reasons.dedup();
+}
+
+fn validate_runtime_union(base: &GraphSnapshot, delta: &RuntimeSessionDelta) -> Result<()> {
+    let session = &delta.session;
+    if session.id.trim().is_empty()
+        || session.source_session_id.trim().is_empty()
+        || session.trace_digest.trim().is_empty()
+        || !matches!(session.status.as_str(), "completed" | "partial")
+        || session.event_count == 0
+        || session.observation_count == 0
+        || session.first_observed_at > session.last_observed_at
+    {
+        bail!("runtime session metadata is invalid");
+    }
+    if session.profile.id != session.profile_id
+        || session
+            .profile
+            .properties
+            .get("profile_phase")
+            .and_then(Value::as_str)
+            != Some("runtime")
+    {
+        bail!("runtime session profile contract is invalid");
+    }
+    if !matches!(session.profile_status.as_str(), "resolved" | "unresolved")
+        || session
+            .profile
+            .properties
+            .get("profile_status")
+            .and_then(Value::as_str)
+            != Some(session.profile_status.as_str())
+        || session.profile.environment != session.environment
+    {
+        bail!("runtime session profile status or environment is invalid");
+    }
+    if session.profile_status == "resolved" {
+        let parent_id = session
+            .parent_profile_id
+            .as_deref()
+            .context("resolved runtime profile has no parent")?;
+        let parent = base
+            .profiles
+            .iter()
+            .find(|profile| profile.id == parent_id)
+            .with_context(|| format!("runtime parent profile {parent_id} was not found"))?;
+        let effective_input_id = canonical_effective_input_id(parent);
+        if declared_parent_profile_id(&session.profile) != Some(parent_id)
+            || declared_effective_input_id(&session.profile) != Some(effective_input_id.as_str())
+            || session.profile.language != parent.language
+            || session.profile_reason.is_some()
+        {
+            bail!("runtime profile effective parent contract is invalid");
+        }
+    } else if session.parent_profile_id.is_some()
+        || declared_parent_profile_id(&session.profile).is_some()
+        || session.profile_reason.as_deref().is_none_or(str::is_empty)
+    {
+        bail!("unresolved runtime profile must retain one bounded reason and no parent");
+    }
+
+    let base_nodes = base
+        .nodes
+        .iter()
+        .map(|node| (node.id.as_str(), node))
+        .collect::<BTreeMap<_, _>>();
+    let mut node_ids = base_nodes.keys().copied().collect::<BTreeSet<_>>();
+    let mut delta_node_ids = BTreeSet::new();
+    for node in &delta.nodes {
+        if !delta_node_ids.insert(node.id.as_str()) {
+            bail!("runtime node {} is duplicated", node.id);
+        }
+        if let Some(existing) = base_nodes.get(node.id.as_str()) {
+            if **existing != *node {
+                bail!("runtime node {} would overwrite the base graph", node.id);
+            }
+        } else if node.properties.get("runtime_only").and_then(Value::as_bool) != Some(true) {
+            bail!("new runtime node {} is not an explicit sentinel", node.id);
+        }
+        node_ids.insert(node.id.as_str());
+    }
+
+    let base_sites = base
+        .sites
+        .iter()
+        .map(|site| (site.id.as_str(), site))
+        .collect::<BTreeMap<_, _>>();
+    let mut site_ids = BTreeSet::new();
+    for site in &delta.sites {
+        if let Some(existing) = base_sites.get(site.id.as_str())
+            && **existing != *site
+        {
+            bail!("runtime site {} conflicts with the base graph", site.id);
+        }
+        if !site_ids.insert(site.id.as_str())
+            || site.profile_id != session.profile_id
+            || site.precision != "observed"
+            || !node_ids.contains(site.source.as_str())
+            || site
+                .target_ids
+                .iter()
+                .any(|target| !node_ids.contains(target.as_str()))
+        {
+            bail!(
+                "runtime site {} is not authorized by the base graph",
+                site.id
+            );
+        }
+    }
+
+    let base_edges = base
+        .edges
+        .iter()
+        .map(|edge| (edge.id.as_str(), edge))
+        .collect::<BTreeMap<_, _>>();
+    let mut edge_ids = BTreeSet::new();
+    let environment_name = session
+        .environment
+        .get("name")
+        .and_then(Value::as_str)
+        .context("runtime session environment has no name")?;
+    for edge in &delta.edges {
+        if let Some(existing) = base_edges.get(edge.id.as_str())
+            && **existing != *edge
+        {
+            bail!("runtime edge {} conflicts with the base graph", edge.id);
+        }
+        if !edge_ids.insert(edge.id.as_str())
+            || edge.phase != "runtime"
+            || edge.precision != "observed"
+            || edge.profile_id != session.profile_id
+            || edge.environment != environment_name
+            || !node_ids.contains(edge.source.as_str())
+            || !node_ids.contains(edge.target.as_str())
+            || edge
+                .site_id
+                .as_deref()
+                .is_none_or(|site_id| !site_ids.contains(site_id))
+        {
+            bail!(
+                "runtime edge {} is not authorized by the base graph",
+                edge.id
+            );
+        }
+    }
+
+    let owners = site_ids
+        .iter()
+        .map(|id| ("site", *id))
+        .chain(edge_ids.iter().map(|id| ("edge", *id)))
+        .collect::<BTreeSet<_>>();
+    let mut evidence_keys = BTreeSet::new();
+    for evidence in &delta.evidence {
+        let properties = evidence
+            .properties
+            .as_object()
+            .context("runtime evidence properties must be an object")?;
+        let first_observed_at = properties
+            .get("first_observed_at")
+            .and_then(Value::as_str)
+            .context("runtime evidence has no first observation time")?;
+        let last_observed_at = properties
+            .get("last_observed_at")
+            .and_then(Value::as_str)
+            .context("runtime evidence has no last observation time")?;
+        if !owners.contains(&(evidence.owner_type.as_str(), evidence.owner_id.as_str()))
+            || evidence.kind != "runtime"
+            || properties.get("session_id").and_then(Value::as_str) != Some(session.id.as_str())
+            || properties.get("source_session_id").and_then(Value::as_str)
+                != Some(session.source_session_id.as_str())
+            || properties.get("environment") != Some(&session.environment)
+            || properties.get("count").and_then(Value::as_u64) == Some(0)
+            || properties.get("count").and_then(Value::as_u64).is_none()
+            || first_observed_at > last_observed_at
+            || first_observed_at < session.first_observed_at.as_str()
+            || last_observed_at > session.last_observed_at.as_str()
+            || !evidence_keys.insert((
+                evidence.owner_type.as_str(),
+                evidence.owner_id.as_str(),
+                evidence.ordinal,
+            ))
+        {
+            bail!("runtime evidence is not owned by its session graph");
+        }
+    }
+    let mut diagnostic_ids = BTreeSet::new();
+    for (ordinal, diagnostic) in delta.diagnostics.iter().enumerate() {
+        if diagnostic.ordinal != ordinal as i64
+            || diagnostic.id.trim().is_empty()
+            || !diagnostic_ids.insert(diagnostic.id.as_str())
+            || diagnostic
+                .properties
+                .get("session_id")
+                .and_then(Value::as_str)
+                != Some(session.id.as_str())
+        {
+            bail!("runtime diagnostics are not canonical for their session");
+        }
+    }
+    if owners.iter().any(|(owner_type, owner_id)| {
+        !delta.evidence.iter().any(|evidence| {
+            evidence.owner_type == *owner_type
+                && evidence.owner_id == *owner_id
+                && evidence.ordinal == 0
+        })
+    }) {
+        bail!("runtime graph owner is missing primary evidence");
+    }
+    Ok(())
+}
+
+fn store_runtime_session(tx: &Transaction<'_>, delta: &RuntimeSessionDelta) -> Result<()> {
+    if let Some(existing) = tx
+        .query_row(
+            "SELECT trace_digest FROM runtime_sessions WHERE id=?1",
+            [&delta.session.id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+    {
+        if existing != delta.session.trace_digest {
+            bail!(
+                "runtime session identity collision for {}",
+                delta.session.id
+            );
+        }
+        return Ok(());
+    }
+    let session = &delta.session;
+    tx.execute(
+        "INSERT INTO runtime_sessions(
+            id, base_snapshot_id, source_session_id, schema_version, status, trace_digest,
+            profile_id, parent_profile_id, profile_status, profile_reason, profile_json,
+            environment_json, redaction_json, started_at, ended_at, first_observed_at,
+            last_observed_at, event_count, observation_count, resolved_targets,
+            external_targets, unresolved_targets, redacted_values, coverage_json, created_at
+         ) VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+            ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25
+         )",
+        params![
+            session.id,
+            session.base_snapshot_id,
+            session.source_session_id,
+            session.schema_version,
+            session.status,
+            session.trace_digest,
+            session.profile_id,
+            session.parent_profile_id,
+            session.profile_status,
+            session.profile_reason,
+            serde_json::to_string(&session.profile)?,
+            serde_json::to_string(&session.environment)?,
+            serde_json::to_string(&session.redaction)?,
+            session.started_at,
+            session.ended_at,
+            session.first_observed_at,
+            session.last_observed_at,
+            session.event_count,
+            session.observation_count,
+            session.resolved_targets,
+            session.external_targets,
+            session.unresolved_targets,
+            session.redacted_values,
+            serde_json::to_string(&session.coverage)?,
+            session.created_at,
+        ],
+    )?;
+    insert_json_rows(tx, "runtime_nodes", &session.id, &delta.nodes, |node| {
+        node.id.as_str()
+    })?;
+    insert_json_rows(tx, "runtime_sites", &session.id, &delta.sites, |site| {
+        site.id.as_str()
+    })?;
+    insert_json_rows(tx, "runtime_edges", &session.id, &delta.edges, |edge| {
+        edge.id.as_str()
+    })?;
+    for evidence in &delta.evidence {
+        tx.execute(
+            "INSERT INTO runtime_evidence(
+                session_id, owner_type, owner_id, ordinal, raw_json
+             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                session.id,
+                evidence.owner_type,
+                evidence.owner_id,
+                evidence.ordinal,
+                serde_json::to_string(evidence)?,
+            ],
+        )?;
+    }
+    for diagnostic in &delta.diagnostics {
+        tx.execute(
+            "INSERT INTO runtime_diagnostics(session_id, ordinal, id, raw_json)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                session.id,
+                diagnostic.ordinal,
+                diagnostic.id,
+                serde_json::to_string(diagnostic)?,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn insert_json_rows<T: Serialize>(
+    tx: &Transaction<'_>,
+    table: &str,
+    session_id: &str,
+    values: &[T],
+    id: impl Fn(&T) -> &str,
+) -> Result<()> {
+    let sql = format!("INSERT INTO {table}(session_id, id, raw_json) VALUES (?1, ?2, ?3)");
+    for value in values {
+        tx.execute(
+            &sql,
+            params![session_id, id(value), serde_json::to_string(value)?],
+        )?;
+    }
+    Ok(())
+}
+
+fn load_runtime_session_record(
+    connection: &Connection,
+    session_id: &str,
+) -> Result<Option<RuntimeSessionRecord>> {
+    connection
+        .query_row(
+            "SELECT id, base_snapshot_id, source_session_id, schema_version, status,
+                    trace_digest, profile_id, parent_profile_id, profile_status,
+                    profile_reason, profile_json, environment_json, redaction_json,
+                    started_at, ended_at, first_observed_at, last_observed_at,
+                    event_count, observation_count, resolved_targets, external_targets,
+                    unresolved_targets, redacted_values, coverage_json, created_at
+               FROM runtime_sessions WHERE id=?1",
+            [session_id],
+            |row| {
+                let profile = decode_json_column(row, 10)?;
+                let environment = decode_json_column(row, 11)?;
+                let redaction = decode_json_column(row, 12)?;
+                let coverage = decode_json_column(row, 23)?;
+                Ok(RuntimeSessionRecord {
+                    id: row.get(0)?,
+                    base_snapshot_id: row.get(1)?,
+                    source_session_id: row.get(2)?,
+                    schema_version: row.get(3)?,
+                    status: row.get(4)?,
+                    trace_digest: row.get(5)?,
+                    profile_id: row.get(6)?,
+                    parent_profile_id: row.get(7)?,
+                    profile_status: row.get(8)?,
+                    profile_reason: row.get(9)?,
+                    profile,
+                    environment,
+                    redaction,
+                    started_at: row.get(13)?,
+                    ended_at: row.get(14)?,
+                    first_observed_at: row.get(15)?,
+                    last_observed_at: row.get(16)?,
+                    event_count: row.get(17)?,
+                    observation_count: row.get(18)?,
+                    resolved_targets: row.get(19)?,
+                    external_targets: row.get(20)?,
+                    unresolved_targets: row.get(21)?,
+                    redacted_values: row.get(22)?,
+                    coverage,
+                    created_at: row.get(24)?,
+                })
+            },
+        )
+        .optional()
+        .context("failed to load runtime session")
+}
+
+fn decode_json_column<T: for<'de> Deserialize<'de>>(
+    row: &rusqlite::Row<'_>,
+    index: usize,
+) -> rusqlite::Result<T> {
+    let raw = row.get::<_, String>(index)?;
+    serde_json::from_str(&raw).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            raw.len(),
+            rusqlite::types::Type::Text,
+            Box::new(error),
+        )
+    })
+}
+
+fn load_runtime_delta(connection: &Connection, session_id: &str) -> Result<RuntimeSessionDelta> {
+    let session = load_runtime_session_record(connection, session_id)?
+        .with_context(|| format!("runtime session {session_id} was not found"))?;
+    let nodes = load_json_rows(connection, "runtime_nodes", session_id)?;
+    let sites = load_json_rows(connection, "runtime_sites", session_id)?;
+    let edges = load_json_rows(connection, "runtime_edges", session_id)?;
+    let evidence = load_json_rows_ordered(
+        connection,
+        "runtime_evidence",
+        session_id,
+        "owner_type, owner_id, ordinal",
+    )?;
+    let diagnostics =
+        load_json_rows_ordered(connection, "runtime_diagnostics", session_id, "ordinal, id")?;
+    Ok(RuntimeSessionDelta {
+        session,
+        nodes,
+        sites,
+        edges,
+        evidence,
+        diagnostics,
+    })
+}
+
+fn load_json_rows<T: for<'de> Deserialize<'de>>(
+    connection: &Connection,
+    table: &str,
+    session_id: &str,
+) -> Result<Vec<T>> {
+    load_json_rows_ordered(connection, table, session_id, "id")
+}
+
+fn load_json_rows_ordered<T: for<'de> Deserialize<'de>>(
+    connection: &Connection,
+    table: &str,
+    session_id: &str,
+    order: &str,
+) -> Result<Vec<T>> {
+    let sql = format!("SELECT raw_json FROM {table} WHERE session_id=?1 ORDER BY {order}");
+    let mut statement = connection.prepare(&sql)?;
+    statement
+        .query_map([session_id], |row| {
+            let raw = row.get::<_, String>(0)?;
+            serde_json::from_str(&raw).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    raw.len(),
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+pub(super) fn merge_runtime_sessions(
+    connection: &Connection,
+    snapshot: &mut GraphSnapshot,
+    runtime_session_ids: &[String],
+) -> Result<()> {
+    let canonical = runtime_session_ids
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if canonical != runtime_session_ids {
+        bail!("completed snapshot runtime session set is not canonical");
+    }
+    let mut profiles = snapshot
+        .profiles
+        .drain(..)
+        .map(|profile| (profile.id.clone(), profile))
+        .collect::<BTreeMap<_, _>>();
+    let mut nodes = snapshot
+        .nodes
+        .drain(..)
+        .map(|node| (node.id.clone(), node))
+        .collect::<BTreeMap<_, _>>();
+    let mut sites = snapshot
+        .sites
+        .drain(..)
+        .map(|site| (site.id.clone(), site))
+        .collect::<BTreeMap<_, _>>();
+    let mut edges = snapshot
+        .edges
+        .drain(..)
+        .map(|edge| (edge.id.clone(), edge))
+        .collect::<BTreeMap<_, _>>();
+    let mut evidence = snapshot.evidence.drain(..).collect::<Vec<_>>();
+    let mut diagnostics = snapshot.diagnostics.drain(..).collect::<Vec<_>>();
+    let mut diagnostic_indexes = diagnostics
+        .iter()
+        .enumerate()
+        .map(|(index, diagnostic)| (diagnostic.id.clone(), index))
+        .collect::<BTreeMap<_, _>>();
+    let mut next_diagnostic_ordinal = diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.ordinal)
+        .max()
+        .unwrap_or(-1)
+        .saturating_add(1);
+
+    for session_id in runtime_session_ids {
+        let delta = load_runtime_delta(connection, session_id)?;
+        insert_exact(
+            &mut profiles,
+            delta.session.profile.id.clone(),
+            delta.session.profile,
+        )?;
+        for node in delta.nodes {
+            insert_exact(&mut nodes, node.id.clone(), node)?;
+        }
+        for site in delta.sites {
+            insert_exact(&mut sites, site.id.clone(), site)?;
+        }
+        for edge in delta.edges {
+            insert_exact(&mut edges, edge.id.clone(), edge)?;
+        }
+        evidence.extend(delta.evidence);
+        for mut diagnostic in delta.diagnostics {
+            if let Some(index) = diagnostic_indexes.get(&diagnostic.id) {
+                if diagnostics[*index] != diagnostic {
+                    bail!("runtime graph identity collision for {}", diagnostic.id);
+                }
+                continue;
+            }
+            diagnostic.ordinal = next_diagnostic_ordinal;
+            next_diagnostic_ordinal = next_diagnostic_ordinal.saturating_add(1);
+            diagnostic_indexes.insert(diagnostic.id.clone(), diagnostics.len());
+            diagnostics.push(diagnostic);
+        }
+        union_coverage(&mut snapshot.coverage, &delta.session.coverage);
+    }
+    reassign_runtime_evidence_ordinals(&mut evidence);
+    snapshot.profiles = profiles.into_values().collect();
+    snapshot.nodes = nodes.into_values().collect();
+    snapshot.sites = sites.into_values().collect();
+    snapshot.edges = edges.into_values().collect();
+    snapshot.evidence = evidence;
+    snapshot.diagnostics = diagnostics;
+    snapshot.coverage.profiles = snapshot.profiles.len() as u64;
+    refresh_profile_matrix(snapshot, false);
+    Ok(())
+}
+
+fn insert_exact<T: PartialEq>(
+    values: &mut BTreeMap<String, T>,
+    id: String,
+    value: T,
+) -> Result<()> {
+    if let Some(existing) = values.get(&id) {
+        if *existing != value {
+            bail!("runtime graph identity collision for {id}");
+        }
+    } else {
+        values.insert(id, value);
+    }
+    Ok(())
+}
+
+fn reassign_runtime_evidence_ordinals(evidence: &mut [EvidenceRecord]) {
+    evidence.sort_by(|left, right| {
+        left.owner_type
+            .cmp(&right.owner_type)
+            .then(left.owner_id.cmp(&right.owner_id))
+            .then_with(|| {
+                evidence_session_id(left)
+                    .cmp(evidence_session_id(right))
+                    .then(left.ordinal.cmp(&right.ordinal))
+            })
+    });
+    let mut previous = None::<(String, String)>;
+    let mut ordinal = 0_i64;
+    for item in evidence {
+        let owner = (item.owner_type.clone(), item.owner_id.clone());
+        if previous.as_ref() != Some(&owner) {
+            previous = Some(owner);
+            ordinal = 0;
+        }
+        item.ordinal = ordinal;
+        ordinal += 1;
+    }
+}
+
+fn evidence_session_id(evidence: &EvidenceRecord) -> &str {
+    evidence
+        .properties
+        .get("session_id")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+}
+
+pub fn runtime_context_for_edge(snapshot: &GraphSnapshot, edge: &EdgeRecord) -> RuntimeEdgeContext {
+    let mut context = RuntimeEdgeContext::default();
+    for evidence in snapshot.evidence.iter().filter(|evidence| {
+        evidence.owner_type == "edge" && evidence.owner_id == edge.id && evidence.kind == "runtime"
+    }) {
+        push_string(
+            &mut context.session_ids,
+            evidence.properties.get("session_id"),
+        );
+        push_string(
+            &mut context.source_session_ids,
+            evidence.properties.get("source_session_id"),
+        );
+        if let Some(environment) = evidence.properties.get("environment") {
+            push_string(&mut context.environment_names, environment.get("name"));
+            push_string(&mut context.runtimes, environment.get("runtime"));
+            push_string(&mut context.regions, environment.get("region"));
+        }
+        context.observation_count = context.observation_count.saturating_add(
+            evidence
+                .properties
+                .get("count")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+        );
+        update_min(
+            &mut context.first_observed_at,
+            evidence
+                .properties
+                .get("first_observed_at")
+                .and_then(Value::as_str),
+        );
+        update_max(
+            &mut context.last_observed_at,
+            evidence
+                .properties
+                .get("last_observed_at")
+                .and_then(Value::as_str),
+        );
+    }
+    context.session_ids.sort();
+    context.session_ids.dedup();
+    context.source_session_ids.sort();
+    context.source_session_ids.dedup();
+    context.environment_names.sort();
+    context.environment_names.dedup();
+    context.runtimes.sort();
+    context.runtimes.dedup();
+    context.regions.sort();
+    context.regions.dedup();
+    context
+}
+
+fn push_string(output: &mut Vec<String>, value: Option<&Value>) {
+    if let Some(value) = value.and_then(Value::as_str) {
+        output.push(value.to_owned());
+    }
+}
+
+fn update_min(current: &mut Option<String>, value: Option<&str>) {
+    if let Some(value) = value
+        && current.as_deref().is_none_or(|current| value < current)
+    {
+        *current = Some(value.to_owned());
+    }
+}
+
+fn update_max(current: &mut Option<String>, value: Option<&str>) {
+    if let Some(value) = value
+        && current.as_deref().is_none_or(|current| value > current)
+    {
+        *current = Some(value.to_owned());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    fn seeded_store() -> Result<(Store, String, GraphSnapshot)> {
+        let mut store = Store::open_in_memory()?;
+        store.start_scan_with_revision(
+            "runtime-atomic",
+            Path::new("/fixture"),
+            false,
+            Some("revision-1"),
+        )?;
+        let coverage = json!({
+            "profiles":1,"files_discovered":0,"files_analyzed":0,"files_skipped":0,
+            "dependency_sites":0,"resolved":0,"candidates":0,"external":0,
+            "unresolved":0,"unsupported_syntax":0,"project_code_executed":false,
+            "completeness":["syntax-complete"],"reasons":[]
+        });
+        let common = |event: &str, seq: u64| {
+            json!({
+                "event":event,"protocol_version":"1.0","scan_id":"runtime-atomic",
+                "adapter":"fixture","adapter_version":"1.0","seq":seq
+            })
+        };
+        let mut started = common("scan_started", 1);
+        started["root"] = json!("/fixture");
+        started["project_code_executed"] = json!(false);
+        started["safe_mode"] = json!(true);
+        store.ingest_event(&started)?;
+        let mut profile = common("profile_declared", 2);
+        profile["profile"] = json!({
+            "id":"profile:base","language":"typescript","target":"server",
+            "features":[],"environment":{},"source_revision":"revision-1","properties":{}
+        });
+        store.ingest_event(&profile)?;
+        for (offset, node) in [
+            json!({
+                "id":"workspace:fixture","kind":"workspace",
+                "locator":"workspace://repository:fixture","display_name":"fixture",
+                "properties":{"repository_identity":"repository:fixture"}
+            }),
+            json!({
+                "id":"file:source","kind":"file","locator":"file://src/source.ts",
+                "display_name":"source.ts","properties":{"path":"src/source.ts"}
+            }),
+            json!({
+                "id":"route:target","kind":"route","locator":"route:/target",
+                "display_name":"/target","properties":{}
+            }),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut event = common("node_upsert", offset as u64 + 3);
+            event["node"] = node;
+            store.ingest_event(&event)?;
+        }
+        let mut profile_completed = common("profile_completed", 6);
+        profile_completed["profile_id"] = json!("profile:base");
+        profile_completed["coverage"] = coverage.clone();
+        store.ingest_event(&profile_completed)?;
+        let mut completed = common("scan_completed", 7);
+        completed["coverage"] = coverage;
+        store.ingest_event(&completed)?;
+        store.finish_scan("runtime-atomic", "completed", None, true)?;
+        let snapshot_id = store.current_snapshot_id()?.context("base snapshot")?;
+        let snapshot = store.load_completed_snapshot(&snapshot_id)?;
+        Ok((store, snapshot_id, snapshot))
+    }
+
+    fn valid_delta(base_snapshot_id: &str, base: &GraphSnapshot) -> RuntimeSessionDelta {
+        let profile_id = "profile:runtime".to_owned();
+        let session_id = "runtime-session:test".to_owned();
+        let coverage = CoverageRecord {
+            profiles: 1,
+            dependency_sites: 1,
+            resolved: 1,
+            project_code_executed: true,
+            completeness: vec!["runtime-observed".to_owned()],
+            ..CoverageRecord::default()
+        };
+        let profile = ProfileRecord {
+            id: profile_id.clone(),
+            language: "typescript".to_owned(),
+            toolchain: None,
+            command: None,
+            target: Some("server".to_owned()),
+            features: Vec::new(),
+            environment: json!({"name":"test"}),
+            source_revision: Some("revision-1".to_owned()),
+            properties: json!({
+                "profile_phase":"runtime",
+                "parent_profile_id":"profile:base",
+                "effective_input_id":canonical_effective_input_id(&base.profiles[0]),
+                "profile_status":"resolved",
+                "profile_reason":null,
+            }),
+            coverage: None,
+        };
+        let properties = json!({
+            "session_id":session_id,
+            "source_session_id":"collector-session",
+            "environment":{"name":"test"},
+            "count":1,
+            "first_observed_at":"2026-07-23T00:00:01Z",
+            "last_observed_at":"2026-07-23T00:00:01Z"
+        });
+        RuntimeSessionDelta {
+            session: RuntimeSessionRecord {
+                id: session_id,
+                base_snapshot_id: base_snapshot_id.to_owned(),
+                source_session_id: "collector-session".to_owned(),
+                schema_version: "1.0".to_owned(),
+                status: "completed".to_owned(),
+                trace_digest: "runtime-trace:sha256:test".to_owned(),
+                profile_id: profile_id.clone(),
+                parent_profile_id: Some("profile:base".to_owned()),
+                profile_status: "resolved".to_owned(),
+                profile_reason: None,
+                profile,
+                environment: json!({"name":"test"}),
+                redaction: json!({"redacted_value_count":0}),
+                started_at: "2026-07-23T00:00:00Z".to_owned(),
+                ended_at: Some("2026-07-23T00:00:02Z".to_owned()),
+                first_observed_at: "2026-07-23T00:00:01Z".to_owned(),
+                last_observed_at: "2026-07-23T00:00:01Z".to_owned(),
+                event_count: 1,
+                observation_count: 1,
+                resolved_targets: 1,
+                external_targets: 0,
+                unresolved_targets: 0,
+                redacted_values: 0,
+                coverage,
+                created_at: "2026-07-23T00:00:03Z".to_owned(),
+            },
+            nodes: Vec::new(),
+            sites: vec![SiteRecord {
+                id: "site:runtime".to_owned(),
+                source: "file:source".to_owned(),
+                kind: "calls".to_owned(),
+                specifier: Some("route:/target".to_owned()),
+                profile_id: profile_id.clone(),
+                resolution_status: "resolved".to_owned(),
+                precision: "observed".to_owned(),
+                condition: json!({"op":"true"}),
+                target_ids: vec!["route:target".to_owned()],
+                reason: None,
+            }],
+            edges: vec![EdgeRecord {
+                id: "edge:runtime".to_owned(),
+                site_id: Some("site:runtime".to_owned()),
+                source: "file:source".to_owned(),
+                target: "route:target".to_owned(),
+                kind: "calls".to_owned(),
+                phase: "runtime".to_owned(),
+                environment: "test".to_owned(),
+                profile_id,
+                resolution_status: "resolved".to_owned(),
+                precision: "observed".to_owned(),
+                condition: json!({"op":"true"}),
+                generated: false,
+            }],
+            evidence: vec![
+                runtime_test_evidence("site", "site:runtime", properties.clone()),
+                runtime_test_evidence("edge", "edge:runtime", properties),
+            ],
+            diagnostics: Vec::new(),
+        }
+    }
+
+    fn runtime_test_evidence(
+        owner_type: &str,
+        owner_id: &str,
+        properties: Value,
+    ) -> EvidenceRecord {
+        EvidenceRecord {
+            owner_type: owner_type.to_owned(),
+            owner_id: owner_id.to_owned(),
+            ordinal: 0,
+            kind: "runtime".to_owned(),
+            extractor: "runtime-trace".to_owned(),
+            extractor_version: "1.0".to_owned(),
+            path: String::new(),
+            start_line: 1,
+            start_column: 1,
+            end_line: 1,
+            end_column: 1,
+            detail: None,
+            properties,
+        }
+    }
+
+    #[test]
+    fn runtime_context_aggregates_sessions_and_time_range() {
+        let edge = EdgeRecord {
+            id: "edge:runtime".to_owned(),
+            site_id: Some("site:runtime".to_owned()),
+            source: "node:a".to_owned(),
+            target: "node:b".to_owned(),
+            kind: "calls".to_owned(),
+            phase: "runtime".to_owned(),
+            environment: "production".to_owned(),
+            profile_id: "profile:runtime".to_owned(),
+            resolution_status: "resolved".to_owned(),
+            precision: "observed".to_owned(),
+            condition: json!({"op":"true"}),
+            generated: false,
+        };
+        let evidence = |session: &str, count: u64, first: &str, last: &str| EvidenceRecord {
+            owner_type: "edge".to_owned(),
+            owner_id: edge.id.clone(),
+            ordinal: 0,
+            kind: "runtime".to_owned(),
+            extractor: "runtime-trace".to_owned(),
+            extractor_version: "1.0".to_owned(),
+            path: String::new(),
+            start_line: 1,
+            start_column: 1,
+            end_line: 1,
+            end_column: 1,
+            detail: None,
+            properties: json!({
+                "session_id":session,
+                "source_session_id":session,
+                "environment":{"name":"production","runtime":"node"},
+                "count":count,
+                "first_observed_at":first,
+                "last_observed_at":last,
+            }),
+        };
+        let snapshot = GraphSnapshot {
+            scan: super::super::ScanRecord {
+                id: "scan".to_owned(),
+                root: ".".to_owned(),
+                status: "completed".to_owned(),
+                strict: false,
+                started_at: String::new(),
+                completed_at: None,
+                project_code_executed: false,
+                error: None,
+                parent_snapshot_id: None,
+                source_revision: None,
+            },
+            profiles: Vec::new(),
+            nodes: Vec::new(),
+            sites: Vec::new(),
+            edges: vec![edge.clone()],
+            evidence: vec![
+                evidence(
+                    "session:b",
+                    3,
+                    "2026-01-02T00:00:00Z",
+                    "2026-01-03T00:00:00Z",
+                ),
+                evidence(
+                    "session:a",
+                    2,
+                    "2026-01-01T00:00:00Z",
+                    "2026-01-04T00:00:00Z",
+                ),
+            ],
+            diagnostics: Vec::new(),
+            file_coverage: Vec::new(),
+            adapter_logs: Vec::new(),
+            coverage: CoverageRecord::default(),
+            profile_matrix: super::super::ProfileMatrixRecord::default(),
+        };
+        let context = runtime_context_for_edge(&snapshot, &edge);
+        assert_eq!(context.session_ids, ["session:a", "session:b"]);
+        assert_eq!(context.observation_count, 5);
+        assert_eq!(
+            context.first_observed_at.as_deref(),
+            Some("2026-01-01T00:00:00Z")
+        );
+        assert_eq!(
+            context.last_observed_at.as_deref(),
+            Some("2026-01-04T00:00:00Z")
+        );
+    }
+
+    #[test]
+    fn failed_promotion_rolls_back_every_runtime_row_and_pointer_change() -> Result<()> {
+        let (mut store, base_snapshot_id, base) = seeded_store()?;
+        let delta = valid_delta(&base_snapshot_id, &base);
+        store.connection.execute_batch(
+            "CREATE TRIGGER reject_runtime_promotion
+             BEFORE UPDATE ON current_completed_snapshot
+             BEGIN SELECT RAISE(ABORT, 'injected runtime promotion failure'); END;",
+        )?;
+        let error = store
+            .import_runtime_session(&base_snapshot_id, delta)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("injected runtime promotion failure"));
+        assert_eq!(
+            store.current_snapshot_id()?.as_deref(),
+            Some(base_snapshot_id.as_str())
+        );
+        assert!(store.runtime_session("runtime-session:test")?.is_none());
+        let runtime_imports: u64 =
+            store
+                .connection
+                .query_row("SELECT COUNT(*) FROM runtime_imports", [], |row| row.get(0))?;
+        assert_eq!(runtime_imports, 0);
+        let runtime_snapshots: u64 = store.connection.query_row(
+            "SELECT COUNT(*) FROM completed_snapshots WHERE source_kind='runtime'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(runtime_snapshots, 0);
+        Ok(())
+    }
+}

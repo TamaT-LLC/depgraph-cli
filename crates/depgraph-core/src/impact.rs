@@ -5,7 +5,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use depgraph_store::{EdgeRecord, GraphSnapshot, NodeRecord};
+use depgraph_store::{EdgeRecord, GraphSnapshot, NodeRecord, runtime_context_for_edge};
 use serde::Serialize;
 
 use crate::{
@@ -52,6 +52,12 @@ pub struct ImpactFilters {
     pub depth: Option<usize>,
     pub profiles: Vec<String>,
     pub conditions: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub phases: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub sessions: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub environments: Vec<String>,
     pub max_nodes: usize,
     pub max_edges: usize,
 }
@@ -74,18 +80,55 @@ impl ImpactFilters {
             depth,
             profiles: normalize_filter("profile", profiles)?,
             conditions: normalize_filter("condition", conditions)?,
+            phases: Vec::new(),
+            sessions: Vec::new(),
+            environments: Vec::new(),
             max_nodes,
             max_edges,
         })
     }
 
-    fn matches(&self, edge: &EdgeRecord) -> bool {
-        (self.profiles.is_empty() || self.profiles.binary_search(&edge.profile_id).is_ok())
+    pub fn with_runtime_filters(
+        mut self,
+        phases: Vec<String>,
+        sessions: Vec<String>,
+        environments: Vec<String>,
+    ) -> Result<Self> {
+        self.phases = normalize_filter("phase", phases)?;
+        self.sessions = normalize_filter("session", sessions)?;
+        self.environments = normalize_filter("environment", environments)?;
+        Ok(self)
+    }
+
+    fn matches(&self, snapshot: &GraphSnapshot, edge: &EdgeRecord) -> bool {
+        let structural = (self.profiles.is_empty()
+            || self.profiles.binary_search(&edge.profile_id).is_ok())
             && (self.conditions.is_empty()
                 || self
                     .conditions
                     .binary_search(&render_condition(&edge.condition))
                     .is_ok())
+            && (self.phases.is_empty() || self.phases.binary_search(&edge.phase).is_ok());
+        if !structural {
+            return false;
+        }
+        if self.sessions.is_empty() && self.environments.is_empty() {
+            return true;
+        }
+        let context = runtime_context_for_edge(snapshot, edge);
+        let session_matches = self.sessions.is_empty()
+            || context
+                .session_ids
+                .iter()
+                .chain(context.source_session_ids.iter())
+                .any(|value| self.sessions.binary_search(value).is_ok());
+        let environment_matches = self.environments.is_empty()
+            || std::iter::once(&edge.environment)
+                .chain(context.environment_names.iter())
+                .chain(context.runtimes.iter())
+                .chain(context.regions.iter())
+                .any(|value| self.environments.binary_search(value).is_ok());
+        session_matches && environment_matches
     }
 }
 
@@ -750,7 +793,11 @@ fn adjacency<'a>(
     filters: &ImpactFilters,
 ) -> BTreeMap<String, Vec<&'a EdgeRecord>> {
     let mut adjacency = BTreeMap::<String, Vec<&EdgeRecord>>::new();
-    for edge in snapshot.edges.iter().filter(|edge| filters.matches(edge)) {
+    for edge in snapshot
+        .edges
+        .iter()
+        .filter(|edge| filters.matches(snapshot, edge))
+    {
         let key = if reverse { &edge.target } else { &edge.source };
         adjacency.entry(key.clone()).or_default().push(edge);
     }
