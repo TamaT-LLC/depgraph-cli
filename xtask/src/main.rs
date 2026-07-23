@@ -37,10 +37,6 @@ const RUST_ANALYZER_DIRECT_DEPENDENCIES: &[&str] =
     &["ra_ap_hir", "ra_ap_ide_db", "ra_ap_syntax", "ra_ap_vfs"];
 const SALSA_DIRECT_DEPENDENCIES: &[&str] = &["salsa", "salsa-macro-rules", "salsa-macros"];
 const TYPESCRIPT_VERSION: &str = "7.0.2";
-const PREVIOUS_RELEASE_VERSION: &str = "0.2.0-rc.1";
-const PREVIOUS_RELEASE_STORE_SCHEMA_VERSION: i64 = 5;
-const MINIMUM_MIGRATABLE_STORE_SCHEMA_VERSION: i64 = 1;
-const MILESTONE4_PACKAGED_SMOKE_CONTRACT: &str = "milestone4-packaged-smoke-v1";
 const WEB_SEMANTIC_CAPABILITIES: &[&str] = &[
     "astro-component-render-hydration-v1",
     "framework-semantic-completeness-v1",
@@ -110,23 +106,7 @@ struct ReleaseManifest {
     runtime_requirements: BTreeMap<String, String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct ReleaseCompatibility {
-    store_schema_version: i64,
-    minimum_migratable_store_schema_version: i64,
-    previous_release_version: String,
-    previous_release_store_schema_version: i64,
-    cache_contract_version: u32,
-    snapshot_diff_schema_version: String,
-    incremental_plan_schema_version: String,
-    daemon_status_schema_version: String,
-    policy_schema_version: String,
-    policy_result_schema_version: String,
-    runtime_trace_schema_version: String,
-    graphml_schema_version: String,
-    packaged_smoke_contract: String,
-}
+type ReleaseCompatibility = depgraph_core::ReleaseCompatibilityHealth;
 
 #[derive(Clone, Debug, serde::Deserialize, Serialize)]
 struct Artifact {
@@ -213,21 +193,7 @@ struct ReleaseVerificationReport {
 }
 
 fn release_compatibility() -> ReleaseCompatibility {
-    ReleaseCompatibility {
-        store_schema_version: depgraph_store::STORE_SCHEMA_VERSION,
-        minimum_migratable_store_schema_version: MINIMUM_MIGRATABLE_STORE_SCHEMA_VERSION,
-        previous_release_version: PREVIOUS_RELEASE_VERSION.to_owned(),
-        previous_release_store_schema_version: PREVIOUS_RELEASE_STORE_SCHEMA_VERSION,
-        cache_contract_version: depgraph_store::CACHE_CONTRACT_VERSION,
-        snapshot_diff_schema_version: depgraph_store::SNAPSHOT_DIFF_SCHEMA_VERSION.to_owned(),
-        incremental_plan_schema_version: depgraph_core::INCREMENTAL_PLAN_SCHEMA_VERSION.to_owned(),
-        daemon_status_schema_version: depgraph_core::DAEMON_STATUS_SCHEMA_VERSION.to_owned(),
-        policy_schema_version: depgraph_core::POLICY_SCHEMA_VERSION.to_owned(),
-        policy_result_schema_version: depgraph_core::POLICY_RESULT_SCHEMA_VERSION.to_owned(),
-        runtime_trace_schema_version: depgraph_core::RUNTIME_TRACE_SCHEMA_VERSION.to_owned(),
-        graphml_schema_version: depgraph_core::GRAPHML_SCHEMA_VERSION.to_owned(),
-        packaged_smoke_contract: MILESTONE4_PACKAGED_SMOKE_CONTRACT.to_owned(),
-    }
+    depgraph_core::release_compatibility_contract()
 }
 
 #[derive(Serialize)]
@@ -3528,7 +3494,7 @@ fn verify_packaged_legacy_store_migration(executable: &Path, verify_root: &Path)
     let connection = rusqlite::Connection::open(&store_path)?;
     connection.execute_batch(include_str!("../fixtures/v0.2.0-rc.1-store-v5.sql"))?;
     let original_schema: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if original_schema != PREVIOUS_RELEASE_STORE_SCHEMA_VERSION {
+    if original_schema != release_compatibility().previous_release_store_schema_version {
         bail!("legacy release fixture is schema {original_schema}, expected schema 5");
     }
     drop(connection);
@@ -3614,7 +3580,7 @@ fn verify_packaged_legacy_store_migration(executable: &Path, verify_root: &Path)
 
     let backup = rusqlite::Connection::open(&backup_path)?;
     let backup_schema: i64 = backup.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if backup_schema != PREVIOUS_RELEASE_STORE_SCHEMA_VERSION {
+    if backup_schema != release_compatibility().previous_release_store_schema_version {
         bail!("packaged migration modified the rollback backup");
     }
     Ok(())
