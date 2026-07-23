@@ -635,11 +635,12 @@ fn path_step(
     }
 }
 
-pub(crate) fn path_steps_for_edges(
+pub(crate) fn path_steps_for_edges_filtered(
     snapshot: &GraphSnapshot,
     edges: &[EdgeRecord],
+    filter: &GraphQueryFilter,
 ) -> Vec<PathStep> {
-    let evidence = edge_evidence_map(snapshot);
+    let evidence = edge_evidence_map_filtered(snapshot, filter);
     let correlations = edge_correlation_map(&snapshot.profile_matrix);
     edges
         .iter()
@@ -666,10 +667,6 @@ fn node_map(snapshot: &GraphSnapshot) -> BTreeMap<String, NodeRecord> {
         .iter()
         .map(|node| (node.id.clone(), node.clone()))
         .collect()
-}
-
-fn edge_evidence_map(snapshot: &GraphSnapshot) -> BTreeMap<String, Vec<EvidenceRecord>> {
-    edge_evidence_map_filtered(snapshot, &GraphQueryFilter::default())
 }
 
 fn edge_evidence_map_filtered(

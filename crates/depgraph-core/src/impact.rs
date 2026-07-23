@@ -9,7 +9,10 @@ use depgraph_store::{EdgeRecord, GraphSnapshot, NodeRecord, runtime_context_for_
 use serde::Serialize;
 
 use crate::{
-    query::{PathStep, path_steps_for_edges, render_condition, resolve_selector},
+    query::{
+        GraphQueryFilter, PathStep, path_steps_for_edges_filtered, render_condition,
+        resolve_selector,
+    },
     worker::resolve_safe_executable,
 };
 
@@ -715,6 +718,12 @@ pub fn impact(
     let mut budget = TraversalBudget::new(&root.id);
     let forward = adjacency(snapshot, false, &filters);
     let reverse = adjacency(snapshot, true, &filters);
+    let evidence_filter = GraphQueryFilter {
+        phases: filters.phases.clone(),
+        profiles: filters.profiles.clone(),
+        sessions: filters.sessions.clone(),
+        environments: filters.environments.clone(),
+    };
 
     let root_path = if changed_ids.contains(&root.id) {
         Some(Vec::new())
@@ -746,7 +755,7 @@ pub fn impact(
                 node,
                 depth,
                 changed_node_id: changed_node_id.clone(),
-                dependency_path: path_steps_for_edges(snapshot, &path),
+                dependency_path: path_steps_for_edges_filtered(snapshot, &path, &evidence_filter),
             });
         }
         impacts.sort_by(|left, right| left.node.id.cmp(&right.node.id));
@@ -1233,6 +1242,57 @@ mod tests {
             }),
         });
         assert!(filters.matches(&graph, &graph.edges[0]));
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_impact_path_evidence_respects_the_session_filter() -> Result<()> {
+        let mut graph = graph();
+        let edge = graph
+            .edges
+            .iter_mut()
+            .find(|edge| edge.id == "e-symbol-file")
+            .context("fixture edge")?;
+        edge.phase = "runtime".to_owned();
+        for (ordinal, session) in ["session-a", "session-b"].into_iter().enumerate() {
+            graph.evidence.push(EvidenceRecord {
+                owner_type: "edge".to_owned(),
+                owner_id: edge.id.clone(),
+                ordinal: graph.evidence.len() as i64 + ordinal as i64,
+                kind: "runtime".to_owned(),
+                extractor: "runtime-trace".to_owned(),
+                extractor_version: "1.0".to_owned(),
+                path: String::new(),
+                start_line: 1,
+                start_column: 1,
+                end_line: 1,
+                end_column: 1,
+                detail: None,
+                properties: json!({
+                    "session_id":format!("runtime-{session}"),
+                    "source_session_id":session,
+                    "environment":{"name":"server"}
+                }),
+            });
+        }
+        let filters = ImpactFilters::new(None, Vec::new(), Vec::new(), 20, 20)?
+            .with_runtime_filters(
+                vec!["runtime".to_owned()],
+                vec!["session-a".to_owned()],
+                vec!["server".to_owned()],
+            )?;
+        let result = impact(&graph, "id:file", None, filters)?;
+        let symbol = result
+            .impacts
+            .iter()
+            .find(|impact| impact.node.id == "symbol")
+            .context("runtime impact")?;
+        assert_eq!(symbol.dependency_path.len(), 1);
+        assert_eq!(symbol.dependency_path[0].evidence.len(), 1);
+        assert_eq!(
+            symbol.dependency_path[0].evidence[0].properties["source_session_id"],
+            json!("session-a")
+        );
         Ok(())
     }
 

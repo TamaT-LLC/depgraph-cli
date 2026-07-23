@@ -11,7 +11,7 @@ use super::{
     CoverageRecord, DiagnosticRecord, EdgeRecord, EvidenceRecord, GraphSnapshot, NodeRecord,
     ProfileRecord, SiteRecord, SnapshotSource, Store, canonical_effective_input_id,
     create_completed_snapshot, declared_effective_input_id, declared_parent_profile_id,
-    promote_completed_snapshot, refresh_profile_matrix, union_coverage,
+    promote_completed_snapshot, refresh_profile_matrix,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -741,7 +741,7 @@ pub(super) fn merge_runtime_sessions(
             diagnostic_indexes.insert(diagnostic.id.clone(), diagnostics.len());
             diagnostics.push(diagnostic);
         }
-        union_coverage(&mut snapshot.coverage, &delta.session.coverage);
+        union_runtime_coverage_metadata(&mut snapshot.coverage, &delta.session.coverage);
     }
     reassign_runtime_evidence_ordinals(&mut evidence);
     snapshot.profiles = profiles.into_values().collect();
@@ -751,8 +751,37 @@ pub(super) fn merge_runtime_sessions(
     snapshot.evidence = evidence;
     snapshot.diagnostics = diagnostics;
     snapshot.coverage.profiles = snapshot.profiles.len() as u64;
+    snapshot.coverage.dependency_sites = snapshot.sites.len() as u64;
+    snapshot.coverage.resolved = 0;
+    snapshot.coverage.candidates = 0;
+    snapshot.coverage.external = 0;
+    snapshot.coverage.unresolved = 0;
+    for site in &snapshot.sites {
+        match site.resolution_status.as_str() {
+            "resolved" => snapshot.coverage.resolved += 1,
+            "candidates" => snapshot.coverage.candidates += 1,
+            "external" => snapshot.coverage.external += 1,
+            "unresolved" => snapshot.coverage.unresolved += 1,
+            _ => {}
+        }
+    }
     refresh_profile_matrix(snapshot, false);
     Ok(())
+}
+
+fn union_runtime_coverage_metadata(target: &mut CoverageRecord, session: &CoverageRecord) {
+    target.unsupported_syntax = target
+        .unsupported_syntax
+        .saturating_add(session.unsupported_syntax);
+    target.project_code_executed |= session.project_code_executed;
+    target
+        .completeness
+        .extend(session.completeness.iter().cloned());
+    target.completeness.sort();
+    target.completeness.dedup();
+    target.reasons.extend(session.reasons.iter().cloned());
+    target.reasons.sort();
+    target.reasons.dedup();
 }
 
 fn insert_exact<T: PartialEq>(
@@ -1240,6 +1269,38 @@ mod tests {
         let snapshot = store.load_completed_snapshot(&current_id)?;
         assert!(snapshot.edges.iter().any(|edge| edge.id == "edge:runtime"));
         assert!(store.verify_snapshot_integrity(&current_id)?.valid);
+        Ok(())
+    }
+
+    #[test]
+    fn multiple_sessions_keep_coverage_aligned_with_the_deduplicated_graph() -> Result<()> {
+        let (mut store, base_snapshot_id, base) = seeded_store()?;
+        let first = store
+            .import_runtime_session(&base_snapshot_id, valid_delta(&base_snapshot_id, &base))?;
+        let mut second = valid_delta(&first.snapshot_id, &base);
+        second.session.id = "runtime-session:test-2".to_owned();
+        second.session.source_session_id = "collector-session-2".to_owned();
+        second.session.trace_digest = "runtime-trace:sha256:test-2".to_owned();
+        for evidence in &mut second.evidence {
+            evidence.properties["session_id"] = json!("runtime-session:test-2");
+            evidence.properties["source_session_id"] = json!("collector-session-2");
+        }
+        let second = store.import_runtime_session(&first.snapshot_id, second)?;
+        let snapshot = store.load_completed_snapshot(&second.snapshot_id)?;
+        assert_eq!(snapshot.sites.len(), 1);
+        assert_eq!(snapshot.coverage.dependency_sites, 1);
+        assert_eq!(snapshot.coverage.resolved, 1);
+        assert_eq!(snapshot.coverage.candidates, 0);
+        assert_eq!(snapshot.coverage.external, 0);
+        assert_eq!(snapshot.coverage.unresolved, 0);
+        assert_eq!(
+            snapshot
+                .evidence
+                .iter()
+                .filter(|evidence| evidence.kind == "runtime")
+                .count(),
+            4
+        );
         Ok(())
     }
 }

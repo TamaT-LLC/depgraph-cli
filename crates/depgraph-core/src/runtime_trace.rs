@@ -523,12 +523,8 @@ pub fn runtime_session_delta(
             condition: json!({"op":"true"}),
             generated: false,
         };
-        let properties = observation.evidence_properties(
-            &session_id,
-            &validated.session.id,
-            &environment,
-            validated.session.redaction.redacted_value_count,
-        );
+        let properties =
+            observation.evidence_properties(&session_id, &validated.session.id, &environment);
         evidence.push(runtime_evidence("site", &site_id, properties.clone()));
         evidence.push(runtime_evidence("edge", &edge_id, properties));
         sites.push(site);
@@ -554,9 +550,18 @@ pub fn runtime_session_delta(
     let coverage = CoverageRecord {
         profiles: 1,
         dependency_sites: sites.len() as u64,
-        resolved: validated.summary.resolved_targets,
-        external: validated.summary.external_targets,
-        unresolved: validated.summary.unresolved_targets,
+        resolved: sites
+            .iter()
+            .filter(|site| site.resolution_status == "resolved")
+            .count() as u64,
+        external: sites
+            .iter()
+            .filter(|site| site.resolution_status == "external")
+            .count() as u64,
+        unresolved: sites
+            .iter()
+            .filter(|site| site.resolution_status == "unresolved")
+            .count() as u64,
         project_code_executed: true,
         completeness: if partial {
             Vec::new()
@@ -677,7 +682,6 @@ impl RuntimeObservation {
         session_id: &str,
         source_session_id: &str,
         environment: &Value,
-        session_redacted_values: u64,
     ) -> Value {
         json!({
             "session_id":session_id,
@@ -691,7 +695,7 @@ impl RuntimeObservation {
             "duration_ns":self.duration_ns,
             "first_observed_at":self.first_observed_at,
             "last_observed_at":self.last_observed_at,
-            "redacted_value_count":self.redacted_values.saturating_add(session_redacted_values),
+            "redacted_value_count":self.redacted_values,
             "reasons":self.reasons,
         })
     }
@@ -1532,6 +1536,30 @@ mod tests {
                 json!("production")
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_coverage_is_graph_unique_and_evidence_redaction_is_event_scoped() -> Result<()> {
+        let snapshot = snapshot();
+        let validated = validate_runtime_trace(Cursor::new(GOLDEN), &snapshot)?;
+        let delta = runtime_session_delta(validated, "snapshot:base", &snapshot)?;
+        assert_eq!(
+            delta.session.coverage.dependency_sites,
+            delta.sites.len() as u64
+        );
+        assert_eq!(delta.session.coverage.resolved, 1);
+        assert_eq!(delta.session.coverage.external, 1);
+        assert_eq!(delta.session.coverage.unresolved, 1);
+        assert_eq!(delta.session.redacted_values, 5);
+        assert_eq!(delta.session.redaction["redacted_value_count"], json!(3));
+        let edge_redactions = delta
+            .evidence
+            .iter()
+            .filter(|evidence| evidence.owner_type == "edge")
+            .filter_map(|evidence| evidence.properties["redacted_value_count"].as_u64())
+            .sum::<u64>();
+        assert_eq!(edge_redactions, 2);
         Ok(())
     }
 
