@@ -157,11 +157,12 @@ Every rule declares source and target selectors, severity, profile and
 condition filters, admitted precision/status values, and its evidence
 requirement. `dependency_depth`, `fan_in`, and `fan_out` rules additionally
 require `threshold = { max = ... }`. Suppressions require a reason and a
-non-empty source, target, profile, or condition scope. Unknown versions, rule
-kinds, properties, and invalid or duplicate IDs fail closed as configuration
-errors. The machine-readable result contract uses stable violation IDs,
-dependency paths, repository-relative evidence spans, applied suppressions,
-and exit code `1` whenever an unsuppressed error remains.
+non-empty source, target, profile, or condition scope; a condition used as the
+only bound must not be statically always true. Unknown versions, rule kinds,
+properties, and invalid or duplicate IDs fail closed as configuration errors.
+The machine-readable result contract uses stable violation IDs, dependency
+paths, repository-relative evidence spans, applied suppressions, and exit code
+`1` whenever an unsuppressed error remains.
 
 The matching JSON Schema is
 [`schemas/depgraph-policy-v1.schema.json`](schemas/depgraph-policy-v1.schema.json).
