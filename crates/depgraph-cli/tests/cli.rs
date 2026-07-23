@@ -1109,7 +1109,7 @@ fn runtime_import_is_atomic_deduplicated_queryable_and_deterministic() {
             .iter()
             .all(|edge| edge["phase"] == "runtime")
     );
-    for format in ["dot", "mermaid"] {
+    for format in ["dot", "mermaid", "graphml"] {
         let render = || {
             Command::cargo_bin("depgraph")
                 .unwrap()
@@ -1131,11 +1131,14 @@ fn runtime_import_is_atomic_deduplicated_queryable_and_deterministic() {
         let rendered_second = render();
         assert!(rendered_first.status.success());
         assert_eq!(rendered_first.stdout, rendered_second.stdout);
-        assert!(
-            String::from_utf8(rendered_first.stdout)
-                .unwrap()
-                .contains("[runtime;")
-        );
+        let rendered = String::from_utf8(rendered_first.stdout).unwrap();
+        if format == "graphml" {
+            assert!(rendered.contains("<graphml xmlns="));
+            assert!(rendered.contains("<data key=\"e_phase\">runtime</data>"));
+            assert!(rendered.contains("<data key=\"g_evidence_json\">"));
+        } else {
+            assert!(rendered.contains("[runtime;"));
+        }
     }
 
     let diff = || {
@@ -4442,7 +4445,7 @@ fn exports_are_byte_identical_across_scan_ids_and_event_order() {
     );
     let reverse: serde_json::Value = serde_json::from_slice(&reverse.stdout).unwrap();
 
-    for format in ["json", "dot", "mermaid"] {
+    for format in ["json", "dot", "mermaid", "graphml"] {
         let first = Command::cargo_bin("depgraph")
             .unwrap()
             .args([
@@ -4476,4 +4479,26 @@ fn exports_are_byte_identical_across_scan_ids_and_event_order() {
             "{format} export was not stable"
         );
     }
+
+    let graphml_path = temp.path().join("graph.graphml");
+    let graphml_file = Command::cargo_bin("depgraph")
+        .unwrap()
+        .args([
+            "--store",
+            store.to_str().unwrap(),
+            "--scan-id",
+            forward["scan_id"].as_str().unwrap(),
+            "export",
+            "--format",
+            "graphml",
+            "--output",
+            graphml_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(graphml_file.status.success());
+    assert!(graphml_file.stdout.is_empty());
+    let graphml = std::fs::read_to_string(graphml_path).unwrap();
+    assert!(graphml.starts_with("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"));
+    assert!(graphml.contains("attr.name=\"depgraph.edge.condition\""));
 }

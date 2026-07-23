@@ -961,7 +961,7 @@ untrusted input上限は16 MiB、100,000 events、1 string 4,096 Unicode scalar 
 
 schema v11は`runtime_sessions`、`runtime_nodes`、`runtime_sites`、`runtime_edges`、`runtime_evidence`、`runtime_diagnostics`、`runtime_imports`を正規化し、completed snapshotへcanonical runtime session setとruntime import sourceを追加する。同じprofile/environment/source/target/kindのgraph IDはsession IDを含めず、複数sessionでnode/site/edgeをdeduplicateする。一方evidenceはinternal session IDとcollector session ID、environment name/runtime/region、event ID/sequence、count/duration、first/last timestamp、redaction countを保持し、query時に集約できる。external/unresolvedまたは一致不能locatorは`runtime_only=true`とreason/raw locator descriptorを持つsentinelとなり、repository nodeを捏造しない。profile/source/target mismatch、resolved/unmatched conflict、partial coverageは`RUNTIME_PROFILE_UNMATCHED`、`RUNTIME_SOURCE_UNMATCHED`、`RUNTIME_TARGET_UNMATCHED`、`RUNTIME_EVIDENCE_CONFLICT`診断へ残す。
 
-session rows、runtime graph/evidence/diagnostic、runtime import、immutable completed snapshot、source mapping、current pointerは1つのSQLite transactionで保存・promotionする。途中errorは全rowをrollbackし、直前current snapshotを維持する。同じvalidated sessionの再importはsession setでidempotentにdeduplicateする。static/semantic/build profile/node/site/edgeはdelete/upsertせず、exact同一runtime graphだけをsession間で共有し、内容衝突はtransaction全体をrejectする。`deps` / `dependents` / `why` / `impact` / `export`はrepeatableなexact `--phase` / `--profile` / `--session` / `--environment`を適用し、runtime environmentはname/runtime/regionを照合する。session filter時は選択sessionのevidenceだけを返す。`diff --phase runtime`はruntime snapshot追加分をcanonicalに比較し、JSON/DOT/Mermaidと反復snapshot diffはstable orderでbyte-identicalとなる。golden/malformed/secret fixture、unsupported version/encoding/size/path、schema parity、v1 optional field backward compatibility、stable event identity、schema v1/v7/v8 migration、multi-session dedup/count/time range、promotion failure rollback、CLI import/query/export/diff repeatabilityでcontractを固定する。
+session rows、runtime graph/evidence/diagnostic、runtime import、immutable completed snapshot、source mapping、current pointerは1つのSQLite transactionで保存・promotionする。途中errorは全rowをrollbackし、直前current snapshotを維持する。同じvalidated sessionの再importはsession setでidempotentにdeduplicateする。static/semantic/build profile/node/site/edgeはdelete/upsertせず、exact同一runtime graphだけをsession間で共有し、内容衝突はtransaction全体をrejectする。`deps` / `dependents` / `why` / `impact` / `export`はrepeatableなexact `--phase` / `--profile` / `--session` / `--environment`を適用し、runtime environmentはname/runtime/regionを照合する。session filter時は選択sessionのevidenceだけを返す。`diff --phase runtime`はruntime snapshot追加分をcanonicalに比較し、JSON/DOT/Mermaid/GraphMLと反復snapshot diffはstable orderでbyte-identicalとなる。golden/malformed/secret fixture、unsupported version/encoding/size/path、schema parity、v1 optional field backward compatibility、stable event identity、schema v1/v7/v8 migration、multi-session dedup/count/time range、promotion failure rollback、CLI import/query/export/diff repeatabilityでcontractを固定する。
 
 ## 13. Storage と Incremental Update
 
@@ -1054,6 +1054,14 @@ Issue #76のchanged-set layerはsystem Gitをsanitized PATHから解決し、opt
 
 `impact <SELECTOR>`単体ではselectorを変更起点とし、incoming edgeを逆走する。`--changed`指定時はselectorからmapped changed nodeへの決定的な最短dependency pathが存在する場合だけselectorをimpactedとし、そのselectorをfocusとしてreverse traversalしたdependentsへfocus-to-change pathを連結する。各path stepはedge kind / phase / resolution / precision、rendered condition、profile correlation / phase coverage、source evidenceを既存query契約と同じ形で保持する。repeatableなprofile / conditionはexact OR-within / AND-across、depthはfocusからのreverse距離へ適用する。node / edge上限は全探索で共有し、到達時は`complete=false`とstable diagnosticを返して暗黙truncateしない。node、mapping、diagnostic、path選択はstable ID順であり、human / schema `1.0` JSONの反復出力はbyte-identicalである。
 
+### 13.9 GraphML export
+
+Issue #85の`export --format graphml`はGraphML 1.0のdirected graphとして共通property graphを出力する。XML element IDはstable ID中の任意UnicodeやXML特殊文字に依存しない`n<ordinal>` / `e<ordinal>`を使い、元のnode / edge stable IDは`depgraph.node.id` / `depgraph.edge.id` keyへ保持する。nodeはkind、locator、display nameをprimitive string、追加propertyをcanonical JSON objectとして持つ。edgeはkind、phase、environment、profile ID、resolution status、precision、generatedをprimitive、conditionをcanonical JSONとhuman-readable textの両方で持ち、optional site IDを明示する。
+
+profileは完全なrecordのcanonical JSON array、dependency siteは完全なrecordとevidence referenceの組、evidenceは`owner_type + owner_id + ordinal`参照と完全なrecordの組としてgraph-level dataへ保存する。node / edgeにも同じevidence reference arrayを持たせるため、GraphML単体からprofile / site / evidence所有関係を再構成できる。JSON object key、profile / site / evidence / node / edgeはstable sortし、入力event順やcheckout rootを出力へ含めない。XML 1.0の5特殊文字をescapeし、valid Unicode scalar valueはUTF-8のまま保持し、XML 1.0で表現できないcontrol characterはfail closedする。
+
+writer APIはheader、key schema、graph-level JSON record、node、edgeを順に直接`Write`へ流し、JSON arrayもrecord単位、XML textもbounded buffer単位で出力する。CLIのstdoutはこのwriterへ直接流し、`--output`は同一directoryのtemporary fileへstreamした後、成功時だけdestinationをatomic replaceするため、失敗時に既存出力をtruncateしない。graph全体を追加の巨大文字列へ複製せず、既存JSON / DOT / Mermaidのschemaとbyte outputは変更しない。
+
 ## 14. CLI UX
 
 ```text
@@ -1073,7 +1081,7 @@ depgraph snapshot create <NAME> [--json]
 depgraph snapshot list [--json]
 depgraph snapshot show <NAME|STABLE_ID|current> [--json]
 depgraph diff <FROM> <TO> [--json] [--kind KIND] [--profile ID] [--phase PHASE] [--status STATUS]
-depgraph export --format json|dot|mermaid [--phase PHASE] [--profile ID] [--session ID] [--environment NAME]
+depgraph export --format json|dot|mermaid|graphml [--phase PHASE] [--profile ID] [--session ID] [--environment NAME]
 ```
 
 selector は path、stable ID、package、symbol、route pattern を受け付ける。曖昧な selector は候補を返し、暗黙に先頭を選択しない。
@@ -1405,7 +1413,7 @@ Go semantic scanではGOOS/GOARCH、build tags、強制されたcgo無効状態�
 5. `why` で二 node 間の依存 path と根拠を表示できる。
 6. `doctor` で skipped / unresolved / candidate / external を報告できる。
 7. `--strict` が incomplete scan を非 0 で終了できる。
-8. JSON、DOT、Mermaid の export ができる。
+8. JSON、DOT、Mermaid、GraphML の export ができる。
 9. safe scan では対象 project の任意コードを実行しない。
 10. 同一入力と profile に対して決定的な graph を生成できる。
 
@@ -1437,6 +1445,7 @@ Go semantic scanではGOOS/GOARCH、build tags、強制されたcgo無効状態�
 
 ## 26. 更新履歴
 
+- 2026-07-24: Issue #85として決定的なGraphML 1.0 exporterを実装。node / edgeのstable ID、kind、phase、profile、condition、precision、resolutionをtyped keyへ、完全なprofile / dependency site / evidenceと所有参照をcanonical JSONへ保持し、GraphML単体で再構成可能にした。XML-safeなgenerated element ID、XML 1.0特殊文字escape、Unicode保持、invalid control fail-closed、stable sort、record/text単位のbounded streaming writer、成功後だけdestinationを置換するatomic file outputを追加し、golden、round-trip、入力順非依存決定性、大容量chunk、runtime filter、CLI stdout / file E2Eで固定した。既存JSON / DOT / Mermaid出力は変更していない。
 - 2026-07-24: Issue #84としてruntime evidenceのschema v11 store unionを実装。validated traceをruntime child profile、observed site/edge、per-session evidence、runtime-only sentinel、partial/conflict/unmatched diagnosticへ変換し、session/graph/import/completed snapshot/current pointerを単一transactionでpromotionする。同一session再importのidempotence、複数sessionのgraph dedupとcount/time range集約、static/semantic/build非上書き、失敗promotion全rollbackを固定した。deps/dependents/why/impact/exportへphase/profile/session/environment filter、diffのruntime phase比較、snapshot metadataのruntime source/sessionを追加し、JSON/DOT/Mermaidとsession-filtered evidenceを決定的に出力する。v1/v7/v8→v11 migration、promotion failure、multi-session、malformed input、query/export/diff repeatabilityをstore/core/CLI testで検証した。
 - 2026-07-23: Issue #82としてpublic API change / runtime boundary policyとCI annotationを実装。`depgraph policy <FROM> <TO>`がcompleted snapshot差分のpublic `symbol / type / route`をadded / removed / changedへ分類し、breakingなremoved / changedをbaselineのcanonical impact path、change ID、profile / condition、宣言source evidenceへ関連付ける。scan側の`runtime_boundary`はroute / componentから明示的な`client_boundary / server_boundary`への同一profile pathだけを評価し、framework conditionとedge runtimeを保持する。JSON reportとGitHub Actions warning/error annotationは同じcanonical resultから生成し、repository-relative path / 1-origin spanだけを出力する。warning / error / suppressionのexit挙動、schema parity、runtime unit、snapshot diff integration、secret / absolute path非漏洩を含むCLI E2Eを追加した。
 - 2026-07-23: Issue #83としてcollector-independentなruntime trace v1 import contractとread-only validatorを実装。repository/session/profile/environment/source/target locatorとredaction name/countだけをstrict JSON Schemaへ固定し、16 MiB / 100,000 event / string / nesting / UTF-8 / version / timestamp / sequence / relative pathをstore access前にbounded validationする。environment/header/secret value、absolute/root escape path、unknown field、common credential formはraw valueをerrorへ出さずfail closedとした。workspace identity/revision、profile、stable node ID/locator/repository pathをselected snapshotへ一意matchし、一致不能/ambiguous/externalをnode捏造なしでexplicit fallbackへ保持する。canonical `runtime-event:sha256` identity、golden/malformed/secret/schema/backward compatibility unit testと反復CLI E2Eを追加し、store unionはIssue #84へ分離した。
