@@ -449,8 +449,7 @@ impl PolicyCondition {
     }
 
     fn validate(&self) -> Result<()> {
-        let mut count = 0_u32;
-        self.validate_inner(0, &mut count)
+        self.validate_inner(0)
     }
 
     fn constant_truth(&self) -> Option<bool> {
@@ -482,21 +481,25 @@ impl PolicyCondition {
         }
     }
 
-    fn validate_inner(&self, depth: u32, count: &mut u32) -> Result<()> {
-        if depth > 16 {
-            bail!("nesting depth must not exceed 16");
-        }
-        *count += 1;
-        if *count > 256 {
-            bail!("condition must not contain more than 256 expressions");
-        }
+    fn validate_inner(&self, depth: u32) -> Result<()> {
         match self {
             Self::All { conditions } | Self::Any { conditions } => {
+                if depth >= 16 {
+                    bail!("condition operator nesting depth must not exceed 16");
+                }
+                if conditions.len() > 255 {
+                    bail!("condition operators must not contain more than 255 children");
+                }
                 for condition in conditions {
-                    condition.validate_inner(depth + 1, count)?;
+                    condition.validate_inner(depth + 1)?;
                 }
             }
-            Self::Not { condition } => condition.validate_inner(depth + 1, count)?,
+            Self::Not { condition } => {
+                if depth >= 16 {
+                    bail!("condition operator nesting depth must not exceed 16");
+                }
+                condition.validate_inner(depth + 1)?;
+            }
             Self::Eq { key, value } => {
                 validate_condition_key(key)?;
                 validate_condition_value(value)?;
@@ -999,10 +1002,10 @@ fn validate_repository_path(name: &str, value: &str) -> Result<()> {
 
 fn validate_bounded_text(name: &str, value: &str, maximum: usize) -> Result<()> {
     if value.is_empty()
-        || value.len() > maximum
+        || value.chars().count() > maximum
         || value.chars().any(|character| character.is_control())
     {
-        bail!("{name} must contain 1-{maximum} non-control UTF-8 bytes");
+        bail!("{name} must contain 1-{maximum} non-control characters");
     }
     Ok(())
 }
@@ -1178,7 +1181,7 @@ mod tests {
             "JSON Schema accepted mismatched cycle selector kinds"
         );
 
-        let mut oversized_condition = value;
+        let mut oversized_condition = value.clone();
         oversized_condition["rules"][0]["condition"] = json!({
             "op": "all",
             "conditions": (0..256)
@@ -1190,6 +1193,66 @@ mod tests {
         assert!(
             validator.validate(&oversized_condition).is_err(),
             "JSON Schema accepted 256 child conditions plus their parent"
+        );
+
+        let mut deeply_nested = value.clone();
+        let mut condition = json!({"op": "eq", "key": "feature", "value": "stable"});
+        for _ in 0..17 {
+            condition = json!({"op": "not", "condition": condition});
+        }
+        deeply_nested["rules"][0]["condition"] = condition;
+        let policy: PolicyConfig = serde_json::from_value(deeply_nested.clone())?;
+        assert!(policy.validate().is_err());
+        assert!(
+            validator.validate(&deeply_nested).is_err(),
+            "JSON Schema accepted a condition deeper than 16 operators"
+        );
+
+        let mut maximum_depth = value.clone();
+        let mut condition = json!({"op": "eq", "key": "feature", "value": "stable"});
+        for _ in 0..16 {
+            condition = json!({"op": "not", "condition": condition});
+        }
+        maximum_depth["rules"][0]["condition"] = condition;
+        let policy: PolicyConfig = serde_json::from_value(maximum_depth.clone())?;
+        policy.validate()?;
+        assert!(
+            validator.validate(&maximum_depth).is_ok(),
+            "JSON Schema rejected a condition at the 16-operator boundary"
+        );
+
+        for invalid_string in [
+            String::new(),
+            "x".repeat(1025),
+            "annotation\nbreak".to_owned(),
+        ] {
+            let mut invalid = value.clone();
+            invalid["rules"][0]["condition"] =
+                json!({"op": "eq", "key": "feature", "value": invalid_string});
+            let policy: PolicyConfig = serde_json::from_value(invalid.clone())?;
+            assert!(policy.validate().is_err());
+            assert!(
+                validator.validate(&invalid).is_err(),
+                "JSON Schema accepted an invalid condition string"
+            );
+        }
+
+        let mut unsafe_reason = value.clone();
+        unsafe_reason["suppressions"][0]["reason"] = json!("annotation\nbreak");
+        let policy: PolicyConfig = serde_json::from_value(unsafe_reason.clone())?;
+        assert!(policy.validate().is_err());
+        assert!(
+            validator.validate(&unsafe_reason).is_err(),
+            "JSON Schema accepted a control-bearing suppression reason"
+        );
+
+        let mut unsafe_match = value;
+        unsafe_match["rules"][0]["source"]["value"] = json!("src/ui/\n**");
+        let policy: PolicyConfig = serde_json::from_value(unsafe_match.clone())?;
+        assert!(policy.validate().is_err());
+        assert!(
+            validator.validate(&unsafe_match).is_err(),
+            "JSON Schema accepted a control-bearing match value"
         );
         Ok(())
     }
