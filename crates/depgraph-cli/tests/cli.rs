@@ -309,6 +309,172 @@ fn seed_cli_diff_snapshot(
     snapshot_id
 }
 
+fn seed_policy_snapshot(
+    store_path: &std::path::Path,
+    root: &std::path::Path,
+    scan_id: &str,
+    name: &str,
+    remove_public_api: bool,
+) -> String {
+    let mut store = depgraph_store::Store::open(store_path).unwrap();
+    store
+        .start_scan_with_revision(
+            scan_id,
+            root,
+            false,
+            Some(if remove_public_api {
+                "policy-revision-2"
+            } else {
+                "policy-revision-1"
+            }),
+        )
+        .unwrap();
+    let coverage = json!({
+        "profiles": 1,
+        "files_discovered": 0,
+        "files_analyzed": 0,
+        "files_skipped": 0,
+        "dependency_sites": if remove_public_api { 0 } else { 1 },
+        "resolved": if remove_public_api { 0 } else { 1 },
+        "candidates": 0,
+        "external": 0,
+        "unresolved": 0,
+        "unsupported_syntax": 0,
+        "project_code_executed": false,
+        "completeness": ["syntax-complete"],
+        "reasons": []
+    });
+    let common = |event: &str, seq: u64| {
+        json!({
+            "event": event,
+            "protocol_version": "1.0",
+            "scan_id": scan_id,
+            "adapter": "fixture",
+            "adapter_version": "1.0",
+            "seq": seq
+        })
+    };
+    let mut events = Vec::new();
+    let mut started = common("scan_started", 1);
+    started["root"] = json!(root.to_string_lossy());
+    started["project_code_executed"] = json!(false);
+    started["safe_mode"] = json!(true);
+    events.push(started);
+    let mut profile = common("profile_declared", 2);
+    profile["profile"] = json!({
+        "id": "fixture:safe",
+        "language": "go",
+        "features": [],
+        "environment": {"mode": "production"},
+        "properties": {}
+    });
+    events.push(profile);
+    let consumer = json!({
+        "id": "symbol:consumer",
+        "kind": "symbol",
+        "locator": "go:fixture#Consumer",
+        "display_name": "Consumer",
+        "properties": {
+            "profile_id": "fixture:safe",
+            "source_path": "src/consumer.go",
+            "source_span": {
+                "start_line": 3,
+                "start_column": 1,
+                "end_line": 3,
+                "end_column": 20
+            }
+        }
+    });
+    let public_api = json!({
+        "id": "symbol:public-api",
+        "kind": "symbol",
+        "locator": "go:fixture#PublicAPI",
+        "display_name": "PublicAPI",
+        "properties": {
+            "profile_id": "fixture:safe",
+            "source_path": "src/public.go",
+            "source_span": {
+                "start_line": 5,
+                "start_column": 1,
+                "end_line": 5,
+                "end_column": 24
+            },
+            "signature": "func PublicAPI() string"
+        }
+    });
+    let mut seq = 3_u64;
+    for node in std::iter::once(consumer).chain((!remove_public_api).then_some(public_api)) {
+        let mut event = common("node_upsert", seq);
+        event["node"] = node;
+        events.push(event);
+        seq += 1;
+    }
+    if !remove_public_api {
+        let evidence = json!([{
+            "kind": "source",
+            "extractor": "fixture",
+            "extractor_version": "1.0",
+            "path": "src/consumer.go",
+            "start_line": 3,
+            "start_column": 1,
+            "end_line": 3,
+            "end_column": 20,
+            "properties": {}
+        }]);
+        let mut site = common("dependency_site", seq);
+        site["site"] = json!({
+            "id": "site:consumer-public-api",
+            "source": "symbol:consumer",
+            "kind": "import",
+            "specifier": "PublicAPI",
+            "resolution_status": "resolved",
+            "target_ids": ["symbol:public-api"],
+            "profile_id": "fixture:safe",
+            "condition": {"op": "all", "conditions": []},
+            "precision": "exact",
+            "evidence": evidence
+        });
+        events.push(site);
+        seq += 1;
+        let mut edge = common("edge_upsert", seq);
+        edge["edge"] = json!({
+            "id": "edge:consumer-public-api",
+            "source": "symbol:consumer",
+            "target": "symbol:public-api",
+            "kind": "imports",
+            "site_id": "site:consumer-public-api",
+            "phase": "source",
+            "environment": "host",
+            "profile_id": "fixture:safe",
+            "condition": {"op": "all", "conditions": []},
+            "resolution_status": "resolved",
+            "precision": "exact",
+            "generated": false,
+            "evidence": evidence
+        });
+        events.push(edge);
+        seq += 1;
+    }
+    let mut profile_completed = common("profile_completed", seq);
+    profile_completed["profile_id"] = json!("fixture:safe");
+    profile_completed["coverage"] = coverage.clone();
+    events.push(profile_completed);
+    seq += 1;
+    let mut completed = common("scan_completed", seq);
+    completed["coverage"] = coverage;
+    events.push(completed);
+    for event in events {
+        store.ingest_event(&event).unwrap();
+    }
+    store.finish_scan(scan_id, "completed", None, true).unwrap();
+    let snapshot_id = store
+        .snapshot_id_for_source("scan", scan_id)
+        .unwrap()
+        .unwrap();
+    store.create_snapshot_name(name, &snapshot_id).unwrap();
+    snapshot_id
+}
+
 fn seed_large_cli_diff_snapshot(
     store: &mut depgraph_store::Store,
     root: &std::path::Path,
@@ -816,6 +982,136 @@ fn diff_empty_and_selector_errors_have_stable_exit_codes() {
         .code(2)
         .stderr(predicate::str::contains(
             "diff kind filter must not be empty",
+        ));
+}
+
+#[test]
+fn policy_command_reports_public_api_impact_and_safe_github_annotation() {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let store_path = cache.path().join("graph.db");
+    fs::create_dir(root.path().join("src")).unwrap();
+    fs::write(
+        root.path().join("src/consumer.go"),
+        "package fixture\n\nfunc Consumer() {}\n",
+    )
+    .unwrap();
+    fs::write(
+        root.path().join("src/public.go"),
+        "package fixture\n\n// PublicAPI\n\nfunc PublicAPI() string { return \"safe\" }\n",
+    )
+    .unwrap();
+    let baseline_id = seed_policy_snapshot(
+        &store_path,
+        root.path(),
+        "policy-baseline",
+        "policy-baseline",
+        false,
+    );
+    let target_id = seed_policy_snapshot(
+        &store_path,
+        root.path(),
+        "policy-target",
+        "policy-target",
+        true,
+    );
+    fs::write(
+        root.path().join(".depgraph.toml"),
+        r#"
+schema_version = 1
+
+[policy]
+schema_version = "1.0"
+
+[[policy.rules]]
+id = "stable-public-api"
+kind = "public_api_change"
+severity = "error"
+source = { kind = "symbol", field = "id", match = "exact", value = "symbol:consumer", cardinality = "one", exclude = [], scope = { paths = [], packages = [] } }
+target = { kind = "symbol", field = "id", match = "exact", value = "symbol:public-api", cardinality = "one", exclude = [], scope = { paths = [], packages = [] } }
+profiles = { include = [{ match = "exact", value = "fixture:safe" }], exclude = [] }
+condition = { op = "all", conditions = [] }
+precisions = ["exact"]
+resolution_statuses = ["resolved"]
+evidence = { kinds = ["source"], minimum_spans = 1, primary_only = true }
+"#,
+    )
+    .unwrap();
+
+    let run = |mode: &str| {
+        Command::cargo_bin("depgraph")
+            .unwrap()
+            .current_dir(root.path())
+            .args([
+                "--store",
+                store_path.to_str().unwrap(),
+                "policy",
+                "policy-baseline",
+                "policy-target",
+                mode,
+            ])
+            .output()
+            .unwrap()
+    };
+    let json_output = run("--json");
+    let repeated_json_output = run("--json");
+    assert_eq!(
+        json_output.status.code(),
+        Some(1),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&json_output.stdout),
+        String::from_utf8_lossy(&json_output.stderr)
+    );
+    assert_eq!(json_output.stdout, repeated_json_output.stdout);
+    assert_eq!(json_output.stderr, repeated_json_output.stderr);
+    let report: serde_json::Value = serde_json::from_slice(&json_output.stdout).unwrap();
+    assert_eq!(report["command"], "policy");
+    assert_eq!(report["data"]["from_snapshot_id"], baseline_id);
+    assert_eq!(report["data"]["to_snapshot_id"], target_id);
+    assert_eq!(
+        report["data"]["result"]["api_changes"][0]["kind"],
+        "removed"
+    );
+    assert_eq!(
+        report["data"]["result"]["violations"][0]["dependency_path"][0]["edge_id"],
+        "edge:consumer-public-api"
+    );
+    assert_eq!(
+        report["data"]["result"]["violations"][0]["evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|span| span["path"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["src/consumer.go", "src/public.go"]
+    );
+    assert_eq!(report["data"]["result"]["exit_code"], 1);
+
+    let annotations = run("--github-annotations");
+    assert_eq!(annotations.status.code(), Some(1));
+    let annotations = String::from_utf8(annotations.stdout).unwrap();
+    assert!(annotations.starts_with(
+        "::error file=src/consumer.go,line=3,col=1,endLine=3,endColumn=20,title=depgraph policy stable-public-api::"
+    ));
+    assert!(!annotations.contains(&root.path().to_string_lossy().to_string()));
+    assert!(!annotations.contains("super-secret-value"));
+
+    Command::cargo_bin("depgraph")
+        .unwrap()
+        .current_dir(root.path())
+        .args([
+            "--store",
+            store_path.to_str().unwrap(),
+            "policy",
+            "policy-baseline",
+            "policy-target",
+            "--json",
+            "--github-annotations",
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains(
+            "cannot be used with '--github-annotations'",
         ));
 }
 
