@@ -1,4 +1,4 @@
-use std::fs;
+use std::{fs, path::Path};
 
 use assert_cmd::Command;
 use predicates::prelude::*;
@@ -1402,7 +1402,7 @@ fn daemon_cli_reports_completed_attempt_and_stops_cleanly() {
 
     let root = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();
-    let store_path = cache.path().join("graph.db");
+    let store_path = Path::new("graph.db");
     let status_path = cache.path().join("graph.db.daemon-status.json");
     let mut child = ChildGuard(Some(
         std::process::Command::new(env!("CARGO_BIN_EXE_depgraph"))
@@ -1413,6 +1413,7 @@ fn daemon_cli_reports_completed_attempt_and_stops_cleanly() {
                 "start",
                 root.path().to_str().unwrap(),
             ])
+            .current_dir(cache.path())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -1439,6 +1440,7 @@ fn daemon_cli_reports_completed_attempt_and_stops_cleanly() {
                 root.path().to_str().unwrap(),
                 "--json",
             ])
+            .current_dir(cache.path())
             .output()
             .unwrap();
         assert!(output.status.success());
@@ -1465,6 +1467,7 @@ fn daemon_cli_reports_completed_attempt_and_stops_cleanly() {
             root.path().to_str().unwrap(),
             "--json",
         ])
+        .current_dir(cache.path())
         .output()
         .unwrap();
     assert!(stopped.status.success());

@@ -834,6 +834,14 @@ struct ActiveAttempt {
     cancellation: CancellationToken,
     completion: oneshot::Receiver<Result<DaemonScanOutcome>>,
     task: JoinHandle<()>,
+    shutdown_flush: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttemptDisposition {
+    Completed,
+    Cancelled,
+    Failed,
 }
 
 async fn run_daemon_loop(
@@ -849,18 +857,22 @@ async fn run_daemon_loop(
     let mut deadline = None::<Instant>;
     let mut active = None::<ActiveAttempt>;
     let mut stopping = false;
+    let mut consecutive_failures = 0_u32;
 
     loop {
-        if !stopping
-            && active.is_none()
+        if active.is_none()
             && !coalescer.is_empty()
-            && deadline.is_some_and(|deadline| deadline <= Instant::now())
+            && (stopping || deadline.is_some_and(|deadline| deadline <= Instant::now()))
         {
             let changes = coalescer.drain();
             deadline = None;
             if !changes.is_empty() {
-                active = Some(spawn_attempt(runner.clone(), changes));
-                status.phase = DaemonPhase::Scanning;
+                active = Some(spawn_attempt(runner.clone(), changes, stopping));
+                status.phase = if stopping {
+                    DaemonPhase::Stopping
+                } else {
+                    DaemonPhase::Scanning
+                };
                 status.pending_change_count = 0;
                 status.active_attempt_id = active
                     .as_ref()
@@ -869,7 +881,7 @@ async fn run_daemon_loop(
                 continue;
             }
         }
-        if stopping && active.is_none() {
+        if stopping && active.is_none() && coalescer.is_empty() {
             break;
         }
 
@@ -880,9 +892,8 @@ async fn run_daemon_loop(
         tokio::select! {
             _ = &mut stop_receiver, if !stopping => {
                 stopping = true;
-                coalescer.clear();
                 deadline = None;
-                status.pending_change_count = 0;
+                status.pending_change_count = coalescer.len();
                 status.phase = DaemonPhase::Stopping;
                 if let Some(active) = &active {
                     active.cancellation.cancel();
@@ -898,6 +909,7 @@ async fn run_daemon_loop(
                             publish_status(&status_sender, &status);
                         }
                         if coalescer.revision() != revision_before {
+                            consecutive_failures = 0;
                             deadline = Some(Instant::now() + debounce);
                             status.pending_change_count = coalescer.len();
                             if let Some(active) = &active {
@@ -937,8 +949,29 @@ async fn run_daemon_loop(
                     Ok(result) => result,
                     Err(_) => Err(anyhow::anyhow!("daemon scan task exited without an outcome")),
                 };
+                let disposition = match &result {
+                    Ok(outcome) if outcome.status == "completed" => AttemptDisposition::Completed,
+                    Ok(outcome) if outcome.status == "cancelled" => AttemptDisposition::Cancelled,
+                    _ => AttemptDisposition::Failed,
+                };
+                let retry_changes = finished.request.changes.clone();
+                let shutdown_flush = finished.shutdown_flush;
                 let _ = finished.task.await;
                 record_attempt(&mut status, finished.request, result);
+                if disposition == AttemptDisposition::Completed {
+                    consecutive_failures = 0;
+                } else if !shutdown_flush {
+                    coalescer.extend(retry_changes);
+                    if !stopping {
+                        let retry_at = if disposition == AttemptDisposition::Cancelled {
+                            Instant::now() + debounce
+                        } else {
+                            consecutive_failures = consecutive_failures.saturating_add(1);
+                            Instant::now() + retry_delay(debounce, consecutive_failures)
+                        };
+                        deadline = Some(deadline.map_or(retry_at, |current| current.min(retry_at)));
+                    }
+                }
                 status.active_attempt_id = None;
                 status.pending_change_count = coalescer.len();
                 status.phase = if stopping {
@@ -964,6 +997,7 @@ async fn run_daemon_loop(
 fn spawn_attempt(
     runner: Arc<dyn DaemonScanRunner>,
     changes: Vec<IncrementalFileChange>,
+    shutdown_flush: bool,
 ) -> ActiveAttempt {
     let request = DaemonScanRequest {
         attempt_id: Uuid::new_v4().to_string(),
@@ -985,7 +1019,15 @@ fn spawn_attempt(
         cancellation,
         completion,
         task,
+        shutdown_flush,
     }
+}
+
+fn retry_delay(debounce: Duration, consecutive_failures: u32) -> Duration {
+    let base = debounce.max(Duration::from_secs(1));
+    let exponent = consecutive_failures.saturating_sub(1).min(5);
+    base.saturating_mul(1_u32 << exponent)
+        .min(Duration::from_secs(30))
 }
 
 fn record_attempt(
@@ -1042,7 +1084,7 @@ mod tests {
     use super::*;
     use std::sync::{
         Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     };
 
     #[derive(Default)]
@@ -1073,6 +1115,7 @@ mod tests {
     struct CancellingRunner {
         started: Arc<AtomicBool>,
         cleaned_up: Arc<AtomicBool>,
+        attempts: AtomicUsize,
     }
 
     impl DaemonScanRunner for CancellingRunner {
@@ -1083,7 +1126,18 @@ mod tests {
         ) -> DaemonScanFuture {
             let started = self.started.clone();
             let cleaned_up = self.cleaned_up.clone();
+            let attempt = self.attempts.fetch_add(1, Ordering::AcqRel);
             Box::pin(async move {
+                if attempt > 0 {
+                    return Ok(DaemonScanOutcome {
+                        scan_id: Some("shutdown-flush".to_owned()),
+                        status: "completed".to_owned(),
+                        completed_snapshot_id: Some("fixture-snapshot".to_owned()),
+                        base_snapshot_id: Some("stable-snapshot".to_owned()),
+                        invalidation_plan: None,
+                        invalidation_error: None,
+                    });
+                }
                 started.store(true, Ordering::Release);
                 cancellation.cancelled().await;
                 cleaned_up.store(true, Ordering::Release);
@@ -1092,6 +1146,34 @@ mod tests {
                     status: "cancelled".to_owned(),
                     completed_snapshot_id: None,
                     base_snapshot_id: Some("stable-snapshot".to_owned()),
+                    invalidation_plan: None,
+                    invalidation_error: None,
+                })
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct FailOnceRunner {
+        attempts: AtomicUsize,
+    }
+
+    impl DaemonScanRunner for FailOnceRunner {
+        fn run(
+            &self,
+            _request: DaemonScanRequest,
+            _cancellation: CancellationToken,
+        ) -> DaemonScanFuture {
+            let attempt = self.attempts.fetch_add(1, Ordering::AcqRel);
+            Box::pin(async move {
+                if attempt == 0 {
+                    bail!("transient fixture failure");
+                }
+                Ok(DaemonScanOutcome {
+                    scan_id: Some("retried-scan".to_owned()),
+                    status: "completed".to_owned(),
+                    completed_snapshot_id: Some("retried-snapshot".to_owned()),
+                    base_snapshot_id: None,
                     invalidation_plan: None,
                     invalidation_error: None,
                 })
@@ -1272,6 +1354,73 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_attempt_requeues_its_changes_and_retries_with_backoff() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let runner = Arc::new(FailOnceRunner::default());
+        let handle = start_daemon_with_runner(
+            root.path().to_path_buf(),
+            DaemonConfig {
+                debounce_milliseconds: 10,
+                ignored_paths: Vec::new(),
+            },
+            None,
+            InterruptedAttemptRecovery::default(),
+            runner.clone(),
+        )?;
+        let mut status = handle.subscribe();
+        std::fs::write(root.path().join("retry.rs"), "fn retry() {}\n")?;
+
+        let completed = wait_for_status(&mut status, |status| {
+            status.last_failed_attempt.is_some() && status.last_completed_attempt.is_some()
+        })
+        .await?;
+        assert!(runner.attempts.load(Ordering::Acquire) >= 2);
+        assert!(
+            completed
+                .last_completed_attempt
+                .unwrap()
+                .changes
+                .iter()
+                .any(|change| change.new_path.as_deref() == Some("retry.rs"))
+        );
+        assert_eq!(handle.stop().await?.phase, DaemonPhase::Stopped);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_flushes_a_pending_debounced_batch_before_stopping() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let runner = Arc::new(RecordingRunner::default());
+        let handle = start_daemon_with_runner(
+            root.path().to_path_buf(),
+            DaemonConfig {
+                debounce_milliseconds: 1_000,
+                ignored_paths: Vec::new(),
+            },
+            None,
+            InterruptedAttemptRecovery::default(),
+            runner.clone(),
+        )?;
+        let mut status = handle.subscribe();
+        std::fs::write(root.path().join("flush.rs"), "fn flush() {}\n")?;
+        wait_for_status(&mut status, |status| {
+            status.phase == DaemonPhase::Debouncing
+        })
+        .await?;
+
+        let stopped = handle.stop().await?;
+        assert_eq!(stopped.phase, DaemonPhase::Stopped);
+        assert!(stopped.last_completed_attempt.is_some());
+        assert!(runner.requests.lock().unwrap().iter().any(|request| {
+            request
+                .changes
+                .iter()
+                .any(|change| change.new_path.as_deref() == Some("flush.rs"))
+        }));
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn shutdown_cancels_and_awaits_the_active_scan_cleanup() -> Result<()> {
         let root = tempfile::tempdir()?;
         let started = Arc::new(AtomicBool::new(false));
@@ -1279,6 +1428,7 @@ mod tests {
         let runner = Arc::new(CancellingRunner {
             started: started.clone(),
             cleaned_up: cleaned_up.clone(),
+            attempts: AtomicUsize::new(0),
         });
         let handle = start_daemon_with_runner(
             root.path().to_path_buf(),

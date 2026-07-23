@@ -1112,7 +1112,10 @@ fn daemon_lock_is_held(store_path: &Path) -> Result<bool> {
 }
 
 fn write_daemon_status(path: &Path, status: &DaemonStatus) -> Result<()> {
-    let parent = path.parent().context("daemon status path has no parent")?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(parent).with_context(|| {
         format!(
             "failed to create daemon status directory {}",
