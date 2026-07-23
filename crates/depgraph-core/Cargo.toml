@@ -17,6 +17,7 @@ depgraph-store = { path = "../depgraph-store" }
 directories.workspace = true
 hex.workspace = true
 libc.workspace = true
+notify.workspace = true
 petgraph.workspace = true
 serde.workspace = true
 serde_json.workspace = true

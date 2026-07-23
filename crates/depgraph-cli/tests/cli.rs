@@ -1386,6 +1386,97 @@ fn cli_cancellation_stops_the_supervised_build_and_retains_the_safe_snapshot() {
 }
 
 #[test]
+fn daemon_cli_reports_completed_attempt_and_stops_cleanly() {
+    use std::{process::Stdio, thread, time::Duration};
+
+    struct ChildGuard(Option<std::process::Child>);
+
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            if let Some(child) = &mut self.0 {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let store_path = cache.path().join("graph.db");
+    let status_path = cache.path().join("graph.db.daemon-status.json");
+    let mut child = ChildGuard(Some(
+        std::process::Command::new(env!("CARGO_BIN_EXE_depgraph"))
+            .args([
+                "--store",
+                store_path.to_str().unwrap(),
+                "daemon",
+                "start",
+                root.path().to_str().unwrap(),
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    ));
+
+    for _ in 0..1_000 {
+        if status_path.exists() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(status_path.exists(), "daemon did not publish its status");
+    fs::write(root.path().join("watched.rs"), "fn watched() {}\n").unwrap();
+
+    let mut completed = None;
+    for _ in 0..1_000 {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_depgraph"))
+            .args([
+                "--store",
+                store_path.to_str().unwrap(),
+                "daemon",
+                "status",
+                root.path().to_str().unwrap(),
+                "--json",
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let status: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        if status["last_completed_attempt"].is_object() {
+            completed = Some(status);
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    let completed = completed.expect("daemon did not complete the watched scan");
+    assert_eq!(completed["phase"], "idle");
+    assert_eq!(
+        completed["last_completed_attempt"]["changes"][0]["new_path"],
+        "watched.rs"
+    );
+
+    let stopped = std::process::Command::new(env!("CARGO_BIN_EXE_depgraph"))
+        .args([
+            "--store",
+            store_path.to_str().unwrap(),
+            "daemon",
+            "stop",
+            root.path().to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(stopped.status.success());
+    let stopped_status: serde_json::Value = serde_json::from_slice(&stopped.stdout).unwrap();
+    assert_eq!(stopped_status["phase"], "stopped");
+
+    let output = child.0.take().unwrap().wait_with_output().unwrap();
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("daemon: stopped"));
+}
+
+#[test]
 fn failed_rust_build_correlation_finalizes_the_attempt_without_promoting_a_delta() {
     let root = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();

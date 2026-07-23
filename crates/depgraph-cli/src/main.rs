@@ -1,5 +1,6 @@
 use std::{
-    io::Cursor,
+    fs::OpenOptions,
+    io::{Cursor, Write},
     path::{Path, PathBuf},
     process::ExitCode,
 };
@@ -7,11 +8,12 @@ use std::{
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use depgraph_core::{
-    BuildOutcomeKind, Config, CycleLevel, ExportFormat, ImpactFilters, ImpactResult, ScanCacheMode,
-    build_cache_key, create_build_execution_request, default_store_path, doctor,
+    BuildOutcomeKind, Config, CycleLevel, DaemonStatus, ExportFormat, ImpactFilters, ImpactResult,
+    ScanCacheMode, build_cache_key, create_build_execution_request, default_store_path, doctor,
     execute_build_request_with_cancellation, export, impact, init_config, open_store,
     read_git_changed_set, render_condition, run_scan_with_cache_mode, rust_build_protocol_ndjson,
-    stage_build_evidence, traverse, unresolved, web_build_protocol_ndjson, why,
+    stage_build_evidence, start_repository_daemon, traverse, unresolved, web_build_protocol_ndjson,
+    why,
 };
 use depgraph_store::{CompletedSnapshotDetails, CoverageRecord};
 use serde::Serialize;
@@ -57,6 +59,11 @@ enum Commands {
         /// Bypass cache lookup and storage for this scan.
         #[arg(long)]
         no_cache: bool,
+    },
+    /// Start, inspect, or stop the repository watcher daemon.
+    Daemon {
+        #[command(subcommand)]
+        command: DaemonCommands,
     },
     /// Observe a project build only after explicit project-code consent.
     Resolve {
@@ -163,6 +170,33 @@ enum Commands {
         format: ExportFormatArg,
         #[arg(short, long)]
         output: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum DaemonCommands {
+    /// Run the watcher daemon in the foreground until stopped or interrupted.
+    Start {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        #[arg(long)]
+        strict: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show the last status published by the repository daemon.
+    Status {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Ask a foreground repository daemon to stop and wait for cleanup.
+    Stop {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -308,6 +342,7 @@ fn error_exit_code(error: &anyhow::Error) -> u8 {
             "already exists; use --force",
             "scan id must not be empty",
             "no matching scan is available",
+            "daemon status",
         ]
         .iter()
         .any(|needle| message.contains(needle))
@@ -383,6 +418,74 @@ async fn run(cli: Cli) -> Result<u8> {
             }
             Ok(outcome.exit_code)
         }
+        Commands::Daemon { command } => match command {
+            DaemonCommands::Start { path, strict, json } => {
+                let root = canonical_directory(path)?;
+                let config = Config::load(&root)?;
+                let store_path = store_path(cli.store, &root)?;
+                let status_path = daemon_status_path(&store_path);
+                let stop_path = daemon_stop_path(&store_path);
+                let handle = start_repository_daemon(root, store_path, config, strict)?;
+                // Only the process that acquired the daemon lock may clear a
+                // stale stop request. A competing start must not consume a
+                // request intended for the daemon that already owns the lock.
+                remove_control_file(&stop_path)?;
+                let mut status = handle.subscribe();
+                write_daemon_status(&status_path, &handle.status())?;
+                if !json {
+                    println!("daemon: started");
+                    println!("status: {}", status_path.display());
+                }
+                let mut stop_poll = tokio::time::interval(std::time::Duration::from_millis(100));
+                loop {
+                    tokio::select! {
+                        signal = tokio::signal::ctrl_c() => {
+                            signal.context("failed to listen for daemon shutdown")?;
+                            break;
+                        }
+                        changed = status.changed() => {
+                            if changed.is_err() {
+                                break;
+                            }
+                            write_daemon_status(&status_path, &status.borrow().clone())?;
+                        }
+                        _ = stop_poll.tick() => {
+                            if stop_path.try_exists()? {
+                                break;
+                            }
+                        }
+                    }
+                }
+                let stopped = handle.stop().await?;
+                write_daemon_status(&status_path, &stopped)?;
+                remove_control_file(&stop_path)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&stopped)?);
+                } else {
+                    println!("daemon: stopped");
+                }
+                Ok(0)
+            }
+            DaemonCommands::Status { path, json } => {
+                let root = canonical_directory(path)?;
+                let store_path = store_path(cli.store, &root)?;
+                let status = read_daemon_status(&daemon_status_path(&store_path))?;
+                print_daemon_status(&status, json)?;
+                Ok(0)
+            }
+            DaemonCommands::Stop { path, json } => {
+                let root = canonical_directory(path)?;
+                let store_path = store_path(cli.store, &root)?;
+                let status_path = daemon_status_path(&store_path);
+                let mut status = read_daemon_status(&status_path)?;
+                if status.phase != depgraph_core::DaemonPhase::Stopped {
+                    write_stop_request(&daemon_stop_path(&store_path))?;
+                    status = wait_for_daemon_stop(&status_path).await?;
+                }
+                print_daemon_status(&status, json)?;
+                Ok(0)
+            }
+        },
         Commands::Resolve {
             build,
             path,
@@ -961,6 +1064,159 @@ fn canonical_directory(path: PathBuf) -> Result<PathBuf> {
 
 fn store_path(explicit: Option<PathBuf>, root: &std::path::Path) -> Result<PathBuf> {
     explicit.map(Ok).unwrap_or_else(|| default_store_path(root))
+}
+
+fn daemon_status_path(store_path: &Path) -> PathBuf {
+    with_path_suffix(store_path, ".daemon-status.json")
+}
+
+fn daemon_stop_path(store_path: &Path) -> PathBuf {
+    with_path_suffix(store_path, ".daemon-stop")
+}
+
+fn write_daemon_status(path: &Path, status: &DaemonStatus) -> Result<()> {
+    let parent = path.parent().context("daemon status path has no parent")?;
+    std::fs::create_dir_all(parent).with_context(|| {
+        format!(
+            "failed to create daemon status directory {}",
+            parent.display()
+        )
+    })?;
+    let temporary = with_path_suffix(path, &format!(".tmp-{}", std::process::id()));
+    remove_control_file(&temporary)?;
+    let bytes = serde_json::to_vec_pretty(status)?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .with_context(|| format!("failed to create daemon status {}", temporary.display()))?;
+    file.write_all(&bytes)?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
+    drop(file);
+    remove_control_file(path)?;
+    std::fs::rename(&temporary, path).with_context(|| {
+        format!(
+            "failed to publish daemon status {} as {}",
+            temporary.display(),
+            path.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn with_path_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(suffix);
+    PathBuf::from(value)
+}
+
+fn read_daemon_status(path: &Path) -> Result<DaemonStatus> {
+    let metadata = read_daemon_status_metadata(path)?;
+    if !metadata.file_type().is_file() {
+        anyhow::bail!(
+            "daemon status path {} is not a regular file",
+            path.display()
+        );
+    }
+    let raw = std::fs::read(path)
+        .with_context(|| format!("failed to read daemon status {}", path.display()))?;
+    serde_json::from_slice(&raw)
+        .with_context(|| format!("failed to parse daemon status {}", path.display()))
+}
+
+fn read_daemon_status_metadata(path: &Path) -> Result<std::fs::Metadata> {
+    for attempt in 0..5 {
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) => return Ok(metadata),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && attempt < 4 => {
+                // Windows cannot replace an open destination with rename, so
+                // publication removes the old snapshot just before renaming
+                // the fully-synced temporary file. Retry across that tiny gap.
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("daemon status was not found at {}", path.display()));
+            }
+        }
+    }
+    unreachable!("the final metadata attempt always returns")
+}
+
+fn write_stop_request(path: &Path) -> Result<()> {
+    if path.try_exists()? {
+        return Ok(());
+    }
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .with_context(|| format!("failed to create daemon stop request {}", path.display()))?;
+    let requested_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("system clock is before the Unix epoch")?
+        .as_millis();
+    writeln!(file, "{requested_at}")?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn remove_control_file(path: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.is_dir() {
+                anyhow::bail!("daemon control path {} is a directory", path.display());
+            }
+            std::fs::remove_file(path).with_context(|| {
+                format!("failed to remove daemon control file {}", path.display())
+            })?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("failed to inspect daemon control file {}", path.display())
+            });
+        }
+    }
+    Ok(())
+}
+
+async fn wait_for_daemon_stop(path: &Path) -> Result<DaemonStatus> {
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            let status = read_daemon_status(path)?;
+            if status.phase == depgraph_core::DaemonPhase::Stopped {
+                return Ok(status);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .context("timed out waiting for daemon process cleanup")?
+}
+
+fn print_daemon_status(status: &DaemonStatus, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(status)?);
+    } else {
+        println!("daemon: {:?}", status.phase);
+        println!("root: {}", status.root);
+        println!("pending changes: {}", status.pending_change_count);
+        if let Some(attempt) = &status.last_completed_attempt {
+            println!("last completed: {}", attempt.attempt_id);
+        }
+        if let Some(attempt) = &status.last_failed_attempt {
+            println!("last failed: {}", attempt.attempt_id);
+        }
+        if let Some(attempt) = &status.last_cancelled_attempt {
+            println!("last cancelled: {}", attempt.attempt_id);
+        }
+        if let Some(error) = &status.last_watcher_error {
+            println!("watcher error: {error}");
+        }
+    }
+    Ok(())
 }
 
 fn load_snapshot(

@@ -13,10 +13,12 @@ use uuid::Uuid;
 
 use crate::{
     cache::{ScanCachePlan, ScanCachePreparation, prepare_scan_cache},
+    cancellation::CancellationToken,
     config::Config,
     worker::{
-        AdapterKind, WorkerFailureKind, WorkerOutput, WorkerSpec, detect_adapters, execute_worker,
-        is_security_error, locate_worker, resolve_safe_executable,
+        AdapterKind, WorkerFailureKind, WorkerOutput, WorkerSpec, detect_adapters,
+        execute_worker_with_cancellation, is_security_error, locate_worker,
+        resolve_safe_executable,
     },
 };
 
@@ -129,6 +131,34 @@ pub async fn run_scan_with_cache_mode(
     strict: bool,
     cache_mode: ScanCacheMode,
 ) -> Result<ScanOutcome> {
+    let cancellation = CancellationToken::new();
+    let scan = run_scan_with_cache_mode_and_cancellation(
+        store,
+        root,
+        config,
+        strict,
+        cache_mode,
+        cancellation.clone(),
+    );
+    tokio::pin!(scan);
+    tokio::select! {
+        outcome = &mut scan => outcome,
+        signal = tokio::signal::ctrl_c() => {
+            signal.context("failed to listen for scan cancellation")?;
+            cancellation.cancel();
+            scan.await
+        }
+    }
+}
+
+pub async fn run_scan_with_cache_mode_and_cancellation(
+    store: &mut Store,
+    root: PathBuf,
+    config: &Config,
+    strict: bool,
+    cache_mode: ScanCacheMode,
+    cancellation: CancellationToken,
+) -> Result<ScanOutcome> {
     let root = root
         .canonicalize()
         .with_context(|| format!("failed to canonicalize {}", root.display()))?;
@@ -140,6 +170,9 @@ pub async fn run_scan_with_cache_mode(
     let scan_id = Uuid::new_v4().to_string();
     let source_revision = git_source_revision(&root);
     store.start_scan_with_revision(&scan_id, &root, strict, source_revision.as_deref())?;
+    if cancellation.is_cancelled() {
+        return cancel_scan(store, &scan_id);
+    }
 
     let adapters = match detect_adapters(&root, config.scan.follow_symlinks) {
         Ok(adapters) => adapters,
@@ -157,6 +190,9 @@ pub async fn run_scan_with_cache_mode(
             return snapshot_outcome(store, &scan_id, 3);
         }
     };
+    if cancellation.is_cancelled() {
+        return cancel_scan(store, &scan_id);
+    }
 
     let WorkerPreflight {
         workers_to_run,
@@ -187,6 +223,9 @@ pub async fn run_scan_with_cache_mode(
                     {
                         match store.clone_completed_scan_into_staging(&snapshot_id, &scan_id) {
                             Ok(()) => {
+                                if cancellation.is_cancelled() {
+                                    return cancel_scan(store, &scan_id);
+                                }
                                 return complete_scan(store, &scan_id, strict, config, None);
                             }
                             Err(_) => {
@@ -224,8 +263,18 @@ pub async fn run_scan_with_cache_mode(
         let scan_id = scan_id.clone();
         let scan_config = config.scan.clone();
         let profiles = config.profiles.clone();
-        let task = join_set
-            .spawn(async move { execute_worker(spec, root, scan_id, scan_config, profiles).await });
+        let cancellation = cancellation.clone();
+        let task = join_set.spawn(async move {
+            execute_worker_with_cancellation(
+                spec,
+                root,
+                scan_id,
+                scan_config,
+                profiles,
+                cancellation,
+            )
+            .await
+        });
         task_adapters.insert(task.id(), adapter);
     }
 
@@ -248,6 +297,10 @@ pub async fn run_scan_with_cache_mode(
         }
     }
     outputs.sort_by_key(|output| output.adapter);
+
+    if cancellation.is_cancelled() {
+        return cancel_scan(store, &scan_id);
+    }
 
     let mut global_upserts = BTreeMap::<(String, String), Value>::new();
     for output in outputs {
@@ -328,7 +381,16 @@ pub async fn run_scan_with_cache_mode(
         }
     }
 
+    if cancellation.is_cancelled() {
+        return cancel_scan(store, &scan_id);
+    }
+
     complete_scan(store, &scan_id, strict, config, cache_plan.as_ref())
+}
+
+fn cancel_scan(store: &mut Store, scan_id: &str) -> Result<ScanOutcome> {
+    store.finish_scan(scan_id, "cancelled", Some("scan cancelled"), false)?;
+    snapshot_outcome(store, scan_id, 3)
 }
 
 fn complete_scan(
@@ -716,6 +778,40 @@ mod tests {
         assert_eq!(outcome.exit_code, 0);
         assert_eq!(outcome.status, "completed");
         assert_eq!(outcome.coverage.dependency_sites, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancelled_scan_never_replaces_the_current_completed_snapshot() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let mut store = Store::open_in_memory()?;
+        run_scan(
+            &mut store,
+            root.path().to_path_buf(),
+            &Config::default(),
+            false,
+        )
+        .await?;
+        let current = store.current_snapshot_id()?.context("current snapshot")?;
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+
+        let cancelled = run_scan_with_cache_mode_and_cancellation(
+            &mut store,
+            root.path().to_path_buf(),
+            &Config::default(),
+            false,
+            ScanCacheMode::Enabled,
+            cancellation,
+        )
+        .await?;
+
+        assert_eq!(cancelled.status, "cancelled");
+        assert_eq!(
+            store.current_snapshot_id()?.as_deref(),
+            Some(current.as_str())
+        );
+        assert_eq!(store.scan(&cancelled.scan_id)?.unwrap().status, "cancelled");
         Ok(())
     }
 
