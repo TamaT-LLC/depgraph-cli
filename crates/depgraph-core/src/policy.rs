@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use depgraph_protocol::{
     Condition, EvidenceKind, Precision, ResolutionStatus, stable_id_from_value,
 };
@@ -148,6 +148,34 @@ impl PolicyRule {
                 self.id
             );
         }
+        if self.kind == PolicyRuleKind::Cycle && self.source.kind == PolicySelectorKind::Component {
+            bail!(
+                "cycle rule {:?} does not support component selectors",
+                self.id
+            );
+        }
+        if self.kind == PolicyRuleKind::PublicApiChange
+            && !matches!(
+                self.target.kind,
+                PolicySelectorKind::Symbol | PolicySelectorKind::Type | PolicySelectorKind::Route
+            )
+        {
+            bail!(
+                "public API change rule {:?} requires a symbol, type, or route target selector",
+                self.id
+            );
+        }
+        if self.kind == PolicyRuleKind::RuntimeBoundary
+            && (!matches!(
+                self.source.kind,
+                PolicySelectorKind::Route | PolicySelectorKind::Component
+            ) || self.target.kind != PolicySelectorKind::Component)
+        {
+            bail!(
+                "runtime boundary rule {:?} requires a route/component source and component target",
+                self.id
+            );
+        }
         Ok(())
     }
 }
@@ -160,6 +188,7 @@ pub enum PolicySelectorKind {
     Symbol,
     Type,
     Route,
+    Component,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -709,6 +738,143 @@ pub struct AppliedPolicySuppression {
     pub reason: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicApiChangeKind {
+    Added,
+    Removed,
+    Changed,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublicApiChange {
+    pub id: String,
+    pub rule_id: String,
+    pub kind: PublicApiChangeKind,
+    pub breaking: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub changed_fields: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before: Option<PolicyEntity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<PolicyEntity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    pub condition: PolicyCondition,
+    pub evidence: Vec<PolicyEvidenceSpan>,
+}
+
+impl PublicApiChange {
+    pub fn stable_id(
+        rule_id: &str,
+        kind: PublicApiChangeKind,
+        before_id: Option<&str>,
+        after_id: Option<&str>,
+        profile_id: Option<&str>,
+        changed_fields: &[String],
+    ) -> String {
+        stable_id_from_value(
+            "policy-api-change",
+            &json!({
+                "schema_version": POLICY_RESULT_SCHEMA_VERSION,
+                "rule_id": rule_id,
+                "kind": kind,
+                "before_id": before_id,
+                "after_id": after_id,
+                "profile_id": profile_id,
+                "changed_fields": changed_fields,
+            }),
+        )
+    }
+
+    fn validate(&self) -> Result<()> {
+        if !is_stable_id(&self.id, "policy-api-change") {
+            bail!(
+                "public API change ID {:?} must be policy-api-change:sha256:<64 lowercase hex>",
+                self.id
+            );
+        }
+        validate_contract_id("public API change rule", &self.rule_id)?;
+        match self.kind {
+            PublicApiChangeKind::Added if self.before.is_some() || self.after.is_none() => {
+                bail!("added public API change must contain only an after entity")
+            }
+            PublicApiChangeKind::Removed if self.before.is_none() || self.after.is_some() => {
+                bail!("removed public API change must contain only a before entity")
+            }
+            PublicApiChangeKind::Changed if self.before.is_none() || self.after.is_none() => {
+                bail!("changed public API change must contain before and after entities")
+            }
+            _ => {}
+        }
+        if self.breaking != (self.kind != PublicApiChangeKind::Added) {
+            bail!("only removed or changed public APIs are breaking in policy result v1");
+        }
+        if self.kind == PublicApiChangeKind::Changed && self.changed_fields.is_empty() {
+            bail!("changed public API change must list changed_fields");
+        }
+        if self.kind != PublicApiChangeKind::Changed && !self.changed_fields.is_empty() {
+            bail!("added or removed public API changes must not list changed_fields");
+        }
+        let mut canonical_fields = self.changed_fields.clone();
+        canonical_fields.sort();
+        canonical_fields.dedup();
+        if canonical_fields != self.changed_fields {
+            bail!("public API changed_fields must be unique and sorted");
+        }
+        for field in &self.changed_fields {
+            validate_bounded_text("public API changed field", field, 256)?;
+        }
+        if let Some(before) = &self.before {
+            validate_entity("public API before entity", before)?;
+            if !matches!(
+                before.kind,
+                PolicySelectorKind::Symbol | PolicySelectorKind::Type | PolicySelectorKind::Route
+            ) {
+                bail!("public API before entity must be a symbol, type, or route");
+            }
+        }
+        if let Some(after) = &self.after {
+            validate_entity("public API after entity", after)?;
+            if !matches!(
+                after.kind,
+                PolicySelectorKind::Symbol | PolicySelectorKind::Type | PolicySelectorKind::Route
+            ) {
+                bail!("public API after entity must be a symbol, type, or route");
+            }
+        }
+        if let (Some(before), Some(after)) = (&self.before, &self.after)
+            && before.kind != after.kind
+        {
+            bail!("changed public API before and after entities must have the same kind");
+        }
+        if let Some(profile_id) = &self.profile_id {
+            validate_bounded_text("public API change profile ID", profile_id, 1024)?;
+        }
+        self.condition.validate()?;
+        if self.evidence.is_empty() {
+            bail!("public API change evidence must not be empty");
+        }
+        for span in &self.evidence {
+            span.validate()?;
+        }
+        validate_unique("public API change evidence", &self.evidence)?;
+        let expected_id = Self::stable_id(
+            &self.rule_id,
+            self.kind,
+            self.before.as_ref().map(|entity| entity.id.as_str()),
+            self.after.as_ref().map(|entity| entity.id.as_str()),
+            self.profile_id.as_deref(),
+            &self.changed_fields,
+        );
+        if self.id != expected_id {
+            bail!("public API change ID does not match its canonical fields");
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PolicyViolation {
@@ -723,6 +889,8 @@ pub struct PolicyViolation {
     pub profile_id: Option<String>,
     pub condition: PolicyCondition,
     pub evidence: Vec<PolicyEvidenceSpan>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub suppression: Option<AppliedPolicySuppression>,
 }
@@ -796,6 +964,14 @@ impl PolicyViolation {
             span.validate()?;
         }
         validate_unique("policy violation evidence", &self.evidence)?;
+        if let Some(change_id) = &self.change_id
+            && !is_stable_id(change_id, "policy-api-change")
+        {
+            bail!(
+                "policy violation change_id {:?} must be policy-api-change:sha256:<64 lowercase hex>",
+                change_id
+            );
+        }
         if let Some(suppression) = &self.suppression {
             validate_contract_id("applied policy suppression", &suppression.id)?;
             validate_bounded_text(
@@ -834,6 +1010,8 @@ pub struct PolicyResultSummary {
 pub struct PolicyResult {
     pub schema_version: String,
     pub snapshot_id: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub api_changes: Vec<PublicApiChange>,
     pub violations: Vec<PolicyViolation>,
     pub summary: PolicyResultSummary,
     pub exit_code: u8,
@@ -841,7 +1019,34 @@ pub struct PolicyResult {
 
 impl PolicyResult {
     #[must_use]
-    pub fn new(snapshot_id: impl Into<String>, mut violations: Vec<PolicyViolation>) -> Self {
+    pub fn new(snapshot_id: impl Into<String>, violations: Vec<PolicyViolation>) -> Self {
+        Self::with_api_changes(snapshot_id, Vec::new(), violations)
+    }
+
+    #[must_use]
+    pub fn with_api_changes(
+        snapshot_id: impl Into<String>,
+        mut api_changes: Vec<PublicApiChange>,
+        mut violations: Vec<PolicyViolation>,
+    ) -> Self {
+        api_changes.sort_by(|left, right| {
+            (
+                &left.rule_id,
+                left.kind,
+                left.before.as_ref().map(|entity| &entity.id),
+                left.after.as_ref().map(|entity| &entity.id),
+                &left.profile_id,
+                &left.id,
+            )
+                .cmp(&(
+                    &right.rule_id,
+                    right.kind,
+                    right.before.as_ref().map(|entity| &entity.id),
+                    right.after.as_ref().map(|entity| &entity.id),
+                    &right.profile_id,
+                    &right.id,
+                ))
+        });
         violations.sort_by(|left, right| {
             (
                 &left.rule_id,
@@ -863,6 +1068,7 @@ impl PolicyResult {
         Self {
             schema_version: POLICY_RESULT_SCHEMA_VERSION.to_owned(),
             snapshot_id: snapshot_id.into(),
+            api_changes,
             violations,
             summary,
             exit_code,
@@ -877,8 +1083,54 @@ impl PolicyResult {
             );
         }
         validate_bounded_text("policy result snapshot ID", &self.snapshot_id, 1024)?;
+        for change in &self.api_changes {
+            change.validate()?;
+        }
+        let mut canonical_changes = self.api_changes.clone();
+        canonical_changes.sort_by(|left, right| {
+            (
+                &left.rule_id,
+                left.kind,
+                left.before.as_ref().map(|entity| &entity.id),
+                left.after.as_ref().map(|entity| &entity.id),
+                &left.profile_id,
+                &left.id,
+            )
+                .cmp(&(
+                    &right.rule_id,
+                    right.kind,
+                    right.before.as_ref().map(|entity| &entity.id),
+                    right.after.as_ref().map(|entity| &entity.id),
+                    &right.profile_id,
+                    &right.id,
+                ))
+        });
+        if canonical_changes != self.api_changes {
+            bail!("policy result public API changes are not in canonical order");
+        }
+        let changes_by_id: std::collections::BTreeMap<_, _> = self
+            .api_changes
+            .iter()
+            .map(|change| (change.id.as_str(), change))
+            .collect();
+        if changes_by_id.len() != self.api_changes.len() {
+            bail!("policy result contains duplicate public API change IDs");
+        }
         for violation in &self.violations {
             violation.validate()?;
+            if let Some(change_id) = violation.change_id.as_deref() {
+                let change = changes_by_id
+                    .get(change_id)
+                    .context("policy violation references an unknown public API change")?;
+                if change.rule_id != violation.rule_id {
+                    bail!(
+                        "policy violation and referenced public API change must use the same rule"
+                    );
+                }
+                if !change.breaking {
+                    bail!("policy violation cannot reference a compatible public API addition");
+                }
+            }
         }
         let mut canonical = self.violations.clone();
         canonical.sort_by(|left, right| {
@@ -920,6 +1172,115 @@ impl PolicyResult {
         }
         Ok(())
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyAnnotationLevel {
+    Warning,
+    Error,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PolicyAnnotation {
+    pub violation_id: String,
+    pub rule_id: String,
+    pub level: PolicyAnnotationLevel,
+    pub path: String,
+    pub start_line: u32,
+    pub start_column: u32,
+    pub end_line: u32,
+    pub end_column: u32,
+    pub title: String,
+    pub message: String,
+}
+
+pub fn policy_annotations(result: &PolicyResult) -> Result<Vec<PolicyAnnotation>> {
+    result.validate()?;
+    let mut annotations = Vec::new();
+    for violation in result
+        .violations
+        .iter()
+        .filter(|violation| violation.suppression.is_none())
+    {
+        let evidence = violation
+            .evidence
+            .first()
+            .context("active policy violation has no annotation evidence")?;
+        annotations.push(PolicyAnnotation {
+            violation_id: violation.id.clone(),
+            rule_id: violation.rule_id.clone(),
+            level: match violation.severity {
+                PolicySeverity::Warning => PolicyAnnotationLevel::Warning,
+                PolicySeverity::Error => PolicyAnnotationLevel::Error,
+            },
+            path: evidence.path.clone(),
+            start_line: evidence.start_line,
+            start_column: evidence.start_column,
+            end_line: evidence.end_line,
+            end_column: evidence.end_column,
+            title: format!("depgraph policy {}", violation.rule_id),
+            message: format!(
+                "rule {} violated ({}); inspect the depgraph policy report for details",
+                violation.rule_id, violation.id
+            ),
+        });
+    }
+    annotations.sort_by(|left, right| {
+        (
+            &left.path,
+            left.start_line,
+            left.start_column,
+            left.level,
+            &left.rule_id,
+            &left.violation_id,
+        )
+            .cmp(&(
+                &right.path,
+                right.start_line,
+                right.start_column,
+                right.level,
+                &right.rule_id,
+                &right.violation_id,
+            ))
+    });
+    Ok(annotations)
+}
+
+#[must_use]
+pub fn render_github_annotations(annotations: &[PolicyAnnotation]) -> String {
+    let mut output = String::new();
+    for annotation in annotations {
+        let level = match annotation.level {
+            PolicyAnnotationLevel::Warning => "warning",
+            PolicyAnnotationLevel::Error => "error",
+        };
+        output.push_str(&format!(
+            "::{level} file={},line={},col={},endLine={},endColumn={},title={}::{}\n",
+            escape_workflow_property(&annotation.path),
+            annotation.start_line,
+            annotation.start_column,
+            annotation.end_line,
+            annotation.end_column,
+            escape_workflow_property(&annotation.title),
+            escape_workflow_data(&annotation.message),
+        ));
+    }
+    output
+}
+
+fn escape_workflow_property(value: &str) -> String {
+    escape_workflow_data(value)
+        .replace(':', "%3A")
+        .replace(',', "%2C")
+}
+
+fn escape_workflow_data(value: &str) -> String {
+    value
+        .replace('%', "%25")
+        .replace('\r', "%0D")
+        .replace('\n', "%0A")
 }
 
 fn summarize_violations(violations: &[PolicyViolation]) -> PolicyResultSummary {
@@ -1299,6 +1660,82 @@ mod tests {
     }
 
     #[test]
+    fn specialized_rule_selector_contracts_match_json_schema() -> Result<()> {
+        let golden: Value = serde_json::from_str(GOLDEN_POLICY)?;
+        let schema: Value = serde_json::from_str(POLICY_SCHEMA)?;
+        let validator = jsonschema::validator_for(&schema)?;
+        let policy_value = |rule: Value| {
+            json!({
+                "schema_version": POLICY_SCHEMA_VERSION,
+                "rules": [rule],
+                "suppressions": []
+            })
+        };
+
+        let mut runtime = golden["rules"][0].clone();
+        runtime["id"] = json!("runtime-boundary");
+        runtime["kind"] = json!("runtime_boundary");
+        runtime["source"] = json!({
+            "kind": "route",
+            "field": "locator",
+            "match": "prefix",
+            "value": "framework-route:",
+            "cardinality": "many",
+            "exclude": [],
+            "scope": {}
+        });
+        runtime["target"] = json!({
+            "kind": "component",
+            "field": "locator",
+            "match": "prefix",
+            "value": "framework-component:",
+            "cardinality": "many",
+            "exclude": [],
+            "scope": {}
+        });
+        let valid_runtime = policy_value(runtime.clone());
+        let parsed: PolicyConfig = serde_json::from_value(valid_runtime.clone())?;
+        parsed.validate()?;
+        validator
+            .validate(&valid_runtime)
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+
+        runtime["target"]["kind"] = json!("route");
+        let invalid_runtime = policy_value(runtime);
+        let parsed: PolicyConfig = serde_json::from_value(invalid_runtime.clone())?;
+        assert!(parsed.validate().is_err());
+        assert!(validator.validate(&invalid_runtime).is_err());
+
+        let mut public_api = golden["rules"][0].clone();
+        public_api["id"] = json!("public-api");
+        public_api["kind"] = json!("public_api_change");
+        public_api["target"] = json!({
+            "kind": "symbol",
+            "field": "locator",
+            "match": "prefix",
+            "value": "typescript-symbol:",
+            "cardinality": "many",
+            "exclude": [],
+            "scope": {}
+        });
+        let valid_public_api = policy_value(public_api.clone());
+        let parsed: PolicyConfig = serde_json::from_value(valid_public_api.clone())?;
+        parsed.validate()?;
+        validator
+            .validate(&valid_public_api)
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+
+        public_api["target"]["kind"] = json!("file");
+        public_api["target"]["field"] = json!("path");
+        public_api["target"]["value"] = json!("src/**");
+        let invalid_public_api = policy_value(public_api);
+        let parsed: PolicyConfig = serde_json::from_value(invalid_public_api.clone())?;
+        assert!(parsed.validate().is_err());
+        assert!(validator.validate(&invalid_public_api).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn policy_result_is_canonical_and_error_exit_is_one() -> Result<()> {
         let path = vec![PolicyPathStep {
             source_id: "file:source".into(),
@@ -1337,6 +1774,7 @@ mod tests {
                 end_line: 1,
                 end_column: 20,
             }],
+            change_id: None,
             suppression: None,
         };
 
@@ -1399,5 +1837,82 @@ mod tests {
         assert_eq!(result.summary.errors, 1);
         assert_eq!(result.exit_code, 1);
         result.validate()
+    }
+
+    #[test]
+    fn github_annotations_are_repository_relative_escaped_and_omit_suppressed() -> Result<()> {
+        let path = vec![PolicyPathStep {
+            source_id: "symbol:consumer".into(),
+            edge_id: "edge:impact".into(),
+            target_id: "symbol:api".into(),
+        }];
+        let active = PolicyViolation {
+            id: PolicyViolation::stable_id(
+                "stable-api",
+                "symbol:consumer",
+                "symbol:api",
+                Some("profile:web"),
+                &path,
+            ),
+            rule_id: "stable-api".into(),
+            severity: PolicySeverity::Error,
+            message: "policy 100%: public API changed at /Users/alice with super-secret-value"
+                .into(),
+            source: PolicyEntity {
+                id: "symbol:consumer".into(),
+                kind: PolicySelectorKind::Symbol,
+                locator: "symbol:consumer".into(),
+            },
+            target: PolicyEntity {
+                id: "symbol:api".into(),
+                kind: PolicySelectorKind::Symbol,
+                locator: "symbol:api".into(),
+            },
+            dependency_path: path,
+            profile_id: Some("profile:web".into()),
+            condition: PolicyCondition::default(),
+            evidence: vec![PolicyEvidenceSpan {
+                kind: EvidenceKind::Source,
+                path: "src/api,client:entry.ts".into(),
+                start_line: 7,
+                start_column: 3,
+                end_line: 7,
+                end_column: 19,
+            }],
+            change_id: None,
+            suppression: None,
+        };
+        let mut suppressed = active.clone();
+        suppressed.rule_id = "suppressed-api".into();
+        suppressed.id = PolicyViolation::stable_id(
+            &suppressed.rule_id,
+            &suppressed.source.id,
+            &suppressed.target.id,
+            suppressed.profile_id.as_deref(),
+            &suppressed.dependency_path,
+        );
+        suppressed.suppression = Some(AppliedPolicySuppression {
+            id: "reviewed-exception".into(),
+            reason: "migration window".into(),
+        });
+        let result = PolicyResult::new("snapshot:fixture", vec![suppressed, active]);
+
+        let mut annotations = policy_annotations(&result)?;
+        assert_eq!(annotations.len(), 1);
+        assert_eq!(annotations[0].path, "src/api,client:entry.ts");
+        assert_eq!(annotations[0].start_line, 7);
+        assert!(!annotations[0].message.contains("100%"));
+        assert!(!annotations[0].message.contains("public API changed"));
+        assert!(!annotations[0].message.contains("/Users/alice"));
+        assert!(!annotations[0].message.contains("super-secret-value"));
+        annotations[0].message = "policy 100%: public API changed, review required".into();
+        let rendered = render_github_annotations(&annotations);
+        assert!(rendered.starts_with(
+            "::error file=src/api%2Cclient%3Aentry.ts,line=7,col=3,endLine=7,endColumn=19"
+        ));
+        assert!(rendered.contains("policy 100%25: public API changed, review required"));
+        assert!(!rendered.contains("/Users/"));
+        assert!(!rendered.contains("migration window"));
+        Ok(())
     }
 }

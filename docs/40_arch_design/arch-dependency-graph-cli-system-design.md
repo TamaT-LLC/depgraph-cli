@@ -33,6 +33,8 @@ Rust は rust-analyzer `0.0.330`、upstream revision `8954b66d43225e62c92e8bbcc8
 
 Issue #72でsnapshot create / list / show CLIとimmutable name schema v9、Issue #73でcompleted snapshot間のcanonical graph diff engine、Issue #74でfile / symbol / type / routeのrename detection、Issue #75でhuman / JSON diff CLIとfilter、Issue #76でread-only Git changed-setとbounded reverse impact query、Issue #77でsyntax / semantic / build cache keyとschema v10 storage、Issue #78でincremental invalidation plannerとtransactional replacement、Issue #79でwatcher / daemon frontendまで実装済みである。
 
+2026-07-23のIssue #80〜#82でarchitecture policy contract、snapshot-local evaluator、public API / runtime boundary、CI annotationまで実装済みとなった。現時点で未実装の次段はruntime trace importである。
+
 Issue #47ではTypeScript call sliceを`definition-import-type-call-graph-v2`へ進め、完全に追跡できるimmutable local `const` function-value/alias/conditional flowと、zero-argument `new Class()`だけからなるclosed finite flow（direct expressionまたはconditional）で初期化した`const` receiver flowだけを`candidates / overapprox`の`call` siteと候補ごとの`may_call` edgeへ昇格した。fresh-instanceでは各classがnon-inheriting plain class declarationであり、decorator、constructor、field、accessor、static block、other non-method memberを持たず、選択methodがdirect own methodであること、receiverのnon-declaration useが解析対象のnonoptional direct method/tag invocationの1回だけであることを証明する。candidate targetはcanonical sortし、siteとedgeのprimary evidenceへ`typescript-closed-local-call-flow-v1`または`typescript-closed-local-fresh-instance-flow-v1`を記録する。singleton candidateはexactへ昇格せず、mutable/partial flow、parameter、field、return、candidate-receiver constructor/argument、inheritance、receiver alias/property read/write/argument/return/capture/escape/second use、open/interface/overload dispatchは引き続きreason付き`unresolved`へfail closedする。
 
 Issue #48ではpure TypeScript/JavaScript profileの最終fallback / coverage matrixを実装し、Issue #54で同じgateをframework profileへ拡張した。bundled-only isolated TypeScript `7.0.2`、worker-owned ready project model、emitted `definition-import-type-call-graph-v2`、`project_code_executed=false`、skipped / unsupported / unresolved / semantic issue / total・emitted compiler diagnosticがすべて`0`で、検出frameworkのcompleteness ledgerが全件completeの場合だけ昇格する。`candidates` / `external`は許容し、未検出frameworkのcapabilityは要求しない。compiler crash / timeout / cancelはfailed profile・exit `3`、typed late failureはsemantic deltaをatomicに破棄してsyntax graphを保持し、framework profileはbounded reason付きincompleteに留める。Issue #55ではこのWeb semantic compatibility unitをrelease manifestとworker handshakeへ固定し、抽出archiveの各framework scan/query/export、別checkout決定性、runtime fail-closed、SBOM/license closureをpackage gateへ追加した。
@@ -1127,7 +1129,7 @@ profile / canonical condition、採用するprecision / resolution status、
 非負の`threshold.max`を持ち、それ以外のruleにthresholdがあればconfig
 errorとする。
 
-selectorは`package / file / symbol / type / route`、照合field
+selectorは`package / file / symbol / type / route / component`、照合field
 `id / path / locator / display_name`、`exact / prefix / glob`、cardinality
 `one / many`を明示する。`one`は0件と複数件をともに曖昧性errorとし、
 暗黙の先頭選択を禁止する。repository path / package scopeを適用してから
@@ -1157,6 +1159,25 @@ orderでdeduplicateされ、同一graph/configから同じviolation IDとexit co
 non-promotedで完了し、warning / suppressed-only resultはpolicy payloadを
 保持したままsnapshotを昇格する。policy resultの`snapshot_id`にはmutationを
 伴わず算出したprospective content-addressed snapshot identityを使用する。
+
+Issue #82では`runtime_boundary`をvalidated framework semantic graphへ接続した。
+sourceは`route / component`、targetは`component`に限定し、同一profileの
+canonical shortest pathから明示的な`client_boundary / server_boundary`
+edgeへ到達した場合だけ違反とする。rule conditionはboundary edgeの
+environment、framework condition、`next.runtime`等へ適用し、directiveの
+ない既定境界を推測しない。
+
+`public_api_change`は`depgraph policy <FROM> <TO>`でcompleted snapshot差分を
+評価する。targetは`symbol / type / route`に限定し、addedをcompatible、
+removed / changedをbreakingとしてsource evidence付きで分類する。breaking
+changeはFROM snapshotのconfigured sourceから旧APIへのimpact pathへ結び、
+change ID、profile、condition、dependency path、宣言evidenceを同じ
+violationへ保持する。`--json`はclassification、violation、annotationを含む
+versioned machine-readable report、`--github-annotations`はunsuppressedな
+warning / errorだけをrepository-relative pathと1-origin spanへ変換した
+escaped workflow commandとして出力する。absolute scan root、environment
+value、evidence detailはannotationへ含めない。severityとsuppressionは既存の
+集約規則を共有し、active errorだけがexit `1`となる。
 
 ## 18. Testing Strategy
 
@@ -1344,8 +1365,8 @@ Go semantic scanではGOOS/GOARCH、build tags、強制されたcgo無効状態�
 - git changed-set impact: Issue #76で実装済み（2026-07-23）
 - syntax / semantic分離cache key、schema v10 cache storage、doctor cache診断: Issue #77で実装済み（2026-07-23）
 - incremental invalidation planner / transactional graph replacement: Issue #78で実装済み（2026-07-23）
-- architecture policy
-- CI annotations
+- architecture policy: Issue #80〜#82で実装済み（2026-07-23）
+- public API / runtime boundary policy・CI annotations: Issue #82で実装済み（2026-07-23）
 - runtime trace importer
 
 ## 22. MVP 受け入れ基準
@@ -1389,6 +1410,7 @@ Go semantic scanではGOOS/GOARCH、build tags、強制されたcgo無効状態�
 
 ## 26. 更新履歴
 
+- 2026-07-23: Issue #82としてpublic API change / runtime boundary policyとCI annotationを実装。`depgraph policy <FROM> <TO>`がcompleted snapshot差分のpublic `symbol / type / route`をadded / removed / changedへ分類し、breakingなremoved / changedをbaselineのcanonical impact path、change ID、profile / condition、宣言source evidenceへ関連付ける。scan側の`runtime_boundary`はroute / componentから明示的な`client_boundary / server_boundary`への同一profile pathだけを評価し、framework conditionとedge runtimeを保持する。JSON reportとGitHub Actions warning/error annotationは同じcanonical resultから生成し、repository-relative path / 1-origin spanだけを出力する。warning / error / suppressionのexit挙動、schema parity、runtime unit、snapshot diff integration、secret / absolute path非漏洩を含むCLI E2Eを追加した。
 - 2026-07-23: Issue #79としてcross-platform watcher abstraction、deterministic ignore / generated rules、rename・burst coalescing、configurable debounce、daemon start / status / stopを実装。共有cancellation tokenをscanと全workerへ接続し、新event・shutdown時にprocess tree cleanupをawaitしてcancelled attemptのsnapshot promotionを禁止する。`daemon-status-v1`でactive / last completed / failed / cancelled / watcher error / recoveryを公開し、staging scan / build attemptのcrash recoveryでもcurrent completed snapshotを維持する。event storm、rename chain、delete、generated / ignore、native watcher lifecycle、shutdown cleanup、CLI E2E、crash recoveryをmacOS / Linux / Windows共通testへ追加した。
 - 2026-07-23: Issue #78として`incremental-plan-v1`とtransactional graph replacementを実装。added / modified / deleted / renamed pathをpackage ownership、profile、reverse package dependency、generated route / artifactへ決定的に展開し、manifest / lock / global・ecosystem configをworkspace/profile replanへ昇格する。current completed snapshotをfresh stagingへ複製し、file/package/profile/artifact所有のnode / site / edge / evidence / diagnostic / coverageを単一transactionでdelete / replaceする。scope外の既存record変更と新規record追加を拒否し、失敗時はrollbackしてcurrent completed snapshotを保持する。無関係package/profile非選択、generated dependency、lock/global config、rename、full scan同一性、scope外追加、rollbackをcore/store testで検証した。watcher / debounce / cancel / daemon lifecycleはIssue #79へ分離した。
 - 2026-07-23: Issue #77としてcache contract v1とschema v10 storageを実装。repository-relative file/content、manifest / lock / config、adapter / protocol artifact、toolchain / framework、profile、generated artifactをcanonical digestへ分離し、profile-independent syntax、profile-dependent semantic、observed build cacheを別tableへ保存する。semantic hitはkey / version / completed snapshot / canonical payloadを再検証してfresh attemptへtransactional copyし、通常validationとpromotionを通す。Go external dependency fingerprintを事前再導出できない場合、symlink / inventory上限、unknown version、tamper、stale / conflicting payloadは固定reasonでfail closedし、worker rescanへfallbackする。`--no-cache`、scan JSON/text、doctor entry count / eventを追加し、反復scan、別checkout、profile / config / content差分、corrupt / unknown cache、cache有無のgraph同一性、build cache保存をunit / CLI E2Eで検証した。

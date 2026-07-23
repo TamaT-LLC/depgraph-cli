@@ -58,13 +58,15 @@ pub use incremental::{
 };
 pub use policy::{
     AppliedPolicySuppression, POLICY_RESULT_SCHEMA_VERSION, POLICY_SCHEMA, POLICY_SCHEMA_VERSION,
-    PolicyCondition, PolicyConfig, PolicyEntity, PolicyEvidenceRequirement, PolicyEvidenceSpan,
-    PolicyMatchKind, PolicyPathStep, PolicyPattern, PolicyProfileFilter, PolicyResult,
-    PolicyResultSummary, PolicyRule, PolicyRuleKind, PolicySelector, PolicySelectorCardinality,
-    PolicySelectorField, PolicySelectorKind, PolicySelectorPattern, PolicySelectorScope,
-    PolicySeverity, PolicySuppression, PolicySuppressionScope, PolicyThreshold, PolicyViolation,
+    PolicyAnnotation, PolicyAnnotationLevel, PolicyCondition, PolicyConfig, PolicyEntity,
+    PolicyEvidenceRequirement, PolicyEvidenceSpan, PolicyMatchKind, PolicyPathStep, PolicyPattern,
+    PolicyProfileFilter, PolicyResult, PolicyResultSummary, PolicyRule, PolicyRuleKind,
+    PolicySelector, PolicySelectorCardinality, PolicySelectorField, PolicySelectorKind,
+    PolicySelectorPattern, PolicySelectorScope, PolicySeverity, PolicySuppression,
+    PolicySuppressionScope, PolicyThreshold, PolicyViolation, PublicApiChange, PublicApiChangeKind,
+    policy_annotations, render_github_annotations,
 };
-pub use policy_engine::evaluate_policy;
+pub use policy_engine::{evaluate_policy, evaluate_policy_diff};
 pub use query::{
     CycleLevel, CycleResult, TraversalResult, UnresolvedResult, WhyResult, cycles,
     render_condition, resolve_selector, traverse, unresolved, why,

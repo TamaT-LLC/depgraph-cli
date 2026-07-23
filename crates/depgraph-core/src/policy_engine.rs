@@ -2,7 +2,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
 use anyhow::{Context, Result, bail};
 use depgraph_protocol::EvidenceKind;
-use depgraph_store::{EdgeRecord, EvidenceRecord, GraphSnapshot, NodeRecord, ProfileRecord};
+use depgraph_store::{
+    EdgeRecord, EvidenceRecord, GraphSnapshot, NodeRecord, ProfileRecord, diff_graph_snapshots,
+};
 use serde::Serialize;
 use serde_json::Value;
 
@@ -12,7 +14,7 @@ use crate::{
         PolicyEvidenceRequirement, PolicyEvidenceSpan, PolicyMatchKind, PolicyPathStep,
         PolicyPattern, PolicyProfileFilter, PolicyResult, PolicyRule, PolicyRuleKind,
         PolicySelector, PolicySelectorCardinality, PolicySelectorField, PolicySelectorKind,
-        PolicySuppression, PolicyViolation,
+        PolicySuppression, PolicyViolation, PublicApiChange, PublicApiChangeKind,
     },
     query::{CycleLevel, cycles},
 };
@@ -33,19 +35,16 @@ pub fn evaluate_policy(
         .iter()
         .map(|node| (node.id.as_str(), node))
         .collect();
-    let suppressions = resolve_suppressions(snapshot, config)?;
     let mut violations = BTreeMap::new();
 
     for rule in &config.rules {
         // These rule kinds use specialized evaluation contexts outside this static
         // architecture pass. Their dedicated evaluators compose with this pass, so
         // do not let them discard otherwise valid static architecture violations.
-        if matches!(
-            rule.kind,
-            PolicyRuleKind::PublicApiChange | PolicyRuleKind::RuntimeBoundary
-        ) {
+        if rule.kind == PolicyRuleKind::PublicApiChange {
             continue;
         }
+        let suppressions = resolve_suppressions(snapshot, config, Some(&rule.id))?;
         let sources = resolve_selector(
             snapshot,
             &rule.source,
@@ -58,7 +57,11 @@ pub fn evaluate_policy(
         )?;
         let source_ids: BTreeSet<_> = sources.iter().map(|node| node.id.as_str()).collect();
         let target_ids: BTreeSet<_> = targets.iter().map(|node| node.id.as_str()).collect();
-        let admitted = admitted_edges(snapshot, rule)?;
+        let admitted = if rule.kind == PolicyRuleKind::RuntimeBoundary {
+            Vec::new()
+        } else {
+            admitted_edges(snapshot, rule)?
+        };
 
         let evaluated = match rule.kind {
             PolicyRuleKind::LayerBoundary | PolicyRuleKind::ForbiddenDependency => evaluate_direct(
@@ -97,8 +100,16 @@ pub fn evaluate_policy(
                 &nodes,
                 &suppressions,
             )?,
-            PolicyRuleKind::PublicApiChange | PolicyRuleKind::RuntimeBoundary => {
-                unreachable!("specialized policy rules are handled by their dedicated evaluators")
+            PolicyRuleKind::RuntimeBoundary => evaluate_runtime_boundary(
+                rule,
+                snapshot,
+                &sources,
+                &target_ids,
+                &nodes,
+                &suppressions,
+            )?,
+            PolicyRuleKind::PublicApiChange => {
+                unreachable!("public API rules are handled by the snapshot-diff evaluator")
             }
         };
         for violation in evaluated {
@@ -111,12 +122,599 @@ pub fn evaluate_policy(
     Ok(result)
 }
 
+/// Evaluate snapshot-local rules against `to` and public API change rules
+/// against the deterministic diff from `from` to `to`.
+pub fn evaluate_policy_diff(
+    from_snapshot_id: &str,
+    from: &GraphSnapshot,
+    to_snapshot_id: &str,
+    to: &GraphSnapshot,
+    config: &PolicyConfig,
+) -> Result<PolicyResult> {
+    config.validate()?;
+    let current = evaluate_policy(to_snapshot_id, to, config)?;
+    if !config
+        .rules
+        .iter()
+        .any(|rule| rule.kind == PolicyRuleKind::PublicApiChange)
+    {
+        return Ok(current);
+    }
+    let diff = diff_graph_snapshots(from_snapshot_id, to_snapshot_id, from.clone(), to.clone())?;
+    let mut violations: BTreeMap<_, _> = current
+        .violations
+        .into_iter()
+        .map(|violation| (violation.id.clone(), violation))
+        .collect();
+    let mut api_changes = Vec::new();
+    let from_node_evidence = NodeEvidenceIndex::new(from);
+    let to_node_evidence = NodeEvidenceIndex::new(to);
+
+    for rule in config
+        .rules
+        .iter()
+        .filter(|rule| rule.kind == PolicyRuleKind::PublicApiChange)
+    {
+        validate_diff_selector(from, to, &rule.target, &rule.id)?;
+        let suppressions = resolve_diff_suppressions(from, to, config, &rule.id)?;
+        let admitted = admitted_edges_with_options(from, rule, false, false)?;
+        let mut rule_changes = Vec::new();
+
+        for node in &diff.nodes.added {
+            if let Some(change) = classify_public_api_change(
+                rule,
+                PublicApiChangeKind::Added,
+                None,
+                Some(node),
+                Vec::new(),
+                from,
+                to,
+                &from_node_evidence,
+                &to_node_evidence,
+            )? {
+                rule_changes.push((change, None));
+            }
+        }
+        for node in &diff.nodes.removed {
+            if let Some(change) = classify_public_api_change(
+                rule,
+                PublicApiChangeKind::Removed,
+                Some(node),
+                None,
+                Vec::new(),
+                from,
+                to,
+                &from_node_evidence,
+                &to_node_evidence,
+            )? {
+                rule_changes.push((change, Some(node)));
+            }
+        }
+        for changed in &diff.nodes.changed {
+            if let Some(change) = classify_public_api_change(
+                rule,
+                PublicApiChangeKind::Changed,
+                Some(&changed.before),
+                Some(&changed.after),
+                changed.changed_fields.clone(),
+                from,
+                to,
+                &from_node_evidence,
+                &to_node_evidence,
+            )? {
+                rule_changes.push((change, Some(&changed.before)));
+            }
+        }
+        for rename in &diff.renames {
+            if let Some(change) = classify_public_api_change(
+                rule,
+                PublicApiChangeKind::Changed,
+                Some(&rename.before),
+                Some(&rename.after),
+                rename.changed_fields.clone(),
+                from,
+                to,
+                &from_node_evidence,
+                &to_node_evidence,
+            )? {
+                rule_changes.push((change, Some(&rename.before)));
+            }
+        }
+
+        let needs_impact = rule_changes.iter().any(|(change, _)| change.breaking);
+        let sources = needs_impact
+            .then(|| {
+                resolve_selector(
+                    from,
+                    &rule.source,
+                    &format!("public API rule {:?} source", rule.id),
+                )
+            })
+            .transpose()?
+            .unwrap_or_default();
+        let nodes: BTreeMap<_, _> = from
+            .nodes
+            .iter()
+            .map(|node| (node.id.as_str(), node))
+            .collect();
+
+        for (change, before) in rule_changes {
+            if let Some(before) = before {
+                for violation in evaluate_public_api_impact(
+                    rule,
+                    &change,
+                    before,
+                    &sources,
+                    &admitted,
+                    &nodes,
+                    &suppressions,
+                    from,
+                    to,
+                )? {
+                    violations.entry(violation.id.clone()).or_insert(violation);
+                }
+            }
+            api_changes.push(change);
+        }
+    }
+
+    let result = PolicyResult::with_api_changes(
+        to_snapshot_id,
+        api_changes,
+        violations.into_values().collect(),
+    );
+    result.validate()?;
+    Ok(result)
+}
+
+fn validate_diff_selector(
+    from: &GraphSnapshot,
+    to: &GraphSnapshot,
+    selector: &PolicySelector,
+    rule_id: &str,
+) -> Result<()> {
+    if selector.cardinality != PolicySelectorCardinality::One {
+        return Ok(());
+    }
+    let before = from
+        .nodes
+        .iter()
+        .filter(|node| selector_matches_node(node, selector))
+        .count();
+    let after = to
+        .nodes
+        .iter()
+        .filter(|node| selector_matches_node(node, selector))
+        .count();
+    if before > 1 || after > 1 || (before == 0 && after == 0) {
+        bail!(
+            "public API rule {rule_id:?} target selector must resolve to exactly one node in at least one snapshot and at most one per snapshot, but matched {before} before and {after} after"
+        );
+    }
+    Ok(())
+}
+
+fn resolve_diff_suppressions<'a>(
+    from: &GraphSnapshot,
+    to: &GraphSnapshot,
+    config: &'a PolicyConfig,
+    rule_id: &str,
+) -> Result<Vec<ResolvedSuppression<'a>>> {
+    let mut resolved = Vec::new();
+    for suppression in config
+        .suppressions
+        .iter()
+        .filter(|suppression| suppression.rule_id == rule_id)
+    {
+        let source_ids = suppression
+            .scope
+            .source
+            .as_ref()
+            .map(|selector| {
+                resolve_diff_scope_selector(
+                    from,
+                    to,
+                    selector,
+                    &format!("suppression {:?} source", suppression.id),
+                )
+            })
+            .transpose()?;
+        let target_ids = suppression
+            .scope
+            .target
+            .as_ref()
+            .map(|selector| {
+                resolve_diff_scope_selector(
+                    from,
+                    to,
+                    selector,
+                    &format!("suppression {:?} target", suppression.id),
+                )
+            })
+            .transpose()?;
+        resolved.push(ResolvedSuppression {
+            suppression,
+            source_ids,
+            target_ids,
+        });
+    }
+    resolved.sort_by(|left, right| left.suppression.id.cmp(&right.suppression.id));
+    Ok(resolved)
+}
+
+fn resolve_diff_scope_selector(
+    from: &GraphSnapshot,
+    to: &GraphSnapshot,
+    selector: &PolicySelector,
+    description: &str,
+) -> Result<BTreeSet<String>> {
+    let before: Vec<_> = from
+        .nodes
+        .iter()
+        .filter(|node| selector_matches_node(node, selector))
+        .collect();
+    let after: Vec<_> = to
+        .nodes
+        .iter()
+        .filter(|node| selector_matches_node(node, selector))
+        .collect();
+    if selector.cardinality == PolicySelectorCardinality::One
+        && (before.len() > 1 || after.len() > 1 || (before.is_empty() && after.is_empty()))
+    {
+        bail!(
+            "policy selector {description} must resolve to at most one node per snapshot and at least one across the diff, but matched {} before and {} after",
+            before.len(),
+            after.len()
+        );
+    }
+    Ok(before
+        .into_iter()
+        .chain(after)
+        .map(|node| node.id.clone())
+        .collect())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn classify_public_api_change(
+    rule: &PolicyRule,
+    kind: PublicApiChangeKind,
+    before: Option<&NodeRecord>,
+    after: Option<&NodeRecord>,
+    mut changed_fields: Vec<String>,
+    from: &GraphSnapshot,
+    to: &GraphSnapshot,
+    from_node_evidence: &NodeEvidenceIndex<'_>,
+    to_node_evidence: &NodeEvidenceIndex<'_>,
+) -> Result<Option<PublicApiChange>> {
+    if !before.is_some_and(|node| selector_matches_node(node, &rule.target))
+        && !after.is_some_and(|node| selector_matches_node(node, &rule.target))
+    {
+        return Ok(None);
+    }
+    changed_fields.sort();
+    changed_fields.dedup();
+    let node = after.or(before).context("public API change has no node")?;
+    let profile_id = node_profile_id(node).map(ToOwned::to_owned);
+    if !optional_profile_matches(&rule.profiles, profile_id.as_deref()) {
+        return Ok(None);
+    }
+    let profiles = if after.is_some() {
+        &to.profiles
+    } else {
+        &from.profiles
+    };
+    let profile = profile_id
+        .as_deref()
+        .and_then(|profile_id| profiles.iter().find(|profile| profile.id == profile_id));
+    let context = public_api_change_context(before, after, profile, kind, &changed_fields);
+    if evaluate_condition(&rule.condition, &context) != Some(true) {
+        return Ok(None);
+    }
+
+    let mut evidence = Vec::new();
+    if let Some(after) = after {
+        append_unique_evidence(
+            &mut evidence,
+            node_policy_evidence(to_node_evidence, after, &rule.evidence)?,
+        );
+    }
+    if let Some(before) = before {
+        append_unique_evidence(
+            &mut evidence,
+            node_policy_evidence(from_node_evidence, before, &rule.evidence)?,
+        );
+    }
+    if evidence.len() < usize::try_from(rule.evidence.minimum_spans)? {
+        return Ok(None);
+    }
+    let condition = canonical_condition(&PolicyCondition::All {
+        conditions: vec![
+            rule.condition.clone(),
+            PolicyCondition::Eq {
+                key: "change.kind".to_owned(),
+                value: Value::String(public_api_change_kind_name(kind).to_owned()),
+            },
+            PolicyCondition::Eq {
+                key: "change.breaking".to_owned(),
+                value: Value::Bool(kind != PublicApiChangeKind::Added),
+            },
+        ],
+    })?;
+    let before_entity = before.map(|node| policy_entity(node, rule.target.kind));
+    let after_entity = after.map(|node| policy_entity(node, rule.target.kind));
+    let id = PublicApiChange::stable_id(
+        &rule.id,
+        kind,
+        before_entity.as_ref().map(|entity| entity.id.as_str()),
+        after_entity.as_ref().map(|entity| entity.id.as_str()),
+        profile_id.as_deref(),
+        &changed_fields,
+    );
+    Ok(Some(PublicApiChange {
+        id,
+        rule_id: rule.id.clone(),
+        kind,
+        breaking: kind != PublicApiChangeKind::Added,
+        changed_fields,
+        before: before_entity,
+        after: after_entity,
+        profile_id,
+        condition,
+        evidence,
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_public_api_impact(
+    rule: &PolicyRule,
+    change: &PublicApiChange,
+    before: &NodeRecord,
+    sources: &[&NodeRecord],
+    admitted: &[AdmittedEdge<'_>],
+    nodes: &BTreeMap<&str, &NodeRecord>,
+    suppressions: &[ResolvedSuppression<'_>],
+    from: &GraphSnapshot,
+    to: &GraphSnapshot,
+) -> Result<Vec<PolicyViolation>> {
+    let mut by_profile: BTreeMap<&str, Vec<&AdmittedEdge<'_>>> = BTreeMap::new();
+    for item in admitted {
+        if change
+            .profile_id
+            .as_deref()
+            .is_none_or(|profile_id| item.edge.profile_id == profile_id)
+        {
+            by_profile
+                .entry(item.edge.profile_id.as_str())
+                .or_default()
+                .push(item);
+        }
+    }
+    let mut output = BTreeMap::new();
+    for (profile_id, edges) in by_profile {
+        let adjacency = adjacency(&edges);
+        for source in sources {
+            let mut visited = BTreeSet::from([source.id.clone()]);
+            let mut predecessor: HashMap<String, &AdmittedEdge<'_>> = HashMap::new();
+            let mut queue = VecDeque::from([source.id.clone()]);
+            while let Some(current) = queue.pop_front() {
+                for item in adjacency.get(current.as_str()).into_iter().flatten() {
+                    if visited.insert(item.edge.target.clone()) {
+                        predecessor.insert(item.edge.target.clone(), item);
+                        queue.push_back(item.edge.target.clone());
+                    }
+                }
+            }
+            if !visited.contains(&before.id) {
+                continue;
+            }
+            let path_edges = reconstruct_path(&source.id, &before.id, &predecessor)?;
+            if path_edges.is_empty() {
+                continue;
+            }
+            let violation = make_public_api_violation(
+                rule,
+                change,
+                source,
+                before,
+                Some(profile_id),
+                path_edges,
+                nodes,
+                suppressions,
+                from,
+                to,
+            )?;
+            output.entry(violation.id.clone()).or_insert(violation);
+        }
+    }
+    for source in sources.iter().filter(|source| source.id == before.id) {
+        let violation = make_public_api_violation(
+            rule,
+            change,
+            source,
+            before,
+            change.profile_id.as_deref(),
+            Vec::new(),
+            nodes,
+            suppressions,
+            from,
+            to,
+        )?;
+        output.entry(violation.id.clone()).or_insert(violation);
+    }
+    Ok(output.into_values().collect())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn make_public_api_violation(
+    rule: &PolicyRule,
+    change: &PublicApiChange,
+    source: &NodeRecord,
+    target: &NodeRecord,
+    profile_id: Option<&str>,
+    path_edges: Vec<&AdmittedEdge<'_>>,
+    nodes: &BTreeMap<&str, &NodeRecord>,
+    suppressions: &[ResolvedSuppression<'_>],
+    from: &GraphSnapshot,
+    to: &GraphSnapshot,
+) -> Result<PolicyViolation> {
+    if !nodes.contains_key(source.id.as_str()) || !nodes.contains_key(target.id.as_str()) {
+        bail!("public API impact path references a node missing from the baseline snapshot");
+    }
+    let dependency_path = if path_edges.is_empty() {
+        vec![PolicyPathStep {
+            source_id: source.id.clone(),
+            edge_id: change.id.clone(),
+            target_id: target.id.clone(),
+        }]
+    } else {
+        path_edges.iter().map(|item| path_step(item.edge)).collect()
+    };
+    let mut evidence = change.evidence.clone();
+    append_unique_evidence(
+        &mut evidence,
+        path_edges
+            .iter()
+            .flat_map(|item| item.evidence.iter().cloned())
+            .collect(),
+    );
+    let mut conditions = vec![change.condition.clone()];
+    if !path_edges.is_empty() {
+        conditions.push(combined_condition(&path_edges)?);
+    }
+    let condition = canonical_condition(&PolicyCondition::All { conditions })?;
+    let mut context = combined_context(&path_edges);
+    let profiles = if change.after.is_some() {
+        &to.profiles
+    } else {
+        &from.profiles
+    };
+    let node_profile = change
+        .profile_id
+        .as_deref()
+        .and_then(|profile_id| profiles.iter().find(|profile| profile.id == profile_id));
+    for (key, value) in public_api_change_context(
+        Some(target),
+        change
+            .after
+            .as_ref()
+            .and_then(|after| to.nodes.iter().find(|node| node.id == after.id)),
+        node_profile,
+        change.kind,
+        &change.changed_fields,
+    ) {
+        context.entry(key).or_insert(value);
+    }
+    let suppression = applied_suppression(
+        suppressions,
+        &rule.id,
+        &source.id,
+        &target.id,
+        profile_id,
+        &context,
+    );
+    let id = PolicyViolation::stable_id(
+        &rule.id,
+        &source.id,
+        &target.id,
+        profile_id,
+        &dependency_path,
+    );
+    Ok(PolicyViolation {
+        id,
+        rule_id: rule.id.clone(),
+        severity: rule.severity,
+        message: format!(
+            "breaking public API {} for {} impacts {}",
+            public_api_change_kind_name(change.kind),
+            target.id,
+            source.id
+        ),
+        source: policy_entity(source, rule.source.kind),
+        target: policy_entity(target, rule.target.kind),
+        dependency_path,
+        profile_id: profile_id.map(ToOwned::to_owned),
+        condition,
+        evidence,
+        change_id: Some(change.id.clone()),
+        suppression,
+    })
+}
+
 #[derive(Debug)]
 struct AdmittedEdge<'a> {
     edge: &'a EdgeRecord,
     condition: PolicyCondition,
     evidence: Vec<PolicyEvidenceSpan>,
     context: BTreeMap<String, Value>,
+}
+
+#[derive(Debug)]
+struct NodeEvidenceIndex<'a> {
+    records: BTreeMap<&'a str, Vec<&'a EvidenceRecord>>,
+}
+
+impl<'a> NodeEvidenceIndex<'a> {
+    fn new(snapshot: &'a GraphSnapshot) -> Self {
+        let mut evidence_by_owner: BTreeMap<(&str, &str), Vec<&EvidenceRecord>> = BTreeMap::new();
+        let mut records: BTreeMap<&str, Vec<&EvidenceRecord>> = BTreeMap::new();
+        for evidence in &snapshot.evidence {
+            evidence_by_owner
+                .entry((evidence.owner_type.as_str(), evidence.owner_id.as_str()))
+                .or_default()
+                .push(evidence);
+            if evidence.owner_type == "node" {
+                records
+                    .entry(evidence.owner_id.as_str())
+                    .or_default()
+                    .push(evidence);
+            }
+        }
+        for edge in snapshot
+            .edges
+            .iter()
+            .filter(|edge| matches!(edge.kind.as_str(), "declares" | "contains" | "route_entry"))
+        {
+            let mut related = evidence_by_owner
+                .get(&("edge", edge.id.as_str()))
+                .cloned()
+                .unwrap_or_default();
+            if related.is_empty()
+                && let Some(site_id) = edge.site_id.as_deref()
+            {
+                related = evidence_by_owner
+                    .get(&("site", site_id))
+                    .cloned()
+                    .unwrap_or_default();
+            }
+            records
+                .entry(edge.target.as_str())
+                .or_default()
+                .extend(related);
+        }
+        for records in records.values_mut() {
+            records.sort_by(|left, right| {
+                (
+                    left.ordinal,
+                    &left.kind,
+                    &left.path,
+                    left.start_line,
+                    left.start_column,
+                    &left.owner_type,
+                    &left.owner_id,
+                )
+                    .cmp(&(
+                        right.ordinal,
+                        &right.kind,
+                        &right.path,
+                        right.start_line,
+                        right.start_column,
+                        &right.owner_type,
+                        &right.owner_id,
+                    ))
+            });
+        }
+        Self { records }
+    }
 }
 
 #[derive(Debug)]
@@ -129,9 +727,14 @@ struct ResolvedSuppression<'a> {
 fn resolve_suppressions<'a>(
     snapshot: &GraphSnapshot,
     config: &'a PolicyConfig,
+    rule_id: Option<&str>,
 ) -> Result<Vec<ResolvedSuppression<'a>>> {
     let mut resolved = Vec::with_capacity(config.suppressions.len());
-    for suppression in &config.suppressions {
+    for suppression in config
+        .suppressions
+        .iter()
+        .filter(|suppression| rule_id.is_none_or(|rule_id| suppression.rule_id == rule_id))
+    {
         let source_ids = suppression
             .scope
             .source
@@ -172,6 +775,15 @@ fn admitted_edges<'a>(
     snapshot: &'a GraphSnapshot,
     rule: &PolicyRule,
 ) -> Result<Vec<AdmittedEdge<'a>>> {
+    admitted_edges_with_options(snapshot, rule, true, true)
+}
+
+fn admitted_edges_with_options<'a>(
+    snapshot: &'a GraphSnapshot,
+    rule: &PolicyRule,
+    apply_rule_condition: bool,
+    require_evidence: bool,
+) -> Result<Vec<AdmittedEdge<'a>>> {
     let profiles: BTreeMap<_, _> = snapshot
         .profiles
         .iter()
@@ -206,12 +818,12 @@ fn admitted_edges<'a>(
             continue;
         }
         add_condition_facts(&condition, &mut context);
-        if evaluate_condition(&rule.condition, &context) != Some(true) {
+        if apply_rule_condition && evaluate_condition(&rule.condition, &context) != Some(true) {
             continue;
         }
 
         let spans = select_evidence(edge, &rule.evidence, &evidence)?;
-        if spans.len() < usize::try_from(rule.evidence.minimum_spans)? {
+        if require_evidence && spans.len() < usize::try_from(rule.evidence.minimum_spans)? {
             continue;
         }
         admitted.push(AdmittedEdge {
@@ -236,6 +848,85 @@ fn admitted_edges<'a>(
             ))
     });
     Ok(admitted)
+}
+
+fn evaluate_runtime_boundary(
+    rule: &PolicyRule,
+    snapshot: &GraphSnapshot,
+    sources: &[&NodeRecord],
+    target_ids: &BTreeSet<&str>,
+    nodes: &BTreeMap<&str, &NodeRecord>,
+    suppressions: &[ResolvedSuppression<'_>],
+) -> Result<Vec<PolicyViolation>> {
+    let admitted = admitted_edges_with_options(snapshot, rule, false, true)?;
+    let mut by_profile: BTreeMap<&str, Vec<&AdmittedEdge<'_>>> = BTreeMap::new();
+    for item in &admitted {
+        by_profile
+            .entry(item.edge.profile_id.as_str())
+            .or_default()
+            .push(item);
+    }
+
+    let mut output = BTreeMap::new();
+    for (profile_id, edges) in by_profile {
+        let adjacency = adjacency(&edges);
+        let boundaries: Vec<_> = edges
+            .iter()
+            .copied()
+            .filter(|item| {
+                matches!(
+                    item.edge.kind.as_str(),
+                    "client_boundary" | "server_boundary"
+                ) && target_ids.contains(item.edge.target.as_str())
+                    && evaluate_condition(&rule.condition, &item.context) == Some(true)
+            })
+            .collect();
+
+        for source in sources {
+            let mut visited = BTreeSet::from([source.id.clone()]);
+            let mut predecessor: HashMap<String, &AdmittedEdge<'_>> = HashMap::new();
+            let mut queue = VecDeque::from([source.id.clone()]);
+            while let Some(current) = queue.pop_front() {
+                for item in adjacency.get(current.as_str()).into_iter().flatten() {
+                    if visited.insert(item.edge.target.clone()) {
+                        predecessor.insert(item.edge.target.clone(), item);
+                        queue.push_back(item.edge.target.clone());
+                    }
+                }
+            }
+
+            for boundary in &boundaries {
+                let mut path_edges = if source.id == boundary.edge.source {
+                    Vec::new()
+                } else if visited.contains(&boundary.edge.source) {
+                    reconstruct_path(&source.id, &boundary.edge.source, &predecessor)?
+                } else {
+                    continue;
+                };
+                path_edges.push(boundary);
+                let path = path_edges.iter().map(|item| path_step(item.edge)).collect();
+                let violation = make_violation(
+                    rule,
+                    nodes,
+                    &source.id,
+                    &boundary.edge.target,
+                    Some(profile_id),
+                    path,
+                    path_edges,
+                    format!(
+                        "{} {} is reachable from {} to {}",
+                        rule_kind_name(&rule.kind),
+                        boundary.edge.kind,
+                        source.id,
+                        boundary.edge.target
+                    ),
+                    suppressions,
+                )?;
+                output.entry(violation.id.clone()).or_insert(violation);
+            }
+        }
+    }
+    Ok(output.into_values().collect())
 }
 
 fn evaluate_direct(
@@ -623,6 +1314,7 @@ fn make_violation(
         profile_id: profile_id.map(ToOwned::to_owned),
         condition,
         evidence,
+        change_id: None,
         suppression,
     })
 }
@@ -648,7 +1340,10 @@ fn applied_suppression(
                     .target_ids
                     .as_ref()
                     .is_none_or(|ids| ids.contains(target_id))
-                && profile_id.is_some_and(|profile| profile_matches(&scope.profiles, profile))
+                && profile_id.map_or_else(
+                    || scope.profiles == PolicyProfileFilter::default(),
+                    |profile| profile_matches(&scope.profiles, profile),
+                )
                 && scope
                     .condition
                     .as_ref()
@@ -731,6 +1426,7 @@ fn node_kind_matches(node: &NodeRecord, kind: PolicySelectorKind) -> bool {
         PolicySelectorKind::Symbol => node.kind == "symbol",
         PolicySelectorKind::Type => node.kind == "type",
         PolicySelectorKind::Route => node.kind == "route",
+        PolicySelectorKind::Component => node.kind == "component",
     }
 }
 
@@ -771,6 +1467,81 @@ fn node_package(node: &NodeRecord) -> Option<&str> {
         matches!(node.kind.as_str(), "package" | "package_instance")
             .then_some(node.locator.as_str())
     })
+}
+
+fn node_profile_id(node: &NodeRecord) -> Option<&str> {
+    string_property(&node.properties, &["profile_id"]).or_else(|| {
+        node.properties
+            .get("canonical_identity")
+            .and_then(|identity| string_property(identity, &["profile_id"]))
+    })
+}
+
+fn optional_profile_matches(filter: &PolicyProfileFilter, profile_id: Option<&str>) -> bool {
+    profile_id.map_or_else(
+        || filter == &PolicyProfileFilter::default(),
+        |profile_id| profile_matches(filter, profile_id),
+    )
+}
+
+fn policy_entity(node: &NodeRecord, kind: PolicySelectorKind) -> PolicyEntity {
+    PolicyEntity {
+        id: node.id.clone(),
+        kind,
+        locator: node.locator.clone(),
+    }
+}
+
+fn public_api_change_context(
+    before: Option<&NodeRecord>,
+    after: Option<&NodeRecord>,
+    profile: Option<&ProfileRecord>,
+    kind: PublicApiChangeKind,
+    changed_fields: &[String],
+) -> BTreeMap<String, Value> {
+    let mut context = BTreeMap::new();
+    if let Some(profile) = profile {
+        merge_object(&mut context, &profile.environment);
+        merge_object(&mut context, &profile.properties);
+        context.insert(
+            "language".to_owned(),
+            Value::String(profile.language.clone()),
+        );
+        if let Some(target) = &profile.target {
+            context.insert("target".to_owned(), Value::String(target.clone()));
+        }
+        if let Some(command) = &profile.command {
+            context.insert("command".to_owned(), Value::String(command.clone()));
+        }
+        context.insert(
+            "features".to_owned(),
+            Value::Array(
+                profile
+                    .features
+                    .iter()
+                    .cloned()
+                    .map(Value::String)
+                    .collect(),
+            ),
+        );
+        context.insert("profile".to_owned(), Value::String(profile.id.clone()));
+        context.insert("profile_id".to_owned(), Value::String(profile.id.clone()));
+    }
+    if let Some(after) = after {
+        merge_object(&mut context, &after.properties);
+    }
+    if let Some(before) = before {
+        merge_object(&mut context, &before.properties);
+    }
+    context.insert(
+        "change".to_owned(),
+        serde_json::json!({
+            "kind": public_api_change_kind_name(kind),
+            "breaking": kind != PublicApiChangeKind::Added,
+            "changed_fields": changed_fields,
+        }),
+    );
+    context
 }
 
 fn string_property<'a>(value: &'a Value, names: &[&str]) -> Option<&'a str> {
@@ -1114,6 +1885,78 @@ fn select_evidence(
     Ok(spans)
 }
 
+fn node_policy_evidence(
+    index: &NodeEvidenceIndex<'_>,
+    node: &NodeRecord,
+    requirement: &PolicyEvidenceRequirement,
+) -> Result<Vec<PolicyEvidenceSpan>> {
+    let records = index
+        .records
+        .get(node.id.as_str())
+        .cloned()
+        .unwrap_or_default();
+
+    let mut spans = Vec::new();
+    for record in records {
+        if requirement.primary_only && record.ordinal != 0 {
+            continue;
+        }
+        let kind: EvidenceKind = serde_json::from_value(Value::String(record.kind.clone()))
+            .with_context(|| {
+                format!(
+                    "node {:?} evidence has unknown kind {:?}",
+                    node.id, record.kind
+                )
+            })?;
+        if !requirement.kinds.contains(&kind) {
+            continue;
+        }
+        spans.push(PolicyEvidenceSpan {
+            kind,
+            path: record.path.clone(),
+            start_line: u32::try_from(record.start_line)?,
+            start_column: u32::try_from(record.start_column)?,
+            end_line: u32::try_from(record.end_line)?,
+            end_column: u32::try_from(record.end_column)?,
+        });
+    }
+    if requirement.kinds.contains(&EvidenceKind::Source)
+        && let Some(path) = string_property(&node.properties, &["source_path", "path"])
+        && let Some(span) = node
+            .properties
+            .get("source_span")
+            .and_then(Value::as_object)
+    {
+        let position = |name: &str| {
+            span.get(name)
+                .and_then(Value::as_u64)
+                .with_context(|| format!("node {:?} source_span.{name} is missing", node.id))
+                .and_then(|value| u32::try_from(value).map_err(Into::into))
+        };
+        spans.push(PolicyEvidenceSpan {
+            kind: EvidenceKind::Source,
+            path: path.to_owned(),
+            start_line: position("start_line")?,
+            start_column: position("start_column")?,
+            end_line: position("end_line")?,
+            end_column: position("end_column")?,
+        });
+    }
+    canonicalize_evidence(&mut spans);
+    Ok(spans)
+}
+
+fn append_unique_evidence(
+    destination: &mut Vec<PolicyEvidenceSpan>,
+    evidence: Vec<PolicyEvidenceSpan>,
+) {
+    for span in evidence {
+        if !destination.contains(&span) {
+            destination.push(span);
+        }
+    }
+}
+
 fn canonicalize_evidence(evidence: &mut Vec<PolicyEvidenceSpan>) {
     evidence.sort_by(|left, right| {
         (
@@ -1184,6 +2027,7 @@ fn cycle_level(kind: PolicySelectorKind) -> Option<CycleLevel> {
         PolicySelectorKind::Symbol => Some(CycleLevel::Symbol),
         PolicySelectorKind::Type => Some(CycleLevel::Type),
         PolicySelectorKind::Route => Some(CycleLevel::Route),
+        PolicySelectorKind::Component => None,
     }
 }
 
@@ -1206,6 +2050,14 @@ fn rule_kind_name(kind: &PolicyRuleKind) -> &'static str {
         PolicyRuleKind::FanOut => "fan-out",
         PolicyRuleKind::PublicApiChange => "public-api-change",
         PolicyRuleKind::RuntimeBoundary => "runtime-boundary",
+    }
+}
+
+fn public_api_change_kind_name(kind: PublicApiChangeKind) -> &'static str {
+    match kind {
+        PublicApiChangeKind::Added => "added",
+        PublicApiChangeKind::Removed => "removed",
+        PublicApiChangeKind::Changed => "changed",
     }
 }
 
@@ -1238,6 +2090,29 @@ mod tests {
             locator: locator.to_owned(),
             display_name: locator.to_owned(),
             properties: json!({"locator": locator}),
+        }
+    }
+
+    fn semantic_node(id: &str, kind: &str, path: &str, properties: Value) -> NodeRecord {
+        let mut base = serde_json::json!({
+            "profile_id": "profile:production",
+            "source_path": path,
+            "source_span": {
+                "start_line": 3,
+                "start_column": 1,
+                "end_line": 3,
+                "end_column": 24
+            }
+        });
+        if let (Some(base), Some(properties)) = (base.as_object_mut(), properties.as_object()) {
+            base.extend(properties.clone());
+        }
+        NodeRecord {
+            id: id.to_owned(),
+            kind: kind.to_owned(),
+            locator: format!("{kind}:{id}"),
+            display_name: id.to_owned(),
+            properties: base,
         }
     }
 
@@ -1416,6 +2291,15 @@ mod tests {
         let mut specialized_rule = rule(PolicyRuleKind::PublicApiChange);
         specialized_rule.id = "public-api".to_owned();
         specialized_rule.source.value = "not-present/**".to_owned();
+        specialized_rule.target = PolicySelector {
+            kind: PolicySelectorKind::Symbol,
+            field: PolicySelectorField::Locator,
+            match_kind: PolicyMatchKind::Prefix,
+            value: "symbol:".to_owned(),
+            cardinality: PolicySelectorCardinality::Many,
+            exclude: Vec::new(),
+            scope: PolicySelectorScope::default(),
+        };
         let policy = PolicyConfig {
             schema_version: POLICY_SCHEMA_VERSION.to_owned(),
             rules: vec![specialized_rule, static_rule],
@@ -1427,6 +2311,287 @@ mod tests {
         assert_eq!(result.violations.len(), 1);
         assert_eq!(result.violations[0].rule_id, "fixture-rule");
         assert_eq!(result.exit_code, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_boundary_links_route_path_profile_condition_and_exit_behavior() -> Result<()> {
+        let mut route_to_server = edge(
+            "route-renders-server",
+            "route",
+            "server-component",
+            "profile:production",
+        );
+        route_to_server.kind = "renders".to_owned();
+        let mut server_to_client = edge(
+            "server-crosses-client",
+            "server-component",
+            "client-component",
+            "profile:production",
+        );
+        server_to_client.kind = "client_boundary".to_owned();
+        server_to_client.condition = json!({
+            "op": "all",
+            "conditions": [
+                {"op":"eq","key":"mode","value":"production"},
+                {"op":"eq","key":"next.boundary","value":"client"},
+                {"op":"eq","key":"next.runtime","value":"edge"}
+            ]
+        });
+        let mut graph = snapshot(vec![server_to_client, route_to_server]);
+        graph.nodes = vec![
+            semantic_node(
+                "route",
+                "route",
+                "app/page.tsx",
+                json!({"environment":"server"}),
+            ),
+            semantic_node(
+                "server-component",
+                "component",
+                "app/page.tsx",
+                json!({"environment":"server"}),
+            ),
+            semantic_node(
+                "client-component",
+                "component",
+                "app/client.tsx",
+                json!({"environment":"browser"}),
+            ),
+        ];
+        let mut runtime = rule(PolicyRuleKind::RuntimeBoundary);
+        runtime.id = "no-edge-client".to_owned();
+        runtime.source = PolicySelector {
+            kind: PolicySelectorKind::Route,
+            field: PolicySelectorField::Id,
+            match_kind: PolicyMatchKind::Exact,
+            value: "route".to_owned(),
+            cardinality: PolicySelectorCardinality::One,
+            exclude: Vec::new(),
+            scope: PolicySelectorScope::default(),
+        };
+        runtime.target = PolicySelector {
+            kind: PolicySelectorKind::Component,
+            field: PolicySelectorField::Id,
+            match_kind: PolicyMatchKind::Exact,
+            value: "client-component".to_owned(),
+            cardinality: PolicySelectorCardinality::One,
+            exclude: Vec::new(),
+            scope: PolicySelectorScope::default(),
+        };
+        runtime.condition = PolicyCondition::Eq {
+            key: "next.runtime".to_owned(),
+            value: json!("edge"),
+        };
+
+        let active = evaluate_policy("snapshot:runtime", &graph, &config(runtime.clone()))?;
+        assert_eq!(active.exit_code, 1);
+        assert_eq!(active.violations.len(), 1);
+        assert_eq!(
+            active.violations[0]
+                .dependency_path
+                .iter()
+                .map(|step| step.edge_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["route-renders-server", "server-crosses-client"]
+        );
+        assert_eq!(
+            active.violations[0].profile_id.as_deref(),
+            Some("profile:production")
+        );
+        assert!(serde_json::to_string(&active.violations[0].condition)?.contains("next.runtime"));
+        let mut server_boundary_graph = graph.clone();
+        server_boundary_graph
+            .edges
+            .iter_mut()
+            .find(|edge| edge.id == "server-crosses-client")
+            .context("boundary edge")?
+            .kind = "server_boundary".to_owned();
+        let server_boundary = evaluate_policy(
+            "snapshot:runtime-server",
+            &server_boundary_graph,
+            &config(runtime.clone()),
+        )?;
+        assert_eq!(server_boundary.violations.len(), 1);
+        assert!(
+            server_boundary.violations[0]
+                .message
+                .contains("server_boundary")
+        );
+
+        runtime.severity = PolicySeverity::Warning;
+        let warning = evaluate_policy("snapshot:runtime", &graph, &config(runtime.clone()))?;
+        assert_eq!(warning.summary.warnings, 1);
+        assert_eq!(warning.exit_code, 0);
+
+        runtime.severity = PolicySeverity::Error;
+        let mut suppressed_config = config(runtime);
+        suppressed_config.suppressions.push(PolicySuppression {
+            id: "allow-client-island".to_owned(),
+            rule_id: "no-edge-client".to_owned(),
+            reason: "reviewed migration".to_owned(),
+            scope: PolicySuppressionScope {
+                target: Some(PolicySelector {
+                    kind: PolicySelectorKind::Component,
+                    field: PolicySelectorField::Id,
+                    match_kind: PolicyMatchKind::Exact,
+                    value: "client-component".to_owned(),
+                    cardinality: PolicySelectorCardinality::One,
+                    exclude: Vec::new(),
+                    scope: PolicySelectorScope::default(),
+                }),
+                ..PolicySuppressionScope::default()
+            },
+        });
+        let suppressed = evaluate_policy("snapshot:runtime", &graph, &suppressed_config)?;
+        assert_eq!(suppressed.summary.suppressed, 1);
+        assert_eq!(suppressed.exit_code, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn public_api_diff_classifies_changes_and_links_impact_evidence() -> Result<()> {
+        let consumer = semantic_node(
+            "consumer",
+            "symbol",
+            "src/consumer.ts",
+            json!({"signature":"consumer-v1"}),
+        );
+        let api_v1 = semantic_node(
+            "public-api",
+            "symbol",
+            "src/public.ts",
+            json!({"signature":"v1"}),
+        );
+        let api_v2 = semantic_node(
+            "public-api",
+            "symbol",
+            "src/public.ts",
+            json!({"signature":"v2"}),
+        );
+        let dependency = edge(
+            "consumer-imports-api",
+            "consumer",
+            "public-api",
+            "profile:production",
+        );
+        let mut baseline = snapshot(vec![dependency.clone()]);
+        baseline.nodes = vec![api_v1.clone(), consumer.clone()];
+        let mut changed = snapshot(vec![dependency]);
+        changed.nodes = vec![consumer.clone(), api_v2];
+        let mut removed = snapshot(Vec::new());
+        removed.nodes = vec![consumer.clone()];
+        let mut before_added = snapshot(Vec::new());
+        before_added.nodes = vec![consumer.clone()];
+        let mut after_added = snapshot(Vec::new());
+        after_added.nodes = vec![consumer, api_v1];
+
+        let mut public_rule = rule(PolicyRuleKind::PublicApiChange);
+        public_rule.id = "stable-public-api".to_owned();
+        public_rule.source = PolicySelector {
+            kind: PolicySelectorKind::Symbol,
+            field: PolicySelectorField::Id,
+            match_kind: PolicyMatchKind::Exact,
+            value: "consumer".to_owned(),
+            cardinality: PolicySelectorCardinality::One,
+            exclude: Vec::new(),
+            scope: PolicySelectorScope::default(),
+        };
+        public_rule.target = PolicySelector {
+            kind: PolicySelectorKind::Symbol,
+            field: PolicySelectorField::Id,
+            match_kind: PolicyMatchKind::Exact,
+            value: "public-api".to_owned(),
+            cardinality: PolicySelectorCardinality::One,
+            exclude: Vec::new(),
+            scope: PolicySelectorScope::default(),
+        };
+        public_rule.condition = PolicyCondition::default();
+        let policy = config(public_rule.clone());
+
+        let changed_result =
+            evaluate_policy_diff("baseline", &baseline, "changed", &changed, &policy)?;
+        assert_eq!(changed_result.api_changes.len(), 1);
+        assert_eq!(
+            changed_result.api_changes[0].kind,
+            PublicApiChangeKind::Changed
+        );
+        assert!(changed_result.api_changes[0].breaking);
+        assert_eq!(changed_result.violations.len(), 1);
+        assert_eq!(
+            changed_result.violations[0].change_id.as_deref(),
+            Some(changed_result.api_changes[0].id.as_str())
+        );
+        assert_eq!(
+            changed_result.violations[0].dependency_path[0].edge_id,
+            "consumer-imports-api"
+        );
+        assert_eq!(
+            changed_result.violations[0].evidence[0].path,
+            "src/public.ts"
+        );
+        assert_eq!(changed_result.exit_code, 1);
+
+        let removed_result =
+            evaluate_policy_diff("baseline", &baseline, "removed", &removed, &policy)?;
+        assert_eq!(
+            removed_result.api_changes[0].kind,
+            PublicApiChangeKind::Removed
+        );
+        assert_eq!(removed_result.violations.len(), 1);
+        assert_eq!(removed_result.exit_code, 1);
+
+        let added_result = evaluate_policy_diff(
+            "before-added",
+            &before_added,
+            "after-added",
+            &after_added,
+            &policy,
+        )?;
+        assert_eq!(added_result.api_changes[0].kind, PublicApiChangeKind::Added);
+        assert!(!added_result.api_changes[0].breaking);
+        assert!(added_result.violations.is_empty());
+        assert_eq!(added_result.exit_code, 0);
+
+        public_rule.severity = PolicySeverity::Warning;
+        let warning = evaluate_policy_diff(
+            "baseline",
+            &baseline,
+            "changed",
+            &changed,
+            &config(public_rule.clone()),
+        )?;
+        assert_eq!(warning.summary.warnings, 1);
+        assert_eq!(warning.exit_code, 0);
+
+        let mut suppressed_policy = config(public_rule);
+        suppressed_policy.rules[0].severity = PolicySeverity::Error;
+        suppressed_policy.suppressions.push(PolicySuppression {
+            id: "allow-api-change".to_owned(),
+            rule_id: "stable-public-api".to_owned(),
+            reason: "versioned rollout".to_owned(),
+            scope: PolicySuppressionScope {
+                target: Some(PolicySelector {
+                    kind: PolicySelectorKind::Symbol,
+                    field: PolicySelectorField::Id,
+                    match_kind: PolicyMatchKind::Exact,
+                    value: "public-api".to_owned(),
+                    cardinality: PolicySelectorCardinality::One,
+                    exclude: Vec::new(),
+                    scope: PolicySelectorScope::default(),
+                }),
+                ..PolicySuppressionScope::default()
+            },
+        });
+        let suppressed = evaluate_policy_diff(
+            "baseline",
+            &baseline,
+            "changed",
+            &changed,
+            &suppressed_policy,
+        )?;
+        assert_eq!(suppressed.summary.suppressed, 1);
+        assert_eq!(suppressed.exit_code, 0);
         Ok(())
     }
 

@@ -9,11 +9,12 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use depgraph_core::{
     BuildOutcomeKind, Config, CycleLevel, DaemonStatus, ExportFormat, ImpactFilters, ImpactResult,
-    ScanCacheMode, acquire_store_writer_lock, build_cache_key, create_build_execution_request,
-    default_store_path, doctor, execute_build_request_with_cancellation, export, impact,
-    init_config, open_store, read_git_changed_set, render_condition, run_scan_with_cache_mode,
-    rust_build_protocol_ndjson, stage_build_evidence, start_repository_daemon, traverse,
-    unresolved, web_build_protocol_ndjson, why,
+    PolicyAnnotation, PolicyResult, ScanCacheMode, acquire_store_writer_lock, build_cache_key,
+    create_build_execution_request, default_store_path, doctor, evaluate_policy_diff,
+    execute_build_request_with_cancellation, export, impact, init_config, open_store,
+    policy_annotations, read_git_changed_set, render_condition, render_github_annotations,
+    run_scan_with_cache_mode, rust_build_protocol_ndjson, stage_build_evidence,
+    start_repository_daemon, traverse, unresolved, web_build_protocol_ndjson, why,
 };
 use depgraph_store::{CompletedSnapshotDetails, CoverageRecord};
 use serde::Serialize;
@@ -164,6 +165,16 @@ enum Commands {
         #[arg(long, value_name = "STATUS")]
         status: Vec<String>,
     },
+    /// Evaluate architecture policy between two immutable completed snapshots.
+    Policy {
+        from: String,
+        to: String,
+        #[arg(long, conflicts_with = "github_annotations")]
+        json: bool,
+        /// Emit GitHub Actions workflow commands for active violations.
+        #[arg(long, conflicts_with = "json")]
+        github_annotations: bool,
+    },
     /// Export the selected scan in a deterministic format.
     Export {
         #[arg(long, value_enum)]
@@ -265,6 +276,14 @@ struct SnapshotView {
     profile_ids: Vec<String>,
     created_at: String,
     coverage: CoverageRecord,
+}
+
+#[derive(Serialize)]
+struct PolicyCommandData<'a> {
+    from_snapshot_id: &'a str,
+    to_snapshot_id: &'a str,
+    result: &'a PolicyResult,
+    annotations: &'a [PolicyAnnotation],
 }
 
 impl From<CompletedSnapshotDetails> for SnapshotView {
@@ -1054,6 +1073,80 @@ async fn run(cli: Cli) -> Result<u8> {
                 );
             }
             Ok(0)
+        }
+        Commands::Policy {
+            from,
+            to,
+            json,
+            github_annotations,
+        } => {
+            let root = canonical_directory(std::env::current_dir()?)?;
+            let config = Config::load(&root)?;
+            let store_path = store_path(cli.store, &root)?;
+            let store = open_store(&store_path)?;
+            let from_snapshot_id = store.resolve_completed_snapshot_selector(&from)?;
+            let to_snapshot_id = store.resolve_completed_snapshot_selector(&to)?;
+            let from_snapshot = store.load_completed_snapshot(&from_snapshot_id)?;
+            let to_snapshot = store.load_completed_snapshot(&to_snapshot_id)?;
+            let result = evaluate_policy_diff(
+                &from_snapshot_id,
+                &from_snapshot,
+                &to_snapshot_id,
+                &to_snapshot,
+                &config.policy,
+            )?;
+            let annotations = policy_annotations(&result)?;
+            if github_annotations {
+                print!("{}", render_github_annotations(&annotations));
+            } else if json {
+                let output = PolicyCommandData {
+                    from_snapshot_id: &from_snapshot_id,
+                    to_snapshot_id: &to_snapshot_id,
+                    result: &result,
+                    annotations: &annotations,
+                };
+                print_snapshot_json("policy", &output)?;
+            } else {
+                println!(
+                    "policy: {} API changes, {} errors, {} warnings, {} suppressed",
+                    result.api_changes.len(),
+                    result.summary.errors,
+                    result.summary.warnings,
+                    result.summary.suppressed
+                );
+                for change in &result.api_changes {
+                    let entity = change
+                        .after
+                        .as_ref()
+                        .or(change.before.as_ref())
+                        .context("public API change has no entity")?;
+                    println!(
+                        "API {:?} [{}] {}",
+                        change.kind,
+                        if change.breaking {
+                            "breaking"
+                        } else {
+                            "compatible"
+                        },
+                        entity.locator
+                    );
+                }
+                for violation in &result.violations {
+                    let state = violation
+                        .suppression
+                        .as_ref()
+                        .map_or("active", |_| "suppressed");
+                    println!(
+                        "policy {} [{}] {}: {} -> {}",
+                        violation.rule_id,
+                        state,
+                        violation.message,
+                        violation.source.locator,
+                        violation.target.locator
+                    );
+                }
+            }
+            Ok(result.exit_code)
         }
         Commands::Export { format, output } => {
             let (snapshot, _) = load_snapshot(cli.store, cli.scan_id.as_deref(), false)?;

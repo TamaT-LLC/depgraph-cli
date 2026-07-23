@@ -249,7 +249,8 @@
             "file",
             "symbol",
             "type",
-            "route"
+            "route",
+            "component"
           ]
         },
         "field": {
@@ -1867,6 +1868,66 @@
                 }
               }
             ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "public_api_change"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "target": {
+                "properties": {
+                  "kind": {
+                    "enum": [
+                      "symbol",
+                      "type",
+                      "route"
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "runtime_boundary"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "source": {
+                "properties": {
+                  "kind": {
+                    "enum": [
+                      "route",
+                      "component"
+                    ]
+                  }
+                }
+              },
+              "target": {
+                "properties": {
+                  "kind": {
+                    "const": "component"
+                  }
+                }
+              }
+            }
           }
         }
       ]
