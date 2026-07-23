@@ -269,7 +269,7 @@ pub fn match_runtime_trace(
                 "sequence": event.sequence,
                 "timestamp": event.timestamp,
                 "profile": trace.session.profile,
-                "environment": trace.session.environment.name,
+                "environment": trace.session.environment,
                 "dependency_kind": event.dependency_kind,
                 "source": event.source,
                 "target": event.target,
@@ -914,6 +914,18 @@ mod tests {
     }
 
     #[test]
+    fn event_identity_includes_every_environment_axis() -> Result<()> {
+        let baseline = validate_runtime_trace(Cursor::new(GOLDEN), &snapshot())?;
+        let mut value: Value = serde_json::from_str(GOLDEN)?;
+        value["session"]["environment"]["runtime"] = json!("nodejs-25");
+        value["session"]["environment"]["region"] = json!("test-region-2");
+        let changed =
+            validate_runtime_trace(Cursor::new(serde_json::to_vec(&value)?), &snapshot())?;
+        assert_ne!(baseline.events[0].id, changed.events[0].id);
+        Ok(())
+    }
+
+    #[test]
     fn golden_trace_is_accepted_by_json_schema() -> Result<()> {
         let value: Value = serde_json::from_str(GOLDEN)?;
         let schema: Value = serde_json::from_str(RUNTIME_TRACE_SCHEMA)?;
@@ -1091,6 +1103,26 @@ mod tests {
             assert!(
                 !jsonschema::validator_for(&schema)?.is_valid(&value),
                 "schema accepted a non-canonical file URI scheme"
+            );
+        }
+
+        for unsafe_locator in ["framework route:/api/users", "framework\\route:/api/users"] {
+            value = serde_json::from_str(GOLDEN)?;
+            value["events"][0]["target"] = json!({
+                "kind":"graph_locator",
+                "locator":unsafe_locator,
+                "node_kind":"route"
+            });
+            assert!(
+                read_runtime_trace(Cursor::new(serde_json::to_vec(&value)?))
+                    .unwrap_err()
+                    .to_string()
+                    .contains("portable graph locator")
+            );
+            let schema: Value = serde_json::from_str(RUNTIME_TRACE_SCHEMA)?;
+            assert!(
+                !jsonschema::validator_for(&schema)?.is_valid(&value),
+                "schema accepted whitespace or backslash in a graph locator"
             );
         }
 

@@ -131,6 +131,8 @@
             "locator": {
               "allOf": [
                 { "$ref": "#/$defs/boundedString" },
+                { "not": { "pattern": "\\s" } },
+                { "not": { "pattern": "\\\\" } },
                 {
                   "anyOf": [
                     { "not": { "pattern": "^[Ff][Ii][Ll][Ee]:" } },
