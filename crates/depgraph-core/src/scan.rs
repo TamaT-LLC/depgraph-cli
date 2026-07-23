@@ -262,10 +262,18 @@ pub async fn run_scan_with_cache_mode_and_cancellation(
             }
         }
     }
+    if cancellation.is_cancelled() {
+        return cancel_scan(store, &scan_id);
+    }
+
     let mut join_set = JoinSet::new();
     let mut task_adapters = BTreeMap::new();
     let cache_workers = cache_plan.as_ref().map(|_| workers_to_run.clone());
     for (adapter, spec) in workers_to_run {
+        if cancellation.is_cancelled() {
+            join_set.shutdown().await;
+            return cancel_scan(store, &scan_id);
+        }
         let root = root.clone();
         let scan_id = scan_id.clone();
         let scan_config = config.scan.clone();
