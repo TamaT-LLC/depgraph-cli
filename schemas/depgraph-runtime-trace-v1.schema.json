@@ -23,24 +23,35 @@
       "maxLength": 4096,
       "pattern": "^[^\\u0000-\\u001F\\u007F]+$"
     },
+    "idString": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "pattern": "^[^\\u0000-\\u001F\\u007F]+$"
+    },
     "identifier": {
       "type": "string",
       "minLength": 1,
       "maxLength": 512,
       "pattern": "^[A-Za-z0-9_.:/-]+$"
     },
+    "uint64": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 18446744073709551615
+    },
     "nameList": {
       "type": "array",
       "maxItems": 256,
-      "items": { "$ref": "#/$defs/boundedString" }
+      "items": { "$ref": "#/$defs/idString" }
     },
     "repository": {
       "type": "object",
       "additionalProperties": false,
       "required": ["identity"],
       "properties": {
-        "identity": { "$ref": "#/$defs/boundedString" },
-        "revision": { "$ref": "#/$defs/boundedString" }
+        "identity": { "$ref": "#/$defs/idString" },
+        "revision": { "$ref": "#/$defs/idString" }
       }
     },
     "profile": {
@@ -49,13 +60,13 @@
       "required": ["language"],
       "properties": {
         "language": { "$ref": "#/$defs/identifier" },
-        "target": { "$ref": "#/$defs/boundedString" },
+        "target": { "$ref": "#/$defs/idString" },
         "features": {
           "type": "array",
           "maxItems": 256,
-          "items": { "$ref": "#/$defs/boundedString" }
+          "items": { "$ref": "#/$defs/idString" }
         },
-        "parent_profile_id": { "$ref": "#/$defs/boundedString" }
+        "parent_profile_id": { "$ref": "#/$defs/idString" }
       }
     },
     "environment": {
@@ -63,9 +74,9 @@
       "additionalProperties": false,
       "required": ["name"],
       "properties": {
-        "name": { "$ref": "#/$defs/boundedString" },
-        "runtime": { "$ref": "#/$defs/boundedString" },
-        "region": { "$ref": "#/$defs/boundedString" },
+        "name": { "$ref": "#/$defs/idString" },
+        "runtime": { "$ref": "#/$defs/idString" },
+        "region": { "$ref": "#/$defs/idString" },
         "environment_keys": { "$ref": "#/$defs/nameList" }
       }
     },
@@ -77,8 +88,7 @@
         "header_names": { "$ref": "#/$defs/nameList" },
         "secret_names": { "$ref": "#/$defs/nameList" },
         "redacted_value_count": {
-          "type": "integer",
-          "minimum": 0
+          "$ref": "#/$defs/uint64"
         }
       }
     },
@@ -87,7 +97,7 @@
       "additionalProperties": false,
       "required": ["id", "started_at", "profile", "environment"],
       "properties": {
-        "id": { "$ref": "#/$defs/boundedString" },
+        "id": { "$ref": "#/$defs/idString" },
         "started_at": {
           "type": "string",
           "format": "date-time"
@@ -109,7 +119,7 @@
           "required": ["kind", "node_id"],
           "properties": {
             "kind": { "const": "node" },
-            "node_id": { "$ref": "#/$defs/boundedString" }
+            "node_id": { "$ref": "#/$defs/idString" }
           }
         },
         {
@@ -118,7 +128,22 @@
           "required": ["kind", "locator"],
           "properties": {
             "kind": { "const": "graph_locator" },
-            "locator": { "$ref": "#/$defs/boundedString" },
+            "locator": {
+              "allOf": [
+                { "$ref": "#/$defs/boundedString" },
+                {
+                  "anyOf": [
+                    { "not": { "pattern": "^[Ff][Ii][Ll][Ee]:" } },
+                    { "pattern": "^file:" }
+                  ]
+                },
+                {
+                  "not": {
+                    "pattern": "(^file://(?:[A-Za-z]:|/|\\\\|\\.{1,2}(/|$)|.*//|.*/\\.{1,2}(/|$)|.*/$))|(^file:(?!//)(?:[A-Za-z]:|/|\\\\|\\.{1,2}(/|$)|.*//|.*/\\.{1,2}(/|$)|.*/$))"
+                  }
+                }
+              ]
+            },
             "node_kind": { "$ref": "#/$defs/identifier" }
           }
         },
@@ -131,7 +156,7 @@
             "path": {
               "allOf": [
                 { "$ref": "#/$defs/boundedString" },
-                { "not": { "pattern": "(^/|^\\\\|(^|/)(\\.|\\.\\.)(/|$)|\\\\)" } }
+                { "not": { "pattern": "(^/|\\\\|^[A-Za-z]:|(^|/)(\\.|\\.\\.)(/|$)|//|/$)" } }
               ]
             },
             "node_kind": { "$ref": "#/$defs/identifier" }
@@ -170,8 +195,10 @@
       ],
       "properties": {
         "sequence": {
-          "type": "integer",
-          "minimum": 1
+          "allOf": [
+            { "$ref": "#/$defs/uint64" },
+            { "minimum": 1 }
+          ]
         },
         "timestamp": {
           "type": "string",
@@ -181,12 +208,13 @@
         "source": { "$ref": "#/$defs/locator" },
         "target": { "$ref": "#/$defs/locator" },
         "count": {
-          "type": "integer",
-          "minimum": 1
+          "allOf": [
+            { "$ref": "#/$defs/uint64" },
+            { "minimum": 1 }
+          ]
         },
         "duration_ns": {
-          "type": "integer",
-          "minimum": 0
+          "$ref": "#/$defs/uint64"
         },
         "redaction": { "$ref": "#/$defs/redaction" }
       }

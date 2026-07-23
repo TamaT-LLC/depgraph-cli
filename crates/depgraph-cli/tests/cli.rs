@@ -730,6 +730,7 @@ fn runtime_validate_rejects_malformed_and_secret_input_with_bounded_errors() {
     let cache = tempfile::tempdir().unwrap();
     let store_path = cache.path().join("graph.db");
     seed_runtime_trace_snapshot(&store_path, root.path());
+    let unopened_store_path = cache.path().join("must-not-be-opened.db");
     let fixture = |name: &str| {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../depgraph-core/tests/fixtures")
@@ -740,7 +741,7 @@ fn runtime_validate_rejects_malformed_and_secret_input_with_bounded_errors() {
         .unwrap()
         .args([
             "--store",
-            store_path.to_str().unwrap(),
+            unopened_store_path.to_str().unwrap(),
             "runtime",
             "validate",
             fixture("runtime-trace-v1.malformed.json").to_str().unwrap(),
@@ -749,12 +750,13 @@ fn runtime_validate_rejects_malformed_and_secret_input_with_bounded_errors() {
         .code(2)
         .stderr(predicate::str::contains("repository-relative path"))
         .stderr(predicate::str::contains("../outside.ts").not());
+    assert!(!unopened_store_path.exists());
 
     Command::cargo_bin("depgraph")
         .unwrap()
         .args([
             "--store",
-            store_path.to_str().unwrap(),
+            unopened_store_path.to_str().unwrap(),
             "runtime",
             "validate",
             fixture("runtime-trace-v1.secret.json").to_str().unwrap(),
@@ -763,6 +765,7 @@ fn runtime_validate_rejects_malformed_and_secret_input_with_bounded_errors() {
         .code(2)
         .stderr(predicate::str::contains("secret"))
         .stderr(predicate::str::contains("fixture-secret-value").not());
+    assert!(!unopened_store_path.exists());
 }
 
 #[test]

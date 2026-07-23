@@ -15,8 +15,8 @@ pub const RUNTIME_TRACE_SCHEMA: &str = include_str!(concat!(
     "/../../schemas/depgraph-runtime-trace-v1.schema.json"
 ));
 
-const MAX_STRING_BYTES: usize = 4_096;
-const MAX_ID_BYTES: usize = 512;
+const MAX_STRING_CHARS: usize = 4_096;
+const MAX_ID_CHARS: usize = 512;
 const MAX_NAMES: usize = 256;
 const MAX_FEATURES: usize = 256;
 const MAX_JSON_DEPTH: usize = 32;
@@ -212,7 +212,7 @@ pub fn read_runtime_trace(mut reader: impl Read) -> Result<RuntimeTrace> {
         serde_json::from_str(source).context("runtime trace must be a valid JSON document")?;
     validate_untrusted_json(&value, 0)?;
     let mut trace: RuntimeTrace = serde_json::from_value(value)
-        .context("runtime trace does not match the versioned contract")?;
+        .map_err(|_| anyhow::anyhow!("runtime trace does not match the versioned contract"))?;
     trace.validate()?;
     Ok(trace)
 }
@@ -306,18 +306,18 @@ impl RuntimeTrace {
         validate_bounded_string(
             &self.repository.identity,
             "repository.identity",
-            MAX_ID_BYTES,
+            MAX_ID_CHARS,
         )?;
         if let Some(revision) = &self.repository.revision {
-            validate_bounded_string(revision, "repository.revision", MAX_ID_BYTES)?;
+            validate_bounded_string(revision, "repository.revision", MAX_ID_CHARS)?;
         }
-        validate_bounded_string(&self.session.id, "session.id", MAX_ID_BYTES)?;
+        validate_bounded_string(&self.session.id, "session.id", MAX_ID_CHARS)?;
         validate_identifier(&self.session.profile.language, "session.profile.language")?;
         if let Some(target) = &self.session.profile.target {
-            validate_bounded_string(target, "session.profile.target", MAX_ID_BYTES)?;
+            validate_bounded_string(target, "session.profile.target", MAX_ID_CHARS)?;
         }
         if let Some(parent) = &self.session.profile.parent_profile_id {
-            validate_bounded_string(parent, "session.profile.parent_profile_id", MAX_ID_BYTES)?;
+            validate_bounded_string(parent, "session.profile.parent_profile_id", MAX_ID_CHARS)?;
         }
         normalize_names(
             &mut self.session.profile.features,
@@ -327,13 +327,13 @@ impl RuntimeTrace {
         validate_bounded_string(
             &self.session.environment.name,
             "session.environment.name",
-            MAX_ID_BYTES,
+            MAX_ID_CHARS,
         )?;
         if let Some(runtime) = &self.session.environment.runtime {
-            validate_bounded_string(runtime, "session.environment.runtime", MAX_ID_BYTES)?;
+            validate_bounded_string(runtime, "session.environment.runtime", MAX_ID_CHARS)?;
         }
         if let Some(region) = &self.session.environment.region {
-            validate_bounded_string(region, "session.environment.region", MAX_ID_BYTES)?;
+            validate_bounded_string(region, "session.environment.region", MAX_ID_CHARS)?;
         }
         normalize_names(
             &mut self.session.environment.environment_keys,
@@ -413,7 +413,7 @@ fn normalize_timestamp(value: &mut String, field: &str) -> Result<DateTime<Utc>>
 fn validate_locator(locator: &RuntimeTraceLocator, field: &str) -> Result<()> {
     match locator {
         RuntimeTraceLocator::Node { node_id } => {
-            validate_bounded_string(node_id, &format!("{field}.node_id"), MAX_ID_BYTES)
+            validate_bounded_string(node_id, &format!("{field}.node_id"), MAX_ID_CHARS)
         }
         RuntimeTraceLocator::GraphLocator { locator, node_kind } => {
             validate_graph_locator(locator, &format!("{field}.locator"))?;
@@ -431,7 +431,7 @@ fn validate_locator(locator: &RuntimeTraceLocator, field: &str) -> Result<()> {
         }
         RuntimeTraceLocator::External { namespace, name } => {
             validate_identifier(namespace, &format!("{field}.namespace"))?;
-            validate_bounded_string(name, &format!("{field}.name"), MAX_STRING_BYTES)
+            validate_bounded_string(name, &format!("{field}.name"), MAX_STRING_CHARS)
         }
         RuntimeTraceLocator::Unresolved { reason } => {
             validate_identifier(reason, &format!("{field}.reason"))
@@ -440,25 +440,34 @@ fn validate_locator(locator: &RuntimeTraceLocator, field: &str) -> Result<()> {
 }
 
 fn validate_graph_locator(locator: &str, field: &str) -> Result<()> {
-    validate_bounded_string(locator, field, MAX_STRING_BYTES)?;
+    validate_bounded_string(locator, field, MAX_STRING_CHARS)?;
     if locator.contains('\\') || locator.chars().any(char::is_whitespace) {
         bail!("runtime trace {field} is not a portable graph locator");
     }
-    if let Some(path) = locator
-        .strip_prefix("file://")
-        .or_else(|| locator.strip_prefix("file:"))
+    if strip_ascii_case_prefix(locator, "file:").is_some() && !locator.starts_with("file:") {
+        bail!("runtime trace {field} uses a non-canonical file URI scheme");
+    }
+    if let Some(path) = strip_ascii_case_prefix(locator, "file://")
+        .or_else(|| strip_ascii_case_prefix(locator, "file:"))
     {
         validate_repository_path(path, field)?;
     }
     Ok(())
 }
 
+fn strip_ascii_case_prefix<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
+    value
+        .get(..prefix.len())
+        .filter(|candidate| candidate.eq_ignore_ascii_case(prefix))
+        .map(|_| &value[prefix.len()..])
+}
+
 fn validate_repository_path(path: &str, field: &str) -> Result<()> {
-    validate_bounded_string(path, field, MAX_STRING_BYTES)?;
+    validate_bounded_string(path, field, MAX_STRING_CHARS)?;
     if path.starts_with('/')
         || path.starts_with('\\')
         || path.contains('\\')
-        || is_windows_absolute_path(path)
+        || is_windows_drive_path(path)
         || path
             .split('/')
             .any(|part| part.is_empty() || part == "." || part == "..")
@@ -469,7 +478,7 @@ fn validate_repository_path(path: &str, field: &str) -> Result<()> {
 }
 
 fn validate_identifier(value: &str, field: &str) -> Result<()> {
-    validate_bounded_string(value, field, MAX_ID_BYTES)?;
+    validate_bounded_string(value, field, MAX_ID_CHARS)?;
     if !value.bytes().all(|byte| {
         byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':' | b'/')
     }) {
@@ -479,7 +488,7 @@ fn validate_identifier(value: &str, field: &str) -> Result<()> {
 }
 
 fn validate_bounded_string(value: &str, field: &str, max: usize) -> Result<()> {
-    if value.is_empty() || value.len() > max {
+    if value.is_empty() || value.chars().count() > max {
         bail!("runtime trace {field} must be a non-empty bounded string");
     }
     if value.chars().any(char::is_control) {
@@ -499,7 +508,7 @@ fn normalize_names(values: &mut Vec<String>, field: &str, max_items: usize) -> R
         bail!("runtime trace {field} exceeds its item limit");
     }
     for value in values.iter() {
-        validate_bounded_string(value, field, MAX_ID_BYTES)?;
+        validate_bounded_string(value, field, MAX_ID_CHARS)?;
     }
     values.sort();
     values.dedup();
@@ -525,8 +534,8 @@ fn validate_untrusted_json(value: &Value, depth: usize) -> Result<()> {
             }
         }
         Value::String(value) => {
-            if value.len() > MAX_STRING_BYTES {
-                bail!("runtime trace contains a string exceeding its byte limit");
+            if value.chars().count() > MAX_STRING_CHARS {
+                bail!("runtime trace contains a string exceeding its length limit");
             }
             if looks_like_absolute_path(value) {
                 bail!("runtime trace contains an absolute path");
@@ -590,18 +599,15 @@ fn looks_like_secret(value: &str) -> bool {
 fn looks_like_absolute_path(value: &str) -> bool {
     value.starts_with('/')
         || value.starts_with("\\\\")
-        || is_windows_absolute_path(value)
+        || is_windows_drive_path(value)
         || value.to_ascii_lowercase().starts_with("file:///")
         || (value.to_ascii_lowercase().starts_with("file:/")
             && !value.to_ascii_lowercase().starts_with("file://"))
 }
 
-fn is_windows_absolute_path(value: &str) -> bool {
+fn is_windows_drive_path(value: &str) -> bool {
     let bytes = value.as_bytes();
-    bytes.len() >= 3
-        && bytes[0].is_ascii_alphabetic()
-        && bytes[1] == b':'
-        && matches!(bytes[2], b'/' | b'\\')
+    bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
 }
 
 fn validate_repository(
@@ -874,6 +880,21 @@ mod tests {
             .map_err(|error| anyhow::anyhow!("{error}"))?;
         assert!(!validator.is_valid(&serde_json::from_str(MALFORMED)?));
         assert!(!validator.is_valid(&serde_json::from_str(SECRET)?));
+
+        let mut oversized_id = value.clone();
+        oversized_id["repository"]["identity"] = json!("x".repeat(MAX_ID_CHARS + 1));
+        assert!(!validator.is_valid(&oversized_id));
+        assert!(
+            read_runtime_trace(Cursor::new(serde_json::to_vec(&oversized_id)?))
+                .unwrap_err()
+                .to_string()
+                .contains("bounded string")
+        );
+
+        let mut unicode_boundary = value;
+        unicode_boundary["repository"]["identity"] = json!("é".repeat(MAX_ID_CHARS));
+        assert!(validator.is_valid(&unicode_boundary));
+        read_runtime_trace(Cursor::new(serde_json::to_vec(&unicode_boundary)?))?;
         Ok(())
     }
 
@@ -886,6 +907,17 @@ mod tests {
         let message = format!("{secret:#}");
         assert!(message.contains("secret"));
         assert!(!message.contains("fixture-secret-value"));
+    }
+
+    #[test]
+    fn typed_shape_errors_never_echo_raw_values() -> Result<()> {
+        let mut value: Value = serde_json::from_str(GOLDEN)?;
+        value["events"][0]["count"] = json!("opaque-runtime-value");
+        let error = read_runtime_trace(Cursor::new(serde_json::to_vec(&value)?)).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("versioned contract"));
+        assert!(!message.contains("opaque-runtime-value"));
+        Ok(())
     }
 
     #[test]
@@ -976,6 +1008,42 @@ mod tests {
                 .to_string()
                 .contains("repository-relative path")
         );
+
+        for unsafe_path in ["C:/outside.ts", "C:outside.ts", "a//b.ts", "a/"] {
+            value = serde_json::from_str(GOLDEN)?;
+            value["events"][0]["source"]["path"] = json!(unsafe_path);
+            assert!(
+                read_runtime_trace(Cursor::new(serde_json::to_vec(&value)?))
+                    .unwrap_err()
+                    .to_string()
+                    .contains("path")
+            );
+            let schema: Value = serde_json::from_str(RUNTIME_TRACE_SCHEMA)?;
+            assert!(
+                !jsonschema::validator_for(&schema)?.is_valid(&value),
+                "schema accepted unsafe repository path"
+            );
+        }
+
+        for unsafe_locator in ["FILE://../outside.ts", "File://C:/outside.ts"] {
+            value = serde_json::from_str(GOLDEN)?;
+            value["events"][0]["target"] = json!({
+                "kind":"graph_locator",
+                "locator":unsafe_locator,
+                "node_kind":"file"
+            });
+            assert!(
+                read_runtime_trace(Cursor::new(serde_json::to_vec(&value)?))
+                    .unwrap_err()
+                    .to_string()
+                    .contains("file URI scheme")
+            );
+            let schema: Value = serde_json::from_str(RUNTIME_TRACE_SCHEMA)?;
+            assert!(
+                !jsonschema::validator_for(&schema)?.is_valid(&value),
+                "schema accepted a non-canonical file URI scheme"
+            );
+        }
         Ok(())
     }
 

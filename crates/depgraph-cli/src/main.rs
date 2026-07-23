@@ -11,11 +11,11 @@ use depgraph_core::{
     BuildOutcomeKind, Config, CycleLevel, DaemonStatus, ExportFormat, ImpactFilters, ImpactResult,
     PolicyAnnotation, PolicyResult, ScanCacheMode, acquire_store_writer_lock, build_cache_key,
     create_build_execution_request, default_store_path, doctor, evaluate_policy_diff,
-    execute_build_request_with_cancellation, export, impact, init_config, open_store,
-    policy_annotations, read_git_changed_set, render_condition, render_github_annotations,
-    run_scan_with_cache_mode, rust_build_protocol_ndjson, stage_build_evidence,
-    start_repository_daemon, traverse, unresolved, validate_runtime_trace,
-    web_build_protocol_ndjson, why,
+    execute_build_request_with_cancellation, export, impact, init_config, match_runtime_trace,
+    open_store, policy_annotations, read_git_changed_set, read_runtime_trace, render_condition,
+    render_github_annotations, run_scan_with_cache_mode, rust_build_protocol_ndjson,
+    stage_build_evidence, start_repository_daemon, traverse, unresolved, web_build_protocol_ndjson,
+    why,
 };
 use depgraph_store::{CompletedSnapshotDetails, CoverageRecord};
 use serde::Serialize;
@@ -993,8 +993,9 @@ async fn run(cli: Cli) -> Result<u8> {
                 }
                 let input =
                     std::fs::File::open(&trace).context("failed to open runtime trace input")?;
+                let trace = read_runtime_trace(input)?;
                 let (snapshot, scan_id) = load_snapshot(cli.store, cli.scan_id.as_deref(), false)?;
-                let result = validate_runtime_trace(input, &snapshot)?;
+                let result = match_runtime_trace(trace, &snapshot)?;
                 print_structured("runtime.validate", scan_id, &result, json)?;
                 if !json {
                     println!("runtime trace: valid");

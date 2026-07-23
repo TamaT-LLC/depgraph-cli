@@ -227,7 +227,7 @@ matches must be unique; missing or ambiguous locators remain `unresolved`, and
 collector-declared external targets remain `external`. Validation never
 invents a repository node.
 
-Input is bounded to 16 MiB, 100,000 events, 4,096-byte strings, and 32 JSON
+Input is bounded to 16 MiB, 100,000 events, 4,096-character strings, and 32 JSON
 levels. UTF-8, exact version, strict fields, RFC 3339 session bounds, increasing
 sequence numbers, and portable paths are required. Absolute paths, `..`,
 backslashes, unknown properties, secret-bearing fields, and common raw
