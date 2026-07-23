@@ -9,9 +9,12 @@ publish = false
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+depgraph-core = { path = "../crates/depgraph-core" }
 depgraph-protocol = { path = "../crates/depgraph-protocol" }
+depgraph-store = { path = "../crates/depgraph-store" }
 flate2 = "1.1"
 hex.workspace = true
+rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

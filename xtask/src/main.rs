@@ -37,6 +37,10 @@ const RUST_ANALYZER_DIRECT_DEPENDENCIES: &[&str] =
     &["ra_ap_hir", "ra_ap_ide_db", "ra_ap_syntax", "ra_ap_vfs"];
 const SALSA_DIRECT_DEPENDENCIES: &[&str] = &["salsa", "salsa-macro-rules", "salsa-macros"];
 const TYPESCRIPT_VERSION: &str = "7.0.2";
+const PREVIOUS_RELEASE_VERSION: &str = "0.2.0-rc.1";
+const PREVIOUS_RELEASE_STORE_SCHEMA_VERSION: i64 = 5;
+const MINIMUM_MIGRATABLE_STORE_SCHEMA_VERSION: i64 = 1;
+const MILESTONE4_PACKAGED_SMOKE_CONTRACT: &str = "milestone4-packaged-smoke-v1";
 const WEB_SEMANTIC_CAPABILITIES: &[&str] = &[
     "astro-component-render-hydration-v1",
     "framework-semantic-completeness-v1",
@@ -94,6 +98,7 @@ struct ReleaseManifest {
     release_version: String,
     protocol_version: String,
     schema_version: String,
+    compatibility: ReleaseCompatibility,
     target: String,
     license_expression: String,
     project_licenses: Vec<Artifact>,
@@ -103,6 +108,24 @@ struct ReleaseManifest {
     runtime_components: Vec<RuntimeComponent>,
     workers: Vec<WorkerArtifact>,
     runtime_requirements: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ReleaseCompatibility {
+    store_schema_version: i64,
+    minimum_migratable_store_schema_version: i64,
+    previous_release_version: String,
+    previous_release_store_schema_version: i64,
+    cache_contract_version: u32,
+    snapshot_diff_schema_version: String,
+    incremental_plan_schema_version: String,
+    daemon_status_schema_version: String,
+    policy_schema_version: String,
+    policy_result_schema_version: String,
+    runtime_trace_schema_version: String,
+    graphml_schema_version: String,
+    packaged_smoke_contract: String,
 }
 
 #[derive(Clone, Debug, serde::Deserialize, Serialize)]
@@ -184,8 +207,27 @@ struct ReleaseVerificationReport {
     tag: String,
     protocol_version: String,
     schema_compatibility_version: String,
+    compatibility: ReleaseCompatibility,
     license_expression: String,
     targets: Vec<TargetVerificationReport>,
+}
+
+fn release_compatibility() -> ReleaseCompatibility {
+    ReleaseCompatibility {
+        store_schema_version: depgraph_store::STORE_SCHEMA_VERSION,
+        minimum_migratable_store_schema_version: MINIMUM_MIGRATABLE_STORE_SCHEMA_VERSION,
+        previous_release_version: PREVIOUS_RELEASE_VERSION.to_owned(),
+        previous_release_store_schema_version: PREVIOUS_RELEASE_STORE_SCHEMA_VERSION,
+        cache_contract_version: depgraph_store::CACHE_CONTRACT_VERSION,
+        snapshot_diff_schema_version: depgraph_store::SNAPSHOT_DIFF_SCHEMA_VERSION.to_owned(),
+        incremental_plan_schema_version: depgraph_core::INCREMENTAL_PLAN_SCHEMA_VERSION.to_owned(),
+        daemon_status_schema_version: depgraph_core::DAEMON_STATUS_SCHEMA_VERSION.to_owned(),
+        policy_schema_version: depgraph_core::POLICY_SCHEMA_VERSION.to_owned(),
+        policy_result_schema_version: depgraph_core::POLICY_RESULT_SCHEMA_VERSION.to_owned(),
+        runtime_trace_schema_version: depgraph_core::RUNTIME_TRACE_SCHEMA_VERSION.to_owned(),
+        graphml_schema_version: depgraph_core::GRAPHML_SCHEMA_VERSION.to_owned(),
+        packaged_smoke_contract: MILESTONE4_PACKAGED_SMOKE_CONTRACT.to_owned(),
+    }
 }
 
 #[derive(Serialize)]
@@ -299,6 +341,7 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "Rust 1.93.1, Go 1.26.1, Node.js 24.18.0, and pnpm 10.33.0",
         "TypeScript/JavaScript symbol/type/import/re-export/type-use",
         "[the system design](docs/40_arch_design/arch-dependency-graph-cli-system-design.md)",
+        "[`v0.4.0-rc.1`](docs/releases/v0.4.0-rc.1.md)",
         "[`v0.2.0-rc.1`](docs/releases/v0.2.0-rc.1.md)",
         "[MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE)",
     ] {
@@ -312,8 +355,9 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         bail!("README release note link is not synchronized with {VERSION}");
     }
     for required in [
-        "updated: 2026-07-22",
-        "| Product / Rust / Go / Web adapter | `0.2.0-rc.1` |",
+        "updated: 2026-07-24",
+        "| Product / Rust / Go / Web adapter | `0.4.0-rc.1` |",
+        "Milestone 4のrelease candidateは`v0.4.0-rc.1`",
         "Issue #55ではこのWeb semantic compatibility unitをrelease manifest",
     ] {
         if !design.contains(required) {
@@ -339,6 +383,7 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
     }
     for link in [
         "docs/40_arch_design/arch-dependency-graph-cli-system-design.md",
+        "docs/releases/v0.4.0-rc.1.md",
         "docs/releases/v0.2.0-rc.1.md",
         "LICENSE-MIT",
         "LICENSE-APACHE",
@@ -560,6 +605,7 @@ fn package() -> Result<()> {
         release_version: VERSION.to_owned(),
         protocol_version: "1.0".to_owned(),
         schema_version: "1.0".to_owned(),
+        compatibility: release_compatibility(),
         target: target.clone(),
         license_expression: PROJECT_LICENSE_EXPRESSION.to_owned(),
         project_licenses,
@@ -1633,6 +1679,7 @@ fn verify_release_assets(directory: &Path, requested_targets: &[String]) -> Resu
             tag: format!("v{VERSION}"),
             protocol_version: "1.0".to_owned(),
             schema_compatibility_version: "1.0".to_owned(),
+            compatibility: release_compatibility(),
             license_expression: PROJECT_LICENSE_EXPRESSION.to_owned(),
             targets,
         })?,
@@ -1701,6 +1748,7 @@ fn verify_published_release_tree(
     if manifest.release_version != VERSION
         || manifest.protocol_version != "1.0"
         || manifest.schema_version != "1.0"
+        || manifest.compatibility != release_compatibility()
         || manifest.target != expected_target
         || manifest.license_expression != PROJECT_LICENSE_EXPRESSION
     {
@@ -2101,6 +2149,8 @@ fn verify_archive(archive: &Path, name: &str) -> Result<()> {
     if doctor["protocol_version"] != "1.0"
         || release["core_integrity"] != "verified"
         || release["schema_integrity"] != "verified"
+        || release["compatibility_integrity"] != "verified"
+        || release["compatibility"] != serde_json::to_value(release_compatibility())?
         || !runtime_healthy
         || !workers_healthy
     {
@@ -2142,6 +2192,7 @@ fn verify_archive(archive: &Path, name: &str) -> Result<()> {
         &verify_root.join("web-semantic-complete.db"),
         &semantic_complete_fixture,
     )?;
+    verify_packaged_milestone4(&executable, &verify_root, &semantic_complete_fixture)?;
     let framework_complete_fixture =
         Path::new("workers/web/test/fixtures/framework-complete").canonicalize()?;
     verify_packaged_web_framework_completeness(
@@ -2559,6 +2610,14 @@ fn verify_release_static_prelaunch_fails_closed(extracted: &Path) -> Result<()> 
         let mut manifest = baseline.clone();
         manifest.license_expression = "MIT".to_owned();
         cases.push(("project license expression mismatch", manifest));
+
+        let mut manifest = baseline.clone();
+        manifest.compatibility.store_schema_version += 1;
+        cases.push(("store compatibility mismatch", manifest));
+
+        let mut manifest = baseline.clone();
+        manifest.compatibility.packaged_smoke_contract = "unverified-packaged-smoke".to_owned();
+        cases.push(("packaged smoke compatibility mismatch", manifest));
 
         let mut manifest = baseline.clone();
         manifest.project_licenses.pop();
@@ -3300,6 +3359,582 @@ fn verify_packaged_scan(
         verify_packaged_web_import_type_call_graph(executable, store)?;
     }
     Ok(())
+}
+
+fn verify_packaged_milestone4(
+    executable: &Path,
+    verify_root: &Path,
+    source_fixture: &Path,
+) -> Result<()> {
+    verify_packaged_legacy_store_migration(executable, verify_root)?;
+
+    let fixture = verify_root.join("milestone4-fixture");
+    copy_directory(source_fixture, &fixture)?;
+    fs::write(
+        fixture.join(".depgraph.toml"),
+        "schema_version = 1\n\n[policy]\nschema_version = \"1.0\"\n",
+    )?;
+    let store = verify_root.join("milestone4.db");
+
+    let initial = Command::new(executable)
+        .arg("--store")
+        .arg(&store)
+        .arg("scan")
+        .arg(&fixture)
+        .arg("--json")
+        .output()
+        .context("failed to run packaged Milestone 4 baseline scan")?;
+    let initial = successful_json(initial, "packaged Milestone 4 baseline scan")?;
+    if initial["status"] != "completed" {
+        bail!("packaged Milestone 4 baseline scan was not completed: {initial}");
+    }
+
+    let baseline = Command::new(executable)
+        .arg("--store")
+        .arg(&store)
+        .args(["snapshot", "create", "milestone4-baseline", "--json"])
+        .output()?;
+    let baseline = successful_json(baseline, "packaged snapshot create baseline")?;
+    let baseline_id = baseline["data"]["snapshot"]["id"]
+        .as_str()
+        .context("packaged baseline snapshot has no ID")?
+        .to_owned();
+
+    fs::write(
+        fixture.join("src/release_candidate_added.ts"),
+        "import { choose } from \"./calls\";\nexport const releaseCandidate = () => choose();\n",
+    )?;
+    let target_scan = Command::new(executable)
+        .arg("--store")
+        .arg(&store)
+        .arg("scan")
+        .arg(&fixture)
+        .args(["--no-cache", "--json"])
+        .output()
+        .context("failed to run packaged Milestone 4 target scan")?;
+    let target_scan = successful_json(target_scan, "packaged Milestone 4 target scan")?;
+    if target_scan["status"] != "completed" {
+        bail!("packaged Milestone 4 target scan was not completed: {target_scan}");
+    }
+
+    let target = Command::new(executable)
+        .arg("--store")
+        .arg(&store)
+        .args(["snapshot", "create", "milestone4-target", "--json"])
+        .output()?;
+    let target = successful_json(target, "packaged snapshot create target")?;
+    let target_id = target["data"]["snapshot"]["id"]
+        .as_str()
+        .context("packaged target snapshot has no ID")?
+        .to_owned();
+    if target_id == baseline_id {
+        bail!("packaged target scan did not create a distinct immutable snapshot");
+    }
+
+    let listed = Command::new(executable)
+        .arg("--store")
+        .arg(&store)
+        .args(["snapshot", "list", "--json"])
+        .output()?;
+    let listed = successful_json(listed, "packaged snapshot list")?;
+    let names = listed["data"]
+        .as_array()
+        .context("packaged snapshot list has no data array")?
+        .iter()
+        .filter_map(|snapshot| snapshot["name"].as_str())
+        .collect::<BTreeSet<_>>();
+    if names != BTreeSet::from(["milestone4-baseline", "milestone4-target"]) {
+        bail!("packaged snapshot list lost an immutable named snapshot: {listed}");
+    }
+
+    let diff = Command::new(executable)
+        .arg("--store")
+        .arg(&store)
+        .args(["diff", "milestone4-baseline", "milestone4-target", "--json"])
+        .output()?;
+    let diff = successful_json(diff, "packaged snapshot diff")?;
+    if diff["schema_version"] != depgraph_store::SNAPSHOT_DIFF_SCHEMA_VERSION
+        || diff["data"]["from_snapshot_id"] != baseline_id
+        || diff["data"]["to_snapshot_id"] != target_id
+        || diff["data"]["summary"]["total_changes"]
+            .as_u64()
+            .unwrap_or_default()
+            == 0
+    {
+        bail!("packaged snapshot diff did not expose the target change: {diff}");
+    }
+
+    let impact = Command::new(executable)
+        .arg("--store")
+        .arg(&store)
+        .args(["impact", "path:src/release_candidate_added.ts", "--json"])
+        .output()?;
+    let impact = successful_json(impact, "packaged impact query")?;
+    if impact["command"] != "impact"
+        || impact["data"]["root"]["properties"]["path"] != "src/release_candidate_added.ts"
+    {
+        bail!("packaged impact query did not resolve the changed file: {impact}");
+    }
+
+    let policy = Command::new(executable)
+        .current_dir(&fixture)
+        .arg("--store")
+        .arg(&store)
+        .args([
+            "policy",
+            "milestone4-baseline",
+            "milestone4-target",
+            "--json",
+        ])
+        .output()?;
+    let policy = successful_json(policy, "packaged architecture policy JSON")?;
+    if policy["data"]["result"]["exit_code"] != 0
+        || policy["data"]["result"]["violations"]
+            .as_array()
+            .is_none_or(|violations| !violations.is_empty())
+    {
+        bail!("packaged architecture policy did not pass cleanly: {policy}");
+    }
+    let annotations = Command::new(executable)
+        .current_dir(&fixture)
+        .arg("--store")
+        .arg(&store)
+        .args([
+            "policy",
+            "milestone4-baseline",
+            "milestone4-target",
+            "--github-annotations",
+        ])
+        .output()?;
+    if !annotations.status.success()
+        || !annotations.stdout.is_empty()
+        || !annotations.stderr.is_empty()
+    {
+        bail!(
+            "packaged GitHub policy annotations were not a clean CI result: stdout={:?}, stderr={:?}",
+            String::from_utf8_lossy(&annotations.stdout),
+            String::from_utf8_lossy(&annotations.stderr)
+        );
+    }
+
+    verify_packaged_watcher(executable, &store, &fixture)?;
+    verify_packaged_runtime_and_graphml(executable, &store, verify_root)?;
+    Ok(())
+}
+
+fn verify_packaged_legacy_store_migration(executable: &Path, verify_root: &Path) -> Result<()> {
+    let store_path = verify_root.join("legacy-v0.2.0-rc.1-v5.db");
+    let backup_path = verify_root.join("legacy-v0.2.0-rc.1-v5.backup.db");
+    let connection = rusqlite::Connection::open(&store_path)?;
+    connection.execute_batch(include_str!("../fixtures/v0.2.0-rc.1-store-v5.sql"))?;
+    let original_schema: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if original_schema != PREVIOUS_RELEASE_STORE_SCHEMA_VERSION {
+        bail!("legacy release fixture is schema {original_schema}, expected schema 5");
+    }
+    drop(connection);
+    fs::copy(&store_path, &backup_path)?;
+
+    let show = Command::new(executable)
+        .arg("--store")
+        .arg(&store_path)
+        .args(["snapshot", "show", "current", "--json"])
+        .output()
+        .context("failed to open the v0.2.0-rc.1 store with the packaged CLI")?;
+    let show = successful_json(show, "packaged v0.2.0-rc.1 store migration")?;
+    if show["data"]["source_kind"] != "scan"
+        || show["data"]["scan_id"] != "legacy-v0.2.0-rc.1-scan"
+        || show["data"]["status"] != "completed"
+        || show["data"]["coverage"]["dependency_sites"] != 1
+    {
+        bail!("packaged migration lost the legacy completed snapshot: {show}");
+    }
+
+    let migrated = depgraph_store::Store::open(&store_path)?;
+    if migrated.schema_version()? != depgraph_store::STORE_SCHEMA_VERSION {
+        bail!("packaged migration did not reach the current store schema");
+    }
+    let snapshot_id = migrated
+        .current_snapshot_id()?
+        .context("packaged migration has no current completed snapshot")?;
+    let snapshot = migrated.load_completed_snapshot(&snapshot_id)?;
+    if snapshot.nodes.len() != 2
+        || snapshot.sites.len() != 1
+        || snapshot.edges.len() != 1
+        || snapshot.evidence.len() != 2
+        || !migrated.verify_snapshot_integrity(&snapshot_id)?.valid
+    {
+        bail!("packaged migration changed the legacy completed graph");
+    }
+    drop(migrated);
+
+    let named = Command::new(executable)
+        .arg("--store")
+        .arg(&store_path)
+        .args(["snapshot", "create", "migrated-v0.2.0-rc.1", "--json"])
+        .output()?;
+    let named = successful_json(named, "packaged migrated snapshot naming")?;
+    if named["data"]["snapshot"]["id"] != snapshot_id {
+        bail!("naming the migrated snapshot changed its immutable ID: {named}");
+    }
+
+    let exported = Command::new(executable)
+        .arg("--store")
+        .arg(&store_path)
+        .args(["export", "--format", "json"])
+        .output()?;
+    let exported = successful_json(exported, "packaged migrated graph export")?;
+    if exported["graph"]["nodes"]
+        .as_array()
+        .is_none_or(|nodes| nodes.len() != 2)
+        || exported["graph"]["edges"]
+            .as_array()
+            .is_none_or(|edges| edges.len() != 1)
+    {
+        bail!("packaged migrated graph export lost legacy records: {exported}");
+    }
+
+    let why = Command::new(executable)
+        .arg("--store")
+        .arg(&store_path)
+        .args([
+            "why",
+            "id:file:sha256:52c8d93f1c6a95f5ac21789712ec3a06f20bff5dcba71f82250e137928f27ead",
+            "id:module:sha256:3461db6d003d14c3bf3b4db407e83366f737008c0d0d9735dbe7f52852916aa0",
+            "--json",
+        ])
+        .output()?;
+    let why = successful_json(why, "packaged migrated dependency query")?;
+    if why["data"]["path_found"] != Value::Bool(true)
+        || why["data"]["steps"]
+            .as_array()
+            .is_none_or(|steps| steps.len() != 1)
+    {
+        bail!("packaged migration lost the legacy dependency path: {why}");
+    }
+
+    let backup = rusqlite::Connection::open(&backup_path)?;
+    let backup_schema: i64 = backup.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if backup_schema != PREVIOUS_RELEASE_STORE_SCHEMA_VERSION {
+        bail!("packaged migration modified the rollback backup");
+    }
+    Ok(())
+}
+
+fn verify_packaged_watcher(executable: &Path, store: &Path, fixture: &Path) -> Result<()> {
+    use std::{process::Stdio, thread, time::Duration};
+
+    struct ChildGuard(Option<std::process::Child>);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            if let Some(child) = &mut self.0 {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    let status_path = PathBuf::from(format!("{}.daemon-status.json", store.display()));
+    let mut child = ChildGuard(Some(
+        Command::new(executable)
+            .arg("--store")
+            .arg(store)
+            .arg("daemon")
+            .arg("start")
+            .arg(fixture)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("failed to start the packaged incremental watcher")?,
+    ));
+    for _ in 0..1_200 {
+        if status_path.exists() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    if !status_path.exists() {
+        bail!("packaged incremental watcher did not publish status");
+    }
+    fs::write(
+        fixture.join("src/watched_release_candidate.ts"),
+        "export const watchedReleaseCandidate = true;\n",
+    )?;
+
+    let mut completed = None;
+    for _ in 0..1_200 {
+        let status = Command::new(executable)
+            .arg("--store")
+            .arg(store)
+            .arg("daemon")
+            .arg("status")
+            .arg(fixture)
+            .arg("--json")
+            .output()?;
+        if status.status.success() {
+            let status: Value = serde_json::from_slice(&status.stdout)?;
+            let includes_change = status["last_completed_attempt"]["changes"]
+                .as_array()
+                .is_some_and(|changes| {
+                    changes
+                        .iter()
+                        .any(|change| change["new_path"] == "src/watched_release_candidate.ts")
+                });
+            if status["phase"] == "idle" && includes_change {
+                completed = Some(status);
+                break;
+            }
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    let completed =
+        completed.context("packaged incremental watcher did not complete the change")?;
+    if completed["last_completed_attempt"]["invalidation_plan"]["schema_version"]
+        != depgraph_core::INCREMENTAL_PLAN_SCHEMA_VERSION
+        || completed["last_completed_attempt"]["status"] != "completed"
+    {
+        bail!("packaged incremental watcher returned an invalid completed attempt: {completed}");
+    }
+
+    let stopped = Command::new(executable)
+        .arg("--store")
+        .arg(store)
+        .arg("daemon")
+        .arg("stop")
+        .arg(fixture)
+        .arg("--json")
+        .output()?;
+    let stopped = successful_json(stopped, "packaged incremental watcher stop")?;
+    if stopped["phase"] != "stopped" {
+        bail!("packaged incremental watcher did not stop cleanly: {stopped}");
+    }
+    let status = child
+        .0
+        .take()
+        .context("packaged incremental watcher child was missing")?
+        .wait()?;
+    if !status.success() {
+        bail!("packaged incremental watcher exited with {status}");
+    }
+    Ok(())
+}
+
+fn verify_packaged_runtime_and_graphml(
+    executable: &Path,
+    store: &Path,
+    verify_root: &Path,
+) -> Result<()> {
+    let exported = Command::new(executable)
+        .arg("--store")
+        .arg(store)
+        .args(["export", "--format", "json"])
+        .output()?;
+    let exported = successful_json(exported, "packaged runtime base export")?;
+    let graph = &exported["graph"];
+    let repository_identity = graph["nodes"]
+        .as_array()
+        .context("packaged runtime base has no nodes")?
+        .iter()
+        .find_map(|node| {
+            node["properties"]["repository_identity"]
+                .as_str()
+                .map(ToOwned::to_owned)
+        })
+        .context("packaged runtime base has no repository identity")?;
+    let profile = graph["profiles"]
+        .as_array()
+        .context("packaged runtime base has no profiles")?
+        .iter()
+        .find(|profile| matches!(profile["language"].as_str(), Some("web" | "typescript")))
+        .context("packaged runtime base has no Web profile")?;
+    let profile_id = profile["id"]
+        .as_str()
+        .context("packaged runtime profile has no ID")?;
+    let profile_language = profile["language"]
+        .as_str()
+        .context("packaged runtime profile has no language")?;
+    let mut nodes = graph["nodes"]
+        .as_array()
+        .context("packaged runtime base has no nodes")?
+        .iter()
+        .filter_map(|node| node["id"].as_str());
+    let source = nodes
+        .next()
+        .context("packaged runtime base has no source node")?;
+    let target = nodes
+        .find(|node| *node != source)
+        .context("packaged runtime base has no distinct target node")?;
+    let trace_path = verify_root.join("milestone4-runtime-trace.json");
+    fs::write(
+        &trace_path,
+        serde_json::to_vec_pretty(&json!({
+            "schema_version": depgraph_core::RUNTIME_TRACE_SCHEMA_VERSION,
+            "repository": {
+                "identity": repository_identity
+            },
+            "session": {
+                "id": "milestone4-packaged-session",
+                "started_at": "2026-07-24T00:00:00Z",
+                "ended_at": "2026-07-24T00:00:01Z",
+                "profile": {
+                    "language": profile_language,
+                    "parent_profile_id": profile_id
+                },
+                "environment": {
+                    "name": "release-candidate",
+                    "runtime": "nodejs-24",
+                    "region": "package-gate",
+                    "environment_keys": ["NODE_ENV"]
+                },
+                "redaction": {
+                    "environment_keys": ["API_TOKEN"],
+                    "header_names": ["authorization"],
+                    "secret_names": ["release_secret"],
+                    "redacted_value_count": 3
+                }
+            },
+            "events": [{
+                "sequence": 1,
+                "timestamp": "2026-07-24T00:00:01Z",
+                "dependency_kind": "calls",
+                "source": {"kind": "node", "node_id": source},
+                "target": {"kind": "node", "node_id": target},
+                "count": 1,
+                "redaction": {
+                    "environment_keys": [],
+                    "header_names": ["authorization"],
+                    "secret_names": [],
+                    "redacted_value_count": 1
+                }
+            }]
+        }))?,
+    )?;
+
+    let validated = Command::new(executable)
+        .arg("--store")
+        .arg(store)
+        .arg("runtime")
+        .arg("validate")
+        .arg(&trace_path)
+        .arg("--json")
+        .output()?;
+    let validated = successful_json(validated, "packaged runtime trace validation")?;
+    if validated["command"] != "runtime.validate"
+        || validated["data"]["profile_match"]["status"] != "resolved"
+        || validated["data"]["summary"]["resolved_targets"] != 1
+    {
+        bail!("packaged runtime trace validation was incomplete: {validated}");
+    }
+
+    let imported = Command::new(executable)
+        .arg("--store")
+        .arg(store)
+        .arg("runtime")
+        .arg("import")
+        .arg(&trace_path)
+        .arg("--json")
+        .output()?;
+    let imported = successful_json(imported, "packaged runtime trace import")?;
+    if imported["command"] != "runtime.import"
+        || imported["data"]["status"] != "completed"
+        || imported["data"]["deduplicated"] != Value::Bool(false)
+    {
+        bail!("packaged runtime trace import was incomplete: {imported}");
+    }
+
+    let runtime_impact = Command::new(executable)
+        .arg("--store")
+        .arg(store)
+        .arg("impact")
+        .arg(format!("id:{target}"))
+        .args([
+            "--phase",
+            "runtime",
+            "--session",
+            "milestone4-packaged-session",
+            "--json",
+        ])
+        .output()?;
+    let runtime_impact = successful_json(runtime_impact, "packaged runtime impact query")?;
+    if runtime_impact["data"]["filters"]["phases"] != json!(["runtime"])
+        || runtime_impact["data"]["filters"]["sessions"] != json!(["milestone4-packaged-session"])
+    {
+        bail!("packaged runtime impact filters were not preserved: {runtime_impact}");
+    }
+
+    let render = || {
+        Command::new(executable)
+            .arg("--store")
+            .arg(store)
+            .args([
+                "export",
+                "--format",
+                "graphml",
+                "--phase",
+                "runtime",
+                "--session",
+                "milestone4-packaged-session",
+            ])
+            .output()
+    };
+    let first = render()?;
+    let second = render()?;
+    if !first.status.success()
+        || !second.status.success()
+        || first.stdout != second.stdout
+        || !String::from_utf8_lossy(&first.stdout).contains("<graphml xmlns=")
+        || !String::from_utf8_lossy(&first.stdout).contains("<data key=\"e_phase\">runtime</data>")
+    {
+        bail!("packaged GraphML runtime export was invalid or nondeterministic");
+    }
+
+    let graphml_path = verify_root.join("milestone4.graphml");
+    let file = Command::new(executable)
+        .arg("--store")
+        .arg(store)
+        .args([
+            "export",
+            "--format",
+            "graphml",
+            "--phase",
+            "runtime",
+            "--session",
+            "milestone4-packaged-session",
+            "--output",
+        ])
+        .arg(&graphml_path)
+        .output()?;
+    if !file.status.success()
+        || !file.stdout.is_empty()
+        || fs::read(&graphml_path)? != first.stdout
+        || fs::read_dir(verify_root)?.any(|entry| {
+            entry
+                .ok()
+                .and_then(|entry| entry.file_name().to_str().map(str::to_owned))
+                .is_some_and(|name| name.starts_with(".depgraph-export-"))
+        })
+    {
+        bail!("packaged GraphML atomic file export did not match stdout");
+    }
+    if bytes_contain(&fs::read(&trace_path)?, b"release_secret_value")
+        || bytes_contain(&first.stdout, b"release_secret_value")
+        || bytes_contain(&fs::read(store)?, b"release_secret_value")
+    {
+        bail!("packaged runtime trace leaked a secret value");
+    }
+    Ok(())
+}
+
+fn successful_json(output: std::process::Output, scenario: &str) -> Result<Value> {
+    if !output.status.success() {
+        bail!(
+            "{scenario} failed with {}:\nstdout={}\nstderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    serde_json::from_slice(&output.stdout)
+        .with_context(|| format!("{scenario} returned invalid JSON"))
 }
 
 fn verify_packaged_web_import_type_call_graph(executable: &Path, store: &Path) -> Result<()> {
@@ -5837,6 +6472,7 @@ fn verify_release_metadata(extracted: &Path) -> Result<ReleaseManifest> {
     if manifest.release_version != VERSION
         || manifest.protocol_version != "1.0"
         || manifest.schema_version != "1.0"
+        || manifest.compatibility != release_compatibility()
         || manifest.target.trim().is_empty()
     {
         bail!("release manifest has an incompatible release compatibility unit");
@@ -6697,11 +7333,11 @@ mod tests {
         WEB_SEMANTIC_CAPABILITIES, WEB_SEMANTIC_RUNTIME_ARTIFACTS, WEB_SEMANTIC_RUNTIME_COMPONENTS,
         WebSemanticAttestation, WorkerBackend, archive_entries, cargo_runtime_packages,
         create_tar_archive, create_zip_archive, executable_name_for_target, extract_archive,
-        normalized_spdx_license, package_url, parse_worker_handshake, rust_backend_from_handshake,
-        verify_checksum_sidecar, verify_project_metadata, verify_release_tag_values,
-        verify_rust_analyzer_dependencies, verify_rust_backend, verify_web_semantic_attestation,
-        web_runtime_packages, web_semantic_from_handshake, without_windows_verbatim_prefix,
-        workspace_root,
+        normalized_spdx_license, package_url, parse_worker_handshake, release_compatibility,
+        rust_backend_from_handshake, verify_checksum_sidecar, verify_project_metadata,
+        verify_release_tag_values, verify_rust_analyzer_dependencies, verify_rust_backend,
+        verify_web_semantic_attestation, web_runtime_packages, web_semantic_from_handshake,
+        without_windows_verbatim_prefix, workspace_root,
     };
 
     fn release_tree() -> Result<(tempfile::TempDir, String)> {
@@ -6724,6 +7360,35 @@ mod tests {
     #[test]
     fn repository_release_metadata_is_synchronized() -> Result<()> {
         verify_project_metadata(&workspace_root())
+    }
+
+    #[test]
+    fn official_v0_2_store_fixture_migrates_without_losing_the_completed_snapshot() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("legacy.db");
+        let connection = rusqlite::Connection::open(&path)?;
+        connection.execute_batch(include_str!("../fixtures/v0.2.0-rc.1-store-v5.sql"))?;
+        let schema: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        assert_eq!(
+            schema,
+            release_compatibility().previous_release_store_schema_version
+        );
+        drop(connection);
+
+        let store = depgraph_store::Store::open(&path)?;
+        assert_eq!(
+            store.schema_version()?,
+            release_compatibility().store_schema_version
+        );
+        let snapshot_id = store.current_snapshot_id()?.unwrap();
+        let snapshot = store.load_completed_snapshot(&snapshot_id)?;
+        assert_eq!(snapshot.scan.id, "legacy-v0.2.0-rc.1-scan");
+        assert_eq!(snapshot.nodes.len(), 2);
+        assert_eq!(snapshot.sites.len(), 1);
+        assert_eq!(snapshot.edges.len(), 1);
+        assert_eq!(snapshot.evidence.len(), 2);
+        assert!(store.verify_snapshot_integrity(&snapshot_id)?.valid);
+        Ok(())
     }
 
     #[test]
@@ -6821,11 +7486,11 @@ mod tests {
     #[test]
     fn rust_worker_handshake_captures_the_exact_backend_compatibility_unit() -> Result<()> {
         let parsed = parse_worker_handshake(
-            "depgraph-rust-worker 0.2.0-rc.1 (protocol 1.0; rust-analyzer 0.0.330; rust-analyzer-revision 8954b66d43225e62c92e8bbcc8500191b5cceb1e; salsa 0.26.1)",
+            "depgraph-rust-worker 0.4.0-rc.1 (protocol 1.0; rust-analyzer 0.0.330; rust-analyzer-revision 8954b66d43225e62c92e8bbcc8500191b5cceb1e; salsa 0.26.1)",
         )
         .expect("valid Rust worker handshake");
         assert_eq!(parsed.name, "depgraph-rust-worker");
-        assert_eq!(parsed.version, "0.2.0-rc.1");
+        assert_eq!(parsed.version, "0.4.0-rc.1");
         assert_eq!(parsed.protocol, "1.0");
         let backend = rust_backend_from_handshake(&parsed)?;
         verify_rust_backend(&backend)?;
@@ -6857,7 +7522,7 @@ mod tests {
     #[test]
     fn web_worker_handshake_captures_the_release_semantic_compatibility_unit() -> Result<()> {
         let parsed = parse_worker_handshake(
-            "depgraph-web-worker 0.2.0-rc.1 (protocol 1.0; typescript 7.0.2; capabilities astro-component-render-hydration-v1,framework-semantic-completeness-v1,framework-semantic-graph-v1,next-route-component-boundary-v1,tanstack-router-typed-route-v1,tanstack-start-rpc-middleware-v1,typescript-definition-import-type-call-graph-v2)",
+            "depgraph-web-worker 0.4.0-rc.1 (protocol 1.0; typescript 7.0.2; capabilities astro-component-render-hydration-v1,framework-semantic-completeness-v1,framework-semantic-graph-v1,next-route-component-boundary-v1,tanstack-router-typed-route-v1,tanstack-start-rpc-middleware-v1,typescript-definition-import-type-call-graph-v2)",
         )
         .expect("valid Web worker handshake");
         let semantic = web_semantic_from_handshake(&parsed)?;

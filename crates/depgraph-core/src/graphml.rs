@@ -7,7 +7,7 @@ use serde_json::{Map, Value};
 
 use crate::query::render_condition;
 
-const GRAPHML_SCHEMA_VERSION: &str = "1.0";
+pub const GRAPHML_SCHEMA_VERSION: &str = "1.0";
 const XML_TEXT_BUFFER_BYTES: usize = 8 * 1024;
 
 struct Key {

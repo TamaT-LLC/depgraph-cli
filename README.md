@@ -6,7 +6,9 @@ Every recognized dependency site is retained as `resolved`, `candidates`, `exter
 
 The MVP implements the architecture described in [the system design](docs/40_arch_design/arch-dependency-graph-cli-system-design.md): a Rust core, isolated Rust/Go/Web workers using protocol `1.0` NDJSON, an immutable SQLite evidence store, graph queries, and deterministic JSON/DOT/Mermaid/GraphML export.
 
-The current Milestone 2 prerelease is [`v0.2.0-rc.1`](docs/releases/v0.2.0-rc.1.md).
+The current Milestone 4 prerelease is [`v0.4.0-rc.1`](docs/releases/v0.4.0-rc.1.md).
+The previous Milestone 2 semantic-graph candidate remains documented as
+[`v0.2.0-rc.1`](docs/releases/v0.2.0-rc.1.md).
 
 ## Supported MVP graph
 
@@ -35,11 +37,11 @@ unresolved, semantic-issue, and compiler diagnostic counts, and
 `project_code_executed=false`. Candidate and external Web sites are allowed.
 Detected Next.js, Astro, TanStack Router, and TanStack Start profiles must also
 complete their versioned framework semantic capability ledger. Architecture
-policy evaluation and collector-independent runtime trace validation are
-available; persistent runtime evidence union remains a later milestone. The
-supervised build protocol, atomic evidence union foundation, validated
+policy evaluation and GitHub annotations, collector-independent runtime trace
+validation and persistent runtime evidence union, immutable snapshots,
+diff/impact, deterministic GraphML, the supervised build protocol, validated
 syntax/semantic/build cache storage, transactional incremental invalidation
-planner, and cross-platform watcher daemon are available.
+planning, and the cross-platform watcher daemon are available.
 
 ## Build
 

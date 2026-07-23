@@ -24,7 +24,8 @@ use std::{
 use anyhow::Result;
 use depgraph_store::{
     AdapterLogRecord, CACHE_CONTRACT_VERSION, CacheEntryCounts, CacheEventRecord, CoverageRecord,
-    DiagnosticRecord, FileCoverageRecord, ProfileMatrixRecord, ProfileRecord, Store,
+    DiagnosticRecord, FileCoverageRecord, ProfileMatrixRecord, ProfileRecord,
+    SNAPSHOT_DIFF_SCHEMA_VERSION, STORE_SCHEMA_VERSION, Store,
 };
 use serde::{Deserialize, Serialize};
 
@@ -51,6 +52,7 @@ pub use depgraph_store::GraphSnapshot;
 pub use export::{
     ExportFormat, export, export_filtered, export_graphml_filtered_to_writer, filter_snapshot,
 };
+pub use graphml::GRAPHML_SCHEMA_VERSION;
 pub use impact::{
     ChangedNodeMapping, GitChange, GitChangedSet, ImpactDiagnostic, ImpactFilters, ImpactNode,
     ImpactResult, impact, map_changed_set, read_git_changed_set,
@@ -148,11 +150,31 @@ pub struct ReleaseHealth {
     pub version: String,
     pub target: String,
     pub schema_version: String,
+    pub compatibility: ReleaseCompatibilityHealth,
+    pub compatibility_integrity: String,
     pub license_expression: String,
     pub core_integrity: String,
     pub schema_integrity: String,
     pub runtime_integrity: BTreeMap<String, String>,
     pub runtime_requirements: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReleaseCompatibilityHealth {
+    pub store_schema_version: i64,
+    pub minimum_migratable_store_schema_version: i64,
+    pub previous_release_version: String,
+    pub previous_release_store_schema_version: i64,
+    pub cache_contract_version: u32,
+    pub snapshot_diff_schema_version: String,
+    pub incremental_plan_schema_version: String,
+    pub daemon_status_schema_version: String,
+    pub policy_schema_version: String,
+    pub policy_result_schema_version: String,
+    pub runtime_trace_schema_version: String,
+    pub graphml_schema_version: String,
+    pub packaged_smoke_contract: String,
 }
 
 #[derive(Debug)]
@@ -328,6 +350,7 @@ struct ReleaseManifest {
     release_version: String,
     protocol_version: String,
     schema_version: String,
+    compatibility: ReleaseCompatibilityHealth,
     target: String,
     license_expression: String,
     project_licenses: Vec<ReleaseArtifact>,
@@ -407,6 +430,9 @@ fn worker_integrity(
             manifest.release_version,
             env!("CARGO_PKG_VERSION")
         );
+    }
+    if let Err(error) = verify_release_compatibility(&manifest.compatibility) {
+        return format!("error: {error:#}");
     }
     let Some(entry) = manifest
         .workers
@@ -558,16 +584,45 @@ fn release_health() -> Option<ReleaseHealth> {
         };
         runtime_integrity.insert(key, integrity);
     }
+    let compatibility_integrity = verify_release_compatibility(&manifest.compatibility)
+        .map(|()| "verified".to_owned())
+        .unwrap_or_else(|error| format!("error: {error:#}"));
     Some(ReleaseHealth {
         version: manifest.release_version,
         target: manifest.target,
         schema_version: manifest.schema_version,
+        compatibility: manifest.compatibility,
+        compatibility_integrity,
         license_expression: manifest.license_expression,
         core_integrity: artifact_integrity(root, &manifest.core, Some(&executable)),
         schema_integrity: artifact_integrity(root, &manifest.schema, None),
         runtime_integrity,
         runtime_requirements: manifest.runtime_requirements,
     })
+}
+
+fn verify_release_compatibility(compatibility: &ReleaseCompatibilityHealth) -> Result<()> {
+    let expected = ReleaseCompatibilityHealth {
+        store_schema_version: STORE_SCHEMA_VERSION,
+        minimum_migratable_store_schema_version: 1,
+        previous_release_version: "0.2.0-rc.1".to_owned(),
+        previous_release_store_schema_version: 5,
+        cache_contract_version: CACHE_CONTRACT_VERSION,
+        snapshot_diff_schema_version: SNAPSHOT_DIFF_SCHEMA_VERSION.to_owned(),
+        incremental_plan_schema_version: INCREMENTAL_PLAN_SCHEMA_VERSION.to_owned(),
+        daemon_status_schema_version: DAEMON_STATUS_SCHEMA_VERSION.to_owned(),
+        policy_schema_version: POLICY_SCHEMA_VERSION.to_owned(),
+        policy_result_schema_version: POLICY_RESULT_SCHEMA_VERSION.to_owned(),
+        runtime_trace_schema_version: RUNTIME_TRACE_SCHEMA_VERSION.to_owned(),
+        graphml_schema_version: GRAPHML_SCHEMA_VERSION.to_owned(),
+        packaged_smoke_contract: "milestone4-packaged-smoke-v1".to_owned(),
+    };
+    if compatibility != &expected {
+        anyhow::bail!(
+            "release compatibility metadata does not match the core contract: expected {expected:?}, found {compatibility:?}"
+        );
+    }
+    Ok(())
 }
 
 fn artifact_integrity(root: &Path, artifact: &ReleaseArtifact, expected: Option<&Path>) -> String {
@@ -619,8 +674,8 @@ mod tests {
     use std::{ffi::OsString, path::PathBuf};
 
     use super::{
-        AdapterKind, DoctorWorkerLocation, parse_worker_handshake, preflight_doctor_workers,
-        suppressed_worker_health, worker,
+        AdapterKind, DoctorWorkerLocation, ReleaseCompatibilityHealth, parse_worker_handshake,
+        preflight_doctor_workers, suppressed_worker_health, verify_release_compatibility, worker,
     };
 
     fn test_worker_spec(adapter: AdapterKind) -> worker::WorkerSpec {
@@ -648,6 +703,35 @@ mod tests {
             Some(("depgraph-go-worker", "0.1.0", "1.00"))
         );
         assert_eq!(parse_worker_handshake("depgraph-go-worker 0.1.0"), None);
+    }
+
+    #[test]
+    fn release_compatibility_contract_rejects_drift() {
+        let compatible = ReleaseCompatibilityHealth {
+            store_schema_version: depgraph_store::STORE_SCHEMA_VERSION,
+            minimum_migratable_store_schema_version: 1,
+            previous_release_version: "0.2.0-rc.1".to_owned(),
+            previous_release_store_schema_version: 5,
+            cache_contract_version: depgraph_store::CACHE_CONTRACT_VERSION,
+            snapshot_diff_schema_version: depgraph_store::SNAPSHOT_DIFF_SCHEMA_VERSION.to_owned(),
+            incremental_plan_schema_version: super::INCREMENTAL_PLAN_SCHEMA_VERSION.to_owned(),
+            daemon_status_schema_version: super::DAEMON_STATUS_SCHEMA_VERSION.to_owned(),
+            policy_schema_version: super::POLICY_SCHEMA_VERSION.to_owned(),
+            policy_result_schema_version: super::POLICY_RESULT_SCHEMA_VERSION.to_owned(),
+            runtime_trace_schema_version: super::RUNTIME_TRACE_SCHEMA_VERSION.to_owned(),
+            graphml_schema_version: super::GRAPHML_SCHEMA_VERSION.to_owned(),
+            packaged_smoke_contract: "milestone4-packaged-smoke-v1".to_owned(),
+        };
+        verify_release_compatibility(&compatible).unwrap();
+
+        let mut drifted = compatible;
+        drifted.store_schema_version += 1;
+        assert!(
+            verify_release_compatibility(&drifted)
+                .unwrap_err()
+                .to_string()
+                .contains("does not match")
+        );
     }
 
     #[test]
