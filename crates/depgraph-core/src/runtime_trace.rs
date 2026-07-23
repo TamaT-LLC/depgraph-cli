@@ -417,8 +417,10 @@ pub fn runtime_session_delta(
         };
         grouped.entry(key).or_default().observe(event);
     }
+    let mut has_evidence_conflict = false;
     for ((source, dependency_kind), statuses) in resolution_sets {
         if statuses.len() > 1 && statuses.contains("resolved") {
+            has_evidence_conflict = true;
             diagnostics.push(runtime_diagnostic(
                 &session_id,
                 "RUNTIME_EVIDENCE_CONFLICT",
@@ -537,6 +539,7 @@ pub fn runtime_session_delta(
         diagnostic.ordinal = ordinal as i64;
     }
     let partial = validated.profile_match.status != RuntimeTraceMatchStatus::Resolved
+        || has_evidence_conflict
         || validated.events.iter().any(|event| {
             event.source.status != RuntimeTraceMatchStatus::Resolved
                 || event.target.status == RuntimeTraceMatchStatus::Unresolved
@@ -1560,6 +1563,36 @@ mod tests {
             .filter_map(|evidence| evidence.properties["redacted_value_count"].as_u64())
             .sum::<u64>();
         assert_eq!(edge_redactions, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn conflicting_resolution_statuses_make_the_session_partial() -> Result<()> {
+        let snapshot = snapshot();
+        let mut value: Value = serde_json::from_str(GOLDEN)?;
+        let shared_source = value["events"][0]["source"].clone();
+        let events = value["events"].as_array_mut().context("events")?;
+        events.truncate(2);
+        events[1]["source"] = shared_source;
+        events[1]["dependency_kind"] = json!("calls");
+        let validated =
+            validate_runtime_trace(Cursor::new(serde_json::to_vec(&value)?), &snapshot)?;
+        let delta = runtime_session_delta(validated, "snapshot:base", &snapshot)?;
+        assert!(
+            delta
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "RUNTIME_EVIDENCE_CONFLICT")
+        );
+        assert_eq!(delta.session.status, "partial");
+        assert!(delta.session.coverage.completeness.is_empty());
+        assert!(
+            delta
+                .session
+                .coverage
+                .reasons
+                .contains(&"runtime_evidence_conflict".to_owned())
+        );
         Ok(())
     }
 
