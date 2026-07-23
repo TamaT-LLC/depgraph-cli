@@ -99,6 +99,7 @@ impl WatchIgnoreRules {
                 store_paths.insert(format!("{relative}.daemon-status.json"));
                 store_paths.insert(format!("{relative}.daemon-stop"));
                 store_paths.insert(format!("{relative}.daemon-lock"));
+                store_paths.insert(format!("{relative}.writer-lock"));
                 store_prefixes.push(format!("{relative}.daemon-status.json.tmp-"));
             }
         }
@@ -699,7 +700,7 @@ pub fn start_repository_daemon(
         .canonicalize()
         .with_context(|| format!("failed to canonicalize daemon root {}", root.display()))?;
     let store_path = absolute_normalized_path(store_path)?;
-    let lock = acquire_store_writer_lock(&store_path)?;
+    let locks = acquire_daemon_locks(&store_path)?;
     let mut store = open_store(&store_path)?;
     let recovered = store.recover_interrupted_attempts(&root)?;
     let runner = Arc::new(RepositoryScanRunner::new(
@@ -714,7 +715,7 @@ pub fn start_repository_daemon(
         Some(store_path),
         recovered,
         runner,
-        Some(lock),
+        Some(locks),
     )
 }
 
@@ -726,11 +727,11 @@ pub fn start_daemon_with_runner(
     runner: Arc<dyn DaemonScanRunner>,
 ) -> Result<DaemonHandle> {
     let store_path = store_path.map(absolute_normalized_path).transpose()?;
-    let lock = store_path
+    let locks = store_path
         .as_deref()
-        .map(acquire_store_writer_lock)
+        .map(acquire_daemon_locks)
         .transpose()?;
-    start_daemon_with_runner_and_lock(root, config, store_path, recovered_attempts, runner, lock)
+    start_daemon_with_runner_and_lock(root, config, store_path, recovered_attempts, runner, locks)
 }
 
 fn start_daemon_with_runner_and_lock(
@@ -739,7 +740,7 @@ fn start_daemon_with_runner_and_lock(
     store_path: Option<PathBuf>,
     recovered_attempts: InterruptedAttemptRecovery,
     runner: Arc<dyn DaemonScanRunner>,
-    lock: Option<std::fs::File>,
+    locks: Option<DaemonLocks>,
 ) -> Result<DaemonHandle> {
     let requested_root = root.clone();
     let root = root
@@ -776,7 +777,7 @@ fn start_daemon_with_runner_and_lock(
         status,
         status_sender,
         stop_receiver,
-        lock,
+        locks,
     ));
     Ok(DaemonHandle {
         stop_sender: Some(stop_sender),
@@ -789,13 +790,46 @@ fn start_daemon_with_runner_and_lock(
 ///
 /// The returned file must remain alive for the full duration of the writer.
 pub fn acquire_store_writer_lock(store_path: &Path) -> Result<std::fs::File> {
-    let lock_path = with_path_suffix(store_path, ".daemon-lock");
+    acquire_store_sidecar_lock(
+        store_path,
+        ".writer-lock",
+        "store writer",
+        "another store writer is already running",
+    )
+}
+
+struct DaemonLocks {
+    _writer: std::fs::File,
+    _lifecycle: std::fs::File,
+}
+
+fn acquire_daemon_locks(store_path: &Path) -> Result<DaemonLocks> {
+    let writer = acquire_store_writer_lock(store_path)?;
+    let lifecycle = acquire_store_sidecar_lock(
+        store_path,
+        ".daemon-lock",
+        "daemon lifecycle",
+        "a daemon is already running",
+    )?;
+    Ok(DaemonLocks {
+        _writer: writer,
+        _lifecycle: lifecycle,
+    })
+}
+
+fn acquire_store_sidecar_lock(
+    store_path: &Path,
+    suffix: &str,
+    description: &str,
+    contention: &str,
+) -> Result<std::fs::File> {
+    let lock_path = with_path_suffix(store_path, suffix);
     let parent = lock_path
         .parent()
-        .context("daemon lock path has no parent")?;
+        .with_context(|| format!("{description} lock path has no parent"))?;
     std::fs::create_dir_all(parent).with_context(|| {
         format!(
-            "failed to create daemon lock directory {}",
+            "failed to create {description} lock directory {}",
             parent.display()
         )
     })?;
@@ -803,7 +837,7 @@ pub fn acquire_store_writer_lock(store_path: &Path) -> Result<std::fs::File> {
         && !metadata.file_type().is_file()
     {
         bail!(
-            "daemon lock path {} is not a regular file",
+            "{description} lock path {} is not a regular file",
             lock_path.display()
         );
     }
@@ -813,13 +847,9 @@ pub fn acquire_store_writer_lock(store_path: &Path) -> Result<std::fs::File> {
         .create(true)
         .truncate(false)
         .open(&lock_path)
-        .with_context(|| format!("failed to open daemon lock {}", lock_path.display()))?;
-    file.try_lock().with_context(|| {
-        format!(
-            "another store writer is already running for store {}",
-            store_path.display()
-        )
-    })?;
+        .with_context(|| format!("failed to open {description} lock {}", lock_path.display()))?;
+    file.try_lock()
+        .with_context(|| format!("{contention} for store {}", store_path.display()))?;
     Ok(file)
 }
 
@@ -862,7 +892,7 @@ async fn run_daemon_loop(
     mut status: DaemonStatus,
     status_sender: watch::Sender<DaemonStatus>,
     mut stop_receiver: oneshot::Receiver<()>,
-    _lock: Option<std::fs::File>,
+    _locks: Option<DaemonLocks>,
 ) -> DaemonStatus {
     let mut coalescer = EventCoalescer::default();
     let mut deadline = None::<Instant>;

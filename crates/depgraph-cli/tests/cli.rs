@@ -1563,6 +1563,7 @@ fn daemon_stop_rejects_stale_status_without_waiting_for_the_timeout() {
     assert!(status_path.exists(), "daemon did not publish its status");
     child.kill().unwrap();
     child.wait().unwrap();
+    let _foreground_writer = depgraph_core::acquire_store_writer_lock(&store_path).unwrap();
 
     Command::cargo_bin("depgraph")
         .unwrap()
