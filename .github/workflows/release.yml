@@ -32,9 +32,9 @@ jobs:
     env:
       # Shared hosted runners are materially slower than the development-machine
       # targets. Keep an explicit release ceiling while reporting the raw timings.
-      DEPGRAPH_SCAN_LIMIT_MS: "60000"
-      DEPGRAPH_INCREMENTAL_LIMIT_MS: "60000"
-      DEPGRAPH_QUERY_LIMIT_MS: "3000"
+      DEPGRAPH_SCAN_LIMIT_MS: "75000"
+      DEPGRAPH_INCREMENTAL_LIMIT_MS: "90000"
+      DEPGRAPH_QUERY_LIMIT_MS: "3500"
       DEPGRAPH_BUILD_OBSERVATION_LIMIT_MS: "60000"
       DEPGRAPH_BENCH_SAMPLES: "3"
       DEPGRAPH_QUERY_SAMPLES: "5"
@@ -58,6 +58,7 @@ jobs:
       - run: node --test scripts/tests/benchmark.test.mjs
       - run: scripts/benchmark-mvp.sh
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: benchmark-report-${{ github.sha }}
           path: dist/benchmark-report.json

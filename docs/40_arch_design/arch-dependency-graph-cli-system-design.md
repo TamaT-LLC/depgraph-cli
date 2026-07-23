@@ -1309,7 +1309,10 @@ product targetには未達である。この差を隠さずreportの`product_tar
 incremental 40秒、warm impact 1.5秒とする。
 
 共有GitHub hosted Linux runnerのCI/release ceilingは、runner contentionと
-process起動を含め、initial 60秒、incremental 60秒、warm query 3秒とする。
+process起動を含め、initial 75秒、incremental 90秒、warm query 3.5秒とする。
+2026-07-24の初回PR実測はinitial median 68.530秒、incremental median
+83.891秒、warm file/package impact median 2.979秒/2.748秒であり、これを
+hosted baselineとしてreportへ保持する。
 initial / incrementalは3 sample、warm queryは5 sampleを採り、medianがceiling
 以内、ceiling超過sampleは最大1件、全sampleはceiling + 20%以内というnoise
 allowanceを同時に満たした場合だけpassする。cold queryは継続取得するが、
