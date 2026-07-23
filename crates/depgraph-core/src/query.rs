@@ -15,6 +15,7 @@ pub enum CycleLevel {
     Package,
     File,
     Symbol,
+    Type,
     Route,
 }
 
@@ -24,6 +25,7 @@ impl CycleLevel {
             Self::Package => "package_instance",
             Self::File => "file",
             Self::Symbol => "symbol",
+            Self::Type => "type",
             Self::Route => "route",
         }
     }

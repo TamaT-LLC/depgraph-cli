@@ -407,6 +407,26 @@ async fn run(cli: Cli) -> Result<u8> {
                         diagnostic.severity, diagnostic.code, diagnostic.message
                     );
                 }
+                if let Some(policy) = &outcome.policy {
+                    println!(
+                        "policy: {} errors, {} warnings, {} suppressed",
+                        policy.summary.errors, policy.summary.warnings, policy.summary.suppressed
+                    );
+                    for violation in &policy.violations {
+                        let state = violation
+                            .suppression
+                            .as_ref()
+                            .map_or("active", |_| "suppressed");
+                        println!(
+                            "policy {} [{}] {}: {} -> {}",
+                            violation.rule_id,
+                            state,
+                            violation.message,
+                            violation.source.locator,
+                            violation.target.locator
+                        );
+                    }
+                }
                 for event in &outcome.cache_events {
                     println!(
                         "cache {}: {} ({})",
@@ -1542,6 +1562,12 @@ mod tests {
     fn classifies_cli_errors_without_hiding_internal_failures_as_usage() {
         assert_eq!(
             error_exit_code(&anyhow::anyhow!("selector is ambiguous")),
+            2
+        );
+        assert_eq!(
+            error_exit_code(&anyhow::anyhow!(
+                "policy selector rule source must resolve to exactly one node"
+            )),
             2
         );
         assert_eq!(

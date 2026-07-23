@@ -8,6 +8,7 @@ pub mod export;
 pub mod impact;
 pub mod incremental;
 pub mod policy;
+mod policy_engine;
 pub mod query;
 pub mod rust_build_observer;
 pub mod scan;
@@ -63,6 +64,7 @@ pub use policy::{
     PolicySelectorField, PolicySelectorKind, PolicySelectorPattern, PolicySelectorScope,
     PolicySeverity, PolicySuppression, PolicySuppressionScope, PolicyThreshold, PolicyViolation,
 };
+pub use policy_engine::evaluate_policy;
 pub use query::{
     CycleLevel, CycleResult, TraversalResult, UnresolvedResult, WhyResult, cycles,
     render_condition, resolve_selector, traverse, unresolved, why,

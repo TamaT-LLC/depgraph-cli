@@ -15,6 +15,8 @@ use crate::{
     cache::{ScanCachePlan, ScanCachePreparation, prepare_scan_cache},
     cancellation::CancellationToken,
     config::Config,
+    policy::PolicyResult,
+    policy_engine::evaluate_policy,
     worker::{
         AdapterKind, WorkerFailureKind, WorkerOutput, WorkerSpec, detect_adapters,
         execute_worker_with_cancellation, is_security_error, locate_worker,
@@ -30,6 +32,8 @@ pub struct ScanOutcome {
     pub coverage: CoverageRecord,
     pub diagnostics: Vec<DiagnosticRecord>,
     pub cache_events: Vec<CacheEventRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<PolicyResult>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -452,9 +456,10 @@ fn complete_scan(
         );
     }
 
-    let coverage = store.load_snapshot(scan_id)?.coverage;
-    let rust_hir_backend_failure = has_rust_hir_backend_failure(&coverage);
-    let strict_failure = strict && violates_strict_policy(&coverage, config);
+    let snapshot = store.load_snapshot(scan_id)?;
+    let coverage = &snapshot.coverage;
+    let rust_hir_backend_failure = has_rust_hir_backend_failure(coverage);
+    let strict_failure = strict && violates_strict_policy(coverage, config);
     if strict_failure {
         let message = format!(
             "strict policy failed: unresolved={} (max {}), skipped={} (max {}), unsupported={} (max {}), rust_hir_backend_failure={rust_hir_backend_failure}",
@@ -483,11 +488,63 @@ fn complete_scan(
         );
     }
 
+    let policy = if config.policy.rules.is_empty() {
+        None
+    } else {
+        let snapshot_id = store.prospective_scan_snapshot_id(scan_id)?;
+        match evaluate_policy(snapshot_id, &snapshot, &config.policy) {
+            Ok(result) => Some(result),
+            Err(error) => {
+                let message = format!("architecture policy evaluation failed: {error:#}");
+                add_core_diagnostic(
+                    store,
+                    scan_id,
+                    "error",
+                    "architecture-policy-config",
+                    &message,
+                    "architecture-policy-config",
+                )?;
+                let Some(completion) = cancellation
+                    .run_if_active(|| store.finish_scan(scan_id, "failed", Some(&message), false))
+                else {
+                    return cancel_scan(store, scan_id);
+                };
+                completion?;
+                return Err(error.context("architecture policy evaluation failed"));
+            }
+        }
+    };
+    if let Some(result) = policy.as_ref().filter(|result| result.exit_code == 1) {
+        let message = format!(
+            "architecture policy failed: errors={}, warnings={}, suppressed={}",
+            result.summary.errors, result.summary.warnings, result.summary.suppressed
+        );
+        add_core_diagnostic(
+            store,
+            scan_id,
+            "error",
+            "architecture-policy",
+            &message,
+            "architecture-policy",
+        )?;
+        let mut outcome = finish_non_promoted_scan(
+            store,
+            scan_id,
+            "policy_failed",
+            Some(&message),
+            1,
+            cancellation,
+        )?;
+        outcome.policy = policy;
+        return Ok(outcome);
+    }
+
     // Load everything required for the successful outcome before promotion. Once
     // finish_scan promotes the graph, optional cache maintenance must not turn an
     // already-visible completed snapshot into a retryable daemon failure.
     let mut outcome = snapshot_outcome(store, scan_id, 0)?;
     outcome.status = "completed".to_owned();
+    outcome.policy = policy;
 
     let Some(promotion) =
         cancellation.run_if_active(|| store.finish_scan(scan_id, "completed", None, true))
@@ -762,6 +819,7 @@ fn snapshot_outcome(store: &Store, scan_id: &str, exit_code: u8) -> Result<ScanO
         coverage: snapshot.coverage,
         diagnostics: snapshot.diagnostics,
         cache_events: store.cache_events_for_scan(scan_id)?,
+        policy: None,
     })
 }
 
@@ -781,6 +839,143 @@ mod tests {
             expected_version: None,
             release_attested: false,
         }
+    }
+
+    fn ingest_policy_fixture(store: &mut Store, scan_id: &str) -> Result<()> {
+        let common = |event: &str, seq: u64| {
+            json!({
+                "event":event,
+                "protocol_version":"1.0",
+                "scan_id":scan_id,
+                "adapter":"web",
+                "adapter_version":"0.1.0",
+                "seq":seq
+            })
+        };
+        let mut profile = common("profile_declared", 1);
+        profile["profile"] = json!({
+            "id":"profile:production",
+            "language":"web",
+            "features":[],
+            "environment":{"mode":"production"},
+            "properties":{}
+        });
+        let mut source = common("node_upsert", 2);
+        source["node"] = json!({
+            "id":"file:ui",
+            "kind":"file",
+            "locator":"file://src/ui/page.ts",
+            "display_name":"page.ts",
+            "properties":{"path":"src/ui/page.ts","package_locator":"pkg:web"}
+        });
+        let mut target = common("node_upsert", 3);
+        target["node"] = json!({
+            "id":"file:data",
+            "kind":"file",
+            "locator":"file://src/data/internal.ts",
+            "display_name":"internal.ts",
+            "properties":{"path":"src/data/internal.ts","package_locator":"pkg:web"}
+        });
+        let evidence = json!([{
+            "kind":"source",
+            "extractor":"fixture",
+            "extractor_version":"1",
+            "path":"src/ui/page.ts",
+            "start_line":1,
+            "start_column":1,
+            "end_line":1,
+            "end_column":20,
+            "properties":{}
+        }]);
+        let mut site = common("dependency_site", 4);
+        site["site"] = json!({
+            "id":"site:ui-data",
+            "source":"file:ui",
+            "kind":"import",
+            "specifier":"../data/internal",
+            "profile_id":"profile:production",
+            "resolution_status":"resolved",
+            "precision":"exact",
+            "condition":{"op":"eq","key":"mode","value":"production"},
+            "target_ids":["file:data"],
+            "evidence":evidence
+        });
+        let mut edge = common("edge_upsert", 5);
+        edge["edge"] = json!({
+            "id":"edge:ui-data",
+            "site_id":"site:ui-data",
+            "source":"file:ui",
+            "target":"file:data",
+            "kind":"imports",
+            "phase":"source",
+            "environment":"server",
+            "profile_id":"profile:production",
+            "resolution_status":"resolved",
+            "precision":"exact",
+            "condition":{"op":"eq","key":"mode","value":"production"},
+            "generated":false,
+            "evidence":evidence
+        });
+        let coverage = json!({
+            "profiles":1,
+            "files_discovered":0,
+            "files_analyzed":0,
+            "files_skipped":0,
+            "dependency_sites":1,
+            "resolved":1,
+            "candidates":0,
+            "external":0,
+            "unresolved":0,
+            "unsupported_syntax":0,
+            "project_code_executed":false,
+            "completeness":["syntax-complete"],
+            "reasons":[]
+        });
+        let mut profile_completed = common("profile_completed", 6);
+        profile_completed["profile_id"] = json!("profile:production");
+        profile_completed["coverage"] = coverage.clone();
+        let mut completed = common("scan_completed", 7);
+        completed["coverage"] = coverage;
+        store.ingest_events(&[
+            &profile,
+            &source,
+            &target,
+            &site,
+            &edge,
+            &profile_completed,
+            &completed,
+        ])
+    }
+
+    fn policy_fixture_config() -> Result<Config> {
+        let policy = serde_json::from_value(json!({
+            "schema_version":"1.0",
+            "rules":[{
+                "id":"no-ui-data",
+                "kind":"forbidden_dependency",
+                "severity":"error",
+                "source":{
+                    "kind":"file","field":"path","match":"exact",
+                    "value":"src/ui/page.ts","cardinality":"one",
+                    "exclude":[],"scope":{"paths":[],"packages":[]}
+                },
+                "target":{
+                    "kind":"file","field":"path","match":"exact",
+                    "value":"src/data/internal.ts","cardinality":"one",
+                    "exclude":[],"scope":{"paths":[],"packages":[]}
+                },
+                "profiles":{"include":[{"match":"exact","value":"profile:production"}],"exclude":[]},
+                "condition":{"op":"eq","key":"mode","value":"production"},
+                "precisions":["exact"],
+                "resolution_statuses":["resolved"],
+                "evidence":{"kinds":["source"],"minimum_spans":1,"primary_only":true}
+            }],
+            "suppressions":[]
+        }))?;
+        Ok(Config {
+            policy,
+            ..Config::default()
+        })
     }
 
     #[test]
@@ -815,6 +1010,101 @@ mod tests {
         assert_eq!(outcome.exit_code, 0);
         assert_eq!(store.scan(scan_id)?.unwrap().status, "completed");
         assert!(store.snapshot_id_for_source("scan", scan_id)?.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn architecture_policy_failure_returns_result_and_does_not_promote() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let mut store = Store::open_in_memory()?;
+        let scan_id = "architecture-policy-failure";
+        store.start_scan(scan_id, root.path(), false)?;
+        ingest_policy_fixture(&mut store, scan_id)?;
+
+        let outcome = complete_scan(
+            &mut store,
+            scan_id,
+            false,
+            &policy_fixture_config()?,
+            None,
+            &CancellationToken::new(),
+        )?;
+
+        assert_eq!(
+            outcome.status, "policy_failed",
+            "diagnostics: {:?}",
+            outcome.diagnostics
+        );
+        assert_eq!(outcome.exit_code, 1);
+        let policy = outcome.policy.context("policy result")?;
+        assert!(policy.snapshot_id.starts_with("snapshot:sha256:"));
+        assert_eq!(policy.summary.errors, 1);
+        assert_eq!(policy.violations[0].rule_id, "no-ui-data");
+        assert_eq!(
+            policy.violations[0].dependency_path[0].edge_id,
+            "edge:ui-data"
+        );
+        assert_eq!(policy.violations[0].evidence[0].path, "src/ui/page.ts");
+        assert!(store.snapshot_id_for_source("scan", scan_id)?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn architecture_policy_warning_is_reported_and_promoted() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let mut store = Store::open_in_memory()?;
+        let scan_id = "architecture-policy-warning";
+        store.start_scan(scan_id, root.path(), false)?;
+        ingest_policy_fixture(&mut store, scan_id)?;
+        let mut config = policy_fixture_config()?;
+        config.policy.rules[0].severity = crate::policy::PolicySeverity::Warning;
+
+        let outcome = complete_scan(
+            &mut store,
+            scan_id,
+            false,
+            &config,
+            None,
+            &CancellationToken::new(),
+        )?;
+
+        assert_eq!(outcome.status, "completed");
+        assert_eq!(outcome.exit_code, 0);
+        let policy = outcome.policy.context("policy result")?;
+        assert_eq!(policy.summary.warnings, 1);
+        assert_eq!(
+            store.snapshot_id_for_source("scan", scan_id)?.as_deref(),
+            Some(policy.snapshot_id.as_str())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ambiguous_policy_selector_is_a_terminal_non_promoted_attempt() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let mut store = Store::open_in_memory()?;
+        let scan_id = "architecture-policy-selector-error";
+        store.start_scan(scan_id, root.path(), false)?;
+        ingest_policy_fixture(&mut store, scan_id)?;
+        let mut config = policy_fixture_config()?;
+        config.policy.rules[0].source.value = "src/missing.ts".to_owned();
+
+        let error = format!(
+            "{:#}",
+            complete_scan(
+                &mut store,
+                scan_id,
+                false,
+                &config,
+                None,
+                &CancellationToken::new(),
+            )
+            .unwrap_err()
+        );
+
+        assert!(error.contains("policy selector"));
+        assert_eq!(store.scan(scan_id)?.context("scan")?.status, "failed");
+        assert!(store.snapshot_id_for_source("scan", scan_id)?.is_none());
         Ok(())
     }
 

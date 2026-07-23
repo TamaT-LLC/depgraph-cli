@@ -164,6 +164,17 @@ The machine-readable result contract uses stable violation IDs, dependency
 paths, repository-relative evidence spans, applied suppressions, and exit code
 `1` whenever an unsuppressed error remains.
 
+During `depgraph scan`, policy selectors are resolved against the validated
+staging graph and profile, condition, precision, resolution-status, and
+evidence filters are applied before evaluation. `layer_boundary` and
+`forbidden_dependency` evaluate admitted direct edges; `cycle` reuses the
+package/file/symbol/route cycle query per profile; and `dependency_depth`,
+`fan_in`, and `fan_out` evaluate deterministic threshold witnesses. The scan
+JSON includes the complete `policy` result. An active error finishes the
+attempt as `policy_failed` with exit code `1` and does not replace the current
+completed snapshot; warnings and suppressed violations remain visible while
+allowing promotion.
+
 The matching JSON Schema is
 [`schemas/depgraph-policy-v1.schema.json`](schemas/depgraph-policy-v1.schema.json).
 
