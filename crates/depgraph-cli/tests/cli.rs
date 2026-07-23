@@ -1041,7 +1041,7 @@ fn empty_safe_scan_uses_external_store_and_reports_json() {
 }
 
 #[test]
-fn foreground_scan_respects_the_store_writer_lock() {
+fn writer_commands_respect_the_store_writer_lock() {
     let root = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();
     let store = cache.path().join("graph.db");
@@ -1058,7 +1058,39 @@ fn foreground_scan_respects_the_store_writer_lock() {
         .assert()
         .failure()
         .stderr(predicate::str::contains(
-            "a daemon or scan is already running for store",
+            "another store writer is already running for store",
+        ));
+
+    Command::cargo_bin("depgraph")
+        .unwrap()
+        .current_dir(root.path())
+        .args([
+            "--store",
+            store.to_str().unwrap(),
+            "snapshot",
+            "create",
+            "locked",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "another store writer is already running for store",
+        ));
+
+    Command::cargo_bin("depgraph")
+        .unwrap()
+        .args([
+            "--store",
+            store.to_str().unwrap(),
+            "resolve",
+            "--build",
+            root.path().to_str().unwrap(),
+            "--allow-project-code",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "another store writer is already running for store",
         ));
 }
 

@@ -38,7 +38,6 @@ const DEFAULT_IGNORED_COMPONENTS: &[&str] = &[
     "node_modules",
     "target",
     "dist",
-    "build",
     ".next",
     ".astro",
     ".turbo",
@@ -409,6 +408,12 @@ impl RepositoryWatcher {
 
     async fn next(&mut self) -> Option<notify::Result<Event>> {
         self.receiver.recv().await
+    }
+
+    fn try_next(
+        &mut self,
+    ) -> std::result::Result<notify::Result<Event>, mpsc::error::TryRecvError> {
+        self.receiver.try_recv()
     }
 
     fn ingest(&self, event: Event, coalescer: &mut EventCoalescer) -> Result<()> {
@@ -811,7 +816,7 @@ pub fn acquire_store_writer_lock(store_path: &Path) -> Result<std::fs::File> {
         .with_context(|| format!("failed to open daemon lock {}", lock_path.display()))?;
     file.try_lock().with_context(|| {
         format!(
-            "a daemon or scan is already running for store {}",
+            "another store writer is already running for store {}",
             store_path.display()
         )
     })?;
@@ -864,6 +869,8 @@ async fn run_daemon_loop(
     let mut active = None::<ActiveAttempt>;
     let mut stopping = false;
     let mut consecutive_failures = 0_u32;
+    let mut watcher_open = true;
+    let mut pending_watcher_event = None;
 
     loop {
         if active.is_none()
@@ -888,7 +895,11 @@ async fn run_daemon_loop(
             }
         }
         if stopping && active.is_none() && coalescer.is_empty() {
-            break;
+            match watcher.try_next() {
+                Ok(event) => pending_watcher_event = Some(event),
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => break,
+            }
         }
 
         let timer_deadline =
@@ -906,7 +917,13 @@ async fn run_daemon_loop(
                 }
                 publish_status(&status_sender, &status);
             }
-            event = watcher.next(), if !stopping => {
+            event = async {
+                if let Some(event) = pending_watcher_event.take() {
+                    Some(event)
+                } else {
+                    watcher.next().await
+                }
+            }, if watcher_open => {
                 match event {
                     Some(Ok(event)) => {
                         let revision_before = coalescer.revision();
@@ -916,13 +933,25 @@ async fn run_daemon_loop(
                         }
                         if coalescer.revision() != revision_before {
                             consecutive_failures = 0;
-                            deadline = Some(Instant::now() + debounce);
+                            deadline = if stopping {
+                                None
+                            } else {
+                                Some(Instant::now() + debounce)
+                            };
                             status.pending_change_count = coalescer.len();
                             if let Some(active) = &active {
                                 active.cancellation.cancel();
-                                status.phase = DaemonPhase::Cancelling;
+                                status.phase = if stopping {
+                                    DaemonPhase::Stopping
+                                } else {
+                                    DaemonPhase::Cancelling
+                                };
                             } else {
-                                status.phase = DaemonPhase::Debouncing;
+                                status.phase = if stopping {
+                                    DaemonPhase::Stopping
+                                } else {
+                                    DaemonPhase::Debouncing
+                                };
                             }
                             publish_status(&status_sender, &status);
                         }
@@ -932,7 +961,9 @@ async fn run_daemon_loop(
                         publish_status(&status_sender, &status);
                     }
                     None => {
+                        watcher_open = false;
                         stopping = true;
+                        deadline = None;
                         status.last_watcher_error = Some("filesystem watcher stopped unexpectedly".to_owned());
                         status.phase = DaemonPhase::Stopping;
                         if let Some(active) = &active {
@@ -966,7 +997,7 @@ async fn run_daemon_loop(
                 record_attempt(&mut status, finished.request, result);
                 if disposition == AttemptDisposition::Completed {
                     consecutive_failures = 0;
-                } else if !shutdown_flush {
+                } else if !shutdown_flush || disposition == AttemptDisposition::Cancelled {
                     coalescer.extend(retry_changes);
                     if !stopping {
                         let retry_at = if disposition == AttemptDisposition::Cancelled {
@@ -1160,6 +1191,44 @@ mod tests {
     }
 
     #[derive(Default)]
+    struct ShutdownEventRunner {
+        attempts: AtomicUsize,
+        requests: Mutex<Vec<DaemonScanRequest>>,
+    }
+
+    impl DaemonScanRunner for ShutdownEventRunner {
+        fn run(
+            &self,
+            request: DaemonScanRequest,
+            cancellation: CancellationToken,
+        ) -> DaemonScanFuture {
+            let attempt = self.attempts.fetch_add(1, Ordering::AcqRel);
+            self.requests.lock().unwrap().push(request);
+            Box::pin(async move {
+                if attempt < 2 {
+                    cancellation.cancelled().await;
+                    return Ok(DaemonScanOutcome {
+                        scan_id: Some(format!("cancelled-{attempt}")),
+                        status: "cancelled".to_owned(),
+                        completed_snapshot_id: None,
+                        base_snapshot_id: Some("stable-snapshot".to_owned()),
+                        invalidation_plan: None,
+                        invalidation_error: None,
+                    });
+                }
+                Ok(DaemonScanOutcome {
+                    scan_id: Some("final-shutdown-flush".to_owned()),
+                    status: "completed".to_owned(),
+                    completed_snapshot_id: Some("final-snapshot".to_owned()),
+                    base_snapshot_id: Some("stable-snapshot".to_owned()),
+                    invalidation_plan: None,
+                    invalidation_error: None,
+                })
+            })
+        }
+    }
+
+    #[derive(Default)]
     struct FailOnceRunner {
         attempts: AtomicUsize,
     }
@@ -1281,6 +1350,13 @@ mod tests {
             rules.classify(&root.path().join("src/lib.rs"))?,
             Some(WatchedPath {
                 relative_path: "src/lib.rs".to_owned(),
+                kind: WatchPathKind::Source,
+            })
+        );
+        assert_eq!(
+            rules.classify(&root.path().join("src/build/lib.rs"))?,
+            Some(WatchedPath {
+                relative_path: "src/build/lib.rs".to_owned(),
                 kind: WatchPathKind::Source,
             })
         );
@@ -1422,6 +1498,49 @@ mod tests {
                 .changes
                 .iter()
                 .any(|change| change.new_path.as_deref() == Some("flush.rs"))
+        }));
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_flush_includes_events_received_while_stopping() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let runner = Arc::new(ShutdownEventRunner::default());
+        let handle = start_daemon_with_runner(
+            root.path().to_path_buf(),
+            DaemonConfig {
+                debounce_milliseconds: 10,
+                ignored_paths: Vec::new(),
+            },
+            None,
+            InterruptedAttemptRecovery::default(),
+            runner.clone(),
+        )?;
+        let mut status = handle.subscribe();
+        std::fs::write(root.path().join("before-stop.rs"), "fn before_stop() {}\n")?;
+        wait_for_status(&mut status, |status| status.phase == DaemonPhase::Scanning).await?;
+
+        let stopping = tokio::spawn(async move { handle.stop().await });
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while runner.attempts.load(Ordering::Acquire) < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .context("shutdown flush did not start")?;
+        std::fs::write(root.path().join("during-stop.rs"), "fn during_stop() {}\n")?;
+
+        let stopped = tokio::time::timeout(Duration::from_secs(10), stopping)
+            .await
+            .context("daemon did not finish the final shutdown flush")?
+            .context("daemon stop task failed")??;
+        assert_eq!(stopped.phase, DaemonPhase::Stopped);
+        assert!(runner.attempts.load(Ordering::Acquire) >= 3);
+        assert!(runner.requests.lock().unwrap().iter().any(|request| {
+            request
+                .changes
+                .iter()
+                .any(|change| change.new_path.as_deref() == Some("during-stop.rs"))
         }));
         Ok(())
     }

@@ -501,8 +501,9 @@ async fn run(cli: Cli) -> Result<u8> {
             debug_assert!(build, "clap requires --build");
             require_build_consent(allow_project_code)?;
             let root = canonical_directory(path)?;
-            let request = create_build_execution_request(&root)?;
             let store_path = store_path(cli.store, &root)?;
+            let _store_writer_lock = acquire_store_writer_lock(&store_path)?;
+            let request = create_build_execution_request(&root)?;
             let mut store = open_store(&store_path)?;
             let outcome = execute_build_request_with_cancellation(&request, async {
                 let _ = tokio::signal::ctrl_c().await;
@@ -930,6 +931,9 @@ async fn run(cli: Cli) -> Result<u8> {
         Commands::Snapshot { command } => {
             let root = std::env::current_dir()?;
             let store_path = store_path(cli.store, &root)?;
+            let _store_writer_lock = matches!(&command, SnapshotCommands::Create { .. })
+                .then(|| acquire_store_writer_lock(&store_path))
+                .transpose()?;
             let mut store = open_store(&store_path)?;
             match command {
                 SnapshotCommands::Create { name, json } => {
