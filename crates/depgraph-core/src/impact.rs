@@ -115,6 +115,9 @@ impl ImpactFilters {
         if self.sessions.is_empty() && self.environments.is_empty() {
             return true;
         }
+        if edge.phase != "runtime" {
+            return false;
+        }
         let context = runtime_context_for_edge(snapshot, edge);
         let session_matches = self.sessions.is_empty()
             || context
@@ -123,8 +126,9 @@ impl ImpactFilters {
                 .chain(context.source_session_ids.iter())
                 .any(|value| self.sessions.binary_search(value).is_ok());
         let environment_matches = self.environments.is_empty()
-            || std::iter::once(&edge.environment)
-                .chain(context.environment_names.iter())
+            || context
+                .environment_names
+                .iter()
                 .chain(context.runtimes.iter())
                 .chain(context.regions.iter())
                 .any(|value| self.environments.binary_search(value).is_ok());
@@ -1193,6 +1197,42 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["file"]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_environment_filter_excludes_static_edges_with_the_same_label() -> Result<()> {
+        let mut graph = graph();
+        let filters = ImpactFilters::new(None, Vec::new(), Vec::new(), 20, 20)?
+            .with_runtime_filters(Vec::new(), Vec::new(), vec!["server".to_owned()])?;
+        assert!(
+            graph
+                .edges
+                .iter()
+                .all(|edge| !filters.matches(&graph, edge))
+        );
+
+        graph.edges[0].phase = "runtime".to_owned();
+        graph.evidence.push(EvidenceRecord {
+            owner_type: "edge".to_owned(),
+            owner_id: graph.edges[0].id.clone(),
+            ordinal: graph.evidence.len() as i64,
+            kind: "runtime".to_owned(),
+            extractor: "runtime-trace".to_owned(),
+            extractor_version: "1.0".to_owned(),
+            path: String::new(),
+            start_line: 1,
+            start_column: 1,
+            end_line: 1,
+            end_column: 1,
+            detail: None,
+            properties: json!({
+                "session_id":"runtime-session",
+                "source_session_id":"collector-session",
+                "environment":{"name":"server"}
+            }),
+        });
+        assert!(filters.matches(&graph, &graph.edges[0]));
         Ok(())
     }
 

@@ -114,6 +114,9 @@ impl GraphQueryFilter {
         if self.sessions.is_empty() && self.environments.is_empty() {
             return true;
         }
+        if edge.phase != "runtime" {
+            return false;
+        }
         let context = runtime_context_for_edge(snapshot, edge);
         let session_matches = self.sessions.is_empty()
             || context
@@ -122,8 +125,9 @@ impl GraphQueryFilter {
                 .chain(context.source_session_ids.iter())
                 .any(|value| self.sessions.binary_search(value).is_ok());
         let environment_matches = self.environments.is_empty()
-            || std::iter::once(&edge.environment)
-                .chain(context.environment_names.iter())
+            || context
+                .environment_names
+                .iter()
                 .chain(context.runtimes.iter())
                 .chain(context.regions.iter())
                 .any(|value| self.environments.binary_search(value).is_ok());
@@ -132,7 +136,7 @@ impl GraphQueryFilter {
 
     pub fn matches_evidence(&self, evidence: &EvidenceRecord) -> bool {
         if evidence.kind != "runtime" {
-            return self.sessions.is_empty();
+            return self.sessions.is_empty() && self.environments.is_empty();
         }
         let session_matches = self.sessions.is_empty()
             || ["session_id", "source_session_id"].iter().any(|key| {
@@ -1061,6 +1065,32 @@ mod tests {
             )?
             .matches_diagnostic(&diagnostic)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn environment_filter_is_scoped_to_runtime_evidence_context() -> Result<()> {
+        let mut graph = snapshot();
+        graph.edges[0].environment = "production".to_owned();
+        let filter = GraphQueryFilter::new(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec!["production".to_owned()],
+        )?;
+        assert!(!filter.matches_edge(&graph, &graph.edges[0]));
+
+        graph.edges[0].phase = "runtime".to_owned();
+        assert!(!filter.matches_edge(&graph, &graph.edges[0]));
+        let mut runtime_evidence = evidence("edge", "e0", 0, "");
+        runtime_evidence.kind = "runtime".to_owned();
+        runtime_evidence.properties = json!({
+            "session_id":"runtime-session",
+            "source_session_id":"collector-session",
+            "environment":{"name":"production"}
+        });
+        graph.evidence.push(runtime_evidence);
+        assert!(filter.matches_edge(&graph, &graph.edges[0]));
         Ok(())
     }
 
