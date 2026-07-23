@@ -1,0 +1,517 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/TamaT-LLC/depgraph-cli/schemas/depgraph-policy-v1.schema.json",
+  "title": "depgraph architecture policy configuration v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "rules", "suppressions"],
+  "properties": {
+    "schema_version": {
+      "const": "1.0"
+    },
+    "rules": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/rule"
+      }
+    },
+    "suppressions": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/suppression"
+      }
+    }
+  },
+  "$defs": {
+    "contract_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+    },
+    "match_kind": {
+      "enum": ["exact", "prefix", "glob"]
+    },
+    "pattern": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["match", "value"],
+      "properties": {
+        "match": {
+          "$ref": "#/$defs/match_kind"
+        },
+        "value": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        }
+      }
+    },
+    "selector_pattern": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["field", "match", "value"],
+      "properties": {
+        "field": {
+          "enum": ["id", "path", "locator", "display_name"]
+        },
+        "match": {
+          "$ref": "#/$defs/match_kind"
+        },
+        "value": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "field": {
+                "const": "id"
+              }
+            },
+            "required": ["field"]
+          },
+          "then": {
+            "properties": {
+              "match": {
+                "const": "exact"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "selector_scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "paths": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/pattern"
+          }
+        },
+        "packages": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/pattern"
+          }
+        }
+      }
+    },
+    "selector": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "field", "match", "value", "cardinality"],
+      "properties": {
+        "kind": {
+          "enum": ["package", "file", "symbol", "type", "route"]
+        },
+        "field": {
+          "enum": ["id", "path", "locator", "display_name"]
+        },
+        "match": {
+          "$ref": "#/$defs/match_kind"
+        },
+        "value": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        },
+        "cardinality": {
+          "enum": ["one", "many"]
+        },
+        "exclude": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/selector_pattern"
+          }
+        },
+        "scope": {
+          "$ref": "#/$defs/selector_scope"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "field": {
+                "const": "id"
+              }
+            },
+            "required": ["field"]
+          },
+          "then": {
+            "properties": {
+              "match": {
+                "const": "exact"
+              },
+              "cardinality": {
+                "const": "one"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "not": {
+                  "const": "file"
+                }
+              }
+            },
+            "required": ["kind"]
+          },
+          "then": {
+            "properties": {
+              "field": {
+                "not": {
+                  "const": "path"
+                }
+              },
+              "exclude": {
+                "items": {
+                  "properties": {
+                    "field": {
+                      "not": {
+                        "const": "path"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "profile_filter": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "include": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/pattern"
+          }
+        },
+        "exclude": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/pattern"
+          }
+        }
+      }
+    },
+    "condition": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["op", "conditions"],
+          "properties": {
+            "op": {
+              "const": "all"
+            },
+            "conditions": {
+              "type": "array",
+              "maxItems": 256,
+              "items": {
+                "$ref": "#/$defs/condition"
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["op", "conditions"],
+          "properties": {
+            "op": {
+              "const": "any"
+            },
+            "conditions": {
+              "type": "array",
+              "maxItems": 256,
+              "items": {
+                "$ref": "#/$defs/condition"
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["op", "condition"],
+          "properties": {
+            "op": {
+              "const": "not"
+            },
+            "condition": {
+              "$ref": "#/$defs/condition"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["op", "key", "value"],
+          "properties": {
+            "op": {
+              "const": "eq"
+            },
+            "key": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9_.:-]{1,128}$"
+            },
+            "value": {
+              "type": ["string", "number", "boolean", "null"]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["op", "key", "values"],
+          "properties": {
+            "op": {
+              "const": "in"
+            },
+            "key": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9_.:-]{1,128}$"
+            },
+            "values": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 128,
+              "uniqueItems": true,
+              "items": {
+                "type": ["string", "number", "boolean", "null"]
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["op", "key"],
+          "properties": {
+            "op": {
+              "const": "defined"
+            },
+            "key": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9_.:-]{1,128}$"
+            }
+          }
+        }
+      ]
+    },
+    "evidence_requirement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kinds", "minimum_spans", "primary_only"],
+      "properties": {
+        "kinds": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "enum": ["source", "semantic", "build", "runtime"]
+          }
+        },
+        "minimum_spans": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "primary_only": {
+          "type": "boolean"
+        }
+      }
+    },
+    "threshold": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["max"],
+      "properties": {
+        "max": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "rule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "kind",
+        "severity",
+        "source",
+        "target",
+        "profiles",
+        "condition",
+        "precisions",
+        "resolution_statuses",
+        "evidence"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/contract_id"
+        },
+        "kind": {
+          "enum": [
+            "layer_boundary",
+            "forbidden_dependency",
+            "cycle",
+            "dependency_depth",
+            "fan_in",
+            "fan_out",
+            "public_api_change",
+            "runtime_boundary"
+          ]
+        },
+        "severity": {
+          "enum": ["warning", "error"]
+        },
+        "source": {
+          "$ref": "#/$defs/selector"
+        },
+        "target": {
+          "$ref": "#/$defs/selector"
+        },
+        "profiles": {
+          "$ref": "#/$defs/profile_filter"
+        },
+        "condition": {
+          "$ref": "#/$defs/condition"
+        },
+        "precisions": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "enum": ["exact", "overapprox", "heuristic", "observed"]
+          }
+        },
+        "resolution_statuses": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "enum": ["resolved", "candidates", "external", "unresolved"]
+          }
+        },
+        "evidence": {
+          "$ref": "#/$defs/evidence_requirement"
+        },
+        "threshold": {
+          "$ref": "#/$defs/threshold"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "enum": ["dependency_depth", "fan_in", "fan_out"]
+              }
+            },
+            "required": ["kind"]
+          },
+          "then": {
+            "required": ["threshold"]
+          },
+          "else": {
+            "not": {
+              "required": ["threshold"]
+            }
+          }
+        }
+      ]
+    },
+    "suppression_scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "source": {
+          "$ref": "#/$defs/selector"
+        },
+        "target": {
+          "$ref": "#/$defs/selector"
+        },
+        "profiles": {
+          "$ref": "#/$defs/profile_filter"
+        },
+        "condition": {
+          "$ref": "#/$defs/condition"
+        }
+      },
+      "anyOf": [
+        {
+          "required": ["source"]
+        },
+        {
+          "required": ["target"]
+        },
+        {
+          "required": ["condition"]
+        },
+        {
+          "required": ["profiles"],
+          "properties": {
+            "profiles": {
+              "anyOf": [
+                {
+                  "required": ["include"],
+                  "properties": {
+                    "include": {
+                      "minItems": 1
+                    }
+                  }
+                },
+                {
+                  "required": ["exclude"],
+                  "properties": {
+                    "exclude": {
+                      "minItems": 1
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "suppression": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "rule_id", "reason", "scope"],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/contract_id"
+        },
+        "rule_id": {
+          "$ref": "#/$defs/contract_id"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        },
+        "scope": {
+          "$ref": "#/$defs/suppression_scope"
+        }
+      }
+    }
+  }
+}

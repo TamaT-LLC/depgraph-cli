@@ -1,0 +1,153 @@
+{
+  "schema_version": "1.0",
+  "rules": [
+    {
+      "id": "no-ui-to-data",
+      "kind": "forbidden_dependency",
+      "severity": "error",
+      "source": {
+        "kind": "file",
+        "field": "path",
+        "match": "glob",
+        "value": "src/ui/**",
+        "cardinality": "many",
+        "exclude": [
+          {
+            "field": "path",
+            "match": "glob",
+            "value": "src/ui/**/*.test.ts"
+          }
+        ],
+        "scope": {
+          "paths": [
+            {
+              "match": "glob",
+              "value": "src/**"
+            }
+          ],
+          "packages": []
+        }
+      },
+      "target": {
+        "kind": "file",
+        "field": "path",
+        "match": "glob",
+        "value": "src/data/internal/**",
+        "cardinality": "many",
+        "exclude": [],
+        "scope": {
+          "paths": [
+            {
+              "match": "glob",
+              "value": "src/**"
+            }
+          ],
+          "packages": []
+        }
+      },
+      "profiles": {
+        "include": [
+          {
+            "match": "prefix",
+            "value": "profile:"
+          }
+        ],
+        "exclude": []
+      },
+      "condition": {
+        "op": "eq",
+        "key": "mode",
+        "value": "production"
+      },
+      "precisions": ["exact", "observed"],
+      "resolution_statuses": ["resolved"],
+      "evidence": {
+        "kinds": ["source", "semantic"],
+        "minimum_spans": 1,
+        "primary_only": true
+      }
+    },
+    {
+      "id": "bounded-route-depth",
+      "kind": "dependency_depth",
+      "severity": "warning",
+      "source": {
+        "kind": "route",
+        "field": "locator",
+        "match": "glob",
+        "value": "/**",
+        "cardinality": "many",
+        "exclude": [],
+        "scope": {
+          "paths": [],
+          "packages": []
+        }
+      },
+      "target": {
+        "kind": "file",
+        "field": "path",
+        "match": "glob",
+        "value": "**",
+        "cardinality": "many",
+        "exclude": [],
+        "scope": {
+          "paths": [],
+          "packages": []
+        }
+      },
+      "profiles": {
+        "include": [],
+        "exclude": []
+      },
+      "condition": {
+        "op": "all",
+        "conditions": []
+      },
+      "precisions": ["exact", "overapprox", "heuristic", "observed"],
+      "resolution_statuses": ["resolved", "candidates"],
+      "evidence": {
+        "kinds": ["source", "semantic", "build"],
+        "minimum_spans": 1,
+        "primary_only": false
+      },
+      "threshold": {
+        "max": 8
+      }
+    }
+  ],
+  "suppressions": [
+    {
+      "id": "legacy-ui-data",
+      "rule_id": "no-ui-to-data",
+      "reason": "Legacy adapter is isolated until its scheduled migration.",
+      "scope": {
+        "source": {
+          "kind": "file",
+          "field": "path",
+          "match": "exact",
+          "value": "src/ui/legacy-adapter.ts",
+          "cardinality": "one",
+          "exclude": [],
+          "scope": {
+            "paths": [
+              {
+                "match": "exact",
+                "value": "src/ui/legacy-adapter.ts"
+              }
+            ],
+            "packages": []
+          }
+        },
+        "profiles": {
+          "include": [
+            {
+              "match": "prefix",
+              "value": "profile:"
+            }
+          ],
+          "exclude": []
+        }
+      }
+    }
+  ]
+}

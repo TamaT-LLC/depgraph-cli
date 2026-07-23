@@ -435,6 +435,7 @@ dependencies = [
  "directories",
  "find-msvc-tools",
  "hex",
+ "jsonschema",
  "libc",
  "notify",
  "petgraph",

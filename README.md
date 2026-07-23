@@ -115,6 +115,57 @@ depgraph export --format mermaid > graph.mmd
 
 SQLite is stored under the operating system cache directory, keyed by the canonical repository root. Use global `--store PATH` for a specific database and global `--scan-id ID` to inspect a retained partial scan. Queries default to the latest successful scan; `doctor` reports the latest attempt.
 
+## Architecture policy contract
+
+Architecture rules live in the versioned `[policy]` section of `.depgraph.toml`.
+This example forbids production UI files from depending directly on internal
+data files and limits a suppression to one legacy source file:
+
+```toml
+[policy]
+schema_version = "1.0"
+
+[[policy.rules]]
+id = "no-ui-to-data"
+kind = "forbidden_dependency"
+severity = "error"
+source = { kind = "file", field = "path", match = "glob", value = "src/ui/**", cardinality = "many", exclude = [], scope = { paths = [{ match = "glob", value = "src/**" }], packages = [] } }
+target = { kind = "file", field = "path", match = "glob", value = "src/data/internal/**", cardinality = "many", exclude = [], scope = { paths = [{ match = "glob", value = "src/**" }], packages = [] } }
+profiles = { include = [{ match = "prefix", value = "profile:" }], exclude = [] }
+condition = { op = "eq", key = "mode", value = "production" }
+precisions = ["exact", "observed"]
+resolution_statuses = ["resolved"]
+evidence = { kinds = ["source", "semantic"], minimum_spans = 1, primary_only = true }
+
+[[policy.suppressions]]
+id = "legacy-ui-data"
+rule_id = "no-ui-to-data"
+reason = "Legacy adapter is isolated until its scheduled migration."
+scope = { source = { kind = "file", field = "path", match = "exact", value = "src/ui/legacy-adapter.ts", cardinality = "one", exclude = [], scope = { paths = [{ match = "exact", value = "src/ui/legacy-adapter.ts" }], packages = [] } }, profiles = { include = [{ match = "prefix", value = "profile:" }], exclude = [] } }
+```
+
+Selectors support `package`, `file`, `symbol`, `type`, and `route` nodes.
+`field` chooses stable ID, normalized repository path, locator, or display-name
+matching; `match` is `exact`, `prefix`, or the bounded `*` / `**` / `?` glob
+grammar.
+`cardinality = "one"` rejects both zero and multiple matches rather than
+silently choosing the first; `"many"` evaluates every match in canonical
+order. Repository/package scope is applied before exclusions, and neither can
+broaden the selector.
+
+Every rule declares source and target selectors, severity, profile and
+condition filters, admitted precision/status values, and its evidence
+requirement. `dependency_depth`, `fan_in`, and `fan_out` rules additionally
+require `threshold = { max = ... }`. Suppressions require a reason and a
+non-empty source, target, profile, or condition scope. Unknown versions, rule
+kinds, properties, and invalid or duplicate IDs fail closed as configuration
+errors. The machine-readable result contract uses stable violation IDs,
+dependency paths, repository-relative evidence spans, applied suppressions,
+and exit code `1` whenever an unsuppressed error remains.
+
+The matching JSON Schema is
+[`schemas/depgraph-policy-v1.schema.json`](schemas/depgraph-policy-v1.schema.json).
+
 Store schema v10 separates profile-independent `syntax`, profile-dependent `semantic`, and observed `build` cache entries. Keys use contract v1 canonical digests of repository-relative file bytes, manifest/lock/config inputs, adapter/protocol artifacts, toolchain/framework identities, profiles, and generated artifact fingerprints; checkout, cache, and temporary absolute paths are not key dimensions. A semantic hit is reused only after key, contract, completed-snapshot, and canonical payload integrity checks, then copied into a fresh scan attempt and validated before promotion. Unknown versions, corruption, symlinks, unsafe inventory bounds, and dependency snapshots that cannot be re-derived before scanning are explicit misses/rejections. `scan --no-cache` bypasses lookup and storage. Scan JSON/text and `doctor` expose cache hit/miss/reject reasons without adding cache bookkeeping to the canonical graph.
 
 `snapshot create` names the current completed snapshot; global `--scan-id ID` may instead select the completed snapshot produced by that scan and its latest promoted build. Failed or incomplete attempts cannot be named. Names are immutable, case-insensitively unique, 1–64 ASCII characters, begin with a letter or digit, and otherwise use letters, digits, `.`, `_`, or `-`. `current` and `latest` are reserved, and existing names are never overwritten. `snapshot show` accepts a name, a `snapshot:sha256:...` stable ID, or `current`. List and detail JSON are emitted in canonical order.
