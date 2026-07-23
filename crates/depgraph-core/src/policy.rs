@@ -683,6 +683,7 @@ pub struct PolicyEvidenceSpan {
 
 impl PolicyEvidenceSpan {
     fn validate(&self) -> Result<()> {
+        validate_bounded_text("policy evidence path", &self.path, 4096)?;
         validate_repository_path("policy evidence path", &self.path)?;
         if self.start_line == 0
             || self.start_column == 0
@@ -762,6 +763,24 @@ impl PolicyViolation {
             validate_bounded_text("policy path source ID", &step.source_id, 1024)?;
             validate_bounded_text("policy path edge ID", &step.edge_id, 1024)?;
             validate_bounded_text("policy path target ID", &step.target_id, 1024)?;
+        }
+        if self
+            .dependency_path
+            .first()
+            .is_none_or(|step| step.source_id != self.source.id)
+            || self
+                .dependency_path
+                .last()
+                .is_none_or(|step| step.target_id != self.target.id)
+        {
+            bail!("policy violation dependency_path must connect its source and target");
+        }
+        if self
+            .dependency_path
+            .windows(2)
+            .any(|steps| steps[0].target_id != steps[1].source_id)
+        {
+            bail!("policy violation dependency_path steps must form a connected path");
         }
         if let Some(profile_id) = &self.profile_id {
             validate_bounded_text("policy violation profile ID", profile_id, 1024)?;
@@ -1129,6 +1148,49 @@ mod tests {
                 "JSON Schema accepted a vacuous suppression condition"
             );
         }
+
+        for invalid_path in [
+            json!({"match": "glob", "value": "/src/**"}),
+            json!({"match": "glob", "value": "src/../secret"}),
+            json!({"match": "glob", "value": "src/[ab].ts"}),
+            json!({"match": "exact", "value": "src/*.ts"}),
+            json!({"match": "exact", "value": "src\\secret.ts"}),
+        ] {
+            let mut invalid = value.clone();
+            invalid["rules"][0]["source"]["match"] = invalid_path["match"].clone();
+            invalid["rules"][0]["source"]["value"] = invalid_path["value"].clone();
+            let policy: PolicyConfig = serde_json::from_value(invalid.clone())?;
+            assert!(policy.validate().is_err());
+            assert!(
+                validator.validate(&invalid).is_err(),
+                "JSON Schema accepted invalid path pattern {invalid_path}"
+            );
+        }
+
+        let mut mismatched_cycle = value.clone();
+        mismatched_cycle["rules"][0]["kind"] = json!("cycle");
+        mismatched_cycle["rules"][0]["target"]["kind"] = json!("route");
+        mismatched_cycle["rules"][0]["target"]["field"] = json!("locator");
+        let policy: PolicyConfig = serde_json::from_value(mismatched_cycle.clone())?;
+        assert!(policy.validate().is_err());
+        assert!(
+            validator.validate(&mismatched_cycle).is_err(),
+            "JSON Schema accepted mismatched cycle selector kinds"
+        );
+
+        let mut oversized_condition = value;
+        oversized_condition["rules"][0]["condition"] = json!({
+            "op": "all",
+            "conditions": (0..256)
+                .map(|index| json!({"op": "eq", "key": "feature", "value": index}))
+                .collect::<Vec<_>>()
+        });
+        let policy: PolicyConfig = serde_json::from_value(oversized_condition.clone())?;
+        assert!(policy.validate().is_err());
+        assert!(
+            validator.validate(&oversized_condition).is_err(),
+            "JSON Schema accepted 256 child conditions plus their parent"
+        );
         Ok(())
     }
 
@@ -1173,6 +1235,61 @@ mod tests {
             }],
             suppression: None,
         };
+
+        let mut disconnected = violation.clone();
+        disconnected.dependency_path[0].source_id = "file:other".into();
+        disconnected.id = PolicyViolation::stable_id(
+            &disconnected.rule_id,
+            &disconnected.source.id,
+            &disconnected.target.id,
+            disconnected.profile_id.as_deref(),
+            &disconnected.dependency_path,
+        );
+        assert!(
+            disconnected
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("connect its source and target")
+        );
+
+        let mut broken_steps = violation.clone();
+        broken_steps.dependency_path = vec![
+            PolicyPathStep {
+                source_id: "file:source".into(),
+                edge_id: "edge:first".into(),
+                target_id: "file:middle".into(),
+            },
+            PolicyPathStep {
+                source_id: "file:other".into(),
+                edge_id: "edge:second".into(),
+                target_id: "file:target".into(),
+            },
+        ];
+        broken_steps.id = PolicyViolation::stable_id(
+            &broken_steps.rule_id,
+            &broken_steps.source.id,
+            &broken_steps.target.id,
+            broken_steps.profile_id.as_deref(),
+            &broken_steps.dependency_path,
+        );
+        assert!(
+            broken_steps
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("steps must form a connected path")
+        );
+
+        let mut unsafe_evidence_path = violation.clone();
+        unsafe_evidence_path.evidence[0].path = "src/\nannotation.rs".into();
+        assert!(
+            unsafe_evidence_path
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("policy evidence path")
+        );
 
         let result = PolicyResult::new("snapshot:fixture", vec![violation]);
         assert_eq!(result.summary.errors, 1);

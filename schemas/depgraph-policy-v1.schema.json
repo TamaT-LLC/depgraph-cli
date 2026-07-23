@@ -30,6 +30,64 @@
     "match_kind": {
       "enum": ["exact", "prefix", "glob"]
     },
+    "match_value": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1024
+    },
+    "normalized_path_value": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/match_value"
+        },
+        {
+          "pattern": "^[^/\\\\]+(?:/[^/\\\\]+)*$"
+        },
+        {
+          "not": {
+            "pattern": "(^|/)\\.\\.?($|/)"
+          }
+        }
+      ]
+    },
+    "match_constraints": {
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "match": {
+                "enum": ["exact", "prefix"]
+              }
+            },
+            "required": ["match"]
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "pattern": "^[^*?\\\\]+$"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "match": {
+                "const": "glob"
+              }
+            },
+            "required": ["match"]
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "pattern": "^[^\\\\\\[\\]\\{\\}]+$"
+              }
+            }
+          }
+        }
+      ]
+    },
     "pattern": {
       "type": "object",
       "additionalProperties": false,
@@ -39,11 +97,28 @@
           "$ref": "#/$defs/match_kind"
         },
         "value": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 1024
+          "$ref": "#/$defs/match_value"
         }
-      }
+      },
+      "allOf": [
+        {
+          "$ref": "#/$defs/match_constraints"
+        }
+      ]
+    },
+    "path_pattern": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/pattern"
+        },
+        {
+          "properties": {
+            "value": {
+              "$ref": "#/$defs/normalized_path_value"
+            }
+          }
+        }
+      ]
     },
     "selector_pattern": {
       "type": "object",
@@ -57,12 +132,13 @@
           "$ref": "#/$defs/match_kind"
         },
         "value": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 1024
+          "$ref": "#/$defs/match_value"
         }
       },
       "allOf": [
+        {
+          "$ref": "#/$defs/match_constraints"
+        },
         {
           "if": {
             "properties": {
@@ -79,6 +155,23 @@
               }
             }
           }
+        },
+        {
+          "if": {
+            "properties": {
+              "field": {
+                "const": "path"
+              }
+            },
+            "required": ["field"]
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "$ref": "#/$defs/normalized_path_value"
+              }
+            }
+          }
         }
       ]
     },
@@ -90,7 +183,7 @@
           "type": "array",
           "uniqueItems": true,
           "items": {
-            "$ref": "#/$defs/pattern"
+            "$ref": "#/$defs/path_pattern"
           }
         },
         "packages": {
@@ -117,9 +210,7 @@
           "$ref": "#/$defs/match_kind"
         },
         "value": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 1024
+          "$ref": "#/$defs/match_value"
         },
         "cardinality": {
           "enum": ["one", "many"]
@@ -137,6 +228,9 @@
       },
       "allOf": [
         {
+          "$ref": "#/$defs/match_constraints"
+        },
+        {
           "if": {
             "properties": {
               "field": {
@@ -152,6 +246,23 @@
               },
               "cardinality": {
                 "const": "one"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "field": {
+                "const": "path"
+              }
+            },
+            "required": ["field"]
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "$ref": "#/$defs/normalized_path_value"
               }
             }
           }
@@ -222,7 +333,7 @@
             },
             "conditions": {
               "type": "array",
-              "maxItems": 256,
+              "maxItems": 255,
               "items": {
                 "$ref": "#/$defs/condition"
               }
@@ -239,7 +350,7 @@
             },
             "conditions": {
               "type": "array",
-              "maxItems": 256,
+              "maxItems": 255,
               "items": {
                 "$ref": "#/$defs/condition"
               }
@@ -538,6 +649,110 @@
             "not": {
               "required": ["threshold"]
             }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "cycle"
+              }
+            },
+            "required": ["kind"]
+          },
+          "then": {
+            "oneOf": [
+              {
+                "properties": {
+                  "source": {
+                    "properties": {
+                      "kind": {
+                        "const": "package"
+                      }
+                    }
+                  },
+                  "target": {
+                    "properties": {
+                      "kind": {
+                        "const": "package"
+                      }
+                    }
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "source": {
+                    "properties": {
+                      "kind": {
+                        "const": "file"
+                      }
+                    }
+                  },
+                  "target": {
+                    "properties": {
+                      "kind": {
+                        "const": "file"
+                      }
+                    }
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "source": {
+                    "properties": {
+                      "kind": {
+                        "const": "symbol"
+                      }
+                    }
+                  },
+                  "target": {
+                    "properties": {
+                      "kind": {
+                        "const": "symbol"
+                      }
+                    }
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "source": {
+                    "properties": {
+                      "kind": {
+                        "const": "type"
+                      }
+                    }
+                  },
+                  "target": {
+                    "properties": {
+                      "kind": {
+                        "const": "type"
+                      }
+                    }
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "source": {
+                    "properties": {
+                      "kind": {
+                        "const": "route"
+                      }
+                    }
+                  },
+                  "target": {
+                    "properties": {
+                      "kind": {
+                        "const": "route"
+                      }
+                    }
+                  }
+                }
+              }
+            ]
           }
         }
       ]
