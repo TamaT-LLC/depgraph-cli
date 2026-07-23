@@ -242,10 +242,31 @@ function commandVersion(command, args = ["--version"]) {
   }
 }
 
+export function orderedSampleNames(names, pattern) {
+  const samples = names
+    .map((name) => {
+      const match = pattern.exec(name);
+      return match ? { index: Number(match[1]), name } : null;
+    })
+    .filter(Boolean)
+    .sort((left, right) => left.index - right.index);
+  if (
+    samples.some(
+      (sample, expectedIndex) =>
+        !Number.isSafeInteger(sample.index) ||
+        sample.index !== expectedIndex,
+    )
+  ) {
+    throw new Error("benchmark sample files must use contiguous zero-based indices");
+  }
+  return samples.map((sample) => sample.name);
+}
+
 function validateInitialScans(rawDir, fixture) {
-  const paths = readdirSync(rawDir)
-    .filter((name) => /^initial-scan-\d+\.json$/.test(name))
-    .sort()
+  const paths = orderedSampleNames(
+    readdirSync(rawDir),
+    /^initial-scan-(\d+)\.json$/,
+  )
     .map((name) => join(rawDir, name));
   if (paths.length < 3) {
     throw new Error("benchmark requires at least three initial scan samples");
@@ -337,9 +358,10 @@ function validateImpactQueries(rawDir, fixture) {
 }
 
 function validateIncrementalAttempts(rawDir, changedFile) {
-  const paths = readdirSync(rawDir)
-    .filter((name) => /^incremental-status-\d+\.json$/.test(name))
-    .sort()
+  const paths = orderedSampleNames(
+    readdirSync(rawDir),
+    /^incremental-status-(\d+)\.json$/,
+  )
     .map((name) => join(rawDir, name));
   if (paths.length < 3) {
     throw new Error("benchmark requires at least three incremental samples");

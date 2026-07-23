@@ -13,6 +13,7 @@ import {
 import {
   evaluateMetric,
   EXPECTED_FIXTURE_SHA256,
+  orderedSampleNames,
   REPORT_SCHEMA_VERSION,
   verifyReport,
 } from "../benchmark-report.mjs";
@@ -79,6 +80,25 @@ test("metric gate tolerates one bounded outlier but rejects a clear regression",
     allowedOutliers: 1,
   });
   assert.equal(regression.passed, false);
+});
+
+test("sample evidence uses numeric order and rejects gaps", () => {
+  const names = Array.from(
+    { length: 12 },
+    (_, index) => `sample-${index}.json`,
+  ).reverse();
+  assert.deepEqual(
+    orderedSampleNames(names, /^sample-(\d+)\.json$/),
+    Array.from({ length: 12 }, (_, index) => `sample-${index}.json`),
+  );
+  assert.throws(
+    () =>
+      orderedSampleNames(
+        ["sample-0.json", "sample-2.json"],
+        /^sample-(\d+)\.json$/,
+      ),
+    /contiguous/,
+  );
 });
 
 test("release verification requires the complete 10,000-file metric contract", () => {
