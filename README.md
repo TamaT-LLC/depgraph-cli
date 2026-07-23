@@ -35,11 +35,11 @@ unresolved, semantic-issue, and compiler diagnostic counts, and
 `project_code_executed=false`. Candidate and external Web sites are allowed.
 Detected Next.js, Astro, TanStack Router, and TanStack Start profiles must also
 complete their versioned framework semantic capability ledger. Code-based
-routes beyond the safe static boundary, runtime traces, the watcher/daemon
-frontend, and architecture policies remain later milestones. The supervised
+routes beyond the safe static boundary, runtime traces, and architecture
+policies remain later milestones. The supervised
 build protocol, atomic evidence union foundation, validated syntax/semantic/build
-cache storage, and transactional incremental invalidation planner are available
-separately.
+cache storage, transactional incremental invalidation planner, and cross-platform
+watcher daemon are available.
 
 ## Build
 
@@ -67,6 +67,11 @@ depgraph init .
 depgraph scan /path/to/repository
 depgraph scan /path/to/repository --strict
 depgraph scan /path/to/repository --no-cache
+
+# Foreground watcher daemon; status and stop work from another process.
+depgraph daemon start /path/to/repository
+depgraph daemon status /path/to/repository --json
+depgraph daemon stop /path/to/repository
 
 # Privileged build-observation consent form.
 depgraph resolve --build /path/to/repository --allow-project-code
@@ -117,6 +122,8 @@ Store schema v10 separates profile-independent `syntax`, profile-dependent `sema
 `diff` accepts two completed snapshot names, stable IDs, or `current`; failed and incomplete attempt IDs are rejected with exit code `2`. Human output starts with node/site/edge/evidence/profile/coverage/rename counts and follows with canonical change details plus primary source evidence. `--json` emits the versioned `diff` command envelope with normalized filters, a summary, and the canonical before/after records. Repeatable `--kind`, `--profile`, `--phase`, and `--status` filters use exact matching and AND semantics; a record type that does not expose a selected dimension is excluded rather than guessed through an implicit graph join.
 
 `impact <SELECTOR>` follows incoming dependencies from the selected node and reports a deterministic dependency path, rendered condition, profile correlation, and source evidence for every result. With `--changed <GIT_REF>`, depgraph reads both committed changes from `merge-base(GIT_REF, HEAD)..HEAD` and staged, unstaged, and untracked worktree changes without taking Git locks or invoking external diff/textconv helpers. Changed and renamed paths are correlated to file and semantic node identities through canonical node properties and stored evidence. The selector is the focus: it must depend on a mapped changed node, then reverse traversal reports the focus and its dependents. Repeatable `--profile` and `--condition` filters are exact; `--depth`, `--max-nodes`, and `--max-edges` bound traversal, and a reached safety limit is returned as `complete=false` with an explicit diagnostic rather than silently truncating results.
+
+`daemon start` uses the platform-recommended recursive filesystem watcher and a configurable `[daemon].debounce_milliseconds` (default `200`). VCS metadata, dependency/build output directories, the graph store, and daemon control files are ignored; tracked generated source such as `generated`, `*.generated.*`, `*.g.rs`, and `routeTree.gen.ts` remains observable. A burst is normalized into deterministic added/modified/deleted/renamed changes and passed to `incremental-plan-v1`. A newer burst cancels the active scan and requeues its changes; failed batches retry with bounded backoff. Shutdown cancels an active scan, performs one final pending-batch flush, waits for worker process-tree cleanup, and never promotes the cancelled attempt. Status uses schema `daemon-status-v1` and exposes active, last completed, last failed, last cancelled, watcher-error, and crash-recovery state. `[daemon].ignored_paths` accepts normalized repository-relative path prefixes.
 
 Selectors accept `id:`, `path:`, `package:`, `route:`, `symbol:`, and `type:` prefixes. `symbol:` and `type:` only match their respective node kind. A bare or prefixed selector must resolve unambiguously; when candidates are reported, copy the complete stable ID (for example `symbol:sha256:...`) and retry as `id:<stable-id>`.
 

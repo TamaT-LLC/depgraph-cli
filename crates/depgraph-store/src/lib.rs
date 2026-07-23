@@ -99,6 +99,12 @@ pub struct GarbageCollectionReport {
     pub build_audits_deleted: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct InterruptedAttemptRecovery {
+    pub scan_attempt_ids: Vec<String>,
+    pub build_attempt_ids: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct NodeRecord {
     pub id: String,
@@ -1285,6 +1291,62 @@ impl Store {
             scan_attempts_deleted,
             build_attempts_deleted,
             build_audits_deleted,
+        })
+    }
+
+    /// Finalizes staging attempts left behind when a repository daemon or one
+    /// of its worker process trees exited without completing its transaction.
+    /// Completed snapshot pointers are intentionally never changed.
+    pub fn recover_interrupted_attempts(
+        &mut self,
+        root: &Path,
+    ) -> Result<InterruptedAttemptRecovery> {
+        let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        let root = canonical_root.to_string_lossy().into_owned();
+        let tx = self.connection.transaction()?;
+        let scan_attempt_ids = {
+            let mut statement = tx.prepare(
+                "SELECT id FROM scans WHERE root=?1 AND status='staging' ORDER BY started_at, id",
+            )?;
+            statement
+                .query_map([&root], |row| row.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        let build_attempt_ids = {
+            let mut statement = tx.prepare(
+                "SELECT attempt.id
+                   FROM build_attempts attempt
+                   JOIN scans base ON base.id=attempt.base_scan_id
+                  WHERE base.root=?1 AND attempt.status='staging'
+                  ORDER BY attempt.started_at, attempt.id",
+            )?;
+            statement
+                .query_map([&root], |row| row.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        let completed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+        for attempt_id in &build_attempt_ids {
+            tx.execute(
+                "UPDATE build_attempts
+                    SET status='cancelled', completed_at=?2,
+                        error='daemon recovered interrupted build attempt', delta_json=NULL
+                  WHERE id=?1 AND status='staging'",
+                params![attempt_id, completed_at],
+            )?;
+        }
+        for scan_id in &scan_attempt_ids {
+            tx.execute(
+                "UPDATE scans
+                    SET status='cancelled', completed_at=?2,
+                        error='daemon recovered interrupted scan attempt'
+                  WHERE id=?1 AND status='staging'",
+                params![scan_id, completed_at],
+            )?;
+        }
+        tx.commit()?;
+        Ok(InterruptedAttemptRecovery {
+            scan_attempt_ids,
+            build_attempt_ids,
         })
     }
 
@@ -3675,6 +3737,35 @@ mod tests {
         assert_eq!(
             store.latest_successful_id()?.as_deref(),
             Some("scan-golden")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn daemon_recovery_cancels_staging_attempts_without_replacing_current_snapshot() -> Result<()> {
+        let mut store = Store::open_in_memory()?;
+        ingest_protocol_fixture(
+            &mut store,
+            include_str!("../../depgraph-protocol/tests/fixtures/protocol-v1.golden.ndjson"),
+        )?;
+        let current = store.current_snapshot_id()?.context("current snapshot")?;
+        store.start_scan("interrupted-scan", Path::new("/fixture"), false)?;
+        let audit = build_attempt_audit("interrupted-build");
+        store.save_build_audit(&audit)?;
+        store.start_build_attempt("scan-golden", &audit)?;
+
+        let recovered = store.recover_interrupted_attempts(Path::new("/fixture"))?;
+
+        assert_eq!(recovered.scan_attempt_ids, ["interrupted-scan"]);
+        assert_eq!(recovered.build_attempt_ids, ["interrupted-build"]);
+        assert_eq!(store.scan("interrupted-scan")?.unwrap().status, "cancelled");
+        assert_eq!(
+            store.build_attempt("interrupted-build")?.unwrap().status,
+            "cancelled"
+        );
+        assert_eq!(
+            store.current_snapshot_id()?.as_deref(),
+            Some(current.as_str())
         );
         Ok(())
     }

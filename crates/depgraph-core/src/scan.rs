@@ -13,10 +13,12 @@ use uuid::Uuid;
 
 use crate::{
     cache::{ScanCachePlan, ScanCachePreparation, prepare_scan_cache},
+    cancellation::CancellationToken,
     config::Config,
     worker::{
-        AdapterKind, WorkerFailureKind, WorkerOutput, WorkerSpec, detect_adapters, execute_worker,
-        is_security_error, locate_worker, resolve_safe_executable,
+        AdapterKind, WorkerFailureKind, WorkerOutput, WorkerSpec, detect_adapters,
+        execute_worker_with_cancellation, is_security_error, locate_worker,
+        resolve_safe_executable,
     },
 };
 
@@ -129,6 +131,34 @@ pub async fn run_scan_with_cache_mode(
     strict: bool,
     cache_mode: ScanCacheMode,
 ) -> Result<ScanOutcome> {
+    let cancellation = CancellationToken::new();
+    let scan = run_scan_with_cache_mode_and_cancellation(
+        store,
+        root,
+        config,
+        strict,
+        cache_mode,
+        cancellation.clone(),
+    );
+    tokio::pin!(scan);
+    tokio::select! {
+        outcome = &mut scan => outcome,
+        signal = tokio::signal::ctrl_c() => {
+            signal.context("failed to listen for scan cancellation")?;
+            cancellation.cancel();
+            scan.await
+        }
+    }
+}
+
+pub async fn run_scan_with_cache_mode_and_cancellation(
+    store: &mut Store,
+    root: PathBuf,
+    config: &Config,
+    strict: bool,
+    cache_mode: ScanCacheMode,
+    cancellation: CancellationToken,
+) -> Result<ScanOutcome> {
     let root = root
         .canonicalize()
         .with_context(|| format!("failed to canonicalize {}", root.display()))?;
@@ -140,6 +170,9 @@ pub async fn run_scan_with_cache_mode(
     let scan_id = Uuid::new_v4().to_string();
     let source_revision = git_source_revision(&root);
     store.start_scan_with_revision(&scan_id, &root, strict, source_revision.as_deref())?;
+    if cancellation.is_cancelled() {
+        return cancel_scan(store, &scan_id);
+    }
 
     let adapters = match detect_adapters(&root, config.scan.follow_symlinks) {
         Ok(adapters) => adapters,
@@ -153,10 +186,19 @@ pub async fn run_scan_with_cache_mode(
                 &format!("{error:#}"),
                 "workspace-detection-failed",
             )?;
-            store.finish_scan(&scan_id, "failed", Some(&error.to_string()), false)?;
-            return snapshot_outcome(store, &scan_id, 3);
+            return finish_non_promoted_scan(
+                store,
+                &scan_id,
+                "failed",
+                Some(&error.to_string()),
+                3,
+                &cancellation,
+            );
         }
     };
+    if cancellation.is_cancelled() {
+        return cancel_scan(store, &scan_id);
+    }
 
     let WorkerPreflight {
         workers_to_run,
@@ -187,7 +229,17 @@ pub async fn run_scan_with_cache_mode(
                     {
                         match store.clone_completed_scan_into_staging(&snapshot_id, &scan_id) {
                             Ok(()) => {
-                                return complete_scan(store, &scan_id, strict, config, None);
+                                if cancellation.is_cancelled() {
+                                    return cancel_scan(store, &scan_id);
+                                }
+                                return complete_scan(
+                                    store,
+                                    &scan_id,
+                                    strict,
+                                    config,
+                                    None,
+                                    &cancellation,
+                                );
                             }
                             Err(_) => {
                                 store.record_cache_event(
@@ -216,16 +268,34 @@ pub async fn run_scan_with_cache_mode(
             }
         }
     }
+    if cancellation.is_cancelled() {
+        return cancel_scan(store, &scan_id);
+    }
+
     let mut join_set = JoinSet::new();
     let mut task_adapters = BTreeMap::new();
     let cache_workers = cache_plan.as_ref().map(|_| workers_to_run.clone());
     for (adapter, spec) in workers_to_run {
+        if cancellation.is_cancelled() {
+            while join_set.join_next().await.is_some() {}
+            return cancel_scan(store, &scan_id);
+        }
         let root = root.clone();
         let scan_id = scan_id.clone();
         let scan_config = config.scan.clone();
         let profiles = config.profiles.clone();
-        let task = join_set
-            .spawn(async move { execute_worker(spec, root, scan_id, scan_config, profiles).await });
+        let cancellation = cancellation.clone();
+        let task = join_set.spawn(async move {
+            execute_worker_with_cancellation(
+                spec,
+                root,
+                scan_id,
+                scan_config,
+                profiles,
+                cancellation,
+            )
+            .await
+        });
         task_adapters.insert(task.id(), adapter);
     }
 
@@ -248,6 +318,10 @@ pub async fn run_scan_with_cache_mode(
         }
     }
     outputs.sort_by_key(|output| output.adapter);
+
+    if cancellation.is_cancelled() {
+        return cancel_scan(store, &scan_id);
+    }
 
     let mut global_upserts = BTreeMap::<(String, String), Value>::new();
     for output in outputs {
@@ -300,7 +374,8 @@ pub async fn run_scan_with_cache_mode(
             store.mark_coverage_incomplete(&scan_id, &failure.stable_identity())?;
         }
         let security_violation = failures.iter().any(|failure| failure.security_violation);
-        store.finish_scan(
+        return finish_non_promoted_scan(
+            store,
             &scan_id,
             if security_violation {
                 "security_failed"
@@ -308,9 +383,9 @@ pub async fn run_scan_with_cache_mode(
                 "partial"
             },
             Some(&summary),
-            false,
-        )?;
-        return snapshot_outcome(store, &scan_id, if security_violation { 4 } else { 3 });
+            if security_violation { 4 } else { 3 },
+            &cancellation,
+        );
     }
 
     if let (Some(expected), Some(workers)) = (cache_plan.take(), cache_workers.as_deref()) {
@@ -328,7 +403,23 @@ pub async fn run_scan_with_cache_mode(
         }
     }
 
-    complete_scan(store, &scan_id, strict, config, cache_plan.as_ref())
+    if cancellation.is_cancelled() {
+        return cancel_scan(store, &scan_id);
+    }
+
+    complete_scan(
+        store,
+        &scan_id,
+        strict,
+        config,
+        cache_plan.as_ref(),
+        &cancellation,
+    )
+}
+
+fn cancel_scan(store: &mut Store, scan_id: &str) -> Result<ScanOutcome> {
+    store.finish_scan(scan_id, "cancelled", Some("scan cancelled"), false)?;
+    snapshot_outcome(store, scan_id, 3)
 }
 
 fn complete_scan(
@@ -337,7 +428,11 @@ fn complete_scan(
     strict: bool,
     config: &Config,
     cache_plan: Option<&ScanCachePlan>,
+    cancellation: &CancellationToken,
 ) -> Result<ScanOutcome> {
+    if cancellation.is_cancelled() {
+        return cancel_scan(store, scan_id);
+    }
     if let Err(error) = store.validate_scan(scan_id) {
         add_core_diagnostic(
             store,
@@ -347,8 +442,14 @@ fn complete_scan(
             &format!("{error:#}"),
             "graph-validation-failed",
         )?;
-        store.finish_scan(scan_id, "failed", Some(&error.to_string()), false)?;
-        return snapshot_outcome(store, scan_id, 3);
+        return finish_non_promoted_scan(
+            store,
+            scan_id,
+            "failed",
+            Some(&error.to_string()),
+            3,
+            cancellation,
+        );
     }
 
     let coverage = store.load_snapshot(scan_id)?.coverage;
@@ -372,21 +473,78 @@ fn complete_scan(
             &message,
             "strict-policy",
         )?;
-        store.finish_scan(scan_id, "policy_failed", Some(&message), false)?;
-        return snapshot_outcome(store, scan_id, 1);
+        return finish_non_promoted_scan(
+            store,
+            scan_id,
+            "policy_failed",
+            Some(&message),
+            1,
+            cancellation,
+        );
     }
 
-    store.finish_scan(scan_id, "completed", None, true)?;
-    if let Some(plan) = cache_plan {
-        let snapshot_id = store
-            .snapshot_id_for_source("scan", scan_id)?
-            .context("completed scan did not expose its snapshot")?;
-        let _ = store.store_snapshot_cache(&plan.syntax, &snapshot_id, Some(scan_id), None)?;
-        if let Some(semantic) = &plan.semantic {
-            let _ = store.store_snapshot_cache(semantic, &snapshot_id, Some(scan_id), None)?;
-        }
+    // Load everything required for the successful outcome before promotion. Once
+    // finish_scan promotes the graph, optional cache maintenance must not turn an
+    // already-visible completed snapshot into a retryable daemon failure.
+    let mut outcome = snapshot_outcome(store, scan_id, 0)?;
+    outcome.status = "completed".to_owned();
+
+    let Some(promotion) =
+        cancellation.run_if_active(|| store.finish_scan(scan_id, "completed", None, true))
+    else {
+        return cancel_scan(store, scan_id);
+    };
+    promotion?;
+    if let Some(plan) = cache_plan
+        && let Err(error) = store_completed_scan_cache(store, scan_id, plan)
+    {
+        tracing::warn!(
+            scan_id,
+            error = %error,
+            "completed scan cache population failed"
+        );
     }
-    snapshot_outcome(store, scan_id, 0)
+    match store.cache_events_for_scan(scan_id) {
+        Ok(cache_events) => outcome.cache_events = cache_events,
+        Err(error) => tracing::warn!(
+            scan_id,
+            error = %error,
+            "failed to refresh cache events for completed scan outcome"
+        ),
+    }
+    Ok(outcome)
+}
+
+fn finish_non_promoted_scan(
+    store: &mut Store,
+    scan_id: &str,
+    status: &str,
+    error: Option<&str>,
+    exit_code: u8,
+    cancellation: &CancellationToken,
+) -> Result<ScanOutcome> {
+    let Some(completion) =
+        cancellation.run_if_active(|| store.finish_scan(scan_id, status, error, false))
+    else {
+        return cancel_scan(store, scan_id);
+    };
+    completion?;
+    snapshot_outcome(store, scan_id, exit_code)
+}
+
+fn store_completed_scan_cache(
+    store: &mut Store,
+    scan_id: &str,
+    plan: &ScanCachePlan,
+) -> Result<()> {
+    let snapshot_id = store
+        .snapshot_id_for_source("scan", scan_id)?
+        .context("completed scan did not expose its snapshot")?;
+    let _ = store.store_snapshot_cache(&plan.syntax, &snapshot_id, Some(scan_id), None)?;
+    if let Some(semantic) = &plan.semantic {
+        let _ = store.store_snapshot_cache(semantic, &snapshot_id, Some(scan_id), None)?;
+    }
+    Ok(())
 }
 
 fn record_cache_rejection(store: &Store, scan_id: &str, reason: &str) -> Result<()> {
@@ -610,6 +768,7 @@ fn snapshot_outcome(store: &Store, scan_id: &str, exit_code: u8) -> Result<ScanO
 #[cfg(test)]
 mod tests {
     use super::*;
+    use depgraph_store::{CACHE_CONTRACT_VERSION, CacheKey};
 
     fn test_worker_spec(adapter: AdapterKind, program: PathBuf) -> WorkerSpec {
         WorkerSpec {
@@ -622,6 +781,65 @@ mod tests {
             expected_version: None,
             release_attested: false,
         }
+    }
+
+    #[test]
+    fn promoted_scan_remains_successful_when_cache_population_fails() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let mut store = Store::open_in_memory()?;
+        let scan_id = "cache-write-failure";
+        store.start_scan(scan_id, root.path(), false)?;
+        ingest_empty_coverage(&mut store, scan_id)?;
+        let invalid_key = CacheKey {
+            layer: CacheLayer::Syntax,
+            contract_version: CACHE_CONTRACT_VERSION + 1,
+            key: "invalid-cache-contract".to_owned(),
+            dimensions: BTreeMap::from([("fixture".to_owned(), "failure".to_owned())]),
+        };
+        let plan = ScanCachePlan {
+            syntax: invalid_key,
+            semantic: None,
+            semantic_reject_reason: None,
+        };
+
+        let outcome = complete_scan(
+            &mut store,
+            scan_id,
+            false,
+            &Config::default(),
+            Some(&plan),
+            &CancellationToken::new(),
+        )?;
+
+        assert_eq!(outcome.status, "completed");
+        assert_eq!(outcome.exit_code, 0);
+        assert_eq!(store.scan(scan_id)?.unwrap().status, "completed");
+        assert!(store.snapshot_id_for_source("scan", scan_id)?.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn cancellation_preempts_validation_failure_finalization() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let mut store = Store::open_in_memory()?;
+        let scan_id = "cancelled-invalid-scan";
+        store.start_scan(scan_id, root.path(), false)?;
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+
+        let outcome = complete_scan(
+            &mut store,
+            scan_id,
+            false,
+            &Config::default(),
+            None,
+            &cancellation,
+        )?;
+
+        assert_eq!(outcome.status, "cancelled");
+        assert_eq!(outcome.exit_code, 3);
+        assert_eq!(store.scan(scan_id)?.unwrap().status, "cancelled");
+        Ok(())
     }
 
     #[cfg(unix)]
@@ -716,6 +934,40 @@ mod tests {
         assert_eq!(outcome.exit_code, 0);
         assert_eq!(outcome.status, "completed");
         assert_eq!(outcome.coverage.dependency_sites, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancelled_scan_never_replaces_the_current_completed_snapshot() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let mut store = Store::open_in_memory()?;
+        run_scan(
+            &mut store,
+            root.path().to_path_buf(),
+            &Config::default(),
+            false,
+        )
+        .await?;
+        let current = store.current_snapshot_id()?.context("current snapshot")?;
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+
+        let cancelled = run_scan_with_cache_mode_and_cancellation(
+            &mut store,
+            root.path().to_path_buf(),
+            &Config::default(),
+            false,
+            ScanCacheMode::Enabled,
+            cancellation,
+        )
+        .await?;
+
+        assert_eq!(cancelled.status, "cancelled");
+        assert_eq!(
+            store.current_snapshot_id()?.as_deref(),
+            Some(current.as_str())
+        );
+        assert_eq!(store.scan(&cancelled.scan_id)?.unwrap().status, "cancelled");
         Ok(())
     }
 

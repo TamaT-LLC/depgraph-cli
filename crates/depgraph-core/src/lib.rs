@@ -1,7 +1,9 @@
 pub mod build;
 pub mod build_evidence;
 pub mod cache;
+pub mod cancellation;
 pub mod config;
+pub mod daemon;
 pub mod export;
 pub mod impact;
 pub mod incremental;
@@ -33,7 +35,14 @@ pub use build_evidence::{
     stage_build_evidence, validate_build_evidence, web_build_protocol_ndjson,
 };
 pub use cache::build_cache_key;
-pub use config::{Config, default_store_path, init_config};
+pub use cancellation::CancellationToken;
+pub use config::{Config, DaemonConfig, default_store_path, init_config};
+pub use daemon::{
+    DAEMON_STATUS_SCHEMA_VERSION, DaemonAttempt, DaemonHandle, DaemonPhase, DaemonScanFuture,
+    DaemonScanOutcome, DaemonScanRequest, DaemonScanRunner, DaemonStatus, EventCoalescer,
+    RepositoryScanRunner, WatchIgnoreRules, WatchPathKind, WatchedPath, acquire_store_writer_lock,
+    coalesce_incremental_changes, start_daemon_with_runner, start_repository_daemon,
+};
 pub use depgraph_store::GraphSnapshot;
 pub use export::{ExportFormat, export};
 pub use impact::{
@@ -54,7 +63,10 @@ pub use rust_build_observer::{
     RUST_BUILD_OBSERVER_VERSION, RustBuildObservation, rust_build_protocol_events,
     rust_build_protocol_ndjson,
 };
-pub use scan::{ScanCacheMode, ScanOutcome, run_scan, run_scan_with_cache_mode};
+pub use scan::{
+    ScanCacheMode, ScanOutcome, run_scan, run_scan_with_cache_mode,
+    run_scan_with_cache_mode_and_cancellation,
+};
 
 use worker::{
     AdapterKind, RUST_BACKEND_KIND, RUST_BACKEND_REVISION, RUST_BACKEND_SALSA_VERSION,

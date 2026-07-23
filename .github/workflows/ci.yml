@@ -86,6 +86,8 @@ jobs:
           node-version: 24.18.0
       - name: Build supervisor staging, redaction, timeout, cancellation, and descendant reap
         run: cargo test -p depgraph-core --lib --locked build::tests
+      - name: Watcher daemon lifecycle, debounce, cancellation, and recovery
+        run: cargo test -p depgraph-core --lib --locked daemon::tests
       - run: cargo xtask build
       - name: Web semantic import/type/call end-to-end and deterministic export
         shell: bash
@@ -508,6 +510,8 @@ jobs:
           node-version: 24.18.0
       - name: Build supervisor staging, redaction, timeout, cancellation, and descendant reap
         run: cargo test -p depgraph-core --lib --locked build::tests
+      - name: Watcher daemon lifecycle, debounce, cancellation, and recovery
+        run: cargo test -p depgraph-core --lib --locked daemon::tests
       - run: cargo test -p depgraph-rust-worker --lib --locked
       - run: cargo test -p depgraph-core --lib --locked web_worker_timeout_reaps_its_descendant_cross_platform
       - run: cargo xtask build

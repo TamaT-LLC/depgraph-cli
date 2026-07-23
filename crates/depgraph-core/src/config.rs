@@ -13,6 +13,7 @@ pub const CONFIG_FILE: &str = ".depgraph.toml";
 pub struct Config {
     pub schema_version: u32,
     pub scan: ScanConfig,
+    pub daemon: DaemonConfig,
     pub strict: StrictConfig,
     pub profiles: ProfileConfig,
 }
@@ -25,6 +26,13 @@ pub struct ScanConfig {
     pub max_protocol_bytes: usize,
     pub max_stderr_bytes: usize,
     pub follow_symlinks: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DaemonConfig {
+    pub debounce_milliseconds: u64,
+    pub ignored_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -51,8 +59,18 @@ impl Default for Config {
         Self {
             schema_version: 1,
             scan: ScanConfig::default(),
+            daemon: DaemonConfig::default(),
             strict: StrictConfig::default(),
             profiles: ProfileConfig::default(),
+        }
+    }
+}
+
+impl Default for DaemonConfig {
+    fn default() -> Self {
+        Self {
+            debounce_milliseconds: 200,
+            ignored_paths: Vec::new(),
         }
     }
 }
@@ -145,6 +163,18 @@ impl Config {
         if self.scan.follow_symlinks {
             bail!("scan.follow_symlinks=true is not permitted by the safe-scan policy");
         }
+        if !(10..=60_000).contains(&self.daemon.debounce_milliseconds) {
+            bail!("daemon.debounce_milliseconds must be between 10 and 60000");
+        }
+        let mut ignored_paths = self.daemon.ignored_paths.clone();
+        ignored_paths.sort();
+        ignored_paths.dedup();
+        if ignored_paths.len() != self.daemon.ignored_paths.len() {
+            bail!("daemon.ignored_paths must not contain duplicates");
+        }
+        for path in &ignored_paths {
+            validate_ignored_path(path)?;
+        }
         if !matches!(self.profiles.rust_mode.as_str(), "check" | "build" | "test") {
             bail!("profiles.rust_mode must be check, build, or test");
         }
@@ -157,6 +187,21 @@ impl Config {
     pub fn render_default() -> Result<String> {
         toml::to_string_pretty(&Self::default()).context("failed to serialize default config")
     }
+}
+
+fn validate_ignored_path(path: &str) -> Result<()> {
+    if path.is_empty()
+        || path.starts_with('/')
+        || path.ends_with('/')
+        || path.contains('\\')
+        || path.chars().any(char::is_control)
+        || path
+            .split('/')
+            .any(|component| component.is_empty() || matches!(component, "." | ".."))
+    {
+        bail!("daemon ignored path {path:?} must be a normalized repository-relative path");
+    }
+    Ok(())
 }
 
 pub fn init_config(root: &Path, force: bool) -> Result<PathBuf> {
@@ -216,6 +261,7 @@ mod tests {
         let parsed: Config = toml::from_str(&rendered)?;
         assert_eq!(parsed.schema_version, 1);
         assert_eq!(parsed.scan.worker_timeout_seconds, 300);
+        assert_eq!(parsed.daemon.debounce_milliseconds, 200);
         assert_eq!(parsed.strict.max_unresolved, 0);
         assert_eq!(parsed.profiles.rust_mode, "check");
         assert_eq!(parsed.profiles.go_call_graph, "rta-cha");
@@ -233,6 +279,9 @@ mod tests {
             "schema_version = 1\n[scan]\nmax_protocol_bytes = 0\n",
             "schema_version = 1\n[scan]\nmax_stderr_bytes = 0\n",
             "schema_version = 1\n[scan]\nfollow_symlinks = true\n",
+            "schema_version = 1\n[daemon]\ndebounce_milliseconds = 0\n",
+            "schema_version = 1\n[daemon]\nignored_paths = ['../outside']\n",
+            "schema_version = 1\n[daemon]\nignored_paths = ['vendor', 'vendor']\n",
             "schema_version = 1\n[profiles]\nrust_mode = 'release'\n",
             "schema_version = 1\n[profiles]\ngo_call_graph = 'pta'\n",
         ] {

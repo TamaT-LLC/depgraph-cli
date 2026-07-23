@@ -23,7 +23,10 @@ use tokio::{
 };
 use walkdir::{DirEntry, WalkDir};
 
-use crate::config::{ProfileConfig, ScanConfig};
+use crate::{
+    cancellation::CancellationToken,
+    config::{ProfileConfig, ScanConfig},
+};
 
 pub(crate) const RUST_BACKEND_KIND: &str = "rust-analyzer-library";
 pub(crate) const RUST_BACKEND_VERSION: &str = "0.0.330";
@@ -1254,6 +1257,52 @@ pub async fn execute_worker(
 ) -> WorkerOutput {
     let adapter = spec.adapter;
     match execute_worker_inner(&spec, &root, &scan_id, &config, &profiles).await {
+        Ok(execution) => WorkerOutput {
+            adapter,
+            events: execution.events,
+            stderr: execution.stderr,
+            stderr_truncated: execution.stderr_truncated,
+            error: execution.error,
+            failure_kind: execution.failure_kind,
+            security_violation: execution.security_violation,
+        },
+        Err(error) => {
+            let error = format!("{error:#}");
+            WorkerOutput {
+                adapter,
+                events: Vec::new(),
+                stderr: String::new(),
+                stderr_truncated: false,
+                failure_kind: Some(WorkerFailureKind::Other),
+                security_violation: is_security_error(&error),
+                error: Some(error),
+            }
+        }
+    }
+}
+
+pub(crate) async fn execute_worker_with_cancellation(
+    spec: WorkerSpec,
+    root: PathBuf,
+    scan_id: String,
+    config: ScanConfig,
+    profiles: ProfileConfig,
+    cancellation: CancellationToken,
+) -> WorkerOutput {
+    let adapter = spec.adapter;
+    match execute_worker_inner_with_cancellation(
+        &spec,
+        &root,
+        &scan_id,
+        &config,
+        &profiles,
+        async move {
+            cancellation.cancelled().await;
+            Ok(())
+        },
+    )
+    .await
+    {
         Ok(execution) => WorkerOutput {
             adapter,
             events: execution.events,

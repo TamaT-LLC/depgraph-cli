@@ -1,4 +1,4 @@
-use std::fs;
+use std::{fs, path::Path};
 
 use assert_cmd::Command;
 use predicates::prelude::*;
@@ -1041,6 +1041,60 @@ fn empty_safe_scan_uses_external_store_and_reports_json() {
 }
 
 #[test]
+fn writer_commands_respect_the_store_writer_lock() {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let store = cache.path().join("graph.db");
+    let _store_writer_lock = depgraph_core::acquire_store_writer_lock(&store).unwrap();
+
+    Command::cargo_bin("depgraph")
+        .unwrap()
+        .args([
+            "--store",
+            store.to_str().unwrap(),
+            "scan",
+            root.path().to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "another store writer is already running for store",
+        ));
+
+    Command::cargo_bin("depgraph")
+        .unwrap()
+        .current_dir(root.path())
+        .args([
+            "--store",
+            store.to_str().unwrap(),
+            "snapshot",
+            "create",
+            "locked",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "another store writer is already running for store",
+        ));
+
+    Command::cargo_bin("depgraph")
+        .unwrap()
+        .args([
+            "--store",
+            store.to_str().unwrap(),
+            "resolve",
+            "--build",
+            root.path().to_str().unwrap(),
+            "--allow-project-code",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "another store writer is already running for store",
+        ));
+}
+
+#[test]
 fn build_mode_refuses_implicit_or_missing_consent_without_executing_project_code() {
     let root = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();
@@ -1383,6 +1437,146 @@ fn cli_cancellation_stops_the_supervised_build_and_retains_the_safe_snapshot() {
             .iter()
             .all(|node| node.properties["build_generated"] != true)
     );
+}
+
+#[test]
+fn daemon_cli_reports_completed_attempt_and_stops_cleanly() {
+    use std::{process::Stdio, thread, time::Duration};
+
+    struct ChildGuard(Option<std::process::Child>);
+
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            if let Some(child) = &mut self.0 {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let store_path = Path::new("graph.db");
+    let status_path = cache.path().join("graph.db.daemon-status.json");
+    let mut child = ChildGuard(Some(
+        std::process::Command::new(env!("CARGO_BIN_EXE_depgraph"))
+            .args([
+                "--store",
+                store_path.to_str().unwrap(),
+                "daemon",
+                "start",
+                root.path().to_str().unwrap(),
+            ])
+            .current_dir(cache.path())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    ));
+
+    for _ in 0..1_000 {
+        if status_path.exists() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(status_path.exists(), "daemon did not publish its status");
+    fs::write(root.path().join("watched.rs"), "fn watched() {}\n").unwrap();
+
+    let mut completed = None;
+    for _ in 0..1_000 {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_depgraph"))
+            .args([
+                "--store",
+                store_path.to_str().unwrap(),
+                "daemon",
+                "status",
+                root.path().to_str().unwrap(),
+                "--json",
+            ])
+            .current_dir(cache.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let status: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        if status["last_completed_attempt"].is_object() {
+            completed = Some(status);
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    let completed = completed.expect("daemon did not complete the watched scan");
+    assert_eq!(completed["phase"], "idle");
+    assert_eq!(
+        completed["last_completed_attempt"]["changes"][0]["new_path"],
+        "watched.rs"
+    );
+
+    let stopped = std::process::Command::new(env!("CARGO_BIN_EXE_depgraph"))
+        .args([
+            "--store",
+            store_path.to_str().unwrap(),
+            "daemon",
+            "stop",
+            root.path().to_str().unwrap(),
+            "--json",
+        ])
+        .current_dir(cache.path())
+        .output()
+        .unwrap();
+    assert!(stopped.status.success());
+    let stopped_status: serde_json::Value = serde_json::from_slice(&stopped.stdout).unwrap();
+    assert_eq!(stopped_status["phase"], "stopped");
+
+    let output = child.0.take().unwrap().wait_with_output().unwrap();
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("daemon: stopped"));
+}
+
+#[test]
+fn daemon_stop_rejects_stale_status_without_waiting_for_the_timeout() {
+    use std::{process::Stdio, thread, time::Duration};
+
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let store_path = cache.path().join("graph.db");
+    let status_path = cache.path().join("graph.db.daemon-status.json");
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_depgraph"))
+        .args([
+            "--store",
+            store_path.to_str().unwrap(),
+            "daemon",
+            "start",
+            root.path().to_str().unwrap(),
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    for _ in 0..1_000 {
+        if status_path.exists() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(status_path.exists(), "daemon did not publish its status");
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let _foreground_writer = depgraph_core::acquire_store_writer_lock(&store_path).unwrap();
+
+    Command::cargo_bin("depgraph")
+        .unwrap()
+        .args([
+            "--store",
+            store_path.to_str().unwrap(),
+            "daemon",
+            "stop",
+            root.path().to_str().unwrap(),
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("daemon status").and(predicate::str::contains("stale")));
 }
 
 #[test]
