@@ -126,7 +126,8 @@ condition, precision, resolution, and environment remain available through
 typed GraphML keys. Complete profile, dependency-site, and evidence records use
 canonical JSON graph properties, with explicit owner references that allow the
 records to be reconstructed without source-store access. `--output` writes
-GraphML incrementally through a bounded buffer for large graphs.
+GraphML incrementally through a bounded buffer into a sibling temporary file,
+then atomically replaces the destination only after export succeeds.
 
 ## Architecture policy contract
 

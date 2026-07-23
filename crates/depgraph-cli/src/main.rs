@@ -1339,13 +1339,10 @@ async fn run(cli: Cli) -> Result<u8> {
             };
             if format == ExportFormat::Graphml {
                 if let Some(path) = output {
-                    let file = std::fs::File::create(&path)
-                        .with_context(|| format!("failed to create {}", path.display()))?;
-                    let mut writer = std::io::BufWriter::new(file);
-                    export_graphml_filtered_to_writer(&snapshot, &filter, &mut writer)?;
-                    writer
-                        .flush()
-                        .with_context(|| format!("failed to write {}", path.display()))?;
+                    write_file_atomically(&path, |writer| {
+                        let mut writer = writer;
+                        export_graphml_filtered_to_writer(&snapshot, &filter, &mut writer)
+                    })?;
                 } else {
                     let stdout = std::io::stdout();
                     let mut writer = stdout.lock();
@@ -1366,6 +1363,72 @@ async fn run(cli: Cli) -> Result<u8> {
             Ok(0)
         }
     }
+}
+
+fn write_file_atomically(
+    path: &Path,
+    write_contents: impl FnOnce(&mut dyn Write) -> Result<()>,
+) -> Result<()> {
+    let destination_permissions = match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            anyhow::bail!(
+                "refusing to atomically replace symlinked output {}",
+                path.display()
+            )
+        }
+        Ok(metadata) if !metadata.is_file() => {
+            anyhow::bail!("output path is not a regular file: {}", path.display())
+        }
+        Ok(metadata) if metadata.permissions().readonly() => {
+            anyhow::bail!("output file is read-only: {}", path.display())
+        }
+        Ok(metadata) => Some(metadata.permissions()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to inspect output {}", path.display()));
+        }
+    };
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(".depgraph-export-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o666));
+    }
+    let mut temporary = builder.tempfile_in(parent).with_context(|| {
+        format!(
+            "failed to create temporary output beside {}",
+            path.display()
+        )
+    })?;
+    if let Some(permissions) = destination_permissions {
+        temporary
+            .as_file()
+            .set_permissions(permissions)
+            .with_context(|| {
+                format!(
+                    "failed to preserve permissions for temporary output beside {}",
+                    path.display()
+                )
+            })?;
+    }
+    {
+        let mut writer = std::io::BufWriter::new(temporary.as_file_mut());
+        write_contents(&mut writer)?;
+        writer
+            .flush()
+            .with_context(|| format!("failed to write {}", path.display()))?;
+    }
+    temporary
+        .persist(path)
+        .map(|_| ())
+        .map_err(|error| error.error)
+        .with_context(|| format!("failed to replace {}", path.display()))
 }
 
 const BUILD_CONSENT_REQUIRED: &str = "project code execution permission denied: `resolve --build` may execute untrusted build tools, configuration, plugins, build scripts, and proc macros; rerun this invocation with `--allow-project-code` only after reviewing the target repository";
@@ -1889,7 +1952,7 @@ fn print_evidence(evidence: &[depgraph_store::EvidenceRecord], indent: &str) {
 mod tests {
     use super::{
         error_exit_code, inspect_runtime_trace_input, require_build_consent,
-        runtime_trace_metadata_error,
+        runtime_trace_metadata_error, write_file_atomically,
     };
 
     #[test]
@@ -1951,5 +2014,41 @@ mod tests {
         ));
         assert!(denied.to_string().contains("failed to inspect"));
         assert!(!denied.to_string().contains("was not found"));
+    }
+
+    #[test]
+    fn atomic_output_replaces_only_after_the_writer_succeeds() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("graph.graphml");
+        std::fs::write(&output, b"previous graph").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&output, std::fs::Permissions::from_mode(0o640)).unwrap();
+        }
+
+        let error = write_file_atomically(&output, |writer| {
+            writer.write_all(b"partial graph")?;
+            anyhow::bail!("simulated GraphML failure")
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("simulated GraphML failure"));
+        assert_eq!(std::fs::read(&output).unwrap(), b"previous graph");
+
+        write_file_atomically(&output, |writer| {
+            writer.write_all(b"complete graph")?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(std::fs::read(&output).unwrap(), b"complete graph");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&output).unwrap().permissions().mode() & 0o777,
+                0o640
+            );
+        }
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
     }
 }
