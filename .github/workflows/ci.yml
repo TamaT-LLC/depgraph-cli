@@ -60,6 +60,44 @@ jobs:
       - run: pnpm check
       - run: pnpm test
 
+  benchmark:
+    needs: [rust, go, web]
+    runs-on: ubuntu-24.04
+    env:
+      # Product targets remain 30s/2s/500ms on a development machine.
+      # Hosted-runner ceilings include process startup and bounded contention;
+      # the report still records every raw sample and the product target.
+      DEPGRAPH_SCAN_LIMIT_MS: "60000"
+      DEPGRAPH_INCREMENTAL_LIMIT_MS: "60000"
+      DEPGRAPH_QUERY_LIMIT_MS: "3000"
+      DEPGRAPH_BUILD_OBSERVATION_LIMIT_MS: "60000"
+      DEPGRAPH_BENCH_SAMPLES: "3"
+      DEPGRAPH_QUERY_SAMPLES: "5"
+      DEPGRAPH_NOISE_ALLOWANCE_PERCENT: "20"
+      DEPGRAPH_ALLOWED_OUTLIERS: "1"
+      DEPGRAPH_BENCH_REPORT: "dist/benchmark-report.json"
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install 1.93.1 --profile minimal
+      - run: rustup default 1.93.1
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 1.26.1
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.0
+          standalone: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.18.0
+      - run: node --test scripts/tests/benchmark.test.mjs
+      - run: scripts/benchmark-mvp.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-report-${{ github.sha }}
+          path: dist/benchmark-report.json
+          if-no-files-found: error
+
   integration:
     needs: [rust, go, web]
     strategy:
