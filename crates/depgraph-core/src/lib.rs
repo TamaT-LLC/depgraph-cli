@@ -47,7 +47,7 @@ pub use daemon::{
     coalesce_incremental_changes, start_daemon_with_runner, start_repository_daemon,
 };
 pub use depgraph_store::GraphSnapshot;
-pub use export::{ExportFormat, export};
+pub use export::{ExportFormat, export, export_filtered, filter_snapshot};
 pub use impact::{
     ChangedNodeMapping, GitChange, GitChangedSet, ImpactDiagnostic, ImpactFilters, ImpactNode,
     ImpactResult, impact, map_changed_set, read_git_changed_set,
@@ -69,8 +69,9 @@ pub use policy::{
 };
 pub use policy_engine::{evaluate_policy, evaluate_policy_diff};
 pub use query::{
-    CycleLevel, CycleResult, TraversalResult, UnresolvedResult, WhyResult, cycles,
-    render_condition, resolve_selector, traverse, unresolved, why,
+    CycleLevel, CycleResult, GraphQueryFilter, TraversalResult, UnresolvedResult, WhyResult,
+    cycles, render_condition, resolve_selector, traverse, traverse_filtered, unresolved, why,
+    why_filtered,
 };
 pub use runtime_trace::{
     MatchedRuntimeTraceLocator, RUNTIME_TRACE_MAX_BYTES, RUNTIME_TRACE_MAX_EVENTS,
@@ -78,7 +79,7 @@ pub use runtime_trace::{
     RuntimeTraceEvent, RuntimeTraceLocator, RuntimeTraceMatchStatus, RuntimeTraceProfile,
     RuntimeTraceProfileMatch, RuntimeTraceRedaction, RuntimeTraceRepository, RuntimeTraceSession,
     RuntimeTraceSummary, ValidatedRuntimeTrace, ValidatedRuntimeTraceEvent, match_runtime_trace,
-    read_runtime_trace, validate_runtime_trace,
+    read_runtime_trace, runtime_session_delta, validate_runtime_trace,
 };
 pub use rust_build_observer::{
     RUST_BUILD_CAPABILITY, RUST_BUILD_OBSERVATION_SCHEMA, RUST_BUILD_OBSERVER,

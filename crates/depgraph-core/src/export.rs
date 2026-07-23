@@ -1,9 +1,9 @@
 use std::{collections::BTreeMap, fmt::Write};
 
 use anyhow::Result;
-use depgraph_store::GraphSnapshot;
+use depgraph_store::{GraphSnapshot, refresh_profile_matrix_view};
 
-use crate::query::render_condition;
+use crate::query::{GraphQueryFilter, render_condition};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExportFormat {
@@ -18,6 +18,108 @@ pub fn export(snapshot: &GraphSnapshot, format: ExportFormat) -> Result<String> 
         ExportFormat::Dot => Ok(export_dot(snapshot)),
         ExportFormat::Mermaid => Ok(export_mermaid(snapshot)),
     }
+}
+
+pub fn export_filtered(
+    snapshot: &GraphSnapshot,
+    format: ExportFormat,
+    filter: &GraphQueryFilter,
+) -> Result<String> {
+    if filter.is_empty() {
+        return export(snapshot, format);
+    }
+    let filtered = filter_snapshot(snapshot, filter);
+    export(&filtered, format)
+}
+
+pub fn filter_snapshot(snapshot: &GraphSnapshot, filter: &GraphQueryFilter) -> GraphSnapshot {
+    if filter.is_empty() {
+        return snapshot.clone();
+    }
+    let mut filtered = snapshot.clone();
+    filtered
+        .edges
+        .retain(|edge| filter.matches_edge(snapshot, edge));
+    let edge_ids = filtered
+        .edges
+        .iter()
+        .map(|edge| edge.id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let site_ids = filtered
+        .edges
+        .iter()
+        .filter_map(|edge| edge.site_id.as_deref())
+        .collect::<std::collections::BTreeSet<_>>();
+    let node_ids = filtered
+        .edges
+        .iter()
+        .flat_map(|edge| [edge.source.as_str(), edge.target.as_str()])
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut profile_ids = filtered
+        .edges
+        .iter()
+        .map(|edge| edge.profile_id.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    loop {
+        let parents = snapshot
+            .profiles
+            .iter()
+            .filter(|profile| profile_ids.contains(&profile.id))
+            .filter_map(|profile| {
+                profile
+                    .properties
+                    .get("parent_profile_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
+            .collect::<Vec<_>>();
+        let before = profile_ids.len();
+        profile_ids.extend(parents);
+        if profile_ids.len() == before {
+            break;
+        }
+    }
+    filtered
+        .nodes
+        .retain(|node| node_ids.contains(node.id.as_str()));
+    filtered
+        .sites
+        .retain(|site| site_ids.contains(site.id.as_str()));
+    filtered
+        .profiles
+        .retain(|profile| profile_ids.contains(&profile.id));
+    filtered.evidence.retain(|evidence| {
+        ((evidence.owner_type == "edge" && edge_ids.contains(evidence.owner_id.as_str()))
+            || (evidence.owner_type == "site" && site_ids.contains(evidence.owner_id.as_str())))
+            && filter.matches_evidence(evidence)
+    });
+    filtered
+        .diagnostics
+        .retain(|diagnostic| filter.matches_diagnostic(diagnostic));
+    filtered.coverage.profiles = filtered.profiles.len() as u64;
+    filtered.coverage.dependency_sites = filtered.sites.len() as u64;
+    filtered.coverage.resolved = filtered
+        .sites
+        .iter()
+        .filter(|site| site.resolution_status == "resolved")
+        .count() as u64;
+    filtered.coverage.candidates = filtered
+        .sites
+        .iter()
+        .filter(|site| site.resolution_status == "candidates")
+        .count() as u64;
+    filtered.coverage.external = filtered
+        .sites
+        .iter()
+        .filter(|site| site.resolution_status == "external")
+        .count() as u64;
+    filtered.coverage.unresolved = filtered
+        .sites
+        .iter()
+        .filter(|site| site.resolution_status == "unresolved")
+        .count() as u64;
+    refresh_profile_matrix_view(&mut filtered);
+    filtered
 }
 
 fn export_json(snapshot: &GraphSnapshot) -> Result<String> {

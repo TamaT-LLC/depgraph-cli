@@ -5,11 +5,14 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use depgraph_store::{EdgeRecord, GraphSnapshot, NodeRecord};
+use depgraph_store::{EdgeRecord, GraphSnapshot, NodeRecord, runtime_context_for_edge};
 use serde::Serialize;
 
 use crate::{
-    query::{PathStep, path_steps_for_edges, render_condition, resolve_selector},
+    query::{
+        GraphQueryFilter, PathStep, path_steps_for_edges_filtered, render_condition,
+        resolve_selector,
+    },
     worker::resolve_safe_executable,
 };
 
@@ -52,6 +55,12 @@ pub struct ImpactFilters {
     pub depth: Option<usize>,
     pub profiles: Vec<String>,
     pub conditions: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub phases: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub sessions: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub environments: Vec<String>,
     pub max_nodes: usize,
     pub max_edges: usize,
 }
@@ -74,18 +83,59 @@ impl ImpactFilters {
             depth,
             profiles: normalize_filter("profile", profiles)?,
             conditions: normalize_filter("condition", conditions)?,
+            phases: Vec::new(),
+            sessions: Vec::new(),
+            environments: Vec::new(),
             max_nodes,
             max_edges,
         })
     }
 
-    fn matches(&self, edge: &EdgeRecord) -> bool {
-        (self.profiles.is_empty() || self.profiles.binary_search(&edge.profile_id).is_ok())
+    pub fn with_runtime_filters(
+        mut self,
+        phases: Vec<String>,
+        sessions: Vec<String>,
+        environments: Vec<String>,
+    ) -> Result<Self> {
+        self.phases = normalize_filter("phase", phases)?;
+        self.sessions = normalize_filter("session", sessions)?;
+        self.environments = normalize_filter("environment", environments)?;
+        Ok(self)
+    }
+
+    fn matches(&self, snapshot: &GraphSnapshot, edge: &EdgeRecord) -> bool {
+        let structural = (self.profiles.is_empty()
+            || self.profiles.binary_search(&edge.profile_id).is_ok())
             && (self.conditions.is_empty()
                 || self
                     .conditions
                     .binary_search(&render_condition(&edge.condition))
                     .is_ok())
+            && (self.phases.is_empty() || self.phases.binary_search(&edge.phase).is_ok());
+        if !structural {
+            return false;
+        }
+        if self.sessions.is_empty() && self.environments.is_empty() {
+            return true;
+        }
+        if edge.phase != "runtime" {
+            return false;
+        }
+        let context = runtime_context_for_edge(snapshot, edge);
+        let session_matches = self.sessions.is_empty()
+            || context
+                .session_ids
+                .iter()
+                .chain(context.source_session_ids.iter())
+                .any(|value| self.sessions.binary_search(value).is_ok());
+        let environment_matches = self.environments.is_empty()
+            || context
+                .environment_names
+                .iter()
+                .chain(context.runtimes.iter())
+                .chain(context.regions.iter())
+                .any(|value| self.environments.binary_search(value).is_ok());
+        session_matches && environment_matches
     }
 }
 
@@ -668,6 +718,12 @@ pub fn impact(
     let mut budget = TraversalBudget::new(&root.id);
     let forward = adjacency(snapshot, false, &filters);
     let reverse = adjacency(snapshot, true, &filters);
+    let evidence_filter = GraphQueryFilter {
+        phases: filters.phases.clone(),
+        profiles: filters.profiles.clone(),
+        sessions: filters.sessions.clone(),
+        environments: filters.environments.clone(),
+    };
 
     let root_path = if changed_ids.contains(&root.id) {
         Some(Vec::new())
@@ -699,7 +755,7 @@ pub fn impact(
                 node,
                 depth,
                 changed_node_id: changed_node_id.clone(),
-                dependency_path: path_steps_for_edges(snapshot, &path),
+                dependency_path: path_steps_for_edges_filtered(snapshot, &path, &evidence_filter),
             });
         }
         impacts.sort_by(|left, right| left.node.id.cmp(&right.node.id));
@@ -750,7 +806,11 @@ fn adjacency<'a>(
     filters: &ImpactFilters,
 ) -> BTreeMap<String, Vec<&'a EdgeRecord>> {
     let mut adjacency = BTreeMap::<String, Vec<&EdgeRecord>>::new();
-    for edge in snapshot.edges.iter().filter(|edge| filters.matches(edge)) {
+    for edge in snapshot
+        .edges
+        .iter()
+        .filter(|edge| filters.matches(snapshot, edge))
+    {
         let key = if reverse { &edge.target } else { &edge.source };
         adjacency.entry(key.clone()).or_default().push(edge);
     }
@@ -1145,6 +1205,93 @@ mod tests {
                 .map(|impact| impact.node.id.as_str())
                 .collect::<Vec<_>>(),
             ["file"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_environment_filter_excludes_static_edges_with_the_same_label() -> Result<()> {
+        let mut graph = graph();
+        let filters = ImpactFilters::new(None, Vec::new(), Vec::new(), 20, 20)?
+            .with_runtime_filters(Vec::new(), Vec::new(), vec!["server".to_owned()])?;
+        assert!(
+            graph
+                .edges
+                .iter()
+                .all(|edge| !filters.matches(&graph, edge))
+        );
+
+        graph.edges[0].phase = "runtime".to_owned();
+        graph.evidence.push(EvidenceRecord {
+            owner_type: "edge".to_owned(),
+            owner_id: graph.edges[0].id.clone(),
+            ordinal: graph.evidence.len() as i64,
+            kind: "runtime".to_owned(),
+            extractor: "runtime-trace".to_owned(),
+            extractor_version: "1.0".to_owned(),
+            path: String::new(),
+            start_line: 1,
+            start_column: 1,
+            end_line: 1,
+            end_column: 1,
+            detail: None,
+            properties: json!({
+                "session_id":"runtime-session",
+                "source_session_id":"collector-session",
+                "environment":{"name":"server"}
+            }),
+        });
+        assert!(filters.matches(&graph, &graph.edges[0]));
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_impact_path_evidence_respects_the_session_filter() -> Result<()> {
+        let mut graph = graph();
+        let edge = graph
+            .edges
+            .iter_mut()
+            .find(|edge| edge.id == "e-symbol-file")
+            .context("fixture edge")?;
+        edge.phase = "runtime".to_owned();
+        for (ordinal, session) in ["session-a", "session-b"].into_iter().enumerate() {
+            graph.evidence.push(EvidenceRecord {
+                owner_type: "edge".to_owned(),
+                owner_id: edge.id.clone(),
+                ordinal: graph.evidence.len() as i64 + ordinal as i64,
+                kind: "runtime".to_owned(),
+                extractor: "runtime-trace".to_owned(),
+                extractor_version: "1.0".to_owned(),
+                path: String::new(),
+                start_line: 1,
+                start_column: 1,
+                end_line: 1,
+                end_column: 1,
+                detail: None,
+                properties: json!({
+                    "session_id":format!("runtime-{session}"),
+                    "source_session_id":session,
+                    "environment":{"name":"server"}
+                }),
+            });
+        }
+        let filters = ImpactFilters::new(None, Vec::new(), Vec::new(), 20, 20)?
+            .with_runtime_filters(
+                vec!["runtime".to_owned()],
+                vec!["session-a".to_owned()],
+                vec!["server".to_owned()],
+            )?;
+        let result = impact(&graph, "id:file", None, filters)?;
+        let symbol = result
+            .impacts
+            .iter()
+            .find(|impact| impact.node.id == "symbol")
+            .context("runtime impact")?;
+        assert_eq!(symbol.dependency_path.len(), 1);
+        assert_eq!(symbol.dependency_path[0].evidence.len(), 1);
+        assert_eq!(
+            symbol.dependency_path[0].evidence[0].properties["source_session_id"],
+            json!("session-a")
         );
         Ok(())
     }

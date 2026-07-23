@@ -17,6 +17,7 @@ mod cache;
 mod diff;
 mod incremental;
 mod profile_matrix;
+mod runtime;
 
 pub use cache::{
     CACHE_CONTRACT_VERSION, CacheEntryCounts, CacheEventRecord, CacheKey, CacheLayer,
@@ -33,9 +34,14 @@ pub use profile_matrix::{
     ProfileCorrelationRecord, ProfileMatrixEntryRecord, ProfileMatrixRecord,
     canonical_effective_input_id, correlation_for_edge, correlation_for_site,
     declared_effective_input_id, declared_parent_profile_id, phase_coverage_for_effective_profile,
+    refresh_profile_matrix_view,
+};
+pub use runtime::{
+    RuntimeEdgeContext, RuntimeImportResult, RuntimeSessionDelta, RuntimeSessionRecord,
+    runtime_context_for_edge,
 };
 
-const SCHEMA_VERSION: i64 = 10;
+const SCHEMA_VERSION: i64 = 11;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ScanRecord {
@@ -62,6 +68,10 @@ pub struct CompletedSnapshotRecord {
     pub source_attempt_id: String,
     pub scan_id: String,
     pub build_attempt_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_import_id: Option<String>,
+    #[serde(default)]
+    pub runtime_session_ids: Vec<String>,
     pub parent_snapshot_id: Option<String>,
     pub source_revision: Option<String>,
     pub profile_ids: Vec<String>,
@@ -603,24 +613,38 @@ impl Store {
                  ALTER TABLE build_attempts ADD COLUMN base_snapshot_id TEXT;
                  CREATE TABLE completed_snapshots (
                     id TEXT PRIMARY KEY,
-                    source_kind TEXT NOT NULL CHECK (source_kind IN ('scan', 'build')),
+                    source_kind TEXT NOT NULL
+                        CHECK (source_kind IN ('scan', 'build', 'runtime')),
                     source_attempt_id TEXT NOT NULL,
                     scan_id TEXT NOT NULL REFERENCES scans(id),
                     build_attempt_id TEXT REFERENCES build_attempts(id),
+                    runtime_import_id TEXT,
+                    runtime_session_set_json TEXT NOT NULL DEFAULT '[]',
                     parent_snapshot_id TEXT REFERENCES completed_snapshots(id),
                     source_revision TEXT,
                     profile_set_json TEXT NOT NULL,
                     status TEXT NOT NULL CHECK (status = 'completed'),
                     created_at TEXT NOT NULL,
-                    CHECK ((source_kind = 'scan' AND build_attempt_id IS NULL)
-                        OR (source_kind = 'build' AND build_attempt_id IS NOT NULL))
+                    CHECK (
+                        (source_kind = 'scan'
+                            AND build_attempt_id IS NULL
+                            AND runtime_import_id IS NULL
+                            AND runtime_session_set_json = '[]')
+                        OR (source_kind = 'build'
+                            AND build_attempt_id IS NOT NULL
+                            AND runtime_import_id IS NULL)
+                        OR (source_kind = 'runtime'
+                            AND runtime_import_id IS NOT NULL
+                            AND runtime_session_set_json != '[]')
+                    )
                  );
                  CREATE INDEX completed_snapshots_scan_created
                     ON completed_snapshots(scan_id, created_at, id);
                  CREATE INDEX completed_snapshots_parent
                     ON completed_snapshots(parent_snapshot_id, id);
                  CREATE TABLE snapshot_sources (
-                    source_kind TEXT NOT NULL CHECK (source_kind IN ('scan', 'build')),
+                    source_kind TEXT NOT NULL
+                        CHECK (source_kind IN ('scan', 'build', 'runtime')),
                     source_attempt_id TEXT NOT NULL,
                     snapshot_id TEXT NOT NULL REFERENCES completed_snapshots(id) ON DELETE CASCADE,
                     promoted_at TEXT NOT NULL,
@@ -709,6 +733,176 @@ impl Store {
                  PRAGMA user_version = 10;",
             )?;
             tx.commit()?;
+        }
+        if current < 11 {
+            self.connection
+                .execute_batch("PRAGMA foreign_keys = OFF;")?;
+            let migration = (|| -> Result<()> {
+                let tx = self.connection.transaction()?;
+                tx.execute_batch(
+                    "CREATE TABLE completed_snapshots_v11 (
+                        id TEXT PRIMARY KEY,
+                        source_kind TEXT NOT NULL
+                            CHECK (source_kind IN ('scan', 'build', 'runtime')),
+                        source_attempt_id TEXT NOT NULL,
+                        scan_id TEXT NOT NULL REFERENCES scans(id),
+                        build_attempt_id TEXT REFERENCES build_attempts(id),
+                        runtime_import_id TEXT,
+                        runtime_session_set_json TEXT NOT NULL DEFAULT '[]',
+                        parent_snapshot_id TEXT REFERENCES completed_snapshots_v11(id),
+                        source_revision TEXT,
+                        profile_set_json TEXT NOT NULL,
+                        status TEXT NOT NULL CHECK (status = 'completed'),
+                        created_at TEXT NOT NULL,
+                        CHECK (
+                            (source_kind = 'scan'
+                                AND build_attempt_id IS NULL
+                                AND runtime_import_id IS NULL
+                                AND runtime_session_set_json = '[]')
+                            OR (source_kind = 'build'
+                                AND build_attempt_id IS NOT NULL
+                                AND runtime_import_id IS NULL)
+                            OR (source_kind = 'runtime'
+                                AND runtime_import_id IS NOT NULL
+                                AND runtime_session_set_json != '[]')
+                        )
+                     );
+                     INSERT INTO completed_snapshots_v11(
+                        id, source_kind, source_attempt_id, scan_id, build_attempt_id,
+                        runtime_import_id, runtime_session_set_json, parent_snapshot_id,
+                        source_revision, profile_set_json, status, created_at
+                     )
+                     SELECT id, source_kind, source_attempt_id, scan_id, build_attempt_id,
+                            NULL, '[]', parent_snapshot_id, source_revision,
+                            profile_set_json, status, created_at
+                       FROM completed_snapshots;
+                     DROP TABLE completed_snapshots;
+                     ALTER TABLE completed_snapshots_v11 RENAME TO completed_snapshots;
+                     CREATE INDEX completed_snapshots_scan_created
+                        ON completed_snapshots(scan_id, created_at, id);
+                     CREATE INDEX completed_snapshots_parent
+                        ON completed_snapshots(parent_snapshot_id, id);
+
+                     CREATE TABLE snapshot_sources_v11 (
+                        source_kind TEXT NOT NULL
+                            CHECK (source_kind IN ('scan', 'build', 'runtime')),
+                        source_attempt_id TEXT NOT NULL,
+                        snapshot_id TEXT NOT NULL
+                            REFERENCES completed_snapshots(id) ON DELETE CASCADE,
+                        promoted_at TEXT NOT NULL,
+                        PRIMARY KEY (source_kind, source_attempt_id)
+                     );
+                     INSERT INTO snapshot_sources_v11
+                        SELECT source_kind, source_attempt_id, snapshot_id, promoted_at
+                          FROM snapshot_sources;
+                     DROP TABLE snapshot_sources;
+                     ALTER TABLE snapshot_sources_v11 RENAME TO snapshot_sources;
+                     CREATE INDEX snapshot_sources_snapshot
+                        ON snapshot_sources(snapshot_id, source_kind, source_attempt_id);
+
+                     CREATE TABLE IF NOT EXISTS runtime_sessions (
+                        id TEXT PRIMARY KEY,
+                        base_snapshot_id TEXT NOT NULL REFERENCES completed_snapshots(id),
+                        source_session_id TEXT NOT NULL,
+                        schema_version TEXT NOT NULL,
+                        status TEXT NOT NULL CHECK (status IN ('completed', 'partial')),
+                        trace_digest TEXT NOT NULL,
+                        profile_id TEXT NOT NULL,
+                        parent_profile_id TEXT,
+                        profile_status TEXT NOT NULL,
+                        profile_reason TEXT,
+                        profile_json TEXT NOT NULL,
+                        environment_json TEXT NOT NULL,
+                        redaction_json TEXT NOT NULL,
+                        started_at TEXT NOT NULL,
+                        ended_at TEXT,
+                        first_observed_at TEXT NOT NULL,
+                        last_observed_at TEXT NOT NULL,
+                        event_count INTEGER NOT NULL,
+                        observation_count INTEGER NOT NULL,
+                        resolved_targets INTEGER NOT NULL,
+                        external_targets INTEGER NOT NULL,
+                        unresolved_targets INTEGER NOT NULL,
+                        redacted_values INTEGER NOT NULL,
+                        coverage_json TEXT NOT NULL,
+                        created_at TEXT NOT NULL
+                     );
+                     CREATE INDEX IF NOT EXISTS runtime_sessions_base_created
+                        ON runtime_sessions(base_snapshot_id, created_at, id);
+                     CREATE INDEX IF NOT EXISTS runtime_sessions_profile
+                        ON runtime_sessions(profile_id, id);
+
+                     CREATE TABLE IF NOT EXISTS runtime_nodes (
+                        session_id TEXT NOT NULL
+                            REFERENCES runtime_sessions(id) ON DELETE CASCADE,
+                        id TEXT NOT NULL,
+                        raw_json TEXT NOT NULL,
+                        PRIMARY KEY (session_id, id)
+                     );
+                     CREATE TABLE IF NOT EXISTS runtime_sites (
+                        session_id TEXT NOT NULL
+                            REFERENCES runtime_sessions(id) ON DELETE CASCADE,
+                        id TEXT NOT NULL,
+                        raw_json TEXT NOT NULL,
+                        PRIMARY KEY (session_id, id)
+                     );
+                     CREATE TABLE IF NOT EXISTS runtime_edges (
+                        session_id TEXT NOT NULL
+                            REFERENCES runtime_sessions(id) ON DELETE CASCADE,
+                        id TEXT NOT NULL,
+                        raw_json TEXT NOT NULL,
+                        PRIMARY KEY (session_id, id)
+                     );
+                     CREATE INDEX IF NOT EXISTS runtime_edges_session_source
+                        ON runtime_edges(session_id, id);
+                     CREATE TABLE IF NOT EXISTS runtime_evidence (
+                        session_id TEXT NOT NULL
+                            REFERENCES runtime_sessions(id) ON DELETE CASCADE,
+                        owner_type TEXT NOT NULL,
+                        owner_id TEXT NOT NULL,
+                        ordinal INTEGER NOT NULL,
+                        raw_json TEXT NOT NULL,
+                        PRIMARY KEY (session_id, owner_type, owner_id, ordinal)
+                     );
+                     CREATE INDEX IF NOT EXISTS runtime_evidence_owner
+                        ON runtime_evidence(owner_type, owner_id, session_id, ordinal);
+                     CREATE TABLE IF NOT EXISTS runtime_diagnostics (
+                        session_id TEXT NOT NULL
+                            REFERENCES runtime_sessions(id) ON DELETE CASCADE,
+                        ordinal INTEGER NOT NULL,
+                        id TEXT NOT NULL,
+                        raw_json TEXT NOT NULL,
+                        PRIMARY KEY (session_id, ordinal),
+                        UNIQUE (session_id, id)
+                     );
+
+                     CREATE TABLE IF NOT EXISTS runtime_imports (
+                        id TEXT PRIMARY KEY,
+                        parent_snapshot_id TEXT NOT NULL REFERENCES completed_snapshots(id),
+                        session_id TEXT NOT NULL REFERENCES runtime_sessions(id),
+                        status TEXT NOT NULL CHECK (status IN ('staging', 'completed', 'failed')),
+                        result_snapshot_id TEXT REFERENCES completed_snapshots(id),
+                        created_at TEXT NOT NULL,
+                        completed_at TEXT,
+                        error TEXT
+                     );
+                     CREATE INDEX IF NOT EXISTS runtime_imports_parent_created
+                        ON runtime_imports(parent_snapshot_id, created_at, id);
+                     PRAGMA user_version = 11;",
+                )?;
+                tx.commit()?;
+                Ok(())
+            })();
+            self.connection.execute_batch("PRAGMA foreign_keys = ON;")?;
+            migration?;
+            let violations = self.connection.query_row(
+                "SELECT COUNT(*) FROM pragma_foreign_key_check",
+                [],
+                |row| row.get::<_, u64>(0),
+            )?;
+            if violations != 0 {
+                bail!("store schema 11 migration left {violations} foreign key violations");
+            }
         }
         Ok(())
     }
@@ -982,17 +1176,41 @@ impl Store {
             params![attempt_id, status, completed_at, error],
         )?;
         let completed_snapshot_id = if status == "completed" {
-            let parent_snapshot_id = base_snapshot_id.with_context(|| {
+            let attempt_base_snapshot_id = base_snapshot_id.with_context(|| {
                 format!("build attempt {attempt_id} has no base completed snapshot")
             })?;
-            let source_revision = tx
+            let latest_snapshot_id = tx
                 .query_row(
-                    "SELECT source_revision FROM completed_snapshots WHERE id=?1",
-                    [&parent_snapshot_id],
-                    |row| row.get::<_, Option<String>>(0),
+                    "SELECT id FROM completed_snapshots
+                      WHERE scan_id=?1 AND status='completed'
+                      ORDER BY julianday(created_at) DESC, rowid DESC LIMIT 1",
+                    [&base_scan_id],
+                    |row| row.get::<_, String>(0),
                 )
                 .optional()?
-                .flatten();
+                .with_context(|| format!("base scan {base_scan_id} has no completed snapshot"))?;
+            let latest_snapshot = load_completed_snapshot_record(&tx, &latest_snapshot_id)?
+                .context("latest completed snapshot metadata was not found")?;
+            let preserve_runtime = !latest_snapshot.runtime_session_ids.is_empty();
+            let parent_snapshot_id = if preserve_runtime {
+                latest_snapshot.id.as_str()
+            } else {
+                attempt_base_snapshot_id.as_str()
+            };
+            let source_revision = if preserve_runtime {
+                latest_snapshot.source_revision.clone()
+            } else {
+                tx.query_row(
+                    "SELECT source_revision FROM completed_snapshots WHERE id=?1",
+                    [parent_snapshot_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )?
+            };
+            let runtime_session_ids = if preserve_runtime {
+                latest_snapshot.runtime_session_ids.as_slice()
+            } else {
+                &[]
+            };
             Some(create_completed_snapshot(
                 &tx,
                 SnapshotSource {
@@ -1000,7 +1218,9 @@ impl Store {
                     source_attempt_id: attempt_id,
                     scan_id: &base_scan_id,
                     build_attempt_id: Some(attempt_id),
-                    parent_snapshot_id: Some(&parent_snapshot_id),
+                    runtime_import_id: None,
+                    runtime_session_ids,
+                    parent_snapshot_id: Some(parent_snapshot_id),
                     source_revision: source_revision.as_deref(),
                     created_at: &completed_at,
                 },
@@ -1083,7 +1303,7 @@ impl Store {
         source_kind: &str,
         source_attempt_id: &str,
     ) -> Result<Option<String>> {
-        if !matches!(source_kind, "scan" | "build") {
+        if !matches!(source_kind, "scan" | "build" | "runtime") {
             bail!("invalid snapshot source kind {source_kind}");
         }
         self.connection
@@ -1098,12 +1318,16 @@ impl Store {
     }
 
     pub fn snapshot_id_for_scan_selection(&self, scan_id: &str) -> Result<Option<String>> {
-        if let Some(build_attempt_id) = self.current_build_attempt_id(scan_id)?
-            && let Some(snapshot_id) = self.snapshot_id_for_source("build", &build_attempt_id)?
-        {
-            return Ok(Some(snapshot_id));
-        }
-        self.snapshot_id_for_source("scan", scan_id)
+        self.connection
+            .query_row(
+                "SELECT id FROM completed_snapshots
+                  WHERE scan_id=?1 AND status='completed'
+                  ORDER BY julianday(created_at) DESC, rowid DESC LIMIT 1",
+                [scan_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("failed to resolve completed snapshot for scan")
     }
 
     pub fn completed_snapshot(&self, snapshot_id: &str) -> Result<Option<CompletedSnapshotRecord>> {
@@ -1245,6 +1469,7 @@ impl Store {
             &self.connection,
             &record.scan_id,
             record.build_attempt_id.as_deref(),
+            &record.runtime_session_ids,
             record.parent_snapshot_id.as_deref(),
             record.source_revision.as_deref(),
         )?;
@@ -1849,6 +2074,8 @@ impl Store {
                     source_attempt_id: scan_id,
                     scan_id,
                     build_attempt_id: None,
+                    runtime_import_id: None,
+                    runtime_session_ids: &[],
                     parent_snapshot_id: parent_snapshot_id.as_deref(),
                     source_revision: source_revision.as_deref(),
                     created_at: &completed_at,
@@ -1924,6 +2151,13 @@ impl Store {
         if self.completed_snapshot(scan_id)?.is_some() {
             return self.load_completed_snapshot(scan_id);
         }
+        if self
+            .scan(scan_id)?
+            .is_some_and(|scan| scan.status == "completed")
+            && let Some(snapshot_id) = self.snapshot_id_for_scan_selection(scan_id)?
+        {
+            return self.load_completed_snapshot(&snapshot_id);
+        }
         let mut snapshot = self.load_base_snapshot(scan_id)?;
         let Some(attempt_id) = self.current_build_attempt_id(scan_id)? else {
             return Ok(snapshot);
@@ -1957,6 +2191,7 @@ impl Store {
             &self.connection,
             scan_id,
             None,
+            &[],
             scan.parent_snapshot_id.as_deref(),
             scan.source_revision.as_deref(),
         )?;
@@ -1984,6 +2219,13 @@ impl Store {
                 })?;
             let delta: BuildGraphDelta = serde_json::from_str(&raw)?;
             merge_build_delta(&mut snapshot, delta, attempt_id)?;
+        }
+        if !record.runtime_session_ids.is_empty() {
+            runtime::merge_runtime_sessions(
+                &self.connection,
+                &mut snapshot,
+                &record.runtime_session_ids,
+            )?;
         }
         Ok(snapshot)
     }
@@ -2045,6 +2287,8 @@ struct SnapshotSource<'a> {
     source_attempt_id: &'a str,
     scan_id: &'a str,
     build_attempt_id: Option<&'a str>,
+    runtime_import_id: Option<&'a str>,
+    runtime_session_ids: &'a [String],
     parent_snapshot_id: Option<&'a str>,
     source_revision: Option<&'a str>,
     created_at: &'a str,
@@ -2057,11 +2301,21 @@ fn load_completed_snapshot_record(
     connection
         .query_row(
             "SELECT id, source_kind, source_attempt_id, scan_id, build_attempt_id,
-                    parent_snapshot_id, source_revision, profile_set_json, status, created_at
+                    runtime_import_id, runtime_session_set_json, parent_snapshot_id,
+                    source_revision, profile_set_json, status, created_at
                FROM completed_snapshots WHERE id=?1",
             [snapshot_id],
             |row| {
-                let raw_profiles = row.get::<_, String>(7)?;
+                let raw_runtime_sessions = row.get::<_, String>(6)?;
+                let runtime_session_ids =
+                    serde_json::from_str(&raw_runtime_sessions).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            raw_runtime_sessions.len(),
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?;
+                let raw_profiles = row.get::<_, String>(9)?;
                 let profile_ids = serde_json::from_str(&raw_profiles).map_err(|error| {
                     rusqlite::Error::FromSqlConversionFailure(
                         raw_profiles.len(),
@@ -2075,11 +2329,13 @@ fn load_completed_snapshot_record(
                     source_attempt_id: row.get(2)?,
                     scan_id: row.get(3)?,
                     build_attempt_id: row.get(4)?,
-                    parent_snapshot_id: row.get(5)?,
-                    source_revision: row.get(6)?,
+                    runtime_import_id: row.get(5)?,
+                    runtime_session_ids,
+                    parent_snapshot_id: row.get(7)?,
+                    source_revision: row.get(8)?,
                     profile_ids,
-                    status: row.get(8)?,
-                    created_at: row.get(9)?,
+                    status: row.get(10)?,
+                    created_at: row.get(11)?,
                 })
             },
         )
@@ -2159,6 +2415,7 @@ fn completed_snapshot_identity(
     connection: &Connection,
     scan_id: &str,
     build_attempt_id: Option<&str>,
+    runtime_session_ids: &[String],
     parent_snapshot_id: Option<&str>,
     source_revision: Option<&str>,
 ) -> Result<(String, Vec<String>)> {
@@ -2176,6 +2433,9 @@ fn completed_snapshot_identity(
             .with_context(|| format!("completed build attempt {attempt_id} has no graph delta"))?;
         merge_build_delta(&mut snapshot, serde_json::from_str(&raw)?, attempt_id)?;
     }
+    if !runtime_session_ids.is_empty() {
+        runtime::merge_runtime_sessions(connection, &mut snapshot, runtime_session_ids)?;
+    }
     let mut profile_ids = snapshot
         .profiles
         .iter()
@@ -2183,7 +2443,7 @@ fn completed_snapshot_identity(
         .collect::<Vec<_>>();
     profile_ids.sort();
     profile_ids.dedup();
-    let identity = json!({
+    let mut identity = json!({
         "schema": "completed-snapshot-v1",
         "parent_snapshot_id": parent_snapshot_id,
         "source_revision": source_revision,
@@ -2199,6 +2459,10 @@ fn completed_snapshot_identity(
             "coverage": snapshot.coverage,
         },
     });
+    if !runtime_session_ids.is_empty() {
+        identity["schema"] = json!("completed-snapshot-v2");
+        identity["runtime_session_ids"] = json!(runtime_session_ids);
+    }
     Ok((stable_id_from_value("snapshot", &identity), profile_ids))
 }
 
@@ -2210,15 +2474,18 @@ fn create_completed_snapshot(
         connection,
         source.scan_id,
         source.build_attempt_id,
+        source.runtime_session_ids,
         source.parent_snapshot_id,
         source.source_revision,
     )?;
     let profile_set_json = serde_json::to_string(&profile_ids)?;
+    let runtime_session_set_json = serde_json::to_string(source.runtime_session_ids)?;
     connection.execute(
         "INSERT INTO completed_snapshots(
             id, source_kind, source_attempt_id, scan_id, build_attempt_id,
-            parent_snapshot_id, source_revision, profile_set_json, status, created_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'completed', ?9)
+            runtime_import_id, runtime_session_set_json, parent_snapshot_id,
+            source_revision, profile_set_json, status, created_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'completed', ?11)
          ON CONFLICT(id) DO NOTHING",
         params![
             snapshot_id,
@@ -2226,6 +2493,8 @@ fn create_completed_snapshot(
             source.source_attempt_id,
             source.scan_id,
             source.build_attempt_id,
+            source.runtime_import_id,
+            runtime_session_set_json,
             source.parent_snapshot_id,
             source.source_revision,
             profile_set_json,
@@ -2237,6 +2506,8 @@ fn create_completed_snapshot(
     if stored.parent_snapshot_id.as_deref() != source.parent_snapshot_id
         || stored.source_revision.as_deref() != source.source_revision
         || stored.profile_ids != profile_ids
+        || stored.runtime_import_id.as_deref() != source.runtime_import_id
+        || stored.runtime_session_ids != source.runtime_session_ids
         || stored.status != "completed"
     {
         bail!("completed snapshot identity collision for {snapshot_id}");
@@ -2308,6 +2579,8 @@ fn backfill_completed_snapshots(connection: &Connection) -> Result<()> {
                 source_attempt_id: &scan_id,
                 scan_id: &scan_id,
                 build_attempt_id: None,
+                runtime_import_id: None,
+                runtime_session_ids: &[],
                 parent_snapshot_id: parent_snapshot_id.as_deref(),
                 source_revision: source_revision.as_deref(),
                 created_at: &created_at,
@@ -2357,6 +2630,8 @@ fn backfill_completed_snapshots(connection: &Connection) -> Result<()> {
                 source_attempt_id: &attempt_id,
                 scan_id: &scan_id,
                 build_attempt_id: Some(&attempt_id),
+                runtime_import_id: None,
+                runtime_session_ids: &[],
                 parent_snapshot_id: Some(&base_snapshot_id),
                 source_revision: source_revision.as_deref(),
                 created_at: &created_at,
@@ -4530,7 +4805,7 @@ mod tests {
         drop(connection);
 
         let store = Store::open(&path)?;
-        assert_eq!(store.schema_version()?, 10);
+        assert_eq!(store.schema_version()?, 11);
         let site_not_null: i64 = store.connection.query_row(
             "SELECT [notnull] FROM pragma_table_info('edges') WHERE name='site_id'",
             [],
@@ -4647,7 +4922,7 @@ mod tests {
         expected.scan.source_revision = None;
 
         let store = Store::open(&path)?;
-        assert_eq!(store.schema_version()?, 10);
+        assert_eq!(store.schema_version()?, 11);
         let current_id = store
             .current_snapshot_id()?
             .context("migrated current snapshot")?;
@@ -4687,7 +4962,7 @@ mod tests {
         drop(connection);
 
         let mut store = Store::open(&path)?;
-        assert_eq!(store.schema_version()?, 10);
+        assert_eq!(store.schema_version()?, 11);
         assert_eq!(
             store.current_snapshot_id()?.as_deref(),
             Some(snapshot_id.as_str())
