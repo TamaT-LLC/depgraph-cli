@@ -1144,6 +1144,20 @@ rule / property、重複ID、unbounded suppressionはfail closedなconfig error
 （exit `2`）であり、JSON SchemaとRust validatorの両方で同じgolden
 fixtureを検証する。
 
+Issue #81ではcontract v1をvalidated staging graphへ接続した。selectorの
+scope / exclude / cardinalityを先に確定し、profile、canonical condition、
+precision、resolution status、必要evidenceを満たすedgeだけでrule固有の
+subgraphを構築する。`layer_boundary` / `forbidden_dependency`はdirect
+edge、`cycle`はprofileごとに既存package / file / symbol / route cycle
+query、`dependency_depth`はcanonical shortest dependency path、
+`fan_in` / `fan_out`はdistinct endpoint数を評価する。threshold超過の
+witness、path、全edgeの1-origin evidence span、suppressionはcanonical
+orderでdeduplicateされ、同一graph/configから同じviolation IDとexit codeを
+返す。unsuppressed errorはattemptを`policy_failed`・exit `1`として
+non-promotedで完了し、warning / suppressed-only resultはpolicy payloadを
+保持したままsnapshotを昇格する。policy resultの`snapshot_id`にはmutationを
+伴わず算出したprospective content-addressed snapshot identityを使用する。
+
 ## 18. Testing Strategy
 
 ### 18.1 Golden Fixture

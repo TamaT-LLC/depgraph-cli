@@ -3022,6 +3022,66 @@ fn nonzero_worker_exit_is_exit_three_and_keeps_its_valid_prefix() {
 
 #[cfg(unix)]
 #[test]
+fn architecture_policy_violation_is_reported_end_to_end() {
+    let root = fixture_root();
+    fs::write(
+        root.path().join(".depgraph.toml"),
+        r#"
+schema_version = 1
+
+[policy]
+schema_version = "1.0"
+
+[[policy.rules]]
+id = "no-root-to-shared"
+kind = "forbidden_dependency"
+severity = "error"
+source = { kind = "file", field = "path", match = "exact", value = "go.mod", cardinality = "one", exclude = [], scope = { paths = [], packages = [] } }
+target = { kind = "file", field = "path", match = "glob", value = "src/**", cardinality = "many", exclude = [], scope = { paths = [], packages = [] } }
+profiles = { include = [{ match = "exact", value = "go:test" }], exclude = [] }
+condition = { op = "all", conditions = [] }
+precisions = ["exact"]
+resolution_statuses = ["resolved"]
+evidence = { kinds = ["source"], minimum_spans = 1, primary_only = true }
+"#,
+    )
+    .unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let store = temp.path().join("graph.db");
+    let worker = temp.path().join("graph.sh");
+    write_worker(&worker, &graph_worker(false));
+
+    let output = scan_with_worker(root.path(), &store, &worker, false);
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["status"], "policy_failed");
+    assert_eq!(report["exit_code"], 1);
+    assert_eq!(report["policy"]["summary"]["errors"], 2);
+    assert_eq!(
+        report["policy"]["violations"][0]["rule_id"],
+        "no-root-to-shared"
+    );
+    assert_eq!(
+        report["policy"]["violations"][0]["dependency_path"][0]["source_id"],
+        "file:source"
+    );
+    assert_eq!(
+        report["policy"]["violations"][0]["evidence"][0]["path"],
+        "go.mod"
+    );
+    let store = depgraph_store::Store::open(&store).unwrap();
+    assert!(store.current_snapshot_id().unwrap().is_none());
+}
+
+#[cfg(unix)]
+#[test]
 fn ambiguous_bare_selector_lists_candidates_and_explicit_selector_works() {
     let root = fixture_root();
     let temp = tempfile::tempdir().unwrap();

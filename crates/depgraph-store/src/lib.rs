@@ -1925,6 +1925,23 @@ impl Store {
         Ok(snapshot)
     }
 
+    /// Compute the content-addressed identity a validated scan graph would
+    /// receive if it were promoted, without creating a completed snapshot or
+    /// changing the current pointer.
+    pub fn prospective_scan_snapshot_id(&self, scan_id: &str) -> Result<String> {
+        let scan = self
+            .scan(scan_id)?
+            .with_context(|| format!("scan {scan_id} was not found"))?;
+        let (snapshot_id, _) = completed_snapshot_identity(
+            &self.connection,
+            scan_id,
+            None,
+            scan.parent_snapshot_id.as_deref(),
+            scan.source_revision.as_deref(),
+        )?;
+        Ok(snapshot_id)
+    }
+
     pub fn load_completed_snapshot(&self, snapshot_id: &str) -> Result<GraphSnapshot> {
         let record = self
             .completed_snapshot(snapshot_id)?
@@ -3963,6 +3980,24 @@ mod tests {
         assert_eq!(first_id, second_id);
         assert!(first_id.starts_with("snapshot:sha256:"));
         assert!(second.verify_snapshot_integrity(&second_id)?.valid);
+        Ok(())
+    }
+
+    #[test]
+    fn prospective_scan_identity_matches_later_promotion() -> Result<()> {
+        let fixture =
+            include_str!("../../depgraph-protocol/tests/fixtures/protocol-v1.golden.ndjson");
+        let mut store = Store::open_in_memory()?;
+        let scan_id = stage_protocol_fixture(&mut store, fixture, Some("fixture-revision"))?;
+        store.validate_scan(&scan_id)?;
+
+        let prospective = store.prospective_scan_snapshot_id(&scan_id)?;
+        store.finish_scan(&scan_id, "completed", None, true)?;
+
+        assert_eq!(
+            store.snapshot_id_for_source("scan", &scan_id)?.as_deref(),
+            Some(prospective.as_str())
+        );
         Ok(())
     }
 
