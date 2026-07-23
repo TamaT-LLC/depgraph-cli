@@ -37,6 +37,15 @@ pub fn evaluate_policy(
     let mut violations = BTreeMap::new();
 
     for rule in &config.rules {
+        // These rule kinds use specialized evaluation contexts outside this static
+        // architecture pass. Their dedicated evaluators compose with this pass, so
+        // do not let them discard otherwise valid static architecture violations.
+        if matches!(
+            rule.kind,
+            PolicyRuleKind::PublicApiChange | PolicyRuleKind::RuntimeBoundary
+        ) {
+            continue;
+        }
         let sources = resolve_selector(
             snapshot,
             &rule.source,
@@ -88,11 +97,9 @@ pub fn evaluate_policy(
                 &nodes,
                 &suppressions,
             )?,
-            PolicyRuleKind::PublicApiChange | PolicyRuleKind::RuntimeBoundary => bail!(
-                "policy rule {:?} uses {:?}, which is not supported by the static architecture evaluator",
-                rule.id,
-                rule.kind
-            ),
+            PolicyRuleKind::PublicApiChange | PolicyRuleKind::RuntimeBoundary => {
+                unreachable!("specialized policy rules are handled by their dedicated evaluators")
+            }
         };
         for violation in evaluated {
             violations.entry(violation.id.clone()).or_insert(violation);
@@ -1398,6 +1405,27 @@ mod tests {
             result.violations[0].profile_id.as_deref(),
             Some("profile:production")
         );
+        assert_eq!(result.exit_code, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn specialized_rules_do_not_discard_snapshot_policy_results() -> Result<()> {
+        let graph = snapshot(vec![edge("e1", "a", "b", "profile:production")]);
+        let static_rule = rule(PolicyRuleKind::ForbiddenDependency);
+        let mut specialized_rule = rule(PolicyRuleKind::PublicApiChange);
+        specialized_rule.id = "public-api".to_owned();
+        specialized_rule.source.value = "not-present/**".to_owned();
+        let policy = PolicyConfig {
+            schema_version: POLICY_SCHEMA_VERSION.to_owned(),
+            rules: vec![specialized_rule, static_rule],
+            suppressions: Vec::new(),
+        };
+
+        let result = evaluate_policy("snapshot:fixture", &graph, &policy)?;
+
+        assert_eq!(result.violations.len(), 1);
+        assert_eq!(result.violations[0].rule_id, "fixture-rule");
         assert_eq!(result.exit_code, 1);
         Ok(())
     }
