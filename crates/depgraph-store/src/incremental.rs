@@ -492,18 +492,23 @@ fn ensure_event_is_scoped(
             let diagnostic = event
                 .get("diagnostic")
                 .context("diagnostic is missing payload")?;
-            if let Some(id) = diagnostic.get("id").and_then(Value::as_str) {
-                let existing = ensure_existing_value_is_unchanged(
-                    tx,
-                    "diagnostics",
-                    "raw_json",
-                    scan_id,
-                    id,
-                    diagnostic,
-                )?;
-                if !existing && !diagnostic_is_scoped(scope, diagnostic) {
-                    bail!("incremental replacement introduced an out-of-scope diagnostic");
-                }
+            let existing = diagnostic
+                .get("id")
+                .and_then(Value::as_str)
+                .map(|id| {
+                    ensure_existing_value_is_unchanged(
+                        tx,
+                        "diagnostics",
+                        "raw_json",
+                        scan_id,
+                        id,
+                        diagnostic,
+                    )
+                })
+                .transpose()?
+                .unwrap_or(false);
+            if !existing && !diagnostic_is_scoped(scope, diagnostic) {
+                bail!("incremental replacement introduced an out-of-scope diagnostic");
             }
         }
         "file_completed" => {
@@ -992,5 +997,42 @@ mod tests {
             Some(base_id.as_str())
         );
         assert_eq!(store.load_completed_snapshot(&base_id).unwrap(), base);
+    }
+
+    #[test]
+    fn idless_out_of_scope_diagnostic_is_rejected_and_rolled_back() {
+        let mut store = Store::open_in_memory().unwrap();
+        let base_id = complete(&mut store, "base", &graph_events("base", false));
+        let base = store.load_completed_snapshot(&base_id).unwrap();
+        store
+            .start_incremental_scan_with_revision(
+                "failed-diagnostic",
+                Path::new("/fixture"),
+                false,
+                &base_id,
+                None,
+            )
+            .unwrap();
+        let mut events = replacement_events("failed-diagnostic");
+        events.insert(
+            1,
+            json!({"event":"diagnostic","protocol_version":"1.0",
+                "scan_id":"failed-diagnostic","adapter":"web","adapter_version":"1.0.0",
+                "seq":999,"diagnostic":{"severity":"warning","code":"ROGUE",
+                    "message":"outside replacement scope","path":"b/src/index.ts",
+                    "recoverable":true,"properties":{}}}),
+        );
+        assert!(
+            store
+                .replace_incremental_graph("failed-diagnostic", &base_id, &scope(), &events, &[],)
+                .is_err()
+        );
+        let staging = store.load_snapshot("failed-diagnostic").unwrap();
+        assert_eq!(staging.nodes, base.nodes);
+        assert_eq!(staging.diagnostics, base.diagnostics);
+        assert_eq!(
+            store.current_snapshot_id().unwrap().as_deref(),
+            Some(base_id.as_str())
+        );
     }
 }
