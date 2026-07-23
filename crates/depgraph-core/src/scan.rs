@@ -271,7 +271,7 @@ pub async fn run_scan_with_cache_mode_and_cancellation(
     let cache_workers = cache_plan.as_ref().map(|_| workers_to_run.clone());
     for (adapter, spec) in workers_to_run {
         if cancellation.is_cancelled() {
-            join_set.shutdown().await;
+            while join_set.join_next().await.is_some() {}
             return cancel_scan(store, &scan_id);
         }
         let root = root.clone();
