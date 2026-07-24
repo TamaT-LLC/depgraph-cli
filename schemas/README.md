@@ -28,7 +28,7 @@ unsupported versions, and unbounded documents fail closed before matching or
 store access. Output that declares
 `session.collector_contract_version=runtime-collector-v1` additionally rejects
 raw URL graph locators and HTTP targets containing anything other than a
-canonical authority.
+bounded redacted authority.
 
 `depgraph-runtime-collector-v1.schema.json` describes the production collector
 SDK behavior that precedes trace import. It fixes non-throwing lifecycle,

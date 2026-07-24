@@ -92,7 +92,10 @@ Canonical conversion is performed in this order:
 3. Convert an HTTP(S) URL to `external` with namespace `http` or `https` and
    name `host[:port]`. Userinfo, path, query, fragment, and percent-encoded
    material are discarded. A raw URL in a graph locator or HTTP external name
-   is invalid.
+   is invalid. The producer uses its URL parser to canonicalize the host. The
+   consumer treats this field as a non-resolved external identity and applies
+   the same bounded redacted-authority syntax in JSON Schema and Rust; it does
+   not perform DNS or IP semantic validation.
 4. Apply string, rate, and buffer limits, then allocate the next sequence.
 5. Normalize the timestamp and construct the trace v1 event.
 6. Set `session.collector_contract_version=runtime-collector-v1`, serialize

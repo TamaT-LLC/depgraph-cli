@@ -1,7 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     io::Read,
-    net::Ipv6Addr,
 };
 
 use anyhow::{Context, Result, bail};
@@ -1139,7 +1138,7 @@ fn looks_like_raw_url(value: &str) -> bool {
 
 fn validate_http_authority(authority: &str, field: &str) -> Result<()> {
     let invalid =
-        || anyhow::anyhow!("runtime trace {field} must contain a canonical HTTP authority");
+        || anyhow::anyhow!("runtime trace {field} must contain a redacted HTTP authority");
     if !authority.is_ascii() || authority != authority.to_ascii_lowercase() {
         return Err(invalid());
     }
@@ -1147,8 +1146,12 @@ fn validate_http_authority(authority: &str, field: &str) -> Result<()> {
     let (host, port) = if let Some(ipv6) = authority.strip_prefix('[') {
         let close = ipv6.find(']').ok_or_else(&invalid)?;
         let (address, suffix) = ipv6.split_at(close);
-        let parsed = address.parse::<Ipv6Addr>().map_err(|_| invalid())?;
-        if address != parsed.to_string() {
+        if address.is_empty()
+            || !address.contains(':')
+            || !address
+                .chars()
+                .all(|character| character.is_ascii_hexdigit() || matches!(character, ':' | '.'))
+        {
             return Err(invalid());
         }
         let suffix = &suffix[1..];
@@ -1164,10 +1167,8 @@ fn validate_http_authority(authority: &str, field: &str) -> Result<()> {
         let port = parts.next();
         if parts.next().is_some()
             || host.is_empty()
-            || host.len() > 253
             || host.split('.').any(|label| {
                 label.is_empty()
-                    || label.len() > 63
                     || !label.chars().all(|character| {
                         character.is_ascii_lowercase()
                             || character.is_ascii_digit()
@@ -1903,7 +1904,7 @@ mod tests {
     }
 
     #[test]
-    fn http_targets_are_canonical_authorities_only() -> Result<()> {
+    fn production_http_targets_match_the_redacted_authority_contract() -> Result<()> {
         let schema: Value = serde_json::from_str(RUNTIME_TRACE_SCHEMA)?;
         let validator = jsonschema::validator_for(&schema)?;
         let mut legacy: Value = serde_json::from_str(GOLDEN)?;
@@ -1912,7 +1913,13 @@ mod tests {
         read_runtime_trace(Cursor::new(serde_json::to_vec(&legacy)?))?;
         assert!(validator.is_valid(&legacy));
 
-        for authority in ["api.example.test", "localhost:3000", "[::1]:443"] {
+        for authority in [
+            "api.example.test",
+            "localhost:3000",
+            "[::1]:443",
+            "[:::]",
+            "[0:0:0:0:0:0:0:1]:443",
+        ] {
             let mut value: Value = serde_json::from_str(GOLDEN)?;
             value["session"]["collector_contract_version"] =
                 json!(RUNTIME_COLLECTOR_CONTRACT_VERSION);
