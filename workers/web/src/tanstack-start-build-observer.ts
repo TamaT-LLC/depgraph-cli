@@ -3,7 +3,19 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { canonicalJson, stableId } from "./ids";
 import {
-  canonicalizeCondition,
+  FRAMEWORK_BUILD_GRAPH_CONTRACT_VERSION,
+  deduplicateFrameworkBuildRecords,
+  frameworkBuildCondition,
+  frameworkBuildDiagnostic,
+  frameworkBuildEvidence,
+  frameworkBuildGeneratedNode,
+  frameworkBuildProtocolEvents,
+  frameworkBuildRelation,
+  validateFrameworkBuildDelta,
+  validateFrameworkBuildProvenance,
+  type FrameworkBuildDescriptor,
+} from "./framework-build-contract";
+import {
   compareUtf8,
   type Condition,
   type DependencySite,
@@ -19,6 +31,12 @@ export const TANSTACK_START_BUILD_OBSERVER = "tanstack-start-vite-build-observer
 export const TANSTACK_START_BUILD_OBSERVER_VERSION = "0.1.0" as const;
 export const TANSTACK_START_BUILD_CAPABILITY = "tanstack-start-v1-vite-v7-server-fn-resolver-v1" as const;
 export const TANSTACK_START_BUILD_SCHEMA = "tanstack-start-build-observation-v1" as const;
+export const TANSTACK_START_FRAMEWORK_BUILD_DESCRIPTOR: FrameworkBuildDescriptor = Object.freeze({
+  framework: "tanstack-start",
+  observer: TANSTACK_START_BUILD_OBSERVER,
+  observerVersion: TANSTACK_START_BUILD_OBSERVER_VERSION,
+  capability: TANSTACK_START_BUILD_CAPABILITY,
+});
 
 const MAX_SAFE_STRING = 4_096;
 const MAX_RPC_ID = 512;
@@ -784,6 +802,8 @@ export function tanStackStartBuildFailureDiagnostic(error: unknown, profileId: s
     framework: "tanstack-start",
     observer: TANSTACK_START_BUILD_OBSERVER,
     observer_version: TANSTACK_START_BUILD_OBSERVER_VERSION,
+    capability: TANSTACK_START_BUILD_CAPABILITY,
+    contract_version: FRAMEWORK_BUILD_GRAPH_CONTRACT_VERSION,
     observer_failure: true,
   };
   return {
@@ -798,12 +818,10 @@ export function tanStackStartBuildFailureDiagnostic(error: unknown, profileId: s
 }
 
 function validateProvenance(provenance: TanStackStartBuildProvenance): void {
-  for (const [field, value] of Object.entries(provenance)) {
-    if (field === "build_run_id" || field === "profile_id") {
-      if (boundedString(value) === null) fail("web.tanstack_start_build_provenance_invalid");
-    } else if (!/^[a-f0-9]{64}$/u.test(value)) {
-      fail("web.tanstack_start_build_provenance_invalid");
-    }
+  try {
+    validateFrameworkBuildProvenance(provenance);
+  } catch {
+    fail("web.tanstack_start_build_provenance_invalid");
   }
 }
 
@@ -813,23 +831,13 @@ function buildEvidence(
   artifactDigest: string,
   properties: Record<string, JsonValue> = {},
 ): Evidence {
-  return {
-    kind: "build",
-    extractor: TANSTACK_START_BUILD_OBSERVER,
-    extractor_version: TANSTACK_START_BUILD_OBSERVER_VERSION,
-    path: logicalPath,
-    start_line: 1,
-    start_column: 1,
-    end_line: 1,
-    end_column: 1,
-    properties: {
-      ...provenance,
-      logical_artifact_path: logicalPath,
-      artifact_digest: artifactDigest,
-      capability: TANSTACK_START_BUILD_CAPABILITY,
-      ...properties,
-    },
-  };
+  return frameworkBuildEvidence(
+    TANSTACK_START_FRAMEWORK_BUILD_DESCRIPTOR,
+    provenance,
+    logicalPath,
+    artifactDigest,
+    properties,
+  );
 }
 
 function buildNode(
@@ -841,36 +849,20 @@ function buildNode(
   logicalPath: string,
   digest: string,
 ): GraphNode {
-  const id = stableId(kind, identity);
-  return {
-    id,
+  return frameworkBuildGeneratedNode(
+    TANSTACK_START_FRAMEWORK_BUILD_DESCRIPTOR,
     kind,
-    locator: `build://${TANSTACK_START_BUILD_OBSERVER}/${encodeURIComponent(logicalPath)}#${id}`,
-    display_name: displayName,
-    properties: {
-      ...properties,
-      build_generated: true,
-      build_identity: identity,
-      build_provenance: {
-        ...provenance,
-        observer: TANSTACK_START_BUILD_OBSERVER,
-        observer_version: TANSTACK_START_BUILD_OBSERVER_VERSION,
-        logical_artifact_path: logicalPath,
-        artifact_digest: digest,
-      },
-    },
-  };
+    identity,
+    displayName,
+    properties,
+    provenance,
+    logicalPath,
+    digest,
+  );
 }
 
 function observedCondition(environment: TanStackBuildEnvironment, properties: Record<string, string> = {}): Condition {
-  return canonicalizeCondition({
-    op: "all",
-    conditions: [
-      { op: "eq", key: "mode", value: "production" },
-      { op: "eq", key: "environment", value: environment === "client" ? "browser" : environment },
-      ...Object.entries(properties).map(([key, value]) => ({ op: "eq" as const, key, value })),
-    ],
-  });
+  return frameworkBuildCondition(environment, properties);
 }
 
 function addObservedRelation(
@@ -885,54 +877,19 @@ function addObservedRelation(
   evidence: Evidence,
   profileId: string,
 ): void {
-  const siteIdentity: Record<string, JsonValue> = {
-    kind,
-    source,
-    specifier,
-    profile_id: profileId,
-    condition,
-    resolution_status: "resolved",
-    precision: "observed",
-    observer: TANSTACK_START_BUILD_OBSERVER,
-    observer_version: TANSTACK_START_BUILD_OBSERVER_VERSION,
-    validated_output_digest: evidence.properties?.validated_output_digest ?? null,
-    anchor: {
-      path: evidence.path,
-      start_line: evidence.start_line,
-      start_column: evidence.start_column,
-      end_line: evidence.end_line,
-      end_column: evidence.end_column,
-    },
-  };
-  const siteId = stableId("site", siteIdentity);
-  sites.push({
-    id: siteId,
-    source,
-    kind,
-    specifier,
-    resolution_status: "resolved",
-    target_ids: [target],
-    profile_id: profileId,
-    condition,
-    precision: "observed",
-    reason: null,
-    evidence: [evidence],
-  });
-  edges.push({
-    id: stableId("edge", { kind, site_id: siteId, target, phase: "build" }),
+  const { site, edge } = frameworkBuildRelation(
+    TANSTACK_START_FRAMEWORK_BUILD_DESCRIPTOR,
     source,
     target,
     kind,
-    site_id: siteId,
-    phase: "build",
-    environment: environment === "client" ? "browser" : environment,
-    profile_id: profileId,
+    specifier,
+    environment,
     condition,
-    resolution_status: "resolved",
-    precision: "observed",
-    generated: true,
-    evidence: [evidence],
-  });
+    evidence,
+    profileId,
+  );
+  sites.push(site);
+  edges.push(edge);
 }
 
 function graphDiagnostic(
@@ -943,27 +900,23 @@ function graphDiagnostic(
   properties: Record<string, JsonValue>,
   severity: Diagnostic["severity"] = "warning",
 ): Diagnostic {
-  return {
-    id: stableId("diagnostic", { code, subject, profile_id: profileId, properties }),
-    severity,
+  return frameworkBuildDiagnostic(
+    TANSTACK_START_FRAMEWORK_BUILD_DESCRIPTOR,
     code,
-    message: `${code}: ${subject}`,
-    path: evidence.path,
-    profile_id: profileId,
-    evidence: [evidence],
+    subject,
+    profileId,
+    evidence,
     properties,
-  };
+    severity,
+  );
 }
 
 function uniqueById<T extends { id: string }>(values: readonly T[], code: string): T[] {
-  const result = new Map<string, T>();
-  for (const value of values) {
-    const previous = result.get(value.id);
-    if (previous !== undefined
-      && canonicalJson(previous as unknown as JsonValue) !== canonicalJson(value as unknown as JsonValue)) fail(code);
-    result.set(value.id, value);
+  try {
+    return deduplicateFrameworkBuildRecords(values);
+  } catch {
+    fail(code);
   }
-  return [...result.values()].sort((left, right) => compareUtf8(left.id, right.id));
 }
 
 function sourcePath(node: GraphNode): string | null {
@@ -1260,7 +1213,7 @@ export function buildTanStackStartObservedGraph(
     ));
   }
 
-  return {
+  const delta = {
     startVersion: observation.start_version,
     viteVersions: [...new Set(observation.builds.map((build) => build.vite_version))].sort(compareUtf8),
     nodes: [...nodes.values()].sort((left, right) => compareUtf8(left.id, right.id)),
@@ -1268,6 +1221,17 @@ export function buildTanStackStartObservedGraph(
     edges: uniqueById(edges, "web.tanstack_start_build_edge_conflict"),
     diagnostics: uniqueById(diagnostics, "web.tanstack_start_build_diagnostic_conflict"),
   };
+  try {
+    validateFrameworkBuildDelta(
+      delta,
+      TANSTACK_START_FRAMEWORK_BUILD_DESCRIPTOR,
+      input.provenance,
+      input.baseNodes,
+    );
+  } catch {
+    fail("web.tanstack_start_build_graph_contract_invalid");
+  }
+  return delta;
 }
 
 export function tanStackStartBuildProtocolEvents(
@@ -1276,56 +1240,19 @@ export function tanStackStartBuildProtocolEvents(
   provenance: TanStackStartBuildProvenance,
   sourceRevision: string,
 ): ProtocolEvent[] {
-  const common = {
-    protocol_version: "1.0" as const,
-    scan_id: provenance.build_run_id,
-    adapter: "web" as const,
-    adapter_version: "0.4.0-rc.1" as const,
-  };
-  let seq = 0;
-  const event = (kind: string, payload: Record<string, unknown>): ProtocolEvent => ({
-    ...common, event: kind, seq: ++seq, ...payload,
-  });
-  const coverage = {
-    profiles: 1,
-    files_discovered: 0,
-    files_analyzed: 0,
-    files_skipped: 0,
-    dependency_sites: delta.sites.length,
-    resolved: delta.sites.length,
-    candidates: 0,
-    external: 0,
-    unresolved: 0,
-    unsupported_syntax: 0,
-    project_code_executed: true,
-    completeness: ["build-observed"],
-    reasons: [],
-  };
-  const events: ProtocolEvent[] = [event("scan_started", { root, safe_mode: false, project_code_executed: true })];
-  events.push(event("profile_declared", {
-    profile: {
-      id: provenance.profile_id,
-      language: "typescript",
+  return frameworkBuildProtocolEvents(
+    root,
+    delta,
+    provenance,
+    sourceRevision,
+    TANSTACK_START_FRAMEWORK_BUILD_DESCRIPTOR,
+    {
       toolchain: `@tanstack/react-start ${delta.startVersion}`,
       command: "vite build",
-      target: "production",
-      features: [TANSTACK_START_BUILD_CAPABILITY],
-      environment: { mode: "production" },
-      source_revision: sourceRevision,
       properties: {
-        observer: TANSTACK_START_BUILD_OBSERVER,
-        observer_version: TANSTACK_START_BUILD_OBSERVER_VERSION,
         tanstack_start_version: delta.startVersion,
         vite_versions: delta.viteVersions,
-        project_code_executed: true,
       },
     },
-  }));
-  for (const node of delta.nodes) events.push(event("node_upsert", { node }));
-  for (const site of delta.sites) events.push(event("dependency_site", { site }));
-  for (const edge of delta.edges) events.push(event("edge_upsert", { edge }));
-  for (const item of delta.diagnostics) events.push(event("diagnostic", { diagnostic: item }));
-  events.push(event("profile_completed", { profile_id: provenance.profile_id, coverage }));
-  events.push(event("scan_completed", { coverage }));
-  return events;
+  );
 }

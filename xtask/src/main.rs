@@ -200,6 +200,7 @@ struct ReleaseVerificationReport {
     tag: String,
     protocol_version: String,
     schema_compatibility_version: String,
+    framework_build_graph_contract_version: String,
     runtime_collector_contract_version: String,
     compatibility: ReleaseCompatibility,
     license_expression: String,
@@ -1796,6 +1797,8 @@ fn verify_release_assets(directory: &Path, requested_targets: &[String]) -> Resu
             tag: format!("v{VERSION}"),
             protocol_version: "1.0".to_owned(),
             schema_compatibility_version: "1.0".to_owned(),
+            framework_build_graph_contract_version:
+                depgraph_core::FRAMEWORK_BUILD_GRAPH_CONTRACT_VERSION.to_owned(),
             runtime_collector_contract_version: RUNTIME_COLLECTOR_CONTRACT_VERSION.to_owned(),
             compatibility: release_compatibility(),
             license_expression: PROJECT_LICENSE_EXPRESSION.to_owned(),

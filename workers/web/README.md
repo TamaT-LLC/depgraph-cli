@@ -8,6 +8,24 @@ node dist/worker.mjs --root <repository> --scan-id <id>
 
 The worker writes protocol `1.0` NDJSON to stdout and operational logs to stderr. It performs a safe, read-only scan and reports `project_code_executed=false` in both the scan and profile metadata.
 
+## Dynamic framework build graph contract
+
+The checksum-attested Next.js, Astro, and TanStack Start observers emit through
+the shared `framework-build-graph-v1` converter contract. Generated node,
+dependency-site, and edge identities include that contract version but exclude
+the build attempt ID, so repeat builds and separate checkouts produce the same
+graph for the same normalized observation. Base static/semantic nodes can be
+reused only byte-for-byte; conflicting identities reject the complete build
+delta.
+
+Only an actually observed target is emitted as `resolved`. A computed or
+otherwise unmatched dynamic target uses a versioned `unknown_target`,
+`resolution_status=unresolved`, `precision=observed`, and a bounded coverage
+reason. Partial builds, unsupported versions, and missing manifest/hook
+boundaries do not receive `build-observed` completeness and cannot replace the
+last completed snapshot. Both the converter and Rust core revalidate profile
+counts, framework/observer provenance, conditions, and exact site/edge closure.
+
 ## Node.js/TypeScript runtime collector
 
 `pnpm build` also creates the dependency-free ESM reference collector at

@@ -473,7 +473,10 @@ test("static ambiguity and runtime drift retain observed evidence with bounded d
   });
   const runtime = drift.diagnostics.find((item) => item.code === "web.next_build_runtime_drift");
   assert.deepEqual(runtime?.properties, {
+    capability: NEXT_BUILD_OBSERVER_CAPABILITY,
+    contract_version: "framework-build-graph-v1",
     declared_runtime: "edge",
+    framework: "next",
     observed_runtime: "nodejs",
     route_id: baseRoute("one", "edge").id,
   });

@@ -390,7 +390,23 @@ The explicit-consent guard is enforced before path, configuration, store, or too
 
 The allowed Web adapter values are `next`, `astro`, and `tanstack-start`. The relative entrypoint must integrate the release-provided observer named by `DEPGRAPH_OBSERVER` (and `NEXT_ADAPTER_PATH` for Next) into the real build lifecycle. It runs in a temporary staged workspace using canonical system Node, a cleared allowlisted environment, temporary HOME/cache/output, bounded output, timeout/cancellation, and cross-platform process-tree cleanup. Every launched attempt saves a secret-free audit containing command metadata, logical paths, environment key names, limits, isolation capability, and outcome; raw stdout/stderr and temporary or host paths are not persisted. Network isolation is reported as `best-effort` unless an outer namespace/container enforces it.
 
-Validated observer output uses `phase=build`, `precision=observed`, and primary `kind=build` evidence tied to the supervisor audit digests. The Next/Astro/TanStack Start observer entrypoints and their observation-to-protocol converter are separate checksum-attested release artifacts; missing, undeclared, or changed bytes fail closed before project code starts. Schema-v7 stores the delta in an attempt transaction and exposes it to `deps`, `dependents`, `why`, and exports only after completed promotion. Source and semantic rows remain immutable; matching and conflicting build observations coexist as separate layers, with conflicts carrying both provenance sets. Failed, partial, timed-out, cancelled, malformed, or unauthorized deltas are discarded and never replace the current completed graph.
+Validated observer output uses the shared `framework-build-graph-v1` contract:
+`phase=build`, `precision=observed`, canonical production
+profile/conditions, and primary `kind=build` evidence tied to the supervisor
+audit digests. Generated node, site, and edge IDs exclude the attempt ID and
+include the contract version; matching source/semantic nodes are reused only
+when byte-identical. A dynamic target that was not observed is retained as an
+`unresolved` edge to an `unknown_target` with a bounded reason, never promoted
+to a guessed `resolved` edge. The Next/Astro/TanStack Start observer entrypoints
+and their observation-to-protocol converter are separate checksum-attested
+release artifacts; missing, undeclared, or changed bytes fail closed before
+project code starts. Schema-v7 stores the delta in an attempt transaction and
+exposes it to `deps`, `dependents`, `why`, and exports only after completed
+promotion. Source and semantic rows remain immutable; matching and conflicting
+build observations coexist as separate layers, with conflicts carrying both
+provenance sets. Failed, partial, timed-out, cancelled, malformed, unsupported,
+or unauthorized deltas are discarded and never replace the current completed
+graph.
 
 ## Strict policy and exit codes
 

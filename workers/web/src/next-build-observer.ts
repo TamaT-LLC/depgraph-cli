@@ -3,7 +3,18 @@ import { lstat, open, realpath } from "node:fs/promises";
 import path from "node:path";
 import { canonicalJson, stableId } from "./ids";
 import {
-  canonicalizeCondition,
+  FRAMEWORK_BUILD_GRAPH_CONTRACT_VERSION,
+  deduplicateFrameworkBuildRecords,
+  frameworkBuildCondition,
+  frameworkBuildDiagnostic,
+  frameworkBuildEvidence,
+  frameworkBuildGeneratedNode,
+  frameworkBuildProtocolEvents,
+  frameworkBuildRelation,
+  validateFrameworkBuildDelta,
+  type FrameworkBuildDescriptor,
+} from "./framework-build-contract";
+import {
   compareUtf8,
   type Condition,
   type DependencySite,
@@ -19,6 +30,12 @@ export const NEXT_BUILD_OBSERVER = "next-adapter-observer" as const;
 export const NEXT_BUILD_OBSERVER_VERSION = "0.1.0" as const;
 export const NEXT_BUILD_OBSERVER_CAPABILITY = "next-adapter-api-16.2-v1" as const;
 export const NEXT_BUILD_OBSERVATION_SCHEMA = "next-build-observation-v1" as const;
+export const NEXT_FRAMEWORK_BUILD_DESCRIPTOR: FrameworkBuildDescriptor = Object.freeze({
+  framework: "next",
+  observer: NEXT_BUILD_OBSERVER,
+  observerVersion: NEXT_BUILD_OBSERVER_VERSION,
+  capability: NEXT_BUILD_OBSERVER_CAPABILITY,
+});
 
 const MAX_OUTPUTS = 20_000;
 const MAX_ROUTING_ENTRIES = 20_000;
@@ -214,6 +231,8 @@ export function nextBuildFailureDiagnostic(error: unknown, profileId: string): D
     framework: "next",
     observer: NEXT_BUILD_OBSERVER,
     observer_version: NEXT_BUILD_OBSERVER_VERSION,
+    capability: NEXT_BUILD_OBSERVER_CAPABILITY,
+    contract_version: FRAMEWORK_BUILD_GRAPH_CONTRACT_VERSION,
     observer_failure: true,
   };
   return {
@@ -639,22 +658,12 @@ function buildEvidence(
   logicalArtifactPath: string,
   artifactDigest: string,
 ): Evidence {
-  return {
-    kind: "build",
-    extractor: NEXT_BUILD_OBSERVER,
-    extractor_version: NEXT_BUILD_OBSERVER_VERSION,
-    path: logicalArtifactPath,
-    start_line: 1,
-    start_column: 1,
-    end_line: 1,
-    end_column: 1,
-    properties: {
-      ...provenance,
-      logical_artifact_path: logicalArtifactPath,
-      artifact_digest: artifactDigest,
-      capability: NEXT_BUILD_OBSERVER_CAPABILITY,
-    },
-  };
+  return frameworkBuildEvidence(
+    NEXT_FRAMEWORK_BUILD_DESCRIPTOR,
+    provenance,
+    logicalArtifactPath,
+    artifactDigest,
+  );
 }
 
 function buildNode(
@@ -666,36 +675,20 @@ function buildNode(
   logicalArtifactPath: string,
   artifactDigest: string,
 ): GraphNode {
-  const id = stableId(kind, identity);
-  return {
-    id,
+  return frameworkBuildGeneratedNode(
+    NEXT_FRAMEWORK_BUILD_DESCRIPTOR,
     kind,
-    locator: `build://${NEXT_BUILD_OBSERVER}/${encodeURIComponent(logicalArtifactPath)}#${id}`,
-    display_name: displayName,
-    properties: {
-      ...properties,
-      build_generated: true,
-      build_identity: identity,
-      build_provenance: {
-        ...provenance,
-        observer: NEXT_BUILD_OBSERVER,
-        observer_version: NEXT_BUILD_OBSERVER_VERSION,
-        logical_artifact_path: logicalArtifactPath,
-        artifact_digest: artifactDigest,
-      },
-    },
-  };
+    identity,
+    displayName,
+    properties,
+    provenance,
+    logicalArtifactPath,
+    artifactDigest,
+  );
 }
 
 function observedCondition(environment: string, extra: Array<{ key: string; value: string }> = []): Condition {
-  return canonicalizeCondition({
-    op: "all",
-    conditions: [
-      { op: "eq", key: "mode", value: "production" },
-      { op: "eq", key: "environment", value: environment },
-      ...extra.map(({ key, value }) => ({ op: "eq" as const, key, value })),
-    ],
-  });
+  return frameworkBuildCondition(environment, Object.fromEntries(extra.map(({ key, value }) => [key, value])));
 }
 
 function addObservedRelation(
@@ -710,54 +703,17 @@ function addObservedRelation(
   evidence: Evidence,
   profileId: string,
 ): void {
-  const siteIdentity: Record<string, JsonValue> = {
-    kind,
-    source,
-    specifier,
-    profile_id: profileId,
-    condition,
-    resolution_status: "resolved",
-    precision: "observed",
-    observer: NEXT_BUILD_OBSERVER,
-    observer_version: NEXT_BUILD_OBSERVER_VERSION,
-    validated_output_digest: evidence.properties?.validated_output_digest ?? null,
-    anchor: {
-      path: evidence.path,
-      start_line: evidence.start_line,
-      start_column: evidence.start_column,
-      end_line: evidence.end_line,
-      end_column: evidence.end_column,
-    },
-  };
-  const siteId = stableId("site", siteIdentity);
-  const site: DependencySite = {
-    id: siteId,
-    source,
-    kind,
-    specifier,
-    resolution_status: "resolved",
-    target_ids: [target],
-    profile_id: profileId,
-    condition,
-    precision: "observed",
-    reason: null,
-    evidence: [evidence],
-  };
-  const edge: GraphEdge = {
-    id: stableId("edge", { kind, site_id: siteId, target, phase: "build" }),
+  const { site, edge } = frameworkBuildRelation(
+    NEXT_FRAMEWORK_BUILD_DESCRIPTOR,
     source,
     target,
     kind,
-    site_id: siteId,
-    phase: "build",
+    specifier,
     environment,
-    profile_id: profileId,
     condition,
-    resolution_status: "resolved",
-    precision: "observed",
-    generated: true,
-    evidence: [evidence],
-  };
+    evidence,
+    profileId,
+  );
   sites.push(site);
   edges.push(edge);
 }
@@ -833,29 +789,23 @@ function diagnostic(
   properties: Record<string, JsonValue>,
   severity: Diagnostic["severity"] = "warning",
 ): Diagnostic {
-  return {
-    id: stableId("diagnostic", { code, subject, profile_id: profileId, properties }),
-    severity,
+  return frameworkBuildDiagnostic(
+    NEXT_FRAMEWORK_BUILD_DESCRIPTOR,
     code,
-    message: `${code}: ${subject}`,
-    path: evidence.path,
-    profile_id: profileId,
-    evidence: [evidence],
+    subject,
+    profileId,
+    evidence,
     properties,
-  };
+    severity,
+  );
 }
 
 function uniqueById<T extends { id: string }>(values: readonly T[], conflictCode: string): T[] {
-  const unique = new Map<string, T>();
-  for (const value of values) {
-    const existing = unique.get(value.id);
-    if (existing !== undefined
-      && canonicalJson(existing as unknown as JsonValue) !== canonicalJson(value as unknown as JsonValue)) {
-      fail(conflictCode);
-    }
-    unique.set(value.id, value);
+  try {
+    return deduplicateFrameworkBuildRecords(values);
+  } catch {
+    fail(conflictCode);
   }
-  return [...unique.values()].sort((left, right) => compareUtf8(left.id, right.id));
 }
 
 export function buildNextObservedGraph(input: NextBuildGraphInput): NextBuildGraphDelta {
@@ -1062,10 +1012,15 @@ export function buildNextObservedGraph(input: NextBuildGraphInput): NextBuildGra
       observationDigest,
     );
     const phaseNode = buildNode(
-      "unknown_target",
+      "module",
       { framework: "next", routing_phase: routing.phase, profile_id: input.provenance.profile_id },
       `Next routing phase ${routing.phase}`,
-      { framework: "next", routing_phase: routing.phase, profile_id: input.provenance.profile_id },
+      {
+        framework: "next",
+        module_kind: "next-routing-phase",
+        routing_phase: routing.phase,
+        profile_id: input.provenance.profile_id,
+      },
       input.provenance,
       observationPath,
       observationDigest,
@@ -1079,13 +1034,24 @@ export function buildNextObservedGraph(input: NextBuildGraphInput): NextBuildGra
     );
   }
 
-  return {
+  const delta = {
     nextVersion: input.observation.next_version,
     nodes: [...nodes.values()].sort((left, right) => compareUtf8(left.id, right.id)),
     sites: uniqueById(sites, "web.next_build_site_conflict"),
     edges: uniqueById(edges, "web.next_build_edge_conflict"),
     diagnostics: uniqueById(diagnostics, "web.next_build_diagnostic_conflict"),
   };
+  try {
+    validateFrameworkBuildDelta(
+      delta,
+      NEXT_FRAMEWORK_BUILD_DESCRIPTOR,
+      input.provenance,
+      input.baseNodes,
+    );
+  } catch {
+    fail("web.next_build_graph_contract_invalid");
+  }
+  return delta;
 }
 
 export function nextBuildProtocolEvents(
@@ -1094,62 +1060,16 @@ export function nextBuildProtocolEvents(
   provenance: NextBuildProvenance,
   sourceRevision: string,
 ): ProtocolEvent[] {
-  const common = {
-    protocol_version: "1.0" as const,
-    scan_id: provenance.build_run_id,
-    adapter: "web" as const,
-    adapter_version: "0.4.0-rc.1" as const,
-  };
-  let seq = 0;
-  const event = (kind: string, payload: Record<string, unknown>): ProtocolEvent => ({
-    ...common,
-    event: kind,
-    seq: ++seq,
-    ...payload,
-  });
-  const coverage = {
-    profiles: 1,
-    files_discovered: 0,
-    files_analyzed: 0,
-    files_skipped: 0,
-    dependency_sites: delta.sites.length,
-    resolved: delta.sites.length,
-    candidates: 0,
-    external: 0,
-    unresolved: 0,
-    unsupported_syntax: 0,
-    project_code_executed: true,
-    completeness: ["build-observed"],
-    reasons: [],
-  };
-  const events: ProtocolEvent[] = [event("scan_started", {
+  return frameworkBuildProtocolEvents(
     root,
-    safe_mode: false,
-    project_code_executed: true,
-  })];
-  events.push(event("profile_declared", {
-    profile: {
-      id: provenance.profile_id,
-      language: "typescript",
+    delta,
+    provenance,
+    sourceRevision,
+    NEXT_FRAMEWORK_BUILD_DESCRIPTOR,
+    {
       toolchain: `next ${delta.nextVersion}`,
       command: "next build",
-      target: "production",
-      features: [NEXT_BUILD_OBSERVER_CAPABILITY],
-      environment: { mode: "production" },
-      source_revision: sourceRevision,
-      properties: {
-        observer: NEXT_BUILD_OBSERVER,
-        observer_version: NEXT_BUILD_OBSERVER_VERSION,
-        next_version: delta.nextVersion,
-        project_code_executed: true,
-      },
+      properties: { next_version: delta.nextVersion },
     },
-  }));
-  for (const node of delta.nodes) events.push(event("node_upsert", { node }));
-  for (const site of delta.sites) events.push(event("dependency_site", { site }));
-  for (const edge of delta.edges) events.push(event("edge_upsert", { edge }));
-  for (const item of delta.diagnostics) events.push(event("diagnostic", { diagnostic: item }));
-  events.push(event("profile_completed", { profile_id: provenance.profile_id, coverage }));
-  events.push(event("scan_completed", { coverage }));
-  return events;
+  );
 }
