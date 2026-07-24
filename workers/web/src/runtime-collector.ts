@@ -1138,6 +1138,24 @@ export function createFileRuntimeCollectorSink(destination: string): RuntimeColl
 export function createStdoutRuntimeCollectorSink(
   stream: Writable = process.stdout,
 ): RuntimeCollectorSink {
+  let pendingWrites = 0;
+  let errorGuardInstalled = false;
+  const containAsynchronousError = () => {
+    // Queue acceptance is the stdout commit point, so a later stream error
+    // cannot change the returned flush result. It must still be contained at
+    // the collector boundary instead of becoming an uncaught application
+    // error.
+  };
+  const installErrorGuard = () => {
+    if (errorGuardInstalled) return;
+    stream.on("error", containAsynchronousError);
+    errorGuardInstalled = true;
+  };
+  const removeErrorGuard = () => {
+    if (pendingWrites !== 0 || !errorGuardInstalled) return;
+    stream.off("error", containAsynchronousError);
+    errorGuardInstalled = false;
+  };
   return {
     kind: "stdout",
     async write(payload, context) {
@@ -1146,7 +1164,25 @@ export function createStdoutRuntimeCollectorSink(
       // Writable.write accepts the complete line synchronously. The callback
       // is not cancellable, so the transport boundary is queue handoff rather
       // than downstream drain; normal Node shutdown drains accepted writes.
-      stream.write(line);
+      installErrorGuard();
+      pendingWrites += 1;
+      try {
+        stream.write(line, (error) => {
+          pendingWrites -= 1;
+          if (error === null || error === undefined) {
+            removeErrorGuard();
+          } else {
+            // Writable may emit `error` after invoking the callback. Keep the
+            // guard through this event-loop turn, then release it if no other
+            // accepted writes are pending.
+            setImmediate(removeErrorGuard);
+          }
+        });
+      } catch (error) {
+        pendingWrites -= 1;
+        removeErrorGuard();
+        throw error;
+      }
     },
   };
 }

@@ -85,8 +85,9 @@ idempotent, stops admission, aborts retry timers at its deadline, and never
 throws a sink failure into the application. File sinks use same-directory
 temporary files and atomic replacement; stdout writes one compact trace per
 line and treats synchronous Writable queue acceptance as its non-blocking
-handoff boundary; the OTLP adapter places the exact trace bytes in a LogRecord body with
-only contract/media/session/prefix attributes.
+handoff boundary. A shared guard contains asynchronous stream errors until all
+accepted write callbacks settle. The OTLP adapter places the exact trace bytes
+in a LogRecord body with only contract/media/session/prefix attributes.
 
 Passing `enabled: false` returns a no-op handle before any clock read, sink
 write, diagnostic callback, or timer installation. `descriptor` can be

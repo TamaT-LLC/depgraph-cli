@@ -517,6 +517,37 @@ test("stdout handoff does not wait on an uncancellable drain callback", async ()
   output.destroy();
 });
 
+test("stdout contains asynchronous write errors without leaking its guard", async () => {
+  const fixture = await readFixture("next");
+  let writeFailed: (() => void) | undefined;
+  const failed = new Promise<void>((resolve) => {
+    writeFailed = resolve;
+  });
+  const output = new Writable({
+    write(_chunk, _encoding, callback) {
+      setImmediate(() => {
+        callback(new Error("fixture asynchronous stdout failure"));
+        writeFailed?.();
+      });
+    },
+  });
+  const collector = createRuntimeCollector({
+    repository: fixture.repository,
+    session: fixture.session,
+    sink: createStdoutRuntimeCollectorSink(output),
+    clock: new StepClock("2026-07-24T00:00:00Z"),
+    shutdownTimeoutMs: 10,
+  });
+  assert(collector.record(basicObservation("src/stdout-error.ts")));
+  assert.equal((await collector.shutdown()).status, "flushed");
+
+  await failed;
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(collector.state, "stopped");
+  assert.equal(collector.stats().flushedPrefixes, 1);
+  assert.equal(output.listenerCount("error"), 0);
+});
+
 test("file, stdout, and OTLP sinks carry the same canonical trace bytes", async () => {
   const fixture = await readFixture("astro");
   const directory = await mkdtemp(path.join(tmpdir(), "depgraph-runtime-collector-"));
