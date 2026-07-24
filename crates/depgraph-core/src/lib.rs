@@ -179,6 +179,7 @@ pub struct ReleaseCompatibilityHealth {
     pub policy_schema_version: String,
     pub policy_result_schema_version: String,
     pub runtime_trace_schema_version: String,
+    pub runtime_collector_contract_version: String,
     pub graphml_schema_version: String,
     pub packaged_smoke_contract: String,
 }
@@ -196,6 +197,7 @@ pub fn release_compatibility_contract() -> ReleaseCompatibilityHealth {
         policy_schema_version: POLICY_SCHEMA_VERSION.to_owned(),
         policy_result_schema_version: POLICY_RESULT_SCHEMA_VERSION.to_owned(),
         runtime_trace_schema_version: RUNTIME_TRACE_SCHEMA_VERSION.to_owned(),
+        runtime_collector_contract_version: RUNTIME_COLLECTOR_CONTRACT_VERSION.to_owned(),
         graphml_schema_version: GRAPHML_SCHEMA_VERSION.to_owned(),
         packaged_smoke_contract: "milestone4-packaged-smoke-v1".to_owned(),
     }
@@ -752,10 +754,19 @@ mod tests {
         let compatible = release_compatibility_contract();
         verify_release_compatibility(&compatible).unwrap();
 
-        let mut drifted = compatible;
+        let mut drifted = compatible.clone();
         drifted.store_schema_version += 1;
         assert!(
             verify_release_compatibility(&drifted)
+                .unwrap_err()
+                .to_string()
+                .contains("does not match")
+        );
+
+        let mut collector_drifted = compatible;
+        collector_drifted.runtime_collector_contract_version = "runtime-collector-v2".to_owned();
+        assert!(
+            verify_release_compatibility(&collector_drifted)
                 .unwrap_err()
                 .to_string()
                 .contains("does not match")

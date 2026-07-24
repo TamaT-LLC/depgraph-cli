@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import { chmod, copyFile, cp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -86,13 +87,14 @@ await build({
   legalComments: "external",
 });
 
-await build({
+const collectorBundle = await build({
   entryPoints: [fileURLToPath(new URL("../src/runtime-collector-entry.ts", import.meta.url))],
   outfile: fileURLToPath(new URL("../dist/depgraph-runtime-collector.mjs", import.meta.url)),
   bundle: true,
   platform: "node",
   format: "esm",
   target: "node24",
+  metafile: true,
   sourcemap: false,
   legalComments: "external",
 });
@@ -154,6 +156,24 @@ const declaredBundledPackages = [astroMetadata.name, typescriptMetadata.name].so
 if (JSON.stringify(bundledPackages) !== JSON.stringify(declaredBundledPackages)) {
   throw new Error(`runtime package inventory does not match bundle inputs: bundle=${JSON.stringify(bundledPackages)}, declared=${JSON.stringify(declaredBundledPackages)}`);
 }
+const collectorBundledPackages = [...new Set(
+  Object.keys(collectorBundle.metafile.inputs)
+    .map(bundledPackageName)
+    .filter((name) => name !== null),
+)].sort();
+if (collectorBundledPackages.length !== 0) {
+  throw new Error(`runtime collector must remain dependency-free: ${JSON.stringify(collectorBundledPackages)}`);
+}
+const collectorPath = new URL("../dist/depgraph-runtime-collector.mjs", import.meta.url);
+const collectorArtifact = {
+  name: "depgraph-runtime-collector",
+  version: "runtime-collector-v1",
+  license: "MIT OR Apache-2.0",
+  path: "depgraph-runtime-collector.mjs",
+  sha256: createHash("sha256").update(await readFile(collectorPath)).digest("hex"),
+  roles: ["reference-runtime-collector"],
+  bundled_packages: collectorBundledPackages,
+};
 
 const packageEntry = (metadata, roles) => ({
   name: metadata.name,
@@ -168,6 +188,6 @@ const runtimePackages = [
 ].sort((left, right) => left.name.localeCompare(right.name) || left.version.localeCompare(right.version));
 await writeFile(
   new URL("../dist/runtime-packages.json", import.meta.url),
-  `${JSON.stringify({ schema_version: 1, packages: runtimePackages }, null, 2)}\n`,
+  `${JSON.stringify({ schema_version: 1, artifacts: [collectorArtifact], packages: runtimePackages }, null, 2)}\n`,
   "utf8",
 );

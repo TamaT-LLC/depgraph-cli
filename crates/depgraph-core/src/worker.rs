@@ -107,6 +107,13 @@ const WEB_SEMANTIC_RUNTIME_COMPONENTS: &[&str] = &[
     "typescript-native-compiler@7.0.2",
 ];
 const WEB_SEMANTIC_RUNTIME_ARTIFACTS: &[&str] = &[];
+const WEB_RUNTIME_ARTIFACT_PATHS: &[&str] = &[
+    "libexec/next-build-adapter.mjs",
+    "libexec/astro-build-integration.mjs",
+    "libexec/tanstack-start-build-observer.mjs",
+    "libexec/depgraph-web-build-evidence.mjs",
+    "libexec/depgraph-runtime-collector.mjs",
+];
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub enum AdapterKind {
@@ -383,14 +390,10 @@ pub(crate) fn locate_web_build_runtime(file_name: &str, root: &Path) -> Result<P
         let release_root = verified_release_root(&manifest_path)?;
         let manifest: BundledManifest = serde_json::from_slice(&std::fs::read(&manifest_path)?)
             .context("security policy violation: invalid release manifest")?;
-        let expected_runtime_paths = [
-            "libexec/next-build-adapter.mjs",
-            "libexec/astro-build-integration.mjs",
-            "libexec/tanstack-start-build-observer.mjs",
-            "libexec/depgraph-web-build-evidence.mjs",
-        ]
-        .into_iter()
-        .collect::<BTreeSet<_>>();
+        let expected_runtime_paths = WEB_RUNTIME_ARTIFACT_PATHS
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
         let declared_runtime_paths = manifest
             .runtime_artifacts
             .iter()
@@ -624,6 +627,22 @@ fn locate_verified_bundled_worker_for_executable(
     }
     verify_bundled_artifact(&release_root, &manifest.schema, "protocol schema")?;
 
+    let expected_runtime_paths = WEB_RUNTIME_ARTIFACT_PATHS
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let declared_runtime_paths = manifest
+        .runtime_artifacts
+        .iter()
+        .map(|runtime| runtime.path.as_str())
+        .collect::<BTreeSet<_>>();
+    if declared_runtime_paths != expected_runtime_paths
+        || manifest.runtime_artifacts.len() != WEB_RUNTIME_ARTIFACT_PATHS.len()
+    {
+        bail!(
+            "security policy violation: release manifest Web runtime artifact closure is incomplete or unknown"
+        );
+    }
     let mut runtime_paths = BTreeSet::new();
     for runtime in &manifest.runtime_artifacts {
         if !runtime_paths.insert(runtime.path.as_str()) {
@@ -6530,9 +6549,18 @@ mod tests {
 
     fn write_test_release_manifest(
         release: &Path,
-        runtime_artifacts: Vec<Value>,
+        mut runtime_artifacts: Vec<Value>,
         mut runtime_components: Vec<Value>,
     ) -> Result<TestRelease> {
+        if runtime_artifacts.is_empty() {
+            for path in WEB_RUNTIME_ARTIFACT_PATHS {
+                runtime_artifacts.push(write_manifest_artifact(
+                    release,
+                    path,
+                    format!("verified {path}").as_bytes(),
+                )?);
+            }
+        }
         if !runtime_components
             .iter()
             .any(|component| component["name"] == "astro-parser-wasm")
@@ -8589,6 +8617,25 @@ mod tests {
         let error =
             locate_verified_bundled_worker(AdapterKind::Rust, &test_release.manifest).unwrap_err();
         assert!(error.to_string().contains("typescript-native-compiler"));
+        assert!(is_security_error(&error.to_string()));
+        Ok(())
+    }
+
+    #[test]
+    fn packaged_release_requires_the_runtime_collector_artifact() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let release = temp.path().join("release");
+        let test_release = write_test_release_manifest(&release, Vec::new(), Vec::new())?;
+        update_test_manifest(&test_release.manifest, |manifest| {
+            manifest["runtime_artifacts"]
+                .as_array_mut()
+                .context("test manifest has no runtime artifacts")?
+                .retain(|artifact| artifact["path"] != "libexec/depgraph-runtime-collector.mjs");
+            Ok(())
+        })?;
+        let error =
+            locate_verified_bundled_worker(AdapterKind::Rust, &test_release.manifest).unwrap_err();
+        assert!(error.to_string().contains("artifact closure"));
         assert!(is_security_error(&error.to_string()));
         Ok(())
     }

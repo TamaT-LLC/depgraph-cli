@@ -307,6 +307,11 @@ drop-newest backpressure, and coalesce immutable-prefix flushes across file,
 stdout, and OTLP sinks. A disabled instance does not read clocks, call a sink,
 or install timers. See the
 [Web worker runtime collector guide](workers/web/README.md#nodejstypescript-runtime-collector).
+Native archives ship the same module at
+`libexec/depgraph-runtime-collector.mjs`. Its `runtime-collector-v1`
+compatibility unit and SHA-256 are fixed by the release manifest, represented
+as a first-party SPDX package, and exercised from real fixture observation
+through validate/import/query/GraphML export by every package gate.
 
 Store schema v13 retains the v10 profile-independent `syntax`,
 profile-dependent `semantic`, and observed `build` cache tables plus the v11

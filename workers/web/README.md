@@ -12,7 +12,10 @@ The worker writes protocol `1.0` NDJSON to stdout and operational logs to stderr
 
 `pnpm build` also creates the dependency-free ESM reference collector at
 `dist/depgraph-runtime-collector.mjs`. It targets Node.js 24 and implements the
-exact `runtime-collector-v1` descriptor and trace v1 output contract.
+exact `runtime-collector-v1` descriptor and trace v1 output contract. Native
+release archives install the checksum-attested module at
+`libexec/depgraph-runtime-collector.mjs`; the build inventory records its
+project license and proves that its bundle contains no third-party package.
 
 ```js
 import {
