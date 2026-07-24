@@ -19,9 +19,9 @@ pub use delta::{
     DeltaEvidenceOwner, DeltaEvidenceRecord, DeltaFileCoverage, DeltaNodeUpsert, DeltaScope,
     DeltaStarted, DeltaValidator, EdgeDelete, EvidenceDelete, EvidenceUpsert, NodeDelete,
     SiteDelete, SiteUpsert, ValidatedDelta, WORKER_DELTA_CAPABILITY,
-    WORKER_DELTA_REQUEST_SCHEMA_VERSION, WorkerDeltaBaseGraph, WorkerDeltaFileChange,
-    WorkerDeltaFileChangeKind, WorkerDeltaRequest, WorkerProtocolMode, build_delta_stable_id,
-    delta_graph_digest, negotiate_worker_protocol, validate_delta_ndjson,
+    WORKER_DELTA_REQUEST_SCHEMA_VERSION, WorkerDeltaAnalysisMode, WorkerDeltaBaseGraph,
+    WorkerDeltaFileChange, WorkerDeltaFileChangeKind, WorkerDeltaRequest, WorkerProtocolMode,
+    build_delta_stable_id, delta_graph_digest, negotiate_worker_protocol, validate_delta_ndjson,
 };
 pub use event::{
     CommonFields, DependencySiteEvent, DiagnosticEvent, EdgeUpsert, FileCompleted, NodeUpsert,

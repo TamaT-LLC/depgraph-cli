@@ -43,9 +43,10 @@ pub use cache::build_cache_key;
 pub use cancellation::CancellationToken;
 pub use config::{Config, DaemonConfig, default_store_path, init_config};
 pub use daemon::{
-    DAEMON_STATUS_SCHEMA_VERSION, DaemonAttempt, DaemonHandle, DaemonPhase, DaemonScanFuture,
-    DaemonScanOutcome, DaemonScanRequest, DaemonScanRunner, DaemonStatus, EventCoalescer,
-    IncrementalWorkerExecutor, IncrementalWorkerFuture, IncrementalWorkerOutcome,
+    DAEMON_INCREMENTAL_TRACE_SCHEMA_VERSION, DAEMON_STATUS_SCHEMA_VERSION, DaemonAttempt,
+    DaemonHandle, DaemonIncrementalTrace, DaemonPhase, DaemonScanFuture, DaemonScanOutcome,
+    DaemonScanRequest, DaemonScanRunner, DaemonStatus, EventCoalescer, IncrementalWorkerExecutor,
+    IncrementalWorkerFuture, IncrementalWorkerOutcome, IncrementalWorkerTrace,
     RepositoryScanRunner, WatchIgnoreRules, WatchPathKind, WatchedPath, acquire_store_writer_lock,
     coalesce_incremental_changes, start_daemon_with_runner, start_repository_daemon,
 };

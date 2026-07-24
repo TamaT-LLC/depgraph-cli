@@ -5,9 +5,9 @@ use depgraph_protocol::{
     DeltaFileCoverage, DeltaNodeUpsert, DeltaScope, DeltaStarted, EdgeDelete, Evidence,
     EvidenceDelete, EvidenceKind, EvidenceUpsert, GraphEdge, GraphNode, NodeDelete,
     PROTOCOL_SCHEMA, Phase, Precision, ProtocolError, ResolutionStatus, SiteDelete, SiteUpsert,
-    WORKER_DELTA_CAPABILITY, WorkerDeltaFileChange, WorkerDeltaFileChangeKind, WorkerDeltaRequest,
-    WorkerProtocolMode, build_delta_stable_id, delta_graph_digest, negotiate_worker_protocol,
-    validate_delta_ndjson, validate_ndjson,
+    WORKER_DELTA_CAPABILITY, WorkerDeltaAnalysisMode, WorkerDeltaFileChange,
+    WorkerDeltaFileChangeKind, WorkerDeltaRequest, WorkerProtocolMode, build_delta_stable_id,
+    delta_graph_digest, negotiate_worker_protocol, validate_delta_ndjson, validate_ndjson,
 };
 use pretty_assertions::assert_eq;
 use serde_json::{Value, json};
@@ -96,6 +96,38 @@ fn worker_delta_request_round_trips_an_exact_canonical_base_and_closure() {
     let decoded: WorkerDeltaRequest = serde_json::from_slice(&encoded).expect("request decode");
     decoded.validate().expect("decoded request");
     assert_eq!(decoded.base_graph().expect("decoded base"), base);
+    assert_eq!(decoded.analysis_mode, WorkerDeltaAnalysisMode::Complete);
+    let mut legacy = serde_json::to_value(&request).expect("legacy request JSON");
+    legacy
+        .as_object_mut()
+        .expect("request object")
+        .remove("analysis_mode");
+    let legacy: WorkerDeltaRequest = serde_json::from_value(legacy).expect("legacy request decode");
+    assert_eq!(legacy.analysis_mode, WorkerDeltaAnalysisMode::Complete);
+    legacy.validate().expect("legacy request");
+
+    let semantic_noop = WorkerDeltaRequest::new_semantic_noop(
+        "scan-delta-request",
+        "web",
+        vec![WorkerDeltaFileChange {
+            kind: WorkerDeltaFileChangeKind::Modified,
+            old_path: None,
+            new_path: Some("src/index.ts".into()),
+        }],
+        DeltaScope {
+            paths: vec!["src/index.ts".into()],
+            package_locators: vec![],
+            profile_ids: vec![PROFILE_ID.into()],
+            artifact_node_ids: vec![],
+            adapters: vec!["web".into()],
+        },
+        &base,
+    )
+    .expect("semantic no-op request");
+    assert_eq!(
+        semantic_noop.analysis_mode,
+        WorkerDeltaAnalysisMode::SemanticNoop
+    );
 }
 
 #[test]

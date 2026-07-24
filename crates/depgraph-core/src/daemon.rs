@@ -13,7 +13,7 @@ use depgraph_protocol::{
     DeltaScope, ValidatedDelta, WORKER_DELTA_CAPABILITY, WorkerDeltaFileChange,
     WorkerDeltaFileChangeKind, WorkerDeltaRequest, WorkerProtocolMode, negotiate_worker_protocol,
 };
-use depgraph_store::InterruptedAttemptRecovery;
+use depgraph_store::{IncrementalReplacementScope, InterruptedAttemptRecovery};
 use notify::{
     Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
     event::{ModifyKind, RenameMode},
@@ -27,21 +27,23 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::{
-    CancellationToken, Config, DaemonConfig, IncrementalChangeKind, IncrementalFileChange,
-    IncrementalInvalidationMode, IncrementalInvalidationPlan, ScanCacheMode, open_store,
+    CancellationToken, Config, DaemonConfig, INCREMENTAL_PLAN_SCHEMA_VERSION,
+    IncrementalChangeKind, IncrementalFileChange, IncrementalInvalidationMode,
+    IncrementalInvalidationPlan, IncrementalInvalidationReason, ScanCacheMode, open_store,
     plan_incremental_invalidation, run_scan_with_cache_mode_and_cancellation,
     scan::{cancel_scan, complete_scan, git_source_revision},
     worker::{
-        AdapterKind, execute_worker_delta_with_cancellation, locate_worker,
-        probe_worker_version_with_cancellation, worker_capabilities,
+        AdapterKind, WorkerFailureKind, execute_worker_delta_with_cancellation, is_security_error,
+        locate_worker, probe_worker_version_with_cancellation, worker_capabilities,
     },
 };
 
 pub const DAEMON_STATUS_SCHEMA_VERSION: &str = "daemon-status-v1";
+pub const DAEMON_INCREMENTAL_TRACE_SCHEMA_VERSION: &str = "daemon-incremental-trace-v1";
 
-// Exact-base requests currently carry the full canonical graph. Keep that
-// materialization bounded until the fine-grained worker state in TASK-067 can
-// serve package-sized closures without repeated full-graph digest work.
+// Complete-reanalysis requests still carry their canonical graph closure and
+// remain bounded. The one-file semantic no-op path uses a one-node projection
+// and sparse overlay instead, so it never reaches this repository-size guard.
 const MAX_WORKER_DELTA_SCOPE_PATHS: usize = 4_096;
 
 const DEFAULT_IGNORED_COMPONENTS: &[&str] = &[
@@ -547,6 +549,19 @@ pub struct DaemonScanOutcome {
     pub base_snapshot_id: Option<String>,
     pub invalidation_plan: Option<IncrementalInvalidationPlan>,
     pub invalidation_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incremental_trace: Option<DaemonIncrementalTrace>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DaemonIncrementalTrace {
+    pub schema_version: String,
+    pub mode: String,
+    pub base_projection_milliseconds: u64,
+    pub worker_capability_milliseconds: u64,
+    pub worker_analysis_milliseconds: u64,
+    pub store_commit_milliseconds: u64,
+    pub total_milliseconds: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -561,6 +576,8 @@ pub struct DaemonAttempt {
     pub completed_snapshot_id: Option<String>,
     pub invalidation_plan: Option<IncrementalInvalidationPlan>,
     pub invalidation_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incremental_trace: Option<DaemonIncrementalTrace>,
     pub error: Option<String>,
 }
 
@@ -588,15 +605,23 @@ pub trait DaemonScanRunner: Send + Sync + 'static {
     fn run(&self, request: DaemonScanRequest, cancellation: CancellationToken) -> DaemonScanFuture;
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct IncrementalWorkerTrace {
+    pub capability_probe_milliseconds: u64,
+    pub analysis_milliseconds: u64,
+}
+
 #[derive(Debug)]
 pub enum IncrementalWorkerOutcome {
     Unsupported {
         reason: String,
+        trace: IncrementalWorkerTrace,
     },
     Delta {
         delta: Box<ValidatedDelta>,
         stderr: String,
         stderr_truncated: bool,
+        trace: IncrementalWorkerTrace,
     },
 }
 
@@ -625,9 +650,14 @@ impl IncrementalWorkerExecutor for ProcessIncrementalWorkerExecutor {
         cancellation: CancellationToken,
     ) -> IncrementalWorkerFuture {
         Box::pin(async move {
+            let capability_started = Instant::now();
             let Some(adapter) = AdapterKind::from_name(&request.adapter) else {
                 return Ok(IncrementalWorkerOutcome::Unsupported {
                     reason: format!("unknown delta adapter {}", request.adapter),
+                    trace: IncrementalWorkerTrace {
+                        capability_probe_milliseconds: elapsed_milliseconds(capability_started),
+                        analysis_milliseconds: 0,
+                    },
                 });
             };
             let spec = match locate_worker(adapter) {
@@ -635,6 +665,10 @@ impl IncrementalWorkerExecutor for ProcessIncrementalWorkerExecutor {
                 Err(error) => {
                     return Ok(IncrementalWorkerOutcome::Unsupported {
                         reason: format!("delta worker unavailable: {error:#}"),
+                        trace: IncrementalWorkerTrace {
+                            capability_probe_milliseconds: elapsed_milliseconds(capability_started),
+                            analysis_milliseconds: 0,
+                        },
                     });
                 }
             };
@@ -647,9 +681,16 @@ impl IncrementalWorkerExecutor for ProcessIncrementalWorkerExecutor {
                     Err(error) => {
                         return Ok(IncrementalWorkerOutcome::Unsupported {
                             reason: format!("delta capability probe failed: {error:#}"),
+                            trace: IncrementalWorkerTrace {
+                                capability_probe_milliseconds: elapsed_milliseconds(
+                                    capability_started,
+                                ),
+                                analysis_milliseconds: 0,
+                            },
                         });
                     }
                 };
+            let capability_probe_milliseconds = elapsed_milliseconds(capability_started);
             let core_capabilities = vec![WORKER_DELTA_CAPABILITY.to_owned()];
             let worker_capabilities = worker_capabilities(&handshake);
             if negotiate_worker_protocol(&core_capabilities, &worker_capabilities)
@@ -660,8 +701,13 @@ impl IncrementalWorkerExecutor for ProcessIncrementalWorkerExecutor {
                         "{} worker does not advertise {WORKER_DELTA_CAPABILITY}",
                         adapter.name()
                     ),
+                    trace: IncrementalWorkerTrace {
+                        capability_probe_milliseconds,
+                        analysis_milliseconds: 0,
+                    },
                 });
             }
+            let analysis_started = Instant::now();
             let output = execute_worker_delta_with_cancellation(
                 spec,
                 root,
@@ -671,6 +717,11 @@ impl IncrementalWorkerExecutor for ProcessIncrementalWorkerExecutor {
                 cancellation,
             )
             .await;
+            let analysis_milliseconds = elapsed_milliseconds(analysis_started);
+            let trace = IncrementalWorkerTrace {
+                capability_probe_milliseconds,
+                analysis_milliseconds,
+            };
             if output.adapter != adapter {
                 bail!("delta worker returned a different adapter");
             }
@@ -681,6 +732,16 @@ impl IncrementalWorkerExecutor for ProcessIncrementalWorkerExecutor {
                 if output.security_violation {
                     bail!("security policy violation: delta worker failed ({kind}): {error}");
                 }
+                if output.failure_kind == Some(WorkerFailureKind::NonzeroExit)
+                    && output
+                        .stderr
+                        .starts_with("depgraph-web-worker: incremental fallback required:")
+                {
+                    return Ok(IncrementalWorkerOutcome::Unsupported {
+                        reason: output.stderr.trim().to_owned(),
+                        trace,
+                    });
+                }
                 bail!("delta worker failed ({kind}): {error}");
             }
             let delta = output
@@ -690,6 +751,7 @@ impl IncrementalWorkerExecutor for ProcessIncrementalWorkerExecutor {
                 delta: Box::new(delta),
                 stderr: output.stderr,
                 stderr_truncated: output.stderr_truncated,
+                trace,
             })
         })
     }
@@ -741,6 +803,7 @@ impl DaemonScanRunner for RepositoryScanRunner {
         let strict = self.strict;
         let incremental_worker = self.incremental_worker.clone();
         Box::pin(async move {
+            let attempt_started = Instant::now();
             if cancellation.is_cancelled() {
                 return Ok(DaemonScanOutcome {
                     scan_id: None,
@@ -749,10 +812,136 @@ impl DaemonScanRunner for RepositoryScanRunner {
                     base_snapshot_id: None,
                     invalidation_plan: None,
                     invalidation_error: None,
+                    incremental_trace: None,
                 });
             }
             let mut store = open_store(&store_path)?;
             let base_snapshot_id = store.current_snapshot_id()?;
+            let mut force_full_scan = false;
+            if let (Some(base_snapshot_id), Some(path)) = (
+                base_snapshot_id.as_deref(),
+                semantic_noop_change_path(&request.changes),
+            ) {
+                let base_projection_started = Instant::now();
+                let semantic_base = store.semantic_noop_delta_base(base_snapshot_id, path)?;
+                let base_projection_milliseconds = elapsed_milliseconds(base_projection_started);
+                if let Some(base) = semantic_base {
+                    let scan_id = Uuid::new_v4().to_string();
+                    let delta_request = build_semantic_noop_worker_delta_request(
+                        &scan_id,
+                        &request.changes,
+                        &base,
+                    )?;
+                    let plan = semantic_noop_invalidation_plan(
+                        base_snapshot_id,
+                        &request.changes,
+                        path,
+                        &base,
+                    )?;
+                    match incremental_worker
+                        .run(
+                            root.clone(),
+                            config.clone(),
+                            delta_request,
+                            cancellation.clone(),
+                        )
+                        .await
+                    {
+                        Ok(IncrementalWorkerOutcome::Unsupported { reason, .. }) => {
+                            tracing::debug!(
+                                reason,
+                                "semantic no-op delta unavailable; planning complete fallback"
+                            );
+                        }
+                        Ok(IncrementalWorkerOutcome::Delta {
+                            delta,
+                            stderr,
+                            stderr_truncated,
+                            trace,
+                        }) => {
+                            if cancellation.is_cancelled() {
+                                return Ok(cancelled_daemon_outcome(base_snapshot_id, Some(plan)));
+                            }
+                            let source_revision = git_source_revision(&root);
+                            let store_commit_started = Instant::now();
+                            match store.commit_semantic_noop_delta(
+                                &scan_id,
+                                &root,
+                                strict,
+                                base_snapshot_id,
+                                source_revision.as_deref(),
+                                &delta,
+                                &stderr,
+                                stderr_truncated,
+                            ) {
+                                Ok(completed_snapshot_id) => {
+                                    return Ok(DaemonScanOutcome {
+                                        scan_id: Some(scan_id),
+                                        status: "completed".to_owned(),
+                                        completed_snapshot_id: Some(completed_snapshot_id),
+                                        base_snapshot_id: Some(base_snapshot_id.to_owned()),
+                                        invalidation_plan: Some(plan),
+                                        invalidation_error: None,
+                                        incremental_trace: Some(DaemonIncrementalTrace {
+                                            schema_version: DAEMON_INCREMENTAL_TRACE_SCHEMA_VERSION
+                                                .to_owned(),
+                                            mode: "semantic_noop".to_owned(),
+                                            base_projection_milliseconds,
+                                            worker_capability_milliseconds: trace
+                                                .capability_probe_milliseconds,
+                                            worker_analysis_milliseconds: trace
+                                                .analysis_milliseconds,
+                                            store_commit_milliseconds: elapsed_milliseconds(
+                                                store_commit_started,
+                                            ),
+                                            total_milliseconds: elapsed_milliseconds(
+                                                attempt_started,
+                                            ),
+                                        }),
+                                    });
+                                }
+                                Err(error) => {
+                                    return Ok(DaemonScanOutcome {
+                                        scan_id: Some(scan_id),
+                                        status: "failed".to_owned(),
+                                        completed_snapshot_id: None,
+                                        base_snapshot_id: Some(base_snapshot_id.to_owned()),
+                                        invalidation_plan: Some(plan),
+                                        invalidation_error: Some(format!(
+                                            "semantic no-op delta failed: {error:#}"
+                                        )),
+                                        incremental_trace: None,
+                                    });
+                                }
+                            }
+                        }
+                        Err(error) if cancellation.is_cancelled() => {
+                            let _ = error;
+                            return Ok(cancelled_daemon_outcome(base_snapshot_id, Some(plan)));
+                        }
+                        Err(error) if !is_security_error(&format!("{error:#}")) => {
+                            tracing::debug!(
+                                error = %format!("{error:#}"),
+                                "semantic no-op worker failed; using full scan fallback"
+                            );
+                            force_full_scan = true;
+                        }
+                        Err(error) => {
+                            return Ok(DaemonScanOutcome {
+                                scan_id: None,
+                                status: "failed".to_owned(),
+                                completed_snapshot_id: None,
+                                base_snapshot_id: Some(base_snapshot_id.to_owned()),
+                                invalidation_plan: Some(plan),
+                                invalidation_error: Some(format!(
+                                    "semantic no-op worker failed: {error:#}"
+                                )),
+                                incremental_trace: None,
+                            });
+                        }
+                    }
+                }
+            }
             let (invalidation_plan, invalidation_error) = if let Some(base_snapshot_id) =
                 base_snapshot_id.as_deref()
             {
@@ -774,7 +963,7 @@ impl DaemonScanRunner for RepositoryScanRunner {
                 (base_snapshot_id.as_deref(), invalidation_plan.as_ref())
             {
                 let scan_id = Uuid::new_v4().to_string();
-                let base = if worker_delta_plan_is_eligible(plan) {
+                let base = if !force_full_scan && worker_delta_plan_is_eligible(plan) {
                     Some(store.delta_base_graph(base_snapshot_id)?)
                 } else {
                     None
@@ -791,7 +980,7 @@ impl DaemonScanRunner for RepositoryScanRunner {
                         )
                         .await
                     {
-                        Ok(IncrementalWorkerOutcome::Unsupported { reason }) => {
+                        Ok(IncrementalWorkerOutcome::Unsupported { reason, .. }) => {
                             tracing::debug!(
                                 reason,
                                 "incremental delta unavailable; using full scan"
@@ -801,6 +990,7 @@ impl DaemonScanRunner for RepositoryScanRunner {
                             delta,
                             stderr,
                             stderr_truncated,
+                            ..
                         }) => {
                             if cancellation.is_cancelled() {
                                 return Ok(cancelled_daemon_outcome(
@@ -873,6 +1063,7 @@ impl DaemonScanRunner for RepositoryScanRunner {
                                         base_snapshot_id: Some(base_snapshot_id.to_owned()),
                                         invalidation_plan: Some(plan.clone()),
                                         invalidation_error: Some(message),
+                                        incremental_trace: None,
                                     });
                                 }
                             }
@@ -894,6 +1085,7 @@ impl DaemonScanRunner for RepositoryScanRunner {
                                 invalidation_error: Some(format!(
                                     "incremental worker failed: {error:#}"
                                 )),
+                                incremental_trace: None,
                             });
                         }
                     }
@@ -927,9 +1119,99 @@ impl DaemonScanRunner for RepositoryScanRunner {
                 base_snapshot_id,
                 invalidation_plan,
                 invalidation_error,
+                incremental_trace: None,
             })
         })
     }
+}
+
+fn semantic_noop_change_path(changes: &[IncrementalFileChange]) -> Option<&str> {
+    match changes {
+        [change]
+            if matches!(
+                change.kind,
+                IncrementalChangeKind::Added | IncrementalChangeKind::Modified
+            ) =>
+        {
+            change.new_path.as_deref()
+        }
+        _ => None,
+    }
+}
+
+fn build_semantic_noop_worker_delta_request(
+    scan_id: &str,
+    changes: &[IncrementalFileChange],
+    base: &depgraph_protocol::DeltaBaseGraph,
+) -> Result<WorkerDeltaRequest> {
+    let path = semantic_noop_change_path(changes)
+        .context("semantic no-op worker request requires one existing file write")?;
+    WorkerDeltaRequest::new_semantic_noop(
+        scan_id,
+        "web",
+        changes
+            .iter()
+            .map(|change| WorkerDeltaFileChange {
+                kind: match change.kind {
+                    IncrementalChangeKind::Added => WorkerDeltaFileChangeKind::Added,
+                    IncrementalChangeKind::Modified => WorkerDeltaFileChangeKind::Modified,
+                    IncrementalChangeKind::Deleted => WorkerDeltaFileChangeKind::Deleted,
+                    IncrementalChangeKind::Renamed => WorkerDeltaFileChangeKind::Renamed,
+                },
+                old_path: change.old_path.clone(),
+                new_path: change.new_path.clone(),
+            })
+            .collect(),
+        DeltaScope {
+            paths: vec![path.to_owned()],
+            package_locators: Vec::new(),
+            profile_ids: base.profiles.iter().cloned().collect(),
+            artifact_node_ids: Vec::new(),
+            adapters: vec!["web".to_owned()],
+        },
+        base,
+    )
+    .map_err(Into::into)
+}
+
+fn semantic_noop_invalidation_plan(
+    base_snapshot_id: &str,
+    changes: &[IncrementalFileChange],
+    path: &str,
+    base: &depgraph_protocol::DeltaBaseGraph,
+) -> Result<IncrementalInvalidationPlan> {
+    let affected_profile_ids = base.profiles.iter().cloned().collect::<Vec<_>>();
+    let affected_package_locators = base
+        .nodes
+        .values()
+        .filter_map(|node| {
+            node.properties
+                .get("package_locator")
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned)
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let replacement_scope = IncrementalReplacementScope::new(
+        [path.to_owned()],
+        affected_package_locators.iter().cloned(),
+        affected_profile_ids.iter().cloned(),
+        std::iter::empty(),
+        std::iter::empty(),
+        ["web".to_owned()],
+    )?;
+    Ok(IncrementalInvalidationPlan {
+        schema_version: INCREMENTAL_PLAN_SCHEMA_VERSION.to_owned(),
+        base_snapshot_id: base_snapshot_id.to_owned(),
+        mode: IncrementalInvalidationMode::ScopedReplacement,
+        changes: changes.to_vec(),
+        reasons: vec![IncrementalInvalidationReason::SourceChanged],
+        affected_package_locators,
+        affected_profile_ids,
+        affected_generated_artifact_ids: Vec::new(),
+        replacement_scope,
+    })
 }
 
 fn worker_delta_plan_is_eligible(plan: &IncrementalInvalidationPlan) -> bool {
@@ -985,6 +1267,7 @@ fn cancelled_daemon_outcome(
         base_snapshot_id: Some(base_snapshot_id.to_owned()),
         invalidation_plan,
         invalidation_error: None,
+        incremental_trace: None,
     }
 }
 
@@ -1007,6 +1290,7 @@ fn daemon_outcome_from_scan(
         base_snapshot_id: Some(base_snapshot_id.to_owned()),
         invalidation_plan: Some(invalidation_plan),
         invalidation_error,
+        incremental_trace: None,
     })
 }
 
@@ -1468,6 +1752,7 @@ fn record_attempt(
             completed_snapshot_id: outcome.completed_snapshot_id,
             invalidation_plan: outcome.invalidation_plan,
             invalidation_error: outcome.invalidation_error,
+            incremental_trace: outcome.incremental_trace,
             error: None,
         },
         Err(error) => DaemonAttempt {
@@ -1481,6 +1766,7 @@ fn record_attempt(
             completed_snapshot_id: None,
             invalidation_plan: None,
             invalidation_error: None,
+            incremental_trace: None,
             error: Some(format!("{error:#}")),
         },
     };
@@ -1497,6 +1783,10 @@ fn publish_status(sender: &watch::Sender<DaemonStatus>, status: &DaemonStatus) {
 
 fn timestamp() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
+fn elapsed_milliseconds(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]
@@ -1527,6 +1817,7 @@ mod tests {
                     base_snapshot_id: None,
                     invalidation_plan: None,
                     invalidation_error: None,
+                    incremental_trace: None,
                 })
             })
         }
@@ -1556,6 +1847,7 @@ mod tests {
                         base_snapshot_id: Some("stable-snapshot".to_owned()),
                         invalidation_plan: None,
                         invalidation_error: None,
+                        incremental_trace: None,
                     });
                 }
                 started.store(true, Ordering::Release);
@@ -1568,6 +1860,7 @@ mod tests {
                     base_snapshot_id: Some("stable-snapshot".to_owned()),
                     invalidation_plan: None,
                     invalidation_error: None,
+                    incremental_trace: None,
                 })
             })
         }
@@ -1597,6 +1890,7 @@ mod tests {
                         base_snapshot_id: Some("stable-snapshot".to_owned()),
                         invalidation_plan: None,
                         invalidation_error: None,
+                        incremental_trace: None,
                     });
                 }
                 Ok(DaemonScanOutcome {
@@ -1606,6 +1900,7 @@ mod tests {
                     base_snapshot_id: Some("stable-snapshot".to_owned()),
                     invalidation_plan: None,
                     invalidation_error: None,
+                    incremental_trace: None,
                 })
             })
         }
@@ -1634,6 +1929,7 @@ mod tests {
                     base_snapshot_id: None,
                     invalidation_plan: None,
                     invalidation_error: None,
+                    incremental_trace: None,
                 })
             })
         }
@@ -1658,6 +1954,7 @@ mod tests {
                     delta: Box::new(changed_source_delta(&request)?),
                     stderr: "fixture delta worker".to_owned(),
                     stderr_truncated: false,
+                    trace: IncrementalWorkerTrace::default(),
                 })
             })
         }
@@ -1680,6 +1977,7 @@ mod tests {
                     delta: Box::new(delta),
                     stderr: String::new(),
                     stderr_truncated: false,
+                    trace: IncrementalWorkerTrace::default(),
                 })
             })
         }
@@ -1716,6 +2014,7 @@ mod tests {
                     delta: Box::new(delta),
                     stderr: String::new(),
                     stderr_truncated: false,
+                    trace: IncrementalWorkerTrace::default(),
                 })
             })
         }
@@ -1734,6 +2033,7 @@ mod tests {
             Box::pin(async {
                 Ok(IncrementalWorkerOutcome::Unsupported {
                     reason: "fixture worker is legacy".to_owned(),
+                    trace: IncrementalWorkerTrace::default(),
                 })
             })
         }
@@ -1809,7 +2109,8 @@ mod tests {
                 "properties": {
                     "path": path,
                     "package_locator": package,
-                    "content_hash": "before"
+                    "content_hash": format!("sha256:{}", "1".repeat(64)),
+                    "analysis_hash": format!("sha256:{}", "a".repeat(64))
                 }
             });
             event
@@ -1923,9 +2224,10 @@ mod tests {
             .get(SOURCE_NODE_ID)
             .context("fixture source node is missing")?
             .clone();
-        changed
-            .properties
-            .insert("content_hash".to_owned(), serde_json::json!("after"));
+        changed.properties.insert(
+            "content_hash".to_owned(),
+            serde_json::json!(format!("sha256:{}", "2".repeat(64))),
+        );
         let common = |seq| CommonFields {
             protocol_version: "1.0".to_owned(),
             scan_id: request.scan_id.clone(),
@@ -2177,9 +2479,22 @@ mod tests {
             outcome.completed_snapshot_id.as_deref(),
             Some(base_snapshot_id.as_str())
         );
+        let trace = outcome
+            .incremental_trace
+            .as_ref()
+            .context("semantic no-op trace")?;
+        assert_eq!(
+            trace.schema_version,
+            DAEMON_INCREMENTAL_TRACE_SCHEMA_VERSION
+        );
+        assert_eq!(trace.mode, "semantic_noop");
         let requests = worker.requests.lock().unwrap();
         assert_eq!(requests.len(), 1);
         let request = &requests[0];
+        assert_eq!(
+            request.analysis_mode,
+            depgraph_protocol::WorkerDeltaAnalysisMode::SemanticNoop
+        );
         assert_eq!(request.scope.adapters, ["web"]);
         assert!(request.scope.paths.contains(&"src/index.ts".to_owned()));
         assert!(
@@ -2198,13 +2513,19 @@ mod tests {
             .iter()
             .find(|node| node.id == SOURCE_NODE_ID)
             .context("updated source")?;
-        assert_eq!(source.properties["content_hash"], "after");
+        assert_eq!(
+            source.properties["content_hash"],
+            serde_json::json!(format!("sha256:{}", "2".repeat(64)))
+        );
         let untouched = snapshot
             .nodes
             .iter()
             .find(|node| node.id == OTHER_NODE_ID)
             .context("unrelated node")?;
-        assert_eq!(untouched.properties["content_hash"], "before");
+        assert_eq!(
+            untouched.properties["content_hash"],
+            serde_json::json!(format!("sha256:{}", "1".repeat(64)))
+        );
         let scan_id = outcome.scan_id.context("incremental scan ID")?;
         assert_eq!(
             store
@@ -2218,14 +2539,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn incremental_worker_failure_or_cancellation_never_promotes_partial_state() -> Result<()>
-    {
+    async fn incremental_cancellation_or_tampering_never_promotes_partial_state() -> Result<()> {
         for (name, worker, expected_status) in [
-            (
-                "failed",
-                Arc::new(FailingIncrementalWorker) as Arc<dyn IncrementalWorkerExecutor>,
-                "failed",
-            ),
             (
                 "cancelled",
                 Arc::new(CancellingIncrementalWorker) as Arc<dyn IncrementalWorkerExecutor>,
@@ -2272,9 +2587,50 @@ mod tests {
                     .find(|node| node.id == SOURCE_NODE_ID)
                     .context("base source")?
                     .properties["content_hash"],
-                "before"
+                serde_json::json!(format!("sha256:{}", "1".repeat(64)))
             );
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn semantic_noop_worker_failure_uses_the_atomic_full_scan_fallback() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let store_path = root.path().join("graph.db");
+        let base_snapshot_id = seed_incremental_store(root.path(), &store_path)?;
+        let runner = RepositoryScanRunner::new(
+            root.path().to_path_buf(),
+            store_path.clone(),
+            Config::default(),
+            false,
+        )
+        .with_incremental_worker(Arc::new(FailingIncrementalWorker));
+        let outcome = runner
+            .run(
+                DaemonScanRequest {
+                    attempt_id: "worker-failure-fallback".to_owned(),
+                    changes: vec![IncrementalFileChange::modified("src/index.ts")],
+                    started_at: timestamp(),
+                },
+                CancellationToken::new(),
+            )
+            .await?;
+
+        assert_eq!(outcome.status, "completed");
+        assert_eq!(
+            outcome.base_snapshot_id.as_deref(),
+            Some(base_snapshot_id.as_str())
+        );
+        assert!(outcome.invalidation_error.is_none());
+        let completed_snapshot_id = outcome
+            .completed_snapshot_id
+            .context("full scan fallback snapshot")?;
+        assert_ne!(completed_snapshot_id, base_snapshot_id);
+        let store = open_store(&store_path)?;
+        assert_eq!(
+            store.current_snapshot_id()?.as_deref(),
+            Some(completed_snapshot_id.as_str())
+        );
         Ok(())
     }
 

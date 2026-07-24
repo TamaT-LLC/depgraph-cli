@@ -100,11 +100,21 @@ pub struct WorkerDeltaRequest {
     pub protocol_version: String,
     pub scan_id: String,
     pub adapter: String,
+    #[serde(default)]
+    pub analysis_mode: WorkerDeltaAnalysisMode,
     pub base_snapshot_id: String,
     pub base_graph_digest: String,
     pub changes: Vec<WorkerDeltaFileChange>,
     pub scope: DeltaScope,
     pub base_graph: WorkerDeltaBaseGraph,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerDeltaAnalysisMode {
+    #[default]
+    Complete,
+    SemanticNoop,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -509,11 +519,47 @@ impl WorkerDeltaRequest {
         scope: DeltaScope,
         base: &DeltaBaseGraph,
     ) -> Result<Self, ProtocolError> {
+        Self::new_with_mode(
+            scan_id,
+            adapter,
+            WorkerDeltaAnalysisMode::Complete,
+            changes,
+            scope,
+            base,
+        )
+    }
+
+    pub fn new_semantic_noop(
+        scan_id: impl Into<String>,
+        adapter: impl Into<String>,
+        changes: Vec<WorkerDeltaFileChange>,
+        scope: DeltaScope,
+        base: &DeltaBaseGraph,
+    ) -> Result<Self, ProtocolError> {
+        Self::new_with_mode(
+            scan_id,
+            adapter,
+            WorkerDeltaAnalysisMode::SemanticNoop,
+            changes,
+            scope,
+            base,
+        )
+    }
+
+    fn new_with_mode(
+        scan_id: impl Into<String>,
+        adapter: impl Into<String>,
+        analysis_mode: WorkerDeltaAnalysisMode,
+        changes: Vec<WorkerDeltaFileChange>,
+        scope: DeltaScope,
+        base: &DeltaBaseGraph,
+    ) -> Result<Self, ProtocolError> {
         let request = Self {
             schema_version: WORKER_DELTA_REQUEST_SCHEMA_VERSION.to_owned(),
             protocol_version: PROTOCOL_VERSION.to_owned(),
             scan_id: scan_id.into(),
             adapter: adapter.into(),
+            analysis_mode,
             base_snapshot_id: base.snapshot_id.clone(),
             base_graph_digest: base.graph_digest.clone(),
             changes,

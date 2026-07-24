@@ -7,7 +7,7 @@ use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use super::{Store, ensure_scan_staging};
+use super::{Store, ensure_scan_staging, incremental::scan_is_semantic_noop_overlay};
 
 pub const CACHE_CONTRACT_VERSION: u32 = 1;
 
@@ -329,10 +329,24 @@ impl Store {
         target_scan_id: &str,
     ) -> Result<()> {
         self.validate_snapshot_for_layer(CacheLayer::Semantic, snapshot_id)?;
-        let source_scan_id = self
+        let mut source = self
             .completed_snapshot(snapshot_id)?
-            .context("validated cache snapshot disappeared")?
-            .scan_id;
+            .context("validated cache snapshot disappeared")?;
+        let mut overlay_scan_ids = Vec::new();
+        while scan_is_semantic_noop_overlay(&self.connection, &source.scan_id)? {
+            overlay_scan_ids.push(source.scan_id.clone());
+            let parent_snapshot_id = source
+                .parent_snapshot_id
+                .as_deref()
+                .context("semantic no-op cache snapshot has no parent")?;
+            source = self
+                .completed_snapshot(parent_snapshot_id)?
+                .context("semantic no-op cache parent disappeared")?;
+            if source.source_kind != "scan" {
+                bail!("semantic cache overlay parent is not a completed scan snapshot");
+            }
+        }
+        let source_scan_id = source.scan_id;
         let tx = self.connection.transaction()?;
         ensure_scan_staging(&tx, target_scan_id)?;
         let source_status: String = tx.query_row(
@@ -413,6 +427,30 @@ impl Store {
              SELECT ?1, adapter, stderr, truncated FROM adapter_logs WHERE scan_id=?2",
             params![target_scan_id, source_scan_id],
         )?;
+        for overlay_scan_id in overlay_scan_ids.iter().rev() {
+            tx.execute(
+                "INSERT INTO nodes(
+                    scan_id, id, kind, locator, display_name, properties_json, raw_json
+                 ) SELECT ?1, id, kind, locator, display_name, properties_json, raw_json
+                     FROM nodes WHERE scan_id=?2
+                 ON CONFLICT(scan_id, id) DO UPDATE SET
+                    kind=excluded.kind,
+                    locator=excluded.locator,
+                    display_name=excluded.display_name,
+                    properties_json=excluded.properties_json,
+                    raw_json=excluded.raw_json",
+                params![target_scan_id, overlay_scan_id],
+            )?;
+            tx.execute(
+                "INSERT INTO adapter_logs(scan_id, adapter, stderr, truncated)
+                 SELECT ?1, adapter, stderr, truncated
+                   FROM adapter_logs WHERE scan_id=?2
+                 ON CONFLICT(scan_id, adapter) DO UPDATE SET
+                    stderr=excluded.stderr,
+                    truncated=excluded.truncated",
+                params![target_scan_id, overlay_scan_id],
+            )?;
+        }
         tx.execute(
             "UPDATE scans
                 SET project_code_executed=(SELECT project_code_executed FROM scans WHERE id=?2),

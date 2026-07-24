@@ -7,16 +7,17 @@ use anyhow::{Context, Result, bail};
 use chrono::{SecondsFormat, Utc};
 use depgraph_protocol::{
     Coverage, DeltaBaseGraph, DeltaCoverage, DeltaCoverageKey, DeltaEvidenceKey,
-    DeltaEvidenceOwner, DeltaFileCoverage, DeltaValidator, Evidence, ValidatedDelta,
-    delta_graph_digest,
+    DeltaEvidenceOwner, DeltaFileCoverage, DeltaValidator, Evidence, GraphNode, ValidatedDelta,
+    delta_graph_digest, stable_id_from_value,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use super::{
     AdapterLogRecord, Store, completed_snapshot_identity, ensure_scan_staging,
-    ingest_event_in_transaction, insert_node, required_str, upsert_edge_row, upsert_site_row,
+    ingest_event_in_transaction, insert_node, load_completed_snapshot_record,
+    promote_completed_snapshot, required_str, upsert_edge_row, upsert_site_row,
 };
 
 const MAX_SCOPE_VALUES: usize = 100_000;
@@ -100,6 +101,148 @@ impl IncrementalReplacementScope {
 impl Store {
     pub fn delta_base_graph(&self, snapshot_id: &str) -> Result<DeltaBaseGraph> {
         load_delta_base_graph(&self.connection, snapshot_id)
+    }
+
+    /// Builds the bounded validation projection for a one-file semantic no-op.
+    ///
+    /// The projection intentionally contains only the changed file node and a
+    /// synthetic, internally consistent coverage ledger. Its digest is bound
+    /// to the exact current snapshot ID, while the eventual store transaction
+    /// separately proves that the projected node still matches that snapshot.
+    pub fn semantic_noop_delta_base(
+        &self,
+        snapshot_id: &str,
+        path: &str,
+    ) -> Result<Option<DeltaBaseGraph>> {
+        semantic_noop_delta_base(&self.connection, snapshot_id, path)
+    }
+
+    /// Atomically persists and promotes a proven content-fingerprint-only
+    /// mutation without cloning or digesting the repository-complete graph.
+    #[allow(clippy::too_many_arguments)]
+    pub fn commit_semantic_noop_delta(
+        &mut self,
+        scan_id: &str,
+        root: &Path,
+        strict: bool,
+        base_snapshot_id: &str,
+        source_revision: Option<&str>,
+        delta: &ValidatedDelta,
+        stderr: &str,
+        stderr_truncated: bool,
+    ) -> Result<String> {
+        if source_revision.is_some_and(|revision| revision.trim().is_empty()) {
+            bail!("source revision must not be empty");
+        }
+        let tx = self.connection.transaction()?;
+        ensure_current_base(&tx, base_snapshot_id)?;
+        if delta.base_snapshot_id != base_snapshot_id {
+            bail!("semantic no-op delta base does not match the current snapshot");
+        }
+        if delta.scope.paths.len() != 1
+            || delta.scope.adapters.as_slice() != ["web"]
+            || !delta.node_deletes.is_empty()
+            || delta.node_upserts.len() != 1
+            || !delta.site_deletes.is_empty()
+            || !delta.site_upserts.is_empty()
+            || !delta.edge_deletes.is_empty()
+            || !delta.edge_upserts.is_empty()
+            || !delta.evidence_deletes.is_empty()
+            || !delta.evidence_upserts.is_empty()
+            || !delta.coverage_deletes.is_empty()
+            || !delta.coverage_upserts.is_empty()
+        {
+            bail!("semantic no-op delta must contain exactly one Web file-node upsert");
+        }
+        let path = &delta.scope.paths[0];
+        let base = semantic_noop_delta_base(&tx, base_snapshot_id, path)?
+            .context("semantic no-op base file is unavailable")?;
+        let canonical = revalidate_delta(scan_id, base.clone(), &delta.events)?;
+        ensure_staged_metadata_for_delta(delta, &canonical)?;
+        let projected_result = apply_delta_to_graph(base.clone(), &canonical)?;
+        if delta_graph_digest(&projected_result) != canonical.result_graph_digest {
+            bail!("semantic no-op result digest does not match the projected graph");
+        }
+        let previous = base
+            .nodes
+            .values()
+            .next()
+            .context("semantic no-op projection has no file node")?;
+        let next = canonical
+            .node_upserts
+            .values()
+            .next()
+            .context("semantic no-op delta has no file-node upsert")?;
+        validate_semantic_noop_node(previous, next, path)?;
+
+        let started_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+        tx.execute(
+            "INSERT INTO scans(
+                id, root, status, strict, started_at, protocol_version,
+                parent_snapshot_id, source_revision, mutation_count
+             ) VALUES (?1, ?2, 'staging', ?3, ?4, '1.0', ?5, ?6, 1)",
+            params![
+                scan_id,
+                root.to_string_lossy(),
+                strict,
+                started_at,
+                base_snapshot_id,
+                source_revision,
+            ],
+        )?;
+        insert_node(&tx, scan_id, &serde_json::to_value(next)?)?;
+        tx.execute(
+            "INSERT INTO adapter_logs(scan_id, adapter, stderr, truncated)
+             VALUES (?1, 'web', ?2, ?3)",
+            params![scan_id, stderr, stderr_truncated],
+        )?;
+
+        let completed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+        let mutation_count = delta_mutation_count(&canonical);
+        let (snapshot_id, profile_ids) =
+            semantic_noop_snapshot_identity(&tx, scan_id, base_snapshot_id, source_revision)?;
+        tx.execute(
+            "INSERT INTO incremental_deltas(
+                scan_id, delta_id, adapter, base_snapshot_id, base_graph_digest,
+                result_graph_digest, scope_json, events_json, mutation_count,
+                status, prospective_snapshot_id, staged_at, completed_at
+             ) VALUES (?1, ?2, 'web', ?3, ?4, ?5, ?6, ?7, ?8,
+                       'applied', ?9, ?10, ?11)",
+            params![
+                scan_id,
+                canonical.delta_id,
+                base_snapshot_id,
+                canonical.base_graph_digest,
+                canonical.result_graph_digest,
+                serde_json::to_string(&canonical.scope)?,
+                serde_json::to_string(&canonical.events)?,
+                mutation_count,
+                snapshot_id,
+                started_at,
+                completed_at,
+            ],
+        )?;
+        tx.execute(
+            "UPDATE scans SET status='completed', completed_at=?2 WHERE id=?1",
+            params![scan_id, completed_at],
+        )?;
+        insert_semantic_noop_completed_snapshot(
+            &tx,
+            &snapshot_id,
+            scan_id,
+            base_snapshot_id,
+            source_revision,
+            &profile_ids,
+            &completed_at,
+        )?;
+        tx.execute(
+            "INSERT INTO current_successful(singleton, scan_id) VALUES (1, ?1)
+             ON CONFLICT(singleton) DO UPDATE SET scan_id=excluded.scan_id",
+            [scan_id],
+        )?;
+        promote_completed_snapshot(&tx, &snapshot_id)?;
+        tx.commit()?;
+        Ok(snapshot_id)
     }
 
     pub fn stage_incremental_delta(
@@ -483,19 +626,313 @@ fn load_staged_delta(
 }
 
 fn load_delta_base_graph(connection: &Connection, snapshot_id: &str) -> Result<DeltaBaseGraph> {
-    let (source_kind, scan_id) = connection
+    let mut current = snapshot_id.to_owned();
+    let mut visited = BTreeSet::new();
+    let mut overlays = Vec::new();
+    let mut graph = loop {
+        if !visited.insert(current.clone()) {
+            bail!("completed snapshot parent cycle detected while loading delta base");
+        }
+        let (source_kind, scan_id) = connection
+            .query_row(
+                "SELECT source_kind, scan_id FROM completed_snapshots
+                  WHERE id=?1 AND status='completed'",
+                [&current],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?
+            .with_context(|| format!("completed delta base snapshot {current} was not found"))?;
+        if source_kind != "scan" {
+            bail!("worker delta requires a completed scan snapshot base");
+        }
+        if !scan_is_semantic_noop_overlay(connection, &scan_id)? {
+            break load_scan_delta_graph(connection, &scan_id, &current)?;
+        }
+        overlays.push(scan_id.clone());
+        current = incremental_parent(connection, &scan_id)?;
+    };
+    if overlays.is_empty() {
+        return Ok(graph);
+    }
+    for scan_id in overlays.into_iter().rev() {
+        for raw in load_raw_records(connection, "nodes", &scan_id)? {
+            let node: GraphNode = serde_json::from_str(&raw)?;
+            graph.nodes.insert(node.id.clone(), node);
+        }
+    }
+    graph.snapshot_id = snapshot_id.to_owned();
+    graph.graph_digest = delta_graph_digest(&graph);
+    Ok(graph)
+}
+
+fn semantic_noop_delta_base(
+    connection: &Connection,
+    snapshot_id: &str,
+    path: &str,
+) -> Result<Option<DeltaBaseGraph>> {
+    let record = load_completed_snapshot_record(connection, snapshot_id)?
+        .with_context(|| format!("completed delta base snapshot {snapshot_id} was not found"))?;
+    if record.source_kind != "scan" {
+        return Ok(None);
+    }
+    let Some(node) = load_effective_file_node(connection, snapshot_id, path)? else {
+        return Ok(None);
+    };
+    if node.kind != "file"
+        || node.properties.get("path").and_then(Value::as_str) != Some(path)
+        || node
+            .properties
+            .get("analysis_hash")
+            .and_then(Value::as_str)
+            .is_none()
+    {
+        return Ok(None);
+    }
+
+    let mut graph = DeltaBaseGraph {
+        snapshot_id: snapshot_id.to_owned(),
+        profiles: record.profile_ids.iter().cloned().collect(),
+        nodes: BTreeMap::from([(node.id.clone(), node)]),
+        ..DeltaBaseGraph::default()
+    };
+    let aggregate = Coverage {
+        profiles: graph.profiles.len() as u64,
+        files_discovered: 1,
+        files_analyzed: 1,
+        ..Coverage::default()
+    };
+    graph.coverage.insert(
+        DeltaCoverageKey::Aggregate,
+        DeltaCoverage::Aggregate {
+            value: aggregate.clone(),
+        },
+    );
+    for profile_id in &graph.profiles {
+        let coverage = DeltaCoverage::Profile {
+            profile_id: profile_id.clone(),
+            value: Coverage {
+                profiles: 1,
+                files_discovered: 1,
+                files_analyzed: 1,
+                ..Coverage::default()
+            },
+        };
+        graph.coverage.insert(coverage.key(), coverage);
+    }
+    let file = DeltaCoverage::File {
+        adapter: "web".to_owned(),
+        path: path.to_owned(),
+        value: DeltaFileCoverage {
+            discovered_sites: 0,
+            emitted_sites: 0,
+            skipped_sites: 0,
+            skipped: false,
+            reason: None,
+        },
+    };
+    graph.coverage.insert(file.key(), file);
+    graph.graph_digest = delta_graph_digest(&graph);
+    Ok(Some(graph))
+}
+
+fn load_effective_file_node(
+    connection: &Connection,
+    snapshot_id: &str,
+    path: &str,
+) -> Result<Option<GraphNode>> {
+    let mut current = snapshot_id.to_owned();
+    let mut visited = BTreeSet::new();
+    loop {
+        if !visited.insert(current.clone()) {
+            bail!("completed snapshot parent cycle detected while resolving {path}");
+        }
+        let record = load_completed_snapshot_record(connection, &current)?
+            .with_context(|| format!("completed snapshot {current} was not found"))?;
+        if record.source_kind != "scan" {
+            return Ok(None);
+        }
+        let mut statement = connection.prepare(
+            "SELECT raw_json FROM nodes
+              WHERE scan_id=?1 AND kind='file'
+                AND json_extract(properties_json, '$.path')=?2
+              ORDER BY id",
+        )?;
+        let rows = statement
+            .query_map(params![record.scan_id, path], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        match rows.as_slice() {
+            [raw] => return Ok(Some(serde_json::from_str(raw)?)),
+            [] if scan_is_semantic_noop_overlay(connection, &record.scan_id)? => {
+                current = record
+                    .parent_snapshot_id
+                    .context("semantic no-op overlay has no parent snapshot")?;
+            }
+            [] => return Ok(None),
+            _ => bail!("snapshot {current} has multiple file nodes for path {path}"),
+        }
+    }
+}
+
+pub(super) fn scan_is_semantic_noop_overlay(
+    connection: &Connection,
+    scan_id: &str,
+) -> Result<bool> {
+    let has_incremental_deltas = connection
         .query_row(
-            "SELECT source_kind, scan_id FROM completed_snapshots
-              WHERE id=?1 AND status='completed'",
-            [snapshot_id],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            "SELECT 1 FROM sqlite_master
+              WHERE type='table' AND name='incremental_deltas'",
+            [],
+            |_| Ok(()),
         )
         .optional()?
-        .with_context(|| format!("completed delta base snapshot {snapshot_id} was not found"))?;
-    if source_kind != "scan" {
-        bail!("worker delta requires a completed scan snapshot base");
+        .is_some();
+    if !has_incremental_deltas {
+        return Ok(false);
     }
-    load_scan_delta_graph(connection, &scan_id, snapshot_id)
+    let (parent, profiles, deltas): (Option<String>, i64, i64) = connection.query_row(
+        "SELECT s.parent_snapshot_id,
+                (SELECT COUNT(*) FROM profiles p WHERE p.scan_id=s.id),
+                (SELECT COUNT(*) FROM incremental_deltas d
+                  WHERE d.scan_id=s.id AND d.status='applied')
+           FROM scans s WHERE s.id=?1",
+        [scan_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    Ok(parent.is_some() && profiles == 0 && deltas == 1)
+}
+
+fn validate_semantic_noop_node(previous: &GraphNode, next: &GraphNode, path: &str) -> Result<()> {
+    if previous.id != next.id
+        || previous.kind != next.kind
+        || previous.locator != next.locator
+        || previous.display_name != next.display_name
+        || next.kind != "file"
+        || next.properties.get("path").and_then(Value::as_str) != Some(path)
+    {
+        bail!("semantic no-op delta changed file-node identity or routing metadata");
+    }
+    let previous_analysis = required_sha256_property(previous, "analysis_hash")?;
+    let next_analysis = required_sha256_property(next, "analysis_hash")?;
+    if previous_analysis != next_analysis {
+        bail!("semantic no-op delta changed the dependency-analysis fingerprint");
+    }
+    let previous_content = required_sha256_property(previous, "content_hash")?;
+    let next_content = required_sha256_property(next, "content_hash")?;
+    if previous_content == next_content {
+        bail!("semantic no-op delta did not change the content fingerprint");
+    }
+    let mut expected = previous.clone();
+    expected
+        .properties
+        .insert("content_hash".to_owned(), json!(next_content));
+    if &expected != next {
+        bail!("semantic no-op delta changed properties beyond the content fingerprint");
+    }
+    Ok(())
+}
+
+fn required_sha256_property<'a>(node: &'a GraphNode, property: &str) -> Result<&'a str> {
+    let value = node
+        .properties
+        .get(property)
+        .and_then(Value::as_str)
+        .with_context(|| format!("file node has no {property}"))?;
+    if value.len() != "sha256:".len() + 64
+        || !value.starts_with("sha256:")
+        || !value["sha256:".len()..]
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        bail!("file node {property} is not a canonical SHA-256 digest");
+    }
+    Ok(value)
+}
+
+fn ensure_staged_metadata_for_delta(
+    supplied: &ValidatedDelta,
+    canonical: &ValidatedDelta,
+) -> Result<()> {
+    if canonical.delta_id != supplied.delta_id
+        || canonical.base_snapshot_id != supplied.base_snapshot_id
+        || canonical.base_graph_digest != supplied.base_graph_digest
+        || canonical.result_graph_digest != supplied.result_graph_digest
+        || canonical.scope != supplied.scope
+    {
+        bail!("validated delta metadata does not match its canonical event stream");
+    }
+    Ok(())
+}
+
+pub(super) fn semantic_noop_snapshot_identity(
+    connection: &Connection,
+    scan_id: &str,
+    parent_snapshot_id: &str,
+    source_revision: Option<&str>,
+) -> Result<(String, Vec<String>)> {
+    let parent = load_completed_snapshot_record(connection, parent_snapshot_id)?
+        .with_context(|| format!("semantic no-op parent {parent_snapshot_id} was not found"))?;
+    let mut nodes = load_raw_records(connection, "nodes", scan_id)?
+        .into_iter()
+        .map(|raw| serde_json::from_str::<GraphNode>(&raw))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    if nodes.len() != 1 {
+        bail!("semantic no-op overlay must persist exactly one node");
+    }
+    nodes.sort_by(|left, right| left.id.cmp(&right.id));
+    let identity = json!({
+        "schema": "completed-snapshot-v3-semantic-noop",
+        "parent_snapshot_id": parent_snapshot_id,
+        "source_revision": source_revision,
+        "profile_ids": parent.profile_ids,
+        "node_upserts": nodes,
+    });
+    Ok((
+        stable_id_from_value("snapshot", &identity),
+        parent.profile_ids,
+    ))
+}
+
+fn insert_semantic_noop_completed_snapshot(
+    connection: &Connection,
+    snapshot_id: &str,
+    scan_id: &str,
+    parent_snapshot_id: &str,
+    source_revision: Option<&str>,
+    profile_ids: &[String],
+    completed_at: &str,
+) -> Result<()> {
+    connection.execute(
+        "INSERT INTO completed_snapshots(
+            id, source_kind, source_attempt_id, scan_id, build_attempt_id,
+            runtime_import_id, runtime_session_set_json, parent_snapshot_id,
+            source_revision, profile_set_json, status, created_at
+         ) VALUES (?1, 'scan', ?2, ?2, NULL, NULL, '[]', ?3, ?4, ?5,
+                   'completed', ?6)
+         ON CONFLICT(id) DO NOTHING",
+        params![
+            snapshot_id,
+            scan_id,
+            parent_snapshot_id,
+            source_revision,
+            serde_json::to_string(profile_ids)?,
+            completed_at,
+        ],
+    )?;
+    let stored = load_completed_snapshot_record(connection, snapshot_id)?
+        .context("semantic no-op completed snapshot insert was not visible")?;
+    if stored.parent_snapshot_id.as_deref() != Some(parent_snapshot_id)
+        || stored.source_revision.as_deref() != source_revision
+        || stored.profile_ids != profile_ids
+        || stored.status != "completed"
+    {
+        bail!("completed semantic no-op snapshot identity collision for {snapshot_id}");
+    }
+    connection.execute(
+        "INSERT INTO snapshot_sources(source_kind, source_attempt_id, snapshot_id, promoted_at)
+         VALUES ('scan', ?1, ?2, ?3)",
+        params![scan_id, snapshot_id, completed_at],
+    )?;
+    Ok(())
 }
 
 fn load_scan_delta_graph(
@@ -1636,7 +2073,9 @@ mod tests {
             "id":source,"kind":"file","locator":"src/index.ts",
             "display_name":"src/index.ts","properties":{
                 "path":"src/index.ts","package_locator":"npm:fixture@1.0.0",
-                "profile_id":profile_id,"content_hash":"before"}
+                "profile_id":profile_id,
+                "content_hash":format!("sha256:{}", "1".repeat(64)),
+                "analysis_hash":format!("sha256:{}", "a".repeat(64))}
         });
         let mut target_node = common(scan_id, "node_upsert", 3);
         target_node["node"] = json!({
@@ -2003,6 +2442,188 @@ mod tests {
             store.load_completed_snapshot(&base_id).unwrap(),
             base_snapshot
         );
+    }
+
+    #[test]
+    fn semantic_noop_overlay_promotes_without_copying_the_complete_graph() {
+        let mut store = Store::open_in_memory().unwrap();
+        let (events, ids) = stable_graph_events("semantic-noop-base");
+        let base_id = complete(&mut store, "semantic-noop-base", &events);
+        let base_snapshot = store.load_completed_snapshot(&base_id).unwrap();
+        let projection = store
+            .semantic_noop_delta_base(&base_id, "src/index.ts")
+            .unwrap()
+            .unwrap();
+        assert_eq!(projection.nodes.len(), 1);
+        assert_eq!(projection.sites.len(), 0);
+        let delta = validated_node_delta(
+            "semantic-noop-1",
+            &projection,
+            &ids.source,
+            &format!("sha256:{}", "2".repeat(64)),
+        );
+        let first_id = store
+            .commit_semantic_noop_delta(
+                "semantic-noop-1",
+                Path::new("/fixture"),
+                false,
+                &base_id,
+                Some("revision-2"),
+                &delta,
+                "semantic no-op",
+                false,
+            )
+            .unwrap();
+
+        let sparse_counts: (i64, i64, i64, i64) = store
+            .connection
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM profiles WHERE scan_id='semantic-noop-1'),
+                    (SELECT COUNT(*) FROM nodes WHERE scan_id='semantic-noop-1'),
+                    (SELECT COUNT(*) FROM sites WHERE scan_id='semantic-noop-1'),
+                    (SELECT COUNT(*) FROM edges WHERE scan_id='semantic-noop-1')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(sparse_counts, (0, 1, 0, 0));
+        assert_eq!(
+            store.current_snapshot_id().unwrap().as_deref(),
+            Some(first_id.as_str())
+        );
+        assert!(store.verify_snapshot_integrity(&first_id).unwrap().valid);
+        let first = store.load_completed_snapshot(&first_id).unwrap();
+        assert_eq!(first.sites, base_snapshot.sites);
+        assert_eq!(first.edges, base_snapshot.edges);
+        assert_eq!(first.evidence, base_snapshot.evidence);
+        assert_eq!(first.file_coverage, base_snapshot.file_coverage);
+        assert_eq!(first.coverage, base_snapshot.coverage);
+        assert_eq!(
+            first
+                .nodes
+                .iter()
+                .find(|node| node.id == ids.source)
+                .unwrap()
+                .properties["content_hash"],
+            json!(format!("sha256:{}", "2".repeat(64)))
+        );
+
+        let next_projection = store
+            .semantic_noop_delta_base(&first_id, "src/index.ts")
+            .unwrap()
+            .unwrap();
+        let next_delta = validated_node_delta(
+            "semantic-noop-2",
+            &next_projection,
+            &ids.source,
+            &format!("sha256:{}", "3".repeat(64)),
+        );
+        let second_id = store
+            .commit_semantic_noop_delta(
+                "semantic-noop-2",
+                Path::new("/fixture"),
+                false,
+                &first_id,
+                Some("revision-3"),
+                &next_delta,
+                "",
+                false,
+            )
+            .unwrap();
+        assert_ne!(second_id, first_id);
+        assert!(store.verify_snapshot_integrity(&second_id).unwrap().valid);
+        let second = store.load_completed_snapshot(&second_id).unwrap();
+        assert_eq!(second.sites, base_snapshot.sites);
+        assert_eq!(
+            second
+                .nodes
+                .iter()
+                .find(|node| node.id == ids.source)
+                .unwrap()
+                .properties["content_hash"],
+            json!(format!("sha256:{}", "3".repeat(64)))
+        );
+        let complete_base = store.delta_base_graph(&second_id).unwrap();
+        assert_eq!(complete_base.nodes.len(), base_snapshot.nodes.len());
+        assert_eq!(complete_base.sites.len(), base_snapshot.sites.len());
+        assert_eq!(complete_base.edges.len(), base_snapshot.edges.len());
+        assert_eq!(
+            complete_base.nodes[&ids.source].properties["content_hash"],
+            json!(format!("sha256:{}", "3".repeat(64)))
+        );
+        let complete_delta = validated_node_delta(
+            "complete-after-overlay",
+            &complete_base,
+            &ids.source,
+            &format!("sha256:{}", "4".repeat(64)),
+        );
+        store
+            .start_incremental_scan_with_revision(
+                "complete-after-overlay",
+                Path::new("/fixture"),
+                false,
+                &second_id,
+                Some("revision-4"),
+            )
+            .unwrap();
+        let staging_counts: (i64, i64, i64) = store
+            .connection
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM nodes
+                      WHERE scan_id='complete-after-overlay'),
+                    (SELECT COUNT(*) FROM sites
+                      WHERE scan_id='complete-after-overlay'),
+                    (SELECT COUNT(*) FROM edges
+                      WHERE scan_id='complete-after-overlay')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            staging_counts,
+            (
+                base_snapshot.nodes.len() as i64,
+                base_snapshot.sites.len() as i64,
+                base_snapshot.edges.len() as i64,
+            )
+        );
+        store
+            .stage_incremental_delta("complete-after-overlay", &complete_delta)
+            .unwrap();
+        store
+            .apply_staged_incremental_delta("complete-after-overlay", &complete_delta.delta_id)
+            .unwrap();
+        store.validate_scan("complete-after-overlay").unwrap();
+        store
+            .finish_scan("complete-after-overlay", "completed", None, true)
+            .unwrap();
+        let complete_id = store.current_snapshot_id().unwrap().unwrap();
+        let complete = store.load_completed_snapshot(&complete_id).unwrap();
+        assert_eq!(complete.sites, base_snapshot.sites);
+        assert_eq!(complete.edges, base_snapshot.edges);
+        assert_eq!(
+            complete
+                .nodes
+                .iter()
+                .find(|node| node.id == ids.source)
+                .unwrap()
+                .properties["content_hash"],
+            json!(format!("sha256:{}", "4".repeat(64)))
+        );
+
+        store
+            .connection
+            .execute(
+                "UPDATE nodes SET properties_json='{\"tampered\":true}'
+                  WHERE scan_id='semantic-noop-base' AND id=?1",
+                [&ids.source],
+            )
+            .unwrap();
+        let integrity = store.verify_snapshot_integrity(&second_id).unwrap();
+        assert!(!integrity.valid);
+        assert_eq!(integrity.reasons, ["parent_integrity_mismatch"]);
     }
 
     #[test]

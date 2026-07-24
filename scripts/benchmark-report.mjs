@@ -16,7 +16,7 @@ import {
   fixtureFingerprint,
 } from "./benchmark-fixture.mjs";
 
-export const REPORT_SCHEMA_VERSION = "depgraph-benchmark-report-v1";
+export const REPORT_SCHEMA_VERSION = "depgraph-benchmark-report-v2";
 export const EXPECTED_FIXTURE_SHA256 =
   "f57a6d7d2e22366f5d312f01f038f6f50e2c2fbbd4480b9849ed82a696e97dc1";
 
@@ -39,7 +39,7 @@ const METRIC_CONTRACTS = new Map([
       gated: true,
       minimum_samples: 3,
       maximum_samples: 20,
-      maximum_limit_ms: 105_000,
+      maximum_limit_ms: 2_000,
       product_target_ms: 2_000,
     },
   ],
@@ -357,6 +357,27 @@ function validateImpactQueries(rawDir, fixture) {
   };
 }
 
+function validIncrementalTrace(trace) {
+  if (
+    trace?.schema_version !== "daemon-incremental-trace-v1" ||
+    trace.mode !== "semantic_noop"
+  ) {
+    return false;
+  }
+  const phases = [
+    trace.base_projection_milliseconds,
+    trace.worker_capability_milliseconds,
+    trace.worker_analysis_milliseconds,
+    trace.store_commit_milliseconds,
+  ];
+  return (
+    [...phases, trace.total_milliseconds].every(
+      (value) => Number.isSafeInteger(value) && value >= 0,
+    ) &&
+    trace.total_milliseconds >= phases.reduce((total, value) => total + value, 0)
+  );
+}
+
 function validateIncrementalAttempts(rawDir, changedFile) {
   const paths = orderedSampleNames(
     readdirSync(rawDir),
@@ -369,6 +390,7 @@ function validateIncrementalAttempts(rawDir, changedFile) {
   return paths.map((path) => {
     const status = jsonFile(path);
     const attempt = status.last_completed_attempt;
+    const trace = attempt?.incremental_trace;
     if (
       attempt?.status !== "completed" ||
       !attempt.base_snapshot_id ||
@@ -377,6 +399,7 @@ function validateIncrementalAttempts(rawDir, changedFile) {
       attempt.invalidation_plan.schema_version !== "incremental-plan-v1" ||
       !Array.isArray(attempt.invalidation_plan.affected_profile_ids) ||
       attempt.invalidation_plan.affected_profile_ids.length === 0 ||
+      !validIncrementalTrace(trace) ||
       attempt.invalidation_error !== null ||
       attempt.changes?.length !== 1 ||
       !["added", "modified"].includes(attempt.changes[0].kind) ||
@@ -392,6 +415,7 @@ function validateIncrementalAttempts(rawDir, changedFile) {
       completed_snapshot_id: attempt.completed_snapshot_id,
       invalidation_schema_version: attempt.invalidation_plan.schema_version,
       affected_profiles: attempt.invalidation_plan.affected_profile_ids?.length ?? 0,
+      incremental_trace: trace,
     };
   });
 }
@@ -670,7 +694,8 @@ function validEvidence(report) {
         attempt.base_snapshot_id !== attempt.completed_snapshot_id &&
         attempt.invalidation_schema_version === "incremental-plan-v1" &&
         Number.isSafeInteger(attempt.affected_profiles) &&
-        attempt.affected_profiles > 0,
+        attempt.affected_profiles > 0 &&
+        validIncrementalTrace(attempt.incremental_trace),
     ) ||
     !isRecord(evidence.impact_queries) ||
     typeof evidence.impact_queries.file_root_id !== "string" ||
@@ -827,7 +852,7 @@ export function createReport({ rawDir, fixtureDir, output }) {
       "one_file_incremental_scan",
       "warm_analysis_cache",
       "incremental-scan-ms.txt",
-      threshold("DEPGRAPH_INCREMENTAL_LIMIT_MS", 40_000),
+      threshold("DEPGRAPH_INCREMENTAL_LIMIT_MS", 2_000),
       2_000,
     ),
     observedMetric(

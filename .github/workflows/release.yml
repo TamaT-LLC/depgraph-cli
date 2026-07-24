@@ -30,10 +30,10 @@ jobs:
     needs: quality
     runs-on: ubuntu-24.04
     env:
-      # Shared hosted runners are materially slower than the development-machine
-      # targets. Keep an explicit release ceiling while reporting the raw timings.
+      # Product targets are enforced directly. Per-phase daemon traces make
+      # regressions attributable without widening the latency contract.
       DEPGRAPH_SCAN_LIMIT_MS: "80000"
-      DEPGRAPH_INCREMENTAL_LIMIT_MS: "105000"
+      DEPGRAPH_INCREMENTAL_LIMIT_MS: "2000"
       DEPGRAPH_QUERY_LIMIT_MS: "4000"
       DEPGRAPH_BUILD_OBSERVATION_LIMIT_MS: "60000"
       DEPGRAPH_BENCH_SAMPLES: "3"

@@ -1,5 +1,5 @@
 import { isDeepStrictEqual } from "node:util";
-import { canonicalJson, stableId } from "./ids";
+import { canonicalJson, contentHash, stableId } from "./ids";
 import {
   ADAPTER,
   ADAPTER_VERSION,
@@ -15,6 +15,7 @@ import {
   type JsonValue,
   type ScanModel,
 } from "./types";
+import { analysisContentHash } from "./source-fingerprint";
 
 const DELTA_CONTRACT_VERSION = "worker-delta-v1" as const;
 const DELTA_REQUEST_SCHEMA_VERSION = "worker-delta-request-v1" as const;
@@ -77,6 +78,7 @@ export interface WorkerDeltaRequest {
   protocol_version: string;
   scan_id: string;
   adapter: string;
+  analysis_mode: "complete" | "semantic_noop";
   base_snapshot_id: string;
   base_graph_digest: string;
   changes: DeltaFileChange[];
@@ -218,6 +220,10 @@ export function parseWorkerDeltaRequest(value: unknown, expectedScanId: string):
   if (request.scan_id !== expectedScanId || request.adapter !== ADAPTER) {
     throw new Error("worker delta request routing metadata mismatch");
   }
+  request.analysis_mode ??= "complete";
+  if (!["complete", "semantic_noop"].includes(request.analysis_mode)) {
+    throw new Error("worker delta request analysis mode is unsupported");
+  }
   assertStableId("worker delta base snapshot", request.base_snapshot_id, "snapshot");
   assertDigest("worker delta base graph", request.base_graph_digest);
   if (!isRecord(request.scope)) throw new Error("worker delta request scope must be an object");
@@ -254,6 +260,8 @@ export function parseWorkerDeltaRequest(value: unknown, expectedScanId: string):
   }
   return request;
 }
+
+export class IncrementalFallbackError extends Error {}
 
 function hasNamedScopeValue(
   value: JsonValue,
@@ -652,6 +660,100 @@ export function deltaEventsFor(model: ScanModel, request: WorkerDeltaRequest): D
         finalEdges,
         finalEvidence,
         finalCoverage,
+      )),
+    },
+  ];
+}
+
+export function semanticNoopDeltaEventsFor(
+  source: string,
+  request: WorkerDeltaRequest,
+): DeltaEvent[] {
+  if (request.analysis_mode !== "semantic_noop") {
+    throw new Error("semantic no-op delta requires semantic_noop analysis mode");
+  }
+  if (request.changes.length !== 1 || request.scope.paths.length !== 1) {
+    throw new IncrementalFallbackError("semantic no-op delta requires exactly one changed path");
+  }
+  const change = request.changes[0]!;
+  const changedPath = change.new_path;
+  if (
+    !["added", "modified"].includes(change.kind)
+    || changedPath === undefined
+    || changedPath !== request.scope.paths[0]
+  ) {
+    throw new IncrementalFallbackError("semantic no-op delta requires one existing file write");
+  }
+  const baseNodes = mapById("node", request.base_graph.nodes);
+  const fileNodes = [...baseNodes.values()].filter((node) => (
+    node.kind === "file"
+    && node.properties.path === changedPath
+  ));
+  if (fileNodes.length !== 1) {
+    throw new IncrementalFallbackError("semantic no-op base has no unique changed file node");
+  }
+  const fileNode = fileNodes[0]!;
+  const previousAnalysisHash = fileNode.properties.analysis_hash;
+  const nextAnalysisHash = analysisContentHash(source, changedPath);
+  if (
+    typeof previousAnalysisHash !== "string"
+    || previousAnalysisHash !== nextAnalysisHash
+  ) {
+    throw new IncrementalFallbackError("changed file requires dependency reanalysis");
+  }
+  const nextContentHash = contentHash(source);
+  if (fileNode.properties.content_hash === nextContentHash) {
+    throw new IncrementalFallbackError("changed file content is identical to the base");
+  }
+  const nextNode: GraphNode = {
+    ...fileNode,
+    properties: {
+      ...fileNode.properties,
+      content_hash: nextContentHash,
+      analysis_hash: nextAnalysisHash,
+    },
+  };
+  const mutation = {
+    event: "delta_node_upsert",
+    node: nextNode,
+  } as unknown as Mutation;
+  const mutations = [mutation];
+  const identity = deltaId(request, mutations);
+  const common = (event: string, seq: number): DeltaEvent => ({
+    event,
+    protocol_version: PROTOCOL_VERSION,
+    scan_id: request.scan_id,
+    adapter: ADAPTER,
+    adapter_version: ADAPTER_VERSION,
+    seq,
+  });
+  const finalNodes = new Map(baseNodes);
+  finalNodes.set(nextNode.id, nextNode);
+  return [
+    {
+      ...common("delta_started", 1),
+      delta_contract_version: DELTA_CONTRACT_VERSION,
+      delta_id: identity,
+      base_snapshot_id: request.base_snapshot_id,
+      base_graph_digest: request.base_graph_digest,
+      scope: jsonValue(request.scope),
+    },
+    {
+      ...common("delta_node_upsert", 2),
+      node: jsonValue(nextNode),
+    },
+    {
+      ...common("delta_completed", 3),
+      delta_contract_version: DELTA_CONTRACT_VERSION,
+      delta_id: identity,
+      mutation_count: 1,
+      result_graph_digest: graphDigest(resultGraph(
+        request,
+        finalNodes,
+        mapById("site", request.base_graph.sites),
+        mapById("edge", request.base_graph.edges),
+        mapEvidence(request.base_graph.evidence),
+        mapCoverage(request.base_graph.coverage),
       )),
     },
   ];
