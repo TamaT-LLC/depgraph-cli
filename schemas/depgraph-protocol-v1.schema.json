@@ -12,7 +12,19 @@
     { "$ref": "#/$defs/diagnostic_event" },
     { "$ref": "#/$defs/file_completed" },
     { "$ref": "#/$defs/profile_completed" },
-    { "$ref": "#/$defs/scan_completed" }
+    { "$ref": "#/$defs/scan_completed" },
+    { "$ref": "#/$defs/delta_started" },
+    { "$ref": "#/$defs/evidence_delete" },
+    { "$ref": "#/$defs/edge_delete" },
+    { "$ref": "#/$defs/site_delete" },
+    { "$ref": "#/$defs/node_delete" },
+    { "$ref": "#/$defs/delta_node_upsert" },
+    { "$ref": "#/$defs/site_upsert" },
+    { "$ref": "#/$defs/delta_edge_upsert" },
+    { "$ref": "#/$defs/evidence_upsert" },
+    { "$ref": "#/$defs/coverage_delete" },
+    { "$ref": "#/$defs/coverage_upsert" },
+    { "$ref": "#/$defs/delta_completed" }
   ],
   "$defs": {
     "non_empty_string": {
@@ -1294,6 +1306,442 @@
             "coverage": { "$ref": "#/$defs/coverage" }
           },
           "required": ["event", "coverage"],
+          "additionalProperties": true
+        }
+      ]
+    },
+    "stable_id": {
+      "type": "string",
+      "pattern": "^[^:]+:sha256:[0-9a-f]{64}$"
+    },
+    "snapshot_id": {
+      "type": "string",
+      "pattern": "^snapshot:sha256:[0-9a-f]{64}$"
+    },
+    "delta_id": {
+      "type": "string",
+      "pattern": "^delta:sha256:[0-9a-f]{64}$"
+    },
+    "canonical_string_set": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/non_empty_string" },
+      "uniqueItems": true
+    },
+    "delta_scope": {
+      "type": "object",
+      "properties": {
+        "paths": { "$ref": "#/$defs/canonical_string_set" },
+        "package_locators": { "$ref": "#/$defs/canonical_string_set" },
+        "profile_ids": { "$ref": "#/$defs/canonical_string_set" },
+        "artifact_node_ids": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/stable_id" },
+          "uniqueItems": true
+        },
+        "adapters": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/non_empty_string" },
+          "minItems": 1,
+          "maxItems": 1,
+          "uniqueItems": true
+        }
+      },
+      "required": [
+        "paths",
+        "package_locators",
+        "profile_ids",
+        "artifact_node_ids",
+        "adapters"
+      ],
+      "anyOf": [
+        { "properties": { "paths": { "minItems": 1 } } },
+        { "properties": { "package_locators": { "minItems": 1 } } },
+        { "properties": { "profile_ids": { "minItems": 1 } } },
+        { "properties": { "artifact_node_ids": { "minItems": 1 } } }
+      ],
+      "additionalProperties": true
+    },
+    "delta_edge": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^edge:sha256:[0-9a-f]{64}$"
+        },
+        "source": { "$ref": "#/$defs/stable_id" },
+        "target": { "$ref": "#/$defs/stable_id" },
+        "kind": { "$ref": "#/$defs/non_empty_string" },
+        "site_id": {
+          "oneOf": [
+            { "type": "null" },
+            {
+              "type": "string",
+              "pattern": "^site:sha256:[0-9a-f]{64}$"
+            }
+          ]
+        },
+        "phase": { "$ref": "#/$defs/phase" },
+        "environment": { "type": ["string", "null"] },
+        "profile_id": { "$ref": "#/$defs/non_empty_string" },
+        "condition": { "$ref": "#/$defs/condition" },
+        "resolution_status": { "$ref": "#/$defs/resolution_status" },
+        "precision": { "$ref": "#/$defs/precision" },
+        "generated": { "type": "boolean" },
+        "evidence": { "type": "array", "maxItems": 0 }
+      },
+      "required": [
+        "id",
+        "source",
+        "target",
+        "kind",
+        "phase",
+        "profile_id",
+        "condition",
+        "resolution_status",
+        "precision",
+        "generated",
+        "evidence"
+      ],
+      "additionalProperties": true
+    },
+    "delta_site": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^site:sha256:[0-9a-f]{64}$"
+        },
+        "source": { "$ref": "#/$defs/stable_id" },
+        "kind": { "$ref": "#/$defs/non_empty_string" },
+        "specifier": { "type": "string" },
+        "resolution_status": { "$ref": "#/$defs/resolution_status" },
+        "target_ids": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/stable_id" },
+          "minItems": 1,
+          "uniqueItems": true
+        },
+        "profile_id": { "$ref": "#/$defs/non_empty_string" },
+        "condition": { "$ref": "#/$defs/condition" },
+        "precision": { "$ref": "#/$defs/precision" },
+        "reason": { "type": ["string", "null"], "minLength": 1 },
+        "evidence": { "type": "array", "maxItems": 0 }
+      },
+      "required": [
+        "id",
+        "source",
+        "kind",
+        "specifier",
+        "resolution_status",
+        "target_ids",
+        "profile_id",
+        "condition",
+        "precision",
+        "evidence"
+      ],
+      "additionalProperties": true
+    },
+    "delta_evidence_key": {
+      "type": "object",
+      "properties": {
+        "owner_type": { "enum": ["node", "site", "edge"] },
+        "owner_id": { "$ref": "#/$defs/stable_id" },
+        "ordinal": { "type": "integer", "minimum": 0 }
+      },
+      "required": ["owner_type", "owner_id", "ordinal"],
+      "additionalProperties": true
+    },
+    "delta_evidence_record": {
+      "allOf": [
+        { "$ref": "#/$defs/delta_evidence_key" },
+        {
+          "type": "object",
+          "properties": {
+            "evidence": { "$ref": "#/$defs/evidence" }
+          },
+          "required": ["evidence"],
+          "additionalProperties": true
+        }
+      ]
+    },
+    "delta_file_coverage": {
+      "type": "object",
+      "properties": {
+        "discovered_sites": { "type": "integer", "minimum": 0 },
+        "emitted_sites": { "type": "integer", "minimum": 0 },
+        "skipped_sites": { "type": "integer", "minimum": 0 },
+        "skipped": { "type": "boolean" },
+        "reason": { "type": ["string", "null"] }
+      },
+      "required": [
+        "discovered_sites",
+        "emitted_sites",
+        "skipped_sites",
+        "skipped"
+      ],
+      "additionalProperties": true
+    },
+    "delta_coverage_key": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": { "scope": { "const": "aggregate" } },
+          "required": ["scope"],
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "properties": {
+            "scope": { "const": "profile" },
+            "profile_id": { "$ref": "#/$defs/non_empty_string" }
+          },
+          "required": ["scope", "profile_id"],
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "properties": {
+            "scope": { "const": "file" },
+            "adapter": { "$ref": "#/$defs/non_empty_string" },
+            "path": { "$ref": "#/$defs/non_empty_string" }
+          },
+          "required": ["scope", "adapter", "path"],
+          "additionalProperties": true
+        }
+      ]
+    },
+    "delta_coverage": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "scope": { "const": "aggregate" },
+            "value": { "$ref": "#/$defs/coverage" }
+          },
+          "required": ["scope", "value"],
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "properties": {
+            "scope": { "const": "profile" },
+            "profile_id": { "$ref": "#/$defs/non_empty_string" },
+            "value": { "$ref": "#/$defs/coverage" }
+          },
+          "required": ["scope", "profile_id", "value"],
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "properties": {
+            "scope": { "const": "file" },
+            "adapter": { "$ref": "#/$defs/non_empty_string" },
+            "path": { "$ref": "#/$defs/non_empty_string" },
+            "value": { "$ref": "#/$defs/delta_file_coverage" }
+          },
+          "required": ["scope", "adapter", "path", "value"],
+          "additionalProperties": true
+        }
+      ]
+    },
+    "delta_started": {
+      "allOf": [
+        { "$ref": "#/$defs/common" },
+        {
+          "type": "object",
+          "properties": {
+            "event": { "const": "delta_started" },
+            "delta_contract_version": { "const": "worker-delta-v1" },
+            "delta_id": { "$ref": "#/$defs/delta_id" },
+            "base_snapshot_id": { "$ref": "#/$defs/snapshot_id" },
+            "base_graph_digest": { "$ref": "#/$defs/sha256_digest" },
+            "scope": { "$ref": "#/$defs/delta_scope" }
+          },
+          "required": [
+            "event",
+            "delta_contract_version",
+            "delta_id",
+            "base_snapshot_id",
+            "base_graph_digest",
+            "scope"
+          ],
+          "additionalProperties": true
+        }
+      ]
+    },
+    "node_delete": {
+      "allOf": [
+        { "$ref": "#/$defs/common" },
+        {
+          "type": "object",
+          "properties": {
+            "event": { "const": "node_delete" },
+            "node_id": { "$ref": "#/$defs/stable_id" }
+          },
+          "required": ["event", "node_id"],
+          "additionalProperties": true
+        }
+      ]
+    },
+    "delta_node_upsert": {
+      "allOf": [
+        { "$ref": "#/$defs/common" },
+        {
+          "type": "object",
+          "properties": {
+            "event": { "const": "delta_node_upsert" },
+            "node": {
+              "allOf": [
+                { "$ref": "#/$defs/node" },
+                {
+                  "type": "object",
+                  "properties": { "id": { "$ref": "#/$defs/stable_id" } }
+                }
+              ]
+            }
+          },
+          "required": ["event", "node"],
+          "additionalProperties": true
+        }
+      ]
+    },
+    "site_delete": {
+      "allOf": [
+        { "$ref": "#/$defs/common" },
+        {
+          "type": "object",
+          "properties": {
+            "event": { "const": "site_delete" },
+            "site_id": {
+              "type": "string",
+              "pattern": "^site:sha256:[0-9a-f]{64}$"
+            }
+          },
+          "required": ["event", "site_id"],
+          "additionalProperties": true
+        }
+      ]
+    },
+    "site_upsert": {
+      "allOf": [
+        { "$ref": "#/$defs/common" },
+        {
+          "type": "object",
+          "properties": {
+            "event": { "const": "site_upsert" },
+            "site": { "$ref": "#/$defs/delta_site" }
+          },
+          "required": ["event", "site"],
+          "additionalProperties": true
+        }
+      ]
+    },
+    "edge_delete": {
+      "allOf": [
+        { "$ref": "#/$defs/common" },
+        {
+          "type": "object",
+          "properties": {
+            "event": { "const": "edge_delete" },
+            "edge_id": {
+              "type": "string",
+              "pattern": "^edge:sha256:[0-9a-f]{64}$"
+            }
+          },
+          "required": ["event", "edge_id"],
+          "additionalProperties": true
+        }
+      ]
+    },
+    "delta_edge_upsert": {
+      "allOf": [
+        { "$ref": "#/$defs/common" },
+        {
+          "type": "object",
+          "properties": {
+            "event": { "const": "delta_edge_upsert" },
+            "edge": { "$ref": "#/$defs/delta_edge" }
+          },
+          "required": ["event", "edge"],
+          "additionalProperties": true
+        }
+      ]
+    },
+    "evidence_delete": {
+      "allOf": [
+        { "$ref": "#/$defs/common" },
+        {
+          "type": "object",
+          "properties": {
+            "event": { "const": "evidence_delete" },
+            "evidence_key": { "$ref": "#/$defs/delta_evidence_key" }
+          },
+          "required": ["event", "evidence_key"],
+          "additionalProperties": true
+        }
+      ]
+    },
+    "evidence_upsert": {
+      "allOf": [
+        { "$ref": "#/$defs/common" },
+        {
+          "type": "object",
+          "properties": {
+            "event": { "const": "evidence_upsert" },
+            "evidence": { "$ref": "#/$defs/delta_evidence_record" }
+          },
+          "required": ["event", "evidence"],
+          "additionalProperties": true
+        }
+      ]
+    },
+    "coverage_delete": {
+      "allOf": [
+        { "$ref": "#/$defs/common" },
+        {
+          "type": "object",
+          "properties": {
+            "event": { "const": "coverage_delete" },
+            "coverage_key": { "$ref": "#/$defs/delta_coverage_key" }
+          },
+          "required": ["event", "coverage_key"],
+          "additionalProperties": true
+        }
+      ]
+    },
+    "coverage_upsert": {
+      "allOf": [
+        { "$ref": "#/$defs/common" },
+        {
+          "type": "object",
+          "properties": {
+            "event": { "const": "coverage_upsert" },
+            "coverage": { "$ref": "#/$defs/delta_coverage" }
+          },
+          "required": ["event", "coverage"],
+          "additionalProperties": true
+        }
+      ]
+    },
+    "delta_completed": {
+      "allOf": [
+        { "$ref": "#/$defs/common" },
+        {
+          "type": "object",
+          "properties": {
+            "event": { "const": "delta_completed" },
+            "delta_contract_version": { "const": "worker-delta-v1" },
+            "delta_id": { "$ref": "#/$defs/delta_id" },
+            "mutation_count": { "type": "integer", "minimum": 1 },
+            "result_graph_digest": { "$ref": "#/$defs/sha256_digest" }
+          },
+          "required": [
+            "event",
+            "delta_contract_version",
+            "delta_id",
+            "mutation_count",
+            "result_graph_digest"
+          ],
           "additionalProperties": true
         }
       ]
