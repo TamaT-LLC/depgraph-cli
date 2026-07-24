@@ -421,12 +421,12 @@ pub async fn run_scan_with_cache_mode_and_cancellation(
     )
 }
 
-fn cancel_scan(store: &mut Store, scan_id: &str) -> Result<ScanOutcome> {
+pub(crate) fn cancel_scan(store: &mut Store, scan_id: &str) -> Result<ScanOutcome> {
     store.finish_scan(scan_id, "cancelled", Some("scan cancelled"), false)?;
     snapshot_outcome(store, scan_id, 3)
 }
 
-fn complete_scan(
+pub(crate) fn complete_scan(
     store: &mut Store,
     scan_id: &str,
     strict: bool,
@@ -611,7 +611,7 @@ fn record_cache_rejection(store: &Store, scan_id: &str, reason: &str) -> Result<
     Ok(())
 }
 
-fn git_source_revision(root: &Path) -> Option<String> {
+pub(crate) fn git_source_revision(root: &Path) -> Option<String> {
     let git = resolve_safe_executable("git", root).ok()?;
     let output = std::process::Command::new(git)
         .arg("-C")

@@ -24,6 +24,7 @@ export const WEB_SEMANTIC_RELEASE_CAPABILITIES = Object.freeze([
   "tanstack-router-typed-route-v1",
   "tanstack-start-rpc-middleware-v1",
   TYPESCRIPT_SEMANTIC_CAPABILITY,
+  "worker-delta-v1",
 ] as const);
 const REQUIRED_CAPABILITY_BY_FRAMEWORK = new Map([
   ["next", "next-route-component-boundary-v1"],

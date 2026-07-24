@@ -16,6 +16,9 @@ pub const WORKER_DELTA_CAPABILITY: &str = "worker-delta-v1";
 /// Version carried by every delta stream independently from protocol `1.0`.
 pub const DELTA_CONTRACT_VERSION: &str = "worker-delta-v1";
 
+/// Versioned request sent by the core before a worker emits a delta stream.
+pub const WORKER_DELTA_REQUEST_SCHEMA_VERSION: &str = "worker-delta-request-v1";
+
 /// The wire mode selected after core/worker capability negotiation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WorkerProtocolMode {
@@ -56,6 +59,52 @@ pub struct DeltaScope {
     pub profile_ids: Vec<String>,
     pub artifact_node_ids: Vec<String>,
     pub adapters: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerDeltaFileChangeKind {
+    Added,
+    Modified,
+    Deleted,
+    Renamed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct WorkerDeltaFileChange {
+    pub kind: WorkerDeltaFileChangeKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_path: Option<String>,
+}
+
+/// Canonical graph payload supplied to a delta-capable worker.
+///
+/// Maps use vectors on the wire so evidence keys remain valid JSON and every
+/// collection has an explicit canonical ordering.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WorkerDeltaBaseGraph {
+    pub profiles: Vec<String>,
+    pub nodes: Vec<GraphNode>,
+    pub sites: Vec<DependencySite>,
+    pub edges: Vec<GraphEdge>,
+    pub evidence: Vec<DeltaEvidenceRecord>,
+    pub coverage: Vec<DeltaCoverage>,
+}
+
+/// A deterministic, exact-base request for one worker's analysis closure.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WorkerDeltaRequest {
+    pub schema_version: String,
+    pub protocol_version: String,
+    pub scan_id: String,
+    pub adapter: String,
+    pub base_snapshot_id: String,
+    pub base_graph_digest: String,
+    pub changes: Vec<WorkerDeltaFileChange>,
+    pub scope: DeltaScope,
+    pub base_graph: WorkerDeltaBaseGraph,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -337,7 +386,7 @@ impl DeltaEvent {
 
 /// Complete base state required to validate the result of a delta before any
 /// store transaction mutates the current snapshot.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct DeltaBaseGraph {
     pub snapshot_id: String,
     pub graph_digest: String,
@@ -430,6 +479,236 @@ impl DeltaBaseGraph {
             evidence,
             coverage,
         }
+    }
+
+    #[must_use]
+    pub fn worker_request_payload(&self) -> WorkerDeltaBaseGraph {
+        WorkerDeltaBaseGraph {
+            profiles: self.profiles.iter().cloned().collect(),
+            nodes: self.nodes.values().cloned().collect(),
+            sites: self.sites.values().cloned().collect(),
+            edges: self.edges.values().cloned().collect(),
+            evidence: self
+                .evidence
+                .iter()
+                .map(|(key, evidence)| DeltaEvidenceRecord {
+                    key: key.clone(),
+                    evidence: evidence.clone(),
+                })
+                .collect(),
+            coverage: self.coverage.values().cloned().collect(),
+        }
+    }
+}
+
+impl WorkerDeltaRequest {
+    pub fn new(
+        scan_id: impl Into<String>,
+        adapter: impl Into<String>,
+        changes: Vec<WorkerDeltaFileChange>,
+        scope: DeltaScope,
+        base: &DeltaBaseGraph,
+    ) -> Result<Self, ProtocolError> {
+        let request = Self {
+            schema_version: WORKER_DELTA_REQUEST_SCHEMA_VERSION.to_owned(),
+            protocol_version: PROTOCOL_VERSION.to_owned(),
+            scan_id: scan_id.into(),
+            adapter: adapter.into(),
+            base_snapshot_id: base.snapshot_id.clone(),
+            base_graph_digest: base.graph_digest.clone(),
+            changes,
+            scope,
+            base_graph: base.worker_request_payload(),
+        };
+        request.validate()?;
+        Ok(request)
+    }
+
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.schema_version != WORKER_DELTA_REQUEST_SCHEMA_VERSION {
+            return invariant(format!(
+                "unsupported worker delta request schema {}; expected {WORKER_DELTA_REQUEST_SCHEMA_VERSION}",
+                self.schema_version
+            ));
+        }
+        if self.protocol_version != PROTOCOL_VERSION {
+            return Err(ProtocolError::UnsupportedVersion {
+                expected: PROTOCOL_VERSION,
+                found: self.protocol_version.clone(),
+            });
+        }
+        require_non_empty("worker delta request scan ID", &self.scan_id)?;
+        require_non_empty("worker delta request adapter", &self.adapter)?;
+        validate_stable_id(
+            "worker delta request base snapshot ID",
+            &self.base_snapshot_id,
+            Some("snapshot"),
+        )?;
+        validate_digest(
+            "worker delta request base graph digest",
+            &self.base_graph_digest,
+        )?;
+        validate_scope(&self.scope)?;
+        if self.scope.adapters.as_slice() != [self.adapter.as_str()] {
+            return invariant(
+                "worker delta request scope must name exactly its producing adapter".into(),
+            );
+        }
+        if self.changes.is_empty() {
+            return invariant("worker delta request must include at least one file change".into());
+        }
+        if self.changes.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return invariant("worker delta request changes must be sorted and unique".into());
+        }
+        for change in &self.changes {
+            let valid = match change.kind {
+                WorkerDeltaFileChangeKind::Added | WorkerDeltaFileChangeKind::Modified => {
+                    change.old_path.is_none() && change.new_path.is_some()
+                }
+                WorkerDeltaFileChangeKind::Deleted => {
+                    change.old_path.is_some() && change.new_path.is_none()
+                }
+                WorkerDeltaFileChangeKind::Renamed => {
+                    change.old_path.is_some()
+                        && change.new_path.is_some()
+                        && change.old_path != change.new_path
+                }
+            };
+            if !valid {
+                return invariant(
+                    "worker delta request change does not match its change kind".into(),
+                );
+            }
+            if let Some(path) = change.old_path.as_deref() {
+                validate_relative_path("worker delta request old path", path)?;
+                if self
+                    .scope
+                    .paths
+                    .binary_search_by(|candidate| candidate.as_str().cmp(path))
+                    .is_err()
+                {
+                    return invariant(
+                        "worker delta request old path is outside its analysis closure".into(),
+                    );
+                }
+            }
+            if let Some(path) = change.new_path.as_deref() {
+                validate_relative_path("worker delta request new path", path)?;
+                if self
+                    .scope
+                    .paths
+                    .binary_search_by(|candidate| candidate.as_str().cmp(path))
+                    .is_err()
+                {
+                    return invariant(
+                        "worker delta request new path is outside its analysis closure".into(),
+                    );
+                }
+            }
+        }
+        if self
+            .base_graph
+            .profiles
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
+            || self
+                .base_graph
+                .nodes
+                .windows(2)
+                .any(|pair| pair[0].id >= pair[1].id)
+            || self
+                .base_graph
+                .sites
+                .windows(2)
+                .any(|pair| pair[0].id >= pair[1].id)
+            || self
+                .base_graph
+                .edges
+                .windows(2)
+                .any(|pair| pair[0].id >= pair[1].id)
+            || self
+                .base_graph
+                .evidence
+                .windows(2)
+                .any(|pair| pair[0].key >= pair[1].key)
+            || self
+                .base_graph
+                .coverage
+                .windows(2)
+                .any(|pair| pair[0].key() >= pair[1].key())
+        {
+            return invariant(
+                "worker delta request base collections must be sorted and unique".into(),
+            );
+        }
+        let base = self.base_graph()?;
+        if base.snapshot_id != self.base_snapshot_id || base.graph_digest != self.base_graph_digest
+        {
+            return invariant(
+                "worker delta request base identity does not match its graph payload".into(),
+            );
+        }
+        Ok(())
+    }
+
+    pub fn base_graph(&self) -> Result<DeltaBaseGraph, ProtocolError> {
+        let mut base = DeltaBaseGraph {
+            snapshot_id: self.base_snapshot_id.clone(),
+            graph_digest: self.base_graph_digest.clone(),
+            ..DeltaBaseGraph::default()
+        };
+        for profile_id in &self.base_graph.profiles {
+            if !base.profiles.insert(profile_id.clone()) {
+                return invariant(format!("worker delta request repeats profile {profile_id}"));
+            }
+        }
+        for node in &self.base_graph.nodes {
+            if base.nodes.insert(node.id.clone(), node.clone()).is_some() {
+                return invariant(format!("worker delta request repeats node {}", node.id));
+            }
+        }
+        for site in &self.base_graph.sites {
+            if base.sites.insert(site.id.clone(), site.clone()).is_some() {
+                return invariant(format!("worker delta request repeats site {}", site.id));
+            }
+        }
+        for edge in &self.base_graph.edges {
+            if base.edges.insert(edge.id.clone(), edge.clone()).is_some() {
+                return invariant(format!("worker delta request repeats edge {}", edge.id));
+            }
+        }
+        for record in &self.base_graph.evidence {
+            if base
+                .evidence
+                .insert(record.key.clone(), record.evidence.clone())
+                .is_some()
+            {
+                return invariant(format!(
+                    "worker delta request repeats evidence {}",
+                    evidence_key_string(&record.key)
+                ));
+            }
+        }
+        for coverage in &self.base_graph.coverage {
+            if base
+                .coverage
+                .insert(coverage.key(), coverage.clone())
+                .is_some()
+            {
+                return invariant(format!(
+                    "worker delta request repeats coverage {}",
+                    coverage_key_string(&coverage.key())
+                ));
+            }
+        }
+        let computed = delta_graph_digest(&base);
+        if computed != self.base_graph_digest {
+            return invariant(format!(
+                "worker delta request base graph digest mismatch: declared {}, computed {computed}",
+                self.base_graph_digest
+            ));
+        }
+        Ok(base)
     }
 }
 

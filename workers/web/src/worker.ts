@@ -1,7 +1,8 @@
-import { realpath, stat } from "node:fs/promises";
+import { readFile, realpath, stat } from "node:fs/promises";
 import path from "node:path";
 import { inventoryFiles } from "./fs";
 import { stableId } from "./ids";
+import { deltaEventsFor, parseWorkerDeltaRequest } from "./incremental";
 import {
   frameworkSemanticProfileProperties,
   WEB_FRAMEWORK_SEMANTIC_PROFILE_PROPERTIES,
@@ -27,6 +28,7 @@ import {
 interface Options {
   root: string;
   scanId: string;
+  deltaRequest: string | null;
 }
 
 interface VersionOptions {
@@ -88,6 +90,7 @@ function parseArgs(args: string[]): Options | VersionOptions {
   if (args.length === 1 && (args[0] === "--version" || args[0] === "-V")) return { version: true };
   let root: string | null = null;
   let scanId: string | null = null;
+  let deltaRequest: string | null = null;
   for (let index = 0; index < args.length; index += 1) {
     const argument = args[index];
     if (argument === "--root") {
@@ -100,14 +103,25 @@ function parseArgs(args: string[]): Options | VersionOptions {
       if (!value) throw new UsageError("--scan-id requires a non-empty identifier");
       scanId = value;
       index += 1;
+    } else if (argument === "--delta-request") {
+      const value = args[index + 1];
+      if (!value) throw new UsageError("--delta-request requires a path");
+      deltaRequest = path.resolve(value);
+      index += 1;
     } else if (argument === "--help" || argument === "-h") {
-      throw new UsageError("usage: depgraph-web-worker --root <path> --scan-id <id>");
+      throw new UsageError(
+        "usage: depgraph-web-worker --root <path> --scan-id <id> [--delta-request <path>]",
+      );
     } else {
       throw new UsageError(`unknown argument: ${argument ?? ""}`);
     }
   }
-  if (!root || !scanId) throw new UsageError("usage: depgraph-web-worker --root <path> --scan-id <id>");
-  return { root: path.resolve(root), scanId };
+  if (!root || !scanId) {
+    throw new UsageError(
+      "usage: depgraph-web-worker --root <path> --scan-id <id> [--delta-request <path>]",
+    );
+  }
+  return { root: path.resolve(root), scanId, deltaRequest };
 }
 
 function eventsFor(model: ScanModel, root: string, scanId: string): ProtocolEvent[] {
@@ -239,7 +253,7 @@ function failureEventsFor(root: string, scanId: string, failure: TypeScriptProje
   ];
 }
 
-async function writeEvents(events: ProtocolEvent[]): Promise<void> {
+async function writeEvents(events: readonly unknown[]): Promise<void> {
   const write = async (chunk: string): Promise<void> => {
     if (process.stdout.write(chunk)) return;
     await new Promise<void>((resolve, reject) => {
@@ -293,10 +307,20 @@ async function main(): Promise<void> {
   try {
     root = await realpath(options.root);
     if (!(await stat(root)).isDirectory()) throw new Error(`root is not a directory: ${root}`);
+    const deltaRequest = options.deltaRequest === null
+      ? null
+      : parseWorkerDeltaRequest(
+        JSON.parse(await readFile(options.deltaRequest, "utf8")) as unknown,
+        options.scanId,
+      );
     const inventory = await inventoryFiles(root);
     const model = await scan(root, inventory.files, inventory.issues);
-    await writeEvents(eventsFor(model, root, options.scanId));
-    process.stderr.write(`depgraph-web-worker: ${model.coverage.files_analyzed} files, ${model.coverage.dependency_sites} sites, project code executed=false\n`);
+    await writeEvents(deltaRequest === null
+      ? eventsFor(model, root, options.scanId)
+      : deltaEventsFor(model, deltaRequest));
+    process.stderr.write(
+      `depgraph-web-worker: ${model.coverage.files_analyzed} files, ${model.coverage.dependency_sites} sites, ${deltaRequest === null ? "full" : "delta"} mode, project code executed=false\n`,
+    );
   } catch (error) {
     if (error instanceof TypeScriptProjectError && root !== null) {
       await writeEvents(failureEventsFor(root, options.scanId, error)).catch(() => undefined);

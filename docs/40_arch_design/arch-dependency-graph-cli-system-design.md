@@ -21,7 +21,7 @@ updated: 2026-07-24
 | SQLite store / cache contract | `12` / `1` |
 | Snapshot diff / policy / runtime trace / GraphML | `1.0` |
 | Incremental plan / daemon status | `incremental-plan-v1` / `daemon-status-v1` |
-| Worker incremental delta | `worker-delta-v1` |
+| Worker incremental request / delta | `worker-delta-request-v1` / `worker-delta-v1` |
 | Rust / Cargo baseline | `1.93.1` |
 | Go baseline | `1.26.1` |
 | Node.js / pnpm baseline | `24.18.0` / `10.33.0` |
@@ -1083,7 +1083,9 @@ storeはcurrent completed scanをexact baseとしてfresh staging attemptへ複�
 
 Issue #79の`daemon-status-v1`はplatform推奨filesystem watcherをrepository rootへrecursive接続し、VCS・dependency・build output、store / control file、設定されたrepository-relative prefixを監視対象外とする。一方、source tree内の`generated` / `gen` / `codegen` / `artifacts`、`*.generated.*`、`*.g.rs`、`routeTree.gen.ts`はgenerated inputとして保持する。notify backendごとのrename both / tracker付きfrom-toをcanonical renameへ統合し、added / modified / deleted / rename chain、temporary replacementを決定的にcoalesceする。`[daemon].debounce_milliseconds`のquiet windowごとに1 batchだけをplannerへ渡す。
 
-新しいevent burstは進行中scanの共有cancellation tokenを発火し、全workerがprocess group / Windows Job Objectを終了してreader taskまでreapした後、cancelされたbatchと新しい変更を再coalesceして次batchを開始する。失敗batchはbounded exponential backoffで再投入し、daemon stopまたはwatcher終了時はactive scanをcancelしたうえでpending batchを1回だけ最終flushする。cancelled attemptはsnapshotを生成・promoteせず、promotionとcancelは共通linearization gateで競合を解消する。status APIはactive、last completed / failed / cancelled、planner / watcher error、startup recoveryを返す。起動時に同repositoryのstaging scan / build attemptを`cancelled`へ回復するがcurrent completed pointerは変更しない。workerがrepository-complete protocolだけを出力する現段階では、planner scopeをstatusへ保持しつつatomic full replacementをsafe fallbackとし、planner失敗もstatusへ記録してfull scanを継続する。scoped replacement worker emissionへの移行時もdaemon contractを変えない。
+新しいevent burstは進行中scanの共有cancellation tokenを発火し、全workerがprocess group / Windows Job Objectを終了してreader taskまでreapした後、cancelされたbatchと新しい変更を再coalesceして次batchを開始する。失敗batchはbounded exponential backoffで再投入し、daemon stopまたはwatcher終了時はactive scanをcancelしたうえでpending batchを1回だけ最終flushする。cancelled attemptはsnapshotを生成・promoteせず、promotionとcancelは共通linearization gateで競合を解消する。status APIはactive、last completed / failed / cancelled、planner / watcher error、startup recoveryを返す。起動時に同repositoryのstaging scan / build attemptを`cancelled`へ回復するがcurrent completed pointerは変更しない。
+
+Issue #134のincremental executorは`scoped_replacement`かつexactly one adapterのplanを`worker-delta-request-v1`へ決定的に変換する。requestはnormalized change、plannerが算出したpath / package / profile / artifact / adapter closure、exact current completed snapshot ID / graph digest、canonical base graphを持ち、workerにはneutral temporary fileとして渡す。coreとworkerのversion handshakeがともに`worker-delta-v1`をadvertiseした場合だけdelta processを起動し、stream全体のrouting metadata、line / output上限、base / result digest、scope、参照、coverageを検証する。bundled Web workerはrepository-complete modelとexact baseをcanonical diffし、scope所有のnode / site / edge / evidence / file・profile・aggregate coverage mutationだけを交換する。exact-base requestのmaterializationは現在4,096 pathまでにboundし、それを超えるclosureはbase graph構築前にfull scanへ戻す。validated streamはfresh incremental staging scanへdurable stageし、SQLite transactionでapplyした後、通常のgraph / strict / architecture policy / cancellation gateを通してpromotionする。worker failureはbatch retryへ、capability probeを含むcancelは再coalesceへ戻り、どちらもcurrent pointerを更新しない。Rust / Goを含むlegacy / capability欠落 worker、workspace replan、複数adapter plan、oversized closure、planner failureはrepository-complete full scanへfail closedでfallbackするため、daemon status contractは維持される。
 
 ### 13.4 Completed snapshot lifecycle
 
@@ -1373,10 +1375,13 @@ priming後のwarm file/package impactを個別に計測する。
 
 2026-07-24の10,000-file local baselineはinitial median 29.774秒、
 watcher incremental median 31.983秒、warm file/package impact median
-1.185秒/1.105秒であった。incremental executorは現在workerの
-repository-complete protocolを安全にfull atomic replacementするため、2秒の
-product targetには未達である。この差を隠さずreportの`product_target_ms`へ
-残し、現実装の明確な回帰を検出するlocal ceilingをinitial 30秒、
+1.185秒/1.105秒であった。bundled Web workerは`worker-delta-v1`をadvertiseして
+bounded scopeではscope内mutationだけを交換する。exact base graphをrequestへ
+materializeする現contractでは大きなclosureの重複digestが支配的になるため、
+4,096 pathを超えるclosureはatomic full scanへfallbackする。このboundの撤廃と
+worker内部のrepository-complete再解析・重複digestの削減はIssue #135で行い、
+2秒のproduct targetにはまだ未達である。この差を隠さずreportの
+`product_target_ms`へ残し、現実装の明確な回帰を検出するlocal ceilingをinitial 30秒、
 incremental 40秒、warm impact 1.5秒とする。
 
 共有GitHub hosted Linux runnerのCI/release ceilingは、runner contentionと
@@ -1520,6 +1525,7 @@ schema、commit、全必須metric、conservation、総合passを再検証して�
 - deterministic GraphML exporter: Issue #85で実装済み（2026-07-24）
 - initial / incremental / impact benchmarkとCI/release gate: Issue #86で実装済み（2026-07-24）
 - worker delta schema v12 transactional staging / apply / rollback / GC: Issue #133で実装済み（2026-07-24）
+- watcher / daemon fine-grained incremental executor / full fallback: Issue #134で実装済み（2026-07-24）
 
 ## 22. MVP 受け入れ基準
 
@@ -1562,6 +1568,7 @@ schema、commit、全必須metric、conservation、総合passを再検証して�
 
 ## 26. 更新履歴
 
+- 2026-07-24: Issue #134としてwatcher / daemonをcapability-aware incremental executorへ接続。`incremental-plan-v1`のnormalized changeとanalysis closure、exact base snapshot / graph digest、canonical base graphから`worker-delta-request-v1`を生成し、neutral temporary request file、既存timeout / cancel / process-tree supervisor、bounded delta parserを通す。bundled Web workerはexact `worker-delta-v1`をadvertiseし、full modelとbaseのcanonical diffからscope内node / site / edge / evidence / coverage mutationを生成する。fresh incremental stagingへdurable stage / transactional applyし、通常のgraph・strict・architecture policy・cancellation gate後にpromotionする。worker failure / capability probeを含むcancelでは旧current snapshotを維持してdaemon retry / re-coalesceへ戻し、Rust / Goなどのlegacy worker、workspace replan、複数adapter、planner failureはatomic full scanへfallbackする。1-file closure外node不変、failure / cancel非promotion、legacy fallbackをcore testで固定した。
 - 2026-07-24: Issue #133としてschema v12の`incremental_deltas`とtransactional apply APIを実装。validated `worker-delta-v1` streamをexact current completed snapshotへbindしてdurable stagingし、stage / applyの両方でcanonical event、stable delta ID、node / site / edge / evidence / coverage参照、base / result graph digestを再検証する。graph mutation、stored graph digest、prospective completed snapshot ID、delta状態を単一transactionで確定し、失敗時はgraphをrollbackして旧current snapshotを維持する。cancel / process crash recoveryをterminal delta状態と既存attempt GCへ接続した。1-file deltaで対象外ID / payload不変、tampered stagingの全rollback、cancel / crash後GCをstore testで固定した。
 - 2026-07-24: Issue #132として`worker-delta-v1` contractを実装。`delta_started`、node / site / edge / evidence / aggregate・profile・file coverageのupsert / delete、`delta_completed`をprotocol `1.0` Schemaへ追加し、base snapshot / graph digest binding、canonical mutation order、連続sequence、stable delta ID再計算、stable entity ID形式、ownership scope、endpoint / profile / evidence owner・ordinal / aggregate・profile・file・最終graph間coverage整合性を検証する独立state machineを追加した。coreとworker双方のexact capability一致時だけdeltaを選び、legacy / unknown / workspace replanは既存full snapshotへfallbackする。full / delta golden fixture、反復byte同一性、unknown event、malformed ID、dangling reference、途中切断、ordering、scope外upsert / delete、coverage階層矛盾、fallback互換性testで固定した。
 - 2026-07-24: Issue #87としてMilestone 4 release candidate `v0.4.0-rc.1`を確定。product / Rust / Go / Web adapterを同期し、protocol / graph `1.0`、store schema `11`、cache contract `1`と各Milestone 4 schemaをrelease manifestへ固定した。公式`v0.2.0-rc.1` packageで生成したschema `5` store fixtureをpackage gateでschema `11`へ移行し、completed snapshot、node/site/edge/evidence、immutable ID、queryを保全する。snapshot/diff/impact、watcher/incremental、clean policy GitHub annotation、runtime validate/import/filter、決定的GraphML stdout/atomic file出力をpackaged binaryで実行し、全target archive / checksum / manifest / SBOM / license / attestationのaggregate verificationへ閉じる。migration、rollback、安全境界、性能、既知制約をrelease noteへ集約した。

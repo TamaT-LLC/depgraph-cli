@@ -5,8 +5,9 @@ use depgraph_protocol::{
     DeltaFileCoverage, DeltaNodeUpsert, DeltaScope, DeltaStarted, EdgeDelete, Evidence,
     EvidenceDelete, EvidenceKind, EvidenceUpsert, GraphEdge, GraphNode, NodeDelete,
     PROTOCOL_SCHEMA, Phase, Precision, ProtocolError, ResolutionStatus, SiteDelete, SiteUpsert,
-    WORKER_DELTA_CAPABILITY, WorkerProtocolMode, build_delta_stable_id, delta_graph_digest,
-    negotiate_worker_protocol, validate_delta_ndjson, validate_ndjson,
+    WORKER_DELTA_CAPABILITY, WorkerDeltaFileChange, WorkerDeltaFileChangeKind, WorkerDeltaRequest,
+    WorkerProtocolMode, build_delta_stable_id, delta_graph_digest, negotiate_worker_protocol,
+    validate_delta_ndjson, validate_ndjson,
 };
 use pretty_assertions::assert_eq;
 use serde_json::{Value, json};
@@ -69,6 +70,114 @@ fn graph_digest_is_canonical_and_payload_sensitive() {
         .properties
         .insert("content_hash".into(), json!("changed"));
     assert_ne!(delta_graph_digest(&first), delta_graph_digest(&changed));
+}
+
+#[test]
+fn worker_delta_request_round_trips_an_exact_canonical_base_and_closure() {
+    let mut base = base_graph();
+    base.graph_digest = delta_graph_digest(&base);
+    let scope = DeltaScope {
+        paths: vec!["src/index.ts".into(), "src/lib.ts".into()],
+        package_locators: vec!["npm:fixture@1.0.0".into()],
+        profile_ids: vec![PROFILE_ID.into()],
+        artifact_node_ids: vec![],
+        adapters: vec!["web".into()],
+    };
+    let changes = vec![WorkerDeltaFileChange {
+        kind: WorkerDeltaFileChangeKind::Modified,
+        old_path: None,
+        new_path: Some("src/index.ts".into()),
+    }];
+    let request = WorkerDeltaRequest::new("scan-delta-request", "web", changes, scope, &base)
+        .expect("request must validate");
+    let encoded = serde_json::to_vec(&request).expect("request JSON");
+    let repeated = serde_json::to_vec(&request).expect("repeated request JSON");
+    assert_eq!(encoded, repeated);
+    let decoded: WorkerDeltaRequest = serde_json::from_slice(&encoded).expect("request decode");
+    decoded.validate().expect("decoded request");
+    assert_eq!(decoded.base_graph().expect("decoded base"), base);
+}
+
+#[test]
+fn worker_delta_request_rejects_noncanonical_changes_and_tampered_base() {
+    let mut base = base_graph();
+    base.graph_digest = delta_graph_digest(&base);
+    let scope = DeltaScope {
+        paths: vec!["src/index.ts".into()],
+        package_locators: vec![],
+        profile_ids: vec![PROFILE_ID.into()],
+        artifact_node_ids: vec![],
+        adapters: vec!["web".into()],
+    };
+    let mut request = WorkerDeltaRequest::new(
+        "scan-delta-request",
+        "web",
+        vec![WorkerDeltaFileChange {
+            kind: WorkerDeltaFileChangeKind::Modified,
+            old_path: None,
+            new_path: Some("src/index.ts".into()),
+        }],
+        scope,
+        &base,
+    )
+    .unwrap();
+    request.changes[0].old_path = Some("src/other.ts".into());
+    assert!(
+        request
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("does not match its change kind")
+    );
+
+    request.changes[0].old_path = None;
+    request.changes[0].new_path = Some("src/outside.ts".into());
+    assert!(
+        request
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("outside its analysis closure")
+    );
+
+    request.changes[0].new_path = Some("src/index.ts".into());
+    request.base_graph.nodes[0]
+        .properties
+        .insert("content_hash".into(), json!("tampered"));
+    assert!(
+        request
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("digest mismatch")
+    );
+
+    let mut reordered = WorkerDeltaRequest::new(
+        "scan-delta-request",
+        "web",
+        vec![WorkerDeltaFileChange {
+            kind: WorkerDeltaFileChangeKind::Modified,
+            old_path: None,
+            new_path: Some("src/index.ts".into()),
+        }],
+        DeltaScope {
+            paths: vec!["src/index.ts".into()],
+            package_locators: vec![],
+            profile_ids: vec![PROFILE_ID.into()],
+            artifact_node_ids: vec![],
+            adapters: vec!["web".into()],
+        },
+        &base,
+    )
+    .unwrap();
+    reordered.base_graph.nodes.reverse();
+    assert!(
+        reordered
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("base collections must be sorted and unique")
+    );
 }
 
 #[test]
