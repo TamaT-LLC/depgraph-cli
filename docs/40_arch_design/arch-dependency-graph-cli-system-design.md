@@ -18,7 +18,7 @@ updated: 2026-07-24
 | --- | --- |
 | Product / Rust / Go / Web adapter | `0.4.0-rc.1` |
 | NDJSON protocol / graph schema | `1.0` |
-| SQLite store / cache contract | `11` / `1` |
+| SQLite store / cache contract | `12` / `1` |
 | Snapshot diff / policy / runtime trace / GraphML | `1.0` |
 | Incremental plan / daemon status | `incremental-plan-v1` / `daemon-status-v1` |
 | Worker incremental delta | `worker-delta-v1` |
@@ -276,6 +276,18 @@ event、不正ID、scope外path、dangling reference、coverage階層矛盾、�
 従来の
 `protocol-v1.golden.ndjson`をfull fallback、
 `protocol-v1.delta.golden.ndjson`をdelta互換性fixtureとする。
+
+schema v12の`incremental_deltas`はvalidated deltaのscope / event stream、
+base / result graph digest、mutation count、状態をscan attemptに紐づけてdurable
+stagingする。stage時とapply時の両方でexactなcurrent completed snapshotとの
+base binding、canonical event、node / site / edge / evidence / coverageの参照整合性、
+result graph digestを再検証する。applyはgraph mutation、stored graph digest、
+prospective completed snapshot stable ID、delta状態更新を単一SQLite transactionで
+確定する。失敗時はgraph変更をrollbackしてdeltaだけを`failed`へ遷移し、
+cancel / process crash recoveryでは`cancelled`へ遷移する。current pointerは
+通常のscan validation / promotionが成功するまで旧completed snapshotを指し続け、
+terminal attemptとdelta staging rowは既存GCでcascade削除する。1-file deltaでは
+対象外node / site / edge / evidence / coverageのIDとraw payloadを変更しない。
 
 ## 7. 共通 Property Graph
 
@@ -1507,6 +1519,7 @@ schema、commit、全必須metric、conservation、総合passを再検証して�
 - runtime trace schema v11 store union / query / export: Issue #84で実装済み（2026-07-24）
 - deterministic GraphML exporter: Issue #85で実装済み（2026-07-24）
 - initial / incremental / impact benchmarkとCI/release gate: Issue #86で実装済み（2026-07-24）
+- worker delta schema v12 transactional staging / apply / rollback / GC: Issue #133で実装済み（2026-07-24）
 
 ## 22. MVP 受け入れ基準
 
@@ -1549,6 +1562,7 @@ schema、commit、全必須metric、conservation、総合passを再検証して�
 
 ## 26. 更新履歴
 
+- 2026-07-24: Issue #133としてschema v12の`incremental_deltas`とtransactional apply APIを実装。validated `worker-delta-v1` streamをexact current completed snapshotへbindしてdurable stagingし、stage / applyの両方でcanonical event、stable delta ID、node / site / edge / evidence / coverage参照、base / result graph digestを再検証する。graph mutation、stored graph digest、prospective completed snapshot ID、delta状態を単一transactionで確定し、失敗時はgraphをrollbackして旧current snapshotを維持する。cancel / process crash recoveryをterminal delta状態と既存attempt GCへ接続した。1-file deltaで対象外ID / payload不変、tampered stagingの全rollback、cancel / crash後GCをstore testで固定した。
 - 2026-07-24: Issue #132として`worker-delta-v1` contractを実装。`delta_started`、node / site / edge / evidence / aggregate・profile・file coverageのupsert / delete、`delta_completed`をprotocol `1.0` Schemaへ追加し、base snapshot / graph digest binding、canonical mutation order、連続sequence、stable delta ID再計算、stable entity ID形式、ownership scope、endpoint / profile / evidence owner・ordinal / aggregate・profile・file・最終graph間coverage整合性を検証する独立state machineを追加した。coreとworker双方のexact capability一致時だけdeltaを選び、legacy / unknown / workspace replanは既存full snapshotへfallbackする。full / delta golden fixture、反復byte同一性、unknown event、malformed ID、dangling reference、途中切断、ordering、scope外upsert / delete、coverage階層矛盾、fallback互換性testで固定した。
 - 2026-07-24: Issue #87としてMilestone 4 release candidate `v0.4.0-rc.1`を確定。product / Rust / Go / Web adapterを同期し、protocol / graph `1.0`、store schema `11`、cache contract `1`と各Milestone 4 schemaをrelease manifestへ固定した。公式`v0.2.0-rc.1` packageで生成したschema `5` store fixtureをpackage gateでschema `11`へ移行し、completed snapshot、node/site/edge/evidence、immutable ID、queryを保全する。snapshot/diff/impact、watcher/incremental、clean policy GitHub annotation、runtime validate/import/filter、決定的GraphML stdout/atomic file出力をpackaged binaryで実行し、全target archive / checksum / manifest / SBOM / license / attestationのaggregate verificationへ閉じる。migration、rollback、安全境界、性能、既知制約をrelease noteへ集約した。
 - 2026-07-24: Issue #86として決定的な10,000 source-file fixtureと`depgraph-benchmark-report-v1`を実装。fresh-store initial、watcher daemon経由の1-file incremental、cold/warm file/package impactを複数sampleで分離し、platform / runner / toolchain / cache条件とraw timingを記録する。median ceiling、1 bounded outlier、20% hard noise allowanceで明確な回帰だけをfailさせる。変更fileのcontent hash更新を要求しつつ、それ以外のgraph topology、dependency site、edge、evidence、coverage digest保存を検証する。PR CIとreleaseで同じreportをartifact化し、release asset検証前にschema / commit / metric / conservationを再検証する。

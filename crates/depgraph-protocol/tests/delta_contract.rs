@@ -5,8 +5,8 @@ use depgraph_protocol::{
     DeltaFileCoverage, DeltaNodeUpsert, DeltaScope, DeltaStarted, EdgeDelete, Evidence,
     EvidenceDelete, EvidenceKind, EvidenceUpsert, GraphEdge, GraphNode, NodeDelete,
     PROTOCOL_SCHEMA, Phase, Precision, ProtocolError, ResolutionStatus, SiteDelete, SiteUpsert,
-    WORKER_DELTA_CAPABILITY, WorkerProtocolMode, build_delta_stable_id, negotiate_worker_protocol,
-    validate_delta_ndjson, validate_ndjson,
+    WORKER_DELTA_CAPABILITY, WorkerProtocolMode, build_delta_stable_id, delta_graph_digest,
+    negotiate_worker_protocol, validate_delta_ndjson, validate_ndjson,
 };
 use pretty_assertions::assert_eq;
 use serde_json::{Value, json};
@@ -52,6 +52,23 @@ fn valid_delta_is_canonical_and_byte_equivalent_across_repeated_generation() {
         [&NEW_TARGET_ID.to_owned()]
     );
     assert_eq!(validated.result_graph_digest, RESULT_DIGEST);
+}
+
+#[test]
+fn graph_digest_is_canonical_and_payload_sensitive() {
+    let first = base_graph();
+    let mut reordered = base_graph();
+    reordered.nodes = reordered.nodes.into_iter().rev().collect();
+    assert_eq!(delta_graph_digest(&first), delta_graph_digest(&reordered));
+
+    let mut changed = first.clone();
+    changed
+        .nodes
+        .get_mut(SOURCE_ID)
+        .unwrap()
+        .properties
+        .insert("content_hash".into(), json!("changed"));
+    assert_ne!(delta_graph_digest(&first), delta_graph_digest(&changed));
 }
 
 #[test]

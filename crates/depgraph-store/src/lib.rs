@@ -27,7 +27,7 @@ pub use diff::{
     ChangedRecord, GraphSnapshotDiff, NodeRename, NodeRenameEvidence, RecordDiff, RenameConfidence,
     SNAPSHOT_DIFF_SCHEMA_VERSION, diff_graph_snapshots,
 };
-pub use incremental::IncrementalReplacementScope;
+pub use incremental::{IncrementalDeltaRecord, IncrementalReplacementScope};
 use profile_matrix::refresh_profile_matrix;
 pub use profile_matrix::{
     PROFILE_MATRIX_SCHEMA_VERSION, PhaseCoverageRecord, ProfileAxisConflictRecord,
@@ -41,7 +41,7 @@ pub use runtime::{
     runtime_context_for_edge,
 };
 
-pub const STORE_SCHEMA_VERSION: i64 = 11;
+pub const STORE_SCHEMA_VERSION: i64 = 12;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ScanRecord {
@@ -904,6 +904,33 @@ impl Store {
                 bail!("store schema 11 migration left {violations} foreign key violations");
             }
         }
+        if current < 12 {
+            let tx = self.connection.transaction()?;
+            tx.execute_batch(
+                "CREATE TABLE incremental_deltas (
+                    scan_id TEXT NOT NULL REFERENCES scans(id) ON DELETE CASCADE,
+                    delta_id TEXT NOT NULL,
+                    adapter TEXT NOT NULL,
+                    base_snapshot_id TEXT NOT NULL REFERENCES completed_snapshots(id),
+                    base_graph_digest TEXT NOT NULL,
+                    result_graph_digest TEXT NOT NULL,
+                    scope_json TEXT NOT NULL,
+                    events_json TEXT NOT NULL,
+                    mutation_count INTEGER NOT NULL CHECK (mutation_count > 0),
+                    status TEXT NOT NULL
+                        CHECK (status IN ('staging', 'applied', 'failed', 'cancelled')),
+                    prospective_snapshot_id TEXT,
+                    staged_at TEXT NOT NULL,
+                    completed_at TEXT,
+                    error TEXT,
+                    PRIMARY KEY (scan_id, delta_id)
+                 );
+                 CREATE INDEX incremental_deltas_base_status
+                    ON incremental_deltas(base_snapshot_id, status, staged_at, scan_id, delta_id);
+                 PRAGMA user_version = 12;",
+            )?;
+            tx.commit()?;
+        }
         Ok(())
     }
 
@@ -1582,6 +1609,13 @@ impl Store {
         }
         for scan_id in &scan_attempt_ids {
             tx.execute(
+                "UPDATE incremental_deltas
+                    SET status='cancelled', completed_at=?2,
+                        error='daemon recovered interrupted incremental delta'
+                  WHERE scan_id=?1 AND status='staging'",
+                params![scan_id, completed_at],
+            )?;
+            tx.execute(
                 "UPDATE scans
                     SET status='cancelled', completed_at=?2,
                         error='daemon recovered interrupted scan attempt'
@@ -2035,6 +2069,36 @@ impl Store {
         };
         let tx = self.connection.transaction()?;
         ensure_scan_staging(&tx, scan_id)?;
+        if status == "completed" {
+            let non_applied_delta_count: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM incremental_deltas
+                  WHERE scan_id=?1 AND status!='applied'",
+                [scan_id],
+                |row| row.get(0),
+            )?;
+            if non_applied_delta_count != 0 {
+                bail!(
+                    "scan {scan_id} has {non_applied_delta_count} incremental deltas that were not applied successfully"
+                );
+            }
+        } else {
+            let delta_status = if status == "cancelled" {
+                "cancelled"
+            } else {
+                "failed"
+            };
+            tx.execute(
+                "UPDATE incremental_deltas
+                    SET status=?2, completed_at=?3,
+                        error='scan terminated before incremental delta promotion'
+                  WHERE scan_id=?1 AND status='staging'",
+                params![
+                    scan_id,
+                    delta_status,
+                    Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
+                ],
+            )?;
+        }
         if let Some(validated_mutation_count) = validated_mutation_count {
             let observed_mutation_count: i64 = tx.query_row(
                 "SELECT mutation_count FROM scans WHERE id=?1",
@@ -3367,6 +3431,12 @@ fn insert_node(tx: &Transaction<'_>, scan_id: &str, node: &Value) -> Result<()> 
 }
 
 fn insert_site(tx: &Transaction<'_>, scan_id: &str, site: &Value) -> Result<()> {
+    upsert_site_row(tx, scan_id, site)?;
+    insert_evidence(tx, scan_id, "site", required_str(site, "id")?, site)?;
+    Ok(())
+}
+
+fn upsert_site_row(tx: &Transaction<'_>, scan_id: &str, site: &Value) -> Result<()> {
     let targets = site.get("target_ids").cloned().unwrap_or_else(|| json!([]));
     let condition = site
         .get("condition")
@@ -3397,11 +3467,16 @@ fn insert_site(tx: &Transaction<'_>, scan_id: &str, site: &Value) -> Result<()> 
             serde_json::to_string(site)?
         ],
     )?;
-    insert_evidence(tx, scan_id, "site", required_str(site, "id")?, site)?;
     Ok(())
 }
 
 fn insert_edge(tx: &Transaction<'_>, scan_id: &str, edge: &Value) -> Result<()> {
+    upsert_edge_row(tx, scan_id, edge)?;
+    insert_evidence(tx, scan_id, "edge", required_str(edge, "id")?, edge)?;
+    Ok(())
+}
+
+fn upsert_edge_row(tx: &Transaction<'_>, scan_id: &str, edge: &Value) -> Result<()> {
     let condition = edge
         .get("condition")
         .cloned()
@@ -3433,7 +3508,6 @@ fn insert_edge(tx: &Transaction<'_>, scan_id: &str, edge: &Value) -> Result<()> 
             serde_json::to_string(edge)?
         ],
     )?;
-    insert_evidence(tx, scan_id, "edge", required_str(edge, "id")?, edge)?;
     Ok(())
 }
 
@@ -4805,7 +4879,7 @@ mod tests {
         drop(connection);
 
         let store = Store::open(&path)?;
-        assert_eq!(store.schema_version()?, 11);
+        assert_eq!(store.schema_version()?, STORE_SCHEMA_VERSION);
         let site_not_null: i64 = store.connection.query_row(
             "SELECT [notnull] FROM pragma_table_info('edges') WHERE name='site_id'",
             [],
@@ -4856,6 +4930,7 @@ mod tests {
             "semantic_cache",
             "build_cache",
             "cache_events",
+            "incremental_deltas",
         ] {
             let count: i64 = store.connection.query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
@@ -4908,6 +4983,7 @@ mod tests {
              DROP TABLE syntax_cache;
              DROP TABLE semantic_cache;
              DROP TABLE build_cache;
+             DROP TABLE incremental_deltas;
              DROP TABLE snapshot_names;
              DROP TABLE current_completed_snapshot;
              DROP TABLE snapshot_sources;
@@ -4922,7 +4998,7 @@ mod tests {
         expected.scan.source_revision = None;
 
         let store = Store::open(&path)?;
-        assert_eq!(store.schema_version()?, 11);
+        assert_eq!(store.schema_version()?, STORE_SCHEMA_VERSION);
         let current_id = store
             .current_snapshot_id()?
             .context("migrated current snapshot")?;
@@ -4952,7 +5028,8 @@ mod tests {
         };
         let connection = Connection::open(&path)?;
         connection.execute_batch(
-            "DROP TABLE cache_events;
+            "DROP TABLE incremental_deltas;
+             DROP TABLE cache_events;
              DROP TABLE syntax_cache;
              DROP TABLE semantic_cache;
              DROP TABLE build_cache;
@@ -4962,7 +5039,7 @@ mod tests {
         drop(connection);
 
         let mut store = Store::open(&path)?;
-        assert_eq!(store.schema_version()?, 11);
+        assert_eq!(store.schema_version()?, STORE_SCHEMA_VERSION);
         assert_eq!(
             store.current_snapshot_id()?.as_deref(),
             Some(snapshot_id.as_str())

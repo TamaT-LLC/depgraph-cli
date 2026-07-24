@@ -1,16 +1,41 @@
-use std::{collections::BTreeSet, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+};
 
 use anyhow::{Context, Result, bail};
 use chrono::{SecondsFormat, Utc};
-use rusqlite::{OptionalExtension, Transaction, params};
+use depgraph_protocol::{
+    Coverage, DeltaBaseGraph, DeltaCoverage, DeltaCoverageKey, DeltaEvidenceKey,
+    DeltaEvidenceOwner, DeltaFileCoverage, DeltaValidator, Evidence, ValidatedDelta,
+    delta_graph_digest,
+};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::{
-    AdapterLogRecord, Store, ensure_scan_staging, ingest_event_in_transaction, required_str,
+    AdapterLogRecord, Store, completed_snapshot_identity, ensure_scan_staging,
+    ingest_event_in_transaction, insert_node, required_str, upsert_edge_row, upsert_site_row,
 };
 
 const MAX_SCOPE_VALUES: usize = 100_000;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IncrementalDeltaRecord {
+    pub scan_id: String,
+    pub delta_id: String,
+    pub adapter: String,
+    pub base_snapshot_id: String,
+    pub base_graph_digest: String,
+    pub result_graph_digest: String,
+    pub mutation_count: u64,
+    pub status: String,
+    pub prospective_snapshot_id: Option<String>,
+    pub staged_at: String,
+    pub completed_at: Option<String>,
+    pub error: Option<String>,
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct IncrementalReplacementScope {
@@ -73,6 +98,188 @@ impl IncrementalReplacementScope {
 }
 
 impl Store {
+    pub fn delta_base_graph(&self, snapshot_id: &str) -> Result<DeltaBaseGraph> {
+        load_delta_base_graph(&self.connection, snapshot_id)
+    }
+
+    pub fn stage_incremental_delta(
+        &mut self,
+        scan_id: &str,
+        delta: &ValidatedDelta,
+    ) -> Result<IncrementalDeltaRecord> {
+        let tx = self.connection.transaction()?;
+        ensure_scan_staging(&tx, scan_id)?;
+        let parent = incremental_parent(&tx, scan_id)?;
+        if parent != delta.base_snapshot_id {
+            bail!("incremental delta base does not match the staging scan parent");
+        }
+        ensure_current_base(&tx, &parent)?;
+        let base = load_delta_base_graph(&tx, &parent)?;
+        let canonical = revalidate_delta(scan_id, base.clone(), &delta.events)?;
+        if canonical.delta_id != delta.delta_id
+            || canonical.base_snapshot_id != delta.base_snapshot_id
+            || canonical.base_graph_digest != delta.base_graph_digest
+            || canonical.result_graph_digest != delta.result_graph_digest
+        {
+            bail!("validated delta metadata does not match its canonical event stream");
+        }
+        let result = apply_delta_to_graph(base, &canonical)?;
+        let observed_result_digest = delta_graph_digest(&result);
+        if observed_result_digest != canonical.result_graph_digest {
+            bail!("delta result graph digest does not match the canonical graph after mutation");
+        }
+        let mutation_count = delta_mutation_count(&canonical);
+        let adapter = canonical
+            .events
+            .first()
+            .map(|event| event.common().adapter.clone())
+            .context("validated delta has no start event")?;
+        let staged_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+        tx.execute(
+            "INSERT INTO incremental_deltas(
+                scan_id, delta_id, adapter, base_snapshot_id, base_graph_digest,
+                result_graph_digest, scope_json, events_json, mutation_count,
+                status, staged_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'staging', ?10)",
+            params![
+                scan_id,
+                canonical.delta_id,
+                adapter,
+                canonical.base_snapshot_id,
+                canonical.base_graph_digest,
+                canonical.result_graph_digest,
+                serde_json::to_string(&canonical.scope)?,
+                serde_json::to_string(&canonical.events)?,
+                mutation_count,
+                staged_at,
+            ],
+        )?;
+        tx.commit()?;
+        self.incremental_delta(scan_id, &canonical.delta_id)?
+            .context("staged incremental delta was not visible after commit")
+    }
+
+    pub fn apply_staged_incremental_delta(
+        &mut self,
+        scan_id: &str,
+        delta_id: &str,
+    ) -> Result<IncrementalDeltaRecord> {
+        let result = (|| -> Result<()> {
+            let tx = self.connection.transaction()?;
+            ensure_scan_staging(&tx, scan_id)?;
+            let staged = load_staged_delta(&tx, scan_id, delta_id)?;
+            if staged.record.status != "staging" {
+                bail!(
+                    "incremental delta {delta_id} is immutable after reaching status {}",
+                    staged.record.status
+                );
+            }
+            let parent = incremental_parent(&tx, scan_id)?;
+            if parent != staged.record.base_snapshot_id {
+                bail!("staged delta base does not match the incremental scan parent");
+            }
+            ensure_current_base(&tx, &parent)?;
+            let base = load_delta_base_graph(&tx, &parent)?;
+            if delta_graph_digest(&base) != staged.record.base_graph_digest {
+                bail!("staged delta base graph digest no longer matches the completed snapshot");
+            }
+            let canonical = revalidate_delta(scan_id, base.clone(), &staged.events)?;
+            ensure_staged_metadata(&staged.record, &canonical)?;
+            let expected_result = apply_delta_to_graph(base, &canonical)?;
+            if delta_graph_digest(&expected_result) != staged.record.result_graph_digest {
+                bail!("staged delta result graph digest failed canonical recomputation");
+            }
+
+            apply_delta_mutations(&tx, scan_id, &canonical)?;
+            let stored_result = load_scan_delta_graph(&tx, scan_id, &parent)?;
+            if delta_graph_digest(&stored_result) != staged.record.result_graph_digest {
+                bail!("transactional graph mutation produced an unexpected graph digest");
+            }
+            let (source_revision,): (Option<String>,) = tx.query_row(
+                "SELECT source_revision FROM scans WHERE id=?1",
+                [scan_id],
+                |row| Ok((row.get(0)?,)),
+            )?;
+            let (prospective_snapshot_id, _) = completed_snapshot_identity(
+                &tx,
+                scan_id,
+                None,
+                &[],
+                Some(&parent),
+                source_revision.as_deref(),
+            )?;
+            tx.execute(
+                "UPDATE scans SET mutation_count=mutation_count+?2 WHERE id=?1",
+                params![scan_id, staged.record.mutation_count],
+            )?;
+            tx.execute(
+                "UPDATE incremental_deltas
+                    SET status='applied', prospective_snapshot_id=?3,
+                        completed_at=?4, error=NULL
+                  WHERE scan_id=?1 AND delta_id=?2 AND status='staging'",
+                params![
+                    scan_id,
+                    delta_id,
+                    prospective_snapshot_id,
+                    Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+                ],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })();
+
+        if let Err(error) = result {
+            self.connection.execute(
+                "UPDATE incremental_deltas
+                    SET status='failed', completed_at=?3,
+                        error='transactional incremental delta apply failed'
+                  WHERE scan_id=?1 AND delta_id=?2 AND status='staging'",
+                params![
+                    scan_id,
+                    delta_id,
+                    Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
+                ],
+            )?;
+            return Err(error);
+        }
+        self.incremental_delta(scan_id, delta_id)?
+            .context("applied incremental delta was not visible after commit")
+    }
+
+    pub fn cancel_staged_incremental_delta(
+        &mut self,
+        scan_id: &str,
+        delta_id: &str,
+    ) -> Result<IncrementalDeltaRecord> {
+        let tx = self.connection.transaction()?;
+        ensure_scan_staging(&tx, scan_id)?;
+        let changed = tx.execute(
+            "UPDATE incremental_deltas
+                SET status='cancelled', completed_at=?3,
+                    error='incremental delta apply cancelled'
+              WHERE scan_id=?1 AND delta_id=?2 AND status='staging'",
+            params![
+                scan_id,
+                delta_id,
+                Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
+            ],
+        )?;
+        if changed != 1 {
+            bail!("staged incremental delta {delta_id} was not found");
+        }
+        tx.commit()?;
+        self.incremental_delta(scan_id, delta_id)?
+            .context("cancelled incremental delta was not visible after commit")
+    }
+
+    pub fn incremental_delta(
+        &self,
+        scan_id: &str,
+        delta_id: &str,
+    ) -> Result<Option<IncrementalDeltaRecord>> {
+        load_incremental_delta_record(&self.connection, scan_id, delta_id)
+    }
+
     pub fn start_incremental_scan_with_revision(
         &mut self,
         scan_id: &str,
@@ -191,6 +398,523 @@ impl Store {
         tx.commit()?;
         Ok(())
     }
+}
+
+#[derive(Debug)]
+struct StagedDelta {
+    record: IncrementalDeltaRecord,
+    events: Vec<depgraph_protocol::DeltaEvent>,
+}
+
+fn incremental_parent(connection: &Connection, scan_id: &str) -> Result<String> {
+    connection
+        .query_row(
+            "SELECT parent_snapshot_id FROM scans WHERE id=?1",
+            [scan_id],
+            |row| row.get::<_, Option<String>>(0),
+        )?
+        .with_context(|| format!("incremental scan {scan_id} has no parent snapshot"))
+}
+
+fn ensure_current_base(connection: &Connection, base_snapshot_id: &str) -> Result<()> {
+    let current = connection
+        .query_row(
+            "SELECT snapshot_id FROM current_completed_snapshot WHERE singleton=1",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if current.as_deref() != Some(base_snapshot_id) {
+        bail!("incremental delta base is not the current completed snapshot");
+    }
+    Ok(())
+}
+
+fn load_incremental_delta_record(
+    connection: &Connection,
+    scan_id: &str,
+    delta_id: &str,
+) -> Result<Option<IncrementalDeltaRecord>> {
+    connection
+        .query_row(
+            "SELECT scan_id, delta_id, adapter, base_snapshot_id, base_graph_digest,
+                    result_graph_digest, mutation_count, status, prospective_snapshot_id,
+                    staged_at, completed_at, error
+               FROM incremental_deltas
+              WHERE scan_id=?1 AND delta_id=?2",
+            params![scan_id, delta_id],
+            |row| {
+                Ok(IncrementalDeltaRecord {
+                    scan_id: row.get(0)?,
+                    delta_id: row.get(1)?,
+                    adapter: row.get(2)?,
+                    base_snapshot_id: row.get(3)?,
+                    base_graph_digest: row.get(4)?,
+                    result_graph_digest: row.get(5)?,
+                    mutation_count: row.get(6)?,
+                    status: row.get(7)?,
+                    prospective_snapshot_id: row.get(8)?,
+                    staged_at: row.get(9)?,
+                    completed_at: row.get(10)?,
+                    error: row.get(11)?,
+                })
+            },
+        )
+        .optional()
+        .context("failed to load incremental delta")
+}
+
+fn load_staged_delta(
+    connection: &Connection,
+    scan_id: &str,
+    delta_id: &str,
+) -> Result<StagedDelta> {
+    let record = load_incremental_delta_record(connection, scan_id, delta_id)?
+        .with_context(|| format!("incremental delta {delta_id} was not staged for {scan_id}"))?;
+    let raw = connection.query_row(
+        "SELECT events_json FROM incremental_deltas WHERE scan_id=?1 AND delta_id=?2",
+        params![scan_id, delta_id],
+        |row| row.get::<_, String>(0),
+    )?;
+    Ok(StagedDelta {
+        record,
+        events: serde_json::from_str(&raw).context("staged delta event JSON is invalid")?,
+    })
+}
+
+fn load_delta_base_graph(connection: &Connection, snapshot_id: &str) -> Result<DeltaBaseGraph> {
+    let (source_kind, scan_id) = connection
+        .query_row(
+            "SELECT source_kind, scan_id FROM completed_snapshots
+              WHERE id=?1 AND status='completed'",
+            [snapshot_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?
+        .with_context(|| format!("completed delta base snapshot {snapshot_id} was not found"))?;
+    if source_kind != "scan" {
+        bail!("worker delta requires a completed scan snapshot base");
+    }
+    load_scan_delta_graph(connection, &scan_id, snapshot_id)
+}
+
+fn load_scan_delta_graph(
+    connection: &Connection,
+    scan_id: &str,
+    snapshot_id: &str,
+) -> Result<DeltaBaseGraph> {
+    let profiles = {
+        let mut statement =
+            connection.prepare("SELECT id FROM profiles WHERE scan_id=?1 ORDER BY id")?;
+        statement
+            .query_map([scan_id], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<BTreeSet<_>, _>>()?
+    };
+    let nodes = load_raw_records(connection, "nodes", scan_id)?
+        .into_iter()
+        .map(|raw| {
+            let node: depgraph_protocol::GraphNode = serde_json::from_str(&raw)?;
+            Ok((node.id.clone(), node))
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    let sites = load_raw_records(connection, "sites", scan_id)?
+        .into_iter()
+        .map(|raw| {
+            let mut site: depgraph_protocol::DependencySite = serde_json::from_str(&raw)?;
+            site.evidence.clear();
+            Ok((site.id.clone(), site))
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    let edges = load_raw_records(connection, "edges", scan_id)?
+        .into_iter()
+        .map(|raw| {
+            let mut edge: depgraph_protocol::GraphEdge = serde_json::from_str(&raw)?;
+            edge.evidence.clear();
+            Ok((edge.id.clone(), edge))
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
+
+    let evidence = {
+        let mut statement = connection.prepare(
+            "SELECT owner_type, owner_id, ordinal, raw_json
+               FROM evidence WHERE scan_id=?1
+              ORDER BY owner_type, owner_id, ordinal",
+        )?;
+        let rows = statement.query_map([scan_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, u32>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        let mut records = BTreeMap::new();
+        for row in rows {
+            let (owner_type, owner_id, ordinal, raw) = row?;
+            let owner_type = match owner_type.as_str() {
+                "node" => DeltaEvidenceOwner::Node,
+                "site" => DeltaEvidenceOwner::Site,
+                "edge" => DeltaEvidenceOwner::Edge,
+                other => bail!("unsupported delta evidence owner type {other}"),
+            };
+            records.insert(
+                DeltaEvidenceKey {
+                    owner_type,
+                    owner_id,
+                    ordinal,
+                },
+                serde_json::from_str::<Evidence>(&raw)?,
+            );
+        }
+        records
+    };
+
+    let mut coverage = BTreeMap::new();
+    {
+        let mut statement = connection.prepare(
+            "SELECT profile_id, json FROM profile_coverage
+              WHERE scan_id=?1 ORDER BY profile_id",
+        )?;
+        for row in statement.query_map([scan_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })? {
+            let (profile_id, raw) = row?;
+            let item = DeltaCoverage::Profile {
+                profile_id,
+                value: serde_json::from_str::<Coverage>(&raw)?,
+            };
+            coverage.insert(item.key(), item);
+        }
+    }
+    {
+        let mut statement = connection.prepare(
+            "SELECT adapter, path, discovered_sites, emitted_sites, skipped_sites,
+                    skipped, reason
+               FROM file_coverage WHERE scan_id=?1 ORDER BY adapter, path",
+        )?;
+        for row in statement.query_map([scan_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, u64>(2)?,
+                row.get::<_, u64>(3)?,
+                row.get::<_, u64>(4)?,
+                row.get::<_, bool>(5)?,
+                row.get::<_, Option<String>>(6)?,
+            ))
+        })? {
+            let (adapter, path, discovered_sites, emitted_sites, skipped_sites, skipped, reason) =
+                row?;
+            let item = DeltaCoverage::File {
+                adapter,
+                path,
+                value: DeltaFileCoverage {
+                    discovered_sites,
+                    emitted_sites,
+                    skipped_sites,
+                    skipped,
+                    reason,
+                },
+            };
+            coverage.insert(item.key(), item);
+        }
+    }
+    let aggregate = connection
+        .query_row(
+            "SELECT json FROM coverage WHERE scan_id=?1",
+            [scan_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .with_context(|| format!("scan {scan_id} has no aggregate coverage"))?;
+    let aggregate = DeltaCoverage::Aggregate {
+        value: serde_json::from_str::<Coverage>(&aggregate)?,
+    };
+    coverage.insert(aggregate.key(), aggregate);
+
+    let mut graph = DeltaBaseGraph {
+        snapshot_id: snapshot_id.to_owned(),
+        graph_digest: String::new(),
+        profiles,
+        nodes,
+        sites,
+        edges,
+        evidence,
+        coverage,
+    };
+    graph.graph_digest = delta_graph_digest(&graph);
+    Ok(graph)
+}
+
+fn load_raw_records(connection: &Connection, table: &str, scan_id: &str) -> Result<Vec<String>> {
+    let sql = match table {
+        "nodes" => "SELECT raw_json FROM nodes WHERE scan_id=?1 ORDER BY id",
+        "sites" => "SELECT raw_json FROM sites WHERE scan_id=?1 ORDER BY id",
+        "edges" => "SELECT raw_json FROM edges WHERE scan_id=?1 ORDER BY id",
+        _ => unreachable!("delta graph loading uses fixed record tables"),
+    };
+    let mut statement = connection.prepare(sql)?;
+    Ok(statement
+        .query_map([scan_id], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?)
+}
+
+fn revalidate_delta(
+    scan_id: &str,
+    base: DeltaBaseGraph,
+    events: &[depgraph_protocol::DeltaEvent],
+) -> Result<ValidatedDelta> {
+    let mut validator = DeltaValidator::new(base)?;
+    for event in events {
+        if event.common().scan_id != scan_id {
+            bail!("incremental delta event targets another staging scan");
+        }
+        validator.push(event.clone())?;
+    }
+    Ok(validator.finish()?)
+}
+
+fn ensure_staged_metadata(record: &IncrementalDeltaRecord, delta: &ValidatedDelta) -> Result<()> {
+    if record.delta_id != delta.delta_id
+        || record.base_snapshot_id != delta.base_snapshot_id
+        || record.base_graph_digest != delta.base_graph_digest
+        || record.result_graph_digest != delta.result_graph_digest
+        || record.mutation_count != delta_mutation_count(delta)
+    {
+        bail!("staged delta metadata does not match its revalidated event stream");
+    }
+    Ok(())
+}
+
+fn delta_mutation_count(delta: &ValidatedDelta) -> u64 {
+    delta.events.len().saturating_sub(2) as u64
+}
+
+fn apply_delta_to_graph(
+    mut graph: DeltaBaseGraph,
+    delta: &ValidatedDelta,
+) -> Result<DeltaBaseGraph> {
+    if graph.snapshot_id != delta.base_snapshot_id || graph.graph_digest != delta.base_graph_digest
+    {
+        bail!("delta cannot be applied to a different base graph");
+    }
+    for key in &delta.evidence_deletes {
+        graph.evidence.remove(key);
+    }
+    for id in &delta.edge_deletes {
+        graph.edges.remove(id);
+    }
+    for id in &delta.site_deletes {
+        graph.sites.remove(id);
+    }
+    for id in &delta.node_deletes {
+        graph.nodes.remove(id);
+    }
+    graph.nodes.extend(delta.node_upserts.clone());
+    graph.sites.extend(delta.site_upserts.clone());
+    graph.edges.extend(delta.edge_upserts.clone());
+    graph.evidence.extend(delta.evidence_upserts.clone());
+    for key in &delta.coverage_deletes {
+        graph.coverage.remove(key);
+    }
+    graph.coverage.extend(delta.coverage_upserts.clone());
+    graph.graph_digest = delta_graph_digest(&graph);
+    Ok(graph)
+}
+
+fn apply_delta_mutations(
+    tx: &Transaction<'_>,
+    scan_id: &str,
+    delta: &ValidatedDelta,
+) -> Result<()> {
+    for key in &delta.evidence_deletes {
+        let changed = tx.execute(
+            "DELETE FROM evidence
+              WHERE scan_id=?1 AND owner_type=?2 AND owner_id=?3 AND ordinal=?4",
+            params![
+                scan_id,
+                evidence_owner_name(key.owner_type),
+                key.owner_id,
+                key.ordinal
+            ],
+        )?;
+        if changed != 1 {
+            bail!("delta evidence delete did not match its validated base record");
+        }
+    }
+    delete_delta_ids(tx, "edges", scan_id, &delta.edge_deletes)?;
+    delete_delta_ids(tx, "sites", scan_id, &delta.site_deletes)?;
+    delete_delta_ids(tx, "nodes", scan_id, &delta.node_deletes)?;
+
+    for node in delta.node_upserts.values() {
+        insert_node(tx, scan_id, &serde_json::to_value(node)?)?;
+    }
+    for site in delta.site_upserts.values() {
+        upsert_site_row(tx, scan_id, &serde_json::to_value(site)?)?;
+    }
+    for edge in delta.edge_upserts.values() {
+        upsert_edge_row(tx, scan_id, &serde_json::to_value(edge)?)?;
+    }
+    for (key, evidence) in &delta.evidence_upserts {
+        upsert_delta_evidence(tx, scan_id, key, evidence)?;
+    }
+    for key in &delta.coverage_deletes {
+        delete_delta_coverage(tx, scan_id, key)?;
+    }
+    for coverage in delta.coverage_upserts.values() {
+        upsert_delta_coverage(tx, scan_id, coverage)?;
+    }
+    if let Some(DeltaCoverage::Aggregate { value }) =
+        delta.coverage_upserts.get(&DeltaCoverageKey::Aggregate)
+    {
+        tx.execute(
+            "UPDATE scans SET project_code_executed=?2 WHERE id=?1",
+            params![scan_id, value.project_code_executed],
+        )?;
+    }
+    Ok(())
+}
+
+fn delete_delta_ids(
+    tx: &Transaction<'_>,
+    table: &str,
+    scan_id: &str,
+    ids: &BTreeSet<String>,
+) -> Result<()> {
+    let sql = match table {
+        "nodes" => "DELETE FROM nodes WHERE scan_id=?1 AND id=?2",
+        "sites" => "DELETE FROM sites WHERE scan_id=?1 AND id=?2",
+        "edges" => "DELETE FROM edges WHERE scan_id=?1 AND id=?2",
+        _ => unreachable!("delta deletion uses fixed graph tables"),
+    };
+    for id in ids {
+        if tx.execute(sql, params![scan_id, id])? != 1 {
+            bail!("delta {table} delete did not match its validated base record");
+        }
+    }
+    Ok(())
+}
+
+fn evidence_owner_name(owner: DeltaEvidenceOwner) -> &'static str {
+    match owner {
+        DeltaEvidenceOwner::Node => "node",
+        DeltaEvidenceOwner::Site => "site",
+        DeltaEvidenceOwner::Edge => "edge",
+    }
+}
+
+fn upsert_delta_evidence(
+    tx: &Transaction<'_>,
+    scan_id: &str,
+    key: &DeltaEvidenceKey,
+    evidence: &Evidence,
+) -> Result<()> {
+    let raw = serde_json::to_value(evidence)?;
+    tx.execute(
+        "INSERT INTO evidence(
+            scan_id, owner_type, owner_id, ordinal, kind, extractor,
+            extractor_version, path, start_line, start_column, end_line,
+            end_column, raw_json
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+         ON CONFLICT(scan_id, owner_type, owner_id, ordinal) DO UPDATE SET
+            kind=excluded.kind, extractor=excluded.extractor,
+            extractor_version=excluded.extractor_version, path=excluded.path,
+            start_line=excluded.start_line, start_column=excluded.start_column,
+            end_line=excluded.end_line, end_column=excluded.end_column,
+            raw_json=excluded.raw_json",
+        params![
+            scan_id,
+            evidence_owner_name(key.owner_type),
+            key.owner_id,
+            key.ordinal,
+            raw.get("kind").and_then(Value::as_str).unwrap_or("source"),
+            evidence.extractor,
+            evidence.extractor_version,
+            evidence.path.as_deref().unwrap_or(""),
+            evidence.start_line.unwrap_or(1),
+            evidence.start_column.unwrap_or(1),
+            evidence.end_line.unwrap_or(1),
+            evidence.end_column.unwrap_or(1),
+            serde_json::to_string(evidence)?,
+        ],
+    )?;
+    Ok(())
+}
+
+fn delete_delta_coverage(
+    tx: &Transaction<'_>,
+    scan_id: &str,
+    key: &DeltaCoverageKey,
+) -> Result<()> {
+    let changed = match key {
+        DeltaCoverageKey::Aggregate => {
+            tx.execute("DELETE FROM coverage WHERE scan_id=?1", [scan_id])?
+        }
+        DeltaCoverageKey::Profile { profile_id } => tx.execute(
+            "DELETE FROM profile_coverage WHERE scan_id=?1 AND profile_id=?2",
+            params![scan_id, profile_id],
+        )?,
+        DeltaCoverageKey::File { adapter, path } => tx.execute(
+            "DELETE FROM file_coverage WHERE scan_id=?1 AND adapter=?2 AND path=?3",
+            params![scan_id, adapter, path],
+        )?,
+    };
+    if changed != 1 {
+        bail!("delta coverage delete did not match its validated base record");
+    }
+    Ok(())
+}
+
+fn upsert_delta_coverage(
+    tx: &Transaction<'_>,
+    scan_id: &str,
+    coverage: &DeltaCoverage,
+) -> Result<()> {
+    match coverage {
+        DeltaCoverage::Aggregate { value } => {
+            tx.execute(
+                "INSERT INTO coverage(scan_id, json) VALUES (?1, ?2)
+                 ON CONFLICT(scan_id) DO UPDATE SET json=excluded.json",
+                params![scan_id, serde_json::to_string(value)?],
+            )?;
+        }
+        DeltaCoverage::Profile { profile_id, value } => {
+            tx.execute(
+                "INSERT INTO profile_coverage(scan_id, profile_id, json)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(scan_id, profile_id) DO UPDATE SET json=excluded.json",
+                params![scan_id, profile_id, serde_json::to_string(value)?],
+            )?;
+        }
+        DeltaCoverage::File {
+            adapter,
+            path,
+            value,
+        } => {
+            tx.execute(
+                "INSERT INTO file_coverage(
+                    scan_id, path, discovered_sites, emitted_sites, skipped_sites,
+                    skipped, reason, adapter
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(scan_id, adapter, path) DO UPDATE SET
+                    discovered_sites=excluded.discovered_sites,
+                    emitted_sites=excluded.emitted_sites,
+                    skipped_sites=excluded.skipped_sites,
+                    skipped=excluded.skipped, reason=excluded.reason",
+                params![
+                    scan_id,
+                    path,
+                    value.discovered_sites,
+                    value.emitted_sites,
+                    value.skipped_sites,
+                    value.skipped,
+                    value.reason,
+                    adapter,
+                ],
+            )?;
+        }
+    }
+    Ok(())
 }
 
 #[derive(Default)]
@@ -752,6 +1476,10 @@ fn normalize_path(value: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use depgraph_protocol::{
+        CommonFields, DELTA_CONTRACT_VERSION, DeltaCompleted, DeltaEvent, DeltaNodeUpsert,
+        DeltaScope, DeltaStarted, build_delta_stable_id, stable_id_from_value,
+    };
     use serde_json::json;
 
     fn common(scan_id: &str, event: &str, seq: u64) -> Value {
@@ -858,6 +1586,174 @@ mod tests {
         });
         events.push(completed);
         events
+    }
+
+    #[derive(Debug)]
+    struct StableGraphIds {
+        source: String,
+        target: String,
+        site: String,
+        edge: String,
+    }
+
+    fn stable_graph_events(scan_id: &str) -> (Vec<Value>, StableGraphIds) {
+        let profile_id = "web:delta";
+        let source =
+            stable_id_from_value("file", &json!({"path":"src/index.ts","profile":profile_id}));
+        let target =
+            stable_id_from_value("file", &json!({"path":"src/lib.ts","profile":profile_id}));
+        let site = stable_id_from_value(
+            "site",
+            &json!({
+                "kind":"import","path":"src/index.ts","profile_id":profile_id,
+                "source":source,"span":{"start_line":1,"start_column":1,
+                    "end_line":1,"end_column":16}
+            }),
+        );
+        let edge = stable_id_from_value(
+            "edge",
+            &json!({"kind":"imports","site_id":site,"target":target}),
+        );
+        let ids = StableGraphIds {
+            source: source.clone(),
+            target: target.clone(),
+            site: site.clone(),
+            edge: edge.clone(),
+        };
+        let coverage = json!({
+            "profiles":1,"files_discovered":2,"files_analyzed":2,"files_skipped":0,
+            "dependency_sites":1,"resolved":1,"candidates":0,"external":0,"unresolved":0,
+            "unsupported_syntax":0,"project_code_executed":false,
+            "completeness":["syntax-complete"],"reasons":[]
+        });
+        let mut profile = common(scan_id, "profile_declared", 1);
+        profile["profile"] = json!({
+            "id":profile_id,"language":"typescript","features":[],"environment":{},
+            "properties":{"package_locator":"npm:fixture@1.0.0"}
+        });
+        let mut source_node = common(scan_id, "node_upsert", 2);
+        source_node["node"] = json!({
+            "id":source,"kind":"file","locator":"src/index.ts",
+            "display_name":"src/index.ts","properties":{
+                "path":"src/index.ts","package_locator":"npm:fixture@1.0.0",
+                "profile_id":profile_id,"content_hash":"before"}
+        });
+        let mut target_node = common(scan_id, "node_upsert", 3);
+        target_node["node"] = json!({
+            "id":target,"kind":"file","locator":"src/lib.ts",
+            "display_name":"src/lib.ts","properties":{
+                "path":"src/lib.ts","package_locator":"npm:fixture@1.0.0",
+                "profile_id":profile_id,"content_hash":"unchanged"}
+        });
+        let evidence = json!([{
+            "kind":"source","extractor":"fixture","extractor_version":"1.0.0",
+            "path":"src/index.ts","start_line":1,"start_column":1,
+            "end_line":1,"end_column":16,"properties":{}
+        }]);
+        let mut site_event = common(scan_id, "dependency_site", 4);
+        site_event["site"] = json!({
+            "id":site,"source":source,"kind":"import","specifier":"./lib",
+            "profile_id":profile_id,"resolution_status":"resolved","precision":"exact",
+            "condition":{"op":"all","conditions":[]},"target_ids":[target],
+            "evidence":evidence
+        });
+        let mut edge_event = common(scan_id, "edge_upsert", 5);
+        edge_event["edge"] = json!({
+            "id":edge,"site_id":site,"source":source,"target":target,
+            "kind":"imports","phase":"source","environment":"any",
+            "profile_id":profile_id,"resolution_status":"resolved","precision":"exact",
+            "condition":{"op":"all","conditions":[]},"generated":false,
+            "evidence":evidence
+        });
+        let mut source_file = common(scan_id, "file_completed", 6);
+        source_file["path"] = json!("src/index.ts");
+        source_file["discovered_sites"] = json!(1);
+        source_file["emitted_sites"] = json!(1);
+        source_file["skipped_sites"] = json!(0);
+        source_file["skipped"] = json!(false);
+        let mut target_file = common(scan_id, "file_completed", 7);
+        target_file["path"] = json!("src/lib.ts");
+        target_file["discovered_sites"] = json!(0);
+        target_file["emitted_sites"] = json!(0);
+        target_file["skipped_sites"] = json!(0);
+        target_file["skipped"] = json!(false);
+        let mut profile_completed = common(scan_id, "profile_completed", 8);
+        profile_completed["profile_id"] = json!(profile_id);
+        profile_completed["coverage"] = coverage.clone();
+        let mut scan_completed = common(scan_id, "scan_completed", 9);
+        scan_completed["coverage"] = coverage;
+        (
+            vec![
+                profile,
+                source_node,
+                target_node,
+                site_event,
+                edge_event,
+                source_file,
+                target_file,
+                profile_completed,
+                scan_completed,
+            ],
+            ids,
+        )
+    }
+
+    fn validated_node_delta(
+        scan_id: &str,
+        base: &DeltaBaseGraph,
+        source_id: &str,
+        content_hash: &str,
+    ) -> ValidatedDelta {
+        let mut node = base.nodes.get(source_id).unwrap().clone();
+        node.properties
+            .insert("content_hash".into(), json!(content_hash));
+        let scope = DeltaScope {
+            paths: vec!["src/index.ts".into()],
+            package_locators: Vec::new(),
+            profile_ids: Vec::new(),
+            artifact_node_ids: Vec::new(),
+            adapters: vec!["web".into()],
+        };
+        let common = |seq| CommonFields {
+            protocol_version: "1.0".into(),
+            scan_id: scan_id.into(),
+            adapter: "web".into(),
+            adapter_version: "1.0.0".into(),
+            seq,
+        };
+        let mutation = DeltaEvent::NodeUpsert(DeltaNodeUpsert {
+            common: common(2),
+            node: node.clone(),
+        });
+        let delta_id =
+            build_delta_stable_id(&base.snapshot_id, &base.graph_digest, &scope, [&mutation])
+                .unwrap();
+        let mut result = base.clone();
+        result.nodes.insert(node.id.clone(), node);
+        let result_graph_digest = delta_graph_digest(&result);
+        let events = vec![
+            DeltaEvent::DeltaStarted(DeltaStarted {
+                common: common(1),
+                delta_contract_version: DELTA_CONTRACT_VERSION.into(),
+                delta_id: delta_id.clone(),
+                base_snapshot_id: base.snapshot_id.clone(),
+                base_graph_digest: base.graph_digest.clone(),
+                scope,
+            }),
+            mutation,
+            DeltaEvent::DeltaCompleted(DeltaCompleted {
+                common: common(3),
+                delta_contract_version: DELTA_CONTRACT_VERSION.into(),
+                delta_id,
+                mutation_count: 1,
+                result_graph_digest,
+            }),
+        ];
+        let mut validator = DeltaValidator::new(base.clone()).unwrap();
+        for event in events {
+            validator.push(event).unwrap();
+        }
+        validator.finish().unwrap()
     }
 
     fn complete(store: &mut Store, scan_id: &str, events: &[Value]) -> String {
@@ -1034,5 +1930,209 @@ mod tests {
             store.current_snapshot_id().unwrap().as_deref(),
             Some(base_id.as_str())
         );
+    }
+
+    #[test]
+    fn validated_delta_updates_one_file_and_preserves_unaffected_payloads() {
+        let mut store = Store::open_in_memory().unwrap();
+        let (events, ids) = stable_graph_events("base-delta");
+        let base_id = complete(&mut store, "base-delta", &events);
+        let base_snapshot = store.load_completed_snapshot(&base_id).unwrap();
+        let base = store.delta_base_graph(&base_id).unwrap();
+        let delta = validated_node_delta("incremental-delta", &base, &ids.source, "after");
+
+        store
+            .start_incremental_scan_with_revision(
+                "incremental-delta",
+                Path::new("/fixture"),
+                false,
+                &base_id,
+                Some("revision-2"),
+            )
+            .unwrap();
+        let staged = store
+            .stage_incremental_delta("incremental-delta", &delta)
+            .unwrap();
+        assert_eq!(staged.status, "staging");
+        let applied = store
+            .apply_staged_incremental_delta("incremental-delta", &delta.delta_id)
+            .unwrap();
+        assert_eq!(applied.status, "applied");
+        store.validate_scan("incremental-delta").unwrap();
+        store
+            .finish_scan("incremental-delta", "completed", None, true)
+            .unwrap();
+
+        let current = store.current_snapshot_id().unwrap().unwrap();
+        assert_ne!(current, base_id);
+        assert_eq!(
+            applied.prospective_snapshot_id.as_deref(),
+            Some(current.as_str())
+        );
+        let result = store.load_completed_snapshot(&current).unwrap();
+        let base_target = base_snapshot
+            .nodes
+            .iter()
+            .find(|node| node.id == ids.target)
+            .unwrap();
+        assert_eq!(
+            result
+                .nodes
+                .iter()
+                .find(|node| node.id == ids.target)
+                .unwrap(),
+            base_target
+        );
+        assert_eq!(result.sites, base_snapshot.sites);
+        assert_eq!(result.edges, base_snapshot.edges);
+        assert_eq!(result.evidence, base_snapshot.evidence);
+        assert_eq!(result.file_coverage, base_snapshot.file_coverage);
+        assert_eq!(result.coverage, base_snapshot.coverage);
+        assert_eq!(
+            result
+                .nodes
+                .iter()
+                .find(|node| node.id == ids.source)
+                .unwrap()
+                .properties["content_hash"],
+            json!("after")
+        );
+        assert!(result.sites.iter().any(|site| site.id == ids.site));
+        assert!(result.edges.iter().any(|edge| edge.id == ids.edge));
+        assert_eq!(
+            store.load_completed_snapshot(&base_id).unwrap(),
+            base_snapshot
+        );
+    }
+
+    #[test]
+    fn corrupted_staged_delta_rolls_back_and_keeps_current_snapshot() {
+        let mut store = Store::open_in_memory().unwrap();
+        let (events, ids) = stable_graph_events("base-failed-delta");
+        let base_id = complete(&mut store, "base-failed-delta", &events);
+        let base_snapshot = store.load_completed_snapshot(&base_id).unwrap();
+        let base = store.delta_base_graph(&base_id).unwrap();
+        let delta = validated_node_delta("failed-delta", &base, &ids.source, "after");
+        store
+            .start_incremental_scan_with_revision(
+                "failed-delta",
+                Path::new("/fixture"),
+                false,
+                &base_id,
+                None,
+            )
+            .unwrap();
+        store
+            .stage_incremental_delta("failed-delta", &delta)
+            .unwrap();
+        let raw: String = store
+            .connection
+            .query_row(
+                "SELECT events_json FROM incremental_deltas
+                  WHERE scan_id='failed-delta' AND delta_id=?1",
+                [&delta.delta_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut staged_events: Value = serde_json::from_str(&raw).unwrap();
+        staged_events[1]["node"]["id"] = json!("file:not-a-stable-id");
+        store
+            .connection
+            .execute(
+                "UPDATE incremental_deltas SET events_json=?2
+                  WHERE scan_id='failed-delta' AND delta_id=?1",
+                params![
+                    delta.delta_id,
+                    serde_json::to_string(&staged_events).unwrap()
+                ],
+            )
+            .unwrap();
+
+        assert!(
+            store
+                .apply_staged_incremental_delta("failed-delta", &delta.delta_id)
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .incremental_delta("failed-delta", &delta.delta_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            "failed"
+        );
+        let staging = store.load_snapshot("failed-delta").unwrap();
+        assert_eq!(staging.nodes, base_snapshot.nodes);
+        assert_eq!(staging.sites, base_snapshot.sites);
+        assert_eq!(staging.edges, base_snapshot.edges);
+        assert!(
+            store
+                .finish_scan("failed-delta", "completed", None, true)
+                .unwrap_err()
+                .to_string()
+                .contains("were not applied successfully")
+        );
+        assert_eq!(
+            store.current_snapshot_id().unwrap().as_deref(),
+            Some(base_id.as_str())
+        );
+        assert_eq!(
+            store.load_completed_snapshot(&base_id).unwrap(),
+            base_snapshot
+        );
+    }
+
+    #[test]
+    fn cancelled_and_crash_recovered_deltas_are_gc_eligible() {
+        for (scan_id, recover) in [("cancelled-delta", false), ("crashed-delta", true)] {
+            let mut store = Store::open_in_memory().unwrap();
+            let (events, ids) = stable_graph_events("base-cancel-delta");
+            let base_id = complete(&mut store, "base-cancel-delta", &events);
+            let base = store.delta_base_graph(&base_id).unwrap();
+            let delta = validated_node_delta(scan_id, &base, &ids.source, "after");
+            store
+                .start_incremental_scan_with_revision(
+                    scan_id,
+                    Path::new("/fixture"),
+                    false,
+                    &base_id,
+                    None,
+                )
+                .unwrap();
+            store.stage_incremental_delta(scan_id, &delta).unwrap();
+            if recover {
+                let recovery = store
+                    .recover_interrupted_attempts(Path::new("/fixture"))
+                    .unwrap();
+                assert!(recovery.scan_attempt_ids.contains(&scan_id.to_owned()));
+            } else {
+                store
+                    .cancel_staged_incremental_delta(scan_id, &delta.delta_id)
+                    .unwrap();
+                store
+                    .finish_scan(scan_id, "cancelled", Some("cancelled"), false)
+                    .unwrap();
+            }
+            assert_eq!(
+                store
+                    .incremental_delta(scan_id, &delta.delta_id)
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                "cancelled"
+            );
+            assert_eq!(
+                store.current_snapshot_id().unwrap().as_deref(),
+                Some(base_id.as_str())
+            );
+            let report = store.garbage_collect_unreferenced_attempts().unwrap();
+            assert_eq!(report.scan_attempts_deleted, 1);
+            assert!(
+                store
+                    .incremental_delta(scan_id, &delta.delta_id)
+                    .unwrap()
+                    .is_none()
+            );
+        }
     }
 }
