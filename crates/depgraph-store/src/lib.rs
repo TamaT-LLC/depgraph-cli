@@ -948,12 +948,13 @@ impl Store {
                     payload_digest TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     last_used_at TEXT NOT NULL,
+                    last_used_sequence INTEGER NOT NULL,
                     hit_count INTEGER NOT NULL DEFAULT 0
                  );
                  CREATE INDEX impact_query_cache_snapshot_used
-                    ON impact_query_cache(snapshot_id, last_used_at, key);
+                    ON impact_query_cache(snapshot_id, last_used_sequence, key);
                  CREATE INDEX impact_query_cache_lru
-                    ON impact_query_cache(last_used_at, key);
+                    ON impact_query_cache(last_used_sequence, key);
                  PRAGMA user_version = 13;",
             )?;
             tx.commit()?;

@@ -65,7 +65,12 @@ impl Store {
 
         tx.execute(
             "UPDATE impact_query_cache
-                SET last_used_at=?2, hit_count=hit_count+1
+                SET last_used_at=?2,
+                    last_used_sequence=(
+                        SELECT COALESCE(MAX(last_used_sequence), 0) + 1
+                          FROM impact_query_cache
+                    ),
+                    hit_count=hit_count+1
               WHERE key=?1",
             params![key, timestamp],
         )?;
@@ -89,14 +94,22 @@ impl Store {
         tx.execute(
             "INSERT INTO impact_query_cache(
                 key, contract_version, snapshot_id, payload_json, payload_digest,
-                created_at, last_used_at, hit_count
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, 0)
+                created_at, last_used_at, last_used_sequence, hit_count
+             ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?6,
+                (
+                    SELECT COALESCE(MAX(last_used_sequence), 0) + 1
+                      FROM impact_query_cache
+                ),
+                0
+             )
              ON CONFLICT(key) DO UPDATE SET
                 contract_version=excluded.contract_version,
                 snapshot_id=excluded.snapshot_id,
                 payload_json=excluded.payload_json,
                 payload_digest=excluded.payload_digest,
-                last_used_at=excluded.last_used_at",
+                last_used_at=excluded.last_used_at,
+                last_used_sequence=excluded.last_used_sequence",
             params![
                 key,
                 IMPACT_QUERY_CACHE_CONTRACT_VERSION,
@@ -112,7 +125,7 @@ impl Store {
               WHERE key IN (
                 SELECT key
                   FROM impact_query_cache
-                 ORDER BY last_used_at DESC, key DESC
+                 ORDER BY last_used_sequence DESC, key DESC
                  LIMIT -1 OFFSET ?1
               )",
             [IMPACT_QUERY_CACHE_MAX_ENTRIES as i64],
@@ -246,7 +259,7 @@ mod tests {
     #[test]
     fn impact_query_cache_is_bounded_by_entry_count_and_payload_size() -> Result<()> {
         let mut store = seeded_store()?;
-        for index in 0..=IMPACT_QUERY_CACHE_MAX_ENTRIES {
+        for index in 0..IMPACT_QUERY_CACHE_MAX_ENTRIES {
             assert!(store.store_impact_query_cache(
                 &key(index),
                 "snapshot:sha256:test",
@@ -257,6 +270,26 @@ mod tests {
             store.impact_query_cache_entry_count()?,
             IMPACT_QUERY_CACHE_MAX_ENTRIES as u64
         );
+        assert!(
+            store
+                .lookup_impact_query_cache(&key(0), "snapshot:sha256:test")?
+                .is_some()
+        );
+        assert!(store.store_impact_query_cache(
+            &key(IMPACT_QUERY_CACHE_MAX_ENTRIES),
+            "snapshot:sha256:test",
+            r#"{"newest":true}"#,
+        )?);
+        let (recently_used, oldest): (u64, u64) = store.connection.query_row(
+            "SELECT
+                SUM(CASE WHEN key=?1 THEN 1 ELSE 0 END),
+                SUM(CASE WHEN key=?2 THEN 1 ELSE 0 END)
+               FROM impact_query_cache",
+            params![key(0), key(1)],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(recently_used, 1);
+        assert_eq!(oldest, 0);
         let oversized = format!("\"{}\"", "x".repeat(IMPACT_QUERY_CACHE_MAX_PAYLOAD_BYTES));
         assert!(!store.store_impact_query_cache(
             &key(IMPACT_QUERY_CACHE_MAX_ENTRIES + 1),

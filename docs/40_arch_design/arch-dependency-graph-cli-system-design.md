@@ -1071,9 +1071,10 @@ schema v10は`syntax_cache`、`semantic_cache`、`build_cache`を別tableとし�
 schema v13の`impact_query_cache`は、completed snapshot ID、selector、canonical
 depth / profile / condition / phase / session / environment / traversal budgetを
 `depgraph-impact-query-cache-v1` keyへ固定し、canonical `ImpactResult` JSONと
-payload digest、作成・最終利用時刻、hit countを保持する。別processのwarm queryは
+payload digest、作成・最終利用時刻、transaction内で単調増加する利用順、
+hit countを保持する。別processのwarm queryは
 full snapshot、全edge/evidence、profile matrixを再構築せず、同一typed resultを
-復元する。最大128 entry、1 entry 8 MiBでLRU順にpruneし、contract、snapshot、
+復元する。最大128 entry、1 entry 8 MiBで厳密なLRU順にpruneし、contract、snapshot、
 JSON、digest不一致はentryを破棄して通常queryへ戻る。Git changed-set queryは
 worktree stateをkeyへ固定できないためcache対象外とする。snapshot変更または
 filter / traversal budget変更は必ず別keyとなり、result、順序、filter意味、

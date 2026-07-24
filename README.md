@@ -300,7 +300,8 @@ existing unreferenced-attempt garbage collector.
 Schema v13 adds a snapshot-, selector-, and filter-scoped impact result cache
 for warm queries issued by independent CLI processes. Cache payloads use a
 versioned content-addressed key and digest, are capped at 128 entries and 8 MiB
-per entry, and are discarded on contract, snapshot, JSON, or digest mismatch.
+per entry with transactional monotonic LRU ordering, and are discarded on
+contract, snapshot, JSON, or digest mismatch.
 Git changed-set impact bypasses this cache so dirty worktree state is always
 read afresh. A cache hit deserializes the same canonical `ImpactResult`, so
 ordering, depth/profile/condition/runtime filters, diagnostics, and JSON or
