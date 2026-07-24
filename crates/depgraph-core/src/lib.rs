@@ -82,12 +82,13 @@ pub use query::{
     why_filtered,
 };
 pub use runtime_trace::{
-    MatchedRuntimeTraceLocator, RUNTIME_TRACE_MAX_BYTES, RUNTIME_TRACE_MAX_EVENTS,
-    RUNTIME_TRACE_SCHEMA, RUNTIME_TRACE_SCHEMA_VERSION, RuntimeTrace, RuntimeTraceEnvironment,
-    RuntimeTraceEvent, RuntimeTraceLocator, RuntimeTraceMatchStatus, RuntimeTraceProfile,
-    RuntimeTraceProfileMatch, RuntimeTraceRedaction, RuntimeTraceRepository, RuntimeTraceSession,
-    RuntimeTraceSummary, ValidatedRuntimeTrace, ValidatedRuntimeTraceEvent, match_runtime_trace,
-    read_runtime_trace, runtime_session_delta, validate_runtime_trace,
+    MatchedRuntimeTraceLocator, RUNTIME_COLLECTOR_CONTRACT_VERSION, RUNTIME_COLLECTOR_SCHEMA,
+    RUNTIME_TRACE_MAX_BYTES, RUNTIME_TRACE_MAX_EVENTS, RUNTIME_TRACE_SCHEMA,
+    RUNTIME_TRACE_SCHEMA_VERSION, RuntimeTrace, RuntimeTraceEnvironment, RuntimeTraceEvent,
+    RuntimeTraceLocator, RuntimeTraceMatchStatus, RuntimeTraceProfile, RuntimeTraceProfileMatch,
+    RuntimeTraceRedaction, RuntimeTraceRepository, RuntimeTraceSession, RuntimeTraceSummary,
+    ValidatedRuntimeTrace, ValidatedRuntimeTraceEvent, match_runtime_trace, read_runtime_trace,
+    runtime_session_delta, validate_runtime_trace,
 };
 pub use rust_build_observer::{
     RUST_BUILD_CAPABILITY, RUST_BUILD_OBSERVATION_SCHEMA, RUST_BUILD_OBSERVER,

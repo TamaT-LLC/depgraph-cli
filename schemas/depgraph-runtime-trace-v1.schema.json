@@ -16,6 +16,33 @@
       "items": { "$ref": "#/$defs/event" }
     }
   },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "session": {
+            "properties": {
+              "collector_contract_version": {
+                "const": "runtime-collector-v1"
+              }
+            },
+            "required": ["collector_contract_version"]
+          }
+        },
+        "required": ["session"]
+      },
+      "then": {
+        "properties": {
+          "session": {
+            "$ref": "#/$defs/productionCollectorSession"
+          },
+          "events": {
+            "items": { "$ref": "#/$defs/productionCollectorEvent" }
+          }
+        }
+      }
+    }
+  ],
   "$defs": {
     "boundedString": {
       "type": "string",
@@ -44,6 +71,21 @@
       "type": "array",
       "maxItems": 256,
       "items": { "$ref": "#/$defs/idString" }
+    },
+    "productionCollectorName": {
+      "allOf": [
+        { "$ref": "#/$defs/idString" },
+        {
+          "not": {
+            "pattern": "://|[@?#%=]"
+          }
+        }
+      ]
+    },
+    "productionCollectorNameList": {
+      "type": "array",
+      "maxItems": 256,
+      "items": { "$ref": "#/$defs/productionCollectorName" }
     },
     "repository": {
       "type": "object",
@@ -92,6 +134,36 @@
         }
       }
     },
+    "productionCollectorRedaction": {
+      "allOf": [
+        { "$ref": "#/$defs/redaction" },
+        {
+          "properties": {
+            "environment_keys": {
+              "$ref": "#/$defs/productionCollectorNameList"
+            },
+            "header_names": {
+              "$ref": "#/$defs/productionCollectorNameList"
+            },
+            "secret_names": {
+              "$ref": "#/$defs/productionCollectorNameList"
+            }
+          }
+        }
+      ]
+    },
+    "productionCollectorEnvironment": {
+      "allOf": [
+        { "$ref": "#/$defs/environment" },
+        {
+          "properties": {
+            "environment_keys": {
+              "$ref": "#/$defs/productionCollectorNameList"
+            }
+          }
+        }
+      ]
+    },
     "session": {
       "type": "object",
       "additionalProperties": false,
@@ -106,10 +178,28 @@
           "type": "string",
           "format": "date-time"
         },
+        "collector_contract_version": {
+          "const": "runtime-collector-v1"
+        },
         "profile": { "$ref": "#/$defs/profile" },
         "environment": { "$ref": "#/$defs/environment" },
         "redaction": { "$ref": "#/$defs/redaction" }
       }
+    },
+    "productionCollectorSession": {
+      "allOf": [
+        { "$ref": "#/$defs/session" },
+        {
+          "properties": {
+            "environment": {
+              "$ref": "#/$defs/productionCollectorEnvironment"
+            },
+            "redaction": {
+              "$ref": "#/$defs/productionCollectorRedaction"
+            }
+          }
+        }
+      ]
     },
     "locator": {
       "oneOf": [
@@ -185,6 +275,63 @@
         }
       ]
     },
+    "productionCollectorLocator": {
+      "allOf": [
+        { "$ref": "#/$defs/locator" },
+        {
+          "if": {
+            "properties": {
+              "kind": { "const": "graph_locator" }
+            },
+            "required": ["kind"]
+          },
+          "then": {
+            "properties": {
+              "locator": {
+                "not": {
+                  "pattern": "^[Hh][Tt][Tt][Pp][Ss]?://"
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": { "const": "external" }
+            },
+            "required": ["kind"]
+          },
+          "then": {
+            "properties": {
+              "name": {
+                "not": {
+                  "pattern": "^[A-Za-z][A-Za-z0-9+.-]*://"
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": { "const": "external" },
+              "namespace": {
+                "pattern": "^[Hh][Tt][Tt][Pp][Ss]?$"
+              }
+            },
+            "required": ["kind", "namespace"]
+          },
+          "then": {
+            "properties": {
+              "name": {
+                "pattern": "^(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*|\\[[0-9a-f:.]+\\])(?::(?:0|[1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5]))?$"
+              }
+            }
+          }
+        }
+      ]
+    },
     "event": {
       "type": "object",
       "additionalProperties": false,
@@ -220,6 +367,20 @@
         },
         "redaction": { "$ref": "#/$defs/redaction" }
       }
+    },
+    "productionCollectorEvent": {
+      "allOf": [
+        { "$ref": "#/$defs/event" },
+        {
+          "properties": {
+            "source": { "$ref": "#/$defs/productionCollectorLocator" },
+            "target": { "$ref": "#/$defs/productionCollectorLocator" },
+            "redaction": {
+              "$ref": "#/$defs/productionCollectorRedaction"
+            }
+          }
+        }
+      ]
     }
   }
 }

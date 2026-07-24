@@ -280,12 +280,24 @@ levels. UTF-8, exact version, strict fields, RFC 3339 session bounds, increasing
 sequence numbers, and portable paths are required. Absolute paths, `..`, file
 URI hosts, drive-like `:` segments, backslashes, unknown properties,
 secret-bearing fields, and common raw credential forms fail closed with bounded
-errors. Environment variables, headers, and secrets are represented only by
+errors. Production output marked
+`session.collector_contract_version=runtime-collector-v1` also rejects raw
+HTTP(S) graph locators and HTTP targets containing
+userinfo/path/query/fragment. Unmarked trace v1 input retains its existing
+compatibility behavior without claiming the production collector guarantee.
+Environment variables, headers, and secrets are represented only by
 sorted/deduplicated names and redaction counts; their values are not part of the
 contract or output.
 
 The matching JSON Schema is
 [`schemas/depgraph-runtime-trace-v1.schema.json`](schemas/depgraph-runtime-trace-v1.schema.json).
+Production SDK lifecycle, buffer, flush, retry, sequence, clock, file/stdout/OTLP
+transport, redaction, and rate-limit behavior are fixed separately by
+[`runtime-collector-v1`](schemas/depgraph-runtime-collector-v1.schema.json) and
+the
+[collector ADR](docs/40_arch_design/adr-production-runtime-collector-v1.md).
+All transports converge on the same trace v1 JSON; vendor spans are adapted
+outside core.
 
 Store schema v13 retains the v10 profile-independent `syntax`,
 profile-dependent `semantic`, and observed `build` cache tables plus the v11

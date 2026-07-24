@@ -1,0 +1,55 @@
+{
+  "contract_version": "runtime-collector-v1",
+  "output_schema_version": "1.0",
+  "lifecycle": {
+    "disabled": "no_op",
+    "record_failure": "non_throwing_drop",
+    "shutdown": "bounded_best_effort"
+  },
+  "buffer": {
+    "max_events": 4096,
+    "max_bytes": 1048576,
+    "overflow": "drop_newest"
+  },
+  "flush": {
+    "snapshot": "immutable_contiguous_prefix",
+    "concurrency": "coalesce",
+    "shutdown_timeout_ms": 5000
+  },
+  "retry": {
+    "max_attempts": 3,
+    "initial_backoff_ms": 100,
+    "max_backoff_ms": 5000,
+    "payload": "byte_identical",
+    "exhaustion": "report_and_drop"
+  },
+  "sequence": {
+    "initial": 1,
+    "assignment": "accepted_event",
+    "ordering": "contiguous_acceptance_order"
+  },
+  "clock": {
+    "wall_source": "system_utc",
+    "duration_source": "monotonic",
+    "timestamp_format": "rfc3339_utc",
+    "wall_regression": "clamp_to_previous"
+  },
+  "transport": {
+    "kind": "file",
+    "canonical_payload": "depgraph-runtime-trace-v1",
+    "media_type": "application/vnd.tamat.depgraph.runtime-trace.v1+json"
+  },
+  "redaction": {
+    "stage": "before_buffer",
+    "url_policy": "scheme_host_port_only",
+    "environment_keys": ["API_TOKEN", "DATABASE_URL"],
+    "header_names": ["authorization", "cookie"],
+    "secret_names": ["api_token"]
+  },
+  "limits": {
+    "max_events_per_second": 10000,
+    "max_trace_events": 100000,
+    "max_trace_bytes": 16777216,
+    "max_string_chars": 4096
+  }
+}
