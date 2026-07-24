@@ -1080,7 +1080,8 @@ worktree stateをkeyへ固定できないためcache対象外とする。snapsho
 filter / traversal budget変更は必ず別keyとなり、result、順序、filter意味、
 complete diagnosticを変更しない。LRU touch / prune / invalid entry削除は
 best-effort cache maintenanceとし、別CLI processのSQLite writer lockと競合しても
-validated payloadを返すか通常queryへfallbackし、impact commandを失敗させない。
+impact commandを失敗させない。LRU touchを記録できない場合はcache missとして
+通常queryへfallbackし、再計算後のstore成功時だけ新しい利用順とpruneを確定する。
 
 ### 13.3 更新単位
 

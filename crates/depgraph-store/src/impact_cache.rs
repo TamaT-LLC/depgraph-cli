@@ -83,7 +83,7 @@ impl Store {
         // Touch metadata is best-effort and deliberately uses its own
         // autocommit write. A concurrent CLI writer may hold SQLite's single
         // writer lock; the already validated cached result remains usable.
-        best_effort_cache_write(
+        let touched = best_effort_cache_write(
             &self.connection,
             "UPDATE impact_query_cache
                 SET last_used_at=?2,
@@ -106,6 +106,9 @@ impl Store {
                 stored.payload_digest,
             ],
         );
+        if !touched {
+            return Ok(None);
+        }
         Ok(Some(stored.payload_json))
     }
 
@@ -197,17 +200,18 @@ fn payload_digest(payload_json: &str) -> Result<String> {
     Ok(stable_id_from_value("impact-query-result", &value))
 }
 
-fn best_effort_cache_write<P: Params>(connection: &Connection, sql: &str, params: P) {
+fn best_effort_cache_write<P: Params>(connection: &Connection, sql: &str, params: P) -> bool {
     let Ok(previous_timeout_ms) =
         connection.query_row("PRAGMA busy_timeout", [], |row| row.get::<_, u64>(0))
     else {
-        return;
+        return false;
     };
     if connection.busy_timeout(Duration::ZERO).is_err() {
-        return;
+        return false;
     }
-    let _ = connection.execute(sql, params);
-    let _ = connection.busy_timeout(Duration::from_millis(previous_timeout_ms));
+    let changed = connection.execute(sql, params);
+    let restored = connection.busy_timeout(Duration::from_millis(previous_timeout_ms));
+    matches!(changed, Ok(count) if count > 0) && restored.is_ok()
 }
 
 fn now() -> String {
@@ -301,7 +305,7 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_writer_does_not_block_a_valid_cache_hit() -> Result<()> {
+    fn concurrent_writer_falls_back_without_blocking_or_losing_lru_order() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("concurrent.db");
         let mut store = Store::open(&path)?;
@@ -324,8 +328,13 @@ mod tests {
              )",
             [],
         )?;
-        let payload = r#"{"complete":true,"impacts":[]}"#;
-        assert!(store.store_impact_query_cache(&key(1), "snapshot:sha256:test", payload)?);
+        for index in 0..IMPACT_QUERY_CACHE_MAX_ENTRIES {
+            assert!(store.store_impact_query_cache(
+                &key(index),
+                "snapshot:sha256:test",
+                &format!(r#"{{"index":{index}}}"#),
+            )?);
+        }
 
         let writer = Connection::open(&path)?;
         writer.execute_batch(
@@ -335,11 +344,32 @@ mod tests {
         )?;
         let started = Instant::now();
         assert_eq!(
-            store.lookup_impact_query_cache(&key(1), "snapshot:sha256:test")?,
-            Some(payload.to_owned())
+            store.lookup_impact_query_cache(&key(0), "snapshot:sha256:test")?,
+            None
         );
         assert!(started.elapsed() < Duration::from_millis(500));
         writer.execute_batch("ROLLBACK;")?;
+
+        assert!(store.store_impact_query_cache(
+            &key(0),
+            "snapshot:sha256:test",
+            r#"{"index":0}"#,
+        )?);
+        assert!(store.store_impact_query_cache(
+            &key(IMPACT_QUERY_CACHE_MAX_ENTRIES),
+            "snapshot:sha256:test",
+            r#"{"newest":true}"#,
+        )?);
+        let (repopulated, oldest): (u64, u64) = store.connection.query_row(
+            "SELECT
+                SUM(CASE WHEN key=?1 THEN 1 ELSE 0 END),
+                SUM(CASE WHEN key=?2 THEN 1 ELSE 0 END)
+               FROM impact_query_cache",
+            params![key(0), key(1)],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(repopulated, 1);
+        assert_eq!(oldest, 0);
         Ok(())
     }
 

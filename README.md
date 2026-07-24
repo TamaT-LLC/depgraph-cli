@@ -304,9 +304,10 @@ per entry with transactional monotonic LRU ordering, and are discarded on
 contract, snapshot, JSON, or digest mismatch.
 Git changed-set impact bypasses this cache so dirty worktree state is always
 read afresh. Cache maintenance is best-effort, so a concurrent SQLite writer
-cannot make the impact query fail. A cache hit deserializes the same canonical
-`ImpactResult`, so ordering, depth/profile/condition/runtime filters,
-diagnostics, and JSON or human rendering are unchanged.
+cannot make the impact query fail; an unrecorded LRU touch becomes a cache miss
+and uses the normal query path. A cache hit deserializes the same canonical
+`ImpactResult`, so ordering, depth/profile/condition/runtime filters, diagnostics,
+and JSON or human rendering are unchanged.
 Runtime rows, the completed snapshot, its source mapping, and the current
 pointer are committed in one SQLite transaction; any failure rolls back the
 entire session and leaves the previous completed snapshot queryable. Existing
