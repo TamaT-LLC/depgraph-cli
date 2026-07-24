@@ -39,7 +39,7 @@ pub struct TraversalResult {
     pub steps: Vec<PathStep>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PathStep {
     pub edge: EdgeRecord,
     pub condition_text: String,

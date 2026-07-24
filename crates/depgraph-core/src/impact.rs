@@ -5,8 +5,10 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use depgraph_protocol::stable_id_from_value;
 use depgraph_store::{EdgeRecord, GraphSnapshot, NodeRecord, runtime_context_for_edge};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use serde_json::json;
 
 use crate::{
     query::{
@@ -18,20 +20,21 @@ use crate::{
 
 const MAX_GIT_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_CHANGED_PATHS: usize = 100_000;
+pub const IMPACT_QUERY_CACHE_SCHEMA_VERSION: &str = "depgraph-impact-query-cache-v1";
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct GitChange {
     pub status: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub similarity: Option<u8>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub old_path: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub new_path: Option<String>,
     pub sources: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitChangedSet {
     pub requested_ref: String,
     pub resolved_ref: String,
@@ -41,7 +44,7 @@ pub struct GitChangedSet {
     pub changes: Vec<GitChange>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChangedNodeMapping {
     pub change: GitChange,
     pub old_node_ids: Vec<String>,
@@ -49,17 +52,17 @@ pub struct ChangedNodeMapping {
     pub correlated_node_ids: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImpactFilters {
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub depth: Option<usize>,
     pub profiles: Vec<String>,
     pub conditions: Vec<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub phases: Vec<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sessions: Vec<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub environments: Vec<String>,
     pub max_nodes: usize,
     pub max_edges: usize,
@@ -153,13 +156,13 @@ fn normalize_filter(name: &str, values: Vec<String>) -> Result<Vec<String>> {
     Ok(normalized)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImpactDiagnostic {
     pub code: String,
     pub message: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ImpactNode {
     pub node: NodeRecord,
     pub depth: usize,
@@ -167,18 +170,34 @@ pub struct ImpactNode {
     pub dependency_path: Vec<PathStep>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ImpactResult {
     pub root: NodeRecord,
     pub root_impacted: bool,
     pub complete: bool,
     pub filters: ImpactFilters,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub changed_set: Option<GitChangedSet>,
     pub mappings: Vec<ChangedNodeMapping>,
     pub changed_nodes: Vec<NodeRecord>,
     pub impacts: Vec<ImpactNode>,
     pub diagnostics: Vec<ImpactDiagnostic>,
+}
+
+pub fn impact_query_cache_key(
+    snapshot_id: &str,
+    selector: &str,
+    filters: &ImpactFilters,
+) -> String {
+    stable_id_from_value(
+        "impact-query",
+        &json!({
+            "schema": IMPACT_QUERY_CACHE_SCHEMA_VERSION,
+            "snapshot_id": snapshot_id,
+            "selector": selector,
+            "filters": filters,
+        }),
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -1116,6 +1135,33 @@ mod tests {
     }
 
     #[test]
+    fn warm_query_cache_keys_are_snapshot_selector_and_filter_scoped() -> Result<()> {
+        let filters = ImpactFilters::new(None, vec![], vec![], 20, 30)?;
+        let first = impact_query_cache_key("snapshot:one", "path:src/new.ts", &filters);
+        assert_eq!(
+            first,
+            impact_query_cache_key("snapshot:one", "path:src/new.ts", &filters)
+        );
+        assert_ne!(
+            first,
+            impact_query_cache_key("snapshot:two", "path:src/new.ts", &filters)
+        );
+        assert_ne!(
+            first,
+            impact_query_cache_key("snapshot:one", "path:src/other.ts", &filters)
+        );
+        assert_ne!(
+            first,
+            impact_query_cache_key(
+                "snapshot:one",
+                "path:src/new.ts",
+                &ImpactFilters::new(Some(1), vec![], vec![], 20, 30)?,
+            )
+        );
+        Ok(())
+    }
+
+    #[test]
     fn rename_maps_old_and_new_paths_to_one_correlated_identity() {
         let mappings = map_changed_set(&graph(), &rename_set());
         assert!(mappings[0].old_node_ids.is_empty());
@@ -1149,6 +1195,8 @@ mod tests {
             Some(&rename_set()),
             ImpactFilters::new(None, vec!["prod".to_owned()], vec![condition], 20, 20)?,
         )?;
+        let cached: ImpactResult = serde_json::from_value(serde_json::to_value(&first)?)?;
+        assert_eq!(cached, first);
         assert!(first.root_impacted);
         assert!(first.complete);
         assert_eq!(

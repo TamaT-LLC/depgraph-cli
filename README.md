@@ -287,16 +287,24 @@ contract or output.
 The matching JSON Schema is
 [`schemas/depgraph-runtime-trace-v1.schema.json`](schemas/depgraph-runtime-trace-v1.schema.json).
 
-Store schema v12 retains the v10 profile-independent `syntax`,
+Store schema v13 retains the v10 profile-independent `syntax`,
 profile-dependent `semantic`, and observed `build` cache tables plus the v11
 normalized runtime session/node/site/edge/evidence/diagnostic/import tables.
-It adds durable `worker-delta-v1` staging bound to the exact current completed
+Schema v12 added durable `worker-delta-v1` staging bound to the exact current completed
 snapshot and canonical base/result graph digests. Applying a staged delta
 revalidates its event stream and referential integrity inside one SQLite
 transaction, recomputes the prospective completed snapshot ID, and preserves
 unchanged graph payloads and stable IDs. Failed, cancelled, or crash-recovered
 attempts never move the current snapshot pointer and are removed by the
 existing unreferenced-attempt garbage collector.
+Schema v13 adds a snapshot-, selector-, and filter-scoped impact result cache
+for warm queries issued by independent CLI processes. Cache payloads use a
+versioned content-addressed key and digest, are capped at 128 entries and 8 MiB
+per entry, and are discarded on contract, snapshot, JSON, or digest mismatch.
+Git changed-set impact bypasses this cache so dirty worktree state is always
+read afresh. A cache hit deserializes the same canonical `ImpactResult`, so
+ordering, depth/profile/condition/runtime filters, diagnostics, and JSON or
+human rendering are unchanged.
 Runtime rows, the completed snapshot, its source mapping, and the current
 pointer are committed in one SQLite transaction; any failure rolls back the
 entire session and leaves the previous completed snapshot queryable. Existing

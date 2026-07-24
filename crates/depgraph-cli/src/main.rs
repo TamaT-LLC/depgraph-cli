@@ -12,11 +12,12 @@ use depgraph_core::{
     ImpactFilters, ImpactResult, PolicyAnnotation, PolicyResult, ScanCacheMode,
     acquire_store_writer_lock, build_cache_key, create_build_execution_request, default_store_path,
     doctor, evaluate_policy_diff, execute_build_request_with_cancellation, export_filtered,
-    export_graphml_filtered_to_writer, impact, init_config, match_runtime_trace, open_store,
-    open_store_read_only, policy_annotations, read_git_changed_set, read_runtime_trace,
-    render_condition, render_github_annotations, run_scan_with_cache_mode, runtime_session_delta,
-    rust_build_protocol_ndjson, stage_build_evidence, start_repository_daemon, traverse_filtered,
-    unresolved, web_build_protocol_ndjson, why_filtered,
+    export_graphml_filtered_to_writer, impact, impact_query_cache_key, init_config,
+    match_runtime_trace, open_store, open_store_read_only, policy_annotations,
+    read_git_changed_set, read_runtime_trace, render_condition, render_github_annotations,
+    run_scan_with_cache_mode, runtime_session_delta, rust_build_protocol_ndjson,
+    stage_build_evidence, start_repository_daemon, traverse_filtered, unresolved,
+    web_build_protocol_ndjson, why_filtered,
 };
 use depgraph_store::{CompletedSnapshotDetails, CoverageRecord};
 use serde::Serialize;
@@ -754,6 +755,10 @@ async fn run(cli: Cli) -> Result<u8> {
                     report.cache_entries.semantic,
                     report.cache_entries.build
                 );
+                println!(
+                    "impact query cache: contract {}, {} entries",
+                    report.impact_query_cache_contract_version, report.impact_query_cache_entries
+                );
                 if let Some(release) = &report.release {
                     println!(
                         "release: {} ({}, schema {}; core {}; schema {})",
@@ -980,12 +985,44 @@ async fn run(cli: Cli) -> Result<u8> {
         } => {
             let filters = ImpactFilters::new(depth, profile, condition, max_nodes, max_edges)?
                 .with_runtime_filters(phase, session, environment)?;
-            let (snapshot, scan_id) = load_snapshot(cli.store, cli.scan_id.as_deref(), false)?;
-            let changed_set = changed
+            let root = std::env::current_dir()?;
+            let store_path = store_path(cli.store, &root)?;
+            let mut store = open_store(&store_path)?;
+            let scan_id = store.resolve_scan_id(cli.scan_id.as_deref(), false)?;
+            let snapshot_id = if changed.is_none() {
+                store.snapshot_id_for_scan_selection(&scan_id)?
+            } else {
+                None
+            };
+            let cache_key = snapshot_id
                 .as_deref()
-                .map(|git_ref| read_git_changed_set(Path::new(&snapshot.scan.root), git_ref))
-                .transpose()?;
-            let result = impact(&snapshot, &selector, changed_set.as_ref(), filters)?;
+                .map(|snapshot_id| impact_query_cache_key(snapshot_id, &selector, &filters));
+            let cached = match (cache_key.as_deref(), snapshot_id.as_deref()) {
+                (Some(cache_key), Some(snapshot_id)) => store
+                    .lookup_impact_query_cache(cache_key, snapshot_id)?
+                    .and_then(|payload| serde_json::from_str::<ImpactResult>(&payload).ok()),
+                _ => None,
+            };
+            let result = if let Some(result) = cached {
+                result
+            } else {
+                let snapshot = store.load_snapshot(&scan_id)?;
+                let changed_set = changed
+                    .as_deref()
+                    .map(|git_ref| read_git_changed_set(Path::new(&snapshot.scan.root), git_ref))
+                    .transpose()?;
+                let result = impact(&snapshot, &selector, changed_set.as_ref(), filters)?;
+                if let (Some(cache_key), Some(snapshot_id)) =
+                    (cache_key.as_deref(), snapshot_id.as_deref())
+                {
+                    let payload = serde_json::to_string(&result)?;
+                    // Cache population is best-effort: a successful impact
+                    // query must remain usable if the bounded cache cannot be
+                    // written, just as scan cache population failures do.
+                    let _ = store.store_impact_query_cache(cache_key, snapshot_id, &payload);
+                }
+                result
+            };
             print_structured("impact", scan_id, &result, json)?;
             if !json {
                 print_human_impact(&result);

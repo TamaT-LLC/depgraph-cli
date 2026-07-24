@@ -1963,6 +1963,52 @@ fn impact_changed_set_is_read_only_deterministic_and_maps_renames() {
 }
 
 #[test]
+fn warm_impact_queries_reuse_snapshot_and_filter_scoped_bounded_cache_entries() {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let store_path = cache.path().join("graph.db");
+    seed_cli_diff_snapshot(
+        &store_path,
+        root.path(),
+        "impact-cache-target",
+        "impact-cache-target",
+        true,
+    );
+
+    let run = |extra: &[&str]| {
+        let mut arguments = vec![
+            "--store",
+            store_path.to_str().unwrap(),
+            "--scan-id",
+            "impact-cache-target",
+            "impact",
+            "path:src/new.go",
+        ];
+        arguments.extend_from_slice(extra);
+        Command::cargo_bin("depgraph")
+            .unwrap()
+            .args(arguments)
+            .output()
+            .unwrap()
+    };
+    let first = run(&["--json"]);
+    let second = run(&["--json"]);
+    assert!(first.status.success(), "{:?}", first.stderr);
+    assert!(second.status.success(), "{:?}", second.stderr);
+    assert_eq!(first.stdout, second.stdout);
+    let store = depgraph_store::Store::open(&store_path).unwrap();
+    assert_eq!(store.impact_query_cache_entry_count().unwrap(), 1);
+    drop(store);
+
+    let filtered = run(&["--depth", "1", "--json"]);
+    assert!(filtered.status.success(), "{:?}", filtered.stderr);
+    let filtered: serde_json::Value = serde_json::from_slice(&filtered.stdout).unwrap();
+    assert_eq!(filtered["data"]["filters"]["depth"], 1);
+    let store = depgraph_store::Store::open(&store_path).unwrap();
+    assert_eq!(store.impact_query_cache_entry_count().unwrap(), 2);
+}
+
+#[test]
 fn empty_safe_scan_uses_external_store_and_reports_json() {
     let root = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();
@@ -2016,8 +2062,11 @@ fn empty_safe_scan_uses_external_store_and_reports_json() {
         .args(["--store", store.to_str().unwrap(), "doctor", "--json"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("\"store_schema_version\": 12"))
+        .stdout(predicate::str::contains("\"store_schema_version\": 13"))
         .stdout(predicate::str::contains("\"cache_contract_version\": 1"))
+        .stdout(predicate::str::contains(
+            "\"impact_query_cache_contract_version\": 1",
+        ))
         .stdout(predicate::str::contains("\"semantic\": 1"));
     assert!(store.exists());
     assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);

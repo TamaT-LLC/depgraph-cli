@@ -18,7 +18,7 @@ updated: 2026-07-24
 | --- | --- |
 | Product / Rust / Go / Web adapter | `0.4.0-rc.1` |
 | NDJSON protocol / graph schema | `1.0` |
-| SQLite store / cache contract | `12` / `1` |
+| SQLite store / scan cache / impact query cache | `13` / `1` / `1` |
 | Snapshot diff / policy / runtime trace / GraphML | `1.0` |
 | Incremental plan / daemon status | `incremental-plan-v1` / `daemon-status-v1` |
 | Worker incremental request / delta | `worker-delta-request-v1` / `worker-delta-v1` |
@@ -31,7 +31,7 @@ updated: 2026-07-24
 
 Milestone 2のrelease candidateは`v0.2.0-rc.1`とする。5 targetのnative package gateに加え、公開直前に全archive/checksumを再取得してmanifest、SBOM、project/third-party license、worker/runtime attestationを集約検証し、結果を`release-verification.json`としてGitHub prereleaseへ添付する。機能範囲、安全境界、完全性条件、既知制約は[release note](../releases/v0.2.0-rc.1.md)をcanonicalな配布時説明とする。
 
-Milestone 4のrelease candidateは`v0.4.0-rc.1`とする。protocol / graph schemaは`1.0`、SQLite storeは`11`、cache contractは`1`を維持し、公式`v0.2.0-rc.1`が生成したstore schema `5`からcompleted snapshotを失わずに移行する。全5 targetのnative package gateはsnapshot/diff/impact、watcher/incremental、architecture policyとGitHub annotation、runtime trace validate/import/query、GraphML stdout/atomic file exportを実際のpackaged binaryで検証する。manifestにはこれらのversioned compatibility unitと`milestone4-packaged-smoke-v1`を固定し、aggregate verifierはchecksum、archive、manifest、SBOM、license、attestationと同じclosureで再検証する。性能結果、安全境界、migration / rollback、既知制約は[release note](../releases/v0.4.0-rc.1.md)をcanonicalな配布時説明とする。
+Milestone 4のrelease candidateは`v0.4.0-rc.1`とする。protocol / graph schemaは`1.0`、SQLite storeは`13`、scan cache / impact query cache contractは`1`を維持し、公式`v0.2.0-rc.1`が生成したstore schema `5`からcompleted snapshotを失わずに移行する。全5 targetのnative package gateはsnapshot/diff/impact、watcher/incremental、architecture policyとGitHub annotation、runtime trace validate/import/query、GraphML stdout/atomic file exportを実際のpackaged binaryで検証する。manifestにはこれらのversioned compatibility unitと`milestone4-packaged-smoke-v1`を固定し、aggregate verifierはchecksum、archive、manifest、SBOM、license、attestationと同じclosureで再検証する。性能結果、安全境界、migration / rollback、既知制約は[release note](../releases/v0.4.0-rc.1.md)をcanonicalな配布時説明とする。
 
 safe scanではcanonical root外へのsymlink readを拒否し、相対PATH・repository内toolchain・Node実行hookを除外する。Goは制限付き`go/packages`からparser fallbackへ移行する。Cargo metadataはpath-bearing inputのpreflight後、admitted manifest、lockfile、target discovery layoutだけを持つworker-owned confined mirrorに対してneutral cwdから`--frozen --offline --no-deps`で実行し、返却されたtemporary pathをinventory IDへ戻す。配布物はmanifest、MIT / Apache-2.0のproject license全文、core、schema、全worker/runtime artifact/component、backend attestationを検証し、欠損・変更・symlink・checked treeへの追加時にworker起動前にfail closedとする。project licenseはrelease manifestで個別にchecksum attestし、依存componentの権利情報を列挙する`THIRD_PARTY_LICENSES.txt`とは明確に分離する。
 
@@ -1068,6 +1068,17 @@ Issue #77のcache contract v1は`cache:sha256:<digest>`をstable keyとし、key
 
 schema v10は`syntax_cache`、`semantic_cache`、`build_cache`を別tableとし、contract version、canonical dimensions、completed snapshot、payload digest、access metadataを保持する。`cache_events`はscan/build attemptごとの`hit / miss / reject / stored`と固定reasonを記録する。semantic/build hitはcache row identity、contract version、completed snapshot identity、canonical graph payload digestを再計算し、全検証成功時だけ利用する。unknown version、tamper、stale key、payload conflictはoverwriteやbest-effort decodeをせずmiss/rejectとしてworkerへfallbackする。semantic hitもfresh scan attemptへtransactional copyした後に通常のgraph validation、strict policy、completed promotionを通す。cache eventはgraph、diagnostic、snapshot identityへ混ぜないため、`--no-cache`結果とcache hit結果のcanonical graphは一致する。
 
+schema v13の`impact_query_cache`は、completed snapshot ID、selector、canonical
+depth / profile / condition / phase / session / environment / traversal budgetを
+`depgraph-impact-query-cache-v1` keyへ固定し、canonical `ImpactResult` JSONと
+payload digest、作成・最終利用時刻、hit countを保持する。別processのwarm queryは
+full snapshot、全edge/evidence、profile matrixを再構築せず、同一typed resultを
+復元する。最大128 entry、1 entry 8 MiBでLRU順にpruneし、contract、snapshot、
+JSON、digest不一致はentryを破棄して通常queryへ戻る。Git changed-set queryは
+worktree stateをkeyへ固定できないためcache対象外とする。snapshot変更または
+filter / traversal budget変更は必ず別keyとなり、result、順序、filter意味、
+complete diagnosticを変更しない。
+
 ### 13.3 更新単位
 
 - 変更 file の node / edge / site を transaction 内で置換する
@@ -1369,7 +1380,8 @@ manifestへsource count、期待dependency site数、変更path、boundedな
 SHA-256を記録する。benchmarkはfresh SQLite storeのsafe initial scan、
 completed base snapshotとwarm analysis cacheを持つwatcher daemon経由の
 1-file incremental scan、別storeに対する最初のcold file/package impact、
-priming後のwarm file/package impactを個別に計測する。
+priming後にsnapshot / selector / filter scoped bounded cacheを使うwarm
+file/package impactを個別に計測する。
 
 開発機のproduct targetは次のとおり。
 
@@ -1386,12 +1398,12 @@ node 20,003、dependency site 19,998、edge 40,000と全coverageを保存した�
 benchmarkのincremental ceilingはproduct targetと同じ2秒とする。
 
 共有GitHub hosted Linux runnerのCI/release ceilingはinitial 80秒、
-incremental 2秒、warm query 4.0秒とする。initial / incrementalは3 sample、
+incremental 2秒、warm query 500msとする。initial / incrementalは3 sample、
 warm queryは5 sampleを採り、medianがceiling
 以内、ceiling超過sampleは最大1件、全sampleはceiling + 20%以内というnoise
 allowanceを同時に満たした場合だけpassする。cold queryは継続取得するが、
 product targetがwarm cacheであるためgateには使わない。report
-`depgraph-benchmark-report-v2`はraw sample、median / max、cache条件、
+`depgraph-benchmark-report-v3`はraw sample、median / max、cache条件、
 platform / architecture / GitHub runner、depgraph / Rust / Cargo / Go / Node /
 pnpm version、commit、threshold、allowance、判定を保持する。
 
@@ -1564,6 +1576,7 @@ schema、commit、全必須metric、conservation、総合passを再検証して�
 
 ## 26. 更新履歴
 
+- 2026-07-24: Issue #136としてschema v13のbounded impact query cacheを実装。completed snapshot、selector、depth / profile / condition / runtime filter、traversal budgetをversioned content-addressed keyへ固定し、canonical typed resultとdigestを最大128 entry・8 MiB/entryで保持する。primary-key prepared lookup、LRU prune、tamper / unknown contract fallback、schema v12 migration、別process hit、filter / snapshot分離、byte-identical outputをtestで固定した。`depgraph-benchmark-report-v3`とCI/release gateはwarm file/package impactの500ms product targetを直接検証する。
 - 2026-07-24: Issue #134としてwatcher / daemonをcapability-aware incremental executorへ接続。`incremental-plan-v1`のnormalized changeとanalysis closure、exact base snapshot / graph digest、canonical base graphから`worker-delta-request-v1`を生成し、neutral temporary request file、既存timeout / cancel / process-tree supervisor、bounded delta parserを通す。bundled Web workerはexact `worker-delta-v1`をadvertiseし、full modelとbaseのcanonical diffからscope内node / site / edge / evidence / coverage mutationを生成する。fresh incremental stagingへdurable stage / transactional applyし、通常のgraph・strict・architecture policy・cancellation gate後にpromotionする。worker failure / capability probeを含むcancelでは旧current snapshotを維持してdaemon retry / re-coalesceへ戻し、Rust / Goなどのlegacy worker、workspace replan、複数adapter、planner failureはatomic full scanへfallbackする。1-file closure外node不変、failure / cancel非promotion、legacy fallbackをcore testで固定した。
 - 2026-07-24: Issue #133としてschema v12の`incremental_deltas`とtransactional apply APIを実装。validated `worker-delta-v1` streamをexact current completed snapshotへbindしてdurable stagingし、stage / applyの両方でcanonical event、stable delta ID、node / site / edge / evidence / coverage参照、base / result graph digestを再検証する。graph mutation、stored graph digest、prospective completed snapshot ID、delta状態を単一transactionで確定し、失敗時はgraphをrollbackして旧current snapshotを維持する。cancel / process crash recoveryをterminal delta状態と既存attempt GCへ接続した。1-file deltaで対象外ID / payload不変、tampered stagingの全rollback、cancel / crash後GCをstore testで固定した。
 - 2026-07-24: Issue #132として`worker-delta-v1` contractを実装。`delta_started`、node / site / edge / evidence / aggregate・profile・file coverageのupsert / delete、`delta_completed`をprotocol `1.0` Schemaへ追加し、base snapshot / graph digest binding、canonical mutation order、連続sequence、stable delta ID再計算、stable entity ID形式、ownership scope、endpoint / profile / evidence owner・ordinal / aggregate・profile・file・最終graph間coverage整合性を検証する独立state machineを追加した。coreとworker双方のexact capability一致時だけdeltaを選び、legacy / unknown / workspace replanは既存full snapshotへfallbackする。full / delta golden fixture、反復byte同一性、unknown event、malformed ID、dangling reference、途中切断、ordering、scope外upsert / delete、coverage階層矛盾、fallback互換性testで固定した。

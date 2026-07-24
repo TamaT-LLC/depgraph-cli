@@ -16,7 +16,7 @@ import {
   fixtureFingerprint,
 } from "./benchmark-fixture.mjs";
 
-export const REPORT_SCHEMA_VERSION = "depgraph-benchmark-report-v2";
+export const REPORT_SCHEMA_VERSION = "depgraph-benchmark-report-v3";
 export const EXPECTED_FIXTURE_SHA256 =
   "f57a6d7d2e22366f5d312f01f038f6f50e2c2fbbd4480b9849ed82a696e97dc1";
 
@@ -57,11 +57,11 @@ const METRIC_CONTRACTS = new Map([
   [
     "warm_file_impact",
     {
-      cache: "primed_graph_store",
+      cache: "bounded_impact_query_cache",
       gated: true,
       minimum_samples: 3,
       maximum_samples: 50,
-      maximum_limit_ms: 4_000,
+      maximum_limit_ms: 500,
       product_target_ms: 500,
     },
   ],
@@ -79,11 +79,11 @@ const METRIC_CONTRACTS = new Map([
   [
     "warm_package_impact",
     {
-      cache: "primed_graph_store",
+      cache: "bounded_impact_query_cache",
       gated: true,
       minimum_samples: 3,
       maximum_samples: 50,
-      maximum_limit_ms: 4_000,
+      maximum_limit_ms: 500,
       product_target_ms: 500,
     },
   ],
@@ -126,7 +126,8 @@ const CACHE_CONDITIONS = {
   one_file_incremental_scan:
     "watcher daemon with a completed base snapshot and warm analysis cache",
   cold_query: "first query process against an unqueried completed graph store",
-  warm_query: "independent query processes after one priming query",
+  warm_query:
+    "independent query processes using the snapshot/filter-scoped bounded impact query cache after one priming query",
 };
 const CACHE_CONDITION_KEYS = Object.keys(CACHE_CONDITIONS);
 const TOOLCHAIN_KEYS = ["cargo", "depgraph", "go", "node", "pnpm", "rustc"];
@@ -839,7 +840,7 @@ export function createReport({ rawDir, fixtureDir, output }) {
       gated: false,
     });
 
-  const queryLimit = threshold("DEPGRAPH_QUERY_LIMIT_MS", 1_500);
+  const queryLimit = threshold("DEPGRAPH_QUERY_LIMIT_MS", 500);
   const metrics = [
     gatedMetric(
       "safe_initial_scan",
@@ -864,7 +865,7 @@ export function createReport({ rawDir, fixtureDir, output }) {
     ),
     gatedMetric(
       "warm_file_impact",
-      "primed_graph_store",
+      "bounded_impact_query_cache",
       "warm-file-impact-ms.txt",
       queryLimit,
       500,
@@ -878,7 +879,7 @@ export function createReport({ rawDir, fixtureDir, output }) {
     ),
     gatedMetric(
       "warm_package_impact",
-      "primed_graph_store",
+      "bounded_impact_query_cache",
       "warm-package-impact-ms.txt",
       queryLimit,
       500,
