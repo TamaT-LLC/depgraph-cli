@@ -3,7 +3,20 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { canonicalJson, stableId } from "./ids";
 import {
-  canonicalizeCondition,
+  FRAMEWORK_BUILD_GRAPH_CONTRACT_VERSION,
+  deduplicateFrameworkBuildRecords,
+  frameworkBuildCondition,
+  frameworkBuildDiagnostic,
+  frameworkBuildEvidence,
+  frameworkBuildGeneratedNode,
+  frameworkBuildProtocolEvents,
+  frameworkBuildRelation,
+  reconcileFrameworkBuildBaseRecords,
+  validateFrameworkBuildDelta,
+  validateFrameworkBuildProvenance,
+  type FrameworkBuildDescriptor,
+} from "./framework-build-contract";
+import {
   compareUtf8,
   type Condition,
   type DependencySite,
@@ -19,6 +32,12 @@ export const ASTRO_BUILD_OBSERVER = "astro-vite-build-observer" as const;
 export const ASTRO_BUILD_OBSERVER_VERSION = "0.1.0" as const;
 export const ASTRO_BUILD_OBSERVER_CAPABILITY = "astro-integration-v5-v7-vite-v6-v7-v1" as const;
 export const ASTRO_BUILD_OBSERVATION_SCHEMA = "astro-build-observation-v1" as const;
+export const ASTRO_FRAMEWORK_BUILD_DESCRIPTOR: FrameworkBuildDescriptor = Object.freeze({
+  framework: "astro",
+  observer: ASTRO_BUILD_OBSERVER,
+  observerVersion: ASTRO_BUILD_OBSERVER_VERSION,
+  capability: ASTRO_BUILD_OBSERVER_CAPABILITY,
+});
 
 const MAX_SAFE_STRING = 4_096;
 const MAX_ROUTES = 20_000;
@@ -148,6 +167,7 @@ export interface AstroBuildGraphInput {
   provenance: AstroBuildProvenance;
   baseNodes: readonly GraphNode[];
   baseEdges?: readonly GraphEdge[];
+  baseDiagnosticIds?: readonly string[];
 }
 
 export interface AstroBuildGraphDelta {
@@ -791,6 +811,8 @@ export function astroBuildFailureDiagnostic(error: unknown, profileId: string): 
     framework: "astro",
     observer: ASTRO_BUILD_OBSERVER,
     observer_version: ASTRO_BUILD_OBSERVER_VERSION,
+    capability: ASTRO_BUILD_OBSERVER_CAPABILITY,
+    contract_version: FRAMEWORK_BUILD_GRAPH_CONTRACT_VERSION,
     observer_failure: true,
   };
   return {
@@ -805,12 +827,10 @@ export function astroBuildFailureDiagnostic(error: unknown, profileId: string): 
 }
 
 function validateProvenance(provenance: AstroBuildProvenance): void {
-  for (const [field, value] of Object.entries(provenance)) {
-    if (field === "build_run_id" || field === "profile_id") {
-      if (boundedString(value) === null) fail("web.astro_build_provenance_invalid");
-    } else if (!/^[a-f0-9]{64}$/u.test(value)) {
-      fail("web.astro_build_provenance_invalid");
-    }
+  try {
+    validateFrameworkBuildProvenance(provenance);
+  } catch {
+    fail("web.astro_build_provenance_invalid");
   }
 }
 
@@ -819,22 +839,12 @@ function buildEvidence(
   logicalPath: string,
   artifactDigest: string,
 ): Evidence {
-  return {
-    kind: "build",
-    extractor: ASTRO_BUILD_OBSERVER,
-    extractor_version: ASTRO_BUILD_OBSERVER_VERSION,
-    path: logicalPath,
-    start_line: 1,
-    start_column: 1,
-    end_line: 1,
-    end_column: 1,
-    properties: {
-      ...provenance,
-      logical_artifact_path: logicalPath,
-      artifact_digest: artifactDigest,
-      capability: ASTRO_BUILD_OBSERVER_CAPABILITY,
-    },
-  };
+  return frameworkBuildEvidence(
+    ASTRO_FRAMEWORK_BUILD_DESCRIPTOR,
+    provenance,
+    logicalPath,
+    artifactDigest,
+  );
 }
 
 function buildNode(
@@ -846,36 +856,20 @@ function buildNode(
   logicalPath: string,
   artifactDigest: string,
 ): GraphNode {
-  const id = stableId(kind, identity);
-  return {
-    id,
+  return frameworkBuildGeneratedNode(
+    ASTRO_FRAMEWORK_BUILD_DESCRIPTOR,
     kind,
-    locator: `build://${ASTRO_BUILD_OBSERVER}/${encodeURIComponent(logicalPath)}#${id}`,
-    display_name: displayName,
-    properties: {
-      ...properties,
-      build_generated: true,
-      build_identity: identity,
-      build_provenance: {
-        ...provenance,
-        observer: ASTRO_BUILD_OBSERVER,
-        observer_version: ASTRO_BUILD_OBSERVER_VERSION,
-        logical_artifact_path: logicalPath,
-        artifact_digest: artifactDigest,
-      },
-    },
-  };
+    identity,
+    displayName,
+    properties,
+    provenance,
+    logicalPath,
+    artifactDigest,
+  );
 }
 
 function observedCondition(environment: AstroEnvironment, extra: Array<{ key: string; value: string }> = []): Condition {
-  return canonicalizeCondition({
-    op: "all",
-    conditions: [
-      { op: "eq", key: "mode", value: "production" },
-      { op: "eq", key: "environment", value: environment },
-      ...extra.map(({ key, value }) => ({ op: "eq" as const, key, value })),
-    ],
-  });
+  return frameworkBuildCondition(environment, Object.fromEntries(extra.map(({ key, value }) => [key, value])));
 }
 
 function addObservedRelation(
@@ -890,54 +884,19 @@ function addObservedRelation(
   evidence: Evidence,
   profileId: string,
 ): void {
-  const identity: Record<string, JsonValue> = {
-    kind,
-    source,
-    specifier,
-    profile_id: profileId,
-    condition,
-    resolution_status: "resolved",
-    precision: "observed",
-    observer: ASTRO_BUILD_OBSERVER,
-    observer_version: ASTRO_BUILD_OBSERVER_VERSION,
-    validated_output_digest: evidence.properties?.validated_output_digest ?? null,
-    anchor: {
-      path: evidence.path,
-      start_line: evidence.start_line,
-      start_column: evidence.start_column,
-      end_line: evidence.end_line,
-      end_column: evidence.end_column,
-    },
-  };
-  const siteId = stableId("site", identity);
-  sites.push({
-    id: siteId,
-    source,
-    kind,
-    specifier,
-    resolution_status: "resolved",
-    target_ids: [target],
-    profile_id: profileId,
-    condition,
-    precision: "observed",
-    reason: null,
-    evidence: [evidence],
-  });
-  edges.push({
-    id: stableId("edge", { kind, site_id: siteId, target, phase: "build" }),
+  const { site, edge } = frameworkBuildRelation(
+    ASTRO_FRAMEWORK_BUILD_DESCRIPTOR,
     source,
     target,
     kind,
-    site_id: siteId,
-    phase: "build",
+    specifier,
     environment,
-    profile_id: profileId,
     condition,
-    resolution_status: "resolved",
-    precision: "observed",
-    generated: true,
-    evidence: [evidence],
-  });
+    evidence,
+    profileId,
+  );
+  sites.push(site);
+  edges.push(edge);
 }
 
 function graphDiagnostic(
@@ -948,29 +907,23 @@ function graphDiagnostic(
   properties: Record<string, JsonValue>,
   severity: Diagnostic["severity"] = "warning",
 ): Diagnostic {
-  return {
-    id: stableId("diagnostic", { code, subject, profile_id: profileId, properties }),
-    severity,
+  return frameworkBuildDiagnostic(
+    ASTRO_FRAMEWORK_BUILD_DESCRIPTOR,
     code,
-    message: `${code}: ${subject}`,
-    path: evidence.path,
-    profile_id: profileId,
-    evidence: [evidence],
+    subject,
+    profileId,
+    evidence,
     properties,
-  };
+    severity,
+  );
 }
 
 function uniqueById<T extends { id: string }>(values: readonly T[], conflictCode: string): T[] {
-  const unique = new Map<string, T>();
-  for (const value of values) {
-    const existing = unique.get(value.id);
-    if (existing !== undefined
-      && canonicalJson(existing as unknown as JsonValue) !== canonicalJson(value as unknown as JsonValue)) {
-      fail(conflictCode);
-    }
-    unique.set(value.id, value);
+  try {
+    return deduplicateFrameworkBuildRecords(values);
+  } catch {
+    fail(conflictCode);
   }
-  return [...unique.values()].sort((left, right) => compareUtf8(left.id, right.id));
 }
 
 function propertyPath(node: GraphNode): string | null {
@@ -1223,7 +1176,7 @@ export function buildAstroObservedGraph(input: AstroBuildGraphInput): AstroBuild
     }
   }
 
-  return {
+  const candidate = {
     astroVersion: observation.astro_version,
     viteVersions: [...new Set(observation.vite_builds.map((build) => build.vite_version))].sort(compareUtf8),
     nodes: [...nodes.values()].sort((left, right) => compareUtf8(left.id, right.id)),
@@ -1231,6 +1184,30 @@ export function buildAstroObservedGraph(input: AstroBuildGraphInput): AstroBuild
     edges: uniqueById(edges, "web.astro_build_edge_conflict"),
     diagnostics: uniqueById(diagnostics, "web.astro_build_diagnostic_conflict"),
   };
+  let delta: AstroBuildGraphDelta;
+  try {
+    delta = {
+      astroVersion: candidate.astroVersion,
+      viteVersions: candidate.viteVersions,
+      ...reconcileFrameworkBuildBaseRecords(
+        candidate,
+        ASTRO_FRAMEWORK_BUILD_DESCRIPTOR,
+        input.provenance,
+        input.baseNodes,
+        input.baseEdges ?? [],
+        input.baseDiagnosticIds,
+      ),
+    };
+    validateFrameworkBuildDelta(
+      delta,
+      ASTRO_FRAMEWORK_BUILD_DESCRIPTOR,
+      input.provenance,
+      input.baseNodes,
+    );
+  } catch {
+    fail("web.astro_build_graph_contract_invalid");
+  }
+  return delta;
 }
 
 export function astroBuildProtocolEvents(
@@ -1239,59 +1216,19 @@ export function astroBuildProtocolEvents(
   provenance: AstroBuildProvenance,
   sourceRevision: string,
 ): ProtocolEvent[] {
-  const common = {
-    protocol_version: "1.0" as const,
-    scan_id: provenance.build_run_id,
-    adapter: "web" as const,
-    adapter_version: "0.4.0-rc.1" as const,
-  };
-  let seq = 0;
-  const event = (kind: string, payload: Record<string, unknown>): ProtocolEvent => ({
-    ...common,
-    event: kind,
-    seq: ++seq,
-    ...payload,
-  });
-  const coverage = {
-    profiles: 1,
-    files_discovered: 0,
-    files_analyzed: 0,
-    files_skipped: 0,
-    dependency_sites: delta.sites.length,
-    resolved: delta.sites.length,
-    candidates: 0,
-    external: 0,
-    unresolved: 0,
-    unsupported_syntax: 0,
-    project_code_executed: true,
-    completeness: ["build-observed"],
-    reasons: [],
-  };
-  const events: ProtocolEvent[] = [event("scan_started", { root, safe_mode: false, project_code_executed: true })];
-  events.push(event("profile_declared", {
-    profile: {
-      id: provenance.profile_id,
-      language: "typescript",
+  return frameworkBuildProtocolEvents(
+    root,
+    delta,
+    provenance,
+    sourceRevision,
+    ASTRO_FRAMEWORK_BUILD_DESCRIPTOR,
+    {
       toolchain: `astro ${delta.astroVersion}`,
       command: "astro build",
-      target: "production",
-      features: [ASTRO_BUILD_OBSERVER_CAPABILITY],
-      environment: { mode: "production" },
-      source_revision: sourceRevision,
       properties: {
-        observer: ASTRO_BUILD_OBSERVER,
-        observer_version: ASTRO_BUILD_OBSERVER_VERSION,
         astro_version: delta.astroVersion,
         vite_versions: delta.viteVersions,
-        project_code_executed: true,
       },
     },
-  }));
-  for (const node of delta.nodes) events.push(event("node_upsert", { node }));
-  for (const site of delta.sites) events.push(event("dependency_site", { site }));
-  for (const edge of delta.edges) events.push(event("edge_upsert", { edge }));
-  for (const item of delta.diagnostics) events.push(event("diagnostic", { diagnostic: item }));
-  events.push(event("profile_completed", { profile_id: provenance.profile_id, coverage }));
-  events.push(event("scan_completed", { coverage }));
-  return events;
+  );
 }

@@ -37,8 +37,10 @@ pub use build::{
     execute_build_request_with_cancellation, supervise_build, supervise_build_with_cancellation,
 };
 pub use build_evidence::{
-    stage_build_evidence, validate_build_evidence, web_build_protocol_ndjson,
+    stage_build_evidence, validate_build_evidence, validate_framework_build_evidence_contract,
+    web_build_protocol_ndjson,
 };
+pub const FRAMEWORK_BUILD_GRAPH_CONTRACT_VERSION: &str = "framework-build-graph-v1";
 pub use cache::build_cache_key;
 pub use cancellation::CancellationToken;
 pub use config::{Config, DaemonConfig, default_store_path, init_config};
@@ -178,6 +180,7 @@ pub struct ReleaseCompatibilityHealth {
     pub daemon_status_schema_version: String,
     pub policy_schema_version: String,
     pub policy_result_schema_version: String,
+    pub framework_build_graph_contract_version: String,
     pub runtime_trace_schema_version: String,
     pub runtime_collector_contract_version: String,
     pub graphml_schema_version: String,
@@ -196,6 +199,7 @@ pub fn release_compatibility_contract() -> ReleaseCompatibilityHealth {
         daemon_status_schema_version: DAEMON_STATUS_SCHEMA_VERSION.to_owned(),
         policy_schema_version: POLICY_SCHEMA_VERSION.to_owned(),
         policy_result_schema_version: POLICY_RESULT_SCHEMA_VERSION.to_owned(),
+        framework_build_graph_contract_version: FRAMEWORK_BUILD_GRAPH_CONTRACT_VERSION.to_owned(),
         runtime_trace_schema_version: RUNTIME_TRACE_SCHEMA_VERSION.to_owned(),
         runtime_collector_contract_version: RUNTIME_COLLECTOR_CONTRACT_VERSION.to_owned(),
         graphml_schema_version: GRAPHML_SCHEMA_VERSION.to_owned(),
@@ -763,10 +767,20 @@ mod tests {
                 .contains("does not match")
         );
 
-        let mut collector_drifted = compatible;
+        let mut collector_drifted = compatible.clone();
         collector_drifted.runtime_collector_contract_version = "runtime-collector-v2".to_owned();
         assert!(
             verify_release_compatibility(&collector_drifted)
+                .unwrap_err()
+                .to_string()
+                .contains("does not match")
+        );
+
+        let mut framework_build_drifted = compatible;
+        framework_build_drifted.framework_build_graph_contract_version =
+            "framework-build-graph-v2".to_owned();
+        assert!(
+            verify_release_compatibility(&framework_build_drifted)
                 .unwrap_err()
                 .to_string()
                 .contains("does not match")

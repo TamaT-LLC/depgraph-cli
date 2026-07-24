@@ -1896,22 +1896,24 @@ pub fn build_site_stable_id(site: &DependencySite) -> Result<String, ProtocolErr
             "artifact_digest": properties.get("artifact_digest"),
         })
     };
-    Ok(stable_id_from_value(
-        "site",
-        &json!({
-            "kind": site.kind,
-            "source": site.source,
-            "specifier": site.specifier,
-            "profile_id": site.profile_id,
-            "condition": site.condition.canonicalized(),
-            "resolution_status": site.resolution_status,
-            "precision": "observed",
-            "observer": primary.extractor,
-            "observer_version": primary.extractor_version,
-            "validated_output_digest": properties.get("validated_output_digest"),
-            "anchor": anchor,
-        }),
-    ))
+    let mut identity = json!({
+        "kind": site.kind,
+        "source": site.source,
+        "specifier": site.specifier,
+        "profile_id": site.profile_id,
+        "condition": site.condition.canonicalized(),
+        "resolution_status": site.resolution_status,
+        "precision": "observed",
+        "observer": primary.extractor,
+        "observer_version": primary.extractor_version,
+        "validated_output_digest": properties.get("validated_output_digest"),
+        "anchor": anchor,
+    });
+    if let Some(contract_version) = properties.get("contract_version") {
+        identity["contract_version"] = contract_version.clone();
+        identity["reason"] = site.reason.clone().map_or(Value::Null, Value::String);
+    }
+    Ok(stable_id_from_value("site", &identity))
 }
 
 /// Computes the stable ID for an observed build edge. Its phase is included so
@@ -1923,15 +1925,20 @@ pub fn build_edge_stable_id(edge: &GraphEdge) -> Result<String, ProtocolError> {
     let site_id = edge.site_id.as_deref().ok_or_else(|| {
         ProtocolError::Invariant(format!("build edge {} must reference a site", edge.id))
     })?;
-    Ok(stable_id_from_value(
-        "edge",
-        &json!({
-            "kind": edge.kind,
-            "site_id": site_id,
-            "target": edge.target,
-            "phase": "build",
-        }),
-    ))
+    let mut identity = json!({
+        "kind": edge.kind,
+        "site_id": site_id,
+        "target": edge.target,
+        "phase": "build",
+    });
+    if let Some(contract_version) = edge
+        .evidence
+        .first()
+        .and_then(|evidence| evidence.properties.get("contract_version"))
+    {
+        identity["contract_version"] = contract_version.clone();
+    }
+    Ok(stable_id_from_value("edge", &identity))
 }
 
 fn is_sha256_hex(value: &str) -> bool {
