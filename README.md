@@ -287,9 +287,16 @@ contract or output.
 The matching JSON Schema is
 [`schemas/depgraph-runtime-trace-v1.schema.json`](schemas/depgraph-runtime-trace-v1.schema.json).
 
-Store schema v11 retains the v10 profile-independent `syntax`,
-profile-dependent `semantic`, and observed `build` cache tables and adds
+Store schema v12 retains the v10 profile-independent `syntax`,
+profile-dependent `semantic`, and observed `build` cache tables plus the v11
 normalized runtime session/node/site/edge/evidence/diagnostic/import tables.
+It adds durable `worker-delta-v1` staging bound to the exact current completed
+snapshot and canonical base/result graph digests. Applying a staged delta
+revalidates its event stream and referential integrity inside one SQLite
+transaction, recomputes the prospective completed snapshot ID, and preserves
+unchanged graph payloads and stable IDs. Failed, cancelled, or crash-recovered
+attempts never move the current snapshot pointer and are removed by the
+existing unreferenced-attempt garbage collector.
 Runtime rows, the completed snapshot, its source mapping, and the current
 pointer are committed in one SQLite transaction; any failure rolls back the
 entire session and leaves the previous completed snapshot queryable. Existing

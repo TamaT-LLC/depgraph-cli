@@ -433,6 +433,37 @@ impl DeltaBaseGraph {
     }
 }
 
+/// Computes the portable canonical digest used to bind a worker delta to an
+/// exact graph payload. Snapshot metadata, attempt IDs, roots, and timestamps
+/// are deliberately excluded.
+#[must_use]
+pub fn delta_graph_digest(graph: &DeltaBaseGraph) -> String {
+    let evidence = graph
+        .evidence
+        .iter()
+        .map(|(key, evidence)| DeltaEvidenceRecord {
+            key: key.clone(),
+            evidence: evidence.clone(),
+        })
+        .collect::<Vec<_>>();
+    let stable_id = stable_id_from_value(
+        "worker-graph",
+        &json!({
+            "schema": DELTA_CONTRACT_VERSION,
+            "profiles": graph.profiles,
+            "nodes": graph.nodes.values().collect::<Vec<_>>(),
+            "sites": graph.sites.values().collect::<Vec<_>>(),
+            "edges": graph.edges.values().collect::<Vec<_>>(),
+            "evidence": evidence,
+            "coverage": graph.coverage.values().collect::<Vec<_>>(),
+        }),
+    );
+    stable_id
+        .strip_prefix("worker-graph:sha256:")
+        .expect("stable worker graph IDs use the requested namespace")
+        .to_owned()
+}
+
 #[derive(Clone, Debug)]
 pub struct ValidatedDelta {
     pub events: Vec<DeltaEvent>,
