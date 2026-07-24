@@ -33,8 +33,8 @@ use crate::{
     plan_incremental_invalidation, run_scan_with_cache_mode_and_cancellation,
     scan::{cancel_scan, complete_scan, git_source_revision},
     worker::{
-        AdapterKind, WorkerFailureKind, execute_worker_delta_with_cancellation, locate_worker,
-        probe_worker_version_with_cancellation, worker_capabilities,
+        AdapterKind, WorkerFailureKind, execute_worker_delta_with_cancellation, is_security_error,
+        locate_worker, probe_worker_version_with_cancellation, worker_capabilities,
     },
 };
 
@@ -817,6 +817,7 @@ impl DaemonScanRunner for RepositoryScanRunner {
             }
             let mut store = open_store(&store_path)?;
             let base_snapshot_id = store.current_snapshot_id()?;
+            let mut force_full_scan = false;
             if let (Some(base_snapshot_id), Some(path)) = (
                 base_snapshot_id.as_deref(),
                 semantic_noop_change_path(&request.changes),
@@ -918,6 +919,13 @@ impl DaemonScanRunner for RepositoryScanRunner {
                             let _ = error;
                             return Ok(cancelled_daemon_outcome(base_snapshot_id, Some(plan)));
                         }
+                        Err(error) if !is_security_error(&format!("{error:#}")) => {
+                            tracing::debug!(
+                                error = %format!("{error:#}"),
+                                "semantic no-op worker failed; using full scan fallback"
+                            );
+                            force_full_scan = true;
+                        }
                         Err(error) => {
                             return Ok(DaemonScanOutcome {
                                 scan_id: None,
@@ -955,7 +963,7 @@ impl DaemonScanRunner for RepositoryScanRunner {
                 (base_snapshot_id.as_deref(), invalidation_plan.as_ref())
             {
                 let scan_id = Uuid::new_v4().to_string();
-                let base = if worker_delta_plan_is_eligible(plan) {
+                let base = if !force_full_scan && worker_delta_plan_is_eligible(plan) {
                     Some(store.delta_base_graph(base_snapshot_id)?)
                 } else {
                     None
@@ -2531,14 +2539,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn incremental_worker_failure_or_cancellation_never_promotes_partial_state() -> Result<()>
-    {
+    async fn incremental_cancellation_or_tampering_never_promotes_partial_state() -> Result<()> {
         for (name, worker, expected_status) in [
-            (
-                "failed",
-                Arc::new(FailingIncrementalWorker) as Arc<dyn IncrementalWorkerExecutor>,
-                "failed",
-            ),
             (
                 "cancelled",
                 Arc::new(CancellingIncrementalWorker) as Arc<dyn IncrementalWorkerExecutor>,
@@ -2588,6 +2590,47 @@ mod tests {
                 serde_json::json!(format!("sha256:{}", "1".repeat(64)))
             );
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn semantic_noop_worker_failure_uses_the_atomic_full_scan_fallback() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let store_path = root.path().join("graph.db");
+        let base_snapshot_id = seed_incremental_store(root.path(), &store_path)?;
+        let runner = RepositoryScanRunner::new(
+            root.path().to_path_buf(),
+            store_path.clone(),
+            Config::default(),
+            false,
+        )
+        .with_incremental_worker(Arc::new(FailingIncrementalWorker));
+        let outcome = runner
+            .run(
+                DaemonScanRequest {
+                    attempt_id: "worker-failure-fallback".to_owned(),
+                    changes: vec![IncrementalFileChange::modified("src/index.ts")],
+                    started_at: timestamp(),
+                },
+                CancellationToken::new(),
+            )
+            .await?;
+
+        assert_eq!(outcome.status, "completed");
+        assert_eq!(
+            outcome.base_snapshot_id.as_deref(),
+            Some(base_snapshot_id.as_str())
+        );
+        assert!(outcome.invalidation_error.is_none());
+        let completed_snapshot_id = outcome
+            .completed_snapshot_id
+            .context("full scan fallback snapshot")?;
+        assert_ne!(completed_snapshot_id, base_snapshot_id);
+        let store = open_store(&store_path)?;
+        assert_eq!(
+            store.current_snapshot_id()?.as_deref(),
+            Some(completed_snapshot_id.as_str())
+        );
         Ok(())
     }
 

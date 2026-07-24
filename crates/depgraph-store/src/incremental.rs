@@ -2552,6 +2552,66 @@ mod tests {
             complete_base.nodes[&ids.source].properties["content_hash"],
             json!(format!("sha256:{}", "3".repeat(64)))
         );
+        let complete_delta = validated_node_delta(
+            "complete-after-overlay",
+            &complete_base,
+            &ids.source,
+            &format!("sha256:{}", "4".repeat(64)),
+        );
+        store
+            .start_incremental_scan_with_revision(
+                "complete-after-overlay",
+                Path::new("/fixture"),
+                false,
+                &second_id,
+                Some("revision-4"),
+            )
+            .unwrap();
+        let staging_counts: (i64, i64, i64) = store
+            .connection
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM nodes
+                      WHERE scan_id='complete-after-overlay'),
+                    (SELECT COUNT(*) FROM sites
+                      WHERE scan_id='complete-after-overlay'),
+                    (SELECT COUNT(*) FROM edges
+                      WHERE scan_id='complete-after-overlay')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            staging_counts,
+            (
+                base_snapshot.nodes.len() as i64,
+                base_snapshot.sites.len() as i64,
+                base_snapshot.edges.len() as i64,
+            )
+        );
+        store
+            .stage_incremental_delta("complete-after-overlay", &complete_delta)
+            .unwrap();
+        store
+            .apply_staged_incremental_delta("complete-after-overlay", &complete_delta.delta_id)
+            .unwrap();
+        store.validate_scan("complete-after-overlay").unwrap();
+        store
+            .finish_scan("complete-after-overlay", "completed", None, true)
+            .unwrap();
+        let complete_id = store.current_snapshot_id().unwrap().unwrap();
+        let complete = store.load_completed_snapshot(&complete_id).unwrap();
+        assert_eq!(complete.sites, base_snapshot.sites);
+        assert_eq!(complete.edges, base_snapshot.edges);
+        assert_eq!(
+            complete
+                .nodes
+                .iter()
+                .find(|node| node.id == ids.source)
+                .unwrap()
+                .properties["content_hash"],
+            json!(format!("sha256:{}", "4".repeat(64)))
+        );
 
         store
             .connection
