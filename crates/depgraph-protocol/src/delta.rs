@@ -493,6 +493,9 @@ pub struct DeltaValidator {
     evidence_deletes: BTreeSet<DeltaEvidenceKey>,
     coverage_upserts: BTreeMap<DeltaCoverageKey, DeltaCoverage>,
     coverage_deletes: BTreeSet<DeltaCoverageKey>,
+    scoped_nodes: BTreeSet<String>,
+    scoped_sites: BTreeSet<String>,
+    scoped_edges: BTreeSet<String>,
     expected_snapshot_id: String,
     expected_graph_digest: String,
 }
@@ -577,6 +580,9 @@ impl DeltaValidator {
             evidence_deletes: BTreeSet::new(),
             coverage_upserts: BTreeMap::new(),
             coverage_deletes: BTreeSet::new(),
+            scoped_nodes: BTreeSet::new(),
+            scoped_sites: BTreeSet::new(),
+            scoped_edges: BTreeSet::new(),
             expected_snapshot_id: base.snapshot_id,
             expected_graph_digest: base.graph_digest,
         })
@@ -727,6 +733,13 @@ impl DeltaValidator {
                 ));
             }
         }
+        (self.scoped_nodes, self.scoped_sites, self.scoped_edges) = scoped_base_entities(
+            &started.scope,
+            &self.nodes,
+            &self.sites,
+            &self.edges,
+            &self.evidence,
+        );
         self.started = Some(started.clone());
         self.state = DeltaStreamState::Mutating;
         Ok(())
@@ -757,9 +770,19 @@ impl DeltaValidator {
     }
 
     fn apply_mutation(&mut self, event: &DeltaEvent) -> Result<(), ProtocolError> {
+        let scope = &self
+            .started
+            .as_ref()
+            .expect("mutating delta has a start event")
+            .scope;
         match event {
             DeltaEvent::NodeDelete(event) => {
                 validate_stable_id("node_delete.node_id", &event.node_id, None)?;
+                require_scoped(
+                    self.scoped_nodes.contains(&event.node_id),
+                    "node",
+                    &event.node_id,
+                )?;
                 require_present(self.nodes.remove(&event.node_id), "node", &event.node_id)?;
                 self.node_deletes.insert(event.node_id.clone());
             }
@@ -775,12 +798,24 @@ impl DeltaValidator {
                         event.node.id
                     ));
                 }
+                require_scoped(
+                    self.scoped_nodes.contains(&event.node.id)
+                        || node_is_scoped(scope, &event.node),
+                    "node",
+                    &event.node.id,
+                )?;
+                self.scoped_nodes.insert(event.node.id.clone());
                 self.nodes.insert(event.node.id.clone(), event.node.clone());
                 self.node_upserts
                     .insert(event.node.id.clone(), event.node.clone());
             }
             DeltaEvent::SiteDelete(event) => {
                 validate_stable_id("site_delete.site_id", &event.site_id, Some("site"))?;
+                require_scoped(
+                    self.scoped_sites.contains(&event.site_id),
+                    "site",
+                    &event.site_id,
+                )?;
                 require_present(self.sites.remove(&event.site_id), "site", &event.site_id)?;
                 self.site_deletes.insert(event.site_id.clone());
             }
@@ -803,12 +838,24 @@ impl DeltaValidator {
                         event.site.id
                     ));
                 }
+                require_scoped(
+                    self.scoped_sites.contains(&event.site.id)
+                        || site_is_scoped(scope, &event.site, &self.scoped_nodes, &self.evidence),
+                    "site",
+                    &event.site.id,
+                )?;
+                self.scoped_sites.insert(event.site.id.clone());
                 self.sites.insert(event.site.id.clone(), event.site.clone());
                 self.site_upserts
                     .insert(event.site.id.clone(), event.site.clone());
             }
             DeltaEvent::EdgeDelete(event) => {
                 validate_stable_id("edge_delete.edge_id", &event.edge_id, Some("edge"))?;
+                require_scoped(
+                    self.scoped_edges.contains(&event.edge_id),
+                    "edge",
+                    &event.edge_id,
+                )?;
                 require_present(self.edges.remove(&event.edge_id), "edge", &event.edge_id)?;
                 self.edge_deletes.insert(event.edge_id.clone());
             }
@@ -831,12 +878,38 @@ impl DeltaValidator {
                         event.edge.id
                     ));
                 }
+                require_scoped(
+                    self.scoped_edges.contains(&event.edge.id)
+                        || edge_is_scoped(
+                            scope,
+                            &event.edge,
+                            &self.scoped_nodes,
+                            &self.scoped_sites,
+                            &self.evidence,
+                        ),
+                    "edge",
+                    &event.edge.id,
+                )?;
+                self.scoped_edges.insert(event.edge.id.clone());
                 self.edges.insert(event.edge.id.clone(), event.edge.clone());
                 self.edge_upserts
                     .insert(event.edge.id.clone(), event.edge.clone());
             }
             DeltaEvent::EvidenceDelete(event) => {
                 validate_evidence_key(&event.evidence_key)?;
+                let existing = self.evidence.get(&event.evidence_key);
+                require_scoped(
+                    evidence_is_scoped(
+                        scope,
+                        &event.evidence_key,
+                        existing,
+                        &self.scoped_nodes,
+                        &self.scoped_sites,
+                        &self.scoped_edges,
+                    ),
+                    "evidence",
+                    &evidence_key_string(&event.evidence_key),
+                )?;
                 require_present(
                     self.evidence.remove(&event.evidence_key),
                     "evidence",
@@ -847,6 +920,18 @@ impl DeltaValidator {
             DeltaEvent::EvidenceUpsert(event) => {
                 validate_evidence_key(&event.evidence.key)?;
                 validate_evidence(&event.evidence.evidence)?;
+                require_scoped(
+                    evidence_is_scoped(
+                        scope,
+                        &event.evidence.key,
+                        Some(&event.evidence.evidence),
+                        &self.scoped_nodes,
+                        &self.scoped_sites,
+                        &self.scoped_edges,
+                    ),
+                    "evidence",
+                    &evidence_key_string(&event.evidence.key),
+                )?;
                 self.evidence
                     .insert(event.evidence.key.clone(), event.evidence.evidence.clone());
                 self.evidence_upserts
@@ -854,6 +939,11 @@ impl DeltaValidator {
             }
             DeltaEvent::CoverageDelete(event) => {
                 validate_coverage_key(&event.coverage_key)?;
+                require_scoped(
+                    coverage_key_is_scoped(scope, &event.coverage_key),
+                    "coverage",
+                    &coverage_key_string(&event.coverage_key),
+                )?;
                 require_present(
                     self.coverage.remove(&event.coverage_key),
                     "coverage",
@@ -864,6 +954,11 @@ impl DeltaValidator {
             DeltaEvent::CoverageUpsert(event) => {
                 validate_delta_coverage(&event.coverage)?;
                 let key = event.coverage.key();
+                require_scoped(
+                    coverage_key_is_scoped(scope, &key),
+                    "coverage",
+                    &coverage_key_string(&key),
+                )?;
                 self.coverage.insert(key.clone(), event.coverage.clone());
                 self.coverage_upserts.insert(key, event.coverage.clone());
             }
@@ -1008,6 +1103,148 @@ fn normalize_delta_conditions(event: &mut DeltaEvent) {
             event.edge.condition = event.edge.condition.canonicalized();
         }
         _ => {}
+    }
+}
+
+fn scoped_base_entities(
+    scope: &DeltaScope,
+    nodes: &BTreeMap<String, GraphNode>,
+    sites: &BTreeMap<String, DependencySite>,
+    edges: &BTreeMap<String, GraphEdge>,
+    evidence: &BTreeMap<DeltaEvidenceKey, Evidence>,
+) -> (BTreeSet<String>, BTreeSet<String>, BTreeSet<String>) {
+    let scoped_nodes = nodes
+        .values()
+        .filter(|node| {
+            node_is_scoped(scope, node)
+                || owner_has_scoped_evidence(scope, DeltaEvidenceOwner::Node, &node.id, evidence)
+        })
+        .map(|node| node.id.clone())
+        .collect::<BTreeSet<_>>();
+    let scoped_sites = sites
+        .values()
+        .filter(|site| site_is_scoped(scope, site, &scoped_nodes, evidence))
+        .map(|site| site.id.clone())
+        .collect::<BTreeSet<_>>();
+    let scoped_edges = edges
+        .values()
+        .filter(|edge| edge_is_scoped(scope, edge, &scoped_nodes, &scoped_sites, evidence))
+        .map(|edge| edge.id.clone())
+        .collect::<BTreeSet<_>>();
+    (scoped_nodes, scoped_sites, scoped_edges)
+}
+
+fn node_is_scoped(scope: &DeltaScope, node: &GraphNode) -> bool {
+    let properties = Value::Object(node.properties.clone().into_iter().collect());
+    scope.artifact_node_ids.binary_search(&node.id).is_ok()
+        || scope.paths.binary_search(&node.locator).is_ok()
+        || (node.kind == "package_instance"
+            && scope.package_locators.binary_search(&node.locator).is_ok())
+        || has_named_scope_value(
+            &properties,
+            &[
+                "path",
+                "source_path",
+                "manifest_path",
+                "relative_path",
+                "logical_path",
+            ],
+            &scope.paths,
+        )
+        || has_named_scope_value(&properties, &["package_locator"], &scope.package_locators)
+        || has_named_scope_value(&properties, &["profile_id"], &scope.profile_ids)
+}
+
+fn site_is_scoped(
+    scope: &DeltaScope,
+    site: &DependencySite,
+    scoped_nodes: &BTreeSet<String>,
+    evidence: &BTreeMap<DeltaEvidenceKey, Evidence>,
+) -> bool {
+    scope.profile_ids.binary_search(&site.profile_id).is_ok()
+        || scoped_nodes.contains(&site.source)
+        || owner_has_scoped_evidence(scope, DeltaEvidenceOwner::Site, &site.id, evidence)
+}
+
+fn edge_is_scoped(
+    scope: &DeltaScope,
+    edge: &GraphEdge,
+    scoped_nodes: &BTreeSet<String>,
+    scoped_sites: &BTreeSet<String>,
+    evidence: &BTreeMap<DeltaEvidenceKey, Evidence>,
+) -> bool {
+    scope.profile_ids.binary_search(&edge.profile_id).is_ok()
+        || scoped_nodes.contains(&edge.source)
+        || scoped_nodes.contains(&edge.target)
+        || edge
+            .site_id
+            .as_ref()
+            .is_some_and(|site_id| scoped_sites.contains(site_id))
+        || owner_has_scoped_evidence(scope, DeltaEvidenceOwner::Edge, &edge.id, evidence)
+}
+
+fn evidence_is_scoped(
+    scope: &DeltaScope,
+    key: &DeltaEvidenceKey,
+    evidence: Option<&Evidence>,
+    scoped_nodes: &BTreeSet<String>,
+    scoped_sites: &BTreeSet<String>,
+    scoped_edges: &BTreeSet<String>,
+) -> bool {
+    let owner_is_scoped = match key.owner_type {
+        DeltaEvidenceOwner::Node => scoped_nodes.contains(&key.owner_id),
+        DeltaEvidenceOwner::Site => scoped_sites.contains(&key.owner_id),
+        DeltaEvidenceOwner::Edge => scoped_edges.contains(&key.owner_id),
+    };
+    owner_is_scoped
+        || evidence
+            .and_then(|evidence| evidence.path.as_ref())
+            .is_some_and(|path| scope.paths.binary_search(path).is_ok())
+}
+
+fn owner_has_scoped_evidence(
+    scope: &DeltaScope,
+    owner_type: DeltaEvidenceOwner,
+    owner_id: &str,
+    evidence: &BTreeMap<DeltaEvidenceKey, Evidence>,
+) -> bool {
+    evidence.iter().any(|(key, evidence)| {
+        key.owner_type == owner_type
+            && key.owner_id == owner_id
+            && evidence
+                .path
+                .as_ref()
+                .is_some_and(|path| scope.paths.binary_search(path).is_ok())
+    })
+}
+
+fn coverage_key_is_scoped(scope: &DeltaScope, key: &DeltaCoverageKey) -> bool {
+    match key {
+        DeltaCoverageKey::Aggregate => true,
+        DeltaCoverageKey::Profile { profile_id } => {
+            scope.profile_ids.binary_search(profile_id).is_ok()
+        }
+        DeltaCoverageKey::File { adapter, path } => {
+            scope.adapters.binary_search(adapter).is_ok() && scope.paths.binary_search(path).is_ok()
+        }
+    }
+}
+
+fn has_named_scope_value(value: &Value, keys: &[&str], candidates: &[String]) -> bool {
+    match value {
+        Value::Object(object) => object.iter().any(|(key, value)| {
+            (keys.contains(&key.as_str())
+                && value.as_str().is_some_and(|value| {
+                    candidates
+                        .binary_search_by(|candidate| candidate.as_str().cmp(value))
+                        .is_ok()
+                }))
+                || has_named_scope_value(value, keys, candidates)
+        }),
+        Value::Array(values) => values
+            .iter()
+            .any(|value| has_named_scope_value(value, keys, candidates)),
+        _ => false,
     }
 }
 
@@ -1404,6 +1641,15 @@ fn require_present<T>(value: Option<T>, entity: &str, id: &str) -> Result<T, Pro
             "{entity}_delete references missing base entity {id}"
         ))
     })
+}
+
+fn require_scoped(scoped: bool, entity: &str, id: &str) -> Result<(), ProtocolError> {
+    if !scoped {
+        return invariant(format!(
+            "delta {entity} mutation {id} is outside the declared scope"
+        ));
+    }
+    Ok(())
 }
 
 fn evidence_key_string(key: &DeltaEvidenceKey) -> String {

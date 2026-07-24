@@ -119,6 +119,63 @@ fn malformed_ids_and_dangling_references_fail_closed() {
 }
 
 #[test]
+fn every_mutation_is_confined_to_the_declared_scope() {
+    let mut out_of_scope_upsert = delta_events();
+    match &mut out_of_scope_upsert[0] {
+        DeltaEvent::DeltaStarted(started) => {
+            started.scope.paths = vec!["src/index.ts".into(), "src/lib.ts".into()];
+        }
+        _ => unreachable!(),
+    }
+    reset_delta_id(&mut out_of_scope_upsert);
+    let error = validate_delta_ndjson(
+        Cursor::new(events_to_ndjson(&out_of_scope_upsert)),
+        base_graph(),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(error, ProtocolError::Invariant(message) if message.contains("node mutation") && message.contains("outside the declared scope"))
+    );
+
+    let mut out_of_scope_delete = delta_events();
+    match &mut out_of_scope_delete[0] {
+        DeltaEvent::DeltaStarted(started) => {
+            started.scope.paths = vec!["src/index.ts".into(), "src/next.ts".into()];
+        }
+        _ => unreachable!(),
+    }
+    reset_delta_id(&mut out_of_scope_delete);
+    let error = validate_delta_ndjson(
+        Cursor::new(events_to_ndjson(&out_of_scope_delete)),
+        base_graph(),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(error, ProtocolError::Invariant(message) if message.contains("node mutation") && message.contains("outside the declared scope"))
+    );
+
+    let mut out_of_scope_coverage = delta_events();
+    match &mut out_of_scope_coverage[11] {
+        DeltaEvent::CoverageDelete(deleted) => {
+            deleted.coverage_key = DeltaCoverageKey::File {
+                adapter: "web".into(),
+                path: "src/rogue.ts".into(),
+            };
+        }
+        _ => unreachable!(),
+    }
+    reset_delta_id(&mut out_of_scope_coverage);
+    let error = validate_delta_ndjson(
+        Cursor::new(events_to_ndjson(&out_of_scope_coverage)),
+        base_graph(),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(error, ProtocolError::Invariant(message) if message.contains("coverage mutation") && message.contains("outside the declared scope"))
+    );
+}
+
+#[test]
 fn capability_negotiation_preserves_legacy_full_snapshot_fallback() {
     let core = vec![
         "z-unknown-capability".to_owned(),
@@ -221,7 +278,11 @@ fn base_graph() -> DeltaBaseGraph {
 
 fn delta_events() -> Vec<DeltaEvent> {
     let scope = DeltaScope {
-        paths: vec!["src/index.ts".into(), "src/lib.ts".into()],
+        paths: vec![
+            "src/index.ts".into(),
+            "src/lib.ts".into(),
+            "src/next.ts".into(),
+        ],
         package_locators: vec!["npm:fixture@1.0.0".into()],
         profile_ids: vec![PROFILE_ID.into()],
         artifact_node_ids: vec![],
