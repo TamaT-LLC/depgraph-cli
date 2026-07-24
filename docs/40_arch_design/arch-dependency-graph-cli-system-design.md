@@ -1085,7 +1085,7 @@ Issue #79の`daemon-status-v1`はplatform推奨filesystem watcherをrepository r
 
 新しいevent burstは進行中scanの共有cancellation tokenを発火し、全workerがprocess group / Windows Job Objectを終了してreader taskまでreapした後、cancelされたbatchと新しい変更を再coalesceして次batchを開始する。失敗batchはbounded exponential backoffで再投入し、daemon stopまたはwatcher終了時はactive scanをcancelしたうえでpending batchを1回だけ最終flushする。cancelled attemptはsnapshotを生成・promoteせず、promotionとcancelは共通linearization gateで競合を解消する。status APIはactive、last completed / failed / cancelled、planner / watcher error、startup recoveryを返す。起動時に同repositoryのstaging scan / build attemptを`cancelled`へ回復するがcurrent completed pointerは変更しない。
 
-Issue #134のincremental executorは`scoped_replacement`かつexactly one adapterのplanを`worker-delta-request-v1`へ決定的に変換する。requestはnormalized change、plannerが算出したpath / package / profile / artifact / adapter closure、exact current completed snapshot ID / graph digest、canonical base graphを持ち、workerにはneutral temporary fileとして渡す。coreとworkerのversion handshakeがともに`worker-delta-v1`をadvertiseした場合だけdelta processを起動し、stream全体のrouting metadata、line / output上限、base / result digest、scope、参照、coverageを検証する。bundled Web workerはrepository-complete modelとexact baseをcanonical diffし、scope所有のnode / site / edge / evidence / file・profile・aggregate coverage mutationだけを交換する。validated streamはfresh incremental staging scanへdurable stageし、SQLite transactionでapplyした後、通常のgraph / strict / architecture policy / cancellation gateを通してpromotionする。worker failureはbatch retryへ、capability probeを含むcancelは再coalesceへ戻り、どちらもcurrent pointerを更新しない。Rust / Goを含むlegacy / capability欠落 worker、workspace replan、複数adapter plan、planner failureはrepository-complete full scanへfail closedでfallbackするため、daemon status contractは維持される。
+Issue #134のincremental executorは`scoped_replacement`かつexactly one adapterのplanを`worker-delta-request-v1`へ決定的に変換する。requestはnormalized change、plannerが算出したpath / package / profile / artifact / adapter closure、exact current completed snapshot ID / graph digest、canonical base graphを持ち、workerにはneutral temporary fileとして渡す。coreとworkerのversion handshakeがともに`worker-delta-v1`をadvertiseした場合だけdelta processを起動し、stream全体のrouting metadata、line / output上限、base / result digest、scope、参照、coverageを検証する。bundled Web workerはrepository-complete modelとexact baseをcanonical diffし、scope所有のnode / site / edge / evidence / file・profile・aggregate coverage mutationだけを交換する。exact-base requestのmaterializationは現在4,096 pathまでにboundし、それを超えるclosureはbase graph構築前にfull scanへ戻す。validated streamはfresh incremental staging scanへdurable stageし、SQLite transactionでapplyした後、通常のgraph / strict / architecture policy / cancellation gateを通してpromotionする。worker failureはbatch retryへ、capability probeを含むcancelは再coalesceへ戻り、どちらもcurrent pointerを更新しない。Rust / Goを含むlegacy / capability欠落 worker、workspace replan、複数adapter plan、oversized closure、planner failureはrepository-complete full scanへfail closedでfallbackするため、daemon status contractは維持される。
 
 ### 13.4 Completed snapshot lifecycle
 
@@ -1376,10 +1376,12 @@ priming後のwarm file/package impactを個別に計測する。
 2026-07-24の10,000-file local baselineはinitial median 29.774秒、
 watcher incremental median 31.983秒、warm file/package impact median
 1.185秒/1.105秒であった。bundled Web workerは`worker-delta-v1`をadvertiseして
-scope内mutationだけを交換するが、worker内部のrepository-complete再解析と
-request / result digest計算が残るため、2秒の
-product targetには未達である。この差を隠さずreportの`product_target_ms`へ
-残し、現実装の明確な回帰を検出するlocal ceilingをinitial 30秒、
+bounded scopeではscope内mutationだけを交換する。exact base graphをrequestへ
+materializeする現contractでは大きなclosureの重複digestが支配的になるため、
+4,096 pathを超えるclosureはatomic full scanへfallbackする。このboundの撤廃と
+worker内部のrepository-complete再解析・重複digestの削減はIssue #135で行い、
+2秒のproduct targetにはまだ未達である。この差を隠さずreportの
+`product_target_ms`へ残し、現実装の明確な回帰を検出するlocal ceilingをinitial 30秒、
 incremental 40秒、warm impact 1.5秒とする。
 
 共有GitHub hosted Linux runnerのCI/release ceilingは、runner contentionと

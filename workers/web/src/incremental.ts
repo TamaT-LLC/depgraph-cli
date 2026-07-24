@@ -1,3 +1,4 @@
+import { isDeepStrictEqual } from "node:util";
 import { canonicalJson, stableId } from "./ids";
 import {
   ADAPTER,
@@ -175,7 +176,8 @@ function mapCoverage(values: readonly DeltaCoverage[]): Map<string, DeltaCoverag
 }
 
 function canonicalEqual(left: unknown, right: unknown): boolean {
-  return canonicalJson(jsonValue(left)) === canonicalJson(jsonValue(right));
+  return isDeepStrictEqual(left, right)
+    || canonicalJson(jsonValue(left)) === canonicalJson(jsonValue(right));
 }
 
 function wireEvidence(item: Evidence): WireEvidence {
@@ -266,18 +268,24 @@ function hasNamedScopeValue(
   ));
 }
 
-function ownerHasScopedEvidence(
+function scopedEvidenceOwners(
   scopePaths: ReadonlySet<string>,
-  ownerType: DeltaEvidenceRecord["owner_type"],
-  ownerId: string,
   evidence: ReadonlyMap<string, DeltaEvidenceRecord>,
-): boolean {
-  return [...evidence.values()].some((record) => (
-    record.owner_type === ownerType
-    && record.owner_id === ownerId
-    && typeof record.evidence.path === "string"
-    && scopePaths.has(record.evidence.path)
-  ));
+): Record<DeltaEvidenceRecord["owner_type"], Set<string>> {
+  const owners = {
+    node: new Set<string>(),
+    site: new Set<string>(),
+    edge: new Set<string>(),
+  };
+  // A package-sized closure may contain tens of thousands of owners. Index the
+  // scoped evidence in one pass instead of rescanning the full evidence map
+  // once for every node, site, and edge.
+  for (const record of evidence.values()) {
+    if (typeof record.evidence.path === "string" && scopePaths.has(record.evidence.path)) {
+      owners[record.owner_type].add(record.owner_id);
+    }
+  }
+  return owners;
 }
 
 function scopedBaseEntities(
@@ -286,12 +294,15 @@ function scopedBaseEntities(
   sites: ReadonlyMap<string, WireSite>,
   edges: ReadonlyMap<string, WireEdge>,
   evidence: ReadonlyMap<string, DeltaEvidenceRecord>,
-): { nodes: Set<string>; sites: Set<string>; edges: Set<string> } {
+): { paths: Set<string>; nodes: Set<string>; sites: Set<string>; edges: Set<string> } {
   const paths = new Set(request.scope.paths);
   const packages = new Set(request.scope.package_locators);
   const profiles = new Set(request.scope.profile_ids);
   const artifacts = new Set(request.scope.artifact_node_ids);
+  const evidenceOwners = scopedEvidenceOwners(paths, evidence);
   const namedPathKeys = new Set(["path", "source_path", "manifest_path", "relative_path", "logical_path"]);
+  const packageLocatorKeys = new Set(["package_locator"]);
+  const profileIdKeys = new Set(["profile_id"]);
   const scopedNodes = new Set(
     [...nodes.values()]
       .filter((node) => (
@@ -299,9 +310,9 @@ function scopedBaseEntities(
         || paths.has(node.locator)
         || (node.kind === "package_instance" && packages.has(node.locator))
         || hasNamedScopeValue(node.properties, namedPathKeys, paths)
-        || hasNamedScopeValue(node.properties, new Set(["package_locator"]), packages)
-        || hasNamedScopeValue(node.properties, new Set(["profile_id"]), profiles)
-        || ownerHasScopedEvidence(paths, "node", node.id, evidence)
+        || hasNamedScopeValue(node.properties, packageLocatorKeys, packages)
+        || hasNamedScopeValue(node.properties, profileIdKeys, profiles)
+        || evidenceOwners.node.has(node.id)
       ))
       .map((node) => node.id),
   );
@@ -310,7 +321,7 @@ function scopedBaseEntities(
       .filter((site) => (
         profiles.has(site.profile_id)
         || scopedNodes.has(site.source)
-        || ownerHasScopedEvidence(paths, "site", site.id, evidence)
+        || evidenceOwners.site.has(site.id)
       ))
       .map((site) => site.id),
   );
@@ -321,15 +332,14 @@ function scopedBaseEntities(
         || scopedNodes.has(edge.source)
         || scopedNodes.has(edge.target)
         || (edge.site_id !== undefined && scopedSites.has(edge.site_id))
-        || ownerHasScopedEvidence(paths, "edge", edge.id, evidence)
+        || evidenceOwners.edge.has(edge.id)
       ))
       .map((edge) => edge.id),
   );
-  return { nodes: scopedNodes, sites: scopedSites, edges: scopedEdges };
+  return { paths, nodes: scopedNodes, sites: scopedSites, edges: scopedEdges };
 }
 
 function evidenceIsScoped(
-  request: WorkerDeltaRequest,
   record: DeltaEvidenceRecord,
   scoped: ReturnType<typeof scopedBaseEntities>,
 ): boolean {
@@ -339,7 +349,7 @@ function evidenceIsScoped(
       ? scoped.sites.has(record.owner_id)
       : scoped.edges.has(record.owner_id);
   return ownerScoped
-    || (typeof record.evidence.path === "string" && request.scope.paths.includes(record.evidence.path));
+    || (typeof record.evidence.path === "string" && scoped.paths.has(record.evidence.path));
 }
 
 function splitModelEvidence(model: ScanModel): {
@@ -499,7 +509,7 @@ export function deltaEventsFor(model: ScanModel, request: WorkerDeltaRequest): D
 
   const finalEvidence = new Map(baseEvidence);
   for (const [key, record] of baseEvidence) {
-    if (evidenceIsScoped(request, record, scoped) && !modelGraph.evidence.has(key)) {
+    if (evidenceIsScoped(record, scoped) && !modelGraph.evidence.has(key)) {
       finalEvidence.delete(key);
     }
   }
@@ -511,7 +521,7 @@ export function deltaEventsFor(model: ScanModel, request: WorkerDeltaRequest): D
     if (
       item.scope === "file"
       && item.adapter === ADAPTER
-      && request.scope.paths.includes(item.path)
+      && scoped.paths.has(item.path)
       && !modelFileCoverage.has(key)
     ) {
       finalCoverage.delete(key);

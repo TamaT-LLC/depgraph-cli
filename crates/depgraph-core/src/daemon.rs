@@ -39,6 +39,11 @@ use crate::{
 
 pub const DAEMON_STATUS_SCHEMA_VERSION: &str = "daemon-status-v1";
 
+// Exact-base requests currently carry the full canonical graph. Keep that
+// materialization bounded until the fine-grained worker state in TASK-067 can
+// serve package-sized closures without repeated full-graph digest work.
+const MAX_WORKER_DELTA_SCOPE_PATHS: usize = 4_096;
+
 const DEFAULT_IGNORED_COMPONENTS: &[&str] = &[
     ".git",
     ".hg",
@@ -769,8 +774,14 @@ impl DaemonScanRunner for RepositoryScanRunner {
                 (base_snapshot_id.as_deref(), invalidation_plan.as_ref())
             {
                 let scan_id = Uuid::new_v4().to_string();
-                let base = store.delta_base_graph(base_snapshot_id)?;
-                if let Some(delta_request) = build_worker_delta_request(&scan_id, plan, &base)? {
+                let base = if worker_delta_plan_is_eligible(plan) {
+                    Some(store.delta_base_graph(base_snapshot_id)?)
+                } else {
+                    None
+                };
+                if let Some(base) = base.as_ref()
+                    && let Some(delta_request) = build_worker_delta_request(&scan_id, plan, base)?
+                {
                     match incremental_worker
                         .run(
                             root.clone(),
@@ -888,6 +899,8 @@ impl DaemonScanRunner for RepositoryScanRunner {
                     }
                 } else {
                     tracing::debug!(
+                        scope_paths = plan.replacement_scope.paths.len(),
+                        max_scope_paths = MAX_WORKER_DELTA_SCOPE_PATHS,
                         "incremental invalidation plan requires the full-snapshot fallback"
                     );
                 }
@@ -919,15 +932,19 @@ impl DaemonScanRunner for RepositoryScanRunner {
     }
 }
 
+fn worker_delta_plan_is_eligible(plan: &IncrementalInvalidationPlan) -> bool {
+    plan.mode == IncrementalInvalidationMode::ScopedReplacement
+        && plan.replacement_scope.replanned_profile_ids.is_empty()
+        && plan.replacement_scope.adapters.len() == 1
+        && plan.replacement_scope.paths.len() <= MAX_WORKER_DELTA_SCOPE_PATHS
+}
+
 fn build_worker_delta_request(
     scan_id: &str,
     plan: &IncrementalInvalidationPlan,
     base: &depgraph_protocol::DeltaBaseGraph,
 ) -> Result<Option<WorkerDeltaRequest>> {
-    if plan.mode != IncrementalInvalidationMode::ScopedReplacement
-        || !plan.replacement_scope.replanned_profile_ids.is_empty()
-        || plan.replacement_scope.adapters.len() != 1
-    {
+    if !worker_delta_plan_is_eligible(plan) {
         return Ok(None);
     }
     let adapter = plan.replacement_scope.adapters[0].clone();
@@ -2099,6 +2116,30 @@ mod tests {
                 .as_deref()
                 .is_some_and(|error| error.contains("incremental planner failed"))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn worker_delta_request_materialization_is_limited_to_bounded_closures() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let store_path = root.path().join("graph.db");
+        let base_snapshot_id = seed_incremental_store(root.path(), &store_path)?;
+        let store = open_store(&store_path)?;
+        let snapshot = store.load_completed_snapshot(&base_snapshot_id)?;
+        let mut plan = plan_incremental_invalidation(
+            &base_snapshot_id,
+            &snapshot,
+            &[IncrementalFileChange::modified("src/index.ts")],
+        )?;
+
+        assert!(worker_delta_plan_is_eligible(&plan));
+        let base = store.delta_base_graph(&base_snapshot_id)?;
+        assert!(build_worker_delta_request("bounded-request", &plan, &base)?.is_some());
+        plan.replacement_scope.paths = (0..=MAX_WORKER_DELTA_SCOPE_PATHS)
+            .map(|index| format!("src/{index:05}.ts"))
+            .collect();
+        assert!(!worker_delta_plan_is_eligible(&plan));
+        assert!(build_worker_delta_request("oversized-request", &plan, &base)?.is_none());
         Ok(())
     }
 
