@@ -1,0 +1,103 @@
+{
+  "schema_version": "1.0",
+  "repository": {
+    "identity": "workspace://repository:test",
+    "revision": "abc123"
+  },
+  "session": {
+    "id": "next-runtime-001",
+    "started_at": "2026-07-24T00:00:00.000Z",
+    "collector_contract_version": "runtime-collector-v1",
+    "profile": {
+      "language": "typescript",
+      "target": "server",
+      "features": ["next"],
+      "parent_profile_id": "profile:web"
+    },
+    "environment": {
+      "name": "production",
+      "runtime": "nodejs-24",
+      "region": "iad1",
+      "environment_keys": ["NODE_ENV", "SERVICE_NAME"]
+    },
+    "redaction": {
+      "environment_keys": ["NODE_ENV"],
+      "header_names": ["authorization", "cookie"],
+      "secret_names": ["API_TOKEN"],
+      "redacted_value_count": 4
+    }
+  },
+  "events": [
+    {
+      "sequence": 1,
+      "timestamp": "2026-07-24T00:00:01.000Z",
+      "dependency_kind": "imports",
+      "source": {
+        "kind": "repository_path",
+        "path": "src/server.ts",
+        "node_kind": "file"
+      },
+      "target": {
+        "kind": "graph_locator",
+        "locator": "framework-route:/api/users",
+        "node_kind": "route"
+      },
+      "redaction": {
+        "environment_keys": [],
+        "header_names": ["authorization"],
+        "secret_names": [],
+        "redacted_value_count": 1
+      }
+    },
+    {
+      "sequence": 2,
+      "timestamp": "2026-07-24T00:00:02.000Z",
+      "dependency_kind": "calls",
+      "source": {
+        "kind": "node",
+        "node_id": "file:server"
+      },
+      "target": {
+        "kind": "node",
+        "node_id": "route:users"
+      },
+      "count": 2,
+      "duration_ns": 1500
+    },
+    {
+      "sequence": 3,
+      "timestamp": "2026-07-24T00:00:03.000Z",
+      "dependency_kind": "requests",
+      "source": {
+        "kind": "repository_path",
+        "path": "src/server.ts",
+        "node_kind": "file"
+      },
+      "target": {
+        "kind": "graph_locator",
+        "locator": "framework-route:/api/users",
+        "node_kind": "route"
+      }
+    },
+    {
+      "sequence": 4,
+      "timestamp": "2026-07-24T00:00:04.000Z",
+      "dependency_kind": "invokes",
+      "source": {
+        "kind": "node",
+        "node_id": "route:users"
+      },
+      "target": {
+        "kind": "external",
+        "namespace": "https",
+        "name": "api.example.test"
+      },
+      "redaction": {
+        "environment_keys": [],
+        "header_names": ["cookie"],
+        "secret_names": ["url_credentials"],
+        "redacted_value_count": 5
+      }
+    }
+  ]
+}

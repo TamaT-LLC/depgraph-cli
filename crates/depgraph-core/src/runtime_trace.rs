@@ -1574,6 +1574,8 @@ mod tests {
         include_str!("../tests/fixtures/runtime-collector-v1.contract.json");
     const COLLECTOR_SECRET_OUTPUT: &str =
         include_str!("../tests/fixtures/runtime-collector-v1.secret-output.json");
+    const NODE_REFERENCE_COLLECTOR_NEXT: &str =
+        include_str!("../../../workers/web/test/fixtures/runtime-collector/next.expected.json");
 
     fn snapshot() -> GraphSnapshot {
         GraphSnapshot {
@@ -1786,6 +1788,31 @@ mod tests {
         unicode_boundary["repository"]["identity"] = json!("é".repeat(MAX_ID_CHARS));
         assert!(validator.is_valid(&unicode_boundary));
         read_runtime_trace(Cursor::new(serde_json::to_vec(&unicode_boundary)?))?;
+        Ok(())
+    }
+
+    #[test]
+    fn node_reference_collector_fixture_matches_the_trace_import_contract() -> Result<()> {
+        let schema: Value = serde_json::from_str(RUNTIME_TRACE_SCHEMA)?;
+        let validator = jsonschema::validator_for(&schema)?;
+        let value: Value = serde_json::from_str(NODE_REFERENCE_COLLECTOR_NEXT)?;
+        validator
+            .validate(&value)
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        let trace = read_runtime_trace(Cursor::new(NODE_REFERENCE_COLLECTOR_NEXT))?;
+        assert_eq!(
+            trace.session.collector_contract_version.as_deref(),
+            Some(RUNTIME_COLLECTOR_CONTRACT_VERSION)
+        );
+        assert_eq!(trace.events.len(), 4);
+        assert_eq!(
+            trace
+                .events
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            [1, 2, 3, 4]
+        );
         Ok(())
     }
 

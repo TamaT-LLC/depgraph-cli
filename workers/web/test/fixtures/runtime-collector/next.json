@@ -1,0 +1,86 @@
+{
+  "framework": "next",
+  "repository": {
+    "identity": "workspace://repository:test",
+    "revision": "abc123"
+  },
+  "session": {
+    "id": "next-runtime-001",
+    "profile": {
+      "language": "typescript",
+      "target": "server",
+      "features": ["next"],
+      "parentProfileId": "profile:web"
+    },
+    "environment": {
+      "name": "production",
+      "runtime": "nodejs-24",
+      "region": "iad1",
+      "environmentKeys": ["SERVICE_NAME", "NODE_ENV"]
+    },
+    "redaction": {
+      "environmentKeys": ["NODE_ENV"],
+      "headerNames": ["cookie", "authorization"],
+      "secretNames": ["API_TOKEN"],
+      "redactedValueCount": 3
+    }
+  },
+  "observations": [
+    {
+      "kind": "module",
+      "source": {
+        "kind": "repository_path",
+        "path": "src/server.ts",
+        "nodeKind": "file"
+      },
+      "target": {
+        "kind": "graph_locator",
+        "locator": "framework-route:/api/users",
+        "nodeKind": "route"
+      },
+      "redaction": {
+        "headerNames": ["authorization"]
+      }
+    },
+    {
+      "kind": "call",
+      "source": {
+        "kind": "node",
+        "nodeId": "file:server"
+      },
+      "target": {
+        "kind": "node",
+        "nodeId": "route:users"
+      },
+      "count": 2,
+      "durationNs": 1500
+    },
+    {
+      "kind": "route",
+      "source": {
+        "kind": "repository_path",
+        "path": "src/server.ts",
+        "nodeKind": "file"
+      },
+      "target": {
+        "kind": "graph_locator",
+        "locator": "framework-route:/api/users",
+        "nodeKind": "route"
+      }
+    },
+    {
+      "kind": "rpc",
+      "source": {
+        "kind": "node",
+        "nodeId": "route:users"
+      },
+      "target": {
+        "kind": "http_url",
+        "url": "https://alice:not-a-secret@API.EXAMPLE.TEST:443/private?customer=42#detail"
+      },
+      "redaction": {
+        "headerNames": ["cookie"]
+      }
+    }
+  ]
+}

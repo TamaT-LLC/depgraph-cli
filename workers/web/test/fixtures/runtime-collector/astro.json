@@ -1,0 +1,41 @@
+{
+  "framework": "astro",
+  "repository": {
+    "identity": "workspace://repository:astro",
+    "revision": "astro-revision"
+  },
+  "session": {
+    "id": "astro-runtime-001",
+    "profile": {
+      "language": "typescript",
+      "target": "server",
+      "features": ["astro"]
+    },
+    "environment": {
+      "name": "preview",
+      "runtime": "nodejs-24",
+      "region": "local"
+    },
+    "redaction": {
+      "headerNames": ["cookie"]
+    }
+  },
+  "observations": [
+    {
+      "kind": "route",
+      "source": {
+        "kind": "repository_path",
+        "path": "src/pages/[slug].astro",
+        "nodeKind": "component"
+      },
+      "target": {
+        "kind": "graph_locator",
+        "locator": "framework-route:/[slug]",
+        "nodeKind": "route"
+      },
+      "redaction": {
+        "headerNames": ["cookie"]
+      }
+    }
+  ]
+}
