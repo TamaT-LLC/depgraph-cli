@@ -94,8 +94,10 @@ Canonical conversion is performed in this order:
    material are discarded. A raw URL in a graph locator or HTTP external name
    is invalid. The producer uses its URL parser to canonicalize the host. The
    consumer treats this field as a non-resolved external identity and applies
-   the same bounded redacted-authority syntax in JSON Schema and Rust; it does
-   not perform DNS or IP semantic validation.
+   the same bounded redacted-authority syntax in JSON Schema and Rust. IPv6
+   literals must use valid hexadecimal IPv6 syntax; URL parsers normalize an
+   embedded IPv4 tail to hexadecimal before emission. The consumer does not
+   perform DNS resolution.
 4. Apply string, rate, and buffer limits, then allocate the next sequence.
 5. Normalize the timestamp and construct the trace v1 event.
 6. Set `session.collector_contract_version=runtime-collector-v1`, serialize

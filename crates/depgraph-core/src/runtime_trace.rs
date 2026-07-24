@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     io::Read,
+    net::Ipv6Addr,
 };
 
 use anyhow::{Context, Result, bail};
@@ -1146,12 +1147,7 @@ fn validate_http_authority(authority: &str, field: &str) -> Result<()> {
     let (host, port) = if let Some(ipv6) = authority.strip_prefix('[') {
         let close = ipv6.find(']').ok_or_else(&invalid)?;
         let (address, suffix) = ipv6.split_at(close);
-        if address.is_empty()
-            || !address.contains(':')
-            || !address
-                .chars()
-                .all(|character| character.is_ascii_hexdigit() || matches!(character, ':' | '.'))
-        {
+        if address.is_empty() || address.contains('.') || address.parse::<Ipv6Addr>().is_err() {
             return Err(invalid());
         }
         let suffix = &suffix[1..];
@@ -1916,8 +1912,9 @@ mod tests {
         for authority in [
             "api.example.test",
             "localhost:3000",
+            "[::]",
             "[::1]:443",
-            "[:::]",
+            "[2001:db8::1]",
             "[0:0:0:0:0:0:0:1]:443",
         ] {
             let mut value: Value = serde_json::from_str(GOLDEN)?;
@@ -1939,6 +1936,10 @@ mod tests {
             "api.example.test:00080",
             "api.example.test:65536",
             "api..example.test",
+            "[:::]",
+            "[1:2:3:4:5:6:7]",
+            "[1:2:3:4:5:6:7:8:9]",
+            "[::ffff:192.0.2.1]",
         ] {
             let mut value: Value = serde_json::from_str(GOLDEN)?;
             value["session"]["collector_contract_version"] =
