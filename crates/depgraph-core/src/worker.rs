@@ -13516,6 +13516,8 @@ exec sleep 10
         std::fs::create_dir(&root)?;
         let root = root.canonicalize()?;
         let marker = temp.path().join("descendant-survived");
+        let descendant_ready = temp.path().join("descendant-ready");
+        let descendant_trigger = temp.path().join("descendant-trigger");
         let script = temp.path().join("timeout-worker.mjs");
         let script_contents = format!(
             r#"import {{ spawn }} from "node:child_process";
@@ -13538,7 +13540,9 @@ spawn(process.execPath, ["-e", {}], {{ stdio: "ignore" }});
 setInterval(() => undefined, 1_000);
 "#,
             serde_json::to_string(&format!(
-                "setTimeout(() => require('node:fs').writeFileSync({}, 'survived'), 3500); setInterval(() => undefined, 1000);",
+                "const fs = require('node:fs'); fs.writeFileSync({}, 'ready'); setInterval(() => {{ if (fs.existsSync({})) fs.writeFileSync({}, 'survived'); }}, 25);",
+                serde_json::to_string(&descendant_ready.to_string_lossy())?,
+                serde_json::to_string(&descendant_trigger.to_string_lossy())?,
                 serde_json::to_string(&marker.to_string_lossy())?,
             ))?,
         );
@@ -13549,10 +13553,10 @@ setInterval(() => undefined, 1_000);
             &root,
             "web-timeout-scan",
             &ScanConfig {
-                // A cold Windows runner can take over a second to start Node.
-                // Keep the descendant marker beyond this timeout so the test
-                // still proves that the complete process tree was reaped.
-                worker_timeout_seconds: 3,
+                // Windows cold-start antivirus scanning can delay the first
+                // Node protocol event by several seconds. The descendant
+                // handshake below keeps the reap assertion deterministic.
+                worker_timeout_seconds: 10,
                 max_protocol_line_bytes: 4096,
                 max_protocol_bytes: 64 * 1024,
                 max_stderr_bytes: 4096,
@@ -13571,7 +13575,12 @@ setInterval(() => undefined, 1_000);
                 .as_deref()
                 .is_some_and(|error| error.contains("timed out"))
         );
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(
+            descendant_ready.exists(),
+            "timed-out Web worker descendant never reached its ready state"
+        );
+        std::fs::write(&descendant_trigger, b"check")?;
+        tokio::time::sleep(Duration::from_secs(1)).await;
         assert!(!marker.exists(), "timed-out Web worker descendant survived");
         Ok(())
     }
