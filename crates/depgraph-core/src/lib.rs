@@ -45,6 +45,7 @@ pub use config::{Config, DaemonConfig, default_store_path, init_config};
 pub use daemon::{
     DAEMON_STATUS_SCHEMA_VERSION, DaemonAttempt, DaemonHandle, DaemonPhase, DaemonScanFuture,
     DaemonScanOutcome, DaemonScanRequest, DaemonScanRunner, DaemonStatus, EventCoalescer,
+    IncrementalWorkerExecutor, IncrementalWorkerFuture, IncrementalWorkerOutcome,
     RepositoryScanRunner, WatchIgnoreRules, WatchPathKind, WatchedPath, acquire_store_writer_lock,
     coalesce_incremental_changes, start_daemon_with_runner, start_repository_daemon,
 };

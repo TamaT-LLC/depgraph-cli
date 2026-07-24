@@ -2,6 +2,7 @@ use std::{
     collections::BTreeSet,
     ffi::{OsStr, OsString},
     future::Future,
+    io::{Cursor, Write},
     path::{Path, PathBuf},
     process::Stdio,
     time::Duration,
@@ -10,8 +11,8 @@ use std::{
 use anyhow::{Context, Result, bail};
 use depgraph_protocol::{
     CompletenessLevel, Condition, EvidenceKind, MAX_EVENT_LINE_BYTES, Phase, Precision,
-    ProtocolError, ProtocolEvent, ProtocolValidator, ResolutionStatus, ValidatedProtocol,
-    validate_semantic_contract,
+    ProtocolError, ProtocolEvent, ProtocolValidator, ResolutionStatus, ValidatedDelta,
+    ValidatedProtocol, WorkerDeltaRequest, validate_delta_ndjson, validate_semantic_contract,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -122,6 +123,15 @@ impl AdapterKind {
         }
     }
 
+    pub(crate) fn from_name(value: &str) -> Option<Self> {
+        match value {
+            "rust" => Some(Self::Rust),
+            "go" => Some(Self::Go),
+            "web" => Some(Self::Web),
+            _ => None,
+        }
+    }
+
     fn env_override(self) -> &'static str {
         match self {
             Self::Rust => "DEPGRAPH_RUST_WORKER",
@@ -129,6 +139,37 @@ impl AdapterKind {
             Self::Web => "DEPGRAPH_WEB_WORKER",
         }
     }
+}
+
+pub(crate) fn worker_capabilities(handshake: &str) -> Vec<String> {
+    let Some((_, details)) = handshake.split_once(" (protocol ") else {
+        return Vec::new();
+    };
+    let Some(details) = details.strip_suffix(')') else {
+        return Vec::new();
+    };
+    let mut fields = details
+        .split(';')
+        .filter_map(|field| field.trim().strip_prefix("capabilities "));
+    let Some(value) = fields.next() else {
+        return Vec::new();
+    };
+    if fields.next().is_some() {
+        return Vec::new();
+    }
+    let capabilities = value
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if capabilities.is_empty()
+        || capabilities.windows(2).any(|pair| pair[0] >= pair[1])
+        || value.split(',').count() != capabilities.len()
+    {
+        return Vec::new();
+    }
+    capabilities
 }
 
 #[derive(Debug, Clone)]
@@ -155,8 +196,20 @@ pub struct WorkerOutput {
 }
 
 #[derive(Debug)]
+pub(crate) struct WorkerDeltaOutput {
+    pub adapter: AdapterKind,
+    pub delta: Option<ValidatedDelta>,
+    pub stderr: String,
+    pub stderr_truncated: bool,
+    pub error: Option<String>,
+    pub(crate) failure_kind: Option<WorkerFailureKind>,
+    pub security_violation: bool,
+}
+
+#[derive(Debug)]
 struct WorkerExecution {
     events: Vec<Value>,
+    delta: Option<ValidatedDelta>,
     stderr: String,
     stderr_truncated: bool,
     error: Option<String>,
@@ -1301,6 +1354,7 @@ pub(crate) async fn execute_worker_with_cancellation(
         &scan_id,
         &config,
         &profiles,
+        None,
         async move {
             cancellation.cancelled().await;
             Ok(())
@@ -1332,6 +1386,54 @@ pub(crate) async fn execute_worker_with_cancellation(
     }
 }
 
+pub(crate) async fn execute_worker_delta_with_cancellation(
+    spec: WorkerSpec,
+    root: PathBuf,
+    config: ScanConfig,
+    profiles: ProfileConfig,
+    request: WorkerDeltaRequest,
+    cancellation: CancellationToken,
+) -> WorkerDeltaOutput {
+    let adapter = spec.adapter;
+    let scan_id = request.scan_id.clone();
+    match execute_worker_inner_with_cancellation(
+        &spec,
+        &root,
+        &scan_id,
+        &config,
+        &profiles,
+        Some(&request),
+        async move {
+            cancellation.cancelled().await;
+            Ok(())
+        },
+    )
+    .await
+    {
+        Ok(execution) => WorkerDeltaOutput {
+            adapter,
+            delta: execution.delta,
+            stderr: execution.stderr,
+            stderr_truncated: execution.stderr_truncated,
+            error: execution.error,
+            failure_kind: execution.failure_kind,
+            security_violation: execution.security_violation,
+        },
+        Err(error) => {
+            let error = format!("{error:#}");
+            WorkerDeltaOutput {
+                adapter,
+                delta: None,
+                stderr: String::new(),
+                stderr_truncated: false,
+                failure_kind: Some(WorkerFailureKind::Other),
+                security_violation: is_security_error(&error),
+                error: Some(error),
+            }
+        }
+    }
+}
+
 pub(crate) fn is_security_error(error: &str) -> bool {
     error.starts_with("security policy violation:")
         || error.starts_with("security policy violation at line ")
@@ -1353,6 +1455,7 @@ async fn execute_worker_inner(
         scan_id,
         config,
         profiles,
+        None,
         tokio::signal::ctrl_c(),
     )
     .await
@@ -1364,6 +1467,7 @@ async fn execute_worker_inner_with_cancellation<F>(
     scan_id: &str,
     config: &ScanConfig,
     profiles: &ProfileConfig,
+    delta_request: Option<&WorkerDeltaRequest>,
     cancellation: F,
 ) -> Result<WorkerExecution>
 where
@@ -1381,6 +1485,18 @@ where
     }
 
     let neutral_cwd = neutral_working_directory(root)?;
+    let mut delta_request_file = None;
+    if let Some(request) = delta_request {
+        request.validate().context("invalid worker delta request")?;
+        let mut file = tempfile::NamedTempFile::new_in(&neutral_cwd.path)
+            .context("failed to create worker delta request file")?;
+        serde_json::to_writer(file.as_file_mut(), request)
+            .context("failed to serialize worker delta request")?;
+        file.as_file_mut()
+            .flush()
+            .context("failed to flush worker delta request")?;
+        delta_request_file = Some(file);
+    }
     let mut command = Command::new(&program);
     command
         .args(&spec.leading_args)
@@ -1394,6 +1510,9 @@ where
         .stderr(Stdio::piped())
         .kill_on_drop(true)
         .env_clear();
+    if let Some(file) = delta_request_file.as_ref() {
+        command.arg("--delta-request").arg(file.path());
+    }
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt as _;
@@ -1505,15 +1624,39 @@ where
         errors.len() - previous_error_count,
     ));
     let stderr = String::from_utf8_lossy(&stderr_bytes).into_owned();
-    let parsed = parse_events_preserving_prefix(
-        &stdout_bytes,
-        scan_id,
-        spec.adapter.name(),
-        root,
-        config.max_protocol_line_bytes,
-        spec.expected_version.as_deref(),
-        Some(spec.release_attested),
-    );
+    let (events, delta, parsed_error, parsed_failure_kind, parsed_security_violation) =
+        if let Some(request) = delta_request {
+            let parsed = parse_delta_events(
+                &stdout_bytes,
+                request,
+                config.max_protocol_line_bytes,
+                spec.expected_version.as_deref(),
+            );
+            (
+                Vec::new(),
+                parsed.delta,
+                parsed.error,
+                parsed.failure_kind,
+                parsed.security_violation,
+            )
+        } else {
+            let parsed = parse_events_preserving_prefix(
+                &stdout_bytes,
+                scan_id,
+                spec.adapter.name(),
+                root,
+                config.max_protocol_line_bytes,
+                spec.expected_version.as_deref(),
+                Some(spec.release_attested),
+            );
+            (
+                parsed.events,
+                None,
+                parsed.error,
+                parsed.failure_kind,
+                parsed.security_violation,
+            )
+        };
     if stdout_truncated {
         errors.push(format!(
             "{} protocol output exceeded {} bytes",
@@ -1521,25 +1664,23 @@ where
         ));
         failure_kinds.push(WorkerFailureKind::OutputLimit);
     }
-    if let Some(error) = parsed.error {
+    if let Some(error) = parsed_error {
         errors.push(error);
-        failure_kinds.push(
-            parsed
-                .failure_kind
-                .expect("a protocol error always has a typed failure kind"),
-        );
+        failure_kinds
+            .push(parsed_failure_kind.expect("a protocol error always has a typed failure kind"));
     }
     // Classify only supervisor/protocol errors. Worker stderr is retained for
     // diagnosis but must never be able to spoof timeout/security categories.
     let control_error = (!errors.is_empty()).then(|| errors.join("; "));
     let failure_kind = select_worker_failure_kind(&failure_kinds);
-    let security_violation = parsed.security_violation;
+    let security_violation = parsed_security_violation;
     let error = match (control_error, stderr.is_empty()) {
         (Some(error), false) => Some(format!("{error}; stderr: {stderr}")),
         (error, _) => error,
     };
     Ok(WorkerExecution {
-        events: parsed.events,
+        events,
+        delta,
         stderr,
         stderr_truncated,
         error,
@@ -1991,6 +2132,92 @@ struct ParsedProtocol {
     error: Option<String>,
     failure_kind: Option<WorkerFailureKind>,
     security_violation: bool,
+}
+
+#[derive(Debug)]
+struct ParsedDelta {
+    delta: Option<ValidatedDelta>,
+    error: Option<String>,
+    failure_kind: Option<WorkerFailureKind>,
+    security_violation: bool,
+}
+
+fn parse_delta_events(
+    stdout: &[u8],
+    request: &WorkerDeltaRequest,
+    configured_line_limit: usize,
+    expected_adapter_version: Option<&str>,
+) -> ParsedDelta {
+    let line_limit = configured_line_limit.min(MAX_EVENT_LINE_BYTES);
+    if let Some((index, _line)) = stdout
+        .split(|byte| *byte == b'\n')
+        .enumerate()
+        .find(|(_, line)| line.len() > line_limit)
+    {
+        return ParsedDelta {
+            delta: None,
+            error: Some(format!(
+                "delta protocol line {} exceeds {line_limit} bytes",
+                index + 1
+            )),
+            failure_kind: Some(WorkerFailureKind::OutputLimit),
+            security_violation: false,
+        };
+    }
+    let base = match request.base_graph() {
+        Ok(base) => base,
+        Err(error) => {
+            return ParsedDelta {
+                delta: None,
+                error: Some(format!("invalid worker delta request base: {error}")),
+                failure_kind: Some(WorkerFailureKind::MalformedProtocol),
+                security_violation: false,
+            };
+        }
+    };
+    match validate_delta_ndjson(Cursor::new(stdout), base) {
+        Ok(delta) => {
+            let common = delta
+                .events
+                .first()
+                .expect("validated delta contains boundary events")
+                .common();
+            let routing_mismatch =
+                common.scan_id != request.scan_id || common.adapter != request.adapter;
+            let version_mismatch =
+                expected_adapter_version.is_some_and(|expected| common.adapter_version != expected);
+            let request_mismatch = delta.base_snapshot_id != request.base_snapshot_id
+                || delta.base_graph_digest != request.base_graph_digest
+                || delta.scope != request.scope;
+            if routing_mismatch || version_mismatch || request_mismatch {
+                ParsedDelta {
+                    delta: None,
+                    error: Some(
+                        "security policy violation: delta worker request binding mismatch"
+                            .to_owned(),
+                    ),
+                    failure_kind: Some(WorkerFailureKind::MalformedProtocol),
+                    security_violation: expected_adapter_version.is_some(),
+                }
+            } else {
+                ParsedDelta {
+                    delta: Some(delta),
+                    error: None,
+                    failure_kind: None,
+                    security_violation: false,
+                }
+            }
+        }
+        Err(error) => ParsedDelta {
+            delta: None,
+            error: Some(format!("invalid worker delta protocol: {error}")),
+            failure_kind: Some(match error {
+                ProtocolError::LineTooLong { .. } => WorkerFailureKind::OutputLimit,
+                _ => WorkerFailureKind::MalformedProtocol,
+            }),
+            security_violation: false,
+        },
+    }
 }
 
 fn protocol_error_is_security(error: &ProtocolError) -> bool {
@@ -6111,6 +6338,35 @@ fn parse_events_preserving_prefix(
 mod tests {
     use super::*;
 
+    #[test]
+    fn worker_capability_handshake_is_exact_sorted_and_fail_closed() {
+        assert_eq!(
+            worker_capabilities(
+                "depgraph-web-worker 0.4.0 (protocol 1.0; capabilities alpha,worker-delta-v1,zeta)"
+            ),
+            ["alpha", "worker-delta-v1", "zeta"]
+        );
+        assert!(worker_capabilities("depgraph-web-worker 0.4.0").is_empty());
+        assert!(
+            worker_capabilities(
+                "depgraph-web-worker 0.4.0 (protocol 1.0; capabilities worker-delta-v1,alpha)"
+            )
+            .is_empty()
+        );
+        assert!(
+            worker_capabilities(
+                "depgraph-web-worker 0.4.0 (protocol 1.0; capabilities worker-delta-v1,worker-delta-v1)"
+            )
+            .is_empty()
+        );
+        assert!(
+            worker_capabilities(
+                "depgraph-web-worker 0.4.0 (protocol 1.0; future-capabilities worker-delta-v1)"
+            )
+            .is_empty()
+        );
+    }
+
     struct TestRelease {
         manifest: PathBuf,
         rust_worker: PathBuf,
@@ -8460,6 +8716,7 @@ mod tests {
             scan_id,
             &ScanConfig::default(),
             &ProfileConfig::default(),
+            None,
             std::future::pending::<std::io::Result<()>>(),
         )
         .await?;
@@ -8485,6 +8742,7 @@ mod tests {
             scan_id,
             &ScanConfig::default(),
             &ProfileConfig::default(),
+            None,
             std::future::pending::<std::io::Result<()>>(),
         )
         .await?;
@@ -8508,6 +8766,7 @@ mod tests {
             scan_id,
             &ScanConfig::default(),
             &ProfileConfig::default(),
+            None,
             std::future::pending::<std::io::Result<()>>(),
         )
         .await?;
@@ -12970,6 +13229,7 @@ printf '{"event":"scan_completed","protocol_version":"1.0","scan_id":"%s","adapt
             "release-gate-scan",
             &ScanConfig::default(),
             &ProfileConfig::default(),
+            None,
             std::future::pending::<std::io::Result<()>>(),
         )
         .await?;
@@ -12983,6 +13243,7 @@ printf '{"event":"scan_completed","protocol_version":"1.0","scan_id":"%s","adapt
             "unverified-release-gate-scan",
             &ScanConfig::default(),
             &ProfileConfig::default(),
+            None,
             std::future::pending::<std::io::Result<()>>(),
         )
         .await?;
@@ -13020,6 +13281,7 @@ printf '{"event":"scan_completed","protocol_version":"1.0","scan_id":"%s","adapt
             "typescript-gate-scan",
             &ScanConfig::default(),
             &ProfileConfig::default(),
+            None,
             std::future::pending::<std::io::Result<()>>(),
         )
         .await?;
@@ -13040,6 +13302,7 @@ printf '{"event":"scan_completed","protocol_version":"1.0","scan_id":"%s","adapt
             "typescript-gate-scan",
             &ScanConfig::default(),
             &ProfileConfig::default(),
+            None,
             std::future::pending::<std::io::Result<()>>(),
         )
         .await?;
@@ -13108,6 +13371,7 @@ exec sleep 10
                 follow_symlinks: false,
             },
             &ProfileConfig::default(),
+            None,
             std::future::pending::<std::io::Result<()>>(),
         )
         .await?;
@@ -13170,6 +13434,7 @@ setInterval(() => undefined, 1_000);
                 follow_symlinks: false,
             },
             &ProfileConfig::default(),
+            None,
             std::future::pending::<std::io::Result<()>>(),
         )
         .await?;
@@ -13241,6 +13506,7 @@ exec sleep 30
                 follow_symlinks: false,
             },
             &ProfileConfig::default(),
+            None,
             async move {
                 timeout(Duration::from_secs(5), async {
                     while !ready.is_file() {
@@ -13366,6 +13632,7 @@ printf '{"event":"scan_completed","protocol_version":"1.0","scan_id":"%s","adapt
             "neutral-cwd-scan",
             &ScanConfig::default(),
             &ProfileConfig::default(),
+            None,
             std::future::pending::<std::io::Result<()>>(),
         )
         .await?;
