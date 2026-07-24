@@ -999,7 +999,9 @@ async fn run(cli: Cli) -> Result<u8> {
                 .map(|snapshot_id| impact_query_cache_key(snapshot_id, &selector, &filters));
             let cached = match (cache_key.as_deref(), snapshot_id.as_deref()) {
                 (Some(cache_key), Some(snapshot_id)) => store
-                    .lookup_impact_query_cache(cache_key, snapshot_id)?
+                    .lookup_impact_query_cache(cache_key, snapshot_id)
+                    .ok()
+                    .flatten()
                     .and_then(|payload| serde_json::from_str::<ImpactResult>(&payload).ok()),
                 _ => None,
             };

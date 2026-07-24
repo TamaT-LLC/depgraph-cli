@@ -1,7 +1,9 @@
+use std::time::Duration;
+
 use anyhow::{Context, Result, bail};
 use chrono::{SecondsFormat, Utc};
 use depgraph_protocol::stable_id_from_value;
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, Params, params};
 use serde_json::Value;
 
 use super::Store;
@@ -25,10 +27,9 @@ impl Store {
         snapshot_id: &str,
     ) -> Result<Option<String>> {
         validate_cache_identity(key, snapshot_id)?;
-        let timestamp = now();
-        let tx = self.connection.transaction()?;
         let stored = {
-            let mut statement = tx
+            let mut statement = self
+                .connection
                 .prepare_cached(
                     "SELECT contract_version, snapshot_id, payload_json, payload_digest
                        FROM impact_query_cache
@@ -48,7 +49,6 @@ impl Store {
                 .context("failed to look up impact query cache entry")?
         };
         let Some(stored) = stored else {
-            tx.commit()?;
             return Ok(None);
         };
 
@@ -58,12 +58,33 @@ impl Store {
             && payload_digest(&stored.payload_json)
                 .is_ok_and(|digest| digest == stored.payload_digest);
         if !valid {
-            tx.execute("DELETE FROM impact_query_cache WHERE key=?1", [key])?;
-            tx.commit()?;
+            // Deletion is cache maintenance, so a concurrent writer must not
+            // make the product query fail. Match the observed row to avoid
+            // deleting a valid replacement stored after this read.
+            best_effort_cache_write(
+                &self.connection,
+                "DELETE FROM impact_query_cache
+                  WHERE key=?1
+                    AND contract_version=?2
+                    AND snapshot_id=?3
+                    AND payload_json=?4
+                    AND payload_digest=?5",
+                params![
+                    key,
+                    stored.contract_version,
+                    stored.snapshot_id,
+                    stored.payload_json,
+                    stored.payload_digest,
+                ],
+            );
             return Ok(None);
         }
 
-        tx.execute(
+        // Touch metadata is best-effort and deliberately uses its own
+        // autocommit write. A concurrent CLI writer may hold SQLite's single
+        // writer lock; the already validated cached result remains usable.
+        best_effort_cache_write(
+            &self.connection,
             "UPDATE impact_query_cache
                 SET last_used_at=?2,
                     last_used_sequence=(
@@ -71,10 +92,20 @@ impl Store {
                           FROM impact_query_cache
                     ),
                     hit_count=hit_count+1
-              WHERE key=?1",
-            params![key, timestamp],
-        )?;
-        tx.commit()?;
+              WHERE key=?1
+                AND contract_version=?3
+                AND snapshot_id=?4
+                AND payload_json=?5
+                AND payload_digest=?6",
+            params![
+                key,
+                now(),
+                stored.contract_version,
+                stored.snapshot_id,
+                stored.payload_json,
+                stored.payload_digest,
+            ],
+        );
         Ok(Some(stored.payload_json))
     }
 
@@ -166,6 +197,19 @@ fn payload_digest(payload_json: &str) -> Result<String> {
     Ok(stable_id_from_value("impact-query-result", &value))
 }
 
+fn best_effort_cache_write<P: Params>(connection: &Connection, sql: &str, params: P) {
+    let Ok(previous_timeout_ms) =
+        connection.query_row("PRAGMA busy_timeout", [], |row| row.get::<_, u64>(0))
+    else {
+        return;
+    };
+    if connection.busy_timeout(Duration::ZERO).is_err() {
+        return;
+    }
+    let _ = connection.execute(sql, params);
+    let _ = connection.busy_timeout(Duration::from_millis(previous_timeout_ms));
+}
+
 fn now() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
 }
@@ -173,7 +217,7 @@ fn now() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rusqlite::Connection;
+    use std::time::Instant;
 
     fn seeded_store() -> Result<Store> {
         let store = Store::open_in_memory()?;
@@ -253,6 +297,49 @@ mod tests {
             None
         );
         assert_eq!(store.impact_query_cache_entry_count()?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_writer_does_not_block_a_valid_cache_hit() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("concurrent.db");
+        let mut store = Store::open(&path)?;
+        store.connection.execute(
+            "INSERT INTO scans(
+                id, root, status, strict, started_at, completed_at,
+                project_code_executed, protocol_version, error
+             ) VALUES ('scan', '/repo', 'completed', 0, '2026-01-01T00:00:00Z',
+                       '2026-01-01T00:00:01Z', 0, '1.0', NULL)",
+            [],
+        )?;
+        store.connection.execute(
+            "INSERT INTO completed_snapshots(
+                id, source_kind, source_attempt_id, scan_id, build_attempt_id,
+                runtime_import_id, runtime_session_set_json, parent_snapshot_id,
+                source_revision, profile_set_json, status, created_at
+             ) VALUES (
+                'snapshot:sha256:test', 'scan', 'scan', 'scan', NULL, NULL,
+                '[]', NULL, NULL, '[]', 'completed', '2026-01-01T00:00:01Z'
+             )",
+            [],
+        )?;
+        let payload = r#"{"complete":true,"impacts":[]}"#;
+        assert!(store.store_impact_query_cache(&key(1), "snapshot:sha256:test", payload)?);
+
+        let writer = Connection::open(&path)?;
+        writer.execute_batch(
+            "PRAGMA foreign_keys=ON;
+             PRAGMA journal_mode=WAL;
+             BEGIN IMMEDIATE;",
+        )?;
+        let started = Instant::now();
+        assert_eq!(
+            store.lookup_impact_query_cache(&key(1), "snapshot:sha256:test")?,
+            Some(payload.to_owned())
+        );
+        assert!(started.elapsed() < Duration::from_millis(500));
+        writer.execute_batch("ROLLBACK;")?;
         Ok(())
     }
 

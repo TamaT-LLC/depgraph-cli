@@ -1078,7 +1078,9 @@ full snapshot、全edge/evidence、profile matrixを再構築せず、同一type
 JSON、digest不一致はentryを破棄して通常queryへ戻る。Git changed-set queryは
 worktree stateをkeyへ固定できないためcache対象外とする。snapshot変更または
 filter / traversal budget変更は必ず別keyとなり、result、順序、filter意味、
-complete diagnosticを変更しない。
+complete diagnosticを変更しない。LRU touch / prune / invalid entry削除は
+best-effort cache maintenanceとし、別CLI processのSQLite writer lockと競合しても
+validated payloadを返すか通常queryへfallbackし、impact commandを失敗させない。
 
 ### 13.3 更新単位
 
