@@ -1,8 +1,13 @@
 import { readFile, realpath, stat } from "node:fs/promises";
 import path from "node:path";
-import { inventoryFiles } from "./fs";
+import { inventoryFiles, readUtf8 } from "./fs";
 import { stableId } from "./ids";
-import { deltaEventsFor, parseWorkerDeltaRequest } from "./incremental";
+import {
+  deltaEventsFor,
+  IncrementalFallbackError,
+  parseWorkerDeltaRequest,
+  semanticNoopDeltaEventsFor,
+} from "./incremental";
 import {
   frameworkSemanticProfileProperties,
   WEB_FRAMEWORK_SEMANTIC_PROFILE_PROPERTIES,
@@ -313,6 +318,20 @@ async function main(): Promise<void> {
         JSON.parse(await readFile(options.deltaRequest, "utf8")) as unknown,
         options.scanId,
       );
+    if (deltaRequest?.analysis_mode === "semantic_noop") {
+      const changedPath = deltaRequest.changes[0]?.new_path;
+      const source = changedPath === undefined
+        ? null
+        : await readUtf8(root, path.join(root, changedPath));
+      if (source === null) {
+        throw new IncrementalFallbackError("changed file could not be read safely");
+      }
+      await writeEvents(semanticNoopDeltaEventsFor(source, deltaRequest));
+      process.stderr.write(
+        "depgraph-web-worker: 1 file, semantic no-op delta mode, project code executed=false\n",
+      );
+      return;
+    }
     const inventory = await inventoryFiles(root);
     const model = await scan(root, inventory.files, inventory.issues);
     await writeEvents(deltaRequest === null
@@ -322,7 +341,10 @@ async function main(): Promise<void> {
       `depgraph-web-worker: ${model.coverage.files_analyzed} files, ${model.coverage.dependency_sites} sites, ${deltaRequest === null ? "full" : "delta"} mode, project code executed=false\n`,
     );
   } catch (error) {
-    if (error instanceof TypeScriptProjectError && root !== null) {
+    if (error instanceof IncrementalFallbackError) {
+      process.stderr.write(`depgraph-web-worker: incremental fallback required: ${error.message}\n`);
+      process.exitCode = 75;
+    } else if (error instanceof TypeScriptProjectError && root !== null) {
       await writeEvents(failureEventsFor(root, options.scanId, error)).catch(() => undefined);
       process.stderr.write(`depgraph-web-worker: ${error.message}\n`);
     } else {

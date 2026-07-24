@@ -1085,7 +1085,11 @@ Issue #79の`daemon-status-v1`はplatform推奨filesystem watcherをrepository r
 
 新しいevent burstは進行中scanの共有cancellation tokenを発火し、全workerがprocess group / Windows Job Objectを終了してreader taskまでreapした後、cancelされたbatchと新しい変更を再coalesceして次batchを開始する。失敗batchはbounded exponential backoffで再投入し、daemon stopまたはwatcher終了時はactive scanをcancelしたうえでpending batchを1回だけ最終flushする。cancelled attemptはsnapshotを生成・promoteせず、promotionとcancelは共通linearization gateで競合を解消する。status APIはactive、last completed / failed / cancelled、planner / watcher error、startup recoveryを返す。起動時に同repositoryのstaging scan / build attemptを`cancelled`へ回復するがcurrent completed pointerは変更しない。
 
-Issue #134のincremental executorは`scoped_replacement`かつexactly one adapterのplanを`worker-delta-request-v1`へ決定的に変換する。requestはnormalized change、plannerが算出したpath / package / profile / artifact / adapter closure、exact current completed snapshot ID / graph digest、canonical base graphを持ち、workerにはneutral temporary fileとして渡す。coreとworkerのversion handshakeがともに`worker-delta-v1`をadvertiseした場合だけdelta processを起動し、stream全体のrouting metadata、line / output上限、base / result digest、scope、参照、coverageを検証する。bundled Web workerはrepository-complete modelとexact baseをcanonical diffし、scope所有のnode / site / edge / evidence / file・profile・aggregate coverage mutationだけを交換する。exact-base requestのmaterializationは現在4,096 pathまでにboundし、それを超えるclosureはbase graph構築前にfull scanへ戻す。validated streamはfresh incremental staging scanへdurable stageし、SQLite transactionでapplyした後、通常のgraph / strict / architecture policy / cancellation gateを通してpromotionする。worker failureはbatch retryへ、capability probeを含むcancelは再coalesceへ戻り、どちらもcurrent pointerを更新しない。Rust / Goを含むlegacy / capability欠落 worker、workspace replan、複数adapter plan、oversized closure、planner failureはrepository-complete full scanへfail closedでfallbackするため、daemon status contractは維持される。
+Issue #134のincremental executorは`scoped_replacement`かつexactly one adapterのplanを`worker-delta-request-v1`へ決定的に変換する。requestはnormalized change、plannerが算出したpath / package / profile / artifact / adapter closure、exact current completed snapshot ID / graph digest、canonical base graphを持ち、workerにはneutral temporary fileとして渡す。coreとworkerのversion handshakeがともに`worker-delta-v1`をadvertiseした場合だけdelta processを起動し、stream全体のrouting metadata、line / output上限、base / result digest、scope、参照、coverageを検証する。bundled Web workerはcomplete analysisではrepository-complete modelとexact baseをcanonical diffし、scope所有のnode / site / edge / evidence / file・profile・aggregate coverage mutationだけを交換する。complete exact-base requestのmaterializationは4,096 pathまでにboundし、それを超えるclosureはbase graph構築前にfull scanへ戻す。validated streamはfresh incremental staging scanへdurable stageし、SQLite transactionでapplyした後、通常のgraph / strict / architecture policy / cancellation gateを通してpromotionする。worker failureはbatch retryへ、capability probeを含むcancelは再coalesceへ戻り、どちらもcurrent pointerを更新しない。Rust / Goを含むlegacy / capability欠落 worker、workspace replan、複数adapter plan、oversized closure、planner failureはrepository-complete full scanへfail closedでfallbackするため、daemon status contractは維持される。
+
+Issue #135の1-file Web fast pathはrepository-complete plannerより先に動作する。initial scan時にfile nodeへ保存する`analysis_hash`はTypeScript scanner token kind / textとUTF-16 offset / line / columnをcanonical hashする。significant tokenの位置を変えない末尾trivia等は除外できる一方、evidence位置、triple-slash directive、tag-bearing comment、quoted comment module候補は保持する。既存file 1件のwriteではstoreがexact current snapshotから対象nodeだけを解決し、全profileに対する内部整合したzero-site coverageを持つone-node projectionを構築する。workerは対象fileだけをroot-confined readし、新旧`analysis_hash`が一致する場合に限り`content_hash`だけをupsertする。semantic / evidence-position相違、読取不能、追加・削除・rename、複数変更は明示的にcomplete planner/full scanへ戻す。
+
+store transactionはcurrent parent、canonical delta event、projection digest、file node identity、path、analysis hash、content hash以外の全property不変を再検証する。成功時は親completed snapshotとone-node upsertからcontent-addressed overlay snapshot IDを導出し、full graph row copy、repository-complete result digest、通常policy再評価を省略して一括promotionする。topology、evidence、coverage、strict/policy結果は親から不変である。completed snapshot load、integrity check、次回projectionはoverlay chainを解決し、semantic changeのfallback時だけcomplete graphをmaterializeする。`daemon-incremental-trace-v1`はbase projection、worker capability probe、worker analysis、store commit、totalをstatusへ記録する。
 
 ### 13.4 Completed snapshot lifecycle
 
@@ -1373,29 +1377,21 @@ priming後のwarm file/package impactを個別に計測する。
 - 1 file 変更の incremental semantic scan: build を除き 2 秒以内
 - query latency: warm cache の file / package impact で 500 ms 以内
 
-2026-07-24の10,000-file local baselineはinitial median 29.774秒、
-watcher incremental median 31.983秒、warm file/package impact median
-1.185秒/1.105秒であった。bundled Web workerは`worker-delta-v1`をadvertiseして
-bounded scopeではscope内mutationだけを交換する。exact base graphをrequestへ
-materializeする現contractでは大きなclosureの重複digestが支配的になるため、
-4,096 pathを超えるclosureはatomic full scanへfallbackする。このboundの撤廃と
-worker内部のrepository-complete再解析・重複digestの削減はIssue #135で行い、
-2秒のproduct targetにはまだ未達である。この差を隠さずreportの
-`product_target_ms`へ残し、現実装の明確な回帰を検出するlocal ceilingをinitial 30秒、
-incremental 40秒、warm impact 1.5秒とする。
+2026-07-24のIssue #135後の10,000-file macOS local baselineはinitial
+33.458 / 32.641 / 33.206秒、watcher incremental 860 / 513 / 518ms
+（median 518ms）であった。incremental daemon内部traceはcold projectionを含む
+初回523ms、以降143msで、初回base projection 303ms、worker capability
+60–63ms、worker analysis 64–67msが支配する。
+node 20,003、dependency site 19,998、edge 40,000と全coverageを保存した。
+benchmarkのincremental ceilingはproduct targetと同じ2秒とする。
 
-共有GitHub hosted Linux runnerのCI/release ceilingは、runner contentionと
-process起動を含め、initial 80秒、incremental 105秒、warm query 4.0秒とする。
-2026-07-24のPR実測は1回目がinitial median 68.530秒、incremental median
-83.891秒、warm file/package impact median 2.979秒/2.748秒、2回目が
-initial median 71.751秒、incremental median 96.210秒、warm file/package
-impact median 3.603秒/3.179秒であった。2回分のrunner分散をhosted baseline
-として記録し、2回目のmedianから約9〜11%の余裕を持つceilingを設定する。
-initial / incrementalは3 sample、warm queryは5 sampleを採り、medianがceiling
+共有GitHub hosted Linux runnerのCI/release ceilingはinitial 80秒、
+incremental 2秒、warm query 4.0秒とする。initial / incrementalは3 sample、
+warm queryは5 sampleを採り、medianがceiling
 以内、ceiling超過sampleは最大1件、全sampleはceiling + 20%以内というnoise
 allowanceを同時に満たした場合だけpassする。cold queryは継続取得するが、
 product targetがwarm cacheであるためgateには使わない。report
-`depgraph-benchmark-report-v1`はraw sample、median / max、cache条件、
+`depgraph-benchmark-report-v2`はraw sample、median / max、cache条件、
 platform / architecture / GitHub runner、depgraph / Rust / Cargo / Go / Node /
 pnpm version、commit、threshold、allowance、判定を保持する。
 
@@ -1573,6 +1569,7 @@ schema、commit、全必須metric、conservation、総合passを再検証して�
 - 2026-07-24: Issue #132として`worker-delta-v1` contractを実装。`delta_started`、node / site / edge / evidence / aggregate・profile・file coverageのupsert / delete、`delta_completed`をprotocol `1.0` Schemaへ追加し、base snapshot / graph digest binding、canonical mutation order、連続sequence、stable delta ID再計算、stable entity ID形式、ownership scope、endpoint / profile / evidence owner・ordinal / aggregate・profile・file・最終graph間coverage整合性を検証する独立state machineを追加した。coreとworker双方のexact capability一致時だけdeltaを選び、legacy / unknown / workspace replanは既存full snapshotへfallbackする。full / delta golden fixture、反復byte同一性、unknown event、malformed ID、dangling reference、途中切断、ordering、scope外upsert / delete、coverage階層矛盾、fallback互換性testで固定した。
 - 2026-07-24: Issue #87としてMilestone 4 release candidate `v0.4.0-rc.1`を確定。product / Rust / Go / Web adapterを同期し、protocol / graph `1.0`、store schema `11`、cache contract `1`と各Milestone 4 schemaをrelease manifestへ固定した。公式`v0.2.0-rc.1` packageで生成したschema `5` store fixtureをpackage gateでschema `11`へ移行し、completed snapshot、node/site/edge/evidence、immutable ID、queryを保全する。snapshot/diff/impact、watcher/incremental、clean policy GitHub annotation、runtime validate/import/filter、決定的GraphML stdout/atomic file出力をpackaged binaryで実行し、全target archive / checksum / manifest / SBOM / license / attestationのaggregate verificationへ閉じる。migration、rollback、安全境界、性能、既知制約をrelease noteへ集約した。
 - 2026-07-24: Issue #86として決定的な10,000 source-file fixtureと`depgraph-benchmark-report-v1`を実装。fresh-store initial、watcher daemon経由の1-file incremental、cold/warm file/package impactを複数sampleで分離し、platform / runner / toolchain / cache条件とraw timingを記録する。median ceiling、1 bounded outlier、20% hard noise allowanceで明確な回帰だけをfailさせる。変更fileのcontent hash更新を要求しつつ、それ以外のgraph topology、dependency site、edge、evidence、coverage digest保存を検証する。PR CIとreleaseで同じreportをartifact化し、release asset検証前にschema / commit / metric / conservationを再検証する。
+- 2026-07-24: Issue #135として`depgraph-benchmark-report-v2`へ更新し、1-file incrementalの2秒product targetをCIでも直接gateする。daemon statusへbase projection、worker capability probe、worker analysis、sparse store commit、totalのversioned phase traceを追加し、10,000-file fixtureでsemantic no-op fast path以外の完了を拒否する。
 - 2026-07-24: Issue #85として決定的なGraphML 1.0 exporterを実装。node / edgeのstable ID、kind、phase、profile、condition、precision、resolutionをtyped keyへ、完全なprofile / dependency site / evidenceと所有参照をcanonical JSONへ保持し、GraphML単体で再構成可能にした。XML-safeなgenerated element ID、XML 1.0特殊文字escape、Unicode保持、invalid control fail-closed、stable sort、record/text単位のbounded streaming writer、成功後だけdestinationを置換するatomic file outputを追加し、golden、round-trip、入力順非依存決定性、大容量chunk、runtime filter、CLI stdout / file E2Eで固定した。既存JSON / DOT / Mermaid出力は変更していない。
 - 2026-07-24: Issue #84としてruntime evidenceのschema v11 store unionを実装。validated traceをruntime child profile、observed site/edge、per-session evidence、runtime-only sentinel、partial/conflict/unmatched diagnosticへ変換し、session/graph/import/completed snapshot/current pointerを単一transactionでpromotionする。同一session再importのidempotence、複数sessionのgraph dedupとcount/time range集約、static/semantic/build非上書き、失敗promotion全rollbackを固定した。deps/dependents/why/impact/exportへphase/profile/session/environment filter、diffのruntime phase比較、snapshot metadataのruntime source/sessionを追加し、JSON/DOT/Mermaidとsession-filtered evidenceを決定的に出力する。v1/v7/v8→v11 migration、promotion failure、multi-session、malformed input、query/export/diff repeatabilityをstore/core/CLI testで検証した。
 - 2026-07-23: Issue #82としてpublic API change / runtime boundary policyとCI annotationを実装。`depgraph policy <FROM> <TO>`がcompleted snapshot差分のpublic `symbol / type / route`をadded / removed / changedへ分類し、breakingなremoved / changedをbaselineのcanonical impact path、change ID、profile / condition、宣言source evidenceへ関連付ける。scan側の`runtime_boundary`はroute / componentから明示的な`client_boundary / server_boundary`への同一profile pathだけを評価し、framework conditionとedge runtimeを保持する。JSON reportとGitHub Actions warning/error annotationは同じcanonical resultから生成し、repository-relative path / 1-origin spanだけを出力する。warning / error / suppressionのexit挙動、schema parity、runtime unit、snapshot diff integration、secret / absolute path非漏洩を含むCLI E2Eを追加した。

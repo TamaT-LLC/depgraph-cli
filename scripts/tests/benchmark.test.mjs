@@ -109,7 +109,7 @@ test("release verification requires the complete 10,000-file metric contract", (
       "warm_analysis_cache",
       true,
       [20, 21, 22],
-      105_000,
+      2_000,
       2_000,
     ],
     ["cold_file_impact", "first_process_query", false, [1], 4_000, 500],
@@ -167,6 +167,15 @@ test("release verification requires the complete 10,000-file metric contract", (
     completed_snapshot_id: `snapshot:sha256:${"2".repeat(64)}`,
     invalidation_schema_version: "incremental-plan-v1",
     affected_profiles: 1,
+    incremental_trace: {
+      schema_version: "daemon-incremental-trace-v1",
+      mode: "semantic_noop",
+      base_projection_milliseconds: 5,
+      worker_capability_milliseconds: 20,
+      worker_analysis_milliseconds: 30,
+      store_commit_milliseconds: 10,
+      total_milliseconds: 70,
+    },
   };
   const report = {
     schema_version: REPORT_SCHEMA_VERSION,

@@ -11,6 +11,7 @@ import {
   type ResolvedTarget,
   type TypeScriptPathRequest,
 } from "./imports";
+import { analysisContentHash } from "./source-fingerprint";
 import { discoverRoutes, type RouteEntry } from "./routes";
 import { mergeTypeScriptDefinitionDelta, type TypeScriptDefinitionDelta } from "./semantic-delta";
 import {
@@ -2029,6 +2030,7 @@ export async function scan(root: string, allFiles: string[], inventoryIssues: Fi
       continue;
     }
     node.properties.content_hash = contentHash(source);
+    node.properties.analysis_hash = analysisContentHash(source, relative);
     if (extension === ".astro") astroSources.set(relative, source);
     const typeOnlyRanges = nativeTypeScript.typeOnlyDependencyRanges.get(relative) ?? [];
     const extraction = typeOnlyRanges.length === 0

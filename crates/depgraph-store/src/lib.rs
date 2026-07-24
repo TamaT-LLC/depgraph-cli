@@ -1510,6 +1510,56 @@ impl Store {
         if record.status != "completed" {
             reasons.push("snapshot_not_completed".to_owned());
         }
+        if record.build_attempt_id.is_none()
+            && record.runtime_session_ids.is_empty()
+            && incremental::scan_is_semantic_noop_overlay(&self.connection, &record.scan_id)?
+        {
+            let mut parent_id = record
+                .parent_snapshot_id
+                .clone()
+                .context("semantic no-op overlay integrity has no parent")?;
+            let mut visited = BTreeSet::from([record.id.clone()]);
+            let mut parent_invalid = false;
+            loop {
+                if !visited.insert(parent_id.clone()) {
+                    parent_invalid = true;
+                    break;
+                }
+                let parent = self
+                    .completed_snapshot(&parent_id)?
+                    .with_context(|| format!("completed snapshot {parent_id} was not found"))?;
+                let (parent_observed_id, parent_observed_profiles) = completed_snapshot_identity(
+                    &self.connection,
+                    &parent.scan_id,
+                    parent.build_attempt_id.as_deref(),
+                    &parent.runtime_session_ids,
+                    parent.parent_snapshot_id.as_deref(),
+                    parent.source_revision.as_deref(),
+                )?;
+                if parent_observed_id != parent.id
+                    || parent_observed_profiles != parent.profile_ids
+                    || parent.status != "completed"
+                {
+                    parent_invalid = true;
+                    break;
+                }
+                if parent.build_attempt_id.is_some()
+                    || !parent.runtime_session_ids.is_empty()
+                    || !incremental::scan_is_semantic_noop_overlay(
+                        &self.connection,
+                        &parent.scan_id,
+                    )?
+                {
+                    break;
+                }
+                parent_id = parent
+                    .parent_snapshot_id
+                    .context("semantic no-op overlay integrity has no parent")?;
+            }
+            if parent_invalid {
+                reasons.push("parent_integrity_mismatch".to_owned());
+            }
+        }
         Ok(SnapshotIntegrityRecord {
             snapshot_id: record.id.clone(),
             valid: reasons.is_empty(),
@@ -2263,35 +2313,7 @@ impl Store {
     }
 
     pub fn load_completed_snapshot(&self, snapshot_id: &str) -> Result<GraphSnapshot> {
-        let record = self
-            .completed_snapshot(snapshot_id)?
-            .with_context(|| format!("completed snapshot {snapshot_id} was not found"))?;
-        let mut snapshot = self.load_base_snapshot(&record.scan_id)?;
-        if let Some(attempt_id) = &record.build_attempt_id {
-            let raw = self
-                .connection
-                .query_row(
-                    "SELECT delta_json FROM build_attempts
-                      WHERE id=?1 AND base_scan_id=?2 AND status='completed'",
-                    params![attempt_id, record.scan_id],
-                    |row| row.get::<_, Option<String>>(0),
-                )
-                .optional()?
-                .flatten()
-                .with_context(|| {
-                    format!("snapshot {snapshot_id} build attempt {attempt_id} has no delta")
-                })?;
-            let delta: BuildGraphDelta = serde_json::from_str(&raw)?;
-            merge_build_delta(&mut snapshot, delta, attempt_id)?;
-        }
-        if !record.runtime_session_ids.is_empty() {
-            runtime::merge_runtime_sessions(
-                &self.connection,
-                &mut snapshot,
-                &record.runtime_session_ids,
-            )?;
-        }
-        Ok(snapshot)
+        load_completed_snapshot_from_connection(&self.connection, snapshot_id)
     }
 
     fn load_base_snapshot(&self, scan_id: &str) -> Result<GraphSnapshot> {
@@ -2475,6 +2497,106 @@ fn load_base_snapshot_from_connection(
     Ok(snapshot)
 }
 
+fn load_completed_snapshot_from_connection(
+    connection: &Connection,
+    snapshot_id: &str,
+) -> Result<GraphSnapshot> {
+    let mut current = snapshot_id.to_owned();
+    let mut visited = BTreeSet::new();
+    let mut overlays = Vec::new();
+    let (record, mut snapshot) = loop {
+        if !visited.insert(current.clone()) {
+            bail!("completed snapshot parent cycle detected while loading snapshot");
+        }
+        let record = load_completed_snapshot_record(connection, &current)?
+            .with_context(|| format!("completed snapshot {current} was not found"))?;
+        if record.build_attempt_id.is_none()
+            && record.runtime_session_ids.is_empty()
+            && incremental::scan_is_semantic_noop_overlay(connection, &record.scan_id)?
+        {
+            let overlay = load_base_snapshot_from_connection(connection, &record.scan_id)?;
+            current = overlay
+                .scan
+                .parent_snapshot_id
+                .clone()
+                .context("semantic no-op overlay has no parent completed snapshot")?;
+            overlays.push(overlay);
+            continue;
+        }
+        let snapshot = load_effective_scan_snapshot(connection, &record.scan_id)?;
+        break (record, snapshot);
+    };
+    if let Some(attempt_id) = &record.build_attempt_id {
+        let raw = connection
+            .query_row(
+                "SELECT delta_json FROM build_attempts
+                  WHERE id=?1 AND base_scan_id=?2 AND status='completed'",
+                params![attempt_id, record.scan_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten()
+            .with_context(|| {
+                format!("snapshot {snapshot_id} build attempt {attempt_id} has no delta")
+            })?;
+        let delta: BuildGraphDelta = serde_json::from_str(&raw)?;
+        merge_build_delta(&mut snapshot, delta, attempt_id)?;
+    }
+    if !record.runtime_session_ids.is_empty() {
+        runtime::merge_runtime_sessions(connection, &mut snapshot, &record.runtime_session_ids)?;
+    }
+    for overlay in overlays.into_iter().rev() {
+        apply_semantic_noop_overlay(&mut snapshot, overlay)?;
+    }
+    Ok(snapshot)
+}
+
+fn load_effective_scan_snapshot(connection: &Connection, scan_id: &str) -> Result<GraphSnapshot> {
+    let overlay = load_base_snapshot_from_connection(connection, scan_id)?;
+    if !incremental::scan_is_semantic_noop_overlay(connection, scan_id)? {
+        return Ok(overlay);
+    }
+    let parent_snapshot_id = overlay
+        .scan
+        .parent_snapshot_id
+        .as_deref()
+        .context("semantic no-op overlay has no parent completed snapshot")?;
+    let mut snapshot = load_completed_snapshot_from_connection(connection, parent_snapshot_id)?;
+    apply_semantic_noop_overlay(&mut snapshot, overlay)?;
+    Ok(snapshot)
+}
+
+fn apply_semantic_noop_overlay(snapshot: &mut GraphSnapshot, overlay: GraphSnapshot) -> Result<()> {
+    for node in overlay.nodes {
+        if let Some(existing) = snapshot.nodes.iter_mut().find(|item| item.id == node.id) {
+            *existing = node;
+        } else {
+            bail!(
+                "semantic no-op overlay introduced an unknown node {}",
+                node.id
+            );
+        }
+    }
+    for log in overlay.adapter_logs {
+        if let Some(existing) = snapshot
+            .adapter_logs
+            .iter_mut()
+            .find(|item| item.adapter == log.adapter)
+        {
+            *existing = log;
+        } else {
+            snapshot.adapter_logs.push(log);
+        }
+    }
+    snapshot.scan = overlay.scan;
+    snapshot.nodes.sort_by(|left, right| left.id.cmp(&right.id));
+    snapshot
+        .adapter_logs
+        .sort_by(|left, right| left.adapter.cmp(&right.adapter));
+    refresh_profile_matrix(snapshot, false);
+    Ok(())
+}
+
 fn completed_snapshot_identity(
     connection: &Connection,
     scan_id: &str,
@@ -2483,7 +2605,18 @@ fn completed_snapshot_identity(
     parent_snapshot_id: Option<&str>,
     source_revision: Option<&str>,
 ) -> Result<(String, Vec<String>)> {
-    let mut snapshot = load_base_snapshot_from_connection(connection, scan_id)?;
+    if build_attempt_id.is_none()
+        && runtime_session_ids.is_empty()
+        && incremental::scan_is_semantic_noop_overlay(connection, scan_id)?
+    {
+        return incremental::semantic_noop_snapshot_identity(
+            connection,
+            scan_id,
+            parent_snapshot_id.context("semantic no-op overlay identity has no parent")?,
+            source_revision,
+        );
+    }
+    let mut snapshot = load_effective_scan_snapshot(connection, scan_id)?;
     if let Some(attempt_id) = build_attempt_id {
         let raw = connection
             .query_row(

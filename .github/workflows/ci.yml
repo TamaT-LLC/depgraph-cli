@@ -64,11 +64,10 @@ jobs:
     needs: [rust, go, web]
     runs-on: ubuntu-24.04
     env:
-      # Product targets remain 30s/2s/500ms on a development machine.
-      # Hosted-runner ceilings include process startup and bounded contention;
-      # the report still records every raw sample and the product target.
+      # Product targets are enforced directly. Per-phase daemon traces make
+      # regressions attributable without widening the latency contract.
       DEPGRAPH_SCAN_LIMIT_MS: "80000"
-      DEPGRAPH_INCREMENTAL_LIMIT_MS: "105000"
+      DEPGRAPH_INCREMENTAL_LIMIT_MS: "2000"
       DEPGRAPH_QUERY_LIMIT_MS: "4000"
       DEPGRAPH_BUILD_OBSERVATION_LIMIT_MS: "60000"
       DEPGRAPH_BENCH_SAMPLES: "3"
