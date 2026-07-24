@@ -7,7 +7,7 @@ status: Active
 upstream: []
 downstream: []
 owner: TakehiroT
-updated: 2026-07-22
+updated: 2026-07-24
 ---
 
 # アーキテクチャ設計: Semantic Dependency Graph CLI
@@ -16,8 +16,11 @@ updated: 2026-07-22
 
 | Compatibility unit | Version |
 | --- | --- |
-| Product / Rust / Go / Web adapter | `0.2.0-rc.1` |
+| Product / Rust / Go / Web adapter | `0.4.0-rc.1` |
 | NDJSON protocol / graph schema | `1.0` |
+| SQLite store / cache contract | `11` / `1` |
+| Snapshot diff / policy / runtime trace / GraphML | `1.0` |
+| Incremental plan / daemon status | `incremental-plan-v1` / `daemon-status-v1` |
 | Rust / Cargo baseline | `1.93.1` |
 | Go baseline | `1.26.1` |
 | Node.js / pnpm baseline | `24.18.0` / `10.33.0` |
@@ -26,6 +29,8 @@ updated: 2026-07-22
 2026-07-22 時点で Milestone 0〜1 の MVP に加え、Milestone 2 の Go semantic vertical sliceを実装済みである。Go workerは制限付き`go/packages`、`go/types`、serial SSAからsymbol/type/generic instance、`declares`、`extends`、`implements`、`instantiates`、`type_uses`、value `references`、exact `calls`、RTA/CHA candidate `may_call`と明示profileのVTA refinementをprotocol semantic graphとして出力する。reflection、unsafe、go:linkname、assembly、plugin、cgo/native callbackは専用reason・source span・profileを持つcall-graph boundary siteと相関diagnosticへ保持し、exact/candidate targetを捏造しない。これらはSQLite evidence storeへ保存され、symbol/type selector、deps/dependents/why/cycles/unresolved、JSON/DOT/Mermaid exportの対象となる。
 
 Milestone 2のrelease candidateは`v0.2.0-rc.1`とする。5 targetのnative package gateに加え、公開直前に全archive/checksumを再取得してmanifest、SBOM、project/third-party license、worker/runtime attestationを集約検証し、結果を`release-verification.json`としてGitHub prereleaseへ添付する。機能範囲、安全境界、完全性条件、既知制約は[release note](../releases/v0.2.0-rc.1.md)をcanonicalな配布時説明とする。
+
+Milestone 4のrelease candidateは`v0.4.0-rc.1`とする。protocol / graph schemaは`1.0`、SQLite storeは`11`、cache contractは`1`を維持し、公式`v0.2.0-rc.1`が生成したstore schema `5`からcompleted snapshotを失わずに移行する。全5 targetのnative package gateはsnapshot/diff/impact、watcher/incremental、architecture policyとGitHub annotation、runtime trace validate/import/query、GraphML stdout/atomic file exportを実際のpackaged binaryで検証する。manifestにはこれらのversioned compatibility unitと`milestone4-packaged-smoke-v1`を固定し、aggregate verifierはchecksum、archive、manifest、SBOM、license、attestationと同じclosureで再検証する。性能結果、安全境界、migration / rollback、既知制約は[release note](../releases/v0.4.0-rc.1.md)をcanonicalな配布時説明とする。
 
 safe scanではcanonical root外へのsymlink readを拒否し、相対PATH・repository内toolchain・Node実行hookを除外する。Goは制限付き`go/packages`からparser fallbackへ移行する。Cargo metadataはpath-bearing inputのpreflight後、admitted manifest、lockfile、target discovery layoutだけを持つworker-owned confined mirrorに対してneutral cwdから`--frozen --offline --no-deps`で実行し、返却されたtemporary pathをinventory IDへ戻す。配布物はmanifest、MIT / Apache-2.0のproject license全文、core、schema、全worker/runtime artifact/component、backend attestationを検証し、欠損・変更・symlink・checked treeへの追加時にworker起動前にfail closedとする。project licenseはrelease manifestで個別にchecksum attestし、依存componentの権利情報を列挙する`THIRD_PARTY_LICENSES.txt`とは明確に分離する。
 
@@ -1490,6 +1495,7 @@ schema、commit、全必須metric、conservation、総合passを再検証して�
 
 ## 26. 更新履歴
 
+- 2026-07-24: Issue #87としてMilestone 4 release candidate `v0.4.0-rc.1`を確定。product / Rust / Go / Web adapterを同期し、protocol / graph `1.0`、store schema `11`、cache contract `1`と各Milestone 4 schemaをrelease manifestへ固定した。公式`v0.2.0-rc.1` packageで生成したschema `5` store fixtureをpackage gateでschema `11`へ移行し、completed snapshot、node/site/edge/evidence、immutable ID、queryを保全する。snapshot/diff/impact、watcher/incremental、clean policy GitHub annotation、runtime validate/import/filter、決定的GraphML stdout/atomic file出力をpackaged binaryで実行し、全target archive / checksum / manifest / SBOM / license / attestationのaggregate verificationへ閉じる。migration、rollback、安全境界、性能、既知制約をrelease noteへ集約した。
 - 2026-07-24: Issue #86として決定的な10,000 source-file fixtureと`depgraph-benchmark-report-v1`を実装。fresh-store initial、watcher daemon経由の1-file incremental、cold/warm file/package impactを複数sampleで分離し、platform / runner / toolchain / cache条件とraw timingを記録する。median ceiling、1 bounded outlier、20% hard noise allowanceで明確な回帰だけをfailさせる。変更fileのcontent hash更新を要求しつつ、それ以外のgraph topology、dependency site、edge、evidence、coverage digest保存を検証する。PR CIとreleaseで同じreportをartifact化し、release asset検証前にschema / commit / metric / conservationを再検証する。
 - 2026-07-24: Issue #85として決定的なGraphML 1.0 exporterを実装。node / edgeのstable ID、kind、phase、profile、condition、precision、resolutionをtyped keyへ、完全なprofile / dependency site / evidenceと所有参照をcanonical JSONへ保持し、GraphML単体で再構成可能にした。XML-safeなgenerated element ID、XML 1.0特殊文字escape、Unicode保持、invalid control fail-closed、stable sort、record/text単位のbounded streaming writer、成功後だけdestinationを置換するatomic file outputを追加し、golden、round-trip、入力順非依存決定性、大容量chunk、runtime filter、CLI stdout / file E2Eで固定した。既存JSON / DOT / Mermaid出力は変更していない。
 - 2026-07-24: Issue #84としてruntime evidenceのschema v11 store unionを実装。validated traceをruntime child profile、observed site/edge、per-session evidence、runtime-only sentinel、partial/conflict/unmatched diagnosticへ変換し、session/graph/import/completed snapshot/current pointerを単一transactionでpromotionする。同一session再importのidempotence、複数sessionのgraph dedupとcount/time range集約、static/semantic/build非上書き、失敗promotion全rollbackを固定した。deps/dependents/why/impact/exportへphase/profile/session/environment filter、diffのruntime phase比較、snapshot metadataのruntime source/sessionを追加し、JSON/DOT/Mermaidとsession-filtered evidenceを決定的に出力する。v1/v7/v8→v11 migration、promotion failure、multi-session、malformed input、query/export/diff repeatabilityをstore/core/CLI testで検証した。

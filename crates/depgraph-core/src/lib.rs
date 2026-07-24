@@ -21,10 +21,11 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use depgraph_store::{
     AdapterLogRecord, CACHE_CONTRACT_VERSION, CacheEntryCounts, CacheEventRecord, CoverageRecord,
-    DiagnosticRecord, FileCoverageRecord, ProfileMatrixRecord, ProfileRecord, Store,
+    DiagnosticRecord, FileCoverageRecord, ProfileMatrixRecord, ProfileRecord,
+    SNAPSHOT_DIFF_SCHEMA_VERSION, STORE_SCHEMA_VERSION, Store,
 };
 use serde::{Deserialize, Serialize};
 
@@ -51,6 +52,7 @@ pub use depgraph_store::GraphSnapshot;
 pub use export::{
     ExportFormat, export, export_filtered, export_graphml_filtered_to_writer, filter_snapshot,
 };
+pub use graphml::GRAPHML_SCHEMA_VERSION;
 pub use impact::{
     ChangedNodeMapping, GitChange, GitChangedSet, ImpactDiagnostic, ImpactFilters, ImpactNode,
     ImpactResult, impact, map_changed_set, read_git_changed_set,
@@ -148,11 +150,49 @@ pub struct ReleaseHealth {
     pub version: String,
     pub target: String,
     pub schema_version: String,
+    pub compatibility: ReleaseCompatibilityHealth,
+    pub compatibility_integrity: String,
     pub license_expression: String,
     pub core_integrity: String,
     pub schema_integrity: String,
     pub runtime_integrity: BTreeMap<String, String>,
     pub runtime_requirements: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReleaseCompatibilityHealth {
+    pub store_schema_version: i64,
+    pub minimum_migratable_store_schema_version: i64,
+    pub previous_release_version: String,
+    pub previous_release_store_schema_version: i64,
+    pub cache_contract_version: u32,
+    pub snapshot_diff_schema_version: String,
+    pub incremental_plan_schema_version: String,
+    pub daemon_status_schema_version: String,
+    pub policy_schema_version: String,
+    pub policy_result_schema_version: String,
+    pub runtime_trace_schema_version: String,
+    pub graphml_schema_version: String,
+    pub packaged_smoke_contract: String,
+}
+
+pub fn release_compatibility_contract() -> ReleaseCompatibilityHealth {
+    ReleaseCompatibilityHealth {
+        store_schema_version: STORE_SCHEMA_VERSION,
+        minimum_migratable_store_schema_version: 1,
+        previous_release_version: "0.2.0-rc.1".to_owned(),
+        previous_release_store_schema_version: 5,
+        cache_contract_version: CACHE_CONTRACT_VERSION,
+        snapshot_diff_schema_version: SNAPSHOT_DIFF_SCHEMA_VERSION.to_owned(),
+        incremental_plan_schema_version: INCREMENTAL_PLAN_SCHEMA_VERSION.to_owned(),
+        daemon_status_schema_version: DAEMON_STATUS_SCHEMA_VERSION.to_owned(),
+        policy_schema_version: POLICY_SCHEMA_VERSION.to_owned(),
+        policy_result_schema_version: POLICY_RESULT_SCHEMA_VERSION.to_owned(),
+        runtime_trace_schema_version: RUNTIME_TRACE_SCHEMA_VERSION.to_owned(),
+        graphml_schema_version: GRAPHML_SCHEMA_VERSION.to_owned(),
+        packaged_smoke_contract: "milestone4-packaged-smoke-v1".to_owned(),
+    }
 }
 
 #[derive(Debug)]
@@ -294,7 +334,7 @@ pub async fn doctor(store: &Store) -> Result<DoctorReport> {
         workers,
         latest_attempt,
         latest_successful_scan_id: store.latest_successful_id()?,
-        release: release_health(),
+        release: release_health()?,
     })
 }
 
@@ -328,6 +368,7 @@ struct ReleaseManifest {
     release_version: String,
     protocol_version: String,
     schema_version: String,
+    compatibility: ReleaseCompatibilityHealth,
     target: String,
     license_expression: String,
     project_licenses: Vec<ReleaseArtifact>,
@@ -392,8 +433,10 @@ fn worker_integrity(
     artifact: &Path,
     reported_version: Option<&str>,
 ) -> String {
-    let Some((manifest_path, manifest)) = load_release_manifest() else {
-        return "development-unverified".to_owned();
+    let (manifest_path, manifest) = match load_release_manifest() {
+        Ok(Some(release)) => release,
+        Ok(None) => return "development-unverified".to_owned(),
+        Err(error) => return format!("error: {error:#}"),
     };
     if manifest.protocol_version != "1.0" {
         return format!(
@@ -407,6 +450,9 @@ fn worker_integrity(
             manifest.release_version,
             env!("CARGO_PKG_VERSION")
         );
+    }
+    if let Err(error) = verify_release_compatibility(&manifest.compatibility) {
+        return format!("error: {error:#}");
     }
     let Some(entry) = manifest
         .workers
@@ -506,26 +552,51 @@ fn worker_integrity(
     "verified".to_owned()
 }
 
-fn load_release_manifest() -> Option<(PathBuf, ReleaseManifest)> {
-    let executable = std::env::current_exe().ok()?;
-    let parent = executable.parent()?;
+fn parse_release_manifest(path: &Path) -> Result<ReleaseManifest> {
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read release manifest {}", path.display()))?;
+    serde_json::from_str(&raw)
+        .with_context(|| format!("invalid release manifest {}", path.display()))
+}
+
+fn load_release_manifest() -> Result<Option<(PathBuf, ReleaseManifest)>> {
+    let executable =
+        std::env::current_exe().context("failed to locate the running depgraph executable")?;
+    let parent = executable
+        .parent()
+        .context("running depgraph executable has no parent directory")?;
     for candidate in [
         parent.join("release-manifest.json"),
         parent.join("../release-manifest.json"),
     ] {
-        if let Ok(raw) = std::fs::read_to_string(&candidate)
-            && let Ok(manifest) = serde_json::from_str(&raw)
-        {
-            return Some((candidate, manifest));
+        match std::fs::symlink_metadata(&candidate) {
+            Ok(_) => {
+                return Ok(Some((
+                    candidate.clone(),
+                    parse_release_manifest(&candidate)?,
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to inspect release manifest candidate {}",
+                        candidate.display()
+                    )
+                });
+            }
         }
     }
-    None
+    Ok(None)
 }
 
-fn release_health() -> Option<ReleaseHealth> {
-    let (manifest_path, manifest) = load_release_manifest()?;
+fn release_health() -> Result<Option<ReleaseHealth>> {
+    let Some((manifest_path, manifest)) = load_release_manifest()? else {
+        return Ok(None);
+    };
     let root = manifest_path.parent().unwrap_or(Path::new("."));
-    let executable = std::env::current_exe().ok()?;
+    let executable =
+        std::env::current_exe().context("failed to locate the running depgraph executable")?;
     let mut runtime_integrity: BTreeMap<String, String> = manifest
         .project_licenses
         .iter()
@@ -558,16 +629,33 @@ fn release_health() -> Option<ReleaseHealth> {
         };
         runtime_integrity.insert(key, integrity);
     }
-    Some(ReleaseHealth {
+    let compatibility_integrity = verify_release_compatibility(&manifest.compatibility)
+        .map(|()| "verified".to_owned())
+        .unwrap_or_else(|error| format!("error: {error:#}"));
+    Ok(Some(ReleaseHealth {
         version: manifest.release_version,
         target: manifest.target,
         schema_version: manifest.schema_version,
+        compatibility: manifest.compatibility,
+        compatibility_integrity,
         license_expression: manifest.license_expression,
         core_integrity: artifact_integrity(root, &manifest.core, Some(&executable)),
         schema_integrity: artifact_integrity(root, &manifest.schema, None),
         runtime_integrity,
         runtime_requirements: manifest.runtime_requirements,
-    })
+    }))
+}
+
+pub(crate) fn verify_release_compatibility(
+    compatibility: &ReleaseCompatibilityHealth,
+) -> Result<()> {
+    let expected = release_compatibility_contract();
+    if compatibility != &expected {
+        anyhow::bail!(
+            "release compatibility metadata does not match the core contract: expected {expected:?}, found {compatibility:?}"
+        );
+    }
+    Ok(())
 }
 
 fn artifact_integrity(root: &Path, artifact: &ReleaseArtifact, expected: Option<&Path>) -> String {
@@ -619,8 +707,9 @@ mod tests {
     use std::{ffi::OsString, path::PathBuf};
 
     use super::{
-        AdapterKind, DoctorWorkerLocation, parse_worker_handshake, preflight_doctor_workers,
-        suppressed_worker_health, worker,
+        AdapterKind, DoctorWorkerLocation, parse_release_manifest, parse_worker_handshake,
+        preflight_doctor_workers, release_compatibility_contract, suppressed_worker_health,
+        verify_release_compatibility, worker,
     };
 
     fn test_worker_spec(adapter: AdapterKind) -> worker::WorkerSpec {
@@ -648,6 +737,50 @@ mod tests {
             Some(("depgraph-go-worker", "0.1.0", "1.00"))
         );
         assert_eq!(parse_worker_handshake("depgraph-go-worker 0.1.0"), None);
+    }
+
+    #[test]
+    fn release_compatibility_contract_rejects_drift() {
+        let compatible = release_compatibility_contract();
+        verify_release_compatibility(&compatible).unwrap();
+
+        let mut drifted = compatible;
+        drifted.store_schema_version += 1;
+        assert!(
+            verify_release_compatibility(&drifted)
+                .unwrap_err()
+                .to_string()
+                .contains("does not match")
+        );
+    }
+
+    #[test]
+    fn stale_release_manifest_is_an_explicit_parse_error() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let manifest_path = temp.path().join("release-manifest.json");
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "release_version": "0.2.0-rc.1",
+                "protocol_version": "1.0",
+                "schema_version": "1.0",
+                "target": "legacy-target",
+                "license_expression": "MIT OR Apache-2.0",
+                "project_licenses": [],
+                "core": {"path": "bin/depgraph", "sha256": "legacy"},
+                "schema": {"path": "schemas/depgraph-protocol-v1.schema.json", "sha256": "legacy"},
+                "workers": [],
+            }))?,
+        )?;
+
+        let error = match parse_release_manifest(&manifest_path) {
+            Ok(_) => panic!("stale manifest unexpectedly parsed"),
+            Err(error) => error,
+        };
+        let message = format!("{error:#}");
+        assert!(message.contains("invalid release manifest"));
+        assert!(message.contains("missing field `compatibility`"));
+        Ok(())
     }
 
     #[test]

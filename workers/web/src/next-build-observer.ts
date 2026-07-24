@@ -1098,7 +1098,7 @@ export function nextBuildProtocolEvents(
     protocol_version: "1.0" as const,
     scan_id: provenance.build_run_id,
     adapter: "web" as const,
-    adapter_version: "0.2.0-rc.1" as const,
+    adapter_version: "0.4.0-rc.1" as const,
   };
   let seq = 0;
   const event = (kind: string, payload: Record<string, unknown>): ProtocolEvent => ({

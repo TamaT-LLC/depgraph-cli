@@ -41,7 +41,7 @@ pub use runtime::{
     runtime_context_for_edge,
 };
 
-const SCHEMA_VERSION: i64 = 11;
+pub const STORE_SCHEMA_VERSION: i64 = 11;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ScanRecord {
@@ -322,9 +322,9 @@ impl Store {
         })?;
         let store = Self { connection };
         let current = store.schema_version()?;
-        if current != SCHEMA_VERSION {
+        if current != STORE_SCHEMA_VERSION {
             bail!(
-                "store schema {current} does not match supported read-only schema {SCHEMA_VERSION}"
+                "store schema {current} does not match supported read-only schema {STORE_SCHEMA_VERSION}"
             );
         }
         Ok(store)
@@ -350,8 +350,8 @@ impl Store {
              PRAGMA synchronous = NORMAL;",
         )?;
         let current = self.schema_version()?;
-        if current > SCHEMA_VERSION {
-            bail!("store schema {current} is newer than supported schema {SCHEMA_VERSION}");
+        if current > STORE_SCHEMA_VERSION {
+            bail!("store schema {current} is newer than supported schema {STORE_SCHEMA_VERSION}");
         }
         if current == 0 {
             let tx = self.connection.transaction()?;

@@ -24,8 +24,10 @@ use tokio::{
 use walkdir::{DirEntry, WalkDir};
 
 use crate::{
+    ReleaseCompatibilityHealth,
     cancellation::CancellationToken,
     config::{ProfileConfig, ScanConfig},
+    verify_release_compatibility,
 };
 
 pub(crate) const RUST_BACKEND_KIND: &str = "rust-analyzer-library";
@@ -379,6 +381,7 @@ struct BundledManifest {
     release_version: String,
     protocol_version: String,
     schema_version: String,
+    compatibility: ReleaseCompatibilityHealth,
     target: String,
     license_expression: String,
     project_licenses: Vec<BundledArtifact>,
@@ -509,6 +512,8 @@ fn locate_verified_bundled_worker_for_executable(
             manifest.protocol_version
         );
     }
+    verify_release_compatibility(&manifest.compatibility)
+        .context("security policy violation: release manifest compatibility is incompatible")?;
     if manifest.schema_version != "1.0" || manifest.target.trim().is_empty() {
         bail!(
             "security policy violation: release manifest has an incompatible schema or empty target"
@@ -6213,6 +6218,7 @@ mod tests {
                 "release_version": env!("CARGO_PKG_VERSION"),
                 "protocol_version": "1.0",
                 "schema_version": "1.0",
+                "compatibility": crate::release_compatibility_contract(),
                 "target": "test-target",
                 "license_expression": PROJECT_LICENSE_EXPRESSION,
                 "project_licenses": [apache_license, mit_license],
@@ -8603,6 +8609,36 @@ mod tests {
             locate_verified_bundled_worker(AdapterKind::Go, &test_release.manifest).unwrap_err();
         assert!(error.to_string().contains("has no web worker"));
         assert!(is_security_error(&error.to_string()));
+        Ok(())
+    }
+
+    #[test]
+    fn bundled_release_requires_the_exact_core_compatibility_contract() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let release = temp.path().join("release");
+        let test_release = write_test_release_manifest(&release, Vec::new(), Vec::new())?;
+
+        update_test_manifest(&test_release.manifest, |manifest| {
+            manifest["compatibility"]["store_schema_version"] =
+                Value::Number((depgraph_store::STORE_SCHEMA_VERSION + 1).into());
+            Ok(())
+        })?;
+        let drifted =
+            locate_verified_bundled_worker(AdapterKind::Go, &test_release.manifest).unwrap_err();
+        assert!(drifted.to_string().contains("compatibility"));
+        assert!(is_security_error(&drifted.to_string()));
+
+        update_test_manifest(&test_release.manifest, |manifest| {
+            manifest
+                .as_object_mut()
+                .context("test manifest is not an object")?
+                .remove("compatibility");
+            Ok(())
+        })?;
+        let missing =
+            locate_verified_bundled_worker(AdapterKind::Go, &test_release.manifest).unwrap_err();
+        assert!(missing.to_string().contains("invalid release manifest"));
+        assert!(is_security_error(&missing.to_string()));
         Ok(())
     }
 
