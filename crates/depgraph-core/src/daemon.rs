@@ -32,8 +32,8 @@ use crate::{
     plan_incremental_invalidation, run_scan_with_cache_mode_and_cancellation,
     scan::{cancel_scan, complete_scan, git_source_revision},
     worker::{
-        AdapterKind, execute_worker_delta_with_cancellation, locate_worker, probe_worker_version,
-        worker_capabilities,
+        AdapterKind, execute_worker_delta_with_cancellation, locate_worker,
+        probe_worker_version_with_cancellation, worker_capabilities,
     },
 };
 
@@ -633,14 +633,18 @@ impl IncrementalWorkerExecutor for ProcessIncrementalWorkerExecutor {
                     });
                 }
             };
-            let handshake = match probe_worker_version(&spec, &root).await {
-                Ok(handshake) => handshake,
-                Err(error) => {
-                    return Ok(IncrementalWorkerOutcome::Unsupported {
-                        reason: format!("delta capability probe failed: {error:#}"),
-                    });
-                }
-            };
+            let handshake =
+                match probe_worker_version_with_cancellation(&spec, &root, &cancellation).await {
+                    Ok(handshake) => handshake,
+                    Err(error) if cancellation.is_cancelled() => {
+                        return Err(error).context("delta capability probe was cancelled");
+                    }
+                    Err(error) => {
+                        return Ok(IncrementalWorkerOutcome::Unsupported {
+                            reason: format!("delta capability probe failed: {error:#}"),
+                        });
+                    }
+                };
             let core_capabilities = vec![WORKER_DELTA_CAPABILITY.to_owned()];
             let worker_capabilities = worker_capabilities(&handshake);
             if negotiate_worker_protocol(&core_capabilities, &worker_capabilities)

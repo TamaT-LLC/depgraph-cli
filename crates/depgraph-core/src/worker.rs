@@ -100,6 +100,7 @@ const WEB_SEMANTIC_CAPABILITIES: &[&str] = &[
     "tanstack-router-typed-route-v1",
     "tanstack-start-rpc-middleware-v1",
     "typescript-definition-import-type-call-graph-v2",
+    "worker-delta-v1",
 ];
 const WEB_SEMANTIC_RUNTIME_COMPONENTS: &[&str] = &[
     "astro-parser-wasm@4.0.0",
@@ -1474,8 +1475,15 @@ where
     F: Future<Output = std::io::Result<()>>,
 {
     let program = resolve_worker_program(spec, root)?;
+    tokio::pin!(cancellation);
     if let Some(requirement) = &spec.runtime_requirement {
-        let output = run_probe(&program, &[OsString::from("--version")], root).await?;
+        let output = run_probe_with_signal(
+            &program,
+            &[OsString::from("--version")],
+            root,
+            cancellation.as_mut(),
+        )
+        .await?;
         if !output.status.success() {
             bail!("Node.js runtime version check failed");
         }
@@ -1488,8 +1496,20 @@ where
     let mut delta_request_file = None;
     if let Some(request) = delta_request {
         request.validate().context("invalid worker delta request")?;
-        let mut file = tempfile::NamedTempFile::new_in(&neutral_cwd.path)
+        let mut file = tempfile::Builder::new()
+            .prefix("depgraph-worker-delta-")
+            .tempfile()
             .context("failed to create worker delta request file")?;
+        let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        let request_parent = file
+            .path()
+            .parent()
+            .context("worker delta request file has no parent")?
+            .canonicalize()
+            .context("failed to canonicalize worker delta request directory")?;
+        if request_parent.starts_with(&canonical_root) {
+            bail!("security policy violation: worker delta request file is inside the scan root");
+        }
         serde_json::to_writer(file.as_file_mut(), request)
             .context("failed to serialize worker delta request")?;
         file.as_file_mut()
@@ -1569,12 +1589,11 @@ where
         ),
         Cancelled(std::io::Result<()>),
     }
-    tokio::pin!(cancellation);
     let wait_result = tokio::select! {
         result = timeout(Duration::from_secs(config.worker_timeout_seconds), child.wait()) => {
             WaitResult::Process(result)
         }
-        signal = &mut cancellation => WaitResult::Cancelled(signal),
+        signal = cancellation.as_mut() => WaitResult::Cancelled(signal),
     };
     match wait_result {
         WaitResult::Process(Ok(Ok(status))) if !status.success() => {
@@ -1962,6 +1981,34 @@ pub(crate) async fn run_probe(
     arguments: &[OsString],
     root: &Path,
 ) -> Result<std::process::Output> {
+    let cancellation = std::future::pending::<std::io::Result<()>>();
+    tokio::pin!(cancellation);
+    run_probe_with_signal(program, arguments, root, cancellation.as_mut()).await
+}
+
+async fn run_probe_with_cancellation(
+    program: &OsStr,
+    arguments: &[OsString],
+    root: &Path,
+    cancellation: &CancellationToken,
+) -> Result<std::process::Output> {
+    let signal = async {
+        cancellation.cancelled().await;
+        Ok(())
+    };
+    tokio::pin!(signal);
+    run_probe_with_signal(program, arguments, root, signal.as_mut()).await
+}
+
+async fn run_probe_with_signal<F>(
+    program: &OsStr,
+    arguments: &[OsString],
+    root: &Path,
+    mut cancellation: std::pin::Pin<&mut F>,
+) -> Result<std::process::Output>
+where
+    F: Future<Output = std::io::Result<()>>,
+{
     let neutral_cwd = neutral_working_directory(root)?;
     let mut command = Command::new(program);
     command
@@ -1986,11 +2033,31 @@ pub(crate) async fn run_probe(
     let stderr = child.stderr.take().context("probe stderr is unavailable")?;
     let stdout_task = tokio::spawn(read_capped(stdout, 64 * 1024));
     let stderr_task = tokio::spawn(read_capped(stderr, 64 * 1024));
-    let status = match timeout(Duration::from_secs(5), child.wait()).await {
-        Ok(status) => status.context("failed to wait for runtime probe")?,
-        Err(_) => {
+    enum ProbeWait {
+        Process(
+            std::result::Result<
+                std::io::Result<std::process::ExitStatus>,
+                tokio::time::error::Elapsed,
+            >,
+        ),
+        Cancelled(std::io::Result<()>),
+    }
+    let status = match tokio::select! {
+        status = timeout(Duration::from_secs(5), child.wait()) => ProbeWait::Process(status),
+        signal = cancellation.as_mut() => ProbeWait::Cancelled(signal),
+    } {
+        ProbeWait::Process(Ok(status)) => status.context("failed to wait for runtime probe")?,
+        ProbeWait::Process(Err(_)) => {
             terminate_worker(&mut child, &guard).await;
             bail!("runtime probe timed out after 5 seconds");
+        }
+        ProbeWait::Cancelled(Ok(())) => {
+            terminate_worker(&mut child, &guard).await;
+            bail!("runtime probe cancelled");
+        }
+        ProbeWait::Cancelled(Err(error)) => {
+            terminate_worker(&mut child, &guard).await;
+            return Err(error).context("failed to listen for runtime probe cancellation");
         }
     };
     guard.terminate();
@@ -2069,9 +2136,24 @@ fn platform_neutral_working_directory() -> PathBuf {
 }
 
 pub(crate) async fn probe_worker_version(spec: &WorkerSpec, root: &Path) -> Result<String> {
+    let cancellation = CancellationToken::new();
+    probe_worker_version_with_cancellation(spec, root, &cancellation).await
+}
+
+pub(crate) async fn probe_worker_version_with_cancellation(
+    spec: &WorkerSpec,
+    root: &Path,
+    cancellation: &CancellationToken,
+) -> Result<String> {
     let program = resolve_worker_program(spec, root)?;
     if let Some(requirement) = &spec.runtime_requirement {
-        let node = run_probe(&program, &[OsString::from("--version")], root).await?;
+        let node = run_probe_with_cancellation(
+            &program,
+            &[OsString::from("--version")],
+            root,
+            cancellation,
+        )
+        .await?;
         if !node.status.success() {
             bail!("Node.js runtime version check failed");
         }
@@ -2081,7 +2163,7 @@ pub(crate) async fn probe_worker_version(spec: &WorkerSpec, root: &Path) -> Resu
     }
     let mut arguments = spec.leading_args.clone();
     arguments.push(OsString::from("--version"));
-    let output = run_probe(&program, &arguments, root).await?;
+    let output = run_probe_with_cancellation(&program, &arguments, root, cancellation).await?;
     if !output.status.success() {
         bail!(
             "worker version handshake failed: {}",
@@ -6365,6 +6447,49 @@ mod tests {
             )
             .is_empty()
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn worker_version_probe_honors_cancellation_without_waiting_for_timeout() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root)?;
+        let script = temp.path().join("slow-version-worker.sh");
+        std::fs::write(&script, "#!/bin/sh\nexec sleep 30\n")?;
+        let mut permissions = std::fs::metadata(&script)?.permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions)?;
+        let spec = WorkerSpec {
+            adapter: AdapterKind::Go,
+            program: script.clone().into_os_string(),
+            leading_args: Vec::new(),
+            display: script.display().to_string(),
+            artifact_path: script,
+            runtime_requirement: None,
+            expected_version: None,
+            release_attested: false,
+        };
+        let cancellation = CancellationToken::new();
+        let cancel = cancellation.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            cancel.cancel();
+        });
+
+        let started = std::time::Instant::now();
+        let error = probe_worker_version_with_cancellation(&spec, &root, &cancellation)
+            .await
+            .expect_err("the slow version probe should be cancelled");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "cancelled probe waited {:?}",
+            started.elapsed()
+        );
+        assert!(format!("{error:#}").contains("runtime probe cancelled"));
+        Ok(())
     }
 
     struct TestRelease {
