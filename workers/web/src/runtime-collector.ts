@@ -994,6 +994,9 @@ export function createRuntimeCollector(options: RuntimeCollectorOptions): Runtim
       }
       try {
         await options.sink.write(Buffer.from(payload, "utf8"), context);
+        if (controller.signal.aborted) {
+          return { status: "failed", prefixEnd, attempts: attempt + 1 };
+        }
         flushedPrefixes += 1;
         return { status: "flushed", prefixEnd, attempts: attempt + 1 };
       } catch {
@@ -1123,6 +1126,7 @@ export function createFileRuntimeCollectorSink(destination: string): RuntimeColl
         handle = undefined;
         if (context.signal.aborted) throw new Error("runtime collector write aborted");
         await rename(temporary, destination);
+        if (context.signal.aborted) throw new Error("runtime collector write aborted");
       } finally {
         await handle?.close().catch(() => undefined);
         await unlink(temporary).catch(() => undefined);
@@ -1145,6 +1149,7 @@ export function createStdoutRuntimeCollectorSink(
           else resolve();
         });
       });
+      if (context.signal.aborted) throw new Error("runtime collector write aborted");
     },
   };
 }
@@ -1168,6 +1173,7 @@ export function createOtlpRuntimeCollectorSink(
         },
         context.signal,
       );
+      if (context.signal.aborted) throw new Error("runtime collector write aborted");
     },
   };
 }

@@ -447,6 +447,46 @@ test("shutdown is bounded, idempotent, and never throws sink failures into the a
   assert.equal((await collector.shutdown()).status, "failed");
 });
 
+test("a sink resolving after the shutdown deadline cannot commit a successful flush", async () => {
+  const fixture = await readFixture("next");
+  let releaseWrite: (() => void) | undefined;
+  const writeGate = new Promise<void>((resolve) => {
+    releaseWrite = resolve;
+  });
+  let writeReturned: (() => void) | undefined;
+  const returned = new Promise<void>((resolve) => {
+    writeReturned = resolve;
+  });
+  const collector = createRuntimeCollector({
+    repository: fixture.repository,
+    session: fixture.session,
+    sink: {
+      kind: "stdout",
+      async write() {
+        await writeGate;
+        writeReturned?.();
+      },
+    },
+    clock: new StepClock("2026-07-24T00:00:00Z"),
+    shutdownTimeoutMs: 10,
+  });
+  assert(collector.record(basicObservation("src/late-success.ts")));
+
+  assert.deepEqual(await collector.shutdown(), {
+    status: "failed",
+    prefixEnd: 1,
+    attempts: 0,
+  });
+  assert.equal(collector.state, "stopped");
+  assert.equal(collector.stats().flushedPrefixes, 0);
+
+  releaseWrite?.();
+  await returned;
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(collector.state, "stopped");
+  assert.equal(collector.stats().flushedPrefixes, 0);
+});
+
 test("file, stdout, and OTLP sinks carry the same canonical trace bytes", async () => {
   const fixture = await readFixture("astro");
   const directory = await mkdtemp(path.join(tmpdir(), "depgraph-runtime-collector-"));
