@@ -18,6 +18,11 @@ graph for the same normalized observation. Base static/semantic nodes can be
 reused only byte-for-byte; conflicting identities reject the complete build
 delta.
 
+When a completed framework build layer becomes the next base, generated nodes
+with the same identity reuse the exact stored bytes and already-promoted site,
+edge, and diagnostic IDs are omitted. A stable site that points at a different
+target remains a conflict, so repeat builds are idempotent without hiding drift.
+
 Only an actually observed target is emitted as `resolved`. A computed or
 otherwise unmatched dynamic target uses a versioned `unknown_target`,
 `resolution_status=unresolved`, `precision=observed`, and a bounded coverage

@@ -11,6 +11,7 @@ import {
   frameworkBuildGeneratedNode,
   frameworkBuildProtocolEvents,
   frameworkBuildRelation,
+  reconcileFrameworkBuildBaseRecords,
   validateFrameworkBuildDelta,
   validateFrameworkBuildProvenance,
   type FrameworkBuildDescriptor,
@@ -166,6 +167,7 @@ export interface AstroBuildGraphInput {
   provenance: AstroBuildProvenance;
   baseNodes: readonly GraphNode[];
   baseEdges?: readonly GraphEdge[];
+  baseDiagnosticIds?: readonly string[];
 }
 
 export interface AstroBuildGraphDelta {
@@ -1174,7 +1176,7 @@ export function buildAstroObservedGraph(input: AstroBuildGraphInput): AstroBuild
     }
   }
 
-  const delta = {
+  const candidate = {
     astroVersion: observation.astro_version,
     viteVersions: [...new Set(observation.vite_builds.map((build) => build.vite_version))].sort(compareUtf8),
     nodes: [...nodes.values()].sort((left, right) => compareUtf8(left.id, right.id)),
@@ -1182,7 +1184,20 @@ export function buildAstroObservedGraph(input: AstroBuildGraphInput): AstroBuild
     edges: uniqueById(edges, "web.astro_build_edge_conflict"),
     diagnostics: uniqueById(diagnostics, "web.astro_build_diagnostic_conflict"),
   };
+  let delta: AstroBuildGraphDelta;
   try {
+    delta = {
+      astroVersion: candidate.astroVersion,
+      viteVersions: candidate.viteVersions,
+      ...reconcileFrameworkBuildBaseRecords(
+        candidate,
+        ASTRO_FRAMEWORK_BUILD_DESCRIPTOR,
+        input.provenance,
+        input.baseNodes,
+        input.baseEdges ?? [],
+        input.baseDiagnosticIds,
+      ),
+    };
     validateFrameworkBuildDelta(
       delta,
       ASTRO_FRAMEWORK_BUILD_DESCRIPTOR,

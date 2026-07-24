@@ -394,6 +394,7 @@ pub async fn web_build_protocol_ndjson(
         },
         "base_nodes": snapshot.nodes,
         "base_edges": snapshot.edges,
+        "base_diagnostic_ids": snapshot.diagnostics.iter().map(|diagnostic| &diagnostic.id).collect::<Vec<_>>(),
         "profile": {
             "parent_profile_id": parent.id,
             "effective_input_id": canonical_effective_input_id(parent),

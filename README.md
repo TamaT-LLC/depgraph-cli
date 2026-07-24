@@ -395,7 +395,9 @@ Validated observer output uses the shared `framework-build-graph-v1` contract:
 profile/conditions, and primary `kind=build` evidence tied to the supervisor
 audit digests. Generated node, site, and edge IDs exclude the attempt ID and
 include the contract version; matching source/semantic nodes are reused only
-when byte-identical. A dynamic target that was not observed is retained as an
+when byte-identical. Repeated builds reuse the exact stored generated nodes and
+omit already-promoted site, edge, and diagnostic IDs; a stable site with a new
+target remains a conflict. A dynamic target that was not observed is retained as an
 `unresolved` edge to an `unknown_target` with a bounded reason, never promoted
 to a guessed `resolved` edge. The Next/Astro/TanStack Start observer entrypoints
 and their observation-to-protocol converter are separate checksum-attested

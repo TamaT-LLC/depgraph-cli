@@ -38,6 +38,7 @@ interface BuildEvidenceInput {
   provenance: NextBuildProvenance | AstroBuildProvenance | TanStackStartBuildProvenance;
   base_nodes: GraphNode[];
   base_edges: GraphEdge[];
+  base_diagnostic_ids: string[];
   profile: BuildProfileContract;
 }
 
@@ -60,7 +61,10 @@ function parseInput(value: unknown): BuildEvidenceInput {
   }
   const baseNodes = input.base_nodes;
   const baseEdges = input.base_edges;
-  if (!Array.isArray(baseNodes) || !Array.isArray(baseEdges)) throw new Error("invalid-base-graph");
+  const baseDiagnosticIds = input.base_diagnostic_ids;
+  if (!Array.isArray(baseNodes) || !Array.isArray(baseEdges) || !Array.isArray(baseDiagnosticIds)) {
+    throw new Error("invalid-base-graph");
+  }
   const profile = record(input.profile);
   const environment = record(profile.environment) as Record<string, JsonValue>;
   return {
@@ -71,6 +75,7 @@ function parseInput(value: unknown): BuildEvidenceInput {
     provenance: record(input.provenance) as unknown as BuildEvidenceInput["provenance"],
     base_nodes: baseNodes as GraphNode[],
     base_edges: baseEdges as GraphEdge[],
+    base_diagnostic_ids: [...new Set(baseDiagnosticIds.map(boundedString))],
     profile: {
       parent_profile_id: boundedString(profile.parent_profile_id),
       effective_input_id: boundedString(profile.effective_input_id),
@@ -99,6 +104,7 @@ function convert(input: BuildEvidenceInput): ProtocolEvent[] {
     provenance: input.provenance,
     baseNodes: input.base_nodes,
     baseEdges: input.base_edges,
+    baseDiagnosticIds: input.base_diagnostic_ids,
   };
   let events: ProtocolEvent[];
   switch (input.adapter) {

@@ -566,6 +566,67 @@ function validateGeneratedNode(
   }
 }
 
+function withoutBuildProvenance(node: GraphNode): GraphNode {
+  const properties = { ...node.properties };
+  delete properties.build_provenance;
+  return { ...node, properties };
+}
+
+/**
+ * Makes a repeated framework build idempotent against an already promoted
+ * build layer. Stable generated nodes reuse the exact stored bytes, while
+ * sites, edges, and diagnostics that already exist are omitted from the new
+ * delta. A changed target for an existing stable site remains a conflict.
+ */
+export function reconcileFrameworkBuildBaseRecords(
+  delta: FrameworkBuildDelta,
+  descriptor: FrameworkBuildDescriptor,
+  provenance: FrameworkBuildProvenance,
+  baseNodes: readonly GraphNode[],
+  baseEdges: readonly GraphEdge[],
+  baseDiagnosticIds: readonly string[] = [],
+): FrameworkBuildDelta {
+  const baseNodeById = new Map(baseNodes.map((node) => [node.id, node]));
+  const nodes = delta.nodes.map((node) => {
+    const existing = baseNodeById.get(node.id);
+    if (existing === undefined || sameJson(existing, node)) return node;
+    if (node.properties.build_generated !== true
+      || existing.properties.build_generated !== true
+      || !sameJson(withoutBuildProvenance(existing), withoutBuildProvenance(node))) {
+      throw new Error(`framework build graph conflicts with base node ${node.id}`);
+    }
+    return existing;
+  });
+
+  const nodeReconciled = { ...delta, nodes };
+  validateFrameworkBuildDelta(nodeReconciled, descriptor, provenance, baseNodes);
+
+  const baseBuildEdges = baseEdges.filter((edge) => edge.phase === "build" && edge.site_id !== null);
+  const baseEdgeIds = new Set(baseBuildEdges.map((edge) => edge.id));
+  const baseSiteIds = new Set(baseBuildEdges.map((edge) => edge.site_id!));
+  const edgeBySite = new Map(delta.edges.map((edge) => [edge.site_id!, edge]));
+  const retainedSiteIds = new Set<string>();
+  const sites = delta.sites.filter((site) => {
+    const edge = edgeBySite.get(site.id);
+    if (edge === undefined) {
+      throw new Error(`framework build site ${site.id} has no edge during base reconciliation`);
+    }
+    const siteExists = baseSiteIds.has(site.id);
+    const edgeExists = baseEdgeIds.has(edge.id);
+    if (siteExists !== edgeExists) {
+      throw new Error(`framework build site ${site.id} conflicts with an existing evidence layer`);
+    }
+    if (!siteExists) retainedSiteIds.add(site.id);
+    return !siteExists;
+  });
+  const edges = delta.edges.filter((edge) => retainedSiteIds.has(edge.site_id!));
+  const existingDiagnostics = new Set(baseDiagnosticIds);
+  const diagnostics = delta.diagnostics.filter((diagnostic) => !existingDiagnostics.has(diagnostic.id));
+  const reconciled = { nodes, sites, edges, diagnostics };
+  validateFrameworkBuildDelta(reconciled, descriptor, provenance, baseNodes);
+  return reconciled;
+}
+
 /** Validates the full dynamic framework build delta before protocol emission. */
 export function validateFrameworkBuildDelta(
   delta: FrameworkBuildDelta,

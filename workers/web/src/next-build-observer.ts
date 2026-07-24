@@ -11,6 +11,7 @@ import {
   frameworkBuildGeneratedNode,
   frameworkBuildProtocolEvents,
   frameworkBuildRelation,
+  reconcileFrameworkBuildBaseRecords,
   validateFrameworkBuildDelta,
   type FrameworkBuildDescriptor,
 } from "./framework-build-contract";
@@ -203,6 +204,7 @@ export interface NextBuildGraphInput {
   provenance: NextBuildProvenance;
   baseNodes: readonly GraphNode[];
   baseEdges?: readonly GraphEdge[];
+  baseDiagnosticIds?: readonly string[];
 }
 
 export interface NextBuildGraphDelta {
@@ -1034,14 +1036,26 @@ export function buildNextObservedGraph(input: NextBuildGraphInput): NextBuildGra
     );
   }
 
-  const delta = {
+  const candidate = {
     nextVersion: input.observation.next_version,
     nodes: [...nodes.values()].sort((left, right) => compareUtf8(left.id, right.id)),
     sites: uniqueById(sites, "web.next_build_site_conflict"),
     edges: uniqueById(edges, "web.next_build_edge_conflict"),
     diagnostics: uniqueById(diagnostics, "web.next_build_diagnostic_conflict"),
   };
+  let delta: NextBuildGraphDelta;
   try {
+    delta = {
+      nextVersion: candidate.nextVersion,
+      ...reconcileFrameworkBuildBaseRecords(
+        candidate,
+        NEXT_FRAMEWORK_BUILD_DESCRIPTOR,
+        input.provenance,
+        input.baseNodes,
+        input.baseEdges ?? [],
+        input.baseDiagnosticIds,
+      ),
+    };
     validateFrameworkBuildDelta(
       delta,
       NEXT_FRAMEWORK_BUILD_DESCRIPTOR,

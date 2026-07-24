@@ -11,6 +11,7 @@ import {
   frameworkBuildGeneratedNode,
   frameworkBuildProtocolEvents,
   frameworkBuildRelation,
+  reconcileFrameworkBuildBaseRecords,
   validateFrameworkBuildDelta,
   validateFrameworkBuildProvenance,
   type FrameworkBuildDescriptor,
@@ -166,6 +167,7 @@ export interface TanStackStartBuildGraphInput {
   provenance: TanStackStartBuildProvenance;
   baseNodes: readonly GraphNode[];
   baseEdges?: readonly GraphEdge[];
+  baseDiagnosticIds?: readonly string[];
 }
 
 export interface TanStackStartBuildGraphDelta {
@@ -1213,7 +1215,7 @@ export function buildTanStackStartObservedGraph(
     ));
   }
 
-  const delta = {
+  const candidate = {
     startVersion: observation.start_version,
     viteVersions: [...new Set(observation.builds.map((build) => build.vite_version))].sort(compareUtf8),
     nodes: [...nodes.values()].sort((left, right) => compareUtf8(left.id, right.id)),
@@ -1221,7 +1223,20 @@ export function buildTanStackStartObservedGraph(
     edges: uniqueById(edges, "web.tanstack_start_build_edge_conflict"),
     diagnostics: uniqueById(diagnostics, "web.tanstack_start_build_diagnostic_conflict"),
   };
+  let delta: TanStackStartBuildGraphDelta;
   try {
+    delta = {
+      startVersion: candidate.startVersion,
+      viteVersions: candidate.viteVersions,
+      ...reconcileFrameworkBuildBaseRecords(
+        candidate,
+        TANSTACK_START_FRAMEWORK_BUILD_DESCRIPTOR,
+        input.provenance,
+        input.baseNodes,
+        input.baseEdges ?? [],
+        input.baseDiagnosticIds,
+      ),
+    };
     validateFrameworkBuildDelta(
       delta,
       TANSTACK_START_FRAMEWORK_BUILD_DESCRIPTOR,

@@ -9,6 +9,7 @@ import {
   frameworkBuildProtocolEvents,
   frameworkBuildRelation,
   frameworkBuildUnresolvedTarget,
+  reconcileFrameworkBuildBaseRecords,
   validateFrameworkBuildDelta,
   type FrameworkBuildDescriptor,
   type FrameworkBuildProvenance,
@@ -207,5 +208,75 @@ test("base conflicts and partial or unsupported build completion fail closed", (
   assert.throws(
     () => frameworkBuildCoverage([], { status: "unsupported", reason: null }),
     /requires a bounded reason/u,
+  );
+});
+
+test("a repeated build reuses exact base nodes and omits existing evidence layers", () => {
+  const first = resolvedDelta();
+  validateFrameworkBuildDelta(first, descriptor, provenance, [source]);
+  const repeatedProvenance = { ...provenance, build_run_id: "repeat-build-run" };
+  const repeated = resolvedDelta(repeatedProvenance);
+  const reconciled = reconcileFrameworkBuildBaseRecords(
+    repeated,
+    descriptor,
+    repeatedProvenance,
+    first.nodes,
+    first.edges,
+  );
+
+  assert.deepEqual(reconciled.nodes, first.nodes);
+  assert.deepEqual(reconciled.sites, []);
+  assert.deepEqual(reconciled.edges, []);
+  validateFrameworkBuildDelta(reconciled, descriptor, repeatedProvenance, first.nodes);
+
+  const evidence = repeated.sites[0]!.evidence[0]!;
+  const alternateTarget = frameworkBuildGeneratedNode(
+    descriptor,
+    "file",
+    {
+      framework: "tanstack-router",
+      artifact_kind: "route-chunk",
+      logical_path: "dist/routes/alternate.js",
+      artifact_digest: "1".repeat(64),
+      profile_id: repeatedProvenance.profile_id,
+    },
+    "dist/routes/alternate.js",
+    {
+      framework: "tanstack-router",
+      artifact_kind: "route-chunk",
+      logical_path: "dist/routes/alternate.js",
+      artifact_digest: "1".repeat(64),
+      profile_id: repeatedProvenance.profile_id,
+    },
+    repeatedProvenance,
+    "dist/routes/alternate.js",
+    "1".repeat(64),
+  );
+  const alternateRelation = frameworkBuildRelation(
+    descriptor,
+    source.id,
+    alternateTarget.id,
+    "emits",
+    "dist/routes/safe.js",
+    "browser",
+    frameworkBuildCondition("browser", { "tanstack.router.route": "/safe" }),
+    evidence,
+    repeatedProvenance.profile_id,
+  );
+  const changedTarget = {
+    nodes: [...repeated.nodes, alternateTarget],
+    sites: [alternateRelation.site],
+    edges: [alternateRelation.edge],
+    diagnostics: [],
+  };
+  assert.throws(
+    () => reconcileFrameworkBuildBaseRecords(
+      changedTarget,
+      descriptor,
+      repeatedProvenance,
+      first.nodes,
+      first.edges,
+    ),
+    /existing evidence layer/u,
   );
 });
