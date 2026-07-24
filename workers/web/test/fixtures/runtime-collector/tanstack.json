@@ -1,0 +1,43 @@
+{
+  "framework": "tanstack",
+  "repository": {
+    "identity": "workspace://repository:tanstack",
+    "revision": "tanstack-revision"
+  },
+  "session": {
+    "id": "tanstack-runtime-001",
+    "profile": {
+      "language": "typescript",
+      "target": "server",
+      "features": ["tanstack-start", "tanstack-router"]
+    },
+    "environment": {
+      "name": "production",
+      "runtime": "nodejs-24",
+      "region": "fra1",
+      "environmentKeys": ["NODE_ENV"]
+    },
+    "redaction": {
+      "environmentKeys": ["NODE_ENV"],
+      "secretNames": ["RPC_TOKEN"]
+    }
+  },
+  "observations": [
+    {
+      "kind": "rpc",
+      "source": {
+        "kind": "repository_path",
+        "path": "app/routes/api.users.ts",
+        "nodeKind": "server_function"
+      },
+      "target": {
+        "kind": "http_url",
+        "url": "https://fixture-user:fixture-password@RPC.EXAMPLE.TEST/v1/users?tenant=private"
+      },
+      "redaction": {
+        "headerNames": ["authorization"],
+        "secretNames": ["RPC_TOKEN"]
+      }
+    }
+  ]
+}

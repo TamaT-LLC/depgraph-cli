@@ -748,6 +748,85 @@ fn runtime_validate_matches_golden_trace_without_mutating_the_store() {
 }
 
 #[test]
+fn node_reference_collector_trace_passes_runtime_validate_and_import() {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let store_path = cache.path().join("graph.db");
+    seed_runtime_trace_snapshot(&store_path, root.path());
+    let trace = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../workers/web/test/fixtures/runtime-collector/next.expected.json");
+
+    let validate = Command::cargo_bin("depgraph")
+        .unwrap()
+        .args([
+            "--store",
+            store_path.to_str().unwrap(),
+            "runtime",
+            "validate",
+            trace.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        validate.status.success(),
+        "{}",
+        String::from_utf8_lossy(&validate.stderr)
+    );
+    let validate: serde_json::Value = serde_json::from_slice(&validate.stdout).unwrap();
+    assert_eq!(validate["command"], "runtime.validate");
+    assert_eq!(validate["data"]["summary"]["events"], 4);
+    assert_eq!(validate["data"]["profile_match"]["status"], "resolved");
+
+    let import = Command::cargo_bin("depgraph")
+        .unwrap()
+        .args([
+            "--store",
+            store_path.to_str().unwrap(),
+            "runtime",
+            "import",
+            trace.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        import.status.success(),
+        "{}",
+        String::from_utf8_lossy(&import.stderr)
+    );
+    let import: serde_json::Value = serde_json::from_slice(&import.stdout).unwrap();
+    assert_eq!(import["command"], "runtime.import");
+    assert_eq!(import["data"]["deduplicated"], false);
+    assert!(
+        import["data"]["session_id"]
+            .as_str()
+            .unwrap()
+            .starts_with("runtime-session:sha256:")
+    );
+    let snapshot_id = import["data"]["snapshot_id"].as_str().unwrap();
+    let snapshot = depgraph_store::Store::open(&store_path)
+        .unwrap()
+        .load_completed_snapshot(snapshot_id)
+        .unwrap();
+    assert_eq!(
+        snapshot
+            .edges
+            .iter()
+            .filter(|edge| edge.phase == "runtime")
+            .count(),
+        4
+    );
+    assert!(snapshot.evidence.iter().any(|evidence| {
+        evidence
+            .properties
+            .get("source_session_id")
+            .and_then(serde_json::Value::as_str)
+            == Some("next-runtime-001")
+    }));
+}
+
+#[test]
 fn runtime_import_is_atomic_deduplicated_queryable_and_deterministic() {
     let root = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();

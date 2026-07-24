@@ -299,6 +299,15 @@ the
 All transports converge on the same trace v1 JSON; vendor spans are adapted
 outside core.
 
+The Node.js/TypeScript reference implementation is built as
+`workers/web/dist/depgraph-runtime-collector.mjs`. Its typed module, call,
+route, and RPC APIs redact URL credentials/path/query/fragment before
+admission, assign contiguous acceptance-order sequence numbers, apply bounded
+drop-newest backpressure, and coalesce immutable-prefix flushes across file,
+stdout, and OTLP sinks. A disabled instance does not read clocks, call a sink,
+or install timers. See the
+[Web worker runtime collector guide](workers/web/README.md#nodejstypescript-runtime-collector).
+
 Store schema v13 retains the v10 profile-independent `syntax`,
 profile-dependent `semantic`, and observed `build` cache tables plus the v11
 normalized runtime session/node/site/edge/evidence/diagnostic/import tables.

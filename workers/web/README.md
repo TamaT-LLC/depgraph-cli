@@ -8,6 +8,90 @@ node dist/worker.mjs --root <repository> --scan-id <id>
 
 The worker writes protocol `1.0` NDJSON to stdout and operational logs to stderr. It performs a safe, read-only scan and reports `project_code_executed=false` in both the scan and profile metadata.
 
+## Node.js/TypeScript runtime collector
+
+`pnpm build` also creates the dependency-free ESM reference collector at
+`dist/depgraph-runtime-collector.mjs`. It targets Node.js 24 and implements the
+exact `runtime-collector-v1` descriptor and trace v1 output contract.
+
+```js
+import {
+  createFileRuntimeCollectorSink,
+  createRuntimeCollector,
+} from "./dist/depgraph-runtime-collector.mjs";
+
+const collector = createRuntimeCollector({
+  repository: {
+    identity: "workspace://example/service",
+    revision: process.env.GIT_REVISION,
+  },
+  session: {
+    id: crypto.randomUUID(),
+    profile: {
+      language: "typescript",
+      target: "server",
+      features: ["next"],
+    },
+    environment: {
+      name: "production",
+      runtime: "nodejs-24",
+      environmentKeys: ["NODE_ENV"],
+    },
+    redaction: {
+      headerNames: ["authorization", "cookie"],
+      secretNames: ["API_TOKEN"],
+    },
+  },
+  sink: createFileRuntimeCollectorSink("/var/run/depgraph/runtime-trace.json"),
+});
+
+collector.recordRoute({
+  source: {
+    kind: "repository_path",
+    path: "src/server.ts",
+    nodeKind: "file",
+  },
+  target: {
+    kind: "graph_locator",
+    locator: "framework-route:/api/users",
+    nodeKind: "route",
+  },
+  redaction: {
+    headerNames: ["authorization"],
+  },
+});
+
+collector.recordRpc({
+  source: { kind: "node", nodeId: "route:users" },
+  target: {
+    kind: "http_url",
+    url: "https://user:password@api.example.test/private?customer=42",
+  },
+});
+
+await collector.shutdown();
+```
+
+`record`, `recordModule`, `recordCall`, `recordRoute`, and `recordRpc` are
+synchronous and non-throwing. They accept only typed locator/redaction data;
+header, environment, and secret values are not API fields. An `http_url`
+target is reduced to lowercased scheme plus canonical `host[:port]` before it
+can enter the buffer. Only accepted events receive sequence numbers.
+
+The buffer retains a bounded contiguous prefix and drops newest observations
+under event, byte, trace, or rate pressure. `flush()` coalesces concurrent
+calls and retries the same canonical payload bytes. `shutdown()` is
+idempotent, stops admission, aborts retry timers at its deadline, and never
+throws a sink failure into the application. File sinks use same-directory
+temporary files and atomic replacement; stdout writes one compact trace per
+line; the OTLP adapter places the exact trace bytes in a LogRecord body with
+only contract/media/session/prefix attributes.
+
+Passing `enabled: false` returns a no-op handle before any clock read, sink
+write, diagnostic callback, or timer installation. `descriptor` can be
+published alongside deployment metadata, while `stats()` exposes only bounded
+reason counters and never raw observation values.
+
 ## TypeScript compiler decision
 
 The MVP is deliberately `bundled-only`. Project-local TypeScript is useful compatibility metadata, but importing it would execute JavaScript supplied by the repository being scanned. It is therefore never a compiler candidate in safe mode.
