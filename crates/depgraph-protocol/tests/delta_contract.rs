@@ -42,7 +42,7 @@ fn valid_delta_is_canonical_and_byte_equivalent_across_repeated_generation() {
 
     let validated =
         validate_delta_ndjson(Cursor::new(&first), base_graph()).expect("delta must validate");
-    assert_eq!(validated.events.len(), 14);
+    assert_eq!(validated.events.len(), 15);
     assert_eq!(
         validated.node_deletes,
         BTreeSet::from([OLD_TARGET_ID.into()])
@@ -176,6 +176,69 @@ fn every_mutation_is_confined_to_the_declared_scope() {
 }
 
 #[test]
+fn coverage_hierarchy_must_match_profiles_files_and_final_sites() {
+    let mut graph_mismatch = delta_events();
+    match &mut graph_mismatch[12] {
+        DeltaEvent::CoverageUpsert(CoverageUpsert {
+            coverage: DeltaCoverage::Aggregate { value },
+            ..
+        }) => {
+            value.dependency_sites = 2;
+            value.resolved = 2;
+        }
+        _ => unreachable!(),
+    }
+    reset_delta_id(&mut graph_mismatch);
+    let error = validate_delta_ndjson(Cursor::new(events_to_ndjson(&graph_mismatch)), base_graph())
+        .unwrap_err();
+    assert!(
+        matches!(error, ProtocolError::Invariant(message) if message.contains("delta scan coverage site counts"))
+    );
+
+    let mut file_mismatch = delta_events();
+    file_mismatch.remove(13);
+    match file_mismatch.last_mut() {
+        Some(DeltaEvent::DeltaCompleted(completed)) => completed.mutation_count -= 1,
+        _ => unreachable!(),
+    }
+    renumber(&mut file_mismatch);
+    reset_delta_id(&mut file_mismatch);
+    let error = validate_delta_ndjson(Cursor::new(events_to_ndjson(&file_mismatch)), base_graph())
+        .unwrap_err();
+    assert!(
+        matches!(error, ProtocolError::Invariant(message) if message.contains("file coverage records exist"))
+    );
+
+    let mut profile_mismatch = delta_events();
+    let mut completed = profile_mismatch.pop().expect("completion event");
+    match &mut completed {
+        DeltaEvent::DeltaCompleted(completed) => completed.mutation_count += 1,
+        _ => unreachable!(),
+    }
+    let mut inconsistent_profile = coverage();
+    inconsistent_profile.dependency_sites = 2;
+    inconsistent_profile.resolved = 2;
+    profile_mismatch.push(DeltaEvent::CoverageUpsert(CoverageUpsert {
+        common: common(0),
+        coverage: DeltaCoverage::Profile {
+            profile_id: PROFILE_ID.into(),
+            value: inconsistent_profile,
+        },
+    }));
+    profile_mismatch.push(completed);
+    renumber(&mut profile_mismatch);
+    reset_delta_id(&mut profile_mismatch);
+    let error = validate_delta_ndjson(
+        Cursor::new(events_to_ndjson(&profile_mismatch)),
+        base_graph(),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(error, ProtocolError::Invariant(message) if message.contains("delta profile") && message.contains("coverage site counts"))
+    );
+}
+
+#[test]
 fn capability_negotiation_preserves_legacy_full_snapshot_fallback() {
     let core = vec![
         "z-unknown-capability".to_owned(),
@@ -260,6 +323,17 @@ fn base_graph() -> DeltaBaseGraph {
             reason: None,
         },
     };
+    let removed_file = DeltaCoverage::File {
+        adapter: "web".into(),
+        path: "src/lib.ts".into(),
+        value: DeltaFileCoverage {
+            discovered_sites: 0,
+            emitted_sites: 0,
+            skipped_sites: 0,
+            skipped: false,
+            reason: None,
+        },
+    };
     DeltaBaseGraph {
         snapshot_id: SNAPSHOT_ID.into(),
         graph_digest: BASE_DIGEST.into(),
@@ -272,6 +346,7 @@ fn base_graph() -> DeltaBaseGraph {
             (aggregate.key(), aggregate),
             (profile.key(), profile),
             (file.key(), file),
+            (removed_file.key(), removed_file),
         ]),
     }
 }
@@ -394,18 +469,32 @@ fn delta_events() -> Vec<DeltaEvent> {
             common: common(12),
             coverage_key: DeltaCoverageKey::File {
                 adapter: "web".into(),
-                path: "src/index.ts".into(),
+                path: "src/lib.ts".into(),
             },
         }),
         DeltaEvent::CoverageUpsert(CoverageUpsert {
             common: common(13),
             coverage: DeltaCoverage::Aggregate { value: coverage() },
         }),
-        DeltaEvent::DeltaCompleted(DeltaCompleted {
+        DeltaEvent::CoverageUpsert(CoverageUpsert {
             common: common(14),
+            coverage: DeltaCoverage::File {
+                adapter: "web".into(),
+                path: "src/next.ts".into(),
+                value: DeltaFileCoverage {
+                    discovered_sites: 0,
+                    emitted_sites: 0,
+                    skipped_sites: 0,
+                    skipped: false,
+                    reason: None,
+                },
+            },
+        }),
+        DeltaEvent::DeltaCompleted(DeltaCompleted {
+            common: common(15),
             delta_contract_version: DELTA_CONTRACT_VERSION.into(),
             delta_id: placeholder_delta_id.into(),
-            mutation_count: 12,
+            mutation_count: 13,
             result_graph_digest: RESULT_DIGEST.into(),
         }),
     ];
@@ -489,8 +578,8 @@ fn source_evidence(detail: &str) -> Evidence {
 fn coverage() -> Coverage {
     Coverage {
         profiles: 1,
-        files_discovered: 1,
-        files_analyzed: 1,
+        files_discovered: 2,
+        files_analyzed: 2,
         files_skipped: 0,
         dependency_sites: 1,
         resolved: 1,

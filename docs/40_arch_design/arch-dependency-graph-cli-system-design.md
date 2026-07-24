@@ -267,9 +267,13 @@ canonical mutation payloadから
 `delta:sha256:<digest>`として再計算する。`delta_completed`は同じID、
 mutation count、result graph digestを持つ。stable ID形式、base一致、
 mutation ordering、node / site / edge endpoint、profile、evidence ownerと
-contiguous ordinal、coverage conservationを全件検証し、未知event、不正ID、
-scope外path、dangling reference、途中で途切れたstreamを拒否する。全検証が
-完了するまでstore transactionへ適用せず、従来の
+contiguous ordinal、coverage conservationを全件検証する。coverageは各record
+内だけでなく、aggregate / profileのsite status countと最終graph、aggregateの
+profile count・completeness intersection・file count / skipped count、
+profile最大値・project-code execution・blocking reasonを相互照合する。未知
+event、不正ID、scope外path、dangling reference、coverage階層矛盾、途中で
+途切れたstreamを拒否し、全検証が完了するまでstore transactionへ適用しない。
+従来の
 `protocol-v1.golden.ndjson`をfull fallback、
 `protocol-v1.delta.golden.ndjson`をdelta互換性fixtureとする。
 
@@ -1545,7 +1549,7 @@ schema、commit、全必須metric、conservation、総合passを再検証して�
 
 ## 26. 更新履歴
 
-- 2026-07-24: Issue #132として`worker-delta-v1` contractを実装。`delta_started`、node / site / edge / evidence / aggregate・profile・file coverageのupsert / delete、`delta_completed`をprotocol `1.0` Schemaへ追加し、base snapshot / graph digest binding、canonical mutation order、連続sequence、stable delta ID再計算、stable entity ID形式、ownership scope、endpoint / profile / evidence owner・ordinal / coverage整合性を検証する独立state machineを追加した。coreとworker双方のexact capability一致時だけdeltaを選び、legacy / unknown / workspace replanは既存full snapshotへfallbackする。full / delta golden fixture、反復byte同一性、unknown event、malformed ID、dangling reference、途中切断、ordering、scope外upsert / delete、fallback互換性testで固定した。
+- 2026-07-24: Issue #132として`worker-delta-v1` contractを実装。`delta_started`、node / site / edge / evidence / aggregate・profile・file coverageのupsert / delete、`delta_completed`をprotocol `1.0` Schemaへ追加し、base snapshot / graph digest binding、canonical mutation order、連続sequence、stable delta ID再計算、stable entity ID形式、ownership scope、endpoint / profile / evidence owner・ordinal / aggregate・profile・file・最終graph間coverage整合性を検証する独立state machineを追加した。coreとworker双方のexact capability一致時だけdeltaを選び、legacy / unknown / workspace replanは既存full snapshotへfallbackする。full / delta golden fixture、反復byte同一性、unknown event、malformed ID、dangling reference、途中切断、ordering、scope外upsert / delete、coverage階層矛盾、fallback互換性testで固定した。
 - 2026-07-24: Issue #87としてMilestone 4 release candidate `v0.4.0-rc.1`を確定。product / Rust / Go / Web adapterを同期し、protocol / graph `1.0`、store schema `11`、cache contract `1`と各Milestone 4 schemaをrelease manifestへ固定した。公式`v0.2.0-rc.1` packageで生成したschema `5` store fixtureをpackage gateでschema `11`へ移行し、completed snapshot、node/site/edge/evidence、immutable ID、queryを保全する。snapshot/diff/impact、watcher/incremental、clean policy GitHub annotation、runtime validate/import/filter、決定的GraphML stdout/atomic file出力をpackaged binaryで実行し、全target archive / checksum / manifest / SBOM / license / attestationのaggregate verificationへ閉じる。migration、rollback、安全境界、性能、既知制約をrelease noteへ集約した。
 - 2026-07-24: Issue #86として決定的な10,000 source-file fixtureと`depgraph-benchmark-report-v1`を実装。fresh-store initial、watcher daemon経由の1-file incremental、cold/warm file/package impactを複数sampleで分離し、platform / runner / toolchain / cache条件とraw timingを記録する。median ceiling、1 bounded outlier、20% hard noise allowanceで明確な回帰だけをfailさせる。変更fileのcontent hash更新を要求しつつ、それ以外のgraph topology、dependency site、edge、evidence、coverage digest保存を検証する。PR CIとreleaseで同じreportをartifact化し、release asset検証前にschema / commit / metric / conservationを再検証する。
 - 2026-07-24: Issue #85として決定的なGraphML 1.0 exporterを実装。node / edgeのstable ID、kind、phase、profile、condition、precision、resolutionをtyped keyへ、完全なprofile / dependency site / evidenceと所有参照をcanonical JSONへ保持し、GraphML単体で再構成可能にした。XML-safeなgenerated element ID、XML 1.0特殊文字escape、Unicode保持、invalid control fail-closed、stable sort、record/text単位のbounded streaming writer、成功後だけdestinationを置換するatomic file outputを追加し、golden、round-trip、入力順非依存決定性、大容量chunk、runtime filter、CLI stdout / file E2Eで固定した。既存JSON / DOT / Mermaid出力は変更していない。

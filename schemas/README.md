@@ -11,7 +11,8 @@ to emit the unchanged full-snapshot stream. The delta schema binds every
 mutation to an exact base snapshot and graph digest, and the Rust validator
 additionally enforces canonical event ordering, stable IDs, referential
 integrity, declared ownership-scope confinement, contiguous evidence ordinals,
-coverage conservation, and complete termination.
+per-record coverage conservation, aggregate/profile/file/final-graph coverage
+consistency, and complete termination.
 
 `depgraph-policy-v1.schema.json` describes the `.depgraph.toml` architecture policy
 contract after conversion to JSON. The Rust validator and the JSON Schema share the

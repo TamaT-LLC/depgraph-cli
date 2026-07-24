@@ -1,6 +1,7 @@
 use crate::{
     CommonFields, Coverage, DependencySite, Evidence, GraphEdge, GraphNode, PROTOCOL_VERSION,
-    ProtocolError, ValidatedProtocol, stable_id_from_value, validate_site_edge_invariants,
+    ProtocolError, ResolutionStatus, ValidatedProtocol, stable_id_from_value,
+    validate_site_edge_invariants,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -1331,6 +1332,223 @@ fn validate_final_state(
                 "coverage references undeclared profile {profile_id}"
             ));
         }
+    }
+    validate_coverage_hierarchy(profiles, sites, coverage)?;
+    Ok(())
+}
+
+fn validate_coverage_hierarchy(
+    profiles: &BTreeSet<String>,
+    sites: &BTreeMap<String, DependencySite>,
+    coverage: &BTreeMap<DeltaCoverageKey, DeltaCoverage>,
+) -> Result<(), ProtocolError> {
+    let aggregate = match coverage.get(&DeltaCoverageKey::Aggregate) {
+        Some(DeltaCoverage::Aggregate { value }) => value,
+        _ => return invariant("delta result has no aggregate coverage".into()),
+    };
+    if aggregate.profiles != profiles.len() as u64 {
+        return invariant(format!(
+            "delta scan coverage profiles={} but {} profiles are declared",
+            aggregate.profiles,
+            profiles.len()
+        ));
+    }
+    validate_delta_site_counts("delta scan", aggregate, sites.values())?;
+
+    let mut profile_coverage = BTreeMap::new();
+    for profile_id in profiles {
+        let key = DeltaCoverageKey::Profile {
+            profile_id: profile_id.clone(),
+        };
+        let value = match coverage.get(&key) {
+            Some(DeltaCoverage::Profile { value, .. }) => value,
+            _ => {
+                return invariant(format!(
+                    "delta result has no coverage for profile {profile_id}"
+                ));
+            }
+        };
+        if value.profiles != 1 {
+            return invariant(format!(
+                "delta profile {profile_id} coverage must report profiles=1, found {}",
+                value.profiles
+            ));
+        }
+        validate_delta_site_counts(
+            &format!("delta profile {profile_id}"),
+            value,
+            sites.values().filter(|site| site.profile_id == *profile_id),
+        )?;
+        profile_coverage.insert(profile_id, value);
+    }
+    validate_delta_aggregate_profile_coverage(aggregate, &profile_coverage)?;
+
+    let files = coverage
+        .values()
+        .filter_map(|value| match value {
+            DeltaCoverage::File { value, .. } => Some(value),
+            DeltaCoverage::Aggregate { .. } | DeltaCoverage::Profile { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    let files_skipped = files.iter().filter(|file| file.skipped).count() as u64;
+    let emitted_sites = files.iter().try_fold(0_u64, |total, file| {
+        total.checked_add(file.emitted_sites).ok_or_else(|| {
+            ProtocolError::Invariant("delta file coverage emitted-site total overflowed".into())
+        })
+    })?;
+    if aggregate.files_discovered != files.len() as u64 {
+        return invariant(format!(
+            "delta scan coverage files_discovered={} but {} file coverage records exist",
+            aggregate.files_discovered,
+            files.len()
+        ));
+    }
+    if aggregate.files_skipped != files_skipped {
+        return invariant(format!(
+            "delta scan coverage files_skipped={} but {files_skipped} file coverage records are skipped",
+            aggregate.files_skipped
+        ));
+    }
+    if emitted_sites > aggregate.dependency_sites {
+        return invariant(format!(
+            "delta file coverage emitted_sites total {emitted_sites} exceeds scan coverage's {} dependency sites",
+            aggregate.dependency_sites
+        ));
+    }
+    Ok(())
+}
+
+fn validate_delta_aggregate_profile_coverage(
+    aggregate: &Coverage,
+    profiles: &BTreeMap<&String, &Coverage>,
+) -> Result<(), ProtocolError> {
+    let Some(first) = profiles.values().next() else {
+        return Ok(());
+    };
+    let mut expected_completeness = first.completeness.iter().copied().collect::<BTreeSet<_>>();
+    for profile in profiles.values().skip(1) {
+        expected_completeness.retain(|level| profile.completeness.contains(level));
+    }
+    let aggregate_completeness = aggregate
+        .completeness
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    if aggregate_completeness != expected_completeness {
+        return invariant(format!(
+            "delta scan completeness {aggregate_completeness:?} does not equal the profile intersection {expected_completeness:?}"
+        ));
+    }
+
+    let maximums = [
+        (
+            "files_discovered",
+            aggregate.files_discovered,
+            profiles
+                .values()
+                .map(|profile| profile.files_discovered)
+                .max()
+                .unwrap_or_default(),
+        ),
+        (
+            "files_analyzed",
+            aggregate.files_analyzed,
+            profiles
+                .values()
+                .map(|profile| profile.files_analyzed)
+                .max()
+                .unwrap_or_default(),
+        ),
+        (
+            "files_skipped",
+            aggregate.files_skipped,
+            profiles
+                .values()
+                .map(|profile| profile.files_skipped)
+                .max()
+                .unwrap_or_default(),
+        ),
+        (
+            "unsupported_syntax",
+            aggregate.unsupported_syntax,
+            profiles
+                .values()
+                .map(|profile| profile.unsupported_syntax)
+                .max()
+                .unwrap_or_default(),
+        ),
+    ];
+    for (field, reported, minimum) in maximums {
+        if reported < minimum {
+            return invariant(format!(
+                "delta scan coverage {field}={reported}, below the profile maximum {minimum}"
+            ));
+        }
+    }
+    if profiles
+        .values()
+        .any(|profile| profile.project_code_executed)
+        && !aggregate.project_code_executed
+    {
+        return invariant(
+            "delta scan coverage hides project code execution reported by a profile".into(),
+        );
+    }
+    for blocking_reason in ["rust-hir-backend-failure"] {
+        if profiles.values().any(|profile| {
+            profile
+                .reasons
+                .iter()
+                .any(|reason| reason == blocking_reason)
+        }) && !aggregate
+            .reasons
+            .iter()
+            .any(|reason| reason == blocking_reason)
+        {
+            return invariant(format!(
+                "delta scan coverage omits blocking profile reason {blocking_reason}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_delta_site_counts<'a>(
+    scope: &str,
+    coverage: &Coverage,
+    sites: impl Iterator<Item = &'a DependencySite>,
+) -> Result<(), ProtocolError> {
+    let mut total = 0_u64;
+    let mut resolved = 0_u64;
+    let mut candidates = 0_u64;
+    let mut external = 0_u64;
+    let mut unresolved = 0_u64;
+    for site in sites {
+        total = total
+            .checked_add(1)
+            .ok_or_else(|| ProtocolError::Invariant("delta site count overflowed".into()))?;
+        let counter = match site.resolution_status {
+            ResolutionStatus::Resolved => &mut resolved,
+            ResolutionStatus::Candidates => &mut candidates,
+            ResolutionStatus::External => &mut external,
+            ResolutionStatus::Unresolved => &mut unresolved,
+        };
+        *counter = counter
+            .checked_add(1)
+            .ok_or_else(|| ProtocolError::Invariant("delta site status count overflowed".into()))?;
+    }
+    let actual = (total, resolved, candidates, external, unresolved);
+    let reported = (
+        coverage.dependency_sites,
+        coverage.resolved,
+        coverage.candidates,
+        coverage.external,
+        coverage.unresolved,
+    );
+    if actual != reported {
+        return invariant(format!(
+            "{scope} coverage site counts {reported:?} do not match emitted counts {actual:?}"
+        ));
     }
     Ok(())
 }
