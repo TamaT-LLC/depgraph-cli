@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { PassThrough } from "node:stream";
+import { PassThrough, Writable } from "node:stream";
 import test from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -461,7 +461,7 @@ test("a sink resolving after the shutdown deadline cannot commit a successful fl
     repository: fixture.repository,
     session: fixture.session,
     sink: {
-      kind: "stdout",
+      kind: "otlp",
       async write() {
         await writeGate;
         writeReturned?.();
@@ -485,6 +485,36 @@ test("a sink resolving after the shutdown deadline cannot commit a successful fl
   await new Promise<void>((resolve) => setImmediate(resolve));
   assert.equal(collector.state, "stopped");
   assert.equal(collector.stats().flushedPrefixes, 0);
+});
+
+test("stdout commits at queue time instead of waiting on an uncancellable callback", async () => {
+  const fixture = await readFixture("next");
+  let completeWrite: (() => void) | undefined;
+  const output = new Writable({
+    write(_chunk, _encoding, callback) {
+      completeWrite = callback;
+    },
+  });
+  const collector = createRuntimeCollector({
+    repository: fixture.repository,
+    session: fixture.session,
+    sink: createStdoutRuntimeCollectorSink(output),
+    clock: new StepClock("2026-07-24T00:00:00Z"),
+    shutdownTimeoutMs: 10,
+  });
+  assert(collector.record(basicObservation("src/stdout-queue.ts")));
+
+  assert.deepEqual(await collector.shutdown(), {
+    status: "flushed",
+    prefixEnd: 1,
+    attempts: 1,
+  });
+  assert.equal(collector.state, "stopped");
+  assert.equal(collector.stats().flushedPrefixes, 1);
+  assert.equal(collector.stats().dropped.shutdown_timeout, 0);
+
+  completeWrite?.();
+  output.destroy();
 });
 
 test("file, stdout, and OTLP sinks carry the same canonical trace bytes", async () => {

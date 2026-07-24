@@ -1143,13 +1143,10 @@ export function createStdoutRuntimeCollectorSink(
     async write(payload, context) {
       if (context.signal.aborted) throw new Error("runtime collector write aborted");
       const line = Buffer.concat([Buffer.from(payload), Buffer.from("\n", "utf8")]);
-      await new Promise<void>((resolve, reject) => {
-        stream.write(line, (error) => {
-          if (error) reject(error);
-          else resolve();
-        });
-      });
-      if (context.signal.aborted) throw new Error("runtime collector write aborted");
+      // Writable.write queues the complete line synchronously. Its callback is
+      // not cancellable, so waiting for it could let a shutdown deadline pass
+      // while an already-committed stdout write remains pending.
+      stream.write(line);
     },
   };
 }
