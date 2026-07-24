@@ -84,7 +84,8 @@ calls and retries the same canonical payload bytes. `shutdown()` is
 idempotent, stops admission, aborts retry timers at its deadline, and never
 throws a sink failure into the application. File sinks use same-directory
 temporary files and atomic replacement; stdout writes one compact trace per
-line; the OTLP adapter places the exact trace bytes in a LogRecord body with
+line synchronously to its file descriptor before reporting success; the OTLP
+adapter places the exact trace bytes in a LogRecord body with
 only contract/media/session/prefix attributes.
 
 Passing `enabled: false` returns a no-op handle before any clock read, sink

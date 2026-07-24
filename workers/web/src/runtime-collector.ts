@@ -1,6 +1,6 @@
+import { writeSync } from "node:fs";
 import { lstat, open, rename, unlink } from "node:fs/promises";
 import path from "node:path";
-import type { Writable } from "node:stream";
 
 export const RUNTIME_COLLECTOR_CONTRACT_VERSION = "runtime-collector-v1" as const;
 export const RUNTIME_TRACE_SCHEMA_VERSION = "1.0" as const;
@@ -1136,17 +1136,29 @@ export function createFileRuntimeCollectorSink(destination: string): RuntimeColl
 }
 
 export function createStdoutRuntimeCollectorSink(
-  stream: Writable = process.stdout,
+  fileDescriptor: number = process.stdout.fd,
 ): RuntimeCollectorSink {
+  if (!Number.isSafeInteger(fileDescriptor) || fileDescriptor < 0) {
+    throw new Error("runtime collector stdout file descriptor must be non-negative");
+  }
   return {
     kind: "stdout",
     async write(payload, context) {
       if (context.signal.aborted) throw new Error("runtime collector write aborted");
       const line = Buffer.concat([Buffer.from(payload), Buffer.from("\n", "utf8")]);
-      // Writable.write queues the complete line synchronously. Its callback is
-      // not cancellable, so waiting for it could let a shutdown deadline pass
-      // while an already-committed stdout write remains pending.
-      stream.write(line);
+      let offset = 0;
+      while (offset < line.byteLength) {
+        const written = writeSync(
+          fileDescriptor,
+          line,
+          offset,
+          line.byteLength - offset,
+        );
+        if (!Number.isSafeInteger(written) || written <= 0) {
+          throw new Error("runtime collector stdout write made no progress");
+        }
+        offset += written;
+      }
     },
   };
 }
