@@ -37,6 +37,8 @@ const RUST_ANALYZER_DIRECT_DEPENDENCIES: &[&str] =
     &["ra_ap_hir", "ra_ap_ide_db", "ra_ap_syntax", "ra_ap_vfs"];
 const SALSA_DIRECT_DEPENDENCIES: &[&str] = &["salsa", "salsa-macro-rules", "salsa-macros"];
 const TYPESCRIPT_VERSION: &str = "7.0.2";
+const RUNTIME_COLLECTOR_CONTRACT_VERSION: &str = depgraph_core::RUNTIME_COLLECTOR_CONTRACT_VERSION;
+const RUNTIME_COLLECTOR_ARTIFACT: &str = "depgraph-runtime-collector.mjs";
 const WEB_SEMANTIC_CAPABILITIES: &[&str] = &[
     "astro-component-render-hydration-v1",
     "framework-semantic-completeness-v1",
@@ -52,11 +54,12 @@ const WEB_SEMANTIC_RUNTIME_COMPONENTS: &[&str] = &[
     "typescript-native-compiler@7.0.2",
 ];
 const WEB_SEMANTIC_RUNTIME_ARTIFACTS: &[&str] = &[];
-const WEB_BUILD_RUNTIME_ARTIFACTS: &[&str] = &[
+const WEB_RUNTIME_ARTIFACTS: &[&str] = &[
     "next-build-adapter.mjs",
     "astro-build-integration.mjs",
     "tanstack-start-build-observer.mjs",
     "depgraph-web-build-evidence.mjs",
+    RUNTIME_COLLECTOR_ARTIFACT,
 ];
 const WEB_DEFINITION_SELECTOR: &str = r#"type:definition:["package","npm:workspace:@fixture/shared@1.0.0#apps/shared","definition:[\"module\",\"type\",\"apps/shared/src/semantic.ts\",[\"SharedStringCollection\"]]"]"#;
 const FORBIDDEN_RUST_ANALYZER_DEPENDENCIES: &[&str] = &[
@@ -174,6 +177,15 @@ struct DependencyPackage {
 }
 
 #[derive(Clone, Debug)]
+struct RuntimeCollectorInventory {
+    name: String,
+    version: String,
+    license: String,
+    path: String,
+    sha256: String,
+}
+
+#[derive(Clone, Debug)]
 struct ArchiveEntry {
     source: PathBuf,
     path: String,
@@ -188,6 +200,7 @@ struct ReleaseVerificationReport {
     tag: String,
     protocol_version: String,
     schema_compatibility_version: String,
+    runtime_collector_contract_version: String,
     compatibility: ReleaseCompatibility,
     license_expression: String,
     targets: Vec<TargetVerificationReport>,
@@ -205,6 +218,7 @@ struct TargetVerificationReport {
     release_manifest_sha256: String,
     sbom_sha256: String,
     project_licenses: BTreeMap<String, String>,
+    runtime_collector_sha256: String,
     workers: BTreeMap<String, String>,
 }
 
@@ -525,7 +539,7 @@ fn package() -> Result<()> {
         Path::new("workers/web/dist/worker.mjs"),
         &staging.join("libexec/depgraph-web-worker.mjs"),
     )?;
-    for artifact in WEB_BUILD_RUNTIME_ARTIFACTS {
+    for artifact in WEB_RUNTIME_ARTIFACTS {
         copy(
             &Path::new("workers/web/dist").join(artifact),
             &staging.join("libexec").join(artifact),
@@ -584,7 +598,7 @@ fn package() -> Result<()> {
             path: relative_slash(&staging, &schema_path)?,
             sha256: sha256_file(&schema_path)?,
         },
-        runtime_artifacts: WEB_BUILD_RUNTIME_ARTIFACTS
+        runtime_artifacts: WEB_RUNTIME_ARTIFACTS
             .iter()
             .map(|name| {
                 let path = staging.join("libexec").join(name);
@@ -795,6 +809,11 @@ fn verify_web_semantic_attestation(attestation: &WebSemanticAttestation) -> Resu
 }
 
 fn third_party_licenses(target: &str) -> Result<String> {
+    let web_inventory: Value = serde_json::from_slice(
+        &fs::read("workers/web/dist/runtime-packages.json")
+            .context("Web runtime package inventory is missing; run the Web worker build first")?,
+    )?;
+    let collector = runtime_collector_inventory(&web_inventory)?;
     let entries = dependency_inventory(target)?
         .into_iter()
         .map(|package| {
@@ -805,7 +824,10 @@ fn third_party_licenses(target: &str) -> Result<String> {
         })
         .collect::<Vec<_>>();
     let mut output = format!(
-        "depgraph third-party license inventory\nGenerated from the Rust and Go runtime dependency graphs and the Web bundle/runtime artifact inventory.\n{SBOM_SCOPE}\n\n{}\n",
+        "depgraph third-party license inventory\nGenerated from the Rust and Go runtime dependency graphs and the Web bundle/runtime artifact inventory.\nFirst-party artifact {} ({}) is licensed under {} by LICENSE-MIT and LICENSE-APACHE; its dependency-free bundle adds no third-party license entry.\n{SBOM_SCOPE}\n\n{}\n",
+        collector.path,
+        collector.version,
+        collector.license,
         entries.join("\n")
     );
     for (label, content) in web_legal_documents()? {
@@ -815,6 +837,11 @@ fn third_party_licenses(target: &str) -> Result<String> {
 }
 
 fn sbom(target: &str) -> Result<Value> {
+    let web_inventory: Value = serde_json::from_slice(
+        &fs::read("workers/web/dist/runtime-packages.json")
+            .context("Web runtime package inventory is missing; run the Web worker build first")?,
+    )?;
+    let collector = runtime_collector_inventory(&web_inventory)?;
     let dependencies = dependency_inventory(target)?;
     let dependency_ids = dependencies
         .iter()
@@ -866,11 +893,34 @@ fn sbom(target: &str) -> Result<Value> {
             "comment":SBOM_SCOPE
         }),
     );
+    let collector_id = "SPDXRef-Package-depgraph-runtime-collector";
+    packages.insert(
+        1,
+        json!({
+            "SPDXID":collector_id,
+            "name":collector.name,
+            "versionInfo":collector.version,
+            "filesAnalyzed":false,
+            "licenseConcluded":"NOASSERTION",
+            "licenseDeclared":collector.license,
+            "downloadLocation":"NOASSERTION",
+            "checksums":[{
+                "algorithm":"SHA256",
+                "checksumValue":collector.sha256
+            }],
+            "comment":format!("First-party release artifact: libexec/{}", collector.path)
+        }),
+    );
     let mut relationships = vec![json!({
         "spdxElementId":"SPDXRef-DOCUMENT",
         "relationshipType":"DESCRIBES",
         "relatedSpdxElement":"SPDXRef-Package-depgraph"
     })];
+    relationships.push(json!({
+        "spdxElementId":"SPDXRef-Package-depgraph",
+        "relationshipType":"CONTAINS",
+        "relatedSpdxElement":collector_id
+    }));
     relationships.extend(dependency_ids.into_iter().map(|id| {
         json!({
             "spdxElementId":"SPDXRef-Package-depgraph",
@@ -888,6 +938,50 @@ fn sbom(target: &str) -> Result<Value> {
         "packages":packages,
         "relationships":relationships
     }))
+}
+
+fn verify_runtime_collector_sbom(sbom: &Value, expected_sha256: &str, context: &str) -> Result<()> {
+    let packages = sbom["packages"]
+        .as_array()
+        .with_context(|| format!("{context} SBOM has no packages"))?;
+    let collectors = packages
+        .iter()
+        .filter(|package| package["name"] == "depgraph-runtime-collector")
+        .collect::<Vec<_>>();
+    if collectors.len() != 1 {
+        bail!("{context} SBOM must contain exactly one runtime collector package");
+    }
+    let collector = collectors[0];
+    if collector["SPDXID"] != "SPDXRef-Package-depgraph-runtime-collector"
+        || collector["versionInfo"] != RUNTIME_COLLECTOR_CONTRACT_VERSION
+        || collector["filesAnalyzed"] != Value::Bool(false)
+        || collector["licenseDeclared"] != PROJECT_LICENSE_EXPRESSION
+        || collector["checksums"]
+            != json!([{
+                "algorithm": "SHA256",
+                "checksumValue": expected_sha256,
+            }])
+        || collector["comment"]
+            != format!("First-party release artifact: libexec/{RUNTIME_COLLECTOR_ARTIFACT}")
+    {
+        bail!("{context} SBOM runtime collector package is incompatible");
+    }
+    let relationships = sbom["relationships"]
+        .as_array()
+        .with_context(|| format!("{context} SBOM has no relationships"))?;
+    let contains = relationships
+        .iter()
+        .filter(|relationship| {
+            relationship["spdxElementId"] == "SPDXRef-Package-depgraph"
+                && relationship["relationshipType"] == "CONTAINS"
+                && relationship["relatedSpdxElement"]
+                    == "SPDXRef-Package-depgraph-runtime-collector"
+        })
+        .count();
+    if contains != 1 {
+        bail!("{context} SBOM does not contain the runtime collector from the root package");
+    }
+    Ok(())
 }
 
 fn normalized_spdx_license(reported: &str) -> Option<String> {
@@ -998,6 +1092,7 @@ fn dependency_inventory(target: &str) -> Result<Vec<DependencyPackage>> {
         &fs::read("workers/web/dist/runtime-packages.json")
             .context("Web runtime package inventory is missing; run the Web worker build first")?,
     )?;
+    runtime_collector_inventory(&web_inventory)?;
     packages.extend(web_runtime_packages(&web_inventory)?);
     packages.sort_by(|left, right| {
         (&left.ecosystem, &left.name, &left.version).cmp(&(
@@ -1288,11 +1383,57 @@ fn web_runtime_packages(inventory: &Value) -> Result<Vec<DependencyPackage>> {
         .collect()
 }
 
+fn runtime_collector_inventory(inventory: &Value) -> Result<RuntimeCollectorInventory> {
+    if inventory["schema_version"] != 1 {
+        bail!("Web runtime package inventory has an unsupported schema version");
+    }
+    let artifacts = inventory["artifacts"]
+        .as_array()
+        .context("Web runtime package inventory has no first-party artifacts")?;
+    if artifacts.len() != 1 {
+        bail!("Web runtime package inventory must contain exactly one first-party artifact");
+    }
+    let artifact = &artifacts[0];
+    let field = |name: &str| {
+        artifact[name]
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .with_context(|| format!("runtime collector inventory has no {name}"))
+    };
+    let collector = RuntimeCollectorInventory {
+        name: field("name")?.to_owned(),
+        version: field("version")?.to_owned(),
+        license: field("license")?.to_owned(),
+        path: field("path")?.to_owned(),
+        sha256: field("sha256")?.to_owned(),
+    };
+    if collector.name != "depgraph-runtime-collector"
+        || collector.version != RUNTIME_COLLECTOR_CONTRACT_VERSION
+        || collector.license != PROJECT_LICENSE_EXPRESSION
+        || collector.path != RUNTIME_COLLECTOR_ARTIFACT
+        || collector.sha256.len() != 64
+        || !collector
+            .sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        || artifact["roles"] != json!(["reference-runtime-collector"])
+        || artifact["bundled_packages"] != json!([])
+    {
+        bail!("runtime collector inventory does not match the release compatibility unit");
+    }
+    let path = Path::new("workers/web/dist").join(&collector.path);
+    if !path.is_file() || sha256_file(&path)? != collector.sha256 {
+        bail!("runtime collector inventory checksum does not match the built artifact");
+    }
+    Ok(collector)
+}
+
 fn web_legal_documents() -> Result<Vec<(String, String)>> {
     let inventory: Value = serde_json::from_slice(
         &fs::read("workers/web/dist/runtime-packages.json")
             .context("Web runtime package inventory is missing; run the Web worker build first")?,
     )?;
+    runtime_collector_inventory(&inventory)?;
     let packages = web_runtime_packages(&inventory)?;
     let package_by_name = packages
         .iter()
@@ -1637,6 +1778,15 @@ fn verify_release_assets(directory: &Path, requested_targets: &[String]) -> Resu
             archive_sha256,
         )?);
     }
+    if targets
+        .iter()
+        .map(|target| target.runtime_collector_sha256.as_str())
+        .collect::<BTreeSet<_>>()
+        .len()
+        != 1
+    {
+        bail!("release targets do not contain identical runtime collector artifact bytes");
+    }
 
     fs::write(
         directory.join("release-verification.json"),
@@ -1646,6 +1796,7 @@ fn verify_release_assets(directory: &Path, requested_targets: &[String]) -> Resu
             tag: format!("v{VERSION}"),
             protocol_version: "1.0".to_owned(),
             schema_compatibility_version: "1.0".to_owned(),
+            runtime_collector_contract_version: RUNTIME_COLLECTOR_CONTRACT_VERSION.to_owned(),
             compatibility: release_compatibility(),
             license_expression: PROJECT_LICENSE_EXPRESSION.to_owned(),
             targets,
@@ -1769,7 +1920,7 @@ fn verify_published_release_tree(
         verified_licenses.insert((*path).to_owned(), artifact.sha256.clone());
     }
 
-    let expected_runtime_paths = WEB_BUILD_RUNTIME_ARTIFACTS
+    let expected_runtime_paths = WEB_RUNTIME_ARTIFACTS
         .iter()
         .map(|name| format!("libexec/{name}"))
         .collect::<BTreeSet<_>>();
@@ -1779,9 +1930,9 @@ fn verify_published_release_tree(
         .map(|artifact| artifact.path.clone())
         .collect::<BTreeSet<_>>();
     if declared_runtime_paths != expected_runtime_paths
-        || manifest.runtime_artifacts.len() != WEB_BUILD_RUNTIME_ARTIFACTS.len()
+        || manifest.runtime_artifacts.len() != WEB_RUNTIME_ARTIFACTS.len()
     {
-        bail!("published release Web build runtime attestation is incomplete or unknown");
+        bail!("published release Web runtime artifact closure is incomplete or unknown");
     }
     for artifact in &manifest.runtime_artifacts {
         if !artifact_paths.insert(artifact.path.as_str()) {
@@ -1789,6 +1940,13 @@ fn verify_published_release_tree(
         }
         verify_release_artifact(extracted, artifact, "runtime artifact")?;
     }
+    let runtime_collector_sha256 = manifest
+        .runtime_artifacts
+        .iter()
+        .find(|artifact| artifact.path == format!("libexec/{RUNTIME_COLLECTOR_ARTIFACT}"))
+        .context("published release has no runtime collector artifact")?
+        .sha256
+        .clone();
     let mut components = BTreeMap::new();
     for component in &manifest.runtime_components {
         if components
@@ -1956,6 +2114,7 @@ fn verify_published_release_tree(
         .collect::<BTreeSet<_>>();
     for required in [
         "@astrojs/compiler",
+        "depgraph-runtime-collector",
         "typescript",
         "golang.org/x/tools",
         "ra_ap_hir",
@@ -1968,6 +2127,7 @@ fn verify_published_release_tree(
             bail!("published release SBOM is missing {required}");
         }
     }
+    verify_runtime_collector_sbom(&sbom, &runtime_collector_sha256, "published release")?;
     if package_names
         .iter()
         .filter(|name| name.starts_with("@typescript/typescript-"))
@@ -1978,6 +2138,9 @@ fn verify_published_release_tree(
     }
     let third_party = fs::read_to_string(extracted.join("THIRD_PARTY_LICENSES.txt"))?;
     if !third_party.starts_with("depgraph third-party license inventory\n")
+        || !third_party.contains(&format!(
+            "First-party artifact {RUNTIME_COLLECTOR_ARTIFACT} ({RUNTIME_COLLECTOR_CONTRACT_VERSION}) is licensed under {PROJECT_LICENSE_EXPRESSION}"
+        ))
         || PROJECT_LICENSES.iter().any(|(_, project_text)| {
             third_party
                 .as_bytes()
@@ -1987,6 +2150,14 @@ fn verify_published_release_tree(
     {
         bail!("published third-party license inventory is missing or mixes project licenses");
     }
+    verify_runtime_collector_module(
+        &verified_release_path(
+            extracted,
+            &format!("libexec/{RUNTIME_COLLECTOR_ARTIFACT}"),
+            "runtime collector",
+        )?,
+        "published release",
+    )?;
 
     Ok(TargetVerificationReport {
         target: expected_target.to_owned(),
@@ -1995,6 +2166,7 @@ fn verify_published_release_tree(
         release_manifest_sha256: sha256_file(&manifest_path)?,
         sbom_sha256: sha256_file(&sbom_path)?,
         project_licenses: verified_licenses,
+        runtime_collector_sha256,
         workers,
     })
 }
@@ -2310,13 +2482,13 @@ fn verify_packaged_build_evidence(
         let runtime_integrity = doctor_json["release"]["runtime_integrity"]
             .as_object()
             .context("packaged build doctor omitted runtime integrity")?;
-        if WEB_BUILD_RUNTIME_ARTIFACTS.iter().any(|name| {
+        if WEB_RUNTIME_ARTIFACTS.iter().any(|name| {
             runtime_integrity
                 .get(&format!("libexec/{name}"))
                 .and_then(Value::as_str)
                 != Some("verified")
         }) {
-            bail!("packaged {adapter} doctor did not verify all build runtimes");
+            bail!("packaged {adapter} doctor did not verify all Web runtime artifacts");
         }
 
         let exported = Command::new(executable)
@@ -2479,25 +2651,56 @@ fn verify_packaged_build_runtime_fails_closed(
     fixture: &Path,
 ) -> Result<()> {
     let project = fixture.join("apps/next-app");
-    for name in WEB_BUILD_RUNTIME_ARTIFACTS {
-        let path = release_root.join("libexec").join(name);
-        let original = fs::read(&path)?;
-        fs::write(&path, b"tampered-build-runtime")?;
-        let output = Command::new(executable)
+    let run_gate = |scenario: &str| -> Result<std::process::Output> {
+        Ok(Command::new(executable)
             .arg("--store")
-            .arg(verify_root.join(format!("tampered-{name}.db")))
+            .arg(verify_root.join(format!("{scenario}.db")))
             .arg("resolve")
             .arg("--build")
             .arg(&project)
             .arg("--allow-project-code")
-            .output()?;
-        fs::write(&path, original)?;
+            .output()?)
+    };
+    let verify_security_failure = |output: &std::process::Output, scenario: &str| -> Result<()> {
         if output.status.code() != Some(4)
             || !String::from_utf8_lossy(&output.stderr).contains("security policy violation")
         {
-            bail!("packaged build runtime {name} tamper did not fail closed before execution");
+            bail!("packaged {scenario} did not fail closed before execution");
         }
+        Ok(())
+    };
+    for name in WEB_RUNTIME_ARTIFACTS {
+        let path = release_root.join("libexec").join(name);
+        let original = fs::read(&path)?;
+        fs::write(&path, b"tampered-build-runtime")?;
+        let output = run_gate(&format!("tampered-{name}"));
+        let restored = fs::write(&path, original);
+        restored?;
+        let output = output?;
+        verify_security_failure(&output, &format!("Web runtime {name} tamper"))?;
     }
+
+    let collector = release_root
+        .join("libexec")
+        .join(RUNTIME_COLLECTOR_ARTIFACT);
+    let original_collector = fs::read(&collector)?;
+    fs::remove_file(&collector)?;
+    let missing = run_gate("missing-runtime-collector");
+    let restored = fs::write(&collector, original_collector);
+    restored?;
+    let missing = missing?;
+    verify_security_failure(&missing, "missing runtime collector")?;
+
+    let manifest_path = release_root.join("release-manifest.json");
+    let original_manifest = fs::read(&manifest_path)?;
+    let mut manifest: ReleaseManifest = serde_json::from_slice(&original_manifest)?;
+    manifest.compatibility.runtime_collector_contract_version = "runtime-collector-v2".to_owned();
+    fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)?;
+    let mismatch = run_gate("runtime-collector-version-mismatch");
+    let restored = fs::write(&manifest_path, original_manifest);
+    restored?;
+    let mismatch = mismatch?;
+    verify_security_failure(&mismatch, "runtime collector version mismatch")?;
     Ok(())
 }
 
@@ -2585,6 +2788,17 @@ fn verify_release_static_prelaunch_fails_closed(extracted: &Path) -> Result<()> 
         let mut manifest = baseline.clone();
         manifest.compatibility.packaged_smoke_contract = "unverified-packaged-smoke".to_owned();
         cases.push(("packaged smoke compatibility mismatch", manifest));
+
+        let mut manifest = baseline.clone();
+        manifest.compatibility.runtime_collector_contract_version =
+            "runtime-collector-v2".to_owned();
+        cases.push(("runtime collector compatibility mismatch", manifest));
+
+        let mut manifest = baseline.clone();
+        manifest
+            .runtime_artifacts
+            .retain(|artifact| artifact.path != format!("libexec/{RUNTIME_COLLECTOR_ARTIFACT}"));
+        cases.push(("missing runtime collector artifact", manifest));
 
         let mut manifest = baseline.clone();
         manifest.project_licenses.pop();
@@ -3485,7 +3699,7 @@ fn verify_packaged_milestone4(
     }
 
     verify_packaged_watcher(executable, &store, &fixture)?;
-    verify_packaged_runtime_and_graphml(executable, &store, verify_root)?;
+    verify_packaged_runtime_and_graphml(executable, &store, verify_root, &fixture)?;
     Ok(())
 }
 
@@ -3689,6 +3903,7 @@ fn verify_packaged_runtime_and_graphml(
     executable: &Path,
     store: &Path,
     verify_root: &Path,
+    fixture: &Path,
 ) -> Result<()> {
     let exported = Command::new(executable)
         .arg("--store")
@@ -3719,62 +3934,180 @@ fn verify_packaged_runtime_and_graphml(
     let profile_language = profile["language"]
         .as_str()
         .context("packaged runtime profile has no language")?;
-    let mut nodes = graph["nodes"]
+    let nodes = graph["nodes"]
         .as_array()
-        .context("packaged runtime base has no nodes")?
+        .context("packaged runtime base has no nodes")?;
+    let source_node = nodes
         .iter()
-        .filter_map(|node| node["id"].as_str());
-    let source = nodes
-        .next()
-        .context("packaged runtime base has no source node")?;
+        .find(|node| {
+            node["properties"]["path"]
+                .as_str()
+                .is_some_and(|path| fixture.join(path).is_file())
+        })
+        .context("packaged runtime base has no source backed by the real app fixture")?;
+    let source = source_node["id"]
+        .as_str()
+        .context("packaged runtime source node has no ID")?;
+    let source_path = source_node["properties"]["path"]
+        .as_str()
+        .context("packaged runtime source node has no repository path")?;
     let target = nodes
+        .iter()
+        .filter_map(|node| node["id"].as_str())
         .find(|node| *node != source)
         .context("packaged runtime base has no distinct target node")?;
+
+    let release_root = executable
+        .parent()
+        .and_then(Path::parent)
+        .context("packaged executable has no release root")?;
+    let collector_path = release_root
+        .join("libexec")
+        .join(RUNTIME_COLLECTOR_ARTIFACT);
+    if !collector_path.is_file() {
+        bail!("packaged runtime collector artifact is missing");
+    }
     let trace_path = verify_root.join("milestone4-runtime-trace.json");
+    let collector_input_path = verify_root.join("milestone4-runtime-collector-input.json");
     fs::write(
-        &trace_path,
+        &collector_input_path,
         serde_json::to_vec_pretty(&json!({
-            "schema_version": depgraph_core::RUNTIME_TRACE_SCHEMA_VERSION,
             "repository": {
                 "identity": repository_identity
             },
             "session": {
                 "id": "milestone4-packaged-session",
-                "started_at": "2026-07-24T00:00:00Z",
-                "ended_at": "2026-07-24T00:00:01Z",
                 "profile": {
                     "language": profile_language,
-                    "parent_profile_id": profile_id
+                    "parentProfileId": profile_id
                 },
                 "environment": {
                     "name": "release-candidate",
                     "runtime": "nodejs-24",
                     "region": "package-gate",
-                    "environment_keys": ["NODE_ENV"]
+                    "environmentKeys": ["NODE_ENV"]
                 },
                 "redaction": {
-                    "environment_keys": ["API_TOKEN"],
-                    "header_names": ["authorization"],
-                    "secret_names": ["release_secret"],
-                    "redacted_value_count": 3
+                    "environmentKeys": ["API_TOKEN"],
+                    "headerNames": ["authorization"],
+                    "secretNames": ["release_secret"],
+                    "redactedValueCount": 3
                 }
             },
-            "events": [{
-                "sequence": 1,
-                "timestamp": "2026-07-24T00:00:01Z",
-                "dependency_kind": "calls",
-                "source": {"kind": "node", "node_id": source},
-                "target": {"kind": "node", "node_id": target},
-                "count": 1,
-                "redaction": {
-                    "environment_keys": [],
-                    "header_names": ["authorization"],
-                    "secret_names": [],
-                    "redacted_value_count": 1
+            "observations": [
+                {
+                    "kind": "call",
+                    "source": {
+                        "kind": "repository_path",
+                        "path": source_path,
+                        "nodeKind": "file"
+                    },
+                    "target": {
+                        "kind": "node",
+                        "nodeId": target
+                    },
+                    "count": 1,
+                    "redaction": {
+                        "headerNames": ["authorization"]
+                    }
+                },
+                {
+                    "kind": "rpc",
+                    "source": {
+                        "kind": "node",
+                        "nodeId": source
+                    },
+                    "target": {
+                        "kind": "http_url",
+                        "url": "https://release-user:release_secret_value@API.EXAMPLE.TEST:443/private/release_secret_value?token=release_secret_value#release_secret_value"
+                    },
+                    "redaction": {
+                        "secretNames": ["release_secret"]
+                    }
                 }
-            }]
+            ]
         }))?,
     )?;
+    let runner_path = verify_root.join("milestone4-runtime-collector-runner.mjs");
+    fs::write(
+        &runner_path,
+        r#"import { readFile } from "node:fs/promises";
+import { pathToFileURL } from "node:url";
+
+const [collectorPath, inputPath, tracePath] = process.argv.slice(2);
+const sdk = await import(pathToFileURL(collectorPath).href);
+if (sdk.RUNTIME_COLLECTOR_CONTRACT_VERSION !== "runtime-collector-v1"
+    || sdk.RUNTIME_TRACE_SCHEMA_VERSION !== "1.0") {
+  throw new Error("packaged runtime collector compatibility mismatch");
+}
+const input = JSON.parse(await readFile(inputPath, "utf8"));
+let wallMs = Date.parse("2026-07-24T00:00:00Z");
+const collector = sdk.createRuntimeCollector({
+  repository: input.repository,
+  session: input.session,
+  sink: sdk.createFileRuntimeCollectorSink(tracePath),
+  clock: {
+    utcNow() {
+      const now = new Date(wallMs);
+      wallMs += 1_000;
+      return now;
+    },
+    monotonicNow() {
+      return 0;
+    },
+  },
+  retry: { maxAttempts: 0 },
+});
+for (const observation of input.observations) {
+  if (!collector.record(observation)) {
+    throw new Error("packaged runtime collector rejected a fixture observation");
+  }
+}
+const result = await collector.shutdown();
+if (result.status !== "flushed") {
+  throw new Error(`packaged runtime collector flush failed: ${JSON.stringify(result)}`);
+}
+process.stdout.write(JSON.stringify({
+  contract_version: sdk.RUNTIME_COLLECTOR_CONTRACT_VERSION,
+  descriptor: collector.descriptor,
+  result,
+  stats: collector.stats(),
+}));
+"#,
+    )?;
+    let generated = Command::new("node")
+        .arg(process_argument_path(&runner_path))
+        .arg(process_argument_path(&collector_path))
+        .arg(process_argument_path(&collector_input_path))
+        .arg(process_argument_path(&trace_path))
+        .output()
+        .context("failed to run the packaged runtime collector")?;
+    if bytes_contain(&generated.stdout, b"release_secret_value")
+        || bytes_contain(&generated.stderr, b"release_secret_value")
+    {
+        bail!("packaged runtime collector leaked a secret through diagnostics");
+    }
+    let generated = successful_json(generated, "packaged runtime collector generation")?;
+    if generated["contract_version"] != RUNTIME_COLLECTOR_CONTRACT_VERSION
+        || generated["descriptor"]["contract_version"] != RUNTIME_COLLECTOR_CONTRACT_VERSION
+        || generated["descriptor"]["output_schema_version"]
+            != depgraph_core::RUNTIME_TRACE_SCHEMA_VERSION
+        || generated["result"]["status"] != "flushed"
+        || generated["stats"]["acceptedEvents"] != 2
+        || generated["stats"]["flushedPrefixes"] != 1
+    {
+        bail!("packaged runtime collector reported an incompatible result: {generated}");
+    }
+    let generated_trace: Value = serde_json::from_slice(&fs::read(&trace_path)?)
+        .context("packaged runtime collector generated invalid JSON")?;
+    if generated_trace["session"]["collector_contract_version"]
+        != RUNTIME_COLLECTOR_CONTRACT_VERSION
+        || generated_trace["events"]
+            .as_array()
+            .is_none_or(|events| events.len() != 2)
+    {
+        bail!("packaged runtime collector generated an incompatible trace: {generated_trace}");
+    }
 
     let validated = Command::new(executable)
         .arg("--store")
@@ -3787,6 +4120,7 @@ fn verify_packaged_runtime_and_graphml(
     let validated = successful_json(validated, "packaged runtime trace validation")?;
     if validated["command"] != "runtime.validate"
         || validated["data"]["profile_match"]["status"] != "resolved"
+        || validated["data"]["summary"]["events"] != 2
         || validated["data"]["summary"]["resolved_targets"] != 1
     {
         bail!("packaged runtime trace validation was incomplete: {validated}");
@@ -6480,7 +6814,7 @@ fn verify_release_metadata(extracted: &Path) -> Result<ReleaseManifest> {
         bail!("release manifest schema path does not match the packaged protocol schema");
     }
     verify_release_artifact(extracted, &manifest.schema, "schema")?;
-    let expected_runtime_paths = WEB_BUILD_RUNTIME_ARTIFACTS
+    let expected_runtime_paths = WEB_RUNTIME_ARTIFACTS
         .iter()
         .map(|name| format!("libexec/{name}"))
         .collect::<BTreeSet<_>>();
@@ -6490,9 +6824,9 @@ fn verify_release_metadata(extracted: &Path) -> Result<ReleaseManifest> {
         .map(|artifact| artifact.path.clone())
         .collect::<BTreeSet<_>>();
     if declared_runtime_paths != expected_runtime_paths
-        || manifest.runtime_artifacts.len() != WEB_BUILD_RUNTIME_ARTIFACTS.len()
+        || manifest.runtime_artifacts.len() != WEB_RUNTIME_ARTIFACTS.len()
     {
-        bail!("release manifest Web build runtime attestation is incomplete or unknown");
+        bail!("release manifest Web runtime artifact closure is incomplete or unknown");
     }
     let mut runtime_paths = BTreeSet::new();
     for artifact in &manifest.runtime_artifacts {
@@ -6504,6 +6838,13 @@ fn verify_release_metadata(extracted: &Path) -> Result<ReleaseManifest> {
         }
         verify_release_artifact(extracted, artifact, "runtime artifact")?;
     }
+    let runtime_collector_sha256 = manifest
+        .runtime_artifacts
+        .iter()
+        .find(|artifact| artifact.path == format!("libexec/{RUNTIME_COLLECTOR_ARTIFACT}"))
+        .context("release manifest has no runtime collector artifact")?
+        .sha256
+        .clone();
     let mut components = BTreeMap::new();
     for component in &manifest.runtime_components {
         if component.name.trim().is_empty() || component.version.trim().is_empty() {
@@ -6688,6 +7029,7 @@ fn verify_release_metadata(extracted: &Path) -> Result<ReleaseManifest> {
         .collect::<BTreeSet<_>>();
     for required in [
         "@astrojs/compiler",
+        "depgraph-runtime-collector",
         "typescript",
         "golang.org/x/tools",
         "ra_ap_hir",
@@ -6704,6 +7046,7 @@ fn verify_release_metadata(extracted: &Path) -> Result<ReleaseManifest> {
             bail!("release SBOM is missing runtime dependency {required}");
         }
     }
+    verify_runtime_collector_sbom(&sbom, &runtime_collector_sha256, "release")?;
     if package_names
         .iter()
         .filter(|name| name.starts_with("@typescript/typescript-"))
@@ -6777,6 +7120,11 @@ fn verify_release_metadata(extracted: &Path) -> Result<ReleaseManifest> {
         bail!("release SBOM does not declare its package-manager component boundary");
     }
     let license_inventory = fs::read_to_string(extracted.join("THIRD_PARTY_LICENSES.txt"))?;
+    if !license_inventory.contains(&format!(
+        "First-party artifact {RUNTIME_COLLECTOR_ARTIFACT} ({RUNTIME_COLLECTOR_CONTRACT_VERSION}) is licensed under {PROJECT_LICENSE_EXPRESSION}"
+    )) {
+        bail!("license inventory is missing the runtime collector project license notice");
+    }
     for (name, version, license) in [
         ("@astrojs/compiler", "4.0.0", "MIT"),
         ("typescript", TYPESCRIPT_VERSION, "Apache-2.0"),
@@ -6877,6 +7225,14 @@ fn verify_release_metadata(extracted: &Path) -> Result<ReleaseManifest> {
         bail!("third-party license inventory differs from the locked package dependency inventory");
     }
     verify_typescript_compiler(extracted)?;
+    verify_runtime_collector_module(
+        &verified_release_path(
+            extracted,
+            &format!("libexec/{RUNTIME_COLLECTOR_ARTIFACT}"),
+            "runtime collector",
+        )?,
+        "release",
+    )?;
     let rust_worker = manifest
         .workers
         .iter()
@@ -6962,6 +7318,32 @@ fn verify_packaged_web_handshake(
         bail!(
             "packaged Web worker handshake does not match its release manifest compatibility unit"
         );
+    }
+    Ok(())
+}
+
+fn verify_runtime_collector_module(path: &Path, context: &str) -> Result<()> {
+    let output = Command::new("node")
+        .args([
+            "--input-type=module",
+            "--eval",
+            r#"import { pathToFileURL } from "node:url";
+const sdk = await import(pathToFileURL(process.argv[1]).href);
+process.stdout.write(`${sdk.RUNTIME_COLLECTOR_CONTRACT_VERSION}\t${sdk.RUNTIME_TRACE_SCHEMA_VERSION}\n`);
+"#,
+        ])
+        .arg(process_argument_path(path))
+        .output()
+        .with_context(|| format!("failed to inspect {context} runtime collector"))?;
+    let expected = format!(
+        "{RUNTIME_COLLECTOR_CONTRACT_VERSION}\t{}\n",
+        depgraph_core::RUNTIME_TRACE_SCHEMA_VERSION
+    );
+    if !output.status.success()
+        || !output.stderr.is_empty()
+        || String::from_utf8(output.stdout)? != expected
+    {
+        bail!("{context} runtime collector module has an incompatible version handshake");
     }
     Ok(())
 }
