@@ -42,13 +42,13 @@ fn golden_stream_contains_and_validates_all_nine_event_types() {
 }
 
 #[test]
-fn json_schema_is_draft_2020_12_and_lists_nine_events() {
+fn json_schema_is_draft_2020_12_and_lists_full_and_delta_events() {
     let schema: Value = serde_json::from_str(PROTOCOL_SCHEMA).expect("schema must be valid JSON");
     assert_eq!(
         schema["$schema"],
         "https://json-schema.org/draft/2020-12/schema"
     );
-    assert_eq!(schema["oneOf"].as_array().unwrap().len(), 9);
+    assert_eq!(schema["oneOf"].as_array().unwrap().len(), 21);
     assert!(jsonschema::draft202012::meta::is_valid(&schema));
     let validator = jsonschema::draft202012::new(&schema).expect("schema must compile");
     for line in GOLDEN.lines() {

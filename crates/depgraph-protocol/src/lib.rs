@@ -6,12 +6,21 @@
 //! compatibility; unknown event names and malformed required fields are not.
 
 mod condition;
+mod delta;
 mod event;
 mod model;
 mod stable_id;
 mod validator;
 
 pub use condition::Condition;
+pub use delta::{
+    CoverageDelete, CoverageUpsert, DELTA_CONTRACT_VERSION, DeltaBaseGraph, DeltaCompleted,
+    DeltaCoverage, DeltaCoverageKey, DeltaEdgeUpsert, DeltaEvent, DeltaEvidenceKey,
+    DeltaEvidenceOwner, DeltaEvidenceRecord, DeltaFileCoverage, DeltaNodeUpsert, DeltaScope,
+    DeltaStarted, DeltaValidator, EdgeDelete, EvidenceDelete, EvidenceUpsert, NodeDelete,
+    SiteDelete, SiteUpsert, ValidatedDelta, WORKER_DELTA_CAPABILITY, WorkerProtocolMode,
+    build_delta_stable_id, negotiate_worker_protocol, validate_delta_ndjson,
+};
 pub use event::{
     CommonFields, DependencySiteEvent, DiagnosticEvent, EdgeUpsert, FileCompleted, NodeUpsert,
     ProfileCompleted, ProfileDeclared, ProtocolEvent, ScanCompleted, ScanStarted,
