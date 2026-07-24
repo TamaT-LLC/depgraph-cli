@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
-import { closeSync, openSync } from "node:fs";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { PassThrough, Writable } from "node:stream";
 import test from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -487,36 +487,34 @@ test("a sink resolving after the shutdown deadline cannot commit a successful fl
   assert.equal(collector.stats().flushedPrefixes, 0);
 });
 
-test("stdout completes its file-descriptor write before shutdown returns", async () => {
+test("stdout handoff does not wait on an uncancellable drain callback", async () => {
   const fixture = await readFixture("next");
-  const directory = await mkdtemp(path.join(tmpdir(), "depgraph-runtime-stdout-"));
-  const destination = path.join(directory, "trace.ndjson");
-  const fileDescriptor = openSync(destination, "wx", 0o600);
-  try {
-    const collector = createRuntimeCollector({
-      repository: fixture.repository,
-      session: fixture.session,
-      sink: createStdoutRuntimeCollectorSink(fileDescriptor),
-      clock: new StepClock("2026-07-24T00:00:00Z"),
-      shutdownTimeoutMs: 10,
-    });
-    assert(collector.record(basicObservation("src/stdout-sync.ts")));
+  let completeWrite: (() => void) | undefined;
+  const output = new Writable({
+    write(_chunk, _encoding, callback) {
+      completeWrite = callback;
+    },
+  });
+  const collector = createRuntimeCollector({
+    repository: fixture.repository,
+    session: fixture.session,
+    sink: createStdoutRuntimeCollectorSink(output),
+    clock: new StepClock("2026-07-24T00:00:00Z"),
+    shutdownTimeoutMs: 10,
+  });
+  assert(collector.record(basicObservation("src/stdout-queue.ts")));
 
-    assert.deepEqual(await collector.shutdown(), {
-      status: "flushed",
-      prefixEnd: 1,
-      attempts: 1,
-    });
-    assert.equal(collector.state, "stopped");
-    assert.equal(collector.stats().flushedPrefixes, 1);
-    assert.equal(collector.stats().dropped.shutdown_timeout, 0);
-    assert.equal((await readFile(destination, "utf8")), `${collector.snapshot()}\n`);
-  } finally {
-    closeSync(fileDescriptor);
-    await rm(directory, { recursive: true, force: true });
-  }
+  assert.deepEqual(await collector.shutdown(), {
+    status: "flushed",
+    prefixEnd: 1,
+    attempts: 1,
+  });
+  assert.equal(collector.state, "stopped");
+  assert.equal(collector.stats().flushedPrefixes, 1);
+  assert.equal(collector.stats().dropped.shutdown_timeout, 0);
 
-  assert.throws(() => createStdoutRuntimeCollectorSink(-1));
+  completeWrite?.();
+  output.destroy();
 });
 
 test("file, stdout, and OTLP sinks carry the same canonical trace bytes", async () => {
@@ -532,20 +530,16 @@ test("file, stdout, and OTLP sinks carry the same canonical trace bytes", async 
     assert.equal((await fileCollector.flush()).status, "flushed");
     const filePayload = await readFile(destination);
 
-    const stdoutDestination = path.join(directory, "trace.ndjson");
-    const stdoutFileDescriptor = openSync(stdoutDestination, "wx", 0o600);
-    let stdoutPayload: Buffer;
-    try {
-      const stdoutCollector = createFixtureCollector(
-        fixture,
-        createStdoutRuntimeCollectorSink(stdoutFileDescriptor),
-      );
-      fixture.observations.forEach((observation) => assert(stdoutCollector.record(observation)));
-      assert.equal((await stdoutCollector.flush()).status, "flushed");
-      stdoutPayload = (await readFile(stdoutDestination)).subarray(0, -1);
-    } finally {
-      closeSync(stdoutFileDescriptor);
-    }
+    const output = new PassThrough();
+    const chunks: Buffer[] = [];
+    output.on("data", (chunk: Buffer) => chunks.push(Buffer.from(chunk)));
+    const stdoutCollector = createFixtureCollector(
+      fixture,
+      createStdoutRuntimeCollectorSink(output),
+    );
+    fixture.observations.forEach((observation) => assert(stdoutCollector.record(observation)));
+    assert.equal((await stdoutCollector.flush()).status, "flushed");
+    const stdoutPayload = Buffer.concat(chunks).subarray(0, -1);
 
     let otlpBody: Buffer | undefined;
     let otlpAttributes: Record<string, unknown> | undefined;
