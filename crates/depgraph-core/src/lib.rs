@@ -24,8 +24,8 @@ use std::{
 use anyhow::{Context, Result};
 use depgraph_store::{
     AdapterLogRecord, CACHE_CONTRACT_VERSION, CacheEntryCounts, CacheEventRecord, CoverageRecord,
-    DiagnosticRecord, FileCoverageRecord, ProfileMatrixRecord, ProfileRecord,
-    SNAPSHOT_DIFF_SCHEMA_VERSION, STORE_SCHEMA_VERSION, Store,
+    DiagnosticRecord, FileCoverageRecord, IMPACT_QUERY_CACHE_CONTRACT_VERSION, ProfileMatrixRecord,
+    ProfileRecord, SNAPSHOT_DIFF_SCHEMA_VERSION, STORE_SCHEMA_VERSION, Store,
 };
 use serde::{Deserialize, Serialize};
 
@@ -56,8 +56,9 @@ pub use export::{
 };
 pub use graphml::GRAPHML_SCHEMA_VERSION;
 pub use impact::{
-    ChangedNodeMapping, GitChange, GitChangedSet, ImpactDiagnostic, ImpactFilters, ImpactNode,
-    ImpactResult, impact, map_changed_set, read_git_changed_set,
+    ChangedNodeMapping, GitChange, GitChangedSet, IMPACT_QUERY_CACHE_SCHEMA_VERSION,
+    ImpactDiagnostic, ImpactFilters, ImpactNode, ImpactResult, impact, impact_query_cache_key,
+    map_changed_set, read_git_changed_set,
 };
 pub use incremental::{
     INCREMENTAL_PLAN_SCHEMA_VERSION, IncrementalChangeKind, IncrementalFileChange,
@@ -138,6 +139,8 @@ pub struct DoctorReport {
     pub store_schema_version: i64,
     pub cache_contract_version: u32,
     pub cache_entries: CacheEntryCounts,
+    pub impact_query_cache_contract_version: u32,
+    pub impact_query_cache_entries: u64,
     pub recent_cache_events: Vec<CacheEventRecord>,
     pub toolchains: BTreeMap<String, String>,
     pub supported_baselines: BTreeMap<String, String>,
@@ -324,6 +327,8 @@ pub async fn doctor(store: &Store) -> Result<DoctorReport> {
         store_schema_version: store.schema_version()?,
         cache_contract_version: CACHE_CONTRACT_VERSION,
         cache_entries: store.cache_entry_counts()?,
+        impact_query_cache_contract_version: IMPACT_QUERY_CACHE_CONTRACT_VERSION,
+        impact_query_cache_entries: store.impact_query_cache_entry_count()?,
         recent_cache_events: store.recent_cache_events(20)?,
         toolchains: toolchain_versions(&root).await,
         supported_baselines: BTreeMap::from([

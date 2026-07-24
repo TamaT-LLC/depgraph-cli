@@ -15,6 +15,7 @@ use serde_json::{Value, json};
 
 mod cache;
 mod diff;
+mod impact_cache;
 mod incremental;
 mod profile_matrix;
 mod runtime;
@@ -26,6 +27,10 @@ pub use cache::{
 pub use diff::{
     ChangedRecord, GraphSnapshotDiff, NodeRename, NodeRenameEvidence, RecordDiff, RenameConfidence,
     SNAPSHOT_DIFF_SCHEMA_VERSION, diff_graph_snapshots,
+};
+pub use impact_cache::{
+    IMPACT_QUERY_CACHE_CONTRACT_VERSION, IMPACT_QUERY_CACHE_MAX_ENTRIES,
+    IMPACT_QUERY_CACHE_MAX_PAYLOAD_BYTES,
 };
 pub use incremental::{IncrementalDeltaRecord, IncrementalReplacementScope};
 use profile_matrix::refresh_profile_matrix;
@@ -41,7 +46,7 @@ pub use runtime::{
     runtime_context_for_edge,
 };
 
-pub const STORE_SCHEMA_VERSION: i64 = 12;
+pub const STORE_SCHEMA_VERSION: i64 = 13;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ScanRecord {
@@ -928,6 +933,29 @@ impl Store {
                  CREATE INDEX incremental_deltas_base_status
                     ON incremental_deltas(base_snapshot_id, status, staged_at, scan_id, delta_id);
                  PRAGMA user_version = 12;",
+            )?;
+            tx.commit()?;
+        }
+        if current < 13 {
+            let tx = self.connection.transaction()?;
+            tx.execute_batch(
+                "CREATE TABLE impact_query_cache (
+                    key TEXT PRIMARY KEY,
+                    contract_version INTEGER NOT NULL,
+                    snapshot_id TEXT NOT NULL
+                        REFERENCES completed_snapshots(id) ON DELETE CASCADE,
+                    payload_json TEXT NOT NULL,
+                    payload_digest TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    last_used_at TEXT NOT NULL,
+                    last_used_sequence INTEGER NOT NULL,
+                    hit_count INTEGER NOT NULL DEFAULT 0
+                 );
+                 CREATE INDEX impact_query_cache_snapshot_used
+                    ON impact_query_cache(snapshot_id, last_used_sequence, key);
+                 CREATE INDEX impact_query_cache_lru
+                    ON impact_query_cache(last_used_sequence, key);
+                 PRAGMA user_version = 13;",
             )?;
             tx.commit()?;
         }
@@ -5064,6 +5092,7 @@ mod tests {
             "build_cache",
             "cache_events",
             "incremental_deltas",
+            "impact_query_cache",
         ] {
             let count: i64 = store.connection.query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
@@ -5112,6 +5141,7 @@ mod tests {
         let connection = Connection::open(&path)?;
         connection.execute_batch(
             "PRAGMA foreign_keys=OFF;
+             DROP TABLE impact_query_cache;
              DROP TABLE cache_events;
              DROP TABLE syntax_cache;
              DROP TABLE semantic_cache;
@@ -5161,7 +5191,8 @@ mod tests {
         };
         let connection = Connection::open(&path)?;
         connection.execute_batch(
-            "DROP TABLE incremental_deltas;
+            "DROP TABLE impact_query_cache;
+             DROP TABLE incremental_deltas;
              DROP TABLE cache_events;
              DROP TABLE syntax_cache;
              DROP TABLE semantic_cache;
