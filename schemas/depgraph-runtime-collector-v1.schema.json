@@ -1,0 +1,211 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tamat.dev/depgraph/schemas/depgraph-runtime-collector-v1.schema.json",
+  "title": "depgraph production runtime collector contract v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract_version",
+    "output_schema_version",
+    "lifecycle",
+    "buffer",
+    "flush",
+    "retry",
+    "sequence",
+    "clock",
+    "transport",
+    "redaction",
+    "limits"
+  ],
+  "properties": {
+    "contract_version": { "const": "runtime-collector-v1" },
+    "output_schema_version": { "const": "1.0" },
+    "lifecycle": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["disabled", "record_failure", "shutdown"],
+      "properties": {
+        "disabled": { "const": "no_op" },
+        "record_failure": { "const": "non_throwing_drop" },
+        "shutdown": { "const": "bounded_best_effort" }
+      }
+    },
+    "buffer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["max_events", "max_bytes", "overflow"],
+      "properties": {
+        "max_events": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100000
+        },
+        "max_bytes": {
+          "type": "integer",
+          "minimum": 1024,
+          "maximum": 16777216
+        },
+        "overflow": { "const": "drop_newest" }
+      }
+    },
+    "flush": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["snapshot", "concurrency", "shutdown_timeout_ms"],
+      "properties": {
+        "snapshot": { "const": "immutable_contiguous_prefix" },
+        "concurrency": { "const": "coalesce" },
+        "shutdown_timeout_ms": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 60000
+        }
+      }
+    },
+    "retry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "max_attempts",
+        "initial_backoff_ms",
+        "max_backoff_ms",
+        "payload",
+        "exhaustion"
+      ],
+      "properties": {
+        "max_attempts": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 10
+        },
+        "initial_backoff_ms": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 60000
+        },
+        "max_backoff_ms": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 60000
+        },
+        "payload": { "const": "byte_identical" },
+        "exhaustion": { "const": "report_and_drop" }
+      }
+    },
+    "sequence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["initial", "assignment", "ordering"],
+      "properties": {
+        "initial": { "const": 1 },
+        "assignment": { "const": "accepted_event" },
+        "ordering": { "const": "contiguous_acceptance_order" }
+      }
+    },
+    "clock": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "wall_source",
+        "duration_source",
+        "timestamp_format",
+        "wall_regression"
+      ],
+      "properties": {
+        "wall_source": {
+          "enum": ["system_utc", "injected_utc"]
+        },
+        "duration_source": { "const": "monotonic" },
+        "timestamp_format": { "const": "rfc3339_utc" },
+        "wall_regression": { "const": "clamp_to_previous" }
+      }
+    },
+    "transport": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "canonical_payload", "media_type"],
+      "properties": {
+        "kind": {
+          "enum": ["file", "stdout", "otlp"]
+        },
+        "canonical_payload": { "const": "depgraph-runtime-trace-v1" },
+        "media_type": {
+          "const": "application/vnd.tamat.depgraph.runtime-trace.v1+json"
+        }
+      }
+    },
+    "redaction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "stage",
+        "url_policy",
+        "environment_keys",
+        "header_names",
+        "secret_names"
+      ],
+      "properties": {
+        "stage": { "const": "before_buffer" },
+        "url_policy": { "const": "scheme_host_port_only" },
+        "environment_keys": { "$ref": "#/$defs/nameList" },
+        "header_names": { "$ref": "#/$defs/nameList" },
+        "secret_names": { "$ref": "#/$defs/nameList" }
+      }
+    },
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "max_events_per_second",
+        "max_trace_events",
+        "max_trace_bytes",
+        "max_string_chars"
+      ],
+      "properties": {
+        "max_events_per_second": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100000
+        },
+        "max_trace_events": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100000
+        },
+        "max_trace_bytes": {
+          "type": "integer",
+          "minimum": 1024,
+          "maximum": 16777216
+        },
+        "max_string_chars": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4096
+        }
+      }
+    }
+  },
+  "$defs": {
+    "name": {
+      "allOf": [
+        {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512,
+          "pattern": "^[A-Za-z0-9_.:/-]+$"
+        },
+        {
+          "not": {
+            "pattern": "://|[@?#%=]"
+          }
+        }
+      ]
+    },
+    "nameList": {
+      "type": "array",
+      "maxItems": 256,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/name" }
+    }
+  }
+}

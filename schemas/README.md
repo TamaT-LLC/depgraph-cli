@@ -25,4 +25,16 @@ runtime trace import contract. The contract stores environment, header, and
 secret names plus redaction counts, never their values. Repository paths are
 portable relative paths; absolute/root-escaping paths, unknown fields,
 unsupported versions, and unbounded documents fail closed before matching or
-store access.
+store access. Output that declares
+`session.collector_contract_version=runtime-collector-v1` additionally rejects
+raw URL graph locators and HTTP targets containing anything other than a
+bounded redacted authority.
+
+`depgraph-runtime-collector-v1.schema.json` describes the production collector
+SDK behavior that precedes trace import. It fixes non-throwing lifecycle,
+bounded drop-newest buffering, immutable-prefix flush and retry, deterministic
+sequence/clock behavior, file/stdout/OTLP transport identity, pre-buffer
+redaction, and size/rate ceilings. The descriptor contains name-only policy and
+never contains a sink endpoint, credential, header value, or environment value.
+The canonical payload remains `depgraph-runtime-trace-v1`; vendor spans are not
+a core input contract.

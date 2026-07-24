@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     io::Read,
+    net::Ipv6Addr,
 };
 
 use anyhow::{Context, Result, bail};
@@ -15,8 +16,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub const RUNTIME_TRACE_SCHEMA_VERSION: &str = "1.0";
+pub const RUNTIME_COLLECTOR_CONTRACT_VERSION: &str = "runtime-collector-v1";
 pub const RUNTIME_TRACE_MAX_BYTES: usize = 16 * 1024 * 1024;
 pub const RUNTIME_TRACE_MAX_EVENTS: usize = 100_000;
+pub const RUNTIME_COLLECTOR_SCHEMA: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../schemas/depgraph-runtime-collector-v1.schema.json"
+));
 pub const RUNTIME_TRACE_SCHEMA: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../schemas/depgraph-runtime-trace-v1.schema.json"
@@ -52,6 +58,8 @@ pub struct RuntimeTraceSession {
     pub started_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ended_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collector_contract_version: Option<String>,
     pub profile: RuntimeTraceProfile,
     pub environment: RuntimeTraceEnvironment,
     #[serde(default)]
@@ -907,6 +915,11 @@ impl RuntimeTrace {
             validate_bounded_string(revision, "repository.revision", MAX_ID_CHARS)?;
         }
         validate_bounded_string(&self.session.id, "session.id", MAX_ID_CHARS)?;
+        let production_collector = match self.session.collector_contract_version.as_deref() {
+            None => false,
+            Some(RUNTIME_COLLECTOR_CONTRACT_VERSION) => true,
+            Some(_) => bail!("unsupported runtime collector contract version"),
+        };
         validate_identifier(&self.session.profile.language, "session.profile.language")?;
         if let Some(target) = &self.session.profile.target {
             validate_bounded_string(target, "session.profile.target", MAX_ID_CHARS)?;
@@ -936,6 +949,15 @@ impl RuntimeTrace {
             MAX_NAMES,
         )?;
         self.session.redaction.normalize("session.redaction")?;
+        if production_collector {
+            validate_collector_names(
+                &self.session.environment.environment_keys,
+                "session.environment.environment_keys",
+            )?;
+            self.session
+                .redaction
+                .validate_collector_names("session.redaction")?;
+        }
 
         let started_at = normalize_timestamp(&mut self.session.started_at, "session.started_at")?;
         let ended_at = self
@@ -966,12 +988,17 @@ impl RuntimeTrace {
                 bail!("runtime trace event timestamp is outside its session bounds");
             }
             validate_identifier(&event.dependency_kind, "events[].dependency_kind")?;
-            validate_locator(&event.source, "events[].source")?;
-            validate_locator(&event.target, "events[].target")?;
+            validate_locator(&event.source, "events[].source", production_collector)?;
+            validate_locator(&event.target, "events[].target", production_collector)?;
             if event.count == 0 {
                 bail!("runtime trace events[].count must be greater than zero");
             }
             event.redaction.normalize("events[].redaction")?;
+            if production_collector {
+                event
+                    .redaction
+                    .validate_collector_names("events[].redaction")?;
+            }
         }
         Ok(())
     }
@@ -995,6 +1022,12 @@ impl RuntimeTraceRedaction {
             MAX_NAMES,
         )
     }
+
+    fn validate_collector_names(&self, field: &str) -> Result<()> {
+        validate_collector_names(&self.environment_keys, &format!("{field}.environment_keys"))?;
+        validate_collector_names(&self.header_names, &format!("{field}.header_names"))?;
+        validate_collector_names(&self.secret_names, &format!("{field}.secret_names"))
+    }
 }
 
 fn normalize_timestamp(value: &mut String, field: &str) -> Result<DateTime<Utc>> {
@@ -1005,13 +1038,20 @@ fn normalize_timestamp(value: &mut String, field: &str) -> Result<DateTime<Utc>>
     Ok(parsed)
 }
 
-fn validate_locator(locator: &RuntimeTraceLocator, field: &str) -> Result<()> {
+fn validate_locator(
+    locator: &RuntimeTraceLocator,
+    field: &str,
+    production_collector: bool,
+) -> Result<()> {
     match locator {
         RuntimeTraceLocator::Node { node_id } => {
             validate_bounded_string(node_id, &format!("{field}.node_id"), MAX_ID_CHARS)
         }
         RuntimeTraceLocator::GraphLocator { locator, node_kind } => {
             validate_graph_locator(locator, &format!("{field}.locator"))?;
+            if production_collector && looks_like_http_url(locator) {
+                bail!("runtime trace {field}.locator must not contain a raw URL");
+            }
             if let Some(node_kind) = node_kind {
                 validate_identifier(node_kind, &format!("{field}.node_kind"))?;
             }
@@ -1026,7 +1066,11 @@ fn validate_locator(locator: &RuntimeTraceLocator, field: &str) -> Result<()> {
         }
         RuntimeTraceLocator::External { namespace, name } => {
             validate_identifier(namespace, &format!("{field}.namespace"))?;
-            validate_bounded_string(name, &format!("{field}.name"), MAX_STRING_CHARS)
+            validate_bounded_string(name, &format!("{field}.name"), MAX_STRING_CHARS)?;
+            if production_collector {
+                validate_external_name(namespace, name, &format!("{field}.name"))?;
+            }
+            Ok(())
         }
         RuntimeTraceLocator::Unresolved { reason } => {
             validate_identifier(reason, &format!("{field}.reason"))
@@ -1055,6 +1099,111 @@ fn validate_graph_locator(locator: &str, field: &str) -> Result<()> {
         validate_repository_path(path, field)?;
     }
     Ok(())
+}
+
+fn validate_external_name(namespace: &str, name: &str, field: &str) -> Result<()> {
+    if looks_like_raw_url(name) {
+        bail!("runtime trace {field} must contain only a redacted HTTP authority");
+    }
+    if matches_ignore_ascii_case(namespace, "http", "https") {
+        validate_http_authority(name, field)?;
+    }
+    Ok(())
+}
+
+fn validate_collector_names(names: &[String], field: &str) -> Result<()> {
+    if names.iter().any(|name| {
+        looks_like_raw_url(name)
+            || name
+                .chars()
+                .any(|character| matches!(character, '@' | '?' | '#' | '%' | '='))
+    }) {
+        bail!("runtime trace {field} must contain redacted names only");
+    }
+    Ok(())
+}
+
+fn looks_like_raw_url(value: &str) -> bool {
+    let Some((scheme, _)) = value.split_once("://") else {
+        return false;
+    };
+    !scheme.is_empty()
+        && scheme.chars().enumerate().all(|(index, character)| {
+            if index == 0 {
+                character.is_ascii_alphabetic()
+            } else {
+                character.is_ascii_alphanumeric() || matches!(character, '+' | '-' | '.')
+            }
+        })
+}
+
+fn validate_http_authority(authority: &str, field: &str) -> Result<()> {
+    let invalid =
+        || anyhow::anyhow!("runtime trace {field} must contain a redacted HTTP authority");
+    if !authority.is_ascii() || authority != authority.to_ascii_lowercase() {
+        return Err(invalid());
+    }
+
+    let (host, port) = if let Some(ipv6) = authority.strip_prefix('[') {
+        let close = ipv6.find(']').ok_or_else(&invalid)?;
+        let (address, suffix) = ipv6.split_at(close);
+        if address.is_empty() || address.contains('.') || address.parse::<Ipv6Addr>().is_err() {
+            return Err(invalid());
+        }
+        let suffix = &suffix[1..];
+        let port = if suffix.is_empty() {
+            None
+        } else {
+            Some(suffix.strip_prefix(':').ok_or_else(&invalid)?)
+        };
+        (address, port)
+    } else {
+        let mut parts = authority.split(':');
+        let host = parts.next().ok_or_else(&invalid)?;
+        let port = parts.next();
+        if parts.next().is_some()
+            || host.is_empty()
+            || host.split('.').any(|label| {
+                label.is_empty()
+                    || !label.chars().all(|character| {
+                        character.is_ascii_lowercase()
+                            || character.is_ascii_digit()
+                            || character == '-'
+                    })
+                    || !label
+                        .chars()
+                        .next()
+                        .is_some_and(|character| character.is_ascii_alphanumeric())
+                    || !label
+                        .chars()
+                        .next_back()
+                        .is_some_and(|character| character.is_ascii_alphanumeric())
+            })
+        {
+            return Err(invalid());
+        }
+        (host, port)
+    };
+    if host.is_empty()
+        || port.is_some_and(|port| {
+            port.is_empty()
+                || !port.chars().all(|character| character.is_ascii_digit())
+                || (port.len() > 1 && port.starts_with('0'))
+                || port.parse::<u16>().is_err()
+        })
+    {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
+fn looks_like_http_url(value: &str) -> bool {
+    strip_ascii_case_prefix(value, "http://").is_some()
+        || strip_ascii_case_prefix(value, "https://").is_some()
+}
+
+fn matches_ignore_ascii_case(value: &str, first: &str, second: &str) -> bool {
+    value.eq_ignore_ascii_case(first) || value.eq_ignore_ascii_case(second)
 }
 
 fn strip_ascii_case_prefix<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
@@ -1421,6 +1570,10 @@ mod tests {
     const GOLDEN: &str = include_str!("../tests/fixtures/runtime-trace-v1.golden.json");
     const MALFORMED: &str = include_str!("../tests/fixtures/runtime-trace-v1.malformed.json");
     const SECRET: &str = include_str!("../tests/fixtures/runtime-trace-v1.secret.json");
+    const COLLECTOR_CONTRACT: &str =
+        include_str!("../tests/fixtures/runtime-collector-v1.contract.json");
+    const COLLECTOR_SECRET_OUTPUT: &str =
+        include_str!("../tests/fixtures/runtime-collector-v1.secret-output.json");
 
     fn snapshot() -> GraphSnapshot {
         GraphSnapshot {
@@ -1637,6 +1790,54 @@ mod tests {
     }
 
     #[test]
+    fn production_collector_contract_is_fixed_by_json_schema() -> Result<()> {
+        let contract: Value = serde_json::from_str(COLLECTOR_CONTRACT)?;
+        assert_eq!(
+            contract["contract_version"],
+            json!(RUNTIME_COLLECTOR_CONTRACT_VERSION)
+        );
+        let schema: Value = serde_json::from_str(RUNTIME_COLLECTOR_SCHEMA)?;
+        let validator = jsonschema::validator_for(&schema)?;
+        validator
+            .validate(&contract)
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+
+        for transport in ["file", "stdout", "otlp"] {
+            let mut candidate = contract.clone();
+            candidate["transport"]["kind"] = json!(transport);
+            assert!(validator.is_valid(&candidate));
+        }
+
+        let mut unknown_version = contract.clone();
+        unknown_version["contract_version"] = json!("runtime-collector-v2");
+        assert!(!validator.is_valid(&unknown_version));
+
+        let mut unsafe_transport = contract.clone();
+        unsafe_transport["transport"]["authorization"] = json!("fixture-secret-value");
+        assert!(!validator.is_valid(&unsafe_transport));
+        let mut unsafe_name = contract.clone();
+        unsafe_name["redaction"]["header_names"] = json!(["https://user@example.test/private"]);
+        assert!(!validator.is_valid(&unsafe_name));
+
+        let mut output: Value = serde_json::from_str(GOLDEN)?;
+        output["session"]["collector_contract_version"] = json!(RUNTIME_COLLECTOR_CONTRACT_VERSION);
+        let trace_schema: Value = serde_json::from_str(RUNTIME_TRACE_SCHEMA)?;
+        let trace_validator = jsonschema::validator_for(&trace_schema)?;
+        assert!(trace_validator.is_valid(&output));
+        read_runtime_trace(Cursor::new(serde_json::to_vec(&output)?))?;
+
+        output["session"]["collector_contract_version"] = json!("runtime-collector-v2");
+        assert!(!trace_validator.is_valid(&output));
+        assert!(
+            read_runtime_trace(Cursor::new(serde_json::to_vec(&output)?))
+                .unwrap_err()
+                .to_string()
+                .contains("collector contract version")
+        );
+        Ok(())
+    }
+
+    #[test]
     fn malformed_and_secret_fixtures_are_rejected_without_echoing_values() {
         let malformed = read_runtime_trace(Cursor::new(MALFORMED)).unwrap_err();
         assert!(malformed.to_string().contains("repository-relative path"));
@@ -1645,6 +1846,20 @@ mod tests {
         let message = format!("{secret:#}");
         assert!(message.contains("secret"));
         assert!(!message.contains("fixture-secret-value"));
+
+        let collector_output =
+            read_runtime_trace(Cursor::new(COLLECTOR_SECRET_OUTPUT)).unwrap_err();
+        let message = format!("{collector_output:#}");
+        assert!(message.contains("HTTP authority"));
+        assert!(!message.contains("fixture-secret-value"));
+
+        let collector_output: Value = serde_json::from_str(COLLECTOR_SECRET_OUTPUT).unwrap();
+        let schema: Value = serde_json::from_str(RUNTIME_TRACE_SCHEMA).unwrap();
+        assert!(
+            !jsonschema::validator_for(&schema)
+                .unwrap()
+                .is_valid(&collector_output)
+        );
     }
 
     #[test]
@@ -1681,6 +1896,114 @@ mod tests {
                 .to_string()
                 .contains("unsupported runtime trace schema_version")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn production_http_targets_match_the_redacted_authority_contract() -> Result<()> {
+        let schema: Value = serde_json::from_str(RUNTIME_TRACE_SCHEMA)?;
+        let validator = jsonschema::validator_for(&schema)?;
+        let mut legacy: Value = serde_json::from_str(GOLDEN)?;
+        legacy["events"][1]["target"]["name"] =
+            json!("https://user@example.test/private?customer=42");
+        read_runtime_trace(Cursor::new(serde_json::to_vec(&legacy)?))?;
+        assert!(validator.is_valid(&legacy));
+
+        for authority in [
+            "api.example.test",
+            "localhost:3000",
+            "[::]",
+            "[::1]:443",
+            "[1::]",
+            "[2001:db8::1]",
+            "[0:0:0:0:0:0:0:1]:443",
+        ] {
+            let mut value: Value = serde_json::from_str(GOLDEN)?;
+            value["session"]["collector_contract_version"] =
+                json!(RUNTIME_COLLECTOR_CONTRACT_VERSION);
+            value["events"][1]["target"]["name"] = json!(authority);
+            read_runtime_trace(Cursor::new(serde_json::to_vec(&value)?))?;
+            assert!(validator.is_valid(&value));
+        }
+
+        for unsafe_authority in [
+            "HTTPS://api.example.test/private",
+            "user@api.example.test",
+            "api.example.test/private",
+            "api.example.test?customer=42",
+            "API.EXAMPLE.TEST",
+            "api.example.test:secret",
+            "api.example.test:0080",
+            "api.example.test:00080",
+            "api.example.test:65536",
+            "api..example.test",
+            "[:::]",
+            "[1:2:3:4:5:6:7]",
+            "[1:2:3:4:5:6:7:8:9]",
+            "[::ffff:192.0.2.1]",
+        ] {
+            let mut value: Value = serde_json::from_str(GOLDEN)?;
+            value["session"]["collector_contract_version"] =
+                json!(RUNTIME_COLLECTOR_CONTRACT_VERSION);
+            value["events"][1]["target"]["name"] = json!(unsafe_authority);
+            let error = read_runtime_trace(Cursor::new(serde_json::to_vec(&value)?)).unwrap_err();
+            assert!(error.to_string().contains("HTTP authority"));
+            assert!(!validator.is_valid(&value));
+        }
+
+        let mut raw_url_locator: Value = serde_json::from_str(GOLDEN)?;
+        raw_url_locator["session"]["collector_contract_version"] =
+            json!(RUNTIME_COLLECTOR_CONTRACT_VERSION);
+        raw_url_locator["events"][0]["target"] = json!({
+            "kind": "graph_locator",
+            "locator": "https://api.example.test/private",
+            "node_kind": "route"
+        });
+        assert!(
+            read_runtime_trace(Cursor::new(serde_json::to_vec(&raw_url_locator)?))
+                .unwrap_err()
+                .to_string()
+                .contains("raw URL")
+        );
+        assert!(!validator.is_valid(&raw_url_locator));
+
+        let mut raw_url_external: Value = serde_json::from_str(GOLDEN)?;
+        raw_url_external["session"]["collector_contract_version"] =
+            json!(RUNTIME_COLLECTOR_CONTRACT_VERSION);
+        raw_url_external["events"][1]["target"] = json!({
+            "kind": "external",
+            "namespace": "url",
+            "name": "https://api.example.test/private"
+        });
+        assert!(
+            read_runtime_trace(Cursor::new(serde_json::to_vec(&raw_url_external)?))
+                .unwrap_err()
+                .to_string()
+                .contains("HTTP authority")
+        );
+        assert!(!validator.is_valid(&raw_url_external));
+
+        let mut non_http_url_external = raw_url_external.clone();
+        non_http_url_external["events"][1]["target"]["name"] =
+            json!("ftp://user@example.test/private");
+        assert!(
+            read_runtime_trace(Cursor::new(serde_json::to_vec(&non_http_url_external)?))
+                .unwrap_err()
+                .to_string()
+                .contains("HTTP authority")
+        );
+        assert!(!validator.is_valid(&non_http_url_external));
+
+        let mut leaked_name: Value = serde_json::from_str(GOLDEN)?;
+        leaked_name["session"]["collector_contract_version"] =
+            json!(RUNTIME_COLLECTOR_CONTRACT_VERSION);
+        leaked_name["session"]["redaction"]["header_names"] =
+            json!(["https://user:fixture-secret-value@example.test/private"]);
+        let error = read_runtime_trace(Cursor::new(serde_json::to_vec(&leaked_name)?)).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("redacted names only"));
+        assert!(!message.contains("fixture-secret-value"));
+        assert!(!validator.is_valid(&leaked_name));
         Ok(())
     }
 
