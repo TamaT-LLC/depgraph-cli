@@ -1,2 +1,4 @@
 LICENSE-APACHE text eol=lf
 LICENSE-MIT text eol=lf
+third_party/rust-src/COPYRIGHT text eol=lf
+third_party/rust-src/LICENSE-MIT text eol=lf

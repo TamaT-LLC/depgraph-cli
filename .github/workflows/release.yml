@@ -83,7 +83,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - run: rustup toolchain install 1.93.1 --profile minimal
+      - run: rustup toolchain install 1.93.1 --profile minimal --component rust-src
       - run: rustup default 1.93.1
       - uses: actions/setup-go@v5
         with:

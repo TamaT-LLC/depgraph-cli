@@ -7,7 +7,7 @@ status: Active
 upstream: []
 downstream: []
 owner: TakehiroT
-updated: 2026-07-24
+updated: 2026-07-25
 ---
 
 # アーキテクチャ設計: Semantic Dependency Graph CLI
@@ -23,6 +23,7 @@ updated: 2026-07-24
 | Incremental plan / daemon status | `incremental-plan-v1` / `daemon-status-v1` |
 | Worker incremental request / delta | `worker-delta-request-v1` / `worker-delta-v1` |
 | Rust / Cargo baseline | `1.93.1` |
+| Rust sysroot source data-tree | `rust-src-data-tree-v1` / rustc `01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf` |
 | Go baseline | `1.26.1` |
 | Node.js / pnpm baseline | `24.18.0` / `10.33.0` |
 | Bundled TypeScript compiler | `7.0.2` |
@@ -643,7 +644,7 @@ rust-analyzer は internal API を安定 contract とみなさない。導入 / 
 
 library 群は Rust worker binary に静的 link するため、release archive へ別の rust-analyzer executable を同梱しない。release manifest の Rust worker SHA-256 が backend code も一緒に保護する。実装済みpackage gateはmanifestとworker handshakeに記録したbackend kind / version / revision、protocol / schema / targetをcore attestationと一致させ、Cargo dependency graphの完全な`ra_ap_*` / Salsa closureをSPDX SBOMとlicense inventoryへ含める。Web workerは同様にTypeScript `7.0.2`、全versioned semantic capability、`astro-parser-wasm@4.0.0`と`typescript-native-compiler@7.0.2`のruntime component identityをmanifestへ記録し、`--version` handshakeのTypeScript/capability unitと一致させる。全artifact/componentのmissing / added tree entry / tampering / symlink / version mismatchはworker起動前にfail closedとする。
 
-初期 HIR backend は sysroot source を release 同梱しない。実装済みrelease component schema / verifierは、実行可能entrypointを必須とする`kind=executable-tree`と、entrypointをoptionalとする`kind=data-tree`を区別し、version、canonical root、whole-tree SHA-256を検証する。将来exactなstandard-library resolutionのためにsysroot sourceを追加する場合はdata-treeとして宣言し、missing / added / tampering / symlink時にexit `4`でfail closedする。system / project `rust-src`への暗黙fallbackは行わない。
+Issue #146でRust `1.93.1` / rustc commit `01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf`の`rust-src` library treeを`rust-src-data-tree-v1`としてrelease同梱した。`rust-stdlib-source@1.93.1+rustc.01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf`を`libexec/rust-sysroot`へ正規化し、license expression、COPYRIGHT / license本文、source identity、SBOM package、canonical whole-tree SHA-256 `cc5465ef70b933d2a80c30472468abb9f8ab297fc767bd6433b2f6f554f4f0e7`をmanifestのcompatibility unitへ固定する。package時は同じrelease / commitを報告する`rustc`のrustup `rust-src`だけを受け入れ、manifest生成前にこの既知digestと照合し、欠落・ローカル変更時にdownloadやsystem / project source探索を行わない。全target archiveは同一tree digestをattestし、missing / added / tampering / symlink / toolchain mismatch時にworker起動前のexit `4`でfail closedする。現時点のHIR databaseはこのtreeをまだloadせず、exact standard-library resolutionは後続contractで有効化する。
 
 ### 9.7 後続 HIR 実装の分割
 
@@ -657,6 +658,7 @@ library 群は Rust worker binary に静的 link するため、release archive 
 | HIR direct/candidate-call resolution（Issue #28、2026-07-17 完了） | 2〜3日 | function / associated function / method / generic instance / closureのexact `calls`、closed trait / immutable local function pointerのcandidate `may_call`、external / unresolved、macro provenance、canonical condition / evidence / ordering | import / type-use slice |
 | Final fallback / coverage / semantic-complete matrix（Issue #29、2026-07-17 完了） | 1〜2日 | unsupported toolchain / input、metadata failure、broken source、`OUT_DIR` / proc macro / build script / external ledger、typed failureのatomic discardとstrict違反、worker failureのpartial exit `3`、反復scan / 別checkoutの決定性を検証。exact完全性条件を満たす場合だけ`semantic-complete` | import / type-use + call slice |
 | Release schema / package E2E（Issue #30、2026-07-19完了） | 2〜3日 | worker/backend attestation、全artifact/componentとsymlinkのfail-closed、executable-tree/data-tree schema / verifier、抽出archiveのquery / export / determinism、Tier 1 Linux/macOSとWindows package、完全なSBOM / license closure、benchmark gateを検証。developmentは`release-gate-pending`、core-attested archiveだけ`release-gate-verified` | 上記すべて |
+| Rust sysroot / rust-src data-tree package contract（Issue #146、2026-07-25完了） | 1〜2日 | Rust baseline / commitと一致するrustup `rust-src`のみを正規化し、license / SBOM / source identity / whole-tree digestをattest。全5 targetで同一treeを要求し、missing / added / tamper / symlink / toolchain mismatchをfail closedに検証 | Release schema / package E2E |
 
 ### 9.8 Compiler-precise Scan
 
@@ -1605,6 +1607,7 @@ schema、commit、全必須metric、conservation、総合passを再検証して�
 
 ## 26. 更新履歴
 
+- 2026-07-25: Issue #146として`rust-src-data-tree-v1` package契約を実装。Rust `1.93.1` / rustc commit `01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf`と一致するrustup `rust-src`の`library/`だけを`libexec/rust-sysroot`へ正規化し、`rust-stdlib-source@1.93.1+rustc.01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf`としてsource identity、COPYRIGHT / MIT / Apache-2.0本文、license expression、SBOM package / checksum、既知whole-tree digest `cc5465ef70b933d2a80c30472468abb9f8ab297fc767bd6433b2f6f554f4f0e7`をrelease manifestへ固定した。packageはmanifest生成前にsource treeをこの独立digestへ照合し、source欠落・ローカル変更、toolchain release / commit mismatch、project-local source、symlinkをfail closedに拒否する。archive verifierはmissing / added / tamper / symlink / identity / license mismatchをworker起動前に拒否する。aggregate `release-verification.json` v3は全5 targetのsysroot digest同一性を要求し、現行HIR databaseがtreeをまだconsumeしないこととsystem / project `rust-src`へのimplicit fallback禁止を明示した。
 - 2026-07-25: Issue #145として`dynamic-framework-evidence-release-gate-v1`を実装。Next.js / Astro / TanStack Router / TanStack Startのobserver identity / version、observation schema、必須dynamic capability、observer / converter runtime pathをrelease compatibility ledgerへ固定し、core converterもexact registry以外をrejectする。共通polyglot fixtureをdynamic/build-only route、generated lazy route、production RPC manifestへ拡張し、全native archiveでstatic / semantic / build unionのquery、snapshot diff、impact、policy、JSON / GraphML、別checkout決定性、failed-build rollbackを検証する。4 observerとshared converterをdependency-freeなfirst-party SPDX packageとしてchecksum / `CONTAINS` closureへ追加し、aggregate `release-verification.json` v2で全5 targetの同一bytesとcapability ledgerを再検証する。
 - 2026-07-25: Issue #144としてTanStack Start v1 / Vite 7 production RPC observerを`tanstack-start-build-observation-v2`へ更新。公式runtime importを伴うclient / SSR / provider transformとprovider resolver manifestから最終RPC ID、handler export、provider importer、client-reference flagを観測し、manifest count / digestとstub / providerの1対1 closureをconverterでも再検証する。compilerがcollision由来を別fieldで公開しないsuffixは推測せず`not-separately-observed`とする。stub / provider / resolver module role、`client_stub_for` / `observes_definition` / `handled_by`、module / output relation、build-correlated `uses_middleware` chainを`framework-build-graph-v1`へ変換し、static target欠損・曖昧性は`unknown_target`へのunresolved relationとして保持する。unsupported version、non-production mode、collision、manifest / target / virtual module / hook欠損、partial build、timeoutをbounded completion reasonへ分類し、raw code / manifest bytes / artifact bytes / virtual ID / absolute root / crash textを保存しない。
 - 2026-07-25: Issue #143としてTanStack Router v1 / Vite 6〜7 build observerを実装。公式generator後の`routeTree.gen`からfile / virtual route、parent、lazy importを、client transformからcode route、loader、beforeLoad、route maskをallowlist observationへ正規化し、generated source baseを同buildのrepository module pathへ一意に対応付ける。static / semantic routeはpattern・source完全一致時だけ再利用し、generated / build-only route、route entry、parent、lazy、handler、mask、module/output relationを`framework-build-graph-v1`へ重複なくunionする。dynamic / mismatch targetは`unknown_target`と`framework_build_dynamic_target_unmatched` reasonで保持し、raw code / artifact bytes / absolute root / crash textを保存しない。version / plugin順序、unsafe/tampered manifest、ambiguous source mapping、partial build、crash / timeoutをfail closedで固定し、bundled observer、Rust build adapter、runtime artifact attestation、trusted converterへ接続した。

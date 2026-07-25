@@ -50,6 +50,16 @@ pub const FRAMEWORK_BUILD_GRAPH_CONTRACT_VERSION: &str = "framework-build-graph-
 pub const FRAMEWORK_BUILD_GATE_CONTRACT_VERSION: &str =
     "dynamic-framework-evidence-release-gate-v1";
 pub const FRAMEWORK_BUILD_CONVERTER_ARTIFACT: &str = "libexec/depgraph-web-build-evidence.mjs";
+pub const RUST_SYSROOT_DATA_TREE_CONTRACT_VERSION: &str = "rust-src-data-tree-v1";
+pub const RUST_SYSROOT_TOOLCHAIN_VERSION: &str = "1.93.1";
+pub const RUST_SYSROOT_TOOLCHAIN_COMMIT: &str = "01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf";
+pub const RUST_SYSROOT_COMPONENT_NAME: &str = "rust-stdlib-source";
+pub const RUST_SYSROOT_COMPONENT_VERSION: &str =
+    "1.93.1+rustc.01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf";
+pub const RUST_SYSROOT_COMPONENT_ROOT: &str = "libexec/rust-sysroot";
+pub const RUST_SYSROOT_SOURCE_LAYOUT: &str = "rustup-rust-src-library-v1";
+pub const RUST_SYSROOT_LICENSE_EXPRESSION: &str = "MIT OR Apache-2.0";
+pub const RUST_SYSROOT_SBOM_PACKAGE_NAME: &str = "rust-stdlib-source";
 pub use cache::build_cache_key;
 pub use cancellation::CancellationToken;
 pub use config::{Config, DaemonConfig, default_store_path, init_config};
@@ -247,6 +257,34 @@ pub fn framework_build_capability_contract() -> Vec<FrameworkBuildCapabilityHeal
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+pub struct RustSysrootCompatibilityHealth {
+    pub contract_version: String,
+    pub toolchain_version: String,
+    pub toolchain_commit: String,
+    pub component_name: String,
+    pub component_version: String,
+    pub component_root: String,
+    pub source_layout: String,
+    pub license_expression: String,
+    pub sbom_package_name: String,
+}
+
+pub fn rust_sysroot_compatibility_contract() -> RustSysrootCompatibilityHealth {
+    RustSysrootCompatibilityHealth {
+        contract_version: RUST_SYSROOT_DATA_TREE_CONTRACT_VERSION.to_owned(),
+        toolchain_version: RUST_SYSROOT_TOOLCHAIN_VERSION.to_owned(),
+        toolchain_commit: RUST_SYSROOT_TOOLCHAIN_COMMIT.to_owned(),
+        component_name: RUST_SYSROOT_COMPONENT_NAME.to_owned(),
+        component_version: RUST_SYSROOT_COMPONENT_VERSION.to_owned(),
+        component_root: RUST_SYSROOT_COMPONENT_ROOT.to_owned(),
+        source_layout: RUST_SYSROOT_SOURCE_LAYOUT.to_owned(),
+        license_expression: RUST_SYSROOT_LICENSE_EXPRESSION.to_owned(),
+        sbom_package_name: RUST_SYSROOT_SBOM_PACKAGE_NAME.to_owned(),
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ReleaseCompatibilityHealth {
     pub store_schema_version: i64,
     pub minimum_migratable_store_schema_version: i64,
@@ -261,6 +299,7 @@ pub struct ReleaseCompatibilityHealth {
     pub framework_build_graph_contract_version: String,
     pub framework_build_gate_contract_version: String,
     pub framework_build_capabilities: Vec<FrameworkBuildCapabilityHealth>,
+    pub rust_sysroot: RustSysrootCompatibilityHealth,
     pub runtime_trace_schema_version: String,
     pub runtime_collector_contract_version: String,
     pub graphml_schema_version: String,
@@ -282,6 +321,7 @@ pub fn release_compatibility_contract() -> ReleaseCompatibilityHealth {
         framework_build_graph_contract_version: FRAMEWORK_BUILD_GRAPH_CONTRACT_VERSION.to_owned(),
         framework_build_gate_contract_version: FRAMEWORK_BUILD_GATE_CONTRACT_VERSION.to_owned(),
         framework_build_capabilities: framework_build_capability_contract(),
+        rust_sysroot: rust_sysroot_compatibility_contract(),
         runtime_trace_schema_version: RUNTIME_TRACE_SCHEMA_VERSION.to_owned(),
         runtime_collector_contract_version: RUNTIME_COLLECTOR_CONTRACT_VERSION.to_owned(),
         graphml_schema_version: GRAPHML_SCHEMA_VERSION.to_owned(),
@@ -492,6 +532,7 @@ struct ReleaseRuntimeComponent {
     kind: String,
     root: String,
     entrypoint: Option<String>,
+    license: String,
     sha256: String,
 }
 
@@ -713,12 +754,15 @@ fn release_health() -> Result<Option<ReleaseHealth>> {
         let key = format!("component:{}@{}", component.name, component.version);
         let integrity = match verify_release_runtime_component(
             root,
-            &component.name,
-            &component.version,
-            &component.kind,
-            &component.root,
-            component.entrypoint.as_deref(),
-            &component.sha256,
+            &worker::ReleaseRuntimeComponentAttestation {
+                name: &component.name,
+                version: &component.version,
+                kind: &component.kind,
+                root: &component.root,
+                entrypoint: component.entrypoint.as_deref(),
+                license: &component.license,
+                sha256: &component.sha256,
+            },
         ) {
             Ok(()) => "verified".to_owned(),
             Err(error) => format!("error: {error:#}"),
@@ -875,6 +919,16 @@ mod tests {
             "9.9.9".to_owned();
         assert!(
             verify_release_compatibility(&framework_capability_drifted)
+                .unwrap_err()
+                .to_string()
+                .contains("does not match")
+        );
+
+        let mut rust_sysroot_drifted = release_compatibility_contract();
+        rust_sysroot_drifted.rust_sysroot.toolchain_commit =
+            "0000000000000000000000000000000000000000".to_owned();
+        assert!(
+            verify_release_compatibility(&rust_sysroot_drifted)
                 .unwrap_err()
                 .to_string()
                 .contains("does not match")

@@ -25,7 +25,8 @@ use tokio::{
 use walkdir::{DirEntry, WalkDir};
 
 use crate::{
-    ReleaseCompatibilityHealth,
+    RUST_SYSROOT_COMPONENT_NAME, RUST_SYSROOT_COMPONENT_ROOT, RUST_SYSROOT_COMPONENT_VERSION,
+    RUST_SYSROOT_LICENSE_EXPRESSION, ReleaseCompatibilityHealth,
     cancellation::CancellationToken,
     config::{ProfileConfig, ScanConfig},
     verify_release_compatibility,
@@ -467,6 +468,7 @@ struct BundledRuntimeComponent {
     kind: BundledRuntimeComponentKind,
     root: String,
     entrypoint: Option<String>,
+    license: String,
     sha256: String,
 }
 
@@ -675,6 +677,7 @@ fn locate_verified_bundled_worker_for_executable(
         || astro.kind != BundledRuntimeComponentKind::DataTree
         || astro.root != "libexec/astro"
         || astro.entrypoint.as_deref() != Some("libexec/astro/astro.wasm")
+        || astro.license != "MIT"
     {
         bail!(
             "security policy violation: Astro parser runtime component does not match 4.0.0 at libexec/astro/astro.wasm"
@@ -691,9 +694,23 @@ fn locate_verified_bundled_worker_for_executable(
         || typescript.kind != BundledRuntimeComponentKind::ExecutableTree
         || typescript.root != "libexec/typescript/lib"
         || typescript.entrypoint.as_deref() != Some(expected_typescript_entrypoint.as_str())
+        || typescript.license != "Apache-2.0"
     {
         bail!(
             "security policy violation: TypeScript runtime component does not match 7.0.2 at {expected_typescript_entrypoint}"
+        );
+    }
+    let rust_sysroot = runtime_components.get(RUST_SYSROOT_COMPONENT_NAME).context(
+        "security policy violation: release manifest has no required Rust sysroot source component",
+    )?;
+    if rust_sysroot.version != RUST_SYSROOT_COMPONENT_VERSION
+        || rust_sysroot.kind != BundledRuntimeComponentKind::DataTree
+        || rust_sysroot.root != RUST_SYSROOT_COMPONENT_ROOT
+        || rust_sysroot.entrypoint.is_some()
+        || rust_sysroot.license != RUST_SYSROOT_LICENSE_EXPRESSION
+    {
+        bail!(
+            "security policy violation: Rust sysroot source component does not match the pinned release compatibility unit"
         );
     }
     if manifest.runtime_requirements.get("web").map(String::as_str) != Some(WEB_RUNTIME_REQUIREMENT)
@@ -1105,9 +1122,12 @@ fn verify_bundled_runtime_component(
     release_root: &Path,
     component: &BundledRuntimeComponent,
 ) -> Result<PathBuf> {
-    if component.name.trim().is_empty() || component.version.trim().is_empty() {
+    if component.name.trim().is_empty()
+        || component.version.trim().is_empty()
+        || component.license.trim().is_empty()
+    {
         bail!(
-            "security policy violation: bundled runtime component name and version must be non-empty"
+            "security policy violation: bundled runtime component name, version, and license must be non-empty"
         );
     }
     if component.root.trim().is_empty() {
@@ -1219,24 +1239,30 @@ fn reject_symlinked_component_path(release_root: &Path, declared: &str) -> Resul
     Ok(())
 }
 
+pub(crate) struct ReleaseRuntimeComponentAttestation<'a> {
+    pub(crate) name: &'a str,
+    pub(crate) version: &'a str,
+    pub(crate) kind: &'a str,
+    pub(crate) root: &'a str,
+    pub(crate) entrypoint: Option<&'a str>,
+    pub(crate) license: &'a str,
+    pub(crate) sha256: &'a str,
+}
+
 pub(crate) fn verify_release_runtime_component(
     release_root: &Path,
-    name: &str,
-    version: &str,
-    kind: &str,
-    root: &str,
-    entrypoint: Option<&str>,
-    sha256: &str,
+    component: &ReleaseRuntimeComponentAttestation<'_>,
 ) -> Result<()> {
     verify_bundled_runtime_component(
         release_root,
         &BundledRuntimeComponent {
-            name: name.to_owned(),
-            version: version.to_owned(),
-            kind: BundledRuntimeComponentKind::parse(kind)?,
-            root: root.to_owned(),
-            entrypoint: entrypoint.map(ToOwned::to_owned),
-            sha256: sha256.to_owned(),
+            name: component.name.to_owned(),
+            version: component.version.to_owned(),
+            kind: BundledRuntimeComponentKind::parse(component.kind)?,
+            root: component.root.to_owned(),
+            entrypoint: component.entrypoint.map(ToOwned::to_owned),
+            license: component.license.to_owned(),
+            sha256: component.sha256.to_owned(),
         },
     )?;
     Ok(())
@@ -6575,6 +6601,7 @@ mod tests {
                 "kind": "data-tree",
                 "root": "libexec/astro",
                 "entrypoint": "libexec/astro/astro.wasm",
+                "license": "MIT",
                 "sha256": runtime_tree_digest(&astro)?,
             }));
         }
@@ -6594,7 +6621,25 @@ mod tests {
                 "kind": "executable-tree",
                 "root": "libexec/typescript/lib",
                 "entrypoint": format!("libexec/typescript/lib/{}", executable_name("tsc")),
+                "license": "Apache-2.0",
                 "sha256": runtime_tree_digest(&typescript)?,
+            }));
+        }
+        if !runtime_components
+            .iter()
+            .any(|component| component["name"] == RUST_SYSROOT_COMPONENT_NAME)
+        {
+            let sysroot = release.join(RUST_SYSROOT_COMPONENT_ROOT);
+            let core = sysroot.join("library/core/src/lib.rs");
+            std::fs::create_dir_all(core.parent().context("test core source has no parent")?)?;
+            std::fs::write(&core, b"verified bundled core source")?;
+            runtime_components.push(serde_json::json!({
+                "name": RUST_SYSROOT_COMPONENT_NAME,
+                "version": RUST_SYSROOT_COMPONENT_VERSION,
+                "kind": "data-tree",
+                "root": RUST_SYSROOT_COMPONENT_ROOT,
+                "license": RUST_SYSROOT_LICENSE_EXPRESSION,
+                "sha256": runtime_tree_digest(&sysroot)?,
             }));
         }
         write_test_release_manifest_exact(release, runtime_artifacts, runtime_components)
@@ -8623,6 +8668,56 @@ mod tests {
     }
 
     #[test]
+    fn packaged_release_requires_the_pinned_rust_sysroot_source_component() -> Result<()> {
+        for mutation in ["missing", "version", "root", "entrypoint", "license"] {
+            let temp = tempfile::tempdir()?;
+            let release = temp.path().join(mutation);
+            let test_release = write_test_release_manifest(&release, Vec::new(), Vec::new())?;
+            update_test_manifest(&test_release.manifest, |manifest| {
+                let components = manifest["runtime_components"]
+                    .as_array_mut()
+                    .context("test manifest has no runtime components")?;
+                if mutation == "missing" {
+                    components.retain(|component| component["name"] != RUST_SYSROOT_COMPONENT_NAME);
+                    return Ok(());
+                }
+                let replacement_sha256 = (mutation == "root")
+                    .then(|| {
+                        components
+                            .iter()
+                            .find(|component| component["name"] == "astro-parser-wasm")
+                            .map(|component| component["sha256"].clone())
+                    })
+                    .flatten();
+                let component = components
+                    .iter_mut()
+                    .find(|component| component["name"] == RUST_SYSROOT_COMPONENT_NAME)
+                    .context("test manifest has no Rust sysroot component")?;
+                component[mutation] = serde_json::json!(match mutation {
+                    "version" => "0.0.0+wrong-rustc",
+                    "root" => "libexec/astro",
+                    "entrypoint" => "libexec/rust-sysroot/library/core/src/lib.rs",
+                    "license" => "NOASSERTION",
+                    _ => unreachable!(),
+                });
+                if let Some(sha256) = replacement_sha256 {
+                    component["sha256"] = sha256;
+                }
+                Ok(())
+            })?;
+
+            let error = locate_verified_bundled_worker(AdapterKind::Rust, &test_release.manifest)
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("Rust sysroot"),
+                "{mutation}: {error:#}"
+            );
+            assert!(is_security_error(&error.to_string()));
+        }
+        Ok(())
+    }
+
+    #[test]
     fn packaged_release_requires_the_runtime_collector_artifact() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let release = temp.path().join("release");
@@ -8975,6 +9070,7 @@ mod tests {
             "kind":"executable-tree",
             "root":"libexec/typescript/lib",
             "entrypoint":format!("libexec/typescript/lib/{}", executable_name("tsc")),
+            "license":"Apache-2.0",
             "sha256":digest
         });
         let test_release = write_test_release_manifest(&release, Vec::new(), vec![component])?;
@@ -9162,15 +9258,16 @@ mod tests {
     {
         let temp = tempfile::tempdir()?;
         let release = temp.path().join("release");
-        let sysroot = release.join("libexec/rust-sysroot");
+        let sysroot = release.join("libexec/rust-release-data");
         let core_source = sysroot.join("library/core/src/lib.rs");
         std::fs::create_dir_all(core_source.parent().context("core source has no parent")?)?;
         std::fs::write(&core_source, b"verified sysroot source")?;
         let component = serde_json::json!({
-            "name": "rust-sysroot",
+            "name": "rust-release-data-test",
             "version": RUST_BACKEND_REVISION,
             "kind": "data-tree",
-            "root": "libexec/rust-sysroot",
+            "root": "libexec/rust-release-data",
+            "license": PROJECT_LICENSE_EXPRESSION,
             "sha256": runtime_tree_digest(&sysroot)?,
         });
         let test_release = write_test_release_manifest(&release, Vec::new(), vec![component])?;
@@ -9212,8 +9309,9 @@ mod tests {
     #[test]
     fn runtime_component_requires_non_empty_identity_and_paths() -> Result<()> {
         for (field, value, expected) in [
-            ("name", " \t", "name and version"),
-            ("version", "\n", "name and version"),
+            ("name", " \t", "name, version, and license"),
+            ("version", "\n", "name, version, and license"),
+            ("license", "\r", "name, version, and license"),
             ("root", " ", "root must be non-empty"),
             ("entrypoint", "\t", "entrypoint must be non-empty"),
         ] {
@@ -9227,6 +9325,7 @@ mod tests {
                 "version": "1.0.0",
                 "kind": "data-tree",
                 "root": "libexec/runtime-data",
+                "license": PROJECT_LICENSE_EXPRESSION,
                 "sha256": runtime_tree_digest(&runtime)?,
             });
             component[field] = serde_json::json!(value);
@@ -9252,6 +9351,7 @@ mod tests {
             "version": "1.0.0",
             "kind": "executable-tree",
             "root": "libexec/toolchain",
+            "license": PROJECT_LICENSE_EXPRESSION,
             "sha256": runtime_tree_digest(&runtime)?,
         });
         let test_release = write_test_release_manifest(&release, Vec::new(), vec![component])?;

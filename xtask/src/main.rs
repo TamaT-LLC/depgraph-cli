@@ -37,6 +37,24 @@ const RUST_ANALYZER_DIRECT_DEPENDENCIES: &[&str] =
     &["ra_ap_hir", "ra_ap_ide_db", "ra_ap_syntax", "ra_ap_vfs"];
 const SALSA_DIRECT_DEPENDENCIES: &[&str] = &["salsa", "salsa-macro-rules", "salsa-macros"];
 const TYPESCRIPT_VERSION: &str = "7.0.2";
+const RUST_SYSROOT_DATA_TREE_CONTRACT_VERSION: &str =
+    depgraph_core::RUST_SYSROOT_DATA_TREE_CONTRACT_VERSION;
+const RUST_SYSROOT_TOOLCHAIN_VERSION: &str = depgraph_core::RUST_SYSROOT_TOOLCHAIN_VERSION;
+const RUST_SYSROOT_TOOLCHAIN_COMMIT: &str = depgraph_core::RUST_SYSROOT_TOOLCHAIN_COMMIT;
+const RUST_SYSROOT_COMPONENT_NAME: &str = depgraph_core::RUST_SYSROOT_COMPONENT_NAME;
+const RUST_SYSROOT_COMPONENT_VERSION: &str = depgraph_core::RUST_SYSROOT_COMPONENT_VERSION;
+const RUST_SYSROOT_COMPONENT_ROOT: &str = depgraph_core::RUST_SYSROOT_COMPONENT_ROOT;
+const RUST_SYSROOT_SOURCE_LAYOUT: &str = depgraph_core::RUST_SYSROOT_SOURCE_LAYOUT;
+const RUST_SYSROOT_LICENSE_EXPRESSION: &str = depgraph_core::RUST_SYSROOT_LICENSE_EXPRESSION;
+const RUST_SYSROOT_SBOM_PACKAGE_NAME: &str = depgraph_core::RUST_SYSROOT_SBOM_PACKAGE_NAME;
+const RUST_SOURCE_COPYRIGHT: &[u8] = include_bytes!("../../third_party/rust-src/COPYRIGHT");
+const RUST_SOURCE_LICENSE_MIT: &[u8] = include_bytes!("../../third_party/rust-src/LICENSE-MIT");
+const RUST_SOURCE_COPYRIGHT_SHA256: &str =
+    "172020dbfd5b53a226dfde77616190a48dcff519b0bc0e6deb91a8450782c4af";
+const RUST_SOURCE_LICENSE_MIT_SHA256: &str =
+    "b71bd43a069ca0641a9ecfe585ca7b3c53b5cc1608f8b68321168698e28b5ea1";
+const RUST_SYSROOT_COMPONENT_SHA256: &str =
+    "cc5465ef70b933d2a80c30472468abb9f8ab297fc767bd6433b2f6f554f4f0e7";
 const RUNTIME_COLLECTOR_CONTRACT_VERSION: &str = depgraph_core::RUNTIME_COLLECTOR_CONTRACT_VERSION;
 const RUNTIME_COLLECTOR_ARTIFACT: &str = "depgraph-runtime-collector.mjs";
 const WEB_SEMANTIC_CAPABILITIES: &[&str] = &[
@@ -127,7 +145,20 @@ struct RuntimeComponent {
     root: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     entrypoint: Option<String>,
+    license: String,
     sha256: String,
+}
+
+#[derive(Serialize)]
+struct RustSysrootSourceIdentity {
+    contract_version: &'static str,
+    toolchain_version: &'static str,
+    toolchain_commit: &'static str,
+    component_version: &'static str,
+    source_layout: &'static str,
+    acquisition: &'static str,
+    normalized_root: &'static str,
+    license_expression: &'static str,
 }
 
 #[derive(Clone, Debug, serde::Deserialize, Serialize)]
@@ -237,6 +268,7 @@ struct TargetVerificationReport {
     sbom_sha256: String,
     project_licenses: BTreeMap<String, String>,
     runtime_collector_sha256: String,
+    rust_sysroot_sha256: String,
     framework_build_artifacts: BTreeMap<String, String>,
     workers: BTreeMap<String, String>,
 }
@@ -383,7 +415,7 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
     if !go_mod.lines().any(|line| line.trim() == "go 1.26.1")
         || !rust_toolchain
             .lines()
-            .any(|line| line.trim() == "channel = \"1.93.1\"")
+            .any(|line| line.trim() == format!("channel = \"{RUST_SYSROOT_TOOLCHAIN_VERSION}\""))
         || !rust_worker
             .lines()
             .any(|line| line.trim() == "version.workspace = true")
@@ -392,6 +424,16 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
             .any(|line| line.trim() == "version.workspace = true")
     {
         bail!("Rust/Go worker baseline or workspace version metadata is not synchronized");
+    }
+    if sha256_file(&root.join("third_party/rust-src/COPYRIGHT"))? != RUST_SOURCE_COPYRIGHT_SHA256
+        || sha256_file(&root.join("third_party/rust-src/LICENSE-MIT"))?
+            != RUST_SOURCE_LICENSE_MIT_SHA256
+        || fs::read(root.join("third_party/rust-src/COPYRIGHT"))? != RUST_SOURCE_COPYRIGHT
+        || fs::read(root.join("third_party/rust-src/LICENSE-MIT"))? != RUST_SOURCE_LICENSE_MIT
+    {
+        bail!(
+            "pinned Rust {RUST_SYSROOT_TOOLCHAIN_VERSION} source license inputs are missing or modified"
+        );
     }
 
     let readme = fs::read_to_string(root.join("README.md"))?;
@@ -405,6 +447,7 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "[`v0.4.0-rc.1`](docs/releases/v0.4.0-rc.1.md)",
         "[`v0.2.0-rc.1`](docs/releases/v0.2.0-rc.1.md)",
         "dynamic-framework-evidence-release-gate-v1",
+        "rust-stdlib-source@1.93.1+rustc.01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf",
         "[MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE)",
     ] {
         if !readme.contains(required) {
@@ -417,11 +460,12 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         bail!("README release note link is not synchronized with {VERSION}");
     }
     for required in [
-        "updated: 2026-07-24",
+        "updated: 2026-07-25",
         "| Product / Rust / Go / Web adapter | `0.4.0-rc.1` |",
         "Milestone 4のrelease candidateは`v0.4.0-rc.1`",
         "Issue #55ではこのWeb semantic compatibility unitをrelease manifest",
         "Issue #145のrelease gate contractは`dynamic-framework-evidence-release-gate-v1`",
+        "Issue #146でRust `1.93.1`",
     ] {
         if !design.contains(required) {
             bail!("system design release metadata is missing {required:?}");
@@ -442,6 +486,19 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         let actual = fs::read(root.join(path))?;
         if actual != *expected {
             bail!("project license source {path} differs from its compiled release input");
+        }
+    }
+    for (path, expected) in [
+        ("third_party/rust-src/COPYRIGHT", RUST_SOURCE_COPYRIGHT),
+        ("third_party/rust-src/LICENSE-MIT", RUST_SOURCE_LICENSE_MIT),
+    ] {
+        let required_attribute = format!("{path} text eol=lf");
+        if !git_attributes
+            .lines()
+            .any(|line| line.trim() == required_attribute)
+            || expected.contains(&b'\r')
+        {
+            bail!("Rust source legal input {path} is not pinned to LF");
         }
     }
     for link in [
@@ -641,6 +698,8 @@ fn package() -> Result<()> {
         &staging.join("schemas/depgraph-protocol-v1.schema.json"),
     )?;
     let schema_path = staging.join("schemas/depgraph-protocol-v1.schema.json");
+    let rust_sysroot_component = prepare_rust_sysroot_component(&staging)?;
+    let rust_sysroot_sha256 = rust_sysroot_component.sha256.clone();
 
     let workers = vec![
         worker_artifact(
@@ -697,6 +756,7 @@ fn package() -> Result<()> {
                 version: "4.0.0".to_owned(),
                 root: "libexec/astro".to_owned(),
                 entrypoint: Some("libexec/astro/astro.wasm".to_owned()),
+                license: "MIT".to_owned(),
                 sha256: sha256_tree(&staging.join("libexec/astro"))?,
             },
             RuntimeComponent {
@@ -705,8 +765,10 @@ fn package() -> Result<()> {
                 version: TYPESCRIPT_VERSION.to_owned(),
                 root: "libexec/typescript/lib".to_owned(),
                 entrypoint: Some(format!("libexec/typescript/lib/{}", executable_name("tsc"))),
+                license: "Apache-2.0".to_owned(),
                 sha256: sha256_tree(&staging.join("libexec/typescript/lib"))?,
             },
+            rust_sysroot_component,
         ],
         workers,
         runtime_requirements: BTreeMap::from([("web".to_owned(), "Node.js >=24.0.0".to_owned())]),
@@ -728,7 +790,7 @@ fn package() -> Result<()> {
     )?;
     fs::write(
         staging.join("sbom.spdx.json"),
-        serde_json::to_vec_pretty(&sbom(&target)?)?,
+        serde_json::to_vec_pretty(&sbom(&target, &rust_sysroot_sha256)?)?,
     )?;
 
     let archive = create_archive(dist, &name)?;
@@ -750,6 +812,150 @@ fn package() -> Result<()> {
     )?;
     println!("packaged {}", archive.display());
     Ok(())
+}
+
+fn prepare_rust_sysroot_component(staging: &Path) -> Result<RuntimeComponent> {
+    let version_output = Command::new("rustup")
+        .args(["run", RUST_SYSROOT_TOOLCHAIN_VERSION, "rustc", "-vV"])
+        .output()
+        .context("failed to inspect the pinned rustup toolchain used for packaging")?;
+    if !version_output.status.success() {
+        bail!(
+            "rustup could not run the pinned rustc while preparing the Rust sysroot source: {}",
+            String::from_utf8_lossy(&version_output.stderr).trim()
+        );
+    }
+    let version_output =
+        String::from_utf8(version_output.stdout).context("rustc -vV returned non-UTF-8 output")?;
+    let (release, commit) = rustc_source_identity(&version_output)?;
+    if release != RUST_SYSROOT_TOOLCHAIN_VERSION || commit != RUST_SYSROOT_TOOLCHAIN_COMMIT {
+        bail!(
+            "Rust sysroot source packaging requires rustc {RUST_SYSROOT_TOOLCHAIN_VERSION} ({RUST_SYSROOT_TOOLCHAIN_COMMIT}), found {release} ({commit})"
+        );
+    }
+
+    let sysroot_output = Command::new("rustup")
+        .args([
+            "run",
+            RUST_SYSROOT_TOOLCHAIN_VERSION,
+            "rustc",
+            "--print",
+            "sysroot",
+        ])
+        .output()
+        .context("failed to locate the pinned rustup toolchain sysroot")?;
+    if !sysroot_output.status.success() {
+        bail!(
+            "rustup could not report the pinned Rust sysroot while preparing source: {}",
+            String::from_utf8_lossy(&sysroot_output.stderr).trim()
+        );
+    }
+    let sysroot = PathBuf::from(
+        String::from_utf8(sysroot_output.stdout)
+            .context("rustc --print sysroot returned non-UTF-8 output")?
+            .trim(),
+    );
+    if sysroot.as_os_str().is_empty() {
+        bail!("rustc --print sysroot returned an empty path");
+    }
+    let source = sysroot.join("lib/rustlib/src/rust/library");
+    let source_metadata = fs::symlink_metadata(&source).with_context(|| {
+        format!(
+            "pinned rust-src is missing at {}; install it with `rustup component add rust-src --toolchain {RUST_SYSROOT_TOOLCHAIN_VERSION}`",
+            source.display()
+        )
+    })?;
+    if source_metadata.file_type().is_symlink() || !source_metadata.is_dir() {
+        bail!(
+            "pinned rust-src source root must be a real directory, not a symlink: {}",
+            source.display()
+        );
+    }
+    let source = source.canonicalize()?;
+    let workspace = workspace_root().canonicalize()?;
+    if source.starts_with(&workspace) {
+        bail!(
+            "refusing project-local Rust source fallback while packaging: {}",
+            source.display()
+        );
+    }
+    for required in [
+        "Cargo.toml",
+        "core/src/lib.rs",
+        "alloc/src/lib.rs",
+        "std/src/lib.rs",
+        "proc_macro/src/lib.rs",
+    ] {
+        let path = source.join(required);
+        if !path.is_file()
+            || fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_symlink())
+        {
+            bail!(
+                "pinned rust-src is incomplete or symlinked: required file {}",
+                path.display()
+            );
+        }
+    }
+
+    let component_root = staging.join(RUST_SYSROOT_COMPONENT_ROOT);
+    copy_directory(&source, &component_root.join("library"))?;
+    fs::write(component_root.join("COPYRIGHT"), RUST_SOURCE_COPYRIGHT)?;
+    fs::write(component_root.join("LICENSE-MIT"), RUST_SOURCE_LICENSE_MIT)?;
+    fs::write(
+        component_root.join("LICENSE-APACHE"),
+        PROJECT_LICENSES
+            .iter()
+            .find_map(|(path, content)| (*path == "LICENSE-APACHE").then_some(*content))
+            .context("project Apache-2.0 license input is missing")?,
+    )?;
+    fs::write(
+        component_root.join("SOURCE.json"),
+        serde_json::to_vec_pretty(&RustSysrootSourceIdentity {
+            contract_version: RUST_SYSROOT_DATA_TREE_CONTRACT_VERSION,
+            toolchain_version: RUST_SYSROOT_TOOLCHAIN_VERSION,
+            toolchain_commit: RUST_SYSROOT_TOOLCHAIN_COMMIT,
+            component_version: RUST_SYSROOT_COMPONENT_VERSION,
+            source_layout: RUST_SYSROOT_SOURCE_LAYOUT,
+            acquisition: "rustup-component:rust-src",
+            normalized_root: "library",
+            license_expression: RUST_SYSROOT_LICENSE_EXPRESSION,
+        })?,
+    )?;
+    let sha256 = sha256_tree(&component_root)?;
+    verify_pinned_rust_sysroot_digest(&sha256)?;
+
+    Ok(RuntimeComponent {
+        name: RUST_SYSROOT_COMPONENT_NAME.to_owned(),
+        kind: "data-tree".to_owned(),
+        version: RUST_SYSROOT_COMPONENT_VERSION.to_owned(),
+        root: RUST_SYSROOT_COMPONENT_ROOT.to_owned(),
+        entrypoint: None,
+        license: RUST_SYSROOT_LICENSE_EXPRESSION.to_owned(),
+        sha256,
+    })
+}
+
+fn verify_pinned_rust_sysroot_digest(sha256: &str) -> Result<()> {
+    if sha256 != RUST_SYSROOT_COMPONENT_SHA256 {
+        bail!(
+            "pinned Rust sysroot source tree digest mismatch: expected {RUST_SYSROOT_COMPONENT_SHA256}, found {sha256}; refusing modified or unknown rust-src content"
+        );
+    }
+    Ok(())
+}
+
+fn rustc_source_identity(output: &str) -> Result<(&str, &str)> {
+    let release = output
+        .lines()
+        .find_map(|line| line.strip_prefix("release: "))
+        .filter(|value| !value.is_empty())
+        .context("rustc -vV did not report a release")?;
+    let commit = output
+        .lines()
+        .find_map(|line| line.strip_prefix("commit-hash: "))
+        .filter(|value| !value.is_empty() && *value != "unknown")
+        .context("rustc -vV did not report an exact source commit")?;
+    Ok((release, commit))
 }
 
 fn worker_artifact(adapter: &'static str, path: &Path, staging: &Path) -> Result<WorkerArtifact> {
@@ -923,8 +1129,9 @@ fn third_party_licenses(target: &str) -> Result<String> {
         })
         .collect::<Vec<_>>()
         .join("\n");
+    let rust_notice = rust_sysroot_license_notice();
     let mut output = format!(
-        "depgraph third-party license inventory\nGenerated from the Rust and Go runtime dependency graphs and the Web bundle/runtime artifact inventory.\n{notices}\n{SBOM_SCOPE}\n\n{}\n",
+        "depgraph third-party license inventory\nGenerated from the Rust and Go runtime dependency graphs, the pinned Rust standard-library source tree, and the Web bundle/runtime artifact inventory.\n{notices}\n{rust_notice}\n{SBOM_SCOPE}\n\n{}\n",
         entries.join("\n")
     );
     for (label, content) in web_legal_documents()? {
@@ -933,7 +1140,13 @@ fn third_party_licenses(target: &str) -> Result<String> {
     Ok(output)
 }
 
-fn sbom(target: &str) -> Result<Value> {
+fn rust_sysroot_license_notice() -> String {
+    format!(
+        "Rust standard-library source {RUST_SYSROOT_COMPONENT_VERSION} (rustc commit {RUST_SYSROOT_TOOLCHAIN_COMMIT}) — {RUST_SYSROOT_LICENSE_EXPRESSION}; complete COPYRIGHT, LICENSE-MIT, and LICENSE-APACHE texts are packaged under {RUST_SYSROOT_COMPONENT_ROOT}."
+    )
+}
+
+fn sbom(target: &str, rust_sysroot_sha256: &str) -> Result<Value> {
     let web_inventory: Value = serde_json::from_slice(
         &fs::read("workers/web/dist/runtime-packages.json")
             .context("Web runtime package inventory is missing; run the Web worker build first")?,
@@ -991,6 +1204,34 @@ fn sbom(target: &str) -> Result<Value> {
             "comment":SBOM_SCOPE
         }),
     );
+    let rust_sysroot_id = format!(
+        "SPDXRef-Package-{}",
+        spdx_component(RUST_SYSROOT_SBOM_PACKAGE_NAME)
+    );
+    packages.insert(
+        1,
+        json!({
+            "SPDXID":rust_sysroot_id,
+            "name":RUST_SYSROOT_SBOM_PACKAGE_NAME,
+            "versionInfo":RUST_SYSROOT_COMPONENT_VERSION,
+            "filesAnalyzed":false,
+            "licenseConcluded":"NOASSERTION",
+            "licenseDeclared":RUST_SYSROOT_LICENSE_EXPRESSION,
+            "downloadLocation":"NOASSERTION",
+            "checksums":[{
+                "algorithm":"SHA256",
+                "checksumValue":rust_sysroot_sha256
+            }],
+            "comment":format!(
+                "Pinned rust-src data tree: contract {}; rustc {} ({}); layout {}; root {}",
+                RUST_SYSROOT_DATA_TREE_CONTRACT_VERSION,
+                RUST_SYSROOT_TOOLCHAIN_VERSION,
+                RUST_SYSROOT_TOOLCHAIN_COMMIT,
+                RUST_SYSROOT_SOURCE_LAYOUT,
+                RUST_SYSROOT_COMPONENT_ROOT
+            )
+        }),
+    );
     let first_party_ids = first_party
         .iter()
         .map(|artifact| {
@@ -1019,11 +1260,18 @@ fn sbom(target: &str) -> Result<Value> {
             }),
         );
     }
-    let mut relationships = vec![json!({
-        "spdxElementId":"SPDXRef-DOCUMENT",
-        "relationshipType":"DESCRIBES",
-        "relatedSpdxElement":"SPDXRef-Package-depgraph"
-    })];
+    let mut relationships = vec![
+        json!({
+            "spdxElementId":"SPDXRef-DOCUMENT",
+            "relationshipType":"DESCRIBES",
+            "relatedSpdxElement":"SPDXRef-Package-depgraph"
+        }),
+        json!({
+            "spdxElementId":"SPDXRef-Package-depgraph",
+            "relationshipType":"CONTAINS",
+            "relatedSpdxElement":rust_sysroot_id
+        }),
+    ];
     relationships.extend(first_party_ids.into_iter().map(|(id, _)| {
         json!({
             "spdxElementId":"SPDXRef-Package-depgraph",
@@ -1090,6 +1338,62 @@ fn verify_runtime_collector_sbom(sbom: &Value, expected_sha256: &str, context: &
         .count();
     if contains != 1 {
         bail!("{context} SBOM does not contain the runtime collector from the root package");
+    }
+    Ok(())
+}
+
+fn verify_rust_sysroot_sbom(sbom: &Value, expected_sha256: &str, context: &str) -> Result<()> {
+    let packages = sbom["packages"]
+        .as_array()
+        .with_context(|| format!("{context} SBOM has no packages"))?;
+    let matches = packages
+        .iter()
+        .filter(|package| package["name"] == RUST_SYSROOT_SBOM_PACKAGE_NAME)
+        .collect::<Vec<_>>();
+    if matches.len() != 1 {
+        bail!("{context} SBOM must contain exactly one pinned Rust sysroot source package");
+    }
+    let package = matches[0];
+    let expected_id = format!(
+        "SPDXRef-Package-{}",
+        spdx_component(RUST_SYSROOT_SBOM_PACKAGE_NAME)
+    );
+    let expected_comment = format!(
+        "Pinned rust-src data tree: contract {}; rustc {} ({}); layout {}; root {}",
+        RUST_SYSROOT_DATA_TREE_CONTRACT_VERSION,
+        RUST_SYSROOT_TOOLCHAIN_VERSION,
+        RUST_SYSROOT_TOOLCHAIN_COMMIT,
+        RUST_SYSROOT_SOURCE_LAYOUT,
+        RUST_SYSROOT_COMPONENT_ROOT
+    );
+    if package["SPDXID"] != expected_id
+        || package["versionInfo"] != RUST_SYSROOT_COMPONENT_VERSION
+        || package["licenseDeclared"] != RUST_SYSROOT_LICENSE_EXPRESSION
+        || package["filesAnalyzed"] != false
+        || package["checksums"]
+            != json!([{
+                "algorithm": "SHA256",
+                "checksumValue": expected_sha256,
+            }])
+        || package["comment"] != expected_comment
+    {
+        bail!("{context} SBOM Rust sysroot source package does not match the pinned data-tree");
+    }
+    let contains = sbom["relationships"]
+        .as_array()
+        .map(|relationships| {
+            relationships
+                .iter()
+                .filter(|relationship| {
+                    relationship["spdxElementId"] == "SPDXRef-Package-depgraph"
+                        && relationship["relationshipType"] == "CONTAINS"
+                        && relationship["relatedSpdxElement"] == expected_id
+                })
+                .count()
+        })
+        .unwrap_or_default();
+    if contains != 1 {
+        bail!("{context} SBOM does not relate the Rust sysroot source to the release package");
     }
     Ok(())
 }
@@ -2179,6 +2483,15 @@ fn verify_release_assets(directory: &Path, requested_targets: &[String]) -> Resu
     }
     if targets
         .iter()
+        .map(|target| target.rust_sysroot_sha256.as_str())
+        .collect::<BTreeSet<_>>()
+        .len()
+        != 1
+    {
+        bail!("release targets do not contain the identical pinned Rust sysroot data-tree");
+    }
+    if targets
+        .iter()
         .map(|target| &target.framework_build_artifacts)
         .collect::<BTreeSet<_>>()
         .len()
@@ -2190,7 +2503,7 @@ fn verify_release_assets(directory: &Path, requested_targets: &[String]) -> Resu
     fs::write(
         directory.join("release-verification.json"),
         serde_json::to_vec_pretty(&ReleaseVerificationReport {
-            schema_version: 2,
+            schema_version: 3,
             release_version: VERSION.to_owned(),
             tag: format!("v{VERSION}"),
             protocol_version: "1.0".to_owned(),
@@ -2353,6 +2666,13 @@ fn verify_published_release_tree(
         .clone();
     let mut components = BTreeMap::new();
     for component in &manifest.runtime_components {
+        if component.name.trim().is_empty()
+            || component.version.trim().is_empty()
+            || component.license.trim().is_empty()
+            || component.root.trim().is_empty()
+        {
+            bail!("published runtime component name, version, license, and root must be non-empty");
+        }
         if components
             .insert(component.name.as_str(), component)
             .is_some()
@@ -2407,6 +2727,7 @@ fn verify_published_release_tree(
         || astro.kind != "data-tree"
         || astro.root != "libexec/astro"
         || astro.entrypoint.as_deref() != Some("libexec/astro/astro.wasm")
+        || astro.license != "MIT"
     {
         bail!("published Astro compatibility unit is invalid");
     }
@@ -2421,9 +2742,24 @@ fn verify_published_release_tree(
         || typescript.kind != "executable-tree"
         || typescript.root != "libexec/typescript/lib"
         || typescript.entrypoint.as_deref() != Some(expected_typescript_entrypoint.as_str())
+        || typescript.license != "Apache-2.0"
     {
         bail!("published TypeScript compatibility unit is invalid");
     }
+    let rust_sysroot = components
+        .get(RUST_SYSROOT_COMPONENT_NAME)
+        .context("published release has no pinned Rust sysroot source component")?;
+    if rust_sysroot.version != RUST_SYSROOT_COMPONENT_VERSION
+        || rust_sysroot.kind != "data-tree"
+        || rust_sysroot.root != RUST_SYSROOT_COMPONENT_ROOT
+        || rust_sysroot.entrypoint.is_some()
+        || rust_sysroot.license != RUST_SYSROOT_LICENSE_EXPRESSION
+        || rust_sysroot.sha256 != RUST_SYSROOT_COMPONENT_SHA256
+    {
+        bail!("published Rust sysroot source compatibility unit is invalid");
+    }
+    verify_rust_sysroot_tree(extracted, rust_sysroot, "published release")?;
+    let rust_sysroot_sha256 = rust_sysroot.sha256.clone();
 
     let mut workers = BTreeMap::new();
     for worker in &manifest.workers {
@@ -2532,6 +2868,7 @@ fn verify_published_release_tree(
         }
     }
     verify_runtime_collector_sbom(&sbom, &runtime_collector_sha256, "published release")?;
+    verify_rust_sysroot_sbom(&sbom, &rust_sysroot_sha256, "published release")?;
     let framework_build_artifacts = manifest_framework_build_artifact_checksums(&manifest)?;
     verify_framework_build_sbom(&sbom, &framework_build_artifacts, "published release")?;
     if package_names
@@ -2547,6 +2884,7 @@ fn verify_published_release_tree(
         || !third_party.contains(&format!(
             "First-party artifact {RUNTIME_COLLECTOR_ARTIFACT} ({RUNTIME_COLLECTOR_CONTRACT_VERSION}) is licensed under {PROJECT_LICENSE_EXPRESSION}"
         ))
+        || !third_party.contains(&rust_sysroot_license_notice())
         || PROJECT_LICENSES.iter().any(|(_, project_text)| {
             third_party
                 .as_bytes()
@@ -2595,6 +2933,7 @@ fn verify_published_release_tree(
         sbom_sha256: sha256_file(&sbom_path)?,
         project_licenses: verified_licenses,
         runtime_collector_sha256,
+        rust_sysroot_sha256,
         framework_build_artifacts,
         workers,
     })
@@ -3641,6 +3980,11 @@ fn verify_release_static_prelaunch_fails_closed(extracted: &Path) -> Result<()> 
         cases.push(("runtime collector compatibility mismatch", manifest));
 
         let mut manifest = baseline.clone();
+        manifest.compatibility.rust_sysroot.toolchain_commit =
+            "0000000000000000000000000000000000000000".to_owned();
+        cases.push(("Rust sysroot toolchain compatibility mismatch", manifest));
+
+        let mut manifest = baseline.clone();
         manifest
             .runtime_artifacts
             .retain(|artifact| artifact.path != format!("libexec/{RUNTIME_COLLECTOR_ARTIFACT}"));
@@ -3681,6 +4025,12 @@ fn verify_release_static_prelaunch_fails_closed(extracted: &Path) -> Result<()> 
         cases.push(("missing Astro runtime component", manifest));
 
         let mut manifest = baseline.clone();
+        manifest
+            .runtime_components
+            .retain(|component| component.name != RUST_SYSROOT_COMPONENT_NAME);
+        cases.push(("missing Rust sysroot source component", manifest));
+
+        let mut manifest = baseline.clone();
         let duplicate = manifest
             .runtime_components
             .first()
@@ -3706,6 +4056,15 @@ fn verify_release_static_prelaunch_fails_closed(extracted: &Path) -> Result<()> 
             .context("release manifest has no TypeScript runtime component")?
             .version = "9.9.9".to_owned();
         cases.push(("TypeScript compatibility mismatch", manifest));
+
+        let mut manifest = baseline.clone();
+        manifest
+            .runtime_components
+            .iter_mut()
+            .find(|component| component.name == RUST_SYSROOT_COMPONENT_NAME)
+            .context("release manifest has no Rust sysroot source component")?
+            .license = "NOASSERTION".to_owned();
+        cases.push(("Rust sysroot source compatibility mismatch", manifest));
 
         let mut manifest = baseline.clone();
         manifest.runtime_requirements.remove("web");
@@ -3976,25 +4335,20 @@ fn verify_packaged_data_tree_fails_closed(
     original_manifest: &[u8],
 ) -> Result<()> {
     let manifest_path = extracted.join("release-manifest.json");
-    let component_root = extracted.join("libexec/rust-release-data");
-    fs::create_dir_all(&component_root)?;
-    let payload = component_root.join("backend.txt");
-    fs::write(&payload, b"release-owned backend data\n")?;
-    let mut manifest: ReleaseManifest = serde_json::from_slice(original_manifest)?;
-    manifest.runtime_components.push(RuntimeComponent {
-        name: "rust-release-data-test".to_owned(),
-        kind: "data-tree".to_owned(),
-        version: "1".to_owned(),
-        root: "libexec/rust-release-data".to_owned(),
-        entrypoint: None,
-        sha256: sha256_tree(&component_root)?,
-    });
-    fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)?;
+    let manifest: ReleaseManifest = serde_json::from_slice(original_manifest)?;
+    let component = manifest
+        .runtime_components
+        .iter()
+        .find(|component| component.name == RUST_SYSROOT_COMPONENT_NAME)
+        .context("packaged release has no pinned Rust sysroot source component")?;
+    let component_root = extracted.join(&component.root);
+    let payload = component_root.join("library/core/src/lib.rs");
+    let original_payload = fs::read(&payload)?;
     verify_packaged_scan(
         executable,
         &verify_root.join("data-tree-valid.db"),
         fixture,
-        "Rust data-tree",
+        "pinned Rust sysroot data-tree",
     )?;
 
     fs::remove_file(&payload)?;
@@ -4004,7 +4358,7 @@ fn verify_packaged_data_tree_fails_closed(
         fixture,
         "missing Rust data-tree input",
     )?;
-    fs::write(&payload, b"release-owned backend data\n")?;
+    fs::write(&payload, &original_payload)?;
 
     fs::write(&payload, b"tampered backend data\n")?;
     verify_packaged_security_failure(
@@ -4013,7 +4367,7 @@ fn verify_packaged_data_tree_fails_closed(
         fixture,
         "tampered Rust data-tree",
     )?;
-    fs::write(&payload, b"release-owned backend data\n")?;
+    fs::write(&payload, &original_payload)?;
 
     let added = component_root.join("added.txt");
     fs::write(&added, b"undeclared addition\n")?;
@@ -4037,8 +4391,8 @@ fn verify_packaged_data_tree_fails_closed(
 
     #[cfg(unix)]
     {
-        let symlink = component_root.join("backend-link.txt");
-        std::os::unix::fs::symlink("backend.txt", &symlink)?;
+        let symlink = component_root.join("core-link.rs");
+        std::os::unix::fs::symlink("library/core/src/lib.rs", &symlink)?;
         verify_packaged_security_failure(
             executable,
             &verify_root.join("data-tree-symlink.db"),
@@ -4047,7 +4401,59 @@ fn verify_packaged_data_tree_fails_closed(
         )?;
         fs::remove_file(symlink)?;
     }
-    fs::remove_dir_all(component_root)?;
+
+    let mut mismatched: ReleaseManifest = serde_json::from_slice(original_manifest)?;
+    mismatched
+        .runtime_components
+        .iter_mut()
+        .find(|component| component.name == RUST_SYSROOT_COMPONENT_NAME)
+        .context("packaged release has no pinned Rust sysroot source component")?
+        .version = "0.0.0+wrong-rustc".to_owned();
+    fs::write(&manifest_path, serde_json::to_vec_pretty(&mismatched)?)?;
+    verify_packaged_security_failure(
+        executable,
+        &verify_root.join("data-tree-version-mismatch.db"),
+        fixture,
+        "mismatched Rust sysroot component version",
+    )?;
+
+    let mut mismatched: ReleaseManifest = serde_json::from_slice(original_manifest)?;
+    mismatched
+        .runtime_components
+        .iter_mut()
+        .find(|component| component.name == RUST_SYSROOT_COMPONENT_NAME)
+        .context("packaged release has no pinned Rust sysroot source component")?
+        .license = "NOASSERTION".to_owned();
+    fs::write(&manifest_path, serde_json::to_vec_pretty(&mismatched)?)?;
+    verify_packaged_security_failure(
+        executable,
+        &verify_root.join("data-tree-license-mismatch.db"),
+        fixture,
+        "mismatched Rust sysroot component license",
+    )?;
+
+    let mut missing: ReleaseManifest = serde_json::from_slice(original_manifest)?;
+    missing
+        .runtime_components
+        .retain(|component| component.name != RUST_SYSROOT_COMPONENT_NAME);
+    fs::write(&manifest_path, serde_json::to_vec_pretty(&missing)?)?;
+    verify_packaged_security_failure(
+        executable,
+        &verify_root.join("data-tree-component-missing.db"),
+        fixture,
+        "missing Rust sysroot component declaration",
+    )?;
+
+    let mut mismatched: ReleaseManifest = serde_json::from_slice(original_manifest)?;
+    mismatched.compatibility.rust_sysroot.toolchain_commit =
+        "0000000000000000000000000000000000000000".to_owned();
+    fs::write(&manifest_path, serde_json::to_vec_pretty(&mismatched)?)?;
+    verify_packaged_security_failure(
+        executable,
+        &verify_root.join("data-tree-toolchain-mismatch.db"),
+        fixture,
+        "mismatched Rust sysroot toolchain identity",
+    )?;
     fs::write(manifest_path, original_manifest)?;
     Ok(())
 }
@@ -7740,8 +8146,13 @@ fn verify_release_metadata(extracted: &Path) -> Result<ReleaseManifest> {
         .clone();
     let mut components = BTreeMap::new();
     for component in &manifest.runtime_components {
-        if component.name.trim().is_empty() || component.version.trim().is_empty() {
-            bail!("release manifest runtime component name and version must be non-empty");
+        if component.name.trim().is_empty()
+            || component.version.trim().is_empty()
+            || component.license.trim().is_empty()
+        {
+            bail!(
+                "release manifest runtime component name, version, and license must be non-empty"
+            );
         }
         if component.root.trim().is_empty() {
             bail!("release manifest runtime component root must be non-empty");
@@ -7805,6 +8216,7 @@ fn verify_release_metadata(extracted: &Path) -> Result<ReleaseManifest> {
         || astro.kind != "data-tree"
         || astro.root != "libexec/astro"
         || astro.entrypoint.as_deref() != Some("libexec/astro/astro.wasm")
+        || astro.license != "MIT"
     {
         bail!("Astro parser runtime component does not match 4.0.0 at libexec/astro/astro.wasm");
     }
@@ -7817,11 +8229,26 @@ fn verify_release_metadata(extracted: &Path) -> Result<ReleaseManifest> {
         || typescript.kind != "executable-tree"
         || typescript.root != "libexec/typescript/lib"
         || typescript.entrypoint.as_deref() != Some(expected_typescript_entrypoint.as_str())
+        || typescript.license != "Apache-2.0"
     {
         bail!(
             "TypeScript runtime component does not match {TYPESCRIPT_VERSION} at {expected_typescript_entrypoint}"
         );
     }
+    let rust_sysroot = components
+        .get(RUST_SYSROOT_COMPONENT_NAME)
+        .context("release manifest has no required pinned Rust sysroot source component")?;
+    if rust_sysroot.version != RUST_SYSROOT_COMPONENT_VERSION
+        || rust_sysroot.kind != "data-tree"
+        || rust_sysroot.root != RUST_SYSROOT_COMPONENT_ROOT
+        || rust_sysroot.entrypoint.is_some()
+        || rust_sysroot.license != RUST_SYSROOT_LICENSE_EXPRESSION
+        || rust_sysroot.sha256 != RUST_SYSROOT_COMPONENT_SHA256
+    {
+        bail!("Rust sysroot source component does not match the pinned compatibility unit");
+    }
+    verify_rust_sysroot_tree(extracted, rust_sysroot, "release")?;
+    let rust_sysroot_sha256 = rust_sysroot.sha256.clone();
     if manifest.runtime_requirements.get("web").map(String::as_str) != Some("Node.js >=24.0.0") {
         bail!("release manifest Web runtime requirement must be Node.js >=24.0.0");
     }
@@ -7940,6 +8367,7 @@ fn verify_release_metadata(extracted: &Path) -> Result<ReleaseManifest> {
         }
     }
     verify_runtime_collector_sbom(&sbom, &runtime_collector_sha256, "release")?;
+    verify_rust_sysroot_sbom(&sbom, &rust_sysroot_sha256, "release")?;
     verify_framework_build_sbom(
         &sbom,
         &manifest_framework_build_artifact_checksums(&manifest)?,
@@ -8116,7 +8544,7 @@ fn verify_release_metadata(extracted: &Path) -> Result<ReleaseManifest> {
             bail!("third-party license inventory is missing {label}");
         }
     }
-    if sbom != crate::sbom(&manifest.target)? {
+    if sbom != crate::sbom(&manifest.target, &rust_sysroot_sha256)? {
         bail!("release SBOM differs from the locked package dependency inventory");
     }
     if license_inventory != third_party_licenses(&manifest.target)? {
@@ -8294,6 +8722,53 @@ fn verified_release_path(extracted: &Path, declared: &str, description: &str) ->
         bail!("release {description} escapes the release root");
     }
     Ok(path)
+}
+
+fn verify_rust_sysroot_tree(
+    extracted: &Path,
+    component: &RuntimeComponent,
+    context: &str,
+) -> Result<()> {
+    let expected_source = serde_json::to_vec_pretty(&RustSysrootSourceIdentity {
+        contract_version: RUST_SYSROOT_DATA_TREE_CONTRACT_VERSION,
+        toolchain_version: RUST_SYSROOT_TOOLCHAIN_VERSION,
+        toolchain_commit: RUST_SYSROOT_TOOLCHAIN_COMMIT,
+        component_version: RUST_SYSROOT_COMPONENT_VERSION,
+        source_layout: RUST_SYSROOT_SOURCE_LAYOUT,
+        acquisition: "rustup-component:rust-src",
+        normalized_root: "library",
+        license_expression: RUST_SYSROOT_LICENSE_EXPRESSION,
+    })?;
+    let apache = PROJECT_LICENSES
+        .iter()
+        .find_map(|(path, content)| (*path == "LICENSE-APACHE").then_some(*content))
+        .context("project Apache-2.0 license input is missing")?;
+    for (relative, expected) in [
+        ("COPYRIGHT", RUST_SOURCE_COPYRIGHT),
+        ("LICENSE-MIT", RUST_SOURCE_LICENSE_MIT),
+        ("LICENSE-APACHE", apache),
+        ("SOURCE.json", expected_source.as_slice()),
+    ] {
+        let declared = format!("{}/{relative}", component.root);
+        let path = verified_release_path(extracted, &declared, "Rust sysroot legal metadata")?;
+        if !path.is_file() || fs::read(&path)? != expected {
+            bail!("{context} Rust sysroot source metadata {declared} is missing or incompatible");
+        }
+    }
+    for relative in [
+        "library/Cargo.toml",
+        "library/core/src/lib.rs",
+        "library/alloc/src/lib.rs",
+        "library/std/src/lib.rs",
+        "library/proc_macro/src/lib.rs",
+    ] {
+        let declared = format!("{}/{relative}", component.root);
+        let path = verified_release_path(extracted, &declared, "Rust sysroot source")?;
+        if !path.is_file() {
+            bail!("{context} Rust sysroot source is missing {declared}");
+        }
+    }
+    Ok(())
 }
 
 fn verify_typescript_compiler(release_root: &Path) -> Result<()> {
@@ -8576,12 +9051,13 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        ARCHIVE_MTIME, DependencyPackage, RELEASE_TARGETS, TYPESCRIPT_VERSION,
-        WEB_SEMANTIC_CAPABILITIES, WEB_SEMANTIC_RUNTIME_ARTIFACTS, WEB_SEMANTIC_RUNTIME_COMPONENTS,
-        WebSemanticAttestation, WorkerBackend, archive_entries, cargo_runtime_packages,
-        create_tar_archive, create_zip_archive, executable_name_for_target, extract_archive,
-        normalized_spdx_license, package_url, parse_worker_handshake, release_compatibility,
-        remove_transient_build_run_ids, rust_backend_from_handshake, verify_checksum_sidecar,
+        ARCHIVE_MTIME, DependencyPackage, RELEASE_TARGETS, RUST_SYSROOT_COMPONENT_SHA256,
+        TYPESCRIPT_VERSION, WEB_SEMANTIC_CAPABILITIES, WEB_SEMANTIC_RUNTIME_ARTIFACTS,
+        WEB_SEMANTIC_RUNTIME_COMPONENTS, WebSemanticAttestation, WorkerBackend, archive_entries,
+        cargo_runtime_packages, create_tar_archive, create_zip_archive, executable_name_for_target,
+        extract_archive, normalized_spdx_license, package_url, parse_worker_handshake,
+        release_compatibility, remove_transient_build_run_ids, rust_backend_from_handshake,
+        rustc_source_identity, verify_checksum_sidecar, verify_pinned_rust_sysroot_digest,
         verify_project_metadata, verify_release_tag_values, verify_rust_analyzer_dependencies,
         verify_rust_backend, verify_web_semantic_attestation, web_runtime_packages,
         web_semantic_from_handshake, without_windows_verbatim_prefix, workspace_root,
@@ -8607,6 +9083,27 @@ mod tests {
     #[test]
     fn repository_release_metadata_is_synchronized() -> Result<()> {
         verify_project_metadata(&workspace_root())
+    }
+
+    #[test]
+    fn rustc_source_identity_requires_an_exact_release_and_commit() -> Result<()> {
+        assert_eq!(
+            rustc_source_identity(
+                "rustc 1.93.1\ncommit-hash: 01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf\nrelease: 1.93.1\n"
+            )?,
+            ("1.93.1", "01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf")
+        );
+        assert!(rustc_source_identity("release: 1.93.1\n").is_err());
+        assert!(rustc_source_identity("commit-hash: unknown\nrelease: 1.93.1\n").is_err());
+        assert!(rustc_source_identity("commit-hash: abc\n").is_err());
+        verify_pinned_rust_sysroot_digest(RUST_SYSROOT_COMPONENT_SHA256)?;
+        assert!(
+            verify_pinned_rust_sysroot_digest(
+                "0000000000000000000000000000000000000000000000000000000000000000"
+            )
+            .is_err()
+        );
+        Ok(())
     }
 
     #[test]
