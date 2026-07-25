@@ -15,6 +15,7 @@ import {
   EXPECTED_FIXTURE_SHA256,
   orderedSampleNames,
   REPORT_SCHEMA_VERSION,
+  validateRustBenchmarkEvidence,
   verifyReport,
 } from "../benchmark-report.mjs";
 
@@ -98,6 +99,46 @@ test("sample evidence uses numeric order and rejects gaps", () => {
         /^sample-(\d+)\.json$/,
       ),
     /contiguous/,
+  );
+});
+
+test("Rust benchmark requires the safe unattested-sysroot fallback", () => {
+  const scan = { status: "completed" };
+  const graph = {
+    coverage: {
+      completeness: ["syntax-complete"],
+      project_code_executed: false,
+      reasons: ["rust-hir-sysroot-unavailable"],
+    },
+    profiles: [
+      {
+        language: "rust",
+        properties: {
+          analysis_backend: "static-syntax+rust-analyzer-hir",
+          rust_hir_enable_gate: "release-gate-pending",
+          rust_hir_status: "import-type-call-graph-partial",
+          rust_hir_sysroot_status: "unavailable",
+          rust_hir_sysroot_file_count: 0,
+          rust_hir_sysroot_crate_count: 0,
+          rust_hir_project_external_count: 3,
+        },
+      },
+    ],
+  };
+  assert.equal(validateRustBenchmarkEvidence(scan, graph), true);
+
+  const promoted = structuredClone(graph);
+  promoted.coverage.completeness.push("semantic-complete");
+  assert.throws(
+    () => validateRustBenchmarkEvidence(scan, promoted),
+    /Rust HIR benchmark evidence/,
+  );
+
+  const spoofedSysroot = structuredClone(graph);
+  spoofedSysroot.profiles[0].properties.rust_hir_sysroot_status = "attested";
+  assert.throws(
+    () => validateRustBenchmarkEvidence(scan, spoofedSysroot),
+    /Rust HIR benchmark evidence/,
   );
 });
 
@@ -261,7 +302,8 @@ test("release verification requires the complete 10,000-file metric contract", (
         package_root_observed: true,
         package_workspace_observed: true,
       },
-      rust_semantic_complete: true,
+      rust_semantic_complete: false,
+      rust_development_sysroot_fallback: true,
       cross_adapter_build_profiles: [
         "next-app",
         "astro-app",

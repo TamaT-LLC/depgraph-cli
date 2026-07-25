@@ -1436,7 +1436,7 @@ warm queryは5 sampleを採り、medianがceiling
 以内、ceiling超過sampleは最大1件、全sampleはceiling + 20%以内というnoise
 allowanceを同時に満たした場合だけpassする。cold queryは継続取得するが、
 product targetがwarm cacheであるためgateには使わない。report
-`depgraph-benchmark-report-v3`はraw sample、median / max、cache条件、
+`depgraph-benchmark-report-v4`はraw sample、median / max、cache条件、
 platform / architecture / GitHub runner、depgraph / Rust / Cargo / Go / Node /
 pnpm version、commit、threshold、allowance、判定を保持する。
 
@@ -1446,8 +1446,11 @@ aggregate coverage、profile matrixのcanonical digest一致を要求し、変�
 content hashが実際に変化したことも要求する。macOS FSEventsが既存fileへの
 in-place writeを`Create`と分類する場合があるため、daemonの単一change kindは
 `added`または`modified`を許容するが、同一pathのpre-existing nodeと変更前後の
-content hashによって実体が1-file editであることを検証する。従来のRust HIR semantic-complete
-とcross-adapter build evidence gateも同じreportで維持する。pull request CIと
+content hashによって実体が1-file editであることを検証する。Rust HIR benchmarkは
+development binaryがunattested sysrootを明示してsyntax/local HIRを保持し、
+`semantic-complete`へ昇格しないfallback contractを検証する。packaged
+semantic-completeはLinux/macOS integration gateで検証し、cross-adapter build
+evidence gateも同じreportで維持する。pull request CIと
 tag releaseは同じ10,000-file reportをartifact化し、release asset検証jobが
 schema、commit、全必須metric、conservation、総合passを再検証してから公開へ
 進む。fixture件数やdependency site / coverageを性能のために緩和しない。

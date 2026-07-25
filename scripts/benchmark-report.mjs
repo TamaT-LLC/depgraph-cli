@@ -16,7 +16,7 @@ import {
   fixtureFingerprint,
 } from "./benchmark-fixture.mjs";
 
-export const REPORT_SCHEMA_VERSION = "depgraph-benchmark-report-v3";
+export const REPORT_SCHEMA_VERSION = "depgraph-benchmark-report-v4";
 export const EXPECTED_FIXTURE_SHA256 =
   "f57a6d7d2e22366f5d312f01f038f6f50e2c2fbbd4480b9849ed82a696e97dc1";
 
@@ -502,22 +502,38 @@ function graphConservation(rawDir, changedFile, expectedDependencySites) {
   };
 }
 
-function validateAuxiliaryEvidence(rawDir) {
-  const rustScan = jsonFile(join(rawDir, "rust-scan.json"));
-  const rustGraph = jsonFile(join(rawDir, "rust-graph.json")).graph;
+export function validateRustBenchmarkEvidence(rustScan, rustGraph) {
   const profile = rustGraph.profiles?.find(
     (candidate) => candidate.language === "rust",
   );
   if (
     rustScan.status !== "completed" ||
     rustGraph.coverage?.project_code_executed !== false ||
-    !rustGraph.coverage?.completeness?.includes("semantic-complete") ||
+    !rustGraph.coverage?.completeness?.includes("syntax-complete") ||
+    rustGraph.coverage?.completeness?.includes("semantic-complete") ||
+    !rustGraph.coverage?.reasons?.includes("rust-hir-sysroot-unavailable") ||
     profile?.properties?.analysis_backend !==
       "static-syntax+rust-analyzer-hir" ||
-    profile?.properties?.rust_hir_enable_gate !== "release-gate-pending"
+    profile?.properties?.rust_hir_enable_gate !== "release-gate-pending" ||
+    profile?.properties?.rust_hir_status !==
+      "import-type-call-graph-partial" ||
+    profile?.properties?.rust_hir_sysroot_status !== "unavailable" ||
+    profile?.properties?.rust_hir_sysroot_file_count !== 0 ||
+    profile?.properties?.rust_hir_sysroot_crate_count !== 0 ||
+    !Number.isSafeInteger(
+      profile?.properties?.rust_hir_project_external_count,
+    ) ||
+    profile.properties.rust_hir_project_external_count <= 0
   ) {
     throw new Error("Rust HIR benchmark evidence is incomplete");
   }
+  return true;
+}
+
+function validateAuxiliaryEvidence(rawDir) {
+  const rustScan = jsonFile(join(rawDir, "rust-scan.json"));
+  const rustGraph = jsonFile(join(rawDir, "rust-graph.json")).graph;
+  validateRustBenchmarkEvidence(rustScan, rustGraph);
 
   const expected = new Map([
     ["next-app", ["web:build:next", "next-adapter-observer"]],
@@ -548,7 +564,8 @@ function validateAuxiliaryEvidence(rawDir) {
     }
   }
   return {
-    rust_semantic_complete: true,
+    rust_semantic_complete: false,
+    rust_development_sysroot_fallback: true,
     cross_adapter_build_profiles: CROSS_ADAPTER_PROFILES,
   };
 }
@@ -711,7 +728,8 @@ function validEvidence(report) {
     evidence.impact_queries.package_impact_count < 2 ||
     evidence.impact_queries.package_root_observed !== true ||
     evidence.impact_queries.package_workspace_observed !== true ||
-    evidence.rust_semantic_complete !== true ||
+    evidence.rust_semantic_complete !== false ||
+    evidence.rust_development_sysroot_fallback !== true ||
     JSON.stringify(evidence.cross_adapter_build_profiles) !==
       JSON.stringify(CROSS_ADAPTER_PROFILES)
   ) {
