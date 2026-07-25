@@ -423,7 +423,14 @@ remain unresolved and only build-correlated middleware chains receive observed
 edges. The Next/Astro/TanStack Router/TanStack Start observer entrypoints and
 their observation-to-protocol converter are separate checksum-attested release
 artifacts; missing, undeclared, or changed bytes fail closed before project
-code starts. The store saves the delta in an attempt transaction and
+code starts. The release compatibility unit pins the four observer
+versions, observation schemas, dynamic capabilities, and runtime paths under
+`dynamic-framework-evidence-release-gate-v1`. Every native package gate runs
+the same static/semantic/build union fixture through filtered queries,
+snapshot diff, impact, policy, JSON/GraphML export, checkout determinism, and
+failed-build rollback. The observer and converter bundles are dependency-free
+first-party SPDX packages with exact checksums, and the aggregate verifier
+requires the same five-artifact closure from every target archive. The store saves the delta in an attempt transaction and
 exposes it to `deps`, `dependents`, `why`, and exports only after completed
 promotion. Source and semantic rows remain immutable; matching and conflicting
 build observations coexist as separate layers, with conflicts carrying both
@@ -460,7 +467,7 @@ Failed/partial scans and diagnostics remain stored, but only a complete policy-p
 
 Run `cargo xtask package` to create a native archive under `dist/`. Release archives place `depgraph` under `bin/`, compatible workers under `libexec/`, and include the project's complete `LICENSE-MIT` and `LICENSE-APACHE` texts, a checksum-verified release manifest, protocol schema, SPDX SBOM, and a separate third-party license inventory. The release manifest declares `MIT OR Apache-2.0` and attests both project license files independently from `THIRD_PARTY_LICENSES.txt`. The release gate fixes Rust/Cargo `1.93.1`; the Rust worker manifest records the linked backend unit, rust-analyzer `0.0.330` at revision `8954b66d43225e62c92e8bbcc8500191b5cceb1e` with Salsa `0.26.1`. The Web worker manifest records the exact TypeScript version, the complete Web semantic capability set, and its Astro and TypeScript runtime components.
 
-The package verifier extracts the archive and validates the manifest, both project licenses, every artifact and runtime component, Rust and Web worker handshakes, per-framework scan/query/export E2E, cross-checkout JSON/DOT/Mermaid determinism, and the complete runtime SBOM and third-party license closure. Missing, added, modified, symlinked, or version-mismatched license, Web worker, Astro parser, TypeScript compiler, or schema input fails before worker launch. Runtime components distinguish an `executable-tree` with an executable entrypoint from a `data-tree` whose entrypoint is optional. No sysroot or `rust-src` is currently bundled, and packaged scans never fall back implicitly to project or system backend/sysroot bytes. Tier 1 Linux/macOS package gates and Windows safety/determinism smoke cover the Web semantic archive contract.
+The package verifier extracts the archive and validates the manifest, both project licenses, every artifact and runtime component, Rust and Web worker handshakes, per-framework scan/query/export E2E, dynamic framework build query/diff/impact/policy/JSON/GraphML E2E, cross-checkout determinism, rollback, and the complete runtime SBOM and third-party license closure. Missing, added, modified, symlinked, or version-mismatched license, Web worker, build observer/converter, Astro parser, TypeScript compiler, or schema input fails before worker launch. Runtime components distinguish an `executable-tree` with an executable entrypoint from a `data-tree` whose entrypoint is optional. No sysroot or `rust-src` is currently bundled, and packaged scans never fall back implicitly to project or system backend/sysroot bytes. Tier 1 Linux/macOS package gates and Windows safety/determinism smoke cover the Web semantic and dynamic framework archive contracts.
 
 ## License
 

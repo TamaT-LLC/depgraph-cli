@@ -20,10 +20,40 @@ const route = {
   isPrerendered: true,
   origin: "project",
 };
+const dynamicRoute = {
+  route: "/generated/[slug]",
+  pathname: undefined,
+  pattern: "/generated/[slug]",
+  patternRegex: /^\/generated\/([^/]+?)\/?$/,
+  entrypoint: "src/pages/blog/[slug].astro",
+  params: ["slug"],
+  segments: [
+    [{ content: "generated", dynamic: false, spread: false }],
+    [{ content: "slug", dynamic: true, spread: false }],
+  ],
+  type: "page",
+  isPrerendered: false,
+  origin: "integration",
+};
+const endpointRoute = {
+  route: "/api/status",
+  pathname: "/api/status",
+  pattern: "/api/status",
+  patternRegex: /^\/api\/status\/?$/,
+  entrypoint: "src/pages/api/status.ts",
+  params: [],
+  segments: [
+    [{ content: "api", dynamic: false, spread: false }],
+    [{ content: "status", dynamic: false, spread: false }],
+  ],
+  type: "endpoint",
+  isPrerendered: false,
+  origin: "project",
+};
 await integration.hooks["astro:config:done"]({
   config: { output: "static", base: "/", trailingSlash: "ignore", integrations: [integration] },
 });
-await integration.hooks["astro:routes:resolved"]({ routes: [route] });
+await integration.hooks["astro:routes:resolved"]({ routes: [route, dynamicRoute, endpointRoute] });
 for (const environment of ["browser", "server"]) {
   let plugin;
   await integration.hooks["astro:build:setup"]({
@@ -31,10 +61,15 @@ for (const environment of ["browser", "server"]) {
     updateConfig(value) { plugin = value.plugins[0]; },
   });
   const source = path.join(root, "src/pages/index.astro");
+  const dynamicSource = path.join(root, "src/pages/blog/[slug].astro");
+  const endpointSource = path.join(root, "src/pages/api/status.ts");
+  const moduleIds = environment === "browser"
+    ? [source]
+    : [source, dynamicSource, endpointSource];
   const context = {
     environment: { name: environment },
     meta: { viteVersion: "7.0.6", rollupVersion: "4.0.0", watchMode: false },
-    getModuleIds: () => [source].values(),
+    getModuleIds: () => moduleIds.values(),
     getModuleInfo: () => ({ importedIds: [], dynamicallyImportedIds: [], isEntry: true }),
   };
   plugin.configResolved({
@@ -50,17 +85,37 @@ for (const environment of ["browser", "server"]) {
       fileName: `${environment}/entry.mjs`,
       code: `export const secret = ${JSON.stringify(secret)}`,
       isEntry: true,
-      modules: { [source]: {} },
+      modules: Object.fromEntries(moduleIds.map((id) => [id, {}])),
       imports: [], dynamicImports: [],
       viteMetadata: { importedAssets: new Set(), importedCss: new Set() },
     },
+    ...(environment === "server" ? {
+      "server/dynamic.mjs": {
+        type: "chunk",
+        fileName: "server/dynamic.mjs",
+        code: "export const dynamicPage = true",
+        isEntry: true,
+        modules: { [dynamicSource]: {} },
+        imports: [], dynamicImports: [],
+        viteMetadata: { importedAssets: new Set(), importedCss: new Set() },
+      },
+      "server/endpoint.mjs": {
+        type: "chunk",
+        fileName: "server/endpoint.mjs",
+        code: "export const endpoint = true",
+        isEntry: true,
+        modules: { [endpointSource]: {} },
+        imports: [], dynamicImports: [],
+        viteMetadata: { importedAssets: new Set(), importedCss: new Set() },
+      },
+    } : {}),
   });
 }
 await integration.hooks["astro:build:ssr"]({
-  manifest: { routes: [route], entryModules: {} },
+  manifest: { routes: [route, dynamicRoute, endpointRoute], entryModules: {} },
 });
 await integration.hooks["astro:build:generated"]({
-  routeToHeaders: new Map([[route, {}]]),
+  routeToHeaders: new Map([[route, {}], [dynamicRoute, {}], [endpointRoute, {}]]),
 });
 await integration.hooks["astro:build:done"]({
   pages: [{ pathname: "/", secret }],
