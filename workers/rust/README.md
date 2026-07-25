@@ -69,7 +69,11 @@ edition plus feature, target, and test cfg per crate. Registry, git, unmodeled
 path, and build dependencies stay in a deterministic sidecar sentinel ledger.
 For a core-attested packaged release only, the pinned bundled `core`, `alloc`,
 and `std` inventories enter a separate library VFS and crate graph; otherwise
-sysroot dependencies also remain sentinels. Custom targets, build scripts,
+sysroot dependencies also remain sentinels. Local dependency injection follows
+the effective crate root: ordinary crates receive `std` and `core`, `no_std`
+crates receive `core`, and `alloc`/an explicitly restored `std` are added only
+for an active root-level `extern crate`. `no_core` fails closed because its
+lang-item environment is outside the safe model. Custom targets, build scripts,
 proc-macro targets, incomplete crate models, and static Cargo fallback remain
 explicit diagnostic/coverage entries.
 
@@ -244,6 +248,7 @@ no implicit fallback.
 | Cargo preflight rejects the input, mirror/DTO validation fails, or frozen/offline Cargo is unavailable | `CARGO_METADATA_FALLBACK`; static manifest, syntax graph, and file ledger are retained | Syntax fallback with a stable coverage reason; raw Cargo stderr and temporary paths are not exposed |
 | A built-in attribute has no attribute-specific shape/value/placement validator | `unsupported_attribute` site plus `RUST_ATTRIBUTE_UNSUPPORTED`; nested expression-shaped macro arguments are still inventoried | Conservative incomplete ledger; generic `Meta` parsing never proves compiler validity |
 | An unqualified bang macro or derive identity cannot be proven built-in/non-procedural | Generic `macro_expansion` or `proc_macro_expansion` unresolved site; nested expression-shaped `include!` / `env!` arguments are inventoried recursively | Conservative incomplete ledger; names are not trusted because local/imported macros can shadow built-ins |
+| `#![no_std]`, active `cfg_attr(..., no_std)`, or `#![no_core]` changes implicit sysroot injection | `no_std` receives only `core` plus active root-level explicit sysroot crates; `no_core` keeps syntax output and rejects the HIR project model | Never attach `std`/`alloc` merely because the bundled crates exist; unsupported `no_core` never claims `semantic-complete` |
 | `OUT_DIR` include, build script, or proc macro is required | Unresolved site plus `RUST_HIR_OUT_DIR_UNAVAILABLE`, `BUILD_SCRIPT_NOT_EXECUTED`, or `PROC_MACRO_NOT_EXECUTED` | Ledgered partial HIR only; never execute or read generated project output in safe mode |
 | External definition is unavailable | Classified external or unresolved site plus stable coverage evidence | Analysis continues, but either classification blocks `semantic-complete` |
 | Typed HIR semantic-extractor failure | The node/site/edge/file-ledger delta is discarded atomically and the syntax graph is preserved with `RUST_HIR_BACKEND_FAILURE` | Strict-policy failure; never `semantic-complete` |

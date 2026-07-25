@@ -305,6 +305,7 @@ struct PendingCrate {
     cfg_snapshot: Vec<String>,
     test: bool,
     dev_dependencies: bool,
+    sysroot_dependencies: BTreeSet<String>,
 }
 
 type BuiltVfs = (
@@ -472,6 +473,14 @@ pub(crate) fn build_safe_project_model_with_sysroot(
                 && package.workspace_member
                 && matches!(target.kind.as_str(), "example" | "test" | "bench");
             let key = crate_key(package, target);
+            let sysroot_dependencies = crate_sysroot_dependencies(
+                inventory,
+                package_index,
+                &target.src_path,
+                &target_cfg,
+                features,
+                test,
+            )?;
             pending.push(PendingCrate {
                 package_index,
                 key: key.clone(),
@@ -488,12 +497,21 @@ pub(crate) fn build_safe_project_model_with_sysroot(
                 cfg_snapshot: target_cfg.snapshot(features, test),
                 test,
                 dev_dependencies,
+                sysroot_dependencies,
             });
             if profile.mode == HirProjectMode::Test
                 && package.workspace_member
                 && matches!(target.kind.as_str(), "lib" | "bin")
                 && target.test
             {
+                let sysroot_dependencies = crate_sysroot_dependencies(
+                    inventory,
+                    package_index,
+                    &target.src_path,
+                    &target_cfg,
+                    features,
+                    true,
+                )?;
                 pending.push(PendingCrate {
                     package_index,
                     key: format!("{key}#unit-test"),
@@ -510,6 +528,7 @@ pub(crate) fn build_safe_project_model_with_sysroot(
                     cfg_snapshot: target_cfg.snapshot(features, true),
                     test: true,
                     dev_dependencies: true,
+                    sysroot_dependencies,
                 });
             }
         }
@@ -747,10 +766,10 @@ pub(crate) fn build_safe_project_model_with_sysroot(
         }
         dependencies_by_crate.insert(krate.key.clone(), dependencies);
         if sysroot.is_none() {
-            for name in ["std", "core", "alloc"] {
+            for name in &krate.sysroot_dependencies {
                 externals.push(ExternalCrateSnapshot {
                     from_crate: krate.key.clone(),
-                    name: name.into(),
+                    name: name.clone(),
                     kind: ExternalCrateKind::Sysroot,
                 });
             }
@@ -773,7 +792,7 @@ pub(crate) fn build_safe_project_model_with_sysroot(
                     )
                 })?;
         }
-        for name in ["std", "core", "alloc"] {
+        for name in &krate.sysroot_dependencies {
             if let Some(to) = sysroot_builder_ids.get(name) {
                 graph
                     .add_dep(
@@ -820,12 +839,12 @@ pub(crate) fn build_safe_project_model_with_sysroot(
             let mut dependencies: Vec<_> =
                 dependencies_by_crate[&krate.key].iter().cloned().collect();
             if sysroot.is_some() {
-                dependencies.extend(
-                    ["alloc", "core", "std"].map(|name| CrateDependencySnapshot {
-                        name: name.into(),
+                dependencies.extend(krate.sysroot_dependencies.iter().map(|name| {
+                    CrateDependencySnapshot {
+                        name: name.clone(),
                         crate_key: format!("rust-sysroot#{name}"),
-                    }),
-                );
+                    }
+                }));
                 dependencies.sort();
             }
             CrateSnapshot {
@@ -893,6 +912,170 @@ pub(crate) fn build_safe_project_model_with_sysroot(
         crate_instances,
         sysroot_crate_instances,
     })
+}
+
+fn crate_sysroot_dependencies(
+    inventory: &[InventorySource],
+    package_index: usize,
+    root_path: &str,
+    target_cfg: &TargetCfg,
+    features: &BTreeSet<String>,
+    test: bool,
+) -> std::result::Result<BTreeSet<String>, ProjectModelError> {
+    let source = inventory
+        .iter()
+        .find(|source| source.package_index == Some(package_index) && source.rel_path == root_path)
+        .ok_or_else(|| {
+            ProjectModelError::incomplete(
+                Some(root_path),
+                "Cargo target crate root is missing from the admitted source inventory",
+            )
+        })?;
+    let syntax = syn::parse_file(&source.text).map_err(|_| {
+        ProjectModelError::incomplete(
+            Some(root_path),
+            "Rust crate root attributes could not be safely inventoried",
+        )
+    })?;
+    let mut no_std = false;
+    let mut no_core = false;
+    for attribute in &syntax.attrs {
+        apply_sysroot_crate_attribute(
+            &attribute.meta,
+            target_cfg,
+            features,
+            test,
+            &mut no_std,
+            &mut no_core,
+        )
+        .map_err(|reason| ProjectModelError::unsupported(Some(root_path), reason))?;
+    }
+    if no_core {
+        return Err(ProjectModelError::unsupported(
+            Some(root_path),
+            "no_core crates are not supported by the attested sysroot dependency model",
+        ));
+    }
+
+    let mut dependencies = BTreeSet::from(["core".to_owned()]);
+    if !no_std {
+        dependencies.insert("std".into());
+    }
+    for item in &syntax.items {
+        let syn::Item::ExternCrate(extern_crate) = item else {
+            continue;
+        };
+        let name = extern_crate.ident.to_string();
+        if matches!(name.as_str(), "alloc" | "core" | "std")
+            && cfg_attributes_are_active(&extern_crate.attrs, target_cfg, features, test)
+                .map_err(|reason| ProjectModelError::unsupported(Some(root_path), reason))?
+        {
+            dependencies.insert(name);
+        }
+    }
+    Ok(dependencies)
+}
+
+fn apply_sysroot_crate_attribute(
+    meta: &Meta,
+    target_cfg: &TargetCfg,
+    features: &BTreeSet<String>,
+    test: bool,
+    no_std: &mut bool,
+    no_core: &mut bool,
+) -> std::result::Result<(), String> {
+    if meta.path().is_ident("no_core") {
+        *no_core = true;
+        return Ok(());
+    }
+    if meta.path().is_ident("no_std") {
+        *no_std = true;
+        return Ok(());
+    }
+    let Meta::List(list) = meta else {
+        return Ok(());
+    };
+    if !list.path.is_ident("cfg_attr") {
+        return Ok(());
+    }
+    let nested = list
+        .parse_args_with(Punctuated::<Meta, Token![,]>::parse_terminated)
+        .map_err(|_| "crate-level cfg_attr predicate is malformed".to_owned())?;
+    if nested.len() < 2 {
+        return Err("crate-level cfg_attr requires a predicate and attribute".into());
+    }
+    if evaluate_cfg_meta(
+        nested.first().expect("length checked"),
+        target_cfg,
+        features,
+        test,
+    )? {
+        for nested_attribute in nested.iter().skip(1) {
+            apply_sysroot_crate_attribute(
+                nested_attribute,
+                target_cfg,
+                features,
+                test,
+                no_std,
+                no_core,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn cfg_attributes_are_active(
+    attributes: &[Attribute],
+    target_cfg: &TargetCfg,
+    features: &BTreeSet<String>,
+    test: bool,
+) -> std::result::Result<bool, String> {
+    for attribute in attributes {
+        if !cfg_meta_is_active(&attribute.meta, target_cfg, features, test)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn cfg_meta_is_active(
+    meta: &Meta,
+    target_cfg: &TargetCfg,
+    features: &BTreeSet<String>,
+    test: bool,
+) -> std::result::Result<bool, String> {
+    let Meta::List(list) = meta else {
+        return Ok(true);
+    };
+    if list.path.is_ident("cfg") {
+        let predicate = list
+            .parse_args::<Meta>()
+            .map_err(|_| "extern crate cfg predicate is malformed".to_owned())?;
+        return evaluate_cfg_meta(&predicate, target_cfg, features, test);
+    }
+    if !list.path.is_ident("cfg_attr") {
+        return Ok(true);
+    }
+    let nested = list
+        .parse_args_with(Punctuated::<Meta, Token![,]>::parse_terminated)
+        .map_err(|_| "extern crate cfg_attr predicate is malformed".to_owned())?;
+    if nested.len() < 2 {
+        return Err("extern crate cfg_attr requires a predicate and attribute".into());
+    }
+    if !evaluate_cfg_meta(
+        nested.first().expect("length checked"),
+        target_cfg,
+        features,
+        test,
+    )? {
+        return Ok(true);
+    }
+    for nested_attribute in nested.iter().skip(1) {
+        if !cfg_meta_is_active(nested_attribute, target_cfg, features, test)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn inert_proc_macro_cwd() -> Arc<AbsPathBuf> {
@@ -2140,11 +2323,12 @@ mod tests {
         assert!(snapshot.externals.iter().any(|external| {
             external.name == "std" && external.kind == ExternalCrateKind::Sysroot
         }));
-        for name in ["core", "alloc"] {
-            assert!(snapshot.externals.iter().any(|external| {
-                external.name == name && external.kind == ExternalCrateKind::Sysroot
-            }));
-        }
+        assert!(snapshot.externals.iter().any(|external| {
+            external.name == "core" && external.kind == ExternalCrateKind::Sysroot
+        }));
+        assert!(!snapshot.externals.iter().any(|external| {
+            external.name == "alloc" && external.kind == ExternalCrateKind::Sysroot
+        }));
         assert!(snapshot.externals.iter().any(|external| {
             external.name == "outside_path"
                 && external.kind == ExternalCrateKind::OutsideOrUnmodeledPath
@@ -2224,12 +2408,18 @@ mod tests {
             );
         }
         assert!(snapshot.crates.iter().all(|krate| {
-            ["alloc", "core", "std"].iter().all(|name| {
+            ["core", "std"].iter().all(|name| {
                 krate.dependencies.iter().any(|dependency| {
                     dependency.name == *name
                         && dependency.crate_key == format!("rust-sysroot#{name}")
                 })
             })
+        }));
+        assert!(snapshot.crates.iter().all(|krate| {
+            !krate
+                .dependencies
+                .iter()
+                .any(|dependency| dependency.name == "alloc")
         }));
         assert!(!snapshot.externals.iter().any(|external| {
             external.kind == ExternalCrateKind::Sysroot
@@ -2241,6 +2431,63 @@ mod tests {
                 .iter()
                 .any(|issue| { issue.code == "RUST_HIR_SYSROOT_UNAVAILABLE" })
         );
+    }
+
+    #[test]
+    fn crate_root_attributes_control_attested_sysroot_dependencies() {
+        let (packages, mut inventory) = fixture();
+        inventory
+            .iter_mut()
+            .find(|source| source.rel_path == "app/src/lib.rs")
+            .unwrap()
+            .text = "#![cfg_attr(unix, no_std)]\nextern crate alloc;\npub fn enabled() {}\n".into();
+        let model = build_safe_project_model_with_sysroot(
+            &packages,
+            &inventory,
+            Some(&attested_sysroot_fixture()),
+            &HirProjectProfile {
+                target_triple: "x86_64-unknown-linux-gnu".into(),
+                mode: HirProjectMode::Check,
+                requested_features: Vec::new(),
+            },
+            Path::new(""),
+        )
+        .expect("active no_std cfg_attr must produce a confined crate graph");
+        let app = model
+            .snapshot()
+            .crates
+            .iter()
+            .find(|krate| krate.target_name == "app_lib")
+            .expect("app library crate");
+        assert_eq!(
+            app.dependencies
+                .iter()
+                .filter(|dependency| dependency.crate_key.starts_with("rust-sysroot#"))
+                .map(|dependency| dependency.name.as_str())
+                .collect::<Vec<_>>(),
+            ["alloc", "core"]
+        );
+
+        inventory
+            .iter_mut()
+            .find(|source| source.rel_path == "app/src/lib.rs")
+            .unwrap()
+            .text = "#![no_core]\npub fn enabled() {}\n".into();
+        let error = build_safe_project_model_with_sysroot(
+            &packages,
+            &inventory,
+            Some(&attested_sysroot_fixture()),
+            &HirProjectProfile {
+                target_triple: "x86_64-unknown-linux-gnu".into(),
+                mode: HirProjectMode::Check,
+                requested_features: Vec::new(),
+            },
+            Path::new(""),
+        )
+        .err()
+        .expect("no_core must fail closed instead of receiving fabricated sysroot edges");
+        assert_eq!(error.kind, ProjectModelErrorKind::UnsupportedInput);
+        assert!(error.reason.contains("no_core"));
     }
 
     #[test]
