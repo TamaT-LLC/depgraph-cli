@@ -290,6 +290,10 @@ pub struct ReleaseCompatibilityHealth {
     pub minimum_migratable_store_schema_version: i64,
     pub previous_release_version: String,
     pub previous_release_store_schema_version: i64,
+    pub stable_release_gate_contract_version: String,
+    pub stable_release_version: String,
+    pub stable_upgrade_source_version: String,
+    pub stable_upgrade_source_store_schema_version: i64,
     pub cache_contract_version: u32,
     pub snapshot_diff_schema_version: String,
     pub incremental_plan_schema_version: String,
@@ -312,6 +316,10 @@ pub fn release_compatibility_contract() -> ReleaseCompatibilityHealth {
         minimum_migratable_store_schema_version: 1,
         previous_release_version: "0.2.0-rc.1".to_owned(),
         previous_release_store_schema_version: 5,
+        stable_release_gate_contract_version: "stable-release-gate-v1".to_owned(),
+        stable_release_version: "0.4.0".to_owned(),
+        stable_upgrade_source_version: "0.4.0-rc.1".to_owned(),
+        stable_upgrade_source_store_schema_version: 11,
         cache_contract_version: CACHE_CONTRACT_VERSION,
         snapshot_diff_schema_version: SNAPSHOT_DIFF_SCHEMA_VERSION.to_owned(),
         incremental_plan_schema_version: INCREMENTAL_PLAN_SCHEMA_VERSION.to_owned(),
@@ -325,7 +333,7 @@ pub fn release_compatibility_contract() -> ReleaseCompatibilityHealth {
         runtime_trace_schema_version: RUNTIME_TRACE_SCHEMA_VERSION.to_owned(),
         runtime_collector_contract_version: RUNTIME_COLLECTOR_CONTRACT_VERSION.to_owned(),
         graphml_schema_version: GRAPHML_SCHEMA_VERSION.to_owned(),
-        packaged_smoke_contract: "milestone4-packaged-smoke-v1".to_owned(),
+        packaged_smoke_contract: "stable-v0.4.0-packaged-smoke-v1".to_owned(),
     }
 }
 
