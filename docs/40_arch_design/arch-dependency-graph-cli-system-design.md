@@ -1517,14 +1517,14 @@ schema、commit、全必須metric、conservation、総合passを再検証して�
 - TypeScript import / re-export / type-use resolution: 実装済み（Issue #42、2026-07-19）
 - TypeScript exact direct-call graph、closed local candidate `may_call`、external / unresolved call ledger、pure profileのfinal fallback / coverage / `semantic-complete`判定: 実装済み（Issue #43 / #47 / #48、2026-07-19 / 2026-07-21）。Web framework semantic graph v1、Next.js / Astro / TanStack Router / TanStack Start collector、framework completeness gate、package/release verifierも実装済み（Issue #49〜#55、2026-07-21 / 2026-07-22）
 - 他adapterのimport / type-use / direct call / candidate call: 未実装
-- component / route / server function semantic edge: Web adapterは実装済み。Next.jsのdynamic build境界はIssue #141で実装済み、他framework / adapterのbuild観測境界は未実装
+- component / route / server function semantic edge: Web adapterは実装済み。Next.js / Astroのdynamic build境界はIssue #141 / #142で実装済み、他framework / adapterのbuild観測境界は未実装
 
 ### Milestone 3: Build Evidence
 
 - safe execution boundary / explicit consent contract: Issue #62で実装済み（2026-07-22）
 - opt-in child-process supervisor: Issue #63で実装済み（2026-07-22）
 - Next Adapter observer: Issue #65で基盤、Issue #141でdynamic / build-only route manifest graphを実装済み（2026-07-22 / 2026-07-24）
-- Astro integration / Vite observer: Issue #66で実装済み（2026-07-22）
+- Astro integration / Vite observer: Issue #66で基盤、Issue #142でdynamic route / island / endpoint manifest graphを実装済み（2026-07-22 / 2026-07-25）
 - TanStack Start build observer: Issue #67で実装済み（2026-07-22）
 - Rust build script / proc macro opt-in: Issue #68で実装済み（2026-07-22）
 - profile matrix union: Issue #69で実装済み（2026-07-22）
@@ -1592,6 +1592,7 @@ schema、commit、全必須metric、conservation、総合passを再検証して�
 
 ## 26. 更新履歴
 
+- 2026-07-25: Issue #142としてAstro 5〜7 Integration API / Vite 6〜7 observerを`astro-build-observation-v2`へ更新。`astro:routes:resolved`のcanonical route pattern、dynamic / spread params、endpoint / origin / prerender metadata、`astro:build:ssr` / `astro:build:generated` / `astro:build:done`の完了性、route / asset / Vite manifest digest/countを固定した。client / SSR moduleとoutputからroute / endpoint / island、hydration / route / endpoint / client / server chunk、browser / server boundaryをallowlist roleへ分類し、build-only dynamic route、SSR endpoint、hydration chunkを`renders` / `emits` / `loads`のobserved edgeとして共通graphへ変換する。別checkout・反復buildの決定性、secret / absolute path非漏洩、manifest tamper、unsupported version、missing hook、partial environment、crash / timeoutをtestで固定し、失敗attemptは既存atomic promotion契約により直前completed snapshotを維持する。
 - 2026-07-24: Issue #141としてNext.js 16.2+ Adapter APIのroute/output manifestを`next-build-observation-v2`へ固定。通常 / RSC / data variantのcanonical route統合、dynamic route相関、PRERENDER parent、APP_ROUTE / static metadata、server/client chunk、middleware、edge runtimeとserver / browser / edge / static境界をobserved graphへ変換する。route/build manifest digest/count、output identity、build-ID path segment正規化をconverterで再検証し、別checkout・異なるbuild ID・反復buildの決定性をfixtureで固定した。unsupported version、manifest欠損、partial output、missing parent/artifact、edge metadata不正、tamperはbounded failureとしてatomicに破棄する。
 - 2026-07-24: Issue #140としてdynamic framework build evidenceの共通`framework-build-graph-v1` contractを実装。Next.js / Astro / TanStack Router / TanStack Start共通のgenerated nodeとrelation vocabulary、attempt非依存stable ID、production profile / condition、observer capability / audit digest provenanceを固定し、safe base nodeのbyte-identical再利用とconflict reject、site/edge exact closureをTypeScript converterとRust coreの両方で検証する。completed buildをbaseにした反復実行はgenerated nodeの保存済みbytesを再利用し、既存site / edge / diagnosticをidempotentに省略する一方、同じstable siteのtarget driftはrejectする。観測不能dynamic targetはversioned `unknown_target`への`unresolved` / `observed` relationとbounded reasonに限定し、partial / unsupported / manifest・hook欠損は`build-observed`を付与しないcoverage規則をtestで固定した。
 - 2026-07-24: Issue #138としてNode.js 24 / TypeScript reference runtime collectorを`workers/web`へ実装。module / call / route / RPCのtyped observationをtrace v1 eventへ変換し、URLはbuffer admission前にschemeとcanonical `host[:port]`へ縮約する。disabled no-op、UTC / monotonic injectable clock、acceptance-order contiguous sequence、token-bucket rate ceiling、event / byte bounded drop-newest buffer、immutable-prefix / coalesced flush、byte-identical bounded retry、idempotent bounded shutdown、file / stdout / OTLP sinkとbounded diagnostic counterを固定した。Next.js / Astro / TanStack fixtureでprofile / environment metadataとredaction非漏洩を検証し、Node生成goldenをRust Schema / importerおよびCLI `runtime validate` / `runtime import`へ通すcross-language testを追加した。
