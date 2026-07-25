@@ -592,6 +592,42 @@ build constraint は Boolean condition として保存し、単一 scan で非�
 
 TypeScript の `type_target` と runtime / bundler の `runtime_target` は別 edge として保持できるようにする。
 
+### 8.5 Default profile selection（将来 planner）
+
+default matrixは`default-profile-selection-v1`で計画する。safe inventory、
+adapter/toolchain compatibility、attested Rust/Go host target、tracked profile
+設定、planner limitをcanonical inputとし、absolute path、mtime、locale、iteration
+order、CI/TTY、clock、過去のscanを選択入力にしない。同じinputの別checkoutは
+candidate、rank、selected / omitted、reasonをbyte-identicalにする。
+
+検出したRust / Go / Web familyのbaselineを先に1件ずつ確保し、自動候補はbaseline
+からtarget、feature/tag、mode、environmentのいずれか1軸だけを変える。複数
+non-default軸の組合せ、`--all-features`、cgo / VTA、build/runtime profileを自動生成
+せず、明示selectionへ委ねる。cross-language capabilityはcompatibleなselected
+profile setへattachし、root profile数を増やさない。
+
+repository classとdefault total profile capは、relevant source / build unitが
+ともに`tiny <= 1,000 / 25`なら`16`、`small <= 10,000 / 100`なら`10`、
+`medium <= 50,000 / 500`なら`6`、それ以外の`large`は`4`とする。
+selection hard capは`32`、candidate discoveryは言語ごと`256`・全体`512`である。
+budgetはlower parser/worker/protocol/query limitを変更しない。
+
+baseline後の候補はtracked declaration、未coverage dependency occurrence / file、
+dimension、language、canonical profile IDの固定tupleでgreedyに選び、persisted
+配列はprofile IDのUTF-8 byte順とする。budget omission、candidate overflow、
+dynamic/unsupported axis、直積を作らないpolicyをcoverage / doctor / planへ固定reason
+付きで残す。normal scanはselected-scope snapshotをwarning付きで完了できるが
+aggregate `default_profile_matrix_complete=false`とし、`--strict`はexit `1`で
+non-promotionとする。
+
+将来`profiles plan` / `--profile-budget`はauto selectionを説明・調整し、
+`--profiles-file`はstrict versioned JSONで全matrixを置換する。explicit requestは
+truncate / baseline追加 / auto fallbackせず、invalid・unsupported・32件超過をworker
+起動前のexit `2`とする。現行config schema v1はplanner実装まで従来の
+one-selection-per-adapter契約を維持する。規範的なinput、budget、ranking、CLI、
+failure、fixture、段階計画は
+[`PROJ-ARC-001-ADR-004`](adr-default-profile-selection-budget.md)に定める。
+
 ## 9. Rust Adapter
 
 ### 9.1 現状と採用 backend
@@ -1564,6 +1600,19 @@ validatorの後、OpenAPI → Protobuf → GraphQL → HTTP trace → FFIの順�
 11個の1〜3日sliceとsecurity/release gateを
 [`PROJ-ARC-001-ADR-003`](adr-cross-language-adapter-contract.md)に定める。
 
+### ADR-012: Bounded Evidence-ranked Default Profile Selection
+
+**採用。** `default-profile-selection-v1`は検出言語baselineを先に確保し、static
+evidenceから作る単一軸候補だけを規模別total cap `16 / 10 / 6 / 4`とhard cap
+`32`の下でcanonical greedy rankingする。target × feature × mode × environmentの
+直積、build/runtime consent、cgo/VTA、`--all-features`をdefaultへ混入させない。
+budget omission / discovery overflow / policy除外はcoverage、doctor、planへ固定reason
+付きで残し、strictではexit `1`とする。explicit profiles fileは全件またはerrorで、
+truncate、baseline追加、auto fallbackを行わない。現行config schema v1はstaged
+planner実装まで従来contractを維持する。input identity、repository class、
+ranking、CLI/failure semantics、8段階の1〜3日計画は
+[`PROJ-ARC-001-ADR-004`](adr-default-profile-selection-budget.md)に定める。
+
 ## 21. Roadmap
 
 ### Milestone 0: Schema and Contract
@@ -1608,6 +1657,12 @@ validatorの後、OpenAPI → Protobuf → GraphQL → HTTP trace → FFIの順�
   correlation、FFIをformat別capabilityとして導入する。各parser / repository
   mapping / build-runtime correlation / release gateは
   [`PROJ-ARC-001-ADR-003`](adr-cross-language-adapter-contract.md)の11個の
+  1〜3日sliceへ分離する
+- default profile matrix / exploration budget:
+  `default-profile-selection-v1`としてADR確定済み（Issue #151、2026-07-25）。
+  canonical plan DTO、規模分類、Rust / Go / Web単一軸候補、greedy selection、
+  coverage / doctor / CLI explicit override、cache/release gateを
+  [`PROJ-ARC-001-ADR-004`](adr-default-profile-selection-budget.md)の8個の
   1〜3日sliceへ分離する
 
 ### Milestone 3: Build Evidence
@@ -1659,13 +1714,14 @@ validatorの後、OpenAPI → Protobuf → GraphQL → HTTP trace → FFIの順�
 ## 23. Open Questions
 
 - binary / product の最終名称を `depgraph` とするか
-- default profile matrix の範囲と組合せ爆発の抑制方法
 - public OSS とするか、初期は private 検証とするか
 - graph query language を導入する時期
 
 ## 24. 参考資料
 
 - Cargo metadata: https://doc.rust-lang.org/cargo/commands/cargo-metadata.html
+- Cargo features: https://doc.rust-lang.org/cargo/reference/features.html
+- Go build constraints: https://pkg.go.dev/cmd/go#hdr-Build_constraints
 - rust-analyzer architecture: https://rust-analyzer.github.io/book/contributing/architecture.html
 - Go packages: https://pkg.go.dev/golang.org/x/tools/go/packages
 - Go types: https://pkg.go.dev/go/types
@@ -1686,9 +1742,11 @@ validatorの後、OpenAPI → Protobuf → GraphQL → HTTP trace → FFIの順�
 - [`PROJ-ARC-001-ADR-001`: Production runtime collector v1 contract](adr-production-runtime-collector-v1.md)
 - [`PROJ-ARC-001-ADR-002`: Opt-in Rust compiler-precise backend](adr-rust-compiler-precise-backend.md)
 - [`PROJ-ARC-001-ADR-003`: Cross-language adapter common contract](adr-cross-language-adapter-contract.md)
+- [`PROJ-ARC-001-ADR-004`: Default profile selection and exploration budget](adr-default-profile-selection-budget.md)
 
 ## 26. 更新履歴
 
+- 2026-07-25: Issue #151として`default-profile-selection-v1`を確定。safe inventory / compatibility / attested host / tracked config / planner limitをcanonical inputとし、Rust / Go / Web baselineを優先した後、static evidence付き単一軸candidateだけをgreedy rankingする。repository classはrelevant source / build unitの両閾値でtiny / small / medium / largeへ分類し、default total capを`16 / 10 / 6 / 4`、selection hard capを`32`、candidate discoveryを言語ごと`256`・全体`512`へ固定した。target × feature × mode × environmentの直積、all-features、cgo/VTA、build/runtime profileをauto selectionから除外し、budget omission / overflow / policy exclusionをcoverage / doctor / planへ固定reason付きで残す。将来`profiles plan` / `--profile-budget`とstrict versioned `--profiles-file`、all-or-error explicit semantics、8段階の1〜3日実装計画、polyglot / size-boundary / checkout determinism acceptance matrixをADRへ定めた。
 - 2026-07-25: Issue #150として`cross-language-contract-v1`の共通identity / dependency site / edge / evidence / profile / completeness規約とformat別capability boundaryを確定。`service` / `schema` / `operation` / `message` / `native_symbol`、contract relation、generated code / repository mappingのproof hierarchy、external / unresolvedとprofile condition規則を定義し、同名・URL/path・生成コメントだけのexact mappingを禁止した。safe scanではremote ref/introspection、network、generator/plugin、native loadを禁止し、OpenAPI → Protobuf → GraphQL → HTTP runtime correlation → FFIの優先順位、11個の1〜3日slice、hostile / provenance / determinism / five-target security-release gateをADRへ固定した。
 - 2026-07-25: Issue #149として`compiler-precise-rust-v1`の脅威モデルとADRを確定。最初のcompatibility unitを`nightly-2026-07-17` / Rust・Cargo `1.99.0-nightly` / rustc commit `3d50c25bc66853bf0ad205529d0f305a1d841b5e`へ固定し、通常archiveとは別のclosed-tree compiler pack、Cargo unit graph v1、全unit用attested `RUSTC_WRAPPER`、`rustc_public`優先・最小`rustc_private` bridgeを採用する。明示的な`--build` / `--allow-project-code` / 将来`--rust-compiler-precise`の三重gate、project code / wrapper / config / artifactのuntrusted境界、pre/postflight toolchain attestation、typed MIR / monomorphized itemのbuild-phase observed evidence、attempt全破棄と直前snapshot維持を定義した。rolling / system / project toolchain、rustup download、coreへのcompiler library load、既存artifact parse、別toolchain fallbackを棄却し、security review条件と8段階の1〜3日実装計画、hostile / rollback / 5 target acceptance matrixをADRへ固定した。
 - 2026-07-25: Issue #148としてstable `v0.4.0` compatibility / quality gateを確定。product / Rust / Go / Web adapterを`0.4.0`へ同期し、protocol / graph `1.0`、store schema `13`、cache contract `1`を0.4.x compatibility promiseへ固定した。公式`v0.4.0-rc.1` packageが生成したschema `11` fixtureをschema `13`へtransactional migrationし、completed graph integrity、書込み、rollback backupと従来schema `5` migrationをunit / native package smokeで検証する。tag workflowはquality、benchmark、全5 package、aggregate asset verificationをdirect dependencyとする`stable-release-gate-v1`を実行し、release / benchmark artifact digestと各criterionを含む`stable-release-gate.json`が`allow`の場合だけpublishする。GA exit criteria、support matrix、rollback、既知制約と更新規則をstable release noteへ集約した。
