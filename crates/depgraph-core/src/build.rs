@@ -40,6 +40,7 @@ pub const NEXT_BUILD_OBSERVER: &str = "next-adapter-observer";
 pub const ASTRO_BUILD_OBSERVER: &str = "astro-vite-build-observer";
 pub const TANSTACK_START_BUILD_OBSERVER: &str = "tanstack-start-vite-build-observer";
 pub const NEXT_BUILD_OBSERVER_VERSION: &str = "0.2.0";
+pub const ASTRO_BUILD_OBSERVER_VERSION: &str = "0.2.0";
 pub const WEB_BUILD_OBSERVER_VERSION: &str = "0.1.0";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -70,7 +71,8 @@ impl WebBuildAdapter {
     pub(crate) fn observer_version(self) -> &'static str {
         match self {
             Self::Next => NEXT_BUILD_OBSERVER_VERSION,
-            Self::Astro | Self::TanstackStart => WEB_BUILD_OBSERVER_VERSION,
+            Self::Astro => ASTRO_BUILD_OBSERVER_VERSION,
+            Self::TanstackStart => WEB_BUILD_OBSERVER_VERSION,
         }
     }
 
@@ -93,7 +95,7 @@ impl WebBuildAdapter {
     fn observation_schema(self) -> &'static str {
         match self {
             Self::Next => "next-build-observation-v2",
-            Self::Astro => "astro-build-observation-v1",
+            Self::Astro => "astro-build-observation-v2",
             Self::TanstackStart => "tanstack-start-build-observation-v1",
         }
     }
@@ -1134,7 +1136,11 @@ mod tests {
         );
         assert_eq!(
             WebBuildAdapter::Astro.observer_version(),
-            WEB_BUILD_OBSERVER_VERSION
+            ASTRO_BUILD_OBSERVER_VERSION
+        );
+        assert_eq!(
+            WebBuildAdapter::Astro.observation_schema(),
+            "astro-build-observation-v2"
         );
         assert_eq!(
             WebBuildAdapter::TanstackStart.observer_version(),

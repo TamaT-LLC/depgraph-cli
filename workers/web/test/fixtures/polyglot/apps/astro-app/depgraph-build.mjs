@@ -9,22 +9,27 @@ if (!observerPath) process.exit(81);
 const { default: createObserver } = await import(pathToFileURL(observerPath).href);
 const integration = createObserver({ repoRoot: root });
 const route = {
+  route: "/",
   pathname: "/",
-  pattern: /^\/$/,
-  component: "src/pages/index.astro",
+  pattern: "/",
+  patternRegex: /^\/$/,
+  entrypoint: "src/pages/index.astro",
+  params: [],
+  segments: [[{ content: "", dynamic: false, spread: false }]],
   type: "page",
-  prerender: true,
+  isPrerendered: true,
   origin: "project",
 };
 await integration.hooks["astro:config:done"]({
   config: { output: "static", base: "/", trailingSlash: "ignore", integrations: [integration] },
 });
 await integration.hooks["astro:routes:resolved"]({ routes: [route] });
-let plugin;
-await integration.hooks["astro:build:setup"]({
-  updateConfig(value) { plugin = value.plugins[0]; },
-});
 for (const environment of ["browser", "server"]) {
+  let plugin;
+  await integration.hooks["astro:build:setup"]({
+    target: environment === "browser" ? "client" : "server",
+    updateConfig(value) { plugin = value.plugins[0]; },
+  });
   const source = path.join(root, "src/pages/index.astro");
   const context = {
     environment: { name: environment },
@@ -51,9 +56,15 @@ for (const environment of ["browser", "server"]) {
     },
   });
 }
+await integration.hooks["astro:build:ssr"]({
+  manifest: { routes: [route], entryModules: {} },
+});
+await integration.hooks["astro:build:generated"]({
+  routeToHeaders: new Map([[route, {}]]),
+});
 await integration.hooks["astro:build:done"]({
   pages: [{ pathname: "/", secret }],
-  dir: new URL("file:///ignored/"),
-  assets: new Map([[route, ["browser/entry.mjs"]]]),
+  dir: pathToFileURL(path.join(root, "dist")),
+  assets: new Map([["/", [pathToFileURL(path.join(root, "dist", "index.html"))]]]),
 });
 await writeFile(path.join(process.env.DEPGRAPH_OUTPUT_DIR, "PROJECT_CODE_EXECUTED"), "astro", "utf8");
