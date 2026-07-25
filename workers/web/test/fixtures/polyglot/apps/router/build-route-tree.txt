@@ -1,0 +1,39 @@
+import { Route as rootRouteImport } from "./src/routes/__root";
+import { Route as PostsPostIdRouteImport } from "./src/routes/posts.$postId";
+import { Route as GeneratedOnlyRouteImport } from "./src/virtual/generated-only";
+
+const PostsPostIdRoute = PostsPostIdRouteImport.update({
+  id: "/posts/$postId",
+  path: "/posts/$postId",
+  getParentRoute: () => rootRouteImport,
+}).lazy(() => import("./src/routes/posts.lazy").then((value) => value.Route));
+
+const GeneratedOnlyRoute = GeneratedOnlyRouteImport.update({
+  id: "/generated-only",
+  path: "/generated-only",
+  getParentRoute: () => rootRouteImport,
+});
+
+declare module "@tanstack/react-router" {
+  interface FileRoutesByPath {
+    "/posts/$postId": {
+      id: "/posts/$postId";
+      path: "/posts/$postId";
+      fullPath: "/posts/$postId";
+      preLoaderRoute: typeof PostsPostIdRouteImport;
+      parentRoute: typeof rootRouteImport;
+    };
+    "/generated-only": {
+      id: "/generated-only";
+      path: "/generated-only";
+      fullPath: "/generated-only";
+      preLoaderRoute: typeof GeneratedOnlyRouteImport;
+      parentRoute: typeof rootRouteImport;
+    };
+  }
+}
+
+export const routeTree = rootRouteImport.addChildren([
+  PostsPostIdRoute,
+  GeneratedOnlyRoute,
+]);

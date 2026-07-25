@@ -77,6 +77,17 @@ await build({
 });
 
 await build({
+  entryPoints: [fileURLToPath(new URL("../src/tanstack-router-build-observer-entry.ts", import.meta.url))],
+  outfile: fileURLToPath(new URL("../dist/tanstack-router-build-observer.mjs", import.meta.url)),
+  bundle: true,
+  platform: "node",
+  format: "esm",
+  target: "node24",
+  sourcemap: false,
+  legalComments: "external",
+});
+
+await build({
   entryPoints: [fileURLToPath(new URL("../src/build-evidence-entry.ts", import.meta.url))],
   outfile: fileURLToPath(new URL("../dist/depgraph-web-build-evidence.mjs", import.meta.url)),
   bundle: true,

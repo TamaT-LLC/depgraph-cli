@@ -110,6 +110,7 @@ const WEB_SEMANTIC_RUNTIME_ARTIFACTS: &[&str] = &[];
 const WEB_RUNTIME_ARTIFACT_PATHS: &[&str] = &[
     "libexec/next-build-adapter.mjs",
     "libexec/astro-build-integration.mjs",
+    "libexec/tanstack-router-build-observer.mjs",
     "libexec/tanstack-start-build-observer.mjs",
     "libexec/depgraph-web-build-evidence.mjs",
     "libexec/depgraph-runtime-collector.mjs",

@@ -20,6 +20,13 @@ import {
   type TanStackStartBuildObservation,
   type TanStackStartBuildProvenance,
 } from "./tanstack-start-build-observer";
+import {
+  buildTanStackRouterObservedGraph,
+  tanStackRouterBuildProtocolEvents,
+  type TanStackRouterBuildGraphInput,
+  type TanStackRouterBuildObservation,
+  type TanStackRouterBuildProvenance,
+} from "./tanstack-router-build-observer";
 import type { GraphEdge, GraphNode, JsonValue, ProtocolEvent } from "./types";
 
 const MAX_INPUT_BYTES = 64 * 1024 * 1024;
@@ -31,11 +38,11 @@ interface BuildProfileContract {
 }
 
 interface BuildEvidenceInput {
-  adapter: "next" | "astro" | "tanstack-start";
+  adapter: "next" | "astro" | "tanstack-router" | "tanstack-start";
   root: string;
   source_revision: string;
   observation: unknown;
-  provenance: NextBuildProvenance | AstroBuildProvenance | TanStackStartBuildProvenance;
+  provenance: NextBuildProvenance | AstroBuildProvenance | TanStackRouterBuildProvenance | TanStackStartBuildProvenance;
   base_nodes: GraphNode[];
   base_edges: GraphEdge[];
   base_diagnostic_ids: string[];
@@ -56,7 +63,7 @@ function boundedString(value: unknown): string {
 
 function parseInput(value: unknown): BuildEvidenceInput {
   const input = record(value);
-  if (!(["next", "astro", "tanstack-start"] as const).includes(input.adapter as never)) {
+  if (!(["next", "astro", "tanstack-router", "tanstack-start"] as const).includes(input.adapter as never)) {
     throw new Error("invalid-adapter");
   }
   const baseNodes = input.base_nodes;
@@ -134,6 +141,16 @@ function convert(input: BuildEvidenceInput): ProtocolEvent[] {
         input.root,
         buildTanStackStartObservedGraph(graphInput),
         input.provenance as TanStackStartBuildProvenance,
+        input.source_revision,
+      );
+      break;
+    }
+    case "tanstack-router": {
+      const graphInput = { ...common, observation: input.observation as TanStackRouterBuildObservation } as TanStackRouterBuildGraphInput;
+      events = tanStackRouterBuildProtocolEvents(
+        input.root,
+        buildTanStackRouterObservedGraph(graphInput),
+        input.provenance as TanStackRouterBuildProvenance,
         input.source_revision,
       );
       break;
