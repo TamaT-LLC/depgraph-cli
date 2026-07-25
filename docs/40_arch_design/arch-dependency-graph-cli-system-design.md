@@ -36,6 +36,8 @@ Milestone 4のrelease candidateは`v0.4.0-rc.1`とする。protocol / graph sche
 
 Milestone 4のstable releaseは`v0.4.0`とする。`stable-release-gate-v1`は公式`v0.4.0-rc.1` packageが生成したschema `11` store fixtureをstable packageでschema `13`へtransactional migrationし、completed graphのintegrity、node / site / edge / evidence、immutable ID、snapshot nameの書込み、rollback backup非変更を検証する。tag workflowは`quality`、versioned 10,000-file `benchmark`、全5 target `package`、aggregate `verify-assets`の成功をdirect dependencyとし、release identity、protocol / store / cache、RC upgrade、performance、safety、framework / collector、license / SBOM / attestation closureを`stable-release-gate.json`へ`allow`または`reject`として出力する。`allow`以外ではpublish jobへ到達しない。0.4.xの互換性promise、GA exit criteria、support matrix、rollback、既知制約の更新規則は[stable release note](../releases/v0.4.0.md)をcanonical contractとする。
 
+Issue #153として`public-readiness-v1`を採用し、repository visibilityの現行判断を`private / reject`へ固定した。public OSS化は、exact candidate commitと全ref、GitHub surface、governance tree、release closureへ結び付くsecret/history、legal/provenance、security/disclosure、governance/community、repository control、release/support、migration rehearsal、incident readinessの全gateが独立承認され、TamaT-LLC organization ownerが明示的に`allow`した場合だけ候補となる。`stable-release-gate-v1`は必要条件だがpublic readinessの十分条件ではない。visibility変更はADRやreadiness recordから自動実行せず、別途明示承認されたchange windowでのみ行う。
+
 safe scanではcanonical root外へのsymlink readを拒否し、相対PATH・repository内toolchain・Node実行hookを除外する。Goは制限付き`go/packages`からparser fallbackへ移行する。Cargo metadataはpath-bearing inputのpreflight後、admitted manifest、lockfile、target discovery layoutだけを持つworker-owned confined mirrorに対してneutral cwdから`--frozen --offline --no-deps`で実行し、返却されたtemporary pathをinventory IDへ戻す。配布物はmanifest、MIT / Apache-2.0のproject license全文、core、schema、全worker/runtime artifact/component、backend attestationを検証し、欠損・変更・symlink・checked treeへの追加時にworker起動前にfail closedとする。project licenseはrelease manifestで個別にchecksum attestし、依存componentの権利情報を列挙する`THIRD_PARTY_LICENSES.txt`とは明確に分離する。
 
 Rust は rust-analyzer `0.0.330`、upstream revision `8954b66d43225e62c92e8bbcc8500191b5cceb1e`、Salsa `0.26.1` のexact pin、neutral toolchain probe、Cargo read-confinement、safe multi-file project model、HIR definition / import / re-export / type-use / exact・candidate call graphを実装済みである。Issue #146 / #147ではRust `1.93.1` / rustc commit `01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf`の`rust-src`をlicensed data-treeとしてpackageし、coreがwhole-tree検証したrootだけをworkerへ渡す。workerはpinned source identityとbounded inventoryを再検証し、repository VFSとは別のlibrary SourceRootと`core` / `alloc` / `std` crate graphを構築する。standard-library definitionはattested source locationを持つcanonical `symbol` / `type`へ昇格し、`use` / `extern crate` / type-use / direct-callを`resolved / exact` site / edgeへする。project / system `rust-src`、registry source、build output、proc macro、project configはload・実行しない。
@@ -1660,6 +1662,23 @@ CLI/security-release gateは
 [`PROJ-ARC-001-ADR-005`](adr-bounded-graph-query-language.md)の6個の1〜3日sliceへ
 分離する。
 
+### ADR-014: Private-by-default Public OSS Readiness Gate
+
+**採用。** repositoryは`public-readiness-v1`の全mandatory gateが同一のexact
+candidate commit / audited refs / GitHub settings / governance tree / release
+closureに対して`allow`となり、security、legal、releaseの独立sign-offを
+TamaT-LLC organization ownerが明示承認するまでprivateを維持する。現状は必要な
+security/community/governance文書と公開前audit evidenceが未完成であるため
+`private / reject`である。productの`stable-release-gate-v1=allow`だけでは
+history、collaboration record、Actions log、disclosure、maintainer authority、
+post-transition rulesetを保証しないため十分条件にしない。readiness recordは
+evidenceでありvisibility actuatorではない。public化は別途承認されたchange
+windowでruleset再構築、security feature有効化、anonymous verificationまで完了
+した場合だけwritesを再開する。再private化はclone / fork / download / cacheを
+回収できずcontainmentにすぎない。責任分界、closed record、実行可能checklist、
+7個の1〜3日準備sliceと8番目のfinal audit / change windowは
+[`PROJ-ARC-001-ADR-006`](adr-public-oss-release-governance.md)に定める。
+
 ## 21. Roadmap
 
 ### Milestone 0: Schema and Contract
@@ -1751,6 +1770,14 @@ CLI/security-release gateは
 - watcher / daemon fine-grained incremental executor / full fallback: Issue #134で実装済み（2026-07-24）
 - production runtime collector SDK / transport / redaction contract: Issue #137で実装済み（2026-07-24）
 - Node.js / TypeScript reference runtime collector: Issue #138で実装済み（2026-07-24）
+- public OSS readiness / release governance:
+  `public-readiness-v1`としてprivate継続の現行判断とpublic化のno-go gateを確定
+  （Issue #153、2026-07-25）。community/governance文書、closed evidence schema、
+  secret/history/collaboration audit、legal/provenance、workflow/security、
+  desired GitHub controls、migration rehearsalを
+  [`PROJ-ARC-001-ADR-006`](adr-public-oss-release-governance.md)の7個の
+  1〜3日準備sliceへ分離し、8番目のfinal audit / change windowはorganization
+  ownerの別途明示承認を必要とする
 
 ## 22. MVP 受け入れ基準
 
@@ -1768,7 +1795,6 @@ CLI/security-release gateは
 ## 23. Open Questions
 
 - binary / product の最終名称を `depgraph` とするか
-- public OSS とするか、初期は private 検証とするか
 
 ## 24. 参考資料
 
@@ -1793,6 +1819,12 @@ CLI/security-release gateは
 - Neo4j Cypher graph patterns: https://neo4j.com/docs/cypher-manual/current/patterns/
 - CodeQL recursion: https://codeql.github.com/docs/ql-language-reference/recursion/
 - SQLite progress handler: https://www.sqlite.org/c3ref/progress_handler.html
+- GitHub repository visibility: https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/managing-repository-settings/setting-repository-visibility
+- GitHub private vulnerability reporting: https://docs.github.com/en/code-security/how-tos/report-and-fix-vulnerabilities/configure-vulnerability-reporting/configuring-private-vulnerability-reporting-for-a-repository
+- GitHub repository security advisories: https://docs.github.com/en/code-security/concepts/vulnerability-reporting-and-management/repository-security-advisories
+- GitHub rulesets: https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/available-rules-for-rulesets
+- GitHub repository best practices: https://docs.github.com/en/repositories/creating-and-managing-repositories/best-practices-for-repositories
+- GitHub status checks: https://docs.github.com/en/pull-requests/reference/status-checks
 
 ## 25. 関連ドキュメント
 
@@ -1801,9 +1833,11 @@ CLI/security-release gateは
 - [`PROJ-ARC-001-ADR-003`: Cross-language adapter common contract](adr-cross-language-adapter-contract.md)
 - [`PROJ-ARC-001-ADR-004`: Default profile selection and exploration budget](adr-default-profile-selection-budget.md)
 - [`PROJ-ARC-001-ADR-005`: Bounded read-only graph query language](adr-bounded-graph-query-language.md)
+- [`PROJ-ARC-001-ADR-006`: Public OSS readiness and release governance](adr-public-oss-release-governance.md)
 
 ## 26. 更新履歴
 
+- 2026-07-25: Issue #153として`public-readiness-v1`を採用し、repository visibilityの現行判断を`private / reject`、accountable ownerをTamaT-LLC organization owner、実行責任をdesignated repository administratorとした。public化はexact candidate commit、audited refs、GitHub settings、governance tree、release/evidence closureに結び付く9 mandatory gateとsecurity / legal / releaseの独立sign-off、organization ownerの明示`allow`を要求する。secret/history/collaboration、dependency/license/provenance、security disclosure、community/governance、maintainer/review/release/support/issue/PR policy、workflow SHA pin、repository controls、migration rehearsal、anonymous verification、incident containmentの実行可能checklistを定義した。`stable-release-gate-v1`は必要条件だが十分条件とせず、readiness recordからvisibilityを自動変更しない。visibility変更を別途明示承認されたchange windowへ分離し、再private化は公開済みcopyを回収できないcontainmentであることを固定した。
 - 2026-07-25: Issue #152として`bounded-graph-query-v1`を採用。既存専用commandを優先したまま、単一completed snapshot、単一linear pattern、明示depth `1..=8`、closed Node / Path / Edge / Site / Evidence type、profile / phase / canonical condition / evidence filter、必須limitへscopeを限定した。endpoint pairごとのcanonical shortest witnessだけを返し、path依存predicateのpartial stateにはexistential充足bitset / used edge setを含めて同一stateだけをdominanceする。複数MATCH、join、subquery、aggregation、mutation、任意再帰、regex、arbitrary property、all-path列挙を除外した。bounded query reader、parse/type、snapshot cardinality、fixed operator / deterministic cost admission、explain、staged all-or-error executor、read-only store、non-echoing diagnosticとresource/security capを定義し、parser / planner / executor / CLI / five-target release gateを6個の1〜3日後続sliceへ分離した。
 - 2026-07-25: Issue #151として`default-profile-selection-v1`を確定。safe inventory / compatibility / attested host / tracked config / planner limitをcanonical inputとし、Rust / Go / Web baselineを優先した後、static evidence付き単一軸candidateだけをgreedy rankingする。repository classはrelevant source / build unitの両閾値でtiny / small / medium / largeへ分類し、default total capを`16 / 10 / 6 / 4`、selection hard capを`32`、candidate discoveryを言語ごと`256`・全体`512`へ固定した。target × feature × mode × environmentの直積、all-features、cgo/VTA、build/runtime profileをauto selectionから除外し、budget omission / overflow / policy exclusionをcoverage / doctor / planへ固定reason付きで残す。将来`profiles plan` / `--profile-budget`とstrict versioned `--profiles-file`、all-or-error explicit semantics、8段階の1〜3日実装計画、polyglot / size-boundary / checkout determinism acceptance matrixをADRへ定めた。
 - 2026-07-25: Issue #150として`cross-language-contract-v1`の共通identity / dependency site / edge / evidence / profile / completeness規約とformat別capability boundaryを確定。`service` / `schema` / `operation` / `message` / `native_symbol`、contract relation、generated code / repository mappingのproof hierarchy、external / unresolvedとprofile condition規則を定義し、同名・URL/path・生成コメントだけのexact mappingを禁止した。safe scanではremote ref/introspection、network、generator/plugin、native loadを禁止し、OpenAPI → Protobuf → GraphQL → HTTP runtime correlation → FFIの優先順位、11個の1〜3日slice、hostile / provenance / determinism / five-target security-release gateをADRへ固定した。
