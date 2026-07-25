@@ -8,12 +8,14 @@ import { stableId } from "../src/ids";
 import {
   TANSTACK_START_BUILD_CAPABILITY,
   TANSTACK_START_BUILD_OBSERVER,
+  TANSTACK_START_BUILD_OBSERVER_VERSION,
   TanStackStartBuildObserverError,
   buildTanStackStartObservedGraph,
   createTanStackStartBuildObserverPlugin,
   detectTanStackStartBuildCapability,
   tanStackStartBuildFailureDiagnostic,
   tanStackStartBuildProtocolEvents,
+  validateTanStackStartBuildObservation,
   type TanStackStartBuildObservation,
   type TanStackStartBuildProvenance,
   type TanStackVitePluginLike,
@@ -76,7 +78,11 @@ async function observe(options: { collision?: boolean; sink?: (value: TanStackSt
   };
   const client = context("client", clientModules);
   plugin.buildStart.call(client);
-  plugin.transform.call(client, `const getAccount = createClientRpc("rpc${options.collision ? "_1" : ""}")\nconst secret = "CLIENT_SECRET"`, "/repo/src/server/account.ts");
+  plugin.transform.call(
+    client,
+    `import { createClientRpc } from "@tanstack/react-start/client-rpc"\nconst getAccount = createClientRpc("rpc${options.collision ? "_1" : ""}")\nconst secret = "CLIENT_SECRET"`,
+    "/repo/src/server/account.ts",
+  );
   plugin.generateBundle.call(client, {}, {
     "assets/client.js": {
       type: "chunk",
@@ -102,15 +108,19 @@ async function observe(options: { collision?: boolean; sink?: (value: TanStackSt
   const ssr = context("ssr", ssrModules);
   plugin.buildStart.call(ssr);
   const rpcId = `rpc${options.collision ? "_1" : ""}`;
-  plugin.transform.call(ssr, `const getAccount = createSsrRpc("${rpcId}")`, "/repo/src/server/account.ts");
   plugin.transform.call(
     ssr,
-    `const extracted = createServerRpc({ id: "${rpcId}", name: "getAccount", filename: "src/server/account.ts" }, () => "PROVIDER_SECRET")`,
+    `import { createSsrRpc } from "@tanstack/react-start/ssr-rpc"\nconst getAccount = createSsrRpc("${rpcId}")`,
+    "/repo/src/server/account.ts",
+  );
+  plugin.transform.call(
+    ssr,
+    `import { createServerRpc } from "@tanstack/react-start/server-rpc"\nconst extracted = createServerRpc({ id: "${rpcId}", name: "getAccount", filename: "src/server/account.ts" }, () => "PROVIDER_SECRET")`,
     providerId,
   );
   plugin.transform.call(
     ssr,
-    `const manifest = { "${rpcId}": { functionName: "getAccount_createServerFn_handler" } }`,
+    `const manifest = { '${rpcId}': { functionName: 'getAccount_createServerFn_handler', importer: () => import('${providerId}') } }`,
     "\0virtual:tanstack-start-server-fn-resolver",
   );
   plugin.generateBundle.call(ssr, {}, {
@@ -168,22 +178,46 @@ test("observer requires the internal Start plugin, preserves existing order, and
     "web.tanstack_start_build_internal_contract_unavailable");
   assert.equal(errorCode(() => detectTanStackStartBuildCapability("1.0.0", undefined, [{ name: "same" }, { name: "same" }])),
     "web.tanstack_start_build_plugin_chain_invalid");
+
+  const collision = createTanStackStartBuildObserverPlugin({
+    startVersion: "1.168.28", repoRoot: "/repo", sink: { write() {} },
+  });
+  configure(collision);
+  const providerContext = context("ssr", {});
+  collision.buildStart.call(providerContext);
+  const runtime = 'import { createServerRpc } from "@tanstack/react-start/server-rpc";';
+  collision.transform.call(
+    providerContext,
+    `${runtime} createServerRpc({ id: "rpc", name: "first", filename: "src/first.ts" }, () => {})`,
+    "/repo/src/first.ts?tss-serverfn-split",
+  );
+  assert.equal(errorCode(() => collision.transform.call(
+    providerContext,
+    `${runtime} createServerRpc({ id: "rpc", name: "second", filename: "src/second.ts" }, () => {})`,
+    "/repo/src/second.ts?tss-serverfn-split",
+  )), "web.tanstack_start_build_rpc_id_conflict");
 });
 
-test("observer stores authoritative RPC IDs, collision suffixes, and separated client/SSR/server evidence without code", async () => {
+test("observer stores authoritative RPC IDs without guessing suffixes and separates client/SSR/server evidence", async () => {
   const observation = await observe({ collision: true });
   assert.equal(observation.resolver_virtual_module_observed, true);
   assert.deepEqual(observation.builds.map((build) => build.vite_environment), ["client", "ssr"]);
   assert.equal(observation.server_functions[0]?.production_rpc_id, "rpc_1");
-  assert.equal(observation.server_functions[0]?.collision_suffix, 1);
+  assert.equal(observation.server_functions[0]?.collision_suffix, null);
+  assert.equal(observation.server_functions[0]?.collision_suffix_status, "not-separately-observed");
   assert.equal(observation.server_functions[0]?.client_referenced, true);
   assert.equal(observation.server_functions[0]?.ssr_referenced, true);
+  assert.equal(observation.production_rpc_manifest.entry_count, 1);
+  assert.equal(observation.production_rpc_manifest.entries[0]?.production_rpc_id, "rpc_1");
+  assert.equal(observation.production_rpc_manifest.entries[0]?.handler_export_name, "getAccount_createServerFn_handler");
+  assert.match(observation.production_rpc_manifest.entries_digest, /^[a-f0-9]{64}$/u);
   const environments = new Set(observation.builds.flatMap((build) => [
     ...build.modules.map((module) => module.environment),
     ...build.outputs.map((output) => output.environment),
   ]));
   assert.deepEqual([...environments].sort(), ["client", "server", "ssr"]);
   const serialized = JSON.stringify(observation);
+  assert.equal(serialized.includes("tanstack-start-server-fn-resolver"), false);
   assert.equal(
     observation.builds.find((build) => build.vite_environment === "ssr")?.outputs
       .find((output) => output.file_name === "server/manifest.json")?.environment,
@@ -195,6 +229,31 @@ test("observer stores authoritative RPC IDs, collision suffixes, and separated c
     assert.equal(serialized.includes(secret), false);
   }
   assert.equal(serialized.includes("/repo/"), false);
+});
+
+test("v2 observation rejects manifest/provider/stub drift and non-production configuration", async () => {
+  const observation = await observe();
+  assert.equal(observation.observer_version, TANSTACK_START_BUILD_OBSERVER_VERSION);
+  assert.deepEqual(validateTanStackStartBuildObservation(observation), observation);
+  const manifestDrift = structuredClone(observation);
+  manifestDrift.production_rpc_manifest.entries[0]!.provider_module_id = "src/server/other.ts#server-provider";
+  assert.equal(
+    errorCode(() => validateTanStackStartBuildObservation(manifestDrift)),
+    "web.tanstack_start_build_rpc_manifest_invalid",
+  );
+  const stubDrift = structuredClone(observation);
+  stubDrift.stubs[0]!.production_rpc_id = "missing";
+  assert.equal(
+    errorCode(() => validateTanStackStartBuildObservation(stubDrift)),
+    "web.tanstack_start_build_stub_target_missing",
+  );
+  const plugin = createTanStackStartBuildObserverPlugin({
+    startVersion: "1.168.28", repoRoot: "/repo", sink: { write() {} },
+  });
+  assert.equal(errorCode(() => plugin.configResolved({
+    mode: "development",
+    plugins: [{ name: "tanstack-start-core:config" }, plugin],
+  })), "web.tanstack_start_build_mode_unsupported");
 });
 
 test("unsupported Vite, failed builds, missing virtual modules, raw crashes, and timeout fail without partial output", async () => {
@@ -209,6 +268,17 @@ test("unsupported Vite, failed builds, missing virtual modules, raw crashes, and
   const diagnostic = tanStackStartBuildFailureDiagnostic(new Error("RAW_CRASH_SECRET"), "profile");
   assert.equal(diagnostic.code, "web.tanstack_start_build_observer_failed");
   assert.equal(JSON.stringify(diagnostic).includes("RAW_CRASH_SECRET"), false);
+  const unsupported = tanStackStartBuildFailureDiagnostic(
+    new TanStackStartBuildObserverError("web.tanstack_start_build_version_unsupported"),
+    "profile",
+  );
+  assert.equal(unsupported.properties?.framework_build_completion_status, "unsupported");
+  assert.equal(unsupported.properties?.framework_build_completion_reason, "framework_build_version_unsupported");
+  const missingManifest = tanStackStartBuildFailureDiagnostic(
+    new TanStackStartBuildObserverError("web.tanstack_start_build_rpc_manifest_missing"),
+    "profile",
+  );
+  assert.equal(missingManifest.properties?.framework_build_completion_reason, "framework_build_manifest_missing");
 
   const missing = createTanStackStartBuildObserverPlugin({
     startVersion: "1.168.28", repoRoot: "/repo", sink: { write() {} },
@@ -245,7 +315,9 @@ test("unsupported Vite, failed builds, missing virtual modules, raw crashes, and
   });
   configure(timeout);
   for (const environment of ["client", "ssr"]) {
-    const current = context(environment, {});
+    const current = context(environment, environment === "ssr"
+      ? { "\0virtual:tanstack-start-server-fn-resolver": { isEntry: true } }
+      : {});
     timeout.buildStart.call(current);
     if (environment === "ssr") timeout.transform.call(
       current, "const manifest = {}", "\0virtual:tanstack-start-server-fn-resolver",
@@ -311,6 +383,11 @@ test("observed stubs correlate to safe server functions, handlers, routes, middl
       phase: "semantic", environment: "server", profile_id: provenance.profile_id, condition,
       resolution_status: "resolved", precision: "exact", generated: false, evidence: [],
     },
+    {
+      id: "edge:function-middleware", source: serverFunction.id, target: middleware.id, kind: "uses_middleware", site_id: null,
+      phase: "semantic", environment: "server", profile_id: provenance.profile_id, condition,
+      resolution_status: "resolved", precision: "exact", generated: false, evidence: [],
+    },
   ];
   const delta = buildTanStackStartObservedGraph({
     observation,
@@ -323,12 +400,34 @@ test("observed stubs correlate to safe server functions, handlers, routes, middl
   assert.ok(delta.edges.some((edge) => edge.kind === "client_stub_for" && edge.target === observed.id && edge.environment === "browser"));
   assert.ok(delta.edges.some((edge) => edge.kind === "client_stub_for" && edge.target === observed.id && edge.environment === "ssr"));
   assert.ok(delta.edges.some((edge) => edge.kind === "handled_by" && edge.source === observed.id && edge.target === handler.id));
+  assert.ok(delta.edges.some((edge) => edge.kind === "uses_middleware"
+    && edge.source === observed.id && edge.target === middleware.id && edge.precision === "observed"));
   assert.ok(delta.edges.some((edge) => edge.kind === "emits" && edge.source === route.id));
   assert.ok(delta.edges.some((edge) => edge.kind === "emits" && edge.source === middleware.id));
+  const generatedModuleRoles = new Set(delta.nodes
+    .filter((node) => node.kind === "module")
+    .map((node) => node.properties.tanstack_start_module_role));
+  assert.ok(generatedModuleRoles.has("client-rpc-stub"));
+  assert.ok(generatedModuleRoles.has("server-function-provider"));
+  assert.ok(generatedModuleRoles.has("server-function-resolver"));
   assert.equal(delta.diagnostics.some((item) => item.code === "web.tanstack_start_build_middleware_artifact_drift"), false);
   const events = tanStackStartBuildProtocolEvents("/repo", delta, provenance, "revision");
   assert.equal(events[0]?.event, "scan_started");
+  const profile = events.find((event) => event.event === "profile_declared")?.profile as
+    | { properties: Record<string, unknown> }
+    | undefined;
+  assert.equal(profile?.properties.production_rpc_manifest_entry_count, 1);
   assert.equal(events.at(-1)?.event, "scan_completed");
+});
+
+test("missing safe server-function target stays unresolved instead of becoming exact", async () => {
+  const observation = await observe();
+  const delta = buildTanStackStartObservedGraph({ observation, provenance, baseNodes: [] });
+  const site = delta.sites.find((item) => item.kind === "observes_definition");
+  assert.equal(site?.resolution_status, "unresolved");
+  assert.equal(site?.reason, "framework_build_dynamic_target_unmatched");
+  assert.equal(delta.nodes.find((node) => node.id === site?.target_ids[0])?.kind, "unknown_target");
+  assert.ok(delta.diagnostics.some((item) => item.code === "web.tanstack_start_build_server_function_static_missing"));
 });
 
 test("bundled observer writes one confined deterministic observation", async () => {
@@ -343,7 +442,9 @@ test("bundled observer writes one confined deterministic observation", async () 
     const plugin = module.default({ repoRoot: "/repo" });
     configure(plugin);
     for (const environment of ["client", "ssr"]) {
-      const current = context(environment, {});
+      const current = context(environment, environment === "ssr"
+        ? { "\0virtual:tanstack-start-server-fn-resolver": { isEntry: true } }
+        : {});
       plugin.buildStart.call(current);
       if (environment === "ssr") plugin.transform.call(
         current, "const manifest = {}", "\0virtual:tanstack-start-server-fn-resolver",

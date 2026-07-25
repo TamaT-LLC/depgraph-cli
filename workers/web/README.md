@@ -10,8 +10,9 @@ The worker writes protocol `1.0` NDJSON to stdout and operational logs to stderr
 
 ## Dynamic framework build graph contract
 
-The checksum-attested Next.js, Astro, and TanStack Start observers emit through
-the shared `framework-build-graph-v1` converter contract. Generated node,
+The checksum-attested Next.js, Astro, TanStack Router, and TanStack Start
+observers emit through the shared `framework-build-graph-v1` converter
+contract. Generated node,
 dependency-site, and edge identities include that contract version but exclude
 the build attempt ID, so repeat builds and separate checkouts produce the same
 graph for the same normalized observation. Base static/semantic nodes can be
@@ -30,6 +31,29 @@ reason. Partial builds, unsupported versions, and missing manifest/hook
 boundaries do not receive `build-observed` completeness and cannot replace the
 last completed snapshot. Both the converter and Rust core revalidate profile
 counts, framework/observer provenance, conditions, and exact site/edge closure.
+
+### TanStack Start production RPC manifest
+
+TanStack Start v1 with Vite 7 emits
+`tanstack-start-build-observation-v2`. The observer records the compiler-owned
+`createClientRpc`, `createSsrRpc`, and `createServerRpc` transforms only when
+their official runtime imports are present, then parses the provider
+environment's generated server-function resolver manifest. RPC ID, handler
+export, provider module, client-reference flag, resolver importer, and
+manifest digest/count must form a one-to-one closure before conversion.
+
+Client/SSR stub, provider, and resolver modules retain distinct generated
+roles and environments. Production IDs are copied from compiler output and
+are never recomputed. Because the compiler exposes only the final ID, a
+suffix-looking ID keeps `collision_suffix=null` and
+`collision_suffix_status=not-separately-observed`. A missing or ambiguous
+static server function becomes an observed unresolved `observes_definition` relation to an
+`unknown_target`; it is not promoted to an exact definition. Semantic
+middleware relations receive build-phase `uses_middleware` evidence only when
+the source and middleware are correlated by the emitted output graph.
+Unsupported versions, collisions, missing manifest/provider/stub targets, and
+hook failures use bounded completion reasons and discard the partial
+observation.
 
 ### Next.js build manifests
 

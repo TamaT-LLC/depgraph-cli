@@ -31,17 +31,25 @@ for (const environment of ["client", "ssr"]) {
   };
   plugin.buildStart.call(context);
   if (environment === "client") {
-    plugin.transform.call(context, 'const getAccount = createClientRpc("rpc")', source);
-  } else {
-    plugin.transform.call(context, 'const getAccount = createSsrRpc("rpc")', source);
     plugin.transform.call(
       context,
-      `const extracted = createServerRpc({ id: "rpc", name: "getAccount", filename: "src/server/account.ts" }, () => ${JSON.stringify(secret)})`,
+      'import { createClientRpc } from "@tanstack/react-start/client-rpc"; const getAccount = createClientRpc("rpc")',
+      source,
+    );
+  } else {
+    plugin.transform.call(
+      context,
+      'import { createSsrRpc } from "@tanstack/react-start/ssr-rpc"; const getAccount = createSsrRpc("rpc")',
+      source,
+    );
+    plugin.transform.call(
+      context,
+      `import { createServerRpc } from "@tanstack/react-start/server-rpc"; const extracted = createServerRpc({ id: "rpc", name: "getAccount", filename: "src/server/account.ts" }, () => ${JSON.stringify(secret)})`,
       provider,
     );
     plugin.transform.call(
       context,
-      'const manifest = { "rpc": { functionName: "getAccount_createServerFn_handler" } }',
+      `const manifest = { 'rpc': { functionName: 'getAccount_createServerFn_handler', importer: () => import(${JSON.stringify(provider)}) } }`,
       virtual,
     );
   }

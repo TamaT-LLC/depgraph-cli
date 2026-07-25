@@ -388,7 +388,17 @@ The explicit-consent guard is enforced before path, configuration, store, or too
 }
 ```
 
-The allowed Web adapter values are `next`, `astro`, and `tanstack-start`. The relative entrypoint must integrate the release-provided observer named by `DEPGRAPH_OBSERVER` (and `NEXT_ADAPTER_PATH` for Next) into the real build lifecycle. It runs in a temporary staged workspace using canonical system Node, a cleared allowlisted environment, temporary HOME/cache/output, bounded output, timeout/cancellation, and cross-platform process-tree cleanup. Every launched attempt saves a secret-free audit containing command metadata, logical paths, environment key names, limits, isolation capability, and outcome; raw stdout/stderr and temporary or host paths are not persisted. Network isolation is reported as `best-effort` unless an outer namespace/container enforces it.
+The allowed Web adapter values are `next`, `astro`, `tanstack-router`, and
+`tanstack-start`. The relative entrypoint must integrate the release-provided
+observer named by `DEPGRAPH_OBSERVER` (and `NEXT_ADAPTER_PATH` for Next) into
+the real build lifecycle. It runs in a temporary staged workspace using
+canonical system Node, a cleared allowlisted environment, temporary
+HOME/cache/output, bounded output, timeout/cancellation, and cross-platform
+process-tree cleanup. Every launched attempt saves a secret-free audit
+containing command metadata, logical paths, environment key names, limits,
+isolation capability, and outcome; raw stdout/stderr and temporary or host
+paths are not persisted. Network isolation is reported as `best-effort` unless
+an outer namespace/container enforces it.
 
 Validated observer output uses the shared `framework-build-graph-v1` contract:
 `phase=build`, `precision=observed`, canonical production
@@ -404,10 +414,16 @@ observed parent route; metadata routes, chunks, and server/client/edge/static
 boundaries remain explicit. Raw output/build IDs and checkout roots never enter
 portable identity. A dynamic target that was not observed is retained as an
 `unresolved` edge to an `unknown_target` with a bounded reason, never promoted
-to a guessed `resolved` edge. The Next/Astro/TanStack Start observer entrypoints
-and their observation-to-protocol converter are separate checksum-attested
-release artifacts; missing, undeclared, or changed bytes fail closed before
-project code starts. Schema-v7 stores the delta in an attempt transaction and
+to a guessed `resolved` edge. TanStack Start v1 production RPCs use
+`tanstack-start-build-observation-v2`: the provider transform, resolver
+manifest, client/SSR stubs, generated module roles, and manifest importer must
+agree before an RPC ID is exact. A suffix-looking final ID is not separately
+claimed as a collision unless the compiler exposes that fact. Missing static targets
+remain unresolved and only build-correlated middleware chains receive observed
+edges. The Next/Astro/TanStack Router/TanStack Start observer entrypoints and
+their observation-to-protocol converter are separate checksum-attested release
+artifacts; missing, undeclared, or changed bytes fail closed before project
+code starts. The store saves the delta in an attempt transaction and
 exposes it to `deps`, `dependents`, `why`, and exports only after completed
 promotion. Source and semantic rows remain immutable; matching and conflicting
 build observations coexist as separate layers, with conflicts carrying both
