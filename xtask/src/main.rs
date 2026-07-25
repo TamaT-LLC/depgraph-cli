@@ -494,6 +494,9 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
     let cross_language_adr = fs::read_to_string(
         root.join("docs/40_arch_design/adr-cross-language-adapter-contract.md"),
     )?;
+    let default_profile_adr = fs::read_to_string(
+        root.join("docs/40_arch_design/adr-default-profile-selection-budget.md"),
+    )?;
     for required in [
         "Rust 1.93.1, Go 1.26.1, Node.js 24.18.0, and pnpm 10.33.0",
         "TypeScript/JavaScript symbol/type/import/re-export/type-use",
@@ -529,6 +532,9 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "`PROJ-ARC-001-ADR-003`",
         "`cross-language-contract-v1`",
         "Issue #150として`cross-language-contract-v1`",
+        "`PROJ-ARC-001-ADR-004`",
+        "`default-profile-selection-v1`",
+        "Issue #151として`default-profile-selection-v1`",
     ] {
         if !design.contains(required) {
             bail!("system design release metadata is missing {required:?}");
@@ -539,6 +545,8 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "2026-07-25: `PROJ-ARC-001-ADR-002` を追加",
         "| PROJ-ARC-001-ADR-003 | PROJ-ARC-001 | [Cross-language adapter common contract](../40_arch_design/adr-cross-language-adapter-contract.md) | Accepted |",
         "2026-07-25: `PROJ-ARC-001-ADR-003` を追加",
+        "| PROJ-ARC-001-ADR-004 | PROJ-ARC-001 | [Default profile selection and exploration budget](../40_arch_design/adr-default-profile-selection-budget.md) | Accepted |",
+        "2026-07-25: `PROJ-ARC-001-ADR-004` を追加",
     ] {
         if !docs_index.contains(required) {
             bail!("documentation index is missing Rust compiler ADR metadata {required:?}");
@@ -595,6 +603,37 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
             bail!("cross-language adapter ADR is missing required contract {required:?}");
         }
     }
+    for required in [
+        "- Status: Accepted",
+        "- Decision ID: `PROJ-ARC-001-ADR-004`",
+        "- Contract: `default-profile-selection-v1`",
+        "never enumerates a target × feature × mode × environment",
+        "| `tiny` | `<= 1,000` | `<= 25` | `16` |",
+        "| `small` | `<= 10,000` | `<= 100` | `10` |",
+        "| `medium` | `<= 50,000` | `<= 500` | `6` |",
+        "| `large` | otherwise within inventory limits | otherwise within inventory limits | `4` |",
+        "The hard cap is `32` selected root profiles",
+        "A set that exactly exhausts the admitted input at",
+        "## Mandatory language baselines",
+        "## Automatic candidate generation",
+        "## Ranking and canonical selection",
+        "depgraph profiles plan PATH [--profile-budget N] [--json]",
+        "depgraph scan PATH --profiles-file FILE",
+        "The core does not truncate it,",
+        "`default_profile_budget_exhausted`",
+        "`default_profile_candidate_limit_exceeded`",
+        "profiles: 10 selected / 14 eligible; 4 omitted by small-repository budget 10",
+        "`default_profile_matrix_complete=false`",
+        "## Security and resource boundary",
+        "## Staged implementation",
+        "| 8 | Cache/incremental binding and five-target package/release gate | 2-3 days |",
+        "## Acceptance matrix",
+        "| Explicit set above 32 or with unsupported target |",
+    ] {
+        if !default_profile_adr.contains(required) {
+            bail!("default profile ADR is missing required contract {required:?}");
+        }
+    }
     let git_attributes = fs::read_to_string(root.join(".gitattributes"))?;
     for (path, expected) in PROJECT_LICENSES {
         let required_attribute = format!("{path} text eol=lf");
@@ -629,6 +668,7 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "docs/40_arch_design/arch-dependency-graph-cli-system-design.md",
         "docs/40_arch_design/adr-rust-compiler-precise-backend.md",
         "docs/40_arch_design/adr-cross-language-adapter-contract.md",
+        "docs/40_arch_design/adr-default-profile-selection-budget.md",
         "docs/releases/v0.4.0.md",
         "docs/releases/v0.4.0-rc.1.md",
         "docs/releases/v0.2.0-rc.1.md",
