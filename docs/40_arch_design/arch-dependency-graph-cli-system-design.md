@@ -105,7 +105,12 @@ Rust、Go、Next.js、Astro、TanStack Router、TanStack Start のコードベ�
 - Neo4j 等の外部 graph database を必須とする構成
 - 対象 repository の build script や設定コードを無断で実行すること
 
-OpenAPI、GraphQL、Protocol Buffers、FFI、HTTP trace を用いた cross-language edge は、後続 adapter として追加する。
+OpenAPI、Protocol Buffers、GraphQL、HTTP trace、FFIを用いたcross-language
+edgeは`cross-language-contract-v1`の共通identity / evidence / completeness
+規約に従い、この順で後続adapterとして追加する。名称一致だけではexact edgeへ
+昇格せず、generated provenance、descriptor/source map、build/runtime evidenceを
+要求する。規範的な境界と1〜3日粒度の導入計画は
+[`PROJ-ARC-001-ADR-003`](adr-cross-language-adapter-contract.md)に定める。
 
 ## 4. 完全性の定義
 
@@ -498,6 +503,42 @@ Web profileは以下を一組で宣言する。propertyの一部欠落、未知�
 `web_framework_completeness_ledger`はcanonical JSON stringで、検出frameworkごとに`framework`、`required_capabilities`、`emitted_capabilities`、`status`、`reasons`を持つ。必須capabilityは共通の`framework-semantic-graph-v1`と`typescript-definition-import-type-call-graph-v2`に、Next.js=`next-route-component-boundary-v1`、Astro=`astro-component-render-hydration-v1`、TanStack Router=`tanstack-router-typed-route-v1`、TanStack Start=`tanstack-start-rpc-middleware-v1`を加えた3件とする。entryはframework UTF-8順、capabilityとreasonは重複なしのcanonical順とする。未検出frameworkはentryを持たず、featureなしは`not-detected`・issue count 0・空ledgerとする。検出frameworkがすべてrequired=emittedかつreasonなしの場合だけaggregate `complete`とし、それ以外は`incomplete`とする。
 
 `not-emitted` / `discarded`は全countを0とする。workerはframeworkごとのdeltaをcloned map上で検証してからsyntax / TypeScript semantic graphへunionし、別frameworkの成功deltaを保持する。unresolved site、unsupported version、collector discard、TypeScript prerequisite failureはframework別のbounded reasonへ正規化する。coreもprofile authorization、strict protocol contract、observed count、feature/ledger一致を独立に検証する。framework deltaが失敗した場合はframework node/site/edge closureだけを破棄し、既存syntax graphとTypeScript definition/import/type/call graphを保持したうえでledgerを`core_framework_delta_discarded`付き`incomplete`へ更新する。`semantic-complete`にはaggregate `complete`に加えて従来のzero skipped / unsupported / unresolved / semantic issue / compiler diagnostic、safe execution、release gateをすべて要求するため、動的callやbuild-only boundaryはledgerがcompleteでもcoverage reasonで昇格を阻止できる。共通golden fixtureは`crates/depgraph-protocol/tests/fixtures/protocol-v1.framework-semantic.golden.ndjson`とする。
+
+### 7.6 Cross-language Contract（将来 capability）
+
+OpenAPI、Protocol Buffers、GraphQL、HTTP runtime correlation、FFIは
+`cross-language-contract-v1`を共通contractとする。protocol 1.0のopen
+vocabularyを利用できることだけではcapability成立とせず、各adapterが専用validator、
+coverage ledger、golden fixture、query/store互換性を実装した場合だけ宣言できる。
+
+共通node vocabularyは`service`、`schema`、`operation`、`message`、
+`native_symbol`、relation vocabularyは`provides_operation`、
+`accepts_message`、`returns_message`、`references_schema`、
+`calls_operation`、`implemented_by`、`generated_from`、
+`binds_native_symbol`、`provided_by_library`とする。stable identityはformat、
+repository contract locator、format version、format固有canonical coordinateから
+作る。operationId、language上の生成名、GraphQL executable-operation名、
+demangled symbol、HTTP route label、content digestはalias/evidenceでありnode IDに
+しない。
+
+cross-language siteはtargetを確定できなくても必ず`resolved`、`candidates`、
+`external`、`unresolved`へ分類する。static `exact` mappingにはdescriptor /
+generator manifestまたはsource mapを必要とする。compiler/framework/linker
+evidenceは`phase=build` / `precision=observed`、runtime correlationは
+`phase=runtime` / `precision=observed`のまま保持し、独立したstatic proofなしに
+exactへ昇格しない。
+checked-in generated comment、同名、URL/path文字列、operationIdだけのmappingは
+exactの根拠にしない。
+
+safe scanはremote `$ref`、schema registry、GraphQL introspection、DNS/network、
+`protoc` / generator / plugin、native library / binaryを実行・loadしない。
+repository-local regular-file inputだけをbounded parserで処理し、remote inputは
+redacted external identity、missing / ambiguous / dynamic targetはbounded reason付き
+unresolvedとしてledgerへ残す。profileはcontract input digestと参加adapter profile
+のsorted setから作り、無関係なprofileのCartesian productやbuild/runtime evidenceの
+cross-profile昇格を行わない。詳細、format別capability boundary、優先順位、
+security/release gateは
+[`PROJ-ARC-001-ADR-003`](adr-cross-language-adapter-contract.md)を規範とする。
 
 ## 8. Profile と条件付き Graph
 
@@ -1509,6 +1550,20 @@ schema、commit、全必須metric、conservation、総合passを再検証して�
 
 **採用。** compiler-precise Rustはsafe HIR backendへ統合せず、`compiler-precise-rust-v1`として明示consent済みsupervised buildだけで実行する。最初のunitは`nightly-2026-07-17` / Rust・Cargo `1.99.0-nightly` / rustc `3d50c25bc66853bf0ad205529d0f305a1d841b5e`へ固定し、通常archiveとは別のclosed-tree compiler pack、Cargo unit graph v1、全unit用のattested `RUSTC_WRAPPER`、`rustc_public`優先・最小`rustc_private` bridgeを採用する。`RUSTC_WORKSPACE_WRAPPER`は空へ固定する。rolling / system / project toolchain、project wrapper、coreへのcompiler library load、既存artifact parse、rustup download、別toolchain fallbackは棄却する。project codeと同一processで動くwrapper outputをuntrustedとして再検証し、typed MIR / monomorphized itemをbuild-phase observed evidenceとしてatomic unionする。security review条件、rollback、1〜3日粒度の後続計画は[`PROJ-ARC-001-ADR-002`](adr-rust-compiler-precise-backend.md)に定める。
 
+### ADR-011: Format-specific Adapters over a Common Cross-language Contract
+
+**採用。** OpenAPI、Protocol Buffers、GraphQL、HTTP runtime correlation、
+FFIを`cross-language-contract-v1`の共通identity / site / edge / evidence /
+profile / completeness規約へ投影し、format parserと意味境界は各adapterに保持する。
+同名・URL/path文字列・生成コメントだけのmappingをexactとせず、static exactには
+descriptor / generator manifestまたはsource mapを要求する。
+compiler/framework/linker build evidenceと既存operationへの一意なruntime
+correlationはそれぞれbuild/runtimeの`observed` relationとして保持する。safe
+scanではremote reference/introspection、network、generator/plugin、native loadを禁止する。共通
+validatorの後、OpenAPI → Protobuf → GraphQL → HTTP trace → FFIの順で導入し、
+11個の1〜3日sliceとsecurity/release gateを
+[`PROJ-ARC-001-ADR-003`](adr-cross-language-adapter-contract.md)に定める。
+
 ## 21. Roadmap
 
 ### Milestone 0: Schema and Contract
@@ -1547,6 +1602,13 @@ schema、commit、全必須metric、conservation、総合passを再検証して�
 - TypeScript exact direct-call graph、closed local candidate `may_call`、external / unresolved call ledger、pure profileのfinal fallback / coverage / `semantic-complete`判定: 実装済み（Issue #43 / #47 / #48、2026-07-19 / 2026-07-21）。Web framework semantic graph v1、Next.js / Astro / TanStack Router / TanStack Start collector、framework completeness gate、package/release verifierも実装済み（Issue #49〜#55、2026-07-21 / 2026-07-22）
 - 他adapterのimport / type-use / direct call / candidate call: 未実装
 - component / route / server function semantic edge: Web adapterは実装済み。Next.js / Astro / TanStack Router / TanStack Startのdynamic build境界はIssue #141〜#144で実装済み、他adapterのbuild観測境界は未実装
+- cross-language共通identity / evidence / completeness contractと導入順:
+  `cross-language-contract-v1`としてADR確定済み（Issue #150、2026-07-25）。
+  共通validator / golden harnessの後、OpenAPI、Protobuf、GraphQL、HTTP runtime
+  correlation、FFIをformat別capabilityとして導入する。各parser / repository
+  mapping / build-runtime correlation / release gateは
+  [`PROJ-ARC-001-ADR-003`](adr-cross-language-adapter-contract.md)の11個の
+  1〜3日sliceへ分離する
 
 ### Milestone 3: Build Evidence
 
@@ -1598,7 +1660,6 @@ schema、commit、全必須metric、conservation、総合passを再検証して�
 
 - binary / product の最終名称を `depgraph` とするか
 - default profile matrix の範囲と組合せ爆発の抑制方法
-- GraphQL / OpenAPI / Protocol Buffers / FFI adapter の優先順位
 - public OSS とするか、初期は private 検証とするか
 - graph query language を導入する時期
 
@@ -1614,14 +1675,21 @@ schema、commit、全必須metric、conservation、総合passを再検証して�
 - Astro Integration API: https://docs.astro.build/en/reference/integrations-reference/
 - TanStack Router file-based routing: https://tanstack.com/router/latest/docs/routing/file-based-routing
 - TanStack Start server functions: https://tanstack.com/start/latest/docs/framework/react/guide/server-functions
+- OpenAPI Specification 3.1.1: https://spec.openapis.org/oas/v3.1.1.html
+- GraphQL Specification, September 2025: https://spec.graphql.org/September2025/
+- Protocol Buffers descriptor schema: https://github.com/protocolbuffers/protobuf/blob/main/src/google/protobuf/descriptor.proto
+- Rustonomicon FFI: https://doc.rust-lang.org/nomicon/ffi.html
+- OpenTelemetry HTTP semantic conventions: https://opentelemetry.io/docs/specs/semconv/http/
 
 ## 25. 関連ドキュメント
 
 - [`PROJ-ARC-001-ADR-001`: Production runtime collector v1 contract](adr-production-runtime-collector-v1.md)
 - [`PROJ-ARC-001-ADR-002`: Opt-in Rust compiler-precise backend](adr-rust-compiler-precise-backend.md)
+- [`PROJ-ARC-001-ADR-003`: Cross-language adapter common contract](adr-cross-language-adapter-contract.md)
 
 ## 26. 更新履歴
 
+- 2026-07-25: Issue #150として`cross-language-contract-v1`の共通identity / dependency site / edge / evidence / profile / completeness規約とformat別capability boundaryを確定。`service` / `schema` / `operation` / `message` / `native_symbol`、contract relation、generated code / repository mappingのproof hierarchy、external / unresolvedとprofile condition規則を定義し、同名・URL/path・生成コメントだけのexact mappingを禁止した。safe scanではremote ref/introspection、network、generator/plugin、native loadを禁止し、OpenAPI → Protobuf → GraphQL → HTTP runtime correlation → FFIの優先順位、11個の1〜3日slice、hostile / provenance / determinism / five-target security-release gateをADRへ固定した。
 - 2026-07-25: Issue #149として`compiler-precise-rust-v1`の脅威モデルとADRを確定。最初のcompatibility unitを`nightly-2026-07-17` / Rust・Cargo `1.99.0-nightly` / rustc commit `3d50c25bc66853bf0ad205529d0f305a1d841b5e`へ固定し、通常archiveとは別のclosed-tree compiler pack、Cargo unit graph v1、全unit用attested `RUSTC_WRAPPER`、`rustc_public`優先・最小`rustc_private` bridgeを採用する。明示的な`--build` / `--allow-project-code` / 将来`--rust-compiler-precise`の三重gate、project code / wrapper / config / artifactのuntrusted境界、pre/postflight toolchain attestation、typed MIR / monomorphized itemのbuild-phase observed evidence、attempt全破棄と直前snapshot維持を定義した。rolling / system / project toolchain、rustup download、coreへのcompiler library load、既存artifact parse、別toolchain fallbackを棄却し、security review条件と8段階の1〜3日実装計画、hostile / rollback / 5 target acceptance matrixをADRへ固定した。
 - 2026-07-25: Issue #148としてstable `v0.4.0` compatibility / quality gateを確定。product / Rust / Go / Web adapterを`0.4.0`へ同期し、protocol / graph `1.0`、store schema `13`、cache contract `1`を0.4.x compatibility promiseへ固定した。公式`v0.4.0-rc.1` packageが生成したschema `11` fixtureをschema `13`へtransactional migrationし、completed graph integrity、書込み、rollback backupと従来schema `5` migrationをunit / native package smokeで検証する。tag workflowはquality、benchmark、全5 package、aggregate asset verificationをdirect dependencyとする`stable-release-gate-v1`を実行し、release / benchmark artifact digestと各criterionを含む`stable-release-gate.json`が`allow`の場合だけpublishする。GA exit criteria、support matrix、rollback、既知制約と更新規則をstable release noteへ集約した。
 - 2026-07-25: Issue #147としてbundled sysroot exact resolutionを実装。coreがmanifest / whole-treeを検証した`libexec/rust-sysroot`だけをverified workerへhandoffし、workerがpinned `SOURCE.json`、non-symlink directory tree、UTF-8 `.rs` inventory、file / byte上限、必須`core` / `alloc` / `std` rootを再検証する。repository VFSとは別のlibrary SourceRoot、stable virtual path / file ID / digest、`core`、`alloc -> core`、`std -> alloc + core`、local-to-sysroot dependencyを持つattested crate graphを構築し、標準library symbol / type / import / `extern crate` / type-use / direct-callをcanonical `resolved / exact` node / site / edgeへ昇格した。profileはsysroot status / contract / component / layout / file・crate件数を記録し、mismatch / missing / development / unsupported targetではsyntax/local HIRを保持する一方、candidate / external / unresolvedまたはunattested sysrootがあれば`semantic-complete`へ昇格しない。packaged fixtureで18/18 dependency siteのexact resolution、2 scanおよびJSON / DOT / Mermaid determinism、project/system `RUST_SRC_PATH`非参照を検証する。

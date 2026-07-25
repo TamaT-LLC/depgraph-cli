@@ -491,6 +491,9 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
     let docs_index = fs::read_to_string(root.join("docs/00_index/index.md"))?;
     let rust_compiler_adr =
         fs::read_to_string(root.join("docs/40_arch_design/adr-rust-compiler-precise-backend.md"))?;
+    let cross_language_adr = fs::read_to_string(
+        root.join("docs/40_arch_design/adr-cross-language-adapter-contract.md"),
+    )?;
     for required in [
         "Rust 1.93.1, Go 1.26.1, Node.js 24.18.0, and pnpm 10.33.0",
         "TypeScript/JavaScript symbol/type/import/re-export/type-use",
@@ -523,6 +526,9 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "`PROJ-ARC-001-ADR-002`",
         "`compiler-precise-rust-v1`",
         "Issue #149として`compiler-precise-rust-v1`",
+        "`PROJ-ARC-001-ADR-003`",
+        "`cross-language-contract-v1`",
+        "Issue #150として`cross-language-contract-v1`",
     ] {
         if !design.contains(required) {
             bail!("system design release metadata is missing {required:?}");
@@ -531,6 +537,8 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
     for required in [
         "| PROJ-ARC-001-ADR-002 | PROJ-ARC-001 | [Opt-in Rust compiler-precise backend](../40_arch_design/adr-rust-compiler-precise-backend.md) | Accepted |",
         "2026-07-25: `PROJ-ARC-001-ADR-002` を追加",
+        "| PROJ-ARC-001-ADR-003 | PROJ-ARC-001 | [Cross-language adapter common contract](../40_arch_design/adr-cross-language-adapter-contract.md) | Accepted |",
+        "2026-07-25: `PROJ-ARC-001-ADR-003` を追加",
     ] {
         if !docs_index.contains(required) {
             bail!("documentation index is missing Rust compiler ADR metadata {required:?}");
@@ -554,6 +562,37 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
     ] {
         if !rust_compiler_adr.contains(required) {
             bail!("Rust compiler-precise ADR is missing required contract {required:?}");
+        }
+    }
+    for required in [
+        "- Status: Accepted",
+        "- Decision ID: `PROJ-ARC-001-ADR-003`",
+        "- Contract: `cross-language-contract-v1`",
+        "1. OpenAPI;",
+        "2. Protocol Buffers;",
+        "3. GraphQL;",
+        "4. HTTP runtime correlation;",
+        "5. FFI.",
+        "| `service` |",
+        "| `schema` |",
+        "| `operation` |",
+        "| `message` |",
+        "| `native_symbol` |",
+        "`depgraph-cross-language-mapping-v1`",
+        "A unique spelling is not format-aware proof.",
+        "Items 1-2 may support a static `exact` edge",
+        "Item 3 emits `phase=build`, `precision=observed`; item 4 emits",
+        "never satisfies or promotes a static exact mapping by itself.",
+        "## Format capability boundaries",
+        "## Security boundary",
+        "## Rollout order and issue-sized plan",
+        "| 11 | Five-target package/query/release gate | 2-3 days |",
+        "## Acceptance matrix",
+        "| Safe invariant |",
+        "## Security and release gates",
+    ] {
+        if !cross_language_adr.contains(required) {
+            bail!("cross-language adapter ADR is missing required contract {required:?}");
         }
     }
     let git_attributes = fs::read_to_string(root.join(".gitattributes"))?;
@@ -589,6 +628,7 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
     for link in [
         "docs/40_arch_design/arch-dependency-graph-cli-system-design.md",
         "docs/40_arch_design/adr-rust-compiler-precise-backend.md",
+        "docs/40_arch_design/adr-cross-language-adapter-contract.md",
         "docs/releases/v0.4.0.md",
         "docs/releases/v0.4.0-rc.1.md",
         "docs/releases/v0.2.0-rc.1.md",
