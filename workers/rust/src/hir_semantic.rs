@@ -7,7 +7,7 @@
 
 use crate::{
     ADAPTER_VERSION, EXTRACTOR as SOURCE_EXTRACTOR, RUST_ANALYZER_CRATE_VERSION,
-    RUST_ANALYZER_REVISION,
+    RUST_ANALYZER_REVISION, RUST_SYSROOT_COMPONENT_VERSION,
     hir_project::SafeProjectModel,
     source::{
         CallOccurrenceKey, CallSyntaxKind, Occurrence, SourceSpan, TypeUseContext,
@@ -103,6 +103,7 @@ struct Extractor<'a> {
     profile_id: &'a str,
     paths_by_file: BTreeMap<u32, String>,
     crate_keys_by_base: HashMap<ra_ap_ide_db::base_db::Crate, String>,
+    sysroot_crates_by_base: HashMap<ra_ap_ide_db::base_db::Crate, String>,
     nodes: BTreeMap<String, GraphNode>,
     edges: BTreeMap<String, GraphEdge>,
     sites: BTreeMap<String, DependencySite>,
@@ -187,6 +188,11 @@ pub(crate) fn extract_semantic_delta(
         .iter()
         .map(|file| (file.file_id, file.path.clone()))
         .collect();
+    let sysroot_crates_by_base = model
+        .sysroot_crate_instances()
+        .iter()
+        .map(|(name, krate)| (*krate, name.clone()))
+        .collect();
     let external_crates = model
         .snapshot()
         .externals
@@ -210,6 +216,7 @@ pub(crate) fn extract_semantic_delta(
         profile_id,
         paths_by_file,
         crate_keys_by_base,
+        sysroot_crates_by_base,
         nodes: BTreeMap::new(),
         edges: BTreeMap::new(),
         sites: BTreeMap::new(),
@@ -992,6 +999,26 @@ impl Extractor<'_> {
                         use_key.expect("use occurrence has a use key"),
                     )?;
                 }
+                Occurrence::ExternCrate {
+                    specifier,
+                    alias,
+                    condition,
+                    span,
+                    ..
+                } => {
+                    self.emit_extern_crate_occurrence(
+                        crate_key,
+                        file_id,
+                        path,
+                        module,
+                        parsed,
+                        &specifier,
+                        alias.as_deref(),
+                        condition,
+                        span,
+                        use_key.expect("extern-crate occurrence has a use key"),
+                    )?;
+                }
                 Occurrence::TypeUse {
                     specifier,
                     context,
@@ -1560,6 +1587,125 @@ impl Extractor<'_> {
             &location,
             "HIR-resolved Rust use",
             "use",
+            evidence_properties,
+        )?;
+        self.refined_use_keys.insert(use_key);
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit_extern_crate_occurrence(
+        &mut self,
+        crate_key: &str,
+        file_id: FileId,
+        path: &str,
+        module: Module,
+        parsed: &ast::SourceFile,
+        specifier: &str,
+        alias: Option<&str>,
+        condition: Condition,
+        span: SourceSpan,
+        use_key: UseOccurrenceKey,
+    ) -> Result<()> {
+        let mut matches = parsed
+            .syntax()
+            .descendants()
+            .filter_map(ast::ExternCrate::cast)
+            .filter(|item| self.range_matches_span(file_id, item.syntax().text_range(), span));
+        let Some(item) = matches.next() else {
+            self.issue(
+                "RUST_HIR_EXTERN_CRATE_SOURCE_UNAVAILABLE",
+                Some(path.into()),
+                format!(
+                    "semantic extern crate {specifier:?} at {}:{} matched no rust-analyzer syntax node",
+                    span.start_line, span.start_column
+                ),
+            );
+            return Ok(());
+        };
+        if matches.next().is_some() {
+            self.issue(
+                "RUST_HIR_EXTERN_CRATE_SOURCE_AMBIGUOUS",
+                Some(path.into()),
+                format!(
+                    "semantic extern crate {specifier:?} at {}:{} matched multiple rust-analyzer syntax nodes",
+                    span.start_line, span.start_column
+                ),
+            );
+            return Ok(());
+        }
+        let Some(source) = self.semantic_owner_id(item.syntax(), module, false) else {
+            self.issue(
+                "RUST_HIR_EXTERN_CRATE_OWNER_UNAVAILABLE",
+                Some(path.into()),
+                format!("extern crate {specifier:?} has no exact semantic owner"),
+            );
+            return Ok(());
+        };
+        let Some(resolved_crate) = self
+            .sema
+            .to_def(&item)
+            .and_then(|declaration| declaration.resolved_crate(self.db))
+        else {
+            self.issue(
+                "RUST_HIR_EXTERN_CRATE_UNRESOLVED",
+                Some(path.into()),
+                format!("rust-analyzer could not resolve extern crate {specifier:?}"),
+            );
+            return Ok(());
+        };
+        let target = self.classify_definition_target(
+            crate_key,
+            specifier,
+            "extern_crate",
+            Definition::Module(resolved_crate.root_module(self.db)),
+        )?;
+        let resolution = match target {
+            ClassifiedTarget::Concrete { node_id, external } => SemanticResolution {
+                target_ids: vec![node_id],
+                status: if external {
+                    ResolutionStatus::External
+                } else {
+                    ResolutionStatus::Resolved
+                },
+                precision: Precision::Exact,
+                reason: None,
+            },
+            ClassifiedTarget::Unsupported(reason) => {
+                self.issue(
+                    "RUST_HIR_EXTERN_CRATE_TARGET_UNREPRESENTABLE",
+                    Some(path.into()),
+                    reason.clone(),
+                );
+                self.unresolved_resolution(
+                    crate_key,
+                    "extern_crate",
+                    specifier,
+                    &SourceLocation::from_span(path, span),
+                    &reason,
+                )?
+            }
+        };
+        let site_specifier = alias
+            .map(|alias| format!("{specifier} as {alias}"))
+            .unwrap_or_else(|| specifier.into());
+        let location = SourceLocation::from_span(path, span);
+        let mut evidence_properties = Properties::new();
+        evidence_properties.insert("target_specifier".into(), json!(specifier));
+        if let Some(alias) = alias {
+            evidence_properties.insert("alias".into(), json!(alias));
+        }
+        self.add_dependency_site(
+            crate_key,
+            "extern_crate",
+            "imports",
+            &source,
+            &site_specifier,
+            condition,
+            resolution,
+            &location,
+            "HIR-resolved extern crate",
+            "extern_crate",
             evidence_properties,
         )?;
         self.refined_use_keys.insert(use_key);
@@ -2650,6 +2796,13 @@ impl Extractor<'_> {
                 definition
             )));
         }
+        if let Some(sysroot_name) = definition
+            .krate(self.db)
+            .and_then(|krate| self.sysroot_crates_by_base.get(&krate.base()))
+            .cloned()
+        {
+            return self.ensure_sysroot_target(&sysroot_name, definition);
+        }
 
         let (external_name, external_kind) = self
             .external_metadata(crate_key, specifier)
@@ -2667,6 +2820,155 @@ impl Extractor<'_> {
             node_id,
             external: true,
         })
+    }
+
+    fn ensure_sysroot_target(
+        &mut self,
+        sysroot_name: &str,
+        definition: Definition,
+    ) -> Result<ClassifiedTarget> {
+        let location = self.definition_location(definition).or_else(|| {
+            matches!(
+                definition,
+                Definition::Module(module) if module.parent(self.db).is_none()
+            )
+            .then(|| self.sysroot_root_location(sysroot_name))
+            .flatten()
+        });
+        let Some(location) = location else {
+            return Ok(ClassifiedTarget::Unsupported(format!(
+                "bundled sysroot definition {:?} has no exact attested source",
+                definition
+            )));
+        };
+        if location.generated {
+            return Ok(ClassifiedTarget::Unsupported(
+                "bundled sysroot definition is macro-generated without exact provenance".into(),
+            ));
+        }
+        let module_path = definition
+            .canonical_module_path(self.db)
+            .into_iter()
+            .flatten()
+            .filter_map(|module| module.name(self.db))
+            .map(|name| name.as_str().to_owned())
+            .collect::<Vec<_>>();
+        let display_name = self.definition_name(definition).or_else(|| {
+            matches!(definition, Definition::Module(module) if module.parent(self.db).is_none())
+                .then(|| sysroot_name.to_owned())
+        });
+        let Some(display_name) = display_name else {
+            return Ok(ClassifiedTarget::Unsupported(
+                "bundled sysroot definition has no stable canonical name".into(),
+            ));
+        };
+        let mut resolver = format!("rust-sysroot#{sysroot_name}::crate");
+        for segment in module_path {
+            resolver.push_str("::");
+            resolver.push_str(&segment);
+        }
+        if !resolver.ends_with(&format!("::{display_name}")) {
+            resolver.push_str("::");
+            resolver.push_str(&display_name);
+        }
+        let (node_kind, definition_kind) = match definition {
+            Definition::Adt(Adt::Struct(_)) => ("type", "struct"),
+            Definition::Adt(Adt::Enum(_)) => ("type", "enum"),
+            Definition::Adt(Adt::Union(_)) => ("type", "union"),
+            Definition::Trait(_) => ("type", "trait"),
+            Definition::TypeAlias(_) => ("type", "type_alias"),
+            Definition::Module(_) => ("symbol", "module"),
+            Definition::Function(_) => ("symbol", "function"),
+            Definition::EnumVariant(_) => ("symbol", "enum_variant"),
+            Definition::Const(_) => ("symbol", "const"),
+            Definition::Static(_) => ("symbol", "static"),
+            Definition::Field(_) | Definition::TupleField(_) => ("symbol", "field"),
+            _ => {
+                return Ok(ClassifiedTarget::Unsupported(format!(
+                    "bundled sysroot definition {:?} is outside the exact node vocabulary",
+                    definition
+                )));
+            }
+        };
+        let crate_identity = format!("rust-sysroot#{sysroot_name}");
+        let package_locator = format!("rust-sysroot:{RUST_SYSROOT_COMPONENT_VERSION}");
+        let mut identity = json!({
+            "language": "rust",
+            "package_locator": package_locator,
+            "crate_identity": crate_identity,
+            "definition_kind": definition_kind,
+            "resolver_identity": resolver,
+        });
+        identity
+            .as_object_mut()
+            .expect("identity is an object")
+            .insert(
+                if node_kind == "symbol" {
+                    "symbol_kind"
+                } else {
+                    "type_kind"
+                }
+                .into(),
+                Value::String(definition_kind.into()),
+            );
+        if node_kind == "symbol" {
+            identity
+                .as_object_mut()
+                .expect("identity is an object")
+                .insert("identity_kind".into(), Value::String("named".into()));
+        }
+        let node_id = stable_id_from_value(node_kind, &identity);
+        let mut node_properties = properties(json!({
+            "language": "rust",
+            "package_locator": package_locator,
+            "crate_identity": crate_identity,
+            "definition_kind": definition_kind,
+            "canonical_identity": identity,
+            "resolver_identity": resolver,
+            "profile_id": self.profile_id,
+            "source_path": location.path,
+            "source_span": location.as_value(),
+            "external": false,
+            "bundled_sysroot": true,
+            "sysroot_component_version": RUST_SYSROOT_COMPONENT_VERSION,
+            "hir_provenance": EXTRACTOR,
+        }));
+        node_properties.insert(
+            if node_kind == "symbol" {
+                "symbol_kind"
+            } else {
+                "type_kind"
+            }
+            .into(),
+            Value::String(definition_kind.into()),
+        );
+        self.insert_node(GraphNode {
+            id: node_id.clone(),
+            kind: node_kind.into(),
+            locator: format!("rust-{node_kind}:{resolver}"),
+            display_name: Some(display_name),
+            properties: node_properties,
+        })?;
+        self.node_ids.insert(definition, node_id.clone());
+        self.resolvers.insert(definition, resolver);
+        Ok(ClassifiedTarget::Concrete {
+            node_id,
+            external: false,
+        })
+    }
+
+    fn sysroot_root_location(&self, sysroot_name: &str) -> Option<SourceLocation> {
+        let root_file_id = self
+            .model
+            .snapshot()
+            .sysroot_crates
+            .iter()
+            .find(|krate| krate.name == sysroot_name)?
+            .root_file_id;
+        let file_id = FileId::from_raw(root_file_id);
+        let editioned = ra_ap_hir::EditionedFileId::current_edition(self.db, file_id);
+        let source = self.sema.parse(editioned);
+        self.location_from_range(InFile::new(editioned.into(), source.syntax().text_range()))
     }
 
     fn classify_type_resolution(

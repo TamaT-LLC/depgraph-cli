@@ -3,11 +3,13 @@
 //! The builder in this module has no repository loader. Its only source input
 //! is the UTF-8 inventory already admitted by the scanner, and every path
 //! exposed to rust-analyzer is virtual. Cargo discovery, project configuration,
-//! sysroot source, build scripts, and procedural macro binaries remain outside
-//! this boundary.
+//! build scripts, and procedural macro binaries remain outside this boundary.
+//! The only non-repository source is a separately attested bundled sysroot
+//! inventory supplied by core.
 
 use crate::{
     RUST_TOOLCHAIN_BASELINE,
+    hir_sysroot::AttestedSysroot,
     manifest::{Dependency, DependencyKind, Package, Target, expanded_named_features},
 };
 use proc_macro2::TokenStream;
@@ -16,7 +18,8 @@ use ra_ap_ide_db::{
     RootDatabase,
     base_db::{
         Crate as BaseCrate, CrateDisplayName, CrateGraphBuilder, CrateName, CrateOrigin,
-        CrateWorkspaceData, DependencyBuilder, Env, FileId, FileSet, SourceRoot, VfsPath,
+        CrateWorkspaceData, DependencyBuilder, Env, FileId, FileSet, LangCrateOrigin, SourceRoot,
+        VfsPath,
     },
     span::Edition,
 };
@@ -60,8 +63,18 @@ pub(crate) struct ProjectModelSnapshot {
     pub mode: HirProjectMode,
     pub files: Vec<VfsFileSnapshot>,
     pub crates: Vec<CrateSnapshot>,
+    pub sysroot_crates: Vec<SysrootCrateSnapshot>,
     pub externals: Vec<ExternalCrateSnapshot>,
     pub issues: Vec<ProjectModelIssue>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct SysrootCrateSnapshot {
+    pub name: String,
+    pub key: String,
+    pub root_path: String,
+    pub root_file_id: u32,
+    pub dependencies: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -123,6 +136,7 @@ pub(crate) struct SafeProjectModel {
     database: RootDatabase,
     snapshot: ProjectModelSnapshot,
     crate_instances: BTreeMap<String, BaseCrate>,
+    sysroot_crate_instances: BTreeMap<String, BaseCrate>,
 }
 
 impl SafeProjectModel {
@@ -139,6 +153,10 @@ impl SafeProjectModel {
     /// normal crate and its cfg(test) harness intentionally share one file.
     pub(crate) fn crate_instances(&self) -> &BTreeMap<String, BaseCrate> {
         &self.crate_instances
+    }
+
+    pub(crate) fn sysroot_crate_instances(&self) -> &BTreeMap<String, BaseCrate> {
+        &self.sysroot_crate_instances
     }
 }
 
@@ -287,12 +305,15 @@ struct PendingCrate {
     cfg_snapshot: Vec<String>,
     test: bool,
     dev_dependencies: bool,
+    sysroot_dependencies: BTreeSet<String>,
 }
 
 type BuiltVfs = (
     FileSet,
+    FileSet,
     Vec<(FileId, String)>,
     Vec<VfsFileSnapshot>,
+    BTreeMap<String, FileId>,
     BTreeMap<String, FileId>,
 );
 
@@ -301,9 +322,20 @@ type BuiltVfs = (
 /// Failure returns no partial database. rust-analyzer's required proc-macro
 /// cwd field receives a fixed inert absolute sentinel; no proc macro is
 /// registered and the sentinel is never inspected.
+#[cfg(test)]
 pub(crate) fn build_safe_project_model(
     packages: &[Package],
     inventory: &[InventorySource],
+    profile: &HirProjectProfile,
+    neutral_cwd: &Path,
+) -> std::result::Result<SafeProjectModel, ProjectModelError> {
+    build_safe_project_model_with_sysroot(packages, inventory, None, profile, neutral_cwd)
+}
+
+pub(crate) fn build_safe_project_model_with_sysroot(
+    packages: &[Package],
+    inventory: &[InventorySource],
+    sysroot: Option<&AttestedSysroot>,
     profile: &HirProjectProfile,
     _neutral_cwd: &Path,
 ) -> std::result::Result<SafeProjectModel, ProjectModelError> {
@@ -357,8 +389,16 @@ pub(crate) fn build_safe_project_model(
     let excluded_packages: BTreeSet<_> = (0..packages.len())
         .filter(|index| proc_macro_packages.contains(index) || !active_packages.contains(index))
         .collect();
-    let (file_set, file_text, file_snapshots, files_by_path) = build_vfs(
+    let (
+        file_set,
+        sysroot_file_set,
+        file_text,
+        file_snapshots,
+        files_by_path,
+        sysroot_files_by_path,
+    ) = build_vfs(
         inventory,
+        sysroot,
         packages.len(),
         &forbidden_roots,
         &excluded_packages,
@@ -433,6 +473,14 @@ pub(crate) fn build_safe_project_model(
                 && package.workspace_member
                 && matches!(target.kind.as_str(), "example" | "test" | "bench");
             let key = crate_key(package, target);
+            let sysroot_dependencies = crate_sysroot_dependencies(
+                inventory,
+                package_index,
+                &target.src_path,
+                &target_cfg,
+                features,
+                test,
+            )?;
             pending.push(PendingCrate {
                 package_index,
                 key: key.clone(),
@@ -449,12 +497,21 @@ pub(crate) fn build_safe_project_model(
                 cfg_snapshot: target_cfg.snapshot(features, test),
                 test,
                 dev_dependencies,
+                sysroot_dependencies,
             });
             if profile.mode == HirProjectMode::Test
                 && package.workspace_member
                 && matches!(target.kind.as_str(), "lib" | "bin")
                 && target.test
             {
+                let sysroot_dependencies = crate_sysroot_dependencies(
+                    inventory,
+                    package_index,
+                    &target.src_path,
+                    &target_cfg,
+                    features,
+                    true,
+                )?;
                 pending.push(PendingCrate {
                     package_index,
                     key: format!("{key}#unit-test"),
@@ -471,6 +528,7 @@ pub(crate) fn build_safe_project_model(
                     cfg_snapshot: target_cfg.snapshot(features, true),
                     test: true,
                     dev_dependencies: true,
+                    sysroot_dependencies,
                 });
             }
         }
@@ -506,6 +564,77 @@ pub(crate) fn build_safe_project_model(
                 .expect("verified Rust baseline is valid semver"),
         ),
     });
+    let mut sysroot_builder_ids = BTreeMap::new();
+    let mut sysroot_crates = Vec::new();
+    if sysroot.is_some() {
+        let empty_features = BTreeSet::new();
+        let cfg = target_cfg.ra_options(&empty_features, false);
+        for (name, origin, dependencies) in [
+            ("core", LangCrateOrigin::Core, Vec::<String>::new()),
+            ("alloc", LangCrateOrigin::Alloc, vec!["core".into()]),
+            (
+                "std",
+                LangCrateOrigin::Std,
+                vec!["alloc".into(), "core".into()],
+            ),
+        ] {
+            let root_path = format!("library/{name}/src/lib.rs");
+            let root_file_id = sysroot_files_by_path
+                .get(&root_path)
+                .copied()
+                .ok_or_else(|| {
+                    ProjectModelError::incomplete(
+                        Some(&root_path),
+                        "attested sysroot crate root is missing from its inventory",
+                    )
+                })?;
+            let snapshot_path = format!("rust-sysroot/{root_path}");
+            let root_file_raw = file_snapshots
+                .iter()
+                .find(|file| file.path == snapshot_path)
+                .map(|file| file.file_id)
+                .expect("sysroot file snapshot and map are built together");
+            let builder_id = graph.add_crate_root(
+                root_file_id,
+                Edition::Edition2024,
+                Some(CrateDisplayName::from_canonical_name(name)),
+                Some(RUST_TOOLCHAIN_BASELINE.into()),
+                cfg.clone(),
+                Some(cfg.clone()),
+                Env::default(),
+                CrateOrigin::Lang(origin),
+                Vec::new(),
+                false,
+                proc_macro_cwd.clone(),
+                workspace_data.clone(),
+            );
+            let key = format!("rust-sysroot#{name}");
+            sysroot_builder_ids.insert(name.to_owned(), builder_id);
+            sysroot_crates.push(SysrootCrateSnapshot {
+                name: name.into(),
+                key,
+                root_path: snapshot_path,
+                root_file_id: root_file_raw,
+                dependencies,
+            });
+        }
+        for (from_name, dependency_name) in [("alloc", "core"), ("std", "alloc"), ("std", "core")] {
+            graph
+                .add_dep(
+                    sysroot_builder_ids[from_name],
+                    DependencyBuilder::new(
+                        CrateName::normalize_dashes(dependency_name),
+                        sysroot_builder_ids[dependency_name],
+                    ),
+                )
+                .map_err(|_| {
+                    ProjectModelError::incomplete(
+                        None,
+                        "attested sysroot crate dependency graph contains a cycle",
+                    )
+                })?;
+        }
+    }
     let mut builder_ids = BTreeMap::new();
     for krate in &pending {
         let package = &packages[krate.package_index];
@@ -636,12 +765,14 @@ pub(crate) fn build_safe_project_model(
             });
         }
         dependencies_by_crate.insert(krate.key.clone(), dependencies);
-        for name in ["std", "core", "alloc"] {
-            externals.push(ExternalCrateSnapshot {
-                from_crate: krate.key.clone(),
-                name: name.into(),
-                kind: ExternalCrateKind::Sysroot,
-            });
+        if sysroot.is_none() {
+            for name in &krate.sysroot_dependencies {
+                externals.push(ExternalCrateSnapshot {
+                    from_crate: krate.key.clone(),
+                    name: name.clone(),
+                    kind: ExternalCrateKind::Sysroot,
+                });
+            }
         }
     }
 
@@ -661,6 +792,21 @@ pub(crate) fn build_safe_project_model(
                     )
                 })?;
         }
+        for name in &krate.sysroot_dependencies {
+            if let Some(to) = sysroot_builder_ids.get(name) {
+                graph
+                    .add_dep(
+                        from,
+                        DependencyBuilder::new(CrateName::normalize_dashes(name), *to),
+                    )
+                    .map_err(|_| {
+                        ProjectModelError::incomplete(
+                            Some(&krate.target.src_path),
+                            "local-to-sysroot crate dependency graph contains a cycle",
+                        )
+                    })?;
+            }
+        }
     }
 
     externals.sort();
@@ -669,7 +815,18 @@ pub(crate) fn build_safe_project_model(
         issues.push(ProjectModelIssue {
             code: "RUST_HIR_EXTERNAL_DEFINITION_UNAVAILABLE".into(),
             path: None,
-            reason: "external crate definitions and sysroot source were not loaded".into(),
+            reason: if sysroot.is_some() {
+                "external dependency definitions were not loaded".into()
+            } else {
+                "external crate definitions and sysroot source were not loaded".into()
+            },
+        });
+    }
+    if sysroot.is_none() {
+        issues.push(ProjectModelIssue {
+            code: "RUST_HIR_SYSROOT_UNAVAILABLE".into(),
+            path: None,
+            reason: "no core-attested bundled Rust sysroot was available".into(),
         });
     }
     issues.sort();
@@ -679,6 +836,17 @@ pub(crate) fn build_safe_project_model(
         .iter()
         .map(|krate| {
             let package = &packages[krate.package_index];
+            let mut dependencies: Vec<_> =
+                dependencies_by_crate[&krate.key].iter().cloned().collect();
+            if sysroot.is_some() {
+                dependencies.extend(krate.sysroot_dependencies.iter().map(|name| {
+                    CrateDependencySnapshot {
+                        name: name.clone(),
+                        crate_key: format!("rust-sysroot#{name}"),
+                    }
+                }));
+                dependencies.sort();
+            }
             CrateSnapshot {
                 key: krate.key.clone(),
                 package: package.name.clone(),
@@ -689,7 +857,7 @@ pub(crate) fn build_safe_project_model(
                 edition: krate.target.edition.clone(),
                 feature_resolver: package.feature_resolver,
                 cfg: krate.cfg_snapshot.clone(),
-                dependencies: dependencies_by_crate[&krate.key].iter().cloned().collect(),
+                dependencies,
             }
         })
         .collect();
@@ -699,11 +867,15 @@ pub(crate) fn build_safe_project_model(
         mode: profile.mode,
         files: file_snapshots,
         crates: crate_snapshots,
+        sysroot_crates,
         externals,
         issues,
     };
     let mut change = ChangeWithProcMacros::default();
-    change.set_roots(vec![SourceRoot::new_local(file_set)]);
+    change.set_roots(vec![
+        SourceRoot::new_local(file_set),
+        SourceRoot::new_library(sysroot_file_set),
+    ]);
     for (file_id, text) in file_text {
         change.change_file(file_id, Some(text));
     }
@@ -724,11 +896,186 @@ pub(crate) fn build_safe_project_model(
             (key, krate)
         })
         .collect();
+    let sysroot_crate_instances = sysroot_builder_ids
+        .into_iter()
+        .map(|(key, builder_id)| {
+            let krate = crate_id_map
+                .get(&builder_id)
+                .copied()
+                .expect("every sysroot crate builder ID is installed");
+            (key, krate)
+        })
+        .collect();
     Ok(SafeProjectModel {
         database,
         snapshot,
         crate_instances,
+        sysroot_crate_instances,
     })
+}
+
+fn crate_sysroot_dependencies(
+    inventory: &[InventorySource],
+    package_index: usize,
+    root_path: &str,
+    target_cfg: &TargetCfg,
+    features: &BTreeSet<String>,
+    test: bool,
+) -> std::result::Result<BTreeSet<String>, ProjectModelError> {
+    let source = inventory
+        .iter()
+        .find(|source| source.package_index == Some(package_index) && source.rel_path == root_path)
+        .ok_or_else(|| {
+            ProjectModelError::incomplete(
+                Some(root_path),
+                "Cargo target crate root is missing from the admitted source inventory",
+            )
+        })?;
+    let syntax = syn::parse_file(&source.text).map_err(|_| {
+        ProjectModelError::incomplete(
+            Some(root_path),
+            "Rust crate root attributes could not be safely inventoried",
+        )
+    })?;
+    let mut no_std = false;
+    let mut no_core = false;
+    for attribute in &syntax.attrs {
+        apply_sysroot_crate_attribute(
+            &attribute.meta,
+            target_cfg,
+            features,
+            test,
+            &mut no_std,
+            &mut no_core,
+        )
+        .map_err(|reason| ProjectModelError::unsupported(Some(root_path), reason))?;
+    }
+    if no_core {
+        return Err(ProjectModelError::unsupported(
+            Some(root_path),
+            "no_core crates are not supported by the attested sysroot dependency model",
+        ));
+    }
+
+    let mut dependencies = BTreeSet::from(["core".to_owned()]);
+    if !no_std {
+        dependencies.insert("std".into());
+    }
+    for item in &syntax.items {
+        let syn::Item::ExternCrate(extern_crate) = item else {
+            continue;
+        };
+        let name = extern_crate.ident.to_string();
+        if matches!(name.as_str(), "alloc" | "core" | "std")
+            && cfg_attributes_are_active(&extern_crate.attrs, target_cfg, features, test)
+                .map_err(|reason| ProjectModelError::unsupported(Some(root_path), reason))?
+        {
+            dependencies.insert(name);
+        }
+    }
+    Ok(dependencies)
+}
+
+fn apply_sysroot_crate_attribute(
+    meta: &Meta,
+    target_cfg: &TargetCfg,
+    features: &BTreeSet<String>,
+    test: bool,
+    no_std: &mut bool,
+    no_core: &mut bool,
+) -> std::result::Result<(), String> {
+    if meta.path().is_ident("no_core") {
+        *no_core = true;
+        return Ok(());
+    }
+    if meta.path().is_ident("no_std") {
+        *no_std = true;
+        return Ok(());
+    }
+    let Meta::List(list) = meta else {
+        return Ok(());
+    };
+    if !list.path.is_ident("cfg_attr") {
+        return Ok(());
+    }
+    let nested = list
+        .parse_args_with(Punctuated::<Meta, Token![,]>::parse_terminated)
+        .map_err(|_| "crate-level cfg_attr predicate is malformed".to_owned())?;
+    if nested.len() < 2 {
+        return Err("crate-level cfg_attr requires a predicate and attribute".into());
+    }
+    if evaluate_cfg_meta(
+        nested.first().expect("length checked"),
+        target_cfg,
+        features,
+        test,
+    )? {
+        for nested_attribute in nested.iter().skip(1) {
+            apply_sysroot_crate_attribute(
+                nested_attribute,
+                target_cfg,
+                features,
+                test,
+                no_std,
+                no_core,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn cfg_attributes_are_active(
+    attributes: &[Attribute],
+    target_cfg: &TargetCfg,
+    features: &BTreeSet<String>,
+    test: bool,
+) -> std::result::Result<bool, String> {
+    for attribute in attributes {
+        if !cfg_meta_is_active(&attribute.meta, target_cfg, features, test)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn cfg_meta_is_active(
+    meta: &Meta,
+    target_cfg: &TargetCfg,
+    features: &BTreeSet<String>,
+    test: bool,
+) -> std::result::Result<bool, String> {
+    let Meta::List(list) = meta else {
+        return Ok(true);
+    };
+    if list.path.is_ident("cfg") {
+        let predicate = list
+            .parse_args::<Meta>()
+            .map_err(|_| "extern crate cfg predicate is malformed".to_owned())?;
+        return evaluate_cfg_meta(&predicate, target_cfg, features, test);
+    }
+    if !list.path.is_ident("cfg_attr") {
+        return Ok(true);
+    }
+    let nested = list
+        .parse_args_with(Punctuated::<Meta, Token![,]>::parse_terminated)
+        .map_err(|_| "extern crate cfg_attr predicate is malformed".to_owned())?;
+    if nested.len() < 2 {
+        return Err("extern crate cfg_attr requires a predicate and attribute".into());
+    }
+    if !evaluate_cfg_meta(
+        nested.first().expect("length checked"),
+        target_cfg,
+        features,
+        test,
+    )? {
+        return Ok(true);
+    }
+    for nested_attribute in nested.iter().skip(1) {
+        if !cfg_meta_is_active(nested_attribute, target_cfg, features, test)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn inert_proc_macro_cwd() -> Arc<AbsPathBuf> {
@@ -742,6 +1089,7 @@ fn inert_proc_macro_cwd() -> Arc<AbsPathBuf> {
 
 fn build_vfs(
     inventory: &[InventorySource],
+    sysroot: Option<&AttestedSysroot>,
     package_count: usize,
     forbidden_roots: &BTreeSet<String>,
     excluded_packages: &BTreeSet<usize>,
@@ -775,8 +1123,9 @@ fn build_vfs(
         }
     }
     let mut file_set = FileSet::default();
-    let mut file_text = Vec::with_capacity(admitted.len());
-    let mut snapshots = Vec::with_capacity(admitted.len());
+    let sysroot_file_count = sysroot.map_or(0, |sysroot| sysroot.files.len());
+    let mut file_text = Vec::with_capacity(admitted.len() + sysroot_file_count);
+    let mut snapshots = Vec::with_capacity(admitted.len() + sysroot_file_count);
     let mut files_by_path = BTreeMap::new();
     for (index, (path, text)) in admitted.into_iter().enumerate() {
         let raw = u32::try_from(index).map_err(|_| {
@@ -799,7 +1148,54 @@ fn build_vfs(
         files_by_path.insert(path, file_id);
         file_text.push((file_id, text));
     }
-    Ok((file_set, file_text, snapshots, files_by_path))
+    let mut sysroot_file_set = FileSet::default();
+    let mut sysroot_files_by_path = BTreeMap::new();
+    if let Some(sysroot) = sysroot {
+        let offset = u32::try_from(snapshots.len()).map_err(|_| {
+            ProjectModelError::incomplete(None, "source inventory contains too many files")
+        })?;
+        for (index, source) in sysroot.files.iter().enumerate() {
+            validate_inventory_path(&source.rel_path)?;
+            let index = u32::try_from(index).map_err(|_| {
+                ProjectModelError::incomplete(None, "sysroot inventory contains too many files")
+            })?;
+            let raw = offset.checked_add(index).ok_or_else(|| {
+                ProjectModelError::incomplete(None, "combined source inventory is too large")
+            })?;
+            let file_id = FileId::from_raw(raw);
+            sysroot_file_set.insert(
+                file_id,
+                VfsPath::new_virtual_path(format!("/rust-sysroot/{}", source.rel_path)),
+            );
+            snapshots.push(VfsFileSnapshot {
+                file_id: raw,
+                path: format!("rust-sysroot/{}", source.rel_path),
+                bytes: source.text.len(),
+                sha256: Sha256::digest(source.text.as_bytes())
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect(),
+            });
+            if sysroot_files_by_path
+                .insert(source.rel_path.clone(), file_id)
+                .is_some()
+            {
+                return Err(ProjectModelError::incomplete(
+                    Some(&source.rel_path),
+                    "sysroot inventory contains a duplicate path",
+                ));
+            }
+            file_text.push((file_id, source.text.clone()));
+        }
+    }
+    Ok((
+        file_set,
+        sysroot_file_set,
+        file_text,
+        snapshots,
+        files_by_path,
+        sysroot_files_by_path,
+    ))
 }
 
 fn validate_inventory_path(path: &str) -> std::result::Result<(), ProjectModelError> {
@@ -1603,6 +1999,7 @@ fn supported_target_cfg(target: &str) -> std::result::Result<TargetCfg, ProjectM
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hir_sysroot::SysrootSource;
     use depgraph_protocol::Condition;
     use std::path::PathBuf;
 
@@ -1792,6 +2189,18 @@ mod tests {
         (vec![app, dep], inventory)
     }
 
+    fn attested_sysroot_fixture() -> AttestedSysroot {
+        AttestedSysroot {
+            files: ["alloc", "core", "std"]
+                .into_iter()
+                .map(|name| SysrootSource {
+                    rel_path: format!("library/{name}/src/lib.rs"),
+                    text: format!("pub struct {name};\n"),
+                })
+                .collect(),
+        }
+    }
+
     #[test]
     fn builds_confined_vfs_crate_graph_and_crate_scoped_cfg() {
         let (packages, inventory) = fixture();
@@ -1914,11 +2323,12 @@ mod tests {
         assert!(snapshot.externals.iter().any(|external| {
             external.name == "std" && external.kind == ExternalCrateKind::Sysroot
         }));
-        for name in ["core", "alloc"] {
-            assert!(snapshot.externals.iter().any(|external| {
-                external.name == name && external.kind == ExternalCrateKind::Sysroot
-            }));
-        }
+        assert!(snapshot.externals.iter().any(|external| {
+            external.name == "core" && external.kind == ExternalCrateKind::Sysroot
+        }));
+        assert!(!snapshot.externals.iter().any(|external| {
+            external.name == "alloc" && external.kind == ExternalCrateKind::Sysroot
+        }));
         assert!(snapshot.externals.iter().any(|external| {
             external.name == "outside_path"
                 && external.kind == ExternalCrateKind::OutsideOrUnmodeledPath
@@ -1947,6 +2357,137 @@ mod tests {
                 .iter()
                 .any(|issue| issue.code == "PROC_MACRO_NOT_EXECUTED")
         );
+    }
+
+    #[test]
+    fn maps_attested_sysroot_into_a_separate_library_vfs_and_crate_graph() {
+        let (packages, inventory) = fixture();
+        let sysroot = attested_sysroot_fixture();
+        let neutral = tempfile::tempdir().unwrap();
+        let profile = HirProjectProfile {
+            target_triple: "x86_64-unknown-linux-gnu".into(),
+            mode: HirProjectMode::Test,
+            requested_features: vec!["app/fancy".into()],
+        };
+
+        let model = build_safe_project_model_with_sysroot(
+            &packages,
+            &inventory,
+            Some(&sysroot),
+            &profile,
+            neutral.path(),
+        )
+        .expect("safe project model with attested sysroot");
+        let snapshot = model.snapshot();
+
+        assert_eq!(snapshot.crates.len(), 7);
+        assert_eq!(snapshot.sysroot_crates.len(), 3);
+        assert_eq!(model.sysroot_crate_instances().len(), 3);
+        assert_eq!(ra_ap_hir::Crate::all(model.database()).len(), 10);
+        assert_eq!(
+            snapshot
+                .sysroot_crates
+                .iter()
+                .map(|krate| krate.name.as_str())
+                .collect::<Vec<_>>(),
+            ["core", "alloc", "std"]
+        );
+        assert_eq!(
+            snapshot.sysroot_crates[0].dependencies,
+            Vec::<String>::new()
+        );
+        assert_eq!(snapshot.sysroot_crates[1].dependencies, ["core"]);
+        assert_eq!(snapshot.sysroot_crates[2].dependencies, ["alloc", "core"]);
+        for krate in &snapshot.sysroot_crates {
+            assert!(
+                snapshot.files.iter().any(|file| {
+                    file.file_id == krate.root_file_id && file.path == krate.root_path
+                }),
+                "sysroot crate {} has no canonical VFS root mapping",
+                krate.name
+            );
+        }
+        assert!(snapshot.crates.iter().all(|krate| {
+            ["core", "std"].iter().all(|name| {
+                krate.dependencies.iter().any(|dependency| {
+                    dependency.name == *name
+                        && dependency.crate_key == format!("rust-sysroot#{name}")
+                })
+            })
+        }));
+        assert!(snapshot.crates.iter().all(|krate| {
+            !krate
+                .dependencies
+                .iter()
+                .any(|dependency| dependency.name == "alloc")
+        }));
+        assert!(!snapshot.externals.iter().any(|external| {
+            external.kind == ExternalCrateKind::Sysroot
+                && matches!(external.name.as_str(), "alloc" | "core" | "std")
+        }));
+        assert!(
+            !snapshot
+                .issues
+                .iter()
+                .any(|issue| { issue.code == "RUST_HIR_SYSROOT_UNAVAILABLE" })
+        );
+    }
+
+    #[test]
+    fn crate_root_attributes_control_attested_sysroot_dependencies() {
+        let (packages, mut inventory) = fixture();
+        inventory
+            .iter_mut()
+            .find(|source| source.rel_path == "app/src/lib.rs")
+            .unwrap()
+            .text = "#![cfg_attr(unix, no_std)]\nextern crate alloc;\npub fn enabled() {}\n".into();
+        let model = build_safe_project_model_with_sysroot(
+            &packages,
+            &inventory,
+            Some(&attested_sysroot_fixture()),
+            &HirProjectProfile {
+                target_triple: "x86_64-unknown-linux-gnu".into(),
+                mode: HirProjectMode::Check,
+                requested_features: Vec::new(),
+            },
+            Path::new(""),
+        )
+        .expect("active no_std cfg_attr must produce a confined crate graph");
+        let app = model
+            .snapshot()
+            .crates
+            .iter()
+            .find(|krate| krate.target_name == "app_lib")
+            .expect("app library crate");
+        assert_eq!(
+            app.dependencies
+                .iter()
+                .filter(|dependency| dependency.crate_key.starts_with("rust-sysroot#"))
+                .map(|dependency| dependency.name.as_str())
+                .collect::<Vec<_>>(),
+            ["alloc", "core"]
+        );
+
+        inventory
+            .iter_mut()
+            .find(|source| source.rel_path == "app/src/lib.rs")
+            .unwrap()
+            .text = "#![no_core]\npub fn enabled() {}\n".into();
+        let error = build_safe_project_model_with_sysroot(
+            &packages,
+            &inventory,
+            Some(&attested_sysroot_fixture()),
+            &HirProjectProfile {
+                target_triple: "x86_64-unknown-linux-gnu".into(),
+                mode: HirProjectMode::Check,
+                requested_features: Vec::new(),
+            },
+            Path::new(""),
+        )
+        .err()
+        .expect("no_core must fail closed instead of receiving fabricated sysroot edges");
+        assert_eq!(error.kind, ProjectModelErrorKind::UnsupportedInput);
+        assert!(error.reason.contains("no_core"));
     }
 
     #[test]
@@ -2444,6 +2985,23 @@ mod tests {
         .err()
         .unwrap();
         assert_eq!(unsupported.kind, ProjectModelErrorKind::UnsupportedInput);
+        let unsupported_with_sysroot = build_safe_project_model_with_sysroot(
+            &packages,
+            &inventory,
+            Some(&attested_sysroot_fixture()),
+            &HirProjectProfile {
+                target_triple: "custom-target.json".into(),
+                mode: HirProjectMode::Build,
+                requested_features: Vec::new(),
+            },
+            neutral.path(),
+        )
+        .err()
+        .unwrap();
+        assert_eq!(
+            unsupported_with_sysroot.kind,
+            ProjectModelErrorKind::UnsupportedInput
+        );
 
         let mut profile_override_packages = packages.clone();
         profile_override_packages[0]

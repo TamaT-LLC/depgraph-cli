@@ -268,7 +268,45 @@ pub(crate) enum Occurrence {
 
 impl Occurrence {
     pub(crate) fn use_key(&self, relative_path: &str) -> Option<UseOccurrenceKey> {
-        let Self::Use {
+        let (target_specifier, alias, glob, reexport, inline_ancestors, condition, span) =
+            match self {
+                Self::Use {
+                    target_specifier,
+                    alias,
+                    glob,
+                    reexport,
+                    inline_ancestors,
+                    condition,
+                    span,
+                    ..
+                } => (
+                    target_specifier,
+                    alias.as_deref(),
+                    *glob,
+                    *reexport,
+                    inline_ancestors,
+                    condition,
+                    *span,
+                ),
+                Self::ExternCrate {
+                    specifier,
+                    alias,
+                    inline_ancestors,
+                    condition,
+                    span,
+                } => (
+                    specifier,
+                    alias.as_deref(),
+                    false,
+                    false,
+                    inline_ancestors,
+                    condition,
+                    *span,
+                ),
+                _ => return None,
+            };
+        Some(UseOccurrenceKey::from_occurrence(
+            relative_path,
             target_specifier,
             alias,
             glob,
@@ -276,20 +314,6 @@ impl Occurrence {
             inline_ancestors,
             condition,
             span,
-            ..
-        } = self
-        else {
-            return None;
-        };
-        Some(UseOccurrenceKey::from_occurrence(
-            relative_path,
-            target_specifier,
-            alias.as_deref(),
-            *glob,
-            *reexport,
-            inline_ancestors,
-            condition,
-            *span,
         ))
     }
 
@@ -2302,14 +2326,26 @@ mod tests {
     fn preserves_extern_crate_alias() {
         let occurrences =
             collect_occurrences(&syn::parse_file("extern crate std as sys;\n").unwrap());
-        assert!(occurrences.iter().any(|occurrence| matches!(
+        let occurrence = occurrences
+            .iter()
+            .find(|occurrence| matches!(occurrence, Occurrence::ExternCrate { .. }))
+            .expect("extern crate occurrence");
+        assert!(matches!(
             occurrence,
             Occurrence::ExternCrate {
                 specifier,
                 alias: Some(alias),
                 ..
             } if specifier == "std" && alias == "sys"
-        )));
+        ));
+        let key = occurrence
+            .use_key("src/lib.rs")
+            .expect("extern crate refinement key");
+        assert_eq!(key.relative_path, "src/lib.rs");
+        assert_eq!(key.target_specifier, "std");
+        assert_eq!(key.alias.as_deref(), Some("sys"));
+        assert!(!key.glob);
+        assert!(!key.reexport);
     }
 
     #[test]

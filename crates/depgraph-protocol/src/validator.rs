@@ -3092,10 +3092,18 @@ fn validate_rust_semantic_completeness(
             profile.id
         ));
     }
+    if !coverage.reasons.is_empty() {
+        return invariant(format!(
+            "Rust semantic-complete profile {} requires no coverage reasons, found {:?}",
+            profile.id, coverage.reasons
+        ));
+    }
 
     for (field, actual) in [
         ("files_skipped", coverage.files_skipped),
         ("unsupported_syntax", coverage.unsupported_syntax),
+        ("candidates", coverage.candidates),
+        ("external", coverage.external),
         ("unresolved", coverage.unresolved),
     ] {
         if actual != 0 {
@@ -3118,6 +3126,16 @@ fn validate_rust_semantic_completeness(
         ("rust_hir_backend", "rust-analyzer-hir"),
         ("rust_hir_status", "import-type-call-graph-emitted"),
         ("rust_hir_project_model", "ready"),
+        ("rust_hir_sysroot_status", "attested"),
+        ("rust_hir_sysroot_contract_version", "rust-src-data-tree-v1"),
+        (
+            "rust_hir_sysroot_component_version",
+            "1.93.1+rustc.01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf",
+        ),
+        (
+            "rust_hir_sysroot_source_layout",
+            "rustup-rust-src-library-v1",
+        ),
         ("crate_graph_source", "confined-cargo-metadata"),
         ("cargo_metadata_input", "confined-mirror"),
         ("rust_toolchain_probe_status", "compatible"),
@@ -3138,12 +3156,39 @@ fn validate_rust_semantic_completeness(
         .properties
         .get("rust_hir_enable_gate")
         .and_then(Value::as_str);
-    if !matches!(
-        release_gate,
-        Some("release-gate-pending" | "release-gate-verified")
-    ) {
+    if release_gate != Some("release-gate-verified") {
         return invariant(format!(
-            "Rust semantic-complete profile {} requires properties.rust_hir_enable_gate to be release-gate-pending or release-gate-verified, found {release_gate:?}",
+            "Rust semantic-complete profile {} requires properties.rust_hir_enable_gate=\"release-gate-verified\", found {release_gate:?}",
+            profile.id
+        ));
+    }
+    let sysroot_file_count = profile
+        .properties
+        .get("rust_hir_sysroot_file_count")
+        .and_then(Value::as_u64);
+    if sysroot_file_count.is_none_or(|count| count == 0) {
+        return invariant(format!(
+            "Rust semantic-complete profile {} requires properties.rust_hir_sysroot_file_count>0, found {sysroot_file_count:?}",
+            profile.id
+        ));
+    }
+    let sysroot_crate_count = profile
+        .properties
+        .get("rust_hir_sysroot_crate_count")
+        .and_then(Value::as_u64);
+    if sysroot_crate_count != Some(3) {
+        return invariant(format!(
+            "Rust semantic-complete profile {} requires properties.rust_hir_sysroot_crate_count=3, found {sysroot_crate_count:?}",
+            profile.id
+        ));
+    }
+    let external_crate_count = profile
+        .properties
+        .get("rust_hir_project_external_count")
+        .and_then(Value::as_u64);
+    if external_crate_count != Some(0) {
+        return invariant(format!(
+            "Rust semantic-complete profile {} requires properties.rust_hir_project_external_count=0, found {external_crate_count:?}",
             profile.id
         ));
     }
