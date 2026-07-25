@@ -219,6 +219,25 @@ test("TanStack Router v1 capability requires the generator for generated route t
   );
 });
 
+test("observer rejects a Vite base that differs from the canonical route base", async () => {
+  const plugin = createTanStackRouterBuildObserverPlugin({
+    routerVersion: "1.170.18",
+    repoRoot: "/repo",
+    generatedRouteTree: null,
+    basePath: "/router",
+    sink: { write() {} },
+  });
+  await assert.rejects(
+    async () => plugin.configResolved({
+      root: "/repo",
+      mode: "production",
+      base: "/different",
+      plugins: [plugin],
+    }),
+    { code: "web.tanstack_router_build_base_path_mismatch" },
+  );
+});
+
 test("observer captures generated, virtual, lazy, code, handler, and dynamic-mask evidence without code", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "depgraph-router-observer-"));
   try {

@@ -983,6 +983,9 @@ function validateFinalPluginChain(config: UnknownRecord, state: MutableState): T
   const base = rawBase === undefined || rawBase === "/"
     ? ""
     : configuredBasePath(rawBase);
+  if (base !== state.capability.base_path) {
+    fail("web.tanstack_router_build_base_path_mismatch");
+  }
   return {
     mode,
     base,
