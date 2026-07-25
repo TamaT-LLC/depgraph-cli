@@ -1,6 +1,13 @@
 {
   "name": "@fixture/router",
   "version": "1.0.0",
+  "depgraph": {
+    "build": {
+      "adapter": "tanstack-router",
+      "entrypoint": "depgraph-build.mjs",
+      "version": "1.170.18"
+    }
+  },
   "dependencies": {
     "@tanstack/react-router": "1.170.18"
   }

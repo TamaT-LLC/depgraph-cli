@@ -33,8 +33,8 @@ pub use build::{
     ASTRO_BUILD_OBSERVER, ASTRO_BUILD_OBSERVER_VERSION, BUILD_SUPERVISOR_VERSION, BuildAudit,
     BuildExecutionOutcome, BuildExecutionPlan, BuildExecutionRequest, BuildOutcomeKind,
     NEXT_BUILD_OBSERVER, NEXT_BUILD_OBSERVER_VERSION, NetworkIsolation,
-    TANSTACK_START_BUILD_OBSERVER, WEB_BUILD_OBSERVER_VERSION, WebBuildAdapter,
-    WebBuildObservation, create_build_execution_request, execute_build_request,
+    TANSTACK_ROUTER_BUILD_OBSERVER, TANSTACK_START_BUILD_OBSERVER, WEB_BUILD_OBSERVER_VERSION,
+    WebBuildAdapter, WebBuildObservation, create_build_execution_request, execute_build_request,
     execute_build_request_with_cancellation, supervise_build, supervise_build_with_cancellation,
 };
 pub use build_evidence::{

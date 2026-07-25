@@ -38,6 +38,7 @@ const MAX_OBSERVATION_BYTES: u64 = 16 * 1024 * 1024;
 
 pub const NEXT_BUILD_OBSERVER: &str = "next-adapter-observer";
 pub const ASTRO_BUILD_OBSERVER: &str = "astro-vite-build-observer";
+pub const TANSTACK_ROUTER_BUILD_OBSERVER: &str = "tanstack-router-vite-build-observer";
 pub const TANSTACK_START_BUILD_OBSERVER: &str = "tanstack-start-vite-build-observer";
 pub const NEXT_BUILD_OBSERVER_VERSION: &str = "0.2.0";
 pub const ASTRO_BUILD_OBSERVER_VERSION: &str = "0.2.0";
@@ -48,6 +49,7 @@ pub const WEB_BUILD_OBSERVER_VERSION: &str = "0.1.0";
 pub enum WebBuildAdapter {
     Next,
     Astro,
+    TanstackRouter,
     TanstackStart,
 }
 
@@ -56,6 +58,7 @@ impl WebBuildAdapter {
         match self {
             Self::Next => "next",
             Self::Astro => "astro",
+            Self::TanstackRouter => "tanstack-router",
             Self::TanstackStart => "tanstack-start",
         }
     }
@@ -64,6 +67,7 @@ impl WebBuildAdapter {
         match self {
             Self::Next => NEXT_BUILD_OBSERVER,
             Self::Astro => ASTRO_BUILD_OBSERVER,
+            Self::TanstackRouter => TANSTACK_ROUTER_BUILD_OBSERVER,
             Self::TanstackStart => TANSTACK_START_BUILD_OBSERVER,
         }
     }
@@ -72,6 +76,7 @@ impl WebBuildAdapter {
         match self {
             Self::Next => NEXT_BUILD_OBSERVER_VERSION,
             Self::Astro => ASTRO_BUILD_OBSERVER_VERSION,
+            Self::TanstackRouter => WEB_BUILD_OBSERVER_VERSION,
             Self::TanstackStart => WEB_BUILD_OBSERVER_VERSION,
         }
     }
@@ -80,6 +85,7 @@ impl WebBuildAdapter {
         match self {
             Self::Next => "next-build-adapter.mjs",
             Self::Astro => "astro-build-integration.mjs",
+            Self::TanstackRouter => "tanstack-router-build-observer.mjs",
             Self::TanstackStart => "tanstack-start-build-observer.mjs",
         }
     }
@@ -88,6 +94,7 @@ impl WebBuildAdapter {
         match self {
             Self::Next => "next-build-observation.json",
             Self::Astro => "astro-build-observation.json",
+            Self::TanstackRouter => "tanstack-router-build-observation.json",
             Self::TanstackStart => "tanstack-start-build-observation.json",
         }
     }
@@ -96,6 +103,7 @@ impl WebBuildAdapter {
         match self {
             Self::Next => "next-build-observation-v2",
             Self::Astro => "astro-build-observation-v2",
+            Self::TanstackRouter => "tanstack-router-build-observation-v1",
             Self::TanstackStart => "tanstack-start-build-observation-v1",
         }
     }
@@ -213,6 +221,12 @@ pub fn create_build_execution_request(source_root: &Path) -> Result<BuildExecuti
             }
             WebBuildAdapter::Astro => {
                 environment.insert("DEPGRAPH_ASTRO_VERSION".to_owned(), config.version.clone());
+            }
+            WebBuildAdapter::TanstackRouter => {
+                environment.insert(
+                    "DEPGRAPH_TANSTACK_ROUTER_VERSION".to_owned(),
+                    config.version.clone(),
+                );
             }
             WebBuildAdapter::TanstackStart => {
                 environment.insert(
@@ -590,6 +604,7 @@ fn web_adapter_for_observer(observer: &str) -> Option<WebBuildAdapter> {
     match observer {
         NEXT_BUILD_OBSERVER => Some(WebBuildAdapter::Next),
         ASTRO_BUILD_OBSERVER => Some(WebBuildAdapter::Astro),
+        TANSTACK_ROUTER_BUILD_OBSERVER => Some(WebBuildAdapter::TanstackRouter),
         TANSTACK_START_BUILD_OBSERVER => Some(WebBuildAdapter::TanstackStart),
         _ => None,
     }
@@ -872,6 +887,7 @@ fn is_allowed_environment_key(key: &str) -> bool {
         "DEPGRAPH_OBSERVER"
             | "DEPGRAPH_ASTRO_VERSION"
             | "DEPGRAPH_NEXT_EXISTING_ADAPTER"
+            | "DEPGRAPH_TANSTACK_ROUTER_VERSION"
             | "DEPGRAPH_TANSTACK_START_VERSION"
             | "DEPGRAPH_PROFILE"
             | "DEPGRAPH_TARGET"
@@ -1146,6 +1162,14 @@ mod tests {
             WebBuildAdapter::TanstackStart.observer_version(),
             WEB_BUILD_OBSERVER_VERSION
         );
+        assert_eq!(
+            WebBuildAdapter::TanstackRouter.observer_version(),
+            WEB_BUILD_OBSERVER_VERSION
+        );
+        assert_eq!(
+            WebBuildAdapter::TanstackRouter.observation_schema(),
+            "tanstack-router-build-observation-v1"
+        );
     }
 
     fn node_plan(arguments: Vec<String>) -> BuildExecutionPlan {
@@ -1316,6 +1340,10 @@ mod tests {
         );
         plan.environment
             .insert("DEPGRAPH_ASTRO_VERSION".to_owned(), "5.12.0".to_owned());
+        plan.environment.insert(
+            "DEPGRAPH_TANSTACK_ROUTER_VERSION".to_owned(),
+            "1.170.18".to_owned(),
+        );
         plan.environment.insert(
             "DEPGRAPH_TANSTACK_START_VERSION".to_owned(),
             "1.168.28".to_owned(),

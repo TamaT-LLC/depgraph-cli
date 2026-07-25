@@ -57,6 +57,7 @@ const WEB_SEMANTIC_RUNTIME_ARTIFACTS: &[&str] = &[];
 const WEB_RUNTIME_ARTIFACTS: &[&str] = &[
     "next-build-adapter.mjs",
     "astro-build-integration.mjs",
+    "tanstack-router-build-observer.mjs",
     "tanstack-start-build-observer.mjs",
     "depgraph-web-build-evidence.mjs",
     RUNTIME_COLLECTOR_ARTIFACT,
@@ -2407,6 +2408,13 @@ fn verify_packaged_build_evidence(
             "START_BUILD_FIXTURE_SECRET",
         ),
         (
+            "tanstack-router",
+            "router",
+            "web:build:tanstack-router",
+            "tanstack-router-vite-build-observer",
+            "ROUTER_BUILD_FIXTURE_SECRET",
+        ),
+        (
             "rust",
             "rust-app",
             "rust:build",
@@ -2628,6 +2636,7 @@ fn verify_packaged_build_evidence(
     for secret in [
         "NEXT_BUILD_FIXTURE_SECRET",
         "ASTRO_BUILD_FIXTURE_SECRET",
+        "ROUTER_BUILD_FIXTURE_SECRET",
         "START_BUILD_FIXTURE_SECRET",
         "RUST_BUILD_FIXTURE_SECRET",
     ] {
