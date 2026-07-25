@@ -9,6 +9,7 @@
 | ID | Parent | Title | Status |
 | --- | --- | --- | --- |
 | PROJ-ARC-001-ADR-001 | PROJ-ARC-001 | [Production runtime collector v1 contract](../40_arch_design/adr-production-runtime-collector-v1.md) | Accepted |
+| PROJ-ARC-001-ADR-002 | PROJ-ARC-001 | [Opt-in Rust compiler-precise backend](../40_arch_design/adr-rust-compiler-precise-backend.md) | Accepted |
 
 ## 統計
 
@@ -40,6 +41,7 @@
 
 ## 更新履歴
 
+- 2026-07-25: `PROJ-ARC-001-ADR-002` を追加
 - 2026-07-24: `PROJ-ARC-001-ADR-001` を追加
 - 2026-07-15: `PROJ-ARC-001` を追加
 - 2026-07-15: Milestone 0〜1 MVP実装に伴い `PROJ-ARC-001` をActiveへ更新

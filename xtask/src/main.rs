@@ -488,6 +488,9 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
     let design = fs::read_to_string(
         root.join("docs/40_arch_design/arch-dependency-graph-cli-system-design.md"),
     )?;
+    let docs_index = fs::read_to_string(root.join("docs/00_index/index.md"))?;
+    let rust_compiler_adr =
+        fs::read_to_string(root.join("docs/40_arch_design/adr-rust-compiler-precise-backend.md"))?;
     for required in [
         "Rust 1.93.1, Go 1.26.1, Node.js 24.18.0, and pnpm 10.33.0",
         "TypeScript/JavaScript symbol/type/import/re-export/type-use",
@@ -517,9 +520,39 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "Issue #55ではこのWeb semantic compatibility unitをrelease manifest",
         "Issue #145のrelease gate contractは`dynamic-framework-evidence-release-gate-v1`",
         "Issue #146でRust `1.93.1`",
+        "`PROJ-ARC-001-ADR-002`",
+        "`compiler-precise-rust-v1`",
+        "Issue #149として`compiler-precise-rust-v1`",
     ] {
         if !design.contains(required) {
             bail!("system design release metadata is missing {required:?}");
+        }
+    }
+    for required in [
+        "| PROJ-ARC-001-ADR-002 | PROJ-ARC-001 | [Opt-in Rust compiler-precise backend](../40_arch_design/adr-rust-compiler-precise-backend.md) | Accepted |",
+        "2026-07-25: `PROJ-ARC-001-ADR-002` を追加",
+    ] {
+        if !docs_index.contains(required) {
+            bail!("documentation index is missing Rust compiler ADR metadata {required:?}");
+        }
+    }
+    for required in [
+        "- Status: Accepted",
+        "- Decision ID: `PROJ-ARC-001-ADR-002`",
+        "- Contract: `compiler-precise-rust-v1`",
+        "| Toolchain channel | `nightly-2026-07-17` |",
+        "| rustc commit | `3d50c25bc66853bf0ad205529d0f305a1d841b5e` |",
+        "depgraph resolve --build PATH --allow-project-code --rust-compiler-precise",
+        "| wrapper process after rustc starts |",
+        "There is no automatic retry with another toolchain",
+        "## Options considered",
+        "## Security review gates",
+        "## Staged implementation and acceptance matrix",
+        "| Five-target release gate | 2-3 days |",
+        "| Safe invariant |",
+    ] {
+        if !rust_compiler_adr.contains(required) {
+            bail!("Rust compiler-precise ADR is missing required contract {required:?}");
         }
     }
     let git_attributes = fs::read_to_string(root.join(".gitattributes"))?;
@@ -554,6 +587,7 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
     }
     for link in [
         "docs/40_arch_design/arch-dependency-graph-cli-system-design.md",
+        "docs/40_arch_design/adr-rust-compiler-precise-backend.md",
         "docs/releases/v0.4.0.md",
         "docs/releases/v0.4.0-rc.1.md",
         "docs/releases/v0.2.0-rc.1.md",

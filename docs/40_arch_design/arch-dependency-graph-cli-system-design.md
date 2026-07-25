@@ -669,14 +669,15 @@ Issue #147でcoreが検証済みcomponent rootを`DEPGRAPH_RUST_SYSROOT_ROOT`と
 
 ### 9.8 Compiler-precise Scan
 
-rust-analyzer HIR backend と compiler-precise backend は別の意思決定とする。HIR safe scan は project の compiler / build hook を実行しない。将来の opt-in compiler-precise backend でのみ次を検討する。
+rust-analyzer HIR backend と compiler-precise backend は別の意思決定とする。HIR safe scan は project の compiler / build hook を実行しない。compiler-precise backendの規範的な脅威モデル、採用・却下案、compatibility unit、security review gate、段階実装とacceptance matrixは[`PROJ-ARC-001-ADR-002`](adr-rust-compiler-precise-backend.md)に定める。
 
-- Cargo unit graph
-- `RUSTC_WRAPPER`
-- typed MIR
-- monomorphized item graph
+採用contractは`compiler-precise-rust-v1`である。最初のcompatibility unitを`nightly-2026-07-17`、Rust / Cargo `1.99.0-nightly`、rustc commit `3d50c25bc66853bf0ad205529d0f305a1d841b5e`へexact pinする。通常archiveとは分離したtarget別compiler packに`cargo`、`rustc`、`rust-std`、`rust-src`、`rustc-dev`、`llvm-tools`、全unit用compiler wrapper、closed-tree manifest、checksum、SPDX SBOM、license inventoryを同梱し、coreがproject code起動前とprocess tree停止後に全treeをattestする。`rustup` download、rolling nightly、system / project toolchain、既存`rmeta` / `rlib` / incremental artifactへのfallbackは禁止する。
 
-nightly / `rustc_private` への依存は version 固定した worker 内へ隔離し、MVP または HIR safe scan の必須条件にしない。project code を実行する場合は `resolve --build --allow-project-code` を明示必須とし、phase / evidence を safe HIR graph と分離する。
+将来の明示selectorは`resolve --build PATH --allow-project-code --rust-compiler-precise`とし、既存の3条件をすべて同一呼出しで要求する。flag実装前の`resolve --build --allow-project-code`は現行build observationだけを行い、compiler queryを暗黙有効化しない。実行は既存supervisorのrun固有workspace、process tree、`env_clear`、timeout / cancel、network policy、bounded output、atomic attempt内に限定する。Cargo unit graph v1と実際のwrapper invocationを1対1で照合し、`rustc_public`を優先しつつ不足するmonomorphized queryだけをreview済みの最小`rustc_private` bridgeで取得する。compiler内部typeはchild内でboundedな`depgraph-rust-compiler-precise-v1` DTOへ変換し、core processへ持ち込まない。
+
+build script / proc macroはcompiler processを侵害し得るため、wrapper outputもuntrustedとしてschema、path、count、digest、unit conservationをparentで再検証する。typed MIR / monomorphized item graphは`phase=build`、`precision=observed`の別profile evidenceとしてsafe HIR graphへatomic unionし、safe evidenceを上書きしない。pack mismatch、unit欠落、project wrapper注入、artifact escape、ICE / crash / timeout / cancel、unknown schema、coverage不一致はattempt全体を破棄し、直前completed snapshotを維持する。別toolchainへのretryやsafe graphをcompiler-precise成功として返すfallbackは行わない。
+
+後続実装はcompiler-pack verifier、consent / neutral Cargo config / unit graph、wrapper ledger、typed MIR DTO、monomorphized item / call slice、atomic promotion / query、hostile rollback E2E、5 target release gateの順で、各1〜3日粒度に分割する。各段階はedition / target / feature / profile重複、build script / proc macro、config / wrapper / linker注入、artifact tamper / escape、resource failure、別checkout決定性、rollback、safe `scan`不変条件を満たさなければsupportedへ昇格しない。
 
 ## 10. Go Adapter
 
@@ -1504,6 +1505,10 @@ schema、commit、全必須metric、conservation、総合passを再検証して�
 
 **採用。** build tool、config、plugin、build script、proc macroはrepository-controlled arbitrary codeであり、safe scanと同じworker trust boundaryでは扱わない。`resolve --build`は呼出しごとの`--allow-project-code`だけをconsentとし、prompt、CI、environment、config、過去の同意から推測しない。child tree、cleared environment、timeout / cancel、temporary workspace、network policy、secret-free audit、untrusted output validationをsupervisorの必須境界とする。validated resultだけを`phase=build` / `precision=observed`としてatomic unionし、failure / partialでは直前completed snapshotを保持する。Issue #62ではこのcontractとCLI refusalを実装し、実行supervisorはIssue #63へ分離する。
 
+### ADR-010: Exact-pinned Compiler Pack for Rust Compiler-precise Observation
+
+**採用。** compiler-precise Rustはsafe HIR backendへ統合せず、`compiler-precise-rust-v1`として明示consent済みsupervised buildだけで実行する。最初のunitは`nightly-2026-07-17` / Rust・Cargo `1.99.0-nightly` / rustc `3d50c25bc66853bf0ad205529d0f305a1d841b5e`へ固定し、通常archiveとは別のclosed-tree compiler pack、Cargo unit graph v1、全unit用のattested `RUSTC_WRAPPER`、`rustc_public`優先・最小`rustc_private` bridgeを採用する。`RUSTC_WORKSPACE_WRAPPER`は空へ固定する。rolling / system / project toolchain、project wrapper、coreへのcompiler library load、既存artifact parse、rustup download、別toolchain fallbackは棄却する。project codeと同一processで動くwrapper outputをuntrustedとして再検証し、typed MIR / monomorphized itemをbuild-phase observed evidenceとしてatomic unionする。security review条件、rollback、1〜3日粒度の後続計画は[`PROJ-ARC-001-ADR-002`](adr-rust-compiler-precise-backend.md)に定める。
+
 ## 21. Roadmap
 
 ### Milestone 0: Schema and Contract
@@ -1593,7 +1598,6 @@ schema、commit、全必須metric、conservation、総合passを再検証して�
 
 - binary / product の最終名称を `depgraph` とするか
 - default profile matrix の範囲と組合せ爆発の抑制方法
-- Rust compiler-precise MIR backend をどの opt-in toolchain channel で提供するか（safe HIR backend の方式は ADR-007 で決定済み）
 - GraphQL / OpenAPI / Protocol Buffers / FFI adapter の優先順位
 - public OSS とするか、初期は private 検証とするか
 - graph query language を導入する時期
@@ -1613,10 +1617,12 @@ schema、commit、全必須metric、conservation、総合passを再検証して�
 
 ## 25. 関連ドキュメント
 
-- 現時点ではなし。上流要件文書と下流テスト仕様は実装計画の確定後に追加する。
+- [`PROJ-ARC-001-ADR-001`: Production runtime collector v1 contract](adr-production-runtime-collector-v1.md)
+- [`PROJ-ARC-001-ADR-002`: Opt-in Rust compiler-precise backend](adr-rust-compiler-precise-backend.md)
 
 ## 26. 更新履歴
 
+- 2026-07-25: Issue #149として`compiler-precise-rust-v1`の脅威モデルとADRを確定。最初のcompatibility unitを`nightly-2026-07-17` / Rust・Cargo `1.99.0-nightly` / rustc commit `3d50c25bc66853bf0ad205529d0f305a1d841b5e`へ固定し、通常archiveとは別のclosed-tree compiler pack、Cargo unit graph v1、全unit用attested `RUSTC_WRAPPER`、`rustc_public`優先・最小`rustc_private` bridgeを採用する。明示的な`--build` / `--allow-project-code` / 将来`--rust-compiler-precise`の三重gate、project code / wrapper / config / artifactのuntrusted境界、pre/postflight toolchain attestation、typed MIR / monomorphized itemのbuild-phase observed evidence、attempt全破棄と直前snapshot維持を定義した。rolling / system / project toolchain、rustup download、coreへのcompiler library load、既存artifact parse、別toolchain fallbackを棄却し、security review条件と8段階の1〜3日実装計画、hostile / rollback / 5 target acceptance matrixをADRへ固定した。
 - 2026-07-25: Issue #148としてstable `v0.4.0` compatibility / quality gateを確定。product / Rust / Go / Web adapterを`0.4.0`へ同期し、protocol / graph `1.0`、store schema `13`、cache contract `1`を0.4.x compatibility promiseへ固定した。公式`v0.4.0-rc.1` packageが生成したschema `11` fixtureをschema `13`へtransactional migrationし、completed graph integrity、書込み、rollback backupと従来schema `5` migrationをunit / native package smokeで検証する。tag workflowはquality、benchmark、全5 package、aggregate asset verificationをdirect dependencyとする`stable-release-gate-v1`を実行し、release / benchmark artifact digestと各criterionを含む`stable-release-gate.json`が`allow`の場合だけpublishする。GA exit criteria、support matrix、rollback、既知制約と更新規則をstable release noteへ集約した。
 - 2026-07-25: Issue #147としてbundled sysroot exact resolutionを実装。coreがmanifest / whole-treeを検証した`libexec/rust-sysroot`だけをverified workerへhandoffし、workerがpinned `SOURCE.json`、non-symlink directory tree、UTF-8 `.rs` inventory、file / byte上限、必須`core` / `alloc` / `std` rootを再検証する。repository VFSとは別のlibrary SourceRoot、stable virtual path / file ID / digest、`core`、`alloc -> core`、`std -> alloc + core`、local-to-sysroot dependencyを持つattested crate graphを構築し、標準library symbol / type / import / `extern crate` / type-use / direct-callをcanonical `resolved / exact` node / site / edgeへ昇格した。profileはsysroot status / contract / component / layout / file・crate件数を記録し、mismatch / missing / development / unsupported targetではsyntax/local HIRを保持する一方、candidate / external / unresolvedまたはunattested sysrootがあれば`semantic-complete`へ昇格しない。packaged fixtureで18/18 dependency siteのexact resolution、2 scanおよびJSON / DOT / Mermaid determinism、project/system `RUST_SRC_PATH`非参照を検証する。
 - 2026-07-25: Issue #146として`rust-src-data-tree-v1` package契約を実装。Rust `1.93.1` / rustc commit `01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf`と一致するrustup `rust-src`の`library/`だけを`libexec/rust-sysroot`へ正規化し、`rust-stdlib-source@1.93.1+rustc.01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf`としてsource identity、COPYRIGHT / MIT / Apache-2.0本文、license expression、SBOM package / checksum、既知whole-tree digest `cc5465ef70b933d2a80c30472468abb9f8ab297fc767bd6433b2f6f554f4f0e7`をrelease manifestへ固定した。packageはmanifest生成前にsource treeをこの独立digestへ照合し、source欠落・ローカル変更、toolchain release / commit mismatch、project-local source、symlinkをfail closedに拒否する。archive verifierはmissing / added / tamper / symlink / identity / license mismatchをworker起動前に拒否する。aggregate `release-verification.json` v3は全5 targetのsysroot digest同一性を要求し、system / project `rust-src`へのimplicit fallback禁止を明示した。
