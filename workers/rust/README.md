@@ -186,12 +186,15 @@ graph, and is a strict-policy failure. A panic, timeout, cancellation, or
 malformed worker result is a worker failure; the core preserves other adapter
 results and records the overall scan as partial with exit code `3`.
 
-Issue #30 deliberately ships no sysroot or `rust-src`. The implemented release
-schema supports whole-tree-checked `data-tree` components with an optional
-entrypoint if a future compatibility unit adds such data. Missing, added,
-modified, or symlinked content fails closed, and neither development nor
-packaged execution falls back implicitly to project or system backend/sysroot
-bytes.
+Issue #146 ships the Rust `1.93.1` standard-library source from the pinned
+`rust-src` component as the whole-tree-checked `rust-stdlib-source` `data-tree`.
+Its release identity includes rustc commit
+`01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf`, normalized layout, root, license,
+SBOM package, and complete-tree digest. Missing, added, modified, symlinked, or
+toolchain-mismatched content fails closed. The current HIR graph still keeps
+sysroot dependencies in its sidecar until the exact-resolution contract is
+implemented; neither development nor packaged execution falls back implicitly
+to project or system backend/sysroot bytes.
 
 Safe mode must not:
 
@@ -218,9 +221,10 @@ scaffold and deterministic multi-file project model are available, and Cargo
 metadata input reads are confined. When those inputs are compatible, the HIR
 definition, import/re-export, type-use, and call graph is emitted. The final
 fallback/coverage matrix and Issue #30 package/release gate are complete. A
-verified sysroot is additionally required only when a future profile claims
-exact standard-library resolution; the current compatibility unit bundles no
-sysroot and makes no implicit fallback.
+verified sysroot is additionally required when a future profile claims exact
+standard-library resolution. The current compatibility unit bundles and
+attests the source tree but does not yet consume it in the HIR database, and
+makes no implicit fallback.
 
 | Project/toolchain state | Current result | Semantic completeness / release status |
 | --- | --- | --- |
@@ -352,8 +356,9 @@ named data-tree release component with a canonical whole-tree checksum;
 missing, added, modified, or symlinked content must be rejected before the
 worker starts. The implemented runtime-component schema distinguishes an
 `executable-tree`, which requires an executable entrypoint, from a `data-tree`,
-whose entrypoint is optional. The current archive includes no sysroot or
-`rust-src`, and never searches for project or system replacements.
+whose entrypoint is optional. The current archive includes the pinned Rust
+`1.93.1` `rust-src` library tree at `libexec/rust-sysroot`, records its complete
+license/SBOM identity, and never searches for project or system replacements.
 
 An upgrade changes the Rust baseline, rust-analyzer revision, and any bundled
 sysroot as one compatibility unit. Before merging it must:
