@@ -137,8 +137,36 @@ jobs:
           path: artifacts/release-verification.json
           if-no-files-found: error
 
+  stable-gate:
+    needs: [quality, benchmark, package, verify-assets]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install 1.93.1 --profile minimal
+      - run: rustup default 1.93.1
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-verification
+          path: artifacts
+      - uses: actions/download-artifact@v4
+        with:
+          name: benchmark-report-${{ github.sha }}
+          path: benchmark
+      - name: Evaluate the machine-readable stable v0.4.0 release gate
+        env:
+          DEPGRAPH_RELEASE_QUALITY_RESULT: ${{ needs.quality.result }}
+          DEPGRAPH_RELEASE_BENCHMARK_RESULT: ${{ needs.benchmark.result }}
+          DEPGRAPH_RELEASE_PACKAGE_RESULT: ${{ needs.package.result }}
+          DEPGRAPH_RELEASE_VERIFY_ASSETS_RESULT: ${{ needs.verify-assets.result }}
+        run: cargo xtask stable-release-gate artifacts/release-verification.json benchmark/benchmark-report.json --output artifacts/stable-release-gate.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stable-release-gate
+          path: artifacts/stable-release-gate.json
+          if-no-files-found: error
+
   publish:
-    needs: verify-assets
+    needs: stable-gate
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -146,7 +174,7 @@ jobs:
         with:
           path: artifacts
           merge-multiple: true
-      - name: Publish verified release candidate
+      - name: Publish verified stable release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}

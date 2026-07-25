@@ -8,7 +8,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use depgraph_protocol::Condition;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
@@ -17,6 +17,11 @@ mod go_semantic_e2e;
 mod rust_semantic_e2e;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+const STABLE_RELEASE_GATE_SCHEMA_VERSION: &str = "stable-release-gate-v1";
+const STABLE_RELEASE_VERSION: &str = "0.4.0";
+const STABLE_UPGRADE_SOURCE_VERSION: &str = "0.4.0-rc.1";
+const STABLE_UPGRADE_SOURCE_STORE_SCHEMA_VERSION: i64 = 11;
+const BENCHMARK_REPORT_SCHEMA_VERSION: &str = "depgraph-benchmark-report-v4";
 const PROJECT_LICENSE_EXPRESSION: &str = "MIT OR Apache-2.0";
 const PROJECT_LICENSES: &[(&str, &[u8])] = &[
     ("LICENSE-APACHE", include_bytes!("../../LICENSE-APACHE")),
@@ -110,9 +115,16 @@ enum Task {
         #[arg(long)]
         target: Vec<String>,
     },
+    StableReleaseGate {
+        release_verification: PathBuf,
+        benchmark_report: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+    },
 }
 
-#[derive(Clone, Debug, serde::Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct ReleaseManifest {
     release_version: String,
     protocol_version: String,
@@ -239,7 +251,8 @@ struct ArchiveEntry {
     mode: u32,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct ReleaseVerificationReport {
     schema_version: u32,
     release_version: String,
@@ -259,7 +272,8 @@ fn release_compatibility() -> ReleaseCompatibility {
     depgraph_core::release_compatibility_contract()
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct TargetVerificationReport {
     target: String,
     archive: String,
@@ -271,6 +285,35 @@ struct TargetVerificationReport {
     rust_sysroot_sha256: String,
     framework_build_artifacts: BTreeMap<String, String>,
     workers: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum StableReleaseDecision {
+    Allow,
+    Reject,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct StableReleaseGateCheck {
+    id: String,
+    passed: bool,
+    evidence: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct StableReleaseGateReport {
+    schema_version: String,
+    release_version: String,
+    upgrade_source_version: String,
+    tag: String,
+    decision: StableReleaseDecision,
+    release_verification_sha256: String,
+    benchmark_report_sha256: String,
+    workflow_results: BTreeMap<String, String>,
+    checks: Vec<StableReleaseGateCheck>,
 }
 
 #[cfg(any(not(windows), test))]
@@ -290,6 +333,11 @@ fn main() -> Result<()> {
         Task::VerifyReleaseAssets { directory, target } => {
             verify_release_assets(&directory, &target)
         }
+        Task::StableReleaseGate {
+            release_verification,
+            benchmark_report,
+            output,
+        } => stable_release_gate(&release_verification, &benchmark_report, &output),
     }
 }
 
@@ -444,6 +492,7 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "Rust 1.93.1, Go 1.26.1, Node.js 24.18.0, and pnpm 10.33.0",
         "TypeScript/JavaScript symbol/type/import/re-export/type-use",
         "[the system design](docs/40_arch_design/arch-dependency-graph-cli-system-design.md)",
+        "[`v0.4.0`](docs/releases/v0.4.0.md)",
         "[`v0.4.0-rc.1`](docs/releases/v0.4.0-rc.1.md)",
         "[`v0.2.0-rc.1`](docs/releases/v0.2.0-rc.1.md)",
         "dynamic-framework-evidence-release-gate-v1",
@@ -461,8 +510,10 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
     }
     for required in [
         "updated: 2026-07-25",
-        "| Product / Rust / Go / Web adapter | `0.4.0-rc.1` |",
+        "| Product / Rust / Go / Web adapter | `0.4.0` |",
         "Milestone 4のrelease candidateは`v0.4.0-rc.1`",
+        "Milestone 4のstable releaseは`v0.4.0`",
+        "`stable-release-gate-v1`",
         "Issue #55ではこのWeb semantic compatibility unitをrelease manifest",
         "Issue #145のrelease gate contractは`dynamic-framework-evidence-release-gate-v1`",
         "Issue #146でRust `1.93.1`",
@@ -503,6 +554,7 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
     }
     for link in [
         "docs/40_arch_design/arch-dependency-graph-cli-system-design.md",
+        "docs/releases/v0.4.0.md",
         "docs/releases/v0.4.0-rc.1.md",
         "docs/releases/v0.2.0-rc.1.md",
         "LICENSE-MIT",
@@ -532,6 +584,14 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "artifacts/release-verification.json",
         "benchmark-report-${{ github.sha }}",
         "node scripts/benchmark-report.mjs verify benchmark/benchmark-report.json",
+        "needs: [quality, benchmark, package, verify-assets]",
+        "cargo xtask stable-release-gate artifacts/release-verification.json benchmark/benchmark-report.json --output artifacts/stable-release-gate.json",
+        "DEPGRAPH_RELEASE_QUALITY_RESULT: ${{ needs.quality.result }}",
+        "DEPGRAPH_RELEASE_BENCHMARK_RESULT: ${{ needs.benchmark.result }}",
+        "DEPGRAPH_RELEASE_PACKAGE_RESULT: ${{ needs.package.result }}",
+        "DEPGRAPH_RELEASE_VERIFY_ASSETS_RESULT: ${{ needs.verify-assets.result }}",
+        "name: stable-release-gate",
+        "needs: stable-gate",
     ] {
         if !release_workflow.contains(required) {
             bail!("release workflow is missing {required:?}");
@@ -2503,7 +2563,7 @@ fn verify_release_assets(directory: &Path, requested_targets: &[String]) -> Resu
     fs::write(
         directory.join("release-verification.json"),
         serde_json::to_vec_pretty(&ReleaseVerificationReport {
-            schema_version: 3,
+            schema_version: 4,
             release_version: VERSION.to_owned(),
             tag: format!("v{VERSION}"),
             protocol_version: "1.0".to_owned(),
@@ -2525,6 +2585,211 @@ fn verify_release_assets(directory: &Path, requested_targets: &[String]) -> Resu
         directory.display()
     );
     Ok(())
+}
+
+fn stable_release_gate(
+    release_verification_path: &Path,
+    benchmark_report_path: &Path,
+    output: &Path,
+) -> Result<()> {
+    verify_project_metadata(&workspace_root())?;
+    let release_verification: ReleaseVerificationReport =
+        serde_json::from_slice(&fs::read(release_verification_path).with_context(|| {
+            format!(
+                "failed to read release verification {}",
+                release_verification_path.display()
+            )
+        })?)
+        .context("release verification report does not satisfy its closed schema")?;
+    let benchmark_report: Value =
+        serde_json::from_slice(&fs::read(benchmark_report_path).with_context(|| {
+            format!(
+                "failed to read benchmark report {}",
+                benchmark_report_path.display()
+            )
+        })?)
+        .context("benchmark report is not valid JSON")?;
+
+    let report = evaluate_stable_release_gate(
+        &release_verification,
+        &benchmark_report,
+        sha256_file(release_verification_path)?,
+        sha256_file(benchmark_report_path)?,
+        stable_release_workflow_results(),
+    );
+    fs::write(
+        output,
+        format!("{}\n", serde_json::to_string_pretty(&report)?),
+    )
+    .with_context(|| format!("failed to write stable release gate {}", output.display()))?;
+
+    if report.decision == StableReleaseDecision::Reject {
+        let failed = report
+            .checks
+            .iter()
+            .filter(|check| !check.passed)
+            .map(|check| check.id.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        bail!(
+            "stable release gate rejected {STABLE_RELEASE_VERSION}: {failed}; report={}",
+            output.display()
+        );
+    }
+    println!(
+        "stable release gate allowed v{STABLE_RELEASE_VERSION}; report={}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn evaluate_stable_release_gate(
+    release: &ReleaseVerificationReport,
+    benchmark: &Value,
+    release_verification_sha256: String,
+    benchmark_report_sha256: String,
+    workflow_results: BTreeMap<String, String>,
+) -> StableReleaseGateReport {
+    let compatibility = release_compatibility();
+    let expected_targets = RELEASE_TARGETS
+        .iter()
+        .map(|(target, _)| *target)
+        .collect::<BTreeSet<_>>();
+    let actual_targets = release
+        .targets
+        .iter()
+        .map(|target| target.target.as_str())
+        .collect::<BTreeSet<_>>();
+    let metrics = benchmark["metrics"].as_array();
+    let benchmark_metrics_pass = metrics.is_some_and(|metrics| {
+        metrics.len() == 9
+            && metrics
+                .iter()
+                .filter(|metric| metric["gated"] == Value::Bool(true))
+                .count()
+                == 7
+            && metrics
+                .iter()
+                .filter(|metric| metric["gated"] == Value::Bool(true))
+                .all(|metric| metric["passed"] == Value::Bool(true))
+    });
+
+    let checks = vec![
+        StableReleaseGateCheck {
+            id: "release-identity".to_owned(),
+            passed: release.schema_version == 4
+                && release.release_version == STABLE_RELEASE_VERSION
+                && release.tag == format!("v{STABLE_RELEASE_VERSION}"),
+            evidence: "release-verification.json schema 4 and exact stable tag".to_owned(),
+        },
+        StableReleaseGateCheck {
+            id: "protocol-store-cache-compatibility".to_owned(),
+            passed: release.protocol_version == "1.0"
+                && release.schema_compatibility_version == "1.0"
+                && release.compatibility == compatibility
+                && release.compatibility.store_schema_version == depgraph_store::STORE_SCHEMA_VERSION
+                && release.compatibility.cache_contract_version
+                    == depgraph_store::CACHE_CONTRACT_VERSION,
+            evidence: "release manifest closure uses the compiled compatibility contract".to_owned(),
+        },
+        StableReleaseGateCheck {
+            id: "rc1-upgrade-and-rollback".to_owned(),
+            passed: release.compatibility.stable_release_gate_contract_version
+                == STABLE_RELEASE_GATE_SCHEMA_VERSION
+                && release.compatibility.stable_release_version == STABLE_RELEASE_VERSION
+                && release.compatibility.stable_upgrade_source_version
+                    == STABLE_UPGRADE_SOURCE_VERSION
+                && release
+                    .compatibility
+                    .stable_upgrade_source_store_schema_version
+                    == STABLE_UPGRADE_SOURCE_STORE_SCHEMA_VERSION
+                && release.compatibility.packaged_smoke_contract
+                    == "stable-v0.4.0-packaged-smoke-v1",
+            evidence:
+                "official v0.4.0-rc.1 schema-11 fixture, migration, immutable graph, writable name, and untouched backup"
+                    .to_owned(),
+        },
+        StableReleaseGateCheck {
+            id: "five-target-package-closure".to_owned(),
+            passed: release.targets.len() == RELEASE_TARGETS.len()
+                && actual_targets == expected_targets
+                && release.license_expression == PROJECT_LICENSE_EXPRESSION,
+            evidence:
+                "five native archives, checksums, manifests, SBOMs, licenses, and attestations"
+                    .to_owned(),
+        },
+        StableReleaseGateCheck {
+            id: "performance-budget".to_owned(),
+            passed: benchmark["schema_version"] == BENCHMARK_REPORT_SCHEMA_VERSION
+                && benchmark["fixture"]["source_file_count"] == 10_000
+                && benchmark["gate"]["passed"] == Value::Bool(true)
+                && benchmark_metrics_pass,
+            evidence: "depgraph-benchmark-report-v4 exact fixture and seven gated metrics".to_owned(),
+        },
+        StableReleaseGateCheck {
+            id: "safety-framework-collector".to_owned(),
+            passed: release.framework_build_graph_contract_version
+                == depgraph_core::FRAMEWORK_BUILD_GRAPH_CONTRACT_VERSION
+                && release.framework_build_gate_contract_version
+                    == depgraph_core::FRAMEWORK_BUILD_GATE_CONTRACT_VERSION
+                && release.framework_build_capabilities
+                    == depgraph_core::framework_build_capability_contract()
+                && release.runtime_collector_contract_version
+                    == RUNTIME_COLLECTOR_CONTRACT_VERSION,
+            evidence:
+                "safe static analysis, framework Build Evidence, and runtime collector contracts"
+                    .to_owned(),
+        },
+        StableReleaseGateCheck {
+            id: "workflow-quality-closure".to_owned(),
+            passed: workflow_results.get("github_actions").map(String::as_str) == Some("true")
+                && workflow_results.get("ref_type").map(String::as_str) == Some("tag")
+                && workflow_results.get("ref_name").map(String::as_str)
+                    == Some("v0.4.0")
+                && ["quality", "benchmark", "package", "verify-assets"]
+                    .iter()
+                    .all(|job| workflow_results.get(*job).map(String::as_str) == Some("success")),
+            evidence:
+                "stable-gate needs quality, benchmark, package, and verify-assets in release.yml"
+                    .to_owned(),
+        },
+    ];
+    let decision = if checks.iter().all(|check| check.passed) {
+        StableReleaseDecision::Allow
+    } else {
+        StableReleaseDecision::Reject
+    };
+    StableReleaseGateReport {
+        schema_version: STABLE_RELEASE_GATE_SCHEMA_VERSION.to_owned(),
+        release_version: STABLE_RELEASE_VERSION.to_owned(),
+        upgrade_source_version: STABLE_UPGRADE_SOURCE_VERSION.to_owned(),
+        tag: format!("v{STABLE_RELEASE_VERSION}"),
+        decision,
+        release_verification_sha256,
+        benchmark_report_sha256,
+        workflow_results,
+        checks,
+    }
+}
+
+fn stable_release_workflow_results() -> BTreeMap<String, String> {
+    [
+        ("github_actions", "GITHUB_ACTIONS"),
+        ("ref_type", "GITHUB_REF_TYPE"),
+        ("ref_name", "GITHUB_REF_NAME"),
+        ("quality", "DEPGRAPH_RELEASE_QUALITY_RESULT"),
+        ("benchmark", "DEPGRAPH_RELEASE_BENCHMARK_RESULT"),
+        ("package", "DEPGRAPH_RELEASE_PACKAGE_RESULT"),
+        ("verify-assets", "DEPGRAPH_RELEASE_VERIFY_ASSETS_RESULT"),
+    ]
+    .into_iter()
+    .map(|(key, variable)| {
+        (
+            key.to_owned(),
+            std::env::var(variable).unwrap_or_else(|_| "missing".to_owned()),
+        )
+    })
+    .collect()
 }
 
 fn verify_checksum_sidecar(archive: &Path, checksum: &Path) -> Result<String> {
@@ -4815,6 +5080,7 @@ fn verify_packaged_milestone4(
     source_fixture: &Path,
 ) -> Result<()> {
     verify_packaged_legacy_store_migration(executable, verify_root)?;
+    verify_packaged_stable_upgrade(executable, verify_root)?;
 
     let fixture = verify_root.join("milestone4-fixture");
     copy_directory(source_fixture, &fixture)?;
@@ -5064,6 +5330,73 @@ fn verify_packaged_legacy_store_migration(executable: &Path, verify_root: &Path)
     let backup_schema: i64 = backup.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if backup_schema != release_compatibility().previous_release_store_schema_version {
         bail!("packaged migration modified the rollback backup");
+    }
+    Ok(())
+}
+
+fn verify_packaged_stable_upgrade(executable: &Path, verify_root: &Path) -> Result<()> {
+    let store_path = verify_root.join("official-v0.4.0-rc.1-v11.db");
+    let backup_path = verify_root.join("official-v0.4.0-rc.1-v11.backup.db");
+    let connection = rusqlite::Connection::open(&store_path)?;
+    connection.execute_batch(include_str!("../fixtures/v0.4.0-rc.1-store-v11.sql"))?;
+    let original_schema: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if original_schema != release_compatibility().stable_upgrade_source_store_schema_version {
+        bail!(
+            "stable upgrade fixture is schema {original_schema}, expected {}",
+            release_compatibility().stable_upgrade_source_store_schema_version
+        );
+    }
+    drop(connection);
+    fs::copy(&store_path, &backup_path)?;
+
+    let show = Command::new(executable)
+        .arg("--store")
+        .arg(&store_path)
+        .args(["snapshot", "show", "current", "--json"])
+        .output()
+        .context("failed to open the v0.4.0-rc.1 store with the stable packaged CLI")?;
+    let show = successful_json(show, "packaged stable v0.4.0-rc.1 upgrade")?;
+    if show["data"]["source_kind"] != "scan"
+        || show["data"]["scan_id"] != "official-v0.4.0-rc.1-scan"
+        || show["data"]["status"] != "completed"
+        || show["data"]["coverage"]["dependency_sites"] != 1
+    {
+        bail!("stable upgrade lost the v0.4.0-rc.1 completed snapshot: {show}");
+    }
+
+    let upgraded = depgraph_store::Store::open(&store_path)?;
+    if upgraded.schema_version()? != depgraph_store::STORE_SCHEMA_VERSION {
+        bail!("stable upgrade did not retain the current store schema");
+    }
+    let snapshot_id = upgraded
+        .current_snapshot_id()?
+        .context("stable upgrade has no current completed snapshot")?;
+    let snapshot = upgraded.load_completed_snapshot(&snapshot_id)?;
+    if snapshot.scan.id != "official-v0.4.0-rc.1-scan"
+        || snapshot.nodes.len() != 2
+        || snapshot.sites.len() != 1
+        || snapshot.edges.len() != 1
+        || snapshot.evidence.len() != 2
+        || !upgraded.verify_snapshot_integrity(&snapshot_id)?.valid
+    {
+        bail!("stable upgrade changed the v0.4.0-rc.1 immutable graph");
+    }
+    drop(upgraded);
+
+    let named = Command::new(executable)
+        .arg("--store")
+        .arg(&store_path)
+        .args(["snapshot", "create", "stable-v0.4.0-upgrade", "--json"])
+        .output()?;
+    let named = successful_json(named, "packaged stable upgraded snapshot naming")?;
+    if named["data"]["snapshot"]["id"] != snapshot_id {
+        bail!("naming the stable upgraded snapshot changed its immutable ID: {named}");
+    }
+
+    let backup = rusqlite::Connection::open(&backup_path)?;
+    let backup_schema: i64 = backup.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if backup_schema != release_compatibility().stable_upgrade_source_store_schema_version {
+        bail!("stable upgrade modified the v0.4.0-rc.1 rollback backup");
     }
     Ok(())
 }
@@ -9043,18 +9376,23 @@ fn run(command: &mut Command) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::BTreeMap,
         fs,
         time::{Duration, SystemTime},
     };
 
     use anyhow::Result;
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     use super::{
-        ARCHIVE_MTIME, DependencyPackage, RELEASE_TARGETS, RUST_SYSROOT_COMPONENT_SHA256,
-        TYPESCRIPT_VERSION, WEB_SEMANTIC_CAPABILITIES, WEB_SEMANTIC_RUNTIME_ARTIFACTS,
-        WEB_SEMANTIC_RUNTIME_COMPONENTS, WebSemanticAttestation, WorkerBackend, archive_entries,
-        cargo_runtime_packages, create_tar_archive, create_zip_archive, executable_name_for_target,
+        ARCHIVE_MTIME, BENCHMARK_REPORT_SCHEMA_VERSION, DependencyPackage,
+        PROJECT_LICENSE_EXPRESSION, RELEASE_TARGETS, RUNTIME_COLLECTOR_CONTRACT_VERSION,
+        RUST_SYSROOT_COMPONENT_SHA256, ReleaseVerificationReport, STABLE_RELEASE_VERSION,
+        STABLE_UPGRADE_SOURCE_VERSION, StableReleaseDecision, TYPESCRIPT_VERSION,
+        TargetVerificationReport, VERSION, WEB_SEMANTIC_CAPABILITIES,
+        WEB_SEMANTIC_RUNTIME_ARTIFACTS, WEB_SEMANTIC_RUNTIME_COMPONENTS, WebSemanticAttestation,
+        WorkerBackend, archive_entries, cargo_runtime_packages, create_tar_archive,
+        create_zip_archive, evaluate_stable_release_gate, executable_name_for_target,
         extract_archive, normalized_spdx_license, package_url, parse_worker_handshake,
         release_compatibility, remove_transient_build_run_ids, rust_backend_from_handshake,
         rustc_source_identity, verify_checksum_sidecar, verify_pinned_rust_sysroot_digest,
@@ -9162,6 +9500,154 @@ mod tests {
     }
 
     #[test]
+    fn official_v0_4_rc_1_store_fixture_opens_without_changing_the_immutable_graph() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("release-candidate.db");
+        let connection = rusqlite::Connection::open(&path)?;
+        connection.execute_batch(include_str!("../fixtures/v0.4.0-rc.1-store-v11.sql"))?;
+        let schema: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        assert_eq!(
+            schema,
+            release_compatibility().stable_upgrade_source_store_schema_version
+        );
+        drop(connection);
+
+        let mut store = depgraph_store::Store::open(&path)?;
+        assert_eq!(
+            store.schema_version()?,
+            release_compatibility().store_schema_version
+        );
+        let snapshot_id = store.current_snapshot_id()?.unwrap();
+        let snapshot = store.load_completed_snapshot(&snapshot_id)?;
+        assert_eq!(snapshot.scan.id, "official-v0.4.0-rc.1-scan");
+        assert_eq!(snapshot.nodes.len(), 2);
+        assert_eq!(snapshot.sites.len(), 1);
+        assert_eq!(snapshot.edges.len(), 1);
+        assert_eq!(snapshot.evidence.len(), 2);
+        assert!(store.verify_snapshot_integrity(&snapshot_id)?.valid);
+        store.create_snapshot_name("stable-v0.4.0-upgrade", &snapshot_id)?;
+        assert_eq!(
+            store.resolve_completed_snapshot_selector("stable-v0.4.0-upgrade")?,
+            snapshot_id
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stable_release_gate_allows_exact_evidence_and_rejects_drift() {
+        let target = |target: &str| TargetVerificationReport {
+            target: target.to_owned(),
+            archive: format!("depgraph-{VERSION}-{target}.tar.gz"),
+            archive_sha256: "a".repeat(64),
+            release_manifest_sha256: "b".repeat(64),
+            sbom_sha256: "c".repeat(64),
+            project_licenses: BTreeMap::new(),
+            runtime_collector_sha256: "d".repeat(64),
+            rust_sysroot_sha256: "e".repeat(64),
+            framework_build_artifacts: BTreeMap::new(),
+            workers: BTreeMap::new(),
+        };
+        let release = ReleaseVerificationReport {
+            schema_version: 4,
+            release_version: STABLE_RELEASE_VERSION.to_owned(),
+            tag: format!("v{STABLE_RELEASE_VERSION}"),
+            protocol_version: "1.0".to_owned(),
+            schema_compatibility_version: "1.0".to_owned(),
+            framework_build_graph_contract_version:
+                depgraph_core::FRAMEWORK_BUILD_GRAPH_CONTRACT_VERSION.to_owned(),
+            framework_build_gate_contract_version:
+                depgraph_core::FRAMEWORK_BUILD_GATE_CONTRACT_VERSION.to_owned(),
+            framework_build_capabilities: depgraph_core::framework_build_capability_contract(),
+            runtime_collector_contract_version: RUNTIME_COLLECTOR_CONTRACT_VERSION.to_owned(),
+            compatibility: release_compatibility(),
+            license_expression: PROJECT_LICENSE_EXPRESSION.to_owned(),
+            targets: RELEASE_TARGETS
+                .iter()
+                .map(|(name, _)| target(name))
+                .collect(),
+        };
+        let metrics = (0..9)
+            .map(|index| {
+                let gated = index < 7;
+                json!({"gated": gated, "passed": true})
+            })
+            .collect::<Vec<_>>();
+        let benchmark = json!({
+            "schema_version": BENCHMARK_REPORT_SCHEMA_VERSION,
+            "fixture": {"source_file_count": 10_000},
+            "gate": {"passed": true},
+            "metrics": metrics
+        });
+        let workflow_results = BTreeMap::from([
+            ("github_actions".to_owned(), "true".to_owned()),
+            ("ref_type".to_owned(), "tag".to_owned()),
+            ("ref_name".to_owned(), "v0.4.0".to_owned()),
+            ("quality".to_owned(), "success".to_owned()),
+            ("benchmark".to_owned(), "success".to_owned()),
+            ("package".to_owned(), "success".to_owned()),
+            ("verify-assets".to_owned(), "success".to_owned()),
+        ]);
+
+        let evaluate = |release: &ReleaseVerificationReport, benchmark: &Value| {
+            evaluate_stable_release_gate(
+                release,
+                benchmark,
+                "a".repeat(64),
+                "b".repeat(64),
+                workflow_results.clone(),
+            )
+        };
+        assert_eq!(
+            evaluate(&release, &benchmark).decision,
+            StableReleaseDecision::Allow
+        );
+
+        let mut wrong_version = release.clone();
+        wrong_version.release_version = STABLE_UPGRADE_SOURCE_VERSION.to_owned();
+        assert_eq!(
+            evaluate(&wrong_version, &benchmark).decision,
+            StableReleaseDecision::Reject
+        );
+
+        let mut missing_target = release.clone();
+        missing_target.targets.pop();
+        assert_eq!(
+            evaluate(&missing_target, &benchmark).decision,
+            StableReleaseDecision::Reject
+        );
+
+        let mut failed_benchmark = benchmark.clone();
+        failed_benchmark["gate"]["passed"] = Value::Bool(false);
+        assert_eq!(
+            evaluate(&release, &failed_benchmark).decision,
+            StableReleaseDecision::Reject
+        );
+
+        let mut failed_workflow = workflow_results.clone();
+        failed_workflow.insert("quality".to_owned(), "failure".to_owned());
+        assert_eq!(
+            evaluate_stable_release_gate(
+                &release,
+                &benchmark,
+                "a".repeat(64),
+                "b".repeat(64),
+                failed_workflow,
+            )
+            .decision,
+            StableReleaseDecision::Reject
+        );
+
+        let mut incompatible_upgrade = release;
+        incompatible_upgrade
+            .compatibility
+            .stable_upgrade_source_store_schema_version += 1;
+        assert_eq!(
+            evaluate(&incompatible_upgrade, &benchmark).decision,
+            StableReleaseDecision::Reject
+        );
+    }
+
+    #[test]
     fn release_target_matrix_and_executable_names_are_exact() {
         assert_eq!(RELEASE_TARGETS.len(), 5);
         assert_eq!(
@@ -9256,11 +9742,11 @@ mod tests {
     #[test]
     fn rust_worker_handshake_captures_the_exact_backend_compatibility_unit() -> Result<()> {
         let parsed = parse_worker_handshake(
-            "depgraph-rust-worker 0.4.0-rc.1 (protocol 1.0; rust-analyzer 0.0.330; rust-analyzer-revision 8954b66d43225e62c92e8bbcc8500191b5cceb1e; salsa 0.26.1)",
+            "depgraph-rust-worker 0.4.0 (protocol 1.0; rust-analyzer 0.0.330; rust-analyzer-revision 8954b66d43225e62c92e8bbcc8500191b5cceb1e; salsa 0.26.1)",
         )
         .expect("valid Rust worker handshake");
         assert_eq!(parsed.name, "depgraph-rust-worker");
-        assert_eq!(parsed.version, "0.4.0-rc.1");
+        assert_eq!(parsed.version, "0.4.0");
         assert_eq!(parsed.protocol, "1.0");
         let backend = rust_backend_from_handshake(&parsed)?;
         verify_rust_backend(&backend)?;
@@ -9292,7 +9778,7 @@ mod tests {
     #[test]
     fn web_worker_handshake_captures_the_release_semantic_compatibility_unit() -> Result<()> {
         let parsed = parse_worker_handshake(
-            "depgraph-web-worker 0.4.0-rc.1 (protocol 1.0; typescript 7.0.2; capabilities astro-component-render-hydration-v1,framework-semantic-completeness-v1,framework-semantic-graph-v1,next-route-component-boundary-v1,tanstack-router-typed-route-v1,tanstack-start-rpc-middleware-v1,typescript-definition-import-type-call-graph-v2,worker-delta-v1)",
+            "depgraph-web-worker 0.4.0 (protocol 1.0; typescript 7.0.2; capabilities astro-component-render-hydration-v1,framework-semantic-completeness-v1,framework-semantic-graph-v1,next-route-component-boundary-v1,tanstack-router-typed-route-v1,tanstack-start-rpc-middleware-v1,typescript-definition-import-type-call-graph-v2,worker-delta-v1)",
         )
         .expect("valid Web worker handshake");
         let semantic = web_semantic_from_handshake(&parsed)?;
