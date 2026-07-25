@@ -499,6 +499,8 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
     )?;
     let graph_query_adr =
         fs::read_to_string(root.join("docs/40_arch_design/adr-bounded-graph-query-language.md"))?;
+    let public_oss_adr =
+        fs::read_to_string(root.join("docs/40_arch_design/adr-public-oss-release-governance.md"))?;
     for required in [
         "Rust 1.93.1, Go 1.26.1, Node.js 24.18.0, and pnpm 10.33.0",
         "TypeScript/JavaScript symbol/type/import/re-export/type-use",
@@ -540,6 +542,9 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "`PROJ-ARC-001-ADR-005`",
         "`bounded-graph-query-v1`",
         "Issue #152として`bounded-graph-query-v1`",
+        "`PROJ-ARC-001-ADR-006`",
+        "`public-readiness-v1`",
+        "Issue #153として`public-readiness-v1`",
     ] {
         if !design.contains(required) {
             bail!("system design release metadata is missing {required:?}");
@@ -554,6 +559,8 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "2026-07-25: `PROJ-ARC-001-ADR-004` を追加",
         "| PROJ-ARC-001-ADR-005 | PROJ-ARC-001 | [Bounded read-only graph query language](../40_arch_design/adr-bounded-graph-query-language.md) | Accepted |",
         "2026-07-25: `PROJ-ARC-001-ADR-005` を追加",
+        "| PROJ-ARC-001-ADR-006 | PROJ-ARC-001 | [Public OSS readiness and release governance](../40_arch_design/adr-public-oss-release-governance.md) | Accepted |",
+        "2026-07-25: `PROJ-ARC-001-ADR-006` を追加",
     ] {
         if !docs_index.contains(required) {
             bail!("documentation index is missing Rust compiler ADR metadata {required:?}");
@@ -676,6 +683,43 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
     ] {
         if !graph_query_adr.contains(required) {
             bail!("bounded graph query ADR is missing required contract {required:?}");
+        }
+    }
+    for required in [
+        "- Status: Accepted",
+        "- Decision ID: `PROJ-ARC-001-ADR-006`",
+        "- Contract: `public-readiness-v1`",
+        "| Current visibility | `private` |",
+        "| Current public readiness | `reject` / no-go |",
+        "| Accountable owner | TamaT-LLC organization owner |",
+        "Passing `stable-release-gate-v1` is mandatory but insufficient.",
+        "The readiness record is evidence, not an actuator.",
+        "## Authority and separation of duties",
+        "## Decision record",
+        "1. `candidate-and-surface`;",
+        "9. `incident-readiness`.",
+        "## Executable pre-publication checklist",
+        "### Gate 2: history and secrets",
+        "History rewriting alone never remediates a",
+        "### Gate 3: legal, license, and provenance",
+        "Developer Certificate of Origin",
+        "### Gate 4: security and disclosure",
+        "Pin every third-party GitHub Action to a reviewed full commit SHA.",
+        "### Gate 5: governance and community",
+        "### Gate 6: repository controls",
+        "### Gate 7: release and support",
+        "### Gate 8: migration dry run and change window",
+        "### Gate 9: incident readiness",
+        "changing back to private cannot retract clones, forks,",
+        "## Maintainer, review, release, support, and contribution policy",
+        "## Staged implementation",
+        "| 8 | Candidate-bound final audit, owner decision, authorized change window, and observation | 2-3 days |",
+        "## Acceptance matrix",
+        "| Stable release gate passes but history audit is missing |",
+        "| All gates pass but organization owner has not authorized visibility | remain private |",
+    ] {
+        if !public_oss_adr.contains(required) {
+            bail!("public OSS governance ADR is missing required contract {required:?}");
         }
     }
     let git_attributes = fs::read_to_string(root.join(".gitattributes"))?;

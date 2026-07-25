@@ -13,6 +13,7 @@
 | PROJ-ARC-001-ADR-003 | PROJ-ARC-001 | [Cross-language adapter common contract](../40_arch_design/adr-cross-language-adapter-contract.md) | Accepted |
 | PROJ-ARC-001-ADR-004 | PROJ-ARC-001 | [Default profile selection and exploration budget](../40_arch_design/adr-default-profile-selection-budget.md) | Accepted |
 | PROJ-ARC-001-ADR-005 | PROJ-ARC-001 | [Bounded read-only graph query language](../40_arch_design/adr-bounded-graph-query-language.md) | Accepted |
+| PROJ-ARC-001-ADR-006 | PROJ-ARC-001 | [Public OSS readiness and release governance](../40_arch_design/adr-public-oss-release-governance.md) | Accepted |
 
 ## 統計
 
@@ -44,6 +45,7 @@
 
 ## 更新履歴
 
+- 2026-07-25: `PROJ-ARC-001-ADR-006` を追加
 - 2026-07-25: `PROJ-ARC-001-ADR-005` を追加
 - 2026-07-25: `PROJ-ARC-001-ADR-004` を追加
 - 2026-07-25: `PROJ-ARC-001-ADR-003` を追加
