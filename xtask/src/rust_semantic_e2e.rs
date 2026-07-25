@@ -13,6 +13,9 @@ const RUST_ANALYZER_REVISION: &str = "8954b66d43225e62c92e8bbcc8500191b5cceb1e";
 const SALSA_VERSION: &str = "0.26.1";
 const TOOLCHAIN_BASELINE: &str = "1.93.1";
 const HIR_INTEGRATION_POLICY: &str = "pinned-rust-analyzer-library";
+const SYSROOT_CONTRACT_VERSION: &str = "rust-src-data-tree-v1";
+const SYSROOT_COMPONENT_VERSION: &str = "1.93.1+rustc.01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf";
+const SYSROOT_SOURCE_LAYOUT: &str = "rustup-rust-src-library-v1";
 
 #[cfg(test)]
 const CRATE_KEY: &str = "Cargo.toml#lib:rust_release_semantic_fixture:src/lib.rs";
@@ -24,6 +27,10 @@ const CYCLE_LEFT: &str =
     "Cargo.toml#lib:rust_release_semantic_fixture:src/lib.rs::crate::cycle_left";
 const CYCLE_RIGHT: &str =
     "Cargo.toml#lib:rust_release_semantic_fixture:src/lib.rs::crate::cycle_right";
+const STANDARD_CALL: &str =
+    "Cargo.toml#lib:rust_release_semantic_fixture:src/lib.rs::crate::standard_call";
+const STANDARD_TYPES: &str =
+    "Cargo.toml#lib:rust_release_semantic_fixture:src/lib.rs::crate::standard_types";
 
 /// Build the development CLI/worker pair and run the same semantic gate used
 /// by an extracted release archive. A development override deliberately
@@ -84,6 +91,7 @@ pub(crate) fn verify(
         })
         .transpose()?;
     let expected_release_gate = expected_release_gate(worker_override.as_deref());
+    let expect_attested_sysroot = worker_override.is_none();
 
     let root = tempfile::tempdir().context("create the Rust semantic E2E directory")?;
     let first_fixture = root.path().join("fixture-one");
@@ -114,8 +122,8 @@ pub(crate) fn verify(
     let second_store = root.path().join("semantic-two.db");
     let first_scan = runner.scan(&first_store, &first_fixture)?;
     let second_scan = runner.scan(&second_store, &second_fixture)?;
-    assert_semantic_scan(&first_scan)?;
-    assert_semantic_scan(&second_scan)?;
+    assert_semantic_scan(&first_scan, expect_attested_sysroot)?;
+    assert_semantic_scan(&second_scan, expect_attested_sysroot)?;
     ensure!(
         first_scan["coverage"] == second_scan["coverage"],
         "two Rust semantic CLI scans produced different aggregate coverage"
@@ -174,10 +182,10 @@ pub(crate) fn verify(
         "scan report and canonical export disagree on Rust semantic coverage"
     );
 
-    assert_profile(first_graph, expected_release_gate)?;
+    assert_profile(first_graph, expected_release_gate, expect_attested_sysroot)?;
     assert_ledger(first_graph)?;
     assert_normalized_paths(first_graph)?;
-    let ids = assert_required_semantic_graph(first_graph)?;
+    let ids = assert_required_semantic_graph(first_graph, expect_attested_sysroot)?;
     verify_queries(&runner, &first_store, &second_store, &ids)?;
     assert_visual_exports(first_graph, &ids, &first_dot, &first_mermaid)?;
 
@@ -253,7 +261,7 @@ impl Runner<'_> {
     }
 }
 
-fn assert_semantic_scan(scan: &Value) -> Result<()> {
+fn assert_semantic_scan(scan: &Value, expect_attested_sysroot: bool) -> Result<()> {
     let coverage = &scan["coverage"];
     ensure!(
         scan["status"] == "completed"
@@ -265,19 +273,35 @@ fn assert_semantic_scan(scan: &Value) -> Result<()> {
         coverage["files_skipped"] == 0
             && coverage["unsupported_syntax"] == 0
             && coverage["unresolved"] == 0
-            && coverage["dependency_sites"].as_u64().unwrap_or(0) > 0
-            && coverage["resolved"] == coverage["dependency_sites"],
+            && coverage["dependency_sites"].as_u64().unwrap_or(0) > 0,
         "Rust semantic scan failed its complete resolution contract: {coverage}"
     );
     ensure!(
-        string_array_contains(&coverage["completeness"], "syntax-complete")
-            && string_array_contains(&coverage["completeness"], "semantic-complete"),
-        "Rust semantic scan did not report syntax/semantic completeness: {coverage}"
+        string_array_contains(&coverage["completeness"], "syntax-complete"),
+        "Rust semantic scan did not report syntax completeness: {coverage}"
     );
+    if expect_attested_sysroot {
+        ensure!(
+            coverage["resolved"] == coverage["dependency_sites"]
+                && string_array_contains(&coverage["completeness"], "semantic-complete"),
+            "packaged Rust semantic scan did not exactly resolve its attested sysroot: {coverage}"
+        );
+    } else {
+        ensure!(
+            coverage["resolved"].as_u64().unwrap_or(0) + coverage["external"].as_u64().unwrap_or(0)
+                == coverage["dependency_sites"].as_u64().unwrap_or(u64::MAX)
+                && !string_array_contains(&coverage["completeness"], "semantic-complete"),
+            "development Rust semantic scan incorrectly promoted an unattested sysroot: {coverage}"
+        );
+    }
     Ok(())
 }
 
-fn assert_profile(graph: &Value, expected_release_gate: &str) -> Result<()> {
+fn assert_profile(
+    graph: &Value,
+    expected_release_gate: &str,
+    expect_attested_sysroot: bool,
+) -> Result<()> {
     let profiles = graph_array(graph, "profiles")?;
     ensure!(
         profiles.len() == 1 && profiles[0]["language"] == "rust",
@@ -300,9 +324,17 @@ fn assert_profile(graph: &Value, expected_release_gate: &str) -> Result<()> {
         ("rust_analyzer_salsa_version", SALSA_VERSION),
         ("rust_hir_backend", "rust-analyzer-hir"),
         ("rust_hir_project_model", "ready"),
-        ("rust_hir_status", "import-type-call-graph-emitted"),
         ("rust_hir_enable_gate", expected_release_gate),
         ("rust_hir_integration_policy", HIR_INTEGRATION_POLICY),
+        (
+            "rust_hir_sysroot_contract_version",
+            SYSROOT_CONTRACT_VERSION,
+        ),
+        (
+            "rust_hir_sysroot_component_version",
+            SYSROOT_COMPONENT_VERSION,
+        ),
+        ("rust_hir_sysroot_source_layout", SYSROOT_SOURCE_LAYOUT),
         ("rust_toolchain_baseline", TOOLCHAIN_BASELINE),
         ("rust_toolchain_probe_status", "compatible"),
         ("rust_hir_toolchain_status", "compatible"),
@@ -325,11 +357,7 @@ fn assert_profile(graph: &Value, expected_release_gate: &str) -> Result<()> {
     }
     ensure!(
         properties["proc_macro_expansion"] == "disabled"
-            && properties["rust_hir_semantic_issue_count"] == 0
             && properties["rust_hir_semantic_node_count"]
-                .as_u64()
-                .is_some_and(|count| count > 0)
-            && properties["rust_hir_project_external_count"]
                 .as_u64()
                 .is_some_and(|count| count > 0)
             && properties["rust_hir_semantic_site_count"]
@@ -338,9 +366,36 @@ fn assert_profile(graph: &Value, expected_release_gate: &str) -> Result<()> {
             && properties["rust_hir_semantic_relation_count"]
                 .as_u64()
                 .is_some_and(|count| count > 0)
-            && properties["rust_hir_semantic_call_site_count"] == 3,
+            && properties["rust_hir_semantic_call_site_count"] == 4,
         "Rust semantic profile lost its HIR completion counters: {properties}"
     );
+    if expect_attested_sysroot {
+        ensure!(
+            properties["rust_hir_status"] == "import-type-call-graph-emitted"
+                && properties["rust_hir_semantic_issue_count"] == 0
+                && properties["rust_hir_sysroot_status"] == "attested"
+                && properties["rust_hir_sysroot_crate_count"] == 3
+                && properties["rust_hir_sysroot_file_count"]
+                    .as_u64()
+                    .is_some_and(|count| count > 0)
+                && properties["rust_hir_project_external_count"] == 0,
+            "packaged Rust profile lost its attested sysroot contract: {properties}"
+        );
+    } else {
+        ensure!(
+            properties["rust_hir_status"] == "import-type-call-graph-partial"
+                && properties["rust_hir_semantic_issue_count"]
+                    .as_u64()
+                    .is_some_and(|count| count > 0)
+                && properties["rust_hir_sysroot_status"] == "unavailable"
+                && properties["rust_hir_sysroot_crate_count"] == 0
+                && properties["rust_hir_sysroot_file_count"] == 0
+                && properties["rust_hir_project_external_count"]
+                    .as_u64()
+                    .is_some_and(|count| count > 0),
+            "development Rust profile unexpectedly claimed an attested sysroot: {properties}"
+        );
+    }
     ensure!(
         profile["coverage"] == graph["coverage"],
         "Rust profile coverage and aggregate coverage disagree"
@@ -466,7 +521,10 @@ struct FixtureIds {
     right_left_call: String,
 }
 
-fn assert_required_semantic_graph(graph: &Value) -> Result<FixtureIds> {
+fn assert_required_semantic_graph(
+    graph: &Value,
+    expect_attested_sysroot: bool,
+) -> Result<FixtureIds> {
     let nodes = graph_array(graph, "nodes")?;
     let sites = graph_array(graph, "sites")?;
     let edges = graph_array(graph, "edges")?;
@@ -478,6 +536,8 @@ fn assert_required_semantic_graph(graph: &Value) -> Result<FixtureIds> {
     let output = require_node(nodes, "type", OUTPUT, "struct")?;
     let cycle_left = require_node(nodes, "symbol", CYCLE_LEFT, "function")?;
     let cycle_right = require_node(nodes, "symbol", CYCLE_RIGHT, "function")?;
+    let standard_call = require_node(nodes, "symbol", STANDARD_CALL, "function")?;
+    let standard_types = require_node(nodes, "symbol", STANDARD_TYPES, "function")?;
 
     let build_call = require_edge(edges, &build, &transform, "calls")?;
     let build_input = require_edge(edges, &build, &input, "type_uses")?;
@@ -488,6 +548,33 @@ fn assert_required_semantic_graph(graph: &Value) -> Result<FixtureIds> {
     let right_left_call = require_edge(edges, &cycle_right, &cycle_left, "calls")?;
     for edge in [build_call, build_input, left_right_call, right_left_call] {
         assert_dependency_edge_contract(edge, sites, evidence)?;
+    }
+    if expect_attested_sysroot {
+        let abort = require_sysroot_node(nodes, "symbol", "abort", "std")?;
+        let vec = require_sysroot_node(nodes, "type", "Vec", "alloc")?;
+        let string = require_sysroot_node(nodes, "type", "String", "alloc")?;
+        let range = require_sysroot_node(nodes, "type", "Range", "core")?;
+        for edge in [
+            require_edge(edges, &standard_call, &abort, "calls")?,
+            require_edge(edges, &standard_call, &vec, "type_uses")?,
+            require_edge(edges, &standard_types, &string, "type_uses")?,
+            require_edge(edges, &standard_types, &range, "type_uses")?,
+        ] {
+            assert_dependency_edge_contract(edge, sites, evidence)?;
+        }
+        for target in [&abort, &vec, &string, &range] {
+            ensure!(
+                sites.iter().any(|site| {
+                    matches!(site["kind"].as_str(), Some("rust_use" | "extern_crate"))
+                        && site["resolution_status"] == "resolved"
+                        && site["precision"] == "exact"
+                        && site["target_ids"]
+                            .as_array()
+                            .is_some_and(|targets| targets.iter().any(|id| id == target))
+                }),
+                "attested sysroot target {target} has no exact import site"
+            );
+        }
     }
 
     Ok(FixtureIds {
@@ -502,6 +589,27 @@ fn assert_required_semantic_graph(graph: &Value) -> Result<FixtureIds> {
         left_right_call: required_str(left_right_call, "id", "left cycle edge")?.to_owned(),
         right_left_call: required_str(right_left_call, "id", "right cycle edge")?.to_owned(),
     })
+}
+
+fn require_sysroot_node(
+    nodes: &[Value],
+    kind: &str,
+    display_name: &str,
+    crate_name: &str,
+) -> Result<String> {
+    let node = nodes
+        .iter()
+        .find(|node| {
+            node["kind"] == kind
+                && node["display_name"] == display_name
+                && node["properties"]["bundled_sysroot"] == true
+                && node["properties"]["crate_identity"] == format!("rust-sysroot#{crate_name}")
+                && node["properties"]["external"] == false
+        })
+        .with_context(|| {
+            format!("missing exact bundled sysroot {kind} node {crate_name}::{display_name}")
+        })?;
+    Ok(required_str(node, "id", display_name)?.to_owned())
 }
 
 fn require_node(

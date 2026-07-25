@@ -37,6 +37,7 @@ pub(crate) const RUST_BACKEND_VERSION: &str = "0.0.330";
 pub(crate) const RUST_BACKEND_REVISION: &str = "8954b66d43225e62c92e8bbcc8500191b5cceb1e";
 pub(crate) const RUST_BACKEND_SALSA_VERSION: &str = "0.26.1";
 const RUST_RELEASE_GATE_ENV: &str = "DEPGRAPH_RUST_RELEASE_GATE";
+const RUST_SYSROOT_ROOT_ENV: &str = "DEPGRAPH_RUST_SYSROOT_ROOT";
 const RUST_RELEASE_GATE_PENDING: &str = "release-gate-pending";
 const RUST_RELEASE_GATE_VERIFIED: &str = "release-gate-verified";
 const TYPESCRIPT_RELEASE_GATE_ENV: &str = "DEPGRAPH_TYPESCRIPT_RELEASE_GATE";
@@ -192,6 +193,7 @@ pub struct WorkerSpec {
     pub runtime_requirement: Option<String>,
     pub expected_version: Option<String>,
     pub(crate) release_attested: bool,
+    pub(crate) attested_rust_sysroot: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -802,6 +804,14 @@ fn locate_verified_bundled_worker_for_executable(
     let mut spec = worker_spec_from_path(adapter, artifact.clone(), runtime_requirement);
     spec.expected_version = Some(entry.version.clone());
     spec.release_attested = matches!(adapter, AdapterKind::Rust | AdapterKind::Web);
+    if adapter == AdapterKind::Rust {
+        spec.attested_rust_sysroot = Some(
+            release_root
+                .join(&rust_sysroot.root)
+                .canonicalize()
+                .context("security policy violation: Rust sysroot component disappeared")?,
+        );
+    }
     Ok(spec)
 }
 
@@ -1284,6 +1294,7 @@ fn worker_spec_from_path(
             runtime_requirement,
             expected_version: None,
             release_attested: false,
+            attested_rust_sysroot: None,
         }
     } else {
         WorkerSpec {
@@ -1295,6 +1306,7 @@ fn worker_spec_from_path(
             runtime_requirement,
             expected_version: None,
             release_attested: false,
+            attested_rust_sysroot: None,
         }
     }
 }
@@ -1599,7 +1611,12 @@ where
         .env("CARGO_NET_OFFLINE", "true")
         .env("CARGO_REGISTRY_GLOBAL_CREDENTIAL_PROVIDERS", "cargo:token");
     if spec.adapter == AdapterKind::Rust && spec.release_attested {
-        command.env(RUST_RELEASE_GATE_ENV, RUST_RELEASE_GATE_VERIFIED);
+        let sysroot = spec.attested_rust_sysroot.as_ref().context(
+            "security policy violation: verified Rust worker has no attested sysroot component",
+        )?;
+        command
+            .env(RUST_RELEASE_GATE_ENV, RUST_RELEASE_GATE_VERIFIED)
+            .env(RUST_SYSROOT_ROOT_ENV, sysroot);
     }
     if spec.adapter == AdapterKind::Web && spec.release_attested {
         command.env(
@@ -6517,6 +6534,7 @@ mod tests {
             runtime_requirement: None,
             expected_version: None,
             release_attested: false,
+            attested_rust_sysroot: None,
         };
         let cancellation = CancellationToken::new();
         let cancel = cancellation.clone();
@@ -8622,6 +8640,7 @@ mod tests {
             runtime_requirement: None,
             expected_version: None,
             release_attested: false,
+            attested_rust_sysroot: None,
         };
 
         let error = resolve_worker_program(&spec, root.path()).unwrap_err();
@@ -8973,6 +8992,7 @@ mod tests {
             runtime_requirement: None,
             expected_version: Some(env!("CARGO_PKG_VERSION").to_owned()),
             release_attested: false,
+            attested_rust_sysroot: None,
         };
 
         write_protocol_script(serde_json::json!({
@@ -13471,6 +13491,9 @@ mod tests {
 if [ "$DEPGRAPH_RUST_RELEASE_GATE" != "release-gate-verified" ]; then
   exit 9
 fi
+if [ ! -d "$DEPGRAPH_RUST_SYSROOT_ROOT" ]; then
+  exit 10
+fi
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --root) root="$2"; shift 2 ;;
@@ -13486,6 +13509,8 @@ printf '{"event":"scan_completed","protocol_version":"1.0","scan_id":"%s","adapt
         let mut permissions = std::fs::metadata(&script)?.permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(&script, permissions)?;
+        let attested_sysroot = temp.path().join("rust-sysroot");
+        std::fs::create_dir(&attested_sysroot)?;
         let mut spec = WorkerSpec {
             adapter: AdapterKind::Rust,
             program: script.clone().into_os_string(),
@@ -13495,6 +13520,7 @@ printf '{"event":"scan_completed","protocol_version":"1.0","scan_id":"%s","adapt
             runtime_requirement: None,
             expected_version: Some(env!("CARGO_PKG_VERSION").to_owned()),
             release_attested: true,
+            attested_rust_sysroot: Some(attested_sysroot.canonicalize()?),
         };
         let execution = execute_worker_inner_with_cancellation(
             &spec,
@@ -13508,6 +13534,24 @@ printf '{"event":"scan_completed","protocol_version":"1.0","scan_id":"%s","adapt
         .await?;
         assert_eq!(execution.events.len(), 2);
         assert!(execution.error.is_none(), "{:?}", execution.error);
+
+        spec.attested_rust_sysroot = None;
+        let missing_sysroot = execute_worker_inner_with_cancellation(
+            &spec,
+            &root,
+            "missing-sysroot-scan",
+            &ScanConfig::default(),
+            &ProfileConfig::default(),
+            None,
+            std::future::pending::<std::io::Result<()>>(),
+        )
+        .await
+        .expect_err("a verified Rust worker without an attested sysroot must fail closed");
+        assert!(
+            missing_sysroot
+                .to_string()
+                .contains("verified Rust worker has no attested sysroot component")
+        );
 
         spec.release_attested = false;
         let unverified = execute_worker_inner_with_cancellation(
@@ -13625,6 +13669,7 @@ exec sleep 10
             runtime_requirement: None,
             expected_version: None,
             release_attested: false,
+            attested_rust_sysroot: None,
         };
         // Keep this test independent from the process-wide Ctrl-C listener;
         // cancellation has its own deterministic test below.
@@ -13773,6 +13818,7 @@ exec sleep 30
             runtime_requirement: None,
             expected_version: None,
             release_attested: false,
+            attested_rust_sysroot: None,
         };
         let started = Instant::now();
         let ready = temp.path().join("ready");
@@ -13847,6 +13893,7 @@ printf 'operational log' >&2
             runtime_requirement: None,
             expected_version: None,
             release_attested: false,
+            attested_rust_sysroot: None,
         };
         let output = execute_worker(
             spec,
@@ -13907,6 +13954,7 @@ printf '{"event":"scan_completed","protocol_version":"1.0","scan_id":"%s","adapt
             runtime_requirement: None,
             expected_version: None,
             release_attested: false,
+            attested_rust_sysroot: None,
         };
         let execution = execute_worker_inner_with_cancellation(
             &spec,
@@ -13950,6 +13998,7 @@ printf '{"event":"scan_completed","protocol_version":"1.0","scan_id":"%s","adapt
             runtime_requirement: None,
             expected_version: None,
             release_attested: false,
+            attested_rust_sysroot: None,
         };
         let started = Instant::now();
         let output = execute_worker(

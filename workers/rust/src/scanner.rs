@@ -1,11 +1,13 @@
 use crate::{
     ADAPTER_VERSION, EXTRACTOR, RUST_ANALYZER_CRATE_VERSION, RUST_ANALYZER_REVISION,
-    RUST_ANALYZER_SALSA_VERSION, RUST_HIR_INTEGRATION_POLICY, RUST_TOOLCHAIN_BASELINE,
+    RUST_ANALYZER_SALSA_VERSION, RUST_HIR_INTEGRATION_POLICY, RUST_SYSROOT_COMPONENT_VERSION,
+    RUST_SYSROOT_CONTRACT_VERSION, RUST_SYSROOT_SOURCE_LAYOUT, RUST_TOOLCHAIN_BASELINE,
     hir_project::{
         HirProjectMode, HirProjectProfile, InventorySource, ProjectModelErrorKind,
-        SafeProjectModel, build_safe_project_model,
+        SafeProjectModel, build_safe_project_model_with_sysroot,
     },
     hir_semantic::{SemanticCrateContext, SemanticDelta, extract_semantic_delta},
+    hir_sysroot::{RUST_SYSROOT_ROOT_ENV, load_attested_sysroot},
     manifest::{
         Dependency, ManifestDocument, Package, expanded_features, normalize_path, parse_packages,
         select_static_documents, slash_path, workspace_identity,
@@ -755,12 +757,57 @@ impl State {
             mode,
             requested_features,
         };
-        match build_safe_project_model(packages, &inventory, &project_profile, Path::new("")) {
+        let sysroot = match load_attested_sysroot(
+            self.rust_release_gate == RELEASE_GATE_VERIFIED,
+            std::env::var_os(RUST_SYSROOT_ROOT_ENV).as_deref(),
+        ) {
+            Ok(sysroot) => {
+                self.profile.properties.insert(
+                    "rust_hir_sysroot_status".into(),
+                    Value::String("attested".into()),
+                );
+                self.profile.properties.insert(
+                    "rust_hir_sysroot_file_count".into(),
+                    Value::from(sysroot.files.len() as u64),
+                );
+                Some(sysroot)
+            }
+            Err(reason) => {
+                self.profile.properties.insert(
+                    "rust_hir_sysroot_status".into(),
+                    Value::String("unavailable".into()),
+                );
+                self.reasons.insert("rust-hir-sysroot-unavailable".into());
+                self.add_diagnostic(
+                    DiagnosticSeverity::Warning,
+                    "RUST_HIR_SYSROOT_UNAVAILABLE",
+                    &format!(
+                        "the pinned bundled Rust sysroot is unavailable; syntax and local HIR analysis continue without semantic completeness: {reason}"
+                    ),
+                    None,
+                    None,
+                    "rust-hir-sysroot-unavailable",
+                );
+                None
+            }
+        };
+        match build_safe_project_model_with_sysroot(
+            packages,
+            &inventory,
+            sysroot.as_ref(),
+            &project_profile,
+            Path::new(""),
+        ) {
             Ok(model) => {
                 let _ = model.database();
                 let snapshot = model.snapshot();
-                let file_count = snapshot.files.len() as u64;
+                let file_count = snapshot
+                    .files
+                    .iter()
+                    .filter(|file| !file.path.starts_with("rust-sysroot/"))
+                    .count() as u64;
                 let crate_count = snapshot.crates.len() as u64;
+                let sysroot_crate_count = snapshot.sysroot_crates.len() as u64;
                 let external_count = snapshot.externals.len() as u64;
                 self.profile.properties.insert(
                     "rust_hir_project_model".into(),
@@ -779,6 +826,10 @@ impl State {
                     Value::from(crate_count),
                 );
                 self.profile.properties.insert(
+                    "rust_hir_sysroot_crate_count".into(),
+                    Value::from(sysroot_crate_count),
+                );
+                self.profile.properties.insert(
                     "rust_hir_project_external_count".into(),
                     Value::from(external_count),
                 );
@@ -786,7 +837,7 @@ impl State {
                     DiagnosticSeverity::Info,
                     "RUST_HIR_PROJECT_MODEL_READY",
                     &format!(
-                        "safe Rust project model admitted {file_count} inventory files and {crate_count} local crates from confined Cargo metadata"
+                        "safe Rust project model admitted {file_count} inventory files, {crate_count} local crates, and {sysroot_crate_count} attested sysroot crates"
                     ),
                     None,
                     None,
@@ -795,11 +846,16 @@ impl State {
                 if external_count != 0 {
                     self.reasons
                         .insert("rust-hir-external-definition-unavailable".into());
+                    let unavailable = if sysroot_crate_count == 0 {
+                        "external dependency and sysroot crate definitions"
+                    } else {
+                        "external dependency definitions"
+                    };
                     self.add_diagnostic(
                         DiagnosticSeverity::Warning,
                         "RUST_HIR_EXTERNAL_DEFINITION_UNAVAILABLE",
                         &format!(
-                            "{external_count} external crate definitions, including sysroot crates, were recorded as sentinels and were not loaded"
+                            "{external_count} {unavailable} were recorded as sentinels and were not loaded"
                         ),
                         None,
                         None,
@@ -1074,7 +1130,12 @@ impl State {
         let semantic_import_sites = delta
             .sites
             .iter()
-            .filter(|site| matches!(site.kind.as_str(), "rust_use" | "rust_reexport"))
+            .filter(|site| {
+                matches!(
+                    site.kind.as_str(),
+                    "rust_use" | "rust_reexport" | "extern_crate"
+                )
+            })
             .count();
         if semantic_import_sites != delta.refined_use_keys.len() {
             bail!(
@@ -1754,6 +1815,19 @@ impl State {
                         condition,
                         span,
                     } => {
+                        let occurrence_key = UseOccurrenceKey::from_occurrence(
+                            &source.rel_path,
+                            &specifier,
+                            alias.as_deref(),
+                            false,
+                            false,
+                            &inline_ancestors,
+                            &condition,
+                            span,
+                        );
+                        if self.semantic_use_occurrences.contains(&occurrence_key) {
+                            continue;
+                        }
                         let resolution = self.resolve_rust_path(
                             packages,
                             source.package_index,
@@ -2845,6 +2919,8 @@ fn supported_rust_edition(edition: &str) -> bool {
 fn rust_semantic_complete_eligible(profile: &Profile, coverage: &Coverage) -> bool {
     coverage.files_skipped == 0
         && coverage.unsupported_syntax == 0
+        && coverage.candidates == 0
+        && coverage.external == 0
         && coverage.unresolved == 0
         && !coverage.project_code_executed
         && profile.properties.get("analysis").and_then(Value::as_str)
@@ -2871,9 +2947,24 @@ fn rust_semantic_complete_eligible(profile: &Profile, coverage: &Coverage) -> bo
             == Some("ready")
         && profile
             .properties
+            .get("rust_hir_sysroot_status")
+            .and_then(Value::as_str)
+            == Some("attested")
+        && profile
+            .properties
+            .get("rust_hir_sysroot_crate_count")
+            .and_then(Value::as_u64)
+            == Some(3)
+        && profile
+            .properties
+            .get("rust_hir_project_external_count")
+            .and_then(Value::as_u64)
+            == Some(0)
+        && profile
+            .properties
             .get("rust_hir_enable_gate")
             .and_then(Value::as_str)
-            .is_some_and(is_successful_release_gate)
+            == Some(RELEASE_GATE_VERIFIED)
         && profile
             .properties
             .get("crate_graph_source")
@@ -2934,10 +3025,6 @@ fn rust_semantic_complete_eligible(profile: &Profile, coverage: &Coverage) -> bo
             .get("proc_macros_executed")
             .and_then(Value::as_bool)
             == Some(false)
-}
-
-fn is_successful_release_gate(gate: &str) -> bool {
-    matches!(gate, RELEASE_GATE_PENDING | RELEASE_GATE_VERIFIED)
 }
 
 fn configured_rust_release_gate() -> &'static str {
@@ -3003,6 +3090,82 @@ fn rust_profile(
         &selection.rust_mode,
     );
     let expanded_profile_features = features.clone();
+    let mut profile_properties = properties(json!({
+        "analysis": "syntax",
+        "analysis_backend": "static-syntax",
+        "rust_hir_backend": "disabled",
+        "rust_hir_status": "not-invoked",
+        "rust_hir_scaffold": "available",
+        "rust_hir_project_model": if hir_toolchain_status == ToolchainProbeStatus::Compatible {
+            "pending"
+        } else {
+            "not-invoked"
+        },
+        "rust_hir_enable_gate": if hir_toolchain_status == ToolchainProbeStatus::Compatible {
+            "semantic-emission-pending"
+        } else {
+            "toolchain-unsupported"
+        },
+        "rust_hir_project_file_count": 0,
+        "rust_hir_project_crate_count": 0,
+        "rust_hir_project_external_count": 0,
+        "rust_hir_semantic_node_count": 0,
+        "rust_hir_semantic_relation_count": 0,
+        "rust_hir_semantic_site_count": 0,
+        "rust_hir_semantic_call_site_count": 0,
+        "rust_hir_semantic_issue_count": 0,
+        "rust_hir_cfg_profile": "debug-unwind",
+        "rust_hir_integration_policy": RUST_HIR_INTEGRATION_POLICY,
+        "rust_analyzer_version": RUST_ANALYZER_CRATE_VERSION,
+        "rust_analyzer_revision": RUST_ANALYZER_REVISION,
+        "rust_analyzer_salsa_version": RUST_ANALYZER_SALSA_VERSION,
+        "rust_toolchain_baseline": RUST_TOOLCHAIN_BASELINE,
+        "rust_toolchain_probe_status": toolchain_probe.status().as_str(),
+        "rust_hir_toolchain_status": hir_toolchain_status.as_str(),
+        "rust_toolchain_declaration_status": declared_toolchain_status,
+        "rust_toolchain_observed": toolchain_probe.as_value(),
+        "cargo_metadata_input": "confined-mirror",
+        "crate_graph_source_policy": "confined-cargo-metadata-or-static-manifest",
+        "syntax_fallback": "enabled",
+        "effective_target": selected_target,
+        "host_target": host_target,
+        "requested_features": selection.rust_features,
+        "expanded_features": expanded_profile_features,
+        "configured_targets": selection.rust_targets,
+        "rust_mode": selection.rust_mode,
+        "build_scripts_executed": false,
+        "proc_macros_executed": false,
+        "build_script_policy": "disabled",
+        "proc_macro_policy": "disabled",
+        "proc_macro_expansion": "disabled",
+        "project_code_executed": false,
+        "project_toolchain_executed": false
+    }));
+    profile_properties.insert(
+        "rust_hir_sysroot_status".into(),
+        Value::String(
+            if hir_toolchain_status == ToolchainProbeStatus::Compatible {
+                "pending"
+            } else {
+                "not-invoked"
+            }
+            .into(),
+        ),
+    );
+    profile_properties.insert("rust_hir_sysroot_file_count".into(), Value::from(0));
+    profile_properties.insert("rust_hir_sysroot_crate_count".into(), Value::from(0));
+    profile_properties.insert(
+        "rust_hir_sysroot_contract_version".into(),
+        Value::String(RUST_SYSROOT_CONTRACT_VERSION.into()),
+    );
+    profile_properties.insert(
+        "rust_hir_sysroot_component_version".into(),
+        Value::String(RUST_SYSROOT_COMPONENT_VERSION.into()),
+    );
+    profile_properties.insert(
+        "rust_hir_sysroot_source_layout".into(),
+        Value::String(RUST_SYSROOT_SOURCE_LAYOUT.into()),
+    );
     Profile {
         id,
         language: "rust".into(),
@@ -3026,57 +3189,7 @@ fn rust_profile(
             ("safe_mode".into(), Value::Bool(true)),
         ]),
         source_revision: None,
-        properties: properties(json!({
-            "analysis": "syntax",
-            "analysis_backend": "static-syntax",
-            "rust_hir_backend": "disabled",
-            "rust_hir_status": "not-invoked",
-            "rust_hir_scaffold": "available",
-            "rust_hir_project_model": if hir_toolchain_status == ToolchainProbeStatus::Compatible {
-                "pending"
-            } else {
-                "not-invoked"
-            },
-            "rust_hir_enable_gate": if hir_toolchain_status == ToolchainProbeStatus::Compatible {
-                "semantic-emission-pending"
-            } else {
-                "toolchain-unsupported"
-            },
-            "rust_hir_project_file_count": 0,
-            "rust_hir_project_crate_count": 0,
-            "rust_hir_project_external_count": 0,
-            "rust_hir_semantic_node_count": 0,
-            "rust_hir_semantic_relation_count": 0,
-            "rust_hir_semantic_site_count": 0,
-            "rust_hir_semantic_call_site_count": 0,
-            "rust_hir_semantic_issue_count": 0,
-            "rust_hir_cfg_profile": "debug-unwind",
-            "rust_hir_integration_policy": RUST_HIR_INTEGRATION_POLICY,
-            "rust_analyzer_version": RUST_ANALYZER_CRATE_VERSION,
-            "rust_analyzer_revision": RUST_ANALYZER_REVISION,
-            "rust_analyzer_salsa_version": RUST_ANALYZER_SALSA_VERSION,
-            "rust_toolchain_baseline": RUST_TOOLCHAIN_BASELINE,
-            "rust_toolchain_probe_status": toolchain_probe.status().as_str(),
-            "rust_hir_toolchain_status": hir_toolchain_status.as_str(),
-            "rust_toolchain_declaration_status": declared_toolchain_status,
-            "rust_toolchain_observed": toolchain_probe.as_value(),
-            "cargo_metadata_input": "confined-mirror",
-            "crate_graph_source_policy": "confined-cargo-metadata-or-static-manifest",
-            "syntax_fallback": "enabled",
-            "effective_target": selected_target,
-            "host_target": host_target,
-            "requested_features": selection.rust_features,
-            "expanded_features": expanded_profile_features,
-            "configured_targets": selection.rust_targets,
-            "rust_mode": selection.rust_mode,
-            "build_scripts_executed": false,
-            "proc_macros_executed": false,
-            "build_script_policy": "disabled",
-            "proc_macro_policy": "disabled",
-            "proc_macro_expansion": "disabled",
-            "project_code_executed": false,
-            "project_toolchain_executed": false
-        })),
+        properties: profile_properties,
     }
 }
 
@@ -3522,7 +3635,7 @@ mod tests {
     }
 
     #[test]
-    fn complete_hir_profile_reports_semantic_complete() {
+    fn development_hir_profile_requires_an_attested_sysroot_for_semantic_complete() {
         let temp = tempfile::tempdir().unwrap();
         write_complete_semantic_fixture(temp.path());
 
@@ -3538,7 +3651,7 @@ mod tests {
                 .contains(&CompletenessLevel::SyntaxComplete)
         );
         assert!(
-            result
+            !result
                 .coverage
                 .completeness
                 .contains(&CompletenessLevel::SemanticComplete)
@@ -3547,11 +3660,22 @@ mod tests {
             result.profile.properties["rust_hir_enable_gate"],
             "release-gate-pending"
         );
+        assert_eq!(
+            result.profile.properties["rust_hir_sysroot_status"],
+            "unavailable"
+        );
+        assert!(
+            result
+                .coverage
+                .reasons
+                .iter()
+                .any(|reason| reason == "rust-hir-sysroot-unavailable")
+        );
         crate::emit::build_events("semantic-complete-contract", &result).unwrap();
     }
 
     #[test]
-    fn nested_cfg_attr_conditions_are_preserved_in_semantic_complete_graphs() {
+    fn nested_cfg_attr_conditions_are_preserved_without_sysroot_promotion() {
         let temp = tempfile::tempdir().unwrap();
         write_complete_semantic_fixture(temp.path());
         fs::write(
@@ -3567,7 +3691,7 @@ pub fn consume(_: Local) {}
         let result = scan(temp.path()).unwrap();
 
         assert!(
-            result
+            !result
                 .coverage
                 .completeness
                 .contains(&CompletenessLevel::SemanticComplete)

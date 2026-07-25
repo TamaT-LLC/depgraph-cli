@@ -865,6 +865,7 @@ mod tests {
             runtime_requirement: None,
             expected_version: None,
             release_attested: false,
+            attested_rust_sysroot: None,
         }
     }
 

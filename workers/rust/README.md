@@ -16,11 +16,13 @@ database for the HIR definition and dependency graph: canonical `symbol` and
 relations, HIR-refined import/re-export sites, semantic `type_uses`, and
 exact/candidate calls are validated and atomically unioned with the syntax
 graph. The final fallback/coverage matrix is complete, and an eligible profile
-can now claim `semantic-complete`. Source/development execution intentionally
-retains `rust_hir_enable_gate=release-gate-pending`. The Issue #30
-package/release verifier was completed on 2026-07-19; after the core verifies
-the extracted archive and exact Rust backend attestation, the packaged worker
-receives and emits `release-gate-verified` as its release-ready claim.
+can now claim `semantic-complete` only when a core-attested bundled sysroot is
+also present and every dependency site is exact-resolved. Source/development
+execution intentionally retains `rust_hir_enable_gate=release-gate-pending`,
+reports the sysroot unavailable, and never claims semantic completeness. After
+core verifies the extracted archive, exact Rust backend, and complete sysroot
+data tree, the packaged worker receives `release-gate-verified` and the
+canonical sysroot root as its release-ready input.
 
 Preflight rejects ambiguous globs, symlinks, out-of-root workspace members and
 path dependencies, and unknown Cargo path-bearing fields before Cargo starts.
@@ -63,18 +65,22 @@ The original smoke scaffold lowers only caller-supplied bytes through virtual
 the admitted source inventory for selected workspace and active path packages.
 It assigns deterministic virtual file IDs, adds profile-selected workspace
 targets and active in-root path dependencies as local crates, and reconstructs
-edition plus feature, target, and test cfg per crate. Registry,
-git, unmodeled path, build, and sysroot dependencies stay in a deterministic
-sidecar sentinel ledger instead of being loaded into the database. Custom
-targets, build scripts, proc-macro targets, incomplete crate models, and static
-Cargo fallback remain explicit diagnostic/coverage entries.
+edition plus feature, target, and test cfg per crate. Registry, git, unmodeled
+path, and build dependencies stay in a deterministic sidecar sentinel ledger.
+For a core-attested packaged release only, the pinned bundled `core`, `alloc`,
+and `std` inventories enter a separate library VFS and crate graph; otherwise
+sysroot dependencies also remain sentinels. Custom targets, build scripts,
+proc-macro targets, incomplete crate models, and static Cargo fallback remain
+explicit diagnostic/coverage entries.
 
 Neither path discovers a Cargo workspace or reads a repository file on demand.
-The project model does not load `rust-project.json`, `.cargo/config*`, sysroot
-or registry source, build output, or proc-macro libraries, and it does not run
-build scripts or child processes. The implemented semantic pass emits stable
-named/local symbol and type identities, definition relations, HIR-resolved
-import/re-export sites, signature/field/bound/type-alias/body `type_uses`, and
+The project model does not load `rust-project.json`, `.cargo/config*`, project
+or system sysroot/registry source, build output, or proc-macro libraries, and
+it does not run build scripts or child processes. The only admitted
+non-repository source is the core-verified bundled sysroot data tree. The
+implemented semantic pass emits stable named/local and bundled-sysroot symbol
+and type identities, definition relations, HIR-resolved import/re-export and
+`extern crate` sites, signature/field/bound/type-alias/body `type_uses`, and
 exact/candidate call sites into an isolated delta. Each HIR-refined dependency
 keeps semantic primary evidence plus its supporting syntax evidence. The
 scanner validates nodes, sites, edges, and file coverage together before
@@ -191,10 +197,13 @@ Issue #146 ships the Rust `1.93.1` standard-library source from the pinned
 Its release identity includes rustc commit
 `01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf`, normalized layout, root, license,
 SBOM package, and complete-tree digest. Missing, added, modified, symlinked, or
-toolchain-mismatched content fails closed. The current HIR graph still keeps
-sysroot dependencies in its sidecar until the exact-resolution contract is
-implemented; neither development nor packaged execution falls back implicitly
-to project or system backend/sysroot bytes.
+toolchain-mismatched content fails closed. Issue #147 consumes that tree only
+after core attestation, rechecks its pinned `SOURCE.json`, maps `core`, `alloc`,
+and `std` into deterministic library VFS/crate roots, and emits exact
+standard-library symbol/type/import/type-use/direct-call nodes and edges with
+attested source paths. Development, mismatched, missing, or unsupported-target
+execution preserves syntax/local HIR output without `semantic-complete`;
+neither path falls back implicitly to project or system backend/sysroot bytes.
 
 Safe mode must not:
 
@@ -221,14 +230,14 @@ scaffold and deterministic multi-file project model are available, and Cargo
 metadata input reads are confined. When those inputs are compatible, the HIR
 definition, import/re-export, type-use, and call graph is emitted. The final
 fallback/coverage matrix and Issue #30 package/release gate are complete. A
-verified sysroot is additionally required when a future profile claims exact
-standard-library resolution. The current compatibility unit bundles and
-attests the source tree but does not yet consume it in the HIR database, and
-makes no implicit fallback.
+verified sysroot is additionally required for exact standard-library
+resolution and `semantic-complete`. The packaged compatibility unit consumes
+only the source tree handed off by core after whole-tree verification and makes
+no implicit fallback.
 
 | Project/toolchain state | Current result | Semantic completeness / release status |
 | --- | --- | --- |
-| Exact `1.93.1`, supported target, and complete confined crate graph | Static syntax graph plus HIR definitions, refined imports/re-exports, `type_uses`, and exact/candidate calls | `semantic-complete` only with `syntax-complete`, exact compatible HIR, confined metadata, `ready` / `emitted`, issue count `0`, and skipped / unsupported / unresolved all `0`; source/development runs use `release-gate-pending`, while a core-attested packaged worker uses `release-gate-verified` |
+| Exact `1.93.1`, supported target, complete confined crate graph, and core-attested bundled sysroot | Static syntax graph plus HIR definitions, refined imports/re-exports/`extern crate`, `type_uses`, exact/candidate calls, and exact `std` / `core` / `alloc` targets | `semantic-complete` only with `syntax-complete`, exact compatible HIR, confined metadata, attested sysroot, `ready` / `emitted`, issue count `0`, and skipped / unsupported / candidates / external / unresolved all `0`; source/development runs retain syntax/local HIR but never promote an unattested sysroot |
 | No project toolchain declaration | The neutral probe decides eligibility; an exact compatible pair may emit the import/type/call graph | Eligible only when every effective input is the verified baseline and the completeness conditions hold |
 | Older, newer, or nightly declaration | `RUST_TOOLCHAIN_BEST_EFFORT`; static syntax graph | Syntax fallback; never `semantic-complete` |
 | Custom or malformed declaration, unreadable file, or external symlink | Static syntax graph with `RUST_TOOLCHAIN_INVALID` and `RUST_HIR_TOOLCHAIN_UNSUPPORTED` | Fail-closed syntax fallback; never HIR-eligible |
@@ -236,7 +245,7 @@ makes no implicit fallback.
 | A built-in attribute has no attribute-specific shape/value/placement validator | `unsupported_attribute` site plus `RUST_ATTRIBUTE_UNSUPPORTED`; nested expression-shaped macro arguments are still inventoried | Conservative incomplete ledger; generic `Meta` parsing never proves compiler validity |
 | An unqualified bang macro or derive identity cannot be proven built-in/non-procedural | Generic `macro_expansion` or `proc_macro_expansion` unresolved site; nested expression-shaped `include!` / `env!` arguments are inventoried recursively | Conservative incomplete ledger; names are not trusted because local/imported macros can shadow built-ins |
 | `OUT_DIR` include, build script, or proc macro is required | Unresolved site plus `RUST_HIR_OUT_DIR_UNAVAILABLE`, `BUILD_SCRIPT_NOT_EXECUTED`, or `PROC_MACRO_NOT_EXECUTED` | Ledgered partial HIR only; never execute or read generated project output in safe mode |
-| External definition is unavailable | Classified external or unresolved site plus stable coverage evidence | External alone is allowed; unresolved blocks `semantic-complete` |
+| External definition is unavailable | Classified external or unresolved site plus stable coverage evidence | Analysis continues, but either classification blocks `semantic-complete` |
 | Typed HIR semantic-extractor failure | The node/site/edge/file-ledger delta is discarded atomically and the syntax graph is preserved with `RUST_HIR_BACKEND_FAILURE` | Strict-policy failure; never `semantic-complete` |
 | HIR panic, timeout, cancellation, or malformed result | Worker failure; it is not downgraded to syntax success | Other adapter results remain, but the scan is partial with exit `3` |
 | A release artifact/component is missing, changed, added to a checked tree, or symlinked; or the Rust backend manifest/handshake differs | The package verifier and core attestation reject the archive before analysis | `security_failed`, exit `4`, and no development/project/system backend or sysroot fallback |
@@ -246,9 +255,10 @@ It does not imply HIR resolution. The complete condition is the conjunction of
 `syntax-complete`, exact compatible HIR, `confined-cargo-metadata`, a `ready`
 project model, `import-type-call-graph-emitted`, semantic issue count `0`,
 `project_code_executed=false`, and zero skipped, unsupported, and unresolved
-counts. Candidate and external sites may remain. A source/development result is
-still `release-gate-pending` and deliberately not release-ready; only the same
-result from a core-attested packaged worker is `release-gate-verified`.
+counts, with an attested three-crate sysroot and zero candidate/external sites.
+A source/development result is still `release-gate-pending`, retains syntax and
+local HIR analysis, and deliberately does not claim `semantic-complete`; only a
+core-attested packaged worker receives `release-gate-verified`.
 
 ## Profile metadata
 
@@ -263,10 +273,16 @@ values are outcome-dependent; fallback paths retain the syntax-only values.
 | `rust_hir_status` | `import-type-call-graph-emitted`, `import-type-call-graph-partial`, `failed`, or `not-invoked` |
 | `rust_hir_scaffold` | `available` |
 | `rust_hir_project_model` | `ready` after deterministic construction; otherwise `not-invoked`, `unavailable`, or `unsupported` |
-| `rust_hir_enable_gate` | `release-gate-pending` after successful source/development emission; `release-gate-verified` only when the core has verified the packaged manifest, artifacts, components, and exact backend attestation; `semantic-backend-failure` on typed failure; otherwise `semantic-emission-pending`, `toolchain-unsupported`, `crate-graph-unavailable`, or `input-unsupported` |
+| `rust_hir_enable_gate` | `release-gate-pending` after successful source/development emission; `release-gate-verified` only when core has verified the packaged manifest, worker/backend unit, and bundled sysroot data tree; `semantic-backend-failure` on typed failure; otherwise `semantic-emission-pending`, `toolchain-unsupported`, `crate-graph-unavailable`, or `input-unsupported` |
 | `rust_hir_project_file_count` | Number of admitted inventory files in the safe VFS; `0` when no model is available |
 | `rust_hir_project_crate_count` | Number of workspace/path local crates in the safe graph; `0` when no model is available |
-| `rust_hir_project_external_count` | Number of external/sysroot sidecar entries; `0` when no model is available |
+| `rust_hir_project_external_count` | Number of external sidecar entries, including sysroot sentinels when no attested sysroot is admitted; `0` when none or no model is available |
+| `rust_hir_sysroot_status` | `attested` only after the verified handoff and pinned source-identity/inventory checks; otherwise `pending`, `unavailable`, or `not-invoked` |
+| `rust_hir_sysroot_file_count` | Number of bounded UTF-8 `.rs` files in the admitted `core` / `alloc` / `std` inventory |
+| `rust_hir_sysroot_crate_count` | `3` for the admitted `core` / `alloc` / `std` crate graph; otherwise `0` |
+| `rust_hir_sysroot_contract_version` | `rust-src-data-tree-v1` |
+| `rust_hir_sysroot_component_version` | `1.93.1+rustc.01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf` |
+| `rust_hir_sysroot_source_layout` | `rustup-rust-src-library-v1` |
 | `rust_hir_semantic_node_count` | Number of HIR nodes emitted by the current slice, including deterministic external/unresolved sentinels |
 | `rust_hir_semantic_relation_count` | Number of semantic structural and dependency edges emitted by the current slice |
 | `rust_hir_semantic_site_count` | Number of HIR-refined import/re-export, semantic type-use, and call sites |
@@ -296,11 +312,10 @@ values are outcome-dependent; fallback paths retain the syntax-only values.
 | `proc_macros_executed` | `false` |
 
 The profile records the selected rust-analyzer and Salsa versions, upstream
-revision, neutral toolchain probe, confined crate-graph source, and semantic
-graph status/counts. A future profile that claims exact standard-library
-resolution must additionally record its effective sysroot version. Backend and
-toolchain revisions that can change graph identity must participate in the
-profile or evidence identity.
+revision, neutral toolchain probe, confined crate-graph source, semantic graph
+status/counts, and the effective bundled-sysroot contract/component/layout.
+Backend, toolchain, and sysroot revisions that can change graph identity
+participate in profile or canonical semantic identity.
 
 The profile records only the stable confined-metadata policy and status. It
 never records the mirror root, mirror manifest path, temporary Cargo/Rustup
@@ -425,3 +440,14 @@ scan boundary:
    SBOM/license closure; and run Tier 1, Windows, and benchmark gates. Source
    builds remain `release-gate-pending`; only core-attested archives emit
    `release-gate-verified`.
+9. **Completed 2026-07-25 — package the Rust sysroot (Issue #146):** normalize
+   the exact Rust `1.93.1` `rust-src` library tree into a licensed/SBOM-recorded
+   data-tree compatibility unit, pin its source identity and complete-tree
+   digest, and reject missing, added, tampered, symlinked, or cross-target
+   inconsistent inputs before worker launch.
+10. **Completed 2026-07-25 — resolve the attested sysroot (Issue #147):** pass
+    only core-verified sysroot roots into the packaged worker, revalidate the
+    compatibility identity and bounded inventory, create separate
+    `core`/`alloc`/`std` library VFS and crate roots, emit exact
+    symbol/type/import/type-use/direct-call edges, and prove fallback plus
+    repeated packaged-scan/export determinism.

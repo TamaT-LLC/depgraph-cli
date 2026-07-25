@@ -291,7 +291,7 @@ fn rust_hir_backend_failure_cannot_claim_semantic_completeness() {
 }
 
 #[test]
-fn rust_semantic_completeness_accepts_resolved_candidate_and_external_sites() {
+fn rust_semantic_completeness_rejects_candidate_and_external_sites() {
     validate_ndjson(Cursor::new(values_to_ndjson(
         rust_semantic_complete_values(),
     )))
@@ -307,8 +307,11 @@ fn rust_semantic_completeness_accepts_resolved_candidate_and_external_sites() {
         candidate[coverage_index]["coverage"]["resolved"] = json!(0);
         candidate[coverage_index]["coverage"]["candidates"] = json!(1);
     }
-    validate_ndjson(Cursor::new(values_to_ndjson(candidate)))
-        .expect("candidate sites do not make an otherwise complete Rust profile incomplete");
+    let error = validate_ndjson(Cursor::new(values_to_ndjson(candidate))).unwrap_err();
+    assert!(
+        matches!(error, ProtocolError::Invariant(message) if message.contains("candidates")),
+        "Rust semantic completeness accepted candidate coverage"
+    );
 
     let mut external = rust_semantic_complete_values();
     external[3]["node"]["kind"] = json!("external_system");
@@ -321,8 +324,11 @@ fn rust_semantic_completeness_accepts_resolved_candidate_and_external_sites() {
         external[coverage_index]["coverage"]["resolved"] = json!(0);
         external[coverage_index]["coverage"]["external"] = json!(1);
     }
-    validate_ndjson(Cursor::new(values_to_ndjson(external)))
-        .expect("external sites do not make an otherwise complete Rust profile incomplete");
+    let error = validate_ndjson(Cursor::new(values_to_ndjson(external))).unwrap_err();
+    assert!(
+        matches!(error, ProtocolError::Invariant(message) if message.contains("external")),
+        "Rust semantic completeness accepted external coverage"
+    );
 }
 
 #[test]
@@ -359,6 +365,15 @@ fn rust_semantic_completeness_requires_zero_incomplete_coverage_counts() {
     unresolved[8]["coverage"]["unresolved"] = json!(1);
     let error = validate_ndjson(Cursor::new(values_to_ndjson(unresolved))).unwrap_err();
     assert!(matches!(error, ProtocolError::Invariant(message) if message.contains("unresolved")));
+
+    let mut reason = rust_semantic_complete_values();
+    for coverage_index in [8, 9] {
+        reason[coverage_index]["coverage"]["reasons"] = json!(["rust-hir-sysroot-unavailable"]);
+    }
+    let error = validate_ndjson(Cursor::new(values_to_ndjson(reason))).unwrap_err();
+    assert!(
+        matches!(error, ProtocolError::Invariant(message) if message.contains("coverage reasons"))
+    );
 }
 
 #[test]
@@ -369,6 +384,19 @@ fn rust_semantic_completeness_requires_exact_backend_properties() {
         ("rust_hir_backend", json!("disabled")),
         ("rust_hir_status", json!("import-type-call-graph-partial")),
         ("rust_hir_project_model", json!("unavailable")),
+        ("rust_hir_sysroot_status", json!("unavailable")),
+        ("rust_hir_sysroot_file_count", json!(0)),
+        ("rust_hir_sysroot_crate_count", json!(0)),
+        ("rust_hir_project_external_count", json!(1)),
+        (
+            "rust_hir_sysroot_contract_version",
+            json!("rust-src-data-tree-v0"),
+        ),
+        (
+            "rust_hir_sysroot_component_version",
+            json!("1.93.1+rustc.mismatch"),
+        ),
+        ("rust_hir_sysroot_source_layout", json!("unknown-layout")),
         (
             "rust_hir_enable_gate",
             json!("fallback-and-release-gates-pending"),
@@ -398,13 +426,19 @@ fn rust_semantic_completeness_requires_exact_backend_properties() {
 }
 
 #[test]
-fn rust_semantic_completeness_accepts_pending_and_verified_release_gates() {
-    for gate in ["release-gate-pending", "release-gate-verified"] {
-        let mut events = rust_semantic_complete_values();
-        events[1]["profile"]["properties"]["rust_hir_enable_gate"] = json!(gate);
-        validate_ndjson(Cursor::new(values_to_ndjson(events)))
-            .unwrap_or_else(|error| panic!("Rust semantic completeness rejected {gate}: {error}"));
-    }
+fn rust_semantic_completeness_requires_the_verified_release_gate() {
+    validate_ndjson(Cursor::new(values_to_ndjson(
+        rust_semantic_complete_values(),
+    )))
+    .expect("the verified Rust semantic completeness gate must be accepted");
+
+    let mut pending = rust_semantic_complete_values();
+    pending[1]["profile"]["properties"]["rust_hir_enable_gate"] = json!("release-gate-pending");
+    let error = validate_ndjson(Cursor::new(values_to_ndjson(pending))).unwrap_err();
+    assert!(
+        matches!(error, ProtocolError::Invariant(message) if message.contains("rust_hir_enable_gate")),
+        "Rust semantic completeness accepted a development release gate"
+    );
 }
 
 #[test]
@@ -1017,7 +1051,14 @@ fn rust_semantic_complete_values() -> Vec<Value> {
         "rust_hir_backend": "rust-analyzer-hir",
         "rust_hir_status": "import-type-call-graph-emitted",
         "rust_hir_project_model": "ready",
-        "rust_hir_enable_gate": "release-gate-pending",
+        "rust_hir_enable_gate": "release-gate-verified",
+        "rust_hir_sysroot_status": "attested",
+        "rust_hir_sysroot_file_count": 3,
+        "rust_hir_sysroot_crate_count": 3,
+        "rust_hir_project_external_count": 0,
+        "rust_hir_sysroot_contract_version": "rust-src-data-tree-v1",
+        "rust_hir_sysroot_component_version": "1.93.1+rustc.01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf",
+        "rust_hir_sysroot_source_layout": "rustup-rust-src-library-v1",
         "crate_graph_source": "confined-cargo-metadata",
         "cargo_metadata_input": "confined-mirror",
         "rust_toolchain_probe_status": "compatible",

@@ -4,7 +4,9 @@ use depgraph_protocol::{
 };
 use depgraph_rust_worker::{
     ADAPTER_VERSION, RUST_ANALYZER_CRATE_VERSION, RUST_ANALYZER_REVISION,
-    RUST_ANALYZER_SALSA_VERSION, build_events, scan,
+    RUST_ANALYZER_SALSA_VERSION, RUST_SYSROOT_COMPONENT_VERSION, RUST_SYSROOT_CONTRACT_VERSION,
+    RUST_SYSROOT_LICENSE_EXPRESSION, RUST_SYSROOT_SOURCE_LAYOUT, RUST_TOOLCHAIN_BASELINE,
+    RUSTC_BASELINE_COMMIT, build_events, scan,
 };
 use std::{
     collections::BTreeSet,
@@ -2923,10 +2925,37 @@ fn release_gate_environment_requires_the_exact_verified_value() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("release-gate");
     write_minimal_crate(&root, "release-gate", "pub struct Thing;\n");
+    let sysroot = temp.path().join("rust-sysroot");
+    fs::create_dir(&sysroot).unwrap();
+    fs::write(
+        sysroot.join("SOURCE.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "contract_version": RUST_SYSROOT_CONTRACT_VERSION,
+            "toolchain_version": RUST_TOOLCHAIN_BASELINE,
+            "toolchain_commit": RUSTC_BASELINE_COMMIT,
+            "component_version": RUST_SYSROOT_COMPONENT_VERSION,
+            "source_layout": RUST_SYSROOT_SOURCE_LAYOUT,
+            "acquisition": "rustup-component:rust-src",
+            "normalized_root": "library",
+            "license_expression": RUST_SYSROOT_LICENSE_EXPRESSION,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    for crate_name in ["core", "alloc", "std"] {
+        let source = sysroot.join("library").join(crate_name).join("src");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("lib.rs"), format!("pub struct {crate_name};\n")).unwrap();
+    }
 
-    for (value, expected) in [
-        ("release-gate-verified", "release-gate-verified"),
-        ("verified", "release-gate-pending"),
+    for (value, expected_gate, expected_sysroot, semantic_complete) in [
+        (
+            "release-gate-verified",
+            "release-gate-verified",
+            "attested",
+            true,
+        ),
+        ("verified", "release-gate-pending", "unavailable", false),
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_depgraph-rust-worker"))
             .arg("--root")
@@ -2935,6 +2964,7 @@ fn release_gate_environment_requires_the_exact_verified_value() {
             .arg(format!("release-gate-{value}"))
             .env_remove("DEPGRAPH_PROFILE_CONFIG")
             .env("DEPGRAPH_RUST_RELEASE_GATE", value)
+            .env("DEPGRAPH_RUST_SYSROOT_ROOT", &sysroot)
             .output()
             .unwrap();
         assert!(
@@ -2944,7 +2974,11 @@ fn release_gate_environment_requires_the_exact_verified_value() {
         );
         let validated = validate_safe_semantic_ndjson(Cursor::new(output.stdout)).unwrap();
         let profile = validated.profiles.values().next().unwrap();
-        assert_eq!(profile.properties["rust_hir_enable_gate"], expected);
+        assert_eq!(profile.properties["rust_hir_enable_gate"], expected_gate);
+        assert_eq!(
+            profile.properties["rust_hir_sysroot_status"],
+            expected_sysroot
+        );
         assert_eq!(
             profile.properties["rust_analyzer_version"],
             RUST_ANALYZER_CRATE_VERSION
@@ -2957,7 +2991,7 @@ fn release_gate_environment_requires_the_exact_verified_value() {
             profile.properties["rust_analyzer_salsa_version"],
             RUST_ANALYZER_SALSA_VERSION
         );
-        assert!(
+        assert_eq!(
             validated
                 .events
                 .iter()
@@ -2967,7 +3001,8 @@ fn release_gate_environment_requires_the_exact_verified_value() {
                 })
                 .is_some_and(|coverage| coverage
                     .completeness
-                    .contains(&CompletenessLevel::SemanticComplete))
+                    .contains(&CompletenessLevel::SemanticComplete)),
+            semantic_complete
         );
     }
 }
