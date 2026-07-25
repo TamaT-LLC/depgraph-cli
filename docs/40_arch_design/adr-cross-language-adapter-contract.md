@@ -144,7 +144,7 @@ The common resolution matrix is:
 
 | Status | Target and precision | Requirement |
 | --- | --- | --- |
-| `resolved` | one concrete target, `exact` or `heuristic` | `exact` requires format-aware proof; an explicit but non-verifiable manual declaration is `heuristic` |
+| `resolved` | one concrete target, `exact`, `heuristic`, or `observed` | `exact` requires format-aware static proof; `observed` is allowed only for `phase=build|runtime`; an explicit but non-verifiable manual declaration is `heuristic` |
 | `candidates` | one or more concrete targets, `overapprox` | finite, complete-under-the-declared-algorithm set |
 | `external` | one `external_system`, `exact` or `heuristic` | canonical external locator is known; no remote content was implied to be scanned |
 | `unresolved` | one `unknown_target`, `heuristic` | bounded non-empty reason; never omit the occurrence |
@@ -173,9 +173,11 @@ A concrete cross-language `calls_operation`, `implemented_by`,
    target under the same profile;
 4. a runtime observation uniquely correlated to an already-declared operation.
 
-Items 1-3 may support a static `exact` edge after the adapter validates the
-complete proof. Item 4 always remains `phase=runtime`,
-`precision=observed`; it never satisfies or promotes a static exact mapping.
+Items 1-2 may support a static `exact` edge after the adapter validates the
+complete proof. Item 3 emits `phase=build`, `precision=observed`; item 4 emits
+`phase=runtime`, `precision=observed`. Observed evidence may support a separate
+static mapping only when item 1 or 2 independently proves that mapping; it
+never satisfies or promotes a static exact mapping by itself.
 
 Checked-in generated-code comments, naming conventions, adjacent files,
 `operationId`, GraphQL resolver property names, Protobuf language method names,

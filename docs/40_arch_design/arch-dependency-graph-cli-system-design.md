@@ -522,9 +522,11 @@ demangled symbol、HTTP route label、content digestはalias/evidenceでありno
 しない。
 
 cross-language siteはtargetを確定できなくても必ず`resolved`、`candidates`、
-`external`、`unresolved`へ分類する。`exact` mappingにはdescriptor / generator
-manifest、source map、compiler/framework/linker build evidenceのいずれかを必要とし、
-runtime correlationは`phase=runtime` / `precision=observed`のまま保持する。
+`external`、`unresolved`へ分類する。static `exact` mappingにはdescriptor /
+generator manifestまたはsource mapを必要とする。compiler/framework/linker
+evidenceは`phase=build` / `precision=observed`、runtime correlationは
+`phase=runtime` / `precision=observed`のまま保持し、独立したstatic proofなしに
+exactへ昇格しない。
 checked-in generated comment、同名、URL/path文字列、operationIdだけのmappingは
 exactの根拠にしない。
 
@@ -1553,10 +1555,11 @@ schema、commit、全必須metric、conservation、総合passを再検証して�
 **採用。** OpenAPI、Protocol Buffers、GraphQL、HTTP runtime correlation、
 FFIを`cross-language-contract-v1`の共通identity / site / edge / evidence /
 profile / completeness規約へ投影し、format parserと意味境界は各adapterに保持する。
-同名・URL/path文字列・生成コメントだけのmappingをexactとせず、descriptor /
-generator manifest、source map、compiler/framework/linker build evidence、
-または既存operationへの一意なruntime correlationを要求する。safe scanではremote
-reference/introspection、network、generator/plugin、native loadを禁止する。共通
+同名・URL/path文字列・生成コメントだけのmappingをexactとせず、static exactには
+descriptor / generator manifestまたはsource mapを要求する。
+compiler/framework/linker build evidenceと既存operationへの一意なruntime
+correlationはそれぞれbuild/runtimeの`observed` relationとして保持する。safe
+scanではremote reference/introspection、network、generator/plugin、native loadを禁止する。共通
 validatorの後、OpenAPI → Protobuf → GraphQL → HTTP trace → FFIの順で導入し、
 11個の1〜3日sliceとsecurity/release gateを
 [`PROJ-ARC-001-ADR-003`](adr-cross-language-adapter-contract.md)に定める。
