@@ -497,6 +497,8 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
     let default_profile_adr = fs::read_to_string(
         root.join("docs/40_arch_design/adr-default-profile-selection-budget.md"),
     )?;
+    let graph_query_adr =
+        fs::read_to_string(root.join("docs/40_arch_design/adr-bounded-graph-query-language.md"))?;
     for required in [
         "Rust 1.93.1, Go 1.26.1, Node.js 24.18.0, and pnpm 10.33.0",
         "TypeScript/JavaScript symbol/type/import/re-export/type-use",
@@ -535,6 +537,9 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "`PROJ-ARC-001-ADR-004`",
         "`default-profile-selection-v1`",
         "Issue #151として`default-profile-selection-v1`",
+        "`PROJ-ARC-001-ADR-005`",
+        "`bounded-graph-query-v1`",
+        "Issue #152として`bounded-graph-query-v1`",
     ] {
         if !design.contains(required) {
             bail!("system design release metadata is missing {required:?}");
@@ -547,6 +552,8 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "2026-07-25: `PROJ-ARC-001-ADR-003` を追加",
         "| PROJ-ARC-001-ADR-004 | PROJ-ARC-001 | [Default profile selection and exploration budget](../40_arch_design/adr-default-profile-selection-budget.md) | Accepted |",
         "2026-07-25: `PROJ-ARC-001-ADR-004` を追加",
+        "| PROJ-ARC-001-ADR-005 | PROJ-ARC-001 | [Bounded read-only graph query language](../40_arch_design/adr-bounded-graph-query-language.md) | Accepted |",
+        "2026-07-25: `PROJ-ARC-001-ADR-005` を追加",
     ] {
         if !docs_index.contains(required) {
             bail!("documentation index is missing Rust compiler ADR metadata {required:?}");
@@ -634,6 +641,43 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
             bail!("default profile ADR is missing required contract {required:?}");
         }
     }
+    for required in [
+        "- Status: Accepted",
+        "- Decision ID: `PROJ-ARC-001-ADR-005`",
+        "- Contract: `bounded-graph-query-v1`",
+        "Existing dedicated commands remain stable and preferred.",
+        "## Scope boundary",
+        "## Query input and CLI",
+        "depgraph query --query QUERY --explain [--json]",
+        "## MVP grammar",
+        "The parser accepts exactly one statement.",
+        "## Type system",
+        "`EVIDENCE(p)` contains canonical evidence owned by those edges",
+        "## Traversal semantics",
+        "emits at most one path for a `(source_id, target_id)` pair.",
+        "satisfied_existential_predicate_bitset",
+        "predicate bits or used-edge sets remain distinct",
+        "## Planner and cost model",
+        "1 * admitted source-node tests",
+        "| Query bytes / tokens / AST nodes | `64 KiB` / `4,096` / `512` |",
+        "| Minimum/maximum path depth | `1` / `8` |",
+        "| Deterministic cost units | `1,000,000` |",
+        "## Explain contract",
+        "`query_plan_budget_exceeded`",
+        "There is no partial-success mode in v1.",
+        "## Security boundary",
+        "## Staged implementation",
+        "| 1 | Lexer/parser, bounded input reader, canonical AST, and malformed corpus | 2-3 days |",
+        "| 3 | Snapshot cardinality statistics, fixed operator planner, cost admission, and explain schema | 2-3 days |",
+        "| 4 | Canonical forward/reverse BFS executor, site/evidence filters, staging, and cancellation | 2-3 days |",
+        "| 6 | Fuzz/property tests, hostile large-graph benchmark, and five-target package/release gate | 2-3 days |",
+        "## Acceptance matrix",
+        "| Plan above node/edge/evidence/cost cap despite `LIMIT 1` |",
+    ] {
+        if !graph_query_adr.contains(required) {
+            bail!("bounded graph query ADR is missing required contract {required:?}");
+        }
+    }
     let git_attributes = fs::read_to_string(root.join(".gitattributes"))?;
     for (path, expected) in PROJECT_LICENSES {
         let required_attribute = format!("{path} text eol=lf");
@@ -669,6 +713,7 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "docs/40_arch_design/adr-rust-compiler-precise-backend.md",
         "docs/40_arch_design/adr-cross-language-adapter-contract.md",
         "docs/40_arch_design/adr-default-profile-selection-budget.md",
+        "docs/40_arch_design/adr-bounded-graph-query-language.md",
         "docs/releases/v0.4.0.md",
         "docs/releases/v0.4.0-rc.1.md",
         "docs/releases/v0.2.0-rc.1.md",

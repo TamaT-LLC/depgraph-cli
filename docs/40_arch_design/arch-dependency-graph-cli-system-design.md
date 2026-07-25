@@ -1343,7 +1343,38 @@ external dependency と明示された候補 edge は、それだけでは stric
 
 ## 17. Query と Policy
 
-MVP では専用 subcommand を優先し、独自 query language は導入しない。
+現行MVPでは専用subcommandを優先し、独自query languageはまだ実装しない。
+将来のcompositional escape hatchとして`bounded-graph-query-v1`を採用するが、
+`deps / dependents / why / impact / cycles / unresolved / diff / policy`を置換しない。
+
+future `query`は既存global `--store` / `--scan-id`で選ぶ単一completed snapshotを
+read-onlyで開き、source node・canonical path・target nodeからなるlinear pattern
+を1件だけ受ける。direction、edge kind集合、明示depth `1..=8`、Node / Edge /
+Site / Evidenceのclosed typed field、profile / phase / canonical condition /
+evidence filter、projection、必須`LIMIT <= 10,000`に限定する。複数MATCH、join、
+subquery、UNION、aggregation、arbitrary property、regex/glob、user function、
+mutation、任意再帰、cross-snapshot query、all-path enumerationはv1に含めない。
+
+各source / target pairはbounded BFSでcanonical shortest eligible pathを1件だけ
+返し、同長pathはedge ID列、node ID列のbyte順で決める。parser → closed type
+checker → deterministic operator planner / cost admission → staged executorの順に通し、
+path依存の`SOME site/evidence`を落とさないようpartial stateはsource / current
+node / depthにexistential predicate充足bitsetとused edge setを加え、同一tuple
+だけを辞書順でdominanceする。plannerはこのproduct state上限もcostへ含める。
+`64 KiB / 4,096 token / 512 AST node`、source `10,000`、traversal state
+`50,000`、edge test `200,000`、site/evidence test `100,000 / 200,000`、cost
+`1,000,000`、output `16 MiB`、memory `128 MiB`、deadline `5 s`をhard capとする。
+`LIMIT`はworkを安く見せない。
+
+`--explain`は文字列literalをlength / digestへredactしたtyped AST shape、
+snapshot / cardinality / operator / worst-case cost / admission reasonを実行せず
+表示し、executeと同じplan digestを使う。syntax/typeは
+exit `2`、planまたはruntime budget exhaustionはexit `1`でrowを全破棄し、
+store/integrity/internal failureはexit `3`、unsafe query inputはexit `4`とする。
+query fileはbounded UTF-8 regular fileだけを受け、raw literal / query line /
+absolute pathをerrorへechoしない。規範的grammar、type、cost、security、
+failure、parser / planner / executorを分離した6個の後続sliceは
+[`PROJ-ARC-001-ADR-005`](adr-bounded-graph-query-language.md)に定める。
 
 後続で次を検討する。
 
@@ -1613,6 +1644,22 @@ planner実装まで従来contractを維持する。input identity、repository c
 ranking、CLI/failure semantics、8段階の1〜3日計画は
 [`PROJ-ARC-001-ADR-004`](adr-default-profile-selection-budget.md)に定める。
 
+### ADR-013: Bounded Read-only Graph Query Language
+
+**採用。** `bounded-graph-query-v1`は単一completed snapshot上のlinear pattern
+1件だけを扱い、Node / Path / Edge / Site / Evidenceのclosed fieldとprofile /
+phase / condition / evidence filterをparse・type-checkした後、deterministic cost
+planがhard cap内の場合だけread-only executorへ渡す。depthは`1..=8`、結果は
+endpoint pairごとのcanonical shortest witness 1件であり、全path列挙、join、
+subquery、mutation、任意再帰、regex、arbitrary propertyを禁止する。path依存
+predicateの探索stateは充足bitset / used edge setを含み、同一stateだけをdominance
+する。plan/
+runtime cap超過はpartial rowを破棄してexit `1`、`--explain`とexecuteは同一plan
+digestを使う。既存専用commandを優先し続け、parser / planner / executor /
+CLI/security-release gateは
+[`PROJ-ARC-001-ADR-005`](adr-bounded-graph-query-language.md)の6個の1〜3日sliceへ
+分離する。
+
 ## 21. Roadmap
 
 ### Milestone 0: Schema and Contract
@@ -1663,6 +1710,13 @@ ranking、CLI/failure semantics、8段階の1〜3日計画は
   canonical plan DTO、規模分類、Rust / Go / Web単一軸候補、greedy selection、
   coverage / doctor / CLI explicit override、cache/release gateを
   [`PROJ-ARC-001-ADR-004`](adr-default-profile-selection-budget.md)の8個の
+  1〜3日sliceへ分離する
+- bounded graph query language:
+  `bounded-graph-query-v1`として採用決定済み（Issue #152、2026-07-25）。
+  専用commandを維持したまま、lexer/parser、closed type checker、snapshot
+  cardinality / cost planner / explain、canonical shortest-path executor、CLI、
+  fuzz / hostile benchmark / five-target release gateを
+  [`PROJ-ARC-001-ADR-005`](adr-bounded-graph-query-language.md)の6個の
   1〜3日sliceへ分離する
 
 ### Milestone 3: Build Evidence
@@ -1715,7 +1769,6 @@ ranking、CLI/failure semantics、8段階の1〜3日計画は
 
 - binary / product の最終名称を `depgraph` とするか
 - public OSS とするか、初期は private 検証とするか
-- graph query language を導入する時期
 
 ## 24. 参考資料
 
@@ -1736,6 +1789,10 @@ ranking、CLI/failure semantics、8段階の1〜3日計画は
 - Protocol Buffers descriptor schema: https://github.com/protocolbuffers/protobuf/blob/main/src/google/protobuf/descriptor.proto
 - Rustonomicon FFI: https://doc.rust-lang.org/nomicon/ffi.html
 - OpenTelemetry HTTP semantic conventions: https://opentelemetry.io/docs/specs/semconv/http/
+- openCypher specification and grammar: https://opencypher.org/resources/
+- Neo4j Cypher graph patterns: https://neo4j.com/docs/cypher-manual/current/patterns/
+- CodeQL recursion: https://codeql.github.com/docs/ql-language-reference/recursion/
+- SQLite progress handler: https://www.sqlite.org/c3ref/progress_handler.html
 
 ## 25. 関連ドキュメント
 
@@ -1743,9 +1800,11 @@ ranking、CLI/failure semantics、8段階の1〜3日計画は
 - [`PROJ-ARC-001-ADR-002`: Opt-in Rust compiler-precise backend](adr-rust-compiler-precise-backend.md)
 - [`PROJ-ARC-001-ADR-003`: Cross-language adapter common contract](adr-cross-language-adapter-contract.md)
 - [`PROJ-ARC-001-ADR-004`: Default profile selection and exploration budget](adr-default-profile-selection-budget.md)
+- [`PROJ-ARC-001-ADR-005`: Bounded read-only graph query language](adr-bounded-graph-query-language.md)
 
 ## 26. 更新履歴
 
+- 2026-07-25: Issue #152として`bounded-graph-query-v1`を採用。既存専用commandを優先したまま、単一completed snapshot、単一linear pattern、明示depth `1..=8`、closed Node / Path / Edge / Site / Evidence type、profile / phase / canonical condition / evidence filter、必須limitへscopeを限定した。endpoint pairごとのcanonical shortest witnessだけを返し、path依存predicateのpartial stateにはexistential充足bitset / used edge setを含めて同一stateだけをdominanceする。複数MATCH、join、subquery、aggregation、mutation、任意再帰、regex、arbitrary property、all-path列挙を除外した。bounded query reader、parse/type、snapshot cardinality、fixed operator / deterministic cost admission、explain、staged all-or-error executor、read-only store、non-echoing diagnosticとresource/security capを定義し、parser / planner / executor / CLI / five-target release gateを6個の1〜3日後続sliceへ分離した。
 - 2026-07-25: Issue #151として`default-profile-selection-v1`を確定。safe inventory / compatibility / attested host / tracked config / planner limitをcanonical inputとし、Rust / Go / Web baselineを優先した後、static evidence付き単一軸candidateだけをgreedy rankingする。repository classはrelevant source / build unitの両閾値でtiny / small / medium / largeへ分類し、default total capを`16 / 10 / 6 / 4`、selection hard capを`32`、candidate discoveryを言語ごと`256`・全体`512`へ固定した。target × feature × mode × environmentの直積、all-features、cgo/VTA、build/runtime profileをauto selectionから除外し、budget omission / overflow / policy exclusionをcoverage / doctor / planへ固定reason付きで残す。将来`profiles plan` / `--profile-budget`とstrict versioned `--profiles-file`、all-or-error explicit semantics、8段階の1〜3日実装計画、polyglot / size-boundary / checkout determinism acceptance matrixをADRへ定めた。
 - 2026-07-25: Issue #150として`cross-language-contract-v1`の共通identity / dependency site / edge / evidence / profile / completeness規約とformat別capability boundaryを確定。`service` / `schema` / `operation` / `message` / `native_symbol`、contract relation、generated code / repository mappingのproof hierarchy、external / unresolvedとprofile condition規則を定義し、同名・URL/path・生成コメントだけのexact mappingを禁止した。safe scanではremote ref/introspection、network、generator/plugin、native loadを禁止し、OpenAPI → Protobuf → GraphQL → HTTP runtime correlation → FFIの優先順位、11個の1〜3日slice、hostile / provenance / determinism / five-target security-release gateをADRへ固定した。
 - 2026-07-25: Issue #149として`compiler-precise-rust-v1`の脅威モデルとADRを確定。最初のcompatibility unitを`nightly-2026-07-17` / Rust・Cargo `1.99.0-nightly` / rustc commit `3d50c25bc66853bf0ad205529d0f305a1d841b5e`へ固定し、通常archiveとは別のclosed-tree compiler pack、Cargo unit graph v1、全unit用attested `RUSTC_WRAPPER`、`rustc_public`優先・最小`rustc_private` bridgeを採用する。明示的な`--build` / `--allow-project-code` / 将来`--rust-compiler-precise`の三重gate、project code / wrapper / config / artifactのuntrusted境界、pre/postflight toolchain attestation、typed MIR / monomorphized itemのbuild-phase observed evidence、attempt全破棄と直前snapshot維持を定義した。rolling / system / project toolchain、rustup download、coreへのcompiler library load、既存artifact parse、別toolchain fallbackを棄却し、security review条件と8段階の1〜3日実装計画、hostile / rollback / 5 target acceptance matrixをADRへ固定した。
