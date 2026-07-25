@@ -42,6 +42,7 @@ pub const TANSTACK_ROUTER_BUILD_OBSERVER: &str = "tanstack-router-vite-build-obs
 pub const TANSTACK_START_BUILD_OBSERVER: &str = "tanstack-start-vite-build-observer";
 pub const NEXT_BUILD_OBSERVER_VERSION: &str = "0.2.0";
 pub const ASTRO_BUILD_OBSERVER_VERSION: &str = "0.2.0";
+pub const TANSTACK_START_BUILD_OBSERVER_VERSION: &str = "0.2.0";
 pub const WEB_BUILD_OBSERVER_VERSION: &str = "0.1.0";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -77,7 +78,7 @@ impl WebBuildAdapter {
             Self::Next => NEXT_BUILD_OBSERVER_VERSION,
             Self::Astro => ASTRO_BUILD_OBSERVER_VERSION,
             Self::TanstackRouter => WEB_BUILD_OBSERVER_VERSION,
-            Self::TanstackStart => WEB_BUILD_OBSERVER_VERSION,
+            Self::TanstackStart => TANSTACK_START_BUILD_OBSERVER_VERSION,
         }
     }
 
@@ -104,7 +105,7 @@ impl WebBuildAdapter {
             Self::Next => "next-build-observation-v2",
             Self::Astro => "astro-build-observation-v2",
             Self::TanstackRouter => "tanstack-router-build-observation-v1",
-            Self::TanstackStart => "tanstack-start-build-observation-v1",
+            Self::TanstackStart => "tanstack-start-build-observation-v2",
         }
     }
 }
@@ -1160,7 +1161,11 @@ mod tests {
         );
         assert_eq!(
             WebBuildAdapter::TanstackStart.observer_version(),
-            WEB_BUILD_OBSERVER_VERSION
+            TANSTACK_START_BUILD_OBSERVER_VERSION
+        );
+        assert_eq!(
+            WebBuildAdapter::TanstackStart.observation_schema(),
+            "tanstack-start-build-observation-v2"
         );
         assert_eq!(
             WebBuildAdapter::TanstackRouter.observer_version(),

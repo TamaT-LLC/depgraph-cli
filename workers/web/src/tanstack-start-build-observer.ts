@@ -11,6 +11,7 @@ import {
   frameworkBuildGeneratedNode,
   frameworkBuildProtocolEvents,
   frameworkBuildRelation,
+  frameworkBuildUnresolvedTarget,
   reconcileFrameworkBuildBaseRecords,
   validateFrameworkBuildDelta,
   validateFrameworkBuildProvenance,
@@ -29,9 +30,9 @@ import {
 } from "./types";
 
 export const TANSTACK_START_BUILD_OBSERVER = "tanstack-start-vite-build-observer" as const;
-export const TANSTACK_START_BUILD_OBSERVER_VERSION = "0.1.0" as const;
-export const TANSTACK_START_BUILD_CAPABILITY = "tanstack-start-v1-vite-v7-server-fn-resolver-v1" as const;
-export const TANSTACK_START_BUILD_SCHEMA = "tanstack-start-build-observation-v1" as const;
+export const TANSTACK_START_BUILD_OBSERVER_VERSION = "0.2.0" as const;
+export const TANSTACK_START_BUILD_CAPABILITY = "tanstack-start-v1-vite-v7-production-rpc-manifest-v2" as const;
+export const TANSTACK_START_BUILD_SCHEMA = "tanstack-start-build-observation-v2" as const;
 export const TANSTACK_START_FRAMEWORK_BUILD_DESCRIPTOR: FrameworkBuildDescriptor = Object.freeze({
   framework: "tanstack-start",
   observer: TANSTACK_START_BUILD_OBSERVER,
@@ -138,6 +139,7 @@ export interface TanStackObservedServerFunction {
   export_name: string;
   provider_module_id: string;
   collision_suffix: number | null;
+  collision_suffix_status: "not-separately-observed";
   client_referenced: boolean;
   ssr_referenced: boolean;
 }
@@ -149,6 +151,21 @@ export interface TanStackObservedStub {
   environment: "client" | "ssr";
 }
 
+export interface TanStackObservedRpcManifestEntry {
+  production_rpc_id: string;
+  handler_export_name: string;
+  provider_module_id: string;
+  client_referenced: boolean | null;
+}
+
+export interface TanStackObservedRpcManifest {
+  resolver_module_id: string;
+  resolver_environment: string;
+  entry_count: number;
+  entries_digest: string;
+  entries: TanStackObservedRpcManifestEntry[];
+}
+
 export interface TanStackStartBuildObservation {
   schema_version: typeof TANSTACK_START_BUILD_SCHEMA;
   observer: typeof TANSTACK_START_BUILD_OBSERVER;
@@ -157,6 +174,7 @@ export interface TanStackStartBuildObservation {
   start_version: string;
   provider_environment_name: string;
   resolver_virtual_module_observed: boolean;
+  production_rpc_manifest: TanStackObservedRpcManifest;
   builds: TanStackObservedBuild[];
   server_functions: TanStackObservedServerFunction[];
   stubs: TanStackObservedStub[];
@@ -173,6 +191,8 @@ export interface TanStackStartBuildGraphInput {
 export interface TanStackStartBuildGraphDelta {
   startVersion: string;
   viteVersions: string[];
+  productionRpcManifestEntryCount: number;
+  productionRpcManifestDigest: string;
   nodes: GraphNode[];
   sites: DependencySite[];
   edges: GraphEdge[];
@@ -379,24 +399,73 @@ function stringArray(value: unknown, sanitizer: (value: unknown) => string, code
   return [...new Set(value.map(sanitizer))].sort(compareUtf8);
 }
 
-function jsonString(raw: string): string {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
+function jsString(raw: string): string {
+  const quote = raw[0];
+  if ((quote !== '"' && quote !== "'") || raw.at(-1) !== quote) {
     fail("web.tanstack_start_build_rpc_metadata_invalid");
   }
-  const value = boundedString(parsed, MAX_RPC_ID);
-  if (value === null) fail("web.tanstack_start_build_rpc_metadata_invalid");
-  return value;
+  if (quote === '"') {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      fail("web.tanstack_start_build_rpc_metadata_invalid");
+    }
+    const value = boundedString(parsed, MAX_RPC_ID);
+    if (value === null) fail("web.tanstack_start_build_rpc_metadata_invalid");
+    return value;
+  }
+  let value = "";
+  for (let index = 1; index < raw.length - 1; index += 1) {
+    const character = raw[index]!;
+    if (character !== "\\") {
+      value += character;
+      continue;
+    }
+    const escaped = raw[++index];
+    if (escaped === undefined) fail("web.tanstack_start_build_rpc_metadata_invalid");
+    const simple = new Map([
+      ["'", "'"], ['"', '"'], ["\\", "\\"], ["b", "\b"], ["f", "\f"],
+      ["n", "\n"], ["r", "\r"], ["t", "\t"], ["v", "\v"], ["0", "\0"],
+    ]).get(escaped);
+    if (simple !== undefined) {
+      value += simple;
+      continue;
+    }
+    const width = escaped === "x" ? 2 : escaped === "u" ? 4 : 0;
+    const digits = width === 0 ? "" : raw.slice(index + 1, index + 1 + width);
+    if (width === 0 || !new RegExp(`^[a-f0-9]{${width}}$`, "iu").test(digits)) {
+      fail("web.tanstack_start_build_rpc_metadata_invalid");
+    }
+    value += String.fromCharCode(Number.parseInt(digits, 16));
+    index += width;
+  }
+  const bounded = boundedString(value, MAX_RPC_ID);
+  if (bounded === null) fail("web.tanstack_start_build_rpc_metadata_invalid");
+  return bounded;
 }
 
-const JSON_STRING_PATTERN = '"(?:\\\\.|[^"\\\\])*"';
+const JS_STRING_PATTERN = `(?:"(?:\\\\.|[^"\\\\])*"|'(?:\\\\.|[^'\\\\])*')`;
+
+function requiresRuntimeImport(
+  code: string,
+  symbol: "createClientRpc" | "createSsrRpc" | "createServerRpc",
+  runtime: "client-rpc" | "ssr-rpc" | "server-rpc",
+): void {
+  const expression = new RegExp(
+    `\\bimport\\s*\\{[^}]*\\b${symbol}\\b[^}]*\\}\\s*from\\s*["']@tanstack/(?:react|solid|vue)-start/${runtime}["']`,
+    "u",
+  );
+  if (!expression.test(code)) fail("web.tanstack_start_build_rpc_runtime_import_missing");
+}
 
 function callStrings(code: string, functionName: "createClientRpc" | "createSsrRpc"): string[] {
-  const expression = new RegExp(`\\b${functionName}\\s*\\(\\s*(${JSON_STRING_PATTERN})`, "gu");
+  const expression = new RegExp(`\\b${functionName}\\s*\\(\\s*(${JS_STRING_PATTERN})`, "gu");
   const values: string[] = [];
-  for (const match of code.matchAll(expression)) values.push(jsonString(match[1]!));
+  for (const match of code.matchAll(expression)) values.push(jsString(match[1]!));
+  if (values.length > 0) {
+    requiresRuntimeImport(code, functionName, functionName === "createClientRpc" ? "client-rpc" : "ssr-rpc");
+  }
   return [...new Set(values)].sort(compareUtf8);
 }
 
@@ -408,22 +477,47 @@ interface ProviderCall {
 
 function providerCalls(code: string): ProviderCall[] {
   const expression = new RegExp(
-    `\\bcreateServerRpc\\s*\\(\\s*\\{\\s*(?:["']?id["']?)\\s*:\\s*(${JSON_STRING_PATTERN})\\s*,\\s*(?:["']?name["']?)\\s*:\\s*(${JSON_STRING_PATTERN})\\s*,\\s*(?:["']?filename["']?)\\s*:\\s*(${JSON_STRING_PATTERN})`,
+    `\\bcreateServerRpc\\s*\\(\\s*\\{\\s*(?:["']?id["']?)\\s*:\\s*(${JS_STRING_PATTERN})\\s*,\\s*(?:["']?name["']?)\\s*:\\s*(${JS_STRING_PATTERN})\\s*,\\s*(?:["']?filename["']?)\\s*:\\s*(${JS_STRING_PATTERN})`,
     "gu",
   );
   const calls = [...code.matchAll(expression)].map((match) => ({
-    id: jsonString(match[1]!),
-    name: jsonString(match[2]!),
-    filename: jsonString(match[3]!),
+    id: jsString(match[1]!),
+    name: jsString(match[2]!),
+    filename: jsString(match[3]!),
   }));
+  if (calls.length > 0) requiresRuntimeImport(code, "createServerRpc", "server-rpc");
   return calls.sort((left, right) => compareUtf8(left.id, right.id));
 }
 
-function collisionSuffix(id: string): number | null {
-  const match = /_(\d+)$/u.exec(id);
-  if (match === null) return null;
-  const value = Number(match[1]);
-  return Number.isSafeInteger(value) && value > 0 ? value : null;
+function resolverManifestEntries(
+  code: string,
+  state: MutableState,
+  viteEnvironment: string,
+): TanStackObservedRpcManifestEntry[] {
+  const expression = new RegExp(
+    `(${JS_STRING_PATTERN})\\s*:\\s*\\{\\s*functionName\\s*:\\s*(${JS_STRING_PATTERN})\\s*,\\s*`
+      + `importer\\s*:\\s*\\(\\s*\\)\\s*=>\\s*import\\(\\s*(${JS_STRING_PATTERN})\\s*\\)`
+      + `(?:\\s*,\\s*isClientReferenced\\s*:\\s*(true|false))?\\s*\\}`,
+    "gu",
+  );
+  const entries = [...code.matchAll(expression)].map((match) => ({
+    production_rpc_id: jsString(match[1]!),
+    handler_export_name: jsString(match[2]!),
+    provider_module_id: logicalModule(
+      jsString(match[3]!),
+      state.repoRoot,
+      viteEnvironment,
+      state.capability.provider_environment_name,
+    ).module_id,
+    client_referenced: match[4] === undefined ? null : match[4] === "true",
+  })).sort((left, right) => compareUtf8(left.production_rpc_id, right.production_rpc_id));
+  const declaredEntryCount = [...code.matchAll(/\bfunctionName\s*:/gu)].length;
+  if (!/\bconst\s+manifest\s*=\s*\{/u.test(code) || entries.length !== declaredEntryCount) {
+    fail("web.tanstack_start_build_rpc_manifest_invalid");
+  }
+  const ids = entries.map((entry) => entry.production_rpc_id);
+  if (new Set(ids).size !== ids.length) fail("web.tanstack_start_build_rpc_manifest_collision");
+  return entries;
 }
 
 interface MutableState {
@@ -437,6 +531,8 @@ interface MutableState {
   readonly builds: Map<string, TanStackObservedBuild>;
   readonly serverFunctions: Map<string, TanStackObservedServerFunction>;
   readonly stubs: Map<string, TanStackObservedStub>;
+  readonly resolverModules: Map<string, LogicalModule>;
+  rpcManifest: TanStackObservedRpcManifest | null;
   resolverObserved: boolean;
   writing: boolean;
   wrote: boolean;
@@ -473,8 +569,10 @@ function validateFinalPluginChain(config: UnknownRecord, state: MutableState): T
       }
       return value.length > 1 ? value.replace(/\/$/u, "") : "";
     })();
+  const mode = boundedString(config.mode) ?? "production";
+  if (mode !== "production") fail("web.tanstack_start_build_mode_unsupported");
   return {
-    mode: boundedString(config.mode) ?? "production",
+    mode,
     base,
     plugin_count: names.length,
     observer_plugin_index: observerIndex,
@@ -592,7 +690,8 @@ function upsertServerFunction(state: MutableState, call: ProviderCall, module: L
     source_path: sourcePath,
     export_name: call.name,
     provider_module_id: module.module_id,
-    collision_suffix: collisionSuffix(call.id),
+    collision_suffix: null,
+    collision_suffix_status: "not-separately-observed",
     client_referenced: false,
     ssr_referenced: false,
   };
@@ -644,12 +743,24 @@ function finalObservation(state: MutableState): TanStackStartBuildObservation {
     }
   }
   if (!state.resolverObserved) fail("web.tanstack_start_build_virtual_module_missing");
+  const manifest = state.rpcManifest;
+  if (manifest === null) fail("web.tanstack_start_build_rpc_manifest_missing");
   updateReferences(state);
   const functions = [...state.serverFunctions.values()].sort((left, right) => compareUtf8(left.production_rpc_id, right.production_rpc_id));
-  for (const stub of state.stubs.values()) {
-    if (!state.serverFunctions.has(stub.production_rpc_id)) fail("web.tanstack_start_build_stub_target_missing");
+  const functionsById = new Map(functions.map((fn) => [fn.production_rpc_id, fn]));
+  if (manifest.entries.length !== functions.length) fail("web.tanstack_start_build_rpc_manifest_provider_mismatch");
+  for (const entry of manifest.entries) {
+    const fn = functionsById.get(entry.production_rpc_id);
+    if (fn === undefined || entry.handler_export_name !== `${fn.export_name}_createServerFn_handler`
+      || entry.provider_module_id !== fn.provider_module_id
+      || (entry.client_referenced !== null && entry.client_referenced !== fn.client_referenced)) {
+      fail("web.tanstack_start_build_rpc_manifest_provider_mismatch");
+    }
   }
-  return {
+  for (const stub of state.stubs.values()) {
+    if (!functionsById.has(stub.production_rpc_id)) fail("web.tanstack_start_build_stub_target_missing");
+  }
+  return validateTanStackStartBuildObservation({
     schema_version: TANSTACK_START_BUILD_SCHEMA,
     observer: TANSTACK_START_BUILD_OBSERVER,
     observer_version: TANSTACK_START_BUILD_OBSERVER_VERSION,
@@ -657,6 +768,7 @@ function finalObservation(state: MutableState): TanStackStartBuildObservation {
     start_version: state.capability.start_version,
     provider_environment_name: state.capability.provider_environment_name,
     resolver_virtual_module_observed: true,
+    production_rpc_manifest: manifest,
     builds: [...state.builds.values()].sort((left, right) => compareUtf8(left.vite_environment, right.vite_environment)),
     server_functions: functions,
     stubs: [...state.stubs.values()].sort((left, right) => (
@@ -664,6 +776,330 @@ function finalObservation(state: MutableState): TanStackStartBuildObservation {
       || compareUtf8(left.environment, right.environment)
       || compareUtf8(left.source_module_id, right.source_module_id)
     )),
+  });
+}
+
+function strictRecord(value: unknown, keys: readonly string[], code: string): UnknownRecord {
+  const result = record(value);
+  if (result === null) fail(code);
+  const actual = Object.keys(result).sort(compareUtf8);
+  const expected = [...keys].sort(compareUtf8);
+  if (actual.length !== expected.length || actual.some((key, index) => key !== expected[index])) fail(code);
+  return result;
+}
+
+function integer(value: unknown, minimum: number, maximum: number, code: string): number {
+  if (!Number.isSafeInteger(value) || (value as number) < minimum || (value as number) > maximum) fail(code);
+  return value as number;
+}
+
+function booleanValue(value: unknown, code: string): boolean {
+  if (typeof value !== "boolean") fail(code);
+  return value;
+}
+
+function nullableBoolean(value: unknown, code: string): boolean | null {
+  return value === null ? null : booleanValue(value, code);
+}
+
+function digest(value: unknown, code: string): string {
+  const result = boundedString(value, 64);
+  if (result === null || !/^[a-f0-9]{64}$/u.test(result)) fail(code);
+  return result;
+}
+
+function canonicalStringList(
+  value: unknown,
+  sanitizer: (item: unknown) => string,
+  maximum: number,
+  code: string,
+): string[] {
+  if (!Array.isArray(value) || value.length > maximum) fail(code);
+  const values = value.map(sanitizer);
+  if (new Set(values).size !== values.length
+    || values.some((item, index) => index > 0 && compareUtf8(values[index - 1]!, item) >= 0)) {
+    fail(code);
+  }
+  return values;
+}
+
+function normalizedModuleId(value: unknown, code: string): string {
+  const result = boundedString(value);
+  if (result === null) fail(code);
+  if (result.startsWith("virtual:") || result.startsWith("external:")) {
+    if (!/^(?:virtual|external):[a-f0-9]{64}$/u.test(result)) fail(code);
+    return result;
+  }
+  const [source, suffix] = result.split("#", 2);
+  if (canonicalRelativePath(source) !== source) fail(code);
+  if (suffix !== undefined && suffix !== "server-provider" && !/^query:[a-f0-9]{64}$/u.test(suffix)) fail(code);
+  return result;
+}
+
+function moduleEnvironment(value: unknown, code: string): TanStackBuildEnvironment {
+  if (value !== "client" && value !== "ssr" && value !== "server") fail(code);
+  return value;
+}
+
+function validateObservedConfig(value: unknown): TanStackObservedConfig {
+  const code = "web.tanstack_start_build_observation_config_invalid";
+  const item = strictRecord(value, [
+    "mode", "base", "plugin_count", "observer_plugin_index", "tanstack_plugin_count",
+  ], code);
+  const base = item.base === "" ? "" : boundedString(item.base);
+  if (item.mode !== "production" || base === null || (base !== "" && (!base.startsWith("/")
+    || base.endsWith("/") || base.includes("\\") || base.includes("?") || base.includes("#")))) fail(code);
+  const pluginCount = integer(item.plugin_count, 1, MAX_PLUGINS, code);
+  const observerIndex = integer(item.observer_plugin_index, 0, pluginCount - 1, code);
+  return {
+    mode: "production",
+    base,
+    plugin_count: pluginCount,
+    observer_plugin_index: observerIndex,
+    tanstack_plugin_count: integer(item.tanstack_plugin_count, 1, pluginCount, code),
+  };
+}
+
+function validateObservedModule(value: unknown): TanStackObservedModule {
+  const code = "web.tanstack_start_build_observation_module_invalid";
+  const item = strictRecord(value, [
+    "module_id", "source_path", "module_kind", "environment", "is_entry", "imported_ids", "dynamic_imported_ids",
+  ], code);
+  const moduleId = normalizedModuleId(item.module_id, code);
+  if (item.module_kind !== "project" && item.module_kind !== "virtual" && item.module_kind !== "external") fail(code);
+  const sourcePath = item.source_path === null ? null : canonicalRelativePath(item.source_path);
+  if ((item.module_kind === "project") !== (sourcePath !== null)
+    || (item.module_kind === "project" && !moduleId.startsWith(sourcePath!))
+    || (item.module_kind === "virtual" && !moduleId.startsWith("virtual:"))
+    || (item.module_kind === "external" && !moduleId.startsWith("external:"))) fail(code);
+  return {
+    module_id: moduleId,
+    source_path: sourcePath,
+    module_kind: item.module_kind,
+    environment: moduleEnvironment(item.environment, code),
+    is_entry: booleanValue(item.is_entry, code),
+    imported_ids: canonicalStringList(item.imported_ids, (entry) => normalizedModuleId(entry, code), MAX_IMPORTS, code),
+    dynamic_imported_ids: canonicalStringList(
+      item.dynamic_imported_ids, (entry) => normalizedModuleId(entry, code), MAX_IMPORTS, code,
+    ),
+  };
+}
+
+function validateObservedOutput(value: unknown): TanStackObservedOutput {
+  const code = "web.tanstack_start_build_observation_output_invalid";
+  const item = strictRecord(value, [
+    "file_name", "kind", "digest", "environment", "entry", "module_ids", "imported_outputs",
+  ], code);
+  if (item.kind !== "chunk" && item.kind !== "asset") fail(code);
+  const moduleIds = canonicalStringList(
+    item.module_ids, (entry) => normalizedModuleId(entry, code), MAX_MODULES, code,
+  );
+  if (item.kind === "asset" && moduleIds.length !== 0) fail(code);
+  return {
+    file_name: outputPath(item.file_name),
+    kind: item.kind,
+    digest: digest(item.digest, code),
+    environment: moduleEnvironment(item.environment, code),
+    entry: booleanValue(item.entry, code),
+    module_ids: moduleIds,
+    imported_outputs: canonicalStringList(item.imported_outputs, outputPath, MAX_OUTPUTS, code),
+  };
+}
+
+function validateObservedBuild(value: unknown): TanStackObservedBuild {
+  const code = "web.tanstack_start_build_observation_build_invalid";
+  const item = strictRecord(value, ["vite_environment", "vite_version", "config", "modules", "outputs"], code);
+  const viteEnvironment = boundedString(item.vite_environment, 128);
+  if (viteEnvironment === null || !/^[a-z][a-z0-9_-]*$/u.test(viteEnvironment)) fail(code);
+  if (!Array.isArray(item.modules) || item.modules.length > MAX_MODULES
+    || !Array.isArray(item.outputs) || item.outputs.length > MAX_OUTPUTS) fail(code);
+  const modules = item.modules.map(validateObservedModule);
+  const outputs = item.outputs.map(validateObservedOutput);
+  if (modules.some((entry, index) => index > 0 && compareUtf8(modules[index - 1]!.module_id, entry.module_id) >= 0)
+    || outputs.some((entry, index) => index > 0 && compareUtf8(outputs[index - 1]!.file_name, entry.file_name) >= 0)) {
+    fail(code);
+  }
+  const moduleIds = new Set(modules.map((entry) => entry.module_id));
+  const outputNames = new Set(outputs.map((entry) => entry.file_name));
+  for (const output of outputs) {
+    if (output.module_ids.some((moduleId) => !moduleIds.has(moduleId))
+      || output.imported_outputs.some((name) => !outputNames.has(name))) fail(code);
+  }
+  return {
+    vite_environment: viteEnvironment,
+    vite_version: stableVersion(item.vite_version, new Set([7]), "web.tanstack_start_build_vite_version_unsupported"),
+    config: validateObservedConfig(item.config),
+    modules,
+    outputs,
+  };
+}
+
+function validateObservedServerFunction(value: unknown): TanStackObservedServerFunction {
+  const code = "web.tanstack_start_build_observation_server_function_invalid";
+  const item = strictRecord(value, [
+    "production_rpc_id", "source_path", "export_name", "provider_module_id", "collision_suffix",
+    "collision_suffix_status",
+    "client_referenced", "ssr_referenced",
+  ], code);
+  const productionRpcId = boundedString(item.production_rpc_id, MAX_RPC_ID);
+  const source = canonicalRelativePath(item.source_path);
+  const exportName = boundedString(item.export_name);
+  if (productionRpcId === null || source === null || exportName === null) fail(code);
+  if (item.collision_suffix !== null || item.collision_suffix_status !== "not-separately-observed") fail(code);
+  return {
+    production_rpc_id: productionRpcId,
+    source_path: source,
+    export_name: exportName,
+    provider_module_id: normalizedModuleId(item.provider_module_id, code),
+    collision_suffix: null,
+    collision_suffix_status: "not-separately-observed",
+    client_referenced: booleanValue(item.client_referenced, code),
+    ssr_referenced: booleanValue(item.ssr_referenced, code),
+  };
+}
+
+function validateObservedStub(value: unknown): TanStackObservedStub {
+  const code = "web.tanstack_start_build_observation_stub_invalid";
+  const item = strictRecord(value, [
+    "production_rpc_id", "source_module_id", "source_path", "environment",
+  ], code);
+  const productionRpcId = boundedString(item.production_rpc_id, MAX_RPC_ID);
+  if (productionRpcId === null || (item.environment !== "client" && item.environment !== "ssr")) fail(code);
+  const sourcePath = item.source_path === null ? null : canonicalRelativePath(item.source_path);
+  if (item.source_path !== null && sourcePath === null) fail(code);
+  return {
+    production_rpc_id: productionRpcId,
+    source_module_id: normalizedModuleId(item.source_module_id, code),
+    source_path: sourcePath,
+    environment: item.environment,
+  };
+}
+
+function validateRpcManifestEntry(value: unknown): TanStackObservedRpcManifestEntry {
+  const code = "web.tanstack_start_build_rpc_manifest_invalid";
+  const item = strictRecord(value, [
+    "production_rpc_id", "handler_export_name", "provider_module_id", "client_referenced",
+  ], code);
+  const productionRpcId = boundedString(item.production_rpc_id, MAX_RPC_ID);
+  const handlerExportName = boundedString(item.handler_export_name);
+  if (productionRpcId === null || handlerExportName === null) fail(code);
+  return {
+    production_rpc_id: productionRpcId,
+    handler_export_name: handlerExportName,
+    provider_module_id: normalizedModuleId(item.provider_module_id, code),
+    client_referenced: nullableBoolean(item.client_referenced, code),
+  };
+}
+
+function validateRpcManifest(value: unknown): TanStackObservedRpcManifest {
+  const code = "web.tanstack_start_build_rpc_manifest_invalid";
+  const item = strictRecord(value, [
+    "resolver_module_id", "resolver_environment", "entry_count", "entries_digest", "entries",
+  ], code);
+  if (!Array.isArray(item.entries) || item.entries.length > MAX_MODULES) fail(code);
+  const entries = item.entries.map(validateRpcManifestEntry);
+  if (entries.some((entry, index) => index > 0
+    && compareUtf8(entries[index - 1]!.production_rpc_id, entry.production_rpc_id) >= 0)
+    || integer(item.entry_count, 0, MAX_MODULES, code) !== entries.length
+    || digest(item.entries_digest, code) !== digestIdentity(entries as unknown as JsonValue)) fail(code);
+  const resolverModuleId = normalizedModuleId(item.resolver_module_id, code);
+  const resolverEnvironment = boundedString(item.resolver_environment, 128);
+  if (!resolverModuleId.startsWith("virtual:") || resolverEnvironment === null
+    || !/^[a-z][a-z0-9_-]*$/u.test(resolverEnvironment)) fail(code);
+  return {
+    resolver_module_id: resolverModuleId,
+    resolver_environment: resolverEnvironment,
+    entry_count: entries.length,
+    entries_digest: item.entries_digest as string,
+    entries,
+  };
+}
+
+export function validateTanStackStartBuildObservation(value: unknown): TanStackStartBuildObservation {
+  const code = "web.tanstack_start_build_observation_contract_invalid";
+  const item = strictRecord(value, [
+    "schema_version", "observer", "observer_version", "capability", "start_version",
+    "provider_environment_name", "resolver_virtual_module_observed", "production_rpc_manifest",
+    "builds", "server_functions", "stubs",
+  ], code);
+  if (item.schema_version !== TANSTACK_START_BUILD_SCHEMA || item.observer !== TANSTACK_START_BUILD_OBSERVER
+    || item.observer_version !== TANSTACK_START_BUILD_OBSERVER_VERSION
+    || item.capability !== TANSTACK_START_BUILD_CAPABILITY
+    || item.resolver_virtual_module_observed !== true) fail(code);
+  const startVersion = stableVersion(item.start_version, new Set([1]), "web.tanstack_start_build_version_unsupported");
+  const providerValue = boundedString(item.provider_environment_name, 128);
+  if (providerValue === null) fail(code);
+  const provider = providerEnvironmentName(providerValue);
+  if (!Array.isArray(item.builds) || item.builds.length > 3
+    || !Array.isArray(item.server_functions) || item.server_functions.length > MAX_MODULES
+    || !Array.isArray(item.stubs) || item.stubs.length > MAX_MODULES) fail(code);
+  const builds = item.builds.map(validateObservedBuild);
+  const functions = item.server_functions.map(validateObservedServerFunction);
+  const stubs = item.stubs.map(validateObservedStub);
+  const manifest = validateRpcManifest(item.production_rpc_manifest);
+  const expectedEnvironments = [...new Set(["client", "ssr", provider])].sort(compareUtf8);
+  const actualEnvironments = builds.map((build) => build.vite_environment);
+  if (actualEnvironments.length !== expectedEnvironments.length
+    || actualEnvironments.some((environment, index) => environment !== expectedEnvironments[index])
+    || manifest.resolver_environment !== provider
+    || functions.some((entry, index) => index > 0
+      && compareUtf8(functions[index - 1]!.production_rpc_id, entry.production_rpc_id) >= 0)
+    || stubs.some((entry, index) => index > 0 && (
+      compareUtf8(stubs[index - 1]!.production_rpc_id, entry.production_rpc_id)
+      || compareUtf8(stubs[index - 1]!.environment, entry.environment)
+      || compareUtf8(stubs[index - 1]!.source_module_id, entry.source_module_id)
+    ) >= 0)) fail(code);
+  const canonicalConfig = canonicalJson(builds[0]?.config as unknown as JsonValue);
+  if (builds.some((build) => canonicalJson(build.config as unknown as JsonValue) !== canonicalConfig)) fail(code);
+  const modulesByEnvironment = new Map(builds.map((build) => [
+    build.vite_environment,
+    new Map(build.modules.map((module) => [module.module_id, module])),
+  ]));
+  const providerModules = modulesByEnvironment.get(provider);
+  const resolverModule = providerModules?.get(manifest.resolver_module_id);
+  if (resolverModule?.module_kind !== "virtual") fail("web.tanstack_start_build_rpc_manifest_missing");
+  const functionById = new Map(functions.map((fn) => [fn.production_rpc_id, fn]));
+  if (functionById.size !== functions.length || manifest.entries.length !== functions.length) {
+    fail("web.tanstack_start_build_rpc_manifest_provider_mismatch");
+  }
+  const manifestById = new Map(manifest.entries.map((entry) => [entry.production_rpc_id, entry]));
+  for (const fn of functions) {
+    const entry = manifestById.get(fn.production_rpc_id);
+    const providerModule = providerModules?.get(fn.provider_module_id);
+    if (entry === undefined || entry.handler_export_name !== `${fn.export_name}_createServerFn_handler`
+      || entry.provider_module_id !== fn.provider_module_id || providerModule?.environment !== "server"
+      || (entry.client_referenced !== null && entry.client_referenced !== fn.client_referenced)) {
+      fail("web.tanstack_start_build_rpc_manifest_provider_mismatch");
+    }
+  }
+  const clientIds = new Set<string>();
+  const ssrIds = new Set<string>();
+  for (const stub of stubs) {
+    const module = modulesByEnvironment.get(stub.environment)?.get(stub.source_module_id);
+    if ((module !== undefined && module.source_path !== stub.source_path)
+      || (module === undefined && (stub.source_path === null
+        || (stub.source_module_id !== stub.source_path && !stub.source_module_id.startsWith(`${stub.source_path}#`))))
+      || !functionById.has(stub.production_rpc_id)) {
+      fail("web.tanstack_start_build_stub_target_missing");
+    }
+    (stub.environment === "client" ? clientIds : ssrIds).add(stub.production_rpc_id);
+  }
+  for (const fn of functions) {
+    if (fn.client_referenced !== clientIds.has(fn.production_rpc_id)
+      || fn.ssr_referenced !== ssrIds.has(fn.production_rpc_id)) fail(code);
+  }
+  return {
+    schema_version: TANSTACK_START_BUILD_SCHEMA,
+    observer: TANSTACK_START_BUILD_OBSERVER,
+    observer_version: TANSTACK_START_BUILD_OBSERVER_VERSION,
+    capability: TANSTACK_START_BUILD_CAPABILITY,
+    start_version: startVersion,
+    provider_environment_name: provider,
+    resolver_virtual_module_observed: true,
+    production_rpc_manifest: manifest,
+    builds,
+    server_functions: functions,
+    stubs,
   };
 }
 
@@ -701,6 +1137,8 @@ export function createTanStackStartBuildObserverPlugin(options: TanStackStartObs
     builds: new Map(),
     serverFunctions: new Map(),
     stubs: new Map(),
+    resolverModules: new Map(),
+    rpcManifest: null,
     resolverObserved: false,
     writing: false,
     wrote: false,
@@ -740,7 +1178,31 @@ export function createTanStackStartBuildObserverPlugin(options: TanStackStartObs
           fail("web.tanstack_start_build_transform_contract_invalid");
         }
         const module = logicalModule(id, state.repoRoot, environment, capability.provider_environment_name);
-        if (RESOLVER_MARKERS.some((marker) => id.includes(marker))) state.resolverObserved = true;
+        if (RESOLVER_MARKERS.some((marker) => id.includes(marker))) {
+          if (module.module_kind !== "virtual") fail("web.tanstack_start_build_rpc_manifest_invalid");
+          state.resolverObserved = true;
+          const previous = state.resolverModules.get(environment);
+          if (previous !== undefined && previous.module_id !== module.module_id) {
+            fail("web.tanstack_start_build_resolver_module_conflict");
+          }
+          state.resolverModules.set(environment, module);
+          if (environment === capability.provider_environment_name) {
+            const entries = resolverManifestEntries(code, state, environment);
+            const manifest: TanStackObservedRpcManifest = {
+              resolver_module_id: module.module_id,
+              resolver_environment: environment,
+              entry_count: entries.length,
+              entries_digest: digestIdentity(entries as unknown as JsonValue),
+              entries,
+            };
+            if (state.rpcManifest !== null
+              && canonicalJson(state.rpcManifest as unknown as JsonValue)
+                !== canonicalJson(manifest as unknown as JsonValue)) {
+              fail("web.tanstack_start_build_rpc_manifest_conflict");
+            }
+            state.rpcManifest = manifest;
+          }
+        }
         for (const rpcId of callStrings(code, "createClientRpc")) upsertStub(state, rpcId, module, "client");
         for (const rpcId of callStrings(code, "createSsrRpc")) upsertStub(state, rpcId, module, "ssr");
         for (const call of providerCalls(code)) upsertServerFunction(state, call, module);
@@ -800,6 +1262,15 @@ export function tanStackStartBuildFailureDiagnostic(error: unknown, profileId: s
   const code = error instanceof TanStackStartBuildObserverError && /^web\.tanstack_start_build_[a-z0-9_]+$/u.test(error.code)
     ? error.code
     : "web.tanstack_start_build_observer_failed";
+  const reason = code.includes("version_unsupported")
+    ? "framework_build_version_unsupported"
+    : code.includes("manifest") || code.includes("stub_target_missing") || code.includes("virtual_module_missing")
+      ? "framework_build_manifest_missing"
+      : code.includes("conflict") || code.includes("collision")
+        ? "framework_build_generated_identity_conflict"
+        : code.includes("hook") || code.includes("plugin_chain") || code.includes("environment_")
+          ? "framework_build_hook_missing"
+          : "framework_build_incomplete";
   const properties: Record<string, JsonValue> = {
     framework: "tanstack-start",
     observer: TANSTACK_START_BUILD_OBSERVER,
@@ -807,6 +1278,8 @@ export function tanStackStartBuildFailureDiagnostic(error: unknown, profileId: s
     capability: TANSTACK_START_BUILD_CAPABILITY,
     contract_version: FRAMEWORK_BUILD_GRAPH_CONTRACT_VERSION,
     observer_failure: true,
+    framework_build_completion_status: code.includes("version_unsupported") ? "unsupported" : "partial",
+    framework_build_completion_reason: reason,
   };
   return {
     id: stableId("diagnostic", { code, profile_id: profileId, properties }),
@@ -949,14 +1422,7 @@ function serverFunctionCandidates(nodes: readonly GraphNode[], value: TanStackOb
 export function buildTanStackStartObservedGraph(
   input: TanStackStartBuildGraphInput,
 ): TanStackStartBuildGraphDelta {
-  const observation = input.observation;
-  if (observation.schema_version !== TANSTACK_START_BUILD_SCHEMA
-    || observation.observer !== TANSTACK_START_BUILD_OBSERVER
-    || observation.observer_version !== TANSTACK_START_BUILD_OBSERVER_VERSION
-    || observation.capability !== TANSTACK_START_BUILD_CAPABILITY
-    || !observation.resolver_virtual_module_observed) {
-    fail("web.tanstack_start_build_observation_contract_invalid");
-  }
+  const observation = validateTanStackStartBuildObservation(input.observation);
   validateProvenance(input.provenance);
   const observationDigest = digestIdentity(observation as unknown as JsonValue);
   const observationPath = `.tanstack/depgraph/${observationDigest}.json`;
@@ -970,6 +1436,10 @@ export function buildTanStackStartObservedGraph(
   const outputIdsByBaseNode = new Map<string, Set<string>>();
   const observedFunctionByRpcId = new Map<string, GraphNode>();
   const safeFunctionByRpcId = new Map<string, GraphNode>();
+  const observedFunctionBySafeId = new Map<string, GraphNode>();
+  const manifestByRpcId = new Map(
+    observation.production_rpc_manifest.entries.map((entry) => [entry.production_rpc_id, entry]),
+  );
   const addNode = (node: GraphNode): void => {
     const previous = nodes.get(node.id);
     if (previous !== undefined
@@ -990,9 +1460,13 @@ export function buildTanStackStartObservedGraph(
   }
 
   for (const fn of observation.server_functions) {
+    const manifestEntry = manifestByRpcId.get(fn.production_rpc_id);
+    if (manifestEntry === undefined) fail("web.tanstack_start_build_rpc_manifest_provider_mismatch");
     const evidence = buildEvidence(input.provenance, observationPath, observationDigest, {
       production_rpc_id: fn.production_rpc_id,
       collision_suffix: fn.collision_suffix,
+      collision_suffix_status: fn.collision_suffix_status,
+      manifest_entries_digest: observation.production_rpc_manifest.entries_digest,
     });
     const identity: Record<string, JsonValue> = {
       framework: "tanstack-start",
@@ -1005,8 +1479,11 @@ export function buildTanStackStartObservedGraph(
       production_rpc_id: fn.production_rpc_id,
       production_rpc_id_status: "build-observed",
       collision_suffix: fn.collision_suffix,
+      collision_suffix_status: fn.collision_suffix_status,
       source_path: fn.source_path,
       provider_module_id: fn.provider_module_id,
+      manifest_handler_export_name: manifestEntry.handler_export_name,
+      manifest_client_referenced: manifestEntry.client_referenced,
       client_referenced: fn.client_referenced,
       ssr_referenced: fn.ssr_referenced,
       profile_id: input.provenance.profile_id,
@@ -1018,6 +1495,7 @@ export function buildTanStackStartObservedGraph(
       const safe = candidates[0]!;
       addNode(safe);
       safeFunctionByRpcId.set(fn.production_rpc_id, safe);
+      observedFunctionBySafeId.set(safe.id, observed);
       addObservedRelation(
         sites, edges, observed.id, safe.id, "observes_definition", fn.export_name, "server",
         observedCondition("server", { "tanstack.start.rpc_id": fn.production_rpc_id }),
@@ -1032,6 +1510,20 @@ export function buildTanStackStartObservedGraph(
         );
       }
     } else {
+      const unresolved = frameworkBuildUnresolvedTarget(
+        TANSTACK_START_FRAMEWORK_BUILD_DESCRIPTOR,
+        input.provenance,
+        "observes_definition",
+        observed.id,
+        `${fn.source_path}#${fn.export_name}`,
+        "server",
+        observedCondition("server", { "tanstack.start.rpc_id": fn.production_rpc_id }),
+        evidence,
+        "framework_build_dynamic_target_unmatched",
+      );
+      addNode(unresolved.node);
+      sites.push(unresolved.site);
+      edges.push(unresolved.edge);
       diagnostics.push(graphDiagnostic(
         candidates.length === 0
           ? "web.tanstack_start_build_server_function_static_missing"
@@ -1085,16 +1577,29 @@ export function buildTanStackStartObservedGraph(
     }
   }
 
+  const providerModuleIds = new Set(observation.server_functions.map((fn) => fn.provider_module_id));
+  const stubRoleByModule = new Map(observation.stubs.map((stub) => [
+    `${stub.environment}\0${stub.source_module_id}`,
+    stub.environment === "client" ? "client-rpc-stub" : "ssr-rpc-stub",
+  ]));
   for (const build of observation.builds) {
     const moduleNodes = new Map<string, GraphNode>();
     const observedModulesById = new Map(build.modules.map((module) => [module.module_id, module]));
     const outputNodes = new Map<string, GraphNode>();
     for (const module of build.modules) {
+      const generatedModuleRole = module.module_id === observation.production_rpc_manifest.resolver_module_id
+          && build.vite_environment === observation.production_rpc_manifest.resolver_environment
+        ? "server-function-resolver"
+        : providerModuleIds.has(module.module_id)
+          ? "server-function-provider"
+          : stubRoleByModule.get(`${build.vite_environment}\0${module.module_id}`) ?? null;
       const matching = module.source_path === null ? [] : (baseByPath.get(module.source_path) ?? [])
         .filter((node) => node.kind !== "route" && node.kind !== "server_function" && node.kind !== "middleware");
-      let node = matching.find((candidate) => candidate.properties.environment === (module.environment === "client" ? "browser" : module.environment))
-        ?? matching.find((candidate) => candidate.kind === "component" || candidate.kind === "file")
-        ?? null;
+      let node = generatedModuleRole === null
+        ? matching.find((candidate) => candidate.properties.environment === (module.environment === "client" ? "browser" : module.environment))
+          ?? matching.find((candidate) => candidate.kind === "component" || candidate.kind === "file")
+          ?? null
+        : null;
       if (node === null) {
         node = buildNode("module", {
           framework: "tanstack-start",
@@ -1106,6 +1611,7 @@ export function buildTanStackStartObservedGraph(
           module_id: module.module_id,
           source_path: module.source_path,
           module_kind: module.module_kind,
+          tanstack_start_module_role: generatedModuleRole,
           environment: module.environment === "client" ? "browser" : module.environment,
           profile_id: input.provenance.profile_id,
         }, input.provenance, observationPath, observationDigest);
@@ -1206,18 +1712,40 @@ export function buildTanStackStartObservedGraph(
     const targetOutputs = outputIdsByBaseNode.get(edge.target);
     if (sourceOutputs === undefined) continue;
     const shared = targetOutputs !== undefined && [...sourceOutputs].some((id) => reachesOutput(id, targetOutputs));
-    if (!shared) diagnostics.push(graphDiagnostic(
-      "web.tanstack_start_build_middleware_artifact_drift",
-      `${edge.source}->${edge.target}`,
-      input.provenance.profile_id,
+    if (!shared) {
+      diagnostics.push(graphDiagnostic(
+        "web.tanstack_start_build_middleware_artifact_drift",
+        `${edge.source}->${edge.target}`,
+        input.provenance.profile_id,
+        commonEvidence,
+        { source_id: edge.source, middleware_id: edge.target },
+      ));
+      continue;
+    }
+    const source = observedFunctionBySafeId.get(edge.source) ?? baseById.get(edge.source);
+    const target = baseById.get(edge.target);
+    if (source === undefined || target?.kind !== "middleware") continue;
+    addNode(source);
+    addNode(target);
+    addObservedRelation(
+      sites,
+      edges,
+      source.id,
+      target.id,
+      "uses_middleware",
+      target.display_name,
+      "server",
+      observedCondition("server", { "tanstack.start.middleware_chain": "build-correlated" }),
       commonEvidence,
-      { source_id: edge.source, middleware_id: edge.target },
-    ));
+      input.provenance.profile_id,
+    );
   }
 
   const candidate = {
     startVersion: observation.start_version,
     viteVersions: [...new Set(observation.builds.map((build) => build.vite_version))].sort(compareUtf8),
+    productionRpcManifestEntryCount: observation.production_rpc_manifest.entry_count,
+    productionRpcManifestDigest: observation.production_rpc_manifest.entries_digest,
     nodes: [...nodes.values()].sort((left, right) => compareUtf8(left.id, right.id)),
     sites: uniqueById(sites, "web.tanstack_start_build_site_conflict"),
     edges: uniqueById(edges, "web.tanstack_start_build_edge_conflict"),
@@ -1228,6 +1756,8 @@ export function buildTanStackStartObservedGraph(
     delta = {
       startVersion: candidate.startVersion,
       viteVersions: candidate.viteVersions,
+      productionRpcManifestEntryCount: candidate.productionRpcManifestEntryCount,
+      productionRpcManifestDigest: candidate.productionRpcManifestDigest,
       ...reconcileFrameworkBuildBaseRecords(
         candidate,
         TANSTACK_START_FRAMEWORK_BUILD_DESCRIPTOR,
@@ -1267,6 +1797,9 @@ export function tanStackStartBuildProtocolEvents(
       properties: {
         tanstack_start_version: delta.startVersion,
         vite_versions: delta.viteVersions,
+        production_rpc_manifest_observed: true,
+        production_rpc_manifest_entry_count: delta.productionRpcManifestEntryCount,
+        production_rpc_manifest_digest: delta.productionRpcManifestDigest,
       },
     },
   );
