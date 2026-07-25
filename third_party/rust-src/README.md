@@ -7,5 +7,7 @@ standard Apache-2.0 license text, and the `library/` directory from the pinned
 rustup `rust-src` component.
 
 The package task verifies the exact toolchain release and commit before copying
-the source tree. It never downloads source during packaging and never falls back
-to a project or system `rust-src`.
+the source tree, then requires the normalized component digest
+`cc5465ef70b933d2a80c30472468abb9f8ab297fc767bd6433b2f6f554f4f0e7`
+before writing the manifest or SBOM. It never downloads source during packaging
+and never falls back to a project or system `rust-src`.

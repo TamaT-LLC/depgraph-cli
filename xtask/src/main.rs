@@ -53,6 +53,8 @@ const RUST_SOURCE_COPYRIGHT_SHA256: &str =
     "172020dbfd5b53a226dfde77616190a48dcff519b0bc0e6deb91a8450782c4af";
 const RUST_SOURCE_LICENSE_MIT_SHA256: &str =
     "b71bd43a069ca0641a9ecfe585ca7b3c53b5cc1608f8b68321168698e28b5ea1";
+const RUST_SYSROOT_COMPONENT_SHA256: &str =
+    "cc5465ef70b933d2a80c30472468abb9f8ab297fc767bd6433b2f6f554f4f0e7";
 const RUNTIME_COLLECTOR_CONTRACT_VERSION: &str = depgraph_core::RUNTIME_COLLECTOR_CONTRACT_VERSION;
 const RUNTIME_COLLECTOR_ARTIFACT: &str = "depgraph-runtime-collector.mjs";
 const WEB_SEMANTIC_CAPABILITIES: &[&str] = &[
@@ -919,6 +921,8 @@ fn prepare_rust_sysroot_component(staging: &Path) -> Result<RuntimeComponent> {
             license_expression: RUST_SYSROOT_LICENSE_EXPRESSION,
         })?,
     )?;
+    let sha256 = sha256_tree(&component_root)?;
+    verify_pinned_rust_sysroot_digest(&sha256)?;
 
     Ok(RuntimeComponent {
         name: RUST_SYSROOT_COMPONENT_NAME.to_owned(),
@@ -927,8 +931,17 @@ fn prepare_rust_sysroot_component(staging: &Path) -> Result<RuntimeComponent> {
         root: RUST_SYSROOT_COMPONENT_ROOT.to_owned(),
         entrypoint: None,
         license: RUST_SYSROOT_LICENSE_EXPRESSION.to_owned(),
-        sha256: sha256_tree(&component_root)?,
+        sha256,
     })
+}
+
+fn verify_pinned_rust_sysroot_digest(sha256: &str) -> Result<()> {
+    if sha256 != RUST_SYSROOT_COMPONENT_SHA256 {
+        bail!(
+            "pinned Rust sysroot source tree digest mismatch: expected {RUST_SYSROOT_COMPONENT_SHA256}, found {sha256}; refusing modified or unknown rust-src content"
+        );
+    }
+    Ok(())
 }
 
 fn rustc_source_identity(output: &str) -> Result<(&str, &str)> {
@@ -2741,6 +2754,7 @@ fn verify_published_release_tree(
         || rust_sysroot.root != RUST_SYSROOT_COMPONENT_ROOT
         || rust_sysroot.entrypoint.is_some()
         || rust_sysroot.license != RUST_SYSROOT_LICENSE_EXPRESSION
+        || rust_sysroot.sha256 != RUST_SYSROOT_COMPONENT_SHA256
     {
         bail!("published Rust sysroot source compatibility unit is invalid");
     }
@@ -8229,6 +8243,7 @@ fn verify_release_metadata(extracted: &Path) -> Result<ReleaseManifest> {
         || rust_sysroot.root != RUST_SYSROOT_COMPONENT_ROOT
         || rust_sysroot.entrypoint.is_some()
         || rust_sysroot.license != RUST_SYSROOT_LICENSE_EXPRESSION
+        || rust_sysroot.sha256 != RUST_SYSROOT_COMPONENT_SHA256
     {
         bail!("Rust sysroot source component does not match the pinned compatibility unit");
     }
@@ -9036,16 +9051,16 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        ARCHIVE_MTIME, DependencyPackage, RELEASE_TARGETS, TYPESCRIPT_VERSION,
-        WEB_SEMANTIC_CAPABILITIES, WEB_SEMANTIC_RUNTIME_ARTIFACTS, WEB_SEMANTIC_RUNTIME_COMPONENTS,
-        WebSemanticAttestation, WorkerBackend, archive_entries, cargo_runtime_packages,
-        create_tar_archive, create_zip_archive, executable_name_for_target, extract_archive,
-        normalized_spdx_license, package_url, parse_worker_handshake, release_compatibility,
-        remove_transient_build_run_ids, rust_backend_from_handshake, rustc_source_identity,
-        verify_checksum_sidecar, verify_project_metadata, verify_release_tag_values,
-        verify_rust_analyzer_dependencies, verify_rust_backend, verify_web_semantic_attestation,
-        web_runtime_packages, web_semantic_from_handshake, without_windows_verbatim_prefix,
-        workspace_root,
+        ARCHIVE_MTIME, DependencyPackage, RELEASE_TARGETS, RUST_SYSROOT_COMPONENT_SHA256,
+        TYPESCRIPT_VERSION, WEB_SEMANTIC_CAPABILITIES, WEB_SEMANTIC_RUNTIME_ARTIFACTS,
+        WEB_SEMANTIC_RUNTIME_COMPONENTS, WebSemanticAttestation, WorkerBackend, archive_entries,
+        cargo_runtime_packages, create_tar_archive, create_zip_archive, executable_name_for_target,
+        extract_archive, normalized_spdx_license, package_url, parse_worker_handshake,
+        release_compatibility, remove_transient_build_run_ids, rust_backend_from_handshake,
+        rustc_source_identity, verify_checksum_sidecar, verify_pinned_rust_sysroot_digest,
+        verify_project_metadata, verify_release_tag_values, verify_rust_analyzer_dependencies,
+        verify_rust_backend, verify_web_semantic_attestation, web_runtime_packages,
+        web_semantic_from_handshake, without_windows_verbatim_prefix, workspace_root,
     };
 
     fn release_tree() -> Result<(tempfile::TempDir, String)> {
@@ -9081,6 +9096,13 @@ mod tests {
         assert!(rustc_source_identity("release: 1.93.1\n").is_err());
         assert!(rustc_source_identity("commit-hash: unknown\nrelease: 1.93.1\n").is_err());
         assert!(rustc_source_identity("commit-hash: abc\n").is_err());
+        verify_pinned_rust_sysroot_digest(RUST_SYSROOT_COMPONENT_SHA256)?;
+        assert!(
+            verify_pinned_rust_sysroot_digest(
+                "0000000000000000000000000000000000000000000000000000000000000000"
+            )
+            .is_err()
+        );
         Ok(())
     }
 
