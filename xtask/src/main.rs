@@ -186,6 +186,20 @@ struct RuntimeCollectorInventory {
     sha256: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FirstPartyArtifactInventory {
+    name: String,
+    version: String,
+    license: String,
+    path: String,
+    sha256: String,
+    roles: Vec<String>,
+    bundled_packages: Vec<String>,
+    framework: Option<String>,
+    capability: Option<String>,
+    observation_schema: Option<String>,
+}
+
 #[derive(Clone, Debug)]
 struct ArchiveEntry {
     source: PathBuf,
@@ -202,6 +216,8 @@ struct ReleaseVerificationReport {
     protocol_version: String,
     schema_compatibility_version: String,
     framework_build_graph_contract_version: String,
+    framework_build_gate_contract_version: String,
+    framework_build_capabilities: Vec<depgraph_core::FrameworkBuildCapabilityHealth>,
     runtime_collector_contract_version: String,
     compatibility: ReleaseCompatibility,
     license_expression: String,
@@ -221,6 +237,7 @@ struct TargetVerificationReport {
     sbom_sha256: String,
     project_licenses: BTreeMap<String, String>,
     runtime_collector_sha256: String,
+    framework_build_artifacts: BTreeMap<String, String>,
     workers: BTreeMap<String, String>,
 }
 
@@ -297,6 +314,67 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
     {
         bail!("Go/Web adapter versions must match Cargo release version {VERSION}");
     }
+    let framework_build_sources = [
+        (
+            "astro",
+            "workers/web/src/astro-build-observer.ts",
+            "ASTRO_BUILD_OBSERVER",
+            "ASTRO_BUILD_OBSERVER_VERSION",
+            "ASTRO_BUILD_OBSERVER_CAPABILITY",
+            "ASTRO_BUILD_OBSERVATION_SCHEMA",
+        ),
+        (
+            "next",
+            "workers/web/src/next-build-observer.ts",
+            "NEXT_BUILD_OBSERVER",
+            "NEXT_BUILD_OBSERVER_VERSION",
+            "NEXT_BUILD_OBSERVER_CAPABILITY",
+            "NEXT_BUILD_OBSERVATION_SCHEMA",
+        ),
+        (
+            "tanstack-router",
+            "workers/web/src/tanstack-router-build-observer.ts",
+            "TANSTACK_ROUTER_BUILD_OBSERVER",
+            "TANSTACK_ROUTER_BUILD_OBSERVER_VERSION",
+            "TANSTACK_ROUTER_BUILD_CAPABILITY",
+            "TANSTACK_ROUTER_BUILD_SCHEMA",
+        ),
+        (
+            "tanstack-start",
+            "workers/web/src/tanstack-start-build-observer.ts",
+            "TANSTACK_START_BUILD_OBSERVER",
+            "TANSTACK_START_BUILD_OBSERVER_VERSION",
+            "TANSTACK_START_BUILD_CAPABILITY",
+            "TANSTACK_START_BUILD_SCHEMA",
+        ),
+    ];
+    let web_build_script = fs::read_to_string(root.join("workers/web/scripts/build.mjs"))?;
+    for (framework, source_path, observer, version, capability, schema) in framework_build_sources {
+        let expected = depgraph_core::framework_build_capability_contract()
+            .into_iter()
+            .find(|entry| entry.framework == framework)
+            .with_context(|| format!("core has no {framework} framework build capability"))?;
+        let source = fs::read_to_string(root.join(source_path))?;
+        if quoted_assignment(&source, observer).as_deref() != Some(expected.observer.as_str())
+            || quoted_assignment(&source, version).as_deref()
+                != Some(expected.observer_version.as_str())
+            || quoted_assignment(&source, capability).as_deref()
+                != Some(expected.capability.as_str())
+            || quoted_assignment(&source, schema).as_deref()
+                != Some(expected.observation_schema.as_str())
+            || !web_build_script.contains(&format!("framework: \"{framework}\""))
+            || !web_build_script.contains(&format!("version: \"{}\"", expected.observer_version))
+            || !web_build_script.contains(&format!("capability: \"{}\"", expected.capability))
+            || !web_build_script.contains(&format!(
+                "observation_schema: \"{}\"",
+                expected.observation_schema
+            ))
+        {
+            bail!(
+                "{framework} framework build capability is not synchronized across core, observer, and package inventory"
+            );
+        }
+    }
 
     let go_mod = fs::read_to_string(root.join("workers/go/go.mod"))?;
     let rust_toolchain = fs::read_to_string(root.join("rust-toolchain.toml"))?;
@@ -326,6 +404,7 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "[the system design](docs/40_arch_design/arch-dependency-graph-cli-system-design.md)",
         "[`v0.4.0-rc.1`](docs/releases/v0.4.0-rc.1.md)",
         "[`v0.2.0-rc.1`](docs/releases/v0.2.0-rc.1.md)",
+        "dynamic-framework-evidence-release-gate-v1",
         "[MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE)",
     ] {
         if !readme.contains(required) {
@@ -342,6 +421,7 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "| Product / Rust / Go / Web adapter | `0.4.0-rc.1` |",
         "Milestone 4のrelease candidateは`v0.4.0-rc.1`",
         "Issue #55ではこのWeb semantic compatibility unitをrelease manifest",
+        "Issue #145のrelease gate contractは`dynamic-framework-evidence-release-gate-v1`",
     ] {
         if !design.contains(required) {
             bail!("system design release metadata is missing {required:?}");
@@ -631,6 +711,13 @@ fn package() -> Result<()> {
         workers,
         runtime_requirements: BTreeMap::from([("web".to_owned(), "Node.js >=24.0.0".to_owned())]),
     };
+    let web_runtime_inventory: Value =
+        serde_json::from_slice(&fs::read("workers/web/dist/runtime-packages.json")?)?;
+    if manifest_framework_build_artifact_checksums(&manifest)?
+        != framework_build_artifact_checksums(&web_runtime_inventory)?
+    {
+        bail!("release manifest framework build checksums differ from the Web runtime inventory");
+    }
     fs::write(
         staging.join("release-manifest.json"),
         serde_json::to_vec_pretty(&manifest)?,
@@ -815,7 +902,8 @@ fn third_party_licenses(target: &str) -> Result<String> {
         &fs::read("workers/web/dist/runtime-packages.json")
             .context("Web runtime package inventory is missing; run the Web worker build first")?,
     )?;
-    let collector = runtime_collector_inventory(&web_inventory)?;
+    runtime_collector_inventory(&web_inventory)?;
+    let first_party = first_party_artifact_inventory(&web_inventory)?;
     let entries = dependency_inventory(target)?
         .into_iter()
         .map(|package| {
@@ -825,11 +913,18 @@ fn third_party_licenses(target: &str) -> Result<String> {
             )
         })
         .collect::<Vec<_>>();
+    let notices = first_party
+        .iter()
+        .map(|artifact| {
+            format!(
+                "First-party artifact {} ({}) is licensed under {} by LICENSE-MIT and LICENSE-APACHE; its dependency-free bundle adds no third-party license entry.",
+                artifact.path, artifact.version, artifact.license
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
     let mut output = format!(
-        "depgraph third-party license inventory\nGenerated from the Rust and Go runtime dependency graphs and the Web bundle/runtime artifact inventory.\nFirst-party artifact {} ({}) is licensed under {} by LICENSE-MIT and LICENSE-APACHE; its dependency-free bundle adds no third-party license entry.\n{SBOM_SCOPE}\n\n{}\n",
-        collector.path,
-        collector.version,
-        collector.license,
+        "depgraph third-party license inventory\nGenerated from the Rust and Go runtime dependency graphs and the Web bundle/runtime artifact inventory.\n{notices}\n{SBOM_SCOPE}\n\n{}\n",
         entries.join("\n")
     );
     for (label, content) in web_legal_documents()? {
@@ -843,7 +938,8 @@ fn sbom(target: &str) -> Result<Value> {
         &fs::read("workers/web/dist/runtime-packages.json")
             .context("Web runtime package inventory is missing; run the Web worker build first")?,
     )?;
-    let collector = runtime_collector_inventory(&web_inventory)?;
+    runtime_collector_inventory(&web_inventory)?;
+    let first_party = first_party_artifact_inventory(&web_inventory)?;
     let dependencies = dependency_inventory(target)?;
     let dependency_ids = dependencies
         .iter()
@@ -895,33 +991,45 @@ fn sbom(target: &str) -> Result<Value> {
             "comment":SBOM_SCOPE
         }),
     );
-    let collector_id = "SPDXRef-Package-depgraph-runtime-collector";
-    packages.insert(
-        1,
-        json!({
-            "SPDXID":collector_id,
-            "name":collector.name,
-            "versionInfo":collector.version,
-            "filesAnalyzed":false,
-            "licenseConcluded":"NOASSERTION",
-            "licenseDeclared":collector.license,
-            "downloadLocation":"NOASSERTION",
-            "checksums":[{
-                "algorithm":"SHA256",
-                "checksumValue":collector.sha256
-            }],
-            "comment":format!("First-party release artifact: libexec/{}", collector.path)
-        }),
-    );
+    let first_party_ids = first_party
+        .iter()
+        .map(|artifact| {
+            (
+                format!("SPDXRef-Package-{}", spdx_component(&artifact.name)),
+                artifact,
+            )
+        })
+        .collect::<Vec<_>>();
+    for (index, (id, artifact)) in first_party_ids.iter().enumerate() {
+        packages.insert(
+            index + 1,
+            json!({
+                "SPDXID":id,
+                "name":artifact.name,
+                "versionInfo":artifact.version,
+                "filesAnalyzed":false,
+                "licenseConcluded":"NOASSERTION",
+                "licenseDeclared":artifact.license,
+                "downloadLocation":"NOASSERTION",
+                "checksums":[{
+                    "algorithm":"SHA256",
+                    "checksumValue":artifact.sha256
+                }],
+                "comment":format!("First-party release artifact: libexec/{}", artifact.path)
+            }),
+        );
+    }
     let mut relationships = vec![json!({
         "spdxElementId":"SPDXRef-DOCUMENT",
         "relationshipType":"DESCRIBES",
         "relatedSpdxElement":"SPDXRef-Package-depgraph"
     })];
-    relationships.push(json!({
-        "spdxElementId":"SPDXRef-Package-depgraph",
-        "relationshipType":"CONTAINS",
-        "relatedSpdxElement":collector_id
+    relationships.extend(first_party_ids.into_iter().map(|(id, _)| {
+        json!({
+            "spdxElementId":"SPDXRef-Package-depgraph",
+            "relationshipType":"CONTAINS",
+            "relatedSpdxElement":id
+        })
     }));
     relationships.extend(dependency_ids.into_iter().map(|id| {
         json!({
@@ -984,6 +1092,99 @@ fn verify_runtime_collector_sbom(sbom: &Value, expected_sha256: &str, context: &
         bail!("{context} SBOM does not contain the runtime collector from the root package");
     }
     Ok(())
+}
+
+fn verify_framework_build_sbom(
+    sbom: &Value,
+    expected_artifacts: &BTreeMap<String, String>,
+    context: &str,
+) -> Result<()> {
+    let mut expected = depgraph_core::framework_build_capability_contract()
+        .into_iter()
+        .map(|capability| {
+            (
+                capability.observer_runtime_artifact,
+                (
+                    format!("depgraph-{}-build-observer", capability.framework),
+                    capability.observer_version,
+                ),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    expected.insert(
+        depgraph_core::FRAMEWORK_BUILD_CONVERTER_ARTIFACT.to_owned(),
+        (
+            "depgraph-web-build-evidence".to_owned(),
+            depgraph_core::FRAMEWORK_BUILD_GATE_CONTRACT_VERSION.to_owned(),
+        ),
+    );
+    if expected_artifacts.keys().collect::<BTreeSet<_>>()
+        != expected.keys().collect::<BTreeSet<_>>()
+    {
+        bail!("{context} framework build artifact checksum ledger is incomplete or unknown");
+    }
+    let packages = sbom["packages"]
+        .as_array()
+        .with_context(|| format!("{context} SBOM has no packages"))?;
+    let relationships = sbom["relationships"]
+        .as_array()
+        .with_context(|| format!("{context} SBOM has no relationships"))?;
+    for (path, (name, version)) in expected {
+        let matches = packages
+            .iter()
+            .filter(|package| package["name"] == name)
+            .collect::<Vec<_>>();
+        let sha256 = expected_artifacts
+            .get(&path)
+            .with_context(|| format!("{context} has no checksum for {path}"))?;
+        let id = format!("SPDXRef-Package-{}", spdx_component(&name));
+        if matches.len() != 1
+            || matches[0]["SPDXID"] != id
+            || matches[0]["versionInfo"] != version
+            || matches[0]["filesAnalyzed"] != Value::Bool(false)
+            || matches[0]["licenseDeclared"] != PROJECT_LICENSE_EXPRESSION
+            || matches[0]["checksums"]
+                != json!([{
+                    "algorithm": "SHA256",
+                    "checksumValue": sha256,
+                }])
+            || matches[0]["comment"] != format!("First-party release artifact: {path}")
+        {
+            bail!("{context} SBOM framework build artifact {path} is incompatible");
+        }
+        let contains = relationships
+            .iter()
+            .filter(|relationship| {
+                relationship["spdxElementId"] == "SPDXRef-Package-depgraph"
+                    && relationship["relationshipType"] == "CONTAINS"
+                    && relationship["relatedSpdxElement"] == id
+            })
+            .count();
+        if contains != 1 {
+            bail!("{context} SBOM does not contain framework build artifact {path}");
+        }
+    }
+    Ok(())
+}
+
+fn manifest_framework_build_artifact_checksums(
+    manifest: &ReleaseManifest,
+) -> Result<BTreeMap<String, String>> {
+    let mut required = depgraph_core::framework_build_capability_contract()
+        .into_iter()
+        .map(|capability| capability.observer_runtime_artifact)
+        .collect::<BTreeSet<_>>();
+    required.insert(depgraph_core::FRAMEWORK_BUILD_CONVERTER_ARTIFACT.to_owned());
+    let artifacts = manifest
+        .runtime_artifacts
+        .iter()
+        .filter(|artifact| required.contains(&artifact.path))
+        .map(|artifact| (artifact.path.clone(), artifact.sha256.clone()))
+        .collect::<BTreeMap<_, _>>();
+    if artifacts.keys().collect::<BTreeSet<_>>() != required.iter().collect::<BTreeSet<_>>() {
+        bail!("release manifest framework build runtime artifact closure is incomplete");
+    }
+    Ok(artifacts)
 }
 
 fn normalized_spdx_license(reported: &str) -> Option<String> {
@@ -1385,29 +1586,213 @@ fn web_runtime_packages(inventory: &Value) -> Result<Vec<DependencyPackage>> {
         .collect()
 }
 
-fn runtime_collector_inventory(inventory: &Value) -> Result<RuntimeCollectorInventory> {
+fn first_party_artifact_inventory(inventory: &Value) -> Result<Vec<FirstPartyArtifactInventory>> {
     if inventory["schema_version"] != 1 {
         bail!("Web runtime package inventory has an unsupported schema version");
     }
     let artifacts = inventory["artifacts"]
         .as_array()
         .context("Web runtime package inventory has no first-party artifacts")?;
-    if artifacts.len() != 1 {
-        bail!("Web runtime package inventory must contain exactly one first-party artifact");
+    if artifacts.len() != 6 {
+        bail!(
+            "Web runtime package inventory must contain the runtime collector, four framework observers, and their converter"
+        );
     }
-    let artifact = &artifacts[0];
-    let field = |name: &str| {
-        artifact[name]
-            .as_str()
-            .filter(|value| !value.is_empty())
-            .with_context(|| format!("runtime collector inventory has no {name}"))
-    };
+    let mut names = BTreeSet::new();
+    let mut paths = BTreeSet::new();
+    let mut parsed = Vec::new();
+    for artifact in artifacts {
+        let object = artifact
+            .as_object()
+            .context("Web first-party artifact is not an object")?;
+        let field = |name: &str| {
+            object
+                .get(name)
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .with_context(|| format!("Web first-party artifact has no {name}"))
+        };
+        let optional = |name: &str| {
+            object
+                .get(name)
+                .map(|value| {
+                    value
+                        .as_str()
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_owned)
+                        .with_context(|| format!("Web first-party artifact has an invalid {name}"))
+                })
+                .transpose()
+        };
+        let artifact = FirstPartyArtifactInventory {
+            name: field("name")?.to_owned(),
+            version: field("version")?.to_owned(),
+            license: field("license")?.to_owned(),
+            path: field("path")?.to_owned(),
+            sha256: field("sha256")?.to_owned(),
+            roles: object
+                .get("roles")
+                .and_then(Value::as_array)
+                .context("Web first-party artifact has no roles")?
+                .iter()
+                .map(|role| {
+                    role.as_str()
+                        .filter(|role| !role.is_empty())
+                        .map(str::to_owned)
+                        .context("Web first-party artifact has an invalid role")
+                })
+                .collect::<Result<Vec<_>>>()?,
+            bundled_packages: object
+                .get("bundled_packages")
+                .and_then(Value::as_array)
+                .context("Web first-party artifact has no bundled package ledger")?
+                .iter()
+                .map(|package| {
+                    package
+                        .as_str()
+                        .filter(|package| !package.is_empty())
+                        .map(str::to_owned)
+                        .context("Web first-party artifact has an invalid bundled package")
+                })
+                .collect::<Result<Vec<_>>>()?,
+            framework: optional("framework")?,
+            capability: optional("capability")?,
+            observation_schema: optional("observation_schema")?,
+        };
+        let expected_fields = if artifact.framework.is_some() {
+            BTreeSet::from([
+                "bundled_packages",
+                "capability",
+                "framework",
+                "license",
+                "name",
+                "observation_schema",
+                "path",
+                "roles",
+                "sha256",
+                "version",
+            ])
+        } else {
+            BTreeSet::from([
+                "bundled_packages",
+                "license",
+                "name",
+                "path",
+                "roles",
+                "sha256",
+                "version",
+            ])
+        };
+        if object.keys().map(String::as_str).collect::<BTreeSet<_>>() != expected_fields
+            || artifact.license != PROJECT_LICENSE_EXPRESSION
+            || artifact.sha256.len() != 64
+            || !artifact
+                .sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            || !artifact.bundled_packages.is_empty()
+            || !names.insert(artifact.name.clone())
+            || !paths.insert(artifact.path.clone())
+        {
+            bail!("Web first-party artifact inventory is malformed or duplicated");
+        }
+        let path = Path::new("workers/web/dist").join(&artifact.path);
+        if !path.is_file() || sha256_file(&path)? != artifact.sha256 {
+            bail!(
+                "Web first-party artifact inventory checksum does not match {}",
+                artifact.path
+            );
+        }
+        parsed.push(artifact);
+    }
+    Ok(parsed)
+}
+
+fn framework_build_artifact_inventory(
+    inventory: &Value,
+) -> Result<Vec<FirstPartyArtifactInventory>> {
+    let artifacts = first_party_artifact_inventory(inventory)?;
+    let converter_path = depgraph_core::FRAMEWORK_BUILD_CONVERTER_ARTIFACT
+        .strip_prefix("libexec/")
+        .context("framework build converter path is not release-relative")?;
+    let converter = artifacts
+        .iter()
+        .find(|artifact| artifact.path == converter_path)
+        .context("Web first-party inventory has no framework build converter")?;
+    if converter.name != "depgraph-web-build-evidence"
+        || converter.version != depgraph_core::FRAMEWORK_BUILD_GATE_CONTRACT_VERSION
+        || converter.roles != ["framework-build-converter"]
+        || converter.framework.is_some()
+        || converter.capability.is_some()
+        || converter.observation_schema.is_some()
+    {
+        bail!("framework build converter inventory is incompatible");
+    }
+    let mut result = Vec::new();
+    for capability in depgraph_core::framework_build_capability_contract() {
+        let observer_path = capability
+            .observer_runtime_artifact
+            .strip_prefix("libexec/")
+            .context("framework build observer path is not release-relative")?;
+        let artifact = artifacts
+            .iter()
+            .find(|artifact| artifact.path == observer_path)
+            .with_context(|| {
+                format!(
+                    "Web first-party inventory has no {} observer",
+                    capability.framework
+                )
+            })?;
+        if artifact.name != format!("depgraph-{}-build-observer", capability.framework)
+            || artifact.version != capability.observer_version
+            || artifact.roles != ["framework-build-observer"]
+            || artifact.framework.as_deref() != Some(capability.framework.as_str())
+            || artifact.capability.as_deref() != Some(capability.capability.as_str())
+            || artifact.observation_schema.as_deref()
+                != Some(capability.observation_schema.as_str())
+        {
+            bail!(
+                "{} framework build observer inventory is incompatible",
+                capability.framework
+            );
+        }
+        result.push(artifact.clone());
+    }
+    result.push(converter.clone());
+    if artifacts
+        .iter()
+        .filter(|artifact| {
+            artifact.roles == ["framework-build-observer"]
+                || artifact.roles == ["framework-build-converter"]
+        })
+        .count()
+        != result.len()
+    {
+        bail!("Web first-party inventory contains an unknown framework build artifact");
+    }
+    Ok(result)
+}
+
+fn framework_build_artifact_checksums(inventory: &Value) -> Result<BTreeMap<String, String>> {
+    framework_build_artifact_inventory(inventory)?
+        .into_iter()
+        .map(|artifact| Ok((format!("libexec/{}", artifact.path), artifact.sha256)))
+        .collect()
+}
+
+fn runtime_collector_inventory(inventory: &Value) -> Result<RuntimeCollectorInventory> {
+    let artifacts = first_party_artifact_inventory(inventory)?;
+    framework_build_artifact_inventory(inventory)?;
+    let artifact = artifacts
+        .iter()
+        .find(|artifact| artifact.name == "depgraph-runtime-collector")
+        .context("Web runtime package inventory has no runtime collector")?;
     let collector = RuntimeCollectorInventory {
-        name: field("name")?.to_owned(),
-        version: field("version")?.to_owned(),
-        license: field("license")?.to_owned(),
-        path: field("path")?.to_owned(),
-        sha256: field("sha256")?.to_owned(),
+        name: artifact.name.clone(),
+        version: artifact.version.clone(),
+        license: artifact.license.clone(),
+        path: artifact.path.clone(),
+        sha256: artifact.sha256.clone(),
     };
     if collector.name != "depgraph-runtime-collector"
         || collector.version != RUNTIME_COLLECTOR_CONTRACT_VERSION
@@ -1418,8 +1803,11 @@ fn runtime_collector_inventory(inventory: &Value) -> Result<RuntimeCollectorInve
             .sha256
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        || artifact["roles"] != json!(["reference-runtime-collector"])
-        || artifact["bundled_packages"] != json!([])
+        || artifact.roles != ["reference-runtime-collector"]
+        || !artifact.bundled_packages.is_empty()
+        || artifact.framework.is_some()
+        || artifact.capability.is_some()
+        || artifact.observation_schema.is_some()
     {
         bail!("runtime collector inventory does not match the release compatibility unit");
     }
@@ -1789,17 +2177,29 @@ fn verify_release_assets(directory: &Path, requested_targets: &[String]) -> Resu
     {
         bail!("release targets do not contain identical runtime collector artifact bytes");
     }
+    if targets
+        .iter()
+        .map(|target| &target.framework_build_artifacts)
+        .collect::<BTreeSet<_>>()
+        .len()
+        != 1
+    {
+        bail!("release targets do not contain identical framework build artifact bytes");
+    }
 
     fs::write(
         directory.join("release-verification.json"),
         serde_json::to_vec_pretty(&ReleaseVerificationReport {
-            schema_version: 1,
+            schema_version: 2,
             release_version: VERSION.to_owned(),
             tag: format!("v{VERSION}"),
             protocol_version: "1.0".to_owned(),
             schema_compatibility_version: "1.0".to_owned(),
             framework_build_graph_contract_version:
                 depgraph_core::FRAMEWORK_BUILD_GRAPH_CONTRACT_VERSION.to_owned(),
+            framework_build_gate_contract_version:
+                depgraph_core::FRAMEWORK_BUILD_GATE_CONTRACT_VERSION.to_owned(),
+            framework_build_capabilities: depgraph_core::framework_build_capability_contract(),
             runtime_collector_contract_version: RUNTIME_COLLECTOR_CONTRACT_VERSION.to_owned(),
             compatibility: release_compatibility(),
             license_expression: PROJECT_LICENSE_EXPRESSION.to_owned(),
@@ -2132,6 +2532,8 @@ fn verify_published_release_tree(
         }
     }
     verify_runtime_collector_sbom(&sbom, &runtime_collector_sha256, "published release")?;
+    let framework_build_artifacts = manifest_framework_build_artifact_checksums(&manifest)?;
+    verify_framework_build_sbom(&sbom, &framework_build_artifacts, "published release")?;
     if package_names
         .iter()
         .filter(|name| name.starts_with("@typescript/typescript-"))
@@ -2154,6 +2556,28 @@ fn verify_published_release_tree(
     {
         bail!("published third-party license inventory is missing or mixes project licenses");
     }
+    for (path, version) in depgraph_core::framework_build_capability_contract()
+        .into_iter()
+        .map(|capability| {
+            (
+                capability.observer_runtime_artifact,
+                capability.observer_version,
+            )
+        })
+        .chain(std::iter::once((
+            depgraph_core::FRAMEWORK_BUILD_CONVERTER_ARTIFACT.to_owned(),
+            depgraph_core::FRAMEWORK_BUILD_GATE_CONTRACT_VERSION.to_owned(),
+        )))
+    {
+        let path = path
+            .strip_prefix("libexec/")
+            .context("framework build artifact path is not release-relative")?;
+        if !third_party.contains(&format!(
+            "First-party artifact {path} ({version}) is licensed under {PROJECT_LICENSE_EXPRESSION} by LICENSE-MIT and LICENSE-APACHE; its dependency-free bundle adds no third-party license entry."
+        )) {
+            bail!("published third-party license inventory is missing {path}");
+        }
+    }
     verify_runtime_collector_module(
         &verified_release_path(
             extracted,
@@ -2171,6 +2595,7 @@ fn verify_published_release_tree(
         sbom_sha256: sha256_file(&sbom_path)?,
         project_licenses: verified_licenses,
         runtime_collector_sha256,
+        framework_build_artifacts,
         workers,
     })
 }
@@ -2385,6 +2810,7 @@ fn verify_packaged_build_evidence(
     fixture: &Path,
     base_store: &Path,
 ) -> Result<()> {
+    let framework_contract = depgraph_core::framework_build_capability_contract();
     let adapters = [
         (
             "next",
@@ -2423,9 +2849,21 @@ fn verify_packaged_build_evidence(
         ),
     ];
     for (adapter, app, profile_id, observer, secret) in adapters {
+        let framework_capability = framework_contract
+            .iter()
+            .find(|capability| capability.framework == adapter);
         let store = verify_root.join(format!("build-{adapter}.db"));
         fs::copy(base_store, &store)?;
         let project = fixture.join("apps").join(app);
+        let deterministic_project =
+            framework_capability.map(|_| verify_root.join(format!("build-{adapter}-checkout-two")));
+        if let Some(second_project) = &deterministic_project {
+            copy_directory(&project, second_project)?;
+        }
+        let baseline_name = format!("build-{adapter}-baseline");
+        if framework_capability.is_some() {
+            create_packaged_snapshot(executable, &store, &baseline_name)?;
+        }
         let denied = Command::new(executable)
             .arg("--store")
             .arg(&store)
@@ -2442,27 +2880,7 @@ fn verify_packaged_build_evidence(
             bail!("packaged {adapter} build ran without explicit consent");
         }
 
-        let allowed = Command::new(executable)
-            .arg("--store")
-            .arg(&store)
-            .arg("resolve")
-            .arg("--build")
-            .arg(&project)
-            .arg("--allow-project-code")
-            .output()
-            .with_context(|| format!("failed to run packaged {adapter} build"))?;
-        let allowed_stdout = String::from_utf8_lossy(&allowed.stdout);
-        let allowed_stderr = String::from_utf8_lossy(&allowed.stderr);
-        if !allowed.status.success()
-            || !allowed_stdout.contains("status: Completed")
-            || !allowed_stdout.contains("project code executed: true")
-            || !allowed_stdout.contains("build evidence: promoted")
-            || !allowed_stdout.contains("network isolation:")
-        {
-            bail!(
-                "packaged {adapter} build evidence gate failed:\n{allowed_stdout}\n{allowed_stderr}"
-            );
-        }
+        let allowed = run_packaged_build(executable, &store, &project, adapter)?;
 
         let doctor = Command::new(executable)
             .arg("--store")
@@ -2557,12 +2975,55 @@ fn verify_packaged_build_evidence(
             bail!("packaged {adapter} why query could not traverse observed build evidence");
         }
 
+        let mut deterministic_outputs = None;
+        let mut deterministic_store = None;
+        if let (Some(capability), Some(second_project)) =
+            (framework_capability, deterministic_project.as_ref())
+        {
+            let target_name = format!("build-{adapter}-target");
+            create_packaged_snapshot(executable, &store, &target_name)?;
+            verify_packaged_framework_build_e2e(
+                executable,
+                &project,
+                &store,
+                &baseline_name,
+                &target_name,
+                profile_id,
+                capability,
+                graph,
+                edge,
+            )?;
+
+            let second_store = verify_root.join(format!("build-{adapter}-checkout-two.db"));
+            fs::copy(base_store, &second_store)?;
+            let second = run_packaged_build(executable, &second_store, second_project, adapter)?;
+            let second_export = packaged_web_export_json(executable, &second_store)?;
+            let mut first_graph = graph.clone();
+            let mut second_graph = second_export["graph"].clone();
+            remove_transient_build_run_ids(&mut first_graph);
+            remove_transient_build_run_ids(&mut second_graph);
+            if second_graph != first_graph {
+                bail!(
+                    "packaged {adapter} build graph changed across checkout-equivalent fixture roots"
+                );
+            }
+            deterministic_outputs = Some(second);
+            deterministic_store = Some(second_store);
+        }
+
         let secret_bytes = secret.as_bytes();
         if bytes_contain(&allowed.stdout, secret_bytes)
             || bytes_contain(&allowed.stderr, secret_bytes)
             || bytes_contain(&doctor.stdout, secret_bytes)
             || bytes_contain(&exported.stdout, secret_bytes)
             || bytes_contain(&fs::read(&store)?, secret_bytes)
+            || deterministic_outputs.as_ref().is_some_and(|output| {
+                bytes_contain(&output.stdout, secret_bytes)
+                    || bytes_contain(&output.stderr, secret_bytes)
+            })
+            || deterministic_store.as_ref().is_some_and(|store| {
+                fs::read(store).is_ok_and(|bytes| bytes_contain(&bytes, secret_bytes))
+            })
         {
             bail!("packaged {adapter} build leaked its fixture secret");
         }
@@ -2653,6 +3114,369 @@ fn verify_packaged_build_evidence(
         }
     }
     verify_packaged_build_runtime_fails_closed(executable, release_root, verify_root, fixture)?;
+    Ok(())
+}
+
+fn remove_transient_build_run_ids(value: &mut Value) {
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                remove_transient_build_run_ids(value);
+            }
+        }
+        Value::Object(values) => {
+            values.remove("build_run_id");
+            for value in values.values_mut() {
+                remove_transient_build_run_ids(value);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn run_packaged_build(
+    executable: &Path,
+    store: &Path,
+    project: &Path,
+    adapter: &str,
+) -> Result<std::process::Output> {
+    let output = Command::new(executable)
+        .arg("--store")
+        .arg(store)
+        .arg("resolve")
+        .arg("--build")
+        .arg(project)
+        .arg("--allow-project-code")
+        .output()
+        .with_context(|| format!("failed to run packaged {adapter} build"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success()
+        || !stdout.contains("status: Completed")
+        || !stdout.contains("project code executed: true")
+        || !stdout.contains("build evidence: promoted")
+        || !stdout.contains("network isolation:")
+    {
+        bail!("packaged {adapter} build evidence gate failed:\n{stdout}\n{stderr}");
+    }
+    Ok(output)
+}
+
+fn create_packaged_snapshot(executable: &Path, store: &Path, name: &str) -> Result<()> {
+    let output = Command::new(executable)
+        .arg("--store")
+        .arg(store)
+        .args(["snapshot", "create", name, "--json"])
+        .output()
+        .with_context(|| format!("failed to create packaged snapshot {name}"))?;
+    let snapshot = successful_json(output, &format!("create packaged snapshot {name}"))?;
+    if !snapshot["data"]["snapshot"]["names"]
+        .as_array()
+        .is_some_and(|names| names.iter().any(|snapshot_name| snapshot_name == name))
+    {
+        bail!("packaged snapshot {name} was not retained by name: {snapshot}");
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_packaged_framework_build_e2e(
+    executable: &Path,
+    project: &Path,
+    store: &Path,
+    baseline_name: &str,
+    target_name: &str,
+    profile_id: &str,
+    capability: &depgraph_core::FrameworkBuildCapabilityHealth,
+    graph: &Value,
+    edge: &Value,
+) -> Result<()> {
+    let profile = graph["profiles"]
+        .as_array()
+        .and_then(|profiles| profiles.iter().find(|profile| profile["id"] == profile_id))
+        .with_context(|| {
+            format!(
+                "packaged {} build graph omitted its profile",
+                capability.framework
+            )
+        })?;
+    let properties = &profile["properties"];
+    if properties["framework"] != capability.framework
+        || properties["observer"] != capability.observer
+        || properties["observer_version"] != capability.observer_version
+        || properties["framework_build_capability"] != capability.capability
+        || properties["framework_build_graph_contract_version"]
+            != depgraph_core::FRAMEWORK_BUILD_GRAPH_CONTRACT_VERSION
+        || profile["features"].as_array().is_none_or(|features| {
+            !features
+                .iter()
+                .any(|feature| feature == depgraph_core::FRAMEWORK_BUILD_GRAPH_CONTRACT_VERSION)
+                || !features
+                    .iter()
+                    .any(|feature| feature == capability.capability.as_str())
+        })
+    {
+        bail!(
+            "packaged {} build profile does not match its release capability: {profile}",
+            capability.framework
+        );
+    }
+    let edge_id = edge["id"]
+        .as_str()
+        .context("packaged framework build edge omitted its ID")?;
+    if !graph["evidence"].as_array().is_some_and(|evidence| {
+        evidence.iter().any(|item| {
+            item["owner_type"] == "edge"
+                && item["owner_id"] == edge_id
+                && item["kind"] == "build"
+                && item["extractor"] == capability.observer
+                && item["extractor_version"] == capability.observer_version
+                && item["properties"]["framework"] == capability.framework
+                && item["properties"]["capability"] == capability.capability
+                && item["properties"]["contract_version"]
+                    == depgraph_core::FRAMEWORK_BUILD_GRAPH_CONTRACT_VERSION
+        })
+    }) {
+        bail!(
+            "packaged {} build edge omitted exact capability evidence",
+            capability.framework
+        );
+    }
+    let dynamic_capability_observed = match capability.framework.as_str() {
+        "next" => graph["nodes"].as_array().is_some_and(|nodes| {
+            nodes.iter().any(|node| {
+                node["kind"] == "route"
+                    && node["properties"]["observed_only"] == true
+                    && node["properties"]["route_pattern"]
+                        .as_str()
+                        .is_some_and(|pattern| pattern.contains('['))
+            })
+        }),
+        "astro" => graph["nodes"].as_array().is_some_and(|nodes| {
+            nodes.iter().any(|node| {
+                node["kind"] == "route"
+                    && node["properties"]["dynamic"] == true
+                    && node["properties"]["observed_only"] == true
+            })
+        }),
+        "tanstack-router" => graph["edges"].as_array().is_some_and(|edges| {
+            edges.iter().any(|edge| {
+                edge["profile_id"] == profile_id
+                    && edge["phase"] == "build"
+                    && edge["kind"] == "dynamic_imports"
+            })
+        }),
+        "tanstack-start" => graph["nodes"].as_array().is_some_and(|nodes| {
+            nodes.iter().any(|node| {
+                node["kind"] == "server_function"
+                    && node["properties"]["production_rpc_id_status"] == "build-observed"
+            })
+        }),
+        _ => false,
+    };
+    if !dynamic_capability_observed {
+        bail!(
+            "packaged {} fixture did not exercise its mandatory dynamic build capability",
+            capability.framework
+        );
+    }
+
+    let source_selector = format!(
+        "id:{}",
+        edge["source"]
+            .as_str()
+            .context("packaged framework build edge omitted its source")?
+    );
+    let target_selector = format!(
+        "id:{}",
+        edge["target"]
+            .as_str()
+            .context("packaged framework build edge omitted its target")?
+    );
+    let query_contains_edge = |query: &Value| {
+        query["data"]["steps"].as_array().is_some_and(|steps| {
+            steps.iter().any(|step| {
+                step["edge"]["id"] == edge_id
+                    && step["evidence"].as_array().is_some_and(|evidence| {
+                        evidence.iter().any(|item| {
+                            item["kind"] == "build"
+                                && item["extractor"] == capability.observer
+                                && item["extractor_version"] == capability.observer_version
+                        })
+                    })
+            })
+        })
+    };
+    let deps = packaged_web_query(
+        executable,
+        store,
+        &[
+            "deps",
+            &source_selector,
+            "--phase",
+            "build",
+            "--profile",
+            profile_id,
+            "--json",
+        ],
+        &format!("query packaged {} build dependencies", capability.framework),
+    )?;
+    let dependents = packaged_web_query(
+        executable,
+        store,
+        &[
+            "dependents",
+            &target_selector,
+            "--phase",
+            "build",
+            "--profile",
+            profile_id,
+            "--json",
+        ],
+        &format!("query packaged {} build dependents", capability.framework),
+    )?;
+    let why = packaged_web_query(
+        executable,
+        store,
+        &[
+            "why",
+            &source_selector,
+            &target_selector,
+            "--phase",
+            "build",
+            "--profile",
+            profile_id,
+            "--json",
+        ],
+        &format!("explain packaged {} build dependency", capability.framework),
+    )?;
+    if !query_contains_edge(&deps)
+        || !query_contains_edge(&dependents)
+        || why["data"]["path_found"] != true
+        || !query_contains_edge(&why)
+    {
+        bail!(
+            "packaged {} build query lost its exact observed edge",
+            capability.framework
+        );
+    }
+
+    let diff = packaged_web_query(
+        executable,
+        store,
+        &[
+            "diff",
+            baseline_name,
+            target_name,
+            "--phase",
+            "build",
+            "--profile",
+            profile_id,
+            "--json",
+        ],
+        &format!("diff packaged {} build snapshots", capability.framework),
+    )?;
+    if diff["schema_version"] != depgraph_store::SNAPSHOT_DIFF_SCHEMA_VERSION
+        || diff["data"]["summary"]["total_changes"]
+            .as_u64()
+            .unwrap_or_default()
+            == 0
+    {
+        bail!(
+            "packaged {} build diff did not expose build changes: {diff}",
+            capability.framework
+        );
+    }
+
+    let impact = packaged_web_query(
+        executable,
+        store,
+        &[
+            "impact",
+            &target_selector,
+            "--phase",
+            "build",
+            "--profile",
+            profile_id,
+            "--json",
+        ],
+        &format!("query packaged {} build impact", capability.framework),
+    )?;
+    if impact["data"]["root"]["id"] != edge["target"]
+        || impact["data"]["complete"] != true
+        || !impact["data"]["impacts"].as_array().is_some_and(|impacts| {
+            impacts.iter().any(|impact| {
+                impact["dependency_path"]
+                    .as_array()
+                    .is_some_and(|path| path.iter().any(|step| step["edge"]["id"] == edge_id))
+            })
+        })
+    {
+        bail!(
+            "packaged {} build impact lost its observed reverse path: {impact}",
+            capability.framework
+        );
+    }
+
+    let policy = Command::new(executable)
+        .current_dir(project)
+        .arg("--store")
+        .arg(store)
+        .args(["policy", baseline_name, target_name, "--json"])
+        .output()?;
+    let policy = successful_json(
+        policy,
+        &format!("evaluate packaged {} build policy", capability.framework),
+    )?;
+    if policy["data"]["result"]["exit_code"] != 0
+        || policy["data"]["result"]["violations"]
+            .as_array()
+            .is_none_or(|violations| !violations.is_empty())
+    {
+        bail!(
+            "packaged {} build policy was not a clean result: {policy}",
+            capability.framework
+        );
+    }
+
+    let filtered = packaged_web_query(
+        executable,
+        store,
+        &[
+            "export",
+            "--format",
+            "json",
+            "--phase",
+            "build",
+            "--profile",
+            profile_id,
+        ],
+        &format!("export packaged {} build JSON", capability.framework),
+    )?;
+    if !filtered["graph"]["edges"].as_array().is_some_and(|edges| {
+        edges.iter().any(|edge| edge["id"] == edge_id)
+            && edges.iter().all(|edge| edge["phase"] == "build")
+    }) {
+        bail!(
+            "packaged {} filtered JSON export omitted its build edge",
+            capability.framework
+        );
+    }
+    let graphml =
+        packaged_web_export_filtered_text(executable, store, "graphml", profile_id, "build")?;
+    let repeated_graphml =
+        packaged_web_export_filtered_text(executable, store, "graphml", profile_id, "build")?;
+    if graphml != repeated_graphml
+        || !graphml.starts_with("<?xml")
+        || !graphml.contains("<graphml")
+        || !graphml.contains(&capability.capability)
+        || !graphml.contains(depgraph_core::FRAMEWORK_BUILD_GRAPH_CONTRACT_VERSION)
+    {
+        bail!(
+            "packaged {} GraphML build export was invalid or nondeterministic",
+            capability.framework
+        );
+    }
     Ok(())
 }
 
@@ -2802,6 +3626,16 @@ fn verify_release_static_prelaunch_fails_closed(extracted: &Path) -> Result<()> 
         cases.push(("packaged smoke compatibility mismatch", manifest));
 
         let mut manifest = baseline.clone();
+        manifest.compatibility.framework_build_gate_contract_version =
+            "dynamic-framework-evidence-release-gate-v2".to_owned();
+        cases.push(("framework build gate compatibility mismatch", manifest));
+
+        let mut manifest = baseline.clone();
+        manifest.compatibility.framework_build_capabilities[0].observer_version =
+            "9.9.9".to_owned();
+        cases.push(("framework build capability mismatch", manifest));
+
+        let mut manifest = baseline.clone();
         manifest.compatibility.runtime_collector_contract_version =
             "runtime-collector-v2".to_owned();
         cases.push(("runtime collector compatibility mismatch", manifest));
@@ -2811,6 +3645,21 @@ fn verify_release_static_prelaunch_fails_closed(extracted: &Path) -> Result<()> 
             .runtime_artifacts
             .retain(|artifact| artifact.path != format!("libexec/{RUNTIME_COLLECTOR_ARTIFACT}"));
         cases.push(("missing runtime collector artifact", manifest));
+
+        let mut manifest = baseline.clone();
+        manifest
+            .runtime_artifacts
+            .retain(|artifact| artifact.path != depgraph_core::FRAMEWORK_BUILD_CONVERTER_ARTIFACT);
+        cases.push(("missing framework build converter artifact", manifest));
+
+        let mut manifest = baseline.clone();
+        let observer_path = depgraph_core::framework_build_capability_contract()[0]
+            .observer_runtime_artifact
+            .clone();
+        manifest
+            .runtime_artifacts
+            .retain(|artifact| artifact.path != observer_path);
+        cases.push(("missing framework build observer artifact", manifest));
 
         let mut manifest = baseline.clone();
         manifest.project_licenses.pop();
@@ -6690,6 +7539,38 @@ fn packaged_web_export_text(executable: &Path, store: &Path, format: &str) -> Re
         .with_context(|| format!("packaged Web {format} export returned non-UTF-8 output"))
 }
 
+fn packaged_web_export_filtered_text(
+    executable: &Path,
+    store: &Path,
+    format: &str,
+    profile: &str,
+    phase: &str,
+) -> Result<String> {
+    let output = Command::new(executable)
+        .arg("--store")
+        .arg(store)
+        .args([
+            "export",
+            "--format",
+            format,
+            "--phase",
+            phase,
+            "--profile",
+            profile,
+        ])
+        .output()
+        .with_context(|| format!("failed to export filtered packaged Web graph as {format}"))?;
+    if !output.status.success() {
+        bail!(
+            "packaged filtered Web {format} export failed: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    String::from_utf8(output.stdout)
+        .with_context(|| format!("packaged filtered Web {format} export returned non-UTF-8 output"))
+}
+
 fn verify_packaged_web_graph_exports_deterministic(
     executable: &Path,
     first_store: &Path,
@@ -7059,6 +7940,11 @@ fn verify_release_metadata(extracted: &Path) -> Result<ReleaseManifest> {
         }
     }
     verify_runtime_collector_sbom(&sbom, &runtime_collector_sha256, "release")?;
+    verify_framework_build_sbom(
+        &sbom,
+        &manifest_framework_build_artifact_checksums(&manifest)?,
+        "release",
+    )?;
     if package_names
         .iter()
         .filter(|name| name.starts_with("@typescript/typescript-"))
@@ -7695,10 +8581,10 @@ mod tests {
         WebSemanticAttestation, WorkerBackend, archive_entries, cargo_runtime_packages,
         create_tar_archive, create_zip_archive, executable_name_for_target, extract_archive,
         normalized_spdx_license, package_url, parse_worker_handshake, release_compatibility,
-        rust_backend_from_handshake, verify_checksum_sidecar, verify_project_metadata,
-        verify_release_tag_values, verify_rust_analyzer_dependencies, verify_rust_backend,
-        verify_web_semantic_attestation, web_runtime_packages, web_semantic_from_handshake,
-        without_windows_verbatim_prefix, workspace_root,
+        remove_transient_build_run_ids, rust_backend_from_handshake, verify_checksum_sidecar,
+        verify_project_metadata, verify_release_tag_values, verify_rust_analyzer_dependencies,
+        verify_rust_backend, verify_web_semantic_attestation, web_runtime_packages,
+        web_semantic_from_handshake, without_windows_verbatim_prefix, workspace_root,
     };
 
     fn release_tree() -> Result<(tempfile::TempDir, String)> {
@@ -7721,6 +8607,32 @@ mod tests {
     #[test]
     fn repository_release_metadata_is_synchronized() -> Result<()> {
         verify_project_metadata(&workspace_root())
+    }
+
+    #[test]
+    fn framework_build_determinism_ignores_only_transient_run_ids() {
+        let mut graph = json!({
+            "build_run_id": "top-level-run",
+            "nodes": [{
+                "id": "stable-node",
+                "properties": {
+                    "build_run_id": "nested-run",
+                    "artifact_digest": "stable-digest"
+                }
+            }]
+        });
+        remove_transient_build_run_ids(&mut graph);
+        assert_eq!(
+            graph,
+            json!({
+                "nodes": [{
+                    "id": "stable-node",
+                    "properties": {
+                        "artifact_digest": "stable-digest"
+                    }
+                }]
+            })
+        );
     }
 
     #[test]

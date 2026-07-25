@@ -19,6 +19,15 @@ graph for the same normalized observation. Base static/semantic nodes can be
 reused only byte-for-byte; conflicting identities reject the complete build
 delta.
 
+The release compatibility unit additionally fixes
+`dynamic-framework-evidence-release-gate-v1` and an ordered ledger for all four
+frameworks: observer identity/version, observation schema, mandatory dynamic
+capability, observer artifact, and shared converter artifact. The package
+fixture verifies the static/semantic/build union with query, diff, impact,
+policy, JSON/GraphML, checkout determinism, and rollback. All five build
+artifacts are dependency-free first-party SPDX packages whose checksums must be
+identical across the aggregate target set.
+
 When a completed framework build layer becomes the next base, generated nodes
 with the same identity reuse the exact stored bytes and already-promoted site,
 edge, and diagnostic IDs are omitted. A stable site that points at a different

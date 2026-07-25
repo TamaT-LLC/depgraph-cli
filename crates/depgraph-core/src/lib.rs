@@ -30,18 +30,26 @@ use depgraph_store::{
 use serde::{Deserialize, Serialize};
 
 pub use build::{
-    ASTRO_BUILD_OBSERVER, ASTRO_BUILD_OBSERVER_VERSION, BUILD_SUPERVISOR_VERSION, BuildAudit,
-    BuildExecutionOutcome, BuildExecutionPlan, BuildExecutionRequest, BuildOutcomeKind,
-    NEXT_BUILD_OBSERVER, NEXT_BUILD_OBSERVER_VERSION, NetworkIsolation,
-    TANSTACK_ROUTER_BUILD_OBSERVER, TANSTACK_START_BUILD_OBSERVER, WEB_BUILD_OBSERVER_VERSION,
-    WebBuildAdapter, WebBuildObservation, create_build_execution_request, execute_build_request,
-    execute_build_request_with_cancellation, supervise_build, supervise_build_with_cancellation,
+    ASTRO_BUILD_CAPABILITY, ASTRO_BUILD_OBSERVATION_SCHEMA, ASTRO_BUILD_OBSERVER,
+    ASTRO_BUILD_OBSERVER_VERSION, BUILD_SUPERVISOR_VERSION, BuildAudit, BuildExecutionOutcome,
+    BuildExecutionPlan, BuildExecutionRequest, BuildOutcomeKind, NEXT_BUILD_CAPABILITY,
+    NEXT_BUILD_OBSERVATION_SCHEMA, NEXT_BUILD_OBSERVER, NEXT_BUILD_OBSERVER_VERSION,
+    NetworkIsolation, TANSTACK_ROUTER_BUILD_CAPABILITY, TANSTACK_ROUTER_BUILD_OBSERVATION_SCHEMA,
+    TANSTACK_ROUTER_BUILD_OBSERVER, TANSTACK_ROUTER_BUILD_OBSERVER_VERSION,
+    TANSTACK_START_BUILD_CAPABILITY, TANSTACK_START_BUILD_OBSERVATION_SCHEMA,
+    TANSTACK_START_BUILD_OBSERVER, TANSTACK_START_BUILD_OBSERVER_VERSION,
+    WEB_BUILD_OBSERVER_VERSION, WebBuildAdapter, WebBuildObservation,
+    create_build_execution_request, execute_build_request, execute_build_request_with_cancellation,
+    supervise_build, supervise_build_with_cancellation,
 };
 pub use build_evidence::{
     stage_build_evidence, validate_build_evidence, validate_framework_build_evidence_contract,
     web_build_protocol_ndjson,
 };
 pub const FRAMEWORK_BUILD_GRAPH_CONTRACT_VERSION: &str = "framework-build-graph-v1";
+pub const FRAMEWORK_BUILD_GATE_CONTRACT_VERSION: &str =
+    "dynamic-framework-evidence-release-gate-v1";
+pub const FRAMEWORK_BUILD_CONVERTER_ARTIFACT: &str = "libexec/depgraph-web-build-evidence.mjs";
 pub use cache::build_cache_key;
 pub use cancellation::CancellationToken;
 pub use config::{Config, DaemonConfig, default_store_path, init_config};
@@ -170,6 +178,75 @@ pub struct ReleaseHealth {
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+pub struct FrameworkBuildCapabilityHealth {
+    pub framework: String,
+    pub observer: String,
+    pub observer_version: String,
+    pub observation_schema: String,
+    pub capability: String,
+    pub observer_runtime_artifact: String,
+    pub converter_runtime_artifact: String,
+}
+
+pub fn framework_build_capability_contract() -> Vec<FrameworkBuildCapabilityHealth> {
+    [
+        (
+            "astro",
+            ASTRO_BUILD_OBSERVER,
+            ASTRO_BUILD_OBSERVER_VERSION,
+            ASTRO_BUILD_OBSERVATION_SCHEMA,
+            ASTRO_BUILD_CAPABILITY,
+            "libexec/astro-build-integration.mjs",
+        ),
+        (
+            "next",
+            NEXT_BUILD_OBSERVER,
+            NEXT_BUILD_OBSERVER_VERSION,
+            NEXT_BUILD_OBSERVATION_SCHEMA,
+            NEXT_BUILD_CAPABILITY,
+            "libexec/next-build-adapter.mjs",
+        ),
+        (
+            "tanstack-router",
+            TANSTACK_ROUTER_BUILD_OBSERVER,
+            TANSTACK_ROUTER_BUILD_OBSERVER_VERSION,
+            TANSTACK_ROUTER_BUILD_OBSERVATION_SCHEMA,
+            TANSTACK_ROUTER_BUILD_CAPABILITY,
+            "libexec/tanstack-router-build-observer.mjs",
+        ),
+        (
+            "tanstack-start",
+            TANSTACK_START_BUILD_OBSERVER,
+            TANSTACK_START_BUILD_OBSERVER_VERSION,
+            TANSTACK_START_BUILD_OBSERVATION_SCHEMA,
+            TANSTACK_START_BUILD_CAPABILITY,
+            "libexec/tanstack-start-build-observer.mjs",
+        ),
+    ]
+    .into_iter()
+    .map(
+        |(
+            framework,
+            observer,
+            observer_version,
+            observation_schema,
+            capability,
+            observer_runtime_artifact,
+        )| FrameworkBuildCapabilityHealth {
+            framework: framework.to_owned(),
+            observer: observer.to_owned(),
+            observer_version: observer_version.to_owned(),
+            observation_schema: observation_schema.to_owned(),
+            capability: capability.to_owned(),
+            observer_runtime_artifact: observer_runtime_artifact.to_owned(),
+            converter_runtime_artifact: FRAMEWORK_BUILD_CONVERTER_ARTIFACT.to_owned(),
+        },
+    )
+    .collect()
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ReleaseCompatibilityHealth {
     pub store_schema_version: i64,
     pub minimum_migratable_store_schema_version: i64,
@@ -182,6 +259,8 @@ pub struct ReleaseCompatibilityHealth {
     pub policy_schema_version: String,
     pub policy_result_schema_version: String,
     pub framework_build_graph_contract_version: String,
+    pub framework_build_gate_contract_version: String,
+    pub framework_build_capabilities: Vec<FrameworkBuildCapabilityHealth>,
     pub runtime_trace_schema_version: String,
     pub runtime_collector_contract_version: String,
     pub graphml_schema_version: String,
@@ -201,6 +280,8 @@ pub fn release_compatibility_contract() -> ReleaseCompatibilityHealth {
         policy_schema_version: POLICY_SCHEMA_VERSION.to_owned(),
         policy_result_schema_version: POLICY_RESULT_SCHEMA_VERSION.to_owned(),
         framework_build_graph_contract_version: FRAMEWORK_BUILD_GRAPH_CONTRACT_VERSION.to_owned(),
+        framework_build_gate_contract_version: FRAMEWORK_BUILD_GATE_CONTRACT_VERSION.to_owned(),
+        framework_build_capabilities: framework_build_capability_contract(),
         runtime_trace_schema_version: RUNTIME_TRACE_SCHEMA_VERSION.to_owned(),
         runtime_collector_contract_version: RUNTIME_COLLECTOR_CONTRACT_VERSION.to_owned(),
         graphml_schema_version: GRAPHML_SCHEMA_VERSION.to_owned(),
@@ -722,9 +803,11 @@ mod tests {
     use std::{ffi::OsString, path::PathBuf};
 
     use super::{
-        AdapterKind, DoctorWorkerLocation, parse_release_manifest, parse_worker_handshake,
-        preflight_doctor_workers, release_compatibility_contract, suppressed_worker_health,
-        verify_release_compatibility, worker,
+        AdapterKind, DoctorWorkerLocation, FRAMEWORK_BUILD_CONVERTER_ARTIFACT,
+        FRAMEWORK_BUILD_GATE_CONTRACT_VERSION, framework_build_capability_contract,
+        parse_release_manifest, parse_worker_handshake, preflight_doctor_workers,
+        release_compatibility_contract, suppressed_worker_health, verify_release_compatibility,
+        worker,
     };
 
     fn test_worker_spec(adapter: AdapterKind) -> worker::WorkerSpec {
@@ -785,6 +868,39 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("does not match")
+        );
+
+        let mut framework_capability_drifted = release_compatibility_contract();
+        framework_capability_drifted.framework_build_capabilities[0].observer_version =
+            "9.9.9".to_owned();
+        assert!(
+            verify_release_compatibility(&framework_capability_drifted)
+                .unwrap_err()
+                .to_string()
+                .contains("does not match")
+        );
+    }
+
+    #[test]
+    fn framework_build_release_gate_pins_every_dynamic_capability() {
+        let capabilities = framework_build_capability_contract();
+        assert_eq!(
+            capabilities
+                .iter()
+                .map(|capability| capability.framework.as_str())
+                .collect::<Vec<_>>(),
+            ["astro", "next", "tanstack-router", "tanstack-start"]
+        );
+        assert!(capabilities.iter().all(|capability| {
+            capability.converter_runtime_artifact == FRAMEWORK_BUILD_CONVERTER_ARTIFACT
+                && capability.observer_runtime_artifact.starts_with("libexec/")
+                && capability.observer_version.contains('.')
+                && (capability.observation_schema.ends_with("-v1")
+                    || capability.observation_schema.ends_with("-v2"))
+        }));
+        assert_eq!(
+            release_compatibility_contract().framework_build_gate_contract_version,
+            FRAMEWORK_BUILD_GATE_CONTRACT_VERSION
         );
     }
 

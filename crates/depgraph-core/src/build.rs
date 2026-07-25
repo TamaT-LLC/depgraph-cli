@@ -42,8 +42,19 @@ pub const TANSTACK_ROUTER_BUILD_OBSERVER: &str = "tanstack-router-vite-build-obs
 pub const TANSTACK_START_BUILD_OBSERVER: &str = "tanstack-start-vite-build-observer";
 pub const NEXT_BUILD_OBSERVER_VERSION: &str = "0.2.0";
 pub const ASTRO_BUILD_OBSERVER_VERSION: &str = "0.2.0";
+pub const TANSTACK_ROUTER_BUILD_OBSERVER_VERSION: &str = "0.1.0";
 pub const TANSTACK_START_BUILD_OBSERVER_VERSION: &str = "0.2.0";
-pub const WEB_BUILD_OBSERVER_VERSION: &str = "0.1.0";
+pub const WEB_BUILD_OBSERVER_VERSION: &str = TANSTACK_ROUTER_BUILD_OBSERVER_VERSION;
+pub const NEXT_BUILD_CAPABILITY: &str = "next-adapter-api-16.2-v1";
+pub const ASTRO_BUILD_CAPABILITY: &str = "astro-integration-v5-v7-vite-v6-v7-v1";
+pub const TANSTACK_ROUTER_BUILD_CAPABILITY: &str =
+    "tanstack-router-v1-vite-v6-v7-generated-route-v1";
+pub const TANSTACK_START_BUILD_CAPABILITY: &str =
+    "tanstack-start-v1-vite-v7-production-rpc-manifest-v2";
+pub const NEXT_BUILD_OBSERVATION_SCHEMA: &str = "next-build-observation-v2";
+pub const ASTRO_BUILD_OBSERVATION_SCHEMA: &str = "astro-build-observation-v2";
+pub const TANSTACK_ROUTER_BUILD_OBSERVATION_SCHEMA: &str = "tanstack-router-build-observation-v1";
+pub const TANSTACK_START_BUILD_OBSERVATION_SCHEMA: &str = "tanstack-start-build-observation-v2";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -102,10 +113,10 @@ impl WebBuildAdapter {
 
     fn observation_schema(self) -> &'static str {
         match self {
-            Self::Next => "next-build-observation-v2",
-            Self::Astro => "astro-build-observation-v2",
-            Self::TanstackRouter => "tanstack-router-build-observation-v1",
-            Self::TanstackStart => "tanstack-start-build-observation-v2",
+            Self::Next => NEXT_BUILD_OBSERVATION_SCHEMA,
+            Self::Astro => ASTRO_BUILD_OBSERVATION_SCHEMA,
+            Self::TanstackRouter => TANSTACK_ROUTER_BUILD_OBSERVATION_SCHEMA,
+            Self::TanstackStart => TANSTACK_START_BUILD_OBSERVATION_SCHEMA,
         }
     }
 }

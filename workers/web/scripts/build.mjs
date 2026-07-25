@@ -43,57 +43,74 @@ const bundle = await build({
   }],
 });
 
-await build({
-  entryPoints: [fileURLToPath(new URL("../src/next-build-adapter-entry.ts", import.meta.url))],
-  outfile: fileURLToPath(new URL("../dist/next-build-adapter.mjs", import.meta.url)),
-  bundle: true,
-  platform: "node",
-  format: "esm",
-  target: "node24",
-  sourcemap: false,
-  legalComments: "external",
-});
+const frameworkBuildDefinitions = [
+  {
+    framework: "astro",
+    name: "depgraph-astro-build-observer",
+    version: "0.2.0",
+    capability: "astro-integration-v5-v7-vite-v6-v7-v1",
+    observation_schema: "astro-build-observation-v2",
+    entry: "../src/astro-build-integration-entry.ts",
+    path: "astro-build-integration.mjs",
+  },
+  {
+    framework: "next",
+    name: "depgraph-next-build-observer",
+    version: "0.2.0",
+    capability: "next-adapter-api-16.2-v1",
+    observation_schema: "next-build-observation-v2",
+    entry: "../src/next-build-adapter-entry.ts",
+    path: "next-build-adapter.mjs",
+  },
+  {
+    framework: "tanstack-router",
+    name: "depgraph-tanstack-router-build-observer",
+    version: "0.1.0",
+    capability: "tanstack-router-v1-vite-v6-v7-generated-route-v1",
+    observation_schema: "tanstack-router-build-observation-v1",
+    entry: "../src/tanstack-router-build-observer-entry.ts",
+    path: "tanstack-router-build-observer.mjs",
+  },
+  {
+    framework: "tanstack-start",
+    name: "depgraph-tanstack-start-build-observer",
+    version: "0.2.0",
+    capability: "tanstack-start-v1-vite-v7-production-rpc-manifest-v2",
+    observation_schema: "tanstack-start-build-observation-v2",
+    entry: "../src/tanstack-start-build-observer-entry.ts",
+    path: "tanstack-start-build-observer.mjs",
+  },
+];
+const frameworkBuildBundles = [];
+for (const definition of frameworkBuildDefinitions) {
+  const result = await build({
+    entryPoints: [fileURLToPath(new URL(definition.entry, import.meta.url))],
+    outfile: fileURLToPath(new URL(`../dist/${definition.path}`, import.meta.url)),
+    bundle: true,
+    platform: "node",
+    format: "esm",
+    target: "node24",
+    metafile: true,
+    sourcemap: false,
+    legalComments: "external",
+  });
+  frameworkBuildBundles.push({ definition, result });
+}
 
-await build({
-  entryPoints: [fileURLToPath(new URL("../src/astro-build-integration-entry.ts", import.meta.url))],
-  outfile: fileURLToPath(new URL("../dist/astro-build-integration.mjs", import.meta.url)),
+const frameworkBuildConverterDefinition = {
+  name: "depgraph-web-build-evidence",
+  version: "dynamic-framework-evidence-release-gate-v1",
+  entry: "../src/build-evidence-entry.ts",
+  path: "depgraph-web-build-evidence.mjs",
+};
+const frameworkBuildConverterBundle = await build({
+  entryPoints: [fileURLToPath(new URL(frameworkBuildConverterDefinition.entry, import.meta.url))],
+  outfile: fileURLToPath(new URL(`../dist/${frameworkBuildConverterDefinition.path}`, import.meta.url)),
   bundle: true,
   platform: "node",
   format: "esm",
   target: "node24",
-  sourcemap: false,
-  legalComments: "external",
-});
-
-await build({
-  entryPoints: [fileURLToPath(new URL("../src/tanstack-start-build-observer-entry.ts", import.meta.url))],
-  outfile: fileURLToPath(new URL("../dist/tanstack-start-build-observer.mjs", import.meta.url)),
-  bundle: true,
-  platform: "node",
-  format: "esm",
-  target: "node24",
-  sourcemap: false,
-  legalComments: "external",
-});
-
-await build({
-  entryPoints: [fileURLToPath(new URL("../src/tanstack-router-build-observer-entry.ts", import.meta.url))],
-  outfile: fileURLToPath(new URL("../dist/tanstack-router-build-observer.mjs", import.meta.url)),
-  bundle: true,
-  platform: "node",
-  format: "esm",
-  target: "node24",
-  sourcemap: false,
-  legalComments: "external",
-});
-
-await build({
-  entryPoints: [fileURLToPath(new URL("../src/build-evidence-entry.ts", import.meta.url))],
-  outfile: fileURLToPath(new URL("../dist/depgraph-web-build-evidence.mjs", import.meta.url)),
-  bundle: true,
-  platform: "node",
-  format: "esm",
-  target: "node24",
+  metafile: true,
   sourcemap: false,
   legalComments: "external",
 });
@@ -175,6 +192,31 @@ const collectorBundledPackages = [...new Set(
 if (collectorBundledPackages.length !== 0) {
   throw new Error(`runtime collector must remain dependency-free: ${JSON.stringify(collectorBundledPackages)}`);
 }
+const dependencyFreeArtifact = async (definition, result, roles) => {
+  const bundled = [...new Set(
+    Object.keys(result.metafile.inputs)
+      .map(bundledPackageName)
+      .filter((name) => name !== null),
+  )].sort();
+  if (bundled.length !== 0) {
+    throw new Error(`${definition.path} must remain dependency-free: ${JSON.stringify(bundled)}`);
+  }
+  const artifactPath = new URL(`../dist/${definition.path}`, import.meta.url);
+  return {
+    name: definition.name,
+    version: definition.version,
+    license: "MIT OR Apache-2.0",
+    path: definition.path,
+    sha256: createHash("sha256").update(await readFile(artifactPath)).digest("hex"),
+    roles,
+    bundled_packages: bundled,
+    ...("framework" in definition ? {
+      framework: definition.framework,
+      capability: definition.capability,
+      observation_schema: definition.observation_schema,
+    } : {}),
+  };
+};
 const collectorPath = new URL("../dist/depgraph-runtime-collector.mjs", import.meta.url);
 const collectorArtifact = {
   name: "depgraph-runtime-collector",
@@ -185,6 +227,14 @@ const collectorArtifact = {
   roles: ["reference-runtime-collector"],
   bundled_packages: collectorBundledPackages,
 };
+const frameworkBuildArtifacts = await Promise.all(frameworkBuildBundles.map(
+  ({ definition, result }) => dependencyFreeArtifact(definition, result, ["framework-build-observer"]),
+));
+const frameworkBuildConverterArtifact = await dependencyFreeArtifact(
+  frameworkBuildConverterDefinition,
+  frameworkBuildConverterBundle,
+  ["framework-build-converter"],
+);
 
 const packageEntry = (metadata, roles) => ({
   name: metadata.name,
@@ -199,6 +249,10 @@ const runtimePackages = [
 ].sort((left, right) => left.name.localeCompare(right.name) || left.version.localeCompare(right.version));
 await writeFile(
   new URL("../dist/runtime-packages.json", import.meta.url),
-  `${JSON.stringify({ schema_version: 1, artifacts: [collectorArtifact], packages: runtimePackages }, null, 2)}\n`,
+  `${JSON.stringify({
+    schema_version: 1,
+    artifacts: [collectorArtifact, ...frameworkBuildArtifacts, frameworkBuildConverterArtifact],
+    packages: runtimePackages,
+  }, null, 2)}\n`,
   "utf8",
 );

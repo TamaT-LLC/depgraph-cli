@@ -143,15 +143,19 @@ pub fn validate_framework_build_evidence_contract(protocol: &ValidatedProtocol) 
         "framework_build_capability",
         "framework build profile",
     )?;
-    if !matches!(
-        framework,
-        "next" | "astro" | "tanstack-router" | "tanstack-start"
-    ) || profile
-        .features
-        .iter()
-        .filter(|feature| feature.as_str() == crate::FRAMEWORK_BUILD_GRAPH_CONTRACT_VERSION)
-        .count()
-        != 1
+    let expected = crate::framework_build_capability_contract()
+        .into_iter()
+        .find(|entry| entry.framework == framework)
+        .context("framework build profile declares an unsupported framework")?;
+    if observer != expected.observer
+        || observer_version != expected.observer_version
+        || capability != expected.capability
+        || profile
+            .features
+            .iter()
+            .filter(|feature| feature.as_str() == crate::FRAMEWORK_BUILD_GRAPH_CONTRACT_VERSION)
+            .count()
+            != 1
         || profile
             .features
             .iter()
@@ -497,7 +501,7 @@ mod tests {
             "properties":{
                 "framework":"next",
                 "observer":"next-adapter-observer",
-                "observer_version":"0.1.0",
+                "observer_version":"0.2.0",
                 "framework_build_capability":"next-adapter-api-16.2-v1",
                 "framework_build_graph_contract_version":"framework-build-graph-v1",
                 "framework_build_node_count":"0",
@@ -516,7 +520,7 @@ mod tests {
         };
         validate_framework_build_evidence_contract(&protocol)?;
 
-        let mut drifted = protocol;
+        let mut drifted = protocol.clone();
         drifted
             .profiles
             .get_mut("profile:build")
@@ -528,6 +532,23 @@ mod tests {
             );
         assert!(
             validate_framework_build_evidence_contract(&drifted)
+                .unwrap_err()
+                .to_string()
+                .contains("versioned contract")
+        );
+
+        let mut capability_drifted = protocol;
+        capability_drifted
+            .profiles
+            .get_mut("profile:build")
+            .context("test profile")?
+            .properties
+            .insert(
+                "framework_build_capability".to_owned(),
+                json!("next-adapter-api-16.2-v9"),
+            );
+        assert!(
+            validate_framework_build_evidence_contract(&capability_drifted)
                 .unwrap_err()
                 .to_string()
                 .contains("versioned contract")
