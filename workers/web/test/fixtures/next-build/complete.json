@@ -1,0 +1,128 @@
+{
+  "routing": {
+    "beforeMiddleware": [],
+    "beforeFiles": [],
+    "afterFiles": [],
+    "dynamicRoutes": [
+      {
+        "source": "/docs/products/[id]",
+        "sourceRegex": "^/docs/products/([^/]+?)(?:/)?$",
+        "destination": "/docs/products/$1"
+      },
+      {
+        "source": "/docs/products/[id].rsc",
+        "sourceRegex": "^/docs/products/([^/]+?)\\.rsc$",
+        "destination": "/docs/products/$1.rsc"
+      },
+      {
+        "source": "/docs/_next/data/private-build-id/products/[id].json",
+        "sourceRegex": "^/docs/_next/data/private-build-id/products/([^/]+?)\\.json$",
+        "destination": "/docs/_next/data/private-build-id/products/$1.json"
+      }
+    ],
+    "onMatch": [],
+    "fallback": [],
+    "shouldNormalizeNextData": true,
+    "rsc": {}
+  },
+  "outputs": {
+    "pages": [],
+    "pagesApi": [],
+    "appPages": [
+      {
+        "id": "app-products",
+        "type": "APP_PAGE",
+        "pathname": "/docs/products/[id]",
+        "sourcePage": "products/[id]/page",
+        "filePath": "/repo/apps/site/.next/server/app/products/[id]/page.js",
+        "runtime": "nodejs",
+        "assets": {
+          "apps/site/.next/server/chunks/server-shared.js": "/repo/apps/site/.next/server/chunks/server-shared.js",
+          "apps/site/.next/static/chunks/client-shared.js": "/repo/apps/site/.next/static/chunks/client-shared.js"
+        },
+        "wasmAssets": {},
+        "config": {}
+      },
+      {
+        "id": "app-products.rsc",
+        "type": "APP_PAGE",
+        "pathname": "/docs/products/[id].rsc",
+        "sourcePage": "products/[id]/page",
+        "filePath": "/repo/apps/site/.next/server/app/products/[id]/page.js",
+        "runtime": "nodejs",
+        "assets": {},
+        "wasmAssets": {},
+        "config": {}
+      }
+    ],
+    "appRoutes": [
+      {
+        "id": "app-robots",
+        "type": "APP_ROUTE",
+        "pathname": "/docs/robots.txt",
+        "sourcePage": "robots/route",
+        "filePath": "/repo/apps/site/.next/server/edge/robots.js",
+        "runtime": "edge",
+        "edgeRuntime": {
+          "modulePath": "/repo/apps/site/.next/server/edge/robots.js",
+          "entryKey": "middleware_app/robots/route",
+          "handlerExport": "handler"
+        },
+        "assets": {
+          "apps/site/.next/server/edge/robots-runtime.js": "/repo/apps/site/.next/server/edge/robots-runtime.js"
+        },
+        "wasmAssets": {},
+        "config": {}
+      },
+      {
+        "id": "app-robots.rsc",
+        "type": "APP_ROUTE",
+        "pathname": "/docs/robots.txt.rsc",
+        "sourcePage": "robots/route",
+        "filePath": "/repo/apps/site/.next/server/edge/robots.js",
+        "runtime": "edge",
+        "edgeRuntime": {
+          "modulePath": "/repo/apps/site/.next/server/edge/robots.js",
+          "entryKey": "middleware_app/robots/route",
+          "handlerExport": "handler"
+        },
+        "assets": {},
+        "wasmAssets": {},
+        "config": {}
+      }
+    ],
+    "prerenders": [
+      {
+        "id": "products-one-prerender",
+        "type": "PRERENDER",
+        "pathname": "/docs/products/one",
+        "parentOutputId": "app-products",
+        "groupId": 7,
+        "fallback": {
+          "filePath": "/repo/apps/site/.next/server/app/products/one.html"
+        },
+        "config": {}
+      }
+    ],
+    "staticFiles": [
+      {
+        "id": "client-chunk-private-id",
+        "type": "STATIC_FILE",
+        "pathname": "/docs/_next/static/chunks/app-a1.js",
+        "filePath": "/repo/apps/site/.next/static/chunks/app-a1.js"
+      },
+      {
+        "id": "build-manifest-private-id",
+        "type": "STATIC_FILE",
+        "pathname": "/docs/_next/static/private-build-id/_buildManifest.js",
+        "filePath": "/repo/apps/site/.next/static/private-build-id/_buildManifest.js"
+      },
+      {
+        "id": "favicon-private-id",
+        "type": "STATIC_FILE",
+        "pathname": "/docs/favicon.ico",
+        "filePath": "/repo/apps/site/.next/server/app/favicon.ico.body"
+      }
+    ]
+  }
+}

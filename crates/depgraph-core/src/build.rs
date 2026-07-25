@@ -39,6 +39,7 @@ const MAX_OBSERVATION_BYTES: u64 = 16 * 1024 * 1024;
 pub const NEXT_BUILD_OBSERVER: &str = "next-adapter-observer";
 pub const ASTRO_BUILD_OBSERVER: &str = "astro-vite-build-observer";
 pub const TANSTACK_START_BUILD_OBSERVER: &str = "tanstack-start-vite-build-observer";
+pub const NEXT_BUILD_OBSERVER_VERSION: &str = "0.2.0";
 pub const WEB_BUILD_OBSERVER_VERSION: &str = "0.1.0";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -66,6 +67,13 @@ impl WebBuildAdapter {
         }
     }
 
+    pub(crate) fn observer_version(self) -> &'static str {
+        match self {
+            Self::Next => NEXT_BUILD_OBSERVER_VERSION,
+            Self::Astro | Self::TanstackStart => WEB_BUILD_OBSERVER_VERSION,
+        }
+    }
+
     fn runtime_artifact(self) -> &'static str {
         match self {
             Self::Next => "next-build-adapter.mjs",
@@ -84,7 +92,7 @@ impl WebBuildAdapter {
 
     fn observation_schema(self) -> &'static str {
         match self {
-            Self::Next => "next-build-observation-v1",
+            Self::Next => "next-build-observation-v2",
             Self::Astro => "astro-build-observation-v1",
             Self::TanstackStart => "tanstack-start-build-observation-v1",
         }
@@ -215,7 +223,7 @@ pub fn create_build_execution_request(source_root: &Path) -> Result<BuildExecuti
             source_root,
             plan: BuildExecutionPlan {
                 adapter: config.adapter.observer().to_owned(),
-                adapter_version: WEB_BUILD_OBSERVER_VERSION.to_owned(),
+                adapter_version: config.adapter.observer_version().to_owned(),
                 profile_id: format!("web:build:{}", config.adapter.key()),
                 program: "node".to_owned(),
                 arguments: vec![display_logical(&config.entrypoint)],
@@ -612,7 +620,7 @@ fn collect_web_build_observation(
         || object
             .get("observer_version")
             .and_then(serde_json::Value::as_str)
-            != Some(WEB_BUILD_OBSERVER_VERSION)
+            != Some(adapter.observer_version())
     {
         bail!("Web build observation identity does not match its execution plan");
     }
@@ -1113,6 +1121,26 @@ fn network_isolation_capability() -> (NetworkIsolation, Option<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn web_build_observer_versions_follow_each_observation_contract() {
+        assert_eq!(
+            WebBuildAdapter::Next.observer_version(),
+            NEXT_BUILD_OBSERVER_VERSION
+        );
+        assert_eq!(
+            WebBuildAdapter::Next.observation_schema(),
+            "next-build-observation-v2"
+        );
+        assert_eq!(
+            WebBuildAdapter::Astro.observer_version(),
+            WEB_BUILD_OBSERVER_VERSION
+        );
+        assert_eq!(
+            WebBuildAdapter::TanstackStart.observer_version(),
+            WEB_BUILD_OBSERVER_VERSION
+        );
+    }
 
     fn node_plan(arguments: Vec<String>) -> BuildExecutionPlan {
         BuildExecutionPlan {

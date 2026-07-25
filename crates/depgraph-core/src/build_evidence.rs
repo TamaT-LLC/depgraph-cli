@@ -351,7 +351,7 @@ pub async fn web_build_protocol_ndjson(
 ) -> Result<Vec<u8>> {
     if audit.outcome != BuildOutcomeKind::Completed
         || audit.adapter != observation.adapter.observer()
-        || audit.adapter_version != crate::build::WEB_BUILD_OBSERVER_VERSION
+        || audit.adapter_version != observation.adapter.observer_version()
     {
         bail!("Web build observation contract does not match its completed audit");
     }
