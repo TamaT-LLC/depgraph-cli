@@ -31,6 +31,24 @@ boundaries do not receive `build-observed` completeness and cannot replace the
 last completed snapshot. Both the converter and Rust core revalidate profile
 counts, framework/observer provenance, conditions, and exact site/edge closure.
 
+### Next.js build manifests
+
+Stable Next.js 16.2+ `onBuildComplete` route and output manifests are projected
+to `next-build-observation-v2` under the unchanged
+`next-adapter-api-16.2-v1` capability. The observation carries canonical route
+and build manifest digests and counts. Normal, RSC, and `/_next/data` variants
+reuse one route identity; prerenders link to the exact observed parent route.
+APP_ROUTE/static metadata, traced server chunks, public client chunks, and
+server/client/edge/static boundaries remain queryable through typed properties,
+conditions, and observed edges.
+
+Output IDs, edge entry keys, build IDs, absolute checkout paths, and config/env
+values are not persisted. Build-ID path segments are replaced with a stable
+placeholder after confined artifact reads. Missing manifest collections,
+missing required route artifacts or prerender parents, unsupported versions,
+malformed edge runtime metadata, and partial builds fail atomically with bounded
+`web.next_build_*` reasons.
+
 ## Node.js/TypeScript runtime collector
 
 `pnpm build` also creates the dependency-free ESM reference collector at

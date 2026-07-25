@@ -1,0 +1,20 @@
+{
+  "outputs": {
+    "pages": [],
+    "pagesApi": [],
+    "appPages": [
+      {
+        "id": "partial-app-page",
+        "type": "APP_PAGE",
+        "pathname": "/docs/partial",
+        "sourcePage": "partial/page",
+        "runtime": "nodejs",
+        "assets": {},
+        "config": {}
+      }
+    ],
+    "appRoutes": [],
+    "prerenders": [],
+    "staticFiles": []
+  }
+}

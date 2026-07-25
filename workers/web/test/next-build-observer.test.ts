@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -26,7 +27,14 @@ import { stableId } from "../src/ids";
 import { canonicalizeCondition, type GraphEdge, type GraphNode, type JsonValue } from "../src/types";
 
 const digest = (character: string): string => character.repeat(64);
+const pathDigest = (value: string): string => createHash("sha256").update(value).digest("hex");
 const execute = promisify(execFile);
+
+async function nextBuildFixture<T>(name: string): Promise<T> {
+  return JSON.parse(
+    await readFile(new URL(`fixtures/next-build/${name}.json`, import.meta.url), "utf8"),
+  ) as T;
+}
 
 function buildContext(overrides: Partial<NextAdapterBuildContext> = {}): NextAdapterBuildContext {
   return {
@@ -322,8 +330,9 @@ test("adapter and observer crashes are normalized without preserving raw error t
 
 test("observer keeps only allowlisted final config, route, runtime, output, and asset metadata", async () => {
   const observed = await observation();
-  assert.equal(observed.schema_version, "next-build-observation-v1");
+  assert.equal(observed.schema_version, "next-build-observation-v2");
   assert.equal(observed.next_version, "16.2.9");
+  assert.equal(observed.manifests.contract_version, "next-adapter-manifests-v1");
   assert.equal(observed.config.output, "standalone");
   assert.equal(observed.config.environment_key_count, 1);
   assert.equal(observed.routing[0]?.phase, "beforeFiles");
@@ -332,6 +341,8 @@ test("observer keeps only allowlisted final config, route, runtime, output, and 
     source: "/legacy",
     source_regex_digest: "ef35ea91a1ad1227dafb8d0e04809cba01c3260b4e15d7487e8072a9dbf6b717",
     destination: "/docs",
+    canonical_route_pattern: null,
+    variant: "route",
     source_present: true,
     destination_present: true,
     status: 307,
@@ -342,6 +353,8 @@ test("observer keeps only allowlisted final config, route, runtime, output, and 
   assert.equal(observed.outputs[0]?.runtime, "nodejs");
   assert.equal(observed.outputs[0]?.logical_artifact_path, "apps/site/.next/server/app/products/[id]/page.js");
   assert.equal(observed.outputs[0]?.assets[0]?.logical_path, "apps/site/.next/server/chunks/shared.js");
+  assert.equal(observed.outputs[0]?.assets[0]?.role, "server_chunk");
+  assert.equal(observed.outputs[0]?.boundary, "server");
   assert.equal(observed.outputs[0]?.config.environment_key_count, 1);
   const encoded = JSON.stringify(observed);
   for (const forbidden of [
@@ -354,23 +367,26 @@ test("observer keeps only allowlisted final config, route, runtime, output, and 
 
 test("prerenders without a fallback artifact use deterministic synthetic metadata", async () => {
   const context = buildContext();
-  context.outputs.appPages = [];
   context.outputs.prerenders = [{
     id: "private-prerender-output-id",
     type: "PRERENDER",
     pathname: "/docs/prerendered",
+    parentOutputId: "private-output-id",
+    groupId: 1,
     config: {},
   }];
-  let artifactReads = 0;
-  const observed = await collectNextBuildObservation(context, () => {
-    artifactReads += 1;
+  const artifactReads: string[] = [];
+  const observed = await collectNextBuildObservation(context, (_absolutePath, logicalPath) => {
+    artifactReads.push(logicalPath);
     return digest("a");
   });
 
-  assert.equal(artifactReads, 0);
-  assert.equal(observed.outputs.length, 1);
-  assert.match(observed.outputs[0]!.logical_artifact_path, /^\.next\/observed\/[a-f0-9]{64}\.metadata$/u);
-  assert.match(observed.outputs[0]!.artifact_digest, /^[a-f0-9]{64}$/u);
+  assert.equal(artifactReads.some((logicalPath) => logicalPath.startsWith(".next/observed/")), false);
+  const prerender = observed.outputs.find((output) => output.type === "PRERENDER");
+  assert.ok(prerender !== undefined);
+  assert.match(prerender.logical_artifact_path, /^\.next\/observed\/[a-f0-9]{64}\.metadata$/u);
+  assert.match(prerender.artifact_digest, /^[a-f0-9]{64}$/u);
+  assert.match(prerender.parent_output_identity_digest ?? "", /^[a-f0-9]{64}$/u);
   assert.equal(JSON.stringify(observed).includes("private-prerender-output-id"), false);
 });
 
@@ -437,8 +453,13 @@ test("observed outputs correlate to canonical safe routes and become determinist
   assert.ok(sourceFallback.edges.some((edge) => edge.kind === "emits" && edge.source === sourceRoute().id));
   assert.equal(sourceFallback.diagnostics.some((item) => item.code === "web.next_build_route_static_missing"), false);
 
-  const sourcePageObservation = await observation();
-  sourcePageObservation.outputs[0]!.pathname = "/docs/rendered-products/[id]";
+  const sourcePageContext = buildContext();
+  (sourcePageContext.outputs.appPages as Array<Record<string, unknown>>)[0]!.pathname =
+    "/docs/rendered-products/[id]";
+  const sourcePageObservation = await collectNextBuildObservation(
+    sourcePageContext,
+    (_absolutePath, logicalPath) => logicalPath.endsWith("shared.js") ? digest("b") : digest("a"),
+  );
   const sourcePageFallback = buildNextObservedGraph({
     observation: sourcePageObservation,
     provenance,
@@ -483,15 +504,139 @@ test("static ambiguity and runtime drift retain observed evidence with bounded d
   assert.equal(JSON.stringify(drift).includes("private-build-id"), false);
 });
 
+test("Next manifests unify route variants and expose build-only routes, chunks, and boundaries deterministically", async () => {
+  const fixture = await nextBuildFixture<Pick<NextAdapterBuildContext, "routing" | "outputs">>("complete");
+  const stableArtifactDigest = (logicalPath: string): string => pathDigest(
+    logicalPath.replace(/\/(?:private-build-id|relocated-build-id)\//gu, "/<build-id>/"),
+  );
+  const observed = await collectNextBuildObservation(
+    buildContext(fixture),
+    (_absolutePath, logicalPath) => stableArtifactDigest(logicalPath),
+  );
+  assert.equal(observed.manifests.route_entry_count, 3);
+  assert.equal(observed.manifests.output_entry_count, 8);
+  assert.match(observed.manifests.route_manifest_digest, /^[a-f0-9]{64}$/u);
+  assert.match(observed.manifests.build_manifest_digest, /^[a-f0-9]{64}$/u);
+  assert.deepEqual(
+    observed.outputs
+      .filter((output) => output.type === "APP_PAGE")
+      .map((output) => [output.variant, output.canonical_route_pattern]),
+    [["route", "/docs/products/[id]"], ["rsc", "/docs/products/[id]"]],
+  );
+  assert.ok(observed.outputs.some((output) => (
+    output.metadata_kind === "robots" && output.boundary === "edge"
+  )));
+  assert.ok(observed.outputs.some((output) => (
+    output.variant === "client_chunk" && output.canonical_route_pattern === null
+  )));
+  assert.ok(observed.outputs.some((output) => (
+    output.metadata_kind === "favicon" && output.variant === "static_route"
+  )));
+  assert.ok(observed.outputs.some((output) => (
+    output.pathname.includes("<build-id>") && output.logical_artifact_path.includes("<build-id>")
+  )));
+  assert.equal(observed.routing.every((route) => route.canonical_route_pattern === "/docs/products/[id]"), true);
+  const encoded = JSON.stringify(observed);
+  for (const forbidden of [
+    "private-build-id", "app-products", "client-chunk-private-id", "middleware_app/robots/route", "/repo/",
+  ]) {
+    assert.equal(encoded.includes(forbidden), false, forbidden);
+  }
+
+  const route = baseRoute();
+  const graph = buildNextObservedGraph({
+    observation: observed,
+    provenance,
+    baseNodes: [route],
+  });
+  const routePatterns = graph.nodes
+    .filter((node) => node.kind === "route")
+    .map((node) => node.properties.route_pattern)
+    .filter((value): value is string => typeof value === "string");
+  assert.equal(routePatterns.filter((pattern) => pattern === "/docs/products/[id]").length, 1);
+  assert.equal(routePatterns.some((pattern) => pattern.includes(".rsc") || pattern.includes("/_next/static/")), false);
+  assert.ok(graph.nodes.some((node) => node.kind === "route" && node.properties.metadata_kind === "robots"));
+  assert.ok(graph.nodes.some((node) => node.kind === "route" && node.properties.metadata_kind === "favicon"));
+  assert.ok(graph.nodes.some((node) => (
+    node.kind === "file" && node.properties.asset_role === "client_chunk"
+  )));
+  assert.ok(graph.edges.some((edge) => edge.kind === "loads" && edge.environment === "browser"));
+  assert.ok(graph.edges.some((edge) => edge.kind === "parent_route" && edge.target === route.id));
+  assert.ok(graph.edges.some((edge) => (
+    edge.kind === "routes_in_phase" && edge.source === route.id
+  )));
+
+  const relocatedFixture = JSON.parse(
+    JSON.stringify(fixture)
+      .replaceAll("/repo/", "/checkout/")
+      .replaceAll("private-build-id", "relocated-build-id"),
+  ) as Pick<NextAdapterBuildContext, "routing" | "outputs">;
+  const relocated = await collectNextBuildObservation(
+    buildContext({
+      ...relocatedFixture,
+      buildId: "relocated-build-id",
+      projectDir: "/checkout/apps/site",
+      repoRoot: "/checkout",
+      distDir: "/checkout/apps/site/.next",
+    }),
+    (_absolutePath, logicalPath) => stableArtifactDigest(logicalPath),
+  );
+  assert.deepEqual(relocated, observed);
+  assert.deepEqual(
+    buildNextObservedGraph({ observation: relocated, provenance, baseNodes: [route] }),
+    graph,
+  );
+
+  const repeated = buildNextObservedGraph({
+    observation: relocated,
+    provenance: { ...provenance, build_run_id: "next-build-run-repeat" },
+    baseNodes: graph.nodes,
+    baseEdges: graph.edges,
+    baseDiagnosticIds: graph.diagnostics.map((diagnostic) => diagnostic.id),
+  });
+  assert.deepEqual(repeated.nodes, graph.nodes);
+  assert.deepEqual(repeated.sites, []);
+  assert.deepEqual(repeated.edges, []);
+  assert.deepEqual(repeated.diagnostics, []);
+
+  const tampered = structuredClone(observed);
+  tampered.outputs[0]!.variant = "data";
+  assert.throws(
+    () => buildNextObservedGraph({ observation: tampered, provenance, baseNodes: [route] }),
+    (error: unknown) => error instanceof NextBuildObserverError
+      && error.code === "web.next_build_observation_contract_invalid",
+  );
+});
+
+test("unsupported, missing-manifest, and partial build fixtures fail closed with bounded reasons", async () => {
+  const unsupported = await nextBuildFixture<Partial<NextAdapterBuildContext>>("unsupported-version");
+  await assert.rejects(
+    collectNextBuildObservation(buildContext(unsupported), () => digest("a")),
+    (error: unknown) => error instanceof NextBuildObserverError
+      && error.code === "web.next_build_version_unsupported",
+  );
+
+  const missing = await nextBuildFixture<Pick<NextAdapterBuildContext, "outputs">>("missing-manifest");
+  await assert.rejects(
+    collectNextBuildObservation(buildContext(missing), () => digest("a")),
+    (error: unknown) => error instanceof NextBuildObserverError
+      && error.code === "web.next_build_manifest_missing",
+  );
+
+  const partial = await nextBuildFixture<Pick<NextAdapterBuildContext, "outputs">>("partial-build");
+  await assert.rejects(
+    collectNextBuildObservation(buildContext(partial), () => digest("a")),
+    (error: unknown) => error instanceof NextBuildObserverError
+      && error.code === "web.next_build_partial_build",
+  );
+});
+
 test("same-source conditional routing entries remain distinct while exact duplicates deduplicate", async () => {
-  const observed = await observation();
-  const first = observed.routing[0]!;
-  const second = {
-    ...first,
-    destination: "/docs/conditional",
-    predicate_count: 1,
-  };
-  observed.routing = [first, second, { ...first }];
+  const context = buildContext();
+  const first = (context.routing.beforeFiles as Array<Record<string, unknown>>)[0]!;
+  const second = { ...first, destination: "/docs/conditional", has: [{ type: "header" }] };
+  context.routing.beforeFiles = [first, second, { ...first }];
+  const observed = await collectNextBuildObservation(context, () => digest("a"));
 
   const graph = buildNextObservedGraph({ observation: observed, provenance, baseNodes: [] });
   const routes = graph.nodes.filter((node) => (
@@ -508,7 +653,7 @@ test("same-source conditional routing entries remain distinct while exact duplic
 
 test("observer identity remains aligned across build evidence and adapter metadata", () => {
   assert.equal(NEXT_BUILD_OBSERVER, "next-adapter-observer");
-  assert.equal(NEXT_BUILD_OBSERVER_VERSION, "0.1.0");
+  assert.equal(NEXT_BUILD_OBSERVER_VERSION, "0.2.0");
 });
 
 test("bundled Next adapter writes one confined sanitized observation artifact", async (context) => {

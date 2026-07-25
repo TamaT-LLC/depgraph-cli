@@ -397,7 +397,12 @@ audit digests. Generated node, site, and edge IDs exclude the attempt ID and
 include the contract version; matching source/semantic nodes are reused only
 when byte-identical. Repeated builds reuse the exact stored generated nodes and
 omit already-promoted site, edge, and diagnostic IDs; a stable site with a new
-target remains a conflict. A dynamic target that was not observed is retained as an
+target remains a conflict. The Next.js observer projects the stable 16.2+
+Adapter API route/output manifests into `next-build-observation-v2`: ordinary,
+RSC, and data variants share one canonical route; prerenders retain their
+observed parent route; metadata routes, chunks, and server/client/edge/static
+boundaries remain explicit. Raw output/build IDs and checkout roots never enter
+portable identity. A dynamic target that was not observed is retained as an
 `unresolved` edge to an `unknown_target` with a bounded reason, never promoted
 to a guessed `resolved` edge. The Next/Astro/TanStack Start observer entrypoints
 and their observation-to-protocol converter are separate checksum-attested
