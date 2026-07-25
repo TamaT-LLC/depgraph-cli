@@ -548,6 +548,7 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "## Options considered",
         "## Security review gates",
         "## Staged implementation and acceptance matrix",
+        "every admitted Cargo unit invocation, including dependency, build-script, and proc-macro units",
         "| Five-target release gate | 2-3 days |",
         "| Safe invariant |",
     ] {

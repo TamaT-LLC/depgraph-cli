@@ -296,7 +296,7 @@ separately reviewable vertical increment.
 | --- | --- | --- | --- |
 | Compiler-pack manifest and verifier | 2-3 days | Build one target pack; verify channel manifest, full component/tree closure, wrapper digest, SBOM/licenses, pre/postflight tamper and no rustup fallback | None |
 | Consent, neutral Cargo config, and unit graph | 2-3 days | Add the CLI selector and early refusal; reject execution-bearing config; validate bounded canonical unit-graph v1 without starting rustc | Compiler pack |
-| Wrapper invocation ledger | 2-3 days | Match exact wrapper/rustc identity and every workspace rustc invocation to one unit; reject nesting, extra/missing units, path leaks, and partial terminal records | Unit graph |
+| Wrapper invocation ledger | 2-3 days | Match exact wrapper/rustc identity and every admitted Cargo unit invocation, including dependency, build-script, and proc-macro units, one-to-one to the unit graph; reject nesting, extra/missing units, path leaks, and partial terminal records | Unit graph |
 | Typed MIR DTO vertical slice | 2-3 days | Emit and validate local function/closure/async typed MIR, canonical places/types/constants, source correlation, bounds, and deterministic DTO; no call promotion yet | Wrapper ledger |
 | Monomorphized item and call slice | 2-3 days | Represent functions, generic instances, shims, drop glue, and exact/candidate/unknown calls without raw compiler IDs | Typed MIR |
 | Atomic graph promotion and query/export | 2-3 days | Union build-phase observed nodes/sites/edges; support doctor/why/JSON/DOT/Mermaid; preserve safe evidence and profile separation | Instance slice |
