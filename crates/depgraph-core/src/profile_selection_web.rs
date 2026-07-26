@@ -385,10 +385,7 @@ fn validate_declaration_source(
             }
             let environment = environment
                 .ok_or_else(|| anyhow::anyhow!("package exports require an environment"))?;
-            if !ordered_conditions
-                .iter()
-                .any(|condition| export_condition_matches(environment, condition))
-            {
+            if !ordered_exports_prove_environment(environment, ordered_conditions) {
                 bail!("Web package export conditions do not prove the declared environment");
             }
             if !evidence.iter().any(|item| {
@@ -450,6 +447,16 @@ fn export_condition_matches(environment: WebEnvironment, condition: &str) -> boo
         }
         WebEnvironment::Browser | WebEnvironment::Server => false,
     }
+}
+
+fn ordered_exports_prove_environment(
+    environment: WebEnvironment,
+    ordered_conditions: &[String],
+) -> bool {
+    ordered_conditions
+        .iter()
+        .take_while(|condition| condition.as_str() != "default")
+        .any(|condition| export_condition_matches(environment, condition))
 }
 
 fn canonicalize_framework_capabilities(capabilities: &mut Vec<String>) -> Result<()> {
@@ -1034,6 +1041,29 @@ mod tests {
             });
         assert!(
             generate_web_profile_candidates(package_exports)
+                .unwrap_err()
+                .to_string()
+                .contains("do not prove")
+        );
+
+        let mut shadowed_worker = input();
+        shadowed_worker
+            .environments
+            .push(WebEnvironmentDeclaration {
+                environment: WebEnvironment::Worker,
+                source: WebDeclarationSource::PackageExports,
+                framework: None,
+                ordered_conditions: vec!["default".to_owned(), "worker".to_owned()],
+                availability: WebProfileAvailability::Available,
+                static_evidence: evidence(
+                    "shadowed-worker",
+                    ProfileCandidateEvidenceKind::Manifest,
+                    "package.json",
+                    2,
+                ),
+            });
+        assert!(
+            generate_web_profile_candidates(shadowed_worker)
                 .unwrap_err()
                 .to_string()
                 .contains("do not prove")
