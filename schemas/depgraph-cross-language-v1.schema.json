@@ -1,0 +1,274 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://depgraph.dev/schemas/depgraph-cross-language-v1.schema.json",
+  "title": "depgraph cross-language common contract v1 DTO",
+  "oneOf": [
+    { "$ref": "#/$defs/canonical_identity" },
+    { "$ref": "#/$defs/profile_identity" },
+    { "$ref": "#/$defs/completeness" },
+    { "$ref": "#/$defs/evidence_properties" }
+  ],
+  "$defs": {
+    "bounded_text": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096,
+      "pattern": "^[^\\u0000-\\u001f\\u007f]+$"
+    },
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "format": {
+      "enum": ["openapi", "protobuf", "graphql", "ffi"]
+    },
+    "capability": {
+      "enum": [
+        "openapi-contract-v1",
+        "protobuf-contract-v1",
+        "graphql-contract-v1",
+        "ffi-contract-v1"
+      ]
+    },
+    "relation": {
+      "enum": [
+        "provides_operation",
+        "accepts_message",
+        "returns_message",
+        "references_schema",
+        "calls_operation",
+        "implemented_by",
+        "generated_from",
+        "binds_native_symbol",
+        "provided_by_library"
+      ]
+    },
+    "mapping": {
+      "enum": [
+        "contract_internal",
+        "descriptor",
+        "generator_manifest",
+        "source_map",
+        "build_observation",
+        "runtime_observation",
+        "repository_mapping",
+        "manual_declaration",
+        "closed_candidates",
+        "external_reference",
+        "unresolved"
+      ]
+    },
+    "canonical_identity": {
+      "type": "object",
+      "properties": {
+        "contract_version": { "const": "cross-language-contract-v1" },
+        "format": { "$ref": "#/$defs/format" },
+        "repository_contract_locator": {
+          "$ref": "#/$defs/bounded_text",
+          "not": { "pattern": "(^/|\\\\|://|[?#]|(^|/)\\.\\.?(/|$))" }
+        },
+        "format_version": { "$ref": "#/$defs/bounded_text" },
+        "coordinate": { "$ref": "#/$defs/bounded_text" },
+        "profile_id": {
+          "type": "string",
+          "pattern": "^profile:sha256:[0-9a-f]{64}$"
+        }
+      },
+      "required": [
+        "contract_version",
+        "format",
+        "repository_contract_locator",
+        "format_version",
+        "coordinate",
+        "profile_id"
+      ],
+      "additionalProperties": false
+    },
+    "profile_identity": {
+      "type": "object",
+      "properties": {
+        "contract_version": { "const": "cross-language-contract-v1" },
+        "completeness_version": { "const": "cross-language-completeness-v1" },
+        "contract_input_digest": { "$ref": "#/$defs/digest" },
+        "adapter_capability_versions": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 4,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/capability" }
+        },
+        "participating_profile_ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/bounded_text" }
+        }
+      },
+      "required": [
+        "contract_version",
+        "completeness_version",
+        "contract_input_digest",
+        "adapter_capability_versions",
+        "participating_profile_ids"
+      ],
+      "additionalProperties": false
+    },
+    "format_coverage": {
+      "type": "object",
+      "properties": {
+        "format": { "$ref": "#/$defs/format" },
+        "capability": { "$ref": "#/$defs/capability" },
+        "status": { "enum": ["complete", "incomplete"] },
+        "input_count": { "type": "integer", "minimum": 1 },
+        "node_count": { "type": "integer", "minimum": 0 },
+        "site_count": { "type": "integer", "minimum": 0 },
+        "edge_count": { "type": "integer", "minimum": 0 },
+        "external_count": { "type": "integer", "minimum": 0 },
+        "unresolved_count": { "type": "integer", "minimum": 0 },
+        "skipped_count": { "type": "integer", "minimum": 0 },
+        "reasons": {
+          "type": "array",
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          }
+        }
+      },
+      "required": [
+        "format",
+        "capability",
+        "status",
+        "input_count",
+        "node_count",
+        "site_count",
+        "edge_count",
+        "external_count",
+        "unresolved_count",
+        "skipped_count",
+        "reasons"
+      ],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "format": { "const": "openapi" }
+            },
+            "required": ["format"]
+          },
+          "then": {
+            "properties": {
+              "capability": { "const": "openapi-contract-v1" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "format": { "const": "protobuf" }
+            },
+            "required": ["format"]
+          },
+          "then": {
+            "properties": {
+              "capability": { "const": "protobuf-contract-v1" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "format": { "const": "graphql" }
+            },
+            "required": ["format"]
+          },
+          "then": {
+            "properties": {
+              "capability": { "const": "graphql-contract-v1" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "format": { "const": "ffi" }
+            },
+            "required": ["format"]
+          },
+          "then": {
+            "properties": {
+              "capability": { "const": "ffi-contract-v1" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": { "const": "complete" }
+            },
+            "required": ["status"]
+          },
+          "then": {
+            "properties": {
+              "unresolved_count": { "const": 0 },
+              "skipped_count": { "const": 0 },
+              "reasons": { "maxItems": 0 }
+            }
+          }
+        }
+      ]
+    },
+    "completeness": {
+      "type": "object",
+      "properties": {
+        "schema_version": { "const": "cross-language-completeness-v1" },
+        "entries": {
+          "type": "array",
+          "maxItems": 4,
+          "items": { "$ref": "#/$defs/format_coverage" }
+        }
+      },
+      "required": ["schema_version", "entries"],
+      "additionalProperties": false
+    },
+    "evidence_properties": {
+      "type": "object",
+      "properties": {
+        "contract_version": { "const": "cross-language-contract-v1" },
+        "format": { "$ref": "#/$defs/format" },
+        "profile_id": {
+          "type": "string",
+          "pattern": "^profile:sha256:[0-9a-f]{64}$"
+        },
+        "format_version": { "$ref": "#/$defs/bounded_text" },
+        "contract_digest": { "$ref": "#/$defs/digest" },
+        "occurrence_kind": { "$ref": "#/$defs/relation" },
+        "mapping_kind": { "$ref": "#/$defs/mapping" },
+        "artifact_identity": { "$ref": "#/$defs/bounded_text" },
+        "ordinal": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000000
+        }
+      },
+      "required": [
+        "contract_version",
+        "format",
+        "profile_id",
+        "format_version",
+        "contract_digest",
+        "occurrence_kind",
+        "mapping_kind"
+      ],
+      "additionalProperties": true,
+      "dependentRequired": {
+        "artifact_identity": ["ordinal"],
+        "ordinal": ["artifact_identity"]
+      }
+    }
+  }
+}

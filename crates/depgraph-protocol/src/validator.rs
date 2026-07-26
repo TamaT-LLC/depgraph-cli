@@ -1,7 +1,9 @@
 use crate::{
     CompletenessLevel, Condition, DependencySite, Diagnostic, Evidence, EvidenceKind, GraphEdge,
     GraphNode, PROTOCOL_VERSION, Phase, Precision, Profile, ProtocolEvent, ResolutionStatus,
-    canonical_json, stable_id_from_value,
+    canonical_json,
+    cross_language::{is_cross_language_artifact_evidence, validate_cross_language_maps},
+    stable_id_from_value,
 };
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -383,6 +385,12 @@ impl ProtocolValidator {
                     )));
                 }
                 validate_site_edge_maps(&self.nodes, &self.edges, &self.sites)?;
+                validate_cross_language_maps(
+                    &self.profiles,
+                    &self.nodes,
+                    &self.edges,
+                    &self.sites,
+                )?;
                 self.state = StreamState::Completed;
             }
         }
@@ -710,7 +718,13 @@ pub fn validate_build_contract(protocol: &ValidatedProtocol) -> Result<(), Proto
 /// validated protocol stream.
 pub fn validate_semantic_contract(protocol: &ValidatedProtocol) -> Result<(), ProtocolError> {
     validate_site_edge_maps(&protocol.nodes, &protocol.edges, &protocol.sites)?;
-    validate_semantic_maps(&protocol.nodes, &protocol.edges, &protocol.sites)
+    validate_semantic_maps(&protocol.nodes, &protocol.edges, &protocol.sites)?;
+    validate_cross_language_maps(
+        &protocol.profiles,
+        &protocol.nodes,
+        &protocol.edges,
+        &protocol.sites,
+    )
 }
 
 fn validate_ndjson_with(
@@ -1700,7 +1714,11 @@ fn validate_edge(edge: &GraphEdge) -> Result<(), ProtocolError> {
     validate_dependency_evidence(
         "edge",
         &edge.evidence,
-        matches!(edge.phase, Phase::Source | Phase::Semantic),
+        matches!(edge.phase, Phase::Source | Phase::Semantic)
+            && !edge
+                .evidence
+                .first()
+                .is_some_and(is_cross_language_artifact_evidence),
     )?;
     if edge.phase == Phase::Build {
         if edge.precision != Precision::Observed {
@@ -1743,7 +1761,15 @@ fn validate_site(site: &DependencySite) -> Result<(), ProtocolError> {
         .evidence
         .first()
         .is_some_and(is_observed_build_evidence);
-    validate_dependency_evidence("dependency_site", &site.evidence, !build)?;
+    validate_dependency_evidence(
+        "dependency_site",
+        &site.evidence,
+        !build
+            && !site
+                .evidence
+                .first()
+                .is_some_and(is_cross_language_artifact_evidence),
+    )?;
     if build {
         if site.precision != Precision::Observed {
             return invariant(format!(

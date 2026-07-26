@@ -6,6 +6,7 @@
 //! compatibility; unknown event names and malformed required fields are not.
 
 mod condition;
+mod cross_language;
 mod delta;
 mod event;
 mod model;
@@ -13,6 +14,18 @@ mod stable_id;
 mod validator;
 
 pub use condition::Condition;
+pub use cross_language::{
+    CROSS_LANGUAGE_COMPLETENESS_PROPERTY, CROSS_LANGUAGE_COMPLETENESS_VERSION,
+    CROSS_LANGUAGE_CONTRACT_PROPERTY, CROSS_LANGUAGE_CONTRACT_VERSION,
+    CROSS_LANGUAGE_PROFILE_IDENTITY_PROPERTY, CROSS_LANGUAGE_SCHEMA, CROSS_LANGUAGE_SCHEMA_PATH,
+    CrossLanguageAdapterDelta, CrossLanguageCanonicalIdentity, CrossLanguageCapabilityStatus,
+    CrossLanguageCompletenessLedger, CrossLanguageEvidenceProperties, CrossLanguageFormat,
+    CrossLanguageFormatCoverage, CrossLanguageMappingKind, CrossLanguageNodeKind,
+    CrossLanguageProfileIdentity, CrossLanguageRelationKind, build_cross_language_edge_id,
+    build_cross_language_site_id, cross_language_graph_digest, cross_language_node_id,
+    cross_language_profile_id, has_cross_language_claim, validate_cross_language_adapter_delta,
+    validate_cross_language_contract, validate_cross_language_graph,
+};
 pub use delta::{
     CoverageDelete, CoverageUpsert, DELTA_CONTRACT_VERSION, DeltaBaseGraph, DeltaCompleted,
     DeltaCoverage, DeltaCoverageKey, DeltaEdgeUpsert, DeltaEvent, DeltaEvidenceKey,

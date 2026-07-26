@@ -30,7 +30,7 @@ use crate::{
     RUST_SYSROOT_LICENSE_EXPRESSION, ReleaseCompatibilityHealth,
     cancellation::CancellationToken,
     config::{ProfileConfig, ScanConfig},
-    verify_release_compatibility,
+    validate_cross_language_worker_protocol, verify_release_compatibility,
 };
 
 pub(crate) const RUST_BACKEND_KIND: &str = "rust-analyzer-library";
@@ -6422,7 +6422,11 @@ fn parse_events_preserving_prefix(
     if parse_error.is_none() {
         match validator.finish() {
             Ok(protocol) if enforce_web_definition_graph => {
-                if let Err(error) = validate_semantic_contract(&protocol) {
+                if let Err(error) = validate_cross_language_worker_protocol(&protocol) {
+                    parse_error = Some(format!(
+                        "security policy violation: invalid cross-language worker closure: {error:#}"
+                    ));
+                } else if let Err(error) = validate_semantic_contract(&protocol) {
                     web_framework_failure = saw_web_framework_semantic_delta
                         && semantic_contract_failure_is_framework(&protocol);
                     parse_error = Some(format!(
@@ -6452,7 +6456,15 @@ fn parse_events_preserving_prefix(
                     security_violation = true;
                 }
             }
-            Ok(_) => {}
+            Ok(protocol) => {
+                if let Err(error) = validate_cross_language_worker_protocol(&protocol) {
+                    parse_error = Some(format!(
+                        "security policy violation: invalid cross-language worker closure: {error:#}"
+                    ));
+                    failure_kind = Some(WorkerFailureKind::MalformedProtocol);
+                    security_violation = true;
+                }
+            }
             Err(error) => {
                 if enforce_web_definition_graph
                     && (saw_web_semantic_delta
