@@ -29,6 +29,7 @@ pub mod profile_selection_rank;
 pub mod profile_selection_rust;
 pub mod profile_selection_web;
 pub mod protobuf;
+pub mod public_readiness;
 pub mod query;
 pub mod runtime_trace;
 pub mod rust_build_observer;
@@ -108,6 +109,17 @@ pub use ffi_link::{
     FFI_LINK_OBSERVATION_SCHEMA_VERSION, FFI_LINK_OBSERVER, FFI_LINK_OBSERVER_VERSION,
     FfiLinkObservation, FfiObservedLink, collect_supervised_ffi_link_observation,
     correlate_ffi_link_observation, validate_ffi_link_observation,
+};
+pub use public_readiness::{
+    PUBLIC_READINESS_EVIDENCE_SCHEMA_VERSION, PUBLIC_READINESS_FINAL_APPROVAL_ROLES,
+    PUBLIC_READINESS_GATE_IDS, PUBLIC_READINESS_REPOSITORY, PUBLIC_READINESS_ROLES,
+    PUBLIC_READINESS_SCHEMA_VERSION, PUBLIC_READINESS_VERIFIER_MODE, PublicReadinessApproval,
+    PublicReadinessBundle, PublicReadinessDecision, PublicReadinessEvaluation,
+    PublicReadinessEvidence, PublicReadinessEvidenceManifest, PublicReadinessExpectedState,
+    PublicReadinessFindingSummary, PublicReadinessGate, PublicReadinessRecord,
+    PublicReadinessRejectionReason, PublicReadinessToolIdentity, canonical_public_readiness_digest,
+    evaluate_public_readiness, public_readiness_approval_statement_digest,
+    public_readiness_evidence_input_digest,
 };
 pub const FRAMEWORK_BUILD_GRAPH_CONTRACT_VERSION: &str = "framework-build-graph-v1";
 pub const FRAMEWORK_BUILD_GATE_CONTRACT_VERSION: &str =

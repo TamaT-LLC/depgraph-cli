@@ -172,6 +172,13 @@ unknown, stale, unsigned, or malformed field is `reject`.
 The readiness record is evidence, not an actuator. No workflow, bot, or CLI
 may change repository visibility merely because a record says `allow`.
 
+The closed record/evidence bundle is defined by
+[`schemas/public-readiness-v1.schema.json`](../../schemas/public-readiness-v1.schema.json).
+The core verifier canonicalizes both documents, binds every gate evidence
+entry to the exact candidate/ref/settings/governance/release state, verifies
+independent role approvals, and emits only the deterministic
+`evidence-only-no-visibility-actuator` decision.
+
 ## Executable pre-publication checklist
 
 Every item below has a pass condition and retained evidence. A checked box
@@ -520,7 +527,7 @@ Each row is an independently reviewable one-to-three-day follow-up.
 | Slice | Deliverable | Estimate |
 | ---: | --- | --- |
 | 1 | Community/governance documents, issue forms, PR template, DCO/CLA decision | Implemented in #202 |
-| 2 | Closed readiness/evidence schemas and deterministic verifier | 2-3 days |
+| 2 | Closed readiness/evidence schemas and deterministic verifier | Implemented in #203 |
 | 3 | All-ref/history/collaboration secret audit tooling and redacted ledger | 2-3 days |
 | 4 | Dependency/license/provenance inventory and legal review package | 2-3 days |
 | 5 | Workflow SHA pinning, threat model, disclosure policy, and security dry run | 2-3 days |
