@@ -278,6 +278,15 @@ ledger for the candidate; “unknown” is not compatible with `allow`.
 Evidence: provenance inventory, license report, vulnerability report, SBOM
 digests, DCO/CLA decision, notices, and legal sign-off statement digest.
 
+Issue #205 implements the deterministic `public-provenance-review-v1`
+package. It aggregates project, generated, vendor, binary, font, image,
+fixture, and document assets with Rust, Go, Web, bundled-runtime, and exact
+five-target release evidence. Exact-pinned license and vulnerability policy
+identities, SBOMs, license reports, `THIRD_PARTY_LICENSES.txt`, manifests,
+archive checksums, the candidate commit, and release artifact closure are
+digest-bound. Missing assets or notices, unresolved provenance,
+unknown/forbidden licenses, and critical/high vulnerabilities reject the gate.
+
 ### Gate 4: security and disclosure
 
 - [ ] Add `SECURITY.md` with supported versions, a private reporting route,
@@ -537,7 +546,7 @@ Each row is an independently reviewable one-to-three-day follow-up.
 | 1 | Community/governance documents, issue forms, PR template, DCO/CLA decision | Implemented in #202 |
 | 2 | Closed readiness/evidence schemas and deterministic verifier | Implemented in #203 |
 | 3 | All-ref/history/collaboration secret audit tooling and redacted ledger | Implemented in #204 |
-| 4 | Dependency/license/provenance inventory and legal review package | 2-3 days |
+| 4 | Dependency/license/provenance inventory and legal review package | Implemented in #205 |
 | 5 | Workflow SHA pinning, threat model, disclosure policy, and security dry run | 2-3 days |
 | 6 | Desired GitHub settings/rulesets manifest, access review, and verifier | 2-3 days |
 | 7 | Temporary-repository migration rehearsal and anonymous smoke suite | 2-3 days |
