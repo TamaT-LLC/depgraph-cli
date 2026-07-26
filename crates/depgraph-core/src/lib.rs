@@ -1,4 +1,5 @@
 pub mod bounded_query;
+pub mod bounded_query_type;
 pub mod build;
 pub mod build_evidence;
 pub mod cache;
@@ -39,6 +40,14 @@ pub use bounded_query::{
     QueryDirection, QueryFailureClass, QueryOrigin, RelationshipPattern, ReturnClause,
     ScalarOperator, ScalarPredicate, SortDirection, parse_bounded_query, parse_bounded_query_bytes,
     parse_bounded_query_file, read_bounded_query_file,
+};
+pub use bounded_query_type::{
+    BOUNDED_QUERY_TYPE_CONTRACT_VERSION, BindingDefinition, EntityType, FIELD_REGISTRY,
+    FieldDefinition, QueryType, ScalarType, TypedEntityExpression, TypedExpression,
+    TypedFieldReference, TypedMatchClause, TypedNodePattern, TypedOrderItem, TypedProjection,
+    TypedQuery, TypedQueryAst, TypedReturnClause, TypedScalarPredicate,
+    canonical_typed_query_ast_json, field_registry, parse_and_type_check_bounded_query,
+    type_check_bounded_query, typed_query_ast_digest,
 };
 pub use build::{
     ASTRO_BUILD_CAPABILITY, ASTRO_BUILD_OBSERVATION_SCHEMA, ASTRO_BUILD_OBSERVER,

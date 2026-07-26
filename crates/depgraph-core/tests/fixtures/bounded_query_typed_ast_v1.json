@@ -1,0 +1,4 @@
+{
+  "query": "MATCH p = (source:\"route\")-[\"calls\"|\"imports\"*1..4]->(target:\"external_system\") WHERE source.kind IN [\"route\",\"service\"] AND p.depth >= 1 AND EVERY edge IN EDGES(p) SATISFIES edge.phase IN [\"build\",\"runtime\",\"semantic\"] AND edge.generated = false AND SOME evidence IN EVIDENCE(p) SATISFIES evidence.path STARTS WITH \"apps/\" AND evidence.ordinal >= 0 RETURN DISTINCT source.id, target.id, p ORDER BY source.id, target.id, p ASC LIMIT 200",
+  "typed_ast_digest": "typed-query-ast:sha256:20af0eb125c2afdb2cc8053d36b635223913ca4255adc1f66f69310d44c554bd"
+}
