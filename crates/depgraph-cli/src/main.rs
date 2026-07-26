@@ -8,17 +8,21 @@ use std::{
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use depgraph_core::{
-    BuildOutcomeKind, Config, CycleLevel, DaemonStatus, ExportFormat, GraphQueryFilter,
-    ImpactFilters, ImpactResult, PolicyAnnotation, PolicyResult, ScanCacheMode,
-    acquire_store_writer_lock, build_cache_key, create_build_execution_request, default_store_path,
-    doctor, evaluate_policy_diff, execute_build_request_with_cancellation, export_filtered,
+    BoundedQueryExecutionError, BoundedQueryPlan, BoundedQueryResult, BuildOutcomeKind,
+    CancellationToken, Config, CycleLevel, DaemonStatus, ExportFormat, GraphQueryFilter,
+    ImpactFilters, ImpactResult, PolicyAnnotation, PolicyResult, QueryDiagnostic,
+    QueryFailureClass, ScanCacheMode, TypedProjection, acquire_store_writer_lock, build_cache_key,
+    create_build_execution_request, default_store_path, doctor, evaluate_policy_diff,
+    execute_bounded_query, execute_build_request_with_cancellation, export_filtered,
     export_graphml_filtered_to_writer, impact, impact_query_cache_key, init_config,
-    match_runtime_trace, open_store, open_store_read_only, policy_annotations,
-    read_git_changed_set, read_runtime_trace, render_condition, render_github_annotations,
-    run_scan_with_cache_mode, runtime_session_delta, rust_build_protocol_ndjson,
-    stage_build_evidence, start_repository_daemon, traverse_filtered, unresolved,
-    web_build_protocol_ndjson, why_filtered,
+    match_runtime_trace, open_store, open_store_read_only, parse_and_type_check_bounded_query,
+    plan_bounded_query, policy_annotations, read_bounded_query_file, read_git_changed_set,
+    read_runtime_trace, render_condition, render_github_annotations, run_scan_with_cache_mode,
+    runtime_session_delta, rust_build_protocol_ndjson, stage_build_evidence,
+    start_repository_daemon, traverse_filtered, unresolved, web_build_protocol_ndjson,
+    why_filtered,
 };
+use depgraph_protocol::canonical_json;
 use depgraph_store::{CompletedSnapshotDetails, CoverageRecord};
 use serde::Serialize;
 
@@ -174,6 +178,31 @@ enum Commands {
     },
     /// List unresolved dependency sites.
     Unresolved {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run one bounded read-only query against an immutable completed snapshot.
+    Query {
+        /// Supply the complete bounded query as one command-line value.
+        #[arg(
+            long,
+            value_name = "QUERY",
+            required_unless_present = "file",
+            conflicts_with = "file"
+        )]
+        query: Option<String>,
+        /// Read the bounded query from one confined UTF-8 regular file.
+        #[arg(
+            long,
+            value_name = "FILE",
+            required_unless_present = "query",
+            conflicts_with = "query"
+        )]
+        file: Option<PathBuf>,
+        /// Validate and print the deterministic plan without traversal.
+        #[arg(long)]
+        explain: bool,
+        /// Emit the canonical versioned JSON contract.
         #[arg(long)]
         json: bool,
     },
@@ -354,6 +383,19 @@ struct PolicyCommandData<'a> {
     annotations: &'a [PolicyAnnotation],
 }
 
+#[derive(Debug)]
+struct QuerySnapshotUnavailable;
+
+impl std::fmt::Display for QuerySnapshotUnavailable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(
+            "query_snapshot_unavailable: the selected scan has no immutable completed snapshot",
+        )
+    }
+}
+
+impl std::error::Error for QuerySnapshotUnavailable {}
+
 impl From<CompletedSnapshotDetails> for SnapshotView {
     fn from(details: CompletedSnapshotDetails) -> Self {
         let snapshot = details.snapshot;
@@ -409,6 +451,26 @@ async fn main() -> ExitCode {
 }
 
 fn error_exit_code(error: &anyhow::Error) -> u8 {
+    if let Some(diagnostic) = error.downcast_ref::<QueryDiagnostic>() {
+        return if diagnostic.class == QueryFailureClass::Security {
+            4
+        } else {
+            2
+        };
+    }
+    if let Some(error) = error.downcast_ref::<BoundedQueryExecutionError>() {
+        return if matches!(
+            error.code,
+            "query_execution_resource_exhausted"
+                | "query_execution_deadline_exceeded"
+                | "query_execution_cancelled"
+                | "query_plan_not_admitted"
+        ) {
+            1
+        } else {
+            3
+        };
+    }
     let message = format!("{error:#}").to_ascii_lowercase();
     if message.contains("security policy") || message.contains("project code execution") {
         return 4;
@@ -1099,6 +1161,39 @@ async fn run(cli: Cli) -> Result<u8> {
             }
             Ok(0)
         }
+        Commands::Query {
+            query,
+            file,
+            explain,
+            json,
+        } => {
+            let repository_root = canonical_directory(std::env::current_dir()?)?;
+            let query = match (query, file) {
+                (Some(query), None) => query,
+                (None, Some(path)) => read_bounded_query_file(&repository_root, &path)?,
+                _ => unreachable!("clap requires exactly one bounded query input"),
+            };
+            // Parse and type-check before store access so malformed, hostile,
+            // and credential-shaped input cannot observe repository state.
+            let typed = parse_and_type_check_bounded_query(&query)?;
+            drop(query);
+
+            let (snapshot, snapshot_id) =
+                load_query_snapshot_read_only(cli.store, cli.scan_id.as_deref())?;
+            let plan = plan_bounded_query(&typed, &snapshot_id, &snapshot)?;
+            if explain {
+                print_query_plan(&plan, json)?;
+                return Ok(if plan.admitted { 0 } else { 1 });
+            }
+            if !plan.admitted {
+                print_query_plan_rejection(&plan);
+                return Ok(1);
+            }
+            let result =
+                execute_bounded_query(&typed, &plan, &snapshot, &CancellationToken::new())?;
+            print_query_result(&typed.ast.return_clause.projections, &result, json)?;
+            Ok(0)
+        }
         Commands::Runtime { command } => match command {
             RuntimeCommands::Validate { trace, json } => {
                 let metadata = inspect_runtime_trace_input(&trace)?;
@@ -1725,6 +1820,147 @@ fn load_snapshot_read_only(
     let scan_id = store.resolve_scan_id(requested_scan_id, latest_attempt)?;
     let snapshot = store.load_snapshot(&scan_id)?;
     Ok((snapshot, scan_id))
+}
+
+fn load_query_snapshot_read_only(
+    explicit_store: Option<PathBuf>,
+    requested_scan_id: Option<&str>,
+) -> Result<(depgraph_core::GraphSnapshot, String)> {
+    let root = std::env::current_dir()?;
+    let store_path = store_path(explicit_store, &root)?;
+    let store = open_store_read_only(&store_path)?;
+    let snapshot_id = if let Some(scan_id) = requested_scan_id {
+        store
+            .snapshot_id_for_scan_selection(scan_id)?
+            .ok_or(QuerySnapshotUnavailable)?
+    } else {
+        store
+            .current_snapshot_id()?
+            .ok_or(QuerySnapshotUnavailable)?
+    };
+    let snapshot = store.load_completed_snapshot(&snapshot_id)?;
+    Ok((snapshot, snapshot_id))
+}
+
+fn print_query_plan(plan: &BoundedQueryPlan, json: bool) -> Result<()> {
+    if json {
+        println!("{}", canonical_json(&serde_json::to_value(plan)?));
+        return Ok(());
+    }
+    println!(
+        "query explain: {}",
+        if plan.admitted {
+            "admitted"
+        } else {
+            "rejected"
+        }
+    );
+    println!("schema: {}", plan.schema_version);
+    println!("contract: {}", plan.contract_version);
+    println!("limits: {}", plan.limit_version);
+    println!("typed AST: {}", plan.typed_ast_digest);
+    println!("snapshot: {}", plan.snapshot_id);
+    println!("graph: {}", plan.graph_digest);
+    println!("plan: {}", plan.plan_digest);
+    println!(
+        "redacted typed AST: {}",
+        canonical_json(&plan.redacted_typed_ast_shape)
+    );
+    println!(
+        "snapshot statistics: {}",
+        canonical_json(&serde_json::to_value(&plan.snapshot_statistics)?)
+    );
+    for (index, operator) in plan.operators.iter().enumerate() {
+        let operator_name = serde_json::to_value(operator.operator)?
+            .as_str()
+            .context("bounded query operator name is not a string")?
+            .to_owned();
+        println!(
+            "operator {}: {} rows={} visits={} tests={} bytes={} cost={}",
+            index + 1,
+            operator_name,
+            operator.worst_case_rows,
+            operator.worst_case_visits,
+            operator.worst_case_tests,
+            operator.worst_case_serialized_bytes,
+            operator.cost,
+        );
+    }
+    println!(
+        "cardinality: {}",
+        canonical_json(&serde_json::to_value(&plan.cardinality_inputs)?)
+    );
+    println!(
+        "bounds: {}",
+        canonical_json(&serde_json::to_value(&plan.bounds)?)
+    );
+    println!(
+        "hard limits: {}",
+        canonical_json(&serde_json::to_value(plan.limits)?)
+    );
+    for reason in &plan.reasons {
+        println!(
+            "rejected [{}] {} observed={} limit={}; remediation={}",
+            reason.code, reason.resource, reason.observed, reason.limit, reason.remediation
+        );
+    }
+    Ok(())
+}
+
+fn print_query_plan_rejection(plan: &BoundedQueryPlan) {
+    for reason in &plan.reasons {
+        eprintln!(
+            "error: {}: resource={}; observed={}; limit={}; remediation={}",
+            reason.code, reason.resource, reason.observed, reason.limit, reason.remediation
+        );
+    }
+}
+
+fn print_query_result(
+    projections: &[TypedProjection],
+    result: &BoundedQueryResult,
+    json: bool,
+) -> Result<()> {
+    if json {
+        println!("{}", canonical_json(&serde_json::to_value(result)?));
+        return Ok(());
+    }
+    println!("query: complete");
+    println!("schema: {}", result.schema_version);
+    println!("contract: {}", result.contract_version);
+    println!("snapshot: {}", result.snapshot_id);
+    println!("graph: {}", result.graph_digest);
+    println!("plan: {}", result.plan_digest);
+    println!("result: {}", result.result_digest);
+    println!("rows: {}", result.rows.len());
+    for (row_index, row) in result.rows.iter().enumerate() {
+        println!("row {}:", row_index + 1);
+        for (projection, value) in projections.iter().zip(row) {
+            println!(
+                "  {}: {}",
+                query_projection_label(projection),
+                canonical_json(value)
+            );
+        }
+    }
+    println!(
+        "metrics: sources={} states={} edges={} sites={} evidence={} output_bytes={} memory_bytes={}",
+        result.metrics.source_node_tests,
+        result.metrics.traversal_states,
+        result.metrics.edge_tests,
+        result.metrics.site_tests,
+        result.metrics.evidence_tests,
+        result.metrics.serialized_output_bytes,
+        result.metrics.working_memory_bytes,
+    );
+    Ok(())
+}
+
+fn query_projection_label(projection: &TypedProjection) -> String {
+    match projection {
+        TypedProjection::Binding(binding) => binding.name.clone(),
+        TypedProjection::Field(field) => format!("{}.{}", field.binding, field.field),
+    }
 }
 
 fn inspect_runtime_trace_input(path: &Path) -> Result<std::fs::Metadata> {
