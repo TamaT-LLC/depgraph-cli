@@ -1,3 +1,4 @@
+pub mod bounded_query;
 pub mod build;
 pub mod build_evidence;
 pub mod cache;
@@ -29,6 +30,16 @@ use depgraph_store::{
 };
 use serde::{Deserialize, Serialize};
 
+pub use bounded_query::{
+    BOUNDED_QUERY_CONTRACT_VERSION, BOUNDED_QUERY_CREDENTIAL_POLICY_VERSION, EntityExpression,
+    Expression, FieldReference, Literal, MAX_QUERY_AST_NODES, MAX_QUERY_BYTES, MAX_QUERY_DEPTH,
+    MAX_QUERY_EXISTENTIAL_PREDICATES, MAX_QUERY_EXPRESSION_NESTING, MAX_QUERY_LIMIT,
+    MAX_QUERY_LIST_LITERALS, MAX_QUERY_PROJECTIONS, MAX_QUERY_TOKENS, MatchClause, NodePattern,
+    OrderItem, Projection, QuantifierKind, QuantifierPredicate, QueryAst, QueryDiagnostic,
+    QueryDirection, QueryFailureClass, QueryOrigin, RelationshipPattern, ReturnClause,
+    ScalarOperator, ScalarPredicate, SortDirection, parse_bounded_query, parse_bounded_query_bytes,
+    parse_bounded_query_file, read_bounded_query_file,
+};
 pub use build::{
     ASTRO_BUILD_CAPABILITY, ASTRO_BUILD_OBSERVATION_SCHEMA, ASTRO_BUILD_OBSERVER,
     ASTRO_BUILD_OBSERVER_VERSION, BUILD_SUPERVISOR_VERSION, BuildAudit, BuildExecutionOutcome,
