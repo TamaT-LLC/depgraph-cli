@@ -10,6 +10,7 @@ pub mod config;
 pub mod cross_language;
 pub mod daemon;
 pub mod export;
+pub mod ffi;
 mod graphml;
 pub mod graphql;
 pub mod http_operation_correlation;
@@ -97,6 +98,10 @@ pub use build_evidence::{
     web_build_protocol_ndjson,
 };
 pub use cross_language::validate_cross_language_worker_protocol;
+pub use ffi::{
+    FFI_CAPABILITY, FFI_FORMAT_VERSION, MAX_FFI_DECLARATIONS, MAX_FFI_FILE_BYTES, MAX_FFI_FILES,
+    MAX_FFI_TOTAL_BYTES, scan_ffi_repository,
+};
 pub const FRAMEWORK_BUILD_GRAPH_CONTRACT_VERSION: &str = "framework-build-graph-v1";
 pub const FRAMEWORK_BUILD_GATE_CONTRACT_VERSION: &str =
     "dynamic-framework-evidence-release-gate-v1";
