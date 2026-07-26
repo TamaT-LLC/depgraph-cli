@@ -120,6 +120,50 @@ for ((sample = 0; sample < query_samples; sample++)); do
     "$binary" --store "$package_query_store" impact package:depgraph-benchmark --json
 done
 
+# Exercise the bounded query planner and executor against the complete
+# 10,000-file graph. One exact source plus an absent open-vocabulary edge kind
+# proves complete zero-result execution inside the hard work budget; the
+# depth-eight real-edge variant proves that the same graph rejects hostile work
+# before traversal even with LIMIT 1.
+"$binary" --store "$file_query_store" export --format json \
+  > "$raw/bounded-query-graph.json"
+bounded_query_source="$(node -e '
+  const fs = require("node:fs");
+  const graph = JSON.parse(fs.readFileSync(process.argv[1], "utf8")).graph;
+  const source = graph.nodes.find(
+    (node) => node.kind === "file" && node.properties?.path === "src/f00000.ts",
+  );
+  if (!source?.id) process.exit(1);
+  process.stdout.write(source.id);
+' "$raw/bounded-query-graph.json")"
+bounded_query="MATCH p = (source:\"file\")-[\"__depgraph_benchmark_missing_v1__\"*1..1]->(target:\"file\") WHERE source.id = \"$bounded_query_source\" RETURN source.id, target.id, p.id ORDER BY source.id, target.id, p.id ASC LIMIT 1"
+measure_capture \
+  "$raw/bounded-query-plan-ms.txt" "$raw/bounded-query-plan.json" \
+  "$binary" --store "$file_query_store" query --query "$bounded_query" --explain --json
+for ((sample = 1; sample < query_samples; sample++)); do
+  measure_silent \
+    "$raw/bounded-query-plan-ms.txt" \
+    "$binary" --store "$file_query_store" query --query "$bounded_query" --explain --json
+done
+measure_capture \
+  "$raw/bounded-query-execute-ms.txt" "$raw/bounded-query-result.json" \
+  "$binary" --store "$file_query_store" query --query "$bounded_query" --json
+for ((sample = 1; sample < query_samples; sample++)); do
+  measure_silent \
+    "$raw/bounded-query-execute-ms.txt" \
+    "$binary" --store "$file_query_store" query --query "$bounded_query" --json
+done
+hostile_query='MATCH p = (source:"file")-["imports"*1..8]->(target:"file") RETURN target.id LIMIT 1'
+set +e
+"$binary" --store "$file_query_store" query --query "$hostile_query" --explain --json \
+  > "$raw/bounded-query-hostile-plan.json"
+hostile_status="$?"
+set -e
+if [[ "$hostile_status" -ne 1 ]]; then
+  echo "hostile bounded query plan must be rejected with exit 1" >&2
+  exit 1
+fi
+
 "$binary" --store "$incremental_store" export --format json \
   > "$raw/graph-before.json"
 

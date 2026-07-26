@@ -35,6 +35,8 @@ jobs:
       DEPGRAPH_SCAN_LIMIT_MS: "80000"
       DEPGRAPH_INCREMENTAL_LIMIT_MS: "2000"
       DEPGRAPH_QUERY_LIMIT_MS: "500"
+      DEPGRAPH_BOUNDED_QUERY_PLAN_LIMIT_MS: "7000"
+      DEPGRAPH_BOUNDED_QUERY_EXECUTE_LIMIT_MS: "10000"
       DEPGRAPH_BUILD_OBSERVATION_LIMIT_MS: "60000"
       DEPGRAPH_BENCH_SAMPLES: "3"
       DEPGRAPH_QUERY_SAMPLES: "5"
@@ -106,6 +108,7 @@ jobs:
             dist/*.tar.gz
             dist/*.zip
             dist/*.sha256
+            dist/*.query-smoke.json
           if-no-files-found: error
 
   verify-assets:

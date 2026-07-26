@@ -25,6 +25,7 @@ use tokio::{
 use walkdir::{DirEntry, WalkDir};
 
 use crate::{
+    BOUNDED_QUERY_RELEASE_SMOKE_FIXTURE_PATH, BOUNDED_QUERY_RELEASE_SMOKE_QUERY,
     RUST_SYSROOT_COMPONENT_NAME, RUST_SYSROOT_COMPONENT_ROOT, RUST_SYSROOT_COMPONENT_VERSION,
     RUST_SYSROOT_LICENSE_EXPRESSION, ReleaseCompatibilityHealth,
     cancellation::CancellationToken,
@@ -448,6 +449,7 @@ struct BundledManifest {
     project_licenses: Vec<BundledArtifact>,
     core: BundledArtifact,
     schema: BundledArtifact,
+    query_fixture: BundledArtifact,
     #[serde(default)]
     runtime_artifacts: Vec<BundledArtifact>,
     #[serde(default)]
@@ -631,6 +633,24 @@ fn locate_verified_bundled_worker_for_executable(
         }
     }
     verify_bundled_artifact(&release_root, &manifest.schema, "protocol schema")?;
+    if manifest.query_fixture.path != BOUNDED_QUERY_RELEASE_SMOKE_FIXTURE_PATH
+        || format!("sha256:{}", manifest.query_fixture.sha256)
+            != manifest.compatibility.bounded_query.fixture_sha256
+    {
+        bail!(
+            "security policy violation: release manifest bounded query fixture identity is incompatible"
+        );
+    }
+    let query_fixture = verify_bundled_artifact(
+        &release_root,
+        &manifest.query_fixture,
+        "bounded query fixture",
+    )?;
+    if std::fs::read_to_string(query_fixture)? != BOUNDED_QUERY_RELEASE_SMOKE_QUERY {
+        bail!(
+            "security policy violation: bounded query fixture differs from the compiled contract"
+        );
+    }
 
     let expected_runtime_paths = WEB_RUNTIME_ARTIFACT_PATHS
         .iter()
@@ -6674,6 +6694,11 @@ mod tests {
         let web_worker_path = "libexec/depgraph-web-worker.mjs";
         let core = write_manifest_artifact(release, &core_path, b"verified core")?;
         let schema = write_manifest_artifact(release, PROTOCOL_SCHEMA_PATH, b"verified schema")?;
+        let query_fixture = write_manifest_artifact(
+            release,
+            BOUNDED_QUERY_RELEASE_SMOKE_FIXTURE_PATH,
+            BOUNDED_QUERY_RELEASE_SMOKE_QUERY.as_bytes(),
+        )?;
         let apache_license =
             write_manifest_artifact(release, "LICENSE-APACHE", b"test Apache-2.0 license")?;
         let mit_license = write_manifest_artifact(release, "LICENSE-MIT", b"test MIT license")?;
@@ -6697,6 +6722,7 @@ mod tests {
                 "project_licenses": [apache_license, mit_license],
                 "core": core,
                 "schema": schema,
+                "query_fixture": query_fixture,
                 "runtime_artifacts": runtime_artifacts,
                 "runtime_components": runtime_components,
                 "runtime_requirements": {"web": WEB_RUNTIME_REQUIREMENT},
@@ -8545,6 +8571,45 @@ mod tests {
                 .to_string()
                 .contains("checksum mismatch")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn bundled_workers_require_the_exact_bounded_query_contract_fixture() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        for mutation in ["path", "version", "missing", "tampered"] {
+            let release = temp.path().join(mutation);
+            let test_release = write_test_release_manifest(&release, Vec::new(), Vec::new())?;
+            match mutation {
+                "path" => update_test_manifest(&test_release.manifest, |manifest| {
+                    manifest["query_fixture"]["path"] =
+                        Value::String("queries/other.query".to_owned());
+                    Ok(())
+                })?,
+                "version" => update_test_manifest(&test_release.manifest, |manifest| {
+                    manifest["compatibility"]["bounded_query"]["result_schema_version"] =
+                        Value::String("bounded-query-result-v2".to_owned());
+                    Ok(())
+                })?,
+                "missing" => {
+                    std::fs::remove_file(release.join(BOUNDED_QUERY_RELEASE_SMOKE_FIXTURE_PATH))?
+                }
+                "tampered" => std::fs::write(
+                    release.join(BOUNDED_QUERY_RELEASE_SMOKE_FIXTURE_PATH),
+                    b"tampered query",
+                )?,
+                _ => unreachable!(),
+            }
+            let error = locate_verified_bundled_worker(AdapterKind::Go, &test_release.manifest)
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("bounded query")
+                    || error.to_string().contains("compatibility")
+                    || error.to_string().contains("checksum mismatch")
+                    || error.to_string().contains("failed to canonicalize"),
+                "{mutation}: {error:#}"
+            );
+        }
         Ok(())
     }
 

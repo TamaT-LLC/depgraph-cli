@@ -483,7 +483,7 @@ Each row is one independently reviewable one-to-three-day follow-up Issue.
 | 3 | Snapshot cardinality statistics, fixed operator planner, cost admission, and explain schema | Implemented in #179 | 2 | Explain and execute admission are byte-identical across checkouts and SQLite row orders |
 | 4 | Canonical forward/reverse BFS executor, site/evidence filters, staging, and cancellation | Implemented in #180 | 3 | One shortest witness per endpoint pair; every cap is all-or-error |
 | 5 | CLI human/JSON output, read-only store integration, profile/phase/condition/evidence fixtures | Implemented in #181 | 4 | Multi-root and cross-kind use cases work without changing a snapshot |
-| 6 | Fuzz/property tests, hostile large-graph benchmark, and five-target package/release gate | 2-3 days | 5 | Parser/planner/executor survive malformed/budget fixtures; all native archives agree |
+| 6 | Fuzz/property tests, hostile large-graph benchmark, and five-target package/release gate | Implemented in #182 | 5 | Parser/planner/executor survive malformed/budget fixtures; all native archives agree |
 
 Parser, planner, and executor remain separate components delivered by separate
 Issues. The parser cannot directly traverse, the planner cannot access raw

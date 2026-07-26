@@ -16,9 +16,21 @@ import {
   fixtureFingerprint,
 } from "./benchmark-fixture.mjs";
 
-export const REPORT_SCHEMA_VERSION = "depgraph-benchmark-report-v4";
+export const REPORT_SCHEMA_VERSION = "depgraph-benchmark-report-v5";
 export const EXPECTED_FIXTURE_SHA256 =
   "f57a6d7d2e22366f5d312f01f038f6f50e2c2fbbd4480b9849ed82a696e97dc1";
+export const BOUNDED_QUERY_RELEASE_CONTRACT = {
+  release_smoke_contract_version: "bounded-query-release-smoke-v1",
+  language_contract_version: "bounded-graph-query-v1",
+  type_contract_version: "bounded-query-types-v1",
+  statistics_version: "bounded-query-statistics-v1",
+  plan_schema_version: "bounded-query-plan-v1",
+  limit_version: "bounded-query-limits-v1",
+  result_schema_version: "bounded-query-result-v1",
+  fixture_path: "queries/bounded-query-smoke-v1.query",
+  fixture_sha256:
+    "sha256:5e4b96c73d214ec8da9a0d9f3276e84eb819b99d8f243ab010318d2e902803a8",
+};
 
 const METRIC_CONTRACTS = new Map([
   [
@@ -88,6 +100,28 @@ const METRIC_CONTRACTS = new Map([
     },
   ],
   [
+    "bounded_query_plan",
+    {
+      cache: "verified_snapshot_plan",
+      gated: true,
+      minimum_samples: 3,
+      maximum_samples: 50,
+      maximum_limit_ms: 7_000,
+      product_target_ms: 5_000,
+    },
+  ],
+  [
+    "bounded_query_execute",
+    {
+      cache: "canonical_adjacency_bfs",
+      gated: true,
+      minimum_samples: 3,
+      maximum_samples: 50,
+      maximum_limit_ms: 10_000,
+      product_target_ms: 8_000,
+    },
+  ],
+  [
     "rust_hir_semantic_scan",
     {
       cache: "cold_graph_store",
@@ -128,6 +162,10 @@ const CACHE_CONDITIONS = {
   cold_query: "first query process against an unqueried completed graph store",
   warm_query:
     "independent query processes using the snapshot/filter-scoped bounded impact query cache after one priming query",
+  bounded_query_plan:
+    "independent read-only planner processes against one verified 10,000-file snapshot",
+  bounded_query_execute:
+    "independent canonical BFS processes against one verified 10,000-file snapshot",
 };
 const CACHE_CONDITION_KEYS = Object.keys(CACHE_CONDITIONS);
 const TOOLCHAIN_KEYS = ["cargo", "depgraph", "go", "node", "pnpm", "rustc"];
@@ -358,6 +396,88 @@ function validateImpactQueries(rawDir, fixture) {
   };
 }
 
+function validateBoundedQueryEvidence(rawDir, fixture) {
+  const graph = jsonFile(join(rawDir, "bounded-query-graph.json")).graph;
+  const plan = jsonFile(join(rawDir, "bounded-query-plan.json"));
+  const result = jsonFile(join(rawDir, "bounded-query-result.json"));
+  const hostile = jsonFile(join(rawDir, "bounded-query-hostile-plan.json"));
+  const limits = plan.limits;
+  const boundedResources = [
+    "source_node_tests",
+    "traversal_states",
+    "edge_tests",
+    "site_tests",
+    "evidence_tests",
+    "result_rows",
+    "serialized_output_bytes",
+    "working_memory_bytes",
+    "deterministic_cost",
+  ];
+  const runtimeResources = boundedResources.filter(
+    (resource) => resource !== "deterministic_cost",
+  );
+  const resultText = JSON.stringify(result);
+  if (
+    !graph ||
+    graph.nodes?.filter((node) => node.kind === "file").length <
+      fixture.source_file_count ||
+    plan.schema_version !== BOUNDED_QUERY_RELEASE_CONTRACT.plan_schema_version ||
+    plan.contract_version !==
+      BOUNDED_QUERY_RELEASE_CONTRACT.language_contract_version ||
+    plan.limit_version !== BOUNDED_QUERY_RELEASE_CONTRACT.limit_version ||
+    plan.admitted !== true ||
+    !boundedResources.every(
+      (resource) =>
+        Number.isSafeInteger(plan.bounds?.[resource]) &&
+        Number.isSafeInteger(limits?.[resource]) &&
+        plan.bounds[resource] <= limits[resource],
+    ) ||
+    result.schema_version !==
+      BOUNDED_QUERY_RELEASE_CONTRACT.result_schema_version ||
+    result.contract_version !==
+      BOUNDED_QUERY_RELEASE_CONTRACT.language_contract_version ||
+    result.plan_digest !== plan.plan_digest ||
+    !/^bounded-query-plan:sha256:[0-9a-f]{64}$/.test(plan.plan_digest) ||
+    !/^bounded-query-result:sha256:[0-9a-f]{64}$/.test(
+      result.result_digest,
+    ) ||
+    !Array.isArray(result.rows) ||
+    result.rows.length !== 0 ||
+    !isRecord(result.metrics) ||
+    !runtimeResources.every(
+      (resource) =>
+        Number.isSafeInteger(result.metrics[resource]) &&
+        result.metrics[resource] <= limits[resource],
+    ) ||
+    resultText.includes('"properties"') ||
+    resultText.includes('"detail"') ||
+    hostile.schema_version !==
+      BOUNDED_QUERY_RELEASE_CONTRACT.plan_schema_version ||
+    hostile.contract_version !==
+      BOUNDED_QUERY_RELEASE_CONTRACT.language_contract_version ||
+    hostile.admitted !== false ||
+    !Array.isArray(hostile.reasons) ||
+    hostile.reasons.length === 0 ||
+    !hostile.reasons.every(
+      (reason) => reason.code === "query_plan_budget_exceeded",
+    )
+  ) {
+    throw new Error("bounded query benchmark evidence is incomplete");
+  }
+  return {
+    contract: BOUNDED_QUERY_RELEASE_CONTRACT,
+    source_file_count: fixture.source_file_count,
+    graph_node_count: graph.nodes.length,
+    graph_edge_count: graph.edges.length,
+    admitted: true,
+    plan_digest: plan.plan_digest,
+    result_digest: result.result_digest,
+    result_rows: result.rows.length,
+    hostile_rejected: true,
+    hostile_resources: hostile.reasons.map((reason) => reason.resource),
+  };
+}
+
 function validIncrementalTrace(trace) {
   if (
     trace?.schema_version !== "daemon-incremental-trace-v1" ||
@@ -530,7 +650,7 @@ export function validateRustBenchmarkEvidence(rustScan, rustGraph) {
   return true;
 }
 
-function validateAuxiliaryEvidence(rawDir) {
+function validateAuxiliaryEvidence(rawDir, fixture) {
   const rustScan = jsonFile(join(rawDir, "rust-scan.json"));
   const rustGraph = jsonFile(join(rawDir, "rust-graph.json")).graph;
   validateRustBenchmarkEvidence(rustScan, rustGraph);
@@ -567,6 +687,7 @@ function validateAuxiliaryEvidence(rawDir) {
     rust_semantic_complete: false,
     rust_development_sysroot_fallback: true,
     cross_adapter_build_profiles: CROSS_ADAPTER_PROFILES,
+    bounded_query: validateBoundedQueryEvidence(rawDir, fixture),
   };
 }
 
@@ -731,7 +852,28 @@ function validEvidence(report) {
     evidence.rust_semantic_complete !== false ||
     evidence.rust_development_sysroot_fallback !== true ||
     JSON.stringify(evidence.cross_adapter_build_profiles) !==
-      JSON.stringify(CROSS_ADAPTER_PROFILES)
+      JSON.stringify(CROSS_ADAPTER_PROFILES) ||
+    !isRecord(evidence.bounded_query) ||
+    JSON.stringify(evidence.bounded_query.contract) !==
+      JSON.stringify(BOUNDED_QUERY_RELEASE_CONTRACT) ||
+    evidence.bounded_query.source_file_count !==
+      report.fixture.source_file_count ||
+    !Number.isSafeInteger(evidence.bounded_query.graph_node_count) ||
+    evidence.bounded_query.graph_node_count < report.fixture.source_file_count ||
+    !Number.isSafeInteger(evidence.bounded_query.graph_edge_count) ||
+    evidence.bounded_query.graph_edge_count <
+      report.fixture.expected_dependency_sites ||
+    evidence.bounded_query.admitted !== true ||
+    !/^bounded-query-plan:sha256:[0-9a-f]{64}$/.test(
+      evidence.bounded_query.plan_digest,
+    ) ||
+    !/^bounded-query-result:sha256:[0-9a-f]{64}$/.test(
+      evidence.bounded_query.result_digest,
+    ) ||
+    evidence.bounded_query.result_rows !== 0 ||
+    evidence.bounded_query.hostile_rejected !== true ||
+    !Array.isArray(evidence.bounded_query.hostile_resources) ||
+    evidence.bounded_query.hostile_resources.length === 0
   ) {
     return false;
   }
@@ -903,6 +1045,20 @@ export function createReport({ rawDir, fixtureDir, output }) {
       500,
     ),
     gatedMetric(
+      "bounded_query_plan",
+      "verified_snapshot_plan",
+      "bounded-query-plan-ms.txt",
+      threshold("DEPGRAPH_BOUNDED_QUERY_PLAN_LIMIT_MS", 7_000),
+      5_000,
+    ),
+    gatedMetric(
+      "bounded_query_execute",
+      "canonical_adjacency_bfs",
+      "bounded-query-execute-ms.txt",
+      threshold("DEPGRAPH_BOUNDED_QUERY_EXECUTE_LIMIT_MS", 10_000),
+      8_000,
+    ),
+    gatedMetric(
       "rust_hir_semantic_scan",
       "cold_graph_store",
       "rust-scan-ms.txt",
@@ -935,7 +1091,7 @@ export function createReport({ rawDir, fixtureDir, output }) {
     fixture.changed_file,
   );
   const impactQueries = validateImpactQueries(rawDir, fixture);
-  const auxiliaryEvidence = validateAuxiliaryEvidence(rawDir);
+  const auxiliaryEvidence = validateAuxiliaryEvidence(rawDir, fixture);
   const gatePassed =
     conservation.passed &&
     metrics.filter((metric) => metric.gated).every((metric) => metric.passed);
