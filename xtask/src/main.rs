@@ -19,6 +19,11 @@ mod rust_semantic_e2e;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const STABLE_RELEASE_GATE_SCHEMA_VERSION: &str = "stable-release-gate-v1";
 const STABLE_RELEASE_VERSION: &str = "0.4.0";
+const STABLE_RELEASE_BASELINE_COMMIT: &str = "d5ca92bae4b4fdbbedb2f3cabd4aa3ef731e7c9f";
+const STABLE_RELEASE_BASELINE_TREE: &str = "46555a059070e94c3ed4567af3c58b278dbb0fb4";
+const STABLE_RELEASE_BASELINE_DIGEST: &str =
+    "0bb7f33d212402025429382489d586956d16f7d63d2e4d9d781d5715a44b00fd";
+const STABLE_RELEASE_MAINTENANCE_BRANCH: &str = "refs/heads/release/0.4";
 const STABLE_UPGRADE_SOURCE_VERSION: &str = "0.4.0-rc.1";
 const STABLE_UPGRADE_SOURCE_STORE_SCHEMA_VERSION: i64 = 11;
 const BENCHMARK_REPORT_SCHEMA_VERSION: &str = "depgraph-benchmark-report-v4";
@@ -272,6 +277,16 @@ fn release_compatibility() -> ReleaseCompatibility {
     depgraph_core::release_compatibility_contract()
 }
 
+fn stable_release_baseline_record() -> String {
+    format!(
+        "release-baseline-v1\nrepository=TamaT-LLC/depgraph-cli\nversion={STABLE_RELEASE_VERSION}\ncommit={STABLE_RELEASE_BASELINE_COMMIT}\n"
+    )
+}
+
+fn stable_release_baseline_digest() -> String {
+    hex::encode(Sha256::digest(stable_release_baseline_record().as_bytes()))
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct TargetVerificationReport {
@@ -522,7 +537,7 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         bail!("README release note link is not synchronized with {VERSION}");
     }
     for required in [
-        "updated: 2026-07-25",
+        "updated: 2026-07-26",
         "| Product / Rust / Go / Web adapter | `0.4.0` |",
         "Milestone 4のrelease candidateは`v0.4.0-rc.1`",
         "Milestone 4のstable releaseは`v0.4.0`",
@@ -545,6 +560,9 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "`PROJ-ARC-001-ADR-006`",
         "`public-readiness-v1`",
         "Issue #153として`public-readiness-v1`",
+        "Issue #176でgreen確認済みのmain commit `d5ca92bae4b4fdbbedb2f3cabd4aa3ef731e7c9f`を`release-baseline-v1`",
+        "### ADR-015: Exact Stable Baseline with a Separate Maintenance Line",
+        "2026-07-26: Issue #176としてgreenなmain commit",
     ] {
         if !design.contains(required) {
             bail!("system design release metadata is missing {required:?}");
@@ -717,9 +735,30 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "## Acceptance matrix",
         "| Stable release gate passes but history audit is missing |",
         "| All gates pass but organization owner has not authorized visibility | remain private |",
+        "### Stable baseline and maintenance line",
+        "`refs/heads/release/0.4`",
+        "default-disabled or explicitly opt-in",
     ] {
         if !public_oss_adr.contains(required) {
             bail!("public OSS governance ADR is missing required contract {required:?}");
+        }
+    }
+    let stable_release_note = fs::read_to_string(root.join("docs/releases/v0.4.0.md"))?;
+    if stable_release_baseline_digest() != STABLE_RELEASE_BASELINE_DIGEST {
+        bail!("compiled stable release baseline digest does not match its canonical record");
+    }
+    for required in [
+        "## Release baseline and maintenance line",
+        STABLE_RELEASE_BASELINE_COMMIT,
+        STABLE_RELEASE_BASELINE_TREE,
+        STABLE_RELEASE_BASELINE_DIGEST,
+        STABLE_RELEASE_MAINTENANCE_BRANCH,
+        "git cherry-pick -x",
+        "default-disabled or explicitly opt-in",
+        "GitHub Actions source SHA is not the baseline",
+    ] {
+        if !stable_release_note.contains(required) {
+            bail!("stable release note is missing baseline contract {required:?}");
         }
     }
     let git_attributes = fs::read_to_string(root.join(".gitattributes"))?;
@@ -2945,6 +2984,14 @@ fn evaluate_stable_release_gate(
                     .to_owned(),
         },
         StableReleaseGateCheck {
+            id: "tag-source-baseline".to_owned(),
+            passed: workflow_results.get("source_sha").map(String::as_str)
+                == Some(STABLE_RELEASE_BASELINE_COMMIT),
+            evidence:
+                "v0.4.0 GitHub Actions source SHA equals the release-baseline-v1 commit"
+                    .to_owned(),
+        },
+        StableReleaseGateCheck {
             id: "workflow-quality-closure".to_owned(),
             passed: workflow_results.get("github_actions").map(String::as_str) == Some("true")
                 && workflow_results.get("ref_type").map(String::as_str) == Some("tag")
@@ -2981,6 +3028,7 @@ fn stable_release_workflow_results() -> BTreeMap<String, String> {
         ("github_actions", "GITHUB_ACTIONS"),
         ("ref_type", "GITHUB_REF_TYPE"),
         ("ref_name", "GITHUB_REF_NAME"),
+        ("source_sha", "GITHUB_SHA"),
         ("quality", "DEPGRAPH_RELEASE_QUALITY_RESULT"),
         ("benchmark", "DEPGRAPH_RELEASE_BENCHMARK_RESULT"),
         ("package", "DEPGRAPH_RELEASE_PACKAGE_RESULT"),
@@ -9441,12 +9489,14 @@ fn verify_release_tag() -> Result<()> {
     verify_release_tag_values(
         std::env::var_os("GITHUB_REF_TYPE").as_deref(),
         std::env::var_os("GITHUB_REF_NAME").as_deref(),
+        std::env::var_os("GITHUB_SHA").as_deref(),
     )
 }
 
 fn verify_release_tag_values(
     ref_type: Option<&std::ffi::OsStr>,
     tag: Option<&std::ffi::OsStr>,
+    source_sha: Option<&std::ffi::OsStr>,
 ) -> Result<()> {
     if ref_type != Some(std::ffi::OsStr::new("tag")) {
         return Ok(());
@@ -9458,6 +9508,17 @@ fn verify_release_tag_values(
     let expected = format!("v{VERSION}");
     if tag != expected {
         bail!("release tag {tag} does not match workspace version {expected}");
+    }
+    if tag == format!("v{STABLE_RELEASE_VERSION}") {
+        let Some(source_sha) = source_sha else {
+            bail!("stable release tag workflow did not expose GITHUB_SHA");
+        };
+        if source_sha != std::ffi::OsStr::new(STABLE_RELEASE_BASELINE_COMMIT) {
+            bail!(
+                "stable release tag source {} does not match baseline {STABLE_RELEASE_BASELINE_COMMIT}",
+                source_sha.to_string_lossy()
+            );
+        }
     }
     Ok(())
 }
@@ -9591,18 +9652,19 @@ mod tests {
     use super::{
         ARCHIVE_MTIME, BENCHMARK_REPORT_SCHEMA_VERSION, DependencyPackage,
         PROJECT_LICENSE_EXPRESSION, RELEASE_TARGETS, RUNTIME_COLLECTOR_CONTRACT_VERSION,
-        RUST_SYSROOT_COMPONENT_SHA256, ReleaseVerificationReport, STABLE_RELEASE_VERSION,
-        STABLE_UPGRADE_SOURCE_VERSION, StableReleaseDecision, TYPESCRIPT_VERSION,
-        TargetVerificationReport, VERSION, WEB_SEMANTIC_CAPABILITIES,
-        WEB_SEMANTIC_RUNTIME_ARTIFACTS, WEB_SEMANTIC_RUNTIME_COMPONENTS, WebSemanticAttestation,
-        WorkerBackend, archive_entries, cargo_runtime_packages, create_tar_archive,
-        create_zip_archive, evaluate_stable_release_gate, executable_name_for_target,
-        extract_archive, normalized_spdx_license, package_url, parse_worker_handshake,
-        release_compatibility, remove_transient_build_run_ids, rust_backend_from_handshake,
-        rustc_source_identity, verify_checksum_sidecar, verify_pinned_rust_sysroot_digest,
-        verify_project_metadata, verify_release_tag_values, verify_rust_analyzer_dependencies,
-        verify_rust_backend, verify_web_semantic_attestation, web_runtime_packages,
-        web_semantic_from_handshake, without_windows_verbatim_prefix, workspace_root,
+        RUST_SYSROOT_COMPONENT_SHA256, ReleaseVerificationReport, STABLE_RELEASE_BASELINE_COMMIT,
+        STABLE_RELEASE_BASELINE_DIGEST, STABLE_RELEASE_VERSION, STABLE_UPGRADE_SOURCE_VERSION,
+        StableReleaseDecision, TYPESCRIPT_VERSION, TargetVerificationReport, VERSION,
+        WEB_SEMANTIC_CAPABILITIES, WEB_SEMANTIC_RUNTIME_ARTIFACTS, WEB_SEMANTIC_RUNTIME_COMPONENTS,
+        WebSemanticAttestation, WorkerBackend, archive_entries, cargo_runtime_packages,
+        create_tar_archive, create_zip_archive, evaluate_stable_release_gate,
+        executable_name_for_target, extract_archive, normalized_spdx_license, package_url,
+        parse_worker_handshake, release_compatibility, remove_transient_build_run_ids,
+        rust_backend_from_handshake, rustc_source_identity, stable_release_baseline_digest,
+        verify_checksum_sidecar, verify_pinned_rust_sysroot_digest, verify_project_metadata,
+        verify_release_tag_values, verify_rust_analyzer_dependencies, verify_rust_backend,
+        verify_web_semantic_attestation, web_runtime_packages, web_semantic_from_handshake,
+        without_windows_verbatim_prefix, workspace_root,
     };
 
     fn release_tree() -> Result<(tempfile::TempDir, String)> {
@@ -9625,6 +9687,14 @@ mod tests {
     #[test]
     fn repository_release_metadata_is_synchronized() -> Result<()> {
         verify_project_metadata(&workspace_root())
+    }
+
+    #[test]
+    fn stable_release_baseline_digest_is_reproducible() {
+        assert_eq!(
+            stable_release_baseline_digest(),
+            STABLE_RELEASE_BASELINE_DIGEST
+        );
     }
 
     #[test]
@@ -9786,6 +9856,10 @@ mod tests {
             ("github_actions".to_owned(), "true".to_owned()),
             ("ref_type".to_owned(), "tag".to_owned()),
             ("ref_name".to_owned(), "v0.4.0".to_owned()),
+            (
+                "source_sha".to_owned(),
+                STABLE_RELEASE_BASELINE_COMMIT.to_owned(),
+            ),
             ("quality".to_owned(), "success".to_owned()),
             ("benchmark".to_owned(), "success".to_owned()),
             ("package".to_owned(), "success".to_owned()),
@@ -9836,6 +9910,20 @@ mod tests {
                 "a".repeat(64),
                 "b".repeat(64),
                 failed_workflow,
+            )
+            .decision,
+            StableReleaseDecision::Reject
+        );
+
+        let mut wrong_source = workflow_results.clone();
+        wrong_source.insert("source_sha".to_owned(), "0".repeat(40));
+        assert_eq!(
+            evaluate_stable_release_gate(
+                &release,
+                &benchmark,
+                "a".repeat(64),
+                "b".repeat(64),
+                wrong_source,
             )
             .decision,
             StableReleaseDecision::Reject
@@ -9921,15 +10009,29 @@ mod tests {
     fn release_tag_gate_ignores_non_tag_github_refs() {
         use std::ffi::OsStr;
 
-        verify_release_tag_values(Some(OsStr::new("branch")), Some(OsStr::new("97/merge")))
-            .expect("pull-request merge refs are not release tags");
-        assert!(verify_release_tag_values(Some(OsStr::new("tag")), None).is_err());
+        verify_release_tag_values(
+            Some(OsStr::new("branch")),
+            Some(OsStr::new("97/merge")),
+            None,
+        )
+        .expect("pull-request merge refs are not release tags");
+        assert!(verify_release_tag_values(Some(OsStr::new("tag")), None, None).is_err());
         assert!(
-            verify_release_tag_values(Some(OsStr::new("tag")), Some(OsStr::new("v9.9.9"))).is_err()
+            verify_release_tag_values(Some(OsStr::new("tag")), Some(OsStr::new("v9.9.9")), None,)
+                .is_err()
+        );
+        assert!(
+            verify_release_tag_values(
+                Some(OsStr::new("tag")),
+                Some(OsStr::new(concat!("v", env!("CARGO_PKG_VERSION")))),
+                Some(OsStr::new("0000000000000000000000000000000000000000")),
+            )
+            .is_err()
         );
         verify_release_tag_values(
             Some(OsStr::new("tag")),
             Some(OsStr::new(concat!("v", env!("CARGO_PKG_VERSION")))),
+            Some(OsStr::new(STABLE_RELEASE_BASELINE_COMMIT)),
         )
         .expect("the workspace release tag must remain valid");
     }
