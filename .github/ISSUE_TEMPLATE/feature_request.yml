@@ -1,0 +1,36 @@
+name: Feature request
+description: Propose a scoped improvement to depgraph.
+title: "[Feature] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Search existing issues first. Security reports belong in the private vulnerability reporting route.
+  - type: textarea
+    id: problem
+    attributes:
+      label: User problem
+      description: Describe the concrete dependency-analysis problem and who is affected.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Include expected CLI or contract behavior, not only an implementation preference.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives and scope boundary
+      description: Explain current workarounds, non-goals, and compatibility considerations.
+    validations:
+      required: true
+  - type: checkboxes
+    id: readiness
+    attributes:
+      label: Contribution readiness
+      options:
+        - label: I searched existing issues and can help validate the behavior.
+        - label: I can prepare a pull request after maintainers agree on scope.

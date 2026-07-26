@@ -1,0 +1,57 @@
+name: Bug report
+description: Report a reproducible defect in a supported depgraph release.
+title: "[Bug] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not include secrets, proprietary source, personal data, or vulnerability details. Use the private security route for suspected vulnerabilities.
+  - type: input
+    id: version
+    attributes:
+      label: depgraph version
+      description: Use `depgraph --version` or provide the exact commit.
+      placeholder: "0.4.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - Linux x86-64
+        - Linux ARM64
+        - macOS Intel
+        - macOS Apple Silicon
+        - Windows x86-64
+        - Source build on another platform
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: Provide redacted commands and the smallest safe repository shape that reproduces the problem.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior and redacted diagnostics
+    validations:
+      required: true
+  - type: checkboxes
+    id: routing
+    attributes:
+      label: Public-report confirmation
+      options:
+        - label: I searched existing issues and removed secrets, private source, personal data, and vulnerability details.
+          required: true
+        - label: This is not a suspected security vulnerability.
+          required: true

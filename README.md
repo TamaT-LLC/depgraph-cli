@@ -12,6 +12,33 @@ candidate remain documented as [`v0.4.0-rc.1`](docs/releases/v0.4.0-rc.1.md)
 and
 [`v0.2.0-rc.1`](docs/releases/v0.2.0-rc.1.md).
 
+## Project status and public collaboration
+
+`v0.4.x` is the supported stable release line. Verified release archives are
+produced for Linux x86-64, Linux ARM64, macOS Intel, macOS Apple Silicon, and
+Windows x86-64; their checksums, SBOM, license inventory, and compatibility
+manifest are validated together by the release gate. Source builds use the
+pinned toolchains documented under [Build](#build).
+
+The worker protocol remains at `1.0` for the 0.4 line. Patch releases preserve
+the documented CLI, store, and release compatibility contract. New work lands
+on `main`; defaults that would break 0.4 behavior stay opt-in until a new minor
+release. The current limitations are that safe scans intentionally do not
+execute project code, compiler-precise and build-observation modes require
+explicit consent, unsupported or ambiguous input remains visible rather than
+being guessed, and product support is best effort without an SLA.
+
+Start with the [system design](docs/40_arch_design/arch-dependency-graph-cli-system-design.md)
+and the [stable release notes](docs/releases/v0.4.0.md). Use
+[SUPPORT.md](SUPPORT.md) to choose the right help channel,
+[CONTRIBUTING.md](CONTRIBUTING.md) before opening an issue or pull request,
+and [GOVERNANCE.md](GOVERNANCE.md) for project decision and maintainer rules.
+Participation is governed by [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
+Suspected vulnerabilities must be reported privately as described in
+[SECURITY.md](SECURITY.md), never through a public issue. The project is
+licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your
+option.
+
 ## Supported MVP graph
 
 - Cargo workspace/package/target/dependency and Rust file/module/import/re-export,
