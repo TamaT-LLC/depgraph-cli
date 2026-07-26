@@ -17,6 +17,7 @@ path = "src/main.rs"
 anyhow.workspace = true
 clap.workspace = true
 depgraph-core = { path = "../depgraph-core" }
+depgraph-protocol = { path = "../depgraph-protocol" }
 depgraph-store = { path = "../depgraph-store" }
 serde.workspace = true
 serde_json.workspace = true
@@ -27,5 +28,4 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 assert_cmd.workspace = true
-depgraph-protocol = { path = "../depgraph-protocol" }
 predicates.workspace = true

@@ -221,6 +221,481 @@ fn seed_runtime_trace_snapshot(store_path: &Path, root: &Path) {
         .unwrap();
 }
 
+fn seed_bounded_query_snapshot(store_path: &Path, root: &Path) {
+    let mut store = depgraph_store::Store::open(store_path).unwrap();
+    store
+        .start_scan_with_revision("query-base", root, false, Some("query-revision"))
+        .unwrap();
+    let coverage = json!({
+        "profiles": 1,
+        "files_discovered": 0,
+        "files_analyzed": 0,
+        "files_skipped": 0,
+        "dependency_sites": 2,
+        "resolved": 2,
+        "candidates": 0,
+        "external": 0,
+        "unresolved": 0,
+        "unsupported_syntax": 0,
+        "project_code_executed": false,
+        "completeness": ["syntax-complete"],
+        "reasons": []
+    });
+    let common = |event: &str, seq: u64| {
+        json!({
+            "event": event,
+            "protocol_version": "1.0",
+            "scan_id": "query-base",
+            "adapter": "fixture",
+            "adapter_version": "1.0",
+            "seq": seq
+        })
+    };
+    let mut started = common("scan_started", 1);
+    started["root"] = json!(root.to_string_lossy());
+    started["project_code_executed"] = json!(false);
+    started["safe_mode"] = json!(true);
+    store.ingest_event(&started).unwrap();
+
+    let mut profile = common("profile_declared", 2);
+    profile["profile"] = json!({
+        "id": "profile:web",
+        "language": "typescript",
+        "target": "server",
+        "features": [],
+        "environment": {"mode":"production"},
+        "source_revision": "query-revision",
+        "properties": {}
+    });
+    store.ingest_event(&profile).unwrap();
+
+    for (offset, node) in [
+        json!({
+            "id":"workspace:apps",
+            "kind":"workspace",
+            "locator":"workspace://apps",
+            "display_name":"apps",
+            "properties":{"path":"apps"}
+        }),
+        json!({
+            "id":"workspace:services",
+            "kind":"workspace",
+            "locator":"workspace://services",
+            "display_name":"services",
+            "properties":{"path":"services"}
+        }),
+        json!({
+            "id":"file:client",
+            "kind":"file",
+            "locator":"file://apps/client.ts",
+            "display_name":"client.ts",
+            "properties":{"path":"apps/client.ts","workspace_id":"workspace:apps"}
+        }),
+        json!({
+            "id":"file:server",
+            "kind":"file",
+            "locator":"file://services/server.ts",
+            "display_name":"server.ts",
+            "properties":{"path":"services/server.ts","workspace_id":"workspace:services"}
+        }),
+        json!({
+            "id":"route:users",
+            "kind":"route",
+            "locator":"framework-route:/api/users",
+            "display_name":"/api/users",
+            "properties":{"workspace_id":"workspace:services"}
+        }),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut event = common("node_upsert", offset as u64 + 3);
+        event["node"] = node;
+        store.ingest_event(&event).unwrap();
+    }
+
+    let condition = json!({
+        "op":"all",
+        "conditions":[{"op":"eq","key":"mode","value":"production"}]
+    });
+    let client_evidence = json!([{
+        "kind":"source","extractor":"fixture","extractor_version":"1.0",
+        "path":"apps/client.ts","start_line":1,"start_column":1,
+        "end_line":1,"end_column":16,"detail":"private client detail","properties":{"private":true}
+    }]);
+    let mut client_site = common("dependency_site", 8);
+    client_site["site"] = json!({
+        "id":"site:client-server","source":"file:client","kind":"call",
+        "specifier":"services/server","resolution_status":"resolved",
+        "target_ids":["file:server"],"profile_id":"profile:web",
+        "condition":condition,"precision":"exact","reason":"workspace-call",
+        "evidence":client_evidence
+    });
+    store.ingest_event(&client_site).unwrap();
+    let mut client_edge = common("edge_upsert", 9);
+    client_edge["edge"] = json!({
+        "id":"edge:client-server","source":"file:client","target":"file:server",
+        "kind":"calls","site_id":"site:client-server","phase":"semantic",
+        "environment":"production","profile_id":"profile:web",
+        "condition":condition,"resolution_status":"resolved",
+        "precision":"exact","generated":false,"evidence":client_evidence
+    });
+    store.ingest_event(&client_edge).unwrap();
+
+    let server_evidence = json!([{
+        "kind":"source","extractor":"fixture","extractor_version":"1.0",
+        "path":"services/server.ts","start_line":2,"start_column":1,
+        "end_line":2,"end_column":20,"detail":"private server detail","properties":{"private":true}
+    }]);
+    let mut server_site = common("dependency_site", 10);
+    server_site["site"] = json!({
+        "id":"site:server-route","source":"file:server","kind":"import",
+        "specifier":"framework-route:/api/users","resolution_status":"resolved",
+        "target_ids":["route:users"],"profile_id":"profile:web",
+        "condition":condition,"precision":"exact","reason":null,
+        "evidence":server_evidence
+    });
+    store.ingest_event(&server_site).unwrap();
+    let mut server_edge = common("edge_upsert", 11);
+    server_edge["edge"] = json!({
+        "id":"edge:server-route","source":"file:server","target":"route:users",
+        "kind":"imports","site_id":"site:server-route","phase":"source",
+        "environment":"production","profile_id":"profile:web",
+        "condition":condition,"resolution_status":"resolved",
+        "precision":"exact","generated":false,"evidence":server_evidence
+    });
+    store.ingest_event(&server_edge).unwrap();
+
+    let mut profile_completed = common("profile_completed", 12);
+    profile_completed["profile_id"] = json!("profile:web");
+    profile_completed["coverage"] = coverage.clone();
+    store.ingest_event(&profile_completed).unwrap();
+    let mut completed = common("scan_completed", 13);
+    completed["coverage"] = coverage;
+    store.ingest_event(&completed).unwrap();
+    store
+        .finish_scan("query-base", "completed", None, true)
+        .unwrap();
+}
+
+const BOUNDED_QUERY_CLI_FIXTURE: &str = r#"MATCH p = (source:"file")-["calls"|"imports"*1..2]->(target:"route")
+WHERE EVERY edge IN EDGES(p) SATISFIES
+        edge.profile_id = "profile:web"
+        AND edge.phase IN ["semantic", "source"]
+        AND edge.condition STARTS WITH "mode"
+  AND SOME site IN SITES(p) SATISFIES
+        site.specifier STARTS WITH "services/"
+  AND SOME evidence IN EVIDENCE(p) SATISFIES
+        evidence.path STARTS WITH "apps/"
+  AND source.locator STARTS WITH "file://apps/"
+RETURN source.id, target.id, p
+ORDER BY source.id, target.id, p ASC
+LIMIT 10"#;
+
+#[test]
+fn bounded_query_cli_is_read_only_canonical_and_filters_closed_evidence() {
+    let root = tempfile::tempdir().unwrap();
+    let other_checkout = tempfile::tempdir().unwrap();
+    let store_path = root.path().join("query.sqlite");
+    seed_bounded_query_snapshot(&store_path, root.path());
+    let before = fs::read(&store_path).unwrap();
+
+    let _writer_lock = depgraph_core::acquire_store_writer_lock(&store_path).unwrap();
+    let first = Command::cargo_bin("depgraph")
+        .unwrap()
+        .current_dir(root.path())
+        .arg("--store")
+        .arg(&store_path)
+        .args(["query", "--query", BOUNDED_QUERY_CLI_FIXTURE, "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let second = Command::cargo_bin("depgraph")
+        .unwrap()
+        .current_dir(other_checkout.path())
+        .arg("--store")
+        .arg(&store_path)
+        .args(["query", "--query", BOUNDED_QUERY_CLI_FIXTURE, "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(first, second);
+    let selected = Command::cargo_bin("depgraph")
+        .unwrap()
+        .current_dir(root.path())
+        .arg("--store")
+        .arg(&store_path)
+        .args([
+            "--scan-id",
+            "query-base",
+            "query",
+            "--query",
+            BOUNDED_QUERY_CLI_FIXTURE,
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(first, selected);
+    let rendered = String::from_utf8(first).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+    assert_eq!(rendered.trim(), depgraph_protocol::canonical_json(&value));
+    assert_eq!(value["schema_version"], "bounded-query-result-v1");
+    assert_eq!(value["complete"], true);
+    assert_eq!(value["rows"].as_array().unwrap().len(), 1);
+    assert_eq!(value["rows"][0][0], "file:client");
+    assert_eq!(value["rows"][0][1], "route:users");
+    assert_eq!(
+        value["rows"][0][2]["nodes"][0]["locator"],
+        "file://apps/client.ts"
+    );
+    assert_eq!(
+        value["rows"][0][2]["nodes"][1]["locator"],
+        "file://services/server.ts"
+    );
+    assert_eq!(value["rows"][0][2]["edges"].as_array().unwrap().len(), 2);
+    assert_eq!(value["rows"][0][2]["edges"][0]["profile_id"], "profile:web");
+    assert_eq!(value["rows"][0][2]["edges"][0]["phase"], "semantic");
+    assert_eq!(value["rows"][0][2]["edges"][1]["phase"], "source");
+    assert_eq!(value["rows"][0][2]["sites"][0]["id"], "site:client-server");
+    assert_eq!(value["rows"][0][2]["evidence"][0]["path"], "apps/client.ts");
+    assert!(
+        value["result_digest"]
+            .as_str()
+            .unwrap()
+            .starts_with("bounded-query-result:sha256:")
+    );
+    assert!(!rendered.contains("private client detail"));
+    assert!(!rendered.contains("\"properties\""));
+    assert_eq!(fs::read(&store_path).unwrap(), before);
+    drop(_writer_lock);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let original = fs::metadata(&store_path).unwrap().permissions();
+        let mut read_only = original.clone();
+        read_only.set_mode(0o444);
+        fs::set_permissions(&store_path, read_only).unwrap();
+        Command::cargo_bin("depgraph")
+            .unwrap()
+            .current_dir(root.path())
+            .arg("--store")
+            .arg(&store_path)
+            .args(["query", "--query", BOUNDED_QUERY_CLI_FIXTURE, "--json"])
+            .assert()
+            .success();
+        fs::set_permissions(&store_path, original).unwrap();
+    }
+
+    Command::cargo_bin("depgraph")
+        .unwrap()
+        .current_dir(root.path())
+        .arg("--store")
+        .arg(&store_path)
+        .args(["query", "--query", BOUNDED_QUERY_CLI_FIXTURE])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("query: complete"))
+        .stdout(predicate::str::contains("source.id: \"file:client\""))
+        .stdout(predicate::str::contains("\"owner_type\":\"edge\""))
+        .stdout(predicate::str::contains(
+            "result: bounded-query-result:sha256:",
+        ));
+}
+
+#[test]
+fn bounded_query_file_explain_and_failure_exit_contracts_are_stable() {
+    let root = tempfile::tempdir().unwrap();
+    let store_path = root.path().join("query.sqlite");
+    seed_bounded_query_snapshot(&store_path, root.path());
+    fs::write(
+        root.path().join("query.depgraph"),
+        BOUNDED_QUERY_CLI_FIXTURE,
+    )
+    .unwrap();
+
+    let explain = Command::cargo_bin("depgraph")
+        .unwrap()
+        .current_dir(root.path())
+        .arg("--store")
+        .arg(&store_path)
+        .args(["query", "--file", "query.depgraph", "--explain", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let explain = String::from_utf8(explain).unwrap();
+    let plan: serde_json::Value = serde_json::from_str(&explain).unwrap();
+    assert_eq!(explain.trim(), depgraph_protocol::canonical_json(&plan));
+    assert_eq!(plan["schema_version"], "bounded-query-plan-v1");
+    assert_eq!(plan["admitted"], true);
+    assert!(
+        plan["plan_digest"]
+            .as_str()
+            .unwrap()
+            .starts_with("bounded-query-plan:sha256:")
+    );
+    let redacted_shape = depgraph_protocol::canonical_json(&plan["redacted_typed_ast_shape"]);
+    assert!(!redacted_shape.contains("profile:web"));
+    assert!(!redacted_shape.contains("src/"));
+
+    let empty = r#"MATCH p = (source:"missing")-["imports"*1..1]->(target:"route")
+                    RETURN target.id LIMIT 1"#;
+    Command::cargo_bin("depgraph")
+        .unwrap()
+        .current_dir(root.path())
+        .arg("--store")
+        .arg(&store_path)
+        .args(["query", "--query", empty, "--json"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"complete\":true"))
+        .stdout(predicate::str::contains("\"rows\":[]"));
+
+    let existential_terms = (0..16)
+        .map(|index| {
+            format!(
+                "SOME evidence{index} IN EVIDENCE(p) SATISFIES evidence{index}.kind = \"source\""
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    let rejected = format!(
+        "MATCH p = (source:\"file\")-[\"imports\"*1..8]->(target:\"route\") \
+         WHERE {existential_terms} RETURN target.id LIMIT 1"
+    );
+    Command::cargo_bin("depgraph")
+        .unwrap()
+        .current_dir(root.path())
+        .arg("--store")
+        .arg(&store_path)
+        .args(["query", "--query", &rejected])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("query_plan_budget_exceeded"))
+        .stdout(predicate::str::is_empty());
+
+    Command::cargo_bin("depgraph")
+        .unwrap()
+        .current_dir(root.path())
+        .arg("--store")
+        .arg(&store_path)
+        .args([
+            "query",
+            "--query",
+            r#"MATCH p = (source)-["imports"*1..1]->(target)
+               WHERE source.unknown = "x" RETURN target.id LIMIT 1"#,
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("query_field_unknown"));
+
+    Command::cargo_bin("depgraph")
+        .unwrap()
+        .current_dir(root.path())
+        .arg("--store")
+        .arg(root.path().join("missing.sqlite"))
+        .args(["query", "--query", BOUNDED_QUERY_CLI_FIXTURE])
+        .assert()
+        .code(3)
+        .stdout(predicate::str::is_empty());
+
+    {
+        let mut store = depgraph_store::Store::open(&store_path).unwrap();
+        store
+            .start_scan("failed-query-scan", root.path(), false)
+            .unwrap();
+        store
+            .finish_scan(
+                "failed-query-scan",
+                "failed",
+                Some("fixture failure"),
+                false,
+            )
+            .unwrap();
+    }
+    Command::cargo_bin("depgraph")
+        .unwrap()
+        .current_dir(root.path())
+        .arg("--store")
+        .arg(&store_path)
+        .args([
+            "--scan-id",
+            "failed-query-scan",
+            "query",
+            "--query",
+            BOUNDED_QUERY_CLI_FIXTURE,
+        ])
+        .assert()
+        .code(3)
+        .stderr(predicate::str::contains("query_snapshot_unavailable"))
+        .stdout(predicate::str::is_empty());
+
+    Command::cargo_bin("depgraph")
+        .unwrap()
+        .current_dir(root.path())
+        .arg("--store")
+        .arg(&store_path)
+        .args(["query"])
+        .assert()
+        .code(2);
+    Command::cargo_bin("depgraph")
+        .unwrap()
+        .current_dir(root.path())
+        .arg("--store")
+        .arg(&store_path)
+        .args([
+            "query",
+            "--query",
+            BOUNDED_QUERY_CLI_FIXTURE,
+            "--file",
+            "query.depgraph",
+        ])
+        .assert()
+        .code(2);
+
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(
+            root.path().join("query.depgraph"),
+            root.path().join("linked.depgraph"),
+        )
+        .unwrap();
+        Command::cargo_bin("depgraph")
+            .unwrap()
+            .current_dir(root.path())
+            .arg("--store")
+            .arg(&store_path)
+            .args(["query", "--file", "linked.depgraph"])
+            .assert()
+            .code(4)
+            .stderr(predicate::str::contains("query_file_symlink_rejected"));
+    }
+
+    let credential = r#"MATCH p = (source)-["imports"*1..1]->(target)
+                        WHERE source.id = "token=abcdefghijklmnopqrstuvwxyz123456"
+                        RETURN target.id LIMIT 1"#;
+    Command::cargo_bin("depgraph")
+        .unwrap()
+        .current_dir(root.path())
+        .arg("--store")
+        .arg(root.path().join("must-not-be-opened.sqlite"))
+        .args(["query", "--query", credential])
+        .assert()
+        .code(4)
+        .stderr(predicate::str::contains("query_literal_credential_shape"))
+        .stderr(predicate::str::contains("abcdefghijklmnopqrstuvwxyz").not());
+}
+
 fn seed_cli_diff_snapshot(
     store_path: &std::path::Path,
     root: &std::path::Path,
