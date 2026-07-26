@@ -38,3 +38,11 @@ redaction, and size/rate ceilings. The descriptor contains name-only policy and
 never contains a sink endpoint, credential, header value, or environment value.
 The canonical payload remains `depgraph-runtime-trace-v1`; vendor spans are not
 a core input contract.
+
+`depgraph-default-profile-selection-v1.schema.json` describes the closed,
+canonical default-profile planning input and selected/omitted/policy-excluded
+ledger. The Rust validator additionally verifies canonical profile, candidate,
+input, exclusion, and plan identities; one-axis alternative relationships;
+baseline references; sorted unique evidence; and exact ledger/count
+conservation. The shared golden and invalid mutation corpus live in
+`crates/depgraph-core/tests/fixtures`.

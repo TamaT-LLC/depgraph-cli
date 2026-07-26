@@ -14,6 +14,7 @@ pub mod impact;
 pub mod incremental;
 pub mod policy;
 mod policy_engine;
+pub mod profile_selection;
 pub mod query;
 pub mod runtime_trace;
 pub mod rust_build_observer;
@@ -138,6 +139,23 @@ pub use policy::{
     policy_annotations, render_github_annotations,
 };
 pub use policy_engine::{evaluate_policy, evaluate_policy_diff};
+pub use profile_selection::{
+    CandidateDiscoveryReason, CanonicalProfileAxes, DEFAULT_PROFILE_SELECTION_CONTRACT_VERSION,
+    DEFAULT_PROFILE_SELECTION_LIMIT_VERSION, DEFAULT_PROFILE_SELECTION_SCHEMA,
+    DEFAULT_PROFILE_SELECTION_SCHEMA_PATH, DefaultProfileSelectionPlan, GoCallGraph, GoHostContext,
+    GoProfileAxes, MAX_AUTOMATIC_PROFILE_CANDIDATES, MAX_AUTOMATIC_PROFILE_CANDIDATES_PER_LANGUAGE,
+    MAX_SELECTED_ROOT_PROFILES, ProfileAxis, ProfileAxisCapability, ProfileCandidateCoverage,
+    ProfileCandidateEvidence, ProfileCandidateEvidenceKind, ProfileCandidateKind,
+    ProfileCandidateRecord, ProfileDiscoveryLedger, ProfileExclusionReason, ProfileHostContext,
+    ProfileLanguage, ProfileOmissionReason, ProfileOmittedLedger, ProfilePolicyExclusion,
+    ProfileRankEvidence, ProfileSelectedLedger, ProfileSelectedReason, ProfileSelectionInput,
+    ProfileSelectionLimits, ProfileSelectionMode, ProfileSelectionProfile,
+    ProfileSelectionRepository, ProfileSelectionSummary, RepositorySizeClass, RustHostContext,
+    RustProfileAxes, RustProfileMode, WebEnvironment, WebProfileAxes, WebProfileMode,
+    canonical_profile_id, canonical_profile_selection_json, canonical_profile_selection_plan_id,
+    profile_candidate_id, profile_exclusion_id, profile_selection_input_digest,
+    validate_profile_selection_plan,
+};
 pub use query::{
     CycleLevel, CycleResult, GraphQueryFilter, TraversalResult, UnresolvedResult, WhyResult,
     cycles, render_condition, resolve_selector, traverse, traverse_filtered, unresolved, why,

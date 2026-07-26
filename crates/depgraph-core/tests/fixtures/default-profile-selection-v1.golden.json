@@ -1,0 +1,164 @@
+{
+  "contract_version": "default-profile-selection-v1",
+  "selection_mode": "automatic",
+  "input": {
+    "contract_version": "default-profile-selection-v1",
+    "inventory_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+    "compatibility_ids": [
+      "depgraph-protocol:1.0",
+      "rust-adapter:0.4.0",
+      "rust-toolchain:1.93.1"
+    ],
+    "language_families": [
+      "rust"
+    ],
+    "host_contexts": [
+      {
+        "language": "rust",
+        "target": "aarch64-apple-darwin"
+      }
+    ],
+    "configuration_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+    "supported_axes": [
+      {
+        "language": "rust",
+        "axis": "feature_or_tag"
+      },
+      {
+        "language": "rust",
+        "axis": "mode"
+      },
+      {
+        "language": "rust",
+        "axis": "target"
+      }
+    ],
+    "repository": {
+      "size_class": "tiny",
+      "relevant_source_files": 2,
+      "build_units": 1
+    },
+    "limits": {
+      "limit_version": "default-profile-selection-limits-v1",
+      "effective_profile_cap": 16,
+      "hard_profile_cap": 32,
+      "per_language_candidate_cap": 256,
+      "total_candidate_cap": 512
+    }
+  },
+  "input_digest": "profile-selection-input:sha256:6015b8b766338b8ba5694e8936a9ef190ffaff9c704aee4dadd6583675552db5",
+  "profiles": [
+    {
+      "id": "profile:sha256:e9beef79b40efc812611b029b3152d607161d668c059cc7a2f8cafe79148d929",
+      "axes": {
+        "language": "rust",
+        "target": "aarch64-apple-darwin",
+        "mode": "check",
+        "default_features": true,
+        "features": []
+      }
+    },
+    {
+      "id": "profile:sha256:ea31c27860f42e07a18b94fefb61a770b9591a42fa9751038189a463fe3c1917",
+      "axes": {
+        "language": "rust",
+        "target": "aarch64-apple-darwin",
+        "mode": "check",
+        "default_features": true,
+        "features": [
+          "serde"
+        ]
+      }
+    }
+  ],
+  "candidates": [
+    {
+      "profile_id": "profile:sha256:e9beef79b40efc812611b029b3152d607161d668c059cc7a2f8cafe79148d929",
+      "baseline_profile_id": "profile:sha256:e9beef79b40efc812611b029b3152d607161d668c059cc7a2f8cafe79148d929",
+      "kind": "baseline",
+      "axis_values": [],
+      "estimated_coverage": {
+        "file_ids": [
+          "file:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ],
+        "dependency_site_ids": []
+      },
+      "evidence": [
+        {
+          "kind": "host_context",
+          "path": "Cargo.toml",
+          "start_line": 1,
+          "end_line": 12
+        }
+      ],
+      "id": "profile-candidate:sha256:558d2fc056e88bb7284a257af81e4def3565f81354efda325b5c57c866c0d39b"
+    },
+    {
+      "profile_id": "profile:sha256:ea31c27860f42e07a18b94fefb61a770b9591a42fa9751038189a463fe3c1917",
+      "baseline_profile_id": "profile:sha256:e9beef79b40efc812611b029b3152d607161d668c059cc7a2f8cafe79148d929",
+      "kind": "alternative",
+      "changed_axis": "feature_or_tag",
+      "axis_values": [
+        "default_features=true",
+        "feature=serde"
+      ],
+      "estimated_coverage": {
+        "file_ids": [
+          "file:sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        ],
+        "dependency_site_ids": [
+          "site:sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        ]
+      },
+      "evidence": [
+        {
+          "kind": "manifest",
+          "path": "Cargo.toml",
+          "start_line": 8,
+          "end_line": 12
+        }
+      ],
+      "id": "profile-candidate:sha256:f14174e290e5c15d8c7f33621f8f4f1516090843517ecea73b2a9bab607b068f"
+    }
+  ],
+  "selected": [
+    {
+      "candidate_id": "profile-candidate:sha256:558d2fc056e88bb7284a257af81e4def3565f81354efda325b5c57c866c0d39b",
+      "profile_id": "profile:sha256:e9beef79b40efc812611b029b3152d607161d668c059cc7a2f8cafe79148d929",
+      "selection_rank": 0,
+      "reason": "mandatory_language_baseline"
+    },
+    {
+      "candidate_id": "profile-candidate:sha256:f14174e290e5c15d8c7f33621f8f4f1516090843517ecea73b2a9bab607b068f",
+      "profile_id": "profile:sha256:ea31c27860f42e07a18b94fefb61a770b9591a42fa9751038189a463fe3c1917",
+      "selection_rank": 1,
+      "reason": "automatic_coverage_ranked",
+      "rank": {
+        "declaration_tier": 3,
+        "new_dependency_occurrences": 1,
+        "new_files": 1,
+        "dimension_priority": 3,
+        "language_priority": 0
+      }
+    }
+  ],
+  "omitted": [],
+  "policy_excluded": [],
+  "discovery": [
+    {
+      "language": "rust",
+      "discovered_candidate_count": 1,
+      "overflow_candidate_count": 0,
+      "complete": true
+    }
+  ],
+  "summary": {
+    "eligible_profile_count": 2,
+    "selected_profile_count": 2,
+    "omitted_profile_count": 0,
+    "policy_excluded_count": 0,
+    "candidate_discovery_complete": true,
+    "selection_complete": true
+  },
+  "plan_id": "profile-selection-plan:sha256:8a86ebe6563622fc568d745e9c1aa03d1713fb21b87b3d761292cd25819c3808"
+}

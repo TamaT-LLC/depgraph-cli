@@ -1,0 +1,64 @@
+[
+  {
+    "name": "unknown top-level field",
+    "operation": "set",
+    "pointer": "/unknown_contract_field",
+    "value": true
+  },
+  {
+    "name": "unknown contract version",
+    "operation": "set",
+    "pointer": "/contract_version",
+    "value": "default-profile-selection-v2"
+  },
+  {
+    "name": "profiles out of canonical order",
+    "operation": "swap",
+    "pointer": "/profiles"
+  },
+  {
+    "name": "duplicate canonical profile",
+    "operation": "duplicate",
+    "pointer": "/profiles"
+  },
+  {
+    "name": "supported axes out of canonical order",
+    "operation": "swap",
+    "pointer": "/input/supported_axes"
+  },
+  {
+    "name": "selected ledger duplicate",
+    "operation": "duplicate",
+    "pointer": "/selected"
+  },
+  {
+    "name": "selected ledger unknown profile",
+    "operation": "set",
+    "pointer": "/selected/1/profile_id",
+    "value": "profile:sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+  },
+  {
+    "name": "summary conservation drift",
+    "operation": "set",
+    "pointer": "/summary/selected_profile_count",
+    "value": 1
+  },
+  {
+    "name": "input digest drift",
+    "operation": "set",
+    "pointer": "/input_digest",
+    "value": "profile-selection-input:sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+  },
+  {
+    "name": "plan identity drift",
+    "operation": "set",
+    "pointer": "/plan_id",
+    "value": "profile-selection-plan:sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+  },
+  {
+    "name": "candidate claims the wrong changed axis",
+    "operation": "set",
+    "pointer": "/candidates/1/changed_axis",
+    "value": "target"
+  }
+]
