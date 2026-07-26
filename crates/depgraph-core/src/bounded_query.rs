@@ -1,11 +1,14 @@
 use std::{
     fmt,
-    fs::{self, File, Metadata, OpenOptions},
+    fs::{self, File, Metadata},
     io::Read,
     path::{Component, Path, PathBuf},
 };
 
 use serde::{Deserialize, Serialize};
+
+#[cfg(not(unix))]
+use std::fs::OpenOptions;
 
 pub const BOUNDED_QUERY_CONTRACT_VERSION: &str = "bounded-graph-query-v1";
 pub const BOUNDED_QUERY_CREDENTIAL_POLICY_VERSION: &str = "release-redaction-shapes-v1";
@@ -298,8 +301,8 @@ pub fn read_bounded_query_file(repository_root: &Path, query_file: &Path) -> Que
         ));
     }
 
-    let mut file = open_query_file(&candidate)?;
-    let before = file.metadata().map_err(|_| {
+    let mut opened = open_query_file(&root, &candidate)?;
+    let before = opened.file.metadata().map_err(|_| {
         QueryDiagnostic::input(
             "query_file_metadata_unavailable",
             QueryFailureClass::Security,
@@ -322,7 +325,9 @@ pub fn read_bounded_query_file(repository_root: &Path, query_file: &Path) -> Que
     }
 
     let mut bytes = Vec::with_capacity(before.len() as usize);
-    file.by_ref()
+    opened
+        .file
+        .by_ref()
         .take(MAX_QUERY_BYTES as u64 + 1)
         .read_to_end(&mut bytes)
         .map_err(|_| {
@@ -332,7 +337,7 @@ pub fn read_bounded_query_file(repository_root: &Path, query_file: &Path) -> Que
                 "query file could not be read safely",
             )
         })?;
-    let after = file.metadata().map_err(|_| {
+    let after = opened.file.metadata().map_err(|_| {
         QueryDiagnostic::input(
             "query_file_metadata_unavailable",
             QueryFailureClass::Security,
@@ -443,18 +448,185 @@ fn reject_symlink_components(root: &Path, candidate: &Path) -> QueryResult<()> {
     Ok(())
 }
 
-fn open_query_file(path: &Path) -> QueryResult<File> {
+struct OpenedQueryFile {
+    file: File,
+    #[cfg(windows)]
+    _parent_directories: Vec<File>,
+}
+
+#[cfg(unix)]
+fn open_query_file(root: &Path, path: &Path) -> QueryResult<OpenedQueryFile> {
+    use std::{
+        ffi::CString,
+        os::{
+            fd::{AsRawFd as _, FromRawFd as _},
+            unix::ffi::OsStrExt as _,
+        },
+    };
+
+    let relative = path.strip_prefix(root).map_err(|_| {
+        QueryDiagnostic::input(
+            "query_file_outside_repository",
+            QueryFailureClass::Security,
+            "query file is outside the repository boundary",
+        )
+    })?;
+    let names = relative
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(name) => Some(name),
+            Component::CurDir => None,
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if names.is_empty() || names.len() != relative.components().count() {
+        return Err(query_file_open_error());
+    }
+
+    let root_name =
+        CString::new(root.as_os_str().as_bytes()).map_err(|_| query_file_open_error())?;
+    // SAFETY: root_name is a valid NUL-terminated path and no ownership is
+    // transferred through the open call.
+    let root_fd = unsafe {
+        libc::open(
+            root_name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if root_fd < 0 {
+        return Err(query_file_open_error());
+    }
+    // SAFETY: root_fd was returned uniquely by libc::open above.
+    let mut directory = unsafe { File::from_raw_fd(root_fd) };
+    let root_path_metadata = fs::metadata(root).map_err(|_| query_file_open_error())?;
+    let root_handle_metadata = directory.metadata().map_err(|_| query_file_open_error())?;
+    if !same_file_identity(&root_path_metadata, &root_handle_metadata) {
+        return Err(query_file_open_error());
+    }
+
+    for (index, name) in names.iter().enumerate() {
+        let name = CString::new(name.as_bytes()).map_err(|_| query_file_open_error())?;
+        let is_file = index + 1 == names.len();
+        let flags = libc::O_RDONLY
+            | libc::O_CLOEXEC
+            | libc::O_NOFOLLOW
+            | if is_file { 0 } else { libc::O_DIRECTORY };
+        // SAFETY: directory remains open for the call, name is NUL-terminated,
+        // and openat returns a new owned descriptor on success.
+        let descriptor = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
+        if descriptor < 0 {
+            return Err(query_file_open_error());
+        }
+        // SAFETY: descriptor was returned uniquely by libc::openat above.
+        let opened = unsafe { File::from_raw_fd(descriptor) };
+        if is_file {
+            return Ok(OpenedQueryFile { file: opened });
+        }
+        directory = opened;
+    }
+    Err(query_file_open_error())
+}
+
+#[cfg(windows)]
+fn open_query_file(root: &Path, path: &Path) -> QueryResult<OpenedQueryFile> {
+    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    let relative = path.strip_prefix(root).map_err(|_| {
+        QueryDiagnostic::input(
+            "query_file_outside_repository",
+            QueryFailureClass::Security,
+            "query file is outside the repository boundary",
+        )
+    })?;
+    let names = relative
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(name) => Some(name),
+            Component::CurDir => None,
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if names.is_empty() || names.len() != relative.components().count() {
+        return Err(query_file_open_error());
+    }
+
+    let mut parent_directories = Vec::with_capacity(names.len());
+    let mut current = root.to_path_buf();
+    let root_directory = OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(&current)
+        .map_err(|_| query_file_open_error())?;
+    let root_metadata = root_directory
+        .metadata()
+        .map_err(|_| query_file_open_error())?;
+    if root_metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || !root_metadata.is_dir()
+    {
+        return Err(query_file_open_error());
+    }
+    // Excluding FILE_SHARE_DELETE pins the repository root while descendants
+    // are inspected and the final file is opened.
+    parent_directories.push(root_directory);
+    for name in &names[..names.len() - 1] {
+        current.push(name);
+        let directory = OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&current)
+            .map_err(|_| query_file_open_error())?;
+        let metadata = directory.metadata().map_err(|_| query_file_open_error())?;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 || !metadata.is_dir() {
+            return Err(query_file_open_error());
+        }
+        // Excluding FILE_SHARE_DELETE pins every opened ancestor against
+        // rename or replacement until the final file has been opened.
+        parent_directories.push(directory);
+    }
+
+    let file = OpenOptions::new()
+        .read(true)
+        .write(false)
+        .share_mode(FILE_SHARE_READ)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(|_| query_file_open_error())?;
+    let metadata = file.metadata().map_err(|_| query_file_open_error())?;
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(query_file_open_error());
+    }
+    Ok(OpenedQueryFile {
+        file,
+        _parent_directories: parent_directories,
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_query_file(root: &Path, path: &Path) -> QueryResult<OpenedQueryFile> {
+    let canonical = fs::canonicalize(path).map_err(|_| query_file_open_error())?;
+    if !canonical.starts_with(root) {
+        return Err(query_file_open_error());
+    }
     OpenOptions::new()
         .read(true)
         .write(false)
-        .open(path)
-        .map_err(|_| {
-            QueryDiagnostic::input(
-                "query_file_open_failed",
-                QueryFailureClass::Security,
-                "query file could not be opened safely",
-            )
-        })
+        .open(&canonical)
+        .map(|file| OpenedQueryFile { file })
+        .map_err(|_| query_file_open_error())
+}
+
+fn query_file_open_error() -> QueryDiagnostic {
+    QueryDiagnostic::input(
+        "query_file_open_failed",
+        QueryFailureClass::Security,
+        "query file could not be opened safely",
+    )
 }
 
 fn metadata_modified(metadata: &Metadata) -> Option<std::time::SystemTime> {
@@ -1135,7 +1307,7 @@ impl Parser {
         let path_binding = self.expect_identifier("where")?;
         self.expect_simple(TokenKind::RightParen, "where")?;
         self.expect_keyword("SATISFIES", "where")?;
-        let expression = self.parse_entity_expression(nesting)?;
+        let expression = self.parse_entity_expression(nesting, &binding)?;
         Ok(QuantifierPredicate {
             kind,
             binding,
@@ -1144,30 +1316,42 @@ impl Parser {
         })
     }
 
-    fn parse_entity_expression(&mut self, nesting: usize) -> QueryResult<EntityExpression> {
+    fn parse_entity_expression(
+        &mut self,
+        nesting: usize,
+        binding: &str,
+    ) -> QueryResult<EntityExpression> {
         self.ensure_nesting(nesting, "where")?;
-        let mut terms = vec![self.parse_entity_and_expression(nesting)?];
-        while self.current_keyword("OR") && self.entity_term_starts_at(self.index + 1) {
+        let mut terms = vec![self.parse_entity_and_expression(nesting, binding)?];
+        while self.current_keyword("OR") && self.entity_term_starts_at(self.index + 1, binding) {
             self.index += 1;
-            terms.push(self.parse_entity_and_expression(nesting)?);
+            terms.push(self.parse_entity_and_expression(nesting, binding)?);
         }
         Ok(canonical_entity_or(terms))
     }
 
-    fn parse_entity_and_expression(&mut self, nesting: usize) -> QueryResult<EntityExpression> {
-        let mut terms = vec![self.parse_entity_term(nesting)?];
-        while self.current_keyword("AND") && self.entity_term_starts_at(self.index + 1) {
+    fn parse_entity_and_expression(
+        &mut self,
+        nesting: usize,
+        binding: &str,
+    ) -> QueryResult<EntityExpression> {
+        let mut terms = vec![self.parse_entity_term(nesting, binding)?];
+        while self.current_keyword("AND") && self.entity_term_starts_at(self.index + 1, binding) {
             self.index += 1;
-            terms.push(self.parse_entity_term(nesting)?);
+            terms.push(self.parse_entity_term(nesting, binding)?);
         }
         Ok(canonical_entity_and(terms))
     }
 
-    fn parse_entity_term(&mut self, nesting: usize) -> QueryResult<EntityExpression> {
+    fn parse_entity_term(
+        &mut self,
+        nesting: usize,
+        binding: &str,
+    ) -> QueryResult<EntityExpression> {
         let negated = self.consume_keyword("NOT");
         let expression = if self.consume_simple(&TokenKind::LeftParen) {
             self.ensure_nesting(nesting + 1, "where")?;
-            let expression = self.parse_entity_expression(nesting + 1)?;
+            let expression = self.parse_entity_expression(nesting + 1, binding)?;
             self.expect_simple(TokenKind::RightParen, "where")?;
             expression
         } else {
@@ -1307,7 +1491,7 @@ impl Parser {
         Ok(())
     }
 
-    fn entity_term_starts_at(&self, mut index: usize) -> bool {
+    fn entity_term_starts_at(&self, mut index: usize, binding: &str) -> bool {
         if self.tokens.get(index).is_some_and(|token| {
             matches!(
                 &token.kind,
@@ -1316,18 +1500,29 @@ impl Parser {
         }) {
             index += 1;
         }
-        if matches!(
+        while matches!(
             self.tokens.get(index).map(|token| &token.kind),
             Some(TokenKind::LeftParen)
         ) {
-            return true;
+            index += 1;
+            if self.tokens.get(index).is_some_and(|token| {
+                matches!(
+                    &token.kind,
+                    TokenKind::Identifier(value) if value.eq_ignore_ascii_case("NOT")
+                )
+            }) {
+                index += 1;
+            }
         }
         matches!(
             (
                 self.tokens.get(index).map(|token| &token.kind),
                 self.tokens.get(index + 1).map(|token| &token.kind),
             ),
-            (Some(TokenKind::Identifier(_)), Some(TokenKind::Dot))
+            (
+                Some(TokenKind::Identifier(candidate)),
+                Some(TokenKind::Dot)
+            ) if candidate == binding
         )
     }
 
@@ -1695,6 +1890,36 @@ mod tests {
     }
 
     #[test]
+    fn quantifier_body_stops_before_outer_predicates() {
+        for outer in [
+            r#"source.kind = "route""#,
+            r#"(source.kind = "route")"#,
+            r#"NOT source.kind = "route""#,
+        ] {
+            let query = format!(
+                r#"MATCH p = (source:"route")-["calls"*1..2]->(target:"external")
+                   WHERE EVERY edge IN EDGES(p) SATISFIES edge.phase = "runtime"
+                     AND {outer}
+                   RETURN source.id LIMIT 10"#
+            );
+            let ast = parse_bounded_query(&query).unwrap();
+            let Expression::And(terms) = ast.where_clause.unwrap() else {
+                panic!("outer predicate must remain outside the quantifier");
+            };
+            assert_eq!(terms.len(), 2);
+            let quantifier = terms.iter().find_map(|term| match term {
+                Expression::Quantifier(predicate) => Some(predicate),
+                _ => None,
+            });
+            let quantifier = quantifier.expect("quantifier remains an outer AND term");
+            assert!(matches!(
+                quantifier.expression,
+                super::EntityExpression::Scalar(_)
+            ));
+        }
+    }
+
+    #[test]
     fn rejects_multiple_statements_comments_and_grammar_extensions() {
         for query in [
             format!("{MINIMAL_QUERY}; {MINIMAL_QUERY}"),
@@ -1970,6 +2195,17 @@ mod tests {
             read_bounded_query_file(
                 repository.path(),
                 Path::new("linked-queries/nested.depgraph")
+            )
+            .is_err()
+        );
+
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("outside.depgraph"), MINIMAL_QUERY).unwrap();
+        symlink(outside.path(), repository.path().join("swapped-parent")).unwrap();
+        assert!(
+            super::open_query_file(
+                repository.path(),
+                &repository.path().join("swapped-parent/outside.depgraph")
             )
             .is_err()
         );
