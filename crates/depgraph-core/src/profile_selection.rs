@@ -653,7 +653,12 @@ impl DefaultProfileSelectionPlan {
         }
 
         for candidate in &self.candidates {
-            validate_candidate_relationship(candidate, &candidates, &profiles)?;
+            validate_candidate_relationship(
+                self.selection_mode,
+                candidate,
+                &candidates,
+                &profiles,
+            )?;
         }
 
         let mut ledger_candidates = BTreeSet::new();
@@ -873,6 +878,7 @@ fn validate_candidate(candidate: &ProfileCandidateRecord) -> Result<()> {
 }
 
 fn validate_candidate_relationship<'a>(
+    selection_mode: ProfileSelectionMode,
     candidate: &ProfileCandidateRecord,
     candidates: &BTreeMap<&'a str, &'a ProfileCandidateRecord>,
     profiles: &BTreeMap<&'a str, &'a ProfileSelectionProfile>,
@@ -897,6 +903,15 @@ fn validate_candidate_relationship<'a>(
                 bail!("alternative baseline_profile_id must reference a baseline candidate");
             }
             let baseline_profile = profiles[baseline.profile_id.as_str()];
+            if selection_mode == ProfileSelectionMode::Explicit {
+                if baseline_profile.axes.language() != profile.axes.language() {
+                    bail!("candidate and baseline profiles must use the same language");
+                }
+                if candidate.changed_axis.is_some() || !candidate.axis_values.is_empty() {
+                    bail!("explicit alternative must not carry automatic changed-axis metadata");
+                }
+                return Ok(());
+            }
             let changed_axis = candidate
                 .changed_axis
                 .ok_or_else(|| anyhow::anyhow!("alternative candidate requires changed_axis"))?;
@@ -1477,6 +1492,95 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("cgo and call-graph")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_alternative_accepts_multi_axis_profile_without_automatic_metadata() -> Result<()> {
+        let baseline_profile = ProfileSelectionProfile {
+            id: "profile:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .to_owned(),
+            axes: CanonicalProfileAxes::Rust(RustProfileAxes {
+                target: "aarch64-apple-darwin".to_owned(),
+                mode: RustProfileMode::Check,
+                default_features: true,
+                features: Vec::new(),
+            }),
+        };
+        let alternative_profile = ProfileSelectionProfile {
+            id: "profile:sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                .to_owned(),
+            axes: CanonicalProfileAxes::Rust(RustProfileAxes {
+                target: "x86_64-unknown-linux-gnu".to_owned(),
+                mode: RustProfileMode::Test,
+                default_features: false,
+                features: vec!["serde".to_owned()],
+            }),
+        };
+        let baseline = ProfileCandidateRecord {
+            id: "profile-candidate:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .to_owned(),
+            profile_id: baseline_profile.id.clone(),
+            baseline_profile_id: baseline_profile.id.clone(),
+            kind: ProfileCandidateKind::Baseline,
+            changed_axis: None,
+            axis_values: Vec::new(),
+            estimated_coverage: ProfileCandidateCoverage {
+                file_ids: Vec::new(),
+                dependency_site_ids: Vec::new(),
+            },
+            evidence: vec![ProfileCandidateEvidence {
+                kind: ProfileCandidateEvidenceKind::Manifest,
+                path: "Cargo.toml".to_owned(),
+                start_line: 1,
+                end_line: 1,
+            }],
+        };
+        let alternative = ProfileCandidateRecord {
+            id: "profile-candidate:sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                .to_owned(),
+            profile_id: alternative_profile.id.clone(),
+            baseline_profile_id: baseline_profile.id.clone(),
+            kind: ProfileCandidateKind::Alternative,
+            changed_axis: None,
+            axis_values: Vec::new(),
+            estimated_coverage: ProfileCandidateCoverage {
+                file_ids: Vec::new(),
+                dependency_site_ids: Vec::new(),
+            },
+            evidence: vec![ProfileCandidateEvidence {
+                kind: ProfileCandidateEvidenceKind::Manifest,
+                path: "Cargo.toml".to_owned(),
+                start_line: 1,
+                end_line: 1,
+            }],
+        };
+        let candidates = BTreeMap::from([
+            (baseline.id.as_str(), &baseline),
+            (alternative.id.as_str(), &alternative),
+        ]);
+        let profiles = BTreeMap::from([
+            (baseline_profile.id.as_str(), &baseline_profile),
+            (alternative_profile.id.as_str(), &alternative_profile),
+        ]);
+
+        validate_candidate_relationship(
+            ProfileSelectionMode::Explicit,
+            &alternative,
+            &candidates,
+            &profiles,
+        )?;
+        assert!(
+            validate_candidate_relationship(
+                ProfileSelectionMode::Automatic,
+                &alternative,
+                &candidates,
+                &profiles,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("requires changed_axis")
         );
         Ok(())
     }
