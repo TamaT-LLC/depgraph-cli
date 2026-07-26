@@ -1,4 +1,5 @@
 pub mod bounded_query;
+pub mod bounded_query_execute;
 pub mod bounded_query_plan;
 pub mod bounded_query_type;
 pub mod build;
@@ -41,6 +42,11 @@ pub use bounded_query::{
     QueryDirection, QueryFailureClass, QueryOrigin, RelationshipPattern, ReturnClause,
     ScalarOperator, ScalarPredicate, SortDirection, parse_bounded_query, parse_bounded_query_bytes,
     parse_bounded_query_file, read_bounded_query_file,
+};
+pub use bounded_query_execute::{
+    BOUNDED_QUERY_RESULT_SCHEMA_VERSION, BoundedQueryExecutionError, BoundedQueryExecutionMetrics,
+    BoundedQueryExecutionOptions, BoundedQueryExecutionResult, BoundedQueryResult,
+    bounded_query_result_digest, execute_bounded_query, execute_bounded_query_with_options,
 };
 pub use bounded_query_plan::{
     BOUNDED_QUERY_LIMIT_VERSION, BOUNDED_QUERY_PLAN_SCHEMA_VERSION,
