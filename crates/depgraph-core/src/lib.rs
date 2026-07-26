@@ -160,10 +160,10 @@ pub use profile_selection::{
     validate_profile_selection_plan,
 };
 pub use profile_selection_go::{
-    GO_PROFILE_PLANNING_VERSION, GoAutomaticBoundaryKind, GoPlatformEvidenceKind,
-    GoProfileAvailability, GoProfileCandidateGenerationResult, GoProfilePlanningInput,
-    GoRejectedProfileDeclaration, GoStaticProfileEvidence, GoTagDeclaration, GoTargetDeclaration,
-    generate_go_profile_candidates,
+    GO_PROFILE_PLANNING_VERSION, GoAutomaticBoundaryKind, GoConstraintTarget,
+    GoPlatformEvidenceKind, GoProfileAvailability, GoProfileCandidateGenerationResult,
+    GoProfilePlanningInput, GoRejectedProfileDeclaration, GoStaticProfileEvidence,
+    GoTagDeclaration, GoTargetDeclaration, generate_go_profile_candidates,
 };
 pub use profile_selection_plan::{
     DEFAULT_LARGE_PROFILE_CAP, DEFAULT_MEDIUM_PROFILE_CAP, DEFAULT_SMALL_PROFILE_CAP,

@@ -79,14 +79,19 @@ pub enum GoPlatformEvidenceKind {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct GoConstraintTarget {
+    pub goos: String,
+    pub goarch: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct GoTargetDeclaration {
     pub goos: String,
     pub goarch: String,
     pub evidence_kind: GoPlatformEvidenceKind,
     #[serde(default)]
-    pub constraint_goos: Vec<String>,
-    #[serde(default)]
-    pub constraint_goarch: Vec<String>,
+    pub constraint_targets: Vec<GoConstraintTarget>,
     pub availability: GoProfileAvailability,
     pub static_evidence: GoStaticProfileEvidence,
 }
@@ -387,14 +392,10 @@ fn validate_platform_evidence(
         bail!("Go filename platform evidence does not match its GOOS/GOARCH pair");
     }
     if target.evidence_kind == GoPlatformEvidenceKind::BuildConstraint
-        && (!target
-            .constraint_goos
+        && !target
+            .constraint_targets
             .iter()
-            .any(|value| value == &target.goos)
-            || !target
-                .constraint_goarch
-                .iter()
-                .any(|value| value == &target.goarch))
+            .any(|value| value.goos == target.goos && value.goarch == target.goarch)
     {
         bail!("Go build-constraint evidence does not match its GOOS/GOARCH pair");
     }
@@ -402,23 +403,20 @@ fn validate_platform_evidence(
 }
 
 fn canonicalize_constraint_platforms(target: &mut GoTargetDeclaration) -> Result<()> {
-    target.constraint_goos.sort();
-    target.constraint_goos.dedup();
-    target.constraint_goarch.sort();
-    target.constraint_goarch.dedup();
-    if target.constraint_goos.len() > GOOS_VALUES.len()
-        || target.constraint_goarch.len() > GOARCH_VALUES.len()
-    {
+    target.constraint_targets.sort_by(|left, right| {
+        (left.goos.as_bytes(), left.goarch.as_bytes())
+            .cmp(&(right.goos.as_bytes(), right.goarch.as_bytes()))
+    });
+    target.constraint_targets.dedup();
+    if target.constraint_targets.len() > GOOS_VALUES.len() * GOARCH_VALUES.len() {
         bail!("Go build-constraint platform evidence exceeds its closed vocabulary");
     }
-    for goos in &target.constraint_goos {
-        validate_known_goos(goos)?;
-    }
-    for goarch in &target.constraint_goarch {
-        validate_known_goarch(goarch)?;
+    for platform in &target.constraint_targets {
+        validate_known_goos(&platform.goos)?;
+        validate_known_goarch(&platform.goarch)?;
     }
     if target.evidence_kind == GoPlatformEvidenceKind::FileName
-        && (!target.constraint_goos.is_empty() || !target.constraint_goarch.is_empty())
+        && !target.constraint_targets.is_empty()
     {
         bail!("Go filename evidence cannot claim parsed build-constraint platforms");
     }
@@ -720,13 +718,11 @@ mod tests {
             goos: goos.to_owned(),
             goarch: goarch.to_owned(),
             evidence_kind: kind,
-            constraint_goos: if kind == GoPlatformEvidenceKind::BuildConstraint {
-                vec![goos.to_owned()]
-            } else {
-                Vec::new()
-            },
-            constraint_goarch: if kind == GoPlatformEvidenceKind::BuildConstraint {
-                vec![goarch.to_owned()]
+            constraint_targets: if kind == GoPlatformEvidenceKind::BuildConstraint {
+                vec![GoConstraintTarget {
+                    goos: goos.to_owned(),
+                    goarch: goarch.to_owned(),
+                }]
             } else {
                 Vec::new()
             },
@@ -935,8 +931,7 @@ mod tests {
             GoPlatformEvidenceKind::BuildConstraint,
             "pkg/service.go",
         );
-        declaration.constraint_goos.clear();
-        declaration.constraint_goarch.clear();
+        declaration.constraint_targets.clear();
         missing.targets.push(declaration);
         assert!(
             generate_go_profile_candidates(missing)
@@ -952,11 +947,38 @@ mod tests {
             GoPlatformEvidenceKind::BuildConstraint,
             "pkg/service.go",
         );
-        declaration.constraint_goos = vec!["linux".to_owned()];
-        declaration.constraint_goarch = vec!["arm64".to_owned()];
+        declaration.constraint_targets = vec![GoConstraintTarget {
+            goos: "linux".to_owned(),
+            goarch: "arm64".to_owned(),
+        }];
         wrong.targets.push(declaration);
         assert!(
             generate_go_profile_candidates(wrong)
+                .unwrap_err()
+                .to_string()
+                .contains("does not match")
+        );
+
+        let mut cross_product = input('a');
+        let mut declaration = target(
+            "windows",
+            "amd64",
+            GoPlatformEvidenceKind::BuildConstraint,
+            "pkg/service.go",
+        );
+        declaration.constraint_targets = vec![
+            GoConstraintTarget {
+                goos: "linux".to_owned(),
+                goarch: "amd64".to_owned(),
+            },
+            GoConstraintTarget {
+                goos: "windows".to_owned(),
+                goarch: "arm64".to_owned(),
+            },
+        ];
+        cross_product.targets.push(declaration);
+        assert!(
+            generate_go_profile_candidates(cross_product)
                 .unwrap_err()
                 .to_string()
                 .contains("does not match")
