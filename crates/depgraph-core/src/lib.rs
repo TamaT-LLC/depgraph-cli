@@ -29,6 +29,7 @@ pub mod profile_selection_rank;
 pub mod profile_selection_rust;
 pub mod profile_selection_web;
 pub mod protobuf;
+pub mod public_history_audit;
 pub mod public_readiness;
 pub mod query;
 pub mod runtime_trace;
@@ -109,6 +110,16 @@ pub use ffi_link::{
     FFI_LINK_OBSERVATION_SCHEMA_VERSION, FFI_LINK_OBSERVER, FFI_LINK_OBSERVER_VERSION,
     FfiLinkObservation, FfiObservedLink, collect_supervised_ffi_link_observation,
     correlate_ffi_link_observation, validate_ffi_link_observation,
+};
+pub use public_history_audit::{
+    FinalizedPublicHistoryAudit, MAX_PUBLIC_AUDIT_REFS, MAX_PUBLIC_AUDIT_SOURCE_BYTES,
+    MAX_PUBLIC_AUDIT_SOURCES, MAX_PUBLIC_AUDIT_TOTAL_BYTES, PUBLIC_AUDIT_SOURCE_KINDS,
+    PUBLIC_HISTORY_AUDIT_FINAL_SCHEMA_VERSION, PUBLIC_HISTORY_AUDIT_SCHEMA_VERSION,
+    PUBLIC_SECRET_SCANNER_NAME, PUBLIC_SECRET_SCANNER_VERSION, PublicAuditCredentialAction,
+    PublicAuditFinding, PublicAuditFindingState, PublicAuditPurgeAction, PublicAuditRefInput,
+    PublicAuditRemediationAttestation, PublicAuditSourceInput, PublicAuditSourceKind,
+    PublicHistoryAuditInput, PublicHistoryAuditReport, audit_public_history,
+    finalize_public_history_audit, public_secret_scanner_identity,
 };
 pub use public_readiness::{
     PUBLIC_READINESS_EVIDENCE_SCHEMA_VERSION, PUBLIC_READINESS_FINAL_APPROVAL_ROLES,
