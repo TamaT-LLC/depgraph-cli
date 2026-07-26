@@ -656,8 +656,16 @@ fn same_file_identity(left: &Metadata, right: &Metadata) -> bool {
 #[cfg(windows)]
 fn same_file_identity(left: &Metadata, right: &Metadata) -> bool {
     use std::os::windows::fs::MetadataExt as _;
-    left.volume_serial_number() == right.volume_serial_number()
-        && left.file_index() == right.file_index()
+
+    // Rust 1.93 does not expose by-handle volume serial and file index
+    // accessors on stable. Replacement is already prevented by the
+    // non-delete-shared root/parent handles and the non-write/delete-shared
+    // final handle, so this baseline-stable metadata comparison corroborates
+    // the read snapshot without relying on a newer standard library.
+    left.file_attributes() == right.file_attributes()
+        && left.creation_time() == right.creation_time()
+        && left.last_write_time() == right.last_write_time()
+        && left.file_size() == right.file_size()
 }
 
 #[cfg(not(any(unix, windows)))]
