@@ -290,6 +290,18 @@ span. Generated-language mapping requires a matching descriptor digest plus a
 supported generator manifest/source map; language-specific naming rules alone
 are not proof.
 
+Repository descriptor sets use the explicit
+`.depgraph-protobuf-descriptor.pb` suffix. Safe scan bounds and decodes the
+binary `FileDescriptorSet` directly; it never starts `protoc`. Each admitted
+descriptor file name must be a confined repository `.proto` locator and its
+package, syntax/edition, imports, public/weak import indexes, nested messages,
+fields, services, methods, and streaming flags must match the independently
+parsed source model. Exact descriptor evidence is emitted only for a unique
+matching descriptor. Missing source, stale or tampered shape, duplicate
+provenance, invalid source locations, symlinked descriptors, and out-of-root
+names remain explicit incomplete coverage. Descriptor relations without
+`SourceCodeInfo` use artifact coordinates and never synthesize a source span.
+
 ### GraphQL
 
 `graphql-contract-v1` admits repository SDL and executable documents. It models
@@ -360,7 +372,7 @@ one to three engineering days of scope.
 | 1 | Common node/site/edge DTO, validator, coverage ledger, and cross-format golden harness | Implemented in #191 | This ADR | Canonical identity, resolution matrix, bounds, closure, and determinism tests pass |
 | 2 | OpenAPI 3.1 repository parser and contract graph | Implemented in #192 | 1 | Local JSON/YAML definitions and refs produce service/operation/message graph; hostile refs fail closed |
 | 3 | OpenAPI generated-client/provider repository mapping | Implemented in #193 | 2 | Provenance-backed calls/implementation edges and stale/ambiguous negative fixtures pass |
-| 4 | Protobuf source/descriptor contract graph | 2-3 days | 1 | Service/method/message/import graph is deterministic without invoking `protoc` |
+| 4 | Protobuf source/descriptor contract graph | Implemented in #194 | 1 | Service/method/message/import graph is deterministic without invoking `protoc` |
 | 5 | Protobuf generated-code mapping | 2-3 days | 4 | Descriptor/source-map digests prove language endpoints; naming-only fixtures stay unresolved |
 | 6 | GraphQL SDL and executable-document graph | 2-3 days | 1 | Field/message/selection graph is complete for admitted files without introspection |
 | 7 | GraphQL client/resolver repository mapping | 2-3 days | 6 | Supported compiler/framework maps prove endpoints; dynamic/federated cases remain ledgered |
