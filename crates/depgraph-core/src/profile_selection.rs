@@ -30,7 +30,7 @@ pub enum ProfileLanguage {
 }
 
 impl ProfileLanguage {
-    const fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Rust => "rust",
             Self::Go => "go",
@@ -57,7 +57,7 @@ pub enum ProfileAxis {
 }
 
 impl ProfileAxis {
-    const fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Target => "target",
             Self::Environment => "environment",
@@ -171,7 +171,7 @@ pub enum RustProfileMode {
 }
 
 impl RustProfileMode {
-    const fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Check => "check",
             Self::Test => "test",

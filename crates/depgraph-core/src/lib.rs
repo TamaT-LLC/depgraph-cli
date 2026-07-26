@@ -15,6 +15,7 @@ pub mod incremental;
 pub mod policy;
 mod policy_engine;
 pub mod profile_selection;
+pub mod profile_selection_plan;
 pub mod query;
 pub mod runtime_trace;
 pub mod rust_build_observer;
@@ -155,6 +156,18 @@ pub use profile_selection::{
     canonical_profile_id, canonical_profile_selection_json, canonical_profile_selection_plan_id,
     profile_candidate_id, profile_exclusion_id, profile_selection_input_digest,
     validate_profile_selection_plan,
+};
+pub use profile_selection_plan::{
+    DEFAULT_LARGE_PROFILE_CAP, DEFAULT_MEDIUM_PROFILE_CAP, DEFAULT_SMALL_PROFILE_CAP,
+    DEFAULT_TINY_PROFILE_CAP, LARGE_BUILD_UNIT_THRESHOLD, LARGE_SOURCE_FILE_THRESHOLD,
+    MEDIUM_BUILD_UNIT_THRESHOLD, MEDIUM_SOURCE_FILE_THRESHOLD, PROFILE_SELECTION_INVENTORY_VERSION,
+    ProfileCandidateDiscoveryResult, ProfilePlanningBuildUnit, ProfilePlanningBuildUnitKind,
+    ProfilePlanningFile, ProfilePlanningFileKind, ProfilePlanningInventory,
+    ProfileSelectionInputContext, SMALL_BUILD_UNIT_THRESHOLD, SMALL_SOURCE_FILE_THRESHOLD,
+    TINY_BUILD_UNIT_THRESHOLD, TINY_SOURCE_FILE_THRESHOLD, bound_profile_candidate_discovery,
+    build_profile_selection_input, canonical_profile_planning_inventory,
+    classify_profile_selection_repository, default_profile_selection_limits,
+    profile_planning_build_unit_id, profile_selection_inventory_digest,
 };
 pub use query::{
     CycleLevel, CycleResult, GraphQueryFilter, TraversalResult, UnresolvedResult, WhyResult,
