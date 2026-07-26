@@ -479,7 +479,7 @@ Each row is one independently reviewable one-to-three-day follow-up Issue.
 | Order | Slice | Estimate | Depends on | Exit criterion |
 | ---: | --- | --- | --- | --- |
 | 1 | Lexer/parser, bounded input reader, canonical AST, and malformed corpus | Implemented in #177 | This ADR | Grammar accepts only one bounded statement and never echoes hostile literals |
-| 2 | Closed type checker, field registry, canonical AST digest, and golden plans | 2-3 days | 1 | Node/Path/Edge/Site/Evidence bindings and operators reject every invalid combination |
+| 2 | Closed type checker, field registry, canonical AST digest, and golden plans | Implemented in #178 | 1 | Node/Path/Edge/Site/Evidence bindings and operators reject every invalid combination |
 | 3 | Snapshot cardinality statistics, fixed operator planner, cost admission, and explain schema | 2-3 days | 2 | Explain and execute admission are byte-identical across checkouts and SQLite row orders |
 | 4 | Canonical forward/reverse BFS executor, site/evidence filters, staging, and cancellation | 2-3 days | 3 | One shortest witness per endpoint pair; every cap is all-or-error |
 | 5 | CLI human/JSON output, read-only store integration, profile/phase/condition/evidence fixtures | 2-3 days | 4 | Multi-root and cross-kind use cases work without changing a snapshot |
