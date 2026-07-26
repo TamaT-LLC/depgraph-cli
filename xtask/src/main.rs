@@ -335,6 +335,7 @@ struct TargetVerificationReport {
 struct BoundedQueryPackageSmokeReport {
     schema_version: String,
     target: String,
+    archive_sha256: String,
     contract: depgraph_core::BoundedQueryReleaseCompatibilityHealth,
     plan_digest: String,
     result_digest: String,
@@ -2955,7 +2956,7 @@ fn verify_release_assets(directory: &Path, requested_targets: &[String]) -> Resu
         let query_smoke: BoundedQueryPackageSmokeReport =
             serde_json::from_slice(&query_smoke_bytes)
                 .context("packaged bounded query smoke report has an invalid schema")?;
-        validate_bounded_query_package_smoke(&query_smoke, target)?;
+        validate_bounded_query_package_smoke(&query_smoke, target, &archive_sha256)?;
         targets.push(verify_published_release_tree(
             &extracted,
             target,
@@ -3038,6 +3039,7 @@ fn verify_release_assets(directory: &Path, requested_targets: &[String]) -> Resu
 fn validate_bounded_query_package_smoke(
     report: &BoundedQueryPackageSmokeReport,
     target: &str,
+    archive_sha256: &str,
 ) -> Result<()> {
     let lowercase_sha256 = |value: &str| {
         value.len() == 64
@@ -3047,6 +3049,8 @@ fn validate_bounded_query_package_smoke(
     };
     if report.schema_version != BOUNDED_QUERY_PACKAGE_SMOKE_SCHEMA_VERSION
         || report.target != target
+        || report.archive_sha256 != archive_sha256
+        || !lowercase_sha256(&report.archive_sha256)
         || report.contract != depgraph_core::bounded_query_release_compatibility_contract()
         || !report
             .plan_digest
@@ -3818,6 +3822,7 @@ fn without_windows_verbatim_prefix(path: &[u16]) -> Vec<u16> {
 }
 
 fn verify_archive(archive: &Path, name: &str) -> Result<BoundedQueryPackageSmokeReport> {
+    let archive_sha256 = sha256_file(archive)?;
     let verify_root = std::env::temp_dir().join(format!(
         "depgraph-release-gate-{}-{}",
         std::process::id(),
@@ -3926,6 +3931,7 @@ fn verify_archive(archive: &Path, name: &str) -> Result<BoundedQueryPackageSmoke
         &second_fixture,
         &second_web_store,
         &release_manifest.target,
+        &archive_sha256,
     )?;
     verify_packaged_web_runtime_fails_closed(&executable, &extracted, &verify_root, &fixture)?;
     let semantic_complete_fixture =
@@ -8984,6 +8990,7 @@ fn verify_packaged_bounded_query(
     second_checkout: &Path,
     second_store: &Path,
     target: &str,
+    archive_sha256: &str,
 ) -> Result<BoundedQueryPackageSmokeReport> {
     let fixture_path = release_root.join(depgraph_core::BOUNDED_QUERY_RELEASE_SMOKE_FIXTURE_PATH);
     let query = fs::read_to_string(&fixture_path)
@@ -9067,6 +9074,7 @@ fn verify_packaged_bounded_query(
     Ok(BoundedQueryPackageSmokeReport {
         schema_version: BOUNDED_QUERY_PACKAGE_SMOKE_SCHEMA_VERSION.to_owned(),
         target: target.to_owned(),
+        archive_sha256: archive_sha256.to_owned(),
         contract,
         plan_digest,
         result_digest,
@@ -10434,24 +10442,50 @@ mod tests {
         let report = BoundedQueryPackageSmokeReport {
             schema_version: BOUNDED_QUERY_PACKAGE_SMOKE_SCHEMA_VERSION.to_owned(),
             target: "aarch64-apple-darwin".to_owned(),
+            archive_sha256: "0".repeat(64),
             contract: depgraph_core::bounded_query_release_compatibility_contract(),
             plan_digest: format!("bounded-query-plan:sha256:{}", "1".repeat(64)),
             result_digest: format!("bounded-query-result:sha256:{}", "2".repeat(64)),
             canonical_output_sha256: "3".repeat(64),
         };
-        validate_bounded_query_package_smoke(&report, "aarch64-apple-darwin").unwrap();
-        assert!(validate_bounded_query_package_smoke(&report, "x86_64-apple-darwin").is_err());
+        validate_bounded_query_package_smoke(&report, "aarch64-apple-darwin", &"0".repeat(64))
+            .unwrap();
+        assert!(
+            validate_bounded_query_package_smoke(&report, "x86_64-apple-darwin", &"0".repeat(64),)
+                .is_err()
+        );
 
         let mut version_drift = report.clone();
         version_drift.contract.limit_version = "bounded-query-limits-v2".to_owned();
         assert!(
-            validate_bounded_query_package_smoke(&version_drift, "aarch64-apple-darwin").is_err()
+            validate_bounded_query_package_smoke(
+                &version_drift,
+                "aarch64-apple-darwin",
+                &"0".repeat(64),
+            )
+            .is_err()
+        );
+
+        let mut archive_drift = report.clone();
+        archive_drift.archive_sha256 = "4".repeat(64);
+        assert!(
+            validate_bounded_query_package_smoke(
+                &archive_drift,
+                "aarch64-apple-darwin",
+                &"0".repeat(64),
+            )
+            .is_err()
         );
 
         let mut output_drift = report;
         output_drift.canonical_output_sha256 = "not-a-digest".to_owned();
         assert!(
-            validate_bounded_query_package_smoke(&output_drift, "aarch64-apple-darwin").is_err()
+            validate_bounded_query_package_smoke(
+                &output_drift,
+                "aarch64-apple-darwin",
+                &"0".repeat(64),
+            )
+            .is_err()
         );
     }
 
