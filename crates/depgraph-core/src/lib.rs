@@ -16,6 +16,7 @@ pub mod policy;
 mod policy_engine;
 pub mod profile_selection;
 pub mod profile_selection_plan;
+pub mod profile_selection_rust;
 pub mod query;
 pub mod runtime_trace;
 pub mod rust_build_observer;
@@ -168,6 +169,12 @@ pub use profile_selection_plan::{
     build_profile_selection_input, canonical_profile_planning_inventory,
     classify_profile_selection_repository, default_profile_selection_limits,
     profile_planning_build_unit_id, profile_selection_inventory_digest,
+};
+pub use profile_selection_rust::{
+    RUST_PROFILE_PLANNING_VERSION, RustAutomaticBoundaryKind, RustProfileAlternativeDeclaration,
+    RustProfileAvailability, RustProfileCandidateGenerationResult, RustProfilePlanningInput,
+    RustRejectedProfileDeclaration, RustRootFeatureDeclaration, RustStaticProfileEvidence,
+    RustTargetDeclaration, generate_rust_profile_candidates,
 };
 pub use query::{
     CycleLevel, CycleResult, GraphQueryFilter, TraversalResult, UnresolvedResult, WhyResult,

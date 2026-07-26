@@ -6,14 +6,17 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
+use crate::profile_selection::{
+    validate_candidate, validate_candidate_relationship, validate_profile,
+};
 use crate::{
     CandidateDiscoveryReason, DEFAULT_PROFILE_SELECTION_CONTRACT_VERSION,
     DEFAULT_PROFILE_SELECTION_LIMIT_VERSION, GoHostContext, MAX_AUTOMATIC_PROFILE_CANDIDATES,
     MAX_AUTOMATIC_PROFILE_CANDIDATES_PER_LANGUAGE, MAX_SELECTED_ROOT_PROFILES, ProfileAxis,
     ProfileAxisCapability, ProfileCandidateEvidence, ProfileCandidateKind, ProfileCandidateRecord,
     ProfileDiscoveryLedger, ProfileHostContext, ProfileLanguage, ProfileSelectionInput,
-    ProfileSelectionLimits, ProfileSelectionProfile, ProfileSelectionRepository,
-    RepositorySizeClass, canonical_profile_id, profile_candidate_id,
+    ProfileSelectionLimits, ProfileSelectionMode, ProfileSelectionProfile,
+    ProfileSelectionRepository, RepositorySizeClass, canonical_profile_id, profile_candidate_id,
 };
 
 pub const PROFILE_SELECTION_INVENTORY_VERSION: &str = "default-profile-inventory-v1";
@@ -392,6 +395,22 @@ pub fn bound_profile_candidate_discovery(
         .map(|profile| (profile.id.as_str(), profile))
         .collect::<BTreeMap<_, _>>();
     let candidates = canonical_candidates(candidates, &profile_by_id)?;
+    for profile in &profiles {
+        validate_profile(profile)?;
+    }
+    let candidate_by_id = candidates
+        .iter()
+        .map(|candidate| (candidate.id.as_str(), candidate))
+        .collect::<BTreeMap<_, _>>();
+    for candidate in &candidates {
+        validate_candidate(candidate)?;
+        validate_candidate_relationship(
+            ProfileSelectionMode::Automatic,
+            candidate,
+            &candidate_by_id,
+            &profile_by_id,
+        )?;
+    }
     if profiles.len() != candidates.len()
         || profiles.iter().any(|profile| {
             !candidates
