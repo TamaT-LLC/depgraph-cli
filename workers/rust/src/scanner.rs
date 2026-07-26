@@ -3656,6 +3656,25 @@ mod tests {
                 .completeness
                 .contains(&CompletenessLevel::SemanticComplete)
         );
+        if result.profile.properties["rust_hir_toolchain_status"] != "compatible" {
+            assert_eq!(
+                result.profile.properties["rust_hir_enable_gate"],
+                "toolchain-unsupported"
+            );
+            assert_eq!(
+                result.profile.properties["rust_hir_sysroot_status"],
+                "not-invoked"
+            );
+            assert!(
+                result
+                    .coverage
+                    .reasons
+                    .iter()
+                    .any(|reason| reason == "rust-hir-unsupported")
+            );
+            crate::emit::build_events("semantic-complete-contract", &result).unwrap();
+            return;
+        }
         assert_eq!(
             result.profile.properties["rust_hir_enable_gate"],
             "release-gate-pending"
