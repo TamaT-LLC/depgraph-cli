@@ -5105,3 +5105,208 @@ fn exports_are_byte_identical_across_scan_ids_and_event_order() {
     assert!(graphml.starts_with("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"));
     assert!(graphml.contains("attr.name=\"depgraph.edge.condition\""));
 }
+
+fn write_profile_plan_fixture(root: &Path) {
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"profile-plan-fixture\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn fixture() {}\n").unwrap();
+}
+
+#[test]
+fn profiles_plan_is_read_only_explainable_and_checkout_independent() {
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    write_profile_plan_fixture(first.path());
+    write_profile_plan_fixture(second.path());
+
+    let run = |root: &Path, json: bool| {
+        let mut command = Command::cargo_bin("depgraph").unwrap();
+        command.args(["profiles", "plan", root.to_str().unwrap()]);
+        if json {
+            command.arg("--json");
+        }
+        command.output().unwrap()
+    };
+    let first_json = run(first.path(), true);
+    let second_json = run(second.path(), true);
+    assert!(
+        first_json.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first_json.stderr)
+    );
+    assert!(second_json.status.success());
+    assert_eq!(first_json.stdout, second_json.stdout);
+    let preview: serde_json::Value = serde_json::from_slice(&first_json.stdout).unwrap();
+    assert_eq!(preview["plan"]["selection_mode"], "automatic");
+    assert_eq!(
+        preview["plan"]["input"]["language_families"],
+        json!(["rust"])
+    );
+    assert_eq!(preview["plan"]["summary"]["selected_profile_count"], 1);
+    assert_eq!(preview["config_migration"]["status"], "default_equivalent");
+    assert!(!first.path().join(".depgraph").exists());
+
+    let human = run(first.path(), false);
+    assert!(human.status.success());
+    let human = String::from_utf8(human.stdout).unwrap();
+    assert!(human.contains("profiles: 1 selected / 1 eligible"));
+    assert!(human.contains("candidate profile:sha256:"));
+    assert!(human.contains("selected profile:sha256:"));
+    assert!(human.contains("config migration:"));
+}
+
+#[test]
+fn profiles_plan_enforces_budget_and_explicit_all_or_error_boundaries() {
+    let root = tempfile::tempdir().unwrap();
+    write_profile_plan_fixture(root.path());
+    let root_path = root.path().to_str().unwrap();
+
+    Command::cargo_bin("depgraph")
+        .unwrap()
+        .args(["profiles", "plan", root_path, "--profile-budget", "0"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("profile-budget must be 1..=32"));
+
+    let automatic = Command::cargo_bin("depgraph")
+        .unwrap()
+        .args(["profiles", "plan", root_path, "--json"])
+        .output()
+        .unwrap();
+    assert!(automatic.status.success());
+    let automatic: serde_json::Value = serde_json::from_slice(&automatic.stdout).unwrap();
+    let axes = automatic["plan"]["profiles"][0]["axes"].clone();
+    let mut unsupported_axes = axes.clone();
+    unsupported_axes["target"] = json!("unsupported-target");
+    let unsupported = root.path().join("unsupported-profiles.json");
+    fs::write(
+        &unsupported,
+        serde_json::to_vec(&json!({
+            "contract_version": "default-profile-selection-v1",
+            "profiles": [unsupported_axes]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    Command::cargo_bin("depgraph")
+        .unwrap()
+        .args([
+            "profiles",
+            "plan",
+            root_path,
+            "--profiles-file",
+            unsupported.to_str().unwrap(),
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("unavailable Rust target"));
+
+    let explicit_value = json!({
+        "contract_version": "default-profile-selection-v1",
+        "profiles": [axes]
+    });
+    let first_file = root.path().join("profiles-a.json");
+    let second_file = root.path().join("profiles-b.json");
+    fs::write(
+        &first_file,
+        serde_json::to_vec_pretty(&explicit_value).unwrap(),
+    )
+    .unwrap();
+    fs::write(&second_file, serde_json::to_vec(&explicit_value).unwrap()).unwrap();
+
+    let run_explicit = |path: &Path| {
+        Command::cargo_bin("depgraph")
+            .unwrap()
+            .args([
+                "profiles",
+                "plan",
+                root_path,
+                "--profiles-file",
+                path.to_str().unwrap(),
+                "--json",
+            ])
+            .output()
+            .unwrap()
+    };
+    let first = run_explicit(&first_file);
+    let second = run_explicit(&second_file);
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert!(second.status.success());
+    assert_eq!(first.stdout, second.stdout);
+    let explicit: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert_eq!(explicit["plan"]["selection_mode"], "explicit");
+    assert_eq!(explicit["plan"]["summary"]["selected_profile_count"], 1);
+    assert_eq!(explicit["plan"]["summary"]["omitted_profile_count"], 0);
+    assert!(explicit["plan"]["discovery"].as_array().unwrap().is_empty());
+
+    Command::cargo_bin("depgraph")
+        .unwrap()
+        .args([
+            "profiles",
+            "plan",
+            root_path,
+            "--profile-budget",
+            "2",
+            "--profiles-file",
+            first_file.to_str().unwrap(),
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("cannot be used with"));
+
+    let secret = "fixture-do-not-echo";
+    let invalid = root.path().join("invalid-profiles.json");
+    fs::write(
+        &invalid,
+        format!(
+            r#"{{"contract_version":"default-profile-selection-v1","profiles":[],"api_token":"{secret}"}}"#
+        ),
+    )
+    .unwrap();
+    Command::cargo_bin("depgraph")
+        .unwrap()
+        .args([
+            "profiles",
+            "plan",
+            root_path,
+            "--profiles-file",
+            invalid.to_str().unwrap(),
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("forbidden secret-bearing field"))
+        .stderr(predicate::str::contains(secret).not());
+}
+
+#[cfg(unix)]
+#[test]
+fn profiles_plan_rejects_symlinked_explicit_files_as_security_errors() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::NamedTempFile::new().unwrap();
+    write_profile_plan_fixture(root.path());
+    let link = root.path().join("profiles.json");
+    symlink(outside.path(), &link).unwrap();
+
+    Command::cargo_bin("depgraph")
+        .unwrap()
+        .args([
+            "profiles",
+            "plan",
+            root.path().to_str().unwrap(),
+            "--profiles-file",
+            link.to_str().unwrap(),
+        ])
+        .assert()
+        .code(4)
+        .stderr(predicate::str::contains("unsafe explicit profiles file"));
+}

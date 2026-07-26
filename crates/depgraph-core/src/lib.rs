@@ -15,8 +15,10 @@ pub mod incremental;
 pub mod policy;
 mod policy_engine;
 pub mod profile_selection;
+pub mod profile_selection_file;
 pub mod profile_selection_go;
 pub mod profile_selection_plan;
+pub mod profile_selection_preview;
 pub mod profile_selection_rank;
 pub mod profile_selection_rust;
 pub mod profile_selection_web;
@@ -161,6 +163,12 @@ pub use profile_selection::{
     profile_candidate_id, profile_exclusion_id, profile_selection_input_digest,
     validate_profile_selection_plan,
 };
+pub use profile_selection_file::{
+    EXPLICIT_PROFILE_SELECTION_FILE_SCHEMA, EXPLICIT_PROFILE_SELECTION_FILE_SCHEMA_PATH,
+    ExplicitProfileSelectionFile, ValidatedExplicitProfileSelection,
+    parse_explicit_profile_selection_file, plan_explicit_profile_selection,
+    read_explicit_profile_selection_file, validate_explicit_profile_selection_capabilities,
+};
 pub use profile_selection_go::{
     GO_PROFILE_PLANNING_VERSION, GoAutomaticBoundaryKind, GoConstraintTarget,
     GoPlatformEvidenceKind, GoProfileAvailability, GoProfileCandidateGenerationResult,
@@ -178,6 +186,11 @@ pub use profile_selection_plan::{
     build_profile_selection_input, canonical_profile_planning_inventory,
     classify_profile_selection_repository, default_profile_selection_limits,
     profile_planning_build_unit_id, profile_selection_inventory_digest,
+};
+pub use profile_selection_preview::{
+    LegacyProfileConfigMigration, LegacyProfileMigrationStatus, RepositoryProfilePlanPreview,
+    build_repository_profile_planning_inventory, migrate_legacy_profile_config,
+    plan_repository_profiles,
 };
 pub use profile_selection_rank::{
     AutomaticProfileSelectionRequest, ProfileMatrixIncompleteReason, ProfileSelectionDoctorStatus,
