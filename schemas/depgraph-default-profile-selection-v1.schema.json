@@ -1,0 +1,702 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/TamaT-LLC/depgraph-cli/schemas/depgraph-default-profile-selection-v1.schema.json",
+  "title": "depgraph default profile selection v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract_version",
+    "selection_mode",
+    "input",
+    "input_digest",
+    "profiles",
+    "candidates",
+    "selected",
+    "omitted",
+    "policy_excluded",
+    "discovery",
+    "summary",
+    "plan_id"
+  ],
+  "properties": {
+    "contract_version": {
+      "const": "default-profile-selection-v1"
+    },
+    "selection_mode": {
+      "enum": ["automatic", "explicit"]
+    },
+    "input": {
+      "$ref": "#/$defs/input"
+    },
+    "input_digest": {
+      "$ref": "#/$defs/inputId"
+    },
+    "profiles": {
+      "type": "array",
+      "maxItems": 515,
+      "items": {
+        "$ref": "#/$defs/profile"
+      }
+    },
+    "candidates": {
+      "type": "array",
+      "maxItems": 515,
+      "items": {
+        "$ref": "#/$defs/candidate"
+      }
+    },
+    "selected": {
+      "type": "array",
+      "maxItems": 32,
+      "items": {
+        "$ref": "#/$defs/selected"
+      }
+    },
+    "omitted": {
+      "type": "array",
+      "maxItems": 515,
+      "items": {
+        "$ref": "#/$defs/omitted"
+      }
+    },
+    "policy_excluded": {
+      "type": "array",
+      "maxItems": 512,
+      "items": {
+        "$ref": "#/$defs/exclusion"
+      }
+    },
+    "discovery": {
+      "type": "array",
+      "maxItems": 3,
+      "items": {
+        "$ref": "#/$defs/discovery"
+      }
+    },
+    "summary": {
+      "$ref": "#/$defs/summary"
+    },
+    "plan_id": {
+      "$ref": "#/$defs/planId"
+    }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "profileId": {
+      "type": "string",
+      "pattern": "^profile:sha256:[0-9a-f]{64}$"
+    },
+    "candidateId": {
+      "type": "string",
+      "pattern": "^profile-candidate:sha256:[0-9a-f]{64}$"
+    },
+    "exclusionId": {
+      "type": "string",
+      "pattern": "^profile-exclusion:sha256:[0-9a-f]{64}$"
+    },
+    "inputId": {
+      "type": "string",
+      "pattern": "^profile-selection-input:sha256:[0-9a-f]{64}$"
+    },
+    "planId": {
+      "type": "string",
+      "pattern": "^profile-selection-plan:sha256:[0-9a-f]{64}$"
+    },
+    "fileId": {
+      "type": "string",
+      "pattern": "^file:sha256:[0-9a-f]{64}$"
+    },
+    "siteId": {
+      "type": "string",
+      "pattern": "^site:sha256:[0-9a-f]{64}$"
+    },
+    "boundedIdentity": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "pattern": "^\\S(?:.*\\S)?$"
+    },
+    "axisValue": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "^[^\\s\\u0000-\\u001f\\u007f]+$"
+    },
+    "language": {
+      "enum": ["rust", "go", "web"]
+    },
+    "axis": {
+      "enum": ["target", "environment", "mode", "feature_or_tag"]
+    },
+    "repository": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["size_class", "relevant_source_files", "build_units"],
+      "properties": {
+        "size_class": {
+          "enum": ["tiny", "small", "medium", "large"]
+        },
+        "relevant_source_files": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "build_units": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "limit_version",
+        "effective_profile_cap",
+        "hard_profile_cap",
+        "per_language_candidate_cap",
+        "total_candidate_cap"
+      ],
+      "properties": {
+        "limit_version": {
+          "const": "default-profile-selection-limits-v1"
+        },
+        "effective_profile_cap": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 32
+        },
+        "hard_profile_cap": {
+          "const": 32
+        },
+        "per_language_candidate_cap": {
+          "const": 256
+        },
+        "total_candidate_cap": {
+          "const": 512
+        }
+      }
+    },
+    "axisCapability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["language", "axis"],
+      "properties": {
+        "language": {
+          "$ref": "#/$defs/language"
+        },
+        "axis": {
+          "$ref": "#/$defs/axis"
+        }
+      }
+    },
+    "hostContext": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["language", "target"],
+          "properties": {
+            "language": {
+              "const": "rust"
+            },
+            "target": {
+              "$ref": "#/$defs/axisValue"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["language", "goos", "goarch"],
+          "properties": {
+            "language": {
+              "const": "go"
+            },
+            "goos": {
+              "$ref": "#/$defs/axisValue"
+            },
+            "goarch": {
+              "$ref": "#/$defs/axisValue"
+            }
+          }
+        }
+      ]
+    },
+    "input": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contract_version",
+        "inventory_digest",
+        "compatibility_ids",
+        "language_families",
+        "host_contexts",
+        "supported_axes",
+        "repository",
+        "limits"
+      ],
+      "properties": {
+        "contract_version": {
+          "const": "default-profile-selection-v1"
+        },
+        "inventory_digest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "compatibility_ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/boundedIdentity"
+          }
+        },
+        "language_families": {
+          "type": "array",
+          "maxItems": 3,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/language"
+          }
+        },
+        "host_contexts": {
+          "type": "array",
+          "maxItems": 2,
+          "items": {
+            "$ref": "#/$defs/hostContext"
+          }
+        },
+        "configuration_digest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "selection_file_digest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "supported_axes": {
+          "type": "array",
+          "maxItems": 9,
+          "items": {
+            "$ref": "#/$defs/axisCapability"
+          }
+        },
+        "repository": {
+          "$ref": "#/$defs/repository"
+        },
+        "limits": {
+          "$ref": "#/$defs/limits"
+        }
+      }
+    },
+    "rustAxes": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["language", "target", "mode", "default_features", "features"],
+      "properties": {
+        "language": {
+          "const": "rust"
+        },
+        "target": {
+          "$ref": "#/$defs/axisValue"
+        },
+        "mode": {
+          "enum": ["check", "test"]
+        },
+        "default_features": {
+          "type": "boolean"
+        },
+        "features": {
+          "type": "array",
+          "maxItems": 256,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/axisValue"
+          }
+        }
+      }
+    },
+    "goAxes": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["language", "goos", "goarch", "tags", "cgo_enabled", "call_graph"],
+      "properties": {
+        "language": {
+          "const": "go"
+        },
+        "goos": {
+          "$ref": "#/$defs/axisValue"
+        },
+        "goarch": {
+          "$ref": "#/$defs/axisValue"
+        },
+        "tags": {
+          "type": "array",
+          "maxItems": 256,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/axisValue"
+          }
+        },
+        "cgo_enabled": {
+          "type": "boolean"
+        },
+        "call_graph": {
+          "enum": ["rta-cha", "vta"]
+        }
+      }
+    },
+    "webAxes": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["language", "mode", "environments"],
+      "properties": {
+        "language": {
+          "const": "web"
+        },
+        "mode": {
+          "enum": ["production", "development", "test"]
+        },
+        "environments": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 4,
+          "uniqueItems": true,
+          "items": {
+            "enum": ["browser", "server", "edge", "worker"]
+          }
+        }
+      }
+    },
+    "axes": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/rustAxes"
+        },
+        {
+          "$ref": "#/$defs/goAxes"
+        },
+        {
+          "$ref": "#/$defs/webAxes"
+        }
+      ]
+    },
+    "profile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "axes"],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/profileId"
+        },
+        "axes": {
+          "$ref": "#/$defs/axes"
+        }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "path", "start_line", "end_line"],
+      "properties": {
+        "kind": {
+          "enum": ["config", "manifest", "source", "host_context"]
+        },
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096,
+          "pattern": "^[^/\\\\:][^\\\\:]*$"
+        },
+        "start_line": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "end_line": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "coverage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["file_ids", "dependency_site_ids"],
+      "properties": {
+        "file_ids": {
+          "type": "array",
+          "maxItems": 100000,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/fileId"
+          }
+        },
+        "dependency_site_ids": {
+          "type": "array",
+          "maxItems": 200000,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/siteId"
+          }
+        }
+      }
+    },
+    "candidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "profile_id",
+        "baseline_profile_id",
+        "kind",
+        "axis_values",
+        "estimated_coverage",
+        "evidence"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/candidateId"
+        },
+        "profile_id": {
+          "$ref": "#/$defs/profileId"
+        },
+        "baseline_profile_id": {
+          "$ref": "#/$defs/profileId"
+        },
+        "kind": {
+          "enum": ["baseline", "alternative"]
+        },
+        "changed_axis": {
+          "$ref": "#/$defs/axis"
+        },
+        "axis_values": {
+          "type": "array",
+          "maxItems": 256,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/axisValue"
+          }
+        },
+        "estimated_coverage": {
+          "$ref": "#/$defs/coverage"
+        },
+        "evidence": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1024,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/evidence"
+          }
+        }
+      }
+    },
+    "rank": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "declaration_tier",
+        "new_dependency_occurrences",
+        "new_files",
+        "dimension_priority",
+        "language_priority"
+      ],
+      "properties": {
+        "declaration_tier": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 3
+        },
+        "new_dependency_occurrences": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "new_files": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "dimension_priority": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 3
+        },
+        "language_priority": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 2
+        }
+      }
+    },
+    "selected": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["candidate_id", "profile_id", "selection_rank", "reason"],
+      "properties": {
+        "candidate_id": {
+          "$ref": "#/$defs/candidateId"
+        },
+        "profile_id": {
+          "$ref": "#/$defs/profileId"
+        },
+        "selection_rank": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 31
+        },
+        "reason": {
+          "enum": [
+            "mandatory_language_baseline",
+            "tracked_profile_configuration",
+            "automatic_coverage_ranked",
+            "explicit_profile_requested"
+          ]
+        },
+        "rank": {
+          "$ref": "#/$defs/rank"
+        }
+      }
+    },
+    "omitted": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["candidate_id", "profile_id", "reason", "rank"],
+      "properties": {
+        "candidate_id": {
+          "$ref": "#/$defs/candidateId"
+        },
+        "profile_id": {
+          "$ref": "#/$defs/profileId"
+        },
+        "reason": {
+          "const": "default_profile_budget_exhausted"
+        },
+        "rank": {
+          "$ref": "#/$defs/rank"
+        }
+      }
+    },
+    "exclusion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "language",
+        "axis_values",
+        "reason",
+        "affects_completeness",
+        "evidence"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/exclusionId"
+        },
+        "language": {
+          "$ref": "#/$defs/language"
+        },
+        "axis": {
+          "$ref": "#/$defs/axis"
+        },
+        "axis_values": {
+          "type": "array",
+          "maxItems": 256,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/axisValue"
+          }
+        },
+        "reason": {
+          "enum": [
+            "default_profile_combination_requires_explicit_selection",
+            "default_profile_dynamic_configuration_not_executed",
+            "default_profile_unsupported_axis",
+            "default_profile_build_requires_consent",
+            "default_profile_runtime_requires_trace",
+            "default_profile_malformed_declaration"
+          ]
+        },
+        "affects_completeness": {
+          "type": "boolean"
+        },
+        "evidence": {
+          "type": "array",
+          "maxItems": 1024,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/evidence"
+          }
+        }
+      }
+    },
+    "discovery": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "language",
+        "discovered_candidate_count",
+        "overflow_candidate_count",
+        "complete"
+      ],
+      "properties": {
+        "language": {
+          "$ref": "#/$defs/language"
+        },
+        "discovered_candidate_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 256
+        },
+        "overflow_candidate_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "complete": {
+          "type": "boolean"
+        },
+        "reason": {
+          "const": "default_profile_candidate_limit_exceeded"
+        }
+      }
+    },
+    "summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "eligible_profile_count",
+        "selected_profile_count",
+        "omitted_profile_count",
+        "policy_excluded_count",
+        "candidate_discovery_complete",
+        "selection_complete"
+      ],
+      "properties": {
+        "eligible_profile_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 515
+        },
+        "selected_profile_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 32
+        },
+        "omitted_profile_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 515
+        },
+        "policy_excluded_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 512
+        },
+        "candidate_discovery_complete": {
+          "type": "boolean"
+        },
+        "selection_complete": {
+          "type": "boolean"
+        }
+      }
+    }
+  }
+}
