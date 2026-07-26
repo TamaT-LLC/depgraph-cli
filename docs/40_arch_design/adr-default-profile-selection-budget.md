@@ -389,7 +389,7 @@ Each row is one independently reviewable one-to-three-day follow-up Issue.
 | 3 | Rust baseline and single-axis target/mode/feature candidates | Implemented in #185 | 1-2 | Default/no-default/feature/target/test fixtures never form a product |
 | 4 | Go baseline and platform/tag candidates | Implemented in #186 | 1-2 | GOOS/GOARCH/tag fixtures are deterministic; cgo/VTA remain non-auto |
 | 5 | Web/framework baseline and environment candidates | Implemented in #187 | 1-2 | browser/server baseline and evidenced edge/worker/dev/test alternatives validate |
-| 6 | Greedy ranking, budget omission, aggregate coverage, doctor, and strict behavior | 2-3 days | 3-5 | Reordered polyglot fixture yields byte-identical selected/omitted output |
+| 6 | Greedy ranking, budget omission, aggregate coverage, doctor, and strict behavior | Implemented in #188 | 3-5 | Reordered polyglot fixture yields byte-identical selected/omitted output |
 | 7 | `profiles plan`, `--profile-budget`, strict profiles-file schema, and v1 config migration | 2-3 days | 6 | Explicit requests are all-or-error and auto planning is explainable |
 | 8 | Cache/incremental binding and five-target package/release gate | 2-3 days | 7 | Plan digest invalidates correctly; Linux/macOS/Windows package tests pass |
 

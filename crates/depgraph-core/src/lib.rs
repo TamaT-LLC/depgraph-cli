@@ -17,6 +17,7 @@ mod policy_engine;
 pub mod profile_selection;
 pub mod profile_selection_go;
 pub mod profile_selection_plan;
+pub mod profile_selection_rank;
 pub mod profile_selection_rust;
 pub mod profile_selection_web;
 pub mod query;
@@ -177,6 +178,11 @@ pub use profile_selection_plan::{
     build_profile_selection_input, canonical_profile_planning_inventory,
     classify_profile_selection_repository, default_profile_selection_limits,
     profile_planning_build_unit_id, profile_selection_inventory_digest,
+};
+pub use profile_selection_rank::{
+    AutomaticProfileSelectionRequest, ProfileMatrixIncompleteReason, ProfileSelectionDoctorStatus,
+    plan_automatic_profile_selection, profile_selection_doctor_status,
+    profile_selection_human_summary,
 };
 pub use profile_selection_rust::{
     RUST_PROFILE_PLANNING_VERSION, RustAutomaticBoundaryKind, RustProfileAlternativeDeclaration,
