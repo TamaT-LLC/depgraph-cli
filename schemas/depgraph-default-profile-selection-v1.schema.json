@@ -335,8 +335,7 @@
         "goarch",
         "tags",
         "cgo_enabled",
-        "call_graph",
-        "dependency_snapshot_id"
+        "call_graph"
       ],
       "properties": {
         "language": {

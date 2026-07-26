@@ -242,6 +242,7 @@ pub struct GoProfileAxes {
     pub tags: Vec<String>,
     pub cgo_enabled: bool,
     pub call_graph: GoCallGraph,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub dependency_snapshot_id: String,
 }
 
@@ -836,11 +837,13 @@ pub(crate) fn validate_profile(profile: &ProfileSelectionProfile) -> Result<()> 
         CanonicalProfileAxes::Go(axes) => {
             validate_axis_value("Go GOOS", &axes.goos)?;
             validate_axis_value("Go GOARCH", &axes.goarch)?;
-            validate_stable_id(
-                "Go dependency snapshot id",
-                &axes.dependency_snapshot_id,
-                "go-dependency-snapshot",
-            )?;
+            if !axes.dependency_snapshot_id.is_empty() {
+                validate_stable_id(
+                    "Go dependency snapshot id",
+                    &axes.dependency_snapshot_id,
+                    "go-dependency-snapshot",
+                )?;
+            }
             validate_sorted_unique_strings("Go tags", &axes.tags, true)?;
             for tag in &axes.tags {
                 validate_axis_value("Go tag", tag)?;
@@ -1407,6 +1410,39 @@ mod tests {
                 .to_string()
                 .contains("canonical inventory attestation")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_v1_go_axes_without_dependency_snapshot_remain_byte_compatible() -> Result<()> {
+        let legacy = json!({
+            "language": "go",
+            "goos": "darwin",
+            "goarch": "arm64",
+            "tags": [],
+            "cgo_enabled": false,
+            "call_graph": "rta-cha"
+        });
+        let axes: CanonicalProfileAxes = serde_json::from_value(legacy.clone())?;
+        let CanonicalProfileAxes::Go(go) = &axes else {
+            unreachable!();
+        };
+        assert!(go.dependency_snapshot_id.is_empty());
+        assert_eq!(serde_json::to_value(&axes)?, legacy);
+        assert_eq!(
+            canonical_profile_id(&axes),
+            canonical_profile_id(&serde_json::from_value(legacy.clone())?)
+        );
+
+        let schema: Value = serde_json::from_str(DEFAULT_PROFILE_SELECTION_SCHEMA)?;
+        let go_axes_schema = json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$ref": "#/$defs/goAxes",
+            "$defs": schema["$defs"].clone()
+        });
+        jsonschema::validator_for(&go_axes_schema)?
+            .validate(&legacy)
+            .map_err(|error| anyhow!("{error}"))?;
         Ok(())
     }
 

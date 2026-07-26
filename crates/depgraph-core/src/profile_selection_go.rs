@@ -83,6 +83,10 @@ pub struct GoTargetDeclaration {
     pub goos: String,
     pub goarch: String,
     pub evidence_kind: GoPlatformEvidenceKind,
+    #[serde(default)]
+    pub constraint_goos: Vec<String>,
+    #[serde(default)]
+    pub constraint_goarch: Vec<String>,
     pub availability: GoProfileAvailability,
     pub static_evidence: GoStaticProfileEvidence,
 }
@@ -136,6 +140,8 @@ pub struct GoProfilePlanningInput {
 pub struct GoProfileCandidateGenerationResult {
     pub bounded: ProfileCandidateDiscoveryResult,
     pub policy_excluded: Vec<ProfilePolicyExclusion>,
+    pub policy_exclusion_overflow_count: u32,
+    pub complete: bool,
     pub baseline_profile_id: String,
 }
 
@@ -282,13 +288,16 @@ pub fn generate_go_profile_candidates(
 
     exclusions.sort_by(|left, right| left.id.as_bytes().cmp(right.id.as_bytes()));
     exclusions.dedup_by(|left, right| left.id == right.id);
-    if exclusions.len() > MAX_GO_POLICY_EXCLUSIONS {
-        bail!("Go profile planning exceeds the closed policy-exclusion limit");
-    }
+    let policy_exclusion_overflow_count =
+        u32::try_from(exclusions.len().saturating_sub(MAX_GO_POLICY_EXCLUSIONS))?;
+    exclusions.truncate(MAX_GO_POLICY_EXCLUSIONS);
     let bounded = bound_profile_candidate_discovery(profiles, candidates, &[ProfileLanguage::Go])?;
+    let complete = bounded.complete && policy_exclusion_overflow_count == 0;
     Ok(GoProfileCandidateGenerationResult {
         bounded,
         policy_excluded: exclusions,
+        policy_exclusion_overflow_count,
+        complete,
         baseline_profile_id,
     })
 }
@@ -306,6 +315,7 @@ fn canonical_targets(
     for mut target in targets {
         validate_known_goos(&target.goos)?;
         validate_known_goarch(&target.goarch)?;
+        canonicalize_constraint_platforms(&mut target)?;
         canonicalize_static_evidence(&mut target.static_evidence)?;
         validate_platform_evidence(&target, host_goos, host_goarch)?;
         let key = (target.goos.clone(), target.goarch.clone());
@@ -375,6 +385,42 @@ fn validate_platform_evidence(
         })
     {
         bail!("Go filename platform evidence does not match its GOOS/GOARCH pair");
+    }
+    if target.evidence_kind == GoPlatformEvidenceKind::BuildConstraint
+        && (!target
+            .constraint_goos
+            .iter()
+            .any(|value| value == &target.goos)
+            || !target
+                .constraint_goarch
+                .iter()
+                .any(|value| value == &target.goarch))
+    {
+        bail!("Go build-constraint evidence does not match its GOOS/GOARCH pair");
+    }
+    Ok(())
+}
+
+fn canonicalize_constraint_platforms(target: &mut GoTargetDeclaration) -> Result<()> {
+    target.constraint_goos.sort();
+    target.constraint_goos.dedup();
+    target.constraint_goarch.sort();
+    target.constraint_goarch.dedup();
+    if target.constraint_goos.len() > GOOS_VALUES.len()
+        || target.constraint_goarch.len() > GOARCH_VALUES.len()
+    {
+        bail!("Go build-constraint platform evidence exceeds its closed vocabulary");
+    }
+    for goos in &target.constraint_goos {
+        validate_known_goos(goos)?;
+    }
+    for goarch in &target.constraint_goarch {
+        validate_known_goarch(goarch)?;
+    }
+    if target.evidence_kind == GoPlatformEvidenceKind::FileName
+        && (!target.constraint_goos.is_empty() || !target.constraint_goarch.is_empty())
+    {
+        bail!("Go filename evidence cannot claim parsed build-constraint platforms");
     }
     Ok(())
 }
@@ -674,6 +720,16 @@ mod tests {
             goos: goos.to_owned(),
             goarch: goarch.to_owned(),
             evidence_kind: kind,
+            constraint_goos: if kind == GoPlatformEvidenceKind::BuildConstraint {
+                vec![goos.to_owned()]
+            } else {
+                Vec::new()
+            },
+            constraint_goarch: if kind == GoPlatformEvidenceKind::BuildConstraint {
+                vec![goarch.to_owned()]
+            } else {
+                Vec::new()
+            },
             availability: GoProfileAvailability::Available,
             static_evidence: evidence(&format!("{goos}-{goarch}"), path),
         }
@@ -868,5 +924,75 @@ mod tests {
                 .to_string()
                 .contains("repository-relative")
         );
+    }
+
+    #[test]
+    fn build_constraint_platform_attestation_must_match_the_declared_target() {
+        let mut missing = input('a');
+        let mut declaration = target(
+            "windows",
+            "amd64",
+            GoPlatformEvidenceKind::BuildConstraint,
+            "pkg/service.go",
+        );
+        declaration.constraint_goos.clear();
+        declaration.constraint_goarch.clear();
+        missing.targets.push(declaration);
+        assert!(
+            generate_go_profile_candidates(missing)
+                .unwrap_err()
+                .to_string()
+                .contains("does not match")
+        );
+
+        let mut wrong = input('a');
+        let mut declaration = target(
+            "windows",
+            "amd64",
+            GoPlatformEvidenceKind::BuildConstraint,
+            "pkg/service.go",
+        );
+        declaration.constraint_goos = vec!["linux".to_owned()];
+        declaration.constraint_goarch = vec!["arm64".to_owned()];
+        wrong.targets.push(declaration);
+        assert!(
+            generate_go_profile_candidates(wrong)
+                .unwrap_err()
+                .to_string()
+                .contains("does not match")
+        );
+    }
+
+    #[test]
+    fn policy_exclusion_overflow_is_bounded_canonical_and_keeps_the_baseline() -> Result<()> {
+        let mut fixture = input('a');
+        fixture.rejected = (0..=MAX_GO_POLICY_EXCLUSIONS)
+            .map(|index| GoRejectedProfileDeclaration {
+                kind: GoAutomaticBoundaryKind::BuildProfile,
+                axis: None,
+                axis_values: vec![format!("profile={index:04}")],
+                evidence: evidence(
+                    &format!("rejected-{index:04}"),
+                    &format!("config/profile-{index:04}.json"),
+                )
+                .evidence,
+            })
+            .collect();
+        let mut reordered = fixture.clone();
+        reordered.rejected.reverse();
+        let first = generate_go_profile_candidates(fixture)?;
+        let second = generate_go_profile_candidates(reordered)?;
+        assert_eq!(first, second);
+        assert_eq!(first.policy_excluded.len(), MAX_GO_POLICY_EXCLUSIONS);
+        assert_eq!(first.policy_exclusion_overflow_count, 1);
+        assert!(!first.complete);
+        assert!(
+            first
+                .bounded
+                .profiles
+                .iter()
+                .any(|profile| { profile.id == first.baseline_profile_id })
+        );
+        Ok(())
     }
 }
