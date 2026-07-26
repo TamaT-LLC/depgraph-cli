@@ -685,6 +685,7 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "| 7 | GraphQL client/resolver repository mapping | Implemented in #197 |",
         "| 8 | HTTP trace-to-operation correlation | Implemented in #198 |",
         "| 9 | Rust/Go/Web static FFI declaration inventory | Implemented in #199 |",
+        "| 10 | FFI supervised link/export evidence | Implemented in #200 |",
         "| 11 | Five-target package/query/release gate | 2-3 days |",
         "## Acceptance matrix",
         "| Safe invariant |",

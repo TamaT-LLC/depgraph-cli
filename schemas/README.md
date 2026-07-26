@@ -42,6 +42,15 @@ never contains a sink endpoint, credential, header value, or environment value.
 The canonical payload remains `depgraph-runtime-trace-v1`; vendor spans are not
 a core input contract.
 
+`depgraph-ffi-link-observation-v1.schema.json` describes sanitized native
+link/export evidence produced only after an explicitly consented build
+supervisor run completes. It binds every entry to a static declaration site,
+language profile, target triple, architecture, link mode, ABI, requested
+library/export symbol, toolchain/link-input identity, and native artifact
+digest. Raw linker output, native bytes, paths, environment values, and
+credentials are outside the contract. The Rust validator additionally requires
+canonical entry order and one entry per declaration site.
+
 `depgraph-default-profile-selection-v1.schema.json` describes the closed,
 canonical default-profile planning input and selected/omitted/policy-excluded
 ledger. The Rust validator additionally verifies canonical profile, candidate,

@@ -451,6 +451,26 @@ manual-declaration sites retain `ffi-link-evidence-pending`, so the static
 inventory cannot advertise observed FFI completeness before the supervised
 link/export adapter supplies same-profile evidence.
 
+The supervised `ffi-link-observation-v1` contract is emitted only from a
+completed, explicitly consented build audit with non-truncated validated
+output. It contains a canonical one-entry-per-declaration ledger and binds the
+build run, participating language profile, target triple, architecture, link
+mode, source-root/toolchain/link-input digests, requested ABI/library/symbol,
+and observed native artifact digest. Raw linker output, binary content,
+environment values, and native paths are never retained or reopened by the
+correlator.
+
+Correlation starts from a validated static FFI closure and requires the
+observation to cover every eligible declaration for exactly one participating
+profile. A same-profile ABI/library/symbol match appends separate
+`phase=build`, `precision=observed` `binds_native_symbol` and
+`provided_by_library` sites/edges; it does not overwrite the static candidate
+or heuristic declaration. Partial link output, an unknown or duplicate site,
+profile/ABI/library/symbol drift, malformed digest, failed/cancelled build, or
+secret-shaped record rejects the entire cloned delta before staging. Reimport
+is idempotent, and observations for Linux, macOS, and Windows remain distinct
+through their target/profile conditions.
+
 ## Security boundary
 
 | Threat | Required control |
@@ -485,7 +505,7 @@ one to three engineering days of scope.
 | 7 | GraphQL client/resolver repository mapping | Implemented in #197 | 6 | Supported compiler/framework maps prove endpoints; dynamic/federated cases remain ledgered |
 | 8 | HTTP trace-to-operation correlation | Implemented in #198 | 2, 4 or 6; runtime trace v1 | Unique profile match is observed; ambiguous, raw-URL, and secret fixtures fail closed |
 | 9 | Rust/Go/Web static FFI declaration inventory | Implemented in #199 | 1 | Every admitted declaration is resolved/candidate/external/unresolved by target profile |
-| 10 | FFI supervised link/export evidence | 2-3 days | 9; build supervisor | Exact ABI/library/symbol mappings require same-profile link evidence and preserve rollback |
+| 10 | FFI supervised link/export evidence | Implemented in #200 | 9; build supervisor | Exact ABI/library/symbol mappings require same-profile link evidence and preserve rollback |
 | 11 | Five-target package/query/release gate | 2-3 days | 2-10 implemented capabilities | Linux/macOS/Windows archives attest adapters and pass query, determinism, tamper, SBOM, and license checks |
 
 Rows 2, 4, 6, and 9 may be implemented in parallel after row 1, but the
