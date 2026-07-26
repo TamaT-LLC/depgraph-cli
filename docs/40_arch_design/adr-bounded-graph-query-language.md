@@ -338,7 +338,7 @@ Planning is a pure function of:
 
 - `contract_version=bounded-graph-query-v1`;
 - canonical typed AST digest;
-- completed snapshot ID and verified graph digest;
+- portable selected-snapshot ID derived from the verified closed graph digest;
 - exact node/edge/site/evidence counts, per-kind/profile/phase cardinality,
   and canonical serialized byte bounds for the closed result fields;
 - the number of existential path predicates and the deterministic upper bound
@@ -347,7 +347,8 @@ Planning is a pure function of:
 
 Checkout path, store path, query-file path, SQLite row order, locale, wall
 clock, runner speed, cache warmth, terminal, CI state, and previous query
-results are not planning input.
+results are not planning input. The store's internal snapshot row ID selects
+the immutable input but is not emitted into the portable plan/result identity.
 
 The planner chooses only these operators:
 

@@ -9,12 +9,13 @@ use depgraph_store::{EdgeRecord, EvidenceRecord, GraphSnapshot, NodeRecord, Site
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::bounded_query_plan::bounded_query_snapshot_id;
 use crate::bounded_query_type::TypedQuantifierPredicate;
 use crate::{
     BOUNDED_QUERY_CONTRACT_VERSION, BoundedQueryLimits, BoundedQueryPlan, CancellationToken,
     EntityType, Literal, QueryDirection, ScalarOperator, SortDirection, TypedEntityExpression,
-    TypedExpression, TypedProjection, TypedQuery, TypedScalarPredicate, bounded_query_plan_digest,
-    plan_bounded_query, render_condition, typed_query_ast_digest,
+    TypedExpression, TypedProjection, TypedQuery, TypedScalarPredicate, bounded_query_graph_digest,
+    bounded_query_plan_digest, render_condition, typed_query_ast_digest,
 };
 
 pub const BOUNDED_QUERY_RESULT_SCHEMA_VERSION: &str = "bounded-query-result-v1";
@@ -140,15 +141,11 @@ fn validate_execution_inputs(
             "typed query or plan digest does not match its canonical payload",
         ));
     }
-    let recomputed = plan_bounded_query(query, &plan.snapshot_id, snapshot).map_err(|_| {
-        execution_error(
-            "query_execution_snapshot_mismatch",
-            "selected snapshot does not match the validated query plan",
-        )
-    })?;
-    if recomputed.plan_digest != plan.plan_digest
-        || recomputed.graph_digest != plan.graph_digest
-        || recomputed.snapshot_id != plan.snapshot_id
+    let graph_digest = bounded_query_graph_digest(snapshot);
+    if graph_digest != plan.graph_digest
+        || plan.snapshot_id != bounded_query_snapshot_id(&graph_digest)
+        || plan.snapshot_statistics.graph_digest != graph_digest
+        || plan.snapshot_statistics.snapshot_id != plan.snapshot_id
     {
         return Err(execution_error(
             "query_execution_snapshot_mismatch",
