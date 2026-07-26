@@ -24,6 +24,10 @@ use serde_json::{Map, Number, Value, json};
 use sha2::{Digest, Sha256};
 use walkdir::{DirEntry, WalkDir};
 
+mod generated;
+
+pub use generated::OPENAPI_GENERATED_MAPPING_SCHEMA_VERSION;
+
 pub const OPENAPI_CAPABILITY: &str = "openapi-contract-v1";
 pub const MAX_OPENAPI_DOCUMENT_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_OPENAPI_TOTAL_BYTES: usize = 64 * 1024 * 1024;
@@ -68,10 +72,14 @@ pub fn scan_openapi_repository(
     }
 
     let inventory = inventory_openapi_documents(&canonical_root)?;
-    if inventory.is_empty() {
+    let generated_inventory = generated::inventory_generated_mappings(&canonical_root)?;
+    if inventory.is_empty() && generated_inventory.is_empty() {
         return Ok(None);
     }
-    let input_digest = digest_input_records(&inventory);
+    let input_digest = digest_value(&json!({
+        "openapi_documents": digest_input_records(&inventory),
+        "generated_mappings": generated_inventory.identity_value(),
+    }));
     let profile_identity = CrossLanguageProfileIdentity {
         contract_version: CROSS_LANGUAGE_CONTRACT_VERSION.to_owned(),
         completeness_version: CROSS_LANGUAGE_COMPLETENESS_VERSION.to_owned(),
@@ -92,16 +100,19 @@ pub fn scan_openapi_repository(
         .collect::<BTreeMap<_, _>>();
     let mut builder = OpenApiGraphBuilder::new(profile_id.clone(), documents);
     builder.build()?;
+    generated::apply_generated_mappings(&canonical_root, &generated_inventory, &mut builder)?;
 
     let skipped_count = inventory
         .iter()
         .filter(|record| record.document.is_none())
-        .count() as u64;
+        .count() as u64
+        + generated_inventory.skipped_count();
     for record in &inventory {
         if let Some(reason) = &record.reason {
             builder.reasons.insert(reason.clone());
         }
     }
+    builder.reasons.extend(generated_inventory.reasons());
     builder.mark_recursive_schema_sites();
 
     let status = if builder.unresolved_count > 0 || skipped_count > 0 || !builder.reasons.is_empty()
@@ -116,7 +127,7 @@ pub fn scan_openapi_repository(
             format: CrossLanguageFormat::Openapi,
             capability: OPENAPI_CAPABILITY.to_owned(),
             status,
-            input_count: inventory.len() as u64,
+            input_count: inventory.len() as u64 + generated_inventory.input_count(),
             node_count: builder.cross_node_ids.len() as u64,
             site_count: builder.sites.len() as u64,
             edge_count: builder.edges.len() as u64,
@@ -201,6 +212,9 @@ fn inventory_openapi_documents(root: &Path) -> Result<Vec<InputRecord>> {
             Some(locator) => locator,
             None => continue,
         };
+        if generated::is_generated_mapping_locator(&locator) {
+            continue;
+        }
         let named_candidate = named_openapi_candidate(&locator);
         if entry.file_type().is_symlink() {
             if named_candidate {
@@ -951,6 +965,7 @@ struct OpenApiGraphBuilder {
     service_ids: BTreeMap<String, String>,
     document_node_ids: BTreeMap<String, String>,
     message_ids: BTreeMap<(String, String), String>,
+    operation_ids: BTreeMap<(String, String), String>,
     scanned_schema_nodes: BTreeSet<String>,
     reference_arcs: Vec<(String, String, String)>,
     reasons: BTreeSet<String>,
@@ -971,6 +986,7 @@ impl OpenApiGraphBuilder {
             service_ids: BTreeMap::new(),
             document_node_ids: BTreeMap::new(),
             message_ids: BTreeMap::new(),
+            operation_ids: BTreeMap::new(),
             scanned_schema_nodes: BTreeSet::new(),
             reference_arcs: Vec::new(),
             reasons: BTreeSet::new(),
@@ -1202,6 +1218,12 @@ impl OpenApiGraphBuilder {
             );
             let operation_id =
                 self.add_cross_node(CrossLanguageNodeKind::Operation, locator, &coordinate)?;
+            insert_identical(
+                &mut self.operation_ids,
+                (locator.to_owned(), coordinate.clone()),
+                operation_id.clone(),
+                "OpenAPI operation identity",
+            )?;
             let service_id = self.service_ids[locator].clone();
             self.add_relation(RelationInput {
                 source: &service_id,
@@ -1985,18 +2007,33 @@ impl OpenApiGraphBuilder {
             detail: None,
             properties: evidence_properties,
         }];
+        self.insert_relation(RelationRecord {
+            source: input.source,
+            target: input.target,
+            relation: input.relation,
+            specifier: format!("#{}", input.pointer),
+            status: input.status,
+            precision: input.precision,
+            reason: input.reason,
+            condition,
+            evidence,
+            generated: false,
+        })
+    }
+
+    fn insert_relation(&mut self, input: RelationRecord<'_>) -> Result<String> {
         let mut site = DependencySite {
             id: String::new(),
             source: input.source.to_owned(),
             kind: input.relation.as_str().to_owned(),
-            specifier: format!("#{}", input.pointer),
+            specifier: input.specifier,
             resolution_status: input.status,
             target_ids: vec![input.target.to_owned()],
             profile_id: self.profile_id.clone(),
-            condition: condition.clone(),
+            condition: input.condition.clone(),
             precision: input.precision,
             reason: input.reason.map(bounded_reason),
-            evidence: evidence.clone(),
+            evidence: input.evidence.clone(),
         };
         site.id = build_cross_language_site_id(&site).map_err(anyhow::Error::from)?;
         let mut edge = GraphEdge {
@@ -2008,11 +2045,11 @@ impl OpenApiGraphBuilder {
             phase: Phase::Semantic,
             environment: None,
             profile_id: self.profile_id.clone(),
-            condition,
+            condition: input.condition,
             resolution_status: input.status,
             precision: input.precision,
-            generated: false,
-            evidence,
+            generated: input.generated,
+            evidence: input.evidence,
         };
         edge.id = build_cross_language_edge_id(&edge).map_err(anyhow::Error::from)?;
         let site_id = site.id.clone();
@@ -2072,6 +2109,19 @@ struct RelationInput<'a> {
     conditions: Vec<(&'a str, String)>,
 }
 
+struct RelationRecord<'a> {
+    source: &'a str,
+    target: &'a str,
+    relation: CrossLanguageRelationKind,
+    specifier: String,
+    status: ResolutionStatus,
+    precision: Precision,
+    reason: Option<&'a str>,
+    condition: Condition,
+    evidence: Vec<Evidence>,
+    generated: bool,
+}
+
 enum ObjectResolution {
     Resolved {
         locator: String,
@@ -2123,9 +2173,9 @@ fn operation_conditions<'a>(
     conditions
 }
 
-fn insert_identical<T: PartialEq>(
-    map: &mut BTreeMap<String, T>,
-    key: String,
+fn insert_identical<K: Ord, T: PartialEq>(
+    map: &mut BTreeMap<K, T>,
+    key: K,
     value: T,
     label: &str,
 ) -> Result<()> {
