@@ -13,6 +13,7 @@ pub mod export;
 mod graphml;
 pub mod impact;
 pub mod incremental;
+pub mod openapi;
 pub mod policy;
 mod policy_engine;
 pub mod profile_selection;
@@ -136,6 +137,11 @@ pub use incremental::{
     INCREMENTAL_PLAN_SCHEMA_VERSION, IncrementalChangeKind, IncrementalFileChange,
     IncrementalInvalidationMode, IncrementalInvalidationPlan, IncrementalInvalidationReason,
     plan_incremental_invalidation, snapshot_profile_plan_id,
+};
+pub use openapi::{
+    MAX_OPENAPI_DEPTH, MAX_OPENAPI_DOCUMENT_BYTES, MAX_OPENAPI_DOCUMENTS,
+    MAX_OPENAPI_REFERENCE_DEPTH, MAX_OPENAPI_REFERENCES, MAX_OPENAPI_SCALAR_BYTES,
+    MAX_OPENAPI_TOTAL_BYTES, MAX_OPENAPI_VALUES, OPENAPI_CAPABILITY, scan_openapi_repository,
 };
 pub use policy::{
     AppliedPolicySuppression, POLICY_RESULT_SCHEMA_VERSION, POLICY_SCHEMA, POLICY_SCHEMA_VERSION,
