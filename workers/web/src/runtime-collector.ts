@@ -41,6 +41,15 @@ export interface RuntimeRedactionInput {
   redactedValueCount?: number;
 }
 
+export interface RuntimeHttpObservationInput {
+  method: "GET" | "HEAD" | "POST" | "PUT" | "PATCH" | "DELETE" | "OPTIONS" | "CONNECT" | "TRACE";
+  routeTemplate: string;
+  format?: "openapi" | "protobuf" | "graphql";
+  operation?: string;
+  contractLocator?: string;
+  formatVersion?: string;
+}
+
 export interface RuntimeObservation {
   kind: RuntimeObservationKind;
   source: RuntimeLocatorInput;
@@ -48,6 +57,7 @@ export interface RuntimeObservation {
   count?: number;
   durationNs?: number;
   redaction?: RuntimeRedactionInput;
+  http?: RuntimeHttpObservationInput;
 }
 
 export interface RuntimeCollectorProfile {
@@ -239,6 +249,15 @@ interface CanonicalRedaction {
 interface CanonicalizedTarget {
   locator: CanonicalLocator;
   urlRedaction: RuntimeRedactionInput | undefined;
+}
+
+interface CanonicalHttpObservation {
+  method: RuntimeHttpObservationInput["method"];
+  route_template: string;
+  format?: RuntimeHttpObservationInput["format"];
+  operation?: string;
+  contract_locator?: string;
+  format_version?: string;
 }
 
 interface NormalizedConfiguration {
@@ -660,6 +679,80 @@ function canonicalizeTarget(input: RuntimeTargetInput, maximum: number): Canonic
   return { locator: canonicalizeLocator(input, maximum), urlRedaction: undefined };
 }
 
+function canonicalizeHttpObservation(
+  input: RuntimeHttpObservationInput | undefined,
+  target: CanonicalLocator,
+  maximum: number,
+): CanonicalHttpObservation | undefined {
+  if (input === undefined) return undefined;
+  if (
+    input === null
+    || typeof input !== "object"
+    || Array.isArray(input)
+    || !hasOnlyKeys(input, [
+      "method",
+      "routeTemplate",
+      "format",
+      "operation",
+      "contractLocator",
+      "formatVersion",
+    ])
+    || !["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "CONNECT", "TRACE"].includes(
+      input.method,
+    )
+    || !validateString(input.routeTemplate, Math.min(maximum, 512))
+    || !input.routeTemplate.startsWith("/")
+    || /:\/\/|[?\s#%\\]/u.test(input.routeTemplate)
+    || looksLikeSecret(input.routeTemplate)
+    || target.kind !== "external"
+    || (target.namespace !== "http" && target.namespace !== "https")
+  ) {
+    throw new Error("invalid HTTP operation observation");
+  }
+  let depth = 0;
+  for (const character of input.routeTemplate) {
+    if (character === "{") depth += 1;
+    if (character === "}") depth -= 1;
+    if (depth < 0 || depth > 1) throw new Error("invalid HTTP operation observation");
+  }
+  if (depth !== 0) throw new Error("invalid HTTP operation observation");
+  if (
+    input.format !== undefined
+    && !["openapi", "protobuf", "graphql"].includes(input.format)
+  ) {
+    throw new Error("invalid HTTP operation observation");
+  }
+  if (
+    input.operation !== undefined
+    && !validateOutputString(input.operation, 512)
+  ) {
+    throw new Error("invalid HTTP operation observation");
+  }
+  if (
+    (input.format === "protobuf" || input.format === "graphql")
+    && input.operation === undefined
+  ) {
+    throw new Error("invalid HTTP operation observation");
+  }
+  const contractLocator = input.contractLocator === undefined
+    ? undefined
+    : normalizeRepositoryPath(input.contractLocator, 512);
+  if (
+    input.formatVersion !== undefined
+    && !validateOutputString(input.formatVersion, 512)
+  ) {
+    throw new Error("invalid HTTP operation observation");
+  }
+  return {
+    method: input.method,
+    route_template: input.routeTemplate,
+    ...(input.format === undefined ? {} : { format: input.format }),
+    ...(input.operation === undefined ? {} : { operation: input.operation }),
+    ...(contractLocator === undefined ? {} : { contract_locator: contractLocator }),
+    ...(input.formatVersion === undefined ? {} : { format_version: input.formatVersion }),
+  };
+}
+
 function defaultSleep(delayMs: number, signal: AbortSignal): Promise<void> {
   if (signal.aborted) return Promise.reject(new Error("aborted"));
   return new Promise((resolve, reject) => {
@@ -919,6 +1012,7 @@ export function createRuntimeCollector(options: RuntimeCollectorOptions): Runtim
           "count",
           "durationNs",
           "redaction",
+          "http",
         ])
         || !Object.hasOwn(dependencyKinds, observation.kind)
       ) {
@@ -926,6 +1020,11 @@ export function createRuntimeCollector(options: RuntimeCollectorOptions): Runtim
       }
       const source = canonicalizeLocator(observation.source, configuration.maxStringChars);
       const target = canonicalizeTarget(observation.target, configuration.maxStringChars);
+      const http = canonicalizeHttpObservation(
+        observation.http,
+        target.locator,
+        configuration.maxStringChars,
+      );
       const count = observation.count ?? 1;
       if (!Number.isSafeInteger(count) || count < 1) throw new Error("invalid count");
       if (
@@ -949,6 +1048,7 @@ export function createRuntimeCollector(options: RuntimeCollectorOptions): Runtim
         dependency_kind: dependencyKinds[observation.kind],
         source,
         target: target.locator,
+        ...(http === undefined ? {} : { http }),
         ...(count === 1 ? {} : { count }),
         ...(observation.durationNs === undefined ? {} : { duration_ns: observation.durationNs }),
         ...(redaction === undefined ? {} : { redaction }),

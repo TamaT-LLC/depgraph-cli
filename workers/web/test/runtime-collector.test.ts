@@ -421,6 +421,90 @@ test("invalid or secret-shaped observations fail closed without consuming sequen
   ]);
 });
 
+test("HTTP operation observations retain only authority and canonical contract metadata", async () => {
+  const fixture = await readFixture("next");
+  const collector = createRuntimeCollector({
+    repository: fixture.repository,
+    session: fixture.session,
+    sink: memorySink(),
+    clock: new StepClock("2026-07-24T00:00:00Z"),
+  });
+  assert.equal(
+    collector.recordRoute({
+      source: { kind: "repository_path", path: "src/client.ts", nodeKind: "symbol" },
+      target: {
+        kind: "http_url",
+        url: "https://fixture-user:fixture-password@API.EXAMPLE.TEST/private/42?token=opaque",
+      },
+      http: {
+        method: "GET",
+        routeTemplate: "/pets/{id}",
+        format: "openapi",
+        operation: "get /pets/{id}",
+        contractLocator: "contracts/api.json",
+        formatVersion: "3.1.0",
+      },
+    }),
+    true,
+  );
+  assert.equal(
+    collector.recordRoute({
+      source: { kind: "repository_path", path: "src/client.ts", nodeKind: "symbol" },
+      target: { kind: "external", namespace: "https", name: "api.example.test" },
+      http: {
+        method: "GET",
+        routeTemplate: "/pets?token=fixture-secret-value",
+      },
+    }),
+    false,
+  );
+  assert.equal(
+    collector.recordRpc({
+      source: { kind: "repository_path", path: "src/client.ts", nodeKind: "symbol" },
+      target: { kind: "external", namespace: "https", name: "api.example.test" },
+      http: {
+        method: "POST",
+        routeTemplate: "/rpc/{service}/{method}",
+        format: "protobuf",
+      },
+    } as unknown as Omit<RuntimeObservation, "kind">),
+    false,
+  );
+  const serialized = collector.snapshot()!;
+  const trace = JSON.parse(serialized) as {
+    events: Array<{
+      target: { kind: string; namespace: string; name: string };
+      http: {
+        method: string;
+        route_template: string;
+        format: string;
+        operation: string;
+        contract_locator: string;
+        format_version: string;
+      };
+    }>;
+  };
+  assert.deepEqual(trace.events[0]!.target, {
+    kind: "external",
+    namespace: "https",
+    name: "api.example.test",
+  });
+  assert.deepEqual(trace.events[0]!.http, {
+    method: "GET",
+    route_template: "/pets/{id}",
+    format: "openapi",
+    operation: "get /pets/{id}",
+    contract_locator: "contracts/api.json",
+    format_version: "3.1.0",
+  });
+  assert(!serialized.includes("fixture-user"));
+  assert(!serialized.includes("fixture-password"));
+  assert(!serialized.includes("/private/42"));
+  assert(!serialized.includes("token=opaque"));
+  assert(!serialized.includes("fixture-secret-value"));
+  assert.equal(trace.events.length, 1);
+});
+
 test("shutdown is bounded, idempotent, and never throws sink failures into the app", async () => {
   const fixture = await readFixture("next");
   const collector = createRuntimeCollector({

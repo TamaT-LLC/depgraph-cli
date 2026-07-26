@@ -683,6 +683,7 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "| 5 | Protobuf generated-code mapping | Implemented in #195 |",
         "| 6 | GraphQL SDL and executable-document graph | Implemented in #196 |",
         "| 7 | GraphQL client/resolver repository mapping | Implemented in #197 |",
+        "| 8 | HTTP trace-to-operation correlation | Implemented in #198 |",
         "| 11 | Five-target package/query/release gate | 2-3 days |",
         "## Acceptance matrix",
         "| Safe invariant |",

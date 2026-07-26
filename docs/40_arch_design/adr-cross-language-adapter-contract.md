@@ -393,6 +393,25 @@ exists in the selected profile. Otherwise it emits candidates, external, or
 unresolved evidence. The relation remains `phase=runtime`,
 `precision=observed`.
 
+Runtime trace v1 carries optional `http` metadata containing only an uppercase
+method, canonical route template, optional OpenAPI/Protobuf/GraphQL operation
+coordinate, confined contract locator, and format version. The authority and
+scheme come from the already-redacted external target locator, so this metadata
+cannot reintroduce a URL, query, header, body, or credential. Protobuf and
+GraphQL observations require an explicit operation coordinate; OpenAPI may use
+its unique method/template coordinate.
+
+The correlator admits only a resolved runtime parent profile present in the
+contract profile identity, requires reconstructable static contract evidence,
+and requires the runtime source node to exist in the same contract closure. A
+unique match appends a `calls_operation` site/edge without changing any static
+edge. The runtime evidence binds event, session, environment, authority,
+method, route template, static contract digest, and operation identity. Same
+input/reimport is idempotent; different sessions remain separately
+conditioned. Ambiguous matches, version drift, unmatched profiles/sources, and
+undeclared operations stay in a canonical reasoned outcome ledger without an
+observed edge.
+
 OpenTelemetry HTTP/RPC semantic-convention spans are vendor input, not a core
 contract. A collector adapter must first convert them to the bounded trace v1
 contract.
@@ -443,7 +462,7 @@ one to three engineering days of scope.
 | 5 | Protobuf generated-code mapping | Implemented in #195 | 4 | Descriptor/source-map digests prove language endpoints; naming-only fixtures stay unresolved |
 | 6 | GraphQL SDL and executable-document graph | Implemented in #196 | 1 | Field/message/selection graph is complete for admitted files without introspection |
 | 7 | GraphQL client/resolver repository mapping | Implemented in #197 | 6 | Supported compiler/framework maps prove endpoints; dynamic/federated cases remain ledgered |
-| 8 | HTTP trace-to-operation correlation | 2-3 days | 2, 4 or 6; runtime trace v1 | Unique profile match is observed; ambiguous, raw-URL, and secret fixtures fail closed |
+| 8 | HTTP trace-to-operation correlation | Implemented in #198 | 2, 4 or 6; runtime trace v1 | Unique profile match is observed; ambiguous, raw-URL, and secret fixtures fail closed |
 | 9 | Rust/Go/Web static FFI declaration inventory | 2-3 days | 1 | Every admitted declaration is resolved/candidate/external/unresolved by target profile |
 | 10 | FFI supervised link/export evidence | 2-3 days | 9; build supervisor | Exact ABI/library/symbol mappings require same-profile link evidence and preserve rollback |
 | 11 | Five-target package/query/release gate | 2-3 days | 2-10 implemented capabilities | Linux/macOS/Windows archives attest adapters and pass query, determinism, tamper, SBOM, and license checks |
