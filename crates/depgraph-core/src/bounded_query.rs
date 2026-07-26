@@ -29,6 +29,8 @@ pub enum QueryFailureClass {
     Security,
     Syntax,
     Limit,
+    Binding,
+    Type,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -74,6 +76,27 @@ impl QueryDiagnostic {
             class,
             "input",
             "query_input",
+            QueryOrigin {
+                line: 1,
+                column: 1,
+                byte_offset: 0,
+            },
+            message,
+        )
+    }
+
+    pub(crate) fn semantic(
+        code: &'static str,
+        class: QueryFailureClass,
+        clause: &'static str,
+        token_class: &'static str,
+        message: &'static str,
+    ) -> Self {
+        Self::new(
+            code,
+            class,
+            clause,
+            token_class,
             QueryOrigin {
                 line: 1,
                 column: 1,
