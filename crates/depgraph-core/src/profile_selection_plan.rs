@@ -252,6 +252,7 @@ pub fn build_profile_selection_input(
     inventory: &ProfilePlanningInventory,
     mut context: ProfileSelectionInputContext,
 ) -> Result<ProfileSelectionInput> {
+    let canonical_inventory = canonical_profile_planning_inventory(inventory)?;
     context
         .compatibility_ids
         .sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
@@ -270,6 +271,12 @@ pub fn build_profile_selection_input(
         .language_families
         .sort_by(|left, right| left.as_str().as_bytes().cmp(right.as_str().as_bytes()));
     context.language_families.dedup();
+    let detected_language_families = detected_language_families(&canonical_inventory);
+    if context.language_families != detected_language_families {
+        bail!(
+            "profile selection language_families must exactly match the canonical safe inventory"
+        );
+    }
     context.host_contexts.sort_by(|left, right| {
         host_language(left)
             .as_str()
@@ -329,11 +336,11 @@ pub fn build_profile_selection_input(
         validate_sha256("profile selection-file digest", digest)?;
     }
 
-    let repository = classify_profile_selection_repository(inventory)?;
+    let repository = classify_profile_selection_repository(&canonical_inventory)?;
     let limits = default_profile_selection_limits(repository.size_class);
     Ok(ProfileSelectionInput {
         contract_version: DEFAULT_PROFILE_SELECTION_CONTRACT_VERSION.to_owned(),
-        inventory_digest: profile_selection_inventory_digest(inventory)?,
+        inventory_digest: profile_selection_inventory_digest(&canonical_inventory)?,
         compatibility_ids: context.compatibility_ids,
         language_families: context.language_families,
         host_contexts: context.host_contexts,
@@ -343,6 +350,27 @@ pub fn build_profile_selection_input(
         repository,
         limits,
     })
+}
+
+fn detected_language_families(inventory: &ProfilePlanningInventory) -> Vec<ProfileLanguage> {
+    let mut languages = inventory
+        .build_units
+        .iter()
+        .map(|unit| unit.language)
+        .chain(inventory.files.iter().filter_map(|file| match file.kind {
+            ProfilePlanningFileKind::RustSource => Some(ProfileLanguage::Rust),
+            ProfilePlanningFileKind::GoSource => Some(ProfileLanguage::Go),
+            ProfilePlanningFileKind::WebSource | ProfilePlanningFileKind::FrameworkSource => {
+                Some(ProfileLanguage::Web)
+            }
+            ProfilePlanningFileKind::SchemaSource | ProfilePlanningFileKind::GeneratedSource => {
+                None
+            }
+        }))
+        .collect::<Vec<_>>();
+    languages.sort_by(|left, right| left.as_str().as_bytes().cmp(right.as_str().as_bytes()));
+    languages.dedup();
+    languages
 }
 
 pub fn bound_profile_candidate_discovery(
@@ -798,7 +826,18 @@ mod tests {
 
     #[test]
     fn input_builder_canonicalizes_order_and_binds_every_portable_context() -> Result<()> {
-        let inventory = inventory(2, 1);
+        let mut inventory = inventory(2, 1);
+        inventory.files.push(file(
+            "packages/web/src/index.ts",
+            ProfilePlanningFileKind::WebSource,
+            'b',
+        ));
+        inventory.build_units.push(unit(
+            ProfileLanguage::Web,
+            ProfilePlanningBuildUnitKind::WebWorkspacePackage,
+            "web",
+            "packages/web/package.json",
+        ));
         let context = ProfileSelectionInputContext {
             compatibility_ids: vec![
                 "rust-toolchain:1.93.1".to_owned(),
@@ -855,6 +894,43 @@ mod tests {
                 .contains("filesystem path")
         );
         Ok(())
+    }
+
+    #[test]
+    fn input_builder_rejects_missing_or_fabricated_language_families() {
+        let mut mixed_inventory = inventory(1, 1);
+        mixed_inventory.build_units.push(unit(
+            ProfileLanguage::Go,
+            ProfilePlanningBuildUnitKind::GoPackageVariant,
+            "go-worker",
+            "workers/go/go.mod",
+        ));
+        let context = ProfileSelectionInputContext {
+            compatibility_ids: vec!["depgraph-protocol:1.0".to_owned()],
+            language_families: vec![ProfileLanguage::Rust],
+            host_contexts: vec![ProfileHostContext::Rust(RustHostContext {
+                target: "aarch64-apple-darwin".to_owned(),
+            })],
+            configuration_digest: None,
+            selection_file_digest: None,
+            supported_axes: Vec::new(),
+        };
+        assert!(
+            build_profile_selection_input(&mixed_inventory, context.clone())
+                .unwrap_err()
+                .to_string()
+                .contains("exactly match")
+        );
+
+        let rust_only = inventory(1, 1);
+        let mut fabricated = context;
+        fabricated.language_families.push(ProfileLanguage::Web);
+        assert!(
+            build_profile_selection_input(&rust_only, fabricated)
+                .unwrap_err()
+                .to_string()
+                .contains("exactly match")
+        );
     }
 
     #[test]
