@@ -7,7 +7,7 @@ status: Active
 upstream: []
 downstream: []
 owner: TakehiroT
-updated: 2026-07-25
+updated: 2026-07-26
 ---
 
 # アーキテクチャ設計: Semantic Dependency Graph CLI
@@ -35,6 +35,8 @@ Milestone 2のrelease candidateは`v0.2.0-rc.1`とする。5 targetのnative pac
 Milestone 4のrelease candidateは`v0.4.0-rc.1`とする。protocol / graph schemaは`1.0`、SQLite storeは`11`、scan cache / impact query cache contractは`1`を維持し、公式`v0.2.0-rc.1`が生成したstore schema `5`からcompleted snapshotを失わずに移行する。全5 targetのnative package gateはsnapshot/diff/impact、watcher/incremental、architecture policyとGitHub annotation、packaged `runtime-collector-v1`による実fixture trace生成、runtime trace validate/import/query、GraphML stdout/atomic file exportを検証する。manifestにはcollectorを含むversioned compatibility unitと`milestone4-packaged-smoke-v1`を固定し、aggregate verifierはchecksum、archive、manifest、SBOM、project/third-party license、attestationと同じclosureで再検証する。性能結果、安全境界、migration / rollback、既知制約は[release note](../releases/v0.4.0-rc.1.md)をcanonicalな配布時説明とする。
 
 Milestone 4のstable releaseは`v0.4.0`とする。`stable-release-gate-v1`は公式`v0.4.0-rc.1` packageが生成したschema `11` store fixtureをstable packageでschema `13`へtransactional migrationし、completed graphのintegrity、node / site / edge / evidence、immutable ID、snapshot nameの書込み、rollback backup非変更を検証する。tag workflowは`quality`、versioned 10,000-file `benchmark`、全5 target `package`、aggregate `verify-assets`の成功をdirect dependencyとし、release identity、protocol / store / cache、RC upgrade、performance、safety、framework / collector、license / SBOM / attestation closureを`stable-release-gate.json`へ`allow`または`reject`として出力する。`allow`以外ではpublish jobへ到達しない。0.4.xの互換性promise、GA exit criteria、support matrix、rollback、既知制約の更新規則は[stable release note](../releases/v0.4.0.md)をcanonical contractとする。
+
+Issue #176でgreen確認済みのmain commit `d5ca92bae4b4fdbbedb2f3cabd4aa3ef731e7c9f`を`release-baseline-v1`として固定し、初期`release/0.4` maintenance refと`v0.4.0` tag sourceを同じexact commitへ結び付けた。canonical baseline digest、tree、再現手順、main-first cherry-pick / stable-first forward-portの観測可能な変更フロー、force-push / wholesale merge禁止は[stable release note](../releases/v0.4.0.md)に定める。mainの次版機能は既存defaultへ影響する間default無効または明示opt-inとし、breaking defaultはminor releaseとmigration contractを要求する。baseline sourceはimmutableで新しい自己検証を含められないため、default branchの`workflow_run(requested)` guardが`Release` runのtag / source SHAを照合し、mismatch時はrunをcancelしてinvalid tagを削除する。
 
 Issue #153として`public-readiness-v1`を採用し、repository visibilityの現行判断を`private / reject`へ固定した。public OSS化は、exact candidate commitと全ref、GitHub surface、governance tree、release closureへ結び付くsecret/history、legal/provenance、security/disclosure、governance/community、repository control、release/support、migration rehearsal、incident readinessの全gateが独立承認され、TamaT-LLC organization ownerが明示的に`allow`した場合だけ候補となる。`stable-release-gate-v1`は必要条件だがpublic readinessの十分条件ではない。visibility変更はADRやreadiness recordから自動実行せず、別途明示承認されたchange windowでのみ行う。
 
@@ -1679,6 +1681,27 @@ windowでruleset再構築、security feature有効化、anonymous verification�
 7個の1〜3日準備sliceと8番目のfinal audit / change windowは
 [`PROJ-ARC-001-ADR-006`](adr-public-oss-release-governance.md)に定める。
 
+### ADR-015: Exact Stable Baseline with a Separate Maintenance Line
+
+**採用。** `release-baseline-v1`はrepository、version、exact commitから作るcanonical
+recordをSHA-256へ固定し、commit
+`d5ca92bae4b4fdbbedb2f3cabd4aa3ef731e7c9f`とtree
+`46555a059070e94c3ed4567af3c58b278dbb0fb4`をv0.4.0のimmutable anchorとする。
+初期`release/0.4` refとpeeled `v0.4.0` tagは同じcommitを指す。baseline sourceは
+この決定より前のimmutable commitなので、default branchから実行される
+`workflow_run(requested)` guardが`Release` runのtagとsource SHAを照合する。
+mismatch時はrunをcancelし、invalid tagを削除してpublishをfail closedにする。
+baseline内の`stable-release-gate-v1`はartifact、compatibility、benchmark、job closureを
+引き続き担当する。
+
+mainは次版開発、`release/0.4`は0.4.x保守に分離する。shared fixはmainのreview済み
+commitを`-x`付きcherry-pick PRでstableへ取り込み、urgent stable fixは別PRでmainへ
+forward-portする。mainのwholesale merge、force-push、history rewrite、0.4.x互換性を
+狭めるbackportは禁止する。既存defaultへ影響する次版機能はdefault無効または明示
+opt-inとし、breaking defaultは新minor versionとmigration contractへ送る。canonical
+digest、ref/tag検証、PR記録項目、patch release時も変わらないancestry anchorは
+[v0.4.0 release contract](../releases/v0.4.0.md)に定める。
+
 ## 21. Roadmap
 
 ### Milestone 0: Schema and Contract
@@ -1837,6 +1860,7 @@ windowでruleset再構築、security feature有効化、anonymous verification�
 
 ## 26. 更新履歴
 
+- 2026-07-26: Issue #176としてgreenなmain commit `d5ca92bae4b4fdbbedb2f3cabd4aa3ef731e7c9f`を`release-baseline-v1`へ固定し、initial `release/0.4` ref、v0.4.0 tag source、canonical SHA-256 digest / treeの再現手順を同一anchorへ結び付けた。main-first cherry-pickとstable-first forward-port、wholesale merge / force-push禁止、main次版機能のdefault-disabled / opt-in互換性規則を定義し、default branchのsource guardがbaseline以外のv0.4.0 Release runをcancelしてinvalid tagを削除するtest contractを追加した。
 - 2026-07-25: Issue #153として`public-readiness-v1`を採用し、repository visibilityの現行判断を`private / reject`、accountable ownerをTamaT-LLC organization owner、実行責任をdesignated repository administratorとした。public化はexact candidate commit、audited refs、GitHub settings、governance tree、release/evidence closureに結び付く9 mandatory gateとsecurity / legal / releaseの独立sign-off、organization ownerの明示`allow`を要求する。secret/history/collaboration、dependency/license/provenance、security disclosure、community/governance、maintainer/review/release/support/issue/PR policy、workflow SHA pin、repository controls、migration rehearsal、anonymous verification、incident containmentの実行可能checklistを定義した。`stable-release-gate-v1`は必要条件だが十分条件とせず、readiness recordからvisibilityを自動変更しない。visibility変更を別途明示承認されたchange windowへ分離し、再private化は公開済みcopyを回収できないcontainmentであることを固定した。
 - 2026-07-25: Issue #152として`bounded-graph-query-v1`を採用。既存専用commandを優先したまま、単一completed snapshot、単一linear pattern、明示depth `1..=8`、closed Node / Path / Edge / Site / Evidence type、profile / phase / canonical condition / evidence filter、必須limitへscopeを限定した。endpoint pairごとのcanonical shortest witnessだけを返し、path依存predicateのpartial stateにはexistential充足bitset / used edge setを含めて同一stateだけをdominanceする。複数MATCH、join、subquery、aggregation、mutation、任意再帰、regex、arbitrary property、all-path列挙を除外した。bounded query reader、parse/type、snapshot cardinality、fixed operator / deterministic cost admission、explain、staged all-or-error executor、read-only store、non-echoing diagnosticとresource/security capを定義し、parser / planner / executor / CLI / five-target release gateを6個の1〜3日後続sliceへ分離した。
 - 2026-07-25: Issue #151として`default-profile-selection-v1`を確定。safe inventory / compatibility / attested host / tracked config / planner limitをcanonical inputとし、Rust / Go / Web baselineを優先した後、static evidence付き単一軸candidateだけをgreedy rankingする。repository classはrelevant source / build unitの両閾値でtiny / small / medium / largeへ分類し、default total capを`16 / 10 / 6 / 4`、selection hard capを`32`、candidate discoveryを言語ごと`256`・全体`512`へ固定した。target × feature × mode × environmentの直積、all-features、cgo/VTA、build/runtime profileをauto selectionから除外し、budget omission / overflow / policy exclusionをcoverage / doctor / planへ固定reason付きで残す。将来`profiles plan` / `--profile-budget`とstrict versioned `--profiles-file`、all-or-error explicit semantics、8段階の1〜3日実装計画、polyglot / size-boundary / checkout determinism acceptance matrixをADRへ定めた。

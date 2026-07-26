@@ -378,6 +378,39 @@ reproducible release closure whose commit matches the readiness record.
 Evidence: CI run identities, stable gate and artifact digests, signed tag
 verification, support matrix, and release dry-run results.
 
+### Stable baseline and maintenance line
+
+The first stable release is anchored by `release-baseline-v1` at commit
+`d5ca92bae4b4fdbbedb2f3cabd4aa3ef731e7c9f`. The canonical record and its
+SHA-256 are defined in `docs/releases/v0.4.0.md`. The initial
+`refs/heads/release/0.4` ref points to that exact commit, and the peeled
+`v0.4.0` tag is valid only at the same commit.
+
+`main` remains the next-version development line. A fix shared with 0.4.x
+lands on `main` first and is cherry-picked with `-x` through a distinct pull
+request to `release/0.4`. An urgent stable-first fix is forward-ported through
+a distinct pull request to `main`. Wholesale merges from `main`, force-pushes,
+history rewrites, and backports that narrow the 0.4.x compatibility promise
+are forbidden. Pull requests record the source commit, issue, compatibility
+assessment, and verification so both directions remain auditable.
+
+Next-version work on `main` that could alter an existing default remains
+default-disabled or explicitly opt-in while 0.4.x is supported. A breaking
+default requires a new minor release and migration contract. It does not enter
+the stable line as a patch.
+
+The baseline source predates this decision and cannot contain a new source
+check without changing the immutable commit. A `workflow_run(requested)`
+guard therefore executes from the default branch for the `Release` workflow.
+For `v0.4.0`, it compares `head_sha` with the recorded baseline; a mismatch
+cancels the release run and deletes the invalid tag before the baseline
+workflow can publish it. The baseline's existing `stable-release-gate-v1`
+continues to close artifacts, compatibility, benchmarks, and release jobs.
+Operators also reproduce the documented commit, tree, canonical digest,
+remote maintenance ref, and signed annotated tag before publication. The
+immutable anchor is not redefined when later approved patch commits advance
+`release/0.4`.
+
 ### Gate 8: migration dry run and change window
 
 - [ ] Back up a fresh mirror plus repository metadata/settings exports and
