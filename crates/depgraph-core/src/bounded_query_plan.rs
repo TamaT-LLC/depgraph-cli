@@ -319,7 +319,7 @@ pub fn plan_bounded_query_with_statistics(
     };
     let result_rows = u64::from(query.ast.limit).min(cardinality.endpoint_pairs);
     let row_bytes = projected_row_byte_bound(&query.ast, &statistics, &cardinality);
-    let serialized_output_bytes = add(2, multiply(result_rows, add(row_bytes, 1)));
+    let serialized_output_bytes = uniform_json_array_byte_bound(result_rows, row_bytes);
     let projection_cost = multiply(cardinality.projection_width, u64::from(query.ast.limit));
     let sort_rows = u64::from(query.ast.limit).min(cardinality.endpoint_pairs);
     let sort_cost = multiply(2, sort_rows);
@@ -660,15 +660,19 @@ fn projected_row_byte_bound(
     statistics: &SnapshotCardinalityStatistics,
     cardinality: &QueryCardinalityInputs,
 ) -> u64 {
-    let mut bytes = 2;
-    for projection in &ast.return_clause.projections {
-        bytes = add(
-            bytes,
-            projection_byte_bound(projection, ast, statistics, cardinality),
-        );
-        bytes = add(bytes, 1);
-    }
-    bytes
+    // Result rows have the fixed canonical shape `[projection, ...]`. Projection
+    // labels are therefore not serialized as object keys; the enclosing result
+    // carries the typed projection list through its plan digest.
+    let projection_bytes = ast
+        .return_clause
+        .projections
+        .iter()
+        .map(|projection| projection_byte_bound(projection, ast, statistics, cardinality))
+        .fold(0, add);
+    heterogeneous_json_array_byte_bound(
+        usize_u64(ast.return_clause.projections.len()),
+        projection_bytes,
+    )
 }
 
 fn projection_byte_bound(
@@ -683,15 +687,33 @@ fn projection_byte_bound(
             EntityType::Node => fields.node_entity,
             EntityType::Path => {
                 let depth = u64::from(ast.match_clause.relationship.max_depth);
-                let node_bytes = multiply(add(depth, 1), add(fields.node_entity, 1));
-                let edge_bytes = multiply(depth, add(fields.edge_entity, 1));
-                let site_bytes = multiply(depth, add(fields.site_entity, 1));
                 let evidence_count =
                     multiply(depth, cardinality.maximum_associated_evidence_per_edge);
-                let evidence_bytes = multiply(evidence_count, add(fields.evidence_entity, 1));
-                [64, node_bytes, edge_bytes, site_bytes, evidence_bytes]
-                    .into_iter()
-                    .fold(0, add)
+                json_object_byte_bound(&[
+                    ("id", stable_id_json_byte_bound("query-path")),
+                    ("depth", json_bytes(&json!(depth))),
+                    (
+                        "direction",
+                        json_bytes(&json!(QueryDirection::Forward))
+                            .max(json_bytes(&json!(QueryDirection::Reverse))),
+                    ),
+                    (
+                        "nodes",
+                        uniform_json_array_byte_bound(add(depth, 1), fields.node_entity),
+                    ),
+                    (
+                        "edges",
+                        uniform_json_array_byte_bound(depth, fields.edge_entity),
+                    ),
+                    (
+                        "sites",
+                        uniform_json_array_byte_bound(depth, fields.site_entity),
+                    ),
+                    (
+                        "evidence",
+                        uniform_json_array_byte_bound(evidence_count, fields.evidence_entity),
+                    ),
+                ])
             }
             _ => 4,
         },
@@ -1125,6 +1147,34 @@ fn json_bytes(value: &Value) -> u64 {
     )
 }
 
+fn stable_id_json_byte_bound(namespace: &str) -> u64 {
+    json_bytes(&Value::String(format!(
+        "{namespace}:sha256:{}",
+        "0".repeat(64)
+    )))
+}
+
+fn heterogeneous_json_array_byte_bound(item_count: u64, item_bytes: u64) -> u64 {
+    add(add(2, item_bytes), item_count.saturating_sub(1))
+}
+
+fn uniform_json_array_byte_bound(item_count: u64, item_byte_bound: u64) -> u64 {
+    heterogeneous_json_array_byte_bound(item_count, multiply(item_count, item_byte_bound))
+}
+
+fn json_object_byte_bound(fields: &[(&str, u64)]) -> u64 {
+    let members = fields
+        .iter()
+        .map(|(key, value_bytes)| {
+            add(
+                add(json_bytes(&Value::String((*key).to_owned())), 1),
+                *value_bytes,
+            )
+        })
+        .fold(0, add);
+    add(add(2, members), usize_u64(fields.len()).saturating_sub(1))
+}
+
 fn sort_values(values: &mut [Value]) {
     values.sort_by_cached_key(|value| {
         serde_json::to_vec(value).expect("closed bounded query graph serialization cannot fail")
@@ -1365,6 +1415,89 @@ mod tests {
         assert_eq!(small.bounds.traversal_states, large.bounds.traversal_states);
         assert_eq!(small.bounds.edge_tests, large.bounds.edge_tests);
         assert!(small.bounds.serialized_output_bytes < large.bounds.serialized_output_bytes);
+    }
+
+    #[test]
+    fn projected_path_json_never_exceeds_the_planned_serialized_byte_bound() {
+        let mut selected = snapshot(false);
+        let maximum = "x".repeat(512);
+        for node in &mut selected.nodes {
+            node.id = format!("node:{maximum}");
+            node.locator = format!("locator:{maximum}");
+            node.display_name = maximum.clone();
+        }
+        selected.edges[0].id = format!("edge:{maximum}");
+        selected.edges[0].profile_id = format!("profile:{maximum}");
+        selected.edges[0].condition = json!({"all":[{"value":maximum}]});
+        selected.sites[0].id = format!("site:{maximum}");
+        selected.sites[0].specifier = Some(maximum.clone());
+        selected.sites[0].profile_id = format!("profile:{maximum}");
+        selected.sites[0].condition = json!({"all":[{"value":maximum}]});
+        selected.evidence[0].owner_id = selected.edges[0].id.clone();
+        selected.evidence[0].path = format!("src/{maximum}.rs");
+        let mut site_evidence = selected.evidence[0].clone();
+        site_evidence.owner_type = "site".into();
+        site_evidence.owner_id = selected.sites[0].id.clone();
+        selected.evidence.push(site_evidence);
+
+        let depth = 8_u8;
+        let typed = query(1, depth, "");
+        let plan = plan_bounded_query(&typed, "snapshot:stable", &selected).unwrap();
+        let statistics = &plan.snapshot_statistics.closed_field_byte_bounds;
+        let largest_node = selected
+            .nodes
+            .iter()
+            .map(super::closed_node)
+            .max_by_key(super::json_bytes)
+            .unwrap();
+        let largest_edge = selected
+            .edges
+            .iter()
+            .map(super::closed_edge)
+            .max_by_key(super::json_bytes)
+            .unwrap();
+        let largest_site = selected
+            .sites
+            .iter()
+            .map(super::closed_site)
+            .max_by_key(super::json_bytes)
+            .unwrap();
+        let largest_evidence = selected
+            .evidence
+            .iter()
+            .map(super::closed_evidence)
+            .max_by_key(super::json_bytes)
+            .unwrap();
+        assert_eq!(super::json_bytes(&largest_node), statistics.node_entity);
+        assert_eq!(super::json_bytes(&largest_edge), statistics.edge_entity);
+        assert_eq!(super::json_bytes(&largest_site), statistics.site_entity);
+        assert_eq!(
+            super::json_bytes(&largest_evidence),
+            statistics.evidence_entity
+        );
+
+        let depth = u64::from(depth);
+        let evidence_count = depth * plan.cardinality_inputs.maximum_associated_evidence_per_edge;
+        let path = json!({
+            "id": format!("query-path:sha256:{}", "f".repeat(64)),
+            "depth": depth,
+            "direction": "forward",
+            "nodes": vec![largest_node; usize::try_from(depth + 1).unwrap()],
+            "edges": vec![largest_edge; usize::try_from(depth).unwrap()],
+            "sites": vec![largest_site; usize::try_from(depth).unwrap()],
+            "evidence": vec![
+                largest_evidence;
+                usize::try_from(evidence_count).unwrap()
+            ],
+        });
+        let row = json!([selected.nodes[0].id, selected.nodes[1].id, path,]);
+        let actual_rows = json!([row]);
+        assert!(
+            super::json_bytes(&actual_rows) <= plan.bounds.serialized_output_bytes,
+            "actual={} planned={}",
+            super::json_bytes(&actual_rows),
+            plan.bounds.serialized_output_bytes
+        );
     }
 
     #[test]
