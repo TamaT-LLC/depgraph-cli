@@ -370,7 +370,14 @@
     "webAxes": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["language", "mode", "environments"],
+      "required": [
+        "language",
+        "mode",
+        "environments",
+        "bundled_typescript_compatibility_id",
+        "package_snapshot_id",
+        "framework_capability_ids"
+      ],
       "properties": {
         "language": {
           "const": "web"
@@ -385,6 +392,23 @@
           "uniqueItems": true,
           "items": {
             "enum": ["browser", "server", "edge", "worker"]
+          }
+        },
+        "bundled_typescript_compatibility_id": {
+          "type": "string",
+          "pattern": "^web-typescript-compatibility:sha256:[0-9a-f]{64}$"
+        },
+        "package_snapshot_id": {
+          "type": "string",
+          "pattern": "^web-package-snapshot:sha256:[0-9a-f]{64}$"
+        },
+        "framework_capability_ids": {
+          "type": "array",
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^web-framework-capability:sha256:[0-9a-f]{64}$"
           }
         }
       }

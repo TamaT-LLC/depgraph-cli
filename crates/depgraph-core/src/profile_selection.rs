@@ -207,7 +207,7 @@ impl WebEnvironment {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WebProfileMode {
     Production,
@@ -251,6 +251,9 @@ pub struct GoProfileAxes {
 pub struct WebProfileAxes {
     pub mode: WebProfileMode,
     pub environments: Vec<WebEnvironment>,
+    pub bundled_typescript_compatibility_id: String,
+    pub package_snapshot_id: String,
+    pub framework_capability_ids: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -287,6 +290,9 @@ impl CanonicalProfileAxes {
                 axes.environments
                     .sort_by(|left, right| left.as_str().as_bytes().cmp(right.as_str().as_bytes()));
                 axes.environments.dedup();
+                axes.framework_capability_ids
+                    .sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+                axes.framework_capability_ids.dedup();
             }
         }
         normalized
@@ -853,6 +859,21 @@ pub(crate) fn validate_profile(profile: &ProfileSelectionProfile) -> Result<()> 
             if axes.environments.is_empty() {
                 bail!("Web environments must not be empty");
             }
+            validate_stable_id(
+                "Web bundled TypeScript compatibility id",
+                &axes.bundled_typescript_compatibility_id,
+                "web-typescript-compatibility",
+            )?;
+            validate_stable_id(
+                "Web package snapshot id",
+                &axes.package_snapshot_id,
+                "web-package-snapshot",
+            )?;
+            validate_sorted_unique_stable_ids(
+                "Web framework capability ids",
+                &axes.framework_capability_ids,
+                "web-framework-capability",
+            )?;
             validate_sorted_by("Web environments", &axes.environments, |environment| {
                 environment.as_str().to_owned()
             })?;
@@ -991,6 +1012,14 @@ fn changed_axes(
             }
             if left.environments != right.environments {
                 changed.push(ProfileAxis::Environment);
+            }
+            if left.bundled_typescript_compatibility_id != right.bundled_typescript_compatibility_id
+                || left.package_snapshot_id != right.package_snapshot_id
+                || left.framework_capability_ids != right.framework_capability_ids
+            {
+                bail!(
+                    "TypeScript, package-snapshot, and framework-capability changes are not automatic profile alternatives"
+                );
             }
         }
         _ => bail!("candidate and baseline profiles must use the same language"),
