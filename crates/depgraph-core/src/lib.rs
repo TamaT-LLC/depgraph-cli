@@ -133,7 +133,7 @@ pub use impact::{
 pub use incremental::{
     INCREMENTAL_PLAN_SCHEMA_VERSION, IncrementalChangeKind, IncrementalFileChange,
     IncrementalInvalidationMode, IncrementalInvalidationPlan, IncrementalInvalidationReason,
-    plan_incremental_invalidation,
+    plan_incremental_invalidation, snapshot_profile_plan_id,
 };
 pub use policy::{
     AppliedPolicySuppression, POLICY_RESULT_SCHEMA_VERSION, POLICY_SCHEMA, POLICY_SCHEMA_VERSION,
@@ -415,6 +415,7 @@ pub struct ReleaseCompatibilityHealth {
     pub graphml_schema_version: String,
     pub packaged_smoke_contract: String,
     pub bounded_query: BoundedQueryReleaseCompatibilityHealth,
+    pub profile_selection: ProfileSelectionReleaseCompatibilityHealth,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -429,6 +430,49 @@ pub struct BoundedQueryReleaseCompatibilityHealth {
     pub result_schema_version: String,
     pub fixture_path: String,
     pub fixture_sha256: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProfileSelectionReleaseCompatibilityHealth {
+    pub release_smoke_contract_version: String,
+    pub selection_contract_version: String,
+    pub limit_version: String,
+    pub inventory_version: String,
+    pub rust_planning_version: String,
+    pub go_planning_version: String,
+    pub web_planning_version: String,
+    pub automatic_schema_path: String,
+    pub automatic_schema_sha256: String,
+    pub explicit_schema_path: String,
+    pub explicit_schema_sha256: String,
+}
+
+pub fn profile_selection_release_compatibility_contract()
+-> ProfileSelectionReleaseCompatibilityHealth {
+    use sha2::{Digest as _, Sha256};
+
+    ProfileSelectionReleaseCompatibilityHealth {
+        release_smoke_contract_version: "profile-selection-release-smoke-v1".to_owned(),
+        selection_contract_version: DEFAULT_PROFILE_SELECTION_CONTRACT_VERSION.to_owned(),
+        limit_version: DEFAULT_PROFILE_SELECTION_LIMIT_VERSION.to_owned(),
+        inventory_version: PROFILE_SELECTION_INVENTORY_VERSION.to_owned(),
+        rust_planning_version: RUST_PROFILE_PLANNING_VERSION.to_owned(),
+        go_planning_version: GO_PROFILE_PLANNING_VERSION.to_owned(),
+        web_planning_version: profile_selection_web::WEB_PROFILE_PLANNING_VERSION.to_owned(),
+        automatic_schema_path: DEFAULT_PROFILE_SELECTION_SCHEMA_PATH.to_owned(),
+        automatic_schema_sha256: format!(
+            "sha256:{}",
+            hex::encode(Sha256::digest(DEFAULT_PROFILE_SELECTION_SCHEMA.as_bytes()))
+        ),
+        explicit_schema_path: EXPLICIT_PROFILE_SELECTION_FILE_SCHEMA_PATH.to_owned(),
+        explicit_schema_sha256: format!(
+            "sha256:{}",
+            hex::encode(Sha256::digest(
+                EXPLICIT_PROFILE_SELECTION_FILE_SCHEMA.as_bytes()
+            ))
+        ),
+    }
 }
 
 pub fn bounded_query_release_compatibility_contract() -> BoundedQueryReleaseCompatibilityHealth {
@@ -475,6 +519,7 @@ pub fn release_compatibility_contract() -> ReleaseCompatibilityHealth {
         graphml_schema_version: GRAPHML_SCHEMA_VERSION.to_owned(),
         packaged_smoke_contract: "stable-v0.4.0-packaged-smoke-v1".to_owned(),
         bounded_query: bounded_query_release_compatibility_contract(),
+        profile_selection: profile_selection_release_compatibility_contract(),
     }
 }
 
@@ -1060,6 +1105,17 @@ mod tests {
         collector_drifted.runtime_collector_contract_version = "runtime-collector-v2".to_owned();
         assert!(
             verify_release_compatibility(&collector_drifted)
+                .unwrap_err()
+                .to_string()
+                .contains("does not match")
+        );
+
+        let mut profile_selection_drifted = compatible.clone();
+        profile_selection_drifted
+            .profile_selection
+            .selection_contract_version = "default-profile-selection-v2".to_owned();
+        assert!(
+            verify_release_compatibility(&profile_selection_drifted)
                 .unwrap_err()
                 .to_string()
                 .contains("does not match")

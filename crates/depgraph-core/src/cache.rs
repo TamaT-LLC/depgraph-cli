@@ -55,6 +55,7 @@ pub(crate) fn prepare_scan_cache(
     config: &Config,
     workers: &[(AdapterKind, WorkerSpec)],
     store_path: Option<&Path>,
+    profile_plan_id: &str,
 ) -> ScanCachePreparation {
     let inventory = match fingerprint_inventory(root, store_path) {
         Ok(value) => value,
@@ -106,6 +107,7 @@ pub(crate) fn prepare_scan_cache(
                 "profile".to_owned(),
                 digest_serialized("profile-v1", &config.profiles),
             ),
+            ("profile_plan".to_owned(), profile_plan_id.to_owned()),
             ("syntax_key".to_owned(), syntax.key.clone()),
             ("toolchain_framework".to_owned(), toolchain),
         ]),
@@ -520,9 +522,13 @@ mod tests {
         fs::write(root.path().join(".depgraph.toml"), "schema_version = 1\n").unwrap();
         let mut first = Config::default();
         let mut second = Config::default();
-        let ScanCachePreparation::Ready(first_plan) =
-            prepare_scan_cache(root.path(), &first, &[], None)
-        else {
+        let ScanCachePreparation::Ready(first_plan) = prepare_scan_cache(
+            root.path(),
+            &first,
+            &[],
+            None,
+            &format!("profile-selection-plan:sha256:{}", "1".repeat(64)),
+        ) else {
             panic!("first cache plan must be available");
         };
         second.profiles.rust_features.push("serde".to_owned());
@@ -531,9 +537,13 @@ mod tests {
             "schema_version = 1\n[profiles]\nrust_features = ['serde']\n",
         )
         .unwrap();
-        let ScanCachePreparation::Ready(second_plan) =
-            prepare_scan_cache(root.path(), &second, &[], None)
-        else {
+        let ScanCachePreparation::Ready(second_plan) = prepare_scan_cache(
+            root.path(),
+            &second,
+            &[],
+            None,
+            &format!("profile-selection-plan:sha256:{}", "2".repeat(64)),
+        ) else {
             panic!("second cache plan must be available");
         };
         assert_eq!(first_plan.syntax.key, second_plan.syntax.key);
@@ -543,9 +553,13 @@ mod tests {
         );
 
         first.scan.max_stderr_bytes += 1;
-        let ScanCachePreparation::Ready(scan_changed) =
-            prepare_scan_cache(root.path(), &first, &[], None)
-        else {
+        let ScanCachePreparation::Ready(scan_changed) = prepare_scan_cache(
+            root.path(),
+            &first,
+            &[],
+            None,
+            &format!("profile-selection-plan:sha256:{}", "1".repeat(64)),
+        ) else {
             panic!("changed scan cache plan must be available");
         };
         assert_ne!(first_plan.syntax.key, scan_changed.syntax.key);
@@ -559,15 +573,48 @@ mod tests {
             "module example.test/app\n\nrequire example.test/dep v1.0.0\n",
         )
         .unwrap();
-        let ScanCachePreparation::Ready(plan) =
-            prepare_scan_cache(root.path(), &Config::default(), &[], None)
-        else {
+        let ScanCachePreparation::Ready(plan) = prepare_scan_cache(
+            root.path(),
+            &Config::default(),
+            &[],
+            None,
+            &format!("profile-selection-plan:sha256:{}", "1".repeat(64)),
+        ) else {
             panic!("syntax cache must remain available");
         };
         assert!(plan.semantic.is_none());
         assert_eq!(
             plan.semantic_reject_reason,
             Some("dependency-fingerprint-requires-rescan")
+        );
+    }
+
+    #[test]
+    fn profile_plan_identity_invalidates_only_the_semantic_cache_layer() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("lib.rs"), "pub fn fixture() {}\n").unwrap();
+        let first_id = format!("profile-selection-plan:sha256:{}", "1".repeat(64));
+        let second_id = format!("profile-selection-plan:sha256:{}", "2".repeat(64));
+        let ScanCachePreparation::Ready(first) =
+            prepare_scan_cache(root.path(), &Config::default(), &[], None, &first_id)
+        else {
+            panic!("first cache plan must be available");
+        };
+        let ScanCachePreparation::Ready(second) =
+            prepare_scan_cache(root.path(), &Config::default(), &[], None, &second_id)
+        else {
+            panic!("second cache plan must be available");
+        };
+        assert_eq!(first.syntax, second.syntax);
+        assert_ne!(first.semantic, second.semantic);
+        assert_eq!(
+            first
+                .semantic
+                .as_ref()
+                .unwrap()
+                .dimensions
+                .get("profile_plan"),
+            Some(&first_id)
         );
     }
 }

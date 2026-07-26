@@ -163,13 +163,21 @@ pub fn plan_repository_profiles(
             axis: *axis,
         }));
     }
-    let configuration_digest = config_digest(config)?;
+    let configuration_digest = profile_config_digest(&config.profiles)?;
+    let release_contract = crate::profile_selection_release_compatibility_contract();
     let mut input = build_profile_selection_input(
         &inventory,
         ProfileSelectionInputContext {
             compatibility_ids: vec![
                 format!("depgraph-core:{}", env!("CARGO_PKG_VERSION")),
                 DEFAULT_PROFILE_SELECTION_CONTRACT_VERSION.to_owned(),
+                release_contract.limit_version,
+                release_contract.inventory_version,
+                release_contract.rust_planning_version,
+                release_contract.go_planning_version,
+                release_contract.web_planning_version,
+                release_contract.automatic_schema_sha256,
+                release_contract.explicit_schema_sha256,
             ],
             language_families: language_families.clone(),
             host_contexts,
@@ -586,7 +594,7 @@ fn manifest_path(path: &str) -> bool {
     path.ends_with("Cargo.toml") || path.ends_with("go.mod") || path.ends_with("package.json")
 }
 
-fn config_digest(config: &Config) -> Result<String> {
+fn profile_config_digest(config: &crate::config::ProfileConfig) -> Result<String> {
     let bytes = toml::to_string(config).context("failed to canonicalize profile configuration")?;
     Ok(format!(
         "sha256:{}",
@@ -744,6 +752,24 @@ mod tests {
                 .to_string()
                 .contains("entry-count")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn only_profile_configuration_changes_the_profile_planning_identity() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        fixture(root.path())?;
+        let baseline = plan_repository_profiles(root.path(), &Config::default(), None)?;
+
+        let mut scan_only = Config::default();
+        scan_only.scan.max_stderr_bytes += 1;
+        let scan_only = plan_repository_profiles(root.path(), &scan_only, None)?;
+        assert_eq!(baseline.plan.plan_id, scan_only.plan.plan_id);
+
+        let mut profile = Config::default();
+        profile.profiles.rust_targets = vec!["wasm32-wasip1".to_owned()];
+        let profile = plan_repository_profiles(root.path(), &profile, None)?;
+        assert_ne!(baseline.plan.plan_id, profile.plan.plan_id);
         Ok(())
     }
 }
