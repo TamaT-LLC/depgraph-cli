@@ -822,7 +822,7 @@ fn validate_input(input: &ProfileSelectionInput) -> Result<()> {
     Ok(())
 }
 
-fn validate_profile(profile: &ProfileSelectionProfile) -> Result<()> {
+pub(crate) fn validate_profile(profile: &ProfileSelectionProfile) -> Result<()> {
     validate_stable_id("profile id", &profile.id, "profile")?;
     match &profile.axes {
         CanonicalProfileAxes::Rust(axes) => {
@@ -861,7 +861,7 @@ fn validate_profile(profile: &ProfileSelectionProfile) -> Result<()> {
     Ok(())
 }
 
-fn validate_candidate(candidate: &ProfileCandidateRecord) -> Result<()> {
+pub(crate) fn validate_candidate(candidate: &ProfileCandidateRecord) -> Result<()> {
     validate_stable_id("candidate id", &candidate.id, "profile-candidate")?;
     validate_stable_id("candidate profile_id", &candidate.profile_id, "profile")?;
     validate_stable_id(
@@ -893,7 +893,7 @@ fn validate_candidate(candidate: &ProfileCandidateRecord) -> Result<()> {
     Ok(())
 }
 
-fn validate_candidate_relationship<'a>(
+pub(crate) fn validate_candidate_relationship<'a>(
     selection_mode: ProfileSelectionMode,
     candidate: &ProfileCandidateRecord,
     candidates: &BTreeMap<&'a str, &'a ProfileCandidateRecord>,
