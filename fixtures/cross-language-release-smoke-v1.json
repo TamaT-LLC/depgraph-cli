@@ -1,0 +1,29 @@
+{
+  "schema_version": "cross-language-release-fixture-v1",
+  "files": [
+    {
+      "path": "client.depgraph-openapi-generated.json",
+      "content": "{\"schema_version\":\"depgraph-openapi-generated-mapping-v1\",\"generator\":{\"name\":\"openapi-generator\",\"version\":\"7.10.0\"},\"contract\":{\"path\":\"openapi.json\",\"digest\":\"sha256:41250b92f14a79d3aeb2df6706aa2fbb563f0bbd8a1abe5e95c0f8eadf271b92\",\"format_version\":\"3.1.1\"},\"mappings\":[{\"language\":\"rust\",\"role\":\"client\",\"operation\":\"get /pets/{id}\",\"output\":\"src/client.rs\",\"output_digest\":\"sha256:1c92776c0aecba934f6a49c854469bb9416356b63a2bf523c0c8016b6b65161a\",\"symbol\":\"client::get_pet\",\"start_line\":1,\"start_column\":1,\"end_line\":1,\"end_column\":20}]}"
+    },
+    {
+      "path": "native.rs",
+      "content": "#[link(name = \"crypto\")]\nunsafe extern \"C\" {\n    fn digest();\n}\n"
+    },
+    {
+      "path": "openapi.json",
+      "content": "{\"openapi\":\"3.1.1\",\"info\":{\"title\":\"Pets\"},\"paths\":{\"/pets/{id}\":{\"get\":{\"responses\":{\"200\":{\"description\":\"ok\"}}}}}}"
+    },
+    {
+      "path": "schema.graphql",
+      "content": "type Query { pet(id: ID!): Pet } type Pet { id: ID! } query GetPet { pet(id: \"redacted\") { id } }\n"
+    },
+    {
+      "path": "service.proto",
+      "content": "syntax = \"proto3\"; package shop.v1; service Pets { rpc GetPet (GetPetRequest) returns (GetPetResponse); } message GetPetRequest {} message GetPetResponse {}\n"
+    },
+    {
+      "path": "src/client.rs",
+      "content": "pub fn get_pet() {}"
+    }
+  ]
+}

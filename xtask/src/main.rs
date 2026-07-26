@@ -29,6 +29,8 @@ const STABLE_UPGRADE_SOURCE_STORE_SCHEMA_VERSION: i64 = 11;
 const BENCHMARK_REPORT_SCHEMA_VERSION: &str = "depgraph-benchmark-report-v5";
 const BOUNDED_QUERY_PACKAGE_SMOKE_SCHEMA_VERSION: &str = "package-analysis-smoke-v2";
 const BOUNDED_QUERY_SBOM_PACKAGE_NAME: &str = "depgraph-bounded-query-contract";
+const CROSS_LANGUAGE_PACKAGE_SMOKE_SCHEMA_VERSION: &str = "cross-language-package-smoke-v1";
+const CROSS_LANGUAGE_SBOM_PACKAGE_NAME: &str = "depgraph-cross-language-contract";
 const PROJECT_LICENSE_EXPRESSION: &str = "MIT OR Apache-2.0";
 const PROJECT_LICENSES: &[(&str, &[u8])] = &[
     ("LICENSE-APACHE", include_bytes!("../../LICENSE-APACHE")),
@@ -143,6 +145,8 @@ struct ReleaseManifest {
     core: Artifact,
     schema: Artifact,
     query_fixture: Artifact,
+    cross_language_fixture: Artifact,
+    cross_language_schemas: Vec<Artifact>,
     runtime_artifacts: Vec<Artifact>,
     runtime_components: Vec<RuntimeComponent>,
     workers: Vec<WorkerArtifact>,
@@ -330,6 +334,11 @@ struct TargetVerificationReport {
     query_output_sha256: String,
     profile_plan_digest: String,
     profile_plan_output_sha256: String,
+    cross_language_smoke_sha256: String,
+    cross_language_graph_digest: String,
+    cross_language_export_sha256: String,
+    cross_language_query_sha256: String,
+    cross_language_schemas: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -345,6 +354,38 @@ struct BoundedQueryPackageSmokeReport {
     profile_contract: depgraph_core::ProfileSelectionReleaseCompatibilityHealth,
     profile_plan_digest: String,
     profile_canonical_output_sha256: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct CrossLanguagePackageSmokeReport {
+    schema_version: String,
+    target: String,
+    contract: depgraph_core::CrossLanguageReleaseCompatibilityHealth,
+    graph_digest: String,
+    canonical_export_sha256: String,
+    query_output_sha256: String,
+}
+
+struct PublishedSmokeReports<'a> {
+    query: &'a BoundedQueryPackageSmokeReport,
+    query_sha256: String,
+    cross_language: &'a CrossLanguagePackageSmokeReport,
+    cross_language_sha256: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CrossLanguageReleaseFixture {
+    schema_version: String,
+    files: Vec<CrossLanguageReleaseFixtureFile>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CrossLanguageReleaseFixtureFile {
+    path: String,
+    content: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -686,7 +727,7 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "| 8 | HTTP trace-to-operation correlation | Implemented in #198 |",
         "| 9 | Rust/Go/Web static FFI declaration inventory | Implemented in #199 |",
         "| 10 | FFI supervised link/export evidence | Implemented in #200 |",
-        "| 11 | Five-target package/query/release gate | 2-3 days |",
+        "| 11 | Five-target package/query/release gate | Implemented in #201 |",
         "## Acceptance matrix",
         "| Safe invariant |",
         "## Security and release gates",
@@ -1022,6 +1063,7 @@ fn package() -> Result<()> {
     fs::create_dir_all(staging.join("libexec"))?;
     fs::create_dir_all(staging.join("schemas"))?;
     fs::create_dir_all(staging.join("queries"))?;
+    fs::create_dir_all(staging.join("fixtures"))?;
 
     let mut project_licenses = Vec::new();
     for (path, _) in PROJECT_LICENSES {
@@ -1078,6 +1120,26 @@ fn package() -> Result<()> {
         Path::new(depgraph_core::BOUNDED_QUERY_RELEASE_SMOKE_FIXTURE_PATH),
         &query_fixture_path,
     )?;
+    let cross_language_contract = depgraph_core::cross_language_release_compatibility_contract();
+    let cross_language_fixture_path =
+        staging.join(depgraph_core::CROSS_LANGUAGE_RELEASE_SMOKE_FIXTURE_PATH);
+    copy(
+        Path::new(depgraph_core::CROSS_LANGUAGE_RELEASE_SMOKE_FIXTURE_PATH),
+        &cross_language_fixture_path,
+    )?;
+    let cross_language_schemas = cross_language_contract
+        .schemas
+        .iter()
+        .map(|schema| {
+            let source = Path::new(&schema.path);
+            let destination = staging.join(&schema.path);
+            copy(source, &destination)?;
+            Ok(Artifact {
+                path: schema.path.clone(),
+                sha256: sha256_file(&destination)?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
     let rust_sysroot_component = prepare_rust_sysroot_component(&staging)?;
     let rust_sysroot_sha256 = rust_sysroot_component.sha256.clone();
 
@@ -1123,6 +1185,11 @@ fn package() -> Result<()> {
             path: relative_slash(&staging, &query_fixture_path)?,
             sha256: sha256_file(&query_fixture_path)?,
         },
+        cross_language_fixture: Artifact {
+            path: relative_slash(&staging, &cross_language_fixture_path)?,
+            sha256: sha256_file(&cross_language_fixture_path)?,
+        },
+        cross_language_schemas,
         runtime_artifacts: WEB_RUNTIME_ARTIFACTS
             .iter()
             .map(|name| {
@@ -1178,10 +1245,14 @@ fn package() -> Result<()> {
     )?;
 
     let archive = create_archive(dist, &name)?;
-    let query_smoke = verify_archive(&archive, &name)?;
+    let (query_smoke, cross_language_smoke) = verify_archive(&archive, &name)?;
     fs::write(
         dist.join(format!("{name}.query-smoke.json")),
         format!("{}\n", serde_json::to_string_pretty(&query_smoke)?),
+    )?;
+    fs::write(
+        dist.join(format!("{name}.cross-language-smoke.json")),
+        format!("{}\n", serde_json::to_string_pretty(&cross_language_smoke)?),
     )?;
     let checksum = sha256_file(&archive)?;
     fs::write(
@@ -1521,6 +1592,11 @@ fn third_party_licenses(target: &str) -> Result<String> {
         depgraph_core::BOUNDED_QUERY_RELEASE_SMOKE_FIXTURE_PATH,
         depgraph_core::BOUNDED_QUERY_RELEASE_SMOKE_CONTRACT_VERSION,
     ));
+    notices.push(format!(
+        "First-party cross-language contract fixture {} ({}) is licensed under {PROJECT_LICENSE_EXPRESSION} by LICENSE-MIT and LICENSE-APACHE.",
+        depgraph_core::CROSS_LANGUAGE_RELEASE_SMOKE_FIXTURE_PATH,
+        depgraph_core::CROSS_LANGUAGE_RELEASE_SMOKE_CONTRACT_VERSION,
+    ));
     let notices = notices.join("\n");
     let rust_notice = rust_sysroot_license_notice();
     let mut output = format!(
@@ -1537,6 +1613,16 @@ fn rust_sysroot_license_notice() -> String {
     format!(
         "Rust standard-library source {RUST_SYSROOT_COMPONENT_VERSION} (rustc commit {RUST_SYSROOT_TOOLCHAIN_COMMIT}) — {RUST_SYSROOT_LICENSE_EXPRESSION}; complete COPYRIGHT, LICENSE-MIT, and LICENSE-APACHE texts are packaged under {RUST_SYSROOT_COMPONENT_ROOT}."
     )
+}
+
+fn cross_language_contract_sha256(
+    contract: &depgraph_core::CrossLanguageReleaseCompatibilityHealth,
+) -> String {
+    let value = serde_json::to_value(contract)
+        .expect("cross-language release compatibility is always serializable");
+    hex::encode(Sha256::digest(
+        depgraph_protocol::canonical_json(&value).as_bytes(),
+    ))
 }
 
 fn sbom(target: &str, rust_sysroot_sha256: &str) -> Result<Value> {
@@ -1634,6 +1720,35 @@ fn sbom(target: &str, rust_sysroot_sha256: &str) -> Result<Value> {
             "comment":query_contract_comment
         }),
     );
+    let cross_language_contract = depgraph_core::cross_language_release_compatibility_contract();
+    let cross_language_package_id = format!(
+        "SPDXRef-Package-{}",
+        spdx_component(CROSS_LANGUAGE_SBOM_PACKAGE_NAME)
+    );
+    packages.insert(
+        1,
+        json!({
+            "SPDXID":cross_language_package_id,
+            "name":CROSS_LANGUAGE_SBOM_PACKAGE_NAME,
+            "versionInfo":cross_language_contract.release_smoke_contract_version,
+            "filesAnalyzed":false,
+            "licenseConcluded":"NOASSERTION",
+            "licenseDeclared":PROJECT_LICENSE_EXPRESSION,
+            "downloadLocation":"NOASSERTION",
+            "checksums":[{
+                "algorithm":"SHA256",
+                "checksumValue":cross_language_contract_sha256(&cross_language_contract)
+            }],
+            "comment":format!(
+                "First-party cross-language contract: {}; completeness {}; capabilities {}; schemas {}; fixture {}",
+                cross_language_contract.contract_version,
+                cross_language_contract.completeness_version,
+                cross_language_contract.capabilities.len(),
+                cross_language_contract.schemas.len(),
+                cross_language_contract.fixture_path,
+            )
+        }),
+    );
     let rust_sysroot_id = format!(
         "SPDXRef-Package-{}",
         spdx_component(RUST_SYSROOT_SBOM_PACKAGE_NAME)
@@ -1705,6 +1820,11 @@ fn sbom(target: &str, rust_sysroot_sha256: &str) -> Result<Value> {
             "spdxElementId":"SPDXRef-Package-depgraph",
             "relationshipType":"CONTAINS",
             "relatedSpdxElement":query_package_id
+        }),
+        json!({
+            "spdxElementId":"SPDXRef-Package-depgraph",
+            "relationshipType":"CONTAINS",
+            "relatedSpdxElement":cross_language_package_id
         }),
     ];
     relationships.extend(first_party_ids.into_iter().map(|(id, _)| {
@@ -1890,6 +2010,65 @@ fn verify_bounded_query_sbom(sbom: &Value, context: &str) -> Result<()> {
         .unwrap_or_default();
     if contains != 1 {
         bail!("{context} SBOM does not contain the bounded query contract from the root package");
+    }
+    Ok(())
+}
+
+fn verify_cross_language_sbom(
+    sbom: &Value,
+    contract: &depgraph_core::CrossLanguageReleaseCompatibilityHealth,
+    context: &str,
+) -> Result<()> {
+    let packages = sbom["packages"]
+        .as_array()
+        .with_context(|| format!("{context} SBOM has no packages"))?;
+    let matches = packages
+        .iter()
+        .filter(|package| package["name"] == CROSS_LANGUAGE_SBOM_PACKAGE_NAME)
+        .collect::<Vec<_>>();
+    if matches.len() != 1 {
+        bail!("{context} SBOM must contain exactly one cross-language contract package");
+    }
+    let expected_id = format!(
+        "SPDXRef-Package-{}",
+        spdx_component(CROSS_LANGUAGE_SBOM_PACKAGE_NAME)
+    );
+    let expected_comment = format!(
+        "First-party cross-language contract: {}; completeness {}; capabilities {}; schemas {}; fixture {}",
+        contract.contract_version,
+        contract.completeness_version,
+        contract.capabilities.len(),
+        contract.schemas.len(),
+        contract.fixture_path,
+    );
+    if matches[0]["SPDXID"] != expected_id
+        || matches[0]["versionInfo"] != contract.release_smoke_contract_version
+        || matches[0]["filesAnalyzed"] != Value::Bool(false)
+        || matches[0]["licenseDeclared"] != PROJECT_LICENSE_EXPRESSION
+        || matches[0]["checksums"]
+            != json!([{
+                "algorithm": "SHA256",
+                "checksumValue": cross_language_contract_sha256(contract),
+            }])
+        || matches[0]["comment"] != expected_comment
+    {
+        bail!("{context} SBOM cross-language contract package is incompatible");
+    }
+    let contains = sbom["relationships"]
+        .as_array()
+        .map(|relationships| {
+            relationships
+                .iter()
+                .filter(|relationship| {
+                    relationship["spdxElementId"] == "SPDXRef-Package-depgraph"
+                        && relationship["relationshipType"] == "CONTAINS"
+                        && relationship["relatedSpdxElement"] == expected_id
+                })
+                .count()
+        })
+        .unwrap_or_default();
+    if contains != 1 {
+        bail!("{context} SBOM does not contain the cross-language contract from the root package");
     }
     Ok(())
 }
@@ -2926,6 +3105,7 @@ fn verify_release_assets(directory: &Path, requested_targets: &[String]) -> Resu
                 archive.clone(),
                 format!("{archive}.sha256"),
                 format!("depgraph-{VERSION}-{target}.query-smoke.json"),
+                format!("depgraph-{VERSION}-{target}.cross-language-smoke.json"),
             ]
         })
         .collect::<BTreeSet<_>>();
@@ -2972,13 +3152,25 @@ fn verify_release_assets(directory: &Path, requested_targets: &[String]) -> Resu
             serde_json::from_slice(&query_smoke_bytes)
                 .context("packaged bounded query smoke report has an invalid schema")?;
         validate_bounded_query_package_smoke(&query_smoke, target, &archive_sha256)?;
+        let cross_language_smoke_path = directory.join(format!(
+            "depgraph-{VERSION}-{target}.cross-language-smoke.json"
+        ));
+        let cross_language_smoke_bytes = fs::read(&cross_language_smoke_path)?;
+        let cross_language_smoke: CrossLanguagePackageSmokeReport =
+            serde_json::from_slice(&cross_language_smoke_bytes)
+                .context("packaged cross-language smoke report has an invalid schema")?;
+        validate_cross_language_package_smoke(&cross_language_smoke, target)?;
         targets.push(verify_published_release_tree(
             &extracted,
             target,
             archive_name,
             archive_sha256,
-            &query_smoke,
-            hex::encode(Sha256::digest(&query_smoke_bytes)),
+            PublishedSmokeReports {
+                query: &query_smoke,
+                query_sha256: hex::encode(Sha256::digest(&query_smoke_bytes)),
+                cross_language: &cross_language_smoke,
+                cross_language_sha256: hex::encode(Sha256::digest(&cross_language_smoke_bytes)),
+            },
         )?);
     }
     if targets
@@ -3037,11 +3229,27 @@ fn verify_release_assets(directory: &Path, requested_targets: &[String]) -> Resu
     {
         bail!("release targets do not produce identical profile plan bytes");
     }
+    if targets
+        .iter()
+        .map(|target| {
+            (
+                target.cross_language_graph_digest.as_str(),
+                target.cross_language_export_sha256.as_str(),
+                target.cross_language_query_sha256.as_str(),
+                &target.cross_language_schemas,
+            )
+        })
+        .collect::<BTreeSet<_>>()
+        .len()
+        != 1
+    {
+        bail!("release targets do not attest identical cross-language graph/query/schema bytes");
+    }
 
     fs::write(
         directory.join("release-verification.json"),
         serde_json::to_vec_pretty(&ReleaseVerificationReport {
-            schema_version: 6,
+            schema_version: 7,
             release_version: VERSION.to_owned(),
             tag: format!("v{VERSION}"),
             protocol_version: "1.0".to_owned(),
@@ -3099,6 +3307,31 @@ fn validate_bounded_query_package_smoke(
         || !lowercase_sha256(&report.profile_canonical_output_sha256)
     {
         bail!("packaged bounded query smoke report is incompatible for {target}");
+    }
+    Ok(())
+}
+
+fn validate_cross_language_package_smoke(
+    report: &CrossLanguagePackageSmokeReport,
+    target: &str,
+) -> Result<()> {
+    let lowercase_sha256 = |value: &str| {
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    };
+    if report.schema_version != CROSS_LANGUAGE_PACKAGE_SMOKE_SCHEMA_VERSION
+        || report.target != target
+        || report.contract != depgraph_core::cross_language_release_compatibility_contract()
+        || !report
+            .graph_digest
+            .strip_prefix("cross-language-release-graph:sha256:")
+            .is_some_and(lowercase_sha256)
+        || !lowercase_sha256(&report.canonical_export_sha256)
+        || !lowercase_sha256(&report.query_output_sha256)
+    {
+        bail!("packaged cross-language smoke report is incompatible for {target}");
     }
     Ok(())
 }
@@ -3247,14 +3480,58 @@ fn evaluate_stable_release_gate(
                     .bytes()
                     .all(|byte| byte.is_ascii_hexdigit())
         });
+    let cross_language_contract = depgraph_core::cross_language_release_compatibility_contract();
+    let cross_language_outputs = release
+        .targets
+        .iter()
+        .map(|target| {
+            (
+                target.cross_language_graph_digest.as_str(),
+                target.cross_language_export_sha256.as_str(),
+                target.cross_language_query_sha256.as_str(),
+                &target.cross_language_schemas,
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    let cross_language_target_gate = release.targets.len() == RELEASE_TARGETS.len()
+        && release.compatibility.cross_language == cross_language_contract
+        && cross_language_outputs.len() == 1
+        && release.targets.iter().all(|target| {
+            target
+                .cross_language_graph_digest
+                .starts_with("cross-language-release-graph:sha256:")
+                && [
+                    target.cross_language_smoke_sha256.as_str(),
+                    target.cross_language_export_sha256.as_str(),
+                    target.cross_language_query_sha256.as_str(),
+                ]
+                .iter()
+                .all(|value| {
+                    value.len() == 64
+                        && value
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                })
+                && target.cross_language_schemas
+                    == cross_language_contract
+                        .schemas
+                        .iter()
+                        .map(|schema| {
+                            (
+                                schema.path.clone(),
+                                schema.sha256.trim_start_matches("sha256:").to_owned(),
+                            )
+                        })
+                        .collect::<BTreeMap<_, _>>()
+        });
 
     let checks = vec![
         StableReleaseGateCheck {
             id: "release-identity".to_owned(),
-            passed: release.schema_version == 6
+            passed: release.schema_version == 7
                 && release.release_version == STABLE_RELEASE_VERSION
                 && release.tag == format!("v{STABLE_RELEASE_VERSION}"),
-            evidence: "release-verification.json schema 6 and exact stable tag".to_owned(),
+            evidence: "release-verification.json schema 7 and exact stable tag".to_owned(),
         },
         StableReleaseGateCheck {
             id: "protocol-store-cache-compatibility".to_owned(),
@@ -3320,6 +3597,13 @@ fn evaluate_stable_release_gate(
             passed: profile_selection_target_gate,
             evidence:
                 "five native archives share the compiled profile-selection contract and canonical plan output"
+                    .to_owned(),
+        },
+        StableReleaseGateCheck {
+            id: "cross-language-five-target".to_owned(),
+            passed: cross_language_target_gate,
+            evidence:
+                "five native archives share the OpenAPI/Protobuf/GraphQL/HTTP/FFI capability ledger, schemas, graph, query, and export bytes"
                     .to_owned(),
         },
         StableReleaseGateCheck {
@@ -3419,8 +3703,7 @@ fn verify_published_release_tree(
     expected_target: &str,
     archive: String,
     archive_sha256: String,
-    query_smoke: &BoundedQueryPackageSmokeReport,
-    query_smoke_sha256: String,
+    smoke: PublishedSmokeReports<'_>,
 ) -> Result<TargetVerificationReport> {
     if fs::symlink_metadata(extracted)?.file_type().is_symlink() {
         bail!("published release root must not be a symlink");
@@ -3442,9 +3725,15 @@ fn verify_published_release_tree(
         "sbom.spdx.json",
         "schemas/depgraph-protocol-v1.schema.json",
         depgraph_core::BOUNDED_QUERY_RELEASE_SMOKE_FIXTURE_PATH,
+        depgraph_core::CROSS_LANGUAGE_RELEASE_SMOKE_FIXTURE_PATH,
     ] {
         if !extracted.join(required).is_file() {
             bail!("published release is missing {required}");
+        }
+    }
+    for schema in depgraph_core::cross_language_release_compatibility_contract().schemas {
+        if !extracted.join(&schema.path).is_file() {
+            bail!("published release is missing {}", schema.path);
         }
     }
 
@@ -3497,6 +3786,50 @@ fn verify_published_release_tree(
             != manifest.compatibility.bounded_query.fixture_sha256
     {
         bail!("published bounded query fixture differs from its compiled contract");
+    }
+    let cross_language_contract = depgraph_core::cross_language_release_compatibility_contract();
+    if manifest.cross_language_fixture.path != cross_language_contract.fixture_path
+        || format!("sha256:{}", manifest.cross_language_fixture.sha256)
+            != cross_language_contract.fixture_sha256
+        || !artifact_paths.insert(manifest.cross_language_fixture.path.as_str())
+    {
+        bail!("published cross-language fixture identity is incompatible or duplicated");
+    }
+    let cross_language_fixture = verify_release_artifact(
+        extracted,
+        &manifest.cross_language_fixture,
+        "cross-language fixture",
+    )?;
+    if fs::read_to_string(cross_language_fixture)?
+        != depgraph_core::CROSS_LANGUAGE_RELEASE_SMOKE_FIXTURE
+    {
+        bail!("published cross-language fixture differs from its compiled contract");
+    }
+    let declared_cross_language_schemas = manifest
+        .cross_language_schemas
+        .iter()
+        .map(|artifact| (artifact.path.as_str(), artifact))
+        .collect::<BTreeMap<_, _>>();
+    if declared_cross_language_schemas.len() != cross_language_contract.schemas.len()
+        || manifest.cross_language_schemas.len() != cross_language_contract.schemas.len()
+    {
+        bail!("published cross-language schema closure is incomplete or duplicated");
+    }
+    let mut cross_language_schemas = BTreeMap::new();
+    for schema in &cross_language_contract.schemas {
+        let artifact = declared_cross_language_schemas
+            .get(schema.path.as_str())
+            .with_context(|| format!("published release is missing {}", schema.path))?;
+        if format!("sha256:{}", artifact.sha256) != schema.sha256
+            || !artifact_paths.insert(artifact.path.as_str())
+        {
+            bail!(
+                "published cross-language schema {} is incompatible or duplicated",
+                schema.path
+            );
+        }
+        verify_release_artifact(extracted, artifact, "cross-language schema")?;
+        cross_language_schemas.insert(schema.path.clone(), artifact.sha256.clone());
     }
 
     if manifest.project_licenses.len() != PROJECT_LICENSES.len() {
@@ -3743,6 +4076,7 @@ fn verify_published_release_tree(
     for required in [
         "@astrojs/compiler",
         BOUNDED_QUERY_SBOM_PACKAGE_NAME,
+        CROSS_LANGUAGE_SBOM_PACKAGE_NAME,
         "depgraph-runtime-collector",
         "typescript",
         "golang.org/x/tools",
@@ -3759,6 +4093,7 @@ fn verify_published_release_tree(
     verify_runtime_collector_sbom(&sbom, &runtime_collector_sha256, "published release")?;
     verify_rust_sysroot_sbom(&sbom, &rust_sysroot_sha256, "published release")?;
     verify_bounded_query_sbom(&sbom, "published release")?;
+    verify_cross_language_sbom(&sbom, &cross_language_contract, "published release")?;
     let framework_build_artifacts = manifest_framework_build_artifact_checksums(&manifest)?;
     verify_framework_build_sbom(&sbom, &framework_build_artifacts, "published release")?;
     if package_names
@@ -3778,6 +4113,11 @@ fn verify_published_release_tree(
             "First-party bounded query contract fixture {} ({}) is licensed under {PROJECT_LICENSE_EXPRESSION}",
             depgraph_core::BOUNDED_QUERY_RELEASE_SMOKE_FIXTURE_PATH,
             depgraph_core::BOUNDED_QUERY_RELEASE_SMOKE_CONTRACT_VERSION,
+        ))
+        || !third_party.contains(&format!(
+            "First-party cross-language contract fixture {} ({}) is licensed under {PROJECT_LICENSE_EXPRESSION}",
+            depgraph_core::CROSS_LANGUAGE_RELEASE_SMOKE_FIXTURE_PATH,
+            depgraph_core::CROSS_LANGUAGE_RELEASE_SMOKE_CONTRACT_VERSION,
         ))
         || !third_party.contains(&rust_sysroot_license_notice())
         || PROJECT_LICENSES.iter().any(|(_, project_text)| {
@@ -3831,12 +4171,17 @@ fn verify_published_release_tree(
         rust_sysroot_sha256,
         framework_build_artifacts,
         workers,
-        query_smoke_sha256,
-        query_plan_digest: query_smoke.plan_digest.clone(),
-        query_result_digest: query_smoke.result_digest.clone(),
-        query_output_sha256: query_smoke.canonical_output_sha256.clone(),
-        profile_plan_digest: query_smoke.profile_plan_digest.clone(),
-        profile_plan_output_sha256: query_smoke.profile_canonical_output_sha256.clone(),
+        query_smoke_sha256: smoke.query_sha256,
+        query_plan_digest: smoke.query.plan_digest.clone(),
+        query_result_digest: smoke.query.result_digest.clone(),
+        query_output_sha256: smoke.query.canonical_output_sha256.clone(),
+        profile_plan_digest: smoke.query.profile_plan_digest.clone(),
+        profile_plan_output_sha256: smoke.query.profile_canonical_output_sha256.clone(),
+        cross_language_smoke_sha256: smoke.cross_language_sha256,
+        cross_language_graph_digest: smoke.cross_language.graph_digest.clone(),
+        cross_language_export_sha256: smoke.cross_language.canonical_export_sha256.clone(),
+        cross_language_query_sha256: smoke.cross_language.query_output_sha256.clone(),
+        cross_language_schemas,
     })
 }
 
@@ -3891,7 +4236,153 @@ fn without_windows_verbatim_prefix(path: &[u16]) -> Vec<u16> {
     }
 }
 
-fn verify_archive(archive: &Path, name: &str) -> Result<BoundedQueryPackageSmokeReport> {
+fn materialize_cross_language_fixture(
+    fixture: &CrossLanguageReleaseFixture,
+    root: &Path,
+    reverse: bool,
+) -> Result<()> {
+    if fixture.schema_version != "cross-language-release-fixture-v1"
+        || fixture.files.is_empty()
+        || fixture.files.len() > 64
+        || fixture
+            .files
+            .windows(2)
+            .any(|pair| pair[0].path.as_bytes() >= pair[1].path.as_bytes())
+    {
+        bail!("packaged cross-language fixture is non-canonical or unbounded");
+    }
+    let files: Box<dyn Iterator<Item = &CrossLanguageReleaseFixtureFile>> = if reverse {
+        Box::new(fixture.files.iter().rev())
+    } else {
+        Box::new(fixture.files.iter())
+    };
+    for file in files {
+        let relative = Path::new(&file.path);
+        if file.path.is_empty()
+            || file.path.len() > 4_096
+            || file.content.len() > 1_048_576
+            || file.path.contains('\\')
+            || relative.is_absolute()
+            || relative
+                .components()
+                .any(|component| !matches!(component, std::path::Component::Normal(_)))
+        {
+            bail!("packaged cross-language fixture contains an unsafe file");
+        }
+        let destination = root.join(relative);
+        fs::create_dir_all(
+            destination
+                .parent()
+                .context("cross-language fixture file has no parent")?,
+        )?;
+        fs::write(destination, file.content.as_bytes())?;
+    }
+    Ok(())
+}
+
+fn cross_language_fixture_export(root: &Path) -> Result<(Value, Value)> {
+    let profile_ids = vec!["release:polyglot".to_owned()];
+    let openapi = depgraph_core::scan_openapi_repository(root, &profile_ids)?
+        .context("packaged cross-language fixture has no OpenAPI graph")?;
+    let protobuf = depgraph_core::scan_protobuf_repository(root, &profile_ids)?
+        .context("packaged cross-language fixture has no Protobuf graph")?;
+    let graphql = depgraph_core::scan_graphql_repository(root, &profile_ids)?
+        .context("packaged cross-language fixture has no GraphQL graph")?;
+    let ffi = depgraph_core::scan_ffi_repository(root, &profile_ids)?
+        .context("packaged cross-language fixture has no FFI graph")?;
+
+    let operation = openapi
+        .nodes
+        .iter()
+        .find(|node| {
+            node.kind == "operation"
+                && node.properties["canonical_identity"]["coordinate"] == "get /pets/{id}"
+        })
+        .context("packaged OpenAPI graph has no canonical get /pets/{id} operation")?;
+    let repository_symbol = openapi
+        .nodes
+        .iter()
+        .find(|node| {
+            node.kind == "symbol"
+                && node.properties["repository_path"].as_str() == Some("src/client.rs")
+                && node.display_name.as_deref() == Some("client::get_pet")
+        })
+        .context("packaged OpenAPI graph has no repository endpoint symbol")?;
+    let mapping = openapi
+        .edges
+        .iter()
+        .find(|edge| {
+            edge.kind == "calls_operation"
+                && edge.source == repository_symbol.id
+                && edge.target == operation.id
+                && edge.resolution_status == depgraph_protocol::ResolutionStatus::Resolved
+                && edge.precision == depgraph_protocol::Precision::Exact
+        })
+        .context("packaged OpenAPI graph cannot query contract to repository endpoint")?;
+    if !protobuf.nodes.iter().any(|node| {
+        node.kind == "operation"
+            && node.properties["canonical_identity"]["coordinate"] == "shop.v1.Pets/GetPet"
+    }) || !graphql.nodes.iter().any(|node| {
+        node.kind == "operation"
+            && node.properties["canonical_identity"]["coordinate"] == "query GetPet"
+    }) || ffi.sites.is_empty()
+    {
+        bail!("packaged cross-language fixture did not exercise every source adapter");
+    }
+
+    let export = json!({
+        "ffi": ffi,
+        "graphql": graphql,
+        "openapi": openapi,
+        "protobuf": protobuf,
+    });
+    let query = json!({
+        "edge_id": mapping.id,
+        "operation_id": operation.id,
+        "repository_path": "src/client.rs",
+        "repository_symbol_id": repository_symbol.id,
+    });
+    Ok((export, query))
+}
+
+fn verify_packaged_cross_language(
+    extracted: &Path,
+    target: &str,
+) -> Result<CrossLanguagePackageSmokeReport> {
+    let fixture_path = extracted.join(depgraph_core::CROSS_LANGUAGE_RELEASE_SMOKE_FIXTURE_PATH);
+    let fixture: CrossLanguageReleaseFixture = serde_json::from_slice(&fs::read(&fixture_path)?)
+        .context("packaged cross-language fixture has an invalid schema")?;
+    let first = tempfile::tempdir()?;
+    let second = tempfile::tempdir()?;
+    materialize_cross_language_fixture(&fixture, first.path(), false)?;
+    materialize_cross_language_fixture(&fixture, second.path(), true)?;
+    let first_output = cross_language_fixture_export(first.path())?;
+    let second_output = cross_language_fixture_export(second.path())?;
+    if first_output != second_output {
+        bail!("packaged cross-language graph/query changed with checkout or file order");
+    }
+    let canonical_export = depgraph_protocol::canonical_json(&first_output.0);
+    let canonical_query = depgraph_protocol::canonical_json(&first_output.1);
+    Ok(CrossLanguagePackageSmokeReport {
+        schema_version: CROSS_LANGUAGE_PACKAGE_SMOKE_SCHEMA_VERSION.to_owned(),
+        target: target.to_owned(),
+        contract: depgraph_core::cross_language_release_compatibility_contract(),
+        graph_digest: depgraph_protocol::stable_id_from_value(
+            "cross-language-release-graph",
+            &first_output.0,
+        ),
+        canonical_export_sha256: hex::encode(Sha256::digest(canonical_export.as_bytes())),
+        query_output_sha256: hex::encode(Sha256::digest(canonical_query.as_bytes())),
+    })
+}
+
+fn verify_archive(
+    archive: &Path,
+    name: &str,
+) -> Result<(
+    BoundedQueryPackageSmokeReport,
+    CrossLanguagePackageSmokeReport,
+)> {
     let archive_sha256 = sha256_file(archive)?;
     let verify_root = std::env::temp_dir().join(format!(
         "depgraph-release-gate-{}-{}",
@@ -4003,6 +4494,8 @@ fn verify_archive(archive: &Path, name: &str) -> Result<BoundedQueryPackageSmoke
         &release_manifest.target,
         &archive_sha256,
     )?;
+    let cross_language_smoke =
+        verify_packaged_cross_language(&extracted, &release_manifest.target)?;
     verify_packaged_web_runtime_fails_closed(&executable, &extracted, &verify_root, &fixture)?;
     let semantic_complete_fixture =
         Path::new("workers/web/test/fixtures/semantic-complete").canonicalize()?;
@@ -4051,7 +4544,7 @@ fn verify_archive(archive: &Path, name: &str) -> Result<BoundedQueryPackageSmoke
     let go_fixture = Path::new("workers/go/internal/worker/testdata/workspace").canonicalize()?;
     verify_packaged_layout_fails_closed(&executable, &extracted, &verify_root, &go_fixture)?;
     fs::remove_dir_all(verify_root)?;
-    Ok(query_smoke)
+    Ok((query_smoke, cross_language_smoke))
 }
 
 fn verify_packaged_build_evidence(
@@ -9216,12 +9709,18 @@ fn verify_release_metadata(extracted: &Path) -> Result<ReleaseManifest> {
         "sbom.spdx.json",
         "schemas/depgraph-protocol-v1.schema.json",
         depgraph_core::BOUNDED_QUERY_RELEASE_SMOKE_FIXTURE_PATH,
+        depgraph_core::CROSS_LANGUAGE_RELEASE_SMOKE_FIXTURE_PATH,
     ] {
         let path = extracted.join(required);
         if !path.is_file()
             || fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_symlink())
         {
             bail!("release archive is missing {required}");
+        }
+    }
+    for schema in depgraph_core::cross_language_release_compatibility_contract().schemas {
+        if !extracted.join(&schema.path).is_file() {
+            bail!("release archive is missing {}", schema.path);
         }
     }
     let manifest: ReleaseManifest =
@@ -9248,6 +9747,45 @@ fn verify_release_metadata(extracted: &Path) -> Result<ReleaseManifest> {
             != manifest.compatibility.bounded_query.fixture_sha256
     {
         bail!("release manifest bounded query fixture identity is incompatible");
+    }
+    let cross_language_contract = depgraph_core::cross_language_release_compatibility_contract();
+    if manifest.cross_language_fixture.path != cross_language_contract.fixture_path
+        || format!("sha256:{}", manifest.cross_language_fixture.sha256)
+            != cross_language_contract.fixture_sha256
+    {
+        bail!("release manifest cross-language fixture identity is incompatible");
+    }
+    let cross_language_fixture = verify_release_artifact(
+        extracted,
+        &manifest.cross_language_fixture,
+        "cross-language fixture",
+    )?;
+    if fs::read_to_string(cross_language_fixture)?
+        != depgraph_core::CROSS_LANGUAGE_RELEASE_SMOKE_FIXTURE
+    {
+        bail!("release manifest cross-language fixture differs from the compiled contract");
+    }
+    let declared_cross_language_schemas = manifest
+        .cross_language_schemas
+        .iter()
+        .map(|artifact| (artifact.path.as_str(), artifact))
+        .collect::<BTreeMap<_, _>>();
+    if declared_cross_language_schemas.len() != cross_language_contract.schemas.len()
+        || manifest.cross_language_schemas.len() != cross_language_contract.schemas.len()
+    {
+        bail!("release manifest cross-language schema closure is incomplete or duplicated");
+    }
+    for schema in &cross_language_contract.schemas {
+        let artifact = declared_cross_language_schemas
+            .get(schema.path.as_str())
+            .with_context(|| format!("release manifest is missing {}", schema.path))?;
+        if format!("sha256:{}", artifact.sha256) != schema.sha256 {
+            bail!(
+                "release manifest cross-language schema {} has an incompatible digest",
+                schema.path
+            );
+        }
+        verify_release_artifact(extracted, artifact, "cross-language schema")?;
     }
     if manifest.project_licenses.len() != PROJECT_LICENSES.len() {
         bail!("release manifest must contain exactly the project license files");
@@ -9518,6 +10056,8 @@ fn verify_release_metadata(extracted: &Path) -> Result<ReleaseManifest> {
         .collect::<BTreeSet<_>>();
     for required in [
         "@astrojs/compiler",
+        BOUNDED_QUERY_SBOM_PACKAGE_NAME,
+        CROSS_LANGUAGE_SBOM_PACKAGE_NAME,
         "depgraph-runtime-collector",
         "typescript",
         "golang.org/x/tools",
@@ -9538,6 +10078,7 @@ fn verify_release_metadata(extracted: &Path) -> Result<ReleaseManifest> {
     verify_runtime_collector_sbom(&sbom, &runtime_collector_sha256, "release")?;
     verify_rust_sysroot_sbom(&sbom, &rust_sysroot_sha256, "release")?;
     verify_bounded_query_sbom(&sbom, "release")?;
+    verify_cross_language_sbom(&sbom, &cross_language_contract, "release")?;
     verify_framework_build_sbom(
         &sbom,
         &manifest_framework_build_artifact_checksums(&manifest)?,
@@ -9627,6 +10168,13 @@ fn verify_release_metadata(extracted: &Path) -> Result<ReleaseManifest> {
         depgraph_core::BOUNDED_QUERY_RELEASE_SMOKE_CONTRACT_VERSION,
     )) {
         bail!("license inventory is missing the bounded query project license notice");
+    }
+    if !license_inventory.contains(&format!(
+        "First-party cross-language contract fixture {} ({}) is licensed under {PROJECT_LICENSE_EXPRESSION}",
+        depgraph_core::CROSS_LANGUAGE_RELEASE_SMOKE_FIXTURE_PATH,
+        depgraph_core::CROSS_LANGUAGE_RELEASE_SMOKE_CONTRACT_VERSION,
+    )) {
+        bail!("license inventory is missing the cross-language project license notice");
     }
     for (name, version, license) in [
         ("@astrojs/compiler", "4.0.0", "MIT"),
@@ -10230,7 +10778,8 @@ mod tests {
 
     use super::{
         ARCHIVE_MTIME, BENCHMARK_REPORT_SCHEMA_VERSION, BOUNDED_QUERY_PACKAGE_SMOKE_SCHEMA_VERSION,
-        BoundedQueryPackageSmokeReport, DependencyPackage, PROJECT_LICENSE_EXPRESSION,
+        BoundedQueryPackageSmokeReport, CROSS_LANGUAGE_PACKAGE_SMOKE_SCHEMA_VERSION,
+        CrossLanguagePackageSmokeReport, DependencyPackage, PROJECT_LICENSE_EXPRESSION,
         RELEASE_TARGETS, RUNTIME_COLLECTOR_CONTRACT_VERSION, RUST_SYSROOT_COMPONENT_SHA256,
         ReleaseVerificationReport, STABLE_RELEASE_BASELINE_COMMIT, STABLE_RELEASE_BASELINE_DIGEST,
         STABLE_RELEASE_VERSION, STABLE_UPGRADE_SOURCE_VERSION, StableReleaseDecision,
@@ -10241,11 +10790,12 @@ mod tests {
         extract_archive, normalized_spdx_license, package_url, parse_worker_handshake,
         release_compatibility, remove_transient_build_run_ids, rust_backend_from_handshake,
         rustc_source_identity, stable_release_baseline_digest,
-        validate_bounded_query_package_smoke, verify_checksum_sidecar,
-        verify_pinned_rust_sysroot_digest, verify_project_metadata, verify_release_tag_values,
-        verify_rust_analyzer_dependencies, verify_rust_backend, verify_stable_release_source_guard,
-        verify_web_semantic_attestation, web_runtime_packages, web_semantic_from_handshake,
-        without_windows_verbatim_prefix, workspace_root,
+        validate_bounded_query_package_smoke, validate_cross_language_package_smoke,
+        verify_checksum_sidecar, verify_packaged_cross_language, verify_pinned_rust_sysroot_digest,
+        verify_project_metadata, verify_release_tag_values, verify_rust_analyzer_dependencies,
+        verify_rust_backend, verify_stable_release_source_guard, verify_web_semantic_attestation,
+        web_runtime_packages, web_semantic_from_handshake, without_windows_verbatim_prefix,
+        workspace_root,
     };
 
     fn release_tree() -> Result<(tempfile::TempDir, String)> {
@@ -10268,6 +10818,30 @@ mod tests {
     #[test]
     fn repository_release_metadata_is_synchronized() -> Result<()> {
         verify_project_metadata(&workspace_root())
+    }
+
+    #[test]
+    fn cross_language_package_smoke_is_deterministic_and_tamper_closed() -> Result<()> {
+        let target = "x86_64-unknown-linux-gnu";
+        let report = verify_packaged_cross_language(&workspace_root(), target)?;
+        validate_cross_language_package_smoke(&report, target)?;
+        assert_eq!(
+            report.schema_version,
+            CROSS_LANGUAGE_PACKAGE_SMOKE_SCHEMA_VERSION
+        );
+        assert!(
+            report
+                .graph_digest
+                .starts_with("cross-language-release-graph:sha256:")
+        );
+
+        let mut drifted = CrossLanguagePackageSmokeReport {
+            contract: report.contract.clone(),
+            ..report
+        };
+        drifted.contract.capabilities.pop();
+        assert!(validate_cross_language_package_smoke(&drifted, target).is_err());
+        Ok(())
     }
 
     #[test]
@@ -10412,9 +10986,26 @@ mod tests {
             query_output_sha256: "3".repeat(64),
             profile_plan_digest: format!("profile-selection-plan:sha256:{}", "4".repeat(64)),
             profile_plan_output_sha256: "5".repeat(64),
+            cross_language_smoke_sha256: "6".repeat(64),
+            cross_language_graph_digest: format!(
+                "cross-language-release-graph:sha256:{}",
+                "7".repeat(64)
+            ),
+            cross_language_export_sha256: "8".repeat(64),
+            cross_language_query_sha256: "9".repeat(64),
+            cross_language_schemas: depgraph_core::cross_language_release_compatibility_contract()
+                .schemas
+                .into_iter()
+                .map(|schema| {
+                    (
+                        schema.path,
+                        schema.sha256.trim_start_matches("sha256:").to_owned(),
+                    )
+                })
+                .collect(),
         };
         let release = ReleaseVerificationReport {
-            schema_version: 6,
+            schema_version: 7,
             release_version: STABLE_RELEASE_VERSION.to_owned(),
             tag: format!("v{STABLE_RELEASE_VERSION}"),
             protocol_version: "1.0".to_owned(),
@@ -10505,6 +11096,13 @@ mod tests {
             format!("bounded-query-result:sha256:{}", "9".repeat(64));
         assert_eq!(
             evaluate(&query_drift, &benchmark).decision,
+            StableReleaseDecision::Reject
+        );
+
+        let mut cross_language_drift = release.clone();
+        cross_language_drift.targets[0].cross_language_query_sha256 = "0".repeat(64);
+        assert_eq!(
+            evaluate(&cross_language_drift, &benchmark).decision,
             StableReleaseDecision::Reject
         );
 
