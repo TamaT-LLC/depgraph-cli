@@ -341,6 +341,7 @@ pub fn build_profile_selection_input(
     Ok(ProfileSelectionInput {
         contract_version: DEFAULT_PROFILE_SELECTION_CONTRACT_VERSION.to_owned(),
         inventory_digest: profile_selection_inventory_digest(&canonical_inventory)?,
+        inventory_language_families: detected_language_families,
         compatibility_ids: context.compatibility_ids,
         language_families: context.language_families,
         host_contexts: context.host_contexts,
@@ -867,6 +868,10 @@ mod tests {
         let first = build_profile_selection_input(&inventory, context)?;
         let second = build_profile_selection_input(&inventory, reordered)?;
         assert_eq!(first, second);
+        assert_eq!(
+            first.inventory_language_families,
+            vec![ProfileLanguage::Rust, ProfileLanguage::Web]
+        );
         assert_eq!(
             profile_selection_input_digest(&first),
             profile_selection_input_digest(&second)

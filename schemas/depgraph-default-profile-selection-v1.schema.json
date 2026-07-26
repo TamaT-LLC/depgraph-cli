@@ -231,6 +231,7 @@
       "required": [
         "contract_version",
         "inventory_digest",
+        "inventory_language_families",
         "compatibility_ids",
         "language_families",
         "host_contexts",
@@ -244,6 +245,14 @@
         },
         "inventory_digest": {
           "$ref": "#/$defs/sha256"
+        },
+        "inventory_language_families": {
+          "type": "array",
+          "maxItems": 3,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/language"
+          }
         },
         "compatibility_ids": {
           "type": "array",
