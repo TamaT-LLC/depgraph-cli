@@ -7,6 +7,7 @@ pub mod build_evidence;
 pub mod cache;
 pub mod cancellation;
 pub mod config;
+pub mod cross_language;
 pub mod daemon;
 pub mod export;
 mod graphml;
@@ -91,6 +92,7 @@ pub use build_evidence::{
     stage_build_evidence, validate_build_evidence, validate_framework_build_evidence_contract,
     web_build_protocol_ndjson,
 };
+pub use cross_language::validate_cross_language_worker_protocol;
 pub const FRAMEWORK_BUILD_GRAPH_CONTRACT_VERSION: &str = "framework-build-graph-v1";
 pub const FRAMEWORK_BUILD_GATE_CONTRACT_VERSION: &str =
     "dynamic-framework-evidence-release-gate-v1";
