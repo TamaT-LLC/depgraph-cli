@@ -1081,6 +1081,15 @@ mod tests {
         let baseline_axes = CanonicalProfileAxes::Web(WebProfileAxes {
             mode: WebProfileMode::Production,
             environments: vec![WebEnvironment::Browser, WebEnvironment::Server],
+            bundled_typescript_compatibility_id: format!(
+                "web-typescript-compatibility:sha256:{}",
+                "a".repeat(64)
+            ),
+            package_snapshot_id: format!("web-package-snapshot:sha256:{}", "b".repeat(64)),
+            framework_capability_ids: vec![format!(
+                "web-framework-capability:sha256:{}",
+                "c".repeat(64)
+            )],
         });
         candidate_family(
             baseline_axes,
@@ -1093,6 +1102,15 @@ mod tests {
                         WebProfileMode::Test
                     },
                     environments: vec![WebEnvironment::Browser, WebEnvironment::Server],
+                    bundled_typescript_compatibility_id: format!(
+                        "web-typescript-compatibility:sha256:{}",
+                        "a".repeat(64)
+                    ),
+                    package_snapshot_id: format!("web-package-snapshot:sha256:{}", "b".repeat(64)),
+                    framework_capability_ids: vec![format!(
+                        "web-framework-capability:sha256:{}",
+                        "c".repeat(64)
+                    )],
                 })
             },
             ProfileAxis::Mode,

@@ -18,6 +18,7 @@ pub mod profile_selection;
 pub mod profile_selection_go;
 pub mod profile_selection_plan;
 pub mod profile_selection_rust;
+pub mod profile_selection_web;
 pub mod query;
 pub mod runtime_trace;
 pub mod rust_build_observer;
