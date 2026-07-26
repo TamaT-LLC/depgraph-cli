@@ -131,7 +131,7 @@ site ID, edge kind, and target ID.
 | `references_schema` | `schema` / `message` | `schema` / `message` | `$ref`, GraphQL type reference, or descriptor type reference |
 | `calls_operation` | `symbol` / `component` / `server_function` / `operation` | `operation` | Consumer-to-contract call |
 | `implemented_by` | `operation` | `symbol` / `server_function` | Provider implementation mapping |
-| `generated_from` | generated `file` / `symbol` / `type` | `schema` / `operation` / `message` | Attested generator provenance |
+| `generated_from` | generated `file` / `symbol` / `type` | `schema` / `service` / `operation` / `message` | Attested generator provenance |
 | `binds_native_symbol` | `symbol` / `build_unit` | `native_symbol` | Language declaration or build unit to ABI symbol |
 | `provided_by_library` | `native_symbol` | `native_library` | Exact or candidate link-provider relation |
 
@@ -302,6 +302,28 @@ provenance, invalid source locations, symlinked descriptors, and out-of-root
 names remain explicit incomplete coverage. Descriptor relations without
 `SourceCodeInfo` use artifact coordinates and never synthesize a source span.
 
+Generated Protobuf mappings use strict JSON source maps ending in
+`.depgraph-protobuf-generated.json` with schema
+`depgraph-protobuf-generated-mapping-v1`. Each source map fixes one generator
+name/version, source locator/version/digest, descriptor locator/digest,
+completeness claim, and a bounded set of generated endpoints. Every endpoint
+names its Rust, Go, or Web repository output/digest/span, generated
+symbol/type coordinate, contract service/method/message coordinate, role, and
+proof kind. Safe scan independently hashes the confined regular output and
+requires `proof=generator_source_map`, a complete source map, a unique endpoint
+claim, current source/output digests, and the unique admitted descriptor proof.
+It never starts a generator.
+
+The v1 support matrix is `prost-build`/`tonic-build` 0.14 for Rust,
+`protoc-gen-go` 1.x for Go messages, `protoc-gen-go-grpc` 1.x for Go
+services/methods, and `ts-proto` or `@bufbuild/protoc-gen-es` 2.x for Web.
+Exact mappings emit `generated_from` plus `calls_operation` or
+`implemented_by` for client/provider methods. Naming-only, partial, stale,
+mixed-generator, duplicate, unsupported, symlinked, out-of-root, or
+descriptor-tampered claims remain reasoned unresolved sites. The profile input
+identity and evidence retain generator, source, descriptor, source-map, and
+generated-output digests; checkout and generator temporary paths are absent.
+
 ### GraphQL
 
 `graphql-contract-v1` admits repository SDL and executable documents. It models
@@ -373,7 +395,7 @@ one to three engineering days of scope.
 | 2 | OpenAPI 3.1 repository parser and contract graph | Implemented in #192 | 1 | Local JSON/YAML definitions and refs produce service/operation/message graph; hostile refs fail closed |
 | 3 | OpenAPI generated-client/provider repository mapping | Implemented in #193 | 2 | Provenance-backed calls/implementation edges and stale/ambiguous negative fixtures pass |
 | 4 | Protobuf source/descriptor contract graph | Implemented in #194 | 1 | Service/method/message/import graph is deterministic without invoking `protoc` |
-| 5 | Protobuf generated-code mapping | 2-3 days | 4 | Descriptor/source-map digests prove language endpoints; naming-only fixtures stay unresolved |
+| 5 | Protobuf generated-code mapping | Implemented in #195 | 4 | Descriptor/source-map digests prove language endpoints; naming-only fixtures stay unresolved |
 | 6 | GraphQL SDL and executable-document graph | 2-3 days | 1 | Field/message/selection graph is complete for admitted files without introspection |
 | 7 | GraphQL client/resolver repository mapping | 2-3 days | 6 | Supported compiler/framework maps prove endpoints; dynamic/federated cases remain ledgered |
 | 8 | HTTP trace-to-operation correlation | 2-3 days | 2, 4 or 6; runtime trace v1 | Unique profile match is observed; ambiguous, raw-URL, and secret fixtures fail closed |
