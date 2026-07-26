@@ -11,6 +11,7 @@ pub mod cross_language;
 pub mod daemon;
 pub mod export;
 mod graphml;
+pub mod graphql;
 pub mod impact;
 pub mod incremental;
 pub mod openapi;
@@ -129,6 +130,11 @@ pub use export::{
     ExportFormat, export, export_filtered, export_graphml_filtered_to_writer, filter_snapshot,
 };
 pub use graphml::GRAPHML_SCHEMA_VERSION;
+pub use graphql::{
+    GRAPHQL_CAPABILITY, GRAPHQL_FORMAT_VERSION, MAX_GRAPHQL_DEFINITIONS, MAX_GRAPHQL_DEPTH,
+    MAX_GRAPHQL_FILE_BYTES, MAX_GRAPHQL_FILES, MAX_GRAPHQL_SELECTIONS, MAX_GRAPHQL_TOKENS,
+    MAX_GRAPHQL_TOTAL_BYTES, scan_graphql_repository,
+};
 pub use impact::{
     ChangedNodeMapping, GitChange, GitChangedSet, IMPACT_QUERY_CACHE_SCHEMA_VERSION,
     ImpactDiagnostic, ImpactFilters, ImpactNode, ImpactResult, impact, impact_query_cache_key,

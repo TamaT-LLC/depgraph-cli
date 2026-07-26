@@ -332,6 +332,29 @@ and statically evaluable selection dependencies. It does not perform remote
 introspection, fetch persisted-query registries, execute directives, load
 resolver modules, or assume that a field spelling identifies a resolver.
 
+Safe scan inventories only confined regular `.graphql`, `.graphqls`, and `.gql`
+files. It treats SDL extensions as local composition data and resolves schema
+roots, named type references, fragment spreads, inline fragments, operation
+variables, and field selections only against that admitted inventory. Source
+bytes, files, tokens, nesting depth, definitions, and selections are bounded.
+GraphQL project configuration and resolver source files are never loaded or
+executed.
+
+The contract graph uses a repository SDL document as a schema owner; named
+types, directives, and fragments as messages; and named or synthetic
+executable definitions as operations. Each schema/type/field/directive,
+fragment/type-condition/spread, operation/root/variable, and selection
+occurrence is represented by a common-contract site and edge. Built-in scalars
+and directives are inert and do not invent repository nodes. Duplicate
+definitions, ambiguous schema roots, missing type/field/fragment references,
+fragment cycles, malformed or over-budget documents, symlinks, and out-of-root
+paths remain explicit reasoned incomplete coverage.
+
+Introspection fields, non-static directive arguments, and federation
+directives never become exact local dependencies. They are preserved as
+reasoned unresolved boundaries. Checkout paths and file creation order are
+absent from canonical identity, profile identity, evidence, and graph output.
+
 Provider `implemented_by` mapping requires a supported framework/compiler map
 or explicit repository mapping under the common precision rule. Dynamic field
 selection, custom directive behavior, stitched/federated remote schemas, and
@@ -396,7 +419,7 @@ one to three engineering days of scope.
 | 3 | OpenAPI generated-client/provider repository mapping | Implemented in #193 | 2 | Provenance-backed calls/implementation edges and stale/ambiguous negative fixtures pass |
 | 4 | Protobuf source/descriptor contract graph | Implemented in #194 | 1 | Service/method/message/import graph is deterministic without invoking `protoc` |
 | 5 | Protobuf generated-code mapping | Implemented in #195 | 4 | Descriptor/source-map digests prove language endpoints; naming-only fixtures stay unresolved |
-| 6 | GraphQL SDL and executable-document graph | 2-3 days | 1 | Field/message/selection graph is complete for admitted files without introspection |
+| 6 | GraphQL SDL and executable-document graph | Implemented in #196 | 1 | Field/message/selection graph is complete for admitted files without introspection |
 | 7 | GraphQL client/resolver repository mapping | 2-3 days | 6 | Supported compiler/framework maps prove endpoints; dynamic/federated cases remain ledgered |
 | 8 | HTTP trace-to-operation correlation | 2-3 days | 2, 4 or 6; runtime trace v1 | Unique profile match is observed; ambiguous, raw-URL, and secret fixtures fail closed |
 | 9 | Rust/Go/Web static FFI declaration inventory | 2-3 days | 1 | Every admitted declaration is resolved/candidate/external/unresolved by target profile |
