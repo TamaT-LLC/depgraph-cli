@@ -30,7 +30,7 @@ pub enum ProfileLanguage {
 }
 
 impl ProfileLanguage {
-    const fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Rust => "rust",
             Self::Go => "go",
@@ -57,7 +57,7 @@ pub enum ProfileAxis {
 }
 
 impl ProfileAxis {
-    const fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Target => "target",
             Self::Environment => "environment",
@@ -151,6 +151,7 @@ pub struct GoHostContext {
 pub struct ProfileSelectionInput {
     pub contract_version: String,
     pub inventory_digest: String,
+    pub inventory_language_families: Vec<ProfileLanguage>,
     pub compatibility_ids: Vec<String>,
     pub language_families: Vec<ProfileLanguage>,
     pub host_contexts: Vec<ProfileHostContext>,
@@ -171,7 +172,7 @@ pub enum RustProfileMode {
 }
 
 impl RustProfileMode {
-    const fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Check => "check",
             Self::Test => "test",
@@ -718,6 +719,18 @@ impl DefaultProfileSelectionPlan {
 
 fn validate_input(input: &ProfileSelectionInput) -> Result<()> {
     validate_digest("inventory_digest", &input.inventory_digest)?;
+    validate_sorted_by(
+        "inventory_language_families",
+        &input.inventory_language_families,
+        |language| language.as_str().to_owned(),
+    )?;
+    validate_unique(
+        "inventory_language_families",
+        input
+            .inventory_language_families
+            .iter()
+            .map(|language| language.as_str()),
+    )?;
     if let Some(digest) = &input.configuration_digest {
         validate_digest("configuration_digest", digest)?;
     }
@@ -738,6 +751,9 @@ fn validate_input(input: &ProfileSelectionInput) -> Result<()> {
             .iter()
             .map(|language| language.as_str()),
     )?;
+    if input.language_families != input.inventory_language_families {
+        bail!("language_families must exactly match the canonical inventory attestation");
+    }
     validate_sorted_by("host_contexts", &input.host_contexts, |context| {
         context.language().as_str().to_owned()
     })?;
@@ -1365,6 +1381,25 @@ mod tests {
     }
 
     #[test]
+    fn deserialized_plan_cannot_drop_an_inventory_attested_language() -> Result<()> {
+        let mut plan: DefaultProfileSelectionPlan = serde_json::from_str(GOLDEN)?;
+        plan.input.language_families.clear();
+        plan.input_digest = profile_selection_input_digest(&plan.input);
+        plan.plan_id = canonical_profile_selection_plan_id(&plan);
+
+        let restored: DefaultProfileSelectionPlan =
+            serde_json::from_value(serde_json::to_value(plan)?)?;
+        assert!(
+            restored
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("canonical inventory attestation")
+        );
+        Ok(())
+    }
+
+    #[test]
     fn canonical_profile_identity_normalizes_set_order_but_validation_rejects_it() -> Result<()> {
         let mut first = CanonicalProfileAxes::Rust(RustProfileAxes {
             target: "aarch64-apple-darwin".to_owned(),
@@ -1606,6 +1641,7 @@ mod tests {
     fn empty_repository_has_a_complete_zero_profile_plan() -> Result<()> {
         let value: Value = serde_json::from_str(GOLDEN)?;
         let mut plan: DefaultProfileSelectionPlan = serde_json::from_value(value)?;
+        plan.input.inventory_language_families.clear();
         plan.input.language_families.clear();
         plan.input.host_contexts.clear();
         plan.input.supported_axes.clear();
