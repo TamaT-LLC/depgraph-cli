@@ -360,6 +360,28 @@ or explicit repository mapping under the common precision rule. Dynamic field
 selection, custom directive behavior, stitched/federated remote schemas, and
 resolver chains without complete provenance remain external or unresolved.
 
+GraphQL repository mappings use strict JSON files ending in
+`.depgraph-graphql-mapping.json` with schema
+`depgraph-graphql-repository-mapping-v1`. Every manifest fixes one supported
+compiler or framework name/version, the complete sorted GraphQL input
+inventory and aggregate digest, and bounded endpoint mappings. Each mapping
+fixes its client or resolver role, Rust/Go/Web language, source document and
+operation/field coordinate, repository output/digest/span, endpoint coordinate,
+and `compiler_source_map` or `framework_map` proof. Safe scan independently
+hashes every confined regular input and output and never starts the named tool
+or loads framework code.
+
+The v1 client matrix is `cynic-codegen` 3.x for Rust, `genqlient` 0.8.x for Go,
+and `@graphql-codegen/client-preset` 4.x for Web. The resolver matrix is
+`async-graphql` 7.x for Rust, `gqlgen` 0.17.x for Go, and
+`@graphql-codegen/typescript-resolvers` 4.x for Web. Exact source-map proof
+emits `generated_from` plus `calls_operation` or `implemented_by`. Naming-only,
+partial, stale, mixed-tool, duplicate, unsupported, symlinked, out-of-root,
+ambiguous-field, dynamic endpoint, and federated resolver claims remain
+reasoned unresolved sites. Evidence retains tool, GraphQL input, contract
+document, mapping manifest, output, and endpoint identities so the source
+contract and repository endpoint can be reconstructed without checkout paths.
+
 ### HTTP runtime correlation
 
 `http-operation-correlation-v1` consumes only validated
@@ -420,7 +442,7 @@ one to three engineering days of scope.
 | 4 | Protobuf source/descriptor contract graph | Implemented in #194 | 1 | Service/method/message/import graph is deterministic without invoking `protoc` |
 | 5 | Protobuf generated-code mapping | Implemented in #195 | 4 | Descriptor/source-map digests prove language endpoints; naming-only fixtures stay unresolved |
 | 6 | GraphQL SDL and executable-document graph | Implemented in #196 | 1 | Field/message/selection graph is complete for admitted files without introspection |
-| 7 | GraphQL client/resolver repository mapping | 2-3 days | 6 | Supported compiler/framework maps prove endpoints; dynamic/federated cases remain ledgered |
+| 7 | GraphQL client/resolver repository mapping | Implemented in #197 | 6 | Supported compiler/framework maps prove endpoints; dynamic/federated cases remain ledgered |
 | 8 | HTTP trace-to-operation correlation | 2-3 days | 2, 4 or 6; runtime trace v1 | Unique profile match is observed; ambiguous, raw-URL, and secret fixtures fail closed |
 | 9 | Rust/Go/Web static FFI declaration inventory | 2-3 days | 1 | Every admitted declaration is resolved/candidate/external/unresolved by target profile |
 | 10 | FFI supervised link/export evidence | 2-3 days | 9; build supervisor | Exact ABI/library/symbol mappings require same-profile link evidence and preserve rollback |

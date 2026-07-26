@@ -23,6 +23,12 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use walkdir::{DirEntry, WalkDir};
 
+mod generated;
+
+pub use generated::{
+    GRAPHQL_REPOSITORY_MAPPING_CAPABILITY, GRAPHQL_REPOSITORY_MAPPING_SCHEMA_VERSION,
+};
+
 pub const GRAPHQL_CAPABILITY: &str = "graphql-contract-v1";
 pub const GRAPHQL_FORMAT_VERSION: &str = "graphql-spec-2021";
 pub const MAX_GRAPHQL_FILE_BYTES: usize = 8 * 1024 * 1024;
@@ -64,7 +70,8 @@ pub fn scan_graphql_repository(
     }
 
     let records = inventory_graphql_sources(&canonical_root)?;
-    if records.is_empty() {
+    let generated_inventory = generated::inventory_repository_mappings(&canonical_root)?;
+    if records.is_empty() && generated_inventory.is_empty() {
         return Ok(None);
     }
     let documents = records
@@ -76,12 +83,13 @@ pub fn scan_graphql_repository(
                 .map(|document| (record.locator.clone(), document))
         })
         .collect::<BTreeMap<_, _>>();
-    let input_digest = digest_value(&json!(
-        records
+    let input_digest = digest_value(&json!({
+        "graphql_documents": records
             .iter()
             .map(SourceRecord::identity_value)
-            .collect::<Vec<_>>()
-    ));
+            .collect::<Vec<_>>(),
+        "repository_mappings": generated_inventory.identity_value(),
+    }));
     let profile_identity = CrossLanguageProfileIdentity {
         contract_version: CROSS_LANGUAGE_CONTRACT_VERSION.to_owned(),
         completeness_version: CROSS_LANGUAGE_COMPLETENESS_VERSION.to_owned(),
@@ -92,13 +100,18 @@ pub fn scan_graphql_repository(
     let profile_id = cross_language_profile_id(&profile_identity);
     let mut builder = GraphQlGraphBuilder::new(profile_id.clone(), documents);
     builder.build()?;
+    generated::apply_repository_mappings(&generated_inventory, &mut builder)?;
     for reason in records.iter().filter_map(|record| record.reason.as_deref()) {
+        builder.insert_reason(reason);
+    }
+    for reason in generated_inventory.reasons() {
         builder.insert_reason(reason);
     }
     let skipped_count = records
         .iter()
         .filter(|record| record.document.is_none())
         .count() as u64;
+    let skipped_count = skipped_count + generated_inventory.skipped_count();
     let status = if builder.unresolved_count > 0 || skipped_count > 0 || !builder.reasons.is_empty()
     {
         CrossLanguageCapabilityStatus::Incomplete
@@ -111,7 +124,7 @@ pub fn scan_graphql_repository(
             format: CrossLanguageFormat::Graphql,
             capability: GRAPHQL_CAPABILITY.to_owned(),
             status,
-            input_count: records.len() as u64,
+            input_count: records.len() as u64 + generated_inventory.input_count(),
             node_count: builder.cross_node_ids.len() as u64,
             site_count: builder.sites.len() as u64,
             edge_count: builder.edges.len() as u64,
@@ -142,6 +155,10 @@ pub fn scan_graphql_repository(
             (
                 CROSS_LANGUAGE_COMPLETENESS_PROPERTY.to_owned(),
                 serde_json::to_value(ledger)?,
+            ),
+            (
+                "graphql_repository_provenance".to_owned(),
+                generated_inventory.identity_value(),
             ),
         ]),
     };
@@ -1227,6 +1244,7 @@ struct GraphQlGraphBuilder {
     schema_ids: BTreeMap<String, String>,
     type_groups: BTreeMap<String, Vec<LocatedType>>,
     type_ids: BTreeMap<String, String>,
+    field_ids: BTreeMap<String, Vec<String>>,
     valid_types: BTreeSet<String>,
     directive_groups: BTreeMap<String, Vec<LocatedDirective>>,
     directive_ids: BTreeMap<String, String>,
@@ -1253,6 +1271,7 @@ impl GraphQlGraphBuilder {
             schema_ids: BTreeMap::new(),
             type_groups: BTreeMap::new(),
             type_ids: BTreeMap::new(),
+            field_ids: BTreeMap::new(),
             valid_types: BTreeSet::new(),
             directive_groups: BTreeMap::new(),
             directive_ids: BTreeMap::new(),
@@ -1419,8 +1438,19 @@ impl GraphQlGraphBuilder {
             let mut field_names = BTreeMap::<String, usize>::new();
             for definition in definitions {
                 for field in definition.definition.fields {
+                    let coordinate = format!("{name}.{}", field.name);
                     *field_names.entry(field.name).or_default() += 1;
+                    let field_id = self.add_cross_node(
+                        CrossLanguageNodeKind::Operation,
+                        &definition.locator,
+                        &coordinate,
+                    )?;
+                    self.field_ids.entry(coordinate).or_default().push(field_id);
                 }
+            }
+            for ids in self.field_ids.values_mut() {
+                ids.sort();
+                ids.dedup();
             }
             if field_names.values().any(|count| *count > 1) {
                 self.insert_reason("ambiguous-graphql-field-definition");
@@ -1590,25 +1620,30 @@ impl GraphQlGraphBuilder {
             )?;
         }
         for field in &located.definition.fields {
+            let field_id = self.unique_field_id(&located.definition.name, &field.name);
+            let Some(field_id) = field_id else {
+                self.insert_reason("ambiguous-graphql-field-definition");
+                continue;
+            };
             for argument in &field.arguments {
                 self.add_type_reference(
-                    type_id,
-                    CrossLanguageRelationKind::ReferencesSchema,
+                    &field_id,
+                    CrossLanguageRelationKind::AcceptsMessage,
                     &located.locator,
                     argument,
                     &[("graphql.field", Value::String(field.name.clone()))],
                 )?;
             }
             self.add_type_reference(
-                type_id,
-                CrossLanguageRelationKind::ReferencesSchema,
+                &field_id,
+                CrossLanguageRelationKind::ReturnsMessage,
                 &located.locator,
                 &field.output,
                 &[("graphql.field", Value::String(field.name.clone()))],
             )?;
             self.add_directive_uses(
-                type_id,
-                CrossLanguageRelationKind::ReferencesSchema,
+                &field_id,
+                CrossLanguageRelationKind::AcceptsMessage,
                 &located.locator,
                 &field.directives,
             )?;
@@ -1925,16 +1960,37 @@ impl GraphQlGraphBuilder {
         current_type: &str,
         field: &FieldSelection,
     ) -> Result<()> {
+        let selected_field = self.unique_field_id(current_type, &field.field_name);
         let field_output = self.field_output_type(current_type, &field.field_name);
         let mut reason = if field.field_name.starts_with("__") {
             Some("graphql-introspection-not-admitted")
         } else if let Some(reason) = directive_boundary_reason(&field.directives) {
             Some(reason)
-        } else if field_output.is_none() {
+        } else if selected_field.is_none() || field_output.is_none() {
             Some("graphql-selected-field-is-unresolved")
         } else {
             None
         };
+        let mut selection_conditions = vec![
+            ("graphql.field", Value::String(field.field_name.clone())),
+            (
+                "graphql.response_name",
+                Value::String(field.response_name.clone()),
+            ),
+        ];
+        selection_conditions.extend(directive_conditions(&field.directives));
+        if matches!(owner, SelectionOwner::Operation) {
+            self.relation_or_unknown(RelationRequest {
+                source: source_id,
+                target: selected_field.as_deref().filter(|_| reason.is_none()),
+                relation: CrossLanguageRelationKind::CallsOperation,
+                locator,
+                span: field.span,
+                coordinate: format!("{current_type}.{}", field.field_name),
+                reason,
+                conditions: selection_conditions.clone(),
+            })?;
+        }
         let output_name = field_output.unwrap_or_else(|| field.field_name.clone());
         if is_builtin_scalar(&output_name) && !field.selections.is_empty() {
             reason = Some("graphql-scalar-selection-is-invalid");
@@ -1946,14 +2002,6 @@ impl GraphQlGraphBuilder {
         if target.is_none() && reason.is_none() {
             reason = Some("graphql-selected-type-is-unresolved");
         }
-        let mut conditions = vec![
-            ("graphql.field", Value::String(field.field_name.clone())),
-            (
-                "graphql.response_name",
-                Value::String(field.response_name.clone()),
-            ),
-        ];
-        conditions.extend(directive_conditions(&field.directives));
         self.relation_or_unknown(RelationRequest {
             source: source_id,
             target: target.as_deref().filter(|_| reason.is_none()),
@@ -1963,9 +2011,9 @@ impl GraphQlGraphBuilder {
             },
             locator,
             span: field.span,
-            coordinate: format!("{current_type}.{}", field.field_name),
+            coordinate: format!("{current_type}.{} return", field.field_name),
             reason,
-            conditions,
+            conditions: selection_conditions,
         })
     }
 
@@ -2080,6 +2128,24 @@ impl GraphQlGraphBuilder {
             .flatten()
     }
 
+    fn unique_field_id(&self, type_name: &str, field_name: &str) -> Option<String> {
+        let fields = self
+            .type_groups
+            .get(type_name)?
+            .iter()
+            .flat_map(|definition| definition.definition.fields.iter())
+            .filter(|field| field.name == field_name)
+            .count();
+        (fields == 1)
+            .then(|| {
+                self.field_ids
+                    .get(&format!("{type_name}.{field_name}"))
+                    .and_then(|ids| ids.first())
+                    .cloned()
+            })
+            .flatten()
+    }
+
     fn unique_directive_id(&self, name: &str) -> Option<String> {
         self.directive_groups
             .get(name)
@@ -2180,7 +2246,11 @@ impl GraphQlGraphBuilder {
                 target.to_owned(),
                 ResolutionStatus::Resolved,
                 Precision::Exact,
-                CrossLanguageMappingKind::ContractInternal,
+                if request.relation == CrossLanguageRelationKind::CallsOperation {
+                    CrossLanguageMappingKind::SourceMap
+                } else {
+                    CrossLanguageMappingKind::ContractInternal
+                },
             )
         } else {
             let reason = effective_reason.expect("unresolved GraphQL relations have a reason");
