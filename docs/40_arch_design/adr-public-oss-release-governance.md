@@ -399,12 +399,17 @@ default-disabled or explicitly opt-in while 0.4.x is supported. A breaking
 default requires a new minor release and migration contract. It does not enter
 the stable line as a patch.
 
-The package and stable gate paths compare a `v0.4.0` GitHub Actions source SHA
-with the compiled baseline commit and reject a mismatch before publication.
-The baseline source predates this documentary change, so operators also
-reproduce the documented commit, tree, canonical digest, remote maintenance
-ref, and signed annotated tag before publication. The immutable anchor is not
-redefined when later approved patch commits advance `release/0.4`.
+The baseline source predates this decision and cannot contain a new source
+check without changing the immutable commit. A `workflow_run(requested)`
+guard therefore executes from the default branch for the `Release` workflow.
+For `v0.4.0`, it compares `head_sha` with the recorded baseline; a mismatch
+cancels the release run and deletes the invalid tag before the baseline
+workflow can publish it. The baseline's existing `stable-release-gate-v1`
+continues to close artifacts, compatibility, benchmarks, and release jobs.
+Operators also reproduce the documented commit, tree, canonical digest,
+remote maintenance ref, and signed annotated tag before publication. The
+immutable anchor is not redefined when later approved patch commits advance
+`release/0.4`.
 
 ### Gate 8: migration dry run and change window
 

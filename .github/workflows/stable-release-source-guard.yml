@@ -1,0 +1,42 @@
+name: Stable release source guard
+
+on:
+  workflow_run:
+    workflows: ["Release"]
+    types: [requested]
+
+permissions:
+  actions: write
+  contents: write
+
+jobs:
+  guard-v0-4-0:
+    if: >-
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'v0.4.0'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Reject a v0.4.0 tag outside the immutable baseline
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          RELEASE_RUN_ID: ${{ github.event.workflow_run.id }}
+          RELEASE_TAG: ${{ github.event.workflow_run.head_branch }}
+          RELEASE_SOURCE_SHA: ${{ github.event.workflow_run.head_sha }}
+          EXPECTED_RELEASE_TAG: v0.4.0
+          EXPECTED_RELEASE_SOURCE_SHA: d5ca92bae4b4fdbbedb2f3cabd4aa3ef731e7c9f
+        run: |
+          set -euo pipefail
+          if [[ "$RELEASE_TAG" == "$EXPECTED_RELEASE_TAG" &&
+                "$RELEASE_SOURCE_SHA" == "$EXPECTED_RELEASE_SOURCE_SHA" ]]; then
+            echo "$RELEASE_TAG source is the immutable release baseline"
+            exit 0
+          fi
+
+          gh api --method POST \
+            "repos/$REPOSITORY/actions/runs/$RELEASE_RUN_ID/cancel"
+          gh api --method DELETE \
+            "repos/$REPOSITORY/git/refs/tags/$EXPECTED_RELEASE_TAG"
+          echo "::error::$RELEASE_TAG source $RELEASE_SOURCE_SHA is not $EXPECTED_RELEASE_SOURCE_SHA"
+          exit 1

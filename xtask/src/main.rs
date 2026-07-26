@@ -287,6 +287,27 @@ fn stable_release_baseline_digest() -> String {
     hex::encode(Sha256::digest(stable_release_baseline_record().as_bytes()))
 }
 
+fn verify_stable_release_source_guard(root: &Path) -> Result<()> {
+    let source_guard =
+        fs::read_to_string(root.join(".github/workflows/stable-release-source-guard.yml"))?;
+    for required in [
+        "name: Stable release source guard",
+        "workflow_run:",
+        "workflows: [\"Release\"]",
+        "types: [requested]",
+        "github.event.workflow_run.head_branch == 'v0.4.0'",
+        "github.event.workflow_run.head_sha",
+        STABLE_RELEASE_BASELINE_COMMIT,
+        "actions/runs/$RELEASE_RUN_ID/cancel",
+        "git/refs/tags/$EXPECTED_RELEASE_TAG",
+    ] {
+        if !source_guard.contains(required) {
+            bail!("stable release source guard is missing contract {required:?}");
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct TargetVerificationReport {
@@ -755,12 +776,13 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         STABLE_RELEASE_MAINTENANCE_BRANCH,
         "git cherry-pick -x",
         "default-disabled or explicitly opt-in",
-        "GitHub Actions source SHA is not the baseline",
+        "Stable release source guard",
     ] {
         if !stable_release_note.contains(required) {
             bail!("stable release note is missing baseline contract {required:?}");
         }
     }
+    verify_stable_release_source_guard(root)?;
     let git_attributes = fs::read_to_string(root.join(".gitattributes"))?;
     for (path, expected) in PROJECT_LICENSES {
         let required_attribute = format!("{path} text eol=lf");
@@ -2984,11 +3006,10 @@ fn evaluate_stable_release_gate(
                     .to_owned(),
         },
         StableReleaseGateCheck {
-            id: "tag-source-baseline".to_owned(),
-            passed: workflow_results.get("source_sha").map(String::as_str)
-                == Some(STABLE_RELEASE_BASELINE_COMMIT),
+            id: "tag-source-guard-contract".to_owned(),
+            passed: verify_stable_release_source_guard(&workspace_root()).is_ok(),
             evidence:
-                "v0.4.0 GitHub Actions source SHA equals the release-baseline-v1 commit"
+                "default-branch workflow_run guard cancels the release and deletes an invalid v0.4.0 tag"
                     .to_owned(),
         },
         StableReleaseGateCheck {
@@ -3028,7 +3049,6 @@ fn stable_release_workflow_results() -> BTreeMap<String, String> {
         ("github_actions", "GITHUB_ACTIONS"),
         ("ref_type", "GITHUB_REF_TYPE"),
         ("ref_name", "GITHUB_REF_NAME"),
-        ("source_sha", "GITHUB_SHA"),
         ("quality", "DEPGRAPH_RELEASE_QUALITY_RESULT"),
         ("benchmark", "DEPGRAPH_RELEASE_BENCHMARK_RESULT"),
         ("package", "DEPGRAPH_RELEASE_PACKAGE_RESULT"),
@@ -9489,14 +9509,12 @@ fn verify_release_tag() -> Result<()> {
     verify_release_tag_values(
         std::env::var_os("GITHUB_REF_TYPE").as_deref(),
         std::env::var_os("GITHUB_REF_NAME").as_deref(),
-        std::env::var_os("GITHUB_SHA").as_deref(),
     )
 }
 
 fn verify_release_tag_values(
     ref_type: Option<&std::ffi::OsStr>,
     tag: Option<&std::ffi::OsStr>,
-    source_sha: Option<&std::ffi::OsStr>,
 ) -> Result<()> {
     if ref_type != Some(std::ffi::OsStr::new("tag")) {
         return Ok(());
@@ -9508,17 +9526,6 @@ fn verify_release_tag_values(
     let expected = format!("v{VERSION}");
     if tag != expected {
         bail!("release tag {tag} does not match workspace version {expected}");
-    }
-    if tag == format!("v{STABLE_RELEASE_VERSION}") {
-        let Some(source_sha) = source_sha else {
-            bail!("stable release tag workflow did not expose GITHUB_SHA");
-        };
-        if source_sha != std::ffi::OsStr::new(STABLE_RELEASE_BASELINE_COMMIT) {
-            bail!(
-                "stable release tag source {} does not match baseline {STABLE_RELEASE_BASELINE_COMMIT}",
-                source_sha.to_string_lossy()
-            );
-        }
     }
     Ok(())
 }
@@ -9663,8 +9670,8 @@ mod tests {
         rust_backend_from_handshake, rustc_source_identity, stable_release_baseline_digest,
         verify_checksum_sidecar, verify_pinned_rust_sysroot_digest, verify_project_metadata,
         verify_release_tag_values, verify_rust_analyzer_dependencies, verify_rust_backend,
-        verify_web_semantic_attestation, web_runtime_packages, web_semantic_from_handshake,
-        without_windows_verbatim_prefix, workspace_root,
+        verify_stable_release_source_guard, verify_web_semantic_attestation, web_runtime_packages,
+        web_semantic_from_handshake, without_windows_verbatim_prefix, workspace_root,
     };
 
     fn release_tree() -> Result<(tempfile::TempDir, String)> {
@@ -9695,6 +9702,11 @@ mod tests {
             stable_release_baseline_digest(),
             STABLE_RELEASE_BASELINE_DIGEST
         );
+    }
+
+    #[test]
+    fn stable_release_source_guard_is_pinned_to_baseline() -> Result<()> {
+        verify_stable_release_source_guard(&workspace_root())
     }
 
     #[test]
@@ -9915,20 +9927,6 @@ mod tests {
             StableReleaseDecision::Reject
         );
 
-        let mut wrong_source = workflow_results.clone();
-        wrong_source.insert("source_sha".to_owned(), "0".repeat(40));
-        assert_eq!(
-            evaluate_stable_release_gate(
-                &release,
-                &benchmark,
-                "a".repeat(64),
-                "b".repeat(64),
-                wrong_source,
-            )
-            .decision,
-            StableReleaseDecision::Reject
-        );
-
         let mut incompatible_upgrade = release;
         incompatible_upgrade
             .compatibility
@@ -10009,29 +10007,16 @@ mod tests {
     fn release_tag_gate_ignores_non_tag_github_refs() {
         use std::ffi::OsStr;
 
-        verify_release_tag_values(
-            Some(OsStr::new("branch")),
-            Some(OsStr::new("97/merge")),
-            None,
-        )
-        .expect("pull-request merge refs are not release tags");
-        assert!(verify_release_tag_values(Some(OsStr::new("tag")), None, None).is_err());
+        verify_release_tag_values(Some(OsStr::new("branch")), Some(OsStr::new("97/merge")))
+            .expect("pull-request merge refs are not release tags");
+        assert!(verify_release_tag_values(Some(OsStr::new("tag")), None).is_err());
         assert!(
-            verify_release_tag_values(Some(OsStr::new("tag")), Some(OsStr::new("v9.9.9")), None,)
+            verify_release_tag_values(Some(OsStr::new("tag")), Some(OsStr::new("v9.9.9")),)
                 .is_err()
-        );
-        assert!(
-            verify_release_tag_values(
-                Some(OsStr::new("tag")),
-                Some(OsStr::new(concat!("v", env!("CARGO_PKG_VERSION")))),
-                Some(OsStr::new("0000000000000000000000000000000000000000")),
-            )
-            .is_err()
         );
         verify_release_tag_values(
             Some(OsStr::new("tag")),
             Some(OsStr::new(concat!("v", env!("CARGO_PKG_VERSION")))),
-            Some(OsStr::new(STABLE_RELEASE_BASELINE_COMMIT)),
         )
         .expect("the workspace release tag must remain valid");
     }
