@@ -713,7 +713,7 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "There is no partial-success mode in v1.",
         "## Security boundary",
         "## Staged implementation",
-        "| 1 | Lexer/parser, bounded input reader, canonical AST, and malformed corpus | 2-3 days |",
+        "| 1 | Lexer/parser, bounded input reader, canonical AST, and malformed corpus | Implemented in #177 |",
         "| 3 | Snapshot cardinality statistics, fixed operator planner, cost admission, and explain schema | 2-3 days |",
         "| 4 | Canonical forward/reverse BFS executor, site/evidence filters, staging, and cancellation | 2-3 days |",
         "| 6 | Fuzz/property tests, hostile large-graph benchmark, and five-target package/release gate | 2-3 days |",

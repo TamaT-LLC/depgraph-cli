@@ -38,6 +38,8 @@ Milestone 4のstable releaseは`v0.4.0`とする。`stable-release-gate-v1`は�
 
 Issue #176でgreen確認済みのmain commit `d5ca92bae4b4fdbbedb2f3cabd4aa3ef731e7c9f`を`release-baseline-v1`として固定し、初期`release/0.4` maintenance refと`v0.4.0` tag sourceを同じexact commitへ結び付けた。canonical baseline digest、tree、再現手順、main-first cherry-pick / stable-first forward-portの観測可能な変更フロー、force-push / wholesale merge禁止は[stable release note](../releases/v0.4.0.md)に定める。mainの次版機能は既存defaultへ影響する間default無効または明示opt-inとし、breaking defaultはminor releaseとmigration contractを要求する。baseline sourceはimmutableで新しい自己検証を含められないため、default branchの`workflow_run(requested)` guardが`Release` runのtag / source SHAを照合し、mismatch時はrunをcancelしてinvalid tagを削除する。
 
+Issue #177で`bounded-graph-query-v1`の最初の実装sliceとして、64 KiB / 4,096 token / 512 AST nodeを上限とするlexer/parserとcanonical untyped ASTを追加した。ASCII case-insensitive keyword、JSON string、canonical unsigned integer、単一linear MATCH、WHERE expression / quantifier、RETURN / ORDER BY、必須LIMIT以外を受理せず、depth、nesting、existential、list、projection上限をparse完了前にfail closedとする。query file readerはcaller-selected repository root内のUTF-8 regular fileだけをidentity / size / modified metadataのpre/post照合付きで読み、parent traversal、symlink component、special file、oversize、read raceをsecurity failureにする。literalは`release-redaction-shapes-v1`のcredential shapeをstore access前に拒否し、全diagnosticはraw query、literal、absolute pathをechoしない。type binding、planner、executor、public CLIは後続sliceの責務として未接続である。
+
 Issue #153として`public-readiness-v1`を採用し、repository visibilityの現行判断を`private / reject`へ固定した。public OSS化は、exact candidate commitと全ref、GitHub surface、governance tree、release closureへ結び付くsecret/history、legal/provenance、security/disclosure、governance/community、repository control、release/support、migration rehearsal、incident readinessの全gateが独立承認され、TamaT-LLC organization ownerが明示的に`allow`した場合だけ候補となる。`stable-release-gate-v1`は必要条件だがpublic readinessの十分条件ではない。visibility変更はADRやreadiness recordから自動実行せず、別途明示承認されたchange windowでのみ行う。
 
 safe scanではcanonical root外へのsymlink readを拒否し、相対PATH・repository内toolchain・Node実行hookを除外する。Goは制限付き`go/packages`からparser fallbackへ移行する。Cargo metadataはpath-bearing inputのpreflight後、admitted manifest、lockfile、target discovery layoutだけを持つworker-owned confined mirrorに対してneutral cwdから`--frozen --offline --no-deps`で実行し、返却されたtemporary pathをinventory IDへ戻す。配布物はmanifest、MIT / Apache-2.0のproject license全文、core、schema、全worker/runtime artifact/component、backend attestationを検証し、欠損・変更・symlink・checked treeへの追加時にworker起動前にfail closedとする。project licenseはrelease manifestで個別にchecksum attestし、依存componentの権利情報を列挙する`THIRD_PARTY_LICENSES.txt`とは明確に分離する。
@@ -1347,11 +1349,19 @@ external dependency と明示された候補 edge は、それだけでは stric
 
 ## 17. Query と Policy
 
-現行MVPでは専用subcommandを優先し、独自query languageはまだ実装しない。
-将来のcompositional escape hatchとして`bounded-graph-query-v1`を採用するが、
+現行CLIでは専用subcommandを優先し、bounded queryはまだ公開実行しない。
+compositional escape hatchとして`bounded-graph-query-v1`を採用するが、
 `deps / dependents / why / impact / cycles / unresolved / diff / policy`を置換しない。
 
-future `query`は既存global `--store` / `--scan-id`で選ぶ単一completed snapshotを
+Issue #177でbounded input reader、lexer/parser、canonical untyped ASTまでを
+実装済みである。query/file入力に共通のbyte/token/AST、expression nesting、
+existential/list/projection/depth/LIMIT上限を適用し、keyword case、JSON escape、
+kind set / IN listをcanonical化する。query fileはrepository confinement、
+symlink-free component、regular file、UTF-8、pre/post metadata identityを検証し、
+credential-shaped literalを`release-redaction-shapes-v1`でstore access前に拒否する。
+diagnosticはstable code / clause / token class / originだけを返し、raw inputをechoしない。
+
+後続のpublic `query`は既存global `--store` / `--scan-id`で選ぶ単一completed snapshotを
 read-onlyで開き、source node・canonical path・target nodeからなるlinear pattern
 を1件だけ受ける。direction、edge kind集合、明示depth `1..=8`、Node / Edge /
 Site / Evidenceのclosed typed field、profile / phase / canonical condition /
@@ -1860,6 +1870,7 @@ digest、ref/tag検証、PR記録項目、patch release時も変わらないance
 
 ## 26. 更新履歴
 
+- 2026-07-26: Issue #177として`bounded-graph-query-v1`のbounded input / lexer / parser sliceを実装。64 KiB / 4,096 token / 512 AST node、nesting 16、existential 16、list 64、projection 32、depth 1..=8、LIMIT 1..=10,000をfail closedに適用し、規範EBNFの単一statement、case-insensitive keyword、JSON string、canonical uint、normalized kind/list setをcanonical untyped ASTへ変換する。file readerはrepository confinement、parent traversal / symlink / special file拒否、UTF-8、size / identity / modified metadataのpre/post照合を行う。`release-redaction-shapes-v1`のcredential-shaped literal、malformed/hostile/boundary corpusをnon-echo diagnostic付きtestで固定し、type/planner/executor/public CLIから分離した。
 - 2026-07-26: Issue #176としてgreenなmain commit `d5ca92bae4b4fdbbedb2f3cabd4aa3ef731e7c9f`を`release-baseline-v1`へ固定し、initial `release/0.4` ref、v0.4.0 tag source、canonical SHA-256 digest / treeの再現手順を同一anchorへ結び付けた。main-first cherry-pickとstable-first forward-port、wholesale merge / force-push禁止、main次版機能のdefault-disabled / opt-in互換性規則を定義し、default branchのsource guardがbaseline以外のv0.4.0 Release runをcancelしてinvalid tagを削除するtest contractを追加した。
 - 2026-07-25: Issue #153として`public-readiness-v1`を採用し、repository visibilityの現行判断を`private / reject`、accountable ownerをTamaT-LLC organization owner、実行責任をdesignated repository administratorとした。public化はexact candidate commit、audited refs、GitHub settings、governance tree、release/evidence closureに結び付く9 mandatory gateとsecurity / legal / releaseの独立sign-off、organization ownerの明示`allow`を要求する。secret/history/collaboration、dependency/license/provenance、security disclosure、community/governance、maintainer/review/release/support/issue/PR policy、workflow SHA pin、repository controls、migration rehearsal、anonymous verification、incident containmentの実行可能checklistを定義した。`stable-release-gate-v1`は必要条件だが十分条件とせず、readiness recordからvisibilityを自動変更しない。visibility変更を別途明示承認されたchange windowへ分離し、再private化は公開済みcopyを回収できないcontainmentであることを固定した。
 - 2026-07-25: Issue #152として`bounded-graph-query-v1`を採用。既存専用commandを優先したまま、単一completed snapshot、単一linear pattern、明示depth `1..=8`、closed Node / Path / Edge / Site / Evidence type、profile / phase / canonical condition / evidence filter、必須limitへscopeを限定した。endpoint pairごとのcanonical shortest witnessだけを返し、path依存predicateのpartial stateにはexistential充足bitset / used edge setを含めて同一stateだけをdominanceする。複数MATCH、join、subquery、aggregation、mutation、任意再帰、regex、arbitrary property、all-path列挙を除外した。bounded query reader、parse/type、snapshot cardinality、fixed operator / deterministic cost admission、explain、staged all-or-error executor、read-only store、non-echoing diagnosticとresource/security capを定義し、parser / planner / executor / CLI / five-target release gateを6個の1〜3日後続sliceへ分離した。
