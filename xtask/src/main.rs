@@ -677,6 +677,7 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "## Security boundary",
         "## Rollout order and issue-sized plan",
         "| 1 | Common node/site/edge DTO, validator, coverage ledger, and cross-format golden harness | Implemented in #191 |",
+        "| 2 | OpenAPI 3.1 repository parser and contract graph | Implemented in #192 |",
         "| 11 | Five-target package/query/release gate | 2-3 days |",
         "## Acceptance matrix",
         "| Safe invariant |",
