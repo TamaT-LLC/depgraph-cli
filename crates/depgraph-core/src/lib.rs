@@ -97,6 +97,10 @@ pub const RUST_SYSROOT_COMPONENT_ROOT: &str = "libexec/rust-sysroot";
 pub const RUST_SYSROOT_SOURCE_LAYOUT: &str = "rustup-rust-src-library-v1";
 pub const RUST_SYSROOT_LICENSE_EXPRESSION: &str = "MIT OR Apache-2.0";
 pub const RUST_SYSROOT_SBOM_PACKAGE_NAME: &str = "rust-stdlib-source";
+pub const BOUNDED_QUERY_RELEASE_SMOKE_CONTRACT_VERSION: &str = "bounded-query-release-smoke-v1";
+pub const BOUNDED_QUERY_RELEASE_SMOKE_FIXTURE_PATH: &str = "queries/bounded-query-smoke-v1.query";
+pub const BOUNDED_QUERY_RELEASE_SMOKE_QUERY: &str =
+    include_str!("../../../queries/bounded-query-smoke-v1.query");
 pub use cache::build_cache_key;
 pub use cancellation::CancellationToken;
 pub use config::{Config, DaemonConfig, default_store_path, init_config};
@@ -345,6 +349,40 @@ pub struct ReleaseCompatibilityHealth {
     pub runtime_collector_contract_version: String,
     pub graphml_schema_version: String,
     pub packaged_smoke_contract: String,
+    pub bounded_query: BoundedQueryReleaseCompatibilityHealth,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BoundedQueryReleaseCompatibilityHealth {
+    pub release_smoke_contract_version: String,
+    pub language_contract_version: String,
+    pub type_contract_version: String,
+    pub statistics_version: String,
+    pub plan_schema_version: String,
+    pub limit_version: String,
+    pub result_schema_version: String,
+    pub fixture_path: String,
+    pub fixture_sha256: String,
+}
+
+pub fn bounded_query_release_compatibility_contract() -> BoundedQueryReleaseCompatibilityHealth {
+    use sha2::{Digest as _, Sha256};
+
+    BoundedQueryReleaseCompatibilityHealth {
+        release_smoke_contract_version: BOUNDED_QUERY_RELEASE_SMOKE_CONTRACT_VERSION.to_owned(),
+        language_contract_version: BOUNDED_QUERY_CONTRACT_VERSION.to_owned(),
+        type_contract_version: BOUNDED_QUERY_TYPE_CONTRACT_VERSION.to_owned(),
+        statistics_version: BOUNDED_QUERY_STATISTICS_VERSION.to_owned(),
+        plan_schema_version: BOUNDED_QUERY_PLAN_SCHEMA_VERSION.to_owned(),
+        limit_version: BOUNDED_QUERY_LIMIT_VERSION.to_owned(),
+        result_schema_version: BOUNDED_QUERY_RESULT_SCHEMA_VERSION.to_owned(),
+        fixture_path: BOUNDED_QUERY_RELEASE_SMOKE_FIXTURE_PATH.to_owned(),
+        fixture_sha256: format!(
+            "sha256:{}",
+            hex::encode(Sha256::digest(BOUNDED_QUERY_RELEASE_SMOKE_QUERY.as_bytes()))
+        ),
+    }
 }
 
 pub fn release_compatibility_contract() -> ReleaseCompatibilityHealth {
@@ -371,6 +409,7 @@ pub fn release_compatibility_contract() -> ReleaseCompatibilityHealth {
         runtime_collector_contract_version: RUNTIME_COLLECTOR_CONTRACT_VERSION.to_owned(),
         graphml_schema_version: GRAPHML_SCHEMA_VERSION.to_owned(),
         packaged_smoke_contract: "stable-v0.4.0-packaged-smoke-v1".to_owned(),
+        bounded_query: bounded_query_release_compatibility_contract(),
     }
 }
 
@@ -555,6 +594,7 @@ struct ReleaseManifest {
     project_licenses: Vec<ReleaseArtifact>,
     core: ReleaseArtifact,
     schema: ReleaseArtifact,
+    query_fixture: ReleaseArtifact,
     #[serde(default)]
     runtime_artifacts: Vec<ReleaseArtifact>,
     #[serde(default)]
@@ -779,6 +819,15 @@ fn release_health() -> Result<Option<ReleaseHealth>> {
     let root = manifest_path.parent().unwrap_or(Path::new("."));
     let executable =
         std::env::current_exe().context("failed to locate the running depgraph executable")?;
+    let query_fixture_integrity = if manifest.query_fixture.path
+        != BOUNDED_QUERY_RELEASE_SMOKE_FIXTURE_PATH
+        || format!("sha256:{}", manifest.query_fixture.sha256)
+            != manifest.compatibility.bounded_query.fixture_sha256
+    {
+        "error: bounded query fixture identity does not match the compatibility contract".to_owned()
+    } else {
+        artifact_integrity(root, &manifest.query_fixture, None)
+    };
     let mut runtime_integrity: BTreeMap<String, String> = manifest
         .project_licenses
         .iter()
@@ -795,6 +844,7 @@ fn release_health() -> Result<Option<ReleaseHealth>> {
             )
         }))
         .collect();
+    runtime_integrity.insert("bounded-query-contract".to_owned(), query_fixture_integrity);
     for component in &manifest.runtime_components {
         let key = format!("component:{}@{}", component.name, component.version);
         let integrity = match verify_release_runtime_component(
@@ -975,6 +1025,15 @@ mod tests {
             "0000000000000000000000000000000000000000".to_owned();
         assert!(
             verify_release_compatibility(&rust_sysroot_drifted)
+                .unwrap_err()
+                .to_string()
+                .contains("does not match")
+        );
+
+        let mut query_drifted = release_compatibility_contract();
+        query_drifted.bounded_query.result_schema_version = "bounded-query-result-v2".to_owned();
+        assert!(
+            verify_release_compatibility(&query_drifted)
                 .unwrap_err()
                 .to_string()
                 .contains("does not match")

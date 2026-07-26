@@ -9,12 +9,13 @@ use depgraph_store::{EdgeRecord, EvidenceRecord, GraphSnapshot, NodeRecord, Site
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::bounded_query_plan::bounded_query_snapshot_id;
 use crate::bounded_query_type::TypedQuantifierPredicate;
 use crate::{
     BOUNDED_QUERY_CONTRACT_VERSION, BoundedQueryLimits, BoundedQueryPlan, CancellationToken,
     EntityType, Literal, QueryDirection, ScalarOperator, SortDirection, TypedEntityExpression,
-    TypedExpression, TypedProjection, TypedQuery, TypedScalarPredicate, bounded_query_plan_digest,
-    plan_bounded_query, render_condition, typed_query_ast_digest,
+    TypedExpression, TypedProjection, TypedQuery, TypedScalarPredicate, bounded_query_graph_digest,
+    bounded_query_plan_digest, render_condition, typed_query_ast_digest,
 };
 
 pub const BOUNDED_QUERY_RESULT_SCHEMA_VERSION: &str = "bounded-query-result-v1";
@@ -140,15 +141,11 @@ fn validate_execution_inputs(
             "typed query or plan digest does not match its canonical payload",
         ));
     }
-    let recomputed = plan_bounded_query(query, &plan.snapshot_id, snapshot).map_err(|_| {
-        execution_error(
-            "query_execution_snapshot_mismatch",
-            "selected snapshot does not match the validated query plan",
-        )
-    })?;
-    if recomputed.plan_digest != plan.plan_digest
-        || recomputed.graph_digest != plan.graph_digest
-        || recomputed.snapshot_id != plan.snapshot_id
+    let graph_digest = bounded_query_graph_digest(snapshot);
+    if graph_digest != plan.graph_digest
+        || plan.snapshot_id != bounded_query_snapshot_id(&graph_digest)
+        || plan.snapshot_statistics.graph_digest != graph_digest
+        || plan.snapshot_statistics.snapshot_id != plan.snapshot_id
     {
         return Err(execution_error(
             "query_execution_snapshot_mismatch",
@@ -1911,5 +1908,130 @@ mod tests {
         sorted.sort_by(|left, right| super::row_order(left, right, &projections, &order));
         assert_eq!(sorted[0][0], Value::Null);
         assert_eq!(sorted[1][0], json!("z"));
+    }
+
+    #[test]
+    fn generated_parser_type_planner_executor_corpus_is_total_and_deterministic() {
+        fn exercise(query: &str, selected: &GraphSnapshot) -> String {
+            let typed = match parse_and_type_check_bounded_query(query) {
+                Ok(typed) => typed,
+                Err(error) => {
+                    return format!("diagnostic:{}:{:?}", error.code, error.class);
+                }
+            };
+            let plan = match plan_bounded_query(&typed, "snapshot:fuzz", selected) {
+                Ok(plan) => plan,
+                Err(error) => return format!("planning-error:{}:{}", error.code, error),
+            };
+            if !plan.admitted {
+                return crate::canonical_bounded_query_plan_json(&plan);
+            }
+            match execute_bounded_query(&typed, &plan, selected, &CancellationToken::new()) {
+                Ok(result) => depgraph_protocol::canonical_json(
+                    &serde_json::to_value(result).expect("result serializes"),
+                ),
+                Err(error) => format!("execution-error:{}:{error}", error.code),
+            }
+        }
+
+        let selected = snapshot(false);
+        let seed = br#"MATCH p = (source:"route")-["calls"*1..4]->(target:"service")
+WHERE source.id = "node:a"
+  AND EVERY edge IN EDGES(p) SATISFIES edge.phase = "semantic"
+  AND SOME evidence IN EVIDENCE(p) SATISFIES evidence.path STARTS WITH "src/"
+RETURN DISTINCT source.id, target.id, p
+ORDER BY source.id, target.id, p ASC
+LIMIT 10"#;
+        let mut state = 0xd1b5_4a32_d192_ed03_u64;
+        for case in 0..1_024_usize {
+            let mut input = seed.to_vec();
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let index = (state as usize) % input.len();
+            match case % 4 {
+                0 => input[index] = state as u8,
+                1 => {
+                    input.insert(index, state as u8);
+                }
+                2 => {
+                    input.remove(index);
+                }
+                _ => {
+                    let end = (index + (state as usize % 31)).min(input.len());
+                    input.drain(index..end);
+                }
+            }
+            let query = String::from_utf8_lossy(&input).into_owned();
+            let first = std::panic::catch_unwind(|| exercise(&query, &selected))
+                .expect("bounded query pipeline must not panic on generated input");
+            let second = std::panic::catch_unwind(|| exercise(&query, &selected))
+                .expect("bounded query pipeline must remain total on replay");
+            assert_eq!(first, second, "generated corpus case {case}");
+        }
+    }
+
+    #[test]
+    fn ten_thousand_node_hostile_graph_is_admitted_or_rejected_before_any_partial_result() {
+        let node_count = 10_001_usize;
+        let mut selected = snapshot(false);
+        selected.nodes = (0..node_count)
+            .map(|index| node(&format!("node:{index:05}"), "file"))
+            .collect();
+        selected.sites.clear();
+        selected.evidence.clear();
+        selected.edges = (0..node_count - 1)
+            .map(|index| {
+                let mut record = edge(
+                    &format!("edge:{index:05}"),
+                    &format!("node:{index:05}"),
+                    &format!("node:{:05}", index + 1),
+                    None,
+                );
+                record.kind = "imports".to_owned();
+                record
+            })
+            .collect();
+
+        let hostile = parse_and_type_check_bounded_query(
+            r#"MATCH p = (source:"file")-["imports"*1..8]->(target:"file")
+               RETURN target.id LIMIT 1"#,
+        )
+        .unwrap();
+        let rejected = plan_bounded_query(&hostile, "snapshot:hostile-10000", &selected).unwrap();
+        assert!(!rejected.admitted);
+        assert!(rejected.reasons.iter().any(|reason| {
+            matches!(
+                reason.resource.as_str(),
+                "traversal_states" | "edge_tests" | "deterministic_cost"
+            )
+        }));
+        let error =
+            execute_bounded_query(&hostile, &rejected, &selected, &CancellationToken::new())
+                .unwrap_err();
+        assert!(matches!(
+            error.code,
+            "query_plan_not_admitted" | "query_execution_resource_exhausted"
+        ));
+
+        let bounded = parse_and_type_check_bounded_query(
+            r#"MATCH p = (source:"file")-["__depgraph_test_missing_v1__"*1..1]->(target:"file")
+               WHERE source.id = "node:00000"
+               RETURN source.id, target.id, p.id
+               ORDER BY source.id, target.id, p.id ASC
+               LIMIT 1"#,
+        )
+        .unwrap();
+        let plan = plan_bounded_query(&bounded, "snapshot:hostile-10000", &selected).unwrap();
+        assert!(plan.admitted, "{:?}", plan.reasons);
+        let first =
+            execute_bounded_query(&bounded, &plan, &selected, &CancellationToken::new()).unwrap();
+        let second =
+            execute_bounded_query(&bounded, &plan, &selected, &CancellationToken::new()).unwrap();
+        assert!(first.rows.is_empty());
+        assert_eq!(first.rows, second.rows);
+        assert_eq!(first.result_digest, second.result_digest);
+        assert!(first.metrics.edge_tests <= plan.limits.edge_tests);
+        assert!(first.metrics.traversal_states <= plan.limits.traversal_states);
     }
 }

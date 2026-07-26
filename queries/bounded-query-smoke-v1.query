@@ -1,0 +1,4 @@
+MATCH p = (source:"workspace")-["__depgraph_release_smoke_missing_v1__"*1..1]->(target:"file")
+RETURN source.id, target.id, p.id
+ORDER BY source.id, target.id, p.id ASC
+LIMIT 1

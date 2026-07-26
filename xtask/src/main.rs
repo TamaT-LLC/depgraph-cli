@@ -26,7 +26,9 @@ const STABLE_RELEASE_BASELINE_DIGEST: &str =
 const STABLE_RELEASE_MAINTENANCE_BRANCH: &str = "refs/heads/release/0.4";
 const STABLE_UPGRADE_SOURCE_VERSION: &str = "0.4.0-rc.1";
 const STABLE_UPGRADE_SOURCE_STORE_SCHEMA_VERSION: i64 = 11;
-const BENCHMARK_REPORT_SCHEMA_VERSION: &str = "depgraph-benchmark-report-v4";
+const BENCHMARK_REPORT_SCHEMA_VERSION: &str = "depgraph-benchmark-report-v5";
+const BOUNDED_QUERY_PACKAGE_SMOKE_SCHEMA_VERSION: &str = "bounded-query-package-smoke-v1";
+const BOUNDED_QUERY_SBOM_PACKAGE_NAME: &str = "depgraph-bounded-query-contract";
 const PROJECT_LICENSE_EXPRESSION: &str = "MIT OR Apache-2.0";
 const PROJECT_LICENSES: &[(&str, &[u8])] = &[
     ("LICENSE-APACHE", include_bytes!("../../LICENSE-APACHE")),
@@ -140,6 +142,7 @@ struct ReleaseManifest {
     project_licenses: Vec<Artifact>,
     core: Artifact,
     schema: Artifact,
+    query_fixture: Artifact,
     runtime_artifacts: Vec<Artifact>,
     runtime_components: Vec<RuntimeComponent>,
     workers: Vec<WorkerArtifact>,
@@ -321,6 +324,22 @@ struct TargetVerificationReport {
     rust_sysroot_sha256: String,
     framework_build_artifacts: BTreeMap<String, String>,
     workers: BTreeMap<String, String>,
+    query_smoke_sha256: String,
+    query_plan_digest: String,
+    query_result_digest: String,
+    query_output_sha256: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct BoundedQueryPackageSmokeReport {
+    schema_version: String,
+    target: String,
+    archive_sha256: String,
+    contract: depgraph_core::BoundedQueryReleaseCompatibilityHealth,
+    plan_digest: String,
+    result_digest: String,
+    canonical_output_sha256: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -582,6 +601,7 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "Issue #179で`bounded-query-statistics-v1`、`bounded-query-plan-v1`、`bounded-query-limits-v1`",
         "Issue #180で`bounded-query-result-v1`のstaged executor",
         "Issue #181でpublic `depgraph query`",
+        "Issue #182で`bounded-query-release-smoke-v1`",
         "`PROJ-ARC-001-ADR-006`",
         "`public-readiness-v1`",
         "Issue #153として`public-readiness-v1`",
@@ -725,7 +745,7 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "| 3 | Snapshot cardinality statistics, fixed operator planner, cost admission, and explain schema | Implemented in #179 |",
         "| 4 | Canonical forward/reverse BFS executor, site/evidence filters, staging, and cancellation | Implemented in #180 |",
         "| 5 | CLI human/JSON output, read-only store integration, profile/phase/condition/evidence fixtures | Implemented in #181 |",
-        "| 6 | Fuzz/property tests, hostile large-graph benchmark, and five-target package/release gate | 2-3 days |",
+        "| 6 | Fuzz/property tests, hostile large-graph benchmark, and five-target package/release gate | Implemented in #182 |",
         "## Acceptance matrix",
         "| Plan above node/edge/evidence/cost cap despite `LIMIT 1` |",
     ] {
@@ -857,6 +877,9 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "docs/releases/${GITHUB_REF_NAME}.md",
         "artifacts/release-verification.json",
         "benchmark-report-${{ github.sha }}",
+        "dist/*.query-smoke.json",
+        "DEPGRAPH_BOUNDED_QUERY_PLAN_LIMIT_MS: \"7000\"",
+        "DEPGRAPH_BOUNDED_QUERY_EXECUTE_LIMIT_MS: \"10000\"",
         "node scripts/benchmark-report.mjs verify benchmark/benchmark-report.json",
         "needs: [quality, benchmark, package, verify-assets]",
         "cargo xtask stable-release-gate artifacts/release-verification.json benchmark/benchmark-report.json --output artifacts/stable-release-gate.json",
@@ -877,6 +900,8 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "node --test scripts/tests/benchmark.test.mjs",
         "scripts/benchmark-mvp.sh",
         "benchmark-report-${{ github.sha }}",
+        "DEPGRAPH_BOUNDED_QUERY_PLAN_LIMIT_MS: \"7000\"",
+        "DEPGRAPH_BOUNDED_QUERY_EXECUTE_LIMIT_MS: \"10000\"",
     ] {
         if !ci_workflow.contains(required) {
             bail!("CI workflow is missing {required:?}");
@@ -981,6 +1006,7 @@ fn package() -> Result<()> {
     fs::create_dir_all(staging.join("bin"))?;
     fs::create_dir_all(staging.join("libexec"))?;
     fs::create_dir_all(staging.join("schemas"))?;
+    fs::create_dir_all(staging.join("queries"))?;
 
     let mut project_licenses = Vec::new();
     for (path, _) in PROJECT_LICENSES {
@@ -1032,6 +1058,11 @@ fn package() -> Result<()> {
         &staging.join("schemas/depgraph-protocol-v1.schema.json"),
     )?;
     let schema_path = staging.join("schemas/depgraph-protocol-v1.schema.json");
+    let query_fixture_path = staging.join(depgraph_core::BOUNDED_QUERY_RELEASE_SMOKE_FIXTURE_PATH);
+    copy(
+        Path::new(depgraph_core::BOUNDED_QUERY_RELEASE_SMOKE_FIXTURE_PATH),
+        &query_fixture_path,
+    )?;
     let rust_sysroot_component = prepare_rust_sysroot_component(&staging)?;
     let rust_sysroot_sha256 = rust_sysroot_component.sha256.clone();
 
@@ -1072,6 +1103,10 @@ fn package() -> Result<()> {
         schema: Artifact {
             path: relative_slash(&staging, &schema_path)?,
             sha256: sha256_file(&schema_path)?,
+        },
+        query_fixture: Artifact {
+            path: relative_slash(&staging, &query_fixture_path)?,
+            sha256: sha256_file(&query_fixture_path)?,
         },
         runtime_artifacts: WEB_RUNTIME_ARTIFACTS
             .iter()
@@ -1128,7 +1163,11 @@ fn package() -> Result<()> {
     )?;
 
     let archive = create_archive(dist, &name)?;
-    verify_archive(&archive, &name)?;
+    let query_smoke = verify_archive(&archive, &name)?;
+    fs::write(
+        dist.join(format!("{name}.query-smoke.json")),
+        format!("{}\n", serde_json::to_string_pretty(&query_smoke)?),
+    )?;
     let checksum = sha256_file(&archive)?;
     fs::write(
         archive.with_extension(format!(
@@ -1453,7 +1492,7 @@ fn third_party_licenses(target: &str) -> Result<String> {
             )
         })
         .collect::<Vec<_>>();
-    let notices = first_party
+    let mut notices = first_party
         .iter()
         .map(|artifact| {
             format!(
@@ -1461,8 +1500,13 @@ fn third_party_licenses(target: &str) -> Result<String> {
                 artifact.path, artifact.version, artifact.license
             )
         })
-        .collect::<Vec<_>>()
-        .join("\n");
+        .collect::<Vec<_>>();
+    notices.push(format!(
+        "First-party bounded query contract fixture {} ({}) is licensed under {PROJECT_LICENSE_EXPRESSION} by LICENSE-MIT and LICENSE-APACHE.",
+        depgraph_core::BOUNDED_QUERY_RELEASE_SMOKE_FIXTURE_PATH,
+        depgraph_core::BOUNDED_QUERY_RELEASE_SMOKE_CONTRACT_VERSION,
+    ));
+    let notices = notices.join("\n");
     let rust_notice = rust_sysroot_license_notice();
     let mut output = format!(
         "depgraph third-party license inventory\nGenerated from the Rust and Go runtime dependency graphs, the pinned Rust standard-library source tree, and the Web bundle/runtime artifact inventory.\n{notices}\n{rust_notice}\n{SBOM_SCOPE}\n\n{}\n",
@@ -1538,6 +1582,43 @@ fn sbom(target: &str, rust_sysroot_sha256: &str) -> Result<Value> {
             "comment":SBOM_SCOPE
         }),
     );
+    let query_contract = depgraph_core::bounded_query_release_compatibility_contract();
+    let query_package_id = format!(
+        "SPDXRef-Package-{}",
+        spdx_component(BOUNDED_QUERY_SBOM_PACKAGE_NAME)
+    );
+    let query_fixture_sha256 = query_contract
+        .fixture_sha256
+        .strip_prefix("sha256:")
+        .context("bounded query fixture digest is not prefixed")?
+        .to_owned();
+    let query_contract_comment = format!(
+        "First-party bounded query contract: language {}; types {}; statistics {}; plan {}; limits {}; result {}; fixture {}",
+        query_contract.language_contract_version,
+        query_contract.type_contract_version,
+        query_contract.statistics_version,
+        query_contract.plan_schema_version,
+        query_contract.limit_version,
+        query_contract.result_schema_version,
+        query_contract.fixture_path,
+    );
+    packages.insert(
+        1,
+        json!({
+            "SPDXID":query_package_id,
+            "name":BOUNDED_QUERY_SBOM_PACKAGE_NAME,
+            "versionInfo":query_contract.release_smoke_contract_version,
+            "filesAnalyzed":false,
+            "licenseConcluded":"NOASSERTION",
+            "licenseDeclared":PROJECT_LICENSE_EXPRESSION,
+            "downloadLocation":"NOASSERTION",
+            "checksums":[{
+                "algorithm":"SHA256",
+                "checksumValue":query_fixture_sha256
+            }],
+            "comment":query_contract_comment
+        }),
+    );
     let rust_sysroot_id = format!(
         "SPDXRef-Package-{}",
         spdx_component(RUST_SYSROOT_SBOM_PACKAGE_NAME)
@@ -1604,6 +1685,11 @@ fn sbom(target: &str, rust_sysroot_sha256: &str) -> Result<Value> {
             "spdxElementId":"SPDXRef-Package-depgraph",
             "relationshipType":"CONTAINS",
             "relatedSpdxElement":rust_sysroot_id
+        }),
+        json!({
+            "spdxElementId":"SPDXRef-Package-depgraph",
+            "relationshipType":"CONTAINS",
+            "relatedSpdxElement":query_package_id
         }),
     ];
     relationships.extend(first_party_ids.into_iter().map(|(id, _)| {
@@ -1728,6 +1814,67 @@ fn verify_rust_sysroot_sbom(sbom: &Value, expected_sha256: &str, context: &str) 
         .unwrap_or_default();
     if contains != 1 {
         bail!("{context} SBOM does not relate the Rust sysroot source to the release package");
+    }
+    Ok(())
+}
+
+fn verify_bounded_query_sbom(sbom: &Value, context: &str) -> Result<()> {
+    let contract = depgraph_core::bounded_query_release_compatibility_contract();
+    let packages = sbom["packages"]
+        .as_array()
+        .with_context(|| format!("{context} SBOM has no packages"))?;
+    let matches = packages
+        .iter()
+        .filter(|package| package["name"] == BOUNDED_QUERY_SBOM_PACKAGE_NAME)
+        .collect::<Vec<_>>();
+    if matches.len() != 1 {
+        bail!("{context} SBOM must contain exactly one bounded query contract package");
+    }
+    let expected_id = format!(
+        "SPDXRef-Package-{}",
+        spdx_component(BOUNDED_QUERY_SBOM_PACKAGE_NAME)
+    );
+    let expected_comment = format!(
+        "First-party bounded query contract: language {}; types {}; statistics {}; plan {}; limits {}; result {}; fixture {}",
+        contract.language_contract_version,
+        contract.type_contract_version,
+        contract.statistics_version,
+        contract.plan_schema_version,
+        contract.limit_version,
+        contract.result_schema_version,
+        contract.fixture_path,
+    );
+    if matches[0]["SPDXID"] != expected_id
+        || matches[0]["versionInfo"] != contract.release_smoke_contract_version
+        || matches[0]["filesAnalyzed"] != Value::Bool(false)
+        || matches[0]["licenseDeclared"] != PROJECT_LICENSE_EXPRESSION
+        || matches[0]["checksums"]
+            != json!([{
+                "algorithm": "SHA256",
+                "checksumValue": contract
+                    .fixture_sha256
+                    .strip_prefix("sha256:")
+                    .context("bounded query fixture digest is not prefixed")?,
+            }])
+        || matches[0]["comment"] != expected_comment
+    {
+        bail!("{context} SBOM bounded query contract package is incompatible");
+    }
+    let contains = sbom["relationships"]
+        .as_array()
+        .map(|relationships| {
+            relationships
+                .iter()
+                .filter(|relationship| {
+                    relationship["spdxElementId"] == "SPDXRef-Package-depgraph"
+                        && relationship["relationshipType"] == "CONTAINS"
+                        && relationship["relatedSpdxElement"] == expected_id
+                })
+                .count()
+        })
+        .unwrap_or_default();
+    if contains != 1 {
+        bail!("{context} SBOM does not contain the bounded query contract from the root package");
     }
     Ok(())
 }
@@ -2760,7 +2907,11 @@ fn verify_release_assets(directory: &Path, requested_targets: &[String]) -> Resu
         .iter()
         .flat_map(|(target, extension)| {
             let archive = format!("depgraph-{VERSION}-{target}.{extension}");
-            [archive.clone(), format!("{archive}.sha256")]
+            vec![
+                archive.clone(),
+                format!("{archive}.sha256"),
+                format!("depgraph-{VERSION}-{target}.query-smoke.json"),
+            ]
         })
         .collect::<BTreeSet<_>>();
     let actual_files = fs::read_dir(directory)?
@@ -2799,11 +2950,20 @@ fn verify_release_assets(directory: &Path, requested_targets: &[String]) -> Resu
             bail!("archive {archive_name} has an unexpected top-level layout: {top_level:?}");
         }
         let extracted = temp.path().join(release_name);
+        let query_smoke_path =
+            directory.join(format!("depgraph-{VERSION}-{target}.query-smoke.json"));
+        let query_smoke_bytes = fs::read(&query_smoke_path)?;
+        let query_smoke: BoundedQueryPackageSmokeReport =
+            serde_json::from_slice(&query_smoke_bytes)
+                .context("packaged bounded query smoke report has an invalid schema")?;
+        validate_bounded_query_package_smoke(&query_smoke, target, &archive_sha256)?;
         targets.push(verify_published_release_tree(
             &extracted,
             target,
             archive_name,
             archive_sha256,
+            &query_smoke,
+            hex::encode(Sha256::digest(&query_smoke_bytes)),
         )?);
     }
     if targets
@@ -2833,11 +2993,26 @@ fn verify_release_assets(directory: &Path, requested_targets: &[String]) -> Resu
     {
         bail!("release targets do not contain identical framework build artifact bytes");
     }
+    if targets
+        .iter()
+        .map(|target| {
+            (
+                target.query_plan_digest.as_str(),
+                target.query_result_digest.as_str(),
+                target.query_output_sha256.as_str(),
+            )
+        })
+        .collect::<BTreeSet<_>>()
+        .len()
+        != 1
+    {
+        bail!("release targets do not produce identical bounded query plan/result bytes");
+    }
 
     fs::write(
         directory.join("release-verification.json"),
         serde_json::to_vec_pretty(&ReleaseVerificationReport {
-            schema_version: 4,
+            schema_version: 5,
             release_version: VERSION.to_owned(),
             tag: format!("v{VERSION}"),
             protocol_version: "1.0".to_owned(),
@@ -2858,6 +3033,37 @@ fn verify_release_assets(directory: &Path, requested_targets: &[String]) -> Resu
         selected_targets.len(),
         directory.display()
     );
+    Ok(())
+}
+
+fn validate_bounded_query_package_smoke(
+    report: &BoundedQueryPackageSmokeReport,
+    target: &str,
+    archive_sha256: &str,
+) -> Result<()> {
+    let lowercase_sha256 = |value: &str| {
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    };
+    if report.schema_version != BOUNDED_QUERY_PACKAGE_SMOKE_SCHEMA_VERSION
+        || report.target != target
+        || report.archive_sha256 != archive_sha256
+        || !lowercase_sha256(&report.archive_sha256)
+        || report.contract != depgraph_core::bounded_query_release_compatibility_contract()
+        || !report
+            .plan_digest
+            .strip_prefix("bounded-query-plan:sha256:")
+            .is_some_and(lowercase_sha256)
+        || !report
+            .result_digest
+            .strip_prefix("bounded-query-result:sha256:")
+            .is_some_and(lowercase_sha256)
+        || !lowercase_sha256(&report.canonical_output_sha256)
+    {
+        bail!("packaged bounded query smoke report is incompatible for {target}");
+    }
     Ok(())
 }
 
@@ -2936,25 +3142,58 @@ fn evaluate_stable_release_gate(
         .collect::<BTreeSet<_>>();
     let metrics = benchmark["metrics"].as_array();
     let benchmark_metrics_pass = metrics.is_some_and(|metrics| {
-        metrics.len() == 9
+        metrics.len() == 11
             && metrics
                 .iter()
                 .filter(|metric| metric["gated"] == Value::Bool(true))
                 .count()
-                == 7
+                == 9
             && metrics
                 .iter()
                 .filter(|metric| metric["gated"] == Value::Bool(true))
                 .all(|metric| metric["passed"] == Value::Bool(true))
     });
+    let bounded_query_contract = depgraph_core::bounded_query_release_compatibility_contract();
+    let bounded_query_outputs = release
+        .targets
+        .iter()
+        .map(|target| {
+            (
+                target.query_plan_digest.as_str(),
+                target.query_result_digest.as_str(),
+                target.query_output_sha256.as_str(),
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    let bounded_query_target_gate = release.targets.len() == RELEASE_TARGETS.len()
+        && release.compatibility.bounded_query == bounded_query_contract
+        && bounded_query_outputs.len() == 1
+        && release.targets.iter().all(|target| {
+            target
+                .query_plan_digest
+                .starts_with("bounded-query-plan:sha256:")
+                && target
+                    .query_result_digest
+                    .starts_with("bounded-query-result:sha256:")
+                && target.query_output_sha256.len() == 64
+                && target
+                    .query_output_sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit())
+                && target.query_smoke_sha256.len() == 64
+                && target
+                    .query_smoke_sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit())
+        });
 
     let checks = vec![
         StableReleaseGateCheck {
             id: "release-identity".to_owned(),
-            passed: release.schema_version == 4
+            passed: release.schema_version == 5
                 && release.release_version == STABLE_RELEASE_VERSION
                 && release.tag == format!("v{STABLE_RELEASE_VERSION}"),
-            evidence: "release-verification.json schema 4 and exact stable tag".to_owned(),
+            evidence: "release-verification.json schema 5 and exact stable tag".to_owned(),
         },
         StableReleaseGateCheck {
             id: "protocol-store-cache-compatibility".to_owned(),
@@ -2998,7 +3237,22 @@ fn evaluate_stable_release_gate(
                 && benchmark["fixture"]["source_file_count"] == 10_000
                 && benchmark["gate"]["passed"] == Value::Bool(true)
                 && benchmark_metrics_pass,
-            evidence: "depgraph-benchmark-report-v4 exact fixture and seven gated metrics".to_owned(),
+            evidence:
+                "depgraph-benchmark-report-v5 exact fixture and nine gated metrics, including bounded query plan/execute"
+                    .to_owned(),
+        },
+        StableReleaseGateCheck {
+            id: "bounded-query-five-target".to_owned(),
+            passed: bounded_query_target_gate
+                && benchmark["evidence"]["bounded_query"]["contract"]
+                    == serde_json::to_value(&bounded_query_contract)
+                        .unwrap_or(Value::Null)
+                && benchmark["evidence"]["bounded_query"]["admitted"] == Value::Bool(true)
+                && benchmark["evidence"]["bounded_query"]["hostile_rejected"]
+                    == Value::Bool(true),
+            evidence:
+                "five native archives share the compiled bounded query identity and canonical smoke output"
+                    .to_owned(),
         },
         StableReleaseGateCheck {
             id: "safety-framework-collector".to_owned(),
@@ -3097,6 +3351,8 @@ fn verify_published_release_tree(
     expected_target: &str,
     archive: String,
     archive_sha256: String,
+    query_smoke: &BoundedQueryPackageSmokeReport,
+    query_smoke_sha256: String,
 ) -> Result<TargetVerificationReport> {
     if fs::symlink_metadata(extracted)?.file_type().is_symlink() {
         bail!("published release root must not be a symlink");
@@ -3117,6 +3373,7 @@ fn verify_published_release_tree(
         "THIRD_PARTY_LICENSES.txt",
         "sbom.spdx.json",
         "schemas/depgraph-protocol-v1.schema.json",
+        depgraph_core::BOUNDED_QUERY_RELEASE_SMOKE_FIXTURE_PATH,
     ] {
         if !extracted.join(required).is_file() {
             bail!("published release is missing {required}");
@@ -3156,6 +3413,23 @@ fn verify_published_release_tree(
     }
     artifact_paths.insert(manifest.schema.path.as_str());
     verify_release_artifact(extracted, &manifest.schema, "schema")?;
+    if manifest.query_fixture.path != depgraph_core::BOUNDED_QUERY_RELEASE_SMOKE_FIXTURE_PATH {
+        bail!("published release query fixture path does not match the query contract");
+    }
+    if !artifact_paths.insert(manifest.query_fixture.path.as_str()) {
+        bail!(
+            "published release reuses query fixture path {}",
+            manifest.query_fixture.path
+        );
+    }
+    let query_fixture =
+        verify_release_artifact(extracted, &manifest.query_fixture, "bounded query fixture")?;
+    if fs::read_to_string(query_fixture)? != depgraph_core::BOUNDED_QUERY_RELEASE_SMOKE_QUERY
+        || format!("sha256:{}", manifest.query_fixture.sha256)
+            != manifest.compatibility.bounded_query.fixture_sha256
+    {
+        bail!("published bounded query fixture differs from its compiled contract");
+    }
 
     if manifest.project_licenses.len() != PROJECT_LICENSES.len() {
         bail!("published release must attest exactly both project licenses");
@@ -3400,6 +3674,7 @@ fn verify_published_release_tree(
         .collect::<BTreeSet<_>>();
     for required in [
         "@astrojs/compiler",
+        BOUNDED_QUERY_SBOM_PACKAGE_NAME,
         "depgraph-runtime-collector",
         "typescript",
         "golang.org/x/tools",
@@ -3415,6 +3690,7 @@ fn verify_published_release_tree(
     }
     verify_runtime_collector_sbom(&sbom, &runtime_collector_sha256, "published release")?;
     verify_rust_sysroot_sbom(&sbom, &rust_sysroot_sha256, "published release")?;
+    verify_bounded_query_sbom(&sbom, "published release")?;
     let framework_build_artifacts = manifest_framework_build_artifact_checksums(&manifest)?;
     verify_framework_build_sbom(&sbom, &framework_build_artifacts, "published release")?;
     if package_names
@@ -3429,6 +3705,11 @@ fn verify_published_release_tree(
     if !third_party.starts_with("depgraph third-party license inventory\n")
         || !third_party.contains(&format!(
             "First-party artifact {RUNTIME_COLLECTOR_ARTIFACT} ({RUNTIME_COLLECTOR_CONTRACT_VERSION}) is licensed under {PROJECT_LICENSE_EXPRESSION}"
+        ))
+        || !third_party.contains(&format!(
+            "First-party bounded query contract fixture {} ({}) is licensed under {PROJECT_LICENSE_EXPRESSION}",
+            depgraph_core::BOUNDED_QUERY_RELEASE_SMOKE_FIXTURE_PATH,
+            depgraph_core::BOUNDED_QUERY_RELEASE_SMOKE_CONTRACT_VERSION,
         ))
         || !third_party.contains(&rust_sysroot_license_notice())
         || PROJECT_LICENSES.iter().any(|(_, project_text)| {
@@ -3482,6 +3763,10 @@ fn verify_published_release_tree(
         rust_sysroot_sha256,
         framework_build_artifacts,
         workers,
+        query_smoke_sha256,
+        query_plan_digest: query_smoke.plan_digest.clone(),
+        query_result_digest: query_smoke.result_digest.clone(),
+        query_output_sha256: query_smoke.canonical_output_sha256.clone(),
     })
 }
 
@@ -3536,7 +3821,8 @@ fn without_windows_verbatim_prefix(path: &[u16]) -> Vec<u16> {
     }
 }
 
-fn verify_archive(archive: &Path, name: &str) -> Result<()> {
+fn verify_archive(archive: &Path, name: &str) -> Result<BoundedQueryPackageSmokeReport> {
+    let archive_sha256 = sha256_file(archive)?;
     let verify_root = std::env::temp_dir().join(format!(
         "depgraph-release-gate-{}-{}",
         std::process::id(),
@@ -3550,7 +3836,7 @@ fn verify_archive(archive: &Path, name: &str) -> Result<()> {
 
     let extracted = verify_root.join(name);
     let executable = extracted.join("bin").join(executable_name("depgraph"));
-    verify_release_metadata(&extracted)?;
+    let release_manifest = verify_release_metadata(&extracted)?;
     #[cfg(unix)]
     {
         let symlinked_root = verify_root.join("symlinked-release-root");
@@ -3637,6 +3923,16 @@ fn verify_archive(archive: &Path, name: &str) -> Result<()> {
     let second_web_store = verify_root.join("web-two.db");
     verify_packaged_scan(&executable, &second_web_store, &second_fixture, "web")?;
     verify_packaged_web_determinism(&executable, &first_web_store, &second_web_store)?;
+    let query_smoke = verify_packaged_bounded_query(
+        &executable,
+        &extracted,
+        &fixture,
+        &first_web_store,
+        &second_fixture,
+        &second_web_store,
+        &release_manifest.target,
+        &archive_sha256,
+    )?;
     verify_packaged_web_runtime_fails_closed(&executable, &extracted, &verify_root, &fixture)?;
     let semantic_complete_fixture =
         Path::new("workers/web/test/fixtures/semantic-complete").canonicalize()?;
@@ -3685,7 +3981,7 @@ fn verify_archive(archive: &Path, name: &str) -> Result<()> {
     let go_fixture = Path::new("workers/go/internal/worker/testdata/workspace").canonicalize()?;
     verify_packaged_layout_fails_closed(&executable, &extracted, &verify_root, &go_fixture)?;
     fs::remove_dir_all(verify_root)?;
-    Ok(())
+    Ok(query_smoke)
 }
 
 fn verify_packaged_build_evidence(
@@ -4460,6 +4756,24 @@ fn verify_packaged_project_licenses_fail_closed(
         )?;
         fs::write(&path, original)?;
     }
+    let query_path = extracted.join(depgraph_core::BOUNDED_QUERY_RELEASE_SMOKE_FIXTURE_PATH);
+    let query = fs::read(&query_path)?;
+    fs::remove_file(&query_path)?;
+    verify_packaged_security_failure(
+        executable,
+        &verify_root.join("bounded-query-fixture-missing.db"),
+        fixture,
+        "missing bounded query fixture",
+    )?;
+    fs::write(&query_path, &query)?;
+    fs::write(&query_path, b"tampered bounded query fixture")?;
+    verify_packaged_security_failure(
+        executable,
+        &verify_root.join("bounded-query-fixture-tampered.db"),
+        fixture,
+        "tampered bounded query fixture",
+    )?;
+    fs::write(&query_path, query)?;
     Ok(())
 }
 
@@ -4499,6 +4813,10 @@ fn verify_release_static_prelaunch_fails_closed(extracted: &Path) -> Result<()> 
         cases.push(("schema path mismatch", manifest));
 
         let mut manifest = baseline.clone();
+        manifest.query_fixture = manifest.schema.clone();
+        cases.push(("bounded query fixture path mismatch", manifest));
+
+        let mut manifest = baseline.clone();
         manifest.license_expression = "MIT".to_owned();
         cases.push(("project license expression mismatch", manifest));
 
@@ -4509,6 +4827,11 @@ fn verify_release_static_prelaunch_fails_closed(extracted: &Path) -> Result<()> 
         let mut manifest = baseline.clone();
         manifest.compatibility.packaged_smoke_contract = "unverified-packaged-smoke".to_owned();
         cases.push(("packaged smoke compatibility mismatch", manifest));
+
+        let mut manifest = baseline.clone();
+        manifest.compatibility.bounded_query.result_schema_version =
+            "bounded-query-result-v2".to_owned();
+        cases.push(("bounded query compatibility mismatch", manifest));
 
         let mut manifest = baseline.clone();
         manifest.compatibility.framework_build_gate_contract_version =
@@ -8658,6 +8981,107 @@ fn verify_packaged_web_determinism(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn verify_packaged_bounded_query(
+    executable: &Path,
+    release_root: &Path,
+    first_checkout: &Path,
+    first_store: &Path,
+    second_checkout: &Path,
+    second_store: &Path,
+    target: &str,
+    archive_sha256: &str,
+) -> Result<BoundedQueryPackageSmokeReport> {
+    let fixture_path = release_root.join(depgraph_core::BOUNDED_QUERY_RELEASE_SMOKE_FIXTURE_PATH);
+    let query = fs::read_to_string(&fixture_path)
+        .context("packaged bounded query smoke fixture is not valid UTF-8")?;
+    if query != depgraph_core::BOUNDED_QUERY_RELEASE_SMOKE_QUERY {
+        bail!("packaged bounded query smoke fixture differs from the compiled contract");
+    }
+    let run = |checkout: &Path, store: &Path, explain: bool| -> Result<std::process::Output> {
+        let mut command = Command::new(executable);
+        command
+            .current_dir(checkout)
+            .arg("--store")
+            .arg(store)
+            .args(["query", "--query", &query]);
+        if explain {
+            command.arg("--explain");
+        }
+        command.arg("--json");
+        let output = command
+            .output()
+            .context("failed to run packaged bounded query")?;
+        if !output.status.success() || !output.stderr.is_empty() {
+            bail!(
+                "packaged bounded query failed: status={:?}\n{}\n{}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        Ok(output)
+    };
+
+    let first_plan = run(first_checkout, first_store, true)?;
+    let second_plan = run(second_checkout, second_store, true)?;
+    let first_result = run(first_checkout, first_store, false)?;
+    let second_result = run(second_checkout, second_store, false)?;
+    if first_plan.stdout != second_plan.stdout || first_result.stdout != second_result.stdout {
+        bail!("packaged bounded query changed across checkout-equivalent snapshots");
+    }
+    let plan: Value = serde_json::from_slice(&first_plan.stdout)
+        .context("packaged query plan is invalid JSON")?;
+    let result: Value = serde_json::from_slice(&first_result.stdout)
+        .context("packaged query result is invalid JSON")?;
+    let contract = depgraph_core::bounded_query_release_compatibility_contract();
+    if plan["schema_version"] != contract.plan_schema_version
+        || plan["contract_version"] != contract.language_contract_version
+        || plan["limit_version"] != contract.limit_version
+        || plan["admitted"] != Value::Bool(true)
+        || result["schema_version"] != contract.result_schema_version
+        || result["contract_version"] != contract.language_contract_version
+        || result["rows"]
+            .as_array()
+            .is_none_or(|rows| !rows.is_empty())
+        || result["plan_digest"] != plan["plan_digest"]
+    {
+        bail!("packaged bounded query output does not satisfy its release contract");
+    }
+    let plan_digest = plan["plan_digest"]
+        .as_str()
+        .context("packaged bounded query plan omitted its digest")?
+        .to_owned();
+    let result_digest = result["result_digest"]
+        .as_str()
+        .context("packaged bounded query result omitted its digest")?
+        .to_owned();
+    if !plan_digest.starts_with("bounded-query-plan:sha256:")
+        || !result_digest.starts_with("bounded-query-result:sha256:")
+    {
+        bail!("packaged bounded query returned malformed plan/result digests");
+    }
+    let rendered = String::from_utf8(first_result.stdout.clone())
+        .context("packaged bounded query result is not UTF-8")?;
+    if rendered.contains("\"properties\"")
+        || rendered.contains("\"detail\"")
+        || rendered.contains(first_checkout.to_string_lossy().as_ref())
+        || rendered.contains(second_checkout.to_string_lossy().as_ref())
+    {
+        bail!("packaged bounded query exposed a closed or checkout-local field");
+    }
+
+    Ok(BoundedQueryPackageSmokeReport {
+        schema_version: BOUNDED_QUERY_PACKAGE_SMOKE_SCHEMA_VERSION.to_owned(),
+        target: target.to_owned(),
+        archive_sha256: archive_sha256.to_owned(),
+        contract,
+        plan_digest,
+        result_digest,
+        canonical_output_sha256: hex::encode(Sha256::digest(&first_result.stdout)),
+    })
+}
+
 fn verify_release_metadata(extracted: &Path) -> Result<ReleaseManifest> {
     if fs::symlink_metadata(extracted)?.file_type().is_symlink() {
         bail!(
@@ -8672,6 +9096,7 @@ fn verify_release_metadata(extracted: &Path) -> Result<ReleaseManifest> {
         "THIRD_PARTY_LICENSES.txt",
         "sbom.spdx.json",
         "schemas/depgraph-protocol-v1.schema.json",
+        depgraph_core::BOUNDED_QUERY_RELEASE_SMOKE_FIXTURE_PATH,
     ] {
         let path = extracted.join(required);
         if !path.is_file()
@@ -8693,6 +9118,17 @@ fn verify_release_metadata(extracted: &Path) -> Result<ReleaseManifest> {
     }
     if manifest.license_expression != PROJECT_LICENSE_EXPRESSION {
         bail!("release manifest project license expression must be {PROJECT_LICENSE_EXPRESSION}");
+    }
+    if manifest.query_fixture.path != depgraph_core::BOUNDED_QUERY_RELEASE_SMOKE_FIXTURE_PATH {
+        bail!("release manifest bounded query fixture path is incompatible");
+    }
+    let query_fixture =
+        verify_release_artifact(extracted, &manifest.query_fixture, "bounded query fixture")?;
+    if fs::read_to_string(query_fixture)? != depgraph_core::BOUNDED_QUERY_RELEASE_SMOKE_QUERY
+        || format!("sha256:{}", manifest.query_fixture.sha256)
+            != manifest.compatibility.bounded_query.fixture_sha256
+    {
+        bail!("release manifest bounded query fixture identity is incompatible");
     }
     if manifest.project_licenses.len() != PROJECT_LICENSES.len() {
         bail!("release manifest must contain exactly the project license files");
@@ -8982,6 +9418,7 @@ fn verify_release_metadata(extracted: &Path) -> Result<ReleaseManifest> {
     }
     verify_runtime_collector_sbom(&sbom, &runtime_collector_sha256, "release")?;
     verify_rust_sysroot_sbom(&sbom, &rust_sysroot_sha256, "release")?;
+    verify_bounded_query_sbom(&sbom, "release")?;
     verify_framework_build_sbom(
         &sbom,
         &manifest_framework_build_artifact_checksums(&manifest)?,
@@ -9064,6 +9501,13 @@ fn verify_release_metadata(extracted: &Path) -> Result<ReleaseManifest> {
         "First-party artifact {RUNTIME_COLLECTOR_ARTIFACT} ({RUNTIME_COLLECTOR_CONTRACT_VERSION}) is licensed under {PROJECT_LICENSE_EXPRESSION}"
     )) {
         bail!("license inventory is missing the runtime collector project license notice");
+    }
+    if !license_inventory.contains(&format!(
+        "First-party bounded query contract fixture {} ({}) is licensed under {PROJECT_LICENSE_EXPRESSION}",
+        depgraph_core::BOUNDED_QUERY_RELEASE_SMOKE_FIXTURE_PATH,
+        depgraph_core::BOUNDED_QUERY_RELEASE_SMOKE_CONTRACT_VERSION,
+    )) {
+        bail!("license inventory is missing the bounded query project license notice");
     }
     for (name, version, license) in [
         ("@astrojs/compiler", "4.0.0", "MIT"),
@@ -9666,21 +10110,23 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        ARCHIVE_MTIME, BENCHMARK_REPORT_SCHEMA_VERSION, DependencyPackage,
-        PROJECT_LICENSE_EXPRESSION, RELEASE_TARGETS, RUNTIME_COLLECTOR_CONTRACT_VERSION,
-        RUST_SYSROOT_COMPONENT_SHA256, ReleaseVerificationReport, STABLE_RELEASE_BASELINE_COMMIT,
-        STABLE_RELEASE_BASELINE_DIGEST, STABLE_RELEASE_VERSION, STABLE_UPGRADE_SOURCE_VERSION,
-        StableReleaseDecision, TYPESCRIPT_VERSION, TargetVerificationReport, VERSION,
-        WEB_SEMANTIC_CAPABILITIES, WEB_SEMANTIC_RUNTIME_ARTIFACTS, WEB_SEMANTIC_RUNTIME_COMPONENTS,
-        WebSemanticAttestation, WorkerBackend, archive_entries, cargo_runtime_packages,
-        create_tar_archive, create_zip_archive, evaluate_stable_release_gate,
-        executable_name_for_target, extract_archive, normalized_spdx_license, package_url,
-        parse_worker_handshake, release_compatibility, remove_transient_build_run_ids,
-        rust_backend_from_handshake, rustc_source_identity, stable_release_baseline_digest,
-        verify_checksum_sidecar, verify_pinned_rust_sysroot_digest, verify_project_metadata,
-        verify_release_tag_values, verify_rust_analyzer_dependencies, verify_rust_backend,
-        verify_stable_release_source_guard, verify_web_semantic_attestation, web_runtime_packages,
-        web_semantic_from_handshake, without_windows_verbatim_prefix, workspace_root,
+        ARCHIVE_MTIME, BENCHMARK_REPORT_SCHEMA_VERSION, BOUNDED_QUERY_PACKAGE_SMOKE_SCHEMA_VERSION,
+        BoundedQueryPackageSmokeReport, DependencyPackage, PROJECT_LICENSE_EXPRESSION,
+        RELEASE_TARGETS, RUNTIME_COLLECTOR_CONTRACT_VERSION, RUST_SYSROOT_COMPONENT_SHA256,
+        ReleaseVerificationReport, STABLE_RELEASE_BASELINE_COMMIT, STABLE_RELEASE_BASELINE_DIGEST,
+        STABLE_RELEASE_VERSION, STABLE_UPGRADE_SOURCE_VERSION, StableReleaseDecision,
+        TYPESCRIPT_VERSION, TargetVerificationReport, VERSION, WEB_SEMANTIC_CAPABILITIES,
+        WEB_SEMANTIC_RUNTIME_ARTIFACTS, WEB_SEMANTIC_RUNTIME_COMPONENTS, WebSemanticAttestation,
+        WorkerBackend, archive_entries, cargo_runtime_packages, create_tar_archive,
+        create_zip_archive, evaluate_stable_release_gate, executable_name_for_target,
+        extract_archive, normalized_spdx_license, package_url, parse_worker_handshake,
+        release_compatibility, remove_transient_build_run_ids, rust_backend_from_handshake,
+        rustc_source_identity, stable_release_baseline_digest,
+        validate_bounded_query_package_smoke, verify_checksum_sidecar,
+        verify_pinned_rust_sysroot_digest, verify_project_metadata, verify_release_tag_values,
+        verify_rust_analyzer_dependencies, verify_rust_backend, verify_stable_release_source_guard,
+        verify_web_semantic_attestation, web_runtime_packages, web_semantic_from_handshake,
+        without_windows_verbatim_prefix, workspace_root,
     };
 
     fn release_tree() -> Result<(tempfile::TempDir, String)> {
@@ -9841,9 +10287,13 @@ mod tests {
             rust_sysroot_sha256: "e".repeat(64),
             framework_build_artifacts: BTreeMap::new(),
             workers: BTreeMap::new(),
+            query_smoke_sha256: "f".repeat(64),
+            query_plan_digest: format!("bounded-query-plan:sha256:{}", "1".repeat(64)),
+            query_result_digest: format!("bounded-query-result:sha256:{}", "2".repeat(64)),
+            query_output_sha256: "3".repeat(64),
         };
         let release = ReleaseVerificationReport {
-            schema_version: 4,
+            schema_version: 5,
             release_version: STABLE_RELEASE_VERSION.to_owned(),
             tag: format!("v{STABLE_RELEASE_VERSION}"),
             protocol_version: "1.0".to_owned(),
@@ -9861,9 +10311,9 @@ mod tests {
                 .map(|(name, _)| target(name))
                 .collect(),
         };
-        let metrics = (0..9)
+        let metrics = (0..11)
             .map(|index| {
-                let gated = index < 7;
+                let gated = index < 9;
                 json!({"gated": gated, "passed": true})
             })
             .collect::<Vec<_>>();
@@ -9871,7 +10321,14 @@ mod tests {
             "schema_version": BENCHMARK_REPORT_SCHEMA_VERSION,
             "fixture": {"source_file_count": 10_000},
             "gate": {"passed": true},
-            "metrics": metrics
+            "metrics": metrics,
+            "evidence": {
+                "bounded_query": {
+                    "contract": depgraph_core::bounded_query_release_compatibility_contract(),
+                    "admitted": true,
+                    "hostile_rejected": true
+                }
+            }
         });
         let workflow_results = BTreeMap::from([
             ("github_actions".to_owned(), "true".to_owned()),
@@ -9922,6 +10379,14 @@ mod tests {
             StableReleaseDecision::Reject
         );
 
+        let mut query_drift = release.clone();
+        query_drift.targets[0].query_result_digest =
+            format!("bounded-query-result:sha256:{}", "9".repeat(64));
+        assert_eq!(
+            evaluate(&query_drift, &benchmark).decision,
+            StableReleaseDecision::Reject
+        );
+
         let mut failed_workflow = workflow_results.clone();
         failed_workflow.insert("quality".to_owned(), "failure".to_owned());
         assert_eq!(
@@ -9969,6 +10434,58 @@ mod tests {
         assert_eq!(
             executable_name_for_target("depgraph", "aarch64-apple-darwin"),
             "depgraph"
+        );
+    }
+
+    #[test]
+    fn bounded_query_package_smoke_rejects_target_version_and_output_drift() {
+        let report = BoundedQueryPackageSmokeReport {
+            schema_version: BOUNDED_QUERY_PACKAGE_SMOKE_SCHEMA_VERSION.to_owned(),
+            target: "aarch64-apple-darwin".to_owned(),
+            archive_sha256: "0".repeat(64),
+            contract: depgraph_core::bounded_query_release_compatibility_contract(),
+            plan_digest: format!("bounded-query-plan:sha256:{}", "1".repeat(64)),
+            result_digest: format!("bounded-query-result:sha256:{}", "2".repeat(64)),
+            canonical_output_sha256: "3".repeat(64),
+        };
+        validate_bounded_query_package_smoke(&report, "aarch64-apple-darwin", &"0".repeat(64))
+            .unwrap();
+        assert!(
+            validate_bounded_query_package_smoke(&report, "x86_64-apple-darwin", &"0".repeat(64),)
+                .is_err()
+        );
+
+        let mut version_drift = report.clone();
+        version_drift.contract.limit_version = "bounded-query-limits-v2".to_owned();
+        assert!(
+            validate_bounded_query_package_smoke(
+                &version_drift,
+                "aarch64-apple-darwin",
+                &"0".repeat(64),
+            )
+            .is_err()
+        );
+
+        let mut archive_drift = report.clone();
+        archive_drift.archive_sha256 = "4".repeat(64);
+        assert!(
+            validate_bounded_query_package_smoke(
+                &archive_drift,
+                "aarch64-apple-darwin",
+                &"0".repeat(64),
+            )
+            .is_err()
+        );
+
+        let mut output_drift = report;
+        output_drift.canonical_output_sha256 = "not-a-digest".to_owned();
+        assert!(
+            validate_bounded_query_package_smoke(
+                &output_drift,
+                "aarch64-apple-darwin",
+                &"0".repeat(64),
+            )
+            .is_err()
         );
     }
 

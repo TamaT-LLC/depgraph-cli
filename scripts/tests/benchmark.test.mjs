@@ -11,6 +11,7 @@ import {
   restoreFixture,
 } from "../benchmark-fixture.mjs";
 import {
+  BOUNDED_QUERY_RELEASE_CONTRACT,
   evaluateMetric,
   EXPECTED_FIXTURE_SHA256,
   orderedSampleNames,
@@ -171,6 +172,22 @@ test("release verification requires the complete 10,000-file metric contract", (
       500,
       500,
     ],
+    [
+      "bounded_query_plan",
+      "verified_snapshot_plan",
+      true,
+      [2, 2, 3],
+      7_000,
+      5_000,
+    ],
+    [
+      "bounded_query_execute",
+      "canonical_adjacency_bfs",
+      true,
+      [3, 3, 4],
+      10_000,
+      8_000,
+    ],
     ["rust_hir_semantic_scan", "cold_graph_store", true, [5], 10_000, 10_000],
     ["warm_rust_symbol_query", "primed_graph_store", true, [1], 4_000, 500],
     [
@@ -248,6 +265,8 @@ test("release verification requires the complete 10,000-file metric contract", (
         one_file_incremental_scan: "test",
         cold_query: "test",
         warm_query: "test",
+        bounded_query_plan: "test",
+        bounded_query_execute: "test",
       },
       toolchains: {
         cargo: "test",
@@ -310,6 +329,18 @@ test("release verification requires the complete 10,000-file metric contract", (
         "start",
         "rust-app",
       ],
+      bounded_query: {
+        contract: BOUNDED_QUERY_RELEASE_CONTRACT,
+        source_file_count: 10_000,
+        graph_node_count: 20_003,
+        graph_edge_count: 40_000,
+        admitted: true,
+        plan_digest: `bounded-query-plan:sha256:${"1".repeat(64)}`,
+        result_digest: `bounded-query-result:sha256:${"2".repeat(64)}`,
+        result_rows: 0,
+        hostile_rejected: true,
+        hostile_resources: ["traversal_states", "deterministic_cost"],
+      },
     },
     metrics,
   };

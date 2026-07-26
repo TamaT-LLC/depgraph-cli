@@ -338,7 +338,7 @@ Planning is a pure function of:
 
 - `contract_version=bounded-graph-query-v1`;
 - canonical typed AST digest;
-- completed snapshot ID and verified graph digest;
+- portable selected-snapshot ID derived from the verified closed graph digest;
 - exact node/edge/site/evidence counts, per-kind/profile/phase cardinality,
   and canonical serialized byte bounds for the closed result fields;
 - the number of existential path predicates and the deterministic upper bound
@@ -347,7 +347,8 @@ Planning is a pure function of:
 
 Checkout path, store path, query-file path, SQLite row order, locale, wall
 clock, runner speed, cache warmth, terminal, CI state, and previous query
-results are not planning input.
+results are not planning input. The store's internal snapshot row ID selects
+the immutable input but is not emitted into the portable plan/result identity.
 
 The planner chooses only these operators:
 
@@ -483,7 +484,7 @@ Each row is one independently reviewable one-to-three-day follow-up Issue.
 | 3 | Snapshot cardinality statistics, fixed operator planner, cost admission, and explain schema | Implemented in #179 | 2 | Explain and execute admission are byte-identical across checkouts and SQLite row orders |
 | 4 | Canonical forward/reverse BFS executor, site/evidence filters, staging, and cancellation | Implemented in #180 | 3 | One shortest witness per endpoint pair; every cap is all-or-error |
 | 5 | CLI human/JSON output, read-only store integration, profile/phase/condition/evidence fixtures | Implemented in #181 | 4 | Multi-root and cross-kind use cases work without changing a snapshot |
-| 6 | Fuzz/property tests, hostile large-graph benchmark, and five-target package/release gate | 2-3 days | 5 | Parser/planner/executor survive malformed/budget fixtures; all native archives agree |
+| 6 | Fuzz/property tests, hostile large-graph benchmark, and five-target package/release gate | Implemented in #182 | 5 | Parser/planner/executor survive malformed/budget fixtures; all native archives agree |
 
 Parser, planner, and executor remain separate components delivered by separate
 Issues. The parser cannot directly traverse, the planner cannot access raw

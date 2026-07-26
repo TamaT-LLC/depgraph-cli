@@ -222,13 +222,13 @@ pub fn bounded_query_graph_digest(snapshot: &GraphSnapshot) -> String {
 
 #[must_use]
 pub fn collect_bounded_query_statistics(
-    snapshot_id: &str,
+    _snapshot_id: &str,
     snapshot: &GraphSnapshot,
 ) -> SnapshotCardinalityStatistics {
     let graph_digest = bounded_query_graph_digest(snapshot);
     let mut statistics = SnapshotCardinalityStatistics {
         statistics_version: BOUNDED_QUERY_STATISTICS_VERSION.to_owned(),
-        snapshot_id: snapshot_id.to_owned(),
+        snapshot_id: bounded_query_snapshot_id(&graph_digest),
         graph_digest,
         node_count: usize_u64(snapshot.nodes.len()),
         profile_count: usize_u64(snapshot.profiles.len()),
@@ -265,7 +265,7 @@ pub fn plan_bounded_query(
     snapshot: &GraphSnapshot,
 ) -> BoundedQueryPlanningResult<BoundedQueryPlan> {
     let statistics = collect_bounded_query_statistics(snapshot_id, snapshot);
-    plan_bounded_query_with_statistics(query, snapshot, statistics)
+    plan_bounded_query_from_verified_statistics(query, statistics)
 }
 
 pub fn plan_bounded_query_with_statistics(
@@ -274,6 +274,13 @@ pub fn plan_bounded_query_with_statistics(
     statistics: SnapshotCardinalityStatistics,
 ) -> BoundedQueryPlanningResult<BoundedQueryPlan> {
     validate_statistics(snapshot, &statistics)?;
+    plan_bounded_query_from_verified_statistics(query, statistics)
+}
+
+fn plan_bounded_query_from_verified_statistics(
+    query: &TypedQuery,
+    statistics: SnapshotCardinalityStatistics,
+) -> BoundedQueryPlanningResult<BoundedQueryPlan> {
     if query.digest != crate::typed_query_ast_digest(&query.ast) {
         return Err(planning_error(
             "query_typed_ast_digest_mismatch",
@@ -507,12 +514,6 @@ fn validate_statistics(
             "snapshot statistics version is not supported",
         ));
     }
-    if statistics.graph_digest != bounded_query_graph_digest(snapshot) {
-        return Err(planning_error(
-            "query_snapshot_graph_digest_mismatch",
-            "snapshot graph digest does not match its canonical closed graph",
-        ));
-    }
     if statistics.metadata_digest != statistics_digest(statistics) {
         return Err(planning_error(
             "query_statistics_digest_mismatch",
@@ -520,6 +521,12 @@ fn validate_statistics(
         ));
     }
     let observed = collect_bounded_query_statistics(&statistics.snapshot_id, snapshot);
+    if statistics.graph_digest != observed.graph_digest {
+        return Err(planning_error(
+            "query_snapshot_graph_digest_mismatch",
+            "snapshot graph digest does not match its canonical closed graph",
+        ));
+    }
     if &observed != statistics {
         return Err(planning_error(
             "query_statistics_cardinality_mismatch",
@@ -527,6 +534,13 @@ fn validate_statistics(
         ));
     }
     Ok(())
+}
+
+pub(crate) fn bounded_query_snapshot_id(graph_digest: &str) -> String {
+    let digest = graph_digest
+        .strip_prefix("bounded-query-graph:sha256:")
+        .expect("bounded query graph digests use their fixed namespace");
+    format!("snapshot:sha256:{digest}")
 }
 
 fn statistics_digest(statistics: &SnapshotCardinalityStatistics) -> String {
@@ -1350,8 +1364,9 @@ mod tests {
             bounded_query_graph_digest(&first_snapshot),
             bounded_query_graph_digest(&second_snapshot)
         );
-        let first = plan_bounded_query(&typed, "snapshot:stable", &first_snapshot).unwrap();
-        let second = plan_bounded_query(&typed, "snapshot:stable", &second_snapshot).unwrap();
+        let first = plan_bounded_query(&typed, "snapshot:checkout-one", &first_snapshot).unwrap();
+        let second = plan_bounded_query(&typed, "snapshot:checkout-two", &second_snapshot).unwrap();
+        assert_eq!(first.snapshot_id, second.snapshot_id);
         assert_eq!(first.plan_digest, second.plan_digest);
         assert_eq!(
             canonical_bounded_query_plan_json(&first),
