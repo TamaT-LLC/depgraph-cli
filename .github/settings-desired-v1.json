@@ -1,0 +1,90 @@
+{
+  "schema_version": "github-settings-desired-v1",
+  "repository": "TamaT-LLC/depgraph-cli",
+  "default_branch": "main",
+  "rulesets": [
+    {
+      "name": "protect-main",
+      "target": "branch",
+      "enforcement": "enabled",
+      "include": [
+        "refs/heads/main"
+      ],
+      "required_checks": [
+        {
+          "context": "go",
+          "source_app_id": 15368,
+          "source_app_slug": "github-actions"
+        },
+        {
+          "context": "rust",
+          "source_app_id": 15368,
+          "source_app_slug": "github-actions"
+        },
+        {
+          "context": "web",
+          "source_app_id": 15368,
+          "source_app_slug": "github-actions"
+        }
+      ],
+      "required_approvals": 1,
+      "require_code_owner_review": true,
+      "require_conversation_resolution": true,
+      "allow_force_pushes": false,
+      "allow_deletions": false,
+      "bypass_actors": []
+    },
+    {
+      "name": "protect-release-tags",
+      "target": "tag",
+      "enforcement": "enabled",
+      "include": [
+        "refs/tags/v*"
+      ],
+      "required_checks": [],
+      "required_approvals": 0,
+      "require_code_owner_review": false,
+      "require_conversation_resolution": false,
+      "allow_force_pushes": false,
+      "allow_deletions": false,
+      "bypass_actors": []
+    }
+  ],
+  "surface": {
+    "apps": [
+      {
+        "identity": "app:github-actions",
+        "permission": "read"
+      }
+    ],
+    "webhook_digests": [],
+    "deploy_key_fingerprints": [],
+    "token_fingerprints": [],
+    "teams": [
+      {
+        "identity": "team:depgraph-maintainers",
+        "permission": "maintain"
+      },
+      {
+        "identity": "team:depgraph-security",
+        "permission": "security-manager"
+      }
+    ],
+    "environments": [
+      "release"
+    ],
+    "runner_groups": [
+      "github-hosted"
+    ]
+  },
+  "security": {
+    "private_vulnerability_reporting": true,
+    "security_advisories": true,
+    "secret_scanning": true,
+    "push_protection": true,
+    "dependency_graph": true,
+    "dependabot_alerts": true,
+    "dependabot_security_updates": true,
+    "code_scanning": true
+  }
+}

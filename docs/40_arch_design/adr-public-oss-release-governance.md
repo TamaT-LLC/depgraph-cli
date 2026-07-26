@@ -385,6 +385,15 @@ passes in a dry-run repository with the same organization plan/features.
 Evidence: desired-state manifest, access review, dry-run before/after settings
 snapshot, verifier identity/output, and approvals.
 
+Issue #207 implements the closed `github-settings-desired-v1` manifest and
+`read-only-no-settings-actuator` verifier. It canonicalizes branch/tag
+rulesets, required check context plus GitHub App source, approvals,
+conversation resolution, force/delete/bypass controls, redacted
+app/webhook/key/token/team/environment/runner inventories, and security
+settings. API permission failure, disabled or missing rules, wrong check
+source, bypass expansion, and unexpected public surface all produce
+digest-only drift and reject readiness.
+
 ### Gate 7: release and support
 
 - [ ] Run the complete local and GitHub Actions quality suite for the exact
@@ -557,7 +566,7 @@ Each row is an independently reviewable one-to-three-day follow-up.
 | 3 | All-ref/history/collaboration secret audit tooling and redacted ledger | Implemented in #204 |
 | 4 | Dependency/license/provenance inventory and legal review package | Implemented in #205 |
 | 5 | Workflow SHA pinning, threat model, disclosure policy, and security dry run | Implemented in #206 |
-| 6 | Desired GitHub settings/rulesets manifest, access review, and verifier | 2-3 days |
+| 6 | Desired GitHub settings/rulesets manifest, access review, and verifier | Implemented in #207 |
 | 7 | Temporary-repository migration rehearsal and anonymous smoke suite | 2-3 days |
 | 8 | Candidate-bound final audit, owner decision, authorized change window, and observation | 2-3 days |
 
