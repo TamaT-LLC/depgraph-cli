@@ -1,0 +1,5 @@
+{
+  "query": "MATCH p = (source:\"route\")-[\"calls\"*1..1]->(target:\"service\") WHERE source.id = \"node:route\" AND SOME evidence IN EVIDENCE(p) SATISFIES evidence.path STARTS WITH \"src/\" RETURN source.id, target.id, p ORDER BY source.id LIMIT 10",
+  "graph_digest": "bounded-query-graph:sha256:621fa224fd25956ca749063e77489694046e78cf5e6c728388dea2cef81b8578",
+  "plan_digest": "bounded-query-plan:sha256:6f6e1ba4ad73fc3e61133e56a312f52c3692af1ba6df2cfcb6687ac95cef99ef"
+}

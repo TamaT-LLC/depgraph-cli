@@ -1,4 +1,5 @@
 pub mod bounded_query;
+pub mod bounded_query_plan;
 pub mod bounded_query_type;
 pub mod build;
 pub mod build_evidence;
@@ -40,6 +41,16 @@ pub use bounded_query::{
     QueryDirection, QueryFailureClass, QueryOrigin, RelationshipPattern, ReturnClause,
     ScalarOperator, ScalarPredicate, SortDirection, parse_bounded_query, parse_bounded_query_bytes,
     parse_bounded_query_file, read_bounded_query_file,
+};
+pub use bounded_query_plan::{
+    BOUNDED_QUERY_LIMIT_VERSION, BOUNDED_QUERY_PLAN_SCHEMA_VERSION,
+    BOUNDED_QUERY_STATISTICS_VERSION, BoundedQueryLimits, BoundedQueryOperatorKind,
+    BoundedQueryOperatorPlan, BoundedQueryPlan, BoundedQueryPlanningError,
+    BoundedQueryPlanningResult, BoundedQueryResourceBounds, ClosedFieldByteBounds,
+    QueryAdmissionReason, QueryCardinalityInputs, SnapshotCardinalityStatistics,
+    bounded_query_graph_digest, bounded_query_plan_digest, canonical_bounded_query_plan_json,
+    collect_bounded_query_statistics, plan_bounded_query, plan_bounded_query_with_statistics,
+    redacted_typed_query_shape,
 };
 pub use bounded_query_type::{
     BOUNDED_QUERY_TYPE_CONTRACT_VERSION, BindingDefinition, EntityType, FIELD_REGISTRY,
