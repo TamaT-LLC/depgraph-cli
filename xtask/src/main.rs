@@ -27,7 +27,7 @@ const STABLE_RELEASE_MAINTENANCE_BRANCH: &str = "refs/heads/release/0.4";
 const STABLE_UPGRADE_SOURCE_VERSION: &str = "0.4.0-rc.1";
 const STABLE_UPGRADE_SOURCE_STORE_SCHEMA_VERSION: i64 = 11;
 const BENCHMARK_REPORT_SCHEMA_VERSION: &str = "depgraph-benchmark-report-v5";
-const BOUNDED_QUERY_PACKAGE_SMOKE_SCHEMA_VERSION: &str = "bounded-query-package-smoke-v1";
+const BOUNDED_QUERY_PACKAGE_SMOKE_SCHEMA_VERSION: &str = "package-analysis-smoke-v2";
 const BOUNDED_QUERY_SBOM_PACKAGE_NAME: &str = "depgraph-bounded-query-contract";
 const PROJECT_LICENSE_EXPRESSION: &str = "MIT OR Apache-2.0";
 const PROJECT_LICENSES: &[(&str, &[u8])] = &[
@@ -328,6 +328,8 @@ struct TargetVerificationReport {
     query_plan_digest: String,
     query_result_digest: String,
     query_output_sha256: String,
+    profile_plan_digest: String,
+    profile_plan_output_sha256: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -340,6 +342,9 @@ struct BoundedQueryPackageSmokeReport {
     plan_digest: String,
     result_digest: String,
     canonical_output_sha256: String,
+    profile_contract: depgraph_core::ProfileSelectionReleaseCompatibilityHealth,
+    profile_plan_digest: String,
+    profile_canonical_output_sha256: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -703,7 +708,7 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "`default_profile_matrix_complete=false`",
         "## Security and resource boundary",
         "## Staged implementation",
-        "| 8 | Cache/incremental binding and five-target package/release gate | 2-3 days |",
+        "| 8 | Cache/incremental binding and five-target package/release gate | Implemented in #190 |",
         "## Acceptance matrix",
         "| Explicit set above 32 or with unsupported target |",
     ] {
@@ -3008,11 +3013,25 @@ fn verify_release_assets(directory: &Path, requested_targets: &[String]) -> Resu
     {
         bail!("release targets do not produce identical bounded query plan/result bytes");
     }
+    if targets
+        .iter()
+        .map(|target| {
+            (
+                target.profile_plan_digest.as_str(),
+                target.profile_plan_output_sha256.as_str(),
+            )
+        })
+        .collect::<BTreeSet<_>>()
+        .len()
+        != 1
+    {
+        bail!("release targets do not produce identical profile plan bytes");
+    }
 
     fs::write(
         directory.join("release-verification.json"),
         serde_json::to_vec_pretty(&ReleaseVerificationReport {
-            schema_version: 5,
+            schema_version: 6,
             release_version: VERSION.to_owned(),
             tag: format!("v{VERSION}"),
             protocol_version: "1.0".to_owned(),
@@ -3061,6 +3080,13 @@ fn validate_bounded_query_package_smoke(
             .strip_prefix("bounded-query-result:sha256:")
             .is_some_and(lowercase_sha256)
         || !lowercase_sha256(&report.canonical_output_sha256)
+        || report.profile_contract
+            != depgraph_core::profile_selection_release_compatibility_contract()
+        || !report
+            .profile_plan_digest
+            .strip_prefix("profile-selection-plan:sha256:")
+            .is_some_and(lowercase_sha256)
+        || !lowercase_sha256(&report.profile_canonical_output_sha256)
     {
         bail!("packaged bounded query smoke report is incompatible for {target}");
     }
@@ -3186,14 +3212,39 @@ fn evaluate_stable_release_gate(
                     .bytes()
                     .all(|byte| byte.is_ascii_hexdigit())
         });
+    let profile_selection_contract =
+        depgraph_core::profile_selection_release_compatibility_contract();
+    let profile_plan_outputs = release
+        .targets
+        .iter()
+        .map(|target| {
+            (
+                target.profile_plan_digest.as_str(),
+                target.profile_plan_output_sha256.as_str(),
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    let profile_selection_target_gate = release.targets.len() == RELEASE_TARGETS.len()
+        && release.compatibility.profile_selection == profile_selection_contract
+        && profile_plan_outputs.len() == 1
+        && release.targets.iter().all(|target| {
+            target
+                .profile_plan_digest
+                .starts_with("profile-selection-plan:sha256:")
+                && target.profile_plan_output_sha256.len() == 64
+                && target
+                    .profile_plan_output_sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit())
+        });
 
     let checks = vec![
         StableReleaseGateCheck {
             id: "release-identity".to_owned(),
-            passed: release.schema_version == 5
+            passed: release.schema_version == 6
                 && release.release_version == STABLE_RELEASE_VERSION
                 && release.tag == format!("v{STABLE_RELEASE_VERSION}"),
-            evidence: "release-verification.json schema 5 and exact stable tag".to_owned(),
+            evidence: "release-verification.json schema 6 and exact stable tag".to_owned(),
         },
         StableReleaseGateCheck {
             id: "protocol-store-cache-compatibility".to_owned(),
@@ -3252,6 +3303,13 @@ fn evaluate_stable_release_gate(
                     == Value::Bool(true),
             evidence:
                 "five native archives share the compiled bounded query identity and canonical smoke output"
+                    .to_owned(),
+        },
+        StableReleaseGateCheck {
+            id: "profile-selection-five-target".to_owned(),
+            passed: profile_selection_target_gate,
+            evidence:
+                "five native archives share the compiled profile-selection contract and canonical plan output"
                     .to_owned(),
         },
         StableReleaseGateCheck {
@@ -3767,6 +3825,8 @@ fn verify_published_release_tree(
         query_plan_digest: query_smoke.plan_digest.clone(),
         query_result_digest: query_smoke.result_digest.clone(),
         query_output_sha256: query_smoke.canonical_output_sha256.clone(),
+        profile_plan_digest: query_smoke.profile_plan_digest.clone(),
+        profile_plan_output_sha256: query_smoke.profile_canonical_output_sha256.clone(),
     })
 }
 
@@ -4832,6 +4892,13 @@ fn verify_release_static_prelaunch_fails_closed(extracted: &Path) -> Result<()> 
         manifest.compatibility.bounded_query.result_schema_version =
             "bounded-query-result-v2".to_owned();
         cases.push(("bounded query compatibility mismatch", manifest));
+
+        let mut manifest = baseline.clone();
+        manifest
+            .compatibility
+            .profile_selection
+            .selection_contract_version = "default-profile-selection-v2".to_owned();
+        cases.push(("profile selection compatibility mismatch", manifest));
 
         let mut manifest = baseline.clone();
         manifest.compatibility.framework_build_gate_contract_version =
@@ -9071,6 +9138,45 @@ fn verify_packaged_bounded_query(
         bail!("packaged bounded query exposed a closed or checkout-local field");
     }
 
+    let run_profile_plan = |checkout: &Path| -> Result<std::process::Output> {
+        let output = Command::new(executable)
+            .args(["profiles", "plan"])
+            .arg(checkout)
+            .arg("--json")
+            .output()
+            .context("failed to run packaged profile planner")?;
+        if !output.status.success() || !output.stderr.is_empty() {
+            bail!(
+                "packaged profile planner failed: status={:?}\n{}\n{}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        Ok(output)
+    };
+    let first_profile_plan = run_profile_plan(first_checkout)?;
+    let second_profile_plan = run_profile_plan(second_checkout)?;
+    if first_profile_plan.stdout != second_profile_plan.stdout {
+        bail!("packaged profile plan changed across checkout-equivalent repositories");
+    }
+    let profile_preview: Value = serde_json::from_slice(&first_profile_plan.stdout)
+        .context("packaged profile plan is invalid JSON")?;
+    let profile_contract = depgraph_core::profile_selection_release_compatibility_contract();
+    if profile_preview["plan"]["contract_version"] != profile_contract.selection_contract_version
+        || profile_preview["plan"]["input"]["limits"]["limit_version"]
+            != profile_contract.limit_version
+        || profile_preview["plan"]["input"]["contract_version"]
+            != profile_contract.selection_contract_version
+    {
+        bail!("packaged profile plan output does not satisfy its release contract");
+    }
+    let profile_plan_digest = profile_preview["plan"]["plan_id"]
+        .as_str()
+        .filter(|value| value.starts_with("profile-selection-plan:sha256:"))
+        .context("packaged profile plan omitted its canonical digest")?
+        .to_owned();
+
     Ok(BoundedQueryPackageSmokeReport {
         schema_version: BOUNDED_QUERY_PACKAGE_SMOKE_SCHEMA_VERSION.to_owned(),
         target: target.to_owned(),
@@ -9079,6 +9185,9 @@ fn verify_packaged_bounded_query(
         plan_digest,
         result_digest,
         canonical_output_sha256: hex::encode(Sha256::digest(&first_result.stdout)),
+        profile_contract,
+        profile_plan_digest,
+        profile_canonical_output_sha256: hex::encode(Sha256::digest(&first_profile_plan.stdout)),
     })
 }
 
@@ -10291,9 +10400,11 @@ mod tests {
             query_plan_digest: format!("bounded-query-plan:sha256:{}", "1".repeat(64)),
             query_result_digest: format!("bounded-query-result:sha256:{}", "2".repeat(64)),
             query_output_sha256: "3".repeat(64),
+            profile_plan_digest: format!("profile-selection-plan:sha256:{}", "4".repeat(64)),
+            profile_plan_output_sha256: "5".repeat(64),
         };
         let release = ReleaseVerificationReport {
-            schema_version: 5,
+            schema_version: 6,
             release_version: STABLE_RELEASE_VERSION.to_owned(),
             tag: format!("v{STABLE_RELEASE_VERSION}"),
             protocol_version: "1.0".to_owned(),
@@ -10447,6 +10558,9 @@ mod tests {
             plan_digest: format!("bounded-query-plan:sha256:{}", "1".repeat(64)),
             result_digest: format!("bounded-query-result:sha256:{}", "2".repeat(64)),
             canonical_output_sha256: "3".repeat(64),
+            profile_contract: depgraph_core::profile_selection_release_compatibility_contract(),
+            profile_plan_digest: format!("profile-selection-plan:sha256:{}", "4".repeat(64)),
+            profile_canonical_output_sha256: "5".repeat(64),
         };
         validate_bounded_query_package_smoke(&report, "aarch64-apple-darwin", &"0".repeat(64))
             .unwrap();

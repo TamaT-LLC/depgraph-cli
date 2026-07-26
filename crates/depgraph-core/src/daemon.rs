@@ -30,8 +30,10 @@ use crate::{
     CancellationToken, Config, DaemonConfig, INCREMENTAL_PLAN_SCHEMA_VERSION,
     IncrementalChangeKind, IncrementalFileChange, IncrementalInvalidationMode,
     IncrementalInvalidationPlan, IncrementalInvalidationReason, ScanCacheMode, open_store,
-    plan_incremental_invalidation, run_scan_with_cache_mode_and_cancellation,
+    plan_incremental_invalidation, plan_repository_profiles,
+    run_scan_with_cache_mode_and_cancellation,
     scan::{cancel_scan, complete_scan, git_source_revision},
+    snapshot_profile_plan_id,
     worker::{
         AdapterKind, WorkerFailureKind, execute_worker_delta_with_cancellation, is_security_error,
         locate_worker, probe_worker_version_with_cancellation, worker_capabilities,
@@ -817,9 +819,20 @@ impl DaemonScanRunner for RepositoryScanRunner {
             }
             let mut store = open_store(&store_path)?;
             let base_snapshot_id = store.current_snapshot_id()?;
-            let mut force_full_scan = false;
+            let current_profile_plan_id =
+                plan_repository_profiles(&root, &config, None)?.plan.plan_id;
+            let base_profile_plan_id = base_snapshot_id
+                .as_deref()
+                .map(|snapshot_id| store.load_completed_snapshot(snapshot_id))
+                .transpose()?
+                .as_ref()
+                .map(snapshot_profile_plan_id)
+                .transpose()?
+                .flatten();
+            let mut force_full_scan =
+                base_profile_plan_id.as_deref() != Some(current_profile_plan_id.as_str());
             if let (Some(base_snapshot_id), Some(path)) = (
-                base_snapshot_id.as_deref(),
+                base_snapshot_id.as_deref().filter(|_| !force_full_scan),
                 semantic_noop_change_path(&request.changes),
             ) {
                 let base_projection_started = Instant::now();
@@ -837,6 +850,7 @@ impl DaemonScanRunner for RepositoryScanRunner {
                         &request.changes,
                         path,
                         &base,
+                        &current_profile_plan_id,
                     )?;
                     match incremental_worker
                         .run(
@@ -862,56 +876,68 @@ impl DaemonScanRunner for RepositoryScanRunner {
                             if cancellation.is_cancelled() {
                                 return Ok(cancelled_daemon_outcome(base_snapshot_id, Some(plan)));
                             }
-                            let source_revision = git_source_revision(&root);
-                            let store_commit_started = Instant::now();
-                            match store.commit_semantic_noop_delta(
-                                &scan_id,
+                            if !profile_selection_plan_matches(
                                 &root,
-                                strict,
-                                base_snapshot_id,
-                                source_revision.as_deref(),
-                                &delta,
-                                &stderr,
-                                stderr_truncated,
+                                &config,
+                                &current_profile_plan_id,
                             ) {
-                                Ok(completed_snapshot_id) => {
-                                    return Ok(DaemonScanOutcome {
-                                        scan_id: Some(scan_id),
-                                        status: "completed".to_owned(),
-                                        completed_snapshot_id: Some(completed_snapshot_id),
-                                        base_snapshot_id: Some(base_snapshot_id.to_owned()),
-                                        invalidation_plan: Some(plan),
-                                        invalidation_error: None,
-                                        incremental_trace: Some(DaemonIncrementalTrace {
-                                            schema_version: DAEMON_INCREMENTAL_TRACE_SCHEMA_VERSION
-                                                .to_owned(),
-                                            mode: "semantic_noop".to_owned(),
-                                            base_projection_milliseconds,
-                                            worker_capability_milliseconds: trace
-                                                .capability_probe_milliseconds,
-                                            worker_analysis_milliseconds: trace
-                                                .analysis_milliseconds,
-                                            store_commit_milliseconds: elapsed_milliseconds(
-                                                store_commit_started,
-                                            ),
-                                            total_milliseconds: elapsed_milliseconds(
-                                                attempt_started,
-                                            ),
-                                        }),
-                                    });
-                                }
-                                Err(error) => {
-                                    return Ok(DaemonScanOutcome {
-                                        scan_id: Some(scan_id),
-                                        status: "failed".to_owned(),
-                                        completed_snapshot_id: None,
-                                        base_snapshot_id: Some(base_snapshot_id.to_owned()),
-                                        invalidation_plan: Some(plan),
-                                        invalidation_error: Some(format!(
-                                            "semantic no-op delta failed: {error:#}"
-                                        )),
-                                        incremental_trace: None,
-                                    });
+                                tracing::debug!(
+                                    "profile selection changed during semantic no-op analysis; using full scan"
+                                );
+                                force_full_scan = true;
+                            } else {
+                                let source_revision = git_source_revision(&root);
+                                let store_commit_started = Instant::now();
+                                match store.commit_semantic_noop_delta(
+                                    &scan_id,
+                                    &root,
+                                    strict,
+                                    base_snapshot_id,
+                                    source_revision.as_deref(),
+                                    &delta,
+                                    &stderr,
+                                    stderr_truncated,
+                                ) {
+                                    Ok(completed_snapshot_id) => {
+                                        return Ok(DaemonScanOutcome {
+                                            scan_id: Some(scan_id),
+                                            status: "completed".to_owned(),
+                                            completed_snapshot_id: Some(completed_snapshot_id),
+                                            base_snapshot_id: Some(base_snapshot_id.to_owned()),
+                                            invalidation_plan: Some(plan),
+                                            invalidation_error: None,
+                                            incremental_trace: Some(DaemonIncrementalTrace {
+                                                schema_version:
+                                                    DAEMON_INCREMENTAL_TRACE_SCHEMA_VERSION
+                                                        .to_owned(),
+                                                mode: "semantic_noop".to_owned(),
+                                                base_projection_milliseconds,
+                                                worker_capability_milliseconds: trace
+                                                    .capability_probe_milliseconds,
+                                                worker_analysis_milliseconds: trace
+                                                    .analysis_milliseconds,
+                                                store_commit_milliseconds: elapsed_milliseconds(
+                                                    store_commit_started,
+                                                ),
+                                                total_milliseconds: elapsed_milliseconds(
+                                                    attempt_started,
+                                                ),
+                                            }),
+                                        });
+                                    }
+                                    Err(error) => {
+                                        return Ok(DaemonScanOutcome {
+                                            scan_id: Some(scan_id),
+                                            status: "failed".to_owned(),
+                                            completed_snapshot_id: None,
+                                            base_snapshot_id: Some(base_snapshot_id.to_owned()),
+                                            invalidation_plan: Some(plan),
+                                            invalidation_error: Some(format!(
+                                                "semantic no-op delta failed: {error:#}"
+                                            )),
+                                            incremental_trace: None,
+                                        });
+                                    }
                                 }
                             }
                         }
@@ -998,73 +1024,87 @@ impl DaemonScanRunner for RepositoryScanRunner {
                                     Some(plan.clone()),
                                 ));
                             }
-                            let source_revision = git_source_revision(&root);
-                            store.start_incremental_scan_with_revision(
-                                &scan_id,
+                            if !profile_selection_plan_matches(
                                 &root,
-                                strict,
-                                base_snapshot_id,
-                                source_revision.as_deref(),
-                            )?;
-                            let result = (|| -> Result<crate::ScanOutcome> {
-                                if cancellation.is_cancelled() {
-                                    return cancel_scan(&mut store, &scan_id);
-                                }
-                                store.save_adapter_log(
+                                &config,
+                                &current_profile_plan_id,
+                            ) {
+                                tracing::debug!(
+                                    "profile selection changed during incremental analysis; using full scan"
+                                );
+                            } else {
+                                let source_revision = git_source_revision(&root);
+                                store.start_incremental_scan_with_revision(
                                     &scan_id,
-                                    &delta.scope.adapters[0],
-                                    &stderr,
-                                    stderr_truncated,
-                                )?;
-                                store.stage_incremental_delta(&scan_id, &delta)?;
-                                if cancellation.is_cancelled() {
-                                    return cancel_scan(&mut store, &scan_id);
-                                }
-                                store.apply_staged_incremental_delta(&scan_id, &delta.delta_id)?;
-                                if cancellation.is_cancelled() {
-                                    return cancel_scan(&mut store, &scan_id);
-                                }
-                                complete_scan(
-                                    &mut store,
-                                    &scan_id,
+                                    &root,
                                     strict,
-                                    &config,
-                                    None,
-                                    &cancellation,
-                                )
-                            })();
-                            match result {
-                                Ok(outcome) => {
-                                    return daemon_outcome_from_scan(
-                                        &store,
-                                        outcome,
-                                        base_snapshot_id,
-                                        plan.clone(),
-                                        None,
-                                    );
-                                }
-                                Err(error) => {
-                                    let message = format!("incremental delta failed: {error:#}");
-                                    if store
-                                        .scan(&scan_id)?
-                                        .is_some_and(|scan| scan.status == "staging")
-                                    {
-                                        store.finish_scan(
-                                            &scan_id,
-                                            "failed",
-                                            Some(&message),
-                                            false,
-                                        )?;
+                                    base_snapshot_id,
+                                    source_revision.as_deref(),
+                                )?;
+                                let result = (|| -> Result<crate::ScanOutcome> {
+                                    if cancellation.is_cancelled() {
+                                        return cancel_scan(&mut store, &scan_id);
                                     }
-                                    return Ok(DaemonScanOutcome {
-                                        scan_id: Some(scan_id),
-                                        status: "failed".to_owned(),
-                                        completed_snapshot_id: None,
-                                        base_snapshot_id: Some(base_snapshot_id.to_owned()),
-                                        invalidation_plan: Some(plan.clone()),
-                                        invalidation_error: Some(message),
-                                        incremental_trace: None,
-                                    });
+                                    store.save_adapter_log(
+                                        &scan_id,
+                                        &delta.scope.adapters[0],
+                                        &stderr,
+                                        stderr_truncated,
+                                    )?;
+                                    store.stage_incremental_delta(&scan_id, &delta)?;
+                                    if cancellation.is_cancelled() {
+                                        return cancel_scan(&mut store, &scan_id);
+                                    }
+                                    store.apply_staged_incremental_delta(
+                                        &scan_id,
+                                        &delta.delta_id,
+                                    )?;
+                                    if cancellation.is_cancelled() {
+                                        return cancel_scan(&mut store, &scan_id);
+                                    }
+                                    complete_scan(
+                                        &mut store,
+                                        &scan_id,
+                                        strict,
+                                        &config,
+                                        None,
+                                        &cancellation,
+                                    )
+                                })();
+                                match result {
+                                    Ok(outcome) => {
+                                        return daemon_outcome_from_scan(
+                                            &store,
+                                            outcome,
+                                            base_snapshot_id,
+                                            plan.clone(),
+                                            None,
+                                        );
+                                    }
+                                    Err(error) => {
+                                        let message =
+                                            format!("incremental delta failed: {error:#}");
+                                        if store
+                                            .scan(&scan_id)?
+                                            .is_some_and(|scan| scan.status == "staging")
+                                        {
+                                            store.finish_scan(
+                                                &scan_id,
+                                                "failed",
+                                                Some(&message),
+                                                false,
+                                            )?;
+                                        }
+                                        return Ok(DaemonScanOutcome {
+                                            scan_id: Some(scan_id),
+                                            status: "failed".to_owned(),
+                                            completed_snapshot_id: None,
+                                            base_snapshot_id: Some(base_snapshot_id.to_owned()),
+                                            invalidation_plan: Some(plan.clone()),
+                                            invalidation_error: Some(message),
+                                            incremental_trace: None,
+                                        });
+                                    }
                                 }
                             }
                         }
@@ -1125,6 +1165,11 @@ impl DaemonScanRunner for RepositoryScanRunner {
     }
 }
 
+fn profile_selection_plan_matches(root: &Path, config: &Config, expected_plan_id: &str) -> bool {
+    plan_repository_profiles(root, config, None)
+        .is_ok_and(|preview| preview.plan.plan_id == expected_plan_id)
+}
+
 fn semantic_noop_change_path(changes: &[IncrementalFileChange]) -> Option<&str> {
     match changes {
         [change]
@@ -1179,6 +1224,7 @@ fn semantic_noop_invalidation_plan(
     changes: &[IncrementalFileChange],
     path: &str,
     base: &depgraph_protocol::DeltaBaseGraph,
+    base_profile_plan_id: &str,
 ) -> Result<IncrementalInvalidationPlan> {
     let affected_profile_ids = base.profiles.iter().cloned().collect::<Vec<_>>();
     let affected_package_locators = base
@@ -1204,6 +1250,7 @@ fn semantic_noop_invalidation_plan(
     Ok(IncrementalInvalidationPlan {
         schema_version: INCREMENTAL_PLAN_SCHEMA_VERSION.to_owned(),
         base_snapshot_id: base_snapshot_id.to_owned(),
+        base_profile_plan_id: Some(base_profile_plan_id.to_owned()),
         mode: IncrementalInvalidationMode::ScopedReplacement,
         changes: changes.to_vec(),
         reasons: vec![IncrementalInvalidationReason::SourceChanged],
@@ -2057,6 +2104,9 @@ mod tests {
 
     fn seed_incremental_store(root: &Path, store_path: &Path) -> Result<String> {
         let mut store = open_store(store_path)?;
+        let profile_plan_id = plan_repository_profiles(root, &Config::default(), None)?
+            .plan
+            .plan_id;
         let scan_id = "incremental-base";
         store.start_scan(scan_id, root, false)?;
         let common = |event: &str, seq: u64| {
@@ -2075,7 +2125,10 @@ mod tests {
             "language": "web",
             "features": [],
             "environment": {},
-            "properties": {"package_locator": "npm:fixture@1.0.0"}
+            "properties": {
+                "package_locator": "npm:fixture@1.0.0",
+                "profile_selection_plan_id": profile_plan_id
+            }
         });
         let mut fixture_package = common("node_upsert", 2);
         fixture_package["node"] = serde_json::json!({
@@ -2534,6 +2587,47 @@ mod tests {
                 .parent_snapshot_id
                 .as_deref(),
             Some(base_snapshot_id.as_str())
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn profile_set_change_skips_delta_and_replaces_the_snapshot_transactionally() -> Result<()>
+    {
+        let root = tempfile::tempdir()?;
+        let store_path = root.path().join("graph.db");
+        let base_snapshot_id = seed_incremental_store(root.path(), &store_path)?;
+        let worker = Arc::new(SuccessfulIncrementalWorker::default());
+        let mut config = Config::default();
+        config.profiles.web_environments = vec!["server".to_owned()];
+        let runner =
+            RepositoryScanRunner::new(root.path().to_path_buf(), store_path.clone(), config, false)
+                .with_incremental_worker(worker.clone());
+
+        let outcome = runner
+            .run(
+                DaemonScanRequest {
+                    attempt_id: "profile-set-change".to_owned(),
+                    changes: vec![IncrementalFileChange::modified("src/index.ts")],
+                    started_at: timestamp(),
+                },
+                CancellationToken::new(),
+            )
+            .await?;
+
+        assert_eq!(outcome.status, "completed");
+        assert!(worker.requests.lock().unwrap().is_empty());
+        let completed_snapshot_id = outcome
+            .completed_snapshot_id
+            .as_deref()
+            .context("full replacement snapshot")?;
+        assert_ne!(completed_snapshot_id, base_snapshot_id);
+        let store = open_store(&store_path)?;
+        let snapshot = store.load_completed_snapshot(completed_snapshot_id)?;
+        assert!(snapshot.profiles.is_empty());
+        assert_eq!(
+            store.current_snapshot_id()?.as_deref(),
+            Some(completed_snapshot_id)
         );
         Ok(())
     }
