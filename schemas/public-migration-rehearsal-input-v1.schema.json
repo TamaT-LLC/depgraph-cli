@@ -1,0 +1,142 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/TamaT-LLC/depgraph-cli/schemas/public-migration-rehearsal-input-v1.schema.json",
+  "title": "depgraph public migration rehearsal input v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "production_repository",
+    "temporary_repository",
+    "temporary_repository_attested",
+    "production_plan_features_digest",
+    "temporary_plan_features_digest",
+    "production_visibility_unchanged",
+    "steps",
+    "anonymous_smoke"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "public-migration-rehearsal-input-v1"
+    },
+    "production_repository": {
+      "$ref": "#/$defs/repository"
+    },
+    "temporary_repository": {
+      "$ref": "#/$defs/repository"
+    },
+    "temporary_repository_attested": {
+      "type": "boolean"
+    },
+    "production_plan_features_digest": {
+      "$ref": "#/$defs/digest"
+    },
+    "temporary_plan_features_digest": {
+      "$ref": "#/$defs/digest"
+    },
+    "production_visibility_unchanged": {
+      "type": "boolean"
+    },
+    "steps": {
+      "type": "array",
+      "maxItems": 32,
+      "items": {
+        "$ref": "#/$defs/step"
+      }
+    },
+    "anonymous_smoke": {
+      "$ref": "#/$defs/anonymous_smoke"
+    }
+  },
+  "$defs": {
+    "repository": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_.:-]{1,128}/[A-Za-z0-9_.:-]{1,128}$"
+    },
+    "digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "phase": {
+      "enum": [
+        "verify_temporary_target",
+        "capture_backup_and_settings",
+        "freeze_writes",
+        "change_visibility",
+        "restore_rulesets",
+        "enable_security",
+        "verify_desired_settings",
+        "run_anonymous_smoke",
+        "reopen_writes",
+        "cleanup_temporary_repository"
+      ]
+    },
+    "step": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "phase",
+        "outcome",
+        "evidence_digest"
+      ],
+      "properties": {
+        "phase": {
+          "$ref": "#/$defs/phase"
+        },
+        "outcome": {
+          "enum": [
+            "pass",
+            "fail"
+          ]
+        },
+        "evidence_digest": {
+          "$ref": "#/$defs/digest"
+        }
+      }
+    },
+    "anonymous_smoke": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "clone",
+        "source_archive",
+        "readme_and_docs",
+        "community_links",
+        "issue_templates",
+        "actions",
+        "release",
+        "package_download",
+        "evidence_digest"
+      ],
+      "properties": {
+        "clone": {
+          "type": "boolean"
+        },
+        "source_archive": {
+          "type": "boolean"
+        },
+        "readme_and_docs": {
+          "type": "boolean"
+        },
+        "community_links": {
+          "type": "boolean"
+        },
+        "issue_templates": {
+          "type": "boolean"
+        },
+        "actions": {
+          "type": "boolean"
+        },
+        "release": {
+          "type": "boolean"
+        },
+        "package_download": {
+          "type": "boolean"
+        },
+        "evidence_digest": {
+          "$ref": "#/$defs/digest"
+        }
+      }
+    }
+  }
+}
