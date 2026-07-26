@@ -387,7 +387,7 @@ Each row is one independently reviewable one-to-three-day follow-up Issue.
 | 1 | Selection DTO/schema, canonical IDs, ledger, validator, and golden fixture | Implemented in #183 | This ADR | Rust/core/schema accept only canonical closed plans |
 | 2 | Safe inventory size classifier, inventory-attested language set, caps, candidate bounds, and plan digest | Implemented in #184 | 1 | Boundary fixtures select tiny/small/medium/large deterministically |
 | 3 | Rust baseline and single-axis target/mode/feature candidates | Implemented in #185 | 1-2 | Default/no-default/feature/target/test fixtures never form a product |
-| 4 | Go baseline and platform/tag candidates | 2-3 days | 1-2 | GOOS/GOARCH/tag fixtures are deterministic; cgo/VTA remain non-auto |
+| 4 | Go baseline and platform/tag candidates | Implemented in #186 | 1-2 | GOOS/GOARCH/tag fixtures are deterministic; cgo/VTA remain non-auto |
 | 5 | Web/framework baseline and environment candidates | 2-3 days | 1-2 | browser/server baseline and evidenced edge/worker/dev/test alternatives validate |
 | 6 | Greedy ranking, budget omission, aggregate coverage, doctor, and strict behavior | 2-3 days | 3-5 | Reordered polyglot fixture yields byte-identical selected/omitted output |
 | 7 | `profiles plan`, `--profile-budget`, strict profiles-file schema, and v1 config migration | 2-3 days | 6 | Explicit requests are all-or-error and auto planning is explainable |

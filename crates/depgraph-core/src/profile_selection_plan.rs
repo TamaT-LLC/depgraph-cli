@@ -1053,6 +1053,7 @@ mod tests {
             tags: Vec::new(),
             cgo_enabled: false,
             call_graph: GoCallGraph::RtaCha,
+            dependency_snapshot_id: format!("go-dependency-snapshot:sha256:{}", "a".repeat(64)),
         });
         candidate_family(
             baseline_axes,
@@ -1064,6 +1065,10 @@ mod tests {
                     tags: Vec::new(),
                     cgo_enabled: false,
                     call_graph: GoCallGraph::RtaCha,
+                    dependency_snapshot_id: format!(
+                        "go-dependency-snapshot:sha256:{}",
+                        "a".repeat(64)
+                    ),
                 })
             },
             ProfileAxis::Target,

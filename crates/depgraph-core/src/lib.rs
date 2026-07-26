@@ -15,6 +15,7 @@ pub mod incremental;
 pub mod policy;
 mod policy_engine;
 pub mod profile_selection;
+pub mod profile_selection_go;
 pub mod profile_selection_plan;
 pub mod profile_selection_rust;
 pub mod query;
@@ -157,6 +158,12 @@ pub use profile_selection::{
     canonical_profile_id, canonical_profile_selection_json, canonical_profile_selection_plan_id,
     profile_candidate_id, profile_exclusion_id, profile_selection_input_digest,
     validate_profile_selection_plan,
+};
+pub use profile_selection_go::{
+    GO_PROFILE_PLANNING_VERSION, GoAutomaticBoundaryKind, GoConstraintTarget,
+    GoPlatformEvidenceKind, GoProfileAvailability, GoProfileCandidateGenerationResult,
+    GoProfilePlanningInput, GoRejectedProfileDeclaration, GoStaticProfileEvidence,
+    GoTagDeclaration, GoTargetDeclaration, generate_go_profile_candidates,
 };
 pub use profile_selection_plan::{
     DEFAULT_LARGE_PROFILE_CAP, DEFAULT_MEDIUM_PROFILE_CAP, DEFAULT_SMALL_PROFILE_CAP,
