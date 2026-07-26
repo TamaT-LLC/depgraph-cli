@@ -44,6 +44,12 @@ exposure, or GitHub workflow/release compromise are in scope. General support,
 feature requests, and dependency warnings without a depgraph impact belong in
 the routes described by [SUPPORT.md](SUPPORT.md).
 
+Maintainers exercise the private report → triage → private advisory → private
+fix → verified release → coordinated disclosure handoff with the redacted
+[security disclosure dry-run harness](docs/50_test/security-disclosure-dry-run.md).
+The exercise never stores vulnerability details in the repository and never
+gives forked code access to private-report or release credentials.
+
 Never test against systems or data you do not own or have permission to use.
 Avoid privacy violations, service disruption, destructive testing, and
 exfiltration. Good-faith reports following this policy will be handled

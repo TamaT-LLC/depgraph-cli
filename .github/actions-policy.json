@@ -1,0 +1,35 @@
+{
+  "schema_version": "github-actions-policy-v1",
+  "actions": [
+    {
+      "identity": "actions/checkout",
+      "sha": "11d5960a326750d5838078e36cf38b85af677262",
+      "reviewed_upstream_ref": "v4"
+    },
+    {
+      "identity": "actions/download-artifact",
+      "sha": "d3f86a106a0bac45b974a628896c90dbdf5c8093",
+      "reviewed_upstream_ref": "v4"
+    },
+    {
+      "identity": "actions/setup-go",
+      "sha": "40f1582b2485089dde7abd97c1529aa768e1baff",
+      "reviewed_upstream_ref": "v5"
+    },
+    {
+      "identity": "actions/setup-node",
+      "sha": "49933ea5288caeca8642d1e84afbd3f7d6820020",
+      "reviewed_upstream_ref": "v4"
+    },
+    {
+      "identity": "actions/upload-artifact",
+      "sha": "ea165f8d65b6e75b540449e92b4886f43607fa02",
+      "reviewed_upstream_ref": "v4"
+    },
+    {
+      "identity": "pnpm/action-setup",
+      "sha": "f40ffcd9367d9f12939873eb1018b921a783ffaa",
+      "reviewed_upstream_ref": "v4"
+    }
+  ]
+}
