@@ -216,7 +216,8 @@ pub use profile_selection_rust::{
 pub use protobuf::{
     MAX_PROTOBUF_DEPTH, MAX_PROTOBUF_DESCRIPTOR_BYTES, MAX_PROTOBUF_DESCRIPTOR_FILES,
     MAX_PROTOBUF_FILE_BYTES, MAX_PROTOBUF_FILES, MAX_PROTOBUF_TOKENS, MAX_PROTOBUF_TOTAL_BYTES,
-    PROTOBUF_CAPABILITY, PROTOBUF_DESCRIPTOR_SUFFIX, scan_protobuf_repository,
+    PROTOBUF_CAPABILITY, PROTOBUF_DESCRIPTOR_SUFFIX, PROTOBUF_GENERATED_MAPPING_SCHEMA_VERSION,
+    scan_protobuf_repository,
 };
 pub use query::{
     CycleLevel, CycleResult, GraphQueryFilter, TraversalResult, UnresolvedResult, WhyResult,

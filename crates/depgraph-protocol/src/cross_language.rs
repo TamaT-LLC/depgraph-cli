@@ -1099,7 +1099,7 @@ fn validate_relation_endpoints(
                 matches!(target_kind, "symbol" | "server_function")
             }
             CrossLanguageRelationKind::GeneratedFrom => {
-                matches!(target_kind, "schema" | "operation" | "message")
+                matches!(target_kind, "schema" | "service" | "operation" | "message")
             }
             CrossLanguageRelationKind::BindsNativeSymbol => target_kind == "native_symbol",
             CrossLanguageRelationKind::ProvidedByLibrary => target_kind == "native_library",
@@ -1420,5 +1420,41 @@ mod tests {
             )
         );
         assert!(profile_id.starts_with("profile:sha256:"));
+    }
+
+    #[test]
+    fn generated_type_may_bind_to_a_contract_service() {
+        let nodes = BTreeMap::from([
+            (
+                "type".to_owned(),
+                GraphNode {
+                    id: "type".to_owned(),
+                    kind: "type".to_owned(),
+                    locator: "generated:type".to_owned(),
+                    display_name: None,
+                    properties: BTreeMap::new(),
+                },
+            ),
+            (
+                "service".to_owned(),
+                GraphNode {
+                    id: "service".to_owned(),
+                    kind: "service".to_owned(),
+                    locator: "cross-language:service".to_owned(),
+                    display_name: None,
+                    properties: BTreeMap::new(),
+                },
+            ),
+        ]);
+        assert!(
+            validate_relation_endpoints(
+                CrossLanguageRelationKind::GeneratedFrom,
+                ResolutionStatus::Resolved,
+                "type",
+                &["service".to_owned()],
+                &nodes,
+            )
+            .is_ok()
+        );
     }
 }

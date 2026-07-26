@@ -28,6 +28,10 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use walkdir::{DirEntry, WalkDir};
 
+mod generated;
+
+pub use generated::PROTOBUF_GENERATED_MAPPING_SCHEMA_VERSION;
+
 pub const PROTOBUF_CAPABILITY: &str = "protobuf-contract-v1";
 pub const PROTOBUF_DESCRIPTOR_SUFFIX: &str = ".depgraph-protobuf-descriptor.pb";
 pub const MAX_PROTOBUF_FILE_BYTES: usize = 8 * 1024 * 1024;
@@ -79,13 +83,15 @@ pub fn scan_protobuf_repository(
         })
         .collect::<BTreeMap<_, _>>();
     let descriptors = inventory_descriptor_sets(&canonical_root, &admitted_sources)?;
-    if sources.is_empty() && descriptors.records.is_empty() {
+    let generated_inventory = generated::inventory_generated_mappings(&canonical_root)?;
+    if sources.is_empty() && descriptors.records.is_empty() && generated_inventory.is_empty() {
         return Ok(None);
     }
 
     let input_digest = digest_value(&json!({
         "sources": sources.iter().map(SourceRecord::identity_value).collect::<Vec<_>>(),
         "descriptors": descriptors.identity_value(),
+        "generated_mappings": generated_inventory.identity_value(),
     }));
     let profile_identity = CrossLanguageProfileIdentity {
         contract_version: CROSS_LANGUAGE_CONTRACT_VERSION.to_owned(),
@@ -98,10 +104,12 @@ pub fn scan_protobuf_repository(
     let mut builder =
         ProtobufGraphBuilder::new(profile_id.clone(), admitted_sources, descriptors.proofs);
     builder.build()?;
+    generated::apply_generated_mappings(&generated_inventory, &mut builder)?;
     for reason in sources
         .iter()
         .filter_map(|record| record.reason.as_deref())
         .chain(descriptors.reasons.iter().map(String::as_str))
+        .chain(generated_inventory.reasons())
     {
         builder.insert_reason(reason);
     }
@@ -110,7 +118,8 @@ pub fn scan_protobuf_repository(
         .iter()
         .filter(|record| record.file.is_none())
         .count() as u64
-        + descriptors.skipped_count;
+        + descriptors.skipped_count
+        + generated_inventory.skipped_count();
     let status = if builder.unresolved_count > 0 || skipped_count > 0 || !builder.reasons.is_empty()
     {
         CrossLanguageCapabilityStatus::Incomplete
@@ -123,7 +132,9 @@ pub fn scan_protobuf_repository(
             format: CrossLanguageFormat::Protobuf,
             capability: PROTOBUF_CAPABILITY.to_owned(),
             status,
-            input_count: sources.len() as u64 + descriptors.records.len() as u64,
+            input_count: sources.len() as u64
+                + descriptors.records.len() as u64
+                + generated_inventory.input_count(),
             node_count: builder.cross_node_ids.len() as u64,
             site_count: builder.sites.len() as u64,
             edge_count: builder.edges.len() as u64,
@@ -154,6 +165,10 @@ pub fn scan_protobuf_repository(
             (
                 CROSS_LANGUAGE_COMPLETENESS_PROPERTY.to_owned(),
                 serde_json::to_value(ledger)?,
+            ),
+            (
+                "protobuf_generated_provenance".to_owned(),
+                generated_inventory.identity_value(),
             ),
         ]),
     };
