@@ -329,7 +329,15 @@
     "goAxes": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["language", "goos", "goarch", "tags", "cgo_enabled", "call_graph"],
+      "required": [
+        "language",
+        "goos",
+        "goarch",
+        "tags",
+        "cgo_enabled",
+        "call_graph",
+        "dependency_snapshot_id"
+      ],
       "properties": {
         "language": {
           "const": "go"
@@ -353,6 +361,10 @@
         },
         "call_graph": {
           "enum": ["rta-cha", "vta"]
+        },
+        "dependency_snapshot_id": {
+          "type": "string",
+          "pattern": "^go-dependency-snapshot:sha256:[0-9a-f]{64}$"
         }
       }
     },

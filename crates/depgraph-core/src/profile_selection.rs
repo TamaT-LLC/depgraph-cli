@@ -242,6 +242,7 @@ pub struct GoProfileAxes {
     pub tags: Vec<String>,
     pub cgo_enabled: bool,
     pub call_graph: GoCallGraph,
+    pub dependency_snapshot_id: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -835,6 +836,11 @@ pub(crate) fn validate_profile(profile: &ProfileSelectionProfile) -> Result<()> 
         CanonicalProfileAxes::Go(axes) => {
             validate_axis_value("Go GOOS", &axes.goos)?;
             validate_axis_value("Go GOARCH", &axes.goarch)?;
+            validate_stable_id(
+                "Go dependency snapshot id",
+                &axes.dependency_snapshot_id,
+                "go-dependency-snapshot",
+            )?;
             validate_sorted_unique_strings("Go tags", &axes.tags, true)?;
             for tag in &axes.tags {
                 validate_axis_value("Go tag", tag)?;
@@ -967,8 +973,13 @@ fn changed_axes(
             if left.tags != right.tags {
                 changed.push(ProfileAxis::FeatureOrTag);
             }
-            if left.cgo_enabled != right.cgo_enabled || left.call_graph != right.call_graph {
-                bail!("cgo and call-graph changes are not automatic profile alternatives");
+            if left.cgo_enabled != right.cgo_enabled
+                || left.call_graph != right.call_graph
+                || left.dependency_snapshot_id != right.dependency_snapshot_id
+            {
+                bail!(
+                    "cgo, call-graph, and dependency-snapshot changes are not automatic profile alternatives"
+                );
             }
         }
         (CanonicalProfileAxes::Web(left), CanonicalProfileAxes::Web(right)) => {
@@ -1516,6 +1527,7 @@ mod tests {
             tags: Vec::new(),
             cgo_enabled: false,
             call_graph: GoCallGraph::RtaCha,
+            dependency_snapshot_id: format!("go-dependency-snapshot:sha256:{}", "a".repeat(64)),
         });
         let mut changed = baseline.clone();
         let CanonicalProfileAxes::Go(axes) = &mut changed else {
@@ -1526,7 +1538,7 @@ mod tests {
             changed_axes(&baseline, &changed)
                 .unwrap_err()
                 .to_string()
-                .contains("cgo and call-graph")
+                .contains("cgo, call-graph, and dependency-snapshot")
         );
         Ok(())
     }
