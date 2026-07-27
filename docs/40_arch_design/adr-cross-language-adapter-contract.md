@@ -259,6 +259,22 @@ tags disabled and alias expansion bounded. Server variables and examples are
 not executed or persisted. Consumer/provider code mapping requires the common
 proof rules; a URL literal or `operationId` match alone is not exact.
 
+Generated OpenAPI mappings use strict JSON files ending in
+`.depgraph-openapi-generated.json` with schema
+`depgraph-openapi-generated-mapping-v1`. The manifest fixes the generator
+name/version, OpenAPI locator/version/digest, generated output
+locator/digest, language, client/provider role, canonical operation
+coordinate, repository symbol coordinate, and complete source span. Safe scan
+supports OpenAPI Generator 7, oapi-codegen 2 for Go, and
+openapi-typescript 7 for Web. It never starts those tools. The adapter hashes
+the admitted manifest, independently reads each confined regular output, and
+requires current contract/output digests and an existing canonical operation
+before emitting exact `generated_from`, `calls_operation`, or
+`implemented_by` edges. Missing, stale, partial, mixed-generator, duplicate,
+ambiguous, unsupported, symlinked, or out-of-root claims remain reasoned
+unresolved sites. A similarly named generated file without this provenance
+creates no exact mapping.
+
 ### Protocol Buffers
 
 `protobuf-contract-v1` admits repository `.proto` sources and deterministic
@@ -343,7 +359,7 @@ one to three engineering days of scope.
 | ---: | --- | --- | --- | --- |
 | 1 | Common node/site/edge DTO, validator, coverage ledger, and cross-format golden harness | Implemented in #191 | This ADR | Canonical identity, resolution matrix, bounds, closure, and determinism tests pass |
 | 2 | OpenAPI 3.1 repository parser and contract graph | Implemented in #192 | 1 | Local JSON/YAML definitions and refs produce service/operation/message graph; hostile refs fail closed |
-| 3 | OpenAPI generated-client/provider repository mapping | 2-3 days | 2 | Provenance-backed calls/implementation edges and stale/ambiguous negative fixtures pass |
+| 3 | OpenAPI generated-client/provider repository mapping | Implemented in #193 | 2 | Provenance-backed calls/implementation edges and stale/ambiguous negative fixtures pass |
 | 4 | Protobuf source/descriptor contract graph | 2-3 days | 1 | Service/method/message/import graph is deterministic without invoking `protoc` |
 | 5 | Protobuf generated-code mapping | 2-3 days | 4 | Descriptor/source-map digests prove language endpoints; naming-only fixtures stay unresolved |
 | 6 | GraphQL SDL and executable-document graph | 2-3 days | 1 | Field/message/selection graph is complete for admitted files without introspection |
