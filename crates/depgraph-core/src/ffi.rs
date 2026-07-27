@@ -443,7 +443,7 @@ fn parse_rust(locator: &str, digest: &str, source: &str) -> (Vec<FfiDeclaration>
             continue;
         }
 
-        if trimmed.contains("extern \"") && trimmed.contains("fn ") && !trimmed.ends_with(';') {
+        if is_extern_function_declaration(trimmed) && !trimmed.ends_with(';') {
             let abi = quoted_after(trimmed, "extern")
                 .map(canonical_abi)
                 .unwrap_or_else(|| "unknown".to_owned());
@@ -1087,12 +1087,22 @@ fn cgo_declarations(preamble: &[String]) -> Vec<String> {
 }
 
 fn foreign_item_symbol(line: &str) -> Option<String> {
-    identifier_after(line, "fn").or_else(|| identifier_after(line, "static"))
+    let item = line.rsplit_once('{').map_or(line, |(_, item)| item);
+    let item = strip_rust_attributes(item.trim_start());
+    let item = strip_rust_item_modifier(item, "pub");
+    let item = strip_rust_item_modifier(item, "unsafe");
+    let item = strip_rust_item_modifier(item, "safe");
+    item.strip_prefix("fn ")
+        .and_then(identifier_prefix)
+        .or_else(|| item.strip_prefix("static ").and_then(identifier_prefix))
 }
 
 fn identifier_after(line: &str, keyword: &str) -> Option<String> {
     let (_, rest) = line.split_once(keyword)?;
-    let rest = rest.trim_start();
+    identifier_prefix(rest.trim_start())
+}
+
+fn identifier_prefix(rest: &str) -> Option<String> {
     let symbol = rest
         .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
         .next()?;
@@ -1352,6 +1362,9 @@ fn is_extern_block_header(line: &str) -> bool {
     let Some(extern_index) = line.find("extern \"") else {
         return false;
     };
+    if !rust_extern_prefix_is_admitted(&line[..extern_index]) {
+        return false;
+    }
     let Some(brace_index) = line[extern_index..]
         .find('{')
         .map(|index| extern_index + index)
@@ -1362,6 +1375,66 @@ fn is_extern_block_header(line: &str) -> bool {
         .find("fn ")
         .map(|index| brace_index < extern_index + index)
         .unwrap_or(true)
+}
+
+fn is_extern_function_declaration(line: &str) -> bool {
+    let Some(extern_index) = line.find("extern \"") else {
+        return false;
+    };
+    if !rust_extern_prefix_is_admitted(&line[..extern_index]) {
+        return false;
+    }
+    let Some(abi) = quoted_after(&line[extern_index..], "extern") else {
+        return false;
+    };
+    let marker = format!("\"{abi}\"");
+    line[extern_index..]
+        .split_once(&marker)
+        .is_some_and(|(_, suffix)| suffix.trim_start().starts_with("fn "))
+}
+
+fn rust_extern_prefix_is_admitted(prefix: &str) -> bool {
+    let prefix = strip_rust_attributes(prefix.trim());
+    let prefix = strip_rust_visibility(prefix);
+    strip_rust_item_modifier(prefix, "unsafe").is_empty()
+}
+
+fn strip_rust_attributes(mut value: &str) -> &str {
+    loop {
+        let trimmed = value.trim_start();
+        let Some(attribute) = trimmed.strip_prefix("#[") else {
+            return trimmed;
+        };
+        let Some(end) = attribute.find(']') else {
+            return trimmed;
+        };
+        value = &attribute[end + 1..];
+    }
+}
+
+fn strip_rust_visibility(value: &str) -> &str {
+    let value = value.trim_start();
+    let Some(rest) = value.strip_prefix("pub") else {
+        return value;
+    };
+    if rest.is_empty() || rest.starts_with(char::is_whitespace) {
+        return rest.trim_start();
+    }
+    let Some(restricted) = rest.strip_prefix('(') else {
+        return value;
+    };
+    let Some(end) = restricted.find(')') else {
+        return value;
+    };
+    restricted[end + 1..].trim_start()
+}
+
+fn strip_rust_item_modifier<'a>(value: &'a str, modifier: &str) -> &'a str {
+    let value = value.trim_start();
+    value
+        .strip_prefix(modifier)
+        .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+        .map_or(value, str::trim_start)
 }
 
 fn safe_symbol(value: &str) -> bool {
@@ -1660,15 +1733,17 @@ unsafe extern "C" {
 
     #[test]
     fn rust_comments_and_inline_extern_blocks_do_not_leak_false_declarations() {
-        let source = r#"
+        let source = r##"
 // extern "C" { fn line_comment(); }
 /*
 extern "C" { fn block_comment(); }
 */
+let standard = "extern \"C\" { fn standard_string(); }";
+let raw = r#"extern "C" { fn raw_string(); }"#;
 extern "C" { fn admitted(); }
 fn ordinary() {}
 static ORDINARY: i32 = 0;
-"#;
+"##;
         let (declarations, boundaries) = parse_rust("native.rs", "sha256:test", source);
         assert!(boundaries.is_empty());
         assert_eq!(declarations.len(), 1);
