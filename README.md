@@ -87,6 +87,11 @@ depgraph scan /path/to/repository
 depgraph scan /path/to/repository --strict
 depgraph scan /path/to/repository --no-cache
 
+# Preview automatic selection without starting workers or changing the store.
+depgraph profiles plan /path/to/repository
+depgraph profiles plan /path/to/repository --profile-budget 8 --json
+depgraph profiles plan /path/to/repository --profiles-file profiles.json --json
+
 # Foreground watcher daemon; status and stop work from another process.
 depgraph daemon start /path/to/repository
 depgraph daemon status /path/to/repository --json
@@ -138,6 +143,14 @@ depgraph export --format graphml --output graph.graphml
 ```
 
 SQLite is stored under the operating system cache directory, keyed by the canonical repository root. Use global `--store PATH` for a specific database and global `--scan-id ID` to inspect a retained partial scan. Queries default to the latest successful scan; `doctor` reports the latest attempt.
+
+`profiles plan` is read-only and uses only a bounded static inventory. Its human
+and canonical JSON output includes every selected, omitted, and policy-excluded
+profile with rank evidence and the schema-v1 configuration migration
+diagnostic. `--profile-budget` accepts `1..=32` while reserving every detected
+language baseline. `--profiles-file` instead reads a confined, non-symlink,
+UTF-8 JSON file of at most 64 KiB; it is all-or-error and cannot be combined
+with `--profile-budget`.
 
 GraphML exports use standard directed `node` and `edge` elements with generated
 XML-safe element IDs. The original stable IDs, kinds, phase, profile,

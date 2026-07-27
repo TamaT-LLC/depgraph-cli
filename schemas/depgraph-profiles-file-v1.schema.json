@@ -1,0 +1,162 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/TamaT-LLC/depgraph-cli/schemas/depgraph-profiles-file-v1.schema.json",
+  "title": "depgraph explicit profiles file v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract_version", "profiles"],
+  "properties": {
+    "contract_version": {
+      "const": "default-profile-selection-v1"
+    },
+    "profiles": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 32,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/axes"
+      }
+    }
+  },
+  "$defs": {
+    "rustAxes": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["language", "target", "mode", "default_features", "features"],
+      "properties": {
+        "language": {
+          "const": "rust"
+        },
+        "target": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "mode": {
+          "enum": ["check", "test"]
+        },
+        "default_features": {
+          "type": "boolean"
+        },
+        "features": {
+          "type": "array",
+          "maxItems": 4096,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          }
+        }
+      }
+    },
+    "goAxes": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "language",
+        "goos",
+        "goarch",
+        "tags",
+        "cgo_enabled",
+        "call_graph",
+        "dependency_snapshot_id"
+      ],
+      "properties": {
+        "language": {
+          "const": "go"
+        },
+        "goos": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "goarch": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "tags": {
+          "type": "array",
+          "maxItems": 4096,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          }
+        },
+        "cgo_enabled": {
+          "const": false
+        },
+        "call_graph": {
+          "enum": ["rta-cha", "vta"]
+        },
+        "dependency_snapshot_id": {
+          "type": "string",
+          "pattern": "^go-dependency-snapshot:sha256:[0-9a-f]{64}$"
+        }
+      }
+    },
+    "webAxes": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "language",
+        "mode",
+        "environments",
+        "bundled_typescript_compatibility_id",
+        "package_snapshot_id",
+        "framework_capability_ids"
+      ],
+      "properties": {
+        "language": {
+          "const": "web"
+        },
+        "mode": {
+          "enum": ["production", "development", "test"]
+        },
+        "environments": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 4,
+          "uniqueItems": true,
+          "items": {
+            "enum": ["browser", "server", "edge", "worker"]
+          }
+        },
+        "bundled_typescript_compatibility_id": {
+          "type": "string",
+          "pattern": "^web-typescript-compatibility:sha256:[0-9a-f]{64}$"
+        },
+        "package_snapshot_id": {
+          "type": "string",
+          "pattern": "^web-package-snapshot:sha256:[0-9a-f]{64}$"
+        },
+        "framework_capability_ids": {
+          "type": "array",
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^web-framework-capability:sha256:[0-9a-f]{64}$"
+          }
+        }
+      }
+    },
+    "axes": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/rustAxes"
+        },
+        {
+          "$ref": "#/$defs/goAxes"
+        },
+        {
+          "$ref": "#/$defs/webAxes"
+        }
+      ]
+    }
+  }
+}

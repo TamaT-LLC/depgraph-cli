@@ -46,3 +46,11 @@ input, exclusion, and plan identities; one-axis alternative relationships;
 baseline references; sorted unique evidence; and exact ledger/count
 conservation. The shared golden and invalid mutation corpus live in
 `crates/depgraph-core/tests/fixtures`.
+
+`depgraph-profiles-file-v1.schema.json` describes an explicit all-or-error
+profile set. Every entry fully declares canonical Rust, Go, or Web axes; the
+file contains at most 32 unique profiles and rejects unknown fields. The Rust
+reader additionally confines the file to the repository, rejects symlinks,
+special files, invalid UTF-8, secret-shaped content, and documents above
+64 KiB, then binds selection identity to canonical content rather than the
+checkout path.

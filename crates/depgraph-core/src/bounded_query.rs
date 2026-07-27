@@ -285,6 +285,35 @@ pub fn parse_bounded_query_bytes(query: &[u8]) -> QueryResult<QueryAst> {
 }
 
 pub fn read_bounded_query_file(repository_root: &Path, query_file: &Path) -> QueryResult<String> {
+    let bytes = read_bounded_repository_file(repository_root, query_file, MAX_QUERY_BYTES)?;
+    String::from_utf8(bytes).map_err(|_| {
+        QueryDiagnostic::input(
+            "query_file_invalid_utf8",
+            QueryFailureClass::Security,
+            "query file is not valid UTF-8",
+        )
+    })
+}
+
+pub(crate) fn read_bounded_repository_file(
+    repository_root: &Path,
+    file: &Path,
+    max_bytes: usize,
+) -> QueryResult<Vec<u8>> {
+    let max_bytes = u64::try_from(max_bytes).map_err(|_| {
+        QueryDiagnostic::input(
+            "query_file_size_or_type_invalid",
+            QueryFailureClass::Security,
+            "query file byte limit is invalid",
+        )
+    })?;
+    let read_limit = max_bytes.checked_add(1).ok_or_else(|| {
+        QueryDiagnostic::input(
+            "query_file_size_or_type_invalid",
+            QueryFailureClass::Security,
+            "query file byte limit is invalid",
+        )
+    })?;
     let root = fs::canonicalize(repository_root).map_err(|_| {
         QueryDiagnostic::input(
             "query_file_repository_boundary_unavailable",
@@ -292,7 +321,7 @@ pub fn read_bounded_query_file(repository_root: &Path, query_file: &Path) -> Que
             "query file repository boundary is unavailable",
         )
     })?;
-    let candidate = confined_candidate(repository_root, &root, query_file)?;
+    let candidate = confined_candidate(repository_root, &root, file)?;
     reject_symlink_components(&root, &candidate)?;
     let canonical = fs::canonicalize(&candidate).map_err(|_| {
         QueryDiagnostic::input(
@@ -332,7 +361,7 @@ pub fn read_bounded_query_file(repository_root: &Path, query_file: &Path) -> Que
             "query file metadata is unavailable",
         )
     })?;
-    if !before.file_type().is_file() || before.len() > MAX_QUERY_BYTES as u64 {
+    if !before.file_type().is_file() || before.len() > max_bytes {
         return Err(QueryDiagnostic::input(
             "query_file_size_or_type_invalid",
             QueryFailureClass::Security,
@@ -347,11 +376,18 @@ pub fn read_bounded_query_file(repository_root: &Path, query_file: &Path) -> Que
         ));
     }
 
-    let mut bytes = Vec::with_capacity(before.len() as usize);
+    let capacity = usize::try_from(before.len()).map_err(|_| {
+        QueryDiagnostic::input(
+            "query_file_size_or_type_invalid",
+            QueryFailureClass::Security,
+            "query file type or size is invalid",
+        )
+    })?;
+    let mut bytes = Vec::with_capacity(capacity);
     opened
         .file
         .by_ref()
-        .take(MAX_QUERY_BYTES as u64 + 1)
+        .take(read_limit)
         .read_to_end(&mut bytes)
         .map_err(|_| {
             QueryDiagnostic::input(
@@ -374,7 +410,7 @@ pub fn read_bounded_query_file(repository_root: &Path, query_file: &Path) -> Que
             "query file changed while it was read",
         )
     })?;
-    if !query_file_snapshot_is_stable(&before, &after, &path_after, bytes.len()) {
+    if !bounded_file_snapshot_is_stable(&before, &after, &path_after, bytes.len(), max_bytes) {
         return Err(QueryDiagnostic::input(
             "query_file_changed_during_read",
             QueryFailureClass::Security,
@@ -382,13 +418,7 @@ pub fn read_bounded_query_file(repository_root: &Path, query_file: &Path) -> Que
         ));
     }
 
-    String::from_utf8(bytes).map_err(|_| {
-        QueryDiagnostic::input(
-            "query_file_invalid_utf8",
-            QueryFailureClass::Security,
-            "query file is not valid UTF-8",
-        )
-    })
+    Ok(bytes)
 }
 
 pub fn parse_bounded_query_file(
@@ -656,18 +686,37 @@ fn metadata_modified(metadata: &Metadata) -> Option<std::time::SystemTime> {
     metadata.modified().ok()
 }
 
+#[cfg(test)]
 fn query_file_snapshot_is_stable(
     before: &Metadata,
     after: &Metadata,
     path_after: &Metadata,
     bytes_read: usize,
 ) -> bool {
-    bytes_read <= MAX_QUERY_BYTES
-        && before.len() == after.len()
-        && bytes_read as u64 == after.len()
-        && same_file_identity(before, after)
-        && same_file_identity(after, path_after)
-        && metadata_modified(before) == metadata_modified(after)
+    bounded_file_snapshot_is_stable(
+        before,
+        after,
+        path_after,
+        bytes_read,
+        MAX_QUERY_BYTES as u64,
+    )
+}
+
+fn bounded_file_snapshot_is_stable(
+    before: &Metadata,
+    after: &Metadata,
+    path_after: &Metadata,
+    bytes_read: usize,
+    max_bytes: u64,
+) -> bool {
+    u64::try_from(bytes_read).is_ok_and(|bytes_read| {
+        bytes_read <= max_bytes
+            && before.len() == after.len()
+            && bytes_read == after.len()
+            && same_file_identity(before, after)
+            && same_file_identity(after, path_after)
+            && metadata_modified(before) == metadata_modified(after)
+    })
 }
 
 #[cfg(unix)]
@@ -1824,8 +1873,9 @@ mod tests {
 
     use super::{
         BOUNDED_QUERY_CONTRACT_VERSION, Expression, Literal, MAX_QUERY_BYTES, QueryDirection,
-        QueryFailureClass, ScalarOperator, parse_bounded_query, parse_bounded_query_bytes,
-        parse_bounded_query_file, query_file_snapshot_is_stable, read_bounded_query_file,
+        QueryFailureClass, ScalarOperator, bounded_file_snapshot_is_stable, parse_bounded_query,
+        parse_bounded_query_bytes, parse_bounded_query_file, query_file_snapshot_is_stable,
+        read_bounded_query_file, read_bounded_repository_file,
     };
 
     const MINIMAL_QUERY: &str = r#"MATCH p = (source:"route")-["calls"*1..1]->(target:"external") RETURN source.id LIMIT 1"#;
@@ -2205,6 +2255,36 @@ mod tests {
             &replacement_metadata,
             after.len() as usize
         ));
+
+        let growing = first.path().join("growing.depgraph");
+        fs::write(&growing, b"before").unwrap();
+        let handle = fs::File::open(&growing).unwrap();
+        let before_growth = handle.metadata().unwrap();
+        let mut append = fs::OpenOptions::new().append(true).open(&growing).unwrap();
+        std::io::Write::write_all(&mut append, b"-after").unwrap();
+        let after_growth = handle.metadata().unwrap();
+        let path_after_growth = fs::metadata(&growing).unwrap();
+        assert!(!bounded_file_snapshot_is_stable(
+            &before_growth,
+            &after_growth,
+            &path_after_growth,
+            before_growth.len() as usize,
+            MAX_QUERY_BYTES as u64,
+        ));
+    }
+
+    #[test]
+    fn repository_file_reader_enforces_the_caller_byte_limit() {
+        let repository = tempfile::tempdir().unwrap();
+        let file = repository.path().join("bounded.bin");
+        fs::write(&file, b"12345").unwrap();
+        assert!(
+            read_bounded_repository_file(repository.path(), Path::new("bounded.bin"), 4).is_err()
+        );
+        assert_eq!(
+            read_bounded_repository_file(repository.path(), Path::new("bounded.bin"), 5).unwrap(),
+            b"12345"
+        );
     }
 
     #[cfg(unix)]

@@ -11,16 +11,18 @@ use depgraph_core::{
     BoundedQueryExecutionError, BoundedQueryPlan, BoundedQueryResult, BuildOutcomeKind,
     CancellationToken, Config, CycleLevel, DaemonStatus, ExportFormat, GraphQueryFilter,
     ImpactFilters, ImpactResult, PolicyAnnotation, PolicyResult, QueryDiagnostic,
-    QueryFailureClass, ScanCacheMode, TypedProjection, acquire_store_writer_lock, build_cache_key,
-    create_build_execution_request, default_store_path, doctor, evaluate_policy_diff,
-    execute_bounded_query, execute_build_request_with_cancellation, export_filtered,
-    export_graphml_filtered_to_writer, impact, impact_query_cache_key, init_config,
-    match_runtime_trace, open_store, open_store_read_only, parse_and_type_check_bounded_query,
-    plan_bounded_query, policy_annotations, read_bounded_query_file, read_git_changed_set,
+    QueryFailureClass, RepositoryProfilePlanPreview, ScanCacheMode, TypedProjection,
+    acquire_store_writer_lock, build_cache_key, create_build_execution_request, default_store_path,
+    doctor, evaluate_policy_diff, execute_bounded_query, execute_build_request_with_cancellation,
+    export_filtered, export_graphml_filtered_to_writer, impact, impact_query_cache_key,
+    init_config, match_runtime_trace, open_store, open_store_read_only,
+    parse_and_type_check_bounded_query, plan_bounded_query, plan_explicit_profile_selection,
+    plan_repository_profiles, policy_annotations, profile_selection_human_summary,
+    read_bounded_query_file, read_explicit_profile_selection_file, read_git_changed_set,
     read_runtime_trace, render_condition, render_github_annotations, run_scan_with_cache_mode,
     runtime_session_delta, rust_build_protocol_ndjson, stage_build_evidence,
-    start_repository_daemon, traverse_filtered, unresolved, web_build_protocol_ndjson,
-    why_filtered,
+    start_repository_daemon, traverse_filtered, unresolved,
+    validate_explicit_profile_selection_capabilities, web_build_protocol_ndjson, why_filtered,
 };
 use depgraph_protocol::canonical_json;
 use depgraph_store::{CompletedSnapshotDetails, CoverageRecord};
@@ -67,6 +69,11 @@ enum Commands {
         /// Bypass cache lookup and storage for this scan.
         #[arg(long)]
         no_cache: bool,
+    },
+    /// Preview the bounded default or explicit profile set without launching workers.
+    Profiles {
+        #[command(subcommand)]
+        command: ProfileCommands,
     },
     /// Start, inspect, or stop the repository watcher daemon.
     Daemon {
@@ -290,6 +297,24 @@ enum DaemonCommands {
 }
 
 #[derive(Debug, Subcommand)]
+enum ProfileCommands {
+    /// Explain the deterministic profile plan for a repository.
+    Plan {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Override the repository-size profile cap while retaining every baseline.
+        #[arg(long, value_name = "N", conflicts_with = "profiles_file")]
+        profile_budget: Option<u32>,
+        /// Replace automatic selection with one strict, bounded versioned JSON file.
+        #[arg(long, value_name = "FILE", conflicts_with = "profile_budget")]
+        profiles_file: Option<PathBuf>,
+        /// Emit the canonical versioned JSON plan and migration diagnostic.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum SnapshotCommands {
     /// Attach an immutable human-readable name to a completed snapshot.
     Create {
@@ -472,7 +497,10 @@ fn error_exit_code(error: &anyhow::Error) -> u8 {
         };
     }
     let message = format!("{error:#}").to_ascii_lowercase();
-    if message.contains("security policy") || message.contains("project code execution") {
+    if message.contains("security policy")
+        || message.contains("project code execution")
+        || message.contains("unsafe explicit profiles file")
+    {
         return 4;
     }
     if (message.contains("scan ") && message.contains(" was not found"))
@@ -495,6 +523,8 @@ fn error_exit_code(error: &anyhow::Error) -> u8 {
             "no matching scan is available",
             "daemon status",
             "runtime trace",
+            "profile-budget",
+            "explicit profiles",
         ]
         .iter()
         .any(|needle| message.contains(needle))
@@ -591,6 +621,27 @@ async fn run(cli: Cli) -> Result<u8> {
             }
             Ok(outcome.exit_code)
         }
+        Commands::Profiles { command } => match command {
+            ProfileCommands::Plan {
+                path,
+                profile_budget,
+                profiles_file,
+                json,
+            } => {
+                let requested_root =
+                    std::path::absolute(&path).context("profile planning root is unavailable")?;
+                let root = canonical_directory(path)?;
+                let config = Config::load(&root)?;
+                let mut preview = plan_repository_profiles(&root, &config, profile_budget)?;
+                if let Some(path) = profiles_file {
+                    let explicit = read_explicit_profile_selection_file(&requested_root, &path)?;
+                    validate_explicit_profile_selection_capabilities(&preview.plan, &explicit)?;
+                    preview.plan = plan_explicit_profile_selection(preview.plan.input, explicit)?;
+                }
+                print_profile_plan(&preview, json)?;
+                Ok(0)
+            }
+        },
         Commands::Daemon { command } => match command {
             DaemonCommands::Start { path, strict, json } => {
                 let root = canonical_directory(path)?;
@@ -1840,6 +1891,81 @@ fn load_query_snapshot_read_only(
     };
     let snapshot = store.load_completed_snapshot(&snapshot_id)?;
     Ok((snapshot, snapshot_id))
+}
+
+fn print_profile_plan(preview: &RepositoryProfilePlanPreview, json: bool) -> Result<()> {
+    if json {
+        println!("{}", canonical_json(&serde_json::to_value(preview)?));
+        return Ok(());
+    }
+    let plan = &preview.plan;
+    println!("{}", profile_selection_human_summary(plan)?);
+    println!("contract: {}", plan.contract_version);
+    println!(
+        "mode: {}",
+        canonical_json(&serde_json::to_value(plan.selection_mode)?)
+    );
+    println!("plan: {}", plan.plan_id);
+    println!("input: {}", plan.input_digest);
+    println!(
+        "repository: {}",
+        canonical_json(&serde_json::to_value(&plan.input.repository)?)
+    );
+    println!(
+        "limits: {}",
+        canonical_json(&serde_json::to_value(&plan.input.limits)?)
+    );
+    println!(
+        "compatibility: {}",
+        canonical_json(&serde_json::to_value(&plan.input.compatibility_ids)?)
+    );
+    println!(
+        "host contexts: {}",
+        canonical_json(&serde_json::to_value(&plan.input.host_contexts)?)
+    );
+    println!(
+        "config migration: {}",
+        canonical_json(&serde_json::to_value(&preview.config_migration)?)
+    );
+    for candidate in &plan.candidates {
+        println!(
+            "candidate {}: {}",
+            candidate.profile_id,
+            canonical_json(&serde_json::to_value(candidate)?)
+        );
+    }
+    for selected in &plan.selected {
+        println!(
+            "selected {}: {}",
+            selected.profile_id,
+            canonical_json(&serde_json::to_value(selected)?)
+        );
+    }
+    for omitted in &plan.omitted {
+        println!(
+            "omitted {}: {}",
+            omitted.profile_id,
+            canonical_json(&serde_json::to_value(omitted)?)
+        );
+    }
+    for excluded in &plan.policy_excluded {
+        println!(
+            "excluded {}: {}",
+            excluded.id,
+            canonical_json(&serde_json::to_value(excluded)?)
+        );
+    }
+    for discovery in &plan.discovery {
+        println!(
+            "discovery: {}",
+            canonical_json(&serde_json::to_value(discovery)?)
+        );
+    }
+    println!(
+        "summary: {}",
+        canonical_json(&serde_json::to_value(&plan.summary)?)
+    );
+    Ok(())
 }
 
 fn print_query_plan(plan: &BoundedQueryPlan, json: bool) -> Result<()> {
