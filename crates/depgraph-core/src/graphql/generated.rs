@@ -207,6 +207,8 @@ struct OutputObservation {
     reason: Option<String>,
     #[serde(skip)]
     source: Option<String>,
+    #[serde(skip)]
+    line_offsets: Vec<usize>,
 }
 
 pub(super) fn inventory_repository_mappings(root: &Path) -> Result<RepositoryMappingInventory> {
@@ -472,9 +474,13 @@ fn observe_output(root: &Path, relative: &str, total_bytes: &mut usize) -> Outpu
                 line_columns: Vec::new(),
                 reason: Some("graphql-mapped-output-is-not-utf8".to_owned()),
                 source: None,
+                line_offsets: Vec::new(),
             };
         }
     };
+    let line_offsets = std::iter::once(0)
+        .chain(source.match_indices('\n').map(|(index, _)| index + 1))
+        .collect();
     OutputObservation {
         digest,
         line_columns: source
@@ -483,6 +489,7 @@ fn observe_output(root: &Path, relative: &str, total_bytes: &mut usize) -> Outpu
             .collect(),
         reason: None,
         source: Some(source.to_owned()),
+        line_offsets,
     }
 }
 
@@ -492,6 +499,7 @@ fn output_failure(reason: &str) -> OutputObservation {
         line_columns: Vec::new(),
         reason: Some(reason.to_owned()),
         source: None,
+        line_offsets: Vec::new(),
     }
 }
 
@@ -899,23 +907,27 @@ fn span_contains_endpoint(observation: &OutputObservation, mapping: &RepositoryM
     let Some(source) = observation.source.as_deref() else {
         return false;
     };
-    let lines = source.split('\n').collect::<Vec<_>>();
     let start_line = mapping.start_line.saturating_sub(1) as usize;
     let end_line = mapping.end_line.saturating_sub(1) as usize;
     let mut inspected_chars = 0_usize;
     let mut found = false;
-    for (line_index, line) in lines
-        .get(start_line..=end_line)
-        .into_iter()
-        .flatten()
-        .enumerate()
-    {
-        let start = if line_index == 0 {
+    for absolute_line in start_line..=end_line {
+        let Some(line_start) = observation.line_offsets.get(absolute_line).copied() else {
+            return false;
+        };
+        let line_end = observation
+            .line_offsets
+            .get(absolute_line + 1)
+            .map_or(source.len(), |next| next.saturating_sub(1));
+        let Some(line) = source.get(line_start..line_end) else {
+            return false;
+        };
+        let start = if absolute_line == start_line {
             mapping.start_column.saturating_sub(1) as usize
         } else {
             0
         };
-        let end = if start_line + line_index == end_line {
+        let end = if absolute_line == end_line {
             mapping.end_column.saturating_sub(1) as usize
         } else {
             line.chars().count()
