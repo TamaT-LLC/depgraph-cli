@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -227,14 +227,15 @@ pub struct CrossLanguageEvidenceProperties {
 /// One adapter's complete, atomically promotable cross-language graph closure.
 ///
 /// Callers validate the whole envelope before staging any member. The envelope
-/// intentionally contains the selected profile and every referenced node so
-/// identity, proof, edge/site closure, and coverage conservation are checked as
-/// one unit rather than record by record.
+/// intentionally contains the selected profile, every participating profile,
+/// and every referenced node so identity, proof, edge/site closure, and
+/// coverage conservation are checked as one unit rather than record by record.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CrossLanguageAdapterDelta {
     pub contract_version: String,
     pub profile: Profile,
+    pub participating_profiles: Vec<Profile>,
     pub nodes: Vec<GraphNode>,
     pub sites: Vec<DependencySite>,
     pub edges: Vec<GraphEdge>,
@@ -349,12 +350,9 @@ pub fn validate_cross_language_adapter_delta(
     if delta.contract_version != CROSS_LANGUAGE_CONTRACT_VERSION {
         return invariant("cross-language adapter delta has an incompatible contract version");
     }
-    cross_language_graph_digest(
-        std::slice::from_ref(&delta.profile),
-        &delta.nodes,
-        &delta.edges,
-        &delta.sites,
-    )
+    let mut profiles = delta.participating_profiles.clone();
+    profiles.push(delta.profile.clone());
+    cross_language_graph_digest(&profiles, &delta.nodes, &delta.edges, &delta.sites)
 }
 
 pub fn cross_language_graph_digest(
@@ -394,6 +392,27 @@ pub(crate) fn validate_cross_language_maps(
             Ok((profile.id.clone(), profile))
         })
         .collect::<Result<BTreeMap<_, _>, ProtocolError>>()?;
+    for profile in claimed_profiles.values() {
+        let identity: CrossLanguageProfileIdentity = parse_property(
+            profile,
+            CROSS_LANGUAGE_PROFILE_IDENTITY_PROPERTY,
+            "profile identity",
+        )?;
+        for participant_id in identity.participating_profile_ids {
+            let Some(participant) = profiles.get(&participant_id) else {
+                return invariant(format!(
+                    "cross-language profile {} references undeclared participating profile {}",
+                    profile.id, participant_id
+                ));
+            };
+            if profile_claims_cross_language(participant) {
+                return invariant(format!(
+                    "cross-language profile {} cannot use cross-language profile {} as a participant",
+                    profile.id, participant_id
+                ));
+            }
+        }
+    }
     let cross_nodes = nodes
         .values()
         .filter(|node| {
@@ -813,6 +832,21 @@ fn validate_cross_language_site_edge_closure(
         if site_edges.len() != site.target_ids.len() {
             return invariant(format!(
                 "cross-language dependency site {} edge closure is incomplete",
+                site.id
+            ));
+        }
+        let edge_targets = site_edges
+            .iter()
+            .map(|edge| edge.target.as_str())
+            .collect::<BTreeSet<_>>();
+        let site_targets = site
+            .target_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        if edge_targets != site_targets {
+            return invariant(format!(
+                "cross-language dependency site {} edge targets differ from its declared targets",
                 site.id
             ));
         }

@@ -2,8 +2,9 @@ use std::io::Cursor;
 
 use depgraph_protocol::{
     CROSS_LANGUAGE_CONTRACT_VERSION, CROSS_LANGUAGE_SCHEMA, CrossLanguageAdapterDelta,
-    PROTOCOL_SCHEMA, ProtocolError, ProtocolEvent, cross_language_graph_digest,
-    validate_cross_language_adapter_delta, validate_cross_language_contract, validate_safe_ndjson,
+    PROTOCOL_SCHEMA, ProtocolError, ProtocolEvent, build_cross_language_edge_id,
+    cross_language_graph_digest, validate_cross_language_adapter_delta,
+    validate_cross_language_contract, validate_safe_ndjson,
 };
 use serde_json::{Value, json};
 
@@ -31,7 +32,9 @@ fn validate_values(values: &[Value]) -> Result<(), ProtocolError> {
 fn profile_event_mut(values: &mut [Value]) -> &mut Value {
     values
         .iter_mut()
-        .find(|event| event["event"] == "profile_declared")
+        .find(|event| {
+            event["event"] == "profile_declared" && event["profile"]["language"] == "cross-language"
+        })
         .expect("profile event")
 }
 
@@ -78,7 +81,9 @@ fn cross_format_golden_is_accepted_by_protocol_contract_and_schema() {
     }
     let profile = values
         .iter()
-        .find(|event| event["event"] == "profile_declared")
+        .find(|event| {
+            event["event"] == "profile_declared" && event["profile"]["language"] == "cross-language"
+        })
         .expect("profile");
     for value in [
         &profile["profile"]["properties"]["cross_language_profile_identity"],
@@ -142,15 +147,46 @@ fn graph_digest_is_independent_of_record_and_checkout_order() {
 #[test]
 fn adapter_delta_is_accepted_or_rejected_as_one_complete_closure() {
     let protocol = validate_safe_ndjson(Cursor::new(GOLDEN)).unwrap();
+    let profile = protocol
+        .profiles
+        .values()
+        .find(|profile| profile.language == "cross-language")
+        .unwrap()
+        .clone();
     let mut delta = CrossLanguageAdapterDelta {
         contract_version: CROSS_LANGUAGE_CONTRACT_VERSION.to_owned(),
-        profile: protocol.profiles.into_values().next().unwrap(),
+        participating_profiles: protocol
+            .profiles
+            .values()
+            .filter(|candidate| candidate.id != profile.id)
+            .cloned()
+            .collect(),
+        profile,
         nodes: protocol.nodes.into_values().collect(),
         sites: protocol.sites.into_values().collect(),
         edges: protocol.edges.into_values().collect(),
     };
     let digest = validate_cross_language_adapter_delta(&delta).unwrap();
     assert!(digest.starts_with("cross-language-graph:sha256:"));
+
+    let mut missing_participant = delta.clone();
+    missing_participant.participating_profiles.clear();
+    assert!(validate_cross_language_adapter_delta(&missing_participant).is_err());
+
+    let mut mismatched_targets = delta.clone();
+    let operation_targets = mismatched_targets
+        .nodes
+        .iter()
+        .filter(|node| node.kind == "operation")
+        .map(|node| node.id.clone())
+        .collect::<Vec<_>>();
+    let edge = mismatched_targets.edges.first_mut().unwrap();
+    edge.target = operation_targets
+        .into_iter()
+        .find(|target| target != &edge.target)
+        .unwrap();
+    edge.id = build_cross_language_edge_id(edge).unwrap();
+    assert!(validate_cross_language_adapter_delta(&mismatched_targets).is_err());
 
     delta
         .profile
