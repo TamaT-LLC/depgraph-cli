@@ -430,6 +430,27 @@ callbacks, and generated bindings remain target-specific. An unsupported ABI
 or missing link evidence stays candidate/unresolved and blocks FFI
 completeness.
 
+The static `ffi-contract-v1` inventory admits bounded repository-local source
+occurrences for Rust foreign blocks and stable `extern` exports, cgo preamble
+prototypes and `//export` declarations, and Web `.node` import/require or
+ambient-module declarations. Each emitted `binds_native_symbol` site retains
+the source language, import/export direction, ABI, requested library and
+symbol, and participating target profile in its canonical condition and source
+evidence. A stable local export is a heuristic manual declaration; an import
+with a confined explicit library request is only a closed candidate; a bare
+Web native package remains external; and missing library/symbol requests,
+wildcards, or unsupported ABIs remain unresolved. None of these source-only
+states is link/export observation.
+
+The inventory is byte-, file-, declaration-, profile-, and reason-bounded.
+Generated sources, Rust macro declarations, cgo headers that would require a C
+preprocessor, `//go:linkname`, dynamic native loading, unsafe paths, symlinks,
+and unsupported encodings are not expanded or executed. Their occurrences are
+conserved in the completeness ledger with fixed reason codes. Candidate and
+manual-declaration sites retain `ffi-link-evidence-pending`, so the static
+inventory cannot advertise observed FFI completeness before the supervised
+link/export adapter supplies same-profile evidence.
+
 ## Security boundary
 
 | Threat | Required control |
@@ -463,7 +484,7 @@ one to three engineering days of scope.
 | 6 | GraphQL SDL and executable-document graph | Implemented in #196 | 1 | Field/message/selection graph is complete for admitted files without introspection |
 | 7 | GraphQL client/resolver repository mapping | Implemented in #197 | 6 | Supported compiler/framework maps prove endpoints; dynamic/federated cases remain ledgered |
 | 8 | HTTP trace-to-operation correlation | Implemented in #198 | 2, 4 or 6; runtime trace v1 | Unique profile match is observed; ambiguous, raw-URL, and secret fixtures fail closed |
-| 9 | Rust/Go/Web static FFI declaration inventory | 2-3 days | 1 | Every admitted declaration is resolved/candidate/external/unresolved by target profile |
+| 9 | Rust/Go/Web static FFI declaration inventory | Implemented in #199 | 1 | Every admitted declaration is resolved/candidate/external/unresolved by target profile |
 | 10 | FFI supervised link/export evidence | 2-3 days | 9; build supervisor | Exact ABI/library/symbol mappings require same-profile link evidence and preserve rollback |
 | 11 | Five-target package/query/release gate | 2-3 days | 2-10 implemented capabilities | Linux/macOS/Windows archives attest adapters and pass query, determinism, tamper, SBOM, and license checks |
 
