@@ -162,9 +162,19 @@ pub fn validate_ffi_link_observation(observation: &FfiLinkObservation) -> Result
 /// tampered item rejects the whole result before a caller can stage it.
 pub fn correlate_ffi_link_observation(
     static_delta: &CrossLanguageAdapterDelta,
+    outcome: &BuildExecutionOutcome,
     observation: &FfiLinkObservation,
 ) -> Result<CrossLanguageAdapterDelta> {
     validate_cross_language_adapter_delta(static_delta).map_err(anyhow::Error::from)?;
+    let trusted_observation = collect_supervised_ffi_link_observation(
+        outcome,
+        &observation.architecture,
+        &observation.link_mode,
+        observation.entries.clone(),
+    )?;
+    if trusted_observation != *observation {
+        bail!("FFI link observation does not match its completed supervisor audit");
+    }
     let observation_digest = validate_ffi_link_observation(observation)?;
     let profile_identity: CrossLanguageProfileIdentity = serde_json::from_value(
         static_delta
@@ -187,10 +197,7 @@ pub fn correlate_ffi_link_observation(
             .participating_profile_ids
             .iter()
             .any(|profile_id| profile_id == &observation.profile_id)
-        || observed_profile
-            .target
-            .as_deref()
-            .is_some_and(|target| target != observation.target_triple)
+        || observed_profile.target.as_deref() != Some(observation.target_triple.as_str())
     {
         bail!("FFI link observation does not match the static profile identity");
     }
@@ -810,13 +817,13 @@ mod tests {
 
     use super::*;
 
-    fn profile(id: &str) -> Profile {
+    fn profile(id: &str, target: &str) -> Profile {
         Profile {
             id: id.to_owned(),
             language: "polyglot".to_owned(),
             toolchain: None,
             command: None,
-            target: None,
+            target: Some(target.to_owned()),
             features: Vec::new(),
             environment: BTreeMap::new(),
             source_revision: None,
@@ -839,7 +846,7 @@ mod tests {
         ];
         let profiles = platforms
             .iter()
-            .map(|(profile_id, _, _)| profile(profile_id))
+            .map(|(profile_id, target, _)| profile(profile_id, target))
             .collect::<Vec<_>>();
         let mut delta = scan_ffi_repository(root.path(), &profiles)
             .unwrap()
@@ -866,7 +873,7 @@ mod tests {
                 )],
             )
             .unwrap();
-            delta = correlate_ffi_link_observation(&delta, &observation).unwrap();
+            delta = correlate_ffi_link_observation(&delta, &outcome, &observation).unwrap();
         }
 
         validate_cross_language_adapter_delta(&delta).unwrap();
@@ -913,12 +920,12 @@ mod tests {
             "#[link(name = \"crypto\")]\nextern \"C\" {\nfn one();\nfn two();\n}\n",
         )
         .unwrap();
-        let mut linux_profile = profile("linux");
-        linux_profile.target = Some("x86_64-unknown-linux-gnu".to_owned());
+        let linux_profile = profile("linux", "x86_64-unknown-linux-gnu");
         let delta = scan_ffi_repository(root.path(), &[linux_profile])
             .unwrap()
             .unwrap();
         let sites = static_sites_for_profile(&delta, "linux");
+        let outcome = completed_outcome("linux", "x86_64-unknown-linux-gnu", true);
         let partial = observation(
             "linux",
             vec![entry_for(
@@ -930,7 +937,7 @@ mod tests {
                 'a',
             )],
         );
-        assert!(correlate_ffi_link_observation(&delta, &partial).is_err());
+        assert!(correlate_ffi_link_observation(&delta, &outcome, &partial).is_err());
 
         let mut mismatch_entries = sites
             .iter()
@@ -949,7 +956,7 @@ mod tests {
         mismatch_entries.sort();
         mismatch_entries[0].abi = "system".to_owned();
         let mismatch = observation("linux", mismatch_entries);
-        assert!(correlate_ffi_link_observation(&delta, &mismatch).is_err());
+        assert!(correlate_ffi_link_observation(&delta, &outcome, &mismatch).is_err());
 
         let mut tampered = observation(
             "linux",
@@ -969,7 +976,7 @@ mod tests {
                 .collect(),
         );
         tampered.entries[0].library_artifact_digest = "sha256:tampered".to_owned();
-        assert!(correlate_ffi_link_observation(&delta, &tampered).is_err());
+        assert!(correlate_ffi_link_observation(&delta, &outcome, &tampered).is_err());
 
         let complete = observation(
             "linux",
@@ -988,15 +995,35 @@ mod tests {
                 })
                 .collect(),
         );
-        let expected = correlate_ffi_link_observation(&delta, &complete).unwrap();
+        let expected = correlate_ffi_link_observation(&delta, &outcome, &complete).unwrap();
+        for mutation in ["run", "source-root", "toolchain", "link-input"] {
+            let mut forged = complete.clone();
+            match mutation {
+                "run" => forged.build_run_id = "run-2".to_owned(),
+                "source-root" => forged.source_root_digest = digest('d'),
+                "toolchain" => forged.toolchain_digest = digest('d'),
+                "link-input" => forged.link_input_digest = digest('d'),
+                _ => unreachable!(),
+            }
+            assert!(
+                correlate_ffi_link_observation(&delta, &outcome, &forged).is_err(),
+                "{mutation}"
+            );
+        }
         let mut wrong_target = complete.clone();
         wrong_target.target_triple = "aarch64-unknown-linux-gnu".to_owned();
-        assert!(correlate_ffi_link_observation(&delta, &wrong_target).is_err());
+        assert!(correlate_ffi_link_observation(&delta, &outcome, &wrong_target).is_err());
+        let mut untargeted_profile = profile("linux", "x86_64-unknown-linux-gnu");
+        untargeted_profile.target = None;
+        let untargeted = scan_ffi_repository(root.path(), &[untargeted_profile])
+            .unwrap()
+            .unwrap();
+        assert!(correlate_ffi_link_observation(&untargeted, &outcome, &complete).is_err());
         let mut reordered = delta.clone();
         reordered.sites.reverse();
         validate_cross_language_adapter_delta(&reordered).unwrap();
         assert_eq!(
-            correlate_ffi_link_observation(&reordered, &complete).unwrap(),
+            correlate_ffi_link_observation(&reordered, &outcome, &complete).unwrap(),
             expected
         );
         assert_eq!(
@@ -1094,12 +1121,18 @@ mod tests {
             )
             .unwrap();
         }
-        let first = scan_ffi_repository(first.path(), &[profile("linux")])
-            .unwrap()
-            .unwrap();
-        let second = scan_ffi_repository(second.path(), &[profile("linux")])
-            .unwrap()
-            .unwrap();
+        let first = scan_ffi_repository(
+            first.path(),
+            &[profile("linux", "x86_64-unknown-linux-gnu")],
+        )
+        .unwrap()
+        .unwrap();
+        let second = scan_ffi_repository(
+            second.path(),
+            &[profile("linux", "x86_64-unknown-linux-gnu")],
+        )
+        .unwrap()
+        .unwrap();
         let observation = observation(
             "linux",
             vec![entry_for(
@@ -1111,9 +1144,10 @@ mod tests {
                 'a',
             )],
         );
-        let once = correlate_ffi_link_observation(&first, &observation).unwrap();
-        let twice = correlate_ffi_link_observation(&once, &observation).unwrap();
-        let other = correlate_ffi_link_observation(&second, &observation).unwrap();
+        let outcome = completed_outcome("linux", "x86_64-unknown-linux-gnu", true);
+        let once = correlate_ffi_link_observation(&first, &outcome, &observation).unwrap();
+        let twice = correlate_ffi_link_observation(&once, &outcome, &observation).unwrap();
+        let other = correlate_ffi_link_observation(&second, &outcome, &observation).unwrap();
         assert_eq!(
             canonical_json(&serde_json::to_value(&once).unwrap()),
             canonical_json(&serde_json::to_value(&twice).unwrap())
