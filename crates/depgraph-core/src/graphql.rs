@@ -346,7 +346,7 @@ struct InlineFragment {
 struct DirectiveUse {
     name: String,
     dynamic: bool,
-    static_boolean: Option<bool>,
+    static_booleans: BTreeMap<String, bool>,
     span: SourceSpan,
 }
 
@@ -789,45 +789,67 @@ impl GraphQlParser {
         let end = match kind {
             TypeKind::Scalar => directives.last().map_or(start, |directive| directive.span),
             TypeKind::Union => {
-                self.expect("=")?;
-                self.consume("|");
-                let token = self.expect_name()?;
-                let mut end = token.span;
-                referenced_types.push(TypeReferenceSite {
-                    named_type: token.text.clone(),
-                    rendered: token.text,
-                    role: "union_member",
-                    span: token.span,
-                });
-                while self.consume("|") {
+                if extend && !directives.is_empty() && self.peek_text() != Some("=") {
+                    directives.last().map_or(start, |directive| directive.span)
+                } else {
+                    self.expect("=")?;
+                    self.consume("|");
                     let token = self.expect_name()?;
-                    end = token.span;
+                    let mut end = token.span;
                     referenced_types.push(TypeReferenceSite {
                         named_type: token.text.clone(),
                         rendered: token.text,
                         role: "union_member",
                         span: token.span,
                     });
+                    while self.consume("|") {
+                        let token = self.expect_name()?;
+                        end = token.span;
+                        referenced_types.push(TypeReferenceSite {
+                            named_type: token.text.clone(),
+                            rendered: token.text,
+                            role: "union_member",
+                            span: token.span,
+                        });
+                    }
+                    end
                 }
-                end
             }
             TypeKind::Enum => {
-                self.expect("{")?;
-                while self.peek_text() != Some("}") {
-                    self.expect_name()?;
-                    self.parse_directives()?;
+                if extend && !directives.is_empty() && self.peek_text() != Some("{") {
+                    directives.last().map_or(start, |directive| directive.span)
+                } else {
+                    self.expect("{")?;
+                    while self.peek_text() != Some("}") {
+                        while self.peek_kind() == Some(TokenKind::String) {
+                            self.cursor += 1;
+                        }
+                        self.expect_name()?;
+                        self.parse_directives()?;
+                    }
+                    self.expect("}")?.span
                 }
-                self.expect("}")?.span
             }
             TypeKind::Input | TypeKind::Interface | TypeKind::Object => {
-                self.expect("{")?;
-                while self.peek_text() != Some("}") {
-                    while self.peek_kind() == Some(TokenKind::String) {
-                        self.cursor += 1;
+                if extend
+                    && self.peek_text() != Some("{")
+                    && (!directives.is_empty() || !referenced_types.is_empty())
+                {
+                    directives
+                        .last()
+                        .map(|directive| directive.span)
+                        .or_else(|| referenced_types.last().map(|reference| reference.span))
+                        .unwrap_or(start)
+                } else {
+                    self.expect("{")?;
+                    while self.peek_text() != Some("}") {
+                        while self.peek_kind() == Some(TokenKind::String) {
+                            self.cursor += 1;
+                        }
+                        fields.push(self.parse_field_definition(kind == TypeKind::Input)?);
                     }
-                    fields.push(self.parse_field_definition(kind == TypeKind::Input)?);
+                    self.expect("}")?.span
                 }
-                self.expect("}")?.span
             }
         };
         Ok(TypeDefinition {
@@ -1075,24 +1097,20 @@ impl GraphQlParser {
             let start = self.tokens[self.cursor - 1].span;
             let name = self.expect_name()?;
             let mut dynamic = false;
-            let mut static_boolean = None;
+            let mut static_booleans = BTreeMap::new();
             let mut end = name.span;
             if self.consume("(") {
                 let begin = self.cursor;
                 self.skip_balanced("(", ")")?;
                 let values = &self.tokens[begin..self.cursor - 1];
                 dynamic = values.iter().any(|token| token.text == "$");
-                static_boolean = values.iter().find_map(|token| match token.text.as_str() {
-                    "true" => Some(true),
-                    "false" => Some(false),
-                    _ => None,
-                });
+                static_booleans = parse_static_boolean_arguments(values);
                 end = self.tokens[self.cursor - 1].span;
             }
             directives.push(DirectiveUse {
                 name: name.text,
                 dynamic,
-                static_boolean,
+                static_booleans,
                 span: merge_span(start, end),
             });
         }
@@ -2574,19 +2592,63 @@ fn directive_boundary_reason(directives: &[DirectiveUse]) -> Option<&'static str
 
 fn directive_conditions(directives: &[DirectiveUse]) -> Vec<(&'static str, Value)> {
     let mut conditions = Vec::new();
-    if let Some(value) = directives
-        .iter()
-        .find_map(|directive| directive.static_boolean)
-    {
-        conditions.push(("graphql.static_directive_value", Value::Bool(value)));
-    }
     if !directives.is_empty() {
+        conditions.push((
+            "graphql.directive_state",
+            Value::Array(
+                directives
+                    .iter()
+                    .map(|directive| {
+                        json!({
+                            "name": directive.name,
+                            "dynamic": directive.dynamic,
+                            "static_booleans": directive.static_booleans,
+                        })
+                    })
+                    .collect(),
+            ),
+        ));
         conditions.push((
             "graphql.directive_count",
             Value::from(directives.len() as u64),
         ));
     }
     conditions
+}
+
+fn parse_static_boolean_arguments(tokens: &[Token]) -> BTreeMap<String, bool> {
+    let mut arguments = BTreeMap::new();
+    let mut depth = 0_usize;
+    let mut index = 0_usize;
+    while index < tokens.len() {
+        match tokens[index].text.as_str() {
+            "[" | "{" | "(" => {
+                depth = depth.saturating_add(1);
+                index += 1;
+            }
+            "]" | "}" | ")" => {
+                depth = depth.saturating_sub(1);
+                index += 1;
+            }
+            _ if depth == 0
+                && index + 2 < tokens.len()
+                && tokens[index].kind == TokenKind::Name
+                && tokens[index + 1].text == ":" =>
+            {
+                let value = match tokens[index + 2].text.as_str() {
+                    "true" => Some(true),
+                    "false" => Some(false),
+                    _ => None,
+                };
+                if let Some(value) = value {
+                    arguments.insert(tokens[index].text.clone(), value);
+                }
+                index += 3;
+            }
+            _ => index += 1,
+        }
+    }
+    arguments
 }
 
 fn is_builtin_scalar(name: &str) -> bool {
@@ -2950,6 +3012,90 @@ fragment Shared on Query { value }
                 .reasons
                 .contains(&"graphql-type-depth-limit-exceeded".to_owned())
         );
+    }
+
+    #[test]
+    fn directive_only_type_extensions_and_enum_value_descriptions_are_admitted() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(
+            root.path().join("extensions.graphql"),
+            r#"
+directive @metadata(enabled: Boolean!) on OBJECT | ENUM | UNION
+type Query { result: Result }
+type Product { id: ID! }
+enum Color {
+  "Primary color"
+  RED
+}
+union Result = Product
+extend type Query @metadata(enabled: true)
+extend enum Color @metadata(enabled: false)
+extend union Result @metadata(enabled: true)
+"#,
+        )
+        .unwrap();
+
+        let delta = scan_graphql_repository(root.path(), &participating_profiles())
+            .unwrap()
+            .unwrap();
+        let ledger: CrossLanguageCompletenessLedger = serde_json::from_value(
+            delta.profile.properties[CROSS_LANGUAGE_COMPLETENESS_PROPERTY].clone(),
+        )
+        .unwrap();
+        assert_eq!(ledger.entries[0].skipped_count, 0);
+        assert!(
+            delta
+                .nodes
+                .iter()
+                .any(|node| node.properties["canonical_identity"]["coordinate"] == "enum Color")
+        );
+    }
+
+    #[test]
+    fn directive_conditions_preserve_names_boolean_arguments_and_order() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(
+            root.path().join("conditions.graphql"),
+            r#"
+directive @feature(enabled: Boolean!) on FIELD
+directive @guard(allowed: Boolean!) on FIELD
+type Query { value: Result }
+type Result { id: ID! }
+query Conditional {
+  value @feature(enabled: true) @guard(allowed: false) { id }
+}
+"#,
+        )
+        .unwrap();
+
+        let delta = scan_graphql_repository(root.path(), &participating_profiles())
+            .unwrap()
+            .unwrap();
+        let condition = delta
+            .sites
+            .iter()
+            .find(|site| {
+                site.evidence.first().is_some_and(|evidence| {
+                    evidence.path.as_deref() == Some("conditions.graphql")
+                        && evidence.properties["graphql_coordinate"] == "Query.value"
+                }) && serde_json::to_string(&site.condition)
+                    .is_ok_and(|condition| condition.contains("graphql.directive_state"))
+            })
+            .map(|site| serde_json::to_value(&site.condition).unwrap())
+            .unwrap();
+        let serialized = serde_json::to_string(&condition).unwrap();
+        for expected in [
+            "graphql.directive_state",
+            "feature",
+            "enabled",
+            "true",
+            "guard",
+            "allowed",
+            "false",
+        ] {
+            assert!(serialized.contains(expected), "{expected}: {serialized}");
+        }
+        assert!(serialized.find("feature").unwrap() < serialized.find("guard").unwrap());
     }
 
     #[test]
