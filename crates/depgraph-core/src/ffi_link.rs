@@ -77,6 +77,8 @@ pub fn collect_supervised_ffi_link_observation(
 ) -> Result<FfiLinkObservation> {
     let audit = &outcome.audit;
     if !outcome.project_code_executed
+        || audit.adapter != FFI_LINK_OBSERVER
+        || audit.adapter_version != FFI_LINK_OBSERVER_VERSION
         || audit.outcome != BuildOutcomeKind::Completed
         || audit.exit_code != Some(0)
         || audit.stdout_truncated
@@ -172,6 +174,11 @@ pub fn correlate_ffi_link_observation(
             .cloned()
             .context("FFI delta has no cross-language profile identity")?,
     )?;
+    let observed_profile = static_delta
+        .participating_profiles
+        .iter()
+        .find(|profile| profile.id == observation.profile_id)
+        .context("FFI link observation profile is not in the static delta")?;
     if !profile_identity
         .adapter_capability_versions
         .iter()
@@ -180,6 +187,10 @@ pub fn correlate_ffi_link_observation(
             .participating_profile_ids
             .iter()
             .any(|profile_id| profile_id == &observation.profile_id)
+        || observed_profile
+            .target
+            .as_deref()
+            .is_some_and(|target| target != observation.target_triple)
     {
         bail!("FFI link observation does not match the static profile identity");
     }
@@ -902,7 +913,9 @@ mod tests {
             "#[link(name = \"crypto\")]\nextern \"C\" {\nfn one();\nfn two();\n}\n",
         )
         .unwrap();
-        let delta = scan_ffi_repository(root.path(), &[profile("linux")])
+        let mut linux_profile = profile("linux");
+        linux_profile.target = Some("x86_64-unknown-linux-gnu".to_owned());
+        let delta = scan_ffi_repository(root.path(), &[linux_profile])
             .unwrap()
             .unwrap();
         let sites = static_sites_for_profile(&delta, "linux");
@@ -976,6 +989,9 @@ mod tests {
                 .collect(),
         );
         let expected = correlate_ffi_link_observation(&delta, &complete).unwrap();
+        let mut wrong_target = complete.clone();
+        wrong_target.target_triple = "aarch64-unknown-linux-gnu".to_owned();
+        assert!(correlate_ffi_link_observation(&delta, &wrong_target).is_err());
         let mut reordered = delta.clone();
         reordered.sites.reverse();
         validate_cross_language_adapter_delta(&reordered).unwrap();
@@ -1014,6 +1030,17 @@ mod tests {
             .is_err()
         );
         let allowed = completed_outcome("linux", "x86_64-unknown-linux-gnu", true);
+        let mut wrong_adapter = allowed.clone();
+        wrong_adapter.audit.adapter = "unrelated-build-adapter".to_owned();
+        assert!(
+            collect_supervised_ffi_link_observation(
+                &wrong_adapter,
+                "x86_64",
+                "dynamic",
+                vec![entry.clone()]
+            )
+            .is_err()
+        );
         let valid = collect_supervised_ffi_link_observation(
             &allowed,
             "x86_64",
