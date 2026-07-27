@@ -7,7 +7,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use depgraph_protocol::Condition;
+use depgraph_protocol::{Condition, Profile};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -3312,10 +3312,7 @@ fn validate_cross_language_package_smoke(
     if report.schema_version != CROSS_LANGUAGE_PACKAGE_SMOKE_SCHEMA_VERSION
         || report.target != target
         || report.contract != depgraph_core::cross_language_release_compatibility_contract()
-        || !prefixed_lowercase_sha256(
-            &report.graph_digest,
-            "cross-language-release-graph:sha256:",
-        )
+        || !prefixed_lowercase_sha256(&report.graph_digest, "cross-language-release-graph:sha256:")
         || !lowercase_sha256(&report.canonical_export_sha256)
         || !lowercase_sha256(&report.query_output_sha256)
     {
@@ -4273,14 +4270,24 @@ fn materialize_cross_language_fixture(
 }
 
 fn cross_language_fixture_export(root: &Path) -> Result<(Value, Value)> {
-    let profile_ids = vec!["release:polyglot".to_owned()];
-    let openapi = depgraph_core::scan_openapi_repository(root, &profile_ids)?
+    let profiles = vec![Profile {
+        id: "release:polyglot".to_owned(),
+        language: "polyglot".to_owned(),
+        toolchain: None,
+        command: None,
+        target: None,
+        features: Vec::new(),
+        environment: BTreeMap::new(),
+        source_revision: None,
+        properties: BTreeMap::new(),
+    }];
+    let openapi = depgraph_core::scan_openapi_repository(root, &profiles)?
         .context("packaged cross-language fixture has no OpenAPI graph")?;
-    let protobuf = depgraph_core::scan_protobuf_repository(root, &profile_ids)?
+    let protobuf = depgraph_core::scan_protobuf_repository(root, &profiles)?
         .context("packaged cross-language fixture has no Protobuf graph")?;
-    let graphql = depgraph_core::scan_graphql_repository(root, &profile_ids)?
+    let graphql = depgraph_core::scan_graphql_repository(root, &profiles)?
         .context("packaged cross-language fixture has no GraphQL graph")?;
-    let ffi = depgraph_core::scan_ffi_repository(root, &profile_ids)?
+    let ffi = depgraph_core::scan_ffi_repository(root, &profiles)?
         .context("packaged cross-language fixture has no FFI graph")?;
 
     let operation = openapi
