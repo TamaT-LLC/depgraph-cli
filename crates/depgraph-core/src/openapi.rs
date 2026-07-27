@@ -395,6 +395,11 @@ fn parse_openapi_document(
     {
         return Err("openapi-paths-is-not-an-object".to_owned());
     }
+    if let Some(webhooks) = object.get("webhooks")
+        && !webhooks.is_object()
+    {
+        return Err("openapi-webhooks-is-not-an-object".to_owned());
+    }
     let (end_line, end_column) = source_end_position(source)?;
     Ok(OpenApiDocument {
         locator: locator.to_owned(),
@@ -1046,6 +1051,7 @@ impl OpenApiGraphBuilder {
 
         for locator in locators {
             self.process_document_paths(&locator)?;
+            self.process_document_webhooks(&locator)?;
         }
         Ok(())
     }
@@ -1151,13 +1157,55 @@ impl OpenApiGraphBuilder {
         Ok(())
     }
 
+    fn process_document_webhooks(&mut self, locator: &str) -> Result<()> {
+        let webhooks = self
+            .documents
+            .get(locator)
+            .and_then(|document| document.root.get("webhooks"))
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        for (index, (name, path_item)) in sorted_object(&webhooks).into_iter().enumerate() {
+            if !bounded_contract_text(&name) {
+                let service = self.service_ids[locator].clone();
+                let target =
+                    self.unknown_node(locator, "/webhooks", "webhook-name-is-unbounded")?;
+                self.add_relation(RelationInput {
+                    source: &service,
+                    target: &target,
+                    relation: CrossLanguageRelationKind::ProvidesOperation,
+                    evidence_locator: locator,
+                    pointer: "/webhooks",
+                    status: ResolutionStatus::Unresolved,
+                    precision: Precision::Heuristic,
+                    mapping: CrossLanguageMappingKind::Unresolved,
+                    reason: Some("webhook-name-is-unbounded"),
+                    conditions: Vec::new(),
+                })?;
+                continue;
+            }
+            let pointer = format!("/webhooks/{}", pointer_escape(&name));
+            let synthetic_path = format!("/webhook/{index}");
+            let operation_context = format!("webhook {name}");
+            self.process_path_item(
+                locator,
+                &synthetic_path,
+                &pointer,
+                path_item,
+                Some(&operation_context),
+                0,
+            )?;
+        }
+        Ok(())
+    }
+
     fn process_path_item(
         &mut self,
         locator: &str,
         path: &str,
         pointer: &str,
         path_item: Value,
-        callback_parent: Option<&str>,
+        operation_context: Option<&str>,
         depth: usize,
     ) -> Result<()> {
         if depth > MAX_OPENAPI_REFERENCE_DEPTH {
@@ -1217,9 +1265,9 @@ impl OpenApiGraphBuilder {
                 continue;
             };
             let operation_pointer = format!("{pointer}/{method}");
-            let coordinate = callback_parent.map_or_else(
+            let coordinate = operation_context.map_or_else(
                 || format!("{method} {path}"),
-                |parent| format!("callback {parent} #{operation_pointer} {method}"),
+                |context| format!("{context} #{operation_pointer} {method}"),
             );
             let operation_id =
                 self.add_cross_node(CrossLanguageNodeKind::Operation, locator, &coordinate)?;
@@ -1624,12 +1672,13 @@ impl OpenApiGraphBuilder {
                     let callback_pointer =
                         format!("{resolved_pointer}/{}", pointer_escape(&expression));
                     let synthetic_path = format!("/callback/{index}");
+                    let operation_context = format!("callback {parent_coordinate}");
                     self.process_path_item(
                         &locator,
                         &synthetic_path,
                         &callback_pointer,
                         path_item,
-                        Some(parent_coordinate),
+                        Some(&operation_context),
                         depth,
                     )?;
                 }
@@ -2677,6 +2726,63 @@ paths:
             }),
             "callback operation was not represented"
         );
+    }
+
+    #[test]
+    fn top_level_webhooks_emit_operations_and_message_relations() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(
+            root.path().join("openapi-webhook.yaml"),
+            r#"
+openapi: 3.1.1
+info:
+  title: Webhooks
+paths: {}
+webhooks:
+  orderCreated:
+    post:
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Order'
+      responses:
+        '202':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Acknowledgement'
+components:
+  schemas:
+    Order:
+      type: object
+    Acknowledgement:
+      type: object
+"#,
+        )
+        .unwrap();
+
+        let delta = scan_openapi_repository(root.path(), &participating_profiles())
+            .unwrap()
+            .unwrap();
+        validate_cross_language_adapter_delta(&delta).unwrap();
+        assert_eq!(
+            ledger(&delta).entries[0].status,
+            CrossLanguageCapabilityStatus::Complete
+        );
+        assert!(delta.nodes.iter().any(|node| {
+            node.kind == "operation"
+                && node.properties["canonical_identity"]["coordinate"]
+                    == "webhook orderCreated #/webhooks/orderCreated/post post"
+        }));
+        let kinds = delta
+            .sites
+            .iter()
+            .map(|site| site.kind.as_str())
+            .collect::<BTreeSet<_>>();
+        assert!(kinds.contains("provides_operation"));
+        assert!(kinds.contains("accepts_message"));
+        assert!(kinds.contains("returns_message"));
     }
 
     #[test]
