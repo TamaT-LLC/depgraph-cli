@@ -32,6 +32,7 @@ const MAX_MAPPINGS: usize = 10_000;
 const MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_TOTAL_OUTPUT_BYTES: usize = 128 * 1024 * 1024;
 const MAX_INVENTORY_ENTRIES: usize = 1_000_000;
+const MAX_ENDPOINT_EVIDENCE_CHARS: usize = 4_096;
 
 #[derive(Clone, Debug)]
 pub(super) struct RepositoryMappingInventory {
@@ -824,17 +825,24 @@ fn resolver_boundary_reason<'a>(
 }
 
 fn supported_tool(tool: &ToolIdentity, language: MappingLanguage, role: MappingRole) -> bool {
-    let parts = tool
-        .version
-        .split('.')
+    let segments = tool.version.split('.').collect::<Vec<_>>();
+    if !(2..=3).contains(&segments.len())
+        || segments.iter().any(|segment| {
+            segment.is_empty()
+                || !segment.bytes().all(|byte| byte.is_ascii_digit())
+                || (segment.len() > 1 && segment.starts_with('0'))
+        })
+    {
+        return false;
+    }
+    let parts = segments
+        .iter()
+        .copied()
         .map(str::parse::<u64>)
         .collect::<std::result::Result<Vec<_>, _>>();
     let Ok(parts) = parts else {
         return false;
     };
-    if parts.len() < 2 || parts.len() > 3 {
-        return false;
-    }
     matches!(
         (tool.name.as_str(), language, role, parts.as_slice()),
         (
@@ -894,16 +902,14 @@ fn span_contains_endpoint(observation: &OutputObservation, mapping: &RepositoryM
     let lines = source.split('\n').collect::<Vec<_>>();
     let start_line = mapping.start_line.saturating_sub(1) as usize;
     let end_line = mapping.end_line.saturating_sub(1) as usize;
-    let mut selected = String::new();
+    let mut inspected_chars = 0_usize;
+    let mut found = false;
     for (line_index, line) in lines
         .get(start_line..=end_line)
         .into_iter()
         .flatten()
         .enumerate()
     {
-        if line_index > 0 {
-            selected.push('\n');
-        }
         let start = if line_index == 0 {
             mapping.start_column.saturating_sub(1) as usize
         } else {
@@ -914,16 +920,31 @@ fn span_contains_endpoint(observation: &OutputObservation, mapping: &RepositoryM
         } else {
             line.chars().count()
         };
-        selected.extend(line.chars().skip(start).take(end.saturating_sub(start)));
+        let segment_chars = end.saturating_sub(start);
+        let Some(total_chars) = inspected_chars.checked_add(segment_chars) else {
+            return false;
+        };
+        if total_chars > MAX_ENDPOINT_EVIDENCE_CHARS {
+            return false;
+        }
+        inspected_chars = total_chars;
+        let selected = line
+            .chars()
+            .skip(start)
+            .take(segment_chars)
+            .collect::<String>();
+        found |= contains_endpoint_token(&selected, &mapping.endpoint);
     }
-    selected
-        .match_indices(&mapping.endpoint)
-        .any(|(index, endpoint)| {
-            let before = selected[..index].chars().next_back();
-            let after = selected[index + endpoint.len()..].chars().next();
-            before.is_none_or(|character| !is_endpoint_identifier_character(character))
-                && after.is_none_or(|character| !is_endpoint_identifier_character(character))
-        })
+    found
+}
+
+fn contains_endpoint_token(selected: &str, endpoint: &str) -> bool {
+    selected.match_indices(endpoint).any(|(index, endpoint)| {
+        let before = selected[..index].chars().next_back();
+        let after = selected[index + endpoint.len()..].chars().next();
+        before.is_none_or(|character| !is_endpoint_identifier_character(character))
+            && after.is_none_or(|character| !is_endpoint_identifier_character(character))
+    })
 }
 
 fn is_endpoint_identifier_character(character: char) -> bool {
@@ -1731,6 +1752,15 @@ type Query @key(fields: "id") {
                 MappingRole::Resolver,
                 "Query.product",
                 MappingProof::FrameworkMap,
+                false,
+                false,
+            ),
+            (
+                "noncanonical-version",
+                ("cynic-codegen", "03.0.0"),
+                MappingRole::Client,
+                "query GetProduct",
+                MappingProof::CompilerSourceMap,
                 false,
                 false,
             ),
