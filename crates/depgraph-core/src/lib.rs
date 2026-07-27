@@ -12,6 +12,7 @@ pub mod daemon;
 pub mod export;
 mod graphml;
 pub mod graphql;
+pub mod http_operation_correlation;
 pub mod impact;
 pub mod incremental;
 pub mod openapi;
@@ -136,6 +137,10 @@ pub use graphql::{
     MAX_GRAPHQL_FILE_BYTES, MAX_GRAPHQL_FILES, MAX_GRAPHQL_SELECTIONS, MAX_GRAPHQL_TOKENS,
     MAX_GRAPHQL_TOTAL_BYTES, scan_graphql_repository,
 };
+pub use http_operation_correlation::{
+    HTTP_OPERATION_CORRELATION_VERSION, HttpOperationCorrelationOutcome,
+    HttpOperationCorrelationResult, correlate_http_operations,
+};
 pub use impact::{
     ChangedNodeMapping, GitChange, GitChangedSet, IMPACT_QUERY_CACHE_SCHEMA_VERSION,
     ImpactDiagnostic, ImpactFilters, ImpactNode, ImpactResult, impact, impact_query_cache_key,
@@ -234,11 +239,11 @@ pub use query::{
 pub use runtime_trace::{
     MatchedRuntimeTraceLocator, RUNTIME_COLLECTOR_CONTRACT_VERSION, RUNTIME_COLLECTOR_SCHEMA,
     RUNTIME_TRACE_MAX_BYTES, RUNTIME_TRACE_MAX_EVENTS, RUNTIME_TRACE_SCHEMA,
-    RUNTIME_TRACE_SCHEMA_VERSION, RuntimeTrace, RuntimeTraceEnvironment, RuntimeTraceEvent,
-    RuntimeTraceLocator, RuntimeTraceMatchStatus, RuntimeTraceProfile, RuntimeTraceProfileMatch,
-    RuntimeTraceRedaction, RuntimeTraceRepository, RuntimeTraceSession, RuntimeTraceSummary,
-    ValidatedRuntimeTrace, ValidatedRuntimeTraceEvent, match_runtime_trace, read_runtime_trace,
-    runtime_session_delta, validate_runtime_trace,
+    RUNTIME_TRACE_SCHEMA_VERSION, RuntimeHttpObservation, RuntimeHttpOperationFormat, RuntimeTrace,
+    RuntimeTraceEnvironment, RuntimeTraceEvent, RuntimeTraceLocator, RuntimeTraceMatchStatus,
+    RuntimeTraceProfile, RuntimeTraceProfileMatch, RuntimeTraceRedaction, RuntimeTraceRepository,
+    RuntimeTraceSession, RuntimeTraceSummary, ValidatedRuntimeTrace, ValidatedRuntimeTraceEvent,
+    match_runtime_trace, read_runtime_trace, runtime_session_delta, validate_runtime_trace,
 };
 pub use rust_build_observer::{
     RUST_BUILD_CAPABILITY, RUST_BUILD_OBSERVATION_SCHEMA, RUST_BUILD_OBSERVER,

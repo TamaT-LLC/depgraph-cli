@@ -356,6 +356,7 @@
         "dependency_kind": { "$ref": "#/$defs/identifier" },
         "source": { "$ref": "#/$defs/locator" },
         "target": { "$ref": "#/$defs/locator" },
+        "http": { "$ref": "#/$defs/httpObservation" },
         "count": {
           "allOf": [
             { "$ref": "#/$defs/uint64" },
@@ -378,6 +379,51 @@
             "redaction": {
               "$ref": "#/$defs/productionCollectorRedaction"
             }
+          }
+        }
+      ]
+    },
+    "httpOperationFormat": {
+      "enum": ["openapi", "protobuf", "graphql"]
+    },
+    "httpObservation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["method", "route_template"],
+      "properties": {
+        "method": {
+          "enum": ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "CONNECT", "TRACE"]
+        },
+        "route_template": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512,
+          "pattern": "^/[^ ?#%\\\\]*$"
+        },
+        "format": { "$ref": "#/$defs/httpOperationFormat" },
+        "operation": { "$ref": "#/$defs/idString" },
+        "contract_locator": {
+          "allOf": [
+            { "$ref": "#/$defs/idString" },
+            {
+              "not": {
+                "pattern": "(^/|^\\\\\\\\|^[A-Za-z]:|\\\\\\\\|:|//|(^|/)\\\\.{1,2}(/|$)|/$)"
+              }
+            }
+          ]
+        },
+        "format_version": { "$ref": "#/$defs/idString" }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "format": { "enum": ["protobuf", "graphql"] }
+            },
+            "required": ["format"]
+          },
+          "then": {
+            "required": ["operation"]
           }
         }
       ]

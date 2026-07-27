@@ -113,6 +113,8 @@ pub struct RuntimeTraceEvent {
     pub dependency_kind: String,
     pub source: RuntimeTraceLocator,
     pub target: RuntimeTraceLocator,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http: Option<RuntimeHttpObservation>,
     #[serde(default = "default_event_count")]
     pub count: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -144,6 +146,29 @@ pub enum RuntimeTraceLocator {
     Unresolved {
         reason: String,
     },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeHttpOperationFormat {
+    Openapi,
+    Protobuf,
+    Graphql,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeHttpObservation {
+    pub method: String,
+    pub route_template: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<RuntimeHttpOperationFormat>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contract_locator: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format_version: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -181,6 +206,8 @@ pub struct ValidatedRuntimeTraceEvent {
     pub dependency_kind: String,
     pub source: MatchedRuntimeTraceLocator,
     pub target: MatchedRuntimeTraceLocator,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http: Option<RuntimeHttpObservation>,
     pub count: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_ns: Option<u64>,
@@ -204,6 +231,108 @@ pub struct ValidatedRuntimeTrace {
     pub profile_match: RuntimeTraceProfileMatch,
     pub events: Vec<ValidatedRuntimeTraceEvent>,
     pub summary: RuntimeTraceSummary,
+}
+
+pub(crate) fn validate_http_correlation_trace(trace: &ValidatedRuntimeTrace) -> Result<()> {
+    if trace.schema_version != RUNTIME_TRACE_SCHEMA_VERSION {
+        bail!("HTTP correlation requires the current validated runtime trace version");
+    }
+    let original = RuntimeTrace {
+        schema_version: trace.schema_version.clone(),
+        repository: trace.repository.clone(),
+        session: trace.session.clone(),
+        events: trace
+            .events
+            .iter()
+            .map(|event| RuntimeTraceEvent {
+                sequence: event.sequence,
+                timestamp: event.timestamp.clone(),
+                dependency_kind: event.dependency_kind.clone(),
+                source: event.source.input.clone(),
+                target: event.target.input.clone(),
+                http: event.http.clone(),
+                count: event.count,
+                duration_ns: event.duration_ns,
+                redaction: event.redaction.clone(),
+            })
+            .collect(),
+    };
+    let mut canonical = original.clone();
+    canonical.validate()?;
+    if canonical != original {
+        bail!("HTTP correlation requires a canonical validated runtime trace");
+    }
+
+    match trace.profile_match.status {
+        RuntimeTraceMatchStatus::Resolved
+            if trace.profile_match.parent_profile_id.is_some()
+                && trace.profile_match.reason.is_none() => {}
+        RuntimeTraceMatchStatus::Unresolved
+            if trace.profile_match.parent_profile_id.is_none()
+                && trace.profile_match.reason.is_some() => {}
+        _ => bail!("HTTP correlation runtime profile match state is inconsistent"),
+    }
+    if let Some(parent) = &trace.profile_match.parent_profile_id {
+        validate_bounded_string(parent, "profile_match.parent_profile_id", MAX_ID_CHARS)?;
+    }
+    if let Some(reason) = &trace.profile_match.reason {
+        validate_bounded_string(reason, "profile_match.reason", MAX_ID_CHARS)?;
+    }
+
+    let mut summary = RuntimeTraceSummary {
+        events: trace.events.len() as u64,
+        redacted_values: trace.session.redaction.redacted_value_count.saturating_add(
+            trace
+                .events
+                .iter()
+                .map(|event| event.redaction.redacted_value_count)
+                .fold(0_u64, u64::saturating_add),
+        ),
+        ..RuntimeTraceSummary::default()
+    };
+    for event in &trace.events {
+        if event.id != expected_validated_runtime_event_id(&trace.repository, &trace.session, event)
+        {
+            bail!("HTTP correlation runtime event ID is inconsistent");
+        }
+        validate_matched_runtime_locator(&event.source, "events[].source")?;
+        validate_matched_runtime_locator(&event.target, "events[].target")?;
+        match event.target.status {
+            RuntimeTraceMatchStatus::Resolved => summary.resolved_targets += 1,
+            RuntimeTraceMatchStatus::External => summary.external_targets += 1,
+            RuntimeTraceMatchStatus::Unresolved => summary.unresolved_targets += 1,
+        }
+    }
+    if trace.summary != summary {
+        bail!("HTTP correlation runtime trace summary is inconsistent");
+    }
+    Ok(())
+}
+
+fn validate_matched_runtime_locator(
+    locator: &MatchedRuntimeTraceLocator,
+    field: &str,
+) -> Result<()> {
+    match locator.status {
+        RuntimeTraceMatchStatus::Resolved
+            if locator.node_id.is_some() && locator.reason.is_none() => {}
+        RuntimeTraceMatchStatus::External
+            if matches!(locator.input, RuntimeTraceLocator::External { .. })
+                && locator.node_id.is_none()
+                && locator.reason.is_some() => {}
+        RuntimeTraceMatchStatus::Unresolved
+            if !matches!(locator.input, RuntimeTraceLocator::External { .. })
+                && locator.node_id.is_none()
+                && locator.reason.is_some() => {}
+        _ => bail!("HTTP correlation runtime locator match state is inconsistent"),
+    }
+    if let Some(node_id) = &locator.node_id {
+        validate_bounded_string(node_id, &format!("{field}.node_id"), MAX_ID_CHARS)?;
+    }
+    if let Some(reason) = &locator.reason {
+        validate_bounded_string(reason, &format!("{field}.reason"), MAX_ID_CHARS)?;
+    }
+    Ok(())
 }
 
 fn default_event_count() -> u64 {
@@ -271,24 +400,7 @@ pub fn match_runtime_trace(
             RuntimeTraceMatchStatus::External => summary.external_targets += 1,
             RuntimeTraceMatchStatus::Unresolved => summary.unresolved_targets += 1,
         }
-        let id = stable_id_from_value(
-            "runtime-event",
-            &json!({
-                "schema_version": RUNTIME_TRACE_SCHEMA_VERSION,
-                "repository_identity": trace.repository.identity,
-                "repository_revision": trace.repository.revision,
-                "session_id": trace.session.id,
-                "sequence": event.sequence,
-                "timestamp": event.timestamp,
-                "profile": trace.session.profile,
-                "environment": trace.session.environment,
-                "dependency_kind": event.dependency_kind,
-                "source": event.source,
-                "target": event.target,
-                "count": event.count,
-                "duration_ns": event.duration_ns,
-            }),
-        );
+        let id = runtime_event_id(&trace.repository, &trace.session, event);
         events.push(ValidatedRuntimeTraceEvent {
             id,
             sequence: event.sequence,
@@ -296,6 +408,7 @@ pub fn match_runtime_trace(
             dependency_kind: event.dependency_kind.clone(),
             source,
             target,
+            http: event.http.clone(),
             count: event.count,
             duration_ns: event.duration_ns,
             redaction: event.redaction.clone(),
@@ -310,6 +423,54 @@ pub fn match_runtime_trace(
         events,
         summary,
     })
+}
+
+fn runtime_event_id(
+    repository: &RuntimeTraceRepository,
+    session: &RuntimeTraceSession,
+    event: &RuntimeTraceEvent,
+) -> String {
+    stable_id_from_value(
+        "runtime-event",
+        &json!({
+            "schema_version": RUNTIME_TRACE_SCHEMA_VERSION,
+            "repository_identity": repository.identity,
+            "repository_revision": repository.revision,
+            "session_id": session.id,
+            "sequence": event.sequence,
+            "timestamp": event.timestamp,
+            "profile": session.profile,
+            "environment": session.environment,
+            "dependency_kind": event.dependency_kind,
+            "source": event.source,
+            "target": event.target,
+            "http": event.http,
+            "count": event.count,
+            "duration_ns": event.duration_ns,
+        }),
+    )
+}
+
+pub(crate) fn expected_validated_runtime_event_id(
+    repository: &RuntimeTraceRepository,
+    session: &RuntimeTraceSession,
+    event: &ValidatedRuntimeTraceEvent,
+) -> String {
+    runtime_event_id(
+        repository,
+        session,
+        &RuntimeTraceEvent {
+            sequence: event.sequence,
+            timestamp: event.timestamp.clone(),
+            dependency_kind: event.dependency_kind.clone(),
+            source: event.source.input.clone(),
+            target: event.target.input.clone(),
+            http: event.http.clone(),
+            count: event.count,
+            duration_ns: event.duration_ns,
+            redaction: event.redaction.clone(),
+        },
+    )
 }
 
 /// Converts a validated collector document into an immutable runtime graph
@@ -990,6 +1151,9 @@ impl RuntimeTrace {
             validate_identifier(&event.dependency_kind, "events[].dependency_kind")?;
             validate_locator(&event.source, "events[].source", production_collector)?;
             validate_locator(&event.target, "events[].target", production_collector)?;
+            if let Some(http) = &event.http {
+                validate_http_observation(http, &event.target)?;
+            }
             if event.count == 0 {
                 bail!("runtime trace events[].count must be greater than zero");
             }
@@ -1076,6 +1240,83 @@ fn validate_locator(
             validate_identifier(reason, &format!("{field}.reason"))
         }
     }
+}
+
+fn validate_http_observation(
+    observation: &RuntimeHttpObservation,
+    target: &RuntimeTraceLocator,
+) -> Result<()> {
+    if !matches!(
+        observation.method.as_str(),
+        "GET" | "HEAD" | "POST" | "PUT" | "PATCH" | "DELETE" | "OPTIONS" | "CONNECT" | "TRACE"
+    ) {
+        bail!("runtime trace events[].http.method is not a canonical HTTP method");
+    }
+    validate_http_route_template(&observation.route_template)?;
+    if let Some(operation) = &observation.operation {
+        validate_bounded_string(operation, "events[].http.operation", MAX_ID_CHARS)?;
+    }
+    if matches!(
+        observation.format,
+        Some(RuntimeHttpOperationFormat::Protobuf | RuntimeHttpOperationFormat::Graphql)
+    ) && observation.operation.is_none()
+    {
+        bail!("runtime trace events[].http.operation is required for this contract format");
+    }
+    if let Some(locator) = &observation.contract_locator {
+        validate_repository_path(locator, "events[].http.contract_locator")?;
+    }
+    if let Some(version) = &observation.format_version {
+        validate_bounded_string(version, "events[].http.format_version", MAX_ID_CHARS)?;
+    }
+    match target {
+        RuntimeTraceLocator::External { namespace, name }
+            if matches_ignore_ascii_case(namespace, "http", "https") =>
+        {
+            validate_http_authority(name, "events[].target.name")
+        }
+        _ => bail!("runtime trace events[].http requires a redacted HTTP external target"),
+    }
+}
+
+fn validate_http_route_template(template: &str) -> Result<()> {
+    if template.is_empty()
+        || template.chars().count() > MAX_ID_CHARS
+        || !template.starts_with('/')
+        || template.contains("://")
+        || template.contains(['?', '#', '%', '\\'])
+        || template.chars().any(char::is_whitespace)
+        || looks_like_secret(template)
+    {
+        bail!("runtime trace events[].http.route_template is not canonical or redacted");
+    }
+    let mut depth = 0_u8;
+    for character in template.chars() {
+        match character {
+            '{' => {
+                depth = depth
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("HTTP route template nesting overflow"))?;
+                if depth > 1 {
+                    bail!(
+                        "runtime trace events[].http.route_template is not canonical or redacted"
+                    );
+                }
+            }
+            '}' => {
+                depth = depth.checked_sub(1).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "runtime trace events[].http.route_template is not canonical or redacted"
+                    )
+                })?;
+            }
+            _ => {}
+        }
+    }
+    if depth != 0 {
+        bail!("runtime trace events[].http.route_template is not canonical or redacted");
+    }
+    Ok(())
 }
 
 fn validate_graph_locator(locator: &str, field: &str) -> Result<()> {
@@ -1276,7 +1517,14 @@ fn validate_untrusted_json(value: &Value, depth: usize) -> Result<()> {
                 if is_forbidden_sensitive_field(key) {
                     bail!("runtime trace contains a forbidden secret-bearing field");
                 }
-                validate_untrusted_json(value, depth + 1)?;
+                if key == "route_template" {
+                    let template = value.as_str().ok_or_else(|| {
+                        anyhow::anyhow!("runtime trace route_template is invalid")
+                    })?;
+                    validate_http_route_template(template)?;
+                } else {
+                    validate_untrusted_json(value, depth + 1)?;
+                }
             }
         }
         Value::Array(values) => {
@@ -2031,6 +2279,67 @@ mod tests {
         assert!(message.contains("redacted names only"));
         assert!(!message.contains("fixture-secret-value"));
         assert!(!validator.is_valid(&leaked_name));
+        Ok(())
+    }
+
+    #[test]
+    fn http_operation_metadata_accepts_only_redacted_canonical_contract_coordinates() -> Result<()>
+    {
+        let schema: Value = serde_json::from_str(RUNTIME_TRACE_SCHEMA)?;
+        let validator = jsonschema::validator_for(&schema)?;
+        let mut value: Value = serde_json::from_str(GOLDEN)?;
+        value["session"]["collector_contract_version"] = json!(RUNTIME_COLLECTOR_CONTRACT_VERSION);
+        value["events"][1]["http"] = json!({
+            "method": "GET",
+            "route_template": "/pets/{id}",
+            "format": "openapi",
+            "operation": "get /pets/{id}",
+            "contract_locator": "api/openapi.json",
+            "format_version": "3.1.0"
+        });
+        validator
+            .validate(&value)
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        let trace = read_runtime_trace(Cursor::new(serde_json::to_vec(&value)?))?;
+        assert_eq!(
+            trace.events[1].http,
+            Some(RuntimeHttpObservation {
+                method: "GET".to_owned(),
+                route_template: "/pets/{id}".to_owned(),
+                format: Some(RuntimeHttpOperationFormat::Openapi),
+                operation: Some("get /pets/{id}".to_owned()),
+                contract_locator: Some("api/openapi.json".to_owned()),
+                format_version: Some("3.1.0".to_owned()),
+            })
+        );
+
+        let secret = "fixture-secret-value";
+        let mut raw_query = value.clone();
+        raw_query["events"][1]["http"]["route_template"] = json!(format!("/pets?token={secret}"));
+        assert!(!validator.is_valid(&raw_query));
+        let error = read_runtime_trace(Cursor::new(serde_json::to_vec(&raw_query)?)).unwrap_err();
+        assert!(!format!("{error:#}").contains(secret));
+
+        let mut raw_url = value.clone();
+        raw_url["events"][1]["http"]["url"] =
+            json!(format!("https://user:{secret}@example.test/private"));
+        assert!(!validator.is_valid(&raw_url));
+        let error = read_runtime_trace(Cursor::new(serde_json::to_vec(&raw_url)?)).unwrap_err();
+        assert!(!format!("{error:#}").contains(secret));
+
+        let mut missing_rpc_coordinate = value.clone();
+        missing_rpc_coordinate["events"][1]["http"]["format"] = json!("protobuf");
+        missing_rpc_coordinate["events"][1]["http"]
+            .as_object_mut()
+            .context("http observation")?
+            .remove("operation");
+        assert!(!validator.is_valid(&missing_rpc_coordinate));
+        assert!(
+            read_runtime_trace(Cursor::new(serde_json::to_vec(&missing_rpc_coordinate)?))
+                .unwrap_err()
+                .to_string()
+                .contains("operation is required")
+        );
         Ok(())
     }
 
