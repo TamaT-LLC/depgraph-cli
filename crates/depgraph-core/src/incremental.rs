@@ -1,11 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use anyhow::{Result, bail};
-use depgraph_store::{GraphSnapshot, IncrementalReplacementScope, NodeRecord};
+use depgraph_store::{GraphSnapshot, IncrementalReplacementScope, NodeRecord, ProfileRecord};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub const INCREMENTAL_PLAN_SCHEMA_VERSION: &str = "incremental-plan-v1";
+pub const INCREMENTAL_PLAN_SCHEMA_VERSION: &str = "incremental-plan-v2";
 const MAX_CHANGES: usize = 100_000;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -110,6 +110,8 @@ pub enum IncrementalInvalidationReason {
 pub struct IncrementalInvalidationPlan {
     pub schema_version: String,
     pub base_snapshot_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_profile_plan_id: Option<String>,
     pub mode: IncrementalInvalidationMode,
     pub changes: Vec<IncrementalFileChange>,
     pub reasons: Vec<IncrementalInvalidationReason>,
@@ -232,6 +234,7 @@ pub fn plan_incremental_invalidation(
     changes.dedup();
 
     let packages = PackageIndex::new(snapshot);
+    let base_profile_plan_id = snapshot_profile_plan_id(snapshot)?;
     let nodes = snapshot
         .nodes
         .iter()
@@ -365,6 +368,7 @@ pub fn plan_incremental_invalidation(
     Ok(IncrementalInvalidationPlan {
         schema_version: INCREMENTAL_PLAN_SCHEMA_VERSION.to_owned(),
         base_snapshot_id: base_snapshot_id.to_owned(),
+        base_profile_plan_id,
         mode: if replan {
             IncrementalInvalidationMode::WorkspaceReplan
         } else {
@@ -377,6 +381,48 @@ pub fn plan_incremental_invalidation(
         affected_generated_artifact_ids: affected_artifacts.into_iter().collect(),
         replacement_scope,
     })
+}
+
+pub fn snapshot_profile_plan_id(snapshot: &GraphSnapshot) -> Result<Option<String>> {
+    profile_plan_id_from_properties(snapshot.profiles.iter().map(|profile| &profile.properties))
+}
+
+pub(crate) fn profile_records_profile_plan_id(
+    profiles: &[ProfileRecord],
+) -> Result<Option<String>> {
+    profile_plan_id_from_properties(profiles.iter().map(|profile| &profile.properties))
+}
+
+fn profile_plan_id_from_properties<'a>(
+    properties: impl IntoIterator<Item = &'a Value>,
+) -> Result<Option<String>> {
+    let mut ids = BTreeSet::new();
+    let mut missing = false;
+    for properties in properties {
+        match properties
+            .get("profile_selection_plan_id")
+            .and_then(Value::as_str)
+        {
+            Some(id)
+                if id
+                    .strip_prefix("profile-selection-plan:sha256:")
+                    .is_some_and(|digest| {
+                        digest.len() == 64
+                            && digest
+                                .bytes()
+                                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                    }) =>
+            {
+                ids.insert(id.to_owned());
+            }
+            Some(_) => bail!("snapshot profile selection plan ID is malformed"),
+            None => missing = true,
+        }
+    }
+    if ids.len() > 1 || (missing && !ids.is_empty()) {
+        bail!("snapshot profiles do not share one profile selection plan ID");
+    }
+    Ok(ids.into_iter().next())
 }
 
 fn package_info(node: &NodeRecord) -> PackageInfo {
@@ -960,6 +1006,38 @@ mod tests {
         assert_eq!(
             global.replacement_scope.replanned_profile_ids,
             global.affected_profile_ids
+        );
+    }
+
+    #[test]
+    fn profile_plan_binding_is_shared_or_the_incremental_plan_fails_closed() {
+        let plan_id = format!("profile-selection-plan:sha256:{}", "a".repeat(64));
+        let mut bound = snapshot();
+        for profile in &mut bound.profiles {
+            profile.properties["profile_selection_plan_id"] = json!(plan_id);
+        }
+        assert_eq!(
+            snapshot_profile_plan_id(&bound).unwrap().as_deref(),
+            Some(plan_id.as_str())
+        );
+        let plan = plan_incremental_invalidation(
+            "snapshot:base",
+            &bound,
+            &[IncrementalFileChange::modified("a/src/lib.rs")],
+        )
+        .unwrap();
+        assert_eq!(plan.base_profile_plan_id.as_deref(), Some(plan_id.as_str()));
+
+        bound.profiles[0].properties["profile_selection_plan_id"] =
+            json!(format!("profile-selection-plan:sha256:{}", "b".repeat(64)));
+        assert!(snapshot_profile_plan_id(&bound).is_err());
+        assert!(
+            plan_incremental_invalidation(
+                "snapshot:base",
+                &bound,
+                &[IncrementalFileChange::modified("a/src/lib.rs")],
+            )
+            .is_err()
         );
     }
 

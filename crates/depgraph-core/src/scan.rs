@@ -17,6 +17,11 @@ use crate::{
     config::Config,
     policy::PolicyResult,
     policy_engine::evaluate_policy,
+    profile_selection::{
+        DefaultProfileSelectionPlan, ProfileSelectionMode, validate_profile_selection_plan,
+    },
+    profile_selection_preview::plan_repository_profiles,
+    profile_selection_rank::profile_selection_doctor_status,
     worker::{
         AdapterKind, WorkerFailureKind, WorkerOutput, WorkerSpec, detect_adapters,
         execute_worker_with_cancellation, is_security_error, locate_worker,
@@ -171,9 +176,32 @@ pub async fn run_scan_with_cache_mode_and_cancellation(
             "security policy violation: a filesystem root cannot be used as a safe scan root"
         );
     }
+    let profile_plan = plan_repository_profiles(&root, config, None)?.plan;
+    validate_profile_selection_plan(&profile_plan)?;
     let scan_id = Uuid::new_v4().to_string();
     let source_revision = git_source_revision(&root);
     store.start_scan_with_revision(&scan_id, &root, strict, source_revision.as_deref())?;
+    let profile_status = profile_selection_doctor_status(&profile_plan, strict)?;
+    if !profile_status.default_profile_matrix_complete {
+        add_core_diagnostic(
+            store,
+            &scan_id,
+            if strict { "error" } else { "warning" },
+            "default-profile-matrix-incomplete",
+            "default profile selection is incomplete; inspect `depgraph profiles plan`",
+            &profile_plan.plan_id,
+        )?;
+        if strict {
+            return finish_non_promoted_scan(
+                store,
+                &scan_id,
+                "policy_failed",
+                Some("strict default profile selection is incomplete"),
+                1,
+                &cancellation,
+            );
+        }
+    }
     if cancellation.is_cancelled() {
         return cancel_scan(store, &scan_id);
     }
@@ -219,6 +247,7 @@ pub async fn run_scan_with_cache_mode_and_cancellation(
             config,
             &workers_to_run,
             store.database_path().as_deref(),
+            &profile_plan.plan_id,
         ) {
             ScanCachePreparation::Rejected(reason) => {
                 record_cache_rejection(store, &scan_id, reason)?;
@@ -235,6 +264,39 @@ pub async fn run_scan_with_cache_mode_and_cancellation(
                             Ok(()) => {
                                 if cancellation.is_cancelled() {
                                     return cancel_scan(store, &scan_id);
+                                }
+                                let profile_plan_unchanged = plan_repository_profiles(
+                                    &root, config, None,
+                                )
+                                .is_ok_and(|preview| preview.plan.plan_id == profile_plan.plan_id);
+                                if !profile_plan_unchanged {
+                                    record_cache_rejection(
+                                        store,
+                                        &scan_id,
+                                        "profile-planning-input-changed-before-cache-hit-promotion",
+                                    )?;
+                                    add_core_diagnostic(
+                                        store,
+                                        &scan_id,
+                                        "error",
+                                        "profile-planning-input-changed",
+                                        "profile planning input changed before the cached scan could be promoted",
+                                        "profile-planning-input-changed-before-cache-hit-promotion",
+                                    )?;
+                                    store.mark_coverage_incomplete(
+                                        &scan_id,
+                                        "profile-planning-input-changed-before-cache-hit-promotion",
+                                    )?;
+                                    return finish_non_promoted_scan(
+                                        store,
+                                        &scan_id,
+                                        "partial",
+                                        Some(
+                                            "profile planning input changed before cache-hit promotion",
+                                        ),
+                                        3,
+                                        &cancellation,
+                                    );
                                 }
                                 return complete_scan(
                                     store,
@@ -328,7 +390,7 @@ pub async fn run_scan_with_cache_mode_and_cancellation(
     }
 
     let mut global_upserts = BTreeMap::<(String, String), Value>::new();
-    for output in outputs {
+    for output in bind_worker_outputs_to_profile_plan(outputs, &profile_plan, &mut failures) {
         let adapter = output.adapter;
         let failure_kind = output.failure_kind;
         let security_violation = output.security_violation;
@@ -392,8 +454,42 @@ pub async fn run_scan_with_cache_mode_and_cancellation(
         );
     }
 
+    let observed_profile_plan = match plan_repository_profiles(&root, config, None) {
+        Ok(preview) if preview.plan.plan_id == profile_plan.plan_id => preview.plan,
+        _ => {
+            record_cache_rejection(
+                store,
+                &scan_id,
+                "profile-planning-input-changed-during-scan",
+            )?;
+            add_core_diagnostic(
+                store,
+                &scan_id,
+                "error",
+                "profile-planning-input-changed",
+                "profile planning input changed while the scan was running",
+                "profile-planning-input-changed",
+            )?;
+            store
+                .mark_coverage_incomplete(&scan_id, "profile-planning-input-changed-during-scan")?;
+            return finish_non_promoted_scan(
+                store,
+                &scan_id,
+                "partial",
+                Some("profile planning input changed during scan"),
+                3,
+                &cancellation,
+            );
+        }
+    };
     if let (Some(expected), Some(workers)) = (cache_plan.take(), cache_workers.as_deref()) {
-        match prepare_scan_cache(&root, config, workers, store.database_path().as_deref()) {
+        match prepare_scan_cache(
+            &root,
+            config,
+            workers,
+            store.database_path().as_deref(),
+            &observed_profile_plan.plan_id,
+        ) {
             ScanCachePreparation::Ready(observed)
                 if observed.syntax == expected.syntax
                     && observed.semantic == expected.semantic
@@ -419,6 +515,91 @@ pub async fn run_scan_with_cache_mode_and_cancellation(
         cache_plan.as_ref(),
         &cancellation,
     )
+}
+
+fn bind_worker_outputs_to_profile_plan(
+    outputs: Vec<WorkerOutput>,
+    plan: &DefaultProfileSelectionPlan,
+    failures: &mut Vec<ScanFailure>,
+) -> Vec<WorkerOutput> {
+    outputs
+        .into_iter()
+        .filter_map(|output| {
+            let adapter = output.adapter;
+            let security_violation = output.security_violation;
+            match bind_worker_output_to_profile_plan(output, plan) {
+                Ok(output) => Some(output),
+                Err(error) => {
+                    failures.push(ScanFailure::with_classification(
+                        adapter,
+                        format!("worker profile-plan binding failed: {error:#}"),
+                        WorkerFailureKind::MalformedProtocol,
+                        security_violation,
+                    ));
+                    None
+                }
+            }
+        })
+        .collect()
+}
+
+fn bind_worker_output_to_profile_plan(
+    mut output: WorkerOutput,
+    plan: &DefaultProfileSelectionPlan,
+) -> Result<WorkerOutput> {
+    validate_profile_selection_plan(plan)?;
+    let selected_profile_ids = plan
+        .selected
+        .iter()
+        .map(|entry| Value::String(entry.profile_id.clone()))
+        .collect::<Vec<_>>();
+    let selection_mode = match plan.selection_mode {
+        ProfileSelectionMode::Automatic => "automatic",
+        ProfileSelectionMode::Explicit => "explicit",
+    };
+    for event in &mut output.events {
+        if event.get("event").and_then(Value::as_str) != Some("profile_declared") {
+            continue;
+        }
+        let profile = event
+            .get_mut("profile")
+            .and_then(Value::as_object_mut)
+            .context("validated worker profile declaration is not an object")?;
+        let properties = profile.entry("properties").or_insert(Value::Null);
+        if properties.is_null() {
+            *properties = json!({});
+        }
+        let properties = properties
+            .as_object_mut()
+            .context("validated worker profile properties are not an object")?;
+        for (key, value) in [
+            (
+                "profile_selection_plan_id",
+                Value::String(plan.plan_id.clone()),
+            ),
+            (
+                "profile_selection_input_digest",
+                Value::String(plan.input_digest.clone()),
+            ),
+            (
+                "profile_selection_mode",
+                Value::String(selection_mode.to_owned()),
+            ),
+            (
+                "profile_selection_selected_profile_ids",
+                Value::Array(selected_profile_ids.clone()),
+            ),
+            (
+                "profile_selection_complete",
+                Value::Bool(plan.summary.selection_complete),
+            ),
+        ] {
+            if properties.insert(key.to_owned(), value).is_some() {
+                anyhow::bail!("worker profile collides with reserved profile-selection metadata");
+            }
+        }
+    }
+    Ok(output)
 }
 
 pub(crate) fn cancel_scan(store: &mut Store, scan_id: &str) -> Result<ScanOutcome> {
@@ -1430,6 +1611,107 @@ mod tests {
         let snapshot = store.load_snapshot("partial-scan")?;
         assert!(snapshot.nodes.iter().any(|node| node.id == "file:kept"));
         assert!(snapshot.edges.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn worker_profiles_are_bound_to_one_validated_selection_plan() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        std::fs::write(root.path().join("main.go"), "package main\n")?;
+        let plan = plan_repository_profiles(root.path(), &Config::default(), None)?.plan;
+        let output = WorkerOutput {
+            adapter: AdapterKind::Go,
+            events: vec![json!({
+                "event":"profile_declared",
+                "profile":{
+                    "id":"go:test",
+                    "language":"go",
+                    "features":[],
+                    "environment":{},
+                    "properties":{}
+                }
+            })],
+            stderr: String::new(),
+            stderr_truncated: false,
+            error: None,
+            failure_kind: None,
+            security_violation: false,
+        };
+        let bound = bind_worker_output_to_profile_plan(output, &plan)?;
+        let properties = &bound.events[0]["profile"]["properties"];
+        assert_eq!(properties["profile_selection_plan_id"], plan.plan_id);
+        assert_eq!(
+            properties["profile_selection_input_digest"],
+            plan.input_digest
+        );
+        assert_eq!(properties["profile_selection_mode"], "automatic");
+        assert_eq!(
+            properties["profile_selection_complete"],
+            plan.summary.selection_complete
+        );
+        assert_eq!(
+            properties["profile_selection_selected_profile_ids"],
+            serde_json::to_value(
+                plan.selected
+                    .iter()
+                    .map(|entry| &entry.profile_id)
+                    .collect::<Vec<_>>()
+            )?
+        );
+
+        let null_properties = WorkerOutput {
+            adapter: AdapterKind::Go,
+            events: vec![json!({
+                "event":"profile_declared",
+                "profile":{
+                    "id":"go:test",
+                    "language":"go",
+                    "features":[],
+                    "environment":{},
+                    "properties":null
+                }
+            })],
+            stderr: String::new(),
+            stderr_truncated: false,
+            error: None,
+            failure_kind: None,
+            security_violation: false,
+        };
+        let bound = bind_worker_output_to_profile_plan(null_properties, &plan)?;
+        assert_eq!(
+            bound.events[0]["profile"]["properties"]["profile_selection_plan_id"],
+            plan.plan_id
+        );
+
+        let collision = WorkerOutput {
+            adapter: AdapterKind::Go,
+            events: vec![json!({
+                "event":"profile_declared",
+                "profile":{
+                    "id":"go:test",
+                    "language":"go",
+                    "features":[],
+                    "environment":{},
+                    "properties":{"profile_selection_plan_id":"forged"}
+                }
+            })],
+            stderr: String::new(),
+            stderr_truncated: false,
+            error: None,
+            failure_kind: None,
+            security_violation: false,
+        };
+        let mut failures = Vec::new();
+        assert!(
+            bind_worker_outputs_to_profile_plan(vec![collision], &plan, &mut failures).is_empty()
+        );
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].kind, WorkerFailureKind::MalformedProtocol);
+        assert!(
+            failures[0]
+                .detail
+                .contains("reserved profile-selection metadata")
+        );
         Ok(())
     }
 }
