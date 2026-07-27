@@ -26,6 +26,7 @@ use tokio::{
 };
 use uuid::Uuid;
 
+use crate::incremental::profile_records_profile_plan_id;
 use crate::{
     CancellationToken, Config, DaemonConfig, INCREMENTAL_PLAN_SCHEMA_VERSION,
     IncrementalChangeKind, IncrementalFileChange, IncrementalInvalidationMode,
@@ -33,7 +34,6 @@ use crate::{
     plan_incremental_invalidation, plan_repository_profiles,
     run_scan_with_cache_mode_and_cancellation,
     scan::{cancel_scan, complete_scan, git_source_revision},
-    snapshot_profile_plan_id,
     worker::{
         AdapterKind, WorkerFailureKind, execute_worker_delta_with_cancellation, is_security_error,
         locate_worker, probe_worker_version_with_cancellation, worker_capabilities,
@@ -823,10 +823,10 @@ impl DaemonScanRunner for RepositoryScanRunner {
                 plan_repository_profiles(&root, &config, None)?.plan.plan_id;
             let base_profile_plan_id = base_snapshot_id
                 .as_deref()
-                .map(|snapshot_id| store.load_completed_snapshot(snapshot_id))
+                .map(|snapshot_id| store.load_completed_snapshot_profiles(snapshot_id))
                 .transpose()?
                 .as_ref()
-                .map(snapshot_profile_plan_id)
+                .map(|profiles| profile_records_profile_plan_id(profiles))
                 .transpose()?
                 .flatten();
             let mut force_full_scan =
