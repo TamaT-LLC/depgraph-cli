@@ -47,7 +47,7 @@ const MAX_REASON_BYTES: usize = 256;
 /// an incomplete delta so the coverage ledger cannot silently omit them.
 pub fn scan_openapi_repository(
     root: &Path,
-    participating_profile_ids: &[String],
+    participating_profiles: &[Profile],
 ) -> Result<Option<CrossLanguageAdapterDelta>> {
     let canonical_root = root
         .canonicalize()
@@ -55,17 +55,23 @@ pub fn scan_openapi_repository(
     if !canonical_root.is_dir() {
         bail!("OpenAPI scan root must be a directory");
     }
-    let mut participating_profile_ids = participating_profile_ids.to_vec();
-    participating_profile_ids.sort();
-    participating_profile_ids.dedup();
-    if participating_profile_ids.is_empty()
-        || participating_profile_ids.len() > MAX_PARTICIPATING_PROFILES
-        || participating_profile_ids
+    let mut participating_profiles = participating_profiles.to_vec();
+    participating_profiles.sort_by(|left, right| left.id.cmp(&right.id));
+    if participating_profiles.is_empty()
+        || participating_profiles.len() > MAX_PARTICIPATING_PROFILES
+        || participating_profiles
             .iter()
-            .any(|value| !bounded_text(value, MAX_OPENAPI_SCALAR_BYTES))
+            .any(|profile| !bounded_text(&profile.id, MAX_OPENAPI_SCALAR_BYTES))
+        || participating_profiles
+            .windows(2)
+            .any(|profiles| profiles[0].id == profiles[1].id)
     {
-        bail!("OpenAPI participating profile IDs must be a bounded non-empty set");
+        bail!("OpenAPI participating profiles must be a bounded non-empty set");
     }
+    let participating_profile_ids = participating_profiles
+        .iter()
+        .map(|profile| profile.id.clone())
+        .collect();
 
     let inventory = inventory_openapi_documents(&canonical_root)?;
     if inventory.is_empty() {
@@ -153,6 +159,7 @@ pub fn scan_openapi_repository(
     let delta = CrossLanguageAdapterDelta {
         contract_version: CROSS_LANGUAGE_CONTRACT_VERSION.to_owned(),
         profile,
+        participating_profiles,
         nodes: builder.nodes.into_values().collect(),
         sites: builder.sites.into_values().collect(),
         edges: builder.edges.into_values().collect(),
@@ -2454,6 +2461,20 @@ components:
         .unwrap()
     }
 
+    fn participating_profiles() -> Vec<Profile> {
+        vec![Profile {
+            id: "web:production".to_owned(),
+            language: "typescript".to_owned(),
+            toolchain: None,
+            command: None,
+            target: None,
+            features: Vec::new(),
+            environment: BTreeMap::new(),
+            source_revision: None,
+            properties: BTreeMap::new(),
+        }]
+    }
+
     #[test]
     fn json_yaml_local_refs_build_a_valid_checkout_independent_contract_graph() {
         let first = tempfile::tempdir().unwrap();
@@ -2461,10 +2482,10 @@ components:
         write_pair(first.path(), false);
         write_pair(second.path(), true);
 
-        let first = scan_openapi_repository(first.path(), &["web:production".to_owned()])
+        let first = scan_openapi_repository(first.path(), &participating_profiles())
             .unwrap()
             .unwrap();
-        let second = scan_openapi_repository(second.path(), &["web:production".to_owned()])
+        let second = scan_openapi_repository(second.path(), &participating_profiles())
             .unwrap()
             .unwrap();
         validate_cross_language_adapter_delta(&first).unwrap();
@@ -2533,7 +2554,7 @@ components:
 "#,
         )
         .unwrap();
-        let delta = scan_openapi_repository(root.path(), &["web:production".to_owned()])
+        let delta = scan_openapi_repository(root.path(), &participating_profiles())
             .unwrap()
             .unwrap();
         validate_cross_language_adapter_delta(&delta).unwrap();
@@ -2582,7 +2603,7 @@ components:
                 .unwrap();
         }
 
-        let delta = scan_openapi_repository(root.path(), &["web:production".to_owned()])
+        let delta = scan_openapi_repository(root.path(), &participating_profiles())
             .unwrap()
             .unwrap();
         let ledger = ledger(&delta);
@@ -2644,7 +2665,7 @@ paths:
 "#,
         )
         .unwrap();
-        let delta = scan_openapi_repository(root.path(), &["web:production".to_owned()])
+        let delta = scan_openapi_repository(root.path(), &participating_profiles())
             .unwrap()
             .unwrap();
         assert!(
@@ -2662,7 +2683,7 @@ paths:
     fn invalid_pointer_depth_and_empty_inventory_fail_closed() {
         let empty = tempfile::tempdir().unwrap();
         assert!(
-            scan_openapi_repository(empty.path(), &["web:production".to_owned()])
+            scan_openapi_repository(empty.path(), &participating_profiles())
                 .unwrap()
                 .is_none()
         );
@@ -2712,7 +2733,7 @@ paths:
         )
         .unwrap();
 
-        let delta = scan_openapi_repository(root.path(), &["web:production".to_owned()])
+        let delta = scan_openapi_repository(root.path(), &participating_profiles())
             .unwrap()
             .unwrap();
         let ledger = ledger(&delta);
