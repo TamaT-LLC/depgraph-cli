@@ -1,10 +1,9 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs::File,
-    io::Read,
     path::{Component, Path},
 };
 
+use crate::bounded_query::read_bounded_repository_file;
 use anyhow::{Context, Result, bail};
 use depgraph_protocol::{
     CROSS_LANGUAGE_COMPLETENESS_PROPERTY, CROSS_LANGUAGE_COMPLETENESS_VERSION,
@@ -41,6 +40,9 @@ pub const MAX_PROTOBUF_TOKENS: usize = 1_000_000;
 pub const MAX_PROTOBUF_DEPTH: usize = 64;
 pub const MAX_PROTOBUF_DESCRIPTOR_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_PROTOBUF_DESCRIPTOR_FILES: usize = 4_096;
+pub const MAX_PROTOBUF_DESCRIPTOR_SETS: usize = 256;
+pub const MAX_PROTOBUF_DESCRIPTOR_TOTAL_BYTES: usize = 128 * 1024 * 1024;
+pub const MAX_PROTOBUF_INVENTORY_ENTRIES: usize = 1_000_000;
 
 const EXTRACTOR: &str = "depgraph-protobuf-adapter";
 const MAX_PARTICIPATING_PROFILES: usize = 64;
@@ -52,7 +54,7 @@ const MAX_REASONS: usize = 64;
 /// network clients.
 pub fn scan_protobuf_repository(
     root: &Path,
-    participating_profile_ids: &[String],
+    participating_profiles: &[Profile],
 ) -> Result<Option<CrossLanguageAdapterDelta>> {
     let canonical_root = root
         .canonicalize()
@@ -60,17 +62,23 @@ pub fn scan_protobuf_repository(
     if !canonical_root.is_dir() {
         bail!("Protobuf scan root must be a directory");
     }
-    let mut participating_profile_ids = participating_profile_ids.to_vec();
-    participating_profile_ids.sort();
-    participating_profile_ids.dedup();
-    if participating_profile_ids.is_empty()
-        || participating_profile_ids.len() > MAX_PARTICIPATING_PROFILES
-        || participating_profile_ids
+    let mut participating_profiles = participating_profiles.to_vec();
+    participating_profiles.sort_by(|left, right| left.id.cmp(&right.id));
+    if participating_profiles.is_empty()
+        || participating_profiles.len() > MAX_PARTICIPATING_PROFILES
+        || participating_profiles
             .iter()
-            .any(|value| !bounded_text(value))
+            .any(|profile| !bounded_text(&profile.id))
+        || participating_profiles
+            .windows(2)
+            .any(|profiles| profiles[0].id == profiles[1].id)
     {
-        bail!("Protobuf participating profile IDs must be a bounded non-empty set");
+        bail!("Protobuf participating profiles must be a bounded non-empty set");
     }
+    let participating_profile_ids = participating_profiles
+        .iter()
+        .map(|profile| profile.id.clone())
+        .collect();
 
     let sources = inventory_proto_sources(&canonical_root)?;
     let admitted_sources = sources
@@ -175,6 +183,7 @@ pub fn scan_protobuf_repository(
     let delta = CrossLanguageAdapterDelta {
         contract_version: CROSS_LANGUAGE_CONTRACT_VERSION.to_owned(),
         profile,
+        participating_profiles,
         nodes: builder.nodes.into_values().collect(),
         sites: builder.sites.into_values().collect(),
         edges: builder.edges.into_values().collect(),
@@ -299,12 +308,14 @@ struct SourceSpan {
 fn inventory_proto_sources(root: &Path) -> Result<Vec<SourceRecord>> {
     let mut records = Vec::new();
     let mut total_bytes = 0_usize;
+    let mut inventory_entries = 0_usize;
     let walker = WalkDir::new(root)
         .follow_links(false)
         .sort_by_file_name()
         .into_iter()
         .filter_entry(inventory_entry_allowed);
     for entry in walker {
+        record_protobuf_inventory_entry(&mut inventory_entries)?;
         let entry = match entry {
             Ok(entry) => entry,
             Err(_) => continue,
@@ -317,74 +328,89 @@ fn inventory_proto_sources(root: &Path) -> Result<Vec<SourceRecord>> {
         let Some(locator) = repository_locator(root, entry.path()) else {
             continue;
         };
-        if records.len() >= MAX_PROTOBUF_FILES {
-            records.push(skipped_source(
-                &locator,
-                "protobuf-file-count-limit-exceeded",
-            ));
-            continue;
-        }
         if entry.file_type().is_symlink() {
-            records.push(skipped_source(
-                &locator,
-                "protobuf-source-symlink-not-admitted",
-            ));
+            push_protobuf_source_record(
+                &mut records,
+                skipped_source(&locator, "protobuf-source-symlink-not-admitted"),
+            )?;
             continue;
         }
         if !entry.file_type().is_file() {
-            records.push(skipped_source(&locator, "protobuf-source-is-not-a-file"));
+            push_protobuf_source_record(
+                &mut records,
+                skipped_source(&locator, "protobuf-source-is-not-a-file"),
+            )?;
             continue;
         }
-        let len = match entry.metadata() {
-            Ok(metadata) => metadata.len() as usize,
-            Err(_) => {
-                records.push(skipped_source(
-                    &locator,
-                    "protobuf-source-metadata-unavailable",
-                ));
-                continue;
-            }
-        };
-        if len > MAX_PROTOBUF_FILE_BYTES {
-            records.push(skipped_source(
-                &locator,
-                "protobuf-source-byte-limit-exceeded",
-            ));
-            continue;
-        }
-        if total_bytes.saturating_add(len) > MAX_PROTOBUF_TOTAL_BYTES {
-            records.push(skipped_source(
-                &locator,
-                "protobuf-inventory-byte-limit-exceeded",
-            ));
-            continue;
-        }
-        total_bytes += len;
-        let bytes = match read_bounded(entry.path(), MAX_PROTOBUF_FILE_BYTES) {
+        let bytes = match read_bounded_repository_file(root, entry.path(), MAX_PROTOBUF_FILE_BYTES)
+        {
             Ok(bytes) => bytes,
-            Err(_) => {
-                records.push(skipped_source(&locator, "protobuf-source-read-failed"));
+            Err(error) => {
+                let reason = if error.code == "query_file_size_or_type_invalid" {
+                    "protobuf-source-byte-limit-exceeded"
+                } else {
+                    "protobuf-source-read-failed"
+                };
+                push_protobuf_source_record(&mut records, skipped_source(&locator, reason))?;
                 continue;
             }
         };
+        let Some(next_total_bytes) = total_bytes.checked_add(bytes.len()) else {
+            bail!("Protobuf source inventory byte count overflowed");
+        };
+        if next_total_bytes > MAX_PROTOBUF_TOTAL_BYTES {
+            push_protobuf_source_record(
+                &mut records,
+                skipped_source(&locator, "protobuf-inventory-byte-limit-exceeded"),
+            )?;
+            continue;
+        }
+        total_bytes = next_total_bytes;
         let digest = sha256_prefixed(&bytes);
         match parse_proto_file(&locator, &digest, &bytes) {
-            Ok(file) => records.push(SourceRecord {
-                locator,
-                digest,
-                file: Some(file),
-                reason: None,
-            }),
-            Err(reason) => records.push(SourceRecord {
-                locator,
-                digest,
-                file: None,
-                reason: Some(reason),
-            }),
+            Ok(file) => push_protobuf_source_record(
+                &mut records,
+                SourceRecord {
+                    locator,
+                    digest,
+                    file: Some(file),
+                    reason: None,
+                },
+            )?,
+            Err(reason) => push_protobuf_source_record(
+                &mut records,
+                SourceRecord {
+                    locator,
+                    digest,
+                    file: None,
+                    reason: Some(reason),
+                },
+            )?,
         }
     }
     records.sort_by(|left, right| left.locator.cmp(&right.locator));
     Ok(records)
+}
+
+fn record_protobuf_inventory_entry(inventory_entries: &mut usize) -> Result<()> {
+    *inventory_entries = inventory_entries
+        .checked_add(1)
+        .context("Protobuf inventory entry count overflowed")?;
+    if *inventory_entries > MAX_PROTOBUF_INVENTORY_ENTRIES {
+        bail!("Protobuf inventory exceeds its closed entry limit");
+    }
+    Ok(())
+}
+
+fn push_protobuf_source_record(
+    records: &mut Vec<SourceRecord>,
+    record: SourceRecord,
+) -> Result<()> {
+    if records.len() >= MAX_PROTOBUF_FILES {
+        bail!("Protobuf inventory exceeds its closed source-file limit");
+    }
+    records.push(record);
+    Ok(())
 }
 
 fn skipped_source(locator: &str, reason: &str) -> SourceRecord {
@@ -424,6 +450,69 @@ enum TokenKind {
     String,
     Number,
     Symbol,
+}
+
+fn discover_package(tokens: &[Token]) -> std::result::Result<String, String> {
+    let mut package = None;
+    let mut depth = 0_usize;
+    let mut statement_start = true;
+    let mut cursor = 0_usize;
+    while cursor < tokens.len() {
+        let token = &tokens[cursor];
+        if depth == 0
+            && statement_start
+            && token.kind == TokenKind::Identifier
+            && token.text == "package"
+        {
+            cursor += 1;
+            let mut parts = Vec::new();
+            loop {
+                let part = tokens
+                    .get(cursor)
+                    .filter(|token| token.kind == TokenKind::Identifier)
+                    .ok_or_else(|| "protobuf-package-is-invalid".to_owned())?;
+                parts.push(part.text.clone());
+                cursor += 1;
+                match tokens.get(cursor).map(|token| token.text.as_str()) {
+                    Some(".") => cursor += 1,
+                    Some(";") => {
+                        cursor += 1;
+                        break;
+                    }
+                    _ => return Err("protobuf-package-is-invalid".to_owned()),
+                }
+            }
+            let discovered = parts.join(".");
+            if !bounded_text(&discovered) {
+                return Err("protobuf-package-is-invalid".to_owned());
+            }
+            if package.replace(discovered).is_some() {
+                return Err("duplicate-protobuf-package".to_owned());
+            }
+            statement_start = true;
+            continue;
+        }
+        match token.text.as_str() {
+            "{" => {
+                depth = depth
+                    .checked_add(1)
+                    .ok_or_else(|| "protobuf-nesting-depth-limit-exceeded".to_owned())?;
+            }
+            "}" => {
+                depth = depth
+                    .checked_sub(1)
+                    .ok_or_else(|| "protobuf-unbalanced-delimiter".to_owned())?;
+                if depth == 0 {
+                    statement_start = true;
+                }
+            }
+            ";" if depth == 0 => statement_start = true,
+            _ if depth == 0 && statement_start => statement_start = false,
+            _ => {}
+        }
+        cursor += 1;
+    }
+    Ok(package.unwrap_or_default())
 }
 
 fn tokenize_proto(source: &str) -> std::result::Result<Vec<Token>, String> {
@@ -609,6 +698,7 @@ struct ProtoParser {
     cursor: usize,
     version: Option<String>,
     package: String,
+    package_declared: bool,
     imports: Vec<ProtoImport>,
     messages: BTreeMap<String, ProtoMessage>,
     enums: BTreeSet<String>,
@@ -624,6 +714,7 @@ impl ProtoParser {
             cursor: 0,
             version: None,
             package: String::new(),
+            package_declared: false,
             imports: Vec::new(),
             messages: BTreeMap::new(),
             enums: BTreeSet::new(),
@@ -633,6 +724,7 @@ impl ProtoParser {
     }
 
     fn parse(mut self) -> std::result::Result<ProtoFile, String> {
+        self.package = discover_package(&self.tokens)?;
         while self.cursor < self.tokens.len() {
             match self.peek_text() {
                 Some("syntax") => self.parse_version("syntax")?,
@@ -714,10 +806,10 @@ impl ProtoParser {
         self.expect("package")?;
         let package = self.parse_qualified_name(false)?;
         self.expect(";")?;
-        if !self.package.is_empty() {
+        if self.package_declared || package != self.package {
             return Err("duplicate-protobuf-package".to_owned());
         }
-        self.package = package;
+        self.package_declared = true;
         Ok(())
     }
 
@@ -790,7 +882,15 @@ impl ProtoParser {
                 _ => {
                     let checkpoint = self.cursor;
                     match self.parse_field(&coordinate, &descriptor_path, None, fields.len()) {
-                        Ok(field) => fields.push(field),
+                        Ok(field) => {
+                            if field.type_name.starts_with("map<") {
+                                nested_message_index =
+                                    nested_message_index.checked_add(1).ok_or_else(|| {
+                                        "protobuf-nested-message-count-overflowed".to_owned()
+                                    })?;
+                            }
+                            fields.push(field);
+                        }
                         Err(_) => {
                             self.cursor = checkpoint;
                             self.skip_statement_or_block()?;
@@ -1206,12 +1306,15 @@ fn inventory_descriptor_sets(
     let mut candidates = BTreeMap::<String, Vec<DescriptorProof>>::new();
     let mut reasons = BTreeSet::new();
     let mut skipped_count = 0_u64;
+    let mut total_descriptor_bytes = 0_usize;
+    let mut inventory_entries = 0_usize;
     let walker = WalkDir::new(root)
         .follow_links(false)
         .sort_by_file_name()
         .into_iter()
         .filter_entry(inventory_entry_allowed);
     for entry in walker {
+        record_protobuf_inventory_entry(&mut inventory_entries)?;
         let entry = match entry {
             Ok(entry) => entry,
             Err(_) => continue,
@@ -1228,80 +1331,83 @@ fn inventory_descriptor_sets(
         if entry.file_type().is_symlink() {
             skipped_count += 1;
             reasons.insert("protobuf-descriptor-symlink-not-admitted".to_owned());
-            records.push(skipped_descriptor(
-                &locator,
-                "protobuf-descriptor-symlink-not-admitted",
-            ));
+            push_protobuf_descriptor_record(
+                &mut records,
+                skipped_descriptor(&locator, "protobuf-descriptor-symlink-not-admitted"),
+            )?;
             continue;
         }
         if !entry.file_type().is_file() {
             skipped_count += 1;
             reasons.insert("protobuf-descriptor-is-not-a-file".to_owned());
-            records.push(skipped_descriptor(
-                &locator,
-                "protobuf-descriptor-is-not-a-file",
-            ));
+            push_protobuf_descriptor_record(
+                &mut records,
+                skipped_descriptor(&locator, "protobuf-descriptor-is-not-a-file"),
+            )?;
             continue;
         }
-        let len = match entry.metadata() {
-            Ok(metadata) => metadata.len() as usize,
-            Err(_) => {
-                skipped_count += 1;
-                reasons.insert("protobuf-descriptor-metadata-unavailable".to_owned());
-                records.push(skipped_descriptor(
-                    &locator,
-                    "protobuf-descriptor-metadata-unavailable",
-                ));
-                continue;
-            }
+        let bytes =
+            match read_bounded_repository_file(root, entry.path(), MAX_PROTOBUF_DESCRIPTOR_BYTES) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    let reason = if error.code == "query_file_size_or_type_invalid" {
+                        "protobuf-descriptor-byte-limit-exceeded"
+                    } else {
+                        "protobuf-descriptor-read-failed"
+                    };
+                    skipped_count += 1;
+                    reasons.insert(reason.to_owned());
+                    push_protobuf_descriptor_record(
+                        &mut records,
+                        skipped_descriptor(&locator, reason),
+                    )?;
+                    continue;
+                }
+            };
+        let Some(next_total_descriptor_bytes) = total_descriptor_bytes.checked_add(bytes.len())
+        else {
+            bail!("Protobuf descriptor inventory byte count overflowed");
         };
-        if len > MAX_PROTOBUF_DESCRIPTOR_BYTES {
+        if next_total_descriptor_bytes > MAX_PROTOBUF_DESCRIPTOR_TOTAL_BYTES {
+            let reason = "protobuf-descriptor-total-byte-limit-exceeded";
             skipped_count += 1;
-            reasons.insert("protobuf-descriptor-byte-limit-exceeded".to_owned());
-            records.push(skipped_descriptor(
-                &locator,
-                "protobuf-descriptor-byte-limit-exceeded",
-            ));
+            reasons.insert(reason.to_owned());
+            push_protobuf_descriptor_record(&mut records, skipped_descriptor(&locator, reason))?;
             continue;
         }
-        let bytes = match read_bounded(entry.path(), MAX_PROTOBUF_DESCRIPTOR_BYTES) {
-            Ok(bytes) => bytes,
-            Err(_) => {
-                skipped_count += 1;
-                reasons.insert("protobuf-descriptor-read-failed".to_owned());
-                records.push(skipped_descriptor(
-                    &locator,
-                    "protobuf-descriptor-read-failed",
-                ));
-                continue;
-            }
-        };
+        total_descriptor_bytes = next_total_descriptor_bytes;
         let digest = sha256_prefixed(&bytes);
         let set = match FileDescriptorSet::decode(bytes.as_slice()) {
             Ok(set) => set,
             Err(_) => {
                 skipped_count += 1;
                 reasons.insert("protobuf-descriptor-decode-failed".to_owned());
-                records.push(DescriptorRecord {
-                    locator,
-                    digest,
-                    status: "skipped",
-                    reason: Some("protobuf-descriptor-decode-failed".to_owned()),
-                    correlated_sources: Vec::new(),
-                });
+                push_protobuf_descriptor_record(
+                    &mut records,
+                    DescriptorRecord {
+                        locator,
+                        digest,
+                        status: "skipped",
+                        reason: Some("protobuf-descriptor-decode-failed".to_owned()),
+                        correlated_sources: Vec::new(),
+                    },
+                )?;
                 continue;
             }
         };
         if set.file.is_empty() || set.file.len() > MAX_PROTOBUF_DESCRIPTOR_FILES {
             skipped_count += 1;
             reasons.insert("protobuf-descriptor-file-count-invalid".to_owned());
-            records.push(DescriptorRecord {
-                locator,
-                digest,
-                status: "skipped",
-                reason: Some("protobuf-descriptor-file-count-invalid".to_owned()),
-                correlated_sources: Vec::new(),
-            });
+            push_protobuf_descriptor_record(
+                &mut records,
+                DescriptorRecord {
+                    locator,
+                    digest,
+                    status: "skipped",
+                    reason: Some("protobuf-descriptor-file-count-invalid".to_owned()),
+                    correlated_sources: Vec::new(),
+                },
+            )?;
             continue;
         }
 
@@ -1365,26 +1471,32 @@ fn inventory_descriptor_sets(
         if let Some(reason) = record_reason {
             skipped_count += 1;
             reasons.insert(reason.to_owned());
-            records.push(DescriptorRecord {
-                locator,
-                digest,
-                status: "skipped",
-                reason: Some(reason.to_owned()),
-                correlated_sources: Vec::new(),
-            });
+            push_protobuf_descriptor_record(
+                &mut records,
+                DescriptorRecord {
+                    locator,
+                    digest,
+                    status: "skipped",
+                    reason: Some(reason.to_owned()),
+                    correlated_sources: Vec::new(),
+                },
+            )?;
             continue;
         }
         correlated_sources.sort();
         for (source, proof) in local_proofs {
             candidates.entry(source).or_default().push(proof);
         }
-        records.push(DescriptorRecord {
-            locator,
-            digest,
-            status: "admitted",
-            reason: None,
-            correlated_sources,
-        });
+        push_protobuf_descriptor_record(
+            &mut records,
+            DescriptorRecord {
+                locator,
+                digest,
+                status: "admitted",
+                reason: None,
+                correlated_sources,
+            },
+        )?;
     }
     records.sort_by(|left, right| left.locator.cmp(&right.locator));
 
@@ -1403,6 +1515,17 @@ fn inventory_descriptor_sets(
         reasons,
         skipped_count,
     })
+}
+
+fn push_protobuf_descriptor_record(
+    records: &mut Vec<DescriptorRecord>,
+    record: DescriptorRecord,
+) -> Result<()> {
+    if records.len() >= MAX_PROTOBUF_DESCRIPTOR_SETS {
+        bail!("Protobuf inventory exceeds its closed descriptor-set limit");
+    }
+    records.push(record);
+    Ok(())
 }
 
 fn skipped_descriptor(locator: &str, reason: &str) -> DescriptorRecord {
@@ -2661,17 +2784,6 @@ fn valid_proto_locator(locator: &str) -> bool {
             .all(|component| matches!(component, Component::Normal(_)))
 }
 
-fn read_bounded(path: &Path, max_bytes: usize) -> Result<Vec<u8>> {
-    let mut bytes = Vec::new();
-    File::open(path)?
-        .take(max_bytes as u64 + 1)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() > max_bytes {
-        bail!("bounded Protobuf read exceeded its byte limit");
-    }
-    Ok(bytes)
-}
-
 fn sha256_prefixed(bytes: &[u8]) -> String {
     format!("sha256:{}", hex::encode(Sha256::digest(bytes)))
 }
@@ -2718,11 +2830,25 @@ mod tests {
     use prost::Message as _;
     use prost_types::{
         DescriptorProto, FieldDescriptorProto, FileDescriptorProto, FileDescriptorSet,
-        MethodDescriptorProto, ServiceDescriptorProto, SourceCodeInfo, field_descriptor_proto,
-        source_code_info,
+        MessageOptions, MethodDescriptorProto, ServiceDescriptorProto, SourceCodeInfo,
+        field_descriptor_proto, source_code_info,
     };
 
     use super::*;
+
+    fn participating_profiles() -> Vec<Profile> {
+        vec![Profile {
+            id: "protobuf:production".to_owned(),
+            language: "protobuf".to_owned(),
+            toolchain: None,
+            command: None,
+            target: None,
+            features: Vec::new(),
+            environment: BTreeMap::new(),
+            source_revision: None,
+            properties: BTreeMap::new(),
+        }]
+    }
 
     const A_PROTO: &str = r#"syntax = "proto3";
 package acme.v1;
@@ -2890,14 +3016,15 @@ message Payload {
         write_positive_fixture(first.path(), false);
         write_positive_fixture(second.path(), true);
 
-        let first = scan_protobuf_repository(first.path(), &["polyglot:production".to_owned()])
+        let first = scan_protobuf_repository(first.path(), &participating_profiles())
             .unwrap()
             .unwrap();
-        let second = scan_protobuf_repository(second.path(), &["polyglot:production".to_owned()])
+        let second = scan_protobuf_repository(second.path(), &participating_profiles())
             .unwrap()
             .unwrap();
         validate_cross_language_adapter_delta(&first).unwrap();
         assert_eq!(first, second);
+        assert_eq!(first.participating_profiles, participating_profiles());
         let coverage = &ledger(&first).entries[0];
         assert_eq!(coverage.status, CrossLanguageCapabilityStatus::Complete);
         assert_eq!(coverage.input_count, 3);
@@ -2955,10 +3082,9 @@ service EditionService { rpc Read (Request) returns (Request); }
 "#,
         )
         .unwrap();
-        let source_only =
-            scan_protobuf_repository(root.path(), &["protobuf:production".to_owned()])
-                .unwrap()
-                .unwrap();
+        let source_only = scan_protobuf_repository(root.path(), &participating_profiles())
+            .unwrap()
+            .unwrap();
         assert_eq!(
             ledger(&source_only).entries[0].status,
             CrossLanguageCapabilityStatus::Complete
@@ -2981,10 +3107,9 @@ service EditionService { rpc Read (Request) returns (Request); }
                 .join(format!("contracts{PROTOBUF_DESCRIPTOR_SUFFIX}")),
             &descriptor_set(false, false),
         );
-        let descriptor =
-            scan_protobuf_repository(descriptors.path(), &["protobuf:production".to_owned()])
-                .unwrap()
-                .unwrap();
+        let descriptor = scan_protobuf_repository(descriptors.path(), &participating_profiles())
+            .unwrap()
+            .unwrap();
         assert!(descriptor.sites.iter().all(|site| {
             site.evidence[0].path.is_none()
                 && site.evidence[0].start_line.is_none()
@@ -2992,6 +3117,149 @@ service EditionService { rpc Read (Request) returns (Request); }
                     .properties
                     .contains_key("artifact_identity")
         }));
+    }
+
+    #[test]
+    fn package_declared_after_definitions_qualifies_the_entire_file() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(
+            root.path().join("late.proto"),
+            r#"syntax = "proto3";
+message Reply { string id = 1; }
+service LateService { rpc Read (Reply) returns (Reply); }
+package late.v1;
+"#,
+        )
+        .unwrap();
+        let delta = scan_protobuf_repository(root.path(), &participating_profiles())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            ledger(&delta).entries[0].status,
+            CrossLanguageCapabilityStatus::Complete
+        );
+        for coordinate in [
+            "late.v1.Reply",
+            "late.v1.LateService",
+            "late.v1.LateService/Read",
+        ] {
+            assert!(
+                delta
+                    .nodes
+                    .iter()
+                    .any(|node| node_coordinate(node) == Some(coordinate)),
+                "missing {coordinate}"
+            );
+        }
+        assert!(
+            delta
+                .sites
+                .iter()
+                .all(|site| site.resolution_status == ResolutionStatus::Resolved)
+        );
+    }
+
+    #[test]
+    fn map_entries_preserve_following_nested_descriptor_paths() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(
+            root.path().join("maps.proto"),
+            r#"syntax = "proto3";
+package maps.v1;
+message Outer {
+  map<string, string> labels = 1;
+  message Child { Outer parent = 1; }
+  Child child = 2;
+}
+"#,
+        )
+        .unwrap();
+
+        let mut labels = field(
+            "labels",
+            1,
+            field_descriptor_proto::Type::Message,
+            Some(".maps.v1.Outer.LabelsEntry"),
+        );
+        labels.label = Some(field_descriptor_proto::Label::Repeated as i32);
+        let map_entry = DescriptorProto {
+            name: Some("LabelsEntry".to_owned()),
+            field: vec![
+                field("key", 1, field_descriptor_proto::Type::String, None),
+                field("value", 2, field_descriptor_proto::Type::String, None),
+            ],
+            options: Some(MessageOptions {
+                map_entry: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let child = DescriptorProto {
+            name: Some("Child".to_owned()),
+            field: vec![field(
+                "parent",
+                1,
+                field_descriptor_proto::Type::Message,
+                Some(".maps.v1.Outer"),
+            )],
+            ..Default::default()
+        };
+        let descriptor = FileDescriptorSet {
+            file: vec![FileDescriptorProto {
+                name: Some("maps.proto".to_owned()),
+                package: Some("maps.v1".to_owned()),
+                message_type: vec![DescriptorProto {
+                    name: Some("Outer".to_owned()),
+                    field: vec![
+                        labels,
+                        field(
+                            "child",
+                            2,
+                            field_descriptor_proto::Type::Message,
+                            Some(".maps.v1.Outer.Child"),
+                        ),
+                    ],
+                    nested_type: vec![map_entry, child],
+                    ..Default::default()
+                }],
+                source_code_info: Some(SourceCodeInfo {
+                    location: vec![
+                        source_code_info::Location {
+                            path: vec![4, 0, 3, 1],
+                            span: vec![0, 0, 1],
+                            ..Default::default()
+                        },
+                        source_code_info::Location {
+                            path: vec![4, 0, 3, 1, 2, 0],
+                            span: vec![0, 0, 1],
+                            ..Default::default()
+                        },
+                    ],
+                }),
+                syntax: Some("proto3".to_owned()),
+                ..Default::default()
+            }],
+        };
+        write_descriptor(
+            &root
+                .path()
+                .join(format!("maps{PROTOBUF_DESCRIPTOR_SUFFIX}")),
+            &descriptor,
+        );
+
+        let delta = scan_protobuf_repository(root.path(), &participating_profiles())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            ledger(&delta).entries[0].status,
+            CrossLanguageCapabilityStatus::Complete
+        );
+        for expected_path in [json!([4, 0, 3, 1]), json!([4, 0, 3, 1, 2, 0])] {
+            assert!(delta.sites.iter().any(|site| {
+                site.evidence[0].path.as_deref() == Some("maps.proto")
+                    && site.evidence[0].properties.get("descriptor_path") == Some(&expected_path)
+            }));
+        }
     }
 
     #[test]
@@ -3008,7 +3276,7 @@ service Broken { rpc Read (Request) returns (Missing); }
 "#,
         )
         .unwrap();
-        let delta = scan_protobuf_repository(root.path(), &["protobuf:production".to_owned()])
+        let delta = scan_protobuf_repository(root.path(), &participating_profiles())
             .unwrap()
             .unwrap();
         validate_cross_language_adapter_delta(&delta).unwrap();
@@ -3075,7 +3343,7 @@ service Broken { rpc Read (Request) returns (Missing); }
                 }
                 _ => unreachable!(),
             }
-            let delta = scan_protobuf_repository(root.path(), &["protobuf:production".to_owned()])
+            let delta = scan_protobuf_repository(root.path(), &participating_profiles())
                 .unwrap()
                 .unwrap();
             validate_cross_language_adapter_delta(&delta).unwrap();
@@ -3132,7 +3400,7 @@ service Broken { rpc Read (Request) returns (Missing); }
                 .join(format!("linked{PROTOBUF_DESCRIPTOR_SUFFIX}")),
         )
         .unwrap();
-        let delta = scan_protobuf_repository(root.path(), &["protobuf:production".to_owned()])
+        let delta = scan_protobuf_repository(root.path(), &participating_profiles())
             .unwrap()
             .unwrap();
         let coverage = &ledger(&delta).entries[0];
@@ -3156,7 +3424,7 @@ service Broken { rpc Read (Request) returns (Missing); }
     fn malformed_inputs_are_bounded_and_empty_repositories_are_ignored() {
         let root = tempfile::tempdir().unwrap();
         assert!(
-            scan_protobuf_repository(root.path(), &["protobuf:production".to_owned()])
+            scan_protobuf_repository(root.path(), &participating_profiles())
                 .unwrap()
                 .is_none()
         );
@@ -3172,7 +3440,7 @@ service Broken { rpc Read (Request) returns (Missing); }
             b"not-a-descriptor",
         )
         .unwrap();
-        let delta = scan_protobuf_repository(root.path(), &["protobuf:production".to_owned()])
+        let delta = scan_protobuf_repository(root.path(), &participating_profiles())
             .unwrap()
             .unwrap();
         let coverage = &ledger(&delta).entries[0];
@@ -3180,5 +3448,53 @@ service Broken { rpc Read (Request) returns (Missing); }
         assert_eq!(coverage.input_count, 2);
         assert_eq!(coverage.skipped_count, 2);
         assert!(delta.nodes.is_empty());
+    }
+
+    #[test]
+    fn protobuf_inventory_limits_fail_closed_without_growing_records() {
+        let mut inventory_entries = MAX_PROTOBUF_INVENTORY_ENTRIES - 1;
+        record_protobuf_inventory_entry(&mut inventory_entries).unwrap();
+        assert_eq!(inventory_entries, MAX_PROTOBUF_INVENTORY_ENTRIES);
+        assert!(record_protobuf_inventory_entry(&mut inventory_entries).is_err());
+
+        let mut sources = Vec::new();
+        for index in 0..MAX_PROTOBUF_FILES {
+            push_protobuf_source_record(
+                &mut sources,
+                skipped_source(&format!("source-{index}.proto"), "test-skip"),
+            )
+            .unwrap();
+        }
+        assert!(
+            push_protobuf_source_record(
+                &mut sources,
+                skipped_source("overflow.proto", "test-skip"),
+            )
+            .is_err()
+        );
+        assert_eq!(sources.len(), MAX_PROTOBUF_FILES);
+
+        let mut descriptors = Vec::new();
+        for index in 0..MAX_PROTOBUF_DESCRIPTOR_SETS {
+            push_protobuf_descriptor_record(
+                &mut descriptors,
+                skipped_descriptor(
+                    &format!("set-{index}{PROTOBUF_DESCRIPTOR_SUFFIX}"),
+                    "test-skip",
+                ),
+            )
+            .unwrap();
+        }
+        assert!(
+            push_protobuf_descriptor_record(
+                &mut descriptors,
+                skipped_descriptor(
+                    &format!("overflow{PROTOBUF_DESCRIPTOR_SUFFIX}"),
+                    "test-skip",
+                ),
+            )
+            .is_err()
+        );
+        assert_eq!(descriptors.len(), MAX_PROTOBUF_DESCRIPTOR_SETS);
     }
 }
