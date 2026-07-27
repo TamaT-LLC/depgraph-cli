@@ -3235,31 +3235,6 @@ fn evaluate_stable_release_gate(
                 "profile-selection-plan:sha256:",
             ) && lowercase_sha256(&target.profile_plan_output_sha256)
         });
-    let profile_selection_contract =
-        depgraph_core::profile_selection_release_compatibility_contract();
-    let profile_plan_outputs = release
-        .targets
-        .iter()
-        .map(|target| {
-            (
-                target.profile_plan_digest.as_str(),
-                target.profile_plan_output_sha256.as_str(),
-            )
-        })
-        .collect::<BTreeSet<_>>();
-    let profile_selection_target_gate = release.targets.len() == RELEASE_TARGETS.len()
-        && release.compatibility.profile_selection == profile_selection_contract
-        && profile_plan_outputs.len() == 1
-        && release.targets.iter().all(|target| {
-            target
-                .profile_plan_digest
-                .starts_with("profile-selection-plan:sha256:")
-                && target.profile_plan_output_sha256.len() == 64
-                && target
-                    .profile_plan_output_sha256
-                    .bytes()
-                    .all(|byte| byte.is_ascii_hexdigit())
-        });
 
     let checks = vec![
         StableReleaseGateCheck {

@@ -791,6 +791,9 @@ fn resolver_boundary_reason<'a>(
     builder: &'a GraphQlGraphBuilder,
     coordinate: &str,
 ) -> Option<&'a str> {
+    if builder.federated_schema {
+        return Some("graphql-federated-resolver-boundary");
+    }
     let (type_name, field_name) = coordinate.split_once('.')?;
     let fields = builder
         .type_groups
@@ -1284,11 +1287,11 @@ fn emit_relation(
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::Path};
+    use std::{collections::BTreeMap, fs, path::Path};
 
     use depgraph_protocol::{
         CROSS_LANGUAGE_COMPLETENESS_PROPERTY, CrossLanguageCompletenessLedger,
-        CrossLanguageMappingKind, CrossLanguageRelationKind, ResolutionStatus,
+        CrossLanguageMappingKind, CrossLanguageRelationKind, Profile, ResolutionStatus,
         validate_cross_language_adapter_delta,
     };
     use serde_json::json;
@@ -1305,6 +1308,20 @@ type Query {
 type Product { id: ID!, name: String! }
 "#;
     const OPERATIONS: &str = "query GetProduct($id: ID!) { product(id: $id) { id name } }\n";
+
+    fn participating_profiles() -> Vec<Profile> {
+        vec![Profile {
+            id: "profile:test".to_owned(),
+            language: "polyglot".to_owned(),
+            toolchain: None,
+            command: None,
+            target: None,
+            features: Vec::new(),
+            environment: BTreeMap::new(),
+            source_revision: None,
+            properties: BTreeMap::new(),
+        }]
+    }
 
     fn write_contract(root: &Path) -> Vec<DocumentIdentity> {
         fs::write(root.join("schema.graphql"), SCHEMA).unwrap();
@@ -1463,10 +1480,10 @@ type Product { id: ID!, name: String! }
                 );
             }
         }
-        let first = scan_graphql_repository(first.path(), &["profile:test".to_owned()])
+        let first = scan_graphql_repository(first.path(), &participating_profiles())
             .unwrap()
             .unwrap();
-        let second = scan_graphql_repository(second.path(), &["profile:test".to_owned()])
+        let second = scan_graphql_repository(second.path(), &participating_profiles())
             .unwrap()
             .unwrap();
         validate_cross_language_adapter_delta(&first).unwrap();
@@ -1562,7 +1579,7 @@ type Product { id: ID!, name: String! }
         )
         .unwrap();
 
-        let delta = scan_graphql_repository(root.path(), &["profile:test".to_owned()])
+        let delta = scan_graphql_repository(root.path(), &participating_profiles())
             .unwrap()
             .unwrap();
         let endpoint_sites = delta
@@ -1621,7 +1638,7 @@ type Product { id: ID!, name: String! }
         )
         .unwrap();
 
-        let delta = scan_graphql_repository(root.path(), &["profile:test".to_owned()])
+        let delta = scan_graphql_repository(root.path(), &participating_profiles())
             .unwrap()
             .unwrap();
         assert!(delta.sites.iter().any(|site| {
@@ -1669,7 +1686,7 @@ type Product { id: ID!, name: String! }
             .unwrap();
         }
 
-        let delta = scan_graphql_repository(root.path(), &["profile:test".to_owned()])
+        let delta = scan_graphql_repository(root.path(), &participating_profiles())
             .unwrap()
             .unwrap();
         let sites = delta
@@ -1818,7 +1835,7 @@ type Query @key(fields: "id") {
             )
             .unwrap();
         }
-        let delta = scan_graphql_repository(root.path(), &["profile:test".to_owned()])
+        let delta = scan_graphql_repository(root.path(), &participating_profiles())
             .unwrap()
             .unwrap();
         validate_cross_language_adapter_delta(&delta).unwrap();
@@ -1850,6 +1867,62 @@ type Query @key(fields: "id") {
         }
     }
 
+    #[test]
+    fn schema_link_directive_marks_every_resolver_mapping_as_federated() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join("generated")).unwrap();
+        let schema = r#"
+extend schema @link(url: "https://specs.apollo.dev/federation/v2.3")
+type Query { product: String }
+"#;
+        fs::write(root.path().join("schema.graphql"), schema).unwrap();
+        let documents = vec![DocumentIdentity {
+            path: "schema.graphql".to_owned(),
+            digest: sha256_prefixed(schema.as_bytes()),
+        }];
+        let output = "generated/resolver.rs";
+        let endpoint = "resolve_product";
+        let source = format!("fn {endpoint}() {{}}\n");
+        fs::write(root.path().join(output), &source).unwrap();
+        let manifest = mapping_manifest(
+            ("async-graphql", "7.0.0"),
+            &documents,
+            RepositoryMapping {
+                language: MappingLanguage::Rust,
+                role: MappingRole::Resolver,
+                contract_path: "schema.graphql".to_owned(),
+                coordinate: "Query.product".to_owned(),
+                output: output.to_owned(),
+                output_digest: sha256_prefixed(source.as_bytes()),
+                endpoint: endpoint.to_owned(),
+                proof: MappingProof::FrameworkMap,
+                dynamic: false,
+                start_line: 1,
+                start_column: 1,
+                end_line: 1,
+                end_column: u32::try_from(source.trim_end().chars().count() + 1).unwrap(),
+            },
+        );
+        fs::write(
+            root.path().join(format!("federated{MANIFEST_SUFFIX}")),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let delta = scan_graphql_repository(root.path(), &participating_profiles())
+            .unwrap()
+            .unwrap();
+        assert!(delta.sites.iter().any(|site| {
+            site.reason.as_deref() == Some("graphql-federated-resolver-boundary")
+                && site.resolution_status == ResolutionStatus::Unresolved
+        }));
+        assert!(!delta.edges.iter().any(|edge| {
+            edge.kind == CrossLanguageRelationKind::ImplementedBy.as_str()
+                && edge.generated
+                && edge.resolution_status == ResolutionStatus::Resolved
+        }));
+    }
+
     #[cfg(unix)]
     #[test]
     fn mapping_and_output_symlinks_are_never_followed() {
@@ -1868,7 +1941,7 @@ type Query @key(fields: "id") {
             root.path().join(format!("unsafe{MANIFEST_SUFFIX}")),
         )
         .unwrap();
-        let delta = scan_graphql_repository(root.path(), &["profile:test".to_owned()])
+        let delta = scan_graphql_repository(root.path(), &participating_profiles())
             .unwrap()
             .unwrap();
         let serialized = serde_json::to_string(&delta).unwrap();
@@ -1896,7 +1969,7 @@ type Query @key(fields: "id") {
             .unwrap(),
         )
         .unwrap();
-        let delta = scan_graphql_repository(root.path(), &["profile:test".to_owned()])
+        let delta = scan_graphql_repository(root.path(), &participating_profiles())
             .unwrap()
             .unwrap();
         let value = serde_json::to_value(delta).unwrap();

@@ -34,7 +34,6 @@ use crate::{
     plan_incremental_invalidation, plan_repository_profiles,
     run_scan_with_cache_mode_and_cancellation,
     scan::{cancel_scan, complete_scan, git_source_revision},
-    snapshot_profile_plan_id,
     worker::{
         AdapterKind, WorkerFailureKind, execute_worker_delta_with_cancellation, is_security_error,
         locate_worker, probe_worker_version_with_cancellation, worker_capabilities,
