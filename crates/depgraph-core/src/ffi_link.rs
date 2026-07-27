@@ -184,7 +184,7 @@ pub fn correlate_ffi_link_observation(
         bail!("FFI link observation does not match the static profile identity");
     }
 
-    let eligible = static_delta
+    let mut eligible = static_delta
         .sites
         .iter()
         .filter_map(|site| StaticFfiSite::parse(site, &observation.profile_id).transpose())
@@ -192,6 +192,7 @@ pub fn correlate_ffi_link_observation(
     if eligible.is_empty() {
         bail!("FFI link observation has no eligible static declaration");
     }
+    eligible.sort_by(|left, right| left.site.id.as_bytes().cmp(right.site.id.as_bytes()));
     let eligible_ids = eligible
         .iter()
         .map(|site| site.site.id.clone())
@@ -233,7 +234,7 @@ pub fn correlate_ffi_link_observation(
     for (ordinal, static_site) in eligible.iter().enumerate() {
         let entry = entries
             .get(static_site.site.id.as_str())
-            .expect("eligible and observed IDs were compared");
+            .context("eligible FFI declaration disappeared from the validated observation")?;
         static_site.validate_entry(entry)?;
         let native_symbol = static_site
             .site
@@ -761,8 +762,10 @@ fn prefixed_sha256(value: &str) -> bool {
 fn bounded_atom(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= MAX_TEXT
-        && !value.chars().any(char::is_control)
-        && !value.contains(['?', '#', '\\'])
+        && value.is_ascii()
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b':' | b'+' | b'-')
+        })
 }
 
 fn safe_symbol(value: &str) -> bool {
@@ -784,10 +787,10 @@ fn digest_value(value: &impl Serialize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, time::Duration};
+    use std::{collections::BTreeMap, fs, time::Duration};
 
     use depgraph_protocol::{
-        CROSS_LANGUAGE_COMPLETENESS_PROPERTY, CrossLanguageCompletenessLedger,
+        CROSS_LANGUAGE_COMPLETENESS_PROPERTY, CrossLanguageCompletenessLedger, Profile,
         validate_cross_language_adapter_delta,
     };
     use tempfile::tempdir;
@@ -795,6 +798,20 @@ mod tests {
     use crate::{BuildAudit, BuildExecutionOutcome, NetworkIsolation, ffi::scan_ffi_repository};
 
     use super::*;
+
+    fn profile(id: &str) -> Profile {
+        Profile {
+            id: id.to_owned(),
+            language: "polyglot".to_owned(),
+            toolchain: None,
+            command: None,
+            target: None,
+            features: Vec::new(),
+            environment: BTreeMap::new(),
+            source_revision: None,
+            properties: BTreeMap::new(),
+        }
+    }
 
     #[test]
     fn linux_macos_and_windows_observations_require_same_profile_and_become_observed() {
@@ -809,11 +826,11 @@ mod tests {
             ("macos-aarch64", "aarch64-apple-darwin", "aarch64"),
             ("windows-x86_64", "x86_64-pc-windows-msvc", "x86_64"),
         ];
-        let profile_ids = platforms
+        let profiles = platforms
             .iter()
-            .map(|(profile, _, _)| (*profile).to_owned())
+            .map(|(profile_id, _, _)| profile(profile_id))
             .collect::<Vec<_>>();
-        let mut delta = scan_ffi_repository(root.path(), &profile_ids)
+        let mut delta = scan_ffi_repository(root.path(), &profiles)
             .unwrap()
             .unwrap();
 
@@ -885,7 +902,7 @@ mod tests {
             "#[link(name = \"crypto\")]\nextern \"C\" {\nfn one();\nfn two();\n}\n",
         )
         .unwrap();
-        let delta = scan_ffi_repository(root.path(), &["linux".to_owned()])
+        let delta = scan_ffi_repository(root.path(), &[profile("linux")])
             .unwrap()
             .unwrap();
         let sites = static_sites_for_profile(&delta, "linux");
@@ -940,6 +957,32 @@ mod tests {
         );
         tampered.entries[0].library_artifact_digest = "sha256:tampered".to_owned();
         assert!(correlate_ffi_link_observation(&delta, &tampered).is_err());
+
+        let complete = observation(
+            "linux",
+            sites
+                .iter()
+                .enumerate()
+                .map(|(index, site)| {
+                    entry_for(
+                        site,
+                        "c",
+                        "import",
+                        "crypto",
+                        site_symbol(site),
+                        (b'a' + index as u8) as char,
+                    )
+                })
+                .collect(),
+        );
+        let expected = correlate_ffi_link_observation(&delta, &complete).unwrap();
+        let mut reordered = delta.clone();
+        reordered.sites.reverse();
+        validate_cross_language_adapter_delta(&reordered).unwrap();
+        assert_eq!(
+            correlate_ffi_link_observation(&reordered, &complete).unwrap(),
+            expected
+        );
         assert_eq!(
             delta
                 .edges
@@ -988,6 +1031,22 @@ mod tests {
                 .unwrap_err()
                 .to_string();
         assert!(!error.contains("hidden"));
+        let error = collect_supervised_ffi_link_observation(
+            &allowed,
+            "x86_64?token=hidden",
+            "dynamic",
+            vec![FfiObservedLink {
+                declaration_site_id: "site".to_owned(),
+                abi: "c".to_owned(),
+                direction: "import".to_owned(),
+                library: "crypto".to_owned(),
+                symbol: "digest".to_owned(),
+                library_artifact_digest: digest('a'),
+            }],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(!error.contains("hidden"));
         let mut unknown = serde_json::to_value(valid).unwrap();
         unknown["raw_linker_output"] = Value::String("forbidden".to_owned());
         assert!(!validator.is_valid(&unknown));
@@ -1004,10 +1063,10 @@ mod tests {
             )
             .unwrap();
         }
-        let first = scan_ffi_repository(first.path(), &["linux".to_owned()])
+        let first = scan_ffi_repository(first.path(), &[profile("linux")])
             .unwrap()
             .unwrap();
-        let second = scan_ffi_repository(second.path(), &["linux".to_owned()])
+        let second = scan_ffi_repository(second.path(), &[profile("linux")])
             .unwrap()
             .unwrap();
         let observation = observation(

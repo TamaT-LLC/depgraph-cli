@@ -415,6 +415,11 @@ fn validate_input(input: &PublicHistoryAuditInput) -> Result<()> {
 }
 
 fn validate_report(report: &PublicHistoryAuditReport) -> Result<()> {
+    let source_count = report
+        .source_counts
+        .values()
+        .try_fold(0_u64, |total, count| total.checked_add(*count))
+        .context("public history audit source count overflow")?;
     let expected_unresolved = report
         .findings
         .iter()
@@ -439,6 +444,12 @@ fn validate_report(report: &PublicHistoryAuditReport) -> Result<()> {
         || !is_digest(&report.collaboration_surface_digest)
         || !is_digest(&report.evidence_digest)
         || report.evidence_digest != report_digest(report)?
+        || report.source_counts.len() != PUBLIC_AUDIT_SOURCE_KINDS.len()
+        || PUBLIC_AUDIT_SOURCE_KINDS
+            .iter()
+            .any(|kind| !report.source_counts.contains_key(kind))
+        || source_count > MAX_PUBLIC_AUDIT_SOURCES as u64
+        || report.findings.len() > MAX_PUBLIC_AUDIT_SOURCES.saturating_mul(PATTERN_IDS.len())
         || report.unresolved_findings != expected_unresolved
         || report.unrotated_credentials != expected_unrotated
         || report
@@ -450,11 +461,31 @@ fn validate_report(report: &PublicHistoryAuditReport) -> Result<()> {
                 || !is_digest(&finding.source_locator_digest)
                 || !is_digest(&finding.content_digest)
                 || !PATTERN_IDS.contains(&finding.pattern_id.as_str())
+                || finding.credential != pattern_is_credential(&finding.pattern_id)
+                || finding.state != PublicAuditFindingState::Unresolved
+                || finding.credential_action
+                    != if finding.credential {
+                        PublicAuditCredentialAction::Unattested
+                    } else {
+                        PublicAuditCredentialAction::NotCredential
+                    }
+                || finding.purge_action != PublicAuditPurgeAction::NotRequired
+                || finding.remediation_attestation_digest.is_some()
         })
     {
         bail!("public history audit report is malformed or tampered");
     }
     Ok(())
+}
+
+fn pattern_is_credential(pattern_id: &str) -> bool {
+    matches!(
+        pattern_id,
+        "aws-access-key-v1"
+            | "generic-credential-assignment-v1"
+            | "github-token-v1"
+            | "pem-private-key-v1"
+    )
 }
 
 fn refs_digest(refs: &[PublicAuditRefInput]) -> Result<String> {
@@ -794,5 +825,34 @@ mod tests {
             collection_complete: true,
         };
         assert!(audit_public_history(&unsafe_input).is_err());
+    }
+
+    #[test]
+    fn tampered_raw_report_cannot_self_attest_remediation() {
+        let mut initial = audit_public_history(&PublicHistoryAuditInput {
+            refs: refs(COMMIT_A),
+            sources: vec![source(
+                PublicAuditSourceKind::GitBlob,
+                "objects/old-blob",
+                "token=ghp_abcdefghijklmnopqrstuvwxyz123456",
+            )],
+            collection_complete: true,
+        })
+        .unwrap();
+        let fresh = audit_public_history(&PublicHistoryAuditInput {
+            refs: refs(COMMIT_B),
+            sources: Vec::new(),
+            collection_complete: true,
+        })
+        .unwrap();
+        initial.findings[0].state = PublicAuditFindingState::Resolved;
+        initial.findings[0].credential_action = PublicAuditCredentialAction::Rotated;
+        initial.findings[0].purge_action = PublicAuditPurgeAction::Purged;
+        initial.findings[0].remediation_attestation_digest = Some(ATTESTATION.into());
+        initial.unresolved_findings = 0;
+        initial.unrotated_credentials = 0;
+        initial.evidence_digest = report_digest(&initial).unwrap();
+
+        assert!(finalize_public_history_audit(&initial, &fresh, &[]).is_err());
     }
 }

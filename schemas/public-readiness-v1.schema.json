@@ -27,7 +27,8 @@
     },
     "timestamp": {
       "type": "string",
-      "format": "date-time"
+      "format": "date-time",
+      "pattern": "Z$"
     },
     "decision": {
       "type": "string",
