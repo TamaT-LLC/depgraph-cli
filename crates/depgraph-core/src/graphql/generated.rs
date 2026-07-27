@@ -204,6 +204,8 @@ struct OutputObservation {
     digest: Option<String>,
     line_columns: Vec<u32>,
     reason: Option<String>,
+    #[serde(skip)]
+    source: Option<String>,
 }
 
 pub(super) fn inventory_repository_mappings(root: &Path) -> Result<RepositoryMappingInventory> {
@@ -468,6 +470,7 @@ fn observe_output(root: &Path, relative: &str, total_bytes: &mut usize) -> Outpu
                 digest,
                 line_columns: Vec::new(),
                 reason: Some("graphql-mapped-output-is-not-utf8".to_owned()),
+                source: None,
             };
         }
     };
@@ -478,6 +481,7 @@ fn observe_output(root: &Path, relative: &str, total_bytes: &mut usize) -> Outpu
             .map(|line| u32::try_from(line.chars().count().saturating_add(1)).unwrap_or(u32::MAX))
             .collect(),
         reason: None,
+        source: Some(source.to_owned()),
     }
 }
 
@@ -486,6 +490,7 @@ fn output_failure(reason: &str) -> OutputObservation {
         digest: None,
         line_columns: Vec::new(),
         reason: Some(reason.to_owned()),
+        source: None,
     }
 }
 
@@ -545,6 +550,14 @@ impl Claim<'_> {
             "language": self.mapping.language,
             "output": self.mapping.output,
             "endpoint": self.mapping.endpoint,
+        }))
+    }
+
+    fn claim_digest(&self) -> String {
+        digest_value(&json!({
+            "endpoint_identity": self.endpoint_digest(),
+            "artifact_identity": self.record.digest,
+            "ordinal": self.ordinal,
         }))
     }
 
@@ -657,6 +670,9 @@ fn mapping_failure_reason(
     }
     if !valid_span(observation, claim.mapping) {
         return Some("graphql-mapped-source-span-is-invalid".to_owned());
+    }
+    if !span_contains_endpoint(observation, claim.mapping) {
+        return Some("graphql-mapped-source-span-does-not-contain-endpoint".to_owned());
     }
     match claim.mapping.role {
         MappingRole::Client => {
@@ -871,6 +887,38 @@ fn valid_span(observation: &OutputObservation, mapping: &RepositoryMapping) -> b
     mapping.start_column <= *start_columns && mapping.end_column <= *end_columns
 }
 
+fn span_contains_endpoint(observation: &OutputObservation, mapping: &RepositoryMapping) -> bool {
+    let Some(source) = observation.source.as_deref() else {
+        return false;
+    };
+    let lines = source.split('\n').collect::<Vec<_>>();
+    let start_line = mapping.start_line.saturating_sub(1) as usize;
+    let end_line = mapping.end_line.saturating_sub(1) as usize;
+    let mut selected = String::new();
+    for (line_index, line) in lines
+        .get(start_line..=end_line)
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
+        if line_index > 0 {
+            selected.push('\n');
+        }
+        let start = if line_index == 0 {
+            mapping.start_column.saturating_sub(1) as usize
+        } else {
+            0
+        };
+        let end = if start_line + line_index == end_line {
+            mapping.end_column.saturating_sub(1) as usize
+        } else {
+            line.chars().count()
+        };
+        selected.extend(line.chars().skip(start).take(end.saturating_sub(start)));
+    }
+    selected.contains(&mapping.endpoint)
+}
+
 fn emit_claim(
     builder: &mut GraphQlGraphBuilder,
     claim: &Claim<'_>,
@@ -890,8 +938,7 @@ fn emit_claim(
         ),
     };
     if let Some(reason) = reason {
-        let unknown =
-            builder.unknown_node(&claim.record.locator, &claim.endpoint_digest(), reason)?;
+        let unknown = builder.unknown_node(&claim.record.locator, &claim.claim_digest(), reason)?;
         match (claim.mapping.role, contract_id.as_deref()) {
             (MappingRole::Client, _) => emit_relation(
                 builder,
@@ -997,10 +1044,6 @@ fn repository_symbol(builder: &mut GraphQlGraphBuilder, claim: &Claim<'_>) -> Re
                 "repository_path".to_owned(),
                 Value::String(claim.mapping.output.clone()),
             ),
-            (
-                "tool_identity".to_owned(),
-                Value::String(claim.tool_digest()),
-            ),
         ]),
     };
     insert_same(&mut builder.nodes, id.clone(), node)
@@ -1062,6 +1105,10 @@ fn emit_relation(
             Condition::Eq {
                 key: "graphql.coordinate".to_owned(),
                 value: Value::String(claim.mapping.coordinate.clone()),
+            },
+            Condition::Eq {
+                key: "graphql.mapping_claim".to_owned(),
+                value: Value::String(claim.claim_digest()),
             },
         ],
     }
@@ -1147,10 +1194,11 @@ fn emit_relation(
         source: source.to_owned(),
         kind: relation.as_str().to_owned(),
         specifier: format!(
-            "graphql-mapping:{}:{}:{}",
+            "graphql-mapping:{}:{}:{}:{}",
             claim.mapping.role.as_str(),
             claim.mapping.coordinate,
-            claim.mapping.endpoint
+            claim.mapping.endpoint,
+            claim.claim_digest(),
         ),
         resolution_status: status,
         target_ids: vec![target.to_owned()],
@@ -1494,6 +1542,103 @@ type Product { id: ID!, name: String! }
                 && edge.resolution_status == ResolutionStatus::Resolved
                 && edge.evidence[0].properties["repository_endpoint"] == endpoint
         }));
+    }
+
+    #[test]
+    fn mapped_span_must_contain_the_declared_repository_endpoint() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join("generated")).unwrap();
+        let documents = write_contract(root.path());
+        let output = "generated/client.rs";
+        let source = "fn actual_endpoint() {}\n";
+        fs::write(root.path().join(output), source).unwrap();
+        let manifest = mapping_manifest(
+            ("cynic-codegen", "3.12.0"),
+            &documents,
+            RepositoryMapping {
+                language: MappingLanguage::Rust,
+                role: MappingRole::Client,
+                contract_path: "operations.graphql".to_owned(),
+                coordinate: "query GetProduct".to_owned(),
+                output: output.to_owned(),
+                output_digest: sha256_prefixed(source.as_bytes()),
+                endpoint: "claimed_endpoint".to_owned(),
+                proof: MappingProof::CompilerSourceMap,
+                dynamic: false,
+                start_line: 1,
+                start_column: 1,
+                end_line: 1,
+                end_column: u32::try_from(source.trim_end().chars().count() + 1).unwrap(),
+            },
+        );
+        fs::write(
+            root.path().join(format!("span{MANIFEST_SUFFIX}")),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let delta = scan_graphql_repository(root.path(), &["profile:test".to_owned()])
+            .unwrap()
+            .unwrap();
+        assert!(delta.sites.iter().any(|site| {
+            site.reason.as_deref() == Some("graphql-mapped-source-span-does-not-contain-endpoint")
+                && site.resolution_status == ResolutionStatus::Unresolved
+        }));
+        assert!(!delta.edges.iter().any(|edge| {
+            edge.generated && edge.resolution_status == ResolutionStatus::Resolved
+        }));
+    }
+
+    #[test]
+    fn mixed_tool_claims_for_one_symbol_remain_reasoned_and_atomic() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join("generated")).unwrap();
+        let documents = write_contract(root.path());
+        let output = "generated/client.rs";
+        let endpoint = "get_product";
+        let source = format!("fn {endpoint}() {{}}\n");
+        fs::write(root.path().join(output), &source).unwrap();
+        let mapping = RepositoryMapping {
+            language: MappingLanguage::Rust,
+            role: MappingRole::Client,
+            contract_path: "operations.graphql".to_owned(),
+            coordinate: "query GetProduct".to_owned(),
+            output: output.to_owned(),
+            output_digest: sha256_prefixed(source.as_bytes()),
+            endpoint: endpoint.to_owned(),
+            proof: MappingProof::CompilerSourceMap,
+            dynamic: false,
+            start_line: 1,
+            start_column: 1,
+            end_line: 1,
+            end_column: u32::try_from(source.trim_end().chars().count() + 1).unwrap(),
+        };
+        for (name, tool) in [
+            ("supported", ("cynic-codegen", "3.12.0")),
+            ("unsupported", ("other-codegen", "3.12.0")),
+        ] {
+            let manifest = mapping_manifest(tool, &documents, mapping.clone());
+            fs::write(
+                root.path().join(format!("{name}{MANIFEST_SUFFIX}")),
+                serde_json::to_vec(&manifest).unwrap(),
+            )
+            .unwrap();
+        }
+
+        let delta = scan_graphql_repository(root.path(), &["profile:test".to_owned()])
+            .unwrap()
+            .unwrap();
+        let sites = delta
+            .sites
+            .iter()
+            .filter(|site| site.reason.as_deref() == Some("graphql-mixed-tool-output-provenance"))
+            .collect::<Vec<_>>();
+        assert_eq!(sites.len(), 2);
+        assert!(
+            sites
+                .iter()
+                .all(|site| site.resolution_status == ResolutionStatus::Unresolved)
+        );
     }
 
     #[test]
