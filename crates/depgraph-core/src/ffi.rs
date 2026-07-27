@@ -1333,7 +1333,24 @@ fn web_native_binding_syntax(line: &str) -> bool {
 }
 
 fn web_type_only_statement(statement: &str) -> bool {
-    statement.starts_with("import type ") || statement.starts_with("export type ")
+    if statement.starts_with("import type ") || statement.starts_with("export type ") {
+        return true;
+    }
+    let clause = statement
+        .strip_prefix("import ")
+        .or_else(|| statement.strip_prefix("export "))
+        .and_then(|rest| rest.strip_prefix('{'))
+        .and_then(|rest| rest.split_once('}'))
+        .filter(|(_, suffix)| token_prefix(suffix.trim_start(), "from"))
+        .map(|(clause, _)| clause);
+    clause.is_some_and(|clause| {
+        !clause.trim().is_empty()
+            && clause.split(',').map(str::trim).all(|entry| {
+                entry
+                    .strip_prefix("type")
+                    .is_some_and(|rest| rest.starts_with(char::is_whitespace))
+            })
+    })
 }
 
 fn call_prefix_ends_with(prefix: &str, function: &str) -> bool {
@@ -1351,6 +1368,15 @@ fn token_suffix(value: &str, token: &str) -> bool {
         .chars()
         .next_back()
         .is_none_or(|character| !character.is_ascii_alphanumeric() && character != '_')
+}
+
+fn token_prefix(value: &str, token: &str) -> bool {
+    value.strip_prefix(token).is_some_and(|suffix| {
+        suffix
+            .chars()
+            .next()
+            .is_none_or(|character| !character.is_ascii_alphanumeric() && character != '_')
+    })
 }
 
 fn web_binding_symbol(line: &str) -> Option<String> {
@@ -1822,6 +1848,9 @@ const native = require("./required.node");
 declare module '*.node';
 import type { NativeType } from './type-only.node';
 export type { NativeExport } from './export-type-only.node';
+import { type InlineType } from './inline-type-only.node';
+export { type InlineExport } from './inline-export-type-only.node';
+import { type Metadata, load } from './mixed.node';
 console.log("also-not-a-load.node");
 "#;
         let (declarations, boundaries) = parse_web("native.ts", "sha256:test", source);
@@ -1831,7 +1860,7 @@ console.log("also-not-a-load.node");
                 .iter()
                 .filter_map(|declaration| declaration.library.as_deref())
                 .collect::<Vec<_>>(),
-            vec!["./real.node", "./required.node", "*.node"]
+            vec!["./real.node", "./required.node", "*.node", "./mixed.node"]
         );
     }
 
