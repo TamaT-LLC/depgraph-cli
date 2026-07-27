@@ -1024,6 +1024,10 @@ mod tests {
         let schema: Value = serde_json::from_str(FFI_LINK_OBSERVATION_SCHEMA).unwrap();
         let validator = jsonschema::validator_for(&schema).unwrap();
         assert!(validator.is_valid(&serde_json::to_value(&valid).unwrap()));
+        let mut noncanonical = valid.clone();
+        noncanonical.architecture = "x86 64".to_owned();
+        assert!(validate_ffi_link_observation(&noncanonical).is_err());
+        assert!(!validator.is_valid(&serde_json::to_value(&noncanonical).unwrap()));
         let mut secret = entry;
         secret.library = "crypto?token=hidden".to_owned();
         let error =
