@@ -1,10 +1,9 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs::File,
-    io::Read,
     path::{Component, Path},
 };
 
+use crate::bounded_query::read_bounded_repository_file;
 use anyhow::{Context, Result, bail};
 use depgraph_protocol::{
     CROSS_LANGUAGE_COMPLETENESS_PROPERTY, CROSS_LANGUAGE_COMPLETENESS_VERSION,
@@ -28,6 +27,7 @@ pub const OPENAPI_CAPABILITY: &str = "openapi-contract-v1";
 pub const MAX_OPENAPI_DOCUMENT_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_OPENAPI_TOTAL_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_OPENAPI_DOCUMENTS: usize = 256;
+pub const MAX_OPENAPI_INVENTORY_ENTRIES: usize = 1_000_000;
 pub const MAX_OPENAPI_VALUES: usize = 100_000;
 pub const MAX_OPENAPI_DEPTH: usize = 96;
 pub const MAX_OPENAPI_SCALAR_BYTES: usize = 64 * 1024;
@@ -184,12 +184,14 @@ struct OpenApiDocument {
 fn inventory_openapi_documents(root: &Path) -> Result<Vec<InputRecord>> {
     let mut records = Vec::new();
     let mut probed_bytes = 0_usize;
+    let mut inventory_entries = 0_usize;
     let walker = WalkDir::new(root)
         .follow_links(false)
         .sort_by_file_name()
         .into_iter()
         .filter_entry(inventory_entry_allowed);
     for entry in walker {
+        record_openapi_inventory_entry(&mut inventory_entries)?;
         let entry = match entry {
             Ok(entry) => entry,
             Err(_) => continue,
@@ -204,68 +206,91 @@ fn inventory_openapi_documents(root: &Path) -> Result<Vec<InputRecord>> {
         let named_candidate = named_openapi_candidate(&locator);
         if entry.file_type().is_symlink() {
             if named_candidate {
-                records.push(skipped_record(&locator, "symlink-input-not-admitted"));
+                push_openapi_inventory_record(
+                    &mut records,
+                    skipped_record(&locator, "symlink-input-not-admitted"),
+                )?;
             }
             continue;
         }
         if !entry.file_type().is_file() {
             continue;
         }
-        let metadata = match entry.metadata() {
-            Ok(metadata) => metadata,
-            Err(_) if named_candidate => {
-                records.push(skipped_record(&locator, "input-metadata-unavailable"));
-                continue;
-            }
-            Err(_) => continue,
+        let bytes =
+            match read_bounded_repository_file(root, entry.path(), MAX_OPENAPI_DOCUMENT_BYTES) {
+                Ok(bytes) => bytes,
+                Err(error) if named_candidate => {
+                    let reason = if error.code == "query_file_size_or_type_invalid" {
+                        "input-byte-limit-exceeded"
+                    } else {
+                        "input-read-failed"
+                    };
+                    push_openapi_inventory_record(&mut records, skipped_record(&locator, reason))?;
+                    continue;
+                }
+                Err(_) => continue,
+            };
+        let Some(total_bytes) = probed_bytes.checked_add(bytes.len()) else {
+            bail!("OpenAPI inventory byte count overflowed");
         };
-        if metadata.len() > MAX_OPENAPI_DOCUMENT_BYTES as u64 {
+        if total_bytes > MAX_OPENAPI_TOTAL_BYTES {
             if named_candidate {
-                records.push(skipped_record(&locator, "input-byte-limit-exceeded"));
+                push_openapi_inventory_record(
+                    &mut records,
+                    skipped_record(&locator, "inventory-byte-limit-exceeded"),
+                )?;
             }
             continue;
         }
-        let file_len = metadata.len() as usize;
-        if probed_bytes.saturating_add(file_len) > MAX_OPENAPI_TOTAL_BYTES {
-            if named_candidate {
-                records.push(skipped_record(&locator, "inventory-byte-limit-exceeded"));
-            }
-            continue;
-        }
-        probed_bytes += file_len;
-        let bytes = match read_bounded(entry.path(), MAX_OPENAPI_DOCUMENT_BYTES) {
-            Ok(bytes) => bytes,
-            Err(_) if named_candidate => {
-                records.push(skipped_record(&locator, "input-read-failed"));
-                continue;
-            }
-            Err(_) => continue,
-        };
+        probed_bytes = total_bytes;
         if !named_candidate && !contains_openapi_marker(&bytes) {
-            continue;
-        }
-        if records.len() >= MAX_OPENAPI_DOCUMENTS {
-            records.push(skipped_record(&locator, "document-count-limit-exceeded"));
             continue;
         }
         let digest = sha256_prefixed(&bytes);
         match parse_openapi_document(&locator, &digest, &bytes) {
-            Ok(document) => records.push(InputRecord {
-                locator,
-                digest,
-                document: Some(document),
-                reason: None,
-            }),
-            Err(reason) => records.push(InputRecord {
-                locator,
-                digest,
-                document: None,
-                reason: Some(reason),
-            }),
+            Ok(document) => push_openapi_inventory_record(
+                &mut records,
+                InputRecord {
+                    locator,
+                    digest,
+                    document: Some(document),
+                    reason: None,
+                },
+            )?,
+            Err(reason) => push_openapi_inventory_record(
+                &mut records,
+                InputRecord {
+                    locator,
+                    digest,
+                    document: None,
+                    reason: Some(reason),
+                },
+            )?,
         }
     }
     records.sort_by(|left, right| left.locator.cmp(&right.locator));
     Ok(records)
+}
+
+fn record_openapi_inventory_entry(inventory_entries: &mut usize) -> Result<()> {
+    *inventory_entries = inventory_entries
+        .checked_add(1)
+        .context("OpenAPI inventory entry count overflowed")?;
+    if *inventory_entries > MAX_OPENAPI_INVENTORY_ENTRIES {
+        bail!("OpenAPI inventory exceeds its closed entry limit");
+    }
+    Ok(())
+}
+
+fn push_openapi_inventory_record(
+    records: &mut Vec<InputRecord>,
+    record: InputRecord,
+) -> Result<()> {
+    if records.len() >= MAX_OPENAPI_DOCUMENTS {
+        bail!("OpenAPI inventory exceeds its closed document limit");
+    }
+    records.push(record);
+    Ok(())
 }
 
 fn inventory_entry_allowed(entry: &DirEntry) -> bool {
@@ -316,17 +341,6 @@ fn repository_locator(root: &Path, path: &Path) -> Option<String> {
     }
     let locator = parts.join("/");
     (!locator.is_empty() && !locator.contains('\\')).then_some(locator)
-}
-
-fn read_bounded(path: &Path, max_bytes: usize) -> Result<Vec<u8>> {
-    let mut bytes = Vec::new();
-    File::open(path)?
-        .take(max_bytes as u64 + 1)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() > max_bytes {
-        bail!("bounded OpenAPI read exceeded its byte limit");
-    }
-    Ok(bytes)
 }
 
 fn skipped_record(locator: &str, reason: &str) -> InputRecord {
@@ -2661,5 +2675,52 @@ paths:
         nested.push_str(&"]".repeat(MAX_OPENAPI_DEPTH + 8));
         nested.push('}');
         assert!(parse_bounded_json(nested.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn inventory_entry_and_document_limits_fail_closed_without_growing_records() {
+        let mut inventory_entries = MAX_OPENAPI_INVENTORY_ENTRIES - 1;
+        record_openapi_inventory_entry(&mut inventory_entries).unwrap();
+        assert_eq!(inventory_entries, MAX_OPENAPI_INVENTORY_ENTRIES);
+        assert!(record_openapi_inventory_entry(&mut inventory_entries).is_err());
+
+        let mut records = Vec::new();
+        for index in 0..MAX_OPENAPI_DOCUMENTS {
+            push_openapi_inventory_record(
+                &mut records,
+                skipped_record(&format!("openapi-{index}.json"), "test-skip"),
+            )
+            .unwrap();
+        }
+        assert_eq!(records.len(), MAX_OPENAPI_DOCUMENTS);
+        assert!(
+            push_openapi_inventory_record(
+                &mut records,
+                skipped_record("openapi-overflow.json", "test-skip"),
+            )
+            .is_err()
+        );
+        assert_eq!(records.len(), MAX_OPENAPI_DOCUMENTS);
+    }
+
+    #[test]
+    fn oversized_named_input_is_ledgered_with_the_byte_limit_reason() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(
+            root.path().join("openapi-oversized.json"),
+            vec![b' '; MAX_OPENAPI_DOCUMENT_BYTES + 1],
+        )
+        .unwrap();
+
+        let delta = scan_openapi_repository(root.path(), &["web:production".to_owned()])
+            .unwrap()
+            .unwrap();
+        let ledger = ledger(&delta);
+        assert_eq!(ledger.entries[0].skipped_count, 1);
+        assert!(
+            ledger.entries[0]
+                .reasons
+                .contains(&"input-byte-limit-exceeded".to_owned())
+        );
     }
 }
