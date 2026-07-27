@@ -139,6 +139,23 @@ pub fn correlate_http_operations(
         candidates.dedup_by(|left, right| {
             left.delta_index == right.delta_index && left.node_id == right.node_id
         });
+        let source_id = (event.source.status == RuntimeTraceMatchStatus::Resolved)
+            .then_some(event.source.node_id.as_deref())
+            .flatten();
+        let source_candidates = source_id
+            .map(|source| {
+                candidates
+                    .iter()
+                    .filter(|candidate| {
+                        deltas[candidate.delta_index]
+                            .nodes
+                            .iter()
+                            .any(|node| node.id == source && valid_runtime_call_source(&node.kind))
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
 
         let mut outcome = if trace.profile_match.status != RuntimeTraceMatchStatus::Resolved {
             outcome(
@@ -150,67 +167,7 @@ pub fn correlate_http_operations(
                 Vec::new(),
                 "runtime-profile-unmatched",
             )
-        } else if candidates.len() > 1 {
-            let formats = candidates
-                .iter()
-                .map(|candidate| candidate.format)
-                .collect::<BTreeSet<_>>();
-            let profiles = candidates
-                .iter()
-                .map(|candidate| candidate.profile_id.as_str())
-                .collect::<BTreeSet<_>>();
-            outcome(
-                &trace_digest,
-                event,
-                ResolutionStatus::Candidates,
-                (formats.len() == 1).then(|| candidates[0].format),
-                (profiles.len() == 1).then(|| candidates[0].profile_id.clone()),
-                candidates
-                    .iter()
-                    .map(|candidate| candidate.node_id.clone())
-                    .collect(),
-                "http-operation-ambiguous",
-            )
-        } else if let Some(candidate) = candidates.first() {
-            let source_id = event.source.node_id.as_deref();
-            if event.source.status != RuntimeTraceMatchStatus::Resolved
-                || !source_id.is_some_and(|source| {
-                    deltas[candidate.delta_index]
-                        .nodes
-                        .iter()
-                        .any(|node| node.id == source && valid_runtime_call_source(&node.kind))
-                })
-            {
-                outcome(
-                    &trace_digest,
-                    event,
-                    ResolutionStatus::Unresolved,
-                    Some(candidate.format),
-                    Some(candidate.profile_id.clone()),
-                    vec![candidate.node_id.clone()],
-                    "runtime-source-not-in-contract-graph",
-                )
-            } else {
-                append_runtime_relation(
-                    &mut deltas[candidate.delta_index],
-                    trace,
-                    event,
-                    http,
-                    candidate,
-                    source_id.context("checked resolved runtime source")?,
-                )?;
-                dirty.insert(candidate.delta_index);
-                outcome(
-                    &trace_digest,
-                    event,
-                    ResolutionStatus::Resolved,
-                    Some(candidate.format),
-                    Some(candidate.profile_id.clone()),
-                    vec![candidate.node_id.clone()],
-                    "unique-compatible-operation",
-                )
-            }
-        } else if version_drift {
+        } else if candidates.is_empty() && version_drift {
             outcome(
                 &trace_digest,
                 event,
@@ -220,7 +177,7 @@ pub fn correlate_http_operations(
                 Vec::new(),
                 "contract-version-drift",
             )
-        } else {
+        } else if candidates.is_empty() {
             outcome(
                 &trace_digest,
                 event,
@@ -229,6 +186,49 @@ pub fn correlate_http_operations(
                 None,
                 Vec::new(),
                 "http-operation-not-declared",
+            )
+        } else if source_id.is_none() {
+            outcome_for_candidates(
+                &trace_digest,
+                event,
+                &candidates,
+                ResolutionStatus::Unresolved,
+                "runtime-source-not-in-contract-graph",
+            )
+        } else if source_candidates.len() > 1 {
+            outcome_for_candidates(
+                &trace_digest,
+                event,
+                &source_candidates,
+                ResolutionStatus::Candidates,
+                "http-operation-ambiguous",
+            )
+        } else if let Some(candidate) = source_candidates.first() {
+            append_runtime_relation(
+                &mut deltas[candidate.delta_index],
+                trace,
+                event,
+                http,
+                candidate,
+                source_id.context("checked resolved runtime source")?,
+            )?;
+            dirty.insert(candidate.delta_index);
+            outcome(
+                &trace_digest,
+                event,
+                ResolutionStatus::Resolved,
+                Some(candidate.format),
+                Some(candidate.profile_id.clone()),
+                vec![candidate.node_id.clone()],
+                "unique-compatible-operation",
+            )
+        } else {
+            outcome_for_candidates(
+                &trace_digest,
+                event,
+                &candidates,
+                ResolutionStatus::Unresolved,
+                "runtime-source-not-in-contract-graph",
             )
         };
         outcome.operation_ids.sort();
@@ -731,6 +731,35 @@ fn canonicalize_and_validate_delta(delta: &mut CrossLanguageAdapterDelta) -> Res
     Ok(())
 }
 
+fn outcome_for_candidates(
+    trace_digest: &str,
+    event: &ValidatedRuntimeTraceEvent,
+    candidates: &[OperationCandidate],
+    status: ResolutionStatus,
+    reason: &str,
+) -> HttpOperationCorrelationOutcome {
+    let formats = candidates
+        .iter()
+        .map(|candidate| candidate.format)
+        .collect::<BTreeSet<_>>();
+    let profiles = candidates
+        .iter()
+        .map(|candidate| candidate.profile_id.as_str())
+        .collect::<BTreeSet<_>>();
+    outcome(
+        trace_digest,
+        event,
+        status,
+        (formats.len() == 1).then(|| candidates[0].format),
+        (profiles.len() == 1).then(|| candidates[0].profile_id.clone()),
+        candidates
+            .iter()
+            .map(|candidate| candidate.node_id.clone())
+            .collect(),
+        reason,
+    )
+}
+
 fn outcome(
     trace_digest: &str,
     event: &ValidatedRuntimeTraceEvent,
@@ -951,6 +980,73 @@ mod tests {
         };
         let unmatched = correlate_http_operations(&runtime, &[contract])?;
         assert_eq!(unmatched.outcomes[0].reason, "runtime-profile-unmatched");
+        Ok(())
+    }
+
+    #[test]
+    fn source_membership_disambiguates_equivalent_contract_coordinates() -> Result<()> {
+        let first_root = tempdir()?;
+        let second_root = tempdir()?;
+        let document = |title: &str| {
+            format!(
+                r#"{{"openapi":"3.1.0","info":{{"title":"{title}","version":"1"}},"paths":{{"/pets":{{"get":{{"responses":{{"200":{{"description":"ok"}}}}}}}}}}}}"#
+            )
+        };
+        fs::write(first_root.path().join("first.json"), document("first"))?;
+        fs::write(second_root.path().join("second.json"), document("second"))?;
+        let first_contract = scan_openapi_repository(first_root.path(), &participating_profiles())?
+            .context("first delta")?;
+        let second_contract =
+            scan_openapi_repository(second_root.path(), &participating_profiles())?
+                .context("second delta")?;
+        let first_operation = operation(
+            std::slice::from_ref(&first_contract),
+            CrossLanguageFormat::Openapi,
+            "get /pets",
+        )?
+        .1
+        .id
+        .clone();
+        let second_operation = operation(
+            std::slice::from_ref(&second_contract),
+            CrossLanguageFormat::Openapi,
+            "get /pets",
+        )?
+        .1
+        .id
+        .clone();
+        assert_ne!(first_operation, second_operation);
+
+        let result = correlate_http_operations(
+            &trace(
+                first_operation.clone(),
+                RuntimeHttpObservation {
+                    method: "GET".to_owned(),
+                    route_template: "/pets".to_owned(),
+                    format: Some(RuntimeHttpOperationFormat::Openapi),
+                    operation: None,
+                    contract_locator: None,
+                    format_version: None,
+                },
+                "session-a",
+            ),
+            &[second_contract, first_contract],
+        )?;
+
+        assert_eq!(result.outcomes[0].status, ResolutionStatus::Resolved);
+        assert_eq!(
+            result.outcomes[0].operation_ids.as_slice(),
+            std::slice::from_ref(&first_operation)
+        );
+        let runtime_edges = result
+            .deltas
+            .iter()
+            .flat_map(|delta| &delta.edges)
+            .filter(|edge| edge.phase == Phase::Runtime)
+            .collect::<Vec<_>>();
+        assert_eq!(runtime_edges.len(), 1);
+        assert_eq!(runtime_edges[0].source, first_operation);
+        assert_eq!(runtime_edges[0].target, runtime_edges[0].source);
         Ok(())
     }
 
