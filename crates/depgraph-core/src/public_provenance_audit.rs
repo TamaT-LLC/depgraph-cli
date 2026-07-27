@@ -467,6 +467,13 @@ fn validate_input(input: &PublicProvenanceAuditInput) -> Result<()> {
 }
 
 fn validate_package(package: &PublicProvenanceReviewPackage) -> Result<()> {
+    if package.assets.is_empty()
+        || package.assets.len() > MAX_PUBLIC_PROVENANCE_ASSETS
+        || package.dependencies.is_empty()
+        || package.dependencies.len() > MAX_PUBLIC_PROVENANCE_DEPENDENCIES
+    {
+        bail!("public provenance review package inventory is empty or exceeds its bound");
+    }
     let expected = expected_findings(&package.assets, &package.dependencies);
     if package.schema_version != PUBLIC_PROVENANCE_REVIEW_SCHEMA_VERSION
         || !is_lower_hex(&package.candidate_commit, 40)
@@ -945,5 +952,32 @@ mod tests {
         let (mut input, _) = fixture();
         input.assets[0].portable_locator = "/private/checkout/src/lib.rs".into();
         assert!(build_public_provenance_review_package(&input).is_err());
+    }
+
+    #[test]
+    fn evaluator_rejects_a_rehashed_empty_inventory() {
+        let (input, expected) = fixture();
+        let mut package = build_public_provenance_review_package(&input).unwrap();
+        package.assets.clear();
+        package.dependencies.clear();
+        package.asset_inventory_digest =
+            canonical_public_readiness_digest(&package.assets).unwrap();
+        package.dependency_inventory_digest =
+            canonical_public_readiness_digest(&package.dependencies).unwrap();
+        package.findings.clear();
+        package.finding_summary = PublicReadinessFindingSummary {
+            resolved: 0,
+            unresolved: 0,
+        };
+        package.decision = PublicReadinessDecision::Allow;
+        package.evidence_digest = package_digest(&package).unwrap();
+
+        let evaluation = evaluate_public_provenance_review(&package, &expected).unwrap();
+        assert_eq!(evaluation.decision, PublicReadinessDecision::Reject);
+        assert!(
+            evaluation
+                .reasons
+                .contains(&PublicProvenanceRejectionReason::InvalidReviewPackage)
+        );
     }
 }
