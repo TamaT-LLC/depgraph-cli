@@ -337,6 +337,7 @@ fn record_ffi_inventory_entry(inventory_entries: &mut usize) -> Result<()> {
 fn parse_rust(locator: &str, digest: &str, source: &str) -> (Vec<FfiDeclaration>, Vec<String>) {
     let mut declarations = Vec::new();
     let mut boundaries = Vec::new();
+    let mut block_comment_depth = 0_usize;
     let mut pending_library = None;
     let mut pending_symbol = None;
     let mut pending_stable_export = false;
@@ -361,7 +362,11 @@ fn parse_rust(locator: &str, digest: &str, source: &str) -> (Vec<FfiDeclaration>
 
     for (index, line) in source.lines().enumerate() {
         let line_number = (index + 1) as u32;
-        let trimmed = line.trim();
+        let code = code_without_comments(line, &mut block_comment_depth, false);
+        let trimmed = code.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
         if macro_depth > 0 {
             macro_depth += brace_delta(trimmed);
             continue;
@@ -404,6 +409,11 @@ fn parse_rust(locator: &str, digest: &str, source: &str) -> (Vec<FfiDeclaration>
                     symbol: Some(symbol),
                     reason: unsupported_abi_reason(abi),
                 }));
+            }
+            if extern_depth <= 0 {
+                extern_abi = None;
+                pending_library = None;
+                pending_symbol = None;
             }
             continue;
         }
@@ -536,7 +546,7 @@ fn parse_go(locator: &str, digest: &str, source: &str) -> (Vec<FfiDeclaration>, 
 fn parse_web(locator: &str, digest: &str, source: &str) -> (Vec<FfiDeclaration>, Vec<String>) {
     let mut declarations = Vec::new();
     let mut boundaries = Vec::new();
-    let mut in_block_comment = false;
+    let mut block_comment_depth = 0_usize;
     if ["process.dlopen(", "node-gyp-build(", "bindings("]
         .iter()
         .any(|needle| source.contains(needle))
@@ -544,27 +554,18 @@ fn parse_web(locator: &str, digest: &str, source: &str) -> (Vec<FfiDeclaration>,
         boundaries.push("ffi-web-dynamic-native-binding".to_owned());
     }
     for (index, line) in source.lines().enumerate() {
-        let trimmed = line.trim();
-        if in_block_comment {
-            if trimmed.contains("*/") {
-                in_block_comment = false;
-            }
-            continue;
-        }
-        if trimmed.starts_with("/*") {
-            in_block_comment = !trimmed.contains("*/");
-            continue;
-        }
-        if trimmed.starts_with("//") {
+        let code = code_without_comments(line, &mut block_comment_depth, true);
+        let trimmed = code.trim();
+        if trimmed.is_empty() {
             continue;
         }
         let mut admitted = false;
-        for literal in quoted_literals(trimmed)
-            .into_iter()
-            .filter(|literal| literal.ends_with(".node"))
-        {
+        for literal in quoted_literal_spans(trimmed).into_iter().filter(|literal| {
+            literal.value.ends_with(".node")
+                && web_native_binding_literal_is_admitted(trimmed, literal.start, literal.end)
+        }) {
             admitted = true;
-            let wildcard = literal.contains('*');
+            let wildcard = literal.value.contains('*');
             let symbol = web_binding_symbol(trimmed).or_else(|| Some("module".to_owned()));
             let reason = wildcard.then(|| "ffi-web-wildcard-native-binding".to_owned());
             declarations.push(declaration(DeclarationInput {
@@ -575,12 +576,12 @@ fn parse_web(locator: &str, digest: &str, source: &str) -> (Vec<FfiDeclaration>,
                 line: (index + 1) as u32,
                 source_line: trimmed,
                 abi: "node-api",
-                library: Some(literal),
+                library: Some(literal.value),
                 symbol,
                 reason,
             }));
         }
-        if trimmed.contains(".node") && !admitted {
+        if trimmed.contains(".node") && !admitted && web_native_binding_syntax(trimmed) {
             boundaries.push("ffi-web-dynamic-native-binding".to_owned());
         }
     }
@@ -1114,7 +1115,75 @@ fn attribute_string(line: &str, key: &str) -> Option<String> {
     Some(value[..end].to_owned())
 }
 
-fn quoted_literals(line: &str) -> Vec<String> {
+fn code_without_comments(
+    line: &str,
+    block_comment_depth: &mut usize,
+    single_quote_strings: bool,
+) -> String {
+    let characters = line.chars().collect::<Vec<_>>();
+    let mut result = String::with_capacity(line.len());
+    let mut index = 0;
+    let mut quote = None;
+    while index < characters.len() {
+        let character = characters[index];
+        let next = characters.get(index + 1).copied();
+        if *block_comment_depth > 0 {
+            if !single_quote_strings && character == '/' && next == Some('*') {
+                *block_comment_depth = block_comment_depth.saturating_add(1);
+                index += 2;
+            } else if character == '*' && next == Some('/') {
+                *block_comment_depth -= 1;
+                index += 2;
+            } else {
+                index += 1;
+            }
+            continue;
+        }
+        if let Some(terminator) = quote {
+            result.push(character);
+            if character == '\\' {
+                if let Some(escaped) = next {
+                    result.push(escaped);
+                    index += 2;
+                    continue;
+                }
+            } else if character == terminator {
+                quote = None;
+            }
+            index += 1;
+            continue;
+        }
+        if character == '/' && next == Some('/') {
+            break;
+        }
+        if character == '/' && next == Some('*') {
+            *block_comment_depth = 1;
+            index += 2;
+            continue;
+        }
+        let rust_character_literal = !single_quote_strings
+            && character == '\''
+            && (characters.get(index + 2) == Some(&'\'')
+                || characters.get(index + 1) == Some(&'\\')
+                    && characters.get(index + 3) == Some(&'\''));
+        if matches!(character, '"' | '`')
+            || character == '\'' && (single_quote_strings || rust_character_literal)
+        {
+            quote = Some(character);
+        }
+        result.push(character);
+        index += 1;
+    }
+    result
+}
+
+struct QuotedLiteral {
+    value: String,
+    start: usize,
+    end: usize,
+}
+
+fn quoted_literal_spans(line: &str) -> Vec<QuotedLiteral> {
     let mut result = Vec::new();
     let bytes = line.as_bytes();
     let mut index = 0;
@@ -1124,6 +1193,7 @@ fn quoted_literals(line: &str) -> Vec<String> {
             index += 1;
             continue;
         }
+        let quote_start = index;
         let start = index + 1;
         index = start;
         while index < bytes.len() && bytes[index] != quote {
@@ -1133,16 +1203,75 @@ fn quoted_literals(line: &str) -> Vec<String> {
                 index += 1;
             }
         }
-        if index <= bytes.len()
+        if index < bytes.len()
             && let Some(value) = line.get(start..index)
             && bounded_text(value)
             && !value.contains(['?', '#', '\\'])
         {
-            result.push(value.to_owned());
+            result.push(QuotedLiteral {
+                value: value.to_owned(),
+                start: quote_start,
+                end: index + 1,
+            });
         }
         index = index.saturating_add(1);
     }
     result
+}
+
+fn web_native_binding_literal_is_admitted(
+    line: &str,
+    literal_start: usize,
+    literal_end: usize,
+) -> bool {
+    let Some(prefix) = line.get(..literal_start) else {
+        return false;
+    };
+    if call_prefix_ends_with(prefix, "require") || call_prefix_ends_with(prefix, "import") {
+        return line
+            .get(literal_end..)
+            .is_some_and(|suffix| matches!(suffix.trim_start().chars().next(), Some(')' | ',')));
+    }
+
+    let statement = line.trim_start();
+    let prefix = prefix.trim();
+    if statement.starts_with("declare module ") {
+        return prefix == "declare module";
+    }
+    if statement.starts_with("import ") {
+        return prefix == "import" || token_suffix(prefix, "from");
+    }
+    statement.starts_with("export ") && token_suffix(prefix, "from")
+}
+
+fn web_native_binding_syntax(line: &str) -> bool {
+    let statement = line.trim_start();
+    statement.starts_with("import ")
+        || statement.starts_with("export ")
+        || statement.starts_with("declare module ")
+        || ["require", "import"].iter().any(|function| {
+            line.match_indices('(').any(|(index, _)| {
+                line.get(..=index)
+                    .is_some_and(|prefix| call_prefix_ends_with(prefix, function))
+            })
+        })
+}
+
+fn call_prefix_ends_with(prefix: &str, function: &str) -> bool {
+    let Some(before_parenthesis) = prefix.trim_end().strip_suffix('(') else {
+        return false;
+    };
+    token_suffix(before_parenthesis.trim_end(), function)
+}
+
+fn token_suffix(value: &str, token: &str) -> bool {
+    let Some(prefix) = value.strip_suffix(token) else {
+        return false;
+    };
+    prefix
+        .chars()
+        .next_back()
+        .is_none_or(|character| !character.is_ascii_alphanumeric() && character != '_')
 }
 
 fn web_binding_symbol(line: &str) -> Option<String> {
@@ -1516,6 +1645,44 @@ unsafe extern "C" {
             entry
                 .reasons
                 .contains(&"ffi-web-dynamic-native-binding".to_owned())
+        );
+    }
+
+    #[test]
+    fn rust_comments_and_inline_extern_blocks_do_not_leak_false_declarations() {
+        let source = r#"
+// extern "C" { fn line_comment(); }
+/*
+extern "C" { fn block_comment(); }
+*/
+extern "C" { fn admitted(); }
+fn ordinary() {}
+static ORDINARY: i32 = 0;
+"#;
+        let (declarations, boundaries) = parse_rust("native.rs", "sha256:test", source);
+        assert!(boundaries.is_empty());
+        assert_eq!(declarations.len(), 1);
+        assert_eq!(declarations[0].symbol.as_deref(), Some("admitted"));
+    }
+
+    #[test]
+    fn web_native_bindings_require_an_import_require_or_declaration_context() {
+        let source = r#"
+const example = "addon.node";
+const another = './not-a-load.node';
+import { hash } from './real.node';
+const native = require("./required.node");
+declare module '*.node';
+console.log("also-not-a-load.node");
+"#;
+        let (declarations, boundaries) = parse_web("native.ts", "sha256:test", source);
+        assert!(boundaries.is_empty());
+        assert_eq!(
+            declarations
+                .iter()
+                .filter_map(|declaration| declaration.library.as_deref())
+                .collect::<Vec<_>>(),
+            vec!["./real.node", "./required.node", "*.node"]
         );
     }
 
