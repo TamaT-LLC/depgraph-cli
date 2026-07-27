@@ -217,6 +217,7 @@ pub(super) fn inventory_repository_mappings(root: &Path) -> Result<RepositoryMap
     let mut output_bytes = 0_usize;
     let mut mapping_count = 0_usize;
     let mut inventory_entries = 0_usize;
+    let mut shared_observations = BTreeMap::<String, OutputObservation>::new();
     let walker = WalkDir::new(root)
         .follow_links(false)
         .sort_by_file_name()
@@ -338,7 +339,7 @@ pub(super) fn inventory_repository_mappings(root: &Path) -> Result<RepositoryMap
         {
             observations.insert(
                 output.to_owned(),
-                observe_output(root, output, &mut output_bytes),
+                observe_output_once(root, output, &mut shared_observations, &mut output_bytes),
             );
         }
         push_inventory_record(
@@ -491,6 +492,20 @@ fn observe_output(root: &Path, relative: &str, total_bytes: &mut usize) -> Outpu
         source: Some(source.to_owned()),
         line_offsets,
     }
+}
+
+fn observe_output_once(
+    root: &Path,
+    relative: &str,
+    observations: &mut BTreeMap<String, OutputObservation>,
+    total_bytes: &mut usize,
+) -> OutputObservation {
+    if let Some(observation) = observations.get(relative) {
+        return observation.clone();
+    }
+    let observation = observe_output(root, relative, total_bytes);
+    observations.insert(relative.to_owned(), observation.clone());
+    observation
 }
 
 fn output_failure(reason: &str) -> OutputObservation {
@@ -2008,5 +2023,37 @@ type Query { product: String }
             .is_err()
         );
         assert_eq!(records.len(), MAX_MANIFESTS);
+    }
+
+    #[test]
+    fn shared_outputs_consume_the_total_byte_budget_once() {
+        let root = tempfile::tempdir().unwrap();
+        let source = b"fn shared_endpoint() {}\n";
+        fs::write(root.path().join("shared.rs"), source).unwrap();
+        fs::write(root.path().join("other.rs"), source).unwrap();
+        let mut observations = BTreeMap::new();
+        let mut total_bytes = MAX_TOTAL_OUTPUT_BYTES - source.len();
+
+        let first = observe_output_once(
+            root.path(),
+            "shared.rs",
+            &mut observations,
+            &mut total_bytes,
+        );
+        let second = observe_output_once(
+            root.path(),
+            "shared.rs",
+            &mut observations,
+            &mut total_bytes,
+        );
+        let overflow =
+            observe_output_once(root.path(), "other.rs", &mut observations, &mut total_bytes);
+
+        assert_eq!(first.digest, second.digest);
+        assert_eq!(total_bytes, MAX_TOTAL_OUTPUT_BYTES);
+        assert_eq!(
+            overflow.reason.as_deref(),
+            Some("graphql-mapped-output-byte-limit-exceeded")
+        );
     }
 }
