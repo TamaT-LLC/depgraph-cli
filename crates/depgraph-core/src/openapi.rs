@@ -1,10 +1,9 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs::File,
-    io::Read,
     path::{Component, Path},
 };
 
+use crate::bounded_query::read_bounded_repository_file;
 use anyhow::{Context, Result, bail};
 use depgraph_protocol::{
     CROSS_LANGUAGE_COMPLETENESS_PROPERTY, CROSS_LANGUAGE_COMPLETENESS_VERSION,
@@ -32,6 +31,7 @@ pub const OPENAPI_CAPABILITY: &str = "openapi-contract-v1";
 pub const MAX_OPENAPI_DOCUMENT_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_OPENAPI_TOTAL_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_OPENAPI_DOCUMENTS: usize = 256;
+pub const MAX_OPENAPI_INVENTORY_ENTRIES: usize = 1_000_000;
 pub const MAX_OPENAPI_VALUES: usize = 100_000;
 pub const MAX_OPENAPI_DEPTH: usize = 96;
 pub const MAX_OPENAPI_SCALAR_BYTES: usize = 64 * 1024;
@@ -51,7 +51,7 @@ const MAX_REASON_BYTES: usize = 256;
 /// an incomplete delta so the coverage ledger cannot silently omit them.
 pub fn scan_openapi_repository(
     root: &Path,
-    participating_profile_ids: &[String],
+    participating_profiles: &[Profile],
 ) -> Result<Option<CrossLanguageAdapterDelta>> {
     let canonical_root = root
         .canonicalize()
@@ -59,17 +59,23 @@ pub fn scan_openapi_repository(
     if !canonical_root.is_dir() {
         bail!("OpenAPI scan root must be a directory");
     }
-    let mut participating_profile_ids = participating_profile_ids.to_vec();
-    participating_profile_ids.sort();
-    participating_profile_ids.dedup();
-    if participating_profile_ids.is_empty()
-        || participating_profile_ids.len() > MAX_PARTICIPATING_PROFILES
-        || participating_profile_ids
+    let mut participating_profiles = participating_profiles.to_vec();
+    participating_profiles.sort_by(|left, right| left.id.cmp(&right.id));
+    if participating_profiles.is_empty()
+        || participating_profiles.len() > MAX_PARTICIPATING_PROFILES
+        || participating_profiles
             .iter()
-            .any(|value| !bounded_text(value, MAX_OPENAPI_SCALAR_BYTES))
+            .any(|profile| !bounded_text(&profile.id, MAX_OPENAPI_SCALAR_BYTES))
+        || participating_profiles
+            .windows(2)
+            .any(|profiles| profiles[0].id == profiles[1].id)
     {
-        bail!("OpenAPI participating profile IDs must be a bounded non-empty set");
+        bail!("OpenAPI participating profiles must be a bounded non-empty set");
     }
+    let participating_profile_ids = participating_profiles
+        .iter()
+        .map(|profile| profile.id.clone())
+        .collect();
 
     let inventory = inventory_openapi_documents(&canonical_root)?;
     let generated_inventory = generated::inventory_generated_mappings(&canonical_root)?;
@@ -164,6 +170,7 @@ pub fn scan_openapi_repository(
     let delta = CrossLanguageAdapterDelta {
         contract_version: CROSS_LANGUAGE_CONTRACT_VERSION.to_owned(),
         profile,
+        participating_profiles,
         nodes: builder.nodes.into_values().collect(),
         sites: builder.sites.into_values().collect(),
         edges: builder.edges.into_values().collect(),
@@ -195,12 +202,14 @@ struct OpenApiDocument {
 fn inventory_openapi_documents(root: &Path) -> Result<Vec<InputRecord>> {
     let mut records = Vec::new();
     let mut probed_bytes = 0_usize;
+    let mut inventory_entries = 0_usize;
     let walker = WalkDir::new(root)
         .follow_links(false)
         .sort_by_file_name()
         .into_iter()
         .filter_entry(inventory_entry_allowed);
     for entry in walker {
+        record_openapi_inventory_entry(&mut inventory_entries)?;
         let entry = match entry {
             Ok(entry) => entry,
             Err(_) => continue,
@@ -218,68 +227,91 @@ fn inventory_openapi_documents(root: &Path) -> Result<Vec<InputRecord>> {
         let named_candidate = named_openapi_candidate(&locator);
         if entry.file_type().is_symlink() {
             if named_candidate {
-                records.push(skipped_record(&locator, "symlink-input-not-admitted"));
+                push_openapi_inventory_record(
+                    &mut records,
+                    skipped_record(&locator, "symlink-input-not-admitted"),
+                )?;
             }
             continue;
         }
         if !entry.file_type().is_file() {
             continue;
         }
-        let metadata = match entry.metadata() {
-            Ok(metadata) => metadata,
-            Err(_) if named_candidate => {
-                records.push(skipped_record(&locator, "input-metadata-unavailable"));
-                continue;
-            }
-            Err(_) => continue,
+        let bytes =
+            match read_bounded_repository_file(root, entry.path(), MAX_OPENAPI_DOCUMENT_BYTES) {
+                Ok(bytes) => bytes,
+                Err(error) if named_candidate => {
+                    let reason = if error.code == "query_file_size_or_type_invalid" {
+                        "input-byte-limit-exceeded"
+                    } else {
+                        "input-read-failed"
+                    };
+                    push_openapi_inventory_record(&mut records, skipped_record(&locator, reason))?;
+                    continue;
+                }
+                Err(_) => continue,
+            };
+        let Some(total_bytes) = probed_bytes.checked_add(bytes.len()) else {
+            bail!("OpenAPI inventory byte count overflowed");
         };
-        if metadata.len() > MAX_OPENAPI_DOCUMENT_BYTES as u64 {
+        if total_bytes > MAX_OPENAPI_TOTAL_BYTES {
             if named_candidate {
-                records.push(skipped_record(&locator, "input-byte-limit-exceeded"));
+                push_openapi_inventory_record(
+                    &mut records,
+                    skipped_record(&locator, "inventory-byte-limit-exceeded"),
+                )?;
             }
             continue;
         }
-        let file_len = metadata.len() as usize;
-        if probed_bytes.saturating_add(file_len) > MAX_OPENAPI_TOTAL_BYTES {
-            if named_candidate {
-                records.push(skipped_record(&locator, "inventory-byte-limit-exceeded"));
-            }
-            continue;
-        }
-        probed_bytes += file_len;
-        let bytes = match read_bounded(entry.path(), MAX_OPENAPI_DOCUMENT_BYTES) {
-            Ok(bytes) => bytes,
-            Err(_) if named_candidate => {
-                records.push(skipped_record(&locator, "input-read-failed"));
-                continue;
-            }
-            Err(_) => continue,
-        };
+        probed_bytes = total_bytes;
         if !named_candidate && !contains_openapi_marker(&bytes) {
-            continue;
-        }
-        if records.len() >= MAX_OPENAPI_DOCUMENTS {
-            records.push(skipped_record(&locator, "document-count-limit-exceeded"));
             continue;
         }
         let digest = sha256_prefixed(&bytes);
         match parse_openapi_document(&locator, &digest, &bytes) {
-            Ok(document) => records.push(InputRecord {
-                locator,
-                digest,
-                document: Some(document),
-                reason: None,
-            }),
-            Err(reason) => records.push(InputRecord {
-                locator,
-                digest,
-                document: None,
-                reason: Some(reason),
-            }),
+            Ok(document) => push_openapi_inventory_record(
+                &mut records,
+                InputRecord {
+                    locator,
+                    digest,
+                    document: Some(document),
+                    reason: None,
+                },
+            )?,
+            Err(reason) => push_openapi_inventory_record(
+                &mut records,
+                InputRecord {
+                    locator,
+                    digest,
+                    document: None,
+                    reason: Some(reason),
+                },
+            )?,
         }
     }
     records.sort_by(|left, right| left.locator.cmp(&right.locator));
     Ok(records)
+}
+
+fn record_openapi_inventory_entry(inventory_entries: &mut usize) -> Result<()> {
+    *inventory_entries = inventory_entries
+        .checked_add(1)
+        .context("OpenAPI inventory entry count overflowed")?;
+    if *inventory_entries > MAX_OPENAPI_INVENTORY_ENTRIES {
+        bail!("OpenAPI inventory exceeds its closed entry limit");
+    }
+    Ok(())
+}
+
+fn push_openapi_inventory_record(
+    records: &mut Vec<InputRecord>,
+    record: InputRecord,
+) -> Result<()> {
+    if records.len() >= MAX_OPENAPI_DOCUMENTS {
+        bail!("OpenAPI inventory exceeds its closed document limit");
+    }
+    records.push(record);
+    Ok(())
 }
 
 fn inventory_entry_allowed(entry: &DirEntry) -> bool {
@@ -332,17 +364,6 @@ fn repository_locator(root: &Path, path: &Path) -> Option<String> {
     (!locator.is_empty() && !locator.contains('\\')).then_some(locator)
 }
 
-fn read_bounded(path: &Path, max_bytes: usize) -> Result<Vec<u8>> {
-    let mut bytes = Vec::new();
-    File::open(path)?
-        .take(max_bytes as u64 + 1)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() > max_bytes {
-        bail!("bounded OpenAPI read exceeded its byte limit");
-    }
-    Ok(bytes)
-}
-
 fn skipped_record(locator: &str, reason: &str) -> InputRecord {
     InputRecord {
         locator: locator.to_owned(),
@@ -387,6 +408,11 @@ fn parse_openapi_document(
         && !paths.is_object()
     {
         return Err("openapi-paths-is-not-an-object".to_owned());
+    }
+    if let Some(webhooks) = object.get("webhooks")
+        && !webhooks.is_object()
+    {
+        return Err("openapi-webhooks-is-not-an-object".to_owned());
     }
     let (end_line, end_column) = source_end_position(source)?;
     Ok(OpenApiDocument {
@@ -1041,6 +1067,7 @@ impl OpenApiGraphBuilder {
 
         for locator in locators {
             self.process_document_paths(&locator)?;
+            self.process_document_webhooks(&locator)?;
         }
         Ok(())
     }
@@ -1146,13 +1173,55 @@ impl OpenApiGraphBuilder {
         Ok(())
     }
 
+    fn process_document_webhooks(&mut self, locator: &str) -> Result<()> {
+        let webhooks = self
+            .documents
+            .get(locator)
+            .and_then(|document| document.root.get("webhooks"))
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        for (index, (name, path_item)) in sorted_object(&webhooks).into_iter().enumerate() {
+            if !bounded_contract_text(&name) {
+                let service = self.service_ids[locator].clone();
+                let target =
+                    self.unknown_node(locator, "/webhooks", "webhook-name-is-unbounded")?;
+                self.add_relation(RelationInput {
+                    source: &service,
+                    target: &target,
+                    relation: CrossLanguageRelationKind::ProvidesOperation,
+                    evidence_locator: locator,
+                    pointer: "/webhooks",
+                    status: ResolutionStatus::Unresolved,
+                    precision: Precision::Heuristic,
+                    mapping: CrossLanguageMappingKind::Unresolved,
+                    reason: Some("webhook-name-is-unbounded"),
+                    conditions: Vec::new(),
+                })?;
+                continue;
+            }
+            let pointer = format!("/webhooks/{}", pointer_escape(&name));
+            let synthetic_path = format!("/webhook/{index}");
+            let operation_context = format!("webhook {name}");
+            self.process_path_item(
+                locator,
+                &synthetic_path,
+                &pointer,
+                path_item,
+                Some(&operation_context),
+                0,
+            )?;
+        }
+        Ok(())
+    }
+
     fn process_path_item(
         &mut self,
         locator: &str,
         path: &str,
         pointer: &str,
         path_item: Value,
-        callback_parent: Option<&str>,
+        operation_context: Option<&str>,
         depth: usize,
     ) -> Result<()> {
         if depth > MAX_OPENAPI_REFERENCE_DEPTH {
@@ -1212,9 +1281,9 @@ impl OpenApiGraphBuilder {
                 continue;
             };
             let operation_pointer = format!("{pointer}/{method}");
-            let coordinate = callback_parent.map_or_else(
+            let coordinate = operation_context.map_or_else(
                 || format!("{method} {path}"),
-                |parent| format!("callback {parent} #{operation_pointer} {method}"),
+                |context| format!("{context} #{operation_pointer} {method}"),
             );
             let operation_id =
                 self.add_cross_node(CrossLanguageNodeKind::Operation, locator, &coordinate)?;
@@ -1625,12 +1694,13 @@ impl OpenApiGraphBuilder {
                     let callback_pointer =
                         format!("{resolved_pointer}/{}", pointer_escape(&expression));
                     let synthetic_path = format!("/callback/{index}");
+                    let operation_context = format!("callback {parent_coordinate}");
                     self.process_path_item(
                         &locator,
                         &synthetic_path,
                         &callback_pointer,
                         path_item,
-                        Some(parent_coordinate),
+                        Some(&operation_context),
                         depth,
                     )?;
                 }
@@ -2490,6 +2560,20 @@ components:
         .unwrap()
     }
 
+    fn participating_profiles() -> Vec<Profile> {
+        vec![Profile {
+            id: "web:production".to_owned(),
+            language: "typescript".to_owned(),
+            toolchain: None,
+            command: None,
+            target: None,
+            features: Vec::new(),
+            environment: BTreeMap::new(),
+            source_revision: None,
+            properties: BTreeMap::new(),
+        }]
+    }
+
     #[test]
     fn json_yaml_local_refs_build_a_valid_checkout_independent_contract_graph() {
         let first = tempfile::tempdir().unwrap();
@@ -2497,10 +2581,10 @@ components:
         write_pair(first.path(), false);
         write_pair(second.path(), true);
 
-        let first = scan_openapi_repository(first.path(), &["web:production".to_owned()])
+        let first = scan_openapi_repository(first.path(), &participating_profiles())
             .unwrap()
             .unwrap();
-        let second = scan_openapi_repository(second.path(), &["web:production".to_owned()])
+        let second = scan_openapi_repository(second.path(), &participating_profiles())
             .unwrap()
             .unwrap();
         validate_cross_language_adapter_delta(&first).unwrap();
@@ -2569,7 +2653,7 @@ components:
 "#,
         )
         .unwrap();
-        let delta = scan_openapi_repository(root.path(), &["web:production".to_owned()])
+        let delta = scan_openapi_repository(root.path(), &participating_profiles())
             .unwrap()
             .unwrap();
         validate_cross_language_adapter_delta(&delta).unwrap();
@@ -2618,7 +2702,7 @@ components:
                 .unwrap();
         }
 
-        let delta = scan_openapi_repository(root.path(), &["web:production".to_owned()])
+        let delta = scan_openapi_repository(root.path(), &participating_profiles())
             .unwrap()
             .unwrap();
         let ledger = ledger(&delta);
@@ -2680,7 +2764,7 @@ paths:
 "#,
         )
         .unwrap();
-        let delta = scan_openapi_repository(root.path(), &["web:production".to_owned()])
+        let delta = scan_openapi_repository(root.path(), &participating_profiles())
             .unwrap()
             .unwrap();
         assert!(
@@ -2695,10 +2779,67 @@ paths:
     }
 
     #[test]
+    fn top_level_webhooks_emit_operations_and_message_relations() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(
+            root.path().join("openapi-webhook.yaml"),
+            r#"
+openapi: 3.1.1
+info:
+  title: Webhooks
+paths: {}
+webhooks:
+  orderCreated:
+    post:
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Order'
+      responses:
+        '202':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Acknowledgement'
+components:
+  schemas:
+    Order:
+      type: object
+    Acknowledgement:
+      type: object
+"#,
+        )
+        .unwrap();
+
+        let delta = scan_openapi_repository(root.path(), &participating_profiles())
+            .unwrap()
+            .unwrap();
+        validate_cross_language_adapter_delta(&delta).unwrap();
+        assert_eq!(
+            ledger(&delta).entries[0].status,
+            CrossLanguageCapabilityStatus::Complete
+        );
+        assert!(delta.nodes.iter().any(|node| {
+            node.kind == "operation"
+                && node.properties["canonical_identity"]["coordinate"]
+                    == "webhook orderCreated #/webhooks/orderCreated/post post"
+        }));
+        let kinds = delta
+            .sites
+            .iter()
+            .map(|site| site.kind.as_str())
+            .collect::<BTreeSet<_>>();
+        assert!(kinds.contains("provides_operation"));
+        assert!(kinds.contains("accepts_message"));
+        assert!(kinds.contains("returns_message"));
+    }
+
+    #[test]
     fn invalid_pointer_depth_and_empty_inventory_fail_closed() {
         let empty = tempfile::tempdir().unwrap();
         assert!(
-            scan_openapi_repository(empty.path(), &["web:production".to_owned()])
+            scan_openapi_repository(empty.path(), &participating_profiles())
                 .unwrap()
                 .is_none()
         );
@@ -2711,5 +2852,52 @@ paths:
         nested.push_str(&"]".repeat(MAX_OPENAPI_DEPTH + 8));
         nested.push('}');
         assert!(parse_bounded_json(nested.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn inventory_entry_and_document_limits_fail_closed_without_growing_records() {
+        let mut inventory_entries = MAX_OPENAPI_INVENTORY_ENTRIES - 1;
+        record_openapi_inventory_entry(&mut inventory_entries).unwrap();
+        assert_eq!(inventory_entries, MAX_OPENAPI_INVENTORY_ENTRIES);
+        assert!(record_openapi_inventory_entry(&mut inventory_entries).is_err());
+
+        let mut records = Vec::new();
+        for index in 0..MAX_OPENAPI_DOCUMENTS {
+            push_openapi_inventory_record(
+                &mut records,
+                skipped_record(&format!("openapi-{index}.json"), "test-skip"),
+            )
+            .unwrap();
+        }
+        assert_eq!(records.len(), MAX_OPENAPI_DOCUMENTS);
+        assert!(
+            push_openapi_inventory_record(
+                &mut records,
+                skipped_record("openapi-overflow.json", "test-skip"),
+            )
+            .is_err()
+        );
+        assert_eq!(records.len(), MAX_OPENAPI_DOCUMENTS);
+    }
+
+    #[test]
+    fn oversized_named_input_is_ledgered_with_the_byte_limit_reason() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(
+            root.path().join("openapi-oversized.json"),
+            vec![b' '; MAX_OPENAPI_DOCUMENT_BYTES + 1],
+        )
+        .unwrap();
+
+        let delta = scan_openapi_repository(root.path(), &participating_profiles())
+            .unwrap()
+            .unwrap();
+        let ledger = ledger(&delta);
+        assert_eq!(ledger.entries[0].skipped_count, 1);
+        assert!(
+            ledger.entries[0]
+                .reasons
+                .contains(&"input-byte-limit-exceeded".to_owned())
+        );
     }
 }
