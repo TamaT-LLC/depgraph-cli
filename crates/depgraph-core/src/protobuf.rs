@@ -50,7 +50,7 @@ const MAX_REASONS: usize = 64;
 /// network clients.
 pub fn scan_protobuf_repository(
     root: &Path,
-    participating_profile_ids: &[String],
+    participating_profiles: &[Profile],
 ) -> Result<Option<CrossLanguageAdapterDelta>> {
     let canonical_root = root
         .canonicalize()
@@ -58,17 +58,23 @@ pub fn scan_protobuf_repository(
     if !canonical_root.is_dir() {
         bail!("Protobuf scan root must be a directory");
     }
-    let mut participating_profile_ids = participating_profile_ids.to_vec();
-    participating_profile_ids.sort();
-    participating_profile_ids.dedup();
-    if participating_profile_ids.is_empty()
-        || participating_profile_ids.len() > MAX_PARTICIPATING_PROFILES
-        || participating_profile_ids
+    let mut participating_profiles = participating_profiles.to_vec();
+    participating_profiles.sort_by(|left, right| left.id.cmp(&right.id));
+    if participating_profiles.is_empty()
+        || participating_profiles.len() > MAX_PARTICIPATING_PROFILES
+        || participating_profiles
             .iter()
-            .any(|value| !bounded_text(value))
+            .any(|profile| !bounded_text(&profile.id))
+        || participating_profiles
+            .windows(2)
+            .any(|profiles| profiles[0].id == profiles[1].id)
     {
-        bail!("Protobuf participating profile IDs must be a bounded non-empty set");
+        bail!("Protobuf participating profiles must be a bounded non-empty set");
     }
+    let participating_profile_ids = participating_profiles
+        .iter()
+        .map(|profile| profile.id.clone())
+        .collect();
 
     let sources = inventory_proto_sources(&canonical_root)?;
     let admitted_sources = sources
@@ -162,6 +168,7 @@ pub fn scan_protobuf_repository(
     let delta = CrossLanguageAdapterDelta {
         contract_version: CROSS_LANGUAGE_CONTRACT_VERSION.to_owned(),
         profile,
+        participating_profiles,
         nodes: builder.nodes.into_values().collect(),
         sites: builder.sites.into_values().collect(),
         edges: builder.edges.into_values().collect(),
@@ -2740,6 +2747,20 @@ mod tests {
 
     use super::*;
 
+    fn participating_profiles() -> Vec<Profile> {
+        vec![Profile {
+            id: "protobuf:production".to_owned(),
+            language: "protobuf".to_owned(),
+            toolchain: None,
+            command: None,
+            target: None,
+            features: Vec::new(),
+            environment: BTreeMap::new(),
+            source_revision: None,
+            properties: BTreeMap::new(),
+        }]
+    }
+
     const A_PROTO: &str = r#"syntax = "proto3";
 package acme.v1;
 import public "b.proto";
@@ -2906,14 +2927,15 @@ message Payload {
         write_positive_fixture(first.path(), false);
         write_positive_fixture(second.path(), true);
 
-        let first = scan_protobuf_repository(first.path(), &["polyglot:production".to_owned()])
+        let first = scan_protobuf_repository(first.path(), &participating_profiles())
             .unwrap()
             .unwrap();
-        let second = scan_protobuf_repository(second.path(), &["polyglot:production".to_owned()])
+        let second = scan_protobuf_repository(second.path(), &participating_profiles())
             .unwrap()
             .unwrap();
         validate_cross_language_adapter_delta(&first).unwrap();
         assert_eq!(first, second);
+        assert_eq!(first.participating_profiles, participating_profiles());
         let coverage = &ledger(&first).entries[0];
         assert_eq!(coverage.status, CrossLanguageCapabilityStatus::Complete);
         assert_eq!(coverage.input_count, 3);
@@ -2971,10 +2993,9 @@ service EditionService { rpc Read (Request) returns (Request); }
 "#,
         )
         .unwrap();
-        let source_only =
-            scan_protobuf_repository(root.path(), &["protobuf:production".to_owned()])
-                .unwrap()
-                .unwrap();
+        let source_only = scan_protobuf_repository(root.path(), &participating_profiles())
+            .unwrap()
+            .unwrap();
         assert_eq!(
             ledger(&source_only).entries[0].status,
             CrossLanguageCapabilityStatus::Complete
@@ -2997,10 +3018,9 @@ service EditionService { rpc Read (Request) returns (Request); }
                 .join(format!("contracts{PROTOBUF_DESCRIPTOR_SUFFIX}")),
             &descriptor_set(false, false),
         );
-        let descriptor =
-            scan_protobuf_repository(descriptors.path(), &["protobuf:production".to_owned()])
-                .unwrap()
-                .unwrap();
+        let descriptor = scan_protobuf_repository(descriptors.path(), &participating_profiles())
+            .unwrap()
+            .unwrap();
         assert!(descriptor.sites.iter().all(|site| {
             site.evidence[0].path.is_none()
                 && site.evidence[0].start_line.is_none()
@@ -3024,7 +3044,7 @@ service Broken { rpc Read (Request) returns (Missing); }
 "#,
         )
         .unwrap();
-        let delta = scan_protobuf_repository(root.path(), &["protobuf:production".to_owned()])
+        let delta = scan_protobuf_repository(root.path(), &participating_profiles())
             .unwrap()
             .unwrap();
         validate_cross_language_adapter_delta(&delta).unwrap();
@@ -3091,7 +3111,7 @@ service Broken { rpc Read (Request) returns (Missing); }
                 }
                 _ => unreachable!(),
             }
-            let delta = scan_protobuf_repository(root.path(), &["protobuf:production".to_owned()])
+            let delta = scan_protobuf_repository(root.path(), &participating_profiles())
                 .unwrap()
                 .unwrap();
             validate_cross_language_adapter_delta(&delta).unwrap();
@@ -3148,7 +3168,7 @@ service Broken { rpc Read (Request) returns (Missing); }
                 .join(format!("linked{PROTOBUF_DESCRIPTOR_SUFFIX}")),
         )
         .unwrap();
-        let delta = scan_protobuf_repository(root.path(), &["protobuf:production".to_owned()])
+        let delta = scan_protobuf_repository(root.path(), &participating_profiles())
             .unwrap()
             .unwrap();
         let coverage = &ledger(&delta).entries[0];
@@ -3172,7 +3192,7 @@ service Broken { rpc Read (Request) returns (Missing); }
     fn malformed_inputs_are_bounded_and_empty_repositories_are_ignored() {
         let root = tempfile::tempdir().unwrap();
         assert!(
-            scan_protobuf_repository(root.path(), &["protobuf:production".to_owned()])
+            scan_protobuf_repository(root.path(), &participating_profiles())
                 .unwrap()
                 .is_none()
         );
@@ -3188,7 +3208,7 @@ service Broken { rpc Read (Request) returns (Missing); }
             b"not-a-descriptor",
         )
         .unwrap();
-        let delta = scan_protobuf_repository(root.path(), &["protobuf:production".to_owned()])
+        let delta = scan_protobuf_repository(root.path(), &participating_profiles())
             .unwrap()
             .unwrap();
         let coverage = &ledger(&delta).entries[0];
