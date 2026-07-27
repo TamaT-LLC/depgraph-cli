@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Component, Path},
+    sync::Arc,
 };
 
 use crate::bounded_query::read_bounded_repository_file;
@@ -76,8 +77,6 @@ struct GeneratedRecord {
     manifest: Option<GeneratedManifest>,
     observations: BTreeMap<String, OutputObservation>,
     reason: Option<String>,
-    end_line: u32,
-    end_column: u32,
 }
 
 impl GeneratedRecord {
@@ -217,10 +216,12 @@ enum GeneratedProof {
     NamingOnly,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug)]
 struct OutputObservation {
     digest: Option<String>,
-    line_columns: Vec<u32>,
+    source: Option<Arc<str>>,
+    line_starts: Arc<[usize]>,
+    line_columns: Arc<[u32]>,
     reason: Option<String>,
 }
 
@@ -228,6 +229,7 @@ pub(super) fn inventory_generated_mappings(root: &Path) -> Result<GeneratedInven
     let mut records = Vec::new();
     let mut manifest_bytes = 0_usize;
     let mut output_bytes = 0_usize;
+    let mut observed_outputs = BTreeMap::<String, OutputObservation>::new();
     let mut mapping_count = 0_usize;
     let mut inventory_entries = 0_usize;
     let walker = WalkDir::new(root)
@@ -292,10 +294,6 @@ pub(super) fn inventory_generated_mappings(root: &Path) -> Result<GeneratedInven
         }
         manifest_bytes = total_manifest_bytes;
         let raw_digest = sha256_prefixed(&bytes);
-        let (end_line, end_column) = std::str::from_utf8(&bytes)
-            .ok()
-            .map(source_end_position)
-            .unwrap_or((1, 1));
         let mut manifest: GeneratedManifest = match serde_json::from_slice(&bytes) {
             Ok(manifest) => manifest,
             Err(_) => {
@@ -307,8 +305,6 @@ pub(super) fn inventory_generated_mappings(root: &Path) -> Result<GeneratedInven
                         manifest: None,
                         observations: BTreeMap::new(),
                         reason: Some("protobuf-generated-manifest-schema-is-invalid".to_owned()),
-                        end_line,
-                        end_column,
                     },
                 )?;
                 continue;
@@ -323,8 +319,6 @@ pub(super) fn inventory_generated_mappings(root: &Path) -> Result<GeneratedInven
                     manifest: None,
                     observations: BTreeMap::new(),
                     reason: Some(reason),
-                    end_line,
-                    end_column,
                 },
             )?;
             continue;
@@ -338,8 +332,6 @@ pub(super) fn inventory_generated_mappings(root: &Path) -> Result<GeneratedInven
                     manifest: None,
                     observations: BTreeMap::new(),
                     reason: Some("protobuf-generated-mapping-count-limit-exceeded".to_owned()),
-                    end_line,
-                    end_column,
                 },
             )?;
             continue;
@@ -353,10 +345,9 @@ pub(super) fn inventory_generated_mappings(root: &Path) -> Result<GeneratedInven
             .map(|mapping| mapping.output.as_str())
             .collect::<BTreeSet<_>>()
         {
-            observations.insert(
-                output.to_owned(),
-                observe_output(root, output, &mut output_bytes),
-            );
+            let observation =
+                observe_output_once(root, output, &mut output_bytes, &mut observed_outputs);
+            observations.insert(output.to_owned(), observation);
         }
         push_generated_inventory_record(
             &mut records,
@@ -366,8 +357,6 @@ pub(super) fn inventory_generated_mappings(root: &Path) -> Result<GeneratedInven
                 manifest: Some(manifest),
                 observations,
                 reason: None,
-                end_line,
-                end_column,
             },
         )?;
     }
@@ -403,8 +392,6 @@ fn skipped_record(locator: &str, reason: &str) -> GeneratedRecord {
         manifest: None,
         observations: BTreeMap::new(),
         reason: Some(reason.to_owned()),
-        end_line: 1,
-        end_column: 1,
     }
 }
 
@@ -457,6 +444,20 @@ fn validate_manifest(manifest: &mut GeneratedManifest) -> std::result::Result<()
     Ok(())
 }
 
+fn observe_output_once(
+    root: &Path,
+    relative: &str,
+    total_bytes: &mut usize,
+    observed_outputs: &mut BTreeMap<String, OutputObservation>,
+) -> OutputObservation {
+    if let Some(observation) = observed_outputs.get(relative) {
+        return observation.clone();
+    }
+    let observation = observe_output(root, relative, total_bytes);
+    observed_outputs.insert(relative.to_owned(), observation.clone());
+    observation
+}
+
 fn observe_output(root: &Path, relative: &str, total_bytes: &mut usize) -> OutputObservation {
     let path = root.join(relative);
     let bytes = match read_bounded_repository_file(root, &path, MAX_GENERATED_OUTPUT_BYTES) {
@@ -469,7 +470,9 @@ fn observe_output(root: &Path, relative: &str, total_bytes: &mut usize) -> Outpu
             };
             return OutputObservation {
                 digest: None,
-                line_columns: Vec::new(),
+                source: None,
+                line_starts: Arc::from(Vec::<usize>::new()),
+                line_columns: Arc::from(Vec::<u32>::new()),
                 reason: Some(reason.to_owned()),
             };
         }
@@ -477,14 +480,18 @@ fn observe_output(root: &Path, relative: &str, total_bytes: &mut usize) -> Outpu
     let Some(total_output_bytes) = total_bytes.checked_add(bytes.len()) else {
         return OutputObservation {
             digest: None,
-            line_columns: Vec::new(),
+            source: None,
+            line_starts: Arc::from(Vec::<usize>::new()),
+            line_columns: Arc::from(Vec::<u32>::new()),
             reason: Some("protobuf-generated-output-byte-limit-exceeded".to_owned()),
         };
     };
     if total_output_bytes > MAX_GENERATED_TOTAL_OUTPUT_BYTES {
         return OutputObservation {
             digest: None,
-            line_columns: Vec::new(),
+            source: None,
+            line_starts: Arc::from(Vec::<usize>::new()),
+            line_columns: Arc::from(Vec::<u32>::new()),
             reason: Some("protobuf-generated-output-byte-limit-exceeded".to_owned()),
         };
     }
@@ -495,17 +502,30 @@ fn observe_output(root: &Path, relative: &str, total_bytes: &mut usize) -> Outpu
         Err(_) => {
             return OutputObservation {
                 digest,
-                line_columns: Vec::new(),
+                source: None,
+                line_starts: Arc::from(Vec::<usize>::new()),
+                line_columns: Arc::from(Vec::<u32>::new()),
                 reason: Some("protobuf-generated-output-is-not-utf8".to_owned()),
             };
         }
     };
+    let line_starts = std::iter::once(0)
+        .chain(
+            source
+                .bytes()
+                .enumerate()
+                .filter_map(|(index, byte)| (byte == b'\n').then_some(index + 1)),
+        )
+        .collect::<Vec<_>>();
+    let line_columns = source
+        .split('\n')
+        .map(|line| u32::try_from(line.chars().count().saturating_add(1)).unwrap_or(u32::MAX))
+        .collect::<Vec<_>>();
     OutputObservation {
         digest,
-        line_columns: source
-            .split('\n')
-            .map(|line| u32::try_from(line.chars().count().saturating_add(1)).unwrap_or(u32::MAX))
-            .collect(),
+        source: Some(Arc::from(source)),
+        line_starts: Arc::from(line_starts),
+        line_columns: Arc::from(line_columns),
         reason: None,
     }
 }
@@ -534,6 +554,7 @@ fn valid_digest(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
+#[cfg(test)]
 fn source_end_position(source: &str) -> (u32, u32) {
     let mut line = 1_u32;
     let mut column = 1_u32;
@@ -571,6 +592,14 @@ impl Claim<'_> {
 
     fn endpoint_digest(&self) -> String {
         digest_value(&self.endpoint_key())
+    }
+
+    fn claim_digest(&self) -> String {
+        digest_value(&json!({
+            "endpoint": self.endpoint_key(),
+            "source_map_locator": self.record.locator,
+            "ordinal": self.ordinal,
+        }))
     }
 
     fn generator_digest(&self) -> String {
@@ -618,21 +647,23 @@ pub(super) fn apply_generated_mappings(
     }
 
     for endpoint_claims in claims_by_endpoint.into_values() {
-        let claim = &endpoint_claims[0];
+        let representative = &endpoint_claims[0];
         let mixed_generator = generators_by_output
-            .get(&claim.mapping.output)
+            .get(&representative.mapping.output)
             .is_some_and(|generators| generators.len() > 1);
         let conflicting_digest = declared_digests_by_output
-            .get(&claim.mapping.output)
+            .get(&representative.mapping.output)
             .is_some_and(|digests| digests.len() > 1);
-        let reason = mapping_failure_reason(
-            claim,
-            endpoint_claims.len(),
-            mixed_generator,
-            conflicting_digest,
-            builder,
-        );
-        emit_claim(builder, claim, reason.as_deref())?;
+        for claim in &endpoint_claims {
+            let reason = mapping_failure_reason(
+                claim,
+                endpoint_claims.len(),
+                mixed_generator,
+                conflicting_digest,
+                builder,
+            );
+            emit_claim(builder, claim, reason.as_deref())?;
+        }
     }
     Ok(())
 }
@@ -677,6 +708,9 @@ fn mapping_failure_reason(
     }
     if !valid_span(observation, claim.mapping) {
         return Some("protobuf-generated-source-span-is-invalid".to_owned());
+    }
+    if !span_contains_endpoint(observation, claim.mapping) {
+        return Some("protobuf-generated-source-symbol-mismatch".to_owned());
     }
     let Some(source) = builder.sources.get(&claim.manifest.source.path) else {
         return Some("protobuf-generated-source-is-not-admitted".to_owned());
@@ -758,6 +792,83 @@ fn valid_span(observation: &OutputObservation, mapping: &GeneratedMapping) -> bo
     mapping.start_column <= *start_columns && mapping.end_column <= *end_columns
 }
 
+fn span_contains_endpoint(observation: &OutputObservation, mapping: &GeneratedMapping) -> bool {
+    let Some(source) = observation.source.as_deref() else {
+        return false;
+    };
+    let Some(symbol) = terminal_symbol(&mapping.endpoint) else {
+        return false;
+    };
+    let start_line = mapping.start_line.saturating_sub(1) as usize;
+    let end_line = mapping.end_line.saturating_sub(1) as usize;
+    (start_line..=end_line).any(|line_index| {
+        let Some(line) = source_line(source, &observation.line_starts, line_index) else {
+            return false;
+        };
+        let start_column = if line_index == start_line {
+            mapping.start_column
+        } else {
+            1
+        };
+        let end_column = if line_index == end_line {
+            mapping.end_column
+        } else {
+            line.chars()
+                .count()
+                .saturating_add(1)
+                .try_into()
+                .unwrap_or(u32::MAX)
+        };
+        source_columns(line, start_column, end_column)
+            .is_some_and(|span| contains_identifier(span, symbol))
+    })
+}
+
+fn terminal_symbol(coordinate: &str) -> Option<&str> {
+    let symbol = coordinate
+        .rsplit([':', '.', '#', '/'])
+        .find(|part| !part.is_empty())?;
+    (!symbol.is_empty()
+        && symbol
+            .chars()
+            .all(|character| character == '_' || character == '$' || character.is_alphanumeric()))
+    .then_some(symbol)
+}
+
+fn source_line<'a>(source: &'a str, line_starts: &[usize], index: usize) -> Option<&'a str> {
+    let start = *line_starts.get(index)?;
+    let end = line_starts
+        .get(index + 1)
+        .map_or(source.len(), |next| next.saturating_sub(1));
+    source.get(start..end)
+}
+
+fn source_columns(source: &str, start_column: u32, end_column: u32) -> Option<&str> {
+    let start_character = usize::try_from(start_column.checked_sub(1)?).ok()?;
+    let end_character = usize::try_from(end_column.checked_sub(1)?).ok()?;
+    let start = source.char_indices().nth(start_character).map_or_else(
+        || (start_character == source.chars().count()).then_some(source.len()),
+        |item| Some(item.0),
+    )?;
+    let end = source.char_indices().nth(end_character).map_or_else(
+        || (end_character == source.chars().count()).then_some(source.len()),
+        |item| Some(item.0),
+    )?;
+    (start <= end).then(|| &source[start..end])
+}
+
+fn contains_identifier(source: &str, identifier: &str) -> bool {
+    source.match_indices(identifier).any(|(start, matched)| {
+        let before = source[..start].chars().next_back();
+        let after = source[start + matched.len()..].chars().next();
+        !before.is_some_and(identifier_character) && !after.is_some_and(identifier_character)
+    })
+}
+
+fn identifier_character(character: char) -> bool {
+    character == '_' || character == '$' || character.is_alphanumeric()
+}
+
 fn contract_target_id(builder: &ProtobufGraphBuilder, claim: &Claim<'_>) -> Option<String> {
     let source_path = &claim.manifest.source.path;
     match claim.mapping.target_kind {
@@ -795,9 +906,9 @@ fn emit_claim(
     let identity = format!(
         "generated:{}",
         claim
-            .endpoint_digest()
+            .claim_digest()
             .strip_prefix("sha256:")
-            .expect("generated endpoint digests use sha256")
+            .expect("generated claim digests use sha256")
     );
     if let Some(reason) = reason {
         let unknown = builder.unknown_node(&claim.record.locator, &identity, reason)?;
@@ -914,18 +1025,6 @@ fn generated_endpoint(builder: &mut ProtobufGraphBuilder, claim: &Claim<'_>) -> 
                 "repository_path".to_owned(),
                 Value::String(claim.mapping.output.clone()),
             ),
-            (
-                "generator_identity".to_owned(),
-                Value::String(claim.generator_digest()),
-            ),
-            (
-                "descriptor_digest".to_owned(),
-                Value::String(claim.manifest.descriptor.digest.clone()),
-            ),
-            (
-                "source_map_digest".to_owned(),
-                Value::String(claim.record.digest.clone()),
-            ),
         ]),
     };
     insert_same(&mut builder.nodes, id.clone(), node)
@@ -946,25 +1045,20 @@ fn emit_relation(
     reason: Option<&str>,
 ) -> Result<()> {
     let observation = claim.record.observations.get(&claim.mapping.output);
-    let use_output_span = observation.is_some_and(|observation| {
-        observation.reason.is_none() && valid_span(observation, claim.mapping)
-    });
+    let use_output_span = reason.is_none()
+        && observation.is_some_and(|observation| {
+            observation.reason.is_none() && valid_span(observation, claim.mapping)
+        });
     let (path, start_line, start_column, end_line, end_column) = if use_output_span {
         (
-            claim.mapping.output.clone(),
-            claim.mapping.start_line,
-            claim.mapping.start_column,
-            claim.mapping.end_line,
-            claim.mapping.end_column,
+            Some(claim.mapping.output.clone()),
+            Some(claim.mapping.start_line),
+            Some(claim.mapping.start_column),
+            Some(claim.mapping.end_line),
+            Some(claim.mapping.end_column),
         )
     } else {
-        (
-            claim.record.locator.clone(),
-            1,
-            1,
-            claim.record.end_line,
-            claim.record.end_column,
-        )
+        (None, None, None, None, None)
     };
     let condition = Condition::All {
         conditions: vec![
@@ -991,11 +1085,11 @@ fn emit_relation(
         kind: EvidenceKind::Semantic,
         extractor: GENERATED_EXTRACTOR.to_owned(),
         extractor_version: env!("CARGO_PKG_VERSION").to_owned(),
-        path: Some(path),
-        start_line: Some(start_line),
-        start_column: Some(start_column),
-        end_line: Some(end_line),
-        end_column: Some(end_column),
+        path,
+        start_line,
+        start_column,
+        end_line,
+        end_column,
         detail: None,
         properties: Properties::from([
             (
@@ -1025,7 +1119,7 @@ fn emit_relation(
             ),
             (
                 "artifact_identity".to_owned(),
-                Value::String(claim.record.digest.clone()),
+                Value::String(claim.claim_digest()),
             ),
             ("ordinal".to_owned(), Value::from(claim.ordinal)),
             (
@@ -1137,7 +1231,7 @@ mod tests {
     use depgraph_protocol::{
         CROSS_LANGUAGE_COMPLETENESS_PROPERTY, CrossLanguageCapabilityStatus,
         CrossLanguageCompletenessLedger, CrossLanguageMappingKind, CrossLanguageRelationKind,
-        ResolutionStatus, validate_cross_language_adapter_delta,
+        Profile, ResolutionStatus, validate_cross_language_adapter_delta,
     };
     use prost::Message as _;
     use prost_types::{
@@ -1226,6 +1320,20 @@ service Greeter {
         )
     }
 
+    fn participating_profiles() -> Vec<Profile> {
+        vec![Profile {
+            id: "polyglot:production".to_owned(),
+            language: "polyglot".to_owned(),
+            toolchain: None,
+            command: None,
+            target: None,
+            features: Vec::new(),
+            environment: BTreeMap::new(),
+            source_revision: None,
+            properties: BTreeMap::new(),
+        }]
+    }
+
     #[derive(Clone, Copy)]
     struct MappingFixture<'a> {
         language: &'a str,
@@ -1249,6 +1357,8 @@ service Greeter {
     ) {
         let output = root.join(fixture.output);
         let output_bytes = fs::read(&output).unwrap();
+        let (end_line, end_column) =
+            source_end_position(std::str::from_utf8(&output_bytes).unwrap());
         let manifest = json!({
             "schema_version": PROTOBUF_GENERATED_MAPPING_SCHEMA_VERSION,
             "generator": {"name": fixture.generator, "version": fixture.version},
@@ -1273,8 +1383,8 @@ service Greeter {
                 "proof": proof,
                 "start_line": 1,
                 "start_column": 1,
-                "end_line": 1,
-                "end_column": 8
+                "end_line": end_line,
+                "end_column": end_column
             }]
         });
         fs::write(
@@ -1361,7 +1471,7 @@ service Greeter {
             &descriptor_digest,
         );
 
-        let delta = scan_protobuf_repository(root.path(), &["polyglot:production".to_owned()])
+        let delta = scan_protobuf_repository(root.path(), &participating_profiles())
             .unwrap()
             .unwrap();
         validate_cross_language_adapter_delta(&delta).unwrap();
@@ -1412,10 +1522,10 @@ service Greeter {
                 &descriptor_digest,
             );
         }
-        let first = scan_protobuf_repository(first.path(), &["polyglot:production".to_owned()])
+        let first = scan_protobuf_repository(first.path(), &participating_profiles())
             .unwrap()
             .unwrap();
-        let second = scan_protobuf_repository(second.path(), &["polyglot:production".to_owned()])
+        let second = scan_protobuf_repository(second.path(), &participating_profiles())
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -1469,7 +1579,7 @@ service Greeter {
                 &claimed_source,
                 &claimed_descriptor,
             );
-            let delta = scan_protobuf_repository(root.path(), &["polyglot:production".to_owned()])
+            let delta = scan_protobuf_repository(root.path(), &participating_profiles())
                 .unwrap()
                 .unwrap();
             assert_eq!(exact_generated_edge_count(&delta), 0, "{name}");
@@ -1524,17 +1634,25 @@ service Greeter {
             &source_digest,
             &descriptor_digest,
         );
-        let delta = scan_protobuf_repository(root.path(), &["polyglot:production".to_owned()])
+        let delta = scan_protobuf_repository(root.path(), &participating_profiles())
             .unwrap()
             .unwrap();
         assert_eq!(exact_generated_edge_count(&delta), 0);
-        assert!(delta.sites.iter().any(|site| {
-            site.reason.as_deref() == Some("ambiguous-protobuf-generated-endpoint-provenance")
-        }));
+        assert_eq!(
+            delta
+                .sites
+                .iter()
+                .filter(|site| {
+                    site.reason.as_deref()
+                        == Some("ambiguous-protobuf-generated-endpoint-provenance")
+                })
+                .count(),
+            2
+        );
 
         fs::remove_file(root.path().join(format!("two{GENERATED_MANIFEST_SUFFIX}"))).unwrap();
         fs::write(root.path().join("generated/go.go"), "tampered output\n").unwrap();
-        let delta = scan_protobuf_repository(root.path(), &["polyglot:production".to_owned()])
+        let delta = scan_protobuf_repository(root.path(), &participating_profiles())
             .unwrap()
             .unwrap();
         assert_eq!(exact_generated_edge_count(&delta), 0);
@@ -1555,13 +1673,75 @@ service Greeter {
             &source_digest,
             &descriptor_digest,
         );
-        let delta = scan_protobuf_repository(root.path(), &["polyglot:production".to_owned()])
+        let delta = scan_protobuf_repository(root.path(), &participating_profiles())
             .unwrap()
             .unwrap();
         assert_eq!(exact_generated_edge_count(&delta), 0);
         assert!(delta.sites.iter().any(|site| {
             site.reason.as_deref() == Some("unsupported-protobuf-generated-toolchain")
         }));
+    }
+
+    #[test]
+    fn generated_source_span_must_contain_the_declared_endpoint_symbol() {
+        let root = tempfile::tempdir().unwrap();
+        let (source_digest, descriptor_digest, _) = initialize(root.path());
+        fs::write(root.path().join("generated/go.go"), "Unrelated call\n").unwrap();
+        write_manifest(
+            root.path(),
+            "go",
+            MappingFixture {
+                language: "go",
+                generator: "protoc-gen-go-grpc",
+                version: "1.5.1",
+                target_kind: "method",
+                role: "client",
+                coordinate: "demo.v1.Greeter/SayHello",
+                endpoint: "demo.GreeterClient.SayHello",
+                output: "generated/go.go",
+            },
+            true,
+            "generator_source_map",
+            &source_digest,
+            &descriptor_digest,
+        );
+
+        let delta = scan_protobuf_repository(root.path(), &participating_profiles())
+            .unwrap()
+            .unwrap();
+        assert_eq!(exact_generated_edge_count(&delta), 0);
+        assert!(delta.sites.iter().any(|site| {
+            site.reason.as_deref() == Some("protobuf-generated-source-symbol-mismatch")
+        }));
+    }
+
+    #[test]
+    fn shared_generated_output_is_charged_to_the_byte_budget_once() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("generated")).unwrap();
+        let output = b"Shared\n";
+        fs::write(root.path().join("generated/shared.rs"), output).unwrap();
+        let mut total_bytes = MAX_GENERATED_TOTAL_OUTPUT_BYTES - output.len();
+        let mut observed_outputs = BTreeMap::new();
+
+        let first = observe_output_once(
+            root.path(),
+            "generated/shared.rs",
+            &mut total_bytes,
+            &mut observed_outputs,
+        );
+        assert!(first.reason.is_none());
+        assert_eq!(total_bytes, MAX_GENERATED_TOTAL_OUTPUT_BYTES);
+        let second = observe_output_once(
+            root.path(),
+            "generated/shared.rs",
+            &mut total_bytes,
+            &mut observed_outputs,
+        );
+
+        assert!(second.reason.is_none());
+        assert_eq!(second.digest, first.digest);
+        assert_eq!(total_bytes, MAX_GENERATED_TOTAL_OUTPUT_BYTES);
     }
 
     #[cfg(unix)]
@@ -1625,7 +1805,7 @@ service Greeter {
             &source_digest,
             &descriptor_digest,
         );
-        let delta = scan_protobuf_repository(root.path(), &["polyglot:production".to_owned()])
+        let delta = scan_protobuf_repository(root.path(), &participating_profiles())
             .unwrap()
             .unwrap();
         assert!(delta.sites.iter().any(|site| {
