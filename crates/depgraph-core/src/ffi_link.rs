@@ -184,7 +184,7 @@ pub fn correlate_ffi_link_observation(
         bail!("FFI link observation does not match the static profile identity");
     }
 
-    let eligible = static_delta
+    let mut eligible = static_delta
         .sites
         .iter()
         .filter_map(|site| StaticFfiSite::parse(site, &observation.profile_id).transpose())
@@ -192,6 +192,7 @@ pub fn correlate_ffi_link_observation(
     if eligible.is_empty() {
         bail!("FFI link observation has no eligible static declaration");
     }
+    eligible.sort_by(|left, right| left.site.id.as_bytes().cmp(right.site.id.as_bytes()));
     let eligible_ids = eligible
         .iter()
         .map(|site| site.site.id.clone())
@@ -233,7 +234,7 @@ pub fn correlate_ffi_link_observation(
     for (ordinal, static_site) in eligible.iter().enumerate() {
         let entry = entries
             .get(static_site.site.id.as_str())
-            .expect("eligible and observed IDs were compared");
+            .context("eligible FFI declaration disappeared from the validated observation")?;
         static_site.validate_entry(entry)?;
         let native_symbol = static_site
             .site
@@ -761,8 +762,10 @@ fn prefixed_sha256(value: &str) -> bool {
 fn bounded_atom(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= MAX_TEXT
-        && !value.chars().any(char::is_control)
-        && !value.contains(['?', '#', '\\'])
+        && value.is_ascii()
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b':' | b'+' | b'-')
+        })
 }
 
 fn safe_symbol(value: &str) -> bool {
@@ -940,6 +943,32 @@ mod tests {
         );
         tampered.entries[0].library_artifact_digest = "sha256:tampered".to_owned();
         assert!(correlate_ffi_link_observation(&delta, &tampered).is_err());
+
+        let complete = observation(
+            "linux",
+            sites
+                .iter()
+                .enumerate()
+                .map(|(index, site)| {
+                    entry_for(
+                        site,
+                        "c",
+                        "import",
+                        "crypto",
+                        site_symbol(site),
+                        (b'a' + index as u8) as char,
+                    )
+                })
+                .collect(),
+        );
+        let expected = correlate_ffi_link_observation(&delta, &complete).unwrap();
+        let mut reordered = delta.clone();
+        reordered.sites.reverse();
+        validate_cross_language_adapter_delta(&reordered).unwrap();
+        assert_eq!(
+            correlate_ffi_link_observation(&reordered, &complete).unwrap(),
+            expected
+        );
         assert_eq!(
             delta
                 .edges
@@ -987,6 +1016,22 @@ mod tests {
             collect_supervised_ffi_link_observation(&allowed, "x86_64", "dynamic", vec![secret])
                 .unwrap_err()
                 .to_string();
+        assert!(!error.contains("hidden"));
+        let error = collect_supervised_ffi_link_observation(
+            &allowed,
+            "x86_64?token=hidden",
+            "dynamic",
+            vec![FfiObservedLink {
+                declaration_site_id: "site".to_owned(),
+                abi: "c".to_owned(),
+                direction: "import".to_owned(),
+                library: "crypto".to_owned(),
+                symbol: "digest".to_owned(),
+                library_artifact_digest: digest('a'),
+            }],
+        )
+        .unwrap_err()
+        .to_string();
         assert!(!error.contains("hidden"));
         let mut unknown = serde_json::to_value(valid).unwrap();
         unknown["raw_linker_output"] = Value::String("forbidden".to_owned());
