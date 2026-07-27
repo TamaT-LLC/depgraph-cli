@@ -2533,6 +2533,10 @@ mod tests {
             .unwrap();
         assert_ne!(second_id, first_id);
         assert!(store.verify_snapshot_integrity(&second_id).unwrap().valid);
+        assert_eq!(
+            store.load_completed_snapshot_profiles(&second_id).unwrap(),
+            base_snapshot.profiles
+        );
         let second = store.load_completed_snapshot(&second_id).unwrap();
         assert_eq!(second.sites, base_snapshot.sites);
         assert_eq!(
