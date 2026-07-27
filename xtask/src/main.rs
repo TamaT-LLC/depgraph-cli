@@ -3499,7 +3499,13 @@ fn evaluate_stable_release_gate(
         && release.targets.iter().all(|target| {
             target
                 .cross_language_graph_digest
-                .starts_with("cross-language-release-graph:sha256:")
+                .strip_prefix("cross-language-release-graph:sha256:")
+                .is_some_and(|digest| {
+                    digest.len() == 64
+                        && digest
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                })
                 && [
                     target.cross_language_smoke_sha256.as_str(),
                     target.cross_language_export_sha256.as_str(),
@@ -11103,6 +11109,16 @@ mod tests {
         cross_language_drift.targets[0].cross_language_query_sha256 = "0".repeat(64);
         assert_eq!(
             evaluate(&cross_language_drift, &benchmark).decision,
+            StableReleaseDecision::Reject
+        );
+
+        let mut malformed_cross_language_digest = release.clone();
+        for target in &mut malformed_cross_language_digest.targets {
+            target.cross_language_graph_digest =
+                format!("cross-language-release-graph:sha256:{}", "7".repeat(65));
+        }
+        assert_eq!(
+            evaluate(&malformed_cross_language_digest, &benchmark).decision,
             StableReleaseDecision::Reject
         );
 
