@@ -679,6 +679,7 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "| 1 | Common node/site/edge DTO, validator, coverage ledger, and cross-format golden harness | Implemented in #191 |",
         "| 2 | OpenAPI 3.1 repository parser and contract graph | Implemented in #192 |",
         "| 3 | OpenAPI generated-client/provider repository mapping | Implemented in #193 |",
+        "| 4 | Protobuf source/descriptor contract graph | Implemented in #194 |",
         "| 11 | Five-target package/query/release gate | 2-3 days |",
         "## Acceptance matrix",
         "| Safe invariant |",

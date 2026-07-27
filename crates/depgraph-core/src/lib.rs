@@ -24,6 +24,7 @@ pub mod profile_selection_preview;
 pub mod profile_selection_rank;
 pub mod profile_selection_rust;
 pub mod profile_selection_web;
+pub mod protobuf;
 pub mod query;
 pub mod runtime_trace;
 pub mod rust_build_observer;
@@ -211,6 +212,11 @@ pub use profile_selection_rust::{
     RustProfileAvailability, RustProfileCandidateGenerationResult, RustProfilePlanningInput,
     RustRejectedProfileDeclaration, RustRootFeatureDeclaration, RustStaticProfileEvidence,
     RustTargetDeclaration, generate_rust_profile_candidates,
+};
+pub use protobuf::{
+    MAX_PROTOBUF_DEPTH, MAX_PROTOBUF_DESCRIPTOR_BYTES, MAX_PROTOBUF_DESCRIPTOR_FILES,
+    MAX_PROTOBUF_FILE_BYTES, MAX_PROTOBUF_FILES, MAX_PROTOBUF_TOKENS, MAX_PROTOBUF_TOTAL_BYTES,
+    PROTOBUF_CAPABILITY, PROTOBUF_DESCRIPTOR_SUFFIX, scan_protobuf_repository,
 };
 pub use query::{
     CycleLevel, CycleResult, GraphQueryFilter, TraversalResult, UnresolvedResult, WhyResult,
