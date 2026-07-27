@@ -361,6 +361,7 @@ struct BoundedQueryPackageSmokeReport {
 struct CrossLanguagePackageSmokeReport {
     schema_version: String,
     target: String,
+    archive_sha256: String,
     contract: depgraph_core::CrossLanguageReleaseCompatibilityHealth,
     graph_digest: String,
     canonical_export_sha256: String,
@@ -3159,7 +3160,7 @@ fn verify_release_assets(directory: &Path, requested_targets: &[String]) -> Resu
         let cross_language_smoke: CrossLanguagePackageSmokeReport =
             serde_json::from_slice(&cross_language_smoke_bytes)
                 .context("packaged cross-language smoke report has an invalid schema")?;
-        validate_cross_language_package_smoke(&cross_language_smoke, target)?;
+        validate_cross_language_package_smoke(&cross_language_smoke, target, &archive_sha256)?;
         targets.push(verify_published_release_tree(
             &extracted,
             target,
@@ -3308,9 +3309,12 @@ fn validate_bounded_query_package_smoke(
 fn validate_cross_language_package_smoke(
     report: &CrossLanguagePackageSmokeReport,
     target: &str,
+    archive_sha256: &str,
 ) -> Result<()> {
     if report.schema_version != CROSS_LANGUAGE_PACKAGE_SMOKE_SCHEMA_VERSION
         || report.target != target
+        || report.archive_sha256 != archive_sha256
+        || !lowercase_sha256(&report.archive_sha256)
         || report.contract != depgraph_core::cross_language_release_compatibility_contract()
         || !prefixed_lowercase_sha256(&report.graph_digest, "cross-language-release-graph:sha256:")
         || !lowercase_sha256(&report.canonical_export_sha256)
@@ -4347,6 +4351,7 @@ fn cross_language_fixture_export(root: &Path) -> Result<(Value, Value)> {
 fn verify_packaged_cross_language(
     extracted: &Path,
     target: &str,
+    archive_sha256: &str,
 ) -> Result<CrossLanguagePackageSmokeReport> {
     let fixture_path = extracted.join(depgraph_core::CROSS_LANGUAGE_RELEASE_SMOKE_FIXTURE_PATH);
     let fixture: CrossLanguageReleaseFixture = serde_json::from_slice(&fs::read(&fixture_path)?)
@@ -4365,6 +4370,7 @@ fn verify_packaged_cross_language(
     Ok(CrossLanguagePackageSmokeReport {
         schema_version: CROSS_LANGUAGE_PACKAGE_SMOKE_SCHEMA_VERSION.to_owned(),
         target: target.to_owned(),
+        archive_sha256: archive_sha256.to_owned(),
         contract: depgraph_core::cross_language_release_compatibility_contract(),
         graph_digest: depgraph_protocol::stable_id_from_value(
             "cross-language-release-graph",
@@ -4494,7 +4500,7 @@ fn verify_archive(
         &archive_sha256,
     )?;
     let cross_language_smoke =
-        verify_packaged_cross_language(&extracted, &release_manifest.target)?;
+        verify_packaged_cross_language(&extracted, &release_manifest.target, &archive_sha256)?;
     verify_packaged_web_runtime_fails_closed(&executable, &extracted, &verify_root, &fixture)?;
     let semantic_complete_fixture =
         Path::new("workers/web/test/fixtures/semantic-complete").canonicalize()?;
@@ -10822,8 +10828,9 @@ mod tests {
     #[test]
     fn cross_language_package_smoke_is_deterministic_and_tamper_closed() -> Result<()> {
         let target = "x86_64-unknown-linux-gnu";
-        let report = verify_packaged_cross_language(&workspace_root(), target)?;
-        validate_cross_language_package_smoke(&report, target)?;
+        let archive_sha256 = "a".repeat(64);
+        let report = verify_packaged_cross_language(&workspace_root(), target, &archive_sha256)?;
+        validate_cross_language_package_smoke(&report, target, &archive_sha256)?;
         assert_eq!(
             report.schema_version,
             CROSS_LANGUAGE_PACKAGE_SMOKE_SCHEMA_VERSION
@@ -10834,12 +10841,19 @@ mod tests {
                 .starts_with("cross-language-release-graph:sha256:")
         );
 
+        let mut archive_drifted = report.clone();
+        archive_drifted.archive_sha256 = "b".repeat(64);
+        assert!(
+            validate_cross_language_package_smoke(&archive_drifted, target, &archive_sha256)
+                .is_err()
+        );
+
         let mut drifted = CrossLanguagePackageSmokeReport {
             contract: report.contract.clone(),
             ..report
         };
         drifted.contract.capabilities.pop();
-        assert!(validate_cross_language_package_smoke(&drifted, target).is_err());
+        assert!(validate_cross_language_package_smoke(&drifted, target, &archive_sha256).is_err());
         Ok(())
     }
 
