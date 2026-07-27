@@ -69,7 +69,7 @@ pub fn parse_explicit_profile_selection_file(
 
     let mut profiles = Vec::with_capacity(file.profiles.len());
     for axes in file.profiles {
-        validate_canonical_axes_order(&axes)?;
+        validate_explicit_profile_axes(&axes)?;
         profiles.push(ProfileSelectionProfile {
             id: canonical_profile_id(&axes),
             axes,
@@ -101,6 +101,12 @@ pub fn plan_explicit_profile_selection(
         || explicit.profiles.len() > usize::try_from(MAX_SELECTED_ROOT_PROFILES)?
     {
         bail!("explicit profile selection is outside the hard profile cap");
+    }
+    for profile in &explicit.profiles {
+        validate_explicit_profile_axes(&profile.axes)?;
+        if profile.id != canonical_profile_id(&profile.axes) {
+            bail!("explicit profile selection contains a non-canonical profile ID");
+        }
     }
     if explicit
         .profiles
@@ -286,6 +292,9 @@ impl ExplicitProfileCapabilities {
                 }
             }
             CanonicalProfileAxes::Go(axes) => {
+                if axes.cgo_enabled {
+                    bail!("explicit profiles file cannot enable unsupported Go CGO");
+                }
                 if !self
                     .go_platforms
                     .contains(&(axes.goos.clone(), axes.goarch.clone()))
@@ -351,12 +360,15 @@ fn explicit_candidate(profile: &ProfileSelectionProfile) -> ProfileCandidateReco
     candidate
 }
 
-fn validate_canonical_axes_order(axes: &CanonicalProfileAxes) -> Result<()> {
+fn validate_explicit_profile_axes(axes: &CanonicalProfileAxes) -> Result<()> {
     match axes {
         CanonicalProfileAxes::Rust(axes) => {
             validate_sorted_unique("Rust explicit features", &axes.features)?;
         }
         CanonicalProfileAxes::Go(axes) => {
+            if axes.cgo_enabled {
+                bail!("explicit profiles file cannot enable unsupported Go CGO");
+            }
             validate_sorted_unique("Go explicit tags", &axes.tags)?;
         }
         CanonicalProfileAxes::Web(axes) => {
@@ -635,6 +647,22 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("strictly sorted")
+        );
+
+        let mut cgo = go();
+        let CanonicalProfileAxes::Go(axes) = &mut cgo else {
+            unreachable!()
+        };
+        axes.cgo_enabled = true;
+        let invalid = ExplicitProfileSelectionFile {
+            contract_version: DEFAULT_PROFILE_SELECTION_CONTRACT_VERSION.to_owned(),
+            profiles: vec![cgo],
+        };
+        assert!(
+            parse_explicit_profile_selection_file(&serde_json::to_string(&invalid)?)
+                .unwrap_err()
+                .to_string()
+                .contains("CGO")
         );
         Ok(())
     }

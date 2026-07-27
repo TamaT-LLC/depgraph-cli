@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, fs, path::Path};
+use std::{collections::BTreeMap, path::Path};
 
 use anyhow::{Context, Result, bail};
 use depgraph_protocol::stable_id_from_value;
@@ -7,6 +7,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use walkdir::{DirEntry, WalkDir};
 
+use crate::bounded_query::read_bounded_repository_file;
 use crate::profile_selection_web::{
     WEB_PROFILE_PLANNING_VERSION, WebAutomaticBoundaryKind, WebProfileCandidateGenerationResult,
     WebProfilePlanningInput, WebRejectedProfileDeclaration, WebStaticProfileEvidence,
@@ -28,9 +29,10 @@ use crate::{
     profile_planning_build_unit_id,
 };
 
-const MAX_PREVIEW_FILE_BYTES: u64 = 16 * 1024 * 1024;
-const MAX_PREVIEW_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_PREVIEW_FILE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_PREVIEW_TOTAL_BYTES: usize = 512 * 1024 * 1024;
 const MAX_PREVIEW_FILES: usize = 1_000_000;
+const MAX_PREVIEW_ENTRIES: usize = 1_000_000;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -238,13 +240,15 @@ pub fn build_repository_profile_planning_inventory(
     }
     let mut files = Vec::new();
     let mut build_units = Vec::new();
-    let mut total_bytes = 0_u64;
+    let mut total_bytes = 0_usize;
+    let mut entry_count = 0_usize;
     for entry in WalkDir::new(&canonical_root)
         .follow_links(false)
         .into_iter()
         .filter_entry(include_entry)
     {
         let entry = entry.context("failed to inspect repository profile inventory")?;
+        record_preview_entry(&mut entry_count)?;
         if !entry.file_type().is_file() {
             continue;
         }
@@ -262,19 +266,17 @@ pub fn build_repository_profile_planning_inventory(
         if files.len() >= MAX_PREVIEW_FILES {
             bail!("profile preview exceeds its closed file-count limit");
         }
-        let metadata = entry
-            .metadata()
-            .context("failed to inspect profile inventory file")?;
-        if metadata.len() > MAX_PREVIEW_FILE_BYTES {
-            bail!("profile preview file exceeds its closed byte limit");
-        }
+        let bytes =
+            read_bounded_repository_file(&canonical_root, entry.path(), MAX_PREVIEW_FILE_BYTES)
+                .map_err(|error| {
+                    anyhow::anyhow!("failed to read bounded profile inventory file: {error}")
+                })?;
         total_bytes = total_bytes
-            .checked_add(metadata.len())
+            .checked_add(bytes.len())
             .context("profile preview byte count overflow")?;
         if total_bytes > MAX_PREVIEW_TOTAL_BYTES {
             bail!("profile preview exceeds its closed total byte limit");
         }
-        let bytes = fs::read(entry.path()).context("failed to read profile inventory file")?;
         files.push(ProfilePlanningFile {
             path: path.clone(),
             kind,
@@ -295,6 +297,16 @@ pub fn build_repository_profile_planning_inventory(
         files,
         build_units,
     })
+}
+
+fn record_preview_entry(entry_count: &mut usize) -> Result<()> {
+    *entry_count = entry_count
+        .checked_add(1)
+        .context("profile preview entry count overflow")?;
+    if *entry_count > MAX_PREVIEW_ENTRIES {
+        bail!("profile preview exceeds its closed entry-count limit");
+    }
+    Ok(())
 }
 
 fn generate_rust_preview(
@@ -612,6 +624,8 @@ fn go_host_platform() -> Result<(&'static str, &'static str)> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use crate::{
         ProfileCandidateKind, ProfileExclusionReason, ProfileSelectedReason,
         canonical_profile_selection_json,
@@ -715,6 +729,20 @@ mod tests {
                 .policy_excluded
                 .iter()
                 .any(|entry| entry.reason == ProfileExclusionReason::DefaultProfileUnsupportedAxis)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn entry_limit_counts_every_walked_entry_before_file_classification() -> Result<()> {
+        let mut entry_count = MAX_PREVIEW_ENTRIES - 1;
+        record_preview_entry(&mut entry_count)?;
+        assert_eq!(entry_count, MAX_PREVIEW_ENTRIES);
+        assert!(
+            record_preview_entry(&mut entry_count)
+                .unwrap_err()
+                .to_string()
+                .contains("entry-count")
         );
         Ok(())
     }
