@@ -154,8 +154,12 @@ pub fn validate_cross_language_worker_protocol(protocol: &ValidatedProtocol) -> 
         let relation: CrossLanguageRelationKind =
             serde_json::from_value(Value::String(site.kind.clone()))
                 .with_context(|| format!("cross-language site {} relation", site.id))?;
+        let primary_evidence = site
+            .evidence
+            .first()
+            .with_context(|| format!("cross-language site {} has no evidence", site.id))?;
         let evidence: CrossLanguageEvidenceProperties = serde_json::from_value(Value::Object(
-            site.evidence[0].properties.clone().into_iter().collect(),
+            primary_evidence.properties.clone().into_iter().collect(),
         ))
         .with_context(|| format!("cross-language site {} evidence", site.id))?;
         if relation != evidence.occurrence_kind
@@ -200,8 +204,12 @@ pub fn validate_cross_language_worker_protocol(protocol: &ValidatedProtocol) -> 
                 edge.id
             )
         })?;
+        let primary_evidence = edge
+            .evidence
+            .first()
+            .with_context(|| format!("cross-language edge {} has no evidence", edge.id))?;
         let evidence: CrossLanguageEvidenceProperties = serde_json::from_value(Value::Object(
-            edge.evidence[0].properties.clone().into_iter().collect(),
+            primary_evidence.properties.clone().into_iter().collect(),
         ))
         .with_context(|| format!("cross-language edge {} evidence", edge.id))?;
         if relation != evidence.occurrence_kind
@@ -301,6 +309,26 @@ mod tests {
             .properties
             .remove("canonical_identity");
         assert!(validate_cross_language_worker_protocol(&missing_identity).is_err());
+
+        let mut missing_site_evidence = protocol.clone();
+        missing_site_evidence
+            .sites
+            .values_mut()
+            .next()
+            .unwrap()
+            .evidence
+            .clear();
+        assert!(validate_cross_language_worker_protocol(&missing_site_evidence).is_err());
+
+        let mut missing_edge_evidence = protocol.clone();
+        missing_edge_evidence
+            .edges
+            .values_mut()
+            .next()
+            .unwrap()
+            .evidence
+            .clear();
+        assert!(validate_cross_language_worker_protocol(&missing_edge_evidence).is_err());
 
         let mut drifted = protocol;
         let profile = drifted.profiles.values_mut().next().unwrap();
