@@ -1864,6 +1864,8 @@ let raw = r#"extern "C" { fn raw_string(); }"#;
 let multiline = r##"
 extern "C" { fn multiline_raw_string(); }
 "##;
+type Callback = extern "C" fn();
+pub type UnsafeCallback = unsafe extern "C" fn();
 extern "C" { fn admitted(); }
 fn ordinary() {}
 static ORDINARY: i32 = 0;
