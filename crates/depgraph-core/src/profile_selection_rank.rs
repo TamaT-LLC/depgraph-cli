@@ -228,18 +228,7 @@ pub fn profile_selection_doctor_status(
     strict: bool,
 ) -> Result<ProfileSelectionDoctorStatus> {
     validate_profile_selection_plan(plan)?;
-    let mut reasons = BTreeSet::new();
-    if !plan.omitted.is_empty() {
-        reasons.insert(ProfileMatrixIncompleteReason::DefaultProfileBudgetExhausted);
-    }
-    if plan.discovery.iter().any(|entry| !entry.complete) {
-        reasons.insert(ProfileMatrixIncompleteReason::DefaultProfileCandidateLimitExceeded);
-    }
-    for exclusion in &plan.policy_excluded {
-        if let Some(reason) = incomplete_exclusion_reason(exclusion.reason) {
-            reasons.insert(reason);
-        }
-    }
+    let reasons = profile_matrix_incomplete_reasons(plan);
     let default_profile_matrix_complete = reasons.is_empty();
     let mut remediation = Vec::new();
     if !plan.omitted.is_empty() {
@@ -262,8 +251,8 @@ pub fn profile_selection_doctor_status(
 
 pub fn profile_selection_human_summary(plan: &DefaultProfileSelectionPlan) -> Result<String> {
     validate_profile_selection_plan(plan)?;
-    if plan.summary.omitted_profile_count == 0 {
-        return Ok(format!(
+    let mut summary = if plan.summary.omitted_profile_count == 0 {
+        format!(
             "profiles: {} selected / {} eligible; default matrix {}",
             plan.summary.selected_profile_count,
             plan.summary.eligible_profile_count,
@@ -272,16 +261,52 @@ pub fn profile_selection_human_summary(plan: &DefaultProfileSelectionPlan) -> Re
             } else {
                 "incomplete"
             }
-        ));
+        )
+    } else {
+        format!(
+            "profiles: {} selected / {} eligible; {} omitted by {}-repository budget {}",
+            plan.summary.selected_profile_count,
+            plan.summary.eligible_profile_count,
+            plan.summary.omitted_profile_count,
+            size_class_name(plan.input.repository.size_class),
+            plan.input.limits.effective_profile_cap
+        )
+    };
+    let additional_reasons = profile_matrix_incomplete_reasons(plan)
+        .into_iter()
+        .filter(|reason| {
+            plan.summary.omitted_profile_count == 0
+                || *reason != ProfileMatrixIncompleteReason::DefaultProfileBudgetExhausted
+        })
+        .map(incomplete_reason_human_label)
+        .collect::<Vec<_>>();
+    if !additional_reasons.is_empty() {
+        summary.push_str(if plan.summary.omitted_profile_count == 0 {
+            "; incomplete reasons: "
+        } else {
+            "; additional incomplete reasons: "
+        });
+        summary.push_str(&additional_reasons.join(", "));
     }
-    Ok(format!(
-        "profiles: {} selected / {} eligible; {} omitted by {}-repository budget {}",
-        plan.summary.selected_profile_count,
-        plan.summary.eligible_profile_count,
-        plan.summary.omitted_profile_count,
-        size_class_name(plan.input.repository.size_class),
-        plan.input.limits.effective_profile_cap
-    ))
+    Ok(summary)
+}
+
+fn profile_matrix_incomplete_reasons(
+    plan: &DefaultProfileSelectionPlan,
+) -> BTreeSet<ProfileMatrixIncompleteReason> {
+    let mut reasons = BTreeSet::new();
+    if !plan.omitted.is_empty() {
+        reasons.insert(ProfileMatrixIncompleteReason::DefaultProfileBudgetExhausted);
+    }
+    if plan.discovery.iter().any(|entry| !entry.complete) {
+        reasons.insert(ProfileMatrixIncompleteReason::DefaultProfileCandidateLimitExceeded);
+    }
+    for exclusion in &plan.policy_excluded {
+        if let Some(reason) = incomplete_exclusion_reason(exclusion.reason) {
+            reasons.insert(reason);
+        }
+    }
+    reasons
 }
 
 fn merge_candidate_discoveries(
@@ -453,6 +478,22 @@ const fn incomplete_exclusion_reason(
     }
 }
 
+const fn incomplete_reason_human_label(reason: ProfileMatrixIncompleteReason) -> &'static str {
+    match reason {
+        ProfileMatrixIncompleteReason::DefaultProfileBudgetExhausted => "profile budget exhausted",
+        ProfileMatrixIncompleteReason::DefaultProfileCandidateLimitExceeded => {
+            "candidate discovery limit exceeded"
+        }
+        ProfileMatrixIncompleteReason::DefaultProfileDynamicConfigurationNotExecuted => {
+            "dynamic configuration not executed"
+        }
+        ProfileMatrixIncompleteReason::DefaultProfileUnsupportedAxis => "unsupported profile axis",
+        ProfileMatrixIncompleteReason::DefaultProfileMalformedDeclaration => {
+            "malformed profile declaration"
+        }
+    }
+}
+
 const fn axis_priority(axis: ProfileAxis) -> u8 {
     match axis {
         ProfileAxis::Target => 0,
@@ -490,7 +531,7 @@ mod tests {
         ProfileCandidateEvidenceKind, ProfileHostContext, ProfileSelectionLimits,
         ProfileSelectionRepository, RustHostContext, RustProfileAxes, RustProfileMode,
         WebEnvironment, WebProfileAxes, WebProfileMode, canonical_profile_id,
-        canonical_profile_selection_json, profile_candidate_id,
+        canonical_profile_selection_json, profile_candidate_id, profile_exclusion_id,
     };
 
     use super::*;
@@ -809,10 +850,25 @@ mod tests {
         discoveries[0].discovery[0].reason =
             Some(CandidateDiscoveryReason::DefaultProfileCandidateLimitExceeded);
         discoveries[0].complete = false;
+        let mut exclusion = ProfilePolicyExclusion {
+            id: String::new(),
+            language: ProfileLanguage::Web,
+            axis: Some(ProfileAxis::Environment),
+            axis_values: vec!["worker".to_owned()],
+            reason: ProfileExclusionReason::DefaultProfileDynamicConfigurationNotExecuted,
+            affects_completeness: true,
+            evidence: vec![ProfileCandidateEvidence {
+                kind: ProfileCandidateEvidenceKind::Source,
+                path: "src/worker.ts".to_owned(),
+                start_line: 1,
+                end_line: 1,
+            }],
+        };
+        exclusion.id = profile_exclusion_id(&exclusion);
         let plan = plan_automatic_profile_selection(AutomaticProfileSelectionRequest {
             input: input(3),
             discoveries,
-            policy_excluded: Vec::new(),
+            policy_excluded: vec![exclusion],
             tracked_candidate_ids: Vec::new(),
         })?;
         let status = profile_selection_doctor_status(&plan, true)?;
@@ -821,11 +877,16 @@ mod tests {
             vec![
                 ProfileMatrixIncompleteReason::DefaultProfileBudgetExhausted,
                 ProfileMatrixIncompleteReason::DefaultProfileCandidateLimitExceeded,
+                ProfileMatrixIncompleteReason::DefaultProfileDynamicConfigurationNotExecuted,
             ]
         );
         assert_eq!(status.strict_exit_code, 1);
         assert!(status.remediation.contains(&"--profile-budget".to_owned()));
         assert!(status.remediation.contains(&"--profiles-file".to_owned()));
+        assert_eq!(
+            profile_selection_human_summary(&plan)?,
+            "profiles: 3 selected / 8 eligible; 5 omitted by large-repository budget 3; additional incomplete reasons: candidate discovery limit exceeded, dynamic configuration not executed"
+        );
         Ok(())
     }
 
