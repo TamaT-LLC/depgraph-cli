@@ -166,7 +166,9 @@ pub fn evaluate_public_migration_rehearsal(
     let mut no_go_phase = None;
     let mut stopped = false;
     if input.production_repository != PUBLIC_MIGRATION_PRODUCTION_REPOSITORY
-        || input.temporary_repository == input.production_repository
+        || input
+            .temporary_repository
+            .eq_ignore_ascii_case(&input.production_repository)
     {
         reject_at(
             &mut reasons,
@@ -383,7 +385,7 @@ fn valid_token(value: &str) -> bool {
         && value.len() <= 128
         && value
             .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
 fn is_digest(value: &str) -> bool {
@@ -517,7 +519,7 @@ mod tests {
     #[test]
     fn production_target_and_visibility_mutation_fail_closed() {
         let mut input = successful_input();
-        input.temporary_repository = PUBLIC_MIGRATION_PRODUCTION_REPOSITORY.into();
+        input.temporary_repository = "tamat-llc/DEPGRAPH-CLI".into();
         input.production_visibility_unchanged = false;
         let report = evaluate_public_migration_rehearsal(&input).unwrap();
         assert_eq!(report.decision, PublicReadinessDecision::Reject);
@@ -532,6 +534,10 @@ mod tests {
                 .no_go_reasons
                 .contains(&PublicMigrationNoGoReason::ProductionVisibilityChanged)
         );
+
+        let mut invalid = successful_input();
+        invalid.temporary_repository = "TamaT-LLC/depgraph:rehearsal".into();
+        assert!(evaluate_public_migration_rehearsal(&invalid).is_err());
     }
 
     #[test]
