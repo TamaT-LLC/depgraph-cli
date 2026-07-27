@@ -1,0 +1,126 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://depgraph.dev/schemas/depgraph-ffi-link-observation-v1.schema.json",
+  "title": "depgraph supervised FFI link observation v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "observer",
+    "observer_version",
+    "capability",
+    "build_run_id",
+    "profile_id",
+    "target_triple",
+    "architecture",
+    "link_mode",
+    "source_root_digest",
+    "toolchain_digest",
+    "link_input_digest",
+    "entries"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "ffi-link-observation-v1"
+    },
+    "observer": {
+      "const": "depgraph-supervised-ffi-link-observer"
+    },
+    "observer_version": {
+      "const": "1.0.0"
+    },
+    "capability": {
+      "const": "ffi-supervised-link-export-v1"
+    },
+    "build_run_id": {
+      "$ref": "#/$defs/boundedAtom"
+    },
+    "profile_id": {
+      "$ref": "#/$defs/boundedAtom"
+    },
+    "target_triple": {
+      "$ref": "#/$defs/boundedAtom"
+    },
+    "architecture": {
+      "$ref": "#/$defs/boundedAtom"
+    },
+    "link_mode": {
+      "enum": [
+        "dynamic",
+        "framework",
+        "static"
+      ]
+    },
+    "source_root_digest": {
+      "$ref": "#/$defs/digest"
+    },
+    "toolchain_digest": {
+      "$ref": "#/$defs/digest"
+    },
+    "link_input_digest": {
+      "$ref": "#/$defs/digest"
+    },
+    "entries": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 100000,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/entry"
+      }
+    }
+  },
+  "$defs": {
+    "boundedAtom": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096,
+      "pattern": "^[A-Za-z0-9_.:+-]+$"
+    },
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "symbol": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "pattern": "^[A-Za-z0-9_.$@-]+$"
+    },
+    "entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "declaration_site_id",
+        "abi",
+        "direction",
+        "library",
+        "symbol",
+        "library_artifact_digest"
+      ],
+      "properties": {
+        "declaration_site_id": {
+          "$ref": "#/$defs/boundedAtom"
+        },
+        "abi": {
+          "$ref": "#/$defs/boundedAtom"
+        },
+        "direction": {
+          "enum": [
+            "export",
+            "import"
+          ]
+        },
+        "library": {
+          "$ref": "#/$defs/symbol"
+        },
+        "symbol": {
+          "$ref": "#/$defs/symbol"
+        },
+        "library_artifact_digest": {
+          "$ref": "#/$defs/digest"
+        }
+      }
+    }
+  }
+}

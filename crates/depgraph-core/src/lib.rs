@@ -11,6 +11,7 @@ pub mod cross_language;
 pub mod daemon;
 pub mod export;
 pub mod ffi;
+pub mod ffi_link;
 mod graphml;
 pub mod graphql;
 pub mod http_operation_correlation;
@@ -101,6 +102,12 @@ pub use cross_language::validate_cross_language_worker_protocol;
 pub use ffi::{
     FFI_CAPABILITY, FFI_FORMAT_VERSION, MAX_FFI_DECLARATIONS, MAX_FFI_FILE_BYTES, MAX_FFI_FILES,
     MAX_FFI_TOTAL_BYTES, scan_ffi_repository,
+};
+pub use ffi_link::{
+    FFI_LINK_CAPABILITY, FFI_LINK_OBSERVATION_SCHEMA, FFI_LINK_OBSERVATION_SCHEMA_PATH,
+    FFI_LINK_OBSERVATION_SCHEMA_VERSION, FFI_LINK_OBSERVER, FFI_LINK_OBSERVER_VERSION,
+    FfiLinkObservation, FfiObservedLink, collect_supervised_ffi_link_observation,
+    correlate_ffi_link_observation, validate_ffi_link_observation,
 };
 pub const FRAMEWORK_BUILD_GRAPH_CONTRACT_VERSION: &str = "framework-build-graph-v1";
 pub const FRAMEWORK_BUILD_GATE_CONTRACT_VERSION: &str =
