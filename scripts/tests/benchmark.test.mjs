@@ -230,7 +230,8 @@ test("release verification requires the complete 10,000-file metric contract", (
     changed_file: "src/f05000.ts",
     base_snapshot_id: `snapshot:sha256:${"1".repeat(64)}`,
     completed_snapshot_id: `snapshot:sha256:${"2".repeat(64)}`,
-    invalidation_schema_version: "incremental-plan-v1",
+    invalidation_schema_version: "incremental-plan-v2",
+    base_profile_plan_id: `profile-selection-plan:sha256:${"3".repeat(64)}`,
     affected_profiles: 1,
     incremental_trace: {
       schema_version: "daemon-incremental-trace-v1",

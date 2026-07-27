@@ -330,8 +330,9 @@ fn compare_settings(
     }
     for (key, actual) in &observed_rules {
         if !desired_rules.contains_key(key) {
+            let identity_digest = canonical_public_readiness_digest(&(target_name(key.0), key.1))?;
             drift.push(drift_entry(
-                &format!("rulesets/{}/{}", target_name(key.0), key.1),
+                &format!("rulesets/unexpected/{identity_digest}"),
                 GitHubSettingsDriftReason::UnexpectedSetting,
                 Option::<&GitHubRuleset>::None,
                 Some(*actual),
@@ -816,6 +817,25 @@ mod tests {
             !serde_json::to_string(&drifted)
                 .unwrap()
                 .contains("a".repeat(64).as_str())
+        );
+
+        let mut actual = expected.clone();
+        let mut unexpected_ruleset = actual.rulesets[0].clone();
+        unexpected_ruleset.name = "token-super-secret".into();
+        actual.rulesets.push(unexpected_ruleset);
+        let drifted = evaluate_github_settings(
+            &expected,
+            &GitHubSettingsApiSnapshot {
+                collection_status: GitHubSettingsCollectionStatus::Complete,
+                settings: Some(actual),
+            },
+        )
+        .unwrap();
+        assert_eq!(drifted.decision, PublicReadinessDecision::Reject);
+        assert!(
+            !serde_json::to_string(&drifted)
+                .unwrap()
+                .contains("token-super-secret")
         );
     }
 

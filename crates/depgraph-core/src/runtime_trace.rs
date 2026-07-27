@@ -233,6 +233,108 @@ pub struct ValidatedRuntimeTrace {
     pub summary: RuntimeTraceSummary,
 }
 
+pub(crate) fn validate_http_correlation_trace(trace: &ValidatedRuntimeTrace) -> Result<()> {
+    if trace.schema_version != RUNTIME_TRACE_SCHEMA_VERSION {
+        bail!("HTTP correlation requires the current validated runtime trace version");
+    }
+    let original = RuntimeTrace {
+        schema_version: trace.schema_version.clone(),
+        repository: trace.repository.clone(),
+        session: trace.session.clone(),
+        events: trace
+            .events
+            .iter()
+            .map(|event| RuntimeTraceEvent {
+                sequence: event.sequence,
+                timestamp: event.timestamp.clone(),
+                dependency_kind: event.dependency_kind.clone(),
+                source: event.source.input.clone(),
+                target: event.target.input.clone(),
+                http: event.http.clone(),
+                count: event.count,
+                duration_ns: event.duration_ns,
+                redaction: event.redaction.clone(),
+            })
+            .collect(),
+    };
+    let mut canonical = original.clone();
+    canonical.validate()?;
+    if canonical != original {
+        bail!("HTTP correlation requires a canonical validated runtime trace");
+    }
+
+    match trace.profile_match.status {
+        RuntimeTraceMatchStatus::Resolved
+            if trace.profile_match.parent_profile_id.is_some()
+                && trace.profile_match.reason.is_none() => {}
+        RuntimeTraceMatchStatus::Unresolved
+            if trace.profile_match.parent_profile_id.is_none()
+                && trace.profile_match.reason.is_some() => {}
+        _ => bail!("HTTP correlation runtime profile match state is inconsistent"),
+    }
+    if let Some(parent) = &trace.profile_match.parent_profile_id {
+        validate_bounded_string(parent, "profile_match.parent_profile_id", MAX_ID_CHARS)?;
+    }
+    if let Some(reason) = &trace.profile_match.reason {
+        validate_bounded_string(reason, "profile_match.reason", MAX_ID_CHARS)?;
+    }
+
+    let mut summary = RuntimeTraceSummary {
+        events: trace.events.len() as u64,
+        redacted_values: trace.session.redaction.redacted_value_count.saturating_add(
+            trace
+                .events
+                .iter()
+                .map(|event| event.redaction.redacted_value_count)
+                .fold(0_u64, u64::saturating_add),
+        ),
+        ..RuntimeTraceSummary::default()
+    };
+    for event in &trace.events {
+        if event.id != expected_validated_runtime_event_id(&trace.repository, &trace.session, event)
+        {
+            bail!("HTTP correlation runtime event ID is inconsistent");
+        }
+        validate_matched_runtime_locator(&event.source, "events[].source")?;
+        validate_matched_runtime_locator(&event.target, "events[].target")?;
+        match event.target.status {
+            RuntimeTraceMatchStatus::Resolved => summary.resolved_targets += 1,
+            RuntimeTraceMatchStatus::External => summary.external_targets += 1,
+            RuntimeTraceMatchStatus::Unresolved => summary.unresolved_targets += 1,
+        }
+    }
+    if trace.summary != summary {
+        bail!("HTTP correlation runtime trace summary is inconsistent");
+    }
+    Ok(())
+}
+
+fn validate_matched_runtime_locator(
+    locator: &MatchedRuntimeTraceLocator,
+    field: &str,
+) -> Result<()> {
+    match locator.status {
+        RuntimeTraceMatchStatus::Resolved
+            if locator.node_id.is_some() && locator.reason.is_none() => {}
+        RuntimeTraceMatchStatus::External
+            if matches!(locator.input, RuntimeTraceLocator::External { .. })
+                && locator.node_id.is_none()
+                && locator.reason.is_some() => {}
+        RuntimeTraceMatchStatus::Unresolved
+            if !matches!(locator.input, RuntimeTraceLocator::External { .. })
+                && locator.node_id.is_none()
+                && locator.reason.is_some() => {}
+        _ => bail!("HTTP correlation runtime locator match state is inconsistent"),
+    }
+    if let Some(node_id) = &locator.node_id {
+        validate_bounded_string(node_id, &format!("{field}.node_id"), MAX_ID_CHARS)?;
+    }
+    if let Some(reason) = &locator.reason {
+        validate_bounded_string(reason, &format!("{field}.reason"), MAX_ID_CHARS)?;
+    }
+    Ok(())
+}
+
 fn default_event_count() -> u64 {
     1
 }
@@ -298,25 +400,7 @@ pub fn match_runtime_trace(
             RuntimeTraceMatchStatus::External => summary.external_targets += 1,
             RuntimeTraceMatchStatus::Unresolved => summary.unresolved_targets += 1,
         }
-        let id = stable_id_from_value(
-            "runtime-event",
-            &json!({
-                "schema_version": RUNTIME_TRACE_SCHEMA_VERSION,
-                "repository_identity": trace.repository.identity,
-                "repository_revision": trace.repository.revision,
-                "session_id": trace.session.id,
-                "sequence": event.sequence,
-                "timestamp": event.timestamp,
-                "profile": trace.session.profile,
-                "environment": trace.session.environment,
-                "dependency_kind": event.dependency_kind,
-                "source": event.source,
-                "target": event.target,
-                "http": event.http,
-                "count": event.count,
-                "duration_ns": event.duration_ns,
-            }),
-        );
+        let id = runtime_event_id(&trace.repository, &trace.session, event);
         events.push(ValidatedRuntimeTraceEvent {
             id,
             sequence: event.sequence,
@@ -339,6 +423,54 @@ pub fn match_runtime_trace(
         events,
         summary,
     })
+}
+
+fn runtime_event_id(
+    repository: &RuntimeTraceRepository,
+    session: &RuntimeTraceSession,
+    event: &RuntimeTraceEvent,
+) -> String {
+    stable_id_from_value(
+        "runtime-event",
+        &json!({
+            "schema_version": RUNTIME_TRACE_SCHEMA_VERSION,
+            "repository_identity": repository.identity,
+            "repository_revision": repository.revision,
+            "session_id": session.id,
+            "sequence": event.sequence,
+            "timestamp": event.timestamp,
+            "profile": session.profile,
+            "environment": session.environment,
+            "dependency_kind": event.dependency_kind,
+            "source": event.source,
+            "target": event.target,
+            "http": event.http,
+            "count": event.count,
+            "duration_ns": event.duration_ns,
+        }),
+    )
+}
+
+pub(crate) fn expected_validated_runtime_event_id(
+    repository: &RuntimeTraceRepository,
+    session: &RuntimeTraceSession,
+    event: &ValidatedRuntimeTraceEvent,
+) -> String {
+    runtime_event_id(
+        repository,
+        session,
+        &RuntimeTraceEvent {
+            sequence: event.sequence,
+            timestamp: event.timestamp.clone(),
+            dependency_kind: event.dependency_kind.clone(),
+            source: event.source.input.clone(),
+            target: event.target.input.clone(),
+            http: event.http.clone(),
+            count: event.count,
+            duration_ns: event.duration_ns,
+            redaction: event.redaction.clone(),
+        },
+    )
 }
 
 /// Converts a validated collector document into an immutable runtime graph

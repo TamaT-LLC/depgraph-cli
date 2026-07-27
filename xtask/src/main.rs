@@ -7,7 +7,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use depgraph_protocol::Condition;
+use depgraph_protocol::{Condition, Profile};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -606,12 +606,18 @@ fn verify_workflow_policy_text(
     if !matches!(top_permissions.as_slice(), [] | ["contents: read"]) {
         bail!("{name} has broad workflow-level permissions");
     }
+    if workflow.contains("\n  pull_request:") && workflow.contains("${{ secrets.") {
+        bail!("{name} exposes repository secrets to pull request execution");
+    }
     for line in workflow.lines() {
         let trimmed = line.trim_start();
-        let Some(specification) = trimmed
+        let specification = trimmed
             .strip_prefix("- uses:")
-            .or_else(|| trimmed.strip_prefix("uses:"))
-        else {
+            .or_else(|| trimmed.strip_prefix("uses:"));
+        if specification.is_none() && has_workflow_uses_key(trimmed) {
+            bail!("{name} contains a noncanonical uses key");
+        }
+        let Some(specification) = specification else {
             continue;
         };
         let specification = specification
@@ -667,9 +673,33 @@ fn verify_workflow_policy_text(
                 bail!("stable release source guard must be metadata-only and job-scoped");
             }
         }
-        _ => {}
+        _ => {
+            if workflow.lines().any(has_write_permission) {
+                bail!("{name} grants an unreviewed write permission");
+            }
+        }
     }
     Ok(())
+}
+
+fn has_workflow_uses_key(line: &str) -> bool {
+    let code = line.split('#').next().unwrap_or_default();
+    ["uses", "\"uses\"", "'uses'"].iter().any(|marker| {
+        code.match_indices(marker).any(|(index, matched)| {
+            let boundary = index == 0
+                || !code.as_bytes()[index - 1].is_ascii_alphanumeric()
+                    && code.as_bytes()[index - 1] != b'_';
+            boundary && code[index + matched.len()..].trim_start().starts_with(':')
+        })
+    })
+}
+
+fn has_write_permission(line: &str) -> bool {
+    let code = line.split('#').next().unwrap_or_default().trim();
+    code.contains("permissions:") && code.contains("write")
+        || code
+            .split_once(':')
+            .is_some_and(|(_, value)| value.trim() == "write")
 }
 
 fn top_level_permissions(workflow: &str) -> Result<Vec<&str>> {
@@ -3774,12 +3804,6 @@ fn validate_bounded_query_package_smoke(
     target: &str,
     archive_sha256: &str,
 ) -> Result<()> {
-    let lowercase_sha256 = |value: &str| {
-        value.len() == 64
-            && value
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    };
     if report.schema_version != BOUNDED_QUERY_PACKAGE_SMOKE_SCHEMA_VERSION
         || report.target != target
         || report.archive_sha256 != archive_sha256
@@ -3811,25 +3835,27 @@ fn validate_cross_language_package_smoke(
     report: &CrossLanguagePackageSmokeReport,
     target: &str,
 ) -> Result<()> {
-    let lowercase_sha256 = |value: &str| {
-        value.len() == 64
-            && value
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    };
     if report.schema_version != CROSS_LANGUAGE_PACKAGE_SMOKE_SCHEMA_VERSION
         || report.target != target
         || report.contract != depgraph_core::cross_language_release_compatibility_contract()
-        || !report
-            .graph_digest
-            .strip_prefix("cross-language-release-graph:sha256:")
-            .is_some_and(lowercase_sha256)
+        || !prefixed_lowercase_sha256(&report.graph_digest, "cross-language-release-graph:sha256:")
         || !lowercase_sha256(&report.canonical_export_sha256)
         || !lowercase_sha256(&report.query_output_sha256)
     {
         bail!("packaged cross-language smoke report is incompatible for {target}");
     }
     Ok(())
+}
+
+fn lowercase_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn prefixed_lowercase_sha256(value: &str, prefix: &str) -> bool {
+    value.strip_prefix(prefix).is_some_and(lowercase_sha256)
 }
 
 fn stable_release_gate(
@@ -3934,22 +3960,13 @@ fn evaluate_stable_release_gate(
         && release.compatibility.bounded_query == bounded_query_contract
         && bounded_query_outputs.len() == 1
         && release.targets.iter().all(|target| {
-            target
-                .query_plan_digest
-                .starts_with("bounded-query-plan:sha256:")
-                && target
-                    .query_result_digest
-                    .starts_with("bounded-query-result:sha256:")
-                && target.query_output_sha256.len() == 64
-                && target
-                    .query_output_sha256
-                    .bytes()
-                    .all(|byte| byte.is_ascii_hexdigit())
-                && target.query_smoke_sha256.len() == 64
-                && target
-                    .query_smoke_sha256
-                    .bytes()
-                    .all(|byte| byte.is_ascii_hexdigit())
+            prefixed_lowercase_sha256(&target.query_plan_digest, "bounded-query-plan:sha256:")
+                && prefixed_lowercase_sha256(
+                    &target.query_result_digest,
+                    "bounded-query-result:sha256:",
+                )
+                && lowercase_sha256(&target.query_output_sha256)
+                && lowercase_sha256(&target.query_smoke_sha256)
         });
     let profile_selection_contract =
         depgraph_core::profile_selection_release_compatibility_contract();
@@ -3967,14 +3984,10 @@ fn evaluate_stable_release_gate(
         && release.compatibility.profile_selection == profile_selection_contract
         && profile_plan_outputs.len() == 1
         && release.targets.iter().all(|target| {
-            target
-                .profile_plan_digest
-                .starts_with("profile-selection-plan:sha256:")
-                && target.profile_plan_output_sha256.len() == 64
-                && target
-                    .profile_plan_output_sha256
-                    .bytes()
-                    .all(|byte| byte.is_ascii_hexdigit())
+            prefixed_lowercase_sha256(
+                &target.profile_plan_digest,
+                "profile-selection-plan:sha256:",
+            ) && lowercase_sha256(&target.profile_plan_output_sha256)
         });
     let cross_language_contract = depgraph_core::cross_language_release_compatibility_contract();
     let cross_language_outputs = release
@@ -3995,7 +4008,13 @@ fn evaluate_stable_release_gate(
         && release.targets.iter().all(|target| {
             target
                 .cross_language_graph_digest
-                .starts_with("cross-language-release-graph:sha256:")
+                .strip_prefix("cross-language-release-graph:sha256:")
+                .is_some_and(|digest| {
+                    digest.len() == 64
+                        && digest
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                })
                 && [
                     target.cross_language_smoke_sha256.as_str(),
                     target.cross_language_export_sha256.as_str(),
@@ -4777,14 +4796,24 @@ fn materialize_cross_language_fixture(
 }
 
 fn cross_language_fixture_export(root: &Path) -> Result<(Value, Value)> {
-    let profile_ids = vec!["release:polyglot".to_owned()];
-    let openapi = depgraph_core::scan_openapi_repository(root, &profile_ids)?
+    let profiles = vec![Profile {
+        id: "release:polyglot".to_owned(),
+        language: "polyglot".to_owned(),
+        toolchain: None,
+        command: None,
+        target: None,
+        features: Vec::new(),
+        environment: BTreeMap::new(),
+        source_revision: None,
+        properties: BTreeMap::new(),
+    }];
+    let openapi = depgraph_core::scan_openapi_repository(root, &profiles)?
         .context("packaged cross-language fixture has no OpenAPI graph")?;
-    let protobuf = depgraph_core::scan_protobuf_repository(root, &profile_ids)?
+    let protobuf = depgraph_core::scan_protobuf_repository(root, &profiles)?
         .context("packaged cross-language fixture has no Protobuf graph")?;
-    let graphql = depgraph_core::scan_graphql_repository(root, &profile_ids)?
+    let graphql = depgraph_core::scan_graphql_repository(root, &profiles)?
         .context("packaged cross-language fixture has no GraphQL graph")?;
-    let ffi = depgraph_core::scan_ffi_repository(root, &profile_ids)?
+    let ffi = depgraph_core::scan_ffi_repository(root, &profiles)?
         .context("packaged cross-language fixture has no FFI graph")?;
 
     let operation = openapi
@@ -10122,8 +10151,8 @@ fn verify_packaged_bounded_query(
         .as_str()
         .context("packaged bounded query result omitted its digest")?
         .to_owned();
-    if !plan_digest.starts_with("bounded-query-plan:sha256:")
-        || !result_digest.starts_with("bounded-query-result:sha256:")
+    if !prefixed_lowercase_sha256(&plan_digest, "bounded-query-plan:sha256:")
+        || !prefixed_lowercase_sha256(&result_digest, "bounded-query-result:sha256:")
     {
         bail!("packaged bounded query returned malformed plan/result digests");
     }
@@ -10172,7 +10201,7 @@ fn verify_packaged_bounded_query(
     }
     let profile_plan_digest = profile_preview["plan"]["plan_id"]
         .as_str()
-        .filter(|value| value.starts_with("profile-selection-plan:sha256:"))
+        .filter(|value| prefixed_lowercase_sha256(value, "profile-selection-plan:sha256:"))
         .context("packaged profile plan omitted its canonical digest")?
         .to_owned();
 
@@ -11345,6 +11374,16 @@ mod tests {
             verify_workflow_policy_text("ci.yml", &mutable, &pins, &mut BTreeSet::new()).is_err()
         );
 
+        let inline_mutable = ci.replacen(
+            "- uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4",
+            "- { uses: actions/checkout@v4 }",
+            1,
+        );
+        assert!(
+            verify_workflow_policy_text("ci.yml", &inline_mutable, &pins, &mut BTreeSet::new(),)
+                .is_err()
+        );
+
         let broad = ci.replacen("contents: read", "contents: write", 1);
         assert!(
             verify_workflow_policy_text("ci.yml", &broad, &pins, &mut BTreeSet::new()).is_err()
@@ -11353,6 +11392,17 @@ mod tests {
         let secret = format!("{ci}\n# ${{{{ secrets.RELEASE_TOKEN }}}}\n");
         assert!(
             verify_workflow_policy_text("ci.yml", &secret, &pins, &mut BTreeSet::new()).is_err()
+        );
+
+        let unreviewed_write = "name: Auxiliary\non: workflow_dispatch\npermissions: {}\njobs:\n  mutate:\n    permissions:\n      issues: write\n";
+        assert!(
+            verify_workflow_policy_text(
+                "auxiliary.yml",
+                unreviewed_write,
+                &pins,
+                &mut BTreeSet::new(),
+            )
+            .is_err()
         );
 
         let dry_run = fs::read(root.join("security/disclosure-dry-run-v1.json"))?;
@@ -11649,6 +11699,35 @@ mod tests {
         cross_language_drift.targets[0].cross_language_query_sha256 = "0".repeat(64);
         assert_eq!(
             evaluate(&cross_language_drift, &benchmark).decision,
+            StableReleaseDecision::Reject
+        );
+
+        let mut malformed_cross_language_digest = release.clone();
+        for target in &mut malformed_cross_language_digest.targets {
+            target.cross_language_graph_digest =
+                format!("cross-language-release-graph:sha256:{}", "7".repeat(65));
+        }
+        assert_eq!(
+            evaluate(&malformed_cross_language_digest, &benchmark).decision,
+            StableReleaseDecision::Reject
+        );
+
+        let mut malformed_profile_plan = release.clone();
+        for target in &mut malformed_profile_plan.targets {
+            target.profile_plan_digest = "profile-selection-plan:sha256:not-a-sha256".to_owned();
+        }
+        assert_eq!(
+            evaluate(&malformed_profile_plan, &benchmark).decision,
+            StableReleaseDecision::Reject
+        );
+
+        let mut uppercase_profile_plan = release.clone();
+        for target in &mut uppercase_profile_plan.targets {
+            target.profile_plan_digest =
+                format!("profile-selection-plan:sha256:{}", "A".repeat(64));
+        }
+        assert_eq!(
+            evaluate(&uppercase_profile_plan, &benchmark).decision,
             StableReleaseDecision::Reject
         );
 
