@@ -43,7 +43,7 @@ const MAX_REASONS: usize = 64;
 /// correlated by the supervised FFI adapter.
 pub fn scan_ffi_repository(
     root: &Path,
-    participating_profile_ids: &[String],
+    participating_profiles: &[Profile],
 ) -> Result<Option<CrossLanguageAdapterDelta>> {
     let canonical_root = root
         .canonicalize()
@@ -51,17 +51,23 @@ pub fn scan_ffi_repository(
     if !canonical_root.is_dir() {
         bail!("FFI scan root must be a directory");
     }
-    let mut participating_profile_ids = participating_profile_ids.to_vec();
-    participating_profile_ids.sort();
-    participating_profile_ids.dedup();
-    if participating_profile_ids.is_empty()
-        || participating_profile_ids.len() > MAX_PARTICIPATING_PROFILES
-        || participating_profile_ids
+    let mut participating_profiles = participating_profiles.to_vec();
+    participating_profiles.sort_by(|left, right| left.id.cmp(&right.id));
+    if participating_profiles.is_empty()
+        || participating_profiles.len() > MAX_PARTICIPATING_PROFILES
+        || participating_profiles
             .iter()
-            .any(|value| !bounded_text(value))
+            .any(|profile| !bounded_text(&profile.id))
+        || participating_profiles
+            .windows(2)
+            .any(|profiles| profiles[0].id == profiles[1].id)
     {
-        bail!("FFI participating profile IDs must be a bounded non-empty set");
+        bail!("FFI participating profiles must be a bounded non-empty set");
     }
+    let participating_profile_ids = participating_profiles
+        .iter()
+        .map(|profile| profile.id.clone())
+        .collect::<Vec<_>>();
 
     let inventory = inventory_sources(&canonical_root)?;
     if inventory.declarations.is_empty() && inventory.skipped_count == 0 {
@@ -149,6 +155,7 @@ pub fn scan_ffi_repository(
     let delta = CrossLanguageAdapterDelta {
         contract_version: CROSS_LANGUAGE_CONTRACT_VERSION.to_owned(),
         profile,
+        participating_profiles,
         nodes: builder.nodes.into_values().collect(),
         sites: builder.sites.into_values().collect(),
         edges: builder.edges.into_values().collect(),
@@ -1310,7 +1317,7 @@ fn digest_value(value: &impl Serialize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{collections::BTreeMap, fs};
 
     use depgraph_protocol::{
         CROSS_LANGUAGE_COMPLETENESS_PROPERTY, CrossLanguageCompletenessLedger, Precision,
@@ -1319,6 +1326,22 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    fn profiles(ids: &[&str]) -> Vec<Profile> {
+        ids.iter()
+            .map(|id| Profile {
+                id: (*id).to_owned(),
+                language: "polyglot".to_owned(),
+                toolchain: None,
+                command: None,
+                target: None,
+                features: Vec::new(),
+                environment: BTreeMap::new(),
+                source_revision: None,
+                properties: BTreeMap::new(),
+            })
+            .collect()
+    }
 
     #[test]
     fn rust_go_and_web_declarations_preserve_profile_abi_and_non_exact_imports() {
@@ -1357,7 +1380,7 @@ func GoCallback() {}
         )
         .unwrap();
 
-        let delta = scan_ffi_repository(root.path(), &["linux-x86_64".to_owned()])
+        let delta = scan_ffi_repository(root.path(), &profiles(&["linux-x86_64"]))
             .unwrap()
             .unwrap();
         validate_cross_language_adapter_delta(&delta).unwrap();
@@ -1413,7 +1436,7 @@ unsafe extern "C" {
         )
         .unwrap();
 
-        let delta = scan_ffi_repository(root.path(), &["windows-x86_64".to_owned()])
+        let delta = scan_ffi_repository(root.path(), &profiles(&["windows-x86_64"]))
             .unwrap()
             .unwrap();
         assert!(delta.sites.iter().any(|site| {
@@ -1458,7 +1481,7 @@ unsafe extern "C" {
         )
         .unwrap();
 
-        let delta = scan_ffi_repository(root.path(), &["macos-aarch64".to_owned()])
+        let delta = scan_ffi_repository(root.path(), &profiles(&["macos-aarch64"]))
             .unwrap()
             .unwrap();
         let ledger: CrossLanguageCompletenessLedger = serde_json::from_value(
@@ -1507,7 +1530,7 @@ unsafe extern "C" {
             )
             .unwrap();
         }
-        let profiles = vec!["linux".to_owned(), "windows".to_owned()];
+        let profiles = profiles(&["linux", "windows"]);
         let first = scan_ffi_repository(first.path(), &profiles)
             .unwrap()
             .unwrap();
