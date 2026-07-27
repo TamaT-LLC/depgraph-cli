@@ -766,9 +766,9 @@ fn outcome(
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{collections::BTreeMap, fs};
 
-    use depgraph_protocol::{CROSS_LANGUAGE_PROFILE_IDENTITY_PROPERTY, GraphNode};
+    use depgraph_protocol::{CROSS_LANGUAGE_PROFILE_IDENTITY_PROPERTY, GraphNode, Profile};
     use tempfile::tempdir;
 
     use super::*;
@@ -781,6 +781,20 @@ mod tests {
 
     const PARENT_PROFILE: &str =
         "profile:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    fn participating_profiles() -> Vec<Profile> {
+        vec![Profile {
+            id: PARENT_PROFILE.to_owned(),
+            language: "polyglot".to_owned(),
+            toolchain: None,
+            command: None,
+            target: None,
+            features: Vec::new(),
+            environment: BTreeMap::new(),
+            source_revision: None,
+            properties: BTreeMap::new(),
+        }]
+    }
 
     #[test]
     fn uniquely_correlates_openapi_protobuf_and_graphql_operations_as_observed() -> Result<()> {
@@ -798,11 +812,11 @@ mod tests {
             "type Query { pet(id: ID!): Pet } type Pet { id: ID! } query GetPet { pet(id: \"redacted\") { id } }",
         )?;
         let contracts = vec![
-            scan_openapi_repository(root.path(), &[PARENT_PROFILE.to_owned()])?
+            scan_openapi_repository(root.path(), &participating_profiles())?
                 .context("OpenAPI fixture delta")?,
-            scan_protobuf_repository(root.path(), &[PARENT_PROFILE.to_owned()])?
+            scan_protobuf_repository(root.path(), &participating_profiles())?
                 .context("Protobuf fixture delta")?,
-            scan_graphql_repository(root.path(), &[PARENT_PROFILE.to_owned()])?
+            scan_graphql_repository(root.path(), &participating_profiles())?
                 .context("GraphQL fixture delta")?,
         ];
         let cases = [
@@ -883,7 +897,7 @@ mod tests {
             r#"{"openapi":"3.1.0","info":{"title":"b","version":"1"},"paths":{"/pets":{"get":{"responses":{"200":{"description":"ok"}}}}}}"#,
         )?;
         let contract =
-            scan_openapi_repository(root.path(), &[PARENT_PROFILE.to_owned()])?.context("delta")?;
+            scan_openapi_repository(root.path(), &participating_profiles())?.context("delta")?;
         let source = contract
             .nodes
             .iter()
@@ -947,11 +961,10 @@ mod tests {
         let document = r#"{"openapi":"3.1.0","info":{"title":"api","version":"1"},"paths":{"/health":{"get":{"responses":{"200":{"description":"ok"}}}}}}"#;
         fs::write(first_root.path().join("api.json"), document)?;
         fs::write(second_root.path().join("api.json"), document)?;
-        let first_contract =
-            scan_openapi_repository(first_root.path(), &[PARENT_PROFILE.to_owned()])?
-                .context("first delta")?;
+        let first_contract = scan_openapi_repository(first_root.path(), &participating_profiles())?
+            .context("first delta")?;
         let second_contract =
-            scan_openapi_repository(second_root.path(), &[PARENT_PROFILE.to_owned()])?
+            scan_openapi_repository(second_root.path(), &participating_profiles())?
                 .context("second delta")?;
         assert_eq!(first_contract, second_contract);
         let source = operation(
@@ -1112,7 +1125,7 @@ mod tests {
             r#"{"openapi":"3.1.0","info":{"title":"api","version":"1"},"paths":{"/health":{"get":{"responses":{"200":{"description":"ok"}}}}}}"#,
         )?;
         let contract =
-            scan_openapi_repository(root.path(), &[PARENT_PROFILE.to_owned()])?.context("delta")?;
+            scan_openapi_repository(root.path(), &participating_profiles())?.context("delta")?;
         let source = operation(
             std::slice::from_ref(&contract),
             CrossLanguageFormat::Openapi,
@@ -1176,7 +1189,7 @@ mod tests {
             r#"{"openapi":"3.1.0","info":{"title":"api","version":"1"},"paths":{}}"#,
         )?;
         let delta =
-            scan_openapi_repository(root.path(), &[PARENT_PROFILE.to_owned()])?.context("delta")?;
+            scan_openapi_repository(root.path(), &participating_profiles())?.context("delta")?;
         let identity: CrossLanguageProfileIdentity = serde_json::from_value(
             delta.profile.properties[CROSS_LANGUAGE_PROFILE_IDENTITY_PROPERTY].clone(),
         )?;
