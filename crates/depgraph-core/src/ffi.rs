@@ -1344,13 +1344,24 @@ fn web_type_only_statement(statement: &str) -> bool {
         .filter(|(_, suffix)| token_prefix(suffix.trim_start(), "from"))
         .map(|(clause, _)| clause);
     clause.is_some_and(|clause| {
-        !clause.trim().is_empty()
-            && clause.split(',').map(str::trim).all(|entry| {
-                entry
-                    .strip_prefix("type")
-                    .is_some_and(|rest| rest.starts_with(char::is_whitespace))
-            })
+        let entries = clause
+            .split(',')
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .collect::<Vec<_>>();
+        !entries.is_empty() && entries.into_iter().all(web_inline_type_specifier)
     })
+}
+
+fn web_inline_type_specifier(entry: &str) -> bool {
+    let Some(rest) = entry.strip_prefix("type") else {
+        return false;
+    };
+    if !rest.starts_with(char::is_whitespace) {
+        return false;
+    }
+    let rest = rest.trim_start();
+    !rest.is_empty() && !rest.starts_with("as ")
 }
 
 fn call_prefix_ends_with(prefix: &str, function: &str) -> bool {
@@ -1850,7 +1861,10 @@ import type { NativeType } from './type-only.node';
 export type { NativeExport } from './export-type-only.node';
 import { type InlineType } from './inline-type-only.node';
 export { type InlineExport } from './inline-export-type-only.node';
+import { type TrailingType, } from './trailing-type-only.node';
+export { type TrailingExport, } from './trailing-export-type-only.node';
 import { type Metadata, load } from './mixed.node';
+import { type as runtimeType } from './type-name-value.node';
 console.log("also-not-a-load.node");
 "#;
         let (declarations, boundaries) = parse_web("native.ts", "sha256:test", source);
@@ -1860,7 +1874,13 @@ console.log("also-not-a-load.node");
                 .iter()
                 .filter_map(|declaration| declaration.library.as_deref())
                 .collect::<Vec<_>>(),
-            vec!["./real.node", "./required.node", "*.node", "./mixed.node"]
+            vec![
+                "./real.node",
+                "./required.node",
+                "*.node",
+                "./mixed.node",
+                "./type-name-value.node"
+            ]
         );
     }
 
