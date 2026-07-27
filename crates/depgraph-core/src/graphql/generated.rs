@@ -1,9 +1,9 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs,
     path::{Component, Path},
 };
 
+use crate::bounded_query::read_bounded_repository_file;
 use anyhow::{Context, Result};
 use depgraph_protocol::{
     CROSS_LANGUAGE_CONTRACT_VERSION, Condition, CrossLanguageMappingKind,
@@ -18,8 +18,7 @@ use walkdir::WalkDir;
 use super::{
     GRAPHQL_FORMAT_VERSION, GraphQlGraphBuilder, MAX_GRAPHQL_FILE_BYTES, MAX_GRAPHQL_FILES,
     MAX_GRAPHQL_TOTAL_BYTES, bounded_reason, bounded_text, digest_value, insert_same,
-    inventory_entry_allowed, is_federation_directive, read_bounded, repository_locator,
-    sha256_prefixed,
+    inventory_entry_allowed, is_federation_directive, repository_locator, sha256_prefixed,
 };
 
 pub const GRAPHQL_REPOSITORY_MAPPING_CAPABILITY: &str = "graphql-repository-mapping-v1";
@@ -32,6 +31,7 @@ const MAX_MANIFESTS: usize = 256;
 const MAX_MAPPINGS: usize = 10_000;
 const MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_TOTAL_OUTPUT_BYTES: usize = 128 * 1024 * 1024;
+const MAX_INVENTORY_ENTRIES: usize = 1_000_000;
 
 #[derive(Clone, Debug)]
 pub(super) struct RepositoryMappingInventory {
@@ -211,12 +211,14 @@ pub(super) fn inventory_repository_mappings(root: &Path) -> Result<RepositoryMap
     let mut manifest_bytes = 0_usize;
     let mut output_bytes = 0_usize;
     let mut mapping_count = 0_usize;
+    let mut inventory_entries = 0_usize;
     let walker = WalkDir::new(root)
         .follow_links(false)
         .sort_by_file_name()
         .into_iter()
         .filter_entry(inventory_entry_allowed);
     for entry in walker {
+        record_inventory_entry(&mut inventory_entries)?;
         let entry = match entry {
             Ok(entry) => entry,
             Err(_) => continue,
@@ -230,96 +232,94 @@ pub(super) fn inventory_repository_mappings(root: &Path) -> Result<RepositoryMap
         if !locator.ends_with(MANIFEST_SUFFIX) {
             continue;
         }
-        if records.len() >= MAX_MANIFESTS {
-            records.push(skipped_record(
-                &locator,
-                "graphql-mapping-manifest-count-limit-exceeded",
-            ));
-            break;
-        }
         if entry.file_type().is_symlink() {
-            records.push(skipped_record(
-                &locator,
-                "graphql-mapping-manifest-symlink-not-admitted",
-            ));
+            push_inventory_record(
+                &mut records,
+                skipped_record(&locator, "graphql-mapping-manifest-symlink-not-admitted"),
+            )?;
             continue;
         }
         if !entry.file_type().is_file() {
-            records.push(skipped_record(
-                &locator,
-                "graphql-mapping-manifest-is-not-a-file",
-            ));
+            push_inventory_record(
+                &mut records,
+                skipped_record(&locator, "graphql-mapping-manifest-is-not-a-file"),
+            )?;
             continue;
         }
-        let file_len = match entry.metadata() {
-            Ok(metadata) => metadata.len() as usize,
-            Err(_) => {
-                records.push(skipped_record(
-                    &locator,
-                    "graphql-mapping-manifest-metadata-unavailable",
-                ));
-                continue;
-            }
-        };
-        if file_len > MAX_GRAPHQL_FILE_BYTES
-            || manifest_bytes.saturating_add(file_len) > MAX_GRAPHQL_TOTAL_BYTES
-        {
-            records.push(skipped_record(
-                &locator,
-                "graphql-mapping-manifest-byte-limit-exceeded",
-            ));
-            continue;
-        }
-        manifest_bytes += file_len;
-        let bytes = match read_bounded(entry.path(), MAX_GRAPHQL_FILE_BYTES) {
+        let bytes = match read_bounded_repository_file(root, entry.path(), MAX_GRAPHQL_FILE_BYTES) {
             Ok(bytes) => bytes,
-            Err(_) => {
-                records.push(skipped_record(
-                    &locator,
-                    "graphql-mapping-manifest-read-failed",
-                ));
+            Err(error) => {
+                let reason = if error.code == "query_file_size_or_type_invalid" {
+                    "graphql-mapping-manifest-byte-limit-exceeded"
+                } else {
+                    "graphql-mapping-manifest-read-failed"
+                };
+                push_inventory_record(&mut records, skipped_record(&locator, reason))?;
                 continue;
             }
         };
+        let Some(total_manifest_bytes) = manifest_bytes.checked_add(bytes.len()) else {
+            anyhow::bail!("GraphQL mapping manifest byte count overflowed");
+        };
+        if total_manifest_bytes > MAX_GRAPHQL_TOTAL_BYTES {
+            push_inventory_record(
+                &mut records,
+                skipped_record(
+                    &locator,
+                    "graphql-mapping-manifest-total-byte-limit-exceeded",
+                ),
+            )?;
+            continue;
+        }
+        manifest_bytes = total_manifest_bytes;
         let raw_digest = sha256_prefixed(&bytes);
         let (end_line, end_column) = end_position(&bytes);
         let mut manifest: RepositoryMappingManifest = match serde_json::from_slice(&bytes) {
             Ok(manifest) => manifest,
             Err(_) => {
-                records.push(MappingRecord {
-                    locator,
-                    digest: raw_digest,
-                    manifest: None,
-                    observations: BTreeMap::new(),
-                    reason: Some("graphql-mapping-manifest-schema-is-invalid".to_owned()),
-                    end_line,
-                    end_column,
-                });
+                push_inventory_record(
+                    &mut records,
+                    MappingRecord {
+                        locator,
+                        digest: raw_digest,
+                        manifest: None,
+                        observations: BTreeMap::new(),
+                        reason: Some("graphql-mapping-manifest-schema-is-invalid".to_owned()),
+                        end_line,
+                        end_column,
+                    },
+                )?;
                 continue;
             }
         };
         if let Err(reason) = validate_manifest(&mut manifest) {
-            records.push(MappingRecord {
-                locator,
-                digest: raw_digest,
-                manifest: None,
-                observations: BTreeMap::new(),
-                reason: Some(reason),
-                end_line,
-                end_column,
-            });
+            push_inventory_record(
+                &mut records,
+                MappingRecord {
+                    locator,
+                    digest: raw_digest,
+                    manifest: None,
+                    observations: BTreeMap::new(),
+                    reason: Some(reason),
+                    end_line,
+                    end_column,
+                },
+            )?;
             continue;
         }
         if mapping_count.saturating_add(manifest.mappings.len()) > MAX_MAPPINGS {
-            records.push(MappingRecord {
-                locator,
-                digest: raw_digest,
-                manifest: None,
-                observations: BTreeMap::new(),
-                reason: Some("graphql-repository-mapping-count-limit-exceeded".to_owned()),
-                end_line,
-                end_column,
-            });
+            push_inventory_record(
+                &mut records,
+                MappingRecord {
+                    locator,
+                    digest: raw_digest,
+                    manifest: None,
+                    observations: BTreeMap::new(),
+                    reason: Some("graphql-repository-mapping-count-limit-exceeded".to_owned()),
+                    end_line,
+                    end_column,
+                },
+            )?;
             continue;
         }
         mapping_count += manifest.mappings.len();
@@ -336,18 +336,39 @@ pub(super) fn inventory_repository_mappings(root: &Path) -> Result<RepositoryMap
                 observe_output(root, output, &mut output_bytes),
             );
         }
-        records.push(MappingRecord {
-            locator,
-            digest,
-            manifest: Some(manifest),
-            observations,
-            reason: None,
-            end_line,
-            end_column,
-        });
+        push_inventory_record(
+            &mut records,
+            MappingRecord {
+                locator,
+                digest,
+                manifest: Some(manifest),
+                observations,
+                reason: None,
+                end_line,
+                end_column,
+            },
+        )?;
     }
     records.sort_by(|left, right| left.locator.cmp(&right.locator));
     Ok(RepositoryMappingInventory { records })
+}
+
+fn record_inventory_entry(inventory_entries: &mut usize) -> Result<()> {
+    *inventory_entries = inventory_entries
+        .checked_add(1)
+        .context("GraphQL mapping inventory entry count overflowed")?;
+    if *inventory_entries > MAX_INVENTORY_ENTRIES {
+        anyhow::bail!("GraphQL mapping inventory exceeds its closed entry limit");
+    }
+    Ok(())
+}
+
+fn push_inventory_record(records: &mut Vec<MappingRecord>, record: MappingRecord) -> Result<()> {
+    if records.len() >= MAX_MANIFESTS {
+        anyhow::bail!("GraphQL mapping inventory exceeds its closed manifest limit");
+    }
+    records.push(record);
+    Ok(())
 }
 
 fn skipped_record(locator: &str, reason: &str) -> MappingRecord {
@@ -421,22 +442,24 @@ fn validate_manifest(manifest: &mut RepositoryMappingManifest) -> std::result::R
 
 fn observe_output(root: &Path, relative: &str, total_bytes: &mut usize) -> OutputObservation {
     let path = root.join(relative);
-    if !confined_regular_file(root, &path) {
-        return output_failure("graphql-mapped-output-is-missing-or-unsafe");
-    }
-    let file_len = match fs::metadata(&path) {
-        Ok(metadata) => metadata.len() as usize,
-        Err(_) => return output_failure("graphql-mapped-output-metadata-unavailable"),
+    let bytes = match read_bounded_repository_file(root, &path, MAX_OUTPUT_BYTES) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            let reason = if error.code == "query_file_size_or_type_invalid" {
+                "graphql-mapped-output-byte-limit-exceeded"
+            } else {
+                "graphql-mapped-output-is-missing-or-unsafe"
+            };
+            return output_failure(reason);
+        }
     };
-    if file_len > MAX_OUTPUT_BYTES || total_bytes.saturating_add(file_len) > MAX_TOTAL_OUTPUT_BYTES
-    {
+    let Some(total_output_bytes) = total_bytes.checked_add(bytes.len()) else {
+        return output_failure("graphql-mapped-output-byte-limit-exceeded");
+    };
+    if total_output_bytes > MAX_TOTAL_OUTPUT_BYTES {
         return output_failure("graphql-mapped-output-byte-limit-exceeded");
     }
-    *total_bytes += file_len;
-    let bytes = match read_bounded(&path, MAX_OUTPUT_BYTES) {
-        Ok(bytes) => bytes,
-        Err(_) => return output_failure("graphql-mapped-output-read-failed"),
-    };
+    *total_bytes = total_output_bytes;
     let digest = Some(sha256_prefixed(&bytes));
     let source = match std::str::from_utf8(&bytes) {
         Ok(source) => source,
@@ -464,26 +487,6 @@ fn output_failure(reason: &str) -> OutputObservation {
         line_columns: Vec::new(),
         reason: Some(reason.to_owned()),
     }
-}
-
-fn confined_regular_file(root: &Path, path: &Path) -> bool {
-    let Ok(relative) = path.strip_prefix(root) else {
-        return false;
-    };
-    let mut current = root.to_path_buf();
-    for component in relative.components() {
-        let Component::Normal(component) = component else {
-            return false;
-        };
-        current.push(component);
-        let Ok(metadata) = fs::symlink_metadata(&current) else {
-            return false;
-        };
-        if metadata.file_type().is_symlink() {
-            return false;
-        }
-    }
-    fs::metadata(path).is_ok_and(|metadata| metadata.is_file())
 }
 
 fn valid_repository_path(path: &str) -> bool {
@@ -1634,5 +1637,30 @@ type Query @key(fields: "id") {
                 .as_array()
                 .is_some_and(|records| records.len() == 1)
         );
+    }
+
+    #[test]
+    fn mapping_inventory_limits_fail_closed_without_growing_records() {
+        let mut inventory_entries = MAX_INVENTORY_ENTRIES - 1;
+        record_inventory_entry(&mut inventory_entries).unwrap();
+        assert_eq!(inventory_entries, MAX_INVENTORY_ENTRIES);
+        assert!(record_inventory_entry(&mut inventory_entries).is_err());
+
+        let mut records = Vec::new();
+        for index in 0..MAX_MANIFESTS {
+            push_inventory_record(
+                &mut records,
+                skipped_record(&format!("mapping-{index}{MANIFEST_SUFFIX}"), "test-skip"),
+            )
+            .unwrap();
+        }
+        assert!(
+            push_inventory_record(
+                &mut records,
+                skipped_record(&format!("overflow{MANIFEST_SUFFIX}"), "test-skip"),
+            )
+            .is_err()
+        );
+        assert_eq!(records.len(), MAX_MANIFESTS);
     }
 }
