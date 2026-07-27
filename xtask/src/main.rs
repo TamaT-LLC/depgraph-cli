@@ -3060,12 +3060,6 @@ fn validate_bounded_query_package_smoke(
     target: &str,
     archive_sha256: &str,
 ) -> Result<()> {
-    let lowercase_sha256 = |value: &str| {
-        value.len() == 64
-            && value
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    };
     if report.schema_version != BOUNDED_QUERY_PACKAGE_SMOKE_SCHEMA_VERSION
         || report.target != target
         || report.archive_sha256 != archive_sha256
@@ -3091,6 +3085,17 @@ fn validate_bounded_query_package_smoke(
         bail!("packaged bounded query smoke report is incompatible for {target}");
     }
     Ok(())
+}
+
+fn lowercase_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn prefixed_lowercase_sha256(value: &str, prefix: &str) -> bool {
+    value.strip_prefix(prefix).is_some_and(lowercase_sha256)
 }
 
 fn stable_release_gate(
@@ -3195,22 +3200,13 @@ fn evaluate_stable_release_gate(
         && release.compatibility.bounded_query == bounded_query_contract
         && bounded_query_outputs.len() == 1
         && release.targets.iter().all(|target| {
-            target
-                .query_plan_digest
-                .starts_with("bounded-query-plan:sha256:")
-                && target
-                    .query_result_digest
-                    .starts_with("bounded-query-result:sha256:")
-                && target.query_output_sha256.len() == 64
-                && target
-                    .query_output_sha256
-                    .bytes()
-                    .all(|byte| byte.is_ascii_hexdigit())
-                && target.query_smoke_sha256.len() == 64
-                && target
-                    .query_smoke_sha256
-                    .bytes()
-                    .all(|byte| byte.is_ascii_hexdigit())
+            prefixed_lowercase_sha256(&target.query_plan_digest, "bounded-query-plan:sha256:")
+                && prefixed_lowercase_sha256(
+                    &target.query_result_digest,
+                    "bounded-query-result:sha256:",
+                )
+                && lowercase_sha256(&target.query_output_sha256)
+                && lowercase_sha256(&target.query_smoke_sha256)
         });
     let profile_selection_contract =
         depgraph_core::profile_selection_release_compatibility_contract();
@@ -3228,14 +3224,10 @@ fn evaluate_stable_release_gate(
         && release.compatibility.profile_selection == profile_selection_contract
         && profile_plan_outputs.len() == 1
         && release.targets.iter().all(|target| {
-            target
-                .profile_plan_digest
-                .starts_with("profile-selection-plan:sha256:")
-                && target.profile_plan_output_sha256.len() == 64
-                && target
-                    .profile_plan_output_sha256
-                    .bytes()
-                    .all(|byte| byte.is_ascii_hexdigit())
+            prefixed_lowercase_sha256(
+                &target.profile_plan_digest,
+                "profile-selection-plan:sha256:",
+            ) && lowercase_sha256(&target.profile_plan_output_sha256)
         });
 
     let checks = vec![
@@ -9123,8 +9115,8 @@ fn verify_packaged_bounded_query(
         .as_str()
         .context("packaged bounded query result omitted its digest")?
         .to_owned();
-    if !plan_digest.starts_with("bounded-query-plan:sha256:")
-        || !result_digest.starts_with("bounded-query-result:sha256:")
+    if !prefixed_lowercase_sha256(&plan_digest, "bounded-query-plan:sha256:")
+        || !prefixed_lowercase_sha256(&result_digest, "bounded-query-result:sha256:")
     {
         bail!("packaged bounded query returned malformed plan/result digests");
     }
@@ -9173,7 +9165,7 @@ fn verify_packaged_bounded_query(
     }
     let profile_plan_digest = profile_preview["plan"]["plan_id"]
         .as_str()
-        .filter(|value| value.starts_with("profile-selection-plan:sha256:"))
+        .filter(|value| prefixed_lowercase_sha256(value, "profile-selection-plan:sha256:"))
         .context("packaged profile plan omitted its canonical digest")?
         .to_owned();
 
@@ -10495,6 +10487,25 @@ mod tests {
             format!("bounded-query-result:sha256:{}", "9".repeat(64));
         assert_eq!(
             evaluate(&query_drift, &benchmark).decision,
+            StableReleaseDecision::Reject
+        );
+
+        let mut malformed_profile_plan = release.clone();
+        for target in &mut malformed_profile_plan.targets {
+            target.profile_plan_digest = "profile-selection-plan:sha256:not-a-sha256".to_owned();
+        }
+        assert_eq!(
+            evaluate(&malformed_profile_plan, &benchmark).decision,
+            StableReleaseDecision::Reject
+        );
+
+        let mut uppercase_profile_plan = release.clone();
+        for target in &mut uppercase_profile_plan.targets {
+            target.profile_plan_digest =
+                format!("profile-selection-plan:sha256:{}", "A".repeat(64));
+        }
+        assert_eq!(
+            evaluate(&uppercase_profile_plan, &benchmark).decision,
             StableReleaseDecision::Reject
         );
 
