@@ -8,6 +8,7 @@ use sha2::{Digest, Sha256};
 use walkdir::{DirEntry, WalkDir};
 
 use crate::bounded_query::read_bounded_repository_file;
+use crate::profile_selection_plan::profile_planning_file_content_affects_profiles;
 use crate::profile_selection_web::{
     WEB_PROFILE_PLANNING_VERSION, WebAutomaticBoundaryKind, WebProfileCandidateGenerationResult,
     WebProfilePlanningInput, WebRejectedProfileDeclaration, WebStaticProfileEvidence,
@@ -33,6 +34,10 @@ const MAX_PREVIEW_FILE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PREVIEW_TOTAL_BYTES: usize = 512 * 1024 * 1024;
 const MAX_PREVIEW_FILES: usize = 1_000_000;
 const MAX_PREVIEW_ENTRIES: usize = 1_000_000;
+// Ordinary source contents cannot change profile selection. Keep their closed
+// digest field canonical without opening every source during repeated plans.
+const CONTENT_UNBOUND_PROFILE_SOURCE_DIGEST: &str =
+    "sha256:0000000000000000000000000000000000000000000000000000000000000000";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -274,22 +279,26 @@ pub fn build_repository_profile_planning_inventory(
         if files.len() >= MAX_PREVIEW_FILES {
             bail!("profile preview exceeds its closed file-count limit");
         }
-        let bytes =
-            read_bounded_repository_file(&canonical_root, entry.path(), MAX_PREVIEW_FILE_BYTES)
-                .map_err(|error| {
-                    anyhow::anyhow!("failed to read bounded profile inventory file: {error}")
-                })?;
-        total_bytes = total_bytes
-            .checked_add(bytes.len())
-            .context("profile preview byte count overflow")?;
-        if total_bytes > MAX_PREVIEW_TOTAL_BYTES {
-            bail!("profile preview exceeds its closed total byte limit");
-        }
-        files.push(ProfilePlanningFile {
+        let mut file = ProfilePlanningFile {
             path: path.clone(),
             kind,
-            content_digest: format!("sha256:{}", hex::encode(Sha256::digest(&bytes))),
-        });
+            content_digest: CONTENT_UNBOUND_PROFILE_SOURCE_DIGEST.to_owned(),
+        };
+        if profile_planning_file_content_affects_profiles(&file) {
+            let bytes =
+                read_bounded_repository_file(&canonical_root, entry.path(), MAX_PREVIEW_FILE_BYTES)
+                    .map_err(|error| {
+                        anyhow::anyhow!("failed to read bounded profile inventory file: {error}")
+                    })?;
+            total_bytes = total_bytes
+                .checked_add(bytes.len())
+                .context("profile preview byte count overflow")?;
+            if total_bytes > MAX_PREVIEW_TOTAL_BYTES {
+                bail!("profile preview exceeds its closed total byte limit");
+            }
+            file.content_digest = format!("sha256:{}", hex::encode(Sha256::digest(&bytes)));
+        }
+        files.push(file);
         if let Some(unit_kind) = build_unit_kind(&path, language) {
             build_units.push(ProfilePlanningBuildUnit {
                 id: profile_planning_build_unit_id(language, unit_kind, &path, &path),
@@ -763,6 +772,25 @@ mod tests {
     fn only_profile_configuration_changes_the_profile_planning_identity() -> Result<()> {
         let root = tempfile::tempdir()?;
         fixture(root.path())?;
+        let inventory = build_repository_profile_planning_inventory(root.path())?;
+        assert_eq!(
+            inventory
+                .files
+                .iter()
+                .find(|file| file.path == "src/lib.rs")
+                .unwrap()
+                .content_digest,
+            CONTENT_UNBOUND_PROFILE_SOURCE_DIGEST
+        );
+        assert_ne!(
+            inventory
+                .files
+                .iter()
+                .find(|file| file.path == "Cargo.toml")
+                .unwrap()
+                .content_digest,
+            CONTENT_UNBOUND_PROFILE_SOURCE_DIGEST
+        );
         let baseline = plan_repository_profiles(root.path(), &Config::default(), None)?;
 
         fs::write(root.path().join("src/lib.rs"), "pub fn changed() {}\n")?;

@@ -220,7 +220,7 @@ pub fn profile_selection_inventory_digest(inventory: &ProfilePlanningInventory) 
             json!({
                 "path": file.path,
                 "kind": file.kind,
-                "content_digest": planning_file_content_affects_profiles(file)
+                "content_digest": profile_planning_file_content_affects_profiles(file)
                     .then_some(file.content_digest.as_str()),
             })
         })
@@ -236,7 +236,7 @@ pub fn profile_selection_inventory_digest(inventory: &ProfilePlanningInventory) 
     ))
 }
 
-fn planning_file_content_affects_profiles(file: &ProfilePlanningFile) -> bool {
+pub(crate) fn profile_planning_file_content_affects_profiles(file: &ProfilePlanningFile) -> bool {
     let name = file.path.rsplit('/').next().unwrap_or(file.path.as_str());
     matches!(file.kind, ProfilePlanningFileKind::FrameworkSource)
         || matches!(name, "Cargo.toml" | "go.mod" | "package.json")
