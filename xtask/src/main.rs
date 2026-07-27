@@ -606,12 +606,18 @@ fn verify_workflow_policy_text(
     if !matches!(top_permissions.as_slice(), [] | ["contents: read"]) {
         bail!("{name} has broad workflow-level permissions");
     }
+    if workflow.contains("\n  pull_request:") && workflow.contains("${{ secrets.") {
+        bail!("{name} exposes repository secrets to pull request execution");
+    }
     for line in workflow.lines() {
         let trimmed = line.trim_start();
-        let Some(specification) = trimmed
+        let specification = trimmed
             .strip_prefix("- uses:")
-            .or_else(|| trimmed.strip_prefix("uses:"))
-        else {
+            .or_else(|| trimmed.strip_prefix("uses:"));
+        if specification.is_none() && has_workflow_uses_key(trimmed) {
+            bail!("{name} contains a noncanonical uses key");
+        }
+        let Some(specification) = specification else {
             continue;
         };
         let specification = specification
@@ -667,9 +673,33 @@ fn verify_workflow_policy_text(
                 bail!("stable release source guard must be metadata-only and job-scoped");
             }
         }
-        _ => {}
+        _ => {
+            if workflow.lines().any(has_write_permission) {
+                bail!("{name} grants an unreviewed write permission");
+            }
+        }
     }
     Ok(())
+}
+
+fn has_workflow_uses_key(line: &str) -> bool {
+    let code = line.split('#').next().unwrap_or_default();
+    ["uses", "\"uses\"", "'uses'"].iter().any(|marker| {
+        code.match_indices(marker).any(|(index, matched)| {
+            let boundary = index == 0
+                || !code.as_bytes()[index - 1].is_ascii_alphanumeric()
+                    && code.as_bytes()[index - 1] != b'_';
+            boundary && code[index + matched.len()..].trim_start().starts_with(':')
+        })
+    })
+}
+
+fn has_write_permission(line: &str) -> bool {
+    let code = line.split('#').next().unwrap_or_default().trim();
+    code.contains("permissions:") && code.contains("write")
+        || code
+            .split_once(':')
+            .is_some_and(|(_, value)| value.trim() == "write")
 }
 
 fn top_level_permissions(workflow: &str) -> Result<Vec<&str>> {
@@ -11322,6 +11352,16 @@ mod tests {
             verify_workflow_policy_text("ci.yml", &mutable, &pins, &mut BTreeSet::new()).is_err()
         );
 
+        let inline_mutable = ci.replacen(
+            "- uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4",
+            "- { uses: actions/checkout@v4 }",
+            1,
+        );
+        assert!(
+            verify_workflow_policy_text("ci.yml", &inline_mutable, &pins, &mut BTreeSet::new(),)
+                .is_err()
+        );
+
         let broad = ci.replacen("contents: read", "contents: write", 1);
         assert!(
             verify_workflow_policy_text("ci.yml", &broad, &pins, &mut BTreeSet::new()).is_err()
@@ -11330,6 +11370,17 @@ mod tests {
         let secret = format!("{ci}\n# ${{{{ secrets.RELEASE_TOKEN }}}}\n");
         assert!(
             verify_workflow_policy_text("ci.yml", &secret, &pins, &mut BTreeSet::new()).is_err()
+        );
+
+        let unreviewed_write = "name: Auxiliary\non: workflow_dispatch\npermissions: {}\njobs:\n  mutate:\n    permissions:\n      issues: write\n";
+        assert!(
+            verify_workflow_policy_text(
+                "auxiliary.yml",
+                unreviewed_write,
+                &pins,
+                &mut BTreeSet::new(),
+            )
+            .is_err()
         );
 
         let dry_run = fs::read(root.join("security/disclosure-dry-run-v1.json"))?;
