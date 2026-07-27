@@ -339,6 +339,7 @@ fn parse_rust(locator: &str, digest: &str, source: &str) -> (Vec<FfiDeclaration>
     let mut boundaries = Vec::new();
     let mut block_comment_depth = 0_usize;
     let mut raw_string_hashes = None;
+    let mut quoted_string = None;
     let mut pending_library = None;
     let mut pending_symbol = None;
     let mut pending_stable_export = false;
@@ -367,6 +368,7 @@ fn parse_rust(locator: &str, digest: &str, source: &str) -> (Vec<FfiDeclaration>
             line,
             &mut block_comment_depth,
             &mut raw_string_hashes,
+            &mut quoted_string,
             false,
         );
         let trimmed = code.trim();
@@ -554,6 +556,7 @@ fn parse_web(locator: &str, digest: &str, source: &str) -> (Vec<FfiDeclaration>,
     let mut boundaries = Vec::new();
     let mut block_comment_depth = 0_usize;
     let mut raw_string_hashes = None;
+    let mut quoted_string = None;
     if ["process.dlopen(", "node-gyp-build(", "bindings("]
         .iter()
         .any(|needle| source.contains(needle))
@@ -561,8 +564,13 @@ fn parse_web(locator: &str, digest: &str, source: &str) -> (Vec<FfiDeclaration>,
         boundaries.push("ffi-web-dynamic-native-binding".to_owned());
     }
     for (index, line) in source.lines().enumerate() {
-        let code =
-            code_without_comments(line, &mut block_comment_depth, &mut raw_string_hashes, true);
+        let code = code_without_comments(
+            line,
+            &mut block_comment_depth,
+            &mut raw_string_hashes,
+            &mut quoted_string,
+            true,
+        );
         let trimmed = code.trim();
         if trimmed.is_empty() {
             continue;
@@ -1137,12 +1145,17 @@ fn code_without_comments(
     line: &str,
     block_comment_depth: &mut usize,
     raw_string_hashes: &mut Option<usize>,
+    quoted_string: &mut Option<char>,
     single_quote_strings: bool,
 ) -> String {
     let characters = line.chars().collect::<Vec<_>>();
     let mut result = String::with_capacity(line.len());
     let mut index = 0;
-    let mut quote = None;
+    let mut quote = *quoted_string;
+    let mut suppress_quote_contents = quote.is_some();
+    if let Some(terminator) = quote {
+        result.push(terminator);
+    }
     while index < characters.len() {
         if let Some(hashes) = *raw_string_hashes {
             if let Some(after_end) = raw_string_end(&characters, index, hashes) {
@@ -1167,15 +1180,23 @@ fn code_without_comments(
             continue;
         }
         if let Some(terminator) = quote {
-            result.push(character);
+            if !suppress_quote_contents {
+                result.push(character);
+            }
             if character == '\\' {
                 if let Some(escaped) = next {
-                    result.push(escaped);
+                    if !suppress_quote_contents {
+                        result.push(escaped);
+                    }
                     index += 2;
                     continue;
                 }
             } else if character == terminator {
                 quote = None;
+                if suppress_quote_contents {
+                    result.push(terminator);
+                    suppress_quote_contents = false;
+                }
             }
             index += 1;
             continue;
@@ -1213,6 +1234,7 @@ fn code_without_comments(
         result.push(character);
         index += 1;
     }
+    *quoted_string = quote;
     result
 }
 
@@ -1835,6 +1857,9 @@ unsafe extern "C" {
 extern "C" { fn block_comment(); }
 */
 let standard = "extern \"C\" { fn standard_string(); }";
+let multiline_standard = "prefix
+extern \"C\" { fn multiline_standard_string(); }
+suffix";
 let raw = r#"extern "C" { fn raw_string(); }"#;
 let multiline = r##"
 extern "C" { fn multiline_raw_string(); }
@@ -1854,6 +1879,9 @@ static ORDINARY: i32 = 0;
         let source = r#"
 const example = "addon.node";
 const another = './not-a-load.node';
+const multiline = `prefix
+require("./multiline-template.node")
+suffix`;
 import { hash } from './real.node';
 const native = require("./required.node");
 declare module '*.node';
