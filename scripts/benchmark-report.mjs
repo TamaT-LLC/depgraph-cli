@@ -517,7 +517,10 @@ function validateIncrementalAttempts(rawDir, changedFile) {
       !attempt.base_snapshot_id ||
       !attempt.completed_snapshot_id ||
       !attempt.invalidation_plan ||
-      attempt.invalidation_plan.schema_version !== "incremental-plan-v1" ||
+      attempt.invalidation_plan.schema_version !== "incremental-plan-v2" ||
+      !/^profile-selection-plan:sha256:[0-9a-f]{64}$/.test(
+        attempt.invalidation_plan.base_profile_plan_id,
+      ) ||
       !Array.isArray(attempt.invalidation_plan.affected_profile_ids) ||
       attempt.invalidation_plan.affected_profile_ids.length === 0 ||
       !validIncrementalTrace(trace) ||
@@ -535,6 +538,7 @@ function validateIncrementalAttempts(rawDir, changedFile) {
       base_snapshot_id: attempt.base_snapshot_id,
       completed_snapshot_id: attempt.completed_snapshot_id,
       invalidation_schema_version: attempt.invalidation_plan.schema_version,
+      base_profile_plan_id: attempt.invalidation_plan.base_profile_plan_id,
       affected_profiles: attempt.invalidation_plan.affected_profile_ids?.length ?? 0,
       incremental_trace: trace,
     };
@@ -831,7 +835,11 @@ function validEvidence(report) {
         typeof attempt.completed_snapshot_id === "string" &&
         attempt.completed_snapshot_id.startsWith("snapshot:sha256:") &&
         attempt.base_snapshot_id !== attempt.completed_snapshot_id &&
-        attempt.invalidation_schema_version === "incremental-plan-v1" &&
+        attempt.invalidation_schema_version === "incremental-plan-v2" &&
+        typeof attempt.base_profile_plan_id === "string" &&
+        /^profile-selection-plan:sha256:[0-9a-f]{64}$/.test(
+          attempt.base_profile_plan_id,
+        ) &&
         Number.isSafeInteger(attempt.affected_profiles) &&
         attempt.affected_profiles > 0 &&
         validIncrementalTrace(attempt.incremental_trace),

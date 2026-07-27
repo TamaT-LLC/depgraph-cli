@@ -62,6 +62,25 @@ pub fn validate_cross_language_worker_protocol(protocol: &ValidatedProtocol) -> 
                 profile.id
             );
         }
+        for participant_id in &identity.participating_profile_ids {
+            let participant = protocol.profiles.get(participant_id).with_context(|| {
+                format!(
+                    "cross-language profile {} references undeclared participating profile {}",
+                    profile.id, participant_id
+                )
+            })?;
+            if participant.language == "cross-language"
+                || participant
+                    .properties
+                    .contains_key(CROSS_LANGUAGE_CONTRACT_PROPERTY)
+            {
+                bail!(
+                    "cross-language profile {} uses cross-language profile {} as a participant",
+                    profile.id,
+                    participant_id
+                );
+            }
+        }
         let ledger: CrossLanguageCompletenessLedger =
             property(&profile.properties, CROSS_LANGUAGE_COMPLETENESS_PROPERTY)
                 .with_context(|| format!("cross-language profile {} ledger", profile.id))?;
@@ -154,8 +173,12 @@ pub fn validate_cross_language_worker_protocol(protocol: &ValidatedProtocol) -> 
         let relation: CrossLanguageRelationKind =
             serde_json::from_value(Value::String(site.kind.clone()))
                 .with_context(|| format!("cross-language site {} relation", site.id))?;
+        let primary_evidence = site
+            .evidence
+            .first()
+            .with_context(|| format!("cross-language site {} has no evidence", site.id))?;
         let evidence: CrossLanguageEvidenceProperties = serde_json::from_value(Value::Object(
-            site.evidence[0].properties.clone().into_iter().collect(),
+            primary_evidence.properties.clone().into_iter().collect(),
         ))
         .with_context(|| format!("cross-language site {} evidence", site.id))?;
         if relation != evidence.occurrence_kind
@@ -179,7 +202,7 @@ pub fn validate_cross_language_worker_protocol(protocol: &ValidatedProtocol) -> 
         cross_sites.insert(site.id.clone(), site);
     }
 
-    let mut edge_counts_by_site = BTreeMap::<String, u64>::new();
+    let mut edge_targets_by_site = BTreeMap::<String, BTreeSet<String>>::new();
     for edge in protocol.edges.values() {
         if !claimed_profiles.contains_key(edge.profile_id.as_str())
             && !cross_node_ids.contains(edge.source.as_str())
@@ -200,8 +223,12 @@ pub fn validate_cross_language_worker_protocol(protocol: &ValidatedProtocol) -> 
                 edge.id
             )
         })?;
+        let primary_evidence = edge
+            .evidence
+            .first()
+            .with_context(|| format!("cross-language edge {} has no evidence", edge.id))?;
         let evidence: CrossLanguageEvidenceProperties = serde_json::from_value(Value::Object(
-            edge.evidence[0].properties.clone().into_iter().collect(),
+            primary_evidence.properties.clone().into_iter().collect(),
         ))
         .with_context(|| format!("cross-language edge {} evidence", edge.id))?;
         if relation != evidence.occurrence_kind
@@ -218,21 +245,24 @@ pub fn validate_cross_language_worker_protocol(protocol: &ValidatedProtocol) -> 
                 edge.id
             );
         }
-        *edge_counts_by_site.entry(site_id.to_owned()).or_default() += 1;
+        edge_targets_by_site
+            .entry(site_id.to_owned())
+            .or_default()
+            .insert(edge.target.clone());
         counts
             .entry((edge.profile_id.clone(), evidence.format))
             .or_default()
             .edges += 1;
     }
     for (site_id, site) in &cross_sites {
-        if edge_counts_by_site
+        let edge_targets = edge_targets_by_site
             .get(site_id)
-            .copied()
-            .unwrap_or_default()
-            != site.target_ids.len() as u64
-        {
+            .cloned()
+            .unwrap_or_default();
+        let site_targets = site.target_ids.iter().cloned().collect::<BTreeSet<_>>();
+        if edge_targets != site_targets {
             bail!(
-                "cross-language dependency site {} has an incomplete core edge closure",
+                "cross-language dependency site {} has a mismatched core edge closure",
                 site.id
             );
         }
@@ -301,6 +331,45 @@ mod tests {
             .properties
             .remove("canonical_identity");
         assert!(validate_cross_language_worker_protocol(&missing_identity).is_err());
+
+        let mut missing_site_evidence = protocol.clone();
+        missing_site_evidence
+            .sites
+            .values_mut()
+            .next()
+            .unwrap()
+            .evidence
+            .clear();
+        assert!(validate_cross_language_worker_protocol(&missing_site_evidence).is_err());
+
+        let mut missing_edge_evidence = protocol.clone();
+        missing_edge_evidence
+            .edges
+            .values_mut()
+            .next()
+            .unwrap()
+            .evidence
+            .clear();
+        assert!(validate_cross_language_worker_protocol(&missing_edge_evidence).is_err());
+
+        let mut missing_participant = protocol.clone();
+        missing_participant.profiles.remove("web:production");
+        assert!(validate_cross_language_worker_protocol(&missing_participant).is_err());
+
+        let mut mismatched_targets = protocol.clone();
+        let operation_targets = mismatched_targets
+            .nodes
+            .values()
+            .filter(|node| node.kind == "operation")
+            .map(|node| node.id.clone())
+            .collect::<Vec<_>>();
+        let edge = mismatched_targets.edges.values_mut().next().unwrap();
+        edge.target = operation_targets
+            .into_iter()
+            .find(|target| target != &edge.target)
+            .unwrap();
+        edge.id = build_cross_language_edge_id(edge).unwrap();
+        assert!(validate_cross_language_worker_protocol(&mismatched_targets).is_err());
 
         let mut drifted = protocol;
         let profile = drifted.profiles.values_mut().next().unwrap();
