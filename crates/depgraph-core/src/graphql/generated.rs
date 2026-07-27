@@ -543,9 +543,6 @@ impl Claim<'_> {
     fn endpoint_digest(&self) -> String {
         digest_value(&json!({
             "language": self.mapping.language,
-            "role": self.mapping.role,
-            "contract_path": self.mapping.contract_path,
-            "coordinate": self.mapping.coordinate,
             "output": self.mapping.output,
             "endpoint": self.mapping.endpoint,
         }))
@@ -593,19 +590,20 @@ pub(super) fn apply_repository_mappings(
             .insert(claim.mapping.output_digest.clone());
     }
     for endpoint_claims in claims_by_endpoint.into_values() {
-        let claim = &endpoint_claims[0];
-        let reason = mapping_failure_reason(
-            claim,
-            endpoint_claims.len(),
-            tools_by_output
-                .get(&claim.mapping.output)
-                .is_some_and(|tools| tools.len() > 1),
-            digests_by_output
-                .get(&claim.mapping.output)
-                .is_some_and(|digests| digests.len() > 1),
-            builder,
-        );
-        emit_claim(builder, claim, reason.as_deref())?;
+        for claim in &endpoint_claims {
+            let reason = mapping_failure_reason(
+                claim,
+                endpoint_claims.len(),
+                tools_by_output
+                    .get(&claim.mapping.output)
+                    .is_some_and(|tools| tools.len() > 1),
+                digests_by_output
+                    .get(&claim.mapping.output)
+                    .is_some_and(|digests| digests.len() > 1),
+                builder,
+            );
+            emit_claim(builder, claim, reason.as_deref())?;
+        }
     }
     Ok(())
 }
@@ -1419,6 +1417,83 @@ type Product { id: ID!, name: String! }
         )
         .unwrap();
         assert!(ledger.entries[0].reasons.is_empty());
+    }
+
+    #[test]
+    fn one_repository_endpoint_cannot_map_multiple_contract_coordinates_exactly() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join("generated")).unwrap();
+        fs::write(root.path().join("schema.graphql"), SCHEMA).unwrap();
+        let operations =
+            "query GetProduct($id: ID!) { product(id: $id) { id } }\nquery GetLocal { local }\n";
+        fs::write(root.path().join("operations.graphql"), operations).unwrap();
+        let mut documents = vec![
+            DocumentIdentity {
+                path: "schema.graphql".to_owned(),
+                digest: sha256_prefixed(SCHEMA.as_bytes()),
+            },
+            DocumentIdentity {
+                path: "operations.graphql".to_owned(),
+                digest: sha256_prefixed(operations.as_bytes()),
+            },
+        ];
+        documents.sort();
+
+        let output = "generated/shared.rs";
+        let endpoint = "shared_call";
+        let source = format!("fn {endpoint}() {{}}\n");
+        fs::write(root.path().join(output), &source).unwrap();
+        let mapping = RepositoryMapping {
+            language: MappingLanguage::Rust,
+            role: MappingRole::Client,
+            contract_path: "operations.graphql".to_owned(),
+            coordinate: "query GetProduct".to_owned(),
+            output: output.to_owned(),
+            output_digest: sha256_prefixed(source.as_bytes()),
+            endpoint: endpoint.to_owned(),
+            proof: MappingProof::CompilerSourceMap,
+            dynamic: false,
+            start_line: 1,
+            start_column: 1,
+            end_line: 1,
+            end_column: u32::try_from(source.trim_end().chars().count() + 1).unwrap(),
+        };
+        let mut manifest =
+            mapping_manifest(("cynic-codegen", "3.12.0"), &documents, mapping.clone());
+        manifest.mappings.push(RepositoryMapping {
+            coordinate: "query GetLocal".to_owned(),
+            ..mapping
+        });
+        fs::write(
+            root.path().join(format!("ambiguous{MANIFEST_SUFFIX}")),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let delta = scan_graphql_repository(root.path(), &["profile:test".to_owned()])
+            .unwrap()
+            .unwrap();
+        let endpoint_sites = delta
+            .sites
+            .iter()
+            .filter(|site| {
+                site.evidence[0]
+                    .properties
+                    .get("repository_endpoint")
+                    .is_some_and(|value| value == endpoint)
+                    && site.kind == CrossLanguageRelationKind::CallsOperation.as_str()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(endpoint_sites.len(), 2);
+        assert!(endpoint_sites.iter().all(|site| {
+            site.resolution_status == ResolutionStatus::Unresolved
+                && site.reason.as_deref() == Some("graphql-ambiguous-endpoint-provenance")
+        }));
+        assert!(!delta.edges.iter().any(|edge| {
+            edge.generated
+                && edge.resolution_status == ResolutionStatus::Resolved
+                && edge.evidence[0].properties["repository_endpoint"] == endpoint
+        }));
     }
 
     #[test]
