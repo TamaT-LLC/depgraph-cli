@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use anyhow::{Result, bail};
-use depgraph_store::{GraphSnapshot, IncrementalReplacementScope, NodeRecord};
+use depgraph_store::{GraphSnapshot, IncrementalReplacementScope, NodeRecord, ProfileRecord};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -384,11 +384,22 @@ pub fn plan_incremental_invalidation(
 }
 
 pub fn snapshot_profile_plan_id(snapshot: &GraphSnapshot) -> Result<Option<String>> {
+    profile_plan_id_from_properties(snapshot.profiles.iter().map(|profile| &profile.properties))
+}
+
+pub(crate) fn profile_records_profile_plan_id(
+    profiles: &[ProfileRecord],
+) -> Result<Option<String>> {
+    profile_plan_id_from_properties(profiles.iter().map(|profile| &profile.properties))
+}
+
+fn profile_plan_id_from_properties<'a>(
+    properties: impl IntoIterator<Item = &'a Value>,
+) -> Result<Option<String>> {
     let mut ids = BTreeSet::new();
     let mut missing = false;
-    for profile in &snapshot.profiles {
-        match profile
-            .properties
+    for properties in properties {
+        match properties
             .get("profile_selection_plan_id")
             .and_then(Value::as_str)
         {
