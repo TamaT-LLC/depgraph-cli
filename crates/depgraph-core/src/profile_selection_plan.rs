@@ -213,11 +213,33 @@ pub fn canonical_profile_planning_inventory(
 
 pub fn profile_selection_inventory_digest(inventory: &ProfilePlanningInventory) -> Result<String> {
     let canonical = canonical_profile_planning_inventory(inventory)?;
-    let payload = canonical_json(&serde_json::to_value(canonical)?);
+    let files = canonical
+        .files
+        .iter()
+        .map(|file| {
+            json!({
+                "path": file.path,
+                "kind": file.kind,
+                "content_digest": planning_file_content_affects_profiles(file)
+                    .then_some(file.content_digest.as_str()),
+            })
+        })
+        .collect::<Vec<_>>();
+    let payload = canonical_json(&json!({
+        "inventory_version": canonical.inventory_version,
+        "files": files,
+        "build_units": canonical.build_units,
+    }));
     Ok(format!(
         "sha256:{}",
         hex::encode(Sha256::digest(payload.as_bytes()))
     ))
+}
+
+fn planning_file_content_affects_profiles(file: &ProfilePlanningFile) -> bool {
+    let name = file.path.rsplit('/').next().unwrap_or(file.path.as_str());
+    matches!(file.kind, ProfilePlanningFileKind::FrameworkSource)
+        || matches!(name, "Cargo.toml" | "go.mod" | "package.json")
 }
 
 pub fn classify_profile_selection_repository(
@@ -777,7 +799,7 @@ mod tests {
     }
 
     #[test]
-    fn inventory_digest_is_order_and_checkout_independent_but_content_bound() -> Result<()> {
+    fn inventory_digest_binds_planning_content_but_not_ordinary_source_content() -> Result<()> {
         let mut first = ProfilePlanningInventory {
             inventory_version: PROFILE_SELECTION_INVENTORY_VERSION.to_owned(),
             files: vec![
@@ -813,9 +835,25 @@ mod tests {
         );
 
         first.files[0].content_digest = digest('3');
-        assert_ne!(
+        assert_eq!(
             profile_selection_inventory_digest(&first)?,
             profile_selection_inventory_digest(&reordered)?
+        );
+
+        let mut manifest_baseline = reordered.clone();
+        manifest_baseline
+            .files
+            .push(file("Cargo.toml", ProfilePlanningFileKind::RustSource, '4'));
+        let mut manifest_changed = manifest_baseline.clone();
+        manifest_changed
+            .files
+            .iter_mut()
+            .find(|file| file.path == "Cargo.toml")
+            .unwrap()
+            .content_digest = digest('5');
+        assert_ne!(
+            profile_selection_inventory_digest(&manifest_baseline)?,
+            profile_selection_inventory_digest(&manifest_changed)?
         );
 
         let mut absolute = reordered;

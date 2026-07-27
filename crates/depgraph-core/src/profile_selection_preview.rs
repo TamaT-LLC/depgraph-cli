@@ -26,7 +26,7 @@ use crate::{
     RustRejectedProfileDeclaration, RustRootFeatureDeclaration, RustStaticProfileEvidence,
     RustTargetDeclaration, build_profile_selection_input, canonical_profile_planning_inventory,
     generate_go_profile_candidates, plan_automatic_profile_selection,
-    profile_planning_build_unit_id,
+    profile_planning_build_unit_id, profile_selection_inventory_digest,
 };
 
 const MAX_PREVIEW_FILE_BYTES: usize = 16 * 1024 * 1024;
@@ -444,13 +444,17 @@ fn generate_web_preview(
     if framework_capability_ids.len() > 64 {
         bail!("web preview exceeds its closed framework-capability limit");
     }
+    let package_snapshot_id = profile_selection_inventory_digest(inventory)?;
     generate_web_profile_candidates(WebProfilePlanningInput {
         planning_version: WEB_PROFILE_PLANNING_VERSION.to_owned(),
         bundled_typescript_compatibility_id: stable_id_from_value(
             "web-typescript-compatibility",
             &json!("typescript-7.0.2"),
         ),
-        package_snapshot_id: stable_id_from_value("web-package-snapshot", &json!(inventory.files)),
+        package_snapshot_id: stable_id_from_value(
+            "web-package-snapshot",
+            &json!(package_snapshot_id),
+        ),
         framework_capability_ids,
         baseline: web_evidence("web-baseline", evidence_path),
         environments: Vec::new(),
@@ -761,15 +765,30 @@ mod tests {
         fixture(root.path())?;
         let baseline = plan_repository_profiles(root.path(), &Config::default(), None)?;
 
+        fs::write(root.path().join("src/lib.rs"), "pub fn changed() {}\n")?;
+        fs::write(
+            root.path().join("web/app.ts"),
+            "export const changed = true;\n",
+        )?;
+        let source_only = plan_repository_profiles(root.path(), &Config::default(), None)?;
+        assert_eq!(baseline.plan.plan_id, source_only.plan.plan_id);
+
+        fs::write(
+            root.path().join("web/package.json"),
+            "{\"name\":\"changed\"}\n",
+        )?;
+        let manifest = plan_repository_profiles(root.path(), &Config::default(), None)?;
+        assert_ne!(baseline.plan.plan_id, manifest.plan.plan_id);
+
         let mut scan_only = Config::default();
         scan_only.scan.max_stderr_bytes += 1;
         let scan_only = plan_repository_profiles(root.path(), &scan_only, None)?;
-        assert_eq!(baseline.plan.plan_id, scan_only.plan.plan_id);
+        assert_eq!(manifest.plan.plan_id, scan_only.plan.plan_id);
 
         let mut profile = Config::default();
         profile.profiles.rust_targets = vec!["wasm32-wasip1".to_owned()];
         let profile = plan_repository_profiles(root.path(), &profile, None)?;
-        assert_ne!(baseline.plan.plan_id, profile.plan.plan_id);
+        assert_ne!(manifest.plan.plan_id, profile.plan.plan_id);
         Ok(())
     }
 }
