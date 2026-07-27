@@ -1,10 +1,9 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs::File,
-    io::Read,
     path::{Component, Path},
 };
 
+use crate::bounded_query::read_bounded_repository_file;
 use anyhow::{Context, Result, bail};
 use depgraph_protocol::{
     CROSS_LANGUAGE_COMPLETENESS_PROPERTY, CROSS_LANGUAGE_COMPLETENESS_VERSION,
@@ -28,6 +27,7 @@ pub const GRAPHQL_FORMAT_VERSION: &str = "graphql-spec-2021";
 pub const MAX_GRAPHQL_FILE_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_GRAPHQL_TOTAL_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_GRAPHQL_FILES: usize = 4_096;
+pub const MAX_GRAPHQL_INVENTORY_ENTRIES: usize = 1_000_000;
 pub const MAX_GRAPHQL_TOKENS: usize = 1_000_000;
 pub const MAX_GRAPHQL_DEPTH: usize = 64;
 pub const MAX_GRAPHQL_DEFINITIONS: usize = 100_000;
@@ -354,12 +354,14 @@ struct SourceSpan {
 fn inventory_graphql_sources(root: &Path) -> Result<Vec<SourceRecord>> {
     let mut records = Vec::new();
     let mut total_bytes = 0_usize;
+    let mut inventory_entries = 0_usize;
     let walker = WalkDir::new(root)
         .follow_links(false)
         .sort_by_file_name()
         .into_iter()
         .filter_entry(inventory_entry_allowed);
     for entry in walker {
+        record_graphql_inventory_entry(&mut inventory_entries)?;
         let entry = match entry {
             Ok(entry) => entry,
             Err(_) => continue,
@@ -373,84 +375,104 @@ fn inventory_graphql_sources(root: &Path) -> Result<Vec<SourceRecord>> {
         if !is_graphql_locator(&locator) {
             continue;
         }
-        if records.len() >= MAX_GRAPHQL_FILES {
-            records.push(skipped_source(
-                &locator,
-                "graphql-file-count-limit-exceeded",
-            ));
-            break;
-        }
         if entry.file_type().is_symlink() {
-            records.push(skipped_source(
-                &locator,
-                "graphql-source-symlink-not-admitted",
-            ));
+            push_graphql_source_record(
+                &mut records,
+                skipped_source(&locator, "graphql-source-symlink-not-admitted"),
+            )?;
             continue;
         }
         if !entry.file_type().is_file() {
-            records.push(skipped_source(&locator, "graphql-source-is-not-a-file"));
+            push_graphql_source_record(
+                &mut records,
+                skipped_source(&locator, "graphql-source-is-not-a-file"),
+            )?;
             continue;
         }
-        let len = match entry.metadata() {
-            Ok(metadata) => metadata.len() as usize,
-            Err(_) => {
-                records.push(skipped_source(
-                    &locator,
-                    "graphql-source-metadata-unavailable",
-                ));
-                continue;
-            }
-        };
-        if len > MAX_GRAPHQL_FILE_BYTES || total_bytes.saturating_add(len) > MAX_GRAPHQL_TOTAL_BYTES
-        {
-            records.push(skipped_source(
-                &locator,
-                "graphql-source-byte-limit-exceeded",
-            ));
-            continue;
-        }
-        total_bytes += len;
-        let bytes = match read_bounded(entry.path(), MAX_GRAPHQL_FILE_BYTES) {
+        let bytes = match read_bounded_repository_file(root, entry.path(), MAX_GRAPHQL_FILE_BYTES) {
             Ok(bytes) => bytes,
-            Err(_) => {
-                records.push(skipped_source(&locator, "graphql-source-read-failed"));
+            Err(error) => {
+                let reason = if error.code == "query_file_size_or_type_invalid" {
+                    "graphql-source-byte-limit-exceeded"
+                } else {
+                    "graphql-source-read-failed"
+                };
+                push_graphql_source_record(&mut records, skipped_source(&locator, reason))?;
                 continue;
             }
         };
+        let Some(next_total_bytes) = total_bytes.checked_add(bytes.len()) else {
+            bail!("GraphQL source inventory byte count overflowed");
+        };
+        if next_total_bytes > MAX_GRAPHQL_TOTAL_BYTES {
+            push_graphql_source_record(
+                &mut records,
+                skipped_source(&locator, "graphql-source-total-byte-limit-exceeded"),
+            )?;
+            continue;
+        }
+        total_bytes = next_total_bytes;
         let digest = sha256_prefixed(&bytes);
         let source = match std::str::from_utf8(&bytes) {
             Ok(source) => source,
             Err(_) => {
-                records.push(SourceRecord {
-                    locator,
-                    digest,
-                    document: None,
-                    reason: Some("graphql-source-is-not-utf8".to_owned()),
-                });
+                push_graphql_source_record(
+                    &mut records,
+                    SourceRecord {
+                        locator,
+                        digest,
+                        document: None,
+                        reason: Some("graphql-source-is-not-utf8".to_owned()),
+                    },
+                )?;
                 continue;
             }
         };
         let document = match parse_graphql_document(source, &digest) {
             Ok(document) => document,
             Err(reason) => {
-                records.push(SourceRecord {
-                    locator,
-                    digest,
-                    document: None,
-                    reason: Some(reason),
-                });
+                push_graphql_source_record(
+                    &mut records,
+                    SourceRecord {
+                        locator,
+                        digest,
+                        document: None,
+                        reason: Some(reason),
+                    },
+                )?;
                 continue;
             }
         };
-        records.push(SourceRecord {
-            locator,
-            digest,
-            document: Some(document),
-            reason: None,
-        });
+        push_graphql_source_record(
+            &mut records,
+            SourceRecord {
+                locator,
+                digest,
+                document: Some(document),
+                reason: None,
+            },
+        )?;
     }
     records.sort_by(|left, right| left.locator.cmp(&right.locator));
     Ok(records)
+}
+
+fn record_graphql_inventory_entry(inventory_entries: &mut usize) -> Result<()> {
+    *inventory_entries = inventory_entries
+        .checked_add(1)
+        .context("GraphQL inventory entry count overflowed")?;
+    if *inventory_entries > MAX_GRAPHQL_INVENTORY_ENTRIES {
+        bail!("GraphQL inventory exceeds its closed entry limit");
+    }
+    Ok(())
+}
+
+fn push_graphql_source_record(records: &mut Vec<SourceRecord>, record: SourceRecord) -> Result<()> {
+    if records.len() >= MAX_GRAPHQL_FILES {
+        bail!("GraphQL inventory exceeds its closed source-file limit");
+    }
+    records.push(record);
+    Ok(())
 }
 
 fn skipped_source(locator: &str, reason: &str) -> SourceRecord {
@@ -2475,17 +2497,6 @@ fn repository_locator(root: &Path, path: &Path) -> Option<String> {
     (!locator.is_empty() && !locator.contains('\\')).then_some(locator)
 }
 
-fn read_bounded(path: &Path, max_bytes: usize) -> Result<Vec<u8>> {
-    let mut bytes = Vec::new();
-    File::open(path)?
-        .take(max_bytes as u64 + 1)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() > max_bytes {
-        bail!("bounded GraphQL read exceeded its byte limit");
-    }
-    Ok(bytes)
-}
-
 fn sha256_prefixed(bytes: &[u8]) -> String {
     format!("sha256:{}", hex::encode(Sha256::digest(bytes)))
 }
@@ -2791,5 +2802,30 @@ fragment B on User { id ...A }
                 .to_string()
                 .contains("profile")
         );
+    }
+
+    #[test]
+    fn graphql_inventory_limits_fail_closed_without_growing_records() {
+        let mut inventory_entries = MAX_GRAPHQL_INVENTORY_ENTRIES - 1;
+        record_graphql_inventory_entry(&mut inventory_entries).unwrap();
+        assert_eq!(inventory_entries, MAX_GRAPHQL_INVENTORY_ENTRIES);
+        assert!(record_graphql_inventory_entry(&mut inventory_entries).is_err());
+
+        let mut records = Vec::new();
+        for index in 0..MAX_GRAPHQL_FILES {
+            push_graphql_source_record(
+                &mut records,
+                skipped_source(&format!("source-{index}.graphql"), "test-skip"),
+            )
+            .unwrap();
+        }
+        assert!(
+            push_graphql_source_record(
+                &mut records,
+                skipped_source("overflow.graphql", "test-skip"),
+            )
+            .is_err()
+        );
+        assert_eq!(records.len(), MAX_GRAPHQL_FILES);
     }
 }
