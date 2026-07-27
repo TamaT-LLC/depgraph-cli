@@ -787,10 +787,10 @@ fn digest_value(value: &impl Serialize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, time::Duration};
+    use std::{collections::BTreeMap, fs, time::Duration};
 
     use depgraph_protocol::{
-        CROSS_LANGUAGE_COMPLETENESS_PROPERTY, CrossLanguageCompletenessLedger,
+        CROSS_LANGUAGE_COMPLETENESS_PROPERTY, CrossLanguageCompletenessLedger, Profile,
         validate_cross_language_adapter_delta,
     };
     use tempfile::tempdir;
@@ -798,6 +798,20 @@ mod tests {
     use crate::{BuildAudit, BuildExecutionOutcome, NetworkIsolation, ffi::scan_ffi_repository};
 
     use super::*;
+
+    fn profile(id: &str) -> Profile {
+        Profile {
+            id: id.to_owned(),
+            language: "polyglot".to_owned(),
+            toolchain: None,
+            command: None,
+            target: None,
+            features: Vec::new(),
+            environment: BTreeMap::new(),
+            source_revision: None,
+            properties: BTreeMap::new(),
+        }
+    }
 
     #[test]
     fn linux_macos_and_windows_observations_require_same_profile_and_become_observed() {
@@ -812,11 +826,11 @@ mod tests {
             ("macos-aarch64", "aarch64-apple-darwin", "aarch64"),
             ("windows-x86_64", "x86_64-pc-windows-msvc", "x86_64"),
         ];
-        let profile_ids = platforms
+        let profiles = platforms
             .iter()
-            .map(|(profile, _, _)| (*profile).to_owned())
+            .map(|(profile_id, _, _)| profile(profile_id))
             .collect::<Vec<_>>();
-        let mut delta = scan_ffi_repository(root.path(), &profile_ids)
+        let mut delta = scan_ffi_repository(root.path(), &profiles)
             .unwrap()
             .unwrap();
 
@@ -888,7 +902,7 @@ mod tests {
             "#[link(name = \"crypto\")]\nextern \"C\" {\nfn one();\nfn two();\n}\n",
         )
         .unwrap();
-        let delta = scan_ffi_repository(root.path(), &["linux".to_owned()])
+        let delta = scan_ffi_repository(root.path(), &[profile("linux")])
             .unwrap()
             .unwrap();
         let sites = static_sites_for_profile(&delta, "linux");
@@ -1049,10 +1063,10 @@ mod tests {
             )
             .unwrap();
         }
-        let first = scan_ffi_repository(first.path(), &["linux".to_owned()])
+        let first = scan_ffi_repository(first.path(), &[profile("linux")])
             .unwrap()
             .unwrap();
-        let second = scan_ffi_repository(second.path(), &["linux".to_owned()])
+        let second = scan_ffi_repository(second.path(), &[profile("linux")])
             .unwrap()
             .unwrap();
         let observation = observation(
