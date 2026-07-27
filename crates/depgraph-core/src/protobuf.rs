@@ -437,6 +437,69 @@ enum TokenKind {
     Symbol,
 }
 
+fn discover_package(tokens: &[Token]) -> std::result::Result<String, String> {
+    let mut package = None;
+    let mut depth = 0_usize;
+    let mut statement_start = true;
+    let mut cursor = 0_usize;
+    while cursor < tokens.len() {
+        let token = &tokens[cursor];
+        if depth == 0
+            && statement_start
+            && token.kind == TokenKind::Identifier
+            && token.text == "package"
+        {
+            cursor += 1;
+            let mut parts = Vec::new();
+            loop {
+                let part = tokens
+                    .get(cursor)
+                    .filter(|token| token.kind == TokenKind::Identifier)
+                    .ok_or_else(|| "protobuf-package-is-invalid".to_owned())?;
+                parts.push(part.text.clone());
+                cursor += 1;
+                match tokens.get(cursor).map(|token| token.text.as_str()) {
+                    Some(".") => cursor += 1,
+                    Some(";") => {
+                        cursor += 1;
+                        break;
+                    }
+                    _ => return Err("protobuf-package-is-invalid".to_owned()),
+                }
+            }
+            let discovered = parts.join(".");
+            if !bounded_text(&discovered) {
+                return Err("protobuf-package-is-invalid".to_owned());
+            }
+            if package.replace(discovered).is_some() {
+                return Err("duplicate-protobuf-package".to_owned());
+            }
+            statement_start = true;
+            continue;
+        }
+        match token.text.as_str() {
+            "{" => {
+                depth = depth
+                    .checked_add(1)
+                    .ok_or_else(|| "protobuf-nesting-depth-limit-exceeded".to_owned())?;
+            }
+            "}" => {
+                depth = depth
+                    .checked_sub(1)
+                    .ok_or_else(|| "protobuf-unbalanced-delimiter".to_owned())?;
+                if depth == 0 {
+                    statement_start = true;
+                }
+            }
+            ";" if depth == 0 => statement_start = true,
+            _ if depth == 0 && statement_start => statement_start = false,
+            _ => {}
+        }
+        cursor += 1;
+    }
+    Ok(package.unwrap_or_default())
+}
+
 fn tokenize_proto(source: &str) -> std::result::Result<Vec<Token>, String> {
     let bytes = source.as_bytes();
     let mut tokens = Vec::new();
@@ -620,6 +683,7 @@ struct ProtoParser {
     cursor: usize,
     version: Option<String>,
     package: String,
+    package_declared: bool,
     imports: Vec<ProtoImport>,
     messages: BTreeMap<String, ProtoMessage>,
     enums: BTreeSet<String>,
@@ -635,6 +699,7 @@ impl ProtoParser {
             cursor: 0,
             version: None,
             package: String::new(),
+            package_declared: false,
             imports: Vec::new(),
             messages: BTreeMap::new(),
             enums: BTreeSet::new(),
@@ -644,6 +709,7 @@ impl ProtoParser {
     }
 
     fn parse(mut self) -> std::result::Result<ProtoFile, String> {
+        self.package = discover_package(&self.tokens)?;
         while self.cursor < self.tokens.len() {
             match self.peek_text() {
                 Some("syntax") => self.parse_version("syntax")?,
@@ -725,10 +791,10 @@ impl ProtoParser {
         self.expect("package")?;
         let package = self.parse_qualified_name(false)?;
         self.expect(";")?;
-        if !self.package.is_empty() {
+        if self.package_declared || package != self.package {
             return Err("duplicate-protobuf-package".to_owned());
         }
-        self.package = package;
+        self.package_declared = true;
         Ok(())
     }
 
@@ -801,7 +867,15 @@ impl ProtoParser {
                 _ => {
                     let checkpoint = self.cursor;
                     match self.parse_field(&coordinate, &descriptor_path, None, fields.len()) {
-                        Ok(field) => fields.push(field),
+                        Ok(field) => {
+                            if field.type_name.starts_with("map<") {
+                                nested_message_index =
+                                    nested_message_index.checked_add(1).ok_or_else(|| {
+                                        "protobuf-nested-message-count-overflowed".to_owned()
+                                    })?;
+                            }
+                            fields.push(field);
+                        }
                         Err(_) => {
                             self.cursor = checkpoint;
                             self.skip_statement_or_block()?;
@@ -2741,8 +2815,8 @@ mod tests {
     use prost::Message as _;
     use prost_types::{
         DescriptorProto, FieldDescriptorProto, FileDescriptorProto, FileDescriptorSet,
-        MethodDescriptorProto, ServiceDescriptorProto, SourceCodeInfo, field_descriptor_proto,
-        source_code_info,
+        MessageOptions, MethodDescriptorProto, ServiceDescriptorProto, SourceCodeInfo,
+        field_descriptor_proto, source_code_info,
     };
 
     use super::*;
@@ -3028,6 +3102,149 @@ service EditionService { rpc Read (Request) returns (Request); }
                     .properties
                     .contains_key("artifact_identity")
         }));
+    }
+
+    #[test]
+    fn package_declared_after_definitions_qualifies_the_entire_file() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(
+            root.path().join("late.proto"),
+            r#"syntax = "proto3";
+message Reply { string id = 1; }
+service LateService { rpc Read (Reply) returns (Reply); }
+package late.v1;
+"#,
+        )
+        .unwrap();
+        let delta = scan_protobuf_repository(root.path(), &participating_profiles())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            ledger(&delta).entries[0].status,
+            CrossLanguageCapabilityStatus::Complete
+        );
+        for coordinate in [
+            "late.v1.Reply",
+            "late.v1.LateService",
+            "late.v1.LateService/Read",
+        ] {
+            assert!(
+                delta
+                    .nodes
+                    .iter()
+                    .any(|node| node_coordinate(node) == Some(coordinate)),
+                "missing {coordinate}"
+            );
+        }
+        assert!(
+            delta
+                .sites
+                .iter()
+                .all(|site| site.resolution_status == ResolutionStatus::Resolved)
+        );
+    }
+
+    #[test]
+    fn map_entries_preserve_following_nested_descriptor_paths() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(
+            root.path().join("maps.proto"),
+            r#"syntax = "proto3";
+package maps.v1;
+message Outer {
+  map<string, string> labels = 1;
+  message Child { Outer parent = 1; }
+  Child child = 2;
+}
+"#,
+        )
+        .unwrap();
+
+        let mut labels = field(
+            "labels",
+            1,
+            field_descriptor_proto::Type::Message,
+            Some(".maps.v1.Outer.LabelsEntry"),
+        );
+        labels.label = Some(field_descriptor_proto::Label::Repeated as i32);
+        let map_entry = DescriptorProto {
+            name: Some("LabelsEntry".to_owned()),
+            field: vec![
+                field("key", 1, field_descriptor_proto::Type::String, None),
+                field("value", 2, field_descriptor_proto::Type::String, None),
+            ],
+            options: Some(MessageOptions {
+                map_entry: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let child = DescriptorProto {
+            name: Some("Child".to_owned()),
+            field: vec![field(
+                "parent",
+                1,
+                field_descriptor_proto::Type::Message,
+                Some(".maps.v1.Outer"),
+            )],
+            ..Default::default()
+        };
+        let descriptor = FileDescriptorSet {
+            file: vec![FileDescriptorProto {
+                name: Some("maps.proto".to_owned()),
+                package: Some("maps.v1".to_owned()),
+                message_type: vec![DescriptorProto {
+                    name: Some("Outer".to_owned()),
+                    field: vec![
+                        labels,
+                        field(
+                            "child",
+                            2,
+                            field_descriptor_proto::Type::Message,
+                            Some(".maps.v1.Outer.Child"),
+                        ),
+                    ],
+                    nested_type: vec![map_entry, child],
+                    ..Default::default()
+                }],
+                source_code_info: Some(SourceCodeInfo {
+                    location: vec![
+                        source_code_info::Location {
+                            path: vec![4, 0, 3, 1],
+                            span: vec![0, 0, 1],
+                            ..Default::default()
+                        },
+                        source_code_info::Location {
+                            path: vec![4, 0, 3, 1, 2, 0],
+                            span: vec![0, 0, 1],
+                            ..Default::default()
+                        },
+                    ],
+                }),
+                syntax: Some("proto3".to_owned()),
+                ..Default::default()
+            }],
+        };
+        write_descriptor(
+            &root
+                .path()
+                .join(format!("maps{PROTOBUF_DESCRIPTOR_SUFFIX}")),
+            &descriptor,
+        );
+
+        let delta = scan_protobuf_repository(root.path(), &participating_profiles())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            ledger(&delta).entries[0].status,
+            CrossLanguageCapabilityStatus::Complete
+        );
+        for expected_path in [json!([4, 0, 3, 1]), json!([4, 0, 3, 1, 2, 0])] {
+            assert!(delta.sites.iter().any(|site| {
+                site.evidence[0].path.as_deref() == Some("maps.proto")
+                    && site.evidence[0].properties.get("descriptor_path") == Some(&expected_path)
+            }));
+        }
     }
 
     #[test]
