@@ -43,7 +43,7 @@ const MAX_REASONS: usize = 64;
 /// starts project code, or opens a network client.
 pub fn scan_graphql_repository(
     root: &Path,
-    participating_profile_ids: &[String],
+    participating_profiles: &[Profile],
 ) -> Result<Option<CrossLanguageAdapterDelta>> {
     let canonical_root = root
         .canonicalize()
@@ -51,17 +51,23 @@ pub fn scan_graphql_repository(
     if !canonical_root.is_dir() {
         bail!("GraphQL scan root must be a directory");
     }
-    let mut participating_profile_ids = participating_profile_ids.to_vec();
-    participating_profile_ids.sort();
-    participating_profile_ids.dedup();
-    if participating_profile_ids.is_empty()
-        || participating_profile_ids.len() > MAX_PARTICIPATING_PROFILES
-        || participating_profile_ids
+    let mut participating_profiles = participating_profiles.to_vec();
+    participating_profiles.sort_by(|left, right| left.id.cmp(&right.id));
+    if participating_profiles.is_empty()
+        || participating_profiles.len() > MAX_PARTICIPATING_PROFILES
+        || participating_profiles
             .iter()
-            .any(|value| !bounded_text(value))
+            .any(|profile| !bounded_text(&profile.id))
+        || participating_profiles
+            .windows(2)
+            .any(|profiles| profiles[0].id == profiles[1].id)
     {
-        bail!("GraphQL participating profile IDs must be a bounded non-empty set");
+        bail!("GraphQL participating profiles must be a bounded non-empty set");
     }
+    let participating_profile_ids = participating_profiles
+        .iter()
+        .map(|profile| profile.id.clone())
+        .collect();
 
     let records = inventory_graphql_sources(&canonical_root)?;
     if records.is_empty() {
@@ -148,6 +154,7 @@ pub fn scan_graphql_repository(
     let delta = CrossLanguageAdapterDelta {
         contract_version: CROSS_LANGUAGE_CONTRACT_VERSION.to_owned(),
         profile,
+        participating_profiles,
         nodes: builder.nodes.into_values().collect(),
         sites: builder.sites.into_values().collect(),
         edges: builder.edges.into_values().collect(),
@@ -665,6 +672,7 @@ struct GraphQlParser {
     cursor: usize,
     definitions: usize,
     selections: usize,
+    operations: usize,
     anonymous_operations: usize,
 }
 
@@ -675,6 +683,7 @@ impl GraphQlParser {
             cursor: 0,
             definitions: 0,
             selections: 0,
+            operations: 0,
             anonymous_operations: 0,
         }
     }
@@ -705,8 +714,14 @@ impl GraphQlParser {
                 Some("{") if !extend => Definition::Operation(self.parse_operation(true)?),
                 _ => return Err("graphql-definition-is-unsupported".to_owned()),
             };
+            if matches!(&definition, Definition::Operation(_)) {
+                self.operations += 1;
+            }
             self.definitions += 1;
             definitions.push(definition);
+        }
+        if self.anonymous_operations > 0 && self.operations > 1 {
+            return Err("graphql-anonymous-operation-is-ambiguous".to_owned());
         }
         Ok(definitions)
     }
@@ -714,17 +729,21 @@ impl GraphQlParser {
     fn parse_schema(&mut self, extend: bool) -> std::result::Result<SchemaDefinition, String> {
         let start = self.expect("schema")?.span;
         let directives = self.parse_directives()?;
-        self.expect("{")?;
         let mut roots = BTreeMap::new();
-        while self.peek_text() != Some("}") {
-            let kind = self.parse_operation_kind()?;
-            self.expect(":")?;
-            let target = self.expect_name()?.text;
-            if roots.insert(kind, target).is_some() {
-                return Err("duplicate-graphql-schema-root".to_owned());
+        let end = if extend && self.peek_text() != Some("{") {
+            directives.last().map_or(start, |directive| directive.span)
+        } else {
+            self.expect("{")?;
+            while self.peek_text() != Some("}") {
+                let kind = self.parse_operation_kind()?;
+                self.expect(":")?;
+                let target = self.expect_name()?.text;
+                if roots.insert(kind, target).is_some() {
+                    return Err("duplicate-graphql-schema-root".to_owned());
+                }
             }
-        }
-        let end = self.expect("}")?.span;
+            self.expect("}")?.span
+        };
         Ok(SchemaDefinition {
             extend,
             roots,
@@ -913,7 +932,12 @@ impl GraphQlParser {
                 .bump()
                 .ok_or_else(|| "graphql-operation-kind-is-missing".to_owned())?;
             let kind = parse_operation_kind_text(&token.text)?;
-            let name = self.expect_name()?.text;
+            let name = if matches!(self.peek_text(), Some("(" | "@" | "{")) {
+                self.anonymous_operations += 1;
+                format!("anonymous#{}", self.anonymous_operations)
+            } else {
+                self.expect_name()?.text
+            };
             (kind, token.span, name)
         };
         let variables = if self.consume("(") {
@@ -1079,12 +1103,23 @@ impl GraphQlParser {
         &mut self,
         role: &'static str,
     ) -> std::result::Result<TypeReferenceSite, String> {
+        self.parse_type_reference_at_depth(role, 0)
+    }
+
+    fn parse_type_reference_at_depth(
+        &mut self,
+        role: &'static str,
+        depth: usize,
+    ) -> std::result::Result<TypeReferenceSite, String> {
+        if depth >= MAX_GRAPHQL_DEPTH {
+            return Err("graphql-type-depth-limit-exceeded".to_owned());
+        }
         let start = self
             .peek()
             .map(|token| token.span)
             .ok_or_else(|| "graphql-type-reference-is-missing".to_owned())?;
         let (named_type, mut rendered, mut end) = if self.consume("[") {
-            let inner = self.parse_type_reference(role)?;
+            let inner = self.parse_type_reference_at_depth(role, depth + 1)?;
             let close = self.expect("]")?;
             (
                 inner.named_type,
@@ -1254,6 +1289,7 @@ struct GraphQlGraphBuilder {
     directive_ids: BTreeMap<String, String>,
     operations: Vec<LocatedOperation>,
     operation_ids: BTreeMap<(String, String), String>,
+    ambiguous_operation_keys: BTreeSet<(String, String)>,
     fragments: BTreeMap<String, Vec<LocatedFragment>>,
     fragment_ids: BTreeMap<String, Vec<String>>,
     fragment_cycles: BTreeSet<String>,
@@ -1280,6 +1316,7 @@ impl GraphQlGraphBuilder {
             directive_ids: BTreeMap::new(),
             operations: Vec::new(),
             operation_ids: BTreeMap::new(),
+            ambiguous_operation_keys: BTreeSet::new(),
             fragments: BTreeMap::new(),
             fragment_ids: BTreeMap::new(),
             fragment_cycles: BTreeSet::new(),
@@ -1313,8 +1350,11 @@ impl GraphQlGraphBuilder {
             for definition in document.definitions {
                 match definition {
                     Definition::Schema(schema) => {
-                        self.schema_definition_count += 1;
-                        if schema.extend && schema.roots.is_empty() {
+                        if !schema.extend {
+                            self.schema_definition_count += 1;
+                        }
+                        if schema.extend && schema.roots.is_empty() && schema.directives.is_empty()
+                        {
                             self.insert_reason("graphql-empty-schema-extension");
                         }
                         for (kind, target) in &schema.roots {
@@ -1478,7 +1518,6 @@ impl GraphQlGraphBuilder {
                     ),
                 )?);
             }
-            ids.dedup();
             if ids.len() > 1 {
                 self.insert_reason("ambiguous-graphql-fragment-definition");
             }
@@ -1497,7 +1536,8 @@ impl GraphQlGraphBuilder {
                 &coordinate,
             )?;
             let key = (operation.locator.clone(), coordinate);
-            if self.operation_ids.insert(key, id).is_some() {
+            if self.operation_ids.insert(key.clone(), id).is_some() {
+                self.ambiguous_operation_keys.insert(key);
                 self.insert_reason("ambiguous-graphql-operation-definition");
             }
         }
@@ -1649,19 +1689,24 @@ impl GraphQlGraphBuilder {
         for name in names {
             let fragments = self.fragments[&name].clone();
             let fragment_ids = self.fragment_ids[&name].clone();
+            let ambiguity_reason =
+                (fragments.len() > 1).then_some("ambiguous-graphql-fragment-definition");
             for (index, fragment) in fragments.iter().enumerate() {
                 let source_id = &fragment_ids[index];
                 let target = self.unique_type_id(&fragment.definition.type_condition);
+                let reason = ambiguity_reason.or_else(|| {
+                    target
+                        .is_none()
+                        .then_some("graphql-fragment-type-is-unresolved")
+                });
                 self.relation_or_unknown(RelationRequest {
                     source: source_id,
-                    target: target.as_deref(),
+                    target: target.as_deref().filter(|_| reason.is_none()),
                     relation: CrossLanguageRelationKind::ReferencesSchema,
                     locator: &fragment.locator,
                     span: fragment.definition.span,
                     coordinate: format!("fragment {} type", fragment.definition.name),
-                    reason: target
-                        .is_none()
-                        .then_some("graphql-fragment-type-is-unresolved"),
+                    reason,
                     conditions: vec![(
                         "graphql.fragment",
                         Value::String(fragment.definition.name.clone()),
@@ -1679,6 +1724,7 @@ impl GraphQlGraphBuilder {
                     &fragment.definition.type_condition,
                     &fragment.definition.selections,
                     &fragment.definition.name,
+                    ambiguity_reason,
                 )?;
             }
         }
@@ -1692,6 +1738,7 @@ impl GraphQlGraphBuilder {
         current_type: &str,
         selections: &[Selection],
         fragment_name: &str,
+        forced_reason: Option<&'static str>,
     ) -> Result<()> {
         for selection in selections {
             match selection {
@@ -1699,10 +1746,18 @@ impl GraphQlGraphBuilder {
                     let target = self.unique_fragment_id(&spread.name);
                     let cycle = self.fragment_cycles.contains(fragment_name)
                         && self.fragment_cycles.contains(&spread.name);
-                    let reason = if cycle {
+                    let reason = if let Some(reason) = forced_reason {
+                        Some(reason)
+                    } else if cycle {
                         Some("graphql-fragment-cycle")
                     } else if let Some(reason) = directive_boundary_reason(&spread.directives) {
                         Some(reason)
+                    } else if self
+                        .fragments
+                        .get(&spread.name)
+                        .is_some_and(|fragments| fragments.len() > 1)
+                    {
+                        Some("ambiguous-graphql-fragment-definition")
                     } else if target.is_none() {
                         Some("graphql-fragment-is-missing")
                     } else {
@@ -1723,11 +1778,13 @@ impl GraphQlGraphBuilder {
                     let next_type = inline.type_condition.as_deref().unwrap_or(current_type);
                     if let Some(type_condition) = &inline.type_condition {
                         let target = self.unique_type_id(type_condition);
-                        let reason = directive_boundary_reason(&inline.directives).or_else(|| {
-                            target
-                                .is_none()
-                                .then_some("graphql-inline-fragment-type-is-unresolved")
-                        });
+                        let reason = forced_reason
+                            .or_else(|| directive_boundary_reason(&inline.directives))
+                            .or_else(|| {
+                                target
+                                    .is_none()
+                                    .then_some("graphql-inline-fragment-type-is-unresolved")
+                            });
                         self.relation_or_unknown(RelationRequest {
                             source: source_id,
                             target: target.as_deref().filter(|_| reason.is_none()),
@@ -1745,6 +1802,7 @@ impl GraphQlGraphBuilder {
                         next_type,
                         &inline.selections,
                         fragment_name,
+                        forced_reason,
                     )?;
                 }
                 Selection::Field(field) => {
@@ -1754,6 +1812,7 @@ impl GraphQlGraphBuilder {
                         locator,
                         current_type,
                         field,
+                        forced_reason,
                     )?;
                 }
             }
@@ -1768,8 +1827,12 @@ impl GraphQlGraphBuilder {
                 operation.definition.kind.as_str(),
                 operation.definition.name
             );
-            let operation_id =
-                self.operation_ids[&(operation.locator.clone(), coordinate.clone())].clone();
+            let operation_key = (operation.locator.clone(), coordinate.clone());
+            let operation_id = self.operation_ids[&operation_key].clone();
+            let operation_reason = self
+                .ambiguous_operation_keys
+                .contains(&operation_key)
+                .then_some("ambiguous-graphql-operation-definition");
             let root_name = self
                 .operation_root(operation.definition.kind)
                 .unwrap_or_else(|| operation.definition.kind.default_root().to_owned());
@@ -1781,7 +1844,7 @@ impl GraphQlGraphBuilder {
                 .then(|| self.operation_root(operation.definition.kind))
                 .flatten()
                 .and_then(|name| self.unique_type_id(&name));
-            let root_reason = if ambiguous_root {
+            let schema_root_reason = if ambiguous_root {
                 Some("ambiguous-graphql-schema-root")
             } else if self.operation_root(operation.definition.kind).is_none() {
                 Some("graphql-operation-root-is-not-declared")
@@ -1790,6 +1853,7 @@ impl GraphQlGraphBuilder {
             } else {
                 None
             };
+            let root_reason = operation_reason.or(schema_root_reason);
             self.relation_or_unknown(RelationRequest {
                 source: &operation_id,
                 target: root_id.as_deref().filter(|_| root_reason.is_none()),
@@ -1821,7 +1885,7 @@ impl GraphQlGraphBuilder {
                 &operation.locator,
                 &operation.definition.directives,
             )?;
-            let selection_root = if root_reason.is_none() {
+            let selection_root = if schema_root_reason.is_none() {
                 root_name.as_str()
             } else {
                 "<unresolved-root>"
@@ -1833,12 +1897,15 @@ impl GraphQlGraphBuilder {
                     selection_root,
                     selection,
                     &mut BTreeSet::new(),
+                    operation_reason,
+                    0,
                 )?;
             }
         }
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_operation_selection(
         &mut self,
         operation_id: &str,
@@ -1846,7 +1913,14 @@ impl GraphQlGraphBuilder {
         current_type: &str,
         selection: &Selection,
         visited_fragments: &mut BTreeSet<String>,
+        forced_reason: Option<&'static str>,
+        traversal_depth: usize,
     ) -> Result<()> {
+        let depth_reason = (traversal_depth >= MAX_GRAPHQL_DEPTH)
+            .then_some("graphql-selection-expansion-depth-exceeded");
+        if depth_reason.is_some() {
+            self.insert_reason("graphql-selection-expansion-depth-exceeded");
+        }
         match selection {
             Selection::Field(field) => {
                 self.build_field_selection(
@@ -1855,8 +1929,11 @@ impl GraphQlGraphBuilder {
                     locator,
                     current_type,
                     field,
+                    forced_reason.or(depth_reason),
                 )?;
-                if let Some(next_type) = self.field_output_type(current_type, &field.field_name) {
+                if traversal_depth < MAX_GRAPHQL_DEPTH
+                    && let Some(next_type) = self.field_output_type(current_type, &field.field_name)
+                {
                     for nested in &field.selections {
                         self.build_operation_selection(
                             operation_id,
@@ -1864,6 +1941,8 @@ impl GraphQlGraphBuilder {
                             &next_type,
                             nested,
                             visited_fragments,
+                            forced_reason,
+                            traversal_depth + 1,
                         )?;
                     }
                 }
@@ -1871,15 +1950,22 @@ impl GraphQlGraphBuilder {
             Selection::FragmentSpread(spread) => {
                 let target = self.unique_fragment_id(&spread.name);
                 let cycle = self.fragment_cycles.contains(&spread.name);
-                let reason = if cycle {
+                let boundary_reason = if cycle {
                     Some("graphql-fragment-cycle")
                 } else if let Some(reason) = directive_boundary_reason(&spread.directives) {
                     Some(reason)
+                } else if self
+                    .fragments
+                    .get(&spread.name)
+                    .is_some_and(|fragments| fragments.len() > 1)
+                {
+                    Some("ambiguous-graphql-fragment-definition")
                 } else if target.is_none() {
                     Some("graphql-fragment-is-missing")
                 } else {
                     None
                 };
+                let reason = forced_reason.or(depth_reason).or(boundary_reason);
                 self.relation_or_unknown(RelationRequest {
                     source: operation_id,
                     target: target.as_deref().filter(|_| reason.is_none()),
@@ -1890,15 +1976,20 @@ impl GraphQlGraphBuilder {
                     reason,
                     conditions: directive_conditions(&spread.directives),
                 })?;
-                if reason.is_none() && visited_fragments.insert(spread.name.clone()) {
+                if boundary_reason.is_none()
+                    && traversal_depth < MAX_GRAPHQL_DEPTH
+                    && visited_fragments.insert(spread.name.clone())
+                {
                     if let Some(fragment) = self.unique_fragment(&spread.name).cloned() {
                         for nested in &fragment.definition.selections {
                             self.build_operation_selection(
                                 operation_id,
-                                locator,
+                                &fragment.locator,
                                 &fragment.definition.type_condition,
                                 nested,
                                 visited_fragments,
+                                forced_reason,
+                                traversal_depth + 1,
                             )?;
                         }
                     }
@@ -1909,11 +2000,14 @@ impl GraphQlGraphBuilder {
                 let next_type = inline.type_condition.as_deref().unwrap_or(current_type);
                 if let Some(type_condition) = &inline.type_condition {
                     let target = self.unique_type_id(type_condition);
-                    let reason = directive_boundary_reason(&inline.directives).or_else(|| {
-                        target
-                            .is_none()
-                            .then_some("graphql-inline-fragment-type-is-unresolved")
-                    });
+                    let reason = forced_reason
+                        .or(depth_reason)
+                        .or_else(|| directive_boundary_reason(&inline.directives))
+                        .or_else(|| {
+                            target
+                                .is_none()
+                                .then_some("graphql-inline-fragment-type-is-unresolved")
+                        });
                     self.relation_or_unknown(RelationRequest {
                         source: operation_id,
                         target: target.as_deref().filter(|_| reason.is_none()),
@@ -1924,15 +2018,30 @@ impl GraphQlGraphBuilder {
                         reason,
                         conditions: directive_conditions(&inline.directives),
                     })?;
-                }
-                for nested in &inline.selections {
-                    self.build_operation_selection(
-                        operation_id,
+                } else if let Some(reason) = forced_reason.or(depth_reason) {
+                    self.relation_or_unknown(RelationRequest {
+                        source: operation_id,
+                        target: None,
+                        relation: CrossLanguageRelationKind::ReturnsMessage,
                         locator,
-                        next_type,
-                        nested,
-                        visited_fragments,
-                    )?;
+                        span: inline.span,
+                        coordinate: "inline fragment".to_owned(),
+                        reason: Some(reason),
+                        conditions: directive_conditions(&inline.directives),
+                    })?;
+                }
+                if traversal_depth < MAX_GRAPHQL_DEPTH {
+                    for nested in &inline.selections {
+                        self.build_operation_selection(
+                            operation_id,
+                            locator,
+                            next_type,
+                            nested,
+                            visited_fragments,
+                            forced_reason,
+                            traversal_depth + 1,
+                        )?;
+                    }
                 }
             }
         }
@@ -1946,9 +2055,12 @@ impl GraphQlGraphBuilder {
         locator: &str,
         current_type: &str,
         field: &FieldSelection,
+        forced_reason: Option<&'static str>,
     ) -> Result<()> {
         let field_output = self.field_output_type(current_type, &field.field_name);
-        let mut reason = if field.field_name.starts_with("__") {
+        let mut reason = if let Some(reason) = forced_reason {
+            Some(reason)
+        } else if field.field_name.starts_with("__") {
             Some("graphql-introspection-not-admitted")
         } else if let Some(reason) = directive_boundary_reason(&field.directives) {
             Some(reason)
@@ -2110,6 +2222,9 @@ impl GraphQlGraphBuilder {
     }
 
     fn unique_fragment_id(&self, name: &str) -> Option<String> {
+        self.fragments
+            .get(name)
+            .filter(|fragments| fragments.len() == 1)?;
         self.fragment_ids
             .get(name)
             .filter(|ids| ids.len() == 1)
@@ -2361,43 +2476,71 @@ fn detect_fragment_cycles(fragments: &BTreeMap<String, Vec<LocatedFragment>>) ->
             )
         })
         .collect::<BTreeMap<_, _>>();
-    let mut states = BTreeMap::<String, u8>::new();
-    let mut stack = Vec::new();
-    let mut cycles = BTreeSet::new();
+    let mut visited = BTreeSet::new();
+    let mut finish_order = Vec::new();
     for name in adjacency.keys() {
-        visit_fragment(name, &adjacency, &mut states, &mut stack, &mut cycles);
+        if visited.contains(name) {
+            continue;
+        }
+        let mut stack = vec![(name.clone(), false)];
+        while let Some((current, expanded)) = stack.pop() {
+            if expanded {
+                finish_order.push(current);
+                continue;
+            }
+            if !visited.insert(current.clone()) {
+                continue;
+            }
+            stack.push((current.clone(), true));
+            if let Some(neighbors) = adjacency.get(&current) {
+                for neighbor in neighbors.iter().rev() {
+                    if adjacency.contains_key(neighbor) && !visited.contains(neighbor) {
+                        stack.push((neighbor.clone(), false));
+                    }
+                }
+            }
+        }
+    }
+
+    let mut reverse = adjacency
+        .keys()
+        .map(|name| (name.clone(), Vec::<String>::new()))
+        .collect::<BTreeMap<_, _>>();
+    for (source, targets) in &adjacency {
+        for target in targets {
+            if let Some(predecessors) = reverse.get_mut(target) {
+                predecessors.push(source.clone());
+            }
+        }
+    }
+
+    let mut assigned = BTreeSet::new();
+    let mut cycles = BTreeSet::new();
+    for name in finish_order.into_iter().rev() {
+        if !assigned.insert(name.clone()) {
+            continue;
+        }
+        let mut component = Vec::new();
+        let mut stack = vec![name];
+        while let Some(current) = stack.pop() {
+            component.push(current.clone());
+            for predecessor in reverse.get(&current).into_iter().flatten().rev() {
+                if assigned.insert(predecessor.clone()) {
+                    stack.push(predecessor.clone());
+                }
+            }
+        }
+        let cyclic = component.len() > 1
+            || component.first().is_some_and(|only| {
+                adjacency
+                    .get(only)
+                    .is_some_and(|targets| targets.contains(only))
+            });
+        if cyclic {
+            cycles.extend(component);
+        }
     }
     cycles
-}
-
-fn visit_fragment(
-    name: &str,
-    adjacency: &BTreeMap<String, BTreeSet<String>>,
-    states: &mut BTreeMap<String, u8>,
-    stack: &mut Vec<String>,
-    cycles: &mut BTreeSet<String>,
-) {
-    match states.get(name).copied().unwrap_or(0) {
-        2 => return,
-        1 => {
-            if let Some(index) = stack.iter().position(|item| item == name) {
-                cycles.extend(stack[index..].iter().cloned());
-            }
-            return;
-        }
-        _ => {}
-    }
-    states.insert(name.to_owned(), 1);
-    stack.push(name.to_owned());
-    if let Some(neighbors) = adjacency.get(name) {
-        for neighbor in neighbors {
-            if adjacency.contains_key(neighbor) {
-                visit_fragment(neighbor, adjacency, states, stack, cycles);
-            }
-        }
-    }
-    stack.pop();
-    states.insert(name.to_owned(), 2);
 }
 
 fn fragment_spreads(selections: &[Selection]) -> BTreeSet<String> {
@@ -2538,7 +2681,7 @@ mod tests {
 
     use depgraph_protocol::{
         CROSS_LANGUAGE_COMPLETENESS_PROPERTY, CrossLanguageCapabilityStatus,
-        CrossLanguageCompletenessLedger, CrossLanguageRelationKind, ResolutionStatus,
+        CrossLanguageCompletenessLedger, CrossLanguageRelationKind, Profile, ResolutionStatus,
         validate_cross_language_adapter_delta,
     };
 
@@ -2572,6 +2715,20 @@ fragment UserFields on User {
 }
 "#;
 
+    fn participating_profiles() -> Vec<Profile> {
+        vec![Profile {
+            id: "polyglot:production".to_owned(),
+            language: "polyglot".to_owned(),
+            toolchain: None,
+            command: None,
+            target: None,
+            features: Vec::new(),
+            environment: BTreeMap::new(),
+            source_revision: None,
+            properties: BTreeMap::new(),
+        }]
+    }
+
     fn write_positive_fixture(root: &Path, reverse: bool) {
         let entries = [
             ("schema.graphqls", SCHEMA),
@@ -2600,10 +2757,10 @@ fragment UserFields on User {
         write_positive_fixture(first.path(), false);
         write_positive_fixture(second.path(), true);
 
-        let first = scan_graphql_repository(first.path(), &["polyglot:production".to_owned()])
+        let first = scan_graphql_repository(first.path(), &participating_profiles())
             .unwrap()
             .unwrap();
-        let second = scan_graphql_repository(second.path(), &["polyglot:production".to_owned()])
+        let second = scan_graphql_repository(second.path(), &participating_profiles())
             .unwrap()
             .unwrap();
         validate_cross_language_adapter_delta(&first).unwrap();
@@ -2611,6 +2768,7 @@ fragment UserFields on User {
             serde_json::to_vec(&first).unwrap(),
             serde_json::to_vec(&second).unwrap()
         );
+        assert_eq!(first.participating_profiles, participating_profiles());
         let ledger: CrossLanguageCompletenessLedger = serde_json::from_value(
             first.profile.properties[CROSS_LANGUAGE_COMPLETENESS_PROPERTY].clone(),
         )
@@ -2633,11 +2791,174 @@ fragment UserFields on User {
     }
 
     #[test]
+    fn expanded_fragment_evidence_uses_the_fragment_source_locator() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(
+            root.path().join("schema.graphqls"),
+            "type Query { user: User }\ntype User { friend: User }\n",
+        )
+        .unwrap();
+        fs::write(
+            root.path().join("operation.graphql"),
+            "query Friends { user { ...UserFields } }\n",
+        )
+        .unwrap();
+        fs::write(
+            root.path().join("fragment.graphql"),
+            "fragment UserFields on User { friend { friend } }\n",
+        )
+        .unwrap();
+
+        let delta = scan_graphql_repository(root.path(), &participating_profiles())
+            .unwrap()
+            .unwrap();
+        let operation_id = delta
+            .nodes
+            .iter()
+            .find(|node| {
+                node.kind == "operation"
+                    && node.properties["canonical_identity"]["coordinate"] == "query Friends"
+            })
+            .unwrap()
+            .id
+            .clone();
+        assert!(delta.edges.iter().any(|edge| {
+            edge.source == operation_id
+                && edge.evidence[0].properties["graphql_coordinate"] == "User.friend"
+                && edge.evidence[0].path.as_deref() == Some("fragment.graphql")
+        }));
+    }
+
+    #[test]
+    fn duplicate_fragment_and_operation_definitions_fail_closed_without_panicking() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(
+            root.path().join("duplicates.graphql"),
+            r#"
+type Query { value: String }
+query Duplicate { ...Shared }
+query Duplicate { ...Shared }
+fragment Shared on Query { value }
+fragment Shared on Query { value }
+"#,
+        )
+        .unwrap();
+
+        let delta = scan_graphql_repository(root.path(), &participating_profiles())
+            .unwrap()
+            .unwrap();
+        let reasons = delta
+            .sites
+            .iter()
+            .filter_map(|site| site.reason.as_deref())
+            .collect::<BTreeSet<_>>();
+        assert!(reasons.contains("ambiguous-graphql-fragment-definition"));
+        assert!(reasons.contains("ambiguous-graphql-operation-definition"));
+        assert!(
+            delta
+                .sites
+                .iter()
+                .filter(|site| {
+                    matches!(
+                        site.reason.as_deref(),
+                        Some(
+                            "ambiguous-graphql-fragment-definition"
+                                | "ambiguous-graphql-operation-definition"
+                        )
+                    )
+                })
+                .all(|site| site.resolution_status == ResolutionStatus::Unresolved)
+        );
+    }
+
+    #[test]
+    fn long_fragment_expansion_is_iterative_and_bounded() {
+        let root = tempfile::tempdir().unwrap();
+        let fragment_count = 1_024;
+        let mut source = "type Query { value: String }\nquery Long { ...F0 }\n".to_owned();
+        for index in 0..fragment_count {
+            if index + 1 == fragment_count {
+                source.push_str(&format!("fragment F{index} on Query {{ value }}\n"));
+            } else {
+                source.push_str(&format!(
+                    "fragment F{index} on Query {{ ...F{} }}\n",
+                    index + 1
+                ));
+            }
+        }
+        fs::write(root.path().join("long.graphql"), source).unwrap();
+
+        let delta = scan_graphql_repository(root.path(), &participating_profiles())
+            .unwrap()
+            .unwrap();
+        assert!(delta.sites.iter().any(|site| {
+            site.reason.as_deref() == Some("graphql-selection-expansion-depth-exceeded")
+        }));
+    }
+
+    #[test]
+    fn explicit_anonymous_operations_and_type_nesting_are_validated_boundedly() {
+        let valid = tempfile::tempdir().unwrap();
+        fs::write(
+            valid.path().join("anonymous.graphql"),
+            "type Query { value: String }\nquery { value }\n",
+        )
+        .unwrap();
+        let delta = scan_graphql_repository(valid.path(), &participating_profiles())
+            .unwrap()
+            .unwrap();
+        assert!(delta.nodes.iter().any(|node| {
+            node.kind == "operation"
+                && node.properties["canonical_identity"]["coordinate"] == "query anonymous#1"
+        }));
+
+        let ambiguous = tempfile::tempdir().unwrap();
+        fs::write(
+            ambiguous.path().join("ambiguous.graphql"),
+            "type Query { value: String }\nquery { value }\nquery Named { value }\n",
+        )
+        .unwrap();
+        let delta = scan_graphql_repository(ambiguous.path(), &participating_profiles())
+            .unwrap()
+            .unwrap();
+        let ledger: CrossLanguageCompletenessLedger = serde_json::from_value(
+            delta.profile.properties[CROSS_LANGUAGE_COMPLETENESS_PROPERTY].clone(),
+        )
+        .unwrap();
+        assert!(
+            ledger.entries[0]
+                .reasons
+                .contains(&"graphql-anonymous-operation-is-ambiguous".to_owned())
+        );
+
+        let deep = tempfile::tempdir().unwrap();
+        let source = format!(
+            "type Query {{ deep: {}String{} }}",
+            "[".repeat(MAX_GRAPHQL_DEPTH + 1),
+            "]".repeat(MAX_GRAPHQL_DEPTH + 1)
+        );
+        fs::write(deep.path().join("deep-type.graphql"), source).unwrap();
+        let delta = scan_graphql_repository(deep.path(), &participating_profiles())
+            .unwrap()
+            .unwrap();
+        let ledger: CrossLanguageCompletenessLedger = serde_json::from_value(
+            delta.profile.properties[CROSS_LANGUAGE_COMPLETENESS_PROPERTY].clone(),
+        )
+        .unwrap();
+        assert!(
+            ledger.entries[0]
+                .reasons
+                .contains(&"graphql-type-depth-limit-exceeded".to_owned())
+        );
+    }
+
+    #[test]
     fn missing_type_fragment_dynamic_federation_and_introspection_fail_closed() {
         let root = tempfile::tempdir().unwrap();
         fs::write(
             root.path().join("schema.graphql"),
             r#"
+extend schema @link(url: "https://specs.apollo.dev/federation/v2.3")
 type Query {
   remote: Missing @key(fields: "id")
 }
@@ -2656,7 +2977,7 @@ query Remote($flag: Boolean!) {
 "#,
         )
         .unwrap();
-        let delta = scan_graphql_repository(root.path(), &["polyglot:production".to_owned()])
+        let delta = scan_graphql_repository(root.path(), &participating_profiles())
             .unwrap()
             .unwrap();
         let reasons = delta
@@ -2669,6 +2990,11 @@ query Remote($flag: Boolean!) {
         assert!(reasons.contains("graphql-dynamic-directive"));
         assert!(reasons.contains("graphql-fragment-is-missing"));
         assert!(reasons.contains("graphql-introspection-not-admitted"));
+        let ledger: CrossLanguageCompletenessLedger = serde_json::from_value(
+            delta.profile.properties[CROSS_LANGUAGE_COMPLETENESS_PROPERTY].clone(),
+        )
+        .unwrap();
+        assert_eq!(ledger.entries[0].skipped_count, 0);
         assert!(
             delta
                 .sites
@@ -2698,10 +3024,10 @@ fragment B on User { id ...A }
         let second = tempfile::tempdir().unwrap();
         fs::write(first.path().join("cycle.graphql"), source).unwrap();
         fs::write(second.path().join("cycle.graphql"), source).unwrap();
-        let first = scan_graphql_repository(first.path(), &["polyglot:production".to_owned()])
+        let first = scan_graphql_repository(first.path(), &participating_profiles())
             .unwrap()
             .unwrap();
-        let second = scan_graphql_repository(second.path(), &["polyglot:production".to_owned()])
+        let second = scan_graphql_repository(second.path(), &participating_profiles())
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -2741,7 +3067,7 @@ fragment B on User { id ...A }
             root.path().join("linked.graphql"),
         )
         .unwrap();
-        let delta = scan_graphql_repository(root.path(), &["polyglot:production".to_owned()])
+        let delta = scan_graphql_repository(root.path(), &participating_profiles())
             .unwrap()
             .unwrap();
         assert!(!serde_json::to_string(&delta).unwrap().contains("secret"));
@@ -2761,7 +3087,7 @@ fragment B on User { id ...A }
     fn malformed_deep_and_empty_inputs_are_bounded() {
         let empty = tempfile::tempdir().unwrap();
         assert!(
-            scan_graphql_repository(empty.path(), &["polyglot:production".to_owned()])
+            scan_graphql_repository(empty.path(), &participating_profiles())
                 .unwrap()
                 .is_none()
         );
@@ -2772,7 +3098,7 @@ fragment B on User { id ...A }
             "type Query { broken: [String }",
         )
         .unwrap();
-        let delta = scan_graphql_repository(malformed.path(), &["polyglot:production".to_owned()])
+        let delta = scan_graphql_repository(malformed.path(), &participating_profiles())
             .unwrap()
             .unwrap();
         let ledger: CrossLanguageCompletenessLedger = serde_json::from_value(
@@ -2788,7 +3114,7 @@ fragment B on User { id ...A }
         }
         source.push_str(&"}".repeat(MAX_GRAPHQL_DEPTH + 2));
         fs::write(deep.path().join("deep.graphql"), source).unwrap();
-        let delta = scan_graphql_repository(deep.path(), &["polyglot:production".to_owned()])
+        let delta = scan_graphql_repository(deep.path(), &participating_profiles())
             .unwrap()
             .unwrap();
         let ledger: CrossLanguageCompletenessLedger = serde_json::from_value(
