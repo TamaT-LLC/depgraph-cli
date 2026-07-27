@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Component, Path},
+    sync::Arc,
 };
 
 use crate::bounded_query::read_bounded_repository_file;
@@ -180,10 +181,12 @@ impl GeneratedRole {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug)]
 struct OutputObservation {
     digest: Option<String>,
-    line_columns: Vec<u32>,
+    source: Option<Arc<str>>,
+    line_starts: Arc<[usize]>,
+    line_columns: Arc<[u32]>,
     reason: Option<String>,
 }
 
@@ -191,6 +194,7 @@ pub(super) fn inventory_generated_mappings(root: &Path) -> Result<GeneratedInven
     let mut records = Vec::new();
     let mut manifest_bytes = 0_usize;
     let mut output_bytes = 0_usize;
+    let mut observed_outputs = BTreeMap::<String, OutputObservation>::new();
     let mut mapping_count = 0_usize;
     let mut inventory_entries = 0_usize;
     let walker = WalkDir::new(root)
@@ -336,7 +340,8 @@ pub(super) fn inventory_generated_mappings(root: &Path) -> Result<GeneratedInven
             .map(|mapping| mapping.output.as_str())
             .collect::<BTreeSet<_>>()
         {
-            let observation = observe_output(root, output, &mut output_bytes);
+            let observation =
+                observe_output_once(root, output, &mut output_bytes, &mut observed_outputs);
             observations.insert(output.to_owned(), observation);
         }
         push_generated_inventory_record(
@@ -421,6 +426,20 @@ fn validate_manifest(manifest: &mut GeneratedManifest) -> std::result::Result<()
     Ok(())
 }
 
+fn observe_output_once(
+    root: &Path,
+    relative: &str,
+    total_bytes: &mut usize,
+    observed_outputs: &mut BTreeMap<String, OutputObservation>,
+) -> OutputObservation {
+    if let Some(observation) = observed_outputs.get(relative) {
+        return observation.clone();
+    }
+    let observation = observe_output(root, relative, total_bytes);
+    observed_outputs.insert(relative.to_owned(), observation.clone());
+    observation
+}
+
 fn observe_output(root: &Path, relative: &str, total_bytes: &mut usize) -> OutputObservation {
     let path = root.join(relative);
     let bytes = match read_bounded_repository_file(root, &path, MAX_GENERATED_OUTPUT_BYTES) {
@@ -433,7 +452,9 @@ fn observe_output(root: &Path, relative: &str, total_bytes: &mut usize) -> Outpu
             };
             return OutputObservation {
                 digest: None,
-                line_columns: Vec::new(),
+                source: None,
+                line_starts: Arc::from(Vec::<usize>::new()),
+                line_columns: Arc::from(Vec::<u32>::new()),
                 reason: Some(reason.to_owned()),
             };
         }
@@ -441,14 +462,18 @@ fn observe_output(root: &Path, relative: &str, total_bytes: &mut usize) -> Outpu
     let Some(total_output_bytes) = total_bytes.checked_add(bytes.len()) else {
         return OutputObservation {
             digest: None,
-            line_columns: Vec::new(),
+            source: None,
+            line_starts: Arc::from(Vec::<usize>::new()),
+            line_columns: Arc::from(Vec::<u32>::new()),
             reason: Some("generated-output-byte-limit-exceeded".to_owned()),
         };
     };
     if total_output_bytes > MAX_GENERATED_TOTAL_OUTPUT_BYTES {
         return OutputObservation {
             digest: None,
-            line_columns: Vec::new(),
+            source: None,
+            line_starts: Arc::from(Vec::<usize>::new()),
+            line_columns: Arc::from(Vec::<u32>::new()),
             reason: Some("generated-output-byte-limit-exceeded".to_owned()),
         };
     }
@@ -459,18 +484,30 @@ fn observe_output(root: &Path, relative: &str, total_bytes: &mut usize) -> Outpu
         Err(_) => {
             return OutputObservation {
                 digest,
-                line_columns: Vec::new(),
+                source: None,
+                line_starts: Arc::from(Vec::<usize>::new()),
+                line_columns: Arc::from(Vec::<u32>::new()),
                 reason: Some("generated-output-is-not-utf8".to_owned()),
             };
         }
     };
+    let line_starts = std::iter::once(0)
+        .chain(
+            source
+                .bytes()
+                .enumerate()
+                .filter_map(|(index, byte)| (byte == b'\n').then_some(index + 1)),
+        )
+        .collect::<Vec<_>>();
     let line_columns = source
         .split('\n')
         .map(|line| u32::try_from(line.chars().count().saturating_add(1)).unwrap_or(u32::MAX))
-        .collect();
+        .collect::<Vec<_>>();
     OutputObservation {
         digest,
-        line_columns,
+        source: Some(Arc::from(source)),
+        line_starts: Arc::from(line_starts),
+        line_columns: Arc::from(line_columns),
         reason: None,
     }
 }
@@ -572,21 +609,23 @@ pub(super) fn apply_generated_mappings(
     }
 
     for endpoint_claims in claims_by_endpoint.into_values() {
-        let claim = &endpoint_claims[0];
+        let representative = &endpoint_claims[0];
         let mixed_generator = generators_by_output
-            .get(&claim.mapping.output)
+            .get(&representative.mapping.output)
             .is_some_and(|generators| generators.len() > 1);
         let conflicting_digest = declared_digests_by_output
-            .get(&claim.mapping.output)
+            .get(&representative.mapping.output)
             .is_some_and(|digests| digests.len() > 1);
-        let reason = mapping_failure_reason(
-            claim,
-            endpoint_claims.len(),
-            mixed_generator,
-            conflicting_digest,
-            builder,
-        );
-        emit_claim(builder, claim, reason.as_deref())?;
+        for claim in &endpoint_claims {
+            let reason = mapping_failure_reason(
+                claim,
+                endpoint_claims.len(),
+                mixed_generator,
+                conflicting_digest,
+                builder,
+            );
+            emit_claim(builder, claim, reason.as_deref())?;
+        }
     }
     Ok(())
 }
@@ -636,6 +675,9 @@ fn mapping_failure_reason(
     if !valid_span(observation, claim.mapping) {
         return Some("generated-source-span-is-invalid".to_owned());
     }
+    if !span_contains_symbol(observation, claim.mapping) {
+        return Some("generated-source-symbol-mismatch".to_owned());
+    }
     None
 }
 
@@ -670,6 +712,83 @@ fn valid_span(observation: &OutputObservation, mapping: &GeneratedMapping) -> bo
         return false;
     };
     mapping.start_column <= *start_columns && mapping.end_column <= *end_columns
+}
+
+fn span_contains_symbol(observation: &OutputObservation, mapping: &GeneratedMapping) -> bool {
+    let Some(source) = observation.source.as_deref() else {
+        return false;
+    };
+    let Some(symbol) = terminal_symbol(&mapping.symbol) else {
+        return false;
+    };
+    let start_line = mapping.start_line.saturating_sub(1) as usize;
+    let end_line = mapping.end_line.saturating_sub(1) as usize;
+    (start_line..=end_line).any(|line_index| {
+        let Some(line) = source_line(source, &observation.line_starts, line_index) else {
+            return false;
+        };
+        let start_column = if line_index == start_line {
+            mapping.start_column
+        } else {
+            1
+        };
+        let end_column = if line_index == end_line {
+            mapping.end_column
+        } else {
+            line.chars()
+                .count()
+                .saturating_add(1)
+                .try_into()
+                .unwrap_or(u32::MAX)
+        };
+        source_columns(line, start_column, end_column)
+            .is_some_and(|span| contains_identifier(span, symbol))
+    })
+}
+
+fn terminal_symbol(coordinate: &str) -> Option<&str> {
+    let symbol = coordinate
+        .rsplit([':', '.', '#'])
+        .find(|part| !part.is_empty())?;
+    (!symbol.is_empty()
+        && symbol
+            .chars()
+            .all(|character| character == '_' || character == '$' || character.is_alphanumeric()))
+    .then_some(symbol)
+}
+
+fn source_line<'a>(source: &'a str, line_starts: &[usize], index: usize) -> Option<&'a str> {
+    let start = *line_starts.get(index)?;
+    let end = line_starts
+        .get(index + 1)
+        .map_or(source.len(), |next| next.saturating_sub(1));
+    source.get(start..end)
+}
+
+fn source_columns(source: &str, start_column: u32, end_column: u32) -> Option<&str> {
+    let start_character = usize::try_from(start_column.checked_sub(1)?).ok()?;
+    let end_character = usize::try_from(end_column.checked_sub(1)?).ok()?;
+    let start = source.char_indices().nth(start_character).map_or_else(
+        || (start_character == source.chars().count()).then_some(source.len()),
+        |item| Some(item.0),
+    )?;
+    let end = source.char_indices().nth(end_character).map_or_else(
+        || (end_character == source.chars().count()).then_some(source.len()),
+        |item| Some(item.0),
+    )?;
+    (start <= end).then(|| &source[start..end])
+}
+
+fn contains_identifier(source: &str, identifier: &str) -> bool {
+    source.match_indices(identifier).any(|(start, matched)| {
+        let before = source[..start].chars().next_back();
+        let after = source[start + matched.len()..].chars().next();
+        !before.is_some_and(identifier_character) && !after.is_some_and(identifier_character)
+    })
+}
+
+fn identifier_character(character: char) -> bool {
+    character == '_' || character == '$' || character.is_alphanumeric()
 }
 
 fn emit_claim(
@@ -796,10 +915,6 @@ fn generated_symbol(builder: &mut OpenApiGraphBuilder, claim: &Claim<'_>) -> Res
             (
                 "repository_path".to_owned(),
                 Value::String(claim.mapping.output.clone()),
-            ),
-            (
-                "generator_identity".to_owned(),
-                Value::String(claim.generator_digest()),
             ),
         ]),
     };
@@ -1362,6 +1477,26 @@ mod tests {
             ),
         );
 
+        let wrong_symbol = b"pub fn actual_symbol() {}";
+        fs::write(root.path().join("generated/wrong-symbol.rs"), wrong_symbol).unwrap();
+        write_manifest(
+            root.path(),
+            "wrong-symbol",
+            &manifest(
+                "openapi-generator",
+                "7.10.0",
+                &contract_digest,
+                vec![mapping(
+                    GeneratedLanguage::Rust,
+                    GeneratedRole::Client,
+                    "get /pets/{id}",
+                    "generated/wrong-symbol.rs",
+                    wrong_symbol,
+                    "client::missing_symbol",
+                )],
+            ),
+        );
+
         #[cfg(unix)]
         let _outside_output = {
             use std::io::Write;
@@ -1418,6 +1553,7 @@ mod tests {
             "unsupported-generated-toolchain",
             "generated-contract-digest-mismatch",
             "generated-source-span-is-invalid",
+            "generated-source-symbol-mismatch",
             "generated-manifest-contract-is-invalid",
         ] {
             assert!(
@@ -1444,6 +1580,38 @@ mod tests {
                 })
                 .all(|site| site.resolution_status == ResolutionStatus::Unresolved)
         );
+        assert_eq!(
+            coverage.unresolved_count as usize,
+            delta
+                .sites
+                .iter()
+                .filter(|site| site.resolution_status == ResolutionStatus::Unresolved)
+                .count()
+        );
+        assert_eq!(
+            delta
+                .sites
+                .iter()
+                .filter(|site| {
+                    site.evidence[0]
+                        .properties
+                        .get("generated_output_path")
+                        .and_then(Value::as_str)
+                        == Some("generated/duplicate.go")
+                })
+                .count(),
+            2,
+            "every ambiguous endpoint claim must remain explicit"
+        );
+        assert!(delta.sites.iter().any(|site| {
+            site.evidence[0]
+                .properties
+                .get("generated_output_path")
+                .and_then(Value::as_str)
+                == Some("generated/wrong-symbol.rs")
+                && site.reason.as_deref() == Some("generated-source-symbol-mismatch")
+                && site.resolution_status == ResolutionStatus::Unresolved
+        }));
         assert!(!delta.nodes.iter().any(|node| {
             node.properties
                 .get("repository_path")
@@ -1479,5 +1647,45 @@ mod tests {
             .is_err()
         );
         assert_eq!(records.len(), MAX_OPENAPI_DOCUMENTS);
+    }
+
+    #[test]
+    fn shared_generated_outputs_consume_the_total_byte_budget_once() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("generated")).unwrap();
+        let shared = b"export const shared = 1";
+        fs::write(root.path().join("generated/shared.ts"), shared).unwrap();
+        fs::write(root.path().join("generated/other.ts"), b"x").unwrap();
+
+        let mut total_bytes = MAX_GENERATED_TOTAL_OUTPUT_BYTES - shared.len();
+        let mut observed_outputs = BTreeMap::new();
+        let first = observe_output_once(
+            root.path(),
+            "generated/shared.ts",
+            &mut total_bytes,
+            &mut observed_outputs,
+        );
+        let second = observe_output_once(
+            root.path(),
+            "generated/shared.ts",
+            &mut total_bytes,
+            &mut observed_outputs,
+        );
+
+        assert_eq!(total_bytes, MAX_GENERATED_TOTAL_OUTPUT_BYTES);
+        assert_eq!(first.digest, second.digest);
+        assert!(first.reason.is_none());
+        assert!(second.reason.is_none());
+        assert_eq!(
+            observe_output_once(
+                root.path(),
+                "generated/other.ts",
+                &mut total_bytes,
+                &mut observed_outputs,
+            )
+            .reason
+            .as_deref(),
+            Some("generated-output-byte-limit-exceeded")
+        );
     }
 }
