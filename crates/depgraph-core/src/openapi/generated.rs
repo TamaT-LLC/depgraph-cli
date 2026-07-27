@@ -950,11 +950,11 @@ fn emit_relation(
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::Path};
+    use std::{collections::BTreeMap, fs, path::Path};
 
     use depgraph_protocol::{
         CROSS_LANGUAGE_COMPLETENESS_PROPERTY, CrossLanguageCapabilityStatus,
-        CrossLanguageCompletenessLedger, CrossLanguageMappingKind, ResolutionStatus,
+        CrossLanguageCompletenessLedger, CrossLanguageMappingKind, Profile, ResolutionStatus,
         validate_cross_language_adapter_delta,
     };
 
@@ -1120,6 +1120,20 @@ mod tests {
         .unwrap()
     }
 
+    fn participating_profiles() -> Vec<Profile> {
+        vec![Profile {
+            id: "polyglot:production".to_owned(),
+            language: "polyglot".to_owned(),
+            toolchain: None,
+            command: None,
+            target: None,
+            features: Vec::new(),
+            environment: BTreeMap::new(),
+            source_revision: None,
+            properties: BTreeMap::new(),
+        }]
+    }
+
     #[test]
     fn rust_go_and_web_provenance_create_exact_checkout_independent_mappings() {
         let first = tempfile::tempdir().unwrap();
@@ -1127,10 +1141,10 @@ mod tests {
         write_positive_fixture(first.path(), false);
         write_positive_fixture(second.path(), true);
 
-        let first = scan_openapi_repository(first.path(), &["polyglot:production".to_owned()])
+        let first = scan_openapi_repository(first.path(), &participating_profiles())
             .unwrap()
             .unwrap();
-        let second = scan_openapi_repository(second.path(), &["polyglot:production".to_owned()])
+        let second = scan_openapi_repository(second.path(), &participating_profiles())
             .unwrap()
             .unwrap();
         validate_cross_language_adapter_delta(&first).unwrap();
@@ -1390,7 +1404,7 @@ mod tests {
         )
         .unwrap();
 
-        let delta = scan_openapi_repository(root.path(), &["polyglot:production".to_owned()])
+        let delta = scan_openapi_repository(root.path(), &participating_profiles())
             .unwrap()
             .unwrap();
         validate_cross_language_adapter_delta(&delta).unwrap();
