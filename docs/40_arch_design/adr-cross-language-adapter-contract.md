@@ -342,7 +342,7 @@ one to three engineering days of scope.
 | Order | Slice | Estimate | Depends on | Exit criterion |
 | ---: | --- | --- | --- | --- |
 | 1 | Common node/site/edge DTO, validator, coverage ledger, and cross-format golden harness | Implemented in #191 | This ADR | Canonical identity, resolution matrix, bounds, closure, and determinism tests pass |
-| 2 | OpenAPI 3.1 repository parser and contract graph | 2-3 days | 1 | Local JSON/YAML definitions and refs produce service/operation/message graph; hostile refs fail closed |
+| 2 | OpenAPI 3.1 repository parser and contract graph | Implemented in #192 | 1 | Local JSON/YAML definitions and refs produce service/operation/message graph; hostile refs fail closed |
 | 3 | OpenAPI generated-client/provider repository mapping | 2-3 days | 2 | Provenance-backed calls/implementation edges and stale/ambiguous negative fixtures pass |
 | 4 | Protobuf source/descriptor contract graph | 2-3 days | 1 | Service/method/message/import graph is deterministic without invoking `protoc` |
 | 5 | Protobuf generated-code mapping | 2-3 days | 4 | Descriptor/source-map digests prove language endpoints; naming-only fixtures stay unresolved |
