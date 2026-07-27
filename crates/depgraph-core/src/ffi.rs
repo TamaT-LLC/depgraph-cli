@@ -338,6 +338,7 @@ fn parse_rust(locator: &str, digest: &str, source: &str) -> (Vec<FfiDeclaration>
     let mut declarations = Vec::new();
     let mut boundaries = Vec::new();
     let mut block_comment_depth = 0_usize;
+    let mut raw_string_hashes = None;
     let mut pending_library = None;
     let mut pending_symbol = None;
     let mut pending_stable_export = false;
@@ -362,7 +363,12 @@ fn parse_rust(locator: &str, digest: &str, source: &str) -> (Vec<FfiDeclaration>
 
     for (index, line) in source.lines().enumerate() {
         let line_number = (index + 1) as u32;
-        let code = code_without_comments(line, &mut block_comment_depth, false);
+        let code = code_without_comments(
+            line,
+            &mut block_comment_depth,
+            &mut raw_string_hashes,
+            false,
+        );
         let trimmed = code.trim();
         if trimmed.is_empty() {
             continue;
@@ -547,6 +553,7 @@ fn parse_web(locator: &str, digest: &str, source: &str) -> (Vec<FfiDeclaration>,
     let mut declarations = Vec::new();
     let mut boundaries = Vec::new();
     let mut block_comment_depth = 0_usize;
+    let mut raw_string_hashes = None;
     if ["process.dlopen(", "node-gyp-build(", "bindings("]
         .iter()
         .any(|needle| source.contains(needle))
@@ -554,7 +561,8 @@ fn parse_web(locator: &str, digest: &str, source: &str) -> (Vec<FfiDeclaration>,
         boundaries.push("ffi-web-dynamic-native-binding".to_owned());
     }
     for (index, line) in source.lines().enumerate() {
-        let code = code_without_comments(line, &mut block_comment_depth, true);
+        let code =
+            code_without_comments(line, &mut block_comment_depth, &mut raw_string_hashes, true);
         let trimmed = code.trim();
         if trimmed.is_empty() {
             continue;
@@ -1128,6 +1136,7 @@ fn attribute_string(line: &str, key: &str) -> Option<String> {
 fn code_without_comments(
     line: &str,
     block_comment_depth: &mut usize,
+    raw_string_hashes: &mut Option<usize>,
     single_quote_strings: bool,
 ) -> String {
     let characters = line.chars().collect::<Vec<_>>();
@@ -1135,6 +1144,14 @@ fn code_without_comments(
     let mut index = 0;
     let mut quote = None;
     while index < characters.len() {
+        if let Some(hashes) = *raw_string_hashes {
+            if let Some(after_end) = raw_string_end(&characters, index, hashes) {
+                *raw_string_hashes = None;
+                index = after_end;
+                continue;
+            }
+            break;
+        }
         let character = characters[index];
         let next = characters.get(index + 1).copied();
         if *block_comment_depth > 0 {
@@ -1171,6 +1188,18 @@ fn code_without_comments(
             index += 2;
             continue;
         }
+        if !single_quote_strings
+            && let Some((after_start, hashes)) = raw_string_start(&characters, index)
+        {
+            result.push_str("\"\"");
+            if let Some(after_end) = raw_string_end(&characters, after_start, hashes) {
+                index = after_end;
+            } else {
+                *raw_string_hashes = Some(hashes);
+                break;
+            }
+            continue;
+        }
         let rust_character_literal = !single_quote_strings
             && character == '\''
             && (characters.get(index + 2) == Some(&'\'')
@@ -1185,6 +1214,36 @@ fn code_without_comments(
         index += 1;
     }
     result
+}
+
+fn raw_string_start(characters: &[char], index: usize) -> Option<(usize, usize)> {
+    if index > 0 && (characters[index - 1].is_ascii_alphanumeric() || characters[index - 1] == '_')
+    {
+        return None;
+    }
+    let r_index = match (characters.get(index), characters.get(index + 1)) {
+        (Some('r'), _) => index,
+        (Some('b' | 'c'), Some('r')) => index + 1,
+        _ => return None,
+    };
+    let mut quote_index = r_index + 1;
+    while characters.get(quote_index) == Some(&'#') {
+        quote_index += 1;
+    }
+    (characters.get(quote_index) == Some(&'"'))
+        .then_some((quote_index + 1, quote_index - r_index - 1))
+}
+
+fn raw_string_end(characters: &[char], mut index: usize, hashes: usize) -> Option<usize> {
+    while index < characters.len() {
+        if characters[index] == '"'
+            && (0..hashes).all(|offset| characters.get(index + 1 + offset) == Some(&'#'))
+        {
+            return Some(index + 1 + hashes);
+        }
+        index += 1;
+    }
+    None
 }
 
 struct QuotedLiteral {
@@ -1733,17 +1792,20 @@ unsafe extern "C" {
 
     #[test]
     fn rust_comments_and_inline_extern_blocks_do_not_leak_false_declarations() {
-        let source = r##"
+        let source = r####"
 // extern "C" { fn line_comment(); }
 /*
 extern "C" { fn block_comment(); }
 */
 let standard = "extern \"C\" { fn standard_string(); }";
 let raw = r#"extern "C" { fn raw_string(); }"#;
+let multiline = r##"
+extern "C" { fn multiline_raw_string(); }
+"##;
 extern "C" { fn admitted(); }
 fn ordinary() {}
 static ORDINARY: i32 = 0;
-"##;
+"####;
         let (declarations, boundaries) = parse_rust("native.rs", "sha256:test", source);
         assert!(boundaries.is_empty());
         assert_eq!(declarations.len(), 1);
