@@ -2344,6 +2344,17 @@ impl Store {
         load_completed_snapshot_from_connection(&self.connection, snapshot_id)
     }
 
+    /// Loads only the effective profile records for a completed snapshot.
+    ///
+    /// Semantic no-op snapshots inherit profiles unchanged from their parent,
+    /// so this metadata projection avoids reconstructing the repository graph.
+    pub fn load_completed_snapshot_profiles(
+        &self,
+        snapshot_id: &str,
+    ) -> Result<Vec<ProfileRecord>> {
+        load_completed_snapshot_profiles_from_connection(&self.connection, snapshot_id)
+    }
+
     fn load_base_snapshot(&self, scan_id: &str) -> Result<GraphSnapshot> {
         load_base_snapshot_from_connection(&self.connection, scan_id)
     }
@@ -2577,6 +2588,42 @@ fn load_completed_snapshot_from_connection(
         apply_semantic_noop_overlay(&mut snapshot, overlay)?;
     }
     Ok(snapshot)
+}
+
+fn load_completed_snapshot_profiles_from_connection(
+    connection: &Connection,
+    snapshot_id: &str,
+) -> Result<Vec<ProfileRecord>> {
+    let mut current = snapshot_id.to_owned();
+    let mut visited = BTreeSet::new();
+    loop {
+        if !visited.insert(current.clone()) {
+            bail!("completed snapshot parent cycle detected while loading profiles");
+        }
+        let record = load_completed_snapshot_record(connection, &current)?
+            .with_context(|| format!("completed snapshot {current} was not found"))?;
+        if incremental::scan_is_semantic_noop_overlay(connection, &record.scan_id)? {
+            current = record
+                .parent_snapshot_id
+                .context("semantic no-op snapshot has no parent completed snapshot")?;
+            continue;
+        }
+        let profiles = load_profiles(connection, &record.scan_id)?;
+        let observed_ids = profiles
+            .iter()
+            .map(|profile| profile.id.as_str())
+            .collect::<Vec<_>>();
+        if observed_ids
+            != record
+                .profile_ids
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+        {
+            bail!("completed snapshot profile metadata differs from its stored profile set");
+        }
+        return Ok(profiles);
+    }
 }
 
 fn load_effective_scan_snapshot(connection: &Connection, scan_id: &str) -> Result<GraphSnapshot> {

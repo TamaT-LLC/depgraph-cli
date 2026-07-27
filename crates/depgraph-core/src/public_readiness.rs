@@ -466,7 +466,11 @@ fn contains_sensitive_shape(value: &str) -> bool {
 }
 
 fn parse_time(value: &str) -> Option<DateTime<chrono::FixedOffset>> {
-    DateTime::parse_from_rfc3339(value).ok()
+    value
+        .ends_with('Z')
+        .then(|| DateTime::parse_from_rfc3339(value).ok())
+        .flatten()
+        .filter(|timestamp| timestamp.offset().local_minus_utc() == 0)
 }
 
 #[cfg(test)]
@@ -643,6 +647,10 @@ mod tests {
         let mut personal_contact = bundle.clone();
         personal_contact.record.approvals[0].identity = "person@example.invalid".into();
         cases.push(personal_contact);
+
+        let mut non_canonical_timestamp = bundle.clone();
+        non_canonical_timestamp.record.decided_at = "2026-07-26T09:04:00+09:00".into();
+        cases.push(non_canonical_timestamp);
 
         for case in cases {
             assert_eq!(

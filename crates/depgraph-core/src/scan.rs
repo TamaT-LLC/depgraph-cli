@@ -390,8 +390,7 @@ pub async fn run_scan_with_cache_mode_and_cancellation(
     }
 
     let mut global_upserts = BTreeMap::<(String, String), Value>::new();
-    for output in outputs {
-        let output = bind_worker_output_to_profile_plan(output, &profile_plan)?;
+    for output in bind_worker_outputs_to_profile_plan(outputs, &profile_plan, &mut failures) {
         let adapter = output.adapter;
         let failure_kind = output.failure_kind;
         let security_violation = output.security_violation;
@@ -518,6 +517,32 @@ pub async fn run_scan_with_cache_mode_and_cancellation(
     )
 }
 
+fn bind_worker_outputs_to_profile_plan(
+    outputs: Vec<WorkerOutput>,
+    plan: &DefaultProfileSelectionPlan,
+    failures: &mut Vec<ScanFailure>,
+) -> Vec<WorkerOutput> {
+    outputs
+        .into_iter()
+        .filter_map(|output| {
+            let adapter = output.adapter;
+            let security_violation = output.security_violation;
+            match bind_worker_output_to_profile_plan(output, plan) {
+                Ok(output) => Some(output),
+                Err(error) => {
+                    failures.push(ScanFailure::with_classification(
+                        adapter,
+                        format!("worker profile-plan binding failed: {error:#}"),
+                        WorkerFailureKind::MalformedProtocol,
+                        security_violation,
+                    ));
+                    None
+                }
+            }
+        })
+        .collect()
+}
+
 fn bind_worker_output_to_profile_plan(
     mut output: WorkerOutput,
     plan: &DefaultProfileSelectionPlan,
@@ -540,9 +565,12 @@ fn bind_worker_output_to_profile_plan(
             .get_mut("profile")
             .and_then(Value::as_object_mut)
             .context("validated worker profile declaration is not an object")?;
-        let properties = profile
-            .get_mut("properties")
-            .and_then(Value::as_object_mut)
+        let properties = profile.entry("properties").or_insert(Value::Null);
+        if properties.is_null() {
+            *properties = json!({});
+        }
+        let properties = properties
+            .as_object_mut()
             .context("validated worker profile properties are not an object")?;
         for (key, value) in [
             (
@@ -1631,6 +1659,30 @@ mod tests {
             )?
         );
 
+        let null_properties = WorkerOutput {
+            adapter: AdapterKind::Go,
+            events: vec![json!({
+                "event":"profile_declared",
+                "profile":{
+                    "id":"go:test",
+                    "language":"go",
+                    "features":[],
+                    "environment":{},
+                    "properties":null
+                }
+            })],
+            stderr: String::new(),
+            stderr_truncated: false,
+            error: None,
+            failure_kind: None,
+            security_violation: false,
+        };
+        let bound = bind_worker_output_to_profile_plan(null_properties, &plan)?;
+        assert_eq!(
+            bound.events[0]["profile"]["properties"]["profile_selection_plan_id"],
+            plan.plan_id
+        );
+
         let collision = WorkerOutput {
             adapter: AdapterKind::Go,
             events: vec![json!({
@@ -1649,7 +1701,17 @@ mod tests {
             failure_kind: None,
             security_violation: false,
         };
-        assert!(bind_worker_output_to_profile_plan(collision, &plan).is_err());
+        let mut failures = Vec::new();
+        assert!(
+            bind_worker_outputs_to_profile_plan(vec![collision], &plan, &mut failures).is_empty()
+        );
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].kind, WorkerFailureKind::MalformedProtocol);
+        assert!(
+            failures[0]
+                .detail
+                .contains("reserved profile-selection metadata")
+        );
         Ok(())
     }
 }
