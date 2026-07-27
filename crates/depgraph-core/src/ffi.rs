@@ -1,9 +1,9 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs,
     path::{Component, Path},
 };
 
+use crate::bounded_query::read_bounded_repository_file;
 use anyhow::{Context, Result, bail};
 use depgraph_protocol::{
     CROSS_LANGUAGE_COMPLETENESS_PROPERTY, CROSS_LANGUAGE_COMPLETENESS_VERSION,
@@ -28,9 +28,11 @@ pub const MAX_FFI_FILE_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_FFI_TOTAL_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_FFI_FILES: usize = 4_096;
 pub const MAX_FFI_DECLARATIONS: usize = 100_000;
+pub const MAX_FFI_INVENTORY_ENTRIES: usize = 1_000_000;
 
 const EXTRACTOR: &str = "depgraph-ffi-inventory";
 const MAX_PARTICIPATING_PROFILES: usize = 64;
+const MAX_EXPANDED_DECLARATIONS: usize = 250_000;
 const MAX_BOUNDED_TEXT: usize = 4_096;
 const MAX_REASONS: usize = 64;
 
@@ -79,6 +81,14 @@ pub fn scan_ffi_repository(
         participating_profile_ids: participating_profile_ids.clone(),
     };
     let profile_id = cross_language_profile_id(&profile_identity);
+    let expanded_declarations = inventory
+        .declarations
+        .len()
+        .checked_mul(participating_profile_ids.len())
+        .context("FFI expanded declaration count overflowed")?;
+    if expanded_declarations > MAX_EXPANDED_DECLARATIONS {
+        bail!("FFI inventory exceeds its closed expanded declaration limit");
+    }
     let mut builder = FfiGraphBuilder::new(profile_id.clone());
     for declaration in &inventory.declarations {
         for target_profile_id in &participating_profile_ids {
@@ -213,23 +223,29 @@ struct FfiDeclaration {
 }
 
 fn inventory_sources(root: &Path) -> Result<FfiInventory> {
-    let mut entries = WalkDir::new(root)
+    let entries = WalkDir::new(root)
         .follow_links(false)
+        .sort_by_file_name()
         .into_iter()
-        .filter_entry(admit_entry)
-        .collect::<Result<Vec<_>, _>>()?;
-    entries.sort_by(|left, right| left.path().cmp(right.path()));
+        .filter_entry(admit_entry);
     let mut files = Vec::new();
     let mut declarations = Vec::new();
     let mut skipped_count = 0_u64;
     let mut reasons = BTreeSet::new();
     let mut total_bytes = 0_usize;
+    let mut inventory_entries = 0_usize;
+    let mut source_files = 0_usize;
 
     for entry in entries {
+        record_ffi_inventory_entry(&mut inventory_entries)?;
+        let entry = entry.context("FFI source inventory traversal failed")?;
         let Some(language) = source_language(entry.path()) else {
             continue;
         };
-        if files.len() >= MAX_FFI_FILES {
+        source_files = source_files
+            .checked_add(1)
+            .context("FFI source file count overflowed")?;
+        if source_files > MAX_FFI_FILES {
             bail!("FFI source inventory exceeds its file limit");
         }
         let locator = relative_locator(root, entry.path())?;
@@ -241,21 +257,26 @@ fn inventory_sources(root: &Path) -> Result<FfiInventory> {
         if !entry.file_type().is_file() {
             continue;
         }
-        let metadata = fs::metadata(entry.path())?;
-        let file_bytes = usize::try_from(metadata.len())
-            .map_err(|_| anyhow::anyhow!("FFI source size is not representable"))?;
-        if file_bytes > MAX_FFI_FILE_BYTES {
-            skipped_count += 1;
-            insert_reason(&mut reasons, "ffi-source-file-too-large");
-            continue;
-        }
-        total_bytes = total_bytes
-            .checked_add(file_bytes)
-            .ok_or_else(|| anyhow::anyhow!("FFI source byte count overflowed"))?;
-        if total_bytes > MAX_FFI_TOTAL_BYTES {
+        let bytes = match read_bounded_repository_file(root, entry.path(), MAX_FFI_FILE_BYTES) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                skipped_count += 1;
+                let reason = if error.code == "query_file_size_or_type_invalid" {
+                    "ffi-source-file-too-large"
+                } else {
+                    "ffi-source-read-failed"
+                };
+                insert_reason(&mut reasons, reason);
+                continue;
+            }
+        };
+        let Some(next_total_bytes) = total_bytes.checked_add(bytes.len()) else {
+            bail!("FFI source byte count overflowed");
+        };
+        if next_total_bytes > MAX_FFI_TOTAL_BYTES {
             bail!("FFI source inventory exceeds its total byte limit");
         }
-        let bytes = fs::read(entry.path())?;
+        total_bytes = next_total_bytes;
         let digest = digest_bytes(&bytes);
         let Ok(source) = std::str::from_utf8(&bytes) else {
             skipped_count += 1;
@@ -294,6 +315,16 @@ fn inventory_sources(root: &Path) -> Result<FfiInventory> {
         skipped_count,
         reasons,
     })
+}
+
+fn record_ffi_inventory_entry(inventory_entries: &mut usize) -> Result<()> {
+    *inventory_entries = inventory_entries
+        .checked_add(1)
+        .context("FFI inventory entry count overflowed")?;
+    if *inventory_entries > MAX_FFI_INVENTORY_ENTRIES {
+        bail!("FFI inventory exceeds its closed entry limit");
+    }
+    Ok(())
 }
 
 fn parse_rust(locator: &str, digest: &str, source: &str) -> (Vec<FfiDeclaration>, Vec<String>) {
@@ -1487,5 +1518,13 @@ unsafe extern "C" {
             canonical_json(&serde_json::to_value(first).unwrap()),
             canonical_json(&serde_json::to_value(second).unwrap())
         );
+    }
+
+    #[test]
+    fn inventory_entry_limit_fails_closed() {
+        let mut inventory_entries = MAX_FFI_INVENTORY_ENTRIES - 1;
+        record_ffi_inventory_entry(&mut inventory_entries).unwrap();
+        assert_eq!(inventory_entries, MAX_FFI_INVENTORY_ENTRIES);
+        assert!(record_ffi_inventory_entry(&mut inventory_entries).is_err());
     }
 }
