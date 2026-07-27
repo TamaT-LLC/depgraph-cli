@@ -1,9 +1,9 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs,
     path::{Component, Path},
 };
 
+use crate::bounded_query::read_bounded_repository_file;
 use anyhow::{Context, Result};
 use depgraph_protocol::{
     CROSS_LANGUAGE_CONTRACT_VERSION, Condition, CrossLanguageMappingKind,
@@ -18,7 +18,7 @@ use super::{
     MAX_OPENAPI_DOCUMENT_BYTES, MAX_OPENAPI_DOCUMENTS, MAX_OPENAPI_REFERENCES,
     MAX_OPENAPI_TOTAL_BYTES, OpenApiGraphBuilder, RelationRecord, bounded_contract_text,
     bounded_text, digest_value, insert_identical, inventory_entry_allowed, parse_bounded_json,
-    read_bounded, repository_locator, sha256_prefixed, source_end_position,
+    repository_locator, sha256_prefixed, source_end_position,
 };
 
 pub const OPENAPI_GENERATED_MAPPING_SCHEMA_VERSION: &str = "depgraph-openapi-generated-mapping-v1";
@@ -27,6 +27,7 @@ const GENERATED_EXTRACTOR: &str = "depgraph-openapi-generated-adapter";
 const GENERATED_MANIFEST_SUFFIX: &str = ".depgraph-openapi-generated.json";
 const MAX_GENERATED_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_GENERATED_TOTAL_OUTPUT_BYTES: usize = 128 * 1024 * 1024;
+const MAX_GENERATED_INVENTORY_ENTRIES: usize = 1_000_000;
 
 pub(super) fn is_generated_mapping_locator(locator: &str) -> bool {
     locator.ends_with(GENERATED_MANIFEST_SUFFIX)
@@ -191,12 +192,14 @@ pub(super) fn inventory_generated_mappings(root: &Path) -> Result<GeneratedInven
     let mut manifest_bytes = 0_usize;
     let mut output_bytes = 0_usize;
     let mut mapping_count = 0_usize;
+    let mut inventory_entries = 0_usize;
     let walker = WalkDir::new(root)
         .follow_links(false)
         .sort_by_file_name()
         .into_iter()
         .filter_entry(inventory_entry_allowed);
     for entry in walker {
+        record_generated_inventory_entry(&mut inventory_entries)?;
         let entry = match entry {
             Ok(entry) => entry,
             Err(_) => continue,
@@ -210,51 +213,49 @@ pub(super) fn inventory_generated_mappings(root: &Path) -> Result<GeneratedInven
         if !locator.ends_with(GENERATED_MANIFEST_SUFFIX) {
             continue;
         }
-        if records.len() >= MAX_OPENAPI_DOCUMENTS {
-            records.push(skipped_record(
-                &locator,
-                "generated-manifest-count-limit-exceeded",
-            ));
-            break;
-        }
         if entry.file_type().is_symlink() {
-            records.push(skipped_record(
-                &locator,
-                "generated-manifest-symlink-not-admitted",
-            ));
+            push_generated_inventory_record(
+                &mut records,
+                skipped_record(&locator, "generated-manifest-symlink-not-admitted"),
+            )?;
             continue;
         }
         if !entry.file_type().is_file() {
-            records.push(skipped_record(&locator, "generated-manifest-is-not-a-file"));
+            push_generated_inventory_record(
+                &mut records,
+                skipped_record(&locator, "generated-manifest-is-not-a-file"),
+            )?;
             continue;
         }
-        let file_len = match entry.metadata() {
-            Ok(metadata) => metadata.len() as usize,
-            Err(_) => {
-                records.push(skipped_record(
-                    &locator,
-                    "generated-manifest-metadata-unavailable",
-                ));
-                continue;
-            }
-        };
-        if file_len > MAX_OPENAPI_DOCUMENT_BYTES
-            || manifest_bytes.saturating_add(file_len) > MAX_OPENAPI_TOTAL_BYTES
-        {
-            records.push(skipped_record(
-                &locator,
-                "generated-manifest-byte-limit-exceeded",
+        let bytes =
+            match read_bounded_repository_file(root, entry.path(), MAX_OPENAPI_DOCUMENT_BYTES) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    let reason = if error.code == "query_file_size_or_type_invalid" {
+                        "generated-manifest-byte-limit-exceeded"
+                    } else {
+                        "generated-manifest-read-failed"
+                    };
+                    push_generated_inventory_record(
+                        &mut records,
+                        skipped_record(&locator, reason),
+                    )?;
+                    continue;
+                }
+            };
+        let Some(total_manifest_bytes) = manifest_bytes.checked_add(bytes.len()) else {
+            return Err(anyhow::anyhow!(
+                "OpenAPI generated manifest byte count overflowed"
             ));
+        };
+        if total_manifest_bytes > MAX_OPENAPI_TOTAL_BYTES {
+            push_generated_inventory_record(
+                &mut records,
+                skipped_record(&locator, "generated-manifest-total-byte-limit-exceeded"),
+            )?;
             continue;
         }
-        manifest_bytes += file_len;
-        let bytes = match read_bounded(entry.path(), MAX_OPENAPI_DOCUMENT_BYTES) {
-            Ok(bytes) => bytes,
-            Err(_) => {
-                records.push(skipped_record(&locator, "generated-manifest-read-failed"));
-                continue;
-            }
-        };
+        manifest_bytes = total_manifest_bytes;
         let raw_digest = sha256_prefixed(&bytes);
         let (end_line, end_column) = std::str::from_utf8(&bytes)
             .ok()
@@ -263,7 +264,43 @@ pub(super) fn inventory_generated_mappings(root: &Path) -> Result<GeneratedInven
         let value = match parse_bounded_json(&bytes) {
             Ok(value) => value,
             Err(reason) => {
-                records.push(GeneratedRecord {
+                push_generated_inventory_record(
+                    &mut records,
+                    GeneratedRecord {
+                        locator,
+                        digest: raw_digest,
+                        manifest: None,
+                        observations: BTreeMap::new(),
+                        reason: Some(reason),
+                        end_line,
+                        end_column,
+                    },
+                )?;
+                continue;
+            }
+        };
+        let mut manifest: GeneratedManifest = match serde_json::from_value(value) {
+            Ok(manifest) => manifest,
+            Err(_) => {
+                push_generated_inventory_record(
+                    &mut records,
+                    GeneratedRecord {
+                        locator,
+                        digest: raw_digest,
+                        manifest: None,
+                        observations: BTreeMap::new(),
+                        reason: Some("generated-manifest-schema-is-invalid".to_owned()),
+                        end_line,
+                        end_column,
+                    },
+                )?;
+                continue;
+            }
+        };
+        if let Err(reason) = validate_manifest(&mut manifest) {
+            push_generated_inventory_record(
+                &mut records,
+                GeneratedRecord {
                     locator,
                     digest: raw_digest,
                     manifest: None,
@@ -271,47 +308,23 @@ pub(super) fn inventory_generated_mappings(root: &Path) -> Result<GeneratedInven
                     reason: Some(reason),
                     end_line,
                     end_column,
-                });
-                continue;
-            }
-        };
-        let mut manifest: GeneratedManifest = match serde_json::from_value(value) {
-            Ok(manifest) => manifest,
-            Err(_) => {
-                records.push(GeneratedRecord {
+                },
+            )?;
+            continue;
+        }
+        if mapping_count.saturating_add(manifest.mappings.len()) > MAX_OPENAPI_REFERENCES {
+            push_generated_inventory_record(
+                &mut records,
+                GeneratedRecord {
                     locator,
                     digest: raw_digest,
                     manifest: None,
                     observations: BTreeMap::new(),
-                    reason: Some("generated-manifest-schema-is-invalid".to_owned()),
+                    reason: Some("generated-mapping-count-limit-exceeded".to_owned()),
                     end_line,
                     end_column,
-                });
-                continue;
-            }
-        };
-        if let Err(reason) = validate_manifest(&mut manifest) {
-            records.push(GeneratedRecord {
-                locator,
-                digest: raw_digest,
-                manifest: None,
-                observations: BTreeMap::new(),
-                reason: Some(reason),
-                end_line,
-                end_column,
-            });
-            continue;
-        }
-        if mapping_count.saturating_add(manifest.mappings.len()) > MAX_OPENAPI_REFERENCES {
-            records.push(GeneratedRecord {
-                locator,
-                digest: raw_digest,
-                manifest: None,
-                observations: BTreeMap::new(),
-                reason: Some("generated-mapping-count-limit-exceeded".to_owned()),
-                end_line,
-                end_column,
-            });
+                },
+            )?;
             continue;
         }
         mapping_count += manifest.mappings.len();
@@ -326,18 +339,42 @@ pub(super) fn inventory_generated_mappings(root: &Path) -> Result<GeneratedInven
             let observation = observe_output(root, output, &mut output_bytes);
             observations.insert(output.to_owned(), observation);
         }
-        records.push(GeneratedRecord {
-            locator,
-            digest,
-            manifest: Some(manifest),
-            observations,
-            reason: None,
-            end_line,
-            end_column,
-        });
+        push_generated_inventory_record(
+            &mut records,
+            GeneratedRecord {
+                locator,
+                digest,
+                manifest: Some(manifest),
+                observations,
+                reason: None,
+                end_line,
+                end_column,
+            },
+        )?;
     }
     records.sort_by(|left, right| left.locator.cmp(&right.locator));
     Ok(GeneratedInventory { records })
+}
+
+fn record_generated_inventory_entry(inventory_entries: &mut usize) -> Result<()> {
+    *inventory_entries = inventory_entries
+        .checked_add(1)
+        .context("OpenAPI generated inventory entry count overflowed")?;
+    if *inventory_entries > MAX_GENERATED_INVENTORY_ENTRIES {
+        anyhow::bail!("OpenAPI generated inventory exceeds its closed entry limit");
+    }
+    Ok(())
+}
+
+fn push_generated_inventory_record(
+    records: &mut Vec<GeneratedRecord>,
+    record: GeneratedRecord,
+) -> Result<()> {
+    if records.len() >= MAX_OPENAPI_DOCUMENTS {
+        anyhow::bail!("OpenAPI generated inventory exceeds its closed manifest limit");
+    }
+    records.push(record);
+    Ok(())
 }
 
 fn skipped_record(locator: &str, reason: &str) -> GeneratedRecord {
@@ -386,43 +423,36 @@ fn validate_manifest(manifest: &mut GeneratedManifest) -> std::result::Result<()
 
 fn observe_output(root: &Path, relative: &str, total_bytes: &mut usize) -> OutputObservation {
     let path = root.join(relative);
-    if !confined_regular_file(root, &path) {
-        return OutputObservation {
-            digest: None,
-            line_columns: Vec::new(),
-            reason: Some("generated-output-is-missing-or-unsafe".to_owned()),
-        };
-    }
-    let file_len = match fs::metadata(&path) {
-        Ok(metadata) => metadata.len() as usize,
-        Err(_) => {
+    let bytes = match read_bounded_repository_file(root, &path, MAX_GENERATED_OUTPUT_BYTES) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            let reason = if error.code == "query_file_size_or_type_invalid" {
+                "generated-output-byte-limit-exceeded"
+            } else {
+                "generated-output-is-missing-or-unsafe"
+            };
             return OutputObservation {
                 digest: None,
                 line_columns: Vec::new(),
-                reason: Some("generated-output-metadata-unavailable".to_owned()),
+                reason: Some(reason.to_owned()),
             };
         }
     };
-    if file_len > MAX_GENERATED_OUTPUT_BYTES
-        || total_bytes.saturating_add(file_len) > MAX_GENERATED_TOTAL_OUTPUT_BYTES
-    {
+    let Some(total_output_bytes) = total_bytes.checked_add(bytes.len()) else {
+        return OutputObservation {
+            digest: None,
+            line_columns: Vec::new(),
+            reason: Some("generated-output-byte-limit-exceeded".to_owned()),
+        };
+    };
+    if total_output_bytes > MAX_GENERATED_TOTAL_OUTPUT_BYTES {
         return OutputObservation {
             digest: None,
             line_columns: Vec::new(),
             reason: Some("generated-output-byte-limit-exceeded".to_owned()),
         };
     }
-    *total_bytes += file_len;
-    let bytes = match read_bounded(&path, MAX_GENERATED_OUTPUT_BYTES) {
-        Ok(bytes) => bytes,
-        Err(_) => {
-            return OutputObservation {
-                digest: None,
-                line_columns: Vec::new(),
-                reason: Some("generated-output-read-failed".to_owned()),
-            };
-        }
-    };
+    *total_bytes = total_output_bytes;
     let digest = Some(sha256_prefixed(&bytes));
     let source = match std::str::from_utf8(&bytes) {
         Ok(source) => source,
@@ -443,26 +473,6 @@ fn observe_output(root: &Path, relative: &str, total_bytes: &mut usize) -> Outpu
         line_columns,
         reason: None,
     }
-}
-
-fn confined_regular_file(root: &Path, path: &Path) -> bool {
-    let Ok(relative) = path.strip_prefix(root) else {
-        return false;
-    };
-    let mut current = root.to_path_buf();
-    for component in relative.components() {
-        let Component::Normal(component) = component else {
-            return false;
-        };
-        current.push(component);
-        let Ok(metadata) = fs::symlink_metadata(&current) else {
-            return false;
-        };
-        if metadata.file_type().is_symlink() {
-            return false;
-        }
-    }
-    fs::metadata(path).is_ok_and(|metadata| metadata.is_file())
 }
 
 fn valid_repository_path(value: &str) -> bool {
@@ -1426,5 +1436,34 @@ mod tests {
                 .and_then(Value::as_str)
                 == Some("generated/naming-only.rs")
         }));
+    }
+
+    #[test]
+    fn generated_inventory_limits_fail_closed_without_growing_records() {
+        let mut inventory_entries = MAX_GENERATED_INVENTORY_ENTRIES - 1;
+        record_generated_inventory_entry(&mut inventory_entries).unwrap();
+        assert_eq!(inventory_entries, MAX_GENERATED_INVENTORY_ENTRIES);
+        assert!(record_generated_inventory_entry(&mut inventory_entries).is_err());
+
+        let mut records = Vec::new();
+        for index in 0..MAX_OPENAPI_DOCUMENTS {
+            push_generated_inventory_record(
+                &mut records,
+                skipped_record(
+                    &format!("mapping-{index}{GENERATED_MANIFEST_SUFFIX}"),
+                    "test-skip",
+                ),
+            )
+            .unwrap();
+        }
+        assert_eq!(records.len(), MAX_OPENAPI_DOCUMENTS);
+        assert!(
+            push_generated_inventory_record(
+                &mut records,
+                skipped_record(&format!("overflow{GENERATED_MANIFEST_SUFFIX}"), "test-skip",),
+            )
+            .is_err()
+        );
+        assert_eq!(records.len(), MAX_OPENAPI_DOCUMENTS);
     }
 }
