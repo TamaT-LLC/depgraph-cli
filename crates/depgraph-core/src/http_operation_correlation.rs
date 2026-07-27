@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Context, Result, bail};
 use depgraph_protocol::{
@@ -17,10 +17,14 @@ use serde_json::{Value, json};
 use crate::{
     RuntimeHttpObservation, RuntimeHttpOperationFormat, RuntimeTraceLocator,
     RuntimeTraceMatchStatus, ValidatedRuntimeTrace, ValidatedRuntimeTraceEvent,
+    runtime_trace::validate_http_correlation_trace,
 };
 
 pub const HTTP_OPERATION_CORRELATION_VERSION: &str = "http-operation-correlation-v1";
 const EXTRACTOR: &str = "depgraph-http-operation-correlator";
+const MAX_CORRELATION_CONTRACTS: usize = 256;
+const MAX_CORRELATION_OPERATIONS: usize = 100_000;
+const MAX_CORRELATION_CANDIDATES_PER_EVENT: usize = 10_000;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -55,6 +59,13 @@ struct OperationCandidate {
     contract_digest: String,
 }
 
+#[derive(Clone)]
+struct IndexedOperation {
+    candidate: OperationCandidate,
+    identity: CrossLanguageCanonicalIdentity,
+    proof: Option<(String, String)>,
+}
+
 /// Correlates validated and redacted runtime HTTP observations to existing
 /// static contract operations. The input deltas are cloned and augmented only
 /// for unique, same-profile matches; static exact relations are never changed.
@@ -62,11 +73,16 @@ pub fn correlate_http_operations(
     trace: &ValidatedRuntimeTrace,
     contracts: &[CrossLanguageAdapterDelta],
 ) -> Result<HttpOperationCorrelationResult> {
+    validate_http_correlation_trace(trace)?;
+    if contracts.len() > MAX_CORRELATION_CONTRACTS {
+        bail!("HTTP correlation exceeds its closed contract limit");
+    }
     for contract in contracts {
         validate_cross_language_adapter_delta(contract)
             .map_err(anyhow::Error::from)
             .context("HTTP correlation received an invalid static contract delta")?;
     }
+    let operation_index = build_operation_index(trace, contracts)?;
     let trace_digest = stable_id_from_value(
         "http-operation-trace",
         &serde_json::to_value(trace).context("serializing validated runtime trace")?,
@@ -79,42 +95,33 @@ pub fn correlate_http_operations(
         let http = event.http.as_ref().context("filtered HTTP observation")?;
         let mut candidates = Vec::new();
         let mut version_drift = false;
-        let parent_profile_id = trace.profile_match.parent_profile_id.as_deref();
         if trace.profile_match.status == RuntimeTraceMatchStatus::Resolved {
-            for (delta_index, delta) in contracts.iter().enumerate() {
-                let profile_identity = profile_identity(delta)?;
-                if parent_profile_id.is_none()
-                    || !profile_identity
-                        .participating_profile_ids
-                        .iter()
-                        .any(|profile| Some(profile.as_str()) == parent_profile_id)
-                {
+            let coordinate = http.operation.clone().unwrap_or_else(|| {
+                format!(
+                    "{} {}",
+                    http.method.to_ascii_lowercase(),
+                    http.route_template
+                )
+            });
+            for indexed in operation_index.get(&coordinate).into_iter().flatten() {
+                let match_kind = operation_match(http, &indexed.identity);
+                if match_kind == OperationMatch::VersionDrift {
+                    version_drift = true;
                     continue;
                 }
-                for node in delta.nodes.iter().filter(|node| node.kind == "operation") {
-                    let identity = operation_identity(node)?;
-                    let match_kind = operation_match(http, &identity);
-                    if match_kind == OperationMatch::VersionDrift {
-                        version_drift = true;
-                        continue;
-                    }
-                    if match_kind != OperationMatch::Match {
-                        continue;
-                    }
-                    let Some((format_version, contract_digest)) =
-                        operation_contract_proof(delta, &node.id, &identity)?
-                    else {
-                        continue;
-                    };
-                    candidates.push(OperationCandidate {
-                        delta_index,
-                        node_id: node.id.clone(),
-                        profile_id: delta.profile.id.clone(),
-                        format: identity.format,
-                        format_version,
-                        contract_digest,
-                    });
+                if match_kind != OperationMatch::Match {
+                    continue;
                 }
+                let Some((format_version, contract_digest)) = &indexed.proof else {
+                    continue;
+                };
+                if candidates.len() >= MAX_CORRELATION_CANDIDATES_PER_EVENT {
+                    bail!("HTTP correlation exceeds its closed per-event candidate limit");
+                }
+                let mut candidate = indexed.candidate.clone();
+                candidate.format_version = format_version.clone();
+                candidate.contract_digest = contract_digest.clone();
+                candidates.push(candidate);
             }
         }
         candidates.sort_by(|left, right| {
@@ -243,6 +250,72 @@ pub fn correlate_http_operations(
         outcomes,
         deltas,
     })
+}
+
+fn build_operation_index(
+    trace: &ValidatedRuntimeTrace,
+    contracts: &[CrossLanguageAdapterDelta],
+) -> Result<BTreeMap<String, Vec<IndexedOperation>>> {
+    let mut operation_count = 0_usize;
+    let mut index = BTreeMap::<String, Vec<IndexedOperation>>::new();
+    if trace.profile_match.status != RuntimeTraceMatchStatus::Resolved {
+        return Ok(index);
+    }
+    let parent_profile_id = trace
+        .profile_match
+        .parent_profile_id
+        .as_deref()
+        .context("resolved runtime profile has no parent profile ID")?;
+    for (delta_index, delta) in contracts.iter().enumerate() {
+        let profile_identity = profile_identity(delta)?;
+        if !profile_identity
+            .participating_profile_ids
+            .iter()
+            .any(|profile| profile == parent_profile_id)
+        {
+            continue;
+        }
+        for node in delta.nodes.iter().filter(|node| node.kind == "operation") {
+            operation_count = operation_count
+                .checked_add(1)
+                .context("HTTP correlation operation count overflowed")?;
+            if operation_count > MAX_CORRELATION_OPERATIONS {
+                bail!("HTTP correlation exceeds its closed operation limit");
+            }
+            let identity = operation_identity(node)?;
+            let proof = operation_contract_proof(delta, &node.id, &identity)?;
+            index
+                .entry(identity.coordinate.clone())
+                .or_default()
+                .push(IndexedOperation {
+                    candidate: OperationCandidate {
+                        delta_index,
+                        node_id: node.id.clone(),
+                        profile_id: delta.profile.id.clone(),
+                        format: identity.format,
+                        format_version: String::new(),
+                        contract_digest: String::new(),
+                    },
+                    identity,
+                    proof,
+                });
+        }
+    }
+    for operations in index.values_mut() {
+        operations.sort_by(|left, right| {
+            (
+                left.candidate.format,
+                left.candidate.profile_id.as_bytes(),
+                left.candidate.node_id.as_bytes(),
+            )
+                .cmp(&(
+                    right.candidate.format,
+                    right.candidate.profile_id.as_bytes(),
+                    right.candidate.node_id.as_bytes(),
+                ))
+        });
+    }
+    Ok(index)
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -613,26 +686,23 @@ fn canonicalize_and_validate_delta(delta: &mut CrossLanguageAdapterDelta) -> Res
                     evidence.properties.clone().into_iter().collect(),
                 ))
                 .ok()
+                .map(|properties| (site, properties))
             })
         });
         let site_properties = site_properties.collect::<Vec<_>>();
         entry.site_count = site_properties
             .iter()
-            .filter(|properties| properties.format == entry.format)
+            .filter(|(_, properties)| properties.format == entry.format)
             .count() as u64;
-        entry.external_count = delta
-            .sites
+        entry.external_count = site_properties
             .iter()
-            .zip(&site_properties)
             .filter(|(site, properties)| {
                 properties.format == entry.format
                     && site.resolution_status == ResolutionStatus::External
             })
             .count() as u64;
-        entry.unresolved_count = delta
-            .sites
+        entry.unresolved_count = site_properties
             .iter()
-            .zip(&site_properties)
             .filter(|(site, properties)| {
                 properties.format == entry.format
                     && site.resolution_status == ResolutionStatus::Unresolved
@@ -851,6 +921,11 @@ mod tests {
             .as_mut()
             .context("http")?
             .format_version = Some("3.2.0".to_owned());
+        runtime.events[0].id = crate::runtime_trace::expected_validated_runtime_event_id(
+            &runtime.repository,
+            &runtime.session,
+            &runtime.events[0],
+        );
         let drift = correlate_http_operations(&runtime, std::slice::from_ref(&contract))?;
         assert_eq!(drift.outcomes[0].status, ResolutionStatus::Unresolved);
         assert_eq!(drift.outcomes[0].reason, "contract-version-drift");
@@ -959,7 +1034,7 @@ mod tests {
             namespace: "https".to_owned(),
             name: "api.example.test".to_owned(),
         };
-        ValidatedRuntimeTrace {
+        let mut trace = ValidatedRuntimeTrace {
             schema_version: crate::RUNTIME_TRACE_SCHEMA_VERSION.to_owned(),
             repository: RuntimeTraceRepository {
                 identity: "repository".to_owned(),
@@ -992,10 +1067,7 @@ mod tests {
                 reason: None,
             },
             events: vec![ValidatedRuntimeTraceEvent {
-                id: stable_id_from_value(
-                    "runtime-event",
-                    &json!({"session_id":session_id,"source":source_id,"http":http}),
-                ),
+                id: String::new(),
                 sequence: 1,
                 timestamp: "2026-07-26T00:00:00Z".to_owned(),
                 dependency_kind: "requests".to_owned(),
@@ -1023,7 +1095,77 @@ mod tests {
                 unresolved_targets: 0,
                 redacted_values: 0,
             },
-        }
+        };
+        trace.events[0].id = crate::runtime_trace::expected_validated_runtime_event_id(
+            &trace.repository,
+            &trace.session,
+            &trace.events[0],
+        );
+        trace
+    }
+
+    #[test]
+    fn forged_validated_traces_and_unbounded_contract_sets_fail_closed() -> Result<()> {
+        let root = tempdir()?;
+        fs::write(
+            root.path().join("api.json"),
+            r#"{"openapi":"3.1.0","info":{"title":"api","version":"1"},"paths":{"/health":{"get":{"responses":{"200":{"description":"ok"}}}}}}"#,
+        )?;
+        let contract =
+            scan_openapi_repository(root.path(), &[PARENT_PROFILE.to_owned()])?.context("delta")?;
+        let source = operation(
+            std::slice::from_ref(&contract),
+            CrossLanguageFormat::Openapi,
+            "get /health",
+        )?
+        .1;
+        let source_id = source.id.clone();
+        let mut forged = trace(
+            source_id.clone(),
+            RuntimeHttpObservation {
+                method: "GET".to_owned(),
+                route_template: "/health".to_owned(),
+                format: Some(RuntimeHttpOperationFormat::Openapi),
+                operation: None,
+                contract_locator: Some("api.json".to_owned()),
+                format_version: Some("3.1.0".to_owned()),
+            },
+            "session-a",
+        );
+        let secret = "fixture-secret-value";
+        forged.events[0].target.input = RuntimeTraceLocator::External {
+            namespace: "https".to_owned(),
+            name: format!("user:{secret}@api.example.test"),
+        };
+        forged.events[0].id = crate::runtime_trace::expected_validated_runtime_event_id(
+            &forged.repository,
+            &forged.session,
+            &forged.events[0],
+        );
+        let error = correlate_http_operations(&forged, std::slice::from_ref(&contract))
+            .expect_err("forged validated trace must be rejected");
+        assert!(!format!("{error:#}").contains(secret));
+
+        let contracts = vec![contract; MAX_CORRELATION_CONTRACTS + 1];
+        assert!(
+            correlate_http_operations(
+                &trace(
+                    source_id,
+                    RuntimeHttpObservation {
+                        method: "GET".to_owned(),
+                        route_template: "/health".to_owned(),
+                        format: Some(RuntimeHttpOperationFormat::Openapi),
+                        operation: None,
+                        contract_locator: Some("api.json".to_owned()),
+                        format_version: Some("3.1.0".to_owned()),
+                    },
+                    "session-a",
+                ),
+                &contracts
+            )
+            .is_err()
+        );
+        Ok(())
     }
 
     #[test]
