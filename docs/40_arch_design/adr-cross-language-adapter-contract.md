@@ -442,7 +442,7 @@ one to three engineering days of scope.
 | 4 | Protobuf source/descriptor contract graph | Implemented in #194 | 1 | Service/method/message/import graph is deterministic without invoking `protoc` |
 | 5 | Protobuf generated-code mapping | Implemented in #195 | 4 | Descriptor/source-map digests prove language endpoints; naming-only fixtures stay unresolved |
 | 6 | GraphQL SDL and executable-document graph | Implemented in #196 | 1 | Field/message/selection graph is complete for admitted files without introspection |
-| 7 | GraphQL client/resolver repository mapping | Implemented in #197 | 6 | Supported compiler/framework maps prove endpoints; dynamic/federated cases remain ledgered |
+| 7 | GraphQL client/resolver repository mapping | 2-3 days | 6 | Supported compiler/framework maps prove endpoints; dynamic/federated cases remain ledgered |
 | 8 | HTTP trace-to-operation correlation | 2-3 days | 2, 4 or 6; runtime trace v1 | Unique profile match is observed; ambiguous, raw-URL, and secret fixtures fail closed |
 | 9 | Rust/Go/Web static FFI declaration inventory | 2-3 days | 1 | Every admitted declaration is resolved/candidate/external/unresolved by target profile |
 | 10 | FFI supervised link/export evidence | 2-3 days | 9; build supervisor | Exact ABI/library/symbol mappings require same-profile link evidence and preserve rollback |
