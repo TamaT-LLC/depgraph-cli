@@ -1224,6 +1224,10 @@ fn web_native_binding_literal_is_admitted(
     literal_start: usize,
     literal_end: usize,
 ) -> bool {
+    let statement = line.trim_start();
+    if web_type_only_statement(statement) {
+        return false;
+    }
     let Some(prefix) = line.get(..literal_start) else {
         return false;
     };
@@ -1233,7 +1237,6 @@ fn web_native_binding_literal_is_admitted(
             .is_some_and(|suffix| matches!(suffix.trim_start().chars().next(), Some(')' | ',')));
     }
 
-    let statement = line.trim_start();
     let prefix = prefix.trim();
     if statement.starts_with("declare module ") {
         return prefix == "declare module";
@@ -1246,6 +1249,9 @@ fn web_native_binding_literal_is_admitted(
 
 fn web_native_binding_syntax(line: &str) -> bool {
     let statement = line.trim_start();
+    if web_type_only_statement(statement) {
+        return false;
+    }
     statement.starts_with("import ")
         || statement.starts_with("export ")
         || statement.starts_with("declare module ")
@@ -1255,6 +1261,10 @@ fn web_native_binding_syntax(line: &str) -> bool {
                     .is_some_and(|prefix| call_prefix_ends_with(prefix, function))
             })
         })
+}
+
+fn web_type_only_statement(statement: &str) -> bool {
+    statement.starts_with("import type ") || statement.starts_with("export type ")
 }
 
 fn call_prefix_ends_with(prefix: &str, function: &str) -> bool {
@@ -1673,6 +1683,8 @@ const another = './not-a-load.node';
 import { hash } from './real.node';
 const native = require("./required.node");
 declare module '*.node';
+import type { NativeType } from './type-only.node';
+export type { NativeExport } from './export-type-only.node';
 console.log("also-not-a-load.node");
 "#;
         let (declarations, boundaries) = parse_web("native.ts", "sha256:test", source);
