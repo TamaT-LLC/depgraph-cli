@@ -916,7 +916,18 @@ fn span_contains_endpoint(observation: &OutputObservation, mapping: &RepositoryM
         };
         selected.extend(line.chars().skip(start).take(end.saturating_sub(start)));
     }
-    selected.contains(&mapping.endpoint)
+    selected
+        .match_indices(&mapping.endpoint)
+        .any(|(index, endpoint)| {
+            let before = selected[..index].chars().next_back();
+            let after = selected[index + endpoint.len()..].chars().next();
+            before.is_none_or(|character| !is_endpoint_identifier_character(character))
+                && after.is_none_or(|character| !is_endpoint_identifier_character(character))
+        })
+}
+
+fn is_endpoint_identifier_character(character: char) -> bool {
+    character.is_alphanumeric() || matches!(character, '_' | '$')
 }
 
 fn emit_claim(
@@ -1550,7 +1561,7 @@ type Product { id: ID!, name: String! }
         fs::create_dir_all(root.path().join("generated")).unwrap();
         let documents = write_contract(root.path());
         let output = "generated/client.rs";
-        let source = "fn actual_endpoint() {}\n";
+        let source = "fn claimed_endpoint_suffix() {}\n";
         fs::write(root.path().join(output), source).unwrap();
         let manifest = mapping_manifest(
             ("cynic-codegen", "3.12.0"),
