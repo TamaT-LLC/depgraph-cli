@@ -30,7 +30,7 @@ use crate::{
     RUST_SYSROOT_LICENSE_EXPRESSION, ReleaseCompatibilityHealth,
     cancellation::CancellationToken,
     config::{ProfileConfig, ScanConfig},
-    verify_release_compatibility,
+    validate_cross_language_worker_protocol, verify_release_compatibility,
 };
 
 pub(crate) const RUST_BACKEND_KIND: &str = "rust-analyzer-library";
@@ -6422,7 +6422,11 @@ fn parse_events_preserving_prefix(
     if parse_error.is_none() {
         match validator.finish() {
             Ok(protocol) if enforce_web_definition_graph => {
-                if let Err(error) = validate_semantic_contract(&protocol) {
+                if let Err(error) = validate_cross_language_worker_protocol(&protocol) {
+                    parse_error = Some(format!(
+                        "security policy violation: invalid cross-language worker closure: {error:#}"
+                    ));
+                } else if let Err(error) = validate_semantic_contract(&protocol) {
                     web_framework_failure = saw_web_framework_semantic_delta
                         && semantic_contract_failure_is_framework(&protocol);
                     parse_error = Some(format!(
@@ -6452,7 +6456,15 @@ fn parse_events_preserving_prefix(
                     security_violation = true;
                 }
             }
-            Ok(_) => {}
+            Ok(protocol) => {
+                if let Err(error) = validate_cross_language_worker_protocol(&protocol) {
+                    parse_error = Some(format!(
+                        "security policy violation: invalid cross-language worker closure: {error:#}"
+                    ));
+                    failure_kind = Some(WorkerFailureKind::MalformedProtocol);
+                    security_violation = true;
+                }
+            }
             Err(error) => {
                 if enforce_web_definition_graph
                     && (saw_web_semantic_delta
@@ -6502,6 +6514,145 @@ fn parse_events_preserving_prefix(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn non_cross_language_web_stream_remains_accepted() -> Result<()> {
+        let root = tempfile::tempdir()?.path().canonicalize()?;
+        let common = serde_json::json!({
+            "protocol_version": "1.0",
+            "scan_id": "non-cross-web",
+            "adapter": "web",
+            "adapter_version": "0.1.0",
+        });
+        let coverage = serde_json::json!({
+            "profiles": 1,
+            "files_discovered": 0,
+            "files_analyzed": 0,
+            "files_skipped": 0,
+            "dependency_sites": 0,
+            "resolved": 0,
+            "candidates": 0,
+            "external": 0,
+            "unresolved": 0,
+            "unsupported_syntax": 0,
+            "project_code_executed": false,
+            "completeness": ["syntax-complete"],
+            "reasons": [],
+        });
+        let event = |value: serde_json::Value| {
+            let mut object = common.as_object().cloned().unwrap_or_default();
+            object.extend(value.as_object().cloned().unwrap_or_default());
+            serde_json::Value::Object(object)
+        };
+        let events = [
+            event(serde_json::json!({
+                "event": "scan_started",
+                "seq": 1,
+                "root": root,
+                "project_code_executed": false,
+                "safe_mode": true,
+            })),
+            event(serde_json::json!({
+                "event": "profile_declared",
+                "seq": 2,
+                "profile": {
+                    "id": "web:test",
+                    "language": "web",
+                    "features": [],
+                    "environment": {},
+                    "properties": {
+                        "typescript_analysis_mode": "semantic-definition-graph",
+                        "typescript_project_model_status": "ready",
+                        "typescript_typechecker_status": "definition-graph-emitted",
+                        "typescript_definition_graph_status": "ready",
+                        "typescript_semantic_graph_emission": "definition-graph-v1",
+                        "typescript_semantic_node_count": "0",
+                        "typescript_semantic_relation_count": "0",
+                        "typescript_semantic_issue_count": "0",
+                        "typescript_release_gate": "release-gate-pending",
+                    },
+                },
+            })),
+            event(serde_json::json!({
+                "event": "profile_completed",
+                "seq": 3,
+                "profile_id": "web:test",
+                "coverage": coverage,
+            })),
+            event(serde_json::json!({
+                "event": "scan_completed",
+                "seq": 4,
+                "coverage": coverage,
+            })),
+        ];
+        let output = events
+            .iter()
+            .map(serde_json::to_string)
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .join("\n");
+        let parsed = parse_events_preserving_prefix(
+            output.as_bytes(),
+            "non-cross-web",
+            "web",
+            &root,
+            4096,
+            Some("0.1.0"),
+            Some(false),
+        );
+
+        assert!(parsed.error.is_none(), "{:?}", parsed.error);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn non_cross_language_web_worker_remains_accepted() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("project");
+        std::fs::create_dir(&root)?;
+        let root = root.canonicalize()?;
+        let worker = temp.path().join("web-worker.mjs");
+        std::fs::write(
+            &worker,
+            r#"const args = process.argv.slice(2);
+const root = args[args.indexOf("--root") + 1];
+const scan = args[args.indexOf("--scan-id") + 1];
+const common = {protocol_version:"1.0",scan_id:scan,adapter:"web",adapter_version:"0.1.0"};
+const coverage = {profiles:1,files_discovered:0,files_analyzed:0,files_skipped:0,dependency_sites:0,resolved:0,candidates:0,external:0,unresolved:0,unsupported_syntax:0,project_code_executed:false,completeness:["syntax-complete"],reasons:[]};
+const events = [
+  {event:"scan_started",...common,seq:1,root,project_code_executed:false,safe_mode:true},
+  {event:"profile_declared",...common,seq:2,profile:{id:"web:test",language:"web",features:[],environment:{},properties:{typescript_analysis_mode:"semantic-definition-graph",typescript_project_model_status:"ready",typescript_typechecker_status:"definition-graph-emitted",typescript_definition_graph_status:"ready",typescript_semantic_graph_emission:"definition-graph-v1",typescript_semantic_node_count:"0",typescript_semantic_relation_count:"0",typescript_semantic_issue_count:"0",typescript_release_gate:"release-gate-pending"}}},
+  {event:"profile_completed",...common,seq:3,profile_id:"web:test",coverage},
+  {event:"scan_completed",...common,seq:4,coverage}
+];
+for (const event of events) console.log(JSON.stringify(event));
+"#,
+        )?;
+        let spec = WorkerSpec {
+            adapter: AdapterKind::Web,
+            program: OsString::from("node"),
+            leading_args: vec![worker.clone().into_os_string()],
+            display: worker.display().to_string(),
+            artifact_path: worker,
+            runtime_requirement: None,
+            expected_version: None,
+            release_attested: false,
+            attested_rust_sysroot: None,
+        };
+        let execution = execute_worker_inner_with_cancellation(
+            &spec,
+            &root,
+            "non-cross-web",
+            &ScanConfig::default(),
+            &ProfileConfig::default(),
+            None,
+            std::future::pending::<std::io::Result<()>>(),
+        )
+        .await?;
+
+        assert!(execution.error.is_none(), "{:?}", execution.error);
+        assert_eq!(execution.events.len(), 4);
+        Ok(())
+    }
 
     #[test]
     fn worker_capability_handshake_is_exact_sorted_and_fail_closed() {

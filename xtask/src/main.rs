@@ -676,6 +676,7 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "## Format capability boundaries",
         "## Security boundary",
         "## Rollout order and issue-sized plan",
+        "| 1 | Common node/site/edge DTO, validator, coverage ledger, and cross-format golden harness | Implemented in #191 |",
         "| 11 | Five-target package/query/release gate | 2-3 days |",
         "## Acceptance matrix",
         "| Safe invariant |",
