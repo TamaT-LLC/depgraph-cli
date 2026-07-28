@@ -603,6 +603,7 @@ fn verify_workflow_policy_text(
     let workflow = normalized_workflow.as_str();
     let write_permissions = write_permission_scopes(workflow);
     if workflow.contains("pull_request_target")
+        || contains_yaml_hex_escape(workflow)
         || write_permissions.contains(&"write-all")
         || write_permissions.contains(&"id-token")
         || has_noncanonical_permissions_declaration(workflow)
@@ -645,7 +646,8 @@ fn verify_workflow_policy_text(
 
     match name {
         "ci.yml" => {
-            if !workflow.contains("\n  pull_request:")
+            if top_level_trigger_keys(workflow)? != ["pull_request", "push"]
+                || !workflow.contains("\n  pull_request:")
                 || top_permissions != ["contents: read"]
                 || contains_expression_context(workflow, "secrets")
                 || !write_permissions.is_empty()
@@ -658,7 +660,8 @@ fn verify_workflow_policy_text(
                 .split_once("\n  publish:")
                 .map(|(_, publish)| publish)
                 .context("release workflow is missing the publish job")?;
-            if !workflow.contains("tags: [\"v*\"]")
+            if top_level_trigger_keys(workflow)? != ["push"]
+                || !workflow.contains("tags: [\"v*\"]")
                 || workflow.contains("\n  pull_request:")
                 || workflow.contains("\n  workflow_run:")
                 || write_permissions != ["contents"]
@@ -668,7 +671,8 @@ fn verify_workflow_policy_text(
             }
         }
         "stable-release-source-guard.yml" => {
-            if !workflow.contains("\n  workflow_run:")
+            if top_level_trigger_keys(workflow)? != ["workflow_run"]
+                || !workflow.contains("\n  workflow_run:")
                 || !top_permissions.is_empty()
                 || workflow.contains("actions/checkout@")
                 || contains_expression_context(workflow, "secrets")
@@ -687,6 +691,69 @@ fn verify_workflow_policy_text(
         }
     }
     Ok(())
+}
+
+fn contains_yaml_hex_escape(workflow: &str) -> bool {
+    let bytes = workflow.as_bytes();
+    (0..bytes.len()).any(|index| {
+        if bytes[index] != b'\\' {
+            return false;
+        }
+        let Some(kind) = bytes.get(index + 1).copied() else {
+            return false;
+        };
+        let digits = match kind {
+            b'x' => 2,
+            b'u' => 4,
+            b'U' => 8,
+            _ => return false,
+        };
+        bytes
+            .get(index + 2..index + 2 + digits)
+            .is_some_and(|hex| hex.iter().all(u8::is_ascii_hexdigit))
+    })
+}
+
+fn top_level_trigger_keys(workflow: &str) -> Result<Vec<&str>> {
+    let lines = workflow.lines().collect::<Vec<_>>();
+    let Some((index, declaration)) = lines
+        .iter()
+        .enumerate()
+        .find(|(_, line)| line.starts_with("on:"))
+    else {
+        bail!("workflow is missing an explicit trigger policy");
+    };
+    if declaration.trim() != "on:" {
+        bail!("workflow trigger declaration is malformed");
+    }
+    let mut triggers = Vec::new();
+    for line in &lines[index + 1..] {
+        if line.trim().is_empty() || line.trim_start().starts_with('#') {
+            continue;
+        }
+        if !line.starts_with("  ") {
+            break;
+        }
+        if line.starts_with("    ") {
+            continue;
+        }
+        let (trigger, _) = line
+            .trim()
+            .split_once(':')
+            .context("workflow trigger entry is malformed")?;
+        if !trigger
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+        {
+            bail!("workflow trigger key is noncanonical");
+        }
+        triggers.push(trigger);
+    }
+    triggers.sort_unstable();
+    if triggers.windows(2).any(|pair| pair[0] == pair[1]) {
+        bail!("workflow trigger policy contains a duplicate event");
+    }
+    Ok(triggers)
 }
 
 fn write_permission_scopes(workflow: &str) -> Vec<&str> {
@@ -11777,6 +11844,31 @@ mod tests {
         );
         assert!(
             verify_workflow_policy_text("ci.yml", &mutable, &pins, &mut BTreeSet::new()).is_err()
+        );
+
+        for escaped_trigger in [
+            ci.replacen("  pull_request:", r#"  "\u0070ull_request_target":"#, 1),
+            ci.replacen("on:", r#"on: ["\u0070ull_request_target"]"#, 1),
+        ] {
+            assert!(
+                verify_workflow_policy_text(
+                    "ci.yml",
+                    &escaped_trigger,
+                    &pins,
+                    &mut BTreeSet::new(),
+                )
+                .is_err()
+            );
+        }
+
+        let escaped_secret = ci.replacen(
+            "GOTOOLCHAIN: local",
+            r#"GOTOOLCHAIN: "${{ \u0073ecrets.RELEASE_TOKEN }}""#,
+            1,
+        );
+        assert!(
+            verify_workflow_policy_text("ci.yml", &escaped_secret, &pins, &mut BTreeSet::new(),)
+                .is_err()
         );
 
         let inline_mutable = ci.replacen(
