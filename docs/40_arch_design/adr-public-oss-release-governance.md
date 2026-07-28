@@ -515,7 +515,8 @@ allows only cleanup. The production repository is an explicitly rejected
 target. The temporary target and plan/features comparison are bound to a
 canonical attestation from distinct producer and approver teams, preventing a
 boolean assertion, self-approval, or attestation reuse from authorizing the
-rehearsal.
+rehearsal. The anonymous smoke digest is recomputed over all eight closed
+surface results, preventing an unrelated digest from authorizing write reopen.
 
 ### Gate 9: incident readiness
 

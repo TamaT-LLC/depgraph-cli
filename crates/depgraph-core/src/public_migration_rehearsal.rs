@@ -173,6 +173,8 @@ pub fn evaluate_public_migration_rehearsal(
     input: &PublicMigrationRehearsalInput,
 ) -> Result<PublicMigrationRehearsalReport> {
     validate_input_contract(input)?;
+    let anonymous_smoke_valid = public_migration_anonymous_smoke_digest(&input.anonymous_smoke)?
+        == input.anonymous_smoke.evidence_digest;
 
     let mut reasons = Vec::new();
     let mut no_go_phase = None;
@@ -267,7 +269,7 @@ pub fn evaluate_public_migration_rehearsal(
             continue;
         }
         if step.phase == PublicMigrationPhase::RunAnonymousSmoke
-            && !input.anonymous_smoke.all_pass()
+            && (!input.anonymous_smoke.all_pass() || !anonymous_smoke_valid)
         {
             reject_at(
                 &mut reasons,
@@ -358,6 +360,14 @@ pub fn public_migration_target_attestation_digest(
 ) -> Result<String> {
     let mut value = serde_json::to_value(attestation)?;
     value["attestation_digest"] = serde_json::Value::String(String::new());
+    canonical_public_readiness_digest(&value)
+}
+
+pub fn public_migration_anonymous_smoke_digest(
+    smoke: &AnonymousPublicSurfaceSmoke,
+) -> Result<String> {
+    let mut value = serde_json::to_value(smoke)?;
+    value["evidence_digest"] = serde_json::Value::String(String::new());
     canonical_public_readiness_digest(&value)
 }
 
@@ -465,6 +475,19 @@ mod tests {
         };
         target_attestation.attestation_digest =
             public_migration_target_attestation_digest(&target_attestation).unwrap();
+        let mut anonymous_smoke = AnonymousPublicSurfaceSmoke {
+            clone: true,
+            source_archive: true,
+            readme_and_docs: true,
+            community_links: true,
+            issue_templates: true,
+            actions: true,
+            release: true,
+            package_download: true,
+            evidence_digest: String::new(),
+        };
+        anonymous_smoke.evidence_digest =
+            public_migration_anonymous_smoke_digest(&anonymous_smoke).unwrap();
         PublicMigrationRehearsalInput {
             schema_version: PUBLIC_MIGRATION_REHEARSAL_INPUT_SCHEMA_VERSION.into(),
             production_repository,
@@ -481,17 +504,7 @@ mod tests {
                     evidence_digest: digest(&format!("{phase:?}")),
                 })
                 .collect(),
-            anonymous_smoke: AnonymousPublicSurfaceSmoke {
-                clone: true,
-                source_archive: true,
-                readme_and_docs: true,
-                community_links: true,
-                issue_templates: true,
-                actions: true,
-                release: true,
-                package_download: true,
-                evidence_digest: digest("anonymous-smoke"),
-            },
+            anonymous_smoke,
         }
     }
 
@@ -572,6 +585,20 @@ mod tests {
             report
                 .no_go_reasons
                 .contains(&PublicMigrationNoGoReason::ActivityAfterNoGo)
+        );
+
+        let mut arbitrary_evidence = successful_input();
+        arbitrary_evidence.anonymous_smoke.evidence_digest = digest("unrelated-smoke-evidence");
+        let report = evaluate_public_migration_rehearsal(&arbitrary_evidence).unwrap();
+        assert_eq!(report.decision, PublicReadinessDecision::Reject);
+        assert_eq!(
+            report.no_go_phase,
+            Some(PublicMigrationPhase::RunAnonymousSmoke)
+        );
+        assert!(
+            report
+                .no_go_reasons
+                .contains(&PublicMigrationNoGoReason::AnonymousSmokeFailed)
         );
     }
 

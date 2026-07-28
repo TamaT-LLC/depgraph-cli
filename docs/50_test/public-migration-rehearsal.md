@@ -77,7 +77,10 @@ The smoke report is complete only when all of these closed fields are true:
 
 The anonymous session must not reuse an organization login, SSH agent, API
 token, package credential, browser session, or cached private clone.
-The report stores only the smoke evidence digest.
+The smoke evidence digest is the canonical digest of the complete closed smoke
+result with its digest field blank. The evaluator recomputes it, so a digest
+from another result or an arbitrary 64-hex value cannot authorize reopening.
+The report stores only that smoke evidence digest.
 
 ## Evidence and cleanup
 
