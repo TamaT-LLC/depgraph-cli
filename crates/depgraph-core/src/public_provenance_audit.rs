@@ -215,6 +215,9 @@ pub struct PublicProvenanceExpectedState {
     pub archive_checksums_digest: String,
     pub package_manifest_digest: String,
     pub third_party_licenses_digest: String,
+    pub asset_inventory_digest: String,
+    pub dependency_inventory_digest: String,
+    pub target_inventory_digest: String,
     pub target_sbom_digests: BTreeMap<String, String>,
     pub target_license_report_digests: BTreeMap<String, String>,
 }
@@ -225,6 +228,7 @@ pub enum PublicProvenanceRejectionReason {
     ArtifactClosureStale,
     CandidateStateStale,
     InvalidReviewPackage,
+    InventoryStale,
     LicenseReportStale,
     ReviewPackageTampered,
     SbomStale,
@@ -346,6 +350,15 @@ pub fn evaluate_public_provenance_review(
         || package.third_party_licenses_digest != expected.third_party_licenses_digest
     {
         reasons.insert(PublicProvenanceRejectionReason::ArtifactClosureStale);
+    }
+    if !is_digest(&expected.asset_inventory_digest)
+        || !is_digest(&expected.dependency_inventory_digest)
+        || !is_digest(&expected.target_inventory_digest)
+        || package.asset_inventory_digest != expected.asset_inventory_digest
+        || package.dependency_inventory_digest != expected.dependency_inventory_digest
+        || package.target_inventory_digest != expected.target_inventory_digest
+    {
+        reasons.insert(PublicProvenanceRejectionReason::InventoryStale);
     }
     let target_by_name = package
         .targets
@@ -859,12 +872,40 @@ mod tests {
             ],
             targets,
         };
+        let mut asset_evidence = input
+            .assets
+            .iter()
+            .map(super::asset_evidence)
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        asset_evidence.sort_by(|left, right| left.id.cmp(&right.id));
+        let mut dependency_evidence = input
+            .dependencies
+            .iter()
+            .map(super::dependency_evidence)
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        dependency_evidence.sort_by(|left, right| left.id.cmp(&right.id));
+        let target_evidence = input
+            .targets
+            .iter()
+            .map(|target| PublicTargetEvidence {
+                target: target.target.clone(),
+                archive_digest: target.archive_digest.clone(),
+                sbom_digest: target.sbom_digest.clone(),
+                license_report_digest: target.license_report_digest.clone(),
+            })
+            .collect::<Vec<_>>();
         let expected = PublicProvenanceExpectedState {
             candidate_commit: COMMIT.into(),
             release_artifacts_digest: HASH_A.into(),
             archive_checksums_digest: HASH_B.into(),
             package_manifest_digest: HASH_C.into(),
             third_party_licenses_digest: HASH_D.into(),
+            asset_inventory_digest: canonical_public_readiness_digest(&asset_evidence).unwrap(),
+            dependency_inventory_digest: canonical_public_readiness_digest(&dependency_evidence)
+                .unwrap(),
+            target_inventory_digest: canonical_public_readiness_digest(&target_evidence).unwrap(),
             target_sbom_digests: input
                 .targets
                 .iter()
@@ -955,7 +996,7 @@ mod tests {
     }
 
     #[test]
-    fn evaluator_rejects_a_rehashed_empty_inventory() {
+    fn evaluator_rejects_rehashed_empty_or_safely_omitted_inventory() {
         let (input, expected) = fixture();
         let mut package = build_public_provenance_review_package(&input).unwrap();
         package.assets.clear();
@@ -976,6 +1017,28 @@ mod tests {
         assert_eq!(evaluation.decision, PublicReadinessDecision::Reject);
         assert!(
             evaluation
+                .reasons
+                .contains(&PublicProvenanceRejectionReason::InvalidReviewPackage)
+        );
+
+        let mut package = build_public_provenance_review_package(&input).unwrap();
+        package.assets.pop();
+        package.dependencies.pop();
+        package.asset_inventory_digest =
+            canonical_public_readiness_digest(&package.assets).unwrap();
+        package.dependency_inventory_digest =
+            canonical_public_readiness_digest(&package.dependencies).unwrap();
+        package.evidence_digest = package_digest(&package).unwrap();
+
+        let evaluation = evaluate_public_provenance_review(&package, &expected).unwrap();
+        assert_eq!(evaluation.decision, PublicReadinessDecision::Reject);
+        assert!(
+            evaluation
+                .reasons
+                .contains(&PublicProvenanceRejectionReason::InventoryStale)
+        );
+        assert!(
+            !evaluation
                 .reasons
                 .contains(&PublicProvenanceRejectionReason::InvalidReviewPackage)
         );
