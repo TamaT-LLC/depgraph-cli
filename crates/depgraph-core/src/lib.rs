@@ -30,6 +30,7 @@ pub mod profile_selection_rust;
 pub mod profile_selection_web;
 pub mod protobuf;
 pub mod public_history_audit;
+pub mod public_provenance_audit;
 pub mod public_readiness;
 pub mod query;
 pub mod runtime_trace;
@@ -121,6 +122,20 @@ pub use public_history_audit::{
     PublicHistoryAuditInput, PublicHistoryAuditReport, audit_public_history,
     finalize_public_history_audit, public_audit_remediation_attestation_digest,
     public_secret_scanner_identity,
+};
+pub use public_provenance_audit::{
+    MAX_PUBLIC_PROVENANCE_ASSETS, MAX_PUBLIC_PROVENANCE_DEPENDENCIES, PUBLIC_LICENSE_POLICY_NAME,
+    PUBLIC_LICENSE_POLICY_VERSION, PUBLIC_PROVENANCE_EVALUATION_SCHEMA_VERSION,
+    PUBLIC_PROVENANCE_REVIEW_SCHEMA_VERSION, PUBLIC_RELEASE_TARGETS,
+    PUBLIC_VULNERABILITY_SCANNER_NAME, PUBLIC_VULNERABILITY_SCANNER_VERSION, PublicAssetAuditInput,
+    PublicAssetEvidence, PublicAssetKind, PublicDependencyAuditInput, PublicDependencyEcosystem,
+    PublicDependencyEvidence, PublicLicensePolicyState, PublicProvenanceAuditInput,
+    PublicProvenanceEvaluation, PublicProvenanceExpectedState, PublicProvenanceFinding,
+    PublicProvenanceFindingReason, PublicProvenanceRejectionReason, PublicProvenanceReviewPackage,
+    PublicProvenanceState, PublicTargetAuditInput, PublicTargetEvidence,
+    PublicVulnerabilitySeverity, build_public_provenance_review_package,
+    evaluate_public_provenance_review, public_license_policy_identity,
+    public_vulnerability_scanner_identity,
 };
 pub use public_readiness::{
     PUBLIC_READINESS_EVIDENCE_SCHEMA_VERSION, PUBLIC_READINESS_FINAL_APPROVAL_ROLES,
