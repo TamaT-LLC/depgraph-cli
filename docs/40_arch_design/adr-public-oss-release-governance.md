@@ -405,9 +405,11 @@ Issue #207 implements the closed `github-settings-desired-v1` manifest and
 rulesets, required check context plus GitHub App source, approvals,
 conversation resolution, force/delete/bypass controls, redacted
 app/webhook/key/token/team/environment/runner inventories, and security
-settings. API permission failure, disabled or missing rules, wrong check
-source, bypass expansion, and unexpected public surface all produce
-digest-only drift and reject readiness.
+settings. The verifier binds the desired state to the build-pinned canonical
+manifest digest, so a caller cannot substitute a weaker policy and approve a
+matching weak snapshot. API permission failure, disabled or missing rules,
+wrong check source, bypass expansion, and unexpected public surface all
+produce digest-only drift and reject readiness.
 
 ### Gate 7: release and support
 

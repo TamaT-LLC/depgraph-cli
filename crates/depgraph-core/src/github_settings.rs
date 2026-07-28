@@ -13,6 +13,8 @@ pub const GITHUB_SETTINGS_VERIFIER_MODE: &str = "read-only-no-settings-actuator"
 pub const GITHUB_SETTINGS_REPOSITORY: &str = "TamaT-LLC/depgraph-cli";
 pub const GITHUB_SETTINGS_VERIFIER_NAME: &str = "depgraph-github-settings-verifier";
 pub const GITHUB_SETTINGS_VERIFIER_VERSION: &str = "1.0.0";
+pub const GITHUB_SETTINGS_DESIRED_DIGEST: &str =
+    "d0d2ad331c8519f72fabd34558f1e7d30affee34626bd0f0ce6fed63b964fa5b";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -524,8 +526,9 @@ fn validate_desired_identity(state: &GitHubSettingsState) -> Result<()> {
     if state.repository != GITHUB_SETTINGS_REPOSITORY
         || state.default_branch != "main"
         || state.rulesets.is_empty()
+        || canonical_public_readiness_digest(state)? != GITHUB_SETTINGS_DESIRED_DIGEST
     {
-        bail!("GitHub desired settings must target the fixed repository and main branch");
+        bail!("GitHub desired settings must match the build-pinned repository settings manifest");
     }
     Ok(())
 }
@@ -691,6 +694,38 @@ mod tests {
             canonical_github_settings_digest(&expected).unwrap(),
             canonical_github_settings_digest(&reordered).unwrap()
         );
+        assert_eq!(
+            canonical_github_settings_digest(&expected).unwrap(),
+            GITHUB_SETTINGS_DESIRED_DIGEST
+        );
+    }
+
+    #[test]
+    fn weakened_substitute_desired_state_is_rejected_even_when_observed_matches() {
+        let mut weakened = desired();
+        let main = weakened
+            .rulesets
+            .iter_mut()
+            .find(|ruleset| ruleset.target == GitHubRulesetTarget::Branch)
+            .unwrap();
+        main.allow_force_pushes = true;
+        main.bypass_actors.push(GitHubRedactedPrincipal {
+            identity: "team:unexpected-admins".into(),
+            permission: "bypass".into(),
+        });
+        weakened.security.secret_scanning = false;
+
+        assert!(
+            evaluate_github_settings(
+                &weakened,
+                &GitHubSettingsApiSnapshot {
+                    collection_status: GitHubSettingsCollectionStatus::Complete,
+                    settings: Some(weakened.clone()),
+                },
+            )
+            .is_err()
+        );
+        assert!(canonical_github_settings_digest(&weakened).is_ok());
     }
 
     #[test]
