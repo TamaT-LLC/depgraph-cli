@@ -13,9 +13,13 @@ The repository administrator creates a temporary organization repository whose
 plan and enabled GitHub features are equivalent to the production repository.
 The fixture commit, refs, issues, release, package, and community metadata must
 be synthetic and non-sensitive.
-The administrator records SHA-256 digests for the temporary-repository
-attestation, plan/features comparison, backup, settings export, each transition
-checkpoint, and the anonymous smoke report.
+The administrator records SHA-256 digests for the temporary repository,
+plan/features comparison, backup, settings export, each transition checkpoint,
+and the anonymous smoke report. A repository-administration producer and a
+different security reviewer approve one canonical target attestation that
+binds both repository digests and both plan/features digests. An arbitrary
+digest, self-approval, or an attestation reused for another temporary
+repository is a no-go.
 Raw tokens, webhook URLs, deploy keys, credentials, repository names, and
 private settings exports never enter the report.
 

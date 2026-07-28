@@ -8,7 +8,7 @@
     "schema_version",
     "production_repository",
     "temporary_repository",
-    "temporary_repository_attested",
+    "target_attestation",
     "production_plan_features_digest",
     "temporary_plan_features_digest",
     "production_visibility_unchanged",
@@ -25,8 +25,8 @@
     "temporary_repository": {
       "$ref": "#/$defs/repository"
     },
-    "temporary_repository_attested": {
-      "type": "boolean"
+    "target_attestation": {
+      "$ref": "#/$defs/target_attestation"
     },
     "production_plan_features_digest": {
       "$ref": "#/$defs/digest"
@@ -56,6 +56,46 @@
     "digest": {
       "type": "string",
       "pattern": "^[0-9a-f]{64}$"
+    },
+    "team_identity": {
+      "type": "string",
+      "pattern": "^team:[A-Za-z0-9_.-]{1,128}$"
+    },
+    "target_attestation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "production_repository_digest",
+        "temporary_repository_digest",
+        "production_plan_features_digest",
+        "temporary_plan_features_digest",
+        "producer_identity",
+        "approver_identity",
+        "attestation_digest"
+      ],
+      "properties": {
+        "production_repository_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "temporary_repository_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "production_plan_features_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "temporary_plan_features_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "producer_identity": {
+          "$ref": "#/$defs/team_identity"
+        },
+        "approver_identity": {
+          "$ref": "#/$defs/team_identity"
+        },
+        "attestation_digest": {
+          "$ref": "#/$defs/digest"
+        }
+      }
     },
     "phase": {
       "enum": [

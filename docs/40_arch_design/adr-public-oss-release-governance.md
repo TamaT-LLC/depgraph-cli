@@ -512,7 +512,10 @@ writes to reopen only after the complete anonymous clone/archive,
 docs/community/template, Actions, release, and package smoke passes. Any
 failure enters deterministic containment, preserves digest-only evidence, and
 allows only cleanup. The production repository is an explicitly rejected
-target.
+target. The temporary target and plan/features comparison are bound to a
+canonical attestation from distinct producer and approver teams, preventing a
+boolean assertion, self-approval, or attestation reuse from authorizing the
+rehearsal.
 
 ### Gate 9: incident readiness
 

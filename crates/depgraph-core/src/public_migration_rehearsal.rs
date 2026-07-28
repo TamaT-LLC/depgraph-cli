@@ -82,11 +82,23 @@ impl AnonymousPublicSurfaceSmoke {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct PublicMigrationTargetAttestation {
+    pub production_repository_digest: String,
+    pub temporary_repository_digest: String,
+    pub production_plan_features_digest: String,
+    pub temporary_plan_features_digest: String,
+    pub producer_identity: String,
+    pub approver_identity: String,
+    pub attestation_digest: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct PublicMigrationRehearsalInput {
     pub schema_version: String,
     pub production_repository: String,
     pub temporary_repository: String,
-    pub temporary_repository_attested: bool,
+    pub target_attestation: PublicMigrationTargetAttestation,
     pub production_plan_features_digest: String,
     pub temporary_plan_features_digest: String,
     pub production_visibility_unchanged: bool,
@@ -178,7 +190,7 @@ pub fn evaluate_public_migration_rehearsal(
             PublicMigrationNoGoReason::ProductionTargetRejected,
         );
     }
-    if !input.temporary_repository_attested {
+    if !target_attestation_matches(input)? {
         reject_at(
             &mut reasons,
             &mut no_go_phase,
@@ -341,6 +353,14 @@ pub fn canonical_public_migration_rehearsal_digest(
     canonical_public_readiness_digest(report)
 }
 
+pub fn public_migration_target_attestation_digest(
+    attestation: &PublicMigrationTargetAttestation,
+) -> Result<String> {
+    let mut value = serde_json::to_value(attestation)?;
+    value["attestation_digest"] = serde_json::Value::String(String::new());
+    canonical_public_readiness_digest(&value)
+}
+
 fn validate_input_contract(input: &PublicMigrationRehearsalInput) -> Result<()> {
     if input.schema_version != PUBLIC_MIGRATION_REHEARSAL_INPUT_SCHEMA_VERSION
         || !valid_repository_identifier(&input.production_repository)
@@ -357,6 +377,26 @@ fn validate_input_contract(input: &PublicMigrationRehearsalInput) -> Result<()> 
         bail!("public migration rehearsal input is malformed or exceeds a bound");
     }
     Ok(())
+}
+
+fn target_attestation_matches(input: &PublicMigrationRehearsalInput) -> Result<bool> {
+    let attestation = &input.target_attestation;
+    Ok(is_digest(&attestation.production_repository_digest)
+        && is_digest(&attestation.temporary_repository_digest)
+        && is_digest(&attestation.production_plan_features_digest)
+        && is_digest(&attestation.temporary_plan_features_digest)
+        && is_digest(&attestation.attestation_digest)
+        && valid_team_identity(&attestation.producer_identity)
+        && valid_team_identity(&attestation.approver_identity)
+        && attestation.producer_identity != attestation.approver_identity
+        && attestation.production_repository_digest
+            == canonical_public_readiness_digest(&input.production_repository)?
+        && attestation.temporary_repository_digest
+            == canonical_public_readiness_digest(&input.temporary_repository)?
+        && attestation.production_plan_features_digest == input.production_plan_features_digest
+        && attestation.temporary_plan_features_digest == input.temporary_plan_features_digest
+        && public_migration_target_attestation_digest(attestation)?
+            == attestation.attestation_digest)
 }
 
 fn reject_at(
@@ -388,6 +428,10 @@ fn valid_token(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
+fn valid_team_identity(value: &str) -> bool {
+    value.strip_prefix("team:").is_some_and(valid_token)
+}
+
 fn is_digest(value: &str) -> bool {
     value.len() == 64
         && value
@@ -406,11 +450,26 @@ mod tests {
 
     fn successful_input() -> PublicMigrationRehearsalInput {
         let plan_digest = digest("github-plan-and-features");
+        let production_repository = PUBLIC_MIGRATION_PRODUCTION_REPOSITORY.to_string();
+        let temporary_repository = "TamaT-LLC/depgraph-public-rehearsal-20260726".to_string();
+        let mut target_attestation = PublicMigrationTargetAttestation {
+            production_repository_digest: canonical_public_readiness_digest(&production_repository)
+                .unwrap(),
+            temporary_repository_digest: canonical_public_readiness_digest(&temporary_repository)
+                .unwrap(),
+            production_plan_features_digest: plan_digest.clone(),
+            temporary_plan_features_digest: plan_digest.clone(),
+            producer_identity: "team:repository-administrators".into(),
+            approver_identity: "team:security-reviewers".into(),
+            attestation_digest: String::new(),
+        };
+        target_attestation.attestation_digest =
+            public_migration_target_attestation_digest(&target_attestation).unwrap();
         PublicMigrationRehearsalInput {
             schema_version: PUBLIC_MIGRATION_REHEARSAL_INPUT_SCHEMA_VERSION.into(),
-            production_repository: PUBLIC_MIGRATION_PRODUCTION_REPOSITORY.into(),
-            temporary_repository: "TamaT-LLC/depgraph-public-rehearsal-20260726".into(),
-            temporary_repository_attested: true,
+            production_repository,
+            temporary_repository,
+            target_attestation,
             production_plan_features_digest: plan_digest.clone(),
             temporary_plan_features_digest: plan_digest,
             production_visibility_unchanged: true,
@@ -538,6 +597,42 @@ mod tests {
         let mut invalid = successful_input();
         invalid.temporary_repository = "TamaT-LLC/depgraph:rehearsal".into();
         assert!(evaluate_public_migration_rehearsal(&invalid).is_err());
+    }
+
+    #[test]
+    fn target_attestation_is_identity_bound_and_requires_independent_approval() {
+        let mut arbitrary = successful_input();
+        arbitrary.target_attestation.attestation_digest = digest("unrelated-attestation");
+        let report = evaluate_public_migration_rehearsal(&arbitrary).unwrap();
+        assert_eq!(report.decision, PublicReadinessDecision::Reject);
+        assert!(
+            report
+                .no_go_reasons
+                .contains(&PublicMigrationNoGoReason::TemporaryRepositoryUnattested)
+        );
+
+        let mut reused = successful_input();
+        reused.temporary_repository = "TamaT-LLC/another-public-rehearsal".into();
+        let report = evaluate_public_migration_rehearsal(&reused).unwrap();
+        assert_eq!(report.decision, PublicReadinessDecision::Reject);
+        assert!(
+            report
+                .no_go_reasons
+                .contains(&PublicMigrationNoGoReason::TemporaryRepositoryUnattested)
+        );
+
+        let mut self_approved = successful_input();
+        self_approved.target_attestation.approver_identity =
+            self_approved.target_attestation.producer_identity.clone();
+        self_approved.target_attestation.attestation_digest =
+            public_migration_target_attestation_digest(&self_approved.target_attestation).unwrap();
+        let report = evaluate_public_migration_rehearsal(&self_approved).unwrap();
+        assert_eq!(report.decision, PublicReadinessDecision::Reject);
+        assert!(
+            report
+                .no_go_reasons
+                .contains(&PublicMigrationNoGoReason::TemporaryRepositoryUnattested)
+        );
     }
 
     #[test]
