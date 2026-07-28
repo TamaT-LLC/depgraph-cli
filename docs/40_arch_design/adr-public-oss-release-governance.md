@@ -148,14 +148,14 @@ The complete record contains exactly one gate entry for each mandatory gate,
 sorted by gate ID:
 
 1. `candidate-and-surface`;
-2. `history-and-secrets`;
-3. `legal-and-provenance`;
-4. `security-and-disclosure`;
-5. `governance-and-community`;
-6. `repository-controls`;
+2. `governance-and-community`;
+3. `history-and-secrets`;
+4. `incident-readiness`;
+5. `legal-and-provenance`;
+6. `migration-dry-run`;
 7. `release-and-support`;
-8. `migration-dry-run`;
-9. `incident-readiness`.
+8. `repository-controls`;
+9. `security-and-disclosure`.
 
 Each digest is SHA-256 over canonical bytes described by the evidence
 manifest. Tool name, exact version, acquisition digest, configuration digest,
