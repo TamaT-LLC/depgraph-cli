@@ -31,6 +31,7 @@ pub mod profile_selection_rust;
 pub mod profile_selection_web;
 pub mod protobuf;
 pub mod public_history_audit;
+pub mod public_migration_rehearsal;
 pub mod public_provenance_audit;
 pub mod public_readiness;
 pub mod query;
@@ -123,6 +124,18 @@ pub use public_history_audit::{
     PublicHistoryAuditInput, PublicHistoryAuditReport, audit_public_history,
     finalize_public_history_audit, public_audit_remediation_attestation_digest,
     public_secret_scanner_identity,
+};
+pub use public_migration_rehearsal::{
+    AnonymousPublicSurfaceSmoke, PUBLIC_MIGRATION_CHECKPOINT_VERIFIER_NAME,
+    PUBLIC_MIGRATION_CHECKPOINT_VERIFIER_VERSION, PUBLIC_MIGRATION_PHASES,
+    PUBLIC_MIGRATION_PRODUCTION_REPOSITORY, PUBLIC_MIGRATION_REHEARSAL_INPUT_SCHEMA_VERSION,
+    PUBLIC_MIGRATION_REHEARSAL_MODE, PUBLIC_MIGRATION_REHEARSAL_REPORT_SCHEMA_VERSION,
+    PublicMigrationCheckpointEvidence, PublicMigrationCleanup, PublicMigrationContainment,
+    PublicMigrationEvidence, PublicMigrationEvidenceKind, PublicMigrationNoGoReason,
+    PublicMigrationPhase, PublicMigrationRehearsalInput, PublicMigrationRehearsalReport,
+    PublicMigrationStep, PublicMigrationStepOutcome, PublicMigrationWriteDisposition,
+    canonical_public_migration_rehearsal_digest, evaluate_public_migration_rehearsal,
+    public_migration_checkpoint_evidence_digest, public_migration_checkpoint_verifier_identity,
 };
 pub use public_provenance_audit::{
     MAX_PUBLIC_PROVENANCE_ASSETS, MAX_PUBLIC_PROVENANCE_DEPENDENCIES, PUBLIC_LICENSE_POLICY_NAME,

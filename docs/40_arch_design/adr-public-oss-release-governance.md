@@ -518,6 +518,26 @@ Evidence: backup digests, rehearsal log, official-document review date,
 authorization statement digest, change-window log, settings verification, and
 anonymous smoke report.
 
+Issue #208 implements the closed
+`public-migration-rehearsal-input-v1` contract and
+`temporary-repository-no-production-actuator` evaluator. The exact rehearsal
+sequence freezes writes before the temporary visibility change, restores
+rulesets and security settings before read-only verification, and permits
+writes to reopen only after the complete anonymous clone/archive,
+docs/community/template, Actions, release, and package smoke passes. Any
+failure enters deterministic containment, preserves digest-only evidence, and
+allows only cleanup. The production repository is an explicitly rejected
+target. The temporary target and plan/features comparison are bound to a
+canonical attestation from distinct producer and approver teams, preventing a
+boolean assertion, self-approval, or attestation reuse from authorizing the
+rehearsal. The anonymous smoke digest is recomputed over all eight closed
+surface results, preventing an unrelated digest from authorizing write reopen.
+Every checkpoint also carries phase-specific, repository-bound redacted
+evidence under a build-defined verifier identity. Its digest is recomputed
+over the phase, outcome, and complete evidence object, and every checkpoint is
+bound to the target attestation. Write reopening additionally binds the
+settings-verification checkpoint and anonymous smoke digests.
+
 ### Gate 9: incident readiness
 
 - [ ] Maintain an incident tree covering secret/private-data exposure,
@@ -599,7 +619,7 @@ Each row is an independently reviewable one-to-three-day follow-up.
 | 4 | Dependency/license/provenance inventory and legal review package | Implemented in #205 |
 | 5 | Workflow SHA pinning, threat model, disclosure policy, and security dry run | Implemented in #206 |
 | 6 | Desired GitHub settings/rulesets manifest, access review, and verifier | Implemented in #207 |
-| 7 | Temporary-repository migration rehearsal and anonymous smoke suite | 2-3 days |
+| 7 | Temporary-repository migration rehearsal and anonymous smoke suite | Implemented in #208 |
 | 8 | Candidate-bound final audit, owner decision, authorized change window, and observation | 2-3 days |
 
 Slices 1-7 may proceed while the repository remains private. Slice 8 cannot

@@ -1365,6 +1365,8 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "`read-only-no-settings-actuator`",
         "### Gate 7: release and support",
         "### Gate 8: migration dry run and change window",
+        "`public-migration-rehearsal-input-v1`",
+        "`temporary-repository-no-production-actuator`",
         "### Gate 9: incident readiness",
         "changing back to private cannot retract clones, forks,",
         "## Maintainer, review, release, support, and contribution policy",
@@ -1375,6 +1377,7 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "| 4 | Dependency/license/provenance inventory and legal review package | Implemented in #205 |",
         "| 5 | Workflow SHA pinning, threat model, disclosure policy, and security dry run | Implemented in #206 |",
         "| 6 | Desired GitHub settings/rulesets manifest, access review, and verifier | Implemented in #207 |",
+        "| 7 | Temporary-repository migration rehearsal and anonymous smoke suite | Implemented in #208 |",
         "| 8 | Candidate-bound final audit, owner decision, authorized change window, and observation | 2-3 days |",
         "## Acceptance matrix",
         "| Stable release gate passes but history audit is missing |",
@@ -1385,6 +1388,23 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
     ] {
         if !public_oss_adr.contains(required) {
             bail!("public OSS governance ADR is missing required contract {required:?}");
+        }
+    }
+    let migration_rehearsal =
+        fs::read_to_string(root.join("docs/50_test/public-migration-rehearsal.md"))?;
+    for required in [
+        "`temporary-repository-no-production-actuator`",
+        "The production repository must retain its original visibility",
+        "`freeze_writes`",
+        "`verify_desired_settings`",
+        "`run_anonymous_smoke`",
+        "`reopen_writes`",
+        "`cleanup_temporary_repository`",
+        "`activity_after_no_go`",
+        "schemas/public-migration-rehearsal-input-v1.schema.json",
+    ] {
+        if !migration_rehearsal.contains(required) {
+            bail!("public migration rehearsal is missing required contract {required:?}");
         }
     }
     let stable_release_note = fs::read_to_string(root.join("docs/releases/v0.4.0.md"))?;
