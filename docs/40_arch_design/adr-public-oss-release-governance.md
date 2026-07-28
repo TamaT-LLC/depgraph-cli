@@ -254,6 +254,11 @@ It binds canonical branch/tag/note/pull-request refs, Git object/LFS/submodule
 inputs, and the issue/PR/discussion/wiki/release/Actions collaboration surface
 to the compiled scanner/config identity. Its serialized ledger contains only
 source/content digests, pattern IDs, counts, and remediation attestations.
+Each remediation attestation is a canonical statement bound to the initial and
+fresh-mirror evidence digests, separate rotation/classification and purge
+evidence digests, and distinct producer and approver team identities. The
+verifier recomputes that statement digest and rejects reuse, self-approval, or
+field substitution.
 Rotation or revocation, purge evidence, and a clean fresh-mirror rescan are all
 required before a finding becomes resolved.
 
