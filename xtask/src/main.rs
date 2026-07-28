@@ -599,6 +599,8 @@ fn verify_workflow_policy_text(
     pins: &BTreeMap<&str, &str>,
     used_actions: &mut BTreeSet<String>,
 ) -> Result<()> {
+    let normalized_workflow = workflow.replace("\r\n", "\n").replace('\r', "\n");
+    let workflow = normalized_workflow.as_str();
     let write_permissions = write_permission_scopes(workflow);
     if workflow.contains("pull_request_target")
         || write_permissions.contains(&"write-all")
@@ -11723,6 +11725,17 @@ mod tests {
             .map(|action| (action.identity.as_str(), action.sha.as_str()))
             .collect::<BTreeMap<_, _>>();
         let ci = fs::read_to_string(root.join(".github/workflows/ci.yml"))?;
+
+        for workflow_name in ["ci.yml", "release.yml", "stable-release-source-guard.yml"] {
+            let workflow = fs::read_to_string(root.join(".github/workflows").join(workflow_name))?;
+            let crlf_workflow = workflow.replace('\n', "\r\n");
+            verify_workflow_policy_text(
+                workflow_name,
+                &crlf_workflow,
+                &pins,
+                &mut BTreeSet::new(),
+            )?;
+        }
 
         let mutable = ci.replacen(
             "actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
