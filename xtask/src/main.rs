@@ -31,6 +31,8 @@ const BOUNDED_QUERY_PACKAGE_SMOKE_SCHEMA_VERSION: &str = "package-analysis-smoke
 const BOUNDED_QUERY_SBOM_PACKAGE_NAME: &str = "depgraph-bounded-query-contract";
 const CROSS_LANGUAGE_PACKAGE_SMOKE_SCHEMA_VERSION: &str = "cross-language-package-smoke-v1";
 const CROSS_LANGUAGE_SBOM_PACKAGE_NAME: &str = "depgraph-cross-language-contract";
+const CROSS_LANGUAGE_RELEASE_FIXTURE_PROFILE_ID: &str = "release:polyglot";
+const CROSS_LANGUAGE_RELEASE_FIXTURE_TARGET: &str = "x86_64-unknown-linux-gnu";
 const PROJECT_LICENSE_EXPRESSION: &str = "MIT OR Apache-2.0";
 const PROJECT_LICENSES: &[(&str, &[u8])] = &[
     ("LICENSE-APACHE", include_bytes!("../../LICENSE-APACHE")),
@@ -361,6 +363,7 @@ struct BoundedQueryPackageSmokeReport {
 struct CrossLanguagePackageSmokeReport {
     schema_version: String,
     target: String,
+    archive_sha256: String,
     contract: depgraph_core::CrossLanguageReleaseCompatibilityHealth,
     graph_digest: String,
     canonical_export_sha256: String,
@@ -1152,7 +1155,8 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "## Authority and separation of duties",
         "## Decision record",
         "1. `candidate-and-surface`;",
-        "9. `incident-readiness`.",
+        "4. `incident-readiness`;",
+        "9. `security-and-disclosure`.",
         "## Executable pre-publication checklist",
         "### Gate 2: history and secrets",
         "History rewriting alone never remediates a",
@@ -3665,7 +3669,12 @@ fn verify_release_assets(directory: &Path, requested_targets: &[String]) -> Resu
         let cross_language_smoke: CrossLanguagePackageSmokeReport =
             serde_json::from_slice(&cross_language_smoke_bytes)
                 .context("packaged cross-language smoke report has an invalid schema")?;
-        validate_cross_language_package_smoke(&cross_language_smoke, target)?;
+        verify_cross_language_package_smoke(
+            &cross_language_smoke,
+            &extracted,
+            target,
+            &archive_sha256,
+        )?;
         targets.push(verify_published_release_tree(
             &extracted,
             target,
@@ -3814,15 +3823,34 @@ fn validate_bounded_query_package_smoke(
 fn validate_cross_language_package_smoke(
     report: &CrossLanguagePackageSmokeReport,
     target: &str,
+    archive_sha256: &str,
 ) -> Result<()> {
     if report.schema_version != CROSS_LANGUAGE_PACKAGE_SMOKE_SCHEMA_VERSION
         || report.target != target
+        || report.archive_sha256 != archive_sha256
+        || !lowercase_sha256(&report.archive_sha256)
         || report.contract != depgraph_core::cross_language_release_compatibility_contract()
         || !prefixed_lowercase_sha256(&report.graph_digest, "cross-language-release-graph:sha256:")
         || !lowercase_sha256(&report.canonical_export_sha256)
         || !lowercase_sha256(&report.query_output_sha256)
     {
         bail!("packaged cross-language smoke report is incompatible for {target}");
+    }
+    Ok(())
+}
+
+fn verify_cross_language_package_smoke(
+    report: &CrossLanguagePackageSmokeReport,
+    extracted: &Path,
+    target: &str,
+    archive_sha256: &str,
+) -> Result<()> {
+    validate_cross_language_package_smoke(report, target, archive_sha256)?;
+    let recomputed = verify_packaged_cross_language(extracted, target, archive_sha256)?;
+    if report != &recomputed {
+        bail!(
+            "packaged cross-language smoke report does not match outputs recomputed from {target}"
+        );
     }
     Ok(())
 }
@@ -4777,11 +4805,11 @@ fn materialize_cross_language_fixture(
 
 fn cross_language_fixture_export(root: &Path) -> Result<(Value, Value)> {
     let profiles = vec![Profile {
-        id: "release:polyglot".to_owned(),
+        id: CROSS_LANGUAGE_RELEASE_FIXTURE_PROFILE_ID.to_owned(),
         language: "polyglot".to_owned(),
         toolchain: None,
         command: None,
-        target: None,
+        target: Some(CROSS_LANGUAGE_RELEASE_FIXTURE_TARGET.to_owned()),
         features: Vec::new(),
         environment: BTreeMap::new(),
         source_revision: None,
@@ -4835,14 +4863,70 @@ fn cross_language_fixture_export(root: &Path) -> Result<(Value, Value)> {
         bail!("packaged cross-language fixture did not exercise every source adapter");
     }
 
+    let runtime_trace = cross_language_runtime_trace(repository_symbol.id.clone());
+    let http_runtime = depgraph_core::correlate_http_operations(
+        &runtime_trace,
+        &[openapi.clone(), protobuf.clone(), graphql.clone()],
+    )
+    .context("packaged cross-language fixture failed HTTP runtime correlation")?;
+    let http_outcome = http_runtime
+        .outcomes
+        .first()
+        .filter(|outcome| {
+            http_runtime.outcomes.len() == 1
+                && outcome.status == depgraph_protocol::ResolutionStatus::Resolved
+                && outcome.operation_ids == [operation.id.clone()]
+        })
+        .context("packaged cross-language fixture did not resolve its HTTP operation")?;
+    let http_runtime_edge = http_runtime
+        .deltas
+        .iter()
+        .flat_map(|delta| &delta.edges)
+        .find(|edge| {
+            edge.phase == depgraph_protocol::Phase::Runtime
+                && edge.precision == depgraph_protocol::Precision::Observed
+                && edge.resolution_status == depgraph_protocol::ResolutionStatus::Resolved
+                && edge.target == operation.id
+        })
+        .context("packaged cross-language fixture produced no observed HTTP runtime edge")?;
+
+    let ffi_entries = cross_language_ffi_entries(&ffi)?;
+    let ffi_outcome = cross_language_ffi_outcome(root, &ffi_entries)?;
+    let ffi_observation = depgraph_core::collect_supervised_ffi_link_observation(
+        &ffi_outcome,
+        "x86_64",
+        "dynamic",
+        ffi_entries,
+    )
+    .context("packaged cross-language fixture failed supervised FFI collection")?;
+    let ffi = depgraph_core::correlate_ffi_link_observation(&ffi, &ffi_outcome, &ffi_observation)
+        .context("packaged cross-language fixture failed supervised FFI correlation")?;
+    let ffi_observed_edge_ids = ffi
+        .edges
+        .iter()
+        .filter(|edge| {
+            edge.phase == depgraph_protocol::Phase::Build
+                && edge.precision == depgraph_protocol::Precision::Observed
+                && edge.resolution_status == depgraph_protocol::ResolutionStatus::Resolved
+        })
+        .map(|edge| edge.id.clone())
+        .collect::<Vec<_>>();
+    if ffi_observed_edge_ids.is_empty() {
+        bail!("packaged cross-language fixture produced no observed FFI link edge");
+    }
+
     let export = json!({
         "ffi": ffi,
         "graphql": graphql,
+        "http_runtime": http_runtime,
         "openapi": openapi,
         "protobuf": protobuf,
     });
     let query = json!({
         "edge_id": mapping.id,
+        "ffi_observed_edge_ids": ffi_observed_edge_ids,
+        "http_runtime_edge_id": http_runtime_edge.id,
+        "http_runtime_outcome_id": http_outcome.id,
         "operation_id": operation.id,
         "repository_path": "src/client.rs",
         "repository_symbol_id": repository_symbol.id,
@@ -4850,9 +4934,200 @@ fn cross_language_fixture_export(root: &Path) -> Result<(Value, Value)> {
     Ok((export, query))
 }
 
+fn cross_language_runtime_trace(source_id: String) -> depgraph_core::ValidatedRuntimeTrace {
+    let repository = depgraph_core::RuntimeTraceRepository {
+        identity: "cross-language-release-fixture".to_owned(),
+        revision: Some("fixture-v1".to_owned()),
+    };
+    let session = depgraph_core::RuntimeTraceSession {
+        id: "cross-language-release-http".to_owned(),
+        started_at: "2026-07-26T00:00:00Z".to_owned(),
+        ended_at: Some("2026-07-26T00:00:01Z".to_owned()),
+        collector_contract_version: Some(
+            depgraph_core::RUNTIME_COLLECTOR_CONTRACT_VERSION.to_owned(),
+        ),
+        profile: depgraph_core::RuntimeTraceProfile {
+            language: "polyglot".to_owned(),
+            target: Some(CROSS_LANGUAGE_RELEASE_FIXTURE_TARGET.to_owned()),
+            features: Vec::new(),
+            parent_profile_id: Some(CROSS_LANGUAGE_RELEASE_FIXTURE_PROFILE_ID.to_owned()),
+        },
+        environment: depgraph_core::RuntimeTraceEnvironment {
+            name: "release-fixture".to_owned(),
+            runtime: Some("fixture".to_owned()),
+            region: None,
+            environment_keys: Vec::new(),
+        },
+        redaction: depgraph_core::RuntimeTraceRedaction::default(),
+    };
+    let source = depgraph_core::RuntimeTraceLocator::Node {
+        node_id: source_id.clone(),
+    };
+    let target = depgraph_core::RuntimeTraceLocator::External {
+        namespace: "https".to_owned(),
+        name: "api.example.test".to_owned(),
+    };
+    let http = depgraph_core::RuntimeHttpObservation {
+        method: "GET".to_owned(),
+        route_template: "/pets/{id}".to_owned(),
+        format: Some(depgraph_core::RuntimeHttpOperationFormat::Openapi),
+        operation: Some("get /pets/{id}".to_owned()),
+        contract_locator: Some("openapi.json".to_owned()),
+        format_version: Some("3.1.1".to_owned()),
+    };
+    let event_id = depgraph_protocol::stable_id_from_value(
+        "runtime-event",
+        &json!({
+            "schema_version": depgraph_core::RUNTIME_TRACE_SCHEMA_VERSION,
+            "repository_identity": repository.identity,
+            "repository_revision": repository.revision,
+            "session_id": session.id,
+            "sequence": 1,
+            "timestamp": "2026-07-26T00:00:00Z",
+            "profile": session.profile,
+            "environment": session.environment,
+            "dependency_kind": "requests",
+            "source": source,
+            "target": target,
+            "http": http,
+            "count": 1,
+            "duration_ns": 1,
+        }),
+    );
+    depgraph_core::ValidatedRuntimeTrace {
+        schema_version: depgraph_core::RUNTIME_TRACE_SCHEMA_VERSION.to_owned(),
+        repository,
+        session,
+        profile_match: depgraph_core::RuntimeTraceProfileMatch {
+            status: depgraph_core::RuntimeTraceMatchStatus::Resolved,
+            parent_profile_id: Some(CROSS_LANGUAGE_RELEASE_FIXTURE_PROFILE_ID.to_owned()),
+            reason: None,
+        },
+        events: vec![depgraph_core::ValidatedRuntimeTraceEvent {
+            id: event_id,
+            sequence: 1,
+            timestamp: "2026-07-26T00:00:00Z".to_owned(),
+            dependency_kind: "requests".to_owned(),
+            source: depgraph_core::MatchedRuntimeTraceLocator {
+                status: depgraph_core::RuntimeTraceMatchStatus::Resolved,
+                node_id: Some(source_id),
+                reason: None,
+                input: source,
+            },
+            target: depgraph_core::MatchedRuntimeTraceLocator {
+                status: depgraph_core::RuntimeTraceMatchStatus::External,
+                node_id: None,
+                reason: Some("collector_external".to_owned()),
+                input: target,
+            },
+            http: Some(http),
+            count: 1,
+            duration_ns: Some(1),
+            redaction: depgraph_core::RuntimeTraceRedaction::default(),
+        }],
+        summary: depgraph_core::RuntimeTraceSummary {
+            events: 1,
+            resolved_targets: 0,
+            external_targets: 1,
+            unresolved_targets: 0,
+            redacted_values: 0,
+        },
+    }
+}
+
+fn cross_language_ffi_entries(
+    ffi: &depgraph_protocol::CrossLanguageAdapterDelta,
+) -> Result<Vec<depgraph_core::FfiObservedLink>> {
+    ffi.sites
+        .iter()
+        .filter(|site| {
+            site.precision != depgraph_protocol::Precision::Observed
+                && site.evidence.iter().any(|evidence| {
+                    evidence.properties["target_profile_id"].as_str()
+                        == Some(CROSS_LANGUAGE_RELEASE_FIXTURE_PROFILE_ID)
+                })
+        })
+        .map(|site| {
+            let properties = &site
+                .evidence
+                .first()
+                .context("packaged FFI declaration has no source evidence")?
+                .properties;
+            let field = |name: &str| {
+                properties[name]
+                    .as_str()
+                    .with_context(|| format!("packaged FFI declaration has no {name}"))
+            };
+            let library = field("library_request")?;
+            let symbol = field("symbol_request")?;
+            Ok(depgraph_core::FfiObservedLink {
+                declaration_site_id: site.id.clone(),
+                abi: field("ffi_abi")?.to_owned(),
+                direction: field("ffi_direction")?.to_owned(),
+                library: library.to_owned(),
+                symbol: symbol.to_owned(),
+                library_artifact_digest: format!(
+                    "sha256:{}",
+                    hex::encode(Sha256::digest(format!("{library}:{symbol}").as_bytes()))
+                ),
+            })
+        })
+        .collect()
+}
+
+fn cross_language_ffi_outcome(
+    root: &Path,
+    entries: &[depgraph_core::FfiObservedLink],
+) -> Result<depgraph_core::BuildExecutionOutcome> {
+    let validated_output_digest = hex::encode(Sha256::digest(
+        depgraph_protocol::canonical_json(&serde_json::to_value(entries)?).as_bytes(),
+    ));
+    Ok(depgraph_core::BuildExecutionOutcome {
+        audit: depgraph_core::BuildAudit {
+            schema_version: "build-audit-v1".to_owned(),
+            run_id: "cross-language-release-ffi-link".to_owned(),
+            adapter: depgraph_core::FFI_LINK_OBSERVER.to_owned(),
+            adapter_version: depgraph_core::FFI_LINK_OBSERVER_VERSION.to_owned(),
+            profile_id: CROSS_LANGUAGE_RELEASE_FIXTURE_PROFILE_ID.to_owned(),
+            command_program: "release-fixture-linker".to_owned(),
+            command_arguments: Vec::new(),
+            command_plan_digest: validated_output_digest.clone(),
+            logical_cwd: ".".to_owned(),
+            source_root_digest: sha256_tree(root)?,
+            toolchain_executable_digest: hex::encode(Sha256::digest(
+                depgraph_core::FFI_LINK_OBSERVER_VERSION.as_bytes(),
+            )),
+            toolchain_version: Some("fixture-v1".to_owned()),
+            target: Some(CROSS_LANGUAGE_RELEASE_FIXTURE_TARGET.to_owned()),
+            environment_keys: Vec::new(),
+            environment_key_set_digest: hex::encode(Sha256::digest([])),
+            redacted_secret_key_count: 0,
+            timeout_seconds: 60,
+            stdout_limit_bytes: 1_024,
+            stderr_limit_bytes: 1_024,
+            network_policy: "deny".to_owned(),
+            network_isolation: depgraph_core::NetworkIsolation::Enforced,
+            isolation_diagnostic: None,
+            started_at: "2026-07-26T00:00:00Z".to_owned(),
+            finished_at: "2026-07-26T00:00:01Z".to_owned(),
+            duration_millis: 1,
+            outcome: depgraph_core::BuildOutcomeKind::Completed,
+            exit_code: Some(0),
+            stdout_truncated: false,
+            stderr_truncated: false,
+            validated_output_digest: Some(validated_output_digest),
+            diagnostic_code: None,
+        },
+        project_code_executed: true,
+        rust_observation: None,
+        web_observation: None,
+    })
+}
+
 fn verify_packaged_cross_language(
     extracted: &Path,
     target: &str,
+    archive_sha256: &str,
 ) -> Result<CrossLanguagePackageSmokeReport> {
     let fixture_path = extracted.join(depgraph_core::CROSS_LANGUAGE_RELEASE_SMOKE_FIXTURE_PATH);
     let fixture: CrossLanguageReleaseFixture = serde_json::from_slice(&fs::read(&fixture_path)?)
@@ -4871,6 +5146,7 @@ fn verify_packaged_cross_language(
     Ok(CrossLanguagePackageSmokeReport {
         schema_version: CROSS_LANGUAGE_PACKAGE_SMOKE_SCHEMA_VERSION.to_owned(),
         target: target.to_owned(),
+        archive_sha256: archive_sha256.to_owned(),
         contract: depgraph_core::cross_language_release_compatibility_contract(),
         graph_digest: depgraph_protocol::stable_id_from_value(
             "cross-language-release-graph",
@@ -5000,7 +5276,7 @@ fn verify_archive(
         &archive_sha256,
     )?;
     let cross_language_smoke =
-        verify_packaged_cross_language(&extracted, &release_manifest.target)?;
+        verify_packaged_cross_language(&extracted, &release_manifest.target, &archive_sha256)?;
     verify_packaged_web_runtime_fails_closed(&executable, &extracted, &verify_root, &fixture)?;
     let semantic_complete_fixture =
         Path::new("workers/web/test/fixtures/semantic-complete").canonicalize()?;
@@ -11296,7 +11572,8 @@ mod tests {
         parse_worker_handshake, release_compatibility, remove_transient_build_run_ids,
         rust_backend_from_handshake, rustc_source_identity, stable_release_baseline_digest,
         validate_bounded_query_package_smoke, validate_cross_language_package_smoke,
-        verify_checksum_sidecar, verify_github_actions_security, verify_packaged_cross_language,
+        verify_checksum_sidecar, verify_cross_language_package_smoke,
+        verify_github_actions_security, verify_packaged_cross_language,
         verify_pinned_rust_sysroot_digest, verify_project_metadata,
         verify_public_community_surface, verify_release_tag_values,
         verify_rust_analyzer_dependencies, verify_rust_backend, verify_security_disclosure_dry_run,
@@ -11399,8 +11676,9 @@ mod tests {
     #[test]
     fn cross_language_package_smoke_is_deterministic_and_tamper_closed() -> Result<()> {
         let target = "x86_64-unknown-linux-gnu";
-        let report = verify_packaged_cross_language(&workspace_root(), target)?;
-        validate_cross_language_package_smoke(&report, target)?;
+        let archive_sha256 = "a".repeat(64);
+        let report = verify_packaged_cross_language(&workspace_root(), target, &archive_sha256)?;
+        validate_cross_language_package_smoke(&report, target, &archive_sha256)?;
         assert_eq!(
             report.schema_version,
             CROSS_LANGUAGE_PACKAGE_SMOKE_SCHEMA_VERSION
@@ -11411,12 +11689,35 @@ mod tests {
                 .starts_with("cross-language-release-graph:sha256:")
         );
 
+        let mut archive_drifted = report.clone();
+        archive_drifted.archive_sha256 = "b".repeat(64);
+        assert!(
+            validate_cross_language_package_smoke(&archive_drifted, target, &archive_sha256)
+                .is_err()
+        );
+
+        let mut output_drifted = report.clone();
+        output_drifted.graph_digest =
+            format!("cross-language-release-graph:sha256:{}", "0".repeat(64));
+        assert!(
+            validate_cross_language_package_smoke(&output_drifted, target, &archive_sha256).is_ok()
+        );
+        assert!(
+            verify_cross_language_package_smoke(
+                &output_drifted,
+                &workspace_root(),
+                target,
+                &archive_sha256,
+            )
+            .is_err()
+        );
+
         let mut drifted = CrossLanguagePackageSmokeReport {
             contract: report.contract.clone(),
             ..report
         };
         drifted.contract.capabilities.pop();
-        assert!(validate_cross_language_package_smoke(&drifted, target).is_err());
+        assert!(validate_cross_language_package_smoke(&drifted, target, &archive_sha256).is_err());
         Ok(())
     }
 

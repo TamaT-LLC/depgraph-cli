@@ -460,9 +460,12 @@ and observed native artifact digest. Raw linker output, binary content,
 environment values, and native paths are never retained or reopened by the
 correlator.
 
-Correlation starts from a validated static FFI closure and requires the
-observation to cover every eligible declaration for exactly one participating
-profile. A same-profile ABI/library/symbol match appends separate
+Correlation starts from a validated static FFI closure, the completed
+supervisor outcome that produced the observation, and an explicit target on
+the participating profile. The observation must match the audit run, profile,
+target, source-root/toolchain/link-input digests, and cover every eligible
+declaration for that profile. A same-profile ABI/library/symbol match appends
+separate
 `phase=build`, `precision=observed` `binds_native_symbol` and
 `provided_by_library` sites/edges; it does not overwrite the static candidate
 or heuristic declaration. Partial link output, an unknown or duplicate site,
