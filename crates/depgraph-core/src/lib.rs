@@ -121,7 +121,8 @@ pub use public_history_audit::{
     PublicAuditFinding, PublicAuditFindingState, PublicAuditPurgeAction, PublicAuditRefInput,
     PublicAuditRemediationAttestation, PublicAuditSourceInput, PublicAuditSourceKind,
     PublicHistoryAuditInput, PublicHistoryAuditReport, audit_public_history,
-    finalize_public_history_audit, public_secret_scanner_identity,
+    finalize_public_history_audit, public_audit_remediation_attestation_digest,
+    public_secret_scanner_identity,
 };
 pub use public_provenance_audit::{
     MAX_PUBLIC_PROVENANCE_ASSETS, MAX_PUBLIC_PROVENANCE_DEPENDENCIES, PUBLIC_LICENSE_POLICY_NAME,
