@@ -577,7 +577,7 @@ fn verify_github_actions_security(root: &Path) -> Result<()> {
     for required in [
         "`github-actions-policy-v1`",
         "Pull requests, fork branches",
-        "does not interpolate `secrets.*`",
+        "does not interpolate the `secrets` expression",
         "Only the final `publish` job receives job-scoped",
         "The stable source guard handles `workflow_run` metadata without checking out",
         "No current workflow requests `id-token: write`",
@@ -610,7 +610,7 @@ fn verify_workflow_policy_text(
     if !matches!(top_permissions.as_slice(), [] | ["contents: read"]) {
         bail!("{name} has broad workflow-level permissions");
     }
-    if workflow.contains("\n  pull_request:") && workflow.contains("${{ secrets.") {
+    if workflow.contains("\n  pull_request:") && contains_expression_context(workflow, "secrets") {
         bail!("{name} exposes repository secrets to pull request execution");
     }
     for line in workflow.lines() {
@@ -644,7 +644,7 @@ fn verify_workflow_policy_text(
         "ci.yml" => {
             if !workflow.contains("\n  pull_request:")
                 || top_permissions != ["contents: read"]
-                || workflow.contains("${{ secrets.")
+                || contains_expression_context(workflow, "secrets")
                 || !write_permissions.is_empty()
             {
                 bail!("CI pull requests must remain read-only and secret-free");
@@ -668,7 +668,7 @@ fn verify_workflow_policy_text(
             if !workflow.contains("\n  workflow_run:")
                 || !top_permissions.is_empty()
                 || workflow.contains("actions/checkout@")
-                || workflow.contains("${{ secrets.")
+                || contains_expression_context(workflow, "secrets")
                 || workflow.contains("run: cargo")
                 || workflow.contains("run: ./")
                 || write_permissions != ["actions", "contents"]
@@ -705,6 +705,26 @@ fn write_permission_scopes(workflow: &str) -> Vec<&str> {
         .collect::<Vec<_>>();
     scopes.sort_unstable();
     scopes
+}
+
+fn contains_expression_context(workflow: &str, context: &str) -> bool {
+    workflow.split("${{").skip(1).any(|suffix| {
+        suffix
+            .split_once("}}")
+            .is_some_and(|(expression, _)| contains_identifier(expression, context))
+    })
+}
+
+fn contains_identifier(expression: &str, identifier: &str) -> bool {
+    expression.match_indices(identifier).any(|(index, value)| {
+        let before = index
+            .checked_sub(1)
+            .and_then(|prior| expression.as_bytes().get(prior))
+            .copied();
+        let after = expression.as_bytes().get(index + value.len()).copied();
+        before.is_none_or(|byte| !byte.is_ascii_alphanumeric() && byte != b'_')
+            && after.is_none_or(|byte| !byte.is_ascii_alphanumeric() && byte != b'_')
+    })
 }
 
 fn has_workflow_uses_key(line: &str) -> bool {
@@ -11688,10 +11708,17 @@ mod tests {
             verify_workflow_policy_text("ci.yml", &broad, &pins, &mut BTreeSet::new()).is_err()
         );
 
-        let secret = format!("{ci}\n# ${{{{ secrets.RELEASE_TOKEN }}}}\n");
-        assert!(
-            verify_workflow_policy_text("ci.yml", &secret, &pins, &mut BTreeSet::new()).is_err()
-        );
+        for expression in [
+            "${{ secrets.RELEASE_TOKEN }}",
+            "${{secrets.RELEASE_TOKEN}}",
+            "${{ secrets ['RELEASE_TOKEN'] }}",
+        ] {
+            let secret = format!("{ci}\n# {expression}\n");
+            assert!(
+                verify_workflow_policy_text("ci.yml", &secret, &pins, &mut BTreeSet::new())
+                    .is_err()
+            );
+        }
 
         let unreviewed_write = "name: Auxiliary\non: workflow_dispatch\npermissions: {}\njobs:\n  mutate:\n    permissions:\n      issues: write\n";
         assert!(
