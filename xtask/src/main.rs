@@ -716,12 +716,21 @@ fn contains_expression_context(workflow: &str, context: &str) -> bool {
 }
 
 fn contains_identifier(expression: &str, identifier: &str) -> bool {
-    expression.match_indices(identifier).any(|(index, value)| {
+    let expression = expression.as_bytes();
+    let identifier = identifier.as_bytes();
+    if identifier.is_empty() || identifier.len() > expression.len() {
+        return false;
+    }
+    (0..=expression.len() - identifier.len()).any(|index| {
+        let end = index + identifier.len();
+        if !expression[index..end].eq_ignore_ascii_case(identifier) {
+            return false;
+        }
         let before = index
             .checked_sub(1)
-            .and_then(|prior| expression.as_bytes().get(prior))
+            .and_then(|prior| expression.get(prior))
             .copied();
-        let after = expression.as_bytes().get(index + value.len()).copied();
+        let after = expression.get(end).copied();
         before.is_none_or(|byte| !byte.is_ascii_alphanumeric() && byte != b'_')
             && after.is_none_or(|byte| !byte.is_ascii_alphanumeric() && byte != b'_')
     })
@@ -11735,6 +11744,7 @@ mod tests {
             "${{ secrets.RELEASE_TOKEN }}",
             "${{secrets.RELEASE_TOKEN}}",
             "${{ secrets ['RELEASE_TOKEN'] }}",
+            "${{ SeCrEtS.RELEASE_TOKEN }}",
         ] {
             let secret = format!("{ci}\n# {expression}\n");
             assert!(
