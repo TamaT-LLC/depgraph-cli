@@ -145,7 +145,7 @@ pub use public_readiness::{
     PublicReadinessFindingSummary, PublicReadinessGate, PublicReadinessRecord,
     PublicReadinessRejectionReason, PublicReadinessToolIdentity, canonical_public_readiness_digest,
     evaluate_public_readiness, public_readiness_approval_statement_digest,
-    public_readiness_evidence_input_digest,
+    public_readiness_evidence_digest, public_readiness_evidence_input_digest,
 };
 pub const FRAMEWORK_BUILD_GRAPH_CONTRACT_VERSION: &str = "framework-build-graph-v1";
 pub const FRAMEWORK_BUILD_GATE_CONTRACT_VERSION: &str =
