@@ -15,7 +15,9 @@ the repository token, release environments, tag deletion, advisory contents,
 and published release artifacts are privileged surfaces.
 
 The ordinary CI workflow has only `contents: read`, never uses
-`pull_request_target`, and does not interpolate `secrets.*`. It may compile and
+`pull_request_target`, and does not interpolate the `secrets` expression
+context. The verifier detects that context as an identifier regardless of
+expression whitespace or dot/bracket access syntax. It may compile and
 test fork code, but that code receives no private-report, release, environment,
 OIDC, organization, or write-capable repository credential. CI artifacts and
 caches are untrusted inputs and cannot authorize a release.
