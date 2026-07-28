@@ -23,7 +23,9 @@ caches are untrusted inputs and cannot authorize a release.
 The release workflow is triggered only by a pushed `v*` tag. Its quality,
 benchmark, package, verification, and stable-gate jobs retain read-only
 repository permissions. Only the final `publish` job receives job-scoped
-`contents: write`, after all exact-candidate verification jobs succeed. It
+`contents: write`, after all exact-candidate verification jobs succeed. The
+verifier requires that to be the complete write-scope set, so adding another
+write permission to any release job fails the gate. It
 downloads artifacts produced by the same run and verifies their manifests,
 checksums, SBOMs, licenses, benchmark report, and stable release gate before
 publication. No fork event can trigger this path.
@@ -31,7 +33,8 @@ publication. No fork event can trigger this path.
 The stable source guard handles `workflow_run` metadata without checking out or
 executing the triggering revision. Its write token is restricted to cancelling
 the release run and removing the protected release tag when the immutable
-source identity is wrong. It must never run repository scripts or consume an
+source identity is wrong; its complete write-scope set is exactly `actions` and
+`contents`. It must never run repository scripts or consume an
 artifact from the triggering run.
 
 No current workflow requests `id-token: write` or an environment secret. If

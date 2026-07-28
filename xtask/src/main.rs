@@ -599,9 +599,10 @@ fn verify_workflow_policy_text(
     pins: &BTreeMap<&str, &str>,
     used_actions: &mut BTreeSet<String>,
 ) -> Result<()> {
+    let write_permissions = write_permission_scopes(workflow);
     if workflow.contains("pull_request_target")
-        || workflow.contains("permissions: write-all")
-        || workflow.contains("id-token: write")
+        || write_permissions.contains(&"write-all")
+        || write_permissions.contains(&"id-token")
     {
         bail!("{name} enables a forbidden trigger or broad credential");
     }
@@ -644,8 +645,7 @@ fn verify_workflow_policy_text(
             if !workflow.contains("\n  pull_request:")
                 || top_permissions != ["contents: read"]
                 || workflow.contains("${{ secrets.")
-                || workflow.contains("contents: write")
-                || workflow.contains("actions: write")
+                || !write_permissions.is_empty()
             {
                 bail!("CI pull requests must remain read-only and secret-free");
             }
@@ -658,7 +658,7 @@ fn verify_workflow_policy_text(
             if !workflow.contains("tags: [\"v*\"]")
                 || workflow.contains("\n  pull_request:")
                 || workflow.contains("\n  workflow_run:")
-                || workflow.matches("contents: write").count() != 1
+                || write_permissions != ["contents"]
                 || !publish.contains("permissions:\n      contents: write")
             {
                 bail!("release write permission must be confined to the tag-only publish job");
@@ -671,6 +671,7 @@ fn verify_workflow_policy_text(
                 || workflow.contains("${{ secrets.")
                 || workflow.contains("run: cargo")
                 || workflow.contains("run: ./")
+                || write_permissions != ["actions", "contents"]
                 || !workflow.contains("permissions:\n      actions: write\n      contents: write")
             {
                 bail!("stable release source guard must be metadata-only and job-scoped");
@@ -683,6 +684,27 @@ fn verify_workflow_policy_text(
         }
     }
     Ok(())
+}
+
+fn write_permission_scopes(workflow: &str) -> Vec<&str> {
+    let mut scopes = workflow
+        .lines()
+        .filter_map(|line| {
+            let code = line.split('#').next().unwrap_or_default().trim();
+            let (scope, value) = code.split_once(':')?;
+            let scope = scope.trim();
+            let value = value.trim();
+            if scope == "permissions" && value == "write-all" {
+                Some("write-all")
+            } else if value == "write" {
+                Some(scope)
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    scopes.sort_unstable();
+    scopes
 }
 
 fn has_workflow_uses_key(line: &str) -> bool {
@@ -11679,6 +11701,39 @@ mod tests {
             verify_workflow_policy_text(
                 "auxiliary.yml",
                 unreviewed_write,
+                &pins,
+                &mut BTreeSet::new(),
+            )
+            .is_err()
+        );
+
+        let release = fs::read_to_string(root.join(".github/workflows/release.yml"))?;
+        let overprivileged_release = release.replacen(
+            "      contents: write",
+            "      contents: write\n      issues: write",
+            1,
+        );
+        assert!(
+            verify_workflow_policy_text(
+                "release.yml",
+                &overprivileged_release,
+                &pins,
+                &mut BTreeSet::new(),
+            )
+            .is_err()
+        );
+
+        let guard =
+            fs::read_to_string(root.join(".github/workflows/stable-release-source-guard.yml"))?;
+        let overprivileged_guard = guard.replacen(
+            "      contents: write",
+            "      contents: write\n      packages: write",
+            1,
+        );
+        assert!(
+            verify_workflow_policy_text(
+                "stable-release-source-guard.yml",
+                &overprivileged_guard,
                 &pins,
                 &mut BTreeSet::new(),
             )
