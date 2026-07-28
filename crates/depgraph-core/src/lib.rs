@@ -12,6 +12,7 @@ pub mod daemon;
 pub mod export;
 pub mod ffi;
 pub mod ffi_link;
+pub mod github_settings;
 mod graphml;
 pub mod graphql;
 pub mod http_operation_correlation;
@@ -185,6 +186,16 @@ pub use daemon::{
 pub use depgraph_store::GraphSnapshot;
 pub use export::{
     ExportFormat, export, export_filtered, export_graphml_filtered_to_writer, filter_snapshot,
+};
+pub use github_settings::{
+    GITHUB_SETTINGS_DESIRED_SCHEMA_VERSION, GITHUB_SETTINGS_EVALUATION_SCHEMA_VERSION,
+    GITHUB_SETTINGS_REPOSITORY, GITHUB_SETTINGS_VERIFIER_MODE, GITHUB_SETTINGS_VERIFIER_NAME,
+    GITHUB_SETTINGS_VERIFIER_VERSION, GitHubRedactedPrincipal, GitHubRedactedSurface,
+    GitHubRequiredCheck, GitHubRuleset, GitHubRulesetEnforcement, GitHubRulesetTarget,
+    GitHubSecuritySettings, GitHubSettingsApiSnapshot, GitHubSettingsCollectionStatus,
+    GitHubSettingsDrift, GitHubSettingsDriftReason, GitHubSettingsEvaluation, GitHubSettingsState,
+    canonical_github_settings_digest, evaluate_github_settings, github_settings_verifier_identity,
+    parse_github_settings_desired,
 };
 pub use graphml::GRAPHML_SCHEMA_VERSION;
 pub use graphql::{

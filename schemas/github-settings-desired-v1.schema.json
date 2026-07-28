@@ -1,0 +1,268 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/TamaT-LLC/depgraph-cli/schemas/github-settings-desired-v1.schema.json",
+  "title": "depgraph GitHub settings desired state v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "repository",
+    "default_branch",
+    "rulesets",
+    "surface",
+    "security"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "github-settings-desired-v1"
+    },
+    "repository": {
+      "const": "TamaT-LLC/depgraph-cli"
+    },
+    "default_branch": {
+      "const": "main"
+    },
+    "rulesets": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 64,
+      "items": {
+        "$ref": "#/$defs/ruleset"
+      }
+    },
+    "surface": {
+      "$ref": "#/$defs/surface"
+    },
+    "security": {
+      "$ref": "#/$defs/security"
+    }
+  },
+  "$defs": {
+    "digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "token": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9._:+*-]+$"
+    },
+    "check": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "context",
+        "source_app_id",
+        "source_app_slug"
+      ],
+      "properties": {
+        "context": {
+          "$ref": "#/$defs/token"
+        },
+        "source_app_id": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "source_app_slug": {
+          "$ref": "#/$defs/token"
+        }
+      }
+    },
+    "principal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "identity",
+        "permission"
+      ],
+      "properties": {
+        "identity": {
+          "$ref": "#/$defs/token"
+        },
+        "permission": {
+          "$ref": "#/$defs/token"
+        }
+      }
+    },
+    "ruleset": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "target",
+        "enforcement",
+        "include",
+        "required_checks",
+        "required_approvals",
+        "require_code_owner_review",
+        "require_conversation_resolution",
+        "allow_force_pushes",
+        "allow_deletions",
+        "bypass_actors"
+      ],
+      "properties": {
+        "name": {
+          "$ref": "#/$defs/token"
+        },
+        "target": {
+          "enum": [
+            "branch",
+            "tag"
+          ]
+        },
+        "enforcement": {
+          "enum": [
+            "enabled",
+            "disabled"
+          ]
+        },
+        "include": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          }
+        },
+        "required_checks": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "$ref": "#/$defs/check"
+          }
+        },
+        "required_approvals": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 6
+        },
+        "require_code_owner_review": {
+          "type": "boolean"
+        },
+        "require_conversation_resolution": {
+          "type": "boolean"
+        },
+        "allow_force_pushes": {
+          "type": "boolean"
+        },
+        "allow_deletions": {
+          "type": "boolean"
+        },
+        "bypass_actors": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "$ref": "#/$defs/principal"
+          }
+        }
+      }
+    },
+    "surface": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "apps",
+        "webhook_digests",
+        "deploy_key_fingerprints",
+        "token_fingerprints",
+        "teams",
+        "environments",
+        "runner_groups"
+      ],
+      "properties": {
+        "apps": {
+          "type": "array",
+          "maxItems": 256,
+          "items": {
+            "$ref": "#/$defs/principal"
+          }
+        },
+        "webhook_digests": {
+          "type": "array",
+          "maxItems": 256,
+          "items": {
+            "$ref": "#/$defs/digest"
+          }
+        },
+        "deploy_key_fingerprints": {
+          "type": "array",
+          "maxItems": 256,
+          "items": {
+            "$ref": "#/$defs/digest"
+          }
+        },
+        "token_fingerprints": {
+          "type": "array",
+          "maxItems": 256,
+          "items": {
+            "$ref": "#/$defs/digest"
+          }
+        },
+        "teams": {
+          "type": "array",
+          "maxItems": 256,
+          "items": {
+            "$ref": "#/$defs/principal"
+          }
+        },
+        "environments": {
+          "type": "array",
+          "maxItems": 128,
+          "items": {
+            "$ref": "#/$defs/token"
+          }
+        },
+        "runner_groups": {
+          "type": "array",
+          "maxItems": 128,
+          "items": {
+            "$ref": "#/$defs/token"
+          }
+        }
+      }
+    },
+    "security": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "private_vulnerability_reporting",
+        "security_advisories",
+        "secret_scanning",
+        "push_protection",
+        "dependency_graph",
+        "dependabot_alerts",
+        "dependabot_security_updates",
+        "code_scanning"
+      ],
+      "properties": {
+        "private_vulnerability_reporting": {
+          "type": "boolean"
+        },
+        "security_advisories": {
+          "type": "boolean"
+        },
+        "secret_scanning": {
+          "type": "boolean"
+        },
+        "push_protection": {
+          "type": "boolean"
+        },
+        "dependency_graph": {
+          "type": "boolean"
+        },
+        "dependabot_alerts": {
+          "type": "boolean"
+        },
+        "dependabot_security_updates": {
+          "type": "boolean"
+        },
+        "code_scanning": {
+          "type": "boolean"
+        }
+      }
+    }
+  }
+}

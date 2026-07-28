@@ -400,6 +400,32 @@ passes in a dry-run repository with the same organization plan/features.
 Evidence: desired-state manifest, access review, dry-run before/after settings
 snapshot, verifier identity/output, and approvals.
 
+Issue #207 implements the closed `github-settings-desired-v1` manifest and
+`read-only-no-settings-actuator` verifier. It canonicalizes branch/tag
+rulesets, required check context plus GitHub App source, approvals,
+conversation resolution, force/delete/bypass controls, redacted
+app/webhook/key/token/team/environment/runner inventories, and security
+settings. The verifier binds the desired state to the build-pinned canonical
+manifest digest, so a caller cannot substitute a weaker policy and approve a
+matching weak snapshot. API permission failure, disabled or missing rules,
+wrong check source, bypass expansion, and unexpected public surface all
+produce digest-only drift and reject readiness.
+
+Collect the repository, ruleset, public-surface inventory, and security fields
+into a redacted `GitHubSettingsApiSnapshot`, then run the verifier from the
+repository root:
+
+```sh
+cargo xtask github-settings-verify redacted-settings-snapshot.json \
+  --output redacted-settings-evaluation.json
+```
+
+The command loads the build-pinned `.github/settings-desired-v1.json`; callers
+cannot supply a weaker desired policy. It always writes the digest-only
+evaluation, exits successfully only for `allow`, and exits non-zero for
+permission failure, partial collection, drift, or malformed input. It is
+read-only and does not mutate repository settings.
+
 ### Gate 7: release and support
 
 - [ ] Run the complete local and GitHub Actions quality suite for the exact
@@ -572,7 +598,7 @@ Each row is an independently reviewable one-to-three-day follow-up.
 | 3 | All-ref/history/collaboration secret audit tooling and redacted ledger | Implemented in #204 |
 | 4 | Dependency/license/provenance inventory and legal review package | Implemented in #205 |
 | 5 | Workflow SHA pinning, threat model, disclosure policy, and security dry run | Implemented in #206 |
-| 6 | Desired GitHub settings/rulesets manifest, access review, and verifier | 2-3 days |
+| 6 | Desired GitHub settings/rulesets manifest, access review, and verifier | Implemented in #207 |
 | 7 | Temporary-repository migration rehearsal and anonymous smoke suite | 2-3 days |
 | 8 | Candidate-bound final audit, owner decision, authorized change window, and observation | 2-3 days |
 

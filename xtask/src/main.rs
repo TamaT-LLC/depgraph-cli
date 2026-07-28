@@ -132,6 +132,11 @@ enum Task {
         #[arg(long)]
         output: PathBuf,
     },
+    GithubSettingsVerify {
+        snapshot: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -442,6 +447,9 @@ fn main() -> Result<()> {
             benchmark_report,
             output,
         } => stable_release_gate(&release_verification, &benchmark_report, &output),
+        Task::GithubSettingsVerify { snapshot, output } => {
+            github_settings_verify(&snapshot, &output)
+        }
     }
 }
 
@@ -1353,6 +1361,8 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "`security-disclosure-dry-run-v1`",
         "### Gate 5: governance and community",
         "### Gate 6: repository controls",
+        "`github-settings-desired-v1`",
+        "`read-only-no-settings-actuator`",
         "### Gate 7: release and support",
         "### Gate 8: migration dry run and change window",
         "### Gate 9: incident readiness",
@@ -1364,6 +1374,7 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "| 3 | All-ref/history/collaboration secret audit tooling and redacted ledger | Implemented in #204 |",
         "| 4 | Dependency/license/provenance inventory and legal review package | Implemented in #205 |",
         "| 5 | Workflow SHA pinning, threat model, disclosure policy, and security dry run | Implemented in #206 |",
+        "| 6 | Desired GitHub settings/rulesets manifest, access review, and verifier | Implemented in #207 |",
         "| 8 | Candidate-bound final audit, owner decision, authorized change window, and observation | 2-3 days |",
         "## Acceptance matrix",
         "| Stable release gate passes but history audit is missing |",
@@ -4065,6 +4076,50 @@ fn lowercase_sha256(value: &str) -> bool {
 
 fn prefixed_lowercase_sha256(value: &str, prefix: &str) -> bool {
     value.strip_prefix(prefix).is_some_and(lowercase_sha256)
+}
+
+fn github_settings_verify(snapshot_path: &Path, output: &Path) -> Result<()> {
+    let desired_path = workspace_root().join(".github/settings-desired-v1.json");
+    let desired = depgraph_core::parse_github_settings_desired(
+        &fs::read(&desired_path).with_context(|| {
+            format!(
+                "failed to read canonical GitHub settings manifest {}",
+                desired_path.display()
+            )
+        })?,
+    )
+    .context("canonical GitHub settings manifest is invalid")?;
+    let snapshot: depgraph_core::GitHubSettingsApiSnapshot =
+        serde_json::from_slice(&fs::read(snapshot_path).with_context(|| {
+            format!(
+                "failed to read redacted GitHub settings snapshot {}",
+                snapshot_path.display()
+            )
+        })?)
+        .context("redacted GitHub settings snapshot does not satisfy its closed schema")?;
+    let evaluation = depgraph_core::evaluate_github_settings(&desired, &snapshot)?;
+    fs::write(
+        output,
+        format!("{}\n", serde_json::to_string_pretty(&evaluation)?),
+    )
+    .with_context(|| {
+        format!(
+            "failed to write redacted GitHub settings evaluation {}",
+            output.display()
+        )
+    })?;
+
+    if evaluation.decision == depgraph_core::PublicReadinessDecision::Reject {
+        bail!(
+            "GitHub settings verification rejected; redacted evaluation={}",
+            output.display()
+        );
+    }
+    println!(
+        "GitHub settings verification allowed; redacted evaluation={}",
+        output.display()
+    );
+    Ok(())
 }
 
 fn stable_release_gate(
@@ -11760,22 +11815,23 @@ mod tests {
 
     use super::{
         ARCHIVE_MTIME, BENCHMARK_REPORT_SCHEMA_VERSION, BOUNDED_QUERY_PACKAGE_SMOKE_SCHEMA_VERSION,
-        BoundedQueryPackageSmokeReport, CROSS_LANGUAGE_PACKAGE_SMOKE_SCHEMA_VERSION,
+        BoundedQueryPackageSmokeReport, CROSS_LANGUAGE_PACKAGE_SMOKE_SCHEMA_VERSION, Cli,
         CrossLanguagePackageSmokeReport, DependencyPackage, GithubActionsPolicy,
         PROJECT_LICENSE_EXPRESSION, RELEASE_TARGETS, RUNTIME_COLLECTOR_CONTRACT_VERSION,
         RUST_SYSROOT_COMPONENT_SHA256, ReleaseVerificationReport, STABLE_RELEASE_BASELINE_COMMIT,
         STABLE_RELEASE_BASELINE_DIGEST, STABLE_RELEASE_VERSION, STABLE_UPGRADE_SOURCE_VERSION,
-        StableReleaseDecision, TYPESCRIPT_VERSION, TargetVerificationReport, VERSION,
+        StableReleaseDecision, TYPESCRIPT_VERSION, TargetVerificationReport, Task, VERSION,
         WEB_SEMANTIC_CAPABILITIES, WEB_SEMANTIC_RUNTIME_ARTIFACTS, WEB_SEMANTIC_RUNTIME_COMPONENTS,
         WebSemanticAttestation, WorkerBackend, archive_entries, cargo_runtime_packages,
         create_tar_archive, create_zip_archive, evaluate_stable_release_gate,
-        executable_name_for_target, extract_archive, normalized_spdx_license, package_url,
-        parse_worker_handshake, release_compatibility, remove_transient_build_run_ids,
-        rust_backend_from_handshake, rustc_source_identity, stable_release_baseline_digest,
-        validate_bounded_query_package_smoke, validate_cross_language_package_smoke,
-        verify_checksum_sidecar, verify_cross_language_package_smoke,
-        verify_github_actions_security, verify_local_markdown_links,
-        verify_packaged_cross_language, verify_pinned_rust_sysroot_digest, verify_project_metadata,
+        executable_name_for_target, extract_archive, github_settings_verify,
+        normalized_spdx_license, package_url, parse_worker_handshake, release_compatibility,
+        remove_transient_build_run_ids, rust_backend_from_handshake, rustc_source_identity,
+        stable_release_baseline_digest, validate_bounded_query_package_smoke,
+        validate_cross_language_package_smoke, verify_checksum_sidecar,
+        verify_cross_language_package_smoke, verify_github_actions_security,
+        verify_local_markdown_links, verify_packaged_cross_language,
+        verify_pinned_rust_sysroot_digest, verify_project_metadata,
         verify_public_community_surface, verify_release_tag_values,
         verify_rust_analyzer_dependencies, verify_rust_backend, verify_security_disclosure_dry_run,
         verify_stable_release_source_guard, verify_web_semantic_attestation,
@@ -12215,6 +12271,68 @@ jobs:
         assert_eq!(
             store.resolve_completed_snapshot_selector("stable-v0.4.0-upgrade")?,
             snapshot_id
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn github_settings_verify_command_writes_allow_and_rejects_drift() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let snapshot_path = temp.path().join("snapshot.json");
+        let output_path = temp.path().join("evaluation.json");
+        let cli = <Cli as clap::Parser>::try_parse_from([
+            "cargo-xtask",
+            "github-settings-verify",
+            snapshot_path.to_str().unwrap(),
+            "--output",
+            output_path.to_str().unwrap(),
+        ])?;
+        assert!(matches!(
+            cli.command,
+            Task::GithubSettingsVerify {
+                snapshot,
+                output
+            } if snapshot == snapshot_path && output == output_path
+        ));
+
+        let desired = depgraph_core::parse_github_settings_desired(include_bytes!(
+            "../../.github/settings-desired-v1.json"
+        ))?;
+        let allow_snapshot = depgraph_core::GitHubSettingsApiSnapshot {
+            collection_status: depgraph_core::GitHubSettingsCollectionStatus::Complete,
+            settings: Some(desired.clone()),
+        };
+        fs::write(&snapshot_path, serde_json::to_vec(&allow_snapshot)?)?;
+        github_settings_verify(&snapshot_path, &output_path)?;
+        let allow: depgraph_core::GitHubSettingsEvaluation =
+            serde_json::from_slice(&fs::read(&output_path)?)?;
+        assert_eq!(
+            allow.decision,
+            depgraph_core::PublicReadinessDecision::Allow
+        );
+        assert!(allow.drift.is_empty());
+
+        let mut drifted = desired;
+        drifted.rulesets[0].enforcement = depgraph_core::GitHubRulesetEnforcement::Disabled;
+        let reject_snapshot = depgraph_core::GitHubSettingsApiSnapshot {
+            collection_status: depgraph_core::GitHubSettingsCollectionStatus::Complete,
+            settings: Some(drifted),
+        };
+        fs::write(&snapshot_path, serde_json::to_vec(&reject_snapshot)?)?;
+        let error = github_settings_verify(&snapshot_path, &output_path).unwrap_err();
+        assert!(error.to_string().contains("verification rejected"));
+        let reject: depgraph_core::GitHubSettingsEvaluation =
+            serde_json::from_slice(&fs::read(&output_path)?)?;
+        assert_eq!(
+            reject.decision,
+            depgraph_core::PublicReadinessDecision::Reject
+        );
+        assert!(
+            reject
+                .drift
+                .iter()
+                .any(|drift| drift.reason
+                    == depgraph_core::GitHubSettingsDriftReason::RulesetDisabled)
         );
         Ok(())
     }
