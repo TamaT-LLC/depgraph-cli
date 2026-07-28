@@ -47,9 +47,10 @@ SHA exactly. The trailing major-version comment is documentation only.
 
 To update an Action:
 
-1. fetch the upstream immutable commit for the intended release and review its
-   release notes, source diff, runtime, transitive downloads, and permission
-   changes;
+1. resolve the intended upstream ref through GitHub's commits API so annotated
+   tags are peeled to their commit; never copy the tag-object SHA returned by
+   the Git refs API. Fetch that immutable commit and review its release notes,
+   source diff, runtime, transitive downloads, and permission changes;
 2. verify the commit belongs to the documented upstream ref and record the
    exact identity, SHA, and reviewed ref in `.github/actions-policy.json`;
 3. replace every workflow use atomically, run `cargo xtask test`, and inspect
