@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use chrono::DateTime;
 use depgraph_protocol::canonical_json;
 use serde::{Deserialize, Serialize};
@@ -54,7 +54,9 @@ pub struct PublicReadinessGate {
     pub decision: PublicReadinessDecision,
     pub evidence_digest: String,
     pub producer_role: String,
+    pub producer_identity: String,
     pub approver_role: String,
+    pub approver_identity: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -109,7 +111,9 @@ pub struct PublicReadinessEvidence {
     pub started_at: String,
     pub ended_at: String,
     pub producer_role: String,
+    pub producer_identity: String,
     pub approver_role: String,
+    pub approver_identity: String,
     pub tool: PublicReadinessToolIdentity,
     pub findings: PublicReadinessFindingSummary,
 }
@@ -150,6 +154,7 @@ pub struct PublicReadinessExpectedState {
 pub enum PublicReadinessRejectionReason {
     ApprovalStatementMismatch,
     CandidateStateStale,
+    EvidenceDigestMismatch,
     EvidenceManifestTampered,
     EvidenceMismatch,
     GateNotAllowed,
@@ -214,6 +219,19 @@ pub fn public_readiness_evidence_input_digest(
     hex::encode(Sha256::digest(input.as_bytes()))
 }
 
+pub fn public_readiness_evidence_digest(evidence: &PublicReadinessEvidence) -> Result<String> {
+    let mut value = serde_json::to_value(evidence)?;
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("serialized public readiness evidence is not an object"))?;
+    object
+        .remove("evidence_digest")
+        .ok_or_else(|| anyhow!("serialized public readiness evidence has no digest field"))?;
+    Ok(hex::encode(Sha256::digest(
+        canonical_json(&value).as_bytes(),
+    )))
+}
+
 pub fn evaluate_public_readiness(
     bundle: &PublicReadinessBundle,
     expected: &PublicReadinessExpectedState,
@@ -264,9 +282,14 @@ pub fn evaluate_public_readiness(
         };
         if gate.evidence_digest != evidence.evidence_digest
             || gate.producer_role != evidence.producer_role
+            || gate.producer_identity != evidence.producer_identity
             || gate.approver_role != evidence.approver_role
+            || gate.approver_identity != evidence.approver_identity
         {
             reasons.insert(PublicReadinessRejectionReason::EvidenceMismatch);
+        }
+        if public_readiness_evidence_digest(evidence)? != evidence.evidence_digest {
+            reasons.insert(PublicReadinessRejectionReason::EvidenceDigestMismatch);
         }
         if evidence.findings.unresolved != 0 {
             reasons.insert(PublicReadinessRejectionReason::UnresolvedFinding);
@@ -319,10 +342,18 @@ fn validate_record_shape(
         if !PUBLIC_READINESS_GATE_IDS.contains(&gate.id.as_str())
             || !is_digest(&gate.evidence_digest)
             || !valid_role(&gate.producer_role)
+            || !valid_team_identity(&gate.producer_identity)
             || !valid_role(&gate.approver_role)
+            || !valid_team_identity(&gate.approver_identity)
             || gate.producer_role == gate.approver_role
+            || gate.producer_identity == gate.approver_identity
         {
             reasons.insert(PublicReadinessRejectionReason::InvalidRecordContract);
+        }
+        if contains_sensitive_shape(&gate.producer_identity)
+            || contains_sensitive_shape(&gate.approver_identity)
+        {
+            reasons.insert(PublicReadinessRejectionReason::SensitiveValueRejected);
         }
     }
 }
@@ -359,8 +390,11 @@ fn validate_manifest_shape(
             || !is_digest(&evidence.evidence_digest)
             || evidence.input_digest != expected_input_digest
             || !valid_role(&evidence.producer_role)
+            || !valid_team_identity(&evidence.producer_identity)
             || !valid_role(&evidence.approver_role)
+            || !valid_team_identity(&evidence.approver_identity)
             || evidence.producer_role == evidence.approver_role
+            || evidence.producer_identity == evidence.approver_identity
             || !valid_token(&evidence.tool.name, 64)
             || !valid_token(&evidence.tool.version, 64)
             || !is_digest(&evidence.tool.acquisition_digest)
@@ -371,6 +405,11 @@ fn validate_manifest_shape(
             || ended_at > generated_at
         {
             reasons.insert(PublicReadinessRejectionReason::InvalidEvidenceManifestContract);
+        }
+        if contains_sensitive_shape(&evidence.producer_identity)
+            || contains_sensitive_shape(&evidence.approver_identity)
+        {
+            reasons.insert(PublicReadinessRejectionReason::SensitiveValueRejected);
         }
     }
 }
@@ -390,11 +429,20 @@ fn validate_final_approvals(
     }
     let decided_at = parse_time(&record.decided_at);
     let generated_at = parse_time(&manifest.generated_at);
-    let gate_producers = record
-        .gates
+    let producer_identities = manifest
+        .evidence
         .iter()
-        .map(|gate| (gate.id.as_str(), gate.producer_role.as_str()))
-        .collect::<BTreeMap<_, _>>();
+        .map(|evidence| evidence.producer_identity.as_str())
+        .collect::<BTreeSet<_>>();
+    let approver_identities = manifest
+        .evidence
+        .iter()
+        .map(|evidence| evidence.approver_identity.as_str())
+        .collect::<BTreeSet<_>>();
+    if !producer_identities.is_disjoint(&approver_identities) {
+        reasons.insert(PublicReadinessRejectionReason::InvalidOrSelfApproval);
+    }
+    let mut final_approval_identities = BTreeSet::new();
     for approval in &record.approvals {
         let approved_at = parse_time(&approval.approved_at);
         if !PUBLIC_READINESS_FINAL_APPROVAL_ROLES.contains(&approval.role.as_str())
@@ -406,10 +454,10 @@ fn validate_final_approvals(
         {
             reasons.insert(PublicReadinessRejectionReason::InvalidOrSelfApproval);
         }
-        if record.gates.iter().any(|gate| {
-            gate.approver_role == approval.role
-                && gate_producers.get(gate.id.as_str()) == Some(&approval.role.as_str())
-        }) {
+        if !final_approval_identities.insert(approval.identity.as_str())
+            || producer_identities.contains(approval.identity.as_str())
+            || approver_identities.contains(approval.identity.as_str())
+        {
             reasons.insert(PublicReadinessRejectionReason::InvalidOrSelfApproval);
         }
         if approval.statement_digest
@@ -501,24 +549,30 @@ mod tests {
         manifest.evidence = PUBLIC_READINESS_GATE_IDS
             .iter()
             .enumerate()
-            .map(|(index, gate_id)| PublicReadinessEvidence {
-                gate_id: (*gate_id).into(),
-                evidence_digest: format!("{index:064x}"),
-                input_digest: input_digest.clone(),
-                started_at: "2026-07-26T00:00:00Z".into(),
-                ended_at: "2026-07-26T00:01:00Z".into(),
-                producer_role: "repository-administrator".into(),
-                approver_role: "independent-code-reviewer".into(),
-                tool: PublicReadinessToolIdentity {
-                    name: "readiness-auditor".into(),
-                    version: "1.0.0".into(),
-                    acquisition_digest: HASH_B.into(),
-                    configuration_digest: HASH_C.into(),
-                },
-                findings: PublicReadinessFindingSummary {
-                    resolved: 0,
-                    unresolved: 0,
-                },
+            .map(|(index, gate_id)| {
+                let mut evidence = PublicReadinessEvidence {
+                    gate_id: (*gate_id).into(),
+                    evidence_digest: String::new(),
+                    input_digest: input_digest.clone(),
+                    started_at: "2026-07-26T00:00:00Z".into(),
+                    ended_at: format!("2026-07-26T00:01:{index:02}Z"),
+                    producer_role: "repository-administrator".into(),
+                    producer_identity: "team:readiness-producers".into(),
+                    approver_role: "independent-code-reviewer".into(),
+                    approver_identity: "team:readiness-gate-reviewers".into(),
+                    tool: PublicReadinessToolIdentity {
+                        name: "readiness-auditor".into(),
+                        version: "1.0.0".into(),
+                        acquisition_digest: HASH_B.into(),
+                        configuration_digest: HASH_C.into(),
+                    },
+                    findings: PublicReadinessFindingSummary {
+                        resolved: 0,
+                        unresolved: 0,
+                    },
+                };
+                evidence.evidence_digest = public_readiness_evidence_digest(&evidence).unwrap();
+                evidence
             })
             .collect::<Vec<_>>();
         let evidence_manifest_digest = canonical_public_readiness_digest(&manifest).unwrap();
@@ -530,7 +584,9 @@ mod tests {
                 decision: PublicReadinessDecision::Allow,
                 evidence_digest: evidence.evidence_digest.clone(),
                 producer_role: evidence.producer_role.clone(),
+                producer_identity: evidence.producer_identity.clone(),
                 approver_role: evidence.approver_role.clone(),
+                approver_identity: evidence.approver_identity.clone(),
             })
             .collect();
         let mut record = PublicReadinessRecord {
@@ -640,8 +696,12 @@ mod tests {
         cases.push(tampered);
 
         let mut self_approved = bundle.clone();
-        self_approved.record.gates[0].approver_role =
-            self_approved.record.gates[0].producer_role.clone();
+        self_approved.evidence_manifest.evidence[0].approver_identity =
+            self_approved.evidence_manifest.evidence[0]
+                .producer_identity
+                .clone();
+        self_approved.record.gates[0].approver_identity =
+            self_approved.record.gates[0].producer_identity.clone();
         cases.push(self_approved);
 
         let mut personal_contact = bundle.clone();
@@ -670,5 +730,108 @@ mod tests {
                 .reasons
                 .contains(&PublicReadinessRejectionReason::CandidateStateStale)
         );
+    }
+
+    #[test]
+    fn evidence_digest_is_recomputed_from_canonical_evidence() {
+        let (mut bundle, expected) = fixture();
+        bundle.evidence_manifest.evidence[0].evidence_digest = HASH_E.into();
+        bundle.record.gates[0].evidence_digest = HASH_E.into();
+        refresh_record_integrity(&mut bundle);
+
+        let evaluation = evaluate_public_readiness(&bundle, &expected).unwrap();
+        assert_eq!(evaluation.decision, PublicReadinessDecision::Reject);
+        assert!(
+            evaluation
+                .reasons
+                .contains(&PublicReadinessRejectionReason::EvidenceDigestMismatch)
+        );
+        assert!(
+            !evaluation
+                .reasons
+                .contains(&PublicReadinessRejectionReason::EvidenceManifestTampered)
+        );
+        assert!(
+            !evaluation
+                .reasons
+                .contains(&PublicReadinessRejectionReason::EvidenceMismatch)
+        );
+    }
+
+    #[test]
+    fn authenticated_identities_cannot_cross_approval_boundaries() {
+        let (bundle, expected) = fixture();
+
+        let mut producer_as_approver = bundle.clone();
+        producer_as_approver.evidence_manifest.evidence[0].approver_identity =
+            producer_as_approver.evidence_manifest.evidence[0]
+                .producer_identity
+                .clone();
+        refresh_evidence_and_record_integrity(&mut producer_as_approver, 0);
+
+        let mut producer_as_final_approver = bundle.clone();
+        producer_as_final_approver.record.approvals[0].identity =
+            producer_as_final_approver.evidence_manifest.evidence[0]
+                .producer_identity
+                .clone();
+        refresh_approval_statement_digests(&mut producer_as_final_approver.record);
+
+        let mut duplicate_final_approver = bundle;
+        duplicate_final_approver.record.approvals[1].identity =
+            duplicate_final_approver.record.approvals[0]
+                .identity
+                .clone();
+        refresh_approval_statement_digests(&mut duplicate_final_approver.record);
+
+        for case in [
+            producer_as_approver,
+            producer_as_final_approver,
+            duplicate_final_approver,
+        ] {
+            let evaluation = evaluate_public_readiness(&case, &expected).unwrap();
+            assert_eq!(evaluation.decision, PublicReadinessDecision::Reject);
+            assert!(
+                evaluation
+                    .reasons
+                    .contains(&PublicReadinessRejectionReason::InvalidOrSelfApproval)
+            );
+        }
+    }
+
+    fn refresh_evidence_and_record_integrity(bundle: &mut PublicReadinessBundle, index: usize) {
+        let evidence = &mut bundle.evidence_manifest.evidence[index];
+        evidence.evidence_digest = public_readiness_evidence_digest(evidence).unwrap();
+        let gate = &mut bundle.record.gates[index];
+        gate.evidence_digest.clone_from(&evidence.evidence_digest);
+        gate.producer_role.clone_from(&evidence.producer_role);
+        gate.producer_identity
+            .clone_from(&evidence.producer_identity);
+        gate.approver_role.clone_from(&evidence.approver_role);
+        gate.approver_identity
+            .clone_from(&evidence.approver_identity);
+        refresh_record_integrity(bundle);
+    }
+
+    fn refresh_record_integrity(bundle: &mut PublicReadinessBundle) {
+        bundle.record.evidence_manifest_digest =
+            canonical_public_readiness_digest(&bundle.evidence_manifest).unwrap();
+        refresh_approval_statement_digests(&mut bundle.record);
+    }
+
+    fn refresh_approval_statement_digests(record: &mut PublicReadinessRecord) {
+        let statement_digests = record
+            .approvals
+            .iter()
+            .map(|approval| {
+                public_readiness_approval_statement_digest(
+                    record,
+                    &approval.role,
+                    &approval.identity,
+                )
+            })
+            .collect::<Vec<_>>();
+        for (approval, statement_digest) in record.approvals.iter_mut().zip(statement_digests) {
+            approval.statement_digest = statement_digest;
+        }
     }
 }

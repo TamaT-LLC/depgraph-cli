@@ -49,6 +49,10 @@
         "tamat-llc-organization-owner"
       ]
     },
+    "authenticated_identity": {
+      "type": "string",
+      "pattern": "^team:[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$"
+    },
     "gate_id": {
       "type": "string",
       "enum": [
@@ -71,7 +75,9 @@
         "decision",
         "evidence_digest",
         "producer_role",
-        "approver_role"
+        "producer_identity",
+        "approver_role",
+        "approver_identity"
       ],
       "properties": {
         "id": {
@@ -86,8 +92,14 @@
         "producer_role": {
           "$ref": "#/$defs/role"
         },
+        "producer_identity": {
+          "$ref": "#/$defs/authenticated_identity"
+        },
         "approver_role": {
           "$ref": "#/$defs/role"
+        },
+        "approver_identity": {
+          "$ref": "#/$defs/authenticated_identity"
         }
       }
     },
@@ -111,8 +123,7 @@
           ]
         },
         "identity": {
-          "type": "string",
-          "pattern": "^team:[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$"
+          "$ref": "#/$defs/authenticated_identity"
         },
         "approved_at": {
           "$ref": "#/$defs/timestamp"
@@ -246,7 +257,9 @@
         "started_at",
         "ended_at",
         "producer_role",
+        "producer_identity",
         "approver_role",
+        "approver_identity",
         "tool",
         "findings"
       ],
@@ -269,8 +282,14 @@
         "producer_role": {
           "$ref": "#/$defs/role"
         },
+        "producer_identity": {
+          "$ref": "#/$defs/authenticated_identity"
+        },
         "approver_role": {
           "$ref": "#/$defs/role"
+        },
+        "approver_identity": {
+          "$ref": "#/$defs/authenticated_identity"
         },
         "tool": {
           "$ref": "#/$defs/tool"
