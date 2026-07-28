@@ -411,6 +411,21 @@ matching weak snapshot. API permission failure, disabled or missing rules,
 wrong check source, bypass expansion, and unexpected public surface all
 produce digest-only drift and reject readiness.
 
+Collect the repository, ruleset, public-surface inventory, and security fields
+into a redacted `GitHubSettingsApiSnapshot`, then run the verifier from the
+repository root:
+
+```sh
+cargo xtask github-settings-verify redacted-settings-snapshot.json \
+  --output redacted-settings-evaluation.json
+```
+
+The command loads the build-pinned `.github/settings-desired-v1.json`; callers
+cannot supply a weaker desired policy. It always writes the digest-only
+evaluation, exits successfully only for `allow`, and exits non-zero for
+permission failure, partial collection, drift, or malformed input. It is
+read-only and does not mutate repository settings.
+
 ### Gate 7: release and support
 
 - [ ] Run the complete local and GitHub Actions quality suite for the exact
