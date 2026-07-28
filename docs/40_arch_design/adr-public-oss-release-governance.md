@@ -249,6 +249,19 @@ Evidence: tool identities and configurations, redacted finding ledger,
 rotation/purge attestations without secret values, fresh-mirror digest, and
 anonymous-clone result.
 
+Issue #204 implements the bounded `public-history-audit-v1` scanner contract.
+It binds canonical branch/tag/note/pull-request refs, Git object/LFS/submodule
+inputs, and the issue/PR/discussion/wiki/release/Actions collaboration surface
+to the compiled scanner/config identity. Its serialized ledger contains only
+source/content digests, pattern IDs, counts, and remediation attestations.
+Each remediation attestation is a canonical statement bound to the initial and
+fresh-mirror evidence digests, separate rotation/classification and purge
+evidence digests, and distinct producer and approver team identities. The
+verifier recomputes that statement digest and rejects reuse, self-approval, or
+field substitution.
+Rotation or revocation, purge evidence, and a clean fresh-mirror rescan are all
+required before a finding becomes resolved.
+
 ### Gate 3: legal, license, and provenance
 
 - [ ] Confirm the project remains offered under `MIT OR Apache-2.0`, both
@@ -536,7 +549,7 @@ Each row is an independently reviewable one-to-three-day follow-up.
 | ---: | --- | --- |
 | 1 | Community/governance documents, issue forms, PR template, DCO/CLA decision | Implemented in #202 |
 | 2 | Closed readiness/evidence schemas and deterministic verifier | Implemented in #203 |
-| 3 | All-ref/history/collaboration secret audit tooling and redacted ledger | 2-3 days |
+| 3 | All-ref/history/collaboration secret audit tooling and redacted ledger | Implemented in #204 |
 | 4 | Dependency/license/provenance inventory and legal review package | 2-3 days |
 | 5 | Workflow SHA pinning, threat model, disclosure policy, and security dry run | 2-3 days |
 | 6 | Desired GitHub settings/rulesets manifest, access review, and verifier | 2-3 days |
