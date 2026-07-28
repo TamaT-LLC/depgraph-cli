@@ -603,6 +603,7 @@ fn verify_workflow_policy_text(
     if workflow.contains("pull_request_target")
         || write_permissions.contains(&"write-all")
         || write_permissions.contains(&"id-token")
+        || has_noncanonical_permissions_declaration(workflow)
     {
         bail!("{name} enables a forbidden trigger or broad credential");
     }
@@ -705,6 +706,19 @@ fn write_permission_scopes(workflow: &str) -> Vec<&str> {
         .collect::<Vec<_>>();
     scopes.sort_unstable();
     scopes
+}
+
+fn has_noncanonical_permissions_declaration(workflow: &str) -> bool {
+    workflow.lines().any(|line| {
+        let code = line.split('#').next().unwrap_or_default().trim();
+        let Some((key, value)) = code.split_once(':') else {
+            return false;
+        };
+        let key = key.trim();
+        let normalized_key = key.trim_matches(|character| matches!(character, '"' | '\''));
+        normalized_key == "permissions"
+            && (key != "permissions" || !matches!(value.trim(), "" | "{}"))
+    })
 }
 
 fn contains_expression_context(workflow: &str, context: &str) -> bool {
@@ -11719,6 +11733,21 @@ mod tests {
         assert!(
             verify_workflow_policy_text("ci.yml", &broad, &pins, &mut BTreeSet::new()).is_err()
         );
+
+        for inline_permissions in [
+            "    permissions: { contents: write }\n",
+            "    \"permissions\": { contents: write }\n",
+        ] {
+            let inline_write = ci.replacen(
+                "  rust:\n    runs-on:",
+                &format!("  rust:\n{inline_permissions}    runs-on:"),
+                1,
+            );
+            assert!(
+                verify_workflow_policy_text("ci.yml", &inline_write, &pins, &mut BTreeSet::new(),)
+                    .is_err()
+            );
+        }
 
         for expression in [
             "${{ secrets.RELEASE_TOKEN }}",
