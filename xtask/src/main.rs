@@ -1470,7 +1470,7 @@ fn verify_local_markdown_links(root: &Path, source: &str, content: &str) -> Resu
     let mut remainder = content;
     while let Some(label_end) = remainder.find("](") {
         remainder = &remainder[label_end + 2..];
-        let Some(target_end) = remainder.find(')') else {
+        let Some(target_end) = markdown_link_target_end(remainder) else {
             bail!("public community document {source} contains an unterminated Markdown link");
         };
         let target = remainder[..target_end].trim();
@@ -1494,6 +1494,29 @@ fn verify_local_markdown_links(root: &Path, source: &str, content: &str) -> Resu
         }
     }
     Ok(())
+}
+
+fn markdown_link_target_end(input: &str) -> Option<usize> {
+    let mut depth = 1_usize;
+    let mut escaped = false;
+    for (offset, character) in input.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match character {
+            '\\' => escaped = true,
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(offset);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn quoted_assignment(source: &str, name: &str) -> Option<String> {
@@ -11593,8 +11616,8 @@ mod tests {
         rust_backend_from_handshake, rustc_source_identity, stable_release_baseline_digest,
         validate_bounded_query_package_smoke, validate_cross_language_package_smoke,
         verify_checksum_sidecar, verify_cross_language_package_smoke,
-        verify_github_actions_security, verify_packaged_cross_language,
-        verify_pinned_rust_sysroot_digest, verify_project_metadata,
+        verify_github_actions_security, verify_local_markdown_links,
+        verify_packaged_cross_language, verify_pinned_rust_sysroot_digest, verify_project_metadata,
         verify_public_community_surface, verify_release_tag_values,
         verify_rust_analyzer_dependencies, verify_rust_backend, verify_security_disclosure_dry_run,
         verify_stable_release_source_guard, verify_web_semantic_attestation,
@@ -11690,6 +11713,26 @@ mod tests {
         tampered["fork_secret_access"] = json!(false);
         tampered["unknown"] = json!(true);
         assert!(verify_security_disclosure_dry_run(&serde_json::to_vec(&tampered)?).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn local_markdown_links_allow_balanced_parentheses_and_reject_unterminated_targets()
+    -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().canonicalize()?;
+        fs::create_dir_all(root.join("guides"))?;
+        fs::write(root.join("guides/setup_(safe).md"), b"# Safe setup\n")?;
+
+        verify_local_markdown_links(
+            &root,
+            "README.md",
+            "[Safe setup](guides/setup_(safe).md#install)",
+        )?;
+        assert!(
+            verify_local_markdown_links(&root, "README.md", "[Broken](guides/setup_(safe).md")
+                .is_err()
+        );
         Ok(())
     }
 
