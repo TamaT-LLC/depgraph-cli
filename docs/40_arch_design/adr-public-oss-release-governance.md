@@ -532,6 +532,11 @@ canonical attestation from distinct producer and approver teams, preventing a
 boolean assertion, self-approval, or attestation reuse from authorizing the
 rehearsal. The anonymous smoke digest is recomputed over all eight closed
 surface results, preventing an unrelated digest from authorizing write reopen.
+Every checkpoint also carries phase-specific, repository-bound redacted
+evidence under a build-defined verifier identity. Its digest is recomputed
+over the phase, outcome, and complete evidence object, and every checkpoint is
+bound to the target attestation. Write reopening additionally binds the
+settings-verification checkpoint and anonymous smoke digests.
 
 ### Gate 9: incident readiness
 

@@ -20,6 +20,13 @@ different security reviewer approve one canonical target attestation that
 binds both repository digests and both plan/features digests. An arbitrary
 digest, self-approval, or an attestation reused for another temporary
 repository is a no-go.
+Each checkpoint carries a closed, redacted evidence object with its
+phase-specific evidence kind, temporary-repository digest, sorted artifact
+digests, and the build-defined checkpoint verifier identity. Every checkpoint
+includes the target-attestation digest. The evaluator recomputes the canonical
+checkpoint digest over the phase, outcome, and complete evidence object; an
+arbitrary digest, wrong evidence kind, different repository, modified
+verifier, or unbound target attestation is a deterministic no-go.
 Raw tokens, webhook URLs, deploy keys, credentials, repository names, and
 private settings exports never enter the report.
 
@@ -88,6 +95,10 @@ The versioned input schema is
 `schemas/public-migration-rehearsal-input-v1.schema.json`.
 The evaluator preserves checkpoint phase order and SHA-256 evidence digests,
 hashes the temporary repository identifier, and emits a canonical report.
+A `run_anonymous_smoke` checkpoint must contain the recomputed anonymous smoke
+digest. A `reopen_writes` checkpoint must contain both that smoke digest and
+the canonical `verify_desired_settings` checkpoint digest, so write reopening
+cannot be detached from either prerequisite.
 A failure report names the first deterministic no-go phase, keeps writes
 frozen, marks containment active, and states whether cleanup is completed or
 still required.

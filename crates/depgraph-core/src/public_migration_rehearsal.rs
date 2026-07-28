@@ -1,7 +1,9 @@
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::{PublicReadinessDecision, canonical_public_readiness_digest};
+use crate::{
+    PublicReadinessDecision, PublicReadinessToolIdentity, canonical_public_readiness_digest,
+};
 
 pub const PUBLIC_MIGRATION_REHEARSAL_INPUT_SCHEMA_VERSION: &str =
     "public-migration-rehearsal-input-v1";
@@ -9,6 +11,9 @@ pub const PUBLIC_MIGRATION_REHEARSAL_REPORT_SCHEMA_VERSION: &str =
     "public-migration-rehearsal-report-v1";
 pub const PUBLIC_MIGRATION_REHEARSAL_MODE: &str = "temporary-repository-no-production-actuator";
 pub const PUBLIC_MIGRATION_PRODUCTION_REPOSITORY: &str = "TamaT-LLC/depgraph-cli";
+pub const PUBLIC_MIGRATION_CHECKPOINT_VERIFIER_NAME: &str =
+    "depgraph-public-migration-checkpoint-verifier";
+pub const PUBLIC_MIGRATION_CHECKPOINT_VERIFIER_VERSION: &str = "1.0.0";
 
 pub const PUBLIC_MIGRATION_PHASES: [PublicMigrationPhase; 10] = [
     PublicMigrationPhase::VerifyTemporaryTarget,
@@ -45,11 +50,55 @@ pub enum PublicMigrationStepOutcome {
     Fail,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicMigrationEvidenceKind {
+    TargetAttestation,
+    BackupAndSettingsSnapshot,
+    WriteFreezeAudit,
+    VisibilityObservation,
+    RulesetSnapshot,
+    SecuritySnapshot,
+    DesiredSettingsEvaluation,
+    AnonymousSmokeReport,
+    WriteReopenAudit,
+    CleanupAttestation,
+}
+
+impl PublicMigrationPhase {
+    fn evidence_kind(self) -> PublicMigrationEvidenceKind {
+        match self {
+            Self::VerifyTemporaryTarget => PublicMigrationEvidenceKind::TargetAttestation,
+            Self::CaptureBackupAndSettings => {
+                PublicMigrationEvidenceKind::BackupAndSettingsSnapshot
+            }
+            Self::FreezeWrites => PublicMigrationEvidenceKind::WriteFreezeAudit,
+            Self::ChangeVisibility => PublicMigrationEvidenceKind::VisibilityObservation,
+            Self::RestoreRulesets => PublicMigrationEvidenceKind::RulesetSnapshot,
+            Self::EnableSecurity => PublicMigrationEvidenceKind::SecuritySnapshot,
+            Self::VerifyDesiredSettings => PublicMigrationEvidenceKind::DesiredSettingsEvaluation,
+            Self::RunAnonymousSmoke => PublicMigrationEvidenceKind::AnonymousSmokeReport,
+            Self::ReopenWrites => PublicMigrationEvidenceKind::WriteReopenAudit,
+            Self::CleanupTemporaryRepository => PublicMigrationEvidenceKind::CleanupAttestation,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublicMigrationCheckpointEvidence {
+    pub kind: PublicMigrationEvidenceKind,
+    pub subject_repository_digest: String,
+    pub artifact_digests: Vec<String>,
+    pub verifier: PublicReadinessToolIdentity,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PublicMigrationStep {
     pub phase: PublicMigrationPhase,
     pub outcome: PublicMigrationStepOutcome,
+    pub evidence: PublicMigrationCheckpointEvidence,
     pub evidence_digest: String,
 }
 
@@ -111,6 +160,7 @@ pub struct PublicMigrationRehearsalInput {
 pub enum PublicMigrationNoGoReason {
     ActivityAfterNoGo,
     AnonymousSmokeFailed,
+    CheckpointEvidenceMismatch,
     CleanupIncomplete,
     PlanFeaturesMismatch,
     ProductionTargetRejected,
@@ -173,6 +223,8 @@ pub fn evaluate_public_migration_rehearsal(
     input: &PublicMigrationRehearsalInput,
 ) -> Result<PublicMigrationRehearsalReport> {
     validate_input_contract(input)?;
+    let temporary_repository_digest =
+        canonical_public_readiness_digest(&input.temporary_repository)?;
     let anonymous_smoke_valid = public_migration_anonymous_smoke_digest(&input.anonymous_smoke)?
         == input.anonymous_smoke.evidence_digest;
 
@@ -229,9 +281,14 @@ pub fn evaluate_public_migration_rehearsal(
             if step.phase == PublicMigrationPhase::CleanupTemporaryRepository
                 && step.outcome == PublicMigrationStepOutcome::Pass
                 && !containment_cleanup_seen
+                && checkpoint_evidence_matches(input, step, &temporary_repository_digest)?
             {
                 cleanup_completed = true;
                 containment_cleanup_seen = true;
+            } else if step.phase == PublicMigrationPhase::CleanupTemporaryRepository
+                && !checkpoint_evidence_matches(input, step, &temporary_repository_digest)?
+            {
+                reasons.push(PublicMigrationNoGoReason::CheckpointEvidenceMismatch);
             } else {
                 reasons.push(PublicMigrationNoGoReason::ActivityAfterNoGo);
             }
@@ -255,6 +312,16 @@ pub fn evaluate_public_migration_rehearsal(
                 &mut stopped,
                 expected_phase,
                 PublicMigrationNoGoReason::StepOutOfOrder,
+            );
+            continue;
+        }
+        if !checkpoint_evidence_matches(input, step, &temporary_repository_digest)? {
+            reject_at(
+                &mut reasons,
+                &mut no_go_phase,
+                &mut stopped,
+                step.phase,
+                PublicMigrationNoGoReason::CheckpointEvidenceMismatch,
             );
             continue;
         }
@@ -313,9 +380,7 @@ pub fn evaluate_public_migration_rehearsal(
     Ok(PublicMigrationRehearsalReport {
         schema_version: PUBLIC_MIGRATION_REHEARSAL_REPORT_SCHEMA_VERSION.into(),
         harness_mode: PUBLIC_MIGRATION_REHEARSAL_MODE.into(),
-        temporary_repository_digest: canonical_public_readiness_digest(
-            &input.temporary_repository,
-        )?,
+        temporary_repository_digest,
         plan_features_digest: input.temporary_plan_features_digest.clone(),
         phase_log: input.steps.iter().map(|step| step.phase).collect(),
         evidence: input
@@ -371,6 +436,28 @@ pub fn public_migration_anonymous_smoke_digest(
     canonical_public_readiness_digest(&value)
 }
 
+pub fn public_migration_checkpoint_evidence_digest(step: &PublicMigrationStep) -> Result<String> {
+    let mut value = serde_json::to_value(step)?;
+    value["evidence_digest"] = serde_json::Value::String(String::new());
+    canonical_public_readiness_digest(&value)
+}
+
+pub fn public_migration_checkpoint_verifier_identity(
+    phase: PublicMigrationPhase,
+) -> Result<PublicReadinessToolIdentity> {
+    Ok(PublicReadinessToolIdentity {
+        name: PUBLIC_MIGRATION_CHECKPOINT_VERIFIER_NAME.into(),
+        version: PUBLIC_MIGRATION_CHECKPOINT_VERIFIER_VERSION.into(),
+        acquisition_digest: canonical_public_readiness_digest(
+            &"public-migration-checkpoint-verifier-v1\nredacted-evidence-only\n",
+        )?,
+        configuration_digest: canonical_public_readiness_digest(&(
+            "public-migration-checkpoint-policy-v1",
+            phase,
+        ))?,
+    })
+}
+
 fn validate_input_contract(input: &PublicMigrationRehearsalInput) -> Result<()> {
     if input.schema_version != PUBLIC_MIGRATION_REHEARSAL_INPUT_SCHEMA_VERSION
         || !valid_repository_identifier(&input.production_repository)
@@ -387,6 +474,57 @@ fn validate_input_contract(input: &PublicMigrationRehearsalInput) -> Result<()> 
         bail!("public migration rehearsal input is malformed or exceeds a bound");
     }
     Ok(())
+}
+
+fn checkpoint_evidence_matches(
+    input: &PublicMigrationRehearsalInput,
+    step: &PublicMigrationStep,
+    temporary_repository_digest: &str,
+) -> Result<bool> {
+    let evidence = &step.evidence;
+    if evidence.kind != step.phase.evidence_kind()
+        || evidence.subject_repository_digest != temporary_repository_digest
+        || evidence.artifact_digests.is_empty()
+        || evidence.artifact_digests.len() > 16
+        || evidence
+            .artifact_digests
+            .iter()
+            .any(|digest| !is_digest(digest))
+        || evidence
+            .artifact_digests
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
+        || evidence.verifier != public_migration_checkpoint_verifier_identity(step.phase)?
+        || public_migration_checkpoint_evidence_digest(step)? != step.evidence_digest
+        || !evidence
+            .artifact_digests
+            .contains(&input.target_attestation.attestation_digest)
+    {
+        return Ok(false);
+    }
+
+    let context_bound = match step.phase {
+        PublicMigrationPhase::VerifyTemporaryTarget => evidence
+            .artifact_digests
+            .contains(&input.target_attestation.attestation_digest),
+        PublicMigrationPhase::RunAnonymousSmoke => evidence
+            .artifact_digests
+            .contains(&input.anonymous_smoke.evidence_digest),
+        PublicMigrationPhase::ReopenWrites => {
+            let desired_settings_evidence = input
+                .steps
+                .iter()
+                .find(|candidate| candidate.phase == PublicMigrationPhase::VerifyDesiredSettings)
+                .map(|candidate| &candidate.evidence_digest);
+            evidence
+                .artifact_digests
+                .contains(&input.anonymous_smoke.evidence_digest)
+                && desired_settings_evidence
+                    .is_some_and(|digest| evidence.artifact_digests.contains(digest))
+        }
+        _ => true,
+    };
+    Ok(context_bound)
 }
 
 fn target_attestation_matches(input: &PublicMigrationRehearsalInput) -> Result<bool> {
@@ -458,6 +596,28 @@ mod tests {
         hex::encode(Sha256::digest(label.as_bytes()))
     }
 
+    fn checkpoint_step(
+        phase: PublicMigrationPhase,
+        outcome: PublicMigrationStepOutcome,
+        subject_repository_digest: &str,
+        mut artifact_digests: Vec<String>,
+    ) -> PublicMigrationStep {
+        artifact_digests.sort();
+        let mut step = PublicMigrationStep {
+            phase,
+            outcome,
+            evidence: PublicMigrationCheckpointEvidence {
+                kind: phase.evidence_kind(),
+                subject_repository_digest: subject_repository_digest.into(),
+                artifact_digests,
+                verifier: public_migration_checkpoint_verifier_identity(phase).unwrap(),
+            },
+            evidence_digest: String::new(),
+        };
+        step.evidence_digest = public_migration_checkpoint_evidence_digest(&step).unwrap();
+        step
+    }
+
     fn successful_input() -> PublicMigrationRehearsalInput {
         let plan_digest = digest("github-plan-and-features");
         let production_repository = PUBLIC_MIGRATION_PRODUCTION_REPOSITORY.to_string();
@@ -488,6 +648,42 @@ mod tests {
         };
         anonymous_smoke.evidence_digest =
             public_migration_anonymous_smoke_digest(&anonymous_smoke).unwrap();
+        let temporary_repository_digest =
+            canonical_public_readiness_digest(&temporary_repository).unwrap();
+        let mut steps: Vec<PublicMigrationStep> = Vec::new();
+        for phase in PUBLIC_MIGRATION_PHASES {
+            let artifact_digests = match phase {
+                PublicMigrationPhase::VerifyTemporaryTarget => {
+                    vec![target_attestation.attestation_digest.clone()]
+                }
+                PublicMigrationPhase::RunAnonymousSmoke => {
+                    vec![
+                        target_attestation.attestation_digest.clone(),
+                        anonymous_smoke.evidence_digest.clone(),
+                    ]
+                }
+                PublicMigrationPhase::ReopenWrites => vec![
+                    target_attestation.attestation_digest.clone(),
+                    anonymous_smoke.evidence_digest.clone(),
+                    steps
+                        .iter()
+                        .find(|step| step.phase == PublicMigrationPhase::VerifyDesiredSettings)
+                        .unwrap()
+                        .evidence_digest
+                        .clone(),
+                ],
+                _ => vec![
+                    target_attestation.attestation_digest.clone(),
+                    digest(&format!("{phase:?}-artifact")),
+                ],
+            };
+            steps.push(checkpoint_step(
+                phase,
+                PublicMigrationStepOutcome::Pass,
+                &temporary_repository_digest,
+                artifact_digests,
+            ));
+        }
         PublicMigrationRehearsalInput {
             schema_version: PUBLIC_MIGRATION_REHEARSAL_INPUT_SCHEMA_VERSION.into(),
             production_repository,
@@ -496,14 +692,7 @@ mod tests {
             production_plan_features_digest: plan_digest.clone(),
             temporary_plan_features_digest: plan_digest,
             production_visibility_unchanged: true,
-            steps: PUBLIC_MIGRATION_PHASES
-                .iter()
-                .map(|phase| PublicMigrationStep {
-                    phase: *phase,
-                    outcome: PublicMigrationStepOutcome::Pass,
-                    evidence_digest: digest(&format!("{phase:?}")),
-                })
-                .collect(),
+            steps,
             anonymous_smoke,
         }
     }
@@ -526,8 +715,60 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_evidence_is_recomputed_and_bound_to_the_attested_target() {
+        let mut arbitrary_digest = successful_input();
+        let checkpoint = arbitrary_digest
+            .steps
+            .iter_mut()
+            .find(|step| step.phase == PublicMigrationPhase::CaptureBackupAndSettings)
+            .unwrap();
+        checkpoint.evidence_digest = digest("arbitrary-valid-checkpoint-digest");
+        let report = evaluate_public_migration_rehearsal(&arbitrary_digest).unwrap();
+        assert_eq!(
+            report.no_go_phase,
+            Some(PublicMigrationPhase::CaptureBackupAndSettings)
+        );
+        assert!(
+            report
+                .no_go_reasons
+                .contains(&PublicMigrationNoGoReason::CheckpointEvidenceMismatch)
+        );
+
+        let mut detached_target = successful_input();
+        let target_digest = detached_target
+            .target_attestation
+            .attestation_digest
+            .clone();
+        let checkpoint = detached_target
+            .steps
+            .iter_mut()
+            .find(|step| step.phase == PublicMigrationPhase::RestoreRulesets)
+            .unwrap();
+        checkpoint
+            .evidence
+            .artifact_digests
+            .retain(|digest| digest != &target_digest);
+        checkpoint.evidence_digest =
+            public_migration_checkpoint_evidence_digest(checkpoint).unwrap();
+        let report = evaluate_public_migration_rehearsal(&detached_target).unwrap();
+        assert_eq!(
+            report.no_go_phase,
+            Some(PublicMigrationPhase::RestoreRulesets)
+        );
+        assert!(
+            report
+                .no_go_reasons
+                .contains(&PublicMigrationNoGoReason::CheckpointEvidenceMismatch)
+        );
+        assert_eq!(report.writes, PublicMigrationWriteDisposition::Frozen);
+    }
+
+    #[test]
     fn settings_failure_keeps_writes_frozen_and_allows_only_containment_cleanup() {
         let mut input = successful_input();
+        let temporary_repository_digest =
+            canonical_public_readiness_digest(&input.temporary_repository).unwrap();
+        let target_attestation_digest = input.target_attestation.attestation_digest.clone();
         input.steps = input
             .steps
             .into_iter()
@@ -535,14 +776,17 @@ mod tests {
             .map(|mut step| {
                 if step.phase == PublicMigrationPhase::VerifyDesiredSettings {
                     step.outcome = PublicMigrationStepOutcome::Fail;
+                    step.evidence_digest =
+                        public_migration_checkpoint_evidence_digest(&step).unwrap();
                 }
                 step
             })
-            .chain(std::iter::once(PublicMigrationStep {
-                phase: PublicMigrationPhase::CleanupTemporaryRepository,
-                outcome: PublicMigrationStepOutcome::Pass,
-                evidence_digest: digest("containment-cleanup"),
-            }))
+            .chain(std::iter::once(checkpoint_step(
+                PublicMigrationPhase::CleanupTemporaryRepository,
+                PublicMigrationStepOutcome::Pass,
+                &temporary_repository_digest,
+                vec![target_attestation_digest, digest("containment-cleanup")],
+            )))
             .collect();
         let report = evaluate_public_migration_rehearsal(&input).unwrap();
         assert_eq!(report.decision, PublicReadinessDecision::Reject);
@@ -598,7 +842,7 @@ mod tests {
         assert!(
             report
                 .no_go_reasons
-                .contains(&PublicMigrationNoGoReason::AnonymousSmokeFailed)
+                .contains(&PublicMigrationNoGoReason::CheckpointEvidenceMismatch)
         );
     }
 
@@ -665,12 +909,16 @@ mod tests {
     #[test]
     fn out_of_order_or_duplicate_activity_stops_at_one_deterministic_no_go() {
         let mut input = successful_input();
+        let temporary_repository_digest =
+            canonical_public_readiness_digest(&input.temporary_repository).unwrap();
+        let target_attestation_digest = input.target_attestation.attestation_digest.clone();
         input.steps.swap(1, 2);
-        input.steps.push(PublicMigrationStep {
-            phase: PublicMigrationPhase::CleanupTemporaryRepository,
-            outcome: PublicMigrationStepOutcome::Pass,
-            evidence_digest: digest("duplicate-cleanup"),
-        });
+        input.steps.push(checkpoint_step(
+            PublicMigrationPhase::CleanupTemporaryRepository,
+            PublicMigrationStepOutcome::Pass,
+            &temporary_repository_digest,
+            vec![target_attestation_digest, digest("duplicate-cleanup")],
+        ));
         let report = evaluate_public_migration_rehearsal(&input).unwrap();
         assert_eq!(
             report.no_go_phase,

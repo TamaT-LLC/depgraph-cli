@@ -111,12 +111,81 @@
         "cleanup_temporary_repository"
       ]
     },
+    "evidence_kind": {
+      "enum": [
+        "target_attestation",
+        "backup_and_settings_snapshot",
+        "write_freeze_audit",
+        "visibility_observation",
+        "ruleset_snapshot",
+        "security_snapshot",
+        "desired_settings_evaluation",
+        "anonymous_smoke_report",
+        "write_reopen_audit",
+        "cleanup_attestation"
+      ]
+    },
+    "tool_identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "version",
+        "acquisition_digest",
+        "configuration_digest"
+      ],
+      "properties": {
+        "name": {
+          "const": "depgraph-public-migration-checkpoint-verifier"
+        },
+        "version": {
+          "const": "1.0.0"
+        },
+        "acquisition_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "configuration_digest": {
+          "$ref": "#/$defs/digest"
+        }
+      }
+    },
+    "checkpoint_evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "subject_repository_digest",
+        "artifact_digests",
+        "verifier"
+      ],
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/evidence_kind"
+        },
+        "subject_repository_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "artifact_digests": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 16,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/digest"
+          }
+        },
+        "verifier": {
+          "$ref": "#/$defs/tool_identity"
+        }
+      }
+    },
     "step": {
       "type": "object",
       "additionalProperties": false,
       "required": [
         "phase",
         "outcome",
+        "evidence",
         "evidence_digest"
       ],
       "properties": {
@@ -128,6 +197,9 @@
             "pass",
             "fail"
           ]
+        },
+        "evidence": {
+          "$ref": "#/$defs/checkpoint_evidence"
         },
         "evidence_digest": {
           "$ref": "#/$defs/digest"
