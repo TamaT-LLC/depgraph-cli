@@ -297,7 +297,9 @@ fixture, and document assets with Rust, Go, Web, bundled-runtime, and exact
 five-target release evidence. Exact-pinned license and vulnerability policy
 identities, SBOMs, license reports, `THIRD_PARTY_LICENSES.txt`, manifests,
 archive checksums, the candidate commit, and release artifact closure are
-digest-bound. Missing assets or notices, unresolved provenance,
+digest-bound. The expected state independently binds the complete asset,
+dependency, and five-target inventories, so a valid-looking subset cannot be
+substituted and rehashed. Missing assets or notices, unresolved provenance,
 unknown/forbidden licenses, and critical/high vulnerabilities reject the gate.
 
 ### Gate 4: security and disclosure
