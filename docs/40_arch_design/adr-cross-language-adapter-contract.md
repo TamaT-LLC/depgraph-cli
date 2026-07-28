@@ -509,7 +509,7 @@ one to three engineering days of scope.
 | 8 | HTTP trace-to-operation correlation | Implemented in #198 | 2, 4 or 6; runtime trace v1 | Unique profile match is observed; ambiguous, raw-URL, and secret fixtures fail closed |
 | 9 | Rust/Go/Web static FFI declaration inventory | Implemented in #199 | 1 | Every admitted declaration is resolved/candidate/external/unresolved by target profile |
 | 10 | FFI supervised link/export evidence | Implemented in #200 | 9; build supervisor | Exact ABI/library/symbol mappings require same-profile link evidence and preserve rollback |
-| 11 | Five-target package/query/release gate | 2-3 days | 2-10 implemented capabilities | Linux/macOS/Windows archives attest adapters and pass query, determinism, tamper, SBOM, and license checks |
+| 11 | Five-target package/query/release gate | Implemented in #201 | 2-10 implemented capabilities | Linux/macOS/Windows archives attest adapters and pass query, determinism, tamper, SBOM, and license checks |
 
 Rows 2, 4, 6, and 9 may be implemented in parallel after row 1, but the
 product priority remains the listed order. Rows 3, 5, and 7 are required before

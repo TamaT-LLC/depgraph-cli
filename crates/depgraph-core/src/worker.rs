@@ -450,6 +450,8 @@ struct BundledManifest {
     core: BundledArtifact,
     schema: BundledArtifact,
     query_fixture: BundledArtifact,
+    cross_language_fixture: BundledArtifact,
+    cross_language_schemas: Vec<BundledArtifact>,
     #[serde(default)]
     runtime_artifacts: Vec<BundledArtifact>,
     #[serde(default)]
@@ -650,6 +652,56 @@ fn locate_verified_bundled_worker_for_executable(
         bail!(
             "security policy violation: bounded query fixture differs from the compiled contract"
         );
+    }
+    let cross_language_contract = crate::cross_language_release_compatibility_contract();
+    if manifest.cross_language_fixture.path != cross_language_contract.fixture_path
+        || format!("sha256:{}", manifest.cross_language_fixture.sha256)
+            != cross_language_contract.fixture_sha256
+    {
+        bail!(
+            "security policy violation: release manifest cross-language fixture identity is incompatible"
+        );
+    }
+    let cross_language_fixture = verify_bundled_artifact(
+        &release_root,
+        &manifest.cross_language_fixture,
+        "cross-language fixture",
+    )?;
+    if std::fs::read_to_string(cross_language_fixture)?
+        != crate::CROSS_LANGUAGE_RELEASE_SMOKE_FIXTURE
+    {
+        bail!(
+            "security policy violation: cross-language fixture differs from the compiled contract"
+        );
+    }
+    let declared_cross_language_schemas = manifest
+        .cross_language_schemas
+        .iter()
+        .map(|artifact| (artifact.path.as_str(), artifact))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    if declared_cross_language_schemas.len() != cross_language_contract.schemas.len()
+        || manifest.cross_language_schemas.len() != cross_language_contract.schemas.len()
+    {
+        bail!(
+            "security policy violation: release manifest cross-language schema closure is incomplete"
+        );
+    }
+    for schema in cross_language_contract.schemas {
+        let artifact = declared_cross_language_schemas
+            .get(schema.path.as_str())
+            .with_context(|| {
+                format!(
+                    "security policy violation: release manifest is missing cross-language schema {}",
+                    schema.path
+                )
+            })?;
+        if format!("sha256:{}", artifact.sha256) != schema.sha256 {
+            bail!(
+                "security policy violation: release manifest cross-language schema {} has an incompatible digest",
+                schema.path
+            );
+        }
+        verify_bundled_artifact(&release_root, artifact, "cross-language schema")?;
     }
 
     let expected_runtime_paths = WEB_RUNTIME_ARTIFACT_PATHS
@@ -6850,6 +6902,27 @@ for (const event of events) console.log(JSON.stringify(event));
             BOUNDED_QUERY_RELEASE_SMOKE_FIXTURE_PATH,
             BOUNDED_QUERY_RELEASE_SMOKE_QUERY.as_bytes(),
         )?;
+        let cross_language_fixture = write_manifest_artifact(
+            release,
+            crate::CROSS_LANGUAGE_RELEASE_SMOKE_FIXTURE_PATH,
+            crate::CROSS_LANGUAGE_RELEASE_SMOKE_FIXTURE.as_bytes(),
+        )?;
+        let cross_language_contract = crate::cross_language_release_compatibility_contract();
+        let cross_language_schemas = cross_language_contract
+            .schemas
+            .iter()
+            .map(|schema| {
+                let contents = match schema.path.as_str() {
+                    depgraph_protocol::CROSS_LANGUAGE_SCHEMA_PATH => {
+                        depgraph_protocol::CROSS_LANGUAGE_SCHEMA
+                    }
+                    crate::FFI_LINK_OBSERVATION_SCHEMA_PATH => crate::FFI_LINK_OBSERVATION_SCHEMA,
+                    "schemas/depgraph-runtime-trace-v1.schema.json" => crate::RUNTIME_TRACE_SCHEMA,
+                    path => panic!("unknown test cross-language schema {path}"),
+                };
+                write_manifest_artifact(release, &schema.path, contents.as_bytes())
+            })
+            .collect::<Result<Vec<_>>>()?;
         let apache_license =
             write_manifest_artifact(release, "LICENSE-APACHE", b"test Apache-2.0 license")?;
         let mit_license = write_manifest_artifact(release, "LICENSE-MIT", b"test MIT license")?;
@@ -6874,6 +6947,8 @@ for (const event of events) console.log(JSON.stringify(event));
                 "core": core,
                 "schema": schema,
                 "query_fixture": query_fixture,
+                "cross_language_fixture": cross_language_fixture,
+                "cross_language_schemas": cross_language_schemas,
                 "runtime_artifacts": runtime_artifacts,
                 "runtime_components": runtime_components,
                 "runtime_requirements": {"web": WEB_RUNTIME_REQUIREMENT},
@@ -8755,6 +8830,50 @@ for (const event of events) console.log(JSON.stringify(event));
                 .unwrap_err();
             assert!(
                 error.to_string().contains("bounded query")
+                    || error.to_string().contains("compatibility")
+                    || error.to_string().contains("checksum mismatch")
+                    || error.to_string().contains("failed to canonicalize"),
+                "{mutation}: {error:#}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn bundled_workers_require_the_cross_language_capability_and_artifact_closure() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        for mutation in [
+            "capability",
+            "fixture-missing",
+            "fixture-tampered",
+            "schema-missing",
+        ] {
+            let release = temp.path().join(mutation);
+            let test_release = write_test_release_manifest(&release, Vec::new(), Vec::new())?;
+            match mutation {
+                "capability" => update_test_manifest(&test_release.manifest, |manifest| {
+                    manifest["compatibility"]["cross_language"]["capabilities"]
+                        .as_array_mut()
+                        .context("test manifest has no cross-language capabilities")?
+                        .pop();
+                    Ok(())
+                })?,
+                "fixture-missing" => std::fs::remove_file(
+                    release.join(crate::CROSS_LANGUAGE_RELEASE_SMOKE_FIXTURE_PATH),
+                )?,
+                "fixture-tampered" => std::fs::write(
+                    release.join(crate::CROSS_LANGUAGE_RELEASE_SMOKE_FIXTURE_PATH),
+                    b"tampered fixture",
+                )?,
+                "schema-missing" => std::fs::remove_file(
+                    release.join(depgraph_protocol::CROSS_LANGUAGE_SCHEMA_PATH),
+                )?,
+                _ => unreachable!(),
+            }
+            let error = locate_verified_bundled_worker(AdapterKind::Go, &test_release.manifest)
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("cross-language")
                     || error.to_string().contains("compatibility")
                     || error.to_string().contains("checksum mismatch")
                     || error.to_string().contains("failed to canonicalize"),

@@ -127,6 +127,11 @@ pub const BOUNDED_QUERY_RELEASE_SMOKE_CONTRACT_VERSION: &str = "bounded-query-re
 pub const BOUNDED_QUERY_RELEASE_SMOKE_FIXTURE_PATH: &str = "queries/bounded-query-smoke-v1.query";
 pub const BOUNDED_QUERY_RELEASE_SMOKE_QUERY: &str =
     include_str!("../../../queries/bounded-query-smoke-v1.query");
+pub const CROSS_LANGUAGE_RELEASE_SMOKE_CONTRACT_VERSION: &str = "cross-language-release-smoke-v1";
+pub const CROSS_LANGUAGE_RELEASE_SMOKE_FIXTURE_PATH: &str =
+    "fixtures/cross-language-release-smoke-v1.json";
+pub const CROSS_LANGUAGE_RELEASE_SMOKE_FIXTURE: &str =
+    include_str!("../../../fixtures/cross-language-release-smoke-v1.json");
 pub use cache::build_cache_key;
 pub use cancellation::CancellationToken;
 pub use config::{Config, DaemonConfig, default_store_path, init_config};
@@ -456,6 +461,7 @@ pub struct ReleaseCompatibilityHealth {
     pub packaged_smoke_contract: String,
     pub bounded_query: BoundedQueryReleaseCompatibilityHealth,
     pub profile_selection: ProfileSelectionReleaseCompatibilityHealth,
+    pub cross_language: CrossLanguageReleaseCompatibilityHealth,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -486,6 +492,106 @@ pub struct ProfileSelectionReleaseCompatibilityHealth {
     pub automatic_schema_sha256: String,
     pub explicit_schema_path: String,
     pub explicit_schema_sha256: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CrossLanguageCapabilityHealth {
+    pub surface: String,
+    pub capability: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CrossLanguageSchemaHealth {
+    pub path: String,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CrossLanguageReleaseCompatibilityHealth {
+    pub release_smoke_contract_version: String,
+    pub contract_version: String,
+    pub completeness_version: String,
+    pub fixture_path: String,
+    pub fixture_sha256: String,
+    pub capabilities: Vec<CrossLanguageCapabilityHealth>,
+    pub schemas: Vec<CrossLanguageSchemaHealth>,
+}
+
+pub fn cross_language_release_compatibility_contract() -> CrossLanguageReleaseCompatibilityHealth {
+    use sha2::{Digest as _, Sha256};
+
+    let digest = |contents: &str| {
+        format!(
+            "sha256:{}",
+            hex::encode(Sha256::digest(contents.as_bytes()))
+        )
+    };
+    CrossLanguageReleaseCompatibilityHealth {
+        release_smoke_contract_version: CROSS_LANGUAGE_RELEASE_SMOKE_CONTRACT_VERSION.to_owned(),
+        contract_version: depgraph_protocol::CROSS_LANGUAGE_CONTRACT_VERSION.to_owned(),
+        completeness_version: depgraph_protocol::CROSS_LANGUAGE_COMPLETENESS_VERSION.to_owned(),
+        fixture_path: CROSS_LANGUAGE_RELEASE_SMOKE_FIXTURE_PATH.to_owned(),
+        fixture_sha256: digest(CROSS_LANGUAGE_RELEASE_SMOKE_FIXTURE),
+        capabilities: vec![
+            CrossLanguageCapabilityHealth {
+                surface: "common".to_owned(),
+                capability: depgraph_protocol::CROSS_LANGUAGE_CONTRACT_VERSION.to_owned(),
+            },
+            CrossLanguageCapabilityHealth {
+                surface: "ffi-link".to_owned(),
+                capability: FFI_LINK_CAPABILITY.to_owned(),
+            },
+            CrossLanguageCapabilityHealth {
+                surface: "ffi-static".to_owned(),
+                capability: FFI_CAPABILITY.to_owned(),
+            },
+            CrossLanguageCapabilityHealth {
+                surface: "graphql-mapping".to_owned(),
+                capability: GRAPHQL_REPOSITORY_MAPPING_CAPABILITY.to_owned(),
+            },
+            CrossLanguageCapabilityHealth {
+                surface: "graphql-source".to_owned(),
+                capability: GRAPHQL_CAPABILITY.to_owned(),
+            },
+            CrossLanguageCapabilityHealth {
+                surface: "http-runtime".to_owned(),
+                capability: HTTP_OPERATION_CORRELATION_VERSION.to_owned(),
+            },
+            CrossLanguageCapabilityHealth {
+                surface: "openapi-generated".to_owned(),
+                capability: OPENAPI_GENERATED_MAPPING_SCHEMA_VERSION.to_owned(),
+            },
+            CrossLanguageCapabilityHealth {
+                surface: "openapi-source".to_owned(),
+                capability: OPENAPI_CAPABILITY.to_owned(),
+            },
+            CrossLanguageCapabilityHealth {
+                surface: "protobuf-generated".to_owned(),
+                capability: PROTOBUF_GENERATED_MAPPING_SCHEMA_VERSION.to_owned(),
+            },
+            CrossLanguageCapabilityHealth {
+                surface: "protobuf-source".to_owned(),
+                capability: PROTOBUF_CAPABILITY.to_owned(),
+            },
+        ],
+        schemas: vec![
+            CrossLanguageSchemaHealth {
+                path: depgraph_protocol::CROSS_LANGUAGE_SCHEMA_PATH.to_owned(),
+                sha256: digest(depgraph_protocol::CROSS_LANGUAGE_SCHEMA),
+            },
+            CrossLanguageSchemaHealth {
+                path: FFI_LINK_OBSERVATION_SCHEMA_PATH.to_owned(),
+                sha256: digest(FFI_LINK_OBSERVATION_SCHEMA),
+            },
+            CrossLanguageSchemaHealth {
+                path: "schemas/depgraph-runtime-trace-v1.schema.json".to_owned(),
+                sha256: digest(RUNTIME_TRACE_SCHEMA),
+            },
+        ],
+    }
 }
 
 pub fn profile_selection_release_compatibility_contract()
@@ -560,6 +666,7 @@ pub fn release_compatibility_contract() -> ReleaseCompatibilityHealth {
         packaged_smoke_contract: "stable-v0.4.0-packaged-smoke-v1".to_owned(),
         bounded_query: bounded_query_release_compatibility_contract(),
         profile_selection: profile_selection_release_compatibility_contract(),
+        cross_language: cross_language_release_compatibility_contract(),
     }
 }
 
@@ -745,6 +852,8 @@ struct ReleaseManifest {
     core: ReleaseArtifact,
     schema: ReleaseArtifact,
     query_fixture: ReleaseArtifact,
+    cross_language_fixture: ReleaseArtifact,
+    cross_language_schemas: Vec<ReleaseArtifact>,
     #[serde(default)]
     runtime_artifacts: Vec<ReleaseArtifact>,
     #[serde(default)]
@@ -995,6 +1104,39 @@ fn release_health() -> Result<Option<ReleaseHealth>> {
         }))
         .collect();
     runtime_integrity.insert("bounded-query-contract".to_owned(), query_fixture_integrity);
+    let cross_language_contract = cross_language_release_compatibility_contract();
+    let cross_language_fixture_integrity = if manifest.cross_language_fixture.path
+        != cross_language_contract.fixture_path
+        || format!("sha256:{}", manifest.cross_language_fixture.sha256)
+            != cross_language_contract.fixture_sha256
+    {
+        "error: cross-language fixture identity does not match the compatibility contract"
+            .to_owned()
+    } else {
+        artifact_integrity(root, &manifest.cross_language_fixture, None)
+    };
+    runtime_integrity.insert(
+        "cross-language-contract-fixture".to_owned(),
+        cross_language_fixture_integrity,
+    );
+    let declared_cross_language_schemas = manifest
+        .cross_language_schemas
+        .iter()
+        .map(|artifact| (artifact.path.as_str(), artifact))
+        .collect::<BTreeMap<_, _>>();
+    for expected in cross_language_contract.schemas {
+        let integrity = declared_cross_language_schemas
+            .get(expected.path.as_str())
+            .filter(|artifact| format!("sha256:{}", artifact.sha256) == expected.sha256)
+            .map_or_else(
+                || "error: missing or incompatible cross-language schema".to_owned(),
+                |artifact| artifact_integrity(root, artifact, None),
+            );
+        runtime_integrity.insert(
+            format!("cross-language-schema:{}", expected.path),
+            integrity,
+        );
+    }
     for component in &manifest.runtime_components {
         let key = format!("component:{}@{}", component.name, component.version);
         let integrity = match verify_release_runtime_component(
@@ -1195,6 +1337,15 @@ mod tests {
         query_drifted.bounded_query.result_schema_version = "bounded-query-result-v2".to_owned();
         assert!(
             verify_release_compatibility(&query_drifted)
+                .unwrap_err()
+                .to_string()
+                .contains("does not match")
+        );
+
+        let mut cross_language_drifted = release_compatibility_contract();
+        cross_language_drifted.cross_language.capabilities.pop();
+        assert!(
+            verify_release_compatibility(&cross_language_drifted)
                 .unwrap_err()
                 .to_string()
                 .contains("does not match")

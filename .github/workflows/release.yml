@@ -109,6 +109,7 @@ jobs:
             dist/*.zip
             dist/*.sha256
             dist/*.query-smoke.json
+            dist/*.cross-language-smoke.json
           if-no-files-found: error
 
   verify-assets:
