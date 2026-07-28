@@ -694,7 +694,7 @@ fn write_permission_scopes(workflow: &str) -> Vec<&str> {
             let code = line.split('#').next().unwrap_or_default().trim();
             let (scope, value) = code.split_once(':')?;
             let scope = scope.trim();
-            let value = value.trim();
+            let value = yaml_scalar(value);
             if scope == "permissions" && value == "write-all" {
                 Some("write-all")
             } else if value == "write" {
@@ -706,6 +706,20 @@ fn write_permission_scopes(workflow: &str) -> Vec<&str> {
         .collect::<Vec<_>>();
     scopes.sort_unstable();
     scopes
+}
+
+fn yaml_scalar(value: &str) -> &str {
+    let value = value.trim();
+    if value.len() >= 2
+        && matches!(
+            (value.as_bytes().first(), value.as_bytes().last()),
+            (Some(b'"'), Some(b'"')) | (Some(b'\''), Some(b'\''))
+        )
+    {
+        &value[1..value.len() - 1]
+    } else {
+        value
+    }
 }
 
 fn has_noncanonical_permissions_declaration(workflow: &str) -> bool {
@@ -767,7 +781,7 @@ fn has_write_permission(line: &str) -> bool {
     code.contains("permissions:") && code.contains("write")
         || code
             .split_once(':')
-            .is_some_and(|(_, value)| value.trim() == "write")
+            .is_some_and(|(_, value)| yaml_scalar(value) == "write")
 }
 
 fn top_level_permissions(workflow: &str) -> Result<Vec<&str>> {
@@ -11793,6 +11807,21 @@ mod tests {
             .is_err()
         );
 
+        for quoted in ["\"write\"", "'write'"] {
+            let unreviewed_quoted_write = format!(
+                "name: Auxiliary\non: workflow_dispatch\npermissions: {{}}\njobs:\n  mutate:\n    permissions:\n      issues: {quoted}\n"
+            );
+            assert!(
+                verify_workflow_policy_text(
+                    "auxiliary.yml",
+                    &unreviewed_quoted_write,
+                    &pins,
+                    &mut BTreeSet::new(),
+                )
+                .is_err()
+            );
+        }
+
         let release = fs::read_to_string(root.join(".github/workflows/release.yml"))?;
         let overprivileged_release = release.replacen(
             "      contents: write",
@@ -11803,6 +11832,20 @@ mod tests {
             verify_workflow_policy_text(
                 "release.yml",
                 &overprivileged_release,
+                &pins,
+                &mut BTreeSet::new(),
+            )
+            .is_err()
+        );
+        let quoted_overprivileged_release = release.replacen(
+            "      contents: write",
+            "      contents: write\n      issues: \"write\"",
+            1,
+        );
+        assert!(
+            verify_workflow_policy_text(
+                "release.yml",
+                &quoted_overprivileged_release,
                 &pins,
                 &mut BTreeSet::new(),
             )
