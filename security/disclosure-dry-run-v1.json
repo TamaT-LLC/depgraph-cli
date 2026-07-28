@@ -1,0 +1,42 @@
+{
+  "schema_version": "security-disclosure-dry-run-v1",
+  "scenario_id": "redacted-private-report-001",
+  "candidate_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "private_route": "github-security-advisory",
+  "raw_report_retained": false,
+  "phases": [
+    {
+      "id": "private-report",
+      "owner_role": "security-maintainer",
+      "evidence_digest": "1111111111111111111111111111111111111111111111111111111111111111"
+    },
+    {
+      "id": "triage",
+      "owner_role": "security-maintainer",
+      "evidence_digest": "2222222222222222222222222222222222222222222222222222222222222222"
+    },
+    {
+      "id": "private-advisory",
+      "owner_role": "security-maintainer",
+      "evidence_digest": "3333333333333333333333333333333333333333333333333333333333333333"
+    },
+    {
+      "id": "private-fix",
+      "owner_role": "release-maintainer",
+      "evidence_digest": "4444444444444444444444444444444444444444444444444444444444444444"
+    },
+    {
+      "id": "verified-release",
+      "owner_role": "release-maintainer",
+      "evidence_digest": "5555555555555555555555555555555555555555555555555555555555555555"
+    },
+    {
+      "id": "coordinated-disclosure",
+      "owner_role": "security-maintainer",
+      "evidence_digest": "6666666666666666666666666666666666666666666666666666666666666666"
+    }
+  ],
+  "fork_secret_access": false,
+  "release_secret_access_before_verified_release": false,
+  "completed": true
+}

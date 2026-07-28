@@ -331,6 +331,15 @@ third-party Action reference.
 Evidence: security-policy digest, dry-run record, workflow inventory and
 pinning report, proposed settings manifest, and security sign-off.
 
+Issue #206 implements `github-actions-policy-v1`: all third-party Actions are
+pinned to reviewed full commit SHAs, workflow-wide permissions are read-only
+or empty, and write permission is confined to the release publisher and
+metadata-only stable-source guard. The executable policy verifier rejects
+mutable refs, pin drift, broad top-level permissions, fork secret exposure,
+and tampered disclosure exercises. The threat model and redacted
+`security-disclosure-dry-run-v1` harness cover private report, advisory, fix,
+verified release, and coordinated disclosure.
+
 ### Gate 5: governance and community
 
 - [ ] Review `README.md` for a public audience: product status, installation,
@@ -562,7 +571,7 @@ Each row is an independently reviewable one-to-three-day follow-up.
 | 2 | Closed readiness/evidence schemas and deterministic verifier | Implemented in #203 |
 | 3 | All-ref/history/collaboration secret audit tooling and redacted ledger | Implemented in #204 |
 | 4 | Dependency/license/provenance inventory and legal review package | Implemented in #205 |
-| 5 | Workflow SHA pinning, threat model, disclosure policy, and security dry run | 2-3 days |
+| 5 | Workflow SHA pinning, threat model, disclosure policy, and security dry run | Implemented in #206 |
 | 6 | Desired GitHub settings/rulesets manifest, access review, and verifier | 2-3 days |
 | 7 | Temporary-repository migration rehearsal and anonymous smoke suite | 2-3 days |
 | 8 | Candidate-bound final audit, owner decision, authorized change window, and observation | 2-3 days |

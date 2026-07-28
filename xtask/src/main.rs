@@ -473,7 +473,516 @@ fn build(release: bool) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GithubActionsPolicy {
+    schema_version: String,
+    actions: Vec<GithubActionPin>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GithubActionPin {
+    identity: String,
+    sha: String,
+    reviewed_upstream_ref: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SecurityDisclosureDryRun {
+    schema_version: String,
+    scenario_id: String,
+    candidate_digest: String,
+    private_route: String,
+    raw_report_retained: bool,
+    phases: Vec<SecurityDisclosurePhase>,
+    fork_secret_access: bool,
+    release_secret_access_before_verified_release: bool,
+    completed: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SecurityDisclosurePhase {
+    id: String,
+    owner_role: String,
+    evidence_digest: String,
+}
+
+fn verify_github_actions_security(root: &Path) -> Result<()> {
+    let policy_path = root.join(".github/actions-policy.json");
+    let policy: GithubActionsPolicy = serde_json::from_slice(&fs::read(&policy_path)?)
+        .context("GitHub Actions policy is not closed valid JSON")?;
+    if policy.schema_version != "github-actions-policy-v1" || policy.actions.is_empty() {
+        bail!("GitHub Actions policy version or action inventory is invalid");
+    }
+    let mut pins = BTreeMap::new();
+    let mut prior_identity = None;
+    for action in &policy.actions {
+        if prior_identity.is_some_and(|prior| prior >= action.identity.as_str())
+            || !valid_action_identity(&action.identity)
+            || !is_lower_hex_len(&action.sha, 40)
+            || !valid_reviewed_action_ref(&action.reviewed_upstream_ref)
+            || pins
+                .insert(action.identity.as_str(), action.sha.as_str())
+                .is_some()
+        {
+            bail!("GitHub Actions policy pins must be canonical, unique, and immutable");
+        }
+        prior_identity = Some(action.identity.as_str());
+    }
+
+    let workflow_root = root.join(".github/workflows");
+    let mut workflows = fs::read_dir(&workflow_root)?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    workflows.retain(|path| {
+        matches!(
+            path.extension().and_then(|extension| extension.to_str()),
+            Some("yml" | "yaml")
+        )
+    });
+    workflows.sort();
+    if workflows.is_empty() {
+        bail!("GitHub workflow inventory is empty");
+    }
+    let mut used_actions = BTreeSet::new();
+    for path in workflows {
+        let metadata = fs::symlink_metadata(&path)?;
+        if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+            bail!("GitHub workflow must be a regular non-symlink file");
+        }
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("GitHub workflow has a non-UTF-8 name")?;
+        let workflow = fs::read_to_string(&path)?;
+        verify_workflow_policy_text(name, &workflow, &pins, &mut used_actions)?;
+    }
+    if used_actions
+        != pins
+            .keys()
+            .map(|identity| (*identity).to_owned())
+            .collect::<BTreeSet<_>>()
+    {
+        bail!("GitHub Actions policy contains an unused or unlisted action identity");
+    }
+
+    let dry_run_bytes = fs::read(root.join("security/disclosure-dry-run-v1.json"))?;
+    verify_security_disclosure_dry_run(&dry_run_bytes)?;
+    let threat_model = fs::read_to_string(
+        root.join("docs/40_arch_design/github-actions-security-threat-model.md"),
+    )?;
+    for required in [
+        "`github-actions-policy-v1`",
+        "Pull requests, fork branches",
+        "does not interpolate the `secrets` expression",
+        "Only the final `publish` job receives job-scoped",
+        "The stable source guard handles `workflow_run` metadata without checking out",
+        "No current workflow requests `id-token: write`",
+        "`.github/actions-policy.json` is the canonical allowlist",
+        "A mutable tag or branch is never a temporary fallback.",
+        "| Fork changes a workflow to print a secret |",
+        "| `workflow_run` executes attacker code with write token |",
+    ] {
+        if !threat_model.contains(required) {
+            bail!("GitHub Actions threat model is missing {required:?}");
+        }
+    }
+    Ok(())
+}
+
+fn verify_workflow_policy_text(
+    name: &str,
+    workflow: &str,
+    pins: &BTreeMap<&str, &str>,
+    used_actions: &mut BTreeSet<String>,
+) -> Result<()> {
+    let normalized_workflow = workflow.replace("\r\n", "\n").replace('\r', "\n");
+    let workflow = normalized_workflow.as_str();
+    let write_permissions = write_permission_scopes(workflow);
+    if workflow.contains("pull_request_target")
+        || contains_yaml_hex_escape(workflow)
+        || write_permissions.contains(&"write-all")
+        || write_permissions.contains(&"id-token")
+        || has_noncanonical_permissions_declaration(workflow)
+    {
+        bail!("{name} enables a forbidden trigger or broad credential");
+    }
+    let top_permissions = top_level_permissions(workflow)?;
+    if !matches!(top_permissions.as_slice(), [] | ["contents: read"]) {
+        bail!("{name} has broad workflow-level permissions");
+    }
+    if workflow.contains("\n  pull_request:") && contains_expression_context(workflow, "secrets") {
+        bail!("{name} exposes repository secrets to pull request execution");
+    }
+    for line in workflow.lines() {
+        let trimmed = line.trim_start();
+        let specification = trimmed
+            .strip_prefix("- uses:")
+            .or_else(|| trimmed.strip_prefix("uses:"));
+        if specification.is_none() && has_workflow_uses_key(trimmed) {
+            bail!("{name} contains a noncanonical uses key");
+        }
+        let Some(specification) = specification else {
+            continue;
+        };
+        let specification = specification
+            .split_whitespace()
+            .next()
+            .context("workflow uses entry is empty")?;
+        if specification.starts_with("./") {
+            continue;
+        }
+        let (identity, sha) = specification
+            .rsplit_once('@')
+            .context("third-party Action is missing an immutable revision")?;
+        if !is_lower_hex_len(sha, 40) || pins.get(identity) != Some(&sha) {
+            bail!("{name} uses unreviewed or mutable Action {specification}");
+        }
+        used_actions.insert(identity.to_owned());
+    }
+
+    match name {
+        "ci.yml" => {
+            if top_level_trigger_keys(workflow)? != ["pull_request", "push"]
+                || !workflow.contains("\n  pull_request:")
+                || top_permissions != ["contents: read"]
+                || contains_expression_context(workflow, "secrets")
+                || !write_permissions.is_empty()
+            {
+                bail!("CI pull requests must remain read-only and secret-free");
+            }
+        }
+        "release.yml" => {
+            let publish = workflow
+                .split_once("\n  publish:")
+                .map(|(_, publish)| publish)
+                .context("release workflow is missing the publish job")?;
+            if top_level_trigger_keys(workflow)? != ["push"]
+                || !workflow.contains("tags: [\"v*\"]")
+                || workflow.contains("\n  pull_request:")
+                || workflow.contains("\n  workflow_run:")
+                || write_permissions != ["contents"]
+                || !publish.contains("permissions:\n      contents: write")
+            {
+                bail!("release write permission must be confined to the tag-only publish job");
+            }
+        }
+        "stable-release-source-guard.yml" => {
+            if top_level_trigger_keys(workflow)? != ["workflow_run"]
+                || !workflow.contains("\n  workflow_run:")
+                || !top_permissions.is_empty()
+                || workflow.contains("actions/checkout@")
+                || contains_expression_context(workflow, "secrets")
+                || workflow.contains("run: cargo")
+                || workflow.contains("run: ./")
+                || write_permissions != ["actions", "contents"]
+                || !workflow.contains("permissions:\n      actions: write\n      contents: write")
+            {
+                bail!("stable release source guard must be metadata-only and job-scoped");
+            }
+        }
+        _ => {
+            if workflow.lines().any(has_write_permission) {
+                bail!("{name} grants an unreviewed write permission");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn contains_yaml_hex_escape(workflow: &str) -> bool {
+    let bytes = workflow.as_bytes();
+    (0..bytes.len()).any(|index| {
+        if bytes[index] != b'\\' {
+            return false;
+        }
+        let Some(kind) = bytes.get(index + 1).copied() else {
+            return false;
+        };
+        let digits = match kind {
+            b'x' => 2,
+            b'u' => 4,
+            b'U' => 8,
+            _ => return false,
+        };
+        bytes
+            .get(index + 2..index + 2 + digits)
+            .is_some_and(|hex| hex.iter().all(u8::is_ascii_hexdigit))
+    })
+}
+
+fn top_level_trigger_keys(workflow: &str) -> Result<Vec<&str>> {
+    let lines = workflow.lines().collect::<Vec<_>>();
+    let Some((index, declaration)) = lines
+        .iter()
+        .enumerate()
+        .find(|(_, line)| line.starts_with("on:"))
+    else {
+        bail!("workflow is missing an explicit trigger policy");
+    };
+    if declaration.trim() != "on:" {
+        bail!("workflow trigger declaration is malformed");
+    }
+    let mut triggers = Vec::new();
+    for line in &lines[index + 1..] {
+        if line.trim().is_empty() || line.trim_start().starts_with('#') {
+            continue;
+        }
+        if !line.starts_with("  ") {
+            break;
+        }
+        if line.starts_with("    ") {
+            continue;
+        }
+        let (trigger, _) = line
+            .trim()
+            .split_once(':')
+            .context("workflow trigger entry is malformed")?;
+        if !trigger
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+        {
+            bail!("workflow trigger key is noncanonical");
+        }
+        triggers.push(trigger);
+    }
+    triggers.sort_unstable();
+    if triggers.windows(2).any(|pair| pair[0] == pair[1]) {
+        bail!("workflow trigger policy contains a duplicate event");
+    }
+    Ok(triggers)
+}
+
+fn write_permission_scopes(workflow: &str) -> Vec<&str> {
+    let mut scopes = workflow
+        .lines()
+        .filter_map(|line| {
+            let code = line.split('#').next().unwrap_or_default().trim();
+            let (scope, value) = code.split_once(':')?;
+            let scope = scope.trim();
+            let value = yaml_scalar(value);
+            if scope == "permissions" && value == "write-all" {
+                Some("write-all")
+            } else if value == "write" {
+                Some(scope)
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    scopes.sort_unstable();
+    scopes
+}
+
+fn yaml_scalar(value: &str) -> &str {
+    let value = value.trim();
+    if value.len() >= 2
+        && matches!(
+            (value.as_bytes().first(), value.as_bytes().last()),
+            (Some(b'"'), Some(b'"')) | (Some(b'\''), Some(b'\''))
+        )
+    {
+        &value[1..value.len() - 1]
+    } else {
+        value
+    }
+}
+
+fn has_noncanonical_permissions_declaration(workflow: &str) -> bool {
+    let mut permissions_indent = None;
+    for line in workflow.lines() {
+        let code = line.split('#').next().unwrap_or_default().trim();
+        if code.is_empty() {
+            continue;
+        }
+        let indentation = line.len() - line.trim_start_matches(' ').len();
+        if let Some(block_indent) = permissions_indent {
+            if indentation > block_indent {
+                let Some((scope, value)) = code.split_once(':') else {
+                    return true;
+                };
+                if indentation != block_indent + 2
+                    || scope.trim() != scope
+                    || !scope
+                        .bytes()
+                        .all(|byte| byte.is_ascii_lowercase() || byte == b'-')
+                    || !matches!(value.trim(), "read" | "write" | "none")
+                {
+                    return true;
+                }
+                continue;
+            }
+            permissions_indent = None;
+        }
+        let Some((key, value)) = code.split_once(':') else {
+            continue;
+        };
+        let key = key.trim();
+        if key.contains('\\') && (key.starts_with('"') || key.starts_with('\'')) {
+            return true;
+        }
+        let normalized_key = key.trim_matches(|character| matches!(character, '"' | '\''));
+        if normalized_key == "permissions" {
+            if key != "permissions" || !matches!(value.trim(), "" | "{}") {
+                return true;
+            }
+            if value.trim().is_empty() {
+                permissions_indent = Some(indentation);
+            }
+        }
+    }
+    false
+}
+
+fn contains_expression_context(workflow: &str, context: &str) -> bool {
+    workflow.split("${{").skip(1).any(|suffix| {
+        suffix
+            .split_once("}}")
+            .is_some_and(|(expression, _)| contains_identifier(expression, context))
+    })
+}
+
+fn contains_identifier(expression: &str, identifier: &str) -> bool {
+    let expression = expression.as_bytes();
+    let identifier = identifier.as_bytes();
+    if identifier.is_empty() || identifier.len() > expression.len() {
+        return false;
+    }
+    (0..=expression.len() - identifier.len()).any(|index| {
+        let end = index + identifier.len();
+        if !expression[index..end].eq_ignore_ascii_case(identifier) {
+            return false;
+        }
+        let before = index
+            .checked_sub(1)
+            .and_then(|prior| expression.get(prior))
+            .copied();
+        let after = expression.get(end).copied();
+        before.is_none_or(|byte| !byte.is_ascii_alphanumeric() && byte != b'_')
+            && after.is_none_or(|byte| !byte.is_ascii_alphanumeric() && byte != b'_')
+    })
+}
+
+fn has_workflow_uses_key(line: &str) -> bool {
+    let code = line.split('#').next().unwrap_or_default();
+    ["uses", "\"uses\"", "'uses'"].iter().any(|marker| {
+        code.match_indices(marker).any(|(index, matched)| {
+            let boundary = index == 0
+                || !code.as_bytes()[index - 1].is_ascii_alphanumeric()
+                    && code.as_bytes()[index - 1] != b'_';
+            boundary && code[index + matched.len()..].trim_start().starts_with(':')
+        })
+    })
+}
+
+fn has_write_permission(line: &str) -> bool {
+    let code = line.split('#').next().unwrap_or_default().trim();
+    code.contains("permissions:") && code.contains("write")
+        || code
+            .split_once(':')
+            .is_some_and(|(_, value)| yaml_scalar(value) == "write")
+}
+
+fn top_level_permissions(workflow: &str) -> Result<Vec<&str>> {
+    let lines = workflow.lines().collect::<Vec<_>>();
+    let Some((index, declaration)) = lines
+        .iter()
+        .enumerate()
+        .find(|(_, line)| line.starts_with("permissions:"))
+    else {
+        bail!("workflow is missing an explicit top-level permissions policy");
+    };
+    if declaration.trim() == "permissions: {}" {
+        return Ok(Vec::new());
+    }
+    if declaration.trim() != "permissions:" {
+        bail!("workflow top-level permissions declaration is malformed");
+    }
+    let mut permissions = Vec::new();
+    for line in &lines[index + 1..] {
+        if line.trim().is_empty() || line.trim_start().starts_with('#') {
+            continue;
+        }
+        if !line.starts_with("  ") {
+            break;
+        }
+        if line.starts_with("    ") {
+            bail!("workflow top-level permissions nesting is malformed");
+        }
+        permissions.push(line.trim());
+    }
+    permissions.sort_unstable();
+    Ok(permissions)
+}
+
+fn verify_security_disclosure_dry_run(bytes: &[u8]) -> Result<()> {
+    let dry_run: SecurityDisclosureDryRun =
+        serde_json::from_slice(bytes).context("security disclosure dry run is malformed")?;
+    let expected_phases = [
+        ("private-report", "security-maintainer"),
+        ("triage", "security-maintainer"),
+        ("private-advisory", "security-maintainer"),
+        ("private-fix", "release-maintainer"),
+        ("verified-release", "release-maintainer"),
+        ("coordinated-disclosure", "security-maintainer"),
+    ];
+    if dry_run.schema_version != "security-disclosure-dry-run-v1"
+        || !valid_policy_token(&dry_run.scenario_id)
+        || !is_lower_hex_len(&dry_run.candidate_digest, 64)
+        || dry_run.private_route != "github-security-advisory"
+        || dry_run.raw_report_retained
+        || dry_run.fork_secret_access
+        || dry_run.release_secret_access_before_verified_release
+        || !dry_run.completed
+        || dry_run.phases.len() != expected_phases.len()
+        || dry_run
+            .phases
+            .iter()
+            .zip(expected_phases)
+            .any(|(phase, expected)| {
+                phase.id != expected.0
+                    || phase.owner_role != expected.1
+                    || !is_lower_hex_len(&phase.evidence_digest, 64)
+            })
+    {
+        bail!("security disclosure dry run is incomplete, unsafe, or noncanonical");
+    }
+    Ok(())
+}
+
+fn valid_action_identity(value: &str) -> bool {
+    let mut components = value.split('/');
+    components.next().is_some_and(valid_policy_token)
+        && components.next().is_some_and(valid_policy_token)
+        && components.next().is_none()
+}
+
+fn valid_reviewed_action_ref(value: &str) -> bool {
+    value
+        .strip_prefix('v')
+        .is_some_and(|major| !major.is_empty() && major.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+fn valid_policy_token(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+fn is_lower_hex_len(value: &str, length: usize) -> bool {
+    value.len() == length
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 fn verify_project_metadata(root: &Path) -> Result<()> {
+    verify_github_actions_security(root)?;
     let cargo_manifest = fs::read_to_string(root.join("Cargo.toml"))?;
     if !cargo_manifest
         .lines()
@@ -840,6 +1349,8 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "Developer Certificate of Origin",
         "### Gate 4: security and disclosure",
         "Pin every third-party GitHub Action to a reviewed full commit SHA.",
+        "`github-actions-policy-v1`",
+        "`security-disclosure-dry-run-v1`",
         "### Gate 5: governance and community",
         "### Gate 6: repository controls",
         "### Gate 7: release and support",
@@ -852,6 +1363,7 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "| 2 | Closed readiness/evidence schemas and deterministic verifier | Implemented in #203 |",
         "| 3 | All-ref/history/collaboration secret audit tooling and redacted ledger | Implemented in #204 |",
         "| 4 | Dependency/license/provenance inventory and legal review package | Implemented in #205 |",
+        "| 5 | Workflow SHA pinning, threat model, disclosure policy, and security dry run | Implemented in #206 |",
         "| 8 | Candidate-bound final audit, owner decision, authorized change window, and observation | 2-3 days |",
         "## Acceptance matrix",
         "| Stable release gate passes but history audit is missing |",
@@ -11238,7 +11750,7 @@ fn run(command: &mut Command) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::BTreeMap,
+        collections::{BTreeMap, BTreeSet},
         fs,
         time::{Duration, SystemTime},
     };
@@ -11249,23 +11761,25 @@ mod tests {
     use super::{
         ARCHIVE_MTIME, BENCHMARK_REPORT_SCHEMA_VERSION, BOUNDED_QUERY_PACKAGE_SMOKE_SCHEMA_VERSION,
         BoundedQueryPackageSmokeReport, CROSS_LANGUAGE_PACKAGE_SMOKE_SCHEMA_VERSION,
-        CrossLanguagePackageSmokeReport, DependencyPackage, PROJECT_LICENSE_EXPRESSION,
-        RELEASE_TARGETS, RUNTIME_COLLECTOR_CONTRACT_VERSION, RUST_SYSROOT_COMPONENT_SHA256,
-        ReleaseVerificationReport, STABLE_RELEASE_BASELINE_COMMIT, STABLE_RELEASE_BASELINE_DIGEST,
-        STABLE_RELEASE_VERSION, STABLE_UPGRADE_SOURCE_VERSION, StableReleaseDecision,
-        TYPESCRIPT_VERSION, TargetVerificationReport, VERSION, WEB_SEMANTIC_CAPABILITIES,
-        WEB_SEMANTIC_RUNTIME_ARTIFACTS, WEB_SEMANTIC_RUNTIME_COMPONENTS, WebSemanticAttestation,
-        WorkerBackend, archive_entries, cargo_runtime_packages, create_tar_archive,
-        create_zip_archive, evaluate_stable_release_gate, executable_name_for_target,
-        extract_archive, normalized_spdx_license, package_url, parse_worker_handshake,
-        release_compatibility, remove_transient_build_run_ids, rust_backend_from_handshake,
-        rustc_source_identity, stable_release_baseline_digest,
+        CrossLanguagePackageSmokeReport, DependencyPackage, GithubActionsPolicy,
+        PROJECT_LICENSE_EXPRESSION, RELEASE_TARGETS, RUNTIME_COLLECTOR_CONTRACT_VERSION,
+        RUST_SYSROOT_COMPONENT_SHA256, ReleaseVerificationReport, STABLE_RELEASE_BASELINE_COMMIT,
+        STABLE_RELEASE_BASELINE_DIGEST, STABLE_RELEASE_VERSION, STABLE_UPGRADE_SOURCE_VERSION,
+        StableReleaseDecision, TYPESCRIPT_VERSION, TargetVerificationReport, VERSION,
+        WEB_SEMANTIC_CAPABILITIES, WEB_SEMANTIC_RUNTIME_ARTIFACTS, WEB_SEMANTIC_RUNTIME_COMPONENTS,
+        WebSemanticAttestation, WorkerBackend, archive_entries, cargo_runtime_packages,
+        create_tar_archive, create_zip_archive, evaluate_stable_release_gate,
+        executable_name_for_target, extract_archive, normalized_spdx_license, package_url,
+        parse_worker_handshake, release_compatibility, remove_transient_build_run_ids,
+        rust_backend_from_handshake, rustc_source_identity, stable_release_baseline_digest,
         validate_bounded_query_package_smoke, validate_cross_language_package_smoke,
-        verify_checksum_sidecar, verify_cross_language_package_smoke, verify_local_markdown_links,
+        verify_checksum_sidecar, verify_cross_language_package_smoke,
+        verify_github_actions_security, verify_local_markdown_links,
         verify_packaged_cross_language, verify_pinned_rust_sysroot_digest, verify_project_metadata,
         verify_public_community_surface, verify_release_tag_values,
-        verify_rust_analyzer_dependencies, verify_rust_backend, verify_stable_release_source_guard,
-        verify_web_semantic_attestation, web_runtime_packages, web_semantic_from_handshake,
+        verify_rust_analyzer_dependencies, verify_rust_backend, verify_security_disclosure_dry_run,
+        verify_stable_release_source_guard, verify_web_semantic_attestation,
+        verify_workflow_policy_text, web_runtime_packages, web_semantic_from_handshake,
         without_windows_verbatim_prefix, workspace_root,
     };
 
@@ -11294,6 +11808,224 @@ mod tests {
     #[test]
     fn public_community_surface_is_closed_and_linked() -> Result<()> {
         verify_public_community_surface(&workspace_root())
+    }
+
+    #[test]
+    fn github_actions_policy_permissions_and_security_dry_run_fail_closed() -> Result<()> {
+        let root = workspace_root();
+        verify_github_actions_security(&root)?;
+        let policy: GithubActionsPolicy =
+            serde_json::from_slice(&fs::read(root.join(".github/actions-policy.json"))?)?;
+        let pins = policy
+            .actions
+            .iter()
+            .map(|action| (action.identity.as_str(), action.sha.as_str()))
+            .collect::<BTreeMap<_, _>>();
+        let ci = fs::read_to_string(root.join(".github/workflows/ci.yml"))?;
+
+        for workflow_name in ["ci.yml", "release.yml", "stable-release-source-guard.yml"] {
+            let workflow = fs::read_to_string(root.join(".github/workflows").join(workflow_name))?;
+            let crlf_workflow = workflow.replace('\n', "\r\n");
+            verify_workflow_policy_text(
+                workflow_name,
+                &crlf_workflow,
+                &pins,
+                &mut BTreeSet::new(),
+            )?;
+        }
+
+        let mutable = ci.replacen(
+            "actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
+            "actions/checkout@v4",
+            1,
+        );
+        assert!(
+            verify_workflow_policy_text("ci.yml", &mutable, &pins, &mut BTreeSet::new()).is_err()
+        );
+
+        for escaped_trigger in [
+            ci.replacen("  pull_request:", r#"  "\u0070ull_request_target":"#, 1),
+            ci.replacen("on:", r#"on: ["\u0070ull_request_target"]"#, 1),
+        ] {
+            assert!(
+                verify_workflow_policy_text(
+                    "ci.yml",
+                    &escaped_trigger,
+                    &pins,
+                    &mut BTreeSet::new(),
+                )
+                .is_err()
+            );
+        }
+
+        let escaped_secret = ci.replacen(
+            "GOTOOLCHAIN: local",
+            r#"GOTOOLCHAIN: "${{ \u0073ecrets.RELEASE_TOKEN }}""#,
+            1,
+        );
+        assert!(
+            verify_workflow_policy_text("ci.yml", &escaped_secret, &pins, &mut BTreeSet::new(),)
+                .is_err()
+        );
+
+        let inline_mutable = ci.replacen(
+            "- uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4",
+            "- { uses: actions/checkout@v4 }",
+            1,
+        );
+        assert!(
+            verify_workflow_policy_text("ci.yml", &inline_mutable, &pins, &mut BTreeSet::new(),)
+                .is_err()
+        );
+
+        let broad = ci.replacen("contents: read", "contents: write", 1);
+        assert!(
+            verify_workflow_policy_text("ci.yml", &broad, &pins, &mut BTreeSet::new()).is_err()
+        );
+
+        for inline_permissions in [
+            "    permissions: { contents: write }\n",
+            "    \"permissions\": { contents: write }\n",
+        ] {
+            let inline_write = ci.replacen(
+                "  rust:\n    runs-on:",
+                &format!("  rust:\n{inline_permissions}    runs-on:"),
+                1,
+            );
+            assert!(
+                verify_workflow_policy_text("ci.yml", &inline_write, &pins, &mut BTreeSet::new(),)
+                    .is_err()
+            );
+        }
+
+        for expression in [
+            "${{ secrets.RELEASE_TOKEN }}",
+            "${{secrets.RELEASE_TOKEN}}",
+            "${{ secrets ['RELEASE_TOKEN'] }}",
+            "${{ SeCrEtS.RELEASE_TOKEN }}",
+        ] {
+            let secret = format!("{ci}\n# {expression}\n");
+            assert!(
+                verify_workflow_policy_text("ci.yml", &secret, &pins, &mut BTreeSet::new())
+                    .is_err()
+            );
+        }
+
+        let unreviewed_write = "name: Auxiliary\non: workflow_dispatch\npermissions: {}\njobs:\n  mutate:\n    permissions:\n      issues: write\n";
+        assert!(
+            verify_workflow_policy_text(
+                "auxiliary.yml",
+                unreviewed_write,
+                &pins,
+                &mut BTreeSet::new(),
+            )
+            .is_err()
+        );
+
+        for quoted in ["\"write\"", "'write'"] {
+            let unreviewed_quoted_write = format!(
+                "name: Auxiliary\non: workflow_dispatch\npermissions: {{}}\njobs:\n  mutate:\n    permissions:\n      issues: {quoted}\n"
+            );
+            assert!(
+                verify_workflow_policy_text(
+                    "auxiliary.yml",
+                    &unreviewed_quoted_write,
+                    &pins,
+                    &mut BTreeSet::new(),
+                )
+                .is_err()
+            );
+        }
+
+        for escaped in [r#""\u0077rite""#, r#""\x77rite""#] {
+            let escaped_write = format!(
+                "name: Auxiliary\non: workflow_dispatch\npermissions: {{}}\njobs:\n  mutate:\n    permissions:\n      issues: {escaped}\n"
+            );
+            assert!(
+                verify_workflow_policy_text(
+                    "auxiliary.yml",
+                    &escaped_write,
+                    &pins,
+                    &mut BTreeSet::new(),
+                )
+                .is_err()
+            );
+        }
+
+        let escaped_permissions_key = r#"name: Auxiliary
+on: workflow_dispatch
+permissions: {}
+jobs:
+  mutate:
+    "permi\u0073sions":
+      issues: "\u0077rite"
+"#;
+        assert!(
+            verify_workflow_policy_text(
+                "auxiliary.yml",
+                escaped_permissions_key,
+                &pins,
+                &mut BTreeSet::new(),
+            )
+            .is_err()
+        );
+
+        let release = fs::read_to_string(root.join(".github/workflows/release.yml"))?;
+        let overprivileged_release = release.replacen(
+            "      contents: write",
+            "      contents: write\n      issues: write",
+            1,
+        );
+        assert!(
+            verify_workflow_policy_text(
+                "release.yml",
+                &overprivileged_release,
+                &pins,
+                &mut BTreeSet::new(),
+            )
+            .is_err()
+        );
+        let quoted_overprivileged_release = release.replacen(
+            "      contents: write",
+            "      contents: write\n      issues: \"write\"",
+            1,
+        );
+        assert!(
+            verify_workflow_policy_text(
+                "release.yml",
+                &quoted_overprivileged_release,
+                &pins,
+                &mut BTreeSet::new(),
+            )
+            .is_err()
+        );
+
+        let guard =
+            fs::read_to_string(root.join(".github/workflows/stable-release-source-guard.yml"))?;
+        let overprivileged_guard = guard.replacen(
+            "      contents: write",
+            "      contents: write\n      packages: write",
+            1,
+        );
+        assert!(
+            verify_workflow_policy_text(
+                "stable-release-source-guard.yml",
+                &overprivileged_guard,
+                &pins,
+                &mut BTreeSet::new(),
+            )
+            .is_err()
+        );
+
+        let dry_run = fs::read(root.join("security/disclosure-dry-run-v1.json"))?;
+        verify_security_disclosure_dry_run(&dry_run)?;
+        let mut tampered: Value = serde_json::from_slice(&dry_run)?;
+        tampered["fork_secret_access"] = json!(true);
+        assert!(verify_security_disclosure_dry_run(&serde_json::to_vec(&tampered)?).is_err());
+        tampered["fork_secret_access"] = json!(false);
+        tampered["unknown"] = json!(true);
+        assert!(verify_security_disclosure_dry_run(&serde_json::to_vec(&tampered)?).is_err());
+        Ok(())
     }
 
     #[test]
