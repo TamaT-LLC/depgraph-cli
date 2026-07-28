@@ -19,8 +19,9 @@ The ordinary CI workflow has only `contents: read`, never uses
 context. The verifier detects that context as an identifier regardless of
 ASCII case, expression whitespace, or dot/bracket access syntax. Flow-style or
 quoted `permissions` declarations are rejected so write scopes cannot bypass
-the canonical block scanner. Plain, single-quoted, and double-quoted permission
-values are normalized before checking for `write`. It may compile and
+the canonical block scanner. Permission scope keys and values must be
+unescaped plain scalars; quoted, escaped, folded, aliased, or nested values fail
+closed before checking for `write`. It may compile and
 test fork code, but that code receives no private-report, release, environment,
 OIDC, organization, or write-capable repository credential. CI artifacts and
 caches are untrusted inputs and cannot authorize a release.
