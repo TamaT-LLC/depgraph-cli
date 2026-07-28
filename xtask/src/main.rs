@@ -605,6 +605,7 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         fs::read_to_string(root.join("docs/40_arch_design/adr-bounded-graph-query-language.md"))?;
     let public_oss_adr =
         fs::read_to_string(root.join("docs/40_arch_design/adr-public-oss-release-governance.md"))?;
+    verify_public_community_surface(root)?;
     for required in [
         "Rust 1.93.1, Go 1.26.1, Node.js 24.18.0, and pnpm 10.33.0",
         "TypeScript/JavaScript symbol/type/import/re-export/type-use",
@@ -840,6 +841,7 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "changing back to private cannot retract clones, forks,",
         "## Maintainer, review, release, support, and contribution policy",
         "## Staged implementation",
+        "| 1 | Community/governance documents, issue forms, PR template, DCO/CLA decision | Implemented in #202 |",
         "| 8 | Candidate-bound final audit, owner decision, authorized change window, and observation | 2-3 days |",
         "## Acceptance matrix",
         "| Stable release gate passes but history audit is missing |",
@@ -967,6 +969,190 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn verify_public_community_surface(root: &Path) -> Result<()> {
+    let documents: &[(&str, &[&str])] = &[
+        (
+            "README.md",
+            &[
+                "## Project status and public collaboration",
+                "`v0.4.x` is the supported stable release line.",
+                "[SUPPORT.md](SUPPORT.md)",
+                "[CONTRIBUTING.md](CONTRIBUTING.md)",
+                "[GOVERNANCE.md](GOVERNANCE.md)",
+                "[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)",
+                "[SECURITY.md](SECURITY.md)",
+            ],
+        ),
+        (
+            "CONTRIBUTING.md",
+            &[
+                "## Developer Certificate of Origin",
+                "git commit -s",
+                "Signed-off-by",
+                "cargo xtask test",
+                "[SECURITY.md](SECURITY.md)",
+                "[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)",
+            ],
+        ),
+        (
+            "CODE_OF_CONDUCT.md",
+            &[
+                "## Scope and enforcement",
+                "private route in [SECURITY.md](SECURITY.md)",
+                "may appeal once",
+                "The appeal reviewer must not be the sole person",
+            ],
+        ),
+        (
+            "SECURITY.md",
+            &[
+                "## Supported versions",
+                "## Report a vulnerability privately",
+                "https://github.com/TamaT-LLC/depgraph-cli/security/advisories/new",
+                "Do not open a public issue",
+                "best effort and does not create a response-time SLA",
+            ],
+        ),
+        (
+            "SUPPORT.md",
+            &[
+                "best-effort basis",
+                "does not provide an SLA",
+                "latest `0.4.x` release",
+                "[SECURITY.md](SECURITY.md)",
+                "There is no automatic stale deadline",
+            ],
+        ),
+        (
+            "GOVERNANCE.md",
+            &[
+                "## Maintainer lifecycle and team boundary",
+                "`CODEOWNERS` is added only after",
+                "Personal accounts, invented team names, and",
+                "Authors do not approve their own work.",
+                "Developer Certificate of Origin",
+            ],
+        ),
+        (
+            ".github/ISSUE_TEMPLATE/config.yml",
+            &[
+                "blank_issues_enabled: false",
+                "Private vulnerability report",
+                "https://github.com/TamaT-LLC/depgraph-cli/security/advisories/new",
+                "SUPPORT.md",
+            ],
+        ),
+        (
+            ".github/ISSUE_TEMPLATE/bug_report.yml",
+            &[
+                "name: Bug report",
+                "id: reproduction",
+                "id: expected",
+                "id: actual",
+                "This is not a suspected security vulnerability.",
+            ],
+        ),
+        (
+            ".github/ISSUE_TEMPLATE/feature_request.yml",
+            &[
+                "name: Feature request",
+                "id: problem",
+                "id: proposal",
+                "id: alternatives",
+                "Security reports belong in the private",
+            ],
+        ),
+        (
+            ".github/PULL_REQUEST_TEMPLATE.md",
+            &[
+                "## Scope and compatibility",
+                "cargo xtask test",
+                "## Security and provenance",
+                "DCO `Signed-off-by`",
+                "the author is not the independent approver",
+            ],
+        ),
+    ];
+    let root = root
+        .canonicalize()
+        .with_context(|| format!("canonicalize community surface root {}", root.display()))?;
+    for (path, markers) in documents {
+        let document_path = root.join(path);
+        let content = fs::read_to_string(&document_path)
+            .with_context(|| format!("public community profile is missing {path}"))?;
+        for marker in *markers {
+            if !content.contains(marker) {
+                bail!("public community document {path} is missing marker {marker:?}");
+            }
+        }
+        for forbidden in ["TODO", "TBD", "CHANGEME", "<contact>", "@team-name"] {
+            if content.contains(forbidden) {
+                bail!("public community document {path} contains placeholder {forbidden:?}");
+            }
+        }
+        verify_local_markdown_links(&root, path, &content)?;
+    }
+    if root.join(".github/CODEOWNERS").exists() {
+        bail!(
+            "CODEOWNERS must remain absent until an organization owner attests a live assigned team"
+        );
+    }
+    Ok(())
+}
+
+fn verify_local_markdown_links(root: &Path, source: &str, content: &str) -> Result<()> {
+    let mut remainder = content;
+    while let Some(label_end) = remainder.find("](") {
+        remainder = &remainder[label_end + 2..];
+        let Some(target_end) = markdown_link_target_end(remainder) else {
+            bail!("public community document {source} contains an unterminated Markdown link");
+        };
+        let target = remainder[..target_end].trim();
+        remainder = &remainder[target_end + 1..];
+        if target.is_empty()
+            || target.starts_with('#')
+            || target.starts_with("https://")
+            || target.starts_with("http://")
+            || target.starts_with("mailto:")
+        {
+            continue;
+        }
+        let target = target.split('#').next().unwrap_or_default();
+        let source_parent = Path::new(source).parent().unwrap_or_else(|| Path::new(""));
+        let resolved = root.join(source_parent).join(target);
+        let resolved = resolved.canonicalize().with_context(|| {
+            format!("public community document {source} has broken local link {target:?}")
+        })?;
+        if !resolved.starts_with(root) || !resolved.is_file() {
+            bail!("public community document {source} has unsafe local link {target:?}");
+        }
+    }
+    Ok(())
+}
+
+fn markdown_link_target_end(input: &str) -> Option<usize> {
+    let mut depth = 1_usize;
+    let mut escaped = false;
+    for (offset, character) in input.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match character {
+            '\\' => escaped = true,
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(offset);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn quoted_assignment(source: &str, name: &str) -> Option<String> {
@@ -11065,11 +11251,12 @@ mod tests {
         release_compatibility, remove_transient_build_run_ids, rust_backend_from_handshake,
         rustc_source_identity, stable_release_baseline_digest,
         validate_bounded_query_package_smoke, validate_cross_language_package_smoke,
-        verify_checksum_sidecar, verify_cross_language_package_smoke,
+        verify_checksum_sidecar, verify_cross_language_package_smoke, verify_local_markdown_links,
         verify_packaged_cross_language, verify_pinned_rust_sysroot_digest, verify_project_metadata,
-        verify_release_tag_values, verify_rust_analyzer_dependencies, verify_rust_backend,
-        verify_stable_release_source_guard, verify_web_semantic_attestation, web_runtime_packages,
-        web_semantic_from_handshake, without_windows_verbatim_prefix, workspace_root,
+        verify_public_community_surface, verify_release_tag_values,
+        verify_rust_analyzer_dependencies, verify_rust_backend, verify_stable_release_source_guard,
+        verify_web_semantic_attestation, web_runtime_packages, web_semantic_from_handshake,
+        without_windows_verbatim_prefix, workspace_root,
     };
 
     fn release_tree() -> Result<(tempfile::TempDir, String)> {
@@ -11092,6 +11279,31 @@ mod tests {
     #[test]
     fn repository_release_metadata_is_synchronized() -> Result<()> {
         verify_project_metadata(&workspace_root())
+    }
+
+    #[test]
+    fn public_community_surface_is_closed_and_linked() -> Result<()> {
+        verify_public_community_surface(&workspace_root())
+    }
+
+    #[test]
+    fn local_markdown_links_allow_balanced_parentheses_and_reject_unterminated_targets()
+    -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().canonicalize()?;
+        fs::create_dir_all(root.join("guides"))?;
+        fs::write(root.join("guides/setup_(safe).md"), b"# Safe setup\n")?;
+
+        verify_local_markdown_links(
+            &root,
+            "README.md",
+            "[Safe setup](guides/setup_(safe).md#install)",
+        )?;
+        assert!(
+            verify_local_markdown_links(&root, "README.md", "[Broken](guides/setup_(safe).md")
+                .is_err()
+        );
+        Ok(())
     }
 
     #[test]

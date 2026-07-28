@@ -519,7 +519,7 @@ Each row is an independently reviewable one-to-three-day follow-up.
 
 | Slice | Deliverable | Estimate |
 | ---: | --- | --- |
-| 1 | Community/governance documents, issue forms, PR template, DCO/CLA decision | 2-3 days |
+| 1 | Community/governance documents, issue forms, PR template, DCO/CLA decision | Implemented in #202 |
 | 2 | Closed readiness/evidence schemas and deterministic verifier | 2-3 days |
 | 3 | All-ref/history/collaboration secret audit tooling and redacted ledger | 2-3 days |
 | 4 | Dependency/license/provenance inventory and legal review package | 2-3 days |
