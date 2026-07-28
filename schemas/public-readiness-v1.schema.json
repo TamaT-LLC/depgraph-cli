@@ -1,0 +1,352 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/TamaT-LLC/depgraph-cli/schemas/public-readiness-v1.schema.json",
+  "title": "depgraph public-readiness-v1 bundle",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "record",
+    "evidence_manifest"
+  ],
+  "properties": {
+    "record": {
+      "$ref": "#/$defs/record"
+    },
+    "evidence_manifest": {
+      "$ref": "#/$defs/evidence_manifest"
+    }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "commit": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "Z$"
+    },
+    "decision": {
+      "type": "string",
+      "enum": [
+        "allow",
+        "reject"
+      ]
+    },
+    "role": {
+      "type": "string",
+      "enum": [
+        "independent-code-reviewer",
+        "legal-provenance-reviewer",
+        "release-maintainer",
+        "repository-administrator",
+        "security-maintainer",
+        "support-triage-maintainer",
+        "tamat-llc-organization-owner"
+      ]
+    },
+    "authenticated_identity": {
+      "type": "string",
+      "pattern": "^team:[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$"
+    },
+    "gate_id": {
+      "type": "string",
+      "enum": [
+        "candidate-and-surface",
+        "governance-and-community",
+        "history-and-secrets",
+        "incident-readiness",
+        "legal-and-provenance",
+        "migration-dry-run",
+        "release-and-support",
+        "repository-controls",
+        "security-and-disclosure"
+      ]
+    },
+    "gate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "decision",
+        "evidence_digest",
+        "producer_role",
+        "producer_identity",
+        "approver_role",
+        "approver_identity"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/gate_id"
+        },
+        "decision": {
+          "$ref": "#/$defs/decision"
+        },
+        "evidence_digest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "producer_role": {
+          "$ref": "#/$defs/role"
+        },
+        "producer_identity": {
+          "$ref": "#/$defs/authenticated_identity"
+        },
+        "approver_role": {
+          "$ref": "#/$defs/role"
+        },
+        "approver_identity": {
+          "$ref": "#/$defs/authenticated_identity"
+        }
+      }
+    },
+    "approval": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "role",
+        "identity",
+        "approved_at",
+        "statement_digest"
+      ],
+      "properties": {
+        "role": {
+          "type": "string",
+          "enum": [
+            "legal-provenance-reviewer",
+            "release-maintainer",
+            "security-maintainer",
+            "tamat-llc-organization-owner"
+          ]
+        },
+        "identity": {
+          "$ref": "#/$defs/authenticated_identity"
+        },
+        "approved_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "statement_digest": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "record": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "repository",
+        "candidate_commit",
+        "audited_refs_digest",
+        "github_settings_digest",
+        "governance_tree_digest",
+        "release_gate_digest",
+        "evidence_manifest_digest",
+        "gates",
+        "decision",
+        "decided_at",
+        "accountable_role",
+        "approvals"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": "public-readiness-v1"
+        },
+        "repository": {
+          "const": "TamaT-LLC/depgraph-cli"
+        },
+        "candidate_commit": {
+          "$ref": "#/$defs/commit"
+        },
+        "audited_refs_digest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "github_settings_digest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "governance_tree_digest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "release_gate_digest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "evidence_manifest_digest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "gates": {
+          "type": "array",
+          "minItems": 9,
+          "maxItems": 9,
+          "items": {
+            "$ref": "#/$defs/gate"
+          }
+        },
+        "decision": {
+          "$ref": "#/$defs/decision"
+        },
+        "decided_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "accountable_role": {
+          "const": "tamat-llc-organization-owner"
+        },
+        "approvals": {
+          "type": "array",
+          "minItems": 4,
+          "maxItems": 4,
+          "items": {
+            "$ref": "#/$defs/approval"
+          }
+        }
+      }
+    },
+    "tool": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "version",
+        "acquisition_digest",
+        "configuration_digest"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$"
+        },
+        "version": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$"
+        },
+        "acquisition_digest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "configuration_digest": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "finding_summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "resolved",
+        "unresolved"
+      ],
+      "properties": {
+        "resolved": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "unresolved": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "gate_id",
+        "evidence_digest",
+        "input_digest",
+        "started_at",
+        "ended_at",
+        "producer_role",
+        "producer_identity",
+        "approver_role",
+        "approver_identity",
+        "tool",
+        "findings"
+      ],
+      "properties": {
+        "gate_id": {
+          "$ref": "#/$defs/gate_id"
+        },
+        "evidence_digest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "input_digest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "started_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "ended_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "producer_role": {
+          "$ref": "#/$defs/role"
+        },
+        "producer_identity": {
+          "$ref": "#/$defs/authenticated_identity"
+        },
+        "approver_role": {
+          "$ref": "#/$defs/role"
+        },
+        "approver_identity": {
+          "$ref": "#/$defs/authenticated_identity"
+        },
+        "tool": {
+          "$ref": "#/$defs/tool"
+        },
+        "findings": {
+          "$ref": "#/$defs/finding_summary"
+        }
+      }
+    },
+    "evidence_manifest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "repository",
+        "candidate_commit",
+        "audited_refs_digest",
+        "github_settings_digest",
+        "governance_tree_digest",
+        "release_gate_digest",
+        "generated_at",
+        "evidence"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": "public-readiness-evidence-v1"
+        },
+        "repository": {
+          "const": "TamaT-LLC/depgraph-cli"
+        },
+        "candidate_commit": {
+          "$ref": "#/$defs/commit"
+        },
+        "audited_refs_digest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "github_settings_digest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "governance_tree_digest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "release_gate_digest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "generated_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "evidence": {
+          "type": "array",
+          "minItems": 9,
+          "maxItems": 9,
+          "items": {
+            "$ref": "#/$defs/evidence"
+          }
+        }
+      }
+    }
+  }
+}

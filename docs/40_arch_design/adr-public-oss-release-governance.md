@@ -101,11 +101,14 @@ Roles are organization assignments, not personal names in this ADR.
 | Support/triage maintainer | support scope, issue/PR triage, moderation and response expectations | no |
 
 The organization owner assigns at least one active person or organization team
-to every role before the candidate freeze. One person may hold several roles,
-but every mandatory gate needs a producer and a different approver. The final
-visibility action requires the organization owner plus the recorded security,
-legal, and release sign-offs. Credentials and team membership use least
-privilege and are reviewed at least quarterly and when a maintainer leaves.
+to every role before the candidate freeze. A person may hold several
+day-to-day roles, but one readiness bundle must record different authenticated
+organization identities for evidence production, gate approval, and each final
+approval. An identity used in one of those responsibility classes cannot
+satisfy another class in the same bundle. The final visibility action requires
+the organization owner plus the recorded security, legal, and release
+sign-offs. Credentials and team membership use least privilege and are
+reviewed at least quarterly and when a maintainer leaves.
 
 ## Decision record
 
@@ -127,7 +130,9 @@ The canonical JSON record has this closed top-level shape:
       "decision": "allow",
       "evidence_digest": "<64 lowercase hex>",
       "producer_role": "repository-administrator",
-      "approver_role": "security-maintainer"
+      "producer_identity": "team:readiness-producers",
+      "approver_role": "security-maintainer",
+      "approver_identity": "team:readiness-gate-reviewers"
     }
   ],
   "decision": "allow",
@@ -148,19 +153,21 @@ The complete record contains exactly one gate entry for each mandatory gate,
 sorted by gate ID:
 
 1. `candidate-and-surface`;
-2. `history-and-secrets`;
-3. `legal-and-provenance`;
-4. `security-and-disclosure`;
-5. `governance-and-community`;
-6. `repository-controls`;
+2. `governance-and-community`;
+3. `history-and-secrets`;
+4. `incident-readiness`;
+5. `legal-and-provenance`;
+6. `migration-dry-run`;
 7. `release-and-support`;
-8. `migration-dry-run`;
-9. `incident-readiness`.
+8. `repository-controls`;
+9. `security-and-disclosure`.
 
-Each digest is SHA-256 over canonical bytes described by the evidence
-manifest. Tool name, exact version, acquisition digest, configuration digest,
-start/end time, input ref set, findings, remediation link, producer role, and
-approver role are evidence, not unstructured comments. Raw secrets, scanner
+Each evidence digest is SHA-256 over the canonical evidence object with its
+`evidence_digest` member omitted. The verifier recomputes it instead of
+trusting a caller-supplied digest. Tool name, exact version, acquisition
+digest, configuration digest, start/end time, input ref set, findings,
+producer role and authenticated identity, and approver role and authenticated
+identity are evidence, not unstructured comments. Raw secrets, scanner
 matches, personal contact data, access tokens, and absolute workstation paths
 must not enter the record or its public artifacts.
 
@@ -171,6 +178,14 @@ unknown, stale, unsigned, or malformed field is `reject`.
 
 The readiness record is evidence, not an actuator. No workflow, bot, or CLI
 may change repository visibility merely because a record says `allow`.
+
+The closed record/evidence bundle is defined by
+[`schemas/public-readiness-v1.schema.json`](../../schemas/public-readiness-v1.schema.json).
+The core verifier canonicalizes both documents, binds every gate evidence
+entry to the exact candidate/ref/settings/governance/release state, recomputes
+canonical evidence digests, verifies independent authenticated identities and
+role approvals, and emits only the deterministic
+`evidence-only-no-visibility-actuator` decision.
 
 ## Executable pre-publication checklist
 
@@ -520,7 +535,7 @@ Each row is an independently reviewable one-to-three-day follow-up.
 | Slice | Deliverable | Estimate |
 | ---: | --- | --- |
 | 1 | Community/governance documents, issue forms, PR template, DCO/CLA decision | Implemented in #202 |
-| 2 | Closed readiness/evidence schemas and deterministic verifier | 2-3 days |
+| 2 | Closed readiness/evidence schemas and deterministic verifier | Implemented in #203 |
 | 3 | All-ref/history/collaboration secret audit tooling and redacted ledger | 2-3 days |
 | 4 | Dependency/license/provenance inventory and legal review package | 2-3 days |
 | 5 | Workflow SHA pinning, threat model, disclosure policy, and security dry run | 2-3 days |
