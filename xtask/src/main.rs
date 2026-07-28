@@ -725,16 +725,49 @@ fn yaml_scalar(value: &str) -> &str {
 }
 
 fn has_noncanonical_permissions_declaration(workflow: &str) -> bool {
-    workflow.lines().any(|line| {
+    let mut permissions_indent = None;
+    for line in workflow.lines() {
         let code = line.split('#').next().unwrap_or_default().trim();
+        if code.is_empty() {
+            continue;
+        }
+        let indentation = line.len() - line.trim_start_matches(' ').len();
+        if let Some(block_indent) = permissions_indent {
+            if indentation > block_indent {
+                let Some((scope, value)) = code.split_once(':') else {
+                    return true;
+                };
+                if indentation != block_indent + 2
+                    || scope.trim() != scope
+                    || !scope
+                        .bytes()
+                        .all(|byte| byte.is_ascii_lowercase() || byte == b'-')
+                    || !matches!(value.trim(), "read" | "write" | "none")
+                {
+                    return true;
+                }
+                continue;
+            }
+            permissions_indent = None;
+        }
         let Some((key, value)) = code.split_once(':') else {
-            return false;
+            continue;
         };
         let key = key.trim();
+        if key.contains('\\') && (key.starts_with('"') || key.starts_with('\'')) {
+            return true;
+        }
         let normalized_key = key.trim_matches(|character| matches!(character, '"' | '\''));
-        normalized_key == "permissions"
-            && (key != "permissions" || !matches!(value.trim(), "" | "{}"))
-    })
+        if normalized_key == "permissions" {
+            if key != "permissions" || !matches!(value.trim(), "" | "{}") {
+                return true;
+            }
+            if value.trim().is_empty() {
+                permissions_indent = Some(indentation);
+            }
+        }
+    }
+    false
 }
 
 fn contains_expression_context(workflow: &str, context: &str) -> bool {
@@ -11834,6 +11867,39 @@ mod tests {
                 .is_err()
             );
         }
+
+        for escaped in [r#""\u0077rite""#, r#""\x77rite""#] {
+            let escaped_write = format!(
+                "name: Auxiliary\non: workflow_dispatch\npermissions: {{}}\njobs:\n  mutate:\n    permissions:\n      issues: {escaped}\n"
+            );
+            assert!(
+                verify_workflow_policy_text(
+                    "auxiliary.yml",
+                    &escaped_write,
+                    &pins,
+                    &mut BTreeSet::new(),
+                )
+                .is_err()
+            );
+        }
+
+        let escaped_permissions_key = r#"name: Auxiliary
+on: workflow_dispatch
+permissions: {}
+jobs:
+  mutate:
+    "permi\u0073sions":
+      issues: "\u0077rite"
+"#;
+        assert!(
+            verify_workflow_policy_text(
+                "auxiliary.yml",
+                escaped_permissions_key,
+                &pins,
+                &mut BTreeSet::new(),
+            )
+            .is_err()
+        );
 
         let release = fs::read_to_string(root.join(".github/workflows/release.yml"))?;
         let overprivileged_release = release.replacen(
