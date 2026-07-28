@@ -143,6 +143,12 @@ pub struct PublicAuditRemediationAttestation {
     pub finding_id: String,
     pub credential_action: PublicAuditCredentialAction,
     pub purge_action: PublicAuditPurgeAction,
+    pub initial_evidence_digest: String,
+    pub fresh_mirror_evidence_digest: String,
+    pub credential_action_evidence_digest: String,
+    pub purge_evidence_digest: String,
+    pub producer_identity: String,
+    pub approver_identity: String,
     pub attestation_digest: String,
 }
 
@@ -271,9 +277,18 @@ pub fn finalize_public_history_audit(
         .map(|attestation| (attestation.finding_id.as_str(), attestation))
         .collect::<BTreeMap<_, _>>();
     if attestation_by_finding.len() != attestations.len()
-        || attestations
-            .iter()
-            .any(|attestation| !is_digest(&attestation.attestation_digest))
+        || attestations.iter().any(|attestation| {
+            attestation.initial_evidence_digest != initial.evidence_digest
+                || attestation.fresh_mirror_evidence_digest != fresh_mirror.evidence_digest
+                || !is_digest(&attestation.credential_action_evidence_digest)
+                || !is_digest(&attestation.purge_evidence_digest)
+                || !valid_team_identity(&attestation.producer_identity)
+                || !valid_team_identity(&attestation.approver_identity)
+                || attestation.producer_identity == attestation.approver_identity
+                || !is_digest(&attestation.attestation_digest)
+                || public_audit_remediation_attestation_digest(attestation)
+                    .map_or(true, |digest| digest != attestation.attestation_digest)
+        })
     {
         bail!("public audit remediation attestations are duplicate or malformed");
     }
@@ -286,6 +301,18 @@ pub fn finalize_public_history_audit(
     for finding in &mut findings {
         let attestation = attestation_by_finding.get(finding.id.as_str());
         if let Some(attestation) = attestation {
+            let action_matches_finding = if finding.credential {
+                matches!(
+                    attestation.credential_action,
+                    PublicAuditCredentialAction::Rotated | PublicAuditCredentialAction::Revoked
+                )
+            } else {
+                attestation.credential_action == PublicAuditCredentialAction::NotCredential
+            };
+            if !action_matches_finding || attestation.purge_action != PublicAuditPurgeAction::Purged
+            {
+                bail!("public audit remediation action does not close its finding");
+            }
             finding.credential_action = attestation.credential_action;
             finding.purge_action = attestation.purge_action;
             finding.remediation_attestation_digest = Some(attestation.attestation_digest.clone());
@@ -372,6 +399,14 @@ pub fn finalize_public_history_audit(
     };
     finalized.evidence_digest = finalized_digest(&finalized)?;
     Ok(finalized)
+}
+
+pub fn public_audit_remediation_attestation_digest(
+    attestation: &PublicAuditRemediationAttestation,
+) -> Result<String> {
+    let mut value = serde_json::to_value(attestation)?;
+    value["attestation_digest"] = json!("");
+    Ok(digest_bytes(canonical_json(&value).as_bytes()))
 }
 
 fn validate_input(input: &PublicHistoryAuditInput) -> Result<()> {
@@ -535,6 +570,16 @@ fn is_digest(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+fn valid_team_identity(value: &str) -> bool {
+    value.strip_prefix("team:").is_some_and(|slug| {
+        !slug.is_empty()
+            && slug.len() <= 64
+            && slug.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'+')
+            })
+    })
+}
+
 fn valid_ref_name(value: &str) -> bool {
     [
         "refs/heads/",
@@ -582,6 +627,8 @@ fn scan_patterns(content: &[u8]) -> Vec<(&'static str, bool)> {
     let mut findings = BTreeSet::new();
     if text.contains("-----BEGIN PRIVATE KEY-----")
         || text.contains("-----BEGIN RSA PRIVATE KEY-----")
+        || text.contains("-----BEGIN EC PRIVATE KEY-----")
+        || text.contains("-----BEGIN OPENSSH PRIVATE KEY-----")
     {
         findings.insert(("pem-private-key-v1", true));
     }
@@ -630,25 +677,36 @@ fn contains_credential_assignment(lower: &str) -> bool {
     ["password", "passwd", "secret", "token", "api_key", "apikey"]
         .iter()
         .any(|key| {
-            ["=", ":"].iter().any(|separator| {
-                let needle = format!("{key}{separator}");
-                lower.match_indices(&needle).any(|(index, _)| {
-                    let value = lower[index + needle.len()..]
-                        .trim_start_matches(|character: char| {
-                            character.is_ascii_whitespace() || matches!(character, '"' | '\'' | '`')
-                        })
-                        .split(|character: char| {
-                            character.is_ascii_whitespace()
-                                || matches!(character, '"' | '\'' | '`' | ',' | ';')
-                        })
-                        .next()
-                        .unwrap_or_default();
-                    value.len() >= 8
-                        && !matches!(
-                            value,
-                            "redacted" | "not-required" | "unavailable" | "placeholder"
-                        )
-                })
+            lower.match_indices(key).any(|(index, _)| {
+                let before = &lower[..index];
+                if before
+                    .bytes()
+                    .next_back()
+                    .is_some_and(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+                {
+                    return false;
+                }
+                let after_key = &lower[index + key.len()..];
+                let after_space =
+                    after_key.trim_start_matches(|character: char| character.is_ascii_whitespace());
+                let Some(after_separator) = after_space.strip_prefix(['=', ':']) else {
+                    return false;
+                };
+                let value = after_separator
+                    .trim_start_matches(|character: char| {
+                        character.is_ascii_whitespace() || matches!(character, '"' | '\'' | '`')
+                    })
+                    .split(|character: char| {
+                        character.is_ascii_whitespace()
+                            || matches!(character, '"' | '\'' | '`' | ',' | ';')
+                    })
+                    .next()
+                    .unwrap_or_default();
+                value.len() >= 8
+                    && !matches!(
+                        value,
+                        "redacted" | "not-required" | "unavailable" | "placeholder"
+                    )
             })
         })
 }
@@ -675,7 +733,8 @@ mod tests {
 
     const COMMIT_A: &str = "0123456789abcdef0123456789abcdef01234567";
     const COMMIT_B: &str = "89abcdef0123456789abcdef0123456789abcdef";
-    const ATTESTATION: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const EVIDENCE_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const EVIDENCE_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
     fn source(kind: PublicAuditSourceKind, locator: &str, content: &str) -> PublicAuditSourceInput {
         PublicAuditSourceInput {
@@ -704,6 +763,32 @@ mod tests {
                 object_id: object_id.into(),
             },
         ]
+    }
+
+    fn remediation_attestation(
+        finding: &PublicAuditFinding,
+        initial: &PublicHistoryAuditReport,
+        fresh: &PublicHistoryAuditReport,
+    ) -> PublicAuditRemediationAttestation {
+        let mut attestation = PublicAuditRemediationAttestation {
+            finding_id: finding.id.clone(),
+            credential_action: if finding.credential {
+                PublicAuditCredentialAction::Rotated
+            } else {
+                PublicAuditCredentialAction::NotCredential
+            },
+            purge_action: PublicAuditPurgeAction::Purged,
+            initial_evidence_digest: initial.evidence_digest.clone(),
+            fresh_mirror_evidence_digest: fresh.evidence_digest.clone(),
+            credential_action_evidence_digest: EVIDENCE_A.into(),
+            purge_evidence_digest: EVIDENCE_B.into(),
+            producer_identity: "team:security-remediation".into(),
+            approver_identity: "team:security-reviewers".into(),
+            attestation_digest: String::new(),
+        };
+        attestation.attestation_digest =
+            public_audit_remediation_attestation_digest(&attestation).unwrap();
+        attestation
     }
 
     #[test]
@@ -778,12 +863,7 @@ mod tests {
         let attestations = initial
             .findings
             .iter()
-            .map(|finding| PublicAuditRemediationAttestation {
-                finding_id: finding.id.clone(),
-                credential_action: PublicAuditCredentialAction::Rotated,
-                purge_action: PublicAuditPurgeAction::Purged,
-                attestation_digest: ATTESTATION.into(),
-            })
+            .map(|finding| remediation_attestation(finding, &initial, &fresh))
             .collect::<Vec<_>>();
         let finalized = finalize_public_history_audit(&initial, &fresh, &attestations).unwrap();
         assert!(finalized.history_rewritten);
@@ -848,11 +928,87 @@ mod tests {
         initial.findings[0].state = PublicAuditFindingState::Resolved;
         initial.findings[0].credential_action = PublicAuditCredentialAction::Rotated;
         initial.findings[0].purge_action = PublicAuditPurgeAction::Purged;
-        initial.findings[0].remediation_attestation_digest = Some(ATTESTATION.into());
+        initial.findings[0].remediation_attestation_digest = Some(EVIDENCE_A.into());
         initial.unresolved_findings = 0;
         initial.unrotated_credentials = 0;
         initial.evidence_digest = report_digest(&initial).unwrap();
 
         assert!(finalize_public_history_audit(&initial, &fresh, &[]).is_err());
+    }
+
+    #[test]
+    fn remediation_attestation_is_bound_to_reports_actions_evidence_and_distinct_identities() {
+        let initial = audit_public_history(&PublicHistoryAuditInput {
+            refs: refs(COMMIT_A),
+            sources: vec![source(
+                PublicAuditSourceKind::GitBlob,
+                "objects/old-blob",
+                "password = super-sensitive-value",
+            )],
+            collection_complete: true,
+        })
+        .unwrap();
+        let fresh = audit_public_history(&PublicHistoryAuditInput {
+            refs: refs(COMMIT_B),
+            sources: Vec::new(),
+            collection_complete: true,
+        })
+        .unwrap();
+        let valid = remediation_attestation(&initial.findings[0], &initial, &fresh);
+        assert!(
+            finalize_public_history_audit(&initial, &fresh, std::slice::from_ref(&valid)).is_ok()
+        );
+
+        let mut arbitrary_digest = valid.clone();
+        arbitrary_digest.attestation_digest = EVIDENCE_A.into();
+        assert!(finalize_public_history_audit(&initial, &fresh, &[arbitrary_digest]).is_err());
+
+        let mut reused_for_another_scan = valid.clone();
+        reused_for_another_scan.fresh_mirror_evidence_digest = EVIDENCE_A.into();
+        reused_for_another_scan.attestation_digest =
+            public_audit_remediation_attestation_digest(&reused_for_another_scan).unwrap();
+        assert!(
+            finalize_public_history_audit(&initial, &fresh, &[reused_for_another_scan]).is_err()
+        );
+
+        let mut self_approved = valid;
+        self_approved.approver_identity = self_approved.producer_identity.clone();
+        self_approved.attestation_digest =
+            public_audit_remediation_attestation_digest(&self_approved).unwrap();
+        assert!(finalize_public_history_audit(&initial, &fresh, &[self_approved]).is_err());
+    }
+
+    #[test]
+    fn scanner_detects_private_key_variants_and_spaced_assignments() {
+        for private_key in [
+            "-----BEGIN PRIVATE KEY-----",
+            "-----BEGIN RSA PRIVATE KEY-----",
+            "-----BEGIN EC PRIVATE KEY-----",
+            "-----BEGIN OPENSSH PRIVATE KEY-----",
+        ] {
+            assert!(
+                scan_patterns(private_key.as_bytes())
+                    .iter()
+                    .any(|(pattern, credential)| *pattern == "pem-private-key-v1" && *credential)
+            );
+        }
+        for assignment in [
+            "password=super-sensitive-value",
+            "password = super-sensitive-value",
+            "api_key   :   super-sensitive-value",
+        ] {
+            assert!(
+                scan_patterns(assignment.as_bytes())
+                    .iter()
+                    .any(|(pattern, credential)| {
+                        *pattern == "generic-credential-assignment-v1" && *credential
+                    })
+            );
+        }
+        assert!(
+            scan_patterns(b"not_a_password = super-sensitive-value")
+                .iter()
+                .all(|(pattern, _)| *pattern != "generic-credential-assignment-v1")
+        );
     }
 }
