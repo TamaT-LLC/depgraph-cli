@@ -314,6 +314,20 @@ struct LedgerIdentity<'a> {
     entries: &'a [RustCompilerMirUnit],
 }
 
+pub fn compiler_mir_ledger_digest(
+    attempt_digest: &str,
+    unit_graph_digest: &str,
+    invocation_ledger_digest: &str,
+    entries: &[RustCompilerMirUnit],
+) -> Result<String> {
+    digest_json(&LedgerIdentity {
+        attempt_digest,
+        unit_graph_digest,
+        invocation_ledger_digest,
+        entries,
+    })
+}
+
 pub fn compiler_mir_unit_digest(unit: &RustCompilerMirUnit) -> Result<String> {
     digest_json(&UnitIdentity {
         attempt_digest: &unit.attempt_digest,
@@ -332,6 +346,88 @@ pub fn compiler_mir_unit_digest(unit: &RustCompilerMirUnit) -> Result<String> {
         bodies: &unit.bodies,
         unsupported: &unit.unsupported,
     })
+}
+
+/// Revalidates the retained typed-MIR ledger as one complete compiler attempt.
+/// The filesystem validator below remains responsible for confined source
+/// bytes and spans; this promotion-time check repeats ledger/unit closure and
+/// immutable digests after the supervised workspace has been torn down.
+pub fn validate_compiler_mir_ledger_identity(
+    ledger: &RustCompilerMirLedger,
+    graph: &RustCargoUnitGraph,
+    invocation_ledger: &RustCompilerInvocationLedger,
+    pack: &CompilerPackAttestation,
+) -> Result<()> {
+    crate::compiler_invocation::validate_compiler_invocation_ledger_identity(
+        invocation_ledger,
+        graph,
+    )?;
+    if ledger.schema_version != COMPILER_PRECISE_MIR_LEDGER_SCHEMA_VERSION
+        || ledger.attempt_digest != invocation_ledger.attempt_digest
+        || ledger.unit_graph_digest != graph.digest
+        || ledger.invocation_ledger_digest != invocation_ledger.digest
+        || ledger.entries.len() != invocation_ledger.entries.len()
+        || !ledger
+            .entries
+            .windows(2)
+            .all(|window| window[0].unit_id < window[1].unit_id)
+    {
+        bail!("typed MIR ledger identity or coverage is invalid");
+    }
+    let units = graph
+        .units
+        .iter()
+        .map(|unit| (unit.unit_id.as_str(), unit))
+        .collect::<BTreeMap<_, _>>();
+    let invocations = invocation_ledger
+        .entries
+        .iter()
+        .map(|entry| (entry.unit_id.as_str(), entry))
+        .collect::<BTreeMap<_, _>>();
+    for unit in &ledger.entries {
+        let graph_unit = units
+            .get(unit.unit_id.as_str())
+            .context("typed MIR unit references an unknown Cargo unit")?;
+        let invocation = invocations
+            .get(unit.unit_id.as_str())
+            .context("typed MIR unit references an unknown compiler invocation")?;
+        if unit.schema_version != COMPILER_PRECISE_MIR_SCHEMA_VERSION
+            || unit.attempt_digest != ledger.attempt_digest
+            || unit.invocation_id != invocation.invocation_id
+            || unit.package_id != graph_unit.package_id
+            || unit.target_digest != digest_json(&graph_unit.target)?
+            || unit.source_path != invocation.source_path
+            || unit.source_sha256 != invocation.source_sha256
+            || unit.profile_digest != invocation.profile_digest
+            || unit.compiler_pack_manifest_sha256 != pack.manifest_sha256
+            || unit.rustc_commit != COMPILER_PACK_RUSTC_COMMIT
+            || unit.query_capabilities != ["monomorphized_call_graph", "typed_mir"]
+            || unit.digest != compiler_mir_unit_digest(unit)?
+        {
+            bail!("typed MIR unit immutable identity is invalid");
+        }
+    }
+    if ledger
+        .entries
+        .iter()
+        .map(|entry| entry.unit_id.as_str())
+        .ne(invocation_ledger
+            .entries
+            .iter()
+            .map(|entry| entry.unit_id.as_str()))
+    {
+        bail!("typed MIR ledger invocation coverage is incomplete");
+    }
+    let expected_digest = compiler_mir_ledger_digest(
+        &ledger.attempt_digest,
+        &ledger.unit_graph_digest,
+        &ledger.invocation_ledger_digest,
+        &ledger.entries,
+    )?;
+    if ledger.digest != expected_digest {
+        bail!("typed MIR ledger digest is invalid");
+    }
+    Ok(())
 }
 
 pub fn validate_compiler_mir_directory(
@@ -434,12 +530,12 @@ pub fn validate_compiler_mir_directory(
         bail!("typed MIR output has missing or extra compiler invocations");
     }
     entries.sort_by(|left, right| left.unit_id.cmp(&right.unit_id));
-    let digest = digest_json(&LedgerIdentity {
-        attempt_digest: &invocation_ledger.attempt_digest,
-        unit_graph_digest: &graph.digest,
-        invocation_ledger_digest: &invocation_ledger.digest,
-        entries: &entries,
-    })?;
+    let digest = compiler_mir_ledger_digest(
+        &invocation_ledger.attempt_digest,
+        &graph.digest,
+        &invocation_ledger.digest,
+        &entries,
+    )?;
     Ok(RustCompilerMirLedger {
         schema_version: COMPILER_PRECISE_MIR_LEDGER_SCHEMA_VERSION.to_owned(),
         digest,

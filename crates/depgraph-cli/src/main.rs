@@ -12,19 +12,19 @@ use depgraph_core::{
     CancellationToken, Config, CycleLevel, DaemonStatus, ExportFormat, GraphQueryFilter,
     ImpactFilters, ImpactResult, PolicyAnnotation, PolicyResult, QueryDiagnostic,
     QueryFailureClass, RepositoryProfilePlanPreview, ScanCacheMode, TypedProjection,
-    acquire_store_writer_lock, build_cache_key, create_build_execution_request,
-    create_compiler_precise_invocation_request, create_compiler_precise_unit_graph_request,
-    default_store_path, doctor, evaluate_policy_diff, execute_bounded_query,
-    execute_build_request_with_cancellation, export_filtered, export_graphml_filtered_to_writer,
-    impact, impact_query_cache_key, init_config, match_runtime_trace, open_store,
-    open_store_read_only, parse_and_type_check_bounded_query, plan_bounded_query,
-    plan_explicit_profile_selection, plan_repository_profiles, policy_annotations,
-    profile_selection_human_summary, read_bounded_query_file, read_compiler_pack_requirement,
-    read_explicit_profile_selection_file, read_git_changed_set, read_runtime_trace,
-    render_condition, render_github_annotations, run_scan_with_cache_mode, runtime_session_delta,
-    rust_build_protocol_ndjson, stage_build_evidence, start_repository_daemon, traverse_filtered,
-    unresolved, validate_explicit_profile_selection_capabilities, web_build_protocol_ndjson,
-    why_filtered,
+    acquire_store_writer_lock, build_cache_key, compiler_precise_graph_ndjson,
+    create_build_execution_request, create_compiler_precise_invocation_request,
+    create_compiler_precise_unit_graph_request, default_store_path, doctor, evaluate_policy_diff,
+    execute_bounded_query, execute_build_request_with_cancellation, export_filtered,
+    export_graphml_filtered_to_writer, impact, impact_query_cache_key, init_config,
+    match_runtime_trace, open_store, open_store_read_only, parse_and_type_check_bounded_query,
+    plan_bounded_query, plan_explicit_profile_selection, plan_repository_profiles,
+    policy_annotations, profile_selection_human_summary, read_bounded_query_file,
+    read_compiler_pack_requirement, read_explicit_profile_selection_file, read_git_changed_set,
+    read_runtime_trace, render_condition, render_github_annotations, run_scan_with_cache_mode,
+    runtime_session_delta, rust_build_protocol_ndjson, stage_build_evidence,
+    start_repository_daemon, traverse_filtered, unresolved,
+    validate_explicit_profile_selection_capabilities, web_build_protocol_ndjson, why_filtered,
 };
 use depgraph_protocol::canonical_json;
 use depgraph_store::{CompletedSnapshotDetails, CoverageRecord};
@@ -802,6 +802,7 @@ async fn run(cli: Cli) -> Result<u8> {
                 evidence_status = "not promoted";
                 let build_attempt_required = requires_build_attempt(
                     &outcome.audit.outcome,
+                    outcome.rust_compiler_mir_ledger.is_some(),
                     outcome.rust_compiler_invocation_ledger.is_some(),
                     outcome.rust_cargo_unit_graph.is_some(),
                 );
@@ -810,8 +811,85 @@ async fn run(cli: Cli) -> Result<u8> {
                 }
                 match outcome.audit.outcome {
                     BuildOutcomeKind::Completed => {
-                        if outcome.rust_compiler_mir_ledger.is_some() {
-                            evidence_status = "validated typed MIR DTO (not promoted)";
+                        if let Some(mir) = outcome.rust_compiler_mir_ledger.as_ref() {
+                            let snapshot = store.load_snapshot(&base_scan_id)?;
+                            let ndjson = outcome
+                                .compiler_pack_attestation
+                                .as_ref()
+                                .context(
+                                    "completed compiler-precise attempt has no pack attestation",
+                                )
+                                .and_then(|pack| {
+                                    compiler_precise_graph_ndjson(
+                                        &snapshot,
+                                        &outcome.audit,
+                                        pack,
+                                        outcome.rust_cargo_unit_graph.as_ref().context(
+                                            "completed compiler-precise attempt has no unit graph",
+                                        )?,
+                                        outcome
+                                            .rust_compiler_invocation_ledger
+                                            .as_ref()
+                                            .context(
+                                                "completed compiler-precise attempt has no invocation ledger",
+                                            )?,
+                                        mir,
+                                    )
+                                });
+                            let ndjson = match ndjson {
+                                Ok(value) => value,
+                                Err(error) => {
+                                    store.finish_build_attempt(
+                                        &outcome.audit.run_id,
+                                        "security_failed",
+                                        Some("compiler-precise-graph-correlation-failed"),
+                                        false,
+                                    )?;
+                                    anyhow::bail!(
+                                        "security policy violation: compiler-precise graph could not be correlated: {error:#}"
+                                    );
+                                }
+                            };
+                            if let Err(error) = stage_build_evidence(
+                                &mut store,
+                                &outcome.audit.run_id,
+                                Cursor::new(ndjson),
+                            ) {
+                                store.finish_build_attempt(
+                                    &outcome.audit.run_id,
+                                    "security_failed",
+                                    Some("compiler-precise-evidence-rejected"),
+                                    false,
+                                )?;
+                                anyhow::bail!(
+                                    "security policy violation: compiler-precise evidence was rejected: {error:#}"
+                                );
+                            }
+                            store.finish_build_attempt(
+                                &outcome.audit.run_id,
+                                "completed",
+                                None,
+                                true,
+                            )?;
+                            evidence_status = "promoted compiler-precise graph";
+                            if let Some(cache_key) = build_cache_key(&outcome.audit) {
+                                let snapshot_id = store
+                                    .snapshot_id_for_source("build", &outcome.audit.run_id)?
+                                    .context(
+                                        "promoted compiler-precise build did not expose its completed snapshot",
+                                    )?;
+                                let cache = store.store_snapshot_cache(
+                                    &cache_key,
+                                    &snapshot_id,
+                                    None,
+                                    Some(&outcome.audit.run_id),
+                                )?;
+                                build_cache_status = if cache.outcome == "stored" {
+                                    "stored"
+                                } else {
+                                    "rejected"
+                                };
+                            }
                         } else if outcome.rust_compiler_invocation_ledger.is_some() {
                             evidence_status = "validated compiler invocation ledger (not promoted)";
                         } else if outcome.rust_cargo_unit_graph.is_some() {
@@ -1029,6 +1107,26 @@ async fn run(cli: Cli) -> Result<u8> {
                 }
                 if let Some(scan) = report.latest_attempt {
                     println!("latest attempt: {} ({})", scan.scan_id, scan.status);
+                    if let Some(compiler) = &scan.compiler_precise {
+                        println!(
+                            "compiler precise: {} (phase={}, precision={}, {} profiles)",
+                            compiler.status,
+                            compiler.phase,
+                            compiler.precision,
+                            compiler.profiles.len()
+                        );
+                        for profile in &compiler.profiles {
+                            println!(
+                                "compiler precise profile {}: target={}, {} units, {} MIR bodies, {} instances, {} calls",
+                                profile.profile_id,
+                                profile.target.as_deref().unwrap_or("unspecified"),
+                                profile.cargo_units,
+                                profile.typed_mir_bodies,
+                                profile.compiler_instances,
+                                profile.compiler_calls,
+                            );
+                        }
+                    }
                     println!(
                         "coverage: {} sites ({} resolved, {} candidates, {} external, {} unresolved), {} skipped, {} unsupported",
                         scan.coverage.dependency_sites,
@@ -1751,10 +1849,12 @@ fn require_compiler_precise_consent(
 
 fn requires_build_attempt(
     outcome: &BuildOutcomeKind,
+    has_compiler_mir_ledger: bool,
     has_compiler_invocation_ledger: bool,
     has_cargo_unit_graph: bool,
 ) -> bool {
     !matches!(outcome, BuildOutcomeKind::Completed)
+        || has_compiler_mir_ledger
         || (!has_compiler_invocation_ledger && !has_cargo_unit_graph)
 }
 
@@ -2557,19 +2657,28 @@ mod tests {
     }
 
     #[test]
-    fn completed_compiler_audits_do_not_open_delta_attempts() {
-        assert!(!requires_build_attempt(
+    fn completed_compiler_promotion_opens_only_the_required_delta_attempt() {
+        assert!(requires_build_attempt(
             &BuildOutcomeKind::Completed,
+            true,
             true,
             true
         ));
         assert!(!requires_build_attempt(
             &BuildOutcomeKind::Completed,
             false,
+            true,
+            true
+        ));
+        assert!(!requires_build_attempt(
+            &BuildOutcomeKind::Completed,
+            false,
+            false,
             true
         ));
         assert!(requires_build_attempt(
             &BuildOutcomeKind::Completed,
+            false,
             false,
             false
         ));
@@ -2579,7 +2688,7 @@ mod tests {
             BuildOutcomeKind::Cancelled,
             BuildOutcomeKind::SecurityFailed,
         ] {
-            assert!(requires_build_attempt(&outcome, false, false));
+            assert!(requires_build_attempt(&outcome, false, false, false));
         }
     }
 

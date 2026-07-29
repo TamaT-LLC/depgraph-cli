@@ -127,6 +127,40 @@ struct InvocationIdentity<'a> {
     exit_code: i32,
 }
 
+pub fn compiler_invocation_entry_digest(entry: &RustCompilerInvocation) -> Result<String> {
+    digest_json(&InvocationIdentity {
+        unit_id: &entry.unit_id,
+        invocation_id: &entry.invocation_id,
+        crate_name: &entry.crate_name,
+        crate_types: &entry.crate_types,
+        source_path: &entry.source_path,
+        source_sha256: &entry.source_sha256,
+        profile_digest: &entry.profile_digest,
+        edition: &entry.edition,
+        target: &entry.target,
+        mode: &entry.mode,
+        features: &entry.features,
+        canonical_argv: &entry.canonical_argv,
+        argv_digest: &entry.argv_digest,
+        rustc_sha256: &entry.rustc_sha256,
+        rustc_verbose_sha256: &entry.rustc_verbose_sha256,
+        terminal_status: &entry.terminal_status,
+        exit_code: entry.exit_code,
+    })
+}
+
+pub fn compiler_invocation_ledger_digest(
+    attempt_digest: &str,
+    unit_graph_digest: &str,
+    entries: &[RustCompilerInvocation],
+) -> Result<String> {
+    digest_json(&LedgerIdentity {
+        attempt_digest,
+        unit_graph_digest,
+        entries,
+    })
+}
+
 pub fn compiler_invocation_attempt_digest(
     source_root_digest: &str,
     command_plan_digest: &str,
@@ -185,6 +219,110 @@ pub fn validate_compiler_invocation_unit_graph(graph: &RustCargoUnitGraph) -> Re
             .any(|root| !unit_ids.contains(root.as_str()))
     {
         bail!("compiler invocation Cargo roots are not canonical or conserved");
+    }
+    Ok(())
+}
+
+/// Revalidates the complete in-memory invocation ledger before it crosses the
+/// atomic graph-promotion boundary. The directory validator performs the
+/// filesystem/source checks while the supervised workspace still exists; this
+/// check repeats every canonical identity and conservation invariant on the
+/// retained DTO so post-validation mutation cannot produce a partial delta.
+pub fn validate_compiler_invocation_ledger_identity(
+    ledger: &RustCompilerInvocationLedger,
+    graph: &RustCargoUnitGraph,
+) -> Result<()> {
+    validate_compiler_invocation_unit_graph(graph)?;
+    validate_digest(&ledger.attempt_digest)?;
+    if ledger.schema_version != COMPILER_INVOCATION_LEDGER_SCHEMA_VERSION
+        || ledger.unit_graph_digest != graph.digest
+    {
+        bail!("compiler invocation ledger identity is invalid");
+    }
+    let admitted = graph
+        .units
+        .iter()
+        .filter(|unit| unit.mode != "run-custom-build")
+        .map(|unit| (unit.unit_id.as_str(), unit))
+        .collect::<BTreeMap<_, _>>();
+    if ledger.entries.len() != admitted.len()
+        || !ledger
+            .entries
+            .windows(2)
+            .all(|window| window[0].unit_id < window[1].unit_id)
+    {
+        bail!("compiler invocation ledger does not conserve admitted Cargo units");
+    }
+    let mut invocation_ids = BTreeSet::new();
+    for entry in &ledger.entries {
+        let unit = admitted
+            .get(entry.unit_id.as_str())
+            .context("compiler invocation references an unadmitted Cargo unit")?;
+        let expected_name = unit.target.name.replace('-', "_");
+        let mut expected_types = unit.target.crate_types.clone();
+        expected_types.sort();
+        expected_types.dedup();
+        if entry.crate_name != expected_name
+            || entry.crate_types != expected_types
+            || entry.source_path != unit.target.src_path
+            || entry.profile_digest != digest_json(&unit.profile)?
+            || entry.edition != unit.target.edition
+            || entry.features != unit.features
+            || entry.mode != unit.mode
+            || entry.target != unit.platform
+            || entry.terminal_status != "completed"
+            || entry.exit_code != 0
+            || !invocation_ids.insert(entry.invocation_id.as_str())
+        {
+            bail!("compiler invocation ledger entry is incomplete or mismatched");
+        }
+        for digest in [
+            &entry.invocation_id,
+            &entry.source_sha256,
+            &entry.profile_digest,
+            &entry.argv_digest,
+            &entry.rustc_sha256,
+            &entry.rustc_verbose_sha256,
+        ] {
+            validate_digest(digest)?;
+        }
+        validate_source_path(&entry.source_path)?;
+        validate_sorted_unique_identities("compiler invocation crate types", &entry.crate_types)?;
+        validate_sorted_unique_text("compiler invocation features", &entry.features)?;
+        if entry.canonical_argv.is_empty()
+            || entry.canonical_argv.len() > MAX_ARGUMENTS
+            || entry.argv_digest != digest_json(&entry.canonical_argv)?
+        {
+            bail!("compiler invocation argv identity is invalid");
+        }
+        for argument in &entry.canonical_argv {
+            validate_text("compiler invocation argument", argument)?;
+            if contains_unconfined_path_fragment(argument)
+                || contains_parent_traversal(argument)
+                || argument.contains('@')
+            {
+                bail!("compiler invocation argv contains a path escape or response file");
+            }
+        }
+        let expected_digest = compiler_invocation_entry_digest(entry)?;
+        if entry.invocation_digest != expected_digest {
+            bail!("compiler invocation canonical identity is invalid");
+        }
+    }
+    if admitted
+        .keys()
+        .copied()
+        .ne(ledger.entries.iter().map(|entry| entry.unit_id.as_str()))
+    {
+        bail!("compiler invocation ledger unit coverage is incomplete");
+    }
+    let expected_digest = compiler_invocation_ledger_digest(
+        &ledger.attempt_digest,
+        &ledger.unit_graph_digest,
+        &ledger.entries,
+    )?;
+    if ledger.digest != expected_digest {
+        bail!("compiler invocation ledger digest is invalid");
     }
     Ok(())
 }
@@ -337,36 +475,14 @@ pub fn validate_compiler_invocation_ledger(
             terminal_status: terminal.status,
             exit_code: 0,
         };
-        entry.invocation_digest = digest_json(&InvocationIdentity {
-            unit_id: &entry.unit_id,
-            invocation_id: &entry.invocation_id,
-            crate_name: &entry.crate_name,
-            crate_types: &entry.crate_types,
-            source_path: &entry.source_path,
-            source_sha256: &entry.source_sha256,
-            profile_digest: &entry.profile_digest,
-            edition: &entry.edition,
-            target: &entry.target,
-            mode: &entry.mode,
-            features: &entry.features,
-            canonical_argv: &entry.canonical_argv,
-            argv_digest: &entry.argv_digest,
-            rustc_sha256: &entry.rustc_sha256,
-            rustc_verbose_sha256: &entry.rustc_verbose_sha256,
-            terminal_status: &entry.terminal_status,
-            exit_code: entry.exit_code,
-        })?;
+        entry.invocation_digest = compiler_invocation_entry_digest(&entry)?;
         entries.push(entry);
     }
     if matched_units.len() != admitted.len() {
         bail!("compiler invocation ledger does not conserve admitted Cargo units");
     }
     entries.sort_by(|left, right| left.unit_id.cmp(&right.unit_id));
-    let digest = digest_json(&LedgerIdentity {
-        attempt_digest,
-        unit_graph_digest: &graph.digest,
-        entries: &entries,
-    })?;
+    let digest = compiler_invocation_ledger_digest(attempt_digest, &graph.digest, &entries)?;
     Ok(RustCompilerInvocationLedger {
         schema_version: COMPILER_INVOCATION_LEDGER_SCHEMA_VERSION.to_owned(),
         digest,

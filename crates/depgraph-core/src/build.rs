@@ -354,6 +354,12 @@ pub fn create_compiler_precise_invocation_request(
         bail!("compiler-precise Rust requires confined Cargo.toml and Cargo.lock files");
     }
     project_neutral_cargo_config(&source_root)?;
+    let profile_id = crate::compiler_precise_graph::compiler_precise_profile_id(
+        &compiler_pack.host,
+        &compiler_pack.target,
+        &compiler_pack.expected_manifest_sha256,
+        &unit_graph.digest,
+    )?;
     if expected_source_root_digest.len() != 64
         || !expected_source_root_digest
             .bytes()
@@ -366,7 +372,7 @@ pub fn create_compiler_precise_invocation_request(
         plan: BuildExecutionPlan {
             adapter: COMPILER_PRECISE_INVOCATION_ADAPTER.to_owned(),
             adapter_version: COMPILER_PRECISE_INVOCATION_ADAPTER_VERSION.to_owned(),
-            profile_id: "rust:compiler-precise:invocations".to_owned(),
+            profile_id,
             program: "cargo".to_owned(),
             arguments: vec![
                 "build".to_owned(),
@@ -468,8 +474,21 @@ impl BuildExecutionPlan {
                 bail!("compiler-precise unit graph cannot carry invocation-stage state");
             }
         } else if self.adapter == COMPILER_PRECISE_INVOCATION_ADAPTER {
+            let expected_profile_id = self
+                .compiler_pack
+                .as_ref()
+                .zip(self.compiler_unit_graph.as_ref())
+                .map(|(pack, graph)| {
+                    crate::compiler_precise_graph::compiler_precise_profile_id(
+                        &pack.host,
+                        &pack.target,
+                        &pack.expected_manifest_sha256,
+                        &graph.digest,
+                    )
+                })
+                .transpose()?;
             if self.adapter_version != COMPILER_PRECISE_INVOCATION_ADAPTER_VERSION
-                || self.profile_id != "rust:compiler-precise:invocations"
+                || expected_profile_id.as_deref() != Some(self.profile_id.as_str())
                 || self.compiler_pack.is_none()
                 || self.compiler_unit_graph.is_none()
                 || self.expected_source_root_digest.is_none()
