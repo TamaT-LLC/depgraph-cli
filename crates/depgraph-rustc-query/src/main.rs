@@ -30,6 +30,9 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 const SCHEMA_VERSION: &str = "depgraph-rust-compiler-precise-v1";
+const COMPONENT_HANDSHAKE_SCHEMA_VERSION: &str = "depgraph-compiler-component-handshake-v1";
+const COMPILER_PRECISE_CONTRACT_VERSION: &str = "compiler-precise-rust-v1";
+const WRAPPER_PROTOCOL_VERSION: &str = "depgraph-rust-compiler-precise-v1";
 const RUSTC_COMMIT: &str = "3d50c25bc66853bf0ad205529d0f305a1d841b5e";
 const MAX_BODIES: usize = 100_000;
 const MAX_ATOMS: usize = 1_000_000;
@@ -74,6 +77,18 @@ struct UnitIdentity<'a> {
     calls: &'a [CompilerCall],
     bodies: &'a [MirBody],
     unsupported: &'a [Unsupported],
+}
+
+#[derive(Serialize)]
+struct ComponentHandshake {
+    schema_version: &'static str,
+    component: &'static str,
+    version: &'static str,
+    compiler_contract_version: &'static str,
+    wrapper_protocol_version: &'static str,
+    mir_schema_version: &'static str,
+    rustc_commit: &'static str,
+    query_capabilities: [&'static str; 2],
 }
 
 #[derive(Clone, Serialize)]
@@ -299,6 +314,22 @@ fn main() {
 }
 
 fn execute() -> Result<()> {
+    if env::args().len() == 2 && env::args().nth(1).as_deref() == Some("--depgraph-handshake") {
+        println!(
+            "{}",
+            serde_json::to_string(&ComponentHandshake {
+                schema_version: COMPONENT_HANDSHAKE_SCHEMA_VERSION,
+                component: "query",
+                version: env!("CARGO_PKG_VERSION"),
+                compiler_contract_version: COMPILER_PRECISE_CONTRACT_VERSION,
+                wrapper_protocol_version: WRAPPER_PROTOCOL_VERSION,
+                mir_schema_version: SCHEMA_VERSION,
+                rustc_commit: RUSTC_COMMIT,
+                query_capabilities: ["monomorphized_call_graph", "typed_mir"],
+            })?
+        );
+        return Ok(());
+    }
     validate_environment_identity()?;
     let mut args = env::args().collect::<Vec<_>>();
     let rustc = required_absolute_file("DEPGRAPH_QUERY_RUSTC")?;

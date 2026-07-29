@@ -15,6 +15,11 @@ use sha2::{Digest, Sha256};
 
 const RECORD_SCHEMA_VERSION: &str = "depgraph-rust-compiler-invocation-record-v1";
 const EXPECTED_GRAPH_SCHEMA_VERSION: &str = "depgraph-rust-cargo-unit-graph-v1";
+const COMPONENT_HANDSHAKE_SCHEMA_VERSION: &str = "depgraph-compiler-component-handshake-v1";
+const COMPILER_PRECISE_CONTRACT_VERSION: &str = "compiler-precise-rust-v1";
+const WRAPPER_PROTOCOL_VERSION: &str = "depgraph-rust-compiler-precise-v1";
+const MIR_SCHEMA_VERSION: &str = "depgraph-rust-compiler-precise-v1";
+const RUSTC_COMMIT: &str = "3d50c25bc66853bf0ad205529d0f305a1d841b5e";
 const MAX_ARGUMENTS: usize = 16_384;
 const MAX_ARGUMENT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_EXPECTED_GRAPH_BYTES: u64 = 16 * 1024 * 1024;
@@ -139,6 +144,18 @@ struct TerminalRecord {
     exit_code: Option<i32>,
 }
 
+#[derive(Debug, Serialize)]
+struct ComponentHandshake {
+    schema_version: &'static str,
+    component: &'static str,
+    version: &'static str,
+    compiler_contract_version: &'static str,
+    wrapper_protocol_version: &'static str,
+    mir_schema_version: &'static str,
+    rustc_commit: &'static str,
+    query_capabilities: [&'static str; 2],
+}
+
 #[derive(Debug)]
 struct Invocation {
     crate_name: String,
@@ -171,6 +188,26 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<i32> {
+    if env::args_os().len() == 2
+        && env::args_os()
+            .nth(1)
+            .is_some_and(|argument| argument == "--depgraph-handshake")
+    {
+        println!(
+            "{}",
+            serde_json::to_string(&ComponentHandshake {
+                schema_version: COMPONENT_HANDSHAKE_SCHEMA_VERSION,
+                component: "wrapper",
+                version: env!("CARGO_PKG_VERSION"),
+                compiler_contract_version: COMPILER_PRECISE_CONTRACT_VERSION,
+                wrapper_protocol_version: WRAPPER_PROTOCOL_VERSION,
+                mir_schema_version: MIR_SCHEMA_VERSION,
+                rustc_commit: RUSTC_COMMIT,
+                query_capabilities: ["monomorphized_call_graph", "typed_mir"],
+            })?
+        );
+        return Ok(0);
+    }
     if env::var_os(ENV_WRAPPER_ACTIVE).is_some() {
         bail!("nested compiler wrapper invocation is forbidden");
     }
@@ -216,6 +253,18 @@ fn run() -> Result<i32> {
     let rustc_verbose_sha256 = digest_bytes(&verbose.stdout);
     if rustc_verbose_sha256 != required_digest(ENV_EXPECTED_RUSTC_VERBOSE_SHA256)? {
         bail!("actual rustc verbose identity does not match the attested compiler");
+    }
+    if raw_args[1..] == [OsString::from("-vV")] {
+        std::io::stdout().write_all(&verbose.stdout)?;
+        return Ok(0);
+    }
+    if is_cargo_target_probe(&raw_args[1..], rustc_host) {
+        let status = Command::new(&actual_rustc)
+            .args(&raw_args[1..])
+            .env_clear()
+            .status()
+            .context("failed to run the attested Cargo target probe")?;
+        return Ok(status.code().unwrap_or(1));
     }
 
     let roots = Roots {
@@ -372,6 +421,49 @@ fn run() -> Result<i32> {
         &canonical_json_bytes(&terminal)?,
     )?;
     Ok(status.code().unwrap_or(1))
+}
+
+fn is_cargo_target_probe(args: &[OsString], rustc_host: &str) -> bool {
+    const EXPECTED: &[&str] = &[
+        "-",
+        "--crate-name",
+        "___",
+        "--print=file-names",
+        "--crate-type",
+        "bin",
+        "--crate-type",
+        "rlib",
+        "--crate-type",
+        "dylib",
+        "--crate-type",
+        "cdylib",
+        "--crate-type",
+        "staticlib",
+        "--crate-type",
+        "proc-macro",
+        "--print=sysroot",
+        "--print=split-debuginfo",
+        "--print=crate-name",
+        "--print=cfg",
+        "-Wwarnings",
+    ];
+    let exact_host_probe = args.len() == EXPECTED.len()
+        && args
+            .iter()
+            .zip(EXPECTED)
+            .all(|(actual, expected)| actual == expected);
+    let exact_target_probe = args.len() == EXPECTED.len() + 2
+        && args[..4]
+            .iter()
+            .zip(&EXPECTED[..4])
+            .all(|(actual, expected)| actual == expected)
+        && args[4] == "--target"
+        && args[5] == rustc_host
+        && args[6..]
+            .iter()
+            .zip(&EXPECTED[4..])
+            .all(|(actual, expected)| actual == expected);
+    exact_host_probe || exact_target_probe
 }
 
 fn parse_invocation(args: &[OsString], roots: &Roots) -> Result<Invocation> {
@@ -1024,6 +1116,44 @@ mod tests {
             ("--crate-name", Some("fixture"))
         );
         assert_eq!(split_option("src/lib.rs"), ("src/lib.rs", None));
+    }
+
+    #[test]
+    fn cargo_target_probe_is_exact() {
+        let valid = [
+            "-",
+            "--crate-name",
+            "___",
+            "--print=file-names",
+            "--crate-type",
+            "bin",
+            "--crate-type",
+            "rlib",
+            "--crate-type",
+            "dylib",
+            "--crate-type",
+            "cdylib",
+            "--crate-type",
+            "staticlib",
+            "--crate-type",
+            "proc-macro",
+            "--print=sysroot",
+            "--print=split-debuginfo",
+            "--print=crate-name",
+            "--print=cfg",
+            "-Wwarnings",
+        ]
+        .map(OsString::from);
+        assert!(is_cargo_target_probe(&valid, "aarch64-apple-darwin"));
+        let mut target = valid.to_vec();
+        target.insert(4, OsString::from("--target"));
+        target.insert(5, OsString::from("aarch64-apple-darwin"));
+        assert!(is_cargo_target_probe(&target, "aarch64-apple-darwin"));
+        target[5] = OsString::from("x86_64-apple-darwin");
+        assert!(!is_cargo_target_probe(&target, "aarch64-apple-darwin"));
+        let mut changed = valid;
+        changed[2] = OsString::from("project");
+        assert!(!is_cargo_target_probe(&changed, "aarch64-apple-darwin"));
     }
 
     #[test]

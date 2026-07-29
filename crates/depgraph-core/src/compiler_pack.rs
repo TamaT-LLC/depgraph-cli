@@ -27,6 +27,16 @@ pub const COMPILER_PACK_CHANNEL_MANIFEST: &str = "2026-07-17/channel-rust-nightl
 pub const COMPILER_PACK_CHANNEL_MANIFEST_SHA256: &str =
     "e8598e1b6ab58a60209ba3ac8e5dd3a0f799719829dede0306b4daf1769b52c9";
 pub const COMPILER_PACK_WRAPPER_PROTOCOL_VERSION: &str = "depgraph-rust-compiler-precise-v1";
+pub const COMPILER_PACK_RELEASE_CONTRACT_VERSION: &str = "compiler-pack-five-target-release-v1";
+pub const COMPILER_PACK_DISTRIBUTION: &str = "separate-target-specific-first-party-archive";
+pub const COMPILER_PACK_FALLBACK_POLICY: &str = "unsupported-no-fallback";
+pub const COMPILER_PACK_SUPPORTED_TARGETS: &[&str] = &[
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+];
 
 const COMPILER_PACK_LICENSE_SCHEMA_VERSION: &str = "compiler-pack-license-inventory-v1";
 const COMPILER_PACK_PROVENANCE_SCHEMA_VERSION: &str = "compiler-pack-provenance-v1";

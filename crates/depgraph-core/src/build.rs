@@ -707,6 +707,7 @@ where
         &plan.program,
         rustc.as_deref(),
         compiler_pack_preflight.as_ref(),
+        plan.adapter == COMPILER_PRECISE_INVOCATION_ADAPTER,
     )?;
     for (key, value) in &plan.environment {
         effective_environment.insert(key.clone(), value.clone());
@@ -1381,6 +1382,7 @@ fn supervisor_environment(
     program: &str,
     rustc: Option<&Path>,
     compiler_pack: Option<&VerifiedCompilerPack>,
+    compiler_wrapper_enabled: bool,
 ) -> Result<BTreeMap<String, String>> {
     let mut environment = BTreeMap::new();
     let path = if let Some(pack) = compiler_pack {
@@ -1451,6 +1453,7 @@ fn supervisor_environment(
                 .into_owned(),
         );
         let rustc_wrapper = compiler_pack
+            .filter(|_| compiler_wrapper_enabled)
             .map(|pack| pack.wrapper_path.to_string_lossy().into_owned())
             .unwrap_or_default();
         environment.insert("RUSTC_WRAPPER".to_owned(), rustc_wrapper.clone());
@@ -2417,6 +2420,7 @@ mod tests {
             "cargo",
             Some(&verified.rustc_path),
             Some(&verified),
+            true,
         )?;
         assert_eq!(
             environment.get("RUSTC_WRAPPER").map(String::as_str),
@@ -2431,6 +2435,20 @@ mod tests {
         assert_eq!(
             environment
                 .get("RUSTC_WORKSPACE_WRAPPER")
+                .map(String::as_str),
+            Some("")
+        );
+        let unit_graph_environment = supervisor_environment(
+            &project,
+            &run,
+            "cargo",
+            Some(&verified.rustc_path),
+            Some(&verified),
+            false,
+        )?;
+        assert_eq!(
+            unit_graph_environment
+                .get("RUSTC_WRAPPER")
                 .map(String::as_str),
             Some("")
         );

@@ -13,6 +13,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
+mod compiler_pack_release;
 mod go_semantic_e2e;
 mod rust_semantic_e2e;
 
@@ -127,6 +128,19 @@ enum Task {
         #[arg(long)]
         spec: PathBuf,
     },
+    CompilerPackPackage {
+        #[arg(long)]
+        channel_manifest: PathBuf,
+        #[arg(long, default_value = "dist")]
+        output_directory: PathBuf,
+        #[arg(long)]
+        target: Option<String>,
+    },
+    VerifyCompilerPackAssets {
+        directory: PathBuf,
+        #[arg(long)]
+        target: Vec<String>,
+    },
     VerifyReleaseAssets {
         directory: PathBuf,
         #[arg(long)]
@@ -135,6 +149,7 @@ enum Task {
     StableReleaseGate {
         release_verification: PathBuf,
         benchmark_report: PathBuf,
+        compiler_pack_verification: PathBuf,
         #[arg(long)]
         output: PathBuf,
     },
@@ -427,6 +442,7 @@ struct StableReleaseGateReport {
     decision: StableReleaseDecision,
     release_verification_sha256: String,
     benchmark_report_sha256: String,
+    compiler_pack_verification_sha256: String,
     workflow_results: BTreeMap<String, String>,
     checks: Vec<StableReleaseGateCheck>,
 }
@@ -450,14 +466,30 @@ fn main() -> Result<()> {
             output,
             spec,
         } => compiler_pack(&source, &output, &spec),
+        Task::CompilerPackPackage {
+            channel_manifest,
+            output_directory,
+            target,
+        } => {
+            compiler_pack_release::package(&channel_manifest, &output_directory, target.as_deref())
+        }
+        Task::VerifyCompilerPackAssets { directory, target } => {
+            compiler_pack_release::verify_assets(&directory, &target).map(|_| ())
+        }
         Task::VerifyReleaseAssets { directory, target } => {
             verify_release_assets(&directory, &target)
         }
         Task::StableReleaseGate {
             release_verification,
             benchmark_report,
+            compiler_pack_verification,
             output,
-        } => stable_release_gate(&release_verification, &benchmark_report, &output),
+        } => stable_release_gate(
+            &release_verification,
+            &benchmark_report,
+            &compiler_pack_verification,
+            &output,
+        ),
         Task::GithubSettingsVerify { snapshot, output } => {
             github_settings_verify(&snapshot, &output)
         }
@@ -1138,6 +1170,8 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         fs::read_to_string(root.join("docs/40_arch_design/adr-rust-compiler-precise-backend.md"))?;
     let rust_compiler_hostile =
         fs::read_to_string(root.join("docs/50_test/compiler-precise-hostile-e2e.md"))?;
+    let rust_compiler_release =
+        fs::read_to_string(root.join("docs/50_test/compiler-precise-five-target-release.md"))?;
     let rust_compiler_hostile_gate =
         fs::read_to_string(root.join("scripts/compiler-precise-hostile-e2e.sh"))?;
     let ci_workflow = fs::read_to_string(root.join(".github/workflows/ci.yml"))?;
@@ -1241,7 +1275,8 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "`compiler-precise-hostile-e2e-v1`",
         "Hostile execution and rollback E2E (implemented in #248)",
         "every admitted Cargo unit invocation, including dependency, build-script, and proc-macro units",
-        "| Five-target release gate | 2-3 days |",
+        "Five-target release gate (implemented in #249)",
+        "`compiler-pack-five-target-release-v1`",
         "| Safe invariant |",
     ] {
         if !rust_compiler_adr.contains(required) {
@@ -1269,6 +1304,22 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
     ] {
         if !rust_compiler_hostile_gate.contains(required) {
             bail!("compiler-precise hostile gate is missing {required:?}");
+        }
+    }
+    for required in [
+        "`compiler-pack-five-target-release-v1`",
+        "`x86_64-unknown-linux-gnu`",
+        "`aarch64-unknown-linux-gnu`",
+        "`x86_64-apple-darwin`",
+        "`aarch64-apple-darwin`",
+        "`x86_64-pc-windows-msvc`",
+        "`depgraph-compiler-component-handshake-v1`",
+        "`compiler-pack-five-target-verification-v1`",
+        "`unsupported-no-fallback`",
+        "cargo xtask verify-compiler-pack-assets compiler-artifacts",
+    ] {
+        if !rust_compiler_release.contains(required) {
+            bail!("compiler-pack release evidence is missing {required:?}");
         }
     }
     for required in [
@@ -1564,13 +1615,20 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "DEPGRAPH_BOUNDED_QUERY_PLAN_LIMIT_MS: \"7000\"",
         "DEPGRAPH_BOUNDED_QUERY_EXECUTE_LIMIT_MS: \"10000\"",
         "node scripts/benchmark-report.mjs verify benchmark/benchmark-report.json",
-        "needs: [quality, compiler-precise-hostile, benchmark, package, verify-assets]",
-        "cargo xtask stable-release-gate artifacts/release-verification.json benchmark/benchmark-report.json --output artifacts/stable-release-gate.json",
+        "compiler-pack:",
+        "verify-compiler-packs:",
+        "rustup toolchain install nightly-2026-07-17 --profile minimal --component rust-src,rustc-dev,llvm-tools-preview",
+        "cargo xtask compiler-pack-package --channel-manifest channel-rust-nightly-2026-07-17.toml",
+        "cargo xtask verify-compiler-pack-assets compiler-artifacts",
+        "needs: [quality, compiler-precise-hostile, benchmark, package, verify-assets, compiler-pack, verify-compiler-packs]",
+        "cargo xtask stable-release-gate artifacts/release-verification.json benchmark/benchmark-report.json compiler-artifacts/compiler-pack-verification.json --output artifacts/stable-release-gate.json",
         "DEPGRAPH_RELEASE_QUALITY_RESULT: ${{ needs.quality.result }}",
         "DEPGRAPH_RELEASE_COMPILER_PRECISE_HOSTILE_RESULT: ${{ needs.compiler-precise-hostile.result }}",
         "DEPGRAPH_RELEASE_BENCHMARK_RESULT: ${{ needs.benchmark.result }}",
         "DEPGRAPH_RELEASE_PACKAGE_RESULT: ${{ needs.package.result }}",
         "DEPGRAPH_RELEASE_VERIFY_ASSETS_RESULT: ${{ needs.verify-assets.result }}",
+        "DEPGRAPH_RELEASE_COMPILER_PACK_RESULT: ${{ needs.compiler-pack.result }}",
+        "DEPGRAPH_RELEASE_VERIFY_COMPILER_PACKS_RESULT: ${{ needs.verify-compiler-packs.result }}",
         "name: stable-release-gate",
         "needs: stable-gate",
     ] {
@@ -3808,7 +3866,6 @@ fn is_executable(path: &Path) -> Result<bool> {
     }
 }
 
-#[cfg(any(not(windows), test))]
 fn create_tar_archive(archive: &Path, entries: &[ArchiveEntry]) -> Result<()> {
     let output = fs::File::create(archive)?;
     let encoder = flate2::GzBuilder::new()
@@ -3841,7 +3898,6 @@ fn create_tar_archive(archive: &Path, entries: &[ArchiveEntry]) -> Result<()> {
     Ok(())
 }
 
-#[cfg(any(windows, test))]
 fn create_zip_archive(archive: &Path, entries: &[ArchiveEntry]) -> Result<()> {
     let output = fs::File::create(archive)?;
     let mut writer = zip::ZipWriter::new(output);
@@ -4215,6 +4271,7 @@ fn github_settings_verify(snapshot_path: &Path, output: &Path) -> Result<()> {
 fn stable_release_gate(
     release_verification_path: &Path,
     benchmark_report_path: &Path,
+    compiler_pack_verification_path: &Path,
     output: &Path,
 ) -> Result<()> {
     verify_project_metadata(&workspace_root())?;
@@ -4234,12 +4291,24 @@ fn stable_release_gate(
             )
         })?)
         .context("benchmark report is not valid JSON")?;
+    let compiler_pack_verification: compiler_pack_release::CompilerPackVerificationReport =
+        serde_json::from_slice(&fs::read(compiler_pack_verification_path).with_context(|| {
+            format!(
+                "failed to read compiler pack verification {}",
+                compiler_pack_verification_path.display()
+            )
+        })?)
+        .context("compiler pack verification report does not satisfy its closed schema")?;
+    let compiler_pack_verified =
+        compiler_pack_release::validate_verification_report(&compiler_pack_verification).is_ok();
 
     let report = evaluate_stable_release_gate(
         &release_verification,
         &benchmark_report,
         sha256_file(release_verification_path)?,
         sha256_file(benchmark_report_path)?,
+        sha256_file(compiler_pack_verification_path)?,
+        compiler_pack_verified,
         stable_release_workflow_results(),
     );
     fs::write(
@@ -4273,6 +4342,8 @@ fn evaluate_stable_release_gate(
     benchmark: &Value,
     release_verification_sha256: String,
     benchmark_report_sha256: String,
+    compiler_pack_verification_sha256: String,
+    compiler_pack_verified: bool,
     workflow_results: BTreeMap<String, String>,
 ) -> StableReleaseGateReport {
     let compatibility = release_compatibility();
@@ -4476,6 +4547,15 @@ fn evaluate_stable_release_gate(
                     .to_owned(),
         },
         StableReleaseGateCheck {
+            id: "compiler-pack-five-target".to_owned(),
+            passed: compiler_pack_verified
+                && release.compatibility.compiler_precise
+                    == depgraph_core::compiler_precise_release_compatibility_contract(),
+            evidence:
+                "five separate target-specific compiler packs share the exact toolchain, contract, schema, query capability, semantic, resource, legal, provenance, tamper, and rollback closure"
+                    .to_owned(),
+        },
+        StableReleaseGateCheck {
             id: "safety-framework-collector".to_owned(),
             passed: release.framework_build_graph_contract_version
                 == depgraph_core::FRAMEWORK_BUILD_GRAPH_CONTRACT_VERSION
@@ -4508,10 +4588,12 @@ fn evaluate_stable_release_gate(
                     "benchmark",
                     "package",
                     "verify-assets",
+                    "compiler-pack",
+                    "verify-compiler-packs",
                 ]
                     .iter()
                     .all(|job| workflow_results.get(*job).map(String::as_str) == Some("success")),
-            evidence: "stable-gate needs quality, compiler-precise-hostile, benchmark, package, and verify-assets in release.yml".to_owned(),
+            evidence: "stable-gate needs quality, compiler-precise-hostile, benchmark, package, verify-assets, compiler-pack, and verify-compiler-packs in release.yml".to_owned(),
         },
     ];
     let decision = if checks.iter().all(|check| check.passed) {
@@ -4527,6 +4609,7 @@ fn evaluate_stable_release_gate(
         decision,
         release_verification_sha256,
         benchmark_report_sha256,
+        compiler_pack_verification_sha256,
         workflow_results,
         checks,
     }
@@ -4545,6 +4628,11 @@ fn stable_release_workflow_results() -> BTreeMap<String, String> {
         ("benchmark", "DEPGRAPH_RELEASE_BENCHMARK_RESULT"),
         ("package", "DEPGRAPH_RELEASE_PACKAGE_RESULT"),
         ("verify-assets", "DEPGRAPH_RELEASE_VERIFY_ASSETS_RESULT"),
+        ("compiler-pack", "DEPGRAPH_RELEASE_COMPILER_PACK_RESULT"),
+        (
+            "verify-compiler-packs",
+            "DEPGRAPH_RELEASE_VERIFY_COMPILER_PACKS_RESULT",
+        ),
     ]
     .into_iter()
     .map(|(key, variable)| {
@@ -12527,6 +12615,8 @@ jobs:
             ("benchmark".to_owned(), "success".to_owned()),
             ("package".to_owned(), "success".to_owned()),
             ("verify-assets".to_owned(), "success".to_owned()),
+            ("compiler-pack".to_owned(), "success".to_owned()),
+            ("verify-compiler-packs".to_owned(), "success".to_owned()),
         ]);
 
         let evaluate = |release: &ReleaseVerificationReport, benchmark: &Value| {
@@ -12535,6 +12625,8 @@ jobs:
                 benchmark,
                 "a".repeat(64),
                 "b".repeat(64),
+                "c".repeat(64),
+                true,
                 workflow_results.clone(),
             )
         };
@@ -12616,6 +12708,8 @@ jobs:
                 &benchmark,
                 "a".repeat(64),
                 "b".repeat(64),
+                "c".repeat(64),
+                true,
                 failed_workflow,
             )
             .decision,
@@ -12630,6 +12724,8 @@ jobs:
                 &benchmark,
                 "a".repeat(64),
                 "b".repeat(64),
+                "c".repeat(64),
+                true,
                 failed_hostile,
             )
             .decision,
