@@ -260,9 +260,6 @@ fn extract_unit() -> Result<()> {
     bodies.sort_by(|left, right| left.body_id.cmp(&right.body_id));
     unsupported.sort();
     unsupported.dedup();
-    if bodies.is_empty() {
-        bail!("pinned compiler returned no local typed MIR bodies");
-    }
     let mut unit = Unit {
         schema_version: SCHEMA_VERSION,
         digest: String::new(),
@@ -433,14 +430,30 @@ fn extract_body(
     constants.sort_by(|left, right| left.constant_id.cmp(&right.constant_id));
     let mut places = context.places.into_values().collect::<Vec<_>>();
     places.sort_by(|left, right| left.place_id.cmp(&right.place_id));
-    if types
-        .len()
-        .checked_add(constants.len())
-        .and_then(|count| count.checked_add(locals.len()))
-        .and_then(|count| count.checked_add(places.len()))
-        .and_then(|count| count.checked_add(blocks.len()))
-        .is_none_or(|count| count > MAX_ATOMS)
-    {
+    // Keep this admission formula identical to the parent validator: nested
+    // projections, operations, and successors are DTO atoms too.
+    let nested_atoms = places
+        .iter()
+        .try_fold(0_usize, |total, place| {
+            total.checked_add(place.projections.len())
+        })
+        .and_then(|total| {
+            blocks.iter().try_fold(total, |total, block| {
+                total
+                    .checked_add(block.operations.len())
+                    .and_then(|total| total.checked_add(block.successors.len()))
+            })
+        });
+    let total_atoms = nested_atoms.and_then(|nested_atoms| {
+        types
+            .len()
+            .checked_add(constants.len())
+            .and_then(|count| count.checked_add(locals.len()))
+            .and_then(|count| count.checked_add(places.len()))
+            .and_then(|count| count.checked_add(blocks.len()))
+            .and_then(|count| count.checked_add(nested_atoms))
+    });
+    if total_atoms.is_none_or(|count| count > MAX_ATOMS) {
         bail!("typed MIR body exceeds its atom count limit");
     }
     Ok((

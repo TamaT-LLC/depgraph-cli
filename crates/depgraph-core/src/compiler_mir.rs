@@ -386,7 +386,7 @@ fn validate_unit(
         workspace,
         cargo_home,
     )?;
-    if unit.bodies.is_empty() || unit.bodies.len() > MAX_BODIES_PER_UNIT {
+    if unit.bodies.len() > MAX_BODIES_PER_UNIT {
         bail!("typed MIR body count is outside its bounds");
     }
     if unit.unsupported.len() > MAX_ATOMS_PER_BODY {
@@ -1349,6 +1349,23 @@ mod tests {
         assert!(
             jsonschema::validator_for(&ledger_schema)?
                 .is_valid(&serde_json::to_value(&first_ledger)?)
+        );
+        let mut empty_unit = first_unit.clone();
+        empty_unit.bodies.clear();
+        empty_unit.digest = compiler_mir_unit_digest(&empty_unit)?;
+        let first_root = first.path().canonicalize()?;
+        let cargo_first_root = cargo_first.path().canonicalize()?;
+        validate_unit(
+            &empty_unit,
+            &first_invocations.entries[0],
+            &first_graph.units[0],
+            &first_pack,
+            &empty_unit.attempt_digest,
+            &first_root,
+            &cargo_first_root,
+        )?;
+        assert!(
+            jsonschema::validator_for(&unit_schema)?.is_valid(&serde_json::to_value(&empty_unit)?)
         );
         Ok(())
     }

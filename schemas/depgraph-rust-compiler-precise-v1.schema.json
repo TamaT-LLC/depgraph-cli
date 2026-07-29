@@ -208,7 +208,6 @@
         },
         "bodies": {
           "type": "array",
-          "minItems": 1,
           "maxItems": 100000,
           "items": {
             "$ref": "#/$defs/mir_body"
