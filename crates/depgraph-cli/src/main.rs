@@ -794,29 +794,25 @@ async fn run(cli: Cli) -> Result<u8> {
                 )
                 .await?;
             }
-            store.save_build_audit(&serde_json::to_value(&outcome.audit)?)?;
+            let audit_value = serde_json::to_value(&outcome.audit)?;
+            store.save_build_audit(&audit_value)?;
             let mut evidence_status = "audit-only (no completed base scan)";
             let mut build_cache_status = "not stored";
             if let Some(base_scan_id) = store.latest_successful_id()? {
                 evidence_status = "not promoted";
-                store.start_build_attempt(&base_scan_id, &serde_json::to_value(&outcome.audit)?)?;
+                let build_attempt_required = requires_build_attempt(
+                    &outcome.audit.outcome,
+                    outcome.rust_compiler_invocation_ledger.is_some(),
+                    outcome.rust_cargo_unit_graph.is_some(),
+                );
+                if build_attempt_required {
+                    store.start_build_attempt(&base_scan_id, &audit_value)?;
+                }
                 match outcome.audit.outcome {
                     BuildOutcomeKind::Completed => {
                         if outcome.rust_compiler_invocation_ledger.is_some() {
-                            store.finish_build_attempt(
-                                &outcome.audit.run_id,
-                                "completed",
-                                None,
-                                false,
-                            )?;
                             evidence_status = "validated compiler invocation ledger (not promoted)";
                         } else if outcome.rust_cargo_unit_graph.is_some() {
-                            store.finish_build_attempt(
-                                &outcome.audit.run_id,
-                                "completed",
-                                None,
-                                false,
-                            )?;
                             evidence_status = "validated unit graph (not promoted)";
                         } else {
                             let snapshot = store.load_snapshot(&base_scan_id)?;
@@ -1738,6 +1734,15 @@ fn require_compiler_precise_consent(
     Ok(())
 }
 
+fn requires_build_attempt(
+    outcome: &BuildOutcomeKind,
+    has_compiler_invocation_ledger: bool,
+    has_cargo_unit_graph: bool,
+) -> bool {
+    !matches!(outcome, BuildOutcomeKind::Completed)
+        || (!has_compiler_invocation_ledger && !has_cargo_unit_graph)
+}
+
 fn canonical_directory(path: PathBuf) -> Result<PathBuf> {
     let path = path
         .canonicalize()
@@ -2466,8 +2471,10 @@ fn print_evidence(evidence: &[depgraph_store::EvidenceRecord], indent: &str) {
 mod tests {
     use super::{
         error_exit_code, inspect_runtime_trace_input, require_build_consent,
-        require_compiler_precise_consent, runtime_trace_metadata_error, write_file_atomically,
+        require_compiler_precise_consent, requires_build_attempt, runtime_trace_metadata_error,
+        write_file_atomically,
     };
+    use depgraph_core::BuildOutcomeKind;
 
     #[test]
     fn classifies_cli_errors_without_hiding_internal_failures_as_usage() {
@@ -2532,6 +2539,33 @@ mod tests {
         }
         require_compiler_precise_consent(true, true, true)
             .expect("all three explicit flags grant compiler-precise consent");
+    }
+
+    #[test]
+    fn completed_compiler_audits_do_not_open_delta_attempts() {
+        assert!(!requires_build_attempt(
+            &BuildOutcomeKind::Completed,
+            true,
+            true
+        ));
+        assert!(!requires_build_attempt(
+            &BuildOutcomeKind::Completed,
+            false,
+            true
+        ));
+        assert!(requires_build_attempt(
+            &BuildOutcomeKind::Completed,
+            false,
+            false
+        ));
+        for outcome in [
+            BuildOutcomeKind::Failed,
+            BuildOutcomeKind::TimedOut,
+            BuildOutcomeKind::Cancelled,
+            BuildOutcomeKind::SecurityFailed,
+        ] {
+            assert!(requires_build_attempt(&outcome, false, false));
+        }
     }
 
     #[test]
