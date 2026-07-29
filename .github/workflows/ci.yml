@@ -163,6 +163,14 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24.18.0
+      - name: Install the compiler-precise Linux namespace boundary
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends bubblewrap
+          if sysctl -n kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
       - name: Build supervisor staging, redaction, timeout, cancellation, and descendant reap
         run: cargo test -p depgraph-core --lib --locked build::tests
       - name: Watcher daemon lifecycle, debounce, cancellation, and recovery
