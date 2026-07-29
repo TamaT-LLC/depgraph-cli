@@ -1,0 +1,222 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tamat.dev/depgraph/schemas/depgraph-compiler-pack-v1.schema.json",
+  "title": "depgraph target-specific Rust compiler pack manifest v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "contract_version",
+    "toolchain",
+    "host",
+    "target",
+    "cargo",
+    "rustc",
+    "wrapper",
+    "wrapper_protocol",
+    "components",
+    "sbom",
+    "license_inventory",
+    "source_provenance",
+    "release_checksum_reference",
+    "closed_tree_sha256",
+    "directories",
+    "files"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "depgraph-compiler-pack-manifest-v1"
+    },
+    "contract_version": {
+      "const": "compiler-precise-rust-v1"
+    },
+    "toolchain": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "channel",
+        "rust_release",
+        "cargo_release",
+        "rustc_commit",
+        "channel_manifest",
+        "channel_manifest_sha256"
+      ],
+      "properties": {
+        "channel": { "const": "nightly-2026-07-17" },
+        "rust_release": { "const": "1.99.0-nightly" },
+        "cargo_release": { "const": "1.99.0-nightly" },
+        "rustc_commit": {
+          "const": "3d50c25bc66853bf0ad205529d0f305a1d841b5e"
+        },
+        "channel_manifest": {
+          "const": "2026-07-17/channel-rust-nightly.toml"
+        },
+        "channel_manifest_sha256": {
+          "const": "e8598e1b6ab58a60209ba3ac8e5dd3a0f799719829dede0306b4daf1769b52c9"
+        }
+      }
+    },
+    "host": { "$ref": "#/$defs/identity" },
+    "target": { "$ref": "#/$defs/identity" },
+    "cargo": { "$ref": "#/$defs/artifact" },
+    "rustc": { "$ref": "#/$defs/artifact" },
+    "wrapper": { "$ref": "#/$defs/artifact" },
+    "wrapper_protocol": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["contract_version", "schema"],
+      "properties": {
+        "contract_version": {
+          "const": "depgraph-rust-compiler-precise-v1"
+        },
+        "schema": { "$ref": "#/$defs/artifact" }
+      }
+    },
+    "components": {
+      "type": "array",
+      "minItems": 6,
+      "maxItems": 6,
+      "prefixItems": [
+        { "$ref": "#/$defs/cargoComponent" },
+        { "$ref": "#/$defs/llvmToolsComponent" },
+        { "$ref": "#/$defs/rustSrcComponent" },
+        { "$ref": "#/$defs/rustStdComponent" },
+        { "$ref": "#/$defs/rustcComponent" },
+        { "$ref": "#/$defs/rustcDevComponent" }
+      ],
+      "items": false
+    },
+    "sbom": { "$ref": "#/$defs/artifact" },
+    "license_inventory": { "$ref": "#/$defs/artifact" },
+    "source_provenance": { "$ref": "#/$defs/artifact" },
+    "release_checksum_reference": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "pattern": "^release-checksums:[^\\u0000-\\u001f\\u007f]+$"
+    },
+    "closed_tree_sha256": { "$ref": "#/$defs/sha256" },
+    "directories": {
+      "type": "array",
+      "maxItems": 100000,
+      "items": { "$ref": "#/$defs/path" }
+    },
+    "files": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 250000,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "path",
+          "owner",
+          "sha256",
+          "size",
+          "executable"
+        ],
+        "properties": {
+          "path": { "$ref": "#/$defs/path" },
+          "owner": { "$ref": "#/$defs/identity" },
+          "sha256": { "$ref": "#/$defs/sha256" },
+          "size": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 8589934592
+          },
+          "executable": { "type": "boolean" }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "identity": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "^[A-Za-z0-9._+:-]+$"
+    },
+    "path": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1024,
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.?/)(?!.*\\\\)[^\\u0000-\\u001f\\u007f]+$"
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": { "$ref": "#/$defs/path" },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "component": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "source",
+        "archive_sha256",
+        "tree_sha256",
+        "file_count"
+      ],
+      "properties": {
+        "name": { "$ref": "#/$defs/identity" },
+        "source": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024,
+          "pattern": "^https://static\\.rust-lang\\.org/dist/2026-07-17/"
+        },
+        "archive_sha256": { "$ref": "#/$defs/sha256" },
+        "tree_sha256": { "$ref": "#/$defs/sha256" },
+        "file_count": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 250000
+        }
+      }
+    },
+    "cargoComponent": {
+      "allOf": [
+        { "$ref": "#/$defs/component" },
+        { "properties": { "name": { "const": "cargo" } } }
+      ]
+    },
+    "llvmToolsComponent": {
+      "allOf": [
+        { "$ref": "#/$defs/component" },
+        { "properties": { "name": { "const": "llvm-tools" } } }
+      ]
+    },
+    "rustSrcComponent": {
+      "allOf": [
+        { "$ref": "#/$defs/component" },
+        { "properties": { "name": { "const": "rust-src" } } }
+      ]
+    },
+    "rustStdComponent": {
+      "allOf": [
+        { "$ref": "#/$defs/component" },
+        { "properties": { "name": { "const": "rust-std" } } }
+      ]
+    },
+    "rustcComponent": {
+      "allOf": [
+        { "$ref": "#/$defs/component" },
+        { "properties": { "name": { "const": "rustc" } } }
+      ]
+    },
+    "rustcDevComponent": {
+      "allOf": [
+        { "$ref": "#/$defs/component" },
+        { "properties": { "name": { "const": "rustc-dev" } } }
+      ]
+    }
+  }
+}

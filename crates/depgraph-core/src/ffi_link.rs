@@ -1198,6 +1198,7 @@ mod tests {
                 diagnostic_code: None,
             },
             project_code_executed,
+            compiler_pack_attestation: None,
             rust_observation: None,
             web_observation: None,
         }
