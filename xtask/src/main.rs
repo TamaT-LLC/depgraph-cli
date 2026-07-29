@@ -447,7 +447,6 @@ struct StableReleaseGateReport {
     checks: Vec<StableReleaseGateCheck>,
 }
 
-#[cfg(any(not(windows), test))]
 const ARCHIVE_MTIME: u64 = 1_234_567_890;
 
 fn main() -> Result<()> {
