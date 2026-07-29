@@ -34,6 +34,12 @@ environment clearing, path selection, output bounds, and process-tree cleanup,
 but do not claim a filesystem or network sandbox. Stable target support remains
 blocked on the five-target release gate.
 
+The Ubuntu 24.04 hosted CI runner enables unprivileged user namespaces on its
+ephemeral VM before the gate because the image's default AppArmor sysctl blocks
+bubblewrap namespace creation. The gate preflights both the user and network
+namespaces before any fixture runs; failure is terminal and does not fall back
+to host execution.
+
 ## Fixture and evidence matrix
 
 | Dimension | Fixtures and authoritative checks |

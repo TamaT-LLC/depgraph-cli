@@ -20,6 +20,15 @@ if [[ "$(stat -c '%u' "$bwrap")" != "0" ]] || (( (bwrap_mode & 8#022) != 0 )); t
   echo "bubblewrap must be root-owned and not group/world writable" >&2
   exit 1
 fi
+if ! "$bwrap" \
+  --die-with-parent \
+  --unshare-user \
+  --unshare-net \
+  --ro-bind / / \
+  -- /usr/bin/true; then
+  echo "compiler-precise hostile E2E requires usable user and network namespaces" >&2
+  exit 1
+fi
 
 export CARGO_NET_OFFLINE=true
 cargo test --offline -p depgraph-core --lib --locked build::tests
