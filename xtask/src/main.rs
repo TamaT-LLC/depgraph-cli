@@ -1136,6 +1136,11 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
     let docs_index = fs::read_to_string(root.join("docs/00_index/index.md"))?;
     let rust_compiler_adr =
         fs::read_to_string(root.join("docs/40_arch_design/adr-rust-compiler-precise-backend.md"))?;
+    let rust_compiler_hostile =
+        fs::read_to_string(root.join("docs/50_test/compiler-precise-hostile-e2e.md"))?;
+    let rust_compiler_hostile_gate =
+        fs::read_to_string(root.join("scripts/compiler-precise-hostile-e2e.sh"))?;
+    let ci_workflow = fs::read_to_string(root.join(".github/workflows/ci.yml"))?;
     let cross_language_adr = fs::read_to_string(
         root.join("docs/40_arch_design/adr-cross-language-adapter-contract.md"),
     )?;
@@ -1232,12 +1237,48 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "## Options considered",
         "## Security review gates",
         "## Staged implementation and acceptance matrix",
+        "`linux-bubblewrap-v1`",
+        "`compiler-precise-hostile-e2e-v1`",
+        "Hostile execution and rollback E2E (implemented in #248)",
         "every admitted Cargo unit invocation, including dependency, build-script, and proc-macro units",
         "| Five-target release gate | 2-3 days |",
         "| Safe invariant |",
     ] {
         if !rust_compiler_adr.contains(required) {
             bail!("Rust compiler-precise ADR is missing required contract {required:?}");
+        }
+    }
+    for required in [
+        "Evidence contract: `compiler-precise-hostile-e2e-v1`",
+        "filesystem isolation: enforced",
+        "network isolation: enforced",
+        "process isolation: enforced",
+        "`rust-compiler-invocation-child-signalled`",
+        "`repeated_promotion_is_byte_stable_and_failure_rolls_back`",
+        "The hostile gate fails if",
+    ] {
+        if !rust_compiler_hostile.contains(required) {
+            bail!("compiler-precise hostile evidence is missing {required:?}");
+        }
+    }
+    for required in [
+        "compiler-precise-hostile-e2e-v1",
+        "enforced_hostile_boundary_denies_parent_secret_network_and_private_paths",
+        "unsafe[[:space:]]*\\{",
+        "previous_completed_build_layer_preserved",
+    ] {
+        if !rust_compiler_hostile_gate.contains(required) {
+            bail!("compiler-precise hostile gate is missing {required:?}");
+        }
+    }
+    for required in [
+        "compiler-precise-hostile:",
+        "sudo apt-get install --yes --no-install-recommends bubblewrap",
+        "scripts/compiler-precise-hostile-e2e.sh",
+        "compiler-precise-hostile-${{ github.sha }}",
+    ] {
+        if !ci_workflow.contains(required) {
+            bail!("CI is missing compiler-precise hostile gate {required:?}");
         }
     }
     for required in [
@@ -1516,12 +1557,17 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "artifacts/release-verification.json",
         "benchmark-report-${{ github.sha }}",
         "dist/*.query-smoke.json",
+        "compiler-precise-hostile:",
+        "sudo apt-get install --yes --no-install-recommends bubblewrap",
+        "run: scripts/compiler-precise-hostile-e2e.sh",
+        "needs: [quality, compiler-precise-hostile]",
         "DEPGRAPH_BOUNDED_QUERY_PLAN_LIMIT_MS: \"7000\"",
         "DEPGRAPH_BOUNDED_QUERY_EXECUTE_LIMIT_MS: \"10000\"",
         "node scripts/benchmark-report.mjs verify benchmark/benchmark-report.json",
-        "needs: [quality, benchmark, package, verify-assets]",
+        "needs: [quality, compiler-precise-hostile, benchmark, package, verify-assets]",
         "cargo xtask stable-release-gate artifacts/release-verification.json benchmark/benchmark-report.json --output artifacts/stable-release-gate.json",
         "DEPGRAPH_RELEASE_QUALITY_RESULT: ${{ needs.quality.result }}",
+        "DEPGRAPH_RELEASE_COMPILER_PRECISE_HOSTILE_RESULT: ${{ needs.compiler-precise-hostile.result }}",
         "DEPGRAPH_RELEASE_BENCHMARK_RESULT: ${{ needs.benchmark.result }}",
         "DEPGRAPH_RELEASE_PACKAGE_RESULT: ${{ needs.package.result }}",
         "DEPGRAPH_RELEASE_VERIFY_ASSETS_RESULT: ${{ needs.verify-assets.result }}",
@@ -4456,12 +4502,16 @@ fn evaluate_stable_release_gate(
                 && workflow_results.get("ref_type").map(String::as_str) == Some("tag")
                 && workflow_results.get("ref_name").map(String::as_str)
                     == Some("v0.4.0")
-                && ["quality", "benchmark", "package", "verify-assets"]
+                && [
+                    "quality",
+                    "compiler-precise-hostile",
+                    "benchmark",
+                    "package",
+                    "verify-assets",
+                ]
                     .iter()
                     .all(|job| workflow_results.get(*job).map(String::as_str) == Some("success")),
-            evidence:
-                "stable-gate needs quality, benchmark, package, and verify-assets in release.yml"
-                    .to_owned(),
+            evidence: "stable-gate needs quality, compiler-precise-hostile, benchmark, package, and verify-assets in release.yml".to_owned(),
         },
     ];
     let decision = if checks.iter().all(|check| check.passed) {
@@ -4488,6 +4538,10 @@ fn stable_release_workflow_results() -> BTreeMap<String, String> {
         ("ref_type", "GITHUB_REF_TYPE"),
         ("ref_name", "GITHUB_REF_NAME"),
         ("quality", "DEPGRAPH_RELEASE_QUALITY_RESULT"),
+        (
+            "compiler-precise-hostile",
+            "DEPGRAPH_RELEASE_COMPILER_PRECISE_HOSTILE_RESULT",
+        ),
         ("benchmark", "DEPGRAPH_RELEASE_BENCHMARK_RESULT"),
         ("package", "DEPGRAPH_RELEASE_PACKAGE_RESULT"),
         ("verify-assets", "DEPGRAPH_RELEASE_VERIFY_ASSETS_RESULT"),
@@ -12469,6 +12523,7 @@ jobs:
                 STABLE_RELEASE_BASELINE_COMMIT.to_owned(),
             ),
             ("quality".to_owned(), "success".to_owned()),
+            ("compiler-precise-hostile".to_owned(), "success".to_owned()),
             ("benchmark".to_owned(), "success".to_owned()),
             ("package".to_owned(), "success".to_owned()),
             ("verify-assets".to_owned(), "success".to_owned()),
@@ -12562,6 +12617,20 @@ jobs:
                 "a".repeat(64),
                 "b".repeat(64),
                 failed_workflow,
+            )
+            .decision,
+            StableReleaseDecision::Reject
+        );
+
+        let mut failed_hostile = workflow_results.clone();
+        failed_hostile.insert("compiler-precise-hostile".to_owned(), "failure".to_owned());
+        assert_eq!(
+            evaluate_stable_release_gate(
+                &release,
+                &benchmark,
+                "a".repeat(64),
+                "b".repeat(64),
+                failed_hostile,
             )
             .decision,
             StableReleaseDecision::Reject

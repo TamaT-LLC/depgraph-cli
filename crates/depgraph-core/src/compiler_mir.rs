@@ -2073,16 +2073,10 @@ mod tests {
         );
         assert!(reject_forbidden_serialized_text(b"{\"value\":\"TyCtxt\"}").is_err());
 
-        let directory = tempfile::tempdir()?;
-        let oversized = directory
-            .path()
-            .join(format!("mir-{}.json", "1".repeat(64)));
-        let file = fs::File::create(oversized)?;
-        file.set_len(MAX_UNIT_FILE_BYTES + 1)?;
         let ledger = RustCompilerInvocationLedger {
             schema_version: "depgraph-rust-compiler-invocation-ledger-v1".to_owned(),
             digest: "6".repeat(64),
-            attempt_digest: unit.attempt_digest,
+            attempt_digest: unit.attempt_digest.clone(),
             unit_graph_digest: "7".repeat(64),
             entries: vec![invocation],
         };
@@ -2092,6 +2086,67 @@ mod tests {
             units: vec![graph],
             roots: vec!["cargo-unit:fixture".to_owned()],
         };
+
+        let directory = tempfile::tempdir()?;
+        let hostile_path = directory
+            .path()
+            .join(format!("mir-{}.json", unit.invocation_id));
+        fs::write(&hostile_path, b"{\"truncated\":")?;
+        assert!(
+            validate_compiler_mir_directory(
+                directory.path(),
+                checkout.path(),
+                cargo_home.path(),
+                &graph,
+                &ledger,
+                &pack,
+            )
+            .is_err()
+        );
+
+        let mut foreign = unit.clone();
+        foreign.attempt_digest = "9".repeat(64);
+        foreign.digest = compiler_mir_unit_digest(&foreign)?;
+        fs::write(&hostile_path, serde_json::to_vec(&foreign)?)?;
+        assert!(
+            validate_compiler_mir_directory(
+                directory.path(),
+                checkout.path(),
+                cargo_home.path(),
+                &graph,
+                &ledger,
+                &pack,
+            )
+            .is_err()
+        );
+        fs::remove_file(&hostile_path)?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            let outside = checkout.path().join("foreign-mir-record");
+            fs::write(&outside, serde_json::to_vec(&unit)?)?;
+            symlink(&outside, &hostile_path)?;
+            assert!(
+                validate_compiler_mir_directory(
+                    directory.path(),
+                    checkout.path(),
+                    cargo_home.path(),
+                    &graph,
+                    &ledger,
+                    &pack,
+                )
+                .is_err()
+            );
+            fs::remove_file(&hostile_path)?;
+        }
+
+        let oversized = directory
+            .path()
+            .join(format!("mir-{}.json", "1".repeat(64)));
+        let file = fs::File::create(oversized)?;
+        file.set_len(MAX_UNIT_FILE_BYTES + 1)?;
         assert!(
             validate_compiler_mir_directory(
                 directory.path(),

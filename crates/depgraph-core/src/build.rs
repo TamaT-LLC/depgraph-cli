@@ -166,6 +166,7 @@ pub struct BuildExecutionPlan {
     pub adapter: String,
     pub adapter_version: String,
     pub profile_id: String,
+    pub isolation: BuildIsolation,
     pub program: String,
     pub arguments: Vec<String>,
     pub logical_cwd: PathBuf,
@@ -201,6 +202,7 @@ pub fn create_build_execution_request(source_root: &Path) -> Result<BuildExecuti
                 adapter: RUST_BUILD_OBSERVER.to_owned(),
                 adapter_version: RUST_BUILD_OBSERVER_VERSION.to_owned(),
                 profile_id: "rust:build".to_owned(),
+                isolation: BuildIsolation::BestEffort,
                 program: "cargo".to_owned(),
                 arguments: vec![
                     "build".to_owned(),
@@ -273,6 +275,7 @@ pub fn create_build_execution_request(source_root: &Path) -> Result<BuildExecuti
                 adapter: config.adapter.observer().to_owned(),
                 adapter_version: config.adapter.observer_version().to_owned(),
                 profile_id: format!("web:build:{}", config.adapter.key()),
+                isolation: BuildIsolation::BestEffort,
                 program: "node".to_owned(),
                 arguments: vec![display_logical(&config.entrypoint)],
                 logical_cwd: PathBuf::from("."),
@@ -314,6 +317,7 @@ pub fn create_compiler_precise_unit_graph_request(
             adapter: COMPILER_PRECISE_UNIT_GRAPH_ADAPTER.to_owned(),
             adapter_version: COMPILER_PRECISE_UNIT_GRAPH_ADAPTER_VERSION.to_owned(),
             profile_id: "rust:compiler-precise:unit-graph".to_owned(),
+            isolation: compiler_precise_isolation(),
             program: "cargo".to_owned(),
             arguments: vec![
                 "build".to_owned(),
@@ -373,6 +377,7 @@ pub fn create_compiler_precise_invocation_request(
             adapter: COMPILER_PRECISE_INVOCATION_ADAPTER.to_owned(),
             adapter_version: COMPILER_PRECISE_INVOCATION_ADAPTER_VERSION.to_owned(),
             profile_id,
+            isolation: compiler_precise_isolation(),
             program: "cargo".to_owned(),
             arguments: vec![
                 "build".to_owned(),
@@ -435,6 +440,9 @@ impl BuildExecutionPlan {
         }
         if self.stdout_limit_bytes == 0 || self.stderr_limit_bytes == 0 {
             bail!("build output limits must be at least 1 byte");
+        }
+        if self.isolation == BuildIsolation::EnforcedLinuxNamespace && !cfg!(target_os = "linux") {
+            bail!("enforced build isolation requires the Linux namespace boundary");
         }
         for key in self.environment.keys() {
             if !is_allowed_environment_key(key) {
@@ -529,6 +537,30 @@ pub enum BuildOutcomeKind {
     TimedOut,
     Cancelled,
     SecurityFailed,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum BuildIsolation {
+    BestEffort,
+    EnforcedLinuxNamespace,
+}
+
+impl BuildIsolation {
+    fn contract_name(self) -> &'static str {
+        match self {
+            Self::BestEffort => "best-effort",
+            Self::EnforcedLinuxNamespace => "linux-bubblewrap-v1",
+        }
+    }
+}
+
+const fn compiler_precise_isolation() -> BuildIsolation {
+    if cfg!(target_os = "linux") {
+        BuildIsolation::EnforcedLinuxNamespace
+    } else {
+        BuildIsolation::BestEffort
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -669,20 +701,6 @@ where
 
     let started_wall = Utc::now();
     let started = Instant::now();
-    let mut command = Command::new(&program);
-    command
-        .args(&plan.arguments)
-        .current_dir(&canonical_cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .env_clear();
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt as _;
-        command.as_std_mut().process_group(0);
-    }
     let mut effective_environment = supervisor_environment(
         &source_root,
         &run,
@@ -698,6 +716,7 @@ where
         "version": BUILD_SUPERVISOR_VERSION,
         "adapter": plan.adapter,
         "adapter_version": plan.adapter_version,
+        "isolation": plan.isolation.contract_name(),
         "program": plan.program,
         "arguments": redacted_arguments,
         "logical_cwd": display_logical(&plan.logical_cwd),
@@ -834,11 +853,18 @@ where
     } else {
         None
     };
+    let (mut command, network_isolation, isolation_diagnostic) = build_child_command(
+        &program,
+        &plan.arguments,
+        &canonical_cwd,
+        &run,
+        compiler_pack_preflight.as_ref(),
+        plan.isolation,
+    )?;
     command.envs(&effective_environment);
     let (environment_keys, redacted_secret_key_count) =
         audit_environment_keys(effective_environment.keys().map(String::as_str));
     let environment_key_set_digest = digest_json(&environment_keys)?;
-    let (network_isolation, isolation_diagnostic) = network_isolation_capability();
 
     let mut child = command
         .spawn()
@@ -864,11 +890,14 @@ where
         WaitResult::Process(Ok(status)) if status.success() => {
             (BuildOutcomeKind::Completed, status.code(), None)
         }
-        WaitResult::Process(Ok(status)) => (
-            BuildOutcomeKind::Failed,
-            status.code(),
-            Some("build-child-failed".to_owned()),
-        ),
+        WaitResult::Process(Ok(status)) => {
+            let exit_code = status.code();
+            (
+                BuildOutcomeKind::Failed,
+                exit_code,
+                Some(child_failure_diagnostic(&plan.adapter, exit_code).to_owned()),
+            )
+        }
         WaitResult::Process(Err(_)) => (
             BuildOutcomeKind::Failed,
             None,
@@ -1073,6 +1102,17 @@ where
     })
 }
 
+fn child_failure_diagnostic(adapter: &str, exit_code: Option<i32>) -> &'static str {
+    match (adapter, exit_code.is_none()) {
+        (COMPILER_PRECISE_UNIT_GRAPH_ADAPTER, true) => "rust-compiler-unit-graph-child-signalled",
+        (COMPILER_PRECISE_UNIT_GRAPH_ADAPTER, false) => "rust-compiler-unit-graph-child-failed",
+        (COMPILER_PRECISE_INVOCATION_ADAPTER, true) => "rust-compiler-invocation-child-signalled",
+        (COMPILER_PRECISE_INVOCATION_ADAPTER, false) => "rust-compiler-invocation-child-failed",
+        (_, true) => "build-child-signalled",
+        (_, false) => "build-child-failed",
+    }
+}
+
 fn web_adapter_for_observer(observer: &str) -> Option<WebBuildAdapter> {
     match observer {
         NEXT_BUILD_OBSERVER => Some(WebBuildAdapter::Next),
@@ -1172,6 +1212,167 @@ impl BuildRunDirectories {
             temporary: temporary.canonicalize()?,
         })
     }
+}
+
+fn build_child_command(
+    program: &Path,
+    arguments: &[String],
+    cwd: &Path,
+    run: &BuildRunDirectories,
+    compiler_pack: Option<&VerifiedCompilerPack>,
+    isolation: BuildIsolation,
+) -> Result<(Command, NetworkIsolation, Option<String>)> {
+    let (mut command, network_isolation, isolation_diagnostic) = match isolation {
+        BuildIsolation::BestEffort => {
+            let command = Command::new(program);
+            let (network_isolation, isolation_diagnostic) =
+                best_effort_network_isolation_capability();
+            (command, network_isolation, isolation_diagnostic)
+        }
+        BuildIsolation::EnforcedLinuxNamespace => {
+            #[cfg(target_os = "linux")]
+            {
+                (
+                    linux_namespace_command(program, arguments, cwd, run, compiler_pack)?,
+                    NetworkIsolation::Enforced,
+                    None,
+                )
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = (program, arguments, cwd, run, compiler_pack);
+                bail!("enforced build isolation requires the Linux namespace boundary");
+            }
+        }
+    };
+    if isolation == BuildIsolation::BestEffort {
+        command.args(arguments);
+    }
+    command
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .env_clear();
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.as_std_mut().process_group(0);
+    }
+    Ok((command, network_isolation, isolation_diagnostic))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_namespace_command(
+    program: &Path,
+    arguments: &[String],
+    cwd: &Path,
+    run: &BuildRunDirectories,
+    compiler_pack: Option<&VerifiedCompilerPack>,
+) -> Result<Command> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let bwrap = [Path::new("/usr/bin/bwrap"), Path::new("/bin/bwrap")]
+        .into_iter()
+        .find_map(|candidate| {
+            let canonical = candidate.canonicalize().ok()?;
+            let metadata = fs::metadata(&canonical).ok()?;
+            (metadata.is_file() && metadata.uid() == 0 && metadata.mode() & 0o022 == 0)
+                .then_some(canonical)
+        })
+        .context(
+            "enforced build isolation requires a root-owned, non-writable bubblewrap executable",
+        )?;
+    let program = program
+        .canonicalize()
+        .context("enforced build executable is unavailable")?;
+    let mut command = Command::new(bwrap);
+    command.args([
+        "--die-with-parent",
+        "--new-session",
+        "--unshare-user",
+        "--unshare-ipc",
+        "--unshare-pid",
+        "--unshare-net",
+        "--unshare-uts",
+        "--cap-drop",
+        "ALL",
+        "--hostname",
+        "depgraph-build",
+    ]);
+    add_linux_runtime_mounts(&mut command)?;
+    add_sandbox_parent_directories(&mut command, run._root.path())?;
+    command
+        .arg("--ro-bind")
+        .arg(&run.workspace)
+        .arg(&run.workspace);
+    for directory in [&run.home, &run.output, &run.cache, &run.temporary] {
+        command.arg("--bind").arg(directory).arg(directory);
+    }
+    if let Some(pack) = compiler_pack {
+        add_sandbox_parent_directories(&mut command, &pack.root)?;
+        command.arg("--ro-bind").arg(&pack.root).arg(&pack.root);
+    } else if !["/usr", "/bin", "/sbin", "/lib", "/lib64"]
+        .iter()
+        .any(|root| program.starts_with(root))
+    {
+        add_sandbox_parent_directories(&mut command, &program)?;
+        command.arg("--ro-bind").arg(&program).arg(&program);
+    }
+    command
+        .arg("--chdir")
+        .arg(cwd)
+        .arg("--")
+        .arg(program)
+        .args(arguments);
+    Ok(command)
+}
+
+#[cfg(target_os = "linux")]
+fn add_linux_runtime_mounts(command: &mut Command) -> Result<()> {
+    let usr = Path::new("/usr");
+    if !usr.is_dir() {
+        bail!("enforced build isolation requires the system /usr runtime");
+    }
+    command.arg("--ro-bind").arg(usr).arg(usr);
+    for path in ["/bin", "/sbin", "/lib", "/lib64"] {
+        let path = Path::new(path);
+        let Ok(metadata) = fs::symlink_metadata(path) else {
+            continue;
+        };
+        if metadata.file_type().is_symlink() {
+            command.arg("--symlink").arg(fs::read_link(path)?).arg(path);
+        } else if metadata.is_dir() {
+            command.arg("--ro-bind").arg(path).arg(path);
+        } else {
+            bail!("enforced build runtime path {} is unsafe", path.display());
+        }
+    }
+    command.args(["--dir", "/etc"]);
+    let loader_cache = Path::new("/etc/ld.so.cache");
+    if loader_cache.is_file() {
+        command.arg("--ro-bind").arg(loader_cache).arg(loader_cache);
+    }
+    command.args(["--dir", "/tmp", "--proc", "/proc", "--dev", "/dev"]);
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn add_sandbox_parent_directories(command: &mut Command, path: &Path) -> Result<()> {
+    let parent = path.parent();
+    let Some(parent) = parent else {
+        return Ok(());
+    };
+    let mut directories = parent
+        .ancestors()
+        .filter(|ancestor| *ancestor != Path::new("/"))
+        .collect::<Vec<_>>();
+    directories.reverse();
+    for directory in directories {
+        command.arg("--dir").arg(directory);
+    }
+    Ok(())
 }
 
 fn supervisor_environment(
@@ -1947,7 +2148,7 @@ fn digest_json(value: &impl Serialize) -> Result<String> {
     Ok(digest_bytes(&serde_json::to_vec(value)?))
 }
 
-fn network_isolation_capability() -> (NetworkIsolation, Option<String>) {
+fn best_effort_network_isolation_capability() -> (NetworkIsolation, Option<String>) {
     let platform = std::env::consts::OS;
     (
         NetworkIsolation::BestEffort,
@@ -2073,6 +2274,7 @@ mod tests {
             adapter: "fixture".to_owned(),
             adapter_version: "1.0".to_owned(),
             profile_id: "fixture:build".to_owned(),
+            isolation: BuildIsolation::BestEffort,
             program: "node".to_owned(),
             arguments,
             logical_cwd: PathBuf::from("."),
@@ -2236,6 +2438,7 @@ mod tests {
             adapter: "compiler-pack-fixture".to_owned(),
             adapter_version: "1.0".to_owned(),
             profile_id: "rust:compiler-precise".to_owned(),
+            isolation: BuildIsolation::BestEffort,
             program: "cargo".to_owned(),
             arguments: vec!["build".to_owned()],
             logical_cwd: PathBuf::from("."),
@@ -2464,6 +2667,189 @@ printf '{"version":1,"units":[{"pkg_id":"path+file://%s#0.1.0","target":{"kind":
         );
         tokio::time::sleep(Duration::from_secs(2)).await;
         assert!(!root.path().join("DESCENDANT_SURVIVED").exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn child_output_and_disk_failures_are_reason_coded_and_leave_no_validated_delta()
+    -> Result<()> {
+        let root = tempfile::tempdir()?;
+        fs::write(
+            root.path().join("failed.mjs"),
+            "process.stderr.write('compiler panic fixture'); process.exit(71);\n",
+        )?;
+        let failed =
+            supervise_build(root.path(), &node_plan(vec!["failed.mjs".to_owned()])).await?;
+        assert_eq!(failed.audit.outcome, BuildOutcomeKind::Failed);
+        assert_eq!(failed.audit.exit_code, Some(71));
+        assert_eq!(
+            failed.audit.diagnostic_code.as_deref(),
+            Some("build-child-failed")
+        );
+        assert!(failed.audit.validated_output_digest.is_none());
+
+        fs::write(
+            root.path().join("noisy.mjs"),
+            "process.stdout.write('x'.repeat(4096));\n",
+        )?;
+        let mut noisy_plan = node_plan(vec!["noisy.mjs".to_owned()]);
+        noisy_plan.stdout_limit_bytes = 64;
+        let noisy = supervise_build(root.path(), &noisy_plan).await?;
+        assert_eq!(noisy.audit.outcome, BuildOutcomeKind::Failed);
+        assert!(noisy.audit.stdout_truncated);
+        assert_eq!(
+            noisy.audit.diagnostic_code.as_deref(),
+            Some("build-output-limit")
+        );
+        assert!(noisy.audit.validated_output_digest.is_none());
+
+        #[cfg(unix)]
+        {
+            fs::write(root.path().join("signal.sh"), "kill -SEGV $$\n")?;
+            let mut signal_plan = node_plan(vec!["signal.sh".to_owned()]);
+            signal_plan.program = "bash".to_owned();
+            let signalled = supervise_build(root.path(), &signal_plan).await?;
+            assert_eq!(signalled.audit.outcome, BuildOutcomeKind::Failed);
+            assert_eq!(signalled.audit.exit_code, None);
+            assert_eq!(
+                signalled.audit.diagnostic_code.as_deref(),
+                Some("build-child-signalled")
+            );
+            assert!(signalled.audit.validated_output_digest.is_none());
+        }
+
+        fs::write(
+            root.path().join("disk.mjs"),
+            format!(
+                "import fs from 'node:fs'; fs.closeSync(fs.openSync(process.env.DEPGRAPH_OUTPUT_DIR + '/oversized', 'w')); fs.truncateSync(process.env.DEPGRAPH_OUTPUT_DIR + '/oversized', {});\n",
+                MAX_STAGED_BYTES + 1
+            ),
+        )?;
+        let disk = supervise_build(root.path(), &node_plan(vec!["disk.mjs".to_owned()])).await?;
+        assert_eq!(disk.audit.outcome, BuildOutcomeKind::SecurityFailed);
+        assert_eq!(
+            disk.audit.diagnostic_code.as_deref(),
+            Some("build-output-security-policy")
+        );
+        assert!(disk.audit.validated_output_digest.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn compiler_child_failures_have_stage_and_signal_specific_reason_codes() {
+        assert_eq!(
+            child_failure_diagnostic(COMPILER_PRECISE_UNIT_GRAPH_ADAPTER, Some(1)),
+            "rust-compiler-unit-graph-child-failed"
+        );
+        assert_eq!(
+            child_failure_diagnostic(COMPILER_PRECISE_UNIT_GRAPH_ADAPTER, None),
+            "rust-compiler-unit-graph-child-signalled"
+        );
+        assert_eq!(
+            child_failure_diagnostic(COMPILER_PRECISE_INVOCATION_ADAPTER, Some(1)),
+            "rust-compiler-invocation-child-failed"
+        );
+        assert_eq!(
+            child_failure_diagnostic(COMPILER_PRECISE_INVOCATION_ADAPTER, None),
+            "rust-compiler-invocation-child-signalled"
+        );
+        assert_eq!(
+            child_failure_diagnostic("fixture", None),
+            "build-child-signalled"
+        );
+    }
+
+    #[test]
+    fn compiler_precise_requests_never_fall_back_from_the_linux_namespace_boundary() {
+        let expected = if cfg!(target_os = "linux") {
+            BuildIsolation::EnforcedLinuxNamespace
+        } else {
+            BuildIsolation::BestEffort
+        };
+        assert_eq!(compiler_precise_isolation(), expected);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires the dedicated Linux bubblewrap hostile CI boundary"]
+    async fn enforced_hostile_boundary_denies_parent_secret_network_and_private_paths() -> Result<()>
+    {
+        use std::net::TcpListener;
+
+        let parent_secret = std::env::var("DEPGRAPH_HOSTILE_PARENT_SECRET")
+            .context("hostile gate did not install its parent-only secret")?;
+        let root = tempfile::tempdir()?;
+        let project = root.path().join("project");
+        fs::create_dir(&project)?;
+        let private_file = root.path().join("parent-private-credential");
+        let store_file = root.path().join("parent-store.db");
+        let descendant_marker = root.path().join("DESCENDANT_SURVIVED");
+        let descendant_token = format!("depgraph-hostile-descendant-{}", std::process::id());
+        fs::write(&private_file, &parent_secret)?;
+        fs::write(&store_file, &parent_secret)?;
+        let listener = TcpListener::bind(("127.0.0.1", 0))?;
+        listener.set_nonblocking(true)?;
+        let port = listener.local_addr()?.port();
+
+        fs::write(
+            project.join("benign-hostile-boundary.sh"),
+            format!(
+                r#"set -eu
+if [ "${{DEPGRAPH_HOSTILE_PARENT_SECRET+x}}" = x ]; then exit 81; fi
+if [ -r "{private}" ]; then exit 82; fi
+if [ -r "{store}" ]; then exit 83; fi
+if timeout 1 bash -c 'exec 3<>/dev/tcp/127.0.0.1/{port}' 2>/dev/null; then exit 84; fi
+printf yes > "$DEPGRAPH_OUTPUT_DIR/PROJECT_CODE_EXECUTED"
+"#,
+                private = private_file.display(),
+                store = store_file.display(),
+            ),
+        )?;
+        let mut benign = node_plan(vec!["benign-hostile-boundary.sh".to_owned()]);
+        benign.program = "bash".to_owned();
+        benign.isolation = BuildIsolation::EnforcedLinuxNamespace;
+        let outcome = supervise_build(&project, &benign).await?;
+        assert_eq!(outcome.audit.outcome, BuildOutcomeKind::Completed);
+        assert_eq!(outcome.audit.network_isolation, NetworkIsolation::Enforced);
+        assert!(outcome.project_code_executed);
+        assert!(listener.accept().is_err());
+        let audit = serde_json::to_string(&outcome.audit)?;
+        assert!(!audit.contains(&parent_secret));
+        assert!(!audit.contains(private_file.to_string_lossy().as_ref()));
+        assert!(!audit.contains(store_file.to_string_lossy().as_ref()));
+
+        fs::write(
+            project.join("armed-descendant.sh"),
+            format!(
+                "bash -c 'sleep 30; printf unsafe > \"{}\"' '{}' &\nwait\n",
+                descendant_marker.display(),
+                descendant_token,
+            ),
+        )?;
+        let mut armed = node_plan(vec!["armed-descendant.sh".to_owned()]);
+        armed.program = "bash".to_owned();
+        armed.isolation = BuildIsolation::EnforcedLinuxNamespace;
+        armed.timeout_seconds = 1;
+        let timed_out = supervise_build(&project, &armed).await?;
+        assert_eq!(timed_out.audit.outcome, BuildOutcomeKind::TimedOut);
+        assert_eq!(
+            timed_out.audit.network_isolation,
+            NetworkIsolation::Enforced
+        );
+        assert_eq!(
+            timed_out.audit.diagnostic_code.as_deref(),
+            Some("build-timeout")
+        );
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(!descendant_marker.exists());
+        let escaped_descendant = fs::read_dir("/proc")?.filter_map(Result::ok).any(|entry| {
+            fs::read(entry.path().join("cmdline"))
+                .map(|command_line| {
+                    String::from_utf8_lossy(&command_line).contains(&descendant_token)
+                })
+                .unwrap_or(false)
+        });
+        assert!(!escaped_descendant);
         Ok(())
     }
 

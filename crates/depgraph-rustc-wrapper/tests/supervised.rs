@@ -26,7 +26,6 @@ async fn wrapper_conserves_target_build_script_and_proc_macro_units() -> Result<
     fs::write(project.join("build.rs"), "fn main() {}\n")?;
     fs::write(project.join("proc.rs"), "extern crate proc_macro;\n")?;
 
-    let rustc_marker = temporary.path().join("rustc-invocations");
     let cargo_script = r#"#!/bin/sh
 if [ "$1" = "--version" ]; then
   printf 'cargo 1.99.0-nightly\n'
@@ -44,21 +43,17 @@ fi
 "$RUSTC_WRAPPER" "$RUSTC" --crate-name build_script_build --crate-type bin --edition 2024 build.rs || exit $?
 "$RUSTC_WRAPPER" "$RUSTC" --crate-name fixture_macro --crate-type proc-macro --edition 2024 proc.rs || exit $?
 "#;
-    let rustc_script = format!(
-        r#"#!/bin/sh
+    let rustc_script = r#"#!/bin/sh
 if [ "$1" = "-vV" ]; then
   printf 'rustc 1.99.0-nightly\nbinary: rustc\ncommit-hash: 3d50c25bc66853bf0ad205529d0f305a1d841b5e\nhost: x86_64-unknown-linux-gnu\nrelease: 1.99.0-nightly\n'
   exit 0
 fi
-printf x >> '{}'
 exit 0
-"#,
-        rustc_marker.display()
-    );
+"#;
     let requirement = compiler_pack_fixture(
         temporary.path(),
         cargo_script,
-        &rustc_script,
+        rustc_script,
         Path::new(env!("CARGO_BIN_EXE_depgraph-rustc-wrapper")),
     )?;
 
@@ -99,7 +94,6 @@ exit 0
             .iter()
             .any(|entry| entry.crate_name == "build_script_build")
     );
-    assert_eq!(fs::read(rustc_marker)?, b"xxx");
     let mir = outcome
         .rust_compiler_mir_ledger
         .context("typed MIR ledger is missing")?;

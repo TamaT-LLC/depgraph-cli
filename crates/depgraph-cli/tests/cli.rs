@@ -4306,6 +4306,22 @@ fn safe_scan_does_not_resolve_node_git_or_node_options_from_the_repository() {
     .unwrap();
     write_worker(&root.join("node"), "printf unsafe > NODE_EXECUTED\nexit 91");
     write_worker(&root.join("git"), "printf unsafe > GIT_EXECUTED\nexit 91");
+    write_worker(
+        &root.join("cargo"),
+        "printf unsafe > CARGO_EXECUTED\nexit 91",
+    );
+    write_worker(
+        &root.join("rustc"),
+        "printf unsafe > RUSTC_EXECUTED\nexit 91",
+    );
+    write_worker(
+        &root.join("rustc-wrapper"),
+        "printf unsafe > RUSTC_WRAPPER_EXECUTED\nexit 91",
+    );
+    write_worker(
+        &root.join("rustc-workspace-wrapper"),
+        "printf unsafe > RUSTC_WORKSPACE_WRAPPER_EXECUTED\nexit 91",
+    );
     fs::write(
         root.join("project-hook.cjs"),
         "require('node:fs').writeFileSync('NODE_OPTIONS_EXECUTED', 'unsafe')\n",
@@ -4333,26 +4349,113 @@ for (const event of events) console.log(JSON.stringify(event));
     let mut paths = vec![std::path::PathBuf::from(".")];
     paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
     let path = std::env::join_paths(paths).unwrap();
-
-    Command::cargo_bin("depgraph")
+    let first_store = temp.path().join("web-before-pack.db");
+    let first = Command::cargo_bin("depgraph")
         .unwrap()
         .current_dir(&root)
-        .env("PATH", path)
+        .env("PATH", &path)
         .env("NODE_OPTIONS", "--require ./project-hook.cjs")
+        .env("RUSTC", root.join("rustc"))
+        .env("RUSTC_WRAPPER", root.join("rustc-wrapper"))
+        .env(
+            "RUSTC_WORKSPACE_WRAPPER",
+            root.join("rustc-workspace-wrapper"),
+        )
         .env("DEPGRAPH_WEB_WORKER", &worker)
         .args([
             "--store",
-            temp.path().join("web.db").to_str().unwrap(),
+            first_store.to_str().unwrap(),
             "scan",
             ".",
             "--json",
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains("\"status\": \"completed\""));
+        .stdout(predicate::str::contains("\"status\": \"completed\""))
+        .get_output()
+        .stdout
+        .clone();
+
+    let compiler_pack = root.join(".depgraph/compiler-pack");
+    fs::create_dir_all(&compiler_pack).unwrap();
+    fs::write(
+        compiler_pack.join("manifest.json"),
+        r#"{"schema_version":"hostile-safe-scan-canary"}"#,
+    )
+    .unwrap();
+    for executable in ["cargo", "rustc", "rustc-wrapper", "rustc-workspace-wrapper"] {
+        write_worker(
+            &compiler_pack.join(executable),
+            &format!("printf unsafe > {}_PACK_EXECUTED\nexit 91", executable),
+        );
+    }
+
+    let second_store = temp.path().join("web-after-pack.db");
+    let second = Command::cargo_bin("depgraph")
+        .unwrap()
+        .current_dir(&root)
+        .env("PATH", &path)
+        .env("NODE_OPTIONS", "--require ./project-hook.cjs")
+        .env("RUSTC", root.join("rustc"))
+        .env("RUSTC_WRAPPER", root.join("rustc-wrapper"))
+        .env(
+            "RUSTC_WORKSPACE_WRAPPER",
+            root.join("rustc-workspace-wrapper"),
+        )
+        .env("DEPGRAPH_WEB_WORKER", &worker)
+        .args([
+            "--store",
+            second_store.to_str().unwrap(),
+            "scan",
+            ".",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"status\": \"completed\""))
+        .get_output()
+        .stdout
+        .clone();
+
+    let cache_keys = |output: &[u8]| {
+        serde_json::from_slice::<serde_json::Value>(output).unwrap()["cache_events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|event| event["cache_key"].as_str().map(ToOwned::to_owned))
+            .collect::<Vec<_>>()
+    };
+    let first_cache_keys = cache_keys(&first);
+    assert!(!first_cache_keys.is_empty());
+    assert_eq!(first_cache_keys, cache_keys(&second));
+
+    let export = |store: &std::path::Path| {
+        Command::cargo_bin("depgraph")
+            .unwrap()
+            .args([
+                "--store",
+                store.to_str().unwrap(),
+                "export",
+                "--format",
+                "json",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone()
+    };
+    assert_eq!(export(&first_store), export(&second_store));
     assert!(!root.join("NODE_EXECUTED").exists());
     assert!(!root.join("GIT_EXECUTED").exists());
+    assert!(!root.join("CARGO_EXECUTED").exists());
+    assert!(!root.join("RUSTC_EXECUTED").exists());
+    assert!(!root.join("RUSTC_WRAPPER_EXECUTED").exists());
+    assert!(!root.join("RUSTC_WORKSPACE_WRAPPER_EXECUTED").exists());
     assert!(!root.join("NODE_OPTIONS_EXECUTED").exists());
+    for executable in ["cargo", "rustc", "rustc-wrapper", "rustc-workspace-wrapper"] {
+        assert!(!root.join(format!("{executable}_PACK_EXECUTED")).exists());
+    }
 }
 
 #[cfg(unix)]

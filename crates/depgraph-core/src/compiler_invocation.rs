@@ -1003,6 +1003,59 @@ mod tests {
         )?;
         assert_eq!(first, checkout_independent);
 
+        let write_pair = |start: &serde_json::Value| -> Result<()> {
+            let start_bytes = serde_json::to_vec(start)?;
+            fs::write(
+                ledger.join(format!("start-{invocation_id}.json")),
+                &start_bytes,
+            )?;
+            fs::write(
+                ledger.join(format!("terminal-{invocation_id}.json")),
+                serde_json::to_vec(&serde_json::json!({
+                    "schema_version": COMPILER_INVOCATION_RECORD_SCHEMA_VERSION,
+                    "record_kind": "terminal",
+                    "invocation_id": invocation_id,
+                    "attempt_digest": attempt,
+                    "start_record_sha256": digest_bytes(&start_bytes),
+                    "status": "completed",
+                    "exit_code": 0,
+                }))?,
+            )?;
+            Ok(())
+        };
+        for hostile_start in [
+            {
+                let mut value = start.clone();
+                value["attempt_digest"] = serde_json::json!("9".repeat(64));
+                value
+            },
+            {
+                let mut value = start.clone();
+                value["unit_id"] = serde_json::json!("cargo-unit:foreign");
+                value
+            },
+            {
+                let mut value = start.clone();
+                value["source_path"] = serde_json::json!("../parent-private-credential");
+                value
+            },
+        ] {
+            write_pair(&hostile_start)?;
+            assert!(
+                validate_compiler_invocation_ledger(
+                    &ledger,
+                    &workspace,
+                    &cargo_home,
+                    &graph,
+                    &attempt,
+                    &rustc,
+                    &verbose,
+                )
+                .is_err()
+            );
+        }
+        write_pair(&start)?;
+
         let duplicate_id = "e".repeat(64);
         let mut duplicate_start = start.clone();
         duplicate_start["invocation_id"] = serde_json::json!(duplicate_id);
@@ -1092,6 +1145,59 @@ mod tests {
             )
             .is_err()
         );
+        fs::remove_file(ledger.join("unknown.json"))?;
+
+        let invocation_id = "d".repeat(64);
+        let hostile_record = ledger.join(format!("start-{invocation_id}.json"));
+        fs::write(&hostile_record, b"{\"truncated\":")?;
+        assert!(
+            validate_compiler_invocation_ledger(
+                &ledger,
+                &workspace,
+                &cargo_home,
+                &graph,
+                &digest,
+                &digest,
+                &digest
+            )
+            .is_err()
+        );
+        let file = fs::File::create(&hostile_record)?;
+        file.set_len(MAX_LEDGER_FILE_BYTES + 1)?;
+        assert!(
+            validate_compiler_invocation_ledger(
+                &ledger,
+                &workspace,
+                &cargo_home,
+                &graph,
+                &digest,
+                &digest,
+                &digest
+            )
+            .is_err()
+        );
+        fs::remove_file(&hostile_record)?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            let outside = temporary.path().join("foreign-ledger-record");
+            fs::write(&outside, b"{}")?;
+            symlink(&outside, &hostile_record)?;
+            assert!(
+                validate_compiler_invocation_ledger(
+                    &ledger,
+                    &workspace,
+                    &cargo_home,
+                    &graph,
+                    &digest,
+                    &digest,
+                    &digest
+                )
+                .is_err()
+            );
+        }
         Ok(())
     }
 }
