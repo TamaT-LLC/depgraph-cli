@@ -20,6 +20,11 @@ use walkdir::{DirEntry, WalkDir};
 use crate::compiler_pack::{
     CompilerPackAttestation, CompilerPackRequirement, VerifiedCompilerPack, verify_compiler_pack,
 };
+use crate::compiler_precise::{
+    COMPILER_PRECISE_UNIT_GRAPH_ADAPTER, COMPILER_PRECISE_UNIT_GRAPH_ADAPTER_VERSION,
+    RustCargoUnitGraph, install_neutral_cargo_config, project_neutral_cargo_config,
+    validate_cargo_unit_graph,
+};
 use crate::rust_build_observer::{
     RUST_BUILD_OBSERVER, RUST_BUILD_OBSERVER_VERSION, RustBuildObservation,
     collect_rust_build_observation,
@@ -277,6 +282,48 @@ pub fn create_build_execution_request(source_root: &Path) -> Result<BuildExecuti
     )
 }
 
+pub fn create_compiler_precise_unit_graph_request(
+    source_root: &Path,
+    compiler_pack: CompilerPackRequirement,
+) -> Result<BuildExecutionRequest> {
+    let source_root = source_root
+        .canonicalize()
+        .context("compiler-precise source root is unavailable")?;
+    if !source_root.is_dir() {
+        bail!("compiler-precise source root is not a directory");
+    }
+    if !source_root.join("Cargo.toml").is_file() || !source_root.join("Cargo.lock").is_file() {
+        bail!("compiler-precise Rust requires confined Cargo.toml and Cargo.lock files");
+    }
+    project_neutral_cargo_config(&source_root)?;
+    Ok(BuildExecutionRequest {
+        source_root,
+        plan: BuildExecutionPlan {
+            adapter: COMPILER_PRECISE_UNIT_GRAPH_ADAPTER.to_owned(),
+            adapter_version: COMPILER_PRECISE_UNIT_GRAPH_ADAPTER_VERSION.to_owned(),
+            profile_id: "rust:compiler-precise:unit-graph".to_owned(),
+            program: "cargo".to_owned(),
+            arguments: vec![
+                "build".to_owned(),
+                "--frozen".to_owned(),
+                "--offline".to_owned(),
+                "--unit-graph".to_owned(),
+                "-Z".to_owned(),
+                "unstable-options".to_owned(),
+                "--target".to_owned(),
+                compiler_pack.target.clone(),
+            ],
+            logical_cwd: PathBuf::from("."),
+            environment: BTreeMap::new(),
+            timeout_seconds: DEFAULT_BUILD_TIMEOUT_SECONDS,
+            stdout_limit_bytes: DEFAULT_OUTPUT_LIMIT_BYTES,
+            stderr_limit_bytes: DEFAULT_OUTPUT_LIMIT_BYTES,
+            target: Some(compiler_pack.target.clone()),
+            compiler_pack: Some(compiler_pack),
+        },
+    })
+}
+
 pub async fn execute_build_request(
     request: &BuildExecutionRequest,
 ) -> Result<BuildExecutionOutcome> {
@@ -330,6 +377,28 @@ impl BuildExecutionPlan {
             }
             if self.target.as_deref() != Some(requirement.target.as_str()) {
                 bail!("compiler pack execution target does not match the build plan");
+            }
+        }
+        if self.adapter == COMPILER_PRECISE_UNIT_GRAPH_ADAPTER {
+            if self.compiler_pack.is_none() {
+                bail!("compiler-precise unit graph requires an exact compiler pack");
+            }
+            if self.arguments
+                != [
+                    "build",
+                    "--frozen",
+                    "--offline",
+                    "--unit-graph",
+                    "-Z",
+                    "unstable-options",
+                    "--target",
+                    self.target.as_deref().unwrap_or_default(),
+                ]
+            {
+                bail!("compiler-precise unit graph command plan is not exact");
+            }
+            if !self.environment.is_empty() {
+                bail!("compiler-precise unit graph does not admit caller environment values");
             }
         }
         Ok(())
@@ -395,6 +464,8 @@ pub struct BuildExecutionOutcome {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compiler_pack_attestation: Option<CompilerPackAttestation>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub rust_cargo_unit_graph: Option<RustCargoUnitGraph>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub rust_observation: Option<RustBuildObservation>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub web_observation: Option<WebBuildObservation>,
@@ -422,6 +493,9 @@ where
     if !source_root.is_dir() {
         bail!("build source root is not a directory");
     }
+    let neutral_cargo_config = (plan.adapter == COMPILER_PRECISE_UNIT_GRAPH_ADAPTER)
+        .then(|| project_neutral_cargo_config(&source_root))
+        .transpose()?;
     let compiler_pack_preflight = plan
         .compiler_pack
         .as_ref()
@@ -448,6 +522,9 @@ where
     let toolchain_version = probe_build_tool_version(&program, &source_root).await?;
     let run = BuildRunDirectories::create()?;
     stage_workspace(&source_root, &run.workspace)?;
+    if let Some(config) = &neutral_cargo_config {
+        install_neutral_cargo_config(&run.workspace, config)?;
+    }
     let cwd = run.workspace.join(&plan.logical_cwd);
     let canonical_cwd = cwd.canonicalize().with_context(|| {
         format!(
@@ -490,7 +567,7 @@ where
     let redacted_arguments = redact_arguments(&plan.arguments);
     let (environment_keys, redacted_secret_key_count) =
         audit_environment_keys(effective_environment.keys().map(String::as_str));
-    let command_plan_digest = digest_json(&serde_json::json!({
+    let mut command_plan = serde_json::json!({
         "version": BUILD_SUPERVISOR_VERSION,
         "adapter": plan.adapter,
         "adapter_version": plan.adapter_version,
@@ -500,7 +577,17 @@ where
         "compiler_pack_manifest_sha256": compiler_pack_preflight
             .as_ref()
             .map(|pack| pack.attestation.manifest_sha256.as_str()),
-    }))?;
+    });
+    if let Some(config) = &neutral_cargo_config {
+        command_plan
+            .as_object_mut()
+            .context("build command plan is not an object")?
+            .insert(
+                "neutral_cargo_config_digest".to_owned(),
+                serde_json::Value::String(config.digest.clone()),
+            );
+    }
+    let command_plan_digest = digest_json(&command_plan)?;
     let environment_key_set_digest = digest_json(&environment_keys)?;
     let source_root_digest = digest_workspace(&run.workspace)?;
     let (network_isolation, isolation_diagnostic) = network_isolation_capability();
@@ -591,6 +678,18 @@ where
     }
     let mut rust_observation = None;
     let mut web_observation = None;
+    let mut rust_cargo_unit_graph = None;
+    if matches!(outcome, BuildOutcomeKind::Completed)
+        && plan.adapter == COMPILER_PRECISE_UNIT_GRAPH_ADAPTER
+    {
+        match validate_cargo_unit_graph(&stdout, &run.workspace) {
+            Ok(graph) => rust_cargo_unit_graph = Some(graph),
+            Err(_) => {
+                outcome = BuildOutcomeKind::SecurityFailed;
+                diagnostic_code = Some("rust-compiler-unit-graph-invalid".to_owned());
+            }
+        }
+    }
     if matches!(outcome, BuildOutcomeKind::Completed) && plan.adapter == RUST_BUILD_OBSERVER {
         match collect_rust_build_observation(&stdout, &run.workspace, &run.output) {
             Ok(observation) => rust_observation = Some(observation),
@@ -617,6 +716,7 @@ where
             Err(_) => {
                 outcome = BuildOutcomeKind::SecurityFailed;
                 diagnostic_code = Some("build-output-security-policy".to_owned());
+                rust_cargo_unit_graph = None;
                 rust_observation = None;
                 web_observation = None;
                 None
@@ -661,8 +761,9 @@ where
     };
     Ok(BuildExecutionOutcome {
         audit,
-        project_code_executed: true,
+        project_code_executed: plan.adapter != COMPILER_PRECISE_UNIT_GRAPH_ADAPTER,
         compiler_pack_attestation,
+        rust_cargo_unit_graph,
         rust_observation,
         web_observation,
     })
@@ -1291,6 +1392,21 @@ mod tests {
     fn compiler_pack_fixture(
         temp: &tempfile::TempDir,
     ) -> Result<(CompilerPackRequirement, PathBuf)> {
+        compiler_pack_fixture_with_scripts(
+            temp,
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf 'cargo 1.99.0-nightly\\n'; exit 0; fi\nprintf 'tampered' > \"$DEPGRAPH_TARGET\"\n",
+            "fixture",
+            "fixture",
+        )
+    }
+
+    #[cfg(unix)]
+    fn compiler_pack_fixture_with_scripts(
+        temp: &tempfile::TempDir,
+        cargo_script: &str,
+        rustc_script: &str,
+        wrapper_script: &str,
+    ) -> Result<(CompilerPackRequirement, PathBuf)> {
         use std::os::unix::fs::PermissionsExt as _;
 
         let source = temp.path().join("compiler-pack-source");
@@ -1353,10 +1469,9 @@ mod tests {
             fs::write(path, b"fixture")?;
         }
         let cargo = source.join(&spec.cargo_path);
-        fs::write(
-            &cargo,
-            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf 'cargo 1.99.0-nightly\\n'; exit 0; fi\nprintf 'tampered' > \"$DEPGRAPH_TARGET\"\n",
-        )?;
+        fs::write(&cargo, cargo_script)?;
+        fs::write(source.join(&spec.rustc_path), rustc_script)?;
+        fs::write(source.join(&spec.wrapper_path), wrapper_script)?;
         for relative in [&spec.cargo_path, &spec.rustc_path, &spec.wrapper_path] {
             let path = source.join(relative);
             let mut permissions = fs::metadata(&path)?.permissions();
@@ -1450,6 +1565,80 @@ mod tests {
         let message = format!("{error:#}");
         assert!(message.contains("compiler-precise backend is unsupported"));
         assert!(message.contains("no rustup, PATH, system, or project toolchain fallback"));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn compiler_precise_unit_graph_is_supervised_without_starting_rustc_or_hooks()
+    -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let project = temp.path().join("project");
+        fs::create_dir_all(project.join("src"))?;
+        fs::create_dir(project.join(".cargo"))?;
+        fs::write(
+            project.join("Cargo.toml"),
+            "[package]\nname = \"unit-graph-fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\nbuild = \"build.rs\"\n\n[workspace]\n",
+        )?;
+        fs::write(project.join("Cargo.lock"), "version = 4\n")?;
+        fs::write(project.join("src/lib.rs"), "pub fn fixture() {}\n")?;
+        fs::write(
+            project.join(".cargo/config.toml"),
+            "[build]\nrustflags = [\"--cfg\", \"depgraph_fixture\"]\n",
+        )?;
+        let rustc_marker = temp.path().join("RUSTC_STARTED");
+        let wrapper_marker = temp.path().join("WRAPPER_STARTED");
+        let build_script_marker = temp.path().join("BUILD_SCRIPT_STARTED");
+        fs::write(
+            project.join("build.rs"),
+            format!(
+                "fn main() {{ std::fs::write({:?}, b\"started\").unwrap(); }}\n",
+                build_script_marker
+            ),
+        )?;
+        let cargo_script = r#"#!/bin/sh
+if [ "$1" = "--version" ]; then printf 'cargo 1.99.0-nightly\n'; exit 0; fi
+if [ "$*" != "build --frozen --offline --unit-graph -Z unstable-options --target x86_64-unknown-linux-gnu" ]; then exit 91; fi
+found_offline=false
+while IFS= read -r line; do
+  if [ "$line" = "offline = true" ]; then found_offline=true; fi
+done < .cargo/config.toml
+if [ "$found_offline" != "true" ]; then exit 92; fi
+workspace=$(pwd)
+printf '{"version":1,"units":[{"pkg_id":"path+file://%s#0.1.0","target":{"kind":["lib"],"crate_types":["lib"],"name":"unit_graph_fixture","src_path":"%s/src/lib.rs","edition":"2024","doc":true,"doctest":true,"test":true},"profile":{"name":"dev","opt_level":"0","lto":"false","codegen_units":null,"debuginfo":2,"split_debuginfo":null,"debug_assertions":true,"overflow_checks":true,"rpath":false,"incremental":false,"panic":"unwind","strip":{"deferred":"None"},"codegen_backend":null},"platform":null,"mode":"build","features":[],"dependencies":[]}],"roots":[0]}\n' "$workspace" "$workspace"
+"#;
+        let rustc_script = format!(
+            "#!/bin/sh\nprintf started > '{}'\nexit 93\n",
+            rustc_marker.display()
+        );
+        let wrapper_script = format!(
+            "#!/bin/sh\nprintf started > '{}'\nexit 94\n",
+            wrapper_marker.display()
+        );
+        let (requirement, _) = compiler_pack_fixture_with_scripts(
+            &temp,
+            cargo_script,
+            &rustc_script,
+            &wrapper_script,
+        )?;
+        let request = create_compiler_precise_unit_graph_request(&project, requirement)?;
+        let outcome = execute_build_request(&request).await?;
+        assert_eq!(
+            outcome.audit.outcome,
+            BuildOutcomeKind::Completed,
+            "{:?}",
+            outcome.audit
+        );
+        assert!(!outcome.project_code_executed);
+        assert!(outcome.compiler_pack_attestation.is_some());
+        let graph = outcome
+            .rust_cargo_unit_graph
+            .context("validated Cargo unit graph is missing")?;
+        assert_eq!(graph.units.len(), 1);
+        assert_eq!(graph.roots.len(), 1);
+        assert!(!rustc_marker.exists());
+        assert!(!wrapper_marker.exists());
+        assert!(!build_script_marker.exists());
         Ok(())
     }
 

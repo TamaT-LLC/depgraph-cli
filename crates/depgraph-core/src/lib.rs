@@ -7,6 +7,7 @@ pub mod build_evidence;
 pub mod cache;
 pub mod cancellation;
 pub mod compiler_pack;
+pub mod compiler_precise;
 pub mod config;
 pub mod cross_language;
 pub mod daemon;
@@ -97,8 +98,9 @@ pub use build::{
     TANSTACK_START_BUILD_CAPABILITY, TANSTACK_START_BUILD_OBSERVATION_SCHEMA,
     TANSTACK_START_BUILD_OBSERVER, TANSTACK_START_BUILD_OBSERVER_VERSION,
     WEB_BUILD_OBSERVER_VERSION, WebBuildAdapter, WebBuildObservation,
-    create_build_execution_request, execute_build_request, execute_build_request_with_cancellation,
-    supervise_build, supervise_build_with_cancellation,
+    create_build_execution_request, create_compiler_precise_unit_graph_request,
+    execute_build_request, execute_build_request_with_cancellation, supervise_build,
+    supervise_build_with_cancellation,
 };
 pub use build_evidence::{
     stage_build_evidence, validate_build_evidence, validate_framework_build_evidence_contract,
@@ -198,7 +200,16 @@ pub use compiler_pack::{
     COMPILER_PRECISE_CONTRACT_VERSION, CompilerPackArtifact, CompilerPackAttestation,
     CompilerPackBuildComponent, CompilerPackBuildSpec, CompilerPackComponent, CompilerPackFile,
     CompilerPackManifest, CompilerPackProtocol, CompilerPackRequirement, CompilerPackToolchain,
-    VerifiedCompilerPack, build_compiler_pack, read_compiler_pack_build_spec, verify_compiler_pack,
+    VerifiedCompilerPack, build_compiler_pack, read_compiler_pack_build_spec,
+    read_compiler_pack_requirement, verify_compiler_pack,
+};
+pub use compiler_precise::{
+    COMPILER_PRECISE_UNIT_GRAPH_ADAPTER, COMPILER_PRECISE_UNIT_GRAPH_ADAPTER_VERSION,
+    COMPILER_PRECISE_UNIT_GRAPH_SCHEMA, COMPILER_PRECISE_UNIT_GRAPH_SCHEMA_PATH,
+    COMPILER_PRECISE_UNIT_GRAPH_SCHEMA_VERSION, NEUTRAL_CARGO_CONFIG_SCHEMA_VERSION,
+    NeutralCargoConfig, RustCargoDependency, RustCargoProfile, RustCargoStrip, RustCargoTarget,
+    RustCargoUnit, RustCargoUnitGraph, install_neutral_cargo_config, project_neutral_cargo_config,
+    validate_cargo_unit_graph,
 };
 pub use config::{Config, DaemonConfig, default_store_path, init_config};
 pub use daemon::{

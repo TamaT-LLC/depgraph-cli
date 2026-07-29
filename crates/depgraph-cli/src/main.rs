@@ -12,13 +12,14 @@ use depgraph_core::{
     CancellationToken, Config, CycleLevel, DaemonStatus, ExportFormat, GraphQueryFilter,
     ImpactFilters, ImpactResult, PolicyAnnotation, PolicyResult, QueryDiagnostic,
     QueryFailureClass, RepositoryProfilePlanPreview, ScanCacheMode, TypedProjection,
-    acquire_store_writer_lock, build_cache_key, create_build_execution_request, default_store_path,
-    doctor, evaluate_policy_diff, execute_bounded_query, execute_build_request_with_cancellation,
-    export_filtered, export_graphml_filtered_to_writer, impact, impact_query_cache_key,
-    init_config, match_runtime_trace, open_store, open_store_read_only,
-    parse_and_type_check_bounded_query, plan_bounded_query, plan_explicit_profile_selection,
-    plan_repository_profiles, policy_annotations, profile_selection_human_summary,
-    read_bounded_query_file, read_explicit_profile_selection_file, read_git_changed_set,
+    acquire_store_writer_lock, build_cache_key, create_build_execution_request,
+    create_compiler_precise_unit_graph_request, default_store_path, doctor, evaluate_policy_diff,
+    execute_bounded_query, execute_build_request_with_cancellation, export_filtered,
+    export_graphml_filtered_to_writer, impact, impact_query_cache_key, init_config,
+    match_runtime_trace, open_store, open_store_read_only, parse_and_type_check_bounded_query,
+    plan_bounded_query, plan_explicit_profile_selection, plan_repository_profiles,
+    policy_annotations, profile_selection_human_summary, read_bounded_query_file,
+    read_compiler_pack_requirement, read_explicit_profile_selection_file, read_git_changed_set,
     read_runtime_trace, render_condition, render_github_annotations, run_scan_with_cache_mode,
     runtime_session_delta, rust_build_protocol_ndjson, stage_build_evidence,
     start_repository_daemon, traverse_filtered, unresolved,
@@ -90,6 +91,17 @@ enum Commands {
         /// Acknowledge that untrusted project code may execute for this invocation.
         #[arg(long)]
         allow_project_code: bool,
+        /// Request the exact pinned Rust compiler-precise unit-graph capability.
+        #[arg(long)]
+        rust_compiler_precise: bool,
+        /// Read the release-bound compiler-pack requirement used for this invocation.
+        #[arg(
+            long,
+            value_name = "FILE",
+            required_if_eq("rust_compiler_precise", "true"),
+            requires = "rust_compiler_precise"
+        )]
+        compiler_pack_requirement: Option<PathBuf>,
     },
     /// Report worker, toolchain, coverage, and protocol health.
     Doctor {
@@ -720,13 +732,34 @@ async fn run(cli: Cli) -> Result<u8> {
             build,
             path,
             allow_project_code,
+            rust_compiler_precise,
+            compiler_pack_requirement,
         } => {
             debug_assert!(build, "clap requires --build");
-            require_build_consent(allow_project_code)?;
+            if rust_compiler_precise {
+                require_compiler_precise_consent(build, allow_project_code, rust_compiler_precise)?;
+            } else {
+                require_build_consent(allow_project_code)?;
+            }
             let root = canonical_directory(path)?;
             let store_path = store_path(cli.store, &root)?;
+            let compiler_precise_request = if rust_compiler_precise {
+                let requirement_path = compiler_pack_requirement
+                    .context("--rust-compiler-precise requires --compiler-pack-requirement")?;
+                let requirement = read_compiler_pack_requirement(&requirement_path)?;
+                Some(create_compiler_precise_unit_graph_request(
+                    &root,
+                    requirement,
+                )?)
+            } else {
+                None
+            };
             let _store_writer_lock = acquire_store_writer_lock(&store_path)?;
-            let request = create_build_execution_request(&root)?;
+            let request = if let Some(request) = compiler_precise_request {
+                request
+            } else {
+                create_build_execution_request(&root)?
+            };
             let mut store = open_store(&store_path)?;
             let outcome = execute_build_request_with_cancellation(&request, async {
                 let _ = tokio::signal::ctrl_c().await;
@@ -740,70 +773,84 @@ async fn run(cli: Cli) -> Result<u8> {
                 store.start_build_attempt(&base_scan_id, &serde_json::to_value(&outcome.audit)?)?;
                 match outcome.audit.outcome {
                     BuildOutcomeKind::Completed => {
-                        let snapshot = store.load_snapshot(&base_scan_id)?;
-                        let ndjson = if let Some(observation) = outcome.rust_observation.as_ref() {
-                            rust_build_protocol_ndjson(&snapshot, &outcome.audit, observation)
-                                .context("Rust build observation could not be correlated")
-                        } else if let Some(observation) = outcome.web_observation.as_ref() {
-                            web_build_protocol_ndjson(&snapshot, &outcome.audit, observation)
-                                .await
-                                .context("Web build observation could not be correlated")
+                        if outcome.rust_cargo_unit_graph.is_some() {
+                            store.finish_build_attempt(
+                                &outcome.audit.run_id,
+                                "completed",
+                                None,
+                                false,
+                            )?;
+                            evidence_status = "validated unit graph (not promoted)";
                         } else {
-                            Err(anyhow::anyhow!(
-                                "completed build produced no validated observation"
-                            ))
-                        };
-                        let ndjson = match ndjson {
-                            Ok(value) => value,
-                            Err(error) => {
+                            let snapshot = store.load_snapshot(&base_scan_id)?;
+                            let ndjson = if let Some(observation) =
+                                outcome.rust_observation.as_ref()
+                            {
+                                rust_build_protocol_ndjson(&snapshot, &outcome.audit, observation)
+                                    .context("Rust build observation could not be correlated")
+                            } else if let Some(observation) = outcome.web_observation.as_ref() {
+                                web_build_protocol_ndjson(&snapshot, &outcome.audit, observation)
+                                    .await
+                                    .context("Web build observation could not be correlated")
+                            } else {
+                                Err(anyhow::anyhow!(
+                                    "completed build produced no validated observation"
+                                ))
+                            };
+                            let ndjson = match ndjson {
+                                Ok(value) => value,
+                                Err(error) => {
+                                    store.finish_build_attempt(
+                                        &outcome.audit.run_id,
+                                        "security_failed",
+                                        Some("build-observation-correlation-failed"),
+                                        false,
+                                    )?;
+                                    anyhow::bail!(
+                                        "security policy violation: build observation could not be correlated: {error:#}"
+                                    );
+                                }
+                            };
+                            if let Err(error) = stage_build_evidence(
+                                &mut store,
+                                &outcome.audit.run_id,
+                                Cursor::new(ndjson),
+                            ) {
                                 store.finish_build_attempt(
                                     &outcome.audit.run_id,
                                     "security_failed",
-                                    Some("build-observation-correlation-failed"),
+                                    Some("build-evidence-rejected"),
                                     false,
                                 )?;
                                 anyhow::bail!(
-                                    "security policy violation: build observation could not be correlated: {error:#}"
+                                    "security policy violation: build evidence was rejected: {error:#}"
                                 );
                             }
-                        };
-                        if let Err(error) = stage_build_evidence(
-                            &mut store,
-                            &outcome.audit.run_id,
-                            Cursor::new(ndjson),
-                        ) {
                             store.finish_build_attempt(
                                 &outcome.audit.run_id,
-                                "security_failed",
-                                Some("build-evidence-rejected"),
-                                false,
-                            )?;
-                            anyhow::bail!(
-                                "security policy violation: build evidence was rejected: {error:#}"
-                            );
-                        }
-                        store.finish_build_attempt(
-                            &outcome.audit.run_id,
-                            "completed",
-                            None,
-                            true,
-                        )?;
-                        evidence_status = "promoted";
-                        if let Some(cache_key) = build_cache_key(&outcome.audit) {
-                            let snapshot_id = store
-                                .snapshot_id_for_source("build", &outcome.audit.run_id)?
-                                .context("promoted build did not expose its completed snapshot")?;
-                            let cache = store.store_snapshot_cache(
-                                &cache_key,
-                                &snapshot_id,
+                                "completed",
                                 None,
-                                Some(&outcome.audit.run_id),
+                                true,
                             )?;
-                            build_cache_status = if cache.outcome == "stored" {
-                                "stored"
-                            } else {
-                                "rejected"
-                            };
+                            evidence_status = "promoted";
+                            if let Some(cache_key) = build_cache_key(&outcome.audit) {
+                                let snapshot_id = store
+                                    .snapshot_id_for_source("build", &outcome.audit.run_id)?
+                                    .context(
+                                        "promoted build did not expose its completed snapshot",
+                                    )?;
+                                let cache = store.store_snapshot_cache(
+                                    &cache_key,
+                                    &snapshot_id,
+                                    None,
+                                    Some(&outcome.audit.run_id),
+                                )?;
+                                build_cache_status = if cache.outcome == "stored" {
+                                    "stored"
+                                } else {
+                                    "rejected"
+                                };
+                            }
                         }
                     }
                     BuildOutcomeKind::Failed => store.finish_build_attempt(
@@ -831,6 +878,13 @@ async fn run(cli: Cli) -> Result<u8> {
                         false,
                     )?,
                 }
+            }
+            if let Some(unit_graph) = outcome.rust_cargo_unit_graph.as_ref() {
+                if evidence_status == "audit-only (no completed base scan)" {
+                    evidence_status = "validated unit graph (audit-only; no completed base scan)";
+                }
+                println!("Cargo units: {}", unit_graph.units.len());
+                println!("Cargo unit graph digest: {}", unit_graph.digest);
             }
             println!("build run: {}", outcome.audit.run_id);
             println!("status: {:?}", outcome.audit.outcome);
@@ -1617,10 +1671,22 @@ fn write_file_atomically(
 }
 
 const BUILD_CONSENT_REQUIRED: &str = "project code execution permission denied: `resolve --build` may execute untrusted build tools, configuration, plugins, build scripts, and proc macros; rerun this invocation with `--allow-project-code` only after reviewing the target repository";
+const COMPILER_PRECISE_CONSENT_REQUIRED: &str = "project code execution permission denied: Rust compiler-precise execution requires the independent `--build`, `--allow-project-code`, and `--rust-compiler-precise` flags on this invocation";
 
 fn require_build_consent(allow_project_code: bool) -> Result<()> {
     if !allow_project_code {
         anyhow::bail!(BUILD_CONSENT_REQUIRED);
+    }
+    Ok(())
+}
+
+fn require_compiler_precise_consent(
+    build: bool,
+    allow_project_code: bool,
+    rust_compiler_precise: bool,
+) -> Result<()> {
+    if !build || !allow_project_code || !rust_compiler_precise {
+        anyhow::bail!(COMPILER_PRECISE_CONSENT_REQUIRED);
     }
     Ok(())
 }
@@ -2353,7 +2419,7 @@ fn print_evidence(evidence: &[depgraph_store::EvidenceRecord], indent: &str) {
 mod tests {
     use super::{
         error_exit_code, inspect_runtime_trace_input, require_build_consent,
-        runtime_trace_metadata_error, write_file_atomically,
+        require_compiler_precise_consent, runtime_trace_metadata_error, write_file_atomically,
     };
 
     #[test]
@@ -2400,6 +2466,25 @@ mod tests {
         assert_eq!(error_exit_code(&error), 4);
         assert!(format!("{error:#}").contains("--allow-project-code"));
         require_build_consent(true).expect("the explicit CLI flag grants consent");
+    }
+
+    #[test]
+    fn compiler_precise_consent_requires_all_three_invocation_flags() {
+        for flags in [
+            (false, false, false),
+            (false, true, true),
+            (true, false, true),
+            (true, true, false),
+        ] {
+            let error = require_compiler_precise_consent(flags.0, flags.1, flags.2).unwrap_err();
+            assert_eq!(error_exit_code(&error), 4);
+            let message = error.to_string();
+            assert!(message.contains("--build"));
+            assert!(message.contains("--allow-project-code"));
+            assert!(message.contains("--rust-compiler-precise"));
+        }
+        require_compiler_precise_consent(true, true, true)
+            .expect("all three explicit flags grant compiler-precise consent");
     }
 
     #[test]

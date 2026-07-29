@@ -2728,6 +2728,33 @@ fn build_mode_refuses_implicit_or_missing_consent_without_executing_project_code
 }
 
 #[test]
+fn compiler_precise_refuses_missing_consent_before_paths_pack_or_store() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = temp.path().join("must-not-exist.db");
+    Command::cargo_bin("depgraph")
+        .unwrap()
+        .env("DEPGRAPH_ALLOW_PROJECT_CODE", "1")
+        .env("DEPGRAPH_RUST_COMPILER_PRECISE", "1")
+        .args([
+            "--store",
+            store.to_str().unwrap(),
+            "resolve",
+            "--build",
+            temp.path().join("missing-project").to_str().unwrap(),
+            "--rust-compiler-precise",
+            "--compiler-pack-requirement",
+            temp.path().join("missing-pack.json").to_str().unwrap(),
+        ])
+        .assert()
+        .code(4)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains(
+            "--build`, `--allow-project-code`, and `--rust-compiler-precise",
+        ));
+    assert!(!store.exists());
+}
+
+#[test]
 fn consented_build_mode_runs_project_code_only_in_the_supervised_staging_area() {
     let root = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();

@@ -16,6 +16,14 @@ Missing, additional, modified, symlinked, non-regular, or host-incompatible
 entries fail closed without a rustup, PATH, system, or project-toolchain
 fallback.
 
+`depgraph-rust-cargo-unit-graph-v1.schema.json` describes the bounded,
+checkout-independent DTO produced from the pinned Cargo unit graph v1 stage.
+The core additionally enforces root reachability, index conservation,
+canonical ordering and digest recomputation, package/source confinement, and
+the absence of duplicate canonical units, roots, or dependencies. Host
+temporary paths and Cargo's raw numeric unit indices do not cross this
+boundary.
+
 `depgraph-protocol-v1.schema.json` contains both the repository-complete
 protocol `1.0` events and the opt-in `worker-delta-v1` event family. Delta mode
 is selected only after exact capability negotiation; legacy workers continue

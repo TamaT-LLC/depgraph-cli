@@ -516,6 +516,25 @@ requires that external digest and verifies the pack before project staging and
 again after the supervised process tree has stopped. It never downloads through
 rustup or falls back to PATH, system, or project toolchains.
 
+The first compiler-precise execution stage is explicitly selected with all
+three invocation gates and a release-bound requirement document:
+
+```text
+depgraph resolve --build PATH --allow-project-code --rust-compiler-precise \
+  --compiler-pack-requirement compiler-pack-requirement.json
+```
+
+The requirement JSON contains `root`, `expected_manifest_sha256`,
+`release_checksum_reference`, `host`, and `target`; a relative `root` is
+resolved beside the requirement document. This stage replaces project Cargo
+configuration with a deterministic offline projection after rejecting compiler,
+wrapper, runner, linker, credential-provider, alias, environment, and unsafe
+rustflag injection. It runs only the attested Cargo with `--frozen --offline
+--unit-graph -Z unstable-options`, validates and canonicalizes unit graph v1,
+and does not start rustc, build scripts, or proc macros. Later
+compiler-precise stages add compiler invocation and query output; this stage
+does not promote graph evidence.
+
 Run `rustup component add rust-src --toolchain 1.93.1` once, then `cargo xtask package` to create a native archive under `dist/`. Release archives place `depgraph` under `bin/`, compatible workers under `libexec/`, and include the project's complete `LICENSE-MIT` and `LICENSE-APACHE` texts, a checksum-verified release manifest, protocol schema, SPDX SBOM, and a separate third-party license inventory. The release manifest declares `MIT OR Apache-2.0` and attests both project license files independently from `THIRD_PARTY_LICENSES.txt`. The release gate fixes Rust/Cargo `1.93.1`; the Rust worker manifest records the linked backend unit, rust-analyzer `0.0.330` at revision `8954b66d43225e62c92e8bbcc8500191b5cceb1e` with Salsa `0.26.1`. It also carries `rust-stdlib-source@1.93.1+rustc.01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf` under `libexec/rust-sysroot` as a licensed, SBOM-recorded `data-tree` copied only from that pinned toolchain's `rust-src` and independently matched to the known normalized digest `cc5465ef70b933d2a80c30472468abb9f8ab297fc767bd6433b2f6f554f4f0e7`. The Web worker manifest records the exact TypeScript version, the complete Web semantic capability set, and its Astro and TypeScript runtime components.
 
 The package verifier extracts the archive and validates the manifest, both project licenses, every artifact and runtime component, Rust and Web worker handshakes, per-framework scan/query/export E2E, dynamic framework build query/diff/impact/policy/JSON/GraphML E2E, cross-checkout determinism, rollback, and the complete runtime SBOM and third-party license closure. Missing, added, modified, symlinked, or version-mismatched license, Web worker, build observer/converter, Astro parser, TypeScript compiler, Rust sysroot source, or schema input fails before worker launch. Runtime components distinguish an `executable-tree` with an executable entrypoint from a `data-tree` whose entrypoint is optional. The aggregate release verifier requires all five target archives to attest identical Rust sysroot source bytes. After core verifies that data tree, it hands the canonical root to the packaged Rust worker; the worker rechecks the pinned source identity, builds separate library VFS roots for `core`, `alloc`, and `std`, and emits exact standard-library import, type-use, and direct-call edges. Development, mismatched, missing, unsupported-target, and tampered inputs preserve syntax output without `semantic-complete`, and neither packaging nor scanning falls back implicitly to project or system `rust-src` or backend bytes. Tier 1 Linux/macOS package gates and Windows safety/determinism smoke cover the Web semantic, dynamic framework, and Rust sysroot archive contracts.

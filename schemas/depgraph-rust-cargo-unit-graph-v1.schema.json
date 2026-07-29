@@ -1,0 +1,290 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tamat.dev/depgraph/schemas/depgraph-rust-cargo-unit-graph-v1.schema.json",
+  "title": "depgraph Rust Cargo unit graph v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "digest", "units", "roots"],
+  "properties": {
+    "schema_version": {
+      "const": "depgraph-rust-cargo-unit-graph-v1"
+    },
+    "digest": {
+      "$ref": "#/$defs/sha256"
+    },
+    "units": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 100000,
+      "items": {
+        "$ref": "#/$defs/unit"
+      }
+    },
+    "roots": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 100000,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/unit_id"
+      }
+    }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "text": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096,
+      "pattern": "^[^\\u0000-\\u001f\\u007f]+$"
+    },
+    "identity": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096,
+      "pattern": "^[A-Za-z0-9._-]+$"
+    },
+    "unit_id": {
+      "type": "string",
+      "pattern": "^cargo-unit:[0-9a-f]{64}$"
+    },
+    "unit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "unit_id",
+        "package_id",
+        "target",
+        "profile",
+        "platform",
+        "mode",
+        "features",
+        "is_std",
+        "dependencies"
+      ],
+      "properties": {
+        "unit_id": {
+          "$ref": "#/$defs/unit_id"
+        },
+        "package_id": {
+          "$ref": "#/$defs/text"
+        },
+        "target": {
+          "$ref": "#/$defs/target"
+        },
+        "profile": {
+          "$ref": "#/$defs/profile"
+        },
+        "platform": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/identity"
+            }
+          ]
+        },
+        "mode": {
+          "enum": ["test", "build", "check", "doc", "doctest", "run-custom-build"]
+        },
+        "features": {
+          "type": "array",
+          "maxItems": 1024,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/text"
+          }
+        },
+        "is_std": {
+          "type": "boolean"
+        },
+        "dependencies": {
+          "type": "array",
+          "maxItems": 100000,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/dependency"
+          }
+        }
+      }
+    },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "crate_types",
+        "name",
+        "src_path",
+        "edition",
+        "doc",
+        "doctest",
+        "test"
+      ],
+      "properties": {
+        "kind": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1024,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/text"
+          }
+        },
+        "crate_types": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1024,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/text"
+          }
+        },
+        "name": {
+          "$ref": "#/$defs/text"
+        },
+        "src_path": {
+          "type": "string",
+          "minLength": 8,
+          "maxLength": 4096,
+          "pattern": "^repo://[^/].*$"
+        },
+        "edition": {
+          "$ref": "#/$defs/text"
+        },
+        "doc": {
+          "type": "boolean"
+        },
+        "doctest": {
+          "type": "boolean"
+        },
+        "test": {
+          "type": "boolean"
+        }
+      }
+    },
+    "profile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "opt_level",
+        "lto",
+        "codegen_units",
+        "debuginfo",
+        "split_debuginfo",
+        "debug_assertions",
+        "overflow_checks",
+        "rpath",
+        "incremental",
+        "panic",
+        "strip",
+        "codegen_backend"
+      ],
+      "properties": {
+        "name": {
+          "$ref": "#/$defs/text"
+        },
+        "opt_level": {
+          "$ref": "#/$defs/text"
+        },
+        "lto": {
+          "$ref": "#/$defs/text"
+        },
+        "codegen_units": {
+          "type": ["integer", "null"],
+          "minimum": 0
+        },
+        "debuginfo": {
+          "type": ["integer", "null"],
+          "minimum": 0
+        },
+        "split_debuginfo": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/text"
+            }
+          ]
+        },
+        "debug_assertions": {
+          "type": "boolean"
+        },
+        "overflow_checks": {
+          "type": "boolean"
+        },
+        "rpath": {
+          "type": "boolean"
+        },
+        "incremental": {
+          "type": "boolean"
+        },
+        "panic": {
+          "enum": ["unwind", "abort"]
+        },
+        "strip": {
+          "oneOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["deferred"],
+              "properties": {
+                "deferred": {
+                  "$ref": "#/$defs/text"
+                }
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["resolved"],
+              "properties": {
+                "resolved": {
+                  "$ref": "#/$defs/text"
+                }
+              }
+            }
+          ]
+        },
+        "codegen_backend": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/text"
+            }
+          ]
+        }
+      }
+    },
+    "dependency": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["unit_id", "extern_crate_name", "public", "noprelude", "nounused"],
+      "properties": {
+        "unit_id": {
+          "$ref": "#/$defs/unit_id"
+        },
+        "extern_crate_name": {
+          "$ref": "#/$defs/text"
+        },
+        "public": {
+          "type": "boolean"
+        },
+        "noprelude": {
+          "type": "boolean"
+        },
+        "nounused": {
+          "type": "boolean"
+        }
+      }
+    }
+  }
+}

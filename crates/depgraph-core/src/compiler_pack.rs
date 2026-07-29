@@ -44,7 +44,8 @@ const REQUIRED_COMPONENTS: &[&str] = &[
     "rustc-dev",
 ];
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CompilerPackRequirement {
     pub root: PathBuf,
     pub expected_manifest_sha256: String,
@@ -206,6 +207,28 @@ pub fn read_compiler_pack_build_spec(path: &Path) -> Result<CompilerPackBuildSpe
         bail!("compiler pack build spec must be a regular file no larger than 1 MiB");
     }
     serde_json::from_slice(&fs::read(path)?).context("compiler pack build spec is invalid")
+}
+
+pub fn read_compiler_pack_requirement(path: &Path) -> Result<CompilerPackRequirement> {
+    let metadata = fs::symlink_metadata(path).with_context(|| {
+        format!(
+            "compiler pack requirement {} is unavailable",
+            path.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > 1024 * 1024 {
+        bail!("compiler pack requirement must be a regular file no larger than 1 MiB");
+    }
+    let mut requirement: CompilerPackRequirement =
+        serde_json::from_slice(&fs::read(path)?).context("compiler pack requirement is invalid")?;
+    if requirement.root.is_relative() {
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        requirement.root = parent.join(&requirement.root);
+    }
+    Ok(requirement)
 }
 
 pub fn build_compiler_pack(
