@@ -412,7 +412,7 @@ fn validate_start_record(
     }
     for argument in &record.canonical_argv {
         validate_text("compiler invocation argument", argument)?;
-        if Path::new(argument).is_absolute()
+        if contains_unconfined_path_fragment(argument)
             || contains_parent_traversal(argument)
             || argument.contains('@')
         {
@@ -430,6 +430,69 @@ fn contains_parent_traversal(value: &str) -> bool {
         || value.starts_with("..\\")
         || value.ends_with("\\..")
         || value.contains("\\..\\")
+}
+
+fn contains_unconfined_path_fragment(value: &str) -> bool {
+    value
+        .split(|character: char| {
+            matches!(character, '=' | ',' | ';') || character.is_ascii_whitespace()
+        })
+        .map(|fragment| fragment.trim_matches(['"', '\'']))
+        .filter(|fragment| !fragment.is_empty())
+        .any(|fragment| {
+            let path = Path::new(fragment);
+            path.is_absolute()
+                || is_portable_windows_absolute(fragment)
+                || fragment.starts_with("\\\\")
+                || (fragment.contains("://")
+                    && !fragment.starts_with("repo://")
+                    && !fragment.starts_with("cargo-home://"))
+        })
+}
+
+fn is_portable_windows_absolute(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'/' | b'\\')
+}
+
+fn secret_shaped_text(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    let non_logical_url = lower.replace("repo://", "").replace("cargo-home://", "");
+    [
+        "authorization:",
+        "bearer ",
+        "password=",
+        "passwd=",
+        "client_secret=",
+        "private_key=",
+        "secret_key=",
+        "api_key=",
+        "access_token=",
+        "-----begin ",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+        || value
+            .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+            .any(|token| {
+                (token.starts_with("ghp_") && token.len() >= 20)
+                    || (token.starts_with("github_pat_") && token.len() >= 24)
+                    || (token.starts_with("AKIA") && token.len() == 20)
+            })
+        || value
+            .split(|character: char| character.is_ascii_whitespace() || character == ',')
+            .any(|token| token.starts_with("sk-") && token.len() >= 20)
+        || non_logical_url
+            .split_once("://")
+            .is_some_and(|(_, remainder)| {
+                remainder
+                    .split(['/', '?', '#'])
+                    .next()
+                    .is_some_and(|authority| authority.contains('@'))
+            })
 }
 
 fn validate_terminal_record(
@@ -575,6 +638,7 @@ fn validate_text(label: &str, value: &str) -> Result<()> {
     if value.is_empty()
         || value.len() > MAX_TEXT_BYTES
         || value.chars().any(|character| character.is_control())
+        || secret_shaped_text(value)
     {
         bail!("{label} is invalid or exceeds its text bound");
     }
@@ -677,6 +741,26 @@ mod tests {
             compiler_invocation_attempt_digest(&digest, &digest, &digest, &digest)?
         );
         Ok(())
+    }
+
+    #[test]
+    fn canonical_argv_rejects_embedded_portable_paths_and_secrets() {
+        assert!(contains_unconfined_path_fragment(
+            "--emit=dep-info=/tmp/fixture.d"
+        ));
+        assert!(contains_unconfined_path_fragment(
+            "linker=C:\\toolchain\\link.exe"
+        ));
+        assert!(contains_unconfined_path_fragment(
+            "--cfg=source=file:///tmp/fixture"
+        ));
+        assert!(!contains_unconfined_path_fragment(
+            "--extern=fixture=output/libfixture.rlib"
+        ));
+        assert!(!contains_unconfined_path_fragment("repo://src/lib.rs"));
+        assert!(secret_shaped_text("api_key=fixture-secret"));
+        assert!(!secret_shaped_text("tokenizers"));
+        assert!(!secret_shaped_text("repo://source@fixture/lib.rs"));
     }
 
     #[test]

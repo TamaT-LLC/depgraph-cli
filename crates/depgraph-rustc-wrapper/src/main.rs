@@ -613,13 +613,27 @@ fn canonicalize_embedded_path_fragment(fragment: &str, roots: &Roots) -> Result<
     }
     if path.is_absolute() {
         normalize_path(fragment, roots, false)
+    } else if is_portable_windows_absolute(fragment)
+        || fragment.starts_with("\\\\")
+        || fragment.contains("://")
+    {
+        bail!("rustc argument contains a portable absolute path or URI")
     } else {
         Ok(fragment.to_owned())
     }
 }
 
+fn is_portable_windows_absolute(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'/' | b'\\')
+}
+
 fn reject_secret_shaped_text(value: &str) -> Result<()> {
     let lower = value.to_ascii_lowercase();
+    let non_logical_url = lower.replace("repo://", "").replace("cargo-home://", "");
     if [
         "authorization:",
         "bearer ",
@@ -644,12 +658,14 @@ fn reject_secret_shaped_text(value: &str) -> Result<()> {
         || value
             .split(|character: char| character.is_ascii_whitespace() || character == ',')
             .any(|token| token.starts_with("sk-") && token.len() >= 20)
-        || lower.split_once("://").is_some_and(|(_, remainder)| {
-            remainder
-                .split(['/', '?', '#'])
-                .next()
-                .is_some_and(|authority| authority.contains('@'))
-        })
+        || non_logical_url
+            .split_once("://")
+            .is_some_and(|(_, remainder)| {
+                remainder
+                    .split(['/', '?', '#'])
+                    .next()
+                    .is_some_and(|authority| authority.contains('@'))
+            })
     {
         bail!("rustc invocation contains secret-shaped text");
     }
@@ -955,6 +971,8 @@ mod tests {
         assert!(
             canonicalize_embedded_paths(&format!("emit={}", escaped.display()), &roots).is_err()
         );
+        assert!(canonicalize_embedded_paths("linker=C:\\toolchain\\link.exe", &roots).is_err());
+        assert!(canonicalize_embedded_paths("source=file:///tmp/fixture.rs", &roots).is_err());
         assert!(reject_secret_shaped_text("api_key=fixture-secret").is_err());
         assert!(reject_secret_shaped_text("tokenizers").is_ok());
         Ok(())
