@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://depgraph.dev/schemas/depgraph-rust-compiler-precise-mir-ledger-v1.schema.json",
+  "title": "depgraph validated Rust compiler typed MIR ledger",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "digest",
+    "attempt_digest",
+    "unit_graph_digest",
+    "invocation_ledger_digest",
+    "entries"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "depgraph-rust-compiler-precise-mir-ledger-v1"
+    },
+    "digest": {
+      "$ref": "#/$defs/digest"
+    },
+    "attempt_digest": {
+      "$ref": "#/$defs/digest"
+    },
+    "unit_graph_digest": {
+      "$ref": "#/$defs/digest"
+    },
+    "invocation_ledger_digest": {
+      "$ref": "#/$defs/digest"
+    },
+    "entries": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 100000,
+      "items": {
+        "type": "object"
+      }
+    }
+  },
+  "$defs": {
+    "digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    }
+  }
+}

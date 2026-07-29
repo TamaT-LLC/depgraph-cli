@@ -7,6 +7,7 @@ pub mod build_evidence;
 pub mod cache;
 pub mod cancellation;
 pub mod compiler_invocation;
+pub mod compiler_mir;
 pub mod compiler_pack;
 pub mod compiler_precise;
 pub mod config;
@@ -198,6 +199,16 @@ pub use compiler_invocation::{
     COMPILER_PRECISE_INVOCATION_ADAPTER, COMPILER_PRECISE_INVOCATION_ADAPTER_VERSION,
     RustCompilerInvocation, RustCompilerInvocationLedger, compiler_invocation_attempt_digest,
     validate_compiler_invocation_ledger, validate_compiler_invocation_unit_graph,
+};
+pub use compiler_mir::{
+    COMPILER_PRECISE_MIR_LEDGER_SCHEMA, COMPILER_PRECISE_MIR_LEDGER_SCHEMA_PATH,
+    COMPILER_PRECISE_MIR_LEDGER_SCHEMA_VERSION, COMPILER_PRECISE_MIR_SCHEMA,
+    COMPILER_PRECISE_MIR_SCHEMA_PATH, COMPILER_PRECISE_MIR_SCHEMA_VERSION, RustCompilerMirBlock,
+    RustCompilerMirBody, RustCompilerMirBodyKind, RustCompilerMirConstant,
+    RustCompilerMirDefinition, RustCompilerMirLedger, RustCompilerMirLocal,
+    RustCompilerMirOperation, RustCompilerMirPlace, RustCompilerMirProjection, RustCompilerMirSpan,
+    RustCompilerMirType, RustCompilerMirUnit, RustCompilerMirUnsupported, compiler_mir_unit_digest,
+    validate_compiler_mir_directory,
 };
 pub use compiler_pack::{
     COMPILER_PACK_CHANNEL_MANIFEST, COMPILER_PACK_CHANNEL_MANIFEST_SHA256,

@@ -45,6 +45,7 @@ pub struct RustCompilerInvocationLedger {
 #[serde(deny_unknown_fields)]
 pub struct RustCompilerInvocation {
     pub unit_id: String,
+    pub invocation_id: String,
     pub invocation_digest: String,
     pub crate_name: String,
     pub crate_types: Vec<String>,
@@ -108,6 +109,7 @@ struct LedgerIdentity<'a> {
 #[derive(Serialize)]
 struct InvocationIdentity<'a> {
     unit_id: &'a str,
+    invocation_id: &'a str,
     crate_name: &'a str,
     crate_types: &'a [String],
     source_path: &'a str,
@@ -317,6 +319,7 @@ pub fn validate_compiler_invocation_ledger(
         validate_invocation_against_unit(&start, unit, &workspace, &cargo_home)?;
         let mut entry = RustCompilerInvocation {
             unit_id: start.unit_id,
+            invocation_id: start.invocation_id,
             invocation_digest: String::new(),
             crate_name: start.crate_name,
             crate_types: start.crate_types,
@@ -336,6 +339,7 @@ pub fn validate_compiler_invocation_ledger(
         };
         entry.invocation_digest = digest_json(&InvocationIdentity {
             unit_id: &entry.unit_id,
+            invocation_id: &entry.invocation_id,
             crate_name: &entry.crate_name,
             crate_types: &entry.crate_types,
             source_path: &entry.source_path,

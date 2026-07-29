@@ -26,8 +26,12 @@ const ENV_EXPECTED_RUSTC: &str = "DEPGRAPH_COMPILER_EXPECTED_RUSTC";
 const ENV_EXPECTED_RUSTC_SHA256: &str = "DEPGRAPH_COMPILER_EXPECTED_RUSTC_SHA256";
 const ENV_EXPECTED_RUSTC_VERBOSE_SHA256: &str = "DEPGRAPH_COMPILER_EXPECTED_RUSTC_VERBOSE_SHA256";
 const ENV_LEDGER_DIR: &str = "DEPGRAPH_COMPILER_LEDGER_DIR";
+const ENV_MIR_DIR: &str = "DEPGRAPH_COMPILER_MIR_DIR";
 const ENV_OUTPUT_ROOT: &str = "DEPGRAPH_COMPILER_OUTPUT_ROOT";
 const ENV_PACK_ROOT: &str = "DEPGRAPH_COMPILER_PACK_ROOT";
+const ENV_PACK_MANIFEST_SHA256: &str = "DEPGRAPH_COMPILER_PACK_MANIFEST_SHA256";
+const ENV_QUERY: &str = "DEPGRAPH_COMPILER_QUERY";
+const ENV_QUERY_SHA256: &str = "DEPGRAPH_COMPILER_QUERY_SHA256";
 const ENV_WORKSPACE_ROOT: &str = "DEPGRAPH_COMPILER_WORKSPACE_ROOT";
 const ENV_WRAPPER_ACTIVE: &str = "DEPGRAPH_COMPILER_WRAPPER_ACTIVE";
 
@@ -203,6 +207,12 @@ fn run() -> Result<i32> {
     if !verbose.status.success() || verbose.stdout.len() > 64 * 1024 {
         bail!("actual rustc verbose identity is unavailable");
     }
+    let rustc_host = std::str::from_utf8(&verbose.stdout)
+        .context("actual rustc verbose identity is not UTF-8")?
+        .lines()
+        .find_map(|line| line.strip_prefix("host: "))
+        .context("actual rustc verbose identity omitted its host")?;
+    validate_identity(rustc_host)?;
     let rustc_verbose_sha256 = digest_bytes(&verbose.stdout);
     if rustc_verbose_sha256 != required_digest(ENV_EXPECTED_RUSTC_VERBOSE_SHA256)? {
         bail!("actual rustc verbose identity does not match the attested compiler");
@@ -233,7 +243,8 @@ fn run() -> Result<i32> {
     let expected_graph = read_expected_graph(&expected_graph_path)?;
     let attempt_digest = required_digest(ENV_ATTEMPT_DIGEST)?;
     let invocation = parse_invocation(&raw_args[1..], &roots)?;
-    let (unit_id, profile_digest) = match_unit(&invocation, &expected_graph)?;
+    let (unit_id, package_id, target_digest, profile_digest) =
+        match_unit(&invocation, &expected_graph)?;
     let argv_digest = digest_json(&invocation.canonical_argv)?;
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -272,11 +283,77 @@ fn run() -> Result<i32> {
         &start_bytes,
     )?;
 
-    let status = Command::new(&actual_rustc)
+    let query = canonical_regular_file(&required_absolute_path(ENV_QUERY)?, "compiler query")?;
+    if !query.starts_with(&roots.pack) || digest_file(&query)? != required_digest(ENV_QUERY_SHA256)?
+    {
+        bail!("compiler query does not match its attested pack identity");
+    }
+    let mir_directory = confined_directory(
+        &required_absolute_path(ENV_MIR_DIR)?,
+        &roots.output,
+        "typed MIR",
+    )?;
+    let sysroot = actual_rustc
+        .parent()
+        .and_then(Path::parent)
+        .context("attested rustc path has no sysroot")?;
+    let compiler_libraries = [
+        sysroot.join("lib"),
+        sysroot
+            .join("lib")
+            .join("rustlib")
+            .join(rustc_host)
+            .join("lib"),
+    ];
+    for directory in &compiler_libraries {
+        if !directory.is_dir() || !directory.starts_with(&roots.pack) {
+            bail!("compiler query library path is outside the attested pack");
+        }
+    }
+    let compiler_library_path =
+        env::join_paths(&compiler_libraries).context("compiler query library path is invalid")?;
+    let mut query_command = Command::new(&query);
+    query_command
         .args(&raw_args[1..])
         .env(ENV_WRAPPER_ACTIVE, "1")
+        .env("DEPGRAPH_QUERY_ATTEMPT_DIGEST", &attempt_digest)
+        .env("DEPGRAPH_QUERY_INVOCATION_ID", &invocation_id)
+        .env("DEPGRAPH_QUERY_UNIT_ID", &start.unit_id)
+        .env("DEPGRAPH_QUERY_PACKAGE_ID", package_id)
+        .env("DEPGRAPH_QUERY_TARGET_DIGEST", target_digest)
+        .env("DEPGRAPH_QUERY_SOURCE_PATH", &start.source_path)
+        .env("DEPGRAPH_QUERY_SOURCE_SHA256", &start.source_sha256)
+        .env("DEPGRAPH_QUERY_PROFILE_DIGEST", &start.profile_digest)
+        .env(
+            "DEPGRAPH_QUERY_PACK_MANIFEST_SHA256",
+            required_digest(ENV_PACK_MANIFEST_SHA256)?,
+        )
+        .env("DEPGRAPH_QUERY_RUSTC", &actual_rustc)
+        .env(
+            "DEPGRAPH_QUERY_RUSTC_COMMIT",
+            "3d50c25bc66853bf0ad205529d0f305a1d841b5e",
+        )
+        .env("DEPGRAPH_QUERY_OUTPUT_DIR", mir_directory)
+        .env("DEPGRAPH_QUERY_WORKSPACE_ROOT", &roots.workspace)
+        .env("DEPGRAPH_QUERY_CARGO_HOME", &roots.cargo_home);
+    #[cfg(unix)]
+    query_command
+        .env("LD_LIBRARY_PATH", &compiler_library_path)
+        .env("DYLD_LIBRARY_PATH", &compiler_library_path);
+    #[cfg(windows)]
+    {
+        let mut path_entries = compiler_libraries.to_vec();
+        if let Some(path) = env::var_os("PATH") {
+            path_entries.extend(env::split_paths(&path));
+        }
+        query_command.env(
+            "PATH",
+            env::join_paths(path_entries).context("compiler query PATH is invalid")?,
+        );
+    }
+    let status = query_command
         .status()
-        .context("failed to start attested rustc")?;
+        .context("failed to start attested compiler query")?;
     let terminal = TerminalRecord {
         schema_version: RECORD_SCHEMA_VERSION,
         record_kind: "terminal",
@@ -420,7 +497,10 @@ fn parse_invocation(args: &[OsString], roots: &Roots) -> Result<Invocation> {
     })
 }
 
-fn match_unit(invocation: &Invocation, graph: &ExpectedGraph) -> Result<(String, String)> {
+fn match_unit(
+    invocation: &Invocation,
+    graph: &ExpectedGraph,
+) -> Result<(String, String, String, String)> {
     let mut matches = graph
         .units
         .iter()
@@ -440,6 +520,8 @@ fn match_unit(invocation: &Invocation, graph: &ExpectedGraph) -> Result<(String,
         .map(|unit| {
             Ok((
                 unit.unit_id.clone(),
+                unit.package_id.clone(),
+                digest_json(&unit.target).context("failed to digest admitted Cargo unit target")?,
                 digest_json(&unit.profile)
                     .context("failed to digest admitted Cargo unit profile")?,
             ))

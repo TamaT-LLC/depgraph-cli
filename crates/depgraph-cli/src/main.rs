@@ -810,7 +810,9 @@ async fn run(cli: Cli) -> Result<u8> {
                 }
                 match outcome.audit.outcome {
                     BuildOutcomeKind::Completed => {
-                        if outcome.rust_compiler_invocation_ledger.is_some() {
+                        if outcome.rust_compiler_mir_ledger.is_some() {
+                            evidence_status = "validated typed MIR DTO (not promoted)";
+                        } else if outcome.rust_compiler_invocation_ledger.is_some() {
                             evidence_status = "validated compiler invocation ledger (not promoted)";
                         } else if outcome.rust_cargo_unit_graph.is_some() {
                             evidence_status = "validated unit graph (not promoted)";
@@ -919,6 +921,19 @@ async fn run(cli: Cli) -> Result<u8> {
                 }
                 println!("Rust compiler invocations: {}", ledger.entries.len());
                 println!("Rust compiler invocation ledger digest: {}", ledger.digest);
+            }
+            if let Some(ledger) = outcome.rust_compiler_mir_ledger.as_ref() {
+                if evidence_status == "audit-only (no completed base scan)" {
+                    evidence_status =
+                        "validated typed MIR DTO (audit-only; no completed base scan)";
+                }
+                let body_count = ledger
+                    .entries
+                    .iter()
+                    .map(|entry| entry.bodies.len())
+                    .sum::<usize>();
+                println!("Rust typed MIR bodies: {body_count}");
+                println!("Rust typed MIR ledger digest: {}", ledger.digest);
             }
             if let Some(unit_graph) = outcome.rust_cargo_unit_graph.as_ref() {
                 if evidence_status == "audit-only (no completed base scan)"

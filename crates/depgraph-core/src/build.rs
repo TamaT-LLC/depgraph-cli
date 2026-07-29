@@ -22,6 +22,7 @@ use crate::compiler_invocation::{
     RustCompilerInvocationLedger, compiler_invocation_attempt_digest,
     validate_compiler_invocation_ledger, validate_compiler_invocation_unit_graph,
 };
+use crate::compiler_mir::{RustCompilerMirLedger, validate_compiler_mir_directory};
 use crate::compiler_pack::{
     CompilerPackAttestation, CompilerPackRequirement, VerifiedCompilerPack, verify_compiler_pack,
 };
@@ -564,6 +565,8 @@ pub struct BuildExecutionOutcome {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rust_compiler_invocation_ledger: Option<RustCompilerInvocationLedger>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub rust_compiler_mir_ledger: Option<RustCompilerMirLedger>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub rust_observation: Option<RustBuildObservation>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub web_observation: Option<WebBuildObservation>,
@@ -748,6 +751,8 @@ where
         fs::write(&expected_graph_path, serde_json::to_vec(graph)?)?;
         let ledger_directory = run.output.join("compiler-invocation-ledger");
         fs::create_dir(&ledger_directory)?;
+        let mir_directory = run.output.join("compiler-typed-mir");
+        fs::create_dir(&mir_directory)?;
         for (key, value) in [
             ("DEPGRAPH_COMPILER_ATTEMPT_DIGEST", attempt_digest.clone()),
             (
@@ -771,6 +776,10 @@ where
                 ledger_directory.to_string_lossy().into_owned(),
             ),
             (
+                "DEPGRAPH_COMPILER_MIR_DIR",
+                mir_directory.to_string_lossy().into_owned(),
+            ),
+            (
                 "DEPGRAPH_COMPILER_OUTPUT_ROOT",
                 run.output.to_string_lossy().into_owned(),
             ),
@@ -779,13 +788,30 @@ where
                 pack.root.to_string_lossy().into_owned(),
             ),
             (
+                "DEPGRAPH_COMPILER_PACK_MANIFEST_SHA256",
+                pack.attestation.manifest_sha256.clone(),
+            ),
+            (
+                "DEPGRAPH_COMPILER_QUERY",
+                pack.query_path.to_string_lossy().into_owned(),
+            ),
+            (
+                "DEPGRAPH_COMPILER_QUERY_SHA256",
+                pack.attestation.query_sha256.clone(),
+            ),
+            (
                 "DEPGRAPH_COMPILER_WORKSPACE_ROOT",
                 run.workspace.to_string_lossy().into_owned(),
             ),
         ] {
             effective_environment.insert(key.to_owned(), value);
         }
-        Some((attempt_digest, rustc_verbose_sha256, ledger_directory))
+        Some((
+            attempt_digest,
+            rustc_verbose_sha256,
+            ledger_directory,
+            mir_directory,
+        ))
     } else {
         None
     };
@@ -883,6 +909,7 @@ where
     let mut web_observation = None;
     let mut rust_cargo_unit_graph = None;
     let mut rust_compiler_invocation_ledger = None;
+    let mut rust_compiler_mir_ledger = None;
     if matches!(outcome, BuildOutcomeKind::Completed)
         && plan.adapter == COMPILER_PRECISE_UNIT_GRAPH_ADAPTER
     {
@@ -906,7 +933,7 @@ where
                 .compiler_unit_graph
                 .as_ref()
                 .context("compiler invocation unit graph is unavailable")?;
-            let (attempt_digest, rustc_verbose_sha256, ledger_directory) =
+            let (attempt_digest, rustc_verbose_sha256, ledger_directory, mir_directory) =
                 compiler_invocation_context
                     .as_ref()
                     .context("compiler invocation context is unavailable")?;
@@ -922,16 +949,25 @@ where
                 &pack.attestation.rustc_sha256,
                 rustc_verbose_sha256,
             )?;
-            Ok::<_, anyhow::Error>((graph.clone(), ledger))
+            let mir = validate_compiler_mir_directory(
+                mir_directory,
+                &run.workspace,
+                &run.cache.join("cargo"),
+                graph,
+                &ledger,
+                &pack.attestation,
+            )?;
+            Ok::<_, anyhow::Error>((graph.clone(), ledger, mir))
         })();
         match validation {
-            Ok((graph, ledger)) => {
+            Ok((graph, ledger, mir)) => {
                 rust_cargo_unit_graph = Some(graph);
                 rust_compiler_invocation_ledger = Some(ledger);
+                rust_compiler_mir_ledger = Some(mir);
             }
             Err(_) => {
                 outcome = BuildOutcomeKind::SecurityFailed;
-                diagnostic_code = Some("rust-compiler-invocation-ledger-invalid".to_owned());
+                diagnostic_code = Some("rust-compiler-typed-mir-invalid".to_owned());
             }
         }
     }
@@ -963,6 +999,7 @@ where
                 diagnostic_code = Some("build-output-security-policy".to_owned());
                 rust_cargo_unit_graph = None;
                 rust_compiler_invocation_ledger = None;
+                rust_compiler_mir_ledger = None;
                 rust_observation = None;
                 web_observation = None;
                 None
@@ -1011,6 +1048,7 @@ where
         compiler_pack_attestation,
         rust_cargo_unit_graph,
         rust_compiler_invocation_ledger,
+        rust_compiler_mir_ledger,
         rust_observation,
         web_observation,
     })
@@ -1127,7 +1165,12 @@ fn supervisor_environment(
     let mut environment = BTreeMap::new();
     let path = if let Some(pack) = compiler_pack {
         let mut directories = BTreeSet::new();
-        for executable in [&pack.cargo_path, &pack.rustc_path, &pack.wrapper_path] {
+        for executable in [
+            &pack.cargo_path,
+            &pack.rustc_path,
+            &pack.wrapper_path,
+            &pack.query_path,
+        ] {
             directories.insert(
                 executable
                     .parent()
@@ -2065,6 +2108,7 @@ mod tests {
             cargo_path: "toolchain/cargo/bin/cargo".to_owned(),
             rustc_path: "toolchain/rustc/bin/rustc".to_owned(),
             wrapper_path: "bin/depgraph-rustc-wrapper".to_owned(),
+            query_path: "bin/depgraph-rustc-query".to_owned(),
             wrapper_protocol_schema_path: "schemas/depgraph-rust-compiler-precise-v1.schema.json"
                 .to_owned(),
             components: vec![
@@ -2097,6 +2141,7 @@ mod tests {
         }
         for relative in [
             spec.wrapper_path.as_str(),
+            spec.query_path.as_str(),
             spec.wrapper_protocol_schema_path.as_str(),
             "licenses/LICENSE-APACHE",
             "licenses/LICENSE-MIT",
@@ -2109,7 +2154,13 @@ mod tests {
         fs::write(&cargo, cargo_script)?;
         fs::write(source.join(&spec.rustc_path), rustc_script)?;
         fs::write(source.join(&spec.wrapper_path), wrapper_script)?;
-        for relative in [&spec.cargo_path, &spec.rustc_path, &spec.wrapper_path] {
+        fs::write(source.join(&spec.query_path), wrapper_script)?;
+        for relative in [
+            &spec.cargo_path,
+            &spec.rustc_path,
+            &spec.wrapper_path,
+            &spec.query_path,
+        ] {
             let path = source.join(relative);
             let mut permissions = fs::metadata(&path)?.permissions();
             permissions.set_mode(0o755);
