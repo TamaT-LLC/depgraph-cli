@@ -1,0 +1,180 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://depgraph.dev/schemas/depgraph-rust-compiler-precise-v1.schema.json",
+  "title": "depgraph attested rustc wrapper invocation record",
+  "oneOf": [
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "record_kind",
+        "invocation_id",
+        "attempt_digest",
+        "unit_id",
+        "crate_name",
+        "crate_types",
+        "source_path",
+        "source_sha256",
+        "profile_digest",
+        "edition",
+        "target",
+        "mode",
+        "features",
+        "canonical_argv",
+        "argv_digest",
+        "rustc_sha256",
+        "rustc_verbose_sha256"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": "depgraph-rust-compiler-invocation-record-v1"
+        },
+        "record_kind": {
+          "const": "start"
+        },
+        "invocation_id": {
+          "$ref": "#/$defs/digest"
+        },
+        "attempt_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "unit_id": {
+          "$ref": "#/$defs/text"
+        },
+        "crate_name": {
+          "$ref": "#/$defs/identity"
+        },
+        "crate_types": {
+          "$ref": "#/$defs/identity_list"
+        },
+        "source_path": {
+          "$ref": "#/$defs/text"
+        },
+        "source_sha256": {
+          "$ref": "#/$defs/digest"
+        },
+        "profile_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "edition": {
+          "$ref": "#/$defs/identity"
+        },
+        "target": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/identity"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "mode": {
+          "enum": [
+            "build",
+            "test"
+          ]
+        },
+        "features": {
+          "$ref": "#/$defs/text_list"
+        },
+        "canonical_argv": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 16384,
+          "items": {
+            "$ref": "#/$defs/text"
+          }
+        },
+        "argv_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "rustc_sha256": {
+          "$ref": "#/$defs/digest"
+        },
+        "rustc_verbose_sha256": {
+          "$ref": "#/$defs/digest"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "record_kind",
+        "invocation_id",
+        "attempt_digest",
+        "start_record_sha256",
+        "status",
+        "exit_code"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": "depgraph-rust-compiler-invocation-record-v1"
+        },
+        "record_kind": {
+          "const": "terminal"
+        },
+        "invocation_id": {
+          "$ref": "#/$defs/digest"
+        },
+        "attempt_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "start_record_sha256": {
+          "$ref": "#/$defs/digest"
+        },
+        "status": {
+          "enum": [
+            "completed",
+            "failed"
+          ]
+        },
+        "exit_code": {
+          "oneOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "identity": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096,
+      "pattern": "^[A-Za-z0-9_-]+$"
+    },
+    "text": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096
+    },
+    "identity_list": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 1024,
+      "items": {
+        "$ref": "#/$defs/identity"
+      }
+    },
+    "text_list": {
+      "type": "array",
+      "maxItems": 1024,
+      "items": {
+        "$ref": "#/$defs/text"
+      }
+    }
+  }
+}

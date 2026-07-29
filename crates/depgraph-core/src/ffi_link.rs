@@ -1200,6 +1200,7 @@ mod tests {
             project_code_executed,
             compiler_pack_attestation: None,
             rust_cargo_unit_graph: None,
+            rust_compiler_invocation_ledger: None,
             rust_observation: None,
             web_observation: None,
         }

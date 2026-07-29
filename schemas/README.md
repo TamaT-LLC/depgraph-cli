@@ -26,6 +26,16 @@ boundary. Workspace sources use `repo://...`; registry and Git sources are
 first copied into the bounded run-owned Cargo home and use
 `cargo-home://...`. Paths outside those two staged roots fail closed.
 
+`depgraph-rust-compiler-precise-v1.schema.json` describes the attested
+wrapper's bounded start and terminal records.
+`depgraph-rust-compiler-invocation-ledger-v1.schema.json` describes the
+parent-validated, checkout-independent conservation ledger. The parent
+requires exactly one successful pair per admitted non-`run-custom-build` Cargo
+unit, recomputes source/profile/argv/compiler identities, rejects extra,
+missing, duplicate, partial, nested, response-file, and path-escaping
+invocations, and never persists raw stdout, stderr, environment values, or
+temporary absolute paths.
+
 `depgraph-protocol-v1.schema.json` contains both the repository-complete
 protocol `1.0` events and the opt-in `worker-delta-v1` event family. Delta mode
 is selected only after exact capability negotiation; legacy workers continue
