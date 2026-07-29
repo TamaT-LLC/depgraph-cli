@@ -26,10 +26,13 @@ parent process receives a secret-shaped fixture variable; `env_clear` and the
 allowlist keep it out of the child, audit, and machine-readable evidence.
 Timeout and cancellation terminate the complete bubblewrap/process-group tree.
 
-Local Linux execution and the macOS and Windows supervisor tests continue to
-report `best-effort`. They verify environment clearing, path selection, output
-bounds, and process-tree cleanup, but do not claim a filesystem or network
-sandbox. Stable target support remains blocked on the five-target release gate.
+Linux compiler-precise unit-graph and invocation requests always select this
+enforced boundary and fail if the trusted bubblewrap executable is unavailable.
+There is no implicit fallback to host execution. Generic build adapters and the
+macOS and Windows supervisor tests continue to report `best-effort`. They verify
+environment clearing, path selection, output bounds, and process-tree cleanup,
+but do not claim a filesystem or network sandbox. Stable target support remains
+blocked on the five-target release gate.
 
 ## Fixture and evidence matrix
 

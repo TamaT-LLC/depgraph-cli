@@ -147,7 +147,9 @@ run-owned writable directories. The original checkout, store, parent private
 paths, and host network are not mounted. The executable must be root-owned and
 non-writable, and its version and digest are recorded in the
 [`compiler-precise-hostile-e2e-v1`](../50_test/compiler-precise-hostile-e2e.md)
-evidence.
+evidence. Linux compiler-precise unit-graph and invocation requests always use
+this boundary and fail closed when it is unavailable; they never fall back to
+direct host execution.
 
 The child environment starts from `env_clear`. It contains only versioned
 allowlisted values and run-specific home/cache/output paths. Secret values and

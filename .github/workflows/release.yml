@@ -14,6 +14,10 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - run: rustup toolchain install 1.93.1 --profile minimal --component rustfmt,clippy
       - run: rustup default 1.93.1
+      - name: Install the compiler-precise Linux namespace boundary
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends bubblewrap
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version: 1.26.1

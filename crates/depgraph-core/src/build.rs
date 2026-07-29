@@ -317,7 +317,7 @@ pub fn create_compiler_precise_unit_graph_request(
             adapter: COMPILER_PRECISE_UNIT_GRAPH_ADAPTER.to_owned(),
             adapter_version: COMPILER_PRECISE_UNIT_GRAPH_ADAPTER_VERSION.to_owned(),
             profile_id: "rust:compiler-precise:unit-graph".to_owned(),
-            isolation: BuildIsolation::BestEffort,
+            isolation: compiler_precise_isolation(),
             program: "cargo".to_owned(),
             arguments: vec![
                 "build".to_owned(),
@@ -377,7 +377,7 @@ pub fn create_compiler_precise_invocation_request(
             adapter: COMPILER_PRECISE_INVOCATION_ADAPTER.to_owned(),
             adapter_version: COMPILER_PRECISE_INVOCATION_ADAPTER_VERSION.to_owned(),
             profile_id,
-            isolation: BuildIsolation::BestEffort,
+            isolation: compiler_precise_isolation(),
             program: "cargo".to_owned(),
             arguments: vec![
                 "build".to_owned(),
@@ -552,6 +552,14 @@ impl BuildIsolation {
             Self::BestEffort => "best-effort",
             Self::EnforcedLinuxNamespace => "linux-bubblewrap-v1",
         }
+    }
+}
+
+const fn compiler_precise_isolation() -> BuildIsolation {
+    if cfg!(target_os = "linux") {
+        BuildIsolation::EnforcedLinuxNamespace
+    } else {
+        BuildIsolation::BestEffort
     }
 }
 
@@ -2749,6 +2757,16 @@ printf '{"version":1,"units":[{"pkg_id":"path+file://%s#0.1.0","target":{"kind":
             child_failure_diagnostic("fixture", None),
             "build-child-signalled"
         );
+    }
+
+    #[test]
+    fn compiler_precise_requests_never_fall_back_from_the_linux_namespace_boundary() {
+        let expected = if cfg!(target_os = "linux") {
+            BuildIsolation::EnforcedLinuxNamespace
+        } else {
+            BuildIsolation::BestEffort
+        };
+        assert_eq!(compiler_precise_isolation(), expected);
     }
 
     #[cfg(target_os = "linux")]
