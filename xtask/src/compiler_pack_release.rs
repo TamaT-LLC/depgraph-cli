@@ -1296,6 +1296,7 @@ fn extract_bounded_tar_gz(archive: &Path, destination: &Path) -> Result<()> {
     let decoder = flate2::read::GzDecoder::new(input);
     let mut tar = tar::Archive::new(decoder);
     let mut seen = BTreeSet::new();
+    let mut directories = BTreeSet::new();
     let mut file_count = 0_usize;
     let mut directory_count = 0_usize;
     let mut unpacked_bytes = 0_u64;
@@ -1305,6 +1306,7 @@ fn extract_bounded_tar_gz(archive: &Path, destination: &Path) -> Result<()> {
         if !seen.insert(relative.clone()) {
             bail!("compiler pack archive contains a duplicate path");
         }
+        require_explicit_archive_parent(&relative, &directories)?;
         let entry_type = entry.header().entry_type();
         let size = entry.header().size()?;
         if entry_type.is_dir() {
@@ -1328,6 +1330,9 @@ fn extract_bounded_tar_gz(archive: &Path, destination: &Path) -> Result<()> {
         if !entry.unpack_in(destination)? {
             bail!("compiler pack archive entry escapes its extraction root");
         }
+        if entry_type.is_dir() {
+            directories.insert(relative);
+        }
     }
     Ok(())
 }
@@ -1339,6 +1344,7 @@ fn extract_bounded_zip(archive: &Path, destination: &Path) -> Result<()> {
         bail!("compiler pack archive entry count exceeds its bound");
     }
     let mut seen = BTreeSet::new();
+    let mut directories = BTreeSet::new();
     let mut file_count = 0_usize;
     let mut directory_count = 0_usize;
     let mut unpacked_bytes = 0_u64;
@@ -1351,6 +1357,7 @@ fn extract_bounded_zip(archive: &Path, destination: &Path) -> Result<()> {
         if entry.name().contains('\\') || !seen.insert(relative.clone()) {
             bail!("compiler pack archive contains an unsafe or duplicate path");
         }
+        require_explicit_archive_parent(&relative, &directories)?;
         let unix_file_type = entry.unix_mode().map(|mode| mode & 0o170000);
         if unix_file_type.is_some_and(|file_type| {
             file_type != 0 && file_type != 0o040000 && file_type != 0o100000
@@ -1368,6 +1375,7 @@ fn extract_bounded_zip(archive: &Path, destination: &Path) -> Result<()> {
             enforce_extraction_bounds(file_count, directory_count, unpacked_bytes)?;
             fs::create_dir(&output)?;
             set_zip_permissions(&output, entry.unix_mode())?;
+            directories.insert(relative);
             continue;
         }
         if !entry.is_file() {
@@ -1395,6 +1403,16 @@ fn extract_bounded_zip(archive: &Path, destination: &Path) -> Result<()> {
             bail!("compiler pack archive entry size changed during extraction");
         }
         set_zip_permissions(&output, entry.unix_mode())?;
+    }
+    Ok(())
+}
+
+fn require_explicit_archive_parent(path: &Path, directories: &BTreeSet<PathBuf>) -> Result<()> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+        && !directories.contains(parent)
+    {
+        bail!("compiler pack archive omits an explicit parent directory entry");
     }
     Ok(())
 }
@@ -1725,6 +1743,36 @@ mod tests {
             fs::read_to_string(zip_destination.join("compiler-pack/payload.txt"))?,
             "bounded compiler pack\n"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_tar_rejects_implicit_parent_directories_before_extraction() -> Result<()> {
+        let temp = TempDir::new()?;
+        let archive = temp.path().join("implicit-parent.tar.gz");
+        let output = fs::File::create(&archive)?;
+        let encoder = flate2::GzBuilder::new()
+            .mtime(0)
+            .write(output, flate2::Compression::best());
+        let mut builder = tar::Builder::new(encoder);
+        let payload = b"must not be extracted\n";
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_mode(0o644);
+        header.set_size(payload.len() as u64);
+        header.set_cksum();
+        builder.append_data(
+            &mut header,
+            "compiler-pack/implicit/payload.txt",
+            &payload[..],
+        )?;
+        let encoder = builder.into_inner()?;
+        encoder.finish()?;
+
+        let destination = temp.path().join("destination");
+        fs::create_dir(&destination)?;
+        assert!(extract_compiler_pack_archive(&archive, &destination).is_err());
+        assert!(fs::read_dir(&destination)?.next().is_none());
         Ok(())
     }
 
