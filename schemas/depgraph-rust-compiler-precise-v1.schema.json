@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://depgraph.dev/schemas/depgraph-rust-compiler-precise-v1.schema.json",
-  "title": "depgraph attested rustc wrapper invocation record",
+  "title": "depgraph attested rustc wrapper records and typed MIR unit DTO",
   "oneOf": [
     {
       "type": "object",
@@ -143,6 +143,84 @@
           ]
         }
       }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "digest",
+        "attempt_digest",
+        "invocation_id",
+        "unit_id",
+        "package_id",
+        "target_digest",
+        "source_path",
+        "source_sha256",
+        "profile_digest",
+        "compiler_pack_manifest_sha256",
+        "rustc_commit",
+        "query_capabilities",
+        "bodies",
+        "unsupported"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": "depgraph-rust-compiler-precise-v1"
+        },
+        "digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "attempt_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "invocation_id": {
+          "$ref": "#/$defs/digest"
+        },
+        "unit_id": {
+          "$ref": "#/$defs/text"
+        },
+        "package_id": {
+          "$ref": "#/$defs/text"
+        },
+        "target_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "source_path": {
+          "$ref": "#/$defs/text"
+        },
+        "source_sha256": {
+          "$ref": "#/$defs/digest"
+        },
+        "profile_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "compiler_pack_manifest_sha256": {
+          "$ref": "#/$defs/digest"
+        },
+        "rustc_commit": {
+          "const": "3d50c25bc66853bf0ad205529d0f305a1d841b5e"
+        },
+        "query_capabilities": {
+          "const": [
+            "typed_mir"
+          ]
+        },
+        "bodies": {
+          "type": "array",
+          "maxItems": 100000,
+          "items": {
+            "$ref": "#/$defs/mir_body"
+          }
+        },
+        "unsupported": {
+          "type": "array",
+          "maxItems": 1000000,
+          "items": {
+            "$ref": "#/$defs/unsupported"
+          }
+        }
+      }
     }
   ],
   "$defs": {
@@ -175,6 +253,457 @@
       "items": {
         "$ref": "#/$defs/text"
       }
+    },
+    "span": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source_path",
+        "source_sha256",
+        "start_line",
+        "start_column",
+        "end_line",
+        "end_column"
+      ],
+      "properties": {
+        "source_path": {
+          "$ref": "#/$defs/text"
+        },
+        "source_sha256": {
+          "$ref": "#/$defs/digest"
+        },
+        "start_line": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "start_column": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "end_line": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "end_column": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "definition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "definition_id",
+        "path",
+        "span"
+      ],
+      "properties": {
+        "definition_id": {
+          "$ref": "#/$defs/digest"
+        },
+        "path": {
+          "$ref": "#/$defs/text"
+        },
+        "span": {
+          "$ref": "#/$defs/span"
+        }
+      }
+    },
+    "mir_type": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type_id",
+        "kind",
+        "arguments",
+        "definition_id",
+        "mutability",
+        "value",
+        "unsupported_reason"
+      ],
+      "properties": {
+        "type_id": {
+          "$ref": "#/$defs/digest"
+        },
+        "kind": {
+          "$ref": "#/$defs/text"
+        },
+        "arguments": {
+          "type": "array",
+          "maxItems": 1000000,
+          "items": {
+            "$ref": "#/$defs/digest"
+          }
+        },
+        "definition_id": {
+          "$ref": "#/$defs/nullable_digest"
+        },
+        "mutability": {
+          "enum": [
+            "mutable",
+            "immutable",
+            null
+          ]
+        },
+        "value": {
+          "$ref": "#/$defs/nullable_text"
+        },
+        "unsupported_reason": {
+          "$ref": "#/$defs/nullable_reason_code"
+        }
+      }
+    },
+    "constant": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "constant_id",
+        "type_id",
+        "kind",
+        "value",
+        "definition_id",
+        "unsupported_reason",
+        "span"
+      ],
+      "properties": {
+        "constant_id": {
+          "$ref": "#/$defs/digest"
+        },
+        "type_id": {
+          "$ref": "#/$defs/digest"
+        },
+        "kind": {
+          "$ref": "#/$defs/text"
+        },
+        "value": {
+          "$ref": "#/$defs/nullable_text"
+        },
+        "definition_id": {
+          "$ref": "#/$defs/nullable_digest"
+        },
+        "unsupported_reason": {
+          "$ref": "#/$defs/nullable_reason_code"
+        },
+        "span": {
+          "$ref": "#/$defs/span"
+        }
+      }
+    },
+    "local": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "local_id",
+        "ordinal",
+        "role",
+        "type_id",
+        "span"
+      ],
+      "properties": {
+        "local_id": {
+          "$ref": "#/$defs/digest"
+        },
+        "ordinal": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "role": {
+          "enum": [
+            "return",
+            "argument",
+            "local"
+          ]
+        },
+        "type_id": {
+          "$ref": "#/$defs/digest"
+        },
+        "span": {
+          "$ref": "#/$defs/span"
+        }
+      }
+    },
+    "projection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "index",
+        "from",
+        "to",
+        "from_end",
+        "type_id",
+        "local_id"
+      ],
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/text"
+        },
+        "index": {
+          "$ref": "#/$defs/nullable_integer"
+        },
+        "from": {
+          "$ref": "#/$defs/nullable_integer"
+        },
+        "to": {
+          "$ref": "#/$defs/nullable_integer"
+        },
+        "from_end": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "type_id": {
+          "$ref": "#/$defs/nullable_digest"
+        },
+        "local_id": {
+          "$ref": "#/$defs/nullable_digest"
+        }
+      }
+    },
+    "place": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "place_id",
+        "local_id",
+        "projections",
+        "type_id"
+      ],
+      "properties": {
+        "place_id": {
+          "$ref": "#/$defs/digest"
+        },
+        "local_id": {
+          "$ref": "#/$defs/digest"
+        },
+        "projections": {
+          "type": "array",
+          "maxItems": 32,
+          "items": {
+            "$ref": "#/$defs/projection"
+          }
+        },
+        "type_id": {
+          "$ref": "#/$defs/digest"
+        }
+      }
+    },
+    "operation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operation_id",
+        "ordinal",
+        "kind",
+        "span",
+        "places",
+        "constants",
+        "unsupported_reason"
+      ],
+      "properties": {
+        "operation_id": {
+          "$ref": "#/$defs/digest"
+        },
+        "ordinal": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "kind": {
+          "$ref": "#/$defs/text"
+        },
+        "span": {
+          "$ref": "#/$defs/span"
+        },
+        "places": {
+          "type": "array",
+          "maxItems": 1000000,
+          "items": {
+            "$ref": "#/$defs/digest"
+          }
+        },
+        "constants": {
+          "type": "array",
+          "maxItems": 1000000,
+          "items": {
+            "$ref": "#/$defs/digest"
+          }
+        },
+        "unsupported_reason": {
+          "$ref": "#/$defs/nullable_reason_code"
+        }
+      }
+    },
+    "block": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "block_id",
+        "ordinal",
+        "operations",
+        "successors"
+      ],
+      "properties": {
+        "block_id": {
+          "$ref": "#/$defs/digest"
+        },
+        "ordinal": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "operations": {
+          "type": "array",
+          "maxItems": 1000000,
+          "items": {
+            "$ref": "#/$defs/operation"
+          }
+        },
+        "successors": {
+          "type": "array",
+          "maxItems": 1000000,
+          "items": {
+            "$ref": "#/$defs/digest"
+          }
+        }
+      }
+    },
+    "mir_body": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "body_id",
+        "kind",
+        "definition",
+        "span",
+        "types",
+        "constants",
+        "locals",
+        "places",
+        "blocks"
+      ],
+      "properties": {
+        "body_id": {
+          "$ref": "#/$defs/digest"
+        },
+        "kind": {
+          "enum": [
+            "function",
+            "method",
+            "closure",
+            "async",
+            "coroutine",
+            "const",
+            "static"
+          ]
+        },
+        "definition": {
+          "$ref": "#/$defs/definition"
+        },
+        "span": {
+          "$ref": "#/$defs/span"
+        },
+        "types": {
+          "type": "array",
+          "maxItems": 1000000,
+          "items": {
+            "$ref": "#/$defs/mir_type"
+          }
+        },
+        "constants": {
+          "type": "array",
+          "maxItems": 1000000,
+          "items": {
+            "$ref": "#/$defs/constant"
+          }
+        },
+        "locals": {
+          "type": "array",
+          "maxItems": 1000000,
+          "items": {
+            "$ref": "#/$defs/local"
+          }
+        },
+        "places": {
+          "type": "array",
+          "maxItems": 1000000,
+          "items": {
+            "$ref": "#/$defs/place"
+          }
+        },
+        "blocks": {
+          "type": "array",
+          "maxItems": 1000000,
+          "items": {
+            "$ref": "#/$defs/block"
+          }
+        }
+      }
+    },
+    "unsupported": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "scope_id",
+        "construct_kind",
+        "reason_code"
+      ],
+      "properties": {
+        "scope_id": {
+          "$ref": "#/$defs/digest"
+        },
+        "construct_kind": {
+          "$ref": "#/$defs/text"
+        },
+        "reason_code": {
+          "$ref": "#/$defs/reason_code"
+        }
+      }
+    },
+    "nullable_digest": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "nullable_text": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "minLength": 1,
+      "maxLength": 4096
+    },
+    "reason_code": {
+      "enum": [
+        "unsupported_type",
+        "unsupported_constant",
+        "unsupported_statement",
+        "unsupported_terminator",
+        "unsupported_projection",
+        "generated_span",
+        "external_span",
+        "depth_limit",
+        "count_limit"
+      ]
+    },
+    "nullable_reason_code": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/reason_code"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "nullable_integer": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
     }
   }
 }

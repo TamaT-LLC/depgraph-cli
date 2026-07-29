@@ -1,0 +1,16 @@
+[package]
+name = "depgraph-rustc-query"
+version = "0.4.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.99"
+publish = false
+
+[workspace]
+
+[dependencies]
+anyhow = "1.0"
+hex = "0.4"
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = { version = "1.0", features = ["preserve_order"] }
+sha2 = "0.10"

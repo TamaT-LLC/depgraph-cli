@@ -63,6 +63,7 @@ pub struct CompilerPackBuildSpec {
     pub cargo_path: String,
     pub rustc_path: String,
     pub wrapper_path: String,
+    pub query_path: String,
     pub wrapper_protocol_schema_path: String,
     pub components: Vec<CompilerPackBuildComponent>,
 }
@@ -87,6 +88,7 @@ pub struct CompilerPackManifest {
     pub cargo: CompilerPackArtifact,
     pub rustc: CompilerPackArtifact,
     pub wrapper: CompilerPackArtifact,
+    pub query: CompilerPackArtifact,
     pub wrapper_protocol: CompilerPackProtocol,
     pub components: Vec<CompilerPackComponent>,
     pub sbom: CompilerPackArtifact,
@@ -153,6 +155,7 @@ pub struct CompilerPackAttestation {
     pub cargo_sha256: String,
     pub rustc_sha256: String,
     pub wrapper_sha256: String,
+    pub query_sha256: String,
 }
 
 #[derive(Clone, Debug)]
@@ -162,6 +165,7 @@ pub struct VerifiedCompilerPack {
     pub cargo_path: PathBuf,
     pub rustc_path: PathBuf,
     pub wrapper_path: PathBuf,
+    pub query_path: PathBuf,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -288,6 +292,7 @@ pub fn build_compiler_pack(
         cargo: artifact(&spec.cargo_path)?,
         rustc: artifact(&spec.rustc_path)?,
         wrapper: artifact(&spec.wrapper_path)?,
+        query: artifact(&spec.query_path)?,
         wrapper_protocol: CompilerPackProtocol {
             contract_version: COMPILER_PACK_WRAPPER_PROTOCOL_VERSION.to_owned(),
             schema: artifact(&spec.wrapper_protocol_schema_path)?,
@@ -367,6 +372,7 @@ pub fn verify_compiler_pack(requirement: &CompilerPackRequirement) -> Result<Ver
     let cargo_path = resolve_artifact_path(&root, &manifest.cargo, true)?;
     let rustc_path = resolve_artifact_path(&root, &manifest.rustc, true)?;
     let wrapper_path = resolve_artifact_path(&root, &manifest.wrapper, true)?;
+    let query_path = resolve_artifact_path(&root, &manifest.query, true)?;
     Ok(VerifiedCompilerPack {
         attestation: CompilerPackAttestation {
             contract_version: manifest.contract_version,
@@ -377,11 +383,13 @@ pub fn verify_compiler_pack(requirement: &CompilerPackRequirement) -> Result<Ver
             cargo_sha256: manifest.cargo.sha256,
             rustc_sha256: manifest.rustc.sha256,
             wrapper_sha256: manifest.wrapper.sha256,
+            query_sha256: manifest.query.sha256,
         },
         root,
         cargo_path,
         rustc_path,
         wrapper_path,
+        query_path,
     })
 }
 
@@ -393,6 +401,7 @@ fn validate_build_spec(spec: &CompilerPackBuildSpec) -> Result<()> {
         &spec.cargo_path,
         &spec.rustc_path,
         &spec.wrapper_path,
+        &spec.query_path,
         &spec.wrapper_protocol_schema_path,
     ] {
         validate_pack_path(path)?;
@@ -450,9 +459,12 @@ fn validate_build_spec(spec: &CompilerPackBuildSpec) -> Result<()> {
         bail!("compiler pack cargo and rustc must belong to exact component inventories");
     }
     if all_files.contains(&spec.wrapper_path)
+        || all_files.contains(&spec.query_path)
         || all_files.contains(&spec.wrapper_protocol_schema_path)
     {
-        bail!("compiler pack wrapper and protocol schema must not be component-owned");
+        bail!(
+            "compiler pack wrapper, query child, and protocol schema must not be component-owned"
+        );
     }
     Ok(())
 }
@@ -513,6 +525,7 @@ fn validate_required_payload(root: &Path, spec: &CompilerPackBuildSpec) -> Resul
     require_regular_file(root, &spec.cargo_path, true)?;
     require_regular_file(root, &spec.rustc_path, true)?;
     require_regular_file(root, &spec.wrapper_path, true)?;
+    require_regular_file(root, &spec.query_path, true)?;
     require_regular_file(root, &spec.wrapper_protocol_schema_path, false)?;
     for component in &spec.components {
         for path in &component.files {
@@ -541,6 +554,7 @@ fn build_license_inventory() -> CompilerPackLicenseInventory {
         .map(|name| format!("component:{name}"))
         .chain([
             "depgraph-compiler-wrapper".to_owned(),
+            "depgraph-compiler-query".to_owned(),
             "depgraph-compiler-protocol".to_owned(),
         ])
         .collect::<Vec<_>>();
@@ -604,6 +618,14 @@ fn build_spdx_sbom(spec: &CompilerPackBuildSpec) -> Value {
         json!({
             "SPDXID": "SPDXRef-Depgraph-Compiler-Wrapper",
             "name": "depgraph-compiler-wrapper",
+            "versionInfo": env!("CARGO_PKG_VERSION"),
+            "downloadLocation": "NOASSERTION",
+            "filesAnalyzed": false,
+            "licenseDeclared": COMPILER_PACK_LICENSE_EXPRESSION
+        }),
+        json!({
+            "SPDXID": "SPDXRef-Depgraph-Compiler-Query",
+            "name": "depgraph-compiler-query",
             "versionInfo": env!("CARGO_PKG_VERSION"),
             "downloadLocation": "NOASSERTION",
             "filesAnalyzed": false,
@@ -711,6 +733,9 @@ fn pack_file_owner(
     }
     if path == spec.wrapper_path {
         return Ok("depgraph-wrapper".to_owned());
+    }
+    if path == spec.query_path {
+        return Ok("depgraph-query".to_owned());
     }
     if path == spec.wrapper_protocol_schema_path {
         return Ok("depgraph-protocol".to_owned());
@@ -918,6 +943,7 @@ fn validate_manifest_artifacts(manifest: &CompilerPackManifest) -> Result<()> {
         ("cargo", &manifest.cargo, true, "cargo"),
         ("rustc", &manifest.rustc, true, "rustc"),
         ("wrapper", &manifest.wrapper, true, "depgraph-wrapper"),
+        ("query child", &manifest.query, true, "depgraph-query"),
         (
             "wrapper protocol schema",
             &manifest.wrapper_protocol.schema,
@@ -964,6 +990,7 @@ fn validate_file_ownership(manifest: &CompilerPackManifest) -> Result<()> {
         }
         let valid = match file.owner.as_str() {
             "depgraph-wrapper" => file.path == manifest.wrapper.path,
+            "depgraph-query" => file.path == manifest.query.path,
             "depgraph-protocol" => file.path == manifest.wrapper_protocol.schema.path,
             "depgraph-legal" => COMPILER_PACK_LICENSE_PATHS.contains(&file.path.as_str()),
             "depgraph-metadata" => matches!(
@@ -1047,6 +1074,7 @@ fn validate_spdx_sbom(root: &Path, manifest: &CompilerPackManifest) -> Result<()
         .map(|name| (*name).to_owned())
         .chain([
             "depgraph-compiler-wrapper".to_owned(),
+            "depgraph-compiler-query".to_owned(),
             "depgraph-compiler-protocol".to_owned(),
         ])
         .collect::<BTreeSet<_>>();
@@ -1271,6 +1299,7 @@ mod tests {
             cargo_path: "toolchain/cargo/bin/cargo".to_owned(),
             rustc_path: "toolchain/rustc/bin/rustc".to_owned(),
             wrapper_path: "bin/depgraph-rustc-wrapper".to_owned(),
+            query_path: "bin/depgraph-rustc-query".to_owned(),
             wrapper_protocol_schema_path: "schemas/depgraph-rust-compiler-precise-v1.schema.json"
                 .to_owned(),
             components: vec![
@@ -1306,6 +1335,7 @@ mod tests {
         }
         for path in [
             &spec.wrapper_path,
+            &spec.query_path,
             &spec.wrapper_protocol_schema_path,
             COMPILER_PACK_LICENSE_PATHS[0],
             COMPILER_PACK_LICENSE_PATHS[1],
@@ -1314,7 +1344,12 @@ mod tests {
             fs::create_dir_all(path.parent().context("fixture file has no parent")?)?;
             fs::write(&path, b"fixture")?;
         }
-        for path in [&spec.cargo_path, &spec.rustc_path, &spec.wrapper_path] {
+        for path in [
+            &spec.cargo_path,
+            &spec.rustc_path,
+            &spec.wrapper_path,
+            &spec.query_path,
+        ] {
             make_executable(&root.join(path))?;
         }
         Ok(())

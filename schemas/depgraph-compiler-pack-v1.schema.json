@@ -13,6 +13,7 @@
     "cargo",
     "rustc",
     "wrapper",
+    "query",
     "wrapper_protocol",
     "components",
     "sbom",
@@ -61,6 +62,7 @@
     "cargo": { "$ref": "#/$defs/artifact" },
     "rustc": { "$ref": "#/$defs/artifact" },
     "wrapper": { "$ref": "#/$defs/artifact" },
+    "query": { "$ref": "#/$defs/artifact" },
     "wrapper_protocol": {
       "type": "object",
       "additionalProperties": false,

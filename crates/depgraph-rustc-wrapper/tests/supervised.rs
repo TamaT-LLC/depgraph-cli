@@ -100,6 +100,17 @@ exit 0
             .any(|entry| entry.crate_name == "build_script_build")
     );
     assert_eq!(fs::read(rustc_marker)?, b"xxx");
+    let mir = outcome
+        .rust_compiler_mir_ledger
+        .context("typed MIR ledger is missing")?;
+    assert_eq!(mir.entries.len(), 3);
+    assert_eq!(
+        mir.entries
+            .iter()
+            .map(|entry| entry.bodies.len())
+            .sum::<usize>(),
+        3
+    );
     let serialized = serde_json::to_string(&ledger)?;
     assert!(!serialized.contains(temporary.path().to_string_lossy().as_ref()));
     let audit = serde_json::to_string(&outcome.audit)?;
@@ -127,14 +138,14 @@ fn wrapper_rejects_nesting_response_escape_and_rustc_substitution_before_compile
     fs::write(
         &rustc,
         format!(
-            "#!/bin/sh\nif [ \"$1\" = \"-vV\" ]; then printf 'fixture-rustc-vv\\n'; exit 0; fi\nprintf started > '{}'\n",
+            "#!/bin/sh\nif [ \"$1\" = \"-vV\" ]; then printf 'fixture-rustc-vv\\nhost: x86_64-unknown-linux-gnu\\n'; exit 0; fi\nprintf started > '{}'\n",
             marker.display()
         ),
     )?;
     let mut permissions = fs::metadata(&rustc)?.permissions();
     permissions.set_mode(0o755);
     fs::set_permissions(&rustc, permissions)?;
-    let verbose = b"fixture-rustc-vv\n";
+    let verbose = b"fixture-rustc-vv\nhost: x86_64-unknown-linux-gnu\n";
     let expected_graph = output.join("expected-unit-graph.json");
     let units = vec![RustCargoUnit {
         unit_id: "cargo-unit:fixture".to_owned(),
@@ -366,6 +377,7 @@ fn compiler_pack_fixture(
         cargo_path: "toolchain/cargo/bin/cargo".to_owned(),
         rustc_path: "toolchain/rustc/bin/rustc".to_owned(),
         wrapper_path: "bin/depgraph-rustc-wrapper".to_owned(),
+        query_path: "bin/depgraph-rustc-query".to_owned(),
         wrapper_protocol_schema_path: "schemas/depgraph-rust-compiler-precise-v1.schema.json"
             .to_owned(),
         components: vec![
@@ -414,7 +426,21 @@ fn compiler_pack_fixture(
     let wrapper = source.join(&spec.wrapper_path);
     fs::create_dir_all(wrapper.parent().context("wrapper has no parent")?)?;
     fs::copy(wrapper_binary, &wrapper)?;
-    for relative in [&spec.cargo_path, &spec.rustc_path, &spec.wrapper_path] {
+    fs::write(source.join(&spec.query_path), QUERY_FIXTURE)?;
+    let sysroot = source.join("toolchain/rustc");
+    fs::create_dir_all(sysroot.join("lib"))?;
+    fs::create_dir_all(
+        sysroot
+            .join("lib/rustlib")
+            .join("x86_64-unknown-linux-gnu")
+            .join("lib"),
+    )?;
+    for relative in [
+        &spec.cargo_path,
+        &spec.rustc_path,
+        &spec.wrapper_path,
+        &spec.query_path,
+    ] {
         let path = source.join(relative);
         let mut permissions = fs::metadata(&path)?.permissions();
         permissions.set_mode(0o755);
@@ -429,3 +455,122 @@ fn compiler_pack_fixture(
         target: spec.target,
     })
 }
+
+const QUERY_FIXTURE: &str = r#"#!/usr/bin/python3
+import hashlib
+import json
+import os
+import subprocess
+import sys
+
+def canonical(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+
+def digest(value):
+    return hashlib.sha256(canonical(value)).hexdigest()
+
+status = subprocess.run([os.environ["DEPGRAPH_COMPILER_EXPECTED_RUSTC"], *sys.argv[1:]])
+if status.returncode != 0:
+    raise SystemExit(status.returncode)
+source_path = os.environ["DEPGRAPH_QUERY_SOURCE_PATH"]
+source_sha = os.environ["DEPGRAPH_QUERY_SOURCE_SHA256"]
+span = {
+    "source_path": source_path,
+    "source_sha256": source_sha,
+    "start_line": 1,
+    "start_column": 1,
+    "end_line": 1,
+    "end_column": 1,
+}
+crate_name = sys.argv[sys.argv.index("--crate-name") + 1]
+definition_path = f"{crate_name}::fixture"
+definition_id = digest([
+    definition_path, source_path, source_sha, 1, 1, 1, 1,
+])
+definition = {
+    "definition_id": definition_id,
+    "path": definition_path,
+    "span": span,
+}
+body_id = digest([
+    os.environ["DEPGRAPH_QUERY_UNIT_ID"],
+    os.environ["DEPGRAPH_QUERY_PACKAGE_ID"],
+    os.environ["DEPGRAPH_QUERY_TARGET_DIGEST"],
+    os.environ["DEPGRAPH_QUERY_PROFILE_DIGEST"],
+    "function",
+    definition,
+])
+type_id = digest(["unit", [], None, None, None, None])
+local_id = digest([body_id, "local", 0])
+place_id = digest([body_id, local_id, [], type_id])
+block_id = digest([body_id, "block", 0])
+operation_id = digest([body_id, block_id, 0, "return"])
+body = {
+    "body_id": body_id,
+    "kind": "function",
+    "definition": definition,
+    "span": span,
+    "types": [{
+        "type_id": type_id,
+        "kind": "unit",
+        "arguments": [],
+        "definition_id": None,
+        "mutability": None,
+        "value": None,
+        "unsupported_reason": None,
+    }],
+    "constants": [],
+    "locals": [{
+        "local_id": local_id,
+        "ordinal": 0,
+        "role": "return",
+        "type_id": type_id,
+        "span": span,
+    }],
+    "places": [{
+        "place_id": place_id,
+        "local_id": local_id,
+        "projections": [],
+        "type_id": type_id,
+    }],
+    "blocks": [{
+        "block_id": block_id,
+        "ordinal": 0,
+        "operations": [{
+            "operation_id": operation_id,
+            "ordinal": 0,
+            "kind": "return",
+            "span": span,
+            "places": [],
+            "constants": [],
+            "unsupported_reason": None,
+        }],
+        "successors": [],
+    }],
+}
+unit = {
+    "schema_version": "depgraph-rust-compiler-precise-v1",
+    "digest": "",
+    "attempt_digest": os.environ["DEPGRAPH_QUERY_ATTEMPT_DIGEST"],
+    "invocation_id": os.environ["DEPGRAPH_QUERY_INVOCATION_ID"],
+    "unit_id": os.environ["DEPGRAPH_QUERY_UNIT_ID"],
+    "package_id": os.environ["DEPGRAPH_QUERY_PACKAGE_ID"],
+    "target_digest": os.environ["DEPGRAPH_QUERY_TARGET_DIGEST"],
+    "source_path": source_path,
+    "source_sha256": source_sha,
+    "profile_digest": os.environ["DEPGRAPH_QUERY_PROFILE_DIGEST"],
+    "compiler_pack_manifest_sha256": os.environ["DEPGRAPH_QUERY_PACK_MANIFEST_SHA256"],
+    "rustc_commit": os.environ["DEPGRAPH_QUERY_RUSTC_COMMIT"],
+    "query_capabilities": ["typed_mir"],
+    "bodies": [body],
+    "unsupported": [],
+}
+identity = {key: value for key, value in unit.items() if key not in ("schema_version", "digest")}
+unit["digest"] = digest(identity)
+output = os.path.join(
+    os.environ["DEPGRAPH_QUERY_OUTPUT_DIR"],
+    f"mir-{unit['invocation_id']}.json",
+)
+with open(output, "x", encoding="utf-8") as file:
+    file.write(json.dumps(unit, sort_keys=True, separators=(",", ":")))
+"#;

@@ -303,6 +303,15 @@ separately reviewable vertical increment.
 | Hostile execution and rollback E2E | 2-3 days | Exercise build script/proc macro, malicious config/wrapper, artifact escape/tamper, ICE/crash/timeout/cancel, secret non-leakage, and last-snapshot preservation under enforced CI isolation | Promotion |
 | Five-target release gate | 2-3 days | Linux/macOS x64/arm64 and Windows x64 packs pass extraction, attestation, semantic fixture, determinism, benchmark, SBOM/license, aggregate compatibility, and rollback gates | Hostile E2E |
 
+The typed MIR vertical slice uses an independently attested
+`depgraph-rustc-query` executable in the compiler pack. The stable workspace
+does not link compiler libraries. The query child is built only with the
+pinned nightly, enters through `rustc_public::run!`, and emits one DTO per
+validated wrapper invocation. The parent independently rejects unknown
+schema/fields, raw compiler identity/debug/address text, unconfined spans,
+dangling atoms, and count/byte/depth overflow before retaining the ledger as
+audit-only evidence. Call promotion remains a later stage.
+
 The cross-stage acceptance matrix contains:
 
 | Dimension | Required cases |

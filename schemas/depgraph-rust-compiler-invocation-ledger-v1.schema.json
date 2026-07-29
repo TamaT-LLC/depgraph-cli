@@ -54,6 +54,7 @@
       "additionalProperties": false,
       "required": [
         "unit_id",
+        "invocation_id",
         "invocation_digest",
         "crate_name",
         "crate_types",
@@ -74,6 +75,9 @@
       "properties": {
         "unit_id": {
           "$ref": "#/$defs/text"
+        },
+        "invocation_id": {
+          "$ref": "#/$defs/digest"
         },
         "invocation_digest": {
           "$ref": "#/$defs/digest"
