@@ -34,6 +34,7 @@ cross-checkout gate は、これらの run-scoped provenance と派生 site ID �
 fixture は typed MIR body、generic instance、direct call、static constant を含み、`monomorphized_call_graph` と `typed_mir` の query capability を検証する。
 
 resource gate は archive を 4 GiB 以下、closed tree を 8 GiB 以下、file を 250,000 件以下、semantic gate を 10 分以下に制限する。
+verifier は archive の圧縮サイズを展開前に検証し、展開中も path、entry type、重複、file 数、directory 数、展開 byte 数を上限内に固定する。
 上限超過は target smoke を生成せず release を停止する。
 
 ## Rollback gate

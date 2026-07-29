@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::OsStr,
-    fs,
+    fs, io,
     path::{Path, PathBuf},
     process::Command,
     time::Instant,
@@ -22,7 +22,7 @@ use tempfile::TempDir;
 
 use super::{
     PROJECT_LICENSES, VERSION, archive_entries, cargo_target_dir, create_tar_archive,
-    create_zip_archive, executable_name_for_target, extract_archive, host_target, run, sha256_file,
+    create_zip_archive, executable_name_for_target, host_target, run, sha256_file,
     verify_release_tag,
 };
 
@@ -33,6 +33,7 @@ const COMPONENT_HANDSHAKE_SCHEMA_VERSION: &str = "depgraph-compiler-component-ha
 const MAX_ARCHIVE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const MAX_UNPACKED_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const MAX_PACK_FILES: usize = 250_000;
+const MAX_PACK_DIRECTORIES: usize = 100_000;
 const MAX_SEMANTIC_MILLIS: u64 = 10 * 60 * 1_000;
 
 const COMPONENTS: &[ComponentDefinition] = &[
@@ -242,7 +243,7 @@ pub(crate) fn package(
 
     let semantic_start = Instant::now();
     let extracted = TempDir::new()?;
-    extract_archive(&archive, extracted.path())?;
+    extract_compiler_pack_archive(&archive, extracted.path())?;
     let extracted_root = extracted.path().join(&name);
     let extracted_requirement = CompilerPackRequirement {
         root: extracted_root.clone(),
@@ -370,7 +371,7 @@ pub(crate) fn verify_assets(
         validate_smoke(&smoke, target, &archive_sha256)?;
 
         let extracted = TempDir::new()?;
-        extract_archive(&archive, extracted.path())?;
+        extract_compiler_pack_archive(&archive, extracted.path())?;
         let top_level = fs::read_dir(extracted.path())?
             .map(|entry| Ok(entry?.file_name().to_string_lossy().into_owned()))
             .collect::<Result<BTreeSet<_>>>()?;
@@ -1259,6 +1260,193 @@ fn copy_regular_file(source: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
+fn extract_compiler_pack_archive(archive: &Path, destination: &Path) -> Result<()> {
+    let archive_metadata = fs::symlink_metadata(archive)
+        .with_context(|| format!("compiler pack archive {} is missing", archive.display()))?;
+    if archive_metadata.file_type().is_symlink()
+        || !archive_metadata.is_file()
+        || archive_metadata.len() > MAX_ARCHIVE_BYTES
+    {
+        bail!("compiler pack archive is not a bounded regular file");
+    }
+    let destination_metadata = fs::symlink_metadata(destination).with_context(|| {
+        format!(
+            "compiler pack extraction root {} is missing",
+            destination.display()
+        )
+    })?;
+    if destination_metadata.file_type().is_symlink()
+        || !destination_metadata.is_dir()
+        || fs::read_dir(destination)?.next().is_some()
+    {
+        bail!("compiler pack extraction root must be an empty real directory");
+    }
+    if archive
+        .extension()
+        .is_some_and(|extension| extension == "zip")
+    {
+        extract_bounded_zip(archive, destination)
+    } else {
+        extract_bounded_tar_gz(archive, destination)
+    }
+}
+
+fn extract_bounded_tar_gz(archive: &Path, destination: &Path) -> Result<()> {
+    let input = fs::File::open(archive)?;
+    let decoder = flate2::read::GzDecoder::new(input);
+    let mut tar = tar::Archive::new(decoder);
+    let mut seen = BTreeSet::new();
+    let mut file_count = 0_usize;
+    let mut directory_count = 0_usize;
+    let mut unpacked_bytes = 0_u64;
+    for entry in tar.entries()? {
+        let mut entry = entry?;
+        let relative = bounded_archive_path(entry.path()?.as_ref())?;
+        if !seen.insert(relative.clone()) {
+            bail!("compiler pack archive contains a duplicate path");
+        }
+        let entry_type = entry.header().entry_type();
+        let size = entry.header().size()?;
+        if entry_type.is_dir() {
+            directory_count = directory_count
+                .checked_add(1)
+                .context("compiler pack directory count overflowed")?;
+            if size != 0 {
+                bail!("compiler pack archive directory has a payload");
+            }
+        } else if entry_type.is_file() {
+            file_count = file_count
+                .checked_add(1)
+                .context("compiler pack file count overflowed")?;
+            unpacked_bytes = unpacked_bytes
+                .checked_add(size)
+                .context("compiler pack unpacked byte count overflowed")?;
+        } else {
+            bail!("compiler pack archive contains a non-regular entry");
+        }
+        enforce_extraction_bounds(file_count, directory_count, unpacked_bytes)?;
+        if !entry.unpack_in(destination)? {
+            bail!("compiler pack archive entry escapes its extraction root");
+        }
+    }
+    Ok(())
+}
+
+fn extract_bounded_zip(archive: &Path, destination: &Path) -> Result<()> {
+    let input = fs::File::open(archive)?;
+    let mut zip = zip::ZipArchive::new(input)?;
+    if zip.len() > MAX_PACK_FILES.saturating_add(MAX_PACK_DIRECTORIES) {
+        bail!("compiler pack archive entry count exceeds its bound");
+    }
+    let mut seen = BTreeSet::new();
+    let mut file_count = 0_usize;
+    let mut directory_count = 0_usize;
+    let mut unpacked_bytes = 0_u64;
+    for index in 0..zip.len() {
+        let mut entry = zip.by_index(index)?;
+        let enclosed = entry
+            .enclosed_name()
+            .context("compiler pack zip entry has an unsafe path")?;
+        let relative = bounded_archive_path(&enclosed)?;
+        if entry.name().contains('\\') || !seen.insert(relative.clone()) {
+            bail!("compiler pack archive contains an unsafe or duplicate path");
+        }
+        let unix_file_type = entry.unix_mode().map(|mode| mode & 0o170000);
+        if unix_file_type.is_some_and(|file_type| {
+            file_type != 0 && file_type != 0o040000 && file_type != 0o100000
+        }) {
+            bail!("compiler pack archive contains a non-regular entry");
+        }
+        let output = destination.join(&relative);
+        if entry.is_dir() {
+            directory_count = directory_count
+                .checked_add(1)
+                .context("compiler pack directory count overflowed")?;
+            if entry.size() != 0 {
+                bail!("compiler pack archive directory has a payload");
+            }
+            enforce_extraction_bounds(file_count, directory_count, unpacked_bytes)?;
+            fs::create_dir(&output)?;
+            set_zip_permissions(&output, entry.unix_mode())?;
+            continue;
+        }
+        if !entry.is_file() {
+            bail!("compiler pack archive contains a non-regular entry");
+        }
+        file_count = file_count
+            .checked_add(1)
+            .context("compiler pack file count overflowed")?;
+        unpacked_bytes = unpacked_bytes
+            .checked_add(entry.size())
+            .context("compiler pack unpacked byte count overflowed")?;
+        enforce_extraction_bounds(file_count, directory_count, unpacked_bytes)?;
+        let parent = output
+            .parent()
+            .context("compiler pack archive entry has no parent")?;
+        if !parent.is_dir() {
+            bail!("compiler pack archive omits a parent directory entry");
+        }
+        let mut output_file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&output)?;
+        let copied = io::copy(&mut entry, &mut output_file)?;
+        if copied != entry.size() {
+            bail!("compiler pack archive entry size changed during extraction");
+        }
+        set_zip_permissions(&output, entry.unix_mode())?;
+    }
+    Ok(())
+}
+
+fn bounded_archive_path(path: &Path) -> Result<PathBuf> {
+    let mut relative = PathBuf::new();
+    for component in path.components() {
+        let std::path::Component::Normal(component) = component else {
+            bail!("compiler pack archive contains an unsafe path");
+        };
+        let component = component
+            .to_str()
+            .context("compiler pack archive path is not UTF-8")?;
+        if component.is_empty() || component.contains(['/', '\\']) {
+            bail!("compiler pack archive contains an unsafe path");
+        }
+        relative.push(component);
+    }
+    if relative.as_os_str().is_empty() {
+        bail!("compiler pack archive contains an empty path");
+    }
+    Ok(relative)
+}
+
+fn enforce_extraction_bounds(
+    file_count: usize,
+    directory_count: usize,
+    unpacked_bytes: u64,
+) -> Result<()> {
+    if file_count > MAX_PACK_FILES
+        || directory_count > MAX_PACK_DIRECTORIES
+        || unpacked_bytes > MAX_UNPACKED_BYTES
+    {
+        bail!("compiler pack archive exceeds its extraction resource bounds");
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_zip_permissions(path: &Path, mode: Option<u32>) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let mode = mode.context("compiler pack zip entry omits Unix permissions")? & 0o777;
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_zip_permissions(_path: &Path, _mode: Option<u32>) -> Result<()> {
+    Ok(())
+}
+
 fn clear_exact_directory(path: &Path, parent: &Path) -> Result<()> {
     if path.parent() != Some(parent)
         || !path
@@ -1484,5 +1672,77 @@ mod tests {
         assert_eq!(archive_extension("x86_64-pc-windows-msvc").unwrap(), "zip");
         assert_eq!(archive_extension("aarch64-apple-darwin").unwrap(), "tar.gz");
         assert!(selected_targets(&["unknown-target".to_owned()]).is_err());
+    }
+
+    #[test]
+    fn bounded_archive_paths_reject_escape_and_cross_platform_separators() {
+        assert_eq!(
+            bounded_archive_path(Path::new("root/bin/tool")).unwrap(),
+            PathBuf::from("root/bin/tool")
+        );
+        for unsafe_path in ["../escape", "/absolute", "root\\escape", "C:\\absolute"] {
+            assert!(bounded_archive_path(Path::new(unsafe_path)).is_err());
+        }
+    }
+
+    #[test]
+    fn compiler_pack_extraction_rejects_oversized_archive_before_reading() -> Result<()> {
+        let temp = TempDir::new()?;
+        let archive = temp.path().join("oversized.tar.gz");
+        fs::File::create(&archive)?.set_len(MAX_ARCHIVE_BYTES + 1)?;
+        let destination = temp.path().join("destination");
+        fs::create_dir(&destination)?;
+
+        assert!(extract_compiler_pack_archive(&archive, &destination).is_err());
+        assert!(fs::read_dir(&destination)?.next().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_extraction_accepts_release_tar_and_zip_formats() -> Result<()> {
+        let temp = TempDir::new()?;
+        let source = temp.path().join("source");
+        fs::create_dir(&source)?;
+        fs::write(source.join("payload.txt"), "bounded compiler pack\n")?;
+        let entries = archive_entries(&source, "compiler-pack")?;
+
+        let tar_archive = temp.path().join("compiler-pack.tar.gz");
+        create_tar_archive(&tar_archive, &entries)?;
+        let tar_destination = temp.path().join("tar-destination");
+        fs::create_dir(&tar_destination)?;
+        extract_compiler_pack_archive(&tar_archive, &tar_destination)?;
+        assert_eq!(
+            fs::read_to_string(tar_destination.join("compiler-pack/payload.txt"))?,
+            "bounded compiler pack\n"
+        );
+
+        let zip_archive = temp.path().join("compiler-pack.zip");
+        create_zip_archive(&zip_archive, &entries)?;
+        let zip_destination = temp.path().join("zip-destination");
+        fs::create_dir(&zip_destination)?;
+        extract_compiler_pack_archive(&zip_archive, &zip_destination)?;
+        assert_eq!(
+            fs::read_to_string(zip_destination.join("compiler-pack/payload.txt"))?,
+            "bounded compiler pack\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn extraction_resource_bounds_are_inclusive_and_independent() {
+        enforce_extraction_bounds(MAX_PACK_FILES, MAX_PACK_DIRECTORIES, MAX_UNPACKED_BYTES)
+            .unwrap();
+        assert!(
+            enforce_extraction_bounds(MAX_PACK_FILES + 1, MAX_PACK_DIRECTORIES, MAX_UNPACKED_BYTES)
+                .is_err()
+        );
+        assert!(
+            enforce_extraction_bounds(MAX_PACK_FILES, MAX_PACK_DIRECTORIES + 1, MAX_UNPACKED_BYTES)
+                .is_err()
+        );
+        assert!(
+            enforce_extraction_bounds(MAX_PACK_FILES, MAX_PACK_DIRECTORIES, MAX_UNPACKED_BYTES + 1)
+                .is_err()
+        );
     }
 }
