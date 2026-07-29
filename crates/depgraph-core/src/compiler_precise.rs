@@ -271,12 +271,35 @@ pub fn install_neutral_cargo_config(workspace: &Path, config: &NeutralCargoConfi
 }
 
 pub fn validate_cargo_unit_graph(bytes: &[u8], workspace: &Path) -> Result<RustCargoUnitGraph> {
+    validate_cargo_unit_graph_with_cargo_home(bytes, workspace, None)
+}
+
+pub fn validate_cargo_unit_graph_with_cargo_home(
+    bytes: &[u8],
+    workspace: &Path,
+    cargo_home: Option<&Path>,
+) -> Result<RustCargoUnitGraph> {
     if bytes.is_empty() || bytes.len() > MAX_UNIT_GRAPH_BYTES {
         bail!("Cargo unit graph output is empty or exceeds its byte limit");
     }
     let workspace = workspace
         .canonicalize()
         .context("staged compiler-precise workspace is unavailable")?;
+    let cargo_home = cargo_home
+        .map(|path| {
+            path.canonicalize()
+                .context("staged compiler-precise Cargo home is unavailable")
+        })
+        .transpose()?;
+    if cargo_home.as_ref().is_some_and(|cargo_home| {
+        cargo_home.starts_with(&workspace) || workspace.starts_with(cargo_home)
+    }) {
+        bail!("security policy violation: staged Cargo home overlaps the staged workspace");
+    }
+    let roots = CargoSourceRoots {
+        workspace: &workspace,
+        cargo_home: cargo_home.as_deref(),
+    };
     let raw: RawUnitGraph =
         serde_json::from_slice(bytes).context("Cargo unit graph is invalid JSON")?;
     if raw.version != 1 {
@@ -303,13 +326,13 @@ pub fn validate_cargo_unit_graph(bytes: &[u8], workspace: &Path) -> Result<RustC
     let mut normalized = Vec::with_capacity(raw.units.len());
     let mut identity_set = BTreeSet::new();
     for unit in &raw.units {
-        let package_id = normalize_package_id(&unit.pkg_id, &workspace)?;
+        let package_id = normalize_package_id(&unit.pkg_id, &roots)?;
         let mut target = unit.target.clone();
         validate_string_list("Cargo target kind", &mut target.kind)?;
         validate_string_list("Cargo crate type", &mut target.crate_types)?;
         validate_text("Cargo target name", &target.name)?;
         validate_text("Cargo target edition", &target.edition)?;
-        target.src_path = normalize_source_path(&target.src_path, &workspace)?;
+        target.src_path = normalize_source_path(&target.src_path, &roots)?;
         validate_profile(&unit.profile)?;
         if let Some(platform) = &unit.platform {
             validate_identity("Cargo unit platform", platform)?;
@@ -400,6 +423,11 @@ pub fn validate_cargo_unit_graph(bytes: &[u8], workspace: &Path) -> Result<RustC
         units,
         roots,
     })
+}
+
+struct CargoSourceRoots<'a> {
+    workspace: &'a Path,
+    cargo_home: Option<&'a Path>,
 }
 
 fn validate_and_project_config(table: &toml::Table) -> Result<toml::Table> {
@@ -653,7 +681,7 @@ fn validate_indices_and_reachability(raw: &RawUnitGraph) -> Result<()> {
     Ok(())
 }
 
-fn normalize_package_id(value: &str, workspace: &Path) -> Result<String> {
+fn normalize_package_id(value: &str, roots: &CargoSourceRoots<'_>) -> Result<String> {
     validate_text("Cargo package ID", value)?;
     let Some(path_source) = value.strip_prefix("path+file://") else {
         if value.contains("file://") {
@@ -671,11 +699,11 @@ fn normalize_package_id(value: &str, workspace: &Path) -> Result<String> {
     let path = PathBuf::from(decoded)
         .canonicalize()
         .context("Cargo path package source is unavailable")?;
-    let logical = confined_logical_path(&path, workspace, true)?;
-    Ok(format!("path+repo://{logical}#{fragment}"))
+    let (root, logical) = confined_logical_path(&path, roots, true)?;
+    Ok(format!("path+{root}://{logical}#{fragment}"))
 }
 
-fn normalize_source_path(value: &str, workspace: &Path) -> Result<String> {
+fn normalize_source_path(value: &str, roots: &CargoSourceRoots<'_>) -> Result<String> {
     validate_text("Cargo target source path", value)?;
     let path = PathBuf::from(value);
     if !path.is_absolute() {
@@ -684,27 +712,40 @@ fn normalize_source_path(value: &str, workspace: &Path) -> Result<String> {
     let path = path
         .canonicalize()
         .context("Cargo target source path is unavailable")?;
-    let logical = confined_logical_path(&path, workspace, false)?;
-    Ok(format!("repo://{logical}"))
+    let (root, logical) = confined_logical_path(&path, roots, false)?;
+    Ok(format!("{root}://{logical}"))
 }
 
-fn confined_logical_path(path: &Path, workspace: &Path, allow_root: bool) -> Result<String> {
-    if !path.starts_with(workspace) {
+fn confined_logical_path(
+    path: &Path,
+    roots: &CargoSourceRoots<'_>,
+    allow_root: bool,
+) -> Result<(&'static str, String)> {
+    let (root_name, root, relative) = if let Ok(relative) = path.strip_prefix(roots.workspace) {
+        ("repo", roots.workspace, relative)
+    } else if let Some(cargo_home) = roots.cargo_home {
+        let relative = path.strip_prefix(cargo_home).map_err(|_| {
+            anyhow::anyhow!(
+                "security policy violation: Cargo unit graph source escapes the staged workspace and Cargo home"
+            )
+        })?;
+        ("cargo-home", cargo_home, relative)
+    } else {
         bail!("security policy violation: Cargo unit graph source escapes the staged workspace");
-    }
-    let relative = path.strip_prefix(workspace)?;
+    };
+    debug_assert!(path.starts_with(root));
     if relative.as_os_str().is_empty() {
         if allow_root {
-            return Ok(".".to_owned());
+            return Ok((root_name, ".".to_owned()));
         }
-        bail!("Cargo target source path identifies the workspace directory");
+        bail!("Cargo target source path identifies a staged source root");
     }
     for component in relative.components() {
         if !matches!(component, Component::Normal(_)) {
             bail!("Cargo unit graph source path is not canonical");
         }
     }
-    Ok(relative.to_string_lossy().replace('\\', "/"))
+    Ok((root_name, relative.to_string_lossy().replace('\\', "/")))
 }
 
 fn percent_decode(value: &str) -> Result<String> {
@@ -966,6 +1007,60 @@ mod tests {
         let error =
             validate_cargo_unit_graph(&serde_json::to_vec(&escaped)?, first.path()).unwrap_err();
         assert!(error.to_string().contains("escapes the staged workspace"));
+        Ok(())
+    }
+
+    #[test]
+    fn unit_graph_normalizes_run_owned_registry_sources_without_host_paths() -> Result<()> {
+        let first = tempfile::tempdir()?;
+        let second = tempfile::tempdir()?;
+        let mut normalized = Vec::new();
+        for root in [first.path(), second.path()] {
+            let workspace = root.join("workspace");
+            let cargo_home = root.join("cargo-home");
+            fs::create_dir_all(workspace.join("src"))?;
+            fs::create_dir_all(cargo_home.join("registry/src/index-hash/dep-1.0.0/src"))?;
+            fs::write(workspace.join("src/lib.rs"), "pub fn fixture() {}")?;
+            fs::write(
+                cargo_home.join("registry/src/index-hash/dep-1.0.0/src/lib.rs"),
+                "pub fn dependency() {}",
+            )?;
+            let mut graph = graph_json(&workspace);
+            graph["units"][0]["dependencies"] = serde_json::json!([{
+                "index": 1,
+                "extern_crate_name": "dep"
+            }]);
+            graph["units"]
+                .as_array_mut()
+                .context("fixture units are not an array")?
+                .push(serde_json::json!({
+                    "pkg_id": "registry+https://github.com/rust-lang/crates.io-index#dep@1.0.0",
+                    "target": {
+                        "kind": ["lib"],
+                        "crate_types": ["lib"],
+                        "name": "dep",
+                        "src_path": cargo_home.join("registry/src/index-hash/dep-1.0.0/src/lib.rs"),
+                        "edition": "2021",
+                        "doc": true,
+                        "doctest": true,
+                        "test": true
+                    },
+                    "profile": profile(),
+                    "platform": null,
+                    "mode": "build",
+                    "features": [],
+                    "dependencies": []
+                }));
+            normalized.push(validate_cargo_unit_graph_with_cargo_home(
+                &serde_json::to_vec(&graph)?,
+                &workspace,
+                Some(&cargo_home),
+            )?);
+        }
+        assert_eq!(normalized[0], normalized[1]);
+        let serialized = serde_json::to_string(&normalized[0])?;
+        assert!(serialized.contains("cargo-home://registry/src/index-hash/dep-1.0.0/src/lib.rs"));
+        assert!(!serialized.contains(first.path().to_string_lossy().as_ref()));
         Ok(())
     }
 

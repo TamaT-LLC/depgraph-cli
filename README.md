@@ -531,7 +531,12 @@ configuration with a deterministic offline projection after rejecting compiler,
 wrapper, runner, linker, credential-provider, alias, environment, and unsafe
 rustflag injection. It runs only the attested Cargo with `--frozen --offline
 --unit-graph -Z unstable-options`, validates and canonicalizes unit graph v1,
-and does not start rustc, build scripts, or proc macros. Later
+and does not start rustc, build scripts, or proc macros. Registry and Git
+dependencies are copied from an existing host Cargo cache into a bounded,
+run-owned, credentials-free subset before Cargo starts; their source paths are
+accepted only inside that staged Cargo home and normalized as
+`cargo-home://...`. No network lookup or direct host-cache path is exposed to
+the child or persisted DTO. Later
 compiler-precise stages add compiler invocation and query output; this stage
 does not promote graph evidence.
 

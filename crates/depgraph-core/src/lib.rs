@@ -209,7 +209,7 @@ pub use compiler_precise::{
     COMPILER_PRECISE_UNIT_GRAPH_SCHEMA_VERSION, NEUTRAL_CARGO_CONFIG_SCHEMA_VERSION,
     NeutralCargoConfig, RustCargoDependency, RustCargoProfile, RustCargoStrip, RustCargoTarget,
     RustCargoUnit, RustCargoUnitGraph, install_neutral_cargo_config, project_neutral_cargo_config,
-    validate_cargo_unit_graph,
+    validate_cargo_unit_graph, validate_cargo_unit_graph_with_cargo_home,
 };
 pub use config::{Config, DaemonConfig, default_store_path, init_config};
 pub use daemon::{

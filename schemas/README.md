@@ -22,7 +22,9 @@ The core additionally enforces root reachability, index conservation,
 canonical ordering and digest recomputation, package/source confinement, and
 the absence of duplicate canonical units, roots, or dependencies. Host
 temporary paths and Cargo's raw numeric unit indices do not cross this
-boundary.
+boundary. Workspace sources use `repo://...`; registry and Git sources are
+first copied into the bounded run-owned Cargo home and use
+`cargo-home://...`. Paths outside those two staged roots fail closed.
 
 `depgraph-protocol-v1.schema.json` contains both the repository-complete
 protocol `1.0` events and the opt-in `worker-delta-v1` event family. Delta mode
