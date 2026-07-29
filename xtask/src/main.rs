@@ -121,6 +121,12 @@ enum Task {
     GoSemanticE2e,
     RustSemanticE2e,
     Package,
+    CompilerPack {
+        source: PathBuf,
+        output: PathBuf,
+        #[arg(long)]
+        spec: PathBuf,
+    },
     VerifyReleaseAssets {
         directory: PathBuf,
         #[arg(long)]
@@ -439,6 +445,11 @@ fn main() -> Result<()> {
             rust_semantic_e2e::run_development(&workspace_root(), &cargo_target_dir())
         }
         Task::Package => package(),
+        Task::CompilerPack {
+            source,
+            output,
+            spec,
+        } => compiler_pack(&source, &output, &spec),
         Task::VerifyReleaseAssets { directory, target } => {
             verify_release_assets(&directory, &target)
         }
@@ -451,6 +462,19 @@ fn main() -> Result<()> {
             github_settings_verify(&snapshot, &output)
         }
     }
+}
+
+fn compiler_pack(source: &Path, output: &Path, spec_path: &Path) -> Result<()> {
+    let spec = depgraph_core::read_compiler_pack_build_spec(spec_path)?;
+    let verified = depgraph_core::build_compiler_pack(source, output, &spec)?;
+    println!(
+        "built compiler pack {} for {}/{} (manifest sha256 {})",
+        verified.root.display(),
+        verified.attestation.host,
+        verified.attestation.target,
+        verified.attestation.manifest_sha256
+    );
+    Ok(())
 }
 
 fn build(release: bool) -> Result<()> {
@@ -5395,6 +5419,7 @@ fn cross_language_ffi_outcome(
             diagnostic_code: None,
         },
         project_code_executed: true,
+        compiler_pack_attestation: None,
         rust_observation: None,
         web_observation: None,
     })

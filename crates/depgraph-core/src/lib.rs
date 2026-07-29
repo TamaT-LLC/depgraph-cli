@@ -6,6 +6,7 @@ pub mod build;
 pub mod build_evidence;
 pub mod cache;
 pub mod cancellation;
+pub mod compiler_pack;
 pub mod config;
 pub mod cross_language;
 pub mod daemon;
@@ -187,6 +188,18 @@ pub const CROSS_LANGUAGE_RELEASE_SMOKE_FIXTURE: &str =
     include_str!("../../../fixtures/cross-language-release-smoke-v1.json");
 pub use cache::build_cache_key;
 pub use cancellation::CancellationToken;
+pub use compiler_pack::{
+    COMPILER_PACK_CHANNEL_MANIFEST, COMPILER_PACK_CHANNEL_MANIFEST_SHA256,
+    COMPILER_PACK_LICENSE_INVENTORY_PATH, COMPILER_PACK_MANIFEST_PATH,
+    COMPILER_PACK_MANIFEST_SCHEMA, COMPILER_PACK_MANIFEST_SCHEMA_PATH,
+    COMPILER_PACK_MANIFEST_SCHEMA_VERSION, COMPILER_PACK_PROVENANCE_PATH,
+    COMPILER_PACK_RUST_RELEASE, COMPILER_PACK_RUSTC_COMMIT, COMPILER_PACK_SBOM_PATH,
+    COMPILER_PACK_TOOLCHAIN_CHANNEL, COMPILER_PACK_WRAPPER_PROTOCOL_VERSION,
+    COMPILER_PRECISE_CONTRACT_VERSION, CompilerPackArtifact, CompilerPackAttestation,
+    CompilerPackBuildComponent, CompilerPackBuildSpec, CompilerPackComponent, CompilerPackFile,
+    CompilerPackManifest, CompilerPackProtocol, CompilerPackRequirement, CompilerPackToolchain,
+    VerifiedCompilerPack, build_compiler_pack, read_compiler_pack_build_spec, verify_compiler_pack,
+};
 pub use config::{Config, DaemonConfig, default_store_path, init_config};
 pub use daemon::{
     DAEMON_INCREMENTAL_TRACE_SCHEMA_VERSION, DAEMON_STATUS_SCHEMA_VERSION, DaemonAttempt,

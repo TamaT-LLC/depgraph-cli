@@ -4,6 +4,18 @@ This directory contains versioned, machine-readable contracts shipped with depgr
 Consumers should select a schema by its declared contract version and fail closed on
 unknown versions or properties.
 
+`depgraph-compiler-pack-v1.schema.json` describes the separately distributed,
+target-specific `compiler-precise-rust-v1` compatibility unit. The manifest
+fixes the exact nightly channel, Rust/Cargo release, rustc commit, host/target,
+official component archives and extracted trees, compiler wrapper and protocol,
+SPDX SBOM, license inventory, source provenance, and the complete regular-file
+and directory closure. The core additionally verifies the externally supplied
+release checksum, canonical ordering and digests, executable identities, and
+all legal/provenance cross-references before and after supervised project code.
+Missing, additional, modified, symlinked, non-regular, or host-incompatible
+entries fail closed without a rustup, PATH, system, or project-toolchain
+fallback.
+
 `depgraph-protocol-v1.schema.json` contains both the repository-complete
 protocol `1.0` events and the opt-in `worker-delta-v1` event family. Delta mode
 is selected only after exact capability negotiation; legacy workers continue

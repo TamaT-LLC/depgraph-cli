@@ -17,6 +17,9 @@ use tokio::{process::Command, time::timeout};
 use uuid::Uuid;
 use walkdir::{DirEntry, WalkDir};
 
+use crate::compiler_pack::{
+    CompilerPackAttestation, CompilerPackRequirement, VerifiedCompilerPack, verify_compiler_pack,
+};
 use crate::rust_build_observer::{
     RUST_BUILD_OBSERVER, RUST_BUILD_OBSERVER_VERSION, RustBuildObservation,
     collect_rust_build_observation,
@@ -160,6 +163,7 @@ pub struct BuildExecutionPlan {
     pub stdout_limit_bytes: usize,
     pub stderr_limit_bytes: usize,
     pub target: Option<String>,
+    pub compiler_pack: Option<CompilerPackRequirement>,
 }
 
 #[derive(Debug, Clone)]
@@ -197,6 +201,7 @@ pub fn create_build_execution_request(source_root: &Path) -> Result<BuildExecuti
                 stdout_limit_bytes: DEFAULT_OUTPUT_LIMIT_BYTES,
                 stderr_limit_bytes: DEFAULT_OUTPUT_LIMIT_BYTES,
                 target: None,
+                compiler_pack: None,
             },
         });
     }
@@ -263,6 +268,7 @@ pub fn create_build_execution_request(source_root: &Path) -> Result<BuildExecuti
                 stdout_limit_bytes: DEFAULT_OUTPUT_LIMIT_BYTES,
                 stderr_limit_bytes: DEFAULT_OUTPUT_LIMIT_BYTES,
                 target: Some("production".to_owned()),
+                compiler_pack: None,
             },
         });
     }
@@ -316,6 +322,14 @@ impl BuildExecutionPlan {
         for key in self.environment.keys() {
             if !is_allowed_environment_key(key) {
                 bail!("security policy violation: build environment key {key} is not allowlisted");
+            }
+        }
+        if let Some(requirement) = &self.compiler_pack {
+            if self.program != "cargo" {
+                bail!("compiler pack execution requires the exact packed Cargo");
+            }
+            if self.target.as_deref() != Some(requirement.target.as_str()) {
+                bail!("compiler pack execution target does not match the build plan");
             }
         }
         Ok(())
@@ -379,6 +393,8 @@ pub struct BuildExecutionOutcome {
     pub audit: BuildAudit,
     pub project_code_executed: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub compiler_pack_attestation: Option<CompilerPackAttestation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub rust_observation: Option<RustBuildObservation>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub web_observation: Option<WebBuildObservation>,
@@ -406,7 +422,23 @@ where
     if !source_root.is_dir() {
         bail!("build source root is not a directory");
     }
-    let (program, rustc) = if plan.program == "cargo" {
+    let compiler_pack_preflight = plan
+        .compiler_pack
+        .as_ref()
+        .map(verify_compiler_pack)
+        .transpose()
+        .context(
+            "compiler-precise backend is unsupported: exact compiler pack verification failed; no rustup, PATH, system, or project toolchain fallback was attempted",
+        )?;
+    if compiler_pack_preflight
+        .as_ref()
+        .is_some_and(|pack| pack.root.starts_with(&source_root))
+    {
+        bail!("security policy violation: compiler pack must not be inside the project root");
+    }
+    let (program, rustc) = if let Some(pack) = &compiler_pack_preflight {
+        (pack.cargo_path.clone(), Some(pack.rustc_path.clone()))
+    } else if plan.program == "cargo" {
         let (cargo, rustc) = resolve_active_rust_toolchain(&source_root).await?;
         (cargo, Some(rustc))
     } else {
@@ -443,8 +475,13 @@ where
         use std::os::unix::process::CommandExt as _;
         command.as_std_mut().process_group(0);
     }
-    let mut effective_environment =
-        supervisor_environment(&source_root, &run, &plan.program, rustc.as_deref())?;
+    let mut effective_environment = supervisor_environment(
+        &source_root,
+        &run,
+        &plan.program,
+        rustc.as_deref(),
+        compiler_pack_preflight.as_ref(),
+    )?;
     for (key, value) in &plan.environment {
         effective_environment.insert(key.clone(), value.clone());
     }
@@ -460,6 +497,9 @@ where
         "program": plan.program,
         "arguments": redacted_arguments,
         "logical_cwd": display_logical(&plan.logical_cwd),
+        "compiler_pack_manifest_sha256": compiler_pack_preflight
+            .as_ref()
+            .map(|pack| pack.attestation.manifest_sha256.as_str()),
     }))?;
     let environment_key_set_digest = digest_json(&environment_keys)?;
     let source_root_digest = digest_workspace(&run.workspace)?;
@@ -532,6 +572,21 @@ where
         } else if output_limit_exceeded {
             outcome = BuildOutcomeKind::Failed;
             diagnostic_code = Some("build-output-limit".to_owned());
+        }
+    }
+    let mut compiler_pack_attestation = compiler_pack_preflight
+        .as_ref()
+        .map(|pack| pack.attestation.clone());
+    if let (Some(requirement), Some(preflight)) = (&plan.compiler_pack, &compiler_pack_preflight) {
+        match verify_compiler_pack(requirement) {
+            Ok(postflight) if postflight.attestation == preflight.attestation => {
+                compiler_pack_attestation = Some(postflight.attestation);
+            }
+            Ok(_) | Err(_) => {
+                outcome = BuildOutcomeKind::SecurityFailed;
+                diagnostic_code = Some("compiler-pack-postflight-failed".to_owned());
+                compiler_pack_attestation = None;
+            }
         }
     }
     let mut rust_observation = None;
@@ -607,6 +662,7 @@ where
     Ok(BuildExecutionOutcome {
         audit,
         project_code_executed: true,
+        compiler_pack_attestation,
         rust_observation,
         web_observation,
     })
@@ -718,12 +774,27 @@ fn supervisor_environment(
     run: &BuildRunDirectories,
     program: &str,
     rustc: Option<&Path>,
+    compiler_pack: Option<&VerifiedCompilerPack>,
 ) -> Result<BTreeMap<String, String>> {
     let mut environment = BTreeMap::new();
-    environment.insert(
-        "PATH".to_owned(),
-        sanitized_path(root)?.to_string_lossy().into_owned(),
-    );
+    let path = if let Some(pack) = compiler_pack {
+        let mut directories = BTreeSet::new();
+        for executable in [&pack.cargo_path, &pack.rustc_path, &pack.wrapper_path] {
+            directories.insert(
+                executable
+                    .parent()
+                    .context("compiler pack executable has no parent directory")?
+                    .to_path_buf(),
+            );
+        }
+        std::env::join_paths(directories)
+            .context("compiler pack PATH is invalid")?
+            .to_string_lossy()
+            .into_owned()
+    } else {
+        sanitized_path(root)?.to_string_lossy().into_owned()
+    };
+    environment.insert("PATH".to_owned(), path);
     environment.insert("HOME".to_owned(), run.home.to_string_lossy().into_owned());
     environment.insert(
         "USERPROFILE".to_owned(),
@@ -781,15 +852,20 @@ fn supervisor_environment(
             "CARGO_BUILD_RUSTC".to_owned(),
             rustc.to_string_lossy().into_owned(),
         );
-        if let Some(value) = safe_host_directory("RUSTUP_HOME", root).or_else(|| {
-            BaseDirs::new().and_then(|directories| {
-                safe_directory_path(&directories.home_dir().join(".rustup"), root)
+        let rustup_home = compiler_pack.is_none().then(|| {
+            safe_host_directory("RUSTUP_HOME", root).or_else(|| {
+                BaseDirs::new().and_then(|directories| {
+                    safe_directory_path(&directories.home_dir().join(".rustup"), root)
+                })
             })
-        }) {
+        });
+        if let Some(Some(value)) = rustup_home {
             environment.insert("RUSTUP_HOME".to_owned(), value);
         }
         #[cfg(all(windows, target_env = "msvc"))]
-        copy_safe_msvc_environment(&mut environment, root)?;
+        if compiler_pack.is_none() {
+            copy_safe_msvc_environment(&mut environment, root)?;
+        }
     }
     if let Some(system_root) = std::env::var_os("SystemRoot") {
         environment.insert(
@@ -1151,6 +1227,9 @@ fn network_isolation_capability() -> (NetworkIsolation, Option<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compiler_pack::{
+        CompilerPackBuildComponent, CompilerPackBuildSpec, build_compiler_pack,
+    };
 
     #[test]
     fn web_build_observer_versions_follow_each_observation_contract() {
@@ -1201,7 +1280,149 @@ mod tests {
             stdout_limit_bytes: 1024,
             stderr_limit_bytes: 1024,
             target: None,
+            compiler_pack: None,
         }
+    }
+
+    #[cfg(unix)]
+    fn compiler_pack_fixture(
+        temp: &tempfile::TempDir,
+    ) -> Result<(CompilerPackRequirement, PathBuf)> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let source = temp.path().join("compiler-pack-source");
+        let pack = temp.path().join("compiler-pack");
+        fs::create_dir(&source)?;
+        let component = |name: &str, files: Vec<String>| CompilerPackBuildComponent {
+            name: name.to_owned(),
+            archive_sha256: hex::encode(Sha256::digest(format!("archive:{name}"))),
+            source: format!(
+                "https://static.rust-lang.org/dist/2026-07-17/{name}-nightly-fixture.tar.xz"
+            ),
+            files,
+        };
+        let spec = CompilerPackBuildSpec {
+            host: "x86_64-unknown-linux-gnu".to_owned(),
+            target: "x86_64-unknown-linux-gnu".to_owned(),
+            release_checksum_reference:
+                "release-checksums:v0.4.0/compiler-pack-x86_64-unknown-linux-gnu".to_owned(),
+            cargo_path: "toolchain/cargo/bin/cargo".to_owned(),
+            rustc_path: "toolchain/rustc/bin/rustc".to_owned(),
+            wrapper_path: "bin/depgraph-rustc-wrapper".to_owned(),
+            wrapper_protocol_schema_path: "schemas/depgraph-rust-compiler-precise-v1.schema.json"
+                .to_owned(),
+            components: vec![
+                component("cargo", vec!["toolchain/cargo/bin/cargo".to_owned()]),
+                component(
+                    "llvm-tools",
+                    vec!["toolchain/llvm-tools/bin/llvm-config".to_owned()],
+                ),
+                component(
+                    "rust-src",
+                    vec!["toolchain/rust-src/library/core/src/lib.rs".to_owned()],
+                ),
+                component(
+                    "rust-std",
+                    vec!["toolchain/rust-std/lib/libstd.rlib".to_owned()],
+                ),
+                component("rustc", vec!["toolchain/rustc/bin/rustc".to_owned()]),
+                component(
+                    "rustc-dev",
+                    vec!["toolchain/rustc-dev/lib/librustc_driver.rlib".to_owned()],
+                ),
+            ],
+        };
+        for component in &spec.components {
+            for relative in &component.files {
+                let path = source.join(relative);
+                fs::create_dir_all(path.parent().context("fixture file has no parent")?)?;
+                fs::write(&path, format!("fixture:{}", component.name))?;
+            }
+        }
+        for relative in [
+            spec.wrapper_path.as_str(),
+            spec.wrapper_protocol_schema_path.as_str(),
+            "licenses/LICENSE-APACHE",
+            "licenses/LICENSE-MIT",
+        ] {
+            let path = source.join(relative);
+            fs::create_dir_all(path.parent().context("fixture file has no parent")?)?;
+            fs::write(path, b"fixture")?;
+        }
+        let cargo = source.join(&spec.cargo_path);
+        fs::write(
+            &cargo,
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf 'cargo 1.99.0-nightly\\n'; exit 0; fi\nprintf 'tampered' > \"$DEPGRAPH_TARGET\"\n",
+        )?;
+        for relative in [&spec.cargo_path, &spec.rustc_path, &spec.wrapper_path] {
+            let path = source.join(relative);
+            let mut permissions = fs::metadata(&path)?.permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(path, permissions)?;
+        }
+        let verified = build_compiler_pack(&source, &pack, &spec)?;
+        let tamper_path = pack.join("toolchain/rust-src/library/core/src/lib.rs");
+        Ok((
+            CompilerPackRequirement {
+                root: pack,
+                expected_manifest_sha256: verified.attestation.manifest_sha256,
+                release_checksum_reference: spec.release_checksum_reference,
+                host: spec.host,
+                target: spec.target,
+            },
+            tamper_path,
+        ))
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn compiler_pack_postflight_tamper_is_security_failed() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let project = temp.path().join("project");
+        fs::create_dir(&project)?;
+        fs::write(project.join("input"), b"fixture")?;
+        let (requirement, tamper_path) = compiler_pack_fixture(&temp)?;
+        let mut plan = BuildExecutionPlan {
+            adapter: "compiler-pack-fixture".to_owned(),
+            adapter_version: "1.0".to_owned(),
+            profile_id: "rust:compiler-precise".to_owned(),
+            program: "cargo".to_owned(),
+            arguments: vec!["build".to_owned()],
+            logical_cwd: PathBuf::from("."),
+            environment: BTreeMap::from([(
+                "DEPGRAPH_TARGET".to_owned(),
+                tamper_path.to_string_lossy().into_owned(),
+            )]),
+            timeout_seconds: 10,
+            stdout_limit_bytes: 1024,
+            stderr_limit_bytes: 1024,
+            target: Some(requirement.target.clone()),
+            compiler_pack: Some(requirement),
+        };
+        let outcome = supervise_build(&project, &plan).await?;
+        assert_eq!(outcome.audit.outcome, BuildOutcomeKind::SecurityFailed);
+        assert_eq!(
+            outcome.audit.diagnostic_code.as_deref(),
+            Some("compiler-pack-postflight-failed")
+        );
+        assert!(outcome.audit.validated_output_digest.is_none());
+        assert!(outcome.compiler_pack_attestation.is_none());
+        assert!(outcome.rust_observation.is_none());
+        assert!(outcome.web_observation.is_none());
+
+        plan.compiler_pack = Some(CompilerPackRequirement {
+            root: temp.path().join("missing-pack"),
+            expected_manifest_sha256: "0".repeat(64),
+            release_checksum_reference:
+                "release-checksums:v0.4.0/compiler-pack-x86_64-unknown-linux-gnu".to_owned(),
+            host: "x86_64-unknown-linux-gnu".to_owned(),
+            target: "x86_64-unknown-linux-gnu".to_owned(),
+        });
+        let error = supervise_build(&project, &plan).await.unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("compiler-precise backend is unsupported"));
+        assert!(message.contains("no rustup, PATH, system, or project toolchain fallback"));
+        Ok(())
     }
 
     #[tokio::test]
