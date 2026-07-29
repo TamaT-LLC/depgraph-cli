@@ -220,16 +220,18 @@ pub use compiler_mir::{
 };
 pub use compiler_pack::{
     COMPILER_PACK_CHANNEL_MANIFEST, COMPILER_PACK_CHANNEL_MANIFEST_SHA256,
+    COMPILER_PACK_DISTRIBUTION, COMPILER_PACK_FALLBACK_POLICY,
     COMPILER_PACK_LICENSE_INVENTORY_PATH, COMPILER_PACK_MANIFEST_PATH,
     COMPILER_PACK_MANIFEST_SCHEMA, COMPILER_PACK_MANIFEST_SCHEMA_PATH,
     COMPILER_PACK_MANIFEST_SCHEMA_VERSION, COMPILER_PACK_PROVENANCE_PATH,
-    COMPILER_PACK_RUST_RELEASE, COMPILER_PACK_RUSTC_COMMIT, COMPILER_PACK_SBOM_PATH,
-    COMPILER_PACK_TOOLCHAIN_CHANNEL, COMPILER_PACK_WRAPPER_PROTOCOL_VERSION,
-    COMPILER_PRECISE_CONTRACT_VERSION, CompilerPackArtifact, CompilerPackAttestation,
-    CompilerPackBuildComponent, CompilerPackBuildSpec, CompilerPackComponent, CompilerPackFile,
-    CompilerPackManifest, CompilerPackProtocol, CompilerPackRequirement, CompilerPackToolchain,
-    VerifiedCompilerPack, build_compiler_pack, read_compiler_pack_build_spec,
-    read_compiler_pack_requirement, verify_compiler_pack,
+    COMPILER_PACK_RELEASE_CONTRACT_VERSION, COMPILER_PACK_RUST_RELEASE, COMPILER_PACK_RUSTC_COMMIT,
+    COMPILER_PACK_SBOM_PATH, COMPILER_PACK_SUPPORTED_TARGETS, COMPILER_PACK_TOOLCHAIN_CHANNEL,
+    COMPILER_PACK_WRAPPER_PROTOCOL_VERSION, COMPILER_PRECISE_CONTRACT_VERSION,
+    CompilerPackArtifact, CompilerPackAttestation, CompilerPackBuildComponent,
+    CompilerPackBuildSpec, CompilerPackComponent, CompilerPackFile, CompilerPackManifest,
+    CompilerPackProtocol, CompilerPackRequirement, CompilerPackToolchain, VerifiedCompilerPack,
+    build_compiler_pack, read_compiler_pack_build_spec, read_compiler_pack_requirement,
+    verify_compiler_pack,
 };
 pub use compiler_precise::{
     COMPILER_PRECISE_UNIT_GRAPH_ADAPTER, COMPILER_PRECISE_UNIT_GRAPH_ADAPTER_VERSION,
@@ -605,6 +607,52 @@ pub struct ReleaseCompatibilityHealth {
     pub bounded_query: BoundedQueryReleaseCompatibilityHealth,
     pub profile_selection: ProfileSelectionReleaseCompatibilityHealth,
     pub cross_language: CrossLanguageReleaseCompatibilityHealth,
+    pub compiler_precise: CompilerPreciseReleaseCompatibilityHealth,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CompilerPreciseReleaseCompatibilityHealth {
+    pub release_contract_version: String,
+    pub distribution: String,
+    pub supported_targets: Vec<String>,
+    pub compiler_contract_version: String,
+    pub manifest_schema_version: String,
+    pub toolchain_channel: String,
+    pub rust_release: String,
+    pub rustc_commit: String,
+    pub channel_manifest: String,
+    pub channel_manifest_sha256: String,
+    pub wrapper_protocol_version: String,
+    pub mir_schema_version: String,
+    pub query_capabilities: Vec<String>,
+    pub fallback_policy: String,
+}
+
+pub fn compiler_precise_release_compatibility_contract() -> CompilerPreciseReleaseCompatibilityHealth
+{
+    CompilerPreciseReleaseCompatibilityHealth {
+        release_contract_version: COMPILER_PACK_RELEASE_CONTRACT_VERSION.to_owned(),
+        distribution: COMPILER_PACK_DISTRIBUTION.to_owned(),
+        supported_targets: COMPILER_PACK_SUPPORTED_TARGETS
+            .iter()
+            .map(|target| (*target).to_owned())
+            .collect(),
+        compiler_contract_version: COMPILER_PRECISE_CONTRACT_VERSION.to_owned(),
+        manifest_schema_version: COMPILER_PACK_MANIFEST_SCHEMA_VERSION.to_owned(),
+        toolchain_channel: COMPILER_PACK_TOOLCHAIN_CHANNEL.to_owned(),
+        rust_release: COMPILER_PACK_RUST_RELEASE.to_owned(),
+        rustc_commit: COMPILER_PACK_RUSTC_COMMIT.to_owned(),
+        channel_manifest: COMPILER_PACK_CHANNEL_MANIFEST.to_owned(),
+        channel_manifest_sha256: COMPILER_PACK_CHANNEL_MANIFEST_SHA256.to_owned(),
+        wrapper_protocol_version: COMPILER_PACK_WRAPPER_PROTOCOL_VERSION.to_owned(),
+        mir_schema_version: COMPILER_PRECISE_MIR_SCHEMA_VERSION.to_owned(),
+        query_capabilities: vec![
+            "monomorphized_call_graph".to_owned(),
+            "typed_mir".to_owned(),
+        ],
+        fallback_policy: COMPILER_PACK_FALLBACK_POLICY.to_owned(),
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -810,6 +858,7 @@ pub fn release_compatibility_contract() -> ReleaseCompatibilityHealth {
         bounded_query: bounded_query_release_compatibility_contract(),
         profile_selection: profile_selection_release_compatibility_contract(),
         cross_language: cross_language_release_compatibility_contract(),
+        compiler_precise: compiler_precise_release_compatibility_contract(),
     }
 }
 

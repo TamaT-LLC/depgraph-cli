@@ -3261,6 +3261,7 @@ dependencies = [
  "spdx",
  "tar",
  "tempfile",
+ "toml",
  "walkdir",
  "zip",
 ]

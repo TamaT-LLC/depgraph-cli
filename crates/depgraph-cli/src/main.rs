@@ -1028,6 +1028,9 @@ async fn run(cli: Cli) -> Result<u8> {
             println!("build evidence: {evidence_status}");
             println!("build cache: {build_cache_status}");
             println!("network isolation: {:?}", outcome.audit.network_isolation);
+            if let Some(diagnostic) = &outcome.audit.diagnostic_code {
+                println!("diagnostic: {diagnostic}");
+            }
             if let Some(diagnostic) = &outcome.audit.isolation_diagnostic {
                 eprintln!("warning: {diagnostic}");
             }

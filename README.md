@@ -517,6 +517,18 @@ requires that external digest and verifies the pack before project staging and
 again after the supervised process tree has stopped. It never downloads through
 rustup or falls back to PATH, system, or project toolchains.
 
+Release tags build separate compiler packs for Linux x86-64/ARM64, macOS
+Intel/Apple Silicon, and Windows x86-64 with `cargo xtask
+compiler-pack-package`. Each native job verifies archive extraction,
+closed-tree attestation, wrapper/query handshakes, typed MIR and monomorphized
+call semantics, cross-checkout determinism, resource budgets, legal/provenance
+metadata, tamper rejection, and rollback. `cargo xtask
+verify-compiler-pack-assets` requires all five packs to share
+`compiler-pack-five-target-release-v1`, the pinned toolchain/rustc/schema/query
+identity, and the canonical semantic shape before the stable release gate can
+publish them. Release metadata and `doctor --json` expose this separate
+distribution and its `unsupported-no-fallback` policy.
+
 The first compiler-precise execution stage is explicitly selected with all
 three invocation gates and a release-bound requirement document:
 

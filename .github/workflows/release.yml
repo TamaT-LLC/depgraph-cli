@@ -180,8 +180,81 @@ jobs:
           path: artifacts/release-verification.json
           if-no-files-found: error
 
+  compiler-pack:
+    needs: [quality, compiler-precise-hostile]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: macos-15
+            target: aarch64-apple-darwin
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: rustup toolchain install 1.93.1 --profile minimal
+      - run: rustup default 1.93.1
+      - name: Install the exact compiler-pack toolchain
+        run: rustup toolchain install nightly-2026-07-17 --profile minimal --component rust-src,rustc-dev,llvm-tools-preview
+      - name: Install the enforced Linux namespace boundary
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends bubblewrap
+          if sysctl -n kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+      - name: Acquire the release-bound Rust channel manifest
+        shell: bash
+        run: |
+          curl --fail --silent --show-error --location \
+            --output channel-rust-nightly-2026-07-17.toml \
+            https://static.rust-lang.org/dist/2026-07-17/channel-rust-nightly.toml
+      - name: Build, extract, attest, and exercise the target compiler pack
+        env:
+          DEPGRAPH_TARGET: ${{ matrix.target }}
+        run: cargo xtask compiler-pack-package --channel-manifest channel-rust-nightly-2026-07-17.toml
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: compiler-pack-${{ matrix.target }}
+          path: |
+            dist/depgraph-compiler-pack-*.tar.gz
+            dist/depgraph-compiler-pack-*.zip
+            dist/depgraph-compiler-pack-*.sha256
+            dist/depgraph-compiler-pack-*.requirement.json
+            dist/depgraph-compiler-pack-*.smoke.json
+          if-no-files-found: error
+
+  verify-compiler-packs:
+    needs: compiler-pack
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: rustup toolchain install 1.93.1 --profile minimal
+      - run: rustup default 1.93.1
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: compiler-pack-*
+          path: compiler-artifacts
+          merge-multiple: true
+      - name: Verify the compiler-pack five-target compatibility closure
+        run: cargo xtask verify-compiler-pack-assets compiler-artifacts
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: compiler-pack-verification
+          path: compiler-artifacts/compiler-pack-verification.json
+          if-no-files-found: error
+
   stable-gate:
-    needs: [quality, compiler-precise-hostile, benchmark, package, verify-assets]
+    needs: [quality, compiler-precise-hostile, benchmark, package, verify-assets, compiler-pack, verify-compiler-packs]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -195,6 +268,10 @@ jobs:
         with:
           name: benchmark-report-${{ github.sha }}
           path: benchmark
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: compiler-pack-verification
+          path: compiler-artifacts
       - name: Evaluate the machine-readable stable v0.4.0 release gate
         env:
           DEPGRAPH_RELEASE_QUALITY_RESULT: ${{ needs.quality.result }}
@@ -202,7 +279,9 @@ jobs:
           DEPGRAPH_RELEASE_BENCHMARK_RESULT: ${{ needs.benchmark.result }}
           DEPGRAPH_RELEASE_PACKAGE_RESULT: ${{ needs.package.result }}
           DEPGRAPH_RELEASE_VERIFY_ASSETS_RESULT: ${{ needs.verify-assets.result }}
-        run: cargo xtask stable-release-gate artifacts/release-verification.json benchmark/benchmark-report.json --output artifacts/stable-release-gate.json
+          DEPGRAPH_RELEASE_COMPILER_PACK_RESULT: ${{ needs.compiler-pack.result }}
+          DEPGRAPH_RELEASE_VERIFY_COMPILER_PACKS_RESULT: ${{ needs.verify-compiler-packs.result }}
+        run: cargo xtask stable-release-gate artifacts/release-verification.json benchmark/benchmark-report.json compiler-artifacts/compiler-pack-verification.json --output artifacts/stable-release-gate.json
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
         with:

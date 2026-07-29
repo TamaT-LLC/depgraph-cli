@@ -327,7 +327,7 @@ separately reviewable vertical increment.
 | Monomorphized item and call slice | 2-3 days | Represent functions, generic instances, shims, drop glue, and exact/candidate/unknown calls without raw compiler IDs | Typed MIR |
 | Atomic graph promotion and query/export | 2-3 days | Union build-phase observed nodes/sites/edges; support doctor/why/JSON/DOT/Mermaid; preserve safe evidence and profile separation | Instance slice |
 | Hostile execution and rollback E2E (implemented in #248) | 2-3 days | Exercise build script/proc macro, malicious config/wrapper, artifact escape/tamper, ICE/crash/timeout/cancel, secret non-leakage, and last-snapshot preservation under enforced CI isolation | Promotion |
-| Five-target release gate | 2-3 days | Linux/macOS x64/arm64 and Windows x64 packs pass extraction, attestation, semantic fixture, determinism, benchmark, SBOM/license, aggregate compatibility, and rollback gates | Hostile E2E |
+| Five-target release gate (implemented in #249) | 2-3 days | Linux/macOS x64/arm64 and Windows x64 packs pass extraction, attestation, semantic fixture, determinism, benchmark, SBOM/license, aggregate compatibility, and rollback gates | Hostile E2E |
 
 The typed MIR vertical slice uses an independently attested
 `depgraph-rustc-query` executable in the compiler pack. The stable workspace
@@ -358,6 +358,15 @@ The cross-stage acceptance matrix contains:
 No stage may promote `compiler-precise` support based only on happy-path unit
 tests. The applicable hostile, rollback, and deterministic cases are mandatory
 at every promotion boundary.
+
+Issue #249 implements the release closure as
+[`compiler-pack-five-target-release-v1`](../50_test/compiler-precise-five-target-release.md).
+The five native pack jobs publish archives separately from normal product
+archives, and `verify-compiler-packs` requires the exact target set before the
+stable release gate can pass.
+Release compatibility and doctor output expose the supported targets, exact
+toolchain and schema identity, query capabilities, separate distribution, and
+`unsupported-no-fallback` policy.
 
 ## Consequences
 
