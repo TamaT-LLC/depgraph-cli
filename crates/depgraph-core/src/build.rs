@@ -20,6 +20,11 @@ use walkdir::{DirEntry, WalkDir};
 use crate::compiler_pack::{
     CompilerPackAttestation, CompilerPackRequirement, VerifiedCompilerPack, verify_compiler_pack,
 };
+use crate::compiler_precise::{
+    COMPILER_PRECISE_UNIT_GRAPH_ADAPTER, COMPILER_PRECISE_UNIT_GRAPH_ADAPTER_VERSION,
+    RustCargoUnitGraph, install_neutral_cargo_config, project_neutral_cargo_config,
+    validate_cargo_unit_graph_with_cargo_home,
+};
 use crate::rust_build_observer::{
     RUST_BUILD_OBSERVER, RUST_BUILD_OBSERVER_VERSION, RustBuildObservation,
     collect_rust_build_observation,
@@ -277,6 +282,48 @@ pub fn create_build_execution_request(source_root: &Path) -> Result<BuildExecuti
     )
 }
 
+pub fn create_compiler_precise_unit_graph_request(
+    source_root: &Path,
+    compiler_pack: CompilerPackRequirement,
+) -> Result<BuildExecutionRequest> {
+    let source_root = source_root
+        .canonicalize()
+        .context("compiler-precise source root is unavailable")?;
+    if !source_root.is_dir() {
+        bail!("compiler-precise source root is not a directory");
+    }
+    if !source_root.join("Cargo.toml").is_file() || !source_root.join("Cargo.lock").is_file() {
+        bail!("compiler-precise Rust requires confined Cargo.toml and Cargo.lock files");
+    }
+    project_neutral_cargo_config(&source_root)?;
+    Ok(BuildExecutionRequest {
+        source_root,
+        plan: BuildExecutionPlan {
+            adapter: COMPILER_PRECISE_UNIT_GRAPH_ADAPTER.to_owned(),
+            adapter_version: COMPILER_PRECISE_UNIT_GRAPH_ADAPTER_VERSION.to_owned(),
+            profile_id: "rust:compiler-precise:unit-graph".to_owned(),
+            program: "cargo".to_owned(),
+            arguments: vec![
+                "build".to_owned(),
+                "--frozen".to_owned(),
+                "--offline".to_owned(),
+                "--unit-graph".to_owned(),
+                "-Z".to_owned(),
+                "unstable-options".to_owned(),
+                "--target".to_owned(),
+                compiler_pack.target.clone(),
+            ],
+            logical_cwd: PathBuf::from("."),
+            environment: BTreeMap::new(),
+            timeout_seconds: DEFAULT_BUILD_TIMEOUT_SECONDS,
+            stdout_limit_bytes: DEFAULT_OUTPUT_LIMIT_BYTES,
+            stderr_limit_bytes: DEFAULT_OUTPUT_LIMIT_BYTES,
+            target: Some(compiler_pack.target.clone()),
+            compiler_pack: Some(compiler_pack),
+        },
+    })
+}
+
 pub async fn execute_build_request(
     request: &BuildExecutionRequest,
 ) -> Result<BuildExecutionOutcome> {
@@ -330,6 +377,28 @@ impl BuildExecutionPlan {
             }
             if self.target.as_deref() != Some(requirement.target.as_str()) {
                 bail!("compiler pack execution target does not match the build plan");
+            }
+        }
+        if self.adapter == COMPILER_PRECISE_UNIT_GRAPH_ADAPTER {
+            if self.compiler_pack.is_none() {
+                bail!("compiler-precise unit graph requires an exact compiler pack");
+            }
+            if self.arguments
+                != [
+                    "build",
+                    "--frozen",
+                    "--offline",
+                    "--unit-graph",
+                    "-Z",
+                    "unstable-options",
+                    "--target",
+                    self.target.as_deref().unwrap_or_default(),
+                ]
+            {
+                bail!("compiler-precise unit graph command plan is not exact");
+            }
+            if !self.environment.is_empty() {
+                bail!("compiler-precise unit graph does not admit caller environment values");
             }
         }
         Ok(())
@@ -395,6 +464,8 @@ pub struct BuildExecutionOutcome {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compiler_pack_attestation: Option<CompilerPackAttestation>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub rust_cargo_unit_graph: Option<RustCargoUnitGraph>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub rust_observation: Option<RustBuildObservation>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub web_observation: Option<WebBuildObservation>,
@@ -422,6 +493,9 @@ where
     if !source_root.is_dir() {
         bail!("build source root is not a directory");
     }
+    let neutral_cargo_config = (plan.adapter == COMPILER_PRECISE_UNIT_GRAPH_ADAPTER)
+        .then(|| project_neutral_cargo_config(&source_root))
+        .transpose()?;
     let compiler_pack_preflight = plan
         .compiler_pack
         .as_ref()
@@ -447,7 +521,17 @@ where
     let executable_digest = digest_file(&program)?;
     let toolchain_version = probe_build_tool_version(&program, &source_root).await?;
     let run = BuildRunDirectories::create()?;
+    let cargo_dependency_cache_digest = if plan.adapter == COMPILER_PRECISE_UNIT_GRAPH_ADAPTER {
+        let cargo_home = run.cache.join("cargo");
+        stage_cargo_dependency_cache(&source_root, &cargo_home)?;
+        Some(digest_workspace(&cargo_home)?)
+    } else {
+        None
+    };
     stage_workspace(&source_root, &run.workspace)?;
+    if let Some(config) = &neutral_cargo_config {
+        install_neutral_cargo_config(&run.workspace, config)?;
+    }
     let cwd = run.workspace.join(&plan.logical_cwd);
     let canonical_cwd = cwd.canonicalize().with_context(|| {
         format!(
@@ -490,7 +574,7 @@ where
     let redacted_arguments = redact_arguments(&plan.arguments);
     let (environment_keys, redacted_secret_key_count) =
         audit_environment_keys(effective_environment.keys().map(String::as_str));
-    let command_plan_digest = digest_json(&serde_json::json!({
+    let mut command_plan = serde_json::json!({
         "version": BUILD_SUPERVISOR_VERSION,
         "adapter": plan.adapter,
         "adapter_version": plan.adapter_version,
@@ -500,7 +584,26 @@ where
         "compiler_pack_manifest_sha256": compiler_pack_preflight
             .as_ref()
             .map(|pack| pack.attestation.manifest_sha256.as_str()),
-    }))?;
+    });
+    if let Some(config) = &neutral_cargo_config {
+        command_plan
+            .as_object_mut()
+            .context("build command plan is not an object")?
+            .insert(
+                "neutral_cargo_config_digest".to_owned(),
+                serde_json::Value::String(config.digest.clone()),
+            );
+    }
+    if let Some(digest) = &cargo_dependency_cache_digest {
+        command_plan
+            .as_object_mut()
+            .context("build command plan is not an object")?
+            .insert(
+                "cargo_dependency_cache_digest".to_owned(),
+                serde_json::Value::String(digest.clone()),
+            );
+    }
+    let command_plan_digest = digest_json(&command_plan)?;
     let environment_key_set_digest = digest_json(&environment_keys)?;
     let source_root_digest = digest_workspace(&run.workspace)?;
     let (network_isolation, isolation_diagnostic) = network_isolation_capability();
@@ -591,6 +694,22 @@ where
     }
     let mut rust_observation = None;
     let mut web_observation = None;
+    let mut rust_cargo_unit_graph = None;
+    if matches!(outcome, BuildOutcomeKind::Completed)
+        && plan.adapter == COMPILER_PRECISE_UNIT_GRAPH_ADAPTER
+    {
+        match validate_cargo_unit_graph_with_cargo_home(
+            &stdout,
+            &run.workspace,
+            Some(&run.cache.join("cargo")),
+        ) {
+            Ok(graph) => rust_cargo_unit_graph = Some(graph),
+            Err(_) => {
+                outcome = BuildOutcomeKind::SecurityFailed;
+                diagnostic_code = Some("rust-compiler-unit-graph-invalid".to_owned());
+            }
+        }
+    }
     if matches!(outcome, BuildOutcomeKind::Completed) && plan.adapter == RUST_BUILD_OBSERVER {
         match collect_rust_build_observation(&stdout, &run.workspace, &run.output) {
             Ok(observation) => rust_observation = Some(observation),
@@ -617,6 +736,7 @@ where
             Err(_) => {
                 outcome = BuildOutcomeKind::SecurityFailed;
                 diagnostic_code = Some("build-output-security-policy".to_owned());
+                rust_cargo_unit_graph = None;
                 rust_observation = None;
                 web_observation = None;
                 None
@@ -661,8 +781,9 @@ where
     };
     Ok(BuildExecutionOutcome {
         audit,
-        project_code_executed: true,
+        project_code_executed: plan.adapter != COMPILER_PRECISE_UNIT_GRAPH_ADAPTER,
         compiler_pack_attestation,
+        rust_cargo_unit_graph,
         rust_observation,
         web_observation,
     })
@@ -1116,6 +1237,326 @@ fn stage_workspace(source: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
+fn stage_cargo_dependency_cache(source: &Path, destination: &Path) -> Result<()> {
+    fs::create_dir_all(destination)?;
+    let lockfile = source.join("Cargo.lock");
+    let lock_text = fs::read_to_string(&lockfile)
+        .context("compiler-precise Cargo.lock is unavailable or not UTF-8")?;
+    if lock_text.len() > 16 * 1024 * 1024 {
+        bail!("compiler-precise Cargo.lock exceeds its byte limit");
+    }
+    let lock: toml::Value =
+        toml::from_str(&lock_text).context("compiler-precise Cargo.lock is invalid TOML")?;
+    let packages = lock
+        .get("package")
+        .and_then(toml::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let mut registry_packages = BTreeSet::new();
+    let mut git = false;
+    for package in packages {
+        let Some(package) = package.as_table() else {
+            bail!("compiler-precise Cargo.lock package entry is not a table");
+        };
+        let Some(source) = package.get("source").and_then(toml::Value::as_str) else {
+            continue;
+        };
+        if source.starts_with("registry+") || source.starts_with("sparse+") {
+            let name = package
+                .get("name")
+                .and_then(toml::Value::as_str)
+                .context("compiler-precise registry package has no name")?;
+            let version = package
+                .get("version")
+                .and_then(toml::Value::as_str)
+                .context("compiler-precise registry package has no version")?;
+            validate_cache_package_identity(name)?;
+            validate_cache_package_identity(version)?;
+            registry_packages.insert((name.to_owned(), version.to_owned()));
+        } else if source.starts_with("git+") {
+            git = true;
+        } else {
+            bail!("compiler-precise Cargo.lock contains an unsupported external source");
+        }
+    }
+    if registry_packages.is_empty() && !git {
+        return Ok(());
+    }
+    let host_cargo_home = std::env::var_os("CARGO_HOME")
+        .map(PathBuf::from)
+        .or_else(|| BaseDirs::new().map(|directories| directories.home_dir().join(".cargo")))
+        .and_then(|path| path.canonicalize().ok())
+        .filter(|path| path.is_dir() && !path.starts_with(source))
+        .context(
+            "compiler-precise external dependencies require an existing host Cargo cache; network and credential fallback remain disabled",
+        )?;
+    let mut file_count = 0_usize;
+    let mut byte_count = 0_u64;
+    if !registry_packages.is_empty() {
+        stage_registry_dependency_cache(
+            &host_cargo_home,
+            destination,
+            &registry_packages,
+            &mut file_count,
+            &mut byte_count,
+        )?;
+    }
+    if git {
+        for relative in [Path::new("git/db"), Path::new("git/checkouts")] {
+            let source_path = host_cargo_home.join(relative);
+            if source_path.exists() {
+                copy_bounded_regular_tree(
+                    &source_path,
+                    &destination.join(relative),
+                    &mut file_count,
+                    &mut byte_count,
+                )?;
+            }
+        }
+    }
+    if git && !destination.join("git/checkouts").is_dir() {
+        bail!("compiler-precise Git dependencies are unavailable in the offline Cargo cache");
+    }
+    Ok(())
+}
+
+fn stage_registry_dependency_cache(
+    host_cargo_home: &Path,
+    destination: &Path,
+    packages: &BTreeSet<(String, String)>,
+    file_count: &mut usize,
+    byte_count: &mut u64,
+) -> Result<()> {
+    let registry = host_cargo_home.join("registry");
+    let mut staged_sources = BTreeSet::new();
+    let source_roots = sorted_child_directories(&registry.join("src"))?;
+    for source_root in &source_roots {
+        for (name, version) in packages {
+            let package = format!("{name}-{version}");
+            let source_path = source_root.join(&package);
+            if source_path.is_dir() {
+                let registry_name = source_root
+                    .file_name()
+                    .context("Cargo registry source root has no name")?;
+                copy_bounded_regular_tree(
+                    &source_path,
+                    &destination
+                        .join("registry/src")
+                        .join(registry_name)
+                        .join(&package),
+                    file_count,
+                    byte_count,
+                )?;
+                staged_sources.insert((name.clone(), version.clone()));
+            }
+        }
+    }
+    if staged_sources.len() != packages.len() {
+        bail!("compiler-precise registry dependency sources are incomplete in the offline cache");
+    }
+
+    for cache_root in sorted_child_directories(&registry.join("cache"))? {
+        let registry_name = cache_root
+            .file_name()
+            .context("Cargo registry cache root has no name")?;
+        for (name, version) in packages {
+            let archive = format!("{name}-{version}.crate");
+            let source_path = cache_root.join(&archive);
+            if source_path.is_file() {
+                copy_bounded_regular_file(
+                    &source_path,
+                    &destination
+                        .join("registry/cache")
+                        .join(registry_name)
+                        .join(archive),
+                    file_count,
+                    byte_count,
+                )?;
+            }
+        }
+    }
+
+    for index_root in sorted_child_directories(&registry.join("index"))? {
+        let registry_name = index_root
+            .file_name()
+            .context("Cargo registry index root has no name")?;
+        let output_root = destination.join("registry/index").join(registry_name);
+        let config = index_root.join("config.json");
+        if config.is_file() {
+            copy_bounded_regular_file(
+                &config,
+                &output_root.join("config.json"),
+                file_count,
+                byte_count,
+            )?;
+        }
+        for (name, _) in packages {
+            let relative = cargo_registry_index_path(name)?;
+            for candidate in [
+                index_root.join(".cache").join(&relative),
+                index_root.join(&relative),
+            ] {
+                if candidate.is_file() {
+                    let prefix = candidate
+                        .strip_prefix(&index_root)
+                        .context("Cargo registry index entry escapes its root")?;
+                    copy_bounded_regular_file(
+                        &candidate,
+                        &output_root.join(prefix),
+                        file_count,
+                        byte_count,
+                    )?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn sorted_child_directories(root: &Path) -> Result<Vec<PathBuf>> {
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+    let metadata = fs::symlink_metadata(root)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        bail!("security policy violation: offline Cargo cache root is not a regular directory");
+    }
+    let mut directories = fs::read_dir(root)?
+        .map(|entry| {
+            let path = entry?.path();
+            let metadata = fs::symlink_metadata(&path)?;
+            if metadata.file_type().is_symlink() {
+                bail!("security policy violation: offline Cargo cache root contains a symlink");
+            }
+            Ok(metadata.is_dir().then_some(path))
+        })
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    directories.sort();
+    Ok(directories)
+}
+
+fn cargo_registry_index_path(name: &str) -> Result<PathBuf> {
+    validate_cache_package_identity(name)?;
+    let lowercase = name.to_ascii_lowercase();
+    let bytes = lowercase.as_bytes();
+    Ok(match bytes.len() {
+        1 => PathBuf::from("1").join(&lowercase),
+        2 => PathBuf::from("2").join(&lowercase),
+        3 => PathBuf::from("3").join(&lowercase[..1]).join(&lowercase),
+        _ => PathBuf::from(&lowercase[..2])
+            .join(&lowercase[2..4])
+            .join(&lowercase),
+    })
+}
+
+fn validate_cache_package_identity(value: &str) -> Result<()> {
+    if value.is_empty()
+        || value.len() > 256
+        || value.chars().any(|character| {
+            !(character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '+' | '.'))
+        })
+    {
+        bail!("compiler-precise Cargo.lock package identity is invalid");
+    }
+    Ok(())
+}
+
+fn copy_bounded_regular_file(
+    source: &Path,
+    destination: &Path,
+    file_count: &mut usize,
+    byte_count: &mut u64,
+) -> Result<()> {
+    let metadata = fs::symlink_metadata(source)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!("security policy violation: offline Cargo cache entry is not a regular file");
+    }
+    if matches!(
+        source.file_name().and_then(|name| name.to_str()),
+        Some("config" | "config.json")
+    ) {
+        validate_cargo_cache_metadata(source, metadata.len())?;
+    }
+    *file_count = file_count
+        .checked_add(1)
+        .context("offline Cargo cache file count overflowed")?;
+    *byte_count = byte_count
+        .checked_add(metadata.len())
+        .context("offline Cargo cache byte count overflowed")?;
+    if *file_count > MAX_STAGED_FILES || *byte_count > MAX_STAGED_BYTES {
+        bail!("security policy violation: offline Cargo cache exceeds its staged bounds");
+    }
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::copy(source, destination)?;
+    fs::set_permissions(destination, metadata.permissions())?;
+    Ok(())
+}
+
+fn copy_bounded_regular_tree(
+    source: &Path,
+    destination: &Path,
+    file_count: &mut usize,
+    byte_count: &mut u64,
+) -> Result<()> {
+    let source = source
+        .canonicalize()
+        .context("offline Cargo cache source is unavailable")?;
+    for entry in WalkDir::new(&source).follow_links(false) {
+        let entry = entry?;
+        let relative = entry.path().strip_prefix(&source)?;
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if metadata.file_type().is_symlink() {
+            bail!("security policy violation: offline Cargo cache contains a symlink");
+        }
+        let target = destination.join(relative);
+        if metadata.is_dir() {
+            fs::create_dir_all(&target)?;
+            continue;
+        }
+        if !metadata.is_file() {
+            bail!("security policy violation: offline Cargo cache contains a special file");
+        }
+        copy_bounded_regular_file(entry.path(), &target, file_count, byte_count)?;
+    }
+    Ok(())
+}
+
+fn validate_cargo_cache_metadata(path: &Path, size: u64) -> Result<()> {
+    if size > 1024 * 1024 {
+        bail!("security policy violation: offline Cargo cache metadata exceeds its byte limit");
+    }
+    let bytes = fs::read(path)?;
+    let text = std::str::from_utf8(&bytes)
+        .context("security policy violation: offline Cargo cache metadata is not UTF-8")?;
+    for line in text.lines() {
+        let lowercase = line.to_ascii_lowercase();
+        let key = lowercase
+            .split_once('=')
+            .map(|(key, _)| key.trim())
+            .unwrap_or_default();
+        if ["token", "secret", "password", "credential", "authorization"]
+            .iter()
+            .any(|name| key.contains(name))
+        {
+            bail!("security policy violation: offline Cargo cache metadata is secret-shaped");
+        }
+        if let Some((_, authority_and_path)) = line.split_once("://")
+            && authority_and_path
+                .split(['/', '\\'])
+                .next()
+                .is_some_and(|authority| authority.contains('@'))
+        {
+            bail!("security policy violation: offline Cargo cache URL contains user information");
+        }
+    }
+    Ok(())
+}
+
 fn admit_stage_entry(entry: &DirEntry) -> bool {
     if entry.depth() == 0 || !entry.file_type().is_dir() {
         return true;
@@ -1270,6 +1711,74 @@ mod tests {
         );
     }
 
+    #[test]
+    fn registry_cache_staging_copies_only_locked_packages_and_rejects_credentials() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let host = temporary.path().join("host-cargo");
+        let output = temporary.path().join("run-cargo");
+        let registry_name = "index.crates.io-fixture";
+        for package in ["wanted-1.2.3", "unrelated-9.9.9"] {
+            fs::create_dir_all(
+                host.join("registry/src")
+                    .join(registry_name)
+                    .join(package)
+                    .join("src"),
+            )?;
+            fs::write(
+                host.join("registry/src")
+                    .join(registry_name)
+                    .join(package)
+                    .join("src/lib.rs"),
+                package,
+            )?;
+            fs::create_dir_all(host.join("registry/cache").join(registry_name))?;
+            fs::write(
+                host.join("registry/cache")
+                    .join(registry_name)
+                    .join(format!("{package}.crate")),
+                package,
+            )?;
+        }
+        let index = host.join("registry/index").join(registry_name);
+        fs::create_dir_all(index.join(".cache/wa/nt"))?;
+        fs::write(
+            index.join("config.json"),
+            r#"{"dl":"https://static.crates.io/crates"}"#,
+        )?;
+        fs::write(index.join(".cache/wa/nt/wanted"), b"index")?;
+        let packages = BTreeSet::from([("wanted".to_owned(), "1.2.3".to_owned())]);
+        let mut files = 0;
+        let mut bytes = 0;
+        stage_registry_dependency_cache(&host, &output, &packages, &mut files, &mut bytes)?;
+        assert!(
+            output
+                .join("registry/src")
+                .join(registry_name)
+                .join("wanted-1.2.3/src/lib.rs")
+                .is_file()
+        );
+        assert!(
+            !output
+                .join("registry/src")
+                .join(registry_name)
+                .join("unrelated-9.9.9")
+                .exists()
+        );
+
+        fs::write(
+            index.join("config.json"),
+            r#"{"dl":"https://token@example.invalid/crates"}"#,
+        )?;
+        let rejected = temporary.path().join("rejected");
+        let mut files = 0;
+        let mut bytes = 0;
+        assert!(
+            stage_registry_dependency_cache(&host, &rejected, &packages, &mut files, &mut bytes)
+                .is_err()
+        );
+        Ok(())
+    }
+
     fn node_plan(arguments: Vec<String>) -> BuildExecutionPlan {
         BuildExecutionPlan {
             adapter: "fixture".to_owned(),
@@ -1290,6 +1799,21 @@ mod tests {
     #[cfg(unix)]
     fn compiler_pack_fixture(
         temp: &tempfile::TempDir,
+    ) -> Result<(CompilerPackRequirement, PathBuf)> {
+        compiler_pack_fixture_with_scripts(
+            temp,
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf 'cargo 1.99.0-nightly\\n'; exit 0; fi\nprintf 'tampered' > \"$DEPGRAPH_TARGET\"\n",
+            "fixture",
+            "fixture",
+        )
+    }
+
+    #[cfg(unix)]
+    fn compiler_pack_fixture_with_scripts(
+        temp: &tempfile::TempDir,
+        cargo_script: &str,
+        rustc_script: &str,
+        wrapper_script: &str,
     ) -> Result<(CompilerPackRequirement, PathBuf)> {
         use std::os::unix::fs::PermissionsExt as _;
 
@@ -1353,10 +1877,9 @@ mod tests {
             fs::write(path, b"fixture")?;
         }
         let cargo = source.join(&spec.cargo_path);
-        fs::write(
-            &cargo,
-            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf 'cargo 1.99.0-nightly\\n'; exit 0; fi\nprintf 'tampered' > \"$DEPGRAPH_TARGET\"\n",
-        )?;
+        fs::write(&cargo, cargo_script)?;
+        fs::write(source.join(&spec.rustc_path), rustc_script)?;
+        fs::write(source.join(&spec.wrapper_path), wrapper_script)?;
         for relative in [&spec.cargo_path, &spec.rustc_path, &spec.wrapper_path] {
             let path = source.join(relative);
             let mut permissions = fs::metadata(&path)?.permissions();
@@ -1450,6 +1973,80 @@ mod tests {
         let message = format!("{error:#}");
         assert!(message.contains("compiler-precise backend is unsupported"));
         assert!(message.contains("no rustup, PATH, system, or project toolchain fallback"));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn compiler_precise_unit_graph_is_supervised_without_starting_rustc_or_hooks()
+    -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let project = temp.path().join("project");
+        fs::create_dir_all(project.join("src"))?;
+        fs::create_dir(project.join(".cargo"))?;
+        fs::write(
+            project.join("Cargo.toml"),
+            "[package]\nname = \"unit-graph-fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\nbuild = \"build.rs\"\n\n[workspace]\n",
+        )?;
+        fs::write(project.join("Cargo.lock"), "version = 4\n")?;
+        fs::write(project.join("src/lib.rs"), "pub fn fixture() {}\n")?;
+        fs::write(
+            project.join(".cargo/config.toml"),
+            "[build]\nrustflags = [\"--cfg\", \"depgraph_fixture\"]\n",
+        )?;
+        let rustc_marker = temp.path().join("RUSTC_STARTED");
+        let wrapper_marker = temp.path().join("WRAPPER_STARTED");
+        let build_script_marker = temp.path().join("BUILD_SCRIPT_STARTED");
+        fs::write(
+            project.join("build.rs"),
+            format!(
+                "fn main() {{ std::fs::write({:?}, b\"started\").unwrap(); }}\n",
+                build_script_marker
+            ),
+        )?;
+        let cargo_script = r#"#!/bin/sh
+if [ "$1" = "--version" ]; then printf 'cargo 1.99.0-nightly\n'; exit 0; fi
+if [ "$*" != "build --frozen --offline --unit-graph -Z unstable-options --target x86_64-unknown-linux-gnu" ]; then exit 91; fi
+found_offline=false
+while IFS= read -r line; do
+  if [ "$line" = "offline = true" ]; then found_offline=true; fi
+done < .cargo/config.toml
+if [ "$found_offline" != "true" ]; then exit 92; fi
+workspace=$(pwd)
+printf '{"version":1,"units":[{"pkg_id":"path+file://%s#0.1.0","target":{"kind":["lib"],"crate_types":["lib"],"name":"unit_graph_fixture","src_path":"%s/src/lib.rs","edition":"2024","doc":true,"doctest":true,"test":true},"profile":{"name":"dev","opt_level":"0","lto":"false","codegen_units":null,"debuginfo":2,"split_debuginfo":null,"debug_assertions":true,"overflow_checks":true,"rpath":false,"incremental":false,"panic":"unwind","strip":{"deferred":"None"},"codegen_backend":null},"platform":null,"mode":"build","features":[],"dependencies":[]}],"roots":[0]}\n' "$workspace" "$workspace"
+"#;
+        let rustc_script = format!(
+            "#!/bin/sh\nprintf started > '{}'\nexit 93\n",
+            rustc_marker.display()
+        );
+        let wrapper_script = format!(
+            "#!/bin/sh\nprintf started > '{}'\nexit 94\n",
+            wrapper_marker.display()
+        );
+        let (requirement, _) = compiler_pack_fixture_with_scripts(
+            &temp,
+            cargo_script,
+            &rustc_script,
+            &wrapper_script,
+        )?;
+        let request = create_compiler_precise_unit_graph_request(&project, requirement)?;
+        let outcome = execute_build_request(&request).await?;
+        assert_eq!(
+            outcome.audit.outcome,
+            BuildOutcomeKind::Completed,
+            "{:?}",
+            outcome.audit
+        );
+        assert!(!outcome.project_code_executed);
+        assert!(outcome.compiler_pack_attestation.is_some());
+        let graph = outcome
+            .rust_cargo_unit_graph
+            .context("validated Cargo unit graph is missing")?;
+        assert_eq!(graph.units.len(), 1);
+        assert_eq!(graph.roots.len(), 1);
+        assert!(!rustc_marker.exists());
+        assert!(!wrapper_marker.exists());
+        assert!(!build_script_marker.exists());
         Ok(())
     }
 
