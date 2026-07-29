@@ -802,6 +802,7 @@ async fn run(cli: Cli) -> Result<u8> {
                 evidence_status = "not promoted";
                 let build_attempt_required = requires_build_attempt(
                     &outcome.audit.outcome,
+                    outcome.rust_compiler_mir_ledger.is_some(),
                     outcome.rust_compiler_invocation_ledger.is_some(),
                     outcome.rust_cargo_unit_graph.is_some(),
                 );
@@ -1848,10 +1849,12 @@ fn require_compiler_precise_consent(
 
 fn requires_build_attempt(
     outcome: &BuildOutcomeKind,
+    has_compiler_mir_ledger: bool,
     has_compiler_invocation_ledger: bool,
     has_cargo_unit_graph: bool,
 ) -> bool {
     !matches!(outcome, BuildOutcomeKind::Completed)
+        || has_compiler_mir_ledger
         || (!has_compiler_invocation_ledger && !has_cargo_unit_graph)
 }
 
@@ -2654,19 +2657,28 @@ mod tests {
     }
 
     #[test]
-    fn completed_compiler_audits_do_not_open_delta_attempts() {
-        assert!(!requires_build_attempt(
+    fn completed_compiler_promotion_opens_only_the_required_delta_attempt() {
+        assert!(requires_build_attempt(
             &BuildOutcomeKind::Completed,
+            true,
             true,
             true
         ));
         assert!(!requires_build_attempt(
             &BuildOutcomeKind::Completed,
             false,
+            true,
+            true
+        ));
+        assert!(!requires_build_attempt(
+            &BuildOutcomeKind::Completed,
+            false,
+            false,
             true
         ));
         assert!(requires_build_attempt(
             &BuildOutcomeKind::Completed,
+            false,
             false,
             false
         ));
@@ -2676,7 +2688,7 @@ mod tests {
             BuildOutcomeKind::Cancelled,
             BuildOutcomeKind::SecurityFailed,
         ] {
-            assert!(requires_build_attempt(&outcome, false, false));
+            assert!(requires_build_attempt(&outcome, false, false, false));
         }
     }
 
