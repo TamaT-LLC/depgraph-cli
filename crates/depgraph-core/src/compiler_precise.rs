@@ -101,6 +101,10 @@ pub struct RustCargoDependency {
     pub nounused: bool,
 }
 
+pub fn compiler_unit_graph_digest(units: &[RustCargoUnit], roots: &[String]) -> Result<String> {
+    digest_json(&(units, roots))
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawUnitGraph {
@@ -416,7 +420,7 @@ pub fn validate_cargo_unit_graph_with_cargo_home(
     if !roots.windows(2).all(|window| window[0] != window[1]) {
         bail!("Cargo unit graph contains duplicate roots");
     }
-    let digest = digest_json(&(&units, &roots))?;
+    let digest = compiler_unit_graph_digest(&units, &roots)?;
     Ok(RustCargoUnitGraph {
         schema_version: COMPILER_PRECISE_UNIT_GRAPH_SCHEMA_VERSION.to_owned(),
         digest,

@@ -1107,8 +1107,12 @@ impl Store {
         if base_status != "completed" {
             bail!("build evidence requires a completed base scan");
         }
+        // Build profiles are additive evidence layers. A later build attempt
+        // validates against the latest completed snapshot for the same safe
+        // scan so it cannot silently replace an already-promoted build (or
+        // runtime) layer.
         let base_snapshot_id = self
-            .snapshot_id_for_source("scan", base_scan_id)?
+            .snapshot_id_for_scan_selection(base_scan_id)?
             .with_context(|| format!("base scan {base_scan_id} has no completed snapshot"))?;
         let tx = self.connection.transaction()?;
         tx.execute(
@@ -1153,7 +1157,7 @@ impl Store {
                 attempt.status
             );
         }
-        let delta = build_delta_from_protocol(protocol)?;
+        let mut delta = build_delta_from_protocol(protocol)?;
         let audit = self
             .build_audit(&attempt.audit_run_id)?
             .context("build attempt audit is missing")?;
@@ -1169,6 +1173,7 @@ impl Store {
             bail!("build attempt base snapshot {base_snapshot_id} failed integrity validation");
         }
         let base = self.load_completed_snapshot(base_snapshot_id)?;
+        deduplicate_identical_build_evidence(&base, &mut delta)?;
         validate_build_union(&base, &delta, &attempt)?;
         let encoded = serde_json::to_string(&delta)?;
         let tx = self.connection.transaction()?;
@@ -2540,90 +2545,137 @@ fn load_completed_snapshot_from_connection(
     connection: &Connection,
     snapshot_id: &str,
 ) -> Result<GraphSnapshot> {
-    let mut current = snapshot_id.to_owned();
-    let mut visited = BTreeSet::new();
-    let mut overlays = Vec::new();
-    let (record, mut snapshot) = loop {
-        if !visited.insert(current.clone()) {
+    fn load_inner(
+        connection: &Connection,
+        snapshot_id: &str,
+        visited: &mut BTreeSet<String>,
+    ) -> Result<GraphSnapshot> {
+        if !visited.insert(snapshot_id.to_owned()) {
             bail!("completed snapshot parent cycle detected while loading snapshot");
         }
-        let record = load_completed_snapshot_record(connection, &current)?
-            .with_context(|| format!("completed snapshot {current} was not found"))?;
-        if record.build_attempt_id.is_none()
+        let record = load_completed_snapshot_record(connection, snapshot_id)?
+            .with_context(|| format!("completed snapshot {snapshot_id} was not found"))?;
+        let semantic_noop = record.build_attempt_id.is_none()
             && record.runtime_session_ids.is_empty()
-            && incremental::scan_is_semantic_noop_overlay(connection, &record.scan_id)?
-        {
+            && incremental::scan_is_semantic_noop_overlay(connection, &record.scan_id)?;
+        if semantic_noop {
             let overlay = load_base_snapshot_from_connection(connection, &record.scan_id)?;
-            current = overlay
-                .scan
+            let parent_id = record
                 .parent_snapshot_id
-                .clone()
+                .as_deref()
+                .or(overlay.scan.parent_snapshot_id.as_deref())
                 .context("semantic no-op overlay has no parent completed snapshot")?;
-            overlays.push(overlay);
-            continue;
+            let mut snapshot = load_inner(connection, parent_id, visited)?;
+            apply_semantic_noop_overlay(&mut snapshot, overlay)?;
+            return Ok(snapshot);
         }
-        let snapshot = load_effective_scan_snapshot(connection, &record.scan_id)?;
-        break (record, snapshot);
-    };
-    if let Some(attempt_id) = &record.build_attempt_id {
-        let raw = connection
-            .query_row(
-                "SELECT delta_json FROM build_attempts
-                  WHERE id=?1 AND base_scan_id=?2 AND status='completed'",
-                params![attempt_id, record.scan_id],
-                |row| row.get::<_, Option<String>>(0),
-            )
-            .optional()?
-            .flatten()
-            .with_context(|| {
-                format!("snapshot {snapshot_id} build attempt {attempt_id} has no delta")
-            })?;
-        let delta: BuildGraphDelta = serde_json::from_str(&raw)?;
-        merge_build_delta(&mut snapshot, delta, attempt_id)?;
+
+        let parent_record = record
+            .parent_snapshot_id
+            .as_deref()
+            .map(|parent_id| {
+                load_completed_snapshot_record(connection, parent_id)?
+                    .with_context(|| format!("parent completed snapshot {parent_id} was not found"))
+            })
+            .transpose()?;
+        let layered = matches!(record.source_kind.as_str(), "build" | "runtime");
+        let mut snapshot = if layered {
+            if let Some(parent_id) = record.parent_snapshot_id.as_deref() {
+                load_inner(connection, parent_id, visited)?
+            } else {
+                load_effective_scan_snapshot(connection, &record.scan_id)?
+            }
+        } else {
+            load_effective_scan_snapshot(connection, &record.scan_id)?
+        };
+
+        if let Some(attempt_id) = &record.build_attempt_id
+            && parent_record
+                .as_ref()
+                .and_then(|parent| parent.build_attempt_id.as_deref())
+                != Some(attempt_id.as_str())
+        {
+            let raw = connection
+                .query_row(
+                    "SELECT delta_json FROM build_attempts
+                      WHERE id=?1 AND base_scan_id=?2 AND status='completed'",
+                    params![attempt_id, record.scan_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()?
+                .flatten()
+                .with_context(|| {
+                    format!("snapshot {snapshot_id} build attempt {attempt_id} has no delta")
+                })?;
+            let delta: BuildGraphDelta = serde_json::from_str(&raw)?;
+            merge_build_delta(&mut snapshot, delta, attempt_id)?;
+        }
+        let parent_runtime_ids = parent_record
+            .as_ref()
+            .map(|parent| parent.runtime_session_ids.as_slice())
+            .unwrap_or(&[]);
+        let new_runtime_ids = record
+            .runtime_session_ids
+            .iter()
+            .filter(|id| !parent_runtime_ids.contains(id))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !new_runtime_ids.is_empty() {
+            runtime::merge_runtime_sessions(connection, &mut snapshot, &new_runtime_ids)?;
+        }
+        Ok(snapshot)
     }
-    if !record.runtime_session_ids.is_empty() {
-        runtime::merge_runtime_sessions(connection, &mut snapshot, &record.runtime_session_ids)?;
-    }
-    for overlay in overlays.into_iter().rev() {
-        apply_semantic_noop_overlay(&mut snapshot, overlay)?;
-    }
-    Ok(snapshot)
+
+    load_inner(connection, snapshot_id, &mut BTreeSet::new())
 }
 
 fn load_completed_snapshot_profiles_from_connection(
     connection: &Connection,
     snapshot_id: &str,
 ) -> Result<Vec<ProfileRecord>> {
-    let mut current = snapshot_id.to_owned();
-    let mut visited = BTreeSet::new();
-    loop {
-        if !visited.insert(current.clone()) {
-            bail!("completed snapshot parent cycle detected while loading profiles");
-        }
-        let record = load_completed_snapshot_record(connection, &current)?
-            .with_context(|| format!("completed snapshot {current} was not found"))?;
-        if incremental::scan_is_semantic_noop_overlay(connection, &record.scan_id)? {
-            current = record
-                .parent_snapshot_id
-                .context("semantic no-op snapshot has no parent completed snapshot")?;
-            continue;
-        }
-        let profiles = load_profiles(connection, &record.scan_id)?;
-        let observed_ids = profiles
+    let snapshot = load_completed_snapshot_from_connection(connection, snapshot_id)?;
+    let record = load_completed_snapshot_record(connection, snapshot_id)?
+        .with_context(|| format!("completed snapshot {snapshot_id} was not found"))?;
+    let observed_ids = snapshot
+        .profiles
+        .iter()
+        .map(|profile| profile.id.as_str())
+        .collect::<Vec<_>>();
+    if observed_ids
+        != record
+            .profile_ids
             .iter()
-            .map(|profile| profile.id.as_str())
-            .collect::<Vec<_>>();
-        if observed_ids
-            != record
-                .profile_ids
-                .iter()
-                .map(String::as_str)
-                .collect::<Vec<_>>()
-        {
-            bail!("completed snapshot profile metadata differs from its stored profile set");
-        }
-        return Ok(profiles);
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+    {
+        bail!("completed snapshot profile metadata differs from its stored profile set");
     }
+    Ok(snapshot.profiles)
+}
+
+/*
+ * Kept near the completed-snapshot loader because both reconstruction and
+ * content identity must apply precisely the same immutable overlay order.
+ */
+fn merge_completed_build_delta(
+    connection: &Connection,
+    snapshot: &mut GraphSnapshot,
+    scan_id: &str,
+    attempt_id: &str,
+) -> Result<()> {
+    let raw = connection
+        .query_row(
+            "SELECT delta_json FROM build_attempts
+                  WHERE id=?1 AND base_scan_id=?2 AND status='completed'",
+            params![attempt_id, scan_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten()
+        .with_context(|| format!("completed build attempt {attempt_id} has no graph delta"))?;
+    let delta: BuildGraphDelta = serde_json::from_str(&raw)?;
+    merge_build_delta(snapshot, delta, attempt_id)?;
+    Ok(())
 }
 
 fn load_effective_scan_snapshot(connection: &Connection, scan_id: &str) -> Result<GraphSnapshot> {
@@ -2691,22 +2743,41 @@ fn completed_snapshot_identity(
             source_revision,
         );
     }
-    let mut snapshot = load_effective_scan_snapshot(connection, scan_id)?;
-    if let Some(attempt_id) = build_attempt_id {
-        let raw = connection
-            .query_row(
-                "SELECT delta_json FROM build_attempts
-                  WHERE id=?1 AND base_scan_id=?2 AND status='completed'",
-                params![attempt_id, scan_id],
-                |row| row.get::<_, Option<String>>(0),
-            )
-            .optional()?
-            .flatten()
-            .with_context(|| format!("completed build attempt {attempt_id} has no graph delta"))?;
-        merge_build_delta(&mut snapshot, serde_json::from_str(&raw)?, attempt_id)?;
+    let layered = build_attempt_id.is_some() || !runtime_session_ids.is_empty();
+    let parent_record = parent_snapshot_id
+        .map(|parent_id| {
+            load_completed_snapshot_record(connection, parent_id)?
+                .with_context(|| format!("parent completed snapshot {parent_id} was not found"))
+        })
+        .transpose()?;
+    let mut snapshot = if layered {
+        if let Some(parent_id) = parent_snapshot_id {
+            load_completed_snapshot_from_connection(connection, parent_id)?
+        } else {
+            load_effective_scan_snapshot(connection, scan_id)?
+        }
+    } else {
+        load_effective_scan_snapshot(connection, scan_id)?
+    };
+    if let Some(attempt_id) = build_attempt_id
+        && parent_record
+            .as_ref()
+            .and_then(|parent| parent.build_attempt_id.as_deref())
+            != Some(attempt_id)
+    {
+        merge_completed_build_delta(connection, &mut snapshot, scan_id, attempt_id)?;
     }
-    if !runtime_session_ids.is_empty() {
-        runtime::merge_runtime_sessions(connection, &mut snapshot, runtime_session_ids)?;
+    let parent_runtime_ids = parent_record
+        .as_ref()
+        .map(|parent| parent.runtime_session_ids.as_slice())
+        .unwrap_or(&[]);
+    let new_runtime_ids = runtime_session_ids
+        .iter()
+        .filter(|id| !parent_runtime_ids.contains(id))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !new_runtime_ids.is_empty() {
+        runtime::merge_runtime_sessions(connection, &mut snapshot, &new_runtime_ids)?;
     }
     let mut profile_ids = snapshot
         .profiles
@@ -3354,6 +3425,106 @@ fn validate_build_union(
         }
     }
     Ok(())
+}
+
+fn deduplicate_identical_build_evidence(
+    base: &GraphSnapshot,
+    delta: &mut BuildGraphDelta,
+) -> Result<()> {
+    let base_sites = base
+        .sites
+        .iter()
+        .map(|site| (site.id.as_str(), site))
+        .collect::<BTreeMap<_, _>>();
+    let base_edges = base
+        .edges
+        .iter()
+        .map(|edge| (edge.id.as_str(), edge))
+        .collect::<BTreeMap<_, _>>();
+    let mut removed_sites = Vec::new();
+    for site in &delta.sites {
+        if let Some(existing) = base_sites.get(site.id.as_str()) {
+            if *existing != site {
+                bail!(
+                    "build site {} conflicts with an existing evidence layer",
+                    site.id
+                );
+            }
+            removed_sites.push(site.clone());
+        }
+    }
+    let removed_site_ids = removed_sites
+        .iter()
+        .map(|site| site.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut removed_edge_ids = BTreeSet::new();
+    for edge in &delta.edges {
+        if let Some(existing) = base_edges.get(edge.id.as_str()) {
+            if *existing != edge {
+                bail!(
+                    "build edge {} conflicts with an existing evidence layer",
+                    edge.id
+                );
+            }
+            removed_edge_ids.insert(edge.id.clone());
+        } else if edge
+            .site_id
+            .as_deref()
+            .is_some_and(|site_id| removed_site_ids.contains(site_id))
+        {
+            bail!(
+                "build site {} is already complete but edge {} is missing from its evidence layer",
+                edge.site_id.as_deref().unwrap_or_default(),
+                edge.id
+            );
+        }
+    }
+    if removed_sites.is_empty() && removed_edge_ids.is_empty() {
+        return Ok(());
+    }
+    delta
+        .sites
+        .retain(|site| !removed_site_ids.contains(site.id.as_str()));
+    delta
+        .edges
+        .retain(|edge| !removed_edge_ids.contains(&edge.id));
+    delta.evidence.retain(|evidence| {
+        !((evidence.owner_type == "site" && removed_site_ids.contains(evidence.owner_id.as_str()))
+            || (evidence.owner_type == "edge"
+                && removed_edge_ids.contains(evidence.owner_id.as_str())))
+    });
+    subtract_site_coverage(&mut delta.coverage, &removed_sites);
+    for profile in &mut delta.profiles {
+        if let Some(coverage) = &mut profile.coverage {
+            let removed = removed_sites
+                .iter()
+                .filter(|site| site.profile_id == profile.id)
+                .cloned()
+                .collect::<Vec<_>>();
+            subtract_site_coverage(coverage, &removed);
+        }
+    }
+    Ok(())
+}
+
+fn subtract_site_coverage(coverage: &mut CoverageRecord, sites: &[SiteRecord]) {
+    coverage.dependency_sites = coverage
+        .dependency_sites
+        .saturating_sub(sites.len().try_into().unwrap_or(u64::MAX));
+    for site in sites {
+        let counter = match site.resolution_status.as_str() {
+            "resolved" => &mut coverage.resolved,
+            "candidates" => &mut coverage.candidates,
+            "external" => &mut coverage.external,
+            "unresolved" => &mut coverage.unresolved,
+            _ => continue,
+        };
+        *counter = counter.saturating_sub(1);
+    }
+    if coverage.dependency_sites == 0 {
+        coverage.unsupported_syntax = 0;
+        coverage.reasons.clear();
+    }
 }
 
 fn canonical_profile_language(language: &str) -> &str {
@@ -5451,11 +5622,16 @@ mod tests {
             "production",
             &effective_input_id,
         )))?;
-        store.save_build_delta("build-run-2", &failed_protocol)?;
+        assert!(
+            store
+                .save_build_delta("build-run-2", &failed_protocol)
+                .is_err(),
+            "a conflicting later build layer must fail before staging"
+        );
         store.finish_build_attempt(
             "build-run-2",
-            "failed",
-            Some("observer failed after validation"),
+            "security_failed",
+            Some("build-evidence-conflicts-with-existing-layer"),
             false,
         )?;
         let retained = store.load_snapshot("scan-golden")?;

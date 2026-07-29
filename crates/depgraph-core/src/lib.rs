@@ -10,6 +10,7 @@ pub mod compiler_invocation;
 pub mod compiler_mir;
 pub mod compiler_pack;
 pub mod compiler_precise;
+pub mod compiler_precise_graph;
 pub mod config;
 pub mod cross_language;
 pub mod daemon;
@@ -56,6 +57,7 @@ use depgraph_store::{
     ProfileRecord, SNAPSHOT_DIFF_SCHEMA_VERSION, STORE_SCHEMA_VERSION, Store,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 pub use bounded_query::{
     BOUNDED_QUERY_CONTRACT_VERSION, BOUNDED_QUERY_CREDENTIAL_POLICY_VERSION, EntityExpression,
@@ -198,7 +200,9 @@ pub use compiler_invocation::{
     COMPILER_INVOCATION_RECORD_SCHEMA_PATH, COMPILER_INVOCATION_RECORD_SCHEMA_VERSION,
     COMPILER_PRECISE_INVOCATION_ADAPTER, COMPILER_PRECISE_INVOCATION_ADAPTER_VERSION,
     RustCompilerInvocation, RustCompilerInvocationLedger, compiler_invocation_attempt_digest,
-    validate_compiler_invocation_ledger, validate_compiler_invocation_unit_graph,
+    compiler_invocation_entry_digest, compiler_invocation_ledger_digest,
+    validate_compiler_invocation_ledger, validate_compiler_invocation_ledger_identity,
+    validate_compiler_invocation_unit_graph,
 };
 pub use compiler_mir::{
     COMPILER_PRECISE_MIR_LEDGER_SCHEMA, COMPILER_PRECISE_MIR_LEDGER_SCHEMA_PATH,
@@ -210,7 +214,8 @@ pub use compiler_mir::{
     RustCompilerMirDefinition, RustCompilerMirLedger, RustCompilerMirLocal,
     RustCompilerMirOperation, RustCompilerMirPlace, RustCompilerMirProjection, RustCompilerMirSpan,
     RustCompilerMirType, RustCompilerMirUnit, RustCompilerMirUnsupported, RustCompilerMonoInstance,
-    RustCompilerMonoInstanceKind, compiler_mir_unit_digest, validate_compiler_mir_directory,
+    RustCompilerMonoInstanceKind, compiler_mir_ledger_digest, compiler_mir_unit_digest,
+    validate_compiler_mir_directory, validate_compiler_mir_ledger_identity,
 };
 pub use compiler_pack::{
     COMPILER_PACK_CHANNEL_MANIFEST, COMPILER_PACK_CHANNEL_MANIFEST_SHA256,
@@ -230,8 +235,13 @@ pub use compiler_precise::{
     COMPILER_PRECISE_UNIT_GRAPH_SCHEMA, COMPILER_PRECISE_UNIT_GRAPH_SCHEMA_PATH,
     COMPILER_PRECISE_UNIT_GRAPH_SCHEMA_VERSION, NEUTRAL_CARGO_CONFIG_SCHEMA_VERSION,
     NeutralCargoConfig, RustCargoDependency, RustCargoProfile, RustCargoStrip, RustCargoTarget,
-    RustCargoUnit, RustCargoUnitGraph, install_neutral_cargo_config, project_neutral_cargo_config,
-    validate_cargo_unit_graph, validate_cargo_unit_graph_with_cargo_home,
+    RustCargoUnit, RustCargoUnitGraph, compiler_unit_graph_digest, install_neutral_cargo_config,
+    project_neutral_cargo_config, validate_cargo_unit_graph,
+    validate_cargo_unit_graph_with_cargo_home,
+};
+pub use compiler_precise_graph::{
+    COMPILER_PRECISE_GRAPH_CAPABILITY, COMPILER_PRECISE_GRAPH_CONTRACT_VERSION,
+    compiler_precise_graph_events, compiler_precise_graph_ndjson, compiler_precise_profile_id,
 };
 pub use config::{Config, DaemonConfig, default_store_path, init_config};
 pub use daemon::{
@@ -412,6 +422,29 @@ pub struct ScanHealth {
     pub diagnostics: Vec<DiagnosticRecord>,
     pub profile_matrix: ProfileMatrixRecord,
     pub cache_events: Vec<CacheEventRecord>,
+    pub compiler_precise: Option<CompilerPreciseHealth>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CompilerPreciseHealth {
+    pub status: String,
+    pub phase: String,
+    pub precision: String,
+    pub profiles: Vec<CompilerPreciseProfileHealth>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CompilerPreciseProfileHealth {
+    pub profile_id: String,
+    pub target: Option<String>,
+    pub compiler_pack_manifest_sha256: Option<String>,
+    pub unit_graph_digest: Option<String>,
+    pub invocation_ledger_digest: Option<String>,
+    pub mir_ledger_digest: Option<String>,
+    pub cargo_units: u64,
+    pub typed_mir_bodies: u64,
+    pub compiler_instances: u64,
+    pub compiler_calls: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -874,6 +907,59 @@ pub async fn doctor(store: &Store) -> Result<DoctorReport> {
         .latest_attempt_id()?
         .map(|scan_id| {
             let snapshot = store.load_snapshot(&scan_id)?;
+            let compiler_profiles = snapshot
+                .profiles
+                .iter()
+                .filter(|profile| {
+                    profile
+                        .properties
+                        .get("compiler_precise_contract")
+                        .and_then(Value::as_str)
+                        == Some(COMPILER_PRECISE_CONTRACT_VERSION)
+                        && profile
+                            .properties
+                            .get("profile_phase")
+                            .and_then(Value::as_str)
+                            == Some("build")
+                })
+                .map(|profile| {
+                    let string_property = |name: &str| {
+                        profile
+                            .properties
+                            .get(name)
+                            .and_then(Value::as_str)
+                            .map(ToOwned::to_owned)
+                    };
+                    let count_property = |name: &str| {
+                        profile
+                            .properties
+                            .get(name)
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0)
+                    };
+                    CompilerPreciseProfileHealth {
+                        profile_id: profile.id.clone(),
+                        target: profile.target.clone(),
+                        compiler_pack_manifest_sha256: string_property(
+                            "compiler_pack_manifest_sha256",
+                        ),
+                        unit_graph_digest: string_property("unit_graph_digest"),
+                        invocation_ledger_digest: string_property("invocation_ledger_digest"),
+                        mir_ledger_digest: string_property("mir_ledger_digest"),
+                        cargo_units: count_property("cargo_unit_count"),
+                        typed_mir_bodies: count_property("typed_mir_body_count"),
+                        compiler_instances: count_property("compiler_instance_count"),
+                        compiler_calls: count_property("compiler_call_count"),
+                    }
+                })
+                .collect::<Vec<_>>();
+            let compiler_precise =
+                (!compiler_profiles.is_empty()).then_some(CompilerPreciseHealth {
+                    status: "promoted".to_owned(),
+                    phase: "build".to_owned(),
+                    precision: "observed".to_owned(),
+                    profiles: compiler_profiles,
+                });
             let detected_packages = snapshot
                 .nodes
                 .iter()
@@ -897,6 +983,7 @@ pub async fn doctor(store: &Store) -> Result<DoctorReport> {
                 diagnostics: snapshot.diagnostics,
                 profile_matrix: snapshot.profile_matrix,
                 cache_events: store.cache_events_for_scan(&scan_id)?,
+                compiler_precise,
             })
         })
         .transpose()?;
