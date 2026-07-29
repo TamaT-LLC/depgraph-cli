@@ -17,6 +17,11 @@ use tokio::{process::Command, time::timeout};
 use uuid::Uuid;
 use walkdir::{DirEntry, WalkDir};
 
+use crate::compiler_invocation::{
+    COMPILER_PRECISE_INVOCATION_ADAPTER, COMPILER_PRECISE_INVOCATION_ADAPTER_VERSION,
+    RustCompilerInvocationLedger, compiler_invocation_attempt_digest,
+    validate_compiler_invocation_ledger, validate_compiler_invocation_unit_graph,
+};
 use crate::compiler_pack::{
     CompilerPackAttestation, CompilerPackRequirement, VerifiedCompilerPack, verify_compiler_pack,
 };
@@ -169,6 +174,8 @@ pub struct BuildExecutionPlan {
     pub stderr_limit_bytes: usize,
     pub target: Option<String>,
     pub compiler_pack: Option<CompilerPackRequirement>,
+    pub compiler_unit_graph: Option<RustCargoUnitGraph>,
+    pub expected_source_root_digest: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -207,6 +214,8 @@ pub fn create_build_execution_request(source_root: &Path) -> Result<BuildExecuti
                 stderr_limit_bytes: DEFAULT_OUTPUT_LIMIT_BYTES,
                 target: None,
                 compiler_pack: None,
+                compiler_unit_graph: None,
+                expected_source_root_digest: None,
             },
         });
     }
@@ -274,6 +283,8 @@ pub fn create_build_execution_request(source_root: &Path) -> Result<BuildExecuti
                 stderr_limit_bytes: DEFAULT_OUTPUT_LIMIT_BYTES,
                 target: Some("production".to_owned()),
                 compiler_pack: None,
+                compiler_unit_graph: None,
+                expected_source_root_digest: None,
             },
         });
     }
@@ -320,6 +331,58 @@ pub fn create_compiler_precise_unit_graph_request(
             stderr_limit_bytes: DEFAULT_OUTPUT_LIMIT_BYTES,
             target: Some(compiler_pack.target.clone()),
             compiler_pack: Some(compiler_pack),
+            compiler_unit_graph: None,
+            expected_source_root_digest: None,
+        },
+    })
+}
+
+pub fn create_compiler_precise_invocation_request(
+    source_root: &Path,
+    compiler_pack: CompilerPackRequirement,
+    unit_graph: RustCargoUnitGraph,
+    expected_source_root_digest: String,
+) -> Result<BuildExecutionRequest> {
+    let source_root = source_root
+        .canonicalize()
+        .context("compiler-precise source root is unavailable")?;
+    if !source_root.is_dir()
+        || !source_root.join("Cargo.toml").is_file()
+        || !source_root.join("Cargo.lock").is_file()
+    {
+        bail!("compiler-precise Rust requires confined Cargo.toml and Cargo.lock files");
+    }
+    project_neutral_cargo_config(&source_root)?;
+    if expected_source_root_digest.len() != 64
+        || !expected_source_root_digest
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        bail!("compiler-precise source identity is invalid");
+    }
+    Ok(BuildExecutionRequest {
+        source_root,
+        plan: BuildExecutionPlan {
+            adapter: COMPILER_PRECISE_INVOCATION_ADAPTER.to_owned(),
+            adapter_version: COMPILER_PRECISE_INVOCATION_ADAPTER_VERSION.to_owned(),
+            profile_id: "rust:compiler-precise:invocations".to_owned(),
+            program: "cargo".to_owned(),
+            arguments: vec![
+                "build".to_owned(),
+                "--frozen".to_owned(),
+                "--offline".to_owned(),
+                "--target".to_owned(),
+                compiler_pack.target.clone(),
+            ],
+            logical_cwd: PathBuf::from("."),
+            environment: BTreeMap::new(),
+            timeout_seconds: DEFAULT_BUILD_TIMEOUT_SECONDS,
+            stdout_limit_bytes: DEFAULT_OUTPUT_LIMIT_BYTES,
+            stderr_limit_bytes: DEFAULT_OUTPUT_LIMIT_BYTES,
+            target: Some(compiler_pack.target.clone()),
+            compiler_pack: Some(compiler_pack),
+            compiler_unit_graph: Some(unit_graph),
+            expected_source_root_digest: Some(expected_source_root_digest),
         },
     })
 }
@@ -400,6 +463,39 @@ impl BuildExecutionPlan {
             if !self.environment.is_empty() {
                 bail!("compiler-precise unit graph does not admit caller environment values");
             }
+            if self.compiler_unit_graph.is_some() || self.expected_source_root_digest.is_some() {
+                bail!("compiler-precise unit graph cannot carry invocation-stage state");
+            }
+        } else if self.adapter == COMPILER_PRECISE_INVOCATION_ADAPTER {
+            if self.adapter_version != COMPILER_PRECISE_INVOCATION_ADAPTER_VERSION
+                || self.profile_id != "rust:compiler-precise:invocations"
+                || self.compiler_pack.is_none()
+                || self.compiler_unit_graph.is_none()
+                || self.expected_source_root_digest.is_none()
+            {
+                bail!("compiler-precise invocation ledger requires its exact prior stage");
+            }
+            if self.arguments
+                != [
+                    "build",
+                    "--frozen",
+                    "--offline",
+                    "--target",
+                    self.target.as_deref().unwrap_or_default(),
+                ]
+            {
+                bail!("compiler-precise invocation command plan is not exact");
+            }
+            if !self.environment.is_empty() {
+                bail!("compiler-precise invocation does not admit caller environment values");
+            }
+            validate_compiler_invocation_unit_graph(
+                self.compiler_unit_graph
+                    .as_ref()
+                    .context("compiler invocation unit graph is unavailable")?,
+            )?;
+        } else if self.compiler_unit_graph.is_some() || self.expected_source_root_digest.is_some() {
+            bail!("non-compiler execution cannot carry compiler invocation state");
         }
         Ok(())
     }
@@ -466,6 +562,8 @@ pub struct BuildExecutionOutcome {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rust_cargo_unit_graph: Option<RustCargoUnitGraph>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub rust_compiler_invocation_ledger: Option<RustCompilerInvocationLedger>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub rust_observation: Option<RustBuildObservation>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub web_observation: Option<WebBuildObservation>,
@@ -493,7 +591,11 @@ where
     if !source_root.is_dir() {
         bail!("build source root is not a directory");
     }
-    let neutral_cargo_config = (plan.adapter == COMPILER_PRECISE_UNIT_GRAPH_ADAPTER)
+    let compiler_precise_stage = matches!(
+        plan.adapter.as_str(),
+        COMPILER_PRECISE_UNIT_GRAPH_ADAPTER | COMPILER_PRECISE_INVOCATION_ADAPTER
+    );
+    let neutral_cargo_config = compiler_precise_stage
         .then(|| project_neutral_cargo_config(&source_root))
         .transpose()?;
     let compiler_pack_preflight = plan
@@ -521,7 +623,7 @@ where
     let executable_digest = digest_file(&program)?;
     let toolchain_version = probe_build_tool_version(&program, &source_root).await?;
     let run = BuildRunDirectories::create()?;
-    let cargo_dependency_cache_digest = if plan.adapter == COMPILER_PRECISE_UNIT_GRAPH_ADAPTER {
+    let cargo_dependency_cache_digest = if compiler_precise_stage {
         let cargo_home = run.cache.join("cargo");
         stage_cargo_dependency_cache(&source_root, &cargo_home)?;
         Some(digest_workspace(&cargo_home)?)
@@ -569,11 +671,7 @@ where
     for (key, value) in &plan.environment {
         effective_environment.insert(key.clone(), value.clone());
     }
-    command.envs(&effective_environment);
-
     let redacted_arguments = redact_arguments(&plan.arguments);
-    let (environment_keys, redacted_secret_key_count) =
-        audit_environment_keys(effective_environment.keys().map(String::as_str));
     let mut command_plan = serde_json::json!({
         "version": BUILD_SUPERVISOR_VERSION,
         "adapter": plan.adapter,
@@ -604,8 +702,97 @@ where
             );
     }
     let command_plan_digest = digest_json(&command_plan)?;
+    let workspace_digest = digest_workspace(&run.workspace)?;
+    let source_root_digest = if let Some(cache_digest) = &cargo_dependency_cache_digest {
+        digest_json(&(
+            "depgraph-compiler-source-closure-v1",
+            workspace_digest.as_str(),
+            cache_digest.as_str(),
+        ))?
+    } else {
+        workspace_digest
+    };
+    let compiler_invocation_context = if plan.adapter == COMPILER_PRECISE_INVOCATION_ADAPTER {
+        if plan.expected_source_root_digest.as_deref() != Some(source_root_digest.as_str()) {
+            bail!(
+                "security policy violation: compiler-precise source changed after unit-graph admission"
+            );
+        }
+        let pack = compiler_pack_preflight
+            .as_ref()
+            .context("compiler invocation compiler pack is unavailable")?;
+        let graph = plan
+            .compiler_unit_graph
+            .as_ref()
+            .context("compiler invocation unit graph is unavailable")?;
+        let rustc_verbose = run_probe(
+            pack.rustc_path.as_os_str(),
+            &[OsString::from("-vV")],
+            &source_root,
+        )
+        .await?;
+        if !rustc_verbose.status.success()
+            || rustc_verbose.stdout.is_empty()
+            || rustc_verbose.stdout.len() > 64 * 1024
+        {
+            bail!("compiler invocation rustc verbose identity is unavailable");
+        }
+        let rustc_verbose_sha256 = digest_bytes(&rustc_verbose.stdout);
+        let attempt_digest = compiler_invocation_attempt_digest(
+            &source_root_digest,
+            &command_plan_digest,
+            &pack.attestation.manifest_sha256,
+            &graph.digest,
+        )?;
+        let expected_graph_path = run.output.join("expected-unit-graph.json");
+        fs::write(&expected_graph_path, serde_json::to_vec(graph)?)?;
+        let ledger_directory = run.output.join("compiler-invocation-ledger");
+        fs::create_dir(&ledger_directory)?;
+        for (key, value) in [
+            ("DEPGRAPH_COMPILER_ATTEMPT_DIGEST", attempt_digest.clone()),
+            (
+                "DEPGRAPH_COMPILER_EXPECTED_UNIT_GRAPH",
+                expected_graph_path.to_string_lossy().into_owned(),
+            ),
+            (
+                "DEPGRAPH_COMPILER_EXPECTED_RUSTC",
+                pack.rustc_path.to_string_lossy().into_owned(),
+            ),
+            (
+                "DEPGRAPH_COMPILER_EXPECTED_RUSTC_SHA256",
+                pack.attestation.rustc_sha256.clone(),
+            ),
+            (
+                "DEPGRAPH_COMPILER_EXPECTED_RUSTC_VERBOSE_SHA256",
+                rustc_verbose_sha256.clone(),
+            ),
+            (
+                "DEPGRAPH_COMPILER_LEDGER_DIR",
+                ledger_directory.to_string_lossy().into_owned(),
+            ),
+            (
+                "DEPGRAPH_COMPILER_OUTPUT_ROOT",
+                run.output.to_string_lossy().into_owned(),
+            ),
+            (
+                "DEPGRAPH_COMPILER_PACK_ROOT",
+                pack.root.to_string_lossy().into_owned(),
+            ),
+            (
+                "DEPGRAPH_COMPILER_WORKSPACE_ROOT",
+                run.workspace.to_string_lossy().into_owned(),
+            ),
+        ] {
+            effective_environment.insert(key.to_owned(), value);
+        }
+        Some((attempt_digest, rustc_verbose_sha256, ledger_directory))
+    } else {
+        None
+    };
+    command.envs(&effective_environment);
+    let (environment_keys, redacted_secret_key_count) =
+        audit_environment_keys(effective_environment.keys().map(String::as_str));
     let environment_key_set_digest = digest_json(&environment_keys)?;
-    let source_root_digest = digest_workspace(&run.workspace)?;
     let (network_isolation, isolation_diagnostic) = network_isolation_capability();
 
     let mut child = command
@@ -695,6 +882,7 @@ where
     let mut rust_observation = None;
     let mut web_observation = None;
     let mut rust_cargo_unit_graph = None;
+    let mut rust_compiler_invocation_ledger = None;
     if matches!(outcome, BuildOutcomeKind::Completed)
         && plan.adapter == COMPILER_PRECISE_UNIT_GRAPH_ADAPTER
     {
@@ -707,6 +895,43 @@ where
             Err(_) => {
                 outcome = BuildOutcomeKind::SecurityFailed;
                 diagnostic_code = Some("rust-compiler-unit-graph-invalid".to_owned());
+            }
+        }
+    }
+    if matches!(outcome, BuildOutcomeKind::Completed)
+        && plan.adapter == COMPILER_PRECISE_INVOCATION_ADAPTER
+    {
+        let validation = (|| {
+            let graph = plan
+                .compiler_unit_graph
+                .as_ref()
+                .context("compiler invocation unit graph is unavailable")?;
+            let (attempt_digest, rustc_verbose_sha256, ledger_directory) =
+                compiler_invocation_context
+                    .as_ref()
+                    .context("compiler invocation context is unavailable")?;
+            let pack = compiler_pack_preflight
+                .as_ref()
+                .context("compiler invocation compiler pack is unavailable")?;
+            let ledger = validate_compiler_invocation_ledger(
+                ledger_directory,
+                &run.workspace,
+                &run.cache.join("cargo"),
+                graph,
+                attempt_digest,
+                &pack.attestation.rustc_sha256,
+                rustc_verbose_sha256,
+            )?;
+            Ok::<_, anyhow::Error>((graph.clone(), ledger))
+        })();
+        match validation {
+            Ok((graph, ledger)) => {
+                rust_cargo_unit_graph = Some(graph);
+                rust_compiler_invocation_ledger = Some(ledger);
+            }
+            Err(_) => {
+                outcome = BuildOutcomeKind::SecurityFailed;
+                diagnostic_code = Some("rust-compiler-invocation-ledger-invalid".to_owned());
             }
         }
     }
@@ -737,6 +962,7 @@ where
                 outcome = BuildOutcomeKind::SecurityFailed;
                 diagnostic_code = Some("build-output-security-policy".to_owned());
                 rust_cargo_unit_graph = None;
+                rust_compiler_invocation_ledger = None;
                 rust_observation = None;
                 web_observation = None;
                 None
@@ -784,6 +1010,7 @@ where
         project_code_executed: plan.adapter != COMPILER_PRECISE_UNIT_GRAPH_ADAPTER,
         compiler_pack_attestation,
         rust_cargo_unit_graph,
+        rust_compiler_invocation_ledger,
         rust_observation,
         web_observation,
     })
@@ -1793,6 +2020,8 @@ mod tests {
             stderr_limit_bytes: 1024,
             target: None,
             compiler_pack: None,
+            compiler_unit_graph: None,
+            expected_source_root_digest: None,
         }
     }
 
@@ -1949,6 +2178,8 @@ mod tests {
             stderr_limit_bytes: 1024,
             target: Some(requirement.target.clone()),
             compiler_pack: Some(requirement),
+            compiler_unit_graph: None,
+            expected_source_root_digest: None,
         };
         let outcome = supervise_build(&project, &plan).await?;
         assert_eq!(outcome.audit.outcome, BuildOutcomeKind::SecurityFailed);

@@ -503,6 +503,7 @@ Failed/partial scans and diagnostics remain stored, but only a complete policy-p
 
 - `crates/depgraph-protocol`: typed protocol, canonical conditions/IDs, JSON Schema, and state-machine validation
 - `crates/depgraph-store`: SQLite migrations, immutable scan staging, ledger, and evidence persistence
+- `crates/depgraph-rustc-wrapper`: attested all-unit rustc wrapper and bounded start/terminal ledger emitter
 - `crates/depgraph-core` / `crates/depgraph-cli`: worker supervision, queries, export, doctor, and CLI UX
 - `workers/rust`, `workers/go`, `workers/web`: ecosystem-native safe static adapters
 - `xtask`: reproducible build, full quality checks, release archives, checksums, SBOM, and license inventory
@@ -536,9 +537,16 @@ dependencies are copied from an existing host Cargo cache into a bounded,
 run-owned, credentials-free subset before Cargo starts; their source paths are
 accepted only inside that staged Cargo home and normalized as
 `cargo-home://...`. No network lookup or direct host-cache path is exposed to
-the child or persisted DTO. Later
-compiler-precise stages add compiler invocation and query output; this stage
-does not promote graph evidence.
+the child or persisted DTO. A second supervised stage starts a fresh target,
+fixes the attested wrapper as the only `RUSTC_WRAPPER`, verifies the exact
+rustc path, executable digest, and `-vV` identity, and conserves one bounded
+start/terminal ledger pair for every admitted target, dependency, build-script,
+and proc-macro compiler unit. Nested wrappers, response/path escape,
+extra/missing/duplicate units, partial terminals, or compiler substitution fail
+the whole attempt. The canonical ledger contains staged logical paths and
+digests rather than host paths or raw process streams. Later compiler-precise
+stages add compiler query output; the ledger stage still does not promote graph
+evidence.
 
 Run `rustup component add rust-src --toolchain 1.93.1` once, then `cargo xtask package` to create a native archive under `dist/`. Release archives place `depgraph` under `bin/`, compatible workers under `libexec/`, and include the project's complete `LICENSE-MIT` and `LICENSE-APACHE` texts, a checksum-verified release manifest, protocol schema, SPDX SBOM, and a separate third-party license inventory. The release manifest declares `MIT OR Apache-2.0` and attests both project license files independently from `THIRD_PARTY_LICENSES.txt`. The release gate fixes Rust/Cargo `1.93.1`; the Rust worker manifest records the linked backend unit, rust-analyzer `0.0.330` at revision `8954b66d43225e62c92e8bbcc8500191b5cceb1e` with Salsa `0.26.1`. It also carries `rust-stdlib-source@1.93.1+rustc.01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf` under `libexec/rust-sysroot` as a licensed, SBOM-recorded `data-tree` copied only from that pinned toolchain's `rust-src` and independently matched to the known normalized digest `cc5465ef70b933d2a80c30472468abb9f8ab297fc767bd6433b2f6f554f4f0e7`. The Web worker manifest records the exact TypeScript version, the complete Web semantic capability set, and its Astro and TypeScript runtime components.
 

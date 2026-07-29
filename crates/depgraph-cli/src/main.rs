@@ -13,17 +13,18 @@ use depgraph_core::{
     ImpactFilters, ImpactResult, PolicyAnnotation, PolicyResult, QueryDiagnostic,
     QueryFailureClass, RepositoryProfilePlanPreview, ScanCacheMode, TypedProjection,
     acquire_store_writer_lock, build_cache_key, create_build_execution_request,
-    create_compiler_precise_unit_graph_request, default_store_path, doctor, evaluate_policy_diff,
-    execute_bounded_query, execute_build_request_with_cancellation, export_filtered,
-    export_graphml_filtered_to_writer, impact, impact_query_cache_key, init_config,
-    match_runtime_trace, open_store, open_store_read_only, parse_and_type_check_bounded_query,
-    plan_bounded_query, plan_explicit_profile_selection, plan_repository_profiles,
-    policy_annotations, profile_selection_human_summary, read_bounded_query_file,
-    read_compiler_pack_requirement, read_explicit_profile_selection_file, read_git_changed_set,
-    read_runtime_trace, render_condition, render_github_annotations, run_scan_with_cache_mode,
-    runtime_session_delta, rust_build_protocol_ndjson, stage_build_evidence,
-    start_repository_daemon, traverse_filtered, unresolved,
-    validate_explicit_profile_selection_capabilities, web_build_protocol_ndjson, why_filtered,
+    create_compiler_precise_invocation_request, create_compiler_precise_unit_graph_request,
+    default_store_path, doctor, evaluate_policy_diff, execute_bounded_query,
+    execute_build_request_with_cancellation, export_filtered, export_graphml_filtered_to_writer,
+    impact, impact_query_cache_key, init_config, match_runtime_trace, open_store,
+    open_store_read_only, parse_and_type_check_bounded_query, plan_bounded_query,
+    plan_explicit_profile_selection, plan_repository_profiles, policy_annotations,
+    profile_selection_human_summary, read_bounded_query_file, read_compiler_pack_requirement,
+    read_explicit_profile_selection_file, read_git_changed_set, read_runtime_trace,
+    render_condition, render_github_annotations, run_scan_with_cache_mode, runtime_session_delta,
+    rust_build_protocol_ndjson, stage_build_evidence, start_repository_daemon, traverse_filtered,
+    unresolved, validate_explicit_profile_selection_capabilities, web_build_protocol_ndjson,
+    why_filtered,
 };
 use depgraph_protocol::canonical_json;
 use depgraph_store::{CompletedSnapshotDetails, CoverageRecord};
@@ -743,13 +744,18 @@ async fn run(cli: Cli) -> Result<u8> {
             }
             let root = canonical_directory(path)?;
             let store_path = store_path(cli.store, &root)?;
-            let compiler_precise_request = if rust_compiler_precise {
+            let compiler_precise_requirement = if rust_compiler_precise {
                 let requirement_path = compiler_pack_requirement
                     .context("--rust-compiler-precise requires --compiler-pack-requirement")?;
-                let requirement = read_compiler_pack_requirement(&requirement_path)?;
+                Some(read_compiler_pack_requirement(&requirement_path)?)
+            } else {
+                None
+            };
+            let compiler_precise_request = if let Some(requirement) = &compiler_precise_requirement
+            {
                 Some(create_compiler_precise_unit_graph_request(
                     &root,
-                    requirement,
+                    requirement.clone(),
                 )?)
             } else {
                 None
@@ -761,10 +767,33 @@ async fn run(cli: Cli) -> Result<u8> {
                 create_build_execution_request(&root)?
             };
             let mut store = open_store(&store_path)?;
-            let outcome = execute_build_request_with_cancellation(&request, async {
+            let cancellation = CancellationToken::new();
+            let signal_token = cancellation.clone();
+            tokio::spawn(async move {
                 let _ = tokio::signal::ctrl_c().await;
-            })
-            .await?;
+                signal_token.cancel();
+            });
+            let mut outcome =
+                execute_build_request_with_cancellation(&request, cancellation.cancelled()).await?;
+            if rust_compiler_precise && matches!(outcome.audit.outcome, BuildOutcomeKind::Completed)
+            {
+                let unit_graph = outcome
+                    .rust_cargo_unit_graph
+                    .clone()
+                    .context("compiler-precise unit graph stage produced no validated graph")?;
+                let invocation_request = create_compiler_precise_invocation_request(
+                    &root,
+                    compiler_precise_requirement
+                        .context("compiler-precise pack requirement is unavailable")?,
+                    unit_graph,
+                    outcome.audit.source_root_digest.clone(),
+                )?;
+                outcome = execute_build_request_with_cancellation(
+                    &invocation_request,
+                    cancellation.cancelled(),
+                )
+                .await?;
+            }
             store.save_build_audit(&serde_json::to_value(&outcome.audit)?)?;
             let mut evidence_status = "audit-only (no completed base scan)";
             let mut build_cache_status = "not stored";
@@ -773,7 +802,15 @@ async fn run(cli: Cli) -> Result<u8> {
                 store.start_build_attempt(&base_scan_id, &serde_json::to_value(&outcome.audit)?)?;
                 match outcome.audit.outcome {
                     BuildOutcomeKind::Completed => {
-                        if outcome.rust_cargo_unit_graph.is_some() {
+                        if outcome.rust_compiler_invocation_ledger.is_some() {
+                            store.finish_build_attempt(
+                                &outcome.audit.run_id,
+                                "completed",
+                                None,
+                                false,
+                            )?;
+                            evidence_status = "validated compiler invocation ledger (not promoted)";
+                        } else if outcome.rust_cargo_unit_graph.is_some() {
                             store.finish_build_attempt(
                                 &outcome.audit.run_id,
                                 "completed",
@@ -879,8 +916,18 @@ async fn run(cli: Cli) -> Result<u8> {
                     )?,
                 }
             }
-            if let Some(unit_graph) = outcome.rust_cargo_unit_graph.as_ref() {
+            if let Some(ledger) = outcome.rust_compiler_invocation_ledger.as_ref() {
                 if evidence_status == "audit-only (no completed base scan)" {
+                    evidence_status =
+                        "validated compiler invocation ledger (audit-only; no completed base scan)";
+                }
+                println!("Rust compiler invocations: {}", ledger.entries.len());
+                println!("Rust compiler invocation ledger digest: {}", ledger.digest);
+            }
+            if let Some(unit_graph) = outcome.rust_cargo_unit_graph.as_ref() {
+                if evidence_status == "audit-only (no completed base scan)"
+                    && outcome.rust_compiler_invocation_ledger.is_none()
+                {
                     evidence_status = "validated unit graph (audit-only; no completed base scan)";
                 }
                 println!("Cargo units: {}", unit_graph.units.len());

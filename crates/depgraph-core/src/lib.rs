@@ -6,6 +6,7 @@ pub mod build;
 pub mod build_evidence;
 pub mod cache;
 pub mod cancellation;
+pub mod compiler_invocation;
 pub mod compiler_pack;
 pub mod compiler_precise;
 pub mod config;
@@ -98,9 +99,9 @@ pub use build::{
     TANSTACK_START_BUILD_CAPABILITY, TANSTACK_START_BUILD_OBSERVATION_SCHEMA,
     TANSTACK_START_BUILD_OBSERVER, TANSTACK_START_BUILD_OBSERVER_VERSION,
     WEB_BUILD_OBSERVER_VERSION, WebBuildAdapter, WebBuildObservation,
-    create_build_execution_request, create_compiler_precise_unit_graph_request,
-    execute_build_request, execute_build_request_with_cancellation, supervise_build,
-    supervise_build_with_cancellation,
+    create_build_execution_request, create_compiler_precise_invocation_request,
+    create_compiler_precise_unit_graph_request, execute_build_request,
+    execute_build_request_with_cancellation, supervise_build, supervise_build_with_cancellation,
 };
 pub use build_evidence::{
     stage_build_evidence, validate_build_evidence, validate_framework_build_evidence_contract,
@@ -190,6 +191,14 @@ pub const CROSS_LANGUAGE_RELEASE_SMOKE_FIXTURE: &str =
     include_str!("../../../fixtures/cross-language-release-smoke-v1.json");
 pub use cache::build_cache_key;
 pub use cancellation::CancellationToken;
+pub use compiler_invocation::{
+    COMPILER_INVOCATION_LEDGER_SCHEMA, COMPILER_INVOCATION_LEDGER_SCHEMA_PATH,
+    COMPILER_INVOCATION_LEDGER_SCHEMA_VERSION, COMPILER_INVOCATION_RECORD_SCHEMA,
+    COMPILER_INVOCATION_RECORD_SCHEMA_PATH, COMPILER_INVOCATION_RECORD_SCHEMA_VERSION,
+    COMPILER_PRECISE_INVOCATION_ADAPTER, COMPILER_PRECISE_INVOCATION_ADAPTER_VERSION,
+    RustCompilerInvocation, RustCompilerInvocationLedger, compiler_invocation_attempt_digest,
+    validate_compiler_invocation_ledger, validate_compiler_invocation_unit_graph,
+};
 pub use compiler_pack::{
     COMPILER_PACK_CHANNEL_MANIFEST, COMPILER_PACK_CHANNEL_MANIFEST_SHA256,
     COMPILER_PACK_LICENSE_INVENTORY_PATH, COMPILER_PACK_MANIFEST_PATH,

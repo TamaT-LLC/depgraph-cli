@@ -1,0 +1,153 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://depgraph.dev/schemas/depgraph-rust-compiler-invocation-ledger-v1.schema.json",
+  "title": "depgraph validated Rust compiler invocation ledger",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "digest",
+    "attempt_digest",
+    "unit_graph_digest",
+    "entries"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "depgraph-rust-compiler-invocation-ledger-v1"
+    },
+    "digest": {
+      "$ref": "#/$defs/digest"
+    },
+    "attempt_digest": {
+      "$ref": "#/$defs/digest"
+    },
+    "unit_graph_digest": {
+      "$ref": "#/$defs/digest"
+    },
+    "entries": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 100000,
+      "items": {
+        "$ref": "#/$defs/entry"
+      }
+    }
+  },
+  "$defs": {
+    "digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "identity": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096,
+      "pattern": "^[A-Za-z0-9_-]+$"
+    },
+    "text": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096
+    },
+    "entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "unit_id",
+        "invocation_digest",
+        "crate_name",
+        "crate_types",
+        "source_path",
+        "source_sha256",
+        "profile_digest",
+        "edition",
+        "target",
+        "mode",
+        "features",
+        "canonical_argv",
+        "argv_digest",
+        "rustc_sha256",
+        "rustc_verbose_sha256",
+        "terminal_status",
+        "exit_code"
+      ],
+      "properties": {
+        "unit_id": {
+          "$ref": "#/$defs/text"
+        },
+        "invocation_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "crate_name": {
+          "$ref": "#/$defs/identity"
+        },
+        "crate_types": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1024,
+          "items": {
+            "$ref": "#/$defs/identity"
+          }
+        },
+        "source_path": {
+          "$ref": "#/$defs/text"
+        },
+        "source_sha256": {
+          "$ref": "#/$defs/digest"
+        },
+        "profile_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "edition": {
+          "$ref": "#/$defs/identity"
+        },
+        "target": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/identity"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "mode": {
+          "enum": [
+            "build",
+            "test"
+          ]
+        },
+        "features": {
+          "type": "array",
+          "maxItems": 1024,
+          "items": {
+            "$ref": "#/$defs/text"
+          }
+        },
+        "canonical_argv": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 16384,
+          "items": {
+            "$ref": "#/$defs/text"
+          }
+        },
+        "argv_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "rustc_sha256": {
+          "$ref": "#/$defs/digest"
+        },
+        "rustc_verbose_sha256": {
+          "$ref": "#/$defs/digest"
+        },
+        "terminal_status": {
+          "const": "completed"
+        },
+        "exit_code": {
+          "const": 0
+        }
+      }
+    }
+  }
+}
