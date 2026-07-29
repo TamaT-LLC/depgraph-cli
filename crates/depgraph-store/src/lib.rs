@@ -2633,24 +2633,44 @@ fn load_completed_snapshot_profiles_from_connection(
     connection: &Connection,
     snapshot_id: &str,
 ) -> Result<Vec<ProfileRecord>> {
-    let snapshot = load_completed_snapshot_from_connection(connection, snapshot_id)?;
-    let record = load_completed_snapshot_record(connection, snapshot_id)?
-        .with_context(|| format!("completed snapshot {snapshot_id} was not found"))?;
-    let observed_ids = snapshot
-        .profiles
-        .iter()
-        .map(|profile| profile.id.as_str())
-        .collect::<Vec<_>>();
-    if observed_ids
-        != record
-            .profile_ids
+    let mut current = snapshot_id.to_owned();
+    let mut visited = BTreeSet::new();
+    loop {
+        if !visited.insert(current.clone()) {
+            bail!("completed snapshot parent cycle detected while loading profiles");
+        }
+        let record = load_completed_snapshot_record(connection, &current)?
+            .with_context(|| format!("completed snapshot {current} was not found"))?;
+        if record.build_attempt_id.is_none()
+            && record.runtime_session_ids.is_empty()
+            && incremental::scan_is_semantic_noop_overlay(connection, &record.scan_id)?
+        {
+            current = record
+                .parent_snapshot_id
+                .context("semantic no-op snapshot has no parent completed snapshot")?;
+            continue;
+        }
+        let profiles =
+            if record.build_attempt_id.is_some() || !record.runtime_session_ids.is_empty() {
+                load_completed_snapshot_from_connection(connection, &current)?.profiles
+            } else {
+                load_profiles(connection, &record.scan_id)?
+            };
+        let observed_ids = profiles
             .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>()
-    {
-        bail!("completed snapshot profile metadata differs from its stored profile set");
+            .map(|profile| profile.id.as_str())
+            .collect::<Vec<_>>();
+        if observed_ids
+            != record
+                .profile_ids
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+        {
+            bail!("completed snapshot profile metadata differs from its stored profile set");
+        }
+        return Ok(profiles);
     }
-    Ok(snapshot.profiles)
 }
 
 /*
