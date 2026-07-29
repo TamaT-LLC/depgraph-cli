@@ -161,6 +161,8 @@
         "compiler_pack_manifest_sha256",
         "rustc_commit",
         "query_capabilities",
+        "instances",
+        "calls",
         "bodies",
         "unsupported"
       ],
@@ -203,8 +205,23 @@
         },
         "query_capabilities": {
           "const": [
+            "monomorphized_call_graph",
             "typed_mir"
           ]
+        },
+        "instances": {
+          "type": "array",
+          "maxItems": 1000000,
+          "items": {
+            "$ref": "#/$defs/compiler_instance"
+          }
+        },
+        "calls": {
+          "type": "array",
+          "maxItems": 1000000,
+          "items": {
+            "$ref": "#/$defs/compiler_call"
+          }
         },
         "bodies": {
           "type": "array",
@@ -637,6 +654,170 @@
           "items": {
             "$ref": "#/$defs/block"
           }
+        }
+      }
+    },
+    "compiler_generic_argument": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "value"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "type",
+            "constant"
+          ]
+        },
+        "value": {
+          "$ref": "#/$defs/text"
+        }
+      }
+    },
+    "compiler_instance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "instance_id",
+        "kind",
+        "variant",
+        "definition_path",
+        "symbol_name",
+        "generic_arguments",
+        "definition",
+        "compiler_generated"
+      ],
+      "properties": {
+        "instance_id": {
+          "$ref": "#/$defs/digest"
+        },
+        "kind": {
+          "enum": [
+            "function",
+            "method",
+            "closure",
+            "coroutine",
+            "static",
+            "shim",
+            "drop_glue",
+            "intrinsic",
+            "external"
+          ]
+        },
+        "variant": {
+          "$ref": "#/$defs/text"
+        },
+        "definition_path": {
+          "$ref": "#/$defs/text"
+        },
+        "symbol_name": {
+          "$ref": "#/$defs/text"
+        },
+        "generic_arguments": {
+          "type": "array",
+          "maxItems": 1024,
+          "items": {
+            "$ref": "#/$defs/compiler_generic_argument"
+          }
+        },
+        "definition": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/definition"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "compiler_generated": {
+          "type": "boolean"
+        }
+      }
+    },
+    "compiler_call": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "call_id",
+        "caller_instance_id",
+        "block_ordinal",
+        "operation_ordinal",
+        "relation",
+        "resolution",
+        "evidence",
+        "target_instance_ids",
+        "span",
+        "reason_code"
+      ],
+      "properties": {
+        "call_id": {
+          "$ref": "#/$defs/digest"
+        },
+        "caller_instance_id": {
+          "$ref": "#/$defs/digest"
+        },
+        "block_ordinal": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "operation_ordinal": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "relation": {
+          "enum": [
+            "calls",
+            "may_call"
+          ]
+        },
+        "resolution": {
+          "enum": [
+            "resolved",
+            "candidate",
+            "unknown_target"
+          ]
+        },
+        "evidence": {
+          "enum": [
+            "observed",
+            "candidate",
+            "unknown"
+          ]
+        },
+        "target_instance_ids": {
+          "type": "array",
+          "maxItems": 1000000,
+          "items": {
+            "$ref": "#/$defs/digest"
+          }
+        },
+        "span": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/span"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "reason_code": {
+          "oneOf": [
+            {
+              "enum": [
+                "fn_pointer_unbounded",
+                "virtual_dispatch",
+                "unresolved_instance",
+                "unsupported_callee"
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       }
     },

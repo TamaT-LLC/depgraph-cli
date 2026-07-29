@@ -30,6 +30,8 @@ const MAX_UNIT_FILES: usize = 100_000;
 const MAX_UNIT_FILE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_BODIES_PER_UNIT: usize = 100_000;
+const MAX_INSTANCES_PER_UNIT: usize = 1_000_000;
+const MAX_CALLS_PER_UNIT: usize = 1_000_000;
 const MAX_ATOMS_PER_BODY: usize = 1_000_000;
 const MAX_TEXT_BYTES: usize = 4_096;
 const MAX_TYPE_DEPTH: usize = 32;
@@ -51,8 +53,98 @@ pub struct RustCompilerMirUnit {
     pub compiler_pack_manifest_sha256: String,
     pub rustc_commit: String,
     pub query_capabilities: Vec<String>,
+    pub instances: Vec<RustCompilerMonoInstance>,
+    pub calls: Vec<RustCompilerCall>,
     pub bodies: Vec<RustCompilerMirBody>,
     pub unsupported: Vec<RustCompilerMirUnsupported>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RustCompilerMonoInstance {
+    pub instance_id: String,
+    pub kind: RustCompilerMonoInstanceKind,
+    pub variant: String,
+    pub definition_path: String,
+    pub symbol_name: String,
+    pub generic_arguments: Vec<RustCompilerGenericArgument>,
+    pub definition: Option<RustCompilerMirDefinition>,
+    pub compiler_generated: bool,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RustCompilerMonoInstanceKind {
+    Function,
+    Method,
+    Closure,
+    Coroutine,
+    Static,
+    Shim,
+    DropGlue,
+    Intrinsic,
+    External,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RustCompilerGenericArgument {
+    pub kind: RustCompilerGenericArgumentKind,
+    pub value: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RustCompilerGenericArgumentKind {
+    Type,
+    Constant,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RustCompilerCall {
+    pub call_id: String,
+    pub caller_instance_id: String,
+    pub block_ordinal: u32,
+    pub operation_ordinal: u32,
+    pub relation: RustCompilerCallRelation,
+    pub resolution: RustCompilerCallResolution,
+    pub evidence: RustCompilerCallEvidence,
+    pub target_instance_ids: Vec<String>,
+    pub span: Option<RustCompilerMirSpan>,
+    pub reason_code: Option<RustCompilerCallReason>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RustCompilerCallRelation {
+    Calls,
+    MayCall,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RustCompilerCallResolution {
+    Resolved,
+    Candidate,
+    UnknownTarget,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RustCompilerCallEvidence {
+    Observed,
+    Candidate,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RustCompilerCallReason {
+    FnPointerUnbounded,
+    VirtualDispatch,
+    UnresolvedInstance,
+    UnsupportedCallee,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -208,6 +300,8 @@ struct UnitIdentity<'a> {
     compiler_pack_manifest_sha256: &'a str,
     rustc_commit: &'a str,
     query_capabilities: &'a [String],
+    instances: &'a [RustCompilerMonoInstance],
+    calls: &'a [RustCompilerCall],
     bodies: &'a [RustCompilerMirBody],
     unsupported: &'a [RustCompilerMirUnsupported],
 }
@@ -233,6 +327,8 @@ pub fn compiler_mir_unit_digest(unit: &RustCompilerMirUnit) -> Result<String> {
         compiler_pack_manifest_sha256: &unit.compiler_pack_manifest_sha256,
         rustc_commit: &unit.rustc_commit,
         query_capabilities: &unit.query_capabilities,
+        instances: &unit.instances,
+        calls: &unit.calls,
         bodies: &unit.bodies,
         unsupported: &unit.unsupported,
     })
@@ -375,7 +471,7 @@ fn validate_unit(
         || unit.profile_digest != invocation.profile_digest
         || unit.compiler_pack_manifest_sha256 != pack.manifest_sha256
         || unit.rustc_commit != COMPILER_PACK_RUSTC_COMMIT
-        || unit.query_capabilities != ["typed_mir"]
+        || unit.query_capabilities != ["monomorphized_call_graph", "typed_mir"]
         || unit.digest != compiler_mir_unit_digest(unit)?
     {
         bail!("typed MIR unit identity is invalid");
@@ -389,6 +485,9 @@ fn validate_unit(
     if unit.bodies.len() > MAX_BODIES_PER_UNIT {
         bail!("typed MIR body count is outside its bounds");
     }
+    if unit.instances.len() > MAX_INSTANCES_PER_UNIT || unit.calls.len() > MAX_CALLS_PER_UNIT {
+        bail!("compiler call graph exceeds its count limit");
+    }
     if unit.unsupported.len() > MAX_ATOMS_PER_BODY {
         bail!("typed MIR unsupported coverage exceeds its count limit");
     }
@@ -399,6 +498,7 @@ fn validate_unit(
     {
         bail!("typed MIR bodies must be strictly sorted and unique");
     }
+    validate_compiler_call_graph(unit, workspace, cargo_home)?;
     let mut all_scope_ids = BTreeSet::new();
     let mut required_unsupported = BTreeSet::new();
     for body in &unit.bodies {
@@ -446,6 +546,185 @@ fn validate_unit(
         bail!("typed MIR unsupported constructs are missing reason-coded coverage");
     }
     Ok(())
+}
+
+fn validate_compiler_call_graph(
+    unit: &RustCompilerMirUnit,
+    workspace: &Path,
+    cargo_home: &Path,
+) -> Result<()> {
+    if !unit
+        .instances
+        .windows(2)
+        .all(|window| window[0].instance_id < window[1].instance_id)
+        || !unit
+            .calls
+            .windows(2)
+            .all(|window| window[0].call_id < window[1].call_id)
+    {
+        bail!("compiler instances and calls must be strictly sorted and unique");
+    }
+    let instance_ids = unit
+        .instances
+        .iter()
+        .map(|instance| instance.instance_id.as_str())
+        .collect::<BTreeSet<_>>();
+    for instance in &unit.instances {
+        validate_compiler_instance(instance, unit, workspace, cargo_home)?;
+    }
+    for call in &unit.calls {
+        validate_digest(&call.call_id)?;
+        if !instance_ids.contains(call.caller_instance_id.as_str())
+            || call
+                .target_instance_ids
+                .iter()
+                .any(|target| !instance_ids.contains(target.as_str()))
+            || !call
+                .target_instance_ids
+                .windows(2)
+                .all(|window| window[0] < window[1])
+        {
+            bail!("compiler call has a dangling or non-canonical endpoint");
+        }
+        let valid_claim = match (call.relation, call.resolution, call.evidence) {
+            (
+                RustCompilerCallRelation::Calls,
+                RustCompilerCallResolution::Resolved,
+                RustCompilerCallEvidence::Observed,
+            ) => call.target_instance_ids.len() == 1 && call.reason_code.is_none(),
+            (
+                RustCompilerCallRelation::MayCall,
+                RustCompilerCallResolution::Candidate,
+                RustCompilerCallEvidence::Candidate,
+            ) => !call.target_instance_ids.is_empty() && call.reason_code.is_none(),
+            (
+                RustCompilerCallRelation::MayCall,
+                RustCompilerCallResolution::UnknownTarget,
+                RustCompilerCallEvidence::Unknown,
+            ) => call.target_instance_ids.is_empty() && call.reason_code.is_some(),
+            _ => false,
+        };
+        if !valid_claim {
+            bail!("compiler call overstates or contradicts its resolution evidence");
+        }
+        if let Some(span) = &call.span {
+            validate_span(span, workspace, cargo_home)?;
+        }
+        if call.call_id
+            != digest_json(&(
+                call.caller_instance_id.as_str(),
+                call.block_ordinal,
+                call.operation_ordinal,
+                &call.relation,
+                &call.resolution,
+                &call.evidence,
+                &call.target_instance_ids,
+                &call.span,
+                &call.reason_code,
+            ))?
+        {
+            bail!("compiler call canonical identity is invalid");
+        }
+    }
+    Ok(())
+}
+
+fn validate_compiler_instance(
+    instance: &RustCompilerMonoInstance,
+    unit: &RustCompilerMirUnit,
+    workspace: &Path,
+    cargo_home: &Path,
+) -> Result<()> {
+    validate_digest(&instance.instance_id)?;
+    validate_text("compiler instance variant", &instance.variant)?;
+    validate_text(
+        "compiler instance definition path",
+        &instance.definition_path,
+    )?;
+    validate_text("compiler instance symbol name", &instance.symbol_name)?;
+    if instance.generic_arguments.len() > 1_024 {
+        bail!("compiler instance has too many generic arguments");
+    }
+    for argument in &instance.generic_arguments {
+        validate_text("compiler instance generic argument", &argument.value)?;
+    }
+    let expected_generated = matches!(
+        instance.kind,
+        RustCompilerMonoInstanceKind::Shim
+            | RustCompilerMonoInstanceKind::DropGlue
+            | RustCompilerMonoInstanceKind::Intrinsic
+    );
+    if expected_generated != instance.compiler_generated
+        && !matches!(instance.kind, RustCompilerMonoInstanceKind::External)
+    {
+        bail!("compiler instance generated classification is invalid");
+    }
+    if instance.compiler_generated && instance.definition.is_some() {
+        bail!("compiler-generated instance fabricates a source definition");
+    }
+    if let Some(definition) = &instance.definition {
+        if matches!(
+            instance.kind,
+            RustCompilerMonoInstanceKind::External
+                | RustCompilerMonoInstanceKind::Shim
+                | RustCompilerMonoInstanceKind::DropGlue
+                | RustCompilerMonoInstanceKind::Intrinsic
+        ) {
+            bail!("non-source compiler instance has a source definition");
+        }
+        validate_definition(definition, workspace, cargo_home)?;
+        if definition.path != instance.definition_path {
+            bail!("compiler instance source definition path is inconsistent");
+        }
+    }
+    if !valid_compiler_instance_variant(&instance.variant) {
+        bail!("compiler instance variant is not in the reviewed inventory");
+    }
+    if instance.instance_id
+        != digest_json(&(
+            unit.unit_id.as_str(),
+            unit.package_id.as_str(),
+            unit.target_digest.as_str(),
+            unit.profile_digest.as_str(),
+            unit.compiler_pack_manifest_sha256.as_str(),
+            unit.rustc_commit.as_str(),
+            &instance.kind,
+            instance.variant.as_str(),
+            instance.definition_path.as_str(),
+            instance.symbol_name.as_str(),
+            &instance.generic_arguments,
+            &instance.definition,
+            instance.compiler_generated,
+        ))?
+    {
+        bail!("compiler instance canonical identity is invalid");
+    }
+    Ok(())
+}
+
+fn valid_compiler_instance_variant(value: &str) -> bool {
+    matches!(
+        value,
+        "item"
+            | "static"
+            | "intrinsic"
+            | "llvm_intrinsic"
+            | "shim_public_fallback"
+            | "shim_vtable"
+            | "shim_reify"
+            | "shim_fn_ptr"
+            | "shim_closure_once"
+            | "shim_coroutine_closure"
+            | "shim_thread_local"
+            | "shim_future_drop_poll"
+            | "shim_drop_glue"
+            | "shim_clone"
+            | "shim_fn_ptr_addr"
+            | "shim_async_drop_glue_ctor"
+            | "shim_async_drop_glue"
+    ) || value
+        .strip_prefix("virtual:")
+        .is_some_and(|index| !index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
 fn validate_body(
@@ -1190,7 +1469,7 @@ mod tests {
         let body = RustCompilerMirBody {
             body_id,
             kind: RustCompilerMirBodyKind::Function,
-            definition,
+            definition: definition.clone(),
             span: span.clone(),
             types: vec![ty],
             constants: Vec::new(),
@@ -1245,6 +1524,179 @@ mod tests {
             is_std: false,
             dependencies: Vec::new(),
         };
+        let make_definition = |path: &str| -> Result<RustCompilerMirDefinition> {
+            Ok(RustCompilerMirDefinition {
+                definition_id: digest_json(&(
+                    path,
+                    span.source_path.as_str(),
+                    span.source_sha256.as_str(),
+                    span.start_line,
+                    span.start_column,
+                    span.end_line,
+                    span.end_column,
+                ))?,
+                path: path.to_owned(),
+                span: span.clone(),
+            })
+        };
+        let make_instance = |kind: RustCompilerMonoInstanceKind,
+                             variant: &str,
+                             definition_path: &str,
+                             symbol_name: &str,
+                             generic_arguments: Vec<RustCompilerGenericArgument>,
+                             definition: Option<RustCompilerMirDefinition>,
+                             compiler_generated: bool|
+         -> Result<RustCompilerMonoInstance> {
+            Ok(RustCompilerMonoInstance {
+                instance_id: digest_json(&(
+                    unit_id.as_str(),
+                    package_id.as_str(),
+                    target_digest.as_str(),
+                    profile_digest.as_str(),
+                    pack.manifest_sha256.as_str(),
+                    COMPILER_PACK_RUSTC_COMMIT,
+                    &kind,
+                    variant,
+                    definition_path,
+                    symbol_name,
+                    &generic_arguments,
+                    &definition,
+                    compiler_generated,
+                ))?,
+                kind,
+                variant: variant.to_owned(),
+                definition_path: definition_path.to_owned(),
+                symbol_name: symbol_name.to_owned(),
+                generic_arguments,
+                definition,
+                compiler_generated,
+            })
+        };
+        let root_instance = make_instance(
+            RustCompilerMonoInstanceKind::Function,
+            "item",
+            "fixture::fixture",
+            "_RNvCfixture7fixture",
+            Vec::new(),
+            Some(make_definition("fixture::fixture")?),
+            false,
+        )?;
+        let generic_instance = make_instance(
+            RustCompilerMonoInstanceKind::Function,
+            "item",
+            "fixture::generic",
+            "_RINvCfixture7genericmE",
+            vec![RustCompilerGenericArgument {
+                kind: RustCompilerGenericArgumentKind::Type,
+                value: "u32".to_owned(),
+            }],
+            Some(make_definition("fixture::generic")?),
+            false,
+        )?;
+        let closure_instance = make_instance(
+            RustCompilerMonoInstanceKind::Closure,
+            "item",
+            "fixture::fixture::{closure#0}",
+            "_RNCNvCfixture7fixture0",
+            vec![RustCompilerGenericArgument {
+                kind: RustCompilerGenericArgumentKind::Type,
+                value: "tuple:".to_owned(),
+            }],
+            Some(make_definition("fixture::fixture::{closure#0}")?),
+            false,
+        )?;
+        let drop_instance = make_instance(
+            RustCompilerMonoInstanceKind::DropGlue,
+            "shim_drop_glue",
+            "std::ptr::drop_glue",
+            "_RINvNtCsstd3ptr9drop_glueNtCfixture7DroppedE",
+            vec![RustCompilerGenericArgument {
+                kind: RustCompilerGenericArgumentKind::Type,
+                value: "adt:fixture::Dropped<>".to_owned(),
+            }],
+            None,
+            true,
+        )?;
+        let external_instance = make_instance(
+            RustCompilerMonoInstanceKind::External,
+            "item",
+            "external::callback",
+            "_RNvCexternal8callback",
+            Vec::new(),
+            None,
+            false,
+        )?;
+        let mut instances = vec![
+            root_instance.clone(),
+            generic_instance.clone(),
+            closure_instance.clone(),
+            drop_instance,
+            external_instance.clone(),
+        ];
+        instances.sort_by(|left, right| left.instance_id.cmp(&right.instance_id));
+        let make_call = |block_ordinal: u32,
+                         operation_ordinal: u32,
+                         relation: RustCompilerCallRelation,
+                         resolution: RustCompilerCallResolution,
+                         evidence: RustCompilerCallEvidence,
+                         mut target_instance_ids: Vec<String>,
+                         reason_code: Option<RustCompilerCallReason>|
+         -> Result<RustCompilerCall> {
+            target_instance_ids.sort();
+            let call_id = digest_json(&(
+                root_instance.instance_id.as_str(),
+                block_ordinal,
+                operation_ordinal,
+                &relation,
+                &resolution,
+                &evidence,
+                &target_instance_ids,
+                Option::<RustCompilerMirSpan>::None,
+                &reason_code,
+            ))?;
+            Ok(RustCompilerCall {
+                call_id,
+                caller_instance_id: root_instance.instance_id.clone(),
+                block_ordinal,
+                operation_ordinal,
+                relation,
+                resolution,
+                evidence,
+                target_instance_ids,
+                span: None,
+                reason_code,
+            })
+        };
+        let mut calls = vec![
+            make_call(
+                0,
+                0,
+                RustCompilerCallRelation::Calls,
+                RustCompilerCallResolution::Resolved,
+                RustCompilerCallEvidence::Observed,
+                vec![generic_instance.instance_id],
+                None,
+            )?,
+            make_call(
+                1,
+                0,
+                RustCompilerCallRelation::MayCall,
+                RustCompilerCallResolution::Candidate,
+                RustCompilerCallEvidence::Candidate,
+                vec![closure_instance.instance_id, external_instance.instance_id],
+                None,
+            )?,
+            make_call(
+                2,
+                0,
+                RustCompilerCallRelation::MayCall,
+                RustCompilerCallResolution::UnknownTarget,
+                RustCompilerCallEvidence::Unknown,
+                Vec::new(),
+                Some(RustCompilerCallReason::FnPointerUnbounded),
+            )?,
+        ];
+        calls.sort_by(|left, right| left.call_id.cmp(&right.call_id));
         let mut unit = RustCompilerMirUnit {
             schema_version: COMPILER_PRECISE_MIR_SCHEMA_VERSION.to_owned(),
             digest: String::new(),
@@ -1258,7 +1710,12 @@ mod tests {
             profile_digest,
             compiler_pack_manifest_sha256: pack.manifest_sha256.clone(),
             rustc_commit: COMPILER_PACK_RUSTC_COMMIT.to_owned(),
-            query_capabilities: vec!["typed_mir".to_owned()],
+            query_capabilities: vec![
+                "monomorphized_call_graph".to_owned(),
+                "typed_mir".to_owned(),
+            ],
+            instances,
+            calls,
             bodies: vec![body],
             unsupported: Vec::new(),
         };
@@ -1402,6 +1859,95 @@ mod tests {
                 &graph,
                 &pack,
                 &dangling.attempt_digest,
+                checkout.path(),
+                cargo_home.path(),
+            )
+            .is_err()
+        );
+
+        let mut overclaimed = unit.clone();
+        let additional_target = overclaimed
+            .instances
+            .iter()
+            .find(|instance| instance.kind == RustCompilerMonoInstanceKind::External)
+            .context("fixture external instance is unavailable")?
+            .instance_id
+            .clone();
+        let exact = overclaimed
+            .calls
+            .iter_mut()
+            .find(|call| call.resolution == RustCompilerCallResolution::Resolved)
+            .context("fixture exact call is unavailable")?;
+        exact.target_instance_ids.push(additional_target);
+        exact.target_instance_ids.sort();
+        exact.call_id = digest_json(&(
+            exact.caller_instance_id.as_str(),
+            exact.block_ordinal,
+            exact.operation_ordinal,
+            &exact.relation,
+            &exact.resolution,
+            &exact.evidence,
+            &exact.target_instance_ids,
+            &exact.span,
+            &exact.reason_code,
+        ))?;
+        overclaimed
+            .calls
+            .sort_by(|left, right| left.call_id.cmp(&right.call_id));
+        overclaimed.digest = compiler_mir_unit_digest(&overclaimed)?;
+        assert!(
+            validate_unit(
+                &overclaimed,
+                &invocation,
+                &graph,
+                &pack,
+                &overclaimed.attempt_digest,
+                checkout.path(),
+                cargo_home.path(),
+            )
+            .is_err()
+        );
+
+        let mut fabricated = unit.clone();
+        let generated = fabricated
+            .instances
+            .iter_mut()
+            .find(|instance| instance.compiler_generated)
+            .context("fixture generated instance is unavailable")?;
+        generated.definition = Some(fabricated.bodies[0].definition.clone());
+        fabricated.digest = compiler_mir_unit_digest(&fabricated)?;
+        assert!(
+            validate_unit(
+                &fabricated,
+                &invocation,
+                &graph,
+                &pack,
+                &fabricated.attempt_digest,
+                checkout.path(),
+                cargo_home.path(),
+            )
+            .is_err()
+        );
+
+        let mut cross_profile = unit.clone();
+        cross_profile.profile_digest = "9".repeat(64);
+        cross_profile.digest = compiler_mir_unit_digest(&cross_profile)?;
+        assert!(
+            validate_compiler_instance(
+                &cross_profile.instances[0],
+                &cross_profile,
+                checkout.path(),
+                cargo_home.path(),
+            )
+            .is_err()
+        );
+        assert!(
+            validate_unit(
+                &cross_profile,
+                &invocation,
+                &graph,
+                &pack,
+                &cross_profile.attempt_digest,
                 checkout.path(),
                 cargo_home.path(),
             )

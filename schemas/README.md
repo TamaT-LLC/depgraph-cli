@@ -28,7 +28,7 @@ first copied into the bounded run-owned Cargo home and use
 
 `depgraph-rust-compiler-precise-v1.schema.json` describes the attested
 wrapper's bounded start/terminal records and the pinned compiler query child's
-typed MIR unit DTO.
+typed MIR plus monomorphized instance/call-graph unit DTO.
 `depgraph-rust-compiler-invocation-ledger-v1.schema.json` describes the
 parent-validated, checkout-independent invocation conservation ledger.
 `depgraph-rust-compiler-precise-mir-ledger-v1.schema.json` describes the
@@ -38,10 +38,12 @@ unit, recomputes source/profile/argv/compiler identities, rejects extra,
 missing, duplicate, partial, nested, response-file, and path-escaping
 invocations, and never persists raw stdout, stderr, environment values, or
 temporary absolute paths. MIR validation additionally recomputes canonical
-body/type/place/constant/span identities, enforces source confinement and
-count/byte/depth bounds, and rejects raw compiler IDs, debug/address text,
-dangling references, and unknown fields. This stage remains audit-only and
-does not promote call edges or modify completed snapshots.
+body/type/place/constant/span/instance/call identities, enforces source
+confinement, profile ownership, endpoint closure, exact/candidate/unknown
+evidence rules, and count/byte/depth bounds, and rejects raw compiler IDs,
+fabricated generated spans, debug/address text, dangling references, and
+unknown fields. This stage remains audit-only and does not promote call edges
+or modify completed snapshots.
 
 `depgraph-protocol-v1.schema.json` contains both the repository-complete
 protocol `1.0` events and the opt-in `worker-delta-v1` event family. Delta mode

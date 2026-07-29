@@ -203,12 +203,14 @@ pub use compiler_invocation::{
 pub use compiler_mir::{
     COMPILER_PRECISE_MIR_LEDGER_SCHEMA, COMPILER_PRECISE_MIR_LEDGER_SCHEMA_PATH,
     COMPILER_PRECISE_MIR_LEDGER_SCHEMA_VERSION, COMPILER_PRECISE_MIR_SCHEMA,
-    COMPILER_PRECISE_MIR_SCHEMA_PATH, COMPILER_PRECISE_MIR_SCHEMA_VERSION, RustCompilerMirBlock,
-    RustCompilerMirBody, RustCompilerMirBodyKind, RustCompilerMirConstant,
+    COMPILER_PRECISE_MIR_SCHEMA_PATH, COMPILER_PRECISE_MIR_SCHEMA_VERSION, RustCompilerCall,
+    RustCompilerCallEvidence, RustCompilerCallReason, RustCompilerCallRelation,
+    RustCompilerCallResolution, RustCompilerGenericArgument, RustCompilerGenericArgumentKind,
+    RustCompilerMirBlock, RustCompilerMirBody, RustCompilerMirBodyKind, RustCompilerMirConstant,
     RustCompilerMirDefinition, RustCompilerMirLedger, RustCompilerMirLocal,
     RustCompilerMirOperation, RustCompilerMirPlace, RustCompilerMirProjection, RustCompilerMirSpan,
-    RustCompilerMirType, RustCompilerMirUnit, RustCompilerMirUnsupported, compiler_mir_unit_digest,
-    validate_compiler_mir_directory,
+    RustCompilerMirType, RustCompilerMirUnit, RustCompilerMirUnsupported, RustCompilerMonoInstance,
+    RustCompilerMonoInstanceKind, compiler_mir_unit_digest, validate_compiler_mir_directory,
 };
 pub use compiler_pack::{
     COMPILER_PACK_CHANNEL_MANIFEST, COMPILER_PACK_CHANNEL_MANIFEST_SHA256,

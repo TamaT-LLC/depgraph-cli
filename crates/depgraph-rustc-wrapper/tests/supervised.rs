@@ -548,6 +548,31 @@ body = {
         "successors": [],
     }],
 }
+instance_id = digest([
+    os.environ["DEPGRAPH_QUERY_UNIT_ID"],
+    os.environ["DEPGRAPH_QUERY_PACKAGE_ID"],
+    os.environ["DEPGRAPH_QUERY_TARGET_DIGEST"],
+    os.environ["DEPGRAPH_QUERY_PROFILE_DIGEST"],
+    os.environ["DEPGRAPH_QUERY_PACK_MANIFEST_SHA256"],
+    os.environ["DEPGRAPH_QUERY_RUSTC_COMMIT"],
+    "function",
+    "item",
+    definition_path,
+    "fixture_symbol",
+    [],
+    definition,
+    False,
+])
+instance = {
+    "instance_id": instance_id,
+    "kind": "function",
+    "variant": "item",
+    "definition_path": definition_path,
+    "symbol_name": "fixture_symbol",
+    "generic_arguments": [],
+    "definition": definition,
+    "compiler_generated": False,
+}
 unit = {
     "schema_version": "depgraph-rust-compiler-precise-v1",
     "digest": "",
@@ -561,7 +586,9 @@ unit = {
     "profile_digest": os.environ["DEPGRAPH_QUERY_PROFILE_DIGEST"],
     "compiler_pack_manifest_sha256": os.environ["DEPGRAPH_QUERY_PACK_MANIFEST_SHA256"],
     "rustc_commit": os.environ["DEPGRAPH_QUERY_RUSTC_COMMIT"],
-    "query_capabilities": ["typed_mir"],
+    "query_capabilities": ["monomorphized_call_graph", "typed_mir"],
+    "instances": [instance],
+    "calls": [],
     "bodies": [body],
     "unsupported": [],
 }

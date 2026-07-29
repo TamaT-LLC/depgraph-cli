@@ -6,8 +6,10 @@ extern crate rustc_middle;
 #[macro_use]
 extern crate rustc_public;
 
+mod rustc_private_bridge;
+
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     env,
     fs::{self, OpenOptions},
     io::Write,
@@ -20,6 +22,7 @@ use rustc_public::{
     mir::{
         Body, ConstOperand, NonDivergingIntrinsic, Operand, Place, ProjectionElem, Rvalue,
         StatementKind, TerminatorKind,
+        mono::{Instance, InstanceKind as PublicInstanceKind},
     },
     ty::{ConstantKind, IntTy, RigidTy, Ty, TyConstKind, TyKind, UintTy},
 };
@@ -48,6 +51,8 @@ struct Unit {
     compiler_pack_manifest_sha256: String,
     rustc_commit: &'static str,
     query_capabilities: Vec<String>,
+    instances: Vec<CompilerInstance>,
+    calls: Vec<CompilerCall>,
     bodies: Vec<MirBody>,
     unsupported: Vec<Unsupported>,
 }
@@ -65,8 +70,95 @@ struct UnitIdentity<'a> {
     compiler_pack_manifest_sha256: &'a str,
     rustc_commit: &'a str,
     query_capabilities: &'a [String],
+    instances: &'a [CompilerInstance],
+    calls: &'a [CompilerCall],
     bodies: &'a [MirBody],
     unsupported: &'a [Unsupported],
+}
+
+#[derive(Clone, Serialize)]
+struct CompilerInstance {
+    instance_id: String,
+    kind: CompilerInstanceKind,
+    variant: String,
+    definition_path: String,
+    symbol_name: String,
+    generic_arguments: Vec<CompilerGenericArgument>,
+    definition: Option<Definition>,
+    compiler_generated: bool,
+}
+
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum CompilerInstanceKind {
+    Function,
+    Method,
+    Closure,
+    Coroutine,
+    Static,
+    Shim,
+    DropGlue,
+    Intrinsic,
+    External,
+}
+
+#[derive(Clone, Serialize)]
+struct CompilerGenericArgument {
+    kind: CompilerGenericArgumentKind,
+    value: String,
+}
+
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum CompilerGenericArgumentKind {
+    Type,
+    Constant,
+}
+
+#[derive(Clone, Serialize)]
+struct CompilerCall {
+    call_id: String,
+    caller_instance_id: String,
+    block_ordinal: u32,
+    operation_ordinal: u32,
+    relation: CompilerCallRelation,
+    resolution: CompilerCallResolution,
+    evidence: CompilerCallEvidence,
+    target_instance_ids: Vec<String>,
+    span: Option<Span>,
+    reason_code: Option<CompilerCallReason>,
+}
+
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum CompilerCallRelation {
+    Calls,
+    MayCall,
+}
+
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum CompilerCallResolution {
+    Resolved,
+    Candidate,
+    UnknownTarget,
+}
+
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum CompilerCallEvidence {
+    Observed,
+    Candidate,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum CompilerCallReason {
+    FnPointerUnbounded,
+    VirtualDispatch,
+    UnresolvedInstance,
+    UnsupportedCallee,
 }
 
 #[derive(Clone, Serialize)]
@@ -238,6 +330,103 @@ fn extract_unit() -> Result<()> {
     let profile_digest = required_digest("DEPGRAPH_QUERY_PROFILE_DIGEST")?;
     let workspace = required_absolute_directory("DEPGRAPH_QUERY_WORKSPACE_ROOT")?;
     let cargo_home = required_absolute_directory("DEPGRAPH_QUERY_CARGO_HOME")?;
+    let compiler_pack_manifest_sha256 = required_digest("DEPGRAPH_QUERY_PACK_MANIFEST_SHA256")?;
+    let (mono_items, global_asm_count) = rustc_private_bridge::collect_mono_items();
+    if global_asm_count != 0 {
+        bail!("compiler-selected global assembly is outside the typed mono-item contract");
+    }
+    if mono_items.len() > MAX_ATOMS {
+        bail!("compiler-selected mono item count exceeds its limit");
+    }
+    let identity = InstanceIdentityContext {
+        unit_id: &unit_id,
+        package_id: &package_id,
+        target_digest: &target_digest,
+        profile_digest: &profile_digest,
+        compiler_pack_manifest_sha256: &compiler_pack_manifest_sha256,
+        workspace: &workspace,
+        cargo_home: &cargo_home,
+    };
+    let mut instance_by_id = BTreeMap::new();
+    let mut instance_ids = HashMap::new();
+    let mut callable_items = Vec::new();
+    for item in mono_items {
+        let extracted = reviewed_compiler_instance(item, &identity)?;
+        if let rustc_private_bridge::ReviewedMonoItem::Function { instance, .. } = item {
+            instance_ids.insert(instance, extracted.instance_id.clone());
+            callable_items.push(instance);
+        }
+        if instance_by_id
+            .insert(extracted.instance_id.clone(), extracted)
+            .is_some()
+        {
+            bail!("compiler-selected mono item identity is not unique");
+        }
+    }
+    let mut pending_calls = Vec::new();
+    for instance in callable_items {
+        let caller_instance_id = instance_ids
+            .get(&instance)
+            .context("compiler-selected caller identity is unavailable")?;
+        if let Some(body) = instance.body() {
+            pending_calls.extend(extract_instance_calls(
+                instance,
+                caller_instance_id,
+                &body,
+                &workspace,
+                &cargo_home,
+            )?);
+        }
+    }
+    let mut calls = Vec::with_capacity(pending_calls.len());
+    for pending in pending_calls {
+        let mut target_instance_ids = Vec::with_capacity(pending.targets.len());
+        for target in pending.targets {
+            let target_id = if let Some(target_id) = instance_ids.get(&target) {
+                target_id.clone()
+            } else {
+                let extracted = public_compiler_instance(target, &identity)?;
+                let target_id = extracted.instance_id.clone();
+                instance_by_id.entry(target_id.clone()).or_insert(extracted);
+                instance_ids.insert(target, target_id.clone());
+                target_id
+            };
+            target_instance_ids.push(target_id);
+        }
+        target_instance_ids.sort();
+        target_instance_ids.dedup();
+        let call_id = digest_json(&(
+            pending.caller_instance_id.as_str(),
+            pending.block_ordinal,
+            pending.operation_ordinal,
+            &pending.relation,
+            &pending.resolution,
+            &pending.evidence,
+            &target_instance_ids,
+            &pending.span,
+            &pending.reason_code,
+        ))?;
+        calls.push(CompilerCall {
+            call_id,
+            caller_instance_id: pending.caller_instance_id,
+            block_ordinal: pending.block_ordinal,
+            operation_ordinal: pending.operation_ordinal,
+            relation: pending.relation,
+            resolution: pending.resolution,
+            evidence: pending.evidence,
+            target_instance_ids,
+            span: pending.span,
+            reason_code: pending.reason_code,
+        });
+    }
+    calls.sort_by(|left, right| left.call_id.cmp(&right.call_id));
+    if calls
+        .windows(2)
+        .any(|window| window[0].call_id == window[1].call_id)
+    {
+        bail!("compiler call identity is not unique");
+    }
+    let instances = instance_by_id.into_values().collect::<Vec<_>>();
     for item in all_local_items() {
         if bodies.len() >= MAX_BODIES {
             bail!("typed MIR body count exceeds its limit");
@@ -271,9 +460,14 @@ fn extract_unit() -> Result<()> {
         source_path: required_text("DEPGRAPH_QUERY_SOURCE_PATH")?,
         source_sha256: required_digest("DEPGRAPH_QUERY_SOURCE_SHA256")?,
         profile_digest,
-        compiler_pack_manifest_sha256: required_digest("DEPGRAPH_QUERY_PACK_MANIFEST_SHA256")?,
+        compiler_pack_manifest_sha256,
         rustc_commit: RUSTC_COMMIT,
-        query_capabilities: vec!["typed_mir".to_owned()],
+        query_capabilities: vec![
+            "monomorphized_call_graph".to_owned(),
+            "typed_mir".to_owned(),
+        ],
+        instances,
+        calls,
         bodies,
         unsupported,
     };
@@ -289,6 +483,8 @@ fn extract_unit() -> Result<()> {
         compiler_pack_manifest_sha256: &unit.compiler_pack_manifest_sha256,
         rustc_commit: unit.rustc_commit,
         query_capabilities: &unit.query_capabilities,
+        instances: &unit.instances,
+        calls: &unit.calls,
         bodies: &unit.bodies,
         unsupported: &unit.unsupported,
     })?;
@@ -491,6 +687,768 @@ fn body_kind(item: CrateItem) -> BodyKind {
             }
             _ => BodyKind::Function,
         },
+    }
+}
+
+struct InstanceIdentityContext<'a> {
+    unit_id: &'a str,
+    package_id: &'a str,
+    target_digest: &'a str,
+    profile_digest: &'a str,
+    compiler_pack_manifest_sha256: &'a str,
+    workspace: &'a Path,
+    cargo_home: &'a Path,
+}
+
+struct PendingCall {
+    caller_instance_id: String,
+    block_ordinal: u32,
+    operation_ordinal: u32,
+    relation: CompilerCallRelation,
+    resolution: CompilerCallResolution,
+    evidence: CompilerCallEvidence,
+    targets: Vec<Instance>,
+    span: Option<Span>,
+    reason_code: Option<CompilerCallReason>,
+}
+
+fn reviewed_compiler_instance(
+    item: rustc_private_bridge::ReviewedMonoItem,
+    context: &InstanceIdentityContext<'_>,
+) -> Result<CompilerInstance> {
+    use rustc_private_bridge::{
+        ReviewedInstanceKind as InstanceKind, ReviewedMonoItem, ReviewedShimKind,
+    };
+    match item {
+        ReviewedMonoItem::Function { instance, kind } => {
+            let (variant, kind, compiler_generated) = match kind {
+                InstanceKind::Item => ("item".to_owned(), source_instance_kind(instance), false),
+                InstanceKind::Intrinsic => (
+                    "intrinsic".to_owned(),
+                    CompilerInstanceKind::Intrinsic,
+                    true,
+                ),
+                InstanceKind::LlvmIntrinsic => (
+                    "llvm_intrinsic".to_owned(),
+                    CompilerInstanceKind::Intrinsic,
+                    true,
+                ),
+                InstanceKind::Virtual { vtable_index } => (
+                    format!("virtual:{vtable_index}"),
+                    CompilerInstanceKind::External,
+                    true,
+                ),
+                InstanceKind::Shim(shim) => {
+                    let variant = match shim {
+                        ReviewedShimKind::Vtable => "shim_vtable",
+                        ReviewedShimKind::Reify => "shim_reify",
+                        ReviewedShimKind::FnPtr => "shim_fn_ptr",
+                        ReviewedShimKind::ClosureOnce => "shim_closure_once",
+                        ReviewedShimKind::CoroutineClosure => "shim_coroutine_closure",
+                        ReviewedShimKind::ThreadLocal => "shim_thread_local",
+                        ReviewedShimKind::FutureDropPoll => "shim_future_drop_poll",
+                        ReviewedShimKind::DropGlue => "shim_drop_glue",
+                        ReviewedShimKind::Clone => "shim_clone",
+                        ReviewedShimKind::FnPtrAddr => "shim_fn_ptr_addr",
+                        ReviewedShimKind::AsyncDropGlueCtor => "shim_async_drop_glue_ctor",
+                        ReviewedShimKind::AsyncDropGlue => "shim_async_drop_glue",
+                    };
+                    let kind = if matches!(
+                        shim,
+                        ReviewedShimKind::DropGlue
+                            | ReviewedShimKind::AsyncDropGlueCtor
+                            | ReviewedShimKind::AsyncDropGlue
+                    ) {
+                        CompilerInstanceKind::DropGlue
+                    } else {
+                        CompilerInstanceKind::Shim
+                    };
+                    (variant.to_owned(), kind, true)
+                }
+            };
+            compiler_instance(instance, kind, variant, compiler_generated, context)
+        }
+        ReviewedMonoItem::Static(definition) => {
+            let definition_path = definition.name();
+            validate_text(&definition_path)?;
+            let source_definition = if definition.krate().is_local {
+                source_definition(
+                    definition_path.clone(),
+                    definition.span(),
+                    context.workspace,
+                    context.cargo_home,
+                )
+                .ok()
+            } else {
+                None
+            };
+            let kind = if definition.krate().is_local {
+                CompilerInstanceKind::Static
+            } else {
+                CompilerInstanceKind::External
+            };
+            let variant = "static".to_owned();
+            let symbol_name = Instance::from(definition).mangled_name();
+            validate_text(&symbol_name)?;
+            let generic_arguments = Vec::new();
+            let compiler_generated = false;
+            let mut extracted = CompilerInstance {
+                instance_id: String::new(),
+                kind,
+                variant,
+                definition_path,
+                symbol_name,
+                generic_arguments,
+                definition: source_definition,
+                compiler_generated,
+            };
+            extracted.instance_id = compiler_instance_id(context, &extracted)?;
+            Ok(extracted)
+        }
+    }
+}
+
+fn public_compiler_instance(
+    instance: Instance,
+    context: &InstanceIdentityContext<'_>,
+) -> Result<CompilerInstance> {
+    let (kind, variant, compiler_generated) = match instance.kind {
+        PublicInstanceKind::Item => (source_instance_kind(instance), "item".to_owned(), false),
+        PublicInstanceKind::Intrinsic => (
+            CompilerInstanceKind::Intrinsic,
+            "intrinsic".to_owned(),
+            true,
+        ),
+        PublicInstanceKind::LlvmIntrinsic => (
+            CompilerInstanceKind::Intrinsic,
+            "llvm_intrinsic".to_owned(),
+            true,
+        ),
+        PublicInstanceKind::Virtual { idx } => (
+            CompilerInstanceKind::External,
+            format!("virtual:{idx}"),
+            true,
+        ),
+        PublicInstanceKind::Shim => (
+            CompilerInstanceKind::Shim,
+            "shim_public_fallback".to_owned(),
+            true,
+        ),
+    };
+    compiler_instance(instance, kind, variant, compiler_generated, context)
+}
+
+fn compiler_instance(
+    instance: Instance,
+    mut kind: CompilerInstanceKind,
+    variant: String,
+    compiler_generated: bool,
+    context: &InstanceIdentityContext<'_>,
+) -> Result<CompilerInstance> {
+    let definition_path = instance.def.name();
+    let symbol_name = instance.mangled_name();
+    validate_text(&definition_path)?;
+    validate_text(&symbol_name)?;
+    validate_text(&variant)?;
+    let is_local = instance.def.krate().is_local;
+    if !is_local
+        && matches!(
+            kind,
+            CompilerInstanceKind::Function | CompilerInstanceKind::Method
+        )
+    {
+        kind = CompilerInstanceKind::External;
+    }
+    let generic_arguments = compiler_generic_arguments(&instance.args())?;
+    let definition = if is_local && !compiler_generated {
+        source_definition(
+            definition_path.clone(),
+            instance.def.span(),
+            context.workspace,
+            context.cargo_home,
+        )
+        .ok()
+    } else {
+        None
+    };
+    let mut extracted = CompilerInstance {
+        instance_id: String::new(),
+        kind,
+        variant,
+        definition_path,
+        symbol_name,
+        generic_arguments,
+        definition,
+        compiler_generated,
+    };
+    extracted.instance_id = compiler_instance_id(context, &extracted)?;
+    Ok(extracted)
+}
+
+fn source_instance_kind(instance: Instance) -> CompilerInstanceKind {
+    let Ok(item) = CrateItem::try_from(instance) else {
+        return if instance.def.krate().is_local {
+            CompilerInstanceKind::Function
+        } else {
+            CompilerInstanceKind::External
+        };
+    };
+    match body_kind(item) {
+        BodyKind::Method => CompilerInstanceKind::Method,
+        BodyKind::Closure => CompilerInstanceKind::Closure,
+        BodyKind::Async | BodyKind::Coroutine => CompilerInstanceKind::Coroutine,
+        BodyKind::Function | BodyKind::Const | BodyKind::Static => CompilerInstanceKind::Function,
+    }
+}
+
+fn compiler_instance_id(
+    context: &InstanceIdentityContext<'_>,
+    instance: &CompilerInstance,
+) -> Result<String> {
+    digest_json(&(
+        context.unit_id,
+        context.package_id,
+        context.target_digest,
+        context.profile_digest,
+        context.compiler_pack_manifest_sha256,
+        RUSTC_COMMIT,
+        &instance.kind,
+        instance.variant.as_str(),
+        instance.definition_path.as_str(),
+        instance.symbol_name.as_str(),
+        &instance.generic_arguments,
+        &instance.definition,
+        instance.compiler_generated,
+    ))
+}
+
+fn source_definition(
+    path: String,
+    span: rustc_public::ty::Span,
+    workspace: &Path,
+    cargo_home: &Path,
+) -> Result<Definition> {
+    let span = convert_span(span, workspace, cargo_home, None)?;
+    let definition_id = digest_json(&(
+        path.as_str(),
+        span.source_path.as_str(),
+        span.source_sha256.as_str(),
+        span.start_line,
+        span.start_column,
+        span.end_line,
+        span.end_column,
+    ))?;
+    Ok(Definition {
+        definition_id,
+        path,
+        span,
+    })
+}
+
+fn compiler_generic_arguments(
+    arguments: &rustc_public::ty::GenericArgs,
+) -> Result<Vec<CompilerGenericArgument>> {
+    let mut values = Vec::new();
+    for argument in &arguments.0 {
+        let (kind, value) = match argument {
+            rustc_public::ty::GenericArgKind::Lifetime(_) => continue,
+            rustc_public::ty::GenericArgKind::Type(ty) => {
+                (CompilerGenericArgumentKind::Type, canonical_type(*ty, 0)?)
+            }
+            rustc_public::ty::GenericArgKind::Const(value) => (
+                CompilerGenericArgumentKind::Constant,
+                canonical_type_const(value, 0)?,
+            ),
+        };
+        validate_text(&value)?;
+        values.push(CompilerGenericArgument { kind, value });
+    }
+    Ok(values)
+}
+
+fn canonical_generic_arguments(
+    arguments: &rustc_public::ty::GenericArgs,
+    depth: usize,
+) -> Result<String> {
+    let mut values = Vec::new();
+    for argument in &arguments.0 {
+        match argument {
+            rustc_public::ty::GenericArgKind::Lifetime(_) => {}
+            rustc_public::ty::GenericArgKind::Type(ty) => {
+                values.push(format!("type:{}", canonical_type(*ty, depth + 1)?));
+            }
+            rustc_public::ty::GenericArgKind::Const(value) => {
+                values.push(format!("const:{}", canonical_type_const(value, depth + 1)?));
+            }
+        }
+    }
+    Ok(values.join(","))
+}
+
+fn canonical_type(ty: Ty, depth: usize) -> Result<String> {
+    if depth > MAX_TYPE_DEPTH {
+        bail!("compiler instance type exceeds its nesting depth limit");
+    }
+    let value = match ty.kind() {
+        TyKind::Param(value) => format!("param:{}:{}", value.index, value.name),
+        TyKind::Bound(index, value) => format!("bound:{index}:{}", value.var),
+        TyKind::Alias(kind, value) => format!(
+            "alias:{}:{}<{}>",
+            canonical_alias_name(kind),
+            value.def_id.name(),
+            canonical_generic_arguments(&value.args, depth + 1)?
+        ),
+        TyKind::RigidTy(rigid) => match rigid {
+            RigidTy::Bool => "bool".to_owned(),
+            RigidTy::Char => "char".to_owned(),
+            RigidTy::Int(value) => canonical_int_name(value).to_owned(),
+            RigidTy::Uint(value) => canonical_uint_name(value).to_owned(),
+            RigidTy::Float(value) => canonical_float_name(value).to_owned(),
+            RigidTy::Adt(definition, arguments) => format!(
+                "adt:{}<{}>",
+                definition.name(),
+                canonical_generic_arguments(&arguments, depth + 1)?
+            ),
+            RigidTy::Foreign(definition) => format!("foreign:{}", definition.name()),
+            RigidTy::Str => "str".to_owned(),
+            RigidTy::Array(element, count) => format!(
+                "array:{};{}",
+                canonical_type(element, depth + 1)?,
+                canonical_type_const(&count, depth + 1)?
+            ),
+            RigidTy::Pat(base, _) => format!("pattern:{}", canonical_type(base, depth + 1)?),
+            RigidTy::Slice(element) => {
+                format!("slice:{}", canonical_type(element, depth + 1)?)
+            }
+            RigidTy::RawPtr(element, mutability) => format!(
+                "raw_ptr:{}:{}",
+                mutability_name(mutability),
+                canonical_type(element, depth + 1)?
+            ),
+            RigidTy::Ref(_, element, mutability) => {
+                format!(
+                    "ref:{}:{}",
+                    mutability_name(mutability),
+                    canonical_type(element, depth + 1)?
+                )
+            }
+            RigidTy::FnDef(definition, arguments) => format!(
+                "fn:{}<{}>",
+                definition.name(),
+                canonical_generic_arguments(&arguments, depth + 1)?
+            ),
+            RigidTy::FnPtr(signature) => {
+                let signature = signature.value;
+                let mut values = signature
+                    .inputs()
+                    .iter()
+                    .map(|ty| canonical_type(*ty, depth + 1))
+                    .collect::<Result<Vec<_>>>()?;
+                values.push(canonical_type(signature.output(), depth + 1)?);
+                format!(
+                    "fn_ptr:{}:{}:{}:{}",
+                    canonical_safety_name(signature.safety),
+                    canonical_abi_name(&signature.abi),
+                    signature.c_variadic,
+                    values.join(",")
+                )
+            }
+            RigidTy::Closure(definition, arguments) => format!(
+                "closure:{}<{}>",
+                definition.name(),
+                canonical_generic_arguments(&arguments, depth + 1)?
+            ),
+            RigidTy::Coroutine(definition, arguments) => format!(
+                "coroutine:{}<{}>",
+                definition.name(),
+                canonical_generic_arguments(&arguments, depth + 1)?
+            ),
+            RigidTy::CoroutineClosure(definition, arguments) => format!(
+                "coroutine_closure:{}<{}>",
+                definition.name(),
+                canonical_generic_arguments(&arguments, depth + 1)?
+            ),
+            RigidTy::Dynamic(predicates, _) => {
+                let mut values = Vec::new();
+                for predicate in predicates {
+                    let value = match predicate.value {
+                        rustc_public::ty::ExistentialPredicate::Trait(value) => format!(
+                            "trait:{}<{}>",
+                            value.def_id.name(),
+                            canonical_generic_arguments(&value.generic_args, depth + 1)?
+                        ),
+                        rustc_public::ty::ExistentialPredicate::Projection(value) => format!(
+                            "projection:{}<{}>",
+                            value.def_id.name(),
+                            canonical_generic_arguments(&value.generic_args, depth + 1)?
+                        ),
+                        rustc_public::ty::ExistentialPredicate::AutoTrait(value) => {
+                            format!("auto:{}", value.name())
+                        }
+                    };
+                    values.push(value);
+                }
+                values.sort();
+                format!("dynamic:{}", values.join("+"))
+            }
+            RigidTy::Never => "never".to_owned(),
+            RigidTy::Tuple(values) => format!(
+                "tuple:{}",
+                values
+                    .into_iter()
+                    .map(|ty| canonical_type(ty, depth + 1))
+                    .collect::<Result<Vec<_>>>()?
+                    .join(",")
+            ),
+            RigidTy::CoroutineWitness(definition, arguments) => format!(
+                "coroutine_witness:{}<{}>",
+                definition.name(),
+                canonical_generic_arguments(&arguments, depth + 1)?
+            ),
+        },
+    };
+    validate_text(&value)?;
+    Ok(value)
+}
+
+fn canonical_alias_name(value: rustc_public::ty::AliasKind) -> &'static str {
+    match value {
+        rustc_public::ty::AliasKind::Projection => "projection",
+        rustc_public::ty::AliasKind::Inherent => "inherent",
+        rustc_public::ty::AliasKind::Opaque => "opaque",
+        rustc_public::ty::AliasKind::Free => "free",
+    }
+}
+
+fn canonical_safety_name(value: rustc_public::mir::Safety) -> &'static str {
+    match value {
+        rustc_public::mir::Safety::Safe => "safe",
+        rustc_public::mir::Safety::Unsafe => "unsafe",
+    }
+}
+
+fn canonical_abi_name(value: &rustc_public::ty::Abi) -> String {
+    use rustc_public::ty::Abi;
+
+    let unwind = |name: &str, unwind: bool| format!("{name}:unwind={unwind}");
+    match value {
+        Abi::Rust => "rust".to_owned(),
+        Abi::C { unwind: value } => unwind("c", *value),
+        Abi::Cdecl { unwind: value } => unwind("cdecl", *value),
+        Abi::Stdcall { unwind: value } => unwind("stdcall", *value),
+        Abi::Fastcall { unwind: value } => unwind("fastcall", *value),
+        Abi::Vectorcall { unwind: value } => unwind("vectorcall", *value),
+        Abi::Thiscall { unwind: value } => unwind("thiscall", *value),
+        Abi::Aapcs { unwind: value } => unwind("aapcs", *value),
+        Abi::Win64 { unwind: value } => unwind("win64", *value),
+        Abi::SysV64 { unwind: value } => unwind("sysv64", *value),
+        Abi::PtxKernel => "ptx_kernel".to_owned(),
+        Abi::Msp430Interrupt => "msp430_interrupt".to_owned(),
+        Abi::X86Interrupt => "x86_interrupt".to_owned(),
+        Abi::GpuKernel => "gpu_kernel".to_owned(),
+        Abi::EfiApi => "efi_api".to_owned(),
+        Abi::AvrInterrupt => "avr_interrupt".to_owned(),
+        Abi::AvrNonBlockingInterrupt => "avr_non_blocking_interrupt".to_owned(),
+        Abi::CCmseNonSecureCall => "ccmse_non_secure_call".to_owned(),
+        Abi::CCmseNonSecureEntry => "ccmse_non_secure_entry".to_owned(),
+        Abi::System { unwind: value } => unwind("system", *value),
+        Abi::RustCall => "rust_call".to_owned(),
+        Abi::Unadjusted => "unadjusted".to_owned(),
+        Abi::RustCold => "rust_cold".to_owned(),
+        Abi::RiscvInterruptM => "riscv_interrupt_m".to_owned(),
+        Abi::RiscvInterruptS => "riscv_interrupt_s".to_owned(),
+        Abi::RustPreserveNone => "rust_preserve_none".to_owned(),
+        Abi::RustTail => "rust_tail".to_owned(),
+        Abi::RustInvalid => "rust_invalid".to_owned(),
+        Abi::Custom => "custom".to_owned(),
+        Abi::Swift => "swift".to_owned(),
+    }
+}
+
+fn canonical_int_name(value: IntTy) -> &'static str {
+    match value {
+        IntTy::Isize => "isize",
+        IntTy::I8 => "i8",
+        IntTy::I16 => "i16",
+        IntTy::I32 => "i32",
+        IntTy::I64 => "i64",
+        IntTy::I128 => "i128",
+    }
+}
+
+fn canonical_uint_name(value: UintTy) -> &'static str {
+    match value {
+        UintTy::Usize => "usize",
+        UintTy::U8 => "u8",
+        UintTy::U16 => "u16",
+        UintTy::U32 => "u32",
+        UintTy::U64 => "u64",
+        UintTy::U128 => "u128",
+    }
+}
+
+fn canonical_float_name(value: rustc_public::ty::FloatTy) -> &'static str {
+    match value {
+        rustc_public::ty::FloatTy::F16 => "f16",
+        rustc_public::ty::FloatTy::F32 => "f32",
+        rustc_public::ty::FloatTy::F64 => "f64",
+        rustc_public::ty::FloatTy::F128 => "f128",
+    }
+}
+
+fn canonical_type_const(value: &rustc_public::ty::TyConst, depth: usize) -> Result<String> {
+    if depth > MAX_TYPE_DEPTH {
+        bail!("compiler instance constant exceeds its nesting depth limit");
+    }
+    Ok(match value.kind() {
+        TyConstKind::Param(value) => format!("param:{}:{}", value.index, value.name),
+        TyConstKind::Bound(index, variable) => format!("bound:{index}:{variable}"),
+        TyConstKind::Unevaluated(definition, arguments) => format!(
+            "unevaluated:{}<{}>",
+            definition.name(),
+            canonical_generic_arguments(arguments, depth + 1)?
+        ),
+        TyConstKind::Value(ty, allocation) => format!(
+            "value:{}:{}",
+            canonical_type(*ty, depth + 1)?,
+            allocation
+                .read_uint()
+                .map(|value| value.to_string())
+                .or_else(|_| allocation.read_int().map(|value| value.to_string()))
+                .context("compiler instance constant value is not a scalar")?
+        ),
+        TyConstKind::ZSTValue(ty) => format!("zero_sized:{}", canonical_type(*ty, depth + 1)?),
+    })
+}
+
+fn extract_instance_calls(
+    _caller: Instance,
+    caller_instance_id: &str,
+    body: &Body,
+    workspace: &Path,
+    cargo_home: &Path,
+) -> Result<Vec<PendingCall>> {
+    let fn_pointer_candidates = collect_fn_pointer_candidates(body)?;
+    let mut calls = Vec::new();
+    for (block_index, block) in body.blocks.iter().enumerate() {
+        let block_ordinal =
+            u32::try_from(block_index).context("call graph block ordinal overflowed")?;
+        let operation_ordinal = u32::try_from(block.statements.len())
+            .context("call graph operation ordinal overflowed")?;
+        let span = convert_span(
+            block.terminator.source_info.span,
+            workspace,
+            cargo_home,
+            None,
+        )
+        .ok();
+        match &block.terminator.kind {
+            TerminatorKind::Call { func, .. } => {
+                let ty = func.ty(body.locals()).ok().map(|ty| ty.kind());
+                let call = match ty {
+                    Some(TyKind::RigidTy(RigidTy::FnDef(definition, arguments))) => {
+                        match Instance::resolve(definition, &arguments) {
+                            Ok(target)
+                                if matches!(target.kind, PublicInstanceKind::Virtual { .. }) =>
+                            {
+                                unknown_call(
+                                    caller_instance_id,
+                                    block_ordinal,
+                                    operation_ordinal,
+                                    span,
+                                    CompilerCallReason::VirtualDispatch,
+                                )
+                            }
+                            Ok(target) => resolved_call(
+                                caller_instance_id,
+                                block_ordinal,
+                                operation_ordinal,
+                                span,
+                                target,
+                            ),
+                            Err(_) => unknown_call(
+                                caller_instance_id,
+                                block_ordinal,
+                                operation_ordinal,
+                                span,
+                                CompilerCallReason::UnresolvedInstance,
+                            ),
+                        }
+                    }
+                    Some(TyKind::RigidTy(RigidTy::FnPtr(_))) => {
+                        let targets = operand_local(func)
+                            .and_then(|local| fn_pointer_candidates.get(&local))
+                            .cloned()
+                            .unwrap_or_default();
+                        if targets.is_empty() {
+                            unknown_call(
+                                caller_instance_id,
+                                block_ordinal,
+                                operation_ordinal,
+                                span,
+                                CompilerCallReason::FnPointerUnbounded,
+                            )
+                        } else {
+                            candidate_call(
+                                caller_instance_id,
+                                block_ordinal,
+                                operation_ordinal,
+                                span,
+                                targets,
+                            )
+                        }
+                    }
+                    _ => unknown_call(
+                        caller_instance_id,
+                        block_ordinal,
+                        operation_ordinal,
+                        span,
+                        CompilerCallReason::UnsupportedCallee,
+                    ),
+                };
+                calls.push(call);
+            }
+            TerminatorKind::Drop { place, .. } => {
+                if let Ok(ty) = place.ty(body.locals()) {
+                    let target = Instance::resolve_drop_in_place(ty);
+                    if !target.is_empty_shim() {
+                        calls.push(resolved_call(
+                            caller_instance_id,
+                            block_ordinal,
+                            operation_ordinal,
+                            span,
+                            target,
+                        ));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(calls)
+}
+
+fn collect_fn_pointer_candidates(body: &Body) -> Result<HashMap<usize, Vec<Instance>>> {
+    let mut candidates = HashMap::<usize, Vec<Instance>>::new();
+    for _ in 0..=body.blocks.len() {
+        let mut changed = false;
+        for block in &body.blocks {
+            for statement in &block.statements {
+                let StatementKind::Assign(destination, rvalue) = &statement.kind else {
+                    continue;
+                };
+                if !destination.projection.is_empty() {
+                    continue;
+                }
+                let values = match rvalue {
+                    Rvalue::Cast(_, operand, _) | Rvalue::Use(operand, _) => {
+                        operand_fn_pointer_candidates(operand, body, &candidates)?
+                    }
+                    _ => Vec::new(),
+                };
+                let entry = candidates.entry(destination.local).or_default();
+                for value in values {
+                    if !entry.contains(&value) {
+                        entry.push(value);
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    Ok(candidates)
+}
+
+fn operand_fn_pointer_candidates(
+    operand: &Operand,
+    body: &Body,
+    candidates: &HashMap<usize, Vec<Instance>>,
+) -> Result<Vec<Instance>> {
+    if let TyKind::RigidTy(RigidTy::FnDef(definition, arguments)) =
+        operand.ty(body.locals())?.kind()
+    {
+        return Ok(Instance::resolve_for_fn_ptr(definition, &arguments)
+            .ok()
+            .into_iter()
+            .collect());
+    }
+    Ok(operand_local(operand)
+        .and_then(|local| candidates.get(&local))
+        .cloned()
+        .unwrap_or_default())
+}
+
+fn operand_local(operand: &Operand) -> Option<usize> {
+    match operand {
+        Operand::Copy(place) | Operand::Move(place) if place.projection.is_empty() => {
+            Some(place.local)
+        }
+        Operand::Copy(_) | Operand::Move(_) | Operand::Constant(_) | Operand::RuntimeChecks(_) => {
+            None
+        }
+    }
+}
+
+fn resolved_call(
+    caller_instance_id: &str,
+    block_ordinal: u32,
+    operation_ordinal: u32,
+    span: Option<Span>,
+    target: Instance,
+) -> PendingCall {
+    PendingCall {
+        caller_instance_id: caller_instance_id.to_owned(),
+        block_ordinal,
+        operation_ordinal,
+        relation: CompilerCallRelation::Calls,
+        resolution: CompilerCallResolution::Resolved,
+        evidence: CompilerCallEvidence::Observed,
+        targets: vec![target],
+        span,
+        reason_code: None,
+    }
+}
+
+fn candidate_call(
+    caller_instance_id: &str,
+    block_ordinal: u32,
+    operation_ordinal: u32,
+    span: Option<Span>,
+    targets: Vec<Instance>,
+) -> PendingCall {
+    PendingCall {
+        caller_instance_id: caller_instance_id.to_owned(),
+        block_ordinal,
+        operation_ordinal,
+        relation: CompilerCallRelation::MayCall,
+        resolution: CompilerCallResolution::Candidate,
+        evidence: CompilerCallEvidence::Candidate,
+        targets,
+        span,
+        reason_code: None,
+    }
+}
+
+fn unknown_call(
+    caller_instance_id: &str,
+    block_ordinal: u32,
+    operation_ordinal: u32,
+    span: Option<Span>,
+    reason: CompilerCallReason,
+) -> PendingCall {
+    PendingCall {
+        caller_instance_id: caller_instance_id.to_owned(),
+        block_ordinal,
+        operation_ordinal,
+        relation: CompilerCallRelation::MayCall,
+        resolution: CompilerCallResolution::UnknownTarget,
+        evidence: CompilerCallEvidence::Unknown,
+        targets: Vec::new(),
+        span,
+        reason_code: Some(reason),
     }
 }
 

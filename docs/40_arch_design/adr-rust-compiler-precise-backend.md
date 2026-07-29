@@ -227,6 +227,18 @@ The stable graph/store compatibility unit is the versioned DTO and canonical
 graph conversion, not rustc's internal Rust types. No `rustc_private` type
 crosses the child process boundary.
 
+The first compatibility unit's reviewed private bridge is limited to
+`rustc_middle::ty::tls::with`,
+`TyCtxt::collect_and_partition_mono_items(())`, `CodegenUnit::items()`, and
+exhaustive classification of `rustc_middle::mono::MonoItem` plus
+`rustc_middle::ty::{InstanceKind, ShimKind}`. Each item is immediately converted
+with `rustc_public::rustc_internal::stable`; the bridge returns only public
+`Instance`/`StaticDef` values and its own closed classification enums. It
+contains no `unsafe`, rejects global assembly as unrepresented, and relies on
+exhaustive matches plus the pinned nightly build to fail closed on compiler API
+drift. Adding any query, private type, fallback string representation, or
+`unsafe` operation requires the security review gate below.
+
 ## Failure and rollback
 
 The following outcomes fail closed with no partial promotion:
