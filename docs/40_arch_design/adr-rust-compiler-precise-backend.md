@@ -140,6 +140,15 @@ code trusted and is not represented as a sandbox guarantee. Local execution
 may report network isolation as `best-effort`; release and hostile-fixture CI
 must use an outer environment that reports it as `enforced`.
 
+Issue #248 implements that enforced environment as
+`linux-bubblewrap-v1`: the child receives new user, mount, IPC, PID, network,
+and UTS namespaces, a read-only staged workspace and compiler pack, and only
+run-owned writable directories. The original checkout, store, parent private
+paths, and host network are not mounted. The executable must be root-owned and
+non-writable, and its version and digest are recorded in the
+[`compiler-precise-hostile-e2e-v1`](../50_test/compiler-precise-hostile-e2e.md)
+evidence.
+
 The child environment starts from `env_clear`. It contains only versioned
 allowlisted values and run-specific home/cache/output paths. Secret values and
 secret-like keys are absent. Project settings that can choose executables or
@@ -298,6 +307,9 @@ closed-tree tamper tests, unsafe/internal API inventory, hostile fixtures,
 resource-limit tests, platform isolation statement, redaction review, and
 rollback drill. Until those artifacts pass, doctor reports the backend as
 `unsupported` or `experimental`; release metadata may not claim it as stable.
+The hostile execution, isolation, redaction, and rollback evidence is maintained
+in
+[`docs/50_test/compiler-precise-hostile-e2e.md`](../50_test/compiler-precise-hostile-e2e.md).
 
 ## Staged implementation and acceptance matrix
 
@@ -312,7 +324,7 @@ separately reviewable vertical increment.
 | Typed MIR DTO vertical slice | 2-3 days | Emit and validate local function/closure/async typed MIR, canonical places/types/constants, source correlation, bounds, and deterministic DTO; no call promotion yet | Wrapper ledger |
 | Monomorphized item and call slice | 2-3 days | Represent functions, generic instances, shims, drop glue, and exact/candidate/unknown calls without raw compiler IDs | Typed MIR |
 | Atomic graph promotion and query/export | 2-3 days | Union build-phase observed nodes/sites/edges; support doctor/why/JSON/DOT/Mermaid; preserve safe evidence and profile separation | Instance slice |
-| Hostile execution and rollback E2E | 2-3 days | Exercise build script/proc macro, malicious config/wrapper, artifact escape/tamper, ICE/crash/timeout/cancel, secret non-leakage, and last-snapshot preservation under enforced CI isolation | Promotion |
+| Hostile execution and rollback E2E (implemented in #248) | 2-3 days | Exercise build script/proc macro, malicious config/wrapper, artifact escape/tamper, ICE/crash/timeout/cancel, secret non-leakage, and last-snapshot preservation under enforced CI isolation | Promotion |
 | Five-target release gate | 2-3 days | Linux/macOS x64/arm64 and Windows x64 packs pass extraction, attestation, semantic fixture, determinism, benchmark, SBOM/license, aggregate compatibility, and rollback gates | Hostile E2E |
 
 The typed MIR vertical slice uses an independently attested

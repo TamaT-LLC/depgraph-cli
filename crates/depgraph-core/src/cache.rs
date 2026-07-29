@@ -378,7 +378,7 @@ fn is_cache_scannable_entry(entry: &DirEntry) -> bool {
     }
     !matches!(
         entry.file_name().to_string_lossy().as_ref(),
-        ".git" | ".hg" | ".svn"
+        ".git" | ".hg" | ".svn" | ".depgraph"
     )
 }
 
@@ -491,6 +491,28 @@ mod tests {
         let changed = fingerprint_inventory(second.path(), None).unwrap();
         assert_ne!(first_fingerprint.all, changed.all);
         assert_eq!(first_fingerprint.manifests, changed.manifests);
+    }
+
+    #[test]
+    fn inventory_identity_ignores_internal_compiler_pack_state() {
+        let checkout = tempfile::tempdir().unwrap();
+        fs::create_dir(checkout.path().join("src")).unwrap();
+        fs::write(checkout.path().join("src/lib.rs"), "pub fn fixture() {}\n").unwrap();
+        let before = fingerprint_inventory(checkout.path(), None).unwrap();
+
+        let pack = checkout.path().join(".depgraph/compiler-pack");
+        fs::create_dir_all(&pack).unwrap();
+        fs::write(
+            pack.join("manifest.json"),
+            r#"{"schema_version":"hostile-safe-scan-canary"}"#,
+        )
+        .unwrap();
+        fs::write(pack.join("cargo"), b"armed project-local executable").unwrap();
+        let after = fingerprint_inventory(checkout.path(), None).unwrap();
+
+        assert_eq!(before.all, after.all);
+        assert_eq!(before.manifests, after.manifests);
+        assert_eq!(before.generated, after.generated);
     }
 
     #[test]

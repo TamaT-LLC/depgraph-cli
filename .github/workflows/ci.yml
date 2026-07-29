@@ -60,6 +60,35 @@ jobs:
       - run: pnpm check
       - run: pnpm test
 
+  compiler-precise-hostile:
+    runs-on: ubuntu-24.04
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: rustup toolchain install 1.93.1 --profile minimal
+      - run: rustup default 1.93.1
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24.18.0
+      - name: Install the enforced Linux namespace boundary
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends bubblewrap
+      - name: Populate the locked dependency cache before network isolation
+        run: cargo fetch --locked
+      - name: Compiler-precise hostile execution and rollback E2E
+        env:
+          DEPGRAPH_COMPILER_HOSTILE_REPORT: dist/compiler-precise-hostile-e2e.json
+        run: scripts/compiler-precise-hostile-e2e.sh
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: compiler-precise-hostile-${{ github.sha }}
+          path: dist/compiler-precise-hostile-e2e.json
+          if-no-files-found: error
+
   benchmark:
     needs: [rust, go, web]
     runs-on: ubuntu-24.04
