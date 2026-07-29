@@ -839,9 +839,12 @@ fn supervisor_environment(
                 .to_string_lossy()
                 .into_owned(),
         );
-        environment.insert("RUSTC_WRAPPER".to_owned(), String::new());
+        let rustc_wrapper = compiler_pack
+            .map(|pack| pack.wrapper_path.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        environment.insert("RUSTC_WRAPPER".to_owned(), rustc_wrapper.clone());
         environment.insert("RUSTC_WORKSPACE_WRAPPER".to_owned(), String::new());
-        environment.insert("CARGO_BUILD_RUSTC_WRAPPER".to_owned(), String::new());
+        environment.insert("CARGO_BUILD_RUSTC_WRAPPER".to_owned(), rustc_wrapper);
         environment.insert(
             "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER".to_owned(),
             String::new(),
@@ -1382,6 +1385,31 @@ mod tests {
         fs::create_dir(&project)?;
         fs::write(project.join("input"), b"fixture")?;
         let (requirement, tamper_path) = compiler_pack_fixture(&temp)?;
+        let verified = verify_compiler_pack(&requirement)?;
+        let run = BuildRunDirectories::create()?;
+        let environment = supervisor_environment(
+            &project,
+            &run,
+            "cargo",
+            Some(&verified.rustc_path),
+            Some(&verified),
+        )?;
+        assert_eq!(
+            environment.get("RUSTC_WRAPPER").map(String::as_str),
+            Some(verified.wrapper_path.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            environment
+                .get("CARGO_BUILD_RUSTC_WRAPPER")
+                .map(String::as_str),
+            Some(verified.wrapper_path.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            environment
+                .get("RUSTC_WORKSPACE_WRAPPER")
+                .map(String::as_str),
+            Some("")
+        );
         let mut plan = BuildExecutionPlan {
             adapter: "compiler-pack-fixture".to_owned(),
             adapter_version: "1.0".to_owned(),
