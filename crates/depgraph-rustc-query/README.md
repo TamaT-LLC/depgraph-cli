@@ -26,3 +26,24 @@ The attested wrapper supplies the exact compiler-library search path when it
 starts this executable. The stable parent treats every emitted DTO as
 compromised-capable child output and validates it independently before keeping
 the result as audit-only evidence.
+
+## Reviewed internal API inventory
+
+`src/rustc_private_bridge.rs` is the complete private compiler surface. For the
+pinned rustc commit it uses only:
+
+- `rustc_middle::ty::tls::with` to access the callback's active `TyCtxt`;
+- `TyCtxt::collect_and_partition_mono_items(())` and
+  `CodegenUnit::items()` to obtain compiler-selected mono items;
+- `rustc_middle::mono::MonoItem` plus exhaustive
+  `rustc_middle::ty::{InstanceKind, ShimKind}` matches to classify every
+  supported private variant; and
+- `rustc_public::rustc_internal::stable` to convert each value immediately to
+  `rustc_public::mir::mono::{Instance, StaticDef}`.
+
+The bridge contains no `unsafe` block. It returns only public values and the
+small reviewed classification enums declared in that file; no `TyCtxt`,
+`DefId`, internal `Ty`, lifetime tied to the compiler context, or debug string
+leaves the module. Global assembly is counted and rejected because this DTO has
+no typed call-graph representation for it. Exhaustive matches and the exact
+nightly build make new or changed compiler variants fail closed at build time.
