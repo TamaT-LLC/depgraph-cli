@@ -3913,6 +3913,14 @@ export interface TypeScriptDependencyValidationSource {
   callSpans: readonly TypeScriptCallValidationSpan[];
 }
 
+export interface TypeScriptDependencyValidationTarget {
+  importTypeModuleSpans: Map<string, Array<{ startOffset: number; endOffset: number }>>;
+  moduleCallSpans: Map<string, TypeScriptModuleCallValidationSpan[]>;
+  nonLiteralModuleSpans: Map<string, TypeScriptNonLiteralModuleValidationSpan[]>;
+  typeUseSpans: Map<string, TypeScriptTypeUseValidationSpan[]>;
+  callSpans: Map<string, TypeScriptCallValidationSpan[]>;
+}
+
 export interface TypeScriptCallValidationSpan {
   startOffset: number;
   endOffset: number;
@@ -6604,11 +6612,20 @@ export async function extractTypeScriptRawDependencyDelta(
   sources: readonly TypeScriptSemanticSource[],
   definitions: TypeScriptRawDefinitionDelta,
   priorTypeCheckerQueries = 0,
+  validationTarget?: TypeScriptDependencyValidationTarget,
 ): Promise<TypeScriptRawDependencyDelta> {
   const counter: QueryCounter = { value: 0, prior: priorTypeCheckerQueries };
   const sites: TypeScriptRawDependencySite[] = [];
   const calls: TypeScriptRawCallSite[] = [];
   const issues: TypeScriptSemanticIssue[] = [];
+  const validationByPath = new Map(sources.map((source) => [source.relativePath, {
+    visited: new Set<string>(),
+    importTypeModules: new Map<string, { startOffset: number; endOffset: number }>(),
+    moduleCalls: new Map<string, TypeScriptModuleCallValidationSpan>(),
+    nonLiteralModules: new Map<string, TypeScriptNonLiteralModuleValidationSpan>(),
+    typeUses: new Map<string, TypeScriptTypeUseValidationSpan>(),
+    calls: new Map<string, TypeScriptCallValidationSpan>(),
+  }]));
   let astNodes = 0;
   try {
     const index = definitionIndex(definitions);
@@ -6618,8 +6635,215 @@ export async function extractTypeScriptRawDependencyDelta(
       astNodes += 1;
       if (astNodes > MAX_AST_NODES) throw new DependencyContractError(`dependency AST node limit ${MAX_AST_NODES} exceeded`);
     };
+    const collectValidation = async (node: Node, context: CollectionContext): Promise<void> => {
+      const validation = validationByPath.get(context.source.relativePath);
+      if (validation === undefined) {
+        throw new DependencyContractError(`dependency validation source disappeared for ${context.source.relativePath}`);
+      }
+      const sourceFile = context.source.sourceFile;
+      const validationKey = childTraversalKey(node, sourceFile);
+      if (validation.visited.has(validationKey)) return;
+      validation.visited.add(validationKey);
+      const addNonLiteral = (
+        moduleNode: Node,
+        descriptor: Omit<TypeScriptNonLiteralModuleValidationSpan,
+        | "startOffset"
+        | "endOffset"
+        | "moduleSpecifier"
+        | "bindingScope"> & { bindingScopeAnchor?: Node },
+      ): void => {
+        if (stringLiteralText(moduleNode) !== null) return;
+        const startOffset = nodeStart(moduleNode, sourceFile);
+        const endOffset = nodeEnd(moduleNode, sourceFile);
+        if (endOffset <= startOffset) return;
+        const occurrence: TypeScriptNonLiteralModuleValidationSpan = {
+          startOffset,
+          endOffset,
+          siteKind: descriptor.siteKind,
+          occurrenceKind: descriptor.occurrenceKind,
+          moduleSpecifier: moduleNode.getText(sourceFile),
+          importedName: descriptor.importedName,
+          bindingKind: descriptor.bindingKind,
+          bindingScope: descriptor.bindingScopeAnchor === undefined
+            ? null
+            : bindingScopeSpan(descriptor.bindingScopeAnchor),
+          typeOnly: descriptor.typeOnly,
+          resolutionMode: descriptor.resolutionMode,
+          resolutionModeProof: descriptor.resolutionModeProof,
+          resolutionModeError: descriptor.resolutionModeError,
+        };
+        validation.nonLiteralModules.set(JSON.stringify(occurrence), occurrence);
+      };
+      const addTypeUse = async (
+        typeName: Node | undefined,
+        occurrenceKind: TypeScriptTypeUseValidationSpan["occurrenceKind"],
+        inlineImportModule: Node | null = null,
+      ): Promise<void> => {
+        if (typeName === undefined) return;
+        const terminal = terminalIdentifier(typeName);
+        if (terminal === null) return;
+        const startOffset = nodeStart(terminal, sourceFile);
+        const endOffset = nodeEnd(terminal, sourceFile);
+        const symbol = await querySymbol(
+          checker,
+          terminal,
+          counter,
+          `validation type reference ${terminal.text}@${startOffset}:${endOffset}`,
+        );
+        if (symbol !== undefined && (symbol.flags & SymbolFlags.TypeParameter) !== 0) return;
+        if (endOffset <= startOffset) return;
+        const inlineImportModuleSpan = inlineImportModule === null
+          ? null
+          : nodeSpan(inlineImportModule, sourceFile);
+        const occurrence: TypeScriptTypeUseValidationSpan = {
+          startOffset,
+          endOffset,
+          occurrenceKind,
+          terminalName: terminal.text,
+          inlineImportModuleStartOffset: inlineImportModuleSpan?.startOffset ?? null,
+          inlineImportModuleEndOffset: inlineImportModuleSpan?.endOffset ?? null,
+        };
+        validation.typeUses.set(JSON.stringify(occurrence), occurrence);
+      };
+
+      if (context.syntacticallyValid) {
+        let importTypeModule: Node | undefined;
+        if (node.kind === SyntaxKind.ImportType) {
+          const argument = (node as ImportTypeNode).argument as Node & { readonly literal?: Node };
+          importTypeModule = argument.literal ?? argument;
+        } else if (node.kind === SyntaxKind.JSDocImportTag) {
+          importTypeModule = (node as JSDocImportTag).moduleSpecifier;
+        }
+        if (importTypeModule !== undefined) {
+          const startOffset = nodeStart(importTypeModule, sourceFile);
+          const endOffset = nodeEnd(importTypeModule, sourceFile);
+          if (endOffset > startOffset) {
+            validation.importTypeModules.set(`${startOffset}\0${endOffset}`, { startOffset, endOffset });
+          }
+        }
+
+        if (node.kind === SyntaxKind.ImportDeclaration) {
+          const declaration = node as ImportDeclaration;
+          const typeOnly = declaration.importClause?.phaseModifier === SyntaxKind.TypeKeyword;
+          const directive = resolutionModeForOccurrence(
+            resolutionModeDirective(declaration.attributes, typeOnly),
+            typeOnly,
+          );
+          addNonLiteral(declaration.moduleSpecifier, {
+            siteKind: "web_import",
+            occurrenceKind: "dynamic_import",
+            importedName: null,
+            bindingKind: null,
+            typeOnly,
+            resolutionMode: directive.mode,
+            resolutionModeProof: directive.proof ?? null,
+            resolutionModeError: directive.error,
+          });
+        } else if (node.kind === SyntaxKind.JSDocImportTag) {
+          const declaration = node as JSDocImportTag;
+          const directive = resolutionModeForOccurrence(
+            resolutionModeDirective(declaration.attributes, true),
+            true,
+          );
+          addNonLiteral(declaration.moduleSpecifier, {
+            siteKind: "web_import",
+            occurrenceKind: "import_type",
+            importedName: null,
+            bindingKind: null,
+            typeOnly: true,
+            resolutionMode: directive.mode,
+            resolutionModeProof: directive.proof ?? null,
+            resolutionModeError: directive.error,
+          });
+        } else if (node.kind === SyntaxKind.ExportDeclaration) {
+          const declaration = node as ExportDeclaration;
+          if (declaration.moduleSpecifier !== undefined) {
+            const directive = resolutionModeForOccurrence(
+              resolutionModeDirective(declaration.attributes, declaration.isTypeOnly),
+              declaration.isTypeOnly,
+            );
+            addNonLiteral(declaration.moduleSpecifier, {
+              siteKind: "web_reexport",
+              occurrenceKind: "export_star",
+              importedName: null,
+              bindingKind: null,
+              typeOnly: declaration.isTypeOnly,
+              resolutionMode: directive.mode,
+              resolutionModeProof: directive.proof ?? null,
+              resolutionModeError: directive.error,
+            });
+          }
+        } else if (node.kind === SyntaxKind.ImportEqualsDeclaration) {
+          const declaration = node as ImportEqualsDeclaration;
+          if (declaration.moduleReference.kind === SyntaxKind.ExternalModuleReference) {
+            const expression = (declaration.moduleReference as Node & { readonly expression: Node }).expression;
+            addNonLiteral(expression, {
+              siteKind: "web_import",
+              occurrenceKind: "import_equals",
+              importedName: "=",
+              bindingKind: "import_equals",
+              bindingScopeAnchor: expression,
+              typeOnly: declaration.isTypeOnly,
+              resolutionMode: null,
+              resolutionModeProof: null,
+              resolutionModeError: null,
+            });
+          }
+        }
+
+        if (node.kind === SyntaxKind.TypeReference) {
+          await addTypeUse((node as TypeReferenceNode).typeName, "type_reference");
+        } else if (node.kind === SyntaxKind.TypeQuery) {
+          await addTypeUse((node as TypeQueryNode).exprName, "type_reference");
+        } else if (node.kind === SyntaxKind.ExpressionWithTypeArguments) {
+          await addTypeUse((node as Node & { readonly expression: Node }).expression, "heritage_type");
+        } else if (node.kind === SyntaxKind.JSDocNameReference) {
+          await addTypeUse((node as Node & { readonly name: Node }).name, "jsdoc_type");
+        } else if (node.kind === SyntaxKind.ImportType) {
+          const importType = node as ImportTypeNode;
+          const argument = importType.argument as Node & { readonly literal?: Node };
+          await addTypeUse(importType.qualifier, "type_reference", argument.literal ?? argument);
+        }
+      }
+
+      if (
+        node.kind === SyntaxKind.CallExpression
+        || node.kind === SyntaxKind.NewExpression
+        || node.kind === SyntaxKind.TaggedTemplateExpression
+      ) {
+        const call = node as CallExpression | NewExpression | TaggedTemplateExpression;
+        let moduleLoader = false;
+        let isRequire = false;
+        if (call.kind === SyntaxKind.CallExpression) {
+          const callExpression = call as CallExpression;
+          const isDynamicImport = callExpression.expression.kind === SyntaxKind.ImportKeyword;
+          isRequire = callExpression.expression.kind === SyntaxKind.Identifier
+            && (callExpression.expression as Identifier).text === "require"
+            && !isLexicallyShadowedBinding(callExpression.expression, "require", true);
+          if (context.syntacticallyValid && isRequire) {
+            const symbol = await querySymbol(checker, callExpression.expression, counter, "validation require callee");
+            if (symbol !== undefined && !await isAmbientRequireSymbol(symbol, counter)) isRequire = false;
+          }
+          moduleLoader = isDynamicImport || isRequire;
+          if (context.syntacticallyValid && moduleLoader) {
+            const occurrence = moduleCallValidationOccurrence(callExpression, sourceFile, isRequire);
+            validation.moduleCalls.set(JSON.stringify(occurrence), occurrence);
+          }
+        }
+        if (!moduleLoader) {
+          const spanValue = nodeSpan(call, sourceFile);
+          const occurrence: TypeScriptCallValidationSpan = {
+            ...spanValue,
+            occurrenceKind: callOccurrenceKind(call) as TypeScriptCallValidationSpan["occurrenceKind"],
+            specifier: callSpecifier(call, sourceFile),
+          };
+          validation.calls.set(JSON.stringify(occurrence), occurrence);
+        }
+      }
+    };
     const visitDetachedJSDoc = async (node: Node, context: CollectionContext, depth: number): Promise<void> => {
       consumeAstNode(depth);
+      await collectValidation(node, context);
       if (node.kind === SyntaxKind.JSDocImportTag) {
         if (context.syntacticallyValid) {
           sites.push(...await collectJSDocImportTag(node as JSDocImportTag, context, checker, counter, index, sourcesByPath));
@@ -6637,6 +6861,7 @@ export async function extractTypeScriptRawDependencyDelta(
     };
     const visit = async (node: Node, context: CollectionContext, depth: number): Promise<void> => {
       consumeAstNode(depth);
+      await collectValidation(node, context);
       const semanticOwner = context.syntacticallyValid ? ownerAtNode(index, context.source, node) : null;
       const childContext = semanticOwner === null ? context : { ...context, owner: semanticOwner };
       if (!childContext.syntacticallyValid) {
@@ -6795,35 +7020,49 @@ export async function extractTypeScriptRawDependencyDelta(
         .filter((site) => site.bindingKind === "import_equals" && site.exportPath !== null)
         .map((site) => site.exportPath!),
     );
-    const validationSources: TypeScriptDependencyValidationSource[] = [];
-    for (const source of sources) {
-      const callQueryBudget = { value: counter.prior + counter.value };
-      const callSpans = await callValidationSpans(
-        checker,
-        source.sourceFile,
-        callQueryBudget,
-        source.syntacticallyValid,
-      );
-      counter.value = callQueryBudget.value - counter.prior;
-      validationSources.push({
-        relativePath: source.relativePath,
-        text: source.expectedText,
-        syntacticallyValid: source.syntacticallyValid,
-        importTypeModuleSpans: source.syntacticallyValid
-          ? importTypeModuleValidationSpans(source.sourceFile)
-          : [],
-        moduleCallSpans: source.syntacticallyValid
-          ? moduleCallValidationSpansFromSyntax(source.sourceFile)
-          : [],
-        nonLiteralModuleSpans: source.syntacticallyValid
-          ? nonLiteralModuleValidationSpans(source.sourceFile)
-          : [],
-        typeUseSpans: source.syntacticallyValid
-          ? await typeUseValidationSpansWithCounter(checker, source.sourceFile, counter)
-          : [],
-        callSpans,
+    const validationSources: TypeScriptDependencyValidationSource[] = [...sources]
+      .sort((left, right) => compareStrings(left.relativePath, right.relativePath))
+      .map((source) => {
+        const validation = validationByPath.get(source.relativePath);
+        if (validation === undefined) {
+          throw new DependencyContractError(`dependency validation source disappeared for ${source.relativePath}`);
+        }
+        const importTypeModuleSpans = [...validation.importTypeModules.values()].sort((left, right) => (
+          left.startOffset - right.startOffset || left.endOffset - right.endOffset
+        ));
+        const moduleCallSpans = sortModuleCallValidationSpans(validation.moduleCalls);
+        const nonLiteralModuleSpans = [...validation.nonLiteralModules.values()].sort((left, right) => (
+          left.startOffset - right.startOffset
+          || left.endOffset - right.endOffset
+          || compareStrings(left.occurrenceKind, right.occurrenceKind)
+        ));
+        const typeUseSpans = [...validation.typeUses.values()].sort((left, right) => (
+          left.startOffset - right.startOffset
+          || left.endOffset - right.endOffset
+          || compareStrings(left.occurrenceKind, right.occurrenceKind)
+        ));
+        const callSpans = [...validation.calls.values()].sort((left, right) => (
+          left.startOffset - right.startOffset
+          || left.endOffset - right.endOffset
+          || compareStrings(left.occurrenceKind, right.occurrenceKind)
+          || compareStrings(left.specifier, right.specifier)
+        ));
+        validationTarget?.importTypeModuleSpans.set(source.relativePath, importTypeModuleSpans);
+        validationTarget?.moduleCallSpans.set(source.relativePath, moduleCallSpans);
+        validationTarget?.nonLiteralModuleSpans.set(source.relativePath, nonLiteralModuleSpans);
+        validationTarget?.typeUseSpans.set(source.relativePath, typeUseSpans);
+        validationTarget?.callSpans.set(source.relativePath, callSpans);
+        return {
+          relativePath: source.relativePath,
+          text: source.expectedText,
+          syntacticallyValid: source.syntacticallyValid,
+          importTypeModuleSpans,
+          moduleCallSpans,
+          nonLiteralModuleSpans,
+          typeUseSpans,
+          callSpans,
+        };
       });
-    }
     const result = {
       sites: uniqueSites,
       calls: uniqueCalls,

@@ -64,3 +64,13 @@ test("analysis fingerprint tokenizes JSX with the JSX language variant", () => {
     analysisContentHash("export const View = () => <After />;\n", "src/view.tsx"),
   );
 });
+
+test("analysis fingerprint stays bounded across regular expressions", { timeout: 1_000 }, () => {
+  const baseline = "const heading = /^#\\s+/m;\n";
+  const edited = "const heading = /^##\\s+/m;\n";
+
+  assert.notEqual(
+    analysisContentHash(baseline, "src/value.ts"),
+    analysisContentHash(edited, "src/value.ts"),
+  );
+});

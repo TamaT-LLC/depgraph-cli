@@ -13,6 +13,7 @@ import {
   WEB_FRAMEWORK_SEMANTIC_PROFILE_PROPERTIES,
   WEB_SEMANTIC_RELEASE_CAPABILITIES,
 } from "./framework-semantic";
+import { StderrProgressReporter } from "./progress";
 import { scan } from "./scanner";
 import {
   TYPESCRIPT_COMPILER_PROFILE_PROPERTIES,
@@ -332,8 +333,14 @@ async function main(): Promise<void> {
       );
       return;
     }
+    const progress = new StderrProgressReporter();
+    progress.start("filesystem_inventory");
     const inventory = await inventoryFiles(root);
-    const model = await scan(root, inventory.files, inventory.issues);
+    progress.complete("filesystem_inventory", {
+      inventory_files: inventory.files.length,
+      inventory_issues: inventory.issues.length,
+    });
+    const model = await scan(root, inventory.files, inventory.issues, progress);
     await writeEvents(deltaRequest === null
       ? eventsFor(model, root, options.scanId)
       : deltaEventsFor(model, deltaRequest));

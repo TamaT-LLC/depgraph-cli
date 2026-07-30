@@ -3183,6 +3183,68 @@ test("workspace metadata and generated routes cannot be read through out-of-root
   assert.deepEqual(normalize(withExternalGitLink.events), normalize(withoutGit.events));
 });
 
+test("188-file Next safe scan stays within the product target on regular expressions", { timeout: 35_000 }, async (context) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "depgraph-web-next-performance-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  const sourceRoot = path.join(root, "src");
+  const appRoot = path.join(sourceRoot, "app");
+  const libraryRoot = path.join(sourceRoot, "lib");
+  const marker = path.join(root, "NEXT_CONFIG_EXECUTED");
+  await Promise.all([
+    mkdir(appRoot, { recursive: true }),
+    mkdir(libraryRoot, { recursive: true }),
+  ]);
+
+  const moduleCount = 187;
+  const modules = Array.from({ length: moduleCount }, (_, index) => {
+    const current = String(index).padStart(3, "0");
+    const next = String(index + 1).padStart(3, "0");
+    const importLine = index + 1 < moduleCount
+      ? `import { value${next} } from "./m${next}.js";\n`
+      : "";
+    const value = index + 1 < moduleCount ? `value${next} + 1` : "1";
+    const regex = index === 0
+      ? "export const headingPattern = /^#\\s+/m;\n"
+      : "";
+    return writeFile(
+      path.join(libraryRoot, `m${current}.ts`),
+      `${importLine}${regex}export const value${current} = ${value};\n`,
+    );
+  });
+  await Promise.all([
+    ...modules,
+    writeFile(path.join(root, "package.json"), `${JSON.stringify({
+      name: "next-performance-fixture",
+      version: "1.0.0",
+      private: true,
+      dependencies: { next: "16.2.10" },
+    }, null, 2)}\n`),
+    writeFile(
+      path.join(root, "next.config.mjs"),
+      `import { writeFileSync } from "node:fs";\nwriteFileSync(${JSON.stringify(marker)}, "executed");\nexport default {};\n`,
+    ),
+    writeFile(
+      path.join(appRoot, "page.tsx"),
+      "import { value000 } from \"../lib/m000.js\";\nexport default function Page() { return <main>{value000}</main>; }\n",
+    ),
+  ]);
+
+  const startedAt = performance.now();
+  const result = await run("next-performance", root);
+  const elapsedMilliseconds = performance.now() - startedAt;
+  const completed = result.events.at(-1);
+  assert.ok(elapsedMilliseconds < 30_000, `safe scan took ${elapsedMilliseconds.toFixed(1)}ms`);
+  assert.equal(completed?.event, "scan_completed");
+  assert.ok(completed?.coverage.files_analyzed >= 188);
+  assert.ok(completed?.coverage.dependency_sites >= 187);
+  assert.equal(completed?.coverage.project_code_executed, false);
+  assert.match(
+    result.stderr,
+    /depgraph-progress phase=syntax_preextraction status=completed/u,
+  );
+  await assert.rejects(import("node:fs/promises").then(({ stat }) => stat(marker)));
+});
+
 test("worker reports usage errors on stderr without protocol output", async () => {
   await assert.rejects(
     execute(process.execPath, [worker, "--scan-id", "missing-root"]),
