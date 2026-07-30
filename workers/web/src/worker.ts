@@ -1,6 +1,6 @@
 import { readFile, realpath, stat } from "node:fs/promises";
 import path from "node:path";
-import { inventoryFiles, readUtf8 } from "./fs";
+import { inventoryFiles, inventoryFilesFromManifest, readUtf8 } from "./fs";
 import { stableId } from "./ids";
 import {
   deltaEventsFor,
@@ -35,6 +35,7 @@ interface Options {
   root: string;
   scanId: string;
   deltaRequest: string | null;
+  inventoryFile: string | null;
 }
 
 interface VersionOptions {
@@ -97,6 +98,7 @@ function parseArgs(args: string[]): Options | VersionOptions {
   let root: string | null = null;
   let scanId: string | null = null;
   let deltaRequest: string | null = null;
+  let inventoryFile: string | null = null;
   for (let index = 0; index < args.length; index += 1) {
     const argument = args[index];
     if (argument === "--root") {
@@ -114,9 +116,14 @@ function parseArgs(args: string[]): Options | VersionOptions {
       if (!value) throw new UsageError("--delta-request requires a path");
       deltaRequest = path.resolve(value);
       index += 1;
+    } else if (argument === "--inventory-file") {
+      const value = args[index + 1];
+      if (!value) throw new UsageError("--inventory-file requires a path");
+      inventoryFile = path.resolve(value);
+      index += 1;
     } else if (argument === "--help" || argument === "-h") {
       throw new UsageError(
-        "usage: depgraph-web-worker --root <path> --scan-id <id> [--delta-request <path>]",
+        "usage: depgraph-web-worker --root <path> --scan-id <id> [--inventory-file <path>] [--delta-request <path>]",
       );
     } else {
       throw new UsageError(`unknown argument: ${argument ?? ""}`);
@@ -124,10 +131,10 @@ function parseArgs(args: string[]): Options | VersionOptions {
   }
   if (!root || !scanId) {
     throw new UsageError(
-      "usage: depgraph-web-worker --root <path> --scan-id <id> [--delta-request <path>]",
+      "usage: depgraph-web-worker --root <path> --scan-id <id> [--inventory-file <path>] [--delta-request <path>]",
     );
   }
-  return { root: path.resolve(root), scanId, deltaRequest };
+  return { root: path.resolve(root), scanId, deltaRequest, inventoryFile };
 }
 
 function eventsFor(model: ScanModel, root: string, scanId: string): ProtocolEvent[] {
@@ -335,7 +342,9 @@ async function main(): Promise<void> {
     }
     const progress = new StderrProgressReporter();
     progress.start("filesystem_inventory");
-    const inventory = await inventoryFiles(root);
+    const inventory = options.inventoryFile === null
+      ? await inventoryFiles(root)
+      : await inventoryFilesFromManifest(root, options.inventoryFile);
     progress.complete("filesystem_inventory", {
       inventory_files: inventory.files.length,
       inventory_issues: inventory.issues.length,

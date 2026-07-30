@@ -22,7 +22,7 @@ use tokio::{
     process::Command,
     time::timeout,
 };
-use walkdir::{DirEntry, WalkDir};
+use walkdir::WalkDir;
 
 use crate::{
     BOUNDED_QUERY_RELEASE_SMOKE_FIXTURE_PATH, BOUNDED_QUERY_RELEASE_SMOKE_QUERY,
@@ -30,6 +30,7 @@ use crate::{
     RUST_SYSROOT_LICENSE_EXPRESSION, ReleaseCompatibilityHealth,
     cancellation::CancellationToken,
     config::{ProfileConfig, ScanConfig},
+    repository_inventory::{build_repository_file_inventory, write_repository_inventory_file},
     validate_cross_language_worker_protocol, verify_release_compatibility,
 };
 
@@ -274,18 +275,14 @@ fn select_worker_failure_kind(kinds: &[WorkerFailureKind]) -> Option<WorkerFailu
         .find(|candidate| kinds.contains(candidate))
 }
 
-pub fn detect_adapters(root: &Path, follow_symlinks: bool) -> Result<Vec<AdapterKind>> {
+pub fn detect_adapters(root: &Path, _follow_symlinks: bool) -> Result<Vec<AdapterKind>> {
     let mut detected = BTreeSet::new();
-    for entry in WalkDir::new(root)
-        .follow_links(follow_symlinks)
-        .into_iter()
-        .filter_entry(is_scannable_entry)
-    {
-        let entry = entry?;
-        if !entry.file_type().is_file() && !entry.file_type().is_symlink() {
-            continue;
-        }
-        match entry.file_name().to_string_lossy().as_ref() {
+    for relative in build_repository_file_inventory(root)?.paths {
+        match Path::new(&relative)
+            .file_name()
+            .and_then(OsStr::to_str)
+            .unwrap_or_default()
+        {
             "Cargo.toml" => {
                 detected.insert(AdapterKind::Rust);
             }
@@ -299,26 +296,6 @@ pub fn detect_adapters(root: &Path, follow_symlinks: bool) -> Result<Vec<Adapter
         }
     }
     Ok(detected.into_iter().collect())
-}
-
-fn is_scannable_entry(entry: &DirEntry) -> bool {
-    if !entry.file_type().is_dir() {
-        return true;
-    }
-    !matches!(
-        entry.file_name().to_string_lossy().as_ref(),
-        ".git"
-            | ".hg"
-            | ".svn"
-            | "node_modules"
-            | "target"
-            | "dist"
-            | "build"
-            | ".next"
-            | ".astro"
-            | ".turbo"
-            | ".cache"
-    )
 }
 
 pub fn locate_worker(adapter: AdapterKind) -> Result<WorkerSpec> {
@@ -1623,6 +1600,17 @@ where
     }
 
     let neutral_cwd = neutral_working_directory(root)?;
+    let repository_inventory_file = write_repository_inventory_file(root)?;
+    let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let inventory_parent = repository_inventory_file
+        .path()
+        .parent()
+        .context("repository inventory file has no parent")?
+        .canonicalize()
+        .context("failed to canonicalize repository inventory directory")?;
+    if inventory_parent.starts_with(&canonical_root) {
+        bail!("security policy violation: repository inventory file is inside the scan root");
+    }
     let mut delta_request_file = None;
     if let Some(request) = delta_request {
         request.validate().context("invalid worker delta request")?;
@@ -1654,6 +1642,8 @@ where
         .arg(root)
         .arg("--scan-id")
         .arg(scan_id)
+        .arg("--inventory-file")
+        .arg(repository_inventory_file.path())
         .current_dir(&neutral_cwd.path)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

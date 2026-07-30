@@ -177,6 +177,55 @@ func TestScanWorkspaceFixture(t *testing.T) {
 	}
 }
 
+func TestScanWithInventoryExcludesIgnoredNestedWorkspace(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, ".branches", "feature"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	files := map[string]string{
+		"go.mod":                         "module example.test/inventory\n\ngo 1.26\n",
+		"main.go":                        "package inventory\n\nfunc Kept() {}\n",
+		".branches/feature/go.mod":       "module example.test/ignored\n\ngo 1.26\n",
+		".branches/feature/generated.go": "package ignored\n\nfunc Ignored() {}\n",
+		".branches/feature/generated.s":  "TEXT ·Ignored(SB),$0-0\nRET\n",
+	}
+	for relative, contents := range files {
+		absolute := filepath.Join(root, filepath.FromSlash(relative))
+		if err := os.MkdirAll(filepath.Dir(absolute), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(absolute, []byte(contents), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	inventoryFile := filepath.Join(t.TempDir(), "inventory.json")
+	inventory, err := json.Marshal(repositoryInventoryDocument{
+		ContractVersion: repositoryInventoryContractVersion,
+		Paths:           []string{"go.mod", "main.go"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(inventoryFile, inventory, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := ScanWithInventory(root, inventoryFile)
+	if err != nil {
+		t.Fatalf("ScanWithInventory() error = %v", err)
+	}
+	serialized, err := json.Marshal(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(serialized, []byte(".branches")) || bytes.Contains(serialized, []byte("example.test/ignored")) {
+		t.Fatalf("ignored nested workspace entered the graph: %s", serialized)
+	}
+	if result.Coverage.FilesAnalyzed == 0 {
+		t.Fatalf("tracked source was not analyzed: %+v", result.Coverage)
+	}
+}
+
 func TestSiblingModulesRequireGoWorkOrLocalReplaceForResolution(t *testing.T) {
 	tests := []struct {
 		name      string

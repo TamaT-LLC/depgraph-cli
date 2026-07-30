@@ -16,6 +16,7 @@ depgraph-protocol = { path = "../depgraph-protocol" }
 depgraph-store = { path = "../depgraph-store" }
 directories.workspace = true
 hex.workspace = true
+ignore.workspace = true
 libc.workspace = true
 notify.workspace = true
 petgraph.workspace = true

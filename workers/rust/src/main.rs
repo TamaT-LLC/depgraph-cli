@@ -16,6 +16,8 @@ struct Args {
     root: PathBuf,
     #[arg(long)]
     scan_id: String,
+    #[arg(long)]
+    inventory_file: Option<PathBuf>,
 }
 
 fn main() {
@@ -38,7 +40,12 @@ fn run() -> Result<()> {
         anyhow::bail!("--scan-id requires a non-empty identifier");
     }
 
-    let result = scan(&args.root)?;
+    let result = match args.inventory_file {
+        Some(inventory_file) => {
+            depgraph_rust_worker::scan_with_inventory_file(&args.root, &inventory_file)?
+        }
+        None => scan(&args.root)?,
+    };
     let events = build_events(&args.scan_id, &result)?;
     let stdout = std::io::stdout();
     let mut writer = BufWriter::new(stdout.lock());

@@ -5,7 +5,6 @@ use depgraph_protocol::stable_id_from_value;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use walkdir::{DirEntry, WalkDir};
 
 use crate::bounded_query::read_bounded_repository_file;
 use crate::profile_selection_plan::profile_planning_file_content_affects_profiles;
@@ -14,6 +13,7 @@ use crate::profile_selection_web::{
     WebProfilePlanningInput, WebRejectedProfileDeclaration, WebStaticProfileEvidence,
     generate_web_profile_candidates,
 };
+use crate::repository_inventory::build_repository_file_inventory;
 use crate::{
     AutomaticProfileSelectionRequest, Config, DEFAULT_PROFILE_SELECTION_CONTRACT_VERSION,
     DefaultProfileSelectionPlan, GoAutomaticBoundaryKind, GoHostContext, GoProfileAvailability,
@@ -255,24 +255,15 @@ pub fn build_repository_profile_planning_inventory(
     let mut build_units = Vec::new();
     let mut total_bytes = 0_usize;
     let mut entry_count = 0_usize;
-    for entry in WalkDir::new(&canonical_root)
-        .follow_links(false)
-        .into_iter()
-        .filter_entry(include_entry)
-    {
-        let entry = entry.context("failed to inspect repository profile inventory")?;
+    for path in build_repository_file_inventory(&canonical_root)?.paths {
         record_preview_entry(&mut entry_count)?;
-        if !entry.file_type().is_file() {
+        let absolute = canonical_root.join(&path);
+        if !std::fs::symlink_metadata(&absolute)
+            .with_context(|| format!("failed to inspect repository profile inventory file {path}"))?
+            .is_file()
+        {
             continue;
         }
-        let relative = entry
-            .path()
-            .strip_prefix(&canonical_root)
-            .context("profile inventory path escaped its root")?;
-        let path = relative
-            .to_str()
-            .context("profile inventory path is not UTF-8")?
-            .replace('\\', "/");
         let Some((kind, language)) = planning_file_kind(&path) else {
             continue;
         };
@@ -286,7 +277,7 @@ pub fn build_repository_profile_planning_inventory(
         };
         if profile_planning_file_content_affects_profiles(&file) {
             let bytes =
-                read_bounded_repository_file(&canonical_root, entry.path(), MAX_PREVIEW_FILE_BYTES)
+                read_bounded_repository_file(&canonical_root, &absolute, MAX_PREVIEW_FILE_BYTES)
                     .map_err(|error| {
                         anyhow::anyhow!("failed to read bounded profile inventory file: {error}")
                     })?;
@@ -537,19 +528,6 @@ fn evidence(path: &str) -> ProfileCandidateEvidence {
     }
 }
 
-fn include_entry(entry: &DirEntry) -> bool {
-    if entry.depth() == 0 {
-        return true;
-    }
-    if !entry.file_type().is_dir() {
-        return true;
-    }
-    !matches!(
-        entry.file_name().to_str(),
-        Some(".git" | ".depgraph" | "target" | "node_modules")
-    )
-}
-
 fn planning_file_kind(path: &str) -> Option<(ProfilePlanningFileKind, ProfileLanguage)> {
     if path.ends_with(".rs") || path.ends_with("Cargo.toml") {
         return Some((ProfilePlanningFileKind::RustSource, ProfileLanguage::Rust));
@@ -645,7 +623,7 @@ fn go_host_platform() -> Result<(&'static str, &'static str)> {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{fs, process::Command};
 
     use crate::{
         ProfileCandidateKind, ProfileExclusionReason, ProfileSelectedReason,
@@ -718,6 +696,98 @@ mod tests {
         assert_eq!(
             canonical_profile_selection_json(&first.plan),
             canonical_profile_selection_json(&second.plan)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ignored_worktrees_and_generated_outputs_do_not_change_the_plan() -> Result<()> {
+        if Command::new("git").arg("--version").output().is_err() {
+            return Ok(());
+        }
+        let root = tempfile::tempdir()?;
+        fs::create_dir_all(root.path().join("src"))?;
+        fs::create_dir_all(root.path().join("ignored"))?;
+        fs::write(
+            root.path().join(".gitignore"),
+            ".branches/\nignored/\n.next/\n",
+        )?;
+        fs::write(
+            root.path().join("package.json"),
+            "{\"name\":\"inventory-fixture\"}\n",
+        )?;
+        fs::write(root.path().join("src/app.ts"), "export const app = true;\n")?;
+        fs::write(
+            root.path().join("ignored/tracked.ts"),
+            "export const tracked = true;\n",
+        )?;
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(root.path())
+                .arg("init")
+                .status()?
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(root.path())
+                .args(["add", ".gitignore", "package.json", "src/app.ts"])
+                .status()?
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(root.path())
+                .args(["add", "-f", "ignored/tracked.ts"])
+                .status()?
+                .success()
+        );
+
+        let baseline = plan_repository_profiles(root.path(), &Config::default(), None)?;
+        fs::create_dir_all(root.path().join(".branches/feature/.next/dev/build/nested"))?;
+        fs::write(
+            root.path()
+                .join(".branches/feature/.next/dev/build/postcss.js"),
+            "generated\n",
+        )?;
+        fs::write(
+            root.path().join(".branches/feature/package.json"),
+            "{\"name\":\"ignored-worktree\"}\n",
+        )?;
+        fs::write(
+            root.path().join("ignored/untracked.ts"),
+            "export const ignored = true;\n",
+        )?;
+        let with_ignored = plan_repository_profiles(root.path(), &Config::default(), None)?;
+
+        assert_eq!(baseline.plan.plan_id, with_ignored.plan.plan_id);
+        assert_eq!(
+            baseline.plan.input.inventory_digest,
+            with_ignored.plan.input.inventory_digest
+        );
+        assert_eq!(
+            baseline.plan.input.repository.relevant_source_files,
+            with_ignored.plan.input.repository.relevant_source_files
+        );
+        assert_eq!(
+            baseline.plan.input.repository.build_units,
+            with_ignored.plan.input.repository.build_units
+        );
+        let inventory = build_repository_profile_planning_inventory(root.path())?;
+        assert!(
+            inventory
+                .files
+                .iter()
+                .any(|file| file.path == "ignored/tracked.ts")
+        );
+        assert!(
+            inventory
+                .files
+                .iter()
+                .all(|file| !file.path.starts_with(".branches/"))
         );
         Ok(())
     }
