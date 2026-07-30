@@ -5,6 +5,7 @@ use crate::{
         normalize_feature_map, normalize_path, package_feature_resolver, parse_packages,
         slash_path, workspace_cfg_profile_overrides_at, workspace_feature_resolver_at,
     },
+    toolchain::RustToolchainCommands,
 };
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -582,6 +583,7 @@ pub(crate) fn run_cargo_metadata(
     root: &Path,
     manifest_path: &Path,
     documents: &[ManifestDocument],
+    selected_toolchain: Option<&RustToolchainCommands>,
 ) -> Result<(CargoMetadata, LockIndex)> {
     let workspace_directory = CargoInputMirror::workspace_directory(root, manifest_path, documents)
         .context("resolve confined Cargo workspace inventory")?;
@@ -593,7 +595,16 @@ pub(crate) fn run_cargo_metadata(
     // rejected path-bearing input cannot reach `cargo metadata`.
     let mirror = CargoInputMirror::materialize(root, manifest_path, documents, lock.source())
         .context("preflight and materialize confined Cargo input")?;
-    let cargo = resolve_safe_tool("cargo", root)?;
+    let fallback_cargo;
+    let fallback_rustc;
+    let (cargo, rustc) = if let Some(toolchain) = selected_toolchain {
+        toolchain.verify_integrity()?;
+        (toolchain.cargo(), toolchain.rustc())
+    } else {
+        fallback_cargo = resolve_safe_tool("cargo", root)?;
+        fallback_rustc = resolve_safe_tool("rustc", root)?;
+        (fallback_cargo.as_path(), fallback_rustc.as_path())
+    };
     let cargo_cwd = neutral_cargo_working_directory(mirror.neutral_root())?;
     let mut command = Command::new(cargo);
     command
@@ -609,7 +620,7 @@ pub(crate) fn run_cargo_metadata(
         // Start at a checked filesystem anchor so neither project nor
         // temporary-directory ancestors can contribute configuration.
         .current_dir(cargo_cwd);
-    configure_cargo_safety_environment(&mut command);
+    configure_cargo_safety_environment(&mut command, rustc);
     let safe_path = sanitized_path(root)?;
     command.env("PATH", safe_path);
     configure_path_environment(&mut command, root, mirror.neutral_root())?;
@@ -626,6 +637,9 @@ pub(crate) fn run_cargo_metadata(
         command.env("SystemRoot", system_root);
     }
     let output = command.output().context("start cargo metadata")?;
+    if let Some(toolchain) = selected_toolchain {
+        toolchain.verify_integrity()?;
+    }
     if !output.status.success() {
         bail!("cargo metadata exited unsuccessfully");
     }
@@ -655,7 +669,7 @@ fn neutral_cargo_working_directory(neutral: &Path) -> Result<PathBuf> {
     Ok(anchor)
 }
 
-fn configure_cargo_safety_environment(command: &mut Command) {
+fn configure_cargo_safety_environment(command: &mut Command, rustc: &Path) {
     command
         .env_clear()
         .env("CARGO_NET_OFFLINE", "true")
@@ -663,7 +677,7 @@ fn configure_cargo_safety_environment(command: &mut Command) {
         // The resolved `cargo` can be a rustup proxy. Cargo's offline flag does
         // not prevent rustup from downloading an absent active toolchain.
         .env("RUSTUP_AUTO_INSTALL", "0")
-        .env("RUSTC", "rustc")
+        .env("RUSTC", rustc)
         .env("RUSTC_WRAPPER", "")
         .env("RUSTC_WORKSPACE_WRAPPER", "");
 }
@@ -848,7 +862,7 @@ mod tests {
     #[test]
     fn cargo_metadata_disables_rustup_auto_install() {
         let mut command = Command::new("cargo");
-        configure_cargo_safety_environment(&mut command);
+        configure_cargo_safety_environment(&mut command, Path::new("rustc"));
 
         let auto_install = command
             .get_envs()

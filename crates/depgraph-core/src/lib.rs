@@ -350,9 +350,9 @@ pub use profile_selection_plan::{
     profile_planning_build_unit_id, profile_selection_inventory_digest,
 };
 pub use profile_selection_preview::{
-    LegacyProfileConfigMigration, LegacyProfileMigrationStatus, RepositoryProfilePlanPreview,
-    build_repository_profile_planning_inventory, migrate_legacy_profile_config,
-    plan_repository_profiles,
+    LegacyProfileConfigMigration, LegacyProfileMigrationStatus, ProfileToolchainGuidance,
+    RepositoryProfilePlanPreview, build_repository_profile_planning_inventory,
+    migrate_legacy_profile_config, plan_repository_profiles,
 };
 pub use profile_selection_rank::{
     AutomaticProfileSelectionRequest, ProfileMatrixIncompleteReason, ProfileSelectionDoctorStatus,
@@ -463,6 +463,7 @@ pub struct DoctorReport {
     pub recent_cache_events: Vec<CacheEventRecord>,
     pub toolchains: BTreeMap<String, String>,
     pub supported_baselines: BTreeMap<String, String>,
+    pub toolchain_remediation: BTreeMap<String, String>,
     pub workers: Vec<WorkerHealth>,
     pub latest_attempt: Option<ScanHealth>,
     pub latest_successful_scan_id: Option<String>,
@@ -1038,6 +1039,8 @@ pub async fn doctor(store: &Store) -> Result<DoctorReport> {
             })
         })
         .transpose()?;
+    let toolchains = toolchain_versions(&root).await;
+    let toolchain_remediation = doctor_toolchain_remediation(&toolchains);
     Ok(DoctorReport {
         protocol_version: "1.0",
         graph_schema_version: "1.0",
@@ -1047,7 +1050,7 @@ pub async fn doctor(store: &Store) -> Result<DoctorReport> {
         impact_query_cache_contract_version: IMPACT_QUERY_CACHE_CONTRACT_VERSION,
         impact_query_cache_entries: store.impact_query_cache_entry_count()?,
         recent_cache_events: store.recent_cache_events(20)?,
-        toolchains: toolchain_versions(&root).await,
+        toolchains,
         supported_baselines: BTreeMap::from([
             ("rust".to_owned(), "1.93.1".to_owned()),
             ("go".to_owned(), "1.26.1".to_owned()),
@@ -1055,6 +1058,7 @@ pub async fn doctor(store: &Store) -> Result<DoctorReport> {
             ("pnpm".to_owned(), "10.33.0".to_owned()),
             ("typescript".to_owned(), "7.0.2".to_owned()),
         ]),
+        toolchain_remediation,
         workers,
         latest_attempt,
         latest_successful_scan_id: store.latest_successful_id()?,
@@ -1468,6 +1472,21 @@ async fn toolchain_versions(root: &Path) -> BTreeMap<String, String> {
     versions
 }
 
+fn doctor_toolchain_remediation(toolchains: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    let mut remediation = BTreeMap::new();
+    if toolchains
+        .get("rust")
+        .is_none_or(|version| !version.starts_with("rustc 1.93.1 "))
+    {
+        remediation.insert(
+            "rust".to_owned(),
+            "safe HIR automatically selects an already-installed verified Rust 1.93.1 pair; if it is unavailable, run `rustup toolchain install 1.93.1 --profile minimal --component rust-src`; depgraph never installs or switches toolchains automatically"
+                .to_owned(),
+        );
+    }
+    remediation
+}
+
 pub fn open_store(path: &Path) -> Result<Store> {
     Store::open(path)
 }
@@ -1478,14 +1497,14 @@ pub fn open_store_read_only(path: &Path) -> Result<Store> {
 
 #[cfg(test)]
 mod tests {
-    use std::{ffi::OsString, path::PathBuf};
+    use std::{collections::BTreeMap, ffi::OsString, path::PathBuf};
 
     use super::{
         AdapterKind, DoctorWorkerLocation, FRAMEWORK_BUILD_CONVERTER_ARTIFACT,
-        FRAMEWORK_BUILD_GATE_CONTRACT_VERSION, framework_build_capability_contract,
-        parse_release_manifest, parse_worker_handshake, preflight_doctor_workers,
-        release_compatibility_contract, suppressed_worker_health, verify_release_compatibility,
-        worker,
+        FRAMEWORK_BUILD_GATE_CONTRACT_VERSION, doctor_toolchain_remediation,
+        framework_build_capability_contract, parse_release_manifest, parse_worker_handshake,
+        preflight_doctor_workers, release_compatibility_contract, suppressed_worker_health,
+        verify_release_compatibility, worker,
     };
 
     fn test_worker_spec(adapter: AdapterKind) -> worker::WorkerSpec {
@@ -1501,6 +1520,27 @@ mod tests {
             release_attested: false,
             attested_rust_sysroot: None,
         }
+    }
+
+    #[test]
+    fn doctor_explains_the_installed_baseline_path_for_a_newer_host() {
+        let newer = BTreeMap::from([(
+            "rust".to_owned(),
+            "rustc 1.97.1 (8bab26f4f 2026-07-14)".to_owned(),
+        )]);
+        let remediation = doctor_toolchain_remediation(&newer);
+        let rust = remediation.get("rust").expect("Rust remediation");
+        assert!(rust.contains("automatically selects"));
+        assert!(
+            rust.contains("rustup toolchain install 1.93.1 --profile minimal --component rust-src")
+        );
+        assert!(rust.contains("never installs or switches"));
+
+        let baseline = BTreeMap::from([(
+            "rust".to_owned(),
+            "rustc 1.93.1 (01f6ddf75 2026-02-11)".to_owned(),
+        )]);
+        assert!(doctor_toolchain_remediation(&baseline).is_empty());
     }
 
     #[test]

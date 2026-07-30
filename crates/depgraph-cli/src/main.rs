@@ -1088,6 +1088,9 @@ async fn run(cli: Cli) -> Result<u8> {
                         .map(String::as_str)
                         .unwrap_or("best-effort");
                     println!("toolchain {toolchain}: {version} (baseline {baseline})");
+                    if let Some(remediation) = report.toolchain_remediation.get(&toolchain) {
+                        println!("toolchain {toolchain} remediation: {remediation}");
+                    }
                 }
                 for worker in report.workers {
                     if worker.available {
@@ -2158,6 +2161,10 @@ fn print_profile_plan(preview: &RepositoryProfilePlanPreview, json: bool) -> Res
     println!(
         "host contexts: {}",
         canonical_json(&serde_json::to_value(&plan.input.host_contexts)?)
+    );
+    println!(
+        "toolchain guidance: {}",
+        canonical_json(&serde_json::to_value(&preview.toolchain_guidance)?)
     );
     println!(
         "config migration: {}",

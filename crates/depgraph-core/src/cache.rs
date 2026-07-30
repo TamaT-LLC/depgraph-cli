@@ -19,6 +19,9 @@ use crate::{
 const CACHE_MAX_FILES: usize = 100_000;
 const CACHE_MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
 const CACHE_MAX_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
+const RUST_TOOLCHAIN_BASELINE: &str = "1.93.1";
+const RUSTC_BASELINE_COMMIT: &str = "01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf";
+const CARGO_BASELINE_COMMIT: &str = "083ac5135f967fd9dc906ab057a2315861c7a80d";
 
 #[derive(Debug, Clone)]
 pub(crate) struct ScanCachePlan {
@@ -492,14 +495,10 @@ fn fingerprint_toolchains(
     for (adapter, _) in workers {
         match adapter {
             AdapterKind::Rust => {
-                identities.insert(
-                    "cargo",
-                    tool_identity(root, "cargo", &["--version", "--verbose"])?,
-                );
-                identities.insert(
-                    "rustc",
-                    tool_identity(root, "rustc", &["--version", "--verbose"])?,
-                );
+                let (selection, rustc, cargo) = verified_rust_toolchain_identities(root)?;
+                identities.insert("rust-toolchain-selection", selection);
+                identities.insert("rustc", rustc);
+                identities.insert("cargo", cargo);
             }
             AdapterKind::Go => {
                 identities.insert("go", tool_identity(root, "go", &["version"])?);
@@ -514,8 +513,18 @@ fn fingerprint_toolchains(
 
 fn tool_identity(root: &Path, name: &str, arguments: &[&str]) -> Result<String, ()> {
     let program = resolve_safe_executable(name, root).map_err(|_| ())?;
+    tool_identity_at(root, name, &program, arguments).map(|(identity, _)| identity)
+}
+
+fn tool_identity_at(
+    root: &Path,
+    name: &str,
+    program: &Path,
+    arguments: &[&str],
+) -> Result<(String, Vec<u8>), ()> {
     let artifact = program.canonicalize().map_err(|_| ())?;
-    let artifact_digest = Sha256::digest(fs::read(artifact).map_err(|_| ())?);
+    let artifact_bytes = fs::read(&artifact).map_err(|_| ())?;
+    let artifact_digest = Sha256::digest(&artifact_bytes);
     let mut command = Command::new(program);
     command.args(arguments).env_clear();
     copy_safe_tool_environment(&mut command, root)?;
@@ -524,6 +533,9 @@ fn tool_identity(root: &Path, name: &str, arguments: &[&str]) -> Result<String, 
         || output.stdout.len() > 64 * 1024
         || output.stderr.len() > 64 * 1024
     {
+        return Err(());
+    }
+    if fs::read(&artifact).map_err(|_| ())? != artifact_bytes {
         return Err(());
     }
     let mut hasher = Sha256::new();
@@ -535,7 +547,153 @@ fn tool_identity(root: &Path, name: &str, arguments: &[&str]) -> Result<String, 
     hasher.update(&output.stdout);
     hasher.update(b"\0");
     hasher.update(&output.stderr);
-    Ok(finish_digest(hasher))
+    Ok((finish_digest(hasher), output.stdout))
+}
+
+fn verified_rust_toolchain_identities(root: &Path) -> Result<(String, String, String), ()> {
+    if let Ok((rustc, cargo)) = rustup_baseline_pair(root)
+        && let Ok((rustc_identity, rustc_output)) =
+            tool_identity_at(root, "rustc", &rustc, &["--version", "--verbose"])
+        && let Ok((cargo_identity, cargo_output)) =
+            tool_identity_at(root, "cargo", &cargo, &["--version", "--verbose"])
+        && verified_rust_version(&rustc_output, RUSTC_BASELINE_COMMIT)
+        && verified_rust_version(&cargo_output, CARGO_BASELINE_COMMIT)
+        && version_field(&rustc_output, "host") == version_field(&cargo_output, "host")
+        && rustup_pair_matches_attested_host(root, &rustc, &rustc_output)
+    {
+        return Ok((
+            "installed-verified-baseline".to_owned(),
+            rustc_identity,
+            cargo_identity,
+        ));
+    }
+
+    let rustc = resolve_safe_executable("rustc", root).map_err(|_| ())?;
+    let cargo = resolve_safe_executable("cargo", root).map_err(|_| ())?;
+    let (rustc_identity, rustc_output) =
+        tool_identity_at(root, "rustc", &rustc, &["--version", "--verbose"])?;
+    let (cargo_identity, cargo_output) =
+        tool_identity_at(root, "cargo", &cargo, &["--version", "--verbose"])?;
+    if !verified_rust_version(&rustc_output, RUSTC_BASELINE_COMMIT)
+        || !verified_rust_version(&cargo_output, CARGO_BASELINE_COMMIT)
+        || version_field(&rustc_output, "host") != version_field(&cargo_output, "host")
+    {
+        return Err(());
+    }
+    Ok(("host-default".to_owned(), rustc_identity, cargo_identity))
+}
+
+fn rustup_pair_matches_attested_host(root: &Path, rustc: &Path, output: &[u8]) -> bool {
+    let Some(rustup_home) = safe_rustup_home(root) else {
+        return false;
+    };
+    let Some(host) = version_field(output, "host") else {
+        return false;
+    };
+    rustup_toolchain_root(rustc, &rustup_home)
+        .ok()
+        .and_then(|path| path.file_name().map(ToOwned::to_owned))
+        .is_some_and(|name| name.to_string_lossy() == format!("{RUST_TOOLCHAIN_BASELINE}-{host}"))
+}
+
+fn rustup_baseline_pair(root: &Path) -> Result<(PathBuf, PathBuf), ()> {
+    let rustup = resolve_safe_executable("rustup", root).map_err(|_| ())?;
+    let rustup_home = safe_rustup_home(root).ok_or(())?;
+    let rustc = rustup_which(root, &rustup, &rustup_home, "rustc")?;
+    let cargo = rustup_which(root, &rustup, &rustup_home, "cargo")?;
+    if rustup_toolchain_root(&rustc, &rustup_home)? != rustup_toolchain_root(&cargo, &rustup_home)?
+    {
+        return Err(());
+    }
+    Ok((rustc, cargo))
+}
+
+fn safe_rustup_home(root: &Path) -> Option<PathBuf> {
+    std::env::var_os("RUSTUP_HOME")
+        .as_deref()
+        .and_then(|value| safe_external_directory_for_cache(root, value))
+        .or_else(|| {
+            ["HOME", "USERPROFILE"].into_iter().find_map(|key| {
+                std::env::var_os(key)
+                    .map(PathBuf::from)
+                    .map(|home| home.join(".rustup"))
+                    .filter(|path| path.is_dir())
+                    .and_then(|path| safe_external_directory_for_cache(root, path.as_os_str()))
+            })
+        })
+}
+
+fn safe_external_directory_for_cache(root: &Path, value: &std::ffi::OsStr) -> Option<PathBuf> {
+    let path = Path::new(value);
+    if !path.is_absolute() {
+        return None;
+    }
+    let canonical = path.canonicalize().ok()?;
+    (canonical.is_dir() && !canonical.starts_with(root)).then_some(canonical)
+}
+
+fn rustup_which(root: &Path, rustup: &Path, rustup_home: &Path, tool: &str) -> Result<PathBuf, ()> {
+    let mut command = Command::new(rustup);
+    command
+        .args(["which", "--toolchain", RUST_TOOLCHAIN_BASELINE, tool])
+        .env_clear();
+    copy_safe_tool_environment(&mut command, root)?;
+    command
+        .env("RUSTUP_AUTO_INSTALL", "0")
+        .env("RUSTUP_HOME", rustup_home);
+    let output = command.output().map_err(|_| ())?;
+    if !output.status.success()
+        || output.stdout.len() > 64 * 1024
+        || output.stderr.len() > 64 * 1024
+    {
+        return Err(());
+    }
+    let stdout = std::str::from_utf8(&output.stdout).map_err(|_| ())?;
+    let mut lines = stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty());
+    let path = PathBuf::from(lines.next().ok_or(())?);
+    if lines.next().is_some() || !path.is_absolute() {
+        return Err(());
+    }
+    let metadata = fs::symlink_metadata(&path).map_err(|_| ())?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(());
+    }
+    let path = path.canonicalize().map_err(|_| ())?;
+    rustup_toolchain_root(&path, rustup_home)?;
+    Ok(path)
+}
+
+fn rustup_toolchain_root(tool: &Path, rustup_home: &Path) -> Result<PathBuf, ()> {
+    let toolchains = rustup_home
+        .join("toolchains")
+        .canonicalize()
+        .map_err(|_| ())?;
+    let relative = tool.strip_prefix(&toolchains).map_err(|_| ())?;
+    let mut components = relative.components();
+    let toolchain = components.next().ok_or(())?;
+    let bin = components.next().ok_or(())?;
+    let executable = components.next().ok_or(())?;
+    if components.next().is_some() || bin.as_os_str() != "bin" || executable.as_os_str().is_empty()
+    {
+        return Err(());
+    }
+    Ok(toolchains.join(toolchain.as_os_str()))
+}
+
+fn verified_rust_version(output: &[u8], expected_commit: &str) -> bool {
+    version_field(output, "release") == Some(RUST_TOOLCHAIN_BASELINE)
+        && version_field(output, "commit-hash") == Some(expected_commit)
+        && version_field(output, "host").is_some_and(|host| !host.is_empty())
+}
+
+fn version_field<'a>(output: &'a [u8], key: &str) -> Option<&'a str> {
+    std::str::from_utf8(output).ok()?.lines().find_map(|line| {
+        let (candidate, value) = line.split_once(':')?;
+        (candidate.trim() == key).then(|| value.trim())
+    })
 }
 
 fn copy_safe_tool_environment(command: &mut Command, root: &Path) -> Result<(), ()> {
@@ -672,6 +830,20 @@ fn finish_digest(hasher: Sha256) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn semantic_cache_fingerprints_the_effective_verified_rust_pair() {
+        let root = tempfile::tempdir().unwrap();
+        let (selection, rustc, cargo) =
+            verified_rust_toolchain_identities(root.path()).expect("verified Rust baseline");
+        assert!(matches!(
+            selection.as_str(),
+            "installed-verified-baseline" | "host-default"
+        ));
+        assert!(rustc.starts_with("sha256:"));
+        assert!(cargo.starts_with("sha256:"));
+        assert_ne!(rustc, cargo);
+    }
 
     #[cfg(unix)]
     #[test]

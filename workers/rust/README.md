@@ -227,22 +227,24 @@ Their side effects are covered by the armed fixture under
 ## Toolchain compatibility
 
 The current verified Rust baseline is `1.93.1`. Syntax inventory remains
-best-effort outside that baseline. The worker probes the resolved system
-`rustc` and Cargo pair from a neutral environment and records whether it
-matches the exact baseline. The rust-analyzer revision is selected, the smoke
-scaffold and deterministic multi-file project model are available, and Cargo
-metadata input reads are confined. When those inputs are compatible, the HIR
-definition, import/re-export, type-use, and call graph is emitted. The final
-fallback/coverage matrix and Issue #30 package/release gate are complete. A
-verified sysroot is additionally required for exact standard-library
-resolution and `semantic-complete`. The packaged compatibility unit consumes
-only the source tree handed off by core after whole-tree verification and makes
-no implicit fallback.
+best-effort outside that baseline. The worker records the neutral host-default
+`rustc` and Cargo observation, but HIR eligibility does not depend on that
+default remaining pinned. It first asks Rustup for the already-installed exact
+`1.93.1` pair with `RUSTUP_AUTO_INSTALL=0`, confines both paths to the external
+Rustup toolchain store, and verifies release, commit, host, and executable
+SHA-256 before and after confined Cargo metadata. It falls back to the neutral
+host pair only when that pair itself is the exact baseline. No toolchain is
+downloaded or switched. The rust-analyzer revision is statically linked and
+attested, Cargo metadata input reads are confined, and the same effective pair
+identity participates in the semantic cache key. A verified bundled `rust-src`
+tree is additionally required for exact standard-library resolution and
+`semantic-complete`.
 
 | Project/toolchain state | Current result | Semantic completeness / release status |
 | --- | --- | --- |
 | Exact `1.93.1`, supported target, complete confined crate graph, and core-attested bundled sysroot | Static syntax graph plus HIR definitions, refined imports/re-exports/`extern crate`, `type_uses`, exact/candidate calls, and exact `std` / `core` / `alloc` targets | `semantic-complete` only with `syntax-complete`, exact compatible HIR, confined metadata, attested sysroot, `ready` / `emitted`, issue count `0`, and skipped / unsupported / candidates / external / unresolved all `0`; source/development runs retain syntax/local HIR but never promote an unattested sysroot |
-| No project toolchain declaration | The neutral probe decides eligibility; an exact compatible pair may emit the import/type/call graph | Eligible only when every effective input is the verified baseline and the completeness conditions hold |
+| No project toolchain declaration, newer host default, exact baseline already installed | The raw host observation remains visible, while the installed verified pair emits the import/type/call graph | Eligible when the effective pair and every other completeness input are verified |
+| No compatible installed or host-default pair | Static syntax graph with `RUST_HIR_TOOLCHAIN_UNSUPPORTED` and the exact `rustup toolchain install 1.93.1 --profile minimal --component rust-src` remediation | Syntax fallback; Rustup auto-install remains disabled |
 | Older, newer, or nightly declaration | `RUST_TOOLCHAIN_BEST_EFFORT`; static syntax graph | Syntax fallback; never `semantic-complete` |
 | Custom or malformed declaration, unreadable file, or external symlink | Static syntax graph with `RUST_TOOLCHAIN_INVALID` and `RUST_HIR_TOOLCHAIN_UNSUPPORTED` | Fail-closed syntax fallback; never HIR-eligible |
 | Cargo preflight rejects the input, mirror/DTO validation fails, or frozen/offline Cargo is unavailable | `CARGO_METADATA_FALLBACK`; static manifest, syntax graph, and file ledger are retained | Syntax fallback with a stable coverage reason; raw Cargo stderr and temporary paths are not exposed |
@@ -302,6 +304,9 @@ values are outcome-dependent; fallback paths retain the syntax-only values.
 | `rust_toolchain_baseline` | `1.93.1` |
 | `rust_toolchain_probe_status` | Raw neutral system probe: `compatible`, `unsupported`, or `unavailable` |
 | `rust_hir_toolchain_status` | Effective HIR gate after combining the raw probe and project declaration |
+| `rust_hir_toolchain_selection` | `installed-verified-baseline`, `host-default`, or fail-closed `unavailable` |
+| `rust_hir_toolchain_attestation` | Selection contract plus exact rustc/Cargo release, commit, host, and executable SHA-256; contains no absolute path |
+| `rust_hir_toolchain_remediation` | `null` when eligible; otherwise an executable install or declaration-repair action |
 | `rust_toolchain_declaration_status` | `absent`, `valid`, or fail-closed `invalid` |
 | `rust_toolchain_observed` | Sanitized observed `rustc` / Cargo versions, commits, and hosts, or a bounded failure reason |
 | `cargo_metadata_input` | `confined-mirror` |
@@ -380,8 +385,11 @@ whose entrypoint is optional. The current archive includes the pinned Rust
 `1.93.1` `rust-src` library tree at `libexec/rust-sysroot`, records its complete
 license/SBOM identity, and never searches for project or system replacements.
 
-An upgrade changes the Rust baseline, rust-analyzer revision, and any bundled
-sysroot as one compatibility unit. Before merging it must:
+An upgrade changes the Rust baseline, rustc/Cargo commit matrix,
+rust-analyzer revision, and bundled sysroot as one compatibility unit. Patch
+releases may add an exact stable row only with its full cross-platform
+attestation and fixtures; they never accept a release range or floating
+channel. Before merging an upgrade it must:
 
 1. pin exact dependency versions and record the upstream revision;
 2. build on every Tier 1 release target and the Windows package target;

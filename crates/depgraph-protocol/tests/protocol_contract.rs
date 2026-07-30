@@ -403,7 +403,6 @@ fn rust_semantic_completeness_requires_exact_backend_properties() {
         ),
         ("crate_graph_source", json!("static-manifest-fallback")),
         ("cargo_metadata_input", json!("project-cargo")),
-        ("rust_toolchain_probe_status", json!("unsupported")),
         ("rust_hir_toolchain_status", json!("unsupported")),
         ("proc_macro_expansion", json!("enabled")),
         ("build_script_policy", json!("enabled")),
@@ -421,6 +420,34 @@ fn rust_semantic_completeness_requires_exact_backend_properties() {
         assert!(
             matches!(error, ProtocolError::Invariant(message) if message.contains(property)),
             "Rust semantic completeness accepted invalid {property}"
+        );
+    }
+}
+
+#[test]
+fn rust_semantic_completeness_requires_exact_effective_toolchain_attestation() {
+    let cases: Vec<(Vec<&str>, Value)> = vec![
+        (
+            vec!["contract"],
+            json!("installed-verified-rust-toolchain-v0"),
+        ),
+        (vec!["status"], json!("unsupported")),
+        (vec!["rustc", "release"], json!("1.97.1")),
+        (vec!["rustc", "commit_hash"], json!("mismatch")),
+        (vec!["cargo", "commit_hash"], json!("mismatch")),
+        (vec!["cargo", "host"], json!("other-host")),
+        (vec!["rustc", "sha256"], json!("sha256:short")),
+    ];
+    for (path, replacement) in cases {
+        let mut events = rust_semantic_complete_values();
+        let mut value = &mut events[1]["profile"]["properties"]["rust_hir_toolchain_attestation"];
+        for component in &path[..path.len() - 1] {
+            value = &mut value[*component];
+        }
+        value[path[path.len() - 1]] = replacement;
+        let error = validate_ndjson(Cursor::new(values_to_ndjson(events))).unwrap_err();
+        assert!(
+            matches!(error, ProtocolError::Invariant(message) if message.contains("toolchain attestation") || message.contains("rustc/Cargo attestation"))
         );
     }
 }
@@ -1061,8 +1088,28 @@ fn rust_semantic_complete_values() -> Vec<Value> {
         "rust_hir_sysroot_source_layout": "rustup-rust-src-library-v1",
         "crate_graph_source": "confined-cargo-metadata",
         "cargo_metadata_input": "confined-mirror",
-        "rust_toolchain_probe_status": "compatible",
+        "rust_toolchain_probe_status": "unsupported",
         "rust_hir_toolchain_status": "compatible",
+        "rust_hir_toolchain_selection": "installed-verified-baseline",
+        "rust_hir_toolchain_attestation": {
+            "contract": "installed-verified-rust-toolchain-v1",
+            "selection": "installed-verified-baseline",
+            "status": "compatible",
+            "rustc": {
+                "command": "rustc 1.93.1",
+                "release": "1.93.1",
+                "commit_hash": "01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf",
+                "host": "test-host",
+                "sha256": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            },
+            "cargo": {
+                "command": "cargo 1.93.1",
+                "release": "1.93.1",
+                "commit_hash": "083ac5135f967fd9dc906ab057a2315861c7a80d",
+                "host": "test-host",
+                "sha256": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            }
+        },
         "proc_macro_expansion": "disabled",
         "build_script_policy": "disabled",
         "proc_macro_policy": "disabled",
