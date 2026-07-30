@@ -14,7 +14,10 @@ use tokio::task::{Id, JoinError, JoinSet};
 use uuid::Uuid;
 
 use crate::{
-    cache::{ScanCachePlan, ScanCachePreparation, prepare_scan_cache},
+    cache::{
+        CacheRejection, ScanCachePlan, ScanCachePreparation, prepare_scan_cache,
+        validate_scan_cache_hit_inputs,
+    },
     cancellation::CancellationToken,
     config::Config,
     policy::PolicyResult,
@@ -267,8 +270,8 @@ pub async fn run_scan_with_cache_mode_and_cancellation(
             store.database_path().as_deref(),
             &profile_plan.plan_id,
         ) {
-            ScanCachePreparation::Rejected(reason) => {
-                record_cache_rejection(store, &scan_id, reason)?;
+            ScanCachePreparation::Rejected(rejection) => {
+                record_cache_preparation_rejection(store, &scan_id, &rejection)?;
             }
             ScanCachePreparation::Ready(plan) => {
                 if let Some(semantic_key) = &plan.semantic {
@@ -308,55 +311,85 @@ pub async fn run_scan_with_cache_mode_and_cancellation(
                                 &cancellation,
                             );
                         }
-                        let cached_coverage = hit.coverage();
-                        if !config.policy.rules.is_empty()
-                            || (strict && violates_strict_policy(cached_coverage, config))
-                        {
-                            store.clone_completed_scan_into_staging(hit.snapshot_id(), &scan_id)?;
-                            return complete_scan(
-                                store,
-                                &scan_id,
-                                strict,
-                                config,
-                                None,
-                                &cancellation,
-                            );
-                        }
-                        let mut outcome = ScanOutcome {
-                            scan_id: scan_id.clone(),
-                            status: "completed".to_owned(),
-                            exit_code: 0,
-                            coverage: cached_coverage.clone(),
-                            diagnostics: hit.diagnostics().to_vec(),
-                            cache_events: Vec::new(),
-                            policy: None,
-                        };
-                        match promote_validated_scan_cache_hit_if_active(
-                            store,
-                            &scan_id,
-                            &hit,
-                            &cancellation,
-                        ) {
-                            Some(Ok(())) => {
-                                outcome.cache_events = store.cache_events_for_scan(&scan_id)?;
-                                return Ok(outcome);
+                        match validate_scan_cache_hit_inputs(&root, &plan) {
+                            Err(rejection) => {
+                                record_cache_preparation_rejection(store, &scan_id, &rejection)?;
                             }
-                            Some(Err(error)) => {
-                                tracing::warn!(
-                                    scan_id,
-                                    error = %error,
-                                    "validated semantic cache hit could not be promoted"
-                                );
-                                store.record_cache_event(
-                                    Some(&scan_id),
-                                    None,
-                                    CacheLayer::Semantic,
-                                    Some(&semantic_key.key),
-                                    "reject",
-                                    "promotion-proof-invalidated",
-                                )?;
+                            Ok(()) => {
+                                let cached_coverage = hit.coverage();
+                                let requires_full_validation = !config.policy.rules.is_empty()
+                                    || (strict && violates_strict_policy(cached_coverage, config));
+                                if requires_full_validation {
+                                    if plan.has_symlink_proofs() {
+                                        record_cache_rejection(
+                                            store,
+                                            &scan_id,
+                                            "symlink-cache-hit-policy-requires-rescan",
+                                        )?;
+                                    } else {
+                                        store.clone_completed_scan_into_staging(
+                                            hit.snapshot_id(),
+                                            &scan_id,
+                                        )?;
+                                        return complete_scan(
+                                            store,
+                                            &scan_id,
+                                            strict,
+                                            config,
+                                            None,
+                                            &cancellation,
+                                        );
+                                    }
+                                } else {
+                                    let mut outcome = ScanOutcome {
+                                        scan_id: scan_id.clone(),
+                                        status: "completed".to_owned(),
+                                        exit_code: 0,
+                                        coverage: cached_coverage.clone(),
+                                        diagnostics: hit.diagnostics().to_vec(),
+                                        cache_events: Vec::new(),
+                                        policy: None,
+                                    };
+                                    match promote_validated_scan_cache_hit_if_active(
+                                        store,
+                                        &scan_id,
+                                        &root,
+                                        &plan,
+                                        &hit,
+                                        &cancellation,
+                                    ) {
+                                        Some(Ok(())) => {
+                                            outcome.cache_events =
+                                                store.cache_events_for_scan(&scan_id)?;
+                                            return Ok(outcome);
+                                        }
+                                        Some(Err(error)) => {
+                                            if let Some(rejection) =
+                                                error.downcast_ref::<CacheRejection>()
+                                            {
+                                                record_cache_preparation_rejection(
+                                                    store, &scan_id, rejection,
+                                                )?;
+                                            } else {
+                                                tracing::warn!(
+                                                    scan_id,
+                                                    error = %error,
+                                                    "validated semantic cache hit could not be promoted"
+                                                );
+                                                store.record_cache_event(
+                                                    Some(&scan_id),
+                                                    None,
+                                                    CacheLayer::Semantic,
+                                                    Some(&semantic_key.key),
+                                                    "reject",
+                                                    "promotion-proof-invalidated",
+                                                )?;
+                                            }
+                                        }
+                                        None => return cancel_scan(store, &scan_id),
+                                    }
+                                }
                             }
-                            None => return cancel_scan(store, &scan_id),
                         }
                     }
                 } else {
@@ -652,10 +685,16 @@ pub(crate) fn cancel_scan(store: &mut Store, scan_id: &str) -> Result<ScanOutcom
 fn promote_validated_scan_cache_hit_if_active(
     store: &mut Store,
     scan_id: &str,
+    root: &Path,
+    plan: &ScanCachePlan,
     hit: &ValidatedScanCacheHit,
     cancellation: &CancellationToken,
 ) -> Option<Result<()>> {
-    cancellation.run_if_active(|| store.promote_validated_scan_cache_hit(scan_id, hit))
+    cancellation.run_if_active(|| {
+        store.promote_validated_scan_cache_hit_with_precommit(scan_id, hit, || {
+            validate_scan_cache_hit_inputs(root, plan).map_err(anyhow::Error::new)
+        })
+    })
 }
 
 pub(crate) fn complete_scan(
@@ -843,6 +882,26 @@ fn record_cache_rejection(store: &Store, scan_id: &str, reason: &str) -> Result<
     Ok(())
 }
 
+fn record_cache_preparation_rejection(
+    store: &mut Store,
+    scan_id: &str,
+    rejection: &CacheRejection,
+) -> Result<()> {
+    record_cache_rejection(store, scan_id, rejection.reason)?;
+    if let Some(path) = rejection.path.as_deref() {
+        add_core_diagnostic_at_path(
+            store,
+            scan_id,
+            "warning",
+            "cache-input-rejected",
+            &format!("scan cache input was rejected: {}", rejection.reason),
+            &format!("{}:{path}", rejection.reason),
+            path,
+        )?;
+    }
+    Ok(())
+}
+
 pub(crate) fn git_source_revision(root: &Path) -> Option<String> {
     let git = resolve_safe_executable("git", root).ok()?;
     let output = std::process::Command::new(git)
@@ -994,12 +1053,54 @@ fn add_core_diagnostic(
     message: &str,
     identity: &str,
 ) -> Result<()> {
+    add_core_diagnostic_inner(store, scan_id, severity, code, message, identity, None)
+}
+
+fn add_core_diagnostic_at_path(
+    store: &mut Store,
+    scan_id: &str,
+    severity: &str,
+    code: &str,
+    message: &str,
+    identity: &str,
+    path: &str,
+) -> Result<()> {
+    add_core_diagnostic_inner(
+        store,
+        scan_id,
+        severity,
+        code,
+        message,
+        identity,
+        Some(path),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn add_core_diagnostic_inner(
+    store: &mut Store,
+    scan_id: &str,
+    severity: &str,
+    code: &str,
+    message: &str,
+    identity: &str,
+    path: Option<&str>,
+) -> Result<()> {
     let mut hasher = Sha256::new();
     hasher.update(b"depgraph-core-diagnostic-v1\0");
     hasher.update(code.as_bytes());
     hasher.update(b"\0");
     hasher.update(identity.as_bytes());
     let id = format!("diagnostic:{}", hex::encode(hasher.finalize()));
+    let mut diagnostic = json!({
+        "id":id,
+        "severity":severity,
+        "code":code,
+        "message":message
+    });
+    if let Some(path) = path {
+        diagnostic["path"] = Value::String(path.to_owned());
+    }
     store.ingest_event(&json!({
         "event":"diagnostic",
         "protocol_version":"1.0",
@@ -1007,12 +1108,7 @@ fn add_core_diagnostic(
         "adapter":"core",
         "adapter_version":env!("CARGO_PKG_VERSION"),
         "seq":0,
-        "diagnostic":{
-            "id":id,
-            "severity":severity,
-            "code":code,
-            "message":message
-        }
+        "diagnostic":diagnostic
     }))
 }
 
@@ -1248,6 +1344,7 @@ mod tests {
             syntax: invalid_key,
             semantic: None,
             semantic_reject_reason: None,
+            symlink_proofs: Vec::new(),
         };
 
         let outcome = complete_scan(
@@ -1526,15 +1623,18 @@ mod tests {
         let cache_plan = match prepare_scan_cache(&root, &config, &[], None, &profile_plan.plan_id)
         {
             ScanCachePreparation::Ready(plan) => plan,
-            ScanCachePreparation::Rejected(reason) => {
-                anyhow::bail!("cache preparation unexpectedly rejected: {reason}")
+            ScanCachePreparation::Rejected(rejection) => {
+                anyhow::bail!(
+                    "cache preparation unexpectedly rejected: {}",
+                    rejection.reason
+                )
             }
         };
-        let semantic_key = cache_plan.semantic.context("semantic cache key")?;
+        let semantic_key = cache_plan.semantic.as_ref().context("semantic cache key")?;
 
         store.start_scan("cancelled-cache-hit", &root, false)?;
         let hit = store
-            .lookup_scan_cache(&cache_plan.syntax, &semantic_key, "cancelled-cache-hit")?
+            .lookup_scan_cache(&cache_plan.syntax, semantic_key, "cancelled-cache-hit")?
             .context("validated semantic cache hit")?;
         assert_eq!(hit.snapshot_id(), current);
         let cancellation = CancellationToken::new();
@@ -1544,6 +1644,8 @@ mod tests {
             promote_validated_scan_cache_hit_if_active(
                 &mut store,
                 "cancelled-cache-hit",
+                &root,
+                &cache_plan,
                 &hit,
                 &cancellation,
             )
@@ -1559,6 +1661,225 @@ mod tests {
             store.snapshot_id_for_source("scan", "cancelled-cache-hit")?,
             None
         );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlink_change_at_cache_hit_precommit_never_promotes() -> Result<()> {
+        use std::{fs, os::unix::fs::symlink};
+
+        let root = tempfile::tempdir()?;
+        fs::write(root.path().join("CLAUDE.md"), "first\n")?;
+        symlink("CLAUDE.md", root.path().join("WARP.md"))?;
+        let root = root.path().canonicalize()?;
+        let config = Config::default();
+        let mut store = Store::open_in_memory()?;
+        run_scan(&mut store, root.clone(), &config, false).await?;
+        let current = store.current_snapshot_id()?.context("current snapshot")?;
+        let profile_plan = plan_repository_profiles(&root, &config, None)?.plan;
+        let cache_plan = match prepare_scan_cache(&root, &config, &[], None, &profile_plan.plan_id)
+        {
+            ScanCachePreparation::Ready(plan) => plan,
+            ScanCachePreparation::Rejected(rejection) => {
+                anyhow::bail!(
+                    "cache preparation unexpectedly rejected: {}",
+                    rejection.reason
+                )
+            }
+        };
+        let semantic_key = cache_plan.semantic.as_ref().context("semantic cache key")?;
+        store.start_scan("changed-cache-hit", &root, false)?;
+        let hit = store
+            .lookup_scan_cache(&cache_plan.syntax, semantic_key, "changed-cache-hit")?
+            .context("validated semantic cache hit")?;
+        validate_scan_cache_hit_inputs(&root, &cache_plan).map_err(anyhow::Error::new)?;
+
+        fs::write(root.join("CLAUDE.md"), "other\n")?;
+        let promotion = promote_validated_scan_cache_hit_if_active(
+            &mut store,
+            "changed-cache-hit",
+            &root,
+            &cache_plan,
+            &hit,
+            &CancellationToken::new(),
+        )
+        .context("active promotion")?;
+        let error = promotion.unwrap_err();
+        assert!(error.downcast_ref::<CacheRejection>().is_some());
+        assert_eq!(
+            store.current_snapshot_id()?.as_deref(),
+            Some(current.as_str())
+        );
+        assert_eq!(store.scan("changed-cache-hit")?.unwrap().status, "staging");
+        assert_eq!(
+            store.snapshot_id_for_source("scan", "changed-cache-hit")?,
+            None
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn repository_internal_document_symlink_preserves_graph_and_cache_hits() -> Result<()> {
+        use std::{fs, os::unix::fs::symlink};
+
+        let baseline_root = tempfile::tempdir()?;
+        fs::write(baseline_root.path().join("CLAUDE.md"), "fixture\n")?;
+        let linked_root = tempfile::tempdir()?;
+        fs::write(linked_root.path().join("CLAUDE.md"), "fixture\n")?;
+        symlink("CLAUDE.md", linked_root.path().join("WARP.md"))?;
+        let mut store = Store::open_in_memory()?;
+
+        let baseline = run_scan(
+            &mut store,
+            baseline_root.path().to_path_buf(),
+            &Config::default(),
+            false,
+        )
+        .await?;
+        let linked_miss = run_scan(
+            &mut store,
+            linked_root.path().to_path_buf(),
+            &Config::default(),
+            false,
+        )
+        .await?;
+        let linked_hit = run_scan(
+            &mut store,
+            linked_root.path().to_path_buf(),
+            &Config::default(),
+            false,
+        )
+        .await?;
+
+        assert!(
+            linked_miss
+                .cache_events
+                .iter()
+                .any(|event| { event.layer == CacheLayer::Semantic && event.outcome == "stored" })
+        );
+        assert!(linked_hit.cache_events.iter().any(|event| {
+            event.layer == CacheLayer::Semantic
+                && event.outcome == "hit"
+                && event.reason == "validated"
+        }));
+        assert!(!linked_hit.coverage.project_code_executed);
+        let baseline_graph = store.load_snapshot(&baseline.scan_id)?;
+        let linked_graph = store.load_snapshot(&linked_miss.scan_id)?;
+        assert_eq!(baseline_graph.profiles, linked_graph.profiles);
+        assert_eq!(baseline_graph.nodes, linked_graph.nodes);
+        assert_eq!(baseline_graph.sites, linked_graph.sites);
+        assert_eq!(baseline_graph.edges, linked_graph.edges);
+        assert_eq!(baseline_graph.evidence, linked_graph.evidence);
+        assert_eq!(baseline_graph.diagnostics, linked_graph.diagnostics);
+        assert_eq!(baseline_graph.file_coverage, linked_graph.file_coverage);
+        assert_eq!(baseline_graph.adapter_logs, linked_graph.adapter_logs);
+        assert_eq!(baseline_graph.coverage, linked_graph.coverage);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlink_cache_hit_with_architecture_policy_uses_worker_rescan() -> Result<()> {
+        use std::{fs, os::unix::fs::symlink};
+
+        let root = tempfile::tempdir()?;
+        fs::write(root.path().join("CLAUDE.md"), "fixture\n")?;
+        symlink("CLAUDE.md", root.path().join("WARP.md"))?;
+        let policy = serde_json::from_value(json!({
+            "schema_version":"1.0",
+            "rules":[{
+                "id":"empty-forbidden-dependency",
+                "kind":"forbidden_dependency",
+                "severity":"warning",
+                "source":{
+                    "kind":"file","field":"path","match":"exact",
+                    "value":"missing/source.rs","cardinality":"many",
+                    "exclude":[],"scope":{"paths":[],"packages":[]}
+                },
+                "target":{
+                    "kind":"file","field":"path","match":"exact",
+                    "value":"missing/target.rs","cardinality":"many",
+                    "exclude":[],"scope":{"paths":[],"packages":[]}
+                },
+                "profiles":{"include":[],"exclude":[]},
+                "condition":{"op":"eq","key":"mode","value":"production"},
+                "precisions":["exact"],
+                "resolution_statuses":["resolved"],
+                "evidence":{"kinds":["source"],"minimum_spans":1,"primary_only":true}
+            }],
+            "suppressions":[]
+        }))?;
+        let config = Config {
+            policy,
+            ..Config::default()
+        };
+        let mut store = Store::open_in_memory()?;
+
+        run_scan(&mut store, root.path().to_path_buf(), &config, false).await?;
+        let rescanned = run_scan(&mut store, root.path().to_path_buf(), &config, false).await?;
+
+        assert_eq!(rescanned.status, "completed");
+        assert!(rescanned.cache_events.iter().any(|event| {
+            event.layer == CacheLayer::Semantic
+                && event.outcome == "hit"
+                && event.reason == "validated"
+        }));
+        assert_eq!(
+            rescanned
+                .cache_events
+                .iter()
+                .filter(|event| {
+                    event.outcome == "reject"
+                        && event.reason == "symlink-cache-hit-policy-requires-rescan"
+                })
+                .count(),
+            2
+        );
+        assert!(!rescanned.coverage.project_code_executed);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn root_out_symlink_rejection_reports_only_its_relative_path() -> Result<()> {
+        use std::{fs, os::unix::fs::symlink};
+
+        let root = tempfile::tempdir()?;
+        let outside = tempfile::tempdir()?;
+        let target = outside.path().join("outside.md");
+        fs::write(&target, "outside\n")?;
+        symlink(&target, root.path().join("WARP.md"))?;
+        let mut store = Store::open_in_memory()?;
+
+        let outcome = run_scan(
+            &mut store,
+            root.path().to_path_buf(),
+            &Config::default(),
+            false,
+        )
+        .await?;
+
+        assert_eq!(outcome.status, "completed");
+        assert!(!outcome.coverage.project_code_executed);
+        assert_eq!(
+            outcome
+                .cache_events
+                .iter()
+                .filter(|event| {
+                    event.outcome == "reject" && event.reason == "symlink-target-outside-root"
+                })
+                .count(),
+            2
+        );
+        let diagnostic = outcome
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "cache-input-rejected")
+            .context("cache rejection diagnostic")?;
+        assert_eq!(diagnostic.path.as_deref(), Some("WARP.md"));
+        assert!(!diagnostic.message.contains(&target.display().to_string()));
         Ok(())
     }
 

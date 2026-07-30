@@ -455,6 +455,17 @@ impl Store {
         scan_id: &str,
         hit: &ValidatedScanCacheHit,
     ) -> Result<()> {
+        self.promote_validated_scan_cache_hit_with_precommit(scan_id, hit, || Ok(()))
+    }
+
+    /// Publishes a validated cache hit only if the caller's final external
+    /// input proof still holds at the SQLite transaction's commit boundary.
+    pub fn promote_validated_scan_cache_hit_with_precommit(
+        &mut self,
+        scan_id: &str,
+        hit: &ValidatedScanCacheHit,
+        validate_before_commit: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
         let observed_data_version: i64 =
             self.connection
                 .query_row("PRAGMA data_version", [], |row| row.get(0))?;
@@ -517,6 +528,7 @@ impl Store {
             [scan_id],
         )?;
         promote_completed_snapshot(&tx, &hit.snapshot_id)?;
+        validate_before_commit().context("cache hit pre-commit validation failed")?;
         tx.commit()?;
         Ok(())
     }
@@ -1206,6 +1218,42 @@ mod tests {
                 && event.outcome == "hit"
                 && event.reason == "validated"
         }));
+    }
+
+    #[test]
+    fn cache_hit_precommit_failure_rolls_back_every_promotion_write() {
+        let root = tempfile::tempdir().unwrap();
+        let mut store = Store::open_in_memory().unwrap();
+        let snapshot_id = complete_fixture_scan(&mut store, "source", root.path());
+        let (syntax, semantic) = scan_cache_keys();
+        store
+            .store_snapshot_cache(&syntax, &snapshot_id, Some("source"), None)
+            .unwrap();
+        store
+            .store_snapshot_cache(&semantic, &snapshot_id, Some("source"), None)
+            .unwrap();
+
+        store.start_scan("target", root.path(), false).unwrap();
+        let hit = store
+            .lookup_scan_cache(&syntax, &semantic, "target")
+            .unwrap()
+            .expect("semantic cache hit");
+        let error = store
+            .promote_validated_scan_cache_hit_with_precommit("target", &hit, || {
+                anyhow::bail!("filesystem proof changed")
+            })
+            .unwrap_err();
+
+        assert!(error.to_string().contains("pre-commit validation failed"));
+        assert_eq!(store.scan("target").unwrap().unwrap().status, "staging");
+        assert_eq!(
+            store.snapshot_id_for_source("scan", "target").unwrap(),
+            None
+        );
+        assert_eq!(
+            store.current_snapshot_id().unwrap().as_deref(),
+            Some(snapshot_id.as_str())
+        );
     }
 
     #[test]
