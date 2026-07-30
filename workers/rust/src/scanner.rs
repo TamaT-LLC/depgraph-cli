@@ -2478,82 +2478,95 @@ impl State {
             .find(|part| !part.is_empty())
             .unwrap_or(specifier)
             .trim_start_matches("r#");
-        if !specifier.contains("::") {
-            if let Some(resolution) = self.resolve_syntax_type_path(
-                packages,
-                package_index,
-                specifier,
-                path,
-                inline_ancestors,
-                condition,
-            )? {
-                return Ok(resolution);
-            }
-            let matching_imports: Vec<_> = import_bindings
-                .iter()
-                .filter(|binding| {
-                    binding.local_name == first
-                        && binding.inline_ancestors == inline_ancestors
-                        && (binding.condition == Condition::default()
-                            || binding.condition == *condition)
-                })
-                .cloned()
-                .collect();
-            if !matching_imports.is_empty() {
-                let mut targets = BTreeSet::new();
-                let mut external_only = true;
-                for binding in matching_imports {
-                    if let Some(resolution) = self.resolve_syntax_type_path(
+        if let Some(resolution) = self.resolve_syntax_type_path(
+            packages,
+            package_index,
+            specifier,
+            path,
+            inline_ancestors,
+            condition,
+        )? {
+            return Ok(resolution);
+        }
+        let suffix = specifier
+            .split("::")
+            .filter(|part| !part.is_empty())
+            .skip(1)
+            .collect::<Vec<_>>()
+            .join("::");
+        let matching_imports: Vec<_> = import_bindings
+            .iter()
+            .filter(|binding| {
+                binding.local_name == first
+                    && binding.inline_ancestors == inline_ancestors
+                    && condition_implies(condition, &binding.condition)
+            })
+            .cloned()
+            .collect();
+        if !matching_imports.is_empty() {
+            let mut targets = BTreeSet::new();
+            let mut external_only = true;
+            for binding in matching_imports {
+                let imported_specifier = if suffix.is_empty() {
+                    binding.target_specifier.clone()
+                } else {
+                    format!(
+                        "{}::{suffix}",
+                        binding.target_specifier.trim_end_matches("::")
+                    )
+                };
+                if let Some(resolution) = self.resolve_syntax_type_path(
+                    packages,
+                    package_index,
+                    &imported_specifier,
+                    path,
+                    &binding.inline_ancestors,
+                    condition,
+                )? {
+                    external_only = false;
+                    targets.extend(resolution.target_ids);
+                } else {
+                    let resolution = self.resolve_rust_path(
                         packages,
                         package_index,
-                        &binding.target_specifier,
+                        &imported_specifier,
                         path,
                         &binding.inline_ancestors,
-                        condition,
-                    )? {
-                        external_only = false;
+                        binding.span,
+                    )?;
+                    if resolution.status == ResolutionStatus::External {
                         targets.extend(resolution.target_ids);
-                    } else {
-                        let resolution = self.resolve_rust_path(
-                            packages,
-                            package_index,
-                            &binding.target_specifier,
-                            path,
-                            &binding.inline_ancestors,
-                            binding.span,
-                        )?;
-                        if resolution.status == ResolutionStatus::External {
-                            targets.extend(resolution.target_ids);
-                        }
                     }
                 }
-                if !targets.is_empty() {
-                    let target_ids: Vec<_> = targets.into_iter().collect();
-                    return Ok(if target_ids.len() == 1 {
-                        TargetResolution {
-                            target_ids,
-                            status: if external_only {
-                                ResolutionStatus::External
-                            } else {
-                                ResolutionStatus::Resolved
-                            },
-                            precision: Precision::Heuristic,
-                            reason: Some(format!(
-                                "type use is syntax-resolved through the module-scope import for {first}"
-                            )),
-                        }
-                    } else {
-                        TargetResolution {
-                            target_ids,
-                            status: ResolutionStatus::Candidates,
-                            precision: Precision::Heuristic,
-                            reason: Some(format!(
-                                "module-scope imports for {first} have multiple syntax-proven targets"
-                            )),
-                        }
-                    });
-                }
             }
+            if !targets.is_empty() {
+                let target_ids: Vec<_> = targets.into_iter().collect();
+                return Ok(if target_ids.len() == 1 {
+                    TargetResolution {
+                        target_ids,
+                        status: if external_only {
+                            ResolutionStatus::External
+                        } else {
+                            ResolutionStatus::Resolved
+                        },
+                        precision: Precision::Heuristic,
+                        reason: Some(format!(
+                            "type use is syntax-resolved through the module-scope import for {first}"
+                        )),
+                    }
+                } else {
+                    TargetResolution {
+                        target_ids,
+                        status: ResolutionStatus::Candidates,
+                        precision: Precision::Heuristic,
+                        reason: Some(format!(
+                            "module-scope imports for {first} have multiple syntax-proven targets"
+                        )),
+                    }
+                });
+            }
+        }
+        if !specifier.contains("::") {
             let prelude = package_index
                 .and_then(|index| {
                     packages.get(index).map(|package| {
@@ -2584,16 +2597,6 @@ impl State {
                 });
             }
         } else {
-            if let Some(resolution) = self.resolve_syntax_type_path(
-                packages,
-                package_index,
-                specifier,
-                path,
-                inline_ancestors,
-                condition,
-            )? {
-                return Ok(resolution);
-            }
             let mut resolution = self.resolve_rust_path(
                 packages,
                 package_index,
@@ -2721,10 +2724,7 @@ impl State {
                 targets.extend(
                     candidates
                         .iter()
-                        .filter(|candidate| {
-                            candidate.condition == Condition::default()
-                                || candidate.condition == *condition
-                        })
+                        .filter(|candidate| condition_implies(condition, &candidate.condition))
                         .map(|candidate| (candidate.node.id.clone(), candidate.node.clone())),
                 );
             }
@@ -4199,6 +4199,83 @@ fn syntax_import_bindings(occurrences: &[Occurrence]) -> Vec<SyntaxImportBinding
     bindings
 }
 
+fn condition_implies(assumption: &Condition, required: &Condition) -> bool {
+    condition_implies_canonical(&assumption.canonicalized(), &required.canonicalized())
+}
+
+fn condition_implies_canonical(assumption: &Condition, required: &Condition) -> bool {
+    if assumption == required {
+        return true;
+    }
+    if matches!(
+        required,
+        Condition::All { conditions } if conditions.is_empty()
+    ) {
+        return true;
+    }
+    if matches!(
+        assumption,
+        Condition::Any { conditions } if conditions.is_empty()
+    ) || matches!(
+        assumption,
+        Condition::In { values, .. } if values.is_empty()
+    ) {
+        return true;
+    }
+    match required {
+        Condition::All { conditions } => conditions
+            .iter()
+            .all(|required| condition_implies_canonical(assumption, required)),
+        Condition::Any { conditions } => conditions
+            .iter()
+            .any(|required| condition_implies_canonical(assumption, required)),
+        _ => match assumption {
+            Condition::All { conditions } => conditions
+                .iter()
+                .any(|assumption| condition_implies_canonical(assumption, required)),
+            Condition::Any { conditions } => conditions
+                .iter()
+                .all(|assumption| condition_implies_canonical(assumption, required)),
+            Condition::Eq {
+                key: assumption_key,
+                value,
+            } => match required {
+                Condition::In {
+                    key: required_key,
+                    values,
+                } => assumption_key == required_key && values.contains(value),
+                Condition::Defined { key } => assumption_key == key,
+                _ => false,
+            },
+            Condition::In {
+                key: assumption_key,
+                values: assumption_values,
+            } => match required {
+                Condition::In {
+                    key: required_key,
+                    values: required_values,
+                } => {
+                    assumption_key == required_key
+                        && assumption_values
+                            .iter()
+                            .all(|value| required_values.contains(value))
+                }
+                Condition::Defined { key } => assumption_key == key,
+                _ => false,
+            },
+            Condition::Not {
+                condition: assumption,
+            } => match required {
+                Condition::Not {
+                    condition: required,
+                } => condition_implies_canonical(required, assumption),
+                _ => false,
+            },
+            Condition::Defined { .. } => false,
+        },
+    }
+}
+
 fn syntax_mentions_attribute(syntax: &syn::File, name: &str) -> bool {
     fn meta_mentions(meta: &syn::Meta, name: &str) -> bool {
         if meta.path().is_ident(name) {
@@ -4601,6 +4678,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn syntax_condition_implication_accepts_only_proven_narrower_uses() {
+        let feature = Condition::Eq {
+            key: "cfg.feature".into(),
+            value: Value::String("a".into()),
+        };
+        let unix = Condition::Defined {
+            key: "cfg.unix".into(),
+        };
+        let windows = Condition::Defined {
+            key: "cfg.windows".into(),
+        };
+        let narrowed = Condition::All {
+            conditions: vec![feature.clone(), unix.clone()],
+        };
+        assert!(condition_implies(&narrowed, &feature));
+        assert!(condition_implies(&narrowed, &unix));
+        assert!(!condition_implies(&feature, &narrowed));
+        assert!(condition_implies(
+            &unix,
+            &Condition::Any {
+                conditions: vec![unix.clone(), windows.clone()]
+            }
+        ));
+        assert!(!condition_implies(
+            &Condition::Any {
+                conditions: vec![unix, windows]
+            },
+            &feature
+        ));
+    }
+
     fn write_complete_semantic_fixture(root: &Path) {
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(
@@ -4691,9 +4800,12 @@ mod tests {
             r#"pub mod model;
 
 use crate::model::Thing as ImportedThing;
+use crate::model as m;
 use std::path::Path as StdPath;
 
 pub struct String;
+#[cfg(feature = "a")]
+pub struct FeatureThing;
 
 pub struct Record {
     name: String,
@@ -4701,6 +4813,9 @@ pub struct Record {
     path: StdPath,
     imported: ImportedThing,
     qualified: crate::model::Thing,
+    qualified_alias: m::Thing,
+    #[cfg(all(feature = "a", unix))]
+    condition_narrower_than_definition: FeatureThing,
     external: serde::Serialize,
     unknown: MissingType,
 }
@@ -4734,6 +4849,8 @@ pub fn scoped() {
             "StdPath",
             "ImportedThing",
             "crate::model::Thing",
+            "m::Thing",
+            "FeatureThing",
             "serde::Serialize",
         ] {
             let site = type_site(specifier);
