@@ -5142,6 +5142,8 @@ fn query_commands_report_traversal_evidence_cycles_doctor_and_unresolved_sites()
         "--json",
     ]);
     assert_eq!(first_page, repeated_first_page);
+    let snapshot_id = first_page["snapshot_id"].as_str().unwrap();
+    assert!(snapshot_id.starts_with("snapshot:sha256:"));
     assert_eq!(first_page["complete"], false);
     assert_eq!(first_page["returned_items"], 1);
     assert!(first_page["serialized_output_bytes"].as_u64().unwrap() <= 4096);
@@ -5162,6 +5164,7 @@ fn query_commands_report_traversal_evidence_cycles_doctor_and_unresolved_sites()
         cursor,
         "--json",
     ]);
+    assert_eq!(second_page["snapshot_id"], snapshot_id);
     assert_eq!(second_page["complete"], true);
     assert_eq!(second_page["returned_items"], 1);
     assert!(second_page["next_cursor"].is_null());

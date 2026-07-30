@@ -58,6 +58,7 @@ pub struct InteractiveQueryPage<T> {
     pub contract_version: String,
     pub command: String,
     pub scan_id: String,
+    pub snapshot_id: String,
     pub complete: bool,
     pub returned_items: u64,
     pub total_items: u64,
@@ -84,6 +85,7 @@ pub struct BoundedTraversalResult {
 pub struct InteractiveQueryPageRequest<'a> {
     pub command: &'a str,
     pub scan_id: &'a str,
+    pub snapshot_id: &'a str,
     pub context: &'a Value,
     pub cursor: Option<&'a str>,
     pub max_items: usize,
@@ -230,6 +232,7 @@ where
             "contract_version": INTERACTIVE_QUERY_PAGE_CONTRACT_VERSION,
             "command": request.command,
             "scan_id": request.scan_id,
+            "snapshot_id": request.snapshot_id,
             "context": request.context,
         }),
     );
@@ -347,6 +350,7 @@ where
         contract_version: INTERACTIVE_QUERY_PAGE_CONTRACT_VERSION.to_owned(),
         command: request.command.to_owned(),
         scan_id: request.scan_id.to_owned(),
+        snapshot_id: request.snapshot_id.to_owned(),
         complete,
         returned_items: count.try_into().unwrap_or(u64::MAX),
         total_items: summary.total_items,
@@ -1510,6 +1514,7 @@ mod tests {
                 InteractiveQueryPageRequest {
                     command: "deps",
                     scan_id: "scan",
+                    snapshot_id: "snapshot:scan",
                     context: &context,
                     cursor: cursor.as_deref(),
                     max_items: 1,
@@ -1569,6 +1574,7 @@ mod tests {
         let request = |max_bytes| InteractiveQueryPageRequest {
             command: "deps",
             scan_id: "scan",
+            snapshot_id: "snapshot:scan",
             context: &context,
             cursor: None,
             max_items: items.len(),
@@ -1655,6 +1661,7 @@ mod tests {
                 InteractiveQueryPageRequest {
                     command: "deps",
                     scan_id: "scan-large",
+                    snapshot_id: "snapshot:scan-large",
                     context: &context,
                     cursor: cursor.as_deref(),
                     max_items: 17,
@@ -1714,6 +1721,7 @@ mod tests {
             InteractiveQueryPageRequest {
                 command: "deps",
                 scan_id: "scan",
+                snapshot_id: "snapshot:scan",
                 context: &context,
                 cursor: None,
                 max_items: 1,
@@ -1732,6 +1740,7 @@ mod tests {
             InteractiveQueryPageRequest {
                 command: "deps",
                 scan_id: "other-scan",
+                snapshot_id: "snapshot:other-scan",
                 context: &context,
                 cursor: Some("depgraph-query-cursor-v1.1.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
                 max_items: 1,
@@ -1743,6 +1752,62 @@ mod tests {
             },
         )
         .expect_err("tampered cursor must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("cursor does not match this snapshot and query")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn interactive_cursor_is_bound_to_the_immutable_snapshot_identity() -> Result<()> {
+        let items = vec!["first".to_owned(), "second".to_owned()];
+        let summary = summarize_query_items(
+            std::iter::empty(),
+            std::iter::empty(),
+            std::iter::empty(),
+            std::iter::empty(),
+            std::iter::empty(),
+            items.len(),
+        );
+        let context = json!({"selector":"id:a"});
+        let first = paginate_interactive_query(
+            &items,
+            summary.clone(),
+            InteractiveQueryPageRequest {
+                command: "deps",
+                scan_id: "scan",
+                snapshot_id: "snapshot:before-build",
+                context: &context,
+                cursor: None,
+                max_items: 1,
+                max_bytes: 64 * 1024,
+                traversal_complete: true,
+                traversed_items: 2,
+                root: None,
+                diagnostics: Vec::new(),
+            },
+        )?;
+        let cursor = first.next_cursor.context("first page cursor")?;
+        let error = paginate_interactive_query(
+            &items,
+            summary,
+            InteractiveQueryPageRequest {
+                command: "deps",
+                scan_id: "scan",
+                snapshot_id: "snapshot:after-build",
+                context: &context,
+                cursor: Some(&cursor),
+                max_items: 1,
+                max_bytes: 64 * 1024,
+                traversal_complete: true,
+                traversed_items: 2,
+                root: None,
+                diagnostics: Vec::new(),
+            },
+        )
+        .expect_err("a cursor from another immutable snapshot must fail");
         assert!(
             error
                 .to_string()
@@ -1766,6 +1831,7 @@ mod tests {
             InteractiveQueryPageRequest {
                 command: "deps",
                 scan_id: "scan",
+                snapshot_id: "snapshot:scan",
                 context: &context,
                 cursor: None,
                 max_items: 1,

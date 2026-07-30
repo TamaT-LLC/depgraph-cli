@@ -51,6 +51,50 @@ const DOCTOR_SUMMARY_MAX_DIAGNOSTIC_GROUPS: usize = 64;
 const DOCTOR_SUMMARY_MAX_DIAGNOSTIC_SAMPLES: usize = 5;
 const DOCTOR_SUMMARY_MAX_KEY_BYTES: usize = 128;
 const DOCTOR_SUMMARY_MAX_TEXT_BYTES: usize = 240;
+const DOCTOR_BUILD_LAYERS_CTE: &str = "
+WITH RECURSIVE
+latest_snapshot(id, parent_snapshot_id, build_attempt_id, depth) AS (
+    SELECT seed.id, seed.parent_snapshot_id, seed.build_attempt_id, 0
+      FROM (
+          SELECT id, parent_snapshot_id, build_attempt_id
+            FROM completed_snapshots
+           WHERE scan_id=?1 AND status='completed'
+           ORDER BY julianday(created_at) DESC, rowid DESC
+           LIMIT 1
+      ) AS seed
+    UNION ALL
+    SELECT parent.id, parent.parent_snapshot_id, parent.build_attempt_id, child.depth + 1
+      FROM completed_snapshots AS parent
+      JOIN latest_snapshot AS child ON parent.id=child.parent_snapshot_id
+),
+build_layers(build_attempt_id, depth) AS (
+    SELECT build_attempt_id, MAX(depth)
+      FROM latest_snapshot
+     WHERE build_attempt_id IS NOT NULL
+     GROUP BY build_attempt_id
+)";
+const DOCTOR_EFFECTIVE_DIAGNOSTICS_CTE: &str = ",
+effective_diagnostics(
+    id, severity, code, message, path, adapter, source_rank, layer_depth, ordinal
+) AS (
+    SELECT id, severity, code, message, path, adapter, 0, 0, ordinal
+      FROM diagnostics
+     WHERE scan_id=?1
+    UNION ALL
+    SELECT COALESCE(json_extract(item.value, '$.id'), 'unknown'),
+           COALESCE(json_extract(item.value, '$.severity'), 'warning'),
+           COALESCE(json_extract(item.value, '$.code'), 'unknown'),
+           COALESCE(json_extract(item.value, '$.message'), 'unknown diagnostic'),
+           json_extract(item.value, '$.path'),
+           json_extract(item.value, '$.adapter'),
+           1,
+           layers.depth,
+           CAST(item.key AS INTEGER)
+      FROM build_layers AS layers
+      JOIN build_attempts AS attempts ON attempts.id=layers.build_attempt_id
+      JOIN json_each(attempts.delta_json, '$.diagnostics') AS item
+     WHERE attempts.status='completed' AND attempts.delta_json IS NOT NULL
+)";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ScanRecord {
@@ -4099,7 +4143,7 @@ fn load_scan_attempt_summary(
     connection: &Connection,
     scan_id: &str,
 ) -> Result<ScanAttemptSummaryRecord> {
-    let scan = connection
+    let mut scan = connection
         .query_row(
             "SELECT id, root, status, strict, started_at, completed_at,
                     project_code_executed, error, parent_snapshot_id, source_revision
@@ -4122,20 +4166,8 @@ fn load_scan_attempt_summary(
         )
         .optional()?
         .with_context(|| format!("scan {scan_id} was not found"))?;
-    let profile_count = connection.query_row(
-        "SELECT COUNT(*) FROM profiles WHERE scan_id=?1",
-        [scan_id],
-        |row| row.get::<_, u64>(0),
-    )?;
-    let mut profiles_by_language = BTreeMap::<String, u64>::new();
-    let mut profile_statement =
-        connection.prepare("SELECT json FROM profiles WHERE scan_id=?1 ORDER BY id")?;
-    let profile_rows = profile_statement.query_map([scan_id], |row| row.get::<_, String>(0))?;
-    for raw in profile_rows {
-        let value: Value = serde_json::from_str(&raw?)?;
-        let language = required_str(&value, "language")?;
-        *profiles_by_language.entry(language.to_owned()).or_default() += 1;
-    }
+    let (profile_count, profiles_by_language) =
+        load_effective_profile_summary(connection, scan_id)?;
 
     let stored_coverage = connection
         .query_row(
@@ -4168,19 +4200,19 @@ fn load_scan_attempt_summary(
             ))
         },
     )?;
-    coverage.profiles = profile_count;
     coverage.dependency_sites = dependency_sites;
     coverage.resolved = resolved;
     coverage.candidates = candidates;
     coverage.external = external;
     coverage.unresolved = unresolved;
     coverage.project_code_executed = scan.project_code_executed;
+    for build_coverage in load_doctor_build_coverages(connection, scan_id)? {
+        union_coverage(&mut coverage, &build_coverage);
+    }
+    coverage.profiles = profile_count;
+    scan.project_code_executed = coverage.project_code_executed;
 
-    let package_instance_count = connection.query_row(
-        "SELECT COUNT(*) FROM nodes WHERE scan_id=?1 AND kind='package_instance'",
-        [scan_id],
-        |row| row.get::<_, u64>(0),
-    )?;
+    let package_instance_count = load_effective_package_instance_count(connection, scan_id)?;
     let mut file_statement = connection.prepare(
         "SELECT adapter, COUNT(*),
                 COALESCE(SUM(CASE WHEN skipped THEN 1 ELSE 0 END), 0),
@@ -4232,32 +4264,115 @@ fn load_scan_attempt_summary(
     })
 }
 
+fn load_effective_profile_summary(
+    connection: &Connection,
+    scan_id: &str,
+) -> Result<(u64, BTreeMap<String, u64>)> {
+    let sql = format!(
+        "{DOCTOR_BUILD_LAYERS_CTE},
+effective_profiles(id, language) AS (
+    SELECT id, json_extract(json, '$.language')
+      FROM profiles
+     WHERE scan_id=?1
+    UNION
+    SELECT json_extract(item.value, '$.id'),
+           json_extract(item.value, '$.language')
+      FROM build_layers AS layers
+      JOIN build_attempts AS attempts ON attempts.id=layers.build_attempt_id
+      JOIN json_each(attempts.delta_json, '$.profiles') AS item
+     WHERE attempts.status='completed' AND attempts.delta_json IS NOT NULL
+),
+deduplicated_profiles(id, language) AS (
+    SELECT id, MIN(language)
+      FROM effective_profiles
+     GROUP BY id
+)
+SELECT language, COUNT(*)
+  FROM deduplicated_profiles
+ GROUP BY language
+ ORDER BY language"
+    );
+    let mut statement = connection.prepare(&sql)?;
+    let rows = statement.query_map([scan_id], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))
+    })?;
+    let mut profile_count = 0_u64;
+    let mut profiles_by_language = BTreeMap::new();
+    for row in rows {
+        let (language, count) = row?;
+        profile_count = profile_count.saturating_add(count);
+        profiles_by_language.insert(language, count);
+    }
+    Ok((profile_count, profiles_by_language))
+}
+
+fn load_effective_package_instance_count(connection: &Connection, scan_id: &str) -> Result<u64> {
+    let sql = format!(
+        "{DOCTOR_BUILD_LAYERS_CTE},
+effective_package_instances(id) AS (
+    SELECT id
+      FROM nodes
+     WHERE scan_id=?1 AND kind='package_instance'
+    UNION
+    SELECT json_extract(item.value, '$.id')
+      FROM build_layers AS layers
+      JOIN build_attempts AS attempts ON attempts.id=layers.build_attempt_id
+      JOIN json_each(attempts.delta_json, '$.nodes') AS item
+     WHERE attempts.status='completed'
+       AND attempts.delta_json IS NOT NULL
+       AND json_extract(item.value, '$.kind')='package_instance'
+)
+SELECT COUNT(*) FROM effective_package_instances"
+    );
+    connection
+        .query_row(&sql, [scan_id], |row| row.get(0))
+        .map_err(Into::into)
+}
+
+fn load_doctor_build_coverages(
+    connection: &Connection,
+    scan_id: &str,
+) -> Result<Vec<CoverageRecord>> {
+    let sql = format!(
+        "{DOCTOR_BUILD_LAYERS_CTE}
+SELECT json_extract(attempts.delta_json, '$.coverage')
+  FROM build_layers AS layers
+  JOIN build_attempts AS attempts ON attempts.id=layers.build_attempt_id
+ WHERE attempts.status='completed' AND attempts.delta_json IS NOT NULL
+ ORDER BY layers.depth DESC, attempts.id"
+    );
+    let mut statement = connection.prepare(&sql)?;
+    let rows = statement.query_map([scan_id], |row| row.get::<_, String>(0))?;
+    rows.map(|raw| Ok(serde_json::from_str(&raw?)?)).collect()
+}
+
 fn load_diagnostic_summary(
     connection: &Connection,
     scan_id: &str,
 ) -> Result<DiagnosticSummaryRecord> {
-    let total = connection.query_row(
-        "SELECT COUNT(*) FROM diagnostics WHERE scan_id=?1",
-        [scan_id],
-        |row| row.get::<_, u64>(0),
-    )?;
-    let raw_group_count = connection.query_row(
-        "SELECT COUNT(*) FROM (
-             SELECT 1 FROM diagnostics
-              WHERE scan_id=?1
-              GROUP BY severity, code, adapter
-         )",
-        [scan_id],
-        |row| row.get::<_, u64>(0),
-    )?;
-    let mut statement = connection.prepare(
-        "SELECT severity, code, adapter, COUNT(*) AS diagnostic_count
-           FROM diagnostics
-          WHERE scan_id=?1
-          GROUP BY severity, code, adapter
-          ORDER BY diagnostic_count DESC, severity, code, COALESCE(adapter, '')
-          LIMIT ?2",
-    )?;
+    let effective_diagnostics =
+        format!("{DOCTOR_BUILD_LAYERS_CTE}{DOCTOR_EFFECTIVE_DIAGNOSTICS_CTE}");
+    let total_sql = format!("{effective_diagnostics} SELECT COUNT(*) FROM effective_diagnostics");
+    let total = connection.query_row(&total_sql, [scan_id], |row| row.get::<_, u64>(0))?;
+    let group_count_sql = format!(
+        "{effective_diagnostics}
+SELECT COUNT(*) FROM (
+    SELECT 1
+      FROM effective_diagnostics
+     GROUP BY severity, code, adapter
+)"
+    );
+    let raw_group_count =
+        connection.query_row(&group_count_sql, [scan_id], |row| row.get::<_, u64>(0))?;
+    let groups_sql = format!(
+        "{effective_diagnostics}
+SELECT severity, code, adapter, COUNT(*) AS diagnostic_count
+  FROM effective_diagnostics
+ GROUP BY severity, code, adapter
+ ORDER BY diagnostic_count DESC, severity, code, COALESCE(adapter, '')
+ LIMIT ?2"
+    );
+    let mut statement = connection.prepare(&groups_sql)?;
     let groups = statement
         .query_map(
             params![
@@ -4287,13 +4402,14 @@ fn load_diagnostic_summary(
         .map(|group: &DiagnosticGroupSummaryRecord| group.count)
         .sum::<u64>();
 
-    let mut sample_statement = connection.prepare(
-        "SELECT id, severity, code, message, path, adapter
-           FROM diagnostics
-          WHERE scan_id=?1
-          ORDER BY ordinal
-          LIMIT ?2",
-    )?;
+    let samples_sql = format!(
+        "{effective_diagnostics}
+SELECT id, severity, code, message, path, adapter
+  FROM effective_diagnostics
+ ORDER BY source_rank, layer_depth DESC, ordinal, id
+ LIMIT ?2"
+    );
+    let mut sample_statement = connection.prepare(&samples_sql)?;
     let samples = sample_statement
         .query_map(
             params![
@@ -5942,6 +6058,47 @@ mod tests {
         let union = store.load_snapshot("scan-golden")?;
         assert_eq!(store.load_completed_snapshot(&build_snapshot_id)?, union);
         assert_eq!(union.edges.len(), 2);
+        let doctor_summary = store.scan_attempt_summary("scan-golden")?;
+        let mut expected_profiles_by_language = BTreeMap::new();
+        for profile in &union.profiles {
+            *expected_profiles_by_language
+                .entry(profile.language.clone())
+                .or_default() += 1;
+        }
+        assert!(doctor_summary.scan.project_code_executed);
+        assert_eq!(doctor_summary.coverage, union.coverage);
+        assert_eq!(
+            doctor_summary.profile_count,
+            u64::try_from(union.profiles.len())?
+        );
+        assert_eq!(
+            doctor_summary.profiles_by_language,
+            expected_profiles_by_language
+        );
+        assert_eq!(
+            doctor_summary.package_instance_count,
+            u64::try_from(
+                union
+                    .nodes
+                    .iter()
+                    .filter(|node| node.kind == "package_instance")
+                    .count()
+            )?
+        );
+        assert_eq!(
+            doctor_summary.diagnostics.total,
+            u64::try_from(union.diagnostics.len())?
+        );
+        assert!(
+            doctor_summary
+                .diagnostics
+                .groups
+                .iter()
+                .any(|group| group.code == "build-observed" && group.count == 1)
+        );
+        assert!(
+            !serde_json::to_string(&doctor_summary)?.contains("must-not-appear-in-doctor-summary")
+        );
         assert_eq!(
             union
                 .edges
@@ -6384,17 +6541,26 @@ mod tests {
         events[4]["edge"]["site_id"] = events[5]["site"]["id"].clone();
         let typed_edge: GraphEdge = serde_json::from_value(events[4]["edge"].clone()).unwrap();
         events[4]["edge"]["id"] = json!(build_edge_stable_id(&typed_edge).unwrap());
+        let mut diagnostic = common("diagnostic", 7);
+        diagnostic["diagnostic"] = json!({
+            "id":format!("diagnostic:build:{run_id}"),
+            "severity":"warning",
+            "code":"build-observed",
+            "message":"build observation retained",
+            "properties":{"private_payload":"must-not-appear-in-doctor-summary"}
+        });
+        events.push(diagnostic);
         let coverage = json!({
             "profiles":1,"files_discovered":0,"files_analyzed":0,"files_skipped":0,
             "dependency_sites":1,"resolved":1,"candidates":0,"external":0,
             "unresolved":0,"unsupported_syntax":0,"project_code_executed":true,
             "completeness":["build-observed"],"reasons":[]
         });
-        let mut profile_completed = common("profile_completed", 7);
+        let mut profile_completed = common("profile_completed", 8);
         profile_completed["profile_id"] = json!("web:build");
         profile_completed["coverage"] = coverage.clone();
         events.push(profile_completed);
-        let mut completed = common("scan_completed", 8);
+        let mut completed = common("scan_completed", 9);
         completed["coverage"] = coverage;
         events.push(completed);
         events

@@ -1305,17 +1305,21 @@ async fn run(cli: Cli) -> Result<u8> {
             output,
         } => {
             let filter = GraphQueryFilter::new(phase, profile, session, environment)?;
-            let (snapshot, scan_id) = load_snapshot(cli.store, cli.scan_id.as_deref(), false)?;
             if output.all {
+                let (snapshot, scan_id) = load_snapshot(cli.store, cli.scan_id.as_deref(), false)?;
                 let result = traverse_filtered(&snapshot, &selector, transitive, false, &filter)?;
                 print_structured("deps", scan_id, &result, json)?;
                 if !json {
                     print_path_steps(&result.steps);
                 }
             } else {
+                let (snapshot, snapshot_id) =
+                    load_query_snapshot_read_only(cli.store, cli.scan_id.as_deref())?;
+                let scan_id = snapshot.scan.id.clone();
                 let page = interactive_traversal_page(
                     &snapshot,
                     &scan_id,
+                    &snapshot_id,
                     "deps",
                     &selector,
                     transitive,
@@ -1345,17 +1349,21 @@ async fn run(cli: Cli) -> Result<u8> {
             output,
         } => {
             let filter = GraphQueryFilter::new(phase, profile, session, environment)?;
-            let (snapshot, scan_id) = load_snapshot(cli.store, cli.scan_id.as_deref(), false)?;
             if output.all {
+                let (snapshot, scan_id) = load_snapshot(cli.store, cli.scan_id.as_deref(), false)?;
                 let result = traverse_filtered(&snapshot, &selector, transitive, true, &filter)?;
                 print_structured("dependents", scan_id, &result, json)?;
                 if !json {
                     print_path_steps(&result.steps);
                 }
             } else {
+                let (snapshot, snapshot_id) =
+                    load_query_snapshot_read_only(cli.store, cli.scan_id.as_deref())?;
+                let scan_id = snapshot.scan.id.clone();
                 let page = interactive_traversal_page(
                     &snapshot,
                     &scan_id,
+                    &snapshot_id,
                     "dependents",
                     &selector,
                     transitive,
@@ -1481,14 +1489,18 @@ async fn run(cli: Cli) -> Result<u8> {
             Ok(0)
         }
         Commands::Unresolved { json, output } => {
-            let (snapshot, scan_id) = load_snapshot(cli.store, cli.scan_id.as_deref(), false)?;
-            let result = unresolved(&snapshot);
             if output.all {
+                let (snapshot, scan_id) = load_snapshot(cli.store, cli.scan_id.as_deref(), false)?;
+                let result = unresolved(&snapshot);
                 print_structured("unresolved", scan_id, &result, json)?;
                 if !json {
                     print_unresolved_items(&result);
                 }
             } else {
+                let (snapshot, snapshot_id) =
+                    load_query_snapshot_read_only(cli.store, cli.scan_id.as_deref())?;
+                let scan_id = snapshot.scan.id.clone();
+                let result = unresolved(&snapshot);
                 let max_items = output
                     .max_items
                     .unwrap_or(DEFAULT_INTERACTIVE_QUERY_MAX_ITEMS);
@@ -1503,6 +1515,7 @@ async fn run(cli: Cli) -> Result<u8> {
                     InteractiveQueryPageRequest {
                         command: "unresolved",
                         scan_id: &scan_id,
+                        snapshot_id: &snapshot_id,
                         context: &context,
                         cursor: output.cursor.as_deref(),
                         max_items,
@@ -2541,6 +2554,7 @@ fn print_doctor_summary_human(report: &depgraph_core::DoctorSummaryReport) {
 fn interactive_traversal_page(
     snapshot: &depgraph_store::GraphSnapshot,
     scan_id: &str,
+    snapshot_id: &str,
     command: &'static str,
     selector: &str,
     transitive: bool,
@@ -2579,6 +2593,7 @@ fn interactive_traversal_page(
         InteractiveQueryPageRequest {
             command,
             scan_id,
+            snapshot_id,
             context: &context,
             cursor: output.cursor.as_deref(),
             max_items,

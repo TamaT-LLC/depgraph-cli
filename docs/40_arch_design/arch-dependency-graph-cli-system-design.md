@@ -1287,11 +1287,11 @@ writer APIはheader、key schema、graph-level JSON record、node、edgeを順�
 
 Issue #264の`depgraph-interactive-query-page-v1`は`deps` / `dependents` / `unresolved`の対話的出力をfull graph exportから分離する。既定はcanonical item 100件、compact UTF-8 JSON document 1 MiB、dependency traversal 50,000 edge visitであり、hard capはそれぞれ10,000件、16 MiB、1,000,000 visitとする。document byte budgetはterminal newlineを含まないJSON document全体に適用し、item追加後の実serialize byte数が上限以下になる最大prefixだけを返す。単一itemがbudgetを超える場合は空pageと`QUERY_ITEM_EXCEEDS_BYTE_BUDGET`を返し、同じ入力cursorにより大きいbudgetを指定するremediationを示す。
 
-page itemはstable edge ID順（unresolvedはstable site ID順）である。`next_cursor`はcontract version、command、scan ID、selector、direction、transitive flag、canonical filter、traversal limit、offsetをSHA-256で結合したopaque tokenであり、別snapshot / queryへの再利用、非canonical offset、改変をfail closedする。item / byte打ち切りは`complete:false`、`QUERY_OUTPUT_TRUNCATED`、返却件数、全件数、serialize byte数、次cursorを返す。同一snapshot・同一cursor・同一budgetの出力はbyte-identicalで、cursorを終端まで追うと重複・欠落なくcanonical full item列を復元できる。
+page itemはstable edge ID順（unresolvedはstable site ID順）である。bounded pageはbase scan IDとは別にcontent-addressed completed `snapshot_id`を公開する。`next_cursor`はcontract version、command、immutable snapshot ID、scan ID、selector、direction、transitive flag、canonical filter、traversal limit、offsetをSHA-256で結合したopaque tokenであり、同じscan IDへbuild overlayが昇格した後を含む別snapshot / queryへの再利用、非canonical offset、改変をfail closedする。item / byte打ち切りは`complete:false`、`QUERY_OUTPUT_TRUNCATED`、返却件数、全件数、serialize byte数、次cursorを返す。同一snapshot・同一cursor・同一budgetの出力はbyte-identicalで、cursorを終端まで追うと重複・欠落なくcanonical full item列を復元できる。
 
 traversal budgetはBFSで実際にadmitしたedge visitへ適用する。到達時は`QUERY_TRAVERSAL_LIMIT_REACHED`と`complete:false`を返し、未探索集合を完全なcursorへ偽装しないため、admit済み集合の終端にはcontinuationを出さない。利用者はlimitを増やすかfilterを狭める。`--all`は従来のcomplete `TraversalResult` / unresolved arrayを明示的に維持し、full property graphは引き続きstreaming `export`を使う。
 
-summaryはstatus / phase / profile / kind / reasonを原因件数順・key順で決定的に集約し、各dimension最大64 groupとomitted countに制限する。human出力とJSONは同じsummary、diagnostic、cursorを共有する。
+summaryはstatus / phase / profile / kind / reasonを原因件数順・key順で決定的に集約し、各dimension最大64 groupとomitted countに制限する。doctor summaryはcompleted snapshot chainのbuild overlayをSQLite JSON scalar projectionで合成し、diagnostic properties、base diagnostic raw JSON、graph / evidence、adapter stderrを読み込まずにdetailsと一致するprofile / package / site / diagnostic countとproject-code execution状態を返す。human出力とJSONは同じsummary、diagnostic、cursorを共有する。
 
 ## 14. CLI UX
 

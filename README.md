@@ -185,6 +185,7 @@ SQLite is stored under the operating system cache directory, keyed by the canoni
 `doctor` emits a bounded summary by default. The summary reads diagnostic
 counts and at most 64 cause groups plus five representative diagnostics
 without loading diagnostic payload JSON, graph evidence, or adapter stderr.
+Completed build overlays are projected into the same bounded counts.
 Use `doctor --details` for the complete retained attempt payload.
 
 `deps`, `dependents`, and `unresolved` use the versioned
@@ -193,10 +194,11 @@ The defaults are 100 canonical items, a 1 MiB canonical JSON document, and
 50,000 visited edges for dependency traversal. `--max-items`, `--max-bytes`,
 and `--max-traversal` lower or raise those bounded limits within the hard
 caps. A truncated page returns `complete:false`, a stable diagnostic code,
-and a snapshot/query-bound `next_cursor`; the cursor resumes the canonical
-item order without overlap or gaps. The byte count covers the compact UTF-8
-JSON document (the terminal newline is transport framing). A traversal-limit
-result has no continuation after its admitted result set; raise
+an immutable `snapshot_id`, and a snapshot/query-bound `next_cursor`; the
+cursor resumes the canonical item order without overlap or gaps and is
+rejected after a newer build snapshot is promoted for the same scan. The byte
+count covers the compact UTF-8 JSON document (the terminal newline is transport
+framing). A traversal-limit result has no continuation after its admitted result set; raise
 `--max-traversal` or narrow filters. `--all` preserves the legacy complete
 query shape, while `export` remains the streaming full-graph interface.
 
