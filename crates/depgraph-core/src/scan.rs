@@ -4,7 +4,9 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use depgraph_store::{CacheEventRecord, CacheLayer, CoverageRecord, DiagnosticRecord, Store};
+use depgraph_store::{
+    CacheEventRecord, CacheLayer, CoverageRecord, DiagnosticRecord, Store, ValidatedScanCacheHit,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -329,12 +331,17 @@ pub async fn run_scan_with_cache_mode_and_cancellation(
                             cache_events: Vec::new(),
                             policy: None,
                         };
-                        match store.promote_validated_scan_cache_hit(&scan_id, &hit) {
-                            Ok(()) => {
+                        match promote_validated_scan_cache_hit_if_active(
+                            store,
+                            &scan_id,
+                            &hit,
+                            &cancellation,
+                        ) {
+                            Some(Ok(())) => {
                                 outcome.cache_events = store.cache_events_for_scan(&scan_id)?;
                                 return Ok(outcome);
                             }
-                            Err(error) => {
+                            Some(Err(error)) => {
                                 tracing::warn!(
                                     scan_id,
                                     error = %error,
@@ -349,6 +356,7 @@ pub async fn run_scan_with_cache_mode_and_cancellation(
                                     "promotion-proof-invalidated",
                                 )?;
                             }
+                            None => return cancel_scan(store, &scan_id),
                         }
                     }
                 } else {
@@ -639,6 +647,15 @@ fn bind_worker_output_to_profile_plan(
 pub(crate) fn cancel_scan(store: &mut Store, scan_id: &str) -> Result<ScanOutcome> {
     store.finish_scan(scan_id, "cancelled", Some("scan cancelled"), false)?;
     snapshot_outcome(store, scan_id, 3)
+}
+
+fn promote_validated_scan_cache_hit_if_active(
+    store: &mut Store,
+    scan_id: &str,
+    hit: &ValidatedScanCacheHit,
+    cancellation: &CancellationToken,
+) -> Option<Result<()>> {
+    cancellation.run_if_active(|| store.promote_validated_scan_cache_hit(scan_id, hit))
 }
 
 pub(crate) fn complete_scan(
@@ -1494,6 +1511,54 @@ mod tests {
             Some(current.as_str())
         );
         assert_eq!(store.scan(&cancelled.scan_id)?.unwrap().status, "cancelled");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancellation_preempts_validated_cache_hit_promotion() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let root = root.path().canonicalize()?;
+        let config = Config::default();
+        let mut store = Store::open_in_memory()?;
+        run_scan(&mut store, root.clone(), &config, false).await?;
+        let current = store.current_snapshot_id()?.context("current snapshot")?;
+        let profile_plan = plan_repository_profiles(&root, &config, None)?.plan;
+        let cache_plan = match prepare_scan_cache(&root, &config, &[], None, &profile_plan.plan_id)
+        {
+            ScanCachePreparation::Ready(plan) => plan,
+            ScanCachePreparation::Rejected(reason) => {
+                anyhow::bail!("cache preparation unexpectedly rejected: {reason}")
+            }
+        };
+        let semantic_key = cache_plan.semantic.context("semantic cache key")?;
+
+        store.start_scan("cancelled-cache-hit", &root, false)?;
+        let hit = store
+            .lookup_scan_cache(&cache_plan.syntax, &semantic_key, "cancelled-cache-hit")?
+            .context("validated semantic cache hit")?;
+        assert_eq!(hit.snapshot_id(), current);
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+
+        assert!(
+            promote_validated_scan_cache_hit_if_active(
+                &mut store,
+                "cancelled-cache-hit",
+                &hit,
+                &cancellation,
+            )
+            .is_none()
+        );
+        let cancelled = cancel_scan(&mut store, "cancelled-cache-hit")?;
+        assert_eq!(cancelled.status, "cancelled");
+        assert_eq!(
+            store.current_snapshot_id()?.as_deref(),
+            Some(current.as_str())
+        );
+        assert_eq!(
+            store.snapshot_id_for_source("scan", "cancelled-cache-hit")?,
+            None
+        );
         Ok(())
     }
 
