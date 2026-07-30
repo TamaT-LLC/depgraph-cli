@@ -391,10 +391,14 @@ only after cache contract v2 key, completed-snapshot, and canonical payload
 reference integrity checks. The validated content-addressed snapshot is
 atomically aliased to the fresh scan attempt without cloning every graph row;
 an intervening SQLite writer invalidates the promotion proof.
-Unknown versions, corruption, symlinks, unsafe inventory bounds, and
-dependency snapshots that cannot be re-derived before scanning are explicit
-misses/rejections. `scan --no-cache` bypasses lookup and storage. Scan
-JSON/text and `doctor` expose cache hit/miss/reject reasons without adding
+Repository-internal file symlinks remain cacheable by fingerprinting the link
+identity and confined target content, then revalidating those proofs immediately
+before a cache-hit promotion. Root-out, dangling, looped, non-file, changed, or
+unreadable symlinks fail closed; the rejection diagnostic reports only the safe
+repository-relative link path. Unknown versions, corruption, unsafe inventory
+bounds, and dependency snapshots that cannot be re-derived before scanning are
+also explicit misses/rejections. `scan --no-cache` bypasses lookup and storage.
+Scan JSON/text and `doctor` expose cache hit/miss/reject reasons without adding
 cache bookkeeping to the canonical graph.
 
 `snapshot create` names the current completed snapshot; global `--scan-id ID` may instead select the completed snapshot produced by that scan and its latest promoted build. Failed or incomplete attempts cannot be named. Names are immutable, case-insensitively unique, 1–64 ASCII characters, begin with a letter or digit, and otherwise use letters, digits, `.`, `_`, or `-`. `current` and `latest` are reserved, and existing names are never overwritten. `snapshot show` accepts a name, a `snapshot:sha256:...` stable ID, or `current`. List and detail JSON are emitted in canonical order.

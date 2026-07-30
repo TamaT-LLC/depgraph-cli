@@ -25,12 +25,32 @@ pub(crate) struct ScanCachePlan {
     pub syntax: CacheKey,
     pub semantic: Option<CacheKey>,
     pub semantic_reject_reason: Option<&'static str>,
+    pub(crate) symlink_proofs: Vec<SymlinkProof>,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) enum ScanCachePreparation {
     Ready(ScanCachePlan),
-    Rejected(&'static str),
+    Rejected(CacheRejection),
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct CacheRejection {
+    pub reason: &'static str,
+    pub path: Option<String>,
+}
+
+impl CacheRejection {
+    fn new(reason: &'static str) -> Self {
+        Self { reason, path: None }
+    }
+
+    fn at_path(reason: &'static str, path: &str) -> Self {
+        Self {
+            reason,
+            path: Some(path.to_owned()),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -40,6 +60,22 @@ struct InventoryFile {
     length: u64,
     manifest: bool,
     generated: bool,
+    symlink: Option<SymlinkObservation>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct SymlinkObservation {
+    link_target: String,
+    cache_identity: String,
+    canonical_target: PathBuf,
+    length: u64,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct SymlinkProof {
+    relative: String,
+    observation: SymlinkObservation,
+    content_digest: String,
 }
 
 #[derive(Debug)]
@@ -48,6 +84,7 @@ struct InventoryFingerprints {
     manifests: String,
     generated: String,
     go_dependency_rescan_required: bool,
+    symlink_proofs: Vec<SymlinkProof>,
 }
 
 pub(crate) fn prepare_scan_cache(
@@ -59,11 +96,15 @@ pub(crate) fn prepare_scan_cache(
 ) -> ScanCachePreparation {
     let inventory = match fingerprint_inventory(root, store_path) {
         Ok(value) => value,
-        Err(reason) => return ScanCachePreparation::Rejected(reason),
+        Err(rejection) => return ScanCachePreparation::Rejected(rejection),
     };
     let adapter = match fingerprint_adapters(workers) {
         Ok(value) => value,
-        Err(()) => return ScanCachePreparation::Rejected("adapter-fingerprint-unavailable"),
+        Err(()) => {
+            return ScanCachePreparation::Rejected(CacheRejection::new(
+                "adapter-fingerprint-unavailable",
+            ));
+        }
     };
     let scan_contract = digest_serialized("scan-contract-v1", &config.scan);
 
@@ -80,6 +121,7 @@ pub(crate) fn prepare_scan_cache(
             syntax,
             semantic: None,
             semantic_reject_reason: Some("dependency-fingerprint-requires-rescan"),
+            symlink_proofs: inventory.symlink_proofs,
         });
     }
     let toolchain = match fingerprint_toolchains(root, workers) {
@@ -89,6 +131,7 @@ pub(crate) fn prepare_scan_cache(
                 syntax,
                 semantic: None,
                 semantic_reject_reason: Some("toolchain-fingerprint-unavailable"),
+                symlink_proofs: inventory.symlink_proofs,
             });
         }
     };
@@ -116,7 +159,18 @@ pub(crate) fn prepare_scan_cache(
         syntax,
         semantic: Some(semantic),
         semantic_reject_reason: None,
+        symlink_proofs: inventory.symlink_proofs,
     })
+}
+
+pub(crate) fn validate_scan_cache_hit_inputs(
+    root: &Path,
+    plan: &ScanCachePlan,
+) -> Result<(), CacheRejection> {
+    for proof in &plan.symlink_proofs {
+        validate_symlink_proof(root, proof)?;
+    }
+    Ok(())
 }
 
 pub fn build_cache_key(audit: &BuildAudit) -> Option<CacheKey> {
@@ -157,48 +211,63 @@ pub fn build_cache_key(audit: &BuildAudit) -> Option<CacheKey> {
 fn fingerprint_inventory(
     root: &Path,
     store_path: Option<&Path>,
-) -> Result<InventoryFingerprints, &'static str> {
+) -> Result<InventoryFingerprints, CacheRejection> {
+    let root = root
+        .canonicalize()
+        .map_err(|_| CacheRejection::new("inventory-unavailable"))?;
     let store_path = store_path.and_then(|path| path.canonicalize().ok());
     let mut files = Vec::new();
     let mut total = 0_u64;
-    let inventory = build_repository_file_inventory(root).map_err(|_| "inventory-unavailable")?;
+    let inventory = build_repository_file_inventory(&root)
+        .map_err(|_| CacheRejection::new("inventory-unavailable"))?;
     for relative in inventory.paths {
         let path = root.join(&relative);
         if is_store_artifact(&path, store_path.as_deref()) {
             continue;
-        }
-        let metadata = fs::symlink_metadata(&path).map_err(|_| "inventory-unavailable")?;
-        if metadata.file_type().is_symlink() {
-            return Err("symlink-input");
-        }
-        if !metadata.is_file() {
-            return Err("unsupported-filesystem-entry");
         }
         if relative.is_empty()
             || relative.starts_with('/')
             || relative.split('/').any(|component| component == "..")
             || relative.chars().any(char::is_control)
         {
-            return Err("invalid-relative-path");
+            return Err(CacheRejection::new("invalid-relative-path"));
         }
-        if metadata.len() > CACHE_MAX_FILE_BYTES {
-            return Err("file-size-limit");
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|_| CacheRejection::at_path("inventory-unavailable", &relative))?;
+        let (content_path, length, symlink) = if metadata.file_type().is_symlink() {
+            let observation = observe_confined_symlink(&root, &path, &relative)?;
+            (
+                observation.canonical_target.clone(),
+                observation.length,
+                Some(observation),
+            )
+        } else if metadata.is_file() {
+            (path.clone(), metadata.len(), None)
+        } else {
+            return Err(CacheRejection::at_path(
+                "unsupported-filesystem-entry",
+                &relative,
+            ));
+        };
+        if length > CACHE_MAX_FILE_BYTES {
+            return Err(CacheRejection::at_path("file-size-limit", &relative));
         }
         total = total
-            .checked_add(metadata.len())
-            .ok_or("inventory-size-limit")?;
+            .checked_add(length)
+            .ok_or_else(|| CacheRejection::at_path("inventory-size-limit", &relative))?;
         if total > CACHE_MAX_TOTAL_BYTES {
-            return Err("inventory-size-limit");
+            return Err(CacheRejection::at_path("inventory-size-limit", &relative));
         }
         if files.len() >= CACHE_MAX_FILES {
-            return Err("inventory-file-limit");
+            return Err(CacheRejection::at_path("inventory-file-limit", &relative));
         }
         files.push(InventoryFile {
             manifest: is_manifest_lock_or_config(&relative),
             generated: is_generated_artifact(&relative),
             relative,
-            path,
-            length: metadata.len(),
+            path: content_path,
+            length,
+            symlink,
         });
     }
     files.sort_by(|left, right| left.relative.cmp(&right.relative));
@@ -210,26 +279,50 @@ fn fingerprint_inventory(
     let mut generated = Sha256::new();
     generated.update(b"depgraph-cache-generated-v1\0");
     let mut go_dependency_rescan_required = false;
+    let mut symlink_proofs = Vec::new();
     for file in files {
-        let bytes = fs::read(&file.path).map_err(|_| "inventory-read-failed")?;
+        let bytes = fs::read(&file.path)
+            .map_err(|_| CacheRejection::at_path("inventory-read-failed", &file.relative))?;
         if bytes.len() as u64 != file.length {
-            return Err("input-changed-during-fingerprint");
+            return Err(CacheRejection::at_path(
+                "input-changed-during-fingerprint",
+                &file.relative,
+            ));
         }
         if file.relative.rsplit('/').next() != Some(".depgraph.toml") {
-            update_entry_digest(&mut all, &file.relative, &bytes);
+            update_inventory_entry_digest(&mut all, &file, &bytes);
         }
         if file.manifest {
-            update_entry_digest(&mut manifests, &file.relative, &bytes);
+            update_inventory_entry_digest(&mut manifests, &file, &bytes);
         }
         if file.generated {
-            update_entry_digest(&mut generated, &file.relative, &bytes);
+            update_inventory_entry_digest(&mut generated, &file, &bytes);
         }
         if file.relative.ends_with("go.mod") && go_mod_requires_dependencies(&bytes) {
             go_dependency_rescan_required = true;
         }
-        let observed = fs::metadata(&file.path).map_err(|_| "inventory-read-failed")?;
+        let observed = fs::metadata(&file.path)
+            .map_err(|_| CacheRejection::at_path("inventory-read-failed", &file.relative))?;
         if observed.len() != file.length {
-            return Err("input-changed-during-fingerprint");
+            return Err(CacheRejection::at_path(
+                "input-changed-during-fingerprint",
+                &file.relative,
+            ));
+        }
+        if let Some(expected) = &file.symlink {
+            let link_path = root.join(&file.relative);
+            let observed = observe_confined_symlink(&root, &link_path, &file.relative)?;
+            if &observed != expected {
+                return Err(CacheRejection::at_path(
+                    "symlink-input-changed-during-fingerprint",
+                    &file.relative,
+                ));
+            }
+            symlink_proofs.push(SymlinkProof {
+                relative: file.relative,
+                observation: observed,
+                content_digest: digest_bytes("symlink-target-content-v1", &bytes),
+            });
         }
     }
     Ok(InventoryFingerprints {
@@ -237,7 +330,120 @@ fn fingerprint_inventory(
         manifests: finish_digest(manifests),
         generated: finish_digest(generated),
         go_dependency_rescan_required,
+        symlink_proofs,
     })
+}
+
+fn observe_confined_symlink(
+    root: &Path,
+    link_path: &Path,
+    relative: &str,
+) -> Result<SymlinkObservation, CacheRejection> {
+    let metadata = fs::symlink_metadata(link_path)
+        .map_err(|_| CacheRejection::at_path("symlink-input-unavailable", relative))?;
+    if !metadata.file_type().is_symlink() {
+        return Err(CacheRejection::at_path("symlink-input-changed", relative));
+    }
+    let target = fs::read_link(link_path)
+        .map_err(|_| CacheRejection::at_path("symlink-target-unavailable", relative))?;
+    let link_target = target
+        .to_str()
+        .ok_or_else(|| CacheRejection::at_path("symlink-target-not-utf8", relative))?
+        .to_owned();
+    let unresolved = if target.is_absolute() {
+        target
+    } else {
+        link_path.parent().unwrap_or(root).join(target)
+    };
+    let canonical_target = unresolved.canonicalize().map_err(|error| {
+        CacheRejection::at_path(symlink_resolution_error_reason(&error), relative)
+    })?;
+    if !canonical_target.starts_with(root) {
+        return Err(CacheRejection::at_path(
+            "symlink-target-outside-root",
+            relative,
+        ));
+    }
+    let target_metadata = fs::metadata(&canonical_target)
+        .map_err(|_| CacheRejection::at_path("symlink-target-unavailable", relative))?;
+    if !target_metadata.is_file() {
+        return Err(CacheRejection::at_path("symlink-target-not-file", relative));
+    }
+    let cache_identity = if Path::new(&link_target).is_absolute() {
+        let relative_target = canonical_target
+            .strip_prefix(root)
+            .expect("confined symlink target must be beneath its root")
+            .to_str()
+            .ok_or_else(|| CacheRejection::at_path("symlink-target-not-utf8", relative))?
+            .replace('\\', "/");
+        format!("root:/{relative_target}")
+    } else {
+        format!("relative:{link_target}")
+    };
+    Ok(SymlinkObservation {
+        link_target,
+        cache_identity,
+        canonical_target,
+        length: target_metadata.len(),
+    })
+}
+
+fn symlink_resolution_error_reason(error: &std::io::Error) -> &'static str {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        "dangling-symlink"
+    } else if is_symlink_loop_error(error) {
+        "symlink-loop"
+    } else {
+        "symlink-target-unavailable"
+    }
+}
+
+fn is_symlink_loop_error(error: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        error.raw_os_error() == Some(libc::ELOOP)
+    }
+    #[cfg(windows)]
+    {
+        error.raw_os_error()
+            == Some(windows_sys::Win32::Foundation::ERROR_CANT_RESOLVE_FILENAME as i32)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        false
+    }
+}
+
+fn validate_symlink_proof(root: &Path, proof: &SymlinkProof) -> Result<(), CacheRejection> {
+    let root = root
+        .canonicalize()
+        .map_err(|_| CacheRejection::new("inventory-unavailable"))?;
+    let link_path = root.join(&proof.relative);
+    let before = observe_confined_symlink(&root, &link_path, &proof.relative)?;
+    if before != proof.observation {
+        return Err(CacheRejection::at_path(
+            "symlink-input-changed-before-cache-hit-promotion",
+            &proof.relative,
+        ));
+    }
+    let bytes = fs::read(&before.canonical_target)
+        .map_err(|_| CacheRejection::at_path("symlink-target-unavailable", &proof.relative))?;
+    if bytes.len() as u64 != before.length
+        || digest_bytes("symlink-target-content-v1", &bytes) != proof.content_digest
+    {
+        return Err(CacheRejection::at_path(
+            "symlink-input-changed-before-cache-hit-promotion",
+            &proof.relative,
+        ));
+    }
+    let after = observe_confined_symlink(&root, &link_path, &proof.relative)?;
+    if after != before {
+        return Err(CacheRejection::at_path(
+            "symlink-input-changed-before-cache-hit-promotion",
+            &proof.relative,
+        ));
+    }
+    Ok(())
 }
 
 fn fingerprint_adapters(workers: &[(AdapterKind, WorkerSpec)]) -> Result<String, ()> {
@@ -418,6 +624,20 @@ fn go_mod_requires_dependencies(bytes: &[u8]) -> bool {
     })
 }
 
+fn update_inventory_entry_digest(hasher: &mut Sha256, file: &InventoryFile, bytes: &[u8]) {
+    let Some(symlink) = &file.symlink else {
+        update_entry_digest(hasher, &file.relative, bytes);
+        return;
+    };
+    hasher.update(b"symlink\0");
+    hasher.update((file.relative.len() as u64).to_be_bytes());
+    hasher.update(file.relative.as_bytes());
+    hasher.update((symlink.cache_identity.len() as u64).to_be_bytes());
+    hasher.update(symlink.cache_identity.as_bytes());
+    hasher.update((bytes.len() as u64).to_be_bytes());
+    hasher.update(bytes);
+}
+
 fn update_entry_digest(hasher: &mut Sha256, path: &str, bytes: &[u8]) {
     hasher.update((path.len() as u64).to_be_bytes());
     hasher.update(path.as_bytes());
@@ -445,6 +665,158 @@ fn finish_digest(hasher: Sha256) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn repository_internal_symlink_is_fingerprinted_and_revalidated() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("CLAUDE.md"), "first\n").unwrap();
+        symlink("CLAUDE.md", root.path().join("WARP.md")).unwrap();
+        let profile_plan_id = format!("profile-selection-plan:sha256:{}", "1".repeat(64));
+        let ScanCachePreparation::Ready(first) =
+            prepare_scan_cache(root.path(), &Config::default(), &[], None, &profile_plan_id)
+        else {
+            panic!("root-confined symlink must remain cacheable");
+        };
+        assert_eq!(first.symlink_proofs.len(), 1);
+        validate_scan_cache_hit_inputs(root.path(), &first).unwrap();
+
+        fs::remove_file(root.path().join("WARP.md")).unwrap();
+        symlink("./CLAUDE.md", root.path().join("WARP.md")).unwrap();
+        let relinked_rejection = validate_scan_cache_hit_inputs(root.path(), &first).unwrap_err();
+        assert_eq!(
+            relinked_rejection,
+            CacheRejection::at_path(
+                "symlink-input-changed-before-cache-hit-promotion",
+                "WARP.md"
+            )
+        );
+        let ScanCachePreparation::Ready(relinked) =
+            prepare_scan_cache(root.path(), &Config::default(), &[], None, &profile_plan_id)
+        else {
+            panic!("relinked root-confined symlink must remain cacheable");
+        };
+        assert_ne!(first.syntax.key, relinked.syntax.key);
+
+        fs::write(root.path().join("CLAUDE.md"), "other\n").unwrap();
+        let rejection = validate_scan_cache_hit_inputs(root.path(), &relinked).unwrap_err();
+        assert_eq!(
+            rejection,
+            CacheRejection::at_path(
+                "symlink-input-changed-before-cache-hit-promotion",
+                "WARP.md"
+            )
+        );
+        let ScanCachePreparation::Ready(changed) =
+            prepare_scan_cache(root.path(), &Config::default(), &[], None, &profile_plan_id)
+        else {
+            panic!("changed root-confined symlink must remain cacheable");
+        };
+        assert_ne!(relinked.syntax.key, changed.syntax.key);
+        assert_ne!(
+            relinked.semantic.unwrap().key,
+            changed.semantic.unwrap().key
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn absolute_internal_symlink_identity_is_checkout_independent() {
+        use std::os::unix::fs::symlink;
+
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        for root in [&first, &second] {
+            fs::write(root.path().join("CLAUDE.md"), "fixture\n").unwrap();
+            symlink(root.path().join("CLAUDE.md"), root.path().join("WARP.md")).unwrap();
+        }
+        let profile_plan_id = format!("profile-selection-plan:sha256:{}", "1".repeat(64));
+        let ScanCachePreparation::Ready(first_plan) = prepare_scan_cache(
+            first.path(),
+            &Config::default(),
+            &[],
+            None,
+            &profile_plan_id,
+        ) else {
+            panic!("first absolute internal symlink must remain cacheable");
+        };
+        let ScanCachePreparation::Ready(second_plan) = prepare_scan_cache(
+            second.path(),
+            &Config::default(),
+            &[],
+            None,
+            &profile_plan_id,
+        ) else {
+            panic!("second absolute internal symlink must remain cacheable");
+        };
+        assert_eq!(first_plan.syntax.key, second_plan.syntax.key);
+        assert_eq!(
+            first_plan.semantic.unwrap().key,
+            second_plan.semantic.unwrap().key
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsafe_symlink_shapes_fail_closed_with_repository_relative_paths() {
+        use std::os::unix::fs::symlink;
+
+        let profile_plan_id = format!("profile-selection-plan:sha256:{}", "1".repeat(64));
+        let outside_root = tempfile::tempdir().unwrap();
+        let outside_target = outside_root.path().join("outside.md");
+        fs::write(&outside_target, "outside\n").unwrap();
+
+        let root_out = tempfile::tempdir().unwrap();
+        symlink(&outside_target, root_out.path().join("WARP.md")).unwrap();
+        let ScanCachePreparation::Rejected(root_out_rejection) = prepare_scan_cache(
+            root_out.path(),
+            &Config::default(),
+            &[],
+            None,
+            &profile_plan_id,
+        ) else {
+            panic!("root-out symlink must reject caching");
+        };
+        assert_eq!(
+            root_out_rejection,
+            CacheRejection::at_path("symlink-target-outside-root", "WARP.md")
+        );
+
+        let dangling = tempfile::tempdir().unwrap();
+        symlink("missing.md", dangling.path().join("WARP.md")).unwrap();
+        let ScanCachePreparation::Rejected(dangling_rejection) = prepare_scan_cache(
+            dangling.path(),
+            &Config::default(),
+            &[],
+            None,
+            &profile_plan_id,
+        ) else {
+            panic!("dangling symlink must reject caching");
+        };
+        assert_eq!(
+            dangling_rejection,
+            CacheRejection::at_path("dangling-symlink", "WARP.md")
+        );
+
+        let looped = tempfile::tempdir().unwrap();
+        symlink("second.md", looped.path().join("first.md")).unwrap();
+        symlink("first.md", looped.path().join("second.md")).unwrap();
+        let ScanCachePreparation::Rejected(loop_rejection) = prepare_scan_cache(
+            looped.path(),
+            &Config::default(),
+            &[],
+            None,
+            &profile_plan_id,
+        ) else {
+            panic!("symlink loop must reject caching");
+        };
+        assert_eq!(
+            loop_rejection,
+            CacheRejection::at_path("symlink-loop", "first.md")
+        );
+    }
 
     #[test]
     fn inventory_identity_is_checkout_independent_and_content_sensitive() {
