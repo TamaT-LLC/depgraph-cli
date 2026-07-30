@@ -317,58 +317,77 @@ pub async fn run_scan_with_cache_mode_and_cancellation(
                             }
                             Ok(()) => {
                                 let cached_coverage = hit.coverage();
-                                if !config.policy.rules.is_empty()
-                                    || (strict && violates_strict_policy(cached_coverage, config))
-                                {
-                                    store.clone_completed_scan_into_staging(
-                                        hit.snapshot_id(),
-                                        &scan_id,
-                                    )?;
-                                    return complete_scan(
+                                let requires_full_validation = !config.policy.rules.is_empty()
+                                    || (strict && violates_strict_policy(cached_coverage, config));
+                                if requires_full_validation {
+                                    if plan.has_symlink_proofs() {
+                                        record_cache_rejection(
+                                            store,
+                                            &scan_id,
+                                            "symlink-cache-hit-policy-requires-rescan",
+                                        )?;
+                                    } else {
+                                        store.clone_completed_scan_into_staging(
+                                            hit.snapshot_id(),
+                                            &scan_id,
+                                        )?;
+                                        return complete_scan(
+                                            store,
+                                            &scan_id,
+                                            strict,
+                                            config,
+                                            None,
+                                            &cancellation,
+                                        );
+                                    }
+                                } else {
+                                    let mut outcome = ScanOutcome {
+                                        scan_id: scan_id.clone(),
+                                        status: "completed".to_owned(),
+                                        exit_code: 0,
+                                        coverage: cached_coverage.clone(),
+                                        diagnostics: hit.diagnostics().to_vec(),
+                                        cache_events: Vec::new(),
+                                        policy: None,
+                                    };
+                                    match promote_validated_scan_cache_hit_if_active(
                                         store,
                                         &scan_id,
-                                        strict,
-                                        config,
-                                        None,
+                                        &root,
+                                        &plan,
+                                        &hit,
                                         &cancellation,
-                                    );
-                                }
-                                let mut outcome = ScanOutcome {
-                                    scan_id: scan_id.clone(),
-                                    status: "completed".to_owned(),
-                                    exit_code: 0,
-                                    coverage: cached_coverage.clone(),
-                                    diagnostics: hit.diagnostics().to_vec(),
-                                    cache_events: Vec::new(),
-                                    policy: None,
-                                };
-                                match promote_validated_scan_cache_hit_if_active(
-                                    store,
-                                    &scan_id,
-                                    &hit,
-                                    &cancellation,
-                                ) {
-                                    Some(Ok(())) => {
-                                        outcome.cache_events =
-                                            store.cache_events_for_scan(&scan_id)?;
-                                        return Ok(outcome);
+                                    ) {
+                                        Some(Ok(())) => {
+                                            outcome.cache_events =
+                                                store.cache_events_for_scan(&scan_id)?;
+                                            return Ok(outcome);
+                                        }
+                                        Some(Err(error)) => {
+                                            if let Some(rejection) =
+                                                error.downcast_ref::<CacheRejection>()
+                                            {
+                                                record_cache_preparation_rejection(
+                                                    store, &scan_id, rejection,
+                                                )?;
+                                            } else {
+                                                tracing::warn!(
+                                                    scan_id,
+                                                    error = %error,
+                                                    "validated semantic cache hit could not be promoted"
+                                                );
+                                                store.record_cache_event(
+                                                    Some(&scan_id),
+                                                    None,
+                                                    CacheLayer::Semantic,
+                                                    Some(&semantic_key.key),
+                                                    "reject",
+                                                    "promotion-proof-invalidated",
+                                                )?;
+                                            }
+                                        }
+                                        None => return cancel_scan(store, &scan_id),
                                     }
-                                    Some(Err(error)) => {
-                                        tracing::warn!(
-                                            scan_id,
-                                            error = %error,
-                                            "validated semantic cache hit could not be promoted"
-                                        );
-                                        store.record_cache_event(
-                                            Some(&scan_id),
-                                            None,
-                                            CacheLayer::Semantic,
-                                            Some(&semantic_key.key),
-                                            "reject",
-                                            "promotion-proof-invalidated",
-                                        )?;
-                                    }
-                                    None => return cancel_scan(store, &scan_id),
                                 }
                             }
                         }
@@ -666,10 +685,16 @@ pub(crate) fn cancel_scan(store: &mut Store, scan_id: &str) -> Result<ScanOutcom
 fn promote_validated_scan_cache_hit_if_active(
     store: &mut Store,
     scan_id: &str,
+    root: &Path,
+    plan: &ScanCachePlan,
     hit: &ValidatedScanCacheHit,
     cancellation: &CancellationToken,
 ) -> Option<Result<()>> {
-    cancellation.run_if_active(|| store.promote_validated_scan_cache_hit(scan_id, hit))
+    cancellation.run_if_active(|| {
+        store.promote_validated_scan_cache_hit_with_precommit(scan_id, hit, || {
+            validate_scan_cache_hit_inputs(root, plan).map_err(anyhow::Error::new)
+        })
+    })
 }
 
 pub(crate) fn complete_scan(
@@ -1605,11 +1630,11 @@ mod tests {
                 )
             }
         };
-        let semantic_key = cache_plan.semantic.context("semantic cache key")?;
+        let semantic_key = cache_plan.semantic.as_ref().context("semantic cache key")?;
 
         store.start_scan("cancelled-cache-hit", &root, false)?;
         let hit = store
-            .lookup_scan_cache(&cache_plan.syntax, &semantic_key, "cancelled-cache-hit")?
+            .lookup_scan_cache(&cache_plan.syntax, semantic_key, "cancelled-cache-hit")?
             .context("validated semantic cache hit")?;
         assert_eq!(hit.snapshot_id(), current);
         let cancellation = CancellationToken::new();
@@ -1619,6 +1644,8 @@ mod tests {
             promote_validated_scan_cache_hit_if_active(
                 &mut store,
                 "cancelled-cache-hit",
+                &root,
+                &cache_plan,
                 &hit,
                 &cancellation,
             )
@@ -1632,6 +1659,61 @@ mod tests {
         );
         assert_eq!(
             store.snapshot_id_for_source("scan", "cancelled-cache-hit")?,
+            None
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlink_change_at_cache_hit_precommit_never_promotes() -> Result<()> {
+        use std::{fs, os::unix::fs::symlink};
+
+        let root = tempfile::tempdir()?;
+        fs::write(root.path().join("CLAUDE.md"), "first\n")?;
+        symlink("CLAUDE.md", root.path().join("WARP.md"))?;
+        let root = root.path().canonicalize()?;
+        let config = Config::default();
+        let mut store = Store::open_in_memory()?;
+        run_scan(&mut store, root.clone(), &config, false).await?;
+        let current = store.current_snapshot_id()?.context("current snapshot")?;
+        let profile_plan = plan_repository_profiles(&root, &config, None)?.plan;
+        let cache_plan = match prepare_scan_cache(&root, &config, &[], None, &profile_plan.plan_id)
+        {
+            ScanCachePreparation::Ready(plan) => plan,
+            ScanCachePreparation::Rejected(rejection) => {
+                anyhow::bail!(
+                    "cache preparation unexpectedly rejected: {}",
+                    rejection.reason
+                )
+            }
+        };
+        let semantic_key = cache_plan.semantic.as_ref().context("semantic cache key")?;
+        store.start_scan("changed-cache-hit", &root, false)?;
+        let hit = store
+            .lookup_scan_cache(&cache_plan.syntax, semantic_key, "changed-cache-hit")?
+            .context("validated semantic cache hit")?;
+        validate_scan_cache_hit_inputs(&root, &cache_plan).map_err(anyhow::Error::new)?;
+
+        fs::write(root.join("CLAUDE.md"), "other\n")?;
+        let promotion = promote_validated_scan_cache_hit_if_active(
+            &mut store,
+            "changed-cache-hit",
+            &root,
+            &cache_plan,
+            &hit,
+            &CancellationToken::new(),
+        )
+        .context("active promotion")?;
+        let error = promotion.unwrap_err();
+        assert!(error.downcast_ref::<CacheRejection>().is_some());
+        assert_eq!(
+            store.current_snapshot_id()?.as_deref(),
+            Some(current.as_str())
+        );
+        assert_eq!(store.scan("changed-cache-hit")?.unwrap().status, "staging");
+        assert_eq!(
+            store.snapshot_id_for_source("scan", "changed-cache-hit")?,
             None
         );
         Ok(())
@@ -1694,6 +1776,68 @@ mod tests {
         assert_eq!(baseline_graph.file_coverage, linked_graph.file_coverage);
         assert_eq!(baseline_graph.adapter_logs, linked_graph.adapter_logs);
         assert_eq!(baseline_graph.coverage, linked_graph.coverage);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlink_cache_hit_with_architecture_policy_uses_worker_rescan() -> Result<()> {
+        use std::{fs, os::unix::fs::symlink};
+
+        let root = tempfile::tempdir()?;
+        fs::write(root.path().join("CLAUDE.md"), "fixture\n")?;
+        symlink("CLAUDE.md", root.path().join("WARP.md"))?;
+        let policy = serde_json::from_value(json!({
+            "schema_version":"1.0",
+            "rules":[{
+                "id":"empty-forbidden-dependency",
+                "kind":"forbidden_dependency",
+                "severity":"warning",
+                "source":{
+                    "kind":"file","field":"path","match":"exact",
+                    "value":"missing/source.rs","cardinality":"many",
+                    "exclude":[],"scope":{"paths":[],"packages":[]}
+                },
+                "target":{
+                    "kind":"file","field":"path","match":"exact",
+                    "value":"missing/target.rs","cardinality":"many",
+                    "exclude":[],"scope":{"paths":[],"packages":[]}
+                },
+                "profiles":{"include":[],"exclude":[]},
+                "condition":{"op":"eq","key":"mode","value":"production"},
+                "precisions":["exact"],
+                "resolution_statuses":["resolved"],
+                "evidence":{"kinds":["source"],"minimum_spans":1,"primary_only":true}
+            }],
+            "suppressions":[]
+        }))?;
+        let config = Config {
+            policy,
+            ..Config::default()
+        };
+        let mut store = Store::open_in_memory()?;
+
+        run_scan(&mut store, root.path().to_path_buf(), &config, false).await?;
+        let rescanned = run_scan(&mut store, root.path().to_path_buf(), &config, false).await?;
+
+        assert_eq!(rescanned.status, "completed");
+        assert!(rescanned.cache_events.iter().any(|event| {
+            event.layer == CacheLayer::Semantic
+                && event.outcome == "hit"
+                && event.reason == "validated"
+        }));
+        assert_eq!(
+            rescanned
+                .cache_events
+                .iter()
+                .filter(|event| {
+                    event.outcome == "reject"
+                        && event.reason == "symlink-cache-hit-policy-requires-rescan"
+                })
+                .count(),
+            2
+        );
+        assert!(!rescanned.coverage.project_code_executed);
         Ok(())
     }
 

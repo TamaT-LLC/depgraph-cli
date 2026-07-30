@@ -34,7 +34,8 @@ pub(crate) enum ScanCachePreparation {
     Rejected(CacheRejection),
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
+#[error("{reason}")]
 pub(crate) struct CacheRejection {
     pub reason: &'static str,
     pub path: Option<String>,
@@ -50,6 +51,12 @@ impl CacheRejection {
             reason,
             path: Some(path.to_owned()),
         }
+    }
+}
+
+impl ScanCachePlan {
+    pub(crate) fn has_symlink_proofs(&self) -> bool {
+        !self.symlink_proofs.is_empty()
     }
 }
 
