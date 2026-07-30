@@ -853,6 +853,28 @@ fn semantic_dependency_recognition_is_primary_evidence_driven() {
         .expect("unresolved source-primary type_use site");
     assert_eq!(type_use.resolution_status, ResolutionStatus::Unresolved);
     assert_eq!(type_use.precision, Precision::Heuristic);
+
+    let mut resolved = rust_source_dependency_values();
+    let concrete_target = node_id_by_display_name(&resolved, "Envelope");
+    set_source_type_use_resolution(
+        &mut resolved,
+        "resolved",
+        "heuristic",
+        &concrete_target,
+        "type",
+        Some("source declaration and explicit path prove the type target"),
+    );
+    let resolved = values_to_ndjson(resolved);
+    assert!(semantic_schema_accepts_stream(&resolved));
+    let validated = validate_safe_semantic_ndjson(Cursor::new(resolved))
+        .expect("syntax-proven resolved/heuristic source-primary type_use must validate");
+    let type_use = validated
+        .sites
+        .values()
+        .find(|site| site.kind == "type_use")
+        .expect("resolved source-primary type_use site");
+    assert_eq!(type_use.resolution_status, ResolutionStatus::Resolved);
+    assert_eq!(type_use.precision, Precision::Heuristic);
 }
 
 #[test]
@@ -860,17 +882,16 @@ fn source_fallback_contract_rejects_mutated_primary_evidence_and_metadata() {
     let mut cases = Vec::<(&str, Vec<Value>)>::new();
 
     let mut resolved_type_use = rust_source_dependency_values();
-    let concrete_target = node_id_by_display_name(&resolved_type_use, "Envelope");
     set_source_type_use_resolution(
         &mut resolved_type_use,
         "resolved",
         "heuristic",
-        &concrete_target,
-        "type",
+        "module:rust:source-type-use",
+        "module",
         None,
     );
     cases.push((
-        "source-primary type_use uses resolved status",
+        "resolved source-primary type_use targets a non-type node",
         resolved_type_use,
     ));
 

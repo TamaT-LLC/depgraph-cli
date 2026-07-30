@@ -349,6 +349,21 @@ impl ProtocolValidator {
                     .get(&completed.profile_id)
                     .expect("profile completion requires a declared profile");
                 validate_profile_completeness(profile, &completed.coverage)?;
+                if profile.language == "rust"
+                    && completed
+                        .coverage
+                        .completeness
+                        .contains(&CompletenessLevel::SemanticComplete)
+                    && let Some(site) = self.sites.values().find(|site| {
+                        site.profile_id == completed.profile_id
+                            && source_fallback_edge_kind_for_site(site).is_some()
+                    })
+                {
+                    return Err(ProtocolError::Invariant(format!(
+                        "Rust semantic-complete profile {} cannot retain source fallback dependency site {}",
+                        completed.profile_id, site.id
+                    )));
+                }
                 self.profile_coverage
                     .insert(completed.profile_id.clone(), completed.coverage.clone());
                 self.payload_closed = true;
@@ -1094,7 +1109,7 @@ fn validate_semantic_maps(
         let strict_dependency_site = strict_dependency_sites.contains(site.id.as_str());
         validate_semantic_site(site, strict_dependency_site)?;
         if source_fallback_edge_kind_for_site(site).is_some() {
-            validate_source_fallback_site(site)?;
+            validate_source_fallback_site(nodes, site)?;
             continue;
         }
         if semantic_edge_kind_for_site(site, strict_dependency_site).is_none() {
@@ -1453,21 +1468,37 @@ fn source_fallback_edge_kind_for_site(site: &DependencySite) -> Option<&'static 
     }
 }
 
-fn validate_source_fallback_site(site: &DependencySite) -> Result<(), ProtocolError> {
+fn validate_source_fallback_site(
+    nodes: &BTreeMap<String, GraphNode>,
+    site: &DependencySite,
+) -> Result<(), ProtocolError> {
     validate_primary_source_evidence(
         &format!("source fallback dependency site {}", site.id),
         &site.evidence,
     )?;
-    if site.kind == "type_use"
-        && (!matches!(
-            site.resolution_status,
-            ResolutionStatus::External | ResolutionStatus::Unresolved
-        ) || site.precision != Precision::Heuristic)
-    {
+    if site.kind == "type_use" && site.precision != Precision::Heuristic {
         return invariant(format!(
-            "source fallback type-use site {} must use external or unresolved status with heuristic precision",
+            "source fallback type-use site {} must use heuristic precision",
             site.id
         ));
+    }
+    if site.kind == "type_use"
+        && matches!(
+            site.resolution_status,
+            ResolutionStatus::Resolved | ResolutionStatus::Candidates
+        )
+    {
+        for target_id in &site.target_ids {
+            let target = nodes
+                .get(target_id)
+                .expect("base validation requires dependency-site targets to exist");
+            if target.kind != "type" {
+                return invariant(format!(
+                    "resolved source fallback type-use site {} target {} must be a type node",
+                    site.id, target.id
+                ));
+            }
+        }
     }
     Ok(())
 }

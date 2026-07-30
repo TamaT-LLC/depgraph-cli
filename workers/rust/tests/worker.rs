@@ -1062,7 +1062,7 @@ use defs::dual;
 }
 
 #[test]
-fn ambiguous_type_use_is_preserved_once_as_source_fallback() {
+fn ambiguous_type_use_is_preserved_once_as_candidate_source_fallback() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("ambiguous-type-fallback");
     write_minimal_crate(
@@ -1088,28 +1088,33 @@ pub mod right;
         .collect();
     assert_eq!(sites.len(), 1);
     let site = sites[0];
-    assert_eq!(site.resolution_status, ResolutionStatus::Unresolved);
+    assert_eq!(site.resolution_status, ResolutionStatus::Candidates);
     assert_eq!(site.precision, Precision::Heuristic);
     assert_eq!(site.evidence[0].kind, EvidenceKind::Source);
     assert_eq!(
         site.evidence[0].properties["semantic_refinement"],
         "unavailable"
     );
-    assert_eq!(site.target_ids.len(), 1);
-    assert!(
-        result
-            .nodes
-            .iter()
-            .any(|node| { node.id == site.target_ids[0] && node.kind == "unknown_target" })
-    );
+    assert_eq!(site.target_ids.len(), 2);
+    assert!(site.target_ids.iter().all(|target_id| {
+        result.nodes.iter().any(|node| {
+            node.id == *target_id
+                && node.kind == "type"
+                && node.properties["resolution_provenance"] == "static-syntax"
+        })
+    }));
     let linked: Vec<_> = result
         .edges
         .iter()
         .filter(|edge| edge.site_id.as_deref() == Some(site.id.as_str()))
         .collect();
-    assert_eq!(linked.len(), 1);
-    assert_eq!(linked[0].phase, Phase::Source);
-    assert_eq!(linked[0].kind, "type_uses");
+    assert_eq!(linked.len(), 2);
+    assert!(linked.iter().all(|edge| {
+        edge.phase == Phase::Source
+            && edge.kind == "type_uses"
+            && edge.resolution_status == ResolutionStatus::Candidates
+            && edge.precision == Precision::Heuristic
+    }));
     let external = result
         .sites
         .iter()
@@ -1185,11 +1190,16 @@ fn invalid_source_discards_the_hir_delta_and_preserves_syntax_output() {
     .unwrap();
 
     let result = scan(&root).unwrap();
+    assert!(result.nodes.iter().all(|node| node.kind != "symbol"));
     assert!(
         result
             .nodes
             .iter()
-            .all(|node| !matches!(node.kind.as_str(), "symbol" | "type"))
+            .filter(|node| node.kind == "type")
+            .all(|node| {
+                node.properties["resolution_provenance"] == "static-syntax"
+                    && !node.properties.contains_key("hir_provenance")
+            })
     );
     assert!(result.edges.iter().all(|edge| edge.phase == Phase::Source));
     assert_eq!(

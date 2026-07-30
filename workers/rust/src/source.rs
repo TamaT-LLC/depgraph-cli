@@ -200,6 +200,7 @@ pub(crate) enum Occurrence {
         alias: Option<String>,
         glob: bool,
         reexport: bool,
+        module_scope: bool,
         inline_ancestors: Vec<String>,
         condition: Condition,
         span: SourceSpan,
@@ -230,6 +231,13 @@ pub(crate) enum Occurrence {
         inline: bool,
         inline_ancestors: Vec<String>,
         path_override: Option<String>,
+        condition: Condition,
+        span: SourceSpan,
+    },
+    TypeDefinition {
+        name: String,
+        type_kind: String,
+        inline_ancestors: Vec<String>,
         condition: Condition,
         span: SourceSpan,
     },
@@ -1062,6 +1070,7 @@ impl<'ast> Visit<'ast> for Collector {
                 alias: leaf.alias,
                 glob: leaf.glob,
                 reexport,
+                module_scope: self.type_use_frames.is_empty(),
                 inline_ancestors: self.inline_modules.clone(),
                 condition: condition.clone(),
                 span: leaf.span,
@@ -1087,12 +1096,26 @@ impl<'ast> Visit<'ast> for Collector {
 
     fn visit_item_struct(&mut self, node: &'ast syn::ItemStruct) {
         let condition = self.condition(&node.attrs);
+        self.occurrences.push(Occurrence::TypeDefinition {
+            name: node.ident.to_string(),
+            type_kind: "struct".into(),
+            inline_ancestors: self.inline_modules.clone(),
+            condition: condition.clone(),
+            span: SourceSpan::from_span(node.ident.span()),
+        });
         self.collect_generics(&node.generics, &condition);
         self.collect_fields(&node.fields, &condition);
     }
 
     fn visit_item_enum(&mut self, node: &'ast syn::ItemEnum) {
         let condition = self.condition(&node.attrs);
+        self.occurrences.push(Occurrence::TypeDefinition {
+            name: node.ident.to_string(),
+            type_kind: "enum".into(),
+            inline_ancestors: self.inline_modules.clone(),
+            condition: condition.clone(),
+            span: SourceSpan::from_span(node.ident.span()),
+        });
         self.collect_generics(&node.generics, &condition);
         for variant in &node.variants {
             let variant_condition = self.child_condition(&condition, &variant.attrs);
@@ -1105,6 +1128,13 @@ impl<'ast> Visit<'ast> for Collector {
 
     fn visit_item_union(&mut self, node: &'ast syn::ItemUnion) {
         let condition = self.condition(&node.attrs);
+        self.occurrences.push(Occurrence::TypeDefinition {
+            name: node.ident.to_string(),
+            type_kind: "union".into(),
+            inline_ancestors: self.inline_modules.clone(),
+            condition: condition.clone(),
+            span: SourceSpan::from_span(node.ident.span()),
+        });
         self.collect_generics(&node.generics, &condition);
         for field in &node.fields.named {
             let field_condition = self.child_condition(&condition, &field.attrs);
@@ -1114,18 +1144,39 @@ impl<'ast> Visit<'ast> for Collector {
 
     fn visit_item_type(&mut self, node: &'ast syn::ItemType) {
         let condition = self.condition(&node.attrs);
+        self.occurrences.push(Occurrence::TypeDefinition {
+            name: node.ident.to_string(),
+            type_kind: "type_alias".into(),
+            inline_ancestors: self.inline_modules.clone(),
+            condition: condition.clone(),
+            span: SourceSpan::from_span(node.ident.span()),
+        });
         self.collect_generics(&node.generics, &condition);
         self.collect_type(&node.ty, TypeUseContext::TypeAlias, &condition);
     }
 
     fn visit_item_trait_alias(&mut self, node: &'ast syn::ItemTraitAlias) {
         let condition = self.condition(&node.attrs);
+        self.occurrences.push(Occurrence::TypeDefinition {
+            name: node.ident.to_string(),
+            type_kind: "trait_alias".into(),
+            inline_ancestors: self.inline_modules.clone(),
+            condition: condition.clone(),
+            span: SourceSpan::from_span(node.ident.span()),
+        });
         self.collect_generics(&node.generics, &condition);
         self.collect_bounds(&node.bounds, TypeUseContext::TraitBound, &condition);
     }
 
     fn visit_item_trait(&mut self, node: &'ast syn::ItemTrait) {
         let condition = self.condition(&node.attrs);
+        self.occurrences.push(Occurrence::TypeDefinition {
+            name: node.ident.to_string(),
+            type_kind: "trait".into(),
+            inline_ancestors: self.inline_modules.clone(),
+            condition: condition.clone(),
+            span: SourceSpan::from_span(node.ident.span()),
+        });
         self.collect_generics(&node.generics, &condition);
         self.collect_bounds(&node.supertraits, TypeUseContext::TraitBound, &condition);
         self.inherited_conditions.push(condition);
@@ -2320,6 +2371,38 @@ mod tests {
             text_at_span(source, *span),
             "::external::Thing as LocalThing"
         );
+    }
+
+    #[test]
+    fn distinguishes_module_scope_imports_from_block_local_imports() {
+        let source = concat!(
+            "use crate::Outer;\n",
+            "fn run() {\n",
+            "    use crate::BlockLocal;\n",
+            "    let _: BlockLocal;\n",
+            "}\n",
+            "mod nested {\n",
+            "    use crate::Nested;\n",
+            "}\n",
+        );
+        let occurrences = collect_occurrences(&syn::parse_file(source).unwrap());
+        let module_scope = |specifier: &str| {
+            occurrences
+                .iter()
+                .find_map(|occurrence| match occurrence {
+                    Occurrence::Use {
+                        target_specifier,
+                        module_scope,
+                        ..
+                    } if target_specifier == specifier => Some(*module_scope),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("missing use {specifier}"))
+        };
+
+        assert!(module_scope("crate::Outer"));
+        assert!(!module_scope("crate::BlockLocal"));
+        assert!(module_scope("crate::Nested"));
     }
 
     #[test]
