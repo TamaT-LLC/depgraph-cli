@@ -80,6 +80,37 @@ fn source_content_hash(source: &str) -> String {
     output
 }
 
+fn ordered_string_digest<'a>(values: impl Iterator<Item = &'a str>) -> String {
+    use std::fmt::Write as _;
+
+    let mut hasher = Sha256::new();
+    for value in values {
+        hasher.update((value.len() as u64).to_be_bytes());
+        hasher.update(value.as_bytes());
+    }
+    let mut output = String::from("sha256:");
+    for byte in hasher.finalize() {
+        write!(&mut output, "{byte:02x}").expect("writing a digest to String cannot fail");
+    }
+    output
+}
+
+fn ordered_path_counts_digest(path_counts: &BTreeMap<String, u64>) -> String {
+    use std::fmt::Write as _;
+
+    let mut hasher = Sha256::new();
+    for (path, count) in path_counts {
+        hasher.update((path.len() as u64).to_be_bytes());
+        hasher.update(path.as_bytes());
+        hasher.update(count.to_be_bytes());
+    }
+    let mut output = String::from("sha256:");
+    for byte in hasher.finalize() {
+        write!(&mut output, "{byte:02x}").expect("writing a digest to String cannot fail");
+    }
+    output
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct ModuleContext {
     scope: String,
@@ -93,12 +124,62 @@ struct ModuleKey {
     path: Vec<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct SyntaxTypeKey {
+    package_index: usize,
+    scope: String,
+    path: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct SyntaxTypeCandidate {
+    node: GraphNode,
+    condition: Condition,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RustPreludePolicy {
+    implicit: bool,
+    std: bool,
+}
+
+impl Default for RustPreludePolicy {
+    fn default() -> Self {
+        Self {
+            implicit: true,
+            std: true,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct TargetResolution {
     target_ids: Vec<String>,
     status: ResolutionStatus,
     precision: Precision,
     reason: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SyntaxImportBinding {
+    local_name: String,
+    target_specifier: String,
+    inline_ancestors: Vec<String>,
+    condition: Condition,
+    span: SourceSpan,
+}
+
+#[derive(Debug)]
+struct AggregatedDiagnostic {
+    severity: DiagnosticSeverity,
+    code: String,
+    message: String,
+    site_kind: String,
+    resolution_class: String,
+    remediation: String,
+    occurrence_count: u64,
+    path_counts: BTreeMap<String, u64>,
+    site_evidence: BTreeMap<String, Evidence>,
 }
 
 type SemanticExtractor = fn(
@@ -121,10 +202,13 @@ struct State {
     edges: BTreeMap<String, GraphEdge>,
     sites: BTreeMap<String, DependencySite>,
     diagnostics: BTreeMap<String, Diagnostic>,
+    aggregated_diagnostics: BTreeMap<String, AggregatedDiagnostic>,
     files: BTreeMap<String, FileCoverage>,
     package_nodes: BTreeMap<usize, String>,
     file_nodes: BTreeMap<String, String>,
     module_nodes: BTreeMap<ModuleKey, BTreeSet<String>>,
+    syntax_type_nodes: BTreeMap<SyntaxTypeKey, Vec<SyntaxTypeCandidate>>,
+    rust_prelude_policies: BTreeMap<usize, RustPreludePolicy>,
     source_module_contexts: BTreeMap<(usize, String), BTreeSet<ModuleContext>>,
     dependency_resolutions: BTreeMap<(usize, String), TargetResolution>,
     semantic_use_occurrences: BTreeSet<UseOccurrenceKey>,
@@ -389,6 +473,7 @@ fn scan_with_inventory_and_semantic_extractor(
     state.add_manifest_dependencies(&packages, lock.path.as_deref())?;
     state.add_unexecuted_build_capabilities(&packages)?;
     state.index_modules(&packages, &sources)?;
+    state.index_syntax_types(&packages, &sources)?;
     let hir_model = state.build_hir_project_model(
         &packages,
         &sources,
@@ -418,10 +503,13 @@ impl State {
             edges: BTreeMap::new(),
             sites: BTreeMap::new(),
             diagnostics: BTreeMap::new(),
+            aggregated_diagnostics: BTreeMap::new(),
             files: BTreeMap::new(),
             package_nodes: BTreeMap::new(),
             file_nodes: BTreeMap::new(),
             module_nodes: BTreeMap::new(),
+            syntax_type_nodes: BTreeMap::new(),
+            rust_prelude_policies: BTreeMap::new(),
             source_module_contexts: BTreeMap::new(),
             dependency_resolutions: BTreeMap::new(),
             semantic_use_occurrences: BTreeSet::new(),
@@ -434,7 +522,48 @@ impl State {
         }
     }
 
-    fn finish(self) -> Result<ScanResult> {
+    fn finish(mut self) -> Result<ScanResult> {
+        self.flush_aggregated_diagnostics();
+        let fallback_summary = syntax_fallback_summary(self.sites.values());
+        let summary_count = |class: &str| {
+            fallback_summary
+                .get("resolution_class_counts")
+                .and_then(|counts| counts.get(class))
+                .and_then(Value::as_u64)
+                .unwrap_or_default()
+        };
+        let summary_id = self.id(
+            "diagnostic",
+            None,
+            None,
+            Some(&self.profile.id),
+            "RUST_SYNTAX_FALLBACK_SUMMARY:profile",
+        );
+        self.diagnostics.insert(
+            summary_id.clone(),
+            Diagnostic {
+                id: summary_id,
+                severity: DiagnosticSeverity::Info,
+                code: "RUST_SYNTAX_FALLBACK_SUMMARY".into(),
+                message: format!(
+                    "Rust fallback classification: {} syntax-proven site(s), {} site(s) require HIR, and {} site(s) require macro or build execution",
+                    summary_count("syntax_proven"),
+                    summary_count("hir_required"),
+                    summary_count("macro_execution_required"),
+                ),
+                profile_id: Some(self.profile.id.clone()),
+                path: None,
+                start_line: None,
+                start_column: None,
+                end_line: None,
+                end_column: None,
+                evidence: Vec::new(),
+                properties: properties(fallback_summary.clone()),
+            },
+        );
+        self.profile
+            .properties
+            .insert("rust_syntax_fallback_summary".into(), fallback_summary);
         let nodes: Vec<_> = self.nodes.into_values().collect();
         let edges: Vec<_> = self.edges.into_values().collect();
         let sites: Vec<_> = self.sites.into_values().collect();
@@ -1758,6 +1887,108 @@ impl State {
         Ok(())
     }
 
+    fn index_syntax_types(&mut self, packages: &[Package], sources: &[SourceUnit]) -> Result<()> {
+        for source in sources {
+            let (Some(package_index), Some(syntax)) =
+                (source.package_index, source.syntax.as_ref())
+            else {
+                continue;
+            };
+            let package = &packages[package_index];
+            let prelude_policy = self.rust_prelude_policies.entry(package_index).or_default();
+            if syntax_mentions_attribute(syntax, "no_implicit_prelude") {
+                prelude_policy.implicit = false;
+            }
+            if syntax_mentions_attribute(syntax, "no_std") {
+                prelude_policy.std = false;
+            }
+            let package_locator = package_locator(package);
+            let contexts = self
+                .source_module_contexts
+                .get(&(package_index, source.rel_path.clone()))
+                .cloned()
+                .unwrap_or_default();
+            for occurrence in collect_occurrences(syntax) {
+                let Occurrence::TypeDefinition {
+                    name,
+                    type_kind,
+                    inline_ancestors,
+                    condition,
+                    span,
+                } = occurrence
+                else {
+                    continue;
+                };
+                for context in &contexts {
+                    let mut type_path = context.path.clone();
+                    type_path.extend(inline_ancestors.iter().cloned());
+                    type_path.push(name.clone());
+                    let canonical_name = type_path.join("::");
+                    let resolver_identity = format!(
+                        "syntax:{}:{canonical_name}:{}:{}:{}:{}:{}",
+                        context.scope,
+                        source.rel_path,
+                        span.start_line,
+                        span.start_column,
+                        span.end_line,
+                        span.end_column,
+                    );
+                    let identity = json!({
+                        "language": "rust",
+                        "package_locator": package_locator,
+                        "crate_identity": context.scope,
+                        "type_kind": type_kind,
+                        "resolver_identity": resolver_identity,
+                    });
+                    let node_id = stable_id_from_value("type", &identity);
+                    let node = GraphNode {
+                        id: node_id.clone(),
+                        kind: "type".into(),
+                        locator: format!("rust-syntax-type:{package_locator}:{canonical_name}"),
+                        display_name: Some(name.clone()),
+                        properties: properties(json!({
+                            "language": "rust",
+                            "package_locator": package_locator,
+                            "crate_identity": context.scope,
+                            "type_kind": type_kind,
+                            "canonical_identity": identity,
+                            "resolver_identity": resolver_identity,
+                            "profile_id": self.profile.id,
+                            "source_path": source.rel_path,
+                            "source_span": {
+                                "start_line": span.start_line,
+                                "start_column": span.start_column,
+                                "end_line": span.end_line,
+                                "end_column": span.end_column,
+                            },
+                            "resolution_provenance": "static-syntax",
+                            "syntax_proven": true,
+                        })),
+                    };
+                    self.syntax_type_nodes
+                        .entry(SyntaxTypeKey {
+                            package_index,
+                            scope: context.scope.clone(),
+                            path: type_path.clone(),
+                        })
+                        .or_default()
+                        .push(SyntaxTypeCandidate {
+                            node,
+                            condition: condition.clone(),
+                        });
+                }
+            }
+        }
+        for candidates in self.syntax_type_nodes.values_mut() {
+            candidates.sort_by(|left, right| {
+                (&left.node.id, left.condition.render())
+                    .cmp(&(&right.node.id, right.condition.render()))
+            });
+            candidates.dedup();
+        }
+        Ok(())
+    }
+
     fn extract_source_dependencies(
         &mut self,
         packages: &[Package],
@@ -1768,7 +1999,9 @@ impl State {
                 continue;
             };
             let source_node = self.file_nodes[&source.rel_path].clone();
-            for occurrence in collect_occurrences(syntax) {
+            let occurrences = collect_occurrences(syntax);
+            let import_bindings = syntax_import_bindings(&occurrences);
+            for occurrence in occurrences {
                 match occurrence {
                     Occurrence::Use {
                         target_specifier,
@@ -1776,6 +2009,7 @@ impl State {
                         alias,
                         glob,
                         reexport,
+                        module_scope: _,
                         inline_ancestors,
                         condition,
                         span,
@@ -1840,6 +2074,9 @@ impl State {
                             source.package_index,
                             &specifier,
                             &source.rel_path,
+                            &inline_ancestors,
+                            &condition,
+                            &import_bindings,
                             span,
                         )?;
                         let mut evidence =
@@ -1851,6 +2088,17 @@ impl State {
                         evidence.properties.insert(
                             "semantic_refinement".into(),
                             Value::String("unavailable".into()),
+                        );
+                        evidence.properties.insert(
+                            "fallback_resolution_class".into(),
+                            Value::String(
+                                if resolution.status == ResolutionStatus::Unresolved {
+                                    "hir_required"
+                                } else {
+                                    "syntax_proven"
+                                }
+                                .into(),
+                            ),
                         );
                         self.add_site(
                             &source_node,
@@ -2010,7 +2258,11 @@ impl State {
                             "macro_boundary_kind".into(),
                             Value::String(boundary_kind.as_str().into()),
                         );
-                        self.add_site(
+                        evidence.properties.insert(
+                            "fallback_resolution_class".into(),
+                            Value::String("macro_execution_required".into()),
+                        );
+                        let site_id = self.add_site(
                             &source_node,
                             site_kind,
                             &specifier,
@@ -2021,22 +2273,16 @@ impl State {
                         )?;
                         self.increment_file_site(&source.rel_path);
                         self.reasons.insert(coverage_reason.into());
-                        self.add_diagnostic(
+                        self.add_aggregated_diagnostic(
                             DiagnosticSeverity::Warning,
                             diagnostic_code,
                             message,
-                            Some(&source.rel_path),
-                            Some(evidence),
-                            &format!(
-                                "{}:{}:{}:{}:{}:{}:{}",
-                                source.rel_path,
-                                span.start_line,
-                                span.start_column,
-                                span.end_line,
-                                span.end_column,
-                                boundary_kind.as_str(),
-                                specifier
-                            ),
+                            site_kind,
+                            "macro_execution_required",
+                            "safe scan intentionally does not execute macro code; inspect the preserved dependency sites or use an explicitly authorized build observation",
+                            &source.rel_path,
+                            &site_id,
+                            evidence,
                         );
                     }
                     Occurrence::BuildEnvironmentMacro {
@@ -2087,7 +2333,11 @@ impl State {
                                 Value::String(variable.clone()),
                             );
                         }
-                        self.add_site(
+                        evidence.properties.insert(
+                            "fallback_resolution_class".into(),
+                            Value::String("macro_execution_required".into()),
+                        );
+                        let site_id = self.add_site(
                             &source_node,
                             "build_environment",
                             specifier,
@@ -2098,22 +2348,16 @@ impl State {
                         )?;
                         self.increment_file_site(&source.rel_path);
                         self.reasons.insert(coverage_reason.into());
-                        self.add_diagnostic(
+                        self.add_aggregated_diagnostic(
                             DiagnosticSeverity::Warning,
                             diagnostic_code,
                             message,
-                            Some(&source.rel_path),
-                            Some(evidence),
-                            &format!(
-                                "{}:{}:{}:{}:{}:{}:{}",
-                                source.rel_path,
-                                span.start_line,
-                                span.start_column,
-                                span.end_line,
-                                span.end_column,
-                                macro_name,
-                                specifier
-                            ),
+                            "build_environment",
+                            "macro_execution_required",
+                            "safe scan intentionally does not evaluate the project build environment; inspect the preserved dependency sites or use an explicitly authorized build observation",
+                            &source.rel_path,
+                            &site_id,
+                            evidence,
                         );
                     }
                     Occurrence::UnsupportedAttribute {
@@ -2131,12 +2375,16 @@ impl State {
                             span,
                             &reason,
                         )?;
-                        let evidence = source_evidence(
+                        let mut evidence = source_evidence(
                             &source.rel_path,
                             span,
                             "unsupported Rust attribute payload",
                         );
-                        self.add_site(
+                        evidence.properties.insert(
+                            "fallback_resolution_class".into(),
+                            Value::String("macro_execution_required".into()),
+                        );
+                        let site_id = self.add_site(
                             &source_node,
                             "unsupported_attribute",
                             &specifier,
@@ -2146,21 +2394,16 @@ impl State {
                             evidence.clone(),
                         )?;
                         self.increment_file_site(&source.rel_path);
-                        self.add_diagnostic(
+                        self.add_aggregated_diagnostic(
                             DiagnosticSeverity::Warning,
                             "RUST_ATTRIBUTE_UNSUPPORTED",
                             "A Rust attribute payload could not be parsed and was preserved as an unresolved boundary",
-                            Some(&source.rel_path),
-                            Some(evidence),
-                            &format!(
-                                "{}:{}:{}:{}:{}:{}",
-                                source.rel_path,
-                                span.start_line,
-                                span.start_column,
-                                span.end_line,
-                                span.end_column,
-                                specifier
-                            ),
+                            "unsupported_attribute",
+                            "macro_execution_required",
+                            "safe scan does not interpret unsupported attribute or proc-macro payloads; inspect the preserved dependency sites",
+                            &source.rel_path,
+                            &site_id,
+                            evidence,
                         );
                     }
                     Occurrence::UnsupportedMacroArguments {
@@ -2178,12 +2421,16 @@ impl State {
                             span,
                             reason,
                         )?;
-                        let evidence = source_evidence(
+                        let mut evidence = source_evidence(
                             &source.rel_path,
                             span,
                             "unsupported built-in macro arguments",
                         );
-                        self.add_site(
+                        evidence.properties.insert(
+                            "fallback_resolution_class".into(),
+                            Value::String("macro_execution_required".into()),
+                        );
+                        let site_id = self.add_site(
                             &source_node,
                             "unsupported_macro_arguments",
                             &specifier,
@@ -2193,37 +2440,37 @@ impl State {
                             evidence.clone(),
                         )?;
                         self.increment_file_site(&source.rel_path);
-                        self.add_diagnostic(
+                        self.add_aggregated_diagnostic(
                             DiagnosticSeverity::Warning,
                             "RUST_MACRO_ARGUMENTS_UNSUPPORTED",
                             "Built-in macro arguments could not be parsed recursively; completeness was withheld",
-                            Some(&source.rel_path),
-                            Some(evidence),
-                            &format!(
-                                "{}:{}:{}:{}:{}:{}",
-                                source.rel_path,
-                                span.start_line,
-                                span.start_column,
-                                span.end_line,
-                                span.end_column,
-                                specifier
-                            ),
+                            "unsupported_macro_arguments",
+                            "macro_execution_required",
+                            "safe scan does not evaluate unsupported macro arguments; inspect the preserved dependency sites",
+                            &source.rel_path,
+                            &site_id,
+                            evidence,
                         );
                     }
                     Occurrence::Call { .. } => {}
                     Occurrence::Module { inline: true, .. } => {}
+                    Occurrence::TypeDefinition { .. } => {}
                 }
             }
         }
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn resolve_rust_type_fallback(
         &mut self,
         packages: &[Package],
         package_index: Option<usize>,
         specifier: &str,
         path: &str,
+        inline_ancestors: &[String],
+        condition: &Condition,
+        import_bindings: &[SyntaxImportBinding],
         span: SourceSpan,
     ) -> Result<TargetResolution> {
         let first = specifier
@@ -2231,6 +2478,139 @@ impl State {
             .find(|part| !part.is_empty())
             .unwrap_or(specifier)
             .trim_start_matches("r#");
+        if !specifier.contains("::") {
+            if let Some(resolution) = self.resolve_syntax_type_path(
+                packages,
+                package_index,
+                specifier,
+                path,
+                inline_ancestors,
+                condition,
+            )? {
+                return Ok(resolution);
+            }
+            let matching_imports: Vec<_> = import_bindings
+                .iter()
+                .filter(|binding| {
+                    binding.local_name == first
+                        && binding.inline_ancestors == inline_ancestors
+                        && (binding.condition == Condition::default()
+                            || binding.condition == *condition)
+                })
+                .cloned()
+                .collect();
+            if !matching_imports.is_empty() {
+                let mut targets = BTreeSet::new();
+                let mut external_only = true;
+                for binding in matching_imports {
+                    if let Some(resolution) = self.resolve_syntax_type_path(
+                        packages,
+                        package_index,
+                        &binding.target_specifier,
+                        path,
+                        &binding.inline_ancestors,
+                        condition,
+                    )? {
+                        external_only = false;
+                        targets.extend(resolution.target_ids);
+                    } else {
+                        let resolution = self.resolve_rust_path(
+                            packages,
+                            package_index,
+                            &binding.target_specifier,
+                            path,
+                            &binding.inline_ancestors,
+                            binding.span,
+                        )?;
+                        if resolution.status == ResolutionStatus::External {
+                            targets.extend(resolution.target_ids);
+                        }
+                    }
+                }
+                if !targets.is_empty() {
+                    let target_ids: Vec<_> = targets.into_iter().collect();
+                    return Ok(if target_ids.len() == 1 {
+                        TargetResolution {
+                            target_ids,
+                            status: if external_only {
+                                ResolutionStatus::External
+                            } else {
+                                ResolutionStatus::Resolved
+                            },
+                            precision: Precision::Heuristic,
+                            reason: Some(format!(
+                                "type use is syntax-resolved through the module-scope import for {first}"
+                            )),
+                        }
+                    } else {
+                        TargetResolution {
+                            target_ids,
+                            status: ResolutionStatus::Candidates,
+                            precision: Precision::Heuristic,
+                            reason: Some(format!(
+                                "module-scope imports for {first} have multiple syntax-proven targets"
+                            )),
+                        }
+                    });
+                }
+            }
+            let prelude = package_index
+                .and_then(|index| {
+                    packages.get(index).map(|package| {
+                        (
+                            package.edition.as_str(),
+                            self.rust_prelude_policies
+                                .get(&index)
+                                .copied()
+                                .unwrap_or_default(),
+                        )
+                    })
+                })
+                .filter(|(edition, policy)| rust_prelude_type(first, edition, *policy));
+            if let Some((_, policy)) = prelude {
+                let prelude_crate = if policy.std { "std" } else { "core" };
+                let target = self.external_node(
+                    &format!("rust-sysroot:{prelude_crate}-prelude:{first}"),
+                    first,
+                    Some(RUST_TOOLCHAIN_BASELINE),
+                )?;
+                return Ok(TargetResolution {
+                    target_ids: vec![target],
+                    status: ResolutionStatus::External,
+                    precision: Precision::Heuristic,
+                    reason: Some(format!(
+                        "{first} is provided by the Rust {prelude_crate} prelude; a macro or glob shadow can only be excluded by HIR"
+                    )),
+                });
+            }
+        } else {
+            if let Some(resolution) = self.resolve_syntax_type_path(
+                packages,
+                package_index,
+                specifier,
+                path,
+                inline_ancestors,
+                condition,
+            )? {
+                return Ok(resolution);
+            }
+            let mut resolution = self.resolve_rust_path(
+                packages,
+                package_index,
+                specifier,
+                path,
+                inline_ancestors,
+                span,
+            )?;
+            if resolution.status == ResolutionStatus::External {
+                resolution.precision = Precision::Heuristic;
+                resolution.reason = Some(
+                    "qualified type path has a syntax-proven external crate root; exact item resolution requires HIR"
+                        .into(),
+                );
+                return Ok(resolution);
+            }
+        }
         if matches!(first, "std" | "core" | "alloc" | "proc_macro") {
             let target = self.external_node(&format!("rust-sysroot:{first}"), first, None)?;
             return Ok(TargetResolution {
@@ -2265,6 +2645,114 @@ impl State {
         );
         let unknown = self.unknown_node("rust_type", specifier, path, span, &reason)?;
         Ok(unresolved(unknown, &reason))
+    }
+
+    fn resolve_syntax_type_path(
+        &mut self,
+        packages: &[Package],
+        package_index: Option<usize>,
+        specifier: &str,
+        path: &str,
+        inline_ancestors: &[String],
+        condition: &Condition,
+    ) -> Result<Option<TargetResolution>> {
+        let Some(package_index) = package_index else {
+            return Ok(None);
+        };
+        let Some(package) = packages.get(package_index) else {
+            return Ok(None);
+        };
+        let parts = specifier
+            .split("::")
+            .filter(|part| !part.is_empty())
+            .map(|part| part.trim_start_matches("r#").to_owned())
+            .collect::<Vec<_>>();
+        let Some(first) = parts.first().map(String::as_str) else {
+            return Ok(None);
+        };
+
+        let Some(contexts) = self
+            .source_module_contexts
+            .get(&(package_index, path.to_owned()))
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        let mut targets = BTreeMap::<String, GraphNode>::new();
+        for context in &contexts {
+            let mut type_path;
+            let mut cursor;
+            match first {
+                "crate" => {
+                    type_path = Vec::new();
+                    cursor = 1;
+                }
+                "self" => {
+                    type_path = context.path.clone();
+                    type_path.extend(inline_ancestors.iter().cloned());
+                    cursor = 1;
+                }
+                "super" => {
+                    type_path = context.path.clone();
+                    type_path.extend(inline_ancestors.iter().cloned());
+                    cursor = 0;
+                    while parts.get(cursor).is_some_and(|part| part == "super") {
+                        type_path.pop();
+                        cursor += 1;
+                    }
+                }
+                package_name if package_name == package.name.replace('-', "_") => {
+                    type_path = Vec::new();
+                    cursor = 1;
+                }
+                _ => {
+                    type_path = context.path.clone();
+                    type_path.extend(inline_ancestors.iter().cloned());
+                    cursor = 0;
+                }
+            }
+            type_path.extend(parts[cursor..].iter().cloned());
+            let key = SyntaxTypeKey {
+                package_index,
+                scope: context.scope.clone(),
+                path: type_path,
+            };
+            if let Some(candidates) = self.syntax_type_nodes.get(&key) {
+                targets.extend(
+                    candidates
+                        .iter()
+                        .filter(|candidate| {
+                            candidate.condition == Condition::default()
+                                || candidate.condition == *condition
+                        })
+                        .map(|candidate| (candidate.node.id.clone(), candidate.node.clone())),
+                );
+            }
+        }
+        for node in targets.values().cloned() {
+            self.insert_node(node)?;
+        }
+        let target_ids = targets.into_keys().collect::<Vec<_>>();
+        Ok(match target_ids.len() {
+            0 => None,
+            1 => Some(TargetResolution {
+                target_ids,
+                status: ResolutionStatus::Resolved,
+                precision: Precision::Heuristic,
+                reason: Some(
+                    "type path matches an explicit source declaration in the same static crate graph"
+                        .into(),
+                ),
+            }),
+            _ => Some(TargetResolution {
+                target_ids,
+                status: ResolutionStatus::Candidates,
+                precision: Precision::Heuristic,
+                reason: Some(
+                    "type path matches multiple condition-compatible source declarations".into(),
+                ),
+            }),
+        })
     }
 
     fn resolve_rust_path(
@@ -2543,7 +3031,7 @@ impl State {
         condition: Condition,
         resolution: TargetResolution,
         evidence: Evidence,
-    ) -> Result<()> {
+    ) -> Result<String> {
         let condition = condition.canonicalize();
         let language_identity = format!(
             "site:{source}:{site_kind}:{specifier}:{}:{}:{}:{}:{}:{}",
@@ -2605,7 +3093,7 @@ impl State {
                 evidence: vec![evidence.clone()],
             })?;
         }
-        Ok(())
+        Ok(site_id)
     }
 
     fn add_structural_edge(
@@ -2779,6 +3267,163 @@ impl State {
         file.skipped = true;
         file.reason = Some(reason.into());
         self.reasons.insert("file-skipped".into());
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn add_aggregated_diagnostic(
+        &mut self,
+        severity: DiagnosticSeverity,
+        code: &str,
+        message: &str,
+        site_kind: &str,
+        resolution_class: &str,
+        remediation: &str,
+        path: &str,
+        site_id: &str,
+        mut evidence: Evidence,
+    ) {
+        let key = format!("{code}:{site_kind}:{resolution_class}");
+        evidence.properties.insert(
+            "fallback_diagnostic_group".into(),
+            Value::String(key.clone()),
+        );
+        evidence.properties.insert(
+            "fallback_diagnostic_code".into(),
+            Value::String(code.into()),
+        );
+        if let Some(site) = self.sites.get_mut(site_id) {
+            for site_evidence in &mut site.evidence {
+                site_evidence.properties.insert(
+                    "fallback_diagnostic_group".into(),
+                    Value::String(key.clone()),
+                );
+                site_evidence.properties.insert(
+                    "fallback_diagnostic_code".into(),
+                    Value::String(code.into()),
+                );
+            }
+        }
+        for edge in self
+            .edges
+            .values_mut()
+            .filter(|edge| edge.site_id.as_deref() == Some(site_id))
+        {
+            for edge_evidence in &mut edge.evidence {
+                edge_evidence.properties.insert(
+                    "fallback_diagnostic_group".into(),
+                    Value::String(key.clone()),
+                );
+                edge_evidence.properties.insert(
+                    "fallback_diagnostic_code".into(),
+                    Value::String(code.into()),
+                );
+            }
+        }
+        let entry =
+            self.aggregated_diagnostics
+                .entry(key)
+                .or_insert_with(|| AggregatedDiagnostic {
+                    severity,
+                    code: code.into(),
+                    message: message.into(),
+                    site_kind: site_kind.into(),
+                    resolution_class: resolution_class.into(),
+                    remediation: remediation.into(),
+                    occurrence_count: 0,
+                    path_counts: BTreeMap::new(),
+                    site_evidence: BTreeMap::new(),
+                });
+        entry.occurrence_count += 1;
+        *entry.path_counts.entry(path.into()).or_default() += 1;
+        entry
+            .site_evidence
+            .entry(site_id.into())
+            .or_insert(evidence);
+    }
+
+    fn flush_aggregated_diagnostics(&mut self) {
+        const REPRESENTATIVE_LIMIT: usize = 5;
+        const PATH_REPRESENTATIVE_LIMIT: usize = 64;
+
+        for aggregate in std::mem::take(&mut self.aggregated_diagnostics).into_values() {
+            let affected_site_ids = aggregate.site_evidence.keys().cloned().collect::<Vec<_>>();
+            let representative_site_ids = affected_site_ids
+                .iter()
+                .take(REPRESENTATIVE_LIMIT)
+                .cloned()
+                .collect::<Vec<_>>();
+            let representative_evidence = aggregate
+                .site_evidence
+                .values()
+                .take(REPRESENTATIVE_LIMIT)
+                .cloned()
+                .collect::<Vec<_>>();
+            let representative_count = representative_evidence.len() as u64;
+            let omitted_evidence_count = affected_site_ids
+                .len()
+                .saturating_sub(representative_evidence.len());
+            let affected_site_ids_digest =
+                ordered_string_digest(affected_site_ids.iter().map(String::as_str));
+            let affected_path_counts_digest = ordered_path_counts_digest(&aggregate.path_counts);
+            let affected_path_count = aggregate.path_counts.len();
+            let affected_path_counts = aggregate
+                .path_counts
+                .iter()
+                .take(PATH_REPRESENTATIVE_LIMIT)
+                .map(|(path, count)| (path.clone(), *count))
+                .collect::<BTreeMap<_, _>>();
+            let diagnostic_group = format!(
+                "{}:{}:{}",
+                aggregate.code, aggregate.site_kind, aggregate.resolution_class
+            );
+            let id = self.id(
+                "diagnostic",
+                None,
+                None,
+                Some(&self.profile.id),
+                &format!(
+                    "aggregate:{}:{}:{}",
+                    aggregate.code, aggregate.site_kind, aggregate.resolution_class
+                ),
+            );
+            self.diagnostics.insert(
+                id.clone(),
+                Diagnostic {
+                    id,
+                    severity: aggregate.severity,
+                    code: aggregate.code,
+                    message: format!(
+                        "{}; {} occurrence(s) remain preserved as dependency sites ({} representative source span(s) shown)",
+                        aggregate.message, aggregate.occurrence_count, representative_count
+                    ),
+                    profile_id: Some(self.profile.id.clone()),
+                    path: None,
+                    start_line: None,
+                    start_column: None,
+                    end_line: None,
+                    end_column: None,
+                    evidence: representative_evidence,
+                    properties: properties(json!({
+                        "aggregation_contract": "rust-fallback-diagnostic-summary-v1",
+                        "diagnostic_group": diagnostic_group,
+                        "occurrence_count": aggregate.occurrence_count,
+                        "affected_site_count": affected_site_ids.len(),
+                        "affected_site_ids_digest": affected_site_ids_digest,
+                        "affected_path_count": affected_path_count,
+                        "affected_path_counts": affected_path_counts,
+                        "affected_path_counts_digest": affected_path_counts_digest,
+                        "path_representative_limit": PATH_REPRESENTATIVE_LIMIT,
+                        "omitted_path_count": affected_path_count.saturating_sub(PATH_REPRESENTATIVE_LIMIT),
+                        "affected_site_kind": aggregate.site_kind,
+                        "resolution_class": aggregate.resolution_class,
+                        "representative_site_ids": representative_site_ids,
+                        "representative_limit": REPRESENTATIVE_LIMIT,
+                        "omitted_evidence_count": omitted_evidence_count,
+                        "remediation": aggregate.remediation,
+                    })),
+                },
+            );
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3502,6 +4147,186 @@ fn package_locator(package: &Package) -> String {
     )
 }
 
+fn syntax_import_bindings(occurrences: &[Occurrence]) -> Vec<SyntaxImportBinding> {
+    let mut bindings = occurrences
+        .iter()
+        .filter_map(|occurrence| {
+            let Occurrence::Use {
+                target_specifier,
+                alias,
+                glob: false,
+                module_scope: true,
+                inline_ancestors,
+                condition,
+                span,
+                ..
+            } = occurrence
+            else {
+                return None;
+            };
+            let local_name = alias.as_deref().unwrap_or_else(|| {
+                target_specifier
+                    .rsplit("::")
+                    .find(|part| !part.is_empty())
+                    .unwrap_or(target_specifier)
+            });
+            (!local_name.is_empty() && local_name != "_").then(|| SyntaxImportBinding {
+                local_name: local_name.trim_start_matches("r#").to_owned(),
+                target_specifier: target_specifier.clone(),
+                inline_ancestors: inline_ancestors.clone(),
+                condition: condition.clone(),
+                span: *span,
+            })
+        })
+        .collect::<Vec<_>>();
+    bindings.sort_by(|left, right| {
+        (
+            &left.inline_ancestors,
+            &left.local_name,
+            left.condition.render(),
+            &left.target_specifier,
+            left.span,
+        )
+            .cmp(&(
+                &right.inline_ancestors,
+                &right.local_name,
+                right.condition.render(),
+                &right.target_specifier,
+                right.span,
+            ))
+    });
+    bindings.dedup();
+    bindings
+}
+
+fn syntax_mentions_attribute(syntax: &syn::File, name: &str) -> bool {
+    fn meta_mentions(meta: &syn::Meta, name: &str) -> bool {
+        if meta.path().is_ident(name) {
+            return true;
+        }
+        let syn::Meta::List(list) = meta else {
+            return false;
+        };
+        list.parse_args_with(
+            syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+        )
+        .is_ok_and(|nested| nested.iter().any(|meta| meta_mentions(meta, name)))
+    }
+
+    fn items_mention(items: &[syn::Item], name: &str) -> bool {
+        items.iter().any(|item| {
+            let syn::Item::Mod(module) = item else {
+                return false;
+            };
+            module
+                .attrs
+                .iter()
+                .any(|attr| meta_mentions(&attr.meta, name))
+                || module
+                    .content
+                    .as_ref()
+                    .is_some_and(|(_, items)| items_mention(items, name))
+        })
+    }
+
+    syntax
+        .attrs
+        .iter()
+        .any(|attr| meta_mentions(&attr.meta, name))
+        || items_mention(&syntax.items, name)
+}
+
+fn rust_prelude_type(name: &str, edition: &str, policy: RustPreludePolicy) -> bool {
+    if !policy.implicit {
+        return false;
+    }
+    let base = matches!(
+        name,
+        "AsMut"
+            | "AsRef"
+            | "AsyncFn"
+            | "AsyncFnMut"
+            | "AsyncFnOnce"
+            | "Clone"
+            | "Copy"
+            | "Default"
+            | "DoubleEndedIterator"
+            | "Drop"
+            | "Eq"
+            | "ExactSizeIterator"
+            | "Extend"
+            | "Fn"
+            | "FnMut"
+            | "FnOnce"
+            | "From"
+            | "Into"
+            | "IntoIterator"
+            | "Iterator"
+            | "Option"
+            | "Ord"
+            | "PartialEq"
+            | "PartialOrd"
+            | "Result"
+            | "Send"
+            | "Sized"
+            | "Sync"
+            | "Unpin"
+    );
+    let edition_2021 = matches!(edition, "2021" | "2024")
+        && matches!(name, "FromIterator" | "TryFrom" | "TryInto");
+    let edition_2024 = edition == "2024" && matches!(name, "Future" | "IntoFuture");
+    let std_only = policy.std && matches!(name, "Box" | "String" | "ToOwned" | "ToString" | "Vec");
+    base || edition_2021 || edition_2024 || std_only
+}
+
+fn syntax_fallback_summary<'a>(sites: impl Iterator<Item = &'a DependencySite>) -> Value {
+    let mut class_counts = BTreeMap::<String, u64>::new();
+    let mut site_kind_counts = BTreeMap::<String, u64>::new();
+    let mut unresolved_by_kind = BTreeMap::<String, u64>::new();
+    let mut hir_refined_site_count = 0_u64;
+
+    for site in sites {
+        if site
+            .evidence
+            .first()
+            .is_some_and(|evidence| evidence.kind == EvidenceKind::Semantic)
+        {
+            hir_refined_site_count += 1;
+            continue;
+        }
+        *site_kind_counts.entry(site.kind.clone()).or_default() += 1;
+        let resolution_class = if site.resolution_status != ResolutionStatus::Unresolved {
+            "syntax_proven"
+        } else if site.evidence.iter().any(|evidence| {
+            evidence
+                .properties
+                .get("fallback_resolution_class")
+                .and_then(Value::as_str)
+                == Some("macro_execution_required")
+        }) {
+            "macro_execution_required"
+        } else {
+            "hir_required"
+        };
+        *class_counts.entry(resolution_class.into()).or_default() += 1;
+        if site.resolution_status == ResolutionStatus::Unresolved {
+            *unresolved_by_kind.entry(site.kind.clone()).or_default() += 1;
+        }
+    }
+
+    json!({
+        "contract": "rust-syntax-fallback-summary-v1",
+        "resolution_class_counts": class_counts,
+        "site_kind_counts": site_kind_counts,
+        "unresolved_by_kind": unresolved_by_kind,
+        "hir_refined_site_count": hir_refined_site_count,
+        "remediation": {
+            "hir_required": TOOLCHAIN_REMEDIATION,
+            "macro_execution_required": "safe scan intentionally does not execute macro, build-script, or project code; inspect the preserved sites or use an explicitly authorized build observation",
+        },
+    })
+}
+
 fn resolved(target: String) -> TargetResolution {
     TargetResolution {
         target_ids: vec![target],
@@ -3817,6 +4642,399 @@ mod tests {
             .context("semantic fixture site must have evidence")?
             .path = Some("__missing_semantic_input__.rs".into());
         Ok(delta)
+    }
+
+    fn write_syntax_only_fixture(root: &Path, source: &str) {
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            concat!(
+                "[package]\n",
+                "name='syntax-only'\n",
+                "version='0.1.0'\n",
+                "edition='2024'\n",
+                "\n",
+                "[dependencies]\n",
+                "serde='1'\n",
+            ),
+        )
+        .unwrap();
+        fs::write(
+            root.join("Cargo.lock"),
+            concat!(
+                "version = 4\n",
+                "\n",
+                "[[package]]\n",
+                "name = \"serde\"\n",
+                "version = \"1.0.0\"\n",
+                "\n",
+                "[[package]]\n",
+                "name = \"syntax-only\"\n",
+                "version = \"0.1.0\"\n",
+                "dependencies = [\"serde\"]\n",
+            ),
+        )
+        .unwrap();
+        fs::write(
+            root.join("rust-toolchain.toml"),
+            "[toolchain]\nchannel='1.80.0'\n",
+        )
+        .unwrap();
+        fs::write(root.join("src/lib.rs"), source).unwrap();
+    }
+
+    #[test]
+    fn syntax_fallback_resolves_prelude_manifest_import_and_local_module_types() {
+        let temp = tempfile::tempdir().unwrap();
+        write_syntax_only_fixture(
+            temp.path(),
+            r#"pub mod model;
+
+use crate::model::Thing as ImportedThing;
+use std::path::Path as StdPath;
+
+pub struct String;
+
+pub struct Record {
+    name: String,
+    values: Vec<Option<Result<u8, MissingError>>>,
+    path: StdPath,
+    imported: ImportedThing,
+    qualified: crate::model::Thing,
+    external: serde::Serialize,
+    unknown: MissingType,
+}
+
+pub fn scoped() {
+    use crate::model::Thing as BlockThing;
+    let _: BlockThing;
+}
+"#,
+        );
+        fs::write(temp.path().join("src/model.rs"), "pub struct Thing;\n").unwrap();
+
+        let result = scan(temp.path()).unwrap();
+        assert_eq!(
+            result.profile.properties["rust_hir_toolchain_status"],
+            "unsupported"
+        );
+        let type_site = |specifier: &str| {
+            result
+                .sites
+                .iter()
+                .find(|site| site.kind == "type_use" && site.specifier == specifier)
+                .unwrap_or_else(|| panic!("missing type-use site {specifier}"))
+        };
+
+        for specifier in [
+            "String",
+            "Vec",
+            "Option",
+            "Result",
+            "StdPath",
+            "ImportedThing",
+            "crate::model::Thing",
+            "serde::Serialize",
+        ] {
+            let site = type_site(specifier);
+            assert_ne!(
+                site.resolution_status,
+                ResolutionStatus::Unresolved,
+                "{specifier}"
+            );
+            assert_eq!(site.precision, Precision::Heuristic, "{specifier}");
+        }
+        assert_eq!(
+            type_site("MissingError").resolution_status,
+            ResolutionStatus::Unresolved
+        );
+        assert_eq!(
+            type_site("MissingType").resolution_status,
+            ResolutionStatus::Unresolved
+        );
+        assert_eq!(
+            type_site("BlockThing").resolution_status,
+            ResolutionStatus::Unresolved,
+            "a block-local import must not leak into the file/module scope index"
+        );
+        let shadowed_prelude = type_site("String");
+        assert_eq!(
+            shadowed_prelude.resolution_status,
+            ResolutionStatus::Resolved
+        );
+        assert!(shadowed_prelude.target_ids.iter().all(|target_id| {
+            result.nodes.iter().any(|node| {
+                node.id == *target_id
+                    && node.kind == "type"
+                    && node.properties["resolution_provenance"] == "static-syntax"
+            })
+        }));
+
+        let summary = &result.profile.properties["rust_syntax_fallback_summary"];
+        assert_eq!(summary["contract"], "rust-syntax-fallback-summary-v1");
+        assert!(
+            summary["resolution_class_counts"]["syntax_proven"]
+                .as_u64()
+                .unwrap()
+                >= 8
+        );
+        assert!(
+            summary["resolution_class_counts"]["hir_required"]
+                .as_u64()
+                .unwrap()
+                >= 3
+        );
+        let diagnostic = result
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "RUST_SYNTAX_FALLBACK_SUMMARY")
+            .expect("human/JSON fallback summary diagnostic");
+        assert!(diagnostic.message.contains("require HIR"));
+        assert_eq!(
+            diagnostic.properties["contract"],
+            "rust-syntax-fallback-summary-v1"
+        );
+        assert_eq!(
+            serde_json::to_value(&diagnostic.properties).unwrap(),
+            *summary
+        );
+        assert!(!result.coverage.project_code_executed);
+    }
+
+    #[test]
+    fn syntax_fallback_respects_no_std_no_implicit_prelude_and_edition_vocabularies() {
+        let std_policy = RustPreludePolicy::default();
+        let core_policy = RustPreludePolicy {
+            implicit: true,
+            std: false,
+        };
+        assert!(rust_prelude_type("String", "2024", std_policy));
+        assert!(!rust_prelude_type("String", "2024", core_policy));
+        assert!(rust_prelude_type("Option", "2015", core_policy));
+        assert!(!rust_prelude_type("Debug", "2024", std_policy));
+        assert!(!rust_prelude_type("TryFrom", "2018", std_policy));
+        assert!(rust_prelude_type("TryFrom", "2021", std_policy));
+        assert!(!rust_prelude_type("Future", "2021", std_policy));
+        assert!(rust_prelude_type("Future", "2024", std_policy));
+
+        let no_std = tempfile::tempdir().unwrap();
+        write_syntax_only_fixture(
+            no_std.path(),
+            "#![no_std]\npub struct Record { pub values: Vec<u8>, pub option: Option<u8> }\n",
+        );
+        let result = scan(no_std.path()).unwrap();
+        let type_status = |specifier: &str| {
+            result
+                .sites
+                .iter()
+                .find(|site| site.kind == "type_use" && site.specifier == specifier)
+                .map(|site| site.resolution_status)
+                .unwrap_or_else(|| panic!("missing type-use site {specifier}"))
+        };
+        assert_eq!(type_status("Vec"), ResolutionStatus::Unresolved);
+        assert_eq!(type_status("Option"), ResolutionStatus::External);
+
+        let no_implicit = tempfile::tempdir().unwrap();
+        write_syntax_only_fixture(
+            no_implicit.path(),
+            "#![no_implicit_prelude]\npub struct Record { pub text: String, pub option: Option<u8> }\n",
+        );
+        let result = scan(no_implicit.path()).unwrap();
+        for specifier in ["String", "Option"] {
+            assert_eq!(
+                result
+                    .sites
+                    .iter()
+                    .find(|site| site.kind == "type_use" && site.specifier == specifier)
+                    .map(|site| site.resolution_status),
+                Some(ResolutionStatus::Unresolved),
+                "{specifier}"
+            );
+        }
+    }
+
+    #[test]
+    fn occurrence_diagnostics_are_bounded_and_keep_every_site_and_span() {
+        use std::fmt::Write as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut source = String::new();
+        for index in 0..32 {
+            writeln!(source, "unknown_macro!({index});").unwrap();
+            writeln!(source, "#[derive(CustomDerive)]").unwrap();
+            writeln!(source, "pub struct Derived{index};").unwrap();
+            writeln!(source, "#[repr(align(env!(\"ALIGN_{index}\")))]").unwrap();
+            writeln!(source, "pub struct Unsupported{index}(u8);").unwrap();
+        }
+        write_syntax_only_fixture(temp.path(), &source);
+
+        let first = scan(temp.path()).unwrap();
+        let second = scan(temp.path()).unwrap();
+        let occurrence_codes = [
+            "MACRO_EXPANSION_NOT_EVALUATED",
+            "PROC_MACRO_EXPANSION_NOT_EXECUTED",
+            "RUST_ATTRIBUTE_UNSUPPORTED",
+        ];
+        for code in occurrence_codes {
+            let matching = first
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == code)
+                .collect::<Vec<_>>();
+            assert_eq!(matching.len(), 1, "{code} must be cause-aggregated");
+            let diagnostic = matching[0];
+            let diagnostic_group = diagnostic.properties["diagnostic_group"]
+                .as_str()
+                .expect("diagnostic group");
+            let occurrence_count = diagnostic.properties["occurrence_count"]
+                .as_u64()
+                .expect("occurrence count");
+            let affected_sites = first
+                .sites
+                .iter()
+                .filter(|site| {
+                    site.evidence.iter().any(|evidence| {
+                        evidence
+                            .properties
+                            .get("fallback_diagnostic_group")
+                            .and_then(Value::as_str)
+                            == Some(diagnostic_group)
+                    })
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(affected_sites.len() as u64, occurrence_count);
+            assert_eq!(
+                diagnostic.properties["affected_site_count"],
+                occurrence_count
+            );
+            assert_eq!(
+                diagnostic.properties["affected_site_ids_digest"],
+                ordered_string_digest(affected_sites.iter().map(|site| site.id.as_str()))
+            );
+            assert!(occurrence_count >= 32, "{code}");
+            assert!(diagnostic.evidence.len() <= 5);
+            assert!(
+                serde_json::to_vec(diagnostic).unwrap().len() < 64 * 1024,
+                "aggregate diagnostic must stay bounded"
+            );
+            assert!(
+                diagnostic.properties["omitted_evidence_count"]
+                    .as_u64()
+                    .unwrap()
+                    >= occurrence_count.saturating_sub(5)
+            );
+            for site in affected_sites {
+                assert_eq!(site.resolution_status, ResolutionStatus::Unresolved);
+                assert!(site.evidence.iter().all(|evidence| {
+                    evidence.path.as_deref() == Some("src/lib.rs")
+                        && evidence.start_line.is_some()
+                        && evidence.start_column.is_some()
+                        && evidence.end_line.is_some()
+                        && evidence.end_column.is_some()
+                }));
+            }
+        }
+        assert!(!first.coverage.project_code_executed);
+        assert_eq!(
+            serde_json::to_value((
+                &first.profile,
+                &first.nodes,
+                &first.edges,
+                &first.sites,
+                &first.diagnostics,
+                &first.coverage,
+            ))
+            .unwrap(),
+            serde_json::to_value((
+                &second.profile,
+                &second.nodes,
+                &second.edges,
+                &second.sites,
+                &second.diagnostics,
+                &second.coverage,
+            ))
+            .unwrap(),
+            "fallback graph and summaries must be deterministic"
+        );
+    }
+
+    #[test]
+    fn realistic_syntax_only_fixture_keeps_useful_resolution_and_bounded_diagnostics() {
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/syntax-fallback-realistic");
+
+        let result = scan(&fixture).unwrap();
+        let type_sites = result
+            .sites
+            .iter()
+            .filter(|site| site.kind == "type_use")
+            .collect::<Vec<_>>();
+        let type_count = type_sites.len();
+        let type_unresolved = type_sites
+            .iter()
+            .filter(|site| site.resolution_status == ResolutionStatus::Unresolved)
+            .count();
+        let type_resolved = type_sites
+            .iter()
+            .filter(|site| site.resolution_status == ResolutionStatus::Resolved)
+            .count();
+        let type_external = type_sites
+            .iter()
+            .filter(|site| site.resolution_status == ResolutionStatus::External)
+            .count();
+        let macro_sites = result
+            .sites
+            .iter()
+            .filter(|site| {
+                matches!(
+                    site.kind.as_str(),
+                    "macro_expansion" | "proc_macro_expansion" | "unsupported_attribute"
+                )
+            })
+            .count();
+
+        assert_eq!(result.coverage.files_discovered, 9);
+        assert!(type_count >= 80);
+        assert!(type_resolved >= 30);
+        assert!(type_external >= 35);
+        assert!(
+            type_unresolved * 10 < type_count,
+            "ordinary type-use unresolved rate must stay below 10%: {type_unresolved}/{type_count}"
+        );
+        assert!(macro_sites >= 50);
+        for code in [
+            "MACRO_EXPANSION_NOT_EVALUATED",
+            "PROC_MACRO_EXPANSION_NOT_EXECUTED",
+        ] {
+            let diagnostics = result
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == code)
+                .collect::<Vec<_>>();
+            assert_eq!(diagnostics.len(), 1, "{code}");
+            assert!(diagnostics[0].evidence.len() <= 5);
+            assert!(
+                diagnostics[0].properties["occurrence_count"]
+                    .as_u64()
+                    .unwrap()
+                    >= 4
+            );
+        }
+        assert!(result.diagnostics.len() < 12);
+        assert!(!result.coverage.project_code_executed);
+        assert!(
+            result
+                .sites
+                .iter()
+                .filter(|site| site.resolution_status == ResolutionStatus::Unresolved)
+                .all(|site| site.evidence.iter().all(|evidence| {
+                    evidence.path.is_some()
+                        && evidence.start_line.is_some()
+                        && evidence.start_column.is_some()
+                        && evidence.end_line.is_some()
+                        && evidence.end_column.is_some()
+                }))
+        );
     }
 
     #[test]

@@ -1,0 +1,27 @@
+version = 4
+
+[[package]]
+name = "anyhow"
+version = "1.0.0"
+
+[[package]]
+name = "clap"
+version = "4.0.0"
+
+[[package]]
+name = "serde"
+version = "1.0.0"
+
+[[package]]
+name = "serde_json"
+version = "1.0.0"
+
+[[package]]
+name = "syntax-fallback-realistic"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "serde",
+ "serde_json",
+]

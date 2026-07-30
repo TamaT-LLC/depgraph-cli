@@ -90,8 +90,15 @@ keeps semantic primary evidence plus its supporting syntax evidence. The
 scanner validates nodes, sites, edges, and file coverage together before
 unioning the delta with the static syntax graph.
 Recognized type occurrences that cannot enter the exact delta remain once as
-source-phase external or unresolved fallback sites. A call that cannot be
-proved exact or represented by a complete, finite candidate set remains
+source-phase fallback sites. The fallback resolver recognizes standard-prelude
+types and manifest dependencies as external/heuristic, and may emit a
+source-backed `type` node with resolved/heuristic status when an explicit path
+or module-scope import matches a condition-compatible local declaration.
+The vocabulary follows the crate edition and fails closed for `no_std` and
+`no_implicit_prelude`; an explicit local declaration is checked before a
+prelude or dependency root. Everything else remains unresolved with its
+original span. A call that cannot
+be proved exact or represented by a complete, finite candidate set remains
 external or unresolved instead of being promoted speculatively.
 
 `profiles.rust_mode` accepts `check` (default), `build`, or `test`. Test mode
@@ -182,9 +189,11 @@ now:
   supporting source evidence, and direct-source macro provenance, then atomically
   union the validated node/site/edge/file-ledger delta with the syntax graph.
 
-Block-local aliases whose external definition source is unavailable are kept
-as unresolved type-use sites; the worker does not leak those aliases into the
-surrounding module or infer unqualified prelude names without exact HIR proof.
+Block-local aliases are kept out of the file/module import index, so they
+cannot leak into another lexical scope. The fallback recognizes the fixed
+standard-prelude vocabulary only as heuristic and checks an explicit local
+declaration or module-scope import first. Exact HIR continues to replace those
+fallback sites whenever the compatible semantic backend is available.
 
 Unsupported toolchain/edition/target input, confined metadata fallback, broken
 source or attribute payloads, missing modules/includes, nested `OUT_DIR`
@@ -313,6 +322,7 @@ values are outcome-dependent; fallback paths retain the syntax-only values.
 | `crate_graph_source_policy` | `confined-cargo-metadata-or-static-manifest` |
 | `crate_graph_source` | `confined-cargo-metadata`, `static-manifest-fallback`, or `none` |
 | `syntax_fallback` | `enabled` |
+| `rust_syntax_fallback_summary` | `rust-syntax-fallback-summary-v1`: deterministic `syntax_proven` / `hir_required` / `macro_execution_required` counts, site-kind counts, unresolved-kind counts, and separate remediation |
 | `build_script_policy` | `disabled` |
 | `proc_macro_policy` | `disabled` |
 | `proc_macro_expansion` | `disabled` |
@@ -341,6 +351,18 @@ omits `semantic-complete`. The scanner never silently drops a recognized site.
 Preflight and DTO failures use repository-relative inventory paths and bounded
 reason categories; raw Cargo stderr, mirror paths, and rejected external path
 values do not become diagnostic messages or identities.
+
+Occurrence-heavy macro, proc-macro, unsupported-attribute, unsupported
+macro-argument, and build-environment warnings use
+`rust-fallback-diagnostic-summary-v1`. One diagnostic is emitted per stable
+code/site-kind/resolution-class cause. Its JSON properties retain the complete
+site-set count/digest, bounded per-path counts/digest, total count, distinct
+HIR-vs-macro remediation, and at most five representative site IDs and source
+evidence records. Every affected site carries the same stable diagnostic-group
+key, so the relationship and every source span remain authoritative without
+making one diagnostic line grow with occurrence count.
+`RUST_SYNTAX_FALLBACK_SUMMARY` exposes the same cause classification in both
+human output and JSON diagnostics.
 
 The HIR import/type/call graph requires a validated confined Cargo crate graph, so a
 real metadata fallback intentionally omits HIR `symbol` / `type` nodes and
