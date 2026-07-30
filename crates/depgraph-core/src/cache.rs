@@ -8,11 +8,11 @@ use std::{
 use depgraph_store::{CacheKey, CacheLayer};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use walkdir::{DirEntry, WalkDir};
 
 use crate::{
     build::BuildAudit,
     config::Config,
+    repository_inventory::build_repository_file_inventory,
     worker::{AdapterKind, WorkerSpec, resolve_safe_executable, sanitized_path},
 };
 
@@ -161,31 +161,19 @@ fn fingerprint_inventory(
     let store_path = store_path.and_then(|path| path.canonicalize().ok());
     let mut files = Vec::new();
     let mut total = 0_u64;
-    for entry in WalkDir::new(root)
-        .follow_links(false)
-        .into_iter()
-        .filter_entry(is_cache_scannable_entry)
-    {
-        let entry = entry.map_err(|_| "inventory-unavailable")?;
-        if entry.file_type().is_dir() {
+    let inventory = build_repository_file_inventory(root).map_err(|_| "inventory-unavailable")?;
+    for relative in inventory.paths {
+        let path = root.join(&relative);
+        if is_store_artifact(&path, store_path.as_deref()) {
             continue;
         }
-        if entry.file_type().is_symlink() {
+        let metadata = fs::symlink_metadata(&path).map_err(|_| "inventory-unavailable")?;
+        if metadata.file_type().is_symlink() {
             return Err("symlink-input");
         }
-        if !entry.file_type().is_file() {
+        if !metadata.is_file() {
             return Err("unsupported-filesystem-entry");
         }
-        if is_store_artifact(entry.path(), store_path.as_deref()) {
-            continue;
-        }
-        let relative = entry
-            .path()
-            .strip_prefix(root)
-            .map_err(|_| "invalid-relative-path")?
-            .to_str()
-            .ok_or("non-utf8-path")?
-            .replace('\\', "/");
         if relative.is_empty()
             || relative.starts_with('/')
             || relative.split('/').any(|component| component == "..")
@@ -193,7 +181,6 @@ fn fingerprint_inventory(
         {
             return Err("invalid-relative-path");
         }
-        let metadata = entry.metadata().map_err(|_| "inventory-unavailable")?;
         if metadata.len() > CACHE_MAX_FILE_BYTES {
             return Err("file-size-limit");
         }
@@ -210,7 +197,7 @@ fn fingerprint_inventory(
             manifest: is_manifest_lock_or_config(&relative),
             generated: is_generated_artifact(&relative),
             relative,
-            path: entry.path().to_path_buf(),
+            path,
             length: metadata.len(),
         });
     }
@@ -372,16 +359,6 @@ fn copy_safe_tool_environment(command: &mut Command, root: &Path) -> Result<(), 
     Ok(())
 }
 
-fn is_cache_scannable_entry(entry: &DirEntry) -> bool {
-    if entry.depth() == 0 || !entry.file_type().is_dir() {
-        return true;
-    }
-    !matches!(
-        entry.file_name().to_string_lossy().as_ref(),
-        ".git" | ".hg" | ".svn" | ".depgraph"
-    )
-}
-
 fn is_store_artifact(path: &Path, store_path: Option<&Path>) -> bool {
     let Some(store_path) = store_path else {
         return false;
@@ -510,6 +487,39 @@ mod tests {
         fs::write(pack.join("cargo"), b"armed project-local executable").unwrap();
         let after = fingerprint_inventory(checkout.path(), None).unwrap();
 
+        assert_eq!(before.all, after.all);
+        assert_eq!(before.manifests, after.manifests);
+        assert_eq!(before.generated, after.generated);
+    }
+
+    #[test]
+    fn inventory_identity_ignores_gitignored_worktrees_and_next_outputs() {
+        let checkout = tempfile::tempdir().unwrap();
+        fs::create_dir_all(checkout.path().join("src")).unwrap();
+        fs::create_dir_all(checkout.path().join(".branches/feature/.next/dev/build")).unwrap();
+        fs::write(checkout.path().join(".gitignore"), ".branches/\n.next/\n").unwrap();
+        fs::write(
+            checkout.path().join("src/app.ts"),
+            "export const value = 1;\n",
+        )
+        .unwrap();
+        fs::write(
+            checkout
+                .path()
+                .join(".branches/feature/.next/dev/build/postcss.js"),
+            "generated one\n",
+        )
+        .unwrap();
+        let before = fingerprint_inventory(checkout.path(), None).unwrap();
+
+        fs::write(
+            checkout
+                .path()
+                .join(".branches/feature/.next/dev/build/postcss.js"),
+            "generated two\n",
+        )
+        .unwrap();
+        let after = fingerprint_inventory(checkout.path(), None).unwrap();
         assert_eq!(before.all, after.all);
         assert_eq!(before.manifests, after.manifests);
         assert_eq!(before.generated, after.generated);

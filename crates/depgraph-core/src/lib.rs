@@ -40,6 +40,7 @@ pub mod public_migration_rehearsal;
 pub mod public_provenance_audit;
 pub mod public_readiness;
 pub mod query;
+pub(crate) mod repository_inventory;
 pub mod runtime_trace;
 pub mod rust_build_observer;
 pub mod scan;

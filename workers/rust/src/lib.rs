@@ -13,12 +13,13 @@ mod hir_semantic;
 mod hir_sysroot;
 mod manifest;
 mod metadata;
+mod repository_inventory;
 mod scanner;
 mod source;
 mod toolchain;
 
 pub use emit::build_events;
-pub use scanner::{FileCoverage, ScanResult, scan};
+pub use scanner::{FileCoverage, ScanResult, scan, scan_with_inventory_file};
 
 pub const ADAPTER: &str = "rust";
 pub const ADAPTER_VERSION: &str = env!("CARGO_PKG_VERSION");

@@ -19,6 +19,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	flags.SetOutput(stderr)
 	root := flags.String("root", "", "repository root to scan")
 	scanID := flags.String("scan-id", "", "scan identifier supplied by depgraph core")
+	inventoryFile := flags.String("inventory-file", "", "repository inventory supplied by depgraph core")
 	version := flags.Bool("version", false, "print worker version")
 	flags.Usage = func() {
 		fmt.Fprintln(stderr, "usage: depgraph-go-worker --root <path> --scan-id <id>")
@@ -62,7 +63,12 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}()
 
 	fmt.Fprintf(stderr, "depgraph-go-worker: safe static scan of %s\n", absRoot)
-	result, err := worker.Scan(absRoot)
+	var result worker.Result
+	if *inventoryFile == "" {
+		result, err = worker.Scan(absRoot)
+	} else {
+		result, err = worker.ScanWithInventory(absRoot, *inventoryFile)
+	}
 	if err != nil {
 		fmt.Fprintf(stderr, "depgraph-go-worker: %v\n", err)
 		if emitErr := worker.EmitFailure(stdout, *scanID, absRoot, err); emitErr != nil {

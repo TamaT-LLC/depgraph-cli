@@ -13,6 +13,7 @@ use crate::{
         select_static_documents, slash_path, workspace_identity,
     },
     metadata::{LockIndex, apply_lock_versions, run_cargo_metadata},
+    repository_inventory::RepositoryInventory,
     source::{
         CallOccurrenceKey, Occurrence, SourceSpan, TypeUseOccurrenceKey, UseOccurrenceKey,
         collect_occurrences,
@@ -128,14 +129,28 @@ struct State {
     unsupported_syntax: u64,
     reasons: BTreeSet<String>,
     rust_release_gate: &'static str,
+    inventory: Option<RepositoryInventory>,
 }
 
 pub fn scan(root: &Path) -> Result<ScanResult> {
     scan_with_semantic_extractor(root, extract_semantic_delta)
 }
 
+pub fn scan_with_inventory_file(root: &Path, inventory_file: &Path) -> Result<ScanResult> {
+    let inventory = RepositoryInventory::read(inventory_file)?;
+    scan_with_inventory_and_semantic_extractor(root, Some(inventory), extract_semantic_delta)
+}
+
 fn scan_with_semantic_extractor(
     root: &Path,
+    semantic_extractor: SemanticExtractor,
+) -> Result<ScanResult> {
+    scan_with_inventory_and_semantic_extractor(root, None, semantic_extractor)
+}
+
+fn scan_with_inventory_and_semantic_extractor(
+    root: &Path,
+    inventory: Option<RepositoryInventory>,
     semantic_extractor: SemanticExtractor,
 ) -> Result<ScanResult> {
     let root = root
@@ -156,7 +171,7 @@ fn scan_with_semantic_extractor(
         }
     };
 
-    let (documents, discovery_failures) = discover_manifests(&root)?;
+    let (documents, discovery_failures) = discover_manifests(&root, inventory.as_ref())?;
     let metadata_manifest = documents
         .iter()
         .find(|document| document.rel_path == "Cargo.toml")
@@ -199,7 +214,7 @@ fn scan_with_semantic_extractor(
         declared_toolchain.channel(),
         declared_toolchain.status(),
     );
-    let mut state = State::new(root.clone(), repository_identity, profile);
+    let mut state = State::new(root.clone(), repository_identity, profile, inventory);
 
     match &declared_toolchain {
         RustToolchainDeclaration::Valid { path, channel } if channel != RUST_TOOLCHAIN_BASELINE => {
@@ -372,7 +387,12 @@ fn scan_with_semantic_extractor(
 }
 
 impl State {
-    fn new(root: PathBuf, repository_identity: String, profile: Profile) -> Self {
+    fn new(
+        root: PathBuf,
+        repository_identity: String,
+        profile: Profile,
+        inventory: Option<RepositoryInventory>,
+    ) -> Self {
         Self {
             root,
             repository_identity,
@@ -393,6 +413,7 @@ impl State {
             unsupported_syntax: 0,
             reasons: BTreeSet::new(),
             rust_release_gate: configured_rust_release_gate(),
+            inventory,
         }
     }
 
@@ -528,22 +549,39 @@ impl State {
     ) -> Result<Vec<SourceUnit>> {
         let mut paths = Vec::new();
         let root = self.root.clone();
-        for entry in WalkDir::new(&root)
-            .follow_links(false)
-            .into_iter()
-            .filter_entry(scannable_entry)
-        {
-            let entry = entry.context("walk Rust source tree")?;
-            if entry.path().extension() != Some(OsStr::new("rs"))
+        let candidate_paths = if let Some(inventory) = &self.inventory {
+            inventory
+                .paths()
+                .map(|relative| root.join(relative))
+                .collect::<Vec<_>>()
+        } else {
+            WalkDir::new(&root)
+                .follow_links(false)
+                .into_iter()
+                .filter_entry(scannable_entry)
+                .map(|entry| entry.map(|entry| entry.into_path()))
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .context("walk Rust source tree")?
+        };
+        for candidate in candidate_paths {
+            if candidate.extension() != Some(OsStr::new("rs"))
                 || inactive_manifest_dirs
                     .iter()
-                    .any(|directory| entry.path().starts_with(directory))
+                    .any(|directory| candidate.starts_with(directory))
             {
                 continue;
             }
-            if entry.file_type().is_symlink() {
-                let original = relative_path(&root, entry.path());
-                let ledger_path = confined_skipped_ledger_path(&root, entry.path(), &original);
+            let metadata = match fs::symlink_metadata(&candidate) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("inspect Rust source {}", candidate.display()));
+                }
+            };
+            if metadata.file_type().is_symlink() {
+                let original = relative_path(&root, &candidate);
+                let ledger_path = confined_skipped_ledger_path(&root, &candidate, &original);
                 let reason =
                     format!("Rust source symlink {original} was not followed in safe mode");
                 self.mark_file_skipped(&ledger_path, &reason);
@@ -555,8 +593,8 @@ impl State {
                     None,
                     &original,
                 );
-            } else if entry.file_type().is_file() {
-                paths.push(entry.into_path());
+            } else if metadata.is_file() {
+                paths.push(candidate);
             }
         }
         paths.sort();
@@ -2816,22 +2854,41 @@ struct RustProfileSelection {
     rust_mode: String,
 }
 
-fn discover_manifests(root: &Path) -> Result<(Vec<ManifestDocument>, Vec<DiscoveryFailure>)> {
+fn discover_manifests(
+    root: &Path,
+    inventory: Option<&RepositoryInventory>,
+) -> Result<(Vec<ManifestDocument>, Vec<DiscoveryFailure>)> {
     let mut paths = Vec::new();
     let mut failures = Vec::new();
-    for entry in WalkDir::new(root)
-        .follow_links(false)
-        .into_iter()
-        .filter_entry(scannable_entry)
-    {
-        let entry = entry.context("walk Cargo manifests")?;
-        if entry.file_name() != OsStr::new("Cargo.toml") {
+    let candidate_paths = if let Some(inventory) = inventory {
+        inventory
+            .paths()
+            .map(|relative| root.join(relative))
+            .collect::<Vec<_>>()
+    } else {
+        WalkDir::new(root)
+            .follow_links(false)
+            .into_iter()
+            .filter_entry(scannable_entry)
+            .map(|entry| entry.map(|entry| entry.into_path()))
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .context("walk Cargo manifests")?
+    };
+    for path in candidate_paths {
+        if path.file_name() != Some(OsStr::new("Cargo.toml")) {
             continue;
         }
-        if entry.file_type().is_file() {
-            paths.push(entry.into_path());
-        } else if entry.file_type().is_symlink() {
-            let path = entry.into_path();
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("inspect Cargo manifest {}", path.display()));
+            }
+        };
+        if metadata.is_file() {
+            paths.push(path);
+        } else if metadata.file_type().is_symlink() {
             let lexical = relative_path(root, &path);
             let confined = path
                 .canonicalize()
@@ -2848,7 +2905,6 @@ fn discover_manifests(root: &Path) -> Result<(Vec<ManifestDocument>, Vec<Discove
                 ),
             });
         } else {
-            let path = entry.into_path();
             let lexical = relative_path(root, &path);
             failures.push(DiscoveryFailure {
                 path: lexical.clone(),
@@ -3581,7 +3637,49 @@ fn scannable_entry(entry: &DirEntry) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write as _;
+
     use super::*;
+
+    #[test]
+    fn core_inventory_excludes_ignored_nested_workspace() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join("src")).unwrap();
+        fs::create_dir_all(root.path().join(".branches/feature/src")).unwrap();
+        fs::write(
+            root.path().join("Cargo.toml"),
+            "[package]\nname='inventory'\nversion='0.1.0'\nedition='2024'\n",
+        )
+        .unwrap();
+        fs::write(root.path().join("src/lib.rs"), "pub fn kept() {}\n").unwrap();
+        fs::write(
+            root.path().join(".branches/feature/Cargo.toml"),
+            "[package]\nname='ignored'\nversion='0.1.0'\nedition='2024'\n",
+        )
+        .unwrap();
+        fs::write(
+            root.path().join(".branches/feature/src/lib.rs"),
+            "pub fn ignored() {}\n",
+        )
+        .unwrap();
+        let mut inventory_file = tempfile::NamedTempFile::new().unwrap();
+        serde_json::to_writer(
+            inventory_file.as_file_mut(),
+            &json!({
+                "contract_version": "depgraph-repository-file-inventory-v1",
+                "paths": ["Cargo.toml", "src/lib.rs"]
+            }),
+        )
+        .unwrap();
+        inventory_file.as_file_mut().flush().unwrap();
+
+        let result = scan_with_inventory_file(root.path(), inventory_file.path()).unwrap();
+        let serialized =
+            serde_json::to_string(&(result.nodes, result.edges, result.sites)).unwrap();
+        assert!(!serialized.contains(".branches"));
+        assert!(!serialized.contains("ignored"));
+        assert!(result.files.iter().any(|file| file.path == "src/lib.rs"));
+    }
 
     #[test]
     fn source_hash_uses_raw_utf8_bytes_and_explicit_algorithm_prefix() {

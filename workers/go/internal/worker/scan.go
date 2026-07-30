@@ -200,6 +200,7 @@ type scannerState struct {
 	profile            Profile
 	goPackages         goPackagesInventory
 	moduleResolution   localModuleResolution
+	inventory          *repositoryInventory
 	nodes              map[string]Node
 	edges              map[string]Edge
 	sites              map[string]Site
@@ -216,6 +217,18 @@ func (s *scannerState) scopedID(kind string, parts ...string) string {
 }
 
 func Scan(root string) (Result, error) {
+	return scan(root, nil)
+}
+
+func ScanWithInventory(root, inventoryFile string) (Result, error) {
+	inventory, err := readRepositoryInventory(inventoryFile)
+	if err != nil {
+		return Result{}, err
+	}
+	return scan(root, inventory)
+}
+
+func scan(root string, inventory *repositoryInventory) (Result, error) {
 	absRoot, err := filepath.Abs(root)
 	if err != nil {
 		return Result{}, fmt.Errorf("normalize root: %w", err)
@@ -234,7 +247,7 @@ func Scan(root string) (Result, error) {
 		return Result{}, fmt.Errorf("scan root is not a directory: %s", absRoot)
 	}
 
-	manifestPaths, skippedMetadata, initialDiagnostics, err := findManifests(absRoot)
+	manifestPaths, skippedMetadata, initialDiagnostics, err := findManifests(absRoot, inventory)
 	if err != nil {
 		return Result{}, fmt.Errorf("discover go.mod files: %w", err)
 	}
@@ -356,6 +369,7 @@ func Scan(root string) (Result, error) {
 	state := &scannerState{
 		root: absRoot, workspaceIdentity: workspaceIdentity, profile: profile, goPackages: goPackages,
 		moduleResolution: buildLocalModuleResolution(absRoot, modules, work),
+		inventory:        inventory,
 		nodes:            map[string]Node{}, edges: map[string]Edge{}, sites: map[string]Site{}, diagnostics: initialDiagnostics,
 		files: skippedMetadata,
 	}
@@ -486,17 +500,14 @@ func (s *scannerState) addModules(modules []Module, work WorkFile) (map[string]N
 
 func (s *scannerState) discoverAndParseFiles(modules []Module) ([]*sourceFile, error) {
 	var paths []string
-	err := filepath.WalkDir(s.root, func(path string, entry fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if entry.IsDir() && path != s.root && shouldSkipDirectory(entry.Name()) {
-			return filepath.SkipDir
-		}
+	entries, err := repositoryFileEntries(s.root, s.inventory)
+	if err != nil {
+		return nil, fmt.Errorf("discover Go files: %w", err)
+	}
+	for _, candidate := range entries {
+		path := candidate.path
+		entry := candidate.entry
 		if entry.Type()&os.ModeSymlink != 0 {
-			if entry.IsDir() {
-				return filepath.SkipDir
-			}
 			if strings.HasSuffix(entry.Name(), ".go") && !strings.HasPrefix(entry.Name(), ".") && !strings.HasPrefix(entry.Name(), "_") {
 				originalPath := relativePath(s.root, path)
 				ledgerPath := originalPath
@@ -517,15 +528,11 @@ func (s *scannerState) discoverAndParseFiles(modules []Module) ([]*sourceFile, e
 					Path: ledgerPath, DiscoveredSites: 1, SkippedSites: 1, Skipped: true, Reason: reason,
 				})
 			}
-			return nil
+			continue
 		}
-		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".go") && !strings.HasPrefix(entry.Name(), ".") && !strings.HasPrefix(entry.Name(), "_") {
+		if strings.HasSuffix(entry.Name(), ".go") && !strings.HasPrefix(entry.Name(), ".") && !strings.HasPrefix(entry.Name(), "_") {
 			paths = append(paths, path)
 		}
-		return nil
-	})
-	if err != nil {
-		return nil, fmt.Errorf("discover Go files: %w", err)
 	}
 	sort.Strings(paths)
 	sources := make([]*sourceFile, 0, len(paths))
@@ -678,16 +685,16 @@ func (s *scannerState) addAssemblyBoundaries(
 			groupsByDir[filepath.Clean(group.Dir)] = group
 		}
 	}
-	err := filepath.WalkDir(s.root, func(path string, entry fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if entry.IsDir() && path != s.root && shouldSkipDirectory(entry.Name()) {
-			return filepath.SkipDir
-		}
-		if entry.IsDir() || !strings.HasSuffix(strings.ToLower(entry.Name()), ".s") ||
+	entries, err := repositoryFileEntries(s.root, s.inventory)
+	if err != nil {
+		return discovered, fmt.Errorf("discover Go assembly files: %w", err)
+	}
+	for _, candidate := range entries {
+		path := candidate.path
+		entry := candidate.entry
+		if !strings.HasSuffix(strings.ToLower(entry.Name()), ".s") ||
 			strings.HasPrefix(entry.Name(), ".") || strings.HasPrefix(entry.Name(), "_") {
-			return nil
+			continue
 		}
 		discovered++
 		relative := relativePath(s.root, path)
@@ -700,13 +707,9 @@ func (s *scannerState) addAssemblyBoundaries(
 			s.files = append(s.files, FileCompletion{
 				Path: relative, DiscoveredSites: 1, SkippedSites: 1, Skipped: true, Reason: reason,
 			})
-			return nil
+			continue
 		}
 		paths = append(paths, path)
-		return nil
-	})
-	if err != nil {
-		return discovered, fmt.Errorf("discover Go assembly files: %w", err)
 	}
 	sort.Strings(paths)
 	for _, path := range paths {

@@ -442,18 +442,18 @@ func skippedMetadataPath(relative string) string {
 	return cleanSlash(filepath.Join("__depgraph_skipped__", filepath.FromSlash(relative)))
 }
 
-func findManifests(root string) ([]string, []FileCompletion, []Diagnostic, error) {
+func findManifests(root string, inventory *repositoryInventory) ([]string, []FileCompletion, []Diagnostic, error) {
 	var manifests []string
 	var skipped []FileCompletion
 	var diagnostics []Diagnostic
-	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if entry.IsDir() && path != root && shouldSkipDirectory(entry.Name()) {
-			return filepath.SkipDir
-		}
-		if !entry.IsDir() && entry.Name() == "go.mod" {
+	entries, err := repositoryFileEntries(root, inventory)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	for _, candidate := range entries {
+		path := candidate.path
+		entry := candidate.entry
+		if entry.Name() == "go.mod" {
 			if _, resolveErr := resolveRegularFileWithinRoot(root, path); resolveErr != nil {
 				originalPath := relativePath(root, path)
 				code := "go_mod_read"
@@ -473,12 +473,11 @@ func findManifests(root string) ([]string, []FileCompletion, []Diagnostic, error
 					Code: code, Severity: "warning", Recoverable: true, Path: ledgerPath,
 					Message: reason,
 				})
-				return nil
+				continue
 			}
 			manifests = append(manifests, path)
 		}
-		return nil
-	})
+	}
 	sort.Strings(manifests)
 	sort.Slice(skipped, func(i, j int) bool { return skipped[i].Path < skipped[j].Path })
 	return manifests, skipped, diagnostics, err

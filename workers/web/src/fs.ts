@@ -1,6 +1,10 @@
-import { readdir, readFile, realpath, stat } from "node:fs/promises";
+import { lstat, readdir, readFile, realpath, stat } from "node:fs/promises";
 import path from "node:path";
 import { compareUtf8 } from "./types";
+
+const REPOSITORY_INVENTORY_CONTRACT_VERSION = "depgraph-repository-file-inventory-v1";
+const MAX_REPOSITORY_INVENTORY_BYTES = 64 * 1024 * 1024;
+const MAX_REPOSITORY_INVENTORY_FILES = 1_000_000;
 
 const IGNORED_DIRECTORIES = new Set([
   ".git",
@@ -13,6 +17,20 @@ const IGNORED_DIRECTORIES = new Set([
   "coverage",
   "dist",
   "build",
+  "node_modules",
+  "target",
+]);
+
+const INVENTORY_FORBIDDEN_DIRECTORIES = new Set([
+  ".astro",
+  ".cache",
+  ".depgraph",
+  ".git",
+  ".hg",
+  ".next",
+  ".output",
+  ".svn",
+  ".turbo",
   "node_modules",
   "target",
 ]);
@@ -179,6 +197,100 @@ export async function inventoryFiles(root: string): Promise<FileInventory> {
     `${right.path}\0${right.reason}\0${right.detail}`,
   ));
   return { files: result, issues };
+}
+
+export async function inventoryFilesFromManifest(
+  root: string,
+  inventoryFile: string,
+): Promise<FileInventory> {
+  const inventoryStat = await stat(inventoryFile);
+  if (!inventoryStat.isFile() || inventoryStat.size > MAX_REPOSITORY_INVENTORY_BYTES) {
+    throw new Error("repository inventory file exceeds its closed byte limit");
+  }
+  const parsed: unknown = JSON.parse(await readFile(inventoryFile, "utf8"));
+  if (
+    parsed === null
+    || typeof parsed !== "object"
+    || Array.isArray(parsed)
+    || Object.keys(parsed).sort(compareUtf8).join("\0") !== "contract_version\0paths"
+    || (parsed as { contract_version?: unknown }).contract_version !== REPOSITORY_INVENTORY_CONTRACT_VERSION
+    || !Array.isArray((parsed as { paths?: unknown }).paths)
+  ) {
+    throw new Error("repository inventory file does not satisfy its closed contract");
+  }
+  const rawPaths = (parsed as { paths: unknown[] }).paths;
+  if (rawPaths.length > MAX_REPOSITORY_INVENTORY_FILES) {
+    throw new Error("repository inventory exceeds its closed file-count limit");
+  }
+  const relativePaths: string[] = [];
+  const seen = new Set<string>();
+  for (const value of rawPaths) {
+    if (
+      typeof value !== "string"
+      || value.length === 0
+      || value.includes("\\")
+      || /[\u0000-\u001f\u007f]/u.test(value)
+      || path.posix.isAbsolute(value)
+      || path.posix.normalize(value) !== value
+      || value.split("/").some((component) => component === "" || component === "." || component === "..")
+      || value.split("/").some((component) => INVENTORY_FORBIDDEN_DIRECTORIES.has(component))
+      || seen.has(value)
+    ) {
+      throw new Error("repository inventory contains a non-canonical or duplicate path");
+    }
+    seen.add(value);
+    relativePaths.push(value);
+  }
+  relativePaths.sort(compareUtf8);
+
+  const canonicalRoot = await realpath(root);
+  const files: string[] = [];
+  const issues: FileInventoryIssue[] = [];
+  for (const relative of relativePaths) {
+    const absolute = path.join(canonicalRoot, ...relative.split("/"));
+    let metadata;
+    try {
+      metadata = await lstat(absolute);
+    } catch {
+      // A tracked file may disappear between Git inventory and worker launch.
+      continue;
+    }
+    if (metadata.isSymbolicLink()) {
+      if (!isRelevantFileName(path.basename(relative))) continue;
+      try {
+        const target = await realpath(absolute);
+        const inside = isWithinRoot(canonicalRoot, target);
+        issues.push({
+          path: relative,
+          reason: inside ? "symlink_not_followed" : "out_of_root_symlink",
+          detail: inside
+            ? "symbolic-link source was not read in safe mode"
+            : "symbolic-link source resolves outside the repository boundary",
+        });
+      } catch {
+        issues.push({
+          path: relative,
+          reason: "unreadable_path",
+          detail: "symbolic-link source target could not be read",
+        });
+      }
+    } else if (metadata.isFile()) {
+      const resolved = await resolveWithinRoot(canonicalRoot, absolute);
+      if (resolved !== null) files.push(resolved);
+      else if (isRelevantFileName(path.basename(relative))) {
+        issues.push({
+          path: relative,
+          reason: "unreadable_path",
+          detail: "source could not be resolved within the repository boundary",
+        });
+      }
+    }
+  }
+  issues.sort((left, right) => compareUtf8(
+    `${left.path}\0${left.reason}\0${left.detail}`,
+    `${right.path}\0${right.reason}\0${right.detail}`,
+  ));
+  return { files, issues };
 }
 
 export async function walkFiles(root: string): Promise<string[]> {
