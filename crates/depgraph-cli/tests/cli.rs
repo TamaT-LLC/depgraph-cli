@@ -1545,6 +1545,7 @@ fn runtime_import_is_atomic_deduplicated_queryable_and_deterministic() {
             "session-001",
             "--environment",
             "production",
+            "--all",
             "--json",
         ])
         .output()
@@ -1599,6 +1600,7 @@ fn runtime_import_is_atomic_deduplicated_queryable_and_deterministic() {
             "runtime",
             "--environment",
             "nodejs-24",
+            "--all",
             "--json",
         ])
         .output()
@@ -2929,7 +2931,7 @@ fn consented_build_mode_runs_project_code_only_in_the_supervised_staging_area() 
         );
         serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
     };
-    let doctor = run_json(&["doctor", "--json"]);
+    let doctor = run_json(&["doctor", "--details", "--json"]);
     assert_eq!(
         doctor["latest_attempt"]["profile_matrix"]["entries"]
             .as_array()
@@ -2953,7 +2955,7 @@ fn consented_build_mode_runs_project_code_only_in_the_supervised_staging_area() 
             .all(|correlation| correlation["status"] == "additional")
     );
 
-    let deps = run_json(&["deps", "id:package:app", "--json"]);
+    let deps = run_json(&["deps", "id:package:app", "--all", "--json"]);
     let steps = deps["data"]["steps"].as_array().unwrap();
     assert!(!steps.is_empty());
     assert!(steps.iter().all(|step| {
@@ -4835,6 +4837,7 @@ fn ambiguous_bare_selector_lists_candidates_and_explicit_selector_works() {
             store.to_str().unwrap(),
             "deps",
             "path:src/shared-one.go",
+            "--all",
             "--json",
         ])
         .output()
@@ -4942,12 +4945,12 @@ fn semantic_selectors_cycles_and_query_evidence_are_exposed() {
         output
     };
 
-    let symbol = query(&["deps", "symbol:OnlySymbol", "--json"]);
+    let symbol = query(&["deps", "symbol:OnlySymbol", "--all", "--json"]);
     let symbol: serde_json::Value = serde_json::from_slice(&symbol.stdout).unwrap();
     assert_eq!(symbol["data"]["root"]["id"], fixture.only_symbol_id);
     assert_eq!(symbol["data"]["root"]["kind"], "symbol");
 
-    let r#type = query(&["deps", "type:Shared", "--json"]);
+    let r#type = query(&["deps", "type:Shared", "--all", "--json"]);
     let r#type: serde_json::Value = serde_json::from_slice(&r#type.stdout).unwrap();
     assert_eq!(r#type["data"]["root"]["id"], fixture.shared_type_id);
     assert_eq!(r#type["data"]["root"]["kind"], "type");
@@ -4995,7 +4998,7 @@ fn semantic_selectors_cycles_and_query_evidence_are_exposed() {
 
     let alpha_selector = format!("id:{}", fixture.alpha_id);
     let beta_selector = format!("id:{}", fixture.beta_id);
-    let deps = query(&["deps", &alpha_selector, "--json"]);
+    let deps = query(&["deps", &alpha_selector, "--all", "--json"]);
     let deps: serde_json::Value = serde_json::from_slice(&deps.stdout).unwrap();
     assert_eq!(deps["data"]["root"]["id"], fixture.alpha_id);
     assert_eq!(deps["data"]["edges"][0]["id"], fixture.alpha_beta_edge_id);
@@ -5009,7 +5012,7 @@ fn semantic_selectors_cycles_and_query_evidence_are_exposed() {
         "calls"
     );
 
-    let dependents = query(&["dependents", &beta_selector, "--json"]);
+    let dependents = query(&["dependents", &beta_selector, "--all", "--json"]);
     let dependents: serde_json::Value = serde_json::from_slice(&dependents.stdout).unwrap();
     assert_eq!(
         dependents["data"]["steps"][0]["evidence"][0]["kind"],
@@ -5116,10 +5119,105 @@ fn query_commands_report_traversal_evidence_cycles_doctor_and_unresolved_sites()
     };
 
     let deps = query(&["deps", "path:go.mod", "--json"]);
-    assert_eq!(deps["data"]["edges"].as_array().unwrap().len(), 2);
+    assert_eq!(deps["items"].as_array().unwrap().len(), 2);
+    assert!(deps["complete"].as_bool().unwrap());
+    let first_page = query(&[
+        "deps",
+        "path:go.mod",
+        "--transitive",
+        "--max-items",
+        "1",
+        "--max-bytes",
+        "4096",
+        "--json",
+    ]);
+    let repeated_first_page = query(&[
+        "deps",
+        "path:go.mod",
+        "--transitive",
+        "--max-items",
+        "1",
+        "--max-bytes",
+        "4096",
+        "--json",
+    ]);
+    assert_eq!(first_page, repeated_first_page);
+    let snapshot_id = first_page["snapshot_id"].as_str().unwrap();
+    assert!(snapshot_id.starts_with("snapshot:sha256:"));
+    assert_eq!(first_page["complete"], false);
+    assert_eq!(first_page["returned_items"], 1);
+    assert!(first_page["serialized_output_bytes"].as_u64().unwrap() <= 4096);
+    assert_eq!(
+        first_page["diagnostics"][0]["code"],
+        "QUERY_OUTPUT_TRUNCATED"
+    );
+    let cursor = first_page["next_cursor"].as_str().unwrap();
+    let second_page = query(&[
+        "deps",
+        "path:go.mod",
+        "--transitive",
+        "--max-items",
+        "1",
+        "--max-bytes",
+        "4096",
+        "--cursor",
+        cursor,
+        "--json",
+    ]);
+    assert_eq!(second_page["snapshot_id"], snapshot_id);
+    assert_eq!(second_page["complete"], true);
+    assert_eq!(second_page["returned_items"], 1);
+    assert!(second_page["next_cursor"].is_null());
+    let mut paged_edge_ids = [
+        first_page["items"][0]["step"]["edge"]["id"]
+            .as_str()
+            .unwrap(),
+        second_page["items"][0]["step"]["edge"]["id"]
+            .as_str()
+            .unwrap(),
+    ];
+    paged_edge_ids.sort_unstable();
+    let full = query(&["deps", "path:go.mod", "--transitive", "--all", "--json"]);
+    let mut full_edge_ids = full["data"]["edges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|edge| edge["id"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    full_edge_ids.sort_unstable();
+    assert_eq!(paged_edge_ids.as_slice(), full_edge_ids.as_slice());
+
+    let traversal_limited = query(&[
+        "deps",
+        "path:go.mod",
+        "--transitive",
+        "--max-traversal",
+        "1",
+        "--json",
+    ]);
+    assert_eq!(traversal_limited["complete"], false);
+    assert!(
+        traversal_limited["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "QUERY_TRAVERSAL_LIMIT_REACHED")
+    );
+    let human_page = Command::cargo_bin("depgraph")
+        .unwrap()
+        .args(["--store", store.to_str().unwrap()])
+        .args(["deps", "path:go.mod", "--transitive", "--max-items", "1"])
+        .output()
+        .unwrap();
+    assert!(human_page.status.success());
+    let human_page = String::from_utf8(human_page.stdout).unwrap();
+    assert!(human_page.contains("complete=false"));
+    assert!(human_page.contains("summary status:"));
+    assert!(human_page.contains("next cursor:"));
+
     let dependents = query(&["dependents", "path:src/shared-one.go", "--json"]);
     assert_eq!(
-        dependents["data"]["nodes"][0]["id"],
+        dependents["items"][0]["source"]["id"],
         serde_json::Value::String("file:source".to_owned())
     );
     let why = query(&["why", "path:go.mod", "path:src/shared-one.go", "--json"]);
@@ -5135,21 +5233,22 @@ fn query_commands_report_traversal_evidence_cycles_doctor_and_unresolved_sites()
     assert!(cycles["data"].as_array().unwrap().is_empty());
     let doctor = query(&["doctor", "--json"]);
     assert_eq!(doctor["protocol_version"], "1.0");
+    assert_eq!(doctor["report_kind"], "summary");
     assert_eq!(doctor["latest_attempt"]["status"], "completed");
-    assert_eq!(
-        doctor["latest_attempt"]["profiles"][0]["coverage"]["profiles"],
-        1
-    );
+    assert_eq!(doctor["latest_attempt"]["profile_count"], 1);
+    assert_eq!(doctor["detail_command"], "depgraph doctor --details");
+    let details = query(&["doctor", "--details", "--json"]);
+    assert!(details["latest_attempt"]["profiles"].is_array());
 
     let unresolved_worker_path = temp.path().join("unresolved.sh");
     write_worker(&unresolved_worker_path, &unresolved_worker());
     let unresolved_scan = scan_with_worker(root.path(), &store, &unresolved_worker_path, false);
     assert_eq!(unresolved_scan.status.code(), Some(0));
     let unresolved = query(&["unresolved", "--json"]);
-    assert_eq!(unresolved["data"].as_array().unwrap().len(), 1);
-    assert_eq!(unresolved["data"][0]["site"]["id"], "site:missing");
+    assert_eq!(unresolved["items"].as_array().unwrap().len(), 1);
+    assert_eq!(unresolved["items"][0]["site"]["id"], "site:missing");
     assert_eq!(
-        unresolved["data"][0]["evidence"].as_array().unwrap().len(),
+        unresolved["items"][0]["evidence"].as_array().unwrap().len(),
         1
     );
 }

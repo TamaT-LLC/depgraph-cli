@@ -5863,6 +5863,7 @@ fn verify_packaged_build_evidence(
             .arg("--store")
             .arg(&store)
             .arg("doctor")
+            .arg("--details")
             .arg("--json")
             .output()?;
         if !doctor.status.success() {
@@ -6294,6 +6295,7 @@ fn verify_packaged_framework_build_e2e(
             "build",
             "--profile",
             profile_id,
+            "--all",
             "--json",
         ],
         &format!("query packaged {} build dependencies", capability.framework),
@@ -6308,6 +6310,7 @@ fn verify_packaged_framework_build_e2e(
             "build",
             "--profile",
             profile_id,
+            "--all",
             "--json",
         ],
         &format!("query packaged {} build dependents", capability.framework),
@@ -9218,13 +9221,13 @@ fn verify_packaged_web_import_type_call_graph(executable: &Path, store: &Path) -
         let deps = packaged_web_query(
             executable,
             store,
-            &["deps", &source_selector, "--json"],
+            &["deps", &source_selector, "--all", "--json"],
             &format!("query packaged Next.js {label} dependencies"),
         )?;
         let dependents = packaged_web_query(
             executable,
             store,
-            &["dependents", &target_selector, "--json"],
+            &["dependents", &target_selector, "--all", "--json"],
             &format!("query packaged Next.js {label} dependents"),
         )?;
         let why = packaged_web_query(
@@ -9522,7 +9525,7 @@ fn verify_packaged_web_import_type_call_graph(executable: &Path, store: &Path) -
     let astro_deps = packaged_web_query(
         executable,
         store,
-        &["deps", &astro_source_selector, "--json"],
+        &["deps", &astro_source_selector, "--all", "--json"],
         "query packaged Astro render dependencies",
     )?;
     let astro_why = packaged_web_query(
@@ -9691,7 +9694,7 @@ fn verify_packaged_web_import_type_call_graph(executable: &Path, store: &Path) -
     let tanstack_deps = packaged_web_query(
         executable,
         store,
-        &["deps", &tanstack_source_selector, "--json"],
+        &["deps", &tanstack_source_selector, "--all", "--json"],
         "query packaged TanStack Router parent dependencies",
     )?;
     let queried_parent_edges: BTreeSet<_> = tanstack_deps["data"]["steps"]
@@ -10060,7 +10063,7 @@ fn verify_packaged_web_import_type_call_graph(executable: &Path, store: &Path) -
     let deps = packaged_web_query(
         executable,
         store,
-        &["deps", WEB_DEFINITION_SELECTOR, "--json"],
+        &["deps", WEB_DEFINITION_SELECTOR, "--all", "--json"],
         "query the packaged Web definition graph",
     )?;
     let steps = deps["data"]["steps"]
@@ -10118,13 +10121,13 @@ fn verify_packaged_web_import_type_call_graph(executable: &Path, store: &Path) -
         let semantic_deps = packaged_web_query(
             executable,
             store,
-            &["deps", &source_selector, "--json"],
+            &["deps", &source_selector, "--all", "--json"],
             &format!("query packaged Web exact {label} dependencies"),
         )?;
         let semantic_dependents = packaged_web_query(
             executable,
             store,
-            &["dependents", &target_selector, "--json"],
+            &["dependents", &target_selector, "--all", "--json"],
             &format!("query packaged Web exact {label} dependents"),
         )?;
         let semantic_why = packaged_web_query(
@@ -10180,7 +10183,12 @@ fn verify_packaged_web_import_type_call_graph(executable: &Path, store: &Path) -
     let multiple_candidate_deps = packaged_web_query(
         executable,
         store,
-        &["deps", &multiple_candidate_source_selector, "--json"],
+        &[
+            "deps",
+            &multiple_candidate_source_selector,
+            "--all",
+            "--json",
+        ],
         "query packaged Web two-target candidate dependencies",
     )?;
     let candidate_query_contains_edge = |query: &Value, edge_id: &str| {
@@ -10214,7 +10222,7 @@ fn verify_packaged_web_import_type_call_graph(executable: &Path, store: &Path) -
         let candidate_dependents = packaged_web_query(
             executable,
             store,
-            &["dependents", &candidate_target_selector, "--json"],
+            &["dependents", &candidate_target_selector, "--all", "--json"],
             "query packaged Web two-target candidate dependents",
         )?;
         let candidate_why = packaged_web_query(
@@ -10249,7 +10257,7 @@ fn verify_packaged_web_import_type_call_graph(executable: &Path, store: &Path) -
     let unresolved = packaged_web_query(
         executable,
         store,
-        &["unresolved", "--json"],
+        &["unresolved", "--all", "--json"],
         "query packaged Web unresolved sites",
     )?;
     if !unresolved["data"].as_array().is_some_and(|items| {
@@ -10610,13 +10618,13 @@ fn verify_packaged_web_framework_query(
     let deps = packaged_web_query(
         executable,
         store,
-        &["deps", &source_selector, "--json"],
+        &["deps", &source_selector, "--all", "--json"],
         &format!("query packaged {framework} dependencies"),
     )?;
     let dependents = packaged_web_query(
         executable,
         store,
-        &["dependents", &target_selector, "--json"],
+        &["dependents", &target_selector, "--all", "--json"],
         &format!("query packaged {framework} dependents"),
     )?;
     let why = packaged_web_query(
@@ -10762,13 +10770,13 @@ fn verify_packaged_web_determinism(
     let first_query = packaged_web_query(
         executable,
         first_store,
-        &["deps", &source_selector, "--json"],
+        &["deps", &source_selector, "--all", "--json"],
         "query the first packaged Web semantic graph",
     )?;
     let second_query = packaged_web_query(
         executable,
         second_store,
-        &["deps", &source_selector, "--json"],
+        &["deps", &source_selector, "--all", "--json"],
         "query the second packaged Web semantic graph",
     )?;
     if first_query["data"] != second_query["data"] {

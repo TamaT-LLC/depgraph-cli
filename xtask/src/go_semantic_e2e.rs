@@ -624,7 +624,7 @@ fn verify_call_graph_boundaries(runner: &Runner<'_>, store: &Path, graph: &Value
         "Go profile lost boundary/completeness metadata: {profile}"
     );
 
-    let unresolved = runner.query(store, &["unresolved", "--json"])?;
+    let unresolved = runner.query(store, &["unresolved", "--all", "--json"])?;
     let unresolved_items = unresolved["data"]
         .as_array()
         .context("Go unresolved query has no data array")?;
@@ -668,7 +668,12 @@ fn verify_queries(
 ) -> Result<()> {
     let deps = runner.query(
         first_store,
-        &["deps", &format!("symbol:{DIRECT_CALL_MATRIX}"), "--json"],
+        &[
+            "deps",
+            &format!("symbol:{DIRECT_CALL_MATRIX}"),
+            "--all",
+            "--json",
+        ],
     )?;
     ensure!(
         deps["data"]["root"]["id"] == ids.direct && deps["data"]["root"]["kind"] == "symbol",
@@ -697,7 +702,10 @@ fn verify_queries(
         );
     }
 
-    let type_query = runner.query(first_store, &["deps", &format!("type:{INPUT}"), "--json"])?;
+    let type_query = runner.query(
+        first_store,
+        &["deps", &format!("type:{INPUT}"), "--all", "--json"],
+    )?;
     ensure!(
         type_query["data"]["root"]["id"] == ids.input
             && type_query["data"]["root"]["kind"] == "type",
@@ -706,7 +714,7 @@ fn verify_queries(
 
     let dependents = runner.query(
         first_store,
-        &["dependents", &format!("type:{INPUT}"), "--json"],
+        &["dependents", &format!("type:{INPUT}"), "--all", "--json"],
     )?;
     ensure!(
         dependents["data"]["root"]["id"] == ids.input

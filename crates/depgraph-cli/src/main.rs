@@ -6,25 +6,30 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use depgraph_core::{
     BoundedQueryExecutionError, BoundedQueryPlan, BoundedQueryResult, BuildOutcomeKind,
-    CancellationToken, Config, CycleLevel, DaemonStatus, ExportFormat, GraphQueryFilter,
-    ImpactFilters, ImpactResult, PolicyAnnotation, PolicyResult, QueryDiagnostic,
-    QueryFailureClass, RepositoryProfilePlanPreview, ScanCacheMode, TypedProjection,
-    acquire_store_writer_lock, build_cache_key, compiler_precise_graph_ndjson,
-    create_build_execution_request, create_compiler_precise_invocation_request,
-    create_compiler_precise_unit_graph_request, default_store_path, doctor, evaluate_policy_diff,
-    execute_bounded_query, execute_build_request_with_cancellation, export_filtered,
-    export_graphml_filtered_to_writer, impact, impact_query_cache_key, init_config,
-    match_runtime_trace, open_store, open_store_read_only, parse_and_type_check_bounded_query,
+    CancellationToken, Config, CycleLevel, DEFAULT_INTERACTIVE_QUERY_MAX_BYTES,
+    DEFAULT_INTERACTIVE_QUERY_MAX_ITEMS, DEFAULT_INTERACTIVE_QUERY_MAX_TRAVERSAL, DaemonStatus,
+    ExportFormat, GraphQueryFilter, ImpactFilters, ImpactResult, InteractiveQueryPage,
+    InteractiveQueryPageRequest, PolicyAnnotation, PolicyResult, QueryDiagnostic,
+    QueryFailureClass, RepositoryProfilePlanPreview, ScanCacheMode, TraversalPageItem,
+    TypedProjection, UnresolvedResult, acquire_store_writer_lock, build_cache_key,
+    compiler_precise_graph_ndjson, create_build_execution_request,
+    create_compiler_precise_invocation_request, create_compiler_precise_unit_graph_request,
+    default_store_path, doctor, doctor_summary, evaluate_policy_diff, execute_bounded_query,
+    execute_build_request_with_cancellation, export_filtered, export_graphml_filtered_to_writer,
+    impact, impact_query_cache_key, init_config, match_runtime_trace, open_store,
+    open_store_read_only, paginate_interactive_query, parse_and_type_check_bounded_query,
     plan_bounded_query, plan_explicit_profile_selection, plan_repository_profiles,
     policy_annotations, profile_selection_human_summary, read_bounded_query_file,
     read_compiler_pack_requirement, read_explicit_profile_selection_file, read_git_changed_set,
     read_runtime_trace, render_condition, render_github_annotations, run_scan_with_cache_mode,
     runtime_session_delta, rust_build_protocol_ndjson, stage_build_evidence,
-    start_repository_daemon, traverse_filtered, unresolved,
-    validate_explicit_profile_selection_capabilities, web_build_protocol_ndjson, why_filtered,
+    start_repository_daemon, traversal_page_items, traversal_summary, traverse_bounded_filtered,
+    traverse_filtered, unresolved, unresolved_summary,
+    validate_explicit_profile_selection_capabilities, validate_interactive_query_bounds,
+    web_build_protocol_ndjson, why_filtered,
 };
 use depgraph_protocol::canonical_json;
 use depgraph_store::{CompletedSnapshotDetails, CoverageRecord};
@@ -49,6 +54,25 @@ struct Cli {
 
     #[command(subcommand)]
     command: Commands,
+}
+
+#[derive(Debug, Clone, Args)]
+struct InteractiveOutputArgs {
+    /// Return the explicit full result instead of the bounded page contract.
+    #[arg(
+        long,
+        conflicts_with_all = ["max_items", "max_bytes", "cursor"]
+    )]
+    all: bool,
+    /// Return at most this many canonical result items.
+    #[arg(long, value_name = "N", conflicts_with = "all")]
+    max_items: Option<usize>,
+    /// Bound the canonical JSON document size in UTF-8 bytes.
+    #[arg(long, value_name = "BYTES", conflicts_with = "all")]
+    max_bytes: Option<usize>,
+    /// Continue from a cursor returned for the same snapshot and query.
+    #[arg(long, value_name = "TOKEN", conflicts_with = "all")]
+    cursor: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -108,12 +132,21 @@ enum Commands {
     Doctor {
         #[arg(long)]
         json: bool,
+        /// Emit the bounded health summary (the default).
+        #[arg(long, conflicts_with = "details")]
+        summary: bool,
+        /// Emit the complete retained attempt payload.
+        #[arg(long, conflicts_with = "summary")]
+        details: bool,
     },
     /// List outgoing dependencies from a selector.
     Deps {
         selector: String,
         #[arg(long)]
         transitive: bool,
+        /// Stop traversal after this many visited dependency edges.
+        #[arg(long, value_name = "N", conflicts_with = "all")]
+        max_traversal: Option<usize>,
         #[arg(long, value_name = "PHASE")]
         phase: Vec<String>,
         #[arg(long, value_name = "PROFILE_ID")]
@@ -124,12 +157,17 @@ enum Commands {
         environment: Vec<String>,
         #[arg(long)]
         json: bool,
+        #[command(flatten)]
+        output: InteractiveOutputArgs,
     },
     /// List incoming dependencies to a selector.
     Dependents {
         selector: String,
         #[arg(long)]
         transitive: bool,
+        /// Stop traversal after this many visited dependency edges.
+        #[arg(long, value_name = "N", conflicts_with = "all")]
+        max_traversal: Option<usize>,
         #[arg(long, value_name = "PHASE")]
         phase: Vec<String>,
         #[arg(long, value_name = "PROFILE_ID")]
@@ -140,6 +178,8 @@ enum Commands {
         environment: Vec<String>,
         #[arg(long)]
         json: bool,
+        #[command(flatten)]
+        output: InteractiveOutputArgs,
     },
     /// Explain a deterministic shortest dependency path.
     Why {
@@ -200,6 +240,8 @@ enum Commands {
     Unresolved {
         #[arg(long)]
         json: bool,
+        #[command(flatten)]
+        output: InteractiveOutputArgs,
     },
     /// Run one bounded read-only query against an immutable completed snapshot.
     Query {
@@ -521,6 +563,7 @@ fn error_exit_code(error: &anyhow::Error) -> u8 {
         || (message.contains("diff ") && message.contains(" filter must"))
         || (message.contains("impact ")
             && (message.contains(" filter must") || message.contains("must be greater")))
+        || message.contains("interactive query")
         || message.contains("git ref")
         || [
             "selector",
@@ -1043,10 +1086,23 @@ async fn run(cli: Cli) -> Result<u8> {
                 | BuildOutcomeKind::Cancelled => 3,
             })
         }
-        Commands::Doctor { json } => {
+        Commands::Doctor {
+            json,
+            summary: _,
+            details,
+        } => {
             let root = std::env::current_dir()?;
             let store_path = store_path(cli.store, &root)?;
             let store = open_store(&store_path)?;
+            if !details {
+                let report = doctor_summary(&store).await?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    print_doctor_summary_human(&report);
+                }
+                return Ok(0);
+            }
             let report = doctor(&store).await?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
@@ -1240,36 +1296,88 @@ async fn run(cli: Cli) -> Result<u8> {
         Commands::Deps {
             selector,
             transitive,
+            max_traversal,
             phase,
             profile,
             session,
             environment,
             json,
+            output,
         } => {
             let filter = GraphQueryFilter::new(phase, profile, session, environment)?;
-            let (snapshot, scan_id) = load_snapshot(cli.store, cli.scan_id.as_deref(), false)?;
-            let result = traverse_filtered(&snapshot, &selector, transitive, false, &filter)?;
-            print_structured("deps", scan_id, &result, json)?;
-            if !json {
-                print_path_steps(&result.steps);
+            if output.all {
+                let (snapshot, scan_id) = load_snapshot(cli.store, cli.scan_id.as_deref(), false)?;
+                let result = traverse_filtered(&snapshot, &selector, transitive, false, &filter)?;
+                print_structured("deps", scan_id, &result, json)?;
+                if !json {
+                    print_path_steps(&result.steps);
+                }
+            } else {
+                let (snapshot, snapshot_id) =
+                    load_query_snapshot_read_only(cli.store, cli.scan_id.as_deref())?;
+                let scan_id = snapshot.scan.id.clone();
+                let page = interactive_traversal_page(
+                    &snapshot,
+                    &scan_id,
+                    &snapshot_id,
+                    "deps",
+                    &selector,
+                    transitive,
+                    false,
+                    &filter,
+                    max_traversal,
+                    &output,
+                )?;
+                print_interactive_page(&page, json)?;
+                if !json {
+                    for item in &page.items {
+                        print_path_steps(std::slice::from_ref(&item.step));
+                    }
+                }
             }
             Ok(0)
         }
         Commands::Dependents {
             selector,
             transitive,
+            max_traversal,
             phase,
             profile,
             session,
             environment,
             json,
+            output,
         } => {
             let filter = GraphQueryFilter::new(phase, profile, session, environment)?;
-            let (snapshot, scan_id) = load_snapshot(cli.store, cli.scan_id.as_deref(), false)?;
-            let result = traverse_filtered(&snapshot, &selector, transitive, true, &filter)?;
-            print_structured("dependents", scan_id, &result, json)?;
-            if !json {
-                print_path_steps(&result.steps);
+            if output.all {
+                let (snapshot, scan_id) = load_snapshot(cli.store, cli.scan_id.as_deref(), false)?;
+                let result = traverse_filtered(&snapshot, &selector, transitive, true, &filter)?;
+                print_structured("dependents", scan_id, &result, json)?;
+                if !json {
+                    print_path_steps(&result.steps);
+                }
+            } else {
+                let (snapshot, snapshot_id) =
+                    load_query_snapshot_read_only(cli.store, cli.scan_id.as_deref())?;
+                let scan_id = snapshot.scan.id.clone();
+                let page = interactive_traversal_page(
+                    &snapshot,
+                    &scan_id,
+                    &snapshot_id,
+                    "dependents",
+                    &selector,
+                    transitive,
+                    true,
+                    &filter,
+                    max_traversal,
+                    &output,
+                )?;
+                print_interactive_page(&page, json)?;
+                if !json {
+                    for item in &page.items {
+                        print_path_steps(std::slice::from_ref(&item.step));
+                    }
+                }
             }
             Ok(0)
         }
@@ -1380,50 +1488,47 @@ async fn run(cli: Cli) -> Result<u8> {
             }
             Ok(0)
         }
-        Commands::Unresolved { json } => {
-            let (snapshot, scan_id) = load_snapshot(cli.store, cli.scan_id.as_deref(), false)?;
-            let result = unresolved(&snapshot);
-            print_structured("unresolved", scan_id, &result, json)?;
-            if !json {
-                for unresolved in result {
-                    let effective_profile = unresolved
-                        .effective_profile_id
-                        .as_deref()
-                        .unwrap_or("unavailable");
-                    let observed_status = unresolved
-                        .correlation_status
-                        .as_deref()
-                        .unwrap_or("unavailable");
-                    let difference_reasons = if unresolved.observed_difference_reasons.is_empty() {
-                        "none".to_owned()
-                    } else {
-                        unresolved.observed_difference_reasons.join(",")
-                    };
-                    let site = unresolved.site;
-                    let span = unresolved.evidence.first().map(|evidence| {
-                        format!(
-                            "{}:{}:{}-{}:{}",
-                            evidence.path,
-                            evidence.start_line,
-                            evidence.start_column,
-                            evidence.end_line,
-                            evidence.end_column
-                        )
-                    });
-                    println!(
-                        "{} {} at {} profile={} effective_profile={} observed={} differences={} condition={} span={} ({})",
-                        site.kind,
-                        site.specifier.unwrap_or_default(),
-                        site.source,
-                        site.profile_id,
-                        effective_profile,
-                        observed_status,
-                        difference_reasons,
-                        render_condition(&site.condition),
-                        span.unwrap_or_else(|| "unknown".to_owned()),
-                        site.reason
-                            .unwrap_or_else(|| "no reason provided".to_owned())
-                    );
+        Commands::Unresolved { json, output } => {
+            if output.all {
+                let (snapshot, scan_id) = load_snapshot(cli.store, cli.scan_id.as_deref(), false)?;
+                let result = unresolved(&snapshot);
+                print_structured("unresolved", scan_id, &result, json)?;
+                if !json {
+                    print_unresolved_items(&result);
+                }
+            } else {
+                let (snapshot, snapshot_id) =
+                    load_query_snapshot_read_only(cli.store, cli.scan_id.as_deref())?;
+                let scan_id = snapshot.scan.id.clone();
+                let result = unresolved(&snapshot);
+                let max_items = output
+                    .max_items
+                    .unwrap_or(DEFAULT_INTERACTIVE_QUERY_MAX_ITEMS);
+                let max_bytes = output
+                    .max_bytes
+                    .unwrap_or(DEFAULT_INTERACTIVE_QUERY_MAX_BYTES);
+                validate_interactive_query_bounds(max_items, max_bytes, None)?;
+                let context = serde_json::json!({"query":"unresolved"});
+                let page = paginate_interactive_query(
+                    &result,
+                    unresolved_summary(&result),
+                    InteractiveQueryPageRequest {
+                        command: "unresolved",
+                        scan_id: &scan_id,
+                        snapshot_id: &snapshot_id,
+                        context: &context,
+                        cursor: output.cursor.as_deref(),
+                        max_items,
+                        max_bytes,
+                        traversal_complete: true,
+                        traversed_items: result.len().try_into().unwrap_or(u64::MAX),
+                        root: None,
+                        diagnostics: Vec::new(),
+                    },
+                )?;
+                print_interactive_page(&page, json)?;
+                if !json {
+                    print_unresolved_items(&page.items);
                 }
             }
             Ok(0)
@@ -2332,6 +2437,267 @@ fn query_projection_label(projection: &TypedProjection) -> String {
     }
 }
 
+fn print_doctor_summary_human(report: &depgraph_core::DoctorSummaryReport) {
+    println!("doctor report: {}", report.report_kind);
+    println!("protocol: {}", report.protocol_version);
+    println!("graph schema: {}", report.graph_schema_version);
+    println!("store schema: {}", report.store_schema_version);
+    println!(
+        "cache entries: {} syntax, {} semantic, {} build",
+        report.cache_entries.syntax, report.cache_entries.semantic, report.cache_entries.build
+    );
+    for (toolchain, version) in &report.toolchains {
+        let baseline = report
+            .supported_baselines
+            .get(toolchain)
+            .map(String::as_str)
+            .unwrap_or("best-effort");
+        println!("toolchain {toolchain}: {version} (baseline {baseline})");
+        if let Some(remediation) = report.toolchain_remediation.get(toolchain) {
+            println!("toolchain {toolchain} remediation: {remediation}");
+        }
+    }
+    for worker in &report.workers {
+        if worker.available {
+            println!(
+                "worker {}: available ({}, {}; {})",
+                worker.adapter,
+                worker.command.as_deref().unwrap_or_default(),
+                worker.version.as_deref().unwrap_or("unknown version"),
+                worker.integrity
+            );
+        } else {
+            println!(
+                "worker {}: unavailable ({})",
+                worker.adapter,
+                worker.error.as_deref().unwrap_or_default()
+            );
+        }
+    }
+    if let Some(scan) = &report.latest_attempt {
+        println!(
+            "latest attempt: {} ({}) root={}",
+            scan.scan_id, scan.status, scan.root
+        );
+        println!(
+            "coverage: {} sites ({} resolved, {} candidates, {} external, {} unresolved), {} skipped, {} unsupported",
+            scan.coverage.dependency_sites,
+            scan.coverage.resolved,
+            scan.coverage.candidates,
+            scan.coverage.external,
+            scan.coverage.unresolved,
+            scan.coverage.files_skipped,
+            scan.coverage.unsupported_syntax
+        );
+        let languages = scan
+            .profiles_by_language
+            .iter()
+            .map(|(language, count)| format!("{language}={count}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!(
+            "profiles: {} ({languages}); package instances: {}",
+            scan.profile_count, scan.package_instance_count
+        );
+        println!(
+            "diagnostics: {} total, {} groups shown, {} groups omitted, {} diagnostics omitted",
+            scan.diagnostics.total,
+            scan.diagnostics.groups.len(),
+            scan.diagnostics.omitted_groups,
+            scan.diagnostics.omitted_diagnostics
+        );
+        for group in &scan.diagnostics.groups {
+            println!(
+                "  {} {} adapter={}: {}",
+                group.severity,
+                group.code,
+                group.adapter.as_deref().unwrap_or("none"),
+                group.count
+            );
+        }
+        for sample in &scan.diagnostics.samples {
+            println!(
+                "  sample {} {} path={}: {}",
+                sample.code,
+                sample.id,
+                sample.path.as_deref().unwrap_or("none"),
+                sample.message
+            );
+        }
+        for coverage in &scan.file_coverage {
+            println!(
+                "files {}: {} total, {} skipped; sites discovered={} emitted={} skipped={}",
+                coverage.adapter,
+                coverage.files,
+                coverage.skipped_files,
+                coverage.discovered_sites,
+                coverage.emitted_sites,
+                coverage.skipped_sites
+            );
+        }
+        for log in &scan.adapter_logs {
+            if log.truncated {
+                println!(
+                    "worker {} stderr: {} bytes (truncated)",
+                    log.adapter, log.stderr_bytes
+                );
+            }
+        }
+        println!("project code executed: {}", scan.project_code_executed);
+    } else {
+        println!("latest attempt: none");
+    }
+    println!("details: {}", report.detail_command);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn interactive_traversal_page(
+    snapshot: &depgraph_store::GraphSnapshot,
+    scan_id: &str,
+    snapshot_id: &str,
+    command: &'static str,
+    selector: &str,
+    transitive: bool,
+    reverse: bool,
+    filter: &GraphQueryFilter,
+    max_traversal: Option<usize>,
+    output: &InteractiveOutputArgs,
+) -> Result<InteractiveQueryPage<TraversalPageItem>> {
+    let max_items = output
+        .max_items
+        .unwrap_or(DEFAULT_INTERACTIVE_QUERY_MAX_ITEMS);
+    let max_bytes = output
+        .max_bytes
+        .unwrap_or(DEFAULT_INTERACTIVE_QUERY_MAX_BYTES);
+    let max_traversal = max_traversal.unwrap_or(DEFAULT_INTERACTIVE_QUERY_MAX_TRAVERSAL);
+    validate_interactive_query_bounds(max_items, max_bytes, Some(max_traversal))?;
+    let execution = traverse_bounded_filtered(
+        snapshot,
+        selector,
+        transitive,
+        reverse,
+        filter,
+        max_traversal,
+    )?;
+    let items = traversal_page_items(&execution.result)?;
+    let context = serde_json::json!({
+        "selector": selector,
+        "transitive": transitive,
+        "reverse": reverse,
+        "filter": filter,
+        "max_traversal": max_traversal,
+    });
+    paginate_interactive_query(
+        &items,
+        traversal_summary(&execution.result),
+        InteractiveQueryPageRequest {
+            command,
+            scan_id,
+            snapshot_id,
+            context: &context,
+            cursor: output.cursor.as_deref(),
+            max_items,
+            max_bytes,
+            traversal_complete: execution.complete,
+            traversed_items: execution.traversed_edges,
+            root: Some(&execution.result.root),
+            diagnostics: execution.diagnostics,
+        },
+    )
+}
+
+fn print_interactive_page<T: Serialize>(
+    page: &InteractiveQueryPage<T>,
+    json_output: bool,
+) -> Result<()> {
+    if json_output {
+        println!("{}", canonical_json(&serde_json::to_value(page)?));
+        return Ok(());
+    }
+    println!(
+        "{}: returned {}/{} items; complete={}; traversed={}; output_bytes={}",
+        page.command,
+        page.returned_items,
+        page.total_items,
+        page.complete,
+        page.traversed_items,
+        page.serialized_output_bytes
+    );
+    for (label, summary) in [
+        ("status", &page.summary.by_status),
+        ("phase", &page.summary.by_phase),
+        ("profile", &page.summary.by_profile),
+        ("kind", &page.summary.by_kind),
+        ("reason", &page.summary.by_reason),
+    ] {
+        if summary.groups.is_empty() && summary.omitted_groups == 0 {
+            continue;
+        }
+        let groups = summary
+            .groups
+            .iter()
+            .map(|group| format!("{}={}", group.key, group.count))
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!(
+            "summary {label}: {groups}; omitted_groups={} omitted_items={}",
+            summary.omitted_groups, summary.omitted_items
+        );
+    }
+    for diagnostic in &page.diagnostics {
+        println!(
+            "diagnostic {}: {}; remediation={}",
+            diagnostic.code, diagnostic.message, diagnostic.remediation
+        );
+    }
+    if let Some(cursor) = &page.next_cursor {
+        println!("next cursor: {cursor}");
+    }
+    Ok(())
+}
+
+fn print_unresolved_items(items: &[UnresolvedResult]) {
+    for unresolved in items {
+        let effective_profile = unresolved
+            .effective_profile_id
+            .as_deref()
+            .unwrap_or("unavailable");
+        let observed_status = unresolved
+            .correlation_status
+            .as_deref()
+            .unwrap_or("unavailable");
+        let difference_reasons = if unresolved.observed_difference_reasons.is_empty() {
+            "none".to_owned()
+        } else {
+            unresolved.observed_difference_reasons.join(",")
+        };
+        let site = &unresolved.site;
+        let span = unresolved.evidence.first().map(|evidence| {
+            format!(
+                "{}:{}:{}-{}:{}",
+                evidence.path,
+                evidence.start_line,
+                evidence.start_column,
+                evidence.end_line,
+                evidence.end_column
+            )
+        });
+        println!(
+            "{} {} at {} profile={} effective_profile={} observed={} differences={} condition={} span={} ({})",
+            site.kind,
+            site.specifier.as_deref().unwrap_or_default(),
+            site.source,
+            site.profile_id,
+            effective_profile,
+            observed_status,
+            difference_reasons,
+            render_condition(&site.condition),
+            span.unwrap_or_else(|| "unknown".to_owned()),
+            site.reason.as_deref().unwrap_or("no reason provided")
+        );
+    }
+}
+
 fn inspect_runtime_trace_input(path: &Path) -> Result<std::fs::Metadata> {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) => Ok(metadata),
@@ -2624,6 +2990,12 @@ mod tests {
         assert_eq!(
             error_exit_code(&anyhow::anyhow!(
                 "impact max-nodes must be greater than zero"
+            )),
+            2
+        );
+        assert_eq!(
+            error_exit_code(&anyhow::anyhow!(
+                "interactive query cursor does not match this snapshot and query"
             )),
             2
         );

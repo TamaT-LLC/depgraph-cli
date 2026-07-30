@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
 use anyhow::{Context, Result, bail};
-use depgraph_protocol::Condition;
+use depgraph_protocol::{Condition, canonical_json, stable_id_from_value};
 use depgraph_store::{
     DiagnosticRecord, EdgeRecord, EvidenceRecord, GraphSnapshot, NodeRecord, PhaseCoverageRecord,
     ProfileCorrelationRecord, ProfileMatrixRecord, SiteRecord,
@@ -9,6 +9,420 @@ use depgraph_store::{
 };
 use petgraph::{algo::tarjan_scc, graph::DiGraph};
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+
+pub const INTERACTIVE_QUERY_PAGE_CONTRACT_VERSION: &str = "depgraph-interactive-query-page-v1";
+pub const DEFAULT_INTERACTIVE_QUERY_MAX_ITEMS: usize = 100;
+pub const DEFAULT_INTERACTIVE_QUERY_MAX_BYTES: usize = 1024 * 1024;
+pub const DEFAULT_INTERACTIVE_QUERY_MAX_TRAVERSAL: usize = 50_000;
+pub const MAX_INTERACTIVE_QUERY_ITEMS: usize = 10_000;
+pub const MAX_INTERACTIVE_QUERY_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_INTERACTIVE_QUERY_TRAVERSAL: usize = 1_000_000;
+const MIN_INTERACTIVE_QUERY_BYTES: usize = 4 * 1024;
+const MAX_QUERY_SUMMARY_GROUPS: usize = 64;
+const INTERACTIVE_QUERY_CURSOR_PREFIX: &str = "depgraph-query-cursor-v1";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueryPageDiagnostic {
+    pub code: String,
+    pub message: String,
+    pub remediation: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueryCountGroup {
+    pub key: String,
+    pub count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueryCountSummary {
+    pub groups: Vec<QueryCountGroup>,
+    pub omitted_groups: u64,
+    pub omitted_items: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InteractiveQuerySummary {
+    pub total_items: u64,
+    pub by_status: QueryCountSummary,
+    pub by_phase: QueryCountSummary,
+    pub by_profile: QueryCountSummary,
+    pub by_kind: QueryCountSummary,
+    pub by_reason: QueryCountSummary,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InteractiveQueryPage<T> {
+    pub schema_version: String,
+    pub contract_version: String,
+    pub command: String,
+    pub scan_id: String,
+    pub snapshot_id: String,
+    pub complete: bool,
+    pub returned_items: u64,
+    pub total_items: u64,
+    pub traversed_items: u64,
+    pub serialized_output_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root: Option<NodeRecord>,
+    pub summary: InteractiveQuerySummary,
+    pub diagnostics: Vec<QueryPageDiagnostic>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    pub items: Vec<T>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BoundedTraversalResult {
+    pub result: TraversalResult,
+    pub complete: bool,
+    pub traversed_edges: u64,
+    pub diagnostics: Vec<QueryPageDiagnostic>,
+}
+
+#[derive(Debug, Clone)]
+pub struct InteractiveQueryPageRequest<'a> {
+    pub command: &'a str,
+    pub scan_id: &'a str,
+    pub snapshot_id: &'a str,
+    pub context: &'a Value,
+    pub cursor: Option<&'a str>,
+    pub max_items: usize,
+    pub max_bytes: usize,
+    pub traversal_complete: bool,
+    pub traversed_items: u64,
+    pub root: Option<&'a NodeRecord>,
+    pub diagnostics: Vec<QueryPageDiagnostic>,
+}
+
+pub fn validate_interactive_query_bounds(
+    max_items: usize,
+    max_bytes: usize,
+    max_traversal: Option<usize>,
+) -> Result<()> {
+    if !(1..=MAX_INTERACTIVE_QUERY_ITEMS).contains(&max_items) {
+        bail!("interactive query max-items must be in 1..={MAX_INTERACTIVE_QUERY_ITEMS}");
+    }
+    if !(MIN_INTERACTIVE_QUERY_BYTES..=MAX_INTERACTIVE_QUERY_BYTES).contains(&max_bytes) {
+        bail!(
+            "interactive query max-bytes must be in {MIN_INTERACTIVE_QUERY_BYTES}..={MAX_INTERACTIVE_QUERY_BYTES}"
+        );
+    }
+    if let Some(max_traversal) = max_traversal
+        && !(1..=MAX_INTERACTIVE_QUERY_TRAVERSAL).contains(&max_traversal)
+    {
+        bail!("interactive query max-traversal must be in 1..={MAX_INTERACTIVE_QUERY_TRAVERSAL}");
+    }
+    Ok(())
+}
+
+pub fn traversal_summary(result: &TraversalResult) -> InteractiveQuerySummary {
+    summarize_query_items(
+        result
+            .steps
+            .iter()
+            .map(|step| step.edge.resolution_status.as_str()),
+        result.steps.iter().map(|step| step.edge.phase.as_str()),
+        result
+            .steps
+            .iter()
+            .map(|step| step.edge.profile_id.as_str()),
+        result.steps.iter().map(|step| step.edge.kind.as_str()),
+        std::iter::empty(),
+        result.steps.len(),
+    )
+}
+
+pub fn traversal_page_items(result: &TraversalResult) -> Result<Vec<TraversalPageItem>> {
+    let nodes = std::iter::once(&result.root)
+        .chain(result.nodes.iter())
+        .map(|node| (node.id.as_str(), node))
+        .collect::<BTreeMap<_, _>>();
+    result
+        .steps
+        .iter()
+        .map(|step| {
+            let source = nodes.get(step.edge.source.as_str()).with_context(|| {
+                format!(
+                    "traversal page source node {} is unavailable",
+                    step.edge.source
+                )
+            })?;
+            let target = nodes.get(step.edge.target.as_str()).with_context(|| {
+                format!(
+                    "traversal page target node {} is unavailable",
+                    step.edge.target
+                )
+            })?;
+            Ok(TraversalPageItem {
+                source: (*source).clone(),
+                target: (*target).clone(),
+                step: step.clone(),
+            })
+        })
+        .collect()
+}
+
+pub fn unresolved_summary(result: &[UnresolvedResult]) -> InteractiveQuerySummary {
+    summarize_query_items(
+        result
+            .iter()
+            .map(|item| item.site.resolution_status.as_str()),
+        result
+            .iter()
+            .flat_map(|item| item.phases.iter().map(String::as_str)),
+        result.iter().map(|item| item.site.profile_id.as_str()),
+        result.iter().map(|item| item.site.kind.as_str()),
+        result
+            .iter()
+            .map(|item| item.site.reason.as_deref().unwrap_or("unspecified")),
+        result.len(),
+    )
+}
+
+fn summarize_query_items<'a>(
+    statuses: impl Iterator<Item = &'a str>,
+    phases: impl Iterator<Item = &'a str>,
+    profiles: impl Iterator<Item = &'a str>,
+    kinds: impl Iterator<Item = &'a str>,
+    reasons: impl Iterator<Item = &'a str>,
+    total_items: usize,
+) -> InteractiveQuerySummary {
+    InteractiveQuerySummary {
+        total_items: total_items.try_into().unwrap_or(u64::MAX),
+        by_status: bounded_count_summary(statuses),
+        by_phase: bounded_count_summary(phases),
+        by_profile: bounded_count_summary(profiles),
+        by_kind: bounded_count_summary(kinds),
+        by_reason: bounded_count_summary(reasons),
+    }
+}
+
+fn bounded_count_summary<'a>(values: impl Iterator<Item = &'a str>) -> QueryCountSummary {
+    let mut counts = BTreeMap::<String, u64>::new();
+    for value in values {
+        *counts.entry(value.to_owned()).or_default() += 1;
+    }
+    let mut groups = counts
+        .into_iter()
+        .map(|(key, count)| QueryCountGroup { key, count })
+        .collect::<Vec<_>>();
+    groups.sort_by(|left, right| right.count.cmp(&left.count).then(left.key.cmp(&right.key)));
+    let omitted = groups.split_off(groups.len().min(MAX_QUERY_SUMMARY_GROUPS));
+    QueryCountSummary {
+        groups,
+        omitted_groups: omitted.len().try_into().unwrap_or(u64::MAX),
+        omitted_items: omitted.iter().map(|group| group.count).sum(),
+    }
+}
+
+pub fn paginate_interactive_query<T>(
+    items: &[T],
+    summary: InteractiveQuerySummary,
+    request: InteractiveQueryPageRequest<'_>,
+) -> Result<InteractiveQueryPage<T>>
+where
+    T: Clone + Serialize,
+{
+    validate_interactive_query_bounds(request.max_items, request.max_bytes, None)?;
+    let context_digest = stable_id_from_value(
+        "interactive-query-context",
+        &json!({
+            "contract_version": INTERACTIVE_QUERY_PAGE_CONTRACT_VERSION,
+            "command": request.command,
+            "scan_id": request.scan_id,
+            "snapshot_id": request.snapshot_id,
+            "context": request.context,
+        }),
+    );
+    let offset = request
+        .cursor
+        .map(|cursor| decode_interactive_query_cursor(cursor, &context_digest))
+        .transpose()?
+        .unwrap_or(0);
+    if offset > items.len() {
+        bail!("interactive query cursor is beyond the available canonical result");
+    }
+
+    let maximum_count = request.max_items.min(items.len() - offset);
+    let mut maximum_page = build_interactive_query_page(
+        items,
+        &summary,
+        &request,
+        &context_digest,
+        offset,
+        maximum_count,
+        false,
+    );
+    stabilize_serialized_output_bytes(&mut maximum_page)?;
+    let maximum_fits = usize::try_from(maximum_page.serialized_output_bytes).unwrap_or(usize::MAX)
+        <= request.max_bytes;
+    let mut low = if maximum_fits { maximum_count } else { 0 };
+    if !maximum_fits {
+        let mut high = maximum_count.saturating_sub(1);
+        while low < high {
+            let count = low + (high - low).div_ceil(2);
+            let mut page = build_interactive_query_page(
+                items,
+                &summary,
+                &request,
+                &context_digest,
+                offset,
+                count,
+                false,
+            );
+            stabilize_serialized_output_bytes(&mut page)?;
+            if usize::try_from(page.serialized_output_bytes).unwrap_or(usize::MAX)
+                <= request.max_bytes
+            {
+                low = count;
+            } else {
+                high = count - 1;
+            }
+        }
+    }
+
+    let remaining_item_exceeds_budget = low == 0 && offset < items.len();
+    let mut page = build_interactive_query_page(
+        items,
+        &summary,
+        &request,
+        &context_digest,
+        offset,
+        low,
+        remaining_item_exceeds_budget,
+    );
+    stabilize_serialized_output_bytes(&mut page)?;
+    if usize::try_from(page.serialized_output_bytes).unwrap_or(usize::MAX) > request.max_bytes {
+        bail!(
+            "interactive query max-bytes is too small for the bounded summary metadata; increase --max-bytes"
+        );
+    }
+    Ok(page)
+}
+
+fn build_interactive_query_page<T>(
+    items: &[T],
+    summary: &InteractiveQuerySummary,
+    request: &InteractiveQueryPageRequest<'_>,
+    context_digest: &str,
+    offset: usize,
+    count: usize,
+    remaining_item_exceeds_budget: bool,
+) -> InteractiveQueryPage<T>
+where
+    T: Clone,
+{
+    let page_end = offset + count;
+    let output_truncated = page_end < items.len();
+    let complete = request.traversal_complete && !output_truncated;
+    let mut diagnostics = request.diagnostics.clone();
+    if remaining_item_exceeds_budget {
+        diagnostics.push(QueryPageDiagnostic {
+            code: "QUERY_ITEM_EXCEEDS_BYTE_BUDGET".to_owned(),
+            message: format!(
+                "the next canonical item does not fit within the {}-byte output budget",
+                request.max_bytes
+            ),
+            remediation: "rerun the same cursor with a larger --max-bytes value".to_owned(),
+        });
+    } else if output_truncated {
+        diagnostics.push(QueryPageDiagnostic {
+            code: "QUERY_OUTPUT_TRUNCATED".to_owned(),
+            message: format!(
+                "returned {count} canonical items from offset {offset} before the configured output limit"
+            ),
+            remediation: "resume with next_cursor, or use --all for an explicit full result"
+                .to_owned(),
+        });
+    }
+    diagnostics.sort_by(|left, right| {
+        left.code
+            .cmp(&right.code)
+            .then(left.message.cmp(&right.message))
+    });
+    diagnostics.dedup();
+    let next_cursor = (output_truncated && !remaining_item_exceeds_budget)
+        .then(|| encode_interactive_query_cursor(context_digest, page_end));
+    InteractiveQueryPage {
+        schema_version: "1.0".to_owned(),
+        contract_version: INTERACTIVE_QUERY_PAGE_CONTRACT_VERSION.to_owned(),
+        command: request.command.to_owned(),
+        scan_id: request.scan_id.to_owned(),
+        snapshot_id: request.snapshot_id.to_owned(),
+        complete,
+        returned_items: count.try_into().unwrap_or(u64::MAX),
+        total_items: summary.total_items,
+        traversed_items: request.traversed_items,
+        serialized_output_bytes: 0,
+        root: request.root.cloned(),
+        summary: summary.clone(),
+        diagnostics,
+        next_cursor,
+        items: items[offset..page_end].to_vec(),
+    }
+}
+
+fn serialized_page_len<T: Serialize>(page: &InteractiveQueryPage<T>) -> Result<usize> {
+    Ok(canonical_json(&serde_json::to_value(page)?).len())
+}
+
+fn stabilize_serialized_output_bytes<T: Serialize>(
+    page: &mut InteractiveQueryPage<T>,
+) -> Result<()> {
+    for _ in 0..8 {
+        let length = serialized_page_len(page)?;
+        let length = length.try_into().unwrap_or(u64::MAX);
+        if page.serialized_output_bytes == length {
+            return Ok(());
+        }
+        page.serialized_output_bytes = length;
+    }
+    bail!("interactive query output byte accounting did not converge")
+}
+
+fn encode_interactive_query_cursor(context_digest: &str, offset: usize) -> String {
+    let signature = stable_id_from_value(
+        "interactive-query-cursor",
+        &json!({
+            "context_digest": context_digest,
+            "offset": offset,
+        }),
+    );
+    let signature = signature.rsplit(':').next().unwrap_or(signature.as_str());
+    format!("{INTERACTIVE_QUERY_CURSOR_PREFIX}.{offset}.{signature}")
+}
+
+fn decode_interactive_query_cursor(cursor: &str, context_digest: &str) -> Result<usize> {
+    let mut parts = cursor.split('.');
+    let prefix = parts.next();
+    let raw_offset = parts.next();
+    let signature = parts.next();
+    if prefix != Some(INTERACTIVE_QUERY_CURSOR_PREFIX)
+        || parts.next().is_some()
+        || signature.is_none_or(|value| {
+            value.len() != 64
+                || !value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+    {
+        bail!("interactive query cursor is malformed");
+    }
+    let raw_offset = raw_offset.context("interactive query cursor is malformed")?;
+    let offset = raw_offset
+        .parse::<usize>()
+        .context("interactive query cursor has an invalid offset")?;
+    if offset.to_string() != raw_offset {
+        bail!("interactive query cursor offset is not canonical");
+    }
+    let expected = encode_interactive_query_cursor(context_digest, offset);
+    if expected != cursor {
+        bail!("interactive query cursor does not match this snapshot and query");
+    }
+    Ok(offset)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CycleLevel {
@@ -31,12 +445,19 @@ impl CycleLevel {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TraversalResult {
     pub root: NodeRecord,
     pub nodes: Vec<NodeRecord>,
     pub edges: Vec<EdgeRecord>,
     pub steps: Vec<PathStep>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TraversalPageItem {
+    pub source: NodeRecord,
+    pub target: NodeRecord,
+    pub step: PathStep,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -68,6 +489,8 @@ pub struct CycleResult {
 pub struct UnresolvedResult {
     pub site: SiteRecord,
     pub evidence: Vec<EvidenceRecord>,
+    #[serde(skip_serializing)]
+    pub phases: Vec<String>,
     pub effective_profile_id: Option<String>,
     pub correlation_status: Option<String>,
     pub observed_difference_reasons: Vec<String>,
@@ -319,16 +742,37 @@ pub fn traverse_filtered(
     reverse: bool,
     filter: &GraphQueryFilter,
 ) -> Result<TraversalResult> {
+    Ok(
+        traverse_bounded_filtered(snapshot, selector, transitive, reverse, filter, usize::MAX)?
+            .result,
+    )
+}
+
+pub fn traverse_bounded_filtered(
+    snapshot: &GraphSnapshot,
+    selector: &str,
+    transitive: bool,
+    reverse: bool,
+    filter: &GraphQueryFilter,
+    max_traversal: usize,
+) -> Result<BoundedTraversalResult> {
     let root = resolve_selector(snapshot, selector)?;
     let node_map = node_map(snapshot);
     let adjacency = adjacency(snapshot, reverse, filter);
     let mut queue = VecDeque::from([root.id.clone()]);
     let mut visited = BTreeSet::from([root.id.clone()]);
     let mut selected_edges = BTreeMap::new();
+    let mut traversed_edges = 0_usize;
+    let mut complete = true;
 
-    while let Some(node_id) = queue.pop_front() {
+    'traversal: while let Some(node_id) = queue.pop_front() {
         if let Some(edges) = adjacency.get(&node_id) {
             for edge in edges {
+                if traversed_edges >= max_traversal {
+                    complete = false;
+                    break 'traversal;
+                }
+                traversed_edges += 1;
                 selected_edges.insert(edge.id.clone(), (*edge).clone());
                 let next = if reverse { &edge.source } else { &edge.target };
                 if visited.insert(next.clone()) && transitive {
@@ -360,11 +804,27 @@ pub fn traverse_filtered(
             )
         })
         .collect();
-    Ok(TraversalResult {
-        root,
-        nodes,
-        edges,
-        steps,
+    let diagnostics = (!complete)
+        .then(|| QueryPageDiagnostic {
+            code: "QUERY_TRAVERSAL_LIMIT_REACHED".to_owned(),
+            message: format!(
+                "dependency traversal stopped after {traversed_edges} edge visits (limit {max_traversal})"
+            ),
+            remediation: "rerun with a larger --max-traversal value or narrow the query filters"
+                .to_owned(),
+        })
+        .into_iter()
+        .collect();
+    Ok(BoundedTraversalResult {
+        result: TraversalResult {
+            root,
+            nodes,
+            edges,
+            steps,
+        },
+        complete,
+        traversed_edges: traversed_edges.try_into().unwrap_or(u64::MAX),
+        diagnostics,
     })
 }
 
@@ -551,6 +1011,17 @@ pub fn unresolved(snapshot: &GraphSnapshot) -> Vec<UnresolvedResult> {
                 map
             },
         );
+    let phases = snapshot.edges.iter().fold(
+        BTreeMap::<String, BTreeSet<String>>::new(),
+        |mut map, edge| {
+            if let Some(site_id) = &edge.site_id {
+                map.entry(site_id.clone())
+                    .or_default()
+                    .insert(edge.phase.clone());
+            }
+            map
+        },
+    );
     let correlations = site_correlation_map(&snapshot.profile_matrix);
     snapshot
         .sites
@@ -561,6 +1032,10 @@ pub fn unresolved(snapshot: &GraphSnapshot) -> Vec<UnresolvedResult> {
             UnresolvedResult {
                 site: site.clone(),
                 evidence: evidence.get(&site.id).cloned().unwrap_or_default(),
+                phases: phases
+                    .get(&site.id)
+                    .map(|values| values.iter().cloned().collect())
+                    .unwrap_or_default(),
                 effective_profile_id: correlation
                     .map(|correlation| correlation.effective_profile_id.clone()),
                 correlation_status: correlation.map(|correlation| correlation.status.clone()),
@@ -1013,6 +1488,365 @@ mod tests {
         assert_eq!(dependents.steps.len(), 1);
         assert_eq!(dependents.steps[0].edge.id, "e0");
         assert_eq!(dependents.steps[0].evidence.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn interactive_pages_are_canonical_bounded_and_lossless() -> Result<()> {
+        let graph = snapshot();
+        let traversal = traverse_bounded_filtered(
+            &graph,
+            "id:a",
+            true,
+            false,
+            &GraphQueryFilter::default(),
+            100,
+        )?;
+        assert!(traversal.complete);
+        let summary = traversal_summary(&traversal.result);
+        let context = json!({"selector":"id:a","transitive":true,"reverse":false});
+        let mut cursor = None;
+        let mut observed = Vec::new();
+        loop {
+            let page = paginate_interactive_query(
+                &traversal.result.steps,
+                summary.clone(),
+                InteractiveQueryPageRequest {
+                    command: "deps",
+                    scan_id: "scan",
+                    snapshot_id: "snapshot:scan",
+                    context: &context,
+                    cursor: cursor.as_deref(),
+                    max_items: 1,
+                    max_bytes: 64 * 1024,
+                    traversal_complete: traversal.complete,
+                    traversed_items: traversal.traversed_edges,
+                    root: Some(&traversal.result.root),
+                    diagnostics: traversal.diagnostics.clone(),
+                },
+            )?;
+            assert_eq!(
+                usize::try_from(page.serialized_output_bytes).unwrap(),
+                canonical_json(&serde_json::to_value(&page)?).len()
+            );
+            assert!(usize::try_from(page.serialized_output_bytes).unwrap() <= 64 * 1024);
+            observed.extend(page.items.iter().map(|step| step.edge.id.clone()));
+            if page.complete {
+                assert!(page.next_cursor.is_none());
+                break;
+            }
+            assert_eq!(
+                page.diagnostics
+                    .iter()
+                    .filter(|diagnostic| diagnostic.code == "QUERY_OUTPUT_TRUNCATED")
+                    .count(),
+                1
+            );
+            cursor = page.next_cursor;
+        }
+        assert_eq!(
+            observed,
+            traversal
+                .result
+                .steps
+                .iter()
+                .map(|step| step.edge.id.clone())
+                .collect::<Vec<_>>()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn complete_final_page_is_admitted_when_partial_page_metadata_is_larger() -> Result<()> {
+        let graph = snapshot();
+        let items = vec!["a".to_owned(), "b".to_owned()];
+        let summary = summarize_query_items(
+            std::iter::empty(),
+            std::iter::empty(),
+            std::iter::empty(),
+            std::iter::empty(),
+            std::iter::empty(),
+            items.len(),
+        );
+        let context = json!({"selector":"id:a","final_page_boundary":true});
+        let mut root = graph.nodes[0].clone();
+        root.properties = json!({"padding":"x".repeat(4 * 1024)});
+        let request = |max_bytes| InteractiveQueryPageRequest {
+            command: "deps",
+            scan_id: "scan",
+            snapshot_id: "snapshot:scan",
+            context: &context,
+            cursor: None,
+            max_items: items.len(),
+            max_bytes,
+            traversal_complete: true,
+            traversed_items: 2,
+            root: Some(&root),
+            diagnostics: Vec::new(),
+        };
+        let unconstrained = paginate_interactive_query(
+            &items,
+            summary.clone(),
+            request(MAX_INTERACTIVE_QUERY_BYTES),
+        )?;
+        assert!(unconstrained.complete);
+        let exact_budget = usize::try_from(unconstrained.serialized_output_bytes)?;
+        let page = paginate_interactive_query(&items, summary, request(exact_budget))?;
+        assert!(page.complete);
+        assert_eq!(page.items, items);
+        assert_eq!(page.serialized_output_bytes, exact_budget as u64);
+        Ok(())
+    }
+
+    #[test]
+    fn large_bounded_fixture_pages_without_duplicates_or_gaps() -> Result<()> {
+        let mut graph = snapshot();
+        graph.nodes = (0..=512)
+            .map(|index| {
+                node(
+                    &format!("node:{index:04}"),
+                    "file",
+                    &format!("file://{index:04}"),
+                    &format!("{index:04}"),
+                )
+            })
+            .collect();
+        graph.edges = (0..512)
+            .map(|index| EdgeRecord {
+                id: format!("edge:{index:04}"),
+                site_id: Some(format!("site:{index:04}")),
+                source: format!("node:{index:04}"),
+                target: format!("node:{:04}", index + 1),
+                kind: "imports".to_owned(),
+                phase: if index % 2 == 0 {
+                    "static".to_owned()
+                } else {
+                    "semantic".to_owned()
+                },
+                environment: "host".to_owned(),
+                profile_id: format!("fixture:{}", index % 4),
+                resolution_status: "resolved".to_owned(),
+                precision: "exact".to_owned(),
+                condition: json!({"op":"all","conditions":[]}),
+                generated: false,
+            })
+            .collect();
+        graph.evidence = graph
+            .edges
+            .iter()
+            .map(|edge| {
+                let mut item = evidence("edge", &edge.id, 0, "src/large.rs");
+                item.properties = json!({"bounded_fixture":"x".repeat(128)});
+                item
+            })
+            .collect();
+        let traversal = traverse_bounded_filtered(
+            &graph,
+            "id:node:0000",
+            true,
+            false,
+            &GraphQueryFilter::default(),
+            1_000,
+        )?;
+        assert!(traversal.complete);
+        assert_eq!(traversal.result.steps.len(), 512);
+        let summary = traversal_summary(&traversal.result);
+        let context = json!({"selector":"id:node:0000","fixture":"large"});
+        let mut cursor = None;
+        let mut observed = Vec::new();
+        loop {
+            let page = paginate_interactive_query(
+                &traversal.result.steps,
+                summary.clone(),
+                InteractiveQueryPageRequest {
+                    command: "deps",
+                    scan_id: "scan-large",
+                    snapshot_id: "snapshot:scan-large",
+                    context: &context,
+                    cursor: cursor.as_deref(),
+                    max_items: 17,
+                    max_bytes: 16 * 1024,
+                    traversal_complete: true,
+                    traversed_items: traversal.traversed_edges,
+                    root: Some(&traversal.result.root),
+                    diagnostics: Vec::new(),
+                },
+            )?;
+            assert!(page.serialized_output_bytes <= 16 * 1024);
+            observed.extend(page.items.iter().map(|step| step.edge.id.clone()));
+            cursor = page.next_cursor;
+            if page.complete {
+                break;
+            }
+        }
+        assert_eq!(observed.len(), 512);
+        assert_eq!(
+            observed.iter().collect::<BTreeSet<_>>().len(),
+            observed.len()
+        );
+        assert_eq!(
+            observed,
+            traversal
+                .result
+                .steps
+                .iter()
+                .map(|step| step.edge.id.clone())
+                .collect::<Vec<_>>()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn interactive_cursor_and_traversal_limits_fail_closed() -> Result<()> {
+        let graph = snapshot();
+        let traversal = traverse_bounded_filtered(
+            &graph,
+            "id:a",
+            true,
+            false,
+            &GraphQueryFilter::default(),
+            1,
+        )?;
+        assert!(!traversal.complete);
+        assert_eq!(traversal.traversed_edges, 1);
+        assert_eq!(
+            traversal.diagnostics[0].code,
+            "QUERY_TRAVERSAL_LIMIT_REACHED"
+        );
+
+        let context = json!({"selector":"id:a"});
+        let first = paginate_interactive_query(
+            &traversal.result.steps,
+            traversal_summary(&traversal.result),
+            InteractiveQueryPageRequest {
+                command: "deps",
+                scan_id: "scan",
+                snapshot_id: "snapshot:scan",
+                context: &context,
+                cursor: None,
+                max_items: 1,
+                max_bytes: 64 * 1024,
+                traversal_complete: traversal.complete,
+                traversed_items: traversal.traversed_edges,
+                root: Some(&traversal.result.root),
+                diagnostics: traversal.diagnostics,
+            },
+        )?;
+        assert!(!first.complete);
+        assert!(first.next_cursor.is_none());
+        let error = paginate_interactive_query(
+            &first.items,
+            first.summary.clone(),
+            InteractiveQueryPageRequest {
+                command: "deps",
+                scan_id: "other-scan",
+                snapshot_id: "snapshot:other-scan",
+                context: &context,
+                cursor: Some("depgraph-query-cursor-v1.1.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                max_items: 1,
+                max_bytes: 64 * 1024,
+                traversal_complete: true,
+                traversed_items: 1,
+                root: None,
+                diagnostics: Vec::new(),
+            },
+        )
+        .expect_err("tampered cursor must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("cursor does not match this snapshot and query")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn interactive_cursor_is_bound_to_the_immutable_snapshot_identity() -> Result<()> {
+        let items = vec!["first".to_owned(), "second".to_owned()];
+        let summary = summarize_query_items(
+            std::iter::empty(),
+            std::iter::empty(),
+            std::iter::empty(),
+            std::iter::empty(),
+            std::iter::empty(),
+            items.len(),
+        );
+        let context = json!({"selector":"id:a"});
+        let first = paginate_interactive_query(
+            &items,
+            summary.clone(),
+            InteractiveQueryPageRequest {
+                command: "deps",
+                scan_id: "scan",
+                snapshot_id: "snapshot:before-build",
+                context: &context,
+                cursor: None,
+                max_items: 1,
+                max_bytes: 64 * 1024,
+                traversal_complete: true,
+                traversed_items: 2,
+                root: None,
+                diagnostics: Vec::new(),
+            },
+        )?;
+        let cursor = first.next_cursor.context("first page cursor")?;
+        let error = paginate_interactive_query(
+            &items,
+            summary,
+            InteractiveQueryPageRequest {
+                command: "deps",
+                scan_id: "scan",
+                snapshot_id: "snapshot:after-build",
+                context: &context,
+                cursor: Some(&cursor),
+                max_items: 1,
+                max_bytes: 64 * 1024,
+                traversal_complete: true,
+                traversed_items: 2,
+                root: None,
+                diagnostics: Vec::new(),
+            },
+        )
+        .expect_err("a cursor from another immutable snapshot must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("cursor does not match this snapshot and query")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn oversized_next_item_returns_a_stable_byte_budget_diagnostic() -> Result<()> {
+        let mut graph = snapshot();
+        graph.evidence.push(EvidenceRecord {
+            properties: json!({"large":"x".repeat(8 * 1024)}),
+            ..evidence("edge", "e0", 0, "large.go")
+        });
+        let traversal = traverse(&graph, "id:a", false, false)?;
+        let context = json!({"selector":"id:a"});
+        let page = paginate_interactive_query(
+            &traversal.steps,
+            traversal_summary(&traversal),
+            InteractiveQueryPageRequest {
+                command: "deps",
+                scan_id: "scan",
+                snapshot_id: "snapshot:scan",
+                context: &context,
+                cursor: None,
+                max_items: 1,
+                max_bytes: 4 * 1024,
+                traversal_complete: true,
+                traversed_items: 1,
+                root: Some(&traversal.root),
+                diagnostics: Vec::new(),
+            },
+        )?;
+        assert!(!page.complete);
+        assert!(page.items.is_empty());
+        assert!(page.next_cursor.is_none());
+        assert_eq!(page.diagnostics[0].code, "QUERY_ITEM_EXCEEDS_BYTE_BUDGET");
+        assert!(page.serialized_output_bytes <= 4 * 1024);
         Ok(())
     }
 

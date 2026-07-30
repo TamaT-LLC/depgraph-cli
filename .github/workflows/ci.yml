@@ -493,7 +493,7 @@ jobs:
                 ))
               ))
           ' "$tmp/one.json"
-          target/debug/depgraph --store "$tmp/one.db" deps 'type:definition:["package","npm:workspace:@fixture/shared@1.0.0#apps/shared","definition:[\"module\",\"type\",\"apps/shared/src/semantic.ts\",[\"SharedStringCollection\"]]"]' --json > "$tmp/deps.json"
+          target/debug/depgraph --store "$tmp/one.db" deps 'type:definition:["package","npm:workspace:@fixture/shared@1.0.0#apps/shared","definition:[\"module\",\"type\",\"apps/shared/src/semantic.ts\",[\"SharedStringCollection\"]]"]' --all --json > "$tmp/deps.json"
           jq -e '.data.steps as $steps
             | ([$steps[].edge.kind] | unique) as $kinds
             | (["extends", "implements", "instantiates"]
@@ -503,7 +503,7 @@ jobs:
             .phase == "semantic" and .kind == "calls" and .resolution_status == "resolved"
           )][0].source // empty' "$tmp/one.json")"
           test -n "$semantic_source"
-          target/debug/depgraph --store "$tmp/one.db" deps "id:$semantic_source" --json > "$tmp/semantic-deps-one.json"
+          target/debug/depgraph --store "$tmp/one.db" deps "id:$semantic_source" --all --json > "$tmp/semantic-deps-one.json"
           jq -e '.data.steps | any(
             .edge.phase == "semantic"
             and .edge.kind == "calls" and .edge.resolution_status == "resolved"
@@ -516,7 +516,7 @@ jobs:
                 and (.id as $id | $semantic_ids | index($id))
               )][0].id // empty' "$tmp/one.json")"
           test -n "$semantic_unresolved_id"
-          target/debug/depgraph --store "$tmp/one.db" unresolved --json > "$tmp/unresolved.json"
+          target/debug/depgraph --store "$tmp/one.db" unresolved --all --json > "$tmp/unresolved.json"
           jq -e --arg id "$semantic_unresolved_id" '.data | any(
             .site.id == $id
             and (.site.reason | type == "string" and length > 0)
@@ -551,7 +551,7 @@ jobs:
           jq -S '.graph' "$tmp/one.json" > "$tmp/one.graph.json"
           jq -S '.graph' "$tmp/two.json" > "$tmp/two.graph.json"
           diff -u "$tmp/one.graph.json" "$tmp/two.graph.json"
-          target/debug/depgraph --store "$tmp/two.db" deps "id:$semantic_source" --json > "$tmp/semantic-deps-two.json"
+          target/debug/depgraph --store "$tmp/two.db" deps "id:$semantic_source" --all --json > "$tmp/semantic-deps-two.json"
           jq -S '.data' "$tmp/semantic-deps-one.json" > "$tmp/semantic-deps-one.data.json"
           jq -S '.data' "$tmp/semantic-deps-two.json" > "$tmp/semantic-deps-two.data.json"
           diff -u "$tmp/semantic-deps-one.data.json" "$tmp/semantic-deps-two.data.json"

@@ -1283,19 +1283,29 @@ profileは完全なrecordのcanonical JSON array、dependency siteは完全なre
 
 writer APIはheader、key schema、graph-level JSON record、node、edgeを順に直接`Write`へ流し、JSON arrayもrecord単位、XML textもbounded buffer単位で出力する。CLIのstdoutはこのwriterへ直接流し、`--output`は同一directoryのtemporary fileへstreamした後、成功時だけdestinationをatomic replaceするため、失敗時に既存出力をtruncateしない。graph全体を追加の巨大文字列へ複製せず、既存JSON / DOT / Mermaidのschemaとbyte outputは変更しない。
 
+### 13.10 Interactive query bounded output
+
+Issue #264の`depgraph-interactive-query-page-v1`は`deps` / `dependents` / `unresolved`の対話的出力をfull graph exportから分離する。既定はcanonical item 100件、compact UTF-8 JSON document 1 MiB、dependency traversal 50,000 edge visitであり、hard capはそれぞれ10,000件、16 MiB、1,000,000 visitとする。document byte budgetはterminal newlineを含まないJSON document全体に適用し、item追加後の実serialize byte数が上限以下になる最大prefixだけを返す。単一itemがbudgetを超える場合は空pageと`QUERY_ITEM_EXCEEDS_BYTE_BUDGET`を返し、同じ入力cursorにより大きいbudgetを指定するremediationを示す。
+
+page itemはstable edge ID順（unresolvedはstable site ID順）である。bounded pageはbase scan IDとは別にcontent-addressed completed `snapshot_id`を公開する。`next_cursor`はcontract version、command、immutable snapshot ID、scan ID、selector、direction、transitive flag、canonical filter、traversal limit、offsetをSHA-256で結合したopaque tokenであり、同じscan IDへbuild overlayが昇格した後を含む別snapshot / queryへの再利用、非canonical offset、改変をfail closedする。item / byte打ち切りは`complete:false`、`QUERY_OUTPUT_TRUNCATED`、返却件数、全件数、serialize byte数、次cursorを返す。同一snapshot・同一cursor・同一budgetの出力はbyte-identicalで、cursorを終端まで追うと重複・欠落なくcanonical full item列を復元できる。
+
+traversal budgetはBFSで実際にadmitしたedge visitへ適用する。到達時は`QUERY_TRAVERSAL_LIMIT_REACHED`と`complete:false`を返し、未探索集合を完全なcursorへ偽装しないため、admit済み集合の終端にはcontinuationを出さない。利用者はlimitを増やすかfilterを狭める。`--all`は従来のcomplete `TraversalResult` / unresolved arrayを明示的に維持し、full property graphは引き続きstreaming `export`を使う。
+
+summaryはstatus / phase / profile / kind / reasonを原因件数順・key順で決定的に集約し、各dimension最大64 groupとomitted countに制限する。doctor summaryはcompleted snapshot chainのbuild / runtime overlayをSQLite JSON scalar projectionで合成し、diagnostic properties、base diagnostic raw JSON、graph / evidence、adapter stderrを読み込まずにdetailsと一致するprofile / package / site / diagnostic countとproject-code execution状態を返す。human出力とJSONは同じsummary、diagnostic、cursorを共有する。
+
 ## 14. CLI UX
 
 ```text
 depgraph init
 depgraph scan [PATH] [--profile NAME] [--strict]
 depgraph resolve --build [PATH] [--allow-project-code]
-depgraph doctor [--json]
-depgraph deps <SELECTOR> [--transitive]
-depgraph dependents <SELECTOR> [--transitive]
+depgraph doctor [--summary|--details] [--json]
+depgraph deps <SELECTOR> [--transitive] [--max-items N] [--max-bytes BYTES] [--max-traversal N] [--cursor TOKEN|--all]
+depgraph dependents <SELECTOR> [--transitive] [--max-items N] [--max-bytes BYTES] [--max-traversal N] [--cursor TOKEN|--all]
 depgraph why <FROM> <TO>
 depgraph impact <SELECTOR> [--changed <GIT_REF>]
 depgraph cycles [--level package|file|symbol|route]
-depgraph unresolved [--profile NAME]
+depgraph unresolved [--max-items N] [--max-bytes BYTES] [--cursor TOKEN|--all]
 depgraph runtime validate <TRACE> [--json]
 depgraph runtime import <TRACE> [--json]
 depgraph snapshot create <NAME> [--json]
@@ -1313,6 +1323,9 @@ selector は path、stable ID、package、symbol、route pattern を受け付け
 
 ### 14.2 `doctor`
 
+- 既定`--summary`はgraph / evidence / diagnostic raw JSON / adapter stderrをloadせず、latest attemptのscan / coverage、profile / package count、adapter別file coverage、stderr byte/truncation、diagnostic totalを読む
+- diagnostic summaryは`severity + code + adapter`の上位64原因group、omitted group/item count、ordinal順の代表5件だけをbounded textで返す
+- `--details`は従来どおりlatest attemptの全profile / file coverage / diagnostic / profile matrix / cache event payloadを返す
 - toolchain / worker availability
 - skipped files / parser errors
 - unresolved / candidates / external counts
@@ -1840,6 +1853,7 @@ digest、ref/tag検証、PR記録項目、patch release時も変わらないance
 - runtime trace schema v11 store union / query / export: Issue #84で実装済み（2026-07-24）
 - deterministic GraphML exporter: Issue #85で実装済み（2026-07-24）
 - initial / incremental / impact benchmarkとCI/release gate: Issue #86で実装済み（2026-07-24）
+- doctor summary / interactive query bounded page・cursor: Issue #264で実装済み（2026-07-30）
 - worker delta schema v12 transactional staging / apply / rollback / GC: Issue #133で実装済み（2026-07-24）
 - watcher / daemon fine-grained incremental executor / full fallback: Issue #134で実装済み（2026-07-24）
 - production runtime collector SDK / transport / redaction contract: Issue #137で実装済み（2026-07-24）
@@ -1911,6 +1925,7 @@ digest、ref/tag検証、PR記録項目、patch release時も変わらないance
 
 ## 26. 更新履歴
 
+- 2026-07-30: Issue #264として対話的query出力をbounded化した。`doctor`は既定summaryと明示`--details`を分離し、summaryはdiagnostic raw JSON、graph / evidence、adapter stderrを読まずにcoverage、profile / package、adapter別file、diagnostic total・上位64原因group・代表5件を返す。`deps` / `dependents` / `unresolved`は`depgraph-interactive-query-page-v1`でitem / compact JSON byte / traversalを制限し、打ち切りを`complete:false`、固定diagnostic、実serialize byte数、snapshot/query-bound cursorとして公開する。同一cursorの決定性、page連結の重複・欠落なし、oversized item、改変cursor、traversal上限、human/JSON、512-edge fixtureを回帰検証し、`--all`とstreaming `export`でfull outputを維持する。
 - 2026-07-30: Issue #263としてRust syntax fallbackを改善した。標準prelude / manifest依存をexternal/heuristic、condition-compatibleな明示local型宣言・module-scope importをsource-backed `type`へのresolved/candidates heuristicへ分類し、block-local importはmodule indexへ漏らさない。同一原因のmacro / proc-macro / unsupported attribute / build-environment warningは各siteの安定group参照、全site集合のcount/digest、bounded path count/digest、最大5件の代表ID/evidenceを持つ1 diagnosticへ集約し、全site/span、strict failure、決定性、`project_code_executed=false`を維持する。`rust-syntax-fallback-summary-v1`はsyntax解決、HIR必須、macro実行必須の件数と別々のremediationをhuman/JSONへ出力する。
 - 2026-07-30: Issue #261としてscan cacheのsymlink policyを局所化した。repository内file symlinkはlink target identityとconfined target bytesをsyntax / semantic fingerprintへ含め、cache-hit昇格直前にlink path、canonical target、length、content digestを再検証する。root外、dangling、loop、non-file、変更または読取不能なlinkはworker rescanへfail closedし、cache eventには固定reason、core diagnosticには安全なrepository-relative link pathだけを残す。`WARP.md -> CLAUDE.md`相当の文書linkについて反復cache hit、link有無のgraph / coverage同一性、project code非実行を固定し、root-out / loop / dangling / target content差し替えfixtureで拒否境界を検証する。
 - 2026-07-29: Issue #249としてcompiler-precise five-target release gateを実装。Linux x86-64 / ARM64、macOS Intel / Apple Silicon、Windows x86-64で通常archiveと分離したcompiler packを構築し、公式channel manifestとrustup component inventoryからclosed treeを作る。各native jobはarchive展開、core attestation、wrapper / query handshake、typed MIR / instance / call / constant fixture、別checkout決定性、resource budget、SBOM / license / provenance、missing / unsupported / tamper時のno-fallbackとrollbackを検証する。aggregate verifierは五つのpackが`compiler-pack-five-target-release-v1`、固定toolchain / rustc commit / schema / query capability、canonical semantic shapeを共有することを要求し、stable release gateへ独立reportを渡す。release compatibilityとdoctorはsupported target、separate distribution、`unsupported-no-fallback` policyを公開する。

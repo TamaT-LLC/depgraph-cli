@@ -731,7 +731,10 @@ fn verify_queries(
     second_store: &Path,
     ids: &FixtureIds,
 ) -> Result<()> {
-    let deps = runner.query(first_store, &["deps", &format!("symbol:{BUILD}"), "--json"])?;
+    let deps = runner.query(
+        first_store,
+        &["deps", &format!("symbol:{BUILD}"), "--all", "--json"],
+    )?;
     ensure!(
         deps["data"]["root"]["id"] == ids.build && deps["data"]["root"]["kind"] == "symbol",
         "Rust symbol selector did not resolve build: {deps}"
@@ -740,7 +743,10 @@ fn verify_queries(
         assert_query_edge(&deps, expected)?;
     }
 
-    let type_query = runner.query(first_store, &["deps", &format!("type:{INPUT}"), "--json"])?;
+    let type_query = runner.query(
+        first_store,
+        &["deps", &format!("type:{INPUT}"), "--all", "--json"],
+    )?;
     ensure!(
         type_query["data"]["root"]["id"] == ids.input
             && type_query["data"]["root"]["kind"] == "type",
@@ -749,7 +755,7 @@ fn verify_queries(
 
     let dependents = runner.query(
         first_store,
-        &["dependents", &format!("type:{INPUT}"), "--json"],
+        &["dependents", &format!("type:{INPUT}"), "--all", "--json"],
     )?;
     ensure!(
         dependents["data"]["root"]["id"] == ids.input

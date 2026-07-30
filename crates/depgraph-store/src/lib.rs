@@ -47,6 +47,84 @@ pub use runtime::{
 };
 
 pub const STORE_SCHEMA_VERSION: i64 = 13;
+const DOCTOR_SUMMARY_MAX_DIAGNOSTIC_GROUPS: usize = 64;
+const DOCTOR_SUMMARY_MAX_DIAGNOSTIC_SAMPLES: usize = 5;
+const DOCTOR_SUMMARY_MAX_KEY_BYTES: usize = 128;
+const DOCTOR_SUMMARY_MAX_TEXT_BYTES: usize = 240;
+const DOCTOR_OVERLAY_LAYERS_CTE: &str = "
+WITH RECURSIVE
+latest_snapshot(
+    id, parent_snapshot_id, build_attempt_id, runtime_session_set_json, depth
+) AS (
+    SELECT seed.id, seed.parent_snapshot_id, seed.build_attempt_id,
+           seed.runtime_session_set_json, 0
+      FROM (
+          SELECT id, parent_snapshot_id, build_attempt_id, runtime_session_set_json
+            FROM completed_snapshots
+           WHERE scan_id=?1 AND status='completed'
+           ORDER BY julianday(created_at) DESC, rowid DESC
+           LIMIT 1
+      ) AS seed
+    UNION ALL
+    SELECT parent.id, parent.parent_snapshot_id, parent.build_attempt_id,
+           parent.runtime_session_set_json, child.depth + 1
+      FROM completed_snapshots AS parent
+      JOIN latest_snapshot AS child ON parent.id=child.parent_snapshot_id
+),
+build_layers(build_attempt_id, depth) AS (
+    SELECT build_attempt_id, MAX(depth)
+      FROM latest_snapshot
+     WHERE build_attempt_id IS NOT NULL
+     GROUP BY build_attempt_id
+),
+runtime_layers(session_id) AS (
+    SELECT DISTINCT CAST(item.value AS TEXT)
+      FROM latest_snapshot AS snapshot
+      JOIN json_each(snapshot.runtime_session_set_json) AS item
+     WHERE snapshot.depth=0
+)";
+const DOCTOR_EFFECTIVE_DIAGNOSTICS_CTE: &str = ",
+diagnostic_candidates(
+    id, severity, code, message, path, adapter, source_rank, layer_depth, ordinal
+) AS (
+    SELECT id, severity, code, message, path, adapter, 0, 0, ordinal
+      FROM diagnostics
+     WHERE scan_id=?1
+    UNION ALL
+    SELECT COALESCE(json_extract(item.value, '$.id'), 'unknown'),
+           COALESCE(json_extract(item.value, '$.severity'), 'warning'),
+           COALESCE(json_extract(item.value, '$.code'), 'unknown'),
+           COALESCE(json_extract(item.value, '$.message'), 'unknown diagnostic'),
+           json_extract(item.value, '$.path'),
+           json_extract(item.value, '$.adapter'),
+           1,
+           layers.depth,
+           CAST(item.key AS INTEGER)
+      FROM build_layers AS layers
+      JOIN build_attempts AS attempts ON attempts.id=layers.build_attempt_id
+      JOIN json_each(attempts.delta_json, '$.diagnostics') AS item
+     WHERE attempts.status='completed' AND attempts.delta_json IS NOT NULL
+    UNION ALL
+    SELECT COALESCE(json_extract(diagnostic.raw_json, '$.id'), 'unknown'),
+           COALESCE(json_extract(diagnostic.raw_json, '$.severity'), 'warning'),
+           COALESCE(json_extract(diagnostic.raw_json, '$.code'), 'unknown'),
+           COALESCE(json_extract(diagnostic.raw_json, '$.message'), 'unknown diagnostic'),
+           json_extract(diagnostic.raw_json, '$.path'),
+           json_extract(diagnostic.raw_json, '$.adapter'),
+           2,
+           0,
+           diagnostic.ordinal
+      FROM runtime_layers AS layers
+      JOIN runtime_diagnostics AS diagnostic ON diagnostic.session_id=layers.session_id
+),
+effective_diagnostics(
+    id, severity, code, message, path, adapter, source_rank, layer_depth, ordinal
+) AS (
+    SELECT id, MIN(severity), MIN(code), MIN(message), MIN(path), MIN(adapter),
+           MIN(source_rank), MIN(layer_depth), MIN(ordinal)
+      FROM diagnostic_candidates
+     GROUP BY id
+)";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ScanRecord {
@@ -240,6 +318,62 @@ pub struct AdapterLogRecord {
     pub adapter: String,
     pub stderr: String,
     pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DiagnosticGroupSummaryRecord {
+    pub severity: String,
+    pub code: String,
+    pub adapter: Option<String>,
+    pub count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DiagnosticSampleSummaryRecord {
+    pub id: String,
+    pub severity: String,
+    pub code: String,
+    pub message: String,
+    pub path: Option<String>,
+    pub adapter: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DiagnosticSummaryRecord {
+    pub total: u64,
+    pub groups: Vec<DiagnosticGroupSummaryRecord>,
+    pub omitted_groups: u64,
+    pub omitted_diagnostics: u64,
+    pub samples: Vec<DiagnosticSampleSummaryRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FileCoverageSummaryRecord {
+    pub adapter: String,
+    pub files: u64,
+    pub skipped_files: u64,
+    pub discovered_sites: u64,
+    pub emitted_sites: u64,
+    pub skipped_sites: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AdapterLogSummaryRecord {
+    pub adapter: String,
+    pub stderr_bytes: u64,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScanAttemptSummaryRecord {
+    pub scan: ScanRecord,
+    pub coverage: CoverageRecord,
+    pub profile_count: u64,
+    pub profiles_by_language: BTreeMap<String, u64>,
+    pub package_instance_count: u64,
+    pub file_coverage: Vec<FileCoverageSummaryRecord>,
+    pub adapter_logs: Vec<AdapterLogSummaryRecord>,
+    pub diagnostics: DiagnosticSummaryRecord,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -2299,6 +2433,14 @@ impl Store {
             .context("failed to load scan")
     }
 
+    /// Load the bounded metadata projection used by the default doctor view.
+    ///
+    /// This path deliberately never reads diagnostic `raw_json`, evidence,
+    /// graph edges, or adapter stderr payloads.
+    pub fn scan_attempt_summary(&self, scan_id: &str) -> Result<ScanAttemptSummaryRecord> {
+        load_scan_attempt_summary(&self.connection, scan_id)
+    }
+
     pub fn load_snapshot(&self, scan_id: &str) -> Result<GraphSnapshot> {
         if self.completed_snapshot(scan_id)?.is_some() {
             return self.load_completed_snapshot(scan_id);
@@ -4027,6 +4169,395 @@ fn insert_file_coverage(
     Ok(())
 }
 
+fn load_scan_attempt_summary(
+    connection: &Connection,
+    scan_id: &str,
+) -> Result<ScanAttemptSummaryRecord> {
+    let mut scan = connection
+        .query_row(
+            "SELECT id, root, status, strict, started_at, completed_at,
+                    project_code_executed, error, parent_snapshot_id, source_revision
+               FROM scans WHERE id=?1",
+            [scan_id],
+            |row| {
+                Ok(ScanRecord {
+                    id: row.get(0)?,
+                    root: row.get(1)?,
+                    status: row.get(2)?,
+                    strict: row.get(3)?,
+                    started_at: row.get(4)?,
+                    completed_at: row.get(5)?,
+                    project_code_executed: row.get(6)?,
+                    error: row.get(7)?,
+                    parent_snapshot_id: row.get(8)?,
+                    source_revision: row.get(9)?,
+                })
+            },
+        )
+        .optional()?
+        .with_context(|| format!("scan {scan_id} was not found"))?;
+    let (profile_count, profiles_by_language) =
+        load_effective_profile_summary(connection, scan_id)?;
+
+    let stored_coverage = connection
+        .query_row(
+            "SELECT json FROM coverage WHERE scan_id=?1",
+            [scan_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .map(|raw| serde_json::from_str::<CoverageRecord>(&raw))
+        .transpose()?;
+    let mut coverage = stored_coverage.unwrap_or_else(|| CoverageRecord {
+        reasons: vec!["final worker coverage unavailable".to_owned()],
+        ..CoverageRecord::default()
+    });
+    coverage.project_code_executed = scan.project_code_executed;
+    for build_coverage in load_doctor_build_coverages(connection, scan_id)? {
+        union_coverage(&mut coverage, &build_coverage);
+    }
+    for runtime_coverage in load_doctor_runtime_coverages(connection, scan_id)? {
+        runtime::union_runtime_coverage_metadata(&mut coverage, &runtime_coverage);
+    }
+    let (dependency_sites, resolved, candidates, external, unresolved) =
+        load_effective_site_summary(connection, scan_id)?;
+    coverage.profiles = profile_count;
+    coverage.dependency_sites = dependency_sites;
+    coverage.resolved = resolved;
+    coverage.candidates = candidates;
+    coverage.external = external;
+    coverage.unresolved = unresolved;
+    scan.project_code_executed = coverage.project_code_executed;
+
+    let package_instance_count = load_effective_package_instance_count(connection, scan_id)?;
+    let mut file_statement = connection.prepare(
+        "SELECT adapter, COUNT(*),
+                COALESCE(SUM(CASE WHEN skipped THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(discovered_sites), 0),
+                COALESCE(SUM(emitted_sites), 0),
+                COALESCE(SUM(skipped_sites), 0)
+           FROM file_coverage
+          WHERE scan_id=?1
+          GROUP BY adapter
+          ORDER BY adapter",
+    )?;
+    let file_coverage = file_statement
+        .query_map([scan_id], |row| {
+            Ok(FileCoverageSummaryRecord {
+                adapter: row.get(0)?,
+                files: row.get(1)?,
+                skipped_files: row.get(2)?,
+                discovered_sites: row.get(3)?,
+                emitted_sites: row.get(4)?,
+                skipped_sites: row.get(5)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut log_statement = connection.prepare(
+        "SELECT adapter, length(CAST(stderr AS BLOB)), truncated
+           FROM adapter_logs
+          WHERE scan_id=?1
+          ORDER BY adapter",
+    )?;
+    let adapter_logs = log_statement
+        .query_map([scan_id], |row| {
+            Ok(AdapterLogSummaryRecord {
+                adapter: row.get(0)?,
+                stderr_bytes: row.get(1)?,
+                truncated: row.get(2)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    Ok(ScanAttemptSummaryRecord {
+        scan,
+        coverage,
+        profile_count,
+        profiles_by_language,
+        package_instance_count,
+        file_coverage,
+        adapter_logs,
+        diagnostics: load_diagnostic_summary(connection, scan_id)?,
+    })
+}
+
+fn load_effective_profile_summary(
+    connection: &Connection,
+    scan_id: &str,
+) -> Result<(u64, BTreeMap<String, u64>)> {
+    let sql = format!(
+        "{DOCTOR_OVERLAY_LAYERS_CTE},
+effective_profiles(id, language) AS (
+    SELECT id, json_extract(json, '$.language')
+      FROM profiles
+     WHERE scan_id=?1
+    UNION
+    SELECT json_extract(item.value, '$.id'),
+           json_extract(item.value, '$.language')
+      FROM build_layers AS layers
+      JOIN build_attempts AS attempts ON attempts.id=layers.build_attempt_id
+      JOIN json_each(attempts.delta_json, '$.profiles') AS item
+     WHERE attempts.status='completed' AND attempts.delta_json IS NOT NULL
+    UNION
+    SELECT json_extract(session.profile_json, '$.id'),
+           json_extract(session.profile_json, '$.language')
+      FROM runtime_layers AS layers
+      JOIN runtime_sessions AS session ON session.id=layers.session_id
+),
+deduplicated_profiles(id, language) AS (
+    SELECT id, MIN(language)
+      FROM effective_profiles
+     GROUP BY id
+)
+SELECT language, COUNT(*)
+  FROM deduplicated_profiles
+ GROUP BY language
+ ORDER BY language"
+    );
+    let mut statement = connection.prepare(&sql)?;
+    let rows = statement.query_map([scan_id], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))
+    })?;
+    let mut profile_count = 0_u64;
+    let mut profiles_by_language = BTreeMap::new();
+    for row in rows {
+        let (language, count) = row?;
+        profile_count = profile_count.saturating_add(count);
+        profiles_by_language.insert(language, count);
+    }
+    Ok((profile_count, profiles_by_language))
+}
+
+fn load_effective_package_instance_count(connection: &Connection, scan_id: &str) -> Result<u64> {
+    let sql = format!(
+        "{DOCTOR_OVERLAY_LAYERS_CTE},
+effective_package_instances(id) AS (
+    SELECT id
+      FROM nodes
+     WHERE scan_id=?1 AND kind='package_instance'
+    UNION
+    SELECT json_extract(item.value, '$.id')
+      FROM build_layers AS layers
+      JOIN build_attempts AS attempts ON attempts.id=layers.build_attempt_id
+      JOIN json_each(attempts.delta_json, '$.nodes') AS item
+     WHERE attempts.status='completed'
+       AND attempts.delta_json IS NOT NULL
+       AND json_extract(item.value, '$.kind')='package_instance'
+    UNION
+    SELECT json_extract(node.raw_json, '$.id')
+      FROM runtime_layers AS layers
+      JOIN runtime_nodes AS node ON node.session_id=layers.session_id
+     WHERE json_extract(node.raw_json, '$.kind')='package_instance'
+)
+SELECT COUNT(DISTINCT id) FROM effective_package_instances"
+    );
+    connection
+        .query_row(&sql, [scan_id], |row| row.get(0))
+        .map_err(Into::into)
+}
+
+fn load_doctor_build_coverages(
+    connection: &Connection,
+    scan_id: &str,
+) -> Result<Vec<CoverageRecord>> {
+    let sql = format!(
+        "{DOCTOR_OVERLAY_LAYERS_CTE}
+SELECT json_extract(attempts.delta_json, '$.coverage')
+  FROM build_layers AS layers
+  JOIN build_attempts AS attempts ON attempts.id=layers.build_attempt_id
+ WHERE attempts.status='completed' AND attempts.delta_json IS NOT NULL
+ ORDER BY layers.depth DESC, attempts.id"
+    );
+    let mut statement = connection.prepare(&sql)?;
+    let rows = statement.query_map([scan_id], |row| row.get::<_, String>(0))?;
+    rows.map(|raw| Ok(serde_json::from_str(&raw?)?)).collect()
+}
+
+fn load_doctor_runtime_coverages(
+    connection: &Connection,
+    scan_id: &str,
+) -> Result<Vec<CoverageRecord>> {
+    let sql = format!(
+        "{DOCTOR_OVERLAY_LAYERS_CTE}
+SELECT session.coverage_json
+  FROM runtime_layers AS layers
+  JOIN runtime_sessions AS session ON session.id=layers.session_id
+ ORDER BY layers.session_id"
+    );
+    let mut statement = connection.prepare(&sql)?;
+    let rows = statement.query_map([scan_id], |row| row.get::<_, String>(0))?;
+    rows.map(|raw| Ok(serde_json::from_str(&raw?)?)).collect()
+}
+
+fn load_effective_site_summary(
+    connection: &Connection,
+    scan_id: &str,
+) -> Result<(u64, u64, u64, u64, u64)> {
+    let sql = format!(
+        "{DOCTOR_OVERLAY_LAYERS_CTE},
+site_candidates(id, resolution_status) AS (
+    SELECT id, resolution_status
+      FROM sites
+     WHERE scan_id=?1
+    UNION
+    SELECT json_extract(item.value, '$.id'),
+           json_extract(item.value, '$.resolution_status')
+      FROM build_layers AS layers
+      JOIN build_attempts AS attempts ON attempts.id=layers.build_attempt_id
+      JOIN json_each(attempts.delta_json, '$.sites') AS item
+     WHERE attempts.status='completed' AND attempts.delta_json IS NOT NULL
+    UNION
+    SELECT json_extract(site.raw_json, '$.id'),
+           json_extract(site.raw_json, '$.resolution_status')
+      FROM runtime_layers AS layers
+      JOIN runtime_sites AS site ON site.session_id=layers.session_id
+),
+effective_sites(id, resolution_status) AS (
+    SELECT id, MIN(resolution_status)
+      FROM site_candidates
+     GROUP BY id
+)
+SELECT COUNT(*),
+       COALESCE(SUM(CASE WHEN resolution_status='resolved' THEN 1 ELSE 0 END), 0),
+       COALESCE(SUM(CASE WHEN resolution_status='candidates' THEN 1 ELSE 0 END), 0),
+       COALESCE(SUM(CASE WHEN resolution_status='external' THEN 1 ELSE 0 END), 0),
+       COALESCE(SUM(CASE WHEN resolution_status='unresolved' THEN 1 ELSE 0 END), 0)
+  FROM effective_sites"
+    );
+    connection
+        .query_row(&sql, [scan_id], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        })
+        .map_err(Into::into)
+}
+
+fn load_diagnostic_summary(
+    connection: &Connection,
+    scan_id: &str,
+) -> Result<DiagnosticSummaryRecord> {
+    let effective_diagnostics =
+        format!("{DOCTOR_OVERLAY_LAYERS_CTE}{DOCTOR_EFFECTIVE_DIAGNOSTICS_CTE}");
+    let total_sql = format!("{effective_diagnostics} SELECT COUNT(*) FROM effective_diagnostics");
+    let total = connection.query_row(&total_sql, [scan_id], |row| row.get::<_, u64>(0))?;
+    let group_count_sql = format!(
+        "{effective_diagnostics}
+SELECT COUNT(*) FROM (
+    SELECT 1
+      FROM effective_diagnostics
+     GROUP BY severity, code, adapter
+)"
+    );
+    let raw_group_count =
+        connection.query_row(&group_count_sql, [scan_id], |row| row.get::<_, u64>(0))?;
+    let groups_sql = format!(
+        "{effective_diagnostics}
+SELECT severity, code, adapter, COUNT(*) AS diagnostic_count
+  FROM effective_diagnostics
+ GROUP BY severity, code, adapter
+ ORDER BY diagnostic_count DESC, severity, code, COALESCE(adapter, '')
+ LIMIT ?2"
+    );
+    let mut statement = connection.prepare(&groups_sql)?;
+    let groups = statement
+        .query_map(
+            params![
+                scan_id,
+                i64::try_from(DOCTOR_SUMMARY_MAX_DIAGNOSTIC_GROUPS).unwrap_or(i64::MAX)
+            ],
+            |row| {
+                Ok(DiagnosticGroupSummaryRecord {
+                    severity: bounded_summary_text(
+                        &row.get::<_, String>(0)?,
+                        DOCTOR_SUMMARY_MAX_KEY_BYTES,
+                    ),
+                    code: bounded_summary_text(
+                        &row.get::<_, String>(1)?,
+                        DOCTOR_SUMMARY_MAX_KEY_BYTES,
+                    ),
+                    adapter: row
+                        .get::<_, Option<String>>(2)?
+                        .map(|value| bounded_summary_text(&value, DOCTOR_SUMMARY_MAX_KEY_BYTES)),
+                    count: row.get(3)?,
+                })
+            },
+        )?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let retained_diagnostics = groups
+        .iter()
+        .map(|group: &DiagnosticGroupSummaryRecord| group.count)
+        .sum::<u64>();
+
+    let samples_sql = format!(
+        "{effective_diagnostics}
+SELECT id, severity, code, message, path, adapter
+  FROM effective_diagnostics
+ ORDER BY source_rank, layer_depth DESC, ordinal, id
+ LIMIT ?2"
+    );
+    let mut sample_statement = connection.prepare(&samples_sql)?;
+    let samples = sample_statement
+        .query_map(
+            params![
+                scan_id,
+                i64::try_from(DOCTOR_SUMMARY_MAX_DIAGNOSTIC_SAMPLES).unwrap_or(i64::MAX)
+            ],
+            |row| {
+                Ok(DiagnosticSampleSummaryRecord {
+                    id: bounded_summary_text(
+                        &row.get::<_, String>(0)?,
+                        DOCTOR_SUMMARY_MAX_KEY_BYTES,
+                    ),
+                    severity: bounded_summary_text(
+                        &row.get::<_, String>(1)?,
+                        DOCTOR_SUMMARY_MAX_KEY_BYTES,
+                    ),
+                    code: bounded_summary_text(
+                        &row.get::<_, String>(2)?,
+                        DOCTOR_SUMMARY_MAX_KEY_BYTES,
+                    ),
+                    message: bounded_summary_text(
+                        &row.get::<_, String>(3)?,
+                        DOCTOR_SUMMARY_MAX_TEXT_BYTES,
+                    ),
+                    path: row
+                        .get::<_, Option<String>>(4)?
+                        .map(|value| bounded_summary_text(&value, DOCTOR_SUMMARY_MAX_TEXT_BYTES)),
+                    adapter: row
+                        .get::<_, Option<String>>(5)?
+                        .map(|value| bounded_summary_text(&value, DOCTOR_SUMMARY_MAX_KEY_BYTES)),
+                })
+            },
+        )?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(DiagnosticSummaryRecord {
+        total,
+        groups,
+        omitted_groups: raw_group_count.saturating_sub(DOCTOR_SUMMARY_MAX_DIAGNOSTIC_GROUPS as u64),
+        omitted_diagnostics: total.saturating_sub(retained_diagnostics),
+        samples,
+    })
+}
+
+fn bounded_summary_text(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_owned();
+    }
+    let mut result = String::new();
+    for character in value.chars() {
+        if result.len() + character.len_utf8() > max_bytes {
+            break;
+        }
+        result.push(character);
+    }
+    result
+}
+
 fn load_profiles(connection: &Connection, scan_id: &str) -> Result<Vec<ProfileRecord>> {
     let mut statement = connection.prepare(
         "SELECT p.json, pc.json
@@ -4504,6 +5035,38 @@ mod tests {
         assert_eq!(store.latest_successful_id()?, None);
         assert_eq!(store.current_snapshot_id()?, None);
         assert_eq!(store.snapshot_id_for_source("scan", "scan-1")?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn doctor_summary_is_bounded_and_never_reads_diagnostic_payloads() -> Result<()> {
+        let mut store = Store::open_in_memory()?;
+        store.start_scan("scan-1", Path::new("/tmp/project"), false)?;
+        for ordinal in 0..70_i64 {
+            store.connection.execute(
+                "INSERT INTO diagnostics(
+                     scan_id, ordinal, id, severity, code, message, path, adapter, raw_json
+                 ) VALUES (?1, ?2, ?3, 'warning', ?4, ?5, ?6, 'fixture', ?7)",
+                params![
+                    "scan-1",
+                    ordinal,
+                    format!("diagnostic:{ordinal}"),
+                    format!("CODE_{ordinal:02}"),
+                    format!("representative {ordinal}"),
+                    format!("src/{ordinal}.rs"),
+                    "not-json-and-must-never-be-read secret-value"
+                ],
+            )?;
+        }
+
+        let summary = store.scan_attempt_summary("scan-1")?;
+        assert_eq!(summary.diagnostics.total, 70);
+        assert_eq!(summary.diagnostics.groups.len(), 64);
+        assert_eq!(summary.diagnostics.omitted_groups, 6);
+        assert_eq!(summary.diagnostics.omitted_diagnostics, 6);
+        assert_eq!(summary.diagnostics.samples.len(), 5);
+        assert!(!serde_json::to_string(&summary)?.contains("not-json-and-must-never-be-read"));
+        assert!(store.load_snapshot("scan-1").is_err());
         Ok(())
     }
 
@@ -5586,6 +6149,47 @@ mod tests {
         let union = store.load_snapshot("scan-golden")?;
         assert_eq!(store.load_completed_snapshot(&build_snapshot_id)?, union);
         assert_eq!(union.edges.len(), 2);
+        let doctor_summary = store.scan_attempt_summary("scan-golden")?;
+        let mut expected_profiles_by_language = BTreeMap::new();
+        for profile in &union.profiles {
+            *expected_profiles_by_language
+                .entry(profile.language.clone())
+                .or_default() += 1;
+        }
+        assert!(doctor_summary.scan.project_code_executed);
+        assert_eq!(doctor_summary.coverage, union.coverage);
+        assert_eq!(
+            doctor_summary.profile_count,
+            u64::try_from(union.profiles.len())?
+        );
+        assert_eq!(
+            doctor_summary.profiles_by_language,
+            expected_profiles_by_language
+        );
+        assert_eq!(
+            doctor_summary.package_instance_count,
+            u64::try_from(
+                union
+                    .nodes
+                    .iter()
+                    .filter(|node| node.kind == "package_instance")
+                    .count()
+            )?
+        );
+        assert_eq!(
+            doctor_summary.diagnostics.total,
+            u64::try_from(union.diagnostics.len())?
+        );
+        assert!(
+            doctor_summary
+                .diagnostics
+                .groups
+                .iter()
+                .any(|group| group.code == "build-observed" && group.count == 1)
+        );
+        assert!(
+            !serde_json::to_string(&doctor_summary)?.contains("must-not-appear-in-doctor-summary")
+        );
         assert_eq!(
             union
                 .edges
@@ -6028,17 +6632,26 @@ mod tests {
         events[4]["edge"]["site_id"] = events[5]["site"]["id"].clone();
         let typed_edge: GraphEdge = serde_json::from_value(events[4]["edge"].clone()).unwrap();
         events[4]["edge"]["id"] = json!(build_edge_stable_id(&typed_edge).unwrap());
+        let mut diagnostic = common("diagnostic", 7);
+        diagnostic["diagnostic"] = json!({
+            "id":format!("diagnostic:build:{run_id}"),
+            "severity":"warning",
+            "code":"build-observed",
+            "message":"build observation retained",
+            "properties":{"private_payload":"must-not-appear-in-doctor-summary"}
+        });
+        events.push(diagnostic);
         let coverage = json!({
             "profiles":1,"files_discovered":0,"files_analyzed":0,"files_skipped":0,
             "dependency_sites":1,"resolved":1,"candidates":0,"external":0,
             "unresolved":0,"unsupported_syntax":0,"project_code_executed":true,
             "completeness":["build-observed"],"reasons":[]
         });
-        let mut profile_completed = common("profile_completed", 7);
+        let mut profile_completed = common("profile_completed", 8);
         profile_completed["profile_id"] = json!("web:build");
         profile_completed["coverage"] = coverage.clone();
         events.push(profile_completed);
-        let mut completed = common("scan_completed", 8);
+        let mut completed = common("scan_completed", 9);
         completed["coverage"] = coverage;
         events.push(completed);
         events

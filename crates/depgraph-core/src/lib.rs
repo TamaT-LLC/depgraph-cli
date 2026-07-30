@@ -53,9 +53,10 @@ use std::{
 
 use anyhow::{Context, Result};
 use depgraph_store::{
-    AdapterLogRecord, CACHE_CONTRACT_VERSION, CacheEntryCounts, CacheEventRecord, CoverageRecord,
-    DiagnosticRecord, FileCoverageRecord, IMPACT_QUERY_CACHE_CONTRACT_VERSION, ProfileMatrixRecord,
-    ProfileRecord, SNAPSHOT_DIFF_SCHEMA_VERSION, STORE_SCHEMA_VERSION, Store,
+    AdapterLogRecord, AdapterLogSummaryRecord, CACHE_CONTRACT_VERSION, CacheEntryCounts,
+    CacheEventRecord, CoverageRecord, DiagnosticRecord, DiagnosticSummaryRecord,
+    FileCoverageRecord, FileCoverageSummaryRecord, IMPACT_QUERY_CACHE_CONTRACT_VERSION,
+    ProfileMatrixRecord, ProfileRecord, SNAPSHOT_DIFF_SCHEMA_VERSION, STORE_SCHEMA_VERSION, Store,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -372,9 +373,15 @@ pub use protobuf::{
     scan_protobuf_repository,
 };
 pub use query::{
-    CycleLevel, CycleResult, GraphQueryFilter, TraversalResult, UnresolvedResult, WhyResult,
-    cycles, render_condition, resolve_selector, traverse, traverse_filtered, unresolved, why,
-    why_filtered,
+    BoundedTraversalResult, CycleLevel, CycleResult, DEFAULT_INTERACTIVE_QUERY_MAX_BYTES,
+    DEFAULT_INTERACTIVE_QUERY_MAX_ITEMS, DEFAULT_INTERACTIVE_QUERY_MAX_TRAVERSAL, GraphQueryFilter,
+    INTERACTIVE_QUERY_PAGE_CONTRACT_VERSION, InteractiveQueryPage, InteractiveQueryPageRequest,
+    InteractiveQuerySummary, MAX_INTERACTIVE_QUERY_BYTES, MAX_INTERACTIVE_QUERY_ITEMS,
+    MAX_INTERACTIVE_QUERY_TRAVERSAL, QueryCountGroup, QueryCountSummary, QueryPageDiagnostic,
+    TraversalPageItem, TraversalResult, UnresolvedResult, WhyResult, cycles,
+    paginate_interactive_query, render_condition, resolve_selector, traversal_page_items,
+    traversal_summary, traverse, traverse_bounded_filtered, traverse_filtered, unresolved,
+    unresolved_summary, validate_interactive_query_bounds, why, why_filtered,
 };
 pub use runtime_trace::{
     MatchedRuntimeTraceLocator, RUNTIME_COLLECTOR_CONTRACT_VERSION, RUNTIME_COLLECTOR_SCHEMA,
@@ -430,6 +437,21 @@ pub struct ScanHealth {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct ScanHealthSummary {
+    pub scan_id: String,
+    pub status: String,
+    pub root: String,
+    pub project_code_executed: bool,
+    pub coverage: CoverageRecord,
+    pub profile_count: u64,
+    pub profiles_by_language: BTreeMap<String, u64>,
+    pub package_instance_count: u64,
+    pub file_coverage: Vec<FileCoverageSummaryRecord>,
+    pub adapter_logs: Vec<AdapterLogSummaryRecord>,
+    pub diagnostics: DiagnosticSummaryRecord,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct CompilerPreciseHealth {
     pub status: String,
     pub phase: String,
@@ -466,6 +488,27 @@ pub struct DoctorReport {
     pub toolchain_remediation: BTreeMap<String, String>,
     pub workers: Vec<WorkerHealth>,
     pub latest_attempt: Option<ScanHealth>,
+    pub latest_successful_scan_id: Option<String>,
+    pub release: Option<ReleaseHealth>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DoctorSummaryReport {
+    pub report_kind: &'static str,
+    pub detail_command: &'static str,
+    pub protocol_version: &'static str,
+    pub graph_schema_version: &'static str,
+    pub store_schema_version: i64,
+    pub cache_contract_version: u32,
+    pub cache_entries: CacheEntryCounts,
+    pub impact_query_cache_contract_version: u32,
+    pub impact_query_cache_entries: u64,
+    pub recent_cache_events: Vec<CacheEventRecord>,
+    pub toolchains: BTreeMap<String, String>,
+    pub supported_baselines: BTreeMap<String, String>,
+    pub toolchain_remediation: BTreeMap<String, String>,
+    pub workers: Vec<WorkerHealth>,
+    pub latest_attempt: Option<ScanHealthSummary>,
     pub latest_successful_scan_id: Option<String>,
     pub release: Option<ReleaseHealth>,
 }
@@ -915,8 +958,7 @@ fn suppressed_worker_health(adapter: AdapterKind, spec: worker::WorkerSpec) -> W
     }
 }
 
-pub async fn doctor(store: &Store) -> Result<DoctorReport> {
-    let root = std::env::current_dir()?.canonicalize()?;
+async fn doctor_workers(root: &Path) -> Vec<WorkerHealth> {
     let preflight = preflight_doctor_workers(
         [AdapterKind::Rust, AdapterKind::Go, AdapterKind::Web],
         locate_worker,
@@ -928,7 +970,7 @@ pub async fn doctor(store: &Store) -> Result<DoctorReport> {
                 suppressed_worker_health(adapter, spec)
             }
             DoctorWorkerLocation::Ready(spec) => {
-                let version = worker_version(&spec, &root).await;
+                let version = worker_version(&spec, root).await;
                 let integrity =
                     worker_integrity(adapter, &spec.artifact_path, version.as_deref().ok());
                 let error = version
@@ -955,6 +997,12 @@ pub async fn doctor(store: &Store) -> Result<DoctorReport> {
             },
         });
     }
+    workers
+}
+
+pub async fn doctor(store: &Store) -> Result<DoctorReport> {
+    let root = std::env::current_dir()?.canonicalize()?;
+    let workers = doctor_workers(&root).await;
     let latest_attempt = store
         .latest_attempt_id()?
         .map(|scan_id| {
@@ -1051,19 +1099,68 @@ pub async fn doctor(store: &Store) -> Result<DoctorReport> {
         impact_query_cache_entries: store.impact_query_cache_entry_count()?,
         recent_cache_events: store.recent_cache_events(20)?,
         toolchains,
-        supported_baselines: BTreeMap::from([
-            ("rust".to_owned(), "1.93.1".to_owned()),
-            ("go".to_owned(), "1.26.1".to_owned()),
-            ("node".to_owned(), "24.18.0".to_owned()),
-            ("pnpm".to_owned(), "10.33.0".to_owned()),
-            ("typescript".to_owned(), "7.0.2".to_owned()),
-        ]),
+        supported_baselines: doctor_supported_baselines(),
         toolchain_remediation,
         workers,
         latest_attempt,
         latest_successful_scan_id: store.latest_successful_id()?,
         release: release_health()?,
     })
+}
+
+pub async fn doctor_summary(store: &Store) -> Result<DoctorSummaryReport> {
+    let root = std::env::current_dir()?.canonicalize()?;
+    let workers = doctor_workers(&root).await;
+    let latest_attempt = store
+        .latest_attempt_id()?
+        .map(|scan_id| {
+            let summary = store.scan_attempt_summary(&scan_id)?;
+            Ok::<_, anyhow::Error>(ScanHealthSummary {
+                scan_id,
+                status: summary.scan.status,
+                root: summary.scan.root,
+                project_code_executed: summary.scan.project_code_executed,
+                coverage: summary.coverage,
+                profile_count: summary.profile_count,
+                profiles_by_language: summary.profiles_by_language,
+                package_instance_count: summary.package_instance_count,
+                file_coverage: summary.file_coverage,
+                adapter_logs: summary.adapter_logs,
+                diagnostics: summary.diagnostics,
+            })
+        })
+        .transpose()?;
+    let toolchains = toolchain_versions(&root).await;
+    let toolchain_remediation = doctor_toolchain_remediation(&toolchains);
+    Ok(DoctorSummaryReport {
+        report_kind: "summary",
+        detail_command: "depgraph doctor --details",
+        protocol_version: "1.0",
+        graph_schema_version: "1.0",
+        store_schema_version: store.schema_version()?,
+        cache_contract_version: CACHE_CONTRACT_VERSION,
+        cache_entries: store.cache_entry_counts()?,
+        impact_query_cache_contract_version: IMPACT_QUERY_CACHE_CONTRACT_VERSION,
+        impact_query_cache_entries: store.impact_query_cache_entry_count()?,
+        recent_cache_events: store.recent_cache_events(20)?,
+        toolchains,
+        supported_baselines: doctor_supported_baselines(),
+        toolchain_remediation,
+        workers,
+        latest_attempt,
+        latest_successful_scan_id: store.latest_successful_id()?,
+        release: release_health()?,
+    })
+}
+
+fn doctor_supported_baselines() -> BTreeMap<String, String> {
+    BTreeMap::from([
+        ("rust".to_owned(), "1.93.1".to_owned()),
+        ("go".to_owned(), "1.26.1".to_owned()),
+        ("node".to_owned(), "24.18.0".to_owned()),
+        ("pnpm".to_owned(), "10.33.0".to_owned()),
+        ("typescript".to_owned(), "7.0.2".to_owned()),
+    ])
 }
 
 async fn worker_version(spec: &worker::WorkerSpec, root: &Path) -> Result<String> {

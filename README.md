@@ -135,7 +135,10 @@ depgraph daemon stop /path/to/repository
 depgraph resolve --build /path/to/repository --allow-project-code
 
 depgraph doctor --json
-depgraph deps path:src/app.ts --transitive
+depgraph doctor --details --json
+depgraph deps path:src/app.ts --transitive --max-items 100 --max-bytes 1048576
+depgraph deps path:src/app.ts --transitive --cursor "$NEXT_CURSOR" --json
+depgraph deps path:src/app.ts --transitive --all --json
 depgraph dependents package:example
 depgraph why path:src/app.ts route:/products/$id
 depgraph impact path:src/app.ts
@@ -152,7 +155,8 @@ depgraph cycles --level symbol
 # If a selector is ambiguous, rerun it with a stable ID from the candidates.
 depgraph deps "id:$STABLE_ID" --json
 
-depgraph unresolved --json
+depgraph unresolved --max-items 100 --json
+depgraph unresolved --all --json
 
 # Validate and match an external runtime trace without changing the store.
 depgraph runtime validate runtime-trace.json
@@ -177,6 +181,26 @@ depgraph export --format graphml --output graph.graphml
 ```
 
 SQLite is stored under the operating system cache directory, keyed by the canonical repository root. Use global `--store PATH` for a specific database and global `--scan-id ID` to inspect a retained partial scan. Queries default to the latest successful scan; `doctor` reports the latest attempt.
+
+`doctor` emits a bounded summary by default. The summary reads diagnostic
+counts and at most 64 cause groups plus five representative diagnostics
+without loading diagnostic payload JSON, graph evidence, or adapter stderr.
+Completed build and runtime overlays are projected into the same bounded counts.
+Use `doctor --details` for the complete retained attempt payload.
+
+`deps`, `dependents`, and `unresolved` use the versioned
+`depgraph-interactive-query-page-v1` contract unless `--all` is explicit.
+The defaults are 100 canonical items, a 1 MiB canonical JSON document, and
+50,000 visited edges for dependency traversal. `--max-items`, `--max-bytes`,
+and `--max-traversal` lower or raise those bounded limits within the hard
+caps. A truncated page returns `complete:false`, a stable diagnostic code,
+an immutable `snapshot_id`, and a snapshot/query-bound `next_cursor`; the
+cursor resumes the canonical item order without overlap or gaps and is
+rejected after a newer build snapshot is promoted for the same scan. The byte
+count covers the compact UTF-8 JSON document (the terminal newline is transport
+framing). A traversal-limit result has no continuation after its admitted result set; raise
+`--max-traversal` or narrow filters. `--all` preserves the legacy complete
+query shape, while `export` remains the streaming full-graph interface.
 
 `profiles plan` is read-only and uses only a bounded static inventory. Its human
 and canonical JSON output includes every selected, omitted, and policy-excluded

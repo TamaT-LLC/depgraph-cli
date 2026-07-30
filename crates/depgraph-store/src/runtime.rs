@@ -769,7 +769,10 @@ pub(super) fn merge_runtime_sessions(
     Ok(())
 }
 
-fn union_runtime_coverage_metadata(target: &mut CoverageRecord, session: &CoverageRecord) {
+pub(super) fn union_runtime_coverage_metadata(
+    target: &mut CoverageRecord,
+    session: &CoverageRecord,
+) {
     target.unsupported_syntax = target
         .unsupported_syntax
         .saturating_add(session.unsupported_syntax);
@@ -1223,8 +1226,25 @@ mod tests {
     #[test]
     fn later_build_promotion_preserves_imported_runtime_sessions() -> Result<()> {
         let (mut store, base_snapshot_id, base) = seeded_store()?;
-        let imported = store
-            .import_runtime_session(&base_snapshot_id, valid_delta(&base_snapshot_id, &base))?;
+        let mut delta = valid_delta(&base_snapshot_id, &base);
+        delta.diagnostics.push(DiagnosticRecord {
+            ordinal: 0,
+            id: "diagnostic:runtime".to_owned(),
+            severity: "warning".to_owned(),
+            code: "runtime-observed".to_owned(),
+            message: "runtime observation retained".to_owned(),
+            path: None,
+            adapter: Some("runtime-trace".to_owned()),
+            start_line: None,
+            start_column: None,
+            end_line: None,
+            end_column: None,
+            properties: json!({
+                "session_id":"runtime-session:test",
+                "private_payload":"must-not-appear-in-doctor-summary"
+            }),
+        });
+        let imported = store.import_runtime_session(&base_snapshot_id, delta)?;
         let audit = json!({
             "schema_version":"1.0",
             "run_id":"build-after-runtime",
@@ -1268,6 +1288,44 @@ mod tests {
         );
         let snapshot = store.load_completed_snapshot(&current_id)?;
         assert!(snapshot.edges.iter().any(|edge| edge.id == "edge:runtime"));
+        let doctor_summary = store.scan_attempt_summary("runtime-atomic")?;
+        assert_eq!(doctor_summary.coverage, snapshot.coverage);
+        assert_eq!(
+            doctor_summary.profile_count,
+            u64::try_from(snapshot.profiles.len())?
+        );
+        let mut expected_profiles_by_language = BTreeMap::new();
+        for profile in &snapshot.profiles {
+            *expected_profiles_by_language
+                .entry(profile.language.clone())
+                .or_default() += 1;
+        }
+        assert_eq!(
+            doctor_summary.profiles_by_language,
+            expected_profiles_by_language
+        );
+        assert_eq!(
+            doctor_summary.diagnostics.total,
+            u64::try_from(
+                snapshot
+                    .diagnostics
+                    .iter()
+                    .filter(|diagnostic| {
+                        diagnostic.properties.get("profile_matrix_schema").is_none()
+                    })
+                    .count()
+            )?
+        );
+        assert!(
+            doctor_summary
+                .diagnostics
+                .groups
+                .iter()
+                .any(|group| group.code == "runtime-observed" && group.count == 1)
+        );
+        assert!(
+            !serde_json::to_string(&doctor_summary)?.contains("must-not-appear-in-doctor-summary")
+        );
         assert!(store.verify_snapshot_integrity(&current_id)?.valid);
         Ok(())
     }
