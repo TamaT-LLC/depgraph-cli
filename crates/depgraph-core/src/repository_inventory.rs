@@ -44,11 +44,21 @@ pub(crate) fn build_repository_file_inventory(root: &Path) -> Result<RepositoryF
     if !root.is_dir() {
         bail!("repository inventory root must be a directory");
     }
-    let paths = git_inventory(&root)?.unwrap_or(fallback_inventory(&root)?);
+    let paths = select_repository_inventory(git_inventory(&root)?, || fallback_inventory(&root))?;
     Ok(RepositoryFileInventory {
         contract_version: REPOSITORY_INVENTORY_CONTRACT_VERSION.to_owned(),
         paths,
     })
+}
+
+fn select_repository_inventory(
+    git: Option<Vec<String>>,
+    fallback: impl FnOnce() -> Result<Vec<String>>,
+) -> Result<Vec<String>> {
+    match git {
+        Some(paths) => Ok(paths),
+        None => fallback(),
+    }
 }
 
 fn git_inventory(root: &Path) -> Result<Option<Vec<String>>> {
@@ -253,9 +263,25 @@ pub(crate) fn write_repository_inventory_file(root: &Path) -> Result<tempfile::N
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{cell::Cell, fs};
 
     use super::*;
+
+    #[test]
+    fn successful_git_inventory_does_not_evaluate_the_fallback() -> Result<()> {
+        let fallback_called = Cell::new(false);
+        let paths = select_repository_inventory(
+            Some(vec!["src/lib.rs".to_owned()]),
+            || -> Result<Vec<String>> {
+                fallback_called.set(true);
+                bail!("fallback must not run after a successful Git inventory")
+            },
+        )?;
+
+        assert_eq!(paths, ["src/lib.rs"]);
+        assert!(!fallback_called.get());
+        Ok(())
+    }
 
     #[test]
     fn fallback_inventory_honors_nested_ignores_and_repository_boundaries() -> Result<()> {
