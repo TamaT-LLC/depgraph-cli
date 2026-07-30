@@ -94,14 +94,16 @@ To run the reproducible performance gate with the pinned toolchains:
 scripts/benchmark-mvp.sh
 ```
 
-The benchmark generates a deterministic 10,000-source-file fixture and writes
-`dist/benchmark-report.json`. It records cold safe initial scans, watcher-driven
-one-file incremental scans, cold and warm file/package impact queries, platform
-and toolchain metadata, every raw sample, and the configured regression/noise
-policy. The gate also proves that the changed file was observed while graph
-topology, dependency sites, evidence, and coverage were conserved. CI and tag
-release workflows upload the same versioned report as an artifact; release
-publication verifies it before publishing.
+The benchmark generates deterministic 100-, 1,000-, and 10,000-source-file
+fixtures and writes `dist/benchmark-report.json` plus
+`dist/cache-hit-benchmark-report.json`. It records cold safe initial scans,
+watcher-driven one-file incremental scans, cold and warm file/package impact
+queries, and paired semantic-cache-hit versus `--no-cache` samples. Every
+fixture size requires the median cache hit to be at least 5% faster while
+preserving canonical graph and coverage equality. The reports also record
+platform and toolchain metadata, every raw sample, and the configured
+regression/noise policy. CI and tag release workflows upload the same versioned
+reports as artifacts; release publication verifies them before publishing.
 
 ## Usage
 
@@ -385,8 +387,10 @@ contract v1 canonical digests of repository-relative file bytes,
 manifest/lock/config inputs, adapter/protocol artifacts, toolchain/framework
 identities, profiles, and generated artifact fingerprints; checkout, cache,
 and temporary absolute paths are not key dimensions. A semantic hit is reused
-only after key, contract, completed-snapshot, and canonical payload integrity
-checks, then copied into a fresh scan attempt and validated before promotion.
+only after cache contract v2 key, completed-snapshot, and canonical payload
+reference integrity checks. The validated content-addressed snapshot is
+atomically aliased to the fresh scan attempt without cloning every graph row;
+an intervening SQLite writer invalidates the promotion proof.
 Unknown versions, corruption, symlinks, unsafe inventory bounds, and
 dependency snapshots that cannot be re-derived before scanning are explicit
 misses/rejections. `scan --no-cache` bypasses lookup and storage. Scan

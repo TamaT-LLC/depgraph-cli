@@ -1614,6 +1614,7 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "DEPGRAPH_BOUNDED_QUERY_PLAN_LIMIT_MS: \"7000\"",
         "DEPGRAPH_BOUNDED_QUERY_EXECUTE_LIMIT_MS: \"10000\"",
         "node scripts/benchmark-report.mjs verify benchmark/benchmark-report.json",
+        "node scripts/cache-hit-benchmark.mjs verify benchmark/cache-hit-benchmark-report.json",
         "compiler-pack:",
         "verify-compiler-packs:",
         "rustup toolchain install nightly-2026-07-17 --profile minimal --component rust-src,rustc-dev,llvm-tools-preview",
@@ -1638,9 +1639,11 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
     let ci_workflow = fs::read_to_string(root.join(".github/workflows/ci.yml"))?;
     for required in [
         "needs: [rust, go, web]",
-        "node --test scripts/tests/benchmark.test.mjs",
+        "node --test scripts/tests/benchmark.test.mjs scripts/tests/cache-hit-benchmark.test.mjs",
         "scripts/benchmark-mvp.sh",
         "benchmark-report-${{ github.sha }}",
+        "dist/cache-hit-benchmark-report.json",
+        "DEPGRAPH_CACHE_HIT_MIN_IMPROVEMENT_PERCENT: \"5\"",
         "DEPGRAPH_BOUNDED_QUERY_PLAN_LIMIT_MS: \"7000\"",
         "DEPGRAPH_BOUNDED_QUERY_EXECUTE_LIMIT_MS: \"10000\"",
     ] {
@@ -1865,7 +1868,11 @@ fn test() -> Result<()> {
         "warnings",
     ]))?;
     run(Command::new("cargo").args(["test", "--workspace", "--locked"]))?;
-    run(Command::new("node").args(["--test", "scripts/tests/benchmark.test.mjs"]))?;
+    run(Command::new("node").args([
+        "--test",
+        "scripts/tests/benchmark.test.mjs",
+        "scripts/tests/cache-hit-benchmark.test.mjs",
+    ]))?;
     let gofmt = Command::new("gofmt")
         .arg("-l")
         .arg(".")

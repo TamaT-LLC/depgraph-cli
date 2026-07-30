@@ -30,6 +30,7 @@ samples="${DEPGRAPH_BENCH_SAMPLES:-3}"
 query_samples="${DEPGRAPH_QUERY_SAMPLES:-5}"
 incremental_timeout_seconds="${DEPGRAPH_INCREMENTAL_TIMEOUT_SECONDS:-120}"
 report="${DEPGRAPH_BENCH_REPORT:-$root/dist/benchmark-report.json}"
+cache_hit_report="${DEPGRAPH_CACHE_HIT_REPORT:-$root/dist/cache-hit-benchmark-report.json}"
 if ((file_count < 2 || file_count > 100000)); then
   echo "DEPGRAPH_BENCH_FILES must be between 2 and 100000" >&2
   exit 2
@@ -86,6 +87,37 @@ for ((sample = 0; sample < samples; sample++)); do
   finished="$(now_ms)"
   printf '%d\n' "$((finished - started))" >> "$raw/initial-scan-ms.txt"
 done
+
+benchmark_cache_comparison() {
+  local size="$1"
+  local comparison_fixture="$2"
+  local hit_store="${3:-$cache/cache-$size-hit.db}"
+  local bypass_store="$cache/cache-$size-bypass.db"
+  if [[ ! -f "$hit_store" ]]; then
+    "$binary" --store "$hit_store" scan "$comparison_fixture" --json \
+      > "$raw/cache-$size-warmup.json"
+  fi
+  for ((sample = 0; sample < samples; sample++)); do
+    measure_capture \
+      "$raw/cache-$size-hit-ms.txt" "$raw/cache-$size-hit-$sample.json" \
+      "$binary" --store "$hit_store" scan "$comparison_fixture" --json
+    measure_capture \
+      "$raw/cache-$size-bypass-ms.txt" "$raw/cache-$size-bypass-$sample.json" \
+      "$binary" --store "$bypass_store" scan "$comparison_fixture" --no-cache --json
+  done
+  "$binary" --store "$hit_store" export --format json \
+    > "$raw/cache-$size-hit-graph.json"
+  "$binary" --store "$bypass_store" export --format json \
+    > "$raw/cache-$size-bypass-graph.json"
+}
+
+cache_fixture_small="$fixture_parent/cache-small"
+cache_fixture_medium="$fixture_parent/cache-medium"
+node scripts/benchmark-fixture.mjs generate "$cache_fixture_small" 100 > /dev/null
+node scripts/benchmark-fixture.mjs generate "$cache_fixture_medium" 1000 > /dev/null
+benchmark_cache_comparison small "$cache_fixture_small"
+benchmark_cache_comparison medium "$cache_fixture_medium"
+benchmark_cache_comparison large "$fixture" "${initial_stores[0]}"
 
 changed_file="$(node -e '
 const fs = require("node:fs");
@@ -286,3 +318,4 @@ printf '%d\n' "$((finished - started))" > "$raw/build-observation-ms.txt"
 
 DEPGRAPH_BENCH_BINARY="$binary" \
   node scripts/benchmark-report.mjs create "$raw" "$fixture" "$report"
+node scripts/cache-hit-benchmark.mjs create "$raw" "$cache_hit_report"

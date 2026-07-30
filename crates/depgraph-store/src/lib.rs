@@ -22,7 +22,7 @@ mod runtime;
 
 pub use cache::{
     CACHE_CONTRACT_VERSION, CacheEntryCounts, CacheEventRecord, CacheKey, CacheLayer,
-    CacheLookupResult,
+    CacheLookupResult, ValidatedScanCacheHit,
 };
 pub use diff::{
     ChangedRecord, GraphSnapshotDiff, NodeRename, NodeRenameEvidence, RecordDiff, RenameConfidence,
@@ -1378,7 +1378,8 @@ impl Store {
     }
 
     pub fn snapshot_id_for_scan_selection(&self, scan_id: &str) -> Result<Option<String>> {
-        self.connection
+        let completed = self
+            .connection
             .query_row(
                 "SELECT id FROM completed_snapshots
                   WHERE scan_id=?1 AND status='completed'
@@ -1387,7 +1388,11 @@ impl Store {
                 |row| row.get(0),
             )
             .optional()
-            .context("failed to resolve completed snapshot for scan")
+            .context("failed to resolve completed snapshot for scan")?;
+        if completed.is_some() {
+            return Ok(completed);
+        }
+        self.snapshot_id_for_source("scan", scan_id)
     }
 
     pub fn completed_snapshot(&self, snapshot_id: &str) -> Result<Option<CompletedSnapshotRecord>> {
