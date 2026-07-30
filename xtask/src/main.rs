@@ -5863,6 +5863,7 @@ fn verify_packaged_build_evidence(
             .arg("--store")
             .arg(&store)
             .arg("doctor")
+            .arg("--details")
             .arg("--json")
             .output()?;
         if !doctor.status.success() {
