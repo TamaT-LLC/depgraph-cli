@@ -42,6 +42,12 @@ test("fixture generation is byte-for-byte deterministic and restorable", (t) => 
     canonicalChangedFile,
     readFileSync(join(rootTwo, two.changed_file), "utf8"),
   );
+  assert.equal(
+    readFileSync(join(rootOne, "src/f00000.ts"), "utf8").includes(
+      "export const headingPattern = /^#\\s+/m;\n",
+    ),
+    true,
+  );
   assert.throws(() => generateFixture(rootOne, 8), /exist/i);
 
   mutateFixture(rootOne, 7);

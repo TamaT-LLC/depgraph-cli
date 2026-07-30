@@ -221,9 +221,14 @@ function looksLikeJsxElementStart(source: string, offset: number): boolean {
   return source.indexOf(`</${match[1]}`, tagEnd + 1) >= 0;
 }
 
-function scanTokens(source: string, languageVariant: LanguageVariant): Token[] {
-  const scanner = createScanner(true, languageVariant, source);
+function scanTokens(
+  source: string,
+  languageVariant: LanguageVariant,
+  skipTrivia = true,
+): Token[] {
+  const scanner = createScanner(skipTrivia, languageVariant, source);
   const tokens: Token[] = [];
+  let previousSignificantToken: Token | undefined;
   let braceDepth = 0;
   const templateBases: number[] = [];
   let consumedOffset = 0;
@@ -239,7 +244,7 @@ function scanTokens(source: string, languageVariant: LanguageVariant): Token[] {
     if (
       modeAtScan === "code"
       && (kind === SyntaxKind.SlashToken || kind === SyntaxKind.SlashEqualsToken)
-      && slashStartsRegularExpression(tokens.at(-1))
+      && slashStartsRegularExpression(previousSignificantToken)
     ) {
       kind = scanner.reScanSlashToken();
     }
@@ -258,7 +263,7 @@ function scanTokens(source: string, languageVariant: LanguageVariant): Token[] {
       const recoveryStart = Math.max(consumedOffset, start, end);
       if (recoveryStart >= source.length) break;
       const recoveryEnd = nextCodePointOffset(source, recoveryStart);
-      tokens.push({
+      const recoveryToken: Token = {
         kind: SyntaxKind.Unknown,
         text: source.slice(recoveryStart, recoveryEnd),
         value: source.slice(recoveryStart, recoveryEnd),
@@ -266,19 +271,30 @@ function scanTokens(source: string, languageVariant: LanguageVariant): Token[] {
         end: recoveryEnd,
         unterminated: false,
         scannerError: `TypeScript scanner made no progress at offset ${recoveryStart}; skipped one code point`,
-      });
+      };
+      tokens.push(recoveryToken);
+      previousSignificantToken = recoveryToken;
       scanner.resetTokenState(recoveryEnd);
       consumedOffset = recoveryEnd;
       continue;
     }
-    tokens.push({
+    const token: Token = {
       kind,
       text: scanner.getTokenText(),
       value: scanner.getTokenValue(),
       start,
       end,
       unterminated: scanner.isUnterminated(),
-    });
+    };
+    tokens.push(token);
+    if (
+      kind !== SyntaxKind.WhitespaceTrivia
+      && kind !== SyntaxKind.NewLineTrivia
+      && kind !== SyntaxKind.SingleLineCommentTrivia
+      && kind !== SyntaxKind.MultiLineCommentTrivia
+    ) {
+      previousSignificantToken = token;
+    }
     consumedOffset = end;
 
     if (languageVariant === LanguageVariant.JSX) {
@@ -335,6 +351,11 @@ export function scanTypeScriptSyntaxTokens(source: string, jsx = false): TypeScr
   return scanTokens(source, jsx ? LanguageVariant.JSX : LanguageVariant.Standard);
 }
 
+/** Shared bounded tokenization that retains comments and whitespace. */
+export function scanTypeScriptSyntaxTokensWithTrivia(source: string, jsx = false): TypeScriptSyntaxToken[] {
+  return scanTokens(source, jsx ? LanguageVariant.JSX : LanguageVariant.Standard, false);
+}
+
 function quotedCommentValues(comment: string): string[] {
   const values: string[] = [];
   for (let index = 0; index < comment.length; index += 1) {
@@ -368,15 +389,12 @@ export function extractPotentialTypeScriptModuleSpecifiers(absoluteFile: string,
   const languageVariant = [".tsx", ".jsx"].includes(path.extname(absoluteFile).toLowerCase())
     ? LanguageVariant.JSX
     : LanguageVariant.Standard;
-  const scanner = createScanner(false, languageVariant, source);
   const specifiers = new Set<string>();
-  for (;;) {
-    const kind = scanner.scan() as SyntaxKind;
-    if (kind === SyntaxKind.EndOfFile) break;
-    if (kind === SyntaxKind.StringLiteral || kind === SyntaxKind.NoSubstitutionTemplateLiteral) {
-      specifiers.add(scanner.getTokenValue());
-    } else if (kind === SyntaxKind.SingleLineCommentTrivia || kind === SyntaxKind.MultiLineCommentTrivia) {
-      for (const value of quotedCommentValues(scanner.getTokenText())) specifiers.add(value);
+  for (const token of scanTokens(source, languageVariant, false)) {
+    if (token.kind === SyntaxKind.StringLiteral || token.kind === SyntaxKind.NoSubstitutionTemplateLiteral) {
+      specifiers.add(token.value);
+    } else if (token.kind === SyntaxKind.SingleLineCommentTrivia || token.kind === SyntaxKind.MultiLineCommentTrivia) {
+      for (const value of quotedCommentValues(token.text)) specifiers.add(value);
     }
   }
   return [...specifiers].sort(compareUtf8);

@@ -1,11 +1,10 @@
 import { createHash } from "node:crypto";
 import path from "node:path";
 import {
-  createScanner,
-  LanguageVariant,
   SyntaxKind,
   type SyntaxKind as SyntaxKindValue,
 } from "typescript/unstable/ast";
+import { scanTypeScriptSyntaxTokensWithTrivia } from "./imports";
 
 const SIGNIFICANT_COMMENT = /(?:^\/\/\/|@[a-z][\w-]*|["'])/iu;
 
@@ -64,17 +63,14 @@ function sourcePosition(
  */
 export function analysisContentHash(source: string, filePath: string): string {
   const extension = path.extname(filePath).toLowerCase();
-  const languageVariant = extension === ".tsx" || extension === ".jsx"
-    ? LanguageVariant.JSX
-    : LanguageVariant.Standard;
-  const scanner = createScanner(false, languageVariant, source);
+  const tokens = scanTypeScriptSyntaxTokensWithTrivia(
+    source,
+    extension === ".tsx" || extension === ".jsx",
+  );
   const hash = createHash("sha256");
   const lineStarts = sourceLineStarts(source);
-  for (
-    let kind = scanner.scan();
-    kind !== SyntaxKind.EndOfFile;
-    kind = scanner.scan()
-  ) {
+  for (const token of tokens) {
+    const kind = token.kind;
     if (
       kind === SyntaxKind.WhitespaceTrivia
       || kind === SyntaxKind.NewLineTrivia
@@ -85,20 +81,20 @@ export function analysisContentHash(source: string, filePath: string): string {
       kind === SyntaxKind.SingleLineCommentTrivia
       || kind === SyntaxKind.MultiLineCommentTrivia
     ) {
-      const text = scanner.getTokenText();
+      const text = token.text;
       if (SIGNIFICANT_COMMENT.test(text)) {
-        const startOffset = scanner.getTokenStart();
+        const startOffset = token.start;
         const position = sourcePosition(lineStarts, startOffset);
         appendToken(hash, kind, text, startOffset, position.line, position.column);
       }
       continue;
     }
-    const startOffset = scanner.getTokenStart();
+    const startOffset = token.start;
     const position = sourcePosition(lineStarts, startOffset);
     appendToken(
       hash,
       kind,
-      scanner.getTokenText(),
+      token.text,
       startOffset,
       position.line,
       position.column,

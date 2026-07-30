@@ -18,7 +18,7 @@ import {
 
 export const REPORT_SCHEMA_VERSION = "depgraph-benchmark-report-v5";
 export const EXPECTED_FIXTURE_SHA256 =
-  "f57a6d7d2e22366f5d312f01f038f6f50e2c2fbbd4480b9849ed82a696e97dc1";
+  "40c003b690e34b50a25ae07dc773fa02bb97dd609e5ede49915b56a4e2d1b4a4";
 export const BOUNDED_QUERY_RELEASE_CONTRACT = {
   release_smoke_contract_version: "bounded-query-release-smoke-v1",
   language_contract_version: "bounded-graph-query-v1",

@@ -25,7 +25,9 @@ function sourceContents(index, fileCount) {
     index + 1 < fileCount
       ? `import "./${sourceName(index + 1).replace(/\.ts$/, ".js")}";\n`
       : "";
-  return `${importLine}export const value${current} = ${index};\n`;
+  const scannerSentinel =
+    index === 0 ? "export const headingPattern = /^#\\s+/m;\n" : "";
+  return `${importLine}${scannerSentinel}export const value${current} = ${index};\n`;
 }
 
 function manifestShape(fileCount) {

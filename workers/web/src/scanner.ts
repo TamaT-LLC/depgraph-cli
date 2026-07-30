@@ -12,6 +12,7 @@ import {
   type TypeScriptPathRequest,
 } from "./imports";
 import { analysisContentHash } from "./source-fingerprint";
+import { NOOP_PROGRESS, type ProgressReporter } from "./progress";
 import { discoverRoutes, type RouteEntry } from "./routes";
 import { mergeTypeScriptDefinitionDelta, type TypeScriptDefinitionDelta } from "./semantic-delta";
 import {
@@ -1782,8 +1783,18 @@ async function localTypeScriptVersion(workspace: Workspace): Promise<Array<{ pac
   )) === index);
 }
 
-export async function scan(root: string, allFiles: string[], inventoryIssues: FileInventoryIssue[] = []): Promise<ScanModel> {
+export async function scan(
+  root: string,
+  allFiles: string[],
+  inventoryIssues: FileInventoryIssue[] = [],
+  progress: ProgressReporter = NOOP_PROGRESS,
+): Promise<ScanModel> {
+  progress.start("workspace_discovery", { inventory_files: allFiles.length });
   const workspace = await discoverWorkspace(root, allFiles);
+  progress.complete("workspace_discovery", {
+    inventory_files: allFiles.length,
+    workspace_packages: workspace.packages.length,
+  });
   const graph = new GraphBuilder(workspace);
   if (process.versions.node !== "24.18.0") {
     graph.addDiagnostic({
@@ -1900,7 +1911,12 @@ export async function scan(root: string, allFiles: string[], inventoryIssues: Fi
     }
   }
 
+  progress.start("route_discovery", { inventory_files: allFiles.length });
   const routeDiscovery = await discoverRoutes(workspace, allFiles);
+  progress.complete("route_discovery", {
+    frameworks: routeDiscovery.frameworks.length,
+    routes: routeDiscovery.entries.length,
+  });
   for (const diagnostic of routeDiscovery.configDiagnostics) {
     if (diagnostic.code === "web.static_config_unresolved" || diagnostic.code === "web.config_read_failed") {
       recordSkippedInterpretation(graph, root, diagnostic.path);
@@ -1928,7 +1944,10 @@ export async function scan(root: string, allFiles: string[], inventoryIssues: Fi
   // repository-relative TypeScript 7 `paths` mappings, and feed the normalized
   // allowlist into the worker-owned compiler config. Deprecated `baseUrl` is
   // intentionally not applied.
+  progress.start("source_preparation", { source_files: sourceFiles.length });
+  progress.start("module_resolver_initialization", { inventory_files: allFiles.length });
   const resolver = await ModuleResolver.create(workspace, allFiles);
+  progress.complete("module_resolver_initialization", { inventory_files: allFiles.length });
   // Read every TS/JS input once, then expose only those bytes through the
   // compiler's virtual filesystem. The native compiler never receives the
   // repository path, raw project config, node_modules, or package metadata.
@@ -1939,6 +1958,7 @@ export async function scan(root: string, allFiles: string[], inventoryIssues: Fi
   // Each confined read performs a realpath check followed by the actual file
   // read. Bound the fan-out so large repositories do not serialize tens of
   // thousands of independent filesystem round trips or exhaust descriptors.
+  progress.start("source_read", { compiler_files: compilerFiles.length });
   for (let offset = 0; offset < compilerFiles.length; offset += SOURCE_READ_CONCURRENCY) {
     const batch = compilerFiles.slice(offset, offset + SOURCE_READ_CONCURRENCY);
     const sources = await Promise.all(batch.map(async (file) => await readUtf8(root, file)));
@@ -1948,9 +1968,17 @@ export async function scan(root: string, allFiles: string[], inventoryIssues: Fi
       sourceCache.set(path.resolve(file), source);
       if (source !== null) compilerSources.set(normalizeRelative(path.relative(root, file)), source);
     }
+    progress.checkpoint("source_read", {
+      completed_files: Math.min(offset + batch.length, compilerFiles.length),
+      compiler_files: compilerFiles.length,
+    });
   }
+  progress.complete("source_read", { compiler_files: compilerFiles.length });
   const precompilerExtractions = new Map<string, ReturnType<typeof extractDependencies>>();
   const typeScriptPathRequests: TypeScriptPathRequest[] = [];
+  progress.start("syntax_preextraction", { compiler_files: compilerSources.size });
+  let extractedFiles = 0;
+  const extractionProgressInterval = Math.max(1, Math.ceil(compilerSources.size / 256));
   for (const [relative, source] of compilerSources) {
     const absolute = path.join(root, ...relative.split("/"));
     const extraction = extractDependencies(absolute, relative, source);
@@ -1958,10 +1986,26 @@ export async function scan(root: string, allFiles: string[], inventoryIssues: Fi
     for (const specifier of extractPotentialTypeScriptModuleSpecifiers(absolute, source)) {
       typeScriptPathRequests.push({ sourceFile: absolute, specifier });
     }
+    extractedFiles += 1;
+    if (extractedFiles % extractionProgressInterval === 0 || extractedFiles === compilerSources.size) {
+      progress.checkpoint("syntax_preextraction", {
+        completed_files: extractedFiles,
+        compiler_files: compilerSources.size,
+      });
+    }
   }
+  progress.complete("syntax_preextraction", {
+    compiler_files: compilerSources.size,
+    path_requests: typeScriptPathRequests.length,
+  });
+  progress.complete("source_preparation", {
+    compiler_files: compilerSources.size,
+    source_files: sourceFiles.length,
+  });
   const nativeTypeScript = await analyzeTypeScriptProject(
     compilerSources,
     resolver.typeScriptStaticConfig(typeScriptPathRequests),
+    progress,
   );
   for (const issue of resolver.issues) {
     recordSkippedInterpretation(graph, root, issue.path);
@@ -1973,6 +2017,7 @@ export async function scan(root: string, allFiles: string[], inventoryIssues: Fi
       profile_id: PROFILE_ID,
     });
   }
+  progress.start("syntax_dependency_resolution", { source_files: sourceFiles.length });
   for (const file of sourceFiles) {
     const relative = normalizeRelative(path.relative(root, file));
     const generated = /^routeTree\.gen\./u.test(path.basename(file));
@@ -2077,7 +2122,11 @@ export async function scan(root: string, allFiles: string[], inventoryIssues: Fi
       graph.countSite(relative, resolution.status);
     }
   }
+  progress.complete("syntax_dependency_resolution", { source_files: sourceFiles.length });
 
+  progress.start("typescript_semantic_refinement", {
+    dependency_sites: nativeTypeScript.dependencyGraph.sites.length,
+  });
   for (const issue of nativeTypeScript.definitionGraph.issues) {
     graph.addDiagnostic({
       severity: "warning",
@@ -2156,7 +2205,12 @@ export async function scan(root: string, allFiles: string[], inventoryIssues: Fi
     nativeTypeScript.project.semanticSites = 0;
     nativeTypeScript.project.semanticCallSites = 0;
   }
+  progress.complete("typescript_semantic_refinement", {
+    dependency_sites: nativeTypeScript.dependencyGraph.sites.length,
+    semantic_graph_emitted: semanticGraphEmitted,
+  });
 
+  progress.start("framework_semantic", { frameworks: routeDiscovery.frameworks.length });
   const frameworkCounts = { nodes: 0, sites: 0, edges: 0 };
   const emittedFrameworks = new Set<string>();
   const frameworkIssues = new Map<string, Set<string>>();
@@ -2359,6 +2413,11 @@ export async function scan(root: string, allFiles: string[], inventoryIssues: Fi
       typeScriptPrerequisiteReady,
     ),
   };
+  progress.complete("framework_semantic", {
+    emitted_frameworks: frameworkSemantic.emittedFrameworks.length,
+    frameworks: routeDiscovery.frameworks.length,
+  });
+  progress.start("graph_finalize");
 
   const routeNodesByGroup = new Map<string, Map<string, { node: GraphNode; evidence: Evidence }>>();
   for (const entry of routeDiscovery.entries) {
@@ -2513,7 +2572,7 @@ export async function scan(root: string, allFiles: string[], inventoryIssues: Fi
     && nativeTypeScript.project.semanticDiagnostics === 0
     && nativeTypeScript.project.emittedSemanticDiagnostics === 0
     && frameworkSemantic.completionStatus !== "incomplete";
-  return {
+  const model: ScanModel = {
     nodes: [...graph.nodes.values()].sort(compareById),
     sites,
     edges: [...graph.edges.values()].sort(compareById),
@@ -2541,4 +2600,9 @@ export async function scan(root: string, allFiles: string[], inventoryIssues: Fi
     typeScriptProject: nativeTypeScript.project,
     frameworkSemantic,
   };
+  progress.complete("graph_finalize", {
+    dependency_sites: model.coverage.dependency_sites,
+    files_analyzed: model.coverage.files_analyzed,
+  });
+  return model;
 }

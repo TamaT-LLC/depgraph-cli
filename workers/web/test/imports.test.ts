@@ -73,6 +73,20 @@ test("neutral path request inventory includes code strings and quoted JSDoc modu
   ]);
 });
 
+test("neutral path request inventory stays bounded across regular expressions", { timeout: 1_000 }, () => {
+  const source = [
+    "const heading = /^#\\s+/m;",
+    "const link = /(?=^##\\s+)['\\\"]/m;",
+    'import value from "after-regex";',
+    "",
+  ].join("\n");
+
+  assert.deepEqual(
+    extractPotentialTypeScriptModuleSpecifiers("index.ts", source),
+    ["after-regex"],
+  );
+});
+
 test("TypeScript path mappings preserve declaration order without locale-dependent sorting", async (context) => {
   const root = await mkdtemp(path.join(os.tmpdir(), "depgraph-web-path-ordering-"));
   context.after(async () => rm(root, { recursive: true, force: true }));

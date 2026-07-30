@@ -15,18 +15,14 @@ import {
 } from "typescript/unstable/ast";
 import type { FileSystem, FileSystemEntries } from "typescript/unstable/fs";
 import { compareUtf8, type TypeScriptProjectSummary } from "./types";
+import { NOOP_PROGRESS, type ProgressReporter } from "./progress";
 import {
   extractTypeScriptRawDefinitionDelta,
   TYPESCRIPT_SEMANTIC_MAX_SOURCE_FILES,
   type TypeScriptRawDefinitionDelta,
 } from "./typescript-semantic";
 import {
-  callValidationSpans,
   extractTypeScriptRawDependencyDelta,
-  importTypeModuleValidationSpans,
-  moduleCallValidationSpans,
-  nonLiteralModuleValidationSpans,
-  typeUseValidationSpans,
   type TypeScriptCallValidationSpan,
   type TypeScriptModuleCallValidationSpan,
   type TypeScriptNonLiteralModuleValidationSpan,
@@ -668,7 +664,9 @@ async function analyzeTypeScriptProjectInner(
   sources: ReadonlyMap<string, string>,
   staticConfig: TypeScriptStaticConfig,
   testRuntime?: TypeScriptAnalysisTestRuntime,
+  progress: ProgressReporter = NOOP_PROGRESS,
 ): Promise<TypeScriptProjectAnalysis> {
+  progress.start("typescript_compiler_setup", { source_files: sources.size });
   // Validate the selected compiler even for repositories with no TS/JS
   // sources. The profile must not attest to a bundled, fail-closed compiler
   // that was never resolved.
@@ -740,12 +738,16 @@ async function analyzeTypeScriptProjectInner(
     fs: virtualFileSystem(virtualFiles),
     tsserverPath: compiler,
   });
+  progress.complete("typescript_compiler_setup", { source_files: sources.size });
   const operation = (async (): Promise<void> => {
+    progress.start("typescript_project_open", { source_files: sources.size });
     const snapshot = await withNeutralEnvironment(() => api.updateSnapshot({ openProjects: [VIRTUAL_CONFIG] }));
     try {
       const projects = snapshot.getProjects();
       if (projects.length !== 1) throw new Error(`TypeScript native project analysis opened ${projects.length} projects instead of one neutral project`);
       const project = projects[0]!;
+      progress.complete("typescript_project_open", { source_files: sources.size });
+      progress.start("typescript_ast_transfer", { source_files: sources.size });
       const actualRoots = new Set(project.rootFiles.map(pathKey));
       const sourceFiles = new Map<string, SourceFile>();
       const dependencyValidationQueryBudget = { value: 0 };
@@ -814,6 +816,11 @@ async function analyzeTypeScriptProjectInner(
       if (!loadedStandardLibraryFiles.some((file) => path.basename(file) === "lib.esnext.full.d.ts")) {
         throw new Error(`TypeScript native project analysis did not load bundled lib.esnext.full.d.ts from ${standardLibrary.root}`);
       }
+      progress.complete("typescript_ast_transfer", {
+        program_files: programFiles.length,
+        source_files: sources.size,
+      });
+      progress.start("typescript_syntax_diagnostics", { source_files: sources.size });
       const syntacticallyInvalidPaths = new Set<string>();
       for (const diagnostic of await project.program.getSyntacticDiagnostics()) {
         if (!diagnostic.fileName) throw new Error(`TypeScript native syntax diagnostic TS${diagnostic.code} has no source file`);
@@ -832,29 +839,17 @@ async function analyzeTypeScriptProjectInner(
           endOffset,
         });
       }
+      progress.complete("typescript_syntax_diagnostics", {
+        invalid_files: syntacticallyInvalidPaths.size,
+        source_files: sources.size,
+      });
       for (const [relativePath, sourceFile] of [...sourceFiles.entries()]
         .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)) {
-        if (!syntacticallyInvalidPaths.has(relativePath)) {
-          result.importTypeModuleSpans.set(relativePath, importTypeModuleValidationSpans(sourceFile));
-          result.nonLiteralModuleSpans.set(relativePath, nonLiteralModuleValidationSpans(sourceFile));
-          result.moduleCallSpans.set(
-            relativePath,
-            await moduleCallValidationSpans(project.checker, sourceFile, dependencyValidationQueryBudget),
-          );
-          result.typeUseSpans.set(
-            relativePath,
-            await typeUseValidationSpans(project.checker, sourceFile, dependencyValidationQueryBudget),
-          );
-        }
-        result.callSpans.set(
-          relativePath,
-          await callValidationSpans(
-            project.checker,
-            sourceFile,
-            dependencyValidationQueryBudget,
-            !syntacticallyInvalidPaths.has(relativePath),
-          ),
-        );
+        result.importTypeModuleSpans.set(relativePath, []);
+        result.nonLiteralModuleSpans.set(relativePath, []);
+        result.moduleCallSpans.set(relativePath, []);
+        result.typeUseSpans.set(relativePath, []);
+        result.callSpans.set(relativePath, []);
       }
       const intrinsicString = await project.checker.getStringType();
       if (await project.checker.typeToString(intrinsicString) !== "string") {
@@ -870,23 +865,35 @@ async function analyzeTypeScriptProjectInner(
             sourceFile,
             syntacticallyValid: !syntacticallyInvalidPaths.has(relativePath),
           }));
+        progress.start("typescript_definition_graph", { source_files: semanticSources.length });
         result.definitionGraph = await extractTypeScriptRawDefinitionDelta(
           project.checker,
           semanticSources,
         );
+        progress.complete("typescript_definition_graph", {
+          definitions: result.definitionGraph.definitions.length,
+          source_files: semanticSources.length,
+        });
         if (!result.definitionGraph.issues.some((issue) => issue.fatal)) {
+          progress.start("typescript_dependency_graph", { source_files: semanticSources.length });
           result.dependencyGraph = await extractTypeScriptRawDependencyDelta(
             project.checker,
             semanticSources,
             result.definitionGraph,
             result.definitionGraph.typeCheckerQueries,
+            result,
           );
+          progress.complete("typescript_dependency_graph", {
+            dependency_sites: result.dependencyGraph.sites.length,
+            source_files: semanticSources.length,
+          });
         }
       }
       const typeCheckerQueries = 1
         + result.definitionGraph.typeCheckerQueries
         + result.dependencyGraph.typeCheckerQueries
         + dependencyValidationQueryBudget.value;
+      progress.start("typescript_semantic_diagnostics", { source_files: sources.size });
       const diagnostics = [
         ...await project.program.getProgramDiagnostics(),
         ...await project.program.getGlobalDiagnostics(),
@@ -898,6 +905,10 @@ async function analyzeTypeScriptProjectInner(
         allowedCompilerFiles,
         standardLibrary.root,
       ));
+      progress.complete("typescript_semantic_diagnostics", {
+        diagnostics: diagnostics.length,
+        source_files: sources.size,
+      });
       const uniqueDiagnostics = [...new Map(diagnostics.map((diagnostic) => [
         JSON.stringify(diagnostic),
         diagnostic,
@@ -1024,9 +1035,10 @@ export async function exerciseTypeScriptCompilerLifecycleForTest(
 export async function analyzeTypeScriptProject(
   sources: ReadonlyMap<string, string>,
   staticConfig: TypeScriptStaticConfig = { configFiles: 0, paths: {} },
+  progress: ProgressReporter = NOOP_PROGRESS,
 ): Promise<TypeScriptProjectAnalysis> {
   try {
-    return await analyzeTypeScriptProjectInner(sources, staticConfig);
+    return await analyzeTypeScriptProjectInner(sources, staticConfig, undefined, progress);
   } catch (error) {
     throw projectFailure(error);
   }

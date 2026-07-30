@@ -81,6 +81,22 @@ impl ScanFailure {
             self.kind.as_str()
         )
     }
+
+    fn diagnostic_message(&self) -> String {
+        let identity = self.stable_identity();
+        let Some(phase) = self.detail.lines().rev().find_map(|line| {
+            let (_, progress) = line.split_once("depgraph-progress phase=")?;
+            let phase = progress.split_whitespace().next()?;
+            (!phase.is_empty()
+                && phase
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte == b'_'))
+            .then_some(phase)
+        }) else {
+            return identity;
+        };
+        format!("{identity}; last_progress_phase={phase}")
+    }
 }
 
 #[derive(Debug)]
@@ -412,6 +428,7 @@ pub async fn run_scan_with_cache_mode_and_cancellation(
     failures.sort_by_key(|failure| (failure.adapter, failure.kind));
     for failure in &failures {
         let identity = failure.stable_identity();
+        let message = failure.diagnostic_message();
         add_core_diagnostic(
             store,
             &scan_id,
@@ -421,7 +438,7 @@ pub async fn run_scan_with_cache_mode_and_cancellation(
             } else {
                 "worker-failure"
             },
-            &identity,
+            &message,
             &identity,
         )?;
     }
@@ -1008,6 +1025,26 @@ fn snapshot_outcome(store: &Store, scan_id: &str, exit_code: u8) -> Result<ScanO
 mod tests {
     use super::*;
     use depgraph_store::{CACHE_CONTRACT_VERSION, CacheKey};
+
+    #[test]
+    fn worker_timeout_diagnostic_reports_only_the_last_safe_progress_phase() {
+        let failure = ScanFailure::with_kind(
+            AdapterKind::Web,
+            concat!(
+                "web worker failed: timed out; stderr: ",
+                "depgraph-progress phase=typescript_definition_graph status=completed duration_ms=10\n",
+                "depgraph-progress phase=typescript_dependency_graph status=started source_files=188\n",
+                "untrusted trailing detail phase=/private/repository",
+            )
+            .to_owned(),
+            WorkerFailureKind::Timeout,
+        );
+
+        assert_eq!(
+            failure.diagnostic_message(),
+            "worker-failure:web:timeout; last_progress_phase=typescript_dependency_graph"
+        );
+    }
 
     fn test_worker_spec(adapter: AdapterKind, program: PathBuf) -> WorkerSpec {
         WorkerSpec {
