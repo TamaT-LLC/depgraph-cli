@@ -51,19 +51,23 @@ const DOCTOR_SUMMARY_MAX_DIAGNOSTIC_GROUPS: usize = 64;
 const DOCTOR_SUMMARY_MAX_DIAGNOSTIC_SAMPLES: usize = 5;
 const DOCTOR_SUMMARY_MAX_KEY_BYTES: usize = 128;
 const DOCTOR_SUMMARY_MAX_TEXT_BYTES: usize = 240;
-const DOCTOR_BUILD_LAYERS_CTE: &str = "
+const DOCTOR_OVERLAY_LAYERS_CTE: &str = "
 WITH RECURSIVE
-latest_snapshot(id, parent_snapshot_id, build_attempt_id, depth) AS (
-    SELECT seed.id, seed.parent_snapshot_id, seed.build_attempt_id, 0
+latest_snapshot(
+    id, parent_snapshot_id, build_attempt_id, runtime_session_set_json, depth
+) AS (
+    SELECT seed.id, seed.parent_snapshot_id, seed.build_attempt_id,
+           seed.runtime_session_set_json, 0
       FROM (
-          SELECT id, parent_snapshot_id, build_attempt_id
+          SELECT id, parent_snapshot_id, build_attempt_id, runtime_session_set_json
             FROM completed_snapshots
            WHERE scan_id=?1 AND status='completed'
            ORDER BY julianday(created_at) DESC, rowid DESC
            LIMIT 1
       ) AS seed
     UNION ALL
-    SELECT parent.id, parent.parent_snapshot_id, parent.build_attempt_id, child.depth + 1
+    SELECT parent.id, parent.parent_snapshot_id, parent.build_attempt_id,
+           parent.runtime_session_set_json, child.depth + 1
       FROM completed_snapshots AS parent
       JOIN latest_snapshot AS child ON parent.id=child.parent_snapshot_id
 ),
@@ -72,9 +76,15 @@ build_layers(build_attempt_id, depth) AS (
       FROM latest_snapshot
      WHERE build_attempt_id IS NOT NULL
      GROUP BY build_attempt_id
+),
+runtime_layers(session_id) AS (
+    SELECT DISTINCT CAST(item.value AS TEXT)
+      FROM latest_snapshot AS snapshot
+      JOIN json_each(snapshot.runtime_session_set_json) AS item
+     WHERE snapshot.depth=0
 )";
 const DOCTOR_EFFECTIVE_DIAGNOSTICS_CTE: &str = ",
-effective_diagnostics(
+diagnostic_candidates(
     id, severity, code, message, path, adapter, source_rank, layer_depth, ordinal
 ) AS (
     SELECT id, severity, code, message, path, adapter, 0, 0, ordinal
@@ -94,6 +104,26 @@ effective_diagnostics(
       JOIN build_attempts AS attempts ON attempts.id=layers.build_attempt_id
       JOIN json_each(attempts.delta_json, '$.diagnostics') AS item
      WHERE attempts.status='completed' AND attempts.delta_json IS NOT NULL
+    UNION ALL
+    SELECT COALESCE(json_extract(diagnostic.raw_json, '$.id'), 'unknown'),
+           COALESCE(json_extract(diagnostic.raw_json, '$.severity'), 'warning'),
+           COALESCE(json_extract(diagnostic.raw_json, '$.code'), 'unknown'),
+           COALESCE(json_extract(diagnostic.raw_json, '$.message'), 'unknown diagnostic'),
+           json_extract(diagnostic.raw_json, '$.path'),
+           json_extract(diagnostic.raw_json, '$.adapter'),
+           2,
+           0,
+           diagnostic.ordinal
+      FROM runtime_layers AS layers
+      JOIN runtime_diagnostics AS diagnostic ON diagnostic.session_id=layers.session_id
+),
+effective_diagnostics(
+    id, severity, code, message, path, adapter, source_rank, layer_depth, ordinal
+) AS (
+    SELECT id, MIN(severity), MIN(code), MIN(message), MIN(path), MIN(adapter),
+           MIN(source_rank), MIN(layer_depth), MIN(ordinal)
+      FROM diagnostic_candidates
+     GROUP BY id
 )";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -4182,34 +4212,21 @@ fn load_scan_attempt_summary(
         reasons: vec!["final worker coverage unavailable".to_owned()],
         ..CoverageRecord::default()
     });
-    let (dependency_sites, resolved, candidates, external, unresolved) = connection.query_row(
-        "SELECT COUNT(*),
-                COALESCE(SUM(CASE WHEN resolution_status='resolved' THEN 1 ELSE 0 END), 0),
-                COALESCE(SUM(CASE WHEN resolution_status='candidates' THEN 1 ELSE 0 END), 0),
-                COALESCE(SUM(CASE WHEN resolution_status='external' THEN 1 ELSE 0 END), 0),
-                COALESCE(SUM(CASE WHEN resolution_status='unresolved' THEN 1 ELSE 0 END), 0)
-           FROM sites WHERE scan_id=?1",
-        [scan_id],
-        |row| {
-            Ok((
-                row.get::<_, u64>(0)?,
-                row.get::<_, u64>(1)?,
-                row.get::<_, u64>(2)?,
-                row.get::<_, u64>(3)?,
-                row.get::<_, u64>(4)?,
-            ))
-        },
-    )?;
+    coverage.project_code_executed = scan.project_code_executed;
+    for build_coverage in load_doctor_build_coverages(connection, scan_id)? {
+        union_coverage(&mut coverage, &build_coverage);
+    }
+    for runtime_coverage in load_doctor_runtime_coverages(connection, scan_id)? {
+        runtime::union_runtime_coverage_metadata(&mut coverage, &runtime_coverage);
+    }
+    let (dependency_sites, resolved, candidates, external, unresolved) =
+        load_effective_site_summary(connection, scan_id)?;
+    coverage.profiles = profile_count;
     coverage.dependency_sites = dependency_sites;
     coverage.resolved = resolved;
     coverage.candidates = candidates;
     coverage.external = external;
     coverage.unresolved = unresolved;
-    coverage.project_code_executed = scan.project_code_executed;
-    for build_coverage in load_doctor_build_coverages(connection, scan_id)? {
-        union_coverage(&mut coverage, &build_coverage);
-    }
-    coverage.profiles = profile_count;
     scan.project_code_executed = coverage.project_code_executed;
 
     let package_instance_count = load_effective_package_instance_count(connection, scan_id)?;
@@ -4269,7 +4286,7 @@ fn load_effective_profile_summary(
     scan_id: &str,
 ) -> Result<(u64, BTreeMap<String, u64>)> {
     let sql = format!(
-        "{DOCTOR_BUILD_LAYERS_CTE},
+        "{DOCTOR_OVERLAY_LAYERS_CTE},
 effective_profiles(id, language) AS (
     SELECT id, json_extract(json, '$.language')
       FROM profiles
@@ -4281,6 +4298,11 @@ effective_profiles(id, language) AS (
       JOIN build_attempts AS attempts ON attempts.id=layers.build_attempt_id
       JOIN json_each(attempts.delta_json, '$.profiles') AS item
      WHERE attempts.status='completed' AND attempts.delta_json IS NOT NULL
+    UNION
+    SELECT json_extract(session.profile_json, '$.id'),
+           json_extract(session.profile_json, '$.language')
+      FROM runtime_layers AS layers
+      JOIN runtime_sessions AS session ON session.id=layers.session_id
 ),
 deduplicated_profiles(id, language) AS (
     SELECT id, MIN(language)
@@ -4308,7 +4330,7 @@ SELECT language, COUNT(*)
 
 fn load_effective_package_instance_count(connection: &Connection, scan_id: &str) -> Result<u64> {
     let sql = format!(
-        "{DOCTOR_BUILD_LAYERS_CTE},
+        "{DOCTOR_OVERLAY_LAYERS_CTE},
 effective_package_instances(id) AS (
     SELECT id
       FROM nodes
@@ -4321,6 +4343,11 @@ effective_package_instances(id) AS (
      WHERE attempts.status='completed'
        AND attempts.delta_json IS NOT NULL
        AND json_extract(item.value, '$.kind')='package_instance'
+    UNION
+    SELECT json_extract(node.raw_json, '$.id')
+      FROM runtime_layers AS layers
+      JOIN runtime_nodes AS node ON node.session_id=layers.session_id
+     WHERE json_extract(node.raw_json, '$.kind')='package_instance'
 )
 SELECT COUNT(*) FROM effective_package_instances"
     );
@@ -4334,7 +4361,7 @@ fn load_doctor_build_coverages(
     scan_id: &str,
 ) -> Result<Vec<CoverageRecord>> {
     let sql = format!(
-        "{DOCTOR_BUILD_LAYERS_CTE}
+        "{DOCTOR_OVERLAY_LAYERS_CTE}
 SELECT json_extract(attempts.delta_json, '$.coverage')
   FROM build_layers AS layers
   JOIN build_attempts AS attempts ON attempts.id=layers.build_attempt_id
@@ -4346,12 +4373,76 @@ SELECT json_extract(attempts.delta_json, '$.coverage')
     rows.map(|raw| Ok(serde_json::from_str(&raw?)?)).collect()
 }
 
+fn load_doctor_runtime_coverages(
+    connection: &Connection,
+    scan_id: &str,
+) -> Result<Vec<CoverageRecord>> {
+    let sql = format!(
+        "{DOCTOR_OVERLAY_LAYERS_CTE}
+SELECT session.coverage_json
+  FROM runtime_layers AS layers
+  JOIN runtime_sessions AS session ON session.id=layers.session_id
+ ORDER BY layers.session_id"
+    );
+    let mut statement = connection.prepare(&sql)?;
+    let rows = statement.query_map([scan_id], |row| row.get::<_, String>(0))?;
+    rows.map(|raw| Ok(serde_json::from_str(&raw?)?)).collect()
+}
+
+fn load_effective_site_summary(
+    connection: &Connection,
+    scan_id: &str,
+) -> Result<(u64, u64, u64, u64, u64)> {
+    let sql = format!(
+        "{DOCTOR_OVERLAY_LAYERS_CTE},
+site_candidates(id, resolution_status) AS (
+    SELECT id, resolution_status
+      FROM sites
+     WHERE scan_id=?1
+    UNION
+    SELECT json_extract(item.value, '$.id'),
+           json_extract(item.value, '$.resolution_status')
+      FROM build_layers AS layers
+      JOIN build_attempts AS attempts ON attempts.id=layers.build_attempt_id
+      JOIN json_each(attempts.delta_json, '$.sites') AS item
+     WHERE attempts.status='completed' AND attempts.delta_json IS NOT NULL
+    UNION
+    SELECT json_extract(site.raw_json, '$.id'),
+           json_extract(site.raw_json, '$.resolution_status')
+      FROM runtime_layers AS layers
+      JOIN runtime_sites AS site ON site.session_id=layers.session_id
+),
+effective_sites(id, resolution_status) AS (
+    SELECT id, MIN(resolution_status)
+      FROM site_candidates
+     GROUP BY id
+)
+SELECT COUNT(*),
+       COALESCE(SUM(CASE WHEN resolution_status='resolved' THEN 1 ELSE 0 END), 0),
+       COALESCE(SUM(CASE WHEN resolution_status='candidates' THEN 1 ELSE 0 END), 0),
+       COALESCE(SUM(CASE WHEN resolution_status='external' THEN 1 ELSE 0 END), 0),
+       COALESCE(SUM(CASE WHEN resolution_status='unresolved' THEN 1 ELSE 0 END), 0)
+  FROM effective_sites"
+    );
+    connection
+        .query_row(&sql, [scan_id], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        })
+        .map_err(Into::into)
+}
+
 fn load_diagnostic_summary(
     connection: &Connection,
     scan_id: &str,
 ) -> Result<DiagnosticSummaryRecord> {
     let effective_diagnostics =
-        format!("{DOCTOR_BUILD_LAYERS_CTE}{DOCTOR_EFFECTIVE_DIAGNOSTICS_CTE}");
+        format!("{DOCTOR_OVERLAY_LAYERS_CTE}{DOCTOR_EFFECTIVE_DIAGNOSTICS_CTE}");
     let total_sql = format!("{effective_diagnostics} SELECT COUNT(*) FROM effective_diagnostics");
     let total = connection.query_row(&total_sql, [scan_id], |row| row.get::<_, u64>(0))?;
     let group_count_sql = format!(

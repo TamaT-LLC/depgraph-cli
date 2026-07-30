@@ -185,7 +185,7 @@ SQLite is stored under the operating system cache directory, keyed by the canoni
 `doctor` emits a bounded summary by default. The summary reads diagnostic
 counts and at most 64 cause groups plus five representative diagnostics
 without loading diagnostic payload JSON, graph evidence, or adapter stderr.
-Completed build overlays are projected into the same bounded counts.
+Completed build and runtime overlays are projected into the same bounded counts.
 Use `doctor --details` for the complete retained attempt payload.
 
 `deps`, `dependents`, and `unresolved` use the versioned

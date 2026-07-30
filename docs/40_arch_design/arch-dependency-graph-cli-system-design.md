@@ -1291,7 +1291,7 @@ page itemはstable edge ID順（unresolvedはstable site ID順）である。bou
 
 traversal budgetはBFSで実際にadmitしたedge visitへ適用する。到達時は`QUERY_TRAVERSAL_LIMIT_REACHED`と`complete:false`を返し、未探索集合を完全なcursorへ偽装しないため、admit済み集合の終端にはcontinuationを出さない。利用者はlimitを増やすかfilterを狭める。`--all`は従来のcomplete `TraversalResult` / unresolved arrayを明示的に維持し、full property graphは引き続きstreaming `export`を使う。
 
-summaryはstatus / phase / profile / kind / reasonを原因件数順・key順で決定的に集約し、各dimension最大64 groupとomitted countに制限する。doctor summaryはcompleted snapshot chainのbuild overlayをSQLite JSON scalar projectionで合成し、diagnostic properties、base diagnostic raw JSON、graph / evidence、adapter stderrを読み込まずにdetailsと一致するprofile / package / site / diagnostic countとproject-code execution状態を返す。human出力とJSONは同じsummary、diagnostic、cursorを共有する。
+summaryはstatus / phase / profile / kind / reasonを原因件数順・key順で決定的に集約し、各dimension最大64 groupとomitted countに制限する。doctor summaryはcompleted snapshot chainのbuild / runtime overlayをSQLite JSON scalar projectionで合成し、diagnostic properties、base diagnostic raw JSON、graph / evidence、adapter stderrを読み込まずにdetailsと一致するprofile / package / site / diagnostic countとproject-code execution状態を返す。human出力とJSONは同じsummary、diagnostic、cursorを共有する。
 
 ## 14. CLI UX
 
