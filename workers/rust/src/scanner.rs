@@ -1,7 +1,8 @@
 use crate::{
-    ADAPTER_VERSION, EXTRACTOR, RUST_ANALYZER_CRATE_VERSION, RUST_ANALYZER_REVISION,
-    RUST_ANALYZER_SALSA_VERSION, RUST_HIR_INTEGRATION_POLICY, RUST_SYSROOT_COMPONENT_VERSION,
-    RUST_SYSROOT_CONTRACT_VERSION, RUST_SYSROOT_SOURCE_LAYOUT, RUST_TOOLCHAIN_BASELINE,
+    ADAPTER_VERSION, CARGO_BASELINE_COMMIT, EXTRACTOR, RUST_ANALYZER_CRATE_VERSION,
+    RUST_ANALYZER_REVISION, RUST_ANALYZER_SALSA_VERSION, RUST_HIR_INTEGRATION_POLICY,
+    RUST_SYSROOT_COMPONENT_VERSION, RUST_SYSROOT_CONTRACT_VERSION, RUST_SYSROOT_SOURCE_LAYOUT,
+    RUST_TOOLCHAIN_BASELINE, RUSTC_BASELINE_COMMIT,
     hir_project::{
         HirProjectMode, HirProjectProfile, InventorySource, ProjectModelErrorKind,
         SafeProjectModel, build_safe_project_model_with_sysroot,
@@ -18,7 +19,10 @@ use crate::{
         CallOccurrenceKey, Occurrence, SourceSpan, TypeUseOccurrenceKey, UseOccurrenceKey,
         collect_occurrences,
     },
-    toolchain::{RustToolchainProbe, ToolchainProbeStatus, probe_rust_toolchain},
+    toolchain::{
+        RustToolchainSelection, TOOLCHAIN_REMEDIATION, TOOLCHAIN_SELECTION_CONTRACT,
+        ToolchainProbeStatus, probe_rust_toolchain,
+    },
 };
 use anyhow::{Context, Result, bail};
 use depgraph_protocol::{
@@ -170,6 +174,8 @@ fn scan_with_inventory_and_semantic_extractor(
             toolchain_probe.status()
         }
     };
+    let toolchain_remediation =
+        rust_hir_toolchain_remediation(&declared_toolchain, hir_toolchain_status);
 
     let (documents, discovery_failures) = discover_manifests(&root, inventory.as_ref())?;
     let metadata_manifest = documents
@@ -181,17 +187,22 @@ fn scan_with_inventory_and_semantic_extractor(
         if cargo_ancestor_manifest_failed(&root, document, &discovery_failures) {
             return None;
         }
-        run_cargo_metadata(&root, &document.abs_path, &documents)
-            .and_then(|(metadata, lock)| {
-                let workspace_root = normalize_path(metadata.workspace_root());
-                if !workspace_root.starts_with(&root) {
-                    bail!("cargo metadata workspace root is outside the scan root");
-                }
-                metadata
-                    .into_packages(&root, &lock, &documents)
-                    .map(|(packages, active_documents)| (packages, active_documents, lock))
-            })
-            .ok()
+        run_cargo_metadata(
+            &root,
+            &document.abs_path,
+            &documents,
+            toolchain_probe.commands(),
+        )
+        .and_then(|(metadata, lock)| {
+            let workspace_root = normalize_path(metadata.workspace_root());
+            if !workspace_root.starts_with(&root) {
+                bail!("cargo metadata workspace root is outside the scan root");
+            }
+            metadata
+                .into_packages(&root, &lock, &documents)
+                .map(|(packages, active_documents)| (packages, active_documents, lock))
+        })
+        .ok()
     });
     let metadata_succeeded = metadata_result.is_some();
     let (packages, active_documents, lock) = metadata_result.unwrap_or_else(|| {
@@ -213,6 +224,7 @@ fn scan_with_inventory_and_semantic_extractor(
         hir_toolchain_status,
         declared_toolchain.channel(),
         declared_toolchain.status(),
+        toolchain_remediation.as_deref(),
     );
     let mut state = State::new(root.clone(), repository_identity, profile, inventory);
 
@@ -260,10 +272,15 @@ fn scan_with_inventory_and_semantic_extractor(
                 .rejection_reason()
                 .or_else(|| toolchain_probe.reason().map(str::to_owned))
                 .unwrap_or_else(|| "the verified Rust toolchain pair is unavailable".into());
+            let remediation = toolchain_remediation
+                .as_deref()
+                .unwrap_or("keep the explicit syntax fallback");
             state.add_diagnostic(
                 DiagnosticSeverity::Warning,
                 "RUST_HIR_TOOLCHAIN_UNSUPPORTED",
-                &format!("{reason}; HIR remains disabled and syntax analysis continues"),
+                &format!(
+                    "{reason}; HIR remains disabled and syntax analysis continues; remediation: {remediation}"
+                ),
                 declared_toolchain.path(),
                 None,
                 &format!("rust-hir-toolchain:{}", hir_toolchain_status.as_str()),
@@ -3033,14 +3050,10 @@ fn rust_semantic_complete_eligible(profile: &Profile, coverage: &Coverage) -> bo
             == Some("confined-mirror")
         && profile
             .properties
-            .get("rust_toolchain_probe_status")
-            .and_then(Value::as_str)
-            == Some("compatible")
-        && profile
-            .properties
             .get("rust_hir_toolchain_status")
             .and_then(Value::as_str)
             == Some("compatible")
+        && rust_toolchain_attestation_is_verified(profile)
         && profile
             .properties
             .get("proc_macro_expansion")
@@ -3083,6 +3096,44 @@ fn rust_semantic_complete_eligible(profile: &Profile, coverage: &Coverage) -> bo
             == Some(false)
 }
 
+fn rust_toolchain_attestation_is_verified(profile: &Profile) -> bool {
+    let Some(attestation) = profile
+        .properties
+        .get("rust_hir_toolchain_attestation")
+        .and_then(Value::as_object)
+    else {
+        return false;
+    };
+    if attestation.get("contract").and_then(Value::as_str) != Some(TOOLCHAIN_SELECTION_CONTRACT)
+        || attestation.get("status").and_then(Value::as_str) != Some("compatible")
+    {
+        return false;
+    }
+    let identity_matches = |tool: &str, commit: &str| {
+        let Some(identity) = attestation.get(tool).and_then(Value::as_object) else {
+            return false;
+        };
+        identity.get("release").and_then(Value::as_str) == Some(RUST_TOOLCHAIN_BASELINE)
+            && identity.get("commit_hash").and_then(Value::as_str) == Some(commit)
+            && identity
+                .get("host")
+                .and_then(Value::as_str)
+                .is_some_and(|host| !host.is_empty())
+            && identity
+                .get("sha256")
+                .and_then(Value::as_str)
+                .is_some_and(|digest| {
+                    digest.len() == "sha256:".len() + 64
+                        && digest
+                            .strip_prefix("sha256:")
+                            .is_some_and(|hex| hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
+                })
+    };
+    identity_matches("rustc", RUSTC_BASELINE_COMMIT)
+        && identity_matches("cargo", CARGO_BASELINE_COMMIT)
+        && attestation["rustc"]["host"] == attestation["cargo"]["host"]
+}
+
 fn configured_rust_release_gate() -> &'static str {
     rust_release_gate_from_env_value(std::env::var_os(RUST_RELEASE_GATE_ENV).as_deref())
 }
@@ -3097,10 +3148,11 @@ fn rust_release_gate_from_env_value(value: Option<&OsStr>) -> &'static str {
 
 fn rust_profile(
     packages: &[Package],
-    toolchain_probe: &RustToolchainProbe,
+    toolchain_probe: &RustToolchainSelection,
     hir_toolchain_status: ToolchainProbeStatus,
     declared_toolchain: Option<&str>,
     declared_toolchain_status: &str,
+    toolchain_remediation: Option<&str>,
 ) -> Profile {
     let mut selection = std::env::var("DEPGRAPH_PROFILE_CONFIG")
         .ok()
@@ -3176,10 +3228,10 @@ fn rust_profile(
         "rust_analyzer_revision": RUST_ANALYZER_REVISION,
         "rust_analyzer_salsa_version": RUST_ANALYZER_SALSA_VERSION,
         "rust_toolchain_baseline": RUST_TOOLCHAIN_BASELINE,
-        "rust_toolchain_probe_status": toolchain_probe.status().as_str(),
+        "rust_toolchain_probe_status": toolchain_probe.host_status().as_str(),
         "rust_hir_toolchain_status": hir_toolchain_status.as_str(),
         "rust_toolchain_declaration_status": declared_toolchain_status,
-        "rust_toolchain_observed": toolchain_probe.as_value(),
+        "rust_toolchain_observed": toolchain_probe.host_as_value(),
         "cargo_metadata_input": "confined-mirror",
         "crate_graph_source_policy": "confined-cargo-metadata-or-static-manifest",
         "syntax_fallback": "enabled",
@@ -3197,6 +3249,18 @@ fn rust_profile(
         "project_code_executed": false,
         "project_toolchain_executed": false
     }));
+    profile_properties.insert(
+        "rust_hir_toolchain_selection".into(),
+        Value::String(toolchain_probe.selection().into()),
+    );
+    profile_properties.insert(
+        "rust_hir_toolchain_attestation".into(),
+        toolchain_probe.attestation_as_value(),
+    );
+    profile_properties.insert(
+        "rust_hir_toolchain_remediation".into(),
+        toolchain_remediation.map_or(Value::Null, |value| Value::String(value.into())),
+    );
     profile_properties.insert(
         "rust_hir_sysroot_status".into(),
         Value::String(
@@ -3228,7 +3292,8 @@ fn rust_profile(
         toolchain: Some(json!({
             "metadata_command": "cargo metadata --format-version 1 --no-deps --frozen --offline",
             "adapter_version": ADAPTER_VERSION,
-            "hir_probe": toolchain_probe.as_value(),
+            "hir_probe": toolchain_probe.attestation_as_value(),
+            "host_probe": toolchain_probe.host_as_value(),
             "declared_toolchain": declared_toolchain,
             "declared_toolchain_status": declared_toolchain_status,
         })),
@@ -3533,6 +3598,28 @@ impl RustToolchainDeclaration {
             Self::Absent | Self::Valid { .. } => None,
         }
     }
+}
+
+fn rust_hir_toolchain_remediation(
+    declaration: &RustToolchainDeclaration,
+    status: ToolchainProbeStatus,
+) -> Option<String> {
+    if status == ToolchainProbeStatus::Compatible {
+        return None;
+    }
+    Some(match declaration {
+        RustToolchainDeclaration::Valid { channel, .. } if channel != RUST_TOOLCHAIN_BASELINE => {
+            format!(
+                "pin the repository to Rust {RUST_TOOLCHAIN_BASELINE} only if source compatibility is verified; otherwise keep the explicit syntax fallback"
+            )
+        }
+        RustToolchainDeclaration::Invalid { .. } => {
+            "repair the confined rust-toolchain declaration before enabling HIR".to_owned()
+        }
+        RustToolchainDeclaration::Absent | RustToolchainDeclaration::Valid { .. } => {
+            TOOLCHAIN_REMEDIATION.to_owned()
+        }
+    })
 }
 
 fn declared_rust_toolchain(root: &Path) -> RustToolchainDeclaration {

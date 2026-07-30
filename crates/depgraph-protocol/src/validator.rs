@@ -3164,7 +3164,6 @@ fn validate_rust_semantic_completeness(
         ),
         ("crate_graph_source", "confined-cargo-metadata"),
         ("cargo_metadata_input", "confined-mirror"),
-        ("rust_toolchain_probe_status", "compatible"),
         ("rust_hir_toolchain_status", "compatible"),
         ("proc_macro_expansion", "disabled"),
         ("build_script_policy", "disabled"),
@@ -3178,6 +3177,7 @@ fn validate_rust_semantic_completeness(
             ));
         }
     }
+    validate_verified_rust_toolchain_attestation(profile)?;
     let release_gate = profile
         .properties
         .get("rust_hir_enable_gate")
@@ -3241,6 +3241,62 @@ fn validate_rust_semantic_completeness(
                 profile.id
             ));
         }
+    }
+    Ok(())
+}
+
+fn validate_verified_rust_toolchain_attestation(profile: &Profile) -> Result<(), ProtocolError> {
+    let Some(attestation) = profile
+        .properties
+        .get("rust_hir_toolchain_attestation")
+        .and_then(Value::as_object)
+    else {
+        return invariant(format!(
+            "Rust semantic-complete profile {} requires a verified toolchain attestation",
+            profile.id
+        ));
+    };
+    if attestation.get("contract").and_then(Value::as_str)
+        != Some("installed-verified-rust-toolchain-v1")
+        || attestation.get("status").and_then(Value::as_str) != Some("compatible")
+        || !matches!(
+            attestation.get("selection").and_then(Value::as_str),
+            Some("host-default" | "installed-verified-baseline")
+        )
+    {
+        return invariant(format!(
+            "Rust semantic-complete profile {} has an incompatible toolchain attestation header",
+            profile.id
+        ));
+    }
+    let identity_matches = |tool: &str, commit: &str| {
+        let Some(identity) = attestation.get(tool).and_then(Value::as_object) else {
+            return false;
+        };
+        identity.get("release").and_then(Value::as_str) == Some("1.93.1")
+            && identity.get("commit_hash").and_then(Value::as_str) == Some(commit)
+            && identity
+                .get("host")
+                .and_then(Value::as_str)
+                .is_some_and(|host| !host.is_empty())
+            && identity
+                .get("sha256")
+                .and_then(Value::as_str)
+                .is_some_and(|digest| {
+                    digest.len() == "sha256:".len() + 64
+                        && digest
+                            .strip_prefix("sha256:")
+                            .is_some_and(|hex| hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
+                })
+    };
+    if !identity_matches("rustc", "01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf")
+        || !identity_matches("cargo", "083ac5135f967fd9dc906ab057a2315861c7a80d")
+        || attestation["rustc"]["host"] != attestation["cargo"]["host"]
+    {
+        return invariant(format!(
+            "Rust semantic-complete profile {} has an incompatible rustc/Cargo attestation",
+            profile.id
+        ));
     }
     Ok(())
 }

@@ -55,6 +55,11 @@ Rust HIR final fallback/coverage handling is complete. A profile claims
 HIR backend uses confined Cargo metadata with a ready project model and an
 emitted graph, the semantic issue count is zero, and skipped, unsupported, and
 unresolved counts are all zero. Candidate and external sites are allowed.
+The neutral host Rust version is reported separately from the effective HIR
+toolchain: a newer host may use an already-installed, exact verified Rust
+`1.93.1` rustc/Cargo pair without changing the project or user default.
+Depgraph sets `RUSTUP_AUTO_INSTALL=0`, attests both executable digests and
+versions, and prints the exact install remediation when the baseline is absent.
 Source/development builds intentionally report
 `rust_hir_enable_gate=release-gate-pending`. After the core verifies an
 extracted release archive, including its Rust backend attestation, it starts the

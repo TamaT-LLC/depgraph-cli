@@ -4,6 +4,7 @@ use crate::{
 };
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::{
     fs,
     io::{self, Read},
@@ -16,6 +17,26 @@ use std::{
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const PROBE_OUTPUT_LIMIT: usize = 64 * 1024;
+pub(crate) const TOOLCHAIN_SELECTION_CONTRACT: &str = "installed-verified-rust-toolchain-v1";
+pub(crate) const TOOLCHAIN_REMEDIATION: &str =
+    "rustup toolchain install 1.93.1 --profile minimal --component rust-src";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ToolchainSelectionKind {
+    HostDefault,
+    InstalledVerifiedBaseline,
+    Unavailable,
+}
+
+impl ToolchainSelectionKind {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::HostDefault => "host-default",
+            Self::InstalledVerifiedBaseline => "installed-verified-baseline",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ToolchainProbeStatus {
@@ -40,6 +61,7 @@ pub(crate) struct ToolVersion {
     release: String,
     commit_hash: Option<String>,
     host: String,
+    sha256: Option<String>,
 }
 
 impl ToolVersion {
@@ -49,7 +71,33 @@ impl ToolVersion {
             "release": self.release,
             "commit_hash": self.commit_hash,
             "host": self.host,
+            "sha256": self.sha256,
         })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RustToolchainCommands {
+    rustc: PathBuf,
+    cargo: PathBuf,
+    rustc_sha256: String,
+    cargo_sha256: String,
+}
+
+impl RustToolchainCommands {
+    pub(crate) fn rustc(&self) -> &Path {
+        &self.rustc
+    }
+
+    pub(crate) fn cargo(&self) -> &Path {
+        &self.cargo
+    }
+
+    pub(crate) fn verify_integrity(&self) -> Result<()> {
+        verify_tool_digest(&self.rustc, &self.rustc_sha256)
+            .context("verified rustc changed after toolchain selection")?;
+        verify_tool_digest(&self.cargo, &self.cargo_sha256)
+            .context("verified cargo changed after toolchain selection")
     }
 }
 
@@ -59,6 +107,7 @@ pub(crate) struct RustToolchainProbe {
     rustc: Option<ToolVersion>,
     cargo: Option<ToolVersion>,
     reason: Option<String>,
+    commands: Option<RustToolchainCommands>,
 }
 
 impl RustToolchainProbe {
@@ -85,11 +134,78 @@ impl RustToolchainProbe {
             rustc: None,
             cargo: None,
             reason: Some(reason.into()),
+            commands: None,
         }
     }
 }
 
-pub(crate) fn probe_rust_toolchain(root: &Path) -> RustToolchainProbe {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RustToolchainSelection {
+    host: RustToolchainProbe,
+    effective: RustToolchainProbe,
+    kind: ToolchainSelectionKind,
+}
+
+impl RustToolchainSelection {
+    pub(crate) fn host_status(&self) -> ToolchainProbeStatus {
+        self.host.status()
+    }
+
+    pub(crate) fn status(&self) -> ToolchainProbeStatus {
+        self.effective.status()
+    }
+
+    pub(crate) fn reason(&self) -> Option<&str> {
+        self.effective.reason()
+    }
+
+    pub(crate) fn selection(&self) -> &'static str {
+        self.kind.as_str()
+    }
+
+    pub(crate) fn commands(&self) -> Option<&RustToolchainCommands> {
+        self.effective.commands.as_ref()
+    }
+
+    pub(crate) fn host_as_value(&self) -> Value {
+        self.host.as_value()
+    }
+
+    pub(crate) fn attestation_as_value(&self) -> Value {
+        json!({
+            "contract": TOOLCHAIN_SELECTION_CONTRACT,
+            "selection": self.selection(),
+            "status": self.status().as_str(),
+            "rustc": self.effective.rustc.as_ref().map(ToolVersion::as_value),
+            "cargo": self.effective.cargo.as_ref().map(ToolVersion::as_value),
+        })
+    }
+}
+
+pub(crate) fn probe_rust_toolchain(root: &Path) -> RustToolchainSelection {
+    let host = probe_host_toolchain(root);
+    if let Ok(installed) = probe_installed_baseline(root)
+        && installed.status() == ToolchainProbeStatus::Compatible
+    {
+        return RustToolchainSelection {
+            host,
+            effective: installed,
+            kind: ToolchainSelectionKind::InstalledVerifiedBaseline,
+        };
+    }
+    let kind = if host.status() == ToolchainProbeStatus::Compatible {
+        ToolchainSelectionKind::HostDefault
+    } else {
+        ToolchainSelectionKind::Unavailable
+    };
+    RustToolchainSelection {
+        effective: host.clone(),
+        host,
+        kind,
+    }
+}
+
+fn probe_host_toolchain(root: &Path) -> RustToolchainProbe {
     let rustc = match resolve_safe_tool("rustc", root) {
         Ok(path) => path,
         Err(_) => {
@@ -106,15 +222,128 @@ pub(crate) fn probe_rust_toolchain(root: &Path) -> RustToolchainProbe {
         .unwrap_or_else(|error| RustToolchainProbe::unavailable(error.to_string()))
 }
 
+fn probe_installed_baseline(root: &Path) -> Result<RustToolchainProbe> {
+    let rustup =
+        resolve_safe_tool("rustup", root).context("rustup is unavailable on the sanitized PATH")?;
+    let rustup_home = safe_rustup_home(root).context("safe Rustup home is unavailable")?;
+    let rustc = rustup_which(root, &rustup, &rustup_home, "rustc")?;
+    let cargo = rustup_which(root, &rustup, &rustup_home, "cargo")?;
+    let rustc_root = verified_toolchain_root(&rustc, &rustup_home)?;
+    let cargo_root = verified_toolchain_root(&cargo, &rustup_home)?;
+    if rustc_root != cargo_root {
+        bail!("installed Rust baseline resolves rustc and cargo from different toolchains");
+    }
+    let probe = probe_resolved_toolchain(root, &rustc, &cargo, PROBE_TIMEOUT)?;
+    if probe.status() != ToolchainProbeStatus::Compatible {
+        bail!("installed Rust baseline does not match the verified compatibility pair");
+    }
+    let host = probe
+        .rustc
+        .as_ref()
+        .context("installed Rust baseline omitted rustc identity")?
+        .host
+        .as_str();
+    let expected_name = format!("{RUST_TOOLCHAIN_BASELINE}-{host}");
+    if rustc_root.file_name() != Some(expected_name.as_ref()) {
+        bail!("installed Rust baseline directory does not match its attested host");
+    }
+    Ok(probe)
+}
+
+fn safe_rustup_home(root: &Path) -> Option<PathBuf> {
+    std::env::var_os("RUSTUP_HOME")
+        .as_deref()
+        .and_then(|value| safe_external_directory(root, value))
+        .or_else(|| {
+            ["HOME", "USERPROFILE"].into_iter().find_map(|key| {
+                std::env::var_os(key)
+                    .map(PathBuf::from)
+                    .map(|home| home.join(".rustup"))
+                    .filter(|path| path.is_dir())
+                    .and_then(|path| safe_external_directory(root, path.as_os_str()))
+            })
+        })
+}
+
+fn rustup_which(root: &Path, rustup: &Path, rustup_home: &Path, tool: &str) -> Result<PathBuf> {
+    let neutral = neutral_environment(root)?;
+    let mut command = Command::new(rustup);
+    command
+        .args(["which", "--toolchain", RUST_TOOLCHAIN_BASELINE, tool])
+        .current_dir(neutral.path());
+    configure_probe_environment(&mut command, root, neutral.path())?;
+    command.env("RUSTUP_HOME", rustup_home);
+    let output = bounded_output(command, PROBE_TIMEOUT, PROBE_OUTPUT_LIMIT)
+        .with_context(|| format!("resolve installed verified {tool}"))?;
+    if !output.status.success() {
+        bail!("verified Rust {RUST_TOOLCHAIN_BASELINE} is not installed");
+    }
+    let stdout =
+        std::str::from_utf8(&output.stdout).context("rustup which returned non-UTF-8 output")?;
+    let mut lines = stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty());
+    let path = PathBuf::from(lines.next().context("rustup which returned no path")?);
+    if lines.next().is_some() || !path.is_absolute() {
+        bail!("rustup which returned an invalid path");
+    }
+    let metadata = fs::symlink_metadata(&path).context("inspect rustup-selected tool")?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!("rustup-selected tool is not a non-symlink regular file");
+    }
+    let path = path
+        .canonicalize()
+        .context("canonicalize rustup-selected tool")?;
+    verified_toolchain_root(&path, rustup_home)?;
+    Ok(path)
+}
+
+fn verified_toolchain_root(tool: &Path, rustup_home: &Path) -> Result<PathBuf> {
+    let toolchains = rustup_home
+        .join("toolchains")
+        .canonicalize()
+        .context("canonicalize Rustup toolchains directory")?;
+    let relative = tool
+        .strip_prefix(&toolchains)
+        .context("rustup-selected tool is outside the configured Rustup home")?;
+    let mut components = relative.components();
+    let toolchain = components
+        .next()
+        .context("rustup-selected tool has no toolchain directory")?;
+    let bin = components
+        .next()
+        .context("rustup-selected tool has no bin directory")?;
+    let executable = components
+        .next()
+        .context("rustup-selected tool has no executable")?;
+    if components.next().is_some() || bin.as_os_str() != "bin" || executable.as_os_str().is_empty()
+    {
+        bail!("rustup-selected tool has an unexpected layout");
+    }
+    Ok(toolchains.join(toolchain.as_os_str()))
+}
+
 fn probe_resolved_toolchain(
     root: &Path,
-    rustc: &Path,
-    cargo: &Path,
+    rustc_path: &Path,
+    cargo_path: &Path,
     timeout: Duration,
 ) -> Result<RustToolchainProbe> {
     let neutral = neutral_environment(root)?;
-    let rustc = run_version_probe("rustc", rustc, root, neutral.path(), timeout)?;
-    let cargo = run_version_probe("cargo", cargo, root, neutral.path(), timeout)?;
+    let rustc = run_version_probe("rustc", rustc_path, root, neutral.path(), timeout)?;
+    let cargo = run_version_probe("cargo", cargo_path, root, neutral.path(), timeout)?;
+    let commands = RustToolchainCommands {
+        rustc: rustc_path
+            .canonicalize()
+            .context("canonicalize probed rustc")?,
+        cargo: cargo_path
+            .canonicalize()
+            .context("canonicalize probed cargo")?,
+        rustc_sha256: rustc.sha256.clone().context("rustc digest unavailable")?,
+        cargo_sha256: cargo.sha256.clone().context("cargo digest unavailable")?,
+    };
+    commands.verify_integrity()?;
     let compatible = rustc.release == RUST_TOOLCHAIN_BASELINE
         && cargo.release == RUST_TOOLCHAIN_BASELINE
         && rustc.commit_hash.as_deref() == Some(RUSTC_BASELINE_COMMIT)
@@ -140,6 +369,7 @@ fn probe_resolved_toolchain(
         rustc: Some(rustc),
         cargo: Some(cargo),
         reason,
+        commands: Some(commands),
     })
 }
 
@@ -150,6 +380,7 @@ fn run_version_probe(
     neutral: &Path,
     timeout: Duration,
 ) -> Result<ToolVersion> {
+    let digest_before = digest_tool(program)?;
     let mut command = Command::new(program);
     command
         .arg("--version")
@@ -163,7 +394,13 @@ fn run_version_probe(
     }
     let stdout = std::str::from_utf8(&output.stdout)
         .with_context(|| format!("{name} version probe returned non-UTF-8 output"))?;
-    parse_verbose_version(name, stdout)
+    let mut version = parse_verbose_version(name, stdout)?;
+    let digest_after = digest_tool(program)?;
+    if digest_after != digest_before {
+        bail!("{name} changed during its version probe");
+    }
+    version.sha256 = Some(digest_after);
+    Ok(version)
 }
 
 fn configure_probe_environment(command: &mut Command, root: &Path, neutral: &Path) -> Result<()> {
@@ -243,7 +480,26 @@ fn parse_verbose_version(name: &str, output: &str) -> Result<ToolVersion> {
         release,
         commit_hash: field("commit-hash").filter(|value| !value.is_empty()),
         host,
+        sha256: None,
     })
+}
+
+fn digest_tool(path: &Path) -> Result<String> {
+    use std::fmt::Write as _;
+
+    let bytes = fs::read(path).context("read tool executable for attestation")?;
+    let mut digest = String::from("sha256:");
+    for byte in Sha256::digest(bytes) {
+        write!(&mut digest, "{byte:02x}").expect("writing a digest to String cannot fail");
+    }
+    Ok(digest)
+}
+
+fn verify_tool_digest(path: &Path, expected: &str) -> Result<()> {
+    if digest_tool(path)? != expected {
+        bail!("tool executable digest mismatch");
+    }
+    Ok(())
 }
 
 struct BoundedOutput {
@@ -508,6 +764,86 @@ mod tests {
         let probe = probe_resolved_toolchain(&root, &rustc, &cargo, PROBE_TIMEOUT).unwrap();
         assert_eq!(probe.status(), ToolchainProbeStatus::Compatible);
         assert!(!marker.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn selected_toolchain_digest_rejects_post_probe_mutation() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("repository");
+        let tools = temp.path().join("tools");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&tools).unwrap();
+        let root = root.canonicalize().unwrap();
+        let script = |name: &str, commit: &str| {
+            let path = tools.join(name);
+            std::fs::write(
+                &path,
+                format!(
+                    "#!/bin/sh\nprintf '{} 1.93.1 (test)\\nrelease: 1.93.1\\ncommit-hash: {}\\nhost: test-host\\n'\n",
+                    name, commit,
+                ),
+            )
+            .unwrap();
+            let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&path, permissions).unwrap();
+            path
+        };
+        let rustc = script("rustc", crate::RUSTC_BASELINE_COMMIT);
+        let cargo = script("cargo", crate::CARGO_BASELINE_COMMIT);
+        let probe = probe_resolved_toolchain(&root, &rustc, &cargo, PROBE_TIMEOUT).unwrap();
+        assert_eq!(probe.status(), ToolchainProbeStatus::Compatible);
+
+        std::fs::write(&rustc, "#!/bin/sh\nexit 99\n").unwrap();
+        assert!(
+            probe
+                .commands
+                .as_ref()
+                .expect("verified commands")
+                .verify_integrity()
+                .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mismatched_baseline_pair_remains_fail_closed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("repository");
+        let tools = temp.path().join("tools");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&tools).unwrap();
+        let root = root.canonicalize().unwrap();
+        let script = |name: &str, commit: &str| {
+            let path = tools.join(name);
+            std::fs::write(
+                &path,
+                format!(
+                    "#!/bin/sh\nprintf '{} 1.93.1 (test)\\nrelease: 1.93.1\\ncommit-hash: {}\\nhost: test-host\\n'\n",
+                    name, commit,
+                ),
+            )
+            .unwrap();
+            let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&path, permissions).unwrap();
+            path
+        };
+        let rustc = script("rustc", crate::RUSTC_BASELINE_COMMIT);
+        let cargo = script("cargo", "ffffffffffffffffffffffffffffffffffffffff");
+        let probe = probe_resolved_toolchain(&root, &rustc, &cargo, PROBE_TIMEOUT).unwrap();
+
+        assert_eq!(probe.status(), ToolchainProbeStatus::Unsupported);
+        assert!(
+            probe
+                .reason()
+                .is_some_and(|reason| reason.contains("do not match"))
+        );
     }
 
     #[cfg(unix)]

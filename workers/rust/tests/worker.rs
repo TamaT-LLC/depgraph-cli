@@ -1947,6 +1947,20 @@ fn missing_cargo_preserves_static_syntax_graph_without_semantic_completeness() {
         profile.properties["rust_hir_toolchain_status"],
         "unavailable"
     );
+    assert_eq!(
+        profile.properties["rust_hir_toolchain_selection"],
+        "unavailable"
+    );
+    assert_eq!(
+        profile.properties["rust_hir_toolchain_remediation"],
+        "rustup toolchain install 1.93.1 --profile minimal --component rust-src"
+    );
+    assert!(validated.diagnostics.values().any(|diagnostic| {
+        diagnostic.code == "RUST_HIR_TOOLCHAIN_UNSUPPORTED"
+            && diagnostic
+                .message
+                .contains("rustup toolchain install 1.93.1 --profile minimal --component rust-src")
+    }));
     assert_eq!(profile.properties["syntax_fallback"], "enabled");
     assert!(validated.nodes.values().any(|node| node.kind == "module"));
     assert!(validated.sites.values().any(|site| {
@@ -1992,6 +2006,148 @@ fn missing_cargo_preserves_static_syntax_graph_without_semantic_completeness() {
             .completeness
             .contains(&CompletenessLevel::SemanticComplete)
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn newer_host_without_project_declaration_uses_installed_verified_baseline() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let installed = |tool: &str| {
+        let output = Command::new("rustup")
+            .args(["which", "--toolchain", RUST_TOOLCHAIN_BASELINE, tool])
+            .env("RUSTUP_AUTO_INSTALL", "0")
+            .output()
+            .ok()?;
+        output.status.success().then(|| {
+            PathBuf::from(
+                String::from_utf8(output.stdout)
+                    .expect("UTF-8 rustup path")
+                    .trim(),
+            )
+        })
+    };
+    let Some(rustc) = installed("rustc") else {
+        eprintln!("verified baseline is not installed; fixture is not applicable");
+        return;
+    };
+    let Some(cargo) = installed("cargo") else {
+        eprintln!("verified baseline Cargo is not installed; fixture is not applicable");
+        return;
+    };
+    let rustup_home = rustc
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+        .expect("Rustup home");
+    let quote = |path: &Path| format!("'{}'", path.to_string_lossy().replace('\'', "'\"'\"'"));
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("newer-host-repository");
+    let tools = temp.path().join("host-tools");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::create_dir_all(&tools).unwrap();
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname='newer-host'\nversion='0.1.0'\nedition='2024'\nbuild='build.rs'\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        "pub struct Input;\npub fn transform(_: Input) {}\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("build.rs"),
+        "fn main() { std::fs::write(\"PROJECT_CODE_EXECUTED\", \"bad\").unwrap(); }\n",
+    )
+    .unwrap();
+    for (tool, commit) in [
+        ("rustc", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        ("cargo", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+    ] {
+        let path = tools.join(tool);
+        fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' '{tool} 1.97.1 (fixture)' 'release: 1.97.1' 'commit-hash: {commit}' 'host: fixture-host'\n"
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).unwrap();
+    }
+    let fake_rustup = tools.join("rustup");
+    fs::write(
+        &fake_rustup,
+        format!(
+            "#!/bin/sh\n[ \"$RUSTUP_AUTO_INSTALL\" = 0 ] || exit 90\n[ \"$1\" = which ] || exit 91\n[ \"$2\" = --toolchain ] || exit 92\n[ \"$3\" = {RUST_TOOLCHAIN_BASELINE} ] || exit 93\ncase \"$4\" in rustc) printf '%s\\n' {};; cargo) printf '%s\\n' {};; *) exit 94;; esac\n",
+            quote(&rustc),
+            quote(&cargo),
+        ),
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&fake_rustup).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&fake_rustup, permissions).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_depgraph-rust-worker"))
+        .arg("--root")
+        .arg(&root)
+        .arg("--scan-id")
+        .arg("newer-host-installed-baseline")
+        .env("PATH", &tools)
+        .env("RUSTUP_HOME", rustup_home)
+        .env_remove("DEPGRAPH_PROFILE_CONFIG")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "worker failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let validated = validate_ndjson(Cursor::new(output.stdout)).unwrap();
+    let profile = validated.profiles.values().next().unwrap();
+    assert_eq!(
+        profile.properties["rust_toolchain_probe_status"],
+        "unsupported"
+    );
+    assert_eq!(
+        profile.properties["rust_toolchain_observed"]["rustc"]["release"],
+        "1.97.1"
+    );
+    assert_eq!(
+        profile.properties["rust_hir_toolchain_status"],
+        "compatible"
+    );
+    assert_eq!(
+        profile.properties["rust_hir_toolchain_selection"],
+        "installed-verified-baseline"
+    );
+    assert_eq!(profile.properties["rust_hir_backend"], "rust-analyzer-hir");
+    assert_eq!(profile.properties["rust_hir_project_model"], "ready");
+    assert_eq!(
+        profile.properties["crate_graph_source"],
+        "confined-cargo-metadata"
+    );
+    for tool in ["rustc", "cargo"] {
+        let identity = &profile.properties["rust_hir_toolchain_attestation"][tool];
+        assert_eq!(identity["release"], RUST_TOOLCHAIN_BASELINE);
+        assert!(
+            identity["sha256"]
+                .as_str()
+                .is_some_and(|digest| digest.len() == "sha256:".len() + 64)
+        );
+    }
+    assert!(
+        !validated
+            .diagnostics
+            .values()
+            .any(|diagnostic| diagnostic.code == "RUST_HIR_TOOLCHAIN_UNSUPPORTED")
+    );
+    assert!(!root.join("PROJECT_CODE_EXECUTED").exists());
 }
 
 #[test]
@@ -2277,11 +2433,18 @@ fn default_rust_profile_has_stable_hashed_host_identity() {
     let probe_status = first.properties["rust_toolchain_probe_status"]
         .as_str()
         .expect("toolchain probe status");
+    let hir_toolchain_status = first.properties["rust_hir_toolchain_status"]
+        .as_str()
+        .expect("effective HIR toolchain status");
     assert!(matches!(
         probe_status,
         "compatible" | "unsupported" | "unavailable"
     ));
-    if probe_status == "compatible" {
+    assert!(matches!(
+        hir_toolchain_status,
+        "compatible" | "unsupported" | "unavailable"
+    ));
+    if hir_toolchain_status == "compatible" {
         assert_eq!(
             first.properties["analysis"],
             "syntax+hir-imports-types-calls"
@@ -2305,8 +2468,29 @@ fn default_rust_profile_has_stable_hashed_host_identity() {
         first.properties["rust_toolchain_observed"]["status"],
         probe_status
     );
-    assert_eq!(first.properties["rust_hir_toolchain_status"], probe_status);
-    if probe_status == "compatible" {
+    if first.properties["rust_hir_toolchain_selection"] == "installed-verified-baseline" {
+        assert_eq!(hir_toolchain_status, "compatible");
+        assert_eq!(
+            first.properties["rust_hir_toolchain_attestation"]["contract"],
+            "installed-verified-rust-toolchain-v1"
+        );
+        for tool in ["rustc", "cargo"] {
+            assert_eq!(
+                first.properties["rust_hir_toolchain_attestation"][tool]["release"],
+                "1.93.1"
+            );
+            assert!(
+                first.properties["rust_hir_toolchain_attestation"][tool]["sha256"]
+                    .as_str()
+                    .is_some_and(|digest| digest.starts_with("sha256:"))
+            );
+        }
+        assert_eq!(
+            first.properties["rust_hir_toolchain_remediation"],
+            serde_json::Value::Null
+        );
+    }
+    if hir_toolchain_status == "compatible" {
         assert_eq!(first.properties["rust_hir_project_model"], "ready");
         assert_eq!(
             first.properties["rust_hir_enable_gate"],

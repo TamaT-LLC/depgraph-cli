@@ -1,8 +1,12 @@
 use std::{
     collections::BTreeMap,
     fs,
+    io::{self, Read},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Child, Command, ExitStatus, Output, Stdio},
+    sync::mpsc,
+    thread,
+    time::{Duration, Instant},
 };
 
 use depgraph_store::{CacheKey, CacheLayer};
@@ -19,6 +23,11 @@ use crate::{
 const CACHE_MAX_FILES: usize = 100_000;
 const CACHE_MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
 const CACHE_MAX_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
+const RUST_TOOLCHAIN_BASELINE: &str = "1.93.1";
+const RUSTC_BASELINE_COMMIT: &str = "01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf";
+const CARGO_BASELINE_COMMIT: &str = "083ac5135f967fd9dc906ab057a2315861c7a80d";
+const CACHE_TOOL_TIMEOUT: Duration = Duration::from_secs(5);
+const CACHE_TOOL_OUTPUT_LIMIT: usize = 64 * 1024;
 
 #[derive(Debug, Clone)]
 pub(crate) struct ScanCachePlan {
@@ -492,14 +501,10 @@ fn fingerprint_toolchains(
     for (adapter, _) in workers {
         match adapter {
             AdapterKind::Rust => {
-                identities.insert(
-                    "cargo",
-                    tool_identity(root, "cargo", &["--version", "--verbose"])?,
-                );
-                identities.insert(
-                    "rustc",
-                    tool_identity(root, "rustc", &["--version", "--verbose"])?,
-                );
+                let (selection, rustc, cargo) = verified_rust_toolchain_identities(root)?;
+                identities.insert("rust-toolchain-selection", selection);
+                identities.insert("rustc", rustc);
+                identities.insert("cargo", cargo);
             }
             AdapterKind::Go => {
                 identities.insert("go", tool_identity(root, "go", &["version"])?);
@@ -514,16 +519,29 @@ fn fingerprint_toolchains(
 
 fn tool_identity(root: &Path, name: &str, arguments: &[&str]) -> Result<String, ()> {
     let program = resolve_safe_executable(name, root).map_err(|_| ())?;
+    tool_identity_at(root, name, &program, arguments).map(|(identity, _)| identity)
+}
+
+fn tool_identity_at(
+    root: &Path,
+    name: &str,
+    program: &Path,
+    arguments: &[&str],
+) -> Result<(String, Vec<u8>), ()> {
     let artifact = program.canonicalize().map_err(|_| ())?;
-    let artifact_digest = Sha256::digest(fs::read(artifact).map_err(|_| ())?);
+    let artifact_bytes = fs::read(&artifact).map_err(|_| ())?;
+    let artifact_digest = Sha256::digest(&artifact_bytes);
     let mut command = Command::new(program);
     command.args(arguments).env_clear();
     copy_safe_tool_environment(&mut command, root)?;
-    let output = command.output().map_err(|_| ())?;
+    let output = bounded_cache_tool_output(command, CACHE_TOOL_TIMEOUT, CACHE_TOOL_OUTPUT_LIMIT)?;
     if !output.status.success()
         || output.stdout.len() > 64 * 1024
         || output.stderr.len() > 64 * 1024
     {
+        return Err(());
+    }
+    if fs::read(&artifact).map_err(|_| ())? != artifact_bytes {
         return Err(());
     }
     let mut hasher = Sha256::new();
@@ -535,7 +553,344 @@ fn tool_identity(root: &Path, name: &str, arguments: &[&str]) -> Result<String, 
     hasher.update(&output.stdout);
     hasher.update(b"\0");
     hasher.update(&output.stderr);
-    Ok(finish_digest(hasher))
+    Ok((finish_digest(hasher), output.stdout))
+}
+
+fn verified_rust_toolchain_identities(root: &Path) -> Result<(String, String, String), ()> {
+    if let Ok((rustc, cargo)) = rustup_baseline_pair(root)
+        && let Ok((rustc_identity, rustc_output)) =
+            tool_identity_at(root, "rustc", &rustc, &["--version", "--verbose"])
+        && let Ok((cargo_identity, cargo_output)) =
+            tool_identity_at(root, "cargo", &cargo, &["--version", "--verbose"])
+        && verified_rust_version(&rustc_output, RUSTC_BASELINE_COMMIT)
+        && verified_rust_version(&cargo_output, CARGO_BASELINE_COMMIT)
+        && version_field(&rustc_output, "host") == version_field(&cargo_output, "host")
+        && rustup_pair_matches_attested_host(root, &rustc, &rustc_output)
+    {
+        return Ok((
+            "installed-verified-baseline".to_owned(),
+            rustc_identity,
+            cargo_identity,
+        ));
+    }
+
+    let rustc = resolve_safe_executable("rustc", root).map_err(|_| ())?;
+    let cargo = resolve_safe_executable("cargo", root).map_err(|_| ())?;
+    let (rustc_identity, rustc_output) =
+        tool_identity_at(root, "rustc", &rustc, &["--version", "--verbose"])?;
+    let (cargo_identity, cargo_output) =
+        tool_identity_at(root, "cargo", &cargo, &["--version", "--verbose"])?;
+    if !verified_rust_version(&rustc_output, RUSTC_BASELINE_COMMIT)
+        || !verified_rust_version(&cargo_output, CARGO_BASELINE_COMMIT)
+        || version_field(&rustc_output, "host") != version_field(&cargo_output, "host")
+    {
+        return Err(());
+    }
+    Ok(("host-default".to_owned(), rustc_identity, cargo_identity))
+}
+
+fn rustup_pair_matches_attested_host(root: &Path, rustc: &Path, output: &[u8]) -> bool {
+    let Some(rustup_home) = safe_rustup_home(root) else {
+        return false;
+    };
+    let Some(host) = version_field(output, "host") else {
+        return false;
+    };
+    rustup_toolchain_root(rustc, &rustup_home)
+        .ok()
+        .and_then(|path| path.file_name().map(ToOwned::to_owned))
+        .is_some_and(|name| name.to_string_lossy() == format!("{RUST_TOOLCHAIN_BASELINE}-{host}"))
+}
+
+fn rustup_baseline_pair(root: &Path) -> Result<(PathBuf, PathBuf), ()> {
+    let rustup = resolve_safe_executable("rustup", root).map_err(|_| ())?;
+    let rustup_home = safe_rustup_home(root).ok_or(())?;
+    let rustc = rustup_which(root, &rustup, &rustup_home, "rustc")?;
+    let cargo = rustup_which(root, &rustup, &rustup_home, "cargo")?;
+    if rustup_toolchain_root(&rustc, &rustup_home)? != rustup_toolchain_root(&cargo, &rustup_home)?
+    {
+        return Err(());
+    }
+    Ok((rustc, cargo))
+}
+
+fn safe_rustup_home(root: &Path) -> Option<PathBuf> {
+    std::env::var_os("RUSTUP_HOME")
+        .as_deref()
+        .and_then(|value| safe_external_directory_for_cache(root, value))
+        .or_else(|| {
+            ["HOME", "USERPROFILE"].into_iter().find_map(|key| {
+                std::env::var_os(key)
+                    .map(PathBuf::from)
+                    .map(|home| home.join(".rustup"))
+                    .filter(|path| path.is_dir())
+                    .and_then(|path| safe_external_directory_for_cache(root, path.as_os_str()))
+            })
+        })
+}
+
+fn safe_external_directory_for_cache(root: &Path, value: &std::ffi::OsStr) -> Option<PathBuf> {
+    let path = Path::new(value);
+    if !path.is_absolute() {
+        return None;
+    }
+    let canonical = path.canonicalize().ok()?;
+    (canonical.is_dir() && !canonical.starts_with(root)).then_some(canonical)
+}
+
+fn rustup_which(root: &Path, rustup: &Path, rustup_home: &Path, tool: &str) -> Result<PathBuf, ()> {
+    let mut command = Command::new(rustup);
+    command
+        .args(["which", "--toolchain", RUST_TOOLCHAIN_BASELINE, tool])
+        .env_clear();
+    copy_safe_tool_environment(&mut command, root)?;
+    command
+        .env("RUSTUP_AUTO_INSTALL", "0")
+        .env("RUSTUP_HOME", rustup_home);
+    let output = bounded_cache_tool_output(command, CACHE_TOOL_TIMEOUT, CACHE_TOOL_OUTPUT_LIMIT)?;
+    if !output.status.success() {
+        return Err(());
+    }
+    let stdout = std::str::from_utf8(&output.stdout).map_err(|_| ())?;
+    let mut lines = stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty());
+    let path = PathBuf::from(lines.next().ok_or(())?);
+    if lines.next().is_some() || !path.is_absolute() {
+        return Err(());
+    }
+    let metadata = fs::symlink_metadata(&path).map_err(|_| ())?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(());
+    }
+    let path = path.canonicalize().map_err(|_| ())?;
+    rustup_toolchain_root(&path, rustup_home)?;
+    Ok(path)
+}
+
+fn rustup_toolchain_root(tool: &Path, rustup_home: &Path) -> Result<PathBuf, ()> {
+    let toolchains = rustup_home
+        .join("toolchains")
+        .canonicalize()
+        .map_err(|_| ())?;
+    let relative = tool.strip_prefix(&toolchains).map_err(|_| ())?;
+    let mut components = relative.components();
+    let toolchain = components.next().ok_or(())?;
+    let bin = components.next().ok_or(())?;
+    let executable = components.next().ok_or(())?;
+    if components.next().is_some() || bin.as_os_str() != "bin" || executable.as_os_str().is_empty()
+    {
+        return Err(());
+    }
+    Ok(toolchains.join(toolchain.as_os_str()))
+}
+
+fn verified_rust_version(output: &[u8], expected_commit: &str) -> bool {
+    version_field(output, "release") == Some(RUST_TOOLCHAIN_BASELINE)
+        && version_field(output, "commit-hash") == Some(expected_commit)
+        && version_field(output, "host").is_some_and(|host| !host.is_empty())
+}
+
+fn version_field<'a>(output: &'a [u8], key: &str) -> Option<&'a str> {
+    std::str::from_utf8(output).ok()?.lines().find_map(|line| {
+        let (candidate, value) = line.split_once(':')?;
+        (candidate.trim() == key).then(|| value.trim())
+    })
+}
+
+enum CacheToolStream {
+    Stdout(io::Result<Vec<u8>>),
+    Stderr(io::Result<Vec<u8>>),
+}
+
+struct CacheToolProcessTree {
+    #[cfg(unix)]
+    process_group: i32,
+    #[cfg(windows)]
+    job: usize,
+}
+
+impl CacheToolProcessTree {
+    fn attach(child: &Child) -> Result<Self, ()> {
+        #[cfg(unix)]
+        {
+            let process_group = i32::try_from(child.id()).map_err(|_| ())?;
+            Ok(Self { process_group })
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle as _;
+            use windows_sys::Win32::{
+                Foundation::CloseHandle,
+                System::JobObjects::{
+                    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+                    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+                    SetInformationJobObject,
+                },
+            };
+
+            let process_handle = child.as_raw_handle();
+            let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+            limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+            if job.is_null() {
+                return Err(());
+            }
+            let configured = unsafe {
+                SetInformationJobObject(
+                    job,
+                    JobObjectExtendedLimitInformation,
+                    (&raw const limits).cast(),
+                    std::mem::size_of_val(&limits) as u32,
+                )
+            };
+            let assigned = configured != 0
+                && unsafe { AssignProcessToJobObject(job, process_handle.cast()) } != 0;
+            if !assigned {
+                unsafe {
+                    CloseHandle(job);
+                }
+                return Err(());
+            }
+            Ok(Self { job: job as usize })
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = child;
+            Ok(Self {})
+        }
+    }
+
+    fn terminate(&self) {
+        #[cfg(unix)]
+        unsafe {
+            libc::kill(-self.process_group, libc::SIGKILL);
+        }
+        #[cfg(windows)]
+        unsafe {
+            windows_sys::Win32::System::JobObjects::TerminateJobObject(self.job as _, 1);
+        }
+    }
+}
+
+impl Drop for CacheToolProcessTree {
+    fn drop(&mut self) {
+        self.terminate();
+        #[cfg(windows)]
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(self.job as _);
+        }
+    }
+}
+
+fn bounded_cache_tool_output(
+    mut command: Command,
+    timeout: Duration,
+    limit: usize,
+) -> Result<Output, ()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.process_group(0);
+    }
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|_| ())?;
+    let process_tree = CacheToolProcessTree::attach(&child).inspect_err(|_| {
+        let _ = child.kill();
+        let _ = child.wait();
+    })?;
+    let Some(stdout) = child.stdout.take() else {
+        process_tree.terminate();
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(());
+    };
+    let Some(stderr) = child.stderr.take() else {
+        process_tree.terminate();
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(());
+    };
+    let (sender, receiver) = mpsc::channel();
+    let stdout_sender = sender.clone();
+    thread::spawn(move || {
+        let _ = stdout_sender.send(CacheToolStream::Stdout(read_cache_tool_stream(
+            stdout, limit,
+        )));
+    });
+    thread::spawn(move || {
+        let _ = sender.send(CacheToolStream::Stderr(read_cache_tool_stream(
+            stderr, limit,
+        )));
+    });
+
+    let deadline = Instant::now() + timeout;
+    let result = (|| {
+        let mut status: Option<ExitStatus> = None;
+        let mut stdout = None;
+        let mut stderr = None;
+        loop {
+            if status.is_none() {
+                status = child.try_wait().map_err(|_| ())?;
+            }
+            loop {
+                match receiver.try_recv() {
+                    Ok(CacheToolStream::Stdout(result)) => {
+                        stdout = Some(result.map_err(|_| ())?);
+                    }
+                    Ok(CacheToolStream::Stderr(result)) => {
+                        stderr = Some(result.map_err(|_| ())?);
+                    }
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        if stdout.is_none() || stderr.is_none() {
+                            return Err(());
+                        }
+                        break;
+                    }
+                }
+            }
+            if stdout.as_ref().is_some_and(|bytes| bytes.len() > limit)
+                || stderr.as_ref().is_some_and(|bytes| bytes.len() > limit)
+            {
+                return Err(());
+            }
+            if let (Some(status), Some(stdout), Some(stderr)) =
+                (status, stdout.as_ref(), stderr.as_ref())
+            {
+                return Ok(Output {
+                    status,
+                    stdout: stdout.clone(),
+                    stderr: stderr.clone(),
+                });
+            }
+            if Instant::now() >= deadline {
+                return Err(());
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    })();
+
+    process_tree.terminate();
+    if result.is_err() {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+    result
+}
+
+fn read_cache_tool_stream(mut input: impl Read, limit: usize) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    input
+        .by_ref()
+        .take((limit + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    Ok(bytes)
 }
 
 fn copy_safe_tool_environment(command: &mut Command, root: &Path) -> Result<(), ()> {
@@ -672,6 +1027,36 @@ fn finish_digest(hasher: Sha256) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn semantic_cache_fingerprints_the_effective_verified_rust_pair() {
+        let root = tempfile::tempdir().unwrap();
+        let (selection, rustc, cargo) =
+            verified_rust_toolchain_identities(root.path()).expect("verified Rust baseline");
+        assert!(matches!(
+            selection.as_str(),
+            "installed-verified-baseline" | "host-default"
+        ));
+        assert!(rustc.starts_with("sha256:"));
+        assert!(cargo.starts_with("sha256:"));
+        assert_ne!(rustc, cargo);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_tool_probe_enforces_timeout_and_output_limits() {
+        let mut stalled = Command::new("sh");
+        stalled.args(["-c", "sleep 30 & wait"]);
+        let started = Instant::now();
+        assert!(bounded_cache_tool_output(stalled, Duration::from_millis(100), 1024).is_err());
+        assert!(started.elapsed() < Duration::from_secs(3));
+
+        let mut noisy = Command::new("sh");
+        noisy.args(["-c", "while :; do printf '0123456789'; done"]);
+        let started = Instant::now();
+        assert!(bounded_cache_tool_output(noisy, Duration::from_secs(3), 1024).is_err());
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
 
     #[cfg(unix)]
     #[test]

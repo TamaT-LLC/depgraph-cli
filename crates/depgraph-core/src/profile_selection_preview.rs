@@ -59,9 +59,19 @@ pub struct LegacyProfileConfigMigration {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct ProfileToolchainGuidance {
+    pub language: ProfileLanguage,
+    pub required_baseline: String,
+    pub selection: String,
+    pub remediation: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct RepositoryProfilePlanPreview {
     pub plan: DefaultProfileSelectionPlan,
     pub config_migration: LegacyProfileConfigMigration,
+    pub toolchain_guidance: Vec<ProfileToolchainGuidance>,
 }
 
 pub fn migrate_legacy_profile_config(config: &Config) -> LegacyProfileConfigMigration {
@@ -239,6 +249,18 @@ pub fn plan_repository_profiles(
     Ok(RepositoryProfilePlanPreview {
         plan,
         config_migration: migration,
+        toolchain_guidance: language_families
+            .contains(&ProfileLanguage::Rust)
+            .then(|| ProfileToolchainGuidance {
+                language: ProfileLanguage::Rust,
+                required_baseline: "1.93.1".to_owned(),
+                selection: "installed-verified-baseline-or-host-default".to_owned(),
+                remediation:
+                    "rustup toolchain install 1.93.1 --profile minimal --component rust-src"
+                        .to_owned(),
+            })
+            .into_iter()
+            .collect(),
     })
 }
 
@@ -662,6 +684,18 @@ mod tests {
         assert_eq!(
             preview.config_migration.status,
             LegacyProfileMigrationStatus::NormalizedCandidates
+        );
+        assert_eq!(preview.toolchain_guidance.len(), 1);
+        assert_eq!(
+            preview.toolchain_guidance[0],
+            ProfileToolchainGuidance {
+                language: ProfileLanguage::Rust,
+                required_baseline: "1.93.1".to_owned(),
+                selection: "installed-verified-baseline-or-host-default".to_owned(),
+                remediation:
+                    "rustup toolchain install 1.93.1 --profile minimal --component rust-src"
+                        .to_owned(),
+            }
         );
         let candidates = preview
             .plan

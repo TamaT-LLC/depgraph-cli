@@ -12,6 +12,8 @@ const RUST_ANALYZER_VERSION: &str = "0.0.330";
 const RUST_ANALYZER_REVISION: &str = "8954b66d43225e62c92e8bbcc8500191b5cceb1e";
 const SALSA_VERSION: &str = "0.26.1";
 const TOOLCHAIN_BASELINE: &str = "1.93.1";
+const RUSTC_BASELINE_COMMIT: &str = "01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf";
+const CARGO_BASELINE_COMMIT: &str = "083ac5135f967fd9dc906ab057a2315861c7a80d";
 const HIR_INTEGRATION_POLICY: &str = "pinned-rust-analyzer-library";
 const SYSROOT_CONTRACT_VERSION: &str = "rust-src-data-tree-v1";
 const SYSROOT_COMPONENT_VERSION: &str = "1.93.1+rustc.01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf";
@@ -336,7 +338,6 @@ fn assert_profile(
         ),
         ("rust_hir_sysroot_source_layout", SYSROOT_SOURCE_LAYOUT),
         ("rust_toolchain_baseline", TOOLCHAIN_BASELINE),
-        ("rust_toolchain_probe_status", "compatible"),
         ("rust_hir_toolchain_status", "compatible"),
     ] {
         ensure!(
@@ -344,6 +345,26 @@ fn assert_profile(
             "Rust semantic profile property {field} must be {expected:?}: {properties}"
         );
     }
+    let attestation = &properties["rust_hir_toolchain_attestation"];
+    ensure!(
+        attestation["contract"] == "installed-verified-rust-toolchain-v1"
+            && attestation["status"] == "compatible"
+            && matches!(
+                attestation["selection"].as_str(),
+                Some("host-default" | "installed-verified-baseline")
+            )
+            && attestation["rustc"]["release"] == TOOLCHAIN_BASELINE
+            && attestation["rustc"]["commit_hash"] == RUSTC_BASELINE_COMMIT
+            && attestation["cargo"]["release"] == TOOLCHAIN_BASELINE
+            && attestation["cargo"]["commit_hash"] == CARGO_BASELINE_COMMIT
+            && attestation["rustc"]["host"] == attestation["cargo"]["host"]
+            && ["rustc", "cargo"].into_iter().all(|tool| {
+                attestation[tool]["sha256"].as_str().is_some_and(|digest| {
+                    digest.len() == "sha256:".len() + 64 && digest.starts_with("sha256:")
+                })
+            }),
+        "Rust semantic profile lost its exact toolchain attestation: {properties}"
+    );
     for field in [
         "build_scripts_executed",
         "proc_macros_executed",
