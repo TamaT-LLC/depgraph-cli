@@ -1,8 +1,12 @@
 use std::{
     collections::BTreeMap,
     fs,
+    io::{self, Read},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Child, Command, ExitStatus, Output, Stdio},
+    sync::mpsc,
+    thread,
+    time::{Duration, Instant},
 };
 
 use depgraph_store::{CacheKey, CacheLayer};
@@ -22,6 +26,8 @@ const CACHE_MAX_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
 const RUST_TOOLCHAIN_BASELINE: &str = "1.93.1";
 const RUSTC_BASELINE_COMMIT: &str = "01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf";
 const CARGO_BASELINE_COMMIT: &str = "083ac5135f967fd9dc906ab057a2315861c7a80d";
+const CACHE_TOOL_TIMEOUT: Duration = Duration::from_secs(5);
+const CACHE_TOOL_OUTPUT_LIMIT: usize = 64 * 1024;
 
 #[derive(Debug, Clone)]
 pub(crate) struct ScanCachePlan {
@@ -528,7 +534,7 @@ fn tool_identity_at(
     let mut command = Command::new(program);
     command.args(arguments).env_clear();
     copy_safe_tool_environment(&mut command, root)?;
-    let output = command.output().map_err(|_| ())?;
+    let output = bounded_cache_tool_output(command, CACHE_TOOL_TIMEOUT, CACHE_TOOL_OUTPUT_LIMIT)?;
     if !output.status.success()
         || output.stdout.len() > 64 * 1024
         || output.stderr.len() > 64 * 1024
@@ -641,11 +647,8 @@ fn rustup_which(root: &Path, rustup: &Path, rustup_home: &Path, tool: &str) -> R
     command
         .env("RUSTUP_AUTO_INSTALL", "0")
         .env("RUSTUP_HOME", rustup_home);
-    let output = command.output().map_err(|_| ())?;
-    if !output.status.success()
-        || output.stdout.len() > 64 * 1024
-        || output.stderr.len() > 64 * 1024
-    {
+    let output = bounded_cache_tool_output(command, CACHE_TOOL_TIMEOUT, CACHE_TOOL_OUTPUT_LIMIT)?;
+    if !output.status.success() {
         return Err(());
     }
     let stdout = std::str::from_utf8(&output.stdout).map_err(|_| ())?;
@@ -694,6 +697,200 @@ fn version_field<'a>(output: &'a [u8], key: &str) -> Option<&'a str> {
         let (candidate, value) = line.split_once(':')?;
         (candidate.trim() == key).then(|| value.trim())
     })
+}
+
+enum CacheToolStream {
+    Stdout(io::Result<Vec<u8>>),
+    Stderr(io::Result<Vec<u8>>),
+}
+
+struct CacheToolProcessTree {
+    #[cfg(unix)]
+    process_group: i32,
+    #[cfg(windows)]
+    job: usize,
+}
+
+impl CacheToolProcessTree {
+    fn attach(child: &Child) -> Result<Self, ()> {
+        #[cfg(unix)]
+        {
+            let process_group = i32::try_from(child.id()).map_err(|_| ())?;
+            Ok(Self { process_group })
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle as _;
+            use windows_sys::Win32::{
+                Foundation::CloseHandle,
+                System::JobObjects::{
+                    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+                    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+                    SetInformationJobObject,
+                },
+            };
+
+            let process_handle = child.as_raw_handle();
+            let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+            limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+            if job.is_null() {
+                return Err(());
+            }
+            let configured = unsafe {
+                SetInformationJobObject(
+                    job,
+                    JobObjectExtendedLimitInformation,
+                    (&raw const limits).cast(),
+                    std::mem::size_of_val(&limits) as u32,
+                )
+            };
+            let assigned = configured != 0
+                && unsafe { AssignProcessToJobObject(job, process_handle.cast()) } != 0;
+            if !assigned {
+                unsafe {
+                    CloseHandle(job);
+                }
+                return Err(());
+            }
+            Ok(Self { job: job as usize })
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = child;
+            Ok(Self {})
+        }
+    }
+
+    fn terminate(&self) {
+        #[cfg(unix)]
+        unsafe {
+            libc::kill(-self.process_group, libc::SIGKILL);
+        }
+        #[cfg(windows)]
+        unsafe {
+            windows_sys::Win32::System::JobObjects::TerminateJobObject(self.job as _, 1);
+        }
+    }
+}
+
+impl Drop for CacheToolProcessTree {
+    fn drop(&mut self) {
+        self.terminate();
+        #[cfg(windows)]
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(self.job as _);
+        }
+    }
+}
+
+fn bounded_cache_tool_output(
+    mut command: Command,
+    timeout: Duration,
+    limit: usize,
+) -> Result<Output, ()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.process_group(0);
+    }
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|_| ())?;
+    let process_tree = CacheToolProcessTree::attach(&child).inspect_err(|_| {
+        let _ = child.kill();
+        let _ = child.wait();
+    })?;
+    let Some(stdout) = child.stdout.take() else {
+        process_tree.terminate();
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(());
+    };
+    let Some(stderr) = child.stderr.take() else {
+        process_tree.terminate();
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(());
+    };
+    let (sender, receiver) = mpsc::channel();
+    let stdout_sender = sender.clone();
+    thread::spawn(move || {
+        let _ = stdout_sender.send(CacheToolStream::Stdout(read_cache_tool_stream(
+            stdout, limit,
+        )));
+    });
+    thread::spawn(move || {
+        let _ = sender.send(CacheToolStream::Stderr(read_cache_tool_stream(
+            stderr, limit,
+        )));
+    });
+
+    let deadline = Instant::now() + timeout;
+    let result = (|| {
+        let mut status: Option<ExitStatus> = None;
+        let mut stdout = None;
+        let mut stderr = None;
+        loop {
+            if status.is_none() {
+                status = child.try_wait().map_err(|_| ())?;
+            }
+            loop {
+                match receiver.try_recv() {
+                    Ok(CacheToolStream::Stdout(result)) => {
+                        stdout = Some(result.map_err(|_| ())?);
+                    }
+                    Ok(CacheToolStream::Stderr(result)) => {
+                        stderr = Some(result.map_err(|_| ())?);
+                    }
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        if stdout.is_none() || stderr.is_none() {
+                            return Err(());
+                        }
+                        break;
+                    }
+                }
+            }
+            if stdout.as_ref().is_some_and(|bytes| bytes.len() > limit)
+                || stderr.as_ref().is_some_and(|bytes| bytes.len() > limit)
+            {
+                return Err(());
+            }
+            if let (Some(status), Some(stdout), Some(stderr)) =
+                (status, stdout.as_ref(), stderr.as_ref())
+            {
+                return Ok(Output {
+                    status,
+                    stdout: stdout.clone(),
+                    stderr: stderr.clone(),
+                });
+            }
+            if Instant::now() >= deadline {
+                return Err(());
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    })();
+
+    process_tree.terminate();
+    if result.is_err() {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+    result
+}
+
+fn read_cache_tool_stream(mut input: impl Read, limit: usize) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    input
+        .by_ref()
+        .take((limit + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    Ok(bytes)
 }
 
 fn copy_safe_tool_environment(command: &mut Command, root: &Path) -> Result<(), ()> {
@@ -843,6 +1040,22 @@ mod tests {
         assert!(rustc.starts_with("sha256:"));
         assert!(cargo.starts_with("sha256:"));
         assert_ne!(rustc, cargo);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_tool_probe_enforces_timeout_and_output_limits() {
+        let mut stalled = Command::new("sh");
+        stalled.args(["-c", "sleep 30 & wait"]);
+        let started = Instant::now();
+        assert!(bounded_cache_tool_output(stalled, Duration::from_millis(100), 1024).is_err());
+        assert!(started.elapsed() < Duration::from_secs(3));
+
+        let mut noisy = Command::new("sh");
+        noisy.args(["-c", "while :; do printf '0123456789'; done"]);
+        let started = Instant::now();
+        assert!(bounded_cache_tool_output(noisy, Duration::from_secs(3), 1024).is_err());
+        assert!(started.elapsed() < Duration::from_secs(3));
     }
 
     #[cfg(unix)]
