@@ -4349,7 +4349,7 @@ effective_package_instances(id) AS (
       JOIN runtime_nodes AS node ON node.session_id=layers.session_id
      WHERE json_extract(node.raw_json, '$.kind')='package_instance'
 )
-SELECT COUNT(*) FROM effective_package_instances"
+SELECT COUNT(DISTINCT id) FROM effective_package_instances"
     );
     connection
         .query_row(&sql, [scan_id], |row| row.get(0))
