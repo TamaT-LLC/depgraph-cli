@@ -7,9 +7,12 @@ use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use super::{Store, ensure_scan_staging, incremental::scan_is_semantic_noop_overlay};
+use super::{
+    CoverageRecord, DiagnosticRecord, Store, ensure_scan_staging,
+    incremental::scan_is_semantic_noop_overlay, load_diagnostics, promote_completed_snapshot,
+};
 
-pub const CACHE_CONTRACT_VERSION: u32 = 1;
+pub const CACHE_CONTRACT_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "lowercase")]
@@ -117,6 +120,28 @@ pub struct CacheEntryCounts {
     pub syntax: u64,
     pub semantic: u64,
     pub build: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ValidatedScanCacheHit {
+    snapshot_id: String,
+    data_version: i64,
+    coverage: CoverageRecord,
+    diagnostics: Vec<DiagnosticRecord>,
+}
+
+impl ValidatedScanCacheHit {
+    pub fn snapshot_id(&self) -> &str {
+        &self.snapshot_id
+    }
+
+    pub fn coverage(&self) -> &CoverageRecord {
+        &self.coverage
+    }
+
+    pub fn diagnostics(&self) -> &[DiagnosticRecord] {
+        &self.diagnostics
+    }
 }
 
 #[derive(Debug)]
@@ -254,6 +279,246 @@ impl Store {
             "validated",
             Some(entry.snapshot_id),
         ))
+    }
+
+    /// Validates a semantic scan-cache entry once and correlates its syntax
+    /// provenance without re-hashing the same completed graph.
+    ///
+    /// The returned proof is bound to SQLite's connection data version. A
+    /// different connection changing the store before promotion invalidates
+    /// the proof instead of allowing a time-of-check/time-of-use cache replay.
+    pub fn lookup_scan_cache(
+        &mut self,
+        syntax: &CacheKey,
+        semantic: &CacheKey,
+        scan_id: &str,
+    ) -> Result<Option<ValidatedScanCacheHit>> {
+        syntax.validate()?;
+        semantic.validate()?;
+        validate_context(syntax.layer, Some(scan_id), None)?;
+        validate_context(semantic.layer, Some(scan_id), None)?;
+        if syntax.layer != CacheLayer::Syntax
+            || semantic.layer != CacheLayer::Semantic
+            || semantic.dimensions.get("syntax_key") != Some(&syntax.key)
+        {
+            bail!("scan cache keys do not form a closed syntax/semantic pair");
+        }
+
+        let Some(semantic_entry) =
+            load_cache_entry(&self.connection, CacheLayer::Semantic, &semantic.key)?
+        else {
+            let _ = self.lookup_snapshot_cache(syntax, Some(scan_id), None)?;
+            self.record_cache_event(
+                Some(scan_id),
+                None,
+                CacheLayer::Semantic,
+                Some(&semantic.key),
+                "miss",
+                "not-found",
+            )?;
+            return Ok(None);
+        };
+        if let Some(reason) = self.cache_entry_metadata_rejection(semantic, &semantic_entry)? {
+            let _ = self.lookup_snapshot_cache(syntax, Some(scan_id), None)?;
+            self.record_cache_event(
+                Some(scan_id),
+                None,
+                CacheLayer::Semantic,
+                Some(&semantic.key),
+                "reject",
+                &reason,
+            )?;
+            return Ok(None);
+        }
+        if self
+            .validate_snapshot_for_layer(CacheLayer::Semantic, &semantic_entry.snapshot_id)
+            .is_err()
+        {
+            let _ = self.lookup_snapshot_cache(syntax, Some(scan_id), None)?;
+            self.record_cache_event(
+                Some(scan_id),
+                None,
+                CacheLayer::Semantic,
+                Some(&semantic.key),
+                "reject",
+                "snapshot-integrity-failed",
+            )?;
+            return Ok(None);
+        }
+        let semantic_payload_digest =
+            self.cache_payload_digest(CacheLayer::Semantic, &semantic_entry.snapshot_id)?;
+        if semantic_payload_digest != semantic_entry.payload_digest {
+            let _ = self.lookup_snapshot_cache(syntax, Some(scan_id), None)?;
+            self.record_cache_event(
+                Some(scan_id),
+                None,
+                CacheLayer::Semantic,
+                Some(&semantic.key),
+                "reject",
+                "payload-integrity-failed",
+            )?;
+            return Ok(None);
+        }
+        let snapshot = self
+            .completed_snapshot(&semantic_entry.snapshot_id)?
+            .context("validated cache snapshot disappeared while loading its outcome")?;
+        let (coverage, diagnostics) =
+            if scan_is_semantic_noop_overlay(&self.connection, &snapshot.scan_id)? {
+                let graph = self.load_completed_snapshot(&semantic_entry.snapshot_id)?;
+                (graph.coverage, graph.diagnostics)
+            } else {
+                let coverage_json: String = self.connection.query_row(
+                    "SELECT json FROM coverage WHERE scan_id=?1",
+                    [&snapshot.scan_id],
+                    |row| row.get(0),
+                )?;
+                (
+                    serde_json::from_str(&coverage_json)
+                        .context("cached scan coverage is not valid JSON")?,
+                    load_diagnostics(&self.connection, &snapshot.scan_id)?,
+                )
+            };
+
+        match load_cache_entry(&self.connection, CacheLayer::Syntax, &syntax.key)? {
+            None => self.record_cache_event(
+                Some(scan_id),
+                None,
+                CacheLayer::Syntax,
+                Some(&syntax.key),
+                "miss",
+                "not-found",
+            )?,
+            Some(syntax_entry) => {
+                let rejection = self
+                    .cache_entry_metadata_rejection(syntax, &syntax_entry)?
+                    .or_else(|| {
+                        (syntax_entry.snapshot_id != semantic_entry.snapshot_id)
+                            .then(|| "snapshot-mismatch".to_owned())
+                    })
+                    .or_else(|| {
+                        self.cache_payload_digest(CacheLayer::Syntax, &syntax_entry.snapshot_id)
+                            .map_or_else(
+                                |_| Some("snapshot-integrity-failed".to_owned()),
+                                |digest| {
+                                    (digest != syntax_entry.payload_digest)
+                                        .then(|| "payload-integrity-failed".to_owned())
+                                },
+                            )
+                    });
+                if let Some(reason) = rejection {
+                    self.record_cache_event(
+                        Some(scan_id),
+                        None,
+                        CacheLayer::Syntax,
+                        Some(&syntax.key),
+                        "reject",
+                        &reason,
+                    )?;
+                } else {
+                    self.touch_cache_entry(CacheLayer::Syntax, &syntax.key)?;
+                    self.record_cache_event(
+                        Some(scan_id),
+                        None,
+                        CacheLayer::Syntax,
+                        Some(&syntax.key),
+                        "hit",
+                        "validated-by-semantic-cache",
+                    )?;
+                }
+            }
+        }
+        self.touch_cache_entry(CacheLayer::Semantic, &semantic.key)?;
+        self.record_cache_event(
+            Some(scan_id),
+            None,
+            CacheLayer::Semantic,
+            Some(&semantic.key),
+            "hit",
+            "validated",
+        )?;
+        let data_version = self
+            .connection
+            .query_row("PRAGMA data_version", [], |row| row.get(0))?;
+        Ok(Some(ValidatedScanCacheHit {
+            snapshot_id: semantic_entry.snapshot_id,
+            data_version,
+            coverage,
+            diagnostics,
+        }))
+    }
+
+    /// Publishes a cache hit by adding a source alias to the already validated,
+    /// immutable completed snapshot. No repository-complete graph rows are
+    /// cloned into the new scan attempt.
+    pub fn promote_validated_scan_cache_hit(
+        &mut self,
+        scan_id: &str,
+        hit: &ValidatedScanCacheHit,
+    ) -> Result<()> {
+        let observed_data_version: i64 =
+            self.connection
+                .query_row("PRAGMA data_version", [], |row| row.get(0))?;
+        if observed_data_version != hit.data_version {
+            bail!("cache store changed after validation");
+        }
+        let source = self
+            .completed_snapshot(&hit.snapshot_id)?
+            .context("validated cache snapshot disappeared before promotion")?;
+        if source.source_kind != "scan" || source.status != "completed" {
+            bail!("validated cache snapshot is not a completed scan");
+        }
+
+        let tx = self.connection.transaction()?;
+        ensure_scan_staging(&tx, scan_id)?;
+        let (mutation_count, populated_tables): (i64, i64) = tx.query_row(
+            "SELECT s.mutation_count,
+                    (SELECT COUNT(*) FROM profiles WHERE scan_id=s.id)
+                  + (SELECT COUNT(*) FROM nodes WHERE scan_id=s.id)
+                  + (SELECT COUNT(*) FROM sites WHERE scan_id=s.id)
+                  + (SELECT COUNT(*) FROM edges WHERE scan_id=s.id)
+                  + (SELECT COUNT(*) FROM evidence WHERE scan_id=s.id)
+                  + (SELECT COUNT(*) FROM diagnostics WHERE scan_id=s.id)
+                  + (SELECT COUNT(*) FROM file_coverage WHERE scan_id=s.id)
+                  + (SELECT COUNT(*) FROM coverage WHERE scan_id=s.id)
+                  + (SELECT COUNT(*) FROM profile_coverage WHERE scan_id=s.id)
+                  + (SELECT COUNT(*) FROM adapter_logs WHERE scan_id=s.id)
+               FROM scans s WHERE s.id=?1",
+            [scan_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if mutation_count != 0 || populated_tables != 0 {
+            bail!("cache target scan changed before promotion");
+        }
+        let source_project_code_executed: bool = tx.query_row(
+            "SELECT project_code_executed FROM scans WHERE id=?1",
+            [&source.scan_id],
+            |row| row.get(0),
+        )?;
+        if source_project_code_executed {
+            bail!("a scan that executed project code cannot be promoted in safe mode");
+        }
+        let completed_at = now();
+        tx.execute(
+            "UPDATE scans
+                SET status='completed', completed_at=?2,
+                    project_code_executed=?3
+              WHERE id=?1",
+            params![scan_id, completed_at, source_project_code_executed],
+        )?;
+        tx.execute(
+            "INSERT INTO snapshot_sources(
+                source_kind, source_attempt_id, snapshot_id, promoted_at
+             ) VALUES ('scan', ?1, ?2, ?3)",
+            params![scan_id, hit.snapshot_id, completed_at],
+        )?;
+        tx.execute(
+            "INSERT INTO current_successful(singleton, scan_id) VALUES (1, ?1)
+             ON CONFLICT(singleton) DO UPDATE SET scan_id=excluded.scan_id",
+            [scan_id],
+        )?;
+        promote_completed_snapshot(&tx, &hit.snapshot_id)?;
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn store_snapshot_cache(
@@ -467,17 +732,8 @@ impl Store {
         expected: &CacheKey,
         entry: &StoredCacheEntry,
     ) -> Result<Option<String>> {
-        if entry.contract_version != CACHE_CONTRACT_VERSION {
-            return Ok(Some("unsupported-contract-version".to_owned()));
-        }
-        let dimensions: BTreeMap<String, String> =
-            match serde_json::from_str(&entry.dimensions_json) {
-                Ok(value) => value,
-                Err(_) => return Ok(Some("invalid-dimensions".to_owned())),
-            };
-        let observed = CacheKey::new(expected.layer, dimensions);
-        if observed.key != expected.key || observed.dimensions != expected.dimensions {
-            return Ok(Some("identity-mismatch".to_owned()));
+        if let Some(reason) = self.cache_entry_metadata_rejection(expected, entry)? {
+            return Ok(Some(reason));
         }
         if self
             .validate_snapshot_for_layer(expected.layer, &entry.snapshot_id)
@@ -490,6 +746,35 @@ impl Store {
             return Ok(Some("payload-integrity-failed".to_owned()));
         }
         Ok(None)
+    }
+
+    fn cache_entry_metadata_rejection(
+        &self,
+        expected: &CacheKey,
+        entry: &StoredCacheEntry,
+    ) -> Result<Option<String>> {
+        if entry.contract_version != CACHE_CONTRACT_VERSION {
+            return Ok(Some("unsupported-contract-version".to_owned()));
+        }
+        let dimensions: BTreeMap<String, String> =
+            match serde_json::from_str(&entry.dimensions_json) {
+                Ok(value) => value,
+                Err(_) => return Ok(Some("invalid-dimensions".to_owned())),
+            };
+        let observed = CacheKey::new(expected.layer, dimensions);
+        if observed.key != expected.key || observed.dimensions != expected.dimensions {
+            return Ok(Some("identity-mismatch".to_owned()));
+        }
+        Ok(None)
+    }
+
+    fn touch_cache_entry(&self, layer: CacheLayer, key: &str) -> Result<()> {
+        let table = layer.table();
+        self.connection.execute(
+            &format!("UPDATE {table} SET last_used_at=?2, hit_count=hit_count+1 WHERE key=?1"),
+            params![key, now()],
+        )?;
+        Ok(())
     }
 
     fn validate_snapshot_for_layer(&self, layer: CacheLayer, snapshot_id: &str) -> Result<()> {
@@ -515,32 +800,18 @@ impl Store {
     }
 
     fn cache_payload_digest(&self, layer: CacheLayer, snapshot_id: &str) -> Result<String> {
-        if layer == CacheLayer::Syntax {
-            let snapshot = self
-                .completed_snapshot(snapshot_id)?
-                .context("syntax cache snapshot was not found")?;
-            return Ok(stable_id_from_value(
-                "syntax-cache-payload",
-                &json!({
-                    "schema": "syntax-cache-provenance-v1",
-                    "source_kind": snapshot.source_kind,
-                    "status": snapshot.status,
-                }),
-            ));
-        }
-        let snapshot = self.load_completed_snapshot(snapshot_id)?;
+        let snapshot = self
+            .completed_snapshot(snapshot_id)?
+            .context("cache snapshot was not found")?;
         Ok(stable_id_from_value(
-            "cache-payload",
+            "cache-payload-reference",
             &json!({
-                "schema": "cache-payload-v1",
-                "profiles": snapshot.profiles,
-                "nodes": snapshot.nodes,
-                "sites": snapshot.sites,
-                "edges": snapshot.edges,
-                "evidence": snapshot.evidence,
-                "diagnostics": snapshot.diagnostics,
-                "file_coverage": snapshot.file_coverage,
-                "coverage": snapshot.coverage,
+                "schema": "cache-payload-reference-v2",
+                "contract_version": CACHE_CONTRACT_VERSION,
+                "layer": layer.as_str(),
+                "snapshot_id": snapshot.id,
+                "source_kind": snapshot.source_kind,
+                "status": snapshot.status,
             }),
         ))
     }
@@ -792,6 +1063,18 @@ mod tests {
         )
     }
 
+    fn scan_cache_keys() -> (CacheKey, CacheKey) {
+        let syntax = cache_key(CacheLayer::Syntax, "sha256:syntax");
+        let semantic = CacheKey::new(
+            CacheLayer::Semantic,
+            BTreeMap::from([
+                ("input".to_owned(), "sha256:semantic".to_owned()),
+                ("syntax_key".to_owned(), syntax.key.clone()),
+            ]),
+        );
+        (syntax, semantic)
+    }
+
     #[test]
     fn cache_hit_clones_a_validated_completed_graph() {
         let root = tempfile::tempdir().unwrap();
@@ -846,6 +1129,161 @@ mod tests {
                 build: 0
             }
         );
+    }
+
+    #[test]
+    fn validated_scan_cache_hit_promotes_without_cloning_graph_rows() {
+        let root = tempfile::tempdir().unwrap();
+        let mut store = Store::open_in_memory().unwrap();
+        let snapshot_id = complete_fixture_scan(&mut store, "source", root.path());
+        let (syntax, semantic) = scan_cache_keys();
+        store
+            .store_snapshot_cache(&syntax, &snapshot_id, Some("source"), None)
+            .unwrap();
+        store
+            .store_snapshot_cache(&semantic, &snapshot_id, Some("source"), None)
+            .unwrap();
+
+        store.start_scan("target", root.path(), false).unwrap();
+        let hit = store
+            .lookup_scan_cache(&syntax, &semantic, "target")
+            .unwrap()
+            .expect("semantic cache hit");
+        assert_eq!(hit.snapshot_id(), snapshot_id);
+        store
+            .promote_validated_scan_cache_hit("target", &hit)
+            .unwrap();
+
+        let copied_rows: i64 = store
+            .connection
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM profiles WHERE scan_id='target')
+                  + (SELECT COUNT(*) FROM nodes WHERE scan_id='target')
+                  + (SELECT COUNT(*) FROM sites WHERE scan_id='target')
+                  + (SELECT COUNT(*) FROM edges WHERE scan_id='target')
+                  + (SELECT COUNT(*) FROM evidence WHERE scan_id='target')
+                  + (SELECT COUNT(*) FROM diagnostics WHERE scan_id='target')
+                  + (SELECT COUNT(*) FROM file_coverage WHERE scan_id='target')
+                  + (SELECT COUNT(*) FROM coverage WHERE scan_id='target')
+                  + (SELECT COUNT(*) FROM profile_coverage WHERE scan_id='target')
+                  + (SELECT COUNT(*) FROM adapter_logs WHERE scan_id='target')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(copied_rows, 0);
+        assert_eq!(
+            store
+                .snapshot_id_for_source("scan", "target")
+                .unwrap()
+                .as_deref(),
+            Some(snapshot_id.as_str())
+        );
+        assert_eq!(
+            store.latest_successful_id().unwrap().as_deref(),
+            Some("target")
+        );
+        let source = store.load_snapshot("source").unwrap();
+        let target = store.load_snapshot("target").unwrap();
+        assert_eq!(source.profiles, target.profiles);
+        assert_eq!(source.nodes, target.nodes);
+        assert_eq!(source.sites, target.sites);
+        assert_eq!(source.edges, target.edges);
+        assert_eq!(source.evidence, target.evidence);
+        assert_eq!(source.diagnostics, target.diagnostics);
+        assert_eq!(source.file_coverage, target.file_coverage);
+        assert_eq!(source.adapter_logs, target.adapter_logs);
+        assert_eq!(source.coverage, target.coverage);
+        let events = store.cache_events_for_scan("target").unwrap();
+        assert!(events.iter().any(|event| {
+            event.layer == CacheLayer::Syntax
+                && event.outcome == "hit"
+                && event.reason == "validated-by-semantic-cache"
+        }));
+        assert!(events.iter().any(|event| {
+            event.layer == CacheLayer::Semantic
+                && event.outcome == "hit"
+                && event.reason == "validated"
+        }));
+    }
+
+    #[test]
+    fn validated_scan_cache_hit_rejects_an_intervening_database_write() {
+        let root = tempfile::tempdir().unwrap();
+        let database = root.path().join("cache-race.sqlite");
+        let mut store = Store::open(&database).unwrap();
+        let snapshot_id = complete_fixture_scan(&mut store, "source", root.path());
+        let (syntax, semantic) = scan_cache_keys();
+        store
+            .store_snapshot_cache(&syntax, &snapshot_id, Some("source"), None)
+            .unwrap();
+        store
+            .store_snapshot_cache(&semantic, &snapshot_id, Some("source"), None)
+            .unwrap();
+
+        store.start_scan("target", root.path(), false).unwrap();
+        let hit = store
+            .lookup_scan_cache(&syntax, &semantic, "target")
+            .unwrap()
+            .expect("semantic cache hit");
+        let other = rusqlite::Connection::open(&database).unwrap();
+        other
+            .execute(
+                "INSERT INTO cache_events(
+                    scan_id, layer, cache_key, outcome, reason, created_at
+                 ) VALUES ('target', 'semantic', NULL, 'miss', 'concurrent-write', ?1)",
+                [now()],
+            )
+            .unwrap();
+
+        let error = store
+            .promote_validated_scan_cache_hit("target", &hit)
+            .unwrap_err();
+        assert!(error.to_string().contains("changed after validation"));
+        assert_eq!(
+            store.snapshot_id_for_source("scan", "target").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn scan_cache_pair_rejects_corrupt_semantic_payload() {
+        let root = tempfile::tempdir().unwrap();
+        let mut store = Store::open_in_memory().unwrap();
+        let snapshot_id = complete_fixture_scan(&mut store, "source", root.path());
+        let (syntax, semantic) = scan_cache_keys();
+        store
+            .store_snapshot_cache(&syntax, &snapshot_id, Some("source"), None)
+            .unwrap();
+        store
+            .store_snapshot_cache(&semantic, &snapshot_id, Some("source"), None)
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE semantic_cache
+                    SET payload_digest='cache-payload-reference:sha256:broken'
+                  WHERE key=?1",
+                [&semantic.key],
+            )
+            .unwrap();
+
+        store
+            .start_scan("corrupt-semantic", root.path(), false)
+            .unwrap();
+        assert!(
+            store
+                .lookup_scan_cache(&syntax, &semantic, "corrupt-semantic")
+                .unwrap()
+                .is_none()
+        );
+        let events = store.cache_events_for_scan("corrupt-semantic").unwrap();
+        assert!(events.iter().any(|event| {
+            event.layer == CacheLayer::Semantic
+                && event.outcome == "reject"
+                && event.reason == "payload-integrity-failed"
+        }));
     }
 
     #[test]

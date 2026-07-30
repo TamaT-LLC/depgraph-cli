@@ -18,7 +18,7 @@ updated: 2026-07-26
 | --- | --- |
 | Product / Rust / Go / Web adapter | `0.4.0` |
 | NDJSON protocol / graph schema | `1.0` |
-| SQLite store / scan cache / impact query cache | `13` / `1` / `1` |
+| SQLite store / scan cache / impact query cache | `13` / `2` / `1` |
 | Snapshot diff / policy / runtime trace / GraphML | `1.0` |
 | Incremental plan / daemon status | `incremental-plan-v1` / `daemon-status-v1` |
 | Worker incremental request / delta | `worker-delta-request-v1` / `worker-delta-v1` |
@@ -1194,7 +1194,7 @@ Issue #77のcache contract v1は`cache:sha256:<digest>`をstable keyとし、key
 - `semantic`: syntax keyにmanifest / lock / config、dependency snapshot、adapter / protocol、toolchain / framework、profile、generated artifact fingerprintを加える。Go external dependency snapshotをworker実行前に同じcontractで再導出できない場合はsyntax cacheだけを許可し、semanticは`dependency-fingerprint-requires-rescan`でfail closedとする。
 - `build`: source root digest、command plan、adapter / observer version、toolchain executable / version、profile、environment key set、validated generated artifact fingerprintを含む。明示consent下でpromoteされたbuild snapshotだけを保存する。
 
-schema v10は`syntax_cache`、`semantic_cache`、`build_cache`を別tableとし、contract version、canonical dimensions、completed snapshot、payload digest、access metadataを保持する。`cache_events`はscan/build attemptごとの`hit / miss / reject / stored`と固定reasonを記録する。semantic/build hitはcache row identity、contract version、completed snapshot identity、canonical graph payload digestを再計算し、全検証成功時だけ利用する。unknown version、tamper、stale key、payload conflictはoverwriteやbest-effort decodeをせずmiss/rejectとしてworkerへfallbackする。semantic hitもfresh scan attemptへtransactional copyした後に通常のgraph validation、strict policy、completed promotionを通す。cache eventはgraph、diagnostic、snapshot identityへ混ぜないため、`--no-cache`結果とcache hit結果のcanonical graphは一致する。
+schema v10は`syntax_cache`、`semantic_cache`、`build_cache`を別tableとし、contract version、canonical dimensions、completed snapshot、payload digest、access metadataを保持する。`cache_events`はscan/build attemptごとの`hit / miss / reject / stored`と固定reasonを記録する。Issue #260のscan cache contract v2では、semantic hitのcompleted snapshotについてcontent-addressed graph integrityを1回だけ検証し、syntax / semantic cache rowを同じsnapshot identityへ相関させる。通常のsafe scanは検証済みsnapshotをfresh scan attemptへtransactional aliasとして昇格し、全graph rowの再複製を行わない。検証後に別SQLite connectionが書き込んだ場合は`PRAGMA data_version` proofを無効化してworkerへfallbackする。strict modeとarchitecture policy指定時は従来どおりfresh stagingへcloneし、通常のvalidation / policy / promotionを通す。unknown version、tamper、stale key、payload conflictはoverwriteやbest-effort decodeをせずmiss/rejectとしてworkerへfallbackする。cache eventはgraph、diagnostic、snapshot identityへ混ぜないため、`--no-cache`結果とcache hit結果のcanonical graphは一致する。
 
 schema v13の`impact_query_cache`は、completed snapshot ID、selector、canonical
 depth / profile / condition / phase / session / environment / traversal budgetを
@@ -1611,6 +1611,14 @@ evidence gateも同じreportで維持する。pull request CIと
 tag releaseは同じ10,000-file reportをartifact化し、release asset検証jobが
 schema、commit、全必須metric、conservation、総合passを再検証してから公開へ
 進む。fixture件数やdependency site / coverageを性能のために緩和しない。
+
+Issue #260の`depgraph-cache-hit-benchmark-v1`は100 / 1,000 / 10,000 source
+fileの3規模でsemantic cache hitと`--no-cache`を3回ずつ対にして計測する。
+各規模のmedian cache hitはbypass medianより5%以上高速でなければならない。
+hit / bypassのcompleted status、safe-mode、cache event、coverage、canonical
+graph digestの一致を検証し、raw sampleと改善率を
+`dist/cache-hit-benchmark-report.json`へ保存する。PR CIとrelease gateは既存の
+10,000-file reportと同じartifact closureでこのreportを検証する。
 
 性能のために dependency site を省略してはならない。
 

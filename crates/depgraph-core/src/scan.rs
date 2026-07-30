@@ -269,73 +269,90 @@ pub async fn run_scan_with_cache_mode_and_cancellation(
                 record_cache_rejection(store, &scan_id, reason)?;
             }
             ScanCachePreparation::Ready(plan) => {
-                let _ = store.lookup_snapshot_cache(&plan.syntax, Some(&scan_id), None)?;
                 if let Some(semantic_key) = &plan.semantic {
-                    let semantic =
-                        store.lookup_snapshot_cache(semantic_key, Some(&scan_id), None)?;
-                    if semantic.outcome == "hit"
-                        && let Some(snapshot_id) = semantic.snapshot_id
+                    if let Some(hit) =
+                        store.lookup_scan_cache(&plan.syntax, semantic_key, &scan_id)?
                     {
-                        match store.clone_completed_scan_into_staging(&snapshot_id, &scan_id) {
+                        if cancellation.is_cancelled() {
+                            return cancel_scan(store, &scan_id);
+                        }
+                        let profile_plan_unchanged = plan_repository_profiles(&root, config, None)
+                            .is_ok_and(|preview| preview.plan.plan_id == profile_plan.plan_id);
+                        if !profile_plan_unchanged {
+                            store.clone_completed_scan_into_staging(hit.snapshot_id(), &scan_id)?;
+                            record_cache_rejection(
+                                store,
+                                &scan_id,
+                                "profile-planning-input-changed-before-cache-hit-promotion",
+                            )?;
+                            add_core_diagnostic(
+                                store,
+                                &scan_id,
+                                "error",
+                                "profile-planning-input-changed",
+                                "profile planning input changed before the cached scan could be promoted",
+                                "profile-planning-input-changed-before-cache-hit-promotion",
+                            )?;
+                            store.mark_coverage_incomplete(
+                                &scan_id,
+                                "profile-planning-input-changed-before-cache-hit-promotion",
+                            )?;
+                            return finish_non_promoted_scan(
+                                store,
+                                &scan_id,
+                                "partial",
+                                Some("profile planning input changed before cache-hit promotion"),
+                                3,
+                                &cancellation,
+                            );
+                        }
+                        let cached_coverage = hit.coverage();
+                        if !config.policy.rules.is_empty()
+                            || (strict && violates_strict_policy(cached_coverage, config))
+                        {
+                            store.clone_completed_scan_into_staging(hit.snapshot_id(), &scan_id)?;
+                            return complete_scan(
+                                store,
+                                &scan_id,
+                                strict,
+                                config,
+                                None,
+                                &cancellation,
+                            );
+                        }
+                        let mut outcome = ScanOutcome {
+                            scan_id: scan_id.clone(),
+                            status: "completed".to_owned(),
+                            exit_code: 0,
+                            coverage: cached_coverage.clone(),
+                            diagnostics: hit.diagnostics().to_vec(),
+                            cache_events: Vec::new(),
+                            policy: None,
+                        };
+                        match store.promote_validated_scan_cache_hit(&scan_id, &hit) {
                             Ok(()) => {
-                                if cancellation.is_cancelled() {
-                                    return cancel_scan(store, &scan_id);
-                                }
-                                let profile_plan_unchanged = plan_repository_profiles(
-                                    &root, config, None,
-                                )
-                                .is_ok_and(|preview| preview.plan.plan_id == profile_plan.plan_id);
-                                if !profile_plan_unchanged {
-                                    record_cache_rejection(
-                                        store,
-                                        &scan_id,
-                                        "profile-planning-input-changed-before-cache-hit-promotion",
-                                    )?;
-                                    add_core_diagnostic(
-                                        store,
-                                        &scan_id,
-                                        "error",
-                                        "profile-planning-input-changed",
-                                        "profile planning input changed before the cached scan could be promoted",
-                                        "profile-planning-input-changed-before-cache-hit-promotion",
-                                    )?;
-                                    store.mark_coverage_incomplete(
-                                        &scan_id,
-                                        "profile-planning-input-changed-before-cache-hit-promotion",
-                                    )?;
-                                    return finish_non_promoted_scan(
-                                        store,
-                                        &scan_id,
-                                        "partial",
-                                        Some(
-                                            "profile planning input changed before cache-hit promotion",
-                                        ),
-                                        3,
-                                        &cancellation,
-                                    );
-                                }
-                                return complete_scan(
-                                    store,
-                                    &scan_id,
-                                    strict,
-                                    config,
-                                    None,
-                                    &cancellation,
-                                );
+                                outcome.cache_events = store.cache_events_for_scan(&scan_id)?;
+                                return Ok(outcome);
                             }
-                            Err(_) => {
+                            Err(error) => {
+                                tracing::warn!(
+                                    scan_id,
+                                    error = %error,
+                                    "validated semantic cache hit could not be promoted"
+                                );
                                 store.record_cache_event(
                                     Some(&scan_id),
                                     None,
                                     CacheLayer::Semantic,
                                     Some(&semantic_key.key),
                                     "reject",
-                                    "clone-validation-failed",
+                                    "promotion-proof-invalidated",
                                 )?;
                             }
                         }
                     }
                 } else {
+                    let _ = store.lookup_snapshot_cache(&plan.syntax, Some(&scan_id), None)?;
                     store.record_cache_event(
                         Some(&scan_id),
                         None,

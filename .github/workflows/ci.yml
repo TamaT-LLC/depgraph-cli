@@ -115,7 +115,9 @@ jobs:
       DEPGRAPH_QUERY_SAMPLES: "5"
       DEPGRAPH_NOISE_ALLOWANCE_PERCENT: "20"
       DEPGRAPH_ALLOWED_OUTLIERS: "1"
+      DEPGRAPH_CACHE_HIT_MIN_IMPROVEMENT_PERCENT: "5"
       DEPGRAPH_BENCH_REPORT: "dist/benchmark-report.json"
+      DEPGRAPH_CACHE_HIT_REPORT: "dist/cache-hit-benchmark-report.json"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - run: rustup toolchain install 1.93.1 --profile minimal
@@ -130,13 +132,15 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24.18.0
-      - run: node --test scripts/tests/benchmark.test.mjs
+      - run: node --test scripts/tests/benchmark.test.mjs scripts/tests/cache-hit-benchmark.test.mjs
       - run: scripts/benchmark-mvp.sh
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
         with:
           name: benchmark-report-${{ github.sha }}
-          path: dist/benchmark-report.json
+          path: |
+            dist/benchmark-report.json
+            dist/cache-hit-benchmark-report.json
           if-no-files-found: error
 
   integration:
