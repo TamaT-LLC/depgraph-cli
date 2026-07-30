@@ -5237,6 +5237,71 @@ fn query_commands_report_traversal_evidence_cycles_doctor_and_unresolved_sites()
     assert_eq!(doctor["latest_attempt"]["status"], "completed");
     assert_eq!(doctor["latest_attempt"]["profile_count"], 1);
     assert_eq!(doctor["detail_command"], "depgraph doctor --details");
+    assert_eq!(doctor["diagnostic_root"]["source"], "latest-attempt");
+    assert_eq!(
+        doctor["diagnostic_root"]["path"],
+        root.path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .as_ref()
+    );
+    let doctor_from_scan_root = Command::cargo_bin("depgraph")
+        .unwrap()
+        .current_dir(root.path())
+        .args(["--store", store.to_str().unwrap()])
+        .args(["doctor", "--json"])
+        .output()
+        .unwrap();
+    assert!(doctor_from_scan_root.status.success());
+    let doctor_from_scan_root: serde_json::Value =
+        serde_json::from_slice(&doctor_from_scan_root.stdout).unwrap();
+    assert_eq!(
+        doctor["diagnostic_root"],
+        doctor_from_scan_root["diagnostic_root"]
+    );
+    assert_eq!(doctor["workers"], doctor_from_scan_root["workers"]);
+
+    let repository_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .canonicalize()
+        .unwrap();
+    let explicit_source_root = Command::cargo_bin("depgraph")
+        .unwrap()
+        .current_dir(root.path())
+        .args(["--store", store.to_str().unwrap()])
+        .args([
+            "doctor",
+            "--root",
+            repository_root.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(explicit_source_root.status.success());
+    let explicit_source_root: serde_json::Value =
+        serde_json::from_slice(&explicit_source_root.stdout).unwrap();
+    assert_eq!(
+        explicit_source_root["diagnostic_root"],
+        serde_json::json!({
+            "path": repository_root.to_string_lossy(),
+            "source": "explicit"
+        })
+    );
+    for worker in explicit_source_root["workers"].as_array().unwrap() {
+        if worker["command"].is_string() && worker["integrity"] == "development-unverified" {
+            assert_eq!(worker["root_launch_allowed"], false);
+            assert!(
+                worker["root_launch_error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("inside the scan root")
+            );
+        }
+    }
     let details = query(&["doctor", "--details", "--json"]);
     assert!(details["latest_attempt"]["profiles"].is_array());
 

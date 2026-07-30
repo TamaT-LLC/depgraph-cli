@@ -405,8 +405,9 @@ pub use scan::{
 use worker::{
     AdapterKind, RUST_BACKEND_KIND, RUST_BACKEND_REVISION, RUST_BACKEND_SALSA_VERSION,
     RUST_BACKEND_VERSION, is_security_error, locate_worker, probe_toolchain_version,
-    probe_worker_version, verify_release_artifact, verify_release_runtime_component,
-    verify_rust_release_handshake, verify_web_release_handshake, verify_web_semantic_compatibility,
+    probe_worker_version, validate_worker_launch_policy, verify_release_artifact,
+    verify_release_runtime_component, verify_rust_release_handshake, verify_web_release_handshake,
+    verify_web_semantic_compatibility,
 };
 
 #[derive(Debug, Clone, Serialize)]
@@ -415,8 +416,17 @@ pub struct WorkerHealth {
     pub available: bool,
     pub command: Option<String>,
     pub version: Option<String>,
+    pub protocol: Option<String>,
     pub integrity: String,
     pub error: Option<String>,
+    pub root_launch_allowed: bool,
+    pub root_launch_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct DoctorDiagnosticRoot {
+    pub path: String,
+    pub source: &'static str,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -475,6 +485,7 @@ pub struct CompilerPreciseProfileHealth {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct DoctorReport {
+    pub diagnostic_root: DoctorDiagnosticRoot,
     pub protocol_version: &'static str,
     pub graph_schema_version: &'static str,
     pub store_schema_version: i64,
@@ -496,6 +507,7 @@ pub struct DoctorReport {
 pub struct DoctorSummaryReport {
     pub report_kind: &'static str,
     pub detail_command: &'static str,
+    pub diagnostic_root: DoctorDiagnosticRoot,
     pub protocol_version: &'static str,
     pub graph_schema_version: &'static str,
     pub store_schema_version: i64,
@@ -944,17 +956,62 @@ fn preflight_doctor_workers(
     }
 }
 
-fn suppressed_worker_health(adapter: AdapterKind, spec: worker::WorkerSpec) -> WorkerHealth {
+fn worker_root_launch_policy(spec: &worker::WorkerSpec, root: &Path) -> (bool, Option<String>) {
+    match validate_worker_launch_policy(spec, root) {
+        Ok(()) => (true, None),
+        Err(error) => (false, Some(format!("{error:#}"))),
+    }
+}
+
+fn evaluated_worker_health(
+    adapter: AdapterKind,
+    spec: worker::WorkerSpec,
+    root: &Path,
+    version: Result<String>,
+) -> WorkerHealth {
+    let (root_launch_allowed, root_launch_error) = worker_root_launch_policy(&spec, root);
+    let reported_version = version.as_deref().ok();
+    let protocol = reported_version
+        .and_then(parse_worker_handshake)
+        .map(|(_, _, protocol)| protocol.to_owned());
+    let integrity = worker_integrity(adapter, &spec.artifact_path, reported_version);
+    let error = version
+        .as_ref()
+        .err()
+        .map(ToString::to_string)
+        .or_else(|| integrity.strip_prefix("error: ").map(ToOwned::to_owned));
+    WorkerHealth {
+        adapter: adapter.name().to_owned(),
+        available: error.is_none(),
+        command: Some(spec.display),
+        version: version.ok(),
+        protocol,
+        integrity,
+        error,
+        root_launch_allowed,
+        root_launch_error,
+    }
+}
+
+fn suppressed_worker_health(
+    adapter: AdapterKind,
+    spec: worker::WorkerSpec,
+    root: &Path,
+) -> WorkerHealth {
+    let (root_launch_allowed, root_launch_error) = worker_root_launch_policy(&spec, root);
     WorkerHealth {
         adapter: adapter.name().to_owned(),
         available: false,
         command: Some(spec.display),
         version: None,
+        protocol: None,
         integrity: worker_integrity(adapter, &spec.artifact_path, None),
         error: Some(
             "worker probe suppressed because another adapter failed release security verification"
                 .to_owned(),
         ),
+        root_launch_allowed,
+        root_launch_error,
     }
 }
 
@@ -967,41 +1024,81 @@ async fn doctor_workers(root: &Path) -> Vec<WorkerHealth> {
     for (adapter, location) in preflight.locations {
         workers.push(match location {
             DoctorWorkerLocation::Ready(spec) if preflight.suppress_probes => {
-                suppressed_worker_health(adapter, spec)
+                suppressed_worker_health(adapter, spec, root)
             }
             DoctorWorkerLocation::Ready(spec) => {
-                let version = worker_version(&spec, root).await;
-                let integrity =
-                    worker_integrity(adapter, &spec.artifact_path, version.as_deref().ok());
-                let error = version
-                    .as_ref()
-                    .err()
-                    .map(ToString::to_string)
-                    .or_else(|| integrity.strip_prefix("error: ").map(ToOwned::to_owned));
-                WorkerHealth {
-                    adapter: adapter.name().to_owned(),
-                    available: error.is_none(),
-                    command: Some(spec.display),
-                    version: version.ok(),
-                    integrity,
-                    error,
-                }
+                let version = worker_artifact_version(&spec).await;
+                evaluated_worker_health(adapter, spec, root, version)
             }
             DoctorWorkerLocation::Unavailable(error) => WorkerHealth {
                 adapter: adapter.name().to_owned(),
                 available: false,
                 command: None,
                 version: None,
+                protocol: None,
                 integrity: "unavailable".to_owned(),
-                error: Some(error),
+                error: Some(error.clone()),
+                root_launch_allowed: false,
+                root_launch_error: Some(format!(
+                    "root launch policy was not evaluated because the worker is unavailable: {error}"
+                )),
             },
         });
     }
     workers
 }
 
+async fn worker_artifact_version(spec: &worker::WorkerSpec) -> Result<String> {
+    let probe_root = tempfile::Builder::new()
+        .prefix("depgraph-doctor-worker-probe-")
+        .tempdir()
+        .context("failed to create a neutral worker health probe root")?;
+    worker_version(spec, probe_root.path()).await
+}
+
+fn default_doctor_diagnostic_root(store: &Store) -> Result<(PathBuf, &'static str)> {
+    if let Some(scan_id) = store.latest_attempt_id()?
+        && let Some(scan) = store.scan(&scan_id)?
+    {
+        let root = PathBuf::from(scan.root);
+        if !root.is_absolute() {
+            anyhow::bail!("stored diagnostic root is not absolute");
+        }
+        return Ok((root, "latest-attempt"));
+    }
+    Ok((
+        std::env::current_dir()?.canonicalize()?,
+        "current-working-directory",
+    ))
+}
+
+fn normalize_doctor_diagnostic_root(
+    root: &Path,
+    source: &'static str,
+) -> (PathBuf, DoctorDiagnosticRoot) {
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let diagnostic_root = DoctorDiagnosticRoot {
+        path: root.to_string_lossy().into_owned(),
+        source,
+    };
+    (root, diagnostic_root)
+}
+
 pub async fn doctor(store: &Store) -> Result<DoctorReport> {
-    let root = std::env::current_dir()?.canonicalize()?;
+    let (root, source) = default_doctor_diagnostic_root(store)?;
+    doctor_with_diagnostic_root(store, &root, source).await
+}
+
+pub async fn doctor_for_root(store: &Store, root: &Path) -> Result<DoctorReport> {
+    doctor_with_diagnostic_root(store, root, "explicit").await
+}
+
+async fn doctor_with_diagnostic_root(
+    store: &Store,
+    root: &Path,
+    source: &'static str,
+) -> Result<DoctorReport> {
+    let (root, diagnostic_root) = normalize_doctor_diagnostic_root(root, source);
     let workers = doctor_workers(&root).await;
     let latest_attempt = store
         .latest_attempt_id()?
@@ -1090,6 +1187,7 @@ pub async fn doctor(store: &Store) -> Result<DoctorReport> {
     let toolchains = toolchain_versions(&root).await;
     let toolchain_remediation = doctor_toolchain_remediation(&toolchains);
     Ok(DoctorReport {
+        diagnostic_root,
         protocol_version: "1.0",
         graph_schema_version: "1.0",
         store_schema_version: store.schema_version()?,
@@ -1109,7 +1207,20 @@ pub async fn doctor(store: &Store) -> Result<DoctorReport> {
 }
 
 pub async fn doctor_summary(store: &Store) -> Result<DoctorSummaryReport> {
-    let root = std::env::current_dir()?.canonicalize()?;
+    let (root, source) = default_doctor_diagnostic_root(store)?;
+    doctor_summary_with_diagnostic_root(store, &root, source).await
+}
+
+pub async fn doctor_summary_for_root(store: &Store, root: &Path) -> Result<DoctorSummaryReport> {
+    doctor_summary_with_diagnostic_root(store, root, "explicit").await
+}
+
+async fn doctor_summary_with_diagnostic_root(
+    store: &Store,
+    root: &Path,
+    source: &'static str,
+) -> Result<DoctorSummaryReport> {
+    let (root, diagnostic_root) = normalize_doctor_diagnostic_root(root, source);
     let workers = doctor_workers(&root).await;
     let latest_attempt = store
         .latest_attempt_id()?
@@ -1135,6 +1246,7 @@ pub async fn doctor_summary(store: &Store) -> Result<DoctorSummaryReport> {
     Ok(DoctorSummaryReport {
         report_kind: "summary",
         detail_command: "depgraph doctor --details",
+        diagnostic_root,
         protocol_version: "1.0",
         graph_schema_version: "1.0",
         store_schema_version: store.schema_version()?,
@@ -1594,14 +1706,19 @@ pub fn open_store_read_only(path: &Path) -> Result<Store> {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, ffi::OsString, path::PathBuf};
+    use std::{
+        collections::BTreeMap,
+        ffi::OsString,
+        path::{Path, PathBuf},
+    };
 
     use super::{
         AdapterKind, DoctorWorkerLocation, FRAMEWORK_BUILD_CONVERTER_ARTIFACT,
-        FRAMEWORK_BUILD_GATE_CONTRACT_VERSION, doctor_toolchain_remediation,
-        framework_build_capability_contract, parse_release_manifest, parse_worker_handshake,
-        preflight_doctor_workers, release_compatibility_contract, suppressed_worker_health,
-        verify_release_compatibility, worker,
+        FRAMEWORK_BUILD_GATE_CONTRACT_VERSION, default_doctor_diagnostic_root,
+        doctor_toolchain_remediation, evaluated_worker_health, framework_build_capability_contract,
+        parse_release_manifest, parse_worker_handshake, preflight_doctor_workers,
+        release_compatibility_contract, suppressed_worker_health, verify_release_compatibility,
+        worker,
     };
 
     fn test_worker_spec(adapter: AdapterKind) -> worker::WorkerSpec {
@@ -1818,10 +1935,11 @@ mod tests {
 
         for (adapter, location) in preflight.locations {
             if let DoctorWorkerLocation::Ready(spec) = location {
-                let health = suppressed_worker_health(adapter, spec);
+                let health = suppressed_worker_health(adapter, spec, Path::new("/tmp"));
                 assert!(!health.available);
                 assert!(health.command.is_some());
                 assert!(health.version.is_none());
+                assert!(health.protocol.is_none());
                 assert!(
                     health.integrity == "development-unverified"
                         || health.integrity.starts_with("error: ")
@@ -1834,6 +1952,75 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn worker_artifact_health_is_independent_from_root_confinement_for_every_adapter() {
+        let source_root = tempfile::tempdir().expect("source root");
+        let unrelated_root = tempfile::tempdir().expect("unrelated root");
+        for adapter in [AdapterKind::Rust, AdapterKind::Go, AdapterKind::Web] {
+            let artifact = source_root
+                .path()
+                .join(format!("depgraph-{}-worker", adapter.name()));
+            std::fs::write(&artifact, b"fixture").expect("worker artifact");
+            let spec = worker::WorkerSpec {
+                adapter,
+                program: OsString::from(&artifact),
+                leading_args: Vec::new(),
+                display: artifact.display().to_string(),
+                artifact_path: artifact,
+                runtime_requirement: None,
+                expected_version: None,
+                release_attested: false,
+                attested_rust_sysroot: None,
+            };
+            let version = format!(
+                "depgraph-{}-worker {} (protocol 1.0)",
+                adapter.name(),
+                env!("CARGO_PKG_VERSION")
+            );
+            let blocked = evaluated_worker_health(
+                adapter,
+                spec.clone(),
+                source_root.path(),
+                Ok(version.clone()),
+            );
+            let allowed =
+                evaluated_worker_health(adapter, spec, unrelated_root.path(), Ok(version));
+
+            assert!(blocked.available);
+            assert_eq!(blocked.protocol.as_deref(), Some("1.0"));
+            assert!(blocked.error.is_none());
+            assert!(!blocked.root_launch_allowed);
+            assert!(
+                blocked
+                    .root_launch_error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("inside the scan root"))
+            );
+            assert!(allowed.available);
+            assert_eq!(allowed.protocol.as_deref(), Some("1.0"));
+            assert!(allowed.root_launch_allowed);
+            assert!(allowed.root_launch_error.is_none());
+            assert_eq!(blocked.version, allowed.version);
+            assert_eq!(blocked.integrity, allowed.integrity);
+        }
+    }
+
+    #[test]
+    fn doctor_diagnostic_root_prefers_the_latest_attempt_and_has_a_cwd_fallback()
+    -> anyhow::Result<()> {
+        let mut store = depgraph_store::Store::open_in_memory()?;
+        let (fallback, fallback_source) = default_doctor_diagnostic_root(&store)?;
+        assert_eq!(fallback_source, "current-working-directory");
+        assert_eq!(fallback, std::env::current_dir()?.canonicalize()?);
+
+        let root = tempfile::tempdir()?;
+        store.start_scan("diagnostic-root", root.path(), false)?;
+        let (selected, selected_source) = default_doctor_diagnostic_root(&store)?;
+        assert_eq!(selected_source, "latest-attempt");
+        assert_eq!(selected, root.path());
+        Ok(())
     }
 
     #[test]

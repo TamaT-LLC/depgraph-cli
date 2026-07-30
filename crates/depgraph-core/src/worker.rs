@@ -1945,6 +1945,15 @@ pub(crate) fn sanitize_path_value(raw: &OsStr, root: &Path) -> Result<OsString> 
 }
 
 fn resolve_worker_program(spec: &WorkerSpec, root: &Path) -> Result<OsString> {
+    validate_worker_root_confinement(spec, root)?;
+    if spec.adapter == AdapterKind::Web {
+        resolve_safe_executable("node", root).map(PathBuf::into_os_string)
+    } else {
+        Ok(spec.program.clone())
+    }
+}
+
+pub(crate) fn validate_worker_root_confinement(spec: &WorkerSpec, root: &Path) -> Result<()> {
     let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let artifact = spec.artifact_path.canonicalize().with_context(|| {
         format!(
@@ -1958,11 +1967,11 @@ fn resolve_worker_program(spec: &WorkerSpec, root: &Path) -> Result<OsString> {
             artifact.display()
         );
     }
-    if spec.adapter == AdapterKind::Web {
-        resolve_safe_executable("node", root).map(PathBuf::into_os_string)
-    } else {
-        Ok(spec.program.clone())
-    }
+    Ok(())
+}
+
+pub(crate) fn validate_worker_launch_policy(spec: &WorkerSpec, root: &Path) -> Result<()> {
+    resolve_worker_program(spec, root).map(|_| ())
 }
 
 pub(crate) fn resolve_safe_executable(name: &str, root: &Path) -> Result<PathBuf> {

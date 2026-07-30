@@ -1293,13 +1293,19 @@ traversal budgetはBFSで実際にadmitしたedge visitへ適用する。到達�
 
 summaryはstatus / phase / profile / kind / reasonを原因件数順・key順で決定的に集約し、各dimension最大64 groupとomitted countに制限する。doctor summaryはcompleted snapshot chainのbuild / runtime overlayをSQLite JSON scalar projectionで合成し、diagnostic properties、base diagnostic raw JSON、graph / evidence、adapter stderrを読み込まずにdetailsと一致するprofile / package / site / diagnostic countとproject-code execution状態を返す。human出力とJSONは同じsummary、diagnostic、cursorを共有する。
 
+### 13.11 Doctor worker healthとdiagnostic root
+
+Issue #265ではworker artifact自体のhealthと、特定repository rootに対するlaunch policyを分離する。`doctor`のdiagnostic rootは明示`--root`、storeのlatest attempt root、latest attemptがない場合だけcurrent working directoryの優先順位で選び、canonical pathと選択元を`diagnostic_root.path` / `diagnostic_root.source`へ出力する。同じstore・同じdiagnostic rootなら起動cwdはworker判定へ影響しない。
+
+artifact health probeは新規のrepository外temporary rootとneutral working directoryから、sanitized environment、5秒timeout、64 KiB stdout/stderr上限、process-tree reapを維持して`--version` handshakeを実行する。`available`、`version`、`protocol`、`integrity`、`error`はこのartifact probeだけを表す。実scan rootに対するdevelopment artifact confinementは実行せずに別途検証し、`root_launch_allowed` / `root_launch_error`へ出力する。したがってdepgraph source tree内のdevelopment workerもartifact healthはgreenになり得る一方、そのsource tree自体をdiagnostic rootへ指定した場合は従来どおり`development worker artifact ... is inside the scan root`でlaunchを拒否する。release archive workerは既存のmanifest、checksum、handshake attestationを変更しない。
+
 ## 14. CLI UX
 
 ```text
 depgraph init
 depgraph scan [PATH] [--profile NAME] [--strict]
 depgraph resolve --build [PATH] [--allow-project-code]
-depgraph doctor [--summary|--details] [--json]
+depgraph doctor [--root PATH] [--summary|--details] [--json]
 depgraph deps <SELECTOR> [--transitive] [--max-items N] [--max-bytes BYTES] [--max-traversal N] [--cursor TOKEN|--all]
 depgraph dependents <SELECTOR> [--transitive] [--max-items N] [--max-bytes BYTES] [--max-traversal N] [--cursor TOKEN|--all]
 depgraph why <FROM> <TO>
@@ -1323,6 +1329,9 @@ selector は path、stable ID、package、symbol、route pattern を受け付け
 
 ### 14.2 `doctor`
 
+- `diagnostic_root`は明示`--root`、latest attempt root、attemptなしの場合だけcurrent cwdの順に選択し、path/sourceをmachine-readableに返す
+- worker artifactの`available` / version / protocol / integrityと、diagnostic rootに対する`root_launch_allowed` / errorを分離する
+- artifact handshakeはrepository外のneutral probe rootで行うため起動cwdに依存せず、development artifact inside scan rootのlaunch拒否は維持する
 - 既定`--summary`はgraph / evidence / diagnostic raw JSON / adapter stderrをloadせず、latest attemptのscan / coverage、profile / package count、adapter別file coverage、stderr byte/truncation、diagnostic totalを読む
 - diagnostic summaryは`severity + code + adapter`の上位64原因group、omitted group/item count、ordinal順の代表5件だけをbounded textで返す
 - `--details`は従来どおりlatest attemptの全profile / file coverage / diagnostic / profile matrix / cache event payloadを返す
@@ -1854,6 +1863,7 @@ digest、ref/tag検証、PR記録項目、patch release時も変わらないance
 - deterministic GraphML exporter: Issue #85で実装済み（2026-07-24）
 - initial / incremental / impact benchmarkとCI/release gate: Issue #86で実装済み（2026-07-24）
 - doctor summary / interactive query bounded page・cursor: Issue #264で実装済み（2026-07-30）
+- doctor diagnostic root / worker artifact health・root launch policy分離: Issue #265で実装済み（2026-07-30）
 - worker delta schema v12 transactional staging / apply / rollback / GC: Issue #133で実装済み（2026-07-24）
 - watcher / daemon fine-grained incremental executor / full fallback: Issue #134で実装済み（2026-07-24）
 - production runtime collector SDK / transport / redaction contract: Issue #137で実装済み（2026-07-24）
@@ -1925,6 +1935,7 @@ digest、ref/tag検証、PR記録項目、patch release時も変わらないance
 
 ## 26. 更新履歴
 
+- 2026-07-30: Issue #265として`doctor`のworker artifact healthとper-root launch policyを分離した。diagnostic rootは明示`--root`、store latest attempt root、attemptなしのcurrent cwdの順で選択し、path/sourceをhuman/JSONへ公開する。Rust/Go/Webのversion/protocol/integrity probeはrepository外のneutral rootで実行して起動cwd依存を除去し、`root_launch_allowed` / errorは実diagnostic rootに対して独立評価する。depgraph source tree自体をrootにしたdevelopment artifact拒否、release archive attestation、safe environment・timeout・process reapを維持し、cwd差分と全3workerの回帰テストを追加した。
 - 2026-07-30: Issue #264として対話的query出力をbounded化した。`doctor`は既定summaryと明示`--details`を分離し、summaryはdiagnostic raw JSON、graph / evidence、adapter stderrを読まずにcoverage、profile / package、adapter別file、diagnostic total・上位64原因group・代表5件を返す。`deps` / `dependents` / `unresolved`は`depgraph-interactive-query-page-v1`でitem / compact JSON byte / traversalを制限し、打ち切りを`complete:false`、固定diagnostic、実serialize byte数、snapshot/query-bound cursorとして公開する。同一cursorの決定性、page連結の重複・欠落なし、oversized item、改変cursor、traversal上限、human/JSON、512-edge fixtureを回帰検証し、`--all`とstreaming `export`でfull outputを維持する。
 - 2026-07-30: Issue #263としてRust syntax fallbackを改善した。標準prelude / manifest依存をexternal/heuristic、condition-compatibleな明示local型宣言・module-scope importをsource-backed `type`へのresolved/candidates heuristicへ分類し、block-local importはmodule indexへ漏らさない。同一原因のmacro / proc-macro / unsupported attribute / build-environment warningは各siteの安定group参照、全site集合のcount/digest、bounded path count/digest、最大5件の代表ID/evidenceを持つ1 diagnosticへ集約し、全site/span、strict failure、決定性、`project_code_executed=false`を維持する。`rust-syntax-fallback-summary-v1`はsyntax解決、HIR必須、macro実行必須の件数と別々のremediationをhuman/JSONへ出力する。
 - 2026-07-30: Issue #261としてscan cacheのsymlink policyを局所化した。repository内file symlinkはlink target identityとconfined target bytesをsyntax / semantic fingerprintへ含め、cache-hit昇格直前にlink path、canonical target、length、content digestを再検証する。root外、dangling、loop、non-file、変更または読取不能なlinkはworker rescanへfail closedし、cache eventには固定reason、core diagnosticには安全なrepository-relative link pathだけを残す。`WARP.md -> CLAUDE.md`相当の文書linkについて反復cache hit、link有無のgraph / coverage同一性、project code非実行を固定し、root-out / loop / dangling / target content差し替えfixtureで拒否境界を検証する。
