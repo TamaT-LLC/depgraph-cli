@@ -76,6 +76,7 @@ struct SourceUnit {
     package_index: Option<usize>,
     text: Option<String>,
     syntax: Option<syn::File>,
+    occurrences: Vec<Occurrence>,
 }
 
 fn source_content_hash(source: &str) -> String {
@@ -915,11 +916,13 @@ impl State {
                     }
                 },
             };
+            let occurrences = syntax.as_ref().map(collect_occurrences).unwrap_or_default();
             sources.push(SourceUnit {
                 rel_path,
                 package_index,
                 text: source,
                 syntax,
+                occurrences,
             });
         }
         Ok(sources)
@@ -1180,7 +1183,7 @@ impl State {
                     source
                         .syntax
                         .as_ref()
-                        .map(|syntax| (source.rel_path.clone(), collect_occurrences(syntax)))
+                        .map(|_| (source.rel_path.clone(), source.occurrences.clone()))
                 })
                 .collect();
             let delta =
@@ -1832,8 +1835,7 @@ impl State {
         loop {
             let mut additions = Vec::new();
             for source in sources {
-                let (Some(package_index), Some(syntax)) =
-                    (source.package_index, source.syntax.as_ref())
+                let (Some(package_index), Some(_)) = (source.package_index, source.syntax.as_ref())
                 else {
                     continue;
                 };
@@ -1844,7 +1846,7 @@ impl State {
                 else {
                     continue;
                 };
-                for occurrence in collect_occurrences(syntax) {
+                for occurrence in source.occurrences.clone() {
                     let Occurrence::Module {
                         name,
                         inline: false,
@@ -1898,14 +1900,13 @@ impl State {
     fn index_modules(&mut self, packages: &[Package], sources: &[SourceUnit]) -> Result<()> {
         self.prepare_module_contexts(packages, sources);
         for source in sources {
-            let (Some(package_index), Some(syntax)) =
-                (source.package_index, source.syntax.as_ref())
+            let (Some(package_index), Some(_)) = (source.package_index, source.syntax.as_ref())
             else {
                 continue;
             };
             let package = &packages[package_index];
             let source_node = self.file_nodes[&source.rel_path].clone();
-            for occurrence in collect_occurrences(syntax) {
+            for occurrence in source.occurrences.clone() {
                 let Occurrence::Module {
                     name,
                     inline,
@@ -1993,7 +1994,7 @@ impl State {
                 .get(&(package_index, source.rel_path.clone()))
                 .cloned()
                 .unwrap_or_default();
-            for occurrence in collect_occurrences(syntax) {
+            for occurrence in source.occurrences.clone() {
                 let Occurrence::TypeDefinition {
                     name,
                     type_kind,
@@ -2080,11 +2081,11 @@ impl State {
         sources: &[SourceUnit],
     ) -> Result<()> {
         for source in sources {
-            let Some(syntax) = source.syntax.as_ref() else {
+            if source.syntax.is_none() {
                 continue;
-            };
+            }
             let source_node = self.file_nodes[&source.rel_path].clone();
-            let occurrences = collect_occurrences(syntax);
+            let occurrences = source.occurrences.clone();
             let import_bindings = syntax_import_bindings(&occurrences);
             for occurrence in occurrences {
                 match occurrence {

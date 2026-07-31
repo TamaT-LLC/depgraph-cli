@@ -448,6 +448,24 @@ pub struct GraphSnapshot {
     pub profile_matrix: ProfileMatrixRecord,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GraphTopology {
+    pub nodes: Vec<GraphTopologyNode>,
+    pub edges: Vec<GraphTopologyEdge>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GraphTopologyNode {
+    pub id: String,
+    pub kind: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GraphTopologyEdge {
+    pub source: String,
+    pub target: String,
+}
+
 pub struct Store {
     connection: Connection,
 }
@@ -2562,6 +2580,31 @@ impl Store {
 
     pub fn load_completed_snapshot(&self, snapshot_id: &str) -> Result<GraphSnapshot> {
         load_completed_snapshot_from_connection(&self.connection, snapshot_id)
+    }
+
+    /// Load only node identities/kinds and edge endpoints for graph-topology
+    /// queries such as cycle detection.
+    ///
+    /// Plain scan snapshots can be projected directly from normalized tables
+    /// without parsing node properties, edge conditions, sites, or evidence.
+    /// Layered snapshots retain the full reconstruction path so build/runtime
+    /// overlays and semantic no-op inheritance preserve their exact semantics.
+    pub fn load_completed_topology(&self, snapshot_id: &str) -> Result<GraphTopology> {
+        let record = load_completed_snapshot_record(&self.connection, snapshot_id)?
+            .with_context(|| format!("completed snapshot {snapshot_id} was not found"))?;
+        let semantic_noop = record.build_attempt_id.is_none()
+            && record.runtime_session_ids.is_empty()
+            && incremental::scan_is_semantic_noop_overlay(&self.connection, &record.scan_id)?;
+        let layered = record.source_kind != "scan"
+            || record.build_attempt_id.is_some()
+            || !record.runtime_session_ids.is_empty()
+            || semantic_noop;
+        if !layered {
+            return load_scan_topology(&self.connection, &record.scan_id);
+        }
+        Ok(topology_from_snapshot(
+            load_completed_snapshot_from_connection(&self.connection, snapshot_id)?,
+        ))
     }
 
     /// Loads only the effective profile records for a completed snapshot.
@@ -4706,6 +4749,51 @@ fn load_nodes(connection: &Connection, scan_id: &str) -> Result<Vec<NodeRecord>>
     .collect()
 }
 
+fn load_scan_topology(connection: &Connection, scan_id: &str) -> Result<GraphTopology> {
+    let mut node_statement =
+        connection.prepare("SELECT id, kind FROM nodes WHERE scan_id=?1 ORDER BY id")?;
+    let nodes = node_statement
+        .query_map([scan_id], |row| {
+            Ok(GraphTopologyNode {
+                id: row.get(0)?,
+                kind: row.get(1)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut edge_statement =
+        connection.prepare("SELECT source, target FROM edges WHERE scan_id=?1 ORDER BY id")?;
+    let edges = edge_statement
+        .query_map([scan_id], |row| {
+            Ok(GraphTopologyEdge {
+                source: row.get(0)?,
+                target: row.get(1)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(GraphTopology { nodes, edges })
+}
+
+fn topology_from_snapshot(snapshot: GraphSnapshot) -> GraphTopology {
+    GraphTopology {
+        nodes: snapshot
+            .nodes
+            .into_iter()
+            .map(|node| GraphTopologyNode {
+                id: node.id,
+                kind: node.kind,
+            })
+            .collect(),
+        edges: snapshot
+            .edges
+            .into_iter()
+            .map(|edge| GraphTopologyEdge {
+                source: edge.source,
+                target: edge.target,
+            })
+            .collect(),
+    }
+}
+
 fn load_sites(connection: &Connection, scan_id: &str) -> Result<Vec<SiteRecord>> {
     let mut statement = connection.prepare(
         "SELECT id, source, kind, specifier, profile_id, resolution_status, precision,
@@ -5237,6 +5325,42 @@ mod tests {
         assert_eq!(
             store.latest_successful_id()?.as_deref(),
             Some("scan-golden")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn completed_topology_matches_the_full_scan_snapshot() -> Result<()> {
+        let mut store = Store::open_in_memory()?;
+        ingest_protocol_fixture(
+            &mut store,
+            include_str!("../../depgraph-protocol/tests/fixtures/protocol-v1.golden.ndjson"),
+        )?;
+        let snapshot_id = store.current_snapshot_id()?.context("current snapshot")?;
+        let snapshot = store.load_completed_snapshot(&snapshot_id)?;
+        let topology = store.load_completed_topology(&snapshot_id)?;
+
+        assert_eq!(
+            topology.nodes,
+            snapshot
+                .nodes
+                .into_iter()
+                .map(|node| GraphTopologyNode {
+                    id: node.id,
+                    kind: node.kind,
+                })
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            topology.edges,
+            snapshot
+                .edges
+                .into_iter()
+                .map(|edge| GraphTopologyEdge {
+                    source: edge.source,
+                    target: edge.target,
+                })
+                .collect::<Vec<_>>()
         );
         Ok(())
     }
