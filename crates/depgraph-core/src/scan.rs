@@ -555,12 +555,12 @@ async fn run_scan_with_cache_mode_and_cancellation_inner(
         0
     };
     let ingest_started = Instant::now();
-    let mut global_upserts = BTreeMap::<(String, String), Value>::new();
+    let mut global_upserts = (outputs.len() > 1).then(BTreeMap::<(String, String), Vec<u8>>::new);
     for output in bind_worker_outputs_to_profile_plan(outputs, &profile_plan, &mut failures) {
         let adapter = output.adapter;
         let failure_kind = output.failure_kind;
         let security_violation = output.security_violation;
-        if let Err(error) = ingest_worker_output(store, &scan_id, output, &mut global_upserts) {
+        if let Err(error) = ingest_worker_output(store, &scan_id, output, global_upserts.as_mut()) {
             let detail = format!("{error:#}");
             failures.push(match failure_kind {
                 Some(kind) => {
@@ -887,8 +887,8 @@ pub(crate) fn complete_scan(
         }
     };
 
-    let snapshot = store.load_snapshot(scan_id)?;
-    let coverage = &snapshot.coverage;
+    let summary = store.load_validated_scan_summary(&validation)?;
+    let coverage = &summary.coverage;
     let rust_hir_backend_failure = has_rust_hir_backend_failure(coverage);
     let strict_failure = strict && violates_strict_policy(coverage, config);
     if strict_failure {
@@ -922,6 +922,7 @@ pub(crate) fn complete_scan(
     let policy = if config.policy.rules.is_empty() {
         None
     } else {
+        let snapshot = store.load_snapshot(scan_id)?;
         let snapshot_id = store.prospective_scan_snapshot_id(scan_id)?;
         match evaluate_policy(snapshot_id, &snapshot, &config.policy) {
             Ok(result) => Some(result),
@@ -977,8 +978,8 @@ pub(crate) fn complete_scan(
         scan_id: scan_id.to_owned(),
         status: "completed".to_owned(),
         exit_code: 0,
-        coverage: snapshot.coverage,
-        diagnostics: snapshot.diagnostics,
+        coverage: summary.coverage,
+        diagnostics: summary.diagnostics,
         cache_events: store.cache_events_for_scan(scan_id)?,
         policy,
         performance: None,
@@ -1123,7 +1124,7 @@ fn ingest_worker_output(
     store: &mut Store,
     scan_id: &str,
     output: WorkerOutput,
-    global_upserts: &mut BTreeMap<(String, String), Value>,
+    global_upserts: Option<&mut BTreeMap<(String, String), Vec<u8>>>,
 ) -> Result<()> {
     store.save_adapter_log(
         scan_id,
@@ -1176,19 +1177,22 @@ fn ingest_worker_output(
                 .is_none_or(|site_id| available_sites.contains(site_id))
         });
     }
-    for event in &ordered {
-        if let Some((kind, object)) = upsert_object(event) {
-            let id = object
-                .get("id")
-                .and_then(Value::as_str)
-                .context("upsert object is missing id")?;
-            let key = (kind.to_owned(), id.to_owned());
-            if let Some(previous) = global_upserts.get(&key) {
-                if previous != object {
-                    anyhow::bail!("conflicting cross-worker {kind} upsert for {id}");
+    if let Some(global_upserts) = global_upserts {
+        for event in &ordered {
+            if let Some((kind, object)) = upsert_object(event) {
+                let id = object
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .context("upsert object is missing id")?;
+                let key = (kind.to_owned(), id.to_owned());
+                let serialized = serde_json::to_vec(object)?;
+                if let Some(previous) = global_upserts.get(&key) {
+                    if previous != &serialized {
+                        anyhow::bail!("conflicting cross-worker {kind} upsert for {id}");
+                    }
+                } else {
+                    global_upserts.insert(key, serialized);
                 }
-            } else {
-                global_upserts.insert(key, object.clone());
             }
         }
     }
@@ -2238,7 +2242,13 @@ mod tests {
         };
 
         assert!(
-            ingest_worker_output(&mut store, "partial-scan", output, &mut BTreeMap::new()).is_err()
+            ingest_worker_output(
+                &mut store,
+                "partial-scan",
+                output,
+                Some(&mut BTreeMap::new())
+            )
+            .is_err()
         );
         let snapshot = store.load_snapshot("partial-scan")?;
         assert!(snapshot.nodes.iter().any(|node| node.id == "file:kept"));

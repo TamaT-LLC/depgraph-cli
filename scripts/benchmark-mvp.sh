@@ -311,9 +311,11 @@ measure_capture \
   > "$raw/rust-no-cache-graph.json"
 cmp "$raw/rust-cold-graph.json" "$raw/rust-no-cache-graph.json"
 "$binary" --store "$rust_cold_store" cycles --level symbol --json > /dev/null
-measure_silent \
-  "$raw/rust-query-ms.txt" \
-  "$binary" --store "$rust_cold_store" cycles --level symbol --json
+for ((sample = 0; sample < query_samples; sample++)); do
+  measure_silent \
+    "$raw/rust-query-ms.txt" \
+    "$binary" --store "$rust_cold_store" cycles --level symbol --json
+done
 
 build_fixture="$root/workers/web/test/fixtures/polyglot"
 build_base_store="$cache/build-base.db"

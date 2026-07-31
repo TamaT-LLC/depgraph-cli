@@ -309,7 +309,14 @@ test("release verification requires the complete 10,000-file metric contract", (
       4_000,
       2_000,
     ],
-    ["warm_rust_symbol_query", "primed_graph_store", true, [1], 4_000, 500],
+    [
+      "warm_rust_symbol_query",
+      "primed_graph_store",
+      true,
+      [1, 1, 1],
+      4_000,
+      500,
+    ],
     [
       "cross_adapter_build_observation",
       "warm_base_snapshot",

@@ -163,8 +163,8 @@ const METRIC_CONTRACTS = new Map([
     {
       cache: "primed_graph_store",
       gated: true,
-      minimum_samples: 1,
-      maximum_samples: 1,
+      minimum_samples: 3,
+      maximum_samples: 50,
       maximum_limit_ms: 4_000,
       product_target_ms: 500,
     },

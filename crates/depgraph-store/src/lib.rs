@@ -151,6 +151,12 @@ pub struct ValidatedScan {
 }
 
 #[derive(Debug)]
+pub struct ValidatedScanSummary {
+    pub coverage: CoverageRecord,
+    pub diagnostics: Vec<DiagnosticRecord>,
+}
+
+#[derive(Debug)]
 pub struct CompletedScanSnapshot {
     scan_id: String,
     snapshot_id: String,
@@ -1946,43 +1952,6 @@ impl Store {
     }
 
     pub fn validate_scan(&self, scan_id: &str) -> Result<()> {
-        let mut statement = self.connection.prepare(
-            "SELECT s.id, s.resolution_status, s.target_ids_json,
-                    COUNT(e.id), MIN(CASE WHEN e.resolution_status = s.resolution_status THEN 1 ELSE 0 END)
-             FROM sites s LEFT JOIN edges e ON e.scan_id = s.scan_id AND e.site_id = s.id
-             WHERE s.scan_id = ?1
-             GROUP BY s.id, s.resolution_status, s.target_ids_json
-             ORDER BY s.id",
-        )?;
-        let rows = statement.query_map([scan_id], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, i64>(3)?,
-                row.get::<_, Option<i64>>(4)?,
-            ))
-        })?;
-        for row in rows {
-            let (id, status, targets_json, edge_count, statuses_match) = row?;
-            let targets: Vec<String> = serde_json::from_str(&targets_json)
-                .with_context(|| format!("site {id} has invalid target_ids"))?;
-            match status.as_str() {
-                "resolved" if targets.len() == 1 && edge_count == 1 => {}
-                "candidates" if !targets.is_empty() && edge_count == targets.len() as i64 => {}
-                "external" if targets.len() == 1 && edge_count == 1 => {}
-                "unresolved" if targets.len() == 1 && edge_count == 1 => {}
-                "resolved" | "candidates" | "external" | "unresolved" => bail!(
-                    "site {id} violates {status} cardinality: {} targets, {edge_count} edges",
-                    targets.len()
-                ),
-                _ => bail!("site {id} has unknown resolution status {status}"),
-            }
-            if statuses_match == Some(0) {
-                bail!("site {id} and one or more edges disagree on resolution_status");
-            }
-        }
-
         let missing_nodes: i64 = self.connection.query_row(
             "SELECT COUNT(*) FROM edges e
              LEFT JOIN nodes src ON src.scan_id = e.scan_id AND src.id = e.source
@@ -2042,6 +2011,19 @@ impl Store {
                 bail!("site {} contains duplicate target IDs", site.id);
             }
             let site_edges = edges_by_site.get(&site.id).cloned().unwrap_or_default();
+            match site.resolution_status.as_str() {
+                "resolved" | "external" | "unresolved"
+                    if expected.len() == 1 && site_edges.len() == 1 => {}
+                "candidates" if !expected.is_empty() && site_edges.len() == expected.len() => {}
+                "resolved" | "candidates" | "external" | "unresolved" => bail!(
+                    "site {} violates {} cardinality: {} targets, {} edges",
+                    site.id,
+                    site.resolution_status,
+                    expected.len(),
+                    site_edges.len()
+                ),
+                status => bail!("site {} has unknown resolution status {status}", site.id),
+            }
             let observed = site_edges
                 .iter()
                 .map(|edge| edge.target.clone())
@@ -2304,6 +2286,41 @@ impl Store {
         Ok(CompletedScanSnapshot {
             scan_id: validation.scan_id,
             snapshot_id,
+        })
+    }
+
+    pub fn load_validated_scan_summary(
+        &self,
+        validation: &ValidatedScan,
+    ) -> Result<ValidatedScanSummary> {
+        let (status, mutation_count) = self
+            .connection
+            .query_row(
+                "SELECT status, mutation_count FROM scans WHERE id=?1",
+                [&validation.scan_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?
+            .with_context(|| format!("scan {} was not started", validation.scan_id))?;
+        if status != "staging" || mutation_count != validation.mutation_count {
+            bail!(
+                "scan {} changed after completion validation",
+                validation.scan_id
+            );
+        }
+        let coverage = self
+            .connection
+            .query_row(
+                "SELECT json FROM coverage WHERE scan_id=?1",
+                [&validation.scan_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .with_context(|| format!("scan {} has no final coverage", validation.scan_id))
+            .and_then(|raw| serde_json::from_str(&raw).map_err(Into::into))?;
+        Ok(ValidatedScanSummary {
+            coverage,
+            diagnostics: load_diagnostics(&self.connection, &validation.scan_id)?,
         })
     }
 
@@ -4008,22 +4025,22 @@ fn insert_node(tx: &Transaction<'_>, scan_id: &str, node: &Value) -> Result<()> 
         .and_then(Value::as_str)
         .unwrap_or_else(|| required_str(node, "locator").unwrap_or("<unknown>"));
     let properties = node.get("properties").cloned().unwrap_or_else(|| json!({}));
-    tx.execute(
+    tx.prepare_cached(
         "INSERT INTO nodes(scan_id, id, kind, locator, display_name, properties_json, raw_json)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
          ON CONFLICT(scan_id, id) DO UPDATE SET
            kind=excluded.kind, locator=excluded.locator, display_name=excluded.display_name,
            properties_json=excluded.properties_json, raw_json=excluded.raw_json",
-        params![
-            scan_id,
-            required_str(node, "id")?,
-            required_str(node, "kind")?,
-            required_str(node, "locator")?,
-            display_name,
-            serde_json::to_string(&properties)?,
-            serde_json::to_string(node)?
-        ],
-    )?;
+    )?
+    .execute(params![
+        scan_id,
+        required_str(node, "id")?,
+        required_str(node, "kind")?,
+        required_str(node, "locator")?,
+        display_name,
+        serde_json::to_string(&properties)?,
+        serde_json::to_string(node)?
+    ])?;
     Ok(())
 }
 
@@ -4039,7 +4056,7 @@ fn upsert_site_row(tx: &Transaction<'_>, scan_id: &str, site: &Value) -> Result<
         .get("condition")
         .cloned()
         .unwrap_or_else(|| json!({"op":"all","conditions":[]}));
-    tx.execute(
+    tx.prepare_cached(
         "INSERT INTO sites(scan_id, id, source, kind, specifier, profile_id,
                            resolution_status, precision, condition_json, target_ids_json,
                            reason, raw_json)
@@ -4049,7 +4066,8 @@ fn upsert_site_row(tx: &Transaction<'_>, scan_id: &str, site: &Value) -> Result<
            profile_id=excluded.profile_id, resolution_status=excluded.resolution_status,
            precision=excluded.precision, condition_json=excluded.condition_json,
            target_ids_json=excluded.target_ids_json, reason=excluded.reason, raw_json=excluded.raw_json",
-        params![
+    )?
+    .execute(params![
             scan_id,
             required_str(site, "id")?,
             required_str(site, "source")?,
@@ -4062,8 +4080,7 @@ fn upsert_site_row(tx: &Transaction<'_>, scan_id: &str, site: &Value) -> Result<
             serde_json::to_string(&targets)?,
             site.get("reason").and_then(Value::as_str),
             serde_json::to_string(site)?
-        ],
-    )?;
+        ])?;
     Ok(())
 }
 
@@ -4078,7 +4095,7 @@ fn upsert_edge_row(tx: &Transaction<'_>, scan_id: &str, edge: &Value) -> Result<
         .get("condition")
         .cloned()
         .unwrap_or_else(|| json!({"op":"all","conditions":[]}));
-    tx.execute(
+    tx.prepare_cached(
         "INSERT INTO edges(scan_id, id, site_id, source, target, kind, phase, environment,
                            profile_id, resolution_status, precision, condition_json, generated, raw_json)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
@@ -4088,7 +4105,8 @@ fn upsert_edge_row(tx: &Transaction<'_>, scan_id: &str, edge: &Value) -> Result<
            profile_id=excluded.profile_id, resolution_status=excluded.resolution_status,
            precision=excluded.precision, condition_json=excluded.condition_json,
            generated=excluded.generated, raw_json=excluded.raw_json",
-        params![
+    )?
+    .execute(params![
             scan_id,
             required_str(edge, "id")?,
             edge.get("site_id").and_then(Value::as_str),
@@ -4103,8 +4121,7 @@ fn upsert_edge_row(tx: &Transaction<'_>, scan_id: &str, edge: &Value) -> Result<
             serde_json::to_string(&condition)?,
             edge.get("generated").and_then(Value::as_bool).unwrap_or(false),
             serde_json::to_string(edge)?
-        ],
-    )?;
+        ])?;
     Ok(())
 }
 
@@ -4115,43 +4132,41 @@ fn insert_evidence(
     owner_id: &str,
     object: &Value,
 ) -> Result<()> {
-    tx.execute(
-        "DELETE FROM evidence WHERE scan_id=?1 AND owner_type=?2 AND owner_id=?3",
-        params![scan_id, owner_type, owner_id],
-    )?;
+    tx.prepare_cached("DELETE FROM evidence WHERE scan_id=?1 AND owner_type=?2 AND owner_id=?3")?
+        .execute(params![scan_id, owner_type, owner_id])?;
     let evidence = object
         .get("evidence")
         .and_then(Value::as_array)
-        .cloned()
+        .map(Vec::as_slice)
         .unwrap_or_default();
     for (ordinal, item) in evidence.iter().enumerate() {
-        tx.execute(
+        tx.prepare_cached(
             "INSERT INTO evidence(scan_id, owner_type, owner_id, ordinal, kind, extractor,
                                   extractor_version, path, start_line, start_column,
                                   end_line, end_column, raw_json)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-            params![
-                scan_id,
-                owner_type,
-                owner_id,
-                ordinal as i64,
-                item.get("kind").and_then(Value::as_str).unwrap_or("source"),
-                item.get("extractor")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown"),
-                item.get("extractor_version")
-                    .and_then(Value::as_str)
-                    .unwrap_or("0.0.0"),
-                item.get("path").and_then(Value::as_str).unwrap_or(""),
-                item.get("start_line").and_then(Value::as_u64).unwrap_or(1),
-                item.get("start_column")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(1),
-                item.get("end_line").and_then(Value::as_u64).unwrap_or(1),
-                item.get("end_column").and_then(Value::as_u64).unwrap_or(1),
-                serde_json::to_string(item)?
-            ],
-        )?;
+        )?
+        .execute(params![
+            scan_id,
+            owner_type,
+            owner_id,
+            ordinal as i64,
+            item.get("kind").and_then(Value::as_str).unwrap_or("source"),
+            item.get("extractor")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown"),
+            item.get("extractor_version")
+                .and_then(Value::as_str)
+                .unwrap_or("0.0.0"),
+            item.get("path").and_then(Value::as_str).unwrap_or(""),
+            item.get("start_line").and_then(Value::as_u64).unwrap_or(1),
+            item.get("start_column")
+                .and_then(Value::as_u64)
+                .unwrap_or(1),
+            item.get("end_line").and_then(Value::as_u64).unwrap_or(1),
+            item.get("end_column").and_then(Value::as_u64).unwrap_or(1),
+            serde_json::to_string(item)?
+        ])?;
     }
     Ok(())
 }
@@ -5098,8 +5113,20 @@ mod tests {
             Some("fixture-revision"),
         )?;
         let validation = store.validate_scan_for_completion(&scan_id)?;
+        let summary = store.load_validated_scan_summary(&validation)?;
+        let snapshot = store.load_snapshot(&scan_id)?;
+        assert_eq!(summary.coverage, snapshot.coverage);
+        assert_eq!(summary.diagnostics, snapshot.diagnostics);
         store.save_adapter_log(&scan_id, "late-adapter", "late mutation", false)?;
 
+        let error = store
+            .load_validated_scan_summary(&validation)
+            .expect_err("mutation after validation must invalidate the summary token");
+        assert!(
+            error
+                .to_string()
+                .contains("changed after completion validation")
+        );
         let error = store
             .finish_validated_scan(validation, true)
             .expect_err("mutation after validation must prevent promotion");
