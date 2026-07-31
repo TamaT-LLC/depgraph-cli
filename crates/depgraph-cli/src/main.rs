@@ -17,17 +17,17 @@ use depgraph_core::{
     TypedProjection, UnresolvedResult, acquire_store_writer_lock, build_cache_key,
     compiler_precise_graph_ndjson, create_build_execution_request,
     create_compiler_precise_invocation_request, create_compiler_precise_unit_graph_request,
-    default_store_path, doctor, doctor_summary, evaluate_policy_diff, execute_bounded_query,
-    execute_build_request_with_cancellation, export_filtered, export_graphml_filtered_to_writer,
-    impact, impact_query_cache_key, init_config, match_runtime_trace, open_store,
-    open_store_read_only, paginate_interactive_query, parse_and_type_check_bounded_query,
-    plan_bounded_query, plan_explicit_profile_selection, plan_repository_profiles,
-    policy_annotations, profile_selection_human_summary, read_bounded_query_file,
-    read_compiler_pack_requirement, read_explicit_profile_selection_file, read_git_changed_set,
-    read_runtime_trace, render_condition, render_github_annotations, run_scan_with_cache_mode,
-    runtime_session_delta, rust_build_protocol_ndjson, stage_build_evidence,
-    start_repository_daemon, traversal_page_items, traversal_summary, traverse_bounded_filtered,
-    traverse_filtered, unresolved, unresolved_summary,
+    default_store_path, doctor, doctor_for_root, doctor_summary, doctor_summary_for_root,
+    evaluate_policy_diff, execute_bounded_query, execute_build_request_with_cancellation,
+    export_filtered, export_graphml_filtered_to_writer, impact, impact_query_cache_key,
+    init_config, match_runtime_trace, open_store, open_store_read_only, paginate_interactive_query,
+    parse_and_type_check_bounded_query, plan_bounded_query, plan_explicit_profile_selection,
+    plan_repository_profiles, policy_annotations, profile_selection_human_summary,
+    read_bounded_query_file, read_compiler_pack_requirement, read_explicit_profile_selection_file,
+    read_git_changed_set, read_runtime_trace, render_condition, render_github_annotations,
+    run_scan_with_cache_mode, runtime_session_delta, rust_build_protocol_ndjson,
+    stage_build_evidence, start_repository_daemon, traversal_page_items, traversal_summary,
+    traverse_bounded_filtered, traverse_filtered, unresolved, unresolved_summary,
     validate_explicit_profile_selection_capabilities, validate_interactive_query_bounds,
     web_build_protocol_ndjson, why_filtered,
 };
@@ -132,6 +132,9 @@ enum Commands {
     Doctor {
         #[arg(long)]
         json: bool,
+        /// Diagnose worker launch policy for this repository root.
+        #[arg(long, value_name = "PATH")]
+        root: Option<PathBuf>,
         /// Emit the bounded health summary (the default).
         #[arg(long, conflicts_with = "details")]
         summary: bool,
@@ -1088,14 +1091,23 @@ async fn run(cli: Cli) -> Result<u8> {
         }
         Commands::Doctor {
             json,
+            root,
             summary: _,
             details,
         } => {
-            let root = std::env::current_dir()?;
-            let store_path = store_path(cli.store, &root)?;
+            let invocation_root = std::env::current_dir()?;
+            let diagnostic_root = root.map(canonical_directory).transpose()?;
+            let store_path = store_path(
+                cli.store,
+                diagnostic_root.as_deref().unwrap_or(&invocation_root),
+            )?;
             let store = open_store(&store_path)?;
             if !details {
-                let report = doctor_summary(&store).await?;
+                let report = if let Some(root) = &diagnostic_root {
+                    doctor_summary_for_root(&store, root).await?
+                } else {
+                    doctor_summary(&store).await?
+                };
                 if json {
                     println!("{}", serde_json::to_string_pretty(&report)?);
                 } else {
@@ -1103,10 +1115,18 @@ async fn run(cli: Cli) -> Result<u8> {
                 }
                 return Ok(0);
             }
-            let report = doctor(&store).await?;
+            let report = if let Some(root) = &diagnostic_root {
+                doctor_for_root(&store, root).await?
+            } else {
+                doctor(&store).await?
+            };
             if json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
+                println!(
+                    "diagnostic root: {} ({})",
+                    report.diagnostic_root.path, report.diagnostic_root.source
+                );
                 println!("protocol: {}", report.protocol_version);
                 println!("graph schema: {}", report.graph_schema_version);
                 println!("store schema: {}", report.store_schema_version);
@@ -1151,19 +1171,29 @@ async fn run(cli: Cli) -> Result<u8> {
                 for worker in report.workers {
                     if worker.available {
                         println!(
-                            "worker {}: available ({}, {}; {})",
+                            "worker {} artifact: available ({}, {}; protocol={}; {})",
                             worker.adapter,
                             worker.command.unwrap_or_default(),
                             worker
                                 .version
                                 .unwrap_or_else(|| "unknown version".to_owned()),
+                            worker.protocol.as_deref().unwrap_or("unknown"),
                             worker.integrity
                         );
                     } else {
                         println!(
-                            "worker {}: unavailable ({})",
+                            "worker {} artifact: unavailable ({})",
                             worker.adapter,
                             worker.error.unwrap_or_default()
+                        );
+                    }
+                    if worker.root_launch_allowed {
+                        println!("worker {} root launch: allowed", worker.adapter);
+                    } else {
+                        println!(
+                            "worker {} root launch: blocked ({})",
+                            worker.adapter,
+                            worker.root_launch_error.unwrap_or_default()
                         );
                     }
                 }
@@ -2439,6 +2469,10 @@ fn query_projection_label(projection: &TypedProjection) -> String {
 
 fn print_doctor_summary_human(report: &depgraph_core::DoctorSummaryReport) {
     println!("doctor report: {}", report.report_kind);
+    println!(
+        "diagnostic root: {} ({})",
+        report.diagnostic_root.path, report.diagnostic_root.source
+    );
     println!("protocol: {}", report.protocol_version);
     println!("graph schema: {}", report.graph_schema_version);
     println!("store schema: {}", report.store_schema_version);
@@ -2460,17 +2494,27 @@ fn print_doctor_summary_human(report: &depgraph_core::DoctorSummaryReport) {
     for worker in &report.workers {
         if worker.available {
             println!(
-                "worker {}: available ({}, {}; {})",
+                "worker {} artifact: available ({}, {}; protocol={}; {})",
                 worker.adapter,
                 worker.command.as_deref().unwrap_or_default(),
                 worker.version.as_deref().unwrap_or("unknown version"),
+                worker.protocol.as_deref().unwrap_or("unknown"),
                 worker.integrity
             );
         } else {
             println!(
-                "worker {}: unavailable ({})",
+                "worker {} artifact: unavailable ({})",
                 worker.adapter,
                 worker.error.as_deref().unwrap_or_default()
+            );
+        }
+        if worker.root_launch_allowed {
+            println!("worker {} root launch: allowed", worker.adapter);
+        } else {
+            println!(
+                "worker {} root launch: blocked ({})",
+                worker.adapter,
+                worker.root_launch_error.as_deref().unwrap_or_default()
             );
         }
     }

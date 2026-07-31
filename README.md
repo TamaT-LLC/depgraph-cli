@@ -136,6 +136,7 @@ depgraph resolve --build /path/to/repository --allow-project-code
 
 depgraph doctor --json
 depgraph doctor --details --json
+depgraph doctor --root /path/to/repository --json
 depgraph deps path:src/app.ts --transitive --max-items 100 --max-bytes 1048576
 depgraph deps path:src/app.ts --transitive --cursor "$NEXT_CURSOR" --json
 depgraph deps path:src/app.ts --transitive --all --json
@@ -187,6 +188,14 @@ counts and at most 64 cause groups plus five representative diagnostics
 without loading diagnostic payload JSON, graph evidence, or adapter stderr.
 Completed build and runtime overlays are projected into the same bounded counts.
 Use `doctor --details` for the complete retained attempt payload.
+The diagnostic root defaults to the latest attempt's stored root, falling
+back to the current working directory only when the store has no attempt;
+`--root PATH` selects it explicitly. Worker `available`, version, protocol,
+and integrity describe an isolated artifact handshake and therefore do not
+change with the invoking directory. `root_launch_allowed` and
+`root_launch_error` separately report whether that artifact may be launched
+for the diagnostic root, preserving the development-artifact-inside-root
+security boundary.
 
 `deps`, `dependents`, and `unresolved` use the versioned
 `depgraph-interactive-query-page-v1` contract unless `--all` is explicit.
