@@ -16,8 +16,7 @@ use crate::{
     metadata::{LockIndex, apply_lock_versions, run_cargo_metadata},
     repository_inventory::RepositoryInventory,
     source::{
-        CallOccurrenceKey, Occurrence, SourceSpan, TypeUseOccurrenceKey, UseOccurrenceKey,
-        collect_occurrences,
+        CallOccurrenceKey, Occurrence, SourceSpan, TypeUseOccurrenceKey, collect_occurrences,
     },
     toolchain::{
         RustToolchainSelection, TOOLCHAIN_REMEDIATION, TOOLCHAIN_SELECTION_CONTRACT,
@@ -211,7 +210,6 @@ struct State {
     rust_prelude_policies: BTreeMap<usize, RustPreludePolicy>,
     source_module_contexts: BTreeMap<(usize, String), BTreeSet<ModuleContext>>,
     dependency_resolutions: BTreeMap<(usize, String), TargetResolution>,
-    semantic_use_occurrences: BTreeSet<UseOccurrenceKey>,
     semantic_type_use_occurrences: BTreeSet<TypeUseOccurrenceKey>,
     semantic_call_occurrences: BTreeSet<CallOccurrenceKey>,
     unsupported_syntax: u64,
@@ -512,7 +510,6 @@ impl State {
             rust_prelude_policies: BTreeMap::new(),
             source_module_contexts: BTreeMap::new(),
             dependency_resolutions: BTreeMap::new(),
-            semantic_use_occurrences: BTreeSet::new(),
             semantic_type_use_occurrences: BTreeSet::new(),
             semantic_call_occurrences: BTreeSet::new(),
             unsupported_syntax: 0,
@@ -1358,8 +1355,6 @@ impl State {
         self.edges = edges;
         self.sites = sites;
         self.files = files;
-        self.semantic_use_occurrences
-            .extend(delta.refined_use_keys.iter().cloned());
         self.semantic_type_use_occurrences
             .extend(delta.refined_type_use_keys.iter().cloned());
         self.semantic_call_occurrences
@@ -2006,27 +2001,14 @@ impl State {
                     Occurrence::Use {
                         target_specifier,
                         site_specifier,
-                        alias,
-                        glob,
+                        alias: _,
+                        glob: _,
                         reexport,
                         module_scope: _,
                         inline_ancestors,
                         condition,
                         span,
                     } => {
-                        let occurrence_key = UseOccurrenceKey::from_occurrence(
-                            &source.rel_path,
-                            &target_specifier,
-                            alias.as_deref(),
-                            glob,
-                            reexport,
-                            &inline_ancestors,
-                            &condition,
-                            span,
-                        );
-                        if self.semantic_use_occurrences.contains(&occurrence_key) {
-                            continue;
-                        }
                         let resolution = self.resolve_rust_path(
                             packages,
                             source.package_index,
@@ -2118,19 +2100,6 @@ impl State {
                         condition,
                         span,
                     } => {
-                        let occurrence_key = UseOccurrenceKey::from_occurrence(
-                            &source.rel_path,
-                            &specifier,
-                            alias.as_deref(),
-                            false,
-                            false,
-                            &inline_ancestors,
-                            &condition,
-                            span,
-                        );
-                        if self.semantic_use_occurrences.contains(&occurrence_key) {
-                            continue;
-                        }
                         let resolution = self.resolve_rust_path(
                             packages,
                             source.package_index,
