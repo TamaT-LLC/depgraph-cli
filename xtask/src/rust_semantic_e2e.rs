@@ -284,9 +284,10 @@ fn assert_semantic_scan(scan: &Value, expect_attested_sysroot: bool) -> Result<(
     );
     if expect_attested_sysroot {
         ensure!(
-            coverage["resolved"] == coverage["dependency_sites"]
-                && string_array_contains(&coverage["completeness"], "semantic-complete"),
-            "packaged Rust semantic scan did not exactly resolve its attested sysroot: {coverage}"
+            coverage["resolved"].as_u64().unwrap_or(0) + coverage["external"].as_u64().unwrap_or(0)
+                == coverage["dependency_sites"].as_u64().unwrap_or(u64::MAX)
+                && coverage["candidates"] == 0,
+            "packaged Rust mixed-phase scan did not conserve resolved and external sites: {coverage}"
         );
     } else {
         ensure!(
@@ -530,6 +531,8 @@ fn assert_normalized_relative_path(path: &str, context: &str) -> Result<()> {
 }
 
 struct FixtureIds {
+    main_file: String,
+    package: String,
     build: String,
     transform: String,
     input: String,
@@ -540,6 +543,7 @@ struct FixtureIds {
     build_input: String,
     left_right_call: String,
     right_left_call: String,
+    main_package_import: String,
 }
 
 fn assert_required_semantic_graph(
@@ -551,6 +555,8 @@ fn assert_required_semantic_graph(
     let edges = graph_array(graph, "edges")?;
     let evidence = graph_array(graph, "evidence")?;
 
+    let main_file = require_display_node(nodes, "file", "src/main.rs")?;
+    let package = require_display_node(nodes, "package_instance", "rust-release-semantic-fixture")?;
     let build = require_node(nodes, "symbol", BUILD, "function")?;
     let transform = require_node(nodes, "symbol", TRANSFORM, "function")?;
     let input = require_node(nodes, "type", INPUT, "struct")?;
@@ -567,10 +573,96 @@ fn assert_required_semantic_graph(
     require_edge(edges, &transform, &output, "type_uses")?;
     let left_right_call = require_edge(edges, &cycle_left, &cycle_right, "calls")?;
     let right_left_call = require_edge(edges, &cycle_right, &cycle_left, "calls")?;
+    let main_package_imports = edges
+        .iter()
+        .filter(|edge| {
+            edge["source"] == main_file
+                && edge["target"] == package
+                && edge["kind"] == "imports"
+                && edge["phase"] == "source"
+                && edge["resolution_status"] == "resolved"
+                && edge["precision"] == "exact"
+        })
+        .collect::<Vec<_>>();
+    ensure!(
+        main_package_imports.len() == 1,
+        "src/main.rs must retain exactly one source-phase package import alongside HIR refinement: {main_package_imports:?}"
+    );
+    let main_package_import = main_package_imports[0];
+    let main_package_site_id = required_str(main_package_import, "site_id", "main package import")?;
+    let main_package_site = sites
+        .iter()
+        .find(|site| site["id"] == main_package_site_id)
+        .context("main package import has no source dependency site")?;
+    ensure!(
+        main_package_site["source"] == main_file
+            && main_package_site["kind"] == "rust_use"
+            && main_package_site["target_ids"]
+                .as_array()
+                .is_some_and(|targets| {
+                    targets.len() == 1 && targets[0] == Value::String(package.clone())
+                })
+            && evidence.iter().any(|item| {
+                item["owner_type"] == "edge"
+                    && item["owner_id"] == main_package_import["id"]
+                    && item["kind"] == "source"
+                    && item["extractor"] == "rust-static"
+                    && item["path"] == "src/main.rs"
+            }),
+        "source package import lost its file owner, exact package target, or source evidence: edge={main_package_import}, site={main_package_site}"
+    );
+    let refined_main_imports = edges
+        .iter()
+        .filter(|edge| {
+            edge["target"] == input
+                && edge["kind"] == "imports"
+                && edge["phase"] == "semantic"
+                && edge["resolution_status"] == "resolved"
+                && edge["precision"] == "exact"
+        })
+        .filter(|edge| {
+            evidence.iter().any(|item| {
+                item["owner_type"] == "edge"
+                    && item["owner_id"] == edge["id"]
+                    && item["kind"] == "semantic"
+                    && item["extractor"] == "rust-analyzer-hir"
+                    && item["path"] == "src/main.rs"
+            })
+        })
+        .collect::<Vec<_>>();
+    ensure!(
+        refined_main_imports.len() == 1,
+        "src/main.rs must have exactly one HIR-refined import for Input: {refined_main_imports:?}"
+    );
     for edge in [build_call, build_input, left_right_call, right_left_call] {
         assert_dependency_edge_contract(edge, sites, evidence)?;
     }
     if expect_attested_sysroot {
+        let semantic_edges = edges
+            .iter()
+            .filter(|edge| edge["phase"] == "semantic")
+            .collect::<Vec<_>>();
+        let semantic_dependency_edges = semantic_edges
+            .iter()
+            .filter(|edge| edge["site_id"].as_str().is_some())
+            .collect::<Vec<_>>();
+        ensure!(
+            !semantic_edges.is_empty()
+                && semantic_edges.iter().all(|edge| {
+                    edge["resolution_status"] == "resolved" && edge["precision"] == "exact"
+                })
+                && !semantic_dependency_edges.is_empty()
+                && semantic_dependency_edges.iter().all(|edge| {
+                    edge["site_id"].as_str().is_some_and(|site_id| {
+                        sites.iter().any(|site| {
+                            site["id"] == site_id
+                                && site["resolution_status"] == "resolved"
+                                && site["precision"] == "exact"
+                        })
+                    })
+                }),
+            "packaged Rust graph did not exactly resolve every semantic-phase edge: {semantic_edges:?}"
+        );
         let abort = require_sysroot_node(nodes, "symbol", "abort", "std")?;
         let vec = require_sysroot_node(nodes, "type", "Vec", "alloc")?;
         let string = require_sysroot_node(nodes, "type", "String", "alloc")?;
@@ -599,6 +691,8 @@ fn assert_required_semantic_graph(
     }
 
     Ok(FixtureIds {
+        main_file,
+        package,
         build,
         transform,
         input,
@@ -609,7 +703,23 @@ fn assert_required_semantic_graph(
         build_input: required_str(build_input, "id", "build input edge")?.to_owned(),
         left_right_call: required_str(left_right_call, "id", "left cycle edge")?.to_owned(),
         right_left_call: required_str(right_left_call, "id", "right cycle edge")?.to_owned(),
+        main_package_import: required_str(main_package_import, "id", "main package import edge")?
+            .to_owned(),
     })
+}
+
+fn require_display_node(nodes: &[Value], kind: &str, display_name: &str) -> Result<String> {
+    let matches = nodes
+        .iter()
+        .filter(|node| node["kind"] == kind && node["display_name"] == display_name)
+        .collect::<Vec<_>>();
+    ensure!(
+        matches.len() == 1,
+        "expected exactly one {kind} node named {display_name}, found {}: {matches:?}",
+        matches.len()
+    );
+    let node = matches[0];
+    Ok(required_str(node, "id", display_name)?.to_owned())
 }
 
 fn require_sysroot_node(
@@ -731,6 +841,50 @@ fn verify_queries(
     second_store: &Path,
     ids: &FixtureIds,
 ) -> Result<()> {
+    let file_deps = runner.query(
+        first_store,
+        &["deps", "path:src/main.rs", "--all", "--json"],
+    )?;
+    ensure!(
+        file_deps["data"]["root"]["id"] == ids.main_file
+            && file_deps["data"]["edges"]
+                .as_array()
+                .is_some_and(|edges| edges
+                    .iter()
+                    .any(|edge| edge["id"] == ids.main_package_import)),
+        "Rust deps omitted the retained src/main.rs -> package import: {file_deps}"
+    );
+
+    let file_to_package = runner.query(
+        first_store,
+        &[
+            "why",
+            "path:src/main.rs",
+            "package:rust-release-semantic-fixture",
+            "--json",
+        ],
+    )?;
+    ensure!(
+        file_to_package["data"]["path_found"] == true
+            && file_to_package["data"]["from"]["id"] == ids.main_file
+            && file_to_package["data"]["to"]["id"] == ids.package
+            && file_to_package["data"]["steps"]
+                .as_array()
+                .is_some_and(|steps| {
+                    steps.len() == 1
+                        && steps[0]["edge"]["id"] == ids.main_package_import
+                        && steps[0]["edge"]["phase"] == "source"
+                        && steps[0]["evidence"].as_array().is_some_and(|items| {
+                            items.iter().any(|item| {
+                                item["kind"] == "source"
+                                    && item["extractor"] == "rust-static"
+                                    && item["path"] == "src/main.rs"
+                            })
+                        })
+                }),
+        "Rust why did not retain src/main.rs -> package connectivity and source evidence: {file_to_package}"
+    );
+
     let deps = runner.query(
         first_store,
         &["deps", &format!("symbol:{BUILD}"), "--all", "--json"],
@@ -1090,5 +1244,21 @@ mod tests {
             "release-gate-pending"
         );
         assert_eq!(expected_release_gate(None), "release-gate-verified");
+    }
+
+    #[test]
+    fn display_node_lookup_rejects_ambiguous_matches() {
+        let nodes = [
+            serde_json::json!({"id": "file:one", "kind": "file", "display_name": "src/main.rs"}),
+            serde_json::json!({"id": "file:two", "kind": "file", "display_name": "src/main.rs"}),
+        ];
+
+        let error = require_display_node(&nodes, "file", "src/main.rs").unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("expected exactly one file node named src/main.rs, found 2")
+        );
     }
 }

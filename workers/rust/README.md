@@ -184,7 +184,8 @@ now:
   flow, and call-bearing macro expansion boundaries as explicit external or
   unresolved dependency sites;
   classify every emitted site as resolved, candidates, external, or unresolved;
-  and replace the matching syntax import occurrence instead of duplicating it;
+  retain each matching source-phase file/package import projection alongside
+  its HIR-refined module/symbol occurrence, without duplicating either phase;
 - preserve canonical cfg/feature/target conditions, semantic primary evidence,
   supporting source evidence, and direct-source macro provenance, then atomically
   union the validated node/site/edge/file-ledger delta with the syntax graph.

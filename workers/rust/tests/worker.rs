@@ -1041,12 +1041,21 @@ use defs::dual;
         .iter()
         .filter(|site| site.kind == "rust_use" && site.specifier == "defs::dual")
         .collect();
-    assert_eq!(sites.len(), 1);
-    let site = sites[0];
+    assert_eq!(sites.len(), 2);
+    let site = sites
+        .iter()
+        .find(|site| site.evidence[0].kind == EvidenceKind::Semantic)
+        .expect("HIR-refined use site");
+    let source_site = sites
+        .iter()
+        .find(|site| site.evidence[0].kind == EvidenceKind::Source)
+        .expect("source-phase use site");
     assert_eq!(site.resolution_status, ResolutionStatus::Candidates);
     assert_eq!(site.precision, Precision::Overapprox);
     assert_eq!(site.target_ids.len(), 2);
     assert_eq!(site.evidence[0].kind, EvidenceKind::Semantic);
+    assert_eq!(source_site.resolution_status, ResolutionStatus::Resolved);
+    assert_eq!(source_site.target_ids.len(), 1);
     let linked: Vec<_> = result
         .edges
         .iter()
@@ -2721,6 +2730,7 @@ pub mod nested {
                 .iter()
                 .find(|site| {
                     site.specifier == specifier
+                        && site.evidence[0].kind == EvidenceKind::Semantic
                         && site
                             .evidence
                             .iter()
