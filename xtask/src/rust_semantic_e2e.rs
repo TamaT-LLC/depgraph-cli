@@ -709,10 +709,16 @@ fn assert_required_semantic_graph(
 }
 
 fn require_display_node(nodes: &[Value], kind: &str, display_name: &str) -> Result<String> {
-    let node = nodes
+    let matches = nodes
         .iter()
-        .find(|node| node["kind"] == kind && node["display_name"] == display_name)
-        .with_context(|| format!("missing {kind} node {display_name}"))?;
+        .filter(|node| node["kind"] == kind && node["display_name"] == display_name)
+        .collect::<Vec<_>>();
+    ensure!(
+        matches.len() == 1,
+        "expected exactly one {kind} node named {display_name}, found {}: {matches:?}",
+        matches.len()
+    );
+    let node = matches[0];
     Ok(required_str(node, "id", display_name)?.to_owned())
 }
 
@@ -1238,5 +1244,21 @@ mod tests {
             "release-gate-pending"
         );
         assert_eq!(expected_release_gate(None), "release-gate-verified");
+    }
+
+    #[test]
+    fn display_node_lookup_rejects_ambiguous_matches() {
+        let nodes = [
+            serde_json::json!({"id": "file:one", "kind": "file", "display_name": "src/main.rs"}),
+            serde_json::json!({"id": "file:two", "kind": "file", "display_name": "src/main.rs"}),
+        ];
+
+        let error = require_display_node(&nodes, "file", "src/main.rs").unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("expected exactly one file node named src/main.rs, found 2")
+        );
     }
 }
