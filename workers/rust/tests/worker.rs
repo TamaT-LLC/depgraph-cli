@@ -128,6 +128,27 @@ fn hir_import_type_call_graph_emits_exact_nodes_sites_and_relations() {
         result.profile.properties["rust_hir_semantic_issue_count"],
         0
     );
+    let active_cfg_by_crate = result.profile.properties["rust_hir_active_cfg_by_crate"]
+        .as_object()
+        .expect("HIR profile records active cfg once per crate");
+    assert!(!active_cfg_by_crate.is_empty());
+    assert!(
+        active_cfg_by_crate
+            .values()
+            .all(|cfg| cfg.as_array().is_some_and(|cfg| !cfg.is_empty()))
+    );
+    assert!(
+        result
+            .sites
+            .iter()
+            .flat_map(|site| &site.evidence)
+            .filter(|evidence| evidence.extractor == "rust-analyzer-hir")
+            .all(|evidence| {
+                !evidence.properties.contains_key("active_cfg")
+                    && evidence.properties["active_cfg_source"]
+                        == "profile.rust_hir_active_cfg_by_crate"
+            })
+    );
     assert!(
         !result
             .coverage

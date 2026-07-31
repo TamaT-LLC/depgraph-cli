@@ -50,6 +50,7 @@ pub const STORE_SCHEMA_VERSION: i64 = 13;
 // Larger pages keep the representative semantic graph's multi-kilobyte rows
 // from forcing one B-tree page per row. Existing stores retain their page size.
 const STORE_PAGE_SIZE_BYTES: i64 = 16 * 1024;
+const STORE_CACHE_SIZE_KIB: i64 = 64 * 1024;
 const DOCTOR_SUMMARY_MAX_DIAGNOSTIC_GROUPS: usize = 64;
 const DOCTOR_SUMMARY_MAX_DIAGNOSTIC_SAMPLES: usize = 5;
 const DOCTOR_SUMMARY_MAX_KEY_BYTES: usize = 128;
@@ -530,8 +531,11 @@ impl Store {
         }
         self.connection.execute_batch(
             "PRAGMA journal_mode = WAL;
-             PRAGMA synchronous = NORMAL;",
+             PRAGMA synchronous = NORMAL;
+             PRAGMA temp_store = MEMORY;",
         )?;
+        self.connection
+            .pragma_update(None, "cache_size", -STORE_CACHE_SIZE_KIB)?;
         if current > STORE_SCHEMA_VERSION {
             bail!("store schema {current} is newer than supported schema {STORE_SCHEMA_VERSION}");
         }
@@ -5575,6 +5579,14 @@ mod tests {
             .connection
             .query_row("PRAGMA page_size", [], |row| row.get(0))?;
         assert_eq!(page_size, STORE_PAGE_SIZE_BYTES);
+        let cache_size: i64 = store
+            .connection
+            .query_row("PRAGMA cache_size", [], |row| row.get(0))?;
+        assert_eq!(cache_size, -STORE_CACHE_SIZE_KIB);
+        let temp_store: i64 = store
+            .connection
+            .query_row("PRAGMA temp_store", [], |row| row.get(0))?;
+        assert_eq!(temp_store, 2);
         Ok(())
     }
 

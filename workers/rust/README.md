@@ -305,6 +305,7 @@ values are outcome-dependent; fallback paths retain the syntax-only values.
 | `rust_hir_semantic_site_count` | Number of HIR-refined import/re-export, semantic type-use, and call sites |
 | `rust_hir_semantic_call_site_count` | Number of semantic call sites, including exact, candidate, external, unresolved, and generated macro boundaries |
 | `rust_hir_semantic_issue_count` | Number of recoverable semantic-extraction issues; nonzero yields `import-type-call-graph-partial` |
+| `rust_hir_active_cfg_by_crate` | Canonical crate-identity-to-active-cfg map shared by HIR evidence; semantic evidence refers to this profile property through `active_cfg_source` instead of repeating the same cfg vector per record |
 
 ### Performance audit
 
@@ -316,6 +317,9 @@ discovery/metadata, syntax graph, model planning, VFS bytes, crate graph,
 database apply, HIR semantic walk, source finalization, protocol build/write,
 event counts, and protocol bytes. Core adds worker wall time, protocol ingest,
 SQLite validation/promotion time and database bytes, and total scan wall time.
+HIR occurrence indexes borrow the source inventory, and crate-level active cfg
+is stored once in `rust_hir_active_cfg_by_crate`; this bounds cloning and wire
+size without dropping the cfg context addressable from each evidence record.
 
 `scripts/benchmark-mvp.sh` exercises those phases against the deterministic
 31-source-file Rust fixture in cold-store, `--no-cache`, and validated warm-hit

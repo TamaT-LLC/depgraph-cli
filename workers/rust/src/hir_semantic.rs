@@ -9,6 +9,7 @@ use crate::{
     ADAPTER_VERSION, EXTRACTOR as SOURCE_EXTRACTOR, RUST_ANALYZER_CRATE_VERSION,
     RUST_ANALYZER_REVISION, RUST_SYSROOT_COMPONENT_VERSION,
     hir_project::SafeProjectModel,
+    scanner::OccurrenceIndex,
     source::{
         CallOccurrenceKey, CallSyntaxKind, Occurrence, SourceSpan, TypeUseContext,
         TypeUseOccurrenceKey, UseOccurrenceKey,
@@ -165,7 +166,7 @@ struct Extractor<'a> {
     db: &'a RootDatabase,
     sema: Semantics<'a, RootDatabase>,
     contexts: &'a BTreeMap<String, SemanticCrateContext>,
-    occurrences_by_path: &'a BTreeMap<String, Vec<Occurrence>>,
+    occurrences_by_path: &'a OccurrenceIndex<'a>,
     profile_id: &'a str,
     paths_by_file: BTreeMap<u32, String>,
     crate_keys_by_base: HashMap<ra_ap_ide_db::base_db::Crate, String>,
@@ -239,7 +240,7 @@ impl CallCandidateSet {
 pub(crate) fn extract_semantic_delta(
     model: &SafeProjectModel,
     contexts: &BTreeMap<String, SemanticCrateContext>,
-    occurrences_by_path: &BTreeMap<String, Vec<Occurrence>>,
+    occurrences_by_path: &OccurrenceIndex<'_>,
     profile_id: &str,
 ) -> Result<SemanticDelta> {
     let db = model.database();
@@ -1009,11 +1010,11 @@ impl Extractor<'_> {
             self.index_fn_pointer_targets(file_id, module, &parsed);
             let occurrences = self
                 .occurrences_by_path
-                .get(&path)
-                .cloned()
+                .get(path.as_str())
+                .copied()
                 .unwrap_or_default();
             let syntax_index = FileSyntaxIndex::new(self.db, file_id, &parsed);
-            self.index_external_aliases(&crate_key, module, &syntax_index, &occurrences);
+            self.index_external_aliases(&crate_key, module, &syntax_index, occurrences);
             dependency_sources.push((crate_key, file_id, path, module, syntax_index, occurrences));
         }
         for (crate_key, file_id, path, module, syntax_index, occurrences) in dependency_sources {
@@ -1036,7 +1037,7 @@ impl Extractor<'_> {
         path: &str,
         module: Module,
         syntax_index: &FileSyntaxIndex,
-        occurrences: Vec<Occurrence>,
+        occurrences: &[Occurrence],
     ) -> Result<()> {
         for occurrence in occurrences {
             let use_key = occurrence.use_key(path);
@@ -1058,13 +1059,13 @@ impl Extractor<'_> {
                         path,
                         module,
                         syntax_index,
-                        &target_specifier,
-                        &site_specifier,
+                        target_specifier,
+                        site_specifier,
                         alias.as_deref(),
-                        glob,
-                        reexport,
-                        condition,
-                        span,
+                        *glob,
+                        *reexport,
+                        condition.clone(),
+                        *span,
                         use_key.expect("use occurrence has a use key"),
                     )?;
                 }
@@ -1080,10 +1081,10 @@ impl Extractor<'_> {
                         path,
                         module,
                         syntax_index,
-                        &specifier,
+                        specifier,
                         alias.as_deref(),
-                        condition,
-                        span,
+                        condition.clone(),
+                        *span,
                         use_key.expect("extern-crate occurrence has a use key"),
                     )?;
                 }
@@ -1099,11 +1100,11 @@ impl Extractor<'_> {
                         path,
                         module,
                         syntax_index,
-                        &specifier,
-                        context,
-                        &inline_ancestors,
-                        condition,
-                        span,
+                        specifier,
+                        *context,
+                        inline_ancestors,
+                        condition.clone(),
+                        *span,
                         type_use_key.expect("type-use occurrence has a type-use key"),
                     )?;
                 }
@@ -1120,11 +1121,11 @@ impl Extractor<'_> {
                         path,
                         module,
                         syntax_index,
-                        &specifier,
-                        syntax_kind,
-                        &inline_ancestors,
-                        condition,
-                        span,
+                        specifier,
+                        *syntax_kind,
+                        inline_ancestors,
+                        condition.clone(),
+                        *span,
                         call_key.expect("call occurrence has a call key"),
                     )?;
                 }
@@ -4052,11 +4053,6 @@ impl Extractor<'_> {
         detail: &str,
         hir_kind: &str,
     ) -> Evidence {
-        let cfg = self
-            .contexts
-            .get(crate_key)
-            .map(|context| context.cfg.clone())
-            .unwrap_or_default();
         Evidence {
             kind: EvidenceKind::Semantic,
             extractor: EXTRACTOR.into(),
@@ -4072,7 +4068,7 @@ impl Extractor<'_> {
                 "rust_analyzer_version": RUST_ANALYZER_CRATE_VERSION,
                 "rust_analyzer_revision": RUST_ANALYZER_REVISION,
                 "crate_identity": crate_key,
-                "active_cfg": cfg,
+                "active_cfg_source": "profile.rust_hir_active_cfg_by_crate",
                 "hir_kind": hir_kind,
             })),
         }

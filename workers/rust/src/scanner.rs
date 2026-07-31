@@ -192,10 +192,12 @@ struct AggregatedDiagnostic {
     site_evidence: BTreeMap<String, Evidence>,
 }
 
-type SemanticExtractor = fn(
+pub(crate) type OccurrenceIndex<'a> = BTreeMap<&'a str, &'a [Occurrence]>;
+
+type SemanticExtractor = for<'a> fn(
     &SafeProjectModel,
     &BTreeMap<String, SemanticCrateContext>,
-    &BTreeMap<String, Vec<Occurrence>>,
+    &OccurrenceIndex<'a>,
     &str,
 ) -> Result<SemanticDelta>;
 
@@ -1183,7 +1185,7 @@ impl State {
                     source
                         .syntax
                         .as_ref()
-                        .map(|_| (source.rel_path.clone(), source.occurrences.clone()))
+                        .map(|_| (source.rel_path.as_str(), source.occurrences.as_slice()))
                 })
                 .collect();
             let delta =
@@ -1193,7 +1195,7 @@ impl State {
         })();
 
         match result {
-            Ok((delta, _contexts)) => {
+            Ok((delta, contexts)) => {
                 let node_count = delta.nodes.len() as u64;
                 let relation_count = delta.edges.len() as u64;
                 let site_count = delta.sites.len() as u64;
@@ -1249,6 +1251,18 @@ impl State {
                 self.profile.properties.insert(
                     "rust_hir_semantic_issue_count".into(),
                     Value::from(issue_count),
+                );
+                self.profile.properties.insert(
+                    "rust_hir_active_cfg_by_crate".into(),
+                    serde_json::to_value(
+                        contexts
+                            .iter()
+                            .map(|(crate_identity, context)| {
+                                (crate_identity.as_str(), context.cfg.as_slice())
+                            })
+                            .collect::<BTreeMap<_, _>>(),
+                    )
+                    .expect("Rust HIR active cfg profile is JSON serializable"),
                 );
                 self.add_diagnostic(
                     DiagnosticSeverity::Info,
@@ -1843,7 +1857,15 @@ impl State {
                 else {
                     continue;
                 };
-                for occurrence in source.occurrences.clone() {
+                for occurrence in
+                    source
+                        .occurrences
+                        .iter()
+                        .filter_map(|occurrence| match occurrence {
+                            Occurrence::Module { .. } => Some(occurrence.clone()),
+                            _ => None,
+                        })
+                {
                     let Occurrence::Module {
                         name,
                         inline: false,
@@ -1903,7 +1925,14 @@ impl State {
             };
             let package = &packages[package_index];
             let source_node = self.file_nodes[&source.rel_path].clone();
-            for occurrence in source.occurrences.clone() {
+            for occurrence in source
+                .occurrences
+                .iter()
+                .filter_map(|occurrence| match occurrence {
+                    Occurrence::Module { .. } => Some(occurrence.clone()),
+                    _ => None,
+                })
+            {
                 let Occurrence::Module {
                     name,
                     inline,
@@ -1991,7 +2020,14 @@ impl State {
                 .get(&(package_index, source.rel_path.clone()))
                 .cloned()
                 .unwrap_or_default();
-            for occurrence in source.occurrences.clone() {
+            for occurrence in source
+                .occurrences
+                .iter()
+                .filter_map(|occurrence| match occurrence {
+                    Occurrence::TypeDefinition { .. } => Some(occurrence.clone()),
+                    _ => None,
+                })
+            {
                 let Occurrence::TypeDefinition {
                     name,
                     type_kind,
@@ -2082,9 +2118,17 @@ impl State {
                 continue;
             }
             let source_node = self.file_nodes[&source.rel_path].clone();
-            let occurrences = source.occurrences.clone();
-            let import_bindings = syntax_import_bindings(&occurrences);
-            for occurrence in occurrences {
+            let import_bindings = syntax_import_bindings(&source.occurrences);
+            for occurrence in source
+                .occurrences
+                .iter()
+                .filter_map(|occurrence| match occurrence {
+                    Occurrence::Call { .. }
+                    | Occurrence::Module { inline: true, .. }
+                    | Occurrence::TypeDefinition { .. } => None,
+                    _ => Some(occurrence.clone()),
+                })
+            {
                 match occurrence {
                     Occurrence::Use {
                         target_specifier,
@@ -4786,7 +4830,7 @@ mod tests {
     fn forced_semantic_failure(
         _model: &SafeProjectModel,
         _contexts: &BTreeMap<String, SemanticCrateContext>,
-        _occurrences_by_path: &BTreeMap<String, Vec<Occurrence>>,
+        _occurrences_by_path: &OccurrenceIndex<'_>,
         _profile_id: &str,
     ) -> Result<SemanticDelta> {
         bail!("forced typed semantic backend failure")
@@ -4795,7 +4839,7 @@ mod tests {
     fn invalid_semantic_delta(
         model: &SafeProjectModel,
         contexts: &BTreeMap<String, SemanticCrateContext>,
-        occurrences_by_path: &BTreeMap<String, Vec<Occurrence>>,
+        occurrences_by_path: &OccurrenceIndex<'_>,
         profile_id: &str,
     ) -> Result<SemanticDelta> {
         let mut delta = extract_semantic_delta(model, contexts, occurrences_by_path, profile_id)?;
