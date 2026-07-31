@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     path::Path,
 };
 
@@ -10,7 +10,7 @@ use depgraph_protocol::{
     validate_build_contract,
 };
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer, ser::SerializeMap};
 use serde_json::{Value, json};
 
 mod cache;
@@ -47,6 +47,9 @@ pub use runtime::{
 };
 
 pub const STORE_SCHEMA_VERSION: i64 = 13;
+// Larger pages keep the representative semantic graph's multi-kilobyte rows
+// from forcing one B-tree page per row. Existing stores retain their page size.
+const STORE_PAGE_SIZE_BYTES: i64 = 16 * 1024;
 const DOCTOR_SUMMARY_MAX_DIAGNOSTIC_GROUPS: usize = 64;
 const DOCTOR_SUMMARY_MAX_DIAGNOSTIC_SAMPLES: usize = 5;
 const DOCTOR_SUMMARY_MAX_KEY_BYTES: usize = 128;
@@ -519,12 +522,16 @@ impl Store {
     }
 
     fn migrate(&mut self) -> Result<()> {
+        self.connection.execute_batch("PRAGMA foreign_keys = ON;")?;
+        let current = self.schema_version()?;
+        if current == 0 {
+            self.connection
+                .pragma_update(None, "page_size", STORE_PAGE_SIZE_BYTES)?;
+        }
         self.connection.execute_batch(
-            "PRAGMA foreign_keys = ON;
-             PRAGMA journal_mode = WAL;
+            "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;",
         )?;
-        let current = self.schema_version()?;
         if current > STORE_SCHEMA_VERSION {
             bail!("store schema {current} is newer than supported schema {STORE_SCHEMA_VERSION}");
         }
@@ -1933,11 +1940,24 @@ impl Store {
         let scan_id = required_str(first, "scan_id")?;
         let tx = self.connection.transaction()?;
         ensure_scan_staging(&tx, scan_id)?;
+        // Adapter logs may already have advanced mutation_count, so evidence
+        // itself is the authoritative signal that an owner can need replacing.
+        let replace_existing_evidence: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM evidence WHERE scan_id=?1 LIMIT 1)",
+            [scan_id],
+            |row| row.get(0),
+        )?;
+        let mut evidence_owners = HashSet::new();
         for event in events {
             if required_str(event, "scan_id")? != scan_id {
                 bail!("event batch contains multiple scan IDs");
             }
-            ingest_event_in_transaction(&tx, event)?;
+            ingest_event_in_transaction(
+                &tx,
+                event,
+                replace_existing_evidence,
+                &mut evidence_owners,
+            )?;
         }
         tx.execute(
             "UPDATE scans SET mutation_count=mutation_count+1 WHERE id=?1",
@@ -3930,7 +3950,12 @@ fn validate_snapshot_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn ingest_event_in_transaction(tx: &Transaction<'_>, event: &Value) -> Result<()> {
+fn ingest_event_in_transaction(
+    tx: &Transaction<'_>,
+    event: &Value,
+    replace_existing_evidence: bool,
+    evidence_owners: &mut HashSet<(String, String)>,
+) -> Result<()> {
     let scan_id = required_str(event, "scan_id")?;
     let event_type = required_str(event, "event")?;
     let adapter = event
@@ -3948,11 +3973,28 @@ fn ingest_event_in_transaction(tx: &Transaction<'_>, event: &Value) -> Result<()
         }
         "profile_declared" => insert_profile(tx, scan_id, required_object(event, "profile")?)?,
         "node_upsert" => insert_node(tx, scan_id, required_object(event, "node")?)?,
-        "dependency_site" => insert_site(tx, scan_id, required_object(event, "site")?)?,
-        "edge_upsert" => insert_edge(tx, scan_id, required_object(event, "edge")?)?,
-        "diagnostic" => {
-            insert_diagnostic(tx, scan_id, adapter, required_object(event, "diagnostic")?)?
-        }
+        "dependency_site" => insert_site(
+            tx,
+            scan_id,
+            required_object(event, "site")?,
+            replace_existing_evidence,
+            evidence_owners,
+        )?,
+        "edge_upsert" => insert_edge(
+            tx,
+            scan_id,
+            required_object(event, "edge")?,
+            replace_existing_evidence,
+            evidence_owners,
+        )?,
+        "diagnostic" => insert_diagnostic(
+            tx,
+            scan_id,
+            adapter,
+            required_object(event, "diagnostic")?,
+            replace_existing_evidence,
+            evidence_owners,
+        )?,
         "file_completed" => insert_file_coverage(tx, scan_id, adapter, event)?,
         "profile_completed" => insert_profile_coverage(tx, scan_id, event)?,
         "scan_completed" => {
@@ -4087,9 +4129,23 @@ fn insert_node(tx: &Transaction<'_>, scan_id: &str, node: &Value) -> Result<()> 
     Ok(())
 }
 
-fn insert_site(tx: &Transaction<'_>, scan_id: &str, site: &Value) -> Result<()> {
+fn insert_site(
+    tx: &Transaction<'_>,
+    scan_id: &str,
+    site: &Value,
+    replace_existing_evidence: bool,
+    evidence_owners: &mut HashSet<(String, String)>,
+) -> Result<()> {
     upsert_site_row(tx, scan_id, site)?;
-    insert_evidence(tx, scan_id, "site", required_str(site, "id")?, site)?;
+    insert_evidence(
+        tx,
+        scan_id,
+        "site",
+        required_str(site, "id")?,
+        site,
+        replace_existing_evidence,
+        evidence_owners,
+    )?;
     Ok(())
 }
 
@@ -4122,14 +4178,28 @@ fn upsert_site_row(tx: &Transaction<'_>, scan_id: &str, site: &Value) -> Result<
             serde_json::to_string(&condition)?,
             serde_json::to_string(&targets)?,
             site.get("reason").and_then(Value::as_str),
-            serde_json::to_string(site)?
+            serialize_graph_object_without_evidence(site)?
         ])?;
     Ok(())
 }
 
-fn insert_edge(tx: &Transaction<'_>, scan_id: &str, edge: &Value) -> Result<()> {
+fn insert_edge(
+    tx: &Transaction<'_>,
+    scan_id: &str,
+    edge: &Value,
+    replace_existing_evidence: bool,
+    evidence_owners: &mut HashSet<(String, String)>,
+) -> Result<()> {
     upsert_edge_row(tx, scan_id, edge)?;
-    insert_evidence(tx, scan_id, "edge", required_str(edge, "id")?, edge)?;
+    insert_evidence(
+        tx,
+        scan_id,
+        "edge",
+        required_str(edge, "id")?,
+        edge,
+        replace_existing_evidence,
+        evidence_owners,
+    )?;
     Ok(())
 }
 
@@ -4163,9 +4233,42 @@ fn upsert_edge_row(tx: &Transaction<'_>, scan_id: &str, edge: &Value) -> Result<
             required_str(edge, "precision")?,
             serde_json::to_string(&condition)?,
             edge.get("generated").and_then(Value::as_bool).unwrap_or(false),
-            serde_json::to_string(edge)?
+            serialize_graph_object_without_evidence(edge)?
         ])?;
     Ok(())
+}
+
+// Evidence is authoritative in the normalized evidence table. Keeping an
+// empty wire field preserves typed raw-record decoding without storing every
+// multi-kilobyte payload a second time inside sites and edges.
+struct GraphObjectWithoutEvidence<'a>(&'a serde_json::Map<String, Value>);
+
+impl Serialize for GraphObjectWithoutEvidence<'_> {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let has_evidence = self.0.contains_key("evidence");
+        let mut map = serializer.serialize_map(Some(self.0.len() + usize::from(!has_evidence)))?;
+        for (key, value) in self.0 {
+            if key == "evidence" {
+                map.serialize_entry(key, &[] as &[Value])?;
+            } else {
+                map.serialize_entry(key, value)?;
+            }
+        }
+        if !has_evidence {
+            map.serialize_entry("evidence", &[] as &[Value])?;
+        }
+        map.end()
+    }
+}
+
+fn serialize_graph_object_without_evidence(object: &Value) -> Result<String> {
+    let object = object
+        .as_object()
+        .context("graph record must be a JSON object")?;
+    Ok(serde_json::to_string(&GraphObjectWithoutEvidence(object))?)
 }
 
 fn insert_evidence(
@@ -4174,9 +4277,16 @@ fn insert_evidence(
     owner_type: &str,
     owner_id: &str,
     object: &Value,
+    replace_existing_evidence: bool,
+    evidence_owners: &mut HashSet<(String, String)>,
 ) -> Result<()> {
-    tx.prepare_cached("DELETE FROM evidence WHERE scan_id=?1 AND owner_type=?2 AND owner_id=?3")?
+    let duplicate_in_batch = !evidence_owners.insert((owner_type.to_owned(), owner_id.to_owned()));
+    if replace_existing_evidence || duplicate_in_batch {
+        tx.prepare_cached(
+            "DELETE FROM evidence WHERE scan_id=?1 AND owner_type=?2 AND owner_id=?3",
+        )?
         .execute(params![scan_id, owner_type, owner_id])?;
+    }
     let evidence = object
         .get("evidence")
         .and_then(Value::as_array)
@@ -4219,6 +4329,8 @@ fn insert_diagnostic(
     scan_id: &str,
     adapter: &str,
     diagnostic: &Value,
+    replace_existing_evidence: bool,
+    evidence_owners: &mut HashSet<(String, String)>,
 ) -> Result<()> {
     let ordinal: i64 = tx.query_row(
         "SELECT COALESCE(MAX(ordinal), -1) + 1 FROM diagnostics WHERE scan_id = ?1",
@@ -4248,7 +4360,15 @@ fn insert_diagnostic(
             serde_json::to_string(diagnostic)?
         ],
     )?;
-    insert_evidence(tx, scan_id, "diagnostic", &id, diagnostic)?;
+    insert_evidence(
+        tx,
+        scan_id,
+        "diagnostic",
+        &id,
+        diagnostic,
+        replace_existing_evidence,
+        evidence_owners,
+    )?;
     Ok(())
 }
 
@@ -5366,6 +5486,16 @@ mod tests {
     }
 
     #[test]
+    fn new_stores_use_the_large_graph_page_size() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let page_size: i64 = store
+            .connection
+            .query_row("PRAGMA page_size", [], |row| row.get(0))?;
+        assert_eq!(page_size, STORE_PAGE_SIZE_BYTES);
+        Ok(())
+    }
+
+    #[test]
     fn daemon_recovery_cancels_staging_attempts_without_replacing_current_snapshot() -> Result<()> {
         let mut store = Store::open_in_memory()?;
         ingest_protocol_fixture(
@@ -5991,6 +6121,58 @@ mod tests {
         assert_eq!(snapshot.sites.len(), 1);
         assert_eq!(snapshot.edges.len(), 1);
         assert_eq!(store.latest_successful_id()?.as_deref(), Some("scan-1"));
+        Ok(())
+    }
+
+    #[test]
+    fn repeated_upserts_replace_evidence_within_and_across_batches() -> Result<()> {
+        let mut store = Store::open_in_memory()?;
+        store.start_scan("scan-1", Path::new("/tmp/project"), false)?;
+        let mut node = common("node_upsert", 1);
+        node["node"] = json!({
+            "id":"file:a","kind":"file","locator":"file://a","display_name":"a","properties":{}
+        });
+        store.ingest_event(&node)?;
+
+        let site = |seq, details: &[&str]| {
+            let mut event = common("dependency_site", seq);
+            event["site"] = json!({
+                "id":"site:1","source":"file:a","kind":"imports","specifier":"./b",
+                "profile_id":"fixture:default","resolution_status":"unresolved",
+                "precision":"exact","condition":{"op":"all","conditions":[]},"target_ids":[],
+                "evidence":details.iter().map(|detail| json!({
+                    "kind":"source","extractor":"fixture","extractor_version":"1.0.0",
+                    "path":"a.ts","start_line":1,"start_column":1,
+                    "end_line":1,"end_column":2,"detail":detail
+                })).collect::<Vec<_>>()
+            });
+            event
+        };
+        let first = site(2, &["stale-zero", "stale-one"]);
+        let same_batch_replacement = site(3, &["same-batch"]);
+        store.ingest_events(&[&first, &same_batch_replacement])?;
+        let snapshot = store.load_snapshot("scan-1")?;
+        assert_eq!(snapshot.evidence.len(), 1);
+        assert_eq!(snapshot.evidence[0].ordinal, 0);
+        assert_eq!(snapshot.evidence[0].detail.as_deref(), Some("same-batch"));
+
+        let later_batch_replacement = site(4, &["later-zero", "later-one"]);
+        store.ingest_event(&later_batch_replacement)?;
+        let snapshot = store.load_snapshot("scan-1")?;
+        assert_eq!(snapshot.evidence.len(), 2);
+        assert_eq!(snapshot.evidence[0].ordinal, 0);
+        assert_eq!(snapshot.evidence[0].detail.as_deref(), Some("later-zero"));
+        assert_eq!(snapshot.evidence[1].ordinal, 1);
+        assert_eq!(snapshot.evidence[1].detail.as_deref(), Some("later-one"));
+        let raw_site: String = store.connection.query_row(
+            "SELECT raw_json FROM sites WHERE scan_id='scan-1' AND id='site:1'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            serde_json::from_str::<Value>(&raw_site)?["evidence"],
+            json!([])
+        );
         Ok(())
     }
 
