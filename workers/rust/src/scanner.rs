@@ -27,7 +27,7 @@ use anyhow::{Context, Result, bail};
 use depgraph_protocol::{
     CompletenessLevel, Condition, Coverage, DependencySite, Diagnostic, DiagnosticSeverity,
     Evidence, EvidenceKind, GraphEdge, GraphNode, Phase, Precision, Profile, Properties,
-    ResolutionStatus, StableIdInput, stable_id, stable_id_from_value, validate_semantic_graph,
+    ResolutionStatus, StableIdInput, stable_id, stable_id_from_value, validate_semantic_graph_maps,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -651,11 +651,11 @@ impl State {
         self.profile
             .properties
             .insert("rust_syntax_fallback_summary".into(), fallback_summary);
+        validate_semantic_graph_maps(&self.nodes, &self.edges, &self.sites)
+            .context("Rust worker semantic graph invariants failed")?;
         let nodes: Vec<_> = self.nodes.into_values().collect();
         let edges: Vec<_> = self.edges.into_values().collect();
         let sites: Vec<_> = self.sites.into_values().collect();
-        validate_semantic_graph(&nodes, &edges, &sites)
-            .context("Rust worker semantic graph invariants failed")?;
 
         let files: Vec<_> = self.files.into_values().collect();
         let files_skipped = files.iter().filter(|file| file.skipped).count() as u64;
@@ -1439,10 +1439,7 @@ impl State {
                 delta.refined_call_keys.len()
             );
         }
-        let nodes_vec: Vec<_> = nodes.values().cloned().collect();
-        let edges_vec: Vec<_> = edges.values().cloned().collect();
-        let sites_vec: Vec<_> = sites.values().cloned().collect();
-        validate_semantic_graph(&nodes_vec, &edges_vec, &sites_vec)
+        validate_semantic_graph_maps(&nodes, &edges, &sites)
             .context("validate Rust HIR semantic delta")?;
         self.nodes = nodes;
         self.edges = edges;
@@ -5389,7 +5386,8 @@ pub fn consume(_: Local) {}
     fn scan_result_satisfies_site_edge_invariants() {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/workspace");
         let result = scan(&fixture).unwrap();
-        validate_semantic_graph(&result.nodes, &result.edges, &result.sites).unwrap();
+        depgraph_protocol::validate_semantic_graph(&result.nodes, &result.edges, &result.sites)
+            .unwrap();
         assert!(result.sites.iter().all(|site| !site.evidence.is_empty()));
         assert!(result.edges.iter().any(|edge| edge.phase == Phase::Source));
         assert!(

@@ -558,10 +558,8 @@ fn tool_identity_at(
 
 fn verified_rust_toolchain_identities(root: &Path) -> Result<(String, String, String), ()> {
     if let Ok((rustc, cargo)) = rustup_baseline_pair(root)
-        && let Ok((rustc_identity, rustc_output)) =
-            tool_identity_at(root, "rustc", &rustc, &["--version", "--verbose"])
-        && let Ok((cargo_identity, cargo_output)) =
-            tool_identity_at(root, "cargo", &cargo, &["--version", "--verbose"])
+        && let Ok((rustc_identity, rustc_output, cargo_identity, cargo_output)) =
+            paired_rust_tool_identities(root, &rustc, &cargo)
         && verified_rust_version(&rustc_output, RUSTC_BASELINE_COMMIT)
         && verified_rust_version(&cargo_output, CARGO_BASELINE_COMMIT)
         && version_field(&rustc_output, "host") == version_field(&cargo_output, "host")
@@ -576,10 +574,8 @@ fn verified_rust_toolchain_identities(root: &Path) -> Result<(String, String, St
 
     let rustc = resolve_safe_executable("rustc", root).map_err(|_| ())?;
     let cargo = resolve_safe_executable("cargo", root).map_err(|_| ())?;
-    let (rustc_identity, rustc_output) =
-        tool_identity_at(root, "rustc", &rustc, &["--version", "--verbose"])?;
-    let (cargo_identity, cargo_output) =
-        tool_identity_at(root, "cargo", &cargo, &["--version", "--verbose"])?;
+    let (rustc_identity, rustc_output, cargo_identity, cargo_output) =
+        paired_rust_tool_identities(root, &rustc, &cargo)?;
     if !verified_rust_version(&rustc_output, RUSTC_BASELINE_COMMIT)
         || !verified_rust_version(&cargo_output, CARGO_BASELINE_COMMIT)
         || version_field(&rustc_output, "host") != version_field(&cargo_output, "host")
@@ -587,6 +583,25 @@ fn verified_rust_toolchain_identities(root: &Path) -> Result<(String, String, St
         return Err(());
     }
     Ok(("host-default".to_owned(), rustc_identity, cargo_identity))
+}
+
+fn paired_rust_tool_identities(
+    root: &Path,
+    rustc: &Path,
+    cargo: &Path,
+) -> Result<(String, Vec<u8>, String, Vec<u8>), ()> {
+    thread::scope(|scope| {
+        let rustc_task =
+            scope.spawn(|| tool_identity_at(root, "rustc", rustc, &["--version", "--verbose"]));
+        let cargo_result = tool_identity_at(root, "cargo", cargo, &["--version", "--verbose"])?;
+        let rustc_result = rustc_task.join().map_err(|_| ())??;
+        Ok((
+            rustc_result.0,
+            rustc_result.1,
+            cargo_result.0,
+            cargo_result.1,
+        ))
+    })
 }
 
 fn rustup_pair_matches_attested_host(root: &Path, rustc: &Path, output: &[u8]) -> bool {
@@ -605,8 +620,12 @@ fn rustup_pair_matches_attested_host(root: &Path, rustc: &Path, output: &[u8]) -
 fn rustup_baseline_pair(root: &Path) -> Result<(PathBuf, PathBuf), ()> {
     let rustup = resolve_safe_executable("rustup", root).map_err(|_| ())?;
     let rustup_home = safe_rustup_home(root).ok_or(())?;
-    let rustc = rustup_which(root, &rustup, &rustup_home, "rustc")?;
-    let cargo = rustup_which(root, &rustup, &rustup_home, "cargo")?;
+    let (rustc, cargo) = thread::scope(|scope| {
+        let rustc_task = scope.spawn(|| rustup_which(root, &rustup, &rustup_home, "rustc"));
+        let cargo = rustup_which(root, &rustup, &rustup_home, "cargo")?;
+        let rustc = rustc_task.join().map_err(|_| ())??;
+        Ok::<_, ()>((rustc, cargo))
+    })?;
     if rustup_toolchain_root(&rustc, &rustup_home)? != rustup_toolchain_root(&cargo, &rustup_home)?
     {
         return Err(());

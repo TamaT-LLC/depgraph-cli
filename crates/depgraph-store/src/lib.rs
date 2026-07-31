@@ -2035,20 +2035,27 @@ impl Store {
             );
         }
 
-        let sites = load_sites(&self.connection, scan_id)?;
-        let edges = load_edges(&self.connection, scan_id)?;
-        let mut edges_by_site = BTreeMap::<String, Vec<&EdgeRecord>>::new();
+        let sites = load_site_validation_records(&self.connection, scan_id)?;
+        let edges = load_edge_validation_records(&self.connection, scan_id)?;
+        let mut edges_by_site = BTreeMap::<&str, Vec<&EdgeValidationRecord>>::new();
         for edge in &edges {
             if let Some(site_id) = &edge.site_id {
-                edges_by_site.entry(site_id.clone()).or_default().push(edge);
+                edges_by_site.entry(site_id).or_default().push(edge);
             }
         }
         for site in &sites {
-            let expected = site.target_ids.iter().cloned().collect::<BTreeSet<_>>();
+            let expected = site
+                .target_ids
+                .iter()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>();
             if expected.len() != site.target_ids.len() {
                 bail!("site {} contains duplicate target IDs", site.id);
             }
-            let site_edges = edges_by_site.get(&site.id).cloned().unwrap_or_default();
+            let site_edges = edges_by_site
+                .get(site.id.as_str())
+                .map(Vec::as_slice)
+                .unwrap_or_default();
             match site.resolution_status.as_str() {
                 "resolved" | "external" | "unresolved"
                     if expected.len() == 1 && site_edges.len() == 1 => {}
@@ -2064,7 +2071,7 @@ impl Store {
             }
             let observed = site_edges
                 .iter()
-                .map(|edge| edge.target.clone())
+                .map(|edge| edge.target.as_str())
                 .collect::<BTreeSet<_>>();
             if expected != observed || site_edges.len() != expected.len() {
                 bail!("site {} target IDs do not match its edge targets", site.id);
@@ -4961,6 +4968,82 @@ fn load_sites(connection: &Connection, scan_id: &str) -> Result<Vec<SiteRecord>>
         })
     })
     .collect()
+}
+
+struct SiteValidationRecord {
+    id: String,
+    source: String,
+    profile_id: String,
+    resolution_status: String,
+    precision: String,
+    target_ids: Vec<String>,
+}
+
+fn load_site_validation_records(
+    connection: &Connection,
+    scan_id: &str,
+) -> Result<Vec<SiteValidationRecord>> {
+    let mut statement = connection.prepare(
+        "SELECT id, source, profile_id, resolution_status, precision, target_ids_json
+         FROM sites WHERE scan_id=?1 ORDER BY id",
+    )?;
+    statement
+        .query_map([scan_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })?
+        .map(|row| {
+            let (id, source, profile_id, resolution_status, precision, target_ids) = row?;
+            Ok(SiteValidationRecord {
+                id,
+                source,
+                profile_id,
+                resolution_status,
+                precision,
+                target_ids: serde_json::from_str(&target_ids)?,
+            })
+        })
+        .collect()
+}
+
+struct EdgeValidationRecord {
+    id: String,
+    site_id: Option<String>,
+    source: String,
+    target: String,
+    profile_id: String,
+    resolution_status: String,
+    precision: String,
+}
+
+fn load_edge_validation_records(
+    connection: &Connection,
+    scan_id: &str,
+) -> Result<Vec<EdgeValidationRecord>> {
+    let mut statement = connection.prepare(
+        "SELECT id, site_id, source, target, profile_id, resolution_status, precision
+         FROM edges WHERE scan_id=?1 ORDER BY id",
+    )?;
+    statement
+        .query_map([scan_id], |row| {
+            Ok(EdgeValidationRecord {
+                id: row.get(0)?,
+                site_id: row.get(1)?,
+                source: row.get(2)?,
+                target: row.get(3)?,
+                profile_id: row.get(4)?,
+                resolution_status: row.get(5)?,
+                precision: row.get(6)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
 }
 
 fn load_edges(connection: &Connection, scan_id: &str) -> Result<Vec<EdgeRecord>> {
