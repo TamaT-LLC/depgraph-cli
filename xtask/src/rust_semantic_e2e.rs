@@ -284,9 +284,10 @@ fn assert_semantic_scan(scan: &Value, expect_attested_sysroot: bool) -> Result<(
     );
     if expect_attested_sysroot {
         ensure!(
-            coverage["resolved"] == coverage["dependency_sites"]
-                && string_array_contains(&coverage["completeness"], "semantic-complete"),
-            "packaged Rust semantic scan did not exactly resolve its attested sysroot: {coverage}"
+            coverage["resolved"].as_u64().unwrap_or(0) + coverage["external"].as_u64().unwrap_or(0)
+                == coverage["dependency_sites"].as_u64().unwrap_or(u64::MAX)
+                && coverage["candidates"] == 0,
+            "packaged Rust mixed-phase scan did not conserve resolved and external sites: {coverage}"
         );
     } else {
         ensure!(
@@ -637,6 +638,25 @@ fn assert_required_semantic_graph(
         assert_dependency_edge_contract(edge, sites, evidence)?;
     }
     if expect_attested_sysroot {
+        let semantic_edges = edges
+            .iter()
+            .filter(|edge| edge["phase"] == "semantic")
+            .collect::<Vec<_>>();
+        ensure!(
+            !semantic_edges.is_empty()
+                && semantic_edges.iter().all(|edge| {
+                    edge["resolution_status"] == "resolved"
+                        && edge["precision"] == "exact"
+                        && edge["site_id"].as_str().is_some_and(|site_id| {
+                            sites.iter().any(|site| {
+                                site["id"] == site_id
+                                    && site["resolution_status"] == "resolved"
+                                    && site["precision"] == "exact"
+                            })
+                        })
+                }),
+            "packaged Rust graph did not exactly resolve every semantic-phase edge: {semantic_edges:?}"
+        );
         let abort = require_sysroot_node(nodes, "symbol", "abort", "std")?;
         let vec = require_sysroot_node(nodes, "type", "Vec", "alloc")?;
         let string = require_sysroot_node(nodes, "type", "String", "alloc")?;
