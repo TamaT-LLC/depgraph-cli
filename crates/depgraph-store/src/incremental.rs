@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     path::Path,
 };
 
@@ -500,6 +500,7 @@ impl Store {
         let ownership = load_owned_records(&tx, scan_id, scope)?;
         delete_owned_records(&tx, scan_id, scope, &ownership)?;
         let mut completed_events = 0_usize;
+        let mut evidence_owners = HashSet::new();
         for event in replacement_events {
             if required_str(event, "scan_id")? != scan_id {
                 bail!("incremental replacement event targets another scan");
@@ -509,7 +510,7 @@ impl Store {
                 completed_events += 1;
             }
             ensure_event_is_scoped(&tx, scan_id, scope, event)?;
-            ingest_event_in_transaction(&tx, event)?;
+            ingest_event_in_transaction(&tx, event, false, &mut evidence_owners)?;
         }
         if completed_events != 1 {
             bail!("incremental replacement requires exactly one scan_completed event");
@@ -1716,8 +1717,13 @@ fn ensure_existing_value_is_unchanged(
         .query_row(sql, params![scan_id, id], |row| row.get::<_, String>(0))
         .optional()?;
     if let Some(existing) = existing {
-        let existing: Value = serde_json::from_str(&existing)?;
-        if existing != *replacement {
+        let mut existing: Value = serde_json::from_str(&existing)?;
+        let mut replacement = replacement.clone();
+        if matches!(table, "sites" | "edges") {
+            existing["evidence"] = json!([]);
+            replacement["evidence"] = json!([]);
+        }
+        if existing != replacement {
             bail!("incremental replacement attempted to mutate an out-of-scope record");
         }
         return Ok(true);

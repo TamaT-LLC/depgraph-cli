@@ -27,7 +27,7 @@ use anyhow::{Context, Result, bail};
 use depgraph_protocol::{
     CompletenessLevel, Condition, Coverage, DependencySite, Diagnostic, DiagnosticSeverity,
     Evidence, EvidenceKind, GraphEdge, GraphNode, Phase, Precision, Profile, Properties,
-    ResolutionStatus, StableIdInput, stable_id, stable_id_from_value, validate_semantic_graph,
+    ResolutionStatus, StableIdInput, stable_id, stable_id_from_value, validate_semantic_graph_maps,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -37,6 +37,7 @@ use std::{
     ffi::OsStr,
     fs,
     path::{Component, Path, PathBuf},
+    time::Instant,
 };
 use walkdir::{DirEntry, WalkDir};
 
@@ -59,6 +60,15 @@ pub struct ScanResult {
     pub diagnostics: Vec<Diagnostic>,
     pub files: Vec<FileCoverage>,
     pub coverage: Coverage,
+    pub performance: Vec<ScanPhaseMetric>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScanPhaseMetric {
+    pub phase: String,
+    pub duration_ms: u64,
+    pub items: u64,
+    pub bytes: u64,
 }
 
 struct SourceUnit {
@@ -66,6 +76,7 @@ struct SourceUnit {
     package_index: Option<usize>,
     text: Option<String>,
     syntax: Option<syn::File>,
+    occurrences: Vec<Occurrence>,
 }
 
 fn source_content_hash(source: &str) -> String {
@@ -181,10 +192,12 @@ struct AggregatedDiagnostic {
     site_evidence: BTreeMap<String, Evidence>,
 }
 
-type SemanticExtractor = fn(
+pub(crate) type OccurrenceIndex<'a> = BTreeMap<&'a str, &'a [Occurrence]>;
+
+type SemanticExtractor = for<'a> fn(
     &SafeProjectModel,
     &BTreeMap<String, SemanticCrateContext>,
-    &BTreeMap<String, Vec<Occurrence>>,
+    &OccurrenceIndex<'a>,
     &str,
 ) -> Result<SemanticDelta>;
 
@@ -239,12 +252,14 @@ fn scan_with_inventory_and_semantic_extractor(
     inventory: Option<RepositoryInventory>,
     semantic_extractor: SemanticExtractor,
 ) -> Result<ScanResult> {
+    let total_started = Instant::now();
     let root = root
         .canonicalize()
         .with_context(|| format!("canonicalize scan root {}", root.display()))?;
     if !root.is_dir() {
         bail!("scan root is not a directory: {}", root.display());
     }
+    let discovery_started = Instant::now();
     let toolchain_probe = probe_rust_toolchain(&root);
     let declared_toolchain = declared_rust_toolchain(&root);
     let hir_toolchain_status = match &declared_toolchain {
@@ -309,6 +324,12 @@ fn scan_with_inventory_and_semantic_extractor(
         toolchain_remediation.as_deref(),
     );
     let mut state = State::new(root.clone(), repository_identity, profile, inventory);
+    let mut performance = vec![ScanPhaseMetric {
+        phase: "rust_discovery_metadata".into(),
+        duration_ms: elapsed_ms(discovery_started),
+        items: (documents.len() + packages.len()) as u64,
+        bytes: 0,
+    }];
 
     match &declared_toolchain {
         RustToolchainDeclaration::Valid { path, channel } if channel != RUST_TOOLCHAIN_BASELINE => {
@@ -455,6 +476,7 @@ fn scan_with_inventory_and_semantic_extractor(
         }
     }
 
+    let syntax_started = Instant::now();
     let workspace_node = state.add_workspace_node()?;
     state.add_packages(&packages, &workspace_node)?;
     let inactive_manifest_dirs: Vec<_> = documents
@@ -472,6 +494,18 @@ fn scan_with_inventory_and_semantic_extractor(
     state.add_unexecuted_build_capabilities(&packages)?;
     state.index_modules(&packages, &sources)?;
     state.index_syntax_types(&packages, &sources)?;
+    let source_bytes = sources
+        .iter()
+        .filter_map(|source| source.text.as_ref())
+        .map(|source| source.len() as u64)
+        .sum();
+    performance.push(ScanPhaseMetric {
+        phase: "rust_syntax_graph".into(),
+        duration_ms: elapsed_ms(syntax_started),
+        items: sources.len() as u64,
+        bytes: source_bytes,
+    });
+    let hir_project_started = Instant::now();
     let hir_model = state.build_hir_project_model(
         &packages,
         &sources,
@@ -479,11 +513,69 @@ fn scan_with_inventory_and_semantic_extractor(
         metadata_manifest.is_some(),
         hir_toolchain_status,
     );
-    if let Some(model) = hir_model {
-        state.extract_hir_semantics(&packages, &sources, &model, semantic_extractor);
+    let hir_project_items = hir_model
+        .as_ref()
+        .map(|model| {
+            (model.snapshot().files.len()
+                + model.snapshot().crates.len()
+                + model.snapshot().sysroot_crates.len()) as u64
+        })
+        .unwrap_or_default();
+    if let Some(model) = hir_model.as_ref() {
+        performance.extend(model.performance().iter().map(|metric| ScanPhaseMetric {
+            phase: metric.phase.into(),
+            duration_ms: metric.duration_ms,
+            items: metric.items,
+            bytes: metric.bytes,
+        }));
     }
+    performance.push(ScanPhaseMetric {
+        phase: "rust_hir_project_model".into(),
+        duration_ms: elapsed_ms(hir_project_started),
+        items: hir_project_items,
+        bytes: source_bytes,
+    });
+    if let Some(model) = hir_model {
+        let hir_semantic_started = Instant::now();
+        state.extract_hir_semantics(&packages, &sources, &model, semantic_extractor);
+        let semantic_items = state
+            .profile
+            .properties
+            .get("rust_hir_semantic_site_count")
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        performance.push(ScanPhaseMetric {
+            phase: "rust_hir_semantic".into(),
+            duration_ms: elapsed_ms(hir_semantic_started),
+            items: semantic_items,
+            bytes: 0,
+        });
+    }
+    let source_finish_started = Instant::now();
     state.extract_source_dependencies(&packages, &sources)?;
-    state.finish()
+    let mut result = state.finish()?;
+    performance.push(ScanPhaseMetric {
+        phase: "rust_source_graph_finalize".into(),
+        duration_ms: elapsed_ms(source_finish_started),
+        items: (result.nodes.len() + result.edges.len() + result.sites.len()) as u64,
+        bytes: 0,
+    });
+    performance.push(ScanPhaseMetric {
+        phase: "rust_worker_total".into(),
+        duration_ms: elapsed_ms(total_started),
+        items: (result.nodes.len()
+            + result.edges.len()
+            + result.sites.len()
+            + result.diagnostics.len()
+            + result.files.len()) as u64,
+        bytes: source_bytes,
+    });
+    result.performance = performance;
+    Ok(result)
+}
+
+fn elapsed_ms(started: Instant) -> u64 {
+    started.elapsed().as_millis().try_into().unwrap_or(u64::MAX)
 }
 
 impl State {
@@ -561,11 +653,11 @@ impl State {
         self.profile
             .properties
             .insert("rust_syntax_fallback_summary".into(), fallback_summary);
+        validate_semantic_graph_maps(&self.nodes, &self.edges, &self.sites)
+            .context("Rust worker semantic graph invariants failed")?;
         let nodes: Vec<_> = self.nodes.into_values().collect();
         let edges: Vec<_> = self.edges.into_values().collect();
         let sites: Vec<_> = self.sites.into_values().collect();
-        validate_semantic_graph(&nodes, &edges, &sites)
-            .context("Rust worker semantic graph invariants failed")?;
 
         let files: Vec<_> = self.files.into_values().collect();
         let files_skipped = files.iter().filter(|file| file.skipped).count() as u64;
@@ -624,6 +716,7 @@ impl State {
             diagnostics: self.diagnostics.into_values().collect(),
             files,
             coverage,
+            performance: Vec::new(),
         })
     }
 
@@ -825,11 +918,13 @@ impl State {
                     }
                 },
             };
+            let occurrences = syntax.as_ref().map(collect_occurrences).unwrap_or_default();
             sources.push(SourceUnit {
                 rel_path,
                 package_index,
                 text: source,
                 syntax,
+                occurrences,
             });
         }
         Ok(sources)
@@ -1090,7 +1185,7 @@ impl State {
                     source
                         .syntax
                         .as_ref()
-                        .map(|syntax| (source.rel_path.clone(), collect_occurrences(syntax)))
+                        .map(|_| (source.rel_path.as_str(), source.occurrences.as_slice()))
                 })
                 .collect();
             let delta =
@@ -1100,7 +1195,7 @@ impl State {
         })();
 
         match result {
-            Ok((delta, _contexts)) => {
+            Ok((delta, contexts)) => {
                 let node_count = delta.nodes.len() as u64;
                 let relation_count = delta.edges.len() as u64;
                 let site_count = delta.sites.len() as u64;
@@ -1156,6 +1251,18 @@ impl State {
                 self.profile.properties.insert(
                     "rust_hir_semantic_issue_count".into(),
                     Value::from(issue_count),
+                );
+                self.profile.properties.insert(
+                    "rust_hir_active_cfg_by_crate".into(),
+                    serde_json::to_value(
+                        contexts
+                            .iter()
+                            .map(|(crate_identity, context)| {
+                                (crate_identity.as_str(), context.cfg.as_slice())
+                            })
+                            .collect::<BTreeMap<_, _>>(),
+                    )
+                    .expect("Rust HIR active cfg profile is JSON serializable"),
                 );
                 self.add_diagnostic(
                     DiagnosticSeverity::Info,
@@ -1346,10 +1453,7 @@ impl State {
                 delta.refined_call_keys.len()
             );
         }
-        let nodes_vec: Vec<_> = nodes.values().cloned().collect();
-        let edges_vec: Vec<_> = edges.values().cloned().collect();
-        let sites_vec: Vec<_> = sites.values().cloned().collect();
-        validate_semantic_graph(&nodes_vec, &edges_vec, &sites_vec)
+        validate_semantic_graph_maps(&nodes, &edges, &sites)
             .context("validate Rust HIR semantic delta")?;
         self.nodes = nodes;
         self.edges = edges;
@@ -1742,8 +1846,7 @@ impl State {
         loop {
             let mut additions = Vec::new();
             for source in sources {
-                let (Some(package_index), Some(syntax)) =
-                    (source.package_index, source.syntax.as_ref())
+                let (Some(package_index), Some(_)) = (source.package_index, source.syntax.as_ref())
                 else {
                     continue;
                 };
@@ -1754,7 +1857,15 @@ impl State {
                 else {
                     continue;
                 };
-                for occurrence in collect_occurrences(syntax) {
+                for occurrence in
+                    source
+                        .occurrences
+                        .iter()
+                        .filter_map(|occurrence| match occurrence {
+                            Occurrence::Module { .. } => Some(occurrence.clone()),
+                            _ => None,
+                        })
+                {
                     let Occurrence::Module {
                         name,
                         inline: false,
@@ -1808,14 +1919,20 @@ impl State {
     fn index_modules(&mut self, packages: &[Package], sources: &[SourceUnit]) -> Result<()> {
         self.prepare_module_contexts(packages, sources);
         for source in sources {
-            let (Some(package_index), Some(syntax)) =
-                (source.package_index, source.syntax.as_ref())
+            let (Some(package_index), Some(_)) = (source.package_index, source.syntax.as_ref())
             else {
                 continue;
             };
             let package = &packages[package_index];
             let source_node = self.file_nodes[&source.rel_path].clone();
-            for occurrence in collect_occurrences(syntax) {
+            for occurrence in source
+                .occurrences
+                .iter()
+                .filter_map(|occurrence| match occurrence {
+                    Occurrence::Module { .. } => Some(occurrence.clone()),
+                    _ => None,
+                })
+            {
                 let Occurrence::Module {
                     name,
                     inline,
@@ -1903,7 +2020,14 @@ impl State {
                 .get(&(package_index, source.rel_path.clone()))
                 .cloned()
                 .unwrap_or_default();
-            for occurrence in collect_occurrences(syntax) {
+            for occurrence in source
+                .occurrences
+                .iter()
+                .filter_map(|occurrence| match occurrence {
+                    Occurrence::TypeDefinition { .. } => Some(occurrence.clone()),
+                    _ => None,
+                })
+            {
                 let Occurrence::TypeDefinition {
                     name,
                     type_kind,
@@ -1990,13 +2114,21 @@ impl State {
         sources: &[SourceUnit],
     ) -> Result<()> {
         for source in sources {
-            let Some(syntax) = source.syntax.as_ref() else {
+            if source.syntax.is_none() {
                 continue;
-            };
+            }
             let source_node = self.file_nodes[&source.rel_path].clone();
-            let occurrences = collect_occurrences(syntax);
-            let import_bindings = syntax_import_bindings(&occurrences);
-            for occurrence in occurrences {
+            let import_bindings = syntax_import_bindings(&source.occurrences);
+            for occurrence in source
+                .occurrences
+                .iter()
+                .filter_map(|occurrence| match occurrence {
+                    Occurrence::Call { .. }
+                    | Occurrence::Module { inline: true, .. }
+                    | Occurrence::TypeDefinition { .. } => None,
+                    _ => Some(occurrence.clone()),
+                })
+            {
                 match occurrence {
                     Occurrence::Use {
                         target_specifier,
@@ -4698,7 +4830,7 @@ mod tests {
     fn forced_semantic_failure(
         _model: &SafeProjectModel,
         _contexts: &BTreeMap<String, SemanticCrateContext>,
-        _occurrences_by_path: &BTreeMap<String, Vec<Occurrence>>,
+        _occurrences_by_path: &OccurrenceIndex<'_>,
         _profile_id: &str,
     ) -> Result<SemanticDelta> {
         bail!("forced typed semantic backend failure")
@@ -4707,7 +4839,7 @@ mod tests {
     fn invalid_semantic_delta(
         model: &SafeProjectModel,
         contexts: &BTreeMap<String, SemanticCrateContext>,
-        occurrences_by_path: &BTreeMap<String, Vec<Occurrence>>,
+        occurrences_by_path: &OccurrenceIndex<'_>,
         profile_id: &str,
     ) -> Result<SemanticDelta> {
         let mut delta = extract_semantic_delta(model, contexts, occurrences_by_path, profile_id)?;
@@ -5298,7 +5430,8 @@ pub fn consume(_: Local) {}
     fn scan_result_satisfies_site_edge_invariants() {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/workspace");
         let result = scan(&fixture).unwrap();
-        validate_semantic_graph(&result.nodes, &result.edges, &result.sites).unwrap();
+        depgraph_protocol::validate_semantic_graph(&result.nodes, &result.edges, &result.sites)
+            .unwrap();
         assert!(result.sites.iter().all(|site| !site.evidence.is_empty()));
         assert!(result.edges.iter().any(|edge| edge.phase == Phase::Source));
         assert!(

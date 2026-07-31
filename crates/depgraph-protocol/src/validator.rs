@@ -821,8 +821,20 @@ pub fn validate_semantic_graph(
         .cloned()
         .map(|site| (site.id.clone(), site))
         .collect();
-    validate_site_edge_maps(&nodes, &edges, &sites)?;
-    validate_semantic_maps(&nodes, &edges, &sites)
+    validate_semantic_graph_maps(&nodes, &edges, &sites)
+}
+
+/// Validates an in-memory graph that is already indexed by stable ID.
+///
+/// Large semantic producers use this form to retain the same validation
+/// boundary without cloning every graph payload into a second index.
+pub fn validate_semantic_graph_maps(
+    nodes: &BTreeMap<String, GraphNode>,
+    edges: &BTreeMap<String, GraphEdge>,
+    sites: &BTreeMap<String, DependencySite>,
+) -> Result<(), ProtocolError> {
+    validate_site_edge_maps(nodes, edges, sites)?;
+    validate_semantic_maps(nodes, edges, sites)
 }
 
 fn validate_site_edge_maps(

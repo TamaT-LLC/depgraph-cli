@@ -1672,6 +1672,11 @@ where
         .env("GOFLAGS", "-mod=readonly")
         .env("CARGO_NET_OFFLINE", "true")
         .env("CARGO_REGISTRY_GLOBAL_CREDENTIAL_PROVIDERS", "cargo:token");
+    if spec.adapter == AdapterKind::Rust
+        && std::env::var("DEPGRAPH_SCAN_PROFILE").as_deref() == Ok("1")
+    {
+        command.env("DEPGRAPH_SCAN_PROFILE", "1");
+    }
     if spec.adapter == AdapterKind::Rust && spec.release_attested {
         let sysroot = spec.attested_rust_sysroot.as_ref().context(
             "security policy violation: verified Rust worker has no attested sysroot component",
@@ -5836,9 +5841,7 @@ fn parse_events_preserving_prefix(
     let mut web_semantic_node_candidate_ids = BTreeSet::new();
     let mut web_semantic_endpoint_ids = BTreeSet::new();
     let mut web_discarded_site_ids = BTreeSet::new();
-    let mut saw_web_semantic_delta = false;
     let mut saw_web_framework_semantic_delta = false;
-    let mut saw_web_semantic_complete = false;
     let mut web_framework_failure = false;
     for (line_index, mut line) in stdout.split(|byte| *byte == b'\n').enumerate() {
         if line.last() == Some(&b'\r') {
@@ -6443,9 +6446,7 @@ fn parse_events_preserving_prefix(
             enforce_web_definition_graph && is_web_semantic_delta_event(&event);
         let current_web_framework_semantic_delta =
             enforce_web_definition_graph && is_web_framework_semantic_delta_event(&event);
-        saw_web_semantic_delta |= current_web_semantic_delta;
         saw_web_framework_semantic_delta |= current_web_framework_semantic_delta;
-        saw_web_semantic_complete |= current_web_semantic_complete;
         if let Err(error) = validator.push(event) {
             if let Some(site_id) = current_site_closure {
                 web_discarded_site_ids.insert(site_id);
@@ -6469,72 +6470,73 @@ fn parse_events_preserving_prefix(
             web_framework_node_ids.insert(node_id);
         }
     }
-    let mut prefix = validator.validated_events().to_vec();
+    let mut prefix;
     if parse_error.is_none() {
-        match validator.finish() {
-            Ok(protocol) if enforce_web_definition_graph => {
-                if let Err(error) = validate_cross_language_worker_protocol(&protocol) {
-                    parse_error = Some(format!(
-                        "security policy violation: invalid cross-language worker closure: {error:#}"
-                    ));
-                } else if let Err(error) = validate_semantic_contract(&protocol) {
-                    web_framework_failure = saw_web_framework_semantic_delta
-                        && semantic_contract_failure_is_framework(&protocol);
-                    parse_error = Some(format!(
-                        "security policy violation: invalid Web semantic protocol: {error}"
-                    ));
-                } else if let Err(error) = validate_web_definition_graph(
-                    &protocol,
-                    &web_profiles,
-                    &web_definition_profiles,
-                    &web_import_type_profiles,
-                    &web_call_profiles,
-                    &web_candidate_call_profiles,
-                ) {
-                    parse_error = Some(format!(
-                        "security policy violation: invalid Web TypeScript semantic delta: {error}"
-                    ));
-                } else if let Err(error) =
-                    validate_web_framework_semantic_graph(&protocol, &web_framework_states)
-                {
-                    web_framework_failure = true;
-                    parse_error = Some(format!(
-                        "security policy violation: invalid Web framework semantic delta: {error}"
-                    ));
+        if !matches!(
+            validator.validated_events().last(),
+            Some(ProtocolEvent::ScanCompleted(_))
+        ) {
+            prefix = validator.validated_events().to_vec();
+            parse_error = Some(format!(
+                "incomplete protocol stream: {}",
+                ProtocolError::IncompleteStream
+            ));
+            failure_kind = Some(WorkerFailureKind::IncompleteProtocol);
+        } else {
+            match validator.finish() {
+                Ok(protocol) if enforce_web_definition_graph => {
+                    if let Err(error) = validate_cross_language_worker_protocol(&protocol) {
+                        parse_error = Some(format!(
+                            "security policy violation: invalid cross-language worker closure: {error:#}"
+                        ));
+                    } else if let Err(error) = validate_semantic_contract(&protocol) {
+                        web_framework_failure = saw_web_framework_semantic_delta
+                            && semantic_contract_failure_is_framework(&protocol);
+                        parse_error = Some(format!(
+                            "security policy violation: invalid Web semantic protocol: {error}"
+                        ));
+                    } else if let Err(error) = validate_web_definition_graph(
+                        &protocol,
+                        &web_profiles,
+                        &web_definition_profiles,
+                        &web_import_type_profiles,
+                        &web_call_profiles,
+                        &web_candidate_call_profiles,
+                    ) {
+                        parse_error = Some(format!(
+                            "security policy violation: invalid Web TypeScript semantic delta: {error}"
+                        ));
+                    } else if let Err(error) =
+                        validate_web_framework_semantic_graph(&protocol, &web_framework_states)
+                    {
+                        web_framework_failure = true;
+                        parse_error = Some(format!(
+                            "security policy violation: invalid Web framework semantic delta: {error}"
+                        ));
+                    }
+                    if parse_error.is_some() {
+                        failure_kind = Some(WorkerFailureKind::MalformedProtocol);
+                        security_violation = true;
+                    }
+                    prefix = protocol.events;
                 }
-                if parse_error.is_some() {
-                    failure_kind = Some(WorkerFailureKind::MalformedProtocol);
-                    security_violation = true;
+                Ok(protocol) => {
+                    if let Err(error) = validate_cross_language_worker_protocol(&protocol) {
+                        parse_error = Some(format!(
+                            "security policy violation: invalid cross-language worker closure: {error:#}"
+                        ));
+                        failure_kind = Some(WorkerFailureKind::MalformedProtocol);
+                        security_violation = true;
+                    }
+                    prefix = protocol.events;
                 }
-            }
-            Ok(protocol) => {
-                if let Err(error) = validate_cross_language_worker_protocol(&protocol) {
-                    parse_error = Some(format!(
-                        "security policy violation: invalid cross-language worker closure: {error:#}"
-                    ));
-                    failure_kind = Some(WorkerFailureKind::MalformedProtocol);
-                    security_violation = true;
-                }
-            }
-            Err(error) => {
-                if enforce_web_definition_graph
-                    && (saw_web_semantic_delta
-                        || saw_web_framework_semantic_delta
-                        || saw_web_semantic_complete)
-                    && matches!(error, ProtocolError::Invariant(_))
-                {
-                    web_framework_failure = saw_web_framework_semantic_delta;
-                    parse_error = Some(format!(
-                        "security policy violation: invalid Web semantic protocol: {error}"
-                    ));
-                    failure_kind = Some(WorkerFailureKind::MalformedProtocol);
-                    security_violation = true;
-                } else {
-                    parse_error = Some(format!("incomplete protocol stream: {error}"));
-                    failure_kind = Some(WorkerFailureKind::IncompleteProtocol);
+                Err(_) => {
+                    unreachable!("scan_completed leaves the protocol validator completed")
                 }
             }
         }
+    } else {
+        prefix = validator.validated_events().to_vec();
     }
     if enforce_web_definition_graph && parse_error.is_some() {
         if web_framework_failure {

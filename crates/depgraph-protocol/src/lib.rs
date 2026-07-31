@@ -49,8 +49,8 @@ pub use validator::{
     MAX_EVENT_LINE_BYTES, ProtocolError, ProtocolValidator, ValidatedProtocol, ValidationPolicy,
     build_edge_stable_id, build_site_stable_id, validate_build_contract, validate_build_ndjson,
     validate_ndjson, validate_safe_ndjson, validate_safe_semantic_ndjson,
-    validate_semantic_contract, validate_semantic_graph, validate_semantic_ndjson,
-    validate_site_edge_invariants,
+    validate_semantic_contract, validate_semantic_graph, validate_semantic_graph_maps,
+    validate_semantic_ndjson, validate_site_edge_invariants,
 };
 
 /// The only protocol version accepted by this crate.

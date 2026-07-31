@@ -378,7 +378,7 @@ pub use query::{
     INTERACTIVE_QUERY_PAGE_CONTRACT_VERSION, InteractiveQueryPage, InteractiveQueryPageRequest,
     InteractiveQuerySummary, MAX_INTERACTIVE_QUERY_BYTES, MAX_INTERACTIVE_QUERY_ITEMS,
     MAX_INTERACTIVE_QUERY_TRAVERSAL, QueryCountGroup, QueryCountSummary, QueryPageDiagnostic,
-    TraversalPageItem, TraversalResult, UnresolvedResult, WhyResult, cycles,
+    TraversalPageItem, TraversalResult, UnresolvedResult, WhyResult, cycles, cycles_from_topology,
     paginate_interactive_query, render_condition, resolve_selector, traversal_page_items,
     traversal_summary, traverse, traverse_bounded_filtered, traverse_filtered, unresolved,
     unresolved_summary, validate_interactive_query_bounds, why, why_filtered,

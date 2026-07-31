@@ -30,6 +30,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
     path::{Component, Path},
+    time::Instant,
 };
 use syn::{Attribute, Expr, ExprLit, Lit, Meta, Token, punctuated::Punctuated, visit::Visit as _};
 use triomphe::Arc;
@@ -137,6 +138,15 @@ pub(crate) struct SafeProjectModel {
     snapshot: ProjectModelSnapshot,
     crate_instances: BTreeMap<String, BaseCrate>,
     sysroot_crate_instances: BTreeMap<String, BaseCrate>,
+    performance: Vec<ProjectModelPhaseMetric>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ProjectModelPhaseMetric {
+    pub phase: &'static str,
+    pub duration_ms: u64,
+    pub items: u64,
+    pub bytes: u64,
 }
 
 impl SafeProjectModel {
@@ -157,6 +167,10 @@ impl SafeProjectModel {
 
     pub(crate) fn sysroot_crate_instances(&self) -> &BTreeMap<String, BaseCrate> {
         &self.sysroot_crate_instances
+    }
+
+    pub(crate) fn performance(&self) -> &[ProjectModelPhaseMetric] {
+        &self.performance
     }
 }
 
@@ -339,6 +353,8 @@ pub(crate) fn build_safe_project_model_with_sysroot(
     profile: &HirProjectProfile,
     _neutral_cwd: &Path,
 ) -> std::result::Result<SafeProjectModel, ProjectModelError> {
+    let total_started = Instant::now();
+    let planning_started = Instant::now();
     let target_cfg = supported_target_cfg(&profile.target_triple)?;
     let proc_macro_cwd = inert_proc_macro_cwd();
     if packages.is_empty() {
@@ -389,6 +405,13 @@ pub(crate) fn build_safe_project_model_with_sysroot(
     let excluded_packages: BTreeSet<_> = (0..packages.len())
         .filter(|index| proc_macro_packages.contains(index) || !active_packages.contains(index))
         .collect();
+    let mut performance = vec![ProjectModelPhaseMetric {
+        phase: "rust_hir_model_planning",
+        duration_ms: elapsed_ms(planning_started),
+        items: packages.len() as u64,
+        bytes: 0,
+    }];
+    let vfs_started = Instant::now();
     let (
         file_set,
         sysroot_file_set,
@@ -403,6 +426,14 @@ pub(crate) fn build_safe_project_model_with_sysroot(
         &forbidden_roots,
         &excluded_packages,
     )?;
+    let vfs_bytes = file_text.iter().map(|(_, text)| text.len() as u64).sum();
+    performance.push(ProjectModelPhaseMetric {
+        phase: "rust_hir_vfs",
+        duration_ms: elapsed_ms(vfs_started),
+        items: file_text.len() as u64,
+        bytes: vfs_bytes,
+    });
+    let crate_graph_started = Instant::now();
     let mut issues = Vec::new();
     let mut externals = Vec::new();
     let mut pending = Vec::new();
@@ -871,6 +902,13 @@ pub(crate) fn build_safe_project_model_with_sysroot(
         externals,
         issues,
     };
+    performance.push(ProjectModelPhaseMetric {
+        phase: "rust_hir_crate_graph",
+        duration_ms: elapsed_ms(crate_graph_started),
+        items: (snapshot.crates.len() + snapshot.sysroot_crates.len()) as u64,
+        bytes: 0,
+    });
+    let database_apply_started = Instant::now();
     let mut change = ChangeWithProcMacros::default();
     change.set_roots(vec![
         SourceRoot::new_local(file_set),
@@ -906,12 +944,30 @@ pub(crate) fn build_safe_project_model_with_sysroot(
             (key, krate)
         })
         .collect();
+    performance.push(ProjectModelPhaseMetric {
+        phase: "rust_hir_database_apply",
+        duration_ms: elapsed_ms(database_apply_started),
+        items: snapshot.files.len() as u64,
+        bytes: vfs_bytes,
+    });
+    performance.push(ProjectModelPhaseMetric {
+        phase: "rust_hir_project_total",
+        duration_ms: elapsed_ms(total_started),
+        items: (snapshot.files.len() + snapshot.crates.len() + snapshot.sysroot_crates.len())
+            as u64,
+        bytes: vfs_bytes,
+    });
     Ok(SafeProjectModel {
         database,
         snapshot,
         crate_instances,
         sysroot_crate_instances,
+        performance,
     })
+}
+
+fn elapsed_ms(started: Instant) -> u64 {
+    started.elapsed().as_millis().try_into().unwrap_or(u64::MAX)
 }
 
 fn crate_sysroot_dependencies(

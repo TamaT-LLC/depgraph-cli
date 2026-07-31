@@ -305,6 +305,28 @@ values are outcome-dependent; fallback paths retain the syntax-only values.
 | `rust_hir_semantic_site_count` | Number of HIR-refined import/re-export, semantic type-use, and call sites |
 | `rust_hir_semantic_call_site_count` | Number of semantic call sites, including exact, candidate, external, unresolved, and generated macro boundaries |
 | `rust_hir_semantic_issue_count` | Number of recoverable semantic-extraction issues; nonzero yields `import-type-call-graph-partial` |
+| `rust_hir_active_cfg_by_crate` | Canonical crate-identity-to-active-cfg map shared by HIR evidence; semantic evidence refers to this profile property through `active_cfg_source` instead of repeating the same cfg vector per record |
+
+### Performance audit
+
+`DEPGRAPH_SCAN_PROFILE=1 depgraph scan <root> --no-cache --json` adds an
+attempt-local top-level `performance.phases` report. It is not stored in the
+profile or canonical graph, so elapsed time cannot perturb graph IDs,
+determinism, cache identity, or exports. The Rust worker reports confined
+discovery/metadata, syntax graph, model planning, VFS bytes, crate graph,
+database apply, HIR semantic walk, source finalization, protocol build/write,
+event counts, and protocol bytes. Core adds worker wall time, protocol ingest,
+SQLite validation/promotion time and database bytes, and total scan wall time.
+HIR occurrence indexes borrow the source inventory, and crate-level active cfg
+is stored once in `rust_hir_active_cfg_by_crate`; this bounds cloning and wire
+size without dropping the cfg context addressable from each evidence record.
+
+`scripts/benchmark-mvp.sh` exercises those phases against the deterministic
+31-source-file Rust fixture in cold-store, `--no-cache`, and validated warm-hit
+modes. Cold and no-cache scans share the existing 10-second ceiling, warm scan
+has a 4-second ceiling / 2-second product target, and their canonical graph,
+coverage, diagnostics, safety ledger, and project-code execution flag must
+remain equal.
 | `rust_hir_cfg_profile` | `debug-unwind`; cfg-affecting custom Cargo profile overrides are typed unsupported input |
 | `rust_mode` | Selected safe project mode: `check`, `build`, or `test` |
 | `rust_hir_integration_policy` | `pinned-rust-analyzer-library` |

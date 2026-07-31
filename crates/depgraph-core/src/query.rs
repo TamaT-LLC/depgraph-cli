@@ -3,8 +3,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use anyhow::{Context, Result, bail};
 use depgraph_protocol::{Condition, canonical_json, stable_id_from_value};
 use depgraph_store::{
-    DiagnosticRecord, EdgeRecord, EvidenceRecord, GraphSnapshot, NodeRecord, PhaseCoverageRecord,
-    ProfileCorrelationRecord, ProfileMatrixRecord, SiteRecord,
+    DiagnosticRecord, EdgeRecord, EvidenceRecord, GraphSnapshot, GraphTopology, NodeRecord,
+    PhaseCoverageRecord, ProfileCorrelationRecord, ProfileMatrixRecord, SiteRecord,
     phase_coverage_for_effective_profile, runtime_context_for_edge,
 };
 use petgraph::{algo::tarjan_scc, graph::DiGraph};
@@ -900,25 +900,56 @@ pub fn why_filtered(
 }
 
 pub fn cycles(snapshot: &GraphSnapshot, level: CycleLevel) -> Vec<CycleResult> {
-    let allowed: BTreeSet<_> = snapshot
-        .nodes
-        .iter()
-        .filter(|node| node.kind == level.node_kind())
-        .map(|node| node.id.clone())
+    cycles_from_parts(
+        snapshot
+            .nodes
+            .iter()
+            .map(|node| (node.id.as_str(), node.kind.as_str())),
+        snapshot
+            .edges
+            .iter()
+            .map(|edge| (edge.source.as_str(), edge.target.as_str())),
+        level,
+    )
+}
+
+pub fn cycles_from_topology(topology: &GraphTopology, level: CycleLevel) -> Vec<CycleResult> {
+    cycles_from_parts(
+        topology
+            .nodes
+            .iter()
+            .map(|node| (node.id.as_str(), node.kind.as_str())),
+        topology
+            .edges
+            .iter()
+            .map(|edge| (edge.source.as_str(), edge.target.as_str())),
+        level,
+    )
+}
+
+fn cycles_from_parts<'a>(
+    nodes: impl IntoIterator<Item = (&'a str, &'a str)>,
+    edges: impl IntoIterator<Item = (&'a str, &'a str)>,
+    level: CycleLevel,
+) -> Vec<CycleResult> {
+    let allowed: BTreeSet<_> = nodes
+        .into_iter()
+        .filter(|(_, kind)| *kind == level.node_kind())
+        .map(|(id, _)| id)
         .collect();
     let mut graph = DiGraph::<String, ()>::new();
     let mut indexes = BTreeMap::new();
     for id in &allowed {
-        indexes.insert(id.clone(), graph.add_node(id.clone()));
+        indexes.insert(*id, graph.add_node((*id).to_owned()));
     }
     let mut adjacency: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for edge in &snapshot.edges {
-        if allowed.contains(&edge.source) && allowed.contains(&edge.target) {
-            graph.add_edge(indexes[&edge.source], indexes[&edge.target], ());
+    for (source, target) in edges {
+        if allowed.contains(source) && allowed.contains(target) {
+            graph.add_edge(indexes[source], indexes[target], ());
             adjacency
-                .entry(edge.source.clone())
+                .entry(source.to_owned())
                 .or_default()
-                .push(edge.target.clone());
+                .push(target.to_owned());
         }
     }
     for targets in adjacency.values_mut() {
@@ -1945,5 +1976,33 @@ mod tests {
         assert_eq!(first[0].level, "symbol");
         assert_eq!(first[0].node_ids, expected_node_ids);
         assert_eq!(reversed[0].node_ids, expected_node_ids);
+    }
+
+    #[test]
+    fn topology_projection_preserves_cycle_results() {
+        let graph = snapshot();
+        let topology = GraphTopology {
+            nodes: graph
+                .nodes
+                .iter()
+                .map(|node| depgraph_store::GraphTopologyNode {
+                    id: node.id.clone(),
+                    kind: node.kind.clone(),
+                })
+                .collect(),
+            edges: graph
+                .edges
+                .iter()
+                .map(|edge| depgraph_store::GraphTopologyEdge {
+                    source: edge.source.clone(),
+                    target: edge.target.clone(),
+                })
+                .collect(),
+        };
+
+        assert_eq!(
+            serde_json::to_value(cycles(&graph, CycleLevel::File)).unwrap(),
+            serde_json::to_value(cycles_from_topology(&topology, CycleLevel::File)).unwrap()
+        );
     }
 }

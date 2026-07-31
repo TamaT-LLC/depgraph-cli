@@ -17,17 +17,18 @@ use depgraph_core::{
     TypedProjection, UnresolvedResult, acquire_store_writer_lock, build_cache_key,
     compiler_precise_graph_ndjson, create_build_execution_request,
     create_compiler_precise_invocation_request, create_compiler_precise_unit_graph_request,
-    default_store_path, doctor, doctor_for_root, doctor_summary, doctor_summary_for_root,
-    evaluate_policy_diff, execute_bounded_query, execute_build_request_with_cancellation,
-    export_filtered, export_graphml_filtered_to_writer, impact, impact_query_cache_key,
-    init_config, match_runtime_trace, open_store, open_store_read_only, paginate_interactive_query,
-    parse_and_type_check_bounded_query, plan_bounded_query, plan_explicit_profile_selection,
-    plan_repository_profiles, policy_annotations, profile_selection_human_summary,
-    read_bounded_query_file, read_compiler_pack_requirement, read_explicit_profile_selection_file,
-    read_git_changed_set, read_runtime_trace, render_condition, render_github_annotations,
-    run_scan_with_cache_mode, runtime_session_delta, rust_build_protocol_ndjson,
-    stage_build_evidence, start_repository_daemon, traversal_page_items, traversal_summary,
-    traverse_bounded_filtered, traverse_filtered, unresolved, unresolved_summary,
+    cycles_from_topology, default_store_path, doctor, doctor_for_root, doctor_summary,
+    doctor_summary_for_root, evaluate_policy_diff, execute_bounded_query,
+    execute_build_request_with_cancellation, export_filtered, export_graphml_filtered_to_writer,
+    impact, impact_query_cache_key, init_config, match_runtime_trace, open_store,
+    open_store_read_only, paginate_interactive_query, parse_and_type_check_bounded_query,
+    plan_bounded_query, plan_explicit_profile_selection, plan_repository_profiles,
+    policy_annotations, profile_selection_human_summary, read_bounded_query_file,
+    read_compiler_pack_requirement, read_explicit_profile_selection_file, read_git_changed_set,
+    read_runtime_trace, render_condition, render_github_annotations, run_scan_with_cache_mode,
+    runtime_session_delta, rust_build_protocol_ndjson, stage_build_evidence,
+    start_repository_daemon, traversal_page_items, traversal_summary, traverse_bounded_filtered,
+    traverse_filtered, unresolved, unresolved_summary,
     validate_explicit_profile_selection_capabilities, validate_interactive_query_bounds,
     web_build_protocol_ndjson, why_filtered,
 };
@@ -1499,14 +1500,24 @@ async fn run(cli: Cli) -> Result<u8> {
             Ok(0)
         }
         Commands::Cycles { level, json } => {
-            let (snapshot, scan_id) = load_snapshot(cli.store, cli.scan_id.as_deref(), false)?;
+            let root = std::env::current_dir()?;
+            let store_path = store_path(cli.store, &root)?;
+            let store = open_store_read_only(&store_path)?;
+            let scan_id = store.resolve_scan_id(cli.scan_id.as_deref(), false)?;
             let level = match level {
                 CycleLevelArg::Package => CycleLevel::Package,
                 CycleLevelArg::File => CycleLevel::File,
                 CycleLevelArg::Symbol => CycleLevel::Symbol,
                 CycleLevelArg::Route => CycleLevel::Route,
             };
-            let result = depgraph_core::cycles(&snapshot, level);
+            let result =
+                if let Some(snapshot_id) = store.snapshot_id_for_scan_selection(&scan_id)? {
+                    let topology = store.load_completed_topology(&snapshot_id)?;
+                    cycles_from_topology(&topology, level)
+                } else {
+                    let snapshot = store.load_snapshot(&scan_id)?;
+                    depgraph_core::cycles(&snapshot, level)
+                };
             print_structured("cycles", scan_id, &result, json)?;
             if !json {
                 if result.is_empty() {

@@ -288,17 +288,34 @@ wait "$daemon_pid"
 daemon_pid=""
 node scripts/benchmark-fixture.mjs restore "$fixture" >/dev/null
 
-rust_store="$cache/rust.db"
-rust_fixture="$root/workers/rust/tests/fixtures/release-semantic"
-started="$(now_ms)"
-"$binary" --store "$rust_store" scan "$rust_fixture" --json > "$raw/rust-scan.json"
-finished="$(now_ms)"
-printf '%d\n' "$((finished - started))" > "$raw/rust-scan-ms.txt"
-"$binary" --store "$rust_store" export --format json > "$raw/rust-graph.json"
-"$binary" --store "$rust_store" cycles --level symbol --json > /dev/null
-measure_silent \
-  "$raw/rust-query-ms.txt" \
-  "$binary" --store "$rust_store" cycles --level symbol --json
+rust_fixture="$fixture_parent/rust-hir"
+node scripts/benchmark-rust-fixture.mjs generate "$rust_fixture" \
+  > "$raw/rust-fixture.json"
+rust_cold_store="$cache/rust-cold.db"
+rust_no_cache_store="$cache/rust-no-cache.db"
+measure_capture \
+  "$raw/rust-cold-scan-ms.txt" "$raw/rust-cold-scan.json" \
+  env DEPGRAPH_SCAN_PROFILE=1 \
+  "$binary" --store "$rust_cold_store" scan "$rust_fixture" --json
+measure_capture \
+  "$raw/rust-no-cache-scan-ms.txt" "$raw/rust-no-cache-scan.json" \
+  env DEPGRAPH_SCAN_PROFILE=1 \
+  "$binary" --store "$rust_no_cache_store" scan "$rust_fixture" --no-cache --json
+measure_capture \
+  "$raw/rust-warm-scan-ms.txt" "$raw/rust-warm-scan.json" \
+  env DEPGRAPH_SCAN_PROFILE=1 \
+  "$binary" --store "$rust_cold_store" scan "$rust_fixture" --json
+"$binary" --store "$rust_cold_store" export --format json \
+  > "$raw/rust-cold-graph.json"
+"$binary" --store "$rust_no_cache_store" export --format json \
+  > "$raw/rust-no-cache-graph.json"
+cmp "$raw/rust-cold-graph.json" "$raw/rust-no-cache-graph.json"
+"$binary" --store "$rust_cold_store" cycles --level symbol --json > /dev/null
+for ((sample = 0; sample < query_samples; sample++)); do
+  measure_silent \
+    "$raw/rust-query-ms.txt" \
+    "$binary" --store "$rust_cold_store" cycles --level symbol --json
+done
 
 build_fixture="$root/workers/web/test/fixtures/polyglot"
 build_base_store="$cache/build-base.db"

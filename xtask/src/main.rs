@@ -27,7 +27,7 @@ const STABLE_RELEASE_BASELINE_DIGEST: &str =
 const STABLE_RELEASE_MAINTENANCE_BRANCH: &str = "refs/heads/release/0.4";
 const STABLE_UPGRADE_SOURCE_VERSION: &str = "0.4.0-rc.1";
 const STABLE_UPGRADE_SOURCE_STORE_SCHEMA_VERSION: i64 = 11;
-const BENCHMARK_REPORT_SCHEMA_VERSION: &str = "depgraph-benchmark-report-v5";
+const BENCHMARK_REPORT_SCHEMA_VERSION: &str = "depgraph-benchmark-report-v6";
 const BOUNDED_QUERY_PACKAGE_SMOKE_SCHEMA_VERSION: &str = "package-analysis-smoke-v2";
 const BOUNDED_QUERY_SBOM_PACKAGE_NAME: &str = "depgraph-bounded-query-contract";
 const CROSS_LANGUAGE_PACKAGE_SMOKE_SCHEMA_VERSION: &str = "cross-language-package-smoke-v1";
@@ -4522,7 +4522,7 @@ fn evaluate_stable_release_gate(
                 && benchmark["gate"]["passed"] == Value::Bool(true)
                 && benchmark_metrics_pass,
             evidence:
-                "depgraph-benchmark-report-v5 exact fixture and nine gated metrics, including bounded query plan/execute"
+                "depgraph-benchmark-report-v6 exact fixtures and eleven gated metrics, including bounded query and representative Rust HIR cold/no-cache/warm scans"
                     .to_owned(),
         },
         StableReleaseGateCheck {

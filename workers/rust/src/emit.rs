@@ -1,12 +1,19 @@
 use crate::{ADAPTER, ADAPTER_VERSION, ScanResult};
-use anyhow::{Context, Result};
+#[cfg(debug_assertions)]
+use anyhow::Context;
+use anyhow::Result;
+#[cfg(debug_assertions)]
+use depgraph_protocol::ProtocolValidator;
 use depgraph_protocol::{
     CommonFields, DependencySiteEvent, DiagnosticEvent, EdgeUpsert, FileCompleted, NodeUpsert,
-    ProfileCompleted, ProfileDeclared, ProtocolEvent, ProtocolValidator, ScanCompleted,
-    ScanStarted,
+    ProfileCompleted, ProfileDeclared, ProtocolEvent, ScanCompleted, ScanStarted,
 };
 
-/// Build a complete, typed, self-validated v1.0 event stream.
+/// Build a complete typed v1.0 event stream.
+///
+/// Debug and test builds validate the producer contract here. Release builds
+/// avoid duplicating the full event graph because the core always validates
+/// the worker stream at its process trust boundary before any store mutation.
 pub fn build_events(scan_id: &str, result: &ScanResult) -> Result<Vec<ProtocolEvent>> {
     let mut seq = 0_u64;
     let mut common = || {
@@ -77,14 +84,17 @@ pub fn build_events(scan_id: &str, result: &ScanResult) -> Result<Vec<ProtocolEv
         coverage: result.coverage.clone(),
     }));
 
-    let mut validator = ProtocolValidator::new();
-    for event in events.iter().cloned() {
+    #[cfg(debug_assertions)]
+    {
+        let mut validator = ProtocolValidator::new();
+        for event in events.iter().cloned() {
+            validator
+                .push(event)
+                .context("Rust worker generated an invalid protocol event")?;
+        }
         validator
-            .push(event)
-            .context("Rust worker generated an invalid protocol event")?;
+            .finish()
+            .context("Rust worker generated an incomplete protocol stream")?;
     }
-    validator
-        .finish()
-        .context("Rust worker generated an incomplete protocol stream")?;
     Ok(events)
 }

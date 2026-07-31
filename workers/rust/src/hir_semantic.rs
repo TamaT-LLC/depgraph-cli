@@ -9,6 +9,7 @@ use crate::{
     ADAPTER_VERSION, EXTRACTOR as SOURCE_EXTRACTOR, RUST_ANALYZER_CRATE_VERSION,
     RUST_ANALYZER_REVISION, RUST_SYSROOT_COMPONENT_VERSION,
     hir_project::SafeProjectModel,
+    scanner::OccurrenceIndex,
     source::{
         CallOccurrenceKey, CallSyntaxKind, Occurrence, SourceSpan, TypeUseContext,
         TypeUseOccurrenceKey, UseOccurrenceKey,
@@ -72,6 +73,72 @@ struct SourceLocation {
     generated: bool,
 }
 
+#[derive(Default)]
+struct FileSyntaxIndex {
+    use_trees: BTreeMap<SourceSpan, Vec<ast::UseTree>>,
+    extern_crates: BTreeMap<SourceSpan, Vec<ast::ExternCrate>>,
+    path_types: BTreeMap<SourceSpan, Vec<(ast::PathType, ast::Path)>>,
+    calls: BTreeMap<SourceSpan, Vec<ast::CallExpr>>,
+    method_calls: BTreeMap<SourceSpan, Vec<ast::MethodCallExpr>>,
+    macro_calls: BTreeMap<SourceSpan, Vec<ast::MacroCall>>,
+}
+
+impl FileSyntaxIndex {
+    fn new(db: &RootDatabase, file_id: FileId, parsed: &ast::SourceFile) -> Self {
+        let line_index = line_index(db, file_id);
+        let source_span = |range: TextRange| {
+            let start = line_index.try_line_col(range.start())?;
+            let end = line_index.try_line_col(range.end())?;
+            Some(SourceSpan {
+                start_line: start.line + 1,
+                start_column: start.col + 1,
+                end_line: end.line + 1,
+                end_column: end.col + 1,
+            })
+        };
+        let mut index = Self::default();
+        for node in parsed.syntax().descendants() {
+            if let Some(tree) = ast::UseTree::cast(node.clone())
+                && tree.use_tree_list().is_none()
+                && let Some(span) = source_span(tree.syntax().text_range())
+            {
+                index.use_trees.entry(span).or_default().push(tree);
+            }
+            if let Some(item) = ast::ExternCrate::cast(node.clone())
+                && let Some(span) = source_span(item.syntax().text_range())
+            {
+                index.extern_crates.entry(span).or_default().push(item);
+            }
+            if let Some(path_type) = ast::PathType::cast(node.clone())
+                && let Some(path) = path_type.path()
+                && let Some(span) = source_span(path.syntax().text_range())
+            {
+                index
+                    .path_types
+                    .entry(span)
+                    .or_default()
+                    .push((path_type, path));
+            }
+            if let Some(call) = ast::CallExpr::cast(node.clone())
+                && let Some(span) = source_span(call.syntax().text_range())
+            {
+                index.calls.entry(span).or_default().push(call);
+            }
+            if let Some(call) = ast::MethodCallExpr::cast(node.clone())
+                && let Some(span) = source_span(call.syntax().text_range())
+            {
+                index.method_calls.entry(span).or_default().push(call);
+            }
+            if let Some(call) = ast::MacroCall::cast(node)
+                && let Some(span) = source_span(call.syntax().text_range())
+            {
+                index.macro_calls.entry(span).or_default().push(call);
+            }
+        }
+        index
+    }
+}
+
 impl SourceLocation {
     fn from_span(path: &str, span: SourceSpan) -> Self {
         Self {
@@ -99,7 +166,7 @@ struct Extractor<'a> {
     db: &'a RootDatabase,
     sema: Semantics<'a, RootDatabase>,
     contexts: &'a BTreeMap<String, SemanticCrateContext>,
-    occurrences_by_path: &'a BTreeMap<String, Vec<Occurrence>>,
+    occurrences_by_path: &'a OccurrenceIndex<'a>,
     profile_id: &'a str,
     paths_by_file: BTreeMap<u32, String>,
     crate_keys_by_base: HashMap<ra_ap_ide_db::base_db::Crate, String>,
@@ -173,7 +240,7 @@ impl CallCandidateSet {
 pub(crate) fn extract_semantic_delta(
     model: &SafeProjectModel,
     contexts: &BTreeMap<String, SemanticCrateContext>,
-    occurrences_by_path: &BTreeMap<String, Vec<Occurrence>>,
+    occurrences_by_path: &OccurrenceIndex<'_>,
     profile_id: &str,
 ) -> Result<SemanticDelta> {
     let db = model.database();
@@ -943,14 +1010,22 @@ impl Extractor<'_> {
             self.index_fn_pointer_targets(file_id, module, &parsed);
             let occurrences = self
                 .occurrences_by_path
-                .get(&path)
-                .cloned()
+                .get(path.as_str())
+                .copied()
                 .unwrap_or_default();
-            self.index_external_aliases(&crate_key, file_id, module, &parsed, &occurrences);
-            dependency_sources.push((crate_key, file_id, path, module, parsed));
+            let syntax_index = FileSyntaxIndex::new(self.db, file_id, &parsed);
+            self.index_external_aliases(&crate_key, module, &syntax_index, occurrences);
+            dependency_sources.push((crate_key, file_id, path, module, syntax_index, occurrences));
         }
-        for (crate_key, file_id, path, module, parsed) in dependency_sources {
-            self.extract_dependency_occurrences(&crate_key, file_id, &path, module, &parsed)?;
+        for (crate_key, file_id, path, module, syntax_index, occurrences) in dependency_sources {
+            self.extract_dependency_occurrences(
+                &crate_key,
+                file_id,
+                &path,
+                module,
+                &syntax_index,
+                occurrences,
+            )?;
         }
         Ok(())
     }
@@ -961,13 +1036,9 @@ impl Extractor<'_> {
         file_id: FileId,
         path: &str,
         module: Module,
-        parsed: &ast::SourceFile,
+        syntax_index: &FileSyntaxIndex,
+        occurrences: &[Occurrence],
     ) -> Result<()> {
-        let occurrences = self
-            .occurrences_by_path
-            .get(path)
-            .cloned()
-            .unwrap_or_default();
         for occurrence in occurrences {
             let use_key = occurrence.use_key(path);
             let type_use_key = occurrence.type_use_key(path);
@@ -985,17 +1056,16 @@ impl Extractor<'_> {
                 } => {
                     self.emit_use_occurrence(
                         crate_key,
-                        file_id,
                         path,
                         module,
-                        parsed,
-                        &target_specifier,
-                        &site_specifier,
+                        syntax_index,
+                        target_specifier,
+                        site_specifier,
                         alias.as_deref(),
-                        glob,
-                        reexport,
-                        condition,
-                        span,
+                        *glob,
+                        *reexport,
+                        condition.clone(),
+                        *span,
                         use_key.expect("use occurrence has a use key"),
                     )?;
                 }
@@ -1008,14 +1078,13 @@ impl Extractor<'_> {
                 } => {
                     self.emit_extern_crate_occurrence(
                         crate_key,
-                        file_id,
                         path,
                         module,
-                        parsed,
-                        &specifier,
+                        syntax_index,
+                        specifier,
                         alias.as_deref(),
-                        condition,
-                        span,
+                        condition.clone(),
+                        *span,
                         use_key.expect("extern-crate occurrence has a use key"),
                     )?;
                 }
@@ -1028,15 +1097,14 @@ impl Extractor<'_> {
                 } => {
                     self.emit_type_use_occurrence(
                         crate_key,
-                        file_id,
                         path,
                         module,
-                        parsed,
-                        &specifier,
-                        context,
-                        &inline_ancestors,
-                        condition,
-                        span,
+                        syntax_index,
+                        specifier,
+                        *context,
+                        inline_ancestors,
+                        condition.clone(),
+                        *span,
                         type_use_key.expect("type-use occurrence has a type-use key"),
                     )?;
                 }
@@ -1052,12 +1120,12 @@ impl Extractor<'_> {
                         file_id,
                         path,
                         module,
-                        parsed,
-                        &specifier,
-                        syntax_kind,
-                        &inline_ancestors,
-                        condition,
-                        span,
+                        syntax_index,
+                        specifier,
+                        *syntax_kind,
+                        inline_ancestors,
+                        condition.clone(),
+                        *span,
                         call_key.expect("call occurrence has a call key"),
                     )?;
                 }
@@ -1367,9 +1435,8 @@ impl Extractor<'_> {
     fn index_external_aliases(
         &mut self,
         crate_key: &str,
-        file_id: FileId,
         module: Module,
-        parsed: &ast::SourceFile,
+        syntax_index: &FileSyntaxIndex,
         occurrences: &[Occurrence],
     ) {
         for occurrence in occurrences {
@@ -1418,13 +1485,7 @@ impl Extractor<'_> {
                 continue;
             };
             let module_level = if extern_crate {
-                let mut matches = parsed
-                    .syntax()
-                    .descendants()
-                    .filter_map(ast::ExternCrate::cast)
-                    .filter(|item| {
-                        self.range_matches_span(file_id, item.syntax().text_range(), span)
-                    });
+                let mut matches = syntax_index.extern_crates.get(&span).into_iter().flatten();
                 let Some(item) = matches.next() else {
                     continue;
                 };
@@ -1434,14 +1495,11 @@ impl Extractor<'_> {
                         .ancestors()
                         .any(|node| ast::StmtList::can_cast(node.kind()))
             } else {
-                let mut matches = parsed
-                    .syntax()
-                    .descendants()
-                    .filter_map(ast::UseTree::cast)
-                    .filter(|tree| tree.use_tree_list().is_none())
-                    .filter(|tree| {
-                        self.range_matches_span(file_id, tree.syntax().text_range(), span)
-                    })
+                let mut matches = syntax_index
+                    .use_trees
+                    .get(&span)
+                    .into_iter()
+                    .flatten()
                     .filter(|tree| tree.star_token().is_some() == glob)
                     .filter(|tree| self.use_tree_alias(tree).as_deref() == alias.as_deref());
                 let Some(tree) = matches.next() else {
@@ -1487,10 +1545,9 @@ impl Extractor<'_> {
     fn emit_use_occurrence(
         &mut self,
         crate_key: &str,
-        file_id: FileId,
         path: &str,
         module: Module,
-        parsed: &ast::SourceFile,
+        syntax_index: &FileSyntaxIndex,
         target_specifier: &str,
         site_specifier: &str,
         alias: Option<&str>,
@@ -1500,12 +1557,11 @@ impl Extractor<'_> {
         span: SourceSpan,
         use_key: UseOccurrenceKey,
     ) -> Result<()> {
-        let mut matches: Vec<_> = parsed
-            .syntax()
-            .descendants()
-            .filter_map(ast::UseTree::cast)
-            .filter(|tree| tree.use_tree_list().is_none())
-            .filter(|tree| self.range_matches_span(file_id, tree.syntax().text_range(), span))
+        let matches: Vec<_> = syntax_index
+            .use_trees
+            .get(&span)
+            .into_iter()
+            .flatten()
             .filter(|tree| tree.star_token().is_some() == glob)
             .filter(|tree| self.use_tree_alias(tree).as_deref() == alias)
             .collect();
@@ -1522,7 +1578,7 @@ impl Extractor<'_> {
             );
             return Ok(());
         }
-        let tree = matches.pop().expect("one use tree");
+        let tree = matches[0];
         if tree
             .syntax()
             .ancestors()
@@ -1597,21 +1653,16 @@ impl Extractor<'_> {
     fn emit_extern_crate_occurrence(
         &mut self,
         crate_key: &str,
-        file_id: FileId,
         path: &str,
         module: Module,
-        parsed: &ast::SourceFile,
+        syntax_index: &FileSyntaxIndex,
         specifier: &str,
         alias: Option<&str>,
         condition: Condition,
         span: SourceSpan,
         use_key: UseOccurrenceKey,
     ) -> Result<()> {
-        let mut matches = parsed
-            .syntax()
-            .descendants()
-            .filter_map(ast::ExternCrate::cast)
-            .filter(|item| self.range_matches_span(file_id, item.syntax().text_range(), span));
+        let mut matches = syntax_index.extern_crates.get(&span).into_iter().flatten();
         let Some(item) = matches.next() else {
             self.issue(
                 "RUST_HIR_EXTERN_CRATE_SOURCE_UNAVAILABLE",
@@ -1644,7 +1695,7 @@ impl Extractor<'_> {
         };
         let Some(resolved_crate) = self
             .sema
-            .to_def(&item)
+            .to_def(item)
             .and_then(|declaration| declaration.resolved_crate(self.db))
         else {
             self.issue(
@@ -1716,10 +1767,9 @@ impl Extractor<'_> {
     fn emit_type_use_occurrence(
         &mut self,
         crate_key: &str,
-        file_id: FileId,
         path: &str,
         module: Module,
-        parsed: &ast::SourceFile,
+        syntax_index: &FileSyntaxIndex,
         specifier: &str,
         context: TypeUseContext,
         inline_ancestors: &[String],
@@ -1727,15 +1777,11 @@ impl Extractor<'_> {
         span: SourceSpan,
         type_use_key: TypeUseOccurrenceKey,
     ) -> Result<()> {
-        let mut matches: Vec<_> = parsed
-            .syntax()
-            .descendants()
-            .filter_map(ast::PathType::cast)
-            .filter_map(|path_type| path_type.path().map(|path| (path_type, path)))
-            .filter(|(_, type_path)| {
-                self.range_matches_span(file_id, type_path.syntax().text_range(), span)
-            })
-            .collect();
+        let matches = syntax_index
+            .path_types
+            .get(&span)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
         if matches.len() != 1 {
             // syn represents a receiver such as `&self` as a synthetic
             // `Self` type. There is no explicit path for rust-analyzer to
@@ -1755,7 +1801,7 @@ impl Extractor<'_> {
             );
             return Ok(());
         }
-        let (path_type, type_path) = matches.pop().expect("one type path");
+        let (path_type, type_path) = &matches[0];
         if path_type
             .syntax()
             .ancestors()
@@ -1780,7 +1826,7 @@ impl Extractor<'_> {
         };
         let type_resolution = self
             .sema
-            .resolve_path_per_ns(&type_path)
+            .resolve_path_per_ns(type_path)
             .and_then(|resolution| resolution.type_ns);
         let location = SourceLocation::from_span(path, span);
         let mut lexical_module_path = self.module_path(module);
@@ -1819,7 +1865,7 @@ impl Extractor<'_> {
         file_id: FileId,
         path: &str,
         module: Module,
-        parsed: &ast::SourceFile,
+        syntax_index: &FileSyntaxIndex,
         specifier: &str,
         syntax_kind: CallSyntaxKind,
         inline_ancestors: &[String],
@@ -1830,14 +1876,11 @@ impl Extractor<'_> {
         let location = SourceLocation::from_span(path, span);
         match syntax_kind {
             CallSyntaxKind::MacroBoundary => {
-                let mut matches: Vec<_> = parsed
-                    .syntax()
-                    .descendants()
-                    .filter_map(ast::MacroCall::cast)
-                    .filter(|call| {
-                        self.range_matches_span(file_id, call.syntax().text_range(), span)
-                    })
-                    .collect();
+                let matches = syntax_index
+                    .macro_calls
+                    .get(&span)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
                 if matches.len() != 1 {
                     self.issue(
                         "RUST_HIR_MACRO_CALL_SOURCE_UNAVAILABLE",
@@ -1851,7 +1894,7 @@ impl Extractor<'_> {
                     );
                     return Ok(());
                 }
-                let macro_call = matches.pop().expect("one macro call");
+                let macro_call = &matches[0];
                 if self.has_unrepresented_anonymous_execution_ancestor(macro_call.syntax()) {
                     self.issue(
                         "RUST_HIR_ANONYMOUS_CALLER_UNREPRESENTED",
@@ -1862,7 +1905,7 @@ impl Extractor<'_> {
                     );
                     return Ok(());
                 }
-                let Some(expansion) = self.sema.expand_macro_call(&macro_call) else {
+                let Some(expansion) = self.sema.expand_macro_call(macro_call) else {
                     self.issue(
                         "RUST_HIR_MACRO_CALL_EXPANSION_UNAVAILABLE",
                         Some(path.into()),
@@ -1927,14 +1970,11 @@ impl Extractor<'_> {
 
         let (syntax, resolution, dispatch, algorithm) = match syntax_kind {
             CallSyntaxKind::Function => {
-                let mut matches: Vec<_> = parsed
-                    .syntax()
-                    .descendants()
-                    .filter_map(ast::CallExpr::cast)
-                    .filter(|call| {
-                        self.range_matches_span(file_id, call.syntax().text_range(), span)
-                    })
-                    .collect();
+                let matches = syntax_index
+                    .calls
+                    .get(&span)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
                 if matches.len() != 1 {
                     self.issue(
                         "RUST_HIR_CALL_SOURCE_UNAVAILABLE",
@@ -1948,7 +1988,7 @@ impl Extractor<'_> {
                     );
                     return Ok(());
                 }
-                let call = matches.pop().expect("one call expression");
+                let call = &matches[0];
                 if self.has_unrepresented_anonymous_execution_ancestor(call.syntax()) {
                     self.issue(
                         "RUST_HIR_ANONYMOUS_CALLER_UNREPRESENTED",
@@ -1980,14 +2020,11 @@ impl Extractor<'_> {
                 (call.syntax().clone(), resolution, dispatch, algorithm)
             }
             CallSyntaxKind::Method => {
-                let mut matches: Vec<_> = parsed
-                    .syntax()
-                    .descendants()
-                    .filter_map(ast::MethodCallExpr::cast)
-                    .filter(|call| {
-                        self.range_matches_span(file_id, call.syntax().text_range(), span)
-                    })
-                    .collect();
+                let matches = syntax_index
+                    .method_calls
+                    .get(&span)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
                 if matches.len() != 1 {
                     self.issue(
                         "RUST_HIR_METHOD_CALL_SOURCE_UNAVAILABLE",
@@ -2001,7 +2038,7 @@ impl Extractor<'_> {
                     );
                     return Ok(());
                 }
-                let call = matches.pop().expect("one method-call expression");
+                let call = &matches[0];
                 if self.has_unrepresented_anonymous_execution_ancestor(call.syntax()) {
                     self.issue(
                         "RUST_HIR_ANONYMOUS_CALLER_UNREPRESENTED",
@@ -2016,7 +2053,7 @@ impl Extractor<'_> {
                     crate_key,
                     file_id,
                     module,
-                    &call,
+                    call,
                     specifier,
                     inline_ancestors,
                     &condition,
@@ -2528,20 +2565,6 @@ impl Extractor<'_> {
                 .map(|name| name.text().to_string())
                 .unwrap_or_else(|| "_".into())
         })
-    }
-
-    fn range_matches_span(&self, file_id: FileId, range: TextRange, span: SourceSpan) -> bool {
-        let index = line_index(self.db, file_id);
-        let Some(start) = index.try_line_col(range.start()) else {
-            return false;
-        };
-        let Some(end) = index.try_line_col(range.end()) else {
-            return false;
-        };
-        start.line + 1 == span.start_line
-            && start.col + 1 == span.start_column
-            && end.line + 1 == span.end_line
-            && end.col + 1 == span.end_column
     }
 
     fn semantic_owner_id(
@@ -4030,11 +4053,6 @@ impl Extractor<'_> {
         detail: &str,
         hir_kind: &str,
     ) -> Evidence {
-        let cfg = self
-            .contexts
-            .get(crate_key)
-            .map(|context| context.cfg.clone())
-            .unwrap_or_default();
         Evidence {
             kind: EvidenceKind::Semantic,
             extractor: EXTRACTOR.into(),
@@ -4050,7 +4068,7 @@ impl Extractor<'_> {
                 "rust_analyzer_version": RUST_ANALYZER_CRATE_VERSION,
                 "rust_analyzer_revision": RUST_ANALYZER_REVISION,
                 "crate_identity": crate_key,
-                "active_cfg": cfg,
+                "active_cfg_source": "profile.rust_hir_active_cfg_by_crate",
                 "hir_kind": hir_kind,
             })),
         }
