@@ -37,6 +37,7 @@ use std::{
     ffi::OsStr,
     fs,
     path::{Component, Path, PathBuf},
+    time::Instant,
 };
 use walkdir::{DirEntry, WalkDir};
 
@@ -59,6 +60,15 @@ pub struct ScanResult {
     pub diagnostics: Vec<Diagnostic>,
     pub files: Vec<FileCoverage>,
     pub coverage: Coverage,
+    pub performance: Vec<ScanPhaseMetric>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScanPhaseMetric {
+    pub phase: String,
+    pub duration_ms: u64,
+    pub items: u64,
+    pub bytes: u64,
 }
 
 struct SourceUnit {
@@ -239,12 +249,14 @@ fn scan_with_inventory_and_semantic_extractor(
     inventory: Option<RepositoryInventory>,
     semantic_extractor: SemanticExtractor,
 ) -> Result<ScanResult> {
+    let total_started = Instant::now();
     let root = root
         .canonicalize()
         .with_context(|| format!("canonicalize scan root {}", root.display()))?;
     if !root.is_dir() {
         bail!("scan root is not a directory: {}", root.display());
     }
+    let discovery_started = Instant::now();
     let toolchain_probe = probe_rust_toolchain(&root);
     let declared_toolchain = declared_rust_toolchain(&root);
     let hir_toolchain_status = match &declared_toolchain {
@@ -309,6 +321,12 @@ fn scan_with_inventory_and_semantic_extractor(
         toolchain_remediation.as_deref(),
     );
     let mut state = State::new(root.clone(), repository_identity, profile, inventory);
+    let mut performance = vec![ScanPhaseMetric {
+        phase: "rust_discovery_metadata".into(),
+        duration_ms: elapsed_ms(discovery_started),
+        items: (documents.len() + packages.len()) as u64,
+        bytes: 0,
+    }];
 
     match &declared_toolchain {
         RustToolchainDeclaration::Valid { path, channel } if channel != RUST_TOOLCHAIN_BASELINE => {
@@ -455,6 +473,7 @@ fn scan_with_inventory_and_semantic_extractor(
         }
     }
 
+    let syntax_started = Instant::now();
     let workspace_node = state.add_workspace_node()?;
     state.add_packages(&packages, &workspace_node)?;
     let inactive_manifest_dirs: Vec<_> = documents
@@ -472,6 +491,18 @@ fn scan_with_inventory_and_semantic_extractor(
     state.add_unexecuted_build_capabilities(&packages)?;
     state.index_modules(&packages, &sources)?;
     state.index_syntax_types(&packages, &sources)?;
+    let source_bytes = sources
+        .iter()
+        .filter_map(|source| source.text.as_ref())
+        .map(|source| source.len() as u64)
+        .sum();
+    performance.push(ScanPhaseMetric {
+        phase: "rust_syntax_graph".into(),
+        duration_ms: elapsed_ms(syntax_started),
+        items: sources.len() as u64,
+        bytes: source_bytes,
+    });
+    let hir_project_started = Instant::now();
     let hir_model = state.build_hir_project_model(
         &packages,
         &sources,
@@ -479,11 +510,69 @@ fn scan_with_inventory_and_semantic_extractor(
         metadata_manifest.is_some(),
         hir_toolchain_status,
     );
-    if let Some(model) = hir_model {
-        state.extract_hir_semantics(&packages, &sources, &model, semantic_extractor);
+    let hir_project_items = hir_model
+        .as_ref()
+        .map(|model| {
+            (model.snapshot().files.len()
+                + model.snapshot().crates.len()
+                + model.snapshot().sysroot_crates.len()) as u64
+        })
+        .unwrap_or_default();
+    if let Some(model) = hir_model.as_ref() {
+        performance.extend(model.performance().iter().map(|metric| ScanPhaseMetric {
+            phase: metric.phase.into(),
+            duration_ms: metric.duration_ms,
+            items: metric.items,
+            bytes: metric.bytes,
+        }));
     }
+    performance.push(ScanPhaseMetric {
+        phase: "rust_hir_project_model".into(),
+        duration_ms: elapsed_ms(hir_project_started),
+        items: hir_project_items,
+        bytes: source_bytes,
+    });
+    if let Some(model) = hir_model {
+        let hir_semantic_started = Instant::now();
+        state.extract_hir_semantics(&packages, &sources, &model, semantic_extractor);
+        let semantic_items = state
+            .profile
+            .properties
+            .get("rust_hir_semantic_site_count")
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        performance.push(ScanPhaseMetric {
+            phase: "rust_hir_semantic".into(),
+            duration_ms: elapsed_ms(hir_semantic_started),
+            items: semantic_items,
+            bytes: 0,
+        });
+    }
+    let source_finish_started = Instant::now();
     state.extract_source_dependencies(&packages, &sources)?;
-    state.finish()
+    let mut result = state.finish()?;
+    performance.push(ScanPhaseMetric {
+        phase: "rust_source_graph_finalize".into(),
+        duration_ms: elapsed_ms(source_finish_started),
+        items: (result.nodes.len() + result.edges.len() + result.sites.len()) as u64,
+        bytes: 0,
+    });
+    performance.push(ScanPhaseMetric {
+        phase: "rust_worker_total".into(),
+        duration_ms: elapsed_ms(total_started),
+        items: (result.nodes.len()
+            + result.edges.len()
+            + result.sites.len()
+            + result.diagnostics.len()
+            + result.files.len()) as u64,
+        bytes: source_bytes,
+    });
+    result.performance = performance;
+    Ok(result)
+}
+
+fn elapsed_ms(started: Instant) -> u64 {
+    started.elapsed().as_millis().try_into().unwrap_or(u64::MAX)
 }
 
 impl State {
@@ -624,6 +713,7 @@ impl State {
             diagnostics: self.diagnostics.into_values().collect(),
             files,
             coverage,
+            performance: Vec::new(),
         })
     }
 

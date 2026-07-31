@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::{
-    CoverageRecord, DiagnosticRecord, Store, ensure_scan_staging,
+    CompletedScanSnapshot, CoverageRecord, DiagnosticRecord, Store, ensure_scan_staging,
     incremental::scan_is_semantic_noop_overlay, load_diagnostics, promote_completed_snapshot,
 };
 
@@ -543,6 +543,55 @@ impl Store {
         key.validate()?;
         validate_context(key.layer, scan_id, build_attempt_id)?;
         self.validate_snapshot_for_layer(key.layer, snapshot_id)?;
+        self.store_validated_snapshot_cache(key, snapshot_id, scan_id, build_attempt_id)
+    }
+
+    pub fn store_completed_scan_snapshot_caches(
+        &mut self,
+        syntax: &CacheKey,
+        semantic: Option<&CacheKey>,
+        completed: &CompletedScanSnapshot,
+    ) -> Result<Vec<CacheLookupResult>> {
+        if syntax.layer != CacheLayer::Syntax {
+            bail!("scan syntax cache key must use the syntax layer");
+        }
+        syntax.validate()?;
+        validate_context(syntax.layer, Some(&completed.scan_id), None)?;
+        if let Some(semantic) = semantic {
+            if semantic.layer != CacheLayer::Semantic {
+                bail!("scan semantic cache key must use the semantic layer");
+            }
+            semantic.validate()?;
+            validate_context(semantic.layer, Some(&completed.scan_id), None)?;
+        }
+        // The unforgeable completion token was produced by validation and
+        // content-addressed snapshot creation in the immediately preceding
+        // promotion. Cache reads independently verify snapshot integrity, so
+        // the optional cache write need not hash the same large graph again.
+        let mut results = vec![self.store_validated_snapshot_cache(
+            syntax,
+            &completed.snapshot_id,
+            Some(&completed.scan_id),
+            None,
+        )?];
+        if let Some(semantic) = semantic {
+            results.push(self.store_validated_snapshot_cache(
+                semantic,
+                &completed.snapshot_id,
+                Some(&completed.scan_id),
+                None,
+            )?);
+        }
+        Ok(results)
+    }
+
+    fn store_validated_snapshot_cache(
+        &mut self,
+        key: &CacheKey,
+        snapshot_id: &str,
+        scan_id: Option<&str>,
+        build_attempt_id: Option<&str>,
+    ) -> Result<CacheLookupResult> {
         let payload_digest = self.cache_payload_digest(key.layer, snapshot_id)?;
         if let Some(existing) = load_cache_entry(&self.connection, key.layer, &key.key)?
             && existing.contract_version == CACHE_CONTRACT_VERSION

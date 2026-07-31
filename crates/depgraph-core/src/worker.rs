@@ -1672,6 +1672,11 @@ where
         .env("GOFLAGS", "-mod=readonly")
         .env("CARGO_NET_OFFLINE", "true")
         .env("CARGO_REGISTRY_GLOBAL_CREDENTIAL_PROVIDERS", "cargo:token");
+    if spec.adapter == AdapterKind::Rust
+        && std::env::var("DEPGRAPH_SCAN_PROFILE").as_deref() == Ok("1")
+    {
+        command.env("DEPGRAPH_SCAN_PROFILE", "1");
+    }
     if spec.adapter == AdapterKind::Rust && spec.release_attested {
         let sysroot = spec.attested_rust_sysroot.as_ref().context(
             "security policy violation: verified Rust worker has no attested sysroot component",

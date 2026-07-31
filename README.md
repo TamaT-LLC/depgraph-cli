@@ -100,15 +100,20 @@ scripts/benchmark-mvp.sh
 ```
 
 The benchmark generates deterministic 100-, 1,000-, and 10,000-source-file
-fixtures and writes `dist/benchmark-report.json` plus
+fixtures plus a representative 31-source-file Rust HIR fixture and writes
+`dist/benchmark-report.json` plus
 `dist/cache-hit-benchmark-report.json`. It records cold safe initial scans,
 watcher-driven one-file incremental scans, cold and warm file/package impact
-queries, and paired semantic-cache-hit versus `--no-cache` samples. Every
-fixture size requires the median cache hit to be at least 5% faster while
-preserving canonical graph and coverage equality. The reports also record
-platform and toolchain metadata, every raw sample, and the configured
-regression/noise policy. CI and tag release workflows upload the same versioned
-reports as artifacts; release publication verifies them before publishing.
+queries, paired semantic-cache-hit versus `--no-cache` samples, and Rust HIR
+cold / `--no-cache` / warm scans. The Rust evidence includes worker model/VFS/
+crate-graph/semantic/protocol phases, core ingest, store validation/promotion,
+counts, and byte totals while requiring cold/no-cache graph equality and a
+validated warm semantic-cache hit. Every fixture size requires the median cache
+hit to be at least 5% faster while preserving canonical graph and coverage
+equality. The reports also record platform and toolchain metadata, every raw
+sample, and the configured regression/noise policy. CI and tag release workflows
+upload the same versioned reports as artifacts; release publication verifies
+them before publishing.
 
 ## Usage
 

@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
+    time::Instant,
 };
 
 use anyhow::{Context, Result};
@@ -44,6 +45,21 @@ pub struct ScanOutcome {
     pub cache_events: Vec<CacheEventRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy: Option<PolicyResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub performance: Option<ScanPerformance>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScanPerformance {
+    pub phases: Vec<ScanPhasePerformance>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScanPhasePerformance {
+    pub phase: String,
+    pub duration_ms: u64,
+    pub items: u64,
+    pub bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -189,6 +205,40 @@ pub async fn run_scan_with_cache_mode_and_cancellation(
     cache_mode: ScanCacheMode,
     cancellation: CancellationToken,
 ) -> Result<ScanOutcome> {
+    let total_started = Instant::now();
+    let mut outcome = run_scan_with_cache_mode_and_cancellation_inner(
+        store,
+        root,
+        config,
+        strict,
+        cache_mode,
+        cancellation,
+    )
+    .await?;
+    if scan_profile_enabled() {
+        let dependency_sites = outcome.coverage.dependency_sites;
+        let performance = outcome
+            .performance
+            .get_or_insert_with(|| ScanPerformance { phases: Vec::new() });
+        performance.phases.push(ScanPhasePerformance {
+            phase: "core_scan_total".into(),
+            duration_ms: elapsed_ms(total_started),
+            items: dependency_sites,
+            bytes: 0,
+        });
+    }
+    Ok(outcome)
+}
+
+async fn run_scan_with_cache_mode_and_cancellation_inner(
+    store: &mut Store,
+    root: PathBuf,
+    config: &Config,
+    strict: bool,
+    cache_mode: ScanCacheMode,
+    cancellation: CancellationToken,
+) -> Result<ScanOutcome> {
+    let setup_started = Instant::now();
     let root = root
         .canonicalize()
         .with_context(|| format!("failed to canonicalize {}", root.display()))?;
@@ -349,6 +399,7 @@ pub async fn run_scan_with_cache_mode_and_cancellation(
                                         diagnostics: hit.diagnostics().to_vec(),
                                         cache_events: Vec::new(),
                                         policy: None,
+                                        performance: None,
                                     };
                                     match promote_validated_scan_cache_hit_if_active(
                                         store,
@@ -412,6 +463,8 @@ pub async fn run_scan_with_cache_mode_and_cancellation(
         return cancel_scan(store, &scan_id);
     }
 
+    let setup_ms = elapsed_ms(setup_started);
+    let worker_started = Instant::now();
     let mut join_set = JoinSet::new();
     let mut task_adapters = BTreeMap::new();
     let cache_workers = cache_plan.as_ref().map(|_| workers_to_run.clone());
@@ -458,11 +511,50 @@ pub async fn run_scan_with_cache_mode_and_cancellation(
         }
     }
     outputs.sort_by_key(|output| output.adapter);
+    let worker_ms = elapsed_ms(worker_started);
 
     if cancellation.is_cancelled() {
         return cancel_scan(store, &scan_id);
     }
 
+    let profiling = scan_profile_enabled();
+    let mut performance_phases = if profiling {
+        let mut phases = vec![
+            ScanPhasePerformance {
+                phase: "core_scan_setup".into(),
+                duration_ms: setup_ms,
+                items: outputs.len() as u64,
+                bytes: 0,
+            },
+            ScanPhasePerformance {
+                phase: "core_worker_execution".into(),
+                duration_ms: worker_ms,
+                items: outputs.len() as u64,
+                bytes: 0,
+            },
+        ];
+        phases.extend(outputs.iter().flat_map(worker_phase_performance));
+        phases
+    } else {
+        Vec::new()
+    };
+    let protocol_event_count = if profiling {
+        outputs
+            .iter()
+            .map(|output| output.events.len() as u64)
+            .sum()
+    } else {
+        0
+    };
+    let protocol_bytes = if profiling {
+        performance_phases
+            .iter()
+            .filter(|phase| phase.phase.ends_with("_protocol_write"))
+            .fold(0_u64, |total, phase| total.saturating_add(phase.bytes))
+    } else {
+        0
+    };
+    let ingest_started = Instant::now();
     let mut global_upserts = BTreeMap::<(String, String), Value>::new();
     for output in bind_worker_outputs_to_profile_plan(outputs, &profile_plan, &mut failures) {
         let adapter = output.adapter;
@@ -482,6 +574,14 @@ pub async fn run_scan_with_cache_mode_and_cancellation(
                 ),
             });
         }
+    }
+    if profiling {
+        performance_phases.push(ScanPhasePerformance {
+            phase: "core_protocol_ingest".into(),
+            duration_ms: elapsed_ms(ingest_started),
+            items: protocol_event_count,
+            bytes: protocol_bytes,
+        });
     }
     failures.sort_by_key(|failure| (failure.adapter, failure.kind));
     for failure in &failures {
@@ -582,14 +682,71 @@ pub async fn run_scan_with_cache_mode_and_cancellation(
         return cancel_scan(store, &scan_id);
     }
 
-    complete_scan(
+    let promotion_started = Instant::now();
+    let mut outcome = complete_scan(
         store,
         &scan_id,
         strict,
         config,
         cache_plan.as_ref(),
         &cancellation,
-    )
+    )?;
+    if profiling {
+        performance_phases.push(ScanPhasePerformance {
+            phase: "store_validation_promotion".into(),
+            duration_ms: elapsed_ms(promotion_started),
+            items: outcome.coverage.dependency_sites,
+            bytes: store
+                .database_path()
+                .and_then(|path| std::fs::metadata(path).ok())
+                .map(|metadata| metadata.len())
+                .unwrap_or_default(),
+        });
+        outcome.performance = Some(ScanPerformance {
+            phases: performance_phases,
+        });
+    }
+    Ok(outcome)
+}
+
+fn scan_profile_enabled() -> bool {
+    std::env::var("DEPGRAPH_SCAN_PROFILE").as_deref() == Ok("1")
+}
+
+fn elapsed_ms(started: Instant) -> u64 {
+    started.elapsed().as_millis().try_into().unwrap_or(u64::MAX)
+}
+
+fn worker_phase_performance(output: &WorkerOutput) -> Vec<ScanPhasePerformance> {
+    output
+        .stderr
+        .lines()
+        .filter_map(|line| {
+            let fields = line.strip_prefix("depgraph-progress ")?.split_whitespace();
+            let mut phase = None;
+            let mut completed = false;
+            let mut duration_ms = None;
+            let mut items = 0;
+            let mut bytes = 0;
+            for field in fields {
+                let (key, value) = field.split_once('=')?;
+                match key {
+                    "phase" => phase = Some(value.to_owned()),
+                    "status" => completed = value == "completed",
+                    "duration_ms" => duration_ms = value.parse().ok(),
+                    "items" | "source_files" => items = value.parse().unwrap_or_default(),
+                    "bytes" => bytes = value.parse().unwrap_or_default(),
+                    _ => {}
+                }
+            }
+            (completed && phase.is_some() && duration_ms.is_some()).then(|| ScanPhasePerformance {
+                phase: phase.expect("checked"),
+                duration_ms: duration_ms.expect("checked"),
+                items,
+                bytes,
+            })
+        })
+        .collect()
 }
 
 fn bind_worker_outputs_to_profile_plan(
@@ -708,24 +865,27 @@ pub(crate) fn complete_scan(
     if cancellation.is_cancelled() {
         return cancel_scan(store, scan_id);
     }
-    if let Err(error) = store.validate_scan(scan_id) {
-        add_core_diagnostic(
-            store,
-            scan_id,
-            "error",
-            "graph-validation-failed",
-            &format!("{error:#}"),
-            "graph-validation-failed",
-        )?;
-        return finish_non_promoted_scan(
-            store,
-            scan_id,
-            "failed",
-            Some(&error.to_string()),
-            3,
-            cancellation,
-        );
-    }
+    let validation = match store.validate_scan_for_completion(scan_id) {
+        Ok(validation) => validation,
+        Err(error) => {
+            add_core_diagnostic(
+                store,
+                scan_id,
+                "error",
+                "graph-validation-failed",
+                &format!("{error:#}"),
+                "graph-validation-failed",
+            )?;
+            return finish_non_promoted_scan(
+                store,
+                scan_id,
+                "failed",
+                Some(&error.to_string()),
+                3,
+                cancellation,
+            );
+        }
+    };
 
     let snapshot = store.load_snapshot(scan_id)?;
     let coverage = &snapshot.coverage;
@@ -813,18 +973,25 @@ pub(crate) fn complete_scan(
     // Load everything required for the successful outcome before promotion. Once
     // finish_scan promotes the graph, optional cache maintenance must not turn an
     // already-visible completed snapshot into a retryable daemon failure.
-    let mut outcome = snapshot_outcome(store, scan_id, 0)?;
-    outcome.status = "completed".to_owned();
-    outcome.policy = policy;
+    let mut outcome = ScanOutcome {
+        scan_id: scan_id.to_owned(),
+        status: "completed".to_owned(),
+        exit_code: 0,
+        coverage: snapshot.coverage,
+        diagnostics: snapshot.diagnostics,
+        cache_events: store.cache_events_for_scan(scan_id)?,
+        policy,
+        performance: None,
+    };
 
     let Some(promotion) =
-        cancellation.run_if_active(|| store.finish_scan(scan_id, "completed", None, true))
+        cancellation.run_if_active(|| store.finish_validated_scan(validation, true))
     else {
         return cancel_scan(store, scan_id);
     };
-    promotion?;
+    let completed = promotion?;
     if let Some(plan) = cache_plan
-        && let Err(error) = store_completed_scan_cache(store, scan_id, plan)
+        && let Err(error) = store_completed_scan_cache(store, plan, &completed)
     {
         tracing::warn!(
             scan_id,
@@ -862,16 +1029,14 @@ fn finish_non_promoted_scan(
 
 fn store_completed_scan_cache(
     store: &mut Store,
-    scan_id: &str,
     plan: &ScanCachePlan,
+    completed: &depgraph_store::CompletedScanSnapshot,
 ) -> Result<()> {
-    let snapshot_id = store
-        .snapshot_id_for_source("scan", scan_id)?
-        .context("completed scan did not expose its snapshot")?;
-    let _ = store.store_snapshot_cache(&plan.syntax, &snapshot_id, Some(scan_id), None)?;
-    if let Some(semantic) = &plan.semantic {
-        let _ = store.store_snapshot_cache(semantic, &snapshot_id, Some(scan_id), None)?;
-    }
+    let _ = store.store_completed_scan_snapshot_caches(
+        &plan.syntax,
+        plan.semantic.as_ref(),
+        completed,
+    )?;
     Ok(())
 }
 
@@ -1148,6 +1313,7 @@ fn snapshot_outcome(store: &Store, scan_id: &str, exit_code: u8) -> Result<ScanO
         diagnostics: snapshot.diagnostics,
         cache_events: store.cache_events_for_scan(scan_id)?,
         policy: None,
+        performance: None,
     })
 }
 
@@ -1173,6 +1339,32 @@ mod tests {
         assert_eq!(
             failure.diagnostic_message(),
             "worker-failure:web:timeout; last_progress_phase=typescript_dependency_graph"
+        );
+    }
+
+    #[test]
+    fn worker_phase_profile_accepts_only_completed_bounded_metrics() {
+        let output = WorkerOutput {
+            adapter: AdapterKind::Rust,
+            events: Vec::new(),
+            stderr: concat!(
+                "depgraph-progress phase=rust_hir_vfs status=completed duration_ms=7 items=31 bytes=2048\n",
+                "depgraph-progress phase=rust_hir_semantic status=started items=7600\n",
+                "untrusted phase=repository_secret duration_ms=999\n",
+            )
+            .into(),
+            stderr_truncated: false,
+            error: None,
+            failure_kind: None,
+            security_violation: false,
+        };
+
+        assert_eq!(
+            worker_phase_performance(&output)
+                .into_iter()
+                .map(|phase| (phase.phase, phase.duration_ms, phase.items, phase.bytes))
+                .collect::<Vec<_>>(),
+            vec![("rust_hir_vfs".into(), 7, 31, 2048)]
         );
     }
 

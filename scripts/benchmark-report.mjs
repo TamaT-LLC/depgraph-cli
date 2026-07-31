@@ -15,8 +15,12 @@ import {
   FIXTURE_SCHEMA_VERSION,
   fixtureFingerprint,
 } from "./benchmark-fixture.mjs";
+import {
+  RUST_BENCHMARK_SCHEMA_VERSION,
+  RUST_BENCHMARK_SOURCE_FILES,
+} from "./benchmark-rust-fixture.mjs";
 
-export const REPORT_SCHEMA_VERSION = "depgraph-benchmark-report-v5";
+export const REPORT_SCHEMA_VERSION = "depgraph-benchmark-report-v6";
 export const EXPECTED_FIXTURE_SHA256 =
   "40c003b690e34b50a25ae07dc773fa02bb97dd609e5ede49915b56a4e2d1b4a4";
 export const BOUNDED_QUERY_RELEASE_CONTRACT = {
@@ -122,7 +126,7 @@ const METRIC_CONTRACTS = new Map([
     },
   ],
   [
-    "rust_hir_semantic_scan",
+    "rust_hir_cold_scan",
     {
       cache: "cold_graph_store",
       gated: true,
@@ -130,6 +134,28 @@ const METRIC_CONTRACTS = new Map([
       maximum_samples: 1,
       maximum_limit_ms: 10_000,
       product_target_ms: 10_000,
+    },
+  ],
+  [
+    "rust_hir_no_cache_scan",
+    {
+      cache: "disabled_by_request",
+      gated: true,
+      minimum_samples: 1,
+      maximum_samples: 1,
+      maximum_limit_ms: 10_000,
+      product_target_ms: 10_000,
+    },
+  ],
+  [
+    "rust_hir_warm_scan",
+    {
+      cache: "validated_semantic_hit",
+      gated: true,
+      minimum_samples: 1,
+      maximum_samples: 1,
+      maximum_limit_ms: 4_000,
+      product_target_ms: 2_000,
     },
   ],
   [
@@ -166,6 +192,12 @@ const CACHE_CONDITIONS = {
     "independent read-only planner processes against one verified 10,000-file snapshot",
   bounded_query_execute:
     "independent canonical BFS processes against one verified 10,000-file snapshot",
+  rust_hir_cold_scan:
+    "fresh SQLite graph store for the representative 31-file Rust HIR fixture",
+  rust_hir_no_cache_scan:
+    "fresh SQLite graph store with syntax and semantic cache disabled by request",
+  rust_hir_warm_scan:
+    "validated semantic cache hit after the cold Rust HIR scan",
 };
 const CACHE_CONDITION_KEYS = Object.keys(CACHE_CONDITIONS);
 const TOOLCHAIN_KEYS = ["cargo", "depgraph", "go", "node", "pnpm", "rustc"];
@@ -626,38 +658,155 @@ function graphConservation(rawDir, changedFile, expectedDependencySites) {
   };
 }
 
-export function validateRustBenchmarkEvidence(rustScan, rustGraph) {
+function validateRustPerformance(scan) {
+  const phases = scan.performance?.phases;
+  if (!Array.isArray(phases)) {
+    throw new Error("Rust HIR benchmark phase evidence is missing");
+  }
+  const byName = new Map(phases.map((phase) => [phase?.phase, phase]));
+  if (byName.size !== phases.length) {
+    throw new Error("Rust HIR benchmark phase evidence is duplicated");
+  }
+  for (const name of [
+    "rust_hir_vfs",
+    "rust_hir_crate_graph",
+    "rust_hir_database_apply",
+    "rust_hir_semantic",
+    "rust_protocol_write",
+    "core_protocol_ingest",
+    "store_validation_promotion",
+    "core_scan_total",
+  ]) {
+    const phase = byName.get(name);
+    if (
+      !isRecord(phase) ||
+      !Number.isSafeInteger(phase.duration_ms) ||
+      phase.duration_ms < 0 ||
+      !Number.isSafeInteger(phase.items) ||
+      phase.items <= 0 ||
+      !Number.isSafeInteger(phase.bytes) ||
+      phase.bytes < 0
+    ) {
+      throw new Error(`Rust HIR benchmark phase evidence is invalid for ${name}`);
+    }
+  }
+  for (const name of [
+    "rust_hir_vfs",
+    "rust_protocol_write",
+    "core_protocol_ingest",
+    "store_validation_promotion",
+  ]) {
+    if (byName.get(name).bytes <= 0) {
+      throw new Error(`Rust HIR benchmark byte evidence is missing for ${name}`);
+    }
+  }
+  return Object.fromEntries(
+    [...byName].map(([name, phase]) => [
+      name,
+      {
+        duration_ms: phase.duration_ms,
+        items: phase.items,
+        bytes: phase.bytes,
+      },
+    ]),
+  );
+}
+
+export function validateRustBenchmarkEvidence({
+  fixture,
+  coldScan,
+  noCacheScan,
+  warmScan,
+  coldGraph,
+  noCacheGraph,
+}) {
+  const rustScan = coldScan;
+  const rustGraph = coldGraph;
   const profile = rustGraph.profiles?.find(
     (candidate) => candidate.language === "rust",
   );
   if (
+    profile?.properties?.rust_hir_status !==
+    "import-type-call-graph-emitted"
+  ) {
+    throw new Error(
+      "Rust HIR benchmark evidence has an unexpected rust_hir_status",
+    );
+  }
+  if (
+    fixture?.schema_version !== RUST_BENCHMARK_SCHEMA_VERSION ||
+    fixture?.source_file_count !== RUST_BENCHMARK_SOURCE_FILES ||
+    !Number.isSafeInteger(fixture?.expected_semantic_site_floor) ||
+    fixture.expected_semantic_site_floor <= 0 ||
     rustScan.status !== "completed" ||
+    noCacheScan.status !== "completed" ||
+    warmScan.status !== "completed" ||
     rustGraph.coverage?.project_code_executed !== false ||
+    noCacheGraph.coverage?.project_code_executed !== false ||
     !rustGraph.coverage?.completeness?.includes("syntax-complete") ||
     rustGraph.coverage?.completeness?.includes("semantic-complete") ||
     !rustGraph.coverage?.reasons?.includes("rust-hir-sysroot-unavailable") ||
     profile?.properties?.analysis_backend !==
       "static-syntax+rust-analyzer-hir" ||
     profile?.properties?.rust_hir_enable_gate !== "release-gate-pending" ||
-    profile?.properties?.rust_hir_status !==
-      "import-type-call-graph-partial" ||
     profile?.properties?.rust_hir_sysroot_status !== "unavailable" ||
     profile?.properties?.rust_hir_sysroot_file_count !== 0 ||
     profile?.properties?.rust_hir_sysroot_crate_count !== 0 ||
     !Number.isSafeInteger(
       profile?.properties?.rust_hir_project_external_count,
     ) ||
-    profile.properties.rust_hir_project_external_count <= 0
+    profile.properties.rust_hir_project_external_count <= 0 ||
+    profile.properties.rust_hir_project_file_count !==
+      fixture.source_file_count ||
+    profile.properties.rust_hir_semantic_site_count <
+      fixture.expected_semantic_site_floor ||
+    JSON.stringify(coldGraph) !== JSON.stringify(noCacheGraph) ||
+    JSON.stringify(coldScan.coverage) !== JSON.stringify(noCacheScan.coverage) ||
+    JSON.stringify(coldScan.diagnostics) !==
+      JSON.stringify(noCacheScan.diagnostics) ||
+    JSON.stringify(coldScan.coverage) !== JSON.stringify(warmScan.coverage) ||
+    JSON.stringify(coldScan.diagnostics) !== JSON.stringify(warmScan.diagnostics) ||
+    !warmScan.cache_events?.some(
+      (event) =>
+        event.layer === "semantic" &&
+        event.outcome === "hit" &&
+        event.reason === "validated",
+    )
   ) {
     throw new Error("Rust HIR benchmark evidence is incomplete");
   }
-  return true;
+  const coldPhases = validateRustPerformance(coldScan);
+  const noCachePhases = validateRustPerformance(noCacheScan);
+  return {
+    fixture,
+    graph_sha256: digest(coldGraph),
+    coverage_sha256: digest(coldScan.coverage),
+    diagnostic_sha256: digest(coldScan.diagnostics),
+    counts: {
+      nodes: coldGraph.nodes.length,
+      edges: coldGraph.edges.length,
+      sites: coldGraph.sites.length,
+      evidence: coldGraph.evidence.length,
+      diagnostics: coldGraph.diagnostics.length,
+    },
+    protocol_bytes: coldPhases.rust_protocol_write.bytes,
+    store_bytes: coldPhases.store_validation_promotion.bytes,
+    cold_phases: coldPhases,
+    no_cache_phases: noCachePhases,
+    warm_cache_hit: true,
+    canonical_graph_equal: true,
+  };
 }
 
 function validateAuxiliaryEvidence(rawDir, fixture) {
-  const rustScan = jsonFile(join(rawDir, "rust-scan.json"));
-  const rustGraph = jsonFile(join(rawDir, "rust-graph.json")).graph;
-  validateRustBenchmarkEvidence(rustScan, rustGraph);
+  const rustBenchmark = validateRustBenchmarkEvidence({
+    fixture: jsonFile(join(rawDir, "rust-fixture.json")),
+    coldScan: jsonFile(join(rawDir, "rust-cold-scan.json")),
+    noCacheScan: jsonFile(join(rawDir, "rust-no-cache-scan.json")),
+    warmScan: jsonFile(join(rawDir, "rust-warm-scan.json")),
+    coldGraph: jsonFile(join(rawDir, "rust-cold-graph.json")).graph,
+    noCacheGraph: jsonFile(join(rawDir, "rust-no-cache-graph.json")).graph,
+  });
 
   const expected = new Map([
     ["next-app", ["web:build:next", "next-adapter-observer"]],
@@ -690,6 +839,7 @@ function validateAuxiliaryEvidence(rawDir, fixture) {
   return {
     rust_semantic_complete: false,
     rust_development_sysroot_fallback: true,
+    rust_hir_benchmark: rustBenchmark,
     cross_adapter_build_profiles: CROSS_ADAPTER_PROFILES,
     bounded_query: validateBoundedQueryEvidence(rawDir, fixture),
   };
@@ -797,6 +947,58 @@ function validMetrics(report) {
   return report.gate.passed === expectedGate && expectedGate;
 }
 
+function validRustBenchmarkReportEvidence(evidence) {
+  const requiredPhases = [
+    "rust_hir_vfs",
+    "rust_hir_crate_graph",
+    "rust_hir_database_apply",
+    "rust_hir_semantic",
+    "rust_protocol_write",
+    "core_protocol_ingest",
+    "store_validation_promotion",
+    "core_scan_total",
+  ];
+  const validPhases = (phases) =>
+    isRecord(phases) &&
+    requiredPhases.every((name) => {
+      const phase = phases[name];
+      return (
+        isRecord(phase) &&
+        Number.isSafeInteger(phase.duration_ms) &&
+        phase.duration_ms >= 0 &&
+        Number.isSafeInteger(phase.items) &&
+        phase.items > 0 &&
+        Number.isSafeInteger(phase.bytes) &&
+        phase.bytes >= 0
+      );
+    });
+  return (
+    isRecord(evidence) &&
+    evidence.fixture?.schema_version === RUST_BENCHMARK_SCHEMA_VERSION &&
+    evidence.fixture?.source_file_count === RUST_BENCHMARK_SOURCE_FILES &&
+    Number.isSafeInteger(evidence.fixture?.generated_function_count) &&
+    evidence.fixture.generated_function_count > 0 &&
+    Number.isSafeInteger(evidence.fixture?.expected_semantic_site_floor) &&
+    evidence.fixture.expected_semantic_site_floor > 0 &&
+    /^[0-9a-f]{64}$/.test(evidence.graph_sha256) &&
+    /^[0-9a-f]{64}$/.test(evidence.coverage_sha256) &&
+    /^[0-9a-f]{64}$/.test(evidence.diagnostic_sha256) &&
+    ["nodes", "edges", "sites", "evidence", "diagnostics"].every(
+      (field) =>
+        Number.isSafeInteger(evidence.counts?.[field]) &&
+        evidence.counts[field] > 0,
+    ) &&
+    Number.isSafeInteger(evidence.protocol_bytes) &&
+    evidence.protocol_bytes > 0 &&
+    Number.isSafeInteger(evidence.store_bytes) &&
+    evidence.store_bytes > 0 &&
+    validPhases(evidence.cold_phases) &&
+    validPhases(evidence.no_cache_phases) &&
+    evidence.warm_cache_hit === true &&
+    evidence.canonical_graph_equal === true
+  );
+}
+
 function validEvidence(report) {
   const evidence = report.evidence;
   const initialMetric = report.metrics.find(
@@ -859,6 +1061,7 @@ function validEvidence(report) {
     evidence.impact_queries.package_workspace_observed !== true ||
     evidence.rust_semantic_complete !== false ||
     evidence.rust_development_sysroot_fallback !== true ||
+    !validRustBenchmarkReportEvidence(evidence.rust_hir_benchmark) ||
     JSON.stringify(evidence.cross_adapter_build_profiles) !==
       JSON.stringify(CROSS_ADAPTER_PROFILES) ||
     !isRecord(evidence.bounded_query) ||
@@ -1067,11 +1270,25 @@ export function createReport({ rawDir, fixtureDir, output }) {
       8_000,
     ),
     gatedMetric(
-      "rust_hir_semantic_scan",
+      "rust_hir_cold_scan",
       "cold_graph_store",
-      "rust-scan-ms.txt",
+      "rust-cold-scan-ms.txt",
       threshold("DEPGRAPH_RUST_SCAN_LIMIT_MS", 10_000),
       10_000,
+    ),
+    gatedMetric(
+      "rust_hir_no_cache_scan",
+      "disabled_by_request",
+      "rust-no-cache-scan-ms.txt",
+      threshold("DEPGRAPH_RUST_NO_CACHE_SCAN_LIMIT_MS", 10_000),
+      10_000,
+    ),
+    gatedMetric(
+      "rust_hir_warm_scan",
+      "validated_semantic_hit",
+      "rust-warm-scan-ms.txt",
+      threshold("DEPGRAPH_RUST_WARM_SCAN_LIMIT_MS", 4_000),
+      2_000,
     ),
     gatedMetric(
       "warm_rust_symbol_query",

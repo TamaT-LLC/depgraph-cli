@@ -11,6 +11,11 @@ import {
   restoreFixture,
 } from "../benchmark-fixture.mjs";
 import {
+  generateRustFixture,
+  RUST_BENCHMARK_FUNCTIONS_PER_MODULE,
+  RUST_BENCHMARK_SOURCE_FILES,
+} from "../benchmark-rust-fixture.mjs";
+import {
   BOUNDED_QUERY_RELEASE_CONTRACT,
   evaluateMetric,
   EXPECTED_FIXTURE_SHA256,
@@ -66,6 +71,37 @@ test("fixture generation is byte-for-byte deterministic and restorable", (t) => 
   assert.throws(() => mutateFixture(rootOne, 8), /invalid benchmark fixture/);
 });
 
+test("Rust HIR benchmark fixture is deterministic and representative", (t) => {
+  const parent = mkdtempSync(join(tmpdir(), "depgraph-rust-benchmark-test-"));
+  const rootOne = join(parent, "one");
+  const rootTwo = join(parent, "two");
+  t.after(async () => {
+    const { rm } = await import("node:fs/promises");
+    await rm(parent, { recursive: true, force: true });
+  });
+
+  const one = generateRustFixture(rootOne);
+  const two = generateRustFixture(rootTwo);
+
+  assert.deepEqual(one, two);
+  assert.equal(one.source_file_count, RUST_BENCHMARK_SOURCE_FILES);
+  assert.equal(
+    one.generated_function_count,
+    (RUST_BENCHMARK_SOURCE_FILES - 1) *
+      RUST_BENCHMARK_FUNCTIONS_PER_MODULE,
+  );
+  for (const path of ["Cargo.toml", "Cargo.lock", "src/lib.rs"]) {
+    assert.equal(
+      readFileSync(join(rootOne, path), "utf8"),
+      readFileSync(join(rootTwo, path), "utf8"),
+    );
+  }
+  assert.equal(
+    readFileSync(join(rootOne, "src/module_29.rs"), "utf8"),
+    readFileSync(join(rootTwo, "src/module_29.rs"), "utf8"),
+  );
+});
+
 test("metric gate tolerates one bounded outlier but rejects a clear regression", () => {
   const noisy = evaluateMetric({
     name: "initial",
@@ -110,7 +146,28 @@ test("sample evidence uses numeric order and rejects gaps", () => {
 });
 
 test("Rust benchmark requires the safe unattested-sysroot fallback", () => {
-  const scan = { status: "completed" };
+  const performance = {
+    phases: [
+      "rust_hir_vfs",
+      "rust_hir_crate_graph",
+      "rust_hir_database_apply",
+      "rust_hir_semantic",
+      "rust_protocol_write",
+      "core_protocol_ingest",
+      "store_validation_promotion",
+      "core_scan_total",
+    ].map((phase) => ({
+      phase,
+      duration_ms: 1,
+      items: 1,
+      bytes: 10,
+    })),
+  };
+  const scan = {
+    status: "completed",
+    diagnostics: [],
+    performance,
+  };
   const graph = {
     coverage: {
       completeness: ["syntax-complete"],
@@ -123,28 +180,69 @@ test("Rust benchmark requires the safe unattested-sysroot fallback", () => {
         properties: {
           analysis_backend: "static-syntax+rust-analyzer-hir",
           rust_hir_enable_gate: "release-gate-pending",
-          rust_hir_status: "import-type-call-graph-partial",
+          rust_hir_status: "import-type-call-graph-emitted",
           rust_hir_sysroot_status: "unavailable",
           rust_hir_sysroot_file_count: 0,
           rust_hir_sysroot_crate_count: 0,
           rust_hir_project_external_count: 3,
+          rust_hir_project_file_count: RUST_BENCHMARK_SOURCE_FILES,
+          rust_hir_semantic_site_count: 8_000,
         },
       },
     ],
+    nodes: [],
+    edges: [],
+    sites: [],
+    evidence: [],
+    diagnostics: [],
   };
-  assert.equal(validateRustBenchmarkEvidence(scan, graph), true);
+  const fixture = {
+    schema_version: "depgraph-rust-hir-benchmark-fixture-v1",
+    source_file_count: RUST_BENCHMARK_SOURCE_FILES,
+    generated_function_count: 2_520,
+    expected_semantic_site_floor: 7_560,
+  };
+  scan.coverage = structuredClone(graph.coverage);
+  const warmScan = {
+    ...structuredClone(scan),
+    cache_events: [
+      { layer: "semantic", outcome: "hit", reason: "validated" },
+    ],
+  };
+  const evidence = {
+    fixture,
+    coldScan: scan,
+    noCacheScan: structuredClone(scan),
+    warmScan,
+    coldGraph: graph,
+    noCacheGraph: structuredClone(graph),
+  };
+  assert.equal(
+    validateRustBenchmarkEvidence(evidence).canonical_graph_equal,
+    true,
+  );
 
   const promoted = structuredClone(graph);
   promoted.coverage.completeness.push("semantic-complete");
   assert.throws(
-    () => validateRustBenchmarkEvidence(scan, promoted),
+    () =>
+      validateRustBenchmarkEvidence({
+        ...evidence,
+        coldGraph: promoted,
+        noCacheGraph: structuredClone(promoted),
+      }),
     /Rust HIR benchmark evidence/,
   );
 
   const spoofedSysroot = structuredClone(graph);
   spoofedSysroot.profiles[0].properties.rust_hir_sysroot_status = "attested";
   assert.throws(
-    () => validateRustBenchmarkEvidence(scan, spoofedSysroot),
+    () =>
+      validateRustBenchmarkEvidence({
+        ...evidence,
+        coldGraph: spoofedSysroot,
+        noCacheGraph: structuredClone(spoofedSysroot),
+      }),
     /Rust HIR benchmark evidence/,
   );
 });
@@ -194,7 +292,23 @@ test("release verification requires the complete 10,000-file metric contract", (
       10_000,
       8_000,
     ],
-    ["rust_hir_semantic_scan", "cold_graph_store", true, [5], 10_000, 10_000],
+    ["rust_hir_cold_scan", "cold_graph_store", true, [5], 10_000, 10_000],
+    [
+      "rust_hir_no_cache_scan",
+      "disabled_by_request",
+      true,
+      [5],
+      10_000,
+      10_000,
+    ],
+    [
+      "rust_hir_warm_scan",
+      "validated_semantic_hit",
+      true,
+      [1],
+      4_000,
+      2_000,
+    ],
     ["warm_rust_symbol_query", "primed_graph_store", true, [1], 4_000, 500],
     [
       "cross_adapter_build_observation",
@@ -249,6 +363,21 @@ test("release verification requires the complete 10,000-file metric contract", (
       total_milliseconds: 70,
     },
   };
+  const rustPhases = Object.fromEntries(
+    [
+      "rust_hir_vfs",
+      "rust_hir_crate_graph",
+      "rust_hir_database_apply",
+      "rust_hir_semantic",
+      "rust_protocol_write",
+      "core_protocol_ingest",
+      "store_validation_promotion",
+      "core_scan_total",
+    ].map((phase) => [
+      phase,
+      { duration_ms: 1, items: 1, bytes: 10 },
+    ]),
+  );
   const report = {
     schema_version: REPORT_SCHEMA_VERSION,
     generated_at: "2026-07-24T00:00:00.000Z",
@@ -274,6 +403,9 @@ test("release verification requires the complete 10,000-file metric contract", (
         warm_query: "test",
         bounded_query_plan: "test",
         bounded_query_execute: "test",
+        rust_hir_cold_scan: "test",
+        rust_hir_no_cache_scan: "test",
+        rust_hir_warm_scan: "test",
       },
       toolchains: {
         cargo: "test",
@@ -330,6 +462,30 @@ test("release verification requires the complete 10,000-file metric contract", (
       },
       rust_semantic_complete: false,
       rust_development_sysroot_fallback: true,
+      rust_hir_benchmark: {
+        fixture: {
+          schema_version: "depgraph-rust-hir-benchmark-fixture-v1",
+          source_file_count: 31,
+          generated_function_count: 2_520,
+          expected_semantic_site_floor: 7_560,
+        },
+        graph_sha256: "4".repeat(64),
+        coverage_sha256: "5".repeat(64),
+        diagnostic_sha256: "6".repeat(64),
+        counts: {
+          nodes: 10_000,
+          edges: 12_000,
+          sites: 7_700,
+          evidence: 20_000,
+          diagnostics: 10,
+        },
+        protocol_bytes: 60_000_000,
+        store_bytes: 190_000_000,
+        cold_phases: rustPhases,
+        no_cache_phases: structuredClone(rustPhases),
+        warm_cache_hit: true,
+        canonical_graph_equal: true,
+      },
       cross_adapter_build_profiles: [
         "next-app",
         "astro-app",

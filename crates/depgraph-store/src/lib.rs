@@ -144,6 +144,18 @@ pub struct ScanRecord {
 
 pub type ScanAttemptRecord = ScanRecord;
 
+#[derive(Debug)]
+pub struct ValidatedScan {
+    scan_id: String,
+    mutation_count: i64,
+}
+
+#[derive(Debug)]
+pub struct CompletedScanSnapshot {
+    scan_id: String,
+    snapshot_id: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CompletedSnapshotRecord {
     pub id: String,
@@ -2254,6 +2266,47 @@ impl Store {
         Ok(())
     }
 
+    pub fn validate_scan_for_completion(&self, scan_id: &str) -> Result<ValidatedScan> {
+        let (current, mutation_count) = self
+            .connection
+            .query_row(
+                "SELECT status, mutation_count FROM scans WHERE id=?1",
+                [scan_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?
+            .with_context(|| format!("scan {scan_id} was not started"))?;
+        if current != "staging" {
+            bail!("scan {scan_id} is immutable after reaching status {current}");
+        }
+        self.validate_scan(scan_id)
+            .with_context(|| format!("scan {scan_id} cannot be promoted before validation"))?;
+        Ok(ValidatedScan {
+            scan_id: scan_id.to_owned(),
+            mutation_count,
+        })
+    }
+
+    pub fn finish_validated_scan(
+        &mut self,
+        validation: ValidatedScan,
+        promote: bool,
+    ) -> Result<CompletedScanSnapshot> {
+        let snapshot_id = self
+            .finish_scan_inner(
+                &validation.scan_id,
+                "completed",
+                None,
+                promote,
+                Some(validation.mutation_count),
+            )?
+            .context("validated completed scan did not create a snapshot")?;
+        Ok(CompletedScanSnapshot {
+            scan_id: validation.scan_id,
+            snapshot_id,
+        })
+    }
+
     pub fn finish_scan(
         &mut self,
         scan_id: &str,
@@ -2271,24 +2324,22 @@ impl Store {
             bail!("only completed scans can become the current successful scan");
         }
         let validated_mutation_count = if status == "completed" {
-            let (current, mutation_count) = self
-                .connection
-                .query_row(
-                    "SELECT status, mutation_count FROM scans WHERE id=?1",
-                    [scan_id],
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
-                )
-                .optional()?
-                .with_context(|| format!("scan {scan_id} was not started"))?;
-            if current != "staging" {
-                bail!("scan {scan_id} is immutable after reaching status {current}");
-            }
-            self.validate_scan(scan_id)
-                .with_context(|| format!("scan {scan_id} cannot be promoted before validation"))?;
-            Some(mutation_count)
+            Some(self.validate_scan_for_completion(scan_id)?.mutation_count)
         } else {
             None
         };
+        self.finish_scan_inner(scan_id, status, error, promote, validated_mutation_count)
+            .map(|_| ())
+    }
+
+    fn finish_scan_inner(
+        &mut self,
+        scan_id: &str,
+        status: &str,
+        error: Option<&str>,
+        promote: bool,
+        validated_mutation_count: Option<i64>,
+    ) -> Result<Option<String>> {
         let tx = self.connection.transaction()?;
         ensure_scan_staging(&tx, scan_id)?;
         if status == "completed" {
@@ -2382,7 +2433,7 @@ impl Store {
             promote_completed_snapshot(&tx, snapshot_id)?;
         }
         tx.commit()?;
-        Ok(())
+        Ok(completed_snapshot_id)
     }
 
     pub fn latest_attempt_id(&self) -> Result<Option<String>> {
@@ -5035,6 +5086,65 @@ mod tests {
         assert_eq!(store.latest_successful_id()?, None);
         assert_eq!(store.current_snapshot_id()?, None);
         assert_eq!(store.snapshot_id_for_source("scan", "scan-1")?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn validated_completion_rejects_an_intervening_scan_mutation() -> Result<()> {
+        let mut store = Store::open_in_memory()?;
+        let scan_id = stage_protocol_fixture(
+            &mut store,
+            include_str!("../../depgraph-protocol/tests/fixtures/protocol-v1.golden.ndjson"),
+            Some("fixture-revision"),
+        )?;
+        let validation = store.validate_scan_for_completion(&scan_id)?;
+        store.save_adapter_log(&scan_id, "late-adapter", "late mutation", false)?;
+
+        let error = store
+            .finish_validated_scan(validation, true)
+            .expect_err("mutation after validation must prevent promotion");
+        assert!(error.to_string().contains("changed concurrently"));
+        assert_eq!(
+            store.scan(&scan_id)?.map(|scan| scan.status),
+            Some("staging".into())
+        );
+        assert_eq!(store.current_snapshot_id()?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn validated_completion_token_populates_both_scan_cache_layers() -> Result<()> {
+        let mut store = Store::open_in_memory()?;
+        let scan_id = stage_protocol_fixture(
+            &mut store,
+            include_str!("../../depgraph-protocol/tests/fixtures/protocol-v1.golden.ndjson"),
+            Some("fixture-revision"),
+        )?;
+        let validation = store.validate_scan_for_completion(&scan_id)?;
+        let completed = store.finish_validated_scan(validation, true)?;
+        let syntax = CacheKey::new(
+            CacheLayer::Syntax,
+            BTreeMap::from([("input".into(), "syntax".into())]),
+        );
+        let semantic = CacheKey::new(
+            CacheLayer::Semantic,
+            BTreeMap::from([
+                ("input".into(), "semantic".into()),
+                ("syntax_key".into(), syntax.key.clone()),
+            ]),
+        );
+
+        let results =
+            store.store_completed_scan_snapshot_caches(&syntax, Some(&semantic), &completed)?;
+        assert!(results.iter().all(|result| result.outcome == "stored"));
+        assert_eq!(
+            store.cache_entry_counts()?,
+            CacheEntryCounts {
+                syntax: 1,
+                semantic: 1,
+                build: 0,
+            }
+        );
         Ok(())
     }
 

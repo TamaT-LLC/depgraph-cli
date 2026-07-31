@@ -48,7 +48,7 @@ Issue #180で`bounded-query-result-v1`のstaged executorを追加した。admitt
 
 Issue #181でpublic `depgraph query`を追加した。`--query` / `--file`をclapで排他的かつ必須にし、`--file`はcurrent repository boundary内のbounded regular file readerだけを通す。parse / credential policy / closed type checkをstore access前に完了してから、global `--store` / `--scan-id`でcurrentまたはscan由来のimmutable completed snapshot IDを解決し、storeをread-onlyで開く。`--explain`はexecutorを呼ばず同じadmission / plan digestをcanonical JSONまたはredacted human summaryへ出力する。execute JSONは`bounded-query-result-v1`そのものをcanonical key orderで出力し、humanはsnapshot / graph / plan / result digest、projection label、closed row / path / evidence、deterministic metricsを表示する。syntax / type / binding / limitはexit `2`、plan / runtime resource exhaustionはexit `1`、store / integrity failureはexit `3`、unsafe file / credential inputはexit `4`とし、zero rowはcomplete exit `0`を保つ。query / explainはwriter lock、cache、attempt row、worker、project processを使用しない。
 
-Issue #182で`bounded-query-release-smoke-v1`を追加した。parser / type checker / planner / executorを決定論的byte mutation corpusへ通し、malformed / deep / wide / alternate-path入力がpanic、hang、prefix acceptance、partial resultを起こさないことを固定する。10,000-file benchmarkはexact-sourceのadmitted plan / canonical executionと、同じgraphに対するdepth 8 hostile planの事前拒否を計測し、plan bounds、runtime metrics、result digestを`depgraph-benchmark-report-v5`へ記録する。全5 native packageはmanifestに同一query fixtureとlanguage / type / statistics / plan / limit / result versionを固定し、SBOMとlicense inventoryへfirst-party contractとして含める。各native packageがcheckout-equivalent storeでquery / explainの同一canonical bytesを実行し、target別sidecarのplan / result / output digestをrelease asset集約とstable gateで一致検証する。fixture missing / tamper、capability version drift、sidecar output driftはfail closedである。
+Issue #182で`bounded-query-release-smoke-v1`を追加した。parser / type checker / planner / executorを決定論的byte mutation corpusへ通し、malformed / deep / wide / alternate-path入力がpanic、hang、prefix acceptance、partial resultを起こさないことを固定する。10,000-file benchmarkはexact-sourceのadmitted plan / canonical executionと、同じgraphに対するdepth 8 hostile planの事前拒否を計測し、plan bounds、runtime metrics、result digestを`depgraph-benchmark-report-v6`へ記録する。全5 native packageはmanifestに同一query fixtureとlanguage / type / statistics / plan / limit / result versionを固定し、SBOMとlicense inventoryへfirst-party contractとして含める。各native packageがcheckout-equivalent storeでquery / explainの同一canonical bytesを実行し、target別sidecarのplan / result / output digestをrelease asset集約とstable gateで一致検証する。fixture missing / tamper、capability version drift、sidecar output driftはfail closedである。
 
 Issue #153として`public-readiness-v1`を採用し、repository visibilityの現行判断を`private / reject`へ固定した。public OSS化は、exact candidate commitと全ref、GitHub surface、governance tree、release closureへ結び付くsecret/history、legal/provenance、security/disclosure、governance/community、repository control、release/support、migration rehearsal、incident readinessの全gateが独立承認され、TamaT-LLC organization ownerが明示的に`allow`した場合だけ候補となる。`stable-release-gate-v1`は必要条件だがpublic readinessの十分条件ではない。visibility変更はADRやreadiness recordから自動実行せず、別途明示承認されたchange windowでのみ行う。
 
@@ -1616,7 +1616,7 @@ warm queryは5 sampleを採り、medianがceiling
 以内、ceiling超過sampleは最大1件、全sampleはceiling + 20%以内というnoise
 allowanceを同時に満たした場合だけpassする。cold queryは継続取得するが、
 product targetがwarm cacheであるためgateには使わない。report
-`depgraph-benchmark-report-v5`はraw sample、median / max、cache条件、
+`depgraph-benchmark-report-v6`はraw sample、median / max、cache条件、
 platform / architecture / GitHub runner、depgraph / Rust / Cargo / Go / Node /
 pnpm version、commit、threshold、allowance、判定を保持する。
 
@@ -1634,6 +1634,18 @@ evidence gateも同じreportで維持する。pull request CIと
 tag releaseは同じ10,000-file reportをartifact化し、release asset検証jobが
 schema、commit、全必須metric、conservation、総合passを再検証してから公開へ
 進む。fixture件数やdependency site / coverageを性能のために緩和しない。
+
+Issue #275のRust HIR性能契約は31 source file、2,520 function、7,560以上の
+semantic siteを持つ`depgraph-rust-hir-benchmark-fixture-v1`を決定的に生成する。
+cold storeと`--no-cache`は既存10秒ceiling、validated semantic warm hitは4秒
+ceiling / 2秒product targetとする。attempt-local `performance.phases`はRust
+discovery/metadata、model planning、VFS、crate graph、database apply、semantic
+walk、source finalize、protocol build/write、core ingest、store validation/
+promotion、totalのwall time・件数・bytesを記録するが、profile、cache identity、
+store、canonical exportには保存しない。cold/no-cacheのgraph、coverage、
+diagnostic、安全境界は完全一致し、warmも同じcoverage/diagnosticとvalidated
+semantic cache hitを要求する。HIR occurrenceはfileごとのspan indexから解決し、
+occurrenceごとの全syntax tree再走査を禁止する。
 
 Issue #260の`depgraph-cache-hit-benchmark-v1`は100 / 1,000 / 10,000 source
 fileの3規模でsemantic cache hitと`--no-cache`を3回ずつ対にして計測する。
@@ -1935,6 +1947,7 @@ digest、ref/tag検証、PR記録項目、patch release時も変わらないance
 
 ## 26. 更新履歴
 
+- 2026-07-31: Issue #275としてRust HIR scanのattempt-local性能計測と代表benchmarkを実装した。workerはdiscovery/metadata、syntax、model planning、VFS、crate graph、database apply、HIR semantic、source finalize、protocol build/writeを、coreはworker execution、protocol ingest、store validation/promotion、totalをwall time・件数・bytes付きで`DEPGRAPH_SCAN_PROFILE=1`時だけ報告する。31 source file・2,520 function・7,560以上のsemantic siteを持つ決定的fixtureをcold / `--no-cache` / validated warm hitで検証し、cold/no-cache graph・coverage・diagnostic・安全性を一致させる。HIR occurrenceごとの全syntax tree走査をfile単位span indexへ置換し、scan completionはmutation-count tokenで検証と昇格を結び、同じsnapshotの二重load・再validation・cache layer別再hashを除去した。ローカルrelease実測はcold 9.20秒、`--no-cache` 7.75秒、warm 1.31秒、HIR semantic 1.02秒で、7,776 dependency siteを維持した。
 - 2026-07-30: Issue #265として`doctor`のworker artifact healthとper-root launch policyを分離した。diagnostic rootは明示`--root`、store latest attempt root、attemptなしのcurrent cwdの順で選択し、path/sourceをhuman/JSONへ公開する。Rust/Go/Webのversion/protocol/integrity probeはrepository外のneutral rootで実行して起動cwd依存を除去し、`root_launch_allowed` / errorは実diagnostic rootに対して独立評価する。depgraph source tree自体をrootにしたdevelopment artifact拒否、release archive attestation、safe environment・timeout・process reapを維持し、cwd差分と全3workerの回帰テストを追加した。
 - 2026-07-30: Issue #264として対話的query出力をbounded化した。`doctor`は既定summaryと明示`--details`を分離し、summaryはdiagnostic raw JSON、graph / evidence、adapter stderrを読まずにcoverage、profile / package、adapter別file、diagnostic total・上位64原因group・代表5件を返す。`deps` / `dependents` / `unresolved`は`depgraph-interactive-query-page-v1`でitem / compact JSON byte / traversalを制限し、打ち切りを`complete:false`、固定diagnostic、実serialize byte数、snapshot/query-bound cursorとして公開する。同一cursorの決定性、page連結の重複・欠落なし、oversized item、改変cursor、traversal上限、human/JSON、512-edge fixtureを回帰検証し、`--all`とstreaming `export`でfull outputを維持する。
 - 2026-07-30: Issue #263としてRust syntax fallbackを改善した。標準prelude / manifest依存をexternal/heuristic、condition-compatibleな明示local型宣言・module-scope importをsource-backed `type`へのresolved/candidates heuristicへ分類し、block-local importはmodule indexへ漏らさない。同一原因のmacro / proc-macro / unsupported attribute / build-environment warningは各siteの安定group参照、全site集合のcount/digest、bounded path count/digest、最大5件の代表ID/evidenceを持つ1 diagnosticへ集約し、全site/span、strict failure、決定性、`project_code_executed=false`を維持する。`rust-syntax-fallback-summary-v1`はsyntax解決、HIR必須、macro実行必須の件数と別々のremediationをhuman/JSONへ出力する。
