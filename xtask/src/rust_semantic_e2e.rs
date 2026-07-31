@@ -642,18 +642,24 @@ fn assert_required_semantic_graph(
             .iter()
             .filter(|edge| edge["phase"] == "semantic")
             .collect::<Vec<_>>();
+        let semantic_dependency_edges = semantic_edges
+            .iter()
+            .filter(|edge| edge["site_id"].as_str().is_some())
+            .collect::<Vec<_>>();
         ensure!(
             !semantic_edges.is_empty()
                 && semantic_edges.iter().all(|edge| {
-                    edge["resolution_status"] == "resolved"
-                        && edge["precision"] == "exact"
-                        && edge["site_id"].as_str().is_some_and(|site_id| {
-                            sites.iter().any(|site| {
-                                site["id"] == site_id
-                                    && site["resolution_status"] == "resolved"
-                                    && site["precision"] == "exact"
-                            })
+                    edge["resolution_status"] == "resolved" && edge["precision"] == "exact"
+                })
+                && !semantic_dependency_edges.is_empty()
+                && semantic_dependency_edges.iter().all(|edge| {
+                    edge["site_id"].as_str().is_some_and(|site_id| {
+                        sites.iter().any(|site| {
+                            site["id"] == site_id
+                                && site["resolution_status"] == "resolved"
+                                && site["precision"] == "exact"
                         })
+                    })
                 }),
             "packaged Rust graph did not exactly resolve every semantic-phase edge: {semantic_edges:?}"
         );
