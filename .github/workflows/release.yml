@@ -10,6 +10,13 @@ permissions:
 jobs:
   quality:
     runs-on: ubuntu-24.04
+    env:
+      # The full gate builds rust-analyzer twice (workspace tests and the
+      # packaged semantic E2E). Disable incremental state and debug symbols so
+      # both builds fit on the fixed-size hosted runner disk.
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - run: rustup toolchain install 1.93.1 --profile minimal --component rustfmt,clippy

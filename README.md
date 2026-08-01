@@ -10,6 +10,7 @@ The stable `0.4.0` contract is documented in the
 [`v0.4.0` release notes](docs/releases/v0.4.0.md).
 The compiler-pack release candidate, original Milestone 4 candidate, and
 previous Milestone 2 semantic-graph candidate are documented as
+[`v0.4.0-rc.3`](docs/releases/v0.4.0-rc.3.md),
 [`v0.4.0-rc.2`](docs/releases/v0.4.0-rc.2.md),
 [`v0.4.0-rc.1`](docs/releases/v0.4.0-rc.1.md), and
 [`v0.2.0-rc.1`](docs/releases/v0.2.0-rc.1.md).
@@ -587,12 +588,12 @@ distribution and its `unsupported-no-fallback` policy.
 Download the four assets for the depgraph version and host target from the
 same [GitHub release](https://github.com/TamaT-LLC/depgraph-cli/releases). The
 release tag may be the stable tag or its matching release candidate (for
-example, `v0.4.0-rc.2`), but the normal depgraph archive and compiler pack must
+example, `v0.4.0-rc.3`), but the normal depgraph archive and compiler pack must
 come from that one release run.
 
 ```bash
 version=0.4.0
-release_tag=v0.4.0-rc.2
+release_tag=v0.4.0-rc.3
 target=x86_64-unknown-linux-gnu # doctor --json reports compiler_pack.host_target
 name="depgraph-compiler-pack-${version}-${target}"
 

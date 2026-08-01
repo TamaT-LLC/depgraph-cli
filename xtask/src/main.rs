@@ -1223,6 +1223,7 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "TypeScript/JavaScript symbol/type/import/re-export/type-use",
         "[the system design](docs/40_arch_design/arch-dependency-graph-cli-system-design.md)",
         "[`v0.4.0` release notes](docs/releases/v0.4.0.md)",
+        "[`v0.4.0-rc.3`](docs/releases/v0.4.0-rc.3.md)",
         "[`v0.4.0-rc.2`](docs/releases/v0.4.0-rc.2.md)",
         "[`v0.4.0-rc.1`](docs/releases/v0.4.0-rc.1.md)",
         "[`v0.2.0-rc.1`](docs/releases/v0.2.0-rc.1.md)",
@@ -1612,6 +1613,7 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "docs/40_arch_design/adr-default-profile-selection-budget.md",
         "docs/40_arch_design/adr-bounded-graph-query-language.md",
         "docs/releases/v0.4.0.md",
+        "docs/releases/v0.4.0-rc.3.md",
         "docs/releases/v0.4.0-rc.2.md",
         "docs/releases/v0.4.0-rc.1.md",
         "docs/releases/v0.2.0-rc.1.md",
@@ -12168,6 +12170,21 @@ mod tests {
             .map(|action| (action.identity.as_str(), action.sha.as_str()))
             .collect::<BTreeMap<_, _>>();
         let ci = fs::read_to_string(root.join(".github/workflows/ci.yml"))?;
+        let release = fs::read_to_string(root.join(".github/workflows/release.yml"))?;
+        let release_quality = release
+            .split_once("\n  compiler-precise-hostile:\n")
+            .map(|(quality, _)| quality)
+            .expect("release workflow has no bounded quality job");
+        for resource_bound in [
+            "CARGO_INCREMENTAL: \"0\"",
+            "CARGO_PROFILE_DEV_DEBUG: \"0\"",
+            "CARGO_PROFILE_TEST_DEBUG: \"0\"",
+        ] {
+            assert!(
+                release_quality.contains(resource_bound),
+                "release quality job must retain runner disk bound {resource_bound}"
+            );
+        }
 
         for workflow_name in ["ci.yml", "release.yml", "stable-release-source-guard.yml"] {
             let workflow = fs::read_to_string(root.join(".github/workflows").join(workflow_name))?;
