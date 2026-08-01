@@ -3075,7 +3075,11 @@ fn consented_build_mode_runs_project_code_only_in_the_supervised_staging_area() 
 #[cfg(unix)]
 #[test]
 fn cli_cancellation_stops_the_supervised_build_and_retains_the_safe_snapshot() {
-    use std::{process::Stdio, thread, time::Duration};
+    use std::{
+        process::Stdio,
+        thread,
+        time::{Duration, Instant},
+    };
 
     let root = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();
@@ -3116,10 +3120,8 @@ fn cli_cancellation_stops_the_supervised_build_and_retains_the_safe_snapshot() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    for _ in 0..1_000 {
-        if ready.exists() {
-            break;
-        }
+    let ready_deadline = Instant::now() + Duration::from_secs(30);
+    while !ready.exists() && Instant::now() < ready_deadline {
         thread::sleep(Duration::from_millis(10));
     }
     assert!(
