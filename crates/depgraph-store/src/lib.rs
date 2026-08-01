@@ -21,8 +21,8 @@ mod profile_matrix;
 mod runtime;
 
 pub use cache::{
-    CACHE_CONTRACT_VERSION, CacheEntryCounts, CacheEventRecord, CacheKey, CacheLayer,
-    CacheLookupResult, ValidatedScanCacheHit,
+    BuildCacheLookup, CACHE_CONTRACT_VERSION, CacheEntryCounts, CacheEventRecord, CacheKey,
+    CacheLayer, CacheLookupResult, ValidatedScanCacheHit,
 };
 pub use diff::{
     ChangedRecord, GraphSnapshotDiff, NodeRename, NodeRenameEvidence, RecordDiff, RenameConfidence,
@@ -6840,6 +6840,100 @@ mod tests {
             store.current_build_attempt_id("scan-golden")?.as_deref(),
             Some("build-run-1")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn build_cache_hit_validates_base_audit_and_payload_and_replaces_corrupt_entries() -> Result<()>
+    {
+        let mut store = Store::open_in_memory()?;
+        ingest_protocol_fixture(
+            &mut store,
+            include_str!("../../depgraph-protocol/tests/fixtures/protocol-v1.golden.ndjson"),
+        )?;
+        let base_snapshot_id = store.current_snapshot_id()?.context("base snapshot")?;
+        let audit = build_attempt_audit("build-cache-run");
+        store.save_build_audit(&audit)?;
+        store.start_build_attempt("scan-golden", &audit)?;
+        let effective_input_id =
+            canonical_effective_input_id(&store.load_snapshot("scan-golden")?.profiles[0]);
+        let protocol = validate_build_ndjson(Cursor::new(build_protocol(
+            "build-cache-run",
+            false,
+            "production",
+            &effective_input_id,
+        )))?;
+        store.save_build_delta("build-cache-run", &protocol)?;
+        store.finish_build_attempt("build-cache-run", "completed", None, true)?;
+        let build_snapshot_id = store.current_snapshot_id()?.context("build snapshot")?;
+        let key = CacheKey::new(
+            CacheLayer::Build,
+            BTreeMap::from([
+                ("base_snapshot".to_owned(), base_snapshot_id),
+                ("source".to_owned(), "sha256:source".to_owned()),
+            ]),
+        );
+        assert_eq!(
+            store
+                .store_snapshot_cache(&key, &build_snapshot_id, None, Some("build-cache-run"),)?
+                .outcome,
+            "stored"
+        );
+        let hit = store.lookup_build_cache(&key)?;
+        assert_eq!(hit.result.outcome, "hit");
+        assert_eq!(hit.result.reason, "validated");
+        assert_eq!(
+            hit.audit.as_ref().context("cached audit")?["run_id"],
+            "build-cache-run"
+        );
+        let publish_error = store
+            .publish_validated_build_cache_hit_with_precommit(&hit, || {
+                anyhow::bail!("source changed")
+            })
+            .unwrap_err();
+        assert!(
+            publish_error
+                .to_string()
+                .contains("pre-commit validation failed")
+        );
+        assert!(
+            !store
+                .recent_cache_events(20)?
+                .iter()
+                .any(|event| event.layer == CacheLayer::Build && event.outcome == "hit")
+        );
+        store.publish_validated_build_cache_hit_with_precommit(&hit, || Ok(()))?;
+        assert!(
+            store
+                .recent_cache_events(20)?
+                .iter()
+                .any(|event| event.layer == CacheLayer::Build
+                    && event.outcome == "hit"
+                    && event.reason == "validated")
+        );
+
+        store.connection.execute(
+            "UPDATE build_cache SET payload_digest='cache-payload-reference:sha256:broken' WHERE key=?1",
+            [&key.key],
+        )?;
+        let rejected = store.lookup_build_cache(&key)?;
+        assert_eq!(rejected.result.outcome, "reject");
+        assert_eq!(rejected.result.reason, "payload-integrity-failed");
+
+        assert_eq!(
+            store
+                .store_snapshot_cache(&key, &build_snapshot_id, None, Some("build-cache-run"),)?
+                .outcome,
+            "stored"
+        );
+        assert_eq!(store.lookup_build_cache(&key)?.result.outcome, "hit");
+
+        let mut stale_dimensions = key.dimensions.clone();
+        stale_dimensions.insert("source".to_owned(), "sha256:changed".to_owned());
+        let stale = CacheKey::new(CacheLayer::Build, stale_dimensions);
+        let miss = store.lookup_build_cache(&stale)?;
+        assert_eq!(miss.result.outcome, "miss");
+        assert_eq!(miss.result.reason, "not-found");
         Ok(())
     }
 

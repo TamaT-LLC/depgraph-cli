@@ -189,39 +189,82 @@ pub(crate) fn validate_scan_cache_hit_inputs(
     Ok(())
 }
 
-pub fn build_cache_key(audit: &BuildAudit) -> Option<CacheKey> {
-    let artifact = audit.validated_output_digest.as_ref()?;
-    Some(CacheKey::new(
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildCacheInput {
+    pub base_snapshot_id: String,
+    pub adapter: String,
+    pub adapter_version: String,
+    pub adapter_artifact_digest: String,
+    pub command_plan_digest: String,
+    pub environment_key_set_digest: String,
+    pub manifest_lock_config_digest: String,
+    pub profile_id: String,
+    pub protocol_version: String,
+    pub source_root_digest: String,
+    pub staging_metadata_digest: String,
+    pub target: Option<String>,
+    pub toolchain_executable_digest: String,
+    pub toolchain_version: String,
+}
+
+pub fn build_cache_key(input: &BuildCacheInput) -> CacheKey {
+    CacheKey::new(
         CacheLayer::Build,
         BTreeMap::from([
-            ("adapter".to_owned(), audit.adapter.clone()),
-            ("adapter_version".to_owned(), audit.adapter_version.clone()),
-            ("artifact_fingerprint".to_owned(), artifact.clone()),
-            ("command_plan".to_owned(), audit.command_plan_digest.clone()),
+            ("adapter".to_owned(), input.adapter.clone()),
+            (
+                "adapter_artifact".to_owned(),
+                input.adapter_artifact_digest.clone(),
+            ),
+            ("adapter_version".to_owned(), input.adapter_version.clone()),
+            ("base_snapshot".to_owned(), input.base_snapshot_id.clone()),
+            ("command_plan".to_owned(), input.command_plan_digest.clone()),
             (
                 "environment_keys".to_owned(),
-                audit.environment_key_set_digest.clone(),
+                input.environment_key_set_digest.clone(),
             ),
-            ("profile".to_owned(), audit.profile_id.clone()),
-            ("protocol".to_owned(), audit.schema_version.clone()),
-            ("source".to_owned(), audit.source_root_digest.clone()),
+            (
+                "manifest_lock_config".to_owned(),
+                input.manifest_lock_config_digest.clone(),
+            ),
+            ("profile".to_owned(), input.profile_id.clone()),
+            ("protocol".to_owned(), input.protocol_version.clone()),
+            ("source".to_owned(), input.source_root_digest.clone()),
+            (
+                "staging_metadata".to_owned(),
+                input.staging_metadata_digest.clone(),
+            ),
+            (
+                "target".to_owned(),
+                input.target.as_deref().unwrap_or("host").to_owned(),
+            ),
             (
                 "toolchain_executable".to_owned(),
-                audit.toolchain_executable_digest.clone(),
+                input.toolchain_executable_digest.clone(),
             ),
             (
                 "toolchain_version".to_owned(),
                 digest_bytes(
                     "build-toolchain-version-v1",
-                    audit
-                        .toolchain_version
-                        .as_deref()
-                        .unwrap_or("unknown")
-                        .as_bytes(),
+                    input.toolchain_version.as_bytes(),
                 ),
             ),
         ]),
-    ))
+    )
+}
+
+pub fn validate_build_cache_input(input: &BuildCacheInput, audit: &BuildAudit) -> bool {
+    audit.validated_output_digest.is_some()
+        && audit.adapter == input.adapter
+        && audit.adapter_version == input.adapter_version
+        && audit.command_plan_digest == input.command_plan_digest
+        && audit.environment_key_set_digest == input.environment_key_set_digest
+        && audit.profile_id == input.profile_id
+        && audit.schema_version == input.protocol_version
+        && audit.source_root_digest == input.source_root_digest
+        && audit.target == input.target
+        && audit.toolchain_executable_digest == input.toolchain_executable_digest
+        && audit.toolchain_version.as_deref() == Some(input.toolchain_version.as_str())
 }
 
 fn fingerprint_inventory(
@@ -1046,6 +1089,55 @@ fn finish_digest(hasher: Sha256) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn build_input() -> BuildCacheInput {
+        BuildCacheInput {
+            base_snapshot_id: "snapshot:base".to_owned(),
+            adapter: "rust-build-observer".to_owned(),
+            adapter_version: "1.0".to_owned(),
+            adapter_artifact_digest: "sha256:adapter".to_owned(),
+            command_plan_digest: "sha256:command".to_owned(),
+            environment_key_set_digest: "sha256:environment".to_owned(),
+            manifest_lock_config_digest: "sha256:controls".to_owned(),
+            profile_id: "rust:build".to_owned(),
+            protocol_version: "build-supervisor-v1".to_owned(),
+            source_root_digest: "sha256:source".to_owned(),
+            staging_metadata_digest: "sha256:staging-metadata".to_owned(),
+            target: None,
+            toolchain_executable_digest: "sha256:cargo".to_owned(),
+            toolchain_version: "cargo 1.93.1".to_owned(),
+        }
+    }
+
+    #[test]
+    fn build_cache_key_is_input_only_and_every_admission_dimension_invalidates_it() {
+        let input = build_input();
+        let original = build_cache_key(&input);
+        assert!(!original.dimensions.contains_key("run_id"));
+        assert!(!original.dimensions.contains_key("validated_output"));
+
+        let mutations: [fn(&mut BuildCacheInput); 14] = [
+            |value| value.base_snapshot_id.push_str("-changed"),
+            |value| value.adapter.push_str("-changed"),
+            |value| value.adapter_version.push_str("-changed"),
+            |value| value.adapter_artifact_digest.push_str("-changed"),
+            |value| value.command_plan_digest.push_str("-changed"),
+            |value| value.environment_key_set_digest.push_str("-changed"),
+            |value| value.manifest_lock_config_digest.push_str("-changed"),
+            |value| value.profile_id.push_str("-changed"),
+            |value| value.protocol_version.push_str("-changed"),
+            |value| value.source_root_digest.push_str("-changed"),
+            |value| value.staging_metadata_digest.push_str("-changed"),
+            |value| value.target = Some("changed-target".to_owned()),
+            |value| value.toolchain_executable_digest.push_str("-changed"),
+            |value| value.toolchain_version.push_str("-changed"),
+        ];
+        for mutate in mutations {
+            let mut changed = input.clone();
+            mutate(&mut changed);
+            assert_ne!(build_cache_key(&changed).key, original.key);
+        }
+    }
 
     #[test]
     fn semantic_cache_fingerprints_the_effective_verified_rust_pair() {

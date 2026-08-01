@@ -10,6 +10,11 @@ owner: TakehiroT
 updated: 2026-08-01
 ---
 
+> 2026-08-01: Issue #279として、通常のRust / Web build cacheを実行結果ではなく実行前に検証できる入力identityへ変更した。
+> 入力identityはsource、manifest / lock / config、profile、adapter artifact / version、toolchain executable / version、command / environment contract、target、protocol、base snapshotを閉じる。
+> Warm hitはcache payload、completed snapshot、current snapshot、base binding、completed audit、再計算した入力identityを検証してから、project code、build attempt、evidence、snapshotを追加せず既存graphを再利用する。
+> Miss、reject、stored、hitはbuild attemptとcache keyへ記録し、corrupt / stale entryはfail closedに再実行してvalidated snapshotで置換できる。
+
 > 2026-08-01: Issue #278として、通常archiveとtarget別compiler packのversion、target、compatibilityをstable release gateで直接結合した。
 > Immutableな`v0.4.0` baselineを維持したまま、pack付き`v0.4.0-rc.N`を同一workflow sourceから公開できる。
 > `doctor --compiler-pack-requirement`は現在hostのpackをclosed-tree検証し、未指定、欠損、target不一致、改ざんを`unsupported-no-fallback`診断として返す。
@@ -1955,6 +1960,7 @@ digest、ref/tag検証、PR記録項目、patch release時も変わらないance
 
 ## 26. 更新履歴
 
+- 2026-08-01: Issue #279として通常のRust / Web build cacheをpre-execution input identityへ変更した。source、manifest / lock / config、profile、adapter artifact / version、toolchain executable / version、command / environment contract、target、protocol、base snapshotをkeyに含め、completed snapshot、current snapshot、base binding、payload、audit、入力の再計算が一致した場合だけproject codeを実行せず既存graphを返す。miss / reject / stored / hitをattemptへ記録し、corrupt / stale entryはfail closedに再実行してvalidated outputで置換する。RustとNext.jsのcold / warm testはsnapshot、audit、cache entry、exportが増減・変化しないことを検証する。
 - 2026-07-31: Issue #275としてRust HIR scanのattempt-local性能計測と代表benchmarkを実装した。workerはdiscovery/metadata、syntax、model planning、VFS、crate graph、database apply、HIR semantic、source finalize、protocol build/writeを、coreはworker execution、protocol ingest、store validation/promotion、totalをwall time・件数・bytes付きで`DEPGRAPH_SCAN_PROFILE=1`時だけ報告する。31 source file・2,520 function・7,560以上のsemantic siteを持つ決定的fixtureをcold / `--no-cache` / validated warm hitで検証し、cold/no-cache graph・coverage・diagnostic・安全性を一致させる。HIR occurrenceごとの全syntax tree走査をfile単位span indexへ置換し、source finalizeとHIR extractorは対象occurrenceの借用indexを共有する。crate単位の46-entry active cfgはprofileへ一度だけ正規化し、20,380件のHIR evidenceから参照することでcfg contextを維持したままprotocolを60.0 MBから37.8 MBへ縮小した。scan completionはmutation-count tokenで検証と昇格を結び、同じsnapshotの二重load・再validation・cache layer別再hashを除去した。Rust workerは既存のstable-ID mapを直接検証し、coreは独立なrustc/Cargo attestation probeを並列化し、store completion validationは契約に必要な列だけを読む。新規storeは16 KiB SQLite page、64 MiB connection cache、memory temp storeを使い、初回batchの空DELETEとsite/edge `raw_json`内のevidence重複保存を避ける一方、既存storeのpage sizeと論理graphの読み取り互換性を維持する。ローカルrelease実測はcold 5.02秒、`--no-cache` 3.93秒、warm 0.87秒、HIR semantic 0.72秒、store validation/promotion 0.61秒で、7,776 dependency siteとcold/no-cacheのbyte-identical exportを維持した。
 - 2026-07-30: Issue #265として`doctor`のworker artifact healthとper-root launch policyを分離した。diagnostic rootは明示`--root`、store latest attempt root、attemptなしのcurrent cwdの順で選択し、path/sourceをhuman/JSONへ公開する。Rust/Go/Webのversion/protocol/integrity probeはrepository外のneutral rootで実行して起動cwd依存を除去し、`root_launch_allowed` / errorは実diagnostic rootに対して独立評価する。depgraph source tree自体をrootにしたdevelopment artifact拒否、release archive attestation、safe environment・timeout・process reapを維持し、cwd差分と全3workerの回帰テストを追加した。
 - 2026-07-30: Issue #264として対話的query出力をbounded化した。`doctor`は既定summaryと明示`--details`を分離し、summaryはdiagnostic raw JSON、graph / evidence、adapter stderrを読まずにcoverage、profile / package、adapter別file、diagnostic total・上位64原因group・代表5件を返す。`deps` / `dependents` / `unresolved`は`depgraph-interactive-query-page-v1`でitem / compact JSON byte / traversalを制限し、打ち切りを`complete:false`、固定diagnostic、実serialize byte数、snapshot/query-bound cursorとして公開する。同一cursorの決定性、page連結の重複・欠落なし、oversized item、改変cursor、traversal上限、human/JSON、512-edge fixtureを回帰検証し、`--all`とstreaming `export`でfull outputを維持する。

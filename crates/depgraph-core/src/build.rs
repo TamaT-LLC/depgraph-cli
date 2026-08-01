@@ -17,6 +17,7 @@ use tokio::{process::Command, time::timeout};
 use uuid::Uuid;
 use walkdir::{DirEntry, WalkDir};
 
+use crate::cache::BuildCacheInput;
 use crate::compiler_invocation::{
     COMPILER_PRECISE_INVOCATION_ADAPTER, COMPILER_PRECISE_INVOCATION_ADAPTER_VERSION,
     RustCompilerInvocationLedger, compiler_invocation_attempt_digest,
@@ -413,6 +414,108 @@ where
     F: std::future::Future<Output = ()>,
 {
     supervise_build_with_cancellation(&request.source_root, &request.plan, cancellation).await
+}
+
+pub async fn prepare_build_cache_input(
+    request: &BuildExecutionRequest,
+    base_snapshot_id: &str,
+) -> Result<Option<BuildCacheInput>> {
+    let plan = &request.plan;
+    plan.validate()?;
+    if plan.compiler_pack.is_some()
+        || matches!(
+            plan.adapter.as_str(),
+            COMPILER_PRECISE_UNIT_GRAPH_ADAPTER | COMPILER_PRECISE_INVOCATION_ADAPTER
+        )
+    {
+        return Ok(None);
+    }
+    let source_root = request
+        .source_root
+        .canonicalize()
+        .context("build source root is unavailable")?;
+    if !source_root.is_dir() {
+        bail!("build source root is not a directory");
+    }
+    let (program, rustc) = if plan.program == "cargo" {
+        let (cargo, rustc) = resolve_active_rust_toolchain(&source_root).await?;
+        (cargo, Some(rustc))
+    } else {
+        (resolve_safe_executable(&plan.program, &source_root)?, None)
+    };
+    let toolchain_executable_digest = digest_file(&program)?;
+    let toolchain_version = probe_build_tool_version(&program, &source_root).await?;
+    let (source_root_digest, manifest_lock_config_digest, staging_metadata_digest) =
+        fingerprint_build_source(&source_root)?;
+    let command_plan_digest = digest_json(&serde_json::json!({
+        "version": BUILD_SUPERVISOR_VERSION,
+        "adapter": plan.adapter,
+        "adapter_version": plan.adapter_version,
+        "isolation": plan.isolation.contract_name(),
+        "program": plan.program,
+        "arguments": redact_arguments(&plan.arguments),
+        "logical_cwd": display_logical(&plan.logical_cwd),
+        "compiler_pack_manifest_sha256": serde_json::Value::Null,
+    }))?;
+    let run = BuildRunDirectories::create()?;
+    let mut effective_environment = supervisor_environment(
+        &source_root,
+        &run,
+        &plan.program,
+        rustc.as_deref(),
+        None,
+        false,
+    )?;
+    for (key, value) in &plan.environment {
+        effective_environment.insert(key.clone(), value.clone());
+    }
+    let (environment_keys, _) =
+        audit_environment_keys(effective_environment.keys().map(String::as_str));
+    let environment_key_set_digest = digest_json(&environment_keys)?;
+    let executable = std::env::current_exe()
+        .context("current depgraph executable is unavailable for build cache identity")?;
+    let engine_digest = digest_file(&executable)?;
+    let observer_digest = plan
+        .environment
+        .get("DEPGRAPH_OBSERVER")
+        .map(|path| digest_file(Path::new(path)))
+        .transpose()?;
+    let adapter_artifact_digest = digest_json(&(
+        "build-adapter-artifact-v1",
+        engine_digest,
+        observer_digest.as_deref().unwrap_or("embedded"),
+    ))?;
+    Ok(Some(BuildCacheInput {
+        base_snapshot_id: base_snapshot_id.to_owned(),
+        adapter: plan.adapter.clone(),
+        adapter_version: plan.adapter_version.clone(),
+        adapter_artifact_digest,
+        command_plan_digest,
+        environment_key_set_digest,
+        manifest_lock_config_digest,
+        profile_id: plan.profile_id.clone(),
+        protocol_version: BUILD_SUPERVISOR_VERSION.to_owned(),
+        source_root_digest,
+        staging_metadata_digest,
+        target: plan.target.clone(),
+        toolchain_executable_digest,
+        toolchain_version,
+    }))
+}
+
+pub fn validate_build_cache_source(input: &BuildCacheInput, source_root: &Path) -> Result<()> {
+    let source_root = source_root
+        .canonicalize()
+        .context("build cache source root is unavailable")?;
+    let (source_digest, controls_digest, staging_metadata_digest) =
+        fingerprint_build_source(&source_root)?;
+    if source_digest != input.source_root_digest
+        || controls_digest != input.manifest_lock_config_digest
+        || staging_metadata_digest != input.staging_metadata_digest
+    {
+        bail!("build cache source input changed before publication");
+    }
+    Ok(())
 }
 
 impl BuildExecutionPlan {
@@ -2117,6 +2220,109 @@ fn digest_workspace(root: &Path) -> Result<String> {
     Ok(hex::encode(hasher.finalize()))
 }
 
+fn fingerprint_build_source(root: &Path) -> Result<(String, String, String)> {
+    let mut source = Sha256::new();
+    source.update(b"depgraph-build-source-v1\0");
+    let mut controls = Sha256::new();
+    controls.update(b"depgraph-build-manifest-lock-config-v1\0");
+    let mut staging_metadata = Sha256::new();
+    staging_metadata.update(b"depgraph-build-staging-metadata-v1\0");
+    let mut entries = WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(admit_stage_entry)
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    entries.sort_by_key(|entry| entry.path().to_path_buf());
+    let mut files = 0_usize;
+    let mut bytes = 0_u64;
+    for entry in entries {
+        let relative = entry.path().strip_prefix(root)?;
+        if relative.as_os_str().is_empty() {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if metadata.file_type().is_symlink() {
+            bail!(
+                "security policy violation: staged workspace contains symlink {}",
+                display_logical(relative)
+            );
+        }
+        let logical = display_logical(relative);
+        if metadata.is_dir() {
+            staging_metadata.update(b"directory\0");
+            staging_metadata.update(logical.as_bytes());
+            staging_metadata.update([0]);
+            continue;
+        }
+        if !metadata.is_file() {
+            bail!(
+                "security policy violation: staged workspace contains non-regular file {}",
+                display_logical(relative)
+            );
+        }
+        files += 1;
+        bytes = bytes.saturating_add(metadata.len());
+        if files > MAX_STAGED_FILES || bytes > MAX_STAGED_BYTES {
+            bail!("security policy violation: staged workspace exceeds file or byte limit");
+        }
+        let contents = fs::read(entry.path())?;
+        staging_metadata.update(b"file\0");
+        staging_metadata.update(logical.as_bytes());
+        staging_metadata.update([0]);
+        staging_metadata.update(staged_file_permission_fingerprint(&metadata).to_le_bytes());
+        source.update(logical.as_bytes());
+        source.update([0]);
+        source.update(&contents);
+        source.update([0]);
+        if is_build_control_path(relative) {
+            controls.update(logical.as_bytes());
+            controls.update([0]);
+            controls.update(&contents);
+            controls.update([0]);
+        }
+    }
+    Ok((
+        hex::encode(source.finalize()),
+        hex::encode(controls.finalize()),
+        hex::encode(staging_metadata.finalize()),
+    ))
+}
+
+#[cfg(unix)]
+fn staged_file_permission_fingerprint(metadata: &fs::Metadata) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+
+    metadata.permissions().mode() & 0o7777
+}
+
+#[cfg(not(unix))]
+fn staged_file_permission_fingerprint(metadata: &fs::Metadata) -> u32 {
+    u32::from(metadata.permissions().readonly())
+}
+
+fn is_build_control_path(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    matches!(
+        name,
+        "Cargo.toml"
+            | "Cargo.lock"
+            | "package.json"
+            | "package-lock.json"
+            | "pnpm-lock.yaml"
+            | "yarn.lock"
+            | "bun.lock"
+            | "bun.lockb"
+            | "rust-toolchain"
+            | "rust-toolchain.toml"
+            | "tsconfig.json"
+    ) || name.starts_with("next.config.")
+        || name.starts_with("astro.config.")
+        || name.starts_with("vite.config.")
+}
+
 fn validate_logical_path(path: &Path, allow_empty: bool) -> Result<()> {
     if path.is_absolute() || (!allow_empty && path.as_os_str().is_empty()) {
         bail!("security policy violation: build logical path must be relative");
@@ -2167,6 +2373,32 @@ mod tests {
     use crate::compiler_pack::{
         CompilerPackBuildComponent, CompilerPackBuildSpec, build_compiler_pack,
     };
+
+    #[test]
+    fn build_cache_source_fingerprint_covers_empty_directories_and_staged_permissions() -> Result<()>
+    {
+        let root = tempfile::tempdir()?;
+        fs::create_dir(root.path().join("empty"))?;
+        let source = root.path().join("source.rs");
+        fs::write(&source, "pub fn observed() {}\n")?;
+        let (_, _, original_metadata) = fingerprint_build_source(root.path())?;
+
+        fs::remove_dir(root.path().join("empty"))?;
+        let (_, _, without_empty_directory) = fingerprint_build_source(root.path())?;
+        assert_ne!(original_metadata, without_empty_directory);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mut permissions = fs::metadata(&source)?.permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&source, permissions)?;
+            let (_, _, executable_metadata) = fingerprint_build_source(root.path())?;
+            assert_ne!(without_empty_directory, executable_metadata);
+        }
+        Ok(())
+    }
 
     #[test]
     fn web_build_observer_versions_follow_each_observation_contract() {

@@ -333,6 +333,17 @@ done
 finished="$(now_ms)"
 printf '%d\n' "$((finished - started))" > "$raw/build-observation-ms.txt"
 
+next_build_store="$cache/build-next-app.db"
+"$binary" --store "$next_build_store" resolve --build \
+  "$build_fixture/apps/next-app" --allow-project-code \
+  > "$raw/build-next-app-warm.txt"
+grep -F "project code executed: false" "$raw/build-next-app-warm.txt" > /dev/null
+grep -F "build cache lookup: hit (validated)" "$raw/build-next-app-warm.txt" > /dev/null
+grep -F "build cache: hit" "$raw/build-next-app-warm.txt" > /dev/null
+"$binary" --store "$next_build_store" export --format json \
+  > "$raw/build-next-app-warm.json"
+cmp "$raw/build-next-app.json" "$raw/build-next-app-warm.json"
+
 DEPGRAPH_BENCH_BINARY="$binary" \
   node scripts/benchmark-report.mjs create "$raw" "$fixture" "$report"
 node scripts/cache-hit-benchmark.mjs create "$raw" "$cache_hit_report"

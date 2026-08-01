@@ -5,7 +5,7 @@ use chrono::{SecondsFormat, Utc};
 use depgraph_protocol::stable_id_from_value;
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 
 use super::{
     CompletedScanSnapshot, CoverageRecord, DiagnosticRecord, Store, ensure_scan_staging,
@@ -130,6 +130,21 @@ pub struct ValidatedScanCacheHit {
     diagnostics: Vec<DiagnosticRecord>,
 }
 
+#[derive(Debug, Clone)]
+pub struct BuildCacheLookup {
+    pub result: CacheLookupResult,
+    pub audit: Option<Value>,
+    validated: Option<ValidatedBuildCacheHit>,
+}
+
+#[derive(Debug, Clone)]
+struct ValidatedBuildCacheHit {
+    key: CacheKey,
+    entry: StoredCacheEntry,
+    attempt_id: String,
+    data_version: i64,
+}
+
 impl ValidatedScanCacheHit {
     pub fn snapshot_id(&self) -> &str {
         &self.snapshot_id
@@ -144,7 +159,7 @@ impl ValidatedScanCacheHit {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct StoredCacheEntry {
     contract_version: u32,
     dimensions_json: String,
@@ -163,6 +178,32 @@ impl Store {
             semantic: table_count(&self.connection, CacheLayer::Semantic)?,
             build: table_count(&self.connection, CacheLayer::Build)?,
         })
+    }
+
+    pub fn build_cache_base_snapshot_id(&self, base_scan_id: &str) -> Result<Option<String>> {
+        let Some(current_id) = self.current_snapshot_id()? else {
+            return Ok(None);
+        };
+        let current = self
+            .completed_snapshot(&current_id)?
+            .context("current completed snapshot disappeared")?;
+        if current.scan_id != base_scan_id {
+            return Ok(None);
+        }
+        match current.source_kind.as_str() {
+            "scan" => Ok(Some(current.id)),
+            "build" => {
+                let attempt_id = current
+                    .build_attempt_id
+                    .as_deref()
+                    .context("current build snapshot has no build attempt")?;
+                Ok(self
+                    .build_attempt(attempt_id)?
+                    .and_then(|attempt| attempt.base_snapshot_id))
+            }
+            "runtime" => Ok(None),
+            _ => Ok(None),
+        }
     }
 
     pub fn cache_events_for_scan(&self, scan_id: &str) -> Result<Vec<CacheEventRecord>> {
@@ -279,6 +320,128 @@ impl Store {
             "validated",
             Some(entry.snapshot_id),
         ))
+    }
+
+    pub fn lookup_build_cache(&mut self, key: &CacheKey) -> Result<BuildCacheLookup> {
+        key.validate()?;
+        if key.layer != CacheLayer::Build {
+            bail!("build cache lookup requires the build layer");
+        }
+        let Some(entry) = load_cache_entry(&self.connection, key.layer, &key.key)? else {
+            return Ok(BuildCacheLookup {
+                result: cache_result(key, "miss", "not-found", None),
+                audit: None,
+                validated: None,
+            });
+        };
+        if let Some(reason) = self.cache_entry_rejection(key, &entry)? {
+            return Ok(BuildCacheLookup {
+                result: cache_result(key, "reject", &reason, None),
+                audit: None,
+                validated: None,
+            });
+        }
+        if self.current_snapshot_id()?.as_deref() != Some(entry.snapshot_id.as_str()) {
+            return Ok(BuildCacheLookup {
+                result: cache_result(key, "reject", "current-snapshot-mismatch", None),
+                audit: None,
+                validated: None,
+            });
+        }
+        let snapshot = self
+            .completed_snapshot(&entry.snapshot_id)?
+            .context("validated build cache snapshot disappeared")?;
+        let attempt_id = snapshot
+            .build_attempt_id
+            .as_deref()
+            .context("validated build cache snapshot has no build attempt")?;
+        let attempt = self
+            .build_attempt(attempt_id)?
+            .context("validated build cache attempt disappeared")?;
+        if attempt.base_snapshot_id.as_deref()
+            != key.dimensions.get("base_snapshot").map(String::as_str)
+        {
+            return Ok(BuildCacheLookup {
+                result: cache_result(key, "reject", "base-binding-mismatch", None),
+                audit: None,
+                validated: None,
+            });
+        }
+        let audit = match self.build_audit(&attempt.audit_run_id) {
+            Ok(Some(audit)) if audit.outcome == "completed" => audit.audit,
+            Ok(_) | Err(_) => {
+                return Ok(BuildCacheLookup {
+                    result: cache_result(key, "reject", "audit-integrity-failed", None),
+                    audit: None,
+                    validated: None,
+                });
+            }
+        };
+        let data_version = self
+            .connection
+            .query_row("PRAGMA data_version", [], |row| row.get(0))?;
+        Ok(BuildCacheLookup {
+            result: cache_result(key, "hit", "validated", Some(entry.snapshot_id.clone())),
+            audit: Some(audit),
+            validated: Some(ValidatedBuildCacheHit {
+                key: key.clone(),
+                entry,
+                attempt_id: attempt_id.to_owned(),
+                data_version,
+            }),
+        })
+    }
+
+    /// Publishes a build-cache hit only if the validated SQLite state and the
+    /// caller's final external input proof still hold at the transaction's
+    /// commit boundary.
+    pub fn publish_validated_build_cache_hit_with_precommit(
+        &mut self,
+        lookup: &BuildCacheLookup,
+        validate_before_commit: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        let hit = lookup
+            .validated
+            .as_ref()
+            .context("build cache lookup is not a validated hit")?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let observed_data_version: i64 =
+            tx.query_row("PRAGMA data_version", [], |row| row.get(0))?;
+        if observed_data_version != hit.data_version {
+            bail!("build cache store changed after validation");
+        }
+        let current_snapshot_id: Option<String> = tx
+            .query_row(
+                "SELECT snapshot_id FROM current_completed_snapshot WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if current_snapshot_id.as_deref() != Some(hit.entry.snapshot_id.as_str()) {
+            bail!("build cache current snapshot changed before publication");
+        }
+        let current_entry = load_cache_entry(&tx, CacheLayer::Build, &hit.key.key)?
+            .context("validated build cache entry disappeared before publication")?;
+        if current_entry != hit.entry {
+            bail!("build cache entry changed before publication");
+        }
+        tx.execute(
+            "UPDATE build_cache
+                SET last_used_at=?2, hit_count=hit_count+1
+              WHERE key=?1",
+            params![hit.key.key, now()],
+        )?;
+        tx.execute(
+            "INSERT INTO cache_events(
+                build_attempt_id, layer, cache_key, outcome, reason, created_at
+             ) VALUES (?1, 'build', ?2, 'hit', 'validated', ?3)",
+            params![hit.attempt_id, hit.key.key, now()],
+        )?;
+        validate_before_commit().context("build cache hit pre-commit validation failed")?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// Validates a semantic scan-cache entry once and correlates its syntax
@@ -594,7 +757,7 @@ impl Store {
     ) -> Result<CacheLookupResult> {
         let payload_digest = self.cache_payload_digest(key.layer, snapshot_id)?;
         if let Some(existing) = load_cache_entry(&self.connection, key.layer, &key.key)?
-            && existing.contract_version == CACHE_CONTRACT_VERSION
+            && self.cache_entry_rejection(key, &existing)?.is_none()
             && existing.payload_digest != payload_digest
         {
             self.record_cache_event(

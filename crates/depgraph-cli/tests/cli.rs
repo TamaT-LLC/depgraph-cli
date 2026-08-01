@@ -2914,6 +2914,66 @@ fn consented_build_mode_runs_project_code_only_in_the_supervised_staging_area() 
     assert!(!build_nodes_json.contains("hidden-env-value"));
     assert!(!build_nodes_json.contains("super-secret-token"));
     assert!(!build_nodes_json.contains(&root.path().to_string_lossy().to_string()));
+    let first_snapshot_id = store.current_snapshot_id().unwrap().unwrap();
+    let first_audit_run_id = audit["run_id"].as_str().unwrap().to_owned();
+    drop(store);
+
+    let export = || {
+        let output = Command::cargo_bin("depgraph")
+            .unwrap()
+            .args([
+                "--store",
+                store_path.to_str().unwrap(),
+                "export",
+                "--format",
+                "json",
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        output.stdout
+    };
+    let cold_export = export();
+
+    Command::cargo_bin("depgraph")
+        .unwrap()
+        .args([
+            "--store",
+            store_path.to_str().unwrap(),
+            "resolve",
+            "--build",
+            root.path().to_str().unwrap(),
+            "--allow-project-code",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("project code executed: false"))
+        .stdout(predicate::str::contains("build evidence: reused"))
+        .stdout(predicate::str::contains(
+            "build cache lookup: hit (validated)",
+        ))
+        .stdout(predicate::str::contains("build cache: hit"));
+
+    assert_eq!(export(), cold_export);
+    let store = depgraph_store::Store::open(&store_path).unwrap();
+    assert_eq!(
+        store.current_snapshot_id().unwrap().as_deref(),
+        Some(first_snapshot_id.as_str())
+    );
+    assert_eq!(store.cache_entry_counts().unwrap().build, 1);
+    assert_eq!(
+        store.latest_build_audit().unwrap().unwrap().audit["run_id"],
+        first_audit_run_id
+    );
+    assert!(
+        store
+            .recent_cache_events(20)
+            .unwrap()
+            .iter()
+            .any(|event| event.layer == depgraph_store::CacheLayer::Build
+                && event.outcome == "hit"
+                && event.reason == "validated")
+    );
     drop(store);
 
     let run_json = |arguments: &[&str]| {
@@ -2964,6 +3024,41 @@ fn consented_build_mode_runs_project_code_only_in_the_supervised_staging_area() 
             && step["phase_coverage"]["build"].is_object()
     }));
 
+    fs::write(
+        root.path().join("src/lib.rs"),
+        "use fixture_macro::Observed;\n#[derive(Observed)]\npub struct Fixture;\ninclude!(concat!(env!(\"OUT_DIR\"), \"/generated.rs\"));\n// cache input changed\n",
+    )
+    .unwrap();
+    Command::cargo_bin("depgraph")
+        .unwrap()
+        .args([
+            "--store",
+            store_path.to_str().unwrap(),
+            "resolve",
+            "--build",
+            root.path().to_str().unwrap(),
+            "--allow-project-code",
+        ])
+        .assert()
+        .code(4)
+        .stderr(predicate::str::contains("build evidence was rejected"));
+    let store = depgraph_store::Store::open(&store_path).unwrap();
+    assert_eq!(store.cache_entry_counts().unwrap().build, 1);
+    assert_eq!(
+        store.current_snapshot_id().unwrap().as_deref(),
+        Some(first_snapshot_id.as_str())
+    );
+    assert!(
+        store
+            .recent_cache_events(20)
+            .unwrap()
+            .iter()
+            .any(|event| event.layer == depgraph_store::CacheLayer::Build
+                && event.outcome == "miss"
+                && event.reason == "not-found")
+    );
+    drop(store);
+
     Command::cargo_bin("depgraph")
         .unwrap()
         .args([
@@ -2980,7 +3075,11 @@ fn consented_build_mode_runs_project_code_only_in_the_supervised_staging_area() 
 #[cfg(unix)]
 #[test]
 fn cli_cancellation_stops_the_supervised_build_and_retains_the_safe_snapshot() {
-    use std::{process::Stdio, thread, time::Duration};
+    use std::{
+        process::Stdio,
+        thread,
+        time::{Duration, Instant},
+    };
 
     let root = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();
@@ -3021,10 +3120,8 @@ fn cli_cancellation_stops_the_supervised_build_and_retains_the_safe_snapshot() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    for _ in 0..1_000 {
-        if ready.exists() {
-            break;
-        }
+    let ready_deadline = Instant::now() + Duration::from_secs(30);
+    while !ready.exists() && Instant::now() < ready_deadline {
         thread::sleep(Duration::from_millis(10));
     }
     assert!(
