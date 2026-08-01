@@ -18,7 +18,7 @@ updated: 2026-08-01
 > 2026-08-01: Issue #278として、通常archiveとtarget別compiler packのversion、target、compatibilityをstable release gateで直接結合した。
 > Immutableな`v0.4.0` baselineを維持したまま、pack付き`v0.4.0-rc.N`を同一workflow sourceから公開できる。
 > `doctor --compiler-pack-requirement`は現在hostのpackをclosed-tree検証し、未指定、欠損、target不一致、改ざんを`unsupported-no-fallback`診断として返す。
-> 診断にはasset名と取得、checksum、展開の手順を含め、READMEと最新の`v0.4.0-rc.5` release noteにも取得からresolveまでの手順を記載した。
+> 診断にはasset名と取得、checksum、展開の手順を含め、READMEと最新の`v0.4.0-rc.6` release noteにも取得からresolveまでの手順を記載した。
 
 # アーキテクチャ設計: Semantic Dependency Graph CLI
 
