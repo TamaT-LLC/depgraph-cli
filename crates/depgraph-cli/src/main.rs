@@ -29,8 +29,9 @@ use depgraph_core::{
     run_scan_with_cache_mode, runtime_session_delta, rust_build_protocol_ndjson,
     stage_build_evidence, start_repository_daemon, traversal_page_items, traversal_summary,
     traverse_bounded_filtered, traverse_filtered, unresolved, unresolved_summary,
-    validate_build_cache_input, validate_explicit_profile_selection_capabilities,
-    validate_interactive_query_bounds, web_build_protocol_ndjson, why_filtered,
+    validate_build_cache_input, validate_build_cache_source,
+    validate_explicit_profile_selection_capabilities, validate_interactive_query_bounds,
+    web_build_protocol_ndjson, why_filtered,
 };
 use depgraph_protocol::canonical_json;
 use depgraph_store::{CompletedSnapshotDetails, CoverageRecord};
@@ -837,30 +838,38 @@ async fn run(cli: Cli) -> Result<u8> {
                         .map(|input| build_cache_key(&input));
                     let cached_audit = lookup
                         .audit
-                        .and_then(|audit| serde_json::from_value::<BuildAudit>(audit).ok());
+                        .as_ref()
+                        .and_then(|audit| serde_json::from_value::<BuildAudit>(audit.clone()).ok());
                     if confirmed.as_ref() == Some(&key)
                         && cached_audit.as_ref().is_some_and(|audit| {
                             matches!(audit.outcome, BuildOutcomeKind::Completed)
                                 && validate_build_cache_input(&input, audit)
                         })
                     {
-                        let audit =
-                            cached_audit.context("validated build cache audit is missing")?;
-                        println!("build run: {}", audit.run_id);
-                        println!("status: {:?}", audit.outcome);
-                        println!("project code executed: false");
-                        println!("build evidence: reused");
-                        println!("build cache lookup: hit (validated)");
-                        println!("build cache: hit");
-                        println!("network isolation: {:?}", audit.network_isolation);
-                        if let Some(diagnostic) = &audit.isolation_diagnostic {
-                            eprintln!("warning: {diagnostic}");
+                        let published = store
+                            .publish_validated_build_cache_hit_with_precommit(&lookup, || {
+                                validate_build_cache_source(&input, &root)
+                            })
+                            .is_ok();
+                        if published {
+                            let audit =
+                                cached_audit.context("validated build cache audit is missing")?;
+                            println!("build run: {}", audit.run_id);
+                            println!("status: {:?}", audit.outcome);
+                            println!("project code executed: false");
+                            println!("build evidence: reused");
+                            println!("build cache lookup: hit (validated)");
+                            println!("build cache: hit");
+                            println!("network isolation: {:?}", audit.network_isolation);
+                            if let Some(diagnostic) = &audit.isolation_diagnostic {
+                                eprintln!("warning: {diagnostic}");
+                            }
+                            println!("store: {}", store_path.display());
+                            return Ok(0);
                         }
-                        println!("store: {}", store_path.display());
-                        return Ok(0);
                     }
                     cache_lookup_status = "reject".to_owned();
-                    cache_lookup_reason = "input-changed-after-lookup".to_owned();
+                    cache_lookup_reason = "input-changed-before-publication".to_owned();
                 }
                 cache_input = Some(input);
                 cache_key = Some(key);

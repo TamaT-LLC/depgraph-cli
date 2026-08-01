@@ -445,7 +445,8 @@ pub async fn prepare_build_cache_input(
     };
     let toolchain_executable_digest = digest_file(&program)?;
     let toolchain_version = probe_build_tool_version(&program, &source_root).await?;
-    let (source_root_digest, manifest_lock_config_digest) = fingerprint_build_source(&source_root)?;
+    let (source_root_digest, manifest_lock_config_digest, staging_metadata_digest) =
+        fingerprint_build_source(&source_root)?;
     let command_plan_digest = digest_json(&serde_json::json!({
         "version": BUILD_SUPERVISOR_VERSION,
         "adapter": plan.adapter,
@@ -495,10 +496,26 @@ pub async fn prepare_build_cache_input(
         profile_id: plan.profile_id.clone(),
         protocol_version: BUILD_SUPERVISOR_VERSION.to_owned(),
         source_root_digest,
+        staging_metadata_digest,
         target: plan.target.clone(),
         toolchain_executable_digest,
         toolchain_version,
     }))
+}
+
+pub fn validate_build_cache_source(input: &BuildCacheInput, source_root: &Path) -> Result<()> {
+    let source_root = source_root
+        .canonicalize()
+        .context("build cache source root is unavailable")?;
+    let (source_digest, controls_digest, staging_metadata_digest) =
+        fingerprint_build_source(&source_root)?;
+    if source_digest != input.source_root_digest
+        || controls_digest != input.manifest_lock_config_digest
+        || staging_metadata_digest != input.staging_metadata_digest
+    {
+        bail!("build cache source input changed before publication");
+    }
+    Ok(())
 }
 
 impl BuildExecutionPlan {
@@ -2203,11 +2220,13 @@ fn digest_workspace(root: &Path) -> Result<String> {
     Ok(hex::encode(hasher.finalize()))
 }
 
-fn fingerprint_build_source(root: &Path) -> Result<(String, String)> {
+fn fingerprint_build_source(root: &Path) -> Result<(String, String, String)> {
     let mut source = Sha256::new();
     source.update(b"depgraph-build-source-v1\0");
     let mut controls = Sha256::new();
     controls.update(b"depgraph-build-manifest-lock-config-v1\0");
+    let mut staging_metadata = Sha256::new();
+    staging_metadata.update(b"depgraph-build-staging-metadata-v1\0");
     let mut entries = WalkDir::new(root)
         .follow_links(false)
         .into_iter()
@@ -2228,7 +2247,11 @@ fn fingerprint_build_source(root: &Path) -> Result<(String, String)> {
                 display_logical(relative)
             );
         }
+        let logical = display_logical(relative);
         if metadata.is_dir() {
+            staging_metadata.update(b"directory\0");
+            staging_metadata.update(logical.as_bytes());
+            staging_metadata.update([0]);
             continue;
         }
         if !metadata.is_file() {
@@ -2242,8 +2265,11 @@ fn fingerprint_build_source(root: &Path) -> Result<(String, String)> {
         if files > MAX_STAGED_FILES || bytes > MAX_STAGED_BYTES {
             bail!("security policy violation: staged workspace exceeds file or byte limit");
         }
-        let logical = display_logical(relative);
         let contents = fs::read(entry.path())?;
+        staging_metadata.update(b"file\0");
+        staging_metadata.update(logical.as_bytes());
+        staging_metadata.update([0]);
+        staging_metadata.update(staged_file_permission_fingerprint(&metadata).to_le_bytes());
         source.update(logical.as_bytes());
         source.update([0]);
         source.update(&contents);
@@ -2258,7 +2284,20 @@ fn fingerprint_build_source(root: &Path) -> Result<(String, String)> {
     Ok((
         hex::encode(source.finalize()),
         hex::encode(controls.finalize()),
+        hex::encode(staging_metadata.finalize()),
     ))
+}
+
+#[cfg(unix)]
+fn staged_file_permission_fingerprint(metadata: &fs::Metadata) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+
+    metadata.permissions().mode() & 0o7777
+}
+
+#[cfg(not(unix))]
+fn staged_file_permission_fingerprint(metadata: &fs::Metadata) -> u32 {
+    u32::from(metadata.permissions().readonly())
 }
 
 fn is_build_control_path(path: &Path) -> bool {
@@ -2334,6 +2373,32 @@ mod tests {
     use crate::compiler_pack::{
         CompilerPackBuildComponent, CompilerPackBuildSpec, build_compiler_pack,
     };
+
+    #[test]
+    fn build_cache_source_fingerprint_covers_empty_directories_and_staged_permissions() -> Result<()>
+    {
+        let root = tempfile::tempdir()?;
+        fs::create_dir(root.path().join("empty"))?;
+        let source = root.path().join("source.rs");
+        fs::write(&source, "pub fn observed() {}\n")?;
+        let (_, _, original_metadata) = fingerprint_build_source(root.path())?;
+
+        fs::remove_dir(root.path().join("empty"))?;
+        let (_, _, without_empty_directory) = fingerprint_build_source(root.path())?;
+        assert_ne!(original_metadata, without_empty_directory);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mut permissions = fs::metadata(&source)?.permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&source, permissions)?;
+            let (_, _, executable_metadata) = fingerprint_build_source(root.path())?;
+            assert_ne!(without_empty_directory, executable_metadata);
+        }
+        Ok(())
+    }
 
     #[test]
     fn web_build_observer_versions_follow_each_observation_contract() {

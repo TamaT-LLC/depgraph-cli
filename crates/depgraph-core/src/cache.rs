@@ -201,6 +201,7 @@ pub struct BuildCacheInput {
     pub profile_id: String,
     pub protocol_version: String,
     pub source_root_digest: String,
+    pub staging_metadata_digest: String,
     pub target: Option<String>,
     pub toolchain_executable_digest: String,
     pub toolchain_version: String,
@@ -229,6 +230,10 @@ pub fn build_cache_key(input: &BuildCacheInput) -> CacheKey {
             ("profile".to_owned(), input.profile_id.clone()),
             ("protocol".to_owned(), input.protocol_version.clone()),
             ("source".to_owned(), input.source_root_digest.clone()),
+            (
+                "staging_metadata".to_owned(),
+                input.staging_metadata_digest.clone(),
+            ),
             (
                 "target".to_owned(),
                 input.target.as_deref().unwrap_or("host").to_owned(),
@@ -1097,6 +1102,7 @@ mod tests {
             profile_id: "rust:build".to_owned(),
             protocol_version: "build-supervisor-v1".to_owned(),
             source_root_digest: "sha256:source".to_owned(),
+            staging_metadata_digest: "sha256:staging-metadata".to_owned(),
             target: None,
             toolchain_executable_digest: "sha256:cargo".to_owned(),
             toolchain_version: "cargo 1.93.1".to_owned(),
@@ -1110,7 +1116,7 @@ mod tests {
         assert!(!original.dimensions.contains_key("run_id"));
         assert!(!original.dimensions.contains_key("validated_output"));
 
-        let mutations: [fn(&mut BuildCacheInput); 13] = [
+        let mutations: [fn(&mut BuildCacheInput); 14] = [
             |value| value.base_snapshot_id.push_str("-changed"),
             |value| value.adapter.push_str("-changed"),
             |value| value.adapter_version.push_str("-changed"),
@@ -1121,6 +1127,7 @@ mod tests {
             |value| value.profile_id.push_str("-changed"),
             |value| value.protocol_version.push_str("-changed"),
             |value| value.source_root_digest.push_str("-changed"),
+            |value| value.staging_metadata_digest.push_str("-changed"),
             |value| value.target = Some("changed-target".to_owned()),
             |value| value.toolchain_executable_digest.push_str("-changed"),
             |value| value.toolchain_version.push_str("-changed"),

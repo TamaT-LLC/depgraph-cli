@@ -107,7 +107,7 @@ pub use build::{
     WebBuildObservation, create_build_execution_request,
     create_compiler_precise_invocation_request, create_compiler_precise_unit_graph_request,
     execute_build_request, execute_build_request_with_cancellation, prepare_build_cache_input,
-    supervise_build, supervise_build_with_cancellation,
+    supervise_build, supervise_build_with_cancellation, validate_build_cache_source,
 };
 pub use build_evidence::{
     stage_build_evidence, validate_build_evidence, validate_framework_build_evidence_contract,

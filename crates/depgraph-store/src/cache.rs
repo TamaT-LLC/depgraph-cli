@@ -134,6 +134,15 @@ pub struct ValidatedScanCacheHit {
 pub struct BuildCacheLookup {
     pub result: CacheLookupResult,
     pub audit: Option<Value>,
+    validated: Option<ValidatedBuildCacheHit>,
+}
+
+#[derive(Debug, Clone)]
+struct ValidatedBuildCacheHit {
+    key: CacheKey,
+    entry: StoredCacheEntry,
+    attempt_id: String,
+    data_version: i64,
 }
 
 impl ValidatedScanCacheHit {
@@ -150,7 +159,7 @@ impl ValidatedScanCacheHit {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct StoredCacheEntry {
     contract_version: u32,
     dimensions_json: String,
@@ -322,18 +331,21 @@ impl Store {
             return Ok(BuildCacheLookup {
                 result: cache_result(key, "miss", "not-found", None),
                 audit: None,
+                validated: None,
             });
         };
         if let Some(reason) = self.cache_entry_rejection(key, &entry)? {
             return Ok(BuildCacheLookup {
                 result: cache_result(key, "reject", &reason, None),
                 audit: None,
+                validated: None,
             });
         }
         if self.current_snapshot_id()?.as_deref() != Some(entry.snapshot_id.as_str()) {
             return Ok(BuildCacheLookup {
                 result: cache_result(key, "reject", "current-snapshot-mismatch", None),
                 audit: None,
+                validated: None,
             });
         }
         let snapshot = self
@@ -352,6 +364,7 @@ impl Store {
             return Ok(BuildCacheLookup {
                 result: cache_result(key, "reject", "base-binding-mismatch", None),
                 audit: None,
+                validated: None,
             });
         }
         let audit = match self.build_audit(&attempt.audit_run_id) {
@@ -360,22 +373,75 @@ impl Store {
                 return Ok(BuildCacheLookup {
                     result: cache_result(key, "reject", "audit-integrity-failed", None),
                     audit: None,
+                    validated: None,
                 });
             }
         };
-        self.touch_cache_entry(CacheLayer::Build, &key.key)?;
-        self.record_cache_event(
-            None,
-            Some(attempt_id),
-            CacheLayer::Build,
-            Some(&key.key),
-            "hit",
-            "validated",
-        )?;
+        let data_version = self
+            .connection
+            .query_row("PRAGMA data_version", [], |row| row.get(0))?;
         Ok(BuildCacheLookup {
-            result: cache_result(key, "hit", "validated", Some(entry.snapshot_id)),
+            result: cache_result(key, "hit", "validated", Some(entry.snapshot_id.clone())),
             audit: Some(audit),
+            validated: Some(ValidatedBuildCacheHit {
+                key: key.clone(),
+                entry,
+                attempt_id: attempt_id.to_owned(),
+                data_version,
+            }),
         })
+    }
+
+    /// Publishes a build-cache hit only if the validated SQLite state and the
+    /// caller's final external input proof still hold at the transaction's
+    /// commit boundary.
+    pub fn publish_validated_build_cache_hit_with_precommit(
+        &mut self,
+        lookup: &BuildCacheLookup,
+        validate_before_commit: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        let hit = lookup
+            .validated
+            .as_ref()
+            .context("build cache lookup is not a validated hit")?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let observed_data_version: i64 =
+            tx.query_row("PRAGMA data_version", [], |row| row.get(0))?;
+        if observed_data_version != hit.data_version {
+            bail!("build cache store changed after validation");
+        }
+        let current_snapshot_id: Option<String> = tx
+            .query_row(
+                "SELECT snapshot_id FROM current_completed_snapshot WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if current_snapshot_id.as_deref() != Some(hit.entry.snapshot_id.as_str()) {
+            bail!("build cache current snapshot changed before publication");
+        }
+        let current_entry = load_cache_entry(&tx, CacheLayer::Build, &hit.key.key)?
+            .context("validated build cache entry disappeared before publication")?;
+        if current_entry != hit.entry {
+            bail!("build cache entry changed before publication");
+        }
+        tx.execute(
+            "UPDATE build_cache
+                SET last_used_at=?2, hit_count=hit_count+1
+              WHERE key=?1",
+            params![hit.key.key, now()],
+        )?;
+        tx.execute(
+            "INSERT INTO cache_events(
+                build_attempt_id, layer, cache_key, outcome, reason, created_at
+             ) VALUES (?1, 'build', ?2, 'hit', 'validated', ?3)",
+            params![hit.attempt_id, hit.key.key, now()],
+        )?;
+        validate_before_commit().context("build cache hit pre-commit validation failed")?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// Validates a semantic scan-cache entry once and correlates its syntax

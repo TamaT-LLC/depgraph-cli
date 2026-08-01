@@ -6883,8 +6883,33 @@ mod tests {
         assert_eq!(hit.result.outcome, "hit");
         assert_eq!(hit.result.reason, "validated");
         assert_eq!(
-            hit.audit.context("cached audit")?["run_id"],
+            hit.audit.as_ref().context("cached audit")?["run_id"],
             "build-cache-run"
+        );
+        let publish_error = store
+            .publish_validated_build_cache_hit_with_precommit(&hit, || {
+                anyhow::bail!("source changed")
+            })
+            .unwrap_err();
+        assert!(
+            publish_error
+                .to_string()
+                .contains("pre-commit validation failed")
+        );
+        assert!(
+            !store
+                .recent_cache_events(20)?
+                .iter()
+                .any(|event| event.layer == CacheLayer::Build && event.outcome == "hit")
+        );
+        store.publish_validated_build_cache_hit_with_precommit(&hit, || Ok(()))?;
+        assert!(
+            store
+                .recent_cache_events(20)?
+                .iter()
+                .any(|event| event.layer == CacheLayer::Build
+                    && event.outcome == "hit"
+                    && event.reason == "validated")
         );
 
         store.connection.execute(
