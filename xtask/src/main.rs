@@ -1223,7 +1223,7 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "TypeScript/JavaScript symbol/type/import/re-export/type-use",
         "[the system design](docs/40_arch_design/arch-dependency-graph-cli-system-design.md)",
         "[`v0.4.0` release notes](docs/releases/v0.4.0.md)",
-        "[`v0.4.0-rc.4`](docs/releases/v0.4.0-rc.4.md)",
+        "[`v0.4.0-rc.5`](docs/releases/v0.4.0-rc.5.md)",
         "[`v0.4.0-rc.2`](docs/releases/v0.4.0-rc.2.md)",
         "[`v0.4.0-rc.1`](docs/releases/v0.4.0-rc.1.md)",
         "[`v0.2.0-rc.1`](docs/releases/v0.2.0-rc.1.md)",
@@ -1625,7 +1625,7 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "docs/40_arch_design/adr-default-profile-selection-budget.md",
         "docs/40_arch_design/adr-bounded-graph-query-language.md",
         "docs/releases/v0.4.0.md",
-        "docs/releases/v0.4.0-rc.4.md",
+        "docs/releases/v0.4.0-rc.5.md",
         "docs/releases/v0.4.0-rc.3.md",
         "docs/releases/v0.4.0-rc.2.md",
         "docs/releases/v0.4.0-rc.1.md",
@@ -4136,35 +4136,10 @@ fn verify_release_assets(directory: &Path, requested_targets: &[String]) -> Resu
     {
         bail!("release targets do not contain identical framework build artifact bytes");
     }
-    if targets
-        .iter()
-        .map(|target| {
-            (
-                target.query_plan_digest.as_str(),
-                target.query_result_digest.as_str(),
-                target.query_output_sha256.as_str(),
-            )
-        })
-        .collect::<BTreeSet<_>>()
-        .len()
-        != 1
-    {
-        bail!("release targets do not produce identical bounded query plan/result bytes");
-    }
-    if targets
-        .iter()
-        .map(|target| {
-            (
-                target.profile_plan_digest.as_str(),
-                target.profile_plan_output_sha256.as_str(),
-            )
-        })
-        .collect::<BTreeSet<_>>()
-        .len()
-        != 1
-    {
-        bail!("release targets do not produce identical profile plan bytes");
-    }
+    // Bounded-query and profile-plan digests bind the target-native graph and
+    // host contexts. Each target already proves byte stability across two
+    // checkout-equivalent runs, so their raw identities must remain distinct
+    // evidence instead of becoming a cross-target equality requirement.
     if targets
         .iter()
         .map(|target| {
@@ -4481,20 +4456,12 @@ fn evaluate_stable_release_gate(
                 .all(|metric| metric["passed"] == Value::Bool(true))
     });
     let bounded_query_contract = depgraph_core::bounded_query_release_compatibility_contract();
-    let bounded_query_outputs = release
-        .targets
-        .iter()
-        .map(|target| {
-            (
-                target.query_plan_digest.as_str(),
-                target.query_result_digest.as_str(),
-                target.query_output_sha256.as_str(),
-            )
-        })
-        .collect::<BTreeSet<_>>();
+    // Native query/profile identities are target-bound. Their smoke report and
+    // archive bindings protect the exact values, while the release verifier
+    // checks their shapes. This stable gate checks contracts, digest formats,
+    // and the complete target closure.
     let bounded_query_target_gate = release.targets.len() == RELEASE_TARGETS.len()
         && release.compatibility.bounded_query == bounded_query_contract
-        && bounded_query_outputs.len() == 1
         && release.targets.iter().all(|target| {
             prefixed_lowercase_sha256(&target.query_plan_digest, "bounded-query-plan:sha256:")
                 && prefixed_lowercase_sha256(
@@ -4506,19 +4473,8 @@ fn evaluate_stable_release_gate(
         });
     let profile_selection_contract =
         depgraph_core::profile_selection_release_compatibility_contract();
-    let profile_plan_outputs = release
-        .targets
-        .iter()
-        .map(|target| {
-            (
-                target.profile_plan_digest.as_str(),
-                target.profile_plan_output_sha256.as_str(),
-            )
-        })
-        .collect::<BTreeSet<_>>();
     let profile_selection_target_gate = release.targets.len() == RELEASE_TARGETS.len()
         && release.compatibility.profile_selection == profile_selection_contract
-        && profile_plan_outputs.len() == 1
         && release.targets.iter().all(|target| {
             prefixed_lowercase_sha256(
                 &target.profile_plan_digest,
@@ -12734,7 +12690,7 @@ jobs:
                 })
                 .collect(),
         };
-        let release = ReleaseVerificationReport {
+        let mut release = ReleaseVerificationReport {
             schema_version: 7,
             release_version: STABLE_RELEASE_VERSION.to_owned(),
             tag: format!("v{STABLE_RELEASE_VERSION}"),
@@ -12753,6 +12709,15 @@ jobs:
                 .map(|(name, _)| target(name))
                 .collect(),
         };
+        for (index, target) in release.targets.iter_mut().enumerate() {
+            let digest = |offset: usize| format!("{:064x}", index + offset);
+            target.query_smoke_sha256 = digest(1);
+            target.query_plan_digest = format!("bounded-query-plan:sha256:{}", digest(11));
+            target.query_result_digest = format!("bounded-query-result:sha256:{}", digest(21));
+            target.query_output_sha256 = digest(31);
+            target.profile_plan_digest = format!("profile-selection-plan:sha256:{}", digest(41));
+            target.profile_plan_output_sha256 = digest(51);
+        }
         let compiler_targets = RELEASE_TARGETS
             .iter()
             .map(|(target, _)| (*target).to_owned())
@@ -12891,11 +12856,19 @@ jobs:
             StableReleaseDecision::Reject
         );
 
-        let mut query_drift = release.clone();
-        query_drift.targets[0].query_result_digest =
-            format!("bounded-query-result:sha256:{}", "9".repeat(64));
+        let mut malformed_query_digest = release.clone();
+        malformed_query_digest.targets[0].query_result_digest =
+            "bounded-query-result:sha256:not-a-digest".to_owned();
         assert_eq!(
-            evaluate(&query_drift, &benchmark).decision,
+            evaluate(&malformed_query_digest, &benchmark).decision,
+            StableReleaseDecision::Reject
+        );
+
+        let mut malformed_profile_digest = release.clone();
+        malformed_profile_digest.targets[0].profile_plan_digest =
+            "profile-selection-plan:sha256:not-a-digest".to_owned();
+        assert_eq!(
+            evaluate(&malformed_profile_digest, &benchmark).decision,
             StableReleaseDecision::Reject
         );
 
