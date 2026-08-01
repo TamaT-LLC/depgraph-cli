@@ -28,6 +28,21 @@ const STABLE_RELEASE_MAINTENANCE_BRANCH: &str = "refs/heads/release/0.4";
 const STABLE_UPGRADE_SOURCE_VERSION: &str = "0.4.0-rc.1";
 const STABLE_UPGRADE_SOURCE_STORE_SCHEMA_VERSION: i64 = 11;
 const BENCHMARK_REPORT_SCHEMA_VERSION: &str = "depgraph-benchmark-report-v6";
+const STABLE_BENCHMARK_METRICS: &[(&str, bool)] = &[
+    ("safe_initial_scan", true),
+    ("one_file_incremental_scan", true),
+    ("cold_file_impact", false),
+    ("warm_file_impact", true),
+    ("cold_package_impact", false),
+    ("warm_package_impact", true),
+    ("bounded_query_plan", true),
+    ("bounded_query_execute", true),
+    ("rust_hir_cold_scan", true),
+    ("rust_hir_no_cache_scan", true),
+    ("rust_hir_warm_scan", true),
+    ("warm_rust_symbol_query", true),
+    ("cross_adapter_build_observation", true),
+];
 const BOUNDED_QUERY_PACKAGE_SMOKE_SCHEMA_VERSION: &str = "package-analysis-smoke-v2";
 const BOUNDED_QUERY_SBOM_PACKAGE_NAME: &str = "depgraph-bounded-query-contract";
 const CROSS_LANGUAGE_PACKAGE_SMOKE_SCHEMA_VERSION: &str = "cross-language-package-smoke-v1";
@@ -1274,7 +1289,7 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "TypeScript/JavaScript symbol/type/import/re-export/type-use",
         "[the system design](docs/40_arch_design/arch-dependency-graph-cli-system-design.md)",
         "[`v0.4.0` release notes](docs/releases/v0.4.0.md)",
-        "[`v0.4.0-rc.5`](docs/releases/v0.4.0-rc.5.md)",
+        "[`v0.4.0-rc.6`](docs/releases/v0.4.0-rc.6.md)",
         "[`v0.4.0-rc.2`](docs/releases/v0.4.0-rc.2.md)",
         "[`v0.4.0-rc.1`](docs/releases/v0.4.0-rc.1.md)",
         "[`v0.2.0-rc.1`](docs/releases/v0.2.0-rc.1.md)",
@@ -1676,7 +1691,7 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "docs/40_arch_design/adr-default-profile-selection-budget.md",
         "docs/40_arch_design/adr-bounded-graph-query-language.md",
         "docs/releases/v0.4.0.md",
-        "docs/releases/v0.4.0-rc.5.md",
+        "docs/releases/v0.4.0-rc.6.md",
         "docs/releases/v0.4.0-rc.3.md",
         "docs/releases/v0.4.0-rc.2.md",
         "docs/releases/v0.4.0-rc.1.md",
@@ -4507,16 +4522,16 @@ fn evaluate_stable_release_gate(
         });
     let metrics = benchmark["metrics"].as_array();
     let benchmark_metrics_pass = metrics.is_some_and(|metrics| {
-        metrics.len() == 11
-            && metrics
-                .iter()
-                .filter(|metric| metric["gated"] == Value::Bool(true))
-                .count()
-                == 9
-            && metrics
-                .iter()
-                .filter(|metric| metric["gated"] == Value::Bool(true))
-                .all(|metric| metric["passed"] == Value::Bool(true))
+        metrics.len() == STABLE_BENCHMARK_METRICS.len()
+            && metrics.iter().zip(STABLE_BENCHMARK_METRICS).all(
+                |(metric, (expected_name, expected_gated))| {
+                    let passed = metric["passed"].as_bool();
+                    metric["name"].as_str() == Some(*expected_name)
+                        && metric["gated"].as_bool() == Some(*expected_gated)
+                        && passed.is_some()
+                        && (!expected_gated || passed == Some(true))
+                },
+            )
     });
     let bounded_query_contract = depgraph_core::bounded_query_release_compatibility_contract();
     // Native query/profile identities are target-bound. Package and aggregate
@@ -4658,7 +4673,7 @@ fn evaluate_stable_release_gate(
                 && benchmark["gate"]["passed"] == Value::Bool(true)
                 && benchmark_metrics_pass,
             evidence:
-                "depgraph-benchmark-report-v6 exact fixtures and eleven gated metrics, including bounded query and representative Rust HIR cold/no-cache/warm scans"
+                "depgraph-benchmark-report-v6 exact fixtures and thirteen exact metrics, including eleven gated bounded-query, Rust HIR, cache, and build-observation metrics"
                     .to_owned(),
         },
         StableReleaseGateCheck {
@@ -12180,15 +12195,16 @@ mod tests {
         BoundedQueryPackageSmokeReport, CROSS_LANGUAGE_PACKAGE_SMOKE_SCHEMA_VERSION, Cli,
         CrossLanguagePackageSmokeReport, DependencyPackage, GithubActionsPolicy,
         PROJECT_LICENSE_EXPRESSION, RELEASE_TARGETS, RUNTIME_COLLECTOR_CONTRACT_VERSION,
-        RUST_SYSROOT_COMPONENT_SHA256, ReleaseVerificationReport, STABLE_RELEASE_BASELINE_COMMIT,
-        STABLE_RELEASE_BASELINE_DIGEST, STABLE_RELEASE_VERSION, STABLE_UPGRADE_SOURCE_VERSION,
-        StableReleaseDecision, TYPESCRIPT_VERSION, TargetVerificationReport, Task, VERSION,
-        WEB_SEMANTIC_CAPABILITIES, WEB_SEMANTIC_RUNTIME_ARTIFACTS, WEB_SEMANTIC_RUNTIME_COMPONENTS,
-        WebSemanticAttestation, WorkerBackend, archive_entries, cargo_runtime_packages,
-        compiler_pack_identity_binding, create_tar_archive, create_zip_archive,
-        evaluate_stable_release_gate, executable_name_for_target, extract_archive,
-        github_settings_verify, has_windows_executable_extension, normalized_spdx_license,
-        package_url, parse_worker_handshake, release_compatibility, remove_transient_build_run_ids,
+        RUST_SYSROOT_COMPONENT_SHA256, ReleaseVerificationReport, STABLE_BENCHMARK_METRICS,
+        STABLE_RELEASE_BASELINE_COMMIT, STABLE_RELEASE_BASELINE_DIGEST, STABLE_RELEASE_VERSION,
+        STABLE_UPGRADE_SOURCE_VERSION, StableReleaseDecision, TYPESCRIPT_VERSION,
+        TargetVerificationReport, Task, VERSION, WEB_SEMANTIC_CAPABILITIES,
+        WEB_SEMANTIC_RUNTIME_ARTIFACTS, WEB_SEMANTIC_RUNTIME_COMPONENTS, WebSemanticAttestation,
+        WorkerBackend, archive_entries, cargo_runtime_packages, compiler_pack_identity_binding,
+        create_tar_archive, create_zip_archive, evaluate_stable_release_gate,
+        executable_name_for_target, extract_archive, github_settings_verify,
+        has_windows_executable_extension, normalized_spdx_license, package_url,
+        parse_worker_handshake, release_compatibility, remove_transient_build_run_ids,
         rust_backend_from_handshake, rustc_source_identity, stable_release_baseline_digest,
         target_native_smoke_expectation, validate_bounded_query_package_smoke,
         validate_cross_language_package_smoke, verify_checksum_sidecar,
@@ -12820,11 +12836,9 @@ jobs:
             &compiler_compatibility,
             &missing_compiler_target,
         ));
-        let metrics = (0..11)
-            .map(|index| {
-                let gated = index < 9;
-                json!({"gated": gated, "passed": true})
-            })
+        let metrics = STABLE_BENCHMARK_METRICS
+            .iter()
+            .map(|(name, gated)| json!({"name": name, "gated": gated, "passed": true}))
             .collect::<Vec<_>>();
         let benchmark = json!({
             "schema_version": BENCHMARK_REPORT_SCHEMA_VERSION,
@@ -12929,6 +12943,60 @@ jobs:
         failed_benchmark["gate"]["passed"] = Value::Bool(false);
         assert_eq!(
             evaluate(&release, &failed_benchmark).decision,
+            StableReleaseDecision::Reject
+        );
+
+        let mut missing_benchmark_metric = benchmark.clone();
+        missing_benchmark_metric["metrics"]
+            .as_array_mut()
+            .unwrap()
+            .pop();
+        assert_eq!(
+            evaluate(&release, &missing_benchmark_metric).decision,
+            StableReleaseDecision::Reject
+        );
+
+        let mut unexpected_benchmark_metric = benchmark.clone();
+        unexpected_benchmark_metric["metrics"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"name": "unexpected", "gated": true, "passed": true}));
+        assert_eq!(
+            evaluate(&release, &unexpected_benchmark_metric).decision,
+            StableReleaseDecision::Reject
+        );
+
+        let mut reordered_benchmark_metrics = benchmark.clone();
+        reordered_benchmark_metrics["metrics"]
+            .as_array_mut()
+            .unwrap()
+            .swap(0, 1);
+        assert_eq!(
+            evaluate(&release, &reordered_benchmark_metrics).decision,
+            StableReleaseDecision::Reject
+        );
+
+        let mut benchmark_gated_drift = benchmark.clone();
+        benchmark_gated_drift["metrics"][2]["gated"] = Value::Bool(true);
+        assert_eq!(
+            evaluate(&release, &benchmark_gated_drift).decision,
+            StableReleaseDecision::Reject
+        );
+
+        let mut missing_observed_metric_result = benchmark.clone();
+        missing_observed_metric_result["metrics"][2]
+            .as_object_mut()
+            .unwrap()
+            .remove("passed");
+        assert_eq!(
+            evaluate(&release, &missing_observed_metric_result).decision,
+            StableReleaseDecision::Reject
+        );
+
+        let mut failed_gated_metric = benchmark.clone();
+        failed_gated_metric["metrics"][0]["passed"] = Value::Bool(false);
+        assert_eq!(
+            evaluate(&release, &failed_gated_metric).decision,
             StableReleaseDecision::Reject
         );
 
