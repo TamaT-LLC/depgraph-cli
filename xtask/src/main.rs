@@ -11971,9 +11971,8 @@ fn verify_release_tag_values(
         bail!("release tag workflow did not expose GITHUB_REF_NAME");
     };
     let tag = tag.to_string_lossy();
-    let expected = format!("v{VERSION}");
-    if tag != expected {
-        bail!("release tag {tag} does not match workspace version {expected}");
+    if !supported_release_tag(&tag) {
+        bail!("release tag {tag} must be v{VERSION} or a canonical v{VERSION}-rc.N prerelease");
     }
     Ok(())
 }
@@ -13045,6 +13044,22 @@ jobs:
             Some(OsStr::new(concat!("v", env!("CARGO_PKG_VERSION")))),
         )
         .expect("the workspace release tag must remain valid");
+        verify_release_tag_values(
+            Some(OsStr::new("tag")),
+            Some(OsStr::new(concat!("v", env!("CARGO_PKG_VERSION"), "-rc.2"))),
+        )
+        .expect("a canonical workspace release candidate tag must remain valid");
+        assert!(
+            verify_release_tag_values(
+                Some(OsStr::new("tag")),
+                Some(OsStr::new(concat!(
+                    "v",
+                    env!("CARGO_PKG_VERSION"),
+                    "-rc.02"
+                ))),
+            )
+            .is_err()
+        );
     }
 
     fn change_source_mtime(path: &std::path::Path) -> Result<()> {
