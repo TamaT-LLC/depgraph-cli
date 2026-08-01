@@ -46,6 +46,57 @@ const RELEASE_TARGETS: &[(&str, &str)] = &[
     ("aarch64-apple-darwin", "tar.gz"),
     ("x86_64-pc-windows-msvc", "zip"),
 ];
+struct TargetNativeSmokeExpectation {
+    target: &'static str,
+    query_plan_digest: &'static str,
+    query_result_digest: &'static str,
+    query_output_sha256: &'static str,
+    profile_plan_digest: &'static str,
+    profile_plan_output_sha256: &'static str,
+}
+
+const TARGET_NATIVE_SMOKE_EXPECTATIONS: &[TargetNativeSmokeExpectation] = &[
+    TargetNativeSmokeExpectation {
+        target: "x86_64-unknown-linux-gnu",
+        query_plan_digest: "bounded-query-plan:sha256:38729c001146ed5e203bec6ed5e29f9db9c27a14e0c113bd1b2976028c7e5c19",
+        query_result_digest: "bounded-query-result:sha256:d3795bb2a24fab977de7f0bce3143f207934ebe59d9a92a40388e6872f0900da",
+        query_output_sha256: "9099aa8dbce6fd4a559d520c892f864f532dde041c7c83dd7a3d1dd1933774bc",
+        profile_plan_digest: "profile-selection-plan:sha256:fb436331a593d909d8d51c5dd4844cf84f16d04f6659f3c4b6d934467cc6bbb9",
+        profile_plan_output_sha256: "ae1905d035661fa5753bed426c6d99fd8993f99f941692e1d2714811aaab7ede",
+    },
+    TargetNativeSmokeExpectation {
+        target: "aarch64-unknown-linux-gnu",
+        query_plan_digest: "bounded-query-plan:sha256:be976447c420ff15f1c145b78a62aa5c5aa0c128868e0bbb7ece0595de105b33",
+        query_result_digest: "bounded-query-result:sha256:2c17f973ed9c3032a019cc51a929ab7c5b0f9963a58fccb43d248941c79f0029",
+        query_output_sha256: "31c3308fe5e4b26850bab1a820ba1bd1fe65fe51d1296ab967f999e6f9a5f656",
+        profile_plan_digest: "profile-selection-plan:sha256:415586af7cbf8c0f92e046e1f5b51a9d41d37c5b9fc64fe7d9ed868e62eb8a29",
+        profile_plan_output_sha256: "a30369a84f6ca70a63b2ff29760cfb7ddb05926ae706a762cb7f55703e2460cc",
+    },
+    TargetNativeSmokeExpectation {
+        target: "x86_64-apple-darwin",
+        query_plan_digest: "bounded-query-plan:sha256:cd5f49e7a1b92d75a7c65434b79f632df4caf16c5783c38a018f54b95545a0c1",
+        query_result_digest: "bounded-query-result:sha256:34c09e5456443d51a82999be9d45907b9b1b280362855b1f88e434e7903ea67a",
+        query_output_sha256: "af73ad257d9828b895025fec6af011d2f4bf94358fe902f09c7f15c2c6001763",
+        profile_plan_digest: "profile-selection-plan:sha256:9b56308660bb581507384b5fb3c6629739da7563ee1e43f53c7c69015cdfa51e",
+        profile_plan_output_sha256: "d6cc71e80d66bafa2349599356f512f7d0425f2038bb508db8bdad940b76220f",
+    },
+    TargetNativeSmokeExpectation {
+        target: "aarch64-apple-darwin",
+        query_plan_digest: "bounded-query-plan:sha256:0ea68ae4240774092f33fa0b0353168b9ae2412eedccccac34ba1ff2ece929f6",
+        query_result_digest: "bounded-query-result:sha256:1ab6701936ea78da323268dcea9a73db4db0f920b6844748a315ed62e507d45b",
+        query_output_sha256: "d1e793c0cea143813de95a4ccbbd1a8a5733d230f0033e2adde1cf6d0127a4f7",
+        profile_plan_digest: "profile-selection-plan:sha256:11682a31f985d29cd7c4fd8440a808ed68af337e3753bf73926617b946fb3431",
+        profile_plan_output_sha256: "fd725f63c5ff8f6992b008b295ce6fc7637dc2f5e83a418fe0e118989c25272d",
+    },
+    TargetNativeSmokeExpectation {
+        target: "x86_64-pc-windows-msvc",
+        query_plan_digest: "bounded-query-plan:sha256:84828680ba3c9a2365e0c960d25ac8b2061bcc5ecd41d7d1b455367a91f88f73",
+        query_result_digest: "bounded-query-result:sha256:ea53e45d10ed036b7a5998f68366919401f45911efac91538d255fe24dc619ff",
+        query_output_sha256: "2ad6f0f6db4ff5c0d9eebc50003c38ccf5ab7be9c6cdd058b3169189ed01a116",
+        profile_plan_digest: "profile-selection-plan:sha256:b8c85453d631399a69a0a710d84b451c904552c4e8208057439585ff9d407011",
+        profile_plan_output_sha256: "89bbd316705d1994eabdc988a893dc13a0d1fe2860cff5cc22c690727cae67e6",
+    },
+];
 const SBOM_SCOPE: &str = "Scope: package-manager component boundary; system runtimes/toolchains and dependencies embedded inside upstream prebuilt packages are not recursively enumerated.";
 const RUST_ANALYZER_CRATE_VERSION: &str = "0.0.330";
 const RUST_ANALYZER_REVISION: &str = "8954b66d43225e62c92e8bbcc8500191b5cceb1e";
@@ -1223,7 +1274,7 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "TypeScript/JavaScript symbol/type/import/re-export/type-use",
         "[the system design](docs/40_arch_design/arch-dependency-graph-cli-system-design.md)",
         "[`v0.4.0` release notes](docs/releases/v0.4.0.md)",
-        "[`v0.4.0-rc.4`](docs/releases/v0.4.0-rc.4.md)",
+        "[`v0.4.0-rc.5`](docs/releases/v0.4.0-rc.5.md)",
         "[`v0.4.0-rc.2`](docs/releases/v0.4.0-rc.2.md)",
         "[`v0.4.0-rc.1`](docs/releases/v0.4.0-rc.1.md)",
         "[`v0.2.0-rc.1`](docs/releases/v0.2.0-rc.1.md)",
@@ -1625,7 +1676,7 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "docs/40_arch_design/adr-default-profile-selection-budget.md",
         "docs/40_arch_design/adr-bounded-graph-query-language.md",
         "docs/releases/v0.4.0.md",
-        "docs/releases/v0.4.0-rc.4.md",
+        "docs/releases/v0.4.0-rc.5.md",
         "docs/releases/v0.4.0-rc.3.md",
         "docs/releases/v0.4.0-rc.2.md",
         "docs/releases/v0.4.0-rc.1.md",
@@ -4136,35 +4187,9 @@ fn verify_release_assets(directory: &Path, requested_targets: &[String]) -> Resu
     {
         bail!("release targets do not contain identical framework build artifact bytes");
     }
-    if targets
-        .iter()
-        .map(|target| {
-            (
-                target.query_plan_digest.as_str(),
-                target.query_result_digest.as_str(),
-                target.query_output_sha256.as_str(),
-            )
-        })
-        .collect::<BTreeSet<_>>()
-        .len()
-        != 1
-    {
-        bail!("release targets do not produce identical bounded query plan/result bytes");
-    }
-    if targets
-        .iter()
-        .map(|target| {
-            (
-                target.profile_plan_digest.as_str(),
-                target.profile_plan_output_sha256.as_str(),
-            )
-        })
-        .collect::<BTreeSet<_>>()
-        .len()
-        != 1
-    {
-        bail!("release targets do not produce identical profile plan bytes");
-    }
+    // Bounded-query and profile-plan digests bind the target-native graph and
+    // host contexts. The sidecar validator binds each one to its target's
+    // compiled expectation, while checkout-equivalent runs prove repeatability.
     if targets
         .iter()
         .map(|target| {
@@ -4214,6 +4239,8 @@ fn validate_bounded_query_package_smoke(
     target: &str,
     archive_sha256: &str,
 ) -> Result<()> {
+    let expected = target_native_smoke_expectation(target)
+        .with_context(|| format!("target-native smoke contract is missing for {target}"))?;
     if report.schema_version != BOUNDED_QUERY_PACKAGE_SMOKE_SCHEMA_VERSION
         || report.target != target
         || report.archive_sha256 != archive_sha256
@@ -4235,10 +4262,21 @@ fn validate_bounded_query_package_smoke(
             .strip_prefix("profile-selection-plan:sha256:")
             .is_some_and(lowercase_sha256)
         || !lowercase_sha256(&report.profile_canonical_output_sha256)
+        || report.plan_digest != expected.query_plan_digest
+        || report.result_digest != expected.query_result_digest
+        || report.canonical_output_sha256 != expected.query_output_sha256
+        || report.profile_plan_digest != expected.profile_plan_digest
+        || report.profile_canonical_output_sha256 != expected.profile_plan_output_sha256
     {
         bail!("packaged bounded query smoke report is incompatible for {target}");
     }
     Ok(())
+}
+
+fn target_native_smoke_expectation(target: &str) -> Option<&TargetNativeSmokeExpectation> {
+    TARGET_NATIVE_SMOKE_EXPECTATIONS
+        .iter()
+        .find(|expected| expected.target == target)
 }
 
 fn validate_cross_language_package_smoke(
@@ -4481,21 +4519,15 @@ fn evaluate_stable_release_gate(
                 .all(|metric| metric["passed"] == Value::Bool(true))
     });
     let bounded_query_contract = depgraph_core::bounded_query_release_compatibility_contract();
-    let bounded_query_outputs = release
-        .targets
-        .iter()
-        .map(|target| {
-            (
-                target.query_plan_digest.as_str(),
-                target.query_result_digest.as_str(),
-                target.query_output_sha256.as_str(),
-            )
-        })
-        .collect::<BTreeSet<_>>();
+    // Native query/profile identities are target-bound. Package and aggregate
+    // verification bind the measured archive outputs to these same compiled
+    // expectations; this stable gate preserves that exact five-target binding.
     let bounded_query_target_gate = release.targets.len() == RELEASE_TARGETS.len()
         && release.compatibility.bounded_query == bounded_query_contract
-        && bounded_query_outputs.len() == 1
         && release.targets.iter().all(|target| {
+            let Some(expected) = target_native_smoke_expectation(&target.target) else {
+                return false;
+            };
             prefixed_lowercase_sha256(&target.query_plan_digest, "bounded-query-plan:sha256:")
                 && prefixed_lowercase_sha256(
                     &target.query_result_digest,
@@ -4503,27 +4535,24 @@ fn evaluate_stable_release_gate(
                 )
                 && lowercase_sha256(&target.query_output_sha256)
                 && lowercase_sha256(&target.query_smoke_sha256)
+                && target.query_plan_digest == expected.query_plan_digest
+                && target.query_result_digest == expected.query_result_digest
+                && target.query_output_sha256 == expected.query_output_sha256
         });
     let profile_selection_contract =
         depgraph_core::profile_selection_release_compatibility_contract();
-    let profile_plan_outputs = release
-        .targets
-        .iter()
-        .map(|target| {
-            (
-                target.profile_plan_digest.as_str(),
-                target.profile_plan_output_sha256.as_str(),
-            )
-        })
-        .collect::<BTreeSet<_>>();
     let profile_selection_target_gate = release.targets.len() == RELEASE_TARGETS.len()
         && release.compatibility.profile_selection == profile_selection_contract
-        && profile_plan_outputs.len() == 1
         && release.targets.iter().all(|target| {
+            let Some(expected) = target_native_smoke_expectation(&target.target) else {
+                return false;
+            };
             prefixed_lowercase_sha256(
                 &target.profile_plan_digest,
                 "profile-selection-plan:sha256:",
             ) && lowercase_sha256(&target.profile_plan_output_sha256)
+                && target.profile_plan_digest == expected.profile_plan_digest
+                && target.profile_plan_output_sha256 == expected.profile_plan_output_sha256
         });
     let cross_language_contract = depgraph_core::cross_language_release_compatibility_contract();
     let cross_language_outputs = release
@@ -4642,14 +4671,14 @@ fn evaluate_stable_release_gate(
                 && benchmark["evidence"]["bounded_query"]["hostile_rejected"]
                     == Value::Bool(true),
             evidence:
-                "five native archives share the compiled bounded query identity and canonical smoke output"
+                "five native archives match their compiled target-native bounded query identities and canonical smoke outputs"
                     .to_owned(),
         },
         StableReleaseGateCheck {
             id: "profile-selection-five-target".to_owned(),
             passed: profile_selection_target_gate,
             evidence:
-                "five native archives share the compiled profile-selection contract and canonical plan output"
+                "five native archives match their compiled target-native profile-selection identities and canonical plan outputs"
                     .to_owned(),
         },
         StableReleaseGateCheck {
@@ -11030,7 +11059,7 @@ fn verify_packaged_bounded_query(
         .context("packaged profile plan omitted its canonical digest")?
         .to_owned();
 
-    Ok(BoundedQueryPackageSmokeReport {
+    let report = BoundedQueryPackageSmokeReport {
         schema_version: BOUNDED_QUERY_PACKAGE_SMOKE_SCHEMA_VERSION.to_owned(),
         target: target.to_owned(),
         archive_sha256: archive_sha256.to_owned(),
@@ -11041,7 +11070,9 @@ fn verify_packaged_bounded_query(
         profile_contract,
         profile_plan_digest,
         profile_canonical_output_sha256: hex::encode(Sha256::digest(&first_profile_plan.stdout)),
-    })
+    };
+    validate_bounded_query_package_smoke(&report, target, archive_sha256)?;
+    Ok(report)
 }
 
 fn verify_release_metadata(extracted: &Path) -> Result<ReleaseManifest> {
@@ -12159,10 +12190,11 @@ mod tests {
         github_settings_verify, has_windows_executable_extension, normalized_spdx_license,
         package_url, parse_worker_handshake, release_compatibility, remove_transient_build_run_ids,
         rust_backend_from_handshake, rustc_source_identity, stable_release_baseline_digest,
-        validate_bounded_query_package_smoke, validate_cross_language_package_smoke,
-        verify_checksum_sidecar, verify_cross_language_package_smoke,
-        verify_github_actions_security, verify_local_markdown_links,
-        verify_packaged_cross_language, verify_pinned_rust_sysroot_digest, verify_project_metadata,
+        target_native_smoke_expectation, validate_bounded_query_package_smoke,
+        validate_cross_language_package_smoke, verify_checksum_sidecar,
+        verify_cross_language_package_smoke, verify_github_actions_security,
+        verify_local_markdown_links, verify_packaged_cross_language,
+        verify_pinned_rust_sysroot_digest, verify_project_metadata,
         verify_public_community_surface, verify_release_tag_values,
         verify_rust_analyzer_dependencies, verify_rust_backend, verify_security_disclosure_dry_run,
         verify_stable_release_source_guard, verify_web_semantic_attestation,
@@ -12734,7 +12766,7 @@ jobs:
                 })
                 .collect(),
         };
-        let release = ReleaseVerificationReport {
+        let mut release = ReleaseVerificationReport {
             schema_version: 7,
             release_version: STABLE_RELEASE_VERSION.to_owned(),
             tag: format!("v{STABLE_RELEASE_VERSION}"),
@@ -12753,6 +12785,15 @@ jobs:
                 .map(|(name, _)| target(name))
                 .collect(),
         };
+        for (index, target) in release.targets.iter_mut().enumerate() {
+            let expected = target_native_smoke_expectation(&target.target).unwrap();
+            target.query_smoke_sha256 = format!("{:064x}", index + 1);
+            target.query_plan_digest = expected.query_plan_digest.to_owned();
+            target.query_result_digest = expected.query_result_digest.to_owned();
+            target.query_output_sha256 = expected.query_output_sha256.to_owned();
+            target.profile_plan_digest = expected.profile_plan_digest.to_owned();
+            target.profile_plan_output_sha256 = expected.profile_plan_output_sha256.to_owned();
+        }
         let compiler_targets = RELEASE_TARGETS
             .iter()
             .map(|(target, _)| (*target).to_owned())
@@ -12891,11 +12932,35 @@ jobs:
             StableReleaseDecision::Reject
         );
 
-        let mut query_drift = release.clone();
-        query_drift.targets[0].query_result_digest =
+        let mut malformed_query_digest = release.clone();
+        malformed_query_digest.targets[0].query_result_digest =
+            "bounded-query-result:sha256:not-a-digest".to_owned();
+        assert_eq!(
+            evaluate(&malformed_query_digest, &benchmark).decision,
+            StableReleaseDecision::Reject
+        );
+
+        let mut malformed_profile_digest = release.clone();
+        malformed_profile_digest.targets[0].profile_plan_digest =
+            "profile-selection-plan:sha256:not-a-digest".to_owned();
+        assert_eq!(
+            evaluate(&malformed_profile_digest, &benchmark).decision,
+            StableReleaseDecision::Reject
+        );
+
+        let mut forged_query_digest = release.clone();
+        forged_query_digest.targets[0].query_result_digest =
             format!("bounded-query-result:sha256:{}", "9".repeat(64));
         assert_eq!(
-            evaluate(&query_drift, &benchmark).decision,
+            evaluate(&forged_query_digest, &benchmark).decision,
+            StableReleaseDecision::Reject
+        );
+
+        let mut forged_profile_digest = release.clone();
+        forged_profile_digest.targets[0].profile_plan_digest =
+            format!("profile-selection-plan:sha256:{}", "9".repeat(64));
+        assert_eq!(
+            evaluate(&forged_profile_digest, &benchmark).decision,
             StableReleaseDecision::Reject
         );
 
@@ -13019,17 +13084,18 @@ jobs:
 
     #[test]
     fn bounded_query_package_smoke_rejects_target_version_and_output_drift() {
+        let expected = target_native_smoke_expectation("aarch64-apple-darwin").unwrap();
         let report = BoundedQueryPackageSmokeReport {
             schema_version: BOUNDED_QUERY_PACKAGE_SMOKE_SCHEMA_VERSION.to_owned(),
             target: "aarch64-apple-darwin".to_owned(),
             archive_sha256: "0".repeat(64),
             contract: depgraph_core::bounded_query_release_compatibility_contract(),
-            plan_digest: format!("bounded-query-plan:sha256:{}", "1".repeat(64)),
-            result_digest: format!("bounded-query-result:sha256:{}", "2".repeat(64)),
-            canonical_output_sha256: "3".repeat(64),
+            plan_digest: expected.query_plan_digest.to_owned(),
+            result_digest: expected.query_result_digest.to_owned(),
+            canonical_output_sha256: expected.query_output_sha256.to_owned(),
             profile_contract: depgraph_core::profile_selection_release_compatibility_contract(),
-            profile_plan_digest: format!("profile-selection-plan:sha256:{}", "4".repeat(64)),
-            profile_canonical_output_sha256: "5".repeat(64),
+            profile_plan_digest: expected.profile_plan_digest.to_owned(),
+            profile_canonical_output_sha256: expected.profile_plan_output_sha256.to_owned(),
         };
         validate_bounded_query_package_smoke(&report, "aarch64-apple-darwin", &"0".repeat(64))
             .unwrap();
@@ -13065,6 +13131,19 @@ jobs:
         assert!(
             validate_bounded_query_package_smoke(
                 &output_drift,
+                "aarch64-apple-darwin",
+                &"0".repeat(64),
+            )
+            .is_err()
+        );
+
+        let mut forged_native_digest = output_drift;
+        forged_native_digest.canonical_output_sha256 = expected.query_output_sha256.to_owned();
+        forged_native_digest.result_digest =
+            format!("bounded-query-result:sha256:{}", "9".repeat(64));
+        assert!(
+            validate_bounded_query_package_smoke(
+                &forged_native_digest,
                 "aarch64-apple-darwin",
                 &"0".repeat(64),
             )
