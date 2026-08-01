@@ -8,7 +8,7 @@ use std::{
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use depgraph_core::{
-    BoundedQueryExecutionError, BoundedQueryPlan, BoundedQueryResult, BuildOutcomeKind,
+    BoundedQueryExecutionError, BoundedQueryPlan, BoundedQueryResult, BuildAudit, BuildOutcomeKind,
     CancellationToken, Config, CycleLevel, DEFAULT_INTERACTIVE_QUERY_MAX_BYTES,
     DEFAULT_INTERACTIVE_QUERY_MAX_ITEMS, DEFAULT_INTERACTIVE_QUERY_MAX_TRAVERSAL, DaemonStatus,
     ExportFormat, GraphQueryFilter, ImpactFilters, ImpactResult, InteractiveQueryPage,
@@ -23,14 +23,14 @@ use depgraph_core::{
     impact, impact_query_cache_key, init_config, match_runtime_trace, open_store,
     open_store_read_only, paginate_interactive_query, parse_and_type_check_bounded_query,
     plan_bounded_query, plan_explicit_profile_selection, plan_repository_profiles,
-    policy_annotations, profile_selection_human_summary, read_bounded_query_file,
-    read_compiler_pack_requirement, read_explicit_profile_selection_file, read_git_changed_set,
-    read_runtime_trace, render_condition, render_github_annotations, run_scan_with_cache_mode,
-    runtime_session_delta, rust_build_protocol_ndjson, stage_build_evidence,
-    start_repository_daemon, traversal_page_items, traversal_summary, traverse_bounded_filtered,
-    traverse_filtered, unresolved, unresolved_summary,
-    validate_explicit_profile_selection_capabilities, validate_interactive_query_bounds,
-    web_build_protocol_ndjson, why_filtered,
+    policy_annotations, prepare_build_cache_input, profile_selection_human_summary,
+    read_bounded_query_file, read_compiler_pack_requirement, read_explicit_profile_selection_file,
+    read_git_changed_set, read_runtime_trace, render_condition, render_github_annotations,
+    run_scan_with_cache_mode, runtime_session_delta, rust_build_protocol_ndjson,
+    stage_build_evidence, start_repository_daemon, traversal_page_items, traversal_summary,
+    traverse_bounded_filtered, traverse_filtered, unresolved, unresolved_summary,
+    validate_build_cache_input, validate_explicit_profile_selection_capabilities,
+    validate_interactive_query_bounds, web_build_protocol_ndjson, why_filtered,
 };
 use depgraph_protocol::canonical_json;
 use depgraph_store::{CompletedSnapshotDetails, CoverageRecord};
@@ -817,6 +817,54 @@ async fn run(cli: Cli) -> Result<u8> {
                 create_build_execution_request(&root)?
             };
             let mut store = open_store(&store_path)?;
+            let base_scan_id = store.latest_successful_id()?;
+            let mut cache_input = None;
+            let mut cache_key = None;
+            let mut cache_lookup_status = "unavailable".to_owned();
+            let mut cache_lookup_reason = "no-completed-base-scan".to_owned();
+            if !rust_compiler_precise
+                && let Some(base_scan_id) = base_scan_id.as_deref()
+                && let Some(base_snapshot_id) = store.build_cache_base_snapshot_id(base_scan_id)?
+                && let Some(input) = prepare_build_cache_input(&request, &base_snapshot_id).await?
+            {
+                let key = build_cache_key(&input);
+                let lookup = store.lookup_build_cache(&key)?;
+                cache_lookup_status = lookup.result.outcome.clone();
+                cache_lookup_reason = lookup.result.reason.clone();
+                if lookup.result.outcome == "hit" {
+                    let confirmed = prepare_build_cache_input(&request, &base_snapshot_id)
+                        .await?
+                        .map(|input| build_cache_key(&input));
+                    let cached_audit = lookup
+                        .audit
+                        .and_then(|audit| serde_json::from_value::<BuildAudit>(audit).ok());
+                    if confirmed.as_ref() == Some(&key)
+                        && cached_audit.as_ref().is_some_and(|audit| {
+                            matches!(audit.outcome, BuildOutcomeKind::Completed)
+                                && validate_build_cache_input(&input, audit)
+                        })
+                    {
+                        let audit =
+                            cached_audit.context("validated build cache audit is missing")?;
+                        println!("build run: {}", audit.run_id);
+                        println!("status: {:?}", audit.outcome);
+                        println!("project code executed: false");
+                        println!("build evidence: reused");
+                        println!("build cache lookup: hit (validated)");
+                        println!("build cache: hit");
+                        println!("network isolation: {:?}", audit.network_isolation);
+                        if let Some(diagnostic) = &audit.isolation_diagnostic {
+                            eprintln!("warning: {diagnostic}");
+                        }
+                        println!("store: {}", store_path.display());
+                        return Ok(0);
+                    }
+                    cache_lookup_status = "reject".to_owned();
+                    cache_lookup_reason = "input-changed-after-lookup".to_owned();
+                }
+                cache_input = Some(input);
+                cache_key = Some(key);
+            }
             let cancellation = CancellationToken::new();
             let signal_token = cancellation.clone();
             tokio::spawn(async move {
@@ -848,7 +896,7 @@ async fn run(cli: Cli) -> Result<u8> {
             store.save_build_audit(&audit_value)?;
             let mut evidence_status = "audit-only (no completed base scan)";
             let mut build_cache_status = "not stored";
-            if let Some(base_scan_id) = store.latest_successful_id()? {
+            if let Some(base_scan_id) = base_scan_id {
                 evidence_status = "not promoted";
                 let build_attempt_required = requires_build_attempt(
                     &outcome.audit.outcome,
@@ -858,6 +906,28 @@ async fn run(cli: Cli) -> Result<u8> {
                 );
                 if build_attempt_required {
                     store.start_build_attempt(&base_scan_id, &audit_value)?;
+                    if cache_input.is_some()
+                        && matches!(cache_lookup_status.as_str(), "miss" | "reject")
+                    {
+                        store.record_cache_event(
+                            None,
+                            Some(&outcome.audit.run_id),
+                            depgraph_store::CacheLayer::Build,
+                            cache_key.as_ref().map(|key| key.key.as_str()),
+                            &cache_lookup_status,
+                            &cache_lookup_reason,
+                        )?;
+                    }
+                    if let Some(input) = cache_input.as_mut() {
+                        let attempt_base_snapshot_id = store
+                            .build_attempt(&outcome.audit.run_id)?
+                            .and_then(|attempt| attempt.base_snapshot_id)
+                            .context("build attempt has no completed base snapshot")?;
+                        if input.base_snapshot_id != attempt_base_snapshot_id {
+                            input.base_snapshot_id = attempt_base_snapshot_id;
+                            cache_key = Some(build_cache_key(input));
+                        }
+                    }
                 }
                 match outcome.audit.outcome {
                     BuildOutcomeKind::Completed => {
@@ -922,24 +992,6 @@ async fn run(cli: Cli) -> Result<u8> {
                                 true,
                             )?;
                             evidence_status = "promoted compiler-precise graph";
-                            if let Some(cache_key) = build_cache_key(&outcome.audit) {
-                                let snapshot_id = store
-                                    .snapshot_id_for_source("build", &outcome.audit.run_id)?
-                                    .context(
-                                        "promoted compiler-precise build did not expose its completed snapshot",
-                                    )?;
-                                let cache = store.store_snapshot_cache(
-                                    &cache_key,
-                                    &snapshot_id,
-                                    None,
-                                    Some(&outcome.audit.run_id),
-                                )?;
-                                build_cache_status = if cache.outcome == "stored" {
-                                    "stored"
-                                } else {
-                                    "rejected"
-                                };
-                            }
                         } else if outcome.rust_compiler_invocation_ledger.is_some() {
                             evidence_status = "validated compiler invocation ledger (not promoted)";
                         } else if outcome.rust_cargo_unit_graph.is_some() {
@@ -996,23 +1048,37 @@ async fn run(cli: Cli) -> Result<u8> {
                                 true,
                             )?;
                             evidence_status = "promoted";
-                            if let Some(cache_key) = build_cache_key(&outcome.audit) {
-                                let snapshot_id = store
-                                    .snapshot_id_for_source("build", &outcome.audit.run_id)?
-                                    .context(
-                                        "promoted build did not expose its completed snapshot",
+                            if let (Some(cache_input), Some(cache_key)) =
+                                (cache_input.as_ref(), cache_key.as_ref())
+                            {
+                                if !validate_build_cache_input(cache_input, &outcome.audit) {
+                                    store.record_cache_event(
+                                        None,
+                                        Some(&outcome.audit.run_id),
+                                        depgraph_store::CacheLayer::Build,
+                                        Some(&cache_key.key),
+                                        "reject",
+                                        "input-changed-during-build",
                                     )?;
-                                let cache = store.store_snapshot_cache(
-                                    &cache_key,
-                                    &snapshot_id,
-                                    None,
-                                    Some(&outcome.audit.run_id),
-                                )?;
-                                build_cache_status = if cache.outcome == "stored" {
-                                    "stored"
+                                    build_cache_status = "rejected";
                                 } else {
-                                    "rejected"
-                                };
+                                    let snapshot_id = store
+                                        .snapshot_id_for_source("build", &outcome.audit.run_id)?
+                                        .context(
+                                            "promoted build did not expose its completed snapshot",
+                                        )?;
+                                    let cache = store.store_snapshot_cache(
+                                        cache_key,
+                                        &snapshot_id,
+                                        None,
+                                        Some(&outcome.audit.run_id),
+                                    )?;
+                                    build_cache_status = if cache.outcome == "stored" {
+                                        "stored"
+                                    } else {
+                                        "rejected"
+                                    };
+                                }
                             }
                         }
                     }
@@ -1076,6 +1142,7 @@ async fn run(cli: Cli) -> Result<u8> {
             println!("status: {:?}", outcome.audit.outcome);
             println!("project code executed: {}", outcome.project_code_executed);
             println!("build evidence: {evidence_status}");
+            println!("build cache lookup: {cache_lookup_status} ({cache_lookup_reason})");
             println!("build cache: {build_cache_status}");
             println!("network isolation: {:?}", outcome.audit.network_isolation);
             if let Some(diagnostic) = &outcome.audit.diagnostic_code {

@@ -5,7 +5,7 @@ use chrono::{SecondsFormat, Utc};
 use depgraph_protocol::stable_id_from_value;
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 
 use super::{
     CompletedScanSnapshot, CoverageRecord, DiagnosticRecord, Store, ensure_scan_staging,
@@ -130,6 +130,12 @@ pub struct ValidatedScanCacheHit {
     diagnostics: Vec<DiagnosticRecord>,
 }
 
+#[derive(Debug, Clone)]
+pub struct BuildCacheLookup {
+    pub result: CacheLookupResult,
+    pub audit: Option<Value>,
+}
+
 impl ValidatedScanCacheHit {
     pub fn snapshot_id(&self) -> &str {
         &self.snapshot_id
@@ -163,6 +169,32 @@ impl Store {
             semantic: table_count(&self.connection, CacheLayer::Semantic)?,
             build: table_count(&self.connection, CacheLayer::Build)?,
         })
+    }
+
+    pub fn build_cache_base_snapshot_id(&self, base_scan_id: &str) -> Result<Option<String>> {
+        let Some(current_id) = self.current_snapshot_id()? else {
+            return Ok(None);
+        };
+        let current = self
+            .completed_snapshot(&current_id)?
+            .context("current completed snapshot disappeared")?;
+        if current.scan_id != base_scan_id {
+            return Ok(None);
+        }
+        match current.source_kind.as_str() {
+            "scan" => Ok(Some(current.id)),
+            "build" => {
+                let attempt_id = current
+                    .build_attempt_id
+                    .as_deref()
+                    .context("current build snapshot has no build attempt")?;
+                Ok(self
+                    .build_attempt(attempt_id)?
+                    .and_then(|attempt| attempt.base_snapshot_id))
+            }
+            "runtime" => Ok(None),
+            _ => Ok(None),
+        }
     }
 
     pub fn cache_events_for_scan(&self, scan_id: &str) -> Result<Vec<CacheEventRecord>> {
@@ -279,6 +311,71 @@ impl Store {
             "validated",
             Some(entry.snapshot_id),
         ))
+    }
+
+    pub fn lookup_build_cache(&mut self, key: &CacheKey) -> Result<BuildCacheLookup> {
+        key.validate()?;
+        if key.layer != CacheLayer::Build {
+            bail!("build cache lookup requires the build layer");
+        }
+        let Some(entry) = load_cache_entry(&self.connection, key.layer, &key.key)? else {
+            return Ok(BuildCacheLookup {
+                result: cache_result(key, "miss", "not-found", None),
+                audit: None,
+            });
+        };
+        if let Some(reason) = self.cache_entry_rejection(key, &entry)? {
+            return Ok(BuildCacheLookup {
+                result: cache_result(key, "reject", &reason, None),
+                audit: None,
+            });
+        }
+        if self.current_snapshot_id()?.as_deref() != Some(entry.snapshot_id.as_str()) {
+            return Ok(BuildCacheLookup {
+                result: cache_result(key, "reject", "current-snapshot-mismatch", None),
+                audit: None,
+            });
+        }
+        let snapshot = self
+            .completed_snapshot(&entry.snapshot_id)?
+            .context("validated build cache snapshot disappeared")?;
+        let attempt_id = snapshot
+            .build_attempt_id
+            .as_deref()
+            .context("validated build cache snapshot has no build attempt")?;
+        let attempt = self
+            .build_attempt(attempt_id)?
+            .context("validated build cache attempt disappeared")?;
+        if attempt.base_snapshot_id.as_deref()
+            != key.dimensions.get("base_snapshot").map(String::as_str)
+        {
+            return Ok(BuildCacheLookup {
+                result: cache_result(key, "reject", "base-binding-mismatch", None),
+                audit: None,
+            });
+        }
+        let audit = match self.build_audit(&attempt.audit_run_id) {
+            Ok(Some(audit)) if audit.outcome == "completed" => audit.audit,
+            Ok(_) | Err(_) => {
+                return Ok(BuildCacheLookup {
+                    result: cache_result(key, "reject", "audit-integrity-failed", None),
+                    audit: None,
+                });
+            }
+        };
+        self.touch_cache_entry(CacheLayer::Build, &key.key)?;
+        self.record_cache_event(
+            None,
+            Some(attempt_id),
+            CacheLayer::Build,
+            Some(&key.key),
+            "hit",
+            "validated",
+        )?;
+        Ok(BuildCacheLookup {
+            result: cache_result(key, "hit", "validated", Some(entry.snapshot_id)),
+            audit: Some(audit),
+        })
     }
 
     /// Validates a semantic scan-cache entry once and correlates its syntax
@@ -594,7 +691,7 @@ impl Store {
     ) -> Result<CacheLookupResult> {
         let payload_digest = self.cache_payload_digest(key.layer, snapshot_id)?;
         if let Some(existing) = load_cache_entry(&self.connection, key.layer, &key.key)?
-            && existing.contract_version == CACHE_CONTRACT_VERSION
+            && self.cache_entry_rejection(key, &existing)?.is_none()
             && existing.payload_digest != payload_digest
         {
             self.record_cache_event(
