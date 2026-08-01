@@ -6,10 +6,12 @@ Every recognized dependency site is retained as `resolved`, `candidates`, `exter
 
 The MVP implements the architecture described in [the system design](docs/40_arch_design/arch-dependency-graph-cli-system-design.md): a Rust core, isolated Rust/Go/Web workers using protocol `1.0` NDJSON, an immutable SQLite evidence store, graph queries, and deterministic JSON/DOT/Mermaid/GraphML export.
 
-The current stable release is [`v0.4.0`](docs/releases/v0.4.0.md).
-The Milestone 4 release candidate and previous Milestone 2 semantic-graph
-candidate remain documented as [`v0.4.0-rc.1`](docs/releases/v0.4.0-rc.1.md)
-and
+The stable `0.4.0` contract is documented in the
+[`v0.4.0` release notes](docs/releases/v0.4.0.md).
+The compiler-pack release candidate, original Milestone 4 candidate, and
+previous Milestone 2 semantic-graph candidate are documented as
+[`v0.4.0-rc.2`](docs/releases/v0.4.0-rc.2.md),
+[`v0.4.0-rc.1`](docs/releases/v0.4.0-rc.1.md), and
 [`v0.2.0-rc.1`](docs/releases/v0.2.0-rc.1.md).
 
 ## Project status and public collaboration
@@ -581,6 +583,36 @@ verify-compiler-pack-assets` requires all five packs to share
 identity, and the canonical semantic shape before the stable release gate can
 publish them. Release metadata and `doctor --json` expose this separate
 distribution and its `unsupported-no-fallback` policy.
+
+Download the four assets for the depgraph version and host target from the
+same [GitHub release](https://github.com/TamaT-LLC/depgraph-cli/releases). The
+release tag may be the stable tag or its matching release candidate (for
+example, `v0.4.0-rc.2`), but the normal depgraph archive and compiler pack must
+come from that one release run.
+
+```bash
+version=0.4.0
+release_tag=v0.4.0-rc.2
+target=x86_64-unknown-linux-gnu # doctor --json reports compiler_pack.host_target
+name="depgraph-compiler-pack-${version}-${target}"
+
+gh release download "$release_tag" \
+  --pattern "$name.tar.gz" \
+  --pattern "$name.tar.gz.sha256" \
+  --pattern "$name.requirement.json" \
+  --pattern "$name.smoke.json" \
+  --dir "$name"
+(cd "$name" && sha256sum --check "$name.tar.gz.sha256" && tar -xzf "$name.tar.gz")
+depgraph doctor --compiler-pack-requirement "$name/$name.requirement.json"
+```
+
+Use `shasum -a 256 --check` on macOS. On Windows, download the `.zip` and
+`.zip.sha256` assets, verify the SHA-256 with `Get-FileHash`, and extract with
+`Expand-Archive` into the directory containing the requirement JSON. The
+requirement's relative `root` then resolves to the extracted pack. A missing,
+wrong-version, wrong-target, or modified pack remains unavailable; `doctor`
+prints the exact expected asset names and depgraph never falls back to another
+compiler.
 
 The first compiler-precise execution stage is explicitly selected with all
 three invocation gates and a release-bound requirement document:

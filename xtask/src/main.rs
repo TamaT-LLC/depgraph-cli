@@ -322,6 +322,39 @@ fn stable_release_baseline_digest() -> String {
     hex::encode(Sha256::digest(stable_release_baseline_record().as_bytes()))
 }
 
+fn release_tag() -> Result<String> {
+    let tag = if matches!(std::env::var("GITHUB_ACTIONS").as_deref(), Ok("true"))
+        && matches!(std::env::var("GITHUB_REF_TYPE").as_deref(), Ok("tag"))
+    {
+        std::env::var("GITHUB_REF_NAME").context("GitHub Actions release tag is missing")?
+    } else {
+        format!("v{VERSION}")
+    };
+    if !supported_release_tag(&tag) {
+        bail!("release tag {tag:?} must be v{VERSION} or a canonical v{VERSION}-rc.N prerelease");
+    }
+    Ok(tag)
+}
+
+fn supported_release_tag(tag: &str) -> bool {
+    if tag == format!("v{VERSION}") {
+        return true;
+    }
+    let Some(sequence) = tag.strip_prefix(&format!("v{VERSION}-rc.")) else {
+        return false;
+    };
+    !sequence.is_empty()
+        && sequence.bytes().all(|byte| byte.is_ascii_digit())
+        && !sequence.starts_with('0')
+}
+
+fn lowercase_git_sha(value: &str) -> bool {
+    value.len() == 40
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 fn verify_stable_release_source_guard(root: &Path) -> Result<()> {
     let source_guard =
         fs::read_to_string(root.join(".github/workflows/stable-release-source-guard.yml"))?;
@@ -1189,7 +1222,8 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "Rust 1.93.1, Go 1.26.1, Node.js 24.18.0, and pnpm 10.33.0",
         "TypeScript/JavaScript symbol/type/import/re-export/type-use",
         "[the system design](docs/40_arch_design/arch-dependency-graph-cli-system-design.md)",
-        "[`v0.4.0`](docs/releases/v0.4.0.md)",
+        "[`v0.4.0` release notes](docs/releases/v0.4.0.md)",
+        "[`v0.4.0-rc.2`](docs/releases/v0.4.0-rc.2.md)",
         "[`v0.4.0-rc.1`](docs/releases/v0.4.0-rc.1.md)",
         "[`v0.2.0-rc.1`](docs/releases/v0.2.0-rc.1.md)",
         "dynamic-framework-evidence-release-gate-v1",
@@ -1201,12 +1235,12 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         }
     }
     let release_note = format!("docs/releases/v{VERSION}.md");
-    let release_link = format!("[`v{VERSION}`]({release_note})");
+    let release_link = format!("[`v{VERSION}` release notes]({release_note})");
     if !readme.contains(&release_link) || !root.join(&release_note).is_file() {
         bail!("README release note link is not synchronized with {VERSION}");
     }
     for required in [
-        "updated: 2026-07-26",
+        "updated: 2026-08-01",
         "| Product / Rust / Go / Web adapter | `0.4.0` |",
         "Milestone 4のrelease candidateは`v0.4.0-rc.1`",
         "Milestone 4のstable releaseは`v0.4.0`",
@@ -1578,6 +1612,7 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "docs/40_arch_design/adr-default-profile-selection-budget.md",
         "docs/40_arch_design/adr-bounded-graph-query-language.md",
         "docs/releases/v0.4.0.md",
+        "docs/releases/v0.4.0-rc.2.md",
         "docs/releases/v0.4.0-rc.1.md",
         "docs/releases/v0.2.0-rc.1.md",
         "LICENSE-MIT",
@@ -4130,7 +4165,7 @@ fn verify_release_assets(directory: &Path, requested_targets: &[String]) -> Resu
         serde_json::to_vec_pretty(&ReleaseVerificationReport {
             schema_version: 7,
             release_version: VERSION.to_owned(),
-            tag: format!("v{VERSION}"),
+            tag: release_tag()?,
             protocol_version: "1.0".to_owned(),
             schema_compatibility_version: "1.0".to_owned(),
             framework_build_graph_contract_version:
@@ -4306,7 +4341,8 @@ fn stable_release_gate(
         })?)
         .context("compiler pack verification report does not satisfy its closed schema")?;
     let compiler_pack_verified =
-        compiler_pack_release::validate_verification_report(&compiler_pack_verification).is_ok();
+        compiler_pack_release::validate_verification_report(&compiler_pack_verification).is_ok()
+            && compiler_pack_release_binding(&release_verification, &compiler_pack_verification);
 
     let report = evaluate_stable_release_gate(
         &release_verification,
@@ -4343,6 +4379,44 @@ fn stable_release_gate(
     Ok(())
 }
 
+fn compiler_pack_release_binding(
+    release: &ReleaseVerificationReport,
+    compiler_pack: &compiler_pack_release::CompilerPackVerificationReport,
+) -> bool {
+    let compiler_pack_targets = compiler_pack
+        .targets
+        .iter()
+        .map(|target| target.target.clone())
+        .collect::<Vec<_>>();
+    compiler_pack_identity_binding(
+        release,
+        &compiler_pack.release_version,
+        &compiler_pack.compatibility,
+        &compiler_pack_targets,
+    )
+}
+
+fn compiler_pack_identity_binding(
+    release: &ReleaseVerificationReport,
+    compiler_pack_version: &str,
+    compiler_pack_compatibility: &depgraph_core::CompilerPreciseReleaseCompatibilityHealth,
+    compiler_pack_targets: &[String],
+) -> bool {
+    let release_targets = release
+        .targets
+        .iter()
+        .map(|target| target.target.as_str())
+        .collect::<BTreeSet<_>>();
+    let compiler_pack_target_set = compiler_pack_targets
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    compiler_pack_version == release.release_version
+        && compiler_pack_compatibility == &release.compatibility.compiler_precise
+        && compiler_pack_targets.len() == release.targets.len()
+        && compiler_pack_target_set == release_targets
+}
+
 fn evaluate_stable_release_gate(
     release: &ReleaseVerificationReport,
     benchmark: &Value,
@@ -4362,6 +4436,15 @@ fn evaluate_stable_release_gate(
         .iter()
         .map(|target| target.target.as_str())
         .collect::<BTreeSet<_>>();
+    let release_source_matches_tag = workflow_results
+        .get("source_sha")
+        .is_some_and(|source_sha| {
+            if release.tag == format!("v{STABLE_RELEASE_VERSION}") {
+                source_sha == STABLE_RELEASE_BASELINE_COMMIT
+            } else {
+                supported_release_tag(&release.tag) && lowercase_git_sha(source_sha)
+            }
+        });
     let metrics = benchmark["metrics"].as_array();
     let benchmark_metrics_pass = metrics.is_some_and(|metrics| {
         metrics.len() == 11
@@ -4476,8 +4559,10 @@ fn evaluate_stable_release_gate(
             id: "release-identity".to_owned(),
             passed: release.schema_version == 7
                 && release.release_version == STABLE_RELEASE_VERSION
-                && release.tag == format!("v{STABLE_RELEASE_VERSION}"),
-            evidence: "release-verification.json schema 7 and exact stable tag".to_owned(),
+                && supported_release_tag(&release.tag),
+            evidence:
+                "release-verification.json schema 7 and an exact stable or canonical rc tag"
+                    .to_owned(),
         },
         StableReleaseGateCheck {
             id: "protocol-store-cache-compatibility".to_owned(),
@@ -4577,9 +4662,10 @@ fn evaluate_stable_release_gate(
         },
         StableReleaseGateCheck {
             id: "tag-source-guard-contract".to_owned(),
-            passed: verify_stable_release_source_guard(&workspace_root()).is_ok(),
+            passed: verify_stable_release_source_guard(&workspace_root()).is_ok()
+                && release_source_matches_tag,
             evidence:
-                "default-branch workflow_run guard cancels the release and deletes an invalid v0.4.0 tag"
+                "the immutable v0.4.0 baseline is enforced while canonical rc tags bind their exact source SHA"
                     .to_owned(),
         },
         StableReleaseGateCheck {
@@ -4587,7 +4673,7 @@ fn evaluate_stable_release_gate(
             passed: workflow_results.get("github_actions").map(String::as_str) == Some("true")
                 && workflow_results.get("ref_type").map(String::as_str) == Some("tag")
                 && workflow_results.get("ref_name").map(String::as_str)
-                    == Some("v0.4.0")
+                    == Some(release.tag.as_str())
                 && [
                     "quality",
                     "compiler-precise-hostile",
@@ -4611,7 +4697,7 @@ fn evaluate_stable_release_gate(
         schema_version: STABLE_RELEASE_GATE_SCHEMA_VERSION.to_owned(),
         release_version: STABLE_RELEASE_VERSION.to_owned(),
         upgrade_source_version: STABLE_UPGRADE_SOURCE_VERSION.to_owned(),
-        tag: format!("v{STABLE_RELEASE_VERSION}"),
+        tag: release.tag.clone(),
         decision,
         release_verification_sha256,
         benchmark_report_sha256,
@@ -4626,6 +4712,7 @@ fn stable_release_workflow_results() -> BTreeMap<String, String> {
         ("github_actions", "GITHUB_ACTIONS"),
         ("ref_type", "GITHUB_REF_TYPE"),
         ("ref_name", "GITHUB_REF_NAME"),
+        ("source_sha", "GITHUB_SHA"),
         ("quality", "DEPGRAPH_RELEASE_QUALITY_RESULT"),
         (
             "compiler-precise-hostile",
@@ -11884,9 +11971,8 @@ fn verify_release_tag_values(
         bail!("release tag workflow did not expose GITHUB_REF_NAME");
     };
     let tag = tag.to_string_lossy();
-    let expected = format!("v{VERSION}");
-    if tag != expected {
-        bail!("release tag {tag} does not match workspace version {expected}");
+    if !supported_release_tag(&tag) {
+        bail!("release tag {tag} must be v{VERSION} or a canonical v{VERSION}-rc.N prerelease");
     }
     Ok(())
 }
@@ -12027,15 +12113,15 @@ mod tests {
         StableReleaseDecision, TYPESCRIPT_VERSION, TargetVerificationReport, Task, VERSION,
         WEB_SEMANTIC_CAPABILITIES, WEB_SEMANTIC_RUNTIME_ARTIFACTS, WEB_SEMANTIC_RUNTIME_COMPONENTS,
         WebSemanticAttestation, WorkerBackend, archive_entries, cargo_runtime_packages,
-        create_tar_archive, create_zip_archive, evaluate_stable_release_gate,
-        executable_name_for_target, extract_archive, github_settings_verify,
-        normalized_spdx_license, package_url, parse_worker_handshake, release_compatibility,
-        remove_transient_build_run_ids, rust_backend_from_handshake, rustc_source_identity,
-        stable_release_baseline_digest, validate_bounded_query_package_smoke,
-        validate_cross_language_package_smoke, verify_checksum_sidecar,
-        verify_cross_language_package_smoke, verify_github_actions_security,
-        verify_local_markdown_links, verify_packaged_cross_language,
-        verify_pinned_rust_sysroot_digest, verify_project_metadata,
+        compiler_pack_identity_binding, create_tar_archive, create_zip_archive,
+        evaluate_stable_release_gate, executable_name_for_target, extract_archive,
+        github_settings_verify, normalized_spdx_license, package_url, parse_worker_handshake,
+        release_compatibility, remove_transient_build_run_ids, rust_backend_from_handshake,
+        rustc_source_identity, stable_release_baseline_digest,
+        validate_bounded_query_package_smoke, validate_cross_language_package_smoke,
+        verify_checksum_sidecar, verify_cross_language_package_smoke,
+        verify_github_actions_security, verify_local_markdown_links,
+        verify_packaged_cross_language, verify_pinned_rust_sysroot_digest, verify_project_metadata,
         verify_public_community_surface, verify_release_tag_values,
         verify_rust_analyzer_dependencies, verify_rust_backend, verify_security_disclosure_dry_run,
         verify_stable_release_source_guard, verify_web_semantic_attestation,
@@ -12597,6 +12683,32 @@ jobs:
                 .map(|(name, _)| target(name))
                 .collect(),
         };
+        let compiler_targets = RELEASE_TARGETS
+            .iter()
+            .map(|(target, _)| (*target).to_owned())
+            .collect::<Vec<_>>();
+        let compiler_compatibility =
+            depgraph_core::compiler_precise_release_compatibility_contract();
+        assert!(compiler_pack_identity_binding(
+            &release,
+            STABLE_RELEASE_VERSION,
+            &compiler_compatibility,
+            &compiler_targets,
+        ));
+        assert!(!compiler_pack_identity_binding(
+            &release,
+            STABLE_UPGRADE_SOURCE_VERSION,
+            &compiler_compatibility,
+            &compiler_targets,
+        ));
+        let mut missing_compiler_target = compiler_targets.clone();
+        missing_compiler_target.pop();
+        assert!(!compiler_pack_identity_binding(
+            &release,
+            STABLE_RELEASE_VERSION,
+            &compiler_compatibility,
+            &missing_compiler_target,
+        ));
         let metrics = (0..11)
             .map(|index| {
                 let gated = index < 9;
@@ -12647,6 +12759,45 @@ jobs:
         assert_eq!(
             evaluate(&release, &benchmark).decision,
             StableReleaseDecision::Allow
+        );
+
+        let mut prerelease = release.clone();
+        prerelease.tag = format!("v{STABLE_RELEASE_VERSION}-rc.2");
+        let mut prerelease_workflow = workflow_results.clone();
+        prerelease_workflow.insert("ref_name".to_owned(), prerelease.tag.clone());
+        prerelease_workflow.insert("source_sha".to_owned(), "1".repeat(40));
+        assert_eq!(
+            evaluate_stable_release_gate(
+                &prerelease,
+                &benchmark,
+                "a".repeat(64),
+                "b".repeat(64),
+                "c".repeat(64),
+                true,
+                prerelease_workflow,
+            )
+            .decision,
+            StableReleaseDecision::Allow
+        );
+
+        let mut malformed_prerelease = release.clone();
+        malformed_prerelease.tag = format!("v{STABLE_RELEASE_VERSION}-rc.02");
+        let mut malformed_prerelease_workflow = workflow_results.clone();
+        malformed_prerelease_workflow
+            .insert("ref_name".to_owned(), malformed_prerelease.tag.clone());
+        malformed_prerelease_workflow.insert("source_sha".to_owned(), "1".repeat(40));
+        assert_eq!(
+            evaluate_stable_release_gate(
+                &malformed_prerelease,
+                &benchmark,
+                "a".repeat(64),
+                "b".repeat(64),
+                "c".repeat(64),
+                true,
+                malformed_prerelease_workflow,
+            )
+            .decision,
+            StableReleaseDecision::Reject
         );
 
         let mut wrong_version = release.clone();
@@ -12893,6 +13044,22 @@ jobs:
             Some(OsStr::new(concat!("v", env!("CARGO_PKG_VERSION")))),
         )
         .expect("the workspace release tag must remain valid");
+        verify_release_tag_values(
+            Some(OsStr::new("tag")),
+            Some(OsStr::new(concat!("v", env!("CARGO_PKG_VERSION"), "-rc.2"))),
+        )
+        .expect("a canonical workspace release candidate tag must remain valid");
+        assert!(
+            verify_release_tag_values(
+                Some(OsStr::new("tag")),
+                Some(OsStr::new(concat!(
+                    "v",
+                    env!("CARGO_PKG_VERSION"),
+                    "-rc.02"
+                ))),
+            )
+            .is_err()
+        );
     }
 
     fn change_source_mtime(path: &std::path::Path) -> Result<()> {
