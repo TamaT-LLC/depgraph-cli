@@ -1223,7 +1223,7 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "TypeScript/JavaScript symbol/type/import/re-export/type-use",
         "[the system design](docs/40_arch_design/arch-dependency-graph-cli-system-design.md)",
         "[`v0.4.0` release notes](docs/releases/v0.4.0.md)",
-        "[`v0.4.0-rc.3`](docs/releases/v0.4.0-rc.3.md)",
+        "[`v0.4.0-rc.4`](docs/releases/v0.4.0-rc.4.md)",
         "[`v0.4.0-rc.2`](docs/releases/v0.4.0-rc.2.md)",
         "[`v0.4.0-rc.1`](docs/releases/v0.4.0-rc.1.md)",
         "[`v0.2.0-rc.1`](docs/releases/v0.2.0-rc.1.md)",
@@ -1606,6 +1606,18 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
             bail!("Rust source legal input {path} is not pinned to LF");
         }
     }
+    for required_attribute in [
+        "fixtures/** text eol=lf",
+        "queries/** text eol=lf",
+        "schemas/** text eol=lf",
+    ] {
+        if !git_attributes
+            .lines()
+            .any(|line| line.trim() == required_attribute)
+        {
+            bail!("release contract text is missing checkout normalization {required_attribute}");
+        }
+    }
     for link in [
         "docs/40_arch_design/arch-dependency-graph-cli-system-design.md",
         "docs/40_arch_design/adr-rust-compiler-precise-backend.md",
@@ -1613,6 +1625,7 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "docs/40_arch_design/adr-default-profile-selection-budget.md",
         "docs/40_arch_design/adr-bounded-graph-query-language.md",
         "docs/releases/v0.4.0.md",
+        "docs/releases/v0.4.0-rc.4.md",
         "docs/releases/v0.4.0-rc.3.md",
         "docs/releases/v0.4.0-rc.2.md",
         "docs/releases/v0.4.0-rc.1.md",
@@ -1980,7 +1993,7 @@ fn package() -> Result<()> {
 
     let mut project_licenses = Vec::new();
     for (path, _) in PROJECT_LICENSES {
-        copy(Path::new(path), &staging.join(path))?;
+        copy_lf_normalized_text(Path::new(path), &staging.join(path))?;
         project_licenses.push(Artifact {
             path: (*path).to_owned(),
             sha256: sha256_file(&staging.join(path))?,
@@ -2023,20 +2036,20 @@ fn package() -> Result<()> {
         &staging.join("libexec/typescript"),
     )?;
     verify_typescript_compiler(&staging)?;
-    copy(
+    copy_lf_normalized_text(
         Path::new("schemas/depgraph-protocol-v1.schema.json"),
         &staging.join("schemas/depgraph-protocol-v1.schema.json"),
     )?;
     let schema_path = staging.join("schemas/depgraph-protocol-v1.schema.json");
     let query_fixture_path = staging.join(depgraph_core::BOUNDED_QUERY_RELEASE_SMOKE_FIXTURE_PATH);
-    copy(
+    copy_lf_normalized_text(
         Path::new(depgraph_core::BOUNDED_QUERY_RELEASE_SMOKE_FIXTURE_PATH),
         &query_fixture_path,
     )?;
     let cross_language_contract = depgraph_core::cross_language_release_compatibility_contract();
     let cross_language_fixture_path =
         staging.join(depgraph_core::CROSS_LANGUAGE_RELEASE_SMOKE_FIXTURE_PATH);
-    copy(
+    copy_lf_normalized_text(
         Path::new(depgraph_core::CROSS_LANGUAGE_RELEASE_SMOKE_FIXTURE_PATH),
         &cross_language_fixture_path,
     )?;
@@ -2046,7 +2059,7 @@ fn package() -> Result<()> {
         .map(|schema| {
             let source = Path::new(&schema.path);
             let destination = staging.join(&schema.path);
-            copy(source, &destination)?;
+            copy_lf_normalized_text(source, &destination)?;
             Ok(Artifact {
                 path: schema.path.clone(),
                 sha256: sha256_file(&destination)?,
@@ -3903,10 +3916,17 @@ fn is_executable(path: &Path) -> Result<bool> {
     }
     #[cfg(not(unix))]
     {
-        Ok(path
-            .extension()
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("exe")))
+        Ok(has_windows_executable_extension(path))
     }
+}
+
+#[cfg(any(not(unix), test))]
+fn has_windows_executable_extension(path: &Path) -> bool {
+    path.extension().is_some_and(|extension| {
+        ["exe", "cmd", "bat"]
+            .iter()
+            .any(|candidate| extension.eq_ignore_ascii_case(candidate))
+    })
 }
 
 fn create_tar_archive(archive: &Path, entries: &[ArchiveEntry]) -> Result<()> {
@@ -11990,6 +12010,24 @@ fn copy(source: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
+fn copy_lf_normalized_text(source: &Path, destination: &Path) -> Result<()> {
+    let bytes = fs::read(source)
+        .with_context(|| format!("failed to read release text {}", source.display()))?;
+    let text = String::from_utf8(bytes)
+        .with_context(|| format!("release text {} is not UTF-8", source.display()))?;
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(destination, normalized).with_context(|| {
+        format!(
+            "failed to write LF-normalized release text {}",
+            destination.display()
+        )
+    })?;
+    Ok(())
+}
+
 fn copy_directory(source: &Path, destination: &Path) -> Result<()> {
     for entry in WalkDir::new(source).follow_links(false) {
         let entry = entry?;
@@ -12099,6 +12137,7 @@ mod tests {
     use std::{
         collections::{BTreeMap, BTreeSet},
         fs,
+        path::Path,
         time::{Duration, SystemTime},
     };
 
@@ -12117,9 +12156,9 @@ mod tests {
         WebSemanticAttestation, WorkerBackend, archive_entries, cargo_runtime_packages,
         compiler_pack_identity_binding, create_tar_archive, create_zip_archive,
         evaluate_stable_release_gate, executable_name_for_target, extract_archive,
-        github_settings_verify, normalized_spdx_license, package_url, parse_worker_handshake,
-        release_compatibility, remove_transient_build_run_ids, rust_backend_from_handshake,
-        rustc_source_identity, stable_release_baseline_digest,
+        github_settings_verify, has_windows_executable_extension, normalized_spdx_license,
+        package_url, parse_worker_handshake, release_compatibility, remove_transient_build_run_ids,
+        rust_backend_from_handshake, rustc_source_identity, stable_release_baseline_digest,
         validate_bounded_query_package_smoke, validate_cross_language_package_smoke,
         verify_checksum_sidecar, verify_cross_language_package_smoke,
         verify_github_actions_security, verify_local_markdown_links,
@@ -12151,6 +12190,20 @@ mod tests {
     #[test]
     fn repository_release_metadata_is_synchronized() -> Result<()> {
         verify_project_metadata(&workspace_root())
+    }
+
+    #[test]
+    fn release_contract_text_is_utf8_and_lf_normalized_during_staging() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let source = temp.path().join("contract.json");
+        let destination = temp.path().join("staging/schemas/contract.json");
+        fs::write(&source, b"{\r\n  \"value\": true\r}\r\n")?;
+        super::copy_lf_normalized_text(&source, &destination)?;
+        assert_eq!(fs::read(&destination)?, b"{\n  \"value\": true\n}\n");
+
+        fs::write(&source, [0xff])?;
+        assert!(super::copy_lf_normalized_text(&source, &destination).is_err());
+        Ok(())
     }
 
     #[test]
@@ -12948,6 +13001,20 @@ jobs:
             executable_name_for_target("depgraph", "aarch64-apple-darwin"),
             "depgraph"
         );
+    }
+
+    #[test]
+    fn windows_archive_executable_extensions_match_compiler_pack_verification() {
+        for path in [
+            "bin/depgraph.exe",
+            "toolchain/run.CMD",
+            "toolchain/setup.Bat",
+        ] {
+            assert!(has_windows_executable_extension(Path::new(path)), "{path}");
+        }
+        for path in ["toolchain/library.dll", "rust-src/build.sh", "README"] {
+            assert!(!has_windows_executable_extension(Path::new(path)), "{path}");
+        }
     }
 
     #[test]
