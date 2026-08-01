@@ -15,7 +15,7 @@ use depgraph_core::{
     InteractiveQueryPageRequest, PolicyAnnotation, PolicyResult, QueryDiagnostic,
     QueryFailureClass, RepositoryProfilePlanPreview, ScanCacheMode, TraversalPageItem,
     TypedProjection, UnresolvedResult, acquire_store_writer_lock, build_cache_key,
-    compiler_precise_graph_ndjson, create_build_execution_request,
+    compiler_pack_availability, compiler_precise_graph_ndjson, create_build_execution_request,
     create_compiler_precise_invocation_request, create_compiler_precise_unit_graph_request,
     cycles_from_topology, default_store_path, doctor, doctor_for_root, doctor_summary,
     doctor_summary_for_root, evaluate_policy_diff, execute_bounded_query,
@@ -133,6 +133,9 @@ enum Commands {
     Doctor {
         #[arg(long)]
         json: bool,
+        /// Verify this release-bound compiler-pack requirement for the current host.
+        #[arg(long, value_name = "FILE")]
+        compiler_pack_requirement: Option<PathBuf>,
         /// Diagnose worker launch policy for this repository root.
         #[arg(long, value_name = "PATH")]
         root: Option<PathBuf>,
@@ -1092,6 +1095,7 @@ async fn run(cli: Cli) -> Result<u8> {
         }
         Commands::Doctor {
             json,
+            compiler_pack_requirement,
             root,
             summary: _,
             details,
@@ -1104,11 +1108,13 @@ async fn run(cli: Cli) -> Result<u8> {
             )?;
             let store = open_store(&store_path)?;
             if !details {
-                let report = if let Some(root) = &diagnostic_root {
+                let mut report = if let Some(root) = &diagnostic_root {
                     doctor_summary_for_root(&store, root).await?
                 } else {
                     doctor_summary(&store).await?
                 };
+                report.compiler_pack =
+                    compiler_pack_availability(compiler_pack_requirement.as_deref());
                 if json {
                     println!("{}", serde_json::to_string_pretty(&report)?);
                 } else {
@@ -1116,11 +1122,12 @@ async fn run(cli: Cli) -> Result<u8> {
                 }
                 return Ok(0);
             }
-            let report = if let Some(root) = &diagnostic_root {
+            let mut report = if let Some(root) = &diagnostic_root {
                 doctor_for_root(&store, root).await?
             } else {
                 doctor(&store).await?
             };
+            report.compiler_pack = compiler_pack_availability(compiler_pack_requirement.as_deref());
             if json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
@@ -1138,6 +1145,7 @@ async fn run(cli: Cli) -> Result<u8> {
                     report.cache_entries.semantic,
                     report.cache_entries.build
                 );
+                print_compiler_pack_health_human(&report.compiler_pack);
                 println!(
                     "impact query cache: contract {}, {} entries",
                     report.impact_query_cache_contract_version, report.impact_query_cache_entries
@@ -2478,6 +2486,17 @@ fn query_projection_label(projection: &TypedProjection) -> String {
     }
 }
 
+fn print_compiler_pack_health_human(report: &depgraph_core::CompilerPackAvailabilityHealth) {
+    println!(
+        "compiler pack: {} (host={}; policy={})",
+        report.status,
+        report.host_target.as_deref().unwrap_or("unsupported"),
+        report.fallback_policy
+    );
+    println!("compiler pack diagnostic: {}", report.diagnostic);
+    println!("compiler pack action: {}", report.remediation);
+}
+
 fn print_doctor_summary_human(report: &depgraph_core::DoctorSummaryReport) {
     println!("doctor report: {}", report.report_kind);
     println!(
@@ -2491,6 +2510,7 @@ fn print_doctor_summary_human(report: &depgraph_core::DoctorSummaryReport) {
         "cache entries: {} syntax, {} semantic, {} build",
         report.cache_entries.syntax, report.cache_entries.semantic, report.cache_entries.build
     );
+    print_compiler_pack_health_human(&report.compiler_pack);
     for (toolchain, version) in &report.toolchains {
         let baseline = report
             .supported_baselines

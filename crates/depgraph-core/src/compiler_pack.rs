@@ -38,6 +38,17 @@ pub const COMPILER_PACK_SUPPORTED_TARGETS: &[&str] = &[
     "x86_64-pc-windows-msvc",
 ];
 
+pub fn compiler_pack_host_target() -> Option<&'static str> {
+    match (std::env::consts::ARCH, std::env::consts::OS) {
+        ("x86_64", "linux") if cfg!(target_env = "gnu") => Some("x86_64-unknown-linux-gnu"),
+        ("aarch64", "linux") if cfg!(target_env = "gnu") => Some("aarch64-unknown-linux-gnu"),
+        ("x86_64", "macos") => Some("x86_64-apple-darwin"),
+        ("aarch64", "macos") => Some("aarch64-apple-darwin"),
+        ("x86_64", "windows") if cfg!(target_env = "msvc") => Some("x86_64-pc-windows-msvc"),
+        _ => None,
+    }
+}
+
 const COMPILER_PACK_LICENSE_SCHEMA_VERSION: &str = "compiler-pack-license-inventory-v1";
 const COMPILER_PACK_PROVENANCE_SCHEMA_VERSION: &str = "compiler-pack-provenance-v1";
 const COMPILER_PACK_LICENSE_EXPRESSION: &str = "MIT OR Apache-2.0";
@@ -1291,6 +1302,12 @@ fn is_executable(_metadata: &fs::Metadata, path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn release_host_target_is_in_the_published_matrix() {
+        let target = compiler_pack_host_target().expect("CI uses a supported release host");
+        assert!(COMPILER_PACK_SUPPORTED_TARGETS.contains(&target));
+    }
 
     fn fixture_spec() -> CompilerPackBuildSpec {
         let component = |name: &str, files: Vec<String>| CompilerPackBuildComponent {

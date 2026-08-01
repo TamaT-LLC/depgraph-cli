@@ -232,8 +232,8 @@ pub use compiler_pack::{
     CompilerPackArtifact, CompilerPackAttestation, CompilerPackBuildComponent,
     CompilerPackBuildSpec, CompilerPackComponent, CompilerPackFile, CompilerPackManifest,
     CompilerPackProtocol, CompilerPackRequirement, CompilerPackToolchain, VerifiedCompilerPack,
-    build_compiler_pack, read_compiler_pack_build_spec, read_compiler_pack_requirement,
-    verify_compiler_pack,
+    build_compiler_pack, compiler_pack_host_target, read_compiler_pack_build_spec,
+    read_compiler_pack_requirement, verify_compiler_pack,
 };
 pub use compiler_precise::{
     COMPILER_PRECISE_UNIT_GRAPH_ADAPTER, COMPILER_PRECISE_UNIT_GRAPH_ADAPTER_VERSION,
@@ -484,6 +484,23 @@ pub struct CompilerPreciseProfileHealth {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct CompilerPackAvailabilityHealth {
+    pub status: String,
+    pub host_target: Option<String>,
+    pub requirement_path: Option<String>,
+    pub pack_root: Option<String>,
+    pub manifest_sha256: Option<String>,
+    pub archive_asset: Option<String>,
+    pub checksum_asset: Option<String>,
+    pub requirement_asset: Option<String>,
+    pub smoke_asset: Option<String>,
+    pub release_page: &'static str,
+    pub fallback_policy: &'static str,
+    pub diagnostic: String,
+    pub remediation: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct DoctorReport {
     pub diagnostic_root: DoctorDiagnosticRoot,
     pub protocol_version: &'static str,
@@ -498,6 +515,7 @@ pub struct DoctorReport {
     pub supported_baselines: BTreeMap<String, String>,
     pub toolchain_remediation: BTreeMap<String, String>,
     pub workers: Vec<WorkerHealth>,
+    pub compiler_pack: CompilerPackAvailabilityHealth,
     pub latest_attempt: Option<ScanHealth>,
     pub latest_successful_scan_id: Option<String>,
     pub release: Option<ReleaseHealth>,
@@ -520,6 +538,7 @@ pub struct DoctorSummaryReport {
     pub supported_baselines: BTreeMap<String, String>,
     pub toolchain_remediation: BTreeMap<String, String>,
     pub workers: Vec<WorkerHealth>,
+    pub compiler_pack: CompilerPackAvailabilityHealth,
     pub latest_attempt: Option<ScanHealthSummary>,
     pub latest_successful_scan_id: Option<String>,
     pub release: Option<ReleaseHealth>,
@@ -537,6 +556,113 @@ pub struct ReleaseHealth {
     pub schema_integrity: String,
     pub runtime_integrity: BTreeMap<String, String>,
     pub runtime_requirements: BTreeMap<String, String>,
+}
+
+pub fn compiler_pack_availability(
+    requirement_path: Option<&Path>,
+) -> CompilerPackAvailabilityHealth {
+    const RELEASE_PAGE: &str = "https://github.com/TamaT-LLC/depgraph-cli/releases";
+    let Some(host_target) = compiler_pack_host_target() else {
+        return CompilerPackAvailabilityHealth {
+            status: "unsupported-host".to_owned(),
+            host_target: None,
+            requirement_path: requirement_path.map(|path| path.to_string_lossy().into_owned()),
+            pack_root: None,
+            manifest_sha256: None,
+            archive_asset: None,
+            checksum_asset: None,
+            requirement_asset: None,
+            smoke_asset: None,
+            release_page: RELEASE_PAGE,
+            fallback_policy: COMPILER_PACK_FALLBACK_POLICY,
+            diagnostic: format!(
+                "no first-party compiler pack is published for {}-{}",
+                std::env::consts::ARCH,
+                std::env::consts::OS
+            ),
+            remediation:
+                "use one of the five supported hosts; depgraph will not fall back to rustup, PATH, system, or project compilers"
+                    .to_owned(),
+        };
+    };
+    let version = env!("CARGO_PKG_VERSION");
+    let name = format!("depgraph-compiler-pack-{version}-{host_target}");
+    let archive_asset = format!(
+        "{name}.{}",
+        if host_target.ends_with("windows-msvc") {
+            "zip"
+        } else {
+            "tar.gz"
+        }
+    );
+    let checksum_asset = format!("{archive_asset}.sha256");
+    let requirement_asset = format!("{name}.requirement.json");
+    let smoke_asset = format!("{name}.smoke.json");
+    let install = format!(
+        "download {archive_asset}, {checksum_asset}, {requirement_asset}, and {smoke_asset} from a depgraph {version} release at {RELEASE_PAGE}; verify the checksum, extract the archive next to the requirement, then run `depgraph doctor --compiler-pack-requirement {requirement_asset}`"
+    );
+    let Some(requirement_path) = requirement_path else {
+        return CompilerPackAvailabilityHealth {
+            status: "unconfigured".to_owned(),
+            host_target: Some(host_target.to_owned()),
+            requirement_path: None,
+            pack_root: None,
+            manifest_sha256: None,
+            archive_asset: Some(archive_asset),
+            checksum_asset: Some(checksum_asset),
+            requirement_asset: Some(requirement_asset),
+            smoke_asset: Some(smoke_asset),
+            release_page: RELEASE_PAGE,
+            fallback_policy: COMPILER_PACK_FALLBACK_POLICY,
+            diagnostic: "no compiler-pack requirement was supplied to doctor".to_owned(),
+            remediation: install,
+        };
+    };
+    let requirement_display = requirement_path.to_string_lossy().into_owned();
+    let inspected = read_compiler_pack_requirement(requirement_path).and_then(|requirement| {
+        if requirement.host != host_target || requirement.target != host_target {
+            anyhow::bail!(
+                "compiler pack requirement targets {}/{} instead of current host {host_target}",
+                requirement.host,
+                requirement.target
+            );
+        }
+        verify_compiler_pack(&requirement)
+    });
+    match inspected {
+        Ok(pack) => CompilerPackAvailabilityHealth {
+            status: "available".to_owned(),
+            host_target: Some(host_target.to_owned()),
+            requirement_path: Some(requirement_display.clone()),
+            pack_root: Some(pack.root.to_string_lossy().into_owned()),
+            manifest_sha256: Some(pack.attestation.manifest_sha256),
+            archive_asset: Some(archive_asset),
+            checksum_asset: Some(checksum_asset),
+            requirement_asset: Some(requirement_asset),
+            smoke_asset: Some(smoke_asset),
+            release_page: RELEASE_PAGE,
+            fallback_policy: COMPILER_PACK_FALLBACK_POLICY,
+            diagnostic: "the exact current-host compiler pack is verified and available".to_owned(),
+            remediation: format!(
+                "run compiler-precise resolve with `--compiler-pack-requirement {requirement_display}`"
+            ),
+        },
+        Err(error) => CompilerPackAvailabilityHealth {
+            status: "unavailable".to_owned(),
+            host_target: Some(host_target.to_owned()),
+            requirement_path: Some(requirement_display),
+            pack_root: None,
+            manifest_sha256: None,
+            archive_asset: Some(archive_asset),
+            checksum_asset: Some(checksum_asset),
+            requirement_asset: Some(requirement_asset),
+            smoke_asset: Some(smoke_asset),
+            release_page: RELEASE_PAGE,
+            fallback_policy: COMPILER_PACK_FALLBACK_POLICY,
+            diagnostic: format!("compiler pack verification failed: {error:#}"),
+            remediation: install,
+        },
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -1200,6 +1326,7 @@ async fn doctor_with_diagnostic_root(
         supported_baselines: doctor_supported_baselines(),
         toolchain_remediation,
         workers,
+        compiler_pack: compiler_pack_availability(None),
         latest_attempt,
         latest_successful_scan_id: store.latest_successful_id()?,
         release: release_health()?,
@@ -1259,6 +1386,7 @@ async fn doctor_summary_with_diagnostic_root(
         supported_baselines: doctor_supported_baselines(),
         toolchain_remediation,
         workers,
+        compiler_pack: compiler_pack_availability(None),
         latest_attempt,
         latest_successful_scan_id: store.latest_successful_id()?,
         release: release_health()?,

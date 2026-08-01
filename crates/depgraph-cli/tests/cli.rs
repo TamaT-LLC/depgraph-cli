@@ -5237,6 +5237,18 @@ fn query_commands_report_traversal_evidence_cycles_doctor_and_unresolved_sites()
     assert_eq!(doctor["latest_attempt"]["status"], "completed");
     assert_eq!(doctor["latest_attempt"]["profile_count"], 1);
     assert_eq!(doctor["detail_command"], "depgraph doctor --details");
+    assert_eq!(doctor["compiler_pack"]["status"], "unconfigured");
+    assert!(doctor["compiler_pack"]["host_target"].is_string());
+    assert_eq!(
+        doctor["compiler_pack"]["fallback_policy"],
+        "unsupported-no-fallback"
+    );
+    assert!(
+        doctor["compiler_pack"]["remediation"]
+            .as_str()
+            .unwrap()
+            .contains("requirement")
+    );
     assert_eq!(doctor["diagnostic_root"]["source"], "latest-attempt");
     assert_eq!(
         doctor["diagnostic_root"]["path"],
@@ -5261,6 +5273,21 @@ fn query_commands_report_traversal_evidence_cycles_doctor_and_unresolved_sites()
         doctor_from_scan_root["diagnostic_root"]
     );
     assert_eq!(doctor["workers"], doctor_from_scan_root["workers"]);
+
+    let missing_requirement = root.path().join("missing-compiler-pack-requirement.json");
+    let missing_pack = query(&[
+        "doctor",
+        "--compiler-pack-requirement",
+        missing_requirement.to_str().unwrap(),
+        "--json",
+    ]);
+    assert_eq!(missing_pack["compiler_pack"]["status"], "unavailable");
+    assert!(
+        missing_pack["compiler_pack"]["diagnostic"]
+            .as_str()
+            .unwrap()
+            .contains("requirement")
+    );
 
     let repository_root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()

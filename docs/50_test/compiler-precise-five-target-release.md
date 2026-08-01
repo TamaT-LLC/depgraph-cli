@@ -68,6 +68,9 @@ target ごとの executable digest と component tree digest は native artifact
 
 stable release gate は通常 archive の aggregate report、benchmark report、compiler-pack aggregate report を独立した入力として検証する。
 `compiler-pack` と `verify-compiler-packs` の workflow result が `success` でない場合も release を拒否する。
+さらに、通常 archive とcompiler packのrelease version、五つのtarget集合、compiler compatibility unitを直接比較し、同一release runの対応するassetだけを許可する。
+Immutableな`v0.4.0`は従来どおり固定baseline commitだけを許可し、pack付きの公開検証には同一base versionのcanonicalな`v0.4.0-rc.N` tagを許可する。
+RC tagはworkflowのexact source SHAへ結合し、sequenceは先頭ゼロを含まない正整数に限る。
 
 ## 実行
 
