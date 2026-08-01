@@ -3916,10 +3916,17 @@ fn is_executable(path: &Path) -> Result<bool> {
     }
     #[cfg(not(unix))]
     {
-        Ok(path
-            .extension()
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("exe")))
+        Ok(has_windows_executable_extension(path))
     }
+}
+
+#[cfg(any(not(unix), test))]
+fn has_windows_executable_extension(path: &Path) -> bool {
+    path.extension().is_some_and(|extension| {
+        ["exe", "cmd", "bat"]
+            .iter()
+            .any(|candidate| extension.eq_ignore_ascii_case(candidate))
+    })
 }
 
 fn create_tar_archive(archive: &Path, entries: &[ArchiveEntry]) -> Result<()> {
@@ -12130,6 +12137,7 @@ mod tests {
     use std::{
         collections::{BTreeMap, BTreeSet},
         fs,
+        path::Path,
         time::{Duration, SystemTime},
     };
 
@@ -12148,9 +12156,9 @@ mod tests {
         WebSemanticAttestation, WorkerBackend, archive_entries, cargo_runtime_packages,
         compiler_pack_identity_binding, create_tar_archive, create_zip_archive,
         evaluate_stable_release_gate, executable_name_for_target, extract_archive,
-        github_settings_verify, normalized_spdx_license, package_url, parse_worker_handshake,
-        release_compatibility, remove_transient_build_run_ids, rust_backend_from_handshake,
-        rustc_source_identity, stable_release_baseline_digest,
+        github_settings_verify, has_windows_executable_extension, normalized_spdx_license,
+        package_url, parse_worker_handshake, release_compatibility, remove_transient_build_run_ids,
+        rust_backend_from_handshake, rustc_source_identity, stable_release_baseline_digest,
         validate_bounded_query_package_smoke, validate_cross_language_package_smoke,
         verify_checksum_sidecar, verify_cross_language_package_smoke,
         verify_github_actions_security, verify_local_markdown_links,
@@ -12993,6 +13001,20 @@ jobs:
             executable_name_for_target("depgraph", "aarch64-apple-darwin"),
             "depgraph"
         );
+    }
+
+    #[test]
+    fn windows_archive_executable_extensions_match_compiler_pack_verification() {
+        for path in [
+            "bin/depgraph.exe",
+            "toolchain/run.CMD",
+            "toolchain/setup.Bat",
+        ] {
+            assert!(has_windows_executable_extension(Path::new(path)), "{path}");
+        }
+        for path in ["toolchain/library.dll", "rust-src/build.sh", "README"] {
+            assert!(!has_windows_executable_extension(Path::new(path)), "{path}");
+        }
     }
 
     #[test]
