@@ -114,9 +114,9 @@ counts, and byte totals while requiring cold/no-cache graph equality and a
 validated warm semantic-cache hit. Every fixture size requires the median cache
 hit to be at least 5% faster while preserving canonical graph and coverage
 equality. The reports also record platform and toolchain metadata, every raw
-sample, and the configured regression/noise policy. CI and tag release workflows
-upload the same versioned reports as artifacts; release publication verifies
-them before publishing.
+sample, and the configured regression/noise policy. Manual full CI and tag
+release workflows upload the same versioned reports as artifacts; release
+publication verifies its tag-bound reports before publishing.
 
 ## Usage
 

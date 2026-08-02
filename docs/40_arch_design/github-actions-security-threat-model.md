@@ -18,8 +18,12 @@ The ordinary CI workflow has only `contents: read`, never uses
 `pull_request_target`, and does not interpolate the `secrets` expression
 context. Its exact trigger set is `pull_request`, `push`, and
 `workflow_dispatch`. Manual dispatches retain the same read-only and
-secret-free boundary as the other CI events. The verifier detects the secrets
-context as an identifier regardless of
+secret-free boundary as the other CI events. Pull requests and `main` pushes
+run the Rust, Go, Web, and compiler-precise hostile checks. Benchmark,
+Linux/macOS integration, and Windows smoke jobs run only on an explicit manual
+dispatch. The verifier binds those expensive jobs to `workflow_dispatch`, so a
+workflow edit cannot silently restore them on every merge. The verifier detects
+the secrets context as an identifier regardless of
 ASCII case, expression whitespace, or dot/bracket access syntax. Flow-style or
 quoted `permissions` declarations are rejected so write scopes cannot bypass
 the canonical block scanner. Permission scope keys and values must be
@@ -41,6 +45,11 @@ write permission to any release job fails the gate. It
 downloads artifacts produced by the same run and verifies their manifests,
 checksums, SBOMs, licenses, benchmark report, and stable release gate before
 publication. No fork event can trigger this path.
+
+The manual full CI run is a preflight for one candidate commit and cannot
+authorize publication. The tag-triggered Release workflow rebuilds and verifies
+its own artifacts from the tagged commit. A successful CI artifact is never
+promoted into a release artifact.
 
 The stable source guard handles `workflow_run` metadata without checking out or
 executing the triggering revision. Its write token is restricted to cancelling
