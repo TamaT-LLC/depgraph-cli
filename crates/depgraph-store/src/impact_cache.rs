@@ -426,14 +426,16 @@ mod tests {
         let path = directory.path().join("schema-12.db");
         let connection = Connection::open(&path)?;
         connection.execute_batch(
-            "CREATE TABLE completed_snapshots(id TEXT PRIMARY KEY);
+            "CREATE TABLE scans(id TEXT PRIMARY KEY);
+             CREATE TABLE build_attempts(id TEXT PRIMARY KEY);
+             CREATE TABLE completed_snapshots(id TEXT PRIMARY KEY);
              INSERT INTO completed_snapshots(id) VALUES ('snapshot:sha256:test');
              PRAGMA user_version = 12;",
         )?;
         drop(connection);
 
         let mut store = Store::open(&path)?;
-        assert_eq!(store.schema_version()?, 13);
+        assert_eq!(store.schema_version()?, 14);
         assert!(store.store_impact_query_cache(
             &key(1),
             "snapshot:sha256:test",

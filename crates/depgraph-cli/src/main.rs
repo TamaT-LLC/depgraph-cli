@@ -15,7 +15,8 @@ use depgraph_core::{
     InteractiveQueryPageRequest, PolicyAnnotation, PolicyResult, QueryDiagnostic,
     QueryFailureClass, RepositoryProfilePlanPreview, ScanCacheMode, TraversalPageItem,
     TypedProjection, UnresolvedResult, acquire_store_writer_lock, build_cache_key,
-    compiler_pack_availability, compiler_precise_graph_ndjson, create_build_execution_request,
+    compiler_pack_availability, compiler_precise_cache_hit_audit, compiler_precise_cache_key,
+    compiler_precise_graph_ndjson, create_build_execution_request,
     create_compiler_precise_invocation_request, create_compiler_precise_unit_graph_request,
     cycles_from_topology, default_store_path, doctor, doctor_for_root, doctor_summary,
     doctor_summary_for_root, evaluate_policy_diff, execute_bounded_query,
@@ -23,15 +24,16 @@ use depgraph_core::{
     impact, impact_query_cache_key, init_config, match_runtime_trace, open_store,
     open_store_read_only, paginate_interactive_query, parse_and_type_check_bounded_query,
     plan_bounded_query, plan_explicit_profile_selection, plan_repository_profiles,
-    policy_annotations, prepare_build_cache_input, profile_selection_human_summary,
-    read_bounded_query_file, read_compiler_pack_requirement, read_explicit_profile_selection_file,
-    read_git_changed_set, read_runtime_trace, render_condition, render_github_annotations,
-    run_scan_with_cache_mode, runtime_session_delta, rust_build_protocol_ndjson,
-    stage_build_evidence, start_repository_daemon, traversal_page_items, traversal_summary,
-    traverse_bounded_filtered, traverse_filtered, unresolved, unresolved_summary,
-    validate_build_cache_input, validate_build_cache_source,
-    validate_explicit_profile_selection_capabilities, validate_interactive_query_bounds,
-    web_build_protocol_ndjson, why_filtered,
+    policy_annotations, prepare_build_cache_input, prepare_compiler_precise_cache_input,
+    profile_selection_human_summary, read_bounded_query_file, read_compiler_pack_requirement,
+    read_explicit_profile_selection_file, read_git_changed_set, read_runtime_trace,
+    render_condition, render_github_annotations, run_scan_with_cache_mode, runtime_session_delta,
+    rust_build_protocol_ndjson, snapshot_profile_plan_id, stage_build_evidence,
+    start_repository_daemon, traversal_page_items, traversal_summary, traverse_bounded_filtered,
+    traverse_filtered, unresolved, unresolved_summary, validate_build_cache_input,
+    validate_build_cache_source, validate_compiler_precise_cache_input,
+    validate_compiler_precise_cached_evidence, validate_explicit_profile_selection_capabilities,
+    validate_interactive_query_bounds, web_build_protocol_ndjson, why_filtered,
 };
 use depgraph_protocol::canonical_json;
 use depgraph_store::{CompletedSnapshotDetails, CoverageRecord};
@@ -821,10 +823,152 @@ async fn run(cli: Cli) -> Result<u8> {
             let base_scan_id = store.latest_successful_id()?;
             let mut cache_input = None;
             let mut cache_key = None;
+            let mut compiler_cache_input = None;
+            let mut compiler_cache_key = None;
             let mut cache_lookup_status = "unavailable".to_owned();
             let mut cache_lookup_reason = "no-completed-base-scan".to_owned();
-            if !rust_compiler_precise
-                && let Some(base_scan_id) = base_scan_id.as_deref()
+            if rust_compiler_precise {
+                if let Some(base_scan_id) = base_scan_id.as_deref()
+                    && let Some(base_snapshot_id) =
+                        store.snapshot_id_for_source("scan", base_scan_id)?
+                {
+                    let base = store.load_snapshot(&base_snapshot_id)?;
+                    if let Some(profile_plan_id) = snapshot_profile_plan_id(&base)? {
+                        match prepare_compiler_precise_cache_input(
+                            &request,
+                            &base_snapshot_id,
+                            &profile_plan_id,
+                        ) {
+                            Ok(input) => {
+                                let key = compiler_precise_cache_key(&input);
+                                let lookup = store.lookup_compiler_precise_cache(&key)?;
+                                cache_lookup_status = lookup.result.outcome.clone();
+                                cache_lookup_reason = lookup.result.reason.clone();
+                                if lookup.result.outcome == "hit" {
+                                    let evidence = lookup
+                                        .payload
+                                        .as_ref()
+                                        .and_then(|payload| payload.get("evidence"))
+                                        .cloned()
+                                        .and_then(|value| {
+                                            serde_json::from_value::<
+                                                depgraph_core::CompilerPreciseCachedEvidence,
+                                            >(value)
+                                            .ok()
+                                        });
+                                    let cached_audit = lookup.audit.as_ref().and_then(|audit| {
+                                        serde_json::from_value::<BuildAudit>(audit.clone()).ok()
+                                    });
+                                    let confirmed = prepare_compiler_precise_cache_input(
+                                        &request,
+                                        &base_snapshot_id,
+                                        &profile_plan_id,
+                                    )
+                                    .map(|confirmed| compiler_precise_cache_key(&confirmed));
+                                    if confirmed.as_ref().ok() == Some(&key)
+                                        && evidence.as_ref().is_some_and(|evidence| {
+                                            validate_compiler_precise_cached_evidence(
+                                                evidence, &input, &key,
+                                            )
+                                            .is_ok()
+                                        })
+                                        && cached_audit.as_ref().is_some_and(|audit| {
+                                            matches!(audit.outcome, BuildOutcomeKind::Completed)
+                                                && audit.source_root_digest
+                                                    == input.source_root_digest
+                                                && audit.validated_output_digest.as_deref()
+                                                    == evidence.as_ref().map(|evidence| {
+                                                        evidence.validated_output_digest.as_str()
+                                                    })
+                                        })
+                                    {
+                                        let audit = compiler_precise_cache_hit_audit(
+                                            cached_audit.as_ref().context(
+                                                "validated compiler cache audit is missing",
+                                            )?,
+                                        );
+                                        let audit_value = serde_json::to_value(&audit)?;
+                                        let published = store
+                                            .promote_validated_compiler_precise_cache_hit_with_precommit(
+                                                &lookup,
+                                                base_scan_id,
+                                                &audit_value,
+                                                || {
+                                                    validate_compiler_precise_cache_input(
+                                                        &input,
+                                                        &request,
+                                                        &profile_plan_id,
+                                                    )
+                                                },
+                                            )
+                                            .is_ok();
+                                        if published {
+                                            let evidence = evidence.context(
+                                                "validated compiler cache evidence is missing",
+                                            )?;
+                                            println!(
+                                                "Rust compiler invocations: {}",
+                                                evidence.invocation_ledger.entries.len()
+                                            );
+                                            println!(
+                                                "Rust compiler invocation ledger digest: {}",
+                                                evidence.invocation_ledger.digest
+                                            );
+                                            let body_count = evidence
+                                                .mir_ledger
+                                                .entries
+                                                .iter()
+                                                .map(|entry| entry.bodies.len())
+                                                .sum::<usize>();
+                                            println!("Rust typed MIR bodies: {body_count}");
+                                            println!(
+                                                "Rust typed MIR ledger digest: {}",
+                                                evidence.mir_ledger.digest
+                                            );
+                                            println!(
+                                                "Cargo units: {}",
+                                                evidence.unit_graph.units.len()
+                                            );
+                                            println!(
+                                                "Cargo unit graph digest: {}",
+                                                evidence.unit_graph.digest
+                                            );
+                                            println!("build run: {}", audit.run_id);
+                                            println!("status: {:?}", audit.outcome);
+                                            println!("project code executed: false");
+                                            println!(
+                                                "build evidence: reused compiler-precise graph"
+                                            );
+                                            println!("build cache lookup: hit (validated)");
+                                            println!("build cache: hit");
+                                            println!(
+                                                "network isolation: {:?}",
+                                                audit.network_isolation
+                                            );
+                                            if let Some(diagnostic) = &audit.isolation_diagnostic {
+                                                eprintln!("warning: {diagnostic}");
+                                            }
+                                            println!("store: {}", store_path.display());
+                                            return Ok(0);
+                                        }
+                                    }
+                                    cache_lookup_status = "reject".to_owned();
+                                    cache_lookup_reason = "corrupt".to_owned();
+                                }
+                                compiler_cache_input = Some(input);
+                                compiler_cache_key = Some(key);
+                            }
+                            Err(_) => {
+                                cache_lookup_status = "reject".to_owned();
+                                cache_lookup_reason = "unsafe-input".to_owned();
+                            }
+                        }
+                    } else {
+                        cache_lookup_status = "reject".to_owned();
+                        cache_lookup_reason = "unsafe-input".to_owned();
+                    }
+                }
+            } else if let Some(base_scan_id) = base_scan_id.as_deref()
                 && let Some(base_snapshot_id) = store.build_cache_base_snapshot_id(base_scan_id)?
                 && let Some(input) = prepare_build_cache_input(&request, &base_snapshot_id).await?
             {
@@ -914,7 +1058,15 @@ async fn run(cli: Cli) -> Result<u8> {
                     outcome.rust_cargo_unit_graph.is_some(),
                 );
                 if build_attempt_required {
-                    store.start_build_attempt(&base_scan_id, &audit_value)?;
+                    if let Some(input) = compiler_cache_input.as_ref() {
+                        store.start_build_attempt_at_base_snapshot(
+                            &base_scan_id,
+                            &input.base_snapshot_id,
+                            &audit_value,
+                        )?;
+                    } else {
+                        store.start_build_attempt(&base_scan_id, &audit_value)?;
+                    }
                     if cache_input.is_some()
                         && matches!(cache_lookup_status.as_str(), "miss" | "reject")
                     {
@@ -923,6 +1075,18 @@ async fn run(cli: Cli) -> Result<u8> {
                             Some(&outcome.audit.run_id),
                             depgraph_store::CacheLayer::Build,
                             cache_key.as_ref().map(|key| key.key.as_str()),
+                            &cache_lookup_status,
+                            &cache_lookup_reason,
+                        )?;
+                    }
+                    if rust_compiler_precise
+                        && matches!(cache_lookup_status.as_str(), "miss" | "reject")
+                    {
+                        store.record_cache_event(
+                            None,
+                            Some(&outcome.audit.run_id),
+                            depgraph_store::CacheLayer::CompilerPrecise,
+                            compiler_cache_key.as_ref().map(|key| key.key.as_str()),
                             &cache_lookup_status,
                             &cache_lookup_reason,
                         )?;
@@ -941,7 +1105,11 @@ async fn run(cli: Cli) -> Result<u8> {
                 match outcome.audit.outcome {
                     BuildOutcomeKind::Completed => {
                         if let Some(mir) = outcome.rust_compiler_mir_ledger.as_ref() {
-                            let snapshot = store.load_snapshot(&base_scan_id)?;
+                            let snapshot = if let Some(input) = compiler_cache_input.as_ref() {
+                                store.load_snapshot(&input.base_snapshot_id)?
+                            } else {
+                                store.load_snapshot(&base_scan_id)?
+                            };
                             let ndjson = outcome
                                 .compiler_pack_attestation
                                 .as_ref()
@@ -1001,6 +1169,83 @@ async fn run(cli: Cli) -> Result<u8> {
                                 true,
                             )?;
                             evidence_status = "promoted compiler-precise graph";
+                            if let (Some(input), Some(key)) =
+                                (compiler_cache_input.as_ref(), compiler_cache_key.as_ref())
+                            {
+                                let pack = outcome.compiler_pack_attestation.as_ref().context(
+                                    "completed compiler-precise cache result has no pack",
+                                )?;
+                                let unit_graph = outcome
+                                    .rust_cargo_unit_graph
+                                    .as_ref()
+                                    .context("completed compiler cache result has no unit graph")?;
+                                let invocations =
+                                    outcome.rust_compiler_invocation_ledger.as_ref().context(
+                                        "completed compiler cache result has no invocation ledger",
+                                    )?;
+                                let validated_output_digest =
+                                    outcome.audit.validated_output_digest.as_deref().context(
+                                        "completed compiler cache result has no output digest",
+                                    )?;
+                                let cache_evidence = depgraph_core::CompilerPreciseCachedEvidence {
+                                    schema_version:
+                                        depgraph_core::COMPILER_PRECISE_CACHE_ENTRY_SCHEMA_VERSION
+                                            .to_owned(),
+                                    cache_contract_version:
+                                        depgraph_core::COMPILER_PRECISE_CACHE_CONTRACT_VERSION
+                                            .to_owned(),
+                                    effective_input_identity: key.key.clone(),
+                                    base_snapshot_id: input.base_snapshot_id.clone(),
+                                    compiler_pack_attestation: pack.clone(),
+                                    unit_graph: unit_graph.clone(),
+                                    invocation_ledger: invocations.clone(),
+                                    mir_ledger: mir.clone(),
+                                    validated_output_digest: validated_output_digest.to_owned(),
+                                };
+                                let admitted = outcome.audit.source_root_digest
+                                    == input.source_root_digest
+                                    && pack == &input.compiler_pack_attestation
+                                    && validate_compiler_precise_cached_evidence(
+                                        &cache_evidence,
+                                        input,
+                                        key,
+                                    )
+                                    .is_ok()
+                                    && validate_compiler_precise_cache_input(
+                                        input,
+                                        &request,
+                                        &input.profile_selection_plan_id,
+                                    )
+                                    .is_ok();
+                                if admitted {
+                                    match store.store_compiler_precise_cache(
+                                        key,
+                                        &outcome.audit.run_id,
+                                        &serde_json::to_value(&cache_evidence)?,
+                                    ) {
+                                        Ok(cache) if cache.outcome == "stored" => {
+                                            build_cache_status = "stored";
+                                        }
+                                        Ok(_) => build_cache_status = "not stored",
+                                        Err(error) => {
+                                            eprintln!(
+                                                "warning: compiler-precise cache was not stored: {error:#}"
+                                            );
+                                            build_cache_status = "not stored";
+                                        }
+                                    }
+                                } else {
+                                    store.record_cache_event(
+                                        None,
+                                        Some(&outcome.audit.run_id),
+                                        depgraph_store::CacheLayer::CompilerPrecise,
+                                        Some(&key.key),
+                                        "reject",
+                                        "input-changed",
+                                    )?;
+                                    build_cache_status = "not stored";
+                                }
+                            }
                         } else if outcome.rust_compiler_invocation_ledger.is_some() {
                             evidence_status = "validated compiler invocation ledger (not promoted)";
                         } else if outcome.rust_cargo_unit_graph.is_some() {
@@ -1223,10 +1468,11 @@ async fn run(cli: Cli) -> Result<u8> {
                 println!("store schema: {}", report.store_schema_version);
                 println!("cache contract: {}", report.cache_contract_version);
                 println!(
-                    "cache entries: {} syntax, {} semantic, {} build",
+                    "cache entries: {} syntax, {} semantic, {} build, {} compiler-precise",
                     report.cache_entries.syntax,
                     report.cache_entries.semantic,
-                    report.cache_entries.build
+                    report.cache_entries.build,
+                    report.cache_entries.compiler_precise,
                 );
                 print_compiler_pack_health_human(&report.compiler_pack);
                 println!(
@@ -1403,7 +1649,11 @@ async fn run(cli: Cli) -> Result<u8> {
                     println!("latest attempt: none");
                 }
                 for event in report.recent_cache_events {
-                    if event.layer == depgraph_store::CacheLayer::Build {
+                    if matches!(
+                        event.layer,
+                        depgraph_store::CacheLayer::Build
+                            | depgraph_store::CacheLayer::CompilerPrecise
+                    ) {
                         println!(
                             "recent cache {}: {} ({})",
                             event.layer.as_str(),
@@ -2590,8 +2840,11 @@ fn print_doctor_summary_human(report: &depgraph_core::DoctorSummaryReport) {
     println!("graph schema: {}", report.graph_schema_version);
     println!("store schema: {}", report.store_schema_version);
     println!(
-        "cache entries: {} syntax, {} semantic, {} build",
-        report.cache_entries.syntax, report.cache_entries.semantic, report.cache_entries.build
+        "cache entries: {} syntax, {} semantic, {} build, {} compiler-precise",
+        report.cache_entries.syntax,
+        report.cache_entries.semantic,
+        report.cache_entries.build,
+        report.cache_entries.compiler_precise,
     );
     print_compiler_pack_health_human(&report.compiler_pack);
     for (toolchain, version) in &report.toolchains {

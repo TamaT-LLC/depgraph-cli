@@ -8,11 +8,18 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::{
-    CompletedScanSnapshot, CoverageRecord, DiagnosticRecord, Store, ensure_scan_staging,
-    incremental::scan_is_semantic_noop_overlay, load_diagnostics, promote_completed_snapshot,
+    BuildAttemptRecord, BuildGraphDelta, CompletedScanSnapshot, CoverageRecord, DiagnosticRecord,
+    SnapshotSource, Store, create_completed_snapshot, ensure_scan_staging,
+    incremental::scan_is_semantic_noop_overlay, is_sha256_hex, load_diagnostics,
+    promote_completed_snapshot, required_str, validate_build_union,
+    validate_delta_attempt_metadata,
 };
 
 pub const CACHE_CONTRACT_VERSION: u32 = 2;
+pub const COMPILER_PRECISE_CACHE_MAX_ENTRIES: usize = 32;
+pub const COMPILER_PRECISE_CACHE_MAX_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
+pub const COMPILER_PRECISE_CACHE_MAX_TOTAL_BYTES: usize = 512 * 1024 * 1024;
+const COMPILER_PRECISE_CACHED_RUN_ID: &str = "compiler-precise-cache:canonical-run";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "lowercase")]
@@ -20,6 +27,8 @@ pub enum CacheLayer {
     Syntax,
     Semantic,
     Build,
+    #[serde(rename = "compiler-precise")]
+    CompilerPrecise,
 }
 
 impl CacheLayer {
@@ -28,6 +37,7 @@ impl CacheLayer {
             Self::Syntax => "syntax",
             Self::Semantic => "semantic",
             Self::Build => "build",
+            Self::CompilerPrecise => "compiler-precise",
         }
     }
 
@@ -36,6 +46,7 @@ impl CacheLayer {
             Self::Syntax => "syntax_cache",
             Self::Semantic => "semantic_cache",
             Self::Build => "build_cache",
+            Self::CompilerPrecise => "compiler_precise_cache",
         }
     }
 }
@@ -120,6 +131,7 @@ pub struct CacheEntryCounts {
     pub syntax: u64,
     pub semantic: u64,
     pub build: u64,
+    pub compiler_precise: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -135,6 +147,23 @@ pub struct BuildCacheLookup {
     pub result: CacheLookupResult,
     pub audit: Option<Value>,
     validated: Option<ValidatedBuildCacheHit>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CompilerPreciseCacheLookup {
+    pub result: CacheLookupResult,
+    pub payload: Option<Value>,
+    pub audit: Option<Value>,
+    validated: Option<ValidatedCompilerPreciseCacheHit>,
+}
+
+#[derive(Debug, Clone)]
+struct ValidatedCompilerPreciseCacheHit {
+    key: CacheKey,
+    entry: StoredCompilerPreciseCacheEntry,
+    payload: Value,
+    audit: Value,
+    data_version: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -167,6 +196,17 @@ struct StoredCacheEntry {
     payload_digest: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StoredCompilerPreciseCacheEntry {
+    contract_version: u32,
+    dimensions_json: String,
+    source_snapshot_id: String,
+    source_attempt_id: String,
+    base_snapshot_id: String,
+    payload_json: String,
+    payload_digest: String,
+}
+
 impl Store {
     pub fn database_path(&self) -> Option<std::path::PathBuf> {
         self.connection.path().map(std::path::PathBuf::from)
@@ -177,6 +217,7 @@ impl Store {
             syntax: table_count(&self.connection, CacheLayer::Syntax)?,
             semantic: table_count(&self.connection, CacheLayer::Semantic)?,
             build: table_count(&self.connection, CacheLayer::Build)?,
+            compiler_precise: table_count(&self.connection, CacheLayer::CompilerPrecise)?,
         })
     }
 
@@ -243,8 +284,9 @@ impl Store {
             bail!("cache event reason must be a bounded printable value");
         }
         match (scan_id, build_attempt_id) {
-            (Some(_), None) if layer != CacheLayer::Build => {}
-            (None, Some(_)) if layer == CacheLayer::Build => {}
+            (Some(_), None) if matches!(layer, CacheLayer::Syntax | CacheLayer::Semantic) => {}
+            (None, Some(_)) if matches!(layer, CacheLayer::Build | CacheLayer::CompilerPrecise) => {
+            }
             _ => bail!(
                 "cache event context does not match layer {}",
                 layer.as_str()
@@ -442,6 +484,359 @@ impl Store {
         validate_before_commit().context("build cache hit pre-commit validation failed")?;
         tx.commit()?;
         Ok(())
+    }
+
+    pub fn lookup_compiler_precise_cache(
+        &mut self,
+        key: &CacheKey,
+    ) -> Result<CompilerPreciseCacheLookup> {
+        key.validate()?;
+        if key.layer != CacheLayer::CompilerPrecise {
+            bail!("compiler-precise cache lookup requires its dedicated layer");
+        }
+        let Some(entry) = load_compiler_precise_cache_entry(&self.connection, &key.key)? else {
+            let reason = if table_count(&self.connection, CacheLayer::CompilerPrecise)? == 0 {
+                "not-found"
+            } else {
+                "input-changed"
+            };
+            return Ok(CompilerPreciseCacheLookup {
+                result: cache_result(key, "miss", reason, None),
+                payload: None,
+                audit: None,
+                validated: None,
+            });
+        };
+        if let Some(reason) = compiler_precise_entry_metadata_rejection(key, &entry)? {
+            return Ok(CompilerPreciseCacheLookup {
+                result: cache_result(key, "reject", &reason, None),
+                payload: None,
+                audit: None,
+                validated: None,
+            });
+        }
+        let payload: Value = match serde_json::from_str(&entry.payload_json) {
+            Ok(payload) => payload,
+            Err(_) => {
+                return Ok(CompilerPreciseCacheLookup {
+                    result: cache_result(key, "reject", "corrupt", None),
+                    payload: None,
+                    audit: None,
+                    validated: None,
+                });
+            }
+        };
+        let rejection = self.compiler_precise_cache_payload_rejection(key, &entry, &payload)?;
+        if let Some(reason) = rejection {
+            return Ok(CompilerPreciseCacheLookup {
+                result: cache_result(key, "reject", &reason, None),
+                payload: None,
+                audit: None,
+                validated: None,
+            });
+        }
+        let audit = self
+            .build_audit(&entry.source_attempt_id)?
+            .context("compiler-precise cache source audit disappeared")?
+            .audit;
+        let data_version = self
+            .connection
+            .query_row("PRAGMA data_version", [], |row| row.get(0))?;
+        Ok(CompilerPreciseCacheLookup {
+            result: cache_result(
+                key,
+                "hit",
+                "validated",
+                Some(entry.source_snapshot_id.clone()),
+            ),
+            payload: Some(payload.clone()),
+            audit: Some(audit.clone()),
+            validated: Some(ValidatedCompilerPreciseCacheHit {
+                key: key.clone(),
+                entry,
+                payload,
+                audit,
+                data_version,
+            }),
+        })
+    }
+
+    pub fn store_compiler_precise_cache(
+        &mut self,
+        key: &CacheKey,
+        source_attempt_id: &str,
+        evidence: &Value,
+    ) -> Result<CacheLookupResult> {
+        key.validate()?;
+        if key.layer != CacheLayer::CompilerPrecise {
+            bail!("compiler-precise cache store requires its dedicated layer");
+        }
+        let attempt = self
+            .build_attempt(source_attempt_id)?
+            .context("compiler-precise cache source attempt was not found")?;
+        if attempt.status != "completed"
+            || attempt.base_snapshot_id.as_deref()
+                != key.dimensions.get("base_snapshot").map(String::as_str)
+        {
+            bail!("compiler-precise cache source attempt is not a completed bound result");
+        }
+        let source_snapshot_id = self
+            .snapshot_id_for_source("build", source_attempt_id)?
+            .context("compiler-precise cache source snapshot was not found")?;
+        if !self.verify_snapshot_integrity(&source_snapshot_id)?.valid {
+            bail!("compiler-precise cache source snapshot failed integrity validation");
+        }
+        let raw_delta: String = self.connection.query_row(
+            "SELECT delta_json FROM build_attempts WHERE id=?1 AND status='completed'",
+            [source_attempt_id],
+            |row| row.get(0),
+        )?;
+        let mut delta: BuildGraphDelta = serde_json::from_str(&raw_delta)
+            .context("compiler-precise cache source delta is corrupt")?;
+        rebind_build_delta_run_id(
+            &mut delta,
+            source_attempt_id,
+            COMPILER_PRECISE_CACHED_RUN_ID,
+        )?;
+        let payload = json!({
+            "schema_version": "depgraph-rust-compiler-precise-cache-payload-v1",
+            "evidence": evidence,
+            "graph_delta": delta,
+        });
+        let payload_json = serde_json::to_string(&payload)?;
+        if payload_json.is_empty() || payload_json.len() > COMPILER_PRECISE_CACHE_MAX_PAYLOAD_BYTES
+        {
+            bail!("compiler-precise cache payload exceeds its bounded entry size");
+        }
+        let payload_digest = compiler_precise_payload_digest(&payload);
+        if let Some(existing) = load_compiler_precise_cache_entry(&self.connection, &key.key)? {
+            let existing_is_valid =
+                if compiler_precise_entry_metadata_rejection(key, &existing)?.is_none() {
+                    match serde_json::from_str(&existing.payload_json) {
+                        Ok(existing_payload) => self
+                            .compiler_precise_cache_payload_rejection(
+                                key,
+                                &existing,
+                                &existing_payload,
+                            )?
+                            .is_none(),
+                        Err(_) => false,
+                    }
+                } else {
+                    false
+                };
+            if existing_is_valid && existing.payload_digest != payload_digest {
+                self.record_cache_event(
+                    None,
+                    Some(source_attempt_id),
+                    CacheLayer::CompilerPrecise,
+                    Some(&key.key),
+                    "reject",
+                    "payload-conflict",
+                )?;
+                return Ok(cache_result(key, "reject", "payload-conflict", None));
+            }
+        }
+
+        let timestamp = now();
+        let dimensions_json = serde_json::to_string(&key.dimensions)?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        tx.execute(
+            "INSERT INTO compiler_precise_cache(
+                key, contract_version, dimensions_json, source_snapshot_id, source_attempt_id,
+                base_snapshot_id, payload_json, payload_digest, payload_bytes,
+                created_at, last_used_at, hit_count
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, 0)
+             ON CONFLICT(key) DO UPDATE SET
+                contract_version=excluded.contract_version,
+                dimensions_json=excluded.dimensions_json,
+                source_snapshot_id=excluded.source_snapshot_id,
+                source_attempt_id=excluded.source_attempt_id,
+                base_snapshot_id=excluded.base_snapshot_id,
+                payload_json=excluded.payload_json,
+                payload_digest=excluded.payload_digest,
+                payload_bytes=excluded.payload_bytes,
+                last_used_at=excluded.last_used_at",
+            params![
+                key.key,
+                key.contract_version,
+                dimensions_json,
+                source_snapshot_id,
+                source_attempt_id,
+                attempt.base_snapshot_id,
+                payload_json,
+                payload_digest,
+                i64::try_from(payload_json.len()).unwrap_or(i64::MAX),
+                timestamp,
+            ],
+        )?;
+        gc_compiler_precise_cache(&tx, &key.key)?;
+        tx.execute(
+            "INSERT INTO cache_events(
+                build_attempt_id, layer, cache_key, outcome, reason, created_at
+             ) VALUES (?1, 'compiler-precise', ?2, 'stored', 'validated', ?3)",
+            params![source_attempt_id, key.key, now()],
+        )?;
+        tx.commit()?;
+        Ok(cache_result(
+            key,
+            "stored",
+            "validated",
+            Some(source_snapshot_id),
+        ))
+    }
+
+    pub fn promote_validated_compiler_precise_cache_hit_with_precommit(
+        &mut self,
+        lookup: &CompilerPreciseCacheLookup,
+        base_scan_id: &str,
+        audit: &Value,
+        validate_before_commit: impl FnOnce() -> Result<()>,
+    ) -> Result<String> {
+        let hit = lookup
+            .validated
+            .as_ref()
+            .context("compiler-precise cache lookup is not a validated hit")?;
+        validate_cached_hit_audit(&hit.audit, audit, &hit.payload)?;
+        let run_id = required_str(audit, "run_id")?.to_owned();
+        let started_at = required_str(audit, "started_at")?.to_owned();
+        let finished_at = required_str(audit, "finished_at")?.to_owned();
+        let output_digest = required_str(audit, "validated_output_digest")?.to_owned();
+        let mut delta: BuildGraphDelta = serde_json::from_value(
+            hit.payload
+                .get("graph_delta")
+                .cloned()
+                .context("compiler-precise cache payload has no graph delta")?,
+        )?;
+        rebind_build_delta_run_id(&mut delta, COMPILER_PRECISE_CACHED_RUN_ID, &run_id)?;
+        let attempt = BuildAttemptRecord {
+            id: run_id.clone(),
+            base_scan_id: base_scan_id.to_owned(),
+            base_snapshot_id: Some(hit.entry.base_snapshot_id.clone()),
+            audit_run_id: run_id.clone(),
+            status: "staging".to_owned(),
+            observer: required_str(audit, "adapter")?.to_owned(),
+            observer_version: required_str(audit, "adapter_version")?.to_owned(),
+            profile_id: required_str(audit, "profile_id")?.to_owned(),
+            command_plan_digest: required_str(audit, "command_plan_digest")?.to_owned(),
+            toolchain_executable_digest: required_str(audit, "toolchain_executable_digest")?
+                .to_owned(),
+            environment_key_set_digest: required_str(audit, "environment_key_set_digest")?
+                .to_owned(),
+            validated_output_digest: Some(output_digest.clone()),
+            started_at: started_at.clone(),
+            completed_at: None,
+            error: None,
+        };
+        validate_delta_attempt_metadata(&delta, &attempt)?;
+        let base = self.load_completed_snapshot(&hit.entry.base_snapshot_id)?;
+        validate_build_union(&base, &delta, &attempt)?;
+        let delta_json = serde_json::to_string(&delta)?;
+
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let observed_data_version: i64 =
+            tx.query_row("PRAGMA data_version", [], |row| row.get(0))?;
+        if observed_data_version != hit.data_version {
+            bail!("compiler-precise cache store changed after validation");
+        }
+        let current_entry = load_compiler_precise_cache_entry(&tx, &hit.key.key)?
+            .context("validated compiler-precise cache entry disappeared")?;
+        if current_entry != hit.entry {
+            bail!("compiler-precise cache entry changed before promotion");
+        }
+        let current_scan_id: Option<String> = tx
+            .query_row(
+                "SELECT scan_id FROM current_successful WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let selected_safe_snapshot: Option<String> = tx
+            .query_row(
+                "SELECT snapshot_id FROM snapshot_sources
+                  WHERE source_kind='scan' AND source_attempt_id=?1",
+                [base_scan_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if current_scan_id.as_deref() != Some(base_scan_id)
+            || selected_safe_snapshot.as_deref() != Some(hit.entry.base_snapshot_id.as_str())
+        {
+            bail!("compiler-precise safe base snapshot changed before promotion");
+        }
+        let audit_json = serde_json::to_string(audit)?;
+        tx.execute(
+            "INSERT INTO build_audits(run_id, outcome, started_at, finished_at, audit_json)
+             VALUES (?1, 'completed', ?2, ?3, ?4)",
+            params![run_id, started_at, finished_at, audit_json],
+        )?;
+        tx.execute(
+            "INSERT INTO build_attempts(
+                id, base_scan_id, base_snapshot_id, audit_run_id, status, observer,
+                observer_version, profile_id, command_plan_digest, toolchain_executable_digest,
+                environment_key_set_digest, validated_output_digest, started_at,
+                completed_at, delta_json
+             ) VALUES (?1, ?2, ?3, ?1, 'completed', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![
+                run_id,
+                base_scan_id,
+                hit.entry.base_snapshot_id,
+                attempt.observer,
+                attempt.observer_version,
+                attempt.profile_id,
+                attempt.command_plan_digest,
+                attempt.toolchain_executable_digest,
+                attempt.environment_key_set_digest,
+                output_digest,
+                started_at,
+                finished_at,
+                delta_json,
+            ],
+        )?;
+        let source_revision: Option<String> = tx.query_row(
+            "SELECT source_revision FROM completed_snapshots WHERE id=?1",
+            [&hit.entry.base_snapshot_id],
+            |row| row.get(0),
+        )?;
+        let snapshot_id = create_completed_snapshot(
+            &tx,
+            SnapshotSource {
+                source_kind: "build",
+                source_attempt_id: &run_id,
+                scan_id: base_scan_id,
+                build_attempt_id: Some(&run_id),
+                runtime_import_id: None,
+                runtime_session_ids: &[],
+                parent_snapshot_id: Some(&hit.entry.base_snapshot_id),
+                source_revision: source_revision.as_deref(),
+                created_at: &finished_at,
+            },
+        )?;
+        tx.execute(
+            "INSERT INTO current_build_successful(base_scan_id, attempt_id) VALUES (?1, ?2)
+             ON CONFLICT(base_scan_id) DO UPDATE SET attempt_id=excluded.attempt_id",
+            params![base_scan_id, run_id],
+        )?;
+        promote_completed_snapshot(&tx, &snapshot_id)?;
+        tx.execute(
+            "UPDATE compiler_precise_cache
+                SET last_used_at=?2, hit_count=hit_count+1 WHERE key=?1",
+            params![hit.key.key, now()],
+        )?;
+        tx.execute(
+            "INSERT INTO cache_events(
+                build_attempt_id, layer, cache_key, outcome, reason, created_at
+             ) VALUES (?1, 'compiler-precise', ?2, 'hit', 'validated', ?3)",
+            params![run_id, hit.key.key, now()],
+        )?;
+        validate_before_commit()
+            .context("compiler-precise cache hit pre-commit validation failed")?;
+        tx.commit()?;
+        Ok(snapshot_id)
     }
 
     /// Validates a semantic scan-cache entry once and correlates its syntax
@@ -972,6 +1367,98 @@ impl Store {
         Ok(None)
     }
 
+    fn compiler_precise_cache_payload_rejection(
+        &self,
+        key: &CacheKey,
+        entry: &StoredCompilerPreciseCacheEntry,
+        payload: &Value,
+    ) -> Result<Option<String>> {
+        if compiler_precise_payload_digest(payload) != entry.payload_digest {
+            return Ok(Some("corrupt".to_owned()));
+        }
+        if payload.get("schema_version").and_then(Value::as_str)
+            != Some("depgraph-rust-compiler-precise-cache-payload-v1")
+        {
+            return Ok(Some("corrupt".to_owned()));
+        }
+        let Some(evidence) = payload.get("evidence") else {
+            return Ok(Some("corrupt".to_owned()));
+        };
+        if evidence
+            .get("effective_input_identity")
+            .and_then(Value::as_str)
+            != Some(key.key.as_str())
+            || evidence.get("base_snapshot_id").and_then(Value::as_str)
+                != Some(entry.base_snapshot_id.as_str())
+        {
+            return Ok(Some("input-changed".to_owned()));
+        }
+        let snapshot = match self.completed_snapshot(&entry.source_snapshot_id) {
+            Ok(Some(snapshot)) => snapshot,
+            Ok(None) | Err(_) => return Ok(Some("corrupt".to_owned())),
+        };
+        if snapshot.source_kind != "build"
+            || snapshot.build_attempt_id.as_deref() != Some(entry.source_attempt_id.as_str())
+            || !self
+                .verify_snapshot_integrity(&entry.source_snapshot_id)
+                .is_ok_and(|integrity| integrity.valid)
+            || !self
+                .verify_snapshot_integrity(&entry.base_snapshot_id)
+                .is_ok_and(|integrity| integrity.valid)
+        {
+            return Ok(Some("corrupt".to_owned()));
+        }
+        let attempt = match self.build_attempt(&entry.source_attempt_id) {
+            Ok(Some(attempt)) => attempt,
+            Ok(None) | Err(_) => return Ok(Some("corrupt".to_owned())),
+        };
+        if attempt.status != "completed"
+            || attempt.base_snapshot_id.as_deref() != Some(entry.base_snapshot_id.as_str())
+            || attempt.validated_output_digest.as_deref()
+                != evidence
+                    .get("validated_output_digest")
+                    .and_then(Value::as_str)
+        {
+            return Ok(Some("corrupt".to_owned()));
+        }
+        let audit = match self.build_audit(&entry.source_attempt_id) {
+            Ok(Some(audit)) => audit,
+            Ok(None) | Err(_) => return Ok(Some("corrupt".to_owned())),
+        };
+        if audit.outcome != "completed"
+            || audit
+                .audit
+                .get("validated_output_digest")
+                .and_then(Value::as_str)
+                != attempt.validated_output_digest.as_deref()
+        {
+            return Ok(Some("corrupt".to_owned()));
+        }
+        let raw_delta: String = match self.connection.query_row(
+            "SELECT delta_json FROM build_attempts WHERE id=?1 AND status='completed'",
+            [&entry.source_attempt_id],
+            |row| row.get(0),
+        ) {
+            Ok(delta) => delta,
+            Err(_) => return Ok(Some("corrupt".to_owned())),
+        };
+        let mut delta: BuildGraphDelta = match serde_json::from_str(&raw_delta) {
+            Ok(delta) => delta,
+            Err(_) => return Ok(Some("corrupt".to_owned())),
+        };
+        if rebind_build_delta_run_id(
+            &mut delta,
+            &entry.source_attempt_id,
+            COMPILER_PRECISE_CACHED_RUN_ID,
+        )
+        .is_err()
+            || serde_json::to_value(delta).ok().as_ref() != payload.get("graph_delta")
+        {
+            return Ok(Some("corrupt".to_owned()));
+        }
+        Ok(None)
+    }
+
     fn cache_entry_metadata_rejection(
         &self,
         expected: &CacheKey,
@@ -1005,7 +1492,7 @@ impl Store {
         let snapshot = self
             .completed_snapshot(snapshot_id)?
             .with_context(|| format!("cache snapshot {snapshot_id} was not found"))?;
-        let expected_source = if layer == CacheLayer::Build {
+        let expected_source = if matches!(layer, CacheLayer::Build | CacheLayer::CompilerPrecise) {
             "build"
         } else {
             "scan"
@@ -1047,8 +1534,10 @@ fn validate_context(
     build_attempt_id: Option<&str>,
 ) -> Result<()> {
     match (scan_id, build_attempt_id) {
-        (Some(_), None) if layer != CacheLayer::Build => Ok(()),
-        (None, Some(_)) if layer == CacheLayer::Build => Ok(()),
+        (Some(_), None) if matches!(layer, CacheLayer::Syntax | CacheLayer::Semantic) => Ok(()),
+        (None, Some(_)) if matches!(layer, CacheLayer::Build | CacheLayer::CompilerPrecise) => {
+            Ok(())
+        }
         _ => bail!(
             "cache operation context does not match layer {}",
             layer.as_str()
@@ -1076,6 +1565,9 @@ fn load_cache_entry(
     layer: CacheLayer,
     key: &str,
 ) -> Result<Option<StoredCacheEntry>> {
+    if layer == CacheLayer::CompilerPrecise {
+        bail!("compiler-precise entries require their dedicated payload reader");
+    }
     let table = layer.table();
     connection
         .query_row(
@@ -1095,6 +1587,157 @@ fn load_cache_entry(
         )
         .optional()
         .context("failed to read cache entry")
+}
+
+fn load_compiler_precise_cache_entry(
+    connection: &rusqlite::Connection,
+    key: &str,
+) -> Result<Option<StoredCompilerPreciseCacheEntry>> {
+    connection
+        .query_row(
+            "SELECT contract_version, dimensions_json, source_snapshot_id, source_attempt_id,
+                    base_snapshot_id, payload_json, payload_digest
+               FROM compiler_precise_cache WHERE key=?1",
+            [key],
+            |row| {
+                Ok(StoredCompilerPreciseCacheEntry {
+                    contract_version: row.get(0)?,
+                    dimensions_json: row.get(1)?,
+                    source_snapshot_id: row.get(2)?,
+                    source_attempt_id: row.get(3)?,
+                    base_snapshot_id: row.get(4)?,
+                    payload_json: row.get(5)?,
+                    payload_digest: row.get(6)?,
+                })
+            },
+        )
+        .optional()
+        .context("failed to read compiler-precise cache entry")
+}
+
+fn compiler_precise_entry_metadata_rejection(
+    expected: &CacheKey,
+    entry: &StoredCompilerPreciseCacheEntry,
+) -> Result<Option<String>> {
+    if entry.contract_version != CACHE_CONTRACT_VERSION {
+        return Ok(Some("corrupt".to_owned()));
+    }
+    let dimensions: BTreeMap<String, String> = match serde_json::from_str(&entry.dimensions_json) {
+        Ok(dimensions) => dimensions,
+        Err(_) => return Ok(Some("corrupt".to_owned())),
+    };
+    let observed = CacheKey::new(CacheLayer::CompilerPrecise, dimensions);
+    if observed.key != expected.key
+        || observed.dimensions != expected.dimensions
+        || expected.dimensions.get("base_snapshot") != Some(&entry.base_snapshot_id)
+        || entry.payload_json.is_empty()
+        || entry.payload_json.len() > COMPILER_PRECISE_CACHE_MAX_PAYLOAD_BYTES
+    {
+        return Ok(Some("corrupt".to_owned()));
+    }
+    Ok(None)
+}
+
+fn compiler_precise_payload_digest(payload: &Value) -> String {
+    stable_id_from_value("compiler-precise-cache-payload", payload)
+}
+
+fn rebind_build_delta_run_id(delta: &mut BuildGraphDelta, from: &str, to: &str) -> Result<()> {
+    let mut rebound = 0_usize;
+    for node in &mut delta.nodes {
+        let Some(provenance) = node
+            .properties
+            .get_mut("build_provenance")
+            .and_then(Value::as_object_mut)
+        else {
+            continue;
+        };
+        if provenance.get("build_run_id").and_then(Value::as_str) == Some(from) {
+            provenance.insert("build_run_id".to_owned(), Value::String(to.to_owned()));
+            rebound += 1;
+        }
+    }
+    for evidence in &mut delta.evidence {
+        let Some(properties) = evidence.properties.as_object_mut() else {
+            continue;
+        };
+        if properties.get("build_run_id").and_then(Value::as_str) == Some(from) {
+            properties.insert("build_run_id".to_owned(), Value::String(to.to_owned()));
+            rebound += 1;
+        }
+    }
+    if rebound == 0 {
+        bail!("compiler-precise cache graph delta has no bound build provenance");
+    }
+    Ok(())
+}
+
+fn validate_cached_hit_audit(cached: &Value, candidate: &Value, payload: &Value) -> Result<()> {
+    if required_str(candidate, "outcome")? != "completed"
+        || required_str(candidate, "run_id")? == required_str(cached, "run_id")?
+    {
+        bail!("compiler-precise cache hit audit is not a new completed attempt");
+    }
+    for field in [
+        "schema_version",
+        "adapter",
+        "adapter_version",
+        "profile_id",
+        "command_program",
+        "command_plan_digest",
+        "logical_cwd",
+        "source_root_digest",
+        "toolchain_executable_digest",
+        "environment_key_set_digest",
+        "network_policy",
+        "validated_output_digest",
+    ] {
+        if candidate.get(field) != cached.get(field) {
+            bail!("compiler-precise cache hit audit changed {field}");
+        }
+    }
+    let output_digest = required_str(candidate, "validated_output_digest")?;
+    if !is_sha256_hex(output_digest)
+        || payload
+            .get("evidence")
+            .and_then(|evidence| evidence.get("validated_output_digest"))
+            .and_then(Value::as_str)
+            != Some(output_digest)
+    {
+        bail!("compiler-precise cache hit output digest is invalid");
+    }
+    Ok(())
+}
+
+fn gc_compiler_precise_cache(tx: &rusqlite::Transaction<'_>, retained_key: &str) -> Result<()> {
+    loop {
+        let (count, total): (i64, i64) = tx.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(payload_bytes), 0) FROM compiler_precise_cache",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if count <= i64::try_from(COMPILER_PRECISE_CACHE_MAX_ENTRIES).unwrap_or(i64::MAX)
+            && total <= i64::try_from(COMPILER_PRECISE_CACHE_MAX_TOTAL_BYTES).unwrap_or(i64::MAX)
+        {
+            break;
+        }
+        let candidate: Option<String> = tx
+            .query_row(
+                "SELECT key FROM compiler_precise_cache
+                  WHERE key!=?1 ORDER BY last_used_at, key LIMIT 1",
+                [retained_key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(candidate) = candidate else {
+            bail!("compiler-precise cache payload exceeds the total cache bound");
+        };
+        tx.execute(
+            "DELETE FROM compiler_precise_cache WHERE key=?1",
+            [candidate],
+        )?;
+    }
+    Ok(())
 }
 
 fn table_count(connection: &rusqlite::Connection, layer: CacheLayer) -> Result<u64> {
@@ -1126,6 +1769,7 @@ fn cache_event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CacheEventR
         "syntax" => CacheLayer::Syntax,
         "semantic" => CacheLayer::Semantic,
         "build" => CacheLayer::Build,
+        "compiler-precise" => CacheLayer::CompilerPrecise,
         _ => return Err(rusqlite::Error::InvalidQuery),
     };
     Ok(CacheEventRecord {
@@ -1350,7 +1994,8 @@ mod tests {
             CacheEntryCounts {
                 syntax: 1,
                 semantic: 1,
-                build: 0
+                build: 0,
+                compiler_precise: 0,
             }
         );
     }

@@ -10,15 +10,26 @@ use std::{
 };
 
 use depgraph_store::{CacheKey, CacheLayer};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{
     build::BuildAudit,
+    compiler_invocation::{
+        RustCompilerInvocationLedger, validate_compiler_invocation_ledger_identity,
+    },
+    compiler_mir::{RustCompilerMirLedger, validate_compiler_mir_ledger_identity},
+    compiler_pack::{COMPILER_PRECISE_CONTRACT_VERSION, CompilerPackAttestation},
+    compiler_precise::RustCargoUnitGraph,
     config::Config,
     repository_inventory::build_repository_file_inventory,
     worker::{AdapterKind, WorkerSpec, resolve_safe_executable, sanitized_path},
 };
+
+pub const COMPILER_PRECISE_CACHE_CONTRACT_VERSION: &str =
+    "rust-compiler-precise-validated-cache-v1";
+pub const COMPILER_PRECISE_CACHE_ENTRY_SCHEMA_VERSION: &str =
+    "depgraph-rust-compiler-precise-cache-entry-v1";
 
 const CACHE_MAX_FILES: usize = 100_000;
 const CACHE_MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
@@ -207,6 +218,39 @@ pub struct BuildCacheInput {
     pub toolchain_version: String,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct CompilerPreciseCacheInput {
+    pub base_snapshot_id: String,
+    pub profile_selection_plan_id: String,
+    pub repository_content_digest: String,
+    pub source_root_digest: String,
+    pub manifest_lock_config_digest: String,
+    pub staging_metadata_digest: String,
+    pub cargo_dependency_cache_digest: String,
+    pub compiler_pack_attestation: CompilerPackAttestation,
+    pub rustc_commit: String,
+    pub command_plan_input_digest: String,
+    pub host_tool_identity_digest: String,
+    pub approved_environment_digest: String,
+    pub engine_digest: String,
+    pub target: String,
+    pub contract_identity_digest: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CompilerPreciseCachedEvidence {
+    pub schema_version: String,
+    pub cache_contract_version: String,
+    pub effective_input_identity: String,
+    pub base_snapshot_id: String,
+    pub compiler_pack_attestation: CompilerPackAttestation,
+    pub unit_graph: RustCargoUnitGraph,
+    pub invocation_ledger: RustCompilerInvocationLedger,
+    pub mir_ledger: RustCompilerMirLedger,
+    pub validated_output_digest: String,
+}
+
 pub fn build_cache_key(input: &BuildCacheInput) -> CacheKey {
     CacheKey::new(
         CacheLayer::Build,
@@ -251,6 +295,121 @@ pub fn build_cache_key(input: &BuildCacheInput) -> CacheKey {
             ),
         ]),
     )
+}
+
+pub fn compiler_precise_cache_key(input: &CompilerPreciseCacheInput) -> CacheKey {
+    CacheKey::new(
+        CacheLayer::CompilerPrecise,
+        BTreeMap::from([
+            (
+                "approved_environment".to_owned(),
+                input.approved_environment_digest.clone(),
+            ),
+            ("base_snapshot".to_owned(), input.base_snapshot_id.clone()),
+            (
+                "cargo_dependency_cache".to_owned(),
+                input.cargo_dependency_cache_digest.clone(),
+            ),
+            (
+                "cargo_executable".to_owned(),
+                input.compiler_pack_attestation.cargo_sha256.clone(),
+            ),
+            (
+                "command_plan".to_owned(),
+                input.command_plan_input_digest.clone(),
+            ),
+            (
+                "compiler_pack_closed_tree".to_owned(),
+                input.compiler_pack_attestation.closed_tree_sha256.clone(),
+            ),
+            (
+                "compiler_pack_manifest".to_owned(),
+                input.compiler_pack_attestation.manifest_sha256.clone(),
+            ),
+            (
+                "contract_identity".to_owned(),
+                input.contract_identity_digest.clone(),
+            ),
+            ("engine".to_owned(), input.engine_digest.clone()),
+            (
+                "host".to_owned(),
+                input.compiler_pack_attestation.host.clone(),
+            ),
+            (
+                "host_tools".to_owned(),
+                input.host_tool_identity_digest.clone(),
+            ),
+            (
+                "manifest_lock_config".to_owned(),
+                input.manifest_lock_config_digest.clone(),
+            ),
+            (
+                "profile_plan".to_owned(),
+                input.profile_selection_plan_id.clone(),
+            ),
+            (
+                "query".to_owned(),
+                input.compiler_pack_attestation.query_sha256.clone(),
+            ),
+            (
+                "repository_content".to_owned(),
+                input.repository_content_digest.clone(),
+            ),
+            (
+                "rustc".to_owned(),
+                input.compiler_pack_attestation.rustc_sha256.clone(),
+            ),
+            ("rustc_commit".to_owned(), input.rustc_commit.clone()),
+            (
+                "source_closure".to_owned(),
+                input.source_root_digest.clone(),
+            ),
+            (
+                "staging_metadata".to_owned(),
+                input.staging_metadata_digest.clone(),
+            ),
+            ("target".to_owned(), input.target.clone()),
+            (
+                "wrapper".to_owned(),
+                input.compiler_pack_attestation.wrapper_sha256.clone(),
+            ),
+        ]),
+    )
+}
+
+pub fn validate_compiler_precise_cached_evidence(
+    evidence: &CompilerPreciseCachedEvidence,
+    input: &CompilerPreciseCacheInput,
+    key: &CacheKey,
+) -> anyhow::Result<()> {
+    if evidence.schema_version != COMPILER_PRECISE_CACHE_ENTRY_SCHEMA_VERSION
+        || evidence.cache_contract_version != COMPILER_PRECISE_CACHE_CONTRACT_VERSION
+        || evidence.effective_input_identity != key.key
+        || evidence.base_snapshot_id != input.base_snapshot_id
+        || evidence.compiler_pack_attestation != input.compiler_pack_attestation
+        || evidence.compiler_pack_attestation.contract_version != COMPILER_PRECISE_CONTRACT_VERSION
+        || !is_lower_sha256(&evidence.validated_output_digest)
+    {
+        anyhow::bail!("compiler-precise cache entry identity is invalid");
+    }
+    validate_compiler_invocation_ledger_identity(
+        &evidence.invocation_ledger,
+        &evidence.unit_graph,
+    )?;
+    validate_compiler_mir_ledger_identity(
+        &evidence.mir_ledger,
+        &evidence.unit_graph,
+        &evidence.invocation_ledger,
+        &evidence.compiler_pack_attestation,
+    )?;
+    Ok(())
+}
+
+fn is_lower_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 pub fn validate_build_cache_input(input: &BuildCacheInput, audit: &BuildAudit) -> bool {
@@ -1109,6 +1268,36 @@ mod tests {
         }
     }
 
+    fn compiler_cache_input() -> CompilerPreciseCacheInput {
+        CompilerPreciseCacheInput {
+            base_snapshot_id: "snapshot:safe".to_owned(),
+            profile_selection_plan_id: "profile-plan:sha256:plan".to_owned(),
+            repository_content_digest: "sha256:repository".to_owned(),
+            source_root_digest: "sha256:source-closure".to_owned(),
+            manifest_lock_config_digest: "sha256:controls".to_owned(),
+            staging_metadata_digest: "sha256:metadata".to_owned(),
+            cargo_dependency_cache_digest: "sha256:cargo-cache".to_owned(),
+            compiler_pack_attestation: CompilerPackAttestation {
+                contract_version: COMPILER_PRECISE_CONTRACT_VERSION.to_owned(),
+                host: "aarch64-apple-darwin".to_owned(),
+                target: "aarch64-apple-darwin".to_owned(),
+                manifest_sha256: "1".repeat(64),
+                closed_tree_sha256: "2".repeat(64),
+                cargo_sha256: "3".repeat(64),
+                rustc_sha256: "4".repeat(64),
+                wrapper_sha256: "5".repeat(64),
+                query_sha256: "6".repeat(64),
+            },
+            rustc_commit: "commit".to_owned(),
+            command_plan_input_digest: "sha256:command".to_owned(),
+            host_tool_identity_digest: "sha256:host-tools".to_owned(),
+            approved_environment_digest: "sha256:environment".to_owned(),
+            engine_digest: "sha256:engine".to_owned(),
+            target: "aarch64-apple-darwin".to_owned(),
+            contract_identity_digest: "sha256:contracts".to_owned(),
+        }
+    }
+
     #[test]
     fn build_cache_key_is_input_only_and_every_admission_dimension_invalidates_it() {
         let input = build_input();
@@ -1136,6 +1325,44 @@ mod tests {
             let mut changed = input.clone();
             mutate(&mut changed);
             assert_ne!(build_cache_key(&changed).key, original.key);
+        }
+    }
+
+    #[test]
+    fn compiler_precise_cache_key_is_input_only_and_separate_from_build_cache() {
+        let input = compiler_cache_input();
+        let original = compiler_precise_cache_key(&input);
+        assert_eq!(original.layer, CacheLayer::CompilerPrecise);
+        assert!(!original.dimensions.contains_key("run_id"));
+        assert!(!original.dimensions.contains_key("validated_output"));
+
+        let mutations: [fn(&mut CompilerPreciseCacheInput); 21] = [
+            |value| value.base_snapshot_id.push_str("-changed"),
+            |value| value.profile_selection_plan_id.push_str("-changed"),
+            |value| value.repository_content_digest.push_str("-changed"),
+            |value| value.source_root_digest.push_str("-changed"),
+            |value| value.manifest_lock_config_digest.push_str("-changed"),
+            |value| value.staging_metadata_digest.push_str("-changed"),
+            |value| value.cargo_dependency_cache_digest.push_str("-changed"),
+            |value| value.compiler_pack_attestation.manifest_sha256.push('a'),
+            |value| value.compiler_pack_attestation.closed_tree_sha256.push('a'),
+            |value| value.compiler_pack_attestation.host.push_str("-changed"),
+            |value| value.compiler_pack_attestation.cargo_sha256.push('a'),
+            |value| value.compiler_pack_attestation.rustc_sha256.push('a'),
+            |value| value.compiler_pack_attestation.wrapper_sha256.push('a'),
+            |value| value.compiler_pack_attestation.query_sha256.push('a'),
+            |value| value.rustc_commit.push_str("-changed"),
+            |value| value.command_plan_input_digest.push_str("-changed"),
+            |value| value.host_tool_identity_digest.push_str("-changed"),
+            |value| value.approved_environment_digest.push_str("-changed"),
+            |value| value.engine_digest.push_str("-changed"),
+            |value| value.target.push_str("-changed"),
+            |value| value.contract_identity_digest.push_str("-changed"),
+        ];
+        for mutate in mutations {
+            let mut changed = input.clone();
+            mutate(&mut changed);
+            assert_ne!(compiler_precise_cache_key(&changed).key, original.key);
         }
     }
 

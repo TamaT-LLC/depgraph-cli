@@ -21,8 +21,10 @@ mod profile_matrix;
 mod runtime;
 
 pub use cache::{
-    BuildCacheLookup, CACHE_CONTRACT_VERSION, CacheEntryCounts, CacheEventRecord, CacheKey,
-    CacheLayer, CacheLookupResult, ValidatedScanCacheHit,
+    BuildCacheLookup, CACHE_CONTRACT_VERSION, COMPILER_PRECISE_CACHE_MAX_ENTRIES,
+    COMPILER_PRECISE_CACHE_MAX_PAYLOAD_BYTES, COMPILER_PRECISE_CACHE_MAX_TOTAL_BYTES,
+    CacheEntryCounts, CacheEventRecord, CacheKey, CacheLayer, CacheLookupResult,
+    CompilerPreciseCacheLookup, ValidatedScanCacheHit,
 };
 pub use diff::{
     ChangedRecord, GraphSnapshotDiff, NodeRename, NodeRenameEvidence, RecordDiff, RenameConfidence,
@@ -46,7 +48,7 @@ pub use runtime::{
     runtime_context_for_edge,
 };
 
-pub const STORE_SCHEMA_VERSION: i64 = 13;
+pub const STORE_SCHEMA_VERSION: i64 = 14;
 // Larger pages keep the representative semantic graph's multi-kilobyte rows
 // from forcing one B-tree page per row. Existing stores retain their page size.
 const STORE_PAGE_SIZE_BYTES: i64 = 16 * 1024;
@@ -1140,6 +1142,72 @@ impl Store {
             )?;
             tx.commit()?;
         }
+        if current < 14 {
+            let tx = self.connection.transaction()?;
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS compiler_precise_cache (
+                    key TEXT PRIMARY KEY,
+                    contract_version INTEGER NOT NULL,
+                    dimensions_json TEXT NOT NULL,
+                    source_snapshot_id TEXT NOT NULL
+                        REFERENCES completed_snapshots(id),
+                    source_attempt_id TEXT NOT NULL
+                        REFERENCES build_attempts(id),
+                    base_snapshot_id TEXT NOT NULL
+                        REFERENCES completed_snapshots(id),
+                    payload_json TEXT NOT NULL,
+                    payload_digest TEXT NOT NULL,
+                    payload_bytes INTEGER NOT NULL CHECK (payload_bytes > 0),
+                    created_at TEXT NOT NULL,
+                    last_used_at TEXT NOT NULL,
+                    hit_count INTEGER NOT NULL DEFAULT 0
+                 );
+                 CREATE INDEX IF NOT EXISTS compiler_precise_cache_lru
+                    ON compiler_precise_cache(last_used_at, key);
+
+                 CREATE TABLE IF NOT EXISTS cache_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    scan_id TEXT REFERENCES scans(id) ON DELETE CASCADE,
+                    build_attempt_id TEXT REFERENCES build_attempts(id) ON DELETE CASCADE,
+                    layer TEXT NOT NULL CHECK (layer IN ('syntax', 'semantic', 'build')),
+                    cache_key TEXT,
+                    outcome TEXT NOT NULL
+                        CHECK (outcome IN ('hit', 'miss', 'reject', 'stored')),
+                    reason TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    CHECK ((scan_id IS NOT NULL AND build_attempt_id IS NULL)
+                        OR (scan_id IS NULL AND build_attempt_id IS NOT NULL))
+                 );
+
+                 CREATE TABLE cache_events_v14 (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    scan_id TEXT REFERENCES scans(id) ON DELETE CASCADE,
+                    build_attempt_id TEXT REFERENCES build_attempts(id) ON DELETE CASCADE,
+                    layer TEXT NOT NULL
+                        CHECK (layer IN ('syntax', 'semantic', 'build', 'compiler-precise')),
+                    cache_key TEXT,
+                    outcome TEXT NOT NULL
+                        CHECK (outcome IN ('hit', 'miss', 'reject', 'stored')),
+                    reason TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    CHECK ((scan_id IS NOT NULL AND build_attempt_id IS NULL)
+                        OR (scan_id IS NULL AND build_attempt_id IS NOT NULL))
+                 );
+                 INSERT INTO cache_events_v14(
+                    id, scan_id, build_attempt_id, layer, cache_key, outcome, reason, created_at
+                 )
+                 SELECT id, scan_id, build_attempt_id, layer, cache_key, outcome, reason, created_at
+                   FROM cache_events;
+                 DROP TABLE cache_events;
+                 ALTER TABLE cache_events_v14 RENAME TO cache_events;
+                 CREATE INDEX cache_events_scan_created
+                    ON cache_events(scan_id, created_at, id);
+                 CREATE INDEX cache_events_build_created
+                    ON cache_events(build_attempt_id, created_at, id);
+                 PRAGMA user_version = 14;",
+            )?;
+            tx.commit()?;
+        }
         Ok(())
     }
 
@@ -1243,6 +1311,24 @@ impl Store {
     /// scan and one supervisor audit. Only completed audits may later stage a
     /// graph delta; failed audits remain queryable attempt metadata.
     pub fn start_build_attempt(&mut self, base_scan_id: &str, audit: &Value) -> Result<String> {
+        self.start_build_attempt_with_base_snapshot(base_scan_id, audit, None)
+    }
+
+    pub fn start_build_attempt_at_base_snapshot(
+        &mut self,
+        base_scan_id: &str,
+        base_snapshot_id: &str,
+        audit: &Value,
+    ) -> Result<String> {
+        self.start_build_attempt_with_base_snapshot(base_scan_id, audit, Some(base_snapshot_id))
+    }
+
+    fn start_build_attempt_with_base_snapshot(
+        &mut self,
+        base_scan_id: &str,
+        audit: &Value,
+        requested_base_snapshot_id: Option<&str>,
+    ) -> Result<String> {
         let run_id = required_str(audit, "run_id")?;
         let outcome = required_str(audit, "outcome")?;
         let output_digest = audit
@@ -1292,9 +1378,21 @@ impl Store {
         // validates against the latest completed snapshot for the same safe
         // scan so it cannot silently replace an already-promoted build (or
         // runtime) layer.
-        let base_snapshot_id = self
-            .snapshot_id_for_scan_selection(base_scan_id)?
-            .with_context(|| format!("base scan {base_scan_id} has no completed snapshot"))?;
+        let base_snapshot_id = if let Some(snapshot_id) = requested_base_snapshot_id {
+            let safe_snapshot_id = self
+                .snapshot_id_for_source("scan", base_scan_id)?
+                .with_context(|| format!("base scan {base_scan_id} has no safe snapshot"))?;
+            if safe_snapshot_id != snapshot_id {
+                bail!("requested build base snapshot is not the selected safe scan snapshot");
+            }
+            if !self.verify_snapshot_integrity(snapshot_id)?.valid {
+                bail!("requested build base snapshot failed integrity validation");
+            }
+            snapshot_id.to_owned()
+        } else {
+            self.snapshot_id_for_scan_selection(base_scan_id)?
+                .with_context(|| format!("base scan {base_scan_id} has no completed snapshot"))?
+        };
         let tx = self.connection.transaction()?;
         tx.execute(
             "INSERT INTO build_attempts(
@@ -5465,6 +5563,7 @@ mod tests {
                 syntax: 1,
                 semantic: 1,
                 build: 0,
+                compiler_precise: 0,
             }
         );
         Ok(())
@@ -6934,6 +7033,163 @@ mod tests {
         let miss = store.lookup_build_cache(&stale)?;
         assert_eq!(miss.result.outcome, "miss");
         assert_eq!(miss.result.reason, "not-found");
+        Ok(())
+    }
+
+    #[test]
+    fn compiler_precise_cache_promotes_a_new_attempt_atomically_and_rejects_tampering() -> Result<()>
+    {
+        let mut store = Store::open_in_memory()?;
+        ingest_protocol_fixture(
+            &mut store,
+            include_str!("../../depgraph-protocol/tests/fixtures/protocol-v1.golden.ndjson"),
+        )?;
+        let base_snapshot_id = store.current_snapshot_id()?.context("safe snapshot")?;
+        let effective_input_id =
+            canonical_effective_input_id(&store.load_snapshot("scan-golden")?.profiles[0]);
+        let mut cold_audit = build_attempt_audit("compiler-cold");
+        cold_audit["command_program"] = json!("cargo");
+        cold_audit["logical_cwd"] = json!(".");
+        cold_audit["source_root_digest"] = json!("e".repeat(64));
+        cold_audit["network_policy"] = json!("deny");
+        store.save_build_audit(&cold_audit)?;
+        store.start_build_attempt_at_base_snapshot(
+            "scan-golden",
+            &base_snapshot_id,
+            &cold_audit,
+        )?;
+        let protocol = validate_build_ndjson(Cursor::new(build_protocol(
+            "compiler-cold",
+            false,
+            "production",
+            &effective_input_id,
+        )))?;
+        store.save_build_delta("compiler-cold", &protocol)?;
+        store.finish_build_attempt("compiler-cold", "completed", None, true)?;
+        let cold_snapshot_id = store.current_snapshot_id()?.context("cold snapshot")?;
+        let key = CacheKey::new(
+            CacheLayer::CompilerPrecise,
+            BTreeMap::from([
+                ("base_snapshot".to_owned(), base_snapshot_id.clone()),
+                ("source".to_owned(), "sha256:compiler-input".to_owned()),
+            ]),
+        );
+        let evidence = json!({
+            "effective_input_identity":key.key,
+            "base_snapshot_id":base_snapshot_id,
+            "validated_output_digest":"d".repeat(64),
+        });
+        assert_eq!(
+            store
+                .store_compiler_precise_cache(&key, "compiler-cold", &evidence)?
+                .outcome,
+            "stored"
+        );
+        let hit = store.lookup_compiler_precise_cache(&key)?;
+        assert_eq!(hit.result.outcome, "hit");
+
+        let mut warm_audit = cold_audit.clone();
+        warm_audit["run_id"] = json!("compiler-warm");
+        warm_audit["started_at"] = json!("2026-07-22T00:00:02.000Z");
+        warm_audit["finished_at"] = json!("2026-07-22T00:00:02.000Z");
+        assert!(
+            store
+                .promote_validated_compiler_precise_cache_hit_with_precommit(
+                    &hit,
+                    "scan-golden",
+                    &warm_audit,
+                    || anyhow::bail!("input changed"),
+                )
+                .is_err()
+        );
+        assert_eq!(
+            store.current_snapshot_id()?.as_deref(),
+            Some(cold_snapshot_id.as_str())
+        );
+        assert!(store.build_attempt("compiler-warm")?.is_none());
+
+        let warm_snapshot_id = store.promote_validated_compiler_precise_cache_hit_with_precommit(
+            &hit,
+            "scan-golden",
+            &warm_audit,
+            || Ok(()),
+        )?;
+        assert_ne!(warm_snapshot_id, cold_snapshot_id);
+        assert_eq!(
+            store.current_build_attempt_id("scan-golden")?.as_deref(),
+            Some("compiler-warm")
+        );
+        assert!(
+            store
+                .recent_cache_events(20)?
+                .iter()
+                .any(|event| event.layer == CacheLayer::CompilerPrecise
+                    && event.outcome == "hit"
+                    && event.reason == "validated")
+        );
+
+        store.connection.execute(
+            "UPDATE compiler_precise_cache SET payload_digest='tampered' WHERE key=?1",
+            [&key.key],
+        )?;
+        let rejected = store.lookup_compiler_precise_cache(&key)?;
+        assert_eq!(rejected.result.outcome, "reject");
+        assert_eq!(rejected.result.reason, "corrupt");
+        assert_eq!(
+            store
+                .store_compiler_precise_cache(&key, "compiler-cold", &evidence)?
+                .outcome,
+            "stored"
+        );
+        assert_eq!(
+            store.lookup_compiler_precise_cache(&key)?.result.outcome,
+            "hit"
+        );
+        store.connection.execute(
+            "UPDATE compiler_precise_cache SET payload_json='{' WHERE key=?1",
+            [&key.key],
+        )?;
+        let malformed = store.lookup_compiler_precise_cache(&key)?;
+        assert_eq!(malformed.result.outcome, "reject");
+        assert_eq!(malformed.result.reason, "corrupt");
+        assert_eq!(
+            store
+                .store_compiler_precise_cache(&key, "compiler-cold", &evidence)?
+                .outcome,
+            "stored"
+        );
+        assert_eq!(
+            store.lookup_compiler_precise_cache(&key)?.result.outcome,
+            "hit"
+        );
+
+        for ordinal in 0..=COMPILER_PRECISE_CACHE_MAX_ENTRIES {
+            let bounded = CacheKey::new(
+                CacheLayer::CompilerPrecise,
+                BTreeMap::from([
+                    ("base_snapshot".to_owned(), base_snapshot_id.clone()),
+                    (
+                        "source".to_owned(),
+                        format!("sha256:compiler-input-{ordinal:02}"),
+                    ),
+                ]),
+            );
+            store.store_compiler_precise_cache(
+                &bounded,
+                "compiler-cold",
+                &json!({
+                    "effective_input_identity":bounded.key,
+                    "base_snapshot_id":base_snapshot_id,
+                    "validated_output_digest":"d".repeat(64),
+                }),
+            )?;
+        }
+        assert_eq!(
+            store.cache_entry_counts()?.compiler_precise,
+            COMPILER_PRECISE_CACHE_MAX_ENTRIES as u64
+        );
+        assert!(store.verify_snapshot_integrity(&cold_snapshot_id)?.valid);
+        assert!(store.verify_snapshot_integrity(&warm_snapshot_id)?.valid);
         Ok(())
     }
 

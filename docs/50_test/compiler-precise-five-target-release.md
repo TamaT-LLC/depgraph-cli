@@ -35,6 +35,12 @@ cross-target semantic fixtureはtyped MIR body、generic instance、direct call�
 packaged build-script fixtureは`OUT_DIR`に生成したRustソースをライブラリから利用し、`custom-build`のcompile/run両Cargo unit、atomic promotion、doctor、deps、why、JSON exportを検証する。
 空の`build.rs`だけを持つ最小fixtureも別storeで実行し、compiler-precise resolveが成功することを確認する。
 
+各native targetの代表fixtureは同じstore・同じ入力でresolveを2回実行する。
+Cold runは`project code executed: true`、`build cache lookup: miss (not-found)`、`build cache: stored`を返す。
+Warm runは3つのconsent flagを再度要求し、`project code executed: false`、`build cache lookup: hit (validated)`、`build cache: hit`を返す。
+Cold／warmのJSON exportは`build_run_id`、attempt ID、時刻など実行固有provenanceを除いて同一でなければならない。
+`OUT_DIR` fixtureのwarm exportでもcustom-build compile/run unit、typed MIR、compiler instance/call evidenceを維持し、doctor、deps、whyが成功しなければならない。
+
 resource gate は archive を 4 GiB 以下、closed tree を 8 GiB 以下、file を 250,000 件以下、semantic gate を 10 分以下に制限する。
 verifier は archive の圧縮サイズを展開前に検証し、展開中も path、entry type、重複、明示的な親 directory、file 数、directory 数、展開 byte 数を上限内に固定する。
 上限超過は target smoke を生成せず release を停止する。
@@ -54,6 +60,9 @@ verifier は archive の圧縮サイズを展開前に検証し、展開中も p
 別のsingle-package fixtureではbuild scriptを意図的に非zero終了させる。
 この失敗は`rust-compiler-build-script-failed`、検証済みCargo unit ID、`custom-build / run-custom-build`分類だけを返し、build scriptがstderrへ出した秘密fixture値を返してはならない。
 失敗前後のJSON exportはbyte-identicalであり、compiler invocationやCargo unitの部分graphをpromotionしてはならない。
+
+Compiler cacheのpayload、base binding、pack attestation、ledger digestの改ざんは`reject (corrupt)`となり、同じ呼び出しのcold実行が成功するまでcurrent snapshotを変更してはならない。
+Warm promotionのpre-commit検証を意図的に失敗させるrollback testは、新しいaudit、attempt、snapshot、cache hit eventが一件も残らないことを確認する。
 
 ## Aggregate gate
 

@@ -33,7 +33,8 @@ pub struct NeutralCargoConfig {
     pub rendered: String,
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct RustCargoUnitGraph {
     pub schema_version: String,
     pub digest: String,
@@ -41,7 +42,8 @@ pub struct RustCargoUnitGraph {
     pub roots: Vec<String>,
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct RustCargoUnit {
     pub unit_id: String,
     pub package_id: String,
@@ -92,7 +94,8 @@ pub enum RustCargoStrip {
     Resolved(String),
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(deny_unknown_fields)]
 pub struct RustCargoDependency {
     pub unit_id: String,
     pub extern_crate_name: String,

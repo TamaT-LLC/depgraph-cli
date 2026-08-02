@@ -882,6 +882,14 @@ fn run_semantic_fixture(
         &requirement_path,
         &temp.path().join("checkout-a-export.json"),
     )?;
+    verify_compiler_precise_warm_cache(
+        &cli,
+        &checkout_a,
+        &temp.path().join("checkout-a.db"),
+        &requirement_path,
+        &first.1,
+        &temp.path().join("checkout-a-warm-export.json"),
+    )?;
     let second = run_compiler_precise_checkout(
         &cli,
         &checkout_b,
@@ -1027,7 +1035,16 @@ pub fn generated_fixture(input: u64) -> u64 {
         &temporary_root.join("out-dir-build-script-export.json"),
     )?;
     verify_build_script_units(&export)?;
-    verify_query_surfaces(cli, &store, &export)
+    let warm = verify_compiler_precise_warm_cache(
+        cli,
+        &checkout,
+        &store,
+        &requirement_path,
+        &export,
+        &temporary_root.join("out-dir-build-script-warm-export.json"),
+    )?;
+    verify_build_script_units(&warm)?;
+    verify_query_surfaces(cli, &store, &warm)
 }
 
 fn run_empty_build_script_fixture(
@@ -1127,9 +1144,54 @@ fn run_compiler_precise_checkout(
             OsStr::new("--no-cache"),
         ],
     )?;
-    run_cli(
-        cli,
-        [
+    let cold = run_compiler_precise_resolve(cli, checkout, store, requirement)?;
+    if !cold.contains("project code executed: true")
+        || !cold.contains("build cache lookup: miss (not-found)")
+        || !cold.contains("build cache: stored")
+    {
+        bail!("compiler-precise cold run did not store a validated cache entry: {cold}");
+    }
+    export_graph(cli, store, export)?;
+    let bytes = fs::read(export)?;
+    let value = serde_json::from_slice(&bytes)?;
+    Ok((bytes, value))
+}
+
+fn verify_compiler_precise_warm_cache(
+    cli: &Path,
+    checkout: &Path,
+    store: &Path,
+    requirement: &Path,
+    cold_export: &Value,
+    warm_export_path: &Path,
+) -> Result<Value> {
+    let warm = run_compiler_precise_resolve(cli, checkout, store, requirement)?;
+    if !warm.contains("project code executed: false")
+        || !warm.contains("build cache lookup: hit (validated)")
+        || !warm.contains("build cache: hit")
+    {
+        bail!("compiler-precise warm run did not reuse validated evidence: {warm}");
+    }
+    export_graph(cli, store, warm_export_path)?;
+    let warm_export: Value = serde_json::from_slice(&fs::read(warm_export_path)?)?;
+    let mut normalized_cold = cold_export.clone();
+    let mut normalized_warm = warm_export.clone();
+    remove_execution_provenance(&mut normalized_cold);
+    remove_execution_provenance(&mut normalized_warm);
+    if normalized_cold != normalized_warm {
+        bail!("compiler-precise cold and warm exports differ outside execution provenance");
+    }
+    Ok(warm_export)
+}
+
+fn run_compiler_precise_resolve(
+    cli: &Path,
+    checkout: &Path,
+    store: &Path,
+    requirement: &Path,
+) -> Result<String> {
+    let output = Command::new(cli)
+        .args([
             OsStr::new("--store"),
             store.as_os_str(),
             OsStr::new("resolve"),
@@ -1139,12 +1201,49 @@ fn run_compiler_precise_checkout(
             OsStr::new("--rust-compiler-precise"),
             OsStr::new("--compiler-pack-requirement"),
             requirement.as_os_str(),
-        ],
-    )?;
-    export_graph(cli, store, export)?;
-    let bytes = fs::read(export)?;
-    let value = serde_json::from_slice(&bytes)?;
-    Ok((bytes, value))
+        ])
+        .env("CARGO_NET_OFFLINE", "true")
+        .output()?;
+    let rendered = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    if !output.status.success() {
+        bail!(
+            "{} compiler-precise resolve failed: {rendered}",
+            cli.display()
+        );
+    }
+    Ok(rendered)
+}
+
+fn remove_execution_provenance(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            for key in [
+                "build_run_id",
+                "run_id",
+                "source_attempt_id",
+                "build_attempt_id",
+                "created_at",
+                "started_at",
+                "finished_at",
+                "duration_millis",
+            ] {
+                object.remove(key);
+            }
+            for child in object.values_mut() {
+                remove_execution_provenance(child);
+            }
+        }
+        Value::Array(values) => {
+            for child in values {
+                remove_execution_provenance(child);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn verify_build_script_units(export: &Value) -> Result<()> {

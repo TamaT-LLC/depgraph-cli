@@ -104,10 +104,11 @@ pub use build::{
     TANSTACK_ROUTER_BUILD_OBSERVER_VERSION, TANSTACK_START_BUILD_CAPABILITY,
     TANSTACK_START_BUILD_OBSERVATION_SCHEMA, TANSTACK_START_BUILD_OBSERVER,
     TANSTACK_START_BUILD_OBSERVER_VERSION, WEB_BUILD_OBSERVER_VERSION, WebBuildAdapter,
-    WebBuildObservation, create_build_execution_request,
+    WebBuildObservation, compiler_precise_cache_hit_audit, create_build_execution_request,
     create_compiler_precise_invocation_request, create_compiler_precise_unit_graph_request,
     execute_build_request, execute_build_request_with_cancellation, prepare_build_cache_input,
-    supervise_build, supervise_build_with_cancellation, validate_build_cache_source,
+    prepare_compiler_precise_cache_input, supervise_build, supervise_build_with_cancellation,
+    validate_build_cache_source, validate_compiler_precise_cache_input,
 };
 pub use build_evidence::{
     stage_build_evidence, validate_build_evidence, validate_framework_build_evidence_contract,
@@ -195,7 +196,12 @@ pub const CROSS_LANGUAGE_RELEASE_SMOKE_FIXTURE_PATH: &str =
     "fixtures/cross-language-release-smoke-v1.json";
 pub const CROSS_LANGUAGE_RELEASE_SMOKE_FIXTURE: &str =
     include_str!("../../../fixtures/cross-language-release-smoke-v1.json");
-pub use cache::{BuildCacheInput, build_cache_key, validate_build_cache_input};
+pub use cache::{
+    BuildCacheInput, COMPILER_PRECISE_CACHE_CONTRACT_VERSION,
+    COMPILER_PRECISE_CACHE_ENTRY_SCHEMA_VERSION, CompilerPreciseCacheInput,
+    CompilerPreciseCachedEvidence, build_cache_key, compiler_precise_cache_key,
+    validate_build_cache_input, validate_compiler_precise_cached_evidence,
+};
 pub use cancellation::CancellationToken;
 pub use compiler_invocation::{
     COMPILER_INVOCATION_LEDGER_SCHEMA, COMPILER_INVOCATION_LEDGER_SCHEMA_PATH,
