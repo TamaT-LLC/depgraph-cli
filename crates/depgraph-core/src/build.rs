@@ -1742,11 +1742,12 @@ fn copy_safe_msvc_environment(
         let mut value = sanitize_path_value(value, root)?;
         if key == "PATH" {
             has_linker_path = std::env::split_paths(&value).any(|path| path == linker_directory);
-            let mut paths = environment
+            let mut paths = std::env::split_paths(&value).collect::<Vec<_>>();
+            let existing_paths = environment
                 .get("PATH")
                 .map(|existing| std::env::split_paths(existing).collect::<Vec<_>>())
                 .unwrap_or_default();
-            for path in std::env::split_paths(&value) {
+            for path in existing_paths {
                 if !paths.contains(&path) {
                     paths.push(path);
                 }
