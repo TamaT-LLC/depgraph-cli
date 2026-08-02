@@ -23,8 +23,7 @@ PRまたは`main` pushでbenchmark、integration、windows-smokeが`skipped`に�
 4. `N`には先頭ゼロのない正整数を使う。
 5. PRのCIをgreenにし、Greptileの未解決指摘をゼロにしてから`main`へマージする。
 
-Release workflowはタグ名と同名のrelease noteを読む。
-ファイルがない場合やタグ名とworkspace versionが一致しない場合は、公開前に失敗する。
+Release workflowは、タグ名と同名のrelease noteが存在し、タグ名とworkspace versionが一致する場合だけ公開へ進む。
 
 ## タグ作成前のフルCI
 
