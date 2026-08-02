@@ -44,6 +44,33 @@ exposure, or GitHub workflow/release compromise are in scope. General support,
 feature requests, and dependency warnings without a depgraph impact belong in
 the routes described by [SUPPORT.md](SUPPORT.md).
 
+## Compiler-precise validated cache
+
+The opt-in Rust compiler-precise cache is a separate trust boundary from the
+normal build cache. A hit still requires all three execution consent flags
+because a miss or rejected entry may execute project build scripts or proc
+macros in the same invocation.
+
+The cache key binds the admitted repository tree and filesystem metadata,
+manifest/lock/config inputs, safe base snapshot and profile plan, exact compiler
+pack closed-tree attestation, rustc/wrapper/query/Cargo identities, validated
+host linker tools, allowed non-secret environment inputs, and every relevant
+contract version. Run IDs, timestamps, temporary paths, and secret values are
+never cache identity or payload inputs. Inputs that cannot be represented by
+this bounded contract are not cached.
+
+Warm entries are treated as untrusted persisted data. depgraph re-verifies the
+pack, key, payload digest, base and source snapshots, graph delta, Cargo unit
+conservation, invocation ledger, and typed MIR ledger before creating a new
+atomic build attempt. Corrupt or incompatible entries are never partially
+promoted. A failed pre-commit source/pack check rolls back the new audit,
+attempt, snapshot, cache event, and current pointer. Cache storage or eviction
+failure does not invalidate an already completed cold compiler-precise result.
+
+Each entry is limited to 64 MiB; the store retains at most 32 entries and 512
+MiB of compiler-precise payloads using transactional LRU eviction. Eviction
+removes cache references only and cannot delete a completed snapshot.
+
 Maintainers exercise the private report → triage → private advisory → private
 fix → verified release → coordinated disclosure handoff with the redacted
 [security disclosure dry-run harness](docs/50_test/security-disclosure-dry-run.md).

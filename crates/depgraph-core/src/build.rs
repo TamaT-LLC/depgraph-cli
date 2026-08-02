@@ -17,22 +17,29 @@ use tokio::{process::Command, time::timeout};
 use uuid::Uuid;
 use walkdir::{DirEntry, WalkDir};
 
-use crate::cache::BuildCacheInput;
+use crate::cache::{
+    BuildCacheInput, COMPILER_PRECISE_CACHE_CONTRACT_VERSION, CompilerPreciseCacheInput,
+};
 use crate::compiler_invocation::{
-    COMPILER_PRECISE_INVOCATION_ADAPTER, COMPILER_PRECISE_INVOCATION_ADAPTER_VERSION,
-    RustCompilerFailureContext, RustCompilerInvocationLedger, compiler_invocation_attempt_digest,
+    COMPILER_INVOCATION_LEDGER_SCHEMA_VERSION, COMPILER_PRECISE_INVOCATION_ADAPTER,
+    COMPILER_PRECISE_INVOCATION_ADAPTER_VERSION, RustCompilerFailureContext,
+    RustCompilerInvocationLedger, compiler_invocation_attempt_digest,
     diagnose_compiler_invocation_failure, validate_compiler_invocation_ledger,
     validate_compiler_invocation_unit_graph,
 };
-use crate::compiler_mir::{RustCompilerMirLedger, validate_compiler_mir_directory};
+use crate::compiler_mir::{
+    COMPILER_PRECISE_MIR_LEDGER_SCHEMA_VERSION, RustCompilerMirLedger,
+    validate_compiler_mir_directory,
+};
 use crate::compiler_pack::{
     CompilerPackAttestation, CompilerPackRequirement, VerifiedCompilerPack, verify_compiler_pack,
 };
 use crate::compiler_precise::{
     COMPILER_PRECISE_UNIT_GRAPH_ADAPTER, COMPILER_PRECISE_UNIT_GRAPH_ADAPTER_VERSION,
-    RustCargoUnitGraph, install_neutral_cargo_config, project_neutral_cargo_config,
-    validate_cargo_unit_graph_with_cargo_home,
+    COMPILER_PRECISE_UNIT_GRAPH_SCHEMA_VERSION, RustCargoUnitGraph, install_neutral_cargo_config,
+    project_neutral_cargo_config, validate_cargo_unit_graph_with_cargo_home,
 };
+use crate::compiler_precise_graph::COMPILER_PRECISE_GRAPH_CONTRACT_VERSION;
 use crate::rust_build_observer::{
     RUST_BUILD_OBSERVER, RUST_BUILD_OBSERVER_VERSION, RustBuildObservation,
     collect_rust_build_observation,
@@ -502,6 +509,140 @@ pub async fn prepare_build_cache_input(
         toolchain_executable_digest,
         toolchain_version,
     }))
+}
+
+pub fn prepare_compiler_precise_cache_input(
+    request: &BuildExecutionRequest,
+    base_snapshot_id: &str,
+    profile_selection_plan_id: &str,
+) -> Result<CompilerPreciseCacheInput> {
+    let plan = &request.plan;
+    plan.validate()?;
+    if plan.adapter != COMPILER_PRECISE_UNIT_GRAPH_ADAPTER || plan.compiler_unit_graph.is_some() {
+        bail!("compiler-precise cache admission requires the unit-graph execution plan");
+    }
+    let requirement = plan
+        .compiler_pack
+        .as_ref()
+        .context("compiler-precise cache admission requires an exact compiler pack")?;
+    let source_root = request
+        .source_root
+        .canonicalize()
+        .context("compiler-precise cache source root is unavailable")?;
+    if !source_root.is_dir() {
+        bail!("compiler-precise cache source root is not a directory");
+    }
+    let pack = verify_compiler_pack(requirement)
+        .context("compiler-precise cache pack verification failed")?;
+    let neutral_cargo_config = project_neutral_cargo_config(&source_root)?;
+    let (repository_content_digest, manifest_lock_config_digest, staging_metadata_digest) =
+        fingerprint_build_source(&source_root)?;
+
+    let run = BuildRunDirectories::create()?;
+    let cargo_home = run.cache.join("cargo");
+    stage_cargo_dependency_cache(&source_root, &cargo_home)?;
+    let cargo_dependency_cache_digest = digest_workspace(&cargo_home)?;
+    stage_workspace(&source_root, &run.workspace)?;
+    install_neutral_cargo_config(&run.workspace, &neutral_cargo_config)?;
+    let workspace_digest = digest_workspace(&run.workspace)?;
+    let source_root_digest = digest_json(&(
+        "depgraph-compiler-source-closure-v1",
+        workspace_digest.as_str(),
+        cargo_dependency_cache_digest.as_str(),
+    ))?;
+
+    let command_plan_input_digest = digest_json(&serde_json::json!({
+        "schema": "depgraph-compiler-precise-command-input-v1",
+        "supervisor": BUILD_SUPERVISOR_VERSION,
+        "isolation": plan.isolation.contract_name(),
+        "unit_graph": {
+            "adapter": plan.adapter,
+            "adapter_version": plan.adapter_version,
+            "program": plan.program,
+            "arguments": redact_arguments(&plan.arguments),
+            "logical_cwd": display_logical(&plan.logical_cwd),
+        },
+        "invocation": {
+            "adapter": COMPILER_PRECISE_INVOCATION_ADAPTER,
+            "adapter_version": COMPILER_PRECISE_INVOCATION_ADAPTER_VERSION,
+            "arguments": ["build", "--frozen", "--offline", "--target", &requirement.target],
+        },
+        "neutral_cargo_config_digest": neutral_cargo_config.digest,
+        "cargo_dependency_cache_digest": cargo_dependency_cache_digest,
+        "compiler_pack_manifest_sha256": pack.attestation.manifest_sha256,
+    }))?;
+    let approved_environment = ["LANG", "LC_ALL", "SystemRoot"]
+        .into_iter()
+        .filter_map(|key| std::env::var(key).ok().map(|value| (key, value)))
+        .collect::<BTreeMap<_, _>>();
+    let approved_environment_digest = digest_json(&(
+        "compiler-precise-approved-environment-v1",
+        approved_environment,
+    ))?;
+    let host_tool_identity_digest = compiler_precise_host_tool_identity(&source_root)?;
+    let engine_digest = digest_file(
+        &std::env::current_exe()
+            .context("current depgraph executable is unavailable for compiler cache identity")?,
+    )?;
+    let contract_identity_digest = digest_json(&serde_json::json!({
+        "cache": COMPILER_PRECISE_CACHE_CONTRACT_VERSION,
+        "compiler": crate::compiler_pack::COMPILER_PRECISE_CONTRACT_VERSION,
+        "graph": COMPILER_PRECISE_GRAPH_CONTRACT_VERSION,
+        "unit_graph": COMPILER_PRECISE_UNIT_GRAPH_SCHEMA_VERSION,
+        "invocation_ledger": COMPILER_INVOCATION_LEDGER_SCHEMA_VERSION,
+        "mir_ledger": COMPILER_PRECISE_MIR_LEDGER_SCHEMA_VERSION,
+        "store_schema": depgraph_store::STORE_SCHEMA_VERSION,
+        "cache_contract": depgraph_store::CACHE_CONTRACT_VERSION,
+    }))?;
+    Ok(CompilerPreciseCacheInput {
+        base_snapshot_id: base_snapshot_id.to_owned(),
+        profile_selection_plan_id: profile_selection_plan_id.to_owned(),
+        repository_content_digest,
+        source_root_digest,
+        manifest_lock_config_digest,
+        staging_metadata_digest,
+        cargo_dependency_cache_digest,
+        compiler_pack_attestation: pack.attestation,
+        rustc_commit: crate::compiler_pack::COMPILER_PACK_RUSTC_COMMIT.to_owned(),
+        command_plan_input_digest,
+        host_tool_identity_digest,
+        approved_environment_digest,
+        engine_digest,
+        target: requirement.target.clone(),
+        contract_identity_digest,
+    })
+}
+
+pub fn validate_compiler_precise_cache_input(
+    expected: &CompilerPreciseCacheInput,
+    request: &BuildExecutionRequest,
+    profile_selection_plan_id: &str,
+) -> Result<()> {
+    let observed = prepare_compiler_precise_cache_input(
+        request,
+        &expected.base_snapshot_id,
+        profile_selection_plan_id,
+    )?;
+    if &observed != expected {
+        bail!("compiler-precise cache input changed before promotion");
+    }
+    Ok(())
+}
+
+pub fn compiler_precise_cache_hit_audit(source: &BuildAudit) -> BuildAudit {
+    let timestamp = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+    let mut audit = source.clone();
+    audit.run_id = Uuid::new_v4().to_string();
+    audit.started_at = timestamp.clone();
+    audit.finished_at = timestamp;
+    audit.duration_millis = 0;
+    audit.outcome = BuildOutcomeKind::Completed;
+    audit.exit_code = None;
+    audit.stdout_truncated = false;
+    audit.stderr_truncated = false;
+    audit.diagnostic_code = None;
+    audit.compiler_failure = None;
+    audit
 }
 
 pub fn validate_build_cache_source(input: &BuildCacheInput, source_root: &Path) -> Result<()> {
@@ -1698,6 +1839,30 @@ fn trusted_host_executable(label: &str, candidates: &[&Path], root: &Path) -> Re
     bail!("compiler-precise build-script support requires a root-owned, non-writable host {label}")
 }
 
+#[cfg(unix)]
+fn compiler_precise_host_tool_identity(root: &Path) -> Result<String> {
+    let mut tools = vec![trusted_host_executable(
+        "C compiler",
+        &[Path::new("/usr/bin/cc"), Path::new("/bin/cc")],
+        root,
+    )?];
+    tools.extend(trusted_macos_sdk_tools(root)?);
+    tools.sort();
+    let identities = tools
+        .into_iter()
+        .map(|path| {
+            Ok((
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .context("trusted compiler host tool name is not UTF-8")?
+                    .to_owned(),
+                digest_file(&path)?,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    digest_json(&("compiler-precise-host-tools-v1", identities))
+}
+
 #[cfg(target_os = "macos")]
 fn trusted_macos_sdk_tools(root: &Path) -> Result<Vec<PathBuf>> {
     Ok(vec![trusted_host_executable(
@@ -1763,6 +1928,38 @@ fn copy_safe_msvc_environment(
         bail!("Visual Studio MSVC linker environment is incomplete");
     }
     Ok(())
+}
+
+#[cfg(all(windows, target_env = "msvc"))]
+fn compiler_precise_host_tool_identity(root: &Path) -> Result<String> {
+    let tool = find_msvc_tools::find_tool(std::env::consts::ARCH, "link.exe")
+        .context("Visual Studio MSVC linker is unavailable")?;
+    let linker = tool
+        .path()
+        .canonicalize()
+        .context("Visual Studio MSVC linker is unavailable")?;
+    if !linker.is_file() || linker.starts_with(root) {
+        bail!("security policy violation: MSVC linker is not a trusted host executable");
+    }
+    let environment = tool
+        .env()
+        .iter()
+        .filter_map(|(key, value)| {
+            let key = key.to_str()?;
+            matches!(key, "PATH" | "INCLUDE" | "LIB" | "LIBPATH")
+                .then(|| (key.to_owned(), value.to_string_lossy().into_owned()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    digest_json(&(
+        "compiler-precise-host-tools-v1",
+        digest_file(&linker)?,
+        environment,
+    ))
+}
+
+#[cfg(not(any(unix, all(windows, target_env = "msvc"))))]
+fn compiler_precise_host_tool_identity(_root: &Path) -> Result<String> {
+    bail!("compiler-precise validated cache has no trusted host-tool contract on this platform")
 }
 
 async fn resolve_active_rust_toolchain(root: &Path) -> Result<(PathBuf, PathBuf)> {
@@ -2757,6 +2954,53 @@ mod tests {
             },
             tamper_path,
         ))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compiler_precise_cache_admission_is_repeatable_and_source_sensitive() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let project = temp.path().join("project");
+        fs::create_dir_all(project.join("src"))?;
+        fs::create_dir(project.join("empty"))?;
+        fs::write(
+            project.join("Cargo.toml"),
+            "[package]\nname='cache-fixture'\nversion='0.1.0'\nedition='2024'\n",
+        )?;
+        fs::write(
+            project.join("Cargo.lock"),
+            "version = 4\n\n[[package]]\nname = \"cache-fixture\"\nversion = \"0.1.0\"\n",
+        )?;
+        fs::write(project.join("src/lib.rs"), "pub fn cold() {}\n")?;
+        let (requirement, _) = compiler_pack_fixture(&temp)?;
+        let request = create_compiler_precise_unit_graph_request(&project, requirement)?;
+        let first = prepare_compiler_precise_cache_input(
+            &request,
+            "snapshot:safe",
+            "profile-plan:fixture",
+        )?;
+        let repeated = prepare_compiler_precise_cache_input(
+            &request,
+            "snapshot:safe",
+            "profile-plan:fixture",
+        )?;
+        assert_eq!(first, repeated);
+
+        fs::write(project.join("src/lib.rs"), "pub fn changed() {}\n")?;
+        let changed = prepare_compiler_precise_cache_input(
+            &request,
+            "snapshot:safe",
+            "profile-plan:fixture",
+        )?;
+        assert_ne!(
+            crate::compiler_precise_cache_key(&first).key,
+            crate::compiler_precise_cache_key(&changed).key
+        );
+        assert!(
+            validate_compiler_precise_cache_input(&first, &request, "profile-plan:fixture")
+                .is_err()
+        );
+        Ok(())
     }
 
     #[cfg(unix)]

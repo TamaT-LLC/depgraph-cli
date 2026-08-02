@@ -2618,7 +2618,7 @@ fn empty_safe_scan_uses_external_store_and_reports_json() {
         .args(["--store", store.to_str().unwrap(), "doctor", "--json"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("\"store_schema_version\": 13"))
+        .stdout(predicate::str::contains("\"store_schema_version\": 14"))
         .stdout(predicate::str::contains("\"cache_contract_version\": 2"))
         .stdout(predicate::str::contains(
             "\"impact_query_cache_contract_version\": 1",

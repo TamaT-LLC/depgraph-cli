@@ -2,6 +2,11 @@
 
 この文書は、通常のRust / Web buildに対するpre-execution cache reuseの検証境界を定義する。
 
+Rust compiler-preciseは通常build cacheを共有せず、専用の
+`rust-compiler-precise-validated-cache-v1` entryと診断を使う。
+専用contractのcold／warm release matrixは
+[`compiler-precise-five-target-release.md`](compiler-precise-five-target-release.md)で定義する。
+
 ## Admission identity
 
 Cache keyはbuild開始前に計算し、次の入力を含む。

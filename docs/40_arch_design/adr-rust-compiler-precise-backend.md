@@ -247,6 +247,40 @@ The stable graph/store compatibility unit is the versioned DTO and canonical
 graph conversion, not rustc's internal Rust types. No `rustc_private` type
 crosses the child process boundary.
 
+## Validated cache contract
+
+Compiler-precise uses the dedicated
+`rust-compiler-precise-validated-cache-v1` contract and
+`compiler-precise` store layer. It does not read or write the normal `build`
+cache table. The effective input key is checkout-independent and binds the
+repository content and staging metadata, Cargo controls and dependency cache,
+safe scan snapshot, profile selection plan, target and command plan, exact
+compiler-pack attestation, rustc/Cargo/wrapper/query and trusted host-tool
+digests, allowed non-secret environment values, depgraph engine, graph/ledger
+schemas, cache contract, and store schema.
+
+The retained entry contains a canonical graph delta whose cold run ID is
+replaced by a cache sentinel, the complete Cargo unit graph, invocation ledger,
+typed MIR ledger, compiler-pack attestation, validated output digest, effective
+input identity, and safe base binding. The entry payload is independently
+digested. Unknown fields, versions, digests, graph closure, or unit conservation
+reject the entry as corrupt.
+
+A warm hit creates a new completed build audit and attempt. The canonical delta
+is rebound only to that new attempt ID, revalidated against the immutable safe
+base, and promoted in one SQLite immediate transaction. Source and pack inputs
+are recomputed at the transaction's commit boundary. Any validation or
+promotion error rolls back the audit, attempt, snapshot, cache usage event, and
+current pointer, retaining the previous completed snapshot. The CLI reports
+`project code executed: false` and `build cache lookup: hit (validated)` only
+after this transaction commits.
+
+Cold failures, timeouts, cancellation, partial ledgers, unsafe inputs, and
+security failures are never stored. A cache-write-only failure is a warning and
+does not change the already promoted compiler result. Entries are capped at 64
+MiB each, 32 entries, and 512 MiB total; transactional LRU collection never
+deletes completed snapshots.
+
 The first compatibility unit's reviewed private bridge is limited to
 `rustc_middle::ty::tls::with`,
 `TyCtxt::collect_and_partition_mono_items(())`, `CodegenUnit::items()`, and
