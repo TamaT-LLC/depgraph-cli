@@ -184,6 +184,15 @@ One attempt has the following ordered phases:
    the only `RUSTC_WRAPPER` for all admitted units, and force
    `RUSTC_WORKSPACE_WRAPPER` empty. Record every compiler invocation and match
    it one-to-one to the admitted unit graph before accepting query output.
+   Compiling a `custom-build` target may require the host linker even though
+   Cargo and rustc remain absolute compiler-pack executables. On Unix the
+   supervisor admits only a root-owned, non-writable system `cc`; macOS also
+   admits the root-owned `xcrun` SDK resolver. Windows uses the discovered MSVC
+   linker environment after path confinement. These host tool directories are
+   added only for the wrapper invocation stage. Project linker configuration,
+   inherited `DEVELOPER_DIR`/`SDKROOT`, PATH shadowing, and arbitrary linker
+   selection remain rejected, and a missing trusted host linker fails before
+   project code starts.
 4. Inside each wrapper invocation, validate the actual rustc path and verbose
    identity, then enter the pinned compiler through `rustc_public` where its
    capability is sufficient. A minimal reviewed `rustc_private` bridge may be
@@ -265,10 +274,13 @@ The following outcomes fail closed with no partial promotion:
 - proc-macro/build-script failure or incomplete terminal ledger;
 - unknown DTO field/version, invalid identity/span/edge, or coverage mismatch.
 
-Failure records only a bounded, redacted audit and reason. Raw compiler output,
-environment values, MIR debug text, and temporary absolute paths are not
-persisted. The last completed snapshot and any previous completed build layer
-remain unchanged. A retry starts with a new empty target/output directory.
+Failure records only a bounded, redacted audit and reason. For compiler-query
+and build-script failures, the audit may additionally retain the validated
+Cargo unit ID plus closed classifications for unit kind, mode, and host/target
+platform. Raw package text, compiler/build-script output, environment values,
+MIR debug text, and temporary absolute paths are not persisted. The last
+completed snapshot and any previous completed build layer remain unchanged. A
+retry starts with a new empty target/output directory.
 
 There is no automatic retry with another toolchain or compiler API. Product
 rollback restores the compiler pack, wrapper, schema, compatibility table, and

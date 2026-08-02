@@ -202,8 +202,9 @@ pub use compiler_invocation::{
     COMPILER_INVOCATION_LEDGER_SCHEMA_VERSION, COMPILER_INVOCATION_RECORD_SCHEMA,
     COMPILER_INVOCATION_RECORD_SCHEMA_PATH, COMPILER_INVOCATION_RECORD_SCHEMA_VERSION,
     COMPILER_PRECISE_INVOCATION_ADAPTER, COMPILER_PRECISE_INVOCATION_ADAPTER_VERSION,
-    RustCompilerInvocation, RustCompilerInvocationLedger, compiler_invocation_attempt_digest,
-    compiler_invocation_entry_digest, compiler_invocation_ledger_digest,
+    RustCompilerFailureContext, RustCompilerInvocation, RustCompilerInvocationLedger,
+    compiler_invocation_attempt_digest, compiler_invocation_entry_digest,
+    compiler_invocation_ledger_digest, diagnose_compiler_invocation_failure,
     validate_compiler_invocation_ledger, validate_compiler_invocation_ledger_identity,
     validate_compiler_invocation_unit_graph,
 };

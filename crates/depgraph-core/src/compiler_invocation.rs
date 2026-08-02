@@ -43,6 +43,16 @@ pub struct RustCompilerInvocationLedger {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+pub struct RustCompilerFailureContext {
+    pub reason_code: String,
+    pub unit_id: String,
+    pub unit_kind: String,
+    pub mode: String,
+    pub cargo_platform: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct RustCompilerInvocation {
     pub unit_id: String,
     pub invocation_id: String,
@@ -98,6 +108,9 @@ struct TerminalRecord {
     status: String,
     exit_code: Option<i32>,
 }
+
+type InvocationStartRecords = BTreeMap<String, (StartRecord, Vec<u8>)>;
+type InvocationTerminalRecords = BTreeMap<String, TerminalRecord>;
 
 #[derive(Serialize)]
 struct LedgerIdentity<'a> {
@@ -355,73 +368,12 @@ pub fn validate_compiler_invocation_ledger(
     {
         bail!("staged compiler Cargo home is invalid or overlaps the workspace");
     }
-    let ledger_metadata = fs::symlink_metadata(ledger_directory)
-        .context("compiler invocation ledger directory is unavailable")?;
-    if ledger_metadata.file_type().is_symlink() || !ledger_metadata.is_dir() {
-        bail!("compiler invocation ledger is not a regular directory");
-    }
-    let ledger_directory = ledger_directory
-        .canonicalize()
-        .context("compiler invocation ledger directory is unavailable")?;
-
-    let mut starts = BTreeMap::<String, (StartRecord, Vec<u8>)>::new();
-    let mut terminals = BTreeMap::<String, TerminalRecord>::new();
-    let mut file_count = 0_usize;
-    let mut byte_count = 0_u64;
-    for entry in fs::read_dir(&ledger_directory)? {
-        let entry = entry?;
-        file_count = file_count
-            .checked_add(1)
-            .context("compiler invocation ledger file count overflowed")?;
-        if file_count > MAX_LEDGER_FILES {
-            bail!("compiler invocation ledger exceeds its file count limit");
-        }
-        let metadata = fs::symlink_metadata(entry.path())?;
-        if metadata.file_type().is_symlink()
-            || !metadata.is_file()
-            || metadata.len() == 0
-            || metadata.len() > MAX_LEDGER_FILE_BYTES
-        {
-            bail!("compiler invocation ledger contains a non-regular or oversized record");
-        }
-        byte_count = byte_count
-            .checked_add(metadata.len())
-            .context("compiler invocation ledger byte count overflowed")?;
-        if byte_count > MAX_LEDGER_BYTES {
-            bail!("compiler invocation ledger exceeds its byte limit");
-        }
-        let name = entry
-            .file_name()
-            .into_string()
-            .map_err(|_| anyhow::anyhow!("compiler invocation record name is not UTF-8"))?;
-        let bytes = fs::read(entry.path())?;
-        if let Some(invocation_id) = record_file_id(&name, "start-") {
-            let record: StartRecord = serde_json::from_slice(&bytes)
-                .context("compiler invocation start record is invalid")?;
-            validate_start_record(
-                &record,
-                invocation_id,
-                attempt_digest,
-                rustc_sha256,
-                rustc_verbose_sha256,
-            )?;
-            if starts
-                .insert(invocation_id.to_owned(), (record, bytes))
-                .is_some()
-            {
-                bail!("compiler invocation ledger contains duplicate start records");
-            }
-        } else if let Some(invocation_id) = record_file_id(&name, "terminal-") {
-            let record: TerminalRecord = serde_json::from_slice(&bytes)
-                .context("compiler invocation terminal record is invalid")?;
-            validate_terminal_record(&record, invocation_id, attempt_digest)?;
-            if terminals.insert(invocation_id.to_owned(), record).is_some() {
-                bail!("compiler invocation ledger contains duplicate terminal records");
-            }
-        } else {
-            bail!("compiler invocation ledger contains an unknown record");
-        }
-    }
+    let (starts, mut terminals) = read_invocation_records(
+        ledger_directory,
+        attempt_digest,
+        rustc_sha256,
+        rustc_verbose_sha256,
+    )?;
 
     let admitted = graph
         .units
@@ -490,6 +442,223 @@ pub fn validate_compiler_invocation_ledger(
         unit_graph_digest: graph.digest.clone(),
         entries,
     })
+}
+
+pub fn diagnose_compiler_invocation_failure(
+    ledger_directory: &Path,
+    workspace: &Path,
+    cargo_home: &Path,
+    graph: &RustCargoUnitGraph,
+    attempt_digest: &str,
+    rustc_sha256: &str,
+    rustc_verbose_sha256: &str,
+) -> Result<Option<RustCompilerFailureContext>> {
+    validate_digest(attempt_digest)?;
+    validate_digest(rustc_sha256)?;
+    validate_digest(rustc_verbose_sha256)?;
+    validate_compiler_invocation_unit_graph(graph)?;
+    let workspace = workspace
+        .canonicalize()
+        .context("staged compiler workspace is unavailable")?;
+    let cargo_home = cargo_home
+        .canonicalize()
+        .context("staged compiler Cargo home is unavailable")?;
+    if !workspace.is_dir()
+        || !cargo_home.is_dir()
+        || cargo_home.starts_with(&workspace)
+        || workspace.starts_with(&cargo_home)
+    {
+        bail!("staged compiler source roots are invalid or overlap");
+    }
+    let (starts, terminals) = read_invocation_records(
+        ledger_directory,
+        attempt_digest,
+        rustc_sha256,
+        rustc_verbose_sha256,
+    )?;
+    if terminals.keys().any(|id| !starts.contains_key(id)) {
+        bail!("compiler invocation terminal record has no matching start record");
+    }
+    let admitted = graph
+        .units
+        .iter()
+        .filter(|unit| unit.mode != "run-custom-build")
+        .map(|unit| (unit.unit_id.as_str(), unit))
+        .collect::<BTreeMap<_, _>>();
+    let mut started_units = BTreeSet::new();
+    let mut completed_units = BTreeSet::new();
+    let mut exact_failures = Vec::new();
+    for (invocation_id, (start, start_bytes)) in &starts {
+        let unit = admitted
+            .get(start.unit_id.as_str())
+            .context("compiler invocation failure references an unadmitted Cargo unit")?;
+        if !started_units.insert(start.unit_id.as_str()) {
+            bail!("compiler invocation failure contains a duplicate Cargo unit");
+        }
+        validate_invocation_against_unit(start, unit, &workspace, &cargo_home)?;
+        match terminals.get(invocation_id) {
+            Some(terminal)
+                if terminal.start_record_sha256 == digest_bytes(start_bytes)
+                    && terminal.status == "completed"
+                    && terminal.exit_code == Some(0) =>
+            {
+                completed_units.insert(start.unit_id.as_str());
+            }
+            Some(terminal)
+                if terminal.start_record_sha256 == digest_bytes(start_bytes)
+                    && terminal.status == "failed"
+                    && terminal.exit_code.is_some_and(|code| code != 0) =>
+            {
+                exact_failures.push(failure_context("rust-compiler-query-failed", unit));
+            }
+            None => {
+                exact_failures.push(failure_context("rust-compiler-invocation-incomplete", unit))
+            }
+            Some(_) => bail!("compiler invocation failure terminal record is mismatched"),
+        }
+    }
+    if exact_failures.len() == 1 {
+        return Ok(exact_failures.pop());
+    }
+    if !exact_failures.is_empty() {
+        return Ok(None);
+    }
+
+    let mut build_script_candidates = graph
+        .units
+        .iter()
+        .filter(|unit| unit.mode == "run-custom-build")
+        .filter(|unit| {
+            !unit.dependencies.is_empty()
+                && unit
+                    .dependencies
+                    .iter()
+                    .all(|dependency| completed_units.contains(dependency.unit_id.as_str()))
+        })
+        .filter(|unit| {
+            graph.units.iter().any(|dependent| {
+                dependent
+                    .dependencies
+                    .iter()
+                    .any(|dependency| dependency.unit_id == unit.unit_id)
+                    && !started_units.contains(dependent.unit_id.as_str())
+            })
+        })
+        .collect::<Vec<_>>();
+    if build_script_candidates.len() == 1 {
+        return Ok(Some(failure_context(
+            "rust-compiler-build-script-failed",
+            build_script_candidates.remove(0),
+        )));
+    }
+    Ok(None)
+}
+
+fn failure_context(reason_code: &str, unit: &RustCargoUnit) -> RustCompilerFailureContext {
+    let unit_kind = if unit.target.kind.iter().any(|kind| kind == "custom-build") {
+        "custom-build"
+    } else if unit.target.kind.iter().any(|kind| kind == "proc-macro") {
+        "proc-macro"
+    } else if unit.target.kind.iter().any(|kind| kind == "lib") {
+        "lib"
+    } else if unit.target.kind.iter().any(|kind| kind == "bin") {
+        "bin"
+    } else if unit.target.kind.iter().any(|kind| kind == "test") {
+        "test"
+    } else if unit.target.kind.iter().any(|kind| kind == "example") {
+        "example"
+    } else if unit.target.kind.iter().any(|kind| kind == "bench") {
+        "bench"
+    } else {
+        "other"
+    };
+    RustCompilerFailureContext {
+        reason_code: reason_code.to_owned(),
+        unit_id: unit.unit_id.clone(),
+        unit_kind: unit_kind.to_owned(),
+        mode: unit.mode.clone(),
+        cargo_platform: if unit.platform.is_some() {
+            "explicit-target"
+        } else {
+            "host"
+        }
+        .to_owned(),
+    }
+}
+
+fn read_invocation_records(
+    ledger_directory: &Path,
+    attempt_digest: &str,
+    rustc_sha256: &str,
+    rustc_verbose_sha256: &str,
+) -> Result<(InvocationStartRecords, InvocationTerminalRecords)> {
+    let ledger_metadata = fs::symlink_metadata(ledger_directory)
+        .context("compiler invocation ledger directory is unavailable")?;
+    if ledger_metadata.file_type().is_symlink() || !ledger_metadata.is_dir() {
+        bail!("compiler invocation ledger is not a regular directory");
+    }
+    let ledger_directory = ledger_directory
+        .canonicalize()
+        .context("compiler invocation ledger directory is unavailable")?;
+    let mut starts = BTreeMap::<String, (StartRecord, Vec<u8>)>::new();
+    let mut terminals = BTreeMap::<String, TerminalRecord>::new();
+    let mut file_count = 0_usize;
+    let mut byte_count = 0_u64;
+    for entry in fs::read_dir(&ledger_directory)? {
+        let entry = entry?;
+        file_count = file_count
+            .checked_add(1)
+            .context("compiler invocation ledger file count overflowed")?;
+        if file_count > MAX_LEDGER_FILES {
+            bail!("compiler invocation ledger exceeds its file count limit");
+        }
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || metadata.len() == 0
+            || metadata.len() > MAX_LEDGER_FILE_BYTES
+        {
+            bail!("compiler invocation ledger contains a non-regular or oversized record");
+        }
+        byte_count = byte_count
+            .checked_add(metadata.len())
+            .context("compiler invocation ledger byte count overflowed")?;
+        if byte_count > MAX_LEDGER_BYTES {
+            bail!("compiler invocation ledger exceeds its byte limit");
+        }
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("compiler invocation record name is not UTF-8"))?;
+        let bytes = fs::read(entry.path())?;
+        if let Some(invocation_id) = record_file_id(&name, "start-") {
+            let record: StartRecord = serde_json::from_slice(&bytes)
+                .context("compiler invocation start record is invalid")?;
+            validate_start_record(
+                &record,
+                invocation_id,
+                attempt_digest,
+                rustc_sha256,
+                rustc_verbose_sha256,
+            )?;
+            if starts
+                .insert(invocation_id.to_owned(), (record, bytes))
+                .is_some()
+            {
+                bail!("compiler invocation ledger contains duplicate start records");
+            }
+        } else if let Some(invocation_id) = record_file_id(&name, "terminal-") {
+            let record: TerminalRecord = serde_json::from_slice(&bytes)
+                .context("compiler invocation terminal record is invalid")?;
+            validate_terminal_record(&record, invocation_id, attempt_digest)?;
+            if terminals.insert(invocation_id.to_owned(), record).is_some() {
+                bail!("compiler invocation ledger contains duplicate terminal records");
+            }
+        } else {
+            bail!("compiler invocation ledger contains an unknown record");
+        }
+    }
+    Ok((starts, terminals))
 }
 
 fn validate_start_record(
@@ -805,8 +974,8 @@ fn digest_bytes(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use crate::compiler_precise::{
-        COMPILER_PRECISE_UNIT_GRAPH_SCHEMA_VERSION, RustCargoProfile, RustCargoStrip,
-        RustCargoTarget,
+        COMPILER_PRECISE_UNIT_GRAPH_SCHEMA_VERSION, RustCargoDependency, RustCargoProfile,
+        RustCargoStrip, RustCargoTarget,
     };
 
     fn graph() -> Result<RustCargoUnitGraph> {
@@ -881,6 +1050,160 @@ mod tests {
         assert!(secret_shaped_text("api_key=fixture-secret"));
         assert!(!secret_shaped_text("tokenizers"));
         assert!(!secret_shaped_text("repo://source@fixture/lib.rs"));
+    }
+
+    #[test]
+    fn partial_ledger_identifies_the_failing_build_script_execution_unit() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let workspace = temporary.path().join("workspace");
+        let cargo_home = temporary.path().join("cargo-home");
+        let ledger = temporary.path().join("ledger");
+        fs::create_dir(&workspace)?;
+        fs::create_dir(&cargo_home)?;
+        fs::create_dir(&ledger)?;
+        fs::create_dir(workspace.join("src"))?;
+        fs::write(workspace.join("build.rs"), "fn main() {}\n")?;
+        fs::write(workspace.join("src/lib.rs"), "pub fn fixture() {}\n")?;
+        let profile = graph()?
+            .units
+            .into_iter()
+            .next()
+            .context("fixture graph has no profile")?
+            .profile;
+        let target = RustCargoTarget {
+            kind: vec!["custom-build".to_owned()],
+            crate_types: vec!["bin".to_owned()],
+            name: "build-script-build".to_owned(),
+            src_path: "repo://build.rs".to_owned(),
+            edition: "2024".to_owned(),
+            doc: false,
+            doctest: false,
+            test: false,
+        };
+        let compile = RustCargoUnit {
+            unit_id: "cargo-unit:a".to_owned(),
+            package_id: "path+repo://.#0.1.0".to_owned(),
+            target: target.clone(),
+            profile: profile.clone(),
+            platform: None,
+            mode: "build".to_owned(),
+            features: Vec::new(),
+            is_std: false,
+            dependencies: Vec::new(),
+        };
+        let run = RustCargoUnit {
+            unit_id: "cargo-unit:b".to_owned(),
+            package_id: compile.package_id.clone(),
+            target,
+            profile: profile.clone(),
+            platform: Some("fixture-target".to_owned()),
+            mode: "run-custom-build".to_owned(),
+            features: Vec::new(),
+            is_std: false,
+            dependencies: vec![RustCargoDependency {
+                unit_id: compile.unit_id.clone(),
+                extern_crate_name: "build_script_build".to_owned(),
+                public: false,
+                noprelude: false,
+                nounused: false,
+            }],
+        };
+        let root = RustCargoUnit {
+            unit_id: "cargo-unit:c".to_owned(),
+            package_id: compile.package_id.clone(),
+            target: RustCargoTarget {
+                kind: vec!["lib".to_owned()],
+                crate_types: vec!["lib".to_owned()],
+                name: "fixture".to_owned(),
+                src_path: "repo://src/lib.rs".to_owned(),
+                edition: "2024".to_owned(),
+                doc: true,
+                doctest: true,
+                test: true,
+            },
+            profile,
+            platform: Some("fixture-target".to_owned()),
+            mode: "build".to_owned(),
+            features: Vec::new(),
+            is_std: false,
+            dependencies: vec![RustCargoDependency {
+                unit_id: run.unit_id.clone(),
+                extern_crate_name: "build_script_build".to_owned(),
+                public: false,
+                noprelude: false,
+                nounused: false,
+            }],
+        };
+        let units = vec![compile, run, root];
+        let roots = vec!["cargo-unit:c".to_owned()];
+        let graph = RustCargoUnitGraph {
+            schema_version: COMPILER_PRECISE_UNIT_GRAPH_SCHEMA_VERSION.to_owned(),
+            digest: digest_bytes(&serde_json::to_vec(&(&units, &roots))?),
+            units,
+            roots,
+        };
+        let attempt = "a".repeat(64);
+        let rustc = "b".repeat(64);
+        let verbose = "c".repeat(64);
+        let invocation_id = "d".repeat(64);
+        let canonical_argv = vec![
+            "--crate-name".to_owned(),
+            "build_script_build".to_owned(),
+            "repo://build.rs".to_owned(),
+        ];
+        let start = serde_json::json!({
+            "schema_version": COMPILER_INVOCATION_RECORD_SCHEMA_VERSION,
+            "record_kind": "start",
+            "invocation_id": invocation_id,
+            "attempt_digest": attempt,
+            "unit_id": "cargo-unit:a",
+            "crate_name": "build_script_build",
+            "crate_types": ["bin"],
+            "source_path": "repo://build.rs",
+            "source_sha256": digest_bytes(&fs::read(workspace.join("build.rs"))?),
+            "profile_digest": digest_json(&graph.units[0].profile)?,
+            "edition": "2024",
+            "target": null,
+            "mode": "build",
+            "features": [],
+            "canonical_argv": canonical_argv,
+            "argv_digest": digest_json(&canonical_argv)?,
+            "rustc_sha256": rustc,
+            "rustc_verbose_sha256": verbose,
+        });
+        let start_bytes = serde_json::to_vec(&start)?;
+        fs::write(
+            ledger.join(format!("start-{invocation_id}.json")),
+            &start_bytes,
+        )?;
+        fs::write(
+            ledger.join(format!("terminal-{invocation_id}.json")),
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": COMPILER_INVOCATION_RECORD_SCHEMA_VERSION,
+                "record_kind": "terminal",
+                "invocation_id": invocation_id,
+                "attempt_digest": attempt,
+                "start_record_sha256": digest_bytes(&start_bytes),
+                "status": "completed",
+                "exit_code": 0,
+            }))?,
+        )?;
+        let failure = diagnose_compiler_invocation_failure(
+            &ledger,
+            &workspace,
+            &cargo_home,
+            &graph,
+            &attempt,
+            &rustc,
+            &verbose,
+        )?
+        .context("failed build script has no actionable context")?;
+        assert_eq!(failure.reason_code, "rust-compiler-build-script-failed");
+        assert_eq!(failure.unit_id, "cargo-unit:b");
+        assert_eq!(failure.unit_kind, "custom-build");
+        assert_eq!(failure.mode, "run-custom-build");
+        assert_eq!(failure.cargo_platform, "explicit-target");
+        Ok(())
     }
 
     #[test]
@@ -1023,6 +1346,37 @@ mod tests {
             )?;
             Ok(())
         };
+        fs::write(
+            ledger.join(format!("terminal-{invocation_id}.json")),
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": COMPILER_INVOCATION_RECORD_SCHEMA_VERSION,
+                "record_kind": "terminal",
+                "invocation_id": invocation_id,
+                "attempt_digest": attempt,
+                "start_record_sha256": digest_bytes(&serde_json::to_vec(&start)?),
+                "status": "failed",
+                "exit_code": 87,
+            }))?,
+        )?;
+        let failure = diagnose_compiler_invocation_failure(
+            &ledger,
+            &workspace,
+            &cargo_home,
+            &graph,
+            &attempt,
+            &rustc,
+            &verbose,
+        )?
+        .context("failed compiler invocation has no actionable context")?;
+        assert_eq!(failure.reason_code, "rust-compiler-query-failed");
+        assert_eq!(failure.unit_id, "cargo-unit:fixture");
+        assert_eq!(failure.unit_kind, "lib");
+        assert_eq!(failure.mode, "build");
+        assert_eq!(failure.cargo_platform, "host");
+        assert!(
+            !serde_json::to_string(&failure)?.contains(temporary.path().to_string_lossy().as_ref())
+        );
+        write_pair(&start)?;
         for hostile_start in [
             {
                 let mut value = start.clone();

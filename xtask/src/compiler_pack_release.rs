@@ -895,6 +895,9 @@ fn run_semantic_fixture(
         bail!("compiler pack semantic graph is not stable across equivalent checkouts");
     }
     semantic.checkout_b_export_sha256 = digest_bytes(&second.0);
+    run_out_dir_build_script_fixture(&cli, requirement, temp.path())?;
+    run_empty_build_script_fixture(&cli, requirement, temp.path())?;
+    verify_failing_build_script_fixture(&cli, requirement, temp.path())?;
     let before = first.0.clone();
     let store = temp.path().join("checkout-a.db");
     let export_after = temp.path().join("rollback-export.json");
@@ -992,6 +995,121 @@ pub fn release_entry(input: u64) -> u64 {
     run(&mut commit)
 }
 
+fn run_out_dir_build_script_fixture(
+    cli: &Path,
+    requirement: &CompilerPackRequirement,
+    temporary_root: &Path,
+) -> Result<()> {
+    let checkout = temporary_root.join("out-dir-build-script");
+    seed_build_script_fixture(
+        &checkout,
+        r#"fn main() {
+    let output = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+    std::fs::write(output.join("generated.rs"), "pub const GENERATED_BIAS: u64 = 13;\n")
+        .unwrap();
+}
+"#,
+        r#"include!(concat!(env!("OUT_DIR"), "/generated.rs"));
+
+pub fn generated_fixture(input: u64) -> u64 {
+    input + GENERATED_BIAS
+}
+"#,
+    )?;
+    let requirement_path = temporary_root.join("out-dir-build-script-requirement.json");
+    write_pretty_json(&requirement_path, requirement)?;
+    let store = temporary_root.join("out-dir-build-script.db");
+    let (_, export) = run_compiler_precise_checkout(
+        cli,
+        &checkout,
+        &store,
+        &requirement_path,
+        &temporary_root.join("out-dir-build-script-export.json"),
+    )?;
+    verify_build_script_units(&export)?;
+    verify_query_surfaces(cli, &store, &export)
+}
+
+fn run_empty_build_script_fixture(
+    cli: &Path,
+    requirement: &CompilerPackRequirement,
+    temporary_root: &Path,
+) -> Result<()> {
+    let checkout = temporary_root.join("empty-build-script");
+    seed_build_script_fixture(&checkout, "fn main() {}\n", "pub fn empty_fixture() {}\n")?;
+    let requirement_path = temporary_root.join("empty-build-script-requirement.json");
+    write_pretty_json(&requirement_path, requirement)?;
+    let (_, export) = run_compiler_precise_checkout(
+        cli,
+        &checkout,
+        &temporary_root.join("empty-build-script.db"),
+        &requirement_path,
+        &temporary_root.join("empty-build-script-export.json"),
+    )?;
+    verify_build_script_units(&export)
+}
+
+fn verify_failing_build_script_fixture(
+    cli: &Path,
+    requirement: &CompilerPackRequirement,
+    temporary_root: &Path,
+) -> Result<()> {
+    let checkout = temporary_root.join("failing-build-script");
+    seed_build_script_fixture(
+        &checkout,
+        r#"fn main() {
+    eprintln!("DEPGRAPH_BUILD_SCRIPT_SECRET_MUST_NOT_ESCAPE");
+    std::process::exit(23);
+}
+"#,
+        "pub fn failing_fixture() {}\n",
+    )?;
+    let requirement_path = temporary_root.join("failing-build-script-requirement.json");
+    write_pretty_json(&requirement_path, requirement)?;
+    let store = temporary_root.join("failing-build-script.db");
+    run_cli(
+        cli,
+        [
+            OsStr::new("--store"),
+            store.as_os_str(),
+            OsStr::new("scan"),
+            checkout.as_os_str(),
+            OsStr::new("--no-cache"),
+        ],
+    )?;
+    let before_path = temporary_root.join("failing-build-script-before.json");
+    export_graph(cli, &store, &before_path)?;
+    let before = fs::read(&before_path)?;
+    let failure = failed_resolve(cli, &checkout, &store, &requirement_path)?;
+    if !failure.contains("rust-compiler-build-script-failed")
+        || !failure.contains("kind=custom-build, mode=run-custom-build")
+        || failure.contains("DEPGRAPH_BUILD_SCRIPT_SECRET_MUST_NOT_ESCAPE")
+    {
+        bail!("compiler-precise build-script failure diagnostic is not actionable and redacted");
+    }
+    let after_path = temporary_root.join("failing-build-script-after.json");
+    export_graph(cli, &store, &after_path)?;
+    if before != fs::read(after_path)? {
+        bail!("failed compiler-precise build script promoted a partial graph");
+    }
+    Ok(())
+}
+
+fn seed_build_script_fixture(root: &Path, build_script: &str, library: &str) -> Result<()> {
+    fs::create_dir_all(root.join("src"))?;
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname='compiler-build-script-fixture'\nversion='0.1.0'\nedition='2024'\nbuild='build.rs'\n",
+    )?;
+    fs::write(
+        root.join("Cargo.lock"),
+        "version = 4\n\n[[package]]\nname = \"compiler-build-script-fixture\"\nversion = \"0.1.0\"\n",
+    )?;
+    fs::write(root.join("build.rs"), build_script)?;
+    fs::write(root.join("src/lib.rs"), library)?;
+    Ok(())
+}
+
 fn run_compiler_precise_checkout(
     cli: &Path,
     checkout: &Path,
@@ -1027,6 +1145,93 @@ fn run_compiler_precise_checkout(
     let bytes = fs::read(export)?;
     let value = serde_json::from_slice(&bytes)?;
     Ok((bytes, value))
+}
+
+fn verify_build_script_units(export: &Value) -> Result<()> {
+    let nodes = export["graph"]["nodes"]
+        .as_array()
+        .context("compiler pack export graph nodes are unavailable")?;
+    let find_unit = |mode: &str| {
+        nodes.iter().find(|node| {
+            node["kind"] == "rust_compiler_unit"
+                && node["properties"]["mode"] == mode
+                && node["properties"]["cargo_target"]["kind"]
+                    .as_array()
+                    .is_some_and(|kinds| kinds.iter().any(|kind| kind == "custom-build"))
+        })
+    };
+    let compiler = find_unit("build")
+        .context("compiler pack export omits the build-script compiler Cargo unit")?;
+    find_unit("run-custom-build")
+        .context("compiler pack export omits the build-script execution Cargo unit")?;
+    let mir_digest = compiler["properties"]["mir_unit_digest"]
+        .as_str()
+        .context("build-script compiler Cargo unit omits typed MIR evidence")?;
+    if mir_digest.len() != 64 || !mir_digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("build-script compiler Cargo unit has an invalid typed MIR digest");
+    }
+    if !nodes
+        .iter()
+        .any(|node| node["kind"] == "rust_compiler_instance")
+    {
+        bail!("compiler pack export omits compiler instances for the build-script fixture");
+    }
+    let edges = export["graph"]["edges"]
+        .as_array()
+        .context("compiler pack export graph edges are unavailable")?;
+    if !edges.iter().any(|edge| edge["kind"] == "calls") {
+        bail!("compiler pack export omits compiler call evidence for the build-script fixture");
+    }
+    Ok(())
+}
+
+fn verify_query_surfaces(cli: &Path, store: &Path, export: &Value) -> Result<()> {
+    let nodes = export["graph"]["nodes"]
+        .as_array()
+        .context("compiler pack export graph nodes are unavailable")?;
+    let root = nodes
+        .iter()
+        .find(|node| node["kind"] == "rust_compiler_unit" && node["properties"]["is_root"] == true)
+        .and_then(|node| node["id"].as_str())
+        .context("compiler pack export omits a root Cargo unit")?;
+    let build_script = nodes
+        .iter()
+        .find(|node| {
+            node["kind"] == "rust_compiler_unit"
+                && node["properties"]["mode"] == "build"
+                && node["properties"]["cargo_target"]["kind"]
+                    .as_array()
+                    .is_some_and(|kinds| kinds.iter().any(|kind| kind == "custom-build"))
+        })
+        .and_then(|node| node["id"].as_str())
+        .context("compiler pack export omits the build-script compiler unit")?;
+    for arguments in [
+        vec![
+            OsStr::new("--store"),
+            store.as_os_str(),
+            OsStr::new("doctor"),
+            OsStr::new("--details"),
+        ],
+        vec![
+            OsStr::new("--store"),
+            store.as_os_str(),
+            OsStr::new("deps"),
+            OsStr::new(root),
+            OsStr::new("--json"),
+            OsStr::new("--all"),
+        ],
+        vec![
+            OsStr::new("--store"),
+            store.as_os_str(),
+            OsStr::new("why"),
+            OsStr::new(root),
+            OsStr::new(build_script),
+            OsStr::new("--json"),
+        ],
+    ] {
+        run_cli(cli, arguments)?;
+    }
+    Ok(())
 }
 
 fn failed_resolve(cli: &Path, checkout: &Path, store: &Path, requirement: &Path) -> Result<String> {

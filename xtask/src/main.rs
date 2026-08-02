@@ -5720,6 +5720,7 @@ fn cross_language_ffi_outcome(
             stderr_truncated: false,
             validated_output_digest: Some(validated_output_digest),
             diagnostic_code: None,
+            compiler_failure: None,
         },
         project_code_executed: true,
         compiler_pack_attestation: None,

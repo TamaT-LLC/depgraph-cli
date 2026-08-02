@@ -1196,6 +1196,7 @@ mod tests {
                 stderr_truncated: false,
                 validated_output_digest: Some("c".repeat(64)),
                 diagnostic_code: None,
+                compiler_failure: None,
             },
             project_code_executed,
             compiler_pack_attestation: None,
