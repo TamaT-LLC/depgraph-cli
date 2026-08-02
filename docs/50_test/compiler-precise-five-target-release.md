@@ -31,7 +31,9 @@ wrapper と query child は `depgraph-compiler-component-handshake-v1` を返し
 両 checkout で safe scan、compiler-precise resolve、JSON export を実行する。
 raw export の SHA-256 は、run ごとに変わる build run ID、ledger digest、artifact locator を含む監査証跡として個別に保持する。
 cross-checkout gate は、これらの run-scoped provenance と派生 site ID を除き、node の意味属性と source、target、kind を含む edge 関係を正規化した semantic graph の byte 一致を要求する。
-fixture は typed MIR body、generic instance、direct call、static constant を含み、`monomorphized_call_graph` と `typed_mir` の query capability を検証する。
+cross-target semantic fixtureはtyped MIR body、generic instance、direct call、static constantを含み、`monomorphized_call_graph`と`typed_mir`のquery capabilityを検証する。
+packaged build-script fixtureは`OUT_DIR`に生成したRustソースをライブラリから利用し、`custom-build`のcompile/run両Cargo unit、atomic promotion、doctor、deps、why、JSON exportを検証する。
+空の`build.rs`だけを持つ最小fixtureも別storeで実行し、compiler-precise resolveが成功することを確認する。
 
 resource gate は archive を 4 GiB 以下、closed tree を 8 GiB 以下、file を 250,000 件以下、semantic gate を 10 分以下に制限する。
 verifier は archive の圧縮サイズを展開前に検証し、展開中も path、entry type、重複、明示的な親 directory、file 数、directory 数、展開 byte 数を上限内に固定する。
@@ -48,6 +50,10 @@ verifier は archive の圧縮サイズを展開前に検証し、展開中も p
 三つの失敗は `unsupported` と no-fallback 診断を返さなければならない。
 失敗後の JSON export は成功直後の export と byte-identical でなければならない。
 別 toolchain、PATH 上の compiler、safe scan result を compiler-precise 成功として返す処理は許可しない。
+
+別のsingle-package fixtureではbuild scriptを意図的に非zero終了させる。
+この失敗は`rust-compiler-build-script-failed`、検証済みCargo unit ID、`custom-build / run-custom-build`分類だけを返し、build scriptがstderrへ出した秘密fixture値を返してはならない。
+失敗前後のJSON exportはbyte-identicalであり、compiler invocationやCargo unitの部分graphをpromotionしてはならない。
 
 ## Aggregate gate
 

@@ -1832,6 +1832,7 @@ mod tests {
             stderr_truncated: false,
             validated_output_digest: Some("e".repeat(64)),
             diagnostic_code: None,
+            compiler_failure: None,
         }
     }
 

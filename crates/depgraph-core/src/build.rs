@@ -20,8 +20,9 @@ use walkdir::{DirEntry, WalkDir};
 use crate::cache::BuildCacheInput;
 use crate::compiler_invocation::{
     COMPILER_PRECISE_INVOCATION_ADAPTER, COMPILER_PRECISE_INVOCATION_ADAPTER_VERSION,
-    RustCompilerInvocationLedger, compiler_invocation_attempt_digest,
-    validate_compiler_invocation_ledger, validate_compiler_invocation_unit_graph,
+    RustCompilerFailureContext, RustCompilerInvocationLedger, compiler_invocation_attempt_digest,
+    diagnose_compiler_invocation_failure, validate_compiler_invocation_ledger,
+    validate_compiler_invocation_unit_graph,
 };
 use crate::compiler_mir::{RustCompilerMirLedger, validate_compiler_mir_directory};
 use crate::compiler_pack::{
@@ -706,6 +707,8 @@ pub struct BuildAudit {
     pub stderr_truncated: bool,
     pub validated_output_digest: Option<String>,
     pub diagnostic_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compiler_failure: Option<RustCompilerFailureContext>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1057,6 +1060,29 @@ where
             }
         }
     }
+    let mut compiler_failure = None;
+    if matches!(outcome, BuildOutcomeKind::Failed)
+        && plan.adapter == COMPILER_PRECISE_INVOCATION_ADAPTER
+        && let (Some(graph), Some(pack), Some(context)) = (
+            plan.compiler_unit_graph.as_ref(),
+            compiler_pack_preflight.as_ref(),
+            compiler_invocation_context.as_ref(),
+        )
+    {
+        let (attempt_digest, rustc_verbose_sha256, ledger_directory, _) = context;
+        if let Ok(Some(failure)) = diagnose_compiler_invocation_failure(
+            ledger_directory,
+            &run.workspace,
+            &run.cache.join("cargo"),
+            graph,
+            attempt_digest,
+            &pack.attestation.rustc_sha256,
+            rustc_verbose_sha256,
+        ) {
+            diagnostic_code = Some(failure.reason_code.clone());
+            compiler_failure = Some(failure);
+        }
+    }
     let mut rust_observation = None;
     let mut web_observation = None;
     let mut rust_cargo_unit_graph = None;
@@ -1193,6 +1219,7 @@ where
         stderr_truncated,
         validated_output_digest,
         diagnostic_code,
+        compiler_failure,
     };
     Ok(BuildExecutionOutcome {
         audit,
@@ -1582,8 +1609,12 @@ fn supervisor_environment(
         if let Some(Some(value)) = rustup_home {
             environment.insert("RUSTUP_HOME".to_owned(), value);
         }
+        #[cfg(unix)]
+        if compiler_pack.is_some() && compiler_wrapper_enabled {
+            extend_trusted_host_linker_path(&mut environment, root)?;
+        }
         #[cfg(all(windows, target_env = "msvc"))]
-        if compiler_pack.is_none() {
+        if compiler_pack.is_none() || compiler_wrapper_enabled {
             copy_safe_msvc_environment(&mut environment, root)?;
         }
     }
@@ -1599,6 +1630,86 @@ fn supervisor_environment(
         }
     }
     Ok(environment)
+}
+
+#[cfg(unix)]
+fn extend_trusted_host_linker_path(
+    environment: &mut BTreeMap<String, String>,
+    root: &Path,
+) -> Result<()> {
+    let mut directories = environment
+        .get("PATH")
+        .map(|value| std::env::split_paths(value).collect::<Vec<_>>())
+        .unwrap_or_default();
+    for executable in [trusted_host_executable(
+        "C compiler",
+        &[Path::new("/usr/bin/cc"), Path::new("/bin/cc")],
+        root,
+    )?]
+    .into_iter()
+    .chain(trusted_macos_sdk_tools(root)?)
+    {
+        let directory = executable
+            .parent()
+            .context("trusted host linker executable has no parent directory")?
+            .to_path_buf();
+        if !directories.contains(&directory) {
+            directories.push(directory);
+        }
+    }
+    environment.insert(
+        "PATH".to_owned(),
+        std::env::join_paths(directories)
+            .context("trusted host linker PATH is invalid")?
+            .to_string_lossy()
+            .into_owned(),
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+fn trusted_host_executable(label: &str, candidates: &[&Path], root: &Path) -> Result<PathBuf> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    for candidate in candidates {
+        let Ok(executable) = candidate.canonicalize() else {
+            continue;
+        };
+        let Ok(metadata) = fs::metadata(&executable) else {
+            continue;
+        };
+        let Some(directory) = executable.parent() else {
+            continue;
+        };
+        let Ok(directory_metadata) = fs::metadata(directory) else {
+            continue;
+        };
+        if metadata.is_file()
+            && metadata.uid() == 0
+            && metadata.mode() & 0o022 == 0
+            && directory_metadata.is_dir()
+            && directory_metadata.uid() == 0
+            && directory_metadata.mode() & 0o022 == 0
+            && !executable.starts_with(root)
+        {
+            return Ok(executable);
+        }
+    }
+    bail!("compiler-precise build-script support requires a root-owned, non-writable host {label}")
+}
+
+#[cfg(target_os = "macos")]
+fn trusted_macos_sdk_tools(root: &Path) -> Result<Vec<PathBuf>> {
+    Ok(vec![trusted_host_executable(
+        "macOS SDK resolver",
+        &[Path::new("/usr/bin/xcrun")],
+        root,
+    )?])
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn trusted_macos_sdk_tools(_root: &Path) -> Result<Vec<PathBuf>> {
+    Ok(Vec::new())
 }
 
 #[cfg(all(windows, target_env = "msvc"))]
@@ -1628,9 +1739,20 @@ fn copy_safe_msvc_environment(
         if !matches!(key, "PATH" | "INCLUDE" | "LIB" | "LIBPATH") {
             continue;
         }
-        let value = sanitize_path_value(value, root)?;
+        let mut value = sanitize_path_value(value, root)?;
         if key == "PATH" {
             has_linker_path = std::env::split_paths(&value).any(|path| path == linker_directory);
+            let mut paths = environment
+                .get("PATH")
+                .map(|existing| std::env::split_paths(existing).collect::<Vec<_>>())
+                .unwrap_or_default();
+            for path in std::env::split_paths(&value) {
+                if !paths.contains(&path) {
+                    paths.push(path);
+                }
+            }
+            value =
+                std::env::join_paths(paths).context("Visual Studio MSVC linker PATH is invalid")?;
         } else if key == "LIB" {
             has_library_path = true;
         }
@@ -2670,6 +2792,19 @@ mod tests {
                 .map(String::as_str),
             Some("")
         );
+        let trusted_cc = trusted_host_executable(
+            "C compiler",
+            &[Path::new("/usr/bin/cc"), Path::new("/bin/cc")],
+            &project,
+        )?;
+        assert!(
+            std::env::split_paths(
+                environment
+                    .get("PATH")
+                    .context("compiler PATH is missing")?
+            )
+            .any(|path| trusted_cc.parent() == Some(path.as_path()))
+        );
         let unit_graph_environment = supervisor_environment(
             &project,
             &run,
@@ -2683,6 +2818,14 @@ mod tests {
                 .get("RUSTC_WRAPPER")
                 .map(String::as_str),
             Some("")
+        );
+        assert!(
+            !std::env::split_paths(
+                unit_graph_environment
+                    .get("PATH")
+                    .context("unit graph PATH is missing")?
+            )
+            .any(|path| trusted_cc.parent() == Some(path.as_path()))
         );
         let mut plan = BuildExecutionPlan {
             adapter: "compiler-pack-fixture".to_owned(),

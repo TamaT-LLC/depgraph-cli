@@ -1157,6 +1157,13 @@ async fn run(cli: Cli) -> Result<u8> {
             if let Some(diagnostic) = &outcome.audit.diagnostic_code {
                 println!("diagnostic: {diagnostic}");
             }
+            if let Some(failure) = &outcome.audit.compiler_failure {
+                println!("compiler Cargo unit: {}", failure.unit_id);
+                println!(
+                    "compiler Cargo unit context: kind={}, mode={}, platform={}",
+                    failure.unit_kind, failure.mode, failure.cargo_platform
+                );
+            }
             if let Some(diagnostic) = &outcome.audit.isolation_diagnostic {
                 eprintln!("warning: {diagnostic}");
             }

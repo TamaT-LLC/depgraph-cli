@@ -461,6 +461,13 @@ fn logical_path(ledger: &RustCompilerMirLedger, kind: &str, digest: &str) -> Str
     )
 }
 
+fn cargo_unit_digest(unit_id: &str) -> Result<&str> {
+    unit_id
+        .strip_prefix("cargo-unit:")
+        .filter(|digest| is_digest(digest))
+        .context("compiler Cargo unit ID has no canonical digest")
+}
+
 fn validate_complete_attempt(
     audit: &BuildAudit,
     pack: &CompilerPackAttestation,
@@ -547,7 +554,8 @@ pub fn compiler_precise_graph_events(
     for unit in &graph.units {
         let path = logical_path(mir, "unit", &unit.unit_id);
         let mir_unit = mir_units.get(unit.unit_id.as_str()).copied();
-        let artifact_digest = mir_unit.map_or(unit.unit_id.as_str(), |value| value.digest.as_str());
+        let unit_digest = cargo_unit_digest(&unit.unit_id)?;
+        let artifact_digest = mir_unit.map_or(unit_digest, |value| value.digest.as_str());
         let node = generated_node(
             "rust_compiler_unit",
             json!({
@@ -618,7 +626,12 @@ pub fn compiler_precise_graph_events(
                     specifier: dependency.extern_crate_name.clone(),
                     status: ResolutionStatus::Resolved,
                     reason: None,
-                    evidence: context.evidence(&path, &unit.unit_id, None, None),
+                    evidence: context.evidence(
+                        &path,
+                        cargo_unit_digest(&unit.unit_id)?,
+                        None,
+                        None,
+                    ),
                 },
             )?;
         }
@@ -1110,6 +1123,17 @@ mod tests {
         parse_and_type_check_bounded_query, plan_bounded_query, stage_build_evidence, why,
     };
 
+    #[test]
+    fn cargo_unit_evidence_uses_the_canonical_digest_without_its_namespace_prefix() {
+        let digest = "a".repeat(64);
+        assert_eq!(
+            cargo_unit_digest(&format!("cargo-unit:{digest}")).unwrap(),
+            digest
+        );
+        assert!(cargo_unit_digest(&digest).is_err());
+        assert!(cargo_unit_digest("cargo-unit:not-a-digest").is_err());
+    }
+
     #[derive(Clone)]
     struct Fixture {
         audit: BuildAudit,
@@ -1280,7 +1304,7 @@ mod tests {
             strip: RustCargoStrip::Deferred("None".to_owned()),
             codegen_backend: None,
         };
-        let unit_id = "unit-fixture".to_owned();
+        let unit_id = format!("cargo-unit:{}", "4".repeat(64));
         let package_id = "path+repo://.#0.1.0".to_owned();
         let graph_unit = RustCargoUnit {
             unit_id: unit_id.clone(),
@@ -1574,6 +1598,7 @@ mod tests {
             stderr_truncated: false,
             validated_output_digest: Some("9".repeat(64)),
             diagnostic_code: None,
+            compiler_failure: None,
         };
         Ok(Fixture {
             audit,
