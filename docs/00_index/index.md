@@ -15,6 +15,10 @@
 | PROJ-ARC-001-ADR-005 | PROJ-ARC-001 | [Bounded read-only graph query language](../40_arch_design/adr-bounded-graph-query-language.md) | Accepted |
 | PROJ-ARC-001-ADR-006 | PROJ-ARC-001 | [Public OSS readiness and release governance](../40_arch_design/adr-public-oss-release-governance.md) | Accepted |
 
+## 運用手順
+
+- [GitHub Actionsを使ったリリース手順](../50_test/release-procedure.md)
+
 ## 統計
 
 ### レイヤー別
@@ -45,6 +49,7 @@
 
 ## 更新履歴
 
+- 2026-08-02: GitHub Actionsを使ったリリース手順を追加
 - 2026-07-25: `PROJ-ARC-001-ADR-006` を追加
 - 2026-07-25: `PROJ-ARC-001-ADR-005` を追加
 - 2026-07-25: `PROJ-ARC-001-ADR-004` を追加

@@ -735,7 +735,9 @@ fn verify_github_actions_security(root: &Path) -> Result<()> {
     verify_security_disclosure_dry_run(&dry_run_bytes)?;
     let threat_model = fs::read_to_string(
         root.join("docs/40_arch_design/github-actions-security-threat-model.md"),
-    )?;
+    )?
+    .replace("\r\n", "\n")
+    .replace('\r', "\n");
     for required in [
         "`github-actions-policy-v1`",
         "Pull requests, fork branches",
@@ -812,6 +814,13 @@ fn verify_workflow_policy_text(
             if top_level_trigger_keys(workflow)? != ["pull_request", "push", "workflow_dispatch"]
                 || !workflow.contains("\n  pull_request:")
                 || !workflow.contains("\n  workflow_dispatch:")
+                || ![
+                    "\n  benchmark:\n    needs: [rust, go, web]\n    if: github.event_name == 'workflow_dispatch'\n",
+                    "\n  integration:\n    needs: [rust, go, web]\n    if: github.event_name == 'workflow_dispatch'\n",
+                    "\n  windows-smoke:\n    needs: [rust, go, web]\n    if: github.event_name == 'workflow_dispatch'\n",
+                ]
+                .iter()
+                .all(|required| workflow.contains(required))
                 || top_permissions != ["contents: read"]
                 || contains_expression_context(workflow, "secrets")
                 || !write_permissions.is_empty()
@@ -12330,6 +12339,20 @@ mod tests {
             verify_workflow_policy_text(
                 "ci.yml",
                 &missing_manual_dispatch,
+                &pins,
+                &mut BTreeSet::new(),
+            )
+            .is_err()
+        );
+
+        let expensive_jobs_on_main = ci.replace(
+            "github.event_name == 'workflow_dispatch'",
+            "github.event_name != 'pull_request'",
+        );
+        assert!(
+            verify_workflow_policy_text(
+                "ci.yml",
+                &expensive_jobs_on_main,
                 &pins,
                 &mut BTreeSet::new(),
             )
