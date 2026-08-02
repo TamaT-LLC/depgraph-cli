@@ -743,6 +743,7 @@ fn verify_github_actions_security(root: &Path) -> Result<()> {
         "Only the final `publish` job receives job-scoped",
         "The stable source guard handles `workflow_run` metadata without checking out",
         "No current workflow requests `id-token: write`",
+        "Manual dispatches retain the same read-only and\nsecret-free boundary",
         "`.github/actions-policy.json` is the canonical allowlist",
         "A mutable tag or branch is never a temporary fallback.",
         "| Fork changes a workflow to print a secret |",
@@ -808,8 +809,9 @@ fn verify_workflow_policy_text(
 
     match name {
         "ci.yml" => {
-            if top_level_trigger_keys(workflow)? != ["pull_request", "push"]
+            if top_level_trigger_keys(workflow)? != ["pull_request", "push", "workflow_dispatch"]
                 || !workflow.contains("\n  pull_request:")
+                || !workflow.contains("\n  workflow_dispatch:")
                 || top_permissions != ["contents: read"]
                 || contains_expression_context(workflow, "secrets")
                 || !write_permissions.is_empty()
@@ -12321,6 +12323,17 @@ mod tests {
                 .is_err()
             );
         }
+
+        let missing_manual_dispatch = ci.replacen("  workflow_dispatch:\n", "", 1);
+        assert!(
+            verify_workflow_policy_text(
+                "ci.yml",
+                &missing_manual_dispatch,
+                &pins,
+                &mut BTreeSet::new(),
+            )
+            .is_err()
+        );
 
         let escaped_secret = ci.replacen(
             "GOTOOLCHAIN: local",

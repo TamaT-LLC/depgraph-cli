@@ -1665,8 +1665,10 @@ fileの3規模でsemantic cache hitと`--no-cache`を3回ずつ対にして計�
 各規模のmedian cache hitはbypass medianより5%以上高速でなければならない。
 hit / bypassのcompleted status、safe-mode、cache event、coverage、canonical
 graph digestの一致を検証し、raw sampleと改善率を
-`dist/cache-hit-benchmark-report.json`へ保存する。PR CIとrelease gateは既存の
-10,000-file reportと同じartifact closureでこのreportを検証する。
+`dist/cache-hit-benchmark-report.json`へ保存する。main branch CIとrelease gateは
+既存の10,000-file reportと同じartifact closureでこのreportを検証する。PR CIは
+Rust / Go / Webの品質検査とcompiler-precise hostile E2Eに限定し、benchmarkと
+cross-platform package smokeはmain merge後または手動dispatchで実行する。
 
 性能のために dependency site を省略してはならない。
 
@@ -1960,6 +1962,7 @@ digest、ref/tag検証、PR記録項目、patch release時も変わらないance
 
 ## 26. 更新履歴
 
+- 2026-08-02: PR CIをRust / Go / Webの品質検査とcompiler-precise hostile E2Eに限定し、benchmark、Linux / macOS integration、Windows smokeはmain pushまたは手動dispatchで実行する構成へ変更した。release workflowの全5 target gateは維持する。
 - 2026-08-01: Issue #279として通常のRust / Web build cacheをpre-execution input identityへ変更した。source、manifest / lock / config、profile、adapter artifact / version、toolchain executable / version、command / environment contract、target、protocol、base snapshotをkeyに含め、completed snapshot、current snapshot、base binding、payload、audit、入力の再計算が一致した場合だけproject codeを実行せず既存graphを返す。miss / reject / stored / hitをattemptへ記録し、corrupt / stale entryはfail closedに再実行してvalidated outputで置換する。RustとNext.jsのcold / warm testはsnapshot、audit、cache entry、exportが増減・変化しないことを検証する。
 - 2026-07-31: Issue #275としてRust HIR scanのattempt-local性能計測と代表benchmarkを実装した。workerはdiscovery/metadata、syntax、model planning、VFS、crate graph、database apply、HIR semantic、source finalize、protocol build/writeを、coreはworker execution、protocol ingest、store validation/promotion、totalをwall time・件数・bytes付きで`DEPGRAPH_SCAN_PROFILE=1`時だけ報告する。31 source file・2,520 function・7,560以上のsemantic siteを持つ決定的fixtureをcold / `--no-cache` / validated warm hitで検証し、cold/no-cache graph・coverage・diagnostic・安全性を一致させる。HIR occurrenceごとの全syntax tree走査をfile単位span indexへ置換し、source finalizeとHIR extractorは対象occurrenceの借用indexを共有する。crate単位の46-entry active cfgはprofileへ一度だけ正規化し、20,380件のHIR evidenceから参照することでcfg contextを維持したままprotocolを60.0 MBから37.8 MBへ縮小した。scan completionはmutation-count tokenで検証と昇格を結び、同じsnapshotの二重load・再validation・cache layer別再hashを除去した。Rust workerは既存のstable-ID mapを直接検証し、coreは独立なrustc/Cargo attestation probeを並列化し、store completion validationは契約に必要な列だけを読む。新規storeは16 KiB SQLite page、64 MiB connection cache、memory temp storeを使い、初回batchの空DELETEとsite/edge `raw_json`内のevidence重複保存を避ける一方、既存storeのpage sizeと論理graphの読み取り互換性を維持する。ローカルrelease実測はcold 5.02秒、`--no-cache` 3.93秒、warm 0.87秒、HIR semantic 0.72秒、store validation/promotion 0.61秒で、7,776 dependency siteとcold/no-cacheのbyte-identical exportを維持した。
 - 2026-07-30: Issue #265として`doctor`のworker artifact healthとper-root launch policyを分離した。diagnostic rootは明示`--root`、store latest attempt root、attemptなしのcurrent cwdの順で選択し、path/sourceをhuman/JSONへ公開する。Rust/Go/Webのversion/protocol/integrity probeはrepository外のneutral rootで実行して起動cwd依存を除去し、`root_launch_allowed` / errorは実diagnostic rootに対して独立評価する。depgraph source tree自体をrootにしたdevelopment artifact拒否、release archive attestation、safe environment・timeout・process reapを維持し、cwd差分と全3workerの回帰テストを追加した。

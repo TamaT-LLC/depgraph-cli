@@ -16,7 +16,10 @@ and published release artifacts are privileged surfaces.
 
 The ordinary CI workflow has only `contents: read`, never uses
 `pull_request_target`, and does not interpolate the `secrets` expression
-context. The verifier detects that context as an identifier regardless of
+context. Its exact trigger set is `pull_request`, `push`, and
+`workflow_dispatch`. Manual dispatches retain the same read-only and
+secret-free boundary as the other CI events. The verifier detects the secrets
+context as an identifier regardless of
 ASCII case, expression whitespace, or dot/bracket access syntax. Flow-style or
 quoted `permissions` declarations are rejected so write scopes cannot bypass
 the canonical block scanner. Permission scope keys and values must be

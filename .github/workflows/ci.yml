@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -101,6 +102,7 @@ jobs:
 
   benchmark:
     needs: [rust, go, web]
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     env:
       # Product targets are enforced directly. Per-phase daemon traces make
@@ -145,6 +147,7 @@ jobs:
 
   integration:
     needs: [rust, go, web]
+    if: github.event_name != 'pull_request'
     strategy:
       matrix:
         include:
@@ -584,6 +587,7 @@ jobs:
 
   windows-smoke:
     needs: [rust, go, web]
+    if: github.event_name != 'pull_request'
     runs-on: windows-2025
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
