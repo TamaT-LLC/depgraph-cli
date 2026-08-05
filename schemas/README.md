@@ -4,6 +4,38 @@ This directory contains versioned, machine-readable contracts shipped with depgr
 Consumers should select a schema by its declared contract version and fail closed on
 unknown versions or properties.
 
+`depgraph-mcp-tools-v1.schema.json` is the checked-in JSON Schema 2020-12 catalog
+for the closed Agent-facing contracts implemented by `depgraph-mcp-tools`. It covers
+the common request and versioned envelopes, snapshot selector, bounded page/cursor,
+typed errors, summarized graph DTOs, portable `OperationAccepted`, and the Q-002
+Option A additive Tasks result. The Tasks branch reuses the operation identity
+(`taskId == operation_id`); it does not replace the three baseline recovery tool
+names. Repository paths use the portable repository-relative primitive and reject
+absolute, traversing, backslash, Windows drive/UNC/ADS, and reserved-device forms.
+Arbitrary metadata/properties, raw evidence detail, and absolute root/store paths
+are not fields in these DTOs.
+
+The source of truth is `crates/depgraph-mcp-tools`; regenerate the catalog with
+`cargo run -p depgraph-mcp-tools --bin generate-schema --
+schemas/depgraph-mcp-tools-v1.schema.json`. The output is canonical JSON with no
+trailing newline. Integration tests require byte-for-byte equality with the
+checked-in catalog, its SHA-256 fixture, and the canonical contract-sample golden;
+they also recursively require `additionalProperties: false` on every generated
+object schema. These artifacts are the schema and golden evidence for Issue #295,
+not an MCP transport/server implementation.
+
+The catalog is a structural preflight contract, not the complete semantic validator.
+Consumers **MUST** deserialize with `depgraph-mcp-tools` (or enforce equivalent
+semantic checks) after schema validation. JSON Schema 2020-12 cannot express the
+cross-value arithmetic used by this contract: `returned_items == items.len()`,
+`total_items >= returned_items`, source-span ordering, task timestamp/expiry
+ordering, or UTF-8 byte limits. The Rust constructors and `Deserialize`
+implementations are authoritative for those invariants and fail closed. The schema
+does encode representable bounds, closed fields, fixed recovery names, snapshot
+availability, portable path syntax (including at most 256 components and 255
+Unicode scalar values per component), and scalar ranges. Schema-only acceptance
+must therefore never authorize repository or store access.
+
 `depgraph-compiler-pack-v1.schema.json` describes the separately distributed,
 target-specific `compiler-precise-rust-v1` compatibility unit. The manifest
 fixes the exact nightly channel, Rust/Cargo release, rustc commit, host/target,
