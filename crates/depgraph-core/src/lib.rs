@@ -44,6 +44,7 @@ pub(crate) mod repository_inventory;
 pub mod runtime_trace;
 pub mod rust_build_observer;
 pub mod scan;
+pub mod service;
 pub mod worker;
 
 use std::{
@@ -407,6 +408,15 @@ pub use rust_build_observer::{
 pub use scan::{
     ScanCacheMode, ScanOutcome, run_scan, run_scan_with_cache_mode,
     run_scan_with_cache_mode_and_cancellation,
+};
+pub use service::{
+    DEFAULT_SERVICE_MAX_INLINE_INPUT_BYTES, DEFAULT_SERVICE_MAX_OUTPUT_BYTES,
+    DEFAULT_SERVICE_MAX_PAGE_ITEMS, DEFAULT_SERVICE_PAGE_ITEMS, DEPGRAPH_SERVICE_LIMITS_VERSION,
+    DepgraphCapability, DepgraphCapabilitySet, DepgraphMutatingContext, DepgraphMutatingUseCase,
+    DepgraphMutatingUseCaseKind, DepgraphService, DepgraphServiceConfig,
+    DepgraphServiceConfigurationError, DepgraphServiceError, DepgraphServiceErrorCategory,
+    DepgraphServiceLimit, DepgraphServiceLimits, DepgraphServiceResult, RequestReadStore,
+    RequestReadStoreFactory,
 };
 
 use worker::{
