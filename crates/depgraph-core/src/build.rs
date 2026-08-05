@@ -1943,7 +1943,7 @@ fn compiler_precise_host_tool_identity(root: &Path) -> Result<String> {
     }
     let environment = tool
         .env()
-        .iter()
+        .into_iter()
         .filter_map(|(key, value)| {
             let key = key.to_str()?;
             matches!(key, "PATH" | "INCLUDE" | "LIB" | "LIBPATH")
