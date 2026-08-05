@@ -268,6 +268,9 @@ impl<T> Page<T> {
         if complete && next_cursor.is_some() {
             return Err(ContractBuildError::CompletePageCursor);
         }
+        if !complete && next_cursor.is_none() {
+            return Err(ContractBuildError::IncompletePageCursor);
+        }
         Ok(Self {
             items,
             returned_items,
@@ -611,6 +614,8 @@ pub enum ContractBuildError {
     PageTotal,
     #[error("a complete page cannot carry a continuation cursor")]
     CompletePageCursor,
+    #[error("an incomplete page must carry a continuation cursor")]
+    IncompletePageCursor,
     #[error("returned_items does not match the item array")]
     ReturnedItemCount,
     #[error("error category does not match the typed error code")]

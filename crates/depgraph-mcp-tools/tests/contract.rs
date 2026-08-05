@@ -448,12 +448,27 @@ fn page_bounds_counts_and_cursor_invariants_fail_closed() {
         Page::<()>::new(vec![], 0, true, Some(parse("next"))),
         Err(ContractBuildError::CompletePageCursor)
     );
+    assert_eq!(
+        Page::<()>::new(vec![], 1, false, None),
+        Err(ContractBuildError::IncompletePageCursor)
+    );
+    assert_eq!(
+        Page::<()>::new(vec![], 1, false, Some(parse("next")))
+            .expect("incomplete page with cursor")
+            .next_cursor()
+            .expect("continuation cursor")
+            .as_str(),
+        "next"
+    );
 
     let count_mismatch = json!({"items":[null],"returned_items":0,"total_items":1,"complete":true});
     assert!(serde_json::from_value::<Page<()>>(count_mismatch).is_err());
     let complete_cursor =
         json!({"items":[],"returned_items":0,"total_items":1,"complete":true,"next_cursor":"next"});
     assert!(serde_json::from_value::<Page<()>>(complete_cursor).is_err());
+    let incomplete_without_cursor =
+        json!({"items":[],"returned_items":0,"total_items":1,"complete":false});
+    assert!(serde_json::from_value::<Page<()>>(incomplete_without_cursor).is_err());
 
     let request = PageRequest::new(
         PageSize::new(25).expect("page size"),
