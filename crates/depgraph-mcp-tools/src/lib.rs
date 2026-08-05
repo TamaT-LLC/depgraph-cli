@@ -4,6 +4,7 @@ mod catalog;
 mod contract;
 mod dto;
 mod operation;
+mod response;
 mod scalar;
 mod schema;
 
@@ -28,6 +29,10 @@ pub use operation::{
     AcceptedOperationStatus, AcceptedTaskStatus, BaselineOperationTool, DurableSubmitResult,
     MAX_TASK_TTL_MS, MIN_TASK_TTL_MS, OperationAccepted, OperationAcceptedResultType,
     OperationRecoveryTools, TASK_POLL_INTERVAL_MS, TaskAccepted, TaskResultType, TasksNegotiation,
+};
+pub use response::{
+    CanonicalResponseMapper, CursorKey, MappedToolResult, PaginationContext, PublicPageItem,
+    PublicToolResult, ResponseMappingError,
 };
 pub use scalar::{
     AgentId, AgentLabel, AgentLocator, AgentToken, ContractValueError, Cursor, LogicalRepositoryId,
