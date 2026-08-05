@@ -715,7 +715,7 @@ fn field_schema(field: &str) -> Value {
     match field {
         "cursor" => scalar_schema::<Cursor>(),
         "operation_id" => scalar_schema::<OperationId>(),
-        "node_id" => scalar_schema::<AgentId>(),
+        "node_id" | "site_id" => scalar_schema::<AgentId>(),
         "selector" | "from" | "to" => scalar_schema::<AgentLocator>(),
         "name" => scalar_schema::<SnapshotName>(),
         "strict" | "no_cache" | "force" | "details" | "rust_compiler_precise" => {
@@ -744,12 +744,12 @@ fn scalar_schema<T: JsonSchema>() -> Value {
 
 fn required_input_fields(tool_name: &str) -> &'static [&'static str] {
     match tool_name {
-        "agent_node_get" | "agent_edges_list" | "agent_evidence_list" => &["node_id"],
+        "agent_node_get" | "agent_edges_list" => &["node_id"],
+        "agent_evidence_list" => &["site_id"],
         "snapshot_get" => &["snapshot"],
         "graph_dependencies_list" | "graph_dependents_list" | "graph_impact_get" => &["selector"],
-        "graph_path_get" | "snapshot_diff_get" => &["from", "to"],
+        "graph_path_get" | "snapshot_diff_get" | "policy_evaluate" => &["from", "to"],
         "graph_query" => &["query"],
-        "policy_evaluate" => &["policy"],
         "graph_export" => &["format"],
         "operation_get" | "operation_result" | "operation_cancel" => &["operation_id"],
         "snapshot_name_create" => &["name"],

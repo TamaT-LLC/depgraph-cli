@@ -194,6 +194,36 @@ fn catalog_schemas_compile_are_closed_and_are_deterministic() {
 fn tool_specific_required_fields_and_scalar_contracts_are_preserved() {
     let catalog = ToolCatalog::for_capabilities(&full_capabilities()).unwrap();
 
+    for tool in catalog.tools() {
+        let properties = tool.input_schema()["properties"].as_object().unwrap();
+        for required in tool.input_schema()["required"].as_array().unwrap() {
+            let required = required.as_str().unwrap();
+            assert!(
+                properties.contains_key(required),
+                "{} requires undeclared property {required}",
+                tool.name()
+            );
+        }
+    }
+
+    let evidence = catalog.tool("agent_evidence_list").unwrap();
+    assert!(
+        evidence.input_schema()["required"]
+            .as_array()
+            .unwrap()
+            .contains(&Value::String("site_id".to_owned()))
+    );
+
+    let policy = catalog.tool("policy_evaluate").unwrap();
+    for field in ["from", "to"] {
+        assert!(
+            policy.input_schema()["required"]
+                .as_array()
+                .unwrap()
+                .contains(&Value::String(field.to_owned()))
+        );
+    }
+
     let path = catalog.tool("graph_path_get").unwrap();
     let required = path.input_schema()["required"].as_array().unwrap();
     for field in ["contract_version", "repository_id", "from", "to"] {
