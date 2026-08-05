@@ -8,6 +8,7 @@ use depgraph_core::service::{
     DepgraphServiceErrorCategory, DepgraphServiceLimit, DepgraphServiceLimits,
 };
 use depgraph_store::Store;
+use serde_json::json;
 
 fn read_only_service(
     root: &Path,
@@ -180,9 +181,38 @@ fn each_read_request_uses_a_read_only_store_without_cache_mutation() -> Result<(
     std::fs::create_dir_all(&store_directory)?;
 
     let key = format!("impact-query:sha256:{:064x}", 1);
-    let writer = Store::open(&store_path)?;
+    let payload = r#"{"complete":true,"impacts":[]}"#;
+    let mut writer = Store::open(&store_path)?;
+    let scan_id = "service-cache-seed";
+    let coverage = json!({
+        "profiles": 0,
+        "files_discovered": 0,
+        "files_analyzed": 0,
+        "files_skipped": 0,
+        "dependency_sites": 0,
+        "resolved": 0,
+        "candidates": 0,
+        "external": 0,
+        "unresolved": 0,
+        "unsupported_syntax": 0,
+        "project_code_executed": false,
+        "completeness": ["syntax-complete"],
+        "reasons": []
+    });
+    writer.start_scan_with_revision(scan_id, &root, false, Some("fixture"))?;
+    for event in [
+        json!({"event":"scan_started","protocol_version":"1.0","scan_id":scan_id,"adapter":"rust","adapter_version":"0.1.0","seq":1,"root":root,"project_code_executed":false,"safe_mode":true}),
+        json!({"event":"scan_completed","protocol_version":"1.0","scan_id":scan_id,"adapter":"rust","adapter_version":"0.1.0","seq":2,"coverage":coverage}),
+    ] {
+        writer.ingest_event(&event)?;
+    }
+    writer.finish_scan(scan_id, "completed", None, true)?;
+    let snapshot_id = writer
+        .current_snapshot_id()?
+        .expect("the fixture scan must promote a snapshot");
+    assert!(writer.store_impact_query_cache(&key, &snapshot_id, payload)?);
     let cache_counts_before = writer.cache_entry_counts()?;
-    assert_eq!(writer.impact_query_cache_entry_count()?, 0);
+    assert_eq!(writer.impact_query_cache_entry_count()?, 1);
     drop(writer);
 
     let service = read_only_service(&root, &store_path)?;
@@ -191,9 +221,9 @@ fn each_read_request_uses_a_read_only_store_without_cache_mutation() -> Result<(
     assert_eq!(
         first_request
             .store()
-            .lookup_impact_query_cache(&key, "snapshot:sha256:test")?,
-        None,
-        "a cache miss must remain a read-only cache miss"
+            .lookup_impact_query_cache(&key, &snapshot_id)?,
+        Some(payload.to_owned()),
+        "a validated cache hit must remain usable when its best-effort touch is read-only"
     );
     assert!(
         first_request
@@ -208,7 +238,7 @@ fn each_read_request_uses_a_read_only_store_without_cache_mutation() -> Result<(
         second_request.store().cache_entry_counts()?,
         cache_counts_before
     );
-    assert_eq!(second_request.store().impact_query_cache_entry_count()?, 0);
+    assert_eq!(second_request.store().impact_query_cache_entry_count()?, 1);
     assert!(second_request.store().scan("must-not-write")?.is_none());
     Ok(())
 }
