@@ -3,6 +3,7 @@ resolver = "2"
 members = [
   "crates/depgraph-cli",
   "crates/depgraph-core",
+  "crates/depgraph-mcp-tools",
   "crates/depgraph-protocol",
   "crates/depgraph-rustc-wrapper",
   "crates/depgraph-store",
@@ -45,6 +46,7 @@ rusqlite = { version = "0.37", features = ["bundled", "chrono"] }
 salsa = "=0.26.1"
 salsa-macro-rules = "=0.26.1"
 salsa-macros = "=0.26.1"
+schemars = "=1.2.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["preserve_order"] }
 sha2 = "0.10"

@@ -27,11 +27,26 @@ additive extensionとして採用するかを決定する。
 | Modern MCP protocol | `2026-07-28` | Fixed |
 | Portable operation handle | `depgraph-operation-v1` | Required baseline |
 | MCP Tasks extension | `io.modelcontextprotocol/tasks` | Option A accepted |
+| Agent DTO/schema catalog | `depgraph-mcp-tools-v1` | Issue #295 contract implemented |
 | Open questions | `0` | Resolved |
 
 Stage 1ではcontractをfreezeする。operation journal、runner、baseline operation
 tools、Tasks adapterの実装は後続taskで行い、この文書のnegotiationとrecovery
 semanticsを変更してはならない。
+
+Issue [#295](https://github.com/TamaT-LLC/depgraph-cli/issues/295)は、このStage 1
+境界のうち、共通request/envelope、closed Agent DTO、typed error、page/cursor、
+portable operation resultとTasks result view、JSON Schema生成を
+`crates/depgraph-mcp-tools`へ実装する。MCP transport、tool handler、operation journal、
+runner、rmcp adapterは同issueのcontract crateへ含めず、後続taskの責務とする。
+
+生成JSON Schemaはclosed field・tag・scalar boundを検査するstructural preflightであり、
+Schema単独の受理をauthorizationやrepository/store accessの根拠にしてはならない。
+`returned_items == items.len()`、totalとの大小、source span順序、task時刻/expiryの算術、
+UTF-8 byte長はJSON Schema 2020-12で完全には表現できないため、consumerは必ず
+`depgraph-mcp-tools`でDeserializeするか同等のsemantic validationを実施する。
+Rust constructor/Deserializerがこれらのauthoritativeなfail-closed境界であり、
+schema/Serde差分は回帰testで意図的に固定する。
 
 ## Requirement traceability
 
@@ -41,6 +56,7 @@ semanticsを変更してはならない。
 | `NFR-003` | host差、切断、server restartをfailureとして回収できる | journalをstdio processとrmcp runtimeから独立させ、再接続時に同じIDを解決する |
 | `Q-002` | baseline handleへMCP Tasksを追加するか | **Resolved: Option Aを採用する** |
 | `AC-014` | Tasks非対応hostを含め、accepted operationのstatus、result、cancelが未定義分岐なく機能する | capability matrix、result union、認可、再接続、互換性test matrixを本書で固定する |
+| `#295` | 共通contract、closed DTO、typed error、pagination、operation型、決定的schema生成 | `depgraph-mcp-tools-v1`のRust型、checked-in schema、digestとcontract golden、およびintegration testで固定する |
 
 ## Upstream and API evidence
 
@@ -266,6 +282,26 @@ acknowledgementはcancel完了を意味しない。runnerが協調できれば`c
 
 `open_questions`は`0`である。capability negotiation、result union、cancel認可、
 再接続、legacy fallback、compatibility testに未決定の分岐は残さない。
+
+## Issue #295 contract evidence
+
+Issue #295の実装はQ-002 Option Aを次の型境界へ写像する。
+
+| Design decision / acceptance area | Contract evidence |
+| --- | --- |
+| portable baselineを常時維持 | `OperationAccepted`はversion、`operation_id`、queued status、`operation_get` / `operation_result` / `operation_cancel`の固定recovery名を持つ |
+| Tasksはadditive view | `DurableSubmitResult`はbaseline `OperationAccepted`またはnegotiated `TaskAccepted`のclosed unionであり、Tasks branchは`TaskId::from_operation_id`だけで構築する |
+| `taskId == operation_id` | negotiation integration testが両branchのidentityを同一operation IDとして検証する。別task storeやmutable ID mappingはcontractにない |
+| common and closed wire DTO | common request、snapshot selector、success/error envelope、page/cursor、Agent node/site/edge/evidence/snapshotのSerde deserializationとschemaがunknown fieldを拒否する |
+| bounded, portable disclosure | Agent DTOはsummary fieldだけを持ち、arbitrary metadata/properties、raw evidence detail、absolute root/store pathを受理しない。repository path scalarはportable relative pathだけを受理する |
+| typed failures and pagination | error codeからcategoryを導出し、wire上のcategory偽装を拒否する。page item/byte bounds、returned count、total count、complete/cursor関係をconstructorとdeserializerで検証する |
+| deterministic schema artifact | `generate-schema`はcanonical JSONを末尾改行なしで出力し、`schemas/depgraph-mcp-tools-v1.schema.json`とのbyte equality、再実行間のbytes/SHA-256、全objectの`additionalProperties: false`をintegration testで固定する |
+| golden evidence | `crates/depgraph-mcp-tools/tests/fixtures`のcanonical contract sampleとschema digestをexact comparisonする |
+
+このevidenceはIssue #295のcontract/schema scopeだけを証明する。Q-002で定義した
+protocol negotiation、journal durability、disconnect/restart recovery、Tasks handlerの
+conformanceは、上記[Compatibility and conformance tests](#compatibility-and-conformance-tests)
+に従う後続実装の責務である。
 
 ## Issue #292 acceptance mapping
 
