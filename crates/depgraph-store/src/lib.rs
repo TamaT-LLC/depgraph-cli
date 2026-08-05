@@ -1742,6 +1742,17 @@ impl Store {
             .context("failed to list snapshot names")
     }
 
+    pub fn snapshot_id_for_name(&self, name: &str) -> Result<Option<String>> {
+        self.connection
+            .query_row(
+                "SELECT snapshot_id FROM snapshot_names WHERE name=?1 COLLATE NOCASE",
+                [name],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("failed to resolve completed snapshot name")
+    }
+
     pub fn resolve_completed_snapshot_selector(&self, selector: &str) -> Result<String> {
         if selector.trim().is_empty() {
             bail!("snapshot selector must not be empty");
@@ -1759,14 +1770,7 @@ impl Store {
         let by_id = self
             .completed_snapshot(selector)?
             .map(|snapshot| snapshot.id);
-        let by_name = self
-            .connection
-            .query_row(
-                "SELECT snapshot_id FROM snapshot_names WHERE name=?1 COLLATE NOCASE",
-                [selector],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?;
+        let by_name = self.snapshot_id_for_name(selector)?;
         match (by_id, by_name) {
             (Some(id), Some(named_id)) if id != named_id => bail!(
                 "snapshot selector {selector:?} is ambiguous between stable ID {id} and named snapshot {named_id}"

@@ -1,4 +1,9 @@
-use std::{collections::BTreeSet, error::Error, path::Path};
+use std::{
+    collections::BTreeSet,
+    error::Error,
+    io::{Read as _, Write as _},
+    path::Path,
+};
 
 use anyhow::Result;
 use depgraph_core::service::{
@@ -6,6 +11,9 @@ use depgraph_core::service::{
     DepgraphMutatingContext, DepgraphMutatingUseCase, DepgraphMutatingUseCaseKind, DepgraphService,
     DepgraphServiceConfig, DepgraphServiceConfigurationError, DepgraphServiceError,
     DepgraphServiceErrorCategory, DepgraphServiceLimit, DepgraphServiceLimits,
+    MAX_REPOSITORY_PATH_BYTES, MAX_REPOSITORY_PATH_COMPONENT_BYTES, MAX_REPOSITORY_PATH_COMPONENTS,
+    RepositoryFileError, RepositoryPathError, RepositoryPathSelector, RepositoryRelativePath,
+    SnapshotLocator,
 };
 use depgraph_store::Store;
 use serde_json::json;
@@ -21,6 +29,56 @@ fn read_only_service(
         DepgraphServiceLimits::default(),
     )?;
     Ok(DepgraphService::new(config))
+}
+
+fn repository_write_service(
+    root: &Path,
+    store_path: &Path,
+) -> Result<DepgraphService, DepgraphServiceError> {
+    let config = DepgraphServiceConfig::new(
+        root,
+        store_path,
+        DepgraphCapabilitySet::try_new([
+            DepgraphCapability::Read,
+            DepgraphCapability::RepositoryWrite,
+        ])?,
+        DepgraphServiceLimits::default(),
+    )?;
+    Ok(DepgraphService::new(config))
+}
+
+fn seed_completed_snapshot(
+    store: &mut Store,
+    root: &Path,
+    scan_id: &str,
+    revision: &str,
+) -> Result<String> {
+    let coverage = json!({
+        "profiles": 0,
+        "files_discovered": 0,
+        "files_analyzed": 0,
+        "files_skipped": 0,
+        "dependency_sites": 0,
+        "resolved": 0,
+        "candidates": 0,
+        "external": 0,
+        "unresolved": 0,
+        "unsupported_syntax": 0,
+        "project_code_executed": false,
+        "completeness": ["syntax-complete"],
+        "reasons": []
+    });
+    store.start_scan_with_revision(scan_id, root, false, Some(revision))?;
+    for event in [
+        json!({"event":"scan_started","protocol_version":"1.0","scan_id":scan_id,"adapter":"rust","adapter_version":"0.1.0","seq":1,"root":root,"project_code_executed":false,"safe_mode":true}),
+        json!({"event":"scan_completed","protocol_version":"1.0","scan_id":scan_id,"adapter":"rust","adapter_version":"0.1.0","seq":2,"coverage":coverage}),
+    ] {
+        store.ingest_event(&event)?;
+    }
+    store.finish_scan(scan_id, "completed", None, true)?;
+    Ok(store
+        .current_snapshot_id()?
+        .expect("a promoted completed scan has a current snapshot"))
 }
 
 #[test]
@@ -169,6 +227,281 @@ fn versioned_limits_fail_closed() {
             reason: DepgraphServiceConfigurationError::InvalidPageLimits
         }
     ));
+}
+
+#[test]
+fn repository_paths_and_graph_path_selectors_are_lexically_normalized() -> Result<()> {
+    let path = RepositoryRelativePath::parse("src/domain/model.rs")?;
+    assert_eq!(path.as_str(), "src/domain/model.rs");
+
+    let selector = RepositoryPathSelector::parse("path:src/domain/model.rs")?;
+    assert_eq!(selector.path(), "src/domain/model.rs");
+    assert_eq!(selector.to_string(), "path:src/domain/model.rs");
+
+    for input in [
+        "console",
+        "com10.log",
+        "lpt0",
+        "auxiliary.txt",
+        ".git/config",
+    ] {
+        RepositoryRelativePath::parse(input)
+            .unwrap_or_else(|error| panic!("portable path {input:?} was rejected: {error:?}"));
+    }
+
+    for (input, expected) in [
+        ("", RepositoryPathError::Empty),
+        ("/etc/passwd", RepositoryPathError::Absolute),
+        ("./src/lib.rs", RepositoryPathError::DotComponent),
+        ("src/../secret", RepositoryPathError::ParentComponent),
+        ("src//lib.rs", RepositoryPathError::EmptyComponent),
+        ("src/lib.rs/", RepositoryPathError::EmptyComponent),
+        ("src\0secret", RepositoryPathError::Nul),
+        ("C:/Windows/win.ini", RepositoryPathError::PlatformPrefix),
+        ("C:Windows/win.ini", RepositoryPathError::PlatformPrefix),
+        ("C:\\Windows\\win.ini", RepositoryPathError::PlatformPrefix),
+        ("public.txt:private", RepositoryPathError::PlatformStream),
+        (
+            "nested/public.txt:private",
+            RepositoryPathError::PlatformStream,
+        ),
+        ("nested/.. ", RepositoryPathError::PlatformAlias),
+        ("nested/file.", RepositoryPathError::PlatformAlias),
+        ("CON", RepositoryPathError::PlatformDevice),
+        ("nested/nul.txt", RepositoryPathError::PlatformDevice),
+        ("nested/Com1.log", RepositoryPathError::PlatformDevice),
+        ("nested/LPT9", RepositoryPathError::PlatformDevice),
+        ("nested/COM¹.txt", RepositoryPathError::PlatformDevice),
+        (
+            "\\\\server\\share\\file",
+            RepositoryPathError::PlatformPrefix,
+        ),
+        ("\\\\?\\C:\\file", RepositoryPathError::PlatformPrefix),
+        (
+            "src\\platform-specific.rs",
+            RepositoryPathError::PlatformSeparator,
+        ),
+    ] {
+        let error = RepositoryRelativePath::parse(input).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                DepgraphServiceError::InvalidRepositoryPath { reason } if reason == expected
+            ),
+            "unexpected result for {input:?}: {error:?}"
+        );
+    }
+
+    let long_component = "x".repeat(MAX_REPOSITORY_PATH_COMPONENT_BYTES + 1);
+    assert!(matches!(
+        RepositoryRelativePath::parse(&long_component),
+        Err(DepgraphServiceError::InvalidRepositoryPath {
+            reason: RepositoryPathError::ComponentTooLong
+        })
+    ));
+    let too_many_components = std::iter::repeat_n("a", MAX_REPOSITORY_PATH_COMPONENTS + 1)
+        .collect::<Vec<_>>()
+        .join("/");
+    assert!(matches!(
+        RepositoryRelativePath::parse(&too_many_components),
+        Err(DepgraphServiceError::InvalidRepositoryPath {
+            reason: RepositoryPathError::TooManyComponents
+        })
+    ));
+    let too_long = std::iter::repeat_n("x".repeat(240), 18)
+        .collect::<Vec<_>>()
+        .join("/");
+    assert!(too_long.len() > MAX_REPOSITORY_PATH_BYTES);
+    assert!(matches!(
+        RepositoryRelativePath::parse(&too_long),
+        Err(DepgraphServiceError::InvalidRepositoryPath {
+            reason: RepositoryPathError::TooLong
+        })
+    ));
+    Ok(())
+}
+
+#[test]
+fn confined_input_and_output_handles_use_only_repository_relative_paths() -> Result<()> {
+    let temporary = tempfile::tempdir()?;
+    let root = temporary.path().join("repository");
+    let store_directory = temporary.path().join("cache");
+    let store_path = store_directory.join("graph.db");
+    std::fs::create_dir_all(root.join("nested"))?;
+    std::fs::create_dir_all(&store_directory)?;
+    std::fs::write(root.join("nested/input.txt"), b"confined")?;
+    let service = repository_write_service(&root, &store_path)?;
+
+    let mut input = service.open_repository_input("nested/input.txt")?;
+    let mut contents = String::new();
+    input.read_to_string(&mut contents)?;
+    assert_eq!(contents, "confined");
+    assert_eq!(input.relative_path().as_str(), "nested/input.txt");
+
+    let mut output = service.create_repository_output("nested/output.txt")?;
+    output.write_all(b"created through confined handle")?;
+    output.flush()?;
+    drop(output);
+    assert_eq!(
+        std::fs::read(root.join("nested/output.txt"))?,
+        b"created through confined handle"
+    );
+
+    let conflict = service
+        .create_repository_output("nested/output.txt")
+        .unwrap_err();
+    assert!(matches!(
+        conflict,
+        DepgraphServiceError::RepositoryFile {
+            reason: RepositoryFileError::AlreadyExists
+        }
+    ));
+
+    let read_only = read_only_service(&root, &store_path)?;
+    let denied = read_only
+        .create_repository_output("nested/denied.txt")
+        .unwrap_err();
+    assert!(matches!(
+        denied,
+        DepgraphServiceError::CapabilityDenied {
+            required: DepgraphCapability::RepositoryWrite
+        }
+    ));
+    assert!(!root.join("nested/denied.txt").exists());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn posix_no_follow_handles_reject_symlinks_and_root_identity_changes() -> Result<()> {
+    use std::os::unix::fs::symlink;
+
+    let temporary = tempfile::tempdir()?;
+    let root = temporary.path().join("repository");
+    let outside = temporary.path().join("outside");
+    let store_directory = temporary.path().join("cache");
+    let store_path = store_directory.join("graph.db");
+    std::fs::create_dir_all(root.join("nested"))?;
+    std::fs::create_dir_all(&outside)?;
+    std::fs::create_dir_all(&store_directory)?;
+    std::fs::write(outside.join("canary.txt"), b"outside")?;
+    symlink(outside.join("canary.txt"), root.join("linked-file"))?;
+    symlink(&outside, root.join("linked-directory"))?;
+    symlink(outside.join("canary.txt"), root.join("linked-output"))?;
+
+    let service = repository_write_service(&root, &store_path)?;
+    for relative in ["linked-file", "linked-directory/canary.txt"] {
+        let error = service.open_repository_input(relative).unwrap_err();
+        assert_eq!(error.category(), DepgraphServiceErrorCategory::Integrity);
+    }
+    let output_error = service
+        .create_repository_output("linked-output")
+        .unwrap_err();
+    assert_eq!(
+        output_error.category(),
+        DepgraphServiceErrorCategory::Integrity
+    );
+    assert_eq!(std::fs::read(outside.join("canary.txt"))?, b"outside");
+
+    let original_root = temporary.path().join("original-repository");
+    std::fs::rename(&root, &original_root)?;
+    std::fs::create_dir_all(root.join("nested"))?;
+    std::fs::write(root.join("nested/input.txt"), b"replacement")?;
+    let identity_error = service
+        .open_repository_input("nested/input.txt")
+        .unwrap_err();
+    assert!(matches!(
+        identity_error,
+        DepgraphServiceError::RepositoryFile {
+            reason: RepositoryFileError::BoundaryViolation
+        }
+    ));
+    Ok(())
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_no_follow_handles_reject_file_and_directory_reparse_points() -> Result<()> {
+    use std::os::windows::fs::{symlink_dir, symlink_file};
+
+    let temporary = tempfile::tempdir()?;
+    let root = temporary.path().join("repository");
+    let outside = temporary.path().join("outside");
+    let store_directory = temporary.path().join("cache");
+    let store_path = store_directory.join("graph.db");
+    std::fs::create_dir_all(&root)?;
+    std::fs::create_dir_all(&outside)?;
+    std::fs::create_dir_all(&store_directory)?;
+    std::fs::write(outside.join("canary.txt"), b"outside")?;
+    if let Err(source) = symlink_file(outside.join("canary.txt"), root.join("linked-file")) {
+        if source.kind() == std::io::ErrorKind::PermissionDenied {
+            return Ok(());
+        }
+        return Err(source.into());
+    }
+    symlink_dir(&outside, root.join("linked-directory"))?;
+
+    let service = repository_write_service(&root, &store_path)?;
+    for relative in ["linked-file", "linked-directory/canary.txt"] {
+        let error = service.open_repository_input(relative).unwrap_err();
+        assert_eq!(error.category(), DepgraphServiceErrorCategory::Integrity);
+    }
+    Ok(())
+}
+
+#[test]
+fn snapshot_requests_pin_completed_stable_ids_and_keep_path_selectors_separate() -> Result<()> {
+    let temporary = tempfile::tempdir()?;
+    let root = temporary.path().join("repository");
+    let store_directory = temporary.path().join("cache");
+    let store_path = store_directory.join("graph.db");
+    std::fs::create_dir_all(&root)?;
+    std::fs::create_dir_all(&store_directory)?;
+
+    let mut writer = Store::open(&store_path)?;
+    let first_snapshot = seed_completed_snapshot(&mut writer, &root, "first", "revision-1")?;
+    writer.create_snapshot_name("baseline", &first_snapshot)?;
+
+    let service = read_only_service(&root, &store_path)?;
+    let mut current_request = service.start_snapshot_request("current")?;
+    let named_request = service.start_snapshot_request("baseline")?;
+    let stable_request = service.start_snapshot_request(&first_snapshot)?;
+    assert_eq!(current_request.snapshot_id().as_str(), first_snapshot);
+    assert_eq!(named_request.snapshot_id().as_str(), first_snapshot);
+    assert_eq!(stable_request.snapshot_id().as_str(), first_snapshot);
+
+    let second_snapshot = seed_completed_snapshot(&mut writer, &root, "second", "revision-2")?;
+    assert_ne!(second_snapshot, first_snapshot);
+    assert_eq!(
+        writer.current_snapshot_id()?.as_deref(),
+        Some(second_snapshot.as_str())
+    );
+    assert_eq!(
+        current_request.store().current_snapshot_id()?.as_deref(),
+        Some(second_snapshot.as_str()),
+        "the request connection may observe a later current pointer"
+    );
+    assert_eq!(
+        current_request.snapshot_id().as_str(),
+        first_snapshot,
+        "the resolved request identity must remain immutable"
+    );
+
+    let path_selector = service.normalize_path_selector("path:src/not-on-disk.rs")?;
+    assert_eq!(path_selector.path(), "src/not-on-disk.rs");
+    assert!(matches!(
+        service.start_snapshot_request(path_selector.to_string()),
+        Err(DepgraphServiceError::InvalidInput)
+    ));
+    assert!(matches!(
+        SnapshotLocator::parse("snapshot:sha256:not-a-digest"),
+        Err(DepgraphServiceError::InvalidInput)
+    ));
+    assert!(matches!(
+        service.start_snapshot_request(format!("snapshot:sha256:{}", "0".repeat(64))),
+        Err(DepgraphServiceError::NotFound)
+    ));
+    Ok(())
 }
 
 #[test]
