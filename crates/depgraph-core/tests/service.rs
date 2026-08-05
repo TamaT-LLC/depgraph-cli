@@ -238,6 +238,17 @@ fn repository_paths_and_graph_path_selectors_are_lexically_normalized() -> Resul
     assert_eq!(selector.path(), "src/domain/model.rs");
     assert_eq!(selector.to_string(), "path:src/domain/model.rs");
 
+    for input in [
+        "console",
+        "com10.log",
+        "lpt0",
+        "auxiliary.txt",
+        ".git/config",
+    ] {
+        RepositoryRelativePath::parse(input)
+            .unwrap_or_else(|error| panic!("portable path {input:?} was rejected: {error:?}"));
+    }
+
     for (input, expected) in [
         ("", RepositoryPathError::Empty),
         ("/etc/passwd", RepositoryPathError::Absolute),
@@ -254,6 +265,13 @@ fn repository_paths_and_graph_path_selectors_are_lexically_normalized() -> Resul
             "nested/public.txt:private",
             RepositoryPathError::PlatformStream,
         ),
+        ("nested/.. ", RepositoryPathError::PlatformAlias),
+        ("nested/file.", RepositoryPathError::PlatformAlias),
+        ("CON", RepositoryPathError::PlatformDevice),
+        ("nested/nul.txt", RepositoryPathError::PlatformDevice),
+        ("nested/Com1.log", RepositoryPathError::PlatformDevice),
+        ("nested/LPT9", RepositoryPathError::PlatformDevice),
+        ("nested/COM¹.txt", RepositoryPathError::PlatformDevice),
         (
             "\\\\server\\share\\file",
             RepositoryPathError::PlatformPrefix,

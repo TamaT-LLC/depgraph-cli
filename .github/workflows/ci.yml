@@ -607,6 +607,8 @@ jobs:
         run: cargo test -p depgraph-core --lib --locked build::tests
       - name: Watcher daemon lifecycle, debounce, cancellation, and recovery
         run: cargo test -p depgraph-core --lib --locked daemon::tests
+      - name: Repository path confinement and snapshot pinning
+        run: cargo test -p depgraph-core --test service --locked
       - run: cargo test -p depgraph-rust-worker --lib --locked
       - run: cargo test -p depgraph-core --lib --locked web_worker_timeout_reaps_its_descendant_cross_platform
       - run: cargo xtask build

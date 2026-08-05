@@ -28,6 +28,10 @@ pub enum RepositoryPathError {
     PlatformSeparator,
     #[error("path must not select a platform-specific file stream")]
     PlatformStream,
+    #[error("path component has a platform-specific trailing alias")]
+    PlatformAlias,
+    #[error("path component names a platform-specific device")]
+    PlatformDevice,
     #[error("path contains an empty component")]
     EmptyComponent,
     #[error("path contains a dot component")]
@@ -312,11 +316,42 @@ fn validate_repository_path(path: &str) -> Result<(), RepositoryPathError> {
         if component.contains(':') {
             return Err(RepositoryPathError::PlatformStream);
         }
+        // Win32 strips trailing spaces and dots while resolving ordinary paths,
+        // which could turn a lexically distinct component into `.` or `..`.
+        if component.ends_with(' ') || component.ends_with('.') {
+            return Err(RepositoryPathError::PlatformAlias);
+        }
+        // DOS devices remain reserved case-insensitively even when followed by
+        // an extension (for example, `NUL.txt`). Reject them in the portable
+        // wire grammar rather than relying on platform-specific open behavior.
+        if is_windows_reserved_component(component) {
+            return Err(RepositoryPathError::PlatformDevice);
+        }
         if component.len() > MAX_REPOSITORY_PATH_COMPONENT_BYTES {
             return Err(RepositoryPathError::ComponentTooLong);
         }
     }
     Ok(())
+}
+
+fn is_windows_reserved_component(component: &str) -> bool {
+    let stem = component
+        .split_once('.')
+        .map_or(component, |(stem, _extension)| stem)
+        .trim_end_matches([' ', '.']);
+    let stem = stem.to_ascii_uppercase();
+
+    matches!(
+        stem.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CLOCK$" | "CONIN$" | "CONOUT$"
+    ) || ["COM", "LPT"].iter().any(|prefix| {
+        stem.strip_prefix(prefix).is_some_and(|suffix| {
+            matches!(
+                suffix,
+                "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+            )
+        })
+    })
 }
 
 #[cfg(not(any(unix, windows)))]
