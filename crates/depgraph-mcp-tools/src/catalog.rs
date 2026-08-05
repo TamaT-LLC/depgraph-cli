@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     AgentId, AgentLocator, Cursor, LogicalRepositoryId, MCP_TOOLS_CONTRACT_VERSION, OperationId,
-    SnapshotName,
+    SnapshotId, SnapshotName,
 };
 
 macro_rules! define_cli_actions {
@@ -718,6 +718,13 @@ fn field_schema(field: &str) -> Value {
         "node_id" | "site_id" => scalar_schema::<AgentId>(),
         "selector" | "from" | "to" => scalar_schema::<AgentLocator>(),
         "name" => scalar_schema::<SnapshotName>(),
+        "snapshot" => json!({
+            "oneOf": [
+                {"type": "string", "pattern": "^[Cc][Uu][Rr][Rr][Ee][Nn][Tt]$"},
+                scalar_schema::<SnapshotId>(),
+                scalar_schema::<SnapshotName>()
+            ]
+        }),
         "strict" | "no_cache" | "force" | "details" | "rust_compiler_precise" => {
             json!({"type": "boolean"})
         }

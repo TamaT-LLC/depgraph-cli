@@ -224,6 +224,33 @@ fn tool_specific_required_fields_and_scalar_contracts_are_preserved() {
         );
     }
 
+    let snapshot = catalog.tool("snapshot_get").unwrap();
+    let snapshot_schema = Value::Object(snapshot.input_schema().clone());
+    let snapshot_validator = jsonschema::validator_for(&snapshot_schema).unwrap();
+    for locator in [
+        "current",
+        "CURRENT",
+        "release-1",
+        "snapshot:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    ] {
+        assert!(snapshot_validator.is_valid(&serde_json::json!({
+            "contract_version": "depgraph-mcp-tools-v1",
+            "repository_id": "repo",
+            "snapshot": locator
+        })));
+    }
+    for locator in [
+        "latest",
+        "a-name-that-is-more-than-sixty-four-bytes-and-therefore-invalid-for-snapshots",
+        "snapshot:sha256:not-a-valid-digest",
+    ] {
+        assert!(!snapshot_validator.is_valid(&serde_json::json!({
+            "contract_version": "depgraph-mcp-tools-v1",
+            "repository_id": "repo",
+            "snapshot": locator
+        })));
+    }
+
     let path = catalog.tool("graph_path_get").unwrap();
     let required = path.input_schema()["required"].as_array().unwrap();
     for field in ["contract_version", "repository_id", "from", "to"] {
