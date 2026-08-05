@@ -249,6 +249,11 @@ fn repository_paths_and_graph_path_selectors_are_lexically_normalized() -> Resul
         ("C:/Windows/win.ini", RepositoryPathError::PlatformPrefix),
         ("C:Windows/win.ini", RepositoryPathError::PlatformPrefix),
         ("C:\\Windows\\win.ini", RepositoryPathError::PlatformPrefix),
+        ("public.txt:private", RepositoryPathError::PlatformStream),
+        (
+            "nested/public.txt:private",
+            RepositoryPathError::PlatformStream,
+        ),
         (
             "\\\\server\\share\\file",
             RepositoryPathError::PlatformPrefix,

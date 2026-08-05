@@ -26,6 +26,8 @@ pub enum RepositoryPathError {
     PlatformPrefix,
     #[error("path must use forward-slash separators")]
     PlatformSeparator,
+    #[error("path must not select a platform-specific file stream")]
+    PlatformStream,
     #[error("path contains an empty component")]
     EmptyComponent,
     #[error("path contains a dot component")]
@@ -303,6 +305,12 @@ fn validate_repository_path(path: &str) -> Result<(), RepositoryPathError> {
         }
         if component == ".." {
             return Err(RepositoryPathError::ParentComponent);
+        }
+        // Keep the wire-level path grammar portable and prevent NTFS alternate
+        // data stream selectors such as `public.txt:private` from reaching
+        // Windows handle-relative opens.
+        if component.contains(':') {
+            return Err(RepositoryPathError::PlatformStream);
         }
         if component.len() > MAX_REPOSITORY_PATH_COMPONENT_BYTES {
             return Err(RepositoryPathError::ComponentTooLong);
