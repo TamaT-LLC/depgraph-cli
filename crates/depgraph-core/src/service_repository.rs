@@ -676,7 +676,7 @@ fn open_windows_repository_input_after_root(
         FILE_OPEN,
         Some(false),
     )?;
-    validate_opened_regular_file(&file, traversal.parent(), traversal.final_name)?;
+    validate_opened_windows_regular_file(&file)?;
     validate_windows_directories(&traversal.directories)?;
     Ok(file)
 }
@@ -710,7 +710,7 @@ fn open_windows_repository_output_after_root(
         }
         Err(error) => return Err(error),
     };
-    validate_opened_regular_file(&file, traversal.parent(), traversal.final_name)?;
+    validate_opened_windows_regular_file(&file)?;
     validate_windows_directories(&traversal.directories)?;
     Ok(file)
 }
@@ -770,8 +770,8 @@ fn open_windows_directory(path: &Path, create_child: bool) -> DepgraphServiceRes
     use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_ADD_FILE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
-        FILE_FLAG_OPEN_REPARSE_POINT, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_READ,
-        FILE_SHARE_WRITE, FILE_TRAVERSE, SYNCHRONIZE,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, SYNCHRONIZE,
     };
 
     let access = FILE_LIST_DIRECTORY
@@ -781,7 +781,7 @@ fn open_windows_directory(path: &Path, create_child: bool) -> DepgraphServiceRes
         | if create_child { FILE_ADD_FILE } else { 0 };
     let directory = fs::OpenOptions::new()
         .access_mode(access)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)
         .map_err(map_open_component_error)?;
@@ -801,8 +801,8 @@ fn open_windows_directory_at(
     use windows_sys::{
         Wdk::Storage::FileSystem::FILE_OPEN,
         Win32::Storage::FileSystem::{
-            FILE_ADD_FILE, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_READ,
-            FILE_SHARE_WRITE, FILE_TRAVERSE, SYNCHRONIZE,
+            FILE_ADD_FILE, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
+            FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, SYNCHRONIZE,
         },
     };
 
@@ -815,7 +815,7 @@ fn open_windows_directory_at(
         parent,
         name,
         access,
-        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         FILE_OPEN,
         Some(true),
     )?;
@@ -956,19 +956,9 @@ fn identity_from_file(file: &File) -> DepgraphServiceResult<RepositoryFileIdenti
 }
 
 #[cfg(windows)]
-fn validate_opened_regular_file(
-    file: &File,
-    parent: &File,
-    name: &OsStr,
-) -> DepgraphServiceResult<()> {
+fn validate_opened_windows_regular_file(file: &File) -> DepgraphServiceResult<()> {
     use std::os::windows::fs::MetadataExt as _;
-    use windows_sys::{
-        Wdk::Storage::FileSystem::FILE_OPEN,
-        Win32::Storage::FileSystem::{
-            FILE_ATTRIBUTE_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
-            SYNCHRONIZE,
-        },
-    };
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
 
     let metadata = file.metadata().map_err(map_filesystem_error)?;
     if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
@@ -976,20 +966,6 @@ fn validate_opened_regular_file(
     }
     if !metadata.is_file() {
         return Err(RepositoryFileError::NotRegular.into());
-    }
-    let path_handle = open_windows_at(
-        parent,
-        name,
-        FILE_READ_ATTRIBUTES | SYNCHRONIZE,
-        FILE_SHARE_READ | FILE_SHARE_WRITE,
-        FILE_OPEN,
-        Some(false),
-    )?;
-    let path_metadata = path_handle.metadata().map_err(map_filesystem_error)?;
-    if path_metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-        || identity_from_file(file)? != identity_from_file(&path_handle)?
-    {
-        return Err(RepositoryFileError::BoundaryViolation.into());
     }
     Ok(())
 }
