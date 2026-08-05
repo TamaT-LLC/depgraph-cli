@@ -459,6 +459,8 @@ fn agent_locator_schema_rejects_absolute_path_escape_hatches() {
         "custom://server/share",
         "C:/Windows/win.ini",
         "C:\\Windows\\win.ini",
+        "C:secret",
+        "custom:C:secret",
         "//server/share",
         "\\\\server\\share",
         "custom:file:/etc/passwd",

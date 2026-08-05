@@ -260,6 +260,7 @@ string_newtype!(
                     },
                     { "not": { "pattern": r":/" } },
                     { "not": { "pattern": r"//" } },
+                    { "not": { "pattern": r"(?:^|:)[A-Za-z]:" } },
                     { "not": { "pattern": r"^[Ff][Ii][Ll][Ee]:" } }
                 ]
             }
@@ -488,6 +489,15 @@ fn valid_agent_locator(value: &str) -> bool {
         && !value.contains('\\')
         && !value.contains(":/")
         && !value.contains("//")
+        && !value
+            .as_bytes()
+            .windows(2)
+            .enumerate()
+            .any(|(index, pair)| {
+                pair[0].is_ascii_alphabetic()
+                    && pair[1] == b':'
+                    && (index == 0 || value.as_bytes()[index - 1] == b':')
+            })
         && !value
             .get(..5)
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case("file:"))

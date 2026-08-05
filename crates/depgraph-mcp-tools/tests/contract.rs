@@ -283,6 +283,8 @@ fn agent_locator_is_a_repository_relative_locator_not_an_absolute_path_escape_ha
         "custom://server/share",
         "C:/Windows/win.ini",
         "C:\\Windows\\win.ini",
+        "C:secret",
+        "custom:C:secret",
         "//server/share",
         "\\\\server\\share",
         "custom:file:/etc/passwd",
