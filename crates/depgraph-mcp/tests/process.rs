@@ -325,7 +325,16 @@ fn trace_logging_does_not_expose_untrusted_request_content() {
 }
 
 #[test]
-fn exact_one_mib_frame_is_accepted() {
+fn exact_one_mib_lf_frame_is_accepted() {
+    exact_one_mib_frame_is_accepted_with_terminator(b"\n");
+}
+
+#[test]
+fn exact_one_mib_crlf_frame_is_accepted() {
+    exact_one_mib_frame_is_accepted_with_terminator(b"\r\n");
+}
+
+fn exact_one_mib_frame_is_accepted_with_terminator(terminator: &[u8]) {
     const MAX_FRAME_BYTES: usize = 1024 * 1024;
 
     let root = tempfile::tempdir().unwrap();
@@ -345,7 +354,7 @@ fn exact_one_mib_frame_is_accepted() {
     request["params"]["_meta"]["padding"] = json!("x".repeat(MAX_FRAME_BYTES - base_len));
     let mut input = serde_json::to_vec(&request).unwrap();
     assert_eq!(input.len(), MAX_FRAME_BYTES);
-    input.push(b'\n');
+    input.extend_from_slice(terminator);
 
     let output = run_with_stdin(
         command(
@@ -363,6 +372,32 @@ fn exact_one_mib_frame_is_accepted() {
     assert!(output.stderr.is_empty());
     let messages = assert_json_rpc_only(&output.stdout);
     assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0]["result"]["protocolVersion"], "2026-07-28");
+}
+
+#[test]
+fn malformed_json_is_ignored_and_the_next_valid_frame_is_processed() {
+    let root = tempfile::tempdir().unwrap();
+    let requirement = requirement();
+    let input = b"{not-json}\n{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2026-07-28\",\"capabilities\":{},\"clientInfo\":{\"name\":\"test\",\"version\":\"1\"}}}\n";
+
+    let output = run_with_stdin(
+        command(
+            root.path(),
+            &root.path().join("store.sqlite"),
+            requirement.path(),
+        ),
+        input,
+    );
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    let messages = assert_json_rpc_only(&output.stdout);
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0]["id"], 1);
     assert_eq!(messages[0]["result"]["protocolVersion"], "2026-07-28");
 }
 
@@ -438,20 +473,25 @@ fn oversized_newline_frame_is_rejected_before_deserialization() {
 fn oversized_partial_frame_is_rejected_before_deserialization() {
     let root = tempfile::tempdir().unwrap();
     let requirement = requirement();
-    let output = run_with_stdin(
-        command(
-            root.path(),
-            &root.path().join("store.sqlite"),
-            requirement.path(),
-        ),
-        &vec![b'x'; 1024 * 1024 + 1],
-    );
-    assert!(!output.status.success());
-    assert!(output.stdout.is_empty());
-    assert_eq!(
-        String::from_utf8_lossy(&output.stderr),
-        "depgraph-mcp: inbound message rejected\n"
-    );
+    for input in [
+        vec![b'x'; 1024 * 1024 + 1],
+        [vec![b'x'; 1024 * 1024], vec![b'\r']].concat(),
+    ] {
+        let output = run_with_stdin(
+            command(
+                root.path(),
+                &root.path().join("store.sqlite"),
+                requirement.path(),
+            ),
+            &input,
+        );
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr),
+            "depgraph-mcp: inbound message rejected\n"
+        );
+    }
 }
 
 #[test]

@@ -242,6 +242,12 @@ where
                     Err(_) => return None,
                 };
                 if read == 0 {
+                    if self.frame.len() > MAX_INBOUND_MESSAGE_BYTES {
+                        self.state
+                            .inbound_rejected
+                            .store(true, std::sync::atomic::Ordering::Release);
+                        return None;
+                    }
                     self.state
                         .eof
                         .store(true, std::sync::atomic::Ordering::Release);
@@ -264,7 +270,9 @@ where
                     Err(_) => continue,
                 }
             }
-            if self.frame.len() == MAX_INBOUND_MESSAGE_BYTES {
+            let may_be_crlf_terminator =
+                self.frame.len() == MAX_INBOUND_MESSAGE_BYTES && byte == b'\r';
+            if self.frame.len() >= MAX_INBOUND_MESSAGE_BYTES && !may_be_crlf_terminator {
                 self.state
                     .inbound_rejected
                     .store(true, std::sync::atomic::Ordering::Release);
