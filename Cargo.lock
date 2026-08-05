@@ -523,6 +523,7 @@ dependencies = [
  "depgraph-core",
  "depgraph-mcp-tools",
  "rmcp",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

@@ -13,6 +13,7 @@ use depgraph_core::{
     DepgraphServiceLimits, VerifiedCompilerPack, read_compiler_pack_requirement,
     verify_compiler_pack,
 };
+use depgraph_mcp::runtime::{AuditLogger, RuntimeConfig, RuntimeController};
 use depgraph_mcp_tools::ToolCatalog;
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler, ServiceExt,
@@ -107,15 +108,22 @@ struct Args {
 }
 
 struct DepgraphMcpServer {
-    // Retained as immutable server state so later operation-journal handlers use this validated setup.
+    // Retained as immutable server state so tool handlers share one validated setup and runtime.
     service: DepgraphService,
     compiler_pack: VerifiedCompilerPack,
+    runtime: RuntimeController,
+    audit: AuditLogger,
     tools: Arc<[Tool]>,
 }
 
 impl ServerHandler for DepgraphMcpServer {
     fn get_info(&self) -> ServerInfo {
-        let _ = (&self.service, &self.compiler_pack);
+        let _ = (
+            &self.service,
+            &self.compiler_pack,
+            &self.runtime,
+            &self.audit,
+        );
         let mut tools = ToolsCapability::default();
         tools.list_changed = Some(false);
         let mut capabilities = ServerCapabilities::default();
@@ -337,9 +345,13 @@ fn build_server(args: &Args) -> Result<DepgraphMcpServer> {
     )
     .context("invalid server configuration")?;
 
+    let runtime = RuntimeController::new(RuntimeConfig::default())
+        .context("invalid MCP runtime configuration")?;
     Ok(DepgraphMcpServer {
         service: DepgraphService::new(config),
         compiler_pack,
+        runtime,
+        audit: AuditLogger::default(),
         tools,
     })
 }
