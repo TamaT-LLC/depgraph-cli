@@ -1,10 +1,14 @@
 use std::{collections::BTreeSet, fmt::Write as _};
 
 use depgraph_core::{DepgraphCapability, DepgraphCapabilitySet};
+use schemars::{JsonSchema, SchemaGenerator};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::MCP_TOOLS_CONTRACT_VERSION;
+use crate::{
+    AgentId, AgentLocator, Cursor, LogicalRepositoryId, MCP_TOOLS_CONTRACT_VERSION, OperationId,
+    SnapshotName,
+};
 
 macro_rules! define_cli_actions {
     ($($variant:ident => $stable_id:literal),+ $(,)?) => {
@@ -606,17 +610,19 @@ fn input_schema(spec: &ToolSpec) -> Map<String, Value> {
     );
     properties.insert(
         "repository_id".to_owned(),
-        json!({"type": "string", "minLength": 1, "maxLength": 256}),
+        scalar_schema::<LogicalRepositoryId>(),
     );
     for field in spec.input_fields {
         properties.insert((*field).to_owned(), field_schema(field));
     }
+    let mut required = vec!["contract_version", "repository_id"];
+    required.extend_from_slice(required_input_fields(spec.name));
     json_object(json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "title": format!("{}_input", spec.name),
         "type": "object",
         "properties": properties,
-        "required": ["contract_version", "repository_id"],
+        "required": required,
         "additionalProperties": false
     }))
 }
@@ -707,17 +713,47 @@ fn accepted_operation_output_schema() -> Value {
 
 fn field_schema(field: &str) -> Value {
     match field {
+        "cursor" => scalar_schema::<Cursor>(),
+        "operation_id" => scalar_schema::<OperationId>(),
+        "node_id" => scalar_schema::<AgentId>(),
+        "selector" | "from" | "to" => scalar_schema::<AgentLocator>(),
+        "name" => scalar_schema::<SnapshotName>(),
         "strict" | "no_cache" | "force" | "details" | "rust_compiler_precise" => {
             json!({"type": "boolean"})
         }
         "depth" | "limit" | "max_depth" | "max_paths" | "max_nodes" | "max_edges"
         | "profile_budget" => json!({"type": "integer", "minimum": 1}),
-        "selectors" | "kinds" | "profiles" => json!({
+        "selectors" => json!({
+            "type": "array",
+            "maxItems": 1024,
+            "items": scalar_schema::<AgentLocator>()
+        }),
+        "kinds" | "profiles" => json!({
             "type": "array",
             "maxItems": 1024,
             "items": {"type": "string", "minLength": 1, "maxLength": 4096}
         }),
         _ => json!({"type": "string", "minLength": 1, "maxLength": 1048576}),
+    }
+}
+
+fn scalar_schema<T: JsonSchema>() -> Value {
+    serde_json::to_value(T::json_schema(&mut SchemaGenerator::default()))
+        .expect("contract scalar schemas serialize")
+}
+
+fn required_input_fields(tool_name: &str) -> &'static [&'static str] {
+    match tool_name {
+        "agent_node_get" | "agent_edges_list" | "agent_evidence_list" => &["node_id"],
+        "snapshot_get" => &["snapshot"],
+        "graph_dependencies_list" | "graph_dependents_list" | "graph_impact_get" => &["selector"],
+        "graph_path_get" | "snapshot_diff_get" => &["from", "to"],
+        "graph_query" => &["query"],
+        "policy_evaluate" => &["policy"],
+        "graph_export" => &["format"],
+        "operation_get" | "operation_result" | "operation_cancel" => &["operation_id"],
+        "snapshot_name_create" => &["name"],
+        _ => &[],
     }
 }
 
