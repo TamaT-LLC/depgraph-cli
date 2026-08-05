@@ -1,6 +1,6 @@
 use std::{
     fs,
-    io::Write as _,
+    io::{Read as _, Write as _},
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
     sync::OnceLock,
@@ -159,15 +159,29 @@ fn run_with_stdin(mut command: Command, stdin: &[u8]) -> Output {
     let mut child = command.spawn().unwrap();
     child.stdin.as_mut().unwrap().write_all(stdin).unwrap();
     drop(child.stdin.take());
+    let mut stdout = child.stdout.take().unwrap();
+    let mut stderr = child.stderr.take().unwrap();
+    let stdout_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes).unwrap();
+        bytes
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stderr.read_to_end(&mut bytes).unwrap();
+        bytes
+    });
     let started = Instant::now();
     let status = child
         .wait_timeout(EOF_DEADLINE)
         .unwrap()
         .unwrap_or_else(|| panic!("process did not exit within {EOF_DEADLINE:?}"));
     assert!(started.elapsed() <= EOF_DEADLINE, "EOF deadline exceeded");
-    let output = child.wait_with_output().unwrap();
-    assert_eq!(output.status, status);
-    output
+    Output {
+        status,
+        stdout: stdout_reader.join().unwrap(),
+        stderr: stderr_reader.join().unwrap(),
+    }
 }
 
 fn assert_json_rpc_only(stdout: &[u8]) -> Vec<Value> {
@@ -299,6 +313,118 @@ fn initializes_legacy_2025_11_25() {
 #[test]
 fn initializes_modern_2026_07_28() {
     initializes("2026-07-28");
+}
+
+#[test]
+fn tools_list_is_profile_filtered_static_sorted_and_repeatable() {
+    let root = tempfile::tempdir().unwrap();
+    let requirement = requirement();
+
+    let read_only = tools_list(
+        command(
+            root.path(),
+            &root.path().join("read-store.sqlite"),
+            requirement.path(),
+        ),
+        24,
+    );
+    assert_eq!(
+        read_only,
+        EXPECTED_READ_ONLY_TOOLS
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+    );
+
+    let mut full_command = command(
+        root.path(),
+        &root.path().join("full-store.sqlite"),
+        requirement.path(),
+    );
+    full_command.args([
+        "--capability",
+        "store-write",
+        "--capability",
+        "repository-write",
+        "--capability",
+        "daemon-control",
+        "--capability",
+        "project-exec",
+    ]);
+    let full = tools_list(full_command, 31);
+    assert!(full.contains(&"scan_submit".to_owned()));
+    assert!(full.contains(&"repository_init".to_owned()));
+    assert!(full.contains(&"daemon_start_submit".to_owned()));
+    assert!(full.contains(&"resolve_build_submit".to_owned()));
+}
+
+const EXPECTED_READ_ONLY_TOOLS: &[&str] = &[
+    "agent_edges_list",
+    "agent_evidence_list",
+    "agent_node_get",
+    "agent_nodes_list",
+    "agent_sites_list",
+    "daemon_get",
+    "doctor_get",
+    "graph_cycles_list",
+    "graph_dependencies_list",
+    "graph_dependents_list",
+    "graph_export",
+    "graph_impact_get",
+    "graph_path_get",
+    "graph_query",
+    "graph_unresolved_list",
+    "operation_cancel",
+    "operation_get",
+    "operation_result",
+    "policy_evaluate",
+    "profile_plan_get",
+    "runtime_trace_validate",
+    "snapshot_diff_get",
+    "snapshot_get",
+    "snapshot_list",
+];
+
+fn tools_list(command: Command, expected_count: usize) -> Vec<String> {
+    let input = concat!(
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2026-07-28\",\"capabilities\":{},\"clientInfo\":{\"name\":\"catalog-test\",\"version\":\"1\"}}}\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{}}\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/list\",\"params\":{}}\n"
+    );
+    let output = run_with_stdin(command, input.as_bytes());
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    let messages = assert_json_rpc_only(&output.stdout);
+    assert_eq!(messages.len(), 3);
+    assert_eq!(
+        messages[0]["result"]["capabilities"]["tools"]["listChanged"],
+        false
+    );
+    assert_eq!(messages[1]["result"], messages[2]["result"]);
+
+    let tools = messages[1]["result"]["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), expected_count);
+    let names = tools
+        .iter()
+        .map(|tool| {
+            assert!(
+                tool["description"]
+                    .as_str()
+                    .is_some_and(|value| !value.is_empty())
+            );
+            assert!(tool["inputSchema"].is_object());
+            assert!(tool["outputSchema"].is_object());
+            tool["name"].as_str().unwrap().to_owned()
+        })
+        .collect::<Vec<_>>();
+    let mut sorted = names.clone();
+    sorted.sort_unstable();
+    assert_eq!(names, sorted);
+    names
 }
 
 #[test]

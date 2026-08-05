@@ -35,6 +35,7 @@ use depgraph_core::{
     validate_compiler_precise_cached_evidence, validate_explicit_profile_selection_capabilities,
     validate_interactive_query_bounds, web_build_protocol_ndjson, why_filtered,
 };
+use depgraph_mcp_tools::CliAction;
 use depgraph_protocol::canonical_json;
 use depgraph_store::{CompletedSnapshotDetails, CoverageRecord};
 use serde::Serialize;
@@ -414,6 +415,48 @@ enum RuntimeCommands {
         #[arg(long)]
         json: bool,
     },
+}
+
+/// Compile-time coverage bridge from the real clap command tree to the MCP catalog.
+///
+/// The absence of wildcard arms is intentional: adding a CLI leaf command without assigning its
+/// catalog action fails compilation. The catalog has a separate const assertion that every
+/// `CliAction` is mapped by at least one tool.
+#[allow(dead_code)]
+fn catalog_action_for_command(command: &Commands) -> CliAction {
+    match command {
+        Commands::Init { .. } => CliAction::Init,
+        Commands::Scan { .. } => CliAction::Scan,
+        Commands::Profiles { command } => match command {
+            ProfileCommands::Plan { .. } => CliAction::ProfilesPlan,
+        },
+        Commands::Daemon { command } => match command {
+            DaemonCommands::Start { .. } => CliAction::DaemonStart,
+            DaemonCommands::Status { .. } => CliAction::DaemonStatus,
+            DaemonCommands::Stop { .. } => CliAction::DaemonStop,
+        },
+        Commands::Resolve { .. } => CliAction::ResolveBuild,
+        Commands::Doctor { .. } => CliAction::Doctor,
+        Commands::Deps { .. } => CliAction::Deps,
+        Commands::Dependents { .. } => CliAction::Dependents,
+        Commands::Why { .. } => CliAction::Why,
+        Commands::Impact { .. } => CliAction::Impact,
+        Commands::Cycles { .. } => CliAction::Cycles,
+        Commands::Unresolved { .. } => CliAction::Unresolved,
+        Commands::Query { .. } => CliAction::Query,
+        Commands::Runtime { command } => match command {
+            RuntimeCommands::Validate { .. } => CliAction::RuntimeValidate,
+            RuntimeCommands::Import { .. } => CliAction::RuntimeImport,
+        },
+        Commands::Snapshot { command } => match command {
+            SnapshotCommands::Create { .. } => CliAction::SnapshotCreate,
+            SnapshotCommands::List { .. } => CliAction::SnapshotList,
+            SnapshotCommands::Show { .. } => CliAction::SnapshotShow,
+        },
+        Commands::Diff { .. } => CliAction::Diff,
+        Commands::Policy { .. } => CliAction::Policy,
+        Commands::Export { .. } => CliAction::Export,
+    }
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]

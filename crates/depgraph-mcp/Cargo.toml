@@ -13,6 +13,7 @@ path = "src/main.rs"
 anyhow.workspace = true
 clap.workspace = true
 depgraph-core = { path = "../depgraph-core" }
+depgraph-mcp-tools = { path = "../depgraph-mcp-tools" }
 rmcp = { version = "=3.1.0", default-features = false, features = ["server", "transport-io"] }
 serde_json.workspace = true
 tokio = { workspace = true, features = ["io-std"] }

@@ -1,10 +1,16 @@
 //! Closed, versioned Agent-facing data contracts for depgraph MCP tools.
 
+mod catalog;
 mod contract;
 mod dto;
 mod operation;
 mod scalar;
 mod schema;
+
+pub use catalog::{
+    ALL_CLI_ACTIONS, CapabilityProfile, CliAction, OperationBehavior, ToolAuthorization,
+    ToolCatalog, ToolDefinition,
+};
 
 pub use contract::{
     AgentCapability, AgentError, AgentErrorCategory, AgentErrorCode, AgentErrorDetails,

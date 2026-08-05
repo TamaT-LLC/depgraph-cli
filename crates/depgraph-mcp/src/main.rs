@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     io::{self, Write as _},
     path::PathBuf,
     process::ExitCode,
@@ -12,10 +13,14 @@ use depgraph_core::{
     DepgraphServiceLimits, VerifiedCompilerPack, read_compiler_pack_requirement,
     verify_compiler_pack,
 };
+use depgraph_mcp_tools::ToolCatalog;
 use rmcp::{
-    RoleServer, ServerHandler, ServiceExt,
-    model::{Implementation, ServerCapabilities, ServerInfo},
-    service::{RxJsonRpcMessage, TxJsonRpcMessage},
+    ErrorData as McpError, RoleServer, ServerHandler, ServiceExt,
+    model::{
+        Implementation, ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerInfo,
+        Tool, ToolsCapability,
+    },
+    service::{RequestContext, RxJsonRpcMessage, TxJsonRpcMessage},
     transport::Transport,
 };
 use tokio::{
@@ -105,15 +110,28 @@ struct DepgraphMcpServer {
     // Retained as immutable server state so later operation-journal handlers use this validated setup.
     service: DepgraphService,
     compiler_pack: VerifiedCompilerPack,
+    tools: Arc<[Tool]>,
 }
 
 impl ServerHandler for DepgraphMcpServer {
     fn get_info(&self) -> ServerInfo {
         let _ = (&self.service, &self.compiler_pack);
-        ServerInfo::new(ServerCapabilities::default()).with_server_info(
+        let mut tools = ToolsCapability::default();
+        tools.list_changed = Some(false);
+        let mut capabilities = ServerCapabilities::default();
+        capabilities.tools = Some(tools);
+        ServerInfo::new(capabilities).with_server_info(
             Implementation::new("depgraph-mcp", env!("CARGO_PKG_VERSION"))
                 .with_description("depgraph MCP server"),
         )
+    }
+
+    fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<ListToolsResult, McpError>> + '_ {
+        std::future::ready(Ok(ListToolsResult::with_all_items(self.tools.to_vec())))
     }
 }
 
@@ -295,6 +313,22 @@ fn build_server(args: &Args) -> Result<DepgraphMcpServer> {
         .context("invalid compiler pack requirement")?;
     let compiler_pack = verify_compiler_pack(&compiler_pack_requirement)
         .context("compiler pack verification failed")?;
+    let catalog = ToolCatalog::for_capabilities(&capabilities)
+        .map_err(anyhow::Error::msg)
+        .context("invalid tool catalog")?;
+    let tools = catalog
+        .tools()
+        .iter()
+        .map(|definition| {
+            let mut tool = Tool::default();
+            tool.name = Cow::Owned(definition.name().to_owned());
+            tool.description = Some(Cow::Owned(definition.description().to_owned()));
+            tool.input_schema = Arc::new(definition.input_schema().clone());
+            tool.output_schema = Some(Arc::new(definition.output_schema().clone()));
+            tool
+        })
+        .collect::<Vec<_>>()
+        .into();
     let config = DepgraphServiceConfig::new(
         &args.root,
         &args.store,
@@ -306,6 +340,7 @@ fn build_server(args: &Args) -> Result<DepgraphMcpServer> {
     Ok(DepgraphMcpServer {
         service: DepgraphService::new(config),
         compiler_pack,
+        tools,
     })
 }
 
