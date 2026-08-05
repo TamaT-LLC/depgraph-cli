@@ -17,6 +17,7 @@ path = "src/main.rs"
 anyhow.workspace = true
 clap.workspace = true
 depgraph-core = { path = "../depgraph-core" }
+depgraph-mcp-tools = { path = "../depgraph-mcp-tools" }
 depgraph-protocol = { path = "../depgraph-protocol" }
 depgraph-store = { path = "../depgraph-store" }
 serde.workspace = true
