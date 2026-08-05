@@ -1782,6 +1782,52 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
     Ok(())
 }
 
+fn markdown_table_rows_between(
+    document: &str,
+    start: Option<&str>,
+    end: &str,
+) -> Result<Vec<Vec<String>>> {
+    let section = match start {
+        Some(heading) => {
+            document
+                .split_once(heading)
+                .with_context(|| format!("missing markdown section {heading:?}"))?
+                .1
+        }
+        None => document,
+    };
+    let section = section
+        .split_once(end)
+        .with_context(|| format!("missing markdown section boundary {end:?}"))?
+        .0;
+    Ok(section
+        .lines()
+        .filter(|line| line.starts_with('|') && !line.contains("---"))
+        .map(|line| {
+            line.trim_matches('|')
+                .split('|')
+                .map(|cell| cell.trim().to_owned())
+                .collect()
+        })
+        .skip(1)
+        .collect())
+}
+
+fn markdown_count_table(document: &str, start: &str, end: &str) -> Result<BTreeMap<String, usize>> {
+    markdown_table_rows_between(document, Some(start), end)?
+        .into_iter()
+        .map(|row| {
+            if row.len() != 2 {
+                bail!("count table {start:?} contains a malformed row: {row:?}");
+            }
+            let count = row[1]
+                .parse::<usize>()
+                .with_context(|| format!("count table {start:?} has a nonnumeric count"))?;
+            Ok((row[0].clone(), count))
+        })
+        .collect()
+}
+
 fn verify_mcp_tasks_architecture_decision(root: &Path) -> Result<()> {
     const DOCUMENT_PATH: &str = "docs/40_arch_design/arch-mcp-agent-tools.md";
     const EXPECTED_FRONTMATTER: &str = "---\n\
@@ -1853,16 +1899,65 @@ open_questions: 0\n\
     verify_local_markdown_links(root, DOCUMENT_PATH, &decision)?;
 
     let index = fs::read_to_string(root.join("docs/00_index/index.md"))?;
-    for required in [
-        "| PROJ-ARC-002 | L4 | mcp-agent-tools | feature | [アーキテクチャ設計: MCP Agent Tools](../40_arch_design/arch-mcp-agent-tools.md) | Active |",
-        "| L4 | 2 |",
-        "| Total | 2 |",
-        "| Active | 2 |",
-        "| mcp-agent-tools | 1 |",
-    ] {
-        if !index.contains(required) {
-            bail!("documentation index is missing MCP Agent Tools marker {required:?}");
+    let architecture_rows =
+        markdown_table_rows_between(&index, None, "## Architecture Decision Records")?;
+    let mut ids = BTreeSet::new();
+    let mut layers = BTreeMap::from([
+        ("L0".to_owned(), 0),
+        ("L1".to_owned(), 0),
+        ("L2".to_owned(), 0),
+        ("L3".to_owned(), 0),
+        ("L4".to_owned(), 0),
+        ("L5".to_owned(), 0),
+    ]);
+    let mut statuses = BTreeMap::from([
+        ("Draft".to_owned(), 0),
+        ("Active".to_owned(), 0),
+        ("Deprecated".to_owned(), 0),
+    ]);
+    let mut features = BTreeMap::new();
+    let mut found_mcp_entry = false;
+    for row in &architecture_rows {
+        if row.len() != 6 {
+            bail!("documentation index contains a malformed architecture row: {row:?}");
         }
+        if !ids.insert(row[0].clone()) {
+            bail!(
+                "documentation index contains duplicate architecture ID {:?}",
+                row[0]
+            );
+        }
+        *layers
+            .get_mut(&row[1])
+            .with_context(|| format!("documentation index uses unknown layer {:?}", row[1]))? += 1;
+        *statuses
+            .get_mut(&row[5])
+            .with_context(|| format!("documentation index uses unknown status {:?}", row[5]))? += 1;
+        *features.entry(row[2].clone()).or_insert(0) += 1;
+        found_mcp_entry |= row
+            == &[
+                "PROJ-ARC-002",
+                "L4",
+                "mcp-agent-tools",
+                "feature",
+                "[アーキテクチャ設計: MCP Agent Tools](../40_arch_design/arch-mcp-agent-tools.md)",
+                "Active",
+            ];
+    }
+    if !found_mcp_entry {
+        bail!("documentation index is missing the canonical MCP Agent Tools entry");
+    }
+
+    let mut expected_layers = layers;
+    expected_layers.insert("Total".to_owned(), architecture_rows.len());
+    let indexed_layers = markdown_count_table(&index, "### レイヤー別", "### ステータス別")?;
+    let indexed_statuses = markdown_count_table(&index, "### ステータス別", "### 機能別")?;
+    let indexed_features = markdown_count_table(&index, "### 機能別", "## 更新履歴")?;
+    if indexed_layers != expected_layers
+        || indexed_statuses != statuses
+        || indexed_features != features
+    {
+        bail!("documentation index statistics do not match its architecture entries");
     }
     verify_local_markdown_links(root, "docs/00_index/index.md", &index)?;
     Ok(())
