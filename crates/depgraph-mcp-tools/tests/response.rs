@@ -169,6 +169,8 @@ fn mapper_redacts_sensitive_strings_from_closed_success_dtos() {
         "WITH 'top-secret' AS credential RETURN credential",
         "CREATE (n {token: 'top-secret'})",
         "CALL db.labels()",
+        "EXPLAIN SELECT * FROM credentials",
+        "/* audit */ SELECT * FROM credentials",
         "g.V().has('password', 'top-secret')",
         "C:/private/key",
         concat!("file", ":///Users/alice/private.db"),

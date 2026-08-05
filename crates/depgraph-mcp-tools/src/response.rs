@@ -769,8 +769,29 @@ fn sensitive_string(text: &str) -> bool {
         || looks_like_raw_query(trimmed)
 }
 
-fn looks_like_raw_query(trimmed: &str) -> bool {
+fn looks_like_raw_query(mut trimmed: &str) -> bool {
+    loop {
+        trimmed = trimmed.trim_start();
+        if let Some(comment) = trimmed.strip_prefix("--") {
+            let Some(line_end) = comment.find('\n') else {
+                return true;
+            };
+            trimmed = &comment[line_end + 1..];
+            continue;
+        }
+        if let Some(comment) = trimmed.strip_prefix("/*") {
+            let Some(comment_end) = comment.find("*/") else {
+                return true;
+            };
+            trimmed = &comment[comment_end + 2..];
+            continue;
+        }
+        break;
+    }
+
     [
+        "explain ",
+        "analyze ",
         "match ",
         "optional match ",
         "return ",
@@ -845,7 +866,7 @@ fn lowercase_sha256(bytes: &[u8]) -> String {
 mod tests {
     use serde::{Serialize, Serializer, ser::SerializeSeq};
 
-    use super::{ResponseMappingError, bounded_json_value, sensitive_field};
+    use super::{ResponseMappingError, bounded_json_value, looks_like_raw_query, sensitive_field};
 
     struct StreamingSequence;
 
@@ -866,6 +887,22 @@ mod tests {
     fn bounded_serializer_stops_streaming_values_at_the_hard_limit() {
         let result = bounded_json_value(&StreamingSequence, 128);
         assert!(matches!(result, Err(ResponseMappingError::OutputTooLarge)));
+    }
+
+    #[test]
+    fn query_modifiers_and_comments_cannot_bypass_redaction() {
+        for query in [
+            "EXPLAIN SELECT * FROM credentials",
+            "ANALYZE MATCH (n) RETURN n",
+            "-- audit\nSELECT * FROM credentials",
+            "/* audit */ SELECT * FROM credentials",
+            "/* first */ /* second */ CALL db.labels()",
+        ] {
+            assert!(
+                looks_like_raw_query(&query.to_ascii_lowercase()),
+                "query was not recognized: {query}"
+            );
+        }
     }
 
     #[test]
