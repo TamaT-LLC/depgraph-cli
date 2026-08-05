@@ -83,7 +83,7 @@ impl Store {
         // Touch metadata is best-effort and deliberately uses its own
         // autocommit write. A concurrent CLI writer may hold SQLite's single
         // writer lock; the already validated cached result remains usable.
-        let touched = best_effort_cache_write(
+        best_effort_cache_write(
             &self.connection,
             "UPDATE impact_query_cache
                 SET last_used_at=?2,
@@ -106,9 +106,6 @@ impl Store {
                 stored.payload_digest,
             ],
         );
-        if !touched {
-            return Ok(None);
-        }
         Ok(Some(stored.payload_json))
     }
 
@@ -345,7 +342,7 @@ mod tests {
         let started = Instant::now();
         assert_eq!(
             store.lookup_impact_query_cache(&key(0), "snapshot:sha256:test")?,
-            None
+            Some(r#"{"index":0}"#.to_owned())
         );
         assert!(started.elapsed() < Duration::from_millis(500));
         writer.execute_batch("ROLLBACK;")?;
