@@ -7,13 +7,17 @@ rust-version.workspace = true
 description = "Closed, versioned Agent DTO contracts for depgraph MCP tools"
 
 [dependencies]
+chacha20poly1305.workspace = true
 depgraph-core = { path = "../depgraph-core" }
 depgraph-protocol = { path = "../depgraph-protocol" }
+hex.workspace = true
+rmcp = { version = "=3.1.0", default-features = false }
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 jsonschema = { version = "0.47", default-features = false }
