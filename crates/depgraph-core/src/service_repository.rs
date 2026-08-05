@@ -635,7 +635,7 @@ fn identity_from_metadata(metadata: &fs::Metadata) -> RepositoryFileIdentity {
 pub(crate) fn repository_root_identity(
     canonical_root: &Path,
 ) -> DepgraphServiceResult<RepositoryFileIdentity> {
-    let root = open_windows_directory(canonical_root)?;
+    let root = open_windows_directory(canonical_root, false)?;
     identity_from_file(&root)
 }
 
@@ -666,7 +666,7 @@ fn open_windows_repository_input_after_root(
         Win32::Storage::FileSystem::{FILE_GENERIC_READ, FILE_SHARE_READ},
     };
 
-    let traversal = open_windows_parent(service, path, after_parents_opened)?;
+    let traversal = open_windows_parent(service, path, false, after_parents_opened)?;
     validate_windows_directories(&traversal.directories)?;
     let file = open_windows_at(
         traversal.parent(),
@@ -692,7 +692,7 @@ fn open_windows_repository_output_after_root(
         Win32::Storage::FileSystem::{FILE_GENERIC_WRITE, FILE_SHARE_READ},
     };
 
-    let traversal = open_windows_parent(service, path, after_parents_opened)?;
+    let traversal = open_windows_parent(service, path, true, after_parents_opened)?;
     validate_windows_directories(&traversal.directories)?;
     let file = match open_windows_at(
         traversal.parent(),
@@ -734,21 +734,23 @@ impl WindowsTraversal<'_> {
 fn open_windows_parent<'a>(
     service: &DepgraphService,
     path: &'a RepositoryRelativePath,
+    create_output: bool,
     after_parents_opened: impl FnOnce(),
 ) -> DepgraphServiceResult<WindowsTraversal<'a>> {
     let root = service.config().canonical_root();
-    let root = open_windows_directory(root)?;
+    let components = path.components().collect::<Vec<_>>();
+    let root = open_windows_directory(root, create_output && components.len() == 1)?;
     if identity_from_file(&root)? != *service.config().root_identity() {
         return Err(RepositoryFileError::BoundaryViolation.into());
     }
     let mut directories = vec![root];
-    let components = path.components().collect::<Vec<_>>();
-    for component in &components[..components.len() - 1] {
+    for (index, component) in components[..components.len() - 1].iter().enumerate() {
         let directory = open_windows_directory_at(
             directories
                 .last()
                 .expect("a traversal always retains its root handle"),
             OsStr::new(component),
+            create_output && index == components.len() - 2,
         )?;
         directories.push(directory);
     }
@@ -764,15 +766,21 @@ fn open_windows_parent<'a>(
 }
 
 #[cfg(windows)]
-fn open_windows_directory(path: &Path) -> DepgraphServiceResult<File> {
+fn open_windows_directory(path: &Path, create_child: bool) -> DepgraphServiceResult<File> {
     use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
     use windows_sys::Win32::Storage::FileSystem::{
-        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-        FILE_SHARE_READ, FILE_SHARE_WRITE,
+        FILE_ADD_FILE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, FILE_TRAVERSE, SYNCHRONIZE,
     };
 
+    let access = FILE_LIST_DIRECTORY
+        | FILE_TRAVERSE
+        | FILE_READ_ATTRIBUTES
+        | SYNCHRONIZE
+        | if create_child { FILE_ADD_FILE } else { 0 };
     let directory = fs::OpenOptions::new()
-        .read(true)
+        .access_mode(access)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)
@@ -785,19 +793,28 @@ fn open_windows_directory(path: &Path) -> DepgraphServiceResult<File> {
 }
 
 #[cfg(windows)]
-fn open_windows_directory_at(parent: &File, name: &OsStr) -> DepgraphServiceResult<File> {
+fn open_windows_directory_at(
+    parent: &File,
+    name: &OsStr,
+    create_child: bool,
+) -> DepgraphServiceResult<File> {
     use windows_sys::{
         Wdk::Storage::FileSystem::FILE_OPEN,
         Win32::Storage::FileSystem::{
-            FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
-            FILE_TRAVERSE, SYNCHRONIZE,
+            FILE_ADD_FILE, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_READ,
+            FILE_SHARE_WRITE, FILE_TRAVERSE, SYNCHRONIZE,
         },
     };
 
+    let access = FILE_LIST_DIRECTORY
+        | FILE_TRAVERSE
+        | FILE_READ_ATTRIBUTES
+        | SYNCHRONIZE
+        | if create_child { FILE_ADD_FILE } else { 0 };
     let directory = open_windows_at(
         parent,
         name,
-        FILE_LIST_DIRECTORY | FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+        access,
         FILE_SHARE_READ | FILE_SHARE_WRITE,
         FILE_OPEN,
         Some(true),
