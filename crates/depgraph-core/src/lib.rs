@@ -45,6 +45,8 @@ pub mod runtime_trace;
 pub mod rust_build_observer;
 pub mod scan;
 pub mod service;
+mod service_repository;
+mod service_snapshot;
 pub mod worker;
 
 use std::{
@@ -415,8 +417,10 @@ pub use service::{
     DepgraphCapability, DepgraphCapabilitySet, DepgraphMutatingContext, DepgraphMutatingUseCase,
     DepgraphMutatingUseCaseKind, DepgraphService, DepgraphServiceConfig,
     DepgraphServiceConfigurationError, DepgraphServiceError, DepgraphServiceErrorCategory,
-    DepgraphServiceLimit, DepgraphServiceLimits, DepgraphServiceResult, RequestReadStore,
-    RequestReadStoreFactory,
+    DepgraphServiceLimit, DepgraphServiceLimits, DepgraphServiceResult, OpenedRepositoryFile,
+    RepositoryFileError, RepositoryPathError, RepositoryPathSelector, RepositoryRelativePath,
+    RequestReadStore, RequestReadStoreFactory, ResolvedSnapshotId, SnapshotLocator,
+    SnapshotReadRequest,
 };
 
 use worker::{

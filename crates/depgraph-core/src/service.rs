@@ -7,6 +7,13 @@ use std::{
 
 use depgraph_store::Store;
 
+pub use crate::service_repository::{
+    MAX_REPOSITORY_PATH_BYTES, MAX_REPOSITORY_PATH_COMPONENT_BYTES, MAX_REPOSITORY_PATH_COMPONENTS,
+    OpenedRepositoryFile, RepositoryFileError, RepositoryPathError, RepositoryPathSelector,
+    RepositoryRelativePath,
+};
+pub use crate::service_snapshot::{ResolvedSnapshotId, SnapshotLocator, SnapshotReadRequest};
+
 pub const DEPGRAPH_SERVICE_LIMITS_VERSION: &str = "depgraph-service-limits-v1";
 pub const DEFAULT_SERVICE_MAX_INLINE_INPUT_BYTES: usize = 1024 * 1024;
 pub const DEFAULT_SERVICE_MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
@@ -224,6 +231,7 @@ impl Default for DepgraphServiceLimits {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DepgraphServiceConfig {
     canonical_root: PathBuf,
+    root_identity: crate::service_repository::RepositoryFileIdentity,
     store_path: PathBuf,
     capabilities: DepgraphCapabilitySet,
     limits: DepgraphServiceLimits,
@@ -237,10 +245,11 @@ impl DepgraphServiceConfig {
         limits: DepgraphServiceLimits,
     ) -> DepgraphServiceResult<Self> {
         validate_capabilities(&capabilities.values)?;
-        let canonical_root = canonical_repository_root(root.as_ref())?;
+        let (canonical_root, root_identity) = canonical_repository_root(root.as_ref())?;
         let store_path = fixed_store_path(store_path.as_ref())?;
         Ok(Self {
             canonical_root,
+            root_identity,
             store_path,
             capabilities,
             limits,
@@ -250,6 +259,10 @@ impl DepgraphServiceConfig {
     #[must_use]
     pub fn canonical_root(&self) -> &Path {
         &self.canonical_root
+    }
+
+    pub(crate) const fn root_identity(&self) -> &crate::service_repository::RepositoryFileIdentity {
+        &self.root_identity
     }
 
     #[must_use]
@@ -268,7 +281,9 @@ impl DepgraphServiceConfig {
     }
 }
 
-fn canonical_repository_root(root: &Path) -> DepgraphServiceResult<PathBuf> {
+fn canonical_repository_root(
+    root: &Path,
+) -> DepgraphServiceResult<(PathBuf, crate::service_repository::RepositoryFileIdentity)> {
     let canonical = root.canonicalize().map_err(|source| {
         DepgraphServiceError::from(DepgraphServiceConfigurationError::RootUnavailable { source })
     })?;
@@ -278,7 +293,13 @@ fn canonical_repository_root(root: &Path) -> DepgraphServiceResult<PathBuf> {
     if !metadata.is_dir() {
         return Err(DepgraphServiceConfigurationError::RootNotDirectory.into());
     }
-    Ok(canonical)
+    let identity =
+        crate::service_repository::repository_root_identity(&canonical).map_err(|error| {
+            DepgraphServiceError::from(DepgraphServiceConfigurationError::RootUnavailable {
+                source: io::Error::other(error),
+            })
+        })?;
+    Ok((canonical, identity))
 }
 
 fn fixed_store_path(path: &Path) -> DepgraphServiceResult<PathBuf> {
@@ -525,6 +546,10 @@ pub enum DepgraphServiceError {
     },
     #[error("required capability is not enabled: {required}")]
     CapabilityDenied { required: DepgraphCapability },
+    #[error("invalid repository-relative path: {reason}")]
+    InvalidRepositoryPath { reason: RepositoryPathError },
+    #[error("repository file access failed: {reason}")]
+    RepositoryFile { reason: RepositoryFileError },
     #[error("invalid service input")]
     InvalidInput,
     #[error("requested service resource was not found")]
@@ -562,7 +587,10 @@ impl DepgraphServiceError {
         match self {
             Self::InvalidConfiguration { .. } => DepgraphServiceErrorCategory::Configuration,
             Self::CapabilityDenied { .. } => DepgraphServiceErrorCategory::Authorization,
-            Self::InvalidInput => DepgraphServiceErrorCategory::Input,
+            Self::InvalidRepositoryPath { .. } | Self::InvalidInput => {
+                DepgraphServiceErrorCategory::Input
+            }
+            Self::RepositoryFile { reason } => reason.category(),
             Self::NotFound => DepgraphServiceErrorCategory::NotFound,
             Self::Conflict => DepgraphServiceErrorCategory::Conflict,
             Self::ResourceExhausted => DepgraphServiceErrorCategory::Resource,
