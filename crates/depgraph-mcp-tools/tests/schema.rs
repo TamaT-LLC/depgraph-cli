@@ -1,8 +1,9 @@
 use std::{path::Path, process::Command};
 
 use depgraph_mcp_tools::{
-    AgentError, AgentNode, AgentSourceSpan, MCP_TOOLS_SCHEMA_ID, Page, RepositoryRelativePath,
-    TaskAccepted, canonical_schema_bytes, canonical_schema_sha256, mcp_tools_v1_schema,
+    AgentError, AgentLocator, AgentNode, AgentSourceSpan, MCP_TOOLS_SCHEMA_ID, Page,
+    RepositoryRelativePath, TaskAccepted, canonical_schema_bytes, canonical_schema_sha256,
+    mcp_tools_v1_schema,
 };
 use serde_json::{Value, json};
 
@@ -284,6 +285,10 @@ fn schema_preflight_requires_authoritative_semantic_deserialization() {
         &byte_oversized_component
     ));
     assert!(serde_json::from_value::<RepositoryRelativePath>(byte_oversized_component).is_err());
+
+    let byte_oversized_locator = Value::String("é".repeat(1024));
+    assert!(schema_accepts("AgentLocator", &byte_oversized_locator));
+    assert!(serde_json::from_value::<AgentLocator>(byte_oversized_locator).is_err());
 }
 
 fn assert_all_object_schemas_are_closed(value: &Value, path: &str, objects: &mut usize) {
@@ -427,6 +432,45 @@ fn repository_path_schema_rejects_the_portability_corpus() {
         assert!(
             !validator.is_valid(&json!(invalid)),
             "path schema accepted {invalid:?}"
+        );
+    }
+}
+
+#[test]
+fn agent_locator_schema_rejects_absolute_path_escape_hatches() {
+    let schema = schema_value();
+    let wrapper = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$defs": schema["$defs"].clone(),
+        "$ref": "#/$defs/AgentLocator",
+    });
+    let validator = jsonschema::draft202012::new(&wrapper).expect("locator schema compiles");
+
+    assert!(validator.is_valid(&json!("repo://src/lib.rs")));
+    assert!(validator.is_valid(&json!("crate::dependency")));
+    assert!(validator.is_valid(&json!("@scope/package")));
+    for invalid in [
+        "repo:///Users/alice/private",
+        "repo://../private",
+        "repo://C:/Windows/win.ini",
+        "custom:/absolute/path",
+        "custom:C:/Windows/win.ini",
+        "custom:C:\\Windows\\win.ini",
+        "custom://server/share",
+        "C:/Windows/win.ini",
+        "C:\\Windows\\win.ini",
+        "C:secret",
+        "custom:C:secret",
+        "//server/share",
+        "\\\\server\\share",
+        "custom:file:/etc/passwd",
+        "file:src/lib.rs",
+        "opaque\nsecret",
+        "repo://src\tsecret/lib.rs",
+    ] {
+        assert!(
+            !validator.is_valid(&json!(invalid)),
+            "AgentLocator schema accepted non-portable locator {invalid:?}"
         );
     }
 }

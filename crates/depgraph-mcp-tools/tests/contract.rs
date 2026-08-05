@@ -2,13 +2,14 @@ use std::num::NonZeroU32;
 
 use depgraph_mcp_tools::{
     AcceptedOperationStatus, AgentCapability, AgentEdge, AgentError, AgentErrorCategory,
-    AgentErrorCode, AgentErrorDetails, AgentEvidence, AgentEvidenceKind, AgentNode, AgentPhase,
-    AgentPrecision, AgentRemediation, AgentResolutionStatus, AgentResourceLimit, AgentSite,
-    AgentSnapshot, AgentSourcePosition, AgentSourceSpan, CommonRequest, ContractBuildError, Cursor,
-    DurableSubmitResult, ErrorEnvelope, LogicalRepositoryId, MAX_PAGE_BYTES, MAX_PAGE_ITEMS,
-    MAX_TASK_TTL_MS, MIN_TASK_TTL_MS, OperationAccepted, OperationRecoveryTools, Page,
-    PageByteLimit, PageRequest, PageSize, RepositoryRelativePath, SnapshotId, SnapshotSelector,
-    SuccessEnvelope, TASK_POLL_INTERVAL_MS, TaskAccepted, TasksNegotiation, canonical_json_bytes,
+    AgentErrorCode, AgentErrorDetails, AgentEvidence, AgentEvidenceKind, AgentLocator, AgentNode,
+    AgentPhase, AgentPrecision, AgentRemediation, AgentResolutionStatus, AgentResourceLimit,
+    AgentSite, AgentSnapshot, AgentSourcePosition, AgentSourceSpan, CommonRequest,
+    ContractBuildError, Cursor, DurableSubmitResult, ErrorEnvelope, LogicalRepositoryId,
+    MAX_PAGE_BYTES, MAX_PAGE_ITEMS, MAX_TASK_TTL_MS, MIN_TASK_TTL_MS, OperationAccepted,
+    OperationRecoveryTools, Page, PageByteLimit, PageRequest, PageSize, RepositoryRelativePath,
+    SnapshotId, SnapshotSelector, SuccessEnvelope, TASK_POLL_INTERVAL_MS, TaskAccepted,
+    TasksNegotiation, canonical_json_bytes,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -257,6 +258,47 @@ fn closed_dto_prohibition_corpus_rejects_arbitrary_and_sensitive_fields() {
         assert!(
             serde_json::from_value::<AgentEvidence>(value).is_err(),
             "AgentEvidence accepted forbidden field {field}"
+        );
+    }
+}
+
+#[test]
+fn agent_locator_is_a_repository_relative_locator_not_an_absolute_path_escape_hatch() {
+    assert_eq!(
+        AgentLocator::parse("repo://src/lib.rs")
+            .expect("repository-relative locator")
+            .as_str(),
+        "repo://src/lib.rs"
+    );
+    assert!(AgentLocator::parse("crate::dependency").is_ok());
+    assert!(AgentLocator::parse("@scope/package").is_ok());
+
+    for invalid in [
+        "repo:///Users/alice/private",
+        "repo://../private",
+        "repo://C:/Windows/win.ini",
+        "custom:/absolute/path",
+        "custom:C:/Windows/win.ini",
+        "custom:C:\\Windows\\win.ini",
+        "custom://server/share",
+        "C:/Windows/win.ini",
+        "C:\\Windows\\win.ini",
+        "C:secret",
+        "custom:C:secret",
+        "//server/share",
+        "\\\\server\\share",
+        "custom:file:/etc/passwd",
+        "file:src/lib.rs",
+        "opaque\nsecret",
+        "repo://src\tsecret/lib.rs",
+    ] {
+        assert!(
+            AgentLocator::parse(invalid).is_err(),
+            "AgentLocator accepted non-portable locator {invalid:?}"
+        );
+        assert!(
+            serde_json::from_value::<AgentLocator>(json!(invalid)).is_err(),
+            "AgentLocator Serde accepted non-portable locator {invalid:?}"
         );
     }
 }

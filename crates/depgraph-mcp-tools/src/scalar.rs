@@ -226,15 +226,44 @@ string_newtype!(
     ContractValueError::AgentLocator,
     valid_agent_locator,
     json_schema!({
-        "allOf": [
+        "oneOf": [
             {
-                "type": "string",
-                "minLength": 1,
-                "maxLength": MAX_AGENT_LOCATOR_BYTES,
-                "pattern": r"^[^/\\\u0000][^\\\u0000]*$"
+                "allOf": [
+                    {
+                        "type": "string",
+                        "minLength": 8,
+                        "maxLength": MAX_AGENT_LOCATOR_BYTES,
+                        "pattern": r"^repo://[^/\\:\u0000-\u001F\u007F]+(?:/[^/\\:\u0000-\u001F\u007F]+){0,255}$"
+                    },
+                    { "not": { "pattern": r"(?:^repo://|/)[^/\\:\u0000]{256}" } },
+                    { "not": { "pattern": r"(?:^repo://|/)\.{1,2}(?:/|$)" } },
+                    { "not": { "pattern": r"(?:^repo://|/)[^/]*[. ](?:/|$)" } },
+                    {
+                        "not": {
+                            "pattern": concat!(
+                                r"(?:^repo://|/)(?:[Cc][Oo][Nn]|[Pp][Rr][Nn]|[Aa][Uu][Xx]|",
+                                r"[Nn][Uu][Ll]|[Cc][Ll][Oo][Cc][Kk]\$|[Cc][Oo][Nn][Ii][Nn]\$|",
+                                r"[Cc][Oo][Nn][Oo][Uu][Tt]\$|[Cc][Oo][Mm](?:[1-9]|[¹²³])|",
+                                r"[Ll][Pp][Tt](?:[1-9]|[¹²³]))(?:\.[^/]*)?(?:/|$)"
+                            )
+                        }
+                    }
+                ]
             },
-            { "not": { "pattern": r"^[A-Za-z]:[/\\]" } },
-            { "not": { "pattern": r"^[Ff][Ii][Ll][Ee]:" } }
+            {
+                "allOf": [
+                    {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": MAX_AGENT_LOCATOR_BYTES,
+                        "pattern": r"^[^/\\\u0000-\u001F\u007F][^\\\u0000-\u001F\u007F]*$"
+                    },
+                    { "not": { "pattern": r":/" } },
+                    { "not": { "pattern": r"//" } },
+                    { "not": { "pattern": r"(?:^|:)[A-Za-z]:" } },
+                    { "not": { "pattern": r"^[Ff][Ii][Ll][Ee]:" } }
+                ]
+            }
         ]
     })
 );
@@ -448,23 +477,30 @@ fn valid_agent_token(value: &str) -> bool {
 }
 
 fn valid_agent_locator(value: &str) -> bool {
-    if value.is_empty()
-        || value.len() > MAX_AGENT_LOCATOR_BYTES
-        || value.starts_with('/')
-        || value.starts_with('\\')
-        || value.contains('\\')
-        || value.bytes().any(|byte| byte.is_ascii_control())
-        || value
-            .get(..5)
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("file:"))
-    {
+    if value.len() > MAX_AGENT_LOCATOR_BYTES || value.bytes().any(|byte| byte.is_ascii_control()) {
         return false;
     }
-    let bytes = value.as_bytes();
-    !(bytes.len() >= 3
-        && bytes[0].is_ascii_alphabetic()
-        && bytes[1] == b':'
-        && matches!(bytes[2], b'/' | b'\\'))
+    if let Some(path) = value.strip_prefix("repo://") {
+        return CoreRepositoryRelativePath::parse(path).is_ok();
+    }
+    !value.is_empty()
+        && !value.starts_with('/')
+        && !value.starts_with('\\')
+        && !value.contains('\\')
+        && !value.contains(":/")
+        && !value.contains("//")
+        && !value
+            .as_bytes()
+            .windows(2)
+            .enumerate()
+            .any(|(index, pair)| {
+                pair[0].is_ascii_alphabetic()
+                    && pair[1] == b':'
+                    && (index == 0 || value.as_bytes()[index - 1] == b':')
+            })
+        && !value
+            .get(..5)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("file:"))
 }
 
 fn valid_agent_label(value: &str) -> bool {

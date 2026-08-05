@@ -43,7 +43,8 @@ runner、rmcp adapterは同issueのcontract crateへ含めず、後続taskの責
 生成JSON Schemaはclosed field・tag・scalar boundを検査するstructural preflightであり、
 Schema単独の受理をauthorizationやrepository/store accessの根拠にしてはならない。
 `returned_items == items.len()`、totalとの大小、source span順序、task時刻/expiryの算術、
-UTF-8 byte長はJSON Schema 2020-12で完全には表現できないため、consumerは必ず
+`RepositoryRelativePath`や`AgentLocator`を含むUTF-8 byte長はJSON Schema 2020-12で完全には
+表現できないため、consumerは必ず
 `depgraph-mcp-tools`でDeserializeするか同等のsemantic validationを実施する。
 Rust constructor/Deserializerがこれらのauthoritativeなfail-closed境界であり、
 schema/Serde差分は回帰testで意図的に固定する。
