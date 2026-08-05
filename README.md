@@ -189,6 +189,55 @@ depgraph export --format mermaid > graph.mmd
 depgraph export --format graphml --output graph.graphml
 ```
 
+### MCP stdio server (experimental)
+
+`depgraph-mcp` is a separate MCP stdio process. It requires an existing
+repository root, an explicit absolute store-file path, at least one explicit
+capability grant, and a validated compiler-pack requirement file. Its stdout is
+reserved exclusively for newline-delimited MCP JSON-RPC messages; bounded
+diagnostics and logs go to stderr. The current server supports MCP lifecycle
+initialization; tool registration will follow in later releases.
+
+```sh
+cargo run -p depgraph-mcp -- \
+  --root /path/to/repository \
+  --store /absolute/path/to/depgraph.sqlite \
+  --capability read \
+  --compiler-pack-requirement /absolute/path/to/compiler-pack-requirement.json \
+  --log-level warn
+```
+
+For an MCP client that launches local stdio servers, configure the executable
+and arguments equivalently (after building it with `cargo build -p
+depgraph-mcp`):
+
+```json
+{
+  "mcpServers": {
+    "depgraph": {
+      "command": "/absolute/path/to/depgraph-mcp",
+      "args": [
+        "--root", "/path/to/repository",
+        "--store", "/absolute/path/to/depgraph.sqlite",
+        "--capability", "read",
+        "--compiler-pack-requirement", "/absolute/path/to/compiler-pack-requirement.json",
+        "--log-level", "warn"
+      ]
+    }
+  }
+}
+```
+
+Repeat `--capability` to grant additional operations. Accepted values are
+`read`, `store-write`, `repository-write`, `daemon-control`, and `project-exec`;
+dependency-invalid combinations fail closed during startup.
+
+Inbound MCP JSON messages are limited to 1 MiB before JSON deserialization;
+the server fails closed when that bound is exceeded. The requirement file must
+be a regular non-symlink file no larger than 1 MiB; its manifest, closed tree,
+host/target, checksum reference, and artifact integrity are verified by
+`depgraph-core` before the server accepts MCP input.
+
 SQLite is stored under the operating system cache directory, keyed by the canonical repository root. Use global `--store PATH` for a specific database and global `--scan-id ID` to inspect a retained partial scan. Queries default to the latest successful scan; `doctor` reports the latest attempt.
 
 `doctor` emits a bounded summary by default. The summary reads diagnostic

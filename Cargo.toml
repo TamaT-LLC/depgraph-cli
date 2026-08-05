@@ -4,6 +4,7 @@ members = [
   "crates/depgraph-cli",
   "crates/depgraph-core",
   "crates/depgraph-mcp-tools",
+  "crates/depgraph-mcp",
   "crates/depgraph-protocol",
   "crates/depgraph-rustc-wrapper",
   "crates/depgraph-store",
