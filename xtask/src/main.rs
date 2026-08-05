@@ -1156,6 +1156,7 @@ fn is_lower_hex_len(value: &str, length: usize) -> bool {
 
 fn verify_project_metadata(root: &Path) -> Result<()> {
     verify_github_actions_security(root)?;
+    verify_mcp_tasks_architecture_decision(root)?;
     let cargo_manifest = fs::read_to_string(root.join("Cargo.toml"))?;
     if !cargo_manifest
         .lines()
@@ -1778,6 +1779,187 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
             bail!("CI workflow is missing {required:?}");
         }
     }
+    Ok(())
+}
+
+fn markdown_table_rows_between(
+    document: &str,
+    start: Option<&str>,
+    end: &str,
+) -> Result<Vec<Vec<String>>> {
+    let section = match start {
+        Some(heading) => {
+            document
+                .split_once(heading)
+                .with_context(|| format!("missing markdown section {heading:?}"))?
+                .1
+        }
+        None => document,
+    };
+    let section = section
+        .split_once(end)
+        .with_context(|| format!("missing markdown section boundary {end:?}"))?
+        .0;
+    Ok(section
+        .lines()
+        .filter(|line| line.starts_with('|') && !line.contains("---"))
+        .map(|line| {
+            line.trim_matches('|')
+                .split('|')
+                .map(|cell| cell.trim().to_owned())
+                .collect()
+        })
+        .skip(1)
+        .collect())
+}
+
+fn markdown_count_table(document: &str, start: &str, end: &str) -> Result<BTreeMap<String, usize>> {
+    markdown_table_rows_between(document, Some(start), end)?
+        .into_iter()
+        .map(|row| {
+            if row.len() != 2 {
+                bail!("count table {start:?} contains a malformed row: {row:?}");
+            }
+            let count = row[1]
+                .parse::<usize>()
+                .with_context(|| format!("count table {start:?} has a nonnumeric count"))?;
+            Ok((row[0].clone(), count))
+        })
+        .collect()
+}
+
+fn verify_mcp_tasks_architecture_decision(root: &Path) -> Result<()> {
+    const DOCUMENT_PATH: &str = "docs/40_arch_design/arch-mcp-agent-tools.md";
+    const EXPECTED_FRONTMATTER: &str = "---\n\
+id: PROJ-ARC-002\n\
+layer: L4\n\
+feature: mcp-agent-tools\n\
+scope: feature\n\
+status: Active\n\
+upstream: [PROJ-ARC-001]\n\
+downstream: []\n\
+owner: TakehiroT\n\
+updated: 2026-08-05\n\
+open_questions: 0\n\
+---\n";
+
+    let decision = fs::read_to_string(root.join(DOCUMENT_PATH))?;
+    if !decision.starts_with(EXPECTED_FRONTMATTER) || !decision.ends_with('\n') {
+        bail!("MCP Agent Tools architecture frontmatter is missing, open, or noncanonical");
+    }
+    for required in [
+        "# アーキテクチャ設計: MCP Agent Tools",
+        "| `Q-002` | baseline handleへMCP Tasksを追加するか | **Resolved: Option Aを採用する** |",
+        "**Option A（baseline operation handle + MCP Tasks）を採用する。**",
+        "`rmcp 3.1.0`",
+        "1f9358eddca42d3a510c70ae6446dd6548c7c856",
+        "`io.modelcontextprotocol/tasks`",
+        "`taskId == operation_id`",
+        "## Portable baseline operation contract",
+        "`operation_get`",
+        "`operation_result`",
+        "`operation_cancel`",
+        "## MCP Tasks additive contract",
+        "### Capability negotiation and legacy fallback",
+        "`2025-11-25` experimental",
+        "baseline `OperationAccepted`",
+        "`-32021` Missing Required Client Capability",
+        "CallToolResponse = Complete(CallToolResult<OperationAccepted>)",
+        "| `queued` / `running` / `cancelling` | `working` |",
+        "### `tasks/cancel` authorization",
+        "不足時は`CAPABILITY_DENIED`",
+        "journal digest、lease、runnerを\n   変更しない",
+        "### Disconnect, restart, and reconnection",
+        "再接続先がTasks非対応、extension未宣言、またはlegacy protocolでも",
+        "## Compatibility and conformance tests",
+        "| Legacy fallback |",
+        "| Cancel authorization |",
+        "| `Q-002` | **Resolved** | Option Aを採用する。",
+        "`open_questions`は`0`である。",
+        "## Issue #292 acceptance mapping",
+    ] {
+        if !decision.contains(required) {
+            bail!("MCP Tasks architecture decision is missing {required:?}");
+        }
+    }
+    for forbidden in [
+        "open_questions: 1",
+        "| `Q-002` | Open |",
+        "| `Q-002` | Pending |",
+        "TODO",
+        "TBD",
+    ] {
+        if decision.contains(forbidden) {
+            bail!("MCP Tasks architecture decision contains unresolved marker {forbidden:?}");
+        }
+    }
+    if decision.matches("```").count() % 2 != 0 {
+        bail!("MCP Tasks architecture decision contains an unclosed code fence");
+    }
+    verify_local_markdown_links(root, DOCUMENT_PATH, &decision)?;
+
+    let index = fs::read_to_string(root.join("docs/00_index/index.md"))?;
+    let architecture_rows =
+        markdown_table_rows_between(&index, None, "## Architecture Decision Records")?;
+    let mut ids = BTreeSet::new();
+    let mut layers = BTreeMap::from([
+        ("L0".to_owned(), 0),
+        ("L1".to_owned(), 0),
+        ("L2".to_owned(), 0),
+        ("L3".to_owned(), 0),
+        ("L4".to_owned(), 0),
+        ("L5".to_owned(), 0),
+    ]);
+    let mut statuses = BTreeMap::from([
+        ("Draft".to_owned(), 0),
+        ("Active".to_owned(), 0),
+        ("Deprecated".to_owned(), 0),
+    ]);
+    let mut features = BTreeMap::new();
+    let mut found_mcp_entry = false;
+    for row in &architecture_rows {
+        if row.len() != 6 {
+            bail!("documentation index contains a malformed architecture row: {row:?}");
+        }
+        if !ids.insert(row[0].clone()) {
+            bail!(
+                "documentation index contains duplicate architecture ID {:?}",
+                row[0]
+            );
+        }
+        *layers
+            .get_mut(&row[1])
+            .with_context(|| format!("documentation index uses unknown layer {:?}", row[1]))? += 1;
+        *statuses
+            .get_mut(&row[5])
+            .with_context(|| format!("documentation index uses unknown status {:?}", row[5]))? += 1;
+        *features.entry(row[2].clone()).or_insert(0) += 1;
+        found_mcp_entry |= row
+            == &[
+                "PROJ-ARC-002",
+                "L4",
+                "mcp-agent-tools",
+                "feature",
+                "[アーキテクチャ設計: MCP Agent Tools](../40_arch_design/arch-mcp-agent-tools.md)",
+                "Active",
+            ];
+    }
+    if !found_mcp_entry {
+        bail!("documentation index is missing the canonical MCP Agent Tools entry");
+    }
+
+    let mut expected_layers = layers;
+    expected_layers.insert("Total".to_owned(), architecture_rows.len());
+    let indexed_layers = markdown_count_table(&index, "### レイヤー別", "### ステータス別")?;
+    let indexed_statuses = markdown_count_table(&index, "### ステータス別", "### 機能別")?;
+    let indexed_features = markdown_count_table(&index, "### 機能別", "## 更新履歴")?;
+    if indexed_layers != expected_layers
+        || indexed_statuses != statuses
+        || indexed_features != features
+    {
+        bail!("documentation index statistics do not match its architecture entries");
+    }
+    verify_local_markdown_links(root, "docs/00_index/index.md", &index)?;
     Ok(())
 }
 
@@ -12221,8 +12403,8 @@ mod tests {
         target_native_smoke_expectation, validate_bounded_query_package_smoke,
         validate_cross_language_package_smoke, verify_checksum_sidecar,
         verify_cross_language_package_smoke, verify_github_actions_security,
-        verify_local_markdown_links, verify_packaged_cross_language,
-        verify_pinned_rust_sysroot_digest, verify_project_metadata,
+        verify_local_markdown_links, verify_mcp_tasks_architecture_decision,
+        verify_packaged_cross_language, verify_pinned_rust_sysroot_digest, verify_project_metadata,
         verify_public_community_surface, verify_release_tag_values,
         verify_rust_analyzer_dependencies, verify_rust_backend, verify_security_disclosure_dry_run,
         verify_stable_release_source_guard, verify_web_semantic_attestation,
@@ -12269,6 +12451,11 @@ mod tests {
     #[test]
     fn public_community_surface_is_closed_and_linked() -> Result<()> {
         verify_public_community_surface(&workspace_root())
+    }
+
+    #[test]
+    fn mcp_tasks_architecture_decision_is_closed_and_linked() -> Result<()> {
+        verify_mcp_tasks_architecture_decision(&workspace_root())
     }
 
     #[test]

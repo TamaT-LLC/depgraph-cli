@@ -3,6 +3,7 @@
 | ID | Layer | Feature | Scope | Title | Status |
 | --- | --- | --- | --- | --- | --- |
 | PROJ-ARC-001 | L4 | dependency-graph | feature | アーキテクチャ設計: Semantic Dependency Graph CLI | Active |
+| PROJ-ARC-002 | L4 | mcp-agent-tools | feature | [アーキテクチャ設計: MCP Agent Tools](../40_arch_design/arch-mcp-agent-tools.md) | Active |
 
 ## Architecture Decision Records
 
@@ -29,16 +30,16 @@
 | L1 | 0 |
 | L2 | 0 |
 | L3 | 0 |
-| L4 | 1 |
+| L4 | 2 |
 | L5 | 0 |
-| Total | 1 |
+| Total | 2 |
 
 ### ステータス別
 
 | Status | Count |
 | --- | ---: |
 | Draft | 0 |
-| Active | 1 |
+| Active | 2 |
 | Deprecated | 0 |
 
 ### 機能別
@@ -46,9 +47,11 @@
 | Feature | Count |
 | --- | ---: |
 | dependency-graph | 1 |
+| mcp-agent-tools | 1 |
 
 ## 更新履歴
 
+- 2026-08-05: `PROJ-ARC-002` のMCP Tasks decisionを追加し、`Q-002`をResolvedへ更新
 - 2026-08-02: GitHub Actionsを使ったリリース手順を追加
 - 2026-07-25: `PROJ-ARC-001-ADR-006` を追加
 - 2026-07-25: `PROJ-ARC-001-ADR-005` を追加
