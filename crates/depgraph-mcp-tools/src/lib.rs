@@ -21,9 +21,11 @@ pub use contract::{
     SuccessEnvelope,
 };
 pub use dto::{
-    AgentEdge, AgentEvidence, AgentEvidenceKind, AgentNode, AgentPhase, AgentPrecision,
-    AgentResolutionStatus, AgentSite, AgentSnapshot, AgentSnapshotAvailability,
-    AgentSourcePosition, AgentSourceSpan, MAX_AGENT_EVIDENCE_ITEMS, MAX_AGENT_TARGET_ITEMS,
+    AgentCompletedSnapshot, AgentContext, AgentCoverage, AgentCurrentSnapshot, AgentEdge,
+    AgentEvidence, AgentEvidenceKind, AgentNamedSnapshot, AgentNode, AgentNodeSummary, AgentPhase,
+    AgentPrecision, AgentResolutionStatus, AgentSite, AgentSnapshot, AgentSnapshotAvailability,
+    AgentSourcePosition, AgentSourceSpan, MAX_AGENT_EVIDENCE_ITEMS,
+    MAX_AGENT_SNAPSHOT_METADATA_ITEMS, MAX_AGENT_TARGET_ITEMS,
 };
 pub use operation::{
     AcceptedOperationStatus, AcceptedTaskStatus, BaselineOperationTool, DurableSubmitResult,

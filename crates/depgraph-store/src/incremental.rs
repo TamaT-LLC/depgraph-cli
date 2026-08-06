@@ -870,6 +870,14 @@ pub(super) fn semantic_noop_snapshot_identity(
     parent_snapshot_id: &str,
     source_revision: Option<&str>,
 ) -> Result<(String, Vec<String>)> {
+    let scan_parent_snapshot_id = connection.query_row(
+        "SELECT parent_snapshot_id FROM scans WHERE id=?1",
+        [scan_id],
+        |row| row.get::<_, Option<String>>(0),
+    )?;
+    if scan_parent_snapshot_id.as_deref() != Some(parent_snapshot_id) {
+        bail!("completed snapshot parent differs from its semantic overlay scan parent");
+    }
     let parent = load_completed_snapshot_record(connection, parent_snapshot_id)?
         .with_context(|| format!("semantic no-op parent {parent_snapshot_id} was not found"))?;
     let mut nodes = load_raw_records(connection, "nodes", scan_id)?
@@ -928,6 +936,7 @@ fn insert_semantic_noop_completed_snapshot(
     {
         bail!("completed semantic no-op snapshot identity collision for {snapshot_id}");
     }
+    super::persist_completed_snapshot_seal(connection, snapshot_id)?;
     connection.execute(
         "INSERT INTO snapshot_sources(source_kind, source_attempt_id, snapshot_id, promoted_at)
          VALUES ('scan', ?1, ?2, ?3)",
@@ -2215,6 +2224,39 @@ mod tests {
             .unwrap()
     }
 
+    fn completed_semantic_noop_fixture(
+        label: &str,
+    ) -> (Store, String, String, String, StableGraphIds) {
+        let mut store = Store::open_in_memory().unwrap();
+        let base_scan_id = format!("{label}-base");
+        let overlay_scan_id = format!("{label}-overlay");
+        let (events, ids) = stable_graph_events(&base_scan_id);
+        let base_id = complete(&mut store, &base_scan_id, &events);
+        let projection = store
+            .semantic_noop_delta_base(&base_id, "src/index.ts")
+            .unwrap()
+            .unwrap();
+        let delta = validated_node_delta(
+            &overlay_scan_id,
+            &projection,
+            &ids.source,
+            &format!("sha256:{}", "2".repeat(64)),
+        );
+        let snapshot_id = store
+            .commit_semantic_noop_delta(
+                &overlay_scan_id,
+                Path::new("/fixture"),
+                false,
+                &base_id,
+                Some("revision-overlay"),
+                &delta,
+                "",
+                false,
+            )
+            .unwrap();
+        (store, snapshot_id, base_scan_id, overlay_scan_id, ids)
+    }
+
     fn replacement_events(scan_id: &str) -> Vec<Value> {
         graph_events(scan_id, true)
             .into_iter()
@@ -2765,5 +2807,151 @@ mod tests {
                     .is_none()
             );
         }
+    }
+
+    #[test]
+    fn corrupted_unknown_node_semantic_noop_fails_loader_and_paged_projection() {
+        let (mut store, snapshot_id, _, overlay_scan_id, _) =
+            completed_semantic_noop_fixture("semantic-noop-unknown");
+        store
+            .connection
+            .execute(
+                "UPDATE nodes
+                    SET id='file:unknown', locator='src/unknown.ts',
+                        display_name='src/unknown.ts'
+                  WHERE scan_id=?1",
+                [&overlay_scan_id],
+            )
+            .unwrap();
+
+        let loader_error = store
+            .load_completed_snapshot(&snapshot_id)
+            .expect_err("the canonical loader must reject an unknown overlay node");
+        assert!(loader_error.to_string().contains("unknown node"));
+        store
+            .find_completed_snapshot_nodes_page(
+                &snapshot_id,
+                "file:unknown",
+                crate::NodeTextMatch::Exact,
+                &[],
+                0,
+                10,
+                || false,
+            )
+            .expect_err("the paged projection must fail closed with the canonical loader");
+    }
+
+    #[test]
+    fn corrupted_semantic_noop_shape_parent_and_public_identity_fail_closed() {
+        for corruption in ["multiple", "missing-parent", "cycle", "public-identity"] {
+            let (mut store, snapshot_id, base_scan_id, overlay_scan_id, ids) =
+                completed_semantic_noop_fixture(corruption);
+            match corruption {
+                "multiple" => {
+                    store
+                        .connection
+                        .execute(
+                            "INSERT INTO nodes(
+                                scan_id, id, kind, locator, display_name,
+                                properties_json, raw_json
+                             ) SELECT ?1, id, kind, locator, display_name,
+                                      properties_json, raw_json
+                                 FROM nodes WHERE scan_id=?2 AND id=?3",
+                            params![overlay_scan_id, base_scan_id, ids.target],
+                        )
+                        .unwrap();
+                }
+                "missing-parent" => {
+                    store
+                        .connection
+                        .execute_batch("PRAGMA foreign_keys=OFF;")
+                        .unwrap();
+                    store
+                        .connection
+                        .execute(
+                            "UPDATE completed_snapshots
+                                SET parent_snapshot_id='snapshot:missing'
+                              WHERE id=?1",
+                            [&snapshot_id],
+                        )
+                        .unwrap();
+                    store
+                        .connection
+                        .execute_batch("PRAGMA foreign_keys=ON;")
+                        .unwrap();
+                }
+                "cycle" => {
+                    store
+                        .connection
+                        .execute(
+                            "UPDATE completed_snapshots SET parent_snapshot_id=id WHERE id=?1",
+                            [&snapshot_id],
+                        )
+                        .unwrap();
+                }
+                "public-identity" => {
+                    store
+                        .connection
+                        .execute(
+                            "UPDATE nodes SET display_name='changed identity' WHERE scan_id=?1",
+                            [&overlay_scan_id],
+                        )
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+
+            assert!(
+                store.load_completed_snapshot(&snapshot_id).is_err(),
+                "canonical loader accepted {corruption} semantic no-op corruption"
+            );
+            assert!(
+                store
+                    .find_completed_snapshot_nodes_page(
+                        &snapshot_id,
+                        "",
+                        crate::NodeTextMatch::Contains,
+                        &[],
+                        0,
+                        10,
+                        || false,
+                    )
+                    .is_err(),
+                "paged projection accepted {corruption} semantic no-op corruption"
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_loader_rejects_completed_and_scan_parent_mismatch() {
+        let (mut store, snapshot_id, _, overlay_scan_id, _) =
+            completed_semantic_noop_fixture("semantic-noop-parent-mismatch");
+        store
+            .connection
+            .execute(
+                "UPDATE scans SET parent_snapshot_id=?1 WHERE id=?2",
+                params![snapshot_id, overlay_scan_id],
+            )
+            .unwrap();
+
+        let error = store
+            .load_completed_snapshot(&snapshot_id)
+            .expect_err("canonical loader must reject conflicting parent relationships");
+        assert!(error.to_string().contains("parent"));
+        let identity_error = store
+            .verify_snapshot_integrity(&snapshot_id)
+            .expect_err("snapshot identity must reject conflicting parent relationships");
+        assert!(identity_error.to_string().contains("parent"));
+        store
+            .find_completed_snapshot_nodes_page(
+                &snapshot_id,
+                "",
+                crate::NodeTextMatch::Contains,
+                &[],
+                0,
+                10,
+                || false,
+            )
+            .expect_err("paged projection must reject conflicting parent relationships");
     }
 }

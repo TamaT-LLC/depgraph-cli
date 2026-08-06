@@ -980,6 +980,79 @@ mod tests {
         Ok((store, snapshot_id, snapshot))
     }
 
+    fn assert_node_page_matches_snapshot(
+        store: &mut Store,
+        snapshot_id: &str,
+        snapshot: &GraphSnapshot,
+    ) -> Result<()> {
+        let expected = snapshot
+            .nodes
+            .iter()
+            .map(|node| super::super::NodeSummaryRecord {
+                id: node.id.clone(),
+                kind: node.kind.clone(),
+                locator: node.locator.clone(),
+                display_name: node.display_name.clone(),
+            })
+            .collect::<Vec<_>>();
+        let page = store.find_completed_snapshot_nodes_page(
+            snapshot_id,
+            "",
+            super::super::NodeTextMatch::Contains,
+            &[],
+            0,
+            expected.len().max(1),
+            || false,
+        )?;
+        assert_eq!(page.total_items, expected.len() as u64);
+        assert_eq!(page.items, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn paged_node_projection_rejects_invalid_runtime_metadata_and_non_node_rows() -> Result<()> {
+        for corruption in ["metadata", "edge"] {
+            let (mut store, base_snapshot_id, base) = seeded_store()?;
+            let imported = store
+                .import_runtime_session(&base_snapshot_id, valid_delta(&base_snapshot_id, &base))?;
+            match corruption {
+                "metadata" => {
+                    store.connection.execute(
+                        "UPDATE runtime_sessions
+                            SET coverage_json=json_set(coverage_json, '$.profiles', 'invalid')
+                          WHERE id=?1",
+                        [&imported.session_id],
+                    )?;
+                }
+                "edge" => {
+                    store.connection.execute(
+                        "UPDATE runtime_edges
+                            SET raw_json=json_set(raw_json, '$.generated', 'invalid')
+                          WHERE session_id=?1",
+                        [&imported.session_id],
+                    )?;
+                }
+                _ => unreachable!(),
+            }
+
+            store
+                .load_completed_snapshot(&imported.snapshot_id)
+                .expect_err("canonical runtime decoding must reject the corruption");
+            store
+                .find_completed_snapshot_nodes_page(
+                    &imported.snapshot_id,
+                    "",
+                    super::super::NodeTextMatch::Contains,
+                    &[],
+                    0,
+                    10,
+                    || false,
+                )
+                .expect_err("paged projection must reject the same runtime corruption");
+        }
+        Ok(())
+    }
+
     fn valid_delta(base_snapshot_id: &str, base: &GraphSnapshot) -> RuntimeSessionDelta {
         let profile_id = "profile:runtime".to_owned();
         let session_id = "runtime-session:test".to_owned();
@@ -1227,6 +1300,13 @@ mod tests {
     fn later_build_promotion_preserves_imported_runtime_sessions() -> Result<()> {
         let (mut store, base_snapshot_id, base) = seeded_store()?;
         let mut delta = valid_delta(&base_snapshot_id, &base);
+        delta.nodes.push(NodeRecord {
+            id: "runtime:build-layer".to_owned(),
+            kind: "runtime_target".to_owned(),
+            locator: "runtime://build-layer".to_owned(),
+            display_name: "runtime build layer".to_owned(),
+            properties: json!({"runtime_only": true}),
+        });
         delta.diagnostics.push(DiagnosticRecord {
             ordinal: 0,
             id: "diagnostic:runtime".to_owned(),
@@ -1245,6 +1325,8 @@ mod tests {
             }),
         });
         let imported = store.import_runtime_session(&base_snapshot_id, delta)?;
+        let imported_snapshot = store.load_completed_snapshot(&imported.snapshot_id)?;
+        assert_node_page_matches_snapshot(&mut store, &imported.snapshot_id, &imported_snapshot)?;
         let audit = json!({
             "schema_version":"1.0",
             "run_id":"build-after-runtime",
@@ -1288,6 +1370,13 @@ mod tests {
         );
         let snapshot = store.load_completed_snapshot(&current_id)?;
         assert!(snapshot.edges.iter().any(|edge| edge.id == "edge:runtime"));
+        assert!(
+            snapshot
+                .nodes
+                .iter()
+                .any(|node| node.id == "runtime:build-layer")
+        );
+        assert_node_page_matches_snapshot(&mut store, &current_id, &snapshot)?;
         let doctor_summary = store.scan_attempt_summary("runtime-atomic")?;
         assert_eq!(doctor_summary.coverage, snapshot.coverage);
         assert_eq!(
@@ -1359,6 +1448,121 @@ mod tests {
                 .count(),
             4
         );
+        Ok(())
+    }
+
+    #[test]
+    fn semantic_noop_over_runtime_includes_inherited_runtime_only_nodes_in_paged_projection()
+    -> Result<()> {
+        let (mut store, base_snapshot_id, base) = seeded_store()?;
+        let mut delta = valid_delta(&base_snapshot_id, &base);
+        delta.nodes.push(NodeRecord {
+            id: "runtime:only".to_owned(),
+            kind: "runtime_target".to_owned(),
+            locator: "runtime://only".to_owned(),
+            display_name: "runtime only".to_owned(),
+            properties: json!({"runtime_only": true}),
+        });
+        let runtime_snapshot_id = store
+            .import_runtime_session(&base_snapshot_id, delta)?
+            .snapshot_id;
+        let runtime_snapshot = store.load_completed_snapshot(&runtime_snapshot_id)?;
+        let overlay_node = runtime_snapshot
+            .nodes
+            .iter()
+            .find(|node| node.id == "file:source")
+            .context("base file node")?
+            .clone();
+        let semantic_scan_id = "semantic-over-runtime";
+        let tx = store.connection.transaction()?;
+        tx.execute(
+            "INSERT INTO scans(
+                id, root, status, strict, started_at, completed_at,
+                project_code_executed, protocol_version, parent_snapshot_id,
+                source_revision, mutation_count
+             ) VALUES (?1, '/fixture', 'completed', 0,
+                       '2026-08-01T00:00:00Z', '2026-08-01T00:00:01Z',
+                       0, '1.0', ?2, 'runtime-semantic-revision', 1)",
+            params![semantic_scan_id, runtime_snapshot_id],
+        )?;
+        tx.execute(
+            "INSERT INTO nodes(
+                scan_id, id, kind, locator, display_name, properties_json, raw_json
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                semantic_scan_id,
+                overlay_node.id,
+                overlay_node.kind,
+                overlay_node.locator,
+                overlay_node.display_name,
+                serde_json::to_string(&overlay_node.properties)?,
+                serde_json::to_string(&overlay_node)?,
+            ],
+        )?;
+        tx.execute(
+            "INSERT INTO incremental_deltas(
+                scan_id, delta_id, adapter, base_snapshot_id, base_graph_digest,
+                result_graph_digest, scope_json, events_json, mutation_count,
+                status, prospective_snapshot_id, staged_at, completed_at
+             ) VALUES (?1, 'delta:semantic-over-runtime', 'web', ?2,
+                       'base-digest', 'result-digest', '{}', '[]', 1,
+                       'applied', NULL, '2026-08-01T00:00:00Z',
+                       '2026-08-01T00:00:01Z')",
+            params![semantic_scan_id, runtime_snapshot_id],
+        )?;
+        let (semantic_snapshot_id, profile_ids) =
+            super::super::incremental::semantic_noop_snapshot_identity(
+                &tx,
+                semantic_scan_id,
+                &runtime_snapshot_id,
+                Some("runtime-semantic-revision"),
+            )?;
+        tx.execute(
+            "UPDATE incremental_deltas SET prospective_snapshot_id=?2 WHERE scan_id=?1",
+            params![semantic_scan_id, semantic_snapshot_id],
+        )?;
+        tx.execute(
+            "INSERT INTO completed_snapshots(
+                id, source_kind, source_attempt_id, scan_id, build_attempt_id,
+                runtime_import_id, runtime_session_set_json, parent_snapshot_id,
+                source_revision, profile_set_json, status, created_at
+             ) VALUES (?1, 'scan', ?2, ?2, NULL, NULL, '[]', ?3,
+                       'runtime-semantic-revision', ?4, 'completed',
+                       '2026-08-01T00:00:01Z')",
+            params![
+                semantic_snapshot_id,
+                semantic_scan_id,
+                runtime_snapshot_id,
+                serde_json::to_string(&profile_ids)?,
+            ],
+        )?;
+        super::super::persist_completed_snapshot_seal(&tx, &semantic_snapshot_id)?;
+        tx.commit()?;
+
+        let canonical = store
+            .load_completed_snapshot(&semantic_snapshot_id)?
+            .nodes
+            .into_iter()
+            .map(|node| super::super::NodeSummaryRecord {
+                id: node.id,
+                kind: node.kind,
+                locator: node.locator,
+                display_name: node.display_name,
+            })
+            .collect::<Vec<_>>();
+        assert!(canonical.iter().any(|node| node.id == "runtime:only"));
+        let page = store.find_completed_snapshot_nodes_page(
+            &semantic_snapshot_id,
+            "",
+            super::super::NodeTextMatch::Contains,
+            &[],
+            0,
+            100,
+            || false,
+        )?;
+
+        assert_eq!(page.total_items, canonical.len() as u64);
+        assert_eq!(page.items, canonical);
         Ok(())
     }
 }

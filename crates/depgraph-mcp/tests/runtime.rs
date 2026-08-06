@@ -3,6 +3,7 @@ use std::{
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
+        mpsc,
     },
     time::Duration,
 };
@@ -339,6 +340,60 @@ async fn deadline_keeps_capacity_reserved_until_blocking_work_stops() {
             break;
         }
         tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert_eq!(runtime.admitted_reads(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancellation_keeps_read_capacity_until_the_worker_signals_exit() {
+    let runtime = RuntimeController::new(
+        RuntimeConfig::default()
+            .with_read_concurrency(1)
+            .with_read_queue_capacity(0)
+            .with_read_rate(RateLimit::per_minute(600, 10)),
+    )
+    .unwrap();
+    let cancellation = CancellationToken::new();
+    let (started_tx, started_rx) = mpsc::sync_channel(0);
+    let (cancelled_tx, cancelled_rx) = mpsc::sync_channel(0);
+    let (release_tx, release_rx) = mpsc::sync_channel(0);
+    let (stopped_tx, stopped_rx) = mpsc::sync_channel(0);
+    let first = tokio::spawn({
+        let runtime = runtime.clone();
+        let cancellation = cancellation.clone();
+        async move {
+            runtime
+                .execute_blocking(RuntimeClass::Read, cancellation, move |token| {
+                    started_tx.send(()).unwrap();
+                    while !token.is_cancelled() {
+                        std::thread::yield_now();
+                    }
+                    cancelled_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    stopped_tx.send(()).unwrap();
+                    Ok::<_, ()>(())
+                })
+                .await
+        }
+    });
+    started_rx.recv().unwrap();
+    assert_eq!(runtime.admitted_reads(), 1);
+
+    cancellation.cancel();
+    assert_eq!(first.await.unwrap().unwrap_err(), RuntimeFailure::Cancelled);
+    cancelled_rx.recv().unwrap();
+    assert_eq!(runtime.admitted_reads(), 1);
+    let second = runtime
+        .execute_blocking(RuntimeClass::Read, CancellationToken::new(), |_| {
+            Ok::<_, ()>(())
+        })
+        .await;
+    assert_eq!(second.unwrap_err(), RuntimeFailure::ResourceExhausted);
+
+    release_tx.send(()).unwrap();
+    stopped_rx.recv().unwrap();
+    while runtime.admitted_reads() != 0 {
+        tokio::task::yield_now().await;
     }
     assert_eq!(runtime.admitted_reads(), 0);
 }

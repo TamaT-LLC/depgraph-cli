@@ -23,6 +23,10 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 assert_cmd.workspace = true
+depgraph-store = { path = "../depgraph-store" }
+jsonschema = { version = "0.47", default-features = false }
+rusqlite.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tempfile.workspace = true
 wait-timeout = "0.2"

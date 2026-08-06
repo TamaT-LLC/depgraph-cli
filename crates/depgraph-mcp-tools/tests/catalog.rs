@@ -18,6 +18,7 @@ const EXPECTED_TOOL_NAMES: &[&str] = &[
     "daemon_start_submit",
     "daemon_stop",
     "doctor_get",
+    "get_context",
     "graph_cycles_list",
     "graph_dependencies_list",
     "graph_dependents_list",
@@ -60,7 +61,7 @@ fn full_catalog_is_complete_unique_and_name_sorted() {
         .collect::<Vec<_>>();
 
     assert_eq!(names, EXPECTED_TOOL_NAMES);
-    assert_eq!(catalog.tools().len(), 31);
+    assert_eq!(catalog.tools().len(), 32);
 }
 
 #[test]
@@ -271,6 +272,35 @@ fn tool_specific_required_fields_and_scalar_contracts_are_preserved() {
 
     let nodes = catalog.tool("agent_nodes_list").unwrap();
     assert_eq!(
+        nodes.input_schema()["properties"]["query"]["x-depgraph-maxUtf8Bytes"],
+        256
+    );
+    assert!(
+        nodes.input_schema()["properties"]["query"]["description"]
+            .as_str()
+            .is_some_and(|description| description.contains("UTF-8 bytes"))
+    );
+    assert!(
+        nodes.input_schema()["properties"]["query"]
+            .get("maxLength")
+            .is_none(),
+        "JSON Schema maxLength counts Unicode characters, not UTF-8 bytes"
+    );
+    let nodes_schema = Value::Object(nodes.input_schema().clone());
+    let nodes_validator = jsonschema::validator_for(&nodes_schema).unwrap();
+    for query in ["あ".repeat(85), "あ".repeat(86)] {
+        assert!(nodes_validator.is_valid(&serde_json::json!({
+            "contract_version": "depgraph-mcp-tools-v1",
+            "repository_id": "repo",
+            "query": query,
+            "match_mode": "contains"
+        })));
+    }
+    assert_eq!(
+        nodes.input_schema()["properties"]["match_mode"]["enum"],
+        serde_json::json!(["exact", "prefix", "contains"])
+    );
+    assert_eq!(
         nodes.input_schema()["properties"]["cursor"]["pattern"],
         "^[A-Za-z0-9_~.-]+$"
     );
@@ -285,6 +315,12 @@ fn tool_specific_required_fields_and_scalar_contracts_are_preserved() {
     assert_eq!(
         nodes.input_schema()["properties"]["repository_id"]["maxLength"],
         128
+    );
+
+    let context = catalog.tool("get_context").unwrap();
+    assert_eq!(
+        context.input_schema()["required"],
+        serde_json::json!(["contract_version", "repository_id"])
     );
 }
 

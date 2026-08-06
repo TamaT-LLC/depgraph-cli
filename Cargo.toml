@@ -44,7 +44,7 @@ ra_ap_hir = "=0.0.330"
 ra_ap_ide_db = "=0.0.330"
 ra_ap_syntax = "=0.0.330"
 ra_ap_vfs = "=0.0.330"
-rusqlite = { version = "0.37", features = ["bundled", "chrono"] }
+rusqlite = { version = "0.37", features = ["bundled", "chrono", "hooks"] }
 salsa = "=0.26.1"
 salsa-macro-rules = "=0.26.1"
 salsa-macros = "=0.26.1"

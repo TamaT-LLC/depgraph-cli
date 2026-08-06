@@ -1,13 +1,14 @@
 use std::{collections::BTreeSet, fmt::Write as _};
 
 use depgraph_core::{DepgraphCapability, DepgraphCapabilitySet};
-use schemars::{JsonSchema, SchemaGenerator};
+use schemars::{JsonSchema, SchemaGenerator, generate::SchemaSettings};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    AgentId, AgentLocator, Cursor, LogicalRepositoryId, MCP_TOOLS_CONTRACT_VERSION, OperationId,
-    SnapshotId, SnapshotName,
+    AgentCompletedSnapshot, AgentContext, AgentId, AgentLocator, AgentNamedSnapshot,
+    AgentNodeSummary, Cursor, LogicalRepositoryId, MCP_TOOLS_CONTRACT_VERSION, OperationId, Page,
+    SnapshotId, SnapshotName, SuccessEnvelope,
 };
 
 macro_rules! define_cli_actions {
@@ -294,6 +295,15 @@ macro_rules! tool_spec {
 
 const TOOL_SPECS: &[ToolSpec] = &[
     tool_spec!(
+        "get_context",
+        "Get logical repository identity, enabled capabilities, and current snapshot context.",
+        [],
+        [],
+        READ,
+        ToolAuthorization::FixedCapabilities,
+        OperationBehavior::Immediate
+    ),
+    tool_spec!(
         "agent_node_get",
         "Get one graph node using the frozen agent node contract.",
         ["node_id", "snapshot"],
@@ -305,7 +315,14 @@ const TOOL_SPECS: &[ToolSpec] = &[
     tool_spec!(
         "agent_nodes_list",
         "List graph nodes using bounded text and kind filters.",
-        ["query", "snapshot", "kinds", "cursor", "limit"],
+        [
+            "query",
+            "match_mode",
+            "snapshot",
+            "kinds",
+            "cursor",
+            "limit"
+        ],
         [],
         READ,
         ToolAuthorization::FixedCapabilities,
@@ -628,6 +645,21 @@ fn input_schema(spec: &ToolSpec) -> Map<String, Value> {
 }
 
 fn output_schema(spec: &ToolSpec) -> Map<String, Value> {
+    match spec.name {
+        "get_context" => {
+            return exact_success_output_schema::<AgentContext>(spec.name);
+        }
+        "agent_nodes_list" => {
+            return exact_success_output_schema::<Page<AgentNodeSummary>>(spec.name);
+        }
+        "snapshot_list" => {
+            return exact_success_output_schema::<Page<AgentNamedSnapshot>>(spec.name);
+        }
+        "snapshot_get" => {
+            return exact_success_output_schema::<AgentCompletedSnapshot>(spec.name);
+        }
+        _ => {}
+    }
     let immediate = json!({
         "type": "object",
         "properties": {
@@ -681,6 +713,21 @@ fn output_schema(spec: &ToolSpec) -> Map<String, Value> {
     json_object(schema)
 }
 
+fn exact_success_output_schema<T: JsonSchema>(tool_name: &str) -> Map<String, Value> {
+    let mut schema = serde_json::to_value(
+        SchemaSettings::draft2020_12()
+            .for_serialize()
+            .into_generator()
+            .into_root_schema_for::<SuccessEnvelope<T>>(),
+    )
+    .expect("closed success envelope schemas serialize");
+    schema
+        .as_object_mut()
+        .expect("root success envelope schema is an object")
+        .insert("title".to_owned(), json!(format!("{tool_name}_output")));
+    json_object(schema)
+}
+
 fn accepted_operation_output_schema() -> Value {
     json!({
         "type": "object",
@@ -713,6 +760,15 @@ fn accepted_operation_output_schema() -> Value {
 
 fn field_schema(field: &str) -> Value {
     match field {
+        "query" => json!({
+            "type": "string",
+            "minLength": 1,
+            "description": "Query text is limited to 256 UTF-8 bytes by the handler; JSON Schema maxLength is intentionally omitted because it counts Unicode characters.",
+            "x-depgraph-maxUtf8Bytes": 256
+        }),
+        "match_mode" => {
+            json!({"type": "string", "enum": ["exact", "prefix", "contains"]})
+        }
         "cursor" => scalar_schema::<Cursor>(),
         "operation_id" => scalar_schema::<OperationId>(),
         "node_id" | "site_id" => scalar_schema::<AgentId>(),
@@ -751,6 +807,7 @@ fn scalar_schema<T: JsonSchema>() -> Value {
 
 fn required_input_fields(tool_name: &str) -> &'static [&'static str] {
     match tool_name {
+        "agent_nodes_list" => &["query", "match_mode"],
         "agent_node_get" | "agent_edges_list" => &["node_id"],
         "agent_evidence_list" => &["site_id"],
         "snapshot_get" => &["snapshot"],

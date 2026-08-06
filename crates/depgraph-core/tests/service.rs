@@ -7,11 +7,12 @@ use std::{
 
 use anyhow::Result;
 use depgraph_core::service::{
-    DEPGRAPH_SERVICE_LIMITS_VERSION, DepgraphCapability, DepgraphCapabilitySet,
-    DepgraphMutatingContext, DepgraphMutatingUseCase, DepgraphMutatingUseCaseKind, DepgraphService,
-    DepgraphServiceConfig, DepgraphServiceConfigurationError, DepgraphServiceError,
-    DepgraphServiceErrorCategory, DepgraphServiceLimit, DepgraphServiceLimits,
-    MAX_REPOSITORY_PATH_BYTES, MAX_REPOSITORY_PATH_COMPONENT_BYTES, MAX_REPOSITORY_PATH_COMPONENTS,
+    CurrentSnapshotAvailability, DEPGRAPH_SERVICE_LIMITS_VERSION, DepgraphCapability,
+    DepgraphCapabilitySet, DepgraphMutatingContext, DepgraphMutatingUseCase,
+    DepgraphMutatingUseCaseKind, DepgraphService, DepgraphServiceConfig,
+    DepgraphServiceConfigurationError, DepgraphServiceError, DepgraphServiceErrorCategory,
+    DepgraphServiceLimit, DepgraphServiceLimits, MAX_REPOSITORY_PATH_BYTES,
+    MAX_REPOSITORY_PATH_COMPONENT_BYTES, MAX_REPOSITORY_PATH_COMPONENTS, NodeMatchMode,
     RepositoryFileError, RepositoryPathError, RepositoryPathSelector, RepositoryRelativePath,
     SnapshotLocator,
 };
@@ -79,6 +80,225 @@ fn seed_completed_snapshot(
     Ok(store
         .current_snapshot_id()?
         .expect("a promoted completed scan has a current snapshot"))
+}
+
+fn seed_search_snapshot(store: &mut Store, root: &Path) -> Result<String> {
+    let coverage = json!({
+        "profiles": 1,
+        "files_discovered": 0,
+        "files_analyzed": 0,
+        "files_skipped": 0,
+        "dependency_sites": 0,
+        "resolved": 0,
+        "candidates": 0,
+        "external": 0,
+        "unresolved": 0,
+        "unsupported_syntax": 0,
+        "project_code_executed": false,
+        "completeness": ["syntax-complete"],
+        "reasons": []
+    });
+    store.start_scan_with_revision("search", root, false, Some("revision-search"))?;
+    let common = |event: &str, seq: u64| {
+        json!({
+            "event": event,
+            "protocol_version": "1.0",
+            "scan_id": "search",
+            "adapter": "rust",
+            "adapter_version": "0.1.0",
+            "seq": seq
+        })
+    };
+    let mut started = common("scan_started", 1);
+    started["root"] = json!(root);
+    started["project_code_executed"] = json!(false);
+    started["safe_mode"] = json!(true);
+    store.ingest_event(&started)?;
+    let mut profile = common("profile_declared", 2);
+    profile["profile"] = json!({
+        "id": "rust:safe",
+        "language": "rust",
+        "features": [],
+        "environment": {},
+        "properties": {}
+    });
+    store.ingest_event(&profile)?;
+    for (seq, node) in [
+        json!({
+            "id": "node:zeta",
+            "kind": "module",
+            "locator": "repo://src/zeta.rs",
+            "display_name": "crate::zeta",
+            "properties": {"path": root.join("secret-zeta.rs"), "secret": "must-not-leak"}
+        }),
+        json!({
+            "id": "node:alpha",
+            "kind": "module",
+            "locator": "repo://src/alpha.rs",
+            "display_name": "crate::alpha",
+            "properties": {"path": root.join("secret-alpha.rs"), "secret": "must-not-leak"}
+        }),
+        json!({
+            "id": "node:beta",
+            "kind": "function",
+            "locator": "repo://src/beta.rs#fixture",
+            "display_name": "crate::beta::fixture",
+            "properties": {"path": root.join("secret-beta.rs"), "secret": "must-not-leak"}
+        }),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut event = common("node_upsert", seq as u64 + 3);
+        event["node"] = node;
+        store.ingest_event(&event)?;
+    }
+    let mut profile_completed = common("profile_completed", 6);
+    profile_completed["profile_id"] = json!("rust:safe");
+    profile_completed["coverage"] = coverage.clone();
+    store.ingest_event(&profile_completed)?;
+    let mut completed = common("scan_completed", 7);
+    completed["coverage"] = coverage;
+    store.ingest_event(&completed)?;
+    store.finish_scan("search", "completed", None, true)?;
+    Ok(store
+        .current_snapshot_id()?
+        .expect("search fixture snapshot is current"))
+}
+
+#[test]
+fn context_uses_logical_identity_and_succeeds_without_a_snapshot() -> Result<()> {
+    let temporary = tempfile::tempdir()?;
+    let root = temporary.path().join("repository");
+    let store_path = temporary.path().join("cache/graph.db");
+    std::fs::create_dir_all(&root)?;
+    Store::open(&store_path)?;
+
+    let service = read_only_service(&root, &store_path)?;
+    let empty = service.get_context()?;
+    assert_eq!(empty.repository_id(), "repository");
+    assert!(
+        !empty
+            .repository_id()
+            .contains(root.to_string_lossy().as_ref())
+    );
+    assert_eq!(empty.enabled_capabilities(), &[DepgraphCapability::Read]);
+    assert_eq!(
+        empty.current_snapshot().availability(),
+        CurrentSnapshotAvailability::Unavailable
+    );
+    assert!(empty.current_snapshot().details().is_none());
+
+    let mut writer = Store::open(&store_path)?;
+    let snapshot_id = seed_search_snapshot(&mut writer, &root)?;
+    let populated = service.get_context()?;
+    let current = populated
+        .current_snapshot()
+        .details()
+        .expect("current completed snapshot details");
+    assert_eq!(current.id(), snapshot_id);
+    assert_eq!(current.coverage().profiles, 1);
+    assert_eq!(current.coverage().files_analyzed, 0);
+    Ok(())
+}
+
+#[test]
+fn find_nodes_is_bounded_projected_and_stably_sorted_for_every_match_mode() -> Result<()> {
+    let temporary = tempfile::tempdir()?;
+    let root = temporary.path().join("repository");
+    let store_path = temporary.path().join("cache/graph.db");
+    std::fs::create_dir_all(&root)?;
+    let mut writer = Store::open(&store_path)?;
+    let snapshot_id = seed_search_snapshot(&mut writer, &root)?;
+    let service = read_only_service(&root, &store_path)?;
+    let snapshot = SnapshotLocator::parse(&snapshot_id)?;
+
+    let exact = service.find_nodes(&snapshot, "module", NodeMatchMode::Exact)?;
+    assert_eq!(
+        exact
+            .nodes()
+            .iter()
+            .map(|node| node.id())
+            .collect::<Vec<_>>(),
+        ["node:alpha", "node:zeta"]
+    );
+    let prefix = service.find_nodes(&snapshot, "crate::", NodeMatchMode::Prefix)?;
+    assert_eq!(prefix.nodes().len(), 3);
+    let contains = service.find_nodes(&snapshot, "fixture", NodeMatchMode::Contains)?;
+    assert_eq!(contains.nodes().len(), 1);
+    let public = serde_json::to_value(&contains.nodes()[0])?;
+    let mut fields = public
+        .as_object()
+        .expect("node projection object")
+        .keys()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    fields.sort_unstable();
+    assert_eq!(fields, ["display_name", "id", "kind", "locator"]);
+    assert!(!public.to_string().contains("must-not-leak"));
+    assert!(!public.to_string().contains(root.to_string_lossy().as_ref()));
+
+    assert!(
+        service
+            .find_nodes(&snapshot, &"あ".repeat(85), NodeMatchMode::Contains)
+            .is_ok()
+    );
+    assert!(matches!(
+        service.find_nodes(&snapshot, &"あ".repeat(86), NodeMatchMode::Contains),
+        Err(DepgraphServiceError::InvalidInput)
+    ));
+    Ok(())
+}
+
+#[test]
+fn completed_snapshot_list_and_show_are_stable_closed_service_views() -> Result<()> {
+    let temporary = tempfile::tempdir()?;
+    let root = temporary.path().join("repository");
+    let store_path = temporary.path().join("cache/graph.db");
+    std::fs::create_dir_all(&root)?;
+    let mut writer = Store::open(&store_path)?;
+    let snapshot_id = seed_search_snapshot(&mut writer, &root)?;
+    writer.create_snapshot_name("zeta", &snapshot_id)?;
+    writer.create_snapshot_name("alpha", &snapshot_id)?;
+    let service = read_only_service(&root, &store_path)?;
+
+    let listed = service.list_completed_snapshots()?;
+    assert_eq!(
+        listed.iter().map(|item| item.name()).collect::<Vec<_>>(),
+        ["alpha", "zeta"]
+    );
+    assert!(
+        listed
+            .iter()
+            .all(|item| item.snapshot().id() == snapshot_id)
+    );
+    let shown = service.show_completed_snapshot(&SnapshotLocator::parse("ALPHA")?)?;
+    assert_eq!(shown.id(), snapshot_id);
+    assert_eq!(shown.names(), ["alpha", "zeta"]);
+    let public = serde_json::to_string(&shown)?;
+    assert!(!public.contains(root.to_string_lossy().as_ref()));
+    assert!(!public.contains("properties"));
+    Ok(())
+}
+
+#[test]
+fn completed_snapshot_list_preserves_cli_behavior_above_mcp_page_limit() -> Result<()> {
+    let temporary = tempfile::tempdir()?;
+    let root = temporary.path().join("repository");
+    let store_path = temporary.path().join("cache/graph.db");
+    std::fs::create_dir_all(&root)?;
+    let mut writer = Store::open(&store_path)?;
+    let snapshot_id = seed_completed_snapshot(&mut writer, &root, "many-names", "revision")?;
+    for index in 0..=1_000 {
+        writer.create_snapshot_name(&format!("name-{index:04}"), &snapshot_id)?;
+    }
+    drop(writer);
+
+    let listed = read_only_service(&root, &store_path)?.list_completed_snapshots()?;
+    assert_eq!(listed.len(), 1_001);
+    assert_eq!(listed.first().unwrap().name(), "name-0000");
+    assert_eq!(listed.last().unwrap().name(), "name-1000");
+    Ok(())
 }
 
 #[test]
