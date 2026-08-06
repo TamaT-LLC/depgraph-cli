@@ -21,12 +21,12 @@ use depgraph_core::{
 use depgraph_mcp::runtime::{AuditLogger, RuntimeClass, RuntimeConfig, RuntimeController};
 use depgraph_mcp_tools::{
     AgentCompletedSnapshot, AgentContext, AgentCycleLevel, AgentDaemonStatus,
-    AgentDependenciesResponse, AgentDependencyDirection, AgentDoctor, AgentError, AgentLocator,
-    AgentNamedSnapshot, AgentNode, AgentNodeSummary, AgentPathResponse, AgentProfilePlan,
-    AgentToken, CanonicalResponseMapper, ContractBuildError, ContractVersion, Cursor, CursorKey,
-    ErrorEnvelope, LogicalRepositoryId, MappedToolResult, PageByteLimit, PageRequest, PageSize,
-    PaginationContext, RepositoryRelativePath, ResponseMappingError, SnapshotId, SuccessEnvelope,
-    ToolCatalog, project_cycles_page_cancellable, project_dependencies_page_cancellable,
+    AgentDependencyDirection, AgentDoctor, AgentError, AgentLocator, AgentNamedSnapshot,
+    AgentNodeSummary, AgentPathResponse, AgentProfilePlan, AgentToken, CanonicalResponseMapper,
+    ContractBuildError, ContractVersion, Cursor, CursorKey, ErrorEnvelope, LogicalRepositoryId,
+    MappedToolResult, PageByteLimit, PageRequest, PageSize, PaginationContext,
+    RepositoryRelativePath, ResponseMappingError, SnapshotId, SuccessEnvelope, ToolCatalog,
+    project_cycles_page_cancellable, project_dependencies_page_cancellable,
     project_impact_response_cancellable, project_unresolved_page_cancellable,
 };
 use rmcp::{
@@ -816,30 +816,18 @@ fn execute_catalog_read_tool(
             )?;
             let page_request = page_request(arguments.limit, arguments.cursor)?;
             let found = service.dependencies(&mut snapshot_request, &request, cancellation)?;
-            let page = project_dependencies_page_cancellable(
+            let result = project_dependencies_page_cancellable(
                 &found,
-                &pagination,
-                &page_request,
-                cancellation,
-            )
-            .map_err(ToolExecutionFailure::Agent)?;
-            if cancellation.is_cancelled() {
-                return Err(ToolExecutionFailure::Service(
-                    DepgraphServiceError::Cancelled,
-                ));
-            }
-            let result = AgentDependenciesResponse::new(
-                AgentNode::try_from(&found).map_err(contract_mapping_error)?,
                 match direction {
                     DependencyDirection::Outgoing => AgentDependencyDirection::Outgoing,
                     DependencyDirection::Incoming => AgentDependencyDirection::Incoming,
                 },
                 request.transitive(),
-                found.complete(),
-                found.traversed_edges(),
-                page,
+                &pagination,
+                &page_request,
+                cancellation,
             )
-            .map_err(contract_mapping_error)?;
+            .map_err(ToolExecutionFailure::Agent)?;
             if cancellation.is_cancelled() {
                 return Err(ToolExecutionFailure::Service(
                     DepgraphServiceError::Cancelled,

@@ -45,6 +45,11 @@ struct ImpactRuntimeContextIndexExhausted;
 #[error("impact changed-set preprocessing exceeded its service bound")]
 struct ImpactChangedSetPreprocessingExhausted;
 
+#[cfg(test)]
+pub(crate) fn changed_set_preprocessing_exhausted_for_test() -> anyhow::Error {
+    ImpactChangedSetPreprocessingExhausted.into()
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error("impact adjacency preprocessing exceeded its service bound")]
 struct ImpactAdjacencyPreprocessingExhausted;
@@ -306,6 +311,7 @@ pub(crate) fn read_git_changed_set_cancellable(
     )?;
     validate_object_id("merge base", &merge_base)?;
 
+    let mut changes = BTreeMap::<GitChangeKey, BTreeSet<String>>::new();
     let committed = git_bytes_cancellable(
         &git,
         &repository_root,
@@ -323,6 +329,15 @@ pub(crate) fn read_git_changed_set_cancellable(
         ],
         &mut is_cancelled,
     )?;
+    parse_name_status_into(
+        &committed,
+        "committed",
+        &prefix,
+        &mut changes,
+        MAX_CHANGED_PATHS,
+        &mut is_cancelled,
+    )?;
+    drop(committed);
     let worktree = git_bytes_cancellable(
         &git,
         &repository_root,
@@ -339,40 +354,28 @@ pub(crate) fn read_git_changed_set_cancellable(
         ],
         &mut is_cancelled,
     )?;
+    parse_name_status_into(
+        &worktree,
+        "worktree",
+        &prefix,
+        &mut changes,
+        MAX_CHANGED_PATHS,
+        &mut is_cancelled,
+    )?;
+    drop(worktree);
     let untracked = git_bytes_cancellable(
         &git,
         &repository_root,
         ["ls-files", "--others", "--exclude-standard", "-z"],
         &mut is_cancelled,
     )?;
-
-    let mut changes = BTreeMap::<GitChangeKey, BTreeSet<String>>::new();
-    for change in parse_name_status(&committed, "committed", &prefix, &mut is_cancelled)? {
-        check_cancelled(&mut is_cancelled)?;
-        insert_change(&mut changes, change);
-    }
-    for change in parse_name_status(&worktree, "worktree", &prefix, &mut is_cancelled)? {
-        check_cancelled(&mut is_cancelled)?;
-        insert_change(&mut changes, change);
-    }
-    for path in parse_nul_paths(&untracked, &prefix, &mut is_cancelled)? {
-        check_cancelled(&mut is_cancelled)?;
-        insert_change(
-            &mut changes,
-            GitChange {
-                status: "untracked".to_owned(),
-                similarity: None,
-                old_path: None,
-                new_path: Some(path),
-                sources: vec!["worktree".to_owned()],
-            },
-        );
-    }
-    if changes.len() > MAX_CHANGED_PATHS {
-        bail!(
-            "Git changed set contains more than {MAX_CHANGED_PATHS} paths; narrow the repository scope"
-        );
-    }
+    parse_untracked_paths_into(
+        &untracked,
+        &prefix,
+        &mut changes,
+        MAX_CHANGED_PATHS,
+        &mut is_cancelled,
+    )?;
 
     let mut finalized_changes = Vec::with_capacity(changes.len());
     for (key, sources) in changes {
@@ -518,7 +521,8 @@ fn run_bounded_child_cancellable(
         }
         if overflow.load(Ordering::Acquire) {
             kill_reap_and_join(&mut child, stdout_reader, stderr_reader);
-            bail!("Git changed-set output exceeded the bounded output limit");
+            check_cancelled(is_cancelled)?;
+            return Err(ImpactChangedSetPreprocessingExhausted.into());
         }
         match child.try_wait() {
             Ok(Some(status)) => break status,
@@ -532,17 +536,19 @@ fn run_bounded_child_cancellable(
     };
     let stdout = stdout_reader
         .join()
-        .map_err(|_| anyhow::anyhow!("Git stdout reader failed"))??;
-    stderr_reader
+        .map_err(|_| anyhow::anyhow!("Git stdout reader failed"))?;
+    let stderr = stderr_reader
         .join()
-        .map_err(|_| anyhow::anyhow!("Git stderr reader failed"))??;
+        .map_err(|_| anyhow::anyhow!("Git stderr reader failed"))?;
+    check_cancelled(is_cancelled)?;
     if overflow.load(Ordering::Acquire) {
-        bail!("Git changed-set output exceeded the bounded output limit");
+        return Err(ImpactChangedSetPreprocessingExhausted.into());
     }
+    let stdout = stdout?;
+    stderr?;
     if !status.success() {
         bail!("read-only Git query failed");
     }
-    check_cancelled(is_cancelled)?;
     Ok(stdout)
 }
 
@@ -601,9 +607,9 @@ fn parse_name_status(
     source: &str,
     prefix: &str,
     is_cancelled: &mut impl FnMut() -> bool,
-) -> Result<Vec<GitChange>> {
+    mut visit: impl FnMut(GitChange) -> Result<()>,
+) -> Result<()> {
     let mut fields = nul_fields(bytes);
-    let mut changes = Vec::new();
     while let Some(field) = fields.next() {
         check_cancelled(is_cancelled)?;
         let token = parse_utf8_field(field, "Git status")?;
@@ -637,15 +643,15 @@ fn parse_name_status(
         if old_path.is_none() && new_path.is_none() {
             continue;
         }
-        changes.push(GitChange {
+        visit(GitChange {
             status,
             similarity,
             old_path,
             new_path,
             sources: vec![source.to_owned()],
-        });
+        })?;
     }
-    Ok(changes)
+    Ok(())
 }
 
 fn parse_status(token: &str) -> Result<(String, Option<u8>, usize)> {
@@ -685,16 +691,16 @@ fn parse_nul_paths(
     bytes: &[u8],
     prefix: &str,
     is_cancelled: &mut impl FnMut() -> bool,
-) -> Result<Vec<String>> {
-    let mut paths = Vec::new();
+    mut visit: impl FnMut(String) -> Result<()>,
+) -> Result<()> {
     for field in nul_fields(bytes) {
         check_cancelled(is_cancelled)?;
         let path = parse_utf8_field(field, "Git path")?;
         if let Some(path) = strip_repository_prefix(&path, prefix)? {
-            paths.push(path);
+            visit(path)?;
         }
     }
-    Ok(paths)
+    Ok(())
 }
 
 fn nul_fields(bytes: &[u8]) -> impl Iterator<Item = &[u8]> {
@@ -730,14 +736,65 @@ fn normalize_git_path(value: &str) -> Result<String> {
     Ok(value.to_owned())
 }
 
-fn insert_change(changes: &mut BTreeMap<GitChangeKey, BTreeSet<String>>, change: GitChange) {
+fn parse_name_status_into(
+    bytes: &[u8],
+    source: &str,
+    prefix: &str,
+    changes: &mut BTreeMap<GitChangeKey, BTreeSet<String>>,
+    maximum_changes: usize,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<()> {
+    parse_name_status(bytes, source, prefix, is_cancelled, |change| {
+        insert_change_bounded(changes, change, maximum_changes)
+    })
+}
+
+fn parse_untracked_paths_into(
+    bytes: &[u8],
+    prefix: &str,
+    changes: &mut BTreeMap<GitChangeKey, BTreeSet<String>>,
+    maximum_changes: usize,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<()> {
+    parse_nul_paths(bytes, prefix, is_cancelled, |path| {
+        insert_change_bounded(
+            changes,
+            GitChange {
+                status: "untracked".to_owned(),
+                similarity: None,
+                old_path: None,
+                new_path: Some(path),
+                sources: vec!["worktree".to_owned()],
+            },
+            maximum_changes,
+        )
+    })
+}
+
+fn insert_change_bounded(
+    changes: &mut BTreeMap<GitChangeKey, BTreeSet<String>>,
+    change: GitChange,
+    maximum_changes: usize,
+) -> Result<()> {
     let key = GitChangeKey {
         status: change.status,
         similarity: change.similarity,
         old_path: change.old_path,
         new_path: change.new_path,
     };
-    changes.entry(key).or_default().extend(change.sources);
+    let at_capacity = changes.len() >= maximum_changes;
+    match changes.entry(key) {
+        std::collections::btree_map::Entry::Occupied(mut entry) => {
+            entry.get_mut().extend(change.sources);
+        }
+        std::collections::btree_map::Entry::Vacant(entry) => {
+            if at_capacity {
+                return Err(ImpactChangedSetPreprocessingExhausted.into());
+            }
+            entry.insert(change.sources.into_iter().collect());
+        }
+    }
+    Ok(())
 }
 
 pub fn map_changed_set(
@@ -1796,6 +1853,89 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn changed_path_parsing_enforces_one_cumulative_distinct_key_limit() -> Result<()> {
+        let mut changes = BTreeMap::new();
+        let mut never_cancelled = || false;
+        parse_name_status_into(
+            b"M\0src/a.rs\0M\0src/b.rs\0",
+            "committed",
+            "",
+            &mut changes,
+            2,
+            &mut never_cancelled,
+        )?;
+        assert_eq!(changes.len(), 2, "the exact distinct-key limit succeeds");
+
+        parse_name_status_into(
+            b"M\0src/a.rs\0",
+            "worktree",
+            "",
+            &mut changes,
+            2,
+            &mut never_cancelled,
+        )?;
+        assert_eq!(
+            changes.len(),
+            2,
+            "a duplicate key does not consume capacity"
+        );
+        let duplicate_key = GitChangeKey {
+            status: "modified".to_owned(),
+            similarity: None,
+            old_path: None,
+            new_path: Some("src/a.rs".to_owned()),
+        };
+        assert_eq!(
+            changes
+                .get(&duplicate_key)
+                .expect("duplicate key is retained")
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["committed", "worktree"]
+        );
+
+        let error =
+            parse_untracked_paths_into(b"src/c.rs\0", "", &mut changes, 2, &mut never_cancelled)
+                .expect_err("the next distinct key must fail before map insertion");
+        assert!(is_resource_exhausted(&error));
+        assert_eq!(
+            changes.len(),
+            2,
+            "the over-limit untracked key was never inserted"
+        );
+        assert!(changes.keys().all(|key| {
+            key.old_path.as_deref() != Some("src/c.rs")
+                && key.new_path.as_deref() != Some("src/c.rs")
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn changed_path_parser_observes_cancellation_before_the_next_entry() {
+        let mut changes = BTreeMap::new();
+        let mut checks = 0_usize;
+        let error = parse_name_status_into(
+            b"M\0src/a.rs\0M\0src/b.rs\0",
+            "committed",
+            "",
+            &mut changes,
+            2,
+            &mut || {
+                checks += 1;
+                checks >= 2
+            },
+        )
+        .expect_err("cancellation during parsing must return no changed set");
+        assert!(!is_resource_exhausted(&error));
+        assert_eq!(changes.len(), 1);
+        assert!(changes.keys().all(|key| {
+            key.old_path.as_deref() != Some("src/b.rs")
+                && key.new_path.as_deref() != Some("src/b.rs")
+        }));
+    }
+
     #[cfg(unix)]
     #[test]
     fn bounded_child_output_overflow_kills_reaps_and_joins_promptly() -> Result<()> {
@@ -1804,7 +1944,9 @@ mod tests {
         let mut command = Command::new("sh");
         command
             .arg("-c")
-            .arg("echo $$ > \"$1\"; while :; do printf '0123456789abcdef'; done")
+            .arg(
+                "echo $$ > \"$1\"; while :; do printf 'Bearer review-secret /Users/private/repository '; done >&2",
+            )
             .arg("depgraph-overflow-helper")
             .arg(&pid_path)
             .stdin(Stdio::null())
@@ -1814,10 +1956,14 @@ mod tests {
         let started = Instant::now();
         let error = run_bounded_child_cancellable(command, 64, &mut || false)
             .expect_err("unbounded helper output must fail closed");
+        assert!(is_resource_exhausted(&error));
         assert_eq!(
             error.to_string(),
-            "Git changed-set output exceeded the bounded output limit"
+            ImpactChangedSetPreprocessingExhausted.to_string()
         );
+        for forbidden in ["Bearer", "review-secret", "/Users/private"] {
+            assert!(!error.to_string().contains(forbidden));
+        }
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "overflow supervision did not terminate promptly"
@@ -2125,6 +2271,7 @@ mod tests {
         let _guard = IMPACT_PREPROCESSING_TEST_LOCK
             .lock()
             .expect("impact preprocessing test lock");
+        let _changed_set_guard = CHANGED_SET_TEST_LOCK.lock().expect("changed-set test lock");
         let graph = graph();
         let condition = render_condition(&graph.edges[0].condition);
         let filters = ImpactFilters::new(
@@ -2525,6 +2672,7 @@ mod tests {
         let _guard = IMPACT_PREPROCESSING_TEST_LOCK
             .lock()
             .expect("impact preprocessing test lock");
+        let _changed_set_guard = CHANGED_SET_TEST_LOCK.lock().expect("changed-set test lock");
         let graph = graph();
         let shallow = impact(
             &graph,

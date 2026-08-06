@@ -955,6 +955,61 @@ fn changed_since_service_error_never_discloses_raw_git_stderr() -> Result<()> {
 }
 
 #[test]
+fn changed_path_count_is_independent_from_the_impact_node_limit() -> Result<()> {
+    let temporary = tempfile::tempdir()?;
+    let root = temporary.path().join("repository");
+    let store_path = temporary.path().join("cache/graph.db");
+    fs::create_dir_all(root.join("changed"))?;
+    assert_git_success(&root, &["init", "--quiet"]);
+    assert_git_success(&root, &["config", "user.email", "test@example.invalid"]);
+    assert_git_success(&root, &["config", "user.name", "Test"]);
+    assert_git_success(&root, &["commit", "--quiet", "--allow-empty", "-m", "base"]);
+    let base = assert_git_success(&root, &["rev-parse", "HEAD"]);
+    let changed_path_count = 5_usize;
+    for index in 0..changed_path_count {
+        fs::write(
+            root.join(format!("changed/{index}.rs")),
+            format!("// {index}\n"),
+        )?;
+    }
+    assert_git_success(&root, &["add", "changed"]);
+    assert_git_success(&root, &["commit", "--quiet", "-m", "changed paths"]);
+    let head = assert_git_success(&root, &["rev-parse", "HEAD"]);
+
+    let nodes = vec![(
+        "changed:root".to_owned(),
+        "module".to_owned(),
+        Some("changed/0.rs".to_owned()),
+    )];
+    let mut writer = Store::open(&store_path)?;
+    seed_edge_graph(
+        &mut writer,
+        &root,
+        "changed-path-count-independent",
+        &head,
+        &nodes,
+        &[],
+        0,
+    )?;
+    drop(writer);
+
+    let graph_service = service(&root, &store_path)?;
+    let request = ImpactRequest::try_new(
+        "id:changed:root",
+        Some(base),
+        ImpactFilters::new(None, Vec::new(), Vec::new(), 1, 1)?,
+    )?;
+    let mut snapshot = graph_service.start_snapshot_request("current")?;
+    let result = graph_service.impact(&mut snapshot, &request, &CancellationToken::new())?;
+    assert!(result.impact().complete);
+    assert_eq!(result.impact().mappings.len(), changed_path_count);
+    assert_eq!(result.impact().changed_nodes.len(), 1);
+    assert_eq!(result.impact().impacts.len(), 1);
+    assert_eq!(result.impact().impacts[0].node.id, "changed:root");
+    Ok(())
+}
+
+#[test]
 fn issue_303_service_methods_are_canonical_bounded_and_cancellable() -> Result<()> {
     let temporary = tempfile::tempdir()?;
     let root = temporary.path().join("repository");

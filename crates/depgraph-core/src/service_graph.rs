@@ -508,19 +508,7 @@ impl DepgraphService {
                 })
             })
             .transpose()
-            .map_err(|source| {
-                if cancellation.is_cancelled() {
-                    DepgraphServiceError::Cancelled
-                } else {
-                    DepgraphServiceError::graph_query(source)
-                }
-            })?;
-        if changed_set
-            .as_ref()
-            .is_some_and(|set| set.changes.len() > request.filters().max_nodes)
-        {
-            return Err(DepgraphServiceError::ResourceExhausted);
-        }
+            .map_err(|source| impact_changed_set_service_error(source, cancellation))?;
         if let Some(changed_set) = changed_set.as_ref()
             && snapshot.scan.source_revision.as_deref() != Some(changed_set.head.as_str())
         {
@@ -593,6 +581,19 @@ impl DepgraphService {
             scan_id: snapshot.scan.id,
             items,
         })
+    }
+}
+
+fn impact_changed_set_service_error(
+    source: anyhow::Error,
+    cancellation: &CancellationToken,
+) -> DepgraphServiceError {
+    if cancellation.is_cancelled() {
+        DepgraphServiceError::Cancelled
+    } else if crate::impact::is_resource_exhausted(&source) {
+        DepgraphServiceError::ResourceExhausted
+    } else {
+        DepgraphServiceError::graph_query(source)
     }
 }
 
@@ -1605,6 +1606,29 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn changed_set_preprocessing_errors_map_to_resource_exhausted_with_cancellation_precedence() {
+        let cancellation = CancellationToken::new();
+        let resource = impact_changed_set_service_error(
+            crate::impact::changed_set_preprocessing_exhausted_for_test(),
+            &cancellation,
+        );
+        assert!(matches!(resource, DepgraphServiceError::ResourceExhausted));
+
+        let ordinary = impact_changed_set_service_error(
+            anyhow::anyhow!("invalid Git ref"),
+            &CancellationToken::new(),
+        );
+        assert!(matches!(ordinary, DepgraphServiceError::GraphQuery { .. }));
+
+        cancellation.cancel();
+        let cancelled = impact_changed_set_service_error(
+            crate::impact::changed_set_preprocessing_exhausted_for_test(),
+            &cancellation,
+        );
+        assert!(matches!(cancelled, DepgraphServiceError::Cancelled));
+    }
 
     static SERVICE_GRAPH_COUNTER_TEST_LOCK: Mutex<()> = Mutex::new(());
 
