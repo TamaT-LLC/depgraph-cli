@@ -1319,7 +1319,7 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         bail!("README release note link is not synchronized with {VERSION}");
     }
     for required in [
-        "updated: 2026-08-01",
+        "updated: 2026-08-07",
         "| Product / Rust / Go / Web adapter | `0.4.0` |",
         "Milestone 4のrelease candidateは`v0.4.0-rc.1`",
         "Milestone 4のstable releaseは`v0.4.0`",
@@ -1839,7 +1839,7 @@ status: Active\n\
 upstream: [PROJ-ARC-001]\n\
 downstream: []\n\
 owner: TakehiroT\n\
-updated: 2026-08-05\n\
+updated: 2026-08-07\n\
 open_questions: 0\n\
 ---\n";
 

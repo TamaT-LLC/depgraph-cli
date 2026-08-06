@@ -7,8 +7,12 @@ status: Active
 upstream: []
 downstream: []
 owner: TakehiroT
-updated: 2026-08-01
+updated: 2026-08-07
 ---
+
+> 2026-08-07: Issue #304として、bounded queryとruntime trace validationを共有read-only serviceへ移した。
+> Inline inputまたはrepository-relative regular fileの一方だけを受理し、size/confinement、credential policy、parse/type、query output admissionをstore access前にfail closedで検証する。
+> CLIとMCPは同じpinned completed snapshotを読み、MCPはclosed/paged DTOとinput-bound cursorを返す。validationはstore、snapshot、source treeを変更せず、raw query/trace/pathをerrorへ反射しない。
 
 > 2026-08-01: Issue #279として、通常のRust / Web build cacheを実行結果ではなく実行前に検証できる入力identityへ変更した。
 > 入力identityはsource、manifest / lock / config、profile、adapter artifact / version、toolchain executable / version、command / environment contract、target、protocol、base snapshotを閉じる。
@@ -1165,7 +1169,7 @@ source/target locatorは次のいずれか1種類に限定する。
 
 untrusted input上限は16 MiB、100,000 events、1 string 4,096 Unicode scalar values、JSON depth 32である。UTF-8、exact supported version、strict field set、timestamp、sequence、path、item countをstore access前に検証する。absolute/drive/UNC/file absolute path、file URI host、path内のdrive-like colon、`.`/`..` segment、backslash、control character、unknown property、environment/header/secret value field、Bearer/Basic token、common token/private-key formをrejectし、errorへraw valueをechoしない。production collectorは`session.collector_contract_version=runtime-collector-v1`を出力し、このmarkerを持つtraceではraw HTTP(S) graph locatorとuserinfo/path/query/fragment/percent encodingを含むHTTP targetもrejectする。未marked trace v1は既存互換性を維持するがproduction redaction guaranteeを申告しない。HTTP(S) URLはcollectorでschemeと`host[:port]`へ縮約し、external namespace/nameへ変換する。environment variable、header、secretはsorted/deduplicatedなname配列とredacted countだけを許し、値用propertyはcontractに存在しない。matchingはsnapshot node indexを1回だけ構築し、eventごとの全node走査やlocator文字列生成を行わない。
 
-`depgraph runtime validate <TRACE> [--json]`はselected completed snapshotへmatchingしたversioned resultとresolved/external/unresolved/redacted summaryを返すread-only commandであり、store mutationやruntime graph promotionを行わない。`depgraph runtime import <TRACE> [--json]`は同じpre-store validation後にruntime child profile、`phase=runtime` / `precision=observed` site/edge、per-session evidence、unmatched sentinel、diagnostic、coverageを1つのdeltaへ変換する。child profileはbase内の非runtime parentとcanonical effective inputを宣言し、runtime profile自身を次回parent候補へ混ぜない。
+`depgraph runtime validate (--trace <TRACE>|--file <REPOSITORY_RELATIVE_FILE>) [--json]`はselected completed snapshotへmatchingしたversioned resultとresolved/external/unresolved/redacted summaryを返すread-only commandであり、store mutationやruntime graph promotionを行わない。inline/fileのexactly-one制約はclapだけでなく共有service requestでも再検証し、fileはrepository boundary内のstable regular fileだけをno-followで読む。`depgraph runtime import <TRACE> [--json]`は同じpre-store validation後にruntime child profile、`phase=runtime` / `precision=observed` site/edge、per-session evidence、unmatched sentinel、diagnostic、coverageを1つのdeltaへ変換する。child profileはbase内の非runtime parentとcanonical effective inputを宣言し、runtime profile自身を次回parent候補へ混ぜない。
 
 Issue #138でNode.js / TypeScript reference collectorを実装し、Issue #139で`depgraph-runtime-collector.mjs`を全native archiveのexact runtime artifact closureへ追加した。release compatibilityは`runtime_collector_contract_version=runtime-collector-v1`を固定し、build inventoryはcollector SHA-256、project license、dependency-free bundleを記録する。SPDX SBOMはfirst-party collector packageとrootからの`CONTAINS`関係を持ち、license inventoryはMIT / Apache-2.0のproject license適用とthird-party dependency追加なしを明示する。各native package gateは実アプリfixtureのpackaged graphをcollectorで観測し、secret-bearing URLがcanonical external targetへ縮約されることを含め、生成、validate、import、runtime query、GraphML exportを通す。artifactの欠損・変更、manifest contract version mismatch、secret出力はworker / project code起動前またはimport前にfail closedとなり、aggregate verifierは全targetで同一collector bytes、manifest checksum、SBOM checksum relation、module version handshakeを再検証する。
 
@@ -1322,7 +1326,8 @@ depgraph why <FROM> <TO>
 depgraph impact <SELECTOR> [--changed <GIT_REF>]
 depgraph cycles [--level package|file|symbol|route]
 depgraph unresolved [--max-items N] [--max-bytes BYTES] [--cursor TOKEN|--all]
-depgraph runtime validate <TRACE> [--json]
+depgraph query (--query <QUERY>|--file <REPOSITORY_RELATIVE_FILE>) [--explain] [--json]
+depgraph runtime validate (--trace <TRACE>|--file <REPOSITORY_RELATIVE_FILE>) [--json]
 depgraph runtime import <TRACE> [--json]
 depgraph snapshot create <NAME> [--json]
 depgraph snapshot list [--json]
@@ -1963,6 +1968,7 @@ digest、ref/tag検証、PR記録項目、patch release時も変わらないance
 
 ## 26. 更新履歴
 
+- 2026-08-07: Issue #304としてbounded query/runtime validationの共有read-only service、CLI migration、`graph_query` / `runtime_trace_validate` MCP handlerを実装した。query/traceはinlineまたはconfined repository-relative fileのexactly oneとし、absolute/traversal/symlink/nonregular/oversizeを拒否する。queryのparse/credential/type/output pre-admissionとtrace shape/credential validationをstore前に完了し、query plan cap超過はexecution前の`QUERY_REJECTED`とする。両操作はpinned completed snapshotだけを読み、store/snapshot/source treeを不変に保つ。MCPはclosed query/runtime DTO、canonical byte/item pagination、snapshot/input-bound cursor、Read runtime controlを使い、CLI/MCP parity、non-echo security、catalog/schema/contract goldenで固定した。
 - 2026-08-02: PRとmain pushのCIをRust / Go / Webの品質検査とcompiler-precise hostile E2Eに限定し、benchmark、Linux / macOS integration、Windows smokeは手動dispatchだけで実行する構成へ変更した。`v*` tagのRelease workflowはquality、hostile E2E、benchmark、全5 targetのarchive / compiler pack、aggregate verificationを実行し、全gate成功後だけ公開する。
 - 2026-08-01: Issue #279として通常のRust / Web build cacheをpre-execution input identityへ変更した。source、manifest / lock / config、profile、adapter artifact / version、toolchain executable / version、command / environment contract、target、protocol、base snapshotをkeyに含め、completed snapshot、current snapshot、base binding、payload、audit、入力の再計算が一致した場合だけproject codeを実行せず既存graphを返す。miss / reject / stored / hitをattemptへ記録し、corrupt / stale entryはfail closedに再実行してvalidated outputで置換する。RustとNext.jsのcold / warm testはsnapshot、audit、cache entry、exportが増減・変化しないことを検証する。
 - 2026-07-31: Issue #275としてRust HIR scanのattempt-local性能計測と代表benchmarkを実装した。workerはdiscovery/metadata、syntax、model planning、VFS、crate graph、database apply、HIR semantic、source finalize、protocol build/writeを、coreはworker execution、protocol ingest、store validation/promotion、totalをwall time・件数・bytes付きで`DEPGRAPH_SCAN_PROFILE=1`時だけ報告する。31 source file・2,520 function・7,560以上のsemantic siteを持つ決定的fixtureをcold / `--no-cache` / validated warm hitで検証し、cold/no-cache graph・coverage・diagnostic・安全性を一致させる。HIR occurrenceごとの全syntax tree走査をfile単位span indexへ置換し、source finalizeとHIR extractorは対象occurrenceの借用indexを共有する。crate単位の46-entry active cfgはprofileへ一度だけ正規化し、20,380件のHIR evidenceから参照することでcfg contextを維持したままprotocolを60.0 MBから37.8 MBへ縮小した。scan completionはmutation-count tokenで検証と昇格を結び、同じsnapshotの二重load・再validation・cache layer別再hashを除去した。Rust workerは既存のstable-ID mapを直接検証し、coreは独立なrustc/Cargo attestation probeを並列化し、store completion validationは契約に必要な列だけを読む。新規storeは16 KiB SQLite page、64 MiB connection cache、memory temp storeを使い、初回batchの空DELETEとsite/edge `raw_json`内のevidence重複保存を避ける一方、既存storeのpage sizeと論理graphの読み取り互換性を維持する。ローカルrelease実測はcold 5.02秒、`--no-cache` 3.93秒、warm 0.87秒、HIR semantic 0.72秒、store validation/promotion 0.61秒で、7,776 dependency siteとcold/no-cacheのbyte-identical exportを維持した。

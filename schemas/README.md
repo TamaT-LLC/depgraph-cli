@@ -7,8 +7,10 @@ unknown versions or properties.
 `depgraph-mcp-tools-v1.schema.json` is the checked-in JSON Schema 2020-12 catalog
 for the closed Agent-facing contracts implemented by `depgraph-mcp-tools`. It covers
 the common request and versioned envelopes, snapshot selector, bounded page/cursor,
-typed errors, summarized graph DTOs, portable `OperationAccepted`, and the Q-002
-Option A additive Tasks result. The Tasks branch reuses the operation identity
+typed errors, summarized graph DTOs, closed bounded-query row/runtime-validation
+DTOs, portable `OperationAccepted`, and the Q-002 Option A additive Tasks result.
+The query/runtime DTOs omit arbitrary node/path/evidence properties and raw trace
+repository/session/environment input. The Tasks branch reuses the operation identity
 (`taskId == operation_id`); it does not replace the three baseline recovery tool
 names. Repository paths use the portable repository-relative primitive and reject
 absolute, traversing, backslash, Windows drive/UNC/ADS, and reserved-device forms.
@@ -21,14 +23,16 @@ schemas/depgraph-mcp-tools-v1.schema.json`. The output is canonical JSON with no
 trailing newline. Integration tests require byte-for-byte equality with the
 checked-in catalog, its SHA-256 fixture, and the canonical contract-sample golden;
 they also recursively require `additionalProperties: false` on every generated
-object schema. These artifacts are the schema and golden evidence for Issue #295,
-not an MCP transport/server implementation.
+object schema. These artifacts are the schema and golden evidence for the versioned
+contract, including the Issue #304 query/runtime additions; they are not an MCP
+transport/server implementation.
 
 The catalog is a structural preflight contract, not the complete semantic validator.
 Consumers **MUST** deserialize with `depgraph-mcp-tools` (or enforce equivalent
 semantic checks) after schema validation. JSON Schema 2020-12 cannot express the
 cross-value arithmetic used by this contract: `returned_items == items.len()`,
-`total_items >= returned_items`, source-span ordering, task timestamp/expiry
+`total_items >= returned_items`, query path depth/topology, runtime match status and
+summary/page conservation, source-span ordering, task timestamp/expiry
 ordering, or UTF-8 byte limits. The Rust constructors and `Deserialize`
 implementations are authoritative for those invariants and fail closed. The schema
 does encode representable bounds, closed fields, fixed recovery names, snapshot

@@ -8,9 +8,10 @@ use sha2::{Digest, Sha256};
 use crate::{
     AgentCompletedSnapshot, AgentContext, AgentCycle, AgentCycleLevel, AgentDaemonStatus,
     AgentDependenciesResponse, AgentDoctor, AgentId, AgentImpactResponse, AgentLabel, AgentLocator,
-    AgentNamedSnapshot, AgentNodeSummary, AgentPathResponse, AgentProfilePlan, AgentUnresolved,
-    Cursor, LogicalRepositoryId, MCP_TOOLS_CONTRACT_VERSION, OperationId, Page,
-    RepositoryRelativePath, SnapshotId, SnapshotName, SuccessEnvelope,
+    AgentNamedSnapshot, AgentNodeSummary, AgentPathResponse, AgentProfilePlan, AgentQueryRow,
+    AgentRuntimeValidationResponse, AgentUnresolved, Cursor, LogicalRepositoryId,
+    MCP_TOOLS_CONTRACT_VERSION, OperationId, Page, RepositoryRelativePath, SnapshotId,
+    SnapshotName, SuccessEnvelope,
 };
 
 macro_rules! define_cli_actions {
@@ -504,16 +505,16 @@ const TOOL_SPECS: &[ToolSpec] = &[
     tool_spec!(
         "graph_query",
         "Execute a bounded read-only graph query.",
-        ["query", "snapshot", "cursor", "limit", "max_depth"],
+        ["query", "query_file", "snapshot", "cursor", "limit"],
         [CliAction::Query],
         READ,
         ToolAuthorization::FixedCapabilities,
-        OperationBehavior::MayCreateDurableOperation
+        OperationBehavior::Immediate
     ),
     tool_spec!(
         "runtime_trace_validate",
         "Validate a runtime trace without importing it.",
-        ["trace", "strict"],
+        ["trace", "trace_file", "snapshot", "cursor", "limit"],
         [CliAction::RuntimeValidate],
         READ,
         ToolAuthorization::FixedCapabilities,
@@ -677,7 +678,7 @@ fn input_schema(spec: &ToolSpec) -> Map<String, Value> {
         scalar_schema::<LogicalRepositoryId>(),
     );
     for field in spec.input_fields {
-        properties.insert((*field).to_owned(), field_schema(field));
+        properties.insert((*field).to_owned(), field_schema(spec.name, field));
     }
     let mut required = vec!["contract_version", "repository_id"];
     required.extend_from_slice(required_input_fields(spec.name));
@@ -700,6 +701,20 @@ fn input_schema(spec: &ToolSpec) -> Map<String, Value> {
                     {"not": {"required": ["profile_budget", "profiles_file"]}},
                     {"not": {"required": ["profiles_document", "profiles_file"]}}
                 ]),
+            );
+    }
+    if matches!(spec.name, "graph_query" | "runtime_trace_validate") {
+        let (inline, file) = if spec.name == "graph_query" {
+            ("query", "query_file")
+        } else {
+            ("trace", "trace_file")
+        };
+        schema
+            .as_object_mut()
+            .expect("input schema is an object")
+            .insert(
+                "oneOf".to_owned(),
+                json!([{"required": [inline]}, {"required": [file]}]),
             );
     }
     json_object(schema)
@@ -742,6 +757,12 @@ fn output_schema(spec: &ToolSpec) -> Map<String, Value> {
         }
         "graph_unresolved_list" => {
             return exact_success_output_schema::<Page<AgentUnresolved>>(spec.name);
+        }
+        "graph_query" => {
+            return exact_success_output_schema::<Page<AgentQueryRow>>(spec.name);
+        }
+        "runtime_trace_validate" => {
+            return exact_success_output_schema::<AgentRuntimeValidationResponse>(spec.name);
         }
         _ => {}
     }
@@ -843,8 +864,14 @@ fn accepted_operation_output_schema() -> Value {
     })
 }
 
-fn field_schema(field: &str) -> Value {
+fn field_schema(tool_name: &str, field: &str) -> Value {
     match field {
+        "query" if tool_name == "graph_query" => json!({
+            "type": "string",
+            "minLength": 1,
+            "description": "Bounded graph query text is limited to 65536 UTF-8 bytes by the service.",
+            "x-depgraph-maxUtf8Bytes": 65536
+        }),
         "query" => json!({
             "type": "string",
             "minLength": 1,
@@ -887,6 +914,7 @@ fn field_schema(field: &str) -> Value {
             "x-depgraph-maxUtf8Bytes": 1048576
         }),
         "profiles_file" => scalar_schema::<RepositoryRelativePath>(),
+        "query_file" | "trace_file" => scalar_schema::<RepositoryRelativePath>(),
         "selectors" => json!({
             "type": "array",
             "maxItems": 1024,
@@ -914,7 +942,6 @@ fn required_input_fields(tool_name: &str) -> &'static [&'static str] {
         "snapshot_get" => &["snapshot"],
         "graph_dependencies_list" | "graph_dependents_list" | "graph_impact_get" => &["selector"],
         "graph_path_get" | "snapshot_diff_get" | "policy_evaluate" => &["from", "to"],
-        "graph_query" => &["query"],
         "graph_export" => &["format"],
         "operation_get" | "operation_result" | "operation_cancel" => &["operation_id"],
         "snapshot_name_create" => &["name"],

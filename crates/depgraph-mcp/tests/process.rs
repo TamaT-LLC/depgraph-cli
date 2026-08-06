@@ -253,11 +253,20 @@ fn seed_issue_302_store(path: &Path, root: &Path) -> String {
         });
         store.ingest_event(&edge).unwrap();
     }
-    let mut profile_completed = common("profile_completed", 11);
+    let mut workspace = common("node_upsert", 11);
+    workspace["node"] = json!({
+        "id": "workspace:repository",
+        "kind": "workspace",
+        "locator": "workspace:repository",
+        "display_name": "repository",
+        "properties": {"repository_identity": "workspace:repository"}
+    });
+    store.ingest_event(&workspace).unwrap();
+    let mut profile_completed = common("profile_completed", 12);
     profile_completed["profile_id"] = json!("fixture:safe");
     profile_completed["coverage"] = coverage.clone();
     store.ingest_event(&profile_completed).unwrap();
-    let mut completed = common("scan_completed", 12);
+    let mut completed = common("scan_completed", 13);
     completed["coverage"] = coverage;
     store.ingest_event(&completed).unwrap();
     store
@@ -1739,6 +1748,275 @@ fn issue_303_cli_mcp_parity_schemas_redaction_and_fail_closed_contracts() {
 
     mcp.finish();
     assert_eq!(before, store_invariant(&store_path));
+}
+
+#[test]
+fn issue_304_query_and_runtime_validate_have_cli_mcp_parity_and_fail_closed_security() {
+    const QUERY: &str = r#"MATCH p = (source:"module")-["imports"*1..1]->(target:"module")
+RETURN source.id, target.id LIMIT 10"#;
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("repository");
+    let store_path = temporary.path().join("store.sqlite");
+    fs::create_dir(&root).unwrap();
+    let snapshot_id = seed_issue_302_store(&store_path, &root);
+    fs::write(root.join("query.depgraph"), QUERY).unwrap();
+    let trace = json!({
+        "schema_version": "1.0",
+        "repository": {"identity": "workspace:repository", "revision": "revision-302"},
+        "session": {
+            "id": "session-304",
+            "started_at": "2026-08-07T00:00:00Z",
+            "ended_at": "2026-08-07T00:00:01Z",
+            "profile": {"language": "fixture", "features": []},
+            "environment": {"name": "test"},
+            "redaction": {"redacted_value_count": 1}
+        },
+        "events": [{
+            "sequence": 1,
+            "timestamp": "2026-08-07T00:00:00Z",
+            "dependency_kind": "imports",
+            "source": {"kind": "node", "node_id": "node:a"},
+            "target": {"kind": "node", "node_id": "node:b"},
+            "count": 1,
+            "redaction": {"redacted_value_count": 1}
+        }]
+    });
+    fs::write(root.join("trace.json"), trace.to_string()).unwrap();
+    let before = store_invariant(&store_path);
+
+    let mut mcp = InteractiveMcp::start(&root, &store_path);
+    let initialized = mcp.request(json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2026-07-28",
+            "capabilities": {},
+            "clientInfo": {"name": "issue-304-test", "version": "1"}
+        }
+    }));
+    assert_eq!(initialized["id"], 1);
+    let listed = mcp.request(json!({
+        "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}
+    }));
+    let tools = listed["result"]["tools"].as_array().unwrap();
+    let common = || {
+        json!({
+            "contract_version": "depgraph-mcp-tools-v1",
+            "repository_id": "repository",
+            "snapshot": "current"
+        })
+    };
+
+    let mut query_arguments = common();
+    query_arguments["query"] = json!(QUERY);
+    query_arguments["limit"] = json!(1);
+    let first = interactive_tool_call(&mut mcp, 3, "graph_query", query_arguments.clone());
+    assert_eq!(first["isError"], false, "{first}");
+    assert_tool_text_matches_structured(&first);
+    assert_eq!(first["structuredContent"]["snapshot_id"], snapshot_id);
+    assert_eq!(
+        first["structuredContent"]["result"]["items"][0]["values"][0],
+        json!({"kind":"text","value":"node:a"})
+    );
+    let query_cursor = first["structuredContent"]["result"]["next_cursor"]
+        .as_str()
+        .expect("query fixture has a second row")
+        .to_owned();
+    let repeated = interactive_tool_call(&mut mcp, 4, "graph_query", query_arguments.clone());
+    assert_eq!(repeated["structuredContent"], first["structuredContent"]);
+
+    let mut file_arguments = common();
+    file_arguments["query_file"] = json!("query.depgraph");
+    file_arguments["limit"] = json!(1);
+    let file_query = interactive_tool_call(&mut mcp, 5, "graph_query", file_arguments);
+    assert_eq!(file_query["isError"], false, "{file_query}");
+    assert_eq!(file_query["structuredContent"], first["structuredContent"]);
+
+    let mut next_arguments = query_arguments.clone();
+    next_arguments["cursor"] = json!(query_cursor.clone());
+    let next = interactive_tool_call(&mut mcp, 6, "graph_query", next_arguments);
+    assert_eq!(next["isError"], false, "{next}");
+    assert_ne!(next["structuredContent"], first["structuredContent"]);
+    assert_ne!(
+        next["structuredContent"]["result"]["items"],
+        first["structuredContent"]["result"]["items"]
+    );
+
+    let mut mismatched_arguments = common();
+    mismatched_arguments["query"] = json!(QUERY.replace("source.id, target.id", "target.id"));
+    mismatched_arguments["limit"] = json!(1);
+    mismatched_arguments["cursor"] = json!(query_cursor);
+    let mismatched = interactive_tool_call(&mut mcp, 7, "graph_query", mismatched_arguments);
+    assert_eq!(mismatched["isError"], true);
+    assert_eq!(
+        mismatched["structuredContent"]["error"]["code"],
+        "CURSOR_MISMATCH"
+    );
+
+    let existential_terms = (0..16)
+        .map(|index| {
+            format!(
+                "SOME evidence{index} IN EVIDENCE(p) SATISFIES evidence{index}.kind = \"source\""
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    let hostile_query = format!(
+        "MATCH p = (source:\"module\")-[\"imports\"*1..8]->(target:\"module\") \
+         WHERE {existential_terms} RETURN target.id LIMIT 1"
+    );
+    let mut hostile_arguments = common();
+    hostile_arguments["query"] = json!(hostile_query);
+    let rejected = interactive_tool_call(&mut mcp, 8, "graph_query", hostile_arguments);
+    assert_eq!(rejected["isError"], true, "{rejected}");
+    assert_eq!(
+        rejected["structuredContent"]["error"]["code"],
+        "QUERY_REJECTED"
+    );
+
+    let mut runtime_file_arguments = common();
+    runtime_file_arguments["trace_file"] = json!("trace.json");
+    runtime_file_arguments["limit"] = json!(1);
+    let runtime_file = interactive_tool_call(
+        &mut mcp,
+        9,
+        "runtime_trace_validate",
+        runtime_file_arguments,
+    );
+    assert_eq!(runtime_file["isError"], false, "{runtime_file}");
+    assert_tool_text_matches_structured(&runtime_file);
+    assert_eq!(
+        runtime_file["structuredContent"]["result"]["summary"]["events"],
+        1
+    );
+    assert_eq!(
+        runtime_file["structuredContent"]["result"]["events"]["items"][0]["source"]["node_id"],
+        "node:a"
+    );
+    let mut runtime_inline_arguments = common();
+    runtime_inline_arguments["trace"] = json!(trace.to_string());
+    runtime_inline_arguments["limit"] = json!(1);
+    let runtime_inline = interactive_tool_call(
+        &mut mcp,
+        10,
+        "runtime_trace_validate",
+        runtime_inline_arguments,
+    );
+    assert_eq!(runtime_inline["isError"], false, "{runtime_inline}");
+    assert_eq!(
+        runtime_inline["structuredContent"],
+        runtime_file["structuredContent"]
+    );
+
+    let shared_schema: Value = serde_json::from_slice(include_bytes!(
+        "../../../schemas/depgraph-mcp-tools-v1.schema.json"
+    ))
+    .unwrap();
+    let shared = jsonschema::draft202012::new(&shared_schema).unwrap();
+    for (name, result) in [
+        ("graph_query", &first),
+        ("runtime_trace_validate", &runtime_file),
+    ] {
+        let structured = &result["structuredContent"];
+        let advertised =
+            tools.iter().find(|tool| tool["name"] == name).unwrap()["outputSchema"].clone();
+        jsonschema::draft202012::new(&advertised)
+            .unwrap()
+            .validate(structured)
+            .unwrap_or_else(|error| panic!("{name} advertised schema: {error}"));
+        shared
+            .validate(structured)
+            .unwrap_or_else(|error| panic!("{name} shared schema: {error}"));
+    }
+    mcp.finish();
+
+    let cli = |arguments: &[&str]| {
+        let binary = AssertCommand::cargo_bin("depgraph").unwrap();
+        let output = Command::new(binary.get_program())
+            .args(binary.get_args())
+            .current_dir(&root)
+            .arg("--store")
+            .arg(&store_path)
+            .args(arguments)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "CLI {arguments:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()
+    };
+    let cli_query = cli(&["query", "--query", QUERY, "--json"]);
+    let mcp_first_values = first["structuredContent"]["result"]["items"][0]["values"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|value| value["value"].clone())
+        .collect::<Vec<_>>();
+    assert_eq!(cli_query["rows"][0].as_array().unwrap(), &mcp_first_values);
+    let cli_runtime = cli(&["runtime", "validate", "--file", "trace.json", "--json"]);
+    assert_eq!(
+        cli_runtime["data"]["summary"],
+        runtime_file["structuredContent"]["result"]["summary"]
+    );
+    assert_eq!(
+        cli_runtime["data"]["events"][0]["id"],
+        runtime_file["structuredContent"]["result"]["events"]["items"][0]["id"]
+    );
+    assert_eq!(before, store_invariant(&store_path));
+}
+
+#[test]
+fn issue_304_hostile_inputs_are_rejected_before_missing_store_access_without_echo() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("repository");
+    let missing_store = temporary.path().join("must-not-open.sqlite");
+    fs::create_dir(&root).unwrap();
+    let secret = "fixture-secret-value";
+    let credential_query = format!(
+        "MATCH p = (source)-[\"imports\"*1..1]->(target) \
+         WHERE source.id = \"token={secret}\" RETURN target.id LIMIT 1"
+    );
+    let calls = [
+        (
+            "graph_query",
+            json!({
+                "contract_version":"depgraph-mcp-tools-v1",
+                "repository_id":"repository",
+                "query":credential_query
+            }),
+        ),
+        (
+            "runtime_trace_validate",
+            json!({
+                "contract_version":"depgraph-mcp-tools-v1",
+                "repository_id":"repository",
+                "trace": json!({"authorization":secret}).to_string()
+            }),
+        ),
+        (
+            "graph_query",
+            json!({
+                "contract_version":"depgraph-mcp-tools-v1",
+                "repository_id":"repository",
+                "query_file":root.join("absolute-secret.query")
+            }),
+        ),
+    ];
+    for (name, arguments) in calls {
+        let result = call_issue_300_tool(&root, &missing_store, name, arguments);
+        assert_eq!(result["isError"], true, "{name}: {result}");
+        assert_eq!(
+            result["structuredContent"]["error"]["code"],
+            "INVALID_ARGUMENT"
+        );
+        let encoded = result.to_string();
+        assert!(!encoded.contains(secret));
+        assert!(!encoded.contains(root.to_string_lossy().as_ref()));
+        assert!(!missing_store.exists());
+    }
 }
 
 #[test]

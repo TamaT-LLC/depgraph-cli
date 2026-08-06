@@ -8,10 +8,12 @@ use std::{
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use depgraph_core::service::{
-    CompletedSnapshotView, CyclesRequest, DependenciesRequest, DependencyDirection,
-    DepgraphCapabilitySet, DepgraphService, DepgraphServiceConfig, DepgraphServiceError,
-    DepgraphServiceLimits, DoctorRequest, ExplainPathRequest, ImpactRequest, ProfilePlanRequest,
-    RepositoryRelativePath, SnapshotLocator, SnapshotReadRequest, UnresolvedRequest,
+    BoundedQueryMode, BoundedQueryRequest, CompletedSnapshotView, CyclesRequest,
+    DependenciesRequest, DependencyDirection, DepgraphCapabilitySet, DepgraphService,
+    DepgraphServiceConfig, DepgraphServiceError, DepgraphServiceLimits, DoctorRequest,
+    ExplainPathRequest, ImpactRequest, ProfilePlanRequest, RepositoryRelativePath,
+    RuntimeValidateRequest, ServiceSnapshotSelector, SnapshotLocator, SnapshotReadRequest,
+    UnresolvedRequest,
 };
 use depgraph_core::{
     BoundedQueryExecutionError, BoundedQueryPlan, BoundedQueryResult, BuildAudit, BuildOutcomeKind,
@@ -24,13 +26,11 @@ use depgraph_core::{
     compiler_precise_cache_hit_audit, compiler_precise_cache_key, compiler_precise_graph_ndjson,
     create_build_execution_request, create_compiler_precise_invocation_request,
     create_compiler_precise_unit_graph_request, default_store_path, evaluate_policy_diff,
-    execute_bounded_query, execute_build_request_with_cancellation, export_filtered,
-    export_graphml_filtered_to_writer, init_config, match_runtime_trace, open_store,
-    open_store_read_only, paginate_interactive_query, parse_and_type_check_bounded_query,
-    plan_bounded_query, policy_annotations, prepare_build_cache_input,
-    prepare_compiler_precise_cache_input, profile_selection_human_summary, read_bounded_query_file,
-    read_compiler_pack_requirement, read_runtime_trace, render_condition,
-    render_github_annotations, run_scan_with_cache_mode, runtime_session_delta,
+    execute_build_request_with_cancellation, export_filtered, export_graphml_filtered_to_writer,
+    init_config, match_runtime_trace, open_store, paginate_interactive_query, policy_annotations,
+    prepare_build_cache_input, prepare_compiler_precise_cache_input,
+    profile_selection_human_summary, read_compiler_pack_requirement, read_runtime_trace,
+    render_condition, render_github_annotations, run_scan_with_cache_mode, runtime_session_delta,
     rust_build_protocol_ndjson, snapshot_profile_plan_id, stage_build_evidence,
     start_repository_daemon, traversal_summary, unresolved_summary, validate_build_cache_input,
     validate_build_cache_source, validate_compiler_precise_cache_input,
@@ -419,7 +419,22 @@ enum SnapshotCommands {
 enum RuntimeCommands {
     /// Validate a versioned trace and match its locators to the selected snapshot.
     Validate {
-        trace: PathBuf,
+        /// Supply the complete runtime trace JSON as one command-line value.
+        #[arg(
+            long,
+            value_name = "TRACE",
+            required_unless_present = "file",
+            conflicts_with = "file"
+        )]
+        trace: Option<String>,
+        /// Read the runtime trace from one confined repository-relative regular file.
+        #[arg(
+            long,
+            value_name = "FILE",
+            required_unless_present = "trace",
+            conflicts_with = "trace"
+        )]
+        file: Option<PathBuf>,
         #[arg(long)]
         json: bool,
     },
@@ -592,6 +607,16 @@ async fn main() -> ExitCode {
 
 fn error_exit_code(error: &anyhow::Error) -> u8 {
     if let Some(service_error) = error.downcast_ref::<DepgraphServiceError>() {
+        if matches!(service_error, DepgraphServiceError::QueryRejected) {
+            return 1;
+        }
+        if matches!(
+            service_error,
+            DepgraphServiceError::BoundedQueryInput { diagnostic }
+                if diagnostic.class == QueryFailureClass::Security
+        ) {
+            return 4;
+        }
         if matches!(
             service_error,
             DepgraphServiceError::ProfilePlanSecurity { .. }
@@ -1793,45 +1818,52 @@ async fn run(cli: Cli) -> Result<u8> {
             json,
         } => {
             let repository_root = canonical_directory(std::env::current_dir()?)?;
-            let query = match (query, file) {
-                (Some(query), None) => query,
-                (None, Some(path)) => read_bounded_query_file(&repository_root, &path)?,
-                _ => unreachable!("clap requires exactly one bounded query input"),
+            let store_path = store_path(cli.store, &repository_root)?;
+            let service = snapshot_read_service(&repository_root, &store_path)?;
+            let query_file = file
+                .map(|path| repository_relative_cli_input(&path))
+                .transpose()?;
+            let request = BoundedQueryRequest {
+                query,
+                query_file,
+                snapshot: cli_snapshot_selector(cli.scan_id),
+                mode: if explain {
+                    BoundedQueryMode::Explain
+                } else {
+                    BoundedQueryMode::Execute
+                },
             };
-            // Parse and type-check before store access so malformed, hostile,
-            // and credential-shaped input cannot observe repository state.
-            let typed = parse_and_type_check_bounded_query(&query)?;
-            drop(query);
-
-            let (snapshot, snapshot_id) =
-                load_query_snapshot_read_only(cli.store, cli.scan_id.as_deref())?;
-            let plan = plan_bounded_query(&typed, &snapshot_id, &snapshot)?;
+            let found = match service.bounded_query(&request, &CancellationToken::new()) {
+                Ok(found) => found,
+                Err(DepgraphServiceError::NotFound) => return Err(QuerySnapshotUnavailable.into()),
+                Err(error) => return Err(error.into()),
+            };
+            let plan = found.plan();
             if explain {
-                print_query_plan(&plan, json)?;
+                print_query_plan(plan, json)?;
                 return Ok(if plan.admitted { 0 } else { 1 });
             }
-            if !plan.admitted {
-                print_query_plan_rejection(&plan);
-                return Ok(1);
-            }
-            let result =
-                execute_bounded_query(&typed, &plan, &snapshot, &CancellationToken::new())?;
-            print_query_result(&typed.ast.return_clause.projections, &result, json)?;
+            let result = found
+                .result()
+                .ok_or_else(|| anyhow::anyhow!("bounded query execution result is unavailable"))?;
+            print_query_result(found.projections(), result, json)?;
             Ok(0)
         }
         Commands::Runtime { command } => match command {
-            RuntimeCommands::Validate { trace, json } => {
-                let metadata = inspect_runtime_trace_input(&trace)?;
-                if !metadata.file_type().is_file() {
-                    anyhow::bail!("runtime trace input must be a regular file");
-                }
-                let input =
-                    std::fs::File::open(&trace).context("failed to open runtime trace input")?;
-                let trace = read_runtime_trace(input)?;
-                let (snapshot, scan_id) =
-                    load_snapshot_read_only(cli.store, cli.scan_id.as_deref(), false)?;
-                let result = match_runtime_trace(trace, &snapshot)?;
-                print_structured("runtime.validate", scan_id, &result, json)?;
+            RuntimeCommands::Validate { trace, file, json } => {
+                let repository_root = canonical_directory(std::env::current_dir()?)?;
+                let store_path = store_path(cli.store, &repository_root)?;
+                let service = snapshot_read_service(&repository_root, &store_path)?;
+                let request = RuntimeValidateRequest {
+                    trace,
+                    trace_file: file
+                        .map(|path| repository_relative_cli_input(&path))
+                        .transpose()?,
+                    snapshot: cli_snapshot_selector(cli.scan_id),
+                };
+                let found = service.runtime_validate(&request, &CancellationToken::new())?;
+                let result = found.trace();
+                print_structured("runtime.validate", found.scan_id().to_owned(), result, json)?;
                 if !json {
                     println!("runtime trace: valid");
                     println!("schema: {}", result.schema_version);
@@ -2255,6 +2287,22 @@ fn normalize_cli_repository_file(
         .map_err(|_| unsafe_profiles_file("path is not repository-relative"))
 }
 
+fn repository_relative_cli_input(
+    supplied: &Path,
+) -> std::result::Result<RepositoryRelativePath, DepgraphServiceError> {
+    let supplied = supplied
+        .to_str()
+        .ok_or(DepgraphServiceError::InvalidInput)?;
+    RepositoryRelativePath::parse(supplied)
+}
+
+fn cli_snapshot_selector(scan_id: Option<String>) -> ServiceSnapshotSelector {
+    scan_id.map_or_else(
+        ServiceSnapshotSelector::current,
+        ServiceSnapshotSelector::ScanId,
+    )
+}
+
 fn unsafe_profiles_file(reason: &'static str) -> DepgraphServiceError {
     DepgraphServiceError::profile_plan_security(anyhow::anyhow!(
         "unsafe explicit profiles file: {reason}"
@@ -2505,39 +2553,6 @@ fn load_snapshot(
     Ok((snapshot, scan_id))
 }
 
-fn load_snapshot_read_only(
-    explicit_store: Option<PathBuf>,
-    requested_scan_id: Option<&str>,
-    latest_attempt: bool,
-) -> Result<(depgraph_core::GraphSnapshot, String)> {
-    let root = std::env::current_dir()?;
-    let store_path = store_path(explicit_store, &root)?;
-    let store = open_store_read_only(&store_path)?;
-    let scan_id = store.resolve_scan_id(requested_scan_id, latest_attempt)?;
-    let snapshot = store.load_snapshot(&scan_id)?;
-    Ok((snapshot, scan_id))
-}
-
-fn load_query_snapshot_read_only(
-    explicit_store: Option<PathBuf>,
-    requested_scan_id: Option<&str>,
-) -> Result<(depgraph_core::GraphSnapshot, String)> {
-    let root = std::env::current_dir()?;
-    let store_path = store_path(explicit_store, &root)?;
-    let store = open_store_read_only(&store_path)?;
-    let snapshot_id = if let Some(scan_id) = requested_scan_id {
-        store
-            .snapshot_id_for_scan_selection(scan_id)?
-            .ok_or(QuerySnapshotUnavailable)?
-    } else {
-        store
-            .current_snapshot_id()?
-            .ok_or(QuerySnapshotUnavailable)?
-    };
-    let snapshot = store.load_completed_snapshot(&snapshot_id)?;
-    Ok((snapshot, snapshot_id))
-}
-
 fn graph_snapshot_request(
     explicit_store: Option<PathBuf>,
     requested_scan_id: Option<&str>,
@@ -2696,15 +2711,6 @@ fn print_query_plan(plan: &BoundedQueryPlan, json: bool) -> Result<()> {
         );
     }
     Ok(())
-}
-
-fn print_query_plan_rejection(plan: &BoundedQueryPlan) {
-    for reason in &plan.reasons {
-        eprintln!(
-            "error: {}: resource={}; observed={}; limit={}; remediation={}",
-            reason.code, reason.resource, reason.observed, reason.limit, reason.remediation
-        );
-    }
 }
 
 fn print_query_result(

@@ -105,6 +105,14 @@ impl QueryDiagnostic {
             message,
         )
     }
+
+    pub(crate) fn service_input_limit() -> Self {
+        Self::input(
+            "query_input_bytes_exceeded",
+            QueryFailureClass::Limit,
+            "query input exceeds the byte limit",
+        )
+    }
 }
 
 impl fmt::Display for QueryDiagnostic {

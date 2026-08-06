@@ -255,6 +255,107 @@ fn issue_303_graph_tools_advertise_exact_closed_immediate_contracts() {
 }
 
 #[test]
+fn issue_304_query_and_runtime_validate_advertise_exact_one_confined_inputs() {
+    let catalog = ToolCatalog::for_capabilities(&DepgraphCapabilitySet::read_only()).unwrap();
+    for (name, expected_fields, result_ref) in [
+        (
+            "graph_query",
+            vec![
+                "contract_version",
+                "cursor",
+                "limit",
+                "query",
+                "query_file",
+                "repository_id",
+                "snapshot",
+            ],
+            "#/$defs/Page",
+        ),
+        (
+            "runtime_trace_validate",
+            vec![
+                "contract_version",
+                "cursor",
+                "limit",
+                "repository_id",
+                "snapshot",
+                "trace",
+                "trace_file",
+            ],
+            "#/$defs/AgentRuntimeValidationResponse",
+        ),
+    ] {
+        let tool = catalog.tool(name).unwrap();
+        let mut fields = tool.input_schema()["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        fields.sort_unstable();
+        assert_eq!(fields, expected_fields);
+        assert_eq!(tool.operation_behavior(), OperationBehavior::Immediate);
+        assert_eq!(tool.input_schema()["oneOf"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            tool.output_schema()["properties"]["result"]["$ref"],
+            result_ref
+        );
+    }
+
+    let query = catalog.tool("graph_query").unwrap();
+    assert_eq!(
+        query.input_schema()["properties"]["query"]["x-depgraph-maxUtf8Bytes"],
+        65_536
+    );
+    for field in ["query_file", "trace_file"] {
+        let tool = if field == "query_file" {
+            query
+        } else {
+            catalog.tool("runtime_trace_validate").unwrap()
+        };
+        assert!(
+            tool.input_schema()["properties"][field]["allOf"]
+                .as_array()
+                .is_some_and(|constraints| !constraints.is_empty()),
+            "{field} must retain the closed repository-relative path constraints"
+        );
+        let input_schema = serde_json::Value::Object(tool.input_schema().clone());
+        let schema = jsonschema::draft202012::new(&input_schema).unwrap();
+        let inline_field = if field == "query_file" {
+            "query"
+        } else {
+            "trace"
+        };
+        let valid = serde_json::json!({
+            "contract_version": "depgraph-mcp-tools-v1",
+            "repository_id": "repository",
+            (field): "fixtures/input.json"
+        });
+        assert!(schema.is_valid(&valid));
+        for invalid_path in ["/absolute/input.json", "../escape.json"] {
+            let invalid = serde_json::json!({
+                "contract_version": "depgraph-mcp-tools-v1",
+                "repository_id": "repository",
+                (field): invalid_path
+            });
+            assert!(!schema.is_valid(&invalid));
+        }
+        let neither = serde_json::json!({
+            "contract_version": "depgraph-mcp-tools-v1",
+            "repository_id": "repository"
+        });
+        assert!(!schema.is_valid(&neither));
+        let both = serde_json::json!({
+            "contract_version": "depgraph-mcp-tools-v1",
+            "repository_id": "repository",
+            (field): "fixtures/input.json",
+            (inline_field): "inline"
+        });
+        assert!(!schema.is_valid(&both));
+    }
+}
+
+#[test]
 fn profiles_include_dependencies_and_default_excludes_privileged_tools() {
     assert_eq!(
         CapabilityProfile::Read.required_capabilities(),

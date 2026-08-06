@@ -389,6 +389,7 @@ pub enum AgentErrorCode {
     SnapshotNotFound,
     SnapshotMismatch,
     SnapshotWorktreeMismatch,
+    QueryRejected,
     CursorInvalid,
     CursorMismatch,
     CapabilityDenied,
@@ -426,6 +427,7 @@ impl AgentErrorCode {
             | Self::SnapshotWorktreeMismatch
             | Self::CursorInvalid
             | Self::CursorMismatch => AgentErrorCategory::Input,
+            Self::QueryRejected => AgentErrorCategory::Resource,
             Self::CapabilityDenied => AgentErrorCategory::Authorization,
             Self::SnapshotNotFound | Self::NotFound => AgentErrorCategory::NotFound,
             Self::Conflict | Self::IdempotencyConflict => AgentErrorCategory::Conflict,
@@ -666,4 +668,8 @@ pub enum ContractBuildError {
     TooManyCorrelationReasons,
     #[error("Agent unresolved site contains too many phases")]
     TooManyPhases,
+    #[error("Agent query row contains too many projected values")]
+    TooManyQueryValues,
+    #[error("Agent query value is outside the closed projection contract")]
+    QueryValue,
 }
