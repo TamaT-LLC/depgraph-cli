@@ -344,6 +344,81 @@ async fn deadline_keeps_capacity_reserved_until_blocking_work_stops() {
 }
 
 #[tokio::test]
+async fn aborting_caller_cancels_worker_and_keeps_capacity_until_worker_exits() {
+    let runtime = RuntimeController::new(
+        RuntimeConfig::default()
+            .with_read_concurrency(1)
+            .with_read_queue_capacity(0)
+            .with_read_deadline(Duration::from_secs(5)),
+    )
+    .unwrap();
+    let started = Arc::new(AtomicBool::new(false));
+    let observed_cancellation = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(AtomicBool::new(false));
+
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        let started = Arc::clone(&started);
+        let observed_cancellation = Arc::clone(&observed_cancellation);
+        let release = Arc::clone(&release);
+        async move {
+            runtime
+                .execute_blocking(RuntimeClass::Read, CancellationToken::new(), move |token| {
+                    started.store(true, Ordering::Release);
+                    while !token.is_cancelled() && !release.load(Ordering::Acquire) {
+                        std::thread::yield_now();
+                    }
+                    observed_cancellation.store(token.is_cancelled(), Ordering::Release);
+                    while !release.load(Ordering::Acquire) {
+                        std::thread::yield_now();
+                    }
+                    Ok::<_, ()>("must-not-publish")
+                })
+                .await
+        }
+    });
+    while !started.load(Ordering::Acquire) {
+        tokio::task::yield_now().await;
+    }
+
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    for _ in 0..100 {
+        if observed_cancellation.load(Ordering::Acquire) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+
+    let overflow_started = Arc::new(AtomicBool::new(false));
+    let overflow = runtime
+        .execute_blocking(RuntimeClass::Read, CancellationToken::new(), {
+            let overflow_started = Arc::clone(&overflow_started);
+            move |_| {
+                overflow_started.store(true, Ordering::Release);
+                Ok::<_, ()>(())
+            }
+        })
+        .await;
+    assert_eq!(overflow.unwrap_err(), RuntimeFailure::ResourceExhausted);
+    assert!(!overflow_started.load(Ordering::Acquire));
+
+    let observed = observed_cancellation.load(Ordering::Acquire);
+    release.store(true, Ordering::Release);
+    for _ in 0..100 {
+        if runtime.admitted_reads() == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert!(
+        observed,
+        "worker did not observe cancellation after caller abort"
+    );
+    assert_eq!(runtime.admitted_reads(), 0);
+}
+
+#[tokio::test]
 async fn external_cancellation_reaches_service_work() {
     let runtime = RuntimeController::new(RuntimeConfig::default()).unwrap();
     let cancellation = CancellationToken::new();

@@ -383,6 +383,7 @@ impl RuntimeController {
             operation(worker_cancellation)
         });
         tokio::pin!(worker);
+        let mut cancellation_on_drop = CancellationOnDrop::new(cancellation.clone());
 
         tokio::select! {
             biased;
@@ -395,8 +396,35 @@ impl RuntimeController {
                 Err(RuntimeFailure::DeadlineExceeded)
             }
             joined = &mut worker => {
+                cancellation_on_drop.disarm();
                 joined.map_err(|_| RuntimeFailure::WorkerFailed)
             }
+        }
+    }
+}
+
+struct CancellationOnDrop {
+    cancellation: CancellationToken,
+    armed: bool,
+}
+
+impl CancellationOnDrop {
+    fn new(cancellation: CancellationToken) -> Self {
+        Self {
+            cancellation,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CancellationOnDrop {
+    fn drop(&mut self) {
+        if self.armed {
+            self.cancellation.cancel();
         }
     }
 }
