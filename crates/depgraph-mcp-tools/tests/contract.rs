@@ -7,10 +7,11 @@ use depgraph_mcp_tools::{
     AgentDependencyDirection, AgentEdge, AgentError, AgentErrorCategory, AgentErrorCode,
     AgentErrorDetails, AgentEvidence, AgentEvidenceKind, AgentImpact, AgentImpactResponse,
     AgentLocator, AgentNamedSnapshot, AgentNode, AgentNodeSummary, AgentPathResponse,
-    AgentPathStep, AgentPhase, AgentPrecision, AgentRemediation, AgentResolutionStatus,
-    AgentResourceLimit, AgentSite, AgentSnapshot, AgentSourcePosition, AgentSourceSpan,
-    AgentUnresolved, CommonRequest, ContractBuildError, Cursor, DurableSubmitResult, ErrorEnvelope,
-    LogicalRepositoryId, MAX_AGENT_CORRELATION_REASONS, MAX_AGENT_CYCLE_NODES, MAX_AGENT_PHASES,
+    AgentPathStep, AgentPhase, AgentPrecision, AgentQueryRow, AgentRemediation,
+    AgentResolutionStatus, AgentResourceLimit, AgentRuntimeValidationResponse, AgentSite,
+    AgentSnapshot, AgentSourcePosition, AgentSourceSpan, AgentUnresolved, CommonRequest,
+    ContractBuildError, Cursor, DurableSubmitResult, ErrorEnvelope, LogicalRepositoryId,
+    MAX_AGENT_CORRELATION_REASONS, MAX_AGENT_CYCLE_NODES, MAX_AGENT_PHASES, MAX_AGENT_QUERY_VALUES,
     MAX_PAGE_BYTES, MAX_PAGE_ITEMS, MAX_TASK_TTL_MS, MIN_TASK_TTL_MS, OperationAccepted,
     OperationRecoveryTools, Page, PageByteLimit, PageRequest, PageSize, RepositoryRelativePath,
     SnapshotId, SnapshotSelector, SuccessEnvelope, TASK_POLL_INTERVAL_MS, TaskAccepted,
@@ -72,6 +73,44 @@ fn node_summary() -> AgentNodeSummary {
         parse("repo://src/lib.rs"),
         parse("crate::lib"),
     )
+}
+
+fn query_row() -> AgentQueryRow {
+    serde_json::from_value(json!({
+        "values":[
+            {"kind":"text","value":"node:src"},
+            {"kind":"node","node_id":"node:dependency"}
+        ]
+    }))
+    .expect("representative bounded query row")
+}
+
+fn runtime_validation() -> AgentRuntimeValidationResponse {
+    serde_json::from_value(json!({
+        "schema_version":"1.0",
+        "profile_match":{"status":"resolved","parent_profile_id":"profile:fixture"},
+        "summary":{
+            "events":1,
+            "resolved_targets":1,
+            "external_targets":0,
+            "unresolved_targets":0,
+            "redacted_values":1
+        },
+        "events":{
+            "items":[{
+                "id":"runtime-event:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "sequence":1,
+                "dependency_kind":"imports",
+                "source":{"status":"resolved","node_id":"node:src"},
+                "target":{"status":"resolved","node_id":"node:dependency"},
+                "count":1
+            }],
+            "returned_items":1,
+            "total_items":1,
+            "complete":true
+        }
+    }))
+    .expect("representative runtime validation")
 }
 
 fn completed_snapshot() -> AgentCompletedSnapshot {
@@ -582,6 +621,74 @@ fn issue_303_closed_results_reject_unknown_enums_and_unbounded_shapes() {
 }
 
 #[test]
+fn issue_304_query_and_runtime_dtos_reject_forged_shapes_and_counts() {
+    assert!(serde_json::from_value::<AgentQueryRow>(json!({"values":[]})).is_err());
+    let too_wide = json!({
+        "values": (0..=MAX_AGENT_QUERY_VALUES)
+            .map(|_| json!({"kind":"null"}))
+            .collect::<Vec<_>>()
+    });
+    assert!(serde_json::from_value::<AgentQueryRow>(too_wide).is_err());
+    assert!(
+        serde_json::from_value::<AgentQueryRow>(json!({
+            "values":[{
+                "kind":"path",
+                "path_id":"query-path:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "depth":2,
+                "direction":"forward",
+                "node_ids":["node:a","node:b"],
+                "edge_ids":["edge:a"]
+            }]
+        }))
+        .is_err()
+    );
+
+    let valid = json!({
+        "schema_version":"1.0",
+        "profile_match":{"status":"resolved","parent_profile_id":"profile:fixture"},
+        "summary":{
+            "events":1,
+            "resolved_targets":1,
+            "external_targets":0,
+            "unresolved_targets":0,
+            "redacted_values":1
+        },
+        "events":{
+            "items":[{
+                "id":"runtime-event:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "sequence":1,
+                "dependency_kind":"imports",
+                "source":{"status":"resolved","node_id":"node:a"},
+                "target":{"status":"resolved","node_id":"node:b"},
+                "count":1
+            }],
+            "returned_items":1,
+            "total_items":1,
+            "complete":true
+        }
+    });
+    assert!(serde_json::from_value::<AgentRuntimeValidationResponse>(valid.clone()).is_ok());
+
+    let mut missing_resolved_node = valid.clone();
+    missing_resolved_node["events"]["items"][0]["target"] = json!({"status":"resolved"});
+    assert!(
+        serde_json::from_value::<AgentRuntimeValidationResponse>(missing_resolved_node).is_err()
+    );
+    let mut unresolved_with_node = valid.clone();
+    unresolved_with_node["events"]["items"][0]["target"] =
+        json!({"status":"unresolved","node_id":"node:b"});
+    assert!(
+        serde_json::from_value::<AgentRuntimeValidationResponse>(unresolved_with_node).is_err()
+    );
+    let mut summary_mismatch = valid.clone();
+    summary_mismatch["summary"]["resolved_targets"] = json!(0);
+    assert!(serde_json::from_value::<AgentRuntimeValidationResponse>(summary_mismatch).is_err());
+    let mut page_mismatch = valid;
+    page_mismatch["summary"]["events"] = json!(2);
+    assert!(serde_json::from_value::<AgentRuntimeValidationResponse>(page_mismatch).is_err());
+}
+
+#[test]
 fn issue_300_public_node_projection_has_exactly_four_fields() {
     let value = serde_json::to_value(node_summary()).expect("serialize node summary");
     let mut fields = value
@@ -777,6 +884,7 @@ fn typed_error_category_is_derived_and_deserialization_cannot_forge_it() {
             AgentErrorCode::SnapshotWorktreeMismatch,
             AgentErrorCategory::Input,
         ),
+        (AgentErrorCode::QueryRejected, AgentErrorCategory::Resource),
         (AgentErrorCode::CursorInvalid, AgentErrorCategory::Input),
         (AgentErrorCode::CursorMismatch, AgentErrorCategory::Input),
         (
@@ -991,6 +1099,8 @@ fn contract_samples() -> Value {
             node(), dependency_node(), true, 1, vec![path_step()]
         ).expect("sample path response"),
         "agent_path_step": path_step(),
+        "agent_query_row": query_row(),
+        "agent_runtime_validation": runtime_validation(),
         "agent_context": context(),
         "agent_named_snapshot": named_snapshot(),
         "agent_site": site(),

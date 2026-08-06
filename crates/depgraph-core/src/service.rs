@@ -12,6 +12,10 @@ pub use crate::service_agent::{
     CurrentSnapshotAvailability, DepgraphContext, FindNodesPageResult, FindNodesResult,
     MAX_FIND_NODES_QUERY_BYTES, NamedCompletedSnapshot, NodeMatchMode, NodeProjection,
 };
+pub use crate::service_bounded::{
+    BoundedQueryMode, BoundedQueryRequest, BoundedQueryServiceResult, RuntimeValidateRequest,
+    RuntimeValidateServiceResult, ServiceSnapshotSelector,
+};
 pub use crate::service_graph::{
     CyclesRequest, CyclesResult, DependenciesRequest, DependenciesResult, DependencyDirection,
     ExplainPathRequest, ExplainPathResult, ImpactRequest, ImpactServiceResult, UnresolvedRequest,
@@ -617,6 +621,18 @@ pub enum DepgraphServiceError {
         #[source]
         source: anyhow::Error,
     },
+    #[error("bounded query input is invalid: {diagnostic}")]
+    BoundedQueryInput {
+        #[source]
+        diagnostic: crate::QueryDiagnostic,
+    },
+    #[error("QUERY_REJECTED: query_plan_budget_exceeded")]
+    QueryRejected,
+    #[error("runtime trace input is invalid: {source}")]
+    RuntimeTraceInput {
+        #[source]
+        source: anyhow::Error,
+    },
     #[error("requested service resource was not found")]
     NotFound,
     #[error("request conflicts with the current service state")]
@@ -657,12 +673,14 @@ impl DepgraphServiceError {
             Self::InvalidRepositoryPath { .. }
             | Self::InvalidInput
             | Self::ProfilePlan { .. }
-            | Self::GraphQuery { .. } => DepgraphServiceErrorCategory::Input,
+            | Self::GraphQuery { .. }
+            | Self::BoundedQueryInput { .. }
+            | Self::RuntimeTraceInput { .. } => DepgraphServiceErrorCategory::Input,
             Self::RepositoryFile { reason } => reason.category(),
             Self::NotFound => DepgraphServiceErrorCategory::NotFound,
             Self::Conflict => DepgraphServiceErrorCategory::Conflict,
             Self::SnapshotWorktreeMismatch => DepgraphServiceErrorCategory::Input,
-            Self::ResourceExhausted => DepgraphServiceErrorCategory::Resource,
+            Self::QueryRejected | Self::ResourceExhausted => DepgraphServiceErrorCategory::Resource,
             Self::Cancelled => DepgraphServiceErrorCategory::Cancelled,
             Self::ReadStoreUnavailable { .. }
             | Self::MutatingStoreUnavailable { .. }

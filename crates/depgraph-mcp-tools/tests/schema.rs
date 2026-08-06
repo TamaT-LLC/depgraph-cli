@@ -450,7 +450,7 @@ fn every_generated_object_schema_has_additional_properties_false() {
     let schema = schema_value();
     let mut objects = 0;
     assert_all_object_schemas_are_closed(&schema, "#", &mut objects);
-    assert_eq!(objects, 113, "review newly added object schemas explicitly");
+    assert_eq!(objects, 129, "review newly added object schemas explicitly");
 }
 
 #[test]

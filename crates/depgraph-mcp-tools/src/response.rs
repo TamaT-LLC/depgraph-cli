@@ -22,12 +22,12 @@ use crate::{
     AgentCapability, AgentCompletedSnapshot, AgentContext, AgentCycle, AgentDaemonStatus,
     AgentDependenciesResponse, AgentDoctor, AgentEdge, AgentError, AgentErrorCode,
     AgentErrorDetails, AgentEvidence, AgentImpact, AgentImpactResponse, AgentNamedSnapshot,
-    AgentNode, AgentNodeSummary, AgentPathResponse, AgentPathStep, AgentProfilePlan,
-    AgentRemediation, AgentResourceLimit, AgentSite, AgentSnapshot, AgentUnresolved,
-    CanonicalJsonError, ContractBuildError, Cursor, DurableSubmitResult, ErrorEnvelope,
-    LogicalRepositoryId, MAX_PAGE_BYTES, MAX_PAGE_ITEMS, MCP_TOOLS_CONTRACT_VERSION,
-    OperationAccepted, Page, PageRequest, SnapshotId, SuccessEnvelope, TaskAccepted,
-    canonical_json_bytes,
+    AgentNode, AgentNodeSummary, AgentPathResponse, AgentPathStep, AgentProfilePlan, AgentQueryRow,
+    AgentRemediation, AgentResourceLimit, AgentRuntimeTraceEvent, AgentRuntimeValidationResponse,
+    AgentSite, AgentSnapshot, AgentUnresolved, CanonicalJsonError, ContractBuildError, Cursor,
+    DurableSubmitResult, ErrorEnvelope, LogicalRepositoryId, MAX_PAGE_BYTES, MAX_PAGE_ITEMS,
+    MCP_TOOLS_CONTRACT_VERSION, OperationAccepted, Page, PageRequest, SnapshotId, SuccessEnvelope,
+    TaskAccepted, canonical_json_bytes,
 };
 
 const CURSOR_VERSION: &str = "v1";
@@ -76,6 +76,7 @@ public_result!(
     AgentPathResponse,
     AgentPathStep,
     AgentProfilePlan,
+    AgentRuntimeValidationResponse,
     AgentSite,
     AgentSnapshot,
     DurableSubmitResult,
@@ -93,7 +94,9 @@ public_page_item!(
     AgentSite,
     AgentSnapshot,
     AgentImpact,
-    AgentUnresolved
+    AgentUnresolved,
+    AgentQueryRow,
+    AgentRuntimeTraceEvent,
 );
 
 impl<T: PublicPageItem> private::Sealed for Page<T> {}
@@ -265,7 +268,9 @@ fn map_service_error(source: &DepgraphServiceError) -> AgentError {
         },
         DepgraphServiceError::InvalidInput
         | DepgraphServiceError::ProfilePlan { .. }
-        | DepgraphServiceError::GraphQuery { .. } => AgentError::new(
+        | DepgraphServiceError::GraphQuery { .. }
+        | DepgraphServiceError::BoundedQueryInput { .. }
+        | DepgraphServiceError::RuntimeTraceInput { .. } => AgentError::new(
             AgentErrorCode::InvalidArgument,
             false,
             AgentRemediation::CorrectInput,
@@ -287,6 +292,12 @@ fn map_service_error(source: &DepgraphServiceError) -> AgentError {
             AgentErrorCode::SnapshotWorktreeMismatch,
             false,
             AgentRemediation::SelectCompletedSnapshot,
+            None,
+        ),
+        DepgraphServiceError::QueryRejected => AgentError::new(
+            AgentErrorCode::QueryRejected,
+            false,
+            AgentRemediation::NarrowQuery,
             None,
         ),
         DepgraphServiceError::ResourceExhausted => AgentError::new(

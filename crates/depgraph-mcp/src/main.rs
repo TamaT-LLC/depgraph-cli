@@ -9,8 +9,9 @@ use std::{
 use anyhow::{Context as _, Result, bail};
 use clap::{Parser, ValueEnum};
 use depgraph_core::service::{
-    CyclesRequest, DependenciesRequest, DependencyDirection, DoctorRequest, ExplainPathRequest,
-    ImpactRequest, NodeMatchMode, ProfilePlanRequest, UnresolvedRequest,
+    BoundedQueryMode, BoundedQueryRequest, CyclesRequest, DependenciesRequest, DependencyDirection,
+    DoctorRequest, ExplainPathRequest, ImpactRequest, NodeMatchMode, ProfilePlanRequest,
+    RuntimeValidateRequest, ServiceSnapshotSelector, UnresolvedRequest,
 };
 use depgraph_core::{
     CancellationToken, CycleLevel, DepgraphCapability, DepgraphCapabilitySet, DepgraphService,
@@ -22,12 +23,14 @@ use depgraph_mcp::runtime::{AuditLogger, RuntimeClass, RuntimeConfig, RuntimeCon
 use depgraph_mcp_tools::{
     AgentCompletedSnapshot, AgentContext, AgentCycleLevel, AgentDaemonStatus,
     AgentDependencyDirection, AgentDoctor, AgentError, AgentLocator, AgentNamedSnapshot,
-    AgentNodeSummary, AgentPathResponse, AgentProfilePlan, AgentToken, CanonicalResponseMapper,
-    ContractBuildError, ContractVersion, Cursor, CursorKey, ErrorEnvelope, LogicalRepositoryId,
-    MappedToolResult, PageByteLimit, PageRequest, PageSize, PaginationContext,
+    AgentNodeSummary, AgentPathResponse, AgentProfilePlan, AgentRuntimeTraceEvent,
+    AgentRuntimeValidationResponse, AgentToken, BoundedQueryProjectionFailure,
+    CanonicalResponseMapper, ContractBuildError, ContractVersion, Cursor, CursorKey, ErrorEnvelope,
+    LogicalRepositoryId, MappedToolResult, PageByteLimit, PageRequest, PageSize, PaginationContext,
     RepositoryRelativePath, ResponseMappingError, SnapshotId, SuccessEnvelope, ToolCatalog,
-    project_cycles_page_cancellable, project_dependencies_page_cancellable,
-    project_impact_response_cancellable, project_unresolved_page_cancellable,
+    project_bounded_query_rows_cancellable, project_cycles_page_cancellable,
+    project_dependencies_page_cancellable, project_impact_response_cancellable,
+    project_unresolved_page_cancellable,
 };
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler, ServiceExt,
@@ -341,6 +344,40 @@ struct GraphUnresolvedArguments {
     limit: Option<u16>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GraphQueryArguments {
+    contract_version: ContractVersion,
+    repository_id: LogicalRepositoryId,
+    #[serde(default)]
+    query: Option<String>,
+    #[serde(default)]
+    query_file: Option<RepositoryRelativePath>,
+    #[serde(default)]
+    snapshot: Option<String>,
+    #[serde(default)]
+    cursor: Option<Cursor>,
+    #[serde(default)]
+    limit: Option<u16>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeValidateArguments {
+    contract_version: ContractVersion,
+    repository_id: LogicalRepositoryId,
+    #[serde(default)]
+    trace: Option<String>,
+    #[serde(default)]
+    trace_file: Option<RepositoryRelativePath>,
+    #[serde(default)]
+    snapshot: Option<String>,
+    #[serde(default)]
+    cursor: Option<Cursor>,
+    #[serde(default)]
+    limit: Option<u16>,
+}
+
 enum ToolExecutionFailure {
     Service(DepgraphServiceError),
     Agent(AgentError),
@@ -413,6 +450,8 @@ impl ServerHandler for DepgraphMcpServer {
                 | "graph_impact_get"
                 | "graph_cycles_list"
                 | "graph_unresolved_list"
+                | "graph_query"
+                | "runtime_trace_validate"
         ) {
             return Err(McpError::invalid_params(
                 "tool handler is unavailable",
@@ -1047,6 +1086,108 @@ fn execute_catalog_read_tool(
             ))
             .map_err(Into::into)
         }
+        "graph_query" => {
+            let arguments = decode_arguments::<GraphQueryArguments>(arguments)?;
+            authorize_repository(
+                arguments.contract_version,
+                &arguments.repository_id,
+                repository_id,
+            )?;
+            let locator =
+                SnapshotLocator::parse(arguments.snapshot.as_deref().unwrap_or("current"))?;
+            let request = BoundedQueryRequest {
+                query: arguments.query,
+                query_file: arguments.query_file.map(TryInto::try_into).transpose()?,
+                snapshot: ServiceSnapshotSelector::Locator(locator),
+                mode: BoundedQueryMode::Execute,
+            };
+            let found = service.bounded_query(&request, cancellation)?;
+            let snapshot_id = parse_snapshot_id(found.resolved_snapshot_id().as_str())?;
+            let normalized = serde_json::json!({
+                "query_digest": found.input_digest(),
+            });
+            let pagination = PaginationContext::new(
+                cursor_key,
+                tool,
+                repository_id.clone(),
+                snapshot_id.clone(),
+                &normalized,
+            )?;
+            let request = page_request(arguments.limit, arguments.cursor)?;
+            let rows =
+                project_bounded_query_rows_cancellable(&found, &mut || cancellation.is_cancelled())
+                    .map_err(|error| match error {
+                        BoundedQueryProjectionFailure::Cancelled => {
+                            ToolExecutionFailure::Service(DepgraphServiceError::Cancelled)
+                        }
+                        BoundedQueryProjectionFailure::Contract(error) => {
+                            contract_mapping_error(error)
+                        }
+                    })?;
+            let page = pagination
+                .paginate_cancellable(&rows, &request, cancellation)
+                .map_err(ToolExecutionFailure::Agent)?;
+            CanonicalResponseMapper::success(&SuccessEnvelope::new(
+                repository_id.clone(),
+                Some(snapshot_id),
+                page,
+            ))
+            .map_err(Into::into)
+        }
+        "runtime_trace_validate" => {
+            let arguments = decode_arguments::<RuntimeValidateArguments>(arguments)?;
+            authorize_repository(
+                arguments.contract_version,
+                &arguments.repository_id,
+                repository_id,
+            )?;
+            let locator =
+                SnapshotLocator::parse(arguments.snapshot.as_deref().unwrap_or("current"))?;
+            let request = RuntimeValidateRequest {
+                trace: arguments.trace,
+                trace_file: arguments.trace_file.map(TryInto::try_into).transpose()?,
+                snapshot: ServiceSnapshotSelector::Locator(locator),
+            };
+            let found = service.runtime_validate(&request, cancellation)?;
+            let snapshot_id = parse_snapshot_id(found.resolved_snapshot_id().as_str())?;
+            let normalized = serde_json::json!({
+                "trace_digest": found.input_digest(),
+            });
+            let pagination = PaginationContext::new(
+                cursor_key,
+                tool,
+                repository_id.clone(),
+                snapshot_id.clone(),
+                &normalized,
+            )?;
+            let request = page_request(arguments.limit, arguments.cursor)?;
+            let mut events = Vec::with_capacity(found.trace().events.len());
+            for event in &found.trace().events {
+                if cancellation.is_cancelled() {
+                    return Err(ToolExecutionFailure::Service(
+                        DepgraphServiceError::Cancelled,
+                    ));
+                }
+                events.push(AgentRuntimeTraceEvent::try_from(event).map_err(|error| {
+                    if cancellation.is_cancelled() {
+                        ToolExecutionFailure::Service(DepgraphServiceError::Cancelled)
+                    } else {
+                        contract_mapping_error(error)
+                    }
+                })?);
+            }
+            let page = pagination
+                .paginate_cancellable(&events, &request, cancellation)
+                .map_err(ToolExecutionFailure::Agent)?;
+            let result = AgentRuntimeValidationResponse::try_new(found.trace(), page)
+                .map_err(contract_mapping_error)?;
+            CanonicalResponseMapper::success(&SuccessEnvelope::new(
+                repository_id.clone(),
+                Some(snapshot_id),
+                result,
+            ))
+            .map_err(Into::into)
+        }
         _ => Err(ToolExecutionFailure::Service(
             DepgraphServiceError::NotFound,
         )),
@@ -1087,7 +1228,8 @@ fn contract_mapping_error(error: ContractBuildError) -> ToolExecutionFailure {
         | ContractBuildError::TooManyCorrelationReasons
         | ContractBuildError::TooManyPhases
         | ContractBuildError::TooManyEvidenceItems
-        | ContractBuildError::TooManyTargetItems => DepgraphServiceError::ResourceExhausted,
+        | ContractBuildError::TooManyTargetItems
+        | ContractBuildError::TooManyQueryValues => DepgraphServiceError::ResourceExhausted,
         _ => DepgraphServiceError::Integrity,
     })
 }

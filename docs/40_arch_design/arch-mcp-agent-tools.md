@@ -7,7 +7,7 @@ status: Active
 upstream: [PROJ-ARC-001]
 downstream: []
 owner: TakehiroT
-updated: 2026-08-05
+updated: 2026-08-07
 open_questions: 0
 ---
 
@@ -31,6 +31,7 @@ additive extensionとして採用するかを決定する。
 | Read-only lifecycle tools | `profile_plan_get`, `daemon_get`, `doctor_get` | Issue #301 implemented through the shared service boundary |
 | Graph dependency tools | `graph_dependencies_list`, `graph_dependents_list`, `graph_path_get` | Issue #302 implemented through one pinned snapshot request |
 | Graph analysis tools | `graph_impact_get`, `graph_cycles_list`, `graph_unresolved_list` | Issue #303 implemented through shared bounded read services |
+| Bounded query/runtime validation | `graph_query`, `runtime_trace_validate` | Issue #304 implemented through prevalidated read-only services |
 | Open questions | `0` | Resolved |
 
 Stage 1ではcontractをfreezeする。operation journal、runner、baseline operation
@@ -57,6 +58,7 @@ schema/Serde差分は回帰testで意図的に固定する。
 | ID | Requirement | Resolution |
 | --- | --- | --- |
 | `FR-003` | outgoing/incoming dependency traversalをAgent hostへ公開する | `DependenciesRequest`を共有service requestとし、direction、one-hop/transitive、`GraphQueryFilter`、traversal limitをCLI/MCPで共有する |
+| `FR-004` | bounded graph queryをAgent hostへ安全に公開する | inline queryまたはconfined query fileのexactly-one requestを共有serviceでparse/type-checkし、output admission後にだけpinned snapshotを読む。MCPはclosed query rowをpaged responseとして返す |
 | `FR-006` | 二selector間のdependency pathを説明する | `ExplainPathRequest`がcanonical BFS shortest pathを返し、未探索edgeを残す上限到達はpathなしではなく`RESOURCE_EXHAUSTED`とする |
 | `FR-008` | repository profile plan previewをread-only lifecycle toolとして公開する | `ProfilePlanRequest`を共有service requestとし、`profile_plan_get`はbounded inline documentまたはconfined repository-relative fileからclosed `AgentProfilePlan`を返す |
 | `FR-009` | last daemon statusをprocess制御なしで取得する | `daemon_get`は共有serviceのstatus-file-only readerを呼び、store、daemon lock、process probeを開かない |
@@ -70,13 +72,16 @@ schema/Serde差分は回帰testで意図的に固定する。
 | `AC-004` | profile planはworkerまたはproject codeを起動せずcanonical planを返す | static repository inventory plannerだけを呼ぶcore/CLI/process testとproject-code markerで固定する |
 | `AC-006` | deps/dependentsのdirection、transitive、filter semanticsがCLIとMCPで一致する | 両frontendを同じ`DepgraphService::dependencies`へroutingし、cross-process edge-ID parity testで固定する |
 | `AC-007` | path traversal exhaustionをunreachableと誤認しない | fully explored graphだけが`path_found: false`を返し、未探索edgeがある場合はpartial resultを捨ててtyped resource errorを返す |
+| `AC-009` | 不正またはcredential-shaped queryはstore access前に拒否する | parser、credential policy、type checker、service output pre-admissionをsnapshot requestより前に実行し、missing-store testでraw query/literal非反射とstore未作成を検証する |
+| `AC-010` | runtime trace validationはgraphを変更せずselected snapshotとのmatchingだけを返す | inline/confined traceをprevalidateしてread-only pinned snapshotへmatchし、store/snapshot/source-tree digest不変をCLI/service/MCP process testで固定する |
 | `AC-011` | daemon statusはpublished status fileだけを読み、store/process stateを変更しない | no-follow bounded reader、missing-store test、status/store digest immutability testで固定する |
 | `AC-014` | Tasks非対応hostを含め、accepted operationのstatus、result、cancelが未定義分岐なく機能する | capability matrix、result union、認可、再接続、互換性test matrixを本書で固定する |
-| `AC-015` | 同じnormalized lifecycle inputに対するCLIとMCP domain responseを一致させる | 三操作を同じservice methodとAgent DTO mapperへroutingし、cross-process parity testでJSON value equalityを検証する |
+| `AC-015` | 同じnormalized inputに対するCLIとMCP domain responseを一致させる | lifecycle三操作に加えquery/runtime validationも同じservice methodへroutingし、cross-process parity testでquery values、runtime summary/event IDの一致を検証する |
 | `#295` | 共通contract、closed DTO、typed error、pagination、operation型、決定的schema生成 | `depgraph-mcp-tools-v1`のRust型、checked-in schema、digestとcontract golden、およびintegration testで固定する |
 | `#301` | profile plan、daemon status、doctorを共有serviceとMCPへ接続する | lifecycle service/DTO/handler、CLI migration、security/redaction/immutability/parity/process test、およびcanonical catalog/schema fixtureで固定する |
 | `#302` | dependencies、dependents、explain pathを共有serviceとMCPへ接続する | pinned `SnapshotReadRequest`、closed dependency/path DTO、exact catalog schema、CLI/MCP parity、cursor/exhaustion/process testで固定する |
 | `#303` | reverse impact、cycles、unresolved sitesを共有serviceとMCPへ接続する | current-only changed set、cache-independent canonical impact、closed cycle/unresolved DTO、全phaseのbounds/cancellation、snapshot/input-bound cursor、CLI/MCP/process/schema parityで固定する |
+| `#304` | bounded queryとruntime validationを共有serviceとMCPへ接続する | pre-store input/output admission、confined file input、pinned read-only snapshot、closed query/runtime DTO、input-bound cursor、CLI/MCP parity、redaction/immutability/process/schema testで固定する |
 
 ## Upstream and API evidence
 
@@ -401,6 +406,37 @@ MCP toolへ公開する。
 | cursorはsnapshotとnormalized inputへbindする | repeated first-page equalityとfilter変更時`CURSOR_MISMATCH` process test |
 | CLI/MCP/domain/schema/catalog parity | shared-service integration、cross-process ID parity、real output advertised/shared validation、canonical catalog/schema/contract golden |
 | repository validation | `cargo fmt`、影響packageのfocused unit/integration/process tests、`git diff --check`。workspace-wide expensive gateはparent validationに委譲する |
+
+## Issue #304 bounded query/runtime validation evidence
+
+Issue [#304](https://github.com/TamaT-LLC/depgraph-cli/issues/304)は既存のbounded queryと
+runtime trace validationをCLI固有のstore orchestrationから共有read-only serviceへ移し、
+同じ境界を二つのMCP toolへ公開する。過去のtask記述にあるFR/AC番号は本書の追加要件で
+再配置されているため、現在の`FR-004`、`NFR-001/003/005`、`AC-009/010/015`へ対応付ける。
+
+| Boundary | Frozen behavior and evidence |
+| --- | --- |
+| Exactly-one input | service requestとpublic tool schemaの双方がinlineまたはfileの一方だけを受理する。CLIのclap制約だけには依存せず、none/bothを`INVALID_ARGUMENT`で拒否する |
+| Query prevalidation | query size、stable confined file read、parse、credential-shape policy、closed type check、およびservice/planner output ceiling admissionをstore/snapshot requestより前に完了する。不正入力とoutput cap超過はmissing storeを作成せず、後者は`QUERY_REJECTED`となる |
+| Confined file input | `RepositoryRelativePath`とhandle-relative/no-follow readerを使い、absolute、`.`/`..` escape、parent/final symlink、non-regular、oversized、read中にidentity/size/mtimeが変化したfileをfail closedに拒否する。errorはraw query/trace/supplied pathを反射しない |
+| Pinned read-only execution | query plan/executeとruntime matchingは一度解決した`SnapshotReadRequest`のimmutable completed snapshotだけを読む。writer store、cache、attempt、snapshot/current pointer、runtime import、source treeを変更しない |
+| Bounded query execution | plannerのsnapshot cardinalityとclosed field byte boundsからworst-case rows/serialized bytes/work/memoryを計算し、execution前に全capを判定する。execute modeの非admit planはpartial rowを返さず`QUERY_REJECTED`、explain modeは同じredacted planを返す |
+| Runtime validation | bounded trace JSONをcredential/shape validationしてからrepository identity/revision、profile、locatorをselected snapshotへmatchする。promotion用deltaやruntime sessionを書かず、closed summaryとpaged event projectionだけを返す |
+| Closed Agent DTO | query scalar/node/pathは`AgentQueryValue`のtagged unionへ縮約し、node/pathのraw properties、site/evidence detailを公開しない。runtime outputはschema/profile status、summary、event ID/kind/count、resolved node IDだけを持ち、raw repository/session/environment/redaction name/pathを除外する。constructor/Deserializerはpath topology、match status、summary/page countを再検証する |
+| Pagination/runtime control | cursorはcontract、tool、repository、resolved snapshot ID、canonical query/trace digest、collection digestへbindする。両handlerは`RuntimeController`のRead admission、deadline、rate/concurrency/queue limit、request cancellation内で同期実行する |
+| Determinism and parity | inline/file、repeated first page、cursor mismatch、CLI/MCP query valuesとruntime summary/event IDをreal process testで比較する。advertised exact schemaとchecked-in shared schema、catalog/schema/contract goldensを同じsuccessへ適用する |
+
+### Issue #304 acceptance mapping
+
+| Acceptance criterion | Evidence |
+| --- | --- |
+| invalid/credential queryはstore前に非反射で拒否 | core missing-store testsとMCP hostile process corpus |
+| worst-case output cap超過はexecution前の`QUERY_REJECTED` | configured service-limit test、hostile planner process test、typed error mapper test |
+| runtime validateは永続状態を変更しない | store digest/row/current pointer、snapshot ID、source-file digestのservice/CLI/MCP tests |
+| inlineまたはroot-confined regular fileだけを受理 | service exactly-one、absolute/traversal/symlink/nonregular/oversize testsとcatalog `oneOf` validation |
+| closed/paged/cancellable Agent response | DTO semantic Deserialize、schema closure、input-bound cursor、Read runtime controller process tests |
+| CLI/MCP/catalog/schema parity | shared-service routing、real stdio parity/security test、canonical schema/catalog/contract fixtures |
+| repository validation | focused core/CLI/MCP tests、`cargo fmt`、Clippy `-D warnings`、`cargo xtask test` |
 
 ## Issue #292 acceptance mapping
 

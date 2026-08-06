@@ -264,8 +264,17 @@ pub fn plan_bounded_query(
     snapshot_id: &str,
     snapshot: &GraphSnapshot,
 ) -> BoundedQueryPlanningResult<BoundedQueryPlan> {
+    plan_bounded_query_with_limits(query, snapshot_id, snapshot, BoundedQueryLimits::default())
+}
+
+pub fn plan_bounded_query_with_limits(
+    query: &TypedQuery,
+    snapshot_id: &str,
+    snapshot: &GraphSnapshot,
+    limits: BoundedQueryLimits,
+) -> BoundedQueryPlanningResult<BoundedQueryPlan> {
     let statistics = collect_bounded_query_statistics(snapshot_id, snapshot);
-    plan_bounded_query_from_verified_statistics(query, statistics)
+    plan_bounded_query_from_verified_statistics(query, statistics, limits)
 }
 
 pub fn plan_bounded_query_with_statistics(
@@ -274,12 +283,13 @@ pub fn plan_bounded_query_with_statistics(
     statistics: SnapshotCardinalityStatistics,
 ) -> BoundedQueryPlanningResult<BoundedQueryPlan> {
     validate_statistics(snapshot, &statistics)?;
-    plan_bounded_query_from_verified_statistics(query, statistics)
+    plan_bounded_query_from_verified_statistics(query, statistics, BoundedQueryLimits::default())
 }
 
 fn plan_bounded_query_from_verified_statistics(
     query: &TypedQuery,
     statistics: SnapshotCardinalityStatistics,
+    limits: BoundedQueryLimits,
 ) -> BoundedQueryPlanningResult<BoundedQueryPlan> {
     if query.digest != crate::typed_query_ast_digest(&query.ast) {
         return Err(planning_error(
@@ -288,7 +298,6 @@ fn plan_bounded_query_from_verified_statistics(
         ));
     }
 
-    let limits = BoundedQueryLimits::default();
     let cardinality = query_cardinality_inputs(&query.ast, &statistics);
     let source_operator = choose_source_operator(&query.ast);
     let relationship = &query.ast.match_clause.relationship;

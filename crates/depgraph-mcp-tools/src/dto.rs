@@ -20,6 +20,8 @@ pub const MAX_AGENT_CYCLE_NODES: usize = depgraph_core::service::MAX_CYCLE_NODE_
 pub const MAX_AGENT_CORRELATION_REASONS: usize =
     depgraph_core::service::MAX_UNRESOLVED_CORRELATION_REASONS;
 pub const MAX_AGENT_PHASES: usize = depgraph_core::service::MAX_UNRESOLVED_PHASES;
+pub const MAX_AGENT_QUERY_TEXT_BYTES: usize = depgraph_core::MAX_QUERY_BYTES;
+pub const MAX_AGENT_QUERY_VALUES: usize = depgraph_core::MAX_QUERY_PROJECTIONS;
 
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
@@ -69,6 +71,364 @@ pub enum AgentCycleLevel {
     Symbol,
     Type,
     Route,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentQueryDirection {
+    Forward,
+    Reverse,
+}
+
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum AgentQueryValue {
+    Text {
+        #[schemars(length(max = 65536))]
+        value: String,
+    },
+    Unsigned {
+        value: u64,
+    },
+    Boolean {
+        value: bool,
+    },
+    Null {},
+    Node {
+        node_id: AgentId,
+    },
+    Path {
+        path_id: AgentId,
+        depth: u8,
+        direction: AgentQueryDirection,
+        #[schemars(length(max = 9))]
+        node_ids: Vec<AgentId>,
+        #[schemars(length(max = 8))]
+        edge_ids: Vec<AgentId>,
+    },
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum AgentQueryValueWire {
+    Text {
+        value: String,
+    },
+    Unsigned {
+        value: u64,
+    },
+    Boolean {
+        value: bool,
+    },
+    Null {},
+    Node {
+        node_id: AgentId,
+    },
+    Path {
+        path_id: AgentId,
+        depth: u8,
+        direction: AgentQueryDirection,
+        node_ids: Vec<AgentId>,
+        edge_ids: Vec<AgentId>,
+    },
+}
+
+impl AgentQueryValue {
+    fn from_wire(wire: AgentQueryValueWire) -> Result<Self, ContractBuildError> {
+        let value = match wire {
+            AgentQueryValueWire::Text { value } => Self::Text { value },
+            AgentQueryValueWire::Unsigned { value } => Self::Unsigned { value },
+            AgentQueryValueWire::Boolean { value } => Self::Boolean { value },
+            AgentQueryValueWire::Null {} => Self::Null {},
+            AgentQueryValueWire::Node { node_id } => Self::Node { node_id },
+            AgentQueryValueWire::Path {
+                path_id,
+                depth,
+                direction,
+                node_ids,
+                edge_ids,
+            } => Self::Path {
+                path_id,
+                depth,
+                direction,
+                node_ids,
+                edge_ids,
+            },
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    fn validate(&self) -> Result<(), ContractBuildError> {
+        match self {
+            Self::Text { value }
+                if value.len() > MAX_AGENT_QUERY_TEXT_BYTES
+                    || value.chars().any(char::is_control) =>
+            {
+                Err(ContractBuildError::QueryValue)
+            }
+            Self::Path {
+                depth,
+                node_ids,
+                edge_ids,
+                ..
+            } if *depth == 0
+                || *depth > depgraph_core::MAX_QUERY_DEPTH
+                || edge_ids.len() != usize::from(*depth)
+                || node_ids.len() != edge_ids.len() + 1 =>
+            {
+                Err(ContractBuildError::QueryValue)
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for AgentQueryValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Self::from_wire(AgentQueryValueWire::deserialize(deserializer)?).map_err(D::Error::custom)
+    }
+}
+
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentQueryRow {
+    #[schemars(length(max = 32))]
+    values: Vec<AgentQueryValue>,
+}
+
+impl AgentQueryRow {
+    pub fn new(values: Vec<AgentQueryValue>) -> Result<Self, ContractBuildError> {
+        if values.is_empty() || values.len() > MAX_AGENT_QUERY_VALUES {
+            return Err(ContractBuildError::TooManyQueryValues);
+        }
+        values.iter().try_for_each(AgentQueryValue::validate)?;
+        Ok(Self { values })
+    }
+
+    #[must_use]
+    pub fn values(&self) -> &[AgentQueryValue] {
+        &self.values
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentQueryRowWire {
+    values: Vec<AgentQueryValue>,
+}
+
+impl<'de> Deserialize<'de> for AgentQueryRow {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = AgentQueryRowWire::deserialize(deserializer)?;
+        Self::new(wire.values).map_err(D::Error::custom)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentRuntimeMatchStatus {
+    Resolved,
+    External,
+    Unresolved,
+}
+
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentRuntimeLocatorMatch {
+    status: AgentRuntimeMatchStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    node_id: Option<AgentId>,
+}
+
+impl AgentRuntimeLocatorMatch {
+    fn new(
+        status: AgentRuntimeMatchStatus,
+        node_id: Option<AgentId>,
+    ) -> Result<Self, ContractBuildError> {
+        if matches!(status, AgentRuntimeMatchStatus::Resolved) != node_id.is_some() {
+            return Err(ContractBuildError::AgentDtoValue);
+        }
+        Ok(Self { status, node_id })
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentRuntimeLocatorMatchWire {
+    status: AgentRuntimeMatchStatus,
+    #[serde(default)]
+    node_id: Option<AgentId>,
+}
+
+impl<'de> Deserialize<'de> for AgentRuntimeLocatorMatch {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = AgentRuntimeLocatorMatchWire::deserialize(deserializer)?;
+        Self::new(wire.status, wire.node_id).map_err(D::Error::custom)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentRuntimeTraceEvent {
+    id: AgentId,
+    sequence: u64,
+    dependency_kind: AgentToken,
+    source: AgentRuntimeLocatorMatch,
+    target: AgentRuntimeLocatorMatch,
+    count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    duration_ns: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentRuntimeProfileMatch {
+    status: AgentRuntimeMatchStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    parent_profile_id: Option<AgentId>,
+}
+
+impl AgentRuntimeProfileMatch {
+    fn new(
+        status: AgentRuntimeMatchStatus,
+        parent_profile_id: Option<AgentId>,
+    ) -> Result<Self, ContractBuildError> {
+        if matches!(status, AgentRuntimeMatchStatus::Resolved) != parent_profile_id.is_some()
+            || matches!(status, AgentRuntimeMatchStatus::External)
+        {
+            return Err(ContractBuildError::AgentDtoValue);
+        }
+        Ok(Self {
+            status,
+            parent_profile_id,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentRuntimeProfileMatchWire {
+    status: AgentRuntimeMatchStatus,
+    #[serde(default)]
+    parent_profile_id: Option<AgentId>,
+}
+
+impl<'de> Deserialize<'de> for AgentRuntimeProfileMatch {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = AgentRuntimeProfileMatchWire::deserialize(deserializer)?;
+        Self::new(wire.status, wire.parent_profile_id).map_err(D::Error::custom)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentRuntimeTraceSummary {
+    events: u64,
+    resolved_targets: u64,
+    external_targets: u64,
+    unresolved_targets: u64,
+    redacted_values: u64,
+}
+
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentRuntimeValidationResponse {
+    schema_version: AgentLabel,
+    profile_match: AgentRuntimeProfileMatch,
+    summary: AgentRuntimeTraceSummary,
+    events: Page<AgentRuntimeTraceEvent>,
+}
+
+impl AgentRuntimeValidationResponse {
+    pub fn try_new(
+        trace: &depgraph_core::ValidatedRuntimeTrace,
+        events: Page<AgentRuntimeTraceEvent>,
+    ) -> Result<Self, ContractBuildError> {
+        if events.total_items() != trace.summary.events {
+            return Err(ContractBuildError::TraversalCount);
+        }
+        let response = Self {
+            schema_version: parse_agent_value(&trace.schema_version)?,
+            profile_match: AgentRuntimeProfileMatch::new(
+                agent_runtime_status(trace.profile_match.status),
+                trace
+                    .profile_match
+                    .parent_profile_id
+                    .as_deref()
+                    .map(AgentId::parse)
+                    .transpose()
+                    .map_err(|_| ContractBuildError::AgentDtoValue)?,
+            )?,
+            summary: AgentRuntimeTraceSummary {
+                events: trace.summary.events,
+                resolved_targets: trace.summary.resolved_targets,
+                external_targets: trace.summary.external_targets,
+                unresolved_targets: trace.summary.unresolved_targets,
+                redacted_values: trace.summary.redacted_values,
+            },
+            events,
+        };
+        response.validate()?;
+        Ok(response)
+    }
+
+    #[must_use]
+    pub const fn events(&self) -> &Page<AgentRuntimeTraceEvent> {
+        &self.events
+    }
+
+    fn validate(&self) -> Result<(), ContractBuildError> {
+        if self.events.total_items() != self.summary.events
+            || self
+                .summary
+                .resolved_targets
+                .checked_add(self.summary.external_targets)
+                .and_then(|value| value.checked_add(self.summary.unresolved_targets))
+                != Some(self.summary.events)
+        {
+            return Err(ContractBuildError::TraversalCount);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentRuntimeValidationResponseWire {
+    schema_version: AgentLabel,
+    profile_match: AgentRuntimeProfileMatch,
+    summary: AgentRuntimeTraceSummary,
+    events: Page<AgentRuntimeTraceEvent>,
+}
+
+impl<'de> Deserialize<'de> for AgentRuntimeValidationResponse {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = AgentRuntimeValidationResponseWire::deserialize(deserializer)?;
+        let response = Self {
+            schema_version: wire.schema_version,
+            profile_match: wire.profile_match,
+            summary: wire.summary,
+            events: wire.events,
+        };
+        response.validate().map_err(D::Error::custom)?;
+        Ok(response)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
@@ -2061,6 +2421,183 @@ where
         ));
     }
     Ok(values)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BoundedQueryProjectionFailure {
+    Cancelled,
+    Contract(ContractBuildError),
+}
+
+impl From<ContractBuildError> for BoundedQueryProjectionFailure {
+    fn from(error: ContractBuildError) -> Self {
+        Self::Contract(error)
+    }
+}
+
+pub fn project_bounded_query_rows(
+    result: &depgraph_core::service::BoundedQueryServiceResult,
+) -> Result<Vec<AgentQueryRow>, ContractBuildError> {
+    project_bounded_query_rows_cancellable(result, &mut || false).map_err(|error| match error {
+        BoundedQueryProjectionFailure::Contract(error) => error,
+        BoundedQueryProjectionFailure::Cancelled => ContractBuildError::AgentDtoValue,
+    })
+}
+
+pub fn project_bounded_query_rows_cancellable(
+    result: &depgraph_core::service::BoundedQueryServiceResult,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<Vec<AgentQueryRow>, BoundedQueryProjectionFailure> {
+    if is_cancelled() {
+        return Err(BoundedQueryProjectionFailure::Cancelled);
+    }
+    let executed = result.result().ok_or(ContractBuildError::QueryValue)?;
+    let mut rows = Vec::with_capacity(executed.rows.len());
+    for row in &executed.rows {
+        if is_cancelled() {
+            return Err(BoundedQueryProjectionFailure::Cancelled);
+        }
+        let mut values = Vec::with_capacity(row.len());
+        for value in row {
+            if is_cancelled() {
+                return Err(BoundedQueryProjectionFailure::Cancelled);
+            }
+            values.push(agent_query_value(value)?);
+        }
+        rows.push(AgentQueryRow::new(values)?);
+    }
+    if is_cancelled() {
+        return Err(BoundedQueryProjectionFailure::Cancelled);
+    }
+    Ok(rows)
+}
+
+fn agent_query_value(value: &serde_json::Value) -> Result<AgentQueryValue, ContractBuildError> {
+    let projected = match value {
+        serde_json::Value::Null => AgentQueryValue::Null {},
+        serde_json::Value::Bool(value) => AgentQueryValue::Boolean { value: *value },
+        serde_json::Value::Number(value) => AgentQueryValue::Unsigned {
+            value: value.as_u64().ok_or(ContractBuildError::QueryValue)?,
+        },
+        serde_json::Value::String(value) => AgentQueryValue::Text {
+            value: value.clone(),
+        },
+        serde_json::Value::Object(object)
+            if object.len() == 4 && object.contains_key("locator") =>
+        {
+            AgentQueryValue::Node {
+                node_id: AgentId::parse(
+                    object
+                        .get("id")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or(ContractBuildError::QueryValue)?,
+                )
+                .map_err(|_| ContractBuildError::AgentDtoValue)?,
+            }
+        }
+        serde_json::Value::Object(object)
+            if object.len() == 7
+                && object.contains_key("nodes")
+                && object.contains_key("edges") =>
+        {
+            let edge_ids = query_entity_ids(
+                object
+                    .get("edges")
+                    .and_then(serde_json::Value::as_array)
+                    .ok_or(ContractBuildError::QueryValue)?,
+            )?;
+            let node_ids = query_entity_ids(
+                object
+                    .get("nodes")
+                    .and_then(serde_json::Value::as_array)
+                    .ok_or(ContractBuildError::QueryValue)?,
+            )?;
+            let depth = u8::try_from(
+                object
+                    .get("depth")
+                    .and_then(serde_json::Value::as_u64)
+                    .ok_or(ContractBuildError::QueryValue)?,
+            )
+            .map_err(|_| ContractBuildError::QueryValue)?;
+            let direction = match object.get("direction").and_then(serde_json::Value::as_str) {
+                Some("forward") => AgentQueryDirection::Forward,
+                Some("reverse") => AgentQueryDirection::Reverse,
+                _ => return Err(ContractBuildError::QueryValue),
+            };
+            AgentQueryValue::Path {
+                path_id: AgentId::parse(
+                    object
+                        .get("id")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or(ContractBuildError::QueryValue)?,
+                )
+                .map_err(|_| ContractBuildError::AgentDtoValue)?,
+                depth,
+                direction,
+                node_ids,
+                edge_ids,
+            }
+        }
+        _ => return Err(ContractBuildError::QueryValue),
+    };
+    projected.validate()?;
+    Ok(projected)
+}
+
+fn query_entity_ids(entities: &[serde_json::Value]) -> Result<Vec<AgentId>, ContractBuildError> {
+    entities
+        .iter()
+        .map(|entity| {
+            AgentId::parse(
+                entity
+                    .as_object()
+                    .and_then(|object| object.get("id"))
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or(ContractBuildError::QueryValue)?,
+            )
+            .map_err(|_| ContractBuildError::AgentDtoValue)
+        })
+        .collect()
+}
+
+impl TryFrom<&depgraph_core::ValidatedRuntimeTraceEvent> for AgentRuntimeTraceEvent {
+    type Error = ContractBuildError;
+
+    fn try_from(source: &depgraph_core::ValidatedRuntimeTraceEvent) -> Result<Self, Self::Error> {
+        Ok(Self {
+            id: AgentId::parse(&source.id).map_err(|_| ContractBuildError::AgentDtoValue)?,
+            sequence: source.sequence,
+            dependency_kind: parse_agent_value(&source.dependency_kind)?,
+            source: agent_runtime_locator(&source.source)?,
+            target: agent_runtime_locator(&source.target)?,
+            count: source.count,
+            duration_ns: source.duration_ns,
+        })
+    }
+}
+
+fn agent_runtime_locator(
+    source: &depgraph_core::MatchedRuntimeTraceLocator,
+) -> Result<AgentRuntimeLocatorMatch, ContractBuildError> {
+    AgentRuntimeLocatorMatch::new(
+        agent_runtime_status(source.status),
+        source
+            .node_id
+            .as_deref()
+            .map(AgentId::parse)
+            .transpose()
+            .map_err(|_| ContractBuildError::AgentDtoValue)?,
+    )
+}
+
+const fn agent_runtime_status(
+    status: depgraph_core::RuntimeTraceMatchStatus,
+) -> AgentRuntimeMatchStatus {
+    match status {
+        depgraph_core::RuntimeTraceMatchStatus::Resolved => AgentRuntimeMatchStatus::Resolved,
+        depgraph_core::RuntimeTraceMatchStatus::External => AgentRuntimeMatchStatus::External,
+        depgraph_core::RuntimeTraceMatchStatus::Unresolved => AgentRuntimeMatchStatus::Unresolved,
+    }
 }
 
 #[cfg(test)]

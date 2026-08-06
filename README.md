@@ -168,8 +168,8 @@ depgraph unresolved --max-items 100 --json
 depgraph unresolved --all --json
 
 # Validate and match an external runtime trace without changing the store.
-depgraph runtime validate runtime-trace.json
-depgraph runtime validate runtime-trace.json --json
+depgraph runtime validate --file runtime-trace.json
+depgraph runtime validate --file runtime-trace.json --json
 
 # Name and inspect immutable completed snapshots.
 depgraph snapshot create baseline
@@ -378,7 +378,8 @@ The matching JSON Schema is
 
 ## Runtime trace import contract
 
-`depgraph runtime validate TRACE` reads the versioned `1.0` JSON contract,
+`depgraph runtime validate (--trace TRACE|--file REPOSITORY_RELATIVE_FILE)` reads
+the versioned `1.0` JSON contract,
 matches it against the selected completed snapshot, and produces deterministic
 `runtime-event:sha256:...` identities without changing the store.
 `depgraph runtime import TRACE` performs the same validation and atomically

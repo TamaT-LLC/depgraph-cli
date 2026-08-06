@@ -1305,7 +1305,7 @@ fn validate_filter(filter: &GraphQueryFilter) -> DepgraphServiceResult<()> {
     Ok(())
 }
 
-fn load_pinned_snapshot(
+pub(crate) fn load_pinned_snapshot(
     request: &mut SnapshotReadRequest,
     cancellation: &CancellationToken,
 ) -> DepgraphServiceResult<GraphSnapshot> {

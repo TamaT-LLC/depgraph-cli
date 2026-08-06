@@ -27,10 +27,14 @@ pub use dto::{
     AgentDependenciesResponse, AgentDependencyDirection, AgentEdge, AgentEvidence,
     AgentEvidenceKind, AgentImpact, AgentImpactResponse, AgentNamedSnapshot, AgentNode,
     AgentNodeSummary, AgentPathResponse, AgentPathStep, AgentPhase, AgentPrecision,
-    AgentResolutionStatus, AgentSite, AgentSnapshot, AgentSnapshotAvailability,
-    AgentSourcePosition, AgentSourceSpan, AgentUnresolved, MAX_AGENT_CORRELATION_REASONS,
+    AgentQueryDirection, AgentQueryRow, AgentQueryValue, AgentResolutionStatus,
+    AgentRuntimeLocatorMatch, AgentRuntimeMatchStatus, AgentRuntimeProfileMatch,
+    AgentRuntimeTraceEvent, AgentRuntimeTraceSummary, AgentRuntimeValidationResponse, AgentSite,
+    AgentSnapshot, AgentSnapshotAvailability, AgentSourcePosition, AgentSourceSpan,
+    AgentUnresolved, BoundedQueryProjectionFailure, MAX_AGENT_CORRELATION_REASONS,
     MAX_AGENT_CYCLE_NODES, MAX_AGENT_EVIDENCE_ITEMS, MAX_AGENT_PATH_STEPS, MAX_AGENT_PHASES,
-    MAX_AGENT_SNAPSHOT_METADATA_ITEMS, MAX_AGENT_TARGET_ITEMS,
+    MAX_AGENT_QUERY_TEXT_BYTES, MAX_AGENT_QUERY_VALUES, MAX_AGENT_SNAPSHOT_METADATA_ITEMS,
+    MAX_AGENT_TARGET_ITEMS, project_bounded_query_rows, project_bounded_query_rows_cancellable,
 };
 pub use lifecycle::{
     AgentDaemonAttempt, AgentDaemonChange, AgentDaemonChangeKind, AgentDaemonPhase,

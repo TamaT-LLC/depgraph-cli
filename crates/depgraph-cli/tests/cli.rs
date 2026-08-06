@@ -1176,16 +1176,19 @@ fn runtime_validate_matches_golden_trace_without_mutating_the_store() {
     seed_runtime_trace_snapshot(&store_path, root.path());
     let trace = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../depgraph-core/tests/fixtures/runtime-trace-v1.golden.json");
+    fs::copy(&trace, root.path().join("runtime-trace.json")).unwrap();
 
     let run = || {
         Command::cargo_bin("depgraph")
             .unwrap()
+            .current_dir(root.path())
             .args([
                 "--store",
                 store_path.to_str().unwrap(),
                 "runtime",
                 "validate",
-                trace.to_str().unwrap(),
+                "--file",
+                "runtime-trace.json",
                 "--json",
             ])
             .output()
@@ -1243,15 +1246,18 @@ fn node_reference_collector_trace_passes_runtime_validate_and_import() {
     seed_runtime_trace_snapshot(&store_path, root.path());
     let trace = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../workers/web/test/fixtures/runtime-collector/next.expected.json");
+    fs::copy(&trace, root.path().join("runtime-collector.json")).unwrap();
 
     let validate = Command::cargo_bin("depgraph")
         .unwrap()
+        .current_dir(root.path())
         .args([
             "--store",
             store_path.to_str().unwrap(),
             "runtime",
             "validate",
-            trace.to_str().unwrap(),
+            "--file",
+            "runtime-collector.json",
             "--json",
         ])
         .output()
@@ -1777,15 +1783,24 @@ fn runtime_validate_rejects_malformed_and_secret_input_with_bounded_errors() {
             .join("../depgraph-core/tests/fixtures")
             .join(name)
     };
+    for name in [
+        "runtime-trace-v1.malformed.json",
+        "runtime-trace-v1.secret.json",
+        "runtime-trace-v1.golden.json",
+    ] {
+        fs::copy(fixture(name), root.path().join(name)).unwrap();
+    }
 
     Command::cargo_bin("depgraph")
         .unwrap()
+        .current_dir(root.path())
         .args([
             "--store",
             unopened_store_path.to_str().unwrap(),
             "runtime",
             "validate",
-            fixture("runtime-trace-v1.malformed.json").to_str().unwrap(),
+            "--file",
+            "runtime-trace-v1.malformed.json",
         ])
         .assert()
         .code(2)
@@ -1795,12 +1810,14 @@ fn runtime_validate_rejects_malformed_and_secret_input_with_bounded_errors() {
 
     Command::cargo_bin("depgraph")
         .unwrap()
+        .current_dir(root.path())
         .args([
             "--store",
             unopened_store_path.to_str().unwrap(),
             "runtime",
             "validate",
-            fixture("runtime-trace-v1.secret.json").to_str().unwrap(),
+            "--file",
+            "runtime-trace-v1.secret.json",
         ])
         .assert()
         .code(2)
@@ -1810,12 +1827,14 @@ fn runtime_validate_rejects_malformed_and_secret_input_with_bounded_errors() {
 
     Command::cargo_bin("depgraph")
         .unwrap()
+        .current_dir(root.path())
         .args([
             "--store",
             unopened_store_path.to_str().unwrap(),
             "runtime",
             "validate",
-            fixture("runtime-trace-v1.golden.json").to_str().unwrap(),
+            "--file",
+            "runtime-trace-v1.golden.json",
         ])
         .assert()
         .failure()

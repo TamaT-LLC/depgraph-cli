@@ -1272,6 +1272,7 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
     }
 
     let readme = fs::read_to_string(root.join("README.md"))?;
+    let rc1_release = fs::read_to_string(root.join("docs/releases/v0.4.0-rc.1.md"))?;
     let design = fs::read_to_string(
         root.join("docs/40_arch_design/arch-dependency-graph-cli-system-design.md"),
     )?;
@@ -1308,10 +1309,14 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "dynamic-framework-evidence-release-gate-v1",
         "rust-stdlib-source@1.93.1+rustc.01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf",
         "[MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE)",
+        "depgraph runtime validate --file runtime-trace.json --json",
     ] {
         if !readme.contains(required) {
             bail!("README release metadata is missing {required:?}");
         }
+    }
+    if !rc1_release.contains("depgraph runtime validate --file runtime-trace.json --json") {
+        bail!("v0.4.0-rc.1 runtime validate example is not synchronized with the CLI");
     }
     let release_note = format!("docs/releases/v{VERSION}.md");
     let release_link = format!("[`v{VERSION}` release notes]({release_note})");
@@ -1319,7 +1324,7 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         bail!("README release note link is not synchronized with {VERSION}");
     }
     for required in [
-        "updated: 2026-08-01",
+        "updated: 2026-08-07",
         "| Product / Rust / Go / Web adapter | `0.4.0` |",
         "Milestone 4のrelease candidateは`v0.4.0-rc.1`",
         "Milestone 4のstable releaseは`v0.4.0`",
@@ -1839,7 +1844,7 @@ status: Active\n\
 upstream: [PROJ-ARC-001]\n\
 downstream: []\n\
 owner: TakehiroT\n\
-updated: 2026-08-05\n\
+updated: 2026-08-07\n\
 open_questions: 0\n\
 ---\n";
 

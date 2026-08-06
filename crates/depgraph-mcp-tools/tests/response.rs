@@ -148,6 +148,10 @@ fn service_errors_map_to_closed_redacted_tool_errors() {
             AgentErrorCode::ResourceExhausted,
         ),
         (
+            DepgraphServiceError::QueryRejected,
+            AgentErrorCode::QueryRejected,
+        ),
+        (
             DepgraphServiceError::Integrity,
             AgentErrorCode::IntegrityFailure,
         ),

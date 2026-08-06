@@ -46,6 +46,7 @@ pub mod rust_build_observer;
 pub mod scan;
 pub mod service;
 mod service_agent;
+mod service_bounded;
 mod service_graph;
 mod service_lifecycle;
 mod service_limits;
@@ -90,8 +91,8 @@ pub use bounded_query_plan::{
     BoundedQueryPlanningResult, BoundedQueryResourceBounds, ClosedFieldByteBounds,
     QueryAdmissionReason, QueryCardinalityInputs, SnapshotCardinalityStatistics,
     bounded_query_graph_digest, bounded_query_plan_digest, canonical_bounded_query_plan_json,
-    collect_bounded_query_statistics, plan_bounded_query, plan_bounded_query_with_statistics,
-    redacted_typed_query_shape,
+    collect_bounded_query_statistics, plan_bounded_query, plan_bounded_query_with_limits,
+    plan_bounded_query_with_statistics, redacted_typed_query_shape,
 };
 pub use bounded_query_type::{
     BOUNDED_QUERY_TYPE_CONTRACT_VERSION, BindingDefinition, EntityType, FIELD_REGISTRY,
