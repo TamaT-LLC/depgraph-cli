@@ -8,19 +8,24 @@ use std::{
 
 use anyhow::{Context as _, Result, bail};
 use clap::{Parser, ValueEnum};
-use depgraph_core::service::{DoctorRequest, NodeMatchMode, ProfilePlanRequest};
+use depgraph_core::service::{
+    DependenciesRequest, DependencyDirection, DoctorRequest, ExplainPathRequest, NodeMatchMode,
+    ProfilePlanRequest,
+};
 use depgraph_core::{
     CancellationToken, DepgraphCapability, DepgraphCapabilitySet, DepgraphService,
-    DepgraphServiceConfig, DepgraphServiceError, DepgraphServiceLimits, SnapshotLocator,
-    VerifiedCompilerPack, read_compiler_pack_requirement, verify_compiler_pack,
+    DepgraphServiceConfig, DepgraphServiceError, DepgraphServiceLimits, GraphQueryFilter,
+    MAX_INTERACTIVE_QUERY_TRAVERSAL, SnapshotLocator, VerifiedCompilerPack,
+    read_compiler_pack_requirement, verify_compiler_pack,
 };
 use depgraph_mcp::runtime::{AuditLogger, RuntimeClass, RuntimeConfig, RuntimeController};
 use depgraph_mcp_tools::{
-    AgentCompletedSnapshot, AgentContext, AgentDaemonStatus, AgentDoctor, AgentError,
-    AgentNamedSnapshot, AgentNodeSummary, AgentProfilePlan, AgentToken, CanonicalResponseMapper,
-    ContractVersion, Cursor, CursorKey, ErrorEnvelope, LogicalRepositoryId, MappedToolResult,
-    PageByteLimit, PageRequest, PageSize, PaginationContext, RepositoryRelativePath,
-    ResponseMappingError, SnapshotId, SuccessEnvelope, ToolCatalog,
+    AgentCompletedSnapshot, AgentContext, AgentDaemonStatus, AgentDependenciesResponse,
+    AgentDependencyDirection, AgentDoctor, AgentEdge, AgentError, AgentLocator, AgentNamedSnapshot,
+    AgentNode, AgentNodeSummary, AgentPathResponse, AgentProfilePlan, AgentToken,
+    CanonicalResponseMapper, ContractBuildError, ContractVersion, Cursor, CursorKey, ErrorEnvelope,
+    LogicalRepositoryId, MappedToolResult, PageByteLimit, PageRequest, PageSize, PaginationContext,
+    RepositoryRelativePath, ResponseMappingError, SnapshotId, SuccessEnvelope, ToolCatalog,
 };
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler, ServiceExt,
@@ -217,6 +222,53 @@ struct DaemonStatusArguments {
     repository_id: LogicalRepositoryId,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GraphDependenciesArguments {
+    contract_version: ContractVersion,
+    repository_id: LogicalRepositoryId,
+    selector: AgentLocator,
+    #[serde(default)]
+    snapshot: Option<String>,
+    #[serde(default)]
+    transitive: bool,
+    #[serde(default)]
+    phases: Vec<String>,
+    #[serde(default)]
+    profiles: Vec<String>,
+    #[serde(default)]
+    sessions: Vec<String>,
+    #[serde(default)]
+    environments: Vec<String>,
+    #[serde(default)]
+    max_traversal: Option<usize>,
+    #[serde(default)]
+    cursor: Option<Cursor>,
+    #[serde(default)]
+    limit: Option<u16>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GraphPathArguments {
+    contract_version: ContractVersion,
+    repository_id: LogicalRepositoryId,
+    from: AgentLocator,
+    to: AgentLocator,
+    #[serde(default)]
+    snapshot: Option<String>,
+    #[serde(default)]
+    phases: Vec<String>,
+    #[serde(default)]
+    profiles: Vec<String>,
+    #[serde(default)]
+    sessions: Vec<String>,
+    #[serde(default)]
+    environments: Vec<String>,
+    #[serde(default)]
+    max_traversal: Option<usize>,
+}
+
 enum ToolExecutionFailure {
     Service(DepgraphServiceError),
     Agent(AgentError),
@@ -283,6 +335,9 @@ impl ServerHandler for DepgraphMcpServer {
                 | "profile_plan_get"
                 | "daemon_get"
                 | "doctor_get"
+                | "graph_dependencies_list"
+                | "graph_dependents_list"
+                | "graph_path_get"
         ) {
             return Err(McpError::invalid_params(
                 "tool handler is unavailable",
@@ -627,10 +682,173 @@ fn execute_catalog_read_tool(
             ))
             .map_err(Into::into)
         }
+        "graph_dependencies_list" | "graph_dependents_list" => {
+            let arguments = decode_arguments::<GraphDependenciesArguments>(arguments)?;
+            authorize_repository(
+                arguments.contract_version,
+                &arguments.repository_id,
+                repository_id,
+            )?;
+            validate_graph_filter_lengths(
+                &arguments.phases,
+                &arguments.profiles,
+                &arguments.sessions,
+                &arguments.environments,
+            )?;
+            let filter = GraphQueryFilter::new(
+                arguments.phases,
+                arguments.profiles,
+                arguments.sessions,
+                arguments.environments,
+            )
+            .map_err(|source| {
+                ToolExecutionFailure::Service(DepgraphServiceError::graph_query(source))
+            })?;
+            let max_traversal = graph_max_traversal(arguments.max_traversal)?;
+            let locator =
+                SnapshotLocator::parse(arguments.snapshot.as_deref().unwrap_or("current"))?;
+            let mut snapshot_request =
+                service.start_snapshot_request_at_cancellable(&locator, cancellation)?;
+            let snapshot_id = parse_snapshot_id(snapshot_request.snapshot_id().as_str())?;
+            let direction = if tool == "graph_dependents_list" {
+                DependencyDirection::Incoming
+            } else {
+                DependencyDirection::Outgoing
+            };
+            let request = DependenciesRequest::try_new(
+                arguments.selector.as_str(),
+                direction,
+                arguments.transitive,
+                filter,
+                max_traversal,
+            )?;
+            let normalized = serde_json::json!({
+                "direction": match direction {
+                    DependencyDirection::Outgoing => "outgoing",
+                    DependencyDirection::Incoming => "incoming",
+                },
+                "filter": request.filter(),
+                "max_traversal": request.max_traversal(),
+                "selector": request.selector(),
+                "transitive": request.transitive(),
+            });
+            let pagination = PaginationContext::new(
+                cursor_key,
+                tool,
+                repository_id.clone(),
+                snapshot_id.clone(),
+                &normalized,
+            )?;
+            let page_request = page_request(arguments.limit, arguments.cursor)?;
+            let found = service.dependencies(&mut snapshot_request, &request, cancellation)?;
+            let items = found
+                .items()
+                .iter()
+                .map(|item| AgentEdge::try_from(&item.step))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(contract_mapping_error)?;
+            let page = pagination
+                .paginate(&items, &page_request)
+                .map_err(ToolExecutionFailure::Agent)?;
+            let result = AgentDependenciesResponse::new(
+                AgentNode::try_from(&found).map_err(contract_mapping_error)?,
+                match direction {
+                    DependencyDirection::Outgoing => AgentDependencyDirection::Outgoing,
+                    DependencyDirection::Incoming => AgentDependencyDirection::Incoming,
+                },
+                request.transitive(),
+                found.complete(),
+                found.traversed_edges(),
+                page,
+            )
+            .map_err(contract_mapping_error)?;
+            CanonicalResponseMapper::success(&SuccessEnvelope::new(
+                repository_id.clone(),
+                Some(snapshot_id),
+                result,
+            ))
+            .map_err(Into::into)
+        }
+        "graph_path_get" => {
+            let arguments = decode_arguments::<GraphPathArguments>(arguments)?;
+            authorize_repository(
+                arguments.contract_version,
+                &arguments.repository_id,
+                repository_id,
+            )?;
+            validate_graph_filter_lengths(
+                &arguments.phases,
+                &arguments.profiles,
+                &arguments.sessions,
+                &arguments.environments,
+            )?;
+            let filter = GraphQueryFilter::new(
+                arguments.phases,
+                arguments.profiles,
+                arguments.sessions,
+                arguments.environments,
+            )
+            .map_err(|source| {
+                ToolExecutionFailure::Service(DepgraphServiceError::graph_query(source))
+            })?;
+            let request = ExplainPathRequest::try_new(
+                arguments.from.as_str(),
+                arguments.to.as_str(),
+                filter,
+                graph_max_traversal(arguments.max_traversal)?,
+            )?;
+            let locator =
+                SnapshotLocator::parse(arguments.snapshot.as_deref().unwrap_or("current"))?;
+            let mut snapshot_request =
+                service.start_snapshot_request_at_cancellable(&locator, cancellation)?;
+            let snapshot_id = parse_snapshot_id(snapshot_request.snapshot_id().as_str())?;
+            let found = service.explain_path(&mut snapshot_request, &request, cancellation)?;
+            let result = AgentPathResponse::try_from(&found).map_err(contract_mapping_error)?;
+            CanonicalResponseMapper::success(&SuccessEnvelope::new(
+                repository_id.clone(),
+                Some(snapshot_id),
+                result,
+            ))
+            .map_err(Into::into)
+        }
         _ => Err(ToolExecutionFailure::Service(
             DepgraphServiceError::NotFound,
         )),
     }
+}
+
+fn validate_graph_filter_lengths(
+    phases: &[String],
+    profiles: &[String],
+    sessions: &[String],
+    environments: &[String],
+) -> Result<(), ToolExecutionFailure> {
+    if [phases, profiles, sessions, environments]
+        .into_iter()
+        .any(|values| values.len() > 1_024)
+    {
+        return Err(ToolExecutionFailure::Service(
+            DepgraphServiceError::InvalidInput,
+        ));
+    }
+    Ok(())
+}
+
+fn graph_max_traversal(value: Option<usize>) -> Result<usize, ToolExecutionFailure> {
+    let value = value.unwrap_or(depgraph_core::DEFAULT_INTERACTIVE_QUERY_MAX_TRAVERSAL);
+    if !(1..=MAX_INTERACTIVE_QUERY_TRAVERSAL).contains(&value) {
+        return Err(ToolExecutionFailure::Service(
+            DepgraphServiceError::InvalidInput,
+        ));
+    }
+    Ok(value)
+}
+
+fn contract_mapping_error(error: ContractBuildError) -> ToolExecutionFailure {
+    ToolExecutionFailure::Service(match error {
+        ContractBuildError::TooManyPathSteps => DepgraphServiceError::ResourceExhausted,
+        _ => DepgraphServiceError::Integrity,
+    })
 }
 
 fn parse_snapshot_id(value: &str) -> Result<SnapshotId, ToolExecutionFailure> {

@@ -98,7 +98,50 @@ impl DepgraphService {
             .map(|request| request.snapshot_id)
     }
 
-    pub(crate) fn start_snapshot_request_at_cancellable(
+    pub fn start_snapshot_request_for_scan(
+        &self,
+        scan_id: &str,
+        cancellation: &CancellationToken,
+    ) -> DepgraphServiceResult<SnapshotReadRequest> {
+        if scan_id.is_empty() || scan_id.len() > 256 || scan_id.chars().any(char::is_control) {
+            return Err(DepgraphServiceError::InvalidInput);
+        }
+        if cancellation.is_cancelled() {
+            return Err(DepgraphServiceError::Cancelled);
+        }
+        let mut read_store = self.read_store_factory().open()?;
+        let cancellation_check = cancellation.clone();
+        let resolved = read_store.store().interruptible_read(
+            move || cancellation_check.is_cancelled(),
+            |store| {
+                let snapshot_id = store.snapshot_id_for_scan_selection(scan_id)?;
+                let snapshot = snapshot_id
+                    .as_deref()
+                    .map(|snapshot_id| store.completed_snapshot(snapshot_id))
+                    .transpose()?
+                    .flatten();
+                Ok((snapshot_id, snapshot))
+            },
+        );
+        if cancellation.is_cancelled() {
+            return Err(DepgraphServiceError::Cancelled);
+        }
+        let (snapshot_id, snapshot) = resolved.map_err(DepgraphServiceError::store_operation)?;
+        let snapshot_id = snapshot_id.ok_or(DepgraphServiceError::NotFound)?;
+        if !is_stable_snapshot_id(&snapshot_id) {
+            return Err(DepgraphServiceError::Integrity);
+        }
+        let snapshot = snapshot.ok_or(DepgraphServiceError::Integrity)?;
+        if snapshot.status != "completed" || snapshot.id != snapshot_id {
+            return Err(DepgraphServiceError::Integrity);
+        }
+        Ok(SnapshotReadRequest {
+            snapshot_id: ResolvedSnapshotId(snapshot_id),
+            read_store,
+        })
+    }
+
+    pub fn start_snapshot_request_at_cancellable(
         &self,
         locator: &SnapshotLocator,
         cancellation: &CancellationToken,

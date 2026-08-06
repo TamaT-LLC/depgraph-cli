@@ -29,6 +29,7 @@ additive extensionとして採用するかを決定する。
 | MCP Tasks extension | `io.modelcontextprotocol/tasks` | Option A accepted |
 | Agent DTO/schema catalog | `depgraph-mcp-tools-v1` | Issue #295 contract implemented |
 | Read-only lifecycle tools | `profile_plan_get`, `daemon_get`, `doctor_get` | Issue #301 implemented through the shared service boundary |
+| Graph dependency tools | `graph_dependencies_list`, `graph_dependents_list`, `graph_path_get` | Issue #302 implemented through one pinned snapshot request |
 | Open questions | `0` | Resolved |
 
 Stage 1ではcontractをfreezeする。operation journal、runner、baseline operation
@@ -54,20 +55,26 @@ schema/Serde差分は回帰testで意図的に固定する。
 
 | ID | Requirement | Resolution |
 | --- | --- | --- |
+| `FR-003` | outgoing/incoming dependency traversalをAgent hostへ公開する | `DependenciesRequest`を共有service requestとし、direction、one-hop/transitive、`GraphQueryFilter`、traversal limitをCLI/MCPで共有する |
+| `FR-006` | 二selector間のdependency pathを説明する | `ExplainPathRequest`がcanonical BFS shortest pathを返し、未探索edgeを残す上限到達はpathなしではなく`RESOURCE_EXHAUSTED`とする |
 | `FR-008` | repository profile plan previewをread-only lifecycle toolとして公開する | `ProfilePlanRequest`を共有service requestとし、`profile_plan_get`はbounded inline documentまたはconfined repository-relative fileからclosed `AgentProfilePlan`を返す |
 | `FR-009` | last daemon statusをprocess制御なしで取得する | `daemon_get`は共有serviceのstatus-file-only readerを呼び、store、daemon lock、process probeを開かない |
 | `FR-010` | 長時間処理は切断後もstatus、terminal result、cancelを回収できるdurable handleを返す | baseline operation toolsを全hostに必須とし、Tasksは同じrecordへの追加mappingとする |
 | `FR-011` | bounded doctor summary/detailsをAgent hostへ公開する | `DoctorRequest`とclosed `DoctorResponse`を共有し、`doctor_get`はAgent allowlist projectionだけを返す |
 | `NFR-001` | Agent-facing executionのinput、output、時間、cancel、concurrencyをboundedにする | service byte/item boundsとcancellation checkを適用し、MCP handlerは既存`RuntimeController`のread deadline、queue/concurrency/rate limit、request cancellation内で実行する |
 | `NFR-003` | host差、切断、server restartをfailureとして回収できる | journalをstdio processとrmcp runtimeから独立させ、再接続時に同じIDを解決する |
+| `NFR-004` | 同じsnapshot/filterに対するgraph resultを決定的にする | node endpointとedge IDによるcanonical traversal、canonical shortest-path predecessor、snapshot/query-bound cursorで固定する |
 | `NFR-005` | public Agent responseからhost-private/raw execution dataを除外する | lifecycle DTOをclosed allowlistとし、worker log、command line、environment、arbitrary properties、absolute root/executable pathを投影しない |
 | `Q-002` | baseline handleへMCP Tasksを追加するか | **Resolved: Option Aを採用する** |
 | `AC-004` | profile planはworkerまたはproject codeを起動せずcanonical planを返す | static repository inventory plannerだけを呼ぶcore/CLI/process testとproject-code markerで固定する |
+| `AC-006` | deps/dependentsのdirection、transitive、filter semanticsがCLIとMCPで一致する | 両frontendを同じ`DepgraphService::dependencies`へroutingし、cross-process edge-ID parity testで固定する |
+| `AC-007` | path traversal exhaustionをunreachableと誤認しない | fully explored graphだけが`path_found: false`を返し、未探索edgeがある場合はpartial resultを捨ててtyped resource errorを返す |
 | `AC-011` | daemon statusはpublished status fileだけを読み、store/process stateを変更しない | no-follow bounded reader、missing-store test、status/store digest immutability testで固定する |
 | `AC-014` | Tasks非対応hostを含め、accepted operationのstatus、result、cancelが未定義分岐なく機能する | capability matrix、result union、認可、再接続、互換性test matrixを本書で固定する |
 | `AC-015` | 同じnormalized lifecycle inputに対するCLIとMCP domain responseを一致させる | 三操作を同じservice methodとAgent DTO mapperへroutingし、cross-process parity testでJSON value equalityを検証する |
 | `#295` | 共通contract、closed DTO、typed error、pagination、operation型、決定的schema生成 | `depgraph-mcp-tools-v1`のRust型、checked-in schema、digestとcontract golden、およびintegration testで固定する |
 | `#301` | profile plan、daemon status、doctorを共有serviceとMCPへ接続する | lifecycle service/DTO/handler、CLI migration、security/redaction/immutability/parity/process test、およびcanonical catalog/schema fixtureで固定する |
+| `#302` | dependencies、dependents、explain pathを共有serviceとMCPへ接続する | pinned `SnapshotReadRequest`、closed dependency/path DTO、exact catalog schema、CLI/MCP parity、cursor/exhaustion/process testで固定する |
 
 ## Upstream and API evidence
 
@@ -335,6 +342,34 @@ profile fileのlegacy CLI absolute pathはrepository内部を指す場合だけp
 normalizeして互換性を維持する。repository外、`..`、symlinkを含む場合はsecurity failureとし、
 supplied pathやcontentをerrorへ反射しない。daemon/doctorのhuman outputはCLI向け表示を維持できるが、
 JSON domain responseはAgent projectionをcanonical sourceとする。
+
+## Issue #302 dependency/path tool evidence
+
+Issue [#302](https://github.com/TamaT-LLC/depgraph-cli/issues/302)は既存の`deps`、
+`dependents`、`why` graph semanticsを共有service境界へ移し、三つのread-only MCP toolへ
+公開する。
+
+| Boundary | Frozen behavior and evidence |
+| --- | --- |
+| Snapshot ownership | handler/CLIはlocatorまたはlegacy scan selectionをrequest-owned read-only storeで一度だけstable snapshot IDへ解決する。graph loadは同じ`SnapshotReadRequest`と固定IDを使い、後続scanがcurrent pointerを変えても開始時snapshotだけを読む |
+| Dependency traversal | `DependencyDirection::{Outgoing,Incoming}`、one-hop/transitive、normalized `GraphQueryFilter`を共有する。adjacencyはnext node ID、edge ID、public resultはedge IDでcanonical orderを固定し、bounded traversalはpartialであることを`traversal_complete`へ明示する |
+| Pagination | dependency cursorはcontract、tool、repository、resolved snapshot ID、direction、selector、transitive、filter、traversal limit、およびcanonical collection digestへ暗号学的にbindする。別snapshot/query/toolのcursorは`CURSOR_MISMATCH`となる |
+| Path search | canonical adjacency上のBFSで単一shortest pathを選ぶ。同一nodeはzero-step found path、完全探索したunreachableだけはempty stepsと`path_found: false`、未探索edgeを残すlimit到達は`DepgraphServiceError::ResourceExhausted`となる |
+| Closed Agent mapping | `AgentDependenciesResponse`、`AgentPathResponse`、`AgentPathStep`は`deny_unknown_fields`、`JsonSchema`、validated constructorを持つ。edgeは既存`AgentEdge`、evidenceはcanonical先頭64件の`AgentEvidence`だけを使い、raw detail/properties、absolute evidence path、private node propertyを公開しない |
+| Runtime controls | 三handlerは`RuntimeController` read class、fixed `Read` authorization、request cancellation、deadline、rate/concurrency/queue limitsを通り、service traversalもcooperative cancellationを検査する |
+| Frontend parity | CLIのlegacy full JSON/human形とpaged JSON contractを維持したまま、graph executionだけを共有serviceへroutingする。MCP process testは同じstore/filterから得るcanonical edge/path ID sequenceの一致を検証する |
+| Deterministic artifacts | 三toolの固有input/output schema、global schema、catalog JSONとSHA-256 digestをchecked-in fixtureとして固定し、real stdio resultsをadvertised/shared schemaの双方で検証する |
+
+### Issue #302 acceptance mapping
+
+| Acceptance criterion | Evidence |
+| --- | --- |
+| direction/transitiveが既存CLI semanticsと一致する | core service matrix、既存CLI graph regression、CLI/MCP process parity |
+| 同じsnapshot/filterから同じpath/order/cursorを返す | canonical-order service test、repeated/cursor process test、cursor fingerprint binding |
+| traversal上限をpathなしと誤認しない | service exhaustion testとstdio `RESOURCE_EXHAUSTED` test |
+| concurrent scan中も開始時snapshotだけを参照する | currentを解決後に別snapshotをpublishするrequest-pinning service test |
+| closed schemaとredaction | DTO constructor/Serde/schema tests、およびprivate path/property prohibition process corpus |
+| repository validation | focused tests、workspace formatting、Clippy `-D warnings`、`cargo xtask test` |
 
 ## Issue #292 acceptance mapping
 

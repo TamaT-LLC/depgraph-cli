@@ -6,10 +6,10 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    AgentCompletedSnapshot, AgentContext, AgentDaemonStatus, AgentDoctor, AgentId, AgentLocator,
-    AgentNamedSnapshot, AgentNodeSummary, AgentProfilePlan, Cursor, LogicalRepositoryId,
-    MCP_TOOLS_CONTRACT_VERSION, OperationId, Page, RepositoryRelativePath, SnapshotId,
-    SnapshotName, SuccessEnvelope,
+    AgentCompletedSnapshot, AgentContext, AgentDaemonStatus, AgentDependenciesResponse,
+    AgentDoctor, AgentId, AgentLocator, AgentNamedSnapshot, AgentNodeSummary, AgentPathResponse,
+    AgentProfilePlan, Cursor, LogicalRepositoryId, MCP_TOOLS_CONTRACT_VERSION, OperationId, Page,
+    RepositoryRelativePath, SnapshotId, SnapshotName, SuccessEnvelope,
 };
 
 macro_rules! define_cli_actions {
@@ -404,7 +404,18 @@ const TOOL_SPECS: &[ToolSpec] = &[
     tool_spec!(
         "graph_dependencies_list",
         "Traverse outgoing dependency edges from one selector.",
-        ["selector", "snapshot", "depth", "kinds", "cursor", "limit"],
+        [
+            "selector",
+            "snapshot",
+            "transitive",
+            "phases",
+            "profiles",
+            "sessions",
+            "environments",
+            "max_traversal",
+            "cursor",
+            "limit"
+        ],
         [CliAction::Deps],
         READ,
         ToolAuthorization::FixedCapabilities,
@@ -413,7 +424,18 @@ const TOOL_SPECS: &[ToolSpec] = &[
     tool_spec!(
         "graph_dependents_list",
         "Traverse incoming dependency edges from one selector.",
-        ["selector", "snapshot", "depth", "kinds", "cursor", "limit"],
+        [
+            "selector",
+            "snapshot",
+            "transitive",
+            "phases",
+            "profiles",
+            "sessions",
+            "environments",
+            "max_traversal",
+            "cursor",
+            "limit"
+        ],
         [CliAction::Dependents],
         READ,
         ToolAuthorization::FixedCapabilities,
@@ -422,11 +444,20 @@ const TOOL_SPECS: &[ToolSpec] = &[
     tool_spec!(
         "graph_path_get",
         "Explain a bounded dependency path between two selectors.",
-        ["from", "to", "snapshot", "max_depth", "max_paths"],
+        [
+            "from",
+            "to",
+            "snapshot",
+            "phases",
+            "profiles",
+            "sessions",
+            "environments",
+            "max_traversal"
+        ],
         [CliAction::Why],
         READ,
         ToolAuthorization::FixedCapabilities,
-        OperationBehavior::MayCreateDurableOperation
+        OperationBehavior::Immediate
     ),
     tool_spec!(
         "graph_impact_get",
@@ -682,6 +713,12 @@ fn output_schema(spec: &ToolSpec) -> Map<String, Value> {
         "doctor_get" => {
             return exact_success_output_schema::<AgentDoctor>(spec.name);
         }
+        "graph_dependencies_list" | "graph_dependents_list" => {
+            return exact_success_output_schema::<AgentDependenciesResponse>(spec.name);
+        }
+        "graph_path_get" => {
+            return exact_success_output_schema::<AgentPathResponse>(spec.name);
+        }
         _ => {}
     }
     let immediate = json!({
@@ -805,13 +842,14 @@ fn field_schema(field: &str) -> Value {
                 scalar_schema::<SnapshotName>()
             ]
         }),
-        "strict" | "no_cache" | "force" | "details" | "rust_compiler_precise" => {
+        "strict" | "no_cache" | "force" | "details" | "rust_compiler_precise" | "transitive" => {
             json!({"type": "boolean"})
         }
         "profile_budget" => json!({"type": "integer", "minimum": 1, "maximum": 32}),
         "depth" | "limit" | "max_depth" | "max_paths" | "max_nodes" | "max_edges" => {
             json!({"type": "integer", "minimum": 1})
         }
+        "max_traversal" => json!({"type": "integer", "minimum": 1, "maximum": 1000000}),
         "profiles_document" => json!({
             "type": "string",
             "minLength": 1,
@@ -824,7 +862,7 @@ fn field_schema(field: &str) -> Value {
             "maxItems": 1024,
             "items": scalar_schema::<AgentLocator>()
         }),
-        "kinds" | "profiles" => json!({
+        "kinds" | "profiles" | "phases" | "sessions" | "environments" => json!({
             "type": "array",
             "maxItems": 1024,
             "items": {"type": "string", "minLength": 1, "maxLength": 4096}

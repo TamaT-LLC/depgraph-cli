@@ -646,4 +646,10 @@ pub enum ContractBuildError {
     AgentDtoValue,
     #[error("Agent snapshot contains too many metadata items")]
     TooManySnapshotMetadataItems,
+    #[error("Agent path contains too many steps")]
+    TooManyPathSteps,
+    #[error("Agent path topology is inconsistent")]
+    PathTopology,
+    #[error("Agent graph response traversal counts are inconsistent")]
+    TraversalCount,
 }

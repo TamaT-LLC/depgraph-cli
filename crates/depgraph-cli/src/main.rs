@@ -8,9 +8,10 @@ use std::{
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use depgraph_core::service::{
-    CompletedSnapshotView, DepgraphCapabilitySet, DepgraphService, DepgraphServiceConfig,
-    DepgraphServiceError, DepgraphServiceLimits, DoctorRequest, ProfilePlanRequest,
-    RepositoryRelativePath, SnapshotLocator,
+    CompletedSnapshotView, DependenciesRequest, DependencyDirection, DepgraphCapabilitySet,
+    DepgraphService, DepgraphServiceConfig, DepgraphServiceError, DepgraphServiceLimits,
+    DoctorRequest, ExplainPathRequest, ProfilePlanRequest, RepositoryRelativePath, SnapshotLocator,
+    SnapshotReadRequest,
 };
 use depgraph_core::{
     BoundedQueryExecutionError, BoundedQueryPlan, BoundedQueryResult, BuildAudit, BuildOutcomeKind,
@@ -31,11 +32,10 @@ use depgraph_core::{
     profile_selection_human_summary, read_bounded_query_file, read_compiler_pack_requirement,
     read_git_changed_set, read_runtime_trace, render_condition, render_github_annotations,
     run_scan_with_cache_mode, runtime_session_delta, rust_build_protocol_ndjson,
-    snapshot_profile_plan_id, stage_build_evidence, start_repository_daemon, traversal_page_items,
-    traversal_summary, traverse_bounded_filtered, traverse_filtered, unresolved,
-    unresolved_summary, validate_build_cache_input, validate_build_cache_source,
+    snapshot_profile_plan_id, stage_build_evidence, start_repository_daemon, traversal_summary,
+    unresolved, unresolved_summary, validate_build_cache_input, validate_build_cache_source,
     validate_compiler_precise_cache_input, validate_compiler_precise_cached_evidence,
-    validate_interactive_query_bounds, web_build_protocol_ndjson, why_filtered,
+    validate_interactive_query_bounds, web_build_protocol_ndjson,
 };
 use depgraph_mcp_tools::{AgentDaemonStatus, AgentDoctor, CliAction};
 use depgraph_protocol::canonical_json;
@@ -198,6 +198,9 @@ enum Commands {
     Why {
         from: String,
         to: String,
+        /// Stop path exploration after this many visited dependency edges.
+        #[arg(long, value_name = "N")]
+        max_traversal: Option<usize>,
         #[arg(long, value_name = "PHASE")]
         phase: Vec<String>,
         #[arg(long, value_name = "PROFILE_ID")]
@@ -1523,29 +1526,33 @@ async fn run(cli: Cli) -> Result<u8> {
             output,
         } => {
             let filter = GraphQueryFilter::new(phase, profile, session, environment)?;
+            let (service, mut snapshot) =
+                graph_snapshot_request(cli.store, cli.scan_id.as_deref())?;
+            let request = DependenciesRequest::try_new(
+                selector,
+                DependencyDirection::Outgoing,
+                transitive,
+                filter,
+                if output.all {
+                    usize::MAX
+                } else {
+                    max_traversal.unwrap_or(DEFAULT_INTERACTIVE_QUERY_MAX_TRAVERSAL)
+                },
+            )?;
+            let result =
+                service.dependencies(&mut snapshot, &request, &CancellationToken::new())?;
             if output.all {
-                let (snapshot, scan_id) = load_snapshot(cli.store, cli.scan_id.as_deref(), false)?;
-                let result = traverse_filtered(&snapshot, &selector, transitive, false, &filter)?;
-                print_structured("deps", scan_id, &result, json)?;
+                print_structured(
+                    "deps",
+                    result.scan_id().to_owned(),
+                    result.traversal(),
+                    json,
+                )?;
                 if !json {
-                    print_path_steps(&result.steps);
+                    print_path_steps(&result.traversal().steps);
                 }
             } else {
-                let (snapshot, snapshot_id) =
-                    load_query_snapshot_read_only(cli.store, cli.scan_id.as_deref())?;
-                let scan_id = snapshot.scan.id.clone();
-                let page = interactive_traversal_page(
-                    &snapshot,
-                    &scan_id,
-                    &snapshot_id,
-                    "deps",
-                    &selector,
-                    transitive,
-                    false,
-                    &filter,
-                    max_traversal,
-                    &output,
-                )?;
+                let page = interactive_dependencies_page(&result, "deps", &request, &output)?;
                 print_interactive_page(&page, json)?;
                 if !json {
                     for item in &page.items {
@@ -1567,29 +1574,33 @@ async fn run(cli: Cli) -> Result<u8> {
             output,
         } => {
             let filter = GraphQueryFilter::new(phase, profile, session, environment)?;
+            let (service, mut snapshot) =
+                graph_snapshot_request(cli.store, cli.scan_id.as_deref())?;
+            let request = DependenciesRequest::try_new(
+                selector,
+                DependencyDirection::Incoming,
+                transitive,
+                filter,
+                if output.all {
+                    usize::MAX
+                } else {
+                    max_traversal.unwrap_or(DEFAULT_INTERACTIVE_QUERY_MAX_TRAVERSAL)
+                },
+            )?;
+            let result =
+                service.dependencies(&mut snapshot, &request, &CancellationToken::new())?;
             if output.all {
-                let (snapshot, scan_id) = load_snapshot(cli.store, cli.scan_id.as_deref(), false)?;
-                let result = traverse_filtered(&snapshot, &selector, transitive, true, &filter)?;
-                print_structured("dependents", scan_id, &result, json)?;
+                print_structured(
+                    "dependents",
+                    result.scan_id().to_owned(),
+                    result.traversal(),
+                    json,
+                )?;
                 if !json {
-                    print_path_steps(&result.steps);
+                    print_path_steps(&result.traversal().steps);
                 }
             } else {
-                let (snapshot, snapshot_id) =
-                    load_query_snapshot_read_only(cli.store, cli.scan_id.as_deref())?;
-                let scan_id = snapshot.scan.id.clone();
-                let page = interactive_traversal_page(
-                    &snapshot,
-                    &scan_id,
-                    &snapshot_id,
-                    "dependents",
-                    &selector,
-                    transitive,
-                    true,
-                    &filter,
-                    max_traversal,
-                    &output,
-                )?;
+                let page = interactive_dependencies_page(&result, "dependents", &request, &output)?;
                 print_interactive_page(&page, json)?;
                 if !json {
                     for item in &page.items {
@@ -1602,6 +1613,7 @@ async fn run(cli: Cli) -> Result<u8> {
         Commands::Why {
             from,
             to,
+            max_traversal,
             phase,
             profile,
             session,
@@ -1609,17 +1621,28 @@ async fn run(cli: Cli) -> Result<u8> {
             json,
         } => {
             let filter = GraphQueryFilter::new(phase, profile, session, environment)?;
-            let (snapshot, scan_id) = load_snapshot(cli.store, cli.scan_id.as_deref(), false)?;
-            let result = why_filtered(&snapshot, &from, &to, &filter)?;
-            print_structured("why", scan_id, &result, json)?;
+            let (service, mut snapshot) =
+                graph_snapshot_request(cli.store, cli.scan_id.as_deref())?;
+            let result = service.explain_path(
+                &mut snapshot,
+                &ExplainPathRequest::try_new(
+                    from,
+                    to,
+                    filter,
+                    max_traversal.unwrap_or(DEFAULT_INTERACTIVE_QUERY_MAX_TRAVERSAL),
+                )?,
+                &CancellationToken::new(),
+            )?;
+            print_structured("why", result.scan_id().to_owned(), result.path(), json)?;
             if !json {
-                if result.path_found {
-                    println!("{}", result.from.locator);
-                    print_why_steps(&result.steps);
+                if result.path().path_found {
+                    println!("{}", result.path().from.locator);
+                    print_why_steps(&result.path().steps);
                 } else {
                     println!(
                         "no dependency path exists from {} to {}",
-                        result.from.locator, result.to.locator
+                        result.path().from.locator,
+                        result.path().to.locator
                     );
                 }
             }
@@ -2513,6 +2536,22 @@ fn load_query_snapshot_read_only(
     Ok((snapshot, snapshot_id))
 }
 
+fn graph_snapshot_request(
+    explicit_store: Option<PathBuf>,
+    requested_scan_id: Option<&str>,
+) -> Result<(DepgraphService, SnapshotReadRequest)> {
+    let root = std::env::current_dir()?;
+    let store_path = store_path(explicit_store, &root)?;
+    let service = snapshot_read_service(&root, &store_path)?;
+    let cancellation = CancellationToken::new();
+    let request = match requested_scan_id {
+        Some(scan_id) => service.start_snapshot_request_for_scan(scan_id, &cancellation)?,
+        None => service
+            .start_snapshot_request_at_cancellable(&SnapshotLocator::Current, &cancellation)?,
+    };
+    Ok((service, request))
+}
+
 fn print_profile_plan(preview: &RepositoryProfilePlanPreview, json: bool) -> Result<()> {
     if json {
         println!("{}", canonical_json(&serde_json::to_value(preview)?));
@@ -2858,16 +2897,10 @@ fn print_doctor_summary_human(report: &depgraph_core::DoctorSummaryReport) {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn interactive_traversal_page(
-    snapshot: &depgraph_store::GraphSnapshot,
-    scan_id: &str,
-    snapshot_id: &str,
+fn interactive_dependencies_page(
+    execution: &depgraph_core::service::DependenciesResult,
     command: &'static str,
-    selector: &str,
-    transitive: bool,
-    reverse: bool,
-    filter: &GraphQueryFilter,
-    max_traversal: Option<usize>,
+    request: &DependenciesRequest,
     output: &InteractiveOutputArgs,
 ) -> Result<InteractiveQueryPage<TraversalPageItem>> {
     let max_items = output
@@ -2876,39 +2909,30 @@ fn interactive_traversal_page(
     let max_bytes = output
         .max_bytes
         .unwrap_or(DEFAULT_INTERACTIVE_QUERY_MAX_BYTES);
-    let max_traversal = max_traversal.unwrap_or(DEFAULT_INTERACTIVE_QUERY_MAX_TRAVERSAL);
+    let max_traversal = request.max_traversal();
     validate_interactive_query_bounds(max_items, max_bytes, Some(max_traversal))?;
-    let execution = traverse_bounded_filtered(
-        snapshot,
-        selector,
-        transitive,
-        reverse,
-        filter,
-        max_traversal,
-    )?;
-    let items = traversal_page_items(&execution.result)?;
     let context = serde_json::json!({
-        "selector": selector,
-        "transitive": transitive,
-        "reverse": reverse,
-        "filter": filter,
+        "selector": request.selector(),
+        "transitive": request.transitive(),
+        "reverse": request.direction().is_incoming(),
+        "filter": request.filter(),
         "max_traversal": max_traversal,
     });
     paginate_interactive_query(
-        &items,
-        traversal_summary(&execution.result),
+        execution.items(),
+        traversal_summary(execution.traversal()),
         InteractiveQueryPageRequest {
             command,
-            scan_id,
-            snapshot_id,
+            scan_id: execution.scan_id(),
+            snapshot_id: execution.snapshot_id().as_str(),
             context: &context,
             cursor: output.cursor.as_deref(),
             max_items,
             max_bytes,
-            traversal_complete: execution.complete,
-            traversed_items: execution.traversed_edges,
-            root: Some(&execution.result.root),
-            diagnostics: execution.diagnostics,
+            traversal_complete: execution.complete(),
+            traversed_items: execution.traversed_edges(),
+            root: Some(&execution.traversal().root),
+            diagnostics: execution.diagnostics().to_vec(),
         },
     )
 }

@@ -46,6 +46,7 @@ pub mod rust_build_observer;
 pub mod scan;
 pub mod service;
 mod service_agent;
+mod service_graph;
 mod service_lifecycle;
 mod service_repository;
 mod service_snapshot;
@@ -416,13 +417,15 @@ pub use scan::{
 pub use service::{
     DEFAULT_SERVICE_MAX_INLINE_INPUT_BYTES, DEFAULT_SERVICE_MAX_OUTPUT_BYTES,
     DEFAULT_SERVICE_MAX_PAGE_ITEMS, DEFAULT_SERVICE_PAGE_ITEMS, DEPGRAPH_SERVICE_LIMITS_VERSION,
-    DepgraphCapability, DepgraphCapabilitySet, DepgraphMutatingContext, DepgraphMutatingUseCase,
+    DependenciesRequest, DependenciesResult, DependencyDirection, DepgraphCapability,
+    DepgraphCapabilitySet, DepgraphMutatingContext, DepgraphMutatingUseCase,
     DepgraphMutatingUseCaseKind, DepgraphService, DepgraphServiceConfig,
     DepgraphServiceConfigurationError, DepgraphServiceError, DepgraphServiceErrorCategory,
     DepgraphServiceLimit, DepgraphServiceLimits, DepgraphServiceResult, DoctorRequest,
-    DoctorResponse, OpenedRepositoryFile, ProfilePlanRequest, RepositoryFileError,
-    RepositoryPathError, RepositoryPathSelector, RepositoryRelativePath, RequestReadStore,
-    RequestReadStoreFactory, ResolvedSnapshotId, SnapshotLocator, SnapshotReadRequest,
+    DoctorResponse, ExplainPathRequest, ExplainPathResult, OpenedRepositoryFile,
+    ProfilePlanRequest, RepositoryFileError, RepositoryPathError, RepositoryPathSelector,
+    RepositoryRelativePath, RequestReadStore, RequestReadStoreFactory, ResolvedSnapshotId,
+    SnapshotLocator, SnapshotReadRequest,
 };
 
 use worker::{

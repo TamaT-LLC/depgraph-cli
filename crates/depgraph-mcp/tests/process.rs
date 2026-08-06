@@ -161,6 +161,115 @@ fn seed_issue_300_store(path: &Path, root: &Path) -> String {
     snapshot_id
 }
 
+fn seed_issue_302_store(path: &Path, root: &Path) -> String {
+    let mut store = Store::open(path).unwrap();
+    store
+        .start_scan_with_revision("issue-302", root, false, Some("revision-302"))
+        .unwrap();
+    let coverage = json!({
+        "profiles": 1,
+        "files_discovered": 0,
+        "files_analyzed": 0,
+        "files_skipped": 0,
+        "dependency_sites": 0,
+        "resolved": 0,
+        "candidates": 0,
+        "external": 0,
+        "unresolved": 0,
+        "unsupported_syntax": 0,
+        "project_code_executed": false,
+        "completeness": ["syntax-complete"],
+        "reasons": []
+    });
+    let common = |event: &str, seq: u64| {
+        json!({
+            "event": event,
+            "protocol_version": "1.0",
+            "scan_id": "issue-302",
+            "adapter": "fixture",
+            "adapter_version": "1.0",
+            "seq": seq
+        })
+    };
+    let mut started = common("scan_started", 1);
+    started["root"] = json!(root);
+    started["project_code_executed"] = json!(false);
+    started["safe_mode"] = json!(true);
+    store.ingest_event(&started).unwrap();
+    let mut profile = common("profile_declared", 2);
+    profile["profile"] = json!({
+        "id": "fixture:safe",
+        "language": "fixture",
+        "features": [],
+        "environment": {},
+        "properties": {"private": root}
+    });
+    store.ingest_event(&profile).unwrap();
+    for (offset, name) in ["d", "c", "b", "a"].into_iter().enumerate() {
+        let mut node = common("node_upsert", offset as u64 + 3);
+        node["node"] = json!({
+            "id": format!("node:{name}"),
+            "kind": "module",
+            "locator": format!("repo://src/{name}.rs"),
+            "display_name": format!("fixture::{name}"),
+            "properties": {"path": format!("src/{name}.rs"), "secret": root}
+        });
+        store.ingest_event(&node).unwrap();
+    }
+    for (offset, (id, source, target)) in [
+        ("edge:z", "node:a", "node:c"),
+        ("edge:d", "node:b", "node:d"),
+        ("edge:c", "node:c", "node:d"),
+        ("edge:b", "node:a", "node:b"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut edge = common("edge_upsert", offset as u64 + 7);
+        edge["edge"] = json!({
+            "id": id,
+            "source": source,
+            "target": target,
+            "kind": "imports",
+            "phase": "semantic",
+            "environment": "host",
+            "profile_id": "fixture:safe",
+            "resolution_status": "resolved",
+            "precision": "exact",
+            "condition": {"op": "all", "conditions": []},
+            "generated": false,
+            "evidence": [{
+                "kind": "semantic",
+                "extractor": "fixture",
+                "extractor_version": "1.0",
+                "path": root.join(format!("private-{id}.rs")),
+                "start_line": 1,
+                "start_column": 1,
+                "end_line": 1,
+                "end_column": 2,
+                "detail": "PRIVATE_DETAIL",
+                "properties": {"secret": "PROCESS_GRAPH_SECRET"}
+            }]
+        });
+        store.ingest_event(&edge).unwrap();
+    }
+    let mut profile_completed = common("profile_completed", 11);
+    profile_completed["profile_id"] = json!("fixture:safe");
+    profile_completed["coverage"] = coverage.clone();
+    store.ingest_event(&profile_completed).unwrap();
+    let mut completed = common("scan_completed", 12);
+    completed["coverage"] = coverage;
+    store.ingest_event(&completed).unwrap();
+    store
+        .finish_scan("issue-302", "completed", None, true)
+        .unwrap();
+    let snapshot_id = store.current_snapshot_id().unwrap().unwrap();
+    store
+        .create_snapshot_name("baseline", &snapshot_id)
+        .unwrap();
+    snapshot_id
+}
+
 struct RequirementFixture {
     _temp: tempfile::TempDir,
     path: PathBuf,
@@ -706,6 +815,437 @@ fn issue_300_catalog_tools_call_real_handlers_and_leave_the_store_unchanged() {
         results[3].1["structuredContent"]["result"]["snapshot_id"],
         snapshot_id
     );
+}
+
+#[test]
+fn issue_302_graph_handlers_page_canonically_explain_paths_and_fail_closed_on_exhaustion() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("repository");
+    let store_path = temporary.path().join("store.sqlite");
+    fs::create_dir(&root).unwrap();
+    let snapshot_id = seed_issue_302_store(&store_path, &root);
+    let before = store_invariant(&store_path);
+    let mut mcp = InteractiveMcp::start(&root, &store_path);
+    let initialized = mcp.request(json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2026-07-28",
+            "capabilities": {},
+            "clientInfo": {"name": "issue-302-test", "version": "1"}
+        }
+    }));
+    assert_eq!(initialized["id"], 1);
+
+    let first = mcp.request(json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": {
+            "name": "graph_dependencies_list",
+            "arguments": {
+                "contract_version": "depgraph-mcp-tools-v1",
+                "repository_id": "repository",
+                "snapshot": "baseline",
+                "selector": "id:node:a",
+                "transitive": true,
+                "phases": ["semantic"],
+                "max_traversal": 100,
+                "limit": 1
+            }
+        }
+    }));
+    let first = &first["result"];
+    assert_eq!(first["isError"], false, "{first}");
+    assert_tool_text_matches_structured(first);
+    let structured = &first["structuredContent"];
+    assert_eq!(structured["snapshot_id"], snapshot_id);
+    assert_eq!(structured["result"]["direction"], "outgoing");
+    assert_eq!(structured["result"]["traversal_complete"], true);
+    assert_eq!(structured["result"]["edges"]["items"][0]["id"], "edge:b");
+    assert_eq!(structured["result"]["edges"]["complete"], false);
+    let repeated = mcp.request(json!({
+        "jsonrpc": "2.0",
+        "id": 21,
+        "method": "tools/call",
+        "params": {
+            "name": "graph_dependencies_list",
+            "arguments": {
+                "contract_version": "depgraph-mcp-tools-v1",
+                "repository_id": "repository",
+                "snapshot": "baseline",
+                "selector": "id:node:a",
+                "transitive": true,
+                "phases": ["semantic"],
+                "max_traversal": 100,
+                "limit": 1
+            }
+        }
+    }));
+    let repeated = &repeated["result"];
+    assert_eq!(repeated["isError"], false, "{repeated}");
+    assert_eq!(
+        repeated["structuredContent"].to_string(),
+        structured.to_string(),
+        "same snapshot and filter must reproduce the first structured page byte-for-byte"
+    );
+    assert_eq!(
+        repeated["structuredContent"]["result"]["edges"]["next_cursor"],
+        structured["result"]["edges"]["next_cursor"],
+        "same snapshot and filter must reproduce the next cursor byte-for-byte"
+    );
+    let cursor = structured["result"]["edges"]["next_cursor"].clone();
+    let encoded = structured.to_string();
+    assert!(!encoded.contains(root.to_string_lossy().as_ref()));
+    assert!(!encoded.contains("PROCESS_GRAPH_SECRET"));
+    assert!(!encoded.contains("PRIVATE_DETAIL"));
+    assert!(!encoded.contains("properties"));
+
+    let second = mcp.request(json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "tools/call",
+        "params": {
+            "name": "graph_dependencies_list",
+            "arguments": {
+                "contract_version": "depgraph-mcp-tools-v1",
+                "repository_id": "repository",
+                "snapshot": "baseline",
+                "selector": "id:node:a",
+                "transitive": true,
+                "phases": ["semantic"],
+                "max_traversal": 100,
+                "limit": 3,
+                "cursor": cursor.clone()
+            }
+        }
+    }));
+    let second = &second["result"];
+    assert_eq!(second["isError"], false, "{second}");
+    assert_eq!(
+        second["structuredContent"]["result"]["edges"]["items"][0]["id"],
+        "edge:c"
+    );
+
+    let mismatched = mcp.request(json!({
+        "jsonrpc": "2.0",
+        "id": 31,
+        "method": "tools/call",
+        "params": {
+            "name": "graph_dependencies_list",
+            "arguments": {
+                "contract_version": "depgraph-mcp-tools-v1",
+                "repository_id": "repository",
+                "snapshot": "baseline",
+                "selector": "id:node:a",
+                "transitive": false,
+                "phases": ["semantic"],
+                "max_traversal": 100,
+                "limit": 1,
+                "cursor": cursor
+            }
+        }
+    }));
+    assert_eq!(mismatched["result"]["isError"], true);
+    assert_eq!(
+        mismatched["result"]["structuredContent"]["error"]["code"],
+        "CURSOR_MISMATCH"
+    );
+
+    let path = mcp.request(json!({
+        "jsonrpc": "2.0",
+        "id": 4,
+        "method": "tools/call",
+        "params": {
+            "name": "graph_path_get",
+            "arguments": {
+                "contract_version": "depgraph-mcp-tools-v1",
+                "repository_id": "repository",
+                "snapshot": "current",
+                "from": "id:node:a",
+                "to": "id:node:d",
+                "max_traversal": 100
+            }
+        }
+    }));
+    let path = &path["result"];
+    assert_eq!(path["isError"], false, "{path}");
+    assert_eq!(path["structuredContent"]["result"]["path_found"], true);
+    assert_eq!(
+        path["structuredContent"]["result"]["steps"][0]["edge"]["id"],
+        "edge:b"
+    );
+    assert_eq!(
+        path["structuredContent"]["result"]["steps"][1]["edge"]["id"],
+        "edge:d"
+    );
+
+    let exhausted = mcp.request(json!({
+        "jsonrpc": "2.0",
+        "id": 5,
+        "method": "tools/call",
+        "params": {
+            "name": "graph_path_get",
+            "arguments": {
+                "contract_version": "depgraph-mcp-tools-v1",
+                "repository_id": "repository",
+                "from": "id:node:a",
+                "to": "id:node:d",
+                "max_traversal": 1
+            }
+        }
+    }));
+    let exhausted = &exhausted["result"];
+    assert_eq!(exhausted["isError"], true, "{exhausted}");
+    assert_eq!(
+        exhausted["structuredContent"]["error"]["code"],
+        "RESOURCE_EXHAUSTED"
+    );
+    assert!(exhausted["structuredContent"].get("result").is_none());
+
+    mcp.finish();
+    assert_eq!(before, store_invariant(&store_path));
+}
+
+#[test]
+fn issue_302_real_results_validate_against_advertised_and_shared_schemas() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("repository");
+    let store_path = temporary.path().join("store.sqlite");
+    fs::create_dir(&root).unwrap();
+    seed_issue_302_store(&store_path, &root);
+    let calls = [
+        (
+            "graph_dependencies_list",
+            json!({
+                "contract_version": "depgraph-mcp-tools-v1",
+                "repository_id": "repository",
+                "snapshot": "current",
+                "selector": "id:node:a",
+                "transitive": true,
+                "max_traversal": 100,
+                "limit": 100
+            }),
+        ),
+        (
+            "graph_dependents_list",
+            json!({
+                "contract_version": "depgraph-mcp-tools-v1",
+                "repository_id": "repository",
+                "snapshot": "current",
+                "selector": "id:node:d",
+                "max_traversal": 100,
+                "limit": 100
+            }),
+        ),
+        (
+            "graph_path_get",
+            json!({
+                "contract_version": "depgraph-mcp-tools-v1",
+                "repository_id": "repository",
+                "snapshot": "current",
+                "from": "id:node:a",
+                "to": "id:node:d",
+                "max_traversal": 100
+            }),
+        ),
+    ];
+    let (tools, results) = issue_300_catalog_and_results(&root, &store_path, &calls);
+    let shared_schema: Value = serde_json::from_slice(include_bytes!(
+        "../../../schemas/depgraph-mcp-tools-v1.schema.json"
+    ))
+    .unwrap();
+    let shared = jsonschema::draft202012::new(&shared_schema).unwrap();
+    for ((name, _), result) in calls.iter().zip(results) {
+        assert_eq!(result["isError"], false, "{name}: {result}");
+        let structured = &result["structuredContent"];
+        let advertised_schema =
+            tools.iter().find(|tool| tool["name"] == *name).unwrap()["outputSchema"].clone();
+        jsonschema::draft202012::new(&advertised_schema)
+            .unwrap()
+            .validate(structured)
+            .unwrap_or_else(|error| panic!("{name} advertised schema: {error}"));
+        shared
+            .validate(structured)
+            .unwrap_or_else(|error| panic!("{name} shared schema: {error}"));
+    }
+}
+
+#[test]
+fn issue_302_cli_and_mcp_share_dependency_and_path_semantics() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("repository");
+    let store_path = temporary.path().join("store.sqlite");
+    fs::create_dir(&root).unwrap();
+    seed_issue_302_store(&store_path, &root);
+
+    let cli = |arguments: &[&str]| {
+        let binary = AssertCommand::cargo_bin("depgraph").unwrap();
+        let output = Command::new(binary.get_program())
+            .args(binary.get_args())
+            .current_dir(&root)
+            .arg("--store")
+            .arg(&store_path)
+            .args(arguments)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "CLI stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()
+    };
+    let mcp = |name: &str, arguments| {
+        let result = call_issue_300_tool(&root, &store_path, name, arguments);
+        assert_eq!(result["isError"], false, "{name}: {result}");
+        result
+    };
+    let cli_edge_ids = |document: &Value| {
+        document["data"]["edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|edge| edge["id"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    };
+    let mcp_edge_ids = |document: &Value| {
+        document["structuredContent"]["result"]["edges"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|edge| edge["id"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    };
+    let comparable_node = |node: &Value| {
+        json!({
+            "id": node["id"],
+            "kind": node["kind"],
+            "locator": node["locator"],
+            "display_name": node["display_name"],
+        })
+    };
+    let cli_path_edge_ids = |document: &Value| {
+        document["data"]["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|step| step["edge"]["id"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    };
+    let mcp_path_edge_ids = |document: &Value| {
+        document["structuredContent"]["result"]["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|step| step["edge"]["id"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    };
+
+    let cli_dependencies = cli(&[
+        "deps",
+        "id:node:a",
+        "--transitive",
+        "--phase",
+        "semantic",
+        "--all",
+        "--json",
+    ]);
+    let mcp_dependencies = mcp(
+        "graph_dependencies_list",
+        json!({
+            "contract_version":"depgraph-mcp-tools-v1",
+            "repository_id":"repository",
+            "selector":"id:node:a",
+            "transitive":true,
+            "phases":["semantic"],
+            "max_traversal":100,
+            "limit":100
+        }),
+    );
+    assert_eq!(
+        mcp_dependencies["structuredContent"]["result"]["direction"],
+        "outgoing"
+    );
+    assert_eq!(
+        comparable_node(&mcp_dependencies["structuredContent"]["result"]["root"]),
+        comparable_node(&cli_dependencies["data"]["root"])
+    );
+    assert_eq!(cli_dependencies["data"]["root"]["id"], "node:a");
+    assert_eq!(
+        mcp_edge_ids(&mcp_dependencies),
+        cli_edge_ids(&cli_dependencies)
+    );
+    assert_eq!(
+        cli_edge_ids(&cli_dependencies),
+        ["edge:b", "edge:c", "edge:d", "edge:z"]
+    );
+
+    let cli_dependents = cli(&[
+        "dependents",
+        "id:node:d",
+        "--transitive",
+        "--phase",
+        "semantic",
+        "--all",
+        "--json",
+    ]);
+    let mcp_dependents = mcp(
+        "graph_dependents_list",
+        json!({
+            "contract_version":"depgraph-mcp-tools-v1",
+            "repository_id":"repository",
+            "selector":"id:node:d",
+            "transitive":true,
+            "phases":["semantic"],
+            "max_traversal":100,
+            "limit":100
+        }),
+    );
+    assert_eq!(
+        mcp_dependents["structuredContent"]["result"]["direction"],
+        "incoming"
+    );
+    assert_eq!(
+        comparable_node(&mcp_dependents["structuredContent"]["result"]["root"]),
+        comparable_node(&cli_dependents["data"]["root"])
+    );
+    assert_eq!(cli_dependents["data"]["root"]["id"], "node:d");
+    assert_eq!(mcp_edge_ids(&mcp_dependents), cli_edge_ids(&cli_dependents));
+    assert_eq!(
+        cli_edge_ids(&cli_dependents),
+        ["edge:b", "edge:c", "edge:d", "edge:z"]
+    );
+
+    let cli_path = cli(&["why", "id:node:a", "id:node:d", "--json"]);
+    let mcp_path = mcp(
+        "graph_path_get",
+        json!({
+            "contract_version":"depgraph-mcp-tools-v1",
+            "repository_id":"repository",
+            "from":"id:node:a",
+            "to":"id:node:d",
+            "max_traversal":100
+        }),
+    );
+    assert_eq!(
+        comparable_node(&mcp_path["structuredContent"]["result"]["from"]),
+        comparable_node(&cli_path["data"]["from"])
+    );
+    assert_eq!(
+        comparable_node(&mcp_path["structuredContent"]["result"]["to"]),
+        comparable_node(&cli_path["data"]["to"])
+    );
+    assert_eq!(cli_path["data"]["from"]["id"], "node:a");
+    assert_eq!(cli_path["data"]["to"]["id"], "node:d");
+    assert_eq!(mcp_path["structuredContent"]["result"]["path_found"], true);
+    assert_eq!(
+        mcp_path["structuredContent"]["result"]["path_found"],
+        cli_path["data"]["path_found"]
+    );
+    assert_eq!(mcp_path_edge_ids(&mcp_path), cli_path_edge_ids(&cli_path));
+    assert_eq!(cli_path_edge_ids(&cli_path), ["edge:b", "edge:d"]);
 }
 
 #[test]

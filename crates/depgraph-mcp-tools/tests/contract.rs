@@ -2,9 +2,10 @@ use std::num::NonZeroU32;
 
 use depgraph_mcp_tools::{
     AcceptedOperationStatus, AgentCapability, AgentCompletedSnapshot, AgentContext, AgentCoverage,
-    AgentCurrentSnapshot, AgentEdge, AgentError, AgentErrorCategory, AgentErrorCode,
-    AgentErrorDetails, AgentEvidence, AgentEvidenceKind, AgentLocator, AgentNamedSnapshot,
-    AgentNode, AgentNodeSummary, AgentPhase, AgentPrecision, AgentRemediation,
+    AgentCurrentSnapshot, AgentDependenciesResponse, AgentDependencyDirection, AgentEdge,
+    AgentError, AgentErrorCategory, AgentErrorCode, AgentErrorDetails, AgentEvidence,
+    AgentEvidenceKind, AgentLocator, AgentNamedSnapshot, AgentNode, AgentNodeSummary,
+    AgentPathResponse, AgentPathStep, AgentPhase, AgentPrecision, AgentRemediation,
     AgentResolutionStatus, AgentResourceLimit, AgentSite, AgentSnapshot, AgentSourcePosition,
     AgentSourceSpan, CommonRequest, ContractBuildError, Cursor, DurableSubmitResult, ErrorEnvelope,
     LogicalRepositoryId, MAX_PAGE_BYTES, MAX_PAGE_ITEMS, MAX_TASK_TTL_MS, MIN_TASK_TTL_MS,
@@ -150,6 +151,20 @@ fn edge() -> AgentEdge {
     .expect("bounded edge")
 }
 
+fn dependency_node() -> AgentNode {
+    AgentNode::new(
+        parse("node:dependency"),
+        parse("module"),
+        parse("repo://src/dependency.rs"),
+        Some(parse("crate::dependency")),
+        Some(parse("src/dependency.rs")),
+    )
+}
+
+fn path_step() -> AgentPathStep {
+    AgentPathStep::new(node(), edge(), dependency_node()).expect("connected path step")
+}
+
 fn operation() -> OperationAccepted {
     OperationAccepted::new(parse(OPERATION_ID))
 }
@@ -249,6 +264,33 @@ fn serde_rejects_unknown_fields_for_every_object_and_tagged_enum_branch() {
         "AgentEdge",
         serde_json::to_value(edge()).expect("serialize edge"),
     );
+    assert_unknown_field_rejected::<AgentPathStep>(
+        "AgentPathStep",
+        serde_json::to_value(path_step()).expect("serialize path step"),
+    );
+    assert_unknown_field_rejected::<AgentDependenciesResponse>(
+        "AgentDependenciesResponse",
+        serde_json::to_value(
+            AgentDependenciesResponse::new(
+                node(),
+                AgentDependencyDirection::Outgoing,
+                false,
+                true,
+                1,
+                Page::new(vec![edge()], 1, true, None).expect("complete dependency page"),
+            )
+            .expect("dependency response"),
+        )
+        .expect("serialize dependency response"),
+    );
+    assert_unknown_field_rejected::<AgentPathResponse>(
+        "AgentPathResponse",
+        serde_json::to_value(
+            AgentPathResponse::new(node(), dependency_node(), true, 1, vec![path_step()])
+                .expect("path response"),
+        )
+        .expect("serialize path response"),
+    );
     assert_unknown_field_rejected::<AgentSnapshot>(
         "AgentSnapshot::Available",
         json!({"availability":"available","snapshot_id":SNAPSHOT_ID,"name":"baseline"}),
@@ -306,6 +348,61 @@ fn serde_rejects_unknown_fields_for_every_object_and_tagged_enum_branch() {
         "DurableSubmitResult::Task",
         json!({"resultType":"task","taskId":OPERATION_ID,"status":"working","createdAtMs":1700000000000_u64,"updatedAtMs":1700000000100_u64,"pollIntervalMs":TASK_POLL_INTERVAL_MS,"ttlMs":MIN_TASK_TTL_MS}),
     );
+}
+
+#[test]
+fn dependency_and_path_contracts_validate_topology_and_completion_state() {
+    let dependency_page = Page::new(vec![edge()], 1, true, None).expect("complete edge page");
+    let response = AgentDependenciesResponse::new(
+        node(),
+        AgentDependencyDirection::Outgoing,
+        false,
+        true,
+        1,
+        dependency_page,
+    )
+    .expect("consistent dependencies response");
+    let value = serde_json::to_value(response).expect("serialize response");
+    assert_eq!(
+        value,
+        json!({
+            "root": serde_json::to_value(node()).expect("root"),
+            "direction": "outgoing",
+            "transitive": false,
+            "traversal_complete": true,
+            "traversed_edges": 1,
+            "edges": {
+                "items": [serde_json::to_value(edge()).expect("edge")],
+                "returned_items": 1,
+                "total_items": 1,
+                "complete": true
+            }
+        })
+    );
+
+    let found = AgentPathResponse::new(node(), dependency_node(), true, 1, vec![path_step()])
+        .expect("connected found path");
+    assert_eq!(
+        serde_json::to_value(found).expect("serialize path")["path_found"],
+        true
+    );
+    assert!(
+        AgentPathResponse::new(node(), dependency_node(), false, 1, vec![path_step()]).is_err(),
+        "an unreachable response must never contain partial path steps"
+    );
+    assert!(
+        AgentPathResponse::new(node(), dependency_node(), true, 1, Vec::new()).is_err(),
+        "different endpoints require a non-empty found path"
+    );
+
+    let wrong_target = AgentNode::new(
+        parse("node:wrong"),
+        parse("module"),
+        parse("repo://src/wrong.rs"),
+        None,
+        None,
+    );
+    assert!(AgentPathStep::new(node(), edge(), wrong_target).is_err());
 }
 
 #[test]
@@ -694,10 +791,22 @@ fn contract_samples() -> Value {
     )
     .expect("sample task");
     json!({
+        "agent_dependencies_response": AgentDependenciesResponse::new(
+            node(),
+            AgentDependencyDirection::Outgoing,
+            false,
+            true,
+            1,
+            Page::new(vec![edge()], 1, true, None).expect("sample dependency page"),
+        ).expect("sample dependency response"),
         "agent_edge": edge(),
         "agent_evidence": evidence(),
         "agent_node": node(),
         "agent_node_summary": node_summary(),
+        "agent_path_response": AgentPathResponse::new(
+            node(), dependency_node(), true, 1, vec![path_step()]
+        ).expect("sample path response"),
+        "agent_path_step": path_step(),
         "agent_context": context(),
         "agent_named_snapshot": named_snapshot(),
         "agent_site": site(),

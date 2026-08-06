@@ -756,6 +756,30 @@ pub fn traverse_bounded_filtered(
     filter: &GraphQueryFilter,
     max_traversal: usize,
 ) -> Result<BoundedTraversalResult> {
+    traverse_bounded_filtered_cancellable(
+        snapshot,
+        selector,
+        transitive,
+        reverse,
+        filter,
+        max_traversal,
+        || false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn traverse_bounded_filtered_cancellable(
+    snapshot: &GraphSnapshot,
+    selector: &str,
+    transitive: bool,
+    reverse: bool,
+    filter: &GraphQueryFilter,
+    max_traversal: usize,
+    mut is_cancelled: impl FnMut() -> bool,
+) -> Result<BoundedTraversalResult> {
+    if is_cancelled() {
+        bail!("dependency traversal was cancelled");
+    }
     let root = resolve_selector(snapshot, selector)?;
     let node_map = node_map(snapshot);
     let adjacency = adjacency(snapshot, reverse, filter);
@@ -766,8 +790,14 @@ pub fn traverse_bounded_filtered(
     let mut complete = true;
 
     'traversal: while let Some(node_id) = queue.pop_front() {
+        if is_cancelled() {
+            bail!("dependency traversal was cancelled");
+        }
         if let Some(edges) = adjacency.get(&node_id) {
             for edge in edges {
+                if is_cancelled() {
+                    bail!("dependency traversal was cancelled");
+                }
                 if traversed_edges >= max_traversal {
                     complete = false;
                     break 'traversal;

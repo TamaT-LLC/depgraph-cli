@@ -123,6 +123,38 @@ fn generated_schema_is_valid_draft_2020_12_and_rejects_unknown_fields() {
             json!({"id":"edge:1","source_id":"node:src","target_id":"node:dependency","kind":"imports","phase":"semantic","resolution_status":"resolved","precision":"exact","profile_id":"profile:default","evidence":[]}),
         ),
         (
+            "AgentPathStep",
+            "AgentPathStep",
+            json!({
+                "source":{"id":"node:src","kind":"module","locator":"repo://src/lib.rs"},
+                "edge":{"id":"edge:1","source_id":"node:src","target_id":"node:dependency","kind":"imports","phase":"semantic","resolution_status":"resolved","precision":"exact","profile_id":"profile:default","evidence":[]},
+                "target":{"id":"node:dependency","kind":"module","locator":"repo://src/dependency.rs"}
+            }),
+        ),
+        (
+            "AgentDependenciesResponse",
+            "AgentDependenciesResponse",
+            json!({
+                "root":{"id":"node:src","kind":"module","locator":"repo://src/lib.rs"},
+                "direction":"outgoing",
+                "transitive":false,
+                "traversal_complete":true,
+                "traversed_edges":0,
+                "edges":{"items":[],"returned_items":0,"total_items":0,"complete":true}
+            }),
+        ),
+        (
+            "AgentPathResponse",
+            "AgentPathResponse",
+            json!({
+                "from":{"id":"node:src","kind":"module","locator":"repo://src/lib.rs"},
+                "to":{"id":"node:dependency","kind":"module","locator":"repo://src/dependency.rs"},
+                "path_found":false,
+                "traversed_edges":0,
+                "steps":[]
+            }),
+        ),
+        (
             "AgentSnapshot",
             "AgentSnapshot::Available",
             json!({"availability":"available","snapshot_id":SNAPSHOT_ID,"name":"baseline"}),
@@ -330,7 +362,7 @@ fn every_generated_object_schema_has_additional_properties_false() {
     let schema = schema_value();
     let mut objects = 0;
     assert_all_object_schemas_are_closed(&schema, "#", &mut objects);
-    assert_eq!(objects, 97, "review newly added object schemas explicitly");
+    assert_eq!(objects, 102, "review newly added object schemas explicitly");
 }
 
 #[test]

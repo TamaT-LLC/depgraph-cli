@@ -5,7 +5,7 @@ use std::{
 
 use chacha20poly1305::{
     ChaCha20Poly1305, KeyInit, Nonce,
-    aead::{Aead, AeadCore, OsRng, Payload},
+    aead::{Aead, OsRng, Payload},
 };
 use depgraph_core::{DepgraphCapability, DepgraphServiceError, RepositoryFileError};
 use rmcp::model::CallToolResult;
@@ -15,10 +15,11 @@ use sha2::{Digest, Sha256};
 use zeroize::Zeroize;
 
 use crate::{
-    AgentCapability, AgentCompletedSnapshot, AgentContext, AgentDaemonStatus, AgentDoctor,
-    AgentEdge, AgentError, AgentErrorCode, AgentErrorDetails, AgentEvidence, AgentNamedSnapshot,
-    AgentNode, AgentNodeSummary, AgentProfilePlan, AgentRemediation, AgentResourceLimit, AgentSite,
-    AgentSnapshot, CanonicalJsonError, Cursor, DurableSubmitResult, ErrorEnvelope,
+    AgentCapability, AgentCompletedSnapshot, AgentContext, AgentDaemonStatus,
+    AgentDependenciesResponse, AgentDoctor, AgentEdge, AgentError, AgentErrorCode,
+    AgentErrorDetails, AgentEvidence, AgentNamedSnapshot, AgentNode, AgentNodeSummary,
+    AgentPathResponse, AgentPathStep, AgentProfilePlan, AgentRemediation, AgentResourceLimit,
+    AgentSite, AgentSnapshot, CanonicalJsonError, Cursor, DurableSubmitResult, ErrorEnvelope,
     LogicalRepositoryId, MAX_PAGE_BYTES, MCP_TOOLS_CONTRACT_VERSION, OperationAccepted, Page,
     PageRequest, SnapshotId, SuccessEnvelope, TaskAccepted, canonical_json_bytes,
 };
@@ -57,6 +58,7 @@ macro_rules! public_page_item {
 public_result!(
     AgentCompletedSnapshot,
     AgentContext,
+    AgentDependenciesResponse,
     AgentEdge,
     AgentEvidence,
     AgentDaemonStatus,
@@ -64,6 +66,8 @@ public_result!(
     AgentNamedSnapshot,
     AgentNode,
     AgentNodeSummary,
+    AgentPathResponse,
+    AgentPathStep,
     AgentProfilePlan,
     AgentSite,
     AgentSnapshot,
@@ -77,6 +81,7 @@ public_page_item!(
     AgentNamedSnapshot,
     AgentNode,
     AgentNodeSummary,
+    AgentPathStep,
     AgentSite,
     AgentSnapshot
 );
@@ -248,14 +253,14 @@ fn map_service_error(source: &DepgraphServiceError) -> AgentError {
             }
             RepositoryFileError::Unavailable { .. } => internal_error(true),
         },
-        DepgraphServiceError::InvalidInput | DepgraphServiceError::ProfilePlan { .. } => {
-            AgentError::new(
-                AgentErrorCode::InvalidArgument,
-                false,
-                AgentRemediation::CorrectInput,
-                None,
-            )
-        }
+        DepgraphServiceError::InvalidInput
+        | DepgraphServiceError::ProfilePlan { .. }
+        | DepgraphServiceError::GraphQuery { .. } => AgentError::new(
+            AgentErrorCode::InvalidArgument,
+            false,
+            AgentRemediation::CorrectInput,
+            None,
+        ),
         DepgraphServiceError::NotFound => AgentError::new(
             AgentErrorCode::NotFound,
             false,
@@ -647,11 +652,19 @@ impl PaginationContext {
         state[..8].copy_from_slice(&offset.to_be_bytes());
         state[8..16].copy_from_slice(&total_items.to_be_bytes());
         state[16..].copy_from_slice(result_digest);
-        let nonce = ChaCha20Poly1305::generate_nonce(&mut OsRng);
+        // The cursor state and binding are immutable for a pinned query, so derive a
+        // unique nonce from them. This keeps authenticated cursors reproducible while
+        // avoiding nonce reuse for distinct cursor states under the process-local key.
+        let mut nonce_hasher = Sha256::new();
+        nonce_hasher.update(&self.cursor_key.0);
+        nonce_hasher.update(self.binding_digest.as_bytes());
+        nonce_hasher.update(state);
+        let nonce_digest = nonce_hasher.finalize();
+        let nonce = Nonce::from_slice(&nonce_digest[..CURSOR_NONCE_BYTES]);
         let cipher = ChaCha20Poly1305::new((&self.cursor_key.0).into());
         let ciphertext = cipher
             .encrypt(
-                &nonce,
+                nonce,
                 Payload {
                     msg: &state,
                     aad: self.binding_digest.as_bytes(),
@@ -660,7 +673,7 @@ impl PaginationContext {
             .map_err(|_| ResponseMappingError::CursorEncoding)?;
         state.zeroize();
         let mut sealed = Vec::with_capacity(CURSOR_NONCE_BYTES + ciphertext.len());
-        sealed.extend_from_slice(&nonce);
+        sealed.extend_from_slice(nonce);
         sealed.extend_from_slice(&ciphertext);
         format!("{CURSOR_VERSION}.{}", hex::encode(sealed))
             .parse()
