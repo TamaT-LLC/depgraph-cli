@@ -4,13 +4,14 @@ use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 
 use crate::{
-    AgentId, AgentLabel, AgentLocator, AgentToken, ContractBuildError, RepositoryRelativePath,
-    SnapshotId, SnapshotName,
+    AgentId, AgentLabel, AgentLocator, AgentToken, ContractBuildError, Page,
+    RepositoryRelativePath, SnapshotId, SnapshotName,
 };
 
 pub const MAX_AGENT_EVIDENCE_ITEMS: usize = 64;
 pub const MAX_AGENT_TARGET_ITEMS: usize = 256;
 pub const MAX_AGENT_SNAPSHOT_METADATA_ITEMS: usize = 1_024;
+pub const MAX_AGENT_PATH_STEPS: usize = 1_000;
 
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
@@ -647,6 +648,439 @@ impl AgentEdge {
             evidence,
         })
     }
+
+    #[must_use]
+    pub const fn source_id(&self) -> &AgentId {
+        &self.source_id
+    }
+
+    #[must_use]
+    pub const fn target_id(&self) -> &AgentId {
+        &self.target_id
+    }
+}
+
+#[derive(
+    Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentDependencyDirection {
+    Outgoing,
+    Incoming,
+}
+
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentPathStep {
+    source: AgentNode,
+    edge: AgentEdge,
+    target: AgentNode,
+}
+
+impl AgentPathStep {
+    pub fn new(
+        source: AgentNode,
+        edge: AgentEdge,
+        target: AgentNode,
+    ) -> Result<Self, ContractBuildError> {
+        if source.id() != edge.source_id() || target.id() != edge.target_id() {
+            return Err(ContractBuildError::PathTopology);
+        }
+        Ok(Self {
+            source,
+            edge,
+            target,
+        })
+    }
+
+    #[must_use]
+    pub const fn source(&self) -> &AgentNode {
+        &self.source
+    }
+
+    #[must_use]
+    pub const fn edge(&self) -> &AgentEdge {
+        &self.edge
+    }
+
+    #[must_use]
+    pub const fn target(&self) -> &AgentNode {
+        &self.target
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentPathStepWire {
+    source: AgentNode,
+    edge: AgentEdge,
+    target: AgentNode,
+}
+
+impl<'de> Deserialize<'de> for AgentPathStep {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = AgentPathStepWire::deserialize(deserializer)?;
+        Self::new(wire.source, wire.edge, wire.target).map_err(D::Error::custom)
+    }
+}
+
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentDependenciesResponse {
+    root: AgentNode,
+    direction: AgentDependencyDirection,
+    transitive: bool,
+    traversal_complete: bool,
+    traversed_edges: u64,
+    edges: Page<AgentEdge>,
+}
+
+impl AgentDependenciesResponse {
+    pub fn new(
+        root: AgentNode,
+        direction: AgentDependencyDirection,
+        transitive: bool,
+        traversal_complete: bool,
+        traversed_edges: u64,
+        edges: Page<AgentEdge>,
+    ) -> Result<Self, ContractBuildError> {
+        if traversed_edges < edges.total_items() {
+            return Err(ContractBuildError::TraversalCount);
+        }
+        Ok(Self {
+            root,
+            direction,
+            transitive,
+            traversal_complete,
+            traversed_edges,
+            edges,
+        })
+    }
+
+    /// Projects bounded core traversal items without exposing core properties or paths.
+    /// Request-only values are explicit because the core result does not retain its request.
+    pub fn from_core(
+        source: &depgraph_core::service::DependenciesResult,
+        direction: AgentDependencyDirection,
+        transitive: bool,
+    ) -> Result<Self, ContractBuildError> {
+        let root = AgentNode::try_from(source)?;
+        let edges = source
+            .items()
+            .iter()
+            .map(|item| AgentEdge::try_from(&item.step))
+            .collect::<Result<Vec<_>, _>>()?;
+        let total_items = u64::try_from(edges.len()).map_err(|_| ContractBuildError::PageTotal)?;
+        let edges = Page::new(edges, total_items, true, None)?;
+        Self::new(
+            root,
+            direction,
+            transitive,
+            source.complete(),
+            source.traversed_edges(),
+            edges,
+        )
+    }
+
+    #[must_use]
+    pub const fn edges(&self) -> &Page<AgentEdge> {
+        &self.edges
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentDependenciesResponseWire {
+    root: AgentNode,
+    direction: AgentDependencyDirection,
+    transitive: bool,
+    traversal_complete: bool,
+    traversed_edges: u64,
+    edges: Page<AgentEdge>,
+}
+
+impl<'de> Deserialize<'de> for AgentDependenciesResponse {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = AgentDependenciesResponseWire::deserialize(deserializer)?;
+        Self::new(
+            wire.root,
+            wire.direction,
+            wire.transitive,
+            wire.traversal_complete,
+            wire.traversed_edges,
+            wire.edges,
+        )
+        .map_err(D::Error::custom)
+    }
+}
+
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentPathResponse {
+    from: AgentNode,
+    to: AgentNode,
+    path_found: bool,
+    traversed_edges: u64,
+    #[schemars(length(max = 1000))]
+    steps: Vec<AgentPathStep>,
+}
+
+impl AgentPathResponse {
+    pub fn new(
+        from: AgentNode,
+        to: AgentNode,
+        path_found: bool,
+        traversed_edges: u64,
+        steps: Vec<AgentPathStep>,
+    ) -> Result<Self, ContractBuildError> {
+        if steps.len() > MAX_AGENT_PATH_STEPS {
+            return Err(ContractBuildError::TooManyPathSteps);
+        }
+        if traversed_edges < u64::try_from(steps.len()).unwrap_or(u64::MAX)
+            || (!path_found && !steps.is_empty())
+            || (path_found && from.id() != to.id() && steps.is_empty())
+            || (path_found && from.id() == to.id() && !steps.is_empty())
+        {
+            return Err(ContractBuildError::PathTopology);
+        }
+        if steps
+            .first()
+            .is_some_and(|first| first.source().id() != from.id())
+        {
+            return Err(ContractBuildError::PathTopology);
+        }
+        if steps
+            .last()
+            .is_some_and(|last| last.target().id() != to.id())
+        {
+            return Err(ContractBuildError::PathTopology);
+        }
+        if steps
+            .windows(2)
+            .any(|pair| pair[0].target().id() != pair[1].source().id())
+        {
+            return Err(ContractBuildError::PathTopology);
+        }
+        Ok(Self {
+            from,
+            to,
+            path_found,
+            traversed_edges,
+            steps,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentPathResponseWire {
+    from: AgentNode,
+    to: AgentNode,
+    path_found: bool,
+    traversed_edges: u64,
+    steps: Vec<AgentPathStep>,
+}
+
+impl<'de> Deserialize<'de> for AgentPathResponse {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = AgentPathResponseWire::deserialize(deserializer)?;
+        Self::new(
+            wire.from,
+            wire.to,
+            wire.path_found,
+            wire.traversed_edges,
+            wire.steps,
+        )
+        .map_err(D::Error::custom)
+    }
+}
+
+impl TryFrom<&depgraph_core::query::PathStep> for AgentEdge {
+    type Error = ContractBuildError;
+
+    fn try_from(source: &depgraph_core::query::PathStep) -> Result<Self, Self::Error> {
+        let edge = &source.edge;
+        let evidence = source
+            .evidence
+            .iter()
+            .take(MAX_AGENT_EVIDENCE_ITEMS)
+            .map(|record| {
+                let kind = match record.kind.as_str() {
+                    "source" => AgentEvidenceKind::Source,
+                    "semantic" => AgentEvidenceKind::Semantic,
+                    "build" => AgentEvidenceKind::Build,
+                    "runtime" => AgentEvidenceKind::Runtime,
+                    _ => return Err(ContractBuildError::AgentDtoValue),
+                };
+                let span = safe_source_span(
+                    &record.path,
+                    record.start_line,
+                    record.start_column,
+                    record.end_line,
+                    record.end_column,
+                );
+                Ok(AgentEvidence::new(
+                    kind,
+                    parse_agent_value(&record.extractor)?,
+                    parse_agent_value(&record.extractor_version)?,
+                    span,
+                ))
+            })
+            .collect::<Result<Vec<_>, ContractBuildError>>()?;
+        let phase = match edge.phase.as_str() {
+            "source" => AgentPhase::Source,
+            "semantic" => AgentPhase::Semantic,
+            "build" => AgentPhase::Build,
+            "runtime" => AgentPhase::Runtime,
+            _ => return Err(ContractBuildError::AgentDtoValue),
+        };
+        let resolution_status = match edge.resolution_status.as_str() {
+            "resolved" => AgentResolutionStatus::Resolved,
+            "candidates" => AgentResolutionStatus::Candidates,
+            "external" => AgentResolutionStatus::External,
+            "unresolved" => AgentResolutionStatus::Unresolved,
+            _ => return Err(ContractBuildError::AgentDtoValue),
+        };
+        let precision = match edge.precision.as_str() {
+            "exact" => AgentPrecision::Exact,
+            "overapprox" => AgentPrecision::Overapprox,
+            "heuristic" => AgentPrecision::Heuristic,
+            "observed" => AgentPrecision::Observed,
+            _ => return Err(ContractBuildError::AgentDtoValue),
+        };
+        Self::new(
+            parse_agent_value(&edge.id)?,
+            parse_agent_value(&edge.source)?,
+            parse_agent_value(&edge.target)?,
+            parse_agent_value(&edge.kind)?,
+            phase,
+            resolution_status,
+            precision,
+            parse_agent_value(&edge.profile_id)?,
+            parse_optional_agent_value(edge.site_id.as_deref())?,
+            AgentLabel::parse(&source.condition_text).ok(),
+            evidence,
+        )
+    }
+}
+
+impl TryFrom<&depgraph_core::query::TraversalPageItem> for AgentPathStep {
+    type Error = ContractBuildError;
+
+    fn try_from(source: &depgraph_core::query::TraversalPageItem) -> Result<Self, Self::Error> {
+        Self::new(
+            agent_node_from_fields(
+                &source.source.id,
+                &source.source.kind,
+                &source.source.locator,
+                &source.source.display_name,
+                &source.source.properties,
+            )?,
+            AgentEdge::try_from(&source.step)?,
+            agent_node_from_fields(
+                &source.target.id,
+                &source.target.kind,
+                &source.target.locator,
+                &source.target.display_name,
+                &source.target.properties,
+            )?,
+        )
+    }
+}
+
+impl TryFrom<&depgraph_core::service::DependenciesResult> for AgentNode {
+    type Error = ContractBuildError;
+
+    fn try_from(source: &depgraph_core::service::DependenciesResult) -> Result<Self, Self::Error> {
+        let root = &source.traversal().root;
+        agent_node_from_fields(
+            &root.id,
+            &root.kind,
+            &root.locator,
+            &root.display_name,
+            &root.properties,
+        )
+    }
+}
+
+impl TryFrom<&depgraph_core::service::ExplainPathResult> for AgentPathResponse {
+    type Error = ContractBuildError;
+
+    fn try_from(source: &depgraph_core::service::ExplainPathResult) -> Result<Self, Self::Error> {
+        let path = source.path();
+        let from = agent_node_from_fields(
+            &path.from.id,
+            &path.from.kind,
+            &path.from.locator,
+            &path.from.display_name,
+            &path.from.properties,
+        )?;
+        let to = agent_node_from_fields(
+            &path.to.id,
+            &path.to.kind,
+            &path.to.locator,
+            &path.to.display_name,
+            &path.to.properties,
+        )?;
+        let steps = source
+            .items()
+            .iter()
+            .map(AgentPathStep::try_from)
+            .collect::<Result<Vec<_>, _>>()?;
+        Self::new(from, to, path.path_found, source.traversed_edges(), steps)
+    }
+}
+
+fn agent_node_from_fields(
+    id: &str,
+    kind: &str,
+    locator: &str,
+    display_name: &str,
+    properties: &serde_json::Value,
+) -> Result<AgentNode, ContractBuildError> {
+    let id = AgentId::parse(id).map_err(|_| ContractBuildError::AgentDtoValue)?;
+    let locator = AgentLocator::parse(locator)
+        .or_else(|_| AgentLocator::parse(format!("id:{}", id.as_str())))
+        .map_err(|_| ContractBuildError::AgentDtoValue)?;
+    let repository_path = ["path", "source_path"]
+        .into_iter()
+        .filter_map(|key| properties.get(key).and_then(serde_json::Value::as_str))
+        .find_map(|path| RepositoryRelativePath::parse(path).ok());
+    Ok(AgentNode::new(
+        id,
+        parse_agent_value(kind)?,
+        locator,
+        AgentLabel::parse(display_name).ok(),
+        repository_path,
+    ))
+}
+
+fn safe_source_span(
+    path: &str,
+    start_line: u64,
+    start_column: u64,
+    end_line: u64,
+    end_column: u64,
+) -> Option<AgentSourceSpan> {
+    let path = RepositoryRelativePath::parse(path).ok()?;
+    let start = AgentSourcePosition::new(
+        NonZeroU32::new(u32::try_from(start_line).ok()?)?,
+        NonZeroU32::new(u32::try_from(start_column).ok()?)?,
+    );
+    let end = AgentSourcePosition::new(
+        NonZeroU32::new(u32::try_from(end_line).ok()?)?,
+        NonZeroU32::new(u32::try_from(end_column).ok()?)?,
+    );
+    AgentSourceSpan::new(path, start, end).ok()
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]

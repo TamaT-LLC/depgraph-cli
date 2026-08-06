@@ -22,11 +22,12 @@ pub use contract::{
     SuccessEnvelope,
 };
 pub use dto::{
-    AgentCompletedSnapshot, AgentContext, AgentCoverage, AgentCurrentSnapshot, AgentEdge,
-    AgentEvidence, AgentEvidenceKind, AgentNamedSnapshot, AgentNode, AgentNodeSummary, AgentPhase,
-    AgentPrecision, AgentResolutionStatus, AgentSite, AgentSnapshot, AgentSnapshotAvailability,
-    AgentSourcePosition, AgentSourceSpan, MAX_AGENT_EVIDENCE_ITEMS,
-    MAX_AGENT_SNAPSHOT_METADATA_ITEMS, MAX_AGENT_TARGET_ITEMS,
+    AgentCompletedSnapshot, AgentContext, AgentCoverage, AgentCurrentSnapshot,
+    AgentDependenciesResponse, AgentDependencyDirection, AgentEdge, AgentEvidence,
+    AgentEvidenceKind, AgentNamedSnapshot, AgentNode, AgentNodeSummary, AgentPathResponse,
+    AgentPathStep, AgentPhase, AgentPrecision, AgentResolutionStatus, AgentSite, AgentSnapshot,
+    AgentSnapshotAvailability, AgentSourcePosition, AgentSourceSpan, MAX_AGENT_EVIDENCE_ITEMS,
+    MAX_AGENT_PATH_STEPS, MAX_AGENT_SNAPSHOT_METADATA_ITEMS, MAX_AGENT_TARGET_ITEMS,
 };
 pub use lifecycle::{
     AgentDaemonAttempt, AgentDaemonChange, AgentDaemonChangeKind, AgentDaemonPhase,

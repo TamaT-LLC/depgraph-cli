@@ -106,6 +106,72 @@ fn every_cli_leaf_action_has_a_catalog_mapping() {
 }
 
 #[test]
+fn graph_dependency_and_path_tools_advertise_their_exact_closed_contracts() {
+    let catalog = ToolCatalog::for_capabilities(&DepgraphCapabilitySet::read_only()).unwrap();
+    for name in ["graph_dependencies_list", "graph_dependents_list"] {
+        let tool = catalog.tool(name).expect("dependency tool");
+        let mut fields = tool.input_schema()["properties"]
+            .as_object()
+            .expect("input properties")
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        fields.sort_unstable();
+        assert_eq!(
+            fields,
+            [
+                "contract_version",
+                "cursor",
+                "environments",
+                "limit",
+                "max_traversal",
+                "phases",
+                "profiles",
+                "repository_id",
+                "selector",
+                "sessions",
+                "snapshot",
+                "transitive",
+            ]
+        );
+        assert_eq!(tool.operation_behavior(), OperationBehavior::Immediate);
+        assert_eq!(
+            tool.output_schema()["properties"]["result"]["$ref"],
+            "#/$defs/AgentDependenciesResponse"
+        );
+    }
+
+    let path = catalog.tool("graph_path_get").expect("path tool");
+    let mut fields = path.input_schema()["properties"]
+        .as_object()
+        .expect("input properties")
+        .keys()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    fields.sort_unstable();
+    assert_eq!(
+        fields,
+        [
+            "contract_version",
+            "environments",
+            "from",
+            "max_traversal",
+            "phases",
+            "profiles",
+            "repository_id",
+            "sessions",
+            "snapshot",
+            "to",
+        ]
+    );
+    assert_eq!(path.operation_behavior(), OperationBehavior::Immediate);
+    assert_eq!(
+        path.output_schema()["properties"]["result"]["$ref"],
+        "#/$defs/AgentPathResponse"
+    );
+}
+
+#[test]
 fn profiles_include_dependencies_and_default_excludes_privileged_tools() {
     assert_eq!(
         CapabilityProfile::Read.required_capabilities(),

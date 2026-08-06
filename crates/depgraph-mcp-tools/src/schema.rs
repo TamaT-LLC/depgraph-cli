@@ -6,9 +6,10 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     AgentCompletedSnapshot, AgentContext, AgentCoverage, AgentCurrentSnapshot, AgentDaemonStatus,
-    AgentDoctor, AgentEdge, AgentEvidence, AgentNamedSnapshot, AgentNode, AgentNodeSummary,
-    AgentProfilePlan, AgentSite, AgentSnapshot, CommonRequest, DurableSubmitResult, ErrorEnvelope,
-    OperationAccepted, Page, PageRequest, SnapshotSelector, SuccessEnvelope, TaskAccepted,
+    AgentDependenciesResponse, AgentDoctor, AgentEdge, AgentEvidence, AgentNamedSnapshot,
+    AgentNode, AgentNodeSummary, AgentPathResponse, AgentPathStep, AgentProfilePlan, AgentSite,
+    AgentSnapshot, CommonRequest, DurableSubmitResult, ErrorEnvelope, OperationAccepted, Page,
+    PageRequest, SnapshotSelector, SuccessEnvelope, TaskAccepted,
 };
 
 pub const MCP_TOOLS_SCHEMA_ID: &str =
@@ -43,6 +44,8 @@ impl JsonSchema for McpToolsV1Schema {
             generator.subschema_for::<SuccessEnvelope<AgentProfilePlan>>(),
             generator.subschema_for::<SuccessEnvelope<AgentDaemonStatus>>(),
             generator.subschema_for::<SuccessEnvelope<AgentDoctor>>(),
+            generator.subschema_for::<SuccessEnvelope<AgentDependenciesResponse>>(),
+            generator.subschema_for::<SuccessEnvelope<AgentPathResponse>>(),
             generator.subschema_for::<SuccessEnvelope<Page<AgentNode>>>(),
             generator.subschema_for::<SuccessEnvelope<Page<AgentNodeSummary>>>(),
             generator.subschema_for::<SuccessEnvelope<Page<AgentNamedSnapshot>>>(),
@@ -60,6 +63,9 @@ impl JsonSchema for McpToolsV1Schema {
             generator.subschema_for::<AgentSite>(),
             generator.subschema_for::<AgentEdge>(),
             generator.subschema_for::<AgentEvidence>(),
+            generator.subschema_for::<AgentPathStep>(),
+            generator.subschema_for::<AgentDependenciesResponse>(),
+            generator.subschema_for::<AgentPathResponse>(),
             generator.subschema_for::<AgentSnapshot>(),
         ];
         json_schema!({

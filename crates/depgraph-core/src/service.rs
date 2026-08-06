@@ -12,6 +12,10 @@ pub use crate::service_agent::{
     CurrentSnapshotAvailability, DepgraphContext, FindNodesPageResult, FindNodesResult,
     MAX_FIND_NODES_QUERY_BYTES, NamedCompletedSnapshot, NodeMatchMode, NodeProjection,
 };
+pub use crate::service_graph::{
+    DependenciesRequest, DependenciesResult, DependencyDirection, ExplainPathRequest,
+    ExplainPathResult,
+};
 pub use crate::service_lifecycle::{DoctorRequest, DoctorResponse, ProfilePlanRequest};
 pub use crate::service_repository::{
     MAX_REPOSITORY_PATH_BYTES, MAX_REPOSITORY_PATH_COMPONENT_BYTES, MAX_REPOSITORY_PATH_COMPONENTS,
@@ -602,6 +606,11 @@ pub enum DepgraphServiceError {
         #[source]
         source: anyhow::Error,
     },
+    #[error("graph query is invalid: {source}")]
+    GraphQuery {
+        #[source]
+        source: anyhow::Error,
+    },
     #[error("requested service resource was not found")]
     NotFound,
     #[error("request conflicts with the current service state")]
@@ -637,9 +646,10 @@ impl DepgraphServiceError {
         match self {
             Self::InvalidConfiguration { .. } => DepgraphServiceErrorCategory::Configuration,
             Self::CapabilityDenied { .. } => DepgraphServiceErrorCategory::Authorization,
-            Self::InvalidRepositoryPath { .. } | Self::InvalidInput | Self::ProfilePlan { .. } => {
-                DepgraphServiceErrorCategory::Input
-            }
+            Self::InvalidRepositoryPath { .. }
+            | Self::InvalidInput
+            | Self::ProfilePlan { .. }
+            | Self::GraphQuery { .. } => DepgraphServiceErrorCategory::Input,
             Self::RepositoryFile { reason } => reason.category(),
             Self::NotFound => DepgraphServiceErrorCategory::NotFound,
             Self::Conflict => DepgraphServiceErrorCategory::Conflict,
@@ -665,6 +675,10 @@ impl DepgraphServiceError {
 
     pub fn profile_plan_security(source: anyhow::Error) -> Self {
         Self::ProfilePlanSecurity { source }
+    }
+
+    pub fn graph_query(source: anyhow::Error) -> Self {
+        Self::GraphQuery { source }
     }
 }
 
