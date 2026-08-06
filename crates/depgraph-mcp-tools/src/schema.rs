@@ -5,10 +5,10 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::{
-    AgentCompletedSnapshot, AgentContext, AgentCoverage, AgentCurrentSnapshot, AgentEdge,
-    AgentEvidence, AgentNamedSnapshot, AgentNode, AgentNodeSummary, AgentSite, AgentSnapshot,
-    CommonRequest, DurableSubmitResult, ErrorEnvelope, OperationAccepted, Page, PageRequest,
-    SnapshotSelector, SuccessEnvelope, TaskAccepted,
+    AgentCompletedSnapshot, AgentContext, AgentCoverage, AgentCurrentSnapshot, AgentDaemonStatus,
+    AgentDoctor, AgentEdge, AgentEvidence, AgentNamedSnapshot, AgentNode, AgentNodeSummary,
+    AgentProfilePlan, AgentSite, AgentSnapshot, CommonRequest, DurableSubmitResult, ErrorEnvelope,
+    OperationAccepted, Page, PageRequest, SnapshotSelector, SuccessEnvelope, TaskAccepted,
 };
 
 pub const MCP_TOOLS_SCHEMA_ID: &str =
@@ -40,6 +40,9 @@ impl JsonSchema for McpToolsV1Schema {
             generator.subschema_for::<SuccessEnvelope<AgentNode>>(),
             generator.subschema_for::<SuccessEnvelope<AgentContext>>(),
             generator.subschema_for::<SuccessEnvelope<AgentCompletedSnapshot>>(),
+            generator.subschema_for::<SuccessEnvelope<AgentProfilePlan>>(),
+            generator.subschema_for::<SuccessEnvelope<AgentDaemonStatus>>(),
+            generator.subschema_for::<SuccessEnvelope<AgentDoctor>>(),
             generator.subschema_for::<SuccessEnvelope<Page<AgentNode>>>(),
             generator.subschema_for::<SuccessEnvelope<Page<AgentNodeSummary>>>(),
             generator.subschema_for::<SuccessEnvelope<Page<AgentNamedSnapshot>>>(),

@@ -9,7 +9,8 @@ use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use depgraph_core::service::{
     CompletedSnapshotView, DepgraphCapabilitySet, DepgraphService, DepgraphServiceConfig,
-    DepgraphServiceError, DepgraphServiceLimits, SnapshotLocator,
+    DepgraphServiceError, DepgraphServiceLimits, DoctorRequest, ProfilePlanRequest,
+    RepositoryRelativePath, SnapshotLocator,
 };
 use depgraph_core::{
     BoundedQueryExecutionError, BoundedQueryPlan, BoundedQueryResult, BuildAudit, BuildOutcomeKind,
@@ -19,27 +20,24 @@ use depgraph_core::{
     InteractiveQueryPageRequest, PolicyAnnotation, PolicyResult, QueryDiagnostic,
     QueryFailureClass, RepositoryProfilePlanPreview, ScanCacheMode, TraversalPageItem,
     TypedProjection, UnresolvedResult, acquire_store_writer_lock, build_cache_key,
-    compiler_pack_availability, compiler_precise_cache_hit_audit, compiler_precise_cache_key,
-    compiler_precise_graph_ndjson, create_build_execution_request,
-    create_compiler_precise_invocation_request, create_compiler_precise_unit_graph_request,
-    cycles_from_topology, default_store_path, doctor, doctor_for_root, doctor_summary,
-    doctor_summary_for_root, evaluate_policy_diff, execute_bounded_query,
-    execute_build_request_with_cancellation, export_filtered, export_graphml_filtered_to_writer,
-    impact, impact_query_cache_key, init_config, match_runtime_trace, open_store,
-    open_store_read_only, paginate_interactive_query, parse_and_type_check_bounded_query,
-    plan_bounded_query, plan_explicit_profile_selection, plan_repository_profiles,
-    policy_annotations, prepare_build_cache_input, prepare_compiler_precise_cache_input,
+    compiler_precise_cache_hit_audit, compiler_precise_cache_key, compiler_precise_graph_ndjson,
+    create_build_execution_request, create_compiler_precise_invocation_request,
+    create_compiler_precise_unit_graph_request, cycles_from_topology, default_store_path,
+    evaluate_policy_diff, execute_bounded_query, execute_build_request_with_cancellation,
+    export_filtered, export_graphml_filtered_to_writer, impact, impact_query_cache_key,
+    init_config, match_runtime_trace, open_store, open_store_read_only, paginate_interactive_query,
+    parse_and_type_check_bounded_query, plan_bounded_query, policy_annotations,
+    prepare_build_cache_input, prepare_compiler_precise_cache_input,
     profile_selection_human_summary, read_bounded_query_file, read_compiler_pack_requirement,
-    read_explicit_profile_selection_file, read_git_changed_set, read_runtime_trace,
-    render_condition, render_github_annotations, run_scan_with_cache_mode, runtime_session_delta,
-    rust_build_protocol_ndjson, snapshot_profile_plan_id, stage_build_evidence,
-    start_repository_daemon, traversal_page_items, traversal_summary, traverse_bounded_filtered,
-    traverse_filtered, unresolved, unresolved_summary, validate_build_cache_input,
-    validate_build_cache_source, validate_compiler_precise_cache_input,
-    validate_compiler_precise_cached_evidence, validate_explicit_profile_selection_capabilities,
+    read_git_changed_set, read_runtime_trace, render_condition, render_github_annotations,
+    run_scan_with_cache_mode, runtime_session_delta, rust_build_protocol_ndjson,
+    snapshot_profile_plan_id, stage_build_evidence, start_repository_daemon, traversal_page_items,
+    traversal_summary, traverse_bounded_filtered, traverse_filtered, unresolved,
+    unresolved_summary, validate_build_cache_input, validate_build_cache_source,
+    validate_compiler_precise_cache_input, validate_compiler_precise_cached_evidence,
     validate_interactive_query_bounds, web_build_protocol_ndjson, why_filtered,
 };
-use depgraph_mcp_tools::CliAction;
+use depgraph_mcp_tools::{AgentDaemonStatus, AgentDoctor, CliAction};
 use depgraph_protocol::canonical_json;
 use depgraph_store::{CompletedSnapshotDetails, CoverageRecord};
 use serde::Serialize;
@@ -580,11 +578,20 @@ async fn main() -> ExitCode {
 }
 
 fn error_exit_code(error: &anyhow::Error) -> u8 {
-    if matches!(
-        error.downcast_ref::<DepgraphServiceError>(),
-        Some(DepgraphServiceError::InvalidInput | DepgraphServiceError::NotFound)
-    ) {
-        return 2;
+    if let Some(service_error) = error.downcast_ref::<DepgraphServiceError>() {
+        if matches!(
+            service_error,
+            DepgraphServiceError::ProfilePlanSecurity { .. }
+        ) {
+            return 4;
+        }
+        if matches!(
+            service_error.category(),
+            depgraph_core::service::DepgraphServiceErrorCategory::Input
+                | depgraph_core::service::DepgraphServiceErrorCategory::NotFound
+        ) {
+            return 2;
+        }
     }
     if let Some(diagnostic) = error.downcast_ref::<QueryDiagnostic>() {
         return if diagnostic.class == QueryFailureClass::Security {
@@ -742,13 +749,19 @@ async fn run(cli: Cli) -> Result<u8> {
                 let requested_root =
                     std::path::absolute(&path).context("profile planning root is unavailable")?;
                 let root = canonical_directory(path)?;
-                let config = Config::load(&root)?;
-                let mut preview = plan_repository_profiles(&root, &config, profile_budget)?;
-                if let Some(path) = profiles_file {
-                    let explicit = read_explicit_profile_selection_file(&requested_root, &path)?;
-                    validate_explicit_profile_selection_capabilities(&preview.plan, &explicit)?;
-                    preview.plan = plan_explicit_profile_selection(preview.plan.input, explicit)?;
-                }
+                let store_path = store_path(cli.store, &root)?;
+                let service = snapshot_read_service(&root, &store_path)?;
+                let profiles_file = profiles_file
+                    .map(|path| normalize_cli_repository_file(&requested_root, &root, &path))
+                    .transpose()?;
+                let preview = service.profile_plan_cancellable(
+                    &ProfilePlanRequest {
+                        profile_budget,
+                        profiles_document: None,
+                        profiles_file,
+                    },
+                    &CancellationToken::new(),
+                )?;
                 print_profile_plan(&preview, json)?;
                 Ok(0)
             }
@@ -795,7 +808,7 @@ async fn run(cli: Cli) -> Result<u8> {
                 write_daemon_status(&status_path, &stopped)?;
                 remove_control_file(&stop_path)?;
                 if json {
-                    println!("{}", serde_json::to_string_pretty(&stopped)?);
+                    print_daemon_status(&stopped, true)?;
                 } else {
                     println!("daemon: stopped");
                 }
@@ -804,7 +817,8 @@ async fn run(cli: Cli) -> Result<u8> {
             DaemonCommands::Status { path, json } => {
                 let root = canonical_directory(path)?;
                 let store_path = store_path(cli.store, &root)?;
-                let status = read_daemon_status(&daemon_status_path(&store_path))?;
+                let service = snapshot_read_service(&root, &store_path)?;
+                let status = service.daemon_status_cancellable(&CancellationToken::new())?;
                 print_daemon_status(&status, json)?;
                 Ok(0)
             }
@@ -1479,234 +1493,21 @@ async fn run(cli: Cli) -> Result<u8> {
                 cli.store,
                 diagnostic_root.as_deref().unwrap_or(&invocation_root),
             )?;
-            let store = open_store(&store_path)?;
-            if !details {
-                let mut report = if let Some(root) = &diagnostic_root {
-                    doctor_summary_for_root(&store, root).await?
-                } else {
-                    doctor_summary(&store).await?
-                };
-                report.compiler_pack =
-                    compiler_pack_availability(compiler_pack_requirement.as_deref());
-                if json {
-                    println!("{}", serde_json::to_string_pretty(&report)?);
-                } else {
-                    print_doctor_summary_human(&report);
-                }
-                return Ok(0);
-            }
-            let mut report = if let Some(root) = &diagnostic_root {
-                doctor_for_root(&store, root).await?
-            } else {
-                doctor(&store).await?
-            };
-            report.compiler_pack = compiler_pack_availability(compiler_pack_requirement.as_deref());
+            let service_root = diagnostic_root.as_deref().unwrap_or(&invocation_root);
+            let service = snapshot_read_service(service_root, &store_path)?;
+            let result = service.doctor_cancellable(
+                &DoctorRequest {
+                    details,
+                    use_service_root: diagnostic_root.is_some(),
+                    compiler_pack_requirement,
+                },
+                &CancellationToken::new(),
+            )?;
+            let result = AgentDoctor::from(result);
             if json {
-                println!("{}", serde_json::to_string_pretty(&report)?);
+                println!("{}", serde_json::to_string_pretty(&result)?);
             } else {
-                println!(
-                    "diagnostic root: {} ({})",
-                    report.diagnostic_root.path, report.diagnostic_root.source
-                );
-                println!("protocol: {}", report.protocol_version);
-                println!("graph schema: {}", report.graph_schema_version);
-                println!("store schema: {}", report.store_schema_version);
-                println!("cache contract: {}", report.cache_contract_version);
-                println!(
-                    "cache entries: {} syntax, {} semantic, {} build, {} compiler-precise",
-                    report.cache_entries.syntax,
-                    report.cache_entries.semantic,
-                    report.cache_entries.build,
-                    report.cache_entries.compiler_precise,
-                );
-                print_compiler_pack_health_human(&report.compiler_pack);
-                println!(
-                    "impact query cache: contract {}, {} entries",
-                    report.impact_query_cache_contract_version, report.impact_query_cache_entries
-                );
-                if let Some(release) = &report.release {
-                    println!(
-                        "release: {} ({}, schema {}; core {}; schema {})",
-                        release.version,
-                        release.target,
-                        release.schema_version,
-                        release.core_integrity,
-                        release.schema_integrity
-                    );
-                    for (artifact, integrity) in &release.runtime_integrity {
-                        println!("runtime artifact {artifact}: {integrity}");
-                    }
-                    for (adapter, requirement) in &release.runtime_requirements {
-                        println!("runtime requirement {adapter}: {requirement}");
-                    }
-                }
-                for (toolchain, version) in report.toolchains {
-                    let baseline = report
-                        .supported_baselines
-                        .get(&toolchain)
-                        .map(String::as_str)
-                        .unwrap_or("best-effort");
-                    println!("toolchain {toolchain}: {version} (baseline {baseline})");
-                    if let Some(remediation) = report.toolchain_remediation.get(&toolchain) {
-                        println!("toolchain {toolchain} remediation: {remediation}");
-                    }
-                }
-                for worker in report.workers {
-                    if worker.available {
-                        println!(
-                            "worker {} artifact: available ({}, {}; protocol={}; {})",
-                            worker.adapter,
-                            worker.command.unwrap_or_default(),
-                            worker
-                                .version
-                                .unwrap_or_else(|| "unknown version".to_owned()),
-                            worker.protocol.as_deref().unwrap_or("unknown"),
-                            worker.integrity
-                        );
-                    } else {
-                        println!(
-                            "worker {} artifact: unavailable ({})",
-                            worker.adapter,
-                            worker.error.unwrap_or_default()
-                        );
-                    }
-                    if worker.root_launch_allowed {
-                        println!("worker {} root launch: allowed", worker.adapter);
-                    } else {
-                        println!(
-                            "worker {} root launch: blocked ({})",
-                            worker.adapter,
-                            worker.root_launch_error.unwrap_or_default()
-                        );
-                    }
-                }
-                if let Some(scan) = report.latest_attempt {
-                    println!("latest attempt: {} ({})", scan.scan_id, scan.status);
-                    if let Some(compiler) = &scan.compiler_precise {
-                        println!(
-                            "compiler precise: {} (phase={}, precision={}, {} profiles)",
-                            compiler.status,
-                            compiler.phase,
-                            compiler.precision,
-                            compiler.profiles.len()
-                        );
-                        for profile in &compiler.profiles {
-                            println!(
-                                "compiler precise profile {}: target={}, {} units, {} MIR bodies, {} instances, {} calls",
-                                profile.profile_id,
-                                profile.target.as_deref().unwrap_or("unspecified"),
-                                profile.cargo_units,
-                                profile.typed_mir_bodies,
-                                profile.compiler_instances,
-                                profile.compiler_calls,
-                            );
-                        }
-                    }
-                    println!(
-                        "coverage: {} sites ({} resolved, {} candidates, {} external, {} unresolved), {} skipped, {} unsupported",
-                        scan.coverage.dependency_sites,
-                        scan.coverage.resolved,
-                        scan.coverage.candidates,
-                        scan.coverage.external,
-                        scan.coverage.unresolved,
-                        scan.coverage.files_skipped,
-                        scan.coverage.unsupported_syntax
-                    );
-                    println!(
-                        "profile matrix: {} effective profiles ({} matched, {} additional, {} conflicts, {} unobserved)",
-                        scan.profile_matrix.entries.len(),
-                        scan.profile_matrix
-                            .difference_counts
-                            .get("matched")
-                            .copied()
-                            .unwrap_or(0),
-                        scan.profile_matrix
-                            .difference_counts
-                            .get("additional")
-                            .copied()
-                            .unwrap_or(0),
-                        scan.profile_matrix
-                            .difference_counts
-                            .get("conflict")
-                            .copied()
-                            .unwrap_or(0),
-                        scan.profile_matrix
-                            .difference_counts
-                            .get("unobserved")
-                            .copied()
-                            .unwrap_or(0),
-                    );
-                    for (phase, coverage) in &scan.profile_matrix.phase_coverage {
-                        println!(
-                            "phase {phase}: {} profiles, {} sites, {} edges, {} evidence ({} resolved, {} candidates, {} external, {} unresolved)",
-                            coverage.profile_ids.len(),
-                            coverage.sites,
-                            coverage.edges,
-                            coverage.evidence,
-                            coverage.resolved,
-                            coverage.candidates,
-                            coverage.external,
-                            coverage.unresolved,
-                        );
-                    }
-                    for profile in scan.profiles {
-                        let profile_coverage = profile
-                            .coverage
-                            .as_ref()
-                            .map(|coverage| {
-                                format!(
-                                    "{} sites/{} skipped/{} unsupported",
-                                    coverage.dependency_sites,
-                                    coverage.files_skipped,
-                                    coverage.unsupported_syntax
-                                )
-                            })
-                            .unwrap_or_else(|| "unavailable".to_owned());
-                        println!(
-                            "profile {}: {} target={} features={} coverage={}",
-                            profile.id,
-                            profile.language,
-                            profile.target.unwrap_or_else(|| "unspecified".to_owned()),
-                            if profile.features.is_empty() {
-                                "none".to_owned()
-                            } else {
-                                profile.features.join(",")
-                            },
-                            profile_coverage
-                        );
-                    }
-                    for (package, version) in scan.detected_packages {
-                        println!("package {package}: {version}");
-                    }
-                    for log in scan.adapter_logs.iter().filter(|log| log.truncated) {
-                        println!("worker {} stderr: truncated", log.adapter);
-                    }
-                    for event in scan.cache_events {
-                        println!(
-                            "cache {}: {} ({})",
-                            event.layer.as_str(),
-                            event.outcome,
-                            event.reason
-                        );
-                    }
-                    println!("project code executed: {}", scan.project_code_executed);
-                } else {
-                    println!("latest attempt: none");
-                }
-                for event in report.recent_cache_events {
-                    if matches!(
-                        event.layer,
-                        depgraph_store::CacheLayer::Build
-                            | depgraph_store::CacheLayer::CompilerPrecise
-                    ) {
-                        println!(
-                            "recent cache {}: {} ({})",
-                            event.layer.as_str(),
-                            event.outcome,
-                            event.reason
-                        );
-                    }
-                }
+                print_agent_doctor_human(&serde_json::to_value(result)?, details);
             }
             Ok(0)
         }
@@ -2400,6 +2201,41 @@ fn canonical_directory(path: PathBuf) -> Result<PathBuf> {
     Ok(path)
 }
 
+fn normalize_cli_repository_file(
+    requested_root: &Path,
+    canonical_root: &Path,
+    supplied: &Path,
+) -> std::result::Result<RepositoryRelativePath, DepgraphServiceError> {
+    let candidate = if supplied.is_absolute() {
+        supplied.to_path_buf()
+    } else {
+        requested_root.join(supplied)
+    };
+    let relative = candidate
+        .strip_prefix(requested_root)
+        .or_else(|_| candidate.strip_prefix(canonical_root))
+        .map_err(|_| unsafe_profiles_file("path is outside repository"))?;
+    let mut normalized = Vec::new();
+    for component in relative.components() {
+        let std::path::Component::Normal(component) = component else {
+            return Err(unsafe_profiles_file("path is not repository-relative"));
+        };
+        normalized.push(
+            component
+                .to_str()
+                .ok_or_else(|| unsafe_profiles_file("path is not valid UTF-8"))?,
+        );
+    }
+    RepositoryRelativePath::parse(normalized.join("/"))
+        .map_err(|_| unsafe_profiles_file("path is not repository-relative"))
+}
+
+fn unsafe_profiles_file(reason: &'static str) -> DepgraphServiceError {
+    DepgraphServiceError::profile_plan_security(anyhow::anyhow!(
+        "unsafe explicit profiles file: {reason}"
+    ))
+}
+
 fn store_path(explicit: Option<PathBuf>, root: &std::path::Path) -> Result<PathBuf> {
     explicit.map(Ok).unwrap_or_else(|| default_store_path(root))
 }
@@ -2590,26 +2426,45 @@ async fn wait_for_daemon_stop(path: &Path, store_path: &Path) -> Result<DaemonSt
 }
 
 fn print_daemon_status(status: &DaemonStatus, json: bool) -> Result<()> {
+    let status = AgentDaemonStatus::try_from(status.clone())
+        .map_err(|_| anyhow::anyhow!("daemon status violates the public contract"))?;
     if json {
-        println!("{}", serde_json::to_string_pretty(status)?);
+        println!("{}", serde_json::to_string_pretty(&status)?);
     } else {
-        println!("daemon: {:?}", status.phase);
-        println!("root: {}", status.root);
-        println!("pending changes: {}", status.pending_change_count);
-        if let Some(attempt) = &status.last_completed_attempt {
-            println!("last completed: {}", attempt.attempt_id);
-        }
-        if let Some(attempt) = &status.last_failed_attempt {
-            println!("last failed: {}", attempt.attempt_id);
-        }
-        if let Some(attempt) = &status.last_cancelled_attempt {
-            println!("last cancelled: {}", attempt.attempt_id);
-        }
-        if let Some(error) = &status.last_watcher_error {
-            println!("watcher error: {error}");
+        let status = serde_json::to_value(status)?;
+        println!("daemon: {}", status["phase"].as_str().unwrap_or("unknown"));
+        println!(
+            "pending changes: {}",
+            status["pending_change_count"].as_u64().unwrap_or(0)
+        );
+        for (label, field) in [
+            ("last completed", "last_completed_attempt"),
+            ("last failed", "last_failed_attempt"),
+            ("last cancelled", "last_cancelled_attempt"),
+        ] {
+            if let Some(attempt_id) = status[field]["attempt_id"].as_str() {
+                println!("{label}: {attempt_id}");
+            }
         }
     }
     Ok(())
+}
+
+fn print_agent_doctor_human(report: &serde_json::Value, details: bool) {
+    let kind = report["report_kind"].as_str().unwrap_or("doctor");
+    println!("doctor report: {kind}");
+    if let Some(protocol) = report["protocol_version"].as_str() {
+        println!("protocol: {protocol}");
+    }
+    if let Some(latest) = report["latest_attempt"].as_object() {
+        let status = latest["status"].as_str().unwrap_or("unknown");
+        println!("latest attempt: {status}");
+    } else {
+        println!("latest attempt: none");
+    }
+    if details {
+        println!("details: redacted agent-safe projection");
+    }
 }
 
 fn load_snapshot(
@@ -2858,6 +2713,7 @@ fn query_projection_label(projection: &TypedProjection) -> String {
     }
 }
 
+#[allow(dead_code)]
 fn print_compiler_pack_health_human(report: &depgraph_core::CompilerPackAvailabilityHealth) {
     println!(
         "compiler pack: {} (host={}; policy={})",
@@ -2869,6 +2725,7 @@ fn print_compiler_pack_health_human(report: &depgraph_core::CompilerPackAvailabi
     println!("compiler pack action: {}", report.remediation);
 }
 
+#[allow(dead_code)]
 fn print_doctor_summary_human(report: &depgraph_core::DoctorSummaryReport) {
     println!("doctor report: {}", report.report_kind);
     println!(
@@ -3262,9 +3119,10 @@ fn print_completed_snapshot_view(snapshot: &CompletedSnapshotView) {
 }
 
 fn snapshot_read_service(root: &Path, store_path: &Path) -> Result<DepgraphService> {
+    let store_path = std::path::absolute(store_path).context("store path is unavailable")?;
     let config = DepgraphServiceConfig::new(
         root,
-        store_path,
+        &store_path,
         DepgraphCapabilitySet::read_only(),
         DepgraphServiceLimits::default(),
     )?;

@@ -6,9 +6,10 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    AgentCompletedSnapshot, AgentContext, AgentId, AgentLocator, AgentNamedSnapshot,
-    AgentNodeSummary, Cursor, LogicalRepositoryId, MCP_TOOLS_CONTRACT_VERSION, OperationId, Page,
-    SnapshotId, SnapshotName, SuccessEnvelope,
+    AgentCompletedSnapshot, AgentContext, AgentDaemonStatus, AgentDoctor, AgentId, AgentLocator,
+    AgentNamedSnapshot, AgentNodeSummary, AgentProfilePlan, Cursor, LogicalRepositoryId,
+    MCP_TOOLS_CONTRACT_VERSION, OperationId, Page, RepositoryRelativePath, SnapshotId,
+    SnapshotName, SuccessEnvelope,
 };
 
 macro_rules! define_cli_actions {
@@ -376,7 +377,7 @@ const TOOL_SPECS: &[ToolSpec] = &[
     tool_spec!(
         "profile_plan_get",
         "Plan repository analysis profiles without mutating the store.",
-        ["profile_budget", "profiles"],
+        ["profile_budget", "profiles_document", "profiles_file"],
         [CliAction::ProfilesPlan],
         READ,
         ToolAuthorization::FixedCapabilities,
@@ -634,14 +635,28 @@ fn input_schema(spec: &ToolSpec) -> Map<String, Value> {
     }
     let mut required = vec!["contract_version", "repository_id"];
     required.extend_from_slice(required_input_fields(spec.name));
-    json_object(json!({
+    let mut schema = json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "title": format!("{}_input", spec.name),
         "type": "object",
         "properties": properties,
         "required": required,
         "additionalProperties": false
-    }))
+    });
+    if spec.name == "profile_plan_get" {
+        schema
+            .as_object_mut()
+            .expect("input schema is an object")
+            .insert(
+                "allOf".to_owned(),
+                json!([
+                    {"not": {"required": ["profile_budget", "profiles_document"]}},
+                    {"not": {"required": ["profile_budget", "profiles_file"]}},
+                    {"not": {"required": ["profiles_document", "profiles_file"]}}
+                ]),
+            );
+    }
+    json_object(schema)
 }
 
 fn output_schema(spec: &ToolSpec) -> Map<String, Value> {
@@ -657,6 +672,15 @@ fn output_schema(spec: &ToolSpec) -> Map<String, Value> {
         }
         "snapshot_get" => {
             return exact_success_output_schema::<AgentCompletedSnapshot>(spec.name);
+        }
+        "profile_plan_get" => {
+            return exact_success_output_schema::<AgentProfilePlan>(spec.name);
+        }
+        "daemon_get" => {
+            return exact_success_output_schema::<AgentDaemonStatus>(spec.name);
+        }
+        "doctor_get" => {
+            return exact_success_output_schema::<AgentDoctor>(spec.name);
         }
         _ => {}
     }
@@ -784,8 +808,17 @@ fn field_schema(field: &str) -> Value {
         "strict" | "no_cache" | "force" | "details" | "rust_compiler_precise" => {
             json!({"type": "boolean"})
         }
-        "depth" | "limit" | "max_depth" | "max_paths" | "max_nodes" | "max_edges"
-        | "profile_budget" => json!({"type": "integer", "minimum": 1}),
+        "profile_budget" => json!({"type": "integer", "minimum": 1, "maximum": 32}),
+        "depth" | "limit" | "max_depth" | "max_paths" | "max_nodes" | "max_edges" => {
+            json!({"type": "integer", "minimum": 1})
+        }
+        "profiles_document" => json!({
+            "type": "string",
+            "minLength": 1,
+            "description": "Inline profile JSON is limited to 1048576 UTF-8 bytes by the handler.",
+            "x-depgraph-maxUtf8Bytes": 1048576
+        }),
+        "profiles_file" => scalar_schema::<RepositoryRelativePath>(),
         "selectors" => json!({
             "type": "array",
             "maxItems": 1024,

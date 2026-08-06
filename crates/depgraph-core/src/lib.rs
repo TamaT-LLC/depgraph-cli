@@ -46,6 +46,7 @@ pub mod rust_build_observer;
 pub mod scan;
 pub mod service;
 mod service_agent;
+mod service_lifecycle;
 mod service_repository;
 mod service_snapshot;
 pub mod worker;
@@ -418,18 +419,18 @@ pub use service::{
     DepgraphCapability, DepgraphCapabilitySet, DepgraphMutatingContext, DepgraphMutatingUseCase,
     DepgraphMutatingUseCaseKind, DepgraphService, DepgraphServiceConfig,
     DepgraphServiceConfigurationError, DepgraphServiceError, DepgraphServiceErrorCategory,
-    DepgraphServiceLimit, DepgraphServiceLimits, DepgraphServiceResult, OpenedRepositoryFile,
-    RepositoryFileError, RepositoryPathError, RepositoryPathSelector, RepositoryRelativePath,
-    RequestReadStore, RequestReadStoreFactory, ResolvedSnapshotId, SnapshotLocator,
-    SnapshotReadRequest,
+    DepgraphServiceLimit, DepgraphServiceLimits, DepgraphServiceResult, DoctorRequest,
+    DoctorResponse, OpenedRepositoryFile, ProfilePlanRequest, RepositoryFileError,
+    RepositoryPathError, RepositoryPathSelector, RepositoryRelativePath, RequestReadStore,
+    RequestReadStoreFactory, ResolvedSnapshotId, SnapshotLocator, SnapshotReadRequest,
 };
 
 use worker::{
     AdapterKind, RUST_BACKEND_KIND, RUST_BACKEND_REVISION, RUST_BACKEND_SALSA_VERSION,
-    RUST_BACKEND_VERSION, is_security_error, locate_worker, probe_toolchain_version,
-    probe_worker_version, validate_worker_launch_policy, verify_release_artifact,
-    verify_release_runtime_component, verify_rust_release_handshake, verify_web_release_handshake,
-    verify_web_semantic_compatibility,
+    RUST_BACKEND_VERSION, is_security_error, locate_worker,
+    probe_toolchain_version_with_cancellation, probe_worker_version_with_cancellation,
+    validate_worker_launch_policy, verify_release_artifact, verify_release_runtime_component,
+    verify_rust_release_handshake, verify_web_release_handshake, verify_web_semantic_compatibility,
 };
 
 #[derive(Debug, Clone, Serialize)]
@@ -1163,7 +1164,7 @@ fn suppressed_worker_health(
     }
 }
 
-async fn doctor_workers(root: &Path) -> Vec<WorkerHealth> {
+async fn doctor_workers(root: &Path, cancellation: &CancellationToken) -> Vec<WorkerHealth> {
     let preflight = preflight_doctor_workers(
         [AdapterKind::Rust, AdapterKind::Go, AdapterKind::Web],
         locate_worker,
@@ -1175,7 +1176,7 @@ async fn doctor_workers(root: &Path) -> Vec<WorkerHealth> {
                 suppressed_worker_health(adapter, spec, root)
             }
             DoctorWorkerLocation::Ready(spec) => {
-                let version = worker_artifact_version(&spec).await;
+                let version = worker_artifact_version(&spec, cancellation).await;
                 evaluated_worker_health(adapter, spec, root, version)
             }
             DoctorWorkerLocation::Unavailable(error) => WorkerHealth {
@@ -1196,12 +1197,15 @@ async fn doctor_workers(root: &Path) -> Vec<WorkerHealth> {
     workers
 }
 
-async fn worker_artifact_version(spec: &worker::WorkerSpec) -> Result<String> {
+async fn worker_artifact_version(
+    spec: &worker::WorkerSpec,
+    cancellation: &CancellationToken,
+) -> Result<String> {
     let probe_root = tempfile::Builder::new()
         .prefix("depgraph-doctor-worker-probe-")
         .tempdir()
         .context("failed to create a neutral worker health probe root")?;
-    worker_version(spec, probe_root.path()).await
+    worker_version_cancellable(spec, probe_root.path(), cancellation).await
 }
 
 fn default_doctor_diagnostic_root(store: &Store) -> Result<(PathBuf, &'static str)> {
@@ -1233,21 +1237,40 @@ fn normalize_doctor_diagnostic_root(
 }
 
 pub async fn doctor(store: &Store) -> Result<DoctorReport> {
+    doctor_cancellable(store, &CancellationToken::new()).await
+}
+
+pub async fn doctor_cancellable(
+    store: &Store,
+    cancellation: &CancellationToken,
+) -> Result<DoctorReport> {
     let (root, source) = default_doctor_diagnostic_root(store)?;
-    doctor_with_diagnostic_root(store, &root, source).await
+    doctor_with_diagnostic_root(store, &root, source, cancellation).await
 }
 
 pub async fn doctor_for_root(store: &Store, root: &Path) -> Result<DoctorReport> {
-    doctor_with_diagnostic_root(store, root, "explicit").await
+    doctor_for_root_cancellable(store, root, &CancellationToken::new()).await
+}
+
+pub async fn doctor_for_root_cancellable(
+    store: &Store,
+    root: &Path,
+    cancellation: &CancellationToken,
+) -> Result<DoctorReport> {
+    doctor_with_diagnostic_root(store, root, "explicit", cancellation).await
 }
 
 async fn doctor_with_diagnostic_root(
     store: &Store,
     root: &Path,
     source: &'static str,
+    cancellation: &CancellationToken,
 ) -> Result<DoctorReport> {
+    if cancellation.is_cancelled() {
+        anyhow::bail!("doctor cancelled");
+    }
     let (root, diagnostic_root) = normalize_doctor_diagnostic_root(root, source);
-    let workers = doctor_workers(&root).await;
+    let workers = doctor_workers(&root, cancellation).await;
     let latest_attempt = store
         .latest_attempt_id()?
         .map(|scan_id| {
@@ -1332,7 +1355,10 @@ async fn doctor_with_diagnostic_root(
             })
         })
         .transpose()?;
-    let toolchains = toolchain_versions(&root).await;
+    if cancellation.is_cancelled() {
+        anyhow::bail!("doctor cancelled");
+    }
+    let toolchains = toolchain_versions(&root, cancellation).await;
     let toolchain_remediation = doctor_toolchain_remediation(&toolchains);
     Ok(DoctorReport {
         diagnostic_root,
@@ -1356,21 +1382,40 @@ async fn doctor_with_diagnostic_root(
 }
 
 pub async fn doctor_summary(store: &Store) -> Result<DoctorSummaryReport> {
+    doctor_summary_cancellable(store, &CancellationToken::new()).await
+}
+
+pub async fn doctor_summary_cancellable(
+    store: &Store,
+    cancellation: &CancellationToken,
+) -> Result<DoctorSummaryReport> {
     let (root, source) = default_doctor_diagnostic_root(store)?;
-    doctor_summary_with_diagnostic_root(store, &root, source).await
+    doctor_summary_with_diagnostic_root(store, &root, source, cancellation).await
 }
 
 pub async fn doctor_summary_for_root(store: &Store, root: &Path) -> Result<DoctorSummaryReport> {
-    doctor_summary_with_diagnostic_root(store, root, "explicit").await
+    doctor_summary_for_root_cancellable(store, root, &CancellationToken::new()).await
+}
+
+pub async fn doctor_summary_for_root_cancellable(
+    store: &Store,
+    root: &Path,
+    cancellation: &CancellationToken,
+) -> Result<DoctorSummaryReport> {
+    doctor_summary_with_diagnostic_root(store, root, "explicit", cancellation).await
 }
 
 async fn doctor_summary_with_diagnostic_root(
     store: &Store,
     root: &Path,
     source: &'static str,
+    cancellation: &CancellationToken,
 ) -> Result<DoctorSummaryReport> {
+    if cancellation.is_cancelled() {
+        anyhow::bail!("doctor cancelled");
+    }
     let (root, diagnostic_root) = normalize_doctor_diagnostic_root(root, source);
-    let workers = doctor_workers(&root).await;
+    let workers = doctor_workers(&root, cancellation).await;
     let latest_attempt = store
         .latest_attempt_id()?
         .map(|scan_id| {
@@ -1390,7 +1435,10 @@ async fn doctor_summary_with_diagnostic_root(
             })
         })
         .transpose()?;
-    let toolchains = toolchain_versions(&root).await;
+    if cancellation.is_cancelled() {
+        anyhow::bail!("doctor cancelled");
+    }
+    let toolchains = toolchain_versions(&root, cancellation).await;
     let toolchain_remediation = doctor_toolchain_remediation(&toolchains);
     Ok(DoctorSummaryReport {
         report_kind: "summary",
@@ -1425,8 +1473,12 @@ fn doctor_supported_baselines() -> BTreeMap<String, String> {
     ])
 }
 
-async fn worker_version(spec: &worker::WorkerSpec, root: &Path) -> Result<String> {
-    let version = probe_worker_version(spec, root).await?;
+async fn worker_version_cancellable(
+    spec: &worker::WorkerSpec,
+    root: &Path,
+    cancellation: &CancellationToken,
+) -> Result<String> {
+    let version = probe_worker_version_with_cancellation(spec, root, cancellation).await?;
     let expected_name = format!("depgraph-{}-worker", spec.adapter.name());
     let Some((name, _, protocol)) = parse_worker_handshake(&version) else {
         anyhow::bail!("worker reports a malformed version handshake: {version}");
@@ -1815,17 +1867,24 @@ fn artifact_integrity(root: &Path, artifact: &ReleaseArtifact, expected: Option<
     "verified".to_owned()
 }
 
-async fn toolchain_versions(root: &Path) -> BTreeMap<String, String> {
+async fn toolchain_versions(
+    root: &Path,
+    cancellation: &CancellationToken,
+) -> BTreeMap<String, String> {
     let mut versions = BTreeMap::new();
     for (name, command, argument) in [
         ("rust", "rustc", "--version"),
         ("go", "go", "version"),
         ("node", "node", "--version"),
     ] {
-        let version = probe_toolchain_version(command, argument, root)
-            .await
-            .ok()
-            .unwrap_or_else(|| "unavailable".to_owned());
+        if cancellation.is_cancelled() {
+            break;
+        }
+        let version =
+            probe_toolchain_version_with_cancellation(command, argument, root, cancellation)
+                .await
+                .ok()
+                .unwrap_or_else(|| "unavailable".to_owned());
         versions.insert(name.to_owned(), version);
     }
     versions

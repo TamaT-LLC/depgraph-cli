@@ -1,14 +1,14 @@
 use std::{
     borrow::Cow,
     io::{self, Write as _},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::ExitCode,
     sync::{Arc, Mutex},
 };
 
 use anyhow::{Context as _, Result, bail};
 use clap::{Parser, ValueEnum};
-use depgraph_core::service::NodeMatchMode;
+use depgraph_core::service::{DoctorRequest, NodeMatchMode, ProfilePlanRequest};
 use depgraph_core::{
     CancellationToken, DepgraphCapability, DepgraphCapabilitySet, DepgraphService,
     DepgraphServiceConfig, DepgraphServiceError, DepgraphServiceLimits, SnapshotLocator,
@@ -16,9 +16,10 @@ use depgraph_core::{
 };
 use depgraph_mcp::runtime::{AuditLogger, RuntimeClass, RuntimeConfig, RuntimeController};
 use depgraph_mcp_tools::{
-    AgentCompletedSnapshot, AgentContext, AgentError, AgentNamedSnapshot, AgentNodeSummary,
-    AgentToken, CanonicalResponseMapper, ContractVersion, Cursor, CursorKey, ErrorEnvelope,
-    LogicalRepositoryId, MappedToolResult, PageByteLimit, PageRequest, PageSize, PaginationContext,
+    AgentCompletedSnapshot, AgentContext, AgentDaemonStatus, AgentDoctor, AgentError,
+    AgentNamedSnapshot, AgentNodeSummary, AgentProfilePlan, AgentToken, CanonicalResponseMapper,
+    ContractVersion, Cursor, CursorKey, ErrorEnvelope, LogicalRepositoryId, MappedToolResult,
+    PageByteLimit, PageRequest, PageSize, PaginationContext, RepositoryRelativePath,
     ResponseMappingError, SnapshotId, SuccessEnvelope, ToolCatalog,
 };
 use rmcp::{
@@ -118,6 +119,7 @@ struct DepgraphMcpServer {
     // Retained as immutable server state so tool handlers share one validated setup and runtime.
     service: DepgraphService,
     compiler_pack: VerifiedCompilerPack,
+    compiler_pack_requirement: PathBuf,
     runtime: RuntimeController,
     audit: AuditLogger,
     repository_id: LogicalRepositoryId,
@@ -186,6 +188,35 @@ struct SnapshotGetArguments {
     snapshot: String,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProfilesPlanArguments {
+    contract_version: ContractVersion,
+    repository_id: LogicalRepositoryId,
+    #[serde(default)]
+    profile_budget: Option<u32>,
+    #[serde(default)]
+    profiles_document: Option<String>,
+    #[serde(default)]
+    profiles_file: Option<RepositoryRelativePath>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DoctorArguments {
+    contract_version: ContractVersion,
+    repository_id: LogicalRepositoryId,
+    #[serde(default)]
+    details: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DaemonStatusArguments {
+    contract_version: ContractVersion,
+    repository_id: LogicalRepositoryId,
+}
+
 enum ToolExecutionFailure {
     Service(DepgraphServiceError),
     Agent(AgentError),
@@ -245,7 +276,13 @@ impl ServerHandler for DepgraphMcpServer {
         let tool = request.name.into_owned();
         if !matches!(
             tool.as_str(),
-            "get_context" | "agent_nodes_list" | "snapshot_list" | "snapshot_get"
+            "get_context"
+                | "agent_nodes_list"
+                | "snapshot_list"
+                | "snapshot_get"
+                | "profile_plan_get"
+                | "daemon_get"
+                | "doctor_get"
         ) {
             return Err(McpError::invalid_params(
                 "tool handler is unavailable",
@@ -255,6 +292,7 @@ impl ServerHandler for DepgraphMcpServer {
         let arguments = request.arguments.unwrap_or_default();
         let service = self.service.clone();
         let repository_id = self.repository_id.clone();
+        let compiler_pack_requirement = self.compiler_pack_requirement.clone();
         let cursor_key = self.cursor_key.clone();
         let cancellation = CancellationToken::new();
         let request_cancellation = context.ct;
@@ -280,6 +318,7 @@ impl ServerHandler for DepgraphMcpServer {
                     &service,
                     &repository_id,
                     &cursor_key,
+                    &compiler_pack_requirement,
                     &tool,
                     arguments,
                     &cancellation,
@@ -366,6 +405,7 @@ fn execute_catalog_read_tool(
     service: &DepgraphService,
     repository_id: &LogicalRepositoryId,
     cursor_key: &CursorKey,
+    compiler_pack_requirement: &Path,
     tool: &str,
     arguments: serde_json::Map<String, serde_json::Value>,
     cancellation: &CancellationToken,
@@ -523,6 +563,67 @@ fn execute_catalog_read_tool(
                 repository_id.clone(),
                 Some(snapshot_id),
                 result,
+            ))
+            .map_err(Into::into)
+        }
+        "profile_plan_get" => {
+            let arguments = decode_arguments::<ProfilesPlanArguments>(arguments)?;
+            authorize_repository(
+                arguments.contract_version,
+                &arguments.repository_id,
+                repository_id,
+            )?;
+            let result = service.profile_plan_cancellable(
+                &ProfilePlanRequest {
+                    profile_budget: arguments.profile_budget,
+                    profiles_document: arguments.profiles_document,
+                    profiles_file: arguments.profiles_file.map(TryInto::try_into).transpose()?,
+                },
+                cancellation,
+            )?;
+            CanonicalResponseMapper::success(&SuccessEnvelope::new(
+                repository_id.clone(),
+                None,
+                AgentProfilePlan::from(result),
+            ))
+            .map_err(Into::into)
+        }
+        "daemon_get" => {
+            let arguments = decode_arguments::<DaemonStatusArguments>(arguments)?;
+            authorize_repository(
+                arguments.contract_version,
+                &arguments.repository_id,
+                repository_id,
+            )?;
+            let result =
+                AgentDaemonStatus::try_from(service.daemon_status_cancellable(cancellation)?)
+                    .map_err(|_| ToolExecutionFailure::Service(DepgraphServiceError::Integrity))?;
+            CanonicalResponseMapper::success(&SuccessEnvelope::new(
+                repository_id.clone(),
+                None,
+                result,
+            ))
+            .map_err(Into::into)
+        }
+        "doctor_get" => {
+            let arguments = decode_arguments::<DoctorArguments>(arguments)?;
+            authorize_repository(
+                arguments.contract_version,
+                &arguments.repository_id,
+                repository_id,
+            )?;
+            let result = service.doctor_cancellable(
+                &DoctorRequest {
+                    details: arguments.details,
+                    use_service_root: true,
+                    compiler_pack_requirement: Some(compiler_pack_requirement.to_path_buf()),
+                },
+                cancellation,
+            )?;
+            CanonicalResponseMapper::success(&SuccessEnvelope::new(
+                repository_id.clone(),
+                None,
+                AgentDoctor::from(result),
             ))
             .map_err(Into::into)
         }
@@ -752,6 +853,7 @@ fn build_server(args: &Args) -> Result<DepgraphMcpServer> {
     Ok(DepgraphMcpServer {
         service: DepgraphService::new(config),
         compiler_pack,
+        compiler_pack_requirement: args.compiler_pack_requirement.clone(),
         runtime,
         audit: AuditLogger::default(),
         repository_id,

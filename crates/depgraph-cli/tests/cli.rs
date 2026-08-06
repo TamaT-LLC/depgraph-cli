@@ -3206,6 +3206,7 @@ fn daemon_cli_reports_completed_attempt_and_stops_cleanly() {
                 "daemon",
                 "start",
                 root.path().to_str().unwrap(),
+                "--json",
             ])
             .current_dir(cache.path())
             .stdout(Stdio::piped())
@@ -3270,7 +3271,89 @@ fn daemon_cli_reports_completed_attempt_and_stops_cleanly() {
 
     let output = child.0.take().unwrap().wait_with_output().unwrap();
     assert!(output.status.success());
-    assert!(String::from_utf8_lossy(&output.stdout).contains("daemon: stopped"));
+    let start_status: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(start_status["phase"], "stopped");
+    assert!(start_status.get("root").is_none());
+    assert!(start_status.get("last_watcher_error").is_none());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(!stdout.contains(root.path().to_string_lossy().as_ref()));
+    assert!(!stdout.contains("watcher error"));
+}
+
+#[test]
+fn daemon_status_reads_only_the_status_file_and_projects_safe_json() {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let store = cache.path().join("missing.db");
+    let status_path = cache.path().join("missing.db.daemon-status.json");
+    let original = serde_json::to_vec(&json!({
+        "schema_version": "daemon-status-v1",
+        "root": root.path(),
+        "phase": "idle",
+        "started_at": "2026-08-06T00:00:00Z",
+        "stopped_at": null,
+        "debounce_milliseconds": 100,
+        "pending_change_count": 0,
+        "active_attempt_id": null,
+        "last_completed_attempt": null,
+        "last_failed_attempt": null,
+        "last_cancelled_attempt": null,
+        "last_watcher_error": "CLI_DAEMON_SECRET /private/watcher",
+        "recovered_attempts": {"scan_attempt_ids": [], "build_attempt_ids": []}
+    }))
+    .unwrap();
+    fs::write(&status_path, &original).unwrap();
+
+    let output = Command::cargo_bin("depgraph")
+        .unwrap()
+        .args([
+            "--store",
+            store.to_str().unwrap(),
+            "daemon",
+            "status",
+            root.path().to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let status: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(status["phase"], "idle");
+    assert!(status.get("root").is_none());
+    assert!(status.get("last_watcher_error").is_none());
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("CLI_DAEMON_SECRET"));
+
+    let human = Command::cargo_bin("depgraph")
+        .unwrap()
+        .args([
+            "--store",
+            store.to_str().unwrap(),
+            "daemon",
+            "status",
+            root.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        human.status.success(),
+        "{}",
+        String::from_utf8_lossy(&human.stderr)
+    );
+    let human = String::from_utf8(human.stdout).unwrap();
+    assert!(human.contains("daemon: idle"));
+    assert!(human.contains("pending changes: 0"));
+    assert!(!human.contains("CLI_DAEMON_SECRET"));
+    assert!(!human.contains("/private/watcher"));
+    assert!(!human.contains(root.path().to_string_lossy().as_ref()));
+    assert!(!human.contains("root:"));
+    assert!(!human.contains("watcher error:"));
+
+    assert!(!store.exists());
+    assert_eq!(fs::read(status_path).unwrap(), original);
 }
 
 #[test]
@@ -5374,15 +5457,8 @@ fn query_commands_report_traversal_evidence_cycles_doctor_and_unresolved_sites()
             .unwrap()
             .contains("requirement")
     );
-    assert_eq!(doctor["diagnostic_root"]["source"], "latest-attempt");
-    assert_eq!(
-        doctor["diagnostic_root"]["path"],
-        root.path()
-            .canonicalize()
-            .unwrap()
-            .to_string_lossy()
-            .as_ref()
-    );
+    assert_eq!(doctor["diagnostic_root_source"], "latest-attempt");
+    assert!(doctor.get("diagnostic_root").is_none());
     let doctor_from_scan_root = Command::cargo_bin("depgraph")
         .unwrap()
         .current_dir(root.path())
@@ -5394,8 +5470,8 @@ fn query_commands_report_traversal_evidence_cycles_doctor_and_unresolved_sites()
     let doctor_from_scan_root: serde_json::Value =
         serde_json::from_slice(&doctor_from_scan_root.stdout).unwrap();
     assert_eq!(
-        doctor["diagnostic_root"],
-        doctor_from_scan_root["diagnostic_root"]
+        doctor["diagnostic_root_source"],
+        doctor_from_scan_root["diagnostic_root_source"]
     );
     assert_eq!(doctor["workers"], doctor_from_scan_root["workers"]);
 
@@ -5436,23 +5512,12 @@ fn query_commands_report_traversal_evidence_cycles_doctor_and_unresolved_sites()
     assert!(explicit_source_root.status.success());
     let explicit_source_root: serde_json::Value =
         serde_json::from_slice(&explicit_source_root.stdout).unwrap();
-    assert_eq!(
-        explicit_source_root["diagnostic_root"],
-        serde_json::json!({
-            "path": repository_root.to_string_lossy(),
-            "source": "explicit"
-        })
-    );
+    assert_eq!(explicit_source_root["diagnostic_root_source"], "explicit");
+    assert!(explicit_source_root.get("diagnostic_root").is_none());
     for worker in explicit_source_root["workers"].as_array().unwrap() {
-        if worker["command"].is_string() && worker["integrity"] == "development-unverified" {
-            assert_eq!(worker["root_launch_allowed"], false);
-            assert!(
-                worker["root_launch_error"]
-                    .as_str()
-                    .unwrap()
-                    .contains("inside the scan root")
-            );
-        }
+        assert!(worker.get("command").is_none());
+        assert!(worker.get("root_launch_error").is_none());
+        assert!(worker.get("error").is_none());
     }
     let details = query(&["doctor", "--details", "--json"]);
     assert!(details["latest_attempt"]["profiles"].is_array());
@@ -5568,6 +5633,13 @@ fn profiles_plan_is_read_only_explainable_and_checkout_independent() {
     let second = tempfile::tempdir().unwrap();
     write_profile_plan_fixture(first.path());
     write_profile_plan_fixture(second.path());
+    for root in [first.path(), second.path()] {
+        fs::write(
+            root.join("build.rs"),
+            "fn main() { std::fs::write(\"project-code-ran\", \"bad\").unwrap(); }\n",
+        )
+        .unwrap();
+    }
 
     let run = |root: &Path, json: bool| {
         let mut command = Command::cargo_bin("depgraph").unwrap();
@@ -5595,6 +5667,8 @@ fn profiles_plan_is_read_only_explainable_and_checkout_independent() {
     assert_eq!(preview["plan"]["summary"]["selected_profile_count"], 1);
     assert_eq!(preview["config_migration"]["status"], "default_equivalent");
     assert!(!first.path().join(".depgraph").exists());
+    assert!(!first.path().join("project-code-ran").exists());
+    assert!(!second.path().join("project-code-ran").exists());
 
     let human = run(first.path(), false);
     assert!(human.status.success());
@@ -5755,4 +5829,33 @@ fn profiles_plan_rejects_symlinked_explicit_files_as_security_errors() {
         .assert()
         .code(4)
         .stderr(predicate::str::contains("unsafe explicit profiles file"));
+}
+
+#[test]
+fn profiles_plan_rejects_outside_and_traversing_files_without_disclosure() {
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::NamedTempFile::new().unwrap();
+    write_profile_plan_fixture(root.path());
+    let secret = "outside-profile-secret";
+    fs::write(outside.path(), secret).unwrap();
+
+    for supplied in [
+        outside.path().to_path_buf(),
+        root.path().join("../outside-profile-secret.json"),
+    ] {
+        Command::cargo_bin("depgraph")
+            .unwrap()
+            .args([
+                "profiles",
+                "plan",
+                root.path().to_str().unwrap(),
+                "--profiles-file",
+                supplied.to_str().unwrap(),
+            ])
+            .assert()
+            .code(4)
+            .stderr(predicate::str::contains("unsafe explicit profiles file"))
+            .stderr(predicate::str::contains(secret).not());
+    }
+    assert!(!root.path().join(".depgraph").exists());
 }

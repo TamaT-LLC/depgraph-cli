@@ -16,6 +16,7 @@ use depgraph_core::service::{
     RepositoryFileError, RepositoryPathError, RepositoryPathSelector, RepositoryRelativePath,
     SnapshotLocator,
 };
+use depgraph_core::{CancellationToken, DoctorRequest, ProfilePlanRequest};
 use depgraph_store::Store;
 use serde_json::json;
 
@@ -897,5 +898,292 @@ fn service_errors_have_structural_categories_and_redacted_display() -> Result<()
         invalid.category(),
         DepgraphServiceErrorCategory::Configuration
     );
+    Ok(())
+}
+
+fn write_profile_plan_repository(root: &Path) -> Result<()> {
+    std::fs::create_dir_all(root.join("src"))?;
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname='service-lifecycle-fixture'\nversion='0.1.0'\n",
+    )?;
+    std::fs::write(root.join("src/lib.rs"), "pub fn fixture() {}\n")?;
+    std::fs::write(
+        root.join("build.rs"),
+        "fn main() { std::fs::write(\"project-code-ran\", \"bad\").unwrap(); }\n",
+    )?;
+    Ok(())
+}
+
+#[test]
+fn lifecycle_profile_plan_is_bounded_static_and_inline_file_equivalent() -> Result<()> {
+    let temporary = tempfile::tempdir()?;
+    let root = temporary.path().join("repository");
+    let store_path = temporary.path().join("missing-store.sqlite");
+    std::fs::create_dir_all(&root)?;
+    write_profile_plan_repository(&root)?;
+    let service = read_only_service(&root, &store_path)?;
+
+    let automatic = service
+        .profile_plan_cancellable(&ProfilePlanRequest::default(), &CancellationToken::new())?;
+    assert!(!store_path.exists());
+    assert!(!root.join("project-code-ran").exists());
+
+    let document = serde_json::to_string(&json!({
+        "contract_version": "default-profile-selection-v1",
+        "profiles": [automatic.plan.profiles[0].axes]
+    }))?;
+    std::fs::create_dir_all(root.join(".depgraph"))?;
+    std::fs::write(root.join(".depgraph/profiles.json"), &document)?;
+    let inline = service.profile_plan_cancellable(
+        &ProfilePlanRequest {
+            profiles_document: Some(document),
+            ..ProfilePlanRequest::default()
+        },
+        &CancellationToken::new(),
+    )?;
+    let file = service.profile_plan_cancellable(
+        &ProfilePlanRequest {
+            profiles_file: Some(RepositoryRelativePath::parse(".depgraph/profiles.json")?),
+            ..ProfilePlanRequest::default()
+        },
+        &CancellationToken::new(),
+    )?;
+    assert_eq!(serde_json::to_value(inline)?, serde_json::to_value(file)?);
+    assert!(!store_path.exists());
+    assert!(!root.join("project-code-ran").exists());
+
+    let limits = DepgraphServiceLimits::try_new(
+        DEPGRAPH_SERVICE_LIMITS_VERSION,
+        8,
+        1024 * 1024,
+        100,
+        1_000,
+    )?;
+    let bounded = DepgraphService::new(DepgraphServiceConfig::new(
+        &root,
+        &store_path,
+        DepgraphCapabilitySet::read_only(),
+        limits,
+    )?);
+    assert!(matches!(
+        bounded.profile_plan_cancellable(
+            &ProfilePlanRequest {
+                profiles_document: Some("123456789".to_owned()),
+                ..ProfilePlanRequest::default()
+            },
+            &CancellationToken::new()
+        ),
+        Err(DepgraphServiceError::ResourceExhausted)
+    ));
+    assert!(RepositoryRelativePath::parse("../profiles.json").is_err());
+    assert!(RepositoryRelativePath::parse("/outside/profiles.json").is_err());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn lifecycle_profile_plan_rejects_file_and_parent_symlinks() -> Result<()> {
+    use std::os::unix::fs::symlink;
+
+    let temporary = tempfile::tempdir()?;
+    let root = temporary.path().join("repository");
+    let outside = temporary.path().join("outside");
+    let store_path = temporary.path().join("missing-store.sqlite");
+    std::fs::create_dir_all(&root)?;
+    std::fs::create_dir_all(&outside)?;
+    write_profile_plan_repository(&root)?;
+    std::fs::write(outside.join("profiles.json"), b"{}")?;
+    symlink(
+        outside.join("profiles.json"),
+        root.join("profiles-link.json"),
+    )?;
+    symlink(&outside, root.join("linked-parent"))?;
+    let service = read_only_service(&root, &store_path)?;
+
+    for path in ["profiles-link.json", "linked-parent/profiles.json"] {
+        let error = service
+            .profile_plan_cancellable(
+                &ProfilePlanRequest {
+                    profiles_file: Some(RepositoryRelativePath::parse(path)?),
+                    ..ProfilePlanRequest::default()
+                },
+                &CancellationToken::new(),
+            )
+            .unwrap_err();
+        assert_eq!(error.category(), DepgraphServiceErrorCategory::Integrity);
+    }
+    assert!(!store_path.exists());
+    Ok(())
+}
+
+#[test]
+fn lifecycle_daemon_status_reads_only_the_bounded_status_file() -> Result<()> {
+    let temporary = tempfile::tempdir()?;
+    let root = temporary.path().join("repository");
+    let store_path = temporary.path().join("never-opened.sqlite");
+    std::fs::create_dir_all(&root)?;
+    let service = read_only_service(&root, &store_path)?;
+    let status_path = temporary
+        .path()
+        .join("never-opened.sqlite.daemon-status.json");
+    let status = json!({
+        "schema_version": "daemon-status-v1",
+        "root": root,
+        "phase": "idle",
+        "started_at": "2026-08-06T00:00:00Z",
+        "stopped_at": null,
+        "debounce_milliseconds": 100,
+        "pending_change_count": 0,
+        "active_attempt_id": null,
+        "last_completed_attempt": null,
+        "last_failed_attempt": null,
+        "last_cancelled_attempt": null,
+        "last_watcher_error": null,
+        "recovered_attempts": {"scan_attempt_ids": [], "build_attempt_ids": []}
+    });
+    let original = serde_json::to_vec(&status)?;
+    std::fs::write(&status_path, &original)?;
+
+    let actual = service.daemon_status_cancellable(&CancellationToken::new())?;
+    assert_eq!(serde_json::to_value(actual)?, status);
+    assert_eq!(std::fs::read(&status_path)?, original);
+    assert!(!store_path.exists());
+    Ok(())
+}
+
+#[test]
+fn lifecycle_methods_honor_preexisting_cancellation_before_io() -> Result<()> {
+    let temporary = tempfile::tempdir()?;
+    let root = temporary.path().join("repository");
+    let store_path = temporary.path().join("missing.sqlite");
+    std::fs::create_dir_all(&root)?;
+    write_profile_plan_repository(&root)?;
+    let service = read_only_service(&root, &store_path)?;
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+
+    assert!(matches!(
+        service.profile_plan_cancellable(&ProfilePlanRequest::default(), &cancellation),
+        Err(DepgraphServiceError::Cancelled)
+    ));
+    assert!(matches!(
+        service.daemon_status_cancellable(&cancellation),
+        Err(DepgraphServiceError::Cancelled)
+    ));
+    assert!(matches!(
+        service.doctor_cancellable(&DoctorRequest::default(), &cancellation),
+        Err(DepgraphServiceError::Cancelled)
+    ));
+    assert!(!store_path.exists());
+    Ok(())
+}
+
+#[test]
+fn lifecycle_doctor_projects_only_allowlisted_redacted_agent_data() -> Result<()> {
+    let temporary = tempfile::tempdir()?;
+    let root = temporary.path().join("repository");
+    let store_path = temporary.path().join("graph.sqlite");
+    std::fs::create_dir_all(&root)?;
+    let mut store = Store::open(&store_path)?;
+    store.start_scan("redaction", &root, false)?;
+    let common = |event: &str, seq: u64| {
+        json!({
+            "event": event,
+            "protocol_version": "1.0",
+            "scan_id": "redaction",
+            "adapter": "rust",
+            "adapter_version": "0.1.0",
+            "seq": seq
+        })
+    };
+    let mut started = common("scan_started", 1);
+    started["root"] = json!(root);
+    started["project_code_executed"] = json!(false);
+    started["safe_mode"] = json!(true);
+    store.ingest_event(&started)?;
+    let mut profile = common("profile_declared", 2);
+    profile["profile"] = json!({
+        "id": "rust:safe",
+        "language": "rust",
+        "features": [],
+        "environment": {"API_TOKEN": "profile-secret"},
+        "properties": {"compiler_command": "/usr/bin/rustc --crate-name secret"}
+    });
+    store.ingest_event(&profile)?;
+    let mut diagnostic = common("diagnostic", 3);
+    diagnostic["diagnostic"] = json!({
+        "id": "diagnostic:redaction",
+        "severity": "warning",
+        "code": "fixture.warning",
+        "message": "diagnostic-secret /private/tool",
+        "path": "src/lib.rs",
+        "properties": {"credential": "diagnostic-property-secret"}
+    });
+    store.ingest_event(&diagnostic)?;
+    let coverage = json!({
+        "profiles": 1,
+        "files_discovered": 0,
+        "files_analyzed": 0,
+        "files_skipped": 0,
+        "dependency_sites": 0,
+        "resolved": 0,
+        "candidates": 0,
+        "external": 0,
+        "unresolved": 0,
+        "unsupported_syntax": 0,
+        "project_code_executed": false,
+        "completeness": ["syntax-complete"],
+        "reasons": []
+    });
+    let mut profile_completed = common("profile_completed", 4);
+    profile_completed["profile_id"] = json!("rust:safe");
+    profile_completed["coverage"] = coverage.clone();
+    store.ingest_event(&profile_completed)?;
+    let mut completed = common("scan_completed", 5);
+    completed["coverage"] = coverage;
+    store.ingest_event(&completed)?;
+    store.save_adapter_log(
+        "redaction",
+        "rust",
+        "worker-log-secret /usr/bin/rustc",
+        false,
+    )?;
+    store.finish_scan("redaction", "completed", None, true)?;
+    drop(store);
+
+    let service = read_only_service(&root, &store_path)?;
+    let response = service.doctor_cancellable(
+        &DoctorRequest {
+            details: true,
+            use_service_root: true,
+            compiler_pack_requirement: None,
+        },
+        &CancellationToken::new(),
+    )?;
+    let value = serde_json::to_value(response)?;
+    let encoded = serde_json::to_string(&value)?;
+    for forbidden in [
+        "profile-secret",
+        "diagnostic-secret",
+        "diagnostic-property-secret",
+        "worker-log-secret",
+        "/usr/bin/rustc",
+        &root.to_string_lossy(),
+    ] {
+        assert!(!encoded.contains(forbidden), "leaked {forbidden:?}");
+    }
+    assert!(value.get("diagnostic_root").is_none());
+    for worker in value["workers"].as_array().unwrap() {
+        assert!(worker.get("command").is_none());
+        assert!(worker.get("error").is_none());
+        assert!(worker.get("root_launch_error").is_none());
+    }
+    let latest = &value["latest_attempt"];
+    assert!(latest.get("adapter_logs").is_none());
+    assert!(latest["profiles"][0].get("environment").is_none());
+    assert!(latest["profiles"][0].get("properties").is_none());
+    assert!(latest["diagnostics"][0].get("message").is_none());
+    assert!(latest["diagnostics"][0].get("properties").is_none());
     Ok(())
 }
