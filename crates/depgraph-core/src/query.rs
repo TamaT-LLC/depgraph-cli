@@ -22,6 +22,8 @@ const MIN_INTERACTIVE_QUERY_BYTES: usize = 4 * 1024;
 const MAX_QUERY_SUMMARY_GROUPS: usize = 64;
 const INTERACTIVE_QUERY_CURSOR_PREFIX: &str = "depgraph-query-cursor-v1";
 
+type CanonicalAdjacency<'a> = BTreeMap<&'a str, BTreeMap<(&'a str, &'a str), &'a EdgeRecord>>;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QueryPageDiagnostic {
     pub code: String,
@@ -782,19 +784,25 @@ pub(crate) fn traverse_bounded_filtered_cancellable(
     }
     let root = resolve_selector(snapshot, selector)?;
     let node_map = node_map(snapshot);
-    let adjacency = adjacency(snapshot, reverse, filter);
+    let (adjacency, adjacency_complete) = adjacency_cancellable(
+        snapshot,
+        reverse,
+        filter,
+        MAX_INTERACTIVE_QUERY_TRAVERSAL,
+        &mut is_cancelled,
+    )?;
     let mut queue = VecDeque::from([root.id.clone()]);
     let mut visited = BTreeSet::from([root.id.clone()]);
     let mut selected_edges = BTreeMap::new();
     let mut traversed_edges = 0_usize;
-    let mut complete = true;
+    let mut complete = adjacency_complete;
 
     'traversal: while let Some(node_id) = queue.pop_front() {
         if is_cancelled() {
             bail!("dependency traversal was cancelled");
         }
-        if let Some(edges) = adjacency.get(&node_id) {
-            for edge in edges {
+        if let Some(edges) = adjacency.get(node_id.as_str()) {
+            for edge in edges.values() {
                 if is_cancelled() {
                     bail!("dependency traversal was cancelled");
                 }
@@ -837,11 +845,21 @@ pub(crate) fn traverse_bounded_filtered_cancellable(
     let diagnostics = (!complete)
         .then(|| QueryPageDiagnostic {
             code: "QUERY_TRAVERSAL_LIMIT_REACHED".to_owned(),
-            message: format!(
-                "dependency traversal stopped after {traversed_edges} edge visits (limit {max_traversal})"
-            ),
-            remediation: "rerun with a larger --max-traversal value or narrow the query filters"
-                .to_owned(),
+            message: if adjacency_complete {
+                format!(
+                    "dependency traversal stopped after {traversed_edges} edge visits (limit {max_traversal})"
+                )
+            } else {
+                format!(
+                    "dependency adjacency preprocessing stopped after inspecting {} snapshot edges; result is partial",
+                    MAX_INTERACTIVE_QUERY_TRAVERSAL
+                )
+            },
+            remediation: if adjacency_complete {
+                "rerun with a larger --max-traversal value or narrow the query filters".to_owned()
+            } else {
+                "reduce the snapshot size or narrow the configured scan scope".to_owned()
+            },
         })
         .into_iter()
         .collect();
@@ -878,13 +896,15 @@ pub fn why_filtered(
             steps: Vec::new(),
         });
     }
-    let adjacency = adjacency(snapshot, false, filter);
+    let (adjacency, complete) =
+        adjacency_cancellable(snapshot, false, filter, usize::MAX, &mut || false)?;
+    debug_assert!(complete);
     let mut queue = VecDeque::from([from.id.clone()]);
     let mut seen = BTreeSet::from([from.id.clone()]);
     let mut predecessor: HashMap<String, &EdgeRecord> = HashMap::new();
     while let Some(node_id) = queue.pop_front() {
-        if let Some(edges) = adjacency.get(&node_id) {
-            for edge in edges {
+        if let Some(edges) = adjacency.get(node_id.as_str()) {
+            for edge in edges.values() {
                 if seen.insert(edge.target.clone()) {
                     predecessor.insert(edge.target.clone(), edge);
                     if edge.target == to.id {
@@ -1245,32 +1265,38 @@ fn edge_evidence_map_filtered(
     evidence
 }
 
-fn adjacency<'a>(
+fn adjacency_cancellable<'a>(
     snapshot: &'a GraphSnapshot,
     reverse: bool,
     filter: &GraphQueryFilter,
-) -> BTreeMap<String, Vec<&'a EdgeRecord>> {
-    let mut adjacency = BTreeMap::<String, Vec<&EdgeRecord>>::new();
-    for edge in snapshot
-        .edges
-        .iter()
-        .filter(|edge| filter.matches_edge(snapshot, edge))
-    {
-        let key = if reverse { &edge.target } else { &edge.source };
-        adjacency.entry(key.clone()).or_default().push(edge);
+    max_inspected_edges: usize,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<(CanonicalAdjacency<'a>, bool)> {
+    let mut ordered = BTreeMap::<&str, BTreeMap<(&str, &str), &EdgeRecord>>::new();
+    for (inspected_edges, edge) in snapshot.edges.iter().enumerate() {
+        if is_cancelled() {
+            bail!("dependency traversal was cancelled");
+        }
+        if inspected_edges >= max_inspected_edges {
+            return Ok((ordered, false));
+        }
+        if !filter.matches_edge(snapshot, edge) {
+            continue;
+        }
+        let (key, next) = if reverse {
+            (edge.target.as_str(), edge.source.as_str())
+        } else {
+            (edge.source.as_str(), edge.target.as_str())
+        };
+        ordered
+            .entry(key)
+            .or_default()
+            .insert((next, edge.id.as_str()), edge);
     }
-    for edges in adjacency.values_mut() {
-        edges.sort_by(|left, right| {
-            let left_target = if reverse { &left.source } else { &left.target };
-            let right_target = if reverse {
-                &right.source
-            } else {
-                &right.target
-            };
-            left_target.cmp(right_target).then(left.id.cmp(&right.id))
-        });
+    if is_cancelled() {
+        bail!("dependency traversal was cancelled");
     }
-    adjacency
+    Ok((ordered, true))
 }
 
 #[cfg(test)]
@@ -1360,6 +1386,54 @@ mod tests {
             coverage: CoverageRecord::default(),
             profile_matrix: depgraph_store::ProfileMatrixRecord::default(),
         }
+    }
+
+    #[test]
+    fn adjacency_construction_is_cancellable_during_scanning() {
+        let graph = snapshot();
+        let mut checks = 0_usize;
+        let error = adjacency_cancellable(
+            &graph,
+            false,
+            &GraphQueryFilter::default(),
+            usize::MAX,
+            &mut || {
+                checks += 1;
+                checks > 1
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("cancelled"));
+    }
+
+    #[test]
+    fn adjacency_construction_is_cancellable_after_scanning() {
+        let graph = snapshot();
+        let mut checks = 0_usize;
+        let error = adjacency_cancellable(
+            &graph,
+            false,
+            &GraphQueryFilter::default(),
+            usize::MAX,
+            &mut || {
+                checks += 1;
+                checks > graph.edges.len()
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("cancelled"));
+    }
+
+    #[test]
+    fn adjacency_construction_honors_its_independent_inspection_cap() -> Result<()> {
+        let graph = snapshot();
+        let (adjacency, complete) =
+            adjacency_cancellable(&graph, false, &GraphQueryFilter::default(), 1, &mut || {
+                false
+            })?;
+        assert!(!complete);
+        assert_eq!(adjacency.values().map(BTreeMap::len).sum::<usize>(), 1);
+        Ok(())
     }
 
     #[test]

@@ -17,6 +17,8 @@ use crate::{
 
 const MAX_GRAPH_SELECTOR_BYTES: usize = 4_096;
 
+type CanonicalAdjacency<'a> = BTreeMap<&'a str, BTreeMap<(&'a str, &'a str), &'a EdgeRecord>>;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DependencyDirection {
     Outgoing,
@@ -356,7 +358,12 @@ fn explain_path_bounded(
         ));
     }
 
-    let adjacency = canonical_outgoing_adjacency(snapshot, request.filter());
+    let adjacency = canonical_outgoing_adjacency(
+        snapshot,
+        request.filter(),
+        request.max_traversal(),
+        cancellation,
+    )?;
     let mut queue = VecDeque::from([from.id.clone()]);
     let mut seen = BTreeSet::from([from.id.clone()]);
     let mut predecessor = HashMap::<String, &EdgeRecord>::new();
@@ -366,7 +373,11 @@ fn explain_path_bounded(
         if cancellation.is_cancelled() {
             return Err(DepgraphServiceError::Cancelled);
         }
-        for edge in adjacency.get(&node_id).into_iter().flatten() {
+        for edge in adjacency
+            .get(node_id.as_str())
+            .into_iter()
+            .flat_map(|edges| edges.values())
+        {
             if cancellation.is_cancelled() {
                 return Err(DepgraphServiceError::Cancelled);
             }
@@ -417,19 +428,28 @@ fn explain_path_bounded(
 fn canonical_outgoing_adjacency<'a>(
     snapshot: &'a GraphSnapshot,
     filter: &GraphQueryFilter,
-) -> BTreeMap<String, Vec<&'a EdgeRecord>> {
-    let mut adjacency = BTreeMap::<String, Vec<&EdgeRecord>>::new();
-    for edge in snapshot
-        .edges
-        .iter()
-        .filter(|edge| filter.matches_edge(snapshot, edge))
-    {
-        adjacency.entry(edge.source.clone()).or_default().push(edge);
+    max_inspected_edges: usize,
+    cancellation: &CancellationToken,
+) -> DepgraphServiceResult<CanonicalAdjacency<'a>> {
+    let mut ordered = BTreeMap::<&str, BTreeMap<(&str, &str), &EdgeRecord>>::new();
+    for (inspected_edges, edge) in snapshot.edges.iter().enumerate() {
+        if cancellation.is_cancelled() {
+            return Err(DepgraphServiceError::Cancelled);
+        }
+        if inspected_edges >= max_inspected_edges {
+            return Err(DepgraphServiceError::ResourceExhausted);
+        }
+        if filter.matches_edge(snapshot, edge) {
+            ordered
+                .entry(edge.source.as_str())
+                .or_default()
+                .insert((edge.target.as_str(), edge.id.as_str()), edge);
+        }
     }
-    for edges in adjacency.values_mut() {
-        edges.sort_by(|left, right| left.target.cmp(&right.target).then(left.id.cmp(&right.id)));
+    if cancellation.is_cancelled() {
+        return Err(DepgraphServiceError::Cancelled);
     }
-    adjacency
+    Ok(ordered)
 }
 
 fn reconstruct_path(
