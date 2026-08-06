@@ -1,19 +1,30 @@
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
+    io::Read,
     path::{Component, Path},
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread,
+    time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
 use depgraph_protocol::stable_id_from_value;
-use depgraph_store::{EdgeRecord, GraphSnapshot, NodeRecord, runtime_context_for_edge};
+use depgraph_store::{EdgeRecord, GraphSnapshot, NodeRecord, RuntimeEdgeContext};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::{
     query::{
-        GraphQueryFilter, PathStep, path_steps_for_edges_filtered, render_condition,
-        resolve_selector,
+        GraphQueryFilter, PathStep, PathStepMaterializer, render_condition,
+        resolve_selector_bounded_cancellable,
+    },
+    service_limits::{
+        MAX_DEPENDENCY_PATH_STEPS, MAX_GRAPH_SERVICE_PREPROCESSING_WORK_ITEMS,
+        MAX_IMPACT_MATERIALIZED_PATH_STEPS,
     },
     worker::resolve_safe_executable,
 };
@@ -21,6 +32,42 @@ use crate::{
 const MAX_GIT_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_CHANGED_PATHS: usize = 100_000;
 pub const IMPACT_QUERY_CACHE_SCHEMA_VERSION: &str = "depgraph-impact-query-cache-v1";
+
+#[derive(Debug, thiserror::Error)]
+#[error("impact dependency-path materialization exceeded its service bound")]
+struct ImpactPathMaterializationExhausted;
+
+#[derive(Debug, thiserror::Error)]
+#[error("impact runtime-context preprocessing exceeded its service bound")]
+struct ImpactRuntimeContextIndexExhausted;
+
+#[derive(Debug, thiserror::Error)]
+#[error("impact changed-set preprocessing exceeded its service bound")]
+struct ImpactChangedSetPreprocessingExhausted;
+
+#[derive(Debug, thiserror::Error)]
+#[error("impact adjacency preprocessing exceeded its service bound")]
+struct ImpactAdjacencyPreprocessingExhausted;
+
+pub(crate) fn is_resource_exhausted(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<ImpactPathMaterializationExhausted>()
+        .is_some()
+        || error
+            .downcast_ref::<ImpactRuntimeContextIndexExhausted>()
+            .is_some()
+        || error
+            .downcast_ref::<ImpactChangedSetPreprocessingExhausted>()
+            .is_some()
+        || error
+            .downcast_ref::<ImpactAdjacencyPreprocessingExhausted>()
+            .is_some()
+        || crate::query::is_resource_exhausted(error)
+}
+
+pub(crate) fn is_integrity(error: &anyhow::Error) -> bool {
+    crate::query::is_integrity(error)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct GitChange {
@@ -106,7 +153,11 @@ impl ImpactFilters {
         Ok(self)
     }
 
-    fn matches(&self, snapshot: &GraphSnapshot, edge: &EdgeRecord) -> bool {
+    fn matches(
+        &self,
+        edge: &EdgeRecord,
+        runtime_contexts: Option<&BTreeMap<String, RuntimeEdgeContext>>,
+    ) -> bool {
         let structural = (self.profiles.is_empty()
             || self.profiles.binary_search(&edge.profile_id).is_ok())
             && (self.conditions.is_empty()
@@ -124,7 +175,9 @@ impl ImpactFilters {
         if edge.phase != "runtime" {
             return false;
         }
-        let context = runtime_context_for_edge(snapshot, edge);
+        let Some(context) = runtime_contexts.and_then(|contexts| contexts.get(&edge.id)) else {
+            return false;
+        };
         let session_matches = self.sessions.is_empty()
             || context
                 .session_ids
@@ -209,26 +262,51 @@ struct GitChangeKey {
 }
 
 pub fn read_git_changed_set(root: &Path, requested_ref: &str) -> Result<GitChangedSet> {
+    read_git_changed_set_cancellable(root, requested_ref, || false)
+}
+
+pub(crate) fn read_git_changed_set_cancellable(
+    root: &Path,
+    requested_ref: &str,
+    mut is_cancelled: impl FnMut() -> bool,
+) -> Result<GitChangedSet> {
     validate_git_ref(requested_ref)?;
+    check_cancelled(&mut is_cancelled)?;
     let root = root
         .canonicalize()
         .with_context(|| format!("scan root {} is unavailable", root.display()))?;
     let git = resolve_safe_executable("git", &root)?;
-    let prefix = git_text(&git, &root, ["rev-parse", "--show-prefix"])?;
+    let prefix = git_text_cancellable(
+        &git,
+        &root,
+        ["rev-parse", "--show-prefix"],
+        &mut is_cancelled,
+    )?;
     let prefix = normalize_repository_prefix(&prefix)?;
-    let repository_root = git_text(&git, &root, ["rev-parse", "--show-toplevel"])?;
+    let repository_root = git_text_cancellable(
+        &git,
+        &root,
+        ["rev-parse", "--show-toplevel"],
+        &mut is_cancelled,
+    )?;
     let repository_root = Path::new(&repository_root)
         .canonicalize()
         .context("Git repository root is unavailable")?;
     if !root.starts_with(&repository_root) {
         bail!("security policy violation: Git repository root does not contain the scan root");
     }
-    let head = resolve_commit(&git, &repository_root, "HEAD")?;
-    let resolved_ref = resolve_commit(&git, &repository_root, requested_ref)?;
-    let merge_base = git_text(&git, &repository_root, ["merge-base", &resolved_ref, &head])?;
+    let head = resolve_commit_cancellable(&git, &repository_root, "HEAD", &mut is_cancelled)?;
+    let resolved_ref =
+        resolve_commit_cancellable(&git, &repository_root, requested_ref, &mut is_cancelled)?;
+    let merge_base = git_text_cancellable(
+        &git,
+        &repository_root,
+        ["merge-base", &resolved_ref, &head],
+        &mut is_cancelled,
+    )?;
     validate_object_id("merge base", &merge_base)?;
 
-    let committed = git_bytes(
+    let committed = git_bytes_cancellable(
         &git,
         &repository_root,
         [
@@ -243,8 +321,9 @@ pub fn read_git_changed_set(root: &Path, requested_ref: &str) -> Result<GitChang
             &merge_base,
             &head,
         ],
+        &mut is_cancelled,
     )?;
-    let worktree = git_bytes(
+    let worktree = git_bytes_cancellable(
         &git,
         &repository_root,
         [
@@ -258,21 +337,26 @@ pub fn read_git_changed_set(root: &Path, requested_ref: &str) -> Result<GitChang
             "--ignore-submodules=none",
             &head,
         ],
+        &mut is_cancelled,
     )?;
-    let untracked = git_bytes(
+    let untracked = git_bytes_cancellable(
         &git,
         &repository_root,
         ["ls-files", "--others", "--exclude-standard", "-z"],
+        &mut is_cancelled,
     )?;
 
     let mut changes = BTreeMap::<GitChangeKey, BTreeSet<String>>::new();
-    for change in parse_name_status(&committed, "committed", &prefix)? {
+    for change in parse_name_status(&committed, "committed", &prefix, &mut is_cancelled)? {
+        check_cancelled(&mut is_cancelled)?;
         insert_change(&mut changes, change);
     }
-    for change in parse_name_status(&worktree, "worktree", &prefix)? {
+    for change in parse_name_status(&worktree, "worktree", &prefix, &mut is_cancelled)? {
+        check_cancelled(&mut is_cancelled)?;
         insert_change(&mut changes, change);
     }
-    for path in parse_nul_paths(&untracked, &prefix)? {
+    for path in parse_nul_paths(&untracked, &prefix, &mut is_cancelled)? {
+        check_cancelled(&mut is_cancelled)?;
         insert_change(
             &mut changes,
             GitChange {
@@ -290,22 +374,25 @@ pub fn read_git_changed_set(root: &Path, requested_ref: &str) -> Result<GitChang
         );
     }
 
+    let mut finalized_changes = Vec::with_capacity(changes.len());
+    for (key, sources) in changes {
+        check_cancelled(&mut is_cancelled)?;
+        finalized_changes.push(GitChange {
+            status: key.status,
+            similarity: key.similarity,
+            old_path: key.old_path,
+            new_path: key.new_path,
+            sources: sources.into_iter().collect(),
+        });
+    }
+
     Ok(GitChangedSet {
         requested_ref: requested_ref.to_owned(),
         resolved_ref,
         merge_base: merge_base.to_ascii_lowercase(),
         head,
         repository_prefix: prefix,
-        changes: changes
-            .into_iter()
-            .map(|(key, sources)| GitChange {
-                status: key.status,
-                similarity: key.similarity,
-                old_path: key.old_path,
-                new_path: key.new_path,
-                sources: sources.into_iter().collect(),
-            })
-            .collect(),
+        changes: finalized_changes,
     })
 }
 
@@ -322,12 +409,18 @@ fn validate_git_ref(value: &str) -> Result<()> {
     Ok(())
 }
 
-fn resolve_commit(git: &Path, root: &Path, value: &str) -> Result<String> {
+fn resolve_commit_cancellable(
+    git: &Path,
+    root: &Path,
+    value: &str,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<String> {
     let revision = format!("{value}^{{commit}}");
-    let resolved = git_text(
+    let resolved = git_text_cancellable(
         git,
         root,
         ["rev-parse", "--verify", "--end-of-options", &revision],
+        is_cancelled,
     )
     .with_context(|| format!("Git ref {value:?} does not resolve to a commit"))?;
     validate_object_id("Git ref", &resolved)?;
@@ -341,21 +434,24 @@ fn validate_object_id(name: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
-fn git_text<'a>(
+fn git_text_cancellable<'a>(
     git: &Path,
     root: &Path,
     args: impl IntoIterator<Item = &'a str>,
+    is_cancelled: &mut impl FnMut() -> bool,
 ) -> Result<String> {
-    let bytes = git_bytes(git, root, args)?;
+    let bytes = git_bytes_cancellable(git, root, args, is_cancelled)?;
     let value = String::from_utf8(bytes).context("Git returned non-UTF-8 metadata")?;
     Ok(value.trim().to_owned())
 }
 
-fn git_bytes<'a>(
+fn git_bytes_cancellable<'a>(
     git: &Path,
     root: &Path,
     args: impl IntoIterator<Item = &'a str>,
+    is_cancelled: &mut impl FnMut() -> bool,
 ) -> Result<Vec<u8>> {
+    check_cancelled(is_cancelled)?;
     let mut command = Command::new(git);
     command
         .args([
@@ -372,7 +468,9 @@ fn git_bytes<'a>(
         .arg(root)
         .args(args)
         .env("PAGER", "cat")
-        .stdin(Stdio::null());
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     for (key, _) in std::env::vars_os() {
         if key
             .to_string_lossy()
@@ -385,17 +483,108 @@ fn git_bytes<'a>(
     command
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_PAGER", "cat");
-    let output = command
-        .output()
+    run_bounded_child_cancellable(command, MAX_GIT_OUTPUT_BYTES, is_cancelled)
+}
+
+fn run_bounded_child_cancellable(
+    mut command: Command,
+    maximum_output_bytes: usize,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<Vec<u8>> {
+    let mut child = command
+        .spawn()
         .context("failed to run read-only Git query")?;
-    if output.stdout.len() > MAX_GIT_OUTPUT_BYTES || output.stderr.len() > MAX_GIT_OUTPUT_BYTES {
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        bail!("Git stdout pipe is unavailable");
+    };
+    let Some(stderr) = child.stderr.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        bail!("Git stderr pipe is unavailable");
+    };
+    let overflow = Arc::new(AtomicBool::new(false));
+    let stdout_overflow = Arc::clone(&overflow);
+    let stderr_overflow = Arc::clone(&overflow);
+    let stdout_reader =
+        thread::spawn(move || read_bounded_pipe(stdout, maximum_output_bytes, &stdout_overflow));
+    let stderr_reader =
+        thread::spawn(move || read_bounded_pipe(stderr, maximum_output_bytes, &stderr_overflow));
+    let status = loop {
+        if is_cancelled() {
+            kill_reap_and_join(&mut child, stdout_reader, stderr_reader);
+            bail!("Git changed-set query was cancelled");
+        }
+        if overflow.load(Ordering::Acquire) {
+            kill_reap_and_join(&mut child, stdout_reader, stderr_reader);
+            bail!("Git changed-set output exceeded the bounded output limit");
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(_) => {
+                kill_reap_and_join(&mut child, stdout_reader, stderr_reader);
+                bail!("failed to poll read-only Git query");
+            }
+        }
+        thread::sleep(Duration::from_millis(5));
+    };
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("Git stdout reader failed"))??;
+    stderr_reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("Git stderr reader failed"))??;
+    if overflow.load(Ordering::Acquire) {
         bail!("Git changed-set output exceeded the bounded output limit");
     }
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("read-only Git query failed: {}", stderr.trim());
+    if !status.success() {
+        bail!("read-only Git query failed");
     }
-    Ok(output.stdout)
+    check_cancelled(is_cancelled)?;
+    Ok(stdout)
+}
+
+fn kill_reap_and_join(
+    child: &mut Child,
+    stdout_reader: thread::JoinHandle<std::io::Result<Vec<u8>>>,
+    stderr_reader: thread::JoinHandle<std::io::Result<Vec<u8>>>,
+) {
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = stdout_reader.join();
+    let _ = stderr_reader.join();
+}
+
+fn read_bounded_pipe(
+    mut pipe: impl Read,
+    maximum_output_bytes: usize,
+    overflow: &AtomicBool,
+) -> std::io::Result<Vec<u8>> {
+    const BUFFER_BYTES: usize = 8 * 1024;
+
+    let mut bytes = Vec::with_capacity(maximum_output_bytes.min(BUFFER_BYTES));
+    let mut buffer = [0_u8; BUFFER_BYTES];
+    loop {
+        let read = pipe.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        let retained = maximum_output_bytes.saturating_sub(bytes.len()).min(read);
+        bytes.extend_from_slice(&buffer[..retained]);
+        if retained < read {
+            overflow.store(true, Ordering::Release);
+        }
+    }
+    Ok(bytes)
+}
+
+fn check_cancelled(is_cancelled: &mut (impl FnMut() -> bool + ?Sized)) -> Result<()> {
+    if is_cancelled() {
+        bail!("graph operation was cancelled");
+    }
+    Ok(())
 }
 
 fn normalize_repository_prefix(value: &str) -> Result<String> {
@@ -407,23 +596,31 @@ fn normalize_repository_prefix(value: &str) -> Result<String> {
     Ok(format!("{value}/"))
 }
 
-fn parse_name_status(bytes: &[u8], source: &str, prefix: &str) -> Result<Vec<GitChange>> {
-    let fields = nul_fields(bytes);
+fn parse_name_status(
+    bytes: &[u8],
+    source: &str,
+    prefix: &str,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<Vec<GitChange>> {
+    let mut fields = nul_fields(bytes);
     let mut changes = Vec::new();
-    let mut index = 0;
-    while index < fields.len() {
-        let token = parse_utf8_field(fields[index], "Git status")?;
-        index += 1;
+    while let Some(field) = fields.next() {
+        check_cancelled(is_cancelled)?;
+        let token = parse_utf8_field(field, "Git status")?;
         let (status, similarity, paths) = parse_status(&token)?;
-        if index + paths > fields.len() {
-            bail!("Git name-status output ended before its path fields");
-        }
-        let first = parse_utf8_field(fields[index], "Git path")?;
-        index += 1;
+        let first = parse_utf8_field(
+            fields
+                .next()
+                .context("Git name-status output ended before its path fields")?,
+            "Git path",
+        )?;
         let second = if paths == 2 {
-            let path = parse_utf8_field(fields[index], "Git path")?;
-            index += 1;
-            Some(path)
+            Some(parse_utf8_field(
+                fields
+                    .next()
+                    .context("Git name-status output ended before its path fields")?,
+                "Git path",
+            )?)
         } else {
             None
         };
@@ -484,22 +681,26 @@ fn parse_status(token: &str) -> Result<(String, Option<u8>, usize)> {
     Ok((status.to_owned(), similarity, paths))
 }
 
-fn parse_nul_paths(bytes: &[u8], prefix: &str) -> Result<Vec<String>> {
-    nul_fields(bytes)
-        .into_iter()
-        .map(|field| parse_utf8_field(field, "Git path"))
-        .filter_map(|path| match path {
-            Ok(path) => strip_repository_prefix(&path, prefix).transpose(),
-            Err(error) => Some(Err(error)),
-        })
-        .collect()
+fn parse_nul_paths(
+    bytes: &[u8],
+    prefix: &str,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<Vec<String>> {
+    let mut paths = Vec::new();
+    for field in nul_fields(bytes) {
+        check_cancelled(is_cancelled)?;
+        let path = parse_utf8_field(field, "Git path")?;
+        if let Some(path) = strip_repository_prefix(&path, prefix)? {
+            paths.push(path);
+        }
+    }
+    Ok(paths)
 }
 
-fn nul_fields(bytes: &[u8]) -> Vec<&[u8]> {
+fn nul_fields(bytes: &[u8]) -> impl Iterator<Item = &[u8]> {
     bytes
         .split(|byte| *byte == 0)
         .filter(|field| !field.is_empty())
-        .collect()
 }
 
 fn parse_utf8_field(value: &[u8], name: &str) -> Result<String> {
@@ -542,98 +743,211 @@ fn insert_change(changes: &mut BTreeMap<GitChangeKey, BTreeSet<String>>, change:
 pub fn map_changed_set(
     snapshot: &GraphSnapshot,
     changed_set: &GitChangedSet,
-) -> Vec<ChangedNodeMapping> {
-    let index = path_node_index(snapshot);
-    changed_set
-        .changes
-        .iter()
-        .map(|change| {
-            let old_node_ids: Vec<String> = change
-                .old_path
-                .as_deref()
-                .and_then(|path| index.get(path))
-                .map(|ids| ids.iter().cloned().collect())
-                .unwrap_or_default();
-            let new_node_ids: Vec<String> = change
-                .new_path
-                .as_deref()
-                .and_then(|path| index.get(path))
-                .map(|ids| ids.iter().cloned().collect())
-                .unwrap_or_default();
-            let correlated_node_ids = old_node_ids
-                .iter()
-                .chain(&new_node_ids)
-                .cloned()
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect();
-            ChangedNodeMapping {
-                change: change.clone(),
-                old_node_ids,
-                new_node_ids,
-                correlated_node_ids,
-            }
-        })
-        .collect()
+) -> Result<Vec<ChangedNodeMapping>> {
+    map_changed_set_cancellable(snapshot, changed_set, &mut || false)
 }
 
-fn path_node_index(snapshot: &GraphSnapshot) -> BTreeMap<String, BTreeSet<String>> {
+fn map_changed_set_cancellable(
+    snapshot: &GraphSnapshot,
+    changed_set: &GitChangedSet,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<Vec<ChangedNodeMapping>> {
+    map_changed_set_with_limit(
+        snapshot,
+        changed_set,
+        MAX_GRAPH_SERVICE_PREPROCESSING_WORK_ITEMS,
+        is_cancelled,
+    )
+}
+
+fn map_changed_set_with_limit(
+    snapshot: &GraphSnapshot,
+    changed_set: &GitChangedSet,
+    maximum: usize,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<Vec<ChangedNodeMapping>> {
+    let mut work = ImpactChangedSetWork::new(maximum, is_cancelled);
+    let index = path_node_index_cancellable(snapshot, &mut work)?;
+    let mut mappings = Vec::with_capacity(changed_set.changes.len());
+    for change in &changed_set.changes {
+        work.step()?;
+        let mut correlated = BTreeSet::new();
+        let old_node_ids = copy_changed_node_ids(
+            change.old_path.as_deref().and_then(|path| index.get(path)),
+            &mut correlated,
+            &mut work,
+        )?;
+        let new_node_ids = copy_changed_node_ids(
+            change.new_path.as_deref().and_then(|path| index.get(path)),
+            &mut correlated,
+            &mut work,
+        )?;
+        let mut correlated_node_ids = Vec::with_capacity(correlated.len());
+        for node_id in correlated {
+            work.step()?;
+            correlated_node_ids.push(node_id);
+            #[cfg(test)]
+            CHANGED_CORRELATED_ID_MATERIALIZATION_VISITS.fetch_add(1, Ordering::Relaxed);
+        }
+        let mut sources = Vec::with_capacity(change.sources.len());
+        for source in &change.sources {
+            work.step()?;
+            sources.push(source.clone());
+            #[cfg(test)]
+            CHANGED_SOURCE_MATERIALIZATION_VISITS.fetch_add(1, Ordering::Relaxed);
+        }
+        mappings.push(ChangedNodeMapping {
+            change: GitChange {
+                status: change.status.clone(),
+                similarity: change.similarity,
+                old_path: change.old_path.clone(),
+                new_path: change.new_path.clone(),
+                sources,
+            },
+            old_node_ids,
+            new_node_ids,
+            correlated_node_ids,
+        });
+    }
+    Ok(mappings)
+}
+
+fn path_node_index_cancellable(
+    snapshot: &GraphSnapshot,
+    work: &mut ImpactChangedSetWork<'_>,
+) -> Result<BTreeMap<String, BTreeSet<String>>> {
     let mut index = BTreeMap::<String, BTreeSet<String>>::new();
     for node in &snapshot.nodes {
+        work.step()?;
         for key in ["path", "source_path", "manifest_path", "relative_path"] {
             if let Some(path) = node.properties.get(key).and_then(serde_json::Value::as_str) {
-                index_node_path(&mut index, path, &node.id);
+                index_node_path(&mut index, path, &node.id, work)?;
             }
         }
         if let Some(identity) = node.properties.get("canonical_identity") {
             for key in ["path", "source_path", "relative_path"] {
                 if let Some(path) = identity.get(key).and_then(serde_json::Value::as_str) {
-                    index_node_path(&mut index, path, &node.id);
+                    index_node_path(&mut index, path, &node.id, work)?;
                 }
             }
         }
     }
 
-    let sites: BTreeMap<_, _> = snapshot
-        .sites
-        .iter()
-        .map(|site| (site.id.as_str(), site))
-        .collect();
-    let edges: BTreeMap<_, _> = snapshot
-        .edges
-        .iter()
-        .map(|edge| (edge.id.as_str(), edge))
-        .collect();
+    let mut sites = BTreeMap::new();
+    for site in &snapshot.sites {
+        work.step()?;
+        #[cfg(test)]
+        PATH_NODE_INDEX_SITE_VISITS.fetch_add(1, Ordering::Relaxed);
+        sites.insert(site.id.as_str(), site);
+    }
+    let mut edges = BTreeMap::new();
+    for edge in &snapshot.edges {
+        work.step()?;
+        #[cfg(test)]
+        PATH_NODE_INDEX_EDGE_VISITS.fetch_add(1, Ordering::Relaxed);
+        edges.insert(edge.id.as_str(), edge);
+    }
     for evidence in &snapshot.evidence {
+        work.step()?;
         match evidence.owner_type.as_str() {
-            "node" => index_node_path(&mut index, &evidence.path, &evidence.owner_id),
+            "node" => index_node_path(&mut index, &evidence.path, &evidence.owner_id, work)?,
             "site" => {
                 if let Some(site) = sites.get(evidence.owner_id.as_str()) {
-                    index_node_path(&mut index, &evidence.path, &site.source);
+                    index_node_path(&mut index, &evidence.path, &site.source, work)?;
                 }
             }
             "edge" => {
                 if let Some(edge) = edges.get(evidence.owner_id.as_str()) {
-                    index_node_path(&mut index, &evidence.path, &edge.source);
+                    index_node_path(&mut index, &evidence.path, &edge.source, work)?;
                     if matches!(
                         edge.kind.as_str(),
                         "declares" | "contains" | "defines" | "routes" | "instantiates"
                     ) {
-                        index_node_path(&mut index, &evidence.path, &edge.target);
+                        index_node_path(&mut index, &evidence.path, &edge.target, work)?;
                     }
                 }
             }
             _ => {}
         }
     }
-    index
+    Ok(index)
 }
 
-fn index_node_path(index: &mut BTreeMap<String, BTreeSet<String>>, path: &str, node_id: &str) {
+fn index_node_path(
+    index: &mut BTreeMap<String, BTreeSet<String>>,
+    path: &str,
+    node_id: &str,
+    work: &mut ImpactChangedSetWork<'_>,
+) -> Result<()> {
     if let Ok(path) = normalize_git_path(path) {
+        work.step()?;
         index.entry(path).or_default().insert(node_id.to_owned());
     }
+    Ok(())
 }
+
+fn copy_changed_node_ids(
+    ids: Option<&BTreeSet<String>>,
+    correlated: &mut BTreeSet<String>,
+    work: &mut ImpactChangedSetWork<'_>,
+) -> Result<Vec<String>> {
+    let mut copied = Vec::with_capacity(ids.map_or(0, BTreeSet::len));
+    for node_id in ids.into_iter().flatten() {
+        work.step()?;
+        #[cfg(test)]
+        CHANGED_NODE_ID_COPY_VISITS.fetch_add(1, Ordering::Relaxed);
+        copied.push(node_id.clone());
+        work.step()?;
+        correlated.insert(node_id.clone());
+    }
+    Ok(copied)
+}
+
+struct ImpactChangedSetWork<'a> {
+    used: usize,
+    maximum: usize,
+    is_cancelled: &'a mut dyn FnMut() -> bool,
+}
+
+impl<'a> ImpactChangedSetWork<'a> {
+    fn new(maximum: usize, is_cancelled: &'a mut dyn FnMut() -> bool) -> Self {
+        Self {
+            used: 0,
+            maximum,
+            is_cancelled,
+        }
+    }
+
+    fn step(&mut self) -> Result<()> {
+        check_cancelled(self.is_cancelled)?;
+        if self.used >= self.maximum {
+            return Err(ImpactChangedSetPreprocessingExhausted.into());
+        }
+        self.used += 1;
+        #[cfg(test)]
+        CHANGED_SET_WORK_ITEMS.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+static PATH_NODE_INDEX_SITE_VISITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static PATH_NODE_INDEX_EDGE_VISITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static CHANGED_NODE_ID_COPY_VISITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static CHANGED_CORRELATED_ID_MATERIALIZATION_VISITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static CHANGED_SOURCE_MATERIALIZATION_VISITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static CHANGED_SET_WORK_ITEMS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 #[derive(Default)]
 struct TraversalBudget {
@@ -708,42 +1022,78 @@ pub fn impact(
     changed_set: Option<&GitChangedSet>,
     filters: ImpactFilters,
 ) -> Result<ImpactResult> {
-    let root = resolve_selector(snapshot, selector)?;
-    let node_map: BTreeMap<_, _> = snapshot
-        .nodes
-        .iter()
-        .map(|node| (node.id.clone(), node.clone()))
-        .collect();
-    let edge_map: BTreeMap<_, _> = snapshot
-        .edges
-        .iter()
-        .map(|edge| (edge.id.clone(), edge))
-        .collect();
+    impact_cancellable(snapshot, selector, changed_set, filters, || false)
+}
+
+pub(crate) fn impact_cancellable(
+    snapshot: &GraphSnapshot,
+    selector: &str,
+    changed_set: Option<&GitChangedSet>,
+    filters: ImpactFilters,
+    mut is_cancelled: impl FnMut() -> bool,
+) -> Result<ImpactResult> {
+    check_cancelled(&mut is_cancelled)?;
+    let root = resolve_selector_bounded_cancellable(
+        snapshot,
+        selector,
+        MAX_GRAPH_SERVICE_PREPROCESSING_WORK_ITEMS,
+        &mut is_cancelled,
+    )?;
+    let mut node_map = BTreeMap::new();
+    for node in &snapshot.nodes {
+        check_cancelled(&mut is_cancelled)?;
+        node_map.insert(node.id.clone(), node.clone());
+    }
+    let mut edge_map = BTreeMap::new();
+    for edge in &snapshot.edges {
+        check_cancelled(&mut is_cancelled)?;
+        edge_map.insert(edge.id.clone(), edge);
+    }
     let mappings = changed_set
-        .map(|set| map_changed_set(snapshot, set))
+        .map(|set| map_changed_set_cancellable(snapshot, set, &mut is_cancelled))
+        .transpose()?
         .unwrap_or_default();
     let changed_ids = if changed_set.is_some() {
-        mappings
-            .iter()
-            .flat_map(|mapping| mapping.correlated_node_ids.iter().cloned())
-            .collect::<BTreeSet<_>>()
+        let mut changed_ids = BTreeSet::new();
+        let mut changed_id_work = 0_usize;
+        for mapping in &mappings {
+            for node_id in &mapping.correlated_node_ids {
+                check_cancelled(&mut is_cancelled)?;
+                if changed_id_work >= MAX_GRAPH_SERVICE_PREPROCESSING_WORK_ITEMS {
+                    return Err(ImpactChangedSetPreprocessingExhausted.into());
+                }
+                changed_id_work += 1;
+                changed_ids.insert(node_id.clone());
+            }
+        }
+        changed_ids
     } else {
         BTreeSet::from([root.id.clone()])
     };
-    let changed_nodes = changed_ids
-        .iter()
-        .filter_map(|id| node_map.get(id).cloned())
-        .collect();
+    let mut changed_nodes = Vec::new();
+    for id in &changed_ids {
+        check_cancelled(&mut is_cancelled)?;
+        if let Some(node) = node_map.get(id).cloned() {
+            changed_nodes.push(node);
+        }
+    }
     let mut budget = TraversalBudget::new(&root.id);
-    let forward = adjacency(snapshot, false, &filters);
-    let reverse = adjacency(snapshot, true, &filters);
-    let evidence_filter = GraphQueryFilter {
-        phases: filters.phases.clone(),
-        profiles: filters.profiles.clone(),
-        sessions: filters.sessions.clone(),
-        environments: filters.environments.clone(),
-    };
-
+    let runtime_contexts =
+        runtime_context_index_cancellable(snapshot, &filters, &mut is_cancelled)?;
+    let forward = adjacency_cancellable(
+        snapshot,
+        false,
+        &filters,
+        runtime_contexts.as_ref(),
+        &mut is_cancelled,
+    )?;
+    let reverse = adjacency_cancellable(
+        snapshot,
+        true,
+        &filters,
+        runtime_contexts.as_ref(),
+        &mut is_cancelled,
+    )?;
     let root_path = if changed_ids.contains(&root.id) {
         Some(Vec::new())
     } else {
@@ -754,7 +1104,8 @@ pub fn impact(
             &edge_map,
             &filters,
             &mut budget,
-        )
+            &mut is_cancelled,
+        )?
     };
     let root_impacted = root_path.is_some();
     let mut impacts = Vec::new();
@@ -763,48 +1114,106 @@ pub fn impact(
             .last()
             .map(|edge: &EdgeRecord| edge.target.clone())
             .unwrap_or_else(|| root.id.clone());
-        let scoped = reverse_paths(&root.id, &reverse, &edge_map, &filters, &mut budget);
-        for (node_id, (depth, prefix)) in scoped {
+        let scoped =
+            reverse_path_index(&root.id, &reverse, &filters, &mut budget, &mut is_cancelled)?;
+        preflight_path_materialization(&scoped, root_path.len(), &node_map, &mut is_cancelled)?;
+        let evidence_filter = GraphQueryFilter {
+            phases: filters.phases.clone(),
+            profiles: filters.profiles.clone(),
+            sessions: filters.sessions.clone(),
+            environments: filters.environments.clone(),
+        };
+        let mut projection_edges = Vec::new();
+        for edge_id in scoped.successor.values() {
+            check_cancelled(&mut is_cancelled)?;
+            projection_edges.push(
+                edge_map
+                    .get(edge_id)
+                    .copied()
+                    .ok_or_else(|| anyhow::anyhow!("impact reverse path edge is unavailable"))?,
+            );
+        }
+        for edge in &root_path {
+            check_cancelled(&mut is_cancelled)?;
+            projection_edges.push(edge);
+        }
+        let mut path_steps = PathStepMaterializer::new(
+            snapshot,
+            &evidence_filter,
+            projection_edges.iter().copied(),
+            MAX_GRAPH_SERVICE_PREPROCESSING_WORK_ITEMS,
+            &mut is_cancelled,
+        )?;
+        for (node_id, depth) in scoped.depths {
+            check_cancelled(&mut is_cancelled)?;
             let Some(node) = node_map.get(&node_id).cloned() else {
                 continue;
             };
-            let mut path = prefix;
-            path.extend(root_path.clone());
+            let path_length = depth + root_path.len();
+            let mut dependency_path = Vec::with_capacity(path_length);
+            let mut current = node_id.as_str();
+            while current != root.id {
+                check_cancelled(&mut is_cancelled)?;
+                let edge_id = scoped.successor.get(current).ok_or_else(|| {
+                    anyhow::anyhow!("impact reverse path successor is unavailable")
+                })?;
+                let edge = edge_map
+                    .get(edge_id)
+                    .copied()
+                    .ok_or_else(|| anyhow::anyhow!("impact reverse path edge is unavailable"))?;
+                dependency_path.push(path_steps.materialize(edge, &mut is_cancelled)?);
+                current = edge.target.as_str();
+            }
+            for edge in &root_path {
+                check_cancelled(&mut is_cancelled)?;
+                dependency_path.push(path_steps.materialize(edge, &mut is_cancelled)?);
+            }
             impacts.push(ImpactNode {
                 node,
                 depth,
                 changed_node_id: changed_node_id.clone(),
-                dependency_path: path_steps_for_edges_filtered(snapshot, &path, &evidence_filter),
+                dependency_path,
             });
         }
-        impacts.sort_by(|left, right| left.node.id.cmp(&right.node.id));
     }
 
-    let mut diagnostics: Vec<_> = budget.diagnostics.into_values().collect();
+    let mut diagnostics = budget
+        .diagnostics
+        .into_values()
+        .map(|diagnostic| {
+            (
+                (diagnostic.code.clone(), diagnostic.message.clone()),
+                diagnostic,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
     if changed_set.is_some() {
         for mapping in &mappings {
+            check_cancelled(&mut is_cancelled)?;
             if mapping.correlated_node_ids.is_empty() {
-                diagnostics.push(ImpactDiagnostic {
-                    code: "changed_path_unmapped".to_owned(),
-                    message: format!(
-                        "changed path {} was not present in the selected snapshot",
-                        mapping
-                            .change
-                            .new_path
-                            .as_deref()
-                            .or(mapping.change.old_path.as_deref())
-                            .unwrap_or("unknown")
-                    ),
-                });
+                let code = "changed_path_unmapped".to_owned();
+                let message = format!(
+                    "changed path {} was not present in the selected snapshot",
+                    mapping
+                        .change
+                        .new_path
+                        .as_deref()
+                        .or(mapping.change.old_path.as_deref())
+                        .unwrap_or("unknown")
+                );
+                diagnostics.insert(
+                    (code.clone(), message.clone()),
+                    ImpactDiagnostic { code, message },
+                );
             }
         }
     }
-    diagnostics.sort_by(|left, right| {
-        left.code
-            .cmp(&right.code)
-            .then(left.message.cmp(&right.message))
-    });
-    diagnostics.dedup_by(|left, right| left.code == right.code && left.message == right.message);
+    check_cancelled(&mut is_cancelled)?;
+    let mut finalized_diagnostics = Vec::with_capacity(diagnostics.len());
+    for diagnostic in diagnostics.into_values() {
+        check_cancelled(&mut is_cancelled)?;
+        finalized_diagnostics.push(diagnostic);
+    }
 
     Ok(ImpactResult {
         root,
@@ -815,37 +1224,354 @@ pub fn impact(
         mappings,
         changed_nodes,
         impacts,
-        diagnostics,
+        diagnostics: finalized_diagnostics,
     })
 }
 
-fn adjacency<'a>(
+fn adjacency_cancellable<'a>(
     snapshot: &'a GraphSnapshot,
     reverse: bool,
     filters: &ImpactFilters,
-) -> BTreeMap<String, Vec<&'a EdgeRecord>> {
-    let mut adjacency = BTreeMap::<String, Vec<&EdgeRecord>>::new();
-    for edge in snapshot
-        .edges
-        .iter()
-        .filter(|edge| filters.matches(snapshot, edge))
-    {
-        let key = if reverse { &edge.target } else { &edge.source };
-        adjacency.entry(key.clone()).or_default().push(edge);
-    }
-    for edges in adjacency.values_mut() {
-        edges.sort_by(|left, right| {
-            let left_next = if reverse { &left.source } else { &left.target };
-            let right_next = if reverse {
-                &right.source
-            } else {
-                &right.target
-            };
-            left_next.cmp(right_next).then(left.id.cmp(&right.id))
-        });
-    }
-    adjacency
+    runtime_contexts: Option<&BTreeMap<String, RuntimeEdgeContext>>,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<BTreeMap<String, Vec<&'a EdgeRecord>>> {
+    adjacency_with_limit(
+        snapshot,
+        reverse,
+        filters,
+        runtime_contexts,
+        MAX_GRAPH_SERVICE_PREPROCESSING_WORK_ITEMS,
+        is_cancelled,
+    )
 }
+
+fn adjacency_with_limit<'a>(
+    snapshot: &'a GraphSnapshot,
+    reverse: bool,
+    filters: &ImpactFilters,
+    runtime_contexts: Option<&BTreeMap<String, RuntimeEdgeContext>>,
+    maximum_work: usize,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<BTreeMap<String, Vec<&'a EdgeRecord>>> {
+    let mut work = ImpactAdjacencyWork::new(maximum_work);
+    let mut ordered = BTreeMap::<String, BTreeMap<(String, String), &EdgeRecord>>::new();
+    for edge in &snapshot.edges {
+        work.step(is_cancelled)?;
+        #[cfg(test)]
+        IMPACT_ADJACENCY_EDGE_SCANS.fetch_add(1, Ordering::Relaxed);
+        if !filters.matches(edge, runtime_contexts) {
+            continue;
+        }
+        work.step(is_cancelled)?;
+        let key = if reverse { &edge.target } else { &edge.source };
+        let next = if reverse { &edge.source } else { &edge.target };
+        ordered
+            .entry(key.clone())
+            .or_default()
+            .insert((next.clone(), edge.id.clone()), edge);
+        #[cfg(test)]
+        IMPACT_ADJACENCY_INSERT_VISITS.fetch_add(1, Ordering::Relaxed);
+    }
+    let mut adjacency = BTreeMap::new();
+    for (source, edges) in ordered {
+        let mut materialized = Vec::with_capacity(edges.len());
+        for edge in edges.into_values() {
+            work.step(is_cancelled)?;
+            materialized.push(edge);
+            #[cfg(test)]
+            IMPACT_ADJACENCY_MATERIALIZATION_VISITS.fetch_add(1, Ordering::Relaxed);
+        }
+        adjacency.insert(source, materialized);
+    }
+    Ok(adjacency)
+}
+
+struct ImpactAdjacencyWork {
+    used: usize,
+    maximum: usize,
+}
+
+impl ImpactAdjacencyWork {
+    const fn new(maximum: usize) -> Self {
+        Self { used: 0, maximum }
+    }
+
+    fn step(&mut self, is_cancelled: &mut impl FnMut() -> bool) -> Result<()> {
+        check_cancelled(is_cancelled)?;
+        if self.used >= self.maximum {
+            return Err(ImpactAdjacencyPreprocessingExhausted.into());
+        }
+        self.used += 1;
+        #[cfg(test)]
+        IMPACT_ADJACENCY_WORK_ITEMS.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+static IMPACT_ADJACENCY_WORK_ITEMS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static IMPACT_ADJACENCY_EDGE_SCANS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static IMPACT_ADJACENCY_INSERT_VISITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static IMPACT_ADJACENCY_MATERIALIZATION_VISITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+fn runtime_context_index_cancellable(
+    snapshot: &GraphSnapshot,
+    filters: &ImpactFilters,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<Option<BTreeMap<String, RuntimeEdgeContext>>> {
+    runtime_context_index_with_limit(
+        snapshot,
+        filters,
+        MAX_GRAPH_SERVICE_PREPROCESSING_WORK_ITEMS,
+        is_cancelled,
+    )
+}
+
+fn runtime_context_index_with_limit(
+    snapshot: &GraphSnapshot,
+    filters: &ImpactFilters,
+    maximum_work: usize,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<Option<BTreeMap<String, RuntimeEdgeContext>>> {
+    if (filters.sessions.is_empty() && filters.environments.is_empty())
+        || (!filters.phases.is_empty()
+            && filters
+                .phases
+                .binary_search_by(|phase| phase.as_str().cmp("runtime"))
+                .is_err())
+    {
+        return Ok(None);
+    }
+    #[cfg(test)]
+    RUNTIME_CONTEXT_INDEX_BUILDS.fetch_add(1, Ordering::Relaxed);
+
+    let mut work = RuntimeContextWorkBudget::new(maximum_work);
+    let mut accumulators = BTreeMap::<String, RuntimeContextAccumulator>::new();
+    for evidence in &snapshot.evidence {
+        work.step(is_cancelled)?;
+        #[cfg(test)]
+        RUNTIME_CONTEXT_EVIDENCE_VISITS.fetch_add(1, Ordering::Relaxed);
+        if evidence.owner_type != "edge" || evidence.kind != "runtime" {
+            continue;
+        }
+        if !accumulators.contains_key(&evidence.owner_id) {
+            work.step(is_cancelled)?;
+            accumulators.insert(
+                evidence.owner_id.clone(),
+                RuntimeContextAccumulator::default(),
+            );
+        }
+        let accumulator = accumulators
+            .get_mut(&evidence.owner_id)
+            .expect("runtime context accumulator was inserted");
+        insert_runtime_string(
+            &mut accumulator.session_ids,
+            evidence.properties.get("session_id"),
+            &mut work,
+            is_cancelled,
+        )?;
+        insert_runtime_string(
+            &mut accumulator.source_session_ids,
+            evidence.properties.get("source_session_id"),
+            &mut work,
+            is_cancelled,
+        )?;
+        if let Some(environment) = evidence.properties.get("environment") {
+            insert_runtime_string(
+                &mut accumulator.environment_names,
+                environment.get("name"),
+                &mut work,
+                is_cancelled,
+            )?;
+            insert_runtime_string(
+                &mut accumulator.runtimes,
+                environment.get("runtime"),
+                &mut work,
+                is_cancelled,
+            )?;
+            insert_runtime_string(
+                &mut accumulator.regions,
+                environment.get("region"),
+                &mut work,
+                is_cancelled,
+            )?;
+        }
+        accumulator.observation_count = accumulator.observation_count.saturating_add(
+            evidence
+                .properties
+                .get("count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+        );
+        update_runtime_min(
+            &mut accumulator.first_observed_at,
+            evidence
+                .properties
+                .get("first_observed_at")
+                .and_then(serde_json::Value::as_str),
+            &mut work,
+            is_cancelled,
+        )?;
+        update_runtime_max(
+            &mut accumulator.last_observed_at,
+            evidence
+                .properties
+                .get("last_observed_at")
+                .and_then(serde_json::Value::as_str),
+            &mut work,
+            is_cancelled,
+        )?;
+    }
+    let mut contexts = BTreeMap::new();
+    for (edge_id, accumulator) in accumulators {
+        work.step(is_cancelled)?;
+        contexts.insert(
+            edge_id,
+            RuntimeEdgeContext {
+                session_ids: materialize_runtime_values(
+                    accumulator.session_ids,
+                    &mut work,
+                    is_cancelled,
+                )?,
+                source_session_ids: materialize_runtime_values(
+                    accumulator.source_session_ids,
+                    &mut work,
+                    is_cancelled,
+                )?,
+                environment_names: materialize_runtime_values(
+                    accumulator.environment_names,
+                    &mut work,
+                    is_cancelled,
+                )?,
+                runtimes: materialize_runtime_values(
+                    accumulator.runtimes,
+                    &mut work,
+                    is_cancelled,
+                )?,
+                regions: materialize_runtime_values(accumulator.regions, &mut work, is_cancelled)?,
+                observation_count: accumulator.observation_count,
+                first_observed_at: accumulator.first_observed_at,
+                last_observed_at: accumulator.last_observed_at,
+            },
+        );
+    }
+    check_cancelled(is_cancelled)?;
+    Ok(Some(contexts))
+}
+
+#[derive(Default)]
+struct RuntimeContextAccumulator {
+    session_ids: BTreeSet<String>,
+    source_session_ids: BTreeSet<String>,
+    environment_names: BTreeSet<String>,
+    runtimes: BTreeSet<String>,
+    regions: BTreeSet<String>,
+    observation_count: u64,
+    first_observed_at: Option<String>,
+    last_observed_at: Option<String>,
+}
+
+struct RuntimeContextWorkBudget {
+    used: usize,
+    maximum: usize,
+}
+
+impl RuntimeContextWorkBudget {
+    const fn new(maximum: usize) -> Self {
+        Self { used: 0, maximum }
+    }
+
+    fn step(&mut self, is_cancelled: &mut impl FnMut() -> bool) -> Result<()> {
+        check_cancelled(is_cancelled)?;
+        if self.used >= self.maximum {
+            return Err(ImpactRuntimeContextIndexExhausted.into());
+        }
+        self.used += 1;
+        #[cfg(test)]
+        RUNTIME_CONTEXT_WORK_ITEMS.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+fn insert_runtime_string(
+    output: &mut BTreeSet<String>,
+    value: Option<&serde_json::Value>,
+    work: &mut RuntimeContextWorkBudget,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<()> {
+    if let Some(value) = value.and_then(serde_json::Value::as_str)
+        && !output.contains(value)
+    {
+        work.step(is_cancelled)?;
+        output.insert(value.to_owned());
+    }
+    Ok(())
+}
+
+fn update_runtime_min(
+    current: &mut Option<String>,
+    value: Option<&str>,
+    work: &mut RuntimeContextWorkBudget,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<()> {
+    if let Some(value) = value
+        && current.as_deref().is_none_or(|current| value < current)
+    {
+        work.step(is_cancelled)?;
+        *current = Some(value.to_owned());
+    }
+    Ok(())
+}
+
+fn update_runtime_max(
+    current: &mut Option<String>,
+    value: Option<&str>,
+    work: &mut RuntimeContextWorkBudget,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<()> {
+    if let Some(value) = value
+        && current.as_deref().is_none_or(|current| value > current)
+    {
+        work.step(is_cancelled)?;
+        *current = Some(value.to_owned());
+    }
+    Ok(())
+}
+
+fn materialize_runtime_values(
+    values: BTreeSet<String>,
+    work: &mut RuntimeContextWorkBudget,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<Vec<String>> {
+    let mut materialized = Vec::with_capacity(values.len());
+    for value in values {
+        work.step(is_cancelled)?;
+        materialized.push(value);
+        #[cfg(test)]
+        RUNTIME_CONTEXT_OUTPUT_VALUE_VISITS.fetch_add(1, Ordering::Relaxed);
+    }
+    Ok(materialized)
+}
+
+#[cfg(test)]
+static RUNTIME_CONTEXT_INDEX_BUILDS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static RUNTIME_CONTEXT_EVIDENCE_VISITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static RUNTIME_CONTEXT_WORK_ITEMS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static RUNTIME_CONTEXT_OUTPUT_VALUE_VISITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 fn shortest_path_to_changed(
     root_id: &str,
@@ -854,16 +1580,19 @@ fn shortest_path_to_changed(
     edge_map: &BTreeMap<String, &EdgeRecord>,
     filters: &ImpactFilters,
     budget: &mut TraversalBudget,
-) -> Option<Vec<EdgeRecord>> {
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<Option<Vec<EdgeRecord>>> {
     if changed_ids.is_empty() {
-        return None;
+        return Ok(None);
     }
     let mut queue = VecDeque::from([root_id.to_owned()]);
     let mut seen = BTreeSet::from([root_id.to_owned()]);
     let mut predecessor = BTreeMap::<String, String>::new();
     let mut found = None;
     'search: while let Some(node_id) = queue.pop_front() {
+        check_cancelled(is_cancelled)?;
         for edge in adjacency.get(&node_id).into_iter().flatten() {
+            check_cancelled(is_cancelled)?;
             if !budget.admit_edge(edge, filters) {
                 break 'search;
             }
@@ -880,34 +1609,51 @@ fn shortest_path_to_changed(
             }
         }
     }
-    let mut current = found?;
+    let Some(mut current) = found else {
+        return Ok(None);
+    };
     let mut reversed = Vec::new();
     while current != root_id {
-        let edge_id = predecessor.get(&current)?;
-        let edge = *edge_map.get(edge_id)?;
+        check_cancelled(is_cancelled)?;
+        if reversed.len() >= MAX_DEPENDENCY_PATH_STEPS {
+            return Err(ImpactPathMaterializationExhausted.into());
+        }
+        let Some(edge_id) = predecessor.get(&current) else {
+            return Ok(None);
+        };
+        let Some(edge) = edge_map.get(edge_id).copied() else {
+            return Ok(None);
+        };
         reversed.push(edge.clone());
         current = edge.source.clone();
     }
     reversed.reverse();
-    Some(reversed)
+    Ok(Some(reversed))
 }
 
-fn reverse_paths(
+struct ReversePathIndex {
+    successor: BTreeMap<String, String>,
+    depths: BTreeMap<String, usize>,
+}
+
+fn reverse_path_index(
     root_id: &str,
     adjacency: &BTreeMap<String, Vec<&EdgeRecord>>,
-    edge_map: &BTreeMap<String, &EdgeRecord>,
     filters: &ImpactFilters,
     budget: &mut TraversalBudget,
-) -> BTreeMap<String, (usize, Vec<EdgeRecord>)> {
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<ReversePathIndex> {
     let mut queue = VecDeque::from([(root_id.to_owned(), 0_usize)]);
     let mut seen = BTreeSet::from([root_id.to_owned()]);
     let mut successor = BTreeMap::<String, String>::new();
     let mut depths = BTreeMap::from([(root_id.to_owned(), 0_usize)]);
     'search: while let Some((node_id, depth)) = queue.pop_front() {
+        check_cancelled(is_cancelled)?;
         if filters.depth.is_some_and(|limit| depth >= limit) {
             continue;
         }
         for edge in adjacency.get(&node_id).into_iter().flatten() {
+            check_cancelled(is_cancelled)?;
             if !budget.admit_edge(edge, filters) {
                 break 'search;
             }
@@ -922,28 +1668,44 @@ fn reverse_paths(
         }
     }
 
-    let mut paths = BTreeMap::new();
-    for (node_id, depth) in depths {
-        let mut current = node_id.clone();
-        let mut edges = Vec::new();
-        while current != root_id {
-            let Some(edge_id) = successor.get(&current) else {
-                break;
-            };
-            let Some(edge) = edge_map.get(edge_id).copied() else {
-                break;
-            };
-            edges.push(edge.clone());
-            current = edge.target.clone();
+    check_cancelled(is_cancelled)?;
+    Ok(ReversePathIndex { successor, depths })
+}
+
+fn preflight_path_materialization(
+    paths: &ReversePathIndex,
+    suffix_length: usize,
+    nodes: &BTreeMap<String, NodeRecord>,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<()> {
+    let mut cumulative_steps = 0_usize;
+    for (node_id, depth) in &paths.depths {
+        check_cancelled(is_cancelled)?;
+        if !nodes.contains_key(node_id) {
+            continue;
         }
-        paths.insert(node_id, (depth, edges));
+        let path_steps = depth
+            .checked_add(suffix_length)
+            .ok_or(ImpactPathMaterializationExhausted)?;
+        if path_steps > MAX_DEPENDENCY_PATH_STEPS {
+            return Err(ImpactPathMaterializationExhausted.into());
+        }
+        cumulative_steps = cumulative_steps
+            .checked_add(path_steps)
+            .ok_or(ImpactPathMaterializationExhausted)?;
+        if cumulative_steps > MAX_IMPACT_MATERIALIZED_PATH_STEPS {
+            return Err(ImpactPathMaterializationExhausted.into());
+        }
     }
-    paths
+    check_cancelled(is_cancelled)?;
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    #[cfg(unix)]
+    use std::time::Instant;
+    use std::{fs, sync::Mutex};
 
     use depgraph_store::{
         CoverageRecord, EdgeRecord, EvidenceRecord, GraphSnapshot, NodeRecord, ScanRecord,
@@ -951,6 +1713,22 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    static IMPACT_PREPROCESSING_TEST_LOCK: Mutex<()> = Mutex::new(());
+    static CHANGED_SET_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn reset_changed_set_counters() {
+        for counter in [
+            &PATH_NODE_INDEX_SITE_VISITS,
+            &PATH_NODE_INDEX_EDGE_VISITS,
+            &CHANGED_NODE_ID_COPY_VISITS,
+            &CHANGED_CORRELATED_ID_MATERIALIZATION_VISITS,
+            &CHANGED_SOURCE_MATERIALIZATION_VISITS,
+            &CHANGED_SET_WORK_ITEMS,
+        ] {
+            counter.store(0, Ordering::Relaxed);
+        }
+    }
 
     fn run_git(root: &Path, args: &[&str]) -> String {
         let output = Command::new("git")
@@ -1015,6 +1793,47 @@ mod tests {
                 && change.old_path.as_deref() == Some("old.rs")
                 && change.new_path.as_deref() == Some("new.rs")
         }));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_child_output_overflow_kills_reaps_and_joins_promptly() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let pid_path = temporary.path().join("overflow-helper.pid");
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("echo $$ > \"$1\"; while :; do printf '0123456789abcdef'; done")
+            .arg("depgraph-overflow-helper")
+            .arg(&pid_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let started = Instant::now();
+        let error = run_bounded_child_cancellable(command, 64, &mut || false)
+            .expect_err("unbounded helper output must fail closed");
+        assert_eq!(
+            error.to_string(),
+            "Git changed-set output exceeded the bounded output limit"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "overflow supervision did not terminate promptly"
+        );
+
+        let pid = fs::read_to_string(&pid_path)?.trim().to_owned();
+        let process_still_exists = Command::new("kill")
+            .args(["-0", &pid])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()?
+            .success();
+        assert!(
+            !process_still_exists,
+            "overflow helper {pid} was not killed and reaped"
+        );
         Ok(())
     }
 
@@ -1134,6 +1953,68 @@ mod tests {
         }
     }
 
+    fn hostile_changed_set_fixture() -> (GraphSnapshot, GitChangedSet, usize) {
+        let node_count = 32_usize;
+        let site_count = 8_usize;
+        let edge_count = 8_usize;
+        let source_count = 8_usize;
+        let mut snapshot = graph();
+        snapshot.nodes = (0..node_count)
+            .map(|index| node(&format!("shared:{index:02}"), "file", Some("src/shared.rs")))
+            .collect();
+        snapshot.sites = (0..site_count)
+            .map(|index| {
+                serde_json::from_value(json!({
+                    "id": format!("site:{index:02}"),
+                    "source": format!("shared:{:02}", index % node_count),
+                    "kind": "import",
+                    "specifier": "fixture:dependency",
+                    "resolution_status": "resolved",
+                    "target_ids": [format!("shared:{:02}", (index + 1) % node_count)],
+                    "profile_id": "fixture:profile",
+                    "condition": {"op":"all","conditions":[]},
+                    "precision": "exact"
+                }))
+                .expect("valid changed-set site")
+            })
+            .collect();
+        snapshot.edges = (0..edge_count)
+            .map(|index| {
+                edge(
+                    &format!("edge:{index:02}"),
+                    &format!("shared:{:02}", index % node_count),
+                    &format!("shared:{:02}", (index + 1) % node_count),
+                    "fixture:profile",
+                )
+            })
+            .collect();
+        snapshot.evidence.clear();
+        let changed_set = GitChangedSet {
+            requested_ref: "main".to_owned(),
+            resolved_ref: "a".repeat(40),
+            merge_base: "a".repeat(40),
+            head: "b".repeat(40),
+            repository_prefix: String::new(),
+            changes: vec![GitChange {
+                status: "modified".to_owned(),
+                similarity: None,
+                old_path: Some("src/shared.rs".to_owned()),
+                new_path: Some("src/shared.rs".to_owned()),
+                sources: (0..source_count)
+                    .map(|index| format!("source-{index}"))
+                    .collect(),
+            }],
+        };
+        let calculated_work = node_count * 2
+            + site_count
+            + edge_count
+            + 1
+            + node_count * 2 * 2
+            + node_count
+            + source_count;
+        (snapshot, changed_set, calculated_work)
+    }
+
     #[test]
     fn warm_query_cache_keys_are_snapshot_selector_and_filter_scoped() -> Result<()> {
         let filters = ImpactFilters::new(None, vec![], vec![], 20, 30)?;
@@ -1163,7 +2044,8 @@ mod tests {
 
     #[test]
     fn rename_maps_old_and_new_paths_to_one_correlated_identity() {
-        let mappings = map_changed_set(&graph(), &rename_set());
+        let _guard = CHANGED_SET_TEST_LOCK.lock().expect("changed-set test lock");
+        let mappings = map_changed_set(&graph(), &rename_set()).expect("changed paths map");
         assert!(mappings[0].old_node_ids.is_empty());
         assert_eq!(
             mappings[0].new_node_ids,
@@ -1176,7 +2058,73 @@ mod tests {
     }
 
     #[test]
+    fn changed_set_preprocessing_is_exactly_bounded_and_cancellable_in_each_nested_loop() {
+        let _guard = CHANGED_SET_TEST_LOCK.lock().expect("changed-set test lock");
+        let (snapshot, changed_set, calculated_work) = hostile_changed_set_fixture();
+
+        reset_changed_set_counters();
+        let mappings =
+            map_changed_set_with_limit(&snapshot, &changed_set, calculated_work, &mut || false)
+                .expect("the exact calculated changed-set work bound must succeed");
+        assert_eq!(
+            CHANGED_SET_WORK_ITEMS.load(Ordering::Relaxed),
+            calculated_work
+        );
+        assert_eq!(mappings.len(), 1);
+        assert_eq!(mappings[0].old_node_ids.len(), snapshot.nodes.len());
+        assert_eq!(mappings[0].new_node_ids, mappings[0].old_node_ids);
+        assert_eq!(
+            mappings[0].correlated_node_ids, mappings[0].old_node_ids,
+            "correlated IDs remain sorted and deduplicated"
+        );
+        assert_eq!(mappings[0].change.sources, changed_set.changes[0].sources);
+
+        reset_changed_set_counters();
+        let error =
+            map_changed_set_with_limit(&snapshot, &changed_set, calculated_work - 1, &mut || false)
+                .expect_err("one work item above the maximum must return no mapping");
+        assert!(
+            error
+                .downcast_ref::<ImpactChangedSetPreprocessingExhausted>()
+                .is_some()
+        );
+        assert_eq!(
+            CHANGED_SET_WORK_ITEMS.load(Ordering::Relaxed),
+            calculated_work - 1
+        );
+
+        for (counter, stage) in [
+            (&PATH_NODE_INDEX_SITE_VISITS, "site index"),
+            (&PATH_NODE_INDEX_EDGE_VISITS, "edge index"),
+            (&CHANGED_NODE_ID_COPY_VISITS, "path node-ID copy"),
+            (
+                &CHANGED_CORRELATED_ID_MATERIALIZATION_VISITS,
+                "correlated-ID materialization",
+            ),
+            (
+                &CHANGED_SOURCE_MATERIALIZATION_VISITS,
+                "source materialization",
+            ),
+        ] {
+            reset_changed_set_counters();
+            let result =
+                map_changed_set_with_limit(&snapshot, &changed_set, calculated_work, &mut || {
+                    counter.load(Ordering::Relaxed) >= 3
+                });
+            let error = match result {
+                Err(error) => error,
+                Ok(_) => panic!("cancellation inside {stage} must return no mapping"),
+            };
+            assert!(error.to_string().contains("cancelled"), "stage: {stage}");
+            assert_eq!(counter.load(Ordering::Relaxed), 3, "stage: {stage}");
+        }
+    }
+
+    #[test]
     fn reverse_impact_is_deterministic_filterable_and_has_paths() -> Result<()> {
+        let _guard = IMPACT_PREPROCESSING_TEST_LOCK
+            .lock()
+            .expect("impact preprocessing test lock");
         let graph = graph();
         let condition = render_condition(&graph.edges[0].condition);
         let filters = ImpactFilters::new(
@@ -1258,15 +2206,117 @@ mod tests {
     }
 
     #[test]
+    fn high_fanout_adjacency_is_ordered_once_tightly_bounded_and_cancellable() -> Result<()> {
+        let _guard = IMPACT_PREPROCESSING_TEST_LOCK
+            .lock()
+            .expect("impact preprocessing test lock");
+        let edge_count = 256_usize;
+        let mut graph = graph();
+        graph.edges = (0..edge_count)
+            .rev()
+            .map(|index| {
+                edge(
+                    &format!("edge:{:04}", edge_count - index),
+                    "fanout:root",
+                    &format!("fanout:{index:04}"),
+                    "fixture:profile",
+                )
+            })
+            .collect();
+        graph.evidence.clear();
+        let filters = ImpactFilters::new(None, Vec::new(), Vec::new(), edge_count + 1, edge_count)?;
+        let exact_work = edge_count * 3;
+        let reset = || {
+            for counter in [
+                &IMPACT_ADJACENCY_WORK_ITEMS,
+                &IMPACT_ADJACENCY_EDGE_SCANS,
+                &IMPACT_ADJACENCY_INSERT_VISITS,
+                &IMPACT_ADJACENCY_MATERIALIZATION_VISITS,
+            ] {
+                counter.store(0, Ordering::Relaxed);
+            }
+        };
+
+        reset();
+        let adjacency =
+            adjacency_with_limit(&graph, false, &filters, None, exact_work, &mut || false)?;
+        let bucket = adjacency.get("fanout:root").expect("fanout bucket");
+        assert_eq!(bucket.len(), edge_count);
+        assert!(
+            bucket
+                .windows(2)
+                .all(|pair| { (&pair[0].target, &pair[0].id) < (&pair[1].target, &pair[1].id) })
+        );
+        assert_eq!(
+            IMPACT_ADJACENCY_WORK_ITEMS.load(Ordering::Relaxed),
+            exact_work
+        );
+        assert_eq!(
+            IMPACT_ADJACENCY_EDGE_SCANS.load(Ordering::Relaxed),
+            edge_count
+        );
+        assert_eq!(
+            IMPACT_ADJACENCY_INSERT_VISITS.load(Ordering::Relaxed),
+            edge_count
+        );
+        assert_eq!(
+            IMPACT_ADJACENCY_MATERIALIZATION_VISITS.load(Ordering::Relaxed),
+            edge_count
+        );
+
+        reset();
+        let error =
+            adjacency_with_limit(&graph, false, &filters, None, exact_work - 1, &mut || false)
+                .expect_err("one adjacency work item above the bound returns no adjacency");
+        assert!(
+            error
+                .downcast_ref::<ImpactAdjacencyPreprocessingExhausted>()
+                .is_some()
+        );
+
+        for (counter, stage) in [
+            (&IMPACT_ADJACENCY_INSERT_VISITS, "ordered insertion"),
+            (
+                &IMPACT_ADJACENCY_MATERIALIZATION_VISITS,
+                "ordered materialization",
+            ),
+        ] {
+            reset();
+            let result =
+                adjacency_with_limit(&graph, false, &filters, None, exact_work, &mut || {
+                    counter.load(Ordering::Relaxed) >= 3
+                });
+            let error = match result {
+                Err(error) => error,
+                Ok(_) => panic!("cancellation inside {stage} must return no adjacency"),
+            };
+            assert_eq!(error.to_string(), "graph operation was cancelled");
+            assert_eq!(counter.load(Ordering::Relaxed), 3, "stage: {stage}");
+            if stage == "ordered materialization" {
+                assert_eq!(
+                    IMPACT_ADJACENCY_EDGE_SCANS.load(Ordering::Relaxed),
+                    edge_count,
+                    "ordered materialization must not rescan edges"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn runtime_environment_filter_excludes_static_edges_with_the_same_label() -> Result<()> {
+        let _guard = IMPACT_PREPROCESSING_TEST_LOCK
+            .lock()
+            .expect("runtime index test lock");
         let mut graph = graph();
         let filters = ImpactFilters::new(None, Vec::new(), Vec::new(), 20, 20)?
             .with_runtime_filters(Vec::new(), Vec::new(), vec!["server".to_owned()])?;
+        let runtime_contexts = runtime_context_index_cancellable(&graph, &filters, &mut || false)?;
         assert!(
             graph
                 .edges
                 .iter()
-                .all(|edge| !filters.matches(&graph, edge))
+                .all(|edge| !filters.matches(edge, runtime_contexts.as_ref()))
         );
 
         graph.edges[0].phase = "runtime".to_owned();
@@ -1289,12 +2339,138 @@ mod tests {
                 "environment":{"name":"server"}
             }),
         });
-        assert!(filters.matches(&graph, &graph.edges[0]));
+        let runtime_contexts = runtime_context_index_cancellable(&graph, &filters, &mut || false)?;
+        assert!(filters.matches(&graph.edges[0], runtime_contexts.as_ref()));
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_context_index_is_single_pass_bounded_and_cancellable() -> Result<()> {
+        let _guard = IMPACT_PREPROCESSING_TEST_LOCK
+            .lock()
+            .expect("runtime index test lock");
+        let mut graph = graph();
+        graph.edges[0].phase = "runtime".to_owned();
+        graph.evidence = (0..128)
+            .map(|ordinal| EvidenceRecord {
+                owner_type: "edge".to_owned(),
+                owner_id: graph.edges[0].id.clone(),
+                ordinal,
+                kind: "runtime".to_owned(),
+                extractor: "runtime-trace".to_owned(),
+                extractor_version: "1.0".to_owned(),
+                path: String::new(),
+                start_line: 1,
+                start_column: 1,
+                end_line: 1,
+                end_column: 1,
+                detail: None,
+                properties: json!({
+                    "session_id": format!("session-{}", ordinal % 4),
+                    "source_session_id": format!("source-{}", ordinal % 3),
+                    "environment": {
+                        "name": format!("environment-{}", ordinal % 2),
+                        "runtime": "node",
+                        "region": "test-region"
+                    },
+                    "count": 1,
+                    "first_observed_at": format!("2026-01-01T00:00:{:02}Z", ordinal % 60),
+                    "last_observed_at": format!("2026-01-01T00:01:{:02}Z", ordinal % 60)
+                }),
+            })
+            .collect();
+        let filters = ImpactFilters::new(None, Vec::new(), Vec::new(), 128, 1)?
+            .with_runtime_filters(
+                Vec::new(),
+                vec!["session-1".to_owned()],
+                vec!["environment-1".to_owned()],
+            )?;
+
+        RUNTIME_CONTEXT_INDEX_BUILDS.store(0, Ordering::Relaxed);
+        RUNTIME_CONTEXT_EVIDENCE_VISITS.store(0, Ordering::Relaxed);
+        RUNTIME_CONTEXT_WORK_ITEMS.store(0, Ordering::Relaxed);
+        RUNTIME_CONTEXT_OUTPUT_VALUE_VISITS.store(0, Ordering::Relaxed);
+        let contexts = runtime_context_index_with_limit(&graph, &filters, 10_000, &mut || false)?
+            .expect("runtime filters build an index");
+        let required_work = RUNTIME_CONTEXT_WORK_ITEMS.load(Ordering::Relaxed);
+        assert!(required_work > graph.evidence.len());
+        assert_eq!(RUNTIME_CONTEXT_INDEX_BUILDS.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            RUNTIME_CONTEXT_EVIDENCE_VISITS.load(Ordering::Relaxed),
+            128,
+            "the evidence input must be scanned exactly once"
+        );
+        assert_eq!(
+            contexts[&graph.edges[0].id],
+            depgraph_store::runtime_context_for_edge(&graph, &graph.edges[0]),
+            "the indexed context must preserve the store helper semantics"
+        );
+        for _ in 0..1_000 {
+            for edge in &graph.edges {
+                let _ = filters.matches(edge, Some(&contexts));
+            }
+        }
+        assert_eq!(
+            RUNTIME_CONTEXT_EVIDENCE_VISITS.load(Ordering::Relaxed),
+            128,
+            "edge matching must not rescan evidence"
+        );
+
+        RUNTIME_CONTEXT_WORK_ITEMS.store(0, Ordering::Relaxed);
+        runtime_context_index_with_limit(&graph, &filters, required_work, &mut || false)?
+            .expect("the exact runtime-context work bound must be accepted");
+        assert_eq!(
+            RUNTIME_CONTEXT_WORK_ITEMS.load(Ordering::Relaxed),
+            required_work
+        );
+        let over_limit =
+            runtime_context_index_with_limit(&graph, &filters, required_work - 1, &mut || false)
+                .expect_err("one work item above the hard bound must fail closed");
+        assert!(
+            over_limit
+                .downcast_ref::<ImpactRuntimeContextIndexExhausted>()
+                .is_some()
+        );
+
+        RUNTIME_CONTEXT_EVIDENCE_VISITS.store(0, Ordering::Relaxed);
+        RUNTIME_CONTEXT_OUTPUT_VALUE_VISITS.store(0, Ordering::Relaxed);
+        let cancelled = runtime_context_index_with_limit(&graph, &filters, 10_000, &mut || {
+            RUNTIME_CONTEXT_EVIDENCE_VISITS.load(Ordering::Relaxed) >= 3
+        })
+        .expect_err("cancellation inside the evidence scan must fail closed");
+        assert_eq!(cancelled.to_string(), "graph operation was cancelled");
+        assert_eq!(RUNTIME_CONTEXT_EVIDENCE_VISITS.load(Ordering::Relaxed), 3);
+
+        RUNTIME_CONTEXT_EVIDENCE_VISITS.store(0, Ordering::Relaxed);
+        RUNTIME_CONTEXT_OUTPUT_VALUE_VISITS.store(0, Ordering::Relaxed);
+        let cancelled = runtime_context_index_with_limit(&graph, &filters, 10_000, &mut || {
+            RUNTIME_CONTEXT_OUTPUT_VALUE_VISITS.load(Ordering::Relaxed) >= 1
+        })
+        .expect_err("cancellation inside set materialization must fail closed");
+        assert_eq!(cancelled.to_string(), "graph operation was cancelled");
+        assert_eq!(RUNTIME_CONTEXT_EVIDENCE_VISITS.load(Ordering::Relaxed), 128);
+        assert_eq!(
+            RUNTIME_CONTEXT_OUTPUT_VALUE_VISITS.load(Ordering::Relaxed),
+            1
+        );
+
+        RUNTIME_CONTEXT_INDEX_BUILDS.store(0, Ordering::Relaxed);
+        RUNTIME_CONTEXT_EVIDENCE_VISITS.store(0, Ordering::Relaxed);
+        let no_runtime_filters = ImpactFilters::new(None, Vec::new(), Vec::new(), 128, 1)?;
+        assert!(
+            runtime_context_index_cancellable(&graph, &no_runtime_filters, &mut || false)?
+                .is_none()
+        );
+        assert_eq!(RUNTIME_CONTEXT_INDEX_BUILDS.load(Ordering::Relaxed), 0);
+        assert_eq!(RUNTIME_CONTEXT_EVIDENCE_VISITS.load(Ordering::Relaxed), 0);
         Ok(())
     }
 
     #[test]
     fn runtime_impact_path_evidence_respects_the_session_filter() -> Result<()> {
+        let _guard = IMPACT_PREPROCESSING_TEST_LOCK
+            .lock()
+            .expect("runtime index test lock");
         let mut graph = graph();
         let edge = graph
             .edges
@@ -1346,6 +2522,9 @@ mod tests {
 
     #[test]
     fn depth_and_limits_are_explicit_not_silent() -> Result<()> {
+        let _guard = IMPACT_PREPROCESSING_TEST_LOCK
+            .lock()
+            .expect("impact preprocessing test lock");
         let graph = graph();
         let shallow = impact(
             &graph,

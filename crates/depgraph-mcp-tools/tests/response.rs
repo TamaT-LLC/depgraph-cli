@@ -124,6 +124,10 @@ fn service_errors_map_to_closed_redacted_tool_errors() {
             AgentErrorCode::InvalidArgument,
         ),
         (
+            DepgraphServiceError::SnapshotWorktreeMismatch,
+            AgentErrorCode::SnapshotWorktreeMismatch,
+        ),
+        (
             DepgraphServiceError::RepositoryFile {
                 reason: RepositoryFileError::NotFound,
             },

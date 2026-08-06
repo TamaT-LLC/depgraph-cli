@@ -13,10 +13,16 @@ pub use crate::service_agent::{
     MAX_FIND_NODES_QUERY_BYTES, NamedCompletedSnapshot, NodeMatchMode, NodeProjection,
 };
 pub use crate::service_graph::{
-    DependenciesRequest, DependenciesResult, DependencyDirection, ExplainPathRequest,
-    ExplainPathResult,
+    CyclesRequest, CyclesResult, DependenciesRequest, DependenciesResult, DependencyDirection,
+    ExplainPathRequest, ExplainPathResult, ImpactRequest, ImpactServiceResult, UnresolvedRequest,
+    UnresolvedServiceResult,
 };
 pub use crate::service_lifecycle::{DoctorRequest, DoctorResponse, ProfilePlanRequest};
+pub use crate::service_limits::{
+    MAX_CYCLE_NODE_IDS, MAX_DEPENDENCY_PATH_STEPS, MAX_GRAPH_EVIDENCE_ITEMS,
+    MAX_GRAPH_PHASE_COVERAGE_ITEMS, MAX_GRAPH_SERVICE_PREPROCESSING_WORK_ITEMS,
+    MAX_IMPACT_MATERIALIZED_PATH_STEPS, MAX_UNRESOLVED_CORRELATION_REASONS, MAX_UNRESOLVED_PHASES,
+};
 pub use crate::service_repository::{
     MAX_REPOSITORY_PATH_BYTES, MAX_REPOSITORY_PATH_COMPONENT_BYTES, MAX_REPOSITORY_PATH_COMPONENTS,
     OpenedRepositoryFile, RepositoryFileError, RepositoryPathError, RepositoryPathSelector,
@@ -615,6 +621,8 @@ pub enum DepgraphServiceError {
     NotFound,
     #[error("request conflicts with the current service state")]
     Conflict,
+    #[error("current snapshot source revision does not match the repository worktree HEAD")]
+    SnapshotWorktreeMismatch,
     #[error("request exhausted a service resource limit")]
     ResourceExhausted,
     #[error("request was cancelled")]
@@ -653,6 +661,7 @@ impl DepgraphServiceError {
             Self::RepositoryFile { reason } => reason.category(),
             Self::NotFound => DepgraphServiceErrorCategory::NotFound,
             Self::Conflict => DepgraphServiceErrorCategory::Conflict,
+            Self::SnapshotWorktreeMismatch => DepgraphServiceErrorCategory::Input,
             Self::ResourceExhausted => DepgraphServiceErrorCategory::Resource,
             Self::Cancelled => DepgraphServiceErrorCategory::Cancelled,
             Self::ReadStoreUnavailable { .. }

@@ -11,6 +11,11 @@ use petgraph::{algo::tarjan_scc, graph::DiGraph};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::service_limits::{
+    MAX_GRAPH_EVIDENCE_ITEMS, MAX_GRAPH_PHASE_COVERAGE_ITEMS,
+    MAX_GRAPH_SERVICE_PREPROCESSING_WORK_ITEMS, MAX_UNRESOLVED_CORRELATION_REASONS,
+};
+
 pub const INTERACTIVE_QUERY_PAGE_CONTRACT_VERSION: &str = "depgraph-interactive-query-page-v1";
 pub const DEFAULT_INTERACTIVE_QUERY_MAX_ITEMS: usize = 100;
 pub const DEFAULT_INTERACTIVE_QUERY_MAX_BYTES: usize = 1024 * 1024;
@@ -23,6 +28,50 @@ const MAX_QUERY_SUMMARY_GROUPS: usize = 64;
 const INTERACTIVE_QUERY_CURSOR_PREFIX: &str = "depgraph-query-cursor-v1";
 
 type CanonicalAdjacency<'a> = BTreeMap<&'a str, BTreeMap<(&'a str, &'a str), &'a EdgeRecord>>;
+
+#[derive(Debug, thiserror::Error)]
+#[error("graph selector preprocessing exceeded its service bound")]
+struct SelectorPreprocessingExhausted;
+
+#[derive(Debug, thiserror::Error)]
+#[error("graph selector preprocessing was cancelled")]
+struct SelectorPreprocessingCancelled;
+
+#[derive(Debug, thiserror::Error)]
+#[error("graph path-step postprocessing exceeded its service bound")]
+struct QueryPostprocessingExhausted;
+
+#[derive(Debug, thiserror::Error)]
+#[error("graph path-step postprocessing was cancelled")]
+struct QueryPostprocessingCancelled;
+
+#[derive(Debug, thiserror::Error)]
+#[error("graph path-step postprocessing found inconsistent correlation data")]
+struct QueryPostprocessingIntegrity;
+
+pub(crate) fn is_resource_exhausted(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<SelectorPreprocessingExhausted>()
+        .is_some()
+        || error
+            .downcast_ref::<QueryPostprocessingExhausted>()
+            .is_some()
+}
+
+pub(crate) fn is_cancelled(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<SelectorPreprocessingCancelled>()
+        .is_some()
+        || error
+            .downcast_ref::<QueryPostprocessingCancelled>()
+            .is_some()
+}
+
+pub(crate) fn is_integrity(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<QueryPostprocessingIntegrity>()
+        .is_some()
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QueryPageDiagnostic {
@@ -436,7 +485,7 @@ pub enum CycleLevel {
 }
 
 impl CycleLevel {
-    fn node_kind(self) -> &'static str {
+    pub(crate) const fn node_kind(self) -> &'static str {
         match self {
             Self::Package => "package_instance",
             Self::File => "file",
@@ -638,6 +687,20 @@ fn normalize_query_filter(name: &str, values: Vec<String>) -> Result<Vec<String>
 }
 
 pub fn resolve_selector(snapshot: &GraphSnapshot, selector: &str) -> Result<NodeRecord> {
+    resolve_selector_bounded_cancellable(
+        snapshot,
+        selector,
+        MAX_GRAPH_SERVICE_PREPROCESSING_WORK_ITEMS,
+        &mut || false,
+    )
+}
+
+pub(crate) fn resolve_selector_bounded_cancellable(
+    snapshot: &GraphSnapshot,
+    selector: &str,
+    maximum_work: usize,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<NodeRecord> {
     let (kind, query) = selector
         .split_once(':')
         .filter(|(prefix, _)| {
@@ -652,9 +715,13 @@ pub fn resolve_selector(snapshot: &GraphSnapshot, selector: &str) -> Result<Node
         bail!("selector must not be empty");
     }
 
-    let mut exact = Vec::new();
-    let mut partial = Vec::new();
-    for node in &snapshot.nodes {
+    let mut work = SelectorWork::new(maximum_work);
+    let mut exact = SelectorCandidates::default();
+    let mut partial = SelectorCandidates::default();
+    for (ordinal, node) in snapshot.nodes.iter().enumerate() {
+        work.step(is_cancelled)?;
+        #[cfg(test)]
+        SELECTOR_NODE_SCAN_VISITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let kind_matches = match kind {
             "package" => node.kind == "package_instance",
             "route" => node.kind == "route",
@@ -688,39 +755,122 @@ pub fn resolve_selector(snapshot: &GraphSnapshot, selector: &str) -> Result<Node
                 || values.iter().any(|value| value.as_str() == query)
         };
         if exact_match {
-            exact.push(node.clone());
+            work.step(is_cancelled)?;
+            exact.insert(node, ordinal)?;
+            #[cfg(test)]
+            SELECTOR_CANDIDATE_INSERT_VISITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         } else if values.iter().any(|value| value.contains(query)) {
-            partial.push(node.clone());
+            work.step(is_cancelled)?;
+            partial.insert(node, ordinal)?;
+            #[cfg(test)]
+            SELECTOR_CANDIDATE_INSERT_VISITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
-    choose_unique(
+    choose_unique_bounded_cancellable(
         selector,
         if exact.is_empty() && kind != "id" {
             partial
         } else {
             exact
         },
+        &mut work,
+        is_cancelled,
     )
 }
 
-fn choose_unique(selector: &str, mut candidates: Vec<NodeRecord>) -> Result<NodeRecord> {
-    candidates.sort_by(|left, right| left.id.cmp(&right.id));
-    match candidates.len() {
+fn choose_unique_bounded_cancellable(
+    selector: &str,
+    mut candidates: SelectorCandidates<'_>,
+    work: &mut SelectorWork,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<NodeRecord> {
+    match candidates.count {
         0 => bail!("selector {selector:?} did not match any node"),
-        1 => Ok(candidates.remove(0)),
+        1 => {
+            work.step(is_cancelled)?;
+            candidates
+                .first
+                .pop_first()
+                .map(|(_, node)| node.clone())
+                .context("selector candidate disappeared during finalization")
+        }
         _ => {
-            let choices = candidates
-                .iter()
-                .take(10)
-                .map(|node| format!("{} ({}, id:{})", node.locator, node.kind, node.id))
-                .collect::<Vec<_>>()
-                .join(", ");
+            let mut choices = Vec::with_capacity(candidates.first.len());
+            for node in candidates.first.into_values() {
+                work.step(is_cancelled)?;
+                choices.push(format!("{} ({}, id:{})", node.locator, node.kind, node.id));
+            }
+            let choices = choices.join(", ");
             bail!(
                 "selector {selector:?} is ambiguous; select a candidate with id:<stable-id>. candidates: {choices}"
             )
         }
     }
 }
+
+#[derive(Default)]
+struct SelectorCandidates<'a> {
+    count: usize,
+    first: BTreeMap<(&'a str, usize), &'a NodeRecord>,
+}
+
+impl<'a> SelectorCandidates<'a> {
+    const fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    fn insert(&mut self, node: &'a NodeRecord, ordinal: usize) -> Result<()> {
+        self.count = self
+            .count
+            .checked_add(1)
+            .ok_or(SelectorPreprocessingExhausted)?;
+        let key = (node.id.as_str(), ordinal);
+        if self.first.len() < 10 {
+            self.first.insert(key, node);
+        } else if self
+            .first
+            .last_key_value()
+            .is_some_and(|(last, _)| key < *last)
+        {
+            self.first.pop_last();
+            self.first.insert(key, node);
+        }
+        Ok(())
+    }
+}
+
+struct SelectorWork {
+    used: usize,
+    maximum: usize,
+}
+
+impl SelectorWork {
+    const fn new(maximum: usize) -> Self {
+        Self { used: 0, maximum }
+    }
+
+    fn step(&mut self, is_cancelled: &mut impl FnMut() -> bool) -> Result<()> {
+        if is_cancelled() {
+            return Err(SelectorPreprocessingCancelled.into());
+        }
+        if self.used >= self.maximum {
+            return Err(SelectorPreprocessingExhausted.into());
+        }
+        self.used += 1;
+        #[cfg(test)]
+        SELECTOR_WORK_ITEMS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+static SELECTOR_WORK_ITEMS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static SELECTOR_NODE_SCAN_VISITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static SELECTOR_CANDIDATE_INSERT_VISITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 pub fn traverse(
     snapshot: &GraphSnapshot,
@@ -777,18 +927,45 @@ pub(crate) fn traverse_bounded_filtered_cancellable(
     reverse: bool,
     filter: &GraphQueryFilter,
     max_traversal: usize,
+    is_cancelled: impl FnMut() -> bool,
+) -> Result<BoundedTraversalResult> {
+    traverse_bounded_filtered_cancellable_with_adjacency_limit(
+        snapshot,
+        selector,
+        transitive,
+        reverse,
+        filter,
+        max_traversal,
+        MAX_INTERACTIVE_QUERY_TRAVERSAL,
+        is_cancelled,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn traverse_bounded_filtered_cancellable_with_adjacency_limit(
+    snapshot: &GraphSnapshot,
+    selector: &str,
+    transitive: bool,
+    reverse: bool,
+    filter: &GraphQueryFilter,
+    max_traversal: usize,
+    max_adjacency_inspection: usize,
     mut is_cancelled: impl FnMut() -> bool,
 ) -> Result<BoundedTraversalResult> {
     if is_cancelled() {
         bail!("dependency traversal was cancelled");
     }
-    let root = resolve_selector(snapshot, selector)?;
-    let node_map = node_map(snapshot);
+    let root = resolve_selector_bounded_cancellable(
+        snapshot,
+        selector,
+        MAX_GRAPH_SERVICE_PREPROCESSING_WORK_ITEMS,
+        &mut is_cancelled,
+    )?;
     let (adjacency, adjacency_complete) = adjacency_cancellable(
         snapshot,
         reverse,
         filter,
-        MAX_INTERACTIVE_QUERY_TRAVERSAL,
+        max_adjacency_inspection,
         &mut is_cancelled,
     )?;
     let mut queue = VecDeque::from([root.id.clone()]);
@@ -811,7 +988,7 @@ pub(crate) fn traverse_bounded_filtered_cancellable(
                     break 'traversal;
                 }
                 traversed_edges += 1;
-                selected_edges.insert(edge.id.clone(), (*edge).clone());
+                selected_edges.insert(edge.id.clone(), *edge);
                 let next = if reverse { &edge.source } else { &edge.target };
                 if visited.insert(next.clone()) && transitive {
                     queue.push_back(next.clone());
@@ -823,25 +1000,33 @@ pub(crate) fn traverse_bounded_filtered_cancellable(
         }
     }
 
-    let nodes = visited
-        .iter()
-        .filter(|id| *id != &root.id)
-        .filter_map(|id| node_map.get(id).cloned())
-        .collect();
-    let edges: Vec<_> = selected_edges.into_values().collect();
-    let evidence = edge_evidence_map_filtered(snapshot, filter);
-    let correlations = edge_correlation_map(&snapshot.profile_matrix);
-    let steps = edges
-        .iter()
-        .map(|edge| {
-            path_step(
-                snapshot,
-                edge,
-                &evidence,
-                correlations.get(edge.id.as_str()).copied(),
-            )
-        })
-        .collect();
+    let mut node_work = SelectorWork::new(MAX_GRAPH_SERVICE_PREPROCESSING_WORK_ITEMS);
+    let mut selected_nodes = BTreeMap::new();
+    for node in &snapshot.nodes {
+        node_work.step(&mut is_cancelled)?;
+        if node.id != root.id && visited.contains(&node.id) {
+            node_work.step(&mut is_cancelled)?;
+            selected_nodes.insert(node.id.clone(), node.clone());
+        }
+    }
+    let mut nodes = Vec::with_capacity(selected_nodes.len());
+    for node in selected_nodes.into_values() {
+        node_work.step(&mut is_cancelled)?;
+        nodes.push(node);
+    }
+    let mut materializer = PathStepMaterializer::new(
+        snapshot,
+        filter,
+        selected_edges.values().copied(),
+        MAX_GRAPH_SERVICE_PREPROCESSING_WORK_ITEMS,
+        &mut is_cancelled,
+    )?;
+    let mut edges = Vec::with_capacity(selected_edges.len());
+    let mut steps = Vec::with_capacity(selected_edges.len());
+    for edge in selected_edges.into_values() {
+        steps.push(materializer.materialize(edge, &mut is_cancelled)?);
+        edges.push(materializer.clone_edge_output(edge, &mut is_cancelled)?);
+    }
     let diagnostics = (!complete)
         .then(|| QueryPageDiagnostic {
             code: "QUERY_TRAVERSAL_LIMIT_REACHED".to_owned(),
@@ -852,7 +1037,7 @@ pub(crate) fn traverse_bounded_filtered_cancellable(
             } else {
                 format!(
                     "dependency adjacency preprocessing stopped after inspecting {} snapshot edges; result is partial",
-                    MAX_INTERACTIVE_QUERY_TRAVERSAL
+                    max_adjacency_inspection
                 )
             },
             remediation: if adjacency_complete {
@@ -896,9 +1081,16 @@ pub fn why_filtered(
             steps: Vec::new(),
         });
     }
-    let (adjacency, complete) =
-        adjacency_cancellable(snapshot, false, filter, usize::MAX, &mut || false)?;
-    debug_assert!(complete);
+    let (adjacency, complete) = adjacency_cancellable(
+        snapshot,
+        false,
+        filter,
+        MAX_INTERACTIVE_QUERY_TRAVERSAL,
+        &mut || false,
+    )?;
+    if !complete {
+        return Err(QueryPostprocessingExhausted.into());
+    }
     let mut queue = VecDeque::from([from.id.clone()]);
     let mut seen = BTreeSet::from([from.id.clone()]);
     let mut predecessor: HashMap<String, &EdgeRecord> = HashMap::new();
@@ -924,28 +1116,31 @@ pub fn why_filtered(
             steps: Vec::new(),
         });
     }
-    let evidence_map = edge_evidence_map_filtered(snapshot, filter);
-    let correlations = edge_correlation_map(&snapshot.profile_matrix);
     let mut current = to.id.clone();
-    let mut reversed = Vec::new();
+    let mut reversed_edges = Vec::new();
     while current != from.id {
+        if reversed_edges.len() >= crate::service_limits::MAX_DEPENDENCY_PATH_STEPS {
+            return Err(QueryPostprocessingExhausted.into());
+        }
         let edge = predecessor
             .get(&current)
             .with_context(|| format!("path reconstruction failed at {current}"))?;
-        reversed.push(path_step(
-            snapshot,
-            edge,
-            &evidence_map,
-            correlations.get(edge.id.as_str()).copied(),
-        ));
+        reversed_edges.push(*edge);
         current = edge.source.clone();
     }
-    reversed.reverse();
+    reversed_edges.reverse();
+    let steps = materialize_path_steps_bounded_cancellable(
+        snapshot,
+        filter,
+        &reversed_edges,
+        MAX_GRAPH_SERVICE_PREPROCESSING_WORK_ITEMS,
+        &mut || false,
+    )?;
     Ok(WhyResult {
         from,
         to,
         path_found: true,
-        steps: reversed,
+        steps,
     })
 }
 
@@ -1136,18 +1331,374 @@ pub fn unresolved(snapshot: &GraphSnapshot) -> Vec<UnresolvedResult> {
         .collect()
 }
 
-fn edge_correlation_map(matrix: &ProfileMatrixRecord) -> BTreeMap<&str, &ProfileCorrelationRecord> {
-    matrix
-        .correlations
-        .iter()
-        .flat_map(|correlation| {
-            correlation
-                .edge_ids_by_phase
-                .values()
-                .flatten()
-                .map(move |edge_id| (edge_id.as_str(), correlation))
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(usize)]
+pub(crate) enum QueryPostprocessingStage {
+    EdgeSelection,
+    EvidenceScan,
+    EvidenceOwnerInsertion,
+    EvidenceOwnerFinalization,
+    EvidenceClone,
+    CorrelationRecord,
+    CorrelationPhase,
+    CorrelationEdge,
+    CorrelationInsertion,
+    ProfileEntry,
+    ProfileInsertion,
+    EdgeLookup,
+    PathStep,
+    ReasonClone,
+    PhaseEntryClone,
+    PhaseProfileClone,
+    PhaseCompletenessClone,
+    EdgeOutput,
+}
+
+const QUERY_POSTPROCESSING_STAGE_COUNT: usize = 18;
+
+pub(crate) struct QueryPostprocessingWork {
+    used: usize,
+    maximum: usize,
+    stage_counts: [usize; QUERY_POSTPROCESSING_STAGE_COUNT],
+    #[cfg(test)]
+    cancel_after: Option<(QueryPostprocessingStage, usize)>,
+}
+
+impl QueryPostprocessingWork {
+    fn new(maximum: usize) -> Self {
+        Self {
+            used: 0,
+            maximum,
+            stage_counts: [0; QUERY_POSTPROCESSING_STAGE_COUNT],
+            #[cfg(test)]
+            cancel_after: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_stage_cancellation(
+        maximum: usize,
+        stage: QueryPostprocessingStage,
+        completed_steps: usize,
+    ) -> Self {
+        Self {
+            used: 0,
+            maximum,
+            stage_counts: [0; QUERY_POSTPROCESSING_STAGE_COUNT],
+            cancel_after: Some((stage, completed_steps)),
+        }
+    }
+
+    fn step(
+        &mut self,
+        stage: QueryPostprocessingStage,
+        is_cancelled: &mut impl FnMut() -> bool,
+    ) -> Result<()> {
+        if is_cancelled() {
+            return Err(QueryPostprocessingCancelled.into());
+        }
+        #[cfg(test)]
+        if self.cancel_after.is_some_and(|(cancel_stage, completed)| {
+            cancel_stage == stage && self.stage_counts[stage as usize] >= completed
+        }) {
+            return Err(QueryPostprocessingCancelled.into());
+        }
+        if self.used >= self.maximum {
+            return Err(QueryPostprocessingExhausted.into());
+        }
+        self.used += 1;
+        self.stage_counts[stage as usize] += 1;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn used(&self) -> usize {
+        self.used
+    }
+
+    #[cfg(test)]
+    fn stage_count(&self, stage: QueryPostprocessingStage) -> usize {
+        self.stage_counts[stage as usize]
+    }
+}
+
+#[derive(Debug)]
+struct PathStepProjection<'a> {
+    evidence: BTreeMap<&'a str, Vec<EvidenceRecord>>,
+    correlations: BTreeMap<&'a str, &'a ProfileCorrelationRecord>,
+    phase_coverage: BTreeMap<&'a str, &'a BTreeMap<String, PhaseCoverageRecord>>,
+}
+
+impl<'a> PathStepProjection<'a> {
+    fn build(
+        snapshot: &'a GraphSnapshot,
+        filter: &GraphQueryFilter,
+        selected_edge_ids: &BTreeSet<&str>,
+        work: &mut QueryPostprocessingWork,
+        is_cancelled: &mut impl FnMut() -> bool,
+    ) -> Result<Self> {
+        let mut evidence_refs = BTreeMap::<&str, Vec<&EvidenceRecord>>::new();
+        for item in &snapshot.evidence {
+            work.step(QueryPostprocessingStage::EvidenceScan, is_cancelled)?;
+            if item.owner_type != "edge"
+                || !selected_edge_ids.contains(item.owner_id.as_str())
+                || !filter.matches_evidence(item)
+            {
+                continue;
+            }
+            work.step(
+                QueryPostprocessingStage::EvidenceOwnerInsertion,
+                is_cancelled,
+            )?;
+            let records = evidence_refs.entry(item.owner_id.as_str()).or_default();
+            if records.len() >= MAX_GRAPH_EVIDENCE_ITEMS {
+                return Err(QueryPostprocessingExhausted.into());
+            }
+            records.push(item);
+        }
+
+        let mut evidence = BTreeMap::new();
+        for (owner_id, records) in &mut evidence_refs {
+            work.step(
+                QueryPostprocessingStage::EvidenceOwnerFinalization,
+                is_cancelled,
+            )?;
+            records.sort_by(|left, right| evidence_order(left, right));
+            work.step(
+                QueryPostprocessingStage::EvidenceOwnerFinalization,
+                is_cancelled,
+            )?;
+            let mut cloned = Vec::with_capacity(records.len());
+            for record in records {
+                work.step(QueryPostprocessingStage::EvidenceClone, is_cancelled)?;
+                cloned.push((*record).clone());
+            }
+            evidence.insert(*owner_id, cloned);
+        }
+
+        let mut correlations = BTreeMap::new();
+        let mut effective_profile_ids = BTreeSet::new();
+        for correlation in &snapshot.profile_matrix.correlations {
+            work.step(QueryPostprocessingStage::CorrelationRecord, is_cancelled)?;
+            for edge_ids in correlation.edge_ids_by_phase.values() {
+                work.step(QueryPostprocessingStage::CorrelationPhase, is_cancelled)?;
+                for edge_id in edge_ids {
+                    work.step(QueryPostprocessingStage::CorrelationEdge, is_cancelled)?;
+                    if !selected_edge_ids.contains(edge_id.as_str()) {
+                        continue;
+                    }
+                    if correlation.difference_reasons.len() > MAX_UNRESOLVED_CORRELATION_REASONS {
+                        return Err(QueryPostprocessingExhausted.into());
+                    }
+                    work.step(QueryPostprocessingStage::CorrelationInsertion, is_cancelled)?;
+                    if correlations.insert(edge_id.as_str(), correlation).is_some() {
+                        return Err(QueryPostprocessingIntegrity.into());
+                    }
+                    if !effective_profile_ids.contains(correlation.effective_profile_id.as_str()) {
+                        work.step(QueryPostprocessingStage::CorrelationInsertion, is_cancelled)?;
+                        effective_profile_ids.insert(correlation.effective_profile_id.as_str());
+                    }
+                }
+            }
+        }
+
+        let mut phase_coverage = BTreeMap::new();
+        for entry in &snapshot.profile_matrix.entries {
+            work.step(QueryPostprocessingStage::ProfileEntry, is_cancelled)?;
+            if !effective_profile_ids.contains(entry.id.as_str())
+                || phase_coverage.contains_key(entry.id.as_str())
+            {
+                continue;
+            }
+            if entry.phase_coverage.len() > MAX_GRAPH_PHASE_COVERAGE_ITEMS {
+                return Err(QueryPostprocessingExhausted.into());
+            }
+            work.step(QueryPostprocessingStage::ProfileInsertion, is_cancelled)?;
+            phase_coverage.insert(entry.id.as_str(), &entry.phase_coverage);
+        }
+
+        Ok(Self {
+            evidence,
+            correlations,
+            phase_coverage,
         })
-        .collect()
+    }
+
+    fn materialize(
+        &self,
+        edge: &EdgeRecord,
+        work: &mut QueryPostprocessingWork,
+        is_cancelled: &mut impl FnMut() -> bool,
+    ) -> Result<PathStep> {
+        work.step(QueryPostprocessingStage::EdgeLookup, is_cancelled)?;
+        let evidence = self.evidence.get(edge.id.as_str());
+        let correlation = self.correlations.get(edge.id.as_str()).copied();
+
+        work.step(QueryPostprocessingStage::PathStep, is_cancelled)?;
+        let mut cloned_evidence = Vec::with_capacity(evidence.map_or(0, Vec::len));
+        if let Some(evidence) = evidence {
+            for record in evidence {
+                work.step(QueryPostprocessingStage::EvidenceClone, is_cancelled)?;
+                cloned_evidence.push(record.clone());
+            }
+        }
+
+        let mut observed_difference_reasons = Vec::new();
+        let mut phase_coverage = BTreeMap::new();
+        if let Some(correlation) = correlation {
+            if correlation.difference_reasons.len() > MAX_UNRESOLVED_CORRELATION_REASONS {
+                return Err(QueryPostprocessingExhausted.into());
+            }
+            for reason in &correlation.difference_reasons {
+                work.step(QueryPostprocessingStage::ReasonClone, is_cancelled)?;
+                observed_difference_reasons.push(reason.clone());
+            }
+            if let Some(coverage) = self
+                .phase_coverage
+                .get(correlation.effective_profile_id.as_str())
+            {
+                if coverage.len() > MAX_GRAPH_PHASE_COVERAGE_ITEMS {
+                    return Err(QueryPostprocessingExhausted.into());
+                }
+                for (phase, record) in *coverage {
+                    work.step(QueryPostprocessingStage::PhaseEntryClone, is_cancelled)?;
+                    let mut profile_ids = Vec::new();
+                    for profile_id in &record.profile_ids {
+                        work.step(QueryPostprocessingStage::PhaseProfileClone, is_cancelled)?;
+                        profile_ids.push(profile_id.clone());
+                    }
+                    let mut completeness = Vec::new();
+                    for value in &record.completeness {
+                        work.step(
+                            QueryPostprocessingStage::PhaseCompletenessClone,
+                            is_cancelled,
+                        )?;
+                        completeness.push(value.clone());
+                    }
+                    phase_coverage.insert(
+                        phase.clone(),
+                        PhaseCoverageRecord {
+                            profile_ids,
+                            sites: record.sites,
+                            edges: record.edges,
+                            evidence: record.evidence,
+                            resolved: record.resolved,
+                            candidates: record.candidates,
+                            external: record.external,
+                            unresolved: record.unresolved,
+                            completeness,
+                        },
+                    );
+                }
+            }
+        }
+        work.step(QueryPostprocessingStage::PathStep, is_cancelled)?;
+        Ok(PathStep {
+            edge: edge.clone(),
+            condition_text: render_condition(&edge.condition),
+            evidence: cloned_evidence,
+            effective_profile_id: correlation
+                .map(|correlation| correlation.effective_profile_id.clone()),
+            correlation_status: correlation.map(|correlation| correlation.status.clone()),
+            observed_difference_reasons,
+            phase_coverage,
+        })
+    }
+}
+
+pub(crate) struct PathStepMaterializer<'a> {
+    projection: PathStepProjection<'a>,
+    work: QueryPostprocessingWork,
+}
+
+impl<'a> PathStepMaterializer<'a> {
+    pub(crate) fn new<I>(
+        snapshot: &'a GraphSnapshot,
+        filter: &GraphQueryFilter,
+        edges: I,
+        maximum_work: usize,
+        is_cancelled: &mut impl FnMut() -> bool,
+    ) -> Result<Self>
+    where
+        I: IntoIterator<Item = &'a EdgeRecord>,
+    {
+        let mut work = QueryPostprocessingWork::new(maximum_work);
+        let mut selected_edge_ids = BTreeSet::new();
+        for edge in edges {
+            work.step(QueryPostprocessingStage::EdgeSelection, is_cancelled)?;
+            selected_edge_ids.insert(edge.id.as_str());
+        }
+        let projection = PathStepProjection::build(
+            snapshot,
+            filter,
+            &selected_edge_ids,
+            &mut work,
+            is_cancelled,
+        )?;
+        Ok(Self { projection, work })
+    }
+
+    pub(crate) fn materialize(
+        &mut self,
+        edge: &EdgeRecord,
+        is_cancelled: &mut impl FnMut() -> bool,
+    ) -> Result<PathStep> {
+        self.projection
+            .materialize(edge, &mut self.work, is_cancelled)
+    }
+
+    pub(crate) fn clone_edge_output(
+        &mut self,
+        edge: &EdgeRecord,
+        is_cancelled: &mut impl FnMut() -> bool,
+    ) -> Result<EdgeRecord> {
+        self.work
+            .step(QueryPostprocessingStage::EdgeOutput, is_cancelled)?;
+        Ok(edge.clone())
+    }
+}
+
+pub(crate) fn materialize_path_steps_bounded_cancellable(
+    snapshot: &GraphSnapshot,
+    filter: &GraphQueryFilter,
+    edges: &[&EdgeRecord],
+    maximum_work: usize,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<Vec<PathStep>> {
+    if edges.len() > crate::service_limits::MAX_DEPENDENCY_PATH_STEPS {
+        return Err(QueryPostprocessingExhausted.into());
+    }
+    let mut materializer = PathStepMaterializer::new(
+        snapshot,
+        filter,
+        edges.iter().copied(),
+        maximum_work,
+        is_cancelled,
+    )?;
+    let mut steps = Vec::with_capacity(edges.len());
+    for edge in edges {
+        steps.push(materializer.materialize(edge, is_cancelled)?);
+    }
+    Ok(steps)
+}
+
+fn evidence_order(left: &EvidenceRecord, right: &EvidenceRecord) -> std::cmp::Ordering {
+    left.ordinal
+        .cmp(&right.ordinal)
+        .then(left.kind.cmp(&right.kind))
+        .then(left.path.cmp(&right.path))
+        .then(left.start_line.cmp(&right.start_line))
+        .then(left.start_column.cmp(&right.start_column))
+        .then(left.end_line.cmp(&right.end_line))
+        .then(left.end_column.cmp(&right.end_column))
+        .then(left.extractor.cmp(&right.extractor))
+        .then(left.extractor_version.cmp(&right.extractor_version))
+        .then(left.detail.cmp(&right.detail))
+        .then_with(|| {
+            left.properties
+                .to_string()
+                .cmp(&right.properties.to_string())
+        })
 }
 
 fn site_correlation_map(matrix: &ProfileMatrixRecord) -> BTreeMap<&str, &ProfileCorrelationRecord> {
@@ -1164,105 +1715,10 @@ fn site_correlation_map(matrix: &ProfileMatrixRecord) -> BTreeMap<&str, &Profile
         .collect()
 }
 
-fn path_step(
-    snapshot: &GraphSnapshot,
-    edge: &EdgeRecord,
-    evidence: &BTreeMap<String, Vec<EvidenceRecord>>,
-    correlation: Option<&ProfileCorrelationRecord>,
-) -> PathStep {
-    PathStep {
-        edge: edge.clone(),
-        condition_text: render_condition(&edge.condition),
-        evidence: evidence.get(&edge.id).cloned().unwrap_or_default(),
-        effective_profile_id: correlation
-            .map(|correlation| correlation.effective_profile_id.clone()),
-        correlation_status: correlation.map(|correlation| correlation.status.clone()),
-        observed_difference_reasons: correlation
-            .map(|correlation| correlation.difference_reasons.clone())
-            .unwrap_or_default(),
-        phase_coverage: correlation
-            .map(|correlation| {
-                phase_coverage_for_effective_profile(
-                    &snapshot.profile_matrix,
-                    &correlation.effective_profile_id,
-                )
-            })
-            .unwrap_or_default(),
-    }
-}
-
-pub(crate) fn path_steps_for_edges_filtered(
-    snapshot: &GraphSnapshot,
-    edges: &[EdgeRecord],
-    filter: &GraphQueryFilter,
-) -> Vec<PathStep> {
-    let evidence = edge_evidence_map_filtered(snapshot, filter);
-    let correlations = edge_correlation_map(&snapshot.profile_matrix);
-    edges
-        .iter()
-        .map(|edge| {
-            path_step(
-                snapshot,
-                edge,
-                &evidence,
-                correlations.get(edge.id.as_str()).copied(),
-            )
-        })
-        .collect()
-}
-
 pub fn render_condition(value: &serde_json::Value) -> String {
     serde_json::from_value::<Condition>(value.clone())
         .map(|condition| condition.render())
         .unwrap_or_else(|_| value.to_string())
-}
-
-fn node_map(snapshot: &GraphSnapshot) -> BTreeMap<String, NodeRecord> {
-    snapshot
-        .nodes
-        .iter()
-        .map(|node| (node.id.clone(), node.clone()))
-        .collect()
-}
-
-fn edge_evidence_map_filtered(
-    snapshot: &GraphSnapshot,
-    filter: &GraphQueryFilter,
-) -> BTreeMap<String, Vec<EvidenceRecord>> {
-    let mut evidence = snapshot
-        .evidence
-        .iter()
-        .filter(|item| item.owner_type == "edge" && filter.matches_evidence(item))
-        .fold(
-            BTreeMap::<String, Vec<EvidenceRecord>>::new(),
-            |mut map, item| {
-                map.entry(item.owner_id.clone())
-                    .or_default()
-                    .push(item.clone());
-                map
-            },
-        );
-    for records in evidence.values_mut() {
-        records.sort_by(|left, right| {
-            left.ordinal
-                .cmp(&right.ordinal)
-                .then(left.kind.cmp(&right.kind))
-                .then(left.path.cmp(&right.path))
-                .then(left.start_line.cmp(&right.start_line))
-                .then(left.start_column.cmp(&right.start_column))
-                .then(left.end_line.cmp(&right.end_line))
-                .then(left.end_column.cmp(&right.end_column))
-                .then(left.extractor.cmp(&right.extractor))
-                .then(left.extractor_version.cmp(&right.extractor_version))
-                .then(left.detail.cmp(&right.detail))
-                .then_with(|| {
-                    left.properties
-                        .to_string()
-                        .cmp(&right.properties.to_string())
-                })
-        });
-    }
-    evidence
 }
 
 fn adjacency_cancellable<'a>(
@@ -1330,6 +1786,61 @@ mod tests {
             end_column: 2,
             detail: None,
             properties: json!({}),
+        }
+    }
+
+    fn correlation(edge_ids: Vec<String>, reason_count: usize) -> ProfileCorrelationRecord {
+        ProfileCorrelationRecord {
+            id: "correlation:test".to_owned(),
+            effective_profile_id: "effective:test".to_owned(),
+            source: "a".to_owned(),
+            kind: "imports".to_owned(),
+            specifier: "b".to_owned(),
+            status: "matched".to_owned(),
+            condition_union: json!({"op":"all","conditions":[]}),
+            conditions_by_phase: BTreeMap::new(),
+            targets_by_phase: BTreeMap::new(),
+            resolutions_by_phase: BTreeMap::new(),
+            site_ids_by_phase: BTreeMap::new(),
+            edge_ids_by_phase: BTreeMap::from([("semantic".to_owned(), edge_ids)]),
+            difference_reasons: (0..reason_count)
+                .map(|index| format!("reason-{index:03}"))
+                .collect(),
+            diagnostic_id: None,
+        }
+    }
+
+    fn profile_entry(
+        phase_count: usize,
+        profile_ids_per_phase: usize,
+        completeness_per_phase: usize,
+    ) -> depgraph_store::ProfileMatrixEntryRecord {
+        let mut phase_coverage = BTreeMap::new();
+        for index in 0..phase_count {
+            phase_coverage.insert(
+                format!("phase-{index:03}"),
+                PhaseCoverageRecord {
+                    profile_ids: (0..profile_ids_per_phase)
+                        .map(|item| format!("profile-{item:03}"))
+                        .collect(),
+                    completeness: (0..completeness_per_phase)
+                        .map(|item| format!("complete-{item:03}"))
+                        .collect(),
+                    ..PhaseCoverageRecord::default()
+                },
+            );
+        }
+        depgraph_store::ProfileMatrixEntryRecord {
+            id: "effective:test".to_owned(),
+            effective_input_id: "effective-input:test".to_owned(),
+            language: "rust".to_owned(),
+            profile_ids: Vec::new(),
+            parent_profile_ids: Vec::new(),
+            phases: Vec::new(),
+            condition_union: json!({"op":"all","conditions":[]}),
+            phase_coverage,
+            selection_reasons: Vec::new(),
+            axis_conflicts: Vec::new(),
         }
     }
 
@@ -1433,6 +1944,25 @@ mod tests {
             })?;
         assert!(!complete);
         assert_eq!(adjacency.values().map(BTreeMap::len).sum::<usize>(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn adjacency_scan_overflow_marks_the_complete_execution_fail_closed() -> Result<()> {
+        let graph = snapshot();
+        let execution = traverse_bounded_filtered_cancellable_with_adjacency_limit(
+            &graph,
+            "id:a",
+            true,
+            false,
+            &GraphQueryFilter::default(),
+            100,
+            1,
+            || false,
+        )?;
+        assert!(!execution.complete);
+        assert_eq!(execution.result.steps.len(), 1);
+        assert_eq!(execution.diagnostics.len(), 1);
         Ok(())
     }
 
@@ -1596,6 +2126,71 @@ mod tests {
     }
 
     #[test]
+    fn selector_resolution_is_incrementally_ordered_tightly_bounded_and_cancellable() {
+        let node_count = 64_usize;
+        let mut graph = snapshot();
+        graph.nodes = (0..node_count)
+            .rev()
+            .map(|index| NodeRecord {
+                id: format!("node:{index:04}"),
+                kind: "file".to_owned(),
+                locator: format!("repo://src/{index:04}.rs"),
+                display_name: if index == node_count - 1 {
+                    "unique-target".to_owned()
+                } else {
+                    format!("unrelated-{index:04}")
+                },
+                properties: json!({"path":format!("src/{index:04}.rs")}),
+            })
+            .collect();
+        let exact_work = node_count + 2;
+        let resolved =
+            resolve_selector_bounded_cancellable(&graph, "unique-target", exact_work, &mut || {
+                false
+            })
+            .expect("the exact selector work bound succeeds");
+        assert_eq!(resolved.id, format!("node:{:04}", node_count - 1));
+
+        let error = resolve_selector_bounded_cancellable(
+            &graph,
+            "unique-target",
+            exact_work - 1,
+            &mut || false,
+        )
+        .expect_err("one selector work item above the bound must fail closed");
+        assert!(is_resource_exhausted(&error));
+
+        let mut checks = 0_usize;
+        let error = resolve_selector_bounded_cancellable(
+            &graph,
+            "id:does-not-match",
+            exact_work,
+            &mut || {
+                checks += 1;
+                checks >= 4
+            },
+        )
+        .expect_err("cancellation during the node scan must return no selector");
+        assert!(is_cancelled(&error));
+        assert_eq!(checks, 4);
+
+        for (index, node) in graph.nodes.iter_mut().take(3).enumerate() {
+            node.id = ["node:c", "node:a", "node:b"][index].to_owned();
+            node.display_name = "ambiguous-target".to_owned();
+        }
+        let error =
+            resolve_selector_bounded_cancellable(&graph, "ambiguous-target", 1_000, &mut || false)
+                .expect_err("ambiguous selector remains a domain error");
+        assert!(!is_resource_exhausted(&error));
+        assert!(!is_cancelled(&error));
+        let message = error.to_string();
+        let a = message.find("id:node:a").expect("candidate a");
+        let b = message.find("id:node:b").expect("candidate b");
+        let c = message.find("id:node:c").expect("candidate c");
+        assert!(a < b && b < c, "ambiguous candidates remain ID-ordered");
+    }
+
+    #[test]
     fn traversal_steps_include_only_owned_edge_evidence_in_canonical_order() -> Result<()> {
         let mut graph = snapshot();
         graph.edges[0].phase = "semantic".to_owned();
@@ -1624,6 +2219,326 @@ mod tests {
         assert_eq!(dependents.steps[0].edge.id, "e0");
         assert_eq!(dependents.steps[0].evidence.len(), 2);
         Ok(())
+    }
+
+    #[test]
+    fn edge_evidence_materialization_accepts_exact_bound_and_rejects_one_over() -> Result<()> {
+        let mut graph = snapshot();
+        graph.evidence = (0..MAX_GRAPH_EVIDENCE_ITEMS)
+            .map(|ordinal| evidence("edge", "e0", ordinal as i64, "src/a.rs"))
+            .collect();
+        let exact = traverse(&graph, "id:a", false, false)?;
+        assert_eq!(exact.steps.len(), 1);
+        assert_eq!(exact.steps[0].evidence.len(), MAX_GRAPH_EVIDENCE_ITEMS);
+
+        graph.evidence.push(evidence(
+            "edge",
+            "e0",
+            MAX_GRAPH_EVIDENCE_ITEMS as i64,
+            "src/a.rs",
+        ));
+        let error = traverse(&graph, "id:a", false, false)
+            .expect_err("evidence item 65 must reject the complete traversal");
+        assert!(is_resource_exhausted(&error));
+
+        let selected = BTreeSet::from(["e0"]);
+        let mut work = QueryPostprocessingWork::with_stage_cancellation(
+            MAX_GRAPH_SERVICE_PREPROCESSING_WORK_ITEMS,
+            QueryPostprocessingStage::EvidenceScan,
+            3,
+        );
+        let error = PathStepProjection::build(
+            &graph,
+            &GraphQueryFilter::default(),
+            &selected,
+            &mut work,
+            &mut || false,
+        )
+        .expect_err("cancellation during evidence aggregation must fail closed");
+        assert!(is_cancelled(&error));
+        assert_eq!(work.stage_count(QueryPostprocessingStage::EvidenceScan), 3);
+
+        graph.evidence.truncate(2);
+        let exact = materialize_path_steps_bounded_cancellable(
+            &graph,
+            &GraphQueryFilter::default(),
+            &[&graph.edges[0]],
+            14,
+            &mut || false,
+        )?;
+        assert_eq!(exact[0].evidence.len(), 2);
+        let error = materialize_path_steps_bounded_cancellable(
+            &graph,
+            &GraphQueryFilter::default(),
+            &[&graph.edges[0]],
+            13,
+            &mut || false,
+        )
+        .expect_err("one less than the exact evidence postprocessing work must reject");
+        assert!(is_resource_exhausted(&error));
+        Ok(())
+    }
+
+    #[test]
+    fn path_step_postprocessing_has_one_exact_cumulative_budget() -> Result<()> {
+        let graph = snapshot();
+        let selected = BTreeSet::from(["e0"]);
+        let mut work = QueryPostprocessingWork::new(3);
+        let projection = PathStepProjection::build(
+            &graph,
+            &GraphQueryFilter::default(),
+            &selected,
+            &mut work,
+            &mut || false,
+        )?;
+        let step = projection.materialize(&graph.edges[0], &mut work, &mut || false)?;
+        assert_eq!(step.edge.id, "e0");
+        assert_eq!(work.used(), 3);
+
+        let error = materialize_path_steps_bounded_cancellable(
+            &graph,
+            &GraphQueryFilter::default(),
+            &[&graph.edges[0]],
+            3,
+            &mut || false,
+        )
+        .expect_err("one less than the exact four-step materialization work must reject");
+        assert!(is_resource_exhausted(&error));
+        let exact = materialize_path_steps_bounded_cancellable(
+            &graph,
+            &GraphQueryFilter::default(),
+            &[&graph.edges[0]],
+            4,
+            &mut || false,
+        )?;
+        assert_eq!(exact.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn path_step_evidence_insertion_finalization_and_output_are_cancellable() {
+        let mut graph = snapshot();
+        graph.evidence = vec![
+            evidence("edge", "e0", 2, "two.rs"),
+            evidence("edge", "e0", 1, "one.rs"),
+        ];
+        let selected = BTreeSet::from(["e0"]);
+        for (stage, completed, label) in [
+            (
+                QueryPostprocessingStage::EvidenceOwnerInsertion,
+                1,
+                "evidence insertion",
+            ),
+            (
+                QueryPostprocessingStage::EvidenceOwnerFinalization,
+                1,
+                "evidence finalization",
+            ),
+            (
+                QueryPostprocessingStage::EvidenceClone,
+                1,
+                "retained evidence clone",
+            ),
+        ] {
+            let mut work = QueryPostprocessingWork::with_stage_cancellation(100, stage, completed);
+            let error = PathStepProjection::build(
+                &graph,
+                &GraphQueryFilter::default(),
+                &selected,
+                &mut work,
+                &mut || false,
+            )
+            .expect_err(label);
+            assert!(is_cancelled(&error), "{label}");
+            assert_eq!(work.stage_count(stage), completed);
+        }
+
+        for (stage, completed, label) in [
+            (QueryPostprocessingStage::EdgeLookup, 0, "edge lookup"),
+            (QueryPostprocessingStage::PathStep, 1, "path-step output"),
+        ] {
+            let mut work = QueryPostprocessingWork::with_stage_cancellation(100, stage, completed);
+            let projection = PathStepProjection::build(
+                &graph,
+                &GraphQueryFilter::default(),
+                &selected,
+                &mut work,
+                &mut || false,
+            )
+            .expect("projection builds before output cancellation");
+            let error = projection
+                .materialize(&graph.edges[0], &mut work, &mut || false)
+                .expect_err(label);
+            assert!(is_cancelled(&error), "{label}");
+            assert_eq!(work.stage_count(stage), completed, "{label}");
+        }
+    }
+
+    #[test]
+    fn path_correlation_caps_and_single_phase_index_are_fail_closed() -> Result<()> {
+        let mut graph = snapshot();
+        graph.profile_matrix.correlations = vec![correlation(
+            vec!["e0".to_owned(), "e1".to_owned()],
+            MAX_UNRESOLVED_CORRELATION_REASONS,
+        )];
+        graph.profile_matrix.entries = vec![profile_entry(MAX_GRAPH_PHASE_COVERAGE_ITEMS, 0, 0)];
+        let selected = BTreeSet::from(["e0", "e1"]);
+        let mut work = QueryPostprocessingWork::new(10_000);
+        let projection = PathStepProjection::build(
+            &graph,
+            &GraphQueryFilter::default(),
+            &selected,
+            &mut work,
+            &mut || false,
+        )?;
+        let first = projection.materialize(&graph.edges[0], &mut work, &mut || false)?;
+        let second = projection.materialize(&graph.edges[1], &mut work, &mut || false)?;
+        assert_eq!(
+            first.observed_difference_reasons.len(),
+            MAX_UNRESOLVED_CORRELATION_REASONS
+        );
+        assert_eq!(first.phase_coverage.len(), MAX_GRAPH_PHASE_COVERAGE_ITEMS);
+        assert_eq!(second.phase_coverage, first.phase_coverage);
+        assert_eq!(
+            work.stage_count(QueryPostprocessingStage::ProfileEntry),
+            1,
+            "the profile matrix is indexed once for the complete path"
+        );
+
+        graph.profile_matrix.correlations[0]
+            .difference_reasons
+            .push("one-over".to_owned());
+        let error = materialize_path_steps_bounded_cancellable(
+            &graph,
+            &GraphQueryFilter::default(),
+            &[&graph.edges[0]],
+            10_000,
+            &mut || false,
+        )
+        .expect_err("reason 17 must reject the complete path");
+        assert!(is_resource_exhausted(&error));
+
+        graph.profile_matrix.correlations[0]
+            .difference_reasons
+            .pop();
+        graph.profile_matrix.entries[0]
+            .phase_coverage
+            .insert("phase-over".to_owned(), PhaseCoverageRecord::default());
+        let error = materialize_path_steps_bounded_cancellable(
+            &graph,
+            &GraphQueryFilter::default(),
+            &[&graph.edges[0]],
+            10_000,
+            &mut || false,
+        )
+        .expect_err("phase coverage item 65 must reject the complete path");
+        assert!(is_resource_exhausted(&error));
+        Ok(())
+    }
+
+    #[test]
+    fn path_correlation_nested_scans_and_clones_are_cancellable_without_partial_steps() {
+        let mut graph = snapshot();
+        let mut nested_ids = (0..8)
+            .map(|index| format!("unselected:{index}"))
+            .collect::<Vec<_>>();
+        nested_ids.push("e0".to_owned());
+        graph.profile_matrix.correlations =
+            vec![correlation(nested_ids, MAX_UNRESOLVED_CORRELATION_REASONS)];
+        graph.profile_matrix.entries = vec![profile_entry(2, 4, 4)];
+        let selected = BTreeSet::from(["e0"]);
+
+        for (stage, completed, label) in [
+            (
+                QueryPostprocessingStage::CorrelationPhase,
+                0,
+                "correlation phase scan",
+            ),
+            (
+                QueryPostprocessingStage::CorrelationEdge,
+                3,
+                "nested edge expansion",
+            ),
+            (
+                QueryPostprocessingStage::CorrelationInsertion,
+                0,
+                "edge correlation insertion",
+            ),
+            (
+                QueryPostprocessingStage::ProfileEntry,
+                0,
+                "phase index scan",
+            ),
+            (
+                QueryPostprocessingStage::ProfileInsertion,
+                0,
+                "phase index insertion",
+            ),
+        ] {
+            let mut work =
+                QueryPostprocessingWork::with_stage_cancellation(1_000, stage, completed);
+            let error = PathStepProjection::build(
+                &graph,
+                &GraphQueryFilter::default(),
+                &selected,
+                &mut work,
+                &mut || false,
+            )
+            .expect_err(label);
+            assert!(is_cancelled(&error), "{label}");
+            assert_eq!(work.stage_count(stage), completed, "{label}");
+        }
+
+        for (stage, completed, label) in [
+            (QueryPostprocessingStage::ReasonClone, 3, "reason clone"),
+            (
+                QueryPostprocessingStage::PhaseEntryClone,
+                1,
+                "phase entry clone",
+            ),
+            (
+                QueryPostprocessingStage::PhaseProfileClone,
+                2,
+                "profile ID clone",
+            ),
+            (
+                QueryPostprocessingStage::PhaseCompletenessClone,
+                2,
+                "completeness clone",
+            ),
+        ] {
+            let mut work =
+                QueryPostprocessingWork::with_stage_cancellation(1_000, stage, completed);
+            let projection = PathStepProjection::build(
+                &graph,
+                &GraphQueryFilter::default(),
+                &selected,
+                &mut work,
+                &mut || false,
+            )
+            .expect("projection builds before clone cancellation");
+            let error = projection
+                .materialize(&graph.edges[0], &mut work, &mut || false)
+                .expect_err(label);
+            assert!(is_cancelled(&error), "{label}");
+            assert_eq!(work.stage_count(stage), completed, "{label}");
+        }
+    }
+
+    #[test]
+    fn duplicate_selected_edge_correlation_is_integrity() {
+        let mut graph = snapshot();
+        graph.profile_matrix.correlations =
+            vec![correlation(vec!["e0".to_owned(), "e0".to_owned()], 0)];
+        let error = materialize_path_steps_bounded_cancellable(
+            &graph,
+            &GraphQueryFilter::default(),
+            &[&graph.edges[0]],
+            100,
+            &mut || false,
+        )
+        .expect_err("duplicate edge correlation mapping must fail closed");
+        assert!(is_integrity(&error));
     }
 
     #[test]

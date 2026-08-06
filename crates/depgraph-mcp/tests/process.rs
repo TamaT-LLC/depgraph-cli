@@ -270,6 +270,196 @@ fn seed_issue_302_store(path: &Path, root: &Path) -> String {
     snapshot_id
 }
 
+fn seed_issue_303_store(path: &Path, root: &Path, source_revision: &str) -> String {
+    let mut store = Store::open(path).unwrap();
+    store
+        .start_scan_with_revision("issue-303", root, false, Some(source_revision))
+        .unwrap();
+    let coverage = json!({
+        "profiles": 1,
+        "files_discovered": 0,
+        "files_analyzed": 0,
+        "files_skipped": 0,
+        "dependency_sites": 1,
+        "resolved": 0,
+        "candidates": 0,
+        "external": 0,
+        "unresolved": 1,
+        "unsupported_syntax": 0,
+        "project_code_executed": false,
+        "completeness": ["syntax-complete"],
+        "reasons": []
+    });
+    let common = |event: &str, seq: u64| {
+        json!({
+            "event": event,
+            "protocol_version": "1.0",
+            "scan_id": "issue-303",
+            "adapter": "fixture",
+            "adapter_version": "1.0",
+            "seq": seq
+        })
+    };
+    let mut started = common("scan_started", 1);
+    started["root"] = json!(root);
+    started["project_code_executed"] = json!(false);
+    started["safe_mode"] = json!(true);
+    store.ingest_event(&started).unwrap();
+    let mut profile = common("profile_declared", 2);
+    profile["profile"] = json!({
+        "id": "fixture:safe",
+        "language": "fixture",
+        "features": [],
+        "environment": {"secret": "PROCESS_303_PROFILE_SECRET"},
+        "properties": {"private": root}
+    });
+    store.ingest_event(&profile).unwrap();
+    for (offset, (id, kind, path)) in [
+        ("node:root", "file", "src/root.rs"),
+        ("node:dependent-a", "file", "src/dependent-a.rs"),
+        ("node:dependent-b", "file", "src/dependent-b.rs"),
+        ("node:cycle-a", "file", "src/cycle-a.rs"),
+        ("node:cycle-b", "file", "src/cycle-b.rs"),
+        ("unknown:missing", "unknown_target", "src/missing.rs"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut node = common("node_upsert", offset as u64 + 3);
+        node["node"] = json!({
+            "id": id,
+            "kind": kind,
+            "locator": format!("repo://{path}"),
+            "display_name": id,
+            "properties": {"path": path, "secret": "PROCESS_303_NODE_SECRET", "root": root}
+        });
+        store.ingest_event(&node).unwrap();
+    }
+    for (offset, (id, source, target)) in [
+        ("edge:impact-a", "node:dependent-a", "node:root"),
+        ("edge:impact-b", "node:dependent-b", "node:dependent-a"),
+        ("edge:cycle-a", "node:cycle-a", "node:cycle-b"),
+        ("edge:cycle-b", "node:cycle-b", "node:cycle-a"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut edge = common("edge_upsert", offset as u64 + 9);
+        edge["edge"] = json!({
+            "id": id,
+            "source": source,
+            "target": target,
+            "kind": "imports",
+            "phase": "semantic",
+            "environment": "host",
+            "profile_id": "fixture:safe",
+            "resolution_status": "resolved",
+            "precision": "exact",
+            "condition": {"op": "all", "conditions": []},
+            "generated": false,
+            "evidence": [{
+                "kind": "semantic",
+                "extractor": "fixture",
+                "extractor_version": "1.0",
+                "path": "src/root.rs",
+                "start_line": 1,
+                "start_column": 1,
+                "end_line": 1,
+                "end_column": 2,
+                "detail": "PROCESS_303_EVIDENCE_SECRET",
+                "properties": {"secret": "PROCESS_303_PROPERTY_SECRET", "absolute": root}
+            }]
+        });
+        store.ingest_event(&edge).unwrap();
+    }
+    let mut site = common("dependency_site", 13);
+    site["site"] = json!({
+        "id": "site:missing",
+        "source": "node:dependent-b",
+        "kind": "import",
+        "specifier": "fixture:missing",
+        "resolution_status": "unresolved",
+        "target_ids": ["unknown:missing"],
+        "profile_id": "fixture:safe",
+        "condition": {"op": "all", "conditions": []},
+        "precision": "exact",
+        "reason": "package_not_found",
+        "evidence": [{
+            "kind": "source",
+            "extractor": "fixture",
+            "extractor_version": "1.0",
+            "path": "src/dependent-b.rs",
+            "start_line": 3,
+            "start_column": 1,
+            "end_line": 3,
+            "end_column": 9,
+            "detail": "PROCESS_303_SITE_DETAIL_SECRET",
+            "properties": {"secret": "PROCESS_303_SITE_PROPERTY_SECRET", "absolute": root}
+        }]
+    });
+    store.ingest_event(&site).unwrap();
+    let mut unresolved_edge = common("edge_upsert", 14);
+    unresolved_edge["edge"] = json!({
+        "id": "edge:missing",
+        "site_id": "site:missing",
+        "source": "node:dependent-b",
+        "target": "unknown:missing",
+        "kind": "imports",
+        "phase": "source",
+        "environment": "host",
+        "profile_id": "fixture:safe",
+        "resolution_status": "unresolved",
+        "precision": "exact",
+        "condition": {"op": "all", "conditions": []},
+        "generated": false
+    });
+    store.ingest_event(&unresolved_edge).unwrap();
+    let mut profile_completed = common("profile_completed", 15);
+    profile_completed["profile_id"] = json!("fixture:safe");
+    profile_completed["coverage"] = coverage.clone();
+    store.ingest_event(&profile_completed).unwrap();
+    let mut completed = common("scan_completed", 16);
+    completed["coverage"] = coverage;
+    store.ingest_event(&completed).unwrap();
+    store
+        .finish_scan("issue-303", "completed", None, true)
+        .unwrap();
+    let snapshot_id = store.current_snapshot_id().unwrap().unwrap();
+    store
+        .create_snapshot_name("issue-303", &snapshot_id)
+        .unwrap();
+    snapshot_id
+}
+
+fn issue_303_git(root: &Path, arguments: &[&str]) -> String {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(arguments)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {arguments:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
+fn prepare_issue_303_repository(root: &Path) -> String {
+    fs::create_dir_all(root.join("src")).unwrap();
+    for name in ["root", "dependent-a", "dependent-b", "cycle-a", "cycle-b"] {
+        fs::write(root.join(format!("src/{name}.rs")), format!("// {name}\n")).unwrap();
+    }
+    issue_303_git(root, &["init", "--quiet"]);
+    issue_303_git(root, &["config", "user.email", "test@example.invalid"]);
+    issue_303_git(root, &["config", "user.name", "Issue 303 Test"]);
+    issue_303_git(root, &["add", "src"]);
+    issue_303_git(root, &["commit", "--quiet", "-m", "fixture"]);
+    issue_303_git(root, &["rev-parse", "HEAD"])
+}
+
 struct RequirementFixture {
     _temp: tempfile::TempDir,
     path: PathBuf,
@@ -592,6 +782,16 @@ impl InteractiveMcp {
     }
 }
 
+fn interactive_tool_call(mcp: &mut InteractiveMcp, id: u64, name: &str, arguments: Value) -> Value {
+    mcp.request(json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "tools/call",
+        "params": {"name": name, "arguments": arguments}
+    }))["result"]
+        .clone()
+}
+
 fn seed_issue_300_bulk_rows(store_path: &Path, root: &Path) -> String {
     let mut store = Store::open(store_path).unwrap();
     store
@@ -894,6 +1094,38 @@ fn issue_302_graph_handlers_page_canonically_explain_paths_and_fail_closed_on_ex
         repeated["structuredContent"]["result"]["edges"]["next_cursor"],
         structured["result"]["edges"]["next_cursor"],
         "same snapshot and filter must reproduce the next cursor byte-for-byte"
+    );
+    let traversal_exhausted = mcp.request(json!({
+        "jsonrpc": "2.0",
+        "id": 22,
+        "method": "tools/call",
+        "params": {
+            "name": "graph_dependencies_list",
+            "arguments": {
+                "contract_version": "depgraph-mcp-tools-v1",
+                "repository_id": "repository",
+                "snapshot": "baseline",
+                "selector": "id:node:a",
+                "transitive": true,
+                "phases": ["semantic"],
+                "max_traversal": 1,
+                "limit": 1
+            }
+        }
+    }));
+    let traversal_exhausted = &traversal_exhausted["result"];
+    assert_eq!(
+        traversal_exhausted["isError"], true,
+        "{traversal_exhausted}"
+    );
+    assert_eq!(
+        traversal_exhausted["structuredContent"]["error"]["code"],
+        "RESOURCE_EXHAUSTED"
+    );
+    assert!(
+        traversal_exhausted["structuredContent"]
+            .get("result")
+            .is_none()
     );
     let cursor = structured["result"]["edges"]["next_cursor"].clone();
     let encoded = structured.to_string();
@@ -1246,6 +1478,267 @@ fn issue_302_cli_and_mcp_share_dependency_and_path_semantics() {
     );
     assert_eq!(mcp_path_edge_ids(&mcp_path), cli_path_edge_ids(&cli_path));
     assert_eq!(cli_path_edge_ids(&cli_path), ["edge:b", "edge:d"]);
+}
+
+#[test]
+fn issue_303_cli_mcp_parity_schemas_redaction_and_fail_closed_contracts() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("repository");
+    let store_path = temporary.path().join("store.sqlite");
+    let source_revision = prepare_issue_303_repository(&root);
+    seed_issue_303_store(&store_path, &root, &source_revision);
+    let before = store_invariant(&store_path);
+
+    let cli = |arguments: &[&str]| {
+        let binary = AssertCommand::cargo_bin("depgraph").unwrap();
+        let output = Command::new(binary.get_program())
+            .args(binary.get_args())
+            .current_dir(&root)
+            .arg("--store")
+            .arg(&store_path)
+            .arg("--scan-id")
+            .arg("issue-303")
+            .args(arguments)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "CLI {arguments:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()
+    };
+    let cli_impact = cli(&["impact", "id:node:root", "--json"]);
+    let cli_cycles = cli(&["cycles", "--level", "file", "--json"]);
+    let cli_unresolved = cli(&["unresolved", "--all", "--json"]);
+
+    let common = || {
+        json!({
+            "contract_version": "depgraph-mcp-tools-v1",
+            "repository_id": "repository",
+            "snapshot": "current"
+        })
+    };
+    let mut mcp = InteractiveMcp::start(&root, &store_path);
+    let initialized = mcp.request(json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2026-07-28",
+            "capabilities": {},
+            "clientInfo": {"name": "issue-303-test", "version": "1"}
+        }
+    }));
+    assert_eq!(initialized["id"], 1);
+    let listed = mcp.request(json!({
+        "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}
+    }));
+    let tools = listed["result"]["tools"].as_array().unwrap();
+
+    let mut impact_arguments = common();
+    impact_arguments["selector"] = json!("id:node:root");
+    impact_arguments["max_nodes"] = json!(100);
+    impact_arguments["max_edges"] = json!(100);
+    impact_arguments["limit"] = json!(1);
+    let impact = interactive_tool_call(&mut mcp, 3, "graph_impact_get", impact_arguments.clone());
+    assert_eq!(impact["isError"], false, "{impact}");
+    assert_tool_text_matches_structured(&impact);
+    let impact_cursor = impact["structuredContent"]["result"]["impacts"]["next_cursor"]
+        .as_str()
+        .expect("impact fixture produces more than one item")
+        .to_owned();
+    let impact_repeat =
+        interactive_tool_call(&mut mcp, 4, "graph_impact_get", impact_arguments.clone());
+    assert_eq!(
+        impact_repeat["structuredContent"], impact["structuredContent"],
+        "the canonical first page must be byte-stable"
+    );
+    let mut full_impact_arguments = impact_arguments.clone();
+    full_impact_arguments["limit"] = json!(100);
+    let full_impact =
+        interactive_tool_call(&mut mcp, 30, "graph_impact_get", full_impact_arguments);
+    assert_eq!(full_impact["isError"], false, "{full_impact}");
+    let mut cursor_mismatch_arguments = impact_arguments.clone();
+    cursor_mismatch_arguments["cursor"] = json!(impact_cursor);
+    cursor_mismatch_arguments["depth"] = json!(1);
+    let cursor_mismatch =
+        interactive_tool_call(&mut mcp, 5, "graph_impact_get", cursor_mismatch_arguments);
+    assert_eq!(cursor_mismatch["isError"], true, "{cursor_mismatch}");
+    assert_eq!(
+        cursor_mismatch["structuredContent"]["error"]["code"],
+        "CURSOR_MISMATCH"
+    );
+
+    let mut cycles_arguments = common();
+    cycles_arguments["level"] = json!("file");
+    cycles_arguments["max_traversal"] = json!(100);
+    cycles_arguments["limit"] = json!(100);
+    let cycles = interactive_tool_call(&mut mcp, 6, "graph_cycles_list", cycles_arguments.clone());
+    assert_eq!(cycles["isError"], false, "{cycles}");
+    assert_eq!(
+        cycles["structuredContent"]["result"]["items"][0]["level"],
+        "file"
+    );
+
+    let mut unresolved_arguments = common();
+    unresolved_arguments["max_traversal"] = json!(100);
+    unresolved_arguments["limit"] = json!(100);
+    let unresolved = interactive_tool_call(
+        &mut mcp,
+        7,
+        "graph_unresolved_list",
+        unresolved_arguments.clone(),
+    );
+    assert_eq!(unresolved["isError"], false, "{unresolved}");
+    assert_eq!(
+        unresolved["structuredContent"]["result"]["items"][0]["site"]["id"],
+        "site:missing"
+    );
+    assert!(
+        unresolved["structuredContent"]["result"]["items"][0]["effective_profile_id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("effective-profile:sha256:"))
+    );
+
+    let mcp_impact_ids = full_impact["structuredContent"]["result"]["impacts"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["node"]["id"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    let cli_impact_ids = cli_impact["data"]["impacts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["node"]["id"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(mcp_impact_ids, cli_impact_ids);
+    let mcp_cycles = cycles["structuredContent"]["result"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["node_ids"].clone())
+        .collect::<Vec<_>>();
+    let cli_cycles = cli_cycles["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["node_ids"].clone())
+        .collect::<Vec<_>>();
+    assert_eq!(mcp_cycles, cli_cycles);
+    let mcp_unresolved = unresolved["structuredContent"]["result"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["site"]["id"].clone())
+        .collect::<Vec<_>>();
+    let cli_unresolved = cli_unresolved["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["site"]["id"].clone())
+        .collect::<Vec<_>>();
+    assert_eq!(mcp_unresolved, cli_unresolved);
+
+    fs::write(root.join("src/root.rs"), "// root\n// dirty\n").unwrap();
+    let mut changed_arguments = common();
+    changed_arguments["selector"] = json!("id:node:root");
+    changed_arguments["changed_since"] = json!("HEAD");
+    changed_arguments["max_nodes"] = json!(100);
+    changed_arguments["max_edges"] = json!(100);
+    changed_arguments["limit"] = json!(100);
+    let changed = interactive_tool_call(&mut mcp, 8, "graph_impact_get", changed_arguments.clone());
+    assert_eq!(changed["isError"], false, "{changed}");
+    assert!(
+        changed["structuredContent"]["result"]["changed_since"]["changed_paths"]
+            .as_u64()
+            .unwrap()
+            >= 1
+    );
+    assert!(
+        changed["structuredContent"]["result"]["changed_since"]["mapped_nodes"]
+            .as_u64()
+            .unwrap()
+            >= 1
+    );
+
+    let mut named_changed = changed_arguments.clone();
+    named_changed["snapshot"] = json!("issue-303");
+    let named_changed = interactive_tool_call(&mut mcp, 9, "graph_impact_get", named_changed);
+    assert_eq!(named_changed["isError"], true, "{named_changed}");
+    assert_eq!(
+        named_changed["structuredContent"]["error"]["code"],
+        "INVALID_ARGUMENT"
+    );
+
+    for (id, name, mut arguments) in [
+        (10, "graph_impact_get", impact_arguments.clone()),
+        (11, "graph_cycles_list", cycles_arguments.clone()),
+        (12, "graph_unresolved_list", unresolved_arguments.clone()),
+    ] {
+        if name == "graph_impact_get" {
+            arguments["max_nodes"] = json!(1);
+            arguments["max_edges"] = json!(100);
+        } else {
+            arguments["max_traversal"] = json!(1);
+        }
+        let exhausted = interactive_tool_call(&mut mcp, id, name, arguments);
+        assert_eq!(exhausted["isError"], true, "{name}: {exhausted}");
+        assert_eq!(
+            exhausted["structuredContent"]["error"]["code"],
+            "RESOURCE_EXHAUSTED"
+        );
+        assert!(exhausted["structuredContent"].get("result").is_none());
+    }
+
+    issue_303_git(&root, &["add", "src/root.rs"]);
+    issue_303_git(&root, &["commit", "--quiet", "-m", "advance head"]);
+    let mismatched = interactive_tool_call(&mut mcp, 13, "graph_impact_get", changed_arguments);
+    assert_eq!(mismatched["isError"], true, "{mismatched}");
+    assert_eq!(
+        mismatched["structuredContent"]["error"]["code"],
+        "SNAPSHOT_WORKTREE_MISMATCH"
+    );
+    assert!(mismatched["structuredContent"].get("result").is_none());
+
+    let shared_schema: Value = serde_json::from_slice(include_bytes!(
+        "../../../schemas/depgraph-mcp-tools-v1.schema.json"
+    ))
+    .unwrap();
+    let shared = jsonschema::draft202012::new(&shared_schema).unwrap();
+    for (name, result) in [
+        ("graph_impact_get", &impact),
+        ("graph_impact_get", &full_impact),
+        ("graph_cycles_list", &cycles),
+        ("graph_unresolved_list", &unresolved),
+        ("graph_impact_get", &changed),
+    ] {
+        let structured = &result["structuredContent"];
+        let advertised_schema =
+            tools.iter().find(|tool| tool["name"] == name).unwrap()["outputSchema"].clone();
+        jsonschema::draft202012::new(&advertised_schema)
+            .unwrap()
+            .validate(structured)
+            .unwrap_or_else(|error| panic!("{name} advertised schema: {error}"));
+        shared
+            .validate(structured)
+            .unwrap_or_else(|error| panic!("{name} shared schema: {error}"));
+        assert_tool_text_matches_structured(result);
+        let encoded = structured.to_string();
+        for forbidden in [
+            root.to_string_lossy().as_ref(),
+            "PROCESS_303_",
+            "properties",
+            "SITE_DETAIL_SECRET",
+            "EVIDENCE_SECRET",
+        ] {
+            assert!(!encoded.contains(forbidden), "{name} leaked {forbidden}");
+        }
+    }
+
+    mcp.finish();
+    assert_eq!(before, store_invariant(&store_path));
 }
 
 #[test]

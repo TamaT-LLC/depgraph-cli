@@ -8,10 +8,10 @@ use std::{
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use depgraph_core::service::{
-    CompletedSnapshotView, DependenciesRequest, DependencyDirection, DepgraphCapabilitySet,
-    DepgraphService, DepgraphServiceConfig, DepgraphServiceError, DepgraphServiceLimits,
-    DoctorRequest, ExplainPathRequest, ProfilePlanRequest, RepositoryRelativePath, SnapshotLocator,
-    SnapshotReadRequest,
+    CompletedSnapshotView, CyclesRequest, DependenciesRequest, DependencyDirection,
+    DepgraphCapabilitySet, DepgraphService, DepgraphServiceConfig, DepgraphServiceError,
+    DepgraphServiceLimits, DoctorRequest, ExplainPathRequest, ImpactRequest, ProfilePlanRequest,
+    RepositoryRelativePath, SnapshotLocator, SnapshotReadRequest, UnresolvedRequest,
 };
 use depgraph_core::{
     BoundedQueryExecutionError, BoundedQueryPlan, BoundedQueryResult, BuildAudit, BuildOutcomeKind,
@@ -23,19 +23,19 @@ use depgraph_core::{
     TypedProjection, UnresolvedResult, acquire_store_writer_lock, build_cache_key,
     compiler_precise_cache_hit_audit, compiler_precise_cache_key, compiler_precise_graph_ndjson,
     create_build_execution_request, create_compiler_precise_invocation_request,
-    create_compiler_precise_unit_graph_request, cycles_from_topology, default_store_path,
-    evaluate_policy_diff, execute_bounded_query, execute_build_request_with_cancellation,
-    export_filtered, export_graphml_filtered_to_writer, impact, impact_query_cache_key,
-    init_config, match_runtime_trace, open_store, open_store_read_only, paginate_interactive_query,
-    parse_and_type_check_bounded_query, plan_bounded_query, policy_annotations,
-    prepare_build_cache_input, prepare_compiler_precise_cache_input,
-    profile_selection_human_summary, read_bounded_query_file, read_compiler_pack_requirement,
-    read_git_changed_set, read_runtime_trace, render_condition, render_github_annotations,
-    run_scan_with_cache_mode, runtime_session_delta, rust_build_protocol_ndjson,
-    snapshot_profile_plan_id, stage_build_evidence, start_repository_daemon, traversal_summary,
-    unresolved, unresolved_summary, validate_build_cache_input, validate_build_cache_source,
-    validate_compiler_precise_cache_input, validate_compiler_precise_cached_evidence,
-    validate_interactive_query_bounds, web_build_protocol_ndjson,
+    create_compiler_precise_unit_graph_request, default_store_path, evaluate_policy_diff,
+    execute_bounded_query, execute_build_request_with_cancellation, export_filtered,
+    export_graphml_filtered_to_writer, init_config, match_runtime_trace, open_store,
+    open_store_read_only, paginate_interactive_query, parse_and_type_check_bounded_query,
+    plan_bounded_query, policy_annotations, prepare_build_cache_input,
+    prepare_compiler_precise_cache_input, profile_selection_human_summary, read_bounded_query_file,
+    read_compiler_pack_requirement, read_runtime_trace, render_condition,
+    render_github_annotations, run_scan_with_cache_mode, runtime_session_delta,
+    rust_build_protocol_ndjson, snapshot_profile_plan_id, stage_build_evidence,
+    start_repository_daemon, traversal_summary, unresolved_summary, validate_build_cache_input,
+    validate_build_cache_source, validate_compiler_precise_cache_input,
+    validate_compiler_precise_cached_evidence, validate_interactive_query_bounds,
+    web_build_protocol_ndjson,
 };
 use depgraph_mcp_tools::{AgentDaemonStatus, AgentDoctor, CliAction};
 use depgraph_protocol::canonical_json;
@@ -249,11 +249,20 @@ enum Commands {
     Cycles {
         #[arg(long, value_enum, default_value_t = CycleLevelArg::File)]
         level: CycleLevelArg,
+        /// Bound cycle preprocessing and search work.
+        #[arg(long, value_name = "N")]
+        max_traversal: Option<usize>,
         #[arg(long)]
         json: bool,
     },
     /// List unresolved dependency sites.
     Unresolved {
+        /// Include unresolved sites with one of these exact kinds.
+        #[arg(long, value_name = "KIND")]
+        kind: Vec<String>,
+        /// Bound unresolved-site preprocessing and result construction work.
+        #[arg(long, value_name = "N")]
+        max_traversal: Option<usize>,
         #[arg(long)]
         json: bool,
         #[command(flatten)]
@@ -469,6 +478,7 @@ enum CycleLevelArg {
     Package,
     File,
     Symbol,
+    Type,
     Route,
 }
 
@@ -1534,7 +1544,7 @@ async fn run(cli: Cli) -> Result<u8> {
                 transitive,
                 filter,
                 if output.all {
-                    usize::MAX
+                    depgraph_core::MAX_INTERACTIVE_QUERY_TRAVERSAL
                 } else {
                     max_traversal.unwrap_or(DEFAULT_INTERACTIVE_QUERY_MAX_TRAVERSAL)
                 },
@@ -1582,7 +1592,7 @@ async fn run(cli: Cli) -> Result<u8> {
                 transitive,
                 filter,
                 if output.all {
-                    usize::MAX
+                    depgraph_core::MAX_INTERACTIVE_QUERY_TRAVERSAL
                 } else {
                     max_traversal.unwrap_or(DEFAULT_INTERACTIVE_QUERY_MAX_TRAVERSAL)
                 },
@@ -1663,95 +1673,83 @@ async fn run(cli: Cli) -> Result<u8> {
         } => {
             let filters = ImpactFilters::new(depth, profile, condition, max_nodes, max_edges)?
                 .with_runtime_filters(phase, session, environment)?;
-            let root = std::env::current_dir()?;
-            let store_path = store_path(cli.store, &root)?;
-            let mut store = open_store(&store_path)?;
-            let scan_id = store.resolve_scan_id(cli.scan_id.as_deref(), false)?;
-            let snapshot_id = if changed.is_none() {
-                store.snapshot_id_for_scan_selection(&scan_id)?
-            } else {
-                None
-            };
-            let cache_key = snapshot_id
-                .as_deref()
-                .map(|snapshot_id| impact_query_cache_key(snapshot_id, &selector, &filters));
-            let cached = match (cache_key.as_deref(), snapshot_id.as_deref()) {
-                (Some(cache_key), Some(snapshot_id)) => store
-                    .lookup_impact_query_cache(cache_key, snapshot_id)
-                    .ok()
-                    .flatten()
-                    .and_then(|payload| serde_json::from_str::<ImpactResult>(&payload).ok()),
-                _ => None,
-            };
-            let result = if let Some(result) = cached {
-                result
-            } else {
-                let snapshot = store.load_snapshot(&scan_id)?;
-                let changed_set = changed
-                    .as_deref()
-                    .map(|git_ref| read_git_changed_set(Path::new(&snapshot.scan.root), git_ref))
-                    .transpose()?;
-                let result = impact(&snapshot, &selector, changed_set.as_ref(), filters)?;
-                if let (Some(cache_key), Some(snapshot_id)) =
-                    (cache_key.as_deref(), snapshot_id.as_deref())
-                {
-                    let payload = serde_json::to_string(&result)?;
-                    // Cache population is best-effort: a successful impact
-                    // query must remain usable if the bounded cache cannot be
-                    // written, just as scan cache population failures do.
-                    let _ = store.store_impact_query_cache(cache_key, snapshot_id, &payload);
-                }
-                result
-            };
-            print_structured("impact", scan_id, &result, json)?;
+            let (service, mut snapshot) =
+                graph_snapshot_request(cli.store, cli.scan_id.as_deref())?;
+            let result = service.impact(
+                &mut snapshot,
+                &ImpactRequest::try_new(selector, changed, filters)?,
+                &CancellationToken::new(),
+            )?;
+            print_structured("impact", result.scan_id().to_owned(), result.impact(), json)?;
             if !json {
-                print_human_impact(&result);
+                print_human_impact(result.impact());
             }
             Ok(0)
         }
-        Commands::Cycles { level, json } => {
-            let root = std::env::current_dir()?;
-            let store_path = store_path(cli.store, &root)?;
-            let store = open_store_read_only(&store_path)?;
-            let scan_id = store.resolve_scan_id(cli.scan_id.as_deref(), false)?;
+        Commands::Cycles {
+            level,
+            max_traversal,
+            json,
+        } => {
             let level = match level {
                 CycleLevelArg::Package => CycleLevel::Package,
                 CycleLevelArg::File => CycleLevel::File,
                 CycleLevelArg::Symbol => CycleLevel::Symbol,
+                CycleLevelArg::Type => CycleLevel::Type,
                 CycleLevelArg::Route => CycleLevel::Route,
             };
-            let result =
-                if let Some(snapshot_id) = store.snapshot_id_for_scan_selection(&scan_id)? {
-                    let topology = store.load_completed_topology(&snapshot_id)?;
-                    cycles_from_topology(&topology, level)
-                } else {
-                    let snapshot = store.load_snapshot(&scan_id)?;
-                    depgraph_core::cycles(&snapshot, level)
-                };
-            print_structured("cycles", scan_id, &result, json)?;
+            let (service, mut snapshot) =
+                graph_snapshot_request(cli.store, cli.scan_id.as_deref())?;
+            let result = service.cycles(
+                &mut snapshot,
+                &CyclesRequest::try_new(
+                    level,
+                    max_traversal.unwrap_or(DEFAULT_INTERACTIVE_QUERY_MAX_TRAVERSAL),
+                )?,
+                &CancellationToken::new(),
+            )?;
+            print_structured(
+                "cycles",
+                result.scan_id().to_owned(),
+                &result.cycles(),
+                json,
+            )?;
             if !json {
-                if result.is_empty() {
+                if result.cycles().is_empty() {
                     println!("no cycles");
                 }
-                for cycle in result {
+                for cycle in result.cycles() {
                     println!("{}", cycle.node_ids.join(" -> "));
                 }
             }
             Ok(0)
         }
-        Commands::Unresolved { json, output } => {
+        Commands::Unresolved {
+            kind,
+            max_traversal,
+            json,
+            output,
+        } => {
+            let (service, mut snapshot) =
+                graph_snapshot_request(cli.store, cli.scan_id.as_deref())?;
+            let request = UnresolvedRequest::try_new(
+                kind,
+                max_traversal.unwrap_or(DEFAULT_INTERACTIVE_QUERY_MAX_TRAVERSAL),
+            )?;
+            let result = service.unresolved(&mut snapshot, &request, &CancellationToken::new())?;
             if output.all {
-                let (snapshot, scan_id) = load_snapshot(cli.store, cli.scan_id.as_deref(), false)?;
-                let result = unresolved(&snapshot);
-                print_structured("unresolved", scan_id, &result, json)?;
+                print_structured(
+                    "unresolved",
+                    result.scan_id().to_owned(),
+                    &result.items(),
+                    json,
+                )?;
                 if !json {
-                    print_unresolved_items(&result);
+                    print_unresolved_items(result.items());
                 }
             } else {
-                let (snapshot, snapshot_id) =
-                    load_query_snapshot_read_only(cli.store, cli.scan_id.as_deref())?;
-                let scan_id = snapshot.scan.id.clone();
-                let result = unresolved(&snapshot);
+                let snapshot_id = result.snapshot_id().as_str();
+                let scan_id = result.scan_id();
                 let max_items = output
                     .max_items
                     .unwrap_or(DEFAULT_INTERACTIVE_QUERY_MAX_ITEMS);
@@ -1759,20 +1757,24 @@ async fn run(cli: Cli) -> Result<u8> {
                     .max_bytes
                     .unwrap_or(DEFAULT_INTERACTIVE_QUERY_MAX_BYTES);
                 validate_interactive_query_bounds(max_items, max_bytes, None)?;
-                let context = serde_json::json!({"query":"unresolved"});
+                let context = serde_json::json!({
+                    "query":"unresolved",
+                    "kinds": request.kinds(),
+                    "max_traversal": request.max_traversal(),
+                });
                 let page = paginate_interactive_query(
-                    &result,
-                    unresolved_summary(&result),
+                    result.items(),
+                    unresolved_summary(result.items()),
                     InteractiveQueryPageRequest {
                         command: "unresolved",
-                        scan_id: &scan_id,
-                        snapshot_id: &snapshot_id,
+                        scan_id,
+                        snapshot_id,
                         context: &context,
                         cursor: output.cursor.as_deref(),
                         max_items,
                         max_bytes,
                         traversal_complete: true,
-                        traversed_items: result.len().try_into().unwrap_or(u64::MAX),
+                        traversed_items: result.items().len().try_into().unwrap_or(u64::MAX),
                         root: None,
                         diagnostics: Vec::new(),
                     },

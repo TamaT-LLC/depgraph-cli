@@ -388,6 +388,7 @@ pub enum AgentErrorCode {
     InvalidRepositoryPath,
     SnapshotNotFound,
     SnapshotMismatch,
+    SnapshotWorktreeMismatch,
     CursorInvalid,
     CursorMismatch,
     CapabilityDenied,
@@ -422,6 +423,7 @@ impl AgentErrorCode {
             Self::InvalidArgument
             | Self::InvalidRepositoryPath
             | Self::SnapshotMismatch
+            | Self::SnapshotWorktreeMismatch
             | Self::CursorInvalid
             | Self::CursorMismatch => AgentErrorCategory::Input,
             Self::CapabilityDenied => AgentErrorCategory::Authorization,
@@ -652,4 +654,16 @@ pub enum ContractBuildError {
     PathTopology,
     #[error("Agent graph response traversal counts are inconsistent")]
     TraversalCount,
+    #[error("Agent impact state is inconsistent with its result page")]
+    ImpactState,
+    #[error("Agent cycle topology is inconsistent")]
+    CycleTopology,
+    #[error("Agent cycle contains too many nodes")]
+    TooManyCycleNodes,
+    #[error("Agent unresolved site/profile/correlation state is inconsistent")]
+    UnresolvedState,
+    #[error("Agent unresolved correlation contains too many reasons")]
+    TooManyCorrelationReasons,
+    #[error("Agent unresolved site contains too many phases")]
+    TooManyPhases,
 }

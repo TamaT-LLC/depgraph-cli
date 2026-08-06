@@ -155,6 +155,53 @@ fn generated_schema_is_valid_draft_2020_12_and_rejects_unknown_fields() {
             }),
         ),
         (
+            "AgentChangedSince",
+            "AgentChangedSince",
+            json!({
+                "requested_ref":"HEAD",
+                "resolved_ref":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "merge_base":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "head":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "changed_paths":1,
+                "mapped_nodes":1
+            }),
+        ),
+        (
+            "AgentImpact",
+            "AgentImpact",
+            json!({
+                "node":{"id":"node:src","kind":"module","locator":"repo://src/lib.rs"},
+                "depth":0,
+                "changed_node_id":"node:src",
+                "dependency_path":[]
+            }),
+        ),
+        (
+            "AgentImpactResponse",
+            "AgentImpactResponse",
+            json!({
+                "root":{"id":"node:src","kind":"module","locator":"repo://src/lib.rs"},
+                "root_impacted":true,
+                "impacts":{"items":[],"returned_items":0,"total_items":0,"complete":true}
+            }),
+        ),
+        (
+            "AgentCycle",
+            "AgentCycle",
+            json!({"level":"file","node_ids":["node:src","node:src"]}),
+        ),
+        (
+            "AgentUnresolved",
+            "AgentUnresolved",
+            json!({
+                "site":{"id":"site:1","source_id":"node:src","kind":"import","specifier":"crate::dependency","resolution_status":"unresolved","profile_id":"profile:default","target_ids":[],"evidence":[]},
+                "phases":["source"],
+                "effective_profile_id":"profile:default",
+                "correlation_status":"unobserved",
+                "observed_difference_reasons":["not_observed"]
+            }),
+        ),
+        (
             "AgentSnapshot",
             "AgentSnapshot::Available",
             json!({"availability":"available","snapshot_id":SNAPSHOT_ID,"name":"baseline"}),
@@ -275,6 +322,47 @@ fn generated_schema_matches_recovery_and_snapshot_semantic_invariants() {
 }
 
 #[test]
+fn issue_303_schema_closes_cycle_and_unresolved_enums_and_bounds() {
+    let schema = schema_value();
+    let validator_for = |definition: &str| {
+        let wrapper = json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$defs": schema["$defs"].clone(),
+            "$ref": format!("#/$defs/{definition}"),
+        });
+        jsonschema::draft202012::new(&wrapper).unwrap()
+    };
+    let cycle = validator_for("AgentCycle");
+    assert!(cycle.is_valid(&json!({
+        "level":"file", "node_ids":["node:src","node:src"]
+    })));
+    assert!(!cycle.is_valid(&json!({
+        "level":"directory", "node_ids":["node:src","node:src"]
+    })));
+    assert!(!cycle.is_valid(&json!({
+        "level":"file", "node_ids":[]
+    })));
+
+    let unresolved = validator_for("AgentUnresolved");
+    let sample = json!({
+        "site":{"id":"site:1","source_id":"node:src","kind":"import","specifier":"crate::dependency","resolution_status":"unresolved","profile_id":"profile:default","target_ids":[],"evidence":[]},
+        "phases":["source"],
+        "correlation_status":"unobserved",
+        "observed_difference_reasons":["not_observed"]
+    });
+    assert!(unresolved.is_valid(&sample));
+    let mut invalid = sample.clone();
+    invalid["correlation_status"] = json!("private");
+    assert!(!unresolved.is_valid(&invalid));
+    let mut invalid = sample.clone();
+    invalid["phases"] = json!(["source", "semantic", "build", "runtime", "source"]);
+    assert!(!unresolved.is_valid(&invalid));
+    let mut invalid = sample;
+    invalid["observed_difference_reasons"] = json!(["private"]);
+    assert!(!unresolved.is_valid(&invalid));
+}
+
+#[test]
 fn schema_preflight_requires_authoritative_semantic_deserialization() {
     let schema = schema_value();
     let schema_accepts = |definition: &str, instance: &Value| {
@@ -362,7 +450,7 @@ fn every_generated_object_schema_has_additional_properties_false() {
     let schema = schema_value();
     let mut objects = 0;
     assert_all_object_schemas_are_closed(&schema, "#", &mut objects);
-    assert_eq!(objects, 102, "review newly added object schemas explicitly");
+    assert_eq!(objects, 113, "review newly added object schemas explicitly");
 }
 
 #[test]

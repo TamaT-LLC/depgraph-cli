@@ -30,6 +30,7 @@ additive extensionとして採用するかを決定する。
 | Agent DTO/schema catalog | `depgraph-mcp-tools-v1` | Issue #295 contract implemented |
 | Read-only lifecycle tools | `profile_plan_get`, `daemon_get`, `doctor_get` | Issue #301 implemented through the shared service boundary |
 | Graph dependency tools | `graph_dependencies_list`, `graph_dependents_list`, `graph_path_get` | Issue #302 implemented through one pinned snapshot request |
+| Graph analysis tools | `graph_impact_get`, `graph_cycles_list`, `graph_unresolved_list` | Issue #303 implemented through shared bounded read services |
 | Open questions | `0` | Resolved |
 
 Stage 1ではcontractをfreezeする。operation journal、runner、baseline operation
@@ -75,6 +76,7 @@ schema/Serde差分は回帰testで意図的に固定する。
 | `#295` | 共通contract、closed DTO、typed error、pagination、operation型、決定的schema生成 | `depgraph-mcp-tools-v1`のRust型、checked-in schema、digestとcontract golden、およびintegration testで固定する |
 | `#301` | profile plan、daemon status、doctorを共有serviceとMCPへ接続する | lifecycle service/DTO/handler、CLI migration、security/redaction/immutability/parity/process test、およびcanonical catalog/schema fixtureで固定する |
 | `#302` | dependencies、dependents、explain pathを共有serviceとMCPへ接続する | pinned `SnapshotReadRequest`、closed dependency/path DTO、exact catalog schema、CLI/MCP parity、cursor/exhaustion/process testで固定する |
+| `#303` | reverse impact、cycles、unresolved sitesを共有serviceとMCPへ接続する | current-only changed set、cache-independent canonical impact、closed cycle/unresolved DTO、全phaseのbounds/cancellation、snapshot/input-bound cursor、CLI/MCP/process/schema parityで固定する |
 
 ## Upstream and API evidence
 
@@ -370,6 +372,35 @@ Issue [#302](https://github.com/TamaT-LLC/depgraph-cli/issues/302)は既存の`d
 | concurrent scan中も開始時snapshotだけを参照する | currentを解決後に別snapshotをpublishするrequest-pinning service test |
 | closed schemaとredaction | DTO constructor/Serde/schema tests、およびprivate path/property prohibition process corpus |
 | repository validation | focused tests、workspace formatting、Clippy `-D warnings`、`cargo xtask test` |
+
+## Issue #303 impact/cycle/unresolved tool evidence
+
+Issue [#303](https://github.com/TamaT-LLC/depgraph-cli/issues/303)は既存の`impact`、
+`cycles`、`unresolved`を共有read-only serviceへ移し、同じcanonical resultを三つの
+MCP toolへ公開する。
+
+| Boundary | Frozen behavior and evidence |
+| --- | --- |
+| Snapshot and changed set | selector-only requestは任意のcompleted snapshotを使える。`changed_since`はlocatorが厳密に`current`のrequestだけを許し、Gitが返すHEADとsnapshotの`source_revision`が一致しなければpartial resultを作らず`SNAPSHOT_WORKTREE_MISMATCH`を返す |
+| Cache independence | `DepgraphService::impact`はrequest-owned read-only storeから固定snapshotを読み、毎回canonical mapping、adjacency、shortest path、reverse traversalを計算する。impact query cacheのlookup、insert、touch、event記録を行わず、CLI/MCP反復testはstore digestとcache entry countの不変を検証する |
+| Canonical impact | selector、optional Git changed set、normalized depth/profile/condition/phase/session/environment filterを一つの`ImpactRequest`へ集約する。changed path/node mappingとdependency pathはstable ID順、canonical adjacency/BFS順で固定し、上限到達時は`complete: false`を公開せず`RESOURCE_EXHAUSTED`へ変換する |
+| Bounded cycles | `CyclesRequest`はclosed `CycleLevel`とtraversal limitだけを持つ。node/edge preprocessing、iterative SCC traversal、representative cycle search、sort/finalizationは独立budgetとcancellation checkを持ち、`AgentCycleLevel`および先頭末尾が同じbounded `AgentCycle`だけを公開する |
+| Bounded unresolved projection | `UnresolvedRequest`はnormalized kind filterとtraversal limitを持つ。evidence/edge/correlation preprocessing、site traversal、projection/finalizationをbudget/cancellation境界にし、一siteあたりevidence 64件、target 256件、correlation reason 16件を超える入力は全resultを破棄する |
+| Closed disclosure | `AgentImpactResponse`、`AgentImpact`、`AgentCycle`、`AgentUnresolved`、拡張`AgentSite`はunknown fieldを拒否する。unresolved evidenceはkind/extractor/versionとportable relative spanだけ、profile/correlationはclosed ID/enumだけを返し、raw detail/properties、environment、absolute path、secret-like private dataを投影しない |
+| Pagination and runtime | 各cursorはcontract、tool、repository、resolved snapshot ID、normalized selector/changed-set/filter/level/kind/budget、およびcollection digestへbindする。handlerはread admission、deadline、rate/concurrency/queue limitとrequest cancellationを維持し、service/Git child pollingもcooperative cancellationに従う |
+| Frontend parity and artifacts | CLI三commandとMCP三handlerは同じservice methodを呼ぶ。real stdio/CLI process testがimpact node、cycle path、unresolved site IDを比較し、successをadvertised exact schemaとchecked-in shared schemaの双方で検証する。catalog/schema/contract JSONとdigestはrepository-native golden更新commandで固定する |
+
+### Issue #303 acceptance mapping
+
+| Acceptance criterion | Evidence |
+| --- | --- |
+| `changed_since`はcurrent snapshotだけ、HEAD不一致はtyped failure | named-snapshot rejection、dirty-worktree success、commit後のreal-process `SNAPSHOT_WORKTREE_MISMATCH` test |
+| impactはread-onlyでcache非依存 | service/CLI反復canonical equality、impact cache count zero、MCP store digest/row/current pointer immutability |
+| cycle/unresolved outputはclosed、bounded、redacted | DTO constructor/Serde/schema enum・topology・length testとhostile evidence process corpus |
+| 全phaseがbounded/cancellableでpartial successなし | core cancellation/resource tests、wide preflight、stdio三toolの`RESOURCE_EXHAUSTED`かつresultなしtest |
+| cursorはsnapshotとnormalized inputへbindする | repeated first-page equalityとfilter変更時`CURSOR_MISMATCH` process test |
+| CLI/MCP/domain/schema/catalog parity | shared-service integration、cross-process ID parity、real output advertised/shared validation、canonical catalog/schema/contract golden |
+| repository validation | `cargo fmt`、影響packageのfocused unit/integration/process tests、`git diff --check`。workspace-wide expensive gateはparent validationに委譲する |
 
 ## Issue #292 acceptance mapping
 
