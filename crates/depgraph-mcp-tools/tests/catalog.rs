@@ -341,6 +341,68 @@ fn durable_operation_output_schema_accepts_the_v1_wire_contract() {
 }
 
 #[test]
+fn lifecycle_tool_inputs_and_exact_output_contracts_are_frozen() {
+    let catalog = ToolCatalog::for_capabilities(&DepgraphCapabilitySet::read_only()).unwrap();
+    let profile = catalog.tool("profile_plan_get").unwrap();
+    let daemon = catalog.tool("daemon_get").unwrap();
+    let doctor = catalog.tool("doctor_get").unwrap();
+
+    assert_eq!(
+        profile.input_schema()["properties"]["profile_budget"],
+        serde_json::json!({"type":"integer","minimum":1,"maximum":32})
+    );
+    assert_eq!(
+        profile.input_schema()["properties"]["profiles_document"]["x-depgraph-maxUtf8Bytes"],
+        1_048_576
+    );
+    let profile_input = Value::Object(profile.input_schema().clone());
+    let validator = jsonschema::draft202012::new(&profile_input).unwrap();
+    let common = serde_json::json!({
+        "contract_version":"depgraph-mcp-tools-v1",
+        "repository_id":"repository"
+    });
+    assert!(validator.is_valid(&common));
+    for invalid in [
+        serde_json::json!({
+            "contract_version":"depgraph-mcp-tools-v1","repository_id":"repository",
+            "profile_budget":1,"profiles_document":"{}"
+        }),
+        serde_json::json!({
+            "contract_version":"depgraph-mcp-tools-v1","repository_id":"repository",
+            "profile_budget":1,"profiles_file":"profiles.json"
+        }),
+        serde_json::json!({
+            "contract_version":"depgraph-mcp-tools-v1","repository_id":"repository",
+            "profiles_document":"{}","profiles_file":"profiles.json"
+        }),
+        serde_json::json!({
+            "contract_version":"depgraph-mcp-tools-v1","repository_id":"repository",
+            "profiles_file":"../private.json"
+        }),
+    ] {
+        assert!(!validator.is_valid(&invalid), "accepted {invalid}");
+    }
+
+    for (tool, definition) in [
+        (profile, "AgentProfilePlan"),
+        (daemon, "AgentDaemonStatus"),
+        (doctor, "AgentDoctor"),
+    ] {
+        let output = Value::Object(tool.output_schema().clone());
+        let encoded = output.to_string();
+        assert!(
+            encoded.contains(definition),
+            "{} omitted {definition}",
+            tool.name()
+        );
+        jsonschema::draft202012::new(&output)
+            .unwrap_or_else(|error| panic!("{} output did not compile: {error}", tool.name()));
+    }
+    assert_ne!(profile.output_schema(), daemon.output_schema());
+    assert_ne!(daemon.output_schema(), doctor.output_schema());
+}
+
+#[test]
 fn canonical_catalog_matches_checked_in_golden() {
     let catalog = ToolCatalog::for_capabilities(&full_capabilities()).unwrap();
     let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");

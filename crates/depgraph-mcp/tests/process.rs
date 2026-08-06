@@ -109,8 +109,8 @@ fn seed_issue_300_store(path: &Path, root: &Path) -> String {
         "id": "rust:safe",
         "language": "rust",
         "features": [],
-        "environment": {},
-        "properties": {}
+        "environment": {"API_TOKEN": "PROCESS_PROFILE_SECRET"},
+        "properties": {"compiler_command": "/usr/bin/rustc --crate-name process-secret"}
     });
     store.ingest_event(&profile).unwrap();
     for (seq, node) in [
@@ -143,6 +143,14 @@ fn seed_issue_300_store(path: &Path, root: &Path) -> String {
     let mut completed = common("scan_completed", 6);
     completed["coverage"] = coverage;
     store.ingest_event(&completed).unwrap();
+    store
+        .save_adapter_log(
+            "issue-300",
+            "rust",
+            "PROCESS_WORKER_LOG_SECRET /usr/bin/rustc",
+            false,
+        )
+        .unwrap();
     store
         .finish_scan("issue-300", "completed", None, true)
         .unwrap();
@@ -569,6 +577,34 @@ fn issue_300_arguments(repository_id: &str) -> Value {
     })
 }
 
+fn assert_tool_text_matches_structured(result: &Value) {
+    let text: Value = serde_json::from_str(result["content"][0]["text"].as_str().unwrap())
+        .expect("tool text content is canonical JSON");
+    assert_eq!(text, result["structuredContent"]);
+}
+
+fn run_depgraph_cli_json(arguments: &[&std::ffi::OsStr]) -> Value {
+    let binary = AssertCommand::cargo_bin("depgraph").unwrap();
+    let output = Command::new(binary.get_program())
+        .args(binary.get_args())
+        .args(arguments)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "CLI failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+fn daemon_status_path(store: &Path) -> PathBuf {
+    let mut path = store.as_os_str().to_os_string();
+    path.push(".daemon-status.json");
+    PathBuf::from(path)
+}
+
 #[test]
 fn get_context_succeeds_when_the_store_has_no_completed_snapshot() {
     let temporary = tempfile::tempdir().unwrap();
@@ -730,6 +766,273 @@ fn real_issue_300_successes_validate_against_advertised_and_checked_in_schemas()
         }
     }
     assert!(failures.is_empty(), "schema mismatches: {failures:?}");
+}
+
+fn prepare_issue_301_repository(root: &Path, store_path: &Path) {
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname='issue-301-fixture'\nversion='0.1.0'\n",
+    )
+    .unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn fixture() {}\n").unwrap();
+    fs::write(
+        root.join("build.rs"),
+        "fn main() { std::fs::write(\"project-code-ran\", \"bad\").unwrap(); }\n",
+    )
+    .unwrap();
+    fs::write(
+        daemon_status_path(store_path),
+        serde_json::to_vec(&json!({
+            "schema_version": "daemon-status-v1",
+            "root": root,
+            "phase": "idle",
+            "started_at": "2026-08-06T00:00:00Z",
+            "stopped_at": null,
+            "debounce_milliseconds": 100,
+            "pending_change_count": 0,
+            "active_attempt_id": null,
+            "last_completed_attempt": null,
+            "last_failed_attempt": null,
+            "last_cancelled_attempt": null,
+            "last_watcher_error": "PROCESS_WATCHER_SECRET /private/watcher",
+            "recovered_attempts": {"scan_attempt_ids": [], "build_attempt_ids": []}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn issue_301_cli_and_mcp_lifecycle_results_are_equivalent_and_immutable() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("repository");
+    let store_path = temporary.path().join("store.sqlite");
+    fs::create_dir(&root).unwrap();
+    seed_issue_300_store(&store_path, &root);
+    prepare_issue_301_repository(&root, &store_path);
+    let before = store_invariant(&store_path);
+
+    let cli_automatic = run_depgraph_cli_json(&[
+        "--store".as_ref(),
+        store_path.as_os_str(),
+        "profiles".as_ref(),
+        "plan".as_ref(),
+        root.as_os_str(),
+        "--json".as_ref(),
+    ]);
+    let profiles_document = serde_json::to_string(&json!({
+        "contract_version": "default-profile-selection-v1",
+        "profiles": [cli_automatic["plan"]["profiles"][0]["axes"]]
+    }))
+    .unwrap();
+    let profiles_path = root.join("profiles.json");
+    fs::write(&profiles_path, &profiles_document).unwrap();
+    let cli_profile = run_depgraph_cli_json(&[
+        "--store".as_ref(),
+        store_path.as_os_str(),
+        "profiles".as_ref(),
+        "plan".as_ref(),
+        root.as_os_str(),
+        "--profiles-file".as_ref(),
+        profiles_path.as_os_str(),
+        "--json".as_ref(),
+    ]);
+    let mcp_profile = call_issue_300_tool(
+        &root,
+        &store_path,
+        "profile_plan_get",
+        json!({
+            "contract_version": "depgraph-mcp-tools-v1",
+            "repository_id": "repository",
+            "profiles_document": profiles_document
+        }),
+    );
+    assert_eq!(mcp_profile["isError"], false, "{mcp_profile}");
+    assert_tool_text_matches_structured(&mcp_profile);
+    assert_eq!(mcp_profile["structuredContent"]["result"], cli_profile);
+
+    let cli_daemon = run_depgraph_cli_json(&[
+        "--store".as_ref(),
+        store_path.as_os_str(),
+        "daemon".as_ref(),
+        "status".as_ref(),
+        root.as_os_str(),
+        "--json".as_ref(),
+    ]);
+    let mcp_daemon = call_issue_300_tool(
+        &root,
+        &store_path,
+        "daemon_get",
+        issue_300_arguments("repository"),
+    );
+    assert_eq!(mcp_daemon["isError"], false, "{mcp_daemon}");
+    assert_tool_text_matches_structured(&mcp_daemon);
+    assert_eq!(mcp_daemon["structuredContent"]["result"], cli_daemon);
+    assert!(!cli_daemon.to_string().contains("PROCESS_WATCHER_SECRET"));
+    assert!(cli_daemon.get("root").is_none());
+
+    let cli_doctor = run_depgraph_cli_json(&[
+        "--store".as_ref(),
+        store_path.as_os_str(),
+        "doctor".as_ref(),
+        "--root".as_ref(),
+        root.as_os_str(),
+        "--compiler-pack-requirement".as_ref(),
+        requirement().path().as_os_str(),
+        "--details".as_ref(),
+        "--json".as_ref(),
+    ]);
+    let mcp_doctor = call_issue_300_tool(
+        &root,
+        &store_path,
+        "doctor_get",
+        json!({
+            "contract_version": "depgraph-mcp-tools-v1",
+            "repository_id": "repository",
+            "details": true
+        }),
+    );
+    assert_eq!(mcp_doctor["isError"], false, "{mcp_doctor}");
+    assert_tool_text_matches_structured(&mcp_doctor);
+    assert_eq!(mcp_doctor["structuredContent"]["result"], cli_doctor);
+    let doctor = cli_doctor.to_string();
+    for forbidden in [
+        "PROCESS_PROFILE_SECRET",
+        "PROCESS_WORKER_LOG_SECRET",
+        "/usr/bin/rustc",
+        root.to_string_lossy().as_ref(),
+    ] {
+        assert!(!doctor.contains(forbidden), "doctor leaked {forbidden:?}");
+    }
+    assert!(!root.join("project-code-ran").exists());
+    assert_eq!(before, store_invariant(&store_path));
+}
+
+#[test]
+fn issue_301_lifecycle_successes_validate_against_exact_advertised_and_shared_schemas() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("repository");
+    let store_path = temporary.path().join("store.sqlite");
+    fs::create_dir(&root).unwrap();
+    seed_issue_300_store(&store_path, &root);
+    prepare_issue_301_repository(&root, &store_path);
+    let calls = [
+        (
+            "profile_plan_get",
+            json!({
+                "contract_version": "depgraph-mcp-tools-v1",
+                "repository_id": "repository"
+            }),
+        ),
+        ("daemon_get", issue_300_arguments("repository")),
+        (
+            "doctor_get",
+            json!({
+                "contract_version": "depgraph-mcp-tools-v1",
+                "repository_id": "repository",
+                "details": true
+            }),
+        ),
+    ];
+    let before = store_invariant(&store_path);
+    let (tools, results) = issue_300_catalog_and_results(&root, &store_path, &calls);
+    let shared_schema: Value = serde_json::from_slice(include_bytes!(
+        "../../../schemas/depgraph-mcp-tools-v1.schema.json"
+    ))
+    .unwrap();
+    let shared = jsonschema::draft202012::new(&shared_schema).unwrap();
+    for ((name, arguments), result) in calls.iter().zip(results) {
+        assert_eq!(result["isError"], false, "{name}: {result}");
+        assert_tool_text_matches_structured(&result);
+        let tool = tools.iter().find(|tool| tool["name"] == *name).unwrap();
+        let output = jsonschema::draft202012::new(&tool["outputSchema"]).unwrap();
+        output
+            .validate(&result["structuredContent"])
+            .unwrap_or_else(|error| panic!("{name} advertised output: {error}"));
+        shared
+            .validate(&result["structuredContent"])
+            .unwrap_or_else(|error| panic!("{name} shared output: {error}"));
+
+        let mut unknown = arguments.clone();
+        unknown["unknown"] = json!(true);
+        let input = jsonschema::draft202012::new(&tool["inputSchema"]).unwrap();
+        assert!(
+            !input.is_valid(&unknown),
+            "{name} input accepted unknown key"
+        );
+    }
+    assert_eq!(before, store_invariant(&store_path));
+}
+
+#[test]
+fn issue_301_profile_file_security_failures_are_typed_and_redacted() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("repository");
+    let store_path = temporary.path().join("store.sqlite");
+    fs::create_dir(&root).unwrap();
+    seed_issue_300_store(&store_path, &root);
+    prepare_issue_301_repository(&root, &store_path);
+    let before = store_invariant(&store_path);
+
+    let traversal = call_issue_300_tool(
+        &root,
+        &store_path,
+        "profile_plan_get",
+        json!({
+            "contract_version": "depgraph-mcp-tools-v1",
+            "repository_id": "repository",
+            "profiles_file": "../PROCESS_TRAVERSAL_SECRET.json"
+        }),
+    );
+    assert_eq!(traversal["isError"], true);
+    assert_eq!(
+        traversal["structuredContent"]["error"]["code"],
+        "INVALID_ARGUMENT"
+    );
+    assert!(!traversal.to_string().contains("PROCESS_TRAVERSAL_SECRET"));
+
+    let conflicting = call_issue_300_tool(
+        &root,
+        &store_path,
+        "profile_plan_get",
+        json!({
+            "contract_version": "depgraph-mcp-tools-v1",
+            "repository_id": "repository",
+            "profile_budget": 1,
+            "profiles_document": "{}"
+        }),
+    );
+    assert_eq!(conflicting["isError"], true);
+    assert_eq!(
+        conflicting["structuredContent"]["error"]["code"],
+        "INVALID_ARGUMENT"
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+        let outside = temporary.path().join("PROCESS_SYMLINK_SECRET.json");
+        fs::write(&outside, b"{}").unwrap();
+        symlink(&outside, root.join("profiles-link.json")).unwrap();
+        let symlinked = call_issue_300_tool(
+            &root,
+            &store_path,
+            "profile_plan_get",
+            json!({
+                "contract_version": "depgraph-mcp-tools-v1",
+                "repository_id": "repository",
+                "profiles_file": "profiles-link.json"
+            }),
+        );
+        assert_eq!(symlinked["isError"], true);
+        assert_eq!(
+            symlinked["structuredContent"]["error"]["code"],
+            "INTEGRITY_FAILURE"
+        );
+        assert!(!symlinked.to_string().contains("PROCESS_SYMLINK_SECRET"));
+    }
+    assert_eq!(before, store_invariant(&store_path));
 }
 
 #[test]

@@ -2274,11 +2274,6 @@ fn platform_neutral_working_directory() -> PathBuf {
     }
 }
 
-pub(crate) async fn probe_worker_version(spec: &WorkerSpec, root: &Path) -> Result<String> {
-    let cancellation = CancellationToken::new();
-    probe_worker_version_with_cancellation(spec, root, &cancellation).await
-}
-
 pub(crate) async fn probe_worker_version_with_cancellation(
     spec: &WorkerSpec,
     root: &Path,
@@ -2312,13 +2307,20 @@ pub(crate) async fn probe_worker_version_with_cancellation(
     Ok(String::from_utf8(output.stdout)?.trim().to_owned())
 }
 
-pub(crate) async fn probe_toolchain_version(
+pub(crate) async fn probe_toolchain_version_with_cancellation(
     program: &str,
     argument: &str,
     root: &Path,
+    cancellation: &CancellationToken,
 ) -> Result<String> {
     let program = resolve_safe_executable(program, root)?;
-    let output = run_probe(program.as_os_str(), &[OsString::from(argument)], root).await?;
+    let output = run_probe_with_cancellation(
+        program.as_os_str(),
+        &[OsString::from(argument)],
+        root,
+        cancellation,
+    )
+    .await?;
     if !output.status.success() {
         bail!("{program:?} version probe failed");
     }

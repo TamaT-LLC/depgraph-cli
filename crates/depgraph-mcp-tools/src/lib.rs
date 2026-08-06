@@ -3,6 +3,7 @@
 mod catalog;
 mod contract;
 mod dto;
+mod lifecycle;
 mod operation;
 mod response;
 mod scalar;
@@ -26,6 +27,10 @@ pub use dto::{
     AgentPrecision, AgentResolutionStatus, AgentSite, AgentSnapshot, AgentSnapshotAvailability,
     AgentSourcePosition, AgentSourceSpan, MAX_AGENT_EVIDENCE_ITEMS,
     MAX_AGENT_SNAPSHOT_METADATA_ITEMS, MAX_AGENT_TARGET_ITEMS,
+};
+pub use lifecycle::{
+    AgentDaemonAttempt, AgentDaemonChange, AgentDaemonChangeKind, AgentDaemonPhase,
+    AgentDaemonStatus, AgentDaemonTrace, AgentDoctor, AgentProfilePlan, AgentRecoveredAttempts,
 };
 pub use operation::{
     AcceptedOperationStatus, AcceptedTaskStatus, BaselineOperationTool, DurableSubmitResult,

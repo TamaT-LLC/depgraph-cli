@@ -12,6 +12,7 @@ pub use crate::service_agent::{
     CurrentSnapshotAvailability, DepgraphContext, FindNodesPageResult, FindNodesResult,
     MAX_FIND_NODES_QUERY_BYTES, NamedCompletedSnapshot, NodeMatchMode, NodeProjection,
 };
+pub use crate::service_lifecycle::{DoctorRequest, DoctorResponse, ProfilePlanRequest};
 pub use crate::service_repository::{
     MAX_REPOSITORY_PATH_BYTES, MAX_REPOSITORY_PATH_COMPONENT_BYTES, MAX_REPOSITORY_PATH_COMPONENTS,
     OpenedRepositoryFile, RepositoryFileError, RepositoryPathError, RepositoryPathSelector,
@@ -591,6 +592,16 @@ pub enum DepgraphServiceError {
     RepositoryFile { reason: RepositoryFileError },
     #[error("invalid service input")]
     InvalidInput,
+    #[error("profile plan input is invalid")]
+    ProfilePlan {
+        #[source]
+        source: anyhow::Error,
+    },
+    #[error("profile plan input violates the repository security boundary")]
+    ProfilePlanSecurity {
+        #[source]
+        source: anyhow::Error,
+    },
     #[error("requested service resource was not found")]
     NotFound,
     #[error("request conflicts with the current service state")]
@@ -626,7 +637,7 @@ impl DepgraphServiceError {
         match self {
             Self::InvalidConfiguration { .. } => DepgraphServiceErrorCategory::Configuration,
             Self::CapabilityDenied { .. } => DepgraphServiceErrorCategory::Authorization,
-            Self::InvalidRepositoryPath { .. } | Self::InvalidInput => {
+            Self::InvalidRepositoryPath { .. } | Self::InvalidInput | Self::ProfilePlan { .. } => {
                 DepgraphServiceErrorCategory::Input
             }
             Self::RepositoryFile { reason } => reason.category(),
@@ -637,13 +648,23 @@ impl DepgraphServiceError {
             Self::ReadStoreUnavailable { .. }
             | Self::MutatingStoreUnavailable { .. }
             | Self::StoreOperation { .. } => DepgraphServiceErrorCategory::Store,
-            Self::Integrity => DepgraphServiceErrorCategory::Integrity,
+            Self::ProfilePlanSecurity { .. } | Self::Integrity => {
+                DepgraphServiceErrorCategory::Integrity
+            }
             Self::Internal => DepgraphServiceErrorCategory::Internal,
         }
     }
 
     pub fn store_operation(source: anyhow::Error) -> Self {
         Self::StoreOperation { source }
+    }
+
+    pub fn profile_plan(source: anyhow::Error) -> Self {
+        Self::ProfilePlan { source }
+    }
+
+    pub fn profile_plan_security(source: anyhow::Error) -> Self {
+        Self::ProfilePlanSecurity { source }
     }
 }
 

@@ -28,6 +28,7 @@ additive extensionとして採用するかを決定する。
 | Portable operation handle | `depgraph-operation-v1` | Required baseline |
 | MCP Tasks extension | `io.modelcontextprotocol/tasks` | Option A accepted |
 | Agent DTO/schema catalog | `depgraph-mcp-tools-v1` | Issue #295 contract implemented |
+| Read-only lifecycle tools | `profile_plan_get`, `daemon_get`, `doctor_get` | Issue #301 implemented through the shared service boundary |
 | Open questions | `0` | Resolved |
 
 Stage 1ではcontractをfreezeする。operation journal、runner、baseline operation
@@ -53,11 +54,20 @@ schema/Serde差分は回帰testで意図的に固定する。
 
 | ID | Requirement | Resolution |
 | --- | --- | --- |
+| `FR-008` | repository profile plan previewをread-only lifecycle toolとして公開する | `ProfilePlanRequest`を共有service requestとし、`profile_plan_get`はbounded inline documentまたはconfined repository-relative fileからclosed `AgentProfilePlan`を返す |
+| `FR-009` | last daemon statusをprocess制御なしで取得する | `daemon_get`は共有serviceのstatus-file-only readerを呼び、store、daemon lock、process probeを開かない |
 | `FR-010` | 長時間処理は切断後もstatus、terminal result、cancelを回収できるdurable handleを返す | baseline operation toolsを全hostに必須とし、Tasksは同じrecordへの追加mappingとする |
+| `FR-011` | bounded doctor summary/detailsをAgent hostへ公開する | `DoctorRequest`とclosed `DoctorResponse`を共有し、`doctor_get`はAgent allowlist projectionだけを返す |
+| `NFR-001` | Agent-facing executionのinput、output、時間、cancel、concurrencyをboundedにする | service byte/item boundsとcancellation checkを適用し、MCP handlerは既存`RuntimeController`のread deadline、queue/concurrency/rate limit、request cancellation内で実行する |
 | `NFR-003` | host差、切断、server restartをfailureとして回収できる | journalをstdio processとrmcp runtimeから独立させ、再接続時に同じIDを解決する |
+| `NFR-005` | public Agent responseからhost-private/raw execution dataを除外する | lifecycle DTOをclosed allowlistとし、worker log、command line、environment、arbitrary properties、absolute root/executable pathを投影しない |
 | `Q-002` | baseline handleへMCP Tasksを追加するか | **Resolved: Option Aを採用する** |
+| `AC-004` | profile planはworkerまたはproject codeを起動せずcanonical planを返す | static repository inventory plannerだけを呼ぶcore/CLI/process testとproject-code markerで固定する |
+| `AC-011` | daemon statusはpublished status fileだけを読み、store/process stateを変更しない | no-follow bounded reader、missing-store test、status/store digest immutability testで固定する |
 | `AC-014` | Tasks非対応hostを含め、accepted operationのstatus、result、cancelが未定義分岐なく機能する | capability matrix、result union、認可、再接続、互換性test matrixを本書で固定する |
+| `AC-015` | 同じnormalized lifecycle inputに対するCLIとMCP domain responseを一致させる | 三操作を同じservice methodとAgent DTO mapperへroutingし、cross-process parity testでJSON value equalityを検証する |
 | `#295` | 共通contract、closed DTO、typed error、pagination、operation型、決定的schema生成 | `depgraph-mcp-tools-v1`のRust型、checked-in schema、digestとcontract golden、およびintegration testで固定する |
+| `#301` | profile plan、daemon status、doctorを共有serviceとMCPへ接続する | lifecycle service/DTO/handler、CLI migration、security/redaction/immutability/parity/process test、およびcanonical catalog/schema fixtureで固定する |
 
 ## Upstream and API evidence
 
@@ -303,6 +313,28 @@ Issue #295の実装はQ-002 Option Aを次の型境界へ写像する。
 protocol negotiation、journal durability、disconnect/restart recovery、Tasks handlerの
 conformanceは、上記[Compatibility and conformance tests](#compatibility-and-conformance-tests)
 に従う後続実装の責務である。
+
+## Issue #301 lifecycle tool evidence
+
+Issue [#301](https://github.com/TamaT-LLC/depgraph-cli/issues/301)はread-only lifecycle
+操作をCLI固有実装から共有service boundaryへ移し、同じdomain resultをMCPへ公開する。
+
+| Boundary | Frozen behavior and evidence |
+| --- | --- |
+| Shared requests | `ProfilePlanRequest`と`DoctorRequest`はtyped fieldだけを持つ。profile budget、inline document、repository fileの競合をfail closedにし、daemon statusにはrequest payloadを持たせない |
+| Profile input confinement | inline documentはUTF-8 byte limit内、fileはportable `RepositoryRelativePath`だけを受理する。handle-relative/no-follow openでparent/final symlink、traversal、absolute/outside path、non-regular file、oversized/non-UTF-8 inputを拒否する |
+| Profile execution | profile planningはconfigとstatic repository inventoryだけを読み、worker discovery/probe、compiler、project command、store openを行わない。build script markerとmissing-store immutability testで検証する |
+| Daemon observation | store pathから固定status filenameを導出し、そのregular fileをno-followで一度だけbounded readする。store、daemon lock、stop request、PID/process probeには触れない |
+| Doctor projection | core `DoctorResponse`はallowlist fieldだけをserializeする。worker command/error/log、adapter log、profile environment/properties、diagnostic message/properties、release runtime path/requirement、diagnostic root pathを除外し、残る自由文字列もlength/control/path/credential shapeでsanitizeする |
+| Frontend parity | CLIの`profiles plan`、`daemon status`、`doctor`とMCPの`profile_plan_get`、`daemon_get`、`doctor_get`は同じservice methodを呼び、JSON公開時は同じ`AgentProfilePlan`、`AgentDaemonStatus`、`AgentDoctor` projectionを使う |
+| Runtime controls | MCPの三handlerはread classのadmission、rate、queue/concurrency、30秒deadlineとrequest cancellationを維持する。serviceもI/O、probe、projectionの境界で同じcancellation tokenを検査する |
+| Closed deterministic contract | 三toolはgeneric JSON resultを使わず固有Agent DTOのexact output schemaをadvertiseする。全objectは`additionalProperties: false`であり、catalog bytes/digest、global schema bytes/digest、contract samplesをrepository-native golden commandで固定する |
+| Regression proof | core service、CLI process、MCP stdio process、advertised/shared schema、store/status digest immutability、redaction prohibition corpus、CLI/MCP value parityをintegration testで検証する |
+
+profile fileのlegacy CLI absolute pathはrepository内部を指す場合だけportable relative pathへ
+normalizeして互換性を維持する。repository外、`..`、symlinkを含む場合はsecurity failureとし、
+supplied pathやcontentをerrorへ反射しない。daemon/doctorのhuman outputはCLI向け表示を維持できるが、
+JSON domain responseはAgent projectionをcanonical sourceとする。
 
 ## Issue #292 acceptance mapping
 

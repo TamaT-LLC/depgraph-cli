@@ -15,12 +15,12 @@ use sha2::{Digest, Sha256};
 use zeroize::Zeroize;
 
 use crate::{
-    AgentCapability, AgentCompletedSnapshot, AgentContext, AgentEdge, AgentError, AgentErrorCode,
-    AgentErrorDetails, AgentEvidence, AgentNamedSnapshot, AgentNode, AgentNodeSummary,
-    AgentRemediation, AgentResourceLimit, AgentSite, AgentSnapshot, CanonicalJsonError, Cursor,
-    DurableSubmitResult, ErrorEnvelope, LogicalRepositoryId, MAX_PAGE_BYTES,
-    MCP_TOOLS_CONTRACT_VERSION, OperationAccepted, Page, PageRequest, SnapshotId, SuccessEnvelope,
-    TaskAccepted, canonical_json_bytes,
+    AgentCapability, AgentCompletedSnapshot, AgentContext, AgentDaemonStatus, AgentDoctor,
+    AgentEdge, AgentError, AgentErrorCode, AgentErrorDetails, AgentEvidence, AgentNamedSnapshot,
+    AgentNode, AgentNodeSummary, AgentProfilePlan, AgentRemediation, AgentResourceLimit, AgentSite,
+    AgentSnapshot, CanonicalJsonError, Cursor, DurableSubmitResult, ErrorEnvelope,
+    LogicalRepositoryId, MAX_PAGE_BYTES, MCP_TOOLS_CONTRACT_VERSION, OperationAccepted, Page,
+    PageRequest, SnapshotId, SuccessEnvelope, TaskAccepted, canonical_json_bytes,
 };
 
 const CURSOR_VERSION: &str = "v1";
@@ -59,9 +59,12 @@ public_result!(
     AgentContext,
     AgentEdge,
     AgentEvidence,
+    AgentDaemonStatus,
+    AgentDoctor,
     AgentNamedSnapshot,
     AgentNode,
     AgentNodeSummary,
+    AgentProfilePlan,
     AgentSite,
     AgentSnapshot,
     DurableSubmitResult,
@@ -245,12 +248,14 @@ fn map_service_error(source: &DepgraphServiceError) -> AgentError {
             }
             RepositoryFileError::Unavailable { .. } => internal_error(true),
         },
-        DepgraphServiceError::InvalidInput => AgentError::new(
-            AgentErrorCode::InvalidArgument,
-            false,
-            AgentRemediation::CorrectInput,
-            None,
-        ),
+        DepgraphServiceError::InvalidInput | DepgraphServiceError::ProfilePlan { .. } => {
+            AgentError::new(
+                AgentErrorCode::InvalidArgument,
+                false,
+                AgentRemediation::CorrectInput,
+                None,
+            )
+        }
         DepgraphServiceError::NotFound => AgentError::new(
             AgentErrorCode::NotFound,
             false,
@@ -278,7 +283,9 @@ fn map_service_error(source: &DepgraphServiceError) -> AgentError {
         DepgraphServiceError::ReadStoreUnavailable { .. }
         | DepgraphServiceError::MutatingStoreUnavailable { .. }
         | DepgraphServiceError::StoreOperation { .. } => internal_error(true),
-        DepgraphServiceError::Integrity => integrity_error(),
+        DepgraphServiceError::ProfilePlanSecurity { .. } | DepgraphServiceError::Integrity => {
+            integrity_error()
+        }
         DepgraphServiceError::Internal => internal_error(true),
     }
 }

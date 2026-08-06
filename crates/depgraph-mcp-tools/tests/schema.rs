@@ -330,7 +330,7 @@ fn every_generated_object_schema_has_additional_properties_false() {
     let schema = schema_value();
     let mut objects = 0;
     assert_all_object_schemas_are_closed(&schema, "#", &mut objects);
-    assert_eq!(objects, 41, "review newly added object schemas explicitly");
+    assert_eq!(objects, 97, "review newly added object schemas explicitly");
 }
 
 #[test]
@@ -438,6 +438,114 @@ fn schema_rejects_closed_dto_prohibition_corpus() {
         assert!(
             !validator.is_valid(&evidence),
             "AgentEvidence schema accepted {forbidden}"
+        );
+    }
+}
+
+#[test]
+fn lifecycle_agent_schemas_are_closed_and_prohibit_sensitive_doctor_fields() {
+    let schema = schema_value();
+    let validator_for = |definition: &str| {
+        let wrapper = json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$defs": schema["$defs"].clone(),
+            "$ref": format!("#/$defs/{definition}"),
+        });
+        jsonschema::draft202012::new(&wrapper)
+            .unwrap_or_else(|error| panic!("{definition} schema did not compile: {error}"))
+    };
+
+    let doctor = json!({
+        "report_kind": "details",
+        "diagnostic_root_source": "explicit",
+        "protocol_version": "1.0",
+        "graph_schema_version": "1.0",
+        "store_schema_version": 15,
+        "cache_contract_version": 2,
+        "cache_entries": {"syntax":0,"semantic":0,"build":0,"compiler_precise":0},
+        "impact_query_cache_contract_version": 1,
+        "impact_query_cache_entries": 0,
+        "recent_cache_events": [],
+        "toolchains": [],
+        "supported_baselines": [],
+        "workers": [{
+            "adapter":"rust",
+            "available":true,
+            "version":"0.4.0",
+            "protocol":"1.0",
+            "integrity":"verified",
+            "root_launch_allowed":true
+        }],
+        "compiler_pack": {
+            "status":"available",
+            "release_page":"https://github.com/TamaT-LLC/depgraph-cli/releases",
+            "fallback_policy":"unsupported-no-fallback",
+            "diagnostic":"the configured compiler pack is verified and available",
+            "remediation":"the compiler pack is ready for compiler-precise analysis"
+        },
+        "latest_attempt": {
+            "scan_id":"scan:fixture",
+            "status":"completed",
+            "project_code_executed":false,
+            "coverage": {
+                "profiles":1,"files_discovered":1,"files_analyzed":1,"files_skipped":0,
+                "dependency_sites":0,"resolved":0,"candidates":0,"external":0,
+                "unresolved":0,"unsupported_syntax":0,"project_code_executed":false,
+                "completeness":["syntax-complete"],"reasons":[]
+            },
+            "file_coverage":[],
+            "profiles":[{"id":"rust:safe","language":"rust","features":[]}],
+            "diagnostics":[{"id":"diagnostic:fixture","severity":"warning","code":"fixture.warning","path":"src/lib.rs"}],
+            "cache_events":[]
+        }
+    });
+    let doctor_validator = validator_for("Doctor");
+    assert!(doctor_validator.is_valid(&doctor));
+
+    for field in [
+        "root",
+        "diagnostic_root",
+        "store_path",
+        "toolchain_remediation",
+        "runtime_integrity",
+        "runtime_requirements",
+    ] {
+        let mut invalid = doctor.clone();
+        invalid[field] = json!("/private/secret");
+        assert!(
+            !doctor_validator.is_valid(&invalid),
+            "doctor schema accepted {field}"
+        );
+    }
+    for field in ["command", "error", "root_launch_error", "stderr", "logs"] {
+        let mut invalid = doctor.clone();
+        invalid["workers"][0][field] = json!("/usr/bin/private-worker --secret");
+        assert!(
+            !doctor_validator.is_valid(&invalid),
+            "doctor worker schema accepted {field}"
+        );
+    }
+    for field in ["environment", "properties", "command", "compiler_command"] {
+        let mut invalid = doctor.clone();
+        invalid["latest_attempt"]["profiles"][0][field] = json!({"secret":"value"});
+        assert!(
+            !doctor_validator.is_valid(&invalid),
+            "doctor profile schema accepted {field}"
+        );
+    }
+    for field in ["message", "properties", "raw", "stderr"] {
+        let mut invalid = doctor.clone();
+        invalid["latest_attempt"]["diagnostics"][0][field] = json!("private output");
+        assert!(
+            !doctor_validator.is_valid(&invalid),
+            "doctor diagnostic schema accepted {field}"
+        );
+    }
+
+    for definition in ["AgentProfilePlan", "AgentDaemonStatus", "AgentDoctor"] {
+        assert!(
+            schema["$defs"].get(definition).is_some(),
+            "missing {definition}"
         );
     }
 }
