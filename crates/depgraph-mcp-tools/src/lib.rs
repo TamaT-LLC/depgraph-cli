@@ -22,12 +22,15 @@ pub use contract::{
     SuccessEnvelope,
 };
 pub use dto::{
-    AgentCompletedSnapshot, AgentContext, AgentCoverage, AgentCurrentSnapshot,
+    AgentChangedSince, AgentCompletedSnapshot, AgentContext, AgentCorrelationDifference,
+    AgentCorrelationStatus, AgentCoverage, AgentCurrentSnapshot, AgentCycle, AgentCycleLevel,
     AgentDependenciesResponse, AgentDependencyDirection, AgentEdge, AgentEvidence,
-    AgentEvidenceKind, AgentNamedSnapshot, AgentNode, AgentNodeSummary, AgentPathResponse,
-    AgentPathStep, AgentPhase, AgentPrecision, AgentResolutionStatus, AgentSite, AgentSnapshot,
-    AgentSnapshotAvailability, AgentSourcePosition, AgentSourceSpan, MAX_AGENT_EVIDENCE_ITEMS,
-    MAX_AGENT_PATH_STEPS, MAX_AGENT_SNAPSHOT_METADATA_ITEMS, MAX_AGENT_TARGET_ITEMS,
+    AgentEvidenceKind, AgentImpact, AgentImpactResponse, AgentNamedSnapshot, AgentNode,
+    AgentNodeSummary, AgentPathResponse, AgentPathStep, AgentPhase, AgentPrecision,
+    AgentResolutionStatus, AgentSite, AgentSnapshot, AgentSnapshotAvailability,
+    AgentSourcePosition, AgentSourceSpan, AgentUnresolved, MAX_AGENT_CORRELATION_REASONS,
+    MAX_AGENT_CYCLE_NODES, MAX_AGENT_EVIDENCE_ITEMS, MAX_AGENT_PATH_STEPS, MAX_AGENT_PHASES,
+    MAX_AGENT_SNAPSHOT_METADATA_ITEMS, MAX_AGENT_TARGET_ITEMS,
 };
 pub use lifecycle::{
     AgentDaemonAttempt, AgentDaemonChange, AgentDaemonChangeKind, AgentDaemonPhase,
@@ -40,7 +43,9 @@ pub use operation::{
 };
 pub use response::{
     CanonicalResponseMapper, CursorKey, MappedToolResult, PaginationContext, PublicPageItem,
-    PublicToolResult, ResponseMappingError,
+    PublicToolResult, ResponseMappingError, project_cycles_page_cancellable,
+    project_dependencies_page_cancellable, project_impact_response_cancellable,
+    project_unresolved_page_cancellable,
 };
 pub use scalar::{
     AgentId, AgentLabel, AgentLocator, AgentToken, ContractValueError, Cursor, LogicalRepositoryId,

@@ -9,23 +9,25 @@ use std::{
 use anyhow::{Context as _, Result, bail};
 use clap::{Parser, ValueEnum};
 use depgraph_core::service::{
-    DependenciesRequest, DependencyDirection, DoctorRequest, ExplainPathRequest, NodeMatchMode,
-    ProfilePlanRequest,
+    CyclesRequest, DependenciesRequest, DependencyDirection, DoctorRequest, ExplainPathRequest,
+    ImpactRequest, NodeMatchMode, ProfilePlanRequest, UnresolvedRequest,
 };
 use depgraph_core::{
-    CancellationToken, DepgraphCapability, DepgraphCapabilitySet, DepgraphService,
+    CancellationToken, CycleLevel, DepgraphCapability, DepgraphCapabilitySet, DepgraphService,
     DepgraphServiceConfig, DepgraphServiceError, DepgraphServiceLimits, GraphQueryFilter,
-    MAX_INTERACTIVE_QUERY_TRAVERSAL, SnapshotLocator, VerifiedCompilerPack,
+    ImpactFilters, MAX_INTERACTIVE_QUERY_TRAVERSAL, SnapshotLocator, VerifiedCompilerPack,
     read_compiler_pack_requirement, verify_compiler_pack,
 };
 use depgraph_mcp::runtime::{AuditLogger, RuntimeClass, RuntimeConfig, RuntimeController};
 use depgraph_mcp_tools::{
-    AgentCompletedSnapshot, AgentContext, AgentDaemonStatus, AgentDependenciesResponse,
-    AgentDependencyDirection, AgentDoctor, AgentEdge, AgentError, AgentLocator, AgentNamedSnapshot,
-    AgentNode, AgentNodeSummary, AgentPathResponse, AgentProfilePlan, AgentToken,
-    CanonicalResponseMapper, ContractBuildError, ContractVersion, Cursor, CursorKey, ErrorEnvelope,
-    LogicalRepositoryId, MappedToolResult, PageByteLimit, PageRequest, PageSize, PaginationContext,
+    AgentCompletedSnapshot, AgentContext, AgentCycleLevel, AgentDaemonStatus,
+    AgentDependencyDirection, AgentDoctor, AgentError, AgentLocator, AgentNamedSnapshot,
+    AgentNodeSummary, AgentPathResponse, AgentProfilePlan, AgentToken, CanonicalResponseMapper,
+    ContractBuildError, ContractVersion, Cursor, CursorKey, ErrorEnvelope, LogicalRepositoryId,
+    MappedToolResult, PageByteLimit, PageRequest, PageSize, PaginationContext,
     RepositoryRelativePath, ResponseMappingError, SnapshotId, SuccessEnvelope, ToolCatalog,
+    project_cycles_page_cancellable, project_dependencies_page_cancellable,
+    project_impact_response_cancellable, project_unresolved_page_cancellable,
 };
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler, ServiceExt,
@@ -269,6 +271,76 @@ struct GraphPathArguments {
     max_traversal: Option<usize>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GraphImpactArguments {
+    contract_version: ContractVersion,
+    repository_id: LogicalRepositoryId,
+    selector: AgentLocator,
+    #[serde(default)]
+    snapshot: Option<String>,
+    #[serde(default)]
+    changed_since: Option<String>,
+    #[serde(default)]
+    depth: Option<usize>,
+    #[serde(default)]
+    profiles: Vec<String>,
+    #[serde(default)]
+    conditions: Vec<String>,
+    #[serde(default)]
+    phases: Vec<String>,
+    #[serde(default)]
+    sessions: Vec<String>,
+    #[serde(default)]
+    environments: Vec<String>,
+    #[serde(default)]
+    max_nodes: Option<usize>,
+    #[serde(default)]
+    max_edges: Option<usize>,
+    #[serde(default)]
+    cursor: Option<Cursor>,
+    #[serde(default)]
+    limit: Option<u16>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GraphCyclesArguments {
+    contract_version: ContractVersion,
+    repository_id: LogicalRepositoryId,
+    #[serde(default)]
+    snapshot: Option<String>,
+    #[serde(default = "default_cycle_level")]
+    level: AgentCycleLevel,
+    #[serde(default)]
+    max_traversal: Option<usize>,
+    #[serde(default)]
+    cursor: Option<Cursor>,
+    #[serde(default)]
+    limit: Option<u16>,
+}
+
+const fn default_cycle_level() -> AgentCycleLevel {
+    AgentCycleLevel::File
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GraphUnresolvedArguments {
+    contract_version: ContractVersion,
+    repository_id: LogicalRepositoryId,
+    #[serde(default)]
+    snapshot: Option<String>,
+    #[serde(default)]
+    kinds: Vec<String>,
+    #[serde(default)]
+    max_traversal: Option<usize>,
+    #[serde(default)]
+    cursor: Option<Cursor>,
+    #[serde(default)]
+    limit: Option<u16>,
+}
+
 enum ToolExecutionFailure {
     Service(DepgraphServiceError),
     Agent(AgentError),
@@ -338,6 +410,9 @@ impl ServerHandler for DepgraphMcpServer {
                 | "graph_dependencies_list"
                 | "graph_dependents_list"
                 | "graph_path_get"
+                | "graph_impact_get"
+                | "graph_cycles_list"
+                | "graph_unresolved_list"
         ) {
             return Err(McpError::invalid_params(
                 "tool handler is unavailable",
@@ -741,27 +816,23 @@ fn execute_catalog_read_tool(
             )?;
             let page_request = page_request(arguments.limit, arguments.cursor)?;
             let found = service.dependencies(&mut snapshot_request, &request, cancellation)?;
-            let items = found
-                .items()
-                .iter()
-                .map(|item| AgentEdge::try_from(&item.step))
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(contract_mapping_error)?;
-            let page = pagination
-                .paginate(&items, &page_request)
-                .map_err(ToolExecutionFailure::Agent)?;
-            let result = AgentDependenciesResponse::new(
-                AgentNode::try_from(&found).map_err(contract_mapping_error)?,
+            let result = project_dependencies_page_cancellable(
+                &found,
                 match direction {
                     DependencyDirection::Outgoing => AgentDependencyDirection::Outgoing,
                     DependencyDirection::Incoming => AgentDependencyDirection::Incoming,
                 },
                 request.transitive(),
-                found.complete(),
-                found.traversed_edges(),
-                page,
+                &pagination,
+                &page_request,
+                cancellation,
             )
-            .map_err(contract_mapping_error)?;
+            .map_err(ToolExecutionFailure::Agent)?;
+            if cancellation.is_cancelled() {
+                return Err(ToolExecutionFailure::Service(
+                    DepgraphServiceError::Cancelled,
+                ));
+            }
             CanonicalResponseMapper::success(&SuccessEnvelope::new(
                 repository_id.clone(),
                 Some(snapshot_id),
@@ -811,6 +882,171 @@ fn execute_catalog_read_tool(
             ))
             .map_err(Into::into)
         }
+        "graph_impact_get" => {
+            let arguments = decode_arguments::<GraphImpactArguments>(arguments)?;
+            authorize_repository(
+                arguments.contract_version,
+                &arguments.repository_id,
+                repository_id,
+            )?;
+            validate_graph_filter_lengths(
+                &arguments.phases,
+                &arguments.profiles,
+                &arguments.sessions,
+                &arguments.environments,
+            )?;
+            if arguments.conditions.len() > 1_024 {
+                return Err(ToolExecutionFailure::Service(
+                    DepgraphServiceError::InvalidInput,
+                ));
+            }
+            let filters = ImpactFilters::new(
+                arguments.depth,
+                arguments.profiles,
+                arguments.conditions,
+                arguments.max_nodes.unwrap_or(10_000),
+                arguments.max_edges.unwrap_or(50_000),
+            )
+            .and_then(|filters| {
+                filters.with_runtime_filters(
+                    arguments.phases,
+                    arguments.sessions,
+                    arguments.environments,
+                )
+            })
+            .map_err(|source| {
+                ToolExecutionFailure::Service(DepgraphServiceError::graph_query(source))
+            })?;
+            let request = ImpactRequest::try_new(
+                arguments.selector.as_str(),
+                arguments.changed_since,
+                filters,
+            )?;
+            let locator =
+                SnapshotLocator::parse(arguments.snapshot.as_deref().unwrap_or("current"))?;
+            let mut snapshot_request =
+                service.start_snapshot_request_at_cancellable(&locator, cancellation)?;
+            let snapshot_id = parse_snapshot_id(snapshot_request.snapshot_id().as_str())?;
+            let normalized = serde_json::json!({
+                "changed_since": request.changed_since(),
+                "filters": request.filters(),
+                "selector": request.selector(),
+            });
+            let pagination = PaginationContext::new(
+                cursor_key,
+                tool,
+                repository_id.clone(),
+                snapshot_id.clone(),
+                &normalized,
+            )?;
+            let page_request = page_request(arguments.limit, arguments.cursor)?;
+            let found = service.impact(&mut snapshot_request, &request, cancellation)?;
+            let result = project_impact_response_cancellable(
+                &found,
+                &pagination,
+                &page_request,
+                cancellation,
+            )
+            .map_err(ToolExecutionFailure::Agent)?;
+            CanonicalResponseMapper::success(&SuccessEnvelope::new(
+                repository_id.clone(),
+                Some(snapshot_id),
+                result,
+            ))
+            .map_err(Into::into)
+        }
+        "graph_cycles_list" => {
+            let arguments = decode_arguments::<GraphCyclesArguments>(arguments)?;
+            authorize_repository(
+                arguments.contract_version,
+                &arguments.repository_id,
+                repository_id,
+            )?;
+            let level = match arguments.level {
+                AgentCycleLevel::Package => CycleLevel::Package,
+                AgentCycleLevel::File => CycleLevel::File,
+                AgentCycleLevel::Symbol => CycleLevel::Symbol,
+                AgentCycleLevel::Type => CycleLevel::Type,
+                AgentCycleLevel::Route => CycleLevel::Route,
+            };
+            let request =
+                CyclesRequest::try_new(level, graph_max_traversal(arguments.max_traversal)?)?;
+            let locator =
+                SnapshotLocator::parse(arguments.snapshot.as_deref().unwrap_or("current"))?;
+            let mut snapshot_request =
+                service.start_snapshot_request_at_cancellable(&locator, cancellation)?;
+            let snapshot_id = parse_snapshot_id(snapshot_request.snapshot_id().as_str())?;
+            let normalized = serde_json::json!({
+                "level": arguments.level,
+                "max_traversal": request.max_traversal(),
+            });
+            let pagination = PaginationContext::new(
+                cursor_key,
+                tool,
+                repository_id.clone(),
+                snapshot_id.clone(),
+                &normalized,
+            )?;
+            let page_request = page_request(arguments.limit, arguments.cursor)?;
+            let found = service.cycles(&mut snapshot_request, &request, cancellation)?;
+            let page =
+                project_cycles_page_cancellable(&found, &pagination, &page_request, cancellation)
+                    .map_err(ToolExecutionFailure::Agent)?;
+            CanonicalResponseMapper::success(&SuccessEnvelope::new(
+                repository_id.clone(),
+                Some(snapshot_id),
+                page,
+            ))
+            .map_err(Into::into)
+        }
+        "graph_unresolved_list" => {
+            let arguments = decode_arguments::<GraphUnresolvedArguments>(arguments)?;
+            authorize_repository(
+                arguments.contract_version,
+                &arguments.repository_id,
+                repository_id,
+            )?;
+            if arguments.kinds.len() > 1_024 {
+                return Err(ToolExecutionFailure::Service(
+                    DepgraphServiceError::InvalidInput,
+                ));
+            }
+            let request = UnresolvedRequest::try_new(
+                arguments.kinds,
+                graph_max_traversal(arguments.max_traversal)?,
+            )?;
+            let locator =
+                SnapshotLocator::parse(arguments.snapshot.as_deref().unwrap_or("current"))?;
+            let mut snapshot_request =
+                service.start_snapshot_request_at_cancellable(&locator, cancellation)?;
+            let snapshot_id = parse_snapshot_id(snapshot_request.snapshot_id().as_str())?;
+            let normalized = serde_json::json!({
+                "kinds": request.kinds(),
+                "max_traversal": request.max_traversal(),
+            });
+            let pagination = PaginationContext::new(
+                cursor_key,
+                tool,
+                repository_id.clone(),
+                snapshot_id.clone(),
+                &normalized,
+            )?;
+            let page_request = page_request(arguments.limit, arguments.cursor)?;
+            let found = service.unresolved(&mut snapshot_request, &request, cancellation)?;
+            let page = project_unresolved_page_cancellable(
+                &found,
+                &pagination,
+                &page_request,
+                cancellation,
+            )
+            .map_err(ToolExecutionFailure::Agent)?;
+            CanonicalResponseMapper::success(&SuccessEnvelope::new(
+                repository_id.clone(),
+                Some(snapshot_id),
+                page,
+            ))
+            .map_err(Into::into)
+        }
         _ => Err(ToolExecutionFailure::Service(
             DepgraphServiceError::NotFound,
         )),
@@ -846,7 +1082,12 @@ fn graph_max_traversal(value: Option<usize>) -> Result<usize, ToolExecutionFailu
 
 fn contract_mapping_error(error: ContractBuildError) -> ToolExecutionFailure {
     ToolExecutionFailure::Service(match error {
-        ContractBuildError::TooManyPathSteps => DepgraphServiceError::ResourceExhausted,
+        ContractBuildError::TooManyPathSteps
+        | ContractBuildError::TooManyCycleNodes
+        | ContractBuildError::TooManyCorrelationReasons
+        | ContractBuildError::TooManyPhases
+        | ContractBuildError::TooManyEvidenceItems
+        | ContractBuildError::TooManyTargetItems => DepgraphServiceError::ResourceExhausted,
         _ => DepgraphServiceError::Integrity,
     })
 }
@@ -1164,5 +1405,24 @@ mod tests {
         );
         assert_eq!(bounded_write_len(MAX_STDERR_TOTAL_BYTES - 2, 10, 99), 2);
         assert_eq!(bounded_write_len(MAX_STDERR_TOTAL_BYTES, 10, 99), 0);
+    }
+
+    #[test]
+    fn dto_collection_caps_map_to_service_resource_exhaustion() {
+        for error in [
+            ContractBuildError::TooManyEvidenceItems,
+            ContractBuildError::TooManyCorrelationReasons,
+            ContractBuildError::TooManyPhases,
+            ContractBuildError::TooManyCycleNodes,
+        ] {
+            assert!(matches!(
+                contract_mapping_error(error),
+                ToolExecutionFailure::Service(DepgraphServiceError::ResourceExhausted)
+            ));
+        }
+        assert!(matches!(
+            contract_mapping_error(ContractBuildError::CycleTopology),
+            ToolExecutionFailure::Service(DepgraphServiceError::Integrity)
+        ));
     }
 }

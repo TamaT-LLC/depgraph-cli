@@ -5,11 +5,13 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::{
-    AgentCompletedSnapshot, AgentContext, AgentCoverage, AgentCurrentSnapshot, AgentDaemonStatus,
-    AgentDependenciesResponse, AgentDoctor, AgentEdge, AgentEvidence, AgentNamedSnapshot,
-    AgentNode, AgentNodeSummary, AgentPathResponse, AgentPathStep, AgentProfilePlan, AgentSite,
-    AgentSnapshot, CommonRequest, DurableSubmitResult, ErrorEnvelope, OperationAccepted, Page,
-    PageRequest, SnapshotSelector, SuccessEnvelope, TaskAccepted,
+    AgentChangedSince, AgentCompletedSnapshot, AgentContext, AgentCorrelationDifference,
+    AgentCorrelationStatus, AgentCoverage, AgentCurrentSnapshot, AgentCycle, AgentCycleLevel,
+    AgentDaemonStatus, AgentDependenciesResponse, AgentDoctor, AgentEdge, AgentEvidence,
+    AgentImpact, AgentImpactResponse, AgentNamedSnapshot, AgentNode, AgentNodeSummary,
+    AgentPathResponse, AgentPathStep, AgentProfilePlan, AgentSite, AgentSnapshot, AgentUnresolved,
+    CommonRequest, DurableSubmitResult, ErrorEnvelope, OperationAccepted, Page, PageRequest,
+    SnapshotSelector, SuccessEnvelope, TaskAccepted,
 };
 
 pub const MCP_TOOLS_SCHEMA_ID: &str =
@@ -38,6 +40,9 @@ impl JsonSchema for McpToolsV1Schema {
             generator.subschema_for::<Page<AgentEdge>>(),
             generator.subschema_for::<Page<AgentEvidence>>(),
             generator.subschema_for::<Page<AgentSnapshot>>(),
+            generator.subschema_for::<Page<AgentImpact>>(),
+            generator.subschema_for::<Page<AgentCycle>>(),
+            generator.subschema_for::<Page<AgentUnresolved>>(),
             generator.subschema_for::<SuccessEnvelope<AgentNode>>(),
             generator.subschema_for::<SuccessEnvelope<AgentContext>>(),
             generator.subschema_for::<SuccessEnvelope<AgentCompletedSnapshot>>(),
@@ -46,6 +51,9 @@ impl JsonSchema for McpToolsV1Schema {
             generator.subschema_for::<SuccessEnvelope<AgentDoctor>>(),
             generator.subschema_for::<SuccessEnvelope<AgentDependenciesResponse>>(),
             generator.subschema_for::<SuccessEnvelope<AgentPathResponse>>(),
+            generator.subschema_for::<SuccessEnvelope<AgentImpactResponse>>(),
+            generator.subschema_for::<SuccessEnvelope<Page<AgentCycle>>>(),
+            generator.subschema_for::<SuccessEnvelope<Page<AgentUnresolved>>>(),
             generator.subschema_for::<SuccessEnvelope<Page<AgentNode>>>(),
             generator.subschema_for::<SuccessEnvelope<Page<AgentNodeSummary>>>(),
             generator.subschema_for::<SuccessEnvelope<Page<AgentNamedSnapshot>>>(),
@@ -66,6 +74,14 @@ impl JsonSchema for McpToolsV1Schema {
             generator.subschema_for::<AgentPathStep>(),
             generator.subschema_for::<AgentDependenciesResponse>(),
             generator.subschema_for::<AgentPathResponse>(),
+            generator.subschema_for::<AgentCycleLevel>(),
+            generator.subschema_for::<AgentCycle>(),
+            generator.subschema_for::<AgentCorrelationStatus>(),
+            generator.subschema_for::<AgentCorrelationDifference>(),
+            generator.subschema_for::<AgentUnresolved>(),
+            generator.subschema_for::<AgentChangedSince>(),
+            generator.subschema_for::<AgentImpact>(),
+            generator.subschema_for::<AgentImpactResponse>(),
             generator.subschema_for::<AgentSnapshot>(),
         ];
         json_schema!({

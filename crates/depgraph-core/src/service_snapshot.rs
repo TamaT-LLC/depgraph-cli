@@ -59,6 +59,7 @@ impl std::fmt::Display for ResolvedSnapshotId {
 
 pub struct SnapshotReadRequest {
     snapshot_id: ResolvedSnapshotId,
+    locator: SnapshotLocator,
     read_store: RequestReadStore,
 }
 
@@ -66,6 +67,16 @@ impl SnapshotReadRequest {
     #[must_use]
     pub const fn snapshot_id(&self) -> &ResolvedSnapshotId {
         &self.snapshot_id
+    }
+
+    #[must_use]
+    pub const fn locator(&self) -> &SnapshotLocator {
+        &self.locator
+    }
+
+    #[must_use]
+    pub const fn is_current(&self) -> bool {
+        matches!(self.locator, SnapshotLocator::Current)
     }
 
     pub fn store(&mut self) -> &mut depgraph_store::Store {
@@ -137,6 +148,7 @@ impl DepgraphService {
         }
         Ok(SnapshotReadRequest {
             snapshot_id: ResolvedSnapshotId(snapshot_id),
+            locator: SnapshotLocator::StableId(snapshot.id),
             read_store,
         })
     }
@@ -186,6 +198,7 @@ impl DepgraphService {
 
         Ok(SnapshotReadRequest {
             snapshot_id: ResolvedSnapshotId(snapshot_id),
+            locator: locator.clone(),
             read_store,
         })
     }

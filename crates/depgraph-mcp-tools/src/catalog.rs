@@ -6,9 +6,10 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    AgentCompletedSnapshot, AgentContext, AgentDaemonStatus, AgentDependenciesResponse,
-    AgentDoctor, AgentId, AgentLocator, AgentNamedSnapshot, AgentNodeSummary, AgentPathResponse,
-    AgentProfilePlan, Cursor, LogicalRepositoryId, MCP_TOOLS_CONTRACT_VERSION, OperationId, Page,
+    AgentCompletedSnapshot, AgentContext, AgentCycle, AgentCycleLevel, AgentDaemonStatus,
+    AgentDependenciesResponse, AgentDoctor, AgentId, AgentImpactResponse, AgentLabel, AgentLocator,
+    AgentNamedSnapshot, AgentNodeSummary, AgentPathResponse, AgentProfilePlan, AgentUnresolved,
+    Cursor, LogicalRepositoryId, MCP_TOOLS_CONTRACT_VERSION, OperationId, Page,
     RepositoryRelativePath, SnapshotId, SnapshotName, SuccessEnvelope,
 };
 
@@ -462,25 +463,39 @@ const TOOL_SPECS: &[ToolSpec] = &[
     tool_spec!(
         "graph_impact_get",
         "Compute bounded reverse dependency impact for a selector.",
-        ["selector", "snapshot", "depth", "kinds", "cursor", "limit"],
+        [
+            "selector",
+            "snapshot",
+            "changed_since",
+            "depth",
+            "profiles",
+            "conditions",
+            "phases",
+            "sessions",
+            "environments",
+            "max_nodes",
+            "max_edges",
+            "cursor",
+            "limit"
+        ],
         [CliAction::Impact],
         READ,
         ToolAuthorization::FixedCapabilities,
-        OperationBehavior::MayCreateDurableOperation
+        OperationBehavior::Immediate
     ),
     tool_spec!(
         "graph_cycles_list",
         "List bounded dependency cycles for an immutable snapshot.",
-        ["snapshot", "kinds", "cursor", "limit"],
+        ["snapshot", "level", "max_traversal", "cursor", "limit"],
         [CliAction::Cycles],
         READ,
         ToolAuthorization::FixedCapabilities,
-        OperationBehavior::MayCreateDurableOperation
+        OperationBehavior::Immediate
     ),
     tool_spec!(
         "graph_unresolved_list",
         "List bounded unresolved dependency evidence.",
-        ["snapshot", "kinds", "cursor", "limit"],
+        ["snapshot", "kinds", "max_traversal", "cursor", "limit"],
         [CliAction::Unresolved],
         READ,
         ToolAuthorization::FixedCapabilities,
@@ -719,6 +734,15 @@ fn output_schema(spec: &ToolSpec) -> Map<String, Value> {
         "graph_path_get" => {
             return exact_success_output_schema::<AgentPathResponse>(spec.name);
         }
+        "graph_impact_get" => {
+            return exact_success_output_schema::<AgentImpactResponse>(spec.name);
+        }
+        "graph_cycles_list" => {
+            return exact_success_output_schema::<Page<AgentCycle>>(spec.name);
+        }
+        "graph_unresolved_list" => {
+            return exact_success_output_schema::<Page<AgentUnresolved>>(spec.name);
+        }
         _ => {}
     }
     let immediate = json!({
@@ -834,6 +858,8 @@ fn field_schema(field: &str) -> Value {
         "operation_id" => scalar_schema::<OperationId>(),
         "node_id" | "site_id" => scalar_schema::<AgentId>(),
         "selector" | "from" | "to" => scalar_schema::<AgentLocator>(),
+        "changed_since" => scalar_schema::<AgentLabel>(),
+        "level" => scalar_schema::<AgentCycleLevel>(),
         "name" => scalar_schema::<SnapshotName>(),
         "snapshot" => json!({
             "oneOf": [
@@ -846,8 +872,12 @@ fn field_schema(field: &str) -> Value {
             json!({"type": "boolean"})
         }
         "profile_budget" => json!({"type": "integer", "minimum": 1, "maximum": 32}),
-        "depth" | "limit" | "max_depth" | "max_paths" | "max_nodes" | "max_edges" => {
+        "depth" => json!({"type": "integer", "minimum": 0}),
+        "limit" | "max_depth" | "max_paths" => {
             json!({"type": "integer", "minimum": 1})
+        }
+        "max_nodes" | "max_edges" => {
+            json!({"type": "integer", "minimum": 1, "maximum": 1000000})
         }
         "max_traversal" => json!({"type": "integer", "minimum": 1, "maximum": 1000000}),
         "profiles_document" => json!({
@@ -862,7 +892,7 @@ fn field_schema(field: &str) -> Value {
             "maxItems": 1024,
             "items": scalar_schema::<AgentLocator>()
         }),
-        "kinds" | "profiles" | "phases" | "sessions" | "environments" => json!({
+        "kinds" | "profiles" | "conditions" | "phases" | "sessions" | "environments" => json!({
             "type": "array",
             "maxItems": 1024,
             "items": {"type": "string", "minLength": 1, "maxLength": 4096}

@@ -708,13 +708,22 @@ fn seed_cli_diff_snapshot(
     target: bool,
 ) -> String {
     let mut store = depgraph_store::Store::open(store_path).unwrap();
+    let git_revision = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "--verify", "HEAD"])
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|revision| revision.trim().to_ascii_lowercase());
+    let source_revision =
+        git_revision
+            .as_deref()
+            .unwrap_or(if target { "revision-2" } else { "revision-1" });
     store
-        .start_scan_with_revision(
-            scan_id,
-            root,
-            false,
-            Some(if target { "revision-2" } else { "revision-1" }),
-        )
+        .start_scan_with_revision(scan_id, root, false, Some(source_revision))
         .unwrap();
     let coverage = json!({
         "profiles": 1,
@@ -2468,12 +2477,11 @@ fn impact_changed_set_is_read_only_deterministic_and_maps_renames() {
     let run_json = || {
         Command::cargo_bin("depgraph")
             .unwrap()
+            .current_dir(root.path())
             .env("GIT_TRACE", &git_trace_path)
             .args([
                 "--store",
                 store_path.to_str().unwrap(),
-                "--scan-id",
-                "impact-target",
                 "impact",
                 "path:src/new.go",
                 "--changed",
@@ -2528,11 +2536,10 @@ fn impact_changed_set_is_read_only_deterministic_and_maps_renames() {
 
     Command::cargo_bin("depgraph")
         .unwrap()
+        .current_dir(root.path())
         .args([
             "--store",
             store_path.to_str().unwrap(),
-            "--scan-id",
-            "impact-target",
             "impact",
             "path:src/new.go",
             "--changed",
@@ -2547,7 +2554,85 @@ fn impact_changed_set_is_read_only_deterministic_and_maps_renames() {
 }
 
 #[test]
-fn warm_impact_queries_reuse_snapshot_and_filter_scoped_bounded_cache_entries() {
+fn impact_changed_since_error_never_discloses_raw_git_stderr() {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let store_path = cache.path().join("graph.db");
+    run_git(root.path(), &["init", "--quiet"]);
+    run_git(
+        root.path(),
+        &["config", "user.email", "test@example.invalid"],
+    );
+    run_git(root.path(), &["config", "user.name", "Test"]);
+    run_git(
+        root.path(),
+        &["commit", "--quiet", "--allow-empty", "-m", "head"],
+    );
+    seed_cli_diff_snapshot(
+        &store_path,
+        root.path(),
+        "impact-git-stderr",
+        "impact-git-stderr",
+        true,
+    );
+
+    let private_git = cache
+        .path()
+        .join("private-absolute-Bearer-review-secret.git");
+    fs::rename(root.path().join(".git"), &private_git).unwrap();
+    fs::write(
+        root.path().join(".git"),
+        format!("gitdir: {}\n", private_git.display()),
+    )
+    .unwrap();
+    assert!(!run_git(root.path(), &["rev-parse", "HEAD"]).is_empty());
+    fs::rename(&private_git, cache.path().join("relocated.git")).unwrap();
+
+    let raw_failure = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root.path())
+        .args(["rev-parse", "--show-prefix"])
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap();
+    assert!(!raw_failure.status.success());
+    let raw_stderr = String::from_utf8_lossy(&raw_failure.stderr);
+    assert!(private_git.is_absolute());
+    assert!(raw_stderr.contains("Bearer-review-secret"));
+    assert!(raw_stderr.contains(private_git.to_string_lossy().as_ref()));
+
+    let output = Command::cargo_bin("depgraph")
+        .unwrap()
+        .current_dir(root.path())
+        .args([
+            "--store",
+            store_path.to_str().unwrap(),
+            "impact",
+            "path:src/new.go",
+            "--changed",
+            "HEAD",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let public_error = String::from_utf8(output.stderr).unwrap();
+    assert!(public_error.contains("read-only Git query failed"));
+    let private_git = private_git.to_string_lossy();
+    for forbidden in [
+        raw_stderr.trim(),
+        "Bearer-review-secret",
+        private_git.as_ref(),
+    ] {
+        assert!(
+            !public_error.contains(forbidden),
+            "CLI error disclosed hostile Git stderr fragment {forbidden:?}: {public_error}"
+        );
+    }
+}
+
+#[test]
+fn impact_queries_recompute_canonically_without_reading_or_writing_the_cache() {
     let root = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();
     let store_path = cache.path().join("graph.db");
@@ -2581,7 +2666,7 @@ fn warm_impact_queries_reuse_snapshot_and_filter_scoped_bounded_cache_entries() 
     assert!(second.status.success(), "{:?}", second.stderr);
     assert_eq!(first.stdout, second.stdout);
     let store = depgraph_store::Store::open(&store_path).unwrap();
-    assert_eq!(store.impact_query_cache_entry_count().unwrap(), 1);
+    assert_eq!(store.impact_query_cache_entry_count().unwrap(), 0);
     drop(store);
 
     let filtered = run(&["--depth", "1", "--json"]);
@@ -2589,7 +2674,7 @@ fn warm_impact_queries_reuse_snapshot_and_filter_scoped_bounded_cache_entries() 
     let filtered: serde_json::Value = serde_json::from_slice(&filtered.stdout).unwrap();
     assert_eq!(filtered["data"]["filters"]["depth"], 1);
     let store = depgraph_store::Store::open(&store_path).unwrap();
-    assert_eq!(store.impact_query_cache_entry_count().unwrap(), 2);
+    assert_eq!(store.impact_query_cache_entry_count().unwrap(), 0);
 }
 
 #[test]
@@ -5297,6 +5382,16 @@ fn semantic_selectors_cycles_and_query_evidence_are_exposed() {
             "node_ids": [first, second, first]
         }])
     );
+    let type_cycles = query(&[
+        "cycles",
+        "--level",
+        "type",
+        "--max-traversal",
+        "100",
+        "--json",
+    ]);
+    let type_cycles: serde_json::Value = serde_json::from_slice(&type_cycles.stdout).unwrap();
+    assert!(type_cycles["data"].is_array());
 }
 
 #[cfg(unix)]
@@ -5395,21 +5490,27 @@ fn query_commands_report_traversal_evidence_cycles_doctor_and_unresolved_sites()
     full_edge_ids.sort_unstable();
     assert_eq!(paged_edge_ids.as_slice(), full_edge_ids.as_slice());
 
-    let traversal_limited = query(&[
-        "deps",
-        "path:go.mod",
-        "--transitive",
-        "--max-traversal",
-        "1",
-        "--json",
-    ]);
-    assert_eq!(traversal_limited["complete"], false);
+    let traversal_limited = Command::cargo_bin("depgraph")
+        .unwrap()
+        .args(["--store", store.to_str().unwrap()])
+        .args([
+            "deps",
+            "path:go.mod",
+            "--transitive",
+            "--max-traversal",
+            "1",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(!traversal_limited.status.success());
     assert!(
-        traversal_limited["diagnostics"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|diagnostic| diagnostic["code"] == "QUERY_TRAVERSAL_LIMIT_REACHED")
+        traversal_limited.stdout.is_empty(),
+        "resource exhaustion must not return a partial JSON payload"
+    );
+    assert!(
+        String::from_utf8_lossy(&traversal_limited.stderr)
+            .contains("request exhausted a service resource limit")
     );
     let human_page = Command::cargo_bin("depgraph")
         .unwrap()
@@ -5533,6 +5634,74 @@ fn query_commands_report_traversal_evidence_cycles_doctor_and_unresolved_sites()
         unresolved["items"][0]["evidence"].as_array().unwrap().len(),
         1
     );
+    let filtered = query(&[
+        "unresolved",
+        "--kind",
+        "missing-kind",
+        "--kind",
+        "import",
+        "--max-traversal",
+        "100",
+        "--all",
+        "--json",
+    ]);
+    assert_eq!(filtered["data"].as_array().unwrap().len(), 1);
+    assert_eq!(filtered["data"][0]["site"]["kind"], "import");
+}
+
+#[cfg(unix)]
+#[test]
+fn dependency_and_path_cli_reject_traversal_above_the_shared_maximum() {
+    let root = fixture_root();
+    let temp = tempfile::tempdir().unwrap();
+    let store = temp.path().join("graph.db");
+    let graph = temp.path().join("graph.sh");
+    write_worker(&graph, &graph_worker(false));
+    let scan = scan_with_worker(root.path(), &store, &graph, false);
+    assert_eq!(scan.status.code(), Some(0));
+    let over_maximum = (depgraph_core::MAX_INTERACTIVE_QUERY_TRAVERSAL + 1).to_string();
+
+    for arguments in [
+        vec![
+            "deps",
+            "path:go.mod",
+            "--max-traversal",
+            over_maximum.as_str(),
+            "--json",
+        ],
+        vec![
+            "why",
+            "path:go.mod",
+            "path:src/shared-one.go",
+            "--max-traversal",
+            over_maximum.as_str(),
+            "--json",
+        ],
+        vec![
+            "cycles",
+            "--level",
+            "type",
+            "--max-traversal",
+            over_maximum.as_str(),
+            "--json",
+        ],
+        vec![
+            "unresolved",
+            "--kind",
+            "import",
+            "--max-traversal",
+            over_maximum.as_str(),
+            "--json",
+        ],
+    ] {
+        Command::cargo_bin("depgraph")
+            .unwrap()
+            .args(["--store", store.to_str().unwrap()])
+            .args(arguments)
+            .assert()
+            .code(2)
+            .stderr(predicate::str::contains("invalid service input"));
+    }
 }
 
 #[cfg(unix)]

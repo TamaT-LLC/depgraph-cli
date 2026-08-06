@@ -172,6 +172,89 @@ fn graph_dependency_and_path_tools_advertise_their_exact_closed_contracts() {
 }
 
 #[test]
+fn issue_303_graph_tools_advertise_exact_closed_immediate_contracts() {
+    let catalog = ToolCatalog::for_capabilities(&DepgraphCapabilitySet::read_only()).unwrap();
+    for (name, expected_fields, result_ref) in [
+        (
+            "graph_impact_get",
+            vec![
+                "changed_since",
+                "conditions",
+                "contract_version",
+                "cursor",
+                "depth",
+                "environments",
+                "limit",
+                "max_edges",
+                "max_nodes",
+                "phases",
+                "profiles",
+                "repository_id",
+                "selector",
+                "sessions",
+                "snapshot",
+            ],
+            "#/$defs/AgentImpactResponse",
+        ),
+        (
+            "graph_cycles_list",
+            vec![
+                "contract_version",
+                "cursor",
+                "level",
+                "limit",
+                "max_traversal",
+                "repository_id",
+                "snapshot",
+            ],
+            "#/$defs/Page",
+        ),
+        (
+            "graph_unresolved_list",
+            vec![
+                "contract_version",
+                "cursor",
+                "kinds",
+                "limit",
+                "max_traversal",
+                "repository_id",
+                "snapshot",
+            ],
+            "#/$defs/Page",
+        ),
+    ] {
+        let tool = catalog.tool(name).unwrap();
+        let mut fields = tool.input_schema()["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        fields.sort_unstable();
+        assert_eq!(fields, expected_fields);
+        assert_eq!(tool.operation_behavior(), OperationBehavior::Immediate);
+        assert_eq!(
+            tool.output_schema()["properties"]["result"]["$ref"],
+            result_ref
+        );
+    }
+
+    let impact = catalog.tool("graph_impact_get").unwrap();
+    assert_eq!(
+        impact.input_schema()["properties"]["depth"],
+        serde_json::json!({"type":"integer","minimum":0})
+    );
+    assert_eq!(
+        impact.input_schema()["properties"]["conditions"]["type"],
+        "array"
+    );
+    assert_eq!(
+        catalog.tool("graph_cycles_list").unwrap().input_schema()["properties"]["level"]["enum"],
+        serde_json::json!(["package", "file", "symbol", "type", "route"])
+    );
+}
+
+#[test]
 fn profiles_include_dependencies_and_default_excludes_privileged_tools() {
     assert_eq!(
         CapabilityProfile::Read.required_capabilities(),

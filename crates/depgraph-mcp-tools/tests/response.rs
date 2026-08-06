@@ -124,6 +124,10 @@ fn service_errors_map_to_closed_redacted_tool_errors() {
             AgentErrorCode::InvalidArgument,
         ),
         (
+            DepgraphServiceError::SnapshotWorktreeMismatch,
+            AgentErrorCode::SnapshotWorktreeMismatch,
+        ),
+        (
             DepgraphServiceError::RepositoryFile {
                 reason: RepositoryFileError::NotFound,
             },
@@ -410,4 +414,71 @@ fn item_and_byte_bounded_pages_reassemble_the_canonical_full_result() {
         depgraph_mcp_tools::canonical_json_bytes(&reassembled).unwrap(),
         depgraph_mcp_tools::canonical_json_bytes(&items).unwrap()
     );
+}
+
+#[test]
+fn ten_item_page_projection_accounts_for_returned_item_digit_growth_exactly() {
+    let items = (0..10)
+        .map(|id| item(id, &format!("item-{id}-{}", "x".repeat(200))))
+        .collect::<Vec<_>>();
+    let context = PaginationContext::new(
+        &cursor_key(),
+        "agent_nodes_find",
+        repository_id(),
+        snapshot_id(),
+        &json!({"kinds":[],"filter":null}),
+    )
+    .expect("pagination context");
+    let generous = PageRequest::new(
+        PageSize::new(10).expect("ten item page"),
+        PageByteLimit::new(16 * 1024).expect("generous byte limit"),
+        None,
+    );
+    let baseline = context
+        .paginate(&items, &generous)
+        .expect("ten items fit the generous page");
+    assert_eq!(baseline.returned_items(), 10);
+    let baseline_mapped = CanonicalResponseMapper::success(&SuccessEnvelope::new(
+        repository_id(),
+        Some(snapshot_id()),
+        baseline,
+    ))
+    .expect("baseline page maps");
+    let exact_bytes = u32::try_from(baseline_mapped.output_bytes()).expect("page bytes fit u32");
+
+    let exact_request = PageRequest::new(
+        PageSize::new(10).expect("ten item page"),
+        PageByteLimit::new(exact_bytes).expect("exact byte limit"),
+        None,
+    );
+    let exact_page = context
+        .paginate(&items, &exact_request)
+        .expect("the exact projected ten-item envelope fits");
+    assert_eq!(exact_page.returned_items(), 10);
+    let exact_mapped = CanonicalResponseMapper::success(&SuccessEnvelope::new(
+        repository_id(),
+        Some(snapshot_id()),
+        exact_page,
+    ))
+    .expect("accepted exact page must map successfully");
+    assert_eq!(exact_mapped.output_bytes(), exact_bytes as usize);
+
+    let one_lower = PageRequest::new(
+        PageSize::new(10).expect("ten item page"),
+        PageByteLimit::new(exact_bytes - 1).expect("one-lower byte limit"),
+        None,
+    );
+    match context.paginate(&items, &one_lower) {
+        Ok(page) => {
+            assert!(page.returned_items() < 10);
+            let mapped = CanonicalResponseMapper::success(&SuccessEnvelope::new(
+                repository_id(),
+                Some(snapshot_id()),
+                page,
+            ))
+            .expect("smaller accepted page must still map");
+            assert!(mapped.output_bytes() < exact_bytes as usize);
+        }
+        Err(error) => assert_eq!(error.code(), AgentErrorCode::ResourceExhausted),
+    }
 }

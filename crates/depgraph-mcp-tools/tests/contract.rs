@@ -1,17 +1,20 @@
 use std::num::NonZeroU32;
 
 use depgraph_mcp_tools::{
-    AcceptedOperationStatus, AgentCapability, AgentCompletedSnapshot, AgentContext, AgentCoverage,
-    AgentCurrentSnapshot, AgentDependenciesResponse, AgentDependencyDirection, AgentEdge,
-    AgentError, AgentErrorCategory, AgentErrorCode, AgentErrorDetails, AgentEvidence,
-    AgentEvidenceKind, AgentLocator, AgentNamedSnapshot, AgentNode, AgentNodeSummary,
-    AgentPathResponse, AgentPathStep, AgentPhase, AgentPrecision, AgentRemediation,
-    AgentResolutionStatus, AgentResourceLimit, AgentSite, AgentSnapshot, AgentSourcePosition,
-    AgentSourceSpan, CommonRequest, ContractBuildError, Cursor, DurableSubmitResult, ErrorEnvelope,
-    LogicalRepositoryId, MAX_PAGE_BYTES, MAX_PAGE_ITEMS, MAX_TASK_TTL_MS, MIN_TASK_TTL_MS,
-    OperationAccepted, OperationRecoveryTools, Page, PageByteLimit, PageRequest, PageSize,
-    RepositoryRelativePath, SnapshotId, SnapshotSelector, SuccessEnvelope, TASK_POLL_INTERVAL_MS,
-    TaskAccepted, TasksNegotiation, canonical_json_bytes,
+    AcceptedOperationStatus, AgentCapability, AgentChangedSince, AgentCompletedSnapshot,
+    AgentContext, AgentCorrelationDifference, AgentCorrelationStatus, AgentCoverage,
+    AgentCurrentSnapshot, AgentCycle, AgentCycleLevel, AgentDependenciesResponse,
+    AgentDependencyDirection, AgentEdge, AgentError, AgentErrorCategory, AgentErrorCode,
+    AgentErrorDetails, AgentEvidence, AgentEvidenceKind, AgentImpact, AgentImpactResponse,
+    AgentLocator, AgentNamedSnapshot, AgentNode, AgentNodeSummary, AgentPathResponse,
+    AgentPathStep, AgentPhase, AgentPrecision, AgentRemediation, AgentResolutionStatus,
+    AgentResourceLimit, AgentSite, AgentSnapshot, AgentSourcePosition, AgentSourceSpan,
+    AgentUnresolved, CommonRequest, ContractBuildError, Cursor, DurableSubmitResult, ErrorEnvelope,
+    LogicalRepositoryId, MAX_AGENT_CORRELATION_REASONS, MAX_AGENT_CYCLE_NODES, MAX_AGENT_PHASES,
+    MAX_PAGE_BYTES, MAX_PAGE_ITEMS, MAX_TASK_TTL_MS, MIN_TASK_TTL_MS, OperationAccepted,
+    OperationRecoveryTools, Page, PageByteLimit, PageRequest, PageSize, RepositoryRelativePath,
+    SnapshotId, SnapshotSelector, SuccessEnvelope, TASK_POLL_INTERVAL_MS, TaskAccepted,
+    TasksNegotiation, canonical_json_bytes,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -151,6 +154,21 @@ fn edge() -> AgentEdge {
     .expect("bounded edge")
 }
 
+fn unresolved_site() -> AgentSite {
+    AgentSite::new(
+        parse("site:unresolved-1"),
+        parse("node:src"),
+        parse("import"),
+        parse("crate::missing"),
+        AgentResolutionStatus::Unresolved,
+        parse("profile:default"),
+        vec![parse("node:dependency")],
+        Some(source_span()),
+        vec![evidence()],
+    )
+    .expect("bounded unresolved site")
+}
+
 fn dependency_node() -> AgentNode {
     AgentNode::new(
         parse("node:dependency"),
@@ -163,6 +181,43 @@ fn dependency_node() -> AgentNode {
 
 fn path_step() -> AgentPathStep {
     AgentPathStep::new(node(), edge(), dependency_node()).expect("connected path step")
+}
+
+fn impact() -> AgentImpact {
+    AgentImpact::new(node(), 0, parse("node:src"), Vec::new()).expect("sample impact")
+}
+
+fn impact_response() -> AgentImpactResponse {
+    AgentImpactResponse::new(
+        node(),
+        true,
+        None,
+        Page::new(vec![impact()], 1, true, None).expect("sample impact page"),
+    )
+    .expect("consistent impact response")
+}
+
+fn cycle() -> AgentCycle {
+    AgentCycle::new(
+        AgentCycleLevel::File,
+        vec![
+            parse("node:src"),
+            parse("node:dependency"),
+            parse("node:src"),
+        ],
+    )
+    .expect("sample cycle")
+}
+
+fn unresolved() -> AgentUnresolved {
+    AgentUnresolved::new(
+        unresolved_site(),
+        vec![AgentPhase::Source, AgentPhase::Semantic],
+        Some(parse("profile:default")),
+        Some(AgentCorrelationStatus::Unobserved),
+        vec![AgentCorrelationDifference::NotObserved],
+    )
+    .expect("sample unresolved site")
 }
 
 fn operation() -> OperationAccepted {
@@ -291,6 +346,33 @@ fn serde_rejects_unknown_fields_for_every_object_and_tagged_enum_branch() {
         )
         .expect("serialize path response"),
     );
+    assert_unknown_field_rejected::<AgentImpact>(
+        "AgentImpact",
+        serde_json::to_value(impact()).expect("serialize impact"),
+    );
+    assert_unknown_field_rejected::<AgentImpactResponse>(
+        "AgentImpactResponse",
+        serde_json::to_value(impact_response()).expect("serialize impact response"),
+    );
+    assert_unknown_field_rejected::<AgentCycle>(
+        "AgentCycle",
+        serde_json::to_value(cycle()).expect("serialize cycle"),
+    );
+    assert_unknown_field_rejected::<AgentUnresolved>(
+        "AgentUnresolved",
+        serde_json::to_value(unresolved()).expect("serialize unresolved"),
+    );
+    assert_unknown_field_rejected::<AgentChangedSince>(
+        "AgentChangedSince",
+        json!({
+            "requested_ref":"HEAD",
+            "resolved_ref":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "merge_base":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "head":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "changed_paths":1,
+            "mapped_nodes":1
+        }),
+    );
     assert_unknown_field_rejected::<AgentSnapshot>(
         "AgentSnapshot::Available",
         json!({"availability":"available","snapshot_id":SNAPSHOT_ID,"name":"baseline"}),
@@ -403,6 +485,100 @@ fn dependency_and_path_contracts_validate_topology_and_completion_state() {
         None,
     );
     assert!(AgentPathStep::new(node(), edge(), wrong_target).is_err());
+}
+
+#[test]
+fn issue_303_closed_results_reject_unknown_enums_and_unbounded_shapes() {
+    assert_eq!(
+        AgentImpact::new(node(), 0, parse("node:dependency"), Vec::new()),
+        Err(ContractBuildError::PathTopology)
+    );
+    assert_eq!(
+        AgentImpactResponse::new(
+            node(),
+            true,
+            None,
+            Page::new(Vec::new(), 0, true, None).expect("empty page"),
+        ),
+        Err(ContractBuildError::ImpactState)
+    );
+    assert_eq!(
+        AgentUnresolved::new(
+            unresolved_site(),
+            Vec::new(),
+            None,
+            Some(AgentCorrelationStatus::Unobserved),
+            Vec::new(),
+        ),
+        Err(ContractBuildError::UnresolvedState)
+    );
+    assert!(
+        serde_json::from_value::<AgentCycle>(json!({
+            "level":"directory",
+            "node_ids":["node:src","node:src"]
+        }))
+        .is_err()
+    );
+    assert!(
+        serde_json::from_value::<AgentCycle>(json!({
+            "level":"file",
+            "node_ids":["node:src","node:dependency"]
+        }))
+        .is_err(),
+        "a cycle must close at its starting node"
+    );
+    assert_eq!(
+        AgentCycle::new(
+            AgentCycleLevel::File,
+            vec![parse("node:src"), parse("node:dependency")]
+        ),
+        Err(ContractBuildError::CycleTopology)
+    );
+    assert_eq!(
+        AgentCycle::new(
+            AgentCycleLevel::File,
+            vec![parse("node:src"); MAX_AGENT_CYCLE_NODES + 1]
+        ),
+        Err(ContractBuildError::TooManyCycleNodes)
+    );
+
+    let unresolved_value = serde_json::to_value(unresolved()).expect("serialize unresolved");
+    let mut invalid_status = unresolved_value.clone();
+    invalid_status["correlation_status"] = json!("maybe");
+    assert!(serde_json::from_value::<AgentUnresolved>(invalid_status).is_err());
+    let mut invalid_reason = unresolved_value;
+    invalid_reason["observed_difference_reasons"] = json!(["private_reason"]);
+    assert!(serde_json::from_value::<AgentUnresolved>(invalid_reason).is_err());
+    assert_eq!(
+        AgentUnresolved::new(
+            site(),
+            Vec::new(),
+            None,
+            None,
+            vec![AgentCorrelationDifference::NotObserved; MAX_AGENT_CORRELATION_REASONS + 1],
+        ),
+        Err(ContractBuildError::TooManyCorrelationReasons)
+    );
+    assert!(
+        AgentUnresolved::new(
+            unresolved_site(),
+            vec![AgentPhase::Source; MAX_AGENT_PHASES],
+            None,
+            None,
+            Vec::new(),
+        )
+        .is_ok()
+    );
+    assert_eq!(
+        AgentUnresolved::new(
+            unresolved_site(),
+            vec![AgentPhase::Source; MAX_AGENT_PHASES + 1],
+            None,
+            None,
+            Vec::new(),
+        ),
+        Err(ContractBuildError::TooManyPhases)
+    );
 }
 
 #[test]
@@ -597,6 +773,10 @@ fn typed_error_category_is_derived_and_deserialization_cannot_forge_it() {
             AgentErrorCategory::NotFound,
         ),
         (AgentErrorCode::SnapshotMismatch, AgentErrorCategory::Input),
+        (
+            AgentErrorCode::SnapshotWorktreeMismatch,
+            AgentErrorCategory::Input,
+        ),
         (AgentErrorCode::CursorInvalid, AgentErrorCategory::Input),
         (AgentErrorCode::CursorMismatch, AgentErrorCategory::Input),
         (
@@ -801,6 +981,10 @@ fn contract_samples() -> Value {
         ).expect("sample dependency response"),
         "agent_edge": edge(),
         "agent_evidence": evidence(),
+        "agent_impact": impact(),
+        "agent_impact_response": impact_response(),
+        "agent_cycle": cycle(),
+        "agent_unresolved": unresolved(),
         "agent_node": node(),
         "agent_node_summary": node_summary(),
         "agent_path_response": AgentPathResponse::new(

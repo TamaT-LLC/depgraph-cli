@@ -48,6 +48,7 @@ pub mod service;
 mod service_agent;
 mod service_graph;
 mod service_lifecycle;
+mod service_limits;
 mod service_repository;
 mod service_snapshot;
 pub mod worker;
@@ -415,17 +416,18 @@ pub use scan::{
     run_scan_with_cache_mode_and_cancellation,
 };
 pub use service::{
-    DEFAULT_SERVICE_MAX_INLINE_INPUT_BYTES, DEFAULT_SERVICE_MAX_OUTPUT_BYTES,
-    DEFAULT_SERVICE_MAX_PAGE_ITEMS, DEFAULT_SERVICE_PAGE_ITEMS, DEPGRAPH_SERVICE_LIMITS_VERSION,
-    DependenciesRequest, DependenciesResult, DependencyDirection, DepgraphCapability,
-    DepgraphCapabilitySet, DepgraphMutatingContext, DepgraphMutatingUseCase,
+    CyclesRequest, CyclesResult, DEFAULT_SERVICE_MAX_INLINE_INPUT_BYTES,
+    DEFAULT_SERVICE_MAX_OUTPUT_BYTES, DEFAULT_SERVICE_MAX_PAGE_ITEMS, DEFAULT_SERVICE_PAGE_ITEMS,
+    DEPGRAPH_SERVICE_LIMITS_VERSION, DependenciesRequest, DependenciesResult, DependencyDirection,
+    DepgraphCapability, DepgraphCapabilitySet, DepgraphMutatingContext, DepgraphMutatingUseCase,
     DepgraphMutatingUseCaseKind, DepgraphService, DepgraphServiceConfig,
     DepgraphServiceConfigurationError, DepgraphServiceError, DepgraphServiceErrorCategory,
     DepgraphServiceLimit, DepgraphServiceLimits, DepgraphServiceResult, DoctorRequest,
-    DoctorResponse, ExplainPathRequest, ExplainPathResult, OpenedRepositoryFile,
-    ProfilePlanRequest, RepositoryFileError, RepositoryPathError, RepositoryPathSelector,
-    RepositoryRelativePath, RequestReadStore, RequestReadStoreFactory, ResolvedSnapshotId,
-    SnapshotLocator, SnapshotReadRequest,
+    DoctorResponse, ExplainPathRequest, ExplainPathResult, ImpactRequest, ImpactServiceResult,
+    OpenedRepositoryFile, ProfilePlanRequest, RepositoryFileError, RepositoryPathError,
+    RepositoryPathSelector, RepositoryRelativePath, RequestReadStore, RequestReadStoreFactory,
+    ResolvedSnapshotId, SnapshotLocator, SnapshotReadRequest, UnresolvedRequest,
+    UnresolvedServiceResult,
 };
 
 use worker::{
