@@ -1,6 +1,10 @@
 use std::{fs, path::Path};
 
 use assert_cmd::Command;
+use depgraph_core::service::{
+    DepgraphCapabilitySet, DepgraphService, DepgraphServiceConfig, DepgraphServiceLimits,
+    SnapshotLocator,
+};
 use predicates::prelude::*;
 use serde_json::json;
 
@@ -1816,6 +1820,15 @@ fn snapshot_create_list_and_show_are_canonical_and_scriptable() {
     let cache = tempfile::tempdir().unwrap();
     let store_path = cache.path().join("graph.db");
     seed_safe_rust_scan(&store_path, root.path(), "Cargo.toml");
+    let service = DepgraphService::new(
+        DepgraphServiceConfig::new(
+            root.path(),
+            &store_path,
+            DepgraphCapabilitySet::read_only(),
+            DepgraphServiceLimits::default(),
+        )
+        .unwrap(),
+    );
 
     let created = Command::cargo_bin("depgraph")
         .unwrap()
@@ -1886,6 +1899,11 @@ fn snapshot_create_list_and_show_are_canonical_and_scriptable() {
         listed["data"][0]["coverage"]["completeness"],
         json!(["syntax-complete"])
     );
+    assert_eq!(
+        listed["data"],
+        serde_json::to_value(service.list_completed_snapshots().unwrap()).unwrap(),
+        "CLI snapshot list must be the service value inside its frontend envelope"
+    );
 
     let show = |selector: &str| {
         Command::cargo_bin("depgraph")
@@ -1910,6 +1928,16 @@ fn snapshot_create_list_and_show_are_canonical_and_scriptable() {
     assert_eq!(by_name["data"], by_id["data"]);
     assert_eq!(by_name["data"]["names"], json!(["alpha", "baseline"]));
     assert_eq!(by_name["data"]["scan_id"], "safe-rust-scan");
+    assert_eq!(
+        by_name["data"],
+        serde_json::to_value(
+            service
+                .show_completed_snapshot(&SnapshotLocator::parse("BASELINE").unwrap())
+                .unwrap()
+        )
+        .unwrap(),
+        "CLI snapshot show must be the service value inside its frontend envelope"
+    );
 
     Command::cargo_bin("depgraph")
         .unwrap()
@@ -2618,7 +2646,7 @@ fn empty_safe_scan_uses_external_store_and_reports_json() {
         .args(["--store", store.to_str().unwrap(), "doctor", "--json"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("\"store_schema_version\": 14"))
+        .stdout(predicate::str::contains("\"store_schema_version\": 15"))
         .stdout(predicate::str::contains("\"cache_contract_version\": 2"))
         .stdout(predicate::str::contains(
             "\"impact_query_cache_contract_version\": 1",

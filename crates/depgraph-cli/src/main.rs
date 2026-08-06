@@ -7,6 +7,10 @@ use std::{
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use depgraph_core::service::{
+    CompletedSnapshotView, DepgraphCapabilitySet, DepgraphService, DepgraphServiceConfig,
+    DepgraphServiceError, DepgraphServiceLimits, SnapshotLocator,
+};
 use depgraph_core::{
     BoundedQueryExecutionError, BoundedQueryPlan, BoundedQueryResult, BuildAudit, BuildOutcomeKind,
     CancellationToken, Config, CycleLevel, DEFAULT_INTERACTIVE_QUERY_MAX_BYTES,
@@ -558,14 +562,6 @@ struct SnapshotCreatedOutput {
     snapshot: SnapshotView,
 }
 
-#[derive(Serialize)]
-struct SnapshotListItem {
-    name: String,
-    named_at: String,
-    #[serde(flatten)]
-    snapshot: SnapshotView,
-}
-
 #[tokio::main]
 async fn main() -> ExitCode {
     tracing_subscriber::fmt()
@@ -584,6 +580,12 @@ async fn main() -> ExitCode {
 }
 
 fn error_exit_code(error: &anyhow::Error) -> u8 {
+    if matches!(
+        error.downcast_ref::<DepgraphServiceError>(),
+        Some(DepgraphServiceError::InvalidInput | DepgraphServiceError::NotFound)
+    ) {
+        return 2;
+    }
     if let Some(diagnostic) = error.downcast_ref::<QueryDiagnostic>() {
         return if diagnostic.class == QueryFailureClass::Security {
             4
@@ -2073,13 +2075,13 @@ async fn run(cli: Cli) -> Result<u8> {
         },
         Commands::Snapshot { command } => {
             let root = std::env::current_dir()?;
-            let store_path = store_path(cli.store, &root)?;
+            let store_path = std::path::absolute(store_path(cli.store, &root)?)?;
             let _store_writer_lock = matches!(&command, SnapshotCommands::Create { .. })
                 .then(|| acquire_store_writer_lock(&store_path))
                 .transpose()?;
-            let mut store = open_store(&store_path)?;
             match command {
                 SnapshotCommands::Create { name, json } => {
+                    let mut store = open_store(&store_path)?;
                     let snapshot_id = if let Some(scan_id) = cli.scan_id.as_deref() {
                         store
                             .snapshot_id_for_scan_selection(scan_id)?
@@ -2106,14 +2108,8 @@ async fn run(cli: Cli) -> Result<u8> {
                     }
                 }
                 SnapshotCommands::List { json } => {
-                    let mut output = Vec::new();
-                    for named in store.snapshot_names()? {
-                        output.push(SnapshotListItem {
-                            name: named.name,
-                            named_at: named.named_at,
-                            snapshot: store.completed_snapshot_details(&named.snapshot_id)?.into(),
-                        });
-                    }
+                    let service = snapshot_read_service(&root, &store_path)?;
+                    let output = service.list_completed_snapshots()?;
                     if json {
                         print_snapshot_json("snapshot.list", &output)?;
                     } else if output.is_empty() {
@@ -2122,25 +2118,25 @@ async fn run(cli: Cli) -> Result<u8> {
                         for item in &output {
                             println!(
                                 "{} {} status={} revision={} profiles={} named_at={}",
-                                item.name,
-                                item.snapshot.id,
-                                item.snapshot.status,
-                                display_revision(item.snapshot.source_revision.as_deref()),
-                                display_list(&item.snapshot.profile_ids),
-                                item.named_at,
+                                item.name(),
+                                item.snapshot().id(),
+                                item.snapshot().status(),
+                                display_revision(item.snapshot().source_revision()),
+                                display_list(item.snapshot().profile_ids()),
+                                item.named_at(),
                             );
-                            println!("    {}", coverage_summary(&item.snapshot.coverage));
+                            println!("    {}", coverage_summary(item.snapshot().coverage()));
                         }
                     }
                 }
                 SnapshotCommands::Show { selector, json } => {
-                    let snapshot_id = store.resolve_completed_snapshot_selector(&selector)?;
-                    let output: SnapshotView =
-                        store.completed_snapshot_details(&snapshot_id)?.into();
+                    let service = snapshot_read_service(&root, &store_path)?;
+                    let selector = SnapshotLocator::parse(&selector)?;
+                    let output = service.show_completed_snapshot(&selector)?;
                     if json {
                         print_snapshot_json("snapshot.show", &output)?;
                     } else {
-                        print_snapshot_view(&output);
+                        print_completed_snapshot_view(&output);
                     }
                 }
             }
@@ -3231,6 +3227,48 @@ fn print_snapshot_view(snapshot: &SnapshotView) {
     println!("profiles: {}", display_list(&snapshot.profile_ids));
     println!("created at: {}", snapshot.created_at);
     println!("{}", coverage_summary(&snapshot.coverage));
+}
+
+fn print_completed_snapshot_view(snapshot: &CompletedSnapshotView) {
+    println!("snapshot: {}", snapshot.id());
+    println!("names: {}", display_list(snapshot.names()));
+    println!("status: {}", snapshot.status());
+    println!(
+        "source: {} {}",
+        snapshot.source_kind(),
+        snapshot.source_attempt_id()
+    );
+    println!("scan: {}", snapshot.scan_id());
+    if let Some(build_attempt_id) = snapshot.build_attempt_id() {
+        println!("build attempt: {build_attempt_id}");
+    }
+    if let Some(runtime_import_id) = snapshot.runtime_import_id() {
+        println!("runtime import: {runtime_import_id}");
+    }
+    if !snapshot.runtime_session_ids().is_empty() {
+        println!(
+            "runtime sessions: {}",
+            display_list(snapshot.runtime_session_ids())
+        );
+    }
+    println!(
+        "parent: {}",
+        snapshot.parent_snapshot_id().unwrap_or("none")
+    );
+    println!("revision: {}", display_revision(snapshot.source_revision()));
+    println!("profiles: {}", display_list(snapshot.profile_ids()));
+    println!("created at: {}", snapshot.created_at());
+    println!("{}", coverage_summary(snapshot.coverage()));
+}
+
+fn snapshot_read_service(root: &Path, store_path: &Path) -> Result<DepgraphService> {
+    let config = DepgraphServiceConfig::new(
+        root,
+        store_path,
+        DepgraphCapabilitySet::read_only(),
+        DepgraphServiceLimits::default(),
+    )?;
+    Ok(DepgraphService::new(config))
 }
 
 fn display_revision(revision: Option<&str>) -> &str {

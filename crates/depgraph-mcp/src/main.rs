@@ -8,22 +8,29 @@ use std::{
 
 use anyhow::{Context as _, Result, bail};
 use clap::{Parser, ValueEnum};
+use depgraph_core::service::NodeMatchMode;
 use depgraph_core::{
-    DepgraphCapability, DepgraphCapabilitySet, DepgraphService, DepgraphServiceConfig,
-    DepgraphServiceLimits, VerifiedCompilerPack, read_compiler_pack_requirement,
-    verify_compiler_pack,
+    CancellationToken, DepgraphCapability, DepgraphCapabilitySet, DepgraphService,
+    DepgraphServiceConfig, DepgraphServiceError, DepgraphServiceLimits, SnapshotLocator,
+    VerifiedCompilerPack, read_compiler_pack_requirement, verify_compiler_pack,
 };
-use depgraph_mcp::runtime::{AuditLogger, RuntimeConfig, RuntimeController};
-use depgraph_mcp_tools::ToolCatalog;
+use depgraph_mcp::runtime::{AuditLogger, RuntimeClass, RuntimeConfig, RuntimeController};
+use depgraph_mcp_tools::{
+    AgentCompletedSnapshot, AgentContext, AgentError, AgentNamedSnapshot, AgentNodeSummary,
+    AgentToken, CanonicalResponseMapper, ContractVersion, Cursor, CursorKey, ErrorEnvelope,
+    LogicalRepositoryId, MappedToolResult, PageByteLimit, PageRequest, PageSize, PaginationContext,
+    ResponseMappingError, SnapshotId, SuccessEnvelope, ToolCatalog,
+};
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler, ServiceExt,
     model::{
-        Implementation, ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerInfo,
-        Tool, ToolsCapability,
+        CallToolRequestParams, CallToolResponse, Implementation, ListToolsResult,
+        PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool, ToolsCapability,
     },
     service::{RequestContext, RxJsonRpcMessage, TxJsonRpcMessage},
     transport::Transport,
 };
+use serde::{Deserialize, Serialize};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     sync::Mutex as AsyncMutex,
@@ -113,7 +120,88 @@ struct DepgraphMcpServer {
     compiler_pack: VerifiedCompilerPack,
     runtime: RuntimeController,
     audit: AuditLogger,
+    repository_id: LogicalRepositoryId,
+    cursor_key: CursorKey,
     tools: Arc<[Tool]>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ContextArguments {
+    contract_version: ContractVersion,
+    repository_id: LogicalRepositoryId,
+}
+
+#[derive(Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum NodeMatchArgument {
+    Exact,
+    Prefix,
+    Contains,
+}
+
+impl From<NodeMatchArgument> for NodeMatchMode {
+    fn from(value: NodeMatchArgument) -> Self {
+        match value {
+            NodeMatchArgument::Exact => Self::Exact,
+            NodeMatchArgument::Prefix => Self::Prefix,
+            NodeMatchArgument::Contains => Self::Contains,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FindNodesArguments {
+    contract_version: ContractVersion,
+    repository_id: LogicalRepositoryId,
+    query: String,
+    match_mode: NodeMatchArgument,
+    #[serde(default)]
+    snapshot: Option<String>,
+    #[serde(default)]
+    kinds: Vec<String>,
+    #[serde(default)]
+    cursor: Option<Cursor>,
+    #[serde(default)]
+    limit: Option<u16>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SnapshotListArguments {
+    contract_version: ContractVersion,
+    repository_id: LogicalRepositoryId,
+    #[serde(default)]
+    cursor: Option<Cursor>,
+    #[serde(default)]
+    limit: Option<u16>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SnapshotGetArguments {
+    contract_version: ContractVersion,
+    repository_id: LogicalRepositoryId,
+    snapshot: String,
+}
+
+enum ToolExecutionFailure {
+    Service(DepgraphServiceError),
+    Agent(AgentError),
+    Response(ResponseMappingError),
+}
+
+impl From<DepgraphServiceError> for ToolExecutionFailure {
+    fn from(error: DepgraphServiceError) -> Self {
+        Self::Service(error)
+    }
+}
+
+impl From<ResponseMappingError> for ToolExecutionFailure {
+    fn from(error: ResponseMappingError) -> Self {
+        Self::Response(error)
+    }
 }
 
 impl ServerHandler for DepgraphMcpServer {
@@ -141,6 +229,317 @@ impl ServerHandler for DepgraphMcpServer {
     ) -> impl Future<Output = Result<ListToolsResult, McpError>> + '_ {
         std::future::ready(Ok(ListToolsResult::with_all_items(self.tools.to_vec())))
     }
+
+    fn get_tool(&self, name: &str) -> Option<Tool> {
+        self.tools
+            .binary_search_by(|tool| tool.name.as_ref().cmp(name))
+            .ok()
+            .map(|index| self.tools[index].clone())
+    }
+
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, McpError> {
+        let tool = request.name.into_owned();
+        if !matches!(
+            tool.as_str(),
+            "get_context" | "agent_nodes_list" | "snapshot_list" | "snapshot_get"
+        ) {
+            return Err(McpError::invalid_params(
+                "tool handler is unavailable",
+                None,
+            ));
+        }
+        let arguments = request.arguments.unwrap_or_default();
+        let service = self.service.clone();
+        let repository_id = self.repository_id.clone();
+        let cursor_key = self.cursor_key.clone();
+        let cancellation = CancellationToken::new();
+        let request_cancellation = context.ct;
+        if request_cancellation.is_cancelled() {
+            cancellation.cancel();
+        }
+        let cancellation_bridge = tokio::spawn({
+            let cancellation = cancellation.clone();
+            async move {
+                request_cancellation.cancelled().await;
+                cancellation.cancel();
+            }
+        });
+        let execution = self
+            .runtime
+            .execute_blocking(RuntimeClass::Read, cancellation, move |cancellation| {
+                if cancellation.is_cancelled() {
+                    return Err(ToolExecutionFailure::Service(
+                        DepgraphServiceError::Cancelled,
+                    ));
+                }
+                let result = execute_catalog_read_tool(
+                    &service,
+                    &repository_id,
+                    &cursor_key,
+                    &tool,
+                    arguments,
+                    &cancellation,
+                );
+                if cancellation.is_cancelled() {
+                    Err(ToolExecutionFailure::Service(
+                        DepgraphServiceError::Cancelled,
+                    ))
+                } else {
+                    result
+                }
+            })
+            .await;
+        cancellation_bridge.abort();
+
+        let mapped = match execution {
+            Ok(Ok(mapped)) => mapped,
+            Ok(Err(ToolExecutionFailure::Service(error))) => {
+                CanonicalResponseMapper::service_error(self.repository_id.clone(), &error)
+                    .map_err(internal_mapping_error)?
+            }
+            Ok(Err(ToolExecutionFailure::Agent(error))) => CanonicalResponseMapper::error(
+                &ErrorEnvelope::new(self.repository_id.clone(), error),
+            )
+            .map_err(internal_mapping_error)?,
+            Ok(Err(ToolExecutionFailure::Response(error))) => {
+                return Err(internal_mapping_error(error));
+            }
+            Err(error) => CanonicalResponseMapper::error(&ErrorEnvelope::new(
+                self.repository_id.clone(),
+                error.agent_error(self.runtime.deadline(RuntimeClass::Read)),
+            ))
+            .map_err(internal_mapping_error)?,
+        };
+        Ok(mapped.into_result().into())
+    }
+}
+
+fn internal_mapping_error(_error: ResponseMappingError) -> McpError {
+    McpError::internal_error("canonical tool response mapping failed", None)
+}
+
+fn decode_arguments<T>(
+    arguments: serde_json::Map<String, serde_json::Value>,
+) -> Result<T, ToolExecutionFailure>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    serde_json::from_value(serde_json::Value::Object(arguments))
+        .map_err(|_| ToolExecutionFailure::Service(DepgraphServiceError::InvalidInput))
+}
+
+fn authorize_repository(
+    contract_version: ContractVersion,
+    requested: &LogicalRepositoryId,
+    actual: &LogicalRepositoryId,
+) -> Result<(), ToolExecutionFailure> {
+    let _ = contract_version;
+    if requested != actual {
+        return Err(ToolExecutionFailure::Service(
+            DepgraphServiceError::InvalidInput,
+        ));
+    }
+    Ok(())
+}
+
+fn page_request(
+    limit: Option<u16>,
+    cursor: Option<Cursor>,
+) -> Result<PageRequest, ToolExecutionFailure> {
+    let max_items = limit
+        .map(PageSize::new)
+        .transpose()
+        .map_err(|_| ToolExecutionFailure::Service(DepgraphServiceError::InvalidInput))?
+        .unwrap_or_default();
+    Ok(PageRequest::new(
+        max_items,
+        PageByteLimit::default(),
+        cursor,
+    ))
+}
+
+fn execute_catalog_read_tool(
+    service: &DepgraphService,
+    repository_id: &LogicalRepositoryId,
+    cursor_key: &CursorKey,
+    tool: &str,
+    arguments: serde_json::Map<String, serde_json::Value>,
+    cancellation: &CancellationToken,
+) -> Result<MappedToolResult, ToolExecutionFailure> {
+    match tool {
+        "get_context" => {
+            let arguments = decode_arguments::<ContextArguments>(arguments)?;
+            authorize_repository(
+                arguments.contract_version,
+                &arguments.repository_id,
+                repository_id,
+            )?;
+            let context = service.get_context_cancellable(cancellation)?;
+            let snapshot_id = context
+                .current_snapshot()
+                .details()
+                .map(|details| parse_snapshot_id(details.id()))
+                .transpose()?;
+            let result = AgentContext::try_from(&context)
+                .map_err(|_| ToolExecutionFailure::Service(DepgraphServiceError::Integrity))?;
+            CanonicalResponseMapper::success(&SuccessEnvelope::new(
+                repository_id.clone(),
+                snapshot_id,
+                result,
+            ))
+            .map_err(Into::into)
+        }
+        "agent_nodes_list" => {
+            let arguments = decode_arguments::<FindNodesArguments>(arguments)?;
+            authorize_repository(
+                arguments.contract_version,
+                &arguments.repository_id,
+                repository_id,
+            )?;
+            if arguments.kinds.len() > 1_024 {
+                return Err(ToolExecutionFailure::Service(
+                    DepgraphServiceError::InvalidInput,
+                ));
+            }
+            let kinds = arguments
+                .kinds
+                .iter()
+                .map(AgentToken::parse)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| ToolExecutionFailure::Service(DepgraphServiceError::InvalidInput))?;
+            let snapshot =
+                SnapshotLocator::parse(arguments.snapshot.as_deref().unwrap_or("current"))?;
+            let resolved_snapshot_id =
+                service.resolve_snapshot_id_cancellable(&snapshot, cancellation)?;
+            let snapshot_id = parse_snapshot_id(resolved_snapshot_id.as_str())?;
+            let normalized = serde_json::json!({
+                "kinds": &kinds,
+                "match_mode": arguments.match_mode,
+                "query": &arguments.query,
+            });
+            let pagination = PaginationContext::new(
+                cursor_key,
+                "agent_nodes_list",
+                repository_id.clone(),
+                snapshot_id.clone(),
+                &normalized,
+            )?;
+            let request = page_request(arguments.limit, arguments.cursor)?;
+            let offset = pagination
+                .cursor_offset(&request)
+                .map_err(ToolExecutionFailure::Agent)?;
+            let kind_values = kinds
+                .iter()
+                .map(|kind| kind.as_str().to_owned())
+                .collect::<Vec<_>>();
+            let found = service.find_nodes_page(
+                &resolved_snapshot_id,
+                &arguments.query,
+                arguments.match_mode.into(),
+                &kind_values,
+                offset,
+                usize::from(request.max_items().get()),
+                cancellation,
+            )?;
+            let items = found
+                .nodes()
+                .iter()
+                .map(AgentNodeSummary::try_from)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| ToolExecutionFailure::Service(DepgraphServiceError::Integrity))?;
+            let page = pagination
+                .paginate_window(&items, offset, found.total_items(), &request)
+                .map_err(ToolExecutionFailure::Agent)?;
+            CanonicalResponseMapper::success(&SuccessEnvelope::new(
+                repository_id.clone(),
+                Some(snapshot_id),
+                page,
+            ))
+            .map_err(Into::into)
+        }
+        "snapshot_list" => {
+            let arguments = decode_arguments::<SnapshotListArguments>(arguments)?;
+            authorize_repository(
+                arguments.contract_version,
+                &arguments.repository_id,
+                repository_id,
+            )?;
+            let context = service.get_context_cancellable(cancellation)?;
+            let binding_snapshot_id = context
+                .current_snapshot()
+                .details()
+                .map(|details| parse_snapshot_id(details.id()))
+                .transpose()?
+                .unwrap_or_else(empty_snapshot_id);
+            let pagination = PaginationContext::new(
+                cursor_key,
+                "snapshot_list",
+                repository_id.clone(),
+                binding_snapshot_id,
+                &serde_json::json!({}),
+            )?;
+            let request = page_request(arguments.limit, arguments.cursor)?;
+            let offset = pagination
+                .cursor_offset(&request)
+                .map_err(ToolExecutionFailure::Agent)?;
+            let found = service.list_completed_snapshots_page(
+                offset,
+                usize::from(request.max_items().get()),
+                cancellation,
+            )?;
+            let items = found
+                .snapshots()
+                .iter()
+                .map(AgentNamedSnapshot::try_from)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| ToolExecutionFailure::Service(DepgraphServiceError::Integrity))?;
+            let page = pagination
+                .paginate_window(&items, offset, found.total_items(), &request)
+                .map_err(ToolExecutionFailure::Agent)?;
+            CanonicalResponseMapper::success(&SuccessEnvelope::new(
+                repository_id.clone(),
+                None,
+                page,
+            ))
+            .map_err(Into::into)
+        }
+        "snapshot_get" => {
+            let arguments = decode_arguments::<SnapshotGetArguments>(arguments)?;
+            authorize_repository(
+                arguments.contract_version,
+                &arguments.repository_id,
+                repository_id,
+            )?;
+            let snapshot = SnapshotLocator::parse(arguments.snapshot)?;
+            let shown = service.show_completed_snapshot_cancellable(&snapshot, cancellation)?;
+            let snapshot_id = parse_snapshot_id(shown.id())?;
+            let result = AgentCompletedSnapshot::try_from(&shown)
+                .map_err(|_| ToolExecutionFailure::Service(DepgraphServiceError::Integrity))?;
+            CanonicalResponseMapper::success(&SuccessEnvelope::new(
+                repository_id.clone(),
+                Some(snapshot_id),
+                result,
+            ))
+            .map_err(Into::into)
+        }
+        _ => Err(ToolExecutionFailure::Service(
+            DepgraphServiceError::NotFound,
+        )),
+    }
+}
+
+fn parse_snapshot_id(value: &str) -> Result<SnapshotId, ToolExecutionFailure> {
+    SnapshotId::parse(value)
+        .map_err(|_| ToolExecutionFailure::Service(DepgraphServiceError::Integrity))
+}
+
+fn empty_snapshot_id() -> SnapshotId {
+    SnapshotId::parse(format!("snapshot:sha256:{}", "0".repeat(64)))
+        .expect("fixed empty snapshot cursor binding is valid")
 }
 
 #[derive(Clone)]
@@ -344,6 +743,9 @@ fn build_server(args: &Args) -> Result<DepgraphMcpServer> {
         DepgraphServiceLimits::default(),
     )
     .context("invalid server configuration")?;
+    let repository_id = LogicalRepositoryId::parse(config.logical_repository_id())
+        .map_err(anyhow::Error::msg)
+        .context("invalid logical repository identity")?;
 
     let runtime = RuntimeController::new(RuntimeConfig::default())
         .context("invalid MCP runtime configuration")?;
@@ -352,6 +754,8 @@ fn build_server(args: &Args) -> Result<DepgraphMcpServer> {
         compiler_pack,
         runtime,
         audit: AuditLogger::default(),
+        repository_id,
+        cursor_key: CursorKey::generate(),
         tools,
     })
 }

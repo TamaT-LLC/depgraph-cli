@@ -2,9 +2,9 @@ use std::io;
 
 use depgraph_core::{DepgraphCapability, DepgraphServiceError, RepositoryFileError};
 use depgraph_mcp_tools::{
-    AgentErrorCode, AgentNode, AgentSnapshot, CanonicalResponseMapper, CursorKey,
-    LogicalRepositoryId, OperationAccepted, PageByteLimit, PageRequest, PageSize,
-    PaginationContext, SnapshotId, SuccessEnvelope,
+    AgentCapability, AgentContext, AgentCurrentSnapshot, AgentErrorCode, AgentNode, AgentSnapshot,
+    CanonicalResponseMapper, CursorKey, LogicalRepositoryId, OperationAccepted, PageByteLimit,
+    PageRequest, PageSize, PaginationContext, SnapshotId, SuccessEnvelope,
 };
 use serde_json::{Value, json};
 
@@ -13,6 +13,24 @@ const SNAPSHOT_ID: &str =
 
 fn cursor_key() -> CursorKey {
     CursorKey::from_bytes([0x42; 32])
+}
+
+#[test]
+fn issue_300_closed_context_is_accepted_by_the_public_mapper() {
+    let context = AgentContext::new(
+        repository_id(),
+        vec![AgentCapability::Read],
+        AgentCurrentSnapshot::unavailable(),
+    )
+    .expect("valid context");
+    let mapped =
+        CanonicalResponseMapper::success(&SuccessEnvelope::new(repository_id(), None, context))
+            .expect("closed context is a public result");
+    let structured = mapped.result().structured_content.as_ref().unwrap();
+    assert_eq!(
+        structured["result"]["snapshot"],
+        json!({"available": false})
+    );
 }
 
 fn item(id: u32, label: &str) -> AgentNode {

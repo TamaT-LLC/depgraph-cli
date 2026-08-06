@@ -1,15 +1,16 @@
 use std::num::NonZeroU32;
 
 use depgraph_mcp_tools::{
-    AcceptedOperationStatus, AgentCapability, AgentEdge, AgentError, AgentErrorCategory,
-    AgentErrorCode, AgentErrorDetails, AgentEvidence, AgentEvidenceKind, AgentLocator, AgentNode,
-    AgentPhase, AgentPrecision, AgentRemediation, AgentResolutionStatus, AgentResourceLimit,
-    AgentSite, AgentSnapshot, AgentSourcePosition, AgentSourceSpan, CommonRequest,
-    ContractBuildError, Cursor, DurableSubmitResult, ErrorEnvelope, LogicalRepositoryId,
-    MAX_PAGE_BYTES, MAX_PAGE_ITEMS, MAX_TASK_TTL_MS, MIN_TASK_TTL_MS, OperationAccepted,
-    OperationRecoveryTools, Page, PageByteLimit, PageRequest, PageSize, RepositoryRelativePath,
-    SnapshotId, SnapshotSelector, SuccessEnvelope, TASK_POLL_INTERVAL_MS, TaskAccepted,
-    TasksNegotiation, canonical_json_bytes,
+    AcceptedOperationStatus, AgentCapability, AgentCompletedSnapshot, AgentContext, AgentCoverage,
+    AgentCurrentSnapshot, AgentEdge, AgentError, AgentErrorCategory, AgentErrorCode,
+    AgentErrorDetails, AgentEvidence, AgentEvidenceKind, AgentLocator, AgentNamedSnapshot,
+    AgentNode, AgentNodeSummary, AgentPhase, AgentPrecision, AgentRemediation,
+    AgentResolutionStatus, AgentResourceLimit, AgentSite, AgentSnapshot, AgentSourcePosition,
+    AgentSourceSpan, CommonRequest, ContractBuildError, Cursor, DurableSubmitResult, ErrorEnvelope,
+    LogicalRepositoryId, MAX_PAGE_BYTES, MAX_PAGE_ITEMS, MAX_TASK_TTL_MS, MIN_TASK_TTL_MS,
+    OperationAccepted, OperationRecoveryTools, Page, PageByteLimit, PageRequest, PageSize,
+    RepositoryRelativePath, SnapshotId, SnapshotSelector, SuccessEnvelope, TASK_POLL_INTERVAL_MS,
+    TaskAccepted, TasksNegotiation, canonical_json_bytes,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -57,6 +58,63 @@ fn node() -> AgentNode {
         parse("repo://src/lib.rs"),
         Some(parse("crate::lib")),
         Some(parse("src/lib.rs")),
+    )
+}
+
+fn node_summary() -> AgentNodeSummary {
+    AgentNodeSummary::new(
+        parse("node:src"),
+        parse("module"),
+        parse("repo://src/lib.rs"),
+        parse("crate::lib"),
+    )
+}
+
+fn completed_snapshot() -> AgentCompletedSnapshot {
+    serde_json::from_value(json!({
+        "snapshot_id": SNAPSHOT_ID,
+        "names": ["baseline"],
+        "status": "completed",
+        "source_kind": "scan",
+        "source_attempt_id": "scan:fixture",
+        "scan_id": "scan:fixture",
+        "runtime_session_ids": [],
+        "profile_ids": ["profile:default"],
+        "source_revision": "revision-1",
+        "created_at": "2026-08-06T00:00:00.000Z",
+        "coverage": {
+            "profiles": 1,
+            "files_discovered": 1,
+            "files_analyzed": 1,
+            "files_skipped": 0,
+            "dependency_sites": 0,
+            "resolved": 0,
+            "candidates": 0,
+            "external": 0,
+            "unresolved": 0,
+            "unsupported_syntax": 0,
+            "project_code_executed": false,
+            "completeness": ["syntax-complete"],
+            "reasons": []
+        }
+    }))
+    .expect("representative completed snapshot")
+}
+
+fn context() -> AgentContext {
+    AgentContext::new(
+        parse("repo-1"),
+        vec![AgentCapability::Read],
+        AgentCurrentSnapshot::available(completed_snapshot()),
+    )
+    .expect("representative context")
+}
+
+fn named_snapshot() -> AgentNamedSnapshot {
+    AgentNamedSnapshot::new(
+        parse("baseline"),
+        parse("2026-08-06T00:00:01.000Z"),
+        completed_snapshot(),
     )
 }
 
@@ -163,6 +221,26 @@ fn serde_rejects_unknown_fields_for_every_object_and_tagged_enum_branch() {
         "AgentNode",
         serde_json::to_value(node()).expect("serialize node"),
     );
+    assert_unknown_field_rejected::<AgentNodeSummary>(
+        "AgentNodeSummary",
+        serde_json::to_value(node_summary()).expect("serialize node summary"),
+    );
+    assert_unknown_field_rejected::<AgentCoverage>(
+        "AgentCoverage",
+        serde_json::to_value(completed_snapshot()).expect("serialize snapshot")["coverage"].clone(),
+    );
+    assert_unknown_field_rejected::<AgentCompletedSnapshot>(
+        "AgentCompletedSnapshot",
+        serde_json::to_value(completed_snapshot()).expect("serialize completed snapshot"),
+    );
+    assert_unknown_field_rejected::<AgentNamedSnapshot>(
+        "AgentNamedSnapshot",
+        serde_json::to_value(named_snapshot()).expect("serialize named snapshot"),
+    );
+    assert_unknown_field_rejected::<AgentContext>(
+        "AgentContext",
+        serde_json::to_value(context()).expect("serialize context"),
+    );
     assert_unknown_field_rejected::<AgentSite>(
         "AgentSite",
         serde_json::to_value(site()).expect("serialize site"),
@@ -228,6 +306,37 @@ fn serde_rejects_unknown_fields_for_every_object_and_tagged_enum_branch() {
         "DurableSubmitResult::Task",
         json!({"resultType":"task","taskId":OPERATION_ID,"status":"working","createdAtMs":1700000000000_u64,"updatedAtMs":1700000000100_u64,"pollIntervalMs":TASK_POLL_INTERVAL_MS,"ttlMs":MIN_TASK_TTL_MS}),
     );
+}
+
+#[test]
+fn issue_300_public_node_projection_has_exactly_four_fields() {
+    let value = serde_json::to_value(node_summary()).expect("serialize node summary");
+    let mut fields = value
+        .as_object()
+        .expect("node summary is an object")
+        .keys()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    fields.sort_unstable();
+    assert_eq!(fields, ["display_name", "id", "kind", "locator"]);
+    assert!(value.get("properties").is_none());
+    assert!(value.get("path").is_none());
+    assert!(value.get("repository_path").is_none());
+}
+
+#[test]
+fn issue_300_current_snapshot_unavailable_is_a_success_shape() {
+    let value = serde_json::to_value(
+        AgentContext::new(
+            parse("repo-1"),
+            vec![AgentCapability::Read],
+            AgentCurrentSnapshot::unavailable(),
+        )
+        .expect("empty context"),
+    )
+    .expect("serialize context");
+    assert_eq!(value["snapshot"], json!({"available": false}));
+    assert!(value.to_string().find('/').is_none());
 }
 
 #[test]
@@ -588,6 +697,9 @@ fn contract_samples() -> Value {
         "agent_edge": edge(),
         "agent_evidence": evidence(),
         "agent_node": node(),
+        "agent_node_summary": node_summary(),
+        "agent_context": context(),
+        "agent_named_snapshot": named_snapshot(),
         "agent_site": site(),
         "agent_snapshot": AgentSnapshot::available(snapshot_id, Some(parse("baseline"))),
         "common_request": CommonRequest::new(repository_id.clone()),
@@ -613,6 +725,16 @@ fn contract_samples() -> Value {
 #[test]
 fn canonical_contract_samples_match_the_golden_exactly() {
     let actual = canonical_json_bytes(&contract_samples()).expect("canonical samples");
+    if std::env::var_os("DEPGRAPH_UPDATE_CONTRACT_GOLDEN").is_some() {
+        std::fs::write(
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/depgraph-mcp-tools-v1.contract.golden.json"
+            ),
+            &actual,
+        )
+        .expect("update contract golden");
+    }
     let expected = include_bytes!("fixtures/depgraph-mcp-tools-v1.contract.golden.json");
     assert_eq!(
         std::str::from_utf8(&actual).expect("canonical JSON is UTF-8"),

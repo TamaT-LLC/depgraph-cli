@@ -15,9 +15,10 @@ use sha2::{Digest, Sha256};
 use zeroize::Zeroize;
 
 use crate::{
-    AgentCapability, AgentEdge, AgentError, AgentErrorCode, AgentErrorDetails, AgentEvidence,
-    AgentNode, AgentRemediation, AgentResourceLimit, AgentSite, AgentSnapshot, CanonicalJsonError,
-    Cursor, DurableSubmitResult, ErrorEnvelope, LogicalRepositoryId, MAX_PAGE_BYTES,
+    AgentCapability, AgentCompletedSnapshot, AgentContext, AgentEdge, AgentError, AgentErrorCode,
+    AgentErrorDetails, AgentEvidence, AgentNamedSnapshot, AgentNode, AgentNodeSummary,
+    AgentRemediation, AgentResourceLimit, AgentSite, AgentSnapshot, CanonicalJsonError, Cursor,
+    DurableSubmitResult, ErrorEnvelope, LogicalRepositoryId, MAX_PAGE_BYTES,
     MCP_TOOLS_CONTRACT_VERSION, OperationAccepted, Page, PageRequest, SnapshotId, SuccessEnvelope,
     TaskAccepted, canonical_json_bytes,
 };
@@ -54,9 +55,13 @@ macro_rules! public_page_item {
 }
 
 public_result!(
+    AgentCompletedSnapshot,
+    AgentContext,
     AgentEdge,
     AgentEvidence,
+    AgentNamedSnapshot,
     AgentNode,
+    AgentNodeSummary,
     AgentSite,
     AgentSnapshot,
     DurableSubmitResult,
@@ -66,7 +71,9 @@ public_result!(
 public_page_item!(
     AgentEdge,
     AgentEvidence,
+    AgentNamedSnapshot,
     AgentNode,
+    AgentNodeSummary,
     AgentSite,
     AgentSnapshot
 );
@@ -498,6 +505,128 @@ impl PaginationContext {
             next_cursor,
         )
         .map_err(|_| internal_error(false))
+    }
+
+    /// Decode the starting offset without materializing the bound collection.
+    /// Collection totals and identity are validated by `paginate_window` after
+    /// the bounded store query returns.
+    pub fn cursor_offset(&self, request: &PageRequest) -> Result<usize, AgentError> {
+        request
+            .cursor()
+            .map(|cursor| self.decode_cursor(cursor).map(|state| state.0))
+            .transpose()
+            .map(Option::unwrap_or_default)
+    }
+
+    pub fn paginate_window<T>(
+        &self,
+        items: &[T],
+        offset: usize,
+        total_items: u64,
+        request: &PageRequest,
+    ) -> Result<Page<T>, AgentError>
+    where
+        T: PublicPageItem,
+    {
+        let result_digest = self.bounded_collection_digest();
+        if let Some(cursor) = request.cursor() {
+            let (cursor_offset, cursor_total, cursor_digest) = self.decode_cursor(cursor)?;
+            if cursor_offset != offset
+                || cursor_total != total_items
+                || cursor_digest != result_digest
+            {
+                return Err(cursor_mismatch());
+            }
+        } else if offset != 0 {
+            return Err(cursor_mismatch());
+        }
+        let offset_u64 = u64::try_from(offset).map_err(|_| cursor_mismatch())?;
+        if offset_u64 > total_items
+            || u64::try_from(items.len())
+                .ok()
+                .is_none_or(|count| offset_u64.saturating_add(count) > total_items)
+            || items.len() > usize::from(request.max_items().get())
+        {
+            return Err(cursor_mismatch());
+        }
+        if items.is_empty() {
+            if offset_u64 != total_items {
+                return Err(internal_error(false));
+            }
+            let maximum_bytes = request.max_bytes().get() as usize;
+            let projected = self.projected_page_bytes(0, 0, total_items, true, None)?;
+            if projected > maximum_bytes {
+                return Err(resource_error(
+                    AgentResourceLimit::OutputBytes,
+                    maximum_bytes as u64,
+                ));
+            }
+            return Page::new(Vec::new(), total_items, true, None)
+                .map_err(|_| internal_error(false));
+        }
+
+        let maximum_bytes = request.max_bytes().get() as usize;
+        let mut item_bytes = 0usize;
+        let mut selected = None;
+        for (index, item) in items.iter().enumerate() {
+            let mut item_value = match bounded_json_value(item, maximum_bytes) {
+                Ok(value) => value,
+                Err(ResponseMappingError::OutputTooLarge) if selected.is_some() => break,
+                Err(ResponseMappingError::OutputTooLarge) => {
+                    return Err(resource_error(
+                        AgentResourceLimit::OutputBytes,
+                        maximum_bytes as u64,
+                    ));
+                }
+                Err(_) => return Err(internal_error(false)),
+            };
+            redact_public_value(&mut item_value);
+            let canonical_item =
+                canonical_json_bytes(&item_value).map_err(|_| internal_error(false))?;
+            item_bytes = item_bytes
+                .checked_add(canonical_item.len())
+                .ok_or_else(|| {
+                    resource_error(AgentResourceLimit::OutputBytes, maximum_bytes as u64)
+                })?;
+            let count = index + 1;
+            let next_offset = offset
+                .checked_add(count)
+                .ok_or_else(|| internal_error(false))?;
+            let complete = u64::try_from(next_offset).ok() == Some(total_items);
+            let next_cursor = if complete {
+                None
+            } else {
+                Some(
+                    self.encode_cursor(next_offset, total_items, &result_digest)
+                        .map_err(|_| internal_error(false))?,
+                )
+            };
+            let projected = self.projected_page_bytes(
+                count,
+                item_bytes,
+                total_items,
+                complete,
+                next_cursor.as_ref(),
+            )?;
+            if projected <= maximum_bytes {
+                selected = Some((count, next_cursor));
+            } else {
+                break;
+            }
+        }
+        let Some((count, next_cursor)) = selected else {
+            return Err(resource_error(
+                AgentResourceLimit::OutputBytes,
+                maximum_bytes as u64,
+            ));
+        };
+        let complete = u64::try_from(offset.saturating_add(count)).ok() == Some(total_items);
+        Page::new(items[..count].to_vec(), total_items, complete, next_cursor)
+            .map_err(|_| internal_error(false))
+    }
+
+    fn bounded_collection_digest(&self) -> [u8; 32] {
+        Sha256::digest(self.binding_digest.as_bytes()).into()
     }
 
     fn encode_cursor(

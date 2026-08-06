@@ -45,6 +45,7 @@ pub mod runtime_trace;
 pub mod rust_build_observer;
 pub mod scan;
 pub mod service;
+mod service_agent;
 mod service_repository;
 mod service_snapshot;
 pub mod worker;

@@ -432,7 +432,7 @@ mod tests {
         drop(connection);
 
         let mut store = Store::open(&path)?;
-        assert_eq!(store.schema_version()?, 14);
+        assert_eq!(store.schema_version()?, crate::STORE_SCHEMA_VERSION);
         assert!(store.store_impact_query_cache(
             &key(1),
             "snapshot:sha256:test",

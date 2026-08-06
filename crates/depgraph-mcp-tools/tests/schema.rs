@@ -1,9 +1,9 @@
 use std::{path::Path, process::Command};
 
 use depgraph_mcp_tools::{
-    AgentError, AgentLocator, AgentNode, AgentSourceSpan, MCP_TOOLS_SCHEMA_ID, Page,
-    RepositoryRelativePath, TaskAccepted, canonical_schema_bytes, canonical_schema_sha256,
-    mcp_tools_v1_schema,
+    AgentContext, AgentError, AgentLocator, AgentNode, AgentNodeSummary, AgentSourceSpan,
+    MCP_TOOLS_SCHEMA_ID, Page, RepositoryRelativePath, TaskAccepted, canonical_schema_bytes,
+    canonical_schema_sha256, mcp_tools_v1_schema,
 };
 use serde_json::{Value, json};
 
@@ -101,6 +101,16 @@ fn generated_schema_is_valid_draft_2020_12_and_rejects_unknown_fields() {
             "AgentNode",
             "AgentNode",
             json!({"id":"node:src","kind":"module","locator":"repo://src/lib.rs"}),
+        ),
+        (
+            "AgentNodeSummary",
+            "AgentNodeSummary",
+            json!({"id":"node:src","kind":"module","locator":"repo://src/lib.rs","display_name":"crate::lib"}),
+        ),
+        (
+            "AgentContext",
+            "AgentContext::Unavailable",
+            json!({"repository_id":"repo-1","enabled_capabilities":["read"],"snapshot":{"available":false}}),
         ),
         (
             "AgentSite",
@@ -320,7 +330,7 @@ fn every_generated_object_schema_has_additional_properties_false() {
     let schema = schema_value();
     let mut objects = 0;
     assert_all_object_schemas_are_closed(&schema, "#", &mut objects);
-    assert_eq!(objects, 28, "review newly added object schemas explicitly");
+    assert_eq!(objects, 41, "review newly added object schemas explicitly");
 }
 
 #[test]
@@ -335,6 +345,19 @@ fn schema_bytes_digest_checked_in_file_and_generation_policy_are_exact() {
         first_digest, second_digest,
         "schema digest changed across runs"
     );
+    if std::env::var_os("DEPGRAPH_UPDATE_SCHEMA_GOLDEN").is_some() {
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        std::fs::write(
+            manifest.join("../../schemas/depgraph-mcp-tools-v1.schema.json"),
+            &first,
+        )
+        .expect("update checked-in schema");
+        std::fs::write(
+            manifest.join("tests/fixtures/depgraph-mcp-tools-v1.schema.sha256"),
+            first_digest.as_bytes(),
+        )
+        .expect("update schema digest");
+    }
     assert_eq!(first_digest.as_bytes(), CHECKED_IN_DIGEST);
     assert_eq!(first.as_slice(), CHECKED_IN_SCHEMA);
     assert!(
@@ -377,6 +400,31 @@ fn schema_rejects_closed_dto_prohibition_corpus() {
             "AgentNode schema accepted {forbidden}"
         );
     }
+    let node_summary = json!({
+        "id":"node:src",
+        "kind":"module",
+        "locator":"repo://src/lib.rs",
+        "display_name":"crate::lib",
+        "path":"/absolute/must-not-cross"
+    });
+    let wrapper = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$defs": schema["$defs"].clone(),
+        "$ref": "#/$defs/AgentNodeSummary",
+    });
+    assert!(
+        !jsonschema::draft202012::new(&wrapper)
+            .expect("summary schema compiles")
+            .is_valid(&node_summary)
+    );
+    assert!(serde_json::from_value::<AgentNodeSummary>(node_summary).is_err());
+
+    let absolute_context = json!({
+        "repository_id":"/absolute/repository",
+        "enabled_capabilities":["read"],
+        "snapshot":{"available":false}
+    });
+    assert!(serde_json::from_value::<AgentContext>(absolute_context).is_err());
     for forbidden in ["detail", "raw", "raw_evidence_detail", "stderr"] {
         let mut evidence =
             json!({"kind":"semantic","extractor":"rust-analyzer","extractor_version":"0.0.330"});

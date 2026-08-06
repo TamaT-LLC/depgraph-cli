@@ -451,7 +451,9 @@ pub enum AgentRemediation {
     ContactOperator,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[derive(
+    Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentCapability {
     Read,
@@ -459,6 +461,18 @@ pub enum AgentCapability {
     RepositoryWrite,
     DaemonControl,
     ProjectExec,
+}
+
+impl From<depgraph_core::DepgraphCapability> for AgentCapability {
+    fn from(capability: depgraph_core::DepgraphCapability) -> Self {
+        match capability {
+            depgraph_core::DepgraphCapability::Read => Self::Read,
+            depgraph_core::DepgraphCapability::StoreWrite => Self::StoreWrite,
+            depgraph_core::DepgraphCapability::RepositoryWrite => Self::RepositoryWrite,
+            depgraph_core::DepgraphCapability::DaemonControl => Self::DaemonControl,
+            depgraph_core::DepgraphCapability::ProjectExec => Self::ProjectExec,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
@@ -626,4 +640,10 @@ pub enum ContractBuildError {
     TaskTiming,
     #[error("snapshot availability does not match its fields")]
     SnapshotAvailability,
+    #[error("Agent context capabilities must be unique and stably ordered")]
+    CapabilitySet,
+    #[error("Agent DTO contains a value outside the closed scalar contract")]
+    AgentDtoValue,
+    #[error("Agent snapshot contains too many metadata items")]
+    TooManySnapshotMetadataItems,
 }

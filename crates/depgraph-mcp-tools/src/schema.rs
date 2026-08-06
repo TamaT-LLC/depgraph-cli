@@ -5,9 +5,10 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::{
-    AgentEdge, AgentEvidence, AgentNode, AgentSite, AgentSnapshot, CommonRequest,
-    DurableSubmitResult, ErrorEnvelope, OperationAccepted, Page, PageRequest, SnapshotSelector,
-    SuccessEnvelope, TaskAccepted,
+    AgentCompletedSnapshot, AgentContext, AgentCoverage, AgentCurrentSnapshot, AgentEdge,
+    AgentEvidence, AgentNamedSnapshot, AgentNode, AgentNodeSummary, AgentSite, AgentSnapshot,
+    CommonRequest, DurableSubmitResult, ErrorEnvelope, OperationAccepted, Page, PageRequest,
+    SnapshotSelector, SuccessEnvelope, TaskAccepted,
 };
 
 pub const MCP_TOOLS_SCHEMA_ID: &str =
@@ -30,17 +31,29 @@ impl JsonSchema for McpToolsV1Schema {
             generator.subschema_for::<SnapshotSelector>(),
             generator.subschema_for::<PageRequest>(),
             generator.subschema_for::<Page<AgentNode>>(),
+            generator.subschema_for::<Page<AgentNodeSummary>>(),
+            generator.subschema_for::<Page<AgentNamedSnapshot>>(),
             generator.subschema_for::<Page<AgentSite>>(),
             generator.subschema_for::<Page<AgentEdge>>(),
             generator.subschema_for::<Page<AgentEvidence>>(),
             generator.subschema_for::<Page<AgentSnapshot>>(),
             generator.subschema_for::<SuccessEnvelope<AgentNode>>(),
+            generator.subschema_for::<SuccessEnvelope<AgentContext>>(),
+            generator.subschema_for::<SuccessEnvelope<AgentCompletedSnapshot>>(),
             generator.subschema_for::<SuccessEnvelope<Page<AgentNode>>>(),
+            generator.subschema_for::<SuccessEnvelope<Page<AgentNodeSummary>>>(),
+            generator.subschema_for::<SuccessEnvelope<Page<AgentNamedSnapshot>>>(),
             generator.subschema_for::<ErrorEnvelope>(),
             generator.subschema_for::<OperationAccepted>(),
             generator.subschema_for::<TaskAccepted>(),
             generator.subschema_for::<DurableSubmitResult>(),
             generator.subschema_for::<AgentNode>(),
+            generator.subschema_for::<AgentNodeSummary>(),
+            generator.subschema_for::<AgentCoverage>(),
+            generator.subschema_for::<AgentCompletedSnapshot>(),
+            generator.subschema_for::<AgentNamedSnapshot>(),
+            generator.subschema_for::<AgentCurrentSnapshot>(),
+            generator.subschema_for::<AgentContext>(),
             generator.subschema_for::<AgentSite>(),
             generator.subschema_for::<AgentEdge>(),
             generator.subschema_for::<AgentEvidence>(),

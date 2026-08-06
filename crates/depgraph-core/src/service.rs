@@ -7,6 +7,11 @@ use std::{
 
 use depgraph_store::Store;
 
+pub use crate::service_agent::{
+    CompletedSnapshotView, CompletedSnapshotsPage, CoverageRecord, CurrentSnapshot,
+    CurrentSnapshotAvailability, DepgraphContext, FindNodesPageResult, FindNodesResult,
+    MAX_FIND_NODES_QUERY_BYTES, NamedCompletedSnapshot, NodeMatchMode, NodeProjection,
+};
 pub use crate::service_repository::{
     MAX_REPOSITORY_PATH_BYTES, MAX_REPOSITORY_PATH_COMPONENT_BYTES, MAX_REPOSITORY_PATH_COMPONENTS,
     OpenedRepositoryFile, RepositoryFileError, RepositoryPathError, RepositoryPathSelector,
@@ -231,6 +236,7 @@ impl Default for DepgraphServiceLimits {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DepgraphServiceConfig {
     canonical_root: PathBuf,
+    logical_repository_id: String,
     root_identity: crate::service_repository::RepositoryFileIdentity,
     store_path: PathBuf,
     capabilities: DepgraphCapabilitySet,
@@ -246,9 +252,11 @@ impl DepgraphServiceConfig {
     ) -> DepgraphServiceResult<Self> {
         validate_capabilities(&capabilities.values)?;
         let (canonical_root, root_identity) = canonical_repository_root(root.as_ref())?;
+        let logical_repository_id = logical_repository_id(&canonical_root);
         let store_path = fixed_store_path(store_path.as_ref())?;
         Ok(Self {
             canonical_root,
+            logical_repository_id,
             root_identity,
             store_path,
             capabilities,
@@ -259,6 +267,14 @@ impl DepgraphServiceConfig {
     #[must_use]
     pub fn canonical_root(&self) -> &Path {
         &self.canonical_root
+    }
+
+    /// Portable process-local repository identity exposed to service consumers.
+    ///
+    /// This value is never an absolute filesystem path.
+    #[must_use]
+    pub fn logical_repository_id(&self) -> &str {
+        &self.logical_repository_id
     }
 
     pub(crate) const fn root_identity(&self) -> &crate::service_repository::RepositoryFileIdentity {
@@ -279,6 +295,29 @@ impl DepgraphServiceConfig {
     pub const fn limits(&self) -> &DepgraphServiceLimits {
         &self.limits
     }
+}
+
+fn logical_repository_id(canonical_root: &Path) -> String {
+    let candidate = canonical_root.file_name().and_then(std::ffi::OsStr::to_str);
+    if let Some(candidate) = candidate
+        && !candidate.is_empty()
+        && candidate.len() <= 128
+        && candidate
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        && candidate.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'+' | b'-')
+        })
+    {
+        return candidate.to_owned();
+    }
+
+    use sha2::{Digest as _, Sha256};
+    format!(
+        "repository:sha256:{:x}",
+        Sha256::digest(canonical_root.as_os_str().as_encoded_bytes())
+    )
 }
 
 fn canonical_repository_root(
