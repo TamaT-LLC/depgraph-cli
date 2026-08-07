@@ -897,9 +897,36 @@ fn changed_since_service_error_never_discloses_raw_git_stderr() -> Result<()> {
     assert_git_success(&root, &["config", "user.name", "Test"]);
     assert_git_success(&root, &["commit", "--quiet", "--allow-empty", "-m", "head"]);
     let head = assert_git_success(&root, &["rev-parse", "HEAD"]);
+
+    // Inject a hostile absolute path into raw Git stderr via object alternates.
+    // Missing-gitdir failures on Git 2.54+ report "(null)" and no longer echo the
+    // path, so alternates keep the redaction precondition portable across versions.
+    const SECRET_MARKER: &str = "Bearer-review-secret";
+    let private_alternate = temporary
+        .path()
+        .join(format!("private-absolute-{SECRET_MARKER}"))
+        .join("objects");
+    assert!(private_alternate.is_absolute());
+    let alternates = root.join(".git/objects/info/alternates");
+    fs::create_dir_all(alternates.parent().unwrap())?;
+    fs::write(
+        &alternates,
+        format!("{}\n", private_alternate.display()),
+    )?;
+    let leaky = run_git(&root, &["cat-file", "-p", "HEAD"]);
+    let leaky_stderr = String::from_utf8_lossy(&leaky.stderr);
+    assert!(
+        leaky_stderr.contains(SECRET_MARKER),
+        "precondition: raw Git stderr must mention the hostile alternate path; got {leaky_stderr:?}"
+    );
+    assert!(
+        leaky_stderr.contains(private_alternate.to_string_lossy().as_ref()),
+        "precondition: raw Git stderr must mention the absolute alternate path; got {leaky_stderr:?}"
+    );
+
     let private_git = temporary
         .path()
-        .join("private-absolute-Bearer-review-secret.git");
+        .join(format!("private-absolute-{SECRET_MARKER}.git"));
     fs::rename(root.join(".git"), &private_git)?;
     fs::write(
         root.join(".git"),
@@ -921,11 +948,12 @@ fn changed_since_service_error_never_discloses_raw_git_stderr() -> Result<()> {
     drop(writer);
     fs::rename(&private_git, temporary.path().join("relocated.git"))?;
     let raw_failure = run_git(&root, &["rev-parse", "--show-prefix"]);
-    assert!(!raw_failure.status.success());
-    let raw_stderr = String::from_utf8_lossy(&raw_failure.stderr);
-    assert!(private_git.is_absolute());
-    assert!(raw_stderr.contains("Bearer-review-secret"));
-    assert!(raw_stderr.contains(private_git.to_string_lossy().as_ref()));
+    assert!(
+        !raw_failure.status.success(),
+        "relocated gitdir must make Git fail; stderr={:?} stdout={:?}",
+        String::from_utf8_lossy(&raw_failure.stderr),
+        String::from_utf8_lossy(&raw_failure.stdout)
+    );
 
     let graph_service = service(&root, &store_path)?;
     let request = ImpactRequest::try_new(
@@ -940,12 +968,19 @@ fn changed_since_service_error_never_discloses_raw_git_stderr() -> Result<()> {
     assert!(matches!(error, DepgraphServiceError::GraphQuery { .. }));
     let public_error = format!("{:#}", anyhow::Error::new(error));
     assert!(public_error.contains("read-only Git query failed"));
+    let private_alternate = private_alternate.to_string_lossy();
     let private_git = private_git.to_string_lossy();
+    let raw_failure_stderr = String::from_utf8_lossy(&raw_failure.stderr);
     for forbidden in [
-        raw_stderr.trim(),
-        "Bearer-review-secret",
+        leaky_stderr.trim(),
+        raw_failure_stderr.trim(),
+        SECRET_MARKER,
+        private_alternate.as_ref(),
         private_git.as_ref(),
     ] {
+        if forbidden.is_empty() {
+            continue;
+        }
         assert!(
             !public_error.contains(forbidden),
             "service error disclosed hostile Git stderr fragment {forbidden:?}: {public_error}"
