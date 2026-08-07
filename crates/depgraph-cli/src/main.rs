@@ -11,24 +11,24 @@ use depgraph_core::service::{
     BoundedQueryMode, BoundedQueryRequest, CompletedSnapshotView, CyclesRequest,
     DependenciesRequest, DependencyDirection, DepgraphCapabilitySet, DepgraphService,
     DepgraphServiceConfig, DepgraphServiceError, DepgraphServiceLimits, DoctorRequest,
-    ExplainPathRequest, ImpactRequest, ProfilePlanRequest, RepositoryRelativePath,
-    RuntimeValidateRequest, ServiceSnapshotSelector, SnapshotLocator, SnapshotReadRequest,
-    UnresolvedRequest,
+    ExplainPathRequest, GraphExportFormat, GraphExportRequest, ImpactRequest,
+    MAX_GRAPH_EXPORT_EDGES, MAX_GRAPH_EXPORT_NODES, PolicyEvaluateRequest, ProfilePlanRequest,
+    RepositoryRelativePath, RuntimeValidateRequest, ServiceSnapshotSelector, SnapshotDiffFilters,
+    SnapshotDiffRequest, SnapshotLocator, SnapshotReadRequest, UnresolvedRequest,
 };
 use depgraph_core::{
     BoundedQueryExecutionError, BoundedQueryPlan, BoundedQueryResult, BuildAudit, BuildOutcomeKind,
     CancellationToken, Config, CycleLevel, DEFAULT_INTERACTIVE_QUERY_MAX_BYTES,
     DEFAULT_INTERACTIVE_QUERY_MAX_ITEMS, DEFAULT_INTERACTIVE_QUERY_MAX_TRAVERSAL, DaemonStatus,
     ExportFormat, GraphQueryFilter, ImpactFilters, ImpactResult, InteractiveQueryPage,
-    InteractiveQueryPageRequest, PolicyAnnotation, PolicyResult, QueryDiagnostic,
-    QueryFailureClass, RepositoryProfilePlanPreview, ScanCacheMode, TraversalPageItem,
-    TypedProjection, UnresolvedResult, acquire_store_writer_lock, build_cache_key,
-    compiler_precise_cache_hit_audit, compiler_precise_cache_key, compiler_precise_graph_ndjson,
-    create_build_execution_request, create_compiler_precise_invocation_request,
-    create_compiler_precise_unit_graph_request, default_store_path, evaluate_policy_diff,
-    execute_build_request_with_cancellation, export_filtered, export_graphml_filtered_to_writer,
-    init_config, match_runtime_trace, open_store, paginate_interactive_query, policy_annotations,
-    prepare_build_cache_input, prepare_compiler_precise_cache_input,
+    InteractiveQueryPageRequest, PolicyAnnotation, QueryDiagnostic, QueryFailureClass,
+    RepositoryProfilePlanPreview, ScanCacheMode, TraversalPageItem, TypedProjection,
+    UnresolvedResult, acquire_store_writer_lock, build_cache_key, compiler_precise_cache_hit_audit,
+    compiler_precise_cache_key, compiler_precise_graph_ndjson, create_build_execution_request,
+    create_compiler_precise_invocation_request, create_compiler_precise_unit_graph_request,
+    default_store_path, execute_build_request_with_cancellation, export_filtered,
+    export_graphml_filtered_to_writer, init_config, match_runtime_trace, open_store,
+    paginate_interactive_query, prepare_build_cache_input, prepare_compiler_precise_cache_input,
     profile_selection_human_summary, read_compiler_pack_requirement, read_runtime_trace,
     render_condition, render_github_annotations, run_scan_with_cache_mode, runtime_session_delta,
     rust_build_protocol_ndjson, snapshot_profile_plan_id, stage_build_evidence,
@@ -44,7 +44,7 @@ use serde::Serialize;
 
 mod snapshot_diff;
 
-use snapshot_diff::{DiffCommandData, DiffFilters, render_human_diff};
+use snapshot_diff::render_service_human_diff;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -536,14 +536,6 @@ struct SnapshotView {
     profile_ids: Vec<String>,
     created_at: String,
     coverage: CoverageRecord,
-}
-
-#[derive(Serialize)]
-struct PolicyCommandData<'a> {
-    from_snapshot_id: &'a str,
-    to_snapshot_id: &'a str,
-    result: &'a PolicyResult,
-    annotations: &'a [PolicyAnnotation],
 }
 
 #[derive(Debug)]
@@ -2009,26 +2001,28 @@ async fn run(cli: Cli) -> Result<u8> {
             phase,
             status,
         } => {
-            let filters = DiffFilters::new(kind, profile, phase, status)?;
+            let filters = snapshot_diff::DiffFilters::new(kind, profile, phase, status)?;
+            let filters = SnapshotDiffFilters::try_new(
+                filters.kind,
+                filters.profile,
+                filters.phase,
+                filters.status,
+            )?;
             let root = std::env::current_dir()?;
             let store_path = store_path(cli.store, &root)?;
-            let store = open_store(&store_path)?;
-            let from_snapshot_id = store.resolve_completed_snapshot_selector(&from)?;
-            let to_snapshot_id = store.resolve_completed_snapshot_selector(&to)?;
-            let diff =
-                filters.apply(store.diff_completed_snapshots(&from_snapshot_id, &to_snapshot_id)?);
+            let service = snapshot_read_service(&root, &store_path)?;
+            let request = SnapshotDiffRequest::new(
+                SnapshotLocator::parse(&from)?,
+                SnapshotLocator::parse(&to)?,
+                filters,
+            );
+            let diff = service
+                .snapshot_diff(&request, &CancellationToken::new())
+                .context("snapshot selector resolution failed")?;
             if json {
-                let output = DiffCommandData::new(&diff, &filters);
-                print_snapshot_json("diff", &output)?;
-            } else if diff.is_empty() {
-                print!("{}", render_human_diff(&diff, &filters, None, None));
+                print_snapshot_json("diff", &diff)?;
             } else {
-                let from_snapshot = store.load_completed_snapshot(&from_snapshot_id)?;
-                let to_snapshot = store.load_completed_snapshot(&to_snapshot_id)?;
-                print!(
-                    "{}",
-                    render_human_diff(&diff, &filters, Some(&from_snapshot), Some(&to_snapshot),)
-                );
+                print!("{}", render_service_human_diff(&diff));
             }
             Ok(0)
         }
@@ -2039,30 +2033,35 @@ async fn run(cli: Cli) -> Result<u8> {
             github_annotations,
         } => {
             let root = canonical_directory(std::env::current_dir()?)?;
-            let config = Config::load(&root)?;
             let store_path = store_path(cli.store, &root)?;
-            let store = open_store(&store_path)?;
-            let from_snapshot_id = store.resolve_completed_snapshot_selector(&from)?;
-            let to_snapshot_id = store.resolve_completed_snapshot_selector(&to)?;
-            let from_snapshot = store.load_completed_snapshot(&from_snapshot_id)?;
-            let to_snapshot = store.load_completed_snapshot(&to_snapshot_id)?;
-            let result = evaluate_policy_diff(
-                &from_snapshot_id,
-                &from_snapshot,
-                &to_snapshot_id,
-                &to_snapshot,
-                &config.policy,
-            )?;
-            let annotations = policy_annotations(&result)?;
+            let service = snapshot_read_service(&root, &store_path)?;
+            let request = PolicyEvaluateRequest::new(
+                SnapshotLocator::parse(&from)?,
+                SnapshotLocator::parse(&to)?,
+            );
+            let output = service
+                .policy_evaluate(&request, &CancellationToken::new())
+                .context("snapshot selector resolution failed")?;
+            let result = &output.result;
             if github_annotations {
+                let annotations = output
+                    .annotations
+                    .iter()
+                    .map(|annotation| PolicyAnnotation {
+                        violation_id: annotation.violation_id.clone(),
+                        rule_id: annotation.rule_id.clone(),
+                        level: annotation.level,
+                        path: annotation.path.clone(),
+                        start_line: annotation.start_line,
+                        start_column: annotation.start_column,
+                        end_line: annotation.end_line,
+                        end_column: annotation.end_column,
+                        title: annotation.title.clone(),
+                        message: annotation.message.clone(),
+                    })
+                    .collect::<Vec<_>>();
                 print!("{}", render_github_annotations(&annotations));
             } else if json {
-                let output = PolicyCommandData {
-                    from_snapshot_id: &from_snapshot_id,
-                    to_snapshot_id: &to_snapshot_id,
-                    result: &result,
-                    annotations: &annotations,
-                };
                 print_snapshot_json("policy", &output)?;
             } else {
                 println!(
@@ -2114,7 +2113,6 @@ async fn run(cli: Cli) -> Result<u8> {
             session,
             environment,
         } => {
-            let (snapshot, _) = load_snapshot(cli.store, cli.scan_id.as_deref(), false)?;
             let filter = GraphQueryFilter::new(phase, profile, session, environment)?;
             let format = match format {
                 ExportFormatArg::Json => ExportFormat::Json,
@@ -2122,6 +2120,48 @@ async fn run(cli: Cli) -> Result<u8> {
                 ExportFormatArg::Mermaid => ExportFormat::Mermaid,
                 ExportFormatArg::Graphml => ExportFormat::Graphml,
             };
+            if output.is_none() {
+                let root = canonical_directory(std::env::current_dir()?)?;
+                let store_path = store_path(cli.store.clone(), &root)?;
+                let service = snapshot_read_service(&root, &store_path)?;
+                let snapshot = if let Some(scan_id) = cli.scan_id.as_deref() {
+                    match service
+                        .start_snapshot_request_for_scan(scan_id, &CancellationToken::new())
+                    {
+                        Ok(pinned) => Some(SnapshotLocator::StableId(
+                            pinned.snapshot_id().as_str().to_owned(),
+                        )),
+                        // Explicit failed or partial scans remain inspectable through the legacy
+                        // CLI-only projection. Agent-facing reads never enter this path.
+                        Err(DepgraphServiceError::Integrity | DepgraphServiceError::NotFound) => {
+                            None
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
+                } else {
+                    Some(SnapshotLocator::Current)
+                };
+                if let Some(snapshot) = snapshot {
+                    let service_format = match format {
+                        ExportFormat::Json => GraphExportFormat::Json,
+                        ExportFormat::Dot => GraphExportFormat::Dot,
+                        ExportFormat::Mermaid => GraphExportFormat::Mermaid,
+                        ExportFormat::Graphml => GraphExportFormat::Graphml,
+                    };
+                    let request = GraphExportRequest::try_new(
+                        snapshot,
+                        service_format,
+                        None,
+                        filter.clone(),
+                        MAX_GRAPH_EXPORT_NODES,
+                        MAX_GRAPH_EXPORT_EDGES,
+                    )?;
+                    let rendered = service.graph_export(&request, &CancellationToken::new())?;
+                    print!("{}", rendered.content);
+                    return Ok(0);
+                }
+            }
+            let (snapshot, _) = load_snapshot(cli.store, cli.scan_id.as_deref(), false)?;
             if format == ExportFormat::Graphml {
                 if let Some(path) = output {
                     write_file_atomically(&path, |writer| {

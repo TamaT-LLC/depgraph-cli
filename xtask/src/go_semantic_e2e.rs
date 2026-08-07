@@ -368,7 +368,22 @@ impl Runner<'_> {
     }
 
     fn export_json(&self, store: &Path) -> Result<Value> {
-        self.query(store, &["export", "--format", "json"])
+        let output_path = store.with_extension("export.json");
+        let mut command = self.command();
+        command
+            .arg("--store")
+            .arg(store)
+            .args(["export", "--format", "json", "--output"])
+            .arg(&output_path);
+        checked_output(&mut command, "export the graph as json")?;
+        let bytes = std::fs::read(&output_path)
+            .with_context(|| format!("read JSON export {}", output_path.display()))?;
+        serde_json::from_slice(&bytes).with_context(|| {
+            format!(
+                "JSON export file {} contained invalid JSON",
+                output_path.display()
+            )
+        })
     }
 
     fn export_text(&self, store: &Path, format: &str) -> Result<String> {
@@ -1405,7 +1420,7 @@ fn visual_edge_label(edge: &Value) -> Result<String> {
         required_str(edge, "resolution_status", "semantic edge")?,
         required_str(edge, "precision", "semantic edge")?,
         required_str(edge, "profile_id", "semantic edge")?,
-        required_str(edge, "condition_text", "semantic edge")?
+        required_str(edge, "environment", "semantic edge")?
     ))
 }
 

@@ -1,9 +1,16 @@
+#![cfg_attr(not(test), allow(dead_code))]
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt::Write as _,
 };
 
 use anyhow::{Result, bail};
+use depgraph_core::service::{
+    ClosedChangedRecord, ClosedRecordDiff, SnapshotDiffCoverage, SnapshotDiffEdge,
+    SnapshotDiffEvidence, SnapshotDiffNode, SnapshotDiffProfile, SnapshotDiffResult,
+    SnapshotDiffSite,
+};
 use depgraph_store::{
     ChangedRecord, CoverageRecord, EdgeRecord, EvidenceRecord, GraphSnapshot, GraphSnapshotDiff,
     NodeRecord, NodeRename, ProfileRecord, RecordDiff, RenameConfidence, SiteRecord,
@@ -277,44 +284,6 @@ fn rename_summary(renames: &[NodeRename], candidates: &[NodeRename]) -> RenameSu
         }
     }
     summary
-}
-
-#[derive(Serialize)]
-pub(crate) struct DiffCommandData<'a> {
-    pub from_snapshot_id: &'a str,
-    pub to_snapshot_id: &'a str,
-    pub filters: &'a DiffFilters,
-    pub summary: DiffSummary,
-    pub nodes: &'a RecordDiff<NodeRecord>,
-    pub sites: &'a RecordDiff<SiteRecord>,
-    pub edges: &'a RecordDiff<EdgeRecord>,
-    pub evidence: &'a RecordDiff<EvidenceRecord>,
-    pub profiles: &'a RecordDiff<ProfileRecord>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub coverage: Option<&'a ChangedRecord<CoverageRecord>>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub renames: &'a Vec<NodeRename>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub rename_candidates: &'a Vec<NodeRename>,
-}
-
-impl<'a> DiffCommandData<'a> {
-    pub(crate) fn new(diff: &'a GraphSnapshotDiff, filters: &'a DiffFilters) -> Self {
-        Self {
-            from_snapshot_id: &diff.from_snapshot_id,
-            to_snapshot_id: &diff.to_snapshot_id,
-            filters,
-            summary: DiffSummary::new(diff),
-            nodes: &diff.nodes,
-            sites: &diff.sites,
-            edges: &diff.edges,
-            evidence: &diff.evidence,
-            profiles: &diff.profiles,
-            coverage: diff.coverage.as_ref(),
-            renames: &diff.renames,
-            rename_candidates: &diff.rename_candidates,
-        }
-    }
 }
 
 #[derive(Default)]
@@ -750,6 +719,291 @@ fn write_evidence(output: &mut String, prefix: &str, label: &str, evidence: &Evi
     .expect("writing to String cannot fail");
 }
 
+pub(crate) fn render_service_human_diff(diff: &SnapshotDiffResult) -> String {
+    let mut output = String::new();
+    writeln!(
+        output,
+        "diff: {} -> {}",
+        diff.from_snapshot_id, diff.to_snapshot_id
+    )
+    .expect("writing to String cannot fail");
+    if !diff.filters.is_empty() {
+        writeln!(
+            output,
+            "filters: kind={} profile={} phase={} status={}",
+            display_filter_values(diff.filters.kinds()),
+            display_filter_values(diff.filters.profiles()),
+            display_filter_values(diff.filters.phases()),
+            display_filter_values(diff.filters.statuses()),
+        )
+        .expect("writing to String cannot fail");
+    }
+    writeln!(output, "empty: {}", diff.summary.empty).expect("writing to String cannot fail");
+    writeln!(output, "total changes: {}", diff.summary.total_changes)
+        .expect("writing to String cannot fail");
+    for (label, summary) in [
+        ("nodes", diff.summary.nodes),
+        ("sites", diff.summary.sites),
+        ("edges", diff.summary.edges),
+        ("evidence", diff.summary.evidence),
+        ("profiles", diff.summary.profiles),
+    ] {
+        writeln!(
+            output,
+            "{label}: +{} -{} ~{}",
+            summary.added, summary.removed, summary.changed
+        )
+        .expect("writing to String cannot fail");
+    }
+    writeln!(
+        output,
+        "coverage: {}",
+        if !diff.filters.is_empty() {
+            "excluded by filters"
+        } else if diff.summary.coverage_changed {
+            "changed"
+        } else {
+            "unchanged"
+        }
+    )
+    .expect("writing to String cannot fail");
+    writeln!(
+        output,
+        "renames: {} confirmed, {} candidates (exact={}, high={}, medium={}, ambiguous={})",
+        diff.summary.renames.confirmed,
+        diff.summary.renames.candidates,
+        diff.summary.renames.exact,
+        diff.summary.renames.high,
+        diff.summary.renames.medium,
+        diff.summary.renames.ambiguous,
+    )
+    .expect("writing to String cannot fail");
+
+    write_service_nodes(&mut output, &diff.nodes);
+    write_service_sites(&mut output, &diff.sites);
+    write_service_edges(&mut output, &diff.edges);
+    write_service_profiles(&mut output, &diff.profiles);
+    write_service_coverage(&mut output, diff.coverage.as_ref());
+    for (heading, marker, renames) in [
+        ("renamed nodes", "R", diff.renames.as_slice()),
+        ("rename candidates", "?", diff.rename_candidates.as_slice()),
+    ] {
+        if !renames.is_empty() {
+            writeln!(output, "{heading}:").expect("writing to String cannot fail");
+            for rename in renames {
+                writeln!(
+                    output,
+                    "  {marker} [{}; {}] {} -> {} fields={}",
+                    rename.kind,
+                    rename_confidence(rename.confidence),
+                    rename.old_id,
+                    rename.new_id,
+                    rename.changed_fields.join(","),
+                )
+                .expect("writing to String cannot fail");
+            }
+        }
+    }
+    write_service_evidence_changes(&mut output, &diff.evidence);
+    output
+}
+
+fn write_service_nodes(output: &mut String, records: &ClosedRecordDiff<SnapshotDiffNode>) {
+    if records.added.is_empty() && records.removed.is_empty() && records.changed.is_empty() {
+        return;
+    }
+    output.push_str("node changes:\n");
+    for (marker, values) in [("+", &records.added), ("-", &records.removed)] {
+        for record in values {
+            writeln!(
+                output,
+                "  {marker} [{}] {} {:?}",
+                record.kind, record.id, record.display_name
+            )
+            .expect("writing to String cannot fail");
+        }
+    }
+    for record in &records.changed {
+        writeln!(
+            output,
+            "  ~ [{}] {} fields={} {:?} -> {:?}",
+            record.after.kind,
+            record.id,
+            record.changed_fields.join(","),
+            record.before.display_name,
+            record.after.display_name,
+        )
+        .expect("writing to String cannot fail");
+    }
+}
+
+fn write_service_sites(output: &mut String, records: &ClosedRecordDiff<SnapshotDiffSite>) {
+    if records.added.is_empty() && records.removed.is_empty() && records.changed.is_empty() {
+        return;
+    }
+    output.push_str("site changes:\n");
+    for (marker, values) in [("+", &records.added), ("-", &records.removed)] {
+        for record in values {
+            write_service_site(output, marker, record, &[]);
+        }
+    }
+    for record in &records.changed {
+        write_service_site(output, "~", &record.after, &record.changed_fields);
+    }
+}
+
+fn write_service_site(
+    output: &mut String,
+    marker: &str,
+    record: &SnapshotDiffSite,
+    fields: &[String],
+) {
+    let fields = if fields.is_empty() {
+        String::new()
+    } else {
+        format!(" fields={}", fields.join(","))
+    };
+    writeln!(
+        output,
+        "  {marker} [{}] {} source={} profile={} status={} targets={}{}",
+        record.kind,
+        record.id,
+        record.source,
+        record.profile_id,
+        record.resolution_status,
+        display_list(&record.target_ids),
+        fields,
+    )
+    .expect("writing to String cannot fail");
+}
+
+fn write_service_edges(output: &mut String, records: &ClosedRecordDiff<SnapshotDiffEdge>) {
+    if records.added.is_empty() && records.removed.is_empty() && records.changed.is_empty() {
+        return;
+    }
+    output.push_str("edge changes:\n");
+    for (marker, values) in [("+", &records.added), ("-", &records.removed)] {
+        for record in values {
+            write_service_edge(output, marker, record, &[]);
+        }
+    }
+    for record in &records.changed {
+        write_service_edge(output, "~", &record.after, &record.changed_fields);
+    }
+}
+
+fn write_service_edge(
+    output: &mut String,
+    marker: &str,
+    record: &SnapshotDiffEdge,
+    fields: &[String],
+) {
+    let fields = if fields.is_empty() {
+        String::new()
+    } else {
+        format!(" fields={}", fields.join(","))
+    };
+    writeln!(
+        output,
+        "  {marker} [{}] {} {} -> {} phase={} profile={} status={}{}",
+        record.kind,
+        record.id,
+        record.source,
+        record.target,
+        record.phase,
+        record.profile_id,
+        record.resolution_status,
+        fields,
+    )
+    .expect("writing to String cannot fail");
+}
+
+fn write_service_profiles(output: &mut String, records: &ClosedRecordDiff<SnapshotDiffProfile>) {
+    if records.added.is_empty() && records.removed.is_empty() && records.changed.is_empty() {
+        return;
+    }
+    output.push_str("profile changes:\n");
+    for (marker, values) in [("+", &records.added), ("-", &records.removed)] {
+        for record in values {
+            writeln!(
+                output,
+                "  {marker} {} language={}",
+                record.id, record.language
+            )
+            .expect("writing to String cannot fail");
+        }
+    }
+    for record in &records.changed {
+        writeln!(
+            output,
+            "  ~ {} language={} fields={}",
+            record.id,
+            record.after.language,
+            record.changed_fields.join(","),
+        )
+        .expect("writing to String cannot fail");
+    }
+}
+
+fn write_service_coverage(
+    output: &mut String,
+    coverage: Option<&ClosedChangedRecord<SnapshotDiffCoverage>>,
+) {
+    let Some(coverage) = coverage else {
+        return;
+    };
+    output.push_str("coverage change:\n");
+    writeln!(output, "  ~ fields={}", coverage.changed_fields.join(","))
+        .expect("writing to String cannot fail");
+}
+
+fn write_service_evidence_changes(
+    output: &mut String,
+    records: &ClosedRecordDiff<SnapshotDiffEvidence>,
+) {
+    if records.added.is_empty() && records.removed.is_empty() && records.changed.is_empty() {
+        return;
+    }
+    output.push_str("evidence changes:\n");
+    for (marker, values) in [("+", &records.added), ("-", &records.removed)] {
+        for record in values {
+            write_service_evidence(output, marker, record);
+        }
+    }
+    for record in &records.changed {
+        writeln!(
+            output,
+            "  ~ {}:{}#{} fields={}",
+            record.after.owner_type,
+            record.after.owner_id,
+            record.after.ordinal,
+            record.changed_fields.join(","),
+        )
+        .expect("writing to String cannot fail");
+        write_service_evidence(output, "before", &record.before);
+        write_service_evidence(output, "after", &record.after);
+    }
+}
+
+fn write_service_evidence(output: &mut String, label: &str, evidence: &SnapshotDiffEvidence) {
+    writeln!(
+        output,
+        "  {label} evidence: {}:{}#{} [{} {}@{}] {}:{}:{}-{}:{}",
+        evidence.owner_type,
+        evidence.owner_id,
+        evidence.ordinal,
+        evidence.kind,
+        evidence.extractor,
+        evidence.extractor_version,
+        evidence.path,
+        evidence.start_line,
+        evidence.start_column,
+        evidence.end_line,
+        evidence.end_column,
+    )
+    .expect("writing to String cannot fail");
+}
+
 #[cfg(test)]
 mod tests {
     use depgraph_store::{GraphSnapshotDiff, RenameConfidence};
@@ -782,6 +1036,47 @@ mod tests {
             condition: json!({"op":"all","conditions":[]}),
             generated: false,
         }
+    }
+
+    fn service_evidence(path: &str, extractor: &str, line: u64) -> SnapshotDiffEvidence {
+        SnapshotDiffEvidence {
+            owner_type: "edge".to_owned(),
+            owner_id: "edge:changed".to_owned(),
+            ordinal: 0,
+            kind: "semantic".to_owned(),
+            extractor: extractor.to_owned(),
+            extractor_version: "1.0".to_owned(),
+            path: path.to_owned(),
+            start_line: line,
+            start_column: 1,
+            end_line: line,
+            end_column: 8,
+        }
+    }
+
+    #[test]
+    fn service_human_output_preserves_both_sides_of_changed_evidence() {
+        let records = ClosedRecordDiff {
+            added: Vec::new(),
+            removed: Vec::new(),
+            changed: vec![ClosedChangedRecord {
+                id: "edge:edge:changed#0".to_owned(),
+                changed_fields: vec!["path".to_owned(), "extractor".to_owned()],
+                before: service_evidence("src/before.rs", "before-extractor", 3),
+                after: service_evidence("src/after.rs", "after-extractor", 7),
+            }],
+        };
+        let mut rendered = String::new();
+
+        write_service_evidence_changes(&mut rendered, &records);
+
+        assert!(rendered.contains("fields=path,extractor"));
+        assert!(rendered.contains(
+            "before evidence: edge:edge:changed#0 [semantic before-extractor@1.0] src/before.rs:3:1-3:8"
+        ));
+        assert!(rendered.contains(
+            "after evidence: edge:edge:changed#0 [semantic after-extractor@1.0] src/after.rs:7:1-7:8"
+        ));
     }
 
     #[test]

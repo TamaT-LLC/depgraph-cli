@@ -1675,14 +1675,16 @@ fn runtime_import_is_atomic_deduplicated_queryable_and_deterministic() {
     assert!(export_first.status.success());
     assert_eq!(export_first.stdout, export_second.stdout);
     let exported: serde_json::Value = serde_json::from_slice(&export_first.stdout).unwrap();
-    assert_eq!(exported["graph"]["edges"].as_array().unwrap().len(), 3);
-    assert_eq!(exported["graph"]["evidence"].as_array().unwrap().len(), 6);
+    assert_eq!(exported["schema_version"], "depgraph-agent-graph-export-v1");
+    assert_eq!(exported["edges"].as_array().unwrap().len(), 3);
+    assert!(exported.get("graph").is_none());
+    assert!(exported.get("evidence").is_none());
     assert!(
-        exported["graph"]["edges"]
+        exported["edges"]
             .as_array()
             .unwrap()
             .iter()
-            .all(|edge| edge["phase"] == "runtime")
+            .all(|edge| edge["phase"] == "runtime" && edge.get("properties").is_none())
     );
     for format in ["dot", "mermaid", "graphml"] {
         let render = || {
@@ -1710,7 +1712,8 @@ fn runtime_import_is_atomic_deduplicated_queryable_and_deterministic() {
         if format == "graphml" {
             assert!(rendered.contains("<graphml xmlns="));
             assert!(rendered.contains("<data key=\"e_phase\">runtime</data>"));
-            assert!(rendered.contains("<data key=\"g_evidence_json\">"));
+            assert!(!rendered.contains("evidence_json"));
+            assert!(!rendered.contains("properties_json"));
         } else {
             assert!(rendered.contains("[runtime;"));
         }
@@ -3172,7 +3175,22 @@ fn consented_build_mode_runs_project_code_only_in_the_supervised_staging_area() 
     assert!(doctor["latest_attempt"]["profile_matrix"]["phase_coverage"]["static"].is_object());
     assert!(doctor["latest_attempt"]["profile_matrix"]["phase_coverage"]["build"].is_object());
 
-    let exported = run_json(&["export", "--format", "json"]);
+    let legacy_export_path = root.path().join("profile-matrix-export.json");
+    Command::cargo_bin("depgraph")
+        .unwrap()
+        .args([
+            "--store",
+            store_path.to_str().unwrap(),
+            "export",
+            "--format",
+            "json",
+            "--output",
+            legacy_export_path.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    let exported: serde_json::Value =
+        serde_json::from_slice(&fs::read(&legacy_export_path).unwrap()).unwrap();
     assert_eq!(
         exported["graph"]["profile_matrix"]["schema_version"],
         "profile-matrix-v1"
@@ -5374,8 +5392,16 @@ fn semantic_selectors_cycles_and_query_evidence_are_exposed() {
     assert_eq!(why["data"]["steps"][0]["edge"]["phase"], "semantic");
     assert_eq!(why["data"]["steps"][0]["evidence"][0]["kind"], "semantic");
 
-    let exported = query(&["export", "--format", "json"]);
-    let exported: serde_json::Value = serde_json::from_slice(&exported.stdout).unwrap();
+    let legacy_export_path = root.path().join("semantic-evidence-export.json");
+    query(&[
+        "export",
+        "--format",
+        "json",
+        "--output",
+        legacy_export_path.to_str().unwrap(),
+    ]);
+    let exported: serde_json::Value =
+        serde_json::from_slice(&fs::read(&legacy_export_path).unwrap()).unwrap();
     let semantic_edges = exported["graph"]["edges"]
         .as_array()
         .unwrap()

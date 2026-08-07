@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, fmt::Write, io};
+use std::{collections::BTreeMap, io};
 
 use anyhow::Result;
 use depgraph_store::{GraphSnapshot, refresh_profile_matrix_view};
@@ -36,6 +36,27 @@ pub fn export_filtered(
     }
     let filtered = filter_snapshot(snapshot, filter);
     export(&filtered, format)
+}
+
+pub fn export_filtered_to_writer<W: io::Write>(
+    snapshot: &GraphSnapshot,
+    format: ExportFormat,
+    filter: &GraphQueryFilter,
+    writer: &mut W,
+) -> Result<()> {
+    let filtered;
+    let snapshot = if filter.is_empty() {
+        snapshot
+    } else {
+        filtered = filter_snapshot(snapshot, filter);
+        &filtered
+    };
+    match format {
+        ExportFormat::Json => write_json(snapshot, writer),
+        ExportFormat::Dot => write_dot(snapshot, writer),
+        ExportFormat::Mermaid => write_mermaid(snapshot, writer),
+        ExportFormat::Graphml => crate::graphml::write_graphml(snapshot, writer),
+    }
 }
 
 pub fn export_graphml_filtered_to_writer<W: io::Write>(
@@ -141,6 +162,12 @@ pub fn filter_snapshot(snapshot: &GraphSnapshot, filter: &GraphQueryFilter) -> G
 }
 
 fn export_json(snapshot: &GraphSnapshot) -> Result<String> {
+    let mut output = Vec::new();
+    write_json(snapshot, &mut output)?;
+    Ok(String::from_utf8(output)?)
+}
+
+fn write_json<W: io::Write>(snapshot: &GraphSnapshot, writer: &mut W) -> Result<()> {
     let mut sites = serde_json::to_value(&snapshot.sites)?;
     for site in sites.as_array_mut().into_iter().flatten() {
         if let Some(object) = site.as_object_mut()
@@ -166,34 +193,44 @@ fn export_json(snapshot: &GraphSnapshot) -> Result<String> {
     // Attempt identity, timestamps, absolute checkout roots, and worker logs
     // deliberately stay in `doctor`/the evidence store. This content envelope
     // is reproducible across scans of the same repository state.
-    Ok(serde_json::to_string_pretty(&serde_json::json!({
-        "schema_version":"1.0",
-        "command":"export",
-        "graph":{
-            "profiles":snapshot.profiles,
-            "nodes":snapshot.nodes,
-            "sites":sites,
-            "edges":edges,
-            "evidence":snapshot.evidence,
-            "diagnostics":snapshot.diagnostics,
-            "file_coverage":snapshot.file_coverage,
-            "coverage":snapshot.coverage,
-            "profile_matrix":snapshot.profile_matrix,
-        }
-    }))?)
+    serde_json::to_writer_pretty(
+        writer,
+        &serde_json::json!({
+            "schema_version":"1.0",
+            "command":"export",
+            "graph":{
+                "profiles":snapshot.profiles,
+                "nodes":snapshot.nodes,
+                "sites":sites,
+                "edges":edges,
+                "evidence":snapshot.evidence,
+                "diagnostics":snapshot.diagnostics,
+                "file_coverage":snapshot.file_coverage,
+                "coverage":snapshot.coverage,
+                "profile_matrix":snapshot.profile_matrix,
+            }
+        }),
+    )?;
+    Ok(())
 }
 
 fn export_dot(snapshot: &GraphSnapshot) -> String {
-    let mut output = String::from("digraph depgraph {\n  rankdir=LR;\n");
+    let mut output = Vec::new();
+    write_dot(snapshot, &mut output).expect("writing a graph export to memory cannot fail");
+    String::from_utf8(output).expect("DOT export is UTF-8")
+}
+
+fn write_dot<W: io::Write>(snapshot: &GraphSnapshot, output: &mut W) -> Result<()> {
+    output.write_all(b"digraph depgraph {\n  rankdir=LR;\n")?;
     let observation_status = edge_observation_status(snapshot);
     for node in &snapshot.nodes {
-        let _ = writeln!(
+        writeln!(
             output,
             "  \"{}\" [label=\"{}\\n({})\"];",
             dot_escape(&node.id),
             dot_escape(&node.display_name),
             dot_escape(&node.kind)
-        );
+        )?;
     }
     for edge in &snapshot.edges {
         let observed = observation_status
@@ -210,28 +247,34 @@ fn export_dot(snapshot: &GraphSnapshot) -> String {
             render_condition(&edge.condition),
             observed,
         );
-        let _ = writeln!(
+        writeln!(
             output,
             "  \"{}\" -> \"{}\" [label=\"{}\"];",
             dot_escape(&edge.source),
             dot_escape(&edge.target),
             dot_escape(&label)
-        );
+        )?;
     }
-    output.push_str("}\n");
-    output
+    output.write_all(b"}\n")?;
+    Ok(())
 }
 
 fn export_mermaid(snapshot: &GraphSnapshot) -> String {
-    let mut output = String::from("flowchart LR\n");
+    let mut output = Vec::new();
+    write_mermaid(snapshot, &mut output).expect("writing a graph export to memory cannot fail");
+    String::from_utf8(output).expect("Mermaid export is UTF-8")
+}
+
+fn write_mermaid<W: io::Write>(snapshot: &GraphSnapshot, output: &mut W) -> Result<()> {
+    output.write_all(b"flowchart LR\n")?;
     let observation_status = edge_observation_status(snapshot);
     for (index, node) in snapshot.nodes.iter().enumerate() {
-        let _ = writeln!(
+        writeln!(
             output,
             "  n{index}[\"{}\\n({})\"]",
             mermaid_escape(&node.display_name),
             mermaid_escape(&node.kind)
-        );
+        )?;
     }
     let indexes = snapshot
         .nodes
@@ -248,7 +291,7 @@ fn export_mermaid(snapshot: &GraphSnapshot) -> String {
                 .get(edge.id.as_str())
                 .map(|status| format!("; observed={status}"))
                 .unwrap_or_default();
-            let _ = writeln!(
+            writeln!(
                 output,
                 "  n{source} -->|\"{} [{}; {}; {}; {}; {}{}]\"| n{target}",
                 mermaid_escape(&edge.kind),
@@ -258,10 +301,10 @@ fn export_mermaid(snapshot: &GraphSnapshot) -> String {
                 mermaid_escape(&edge.profile_id),
                 mermaid_escape(&render_condition(&edge.condition)),
                 mermaid_escape(&observed)
-            );
+            )?;
         }
     }
-    output
+    Ok(())
 }
 
 fn edge_observation_status(snapshot: &GraphSnapshot) -> BTreeMap<&str, &str> {

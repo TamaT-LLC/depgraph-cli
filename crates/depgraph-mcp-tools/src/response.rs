@@ -21,13 +21,14 @@ use crate::dto::{AgentImpactProjection, ImpactProjectionFailure};
 use crate::{
     AgentCapability, AgentCompletedSnapshot, AgentContext, AgentCycle, AgentDaemonStatus,
     AgentDependenciesResponse, AgentDoctor, AgentEdge, AgentError, AgentErrorCode,
-    AgentErrorDetails, AgentEvidence, AgentImpact, AgentImpactResponse, AgentNamedSnapshot,
-    AgentNode, AgentNodeSummary, AgentPathResponse, AgentPathStep, AgentProfilePlan, AgentQueryRow,
-    AgentRemediation, AgentResourceLimit, AgentRuntimeTraceEvent, AgentRuntimeValidationResponse,
-    AgentSite, AgentSnapshot, AgentUnresolved, CanonicalJsonError, ContractBuildError, Cursor,
-    DurableSubmitResult, ErrorEnvelope, LogicalRepositoryId, MAX_PAGE_BYTES, MAX_PAGE_ITEMS,
-    MCP_TOOLS_CONTRACT_VERSION, OperationAccepted, Page, PageRequest, SnapshotId, SuccessEnvelope,
-    TaskAccepted, canonical_json_bytes,
+    AgentErrorDetails, AgentEvidence, AgentGraphExportResponse, AgentImpact, AgentImpactResponse,
+    AgentNamedSnapshot, AgentNode, AgentNodeSummary, AgentPathResponse, AgentPathStep,
+    AgentPolicyEvaluationResponse, AgentProfilePlan, AgentQueryRow, AgentRemediation,
+    AgentResourceLimit, AgentRuntimeTraceEvent, AgentRuntimeValidationResponse, AgentSite,
+    AgentSnapshot, AgentSnapshotDiffResponse, AgentUnresolved, CanonicalJsonError,
+    ContractBuildError, Cursor, DurableSubmitResult, ErrorEnvelope, LogicalRepositoryId,
+    MAX_PAGE_BYTES, MAX_PAGE_ITEMS, MCP_TOOLS_CONTRACT_VERSION, OperationAccepted, Page,
+    PageRequest, SnapshotId, SuccessEnvelope, TaskAccepted, canonical_json_bytes,
 };
 
 const CURSOR_VERSION: &str = "v1";
@@ -79,6 +80,9 @@ public_result!(
     AgentRuntimeValidationResponse,
     AgentSite,
     AgentSnapshot,
+    AgentSnapshotDiffResponse,
+    AgentPolicyEvaluationResponse,
+    AgentGraphExportResponse,
     DurableSubmitResult,
     OperationAccepted,
     TaskAccepted,
@@ -140,6 +144,31 @@ impl CanonicalResponseMapper {
             Err(ResponseMappingError::OutputTooLarge) => Self::error(&ErrorEnvelope::new(
                 envelope.repository_id().clone(),
                 resource_error(AgentResourceLimit::OutputBytes, u64::from(MAX_PAGE_BYTES)),
+            )),
+            mapped => mapped,
+        }
+    }
+
+    /// Maps an inline graph export while preserving file-export remediation if
+    /// the final public envelope exceeds the MCP byte limit.
+    pub fn export_success<T>(
+        envelope: &SuccessEnvelope<T>,
+    ) -> Result<MappedToolResult, ResponseMappingError>
+    where
+        T: PublicToolResult,
+    {
+        match map_envelope(envelope, false, MAX_PAGE_BYTES as usize) {
+            Err(ResponseMappingError::OutputTooLarge) => Self::error(&ErrorEnvelope::new(
+                envelope.repository_id().clone(),
+                AgentError::new(
+                    AgentErrorCode::ResourceExhausted,
+                    false,
+                    AgentRemediation::ExportFile,
+                    Some(AgentErrorDetails::ResourceLimit {
+                        limit: AgentResourceLimit::OutputBytes,
+                        maximum: u64::from(MAX_PAGE_BYTES),
+                    }),
+                ),
             )),
             mapped => mapped,
         }
@@ -270,7 +299,8 @@ fn map_service_error(source: &DepgraphServiceError) -> AgentError {
         | DepgraphServiceError::ProfilePlan { .. }
         | DepgraphServiceError::GraphQuery { .. }
         | DepgraphServiceError::BoundedQueryInput { .. }
-        | DepgraphServiceError::RuntimeTraceInput { .. } => AgentError::new(
+        | DepgraphServiceError::RuntimeTraceInput { .. }
+        | DepgraphServiceError::PolicyInput => AgentError::new(
             AgentErrorCode::InvalidArgument,
             false,
             AgentRemediation::CorrectInput,
@@ -305,6 +335,15 @@ fn map_service_error(source: &DepgraphServiceError) -> AgentError {
             false,
             AgentRemediation::NarrowQuery,
             None,
+        ),
+        DepgraphServiceError::InlineExportTooLarge { maximum } => AgentError::new(
+            AgentErrorCode::ResourceExhausted,
+            false,
+            AgentRemediation::ExportFile,
+            Some(AgentErrorDetails::ResourceLimit {
+                limit: AgentResourceLimit::OutputBytes,
+                maximum: *maximum as u64,
+            }),
         ),
         DepgraphServiceError::Cancelled => AgentError::new(
             AgentErrorCode::Cancelled,
