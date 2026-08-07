@@ -2,6 +2,11 @@
   "schema_version": "github-actions-policy-v1",
   "actions": [
     {
+      "identity": "Swatinem/rust-cache",
+      "sha": "6323deb102c322ba6fcbdcafc7e3dddab59af2b6",
+      "reviewed_upstream_ref": "v2"
+    },
+    {
       "identity": "actions/checkout",
       "sha": "11d5960a326750d5838078e36cf38b85af677262",
       "reviewed_upstream_ref": "v4"
