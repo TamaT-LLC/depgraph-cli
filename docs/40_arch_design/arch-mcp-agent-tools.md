@@ -32,6 +32,7 @@ additive extensionとして採用するかを決定する。
 | Graph dependency tools | `graph_dependencies_list`, `graph_dependents_list`, `graph_path_get` | Issue #302 implemented through one pinned snapshot request |
 | Graph analysis tools | `graph_impact_get`, `graph_cycles_list`, `graph_unresolved_list` | Issue #303 implemented through shared bounded read services |
 | Bounded query/runtime validation | `graph_query`, `runtime_trace_validate` | Issue #304 implemented through prevalidated read-only services |
+| Snapshot artifacts | `snapshot_diff_get`, `policy_evaluate`, `graph_export` | Issue #305 implemented through pinned, bounded shared artifact services |
 | Open questions | `0` | Resolved |
 
 Stage 1ではcontractをfreezeする。operation journal、runner、baseline operation
@@ -76,12 +77,13 @@ schema/Serde差分は回帰testで意図的に固定する。
 | `AC-010` | runtime trace validationはgraphを変更せずselected snapshotとのmatchingだけを返す | inline/confined traceをprevalidateしてread-only pinned snapshotへmatchし、store/snapshot/source-tree digest不変をCLI/service/MCP process testで固定する |
 | `AC-011` | daemon statusはpublished status fileだけを読み、store/process stateを変更しない | no-follow bounded reader、missing-store test、status/store digest immutability testで固定する |
 | `AC-014` | Tasks非対応hostを含め、accepted operationのstatus、result、cancelが未定義分岐なく機能する | capability matrix、result union、認可、再接続、互換性test matrixを本書で固定する |
-| `AC-015` | 同じnormalized inputに対するCLIとMCP domain responseを一致させる | lifecycle三操作に加えquery/runtime validationも同じservice methodへroutingし、cross-process parity testでquery values、runtime summary/event IDの一致を検証する |
+| `AC-015` | 同じnormalized inputに対するCLIとMCP domain responseを一致させる | lifecycle、query/runtime validation、snapshot diff、policy evaluation、outputなしgraph exportを同じservice methodへroutingし、cross-process parity testでclosed domain resultの一致を検証する |
 | `#295` | 共通contract、closed DTO、typed error、pagination、operation型、決定的schema生成 | `depgraph-mcp-tools-v1`のRust型、checked-in schema、digestとcontract golden、およびintegration testで固定する |
 | `#301` | profile plan、daemon status、doctorを共有serviceとMCPへ接続する | lifecycle service/DTO/handler、CLI migration、security/redaction/immutability/parity/process test、およびcanonical catalog/schema fixtureで固定する |
 | `#302` | dependencies、dependents、explain pathを共有serviceとMCPへ接続する | pinned `SnapshotReadRequest`、closed dependency/path DTO、exact catalog schema、CLI/MCP parity、cursor/exhaustion/process testで固定する |
 | `#303` | reverse impact、cycles、unresolved sitesを共有serviceとMCPへ接続する | current-only changed set、cache-independent canonical impact、closed cycle/unresolved DTO、全phaseのbounds/cancellation、snapshot/input-bound cursor、CLI/MCP/process/schema parityで固定する |
 | `#304` | bounded queryとruntime validationを共有serviceとMCPへ接続する | pre-store input/output admission、confined file input、pinned read-only snapshot、closed query/runtime DTO、input-bound cursor、CLI/MCP parity、redaction/immutability/process/schema testで固定する |
+| `#305` | snapshot diff、policy evaluation、bounded inline graph exportを共有serviceとMCPへ接続する | request開始時のcompleted snapshot pin、canonical policy digest、closed diff/policy/export DTO、inline byte/node/edge bounds、typed `export_file` remediation、CLI/MCP/schema/catalog parityで固定する |
 
 ## Upstream and API evidence
 
@@ -436,6 +438,33 @@ runtime trace validationをCLI固有のstore orchestrationから共有read-only 
 | inlineまたはroot-confined regular fileだけを受理 | service exactly-one、absolute/traversal/symlink/nonregular/oversize testsとcatalog `oneOf` validation |
 | closed/paged/cancellable Agent response | DTO semantic Deserialize、schema closure、input-bound cursor、Read runtime controller process tests |
 | CLI/MCP/catalog/schema parity | shared-service routing、real stdio parity/security test、canonical schema/catalog/contract fixtures |
+| repository validation | focused core/CLI/MCP tests、`cargo fmt`、Clippy `-D warnings`、`cargo xtask test` |
+
+## Issue #305 snapshot artifact evidence
+
+Issue [#305](https://github.com/TamaT-LLC/depgraph-cli/issues/305)はsnapshot diff、policy
+evaluation、output先を持たないinline graph exportをCLI固有のorchestrationから共有serviceへ
+移し、同じ境界を三つのMCP toolへ公開する。file outputは既存のrepository-confined CLI
+workflowを維持し、inline MCP responseだけにhard byte boundと`export_file` remediationを適用する。
+
+| Boundary | Frozen behavior and evidence |
+| --- | --- |
+| Snapshot pinning | `current`、named、ID selectorはrequest開始時にcompleted snapshot IDへ一度だけ解決し、diff/policyのfrom/toとexport対象を処理完了まで固定する |
+| Shared canonical artifacts | CLIとMCPは同じ`DepgraphService`のdiff、policy、graph export methodを呼ぶ。completed snapshotのoutputなしCLI exportもAgent-safe canonical projectionをそのまま出力し、raw互換projectionは`--output`または明示したfailed/partial scanだけに限定する。handlerはrequest変換とclosed DTO projectionだけを担当し、diff/policy/export logicを複製しない |
+| Policy identity | policy resultはrules、suppressions、selector exclusions/scopes、profile filters、precision/status/evidence sets、commutative condition operandsを意味的なsetとして正規化したconfigurationのSHA-256 digestだけを公開する。source配列順は評価にもidentityにも影響せず、raw config、arbitrary graph properties、host path、credential-shaped dataはAgent DTOへ投影しない |
+| Inline export bounds | JSON、DOT、Mermaid、GraphMLをnode、edge、canonical wire byte ceiling内で全体生成する。上限超過時はpartial contentを捨て、`RESOURCE_EXHAUSTED`と`export_file` remediationを返す。final envelope serialization超過にも同じremediationを維持する |
+| Closed contracts | `AgentSnapshotDiffResponse`、`AgentPolicyEvaluationResponse`、`AgentGraphExportResponse`とnested DTOはunknown fieldを拒否し、advertised exact output schemaとchecked-in shared `$defs`の双方へ登録する |
+| Runtime and confidentiality | input validationとrepository confinementをstore access前に行い、全service phaseはcooperative cancellationをpollする。service errorはraw locator/config/contentを反射せずtyped errorへ変換する |
+
+### Issue #305 acceptance mapping
+
+| Acceptance criterion | Evidence |
+| --- | --- |
+| selectorをrequest開始時にcompleted IDへ固定 | shared service pinning testsとresolved IDを含むclosed result |
+| CLI/MCPが同じcanonical diff/policy/exportを返す | shared-service routing、focused core tests、real process content/digest parityとraw property omission test |
+| policy identityはraw configでなくcanonical digest | source配列順を逆転したrules、suppressions、nested set/conditionのdigest/result identity regressionとclosed DTO/schema prohibition |
+| inline exportはboundedでpartial responseなし | four-format deterministic tests、node/edge/byte exhaustion tests、post-serialization `export_file` mapper regression |
+| MCP contract/schema/catalogがexactかつclosed | catalog golden、shared schema/digest golden、unknown-field rejectionとresponse definition tests |
 | repository validation | focused core/CLI/MCP tests、`cargo fmt`、Clippy `-D warnings`、`cargo xtask test` |
 
 ## Issue #292 acceptance mapping

@@ -6,10 +6,13 @@ use std::{
 
 use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
+use sha2::{Digest as _, Sha256};
 
 use crate::{
-    AgentId, AgentLabel, AgentLocator, AgentToken, ContractBuildError, Page,
-    RepositoryRelativePath, SnapshotId, SnapshotName,
+    AgentArtifactId, AgentFieldName, AgentGraphExportContent, AgentId, AgentLabel, AgentLocator,
+    AgentPolicyText, AgentToken, ContractBuildError, Page, PolicyApiChangeId, PolicyConfigDigest,
+    PolicyEvaluationCollectionDigest, PolicyEvaluationId, PolicyViolationId,
+    RepositoryRelativePath, Sha256Digest, SnapshotDiffCollectionDigest, SnapshotId, SnapshotName,
 };
 
 pub const MAX_AGENT_EVIDENCE_ITEMS: usize = depgraph_core::service::MAX_GRAPH_EVIDENCE_ITEMS;
@@ -22,6 +25,8 @@ pub const MAX_AGENT_CORRELATION_REASONS: usize =
 pub const MAX_AGENT_PHASES: usize = depgraph_core::service::MAX_UNRESOLVED_PHASES;
 pub const MAX_AGENT_QUERY_TEXT_BYTES: usize = depgraph_core::MAX_QUERY_BYTES;
 pub const MAX_AGENT_QUERY_VALUES: usize = depgraph_core::MAX_QUERY_PROJECTIONS;
+pub const MAX_AGENT_ARTIFACT_ITEMS: usize = depgraph_core::service::MAX_SHARED_ARTIFACT_ITEMS;
+pub const MAX_AGENT_CHANGED_FIELDS: usize = 256;
 
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
@@ -2597,6 +2602,835 @@ const fn agent_runtime_status(
         depgraph_core::RuntimeTraceMatchStatus::Resolved => AgentRuntimeMatchStatus::Resolved,
         depgraph_core::RuntimeTraceMatchStatus::External => AgentRuntimeMatchStatus::External,
         depgraph_core::RuntimeTraceMatchStatus::Unresolved => AgentRuntimeMatchStatus::Unresolved,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+pub enum AgentSnapshotDiffSchemaVersion {
+    #[serde(rename = "depgraph-snapshot-diff-service-v1")]
+    V1,
+}
+
+#[derive(
+    Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentSnapshotDiffRecordType {
+    Coverage,
+    Edge,
+    Evidence,
+    Node,
+    Profile,
+    Site,
+}
+
+#[derive(
+    Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentSnapshotDiffChangeType {
+    Added,
+    Changed,
+    Removed,
+    RenameCandidate,
+    Renamed,
+}
+
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentSnapshotDiffChange {
+    pub record_type: AgentSnapshotDiffRecordType,
+    pub change_type: AgentSnapshotDiffChangeType,
+    pub id: AgentArtifactId,
+    #[schemars(length(max = 256))]
+    pub changed_fields: Vec<AgentFieldName>,
+}
+
+impl AgentSnapshotDiffChange {
+    pub fn try_new(
+        record_type: AgentSnapshotDiffRecordType,
+        change_type: AgentSnapshotDiffChangeType,
+        id: String,
+        changed_fields: Vec<String>,
+    ) -> Result<Self, ContractBuildError> {
+        let value = Self {
+            record_type,
+            change_type,
+            id: AgentArtifactId::parse(id).map_err(|_| ContractBuildError::AgentDtoValue)?,
+            changed_fields: changed_fields
+                .into_iter()
+                .map(AgentFieldName::parse)
+                .collect::<Result<_, _>>()
+                .map_err(|_| ContractBuildError::AgentDtoValue)?,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    fn validate(&self) -> Result<(), ContractBuildError> {
+        if self.changed_fields.len() > MAX_AGENT_CHANGED_FIELDS {
+            return Err(ContractBuildError::TooManyChangedFields);
+        }
+        if self
+            .changed_fields
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
+            || matches!(
+                self.change_type,
+                AgentSnapshotDiffChangeType::Added | AgentSnapshotDiffChangeType::Removed
+            ) && !self.changed_fields.is_empty()
+        {
+            return Err(ContractBuildError::SnapshotDiffState);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentSnapshotDiffChangeWire {
+    record_type: AgentSnapshotDiffRecordType,
+    change_type: AgentSnapshotDiffChangeType,
+    id: AgentArtifactId,
+    changed_fields: Vec<AgentFieldName>,
+}
+
+impl<'de> Deserialize<'de> for AgentSnapshotDiffChange {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = AgentSnapshotDiffChangeWire::deserialize(deserializer)?;
+        let value = Self {
+            record_type: wire.record_type,
+            change_type: wire.change_type,
+            id: wire.id,
+            changed_fields: wire.changed_fields,
+        };
+        value.validate().map_err(D::Error::custom)?;
+        Ok(value)
+    }
+}
+
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentSnapshotDiffResponse {
+    pub schema_version: AgentSnapshotDiffSchemaVersion,
+    pub from_snapshot_id: SnapshotId,
+    pub to_snapshot_id: SnapshotId,
+    pub total_changes: u64,
+    pub empty: bool,
+    #[schemars(length(max = 50000))]
+    pub changes: Vec<AgentSnapshotDiffChange>,
+    pub collection_digest: SnapshotDiffCollectionDigest,
+}
+
+impl AgentSnapshotDiffResponse {
+    pub fn try_new(
+        schema_version: &str,
+        from_snapshot_id: &str,
+        to_snapshot_id: &str,
+        total_changes: u64,
+        empty: bool,
+        changes: Vec<AgentSnapshotDiffChange>,
+        collection_digest: &str,
+    ) -> Result<Self, ContractBuildError> {
+        if schema_version != depgraph_core::service::SNAPSHOT_DIFF_SERVICE_SCHEMA_VERSION {
+            return Err(ContractBuildError::AgentDtoValue);
+        }
+        let value = Self {
+            schema_version: AgentSnapshotDiffSchemaVersion::V1,
+            from_snapshot_id: SnapshotId::parse(from_snapshot_id)
+                .map_err(|_| ContractBuildError::AgentDtoValue)?,
+            to_snapshot_id: SnapshotId::parse(to_snapshot_id)
+                .map_err(|_| ContractBuildError::AgentDtoValue)?,
+            total_changes,
+            empty,
+            changes,
+            collection_digest: SnapshotDiffCollectionDigest::parse(collection_digest)
+                .map_err(|_| ContractBuildError::AgentDtoValue)?,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    fn validate(&self) -> Result<(), ContractBuildError> {
+        if self.changes.len() > MAX_AGENT_ARTIFACT_ITEMS {
+            return Err(ContractBuildError::TooManyArtifactItems);
+        }
+        if self.empty != self.changes.is_empty()
+            || self.total_changes > u64::try_from(self.changes.len()).unwrap_or(u64::MAX)
+            || self.changes.windows(2).any(|pair| {
+                (&pair[0].record_type, &pair[0].change_type, &pair[0].id)
+                    >= (&pair[1].record_type, &pair[1].change_type, &pair[1].id)
+            })
+        {
+            return Err(ContractBuildError::SnapshotDiffState);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentSnapshotDiffResponseWire {
+    schema_version: AgentSnapshotDiffSchemaVersion,
+    from_snapshot_id: SnapshotId,
+    to_snapshot_id: SnapshotId,
+    total_changes: u64,
+    empty: bool,
+    changes: Vec<AgentSnapshotDiffChange>,
+    collection_digest: SnapshotDiffCollectionDigest,
+}
+
+impl<'de> Deserialize<'de> for AgentSnapshotDiffResponse {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = AgentSnapshotDiffResponseWire::deserialize(deserializer)?;
+        let value = Self {
+            schema_version: wire.schema_version,
+            from_snapshot_id: wire.from_snapshot_id,
+            to_snapshot_id: wire.to_snapshot_id,
+            total_changes: wire.total_changes,
+            empty: wire.empty,
+            changes: wire.changes,
+            collection_digest: wire.collection_digest,
+        };
+        value.validate().map_err(D::Error::custom)?;
+        Ok(value)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentPolicySeverity {
+    Warning,
+    Error,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentPolicyViolation {
+    pub id: PolicyViolationId,
+    pub rule_id: AgentId,
+    pub severity: AgentPolicySeverity,
+    pub message: AgentPolicyText,
+    pub source_id: AgentArtifactId,
+    pub target_id: AgentArtifactId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<AgentArtifactId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change_id: Option<PolicyApiChangeId>,
+    pub suppressed: bool,
+}
+
+impl AgentPolicyViolation {
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new(
+        id: &str,
+        rule_id: &str,
+        severity: AgentPolicySeverity,
+        message: &str,
+        source_id: &str,
+        target_id: &str,
+        profile_id: Option<&str>,
+        change_id: Option<&str>,
+        suppressed: bool,
+    ) -> Result<Self, ContractBuildError> {
+        Ok(Self {
+            id: PolicyViolationId::parse(id).map_err(|_| ContractBuildError::AgentDtoValue)?,
+            rule_id: AgentId::parse(rule_id).map_err(|_| ContractBuildError::AgentDtoValue)?,
+            severity,
+            message: AgentPolicyText::parse(message)
+                .map_err(|_| ContractBuildError::AgentDtoValue)?,
+            source_id: AgentArtifactId::parse(source_id)
+                .map_err(|_| ContractBuildError::AgentDtoValue)?,
+            target_id: AgentArtifactId::parse(target_id)
+                .map_err(|_| ContractBuildError::AgentDtoValue)?,
+            profile_id: profile_id
+                .map(AgentArtifactId::parse)
+                .transpose()
+                .map_err(|_| ContractBuildError::AgentDtoValue)?,
+            change_id: change_id
+                .map(PolicyApiChangeId::parse)
+                .transpose()
+                .map_err(|_| ContractBuildError::AgentDtoValue)?,
+            suppressed,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentPolicyApiChangeKind {
+    Added,
+    Removed,
+    Changed,
+}
+
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentPolicyApiChange {
+    pub id: PolicyApiChangeId,
+    pub rule_id: AgentId,
+    pub kind: AgentPolicyApiChangeKind,
+    pub breaking: bool,
+    #[schemars(length(max = 256))]
+    pub changed_fields: Vec<AgentFieldName>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_id: Option<AgentArtifactId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_id: Option<AgentArtifactId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<AgentArtifactId>,
+}
+
+impl AgentPolicyApiChange {
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new(
+        id: &str,
+        rule_id: &str,
+        kind: AgentPolicyApiChangeKind,
+        breaking: bool,
+        changed_fields: Vec<String>,
+        before_id: Option<&str>,
+        after_id: Option<&str>,
+        profile_id: Option<&str>,
+    ) -> Result<Self, ContractBuildError> {
+        let value = Self {
+            id: PolicyApiChangeId::parse(id).map_err(|_| ContractBuildError::AgentDtoValue)?,
+            rule_id: AgentId::parse(rule_id).map_err(|_| ContractBuildError::AgentDtoValue)?,
+            kind,
+            breaking,
+            changed_fields: changed_fields
+                .into_iter()
+                .map(AgentFieldName::parse)
+                .collect::<Result<_, _>>()
+                .map_err(|_| ContractBuildError::AgentDtoValue)?,
+            before_id: before_id
+                .map(AgentArtifactId::parse)
+                .transpose()
+                .map_err(|_| ContractBuildError::AgentDtoValue)?,
+            after_id: after_id
+                .map(AgentArtifactId::parse)
+                .transpose()
+                .map_err(|_| ContractBuildError::AgentDtoValue)?,
+            profile_id: profile_id
+                .map(AgentArtifactId::parse)
+                .transpose()
+                .map_err(|_| ContractBuildError::AgentDtoValue)?,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    fn validate(&self) -> Result<(), ContractBuildError> {
+        if self.changed_fields.len() > MAX_AGENT_CHANGED_FIELDS {
+            return Err(ContractBuildError::TooManyChangedFields);
+        }
+        if self
+            .changed_fields
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
+        {
+            return Err(ContractBuildError::PolicyEvaluationState);
+        }
+        let valid_shape = match self.kind {
+            AgentPolicyApiChangeKind::Added => {
+                !self.breaking
+                    && self.before_id.is_none()
+                    && self.after_id.is_some()
+                    && self.changed_fields.is_empty()
+            }
+            AgentPolicyApiChangeKind::Removed => {
+                self.breaking
+                    && self.before_id.is_some()
+                    && self.after_id.is_none()
+                    && self.changed_fields.is_empty()
+            }
+            AgentPolicyApiChangeKind::Changed => {
+                self.breaking
+                    && self.before_id.is_some()
+                    && self.after_id.is_some()
+                    && !self.changed_fields.is_empty()
+            }
+        };
+        if !valid_shape {
+            return Err(ContractBuildError::PolicyEvaluationState);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentPolicyApiChangeWire {
+    id: PolicyApiChangeId,
+    rule_id: AgentId,
+    kind: AgentPolicyApiChangeKind,
+    breaking: bool,
+    changed_fields: Vec<AgentFieldName>,
+    #[serde(default)]
+    before_id: Option<AgentArtifactId>,
+    #[serde(default)]
+    after_id: Option<AgentArtifactId>,
+    #[serde(default)]
+    profile_id: Option<AgentArtifactId>,
+}
+
+impl<'de> Deserialize<'de> for AgentPolicyApiChange {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = AgentPolicyApiChangeWire::deserialize(deserializer)?;
+        let value = Self {
+            id: wire.id,
+            rule_id: wire.rule_id,
+            kind: wire.kind,
+            breaking: wire.breaking,
+            changed_fields: wire.changed_fields,
+            before_id: wire.before_id,
+            after_id: wire.after_id,
+            profile_id: wire.profile_id,
+        };
+        value.validate().map_err(D::Error::custom)?;
+        Ok(value)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentPolicySummary {
+    pub errors: u64,
+    pub warnings: u64,
+    pub suppressed: u64,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentPolicyAnnotationLevel {
+    Warning,
+    Error,
+}
+
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentPolicyAnnotation {
+    pub violation_id: PolicyViolationId,
+    pub rule_id: AgentId,
+    pub level: AgentPolicyAnnotationLevel,
+    pub path: RepositoryRelativePath,
+    pub start_line: u32,
+    pub start_column: u32,
+    pub end_line: u32,
+    pub end_column: u32,
+    pub title: AgentLabel,
+    pub message: AgentPolicyText,
+}
+
+impl AgentPolicyAnnotation {
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new(
+        violation_id: &str,
+        rule_id: &str,
+        level: AgentPolicyAnnotationLevel,
+        path: &str,
+        start_line: u32,
+        start_column: u32,
+        end_line: u32,
+        end_column: u32,
+        title: &str,
+        message: &str,
+    ) -> Result<Self, ContractBuildError> {
+        let value = Self {
+            violation_id: PolicyViolationId::parse(violation_id)
+                .map_err(|_| ContractBuildError::AgentDtoValue)?,
+            rule_id: AgentId::parse(rule_id).map_err(|_| ContractBuildError::AgentDtoValue)?,
+            level,
+            path: RepositoryRelativePath::parse(path)
+                .map_err(|_| ContractBuildError::AgentDtoValue)?,
+            start_line,
+            start_column,
+            end_line,
+            end_column,
+            title: AgentLabel::parse(title).map_err(|_| ContractBuildError::AgentDtoValue)?,
+            message: AgentPolicyText::parse(message)
+                .map_err(|_| ContractBuildError::AgentDtoValue)?,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    fn validate(&self) -> Result<(), ContractBuildError> {
+        if self.start_line == 0
+            || self.start_column == 0
+            || self.end_line == 0
+            || self.end_column == 0
+            || (self.end_line, self.end_column) < (self.start_line, self.start_column)
+        {
+            return Err(ContractBuildError::SourceSpan);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentPolicyAnnotationWire {
+    violation_id: PolicyViolationId,
+    rule_id: AgentId,
+    level: AgentPolicyAnnotationLevel,
+    path: RepositoryRelativePath,
+    start_line: u32,
+    start_column: u32,
+    end_line: u32,
+    end_column: u32,
+    title: AgentLabel,
+    message: AgentPolicyText,
+}
+
+impl<'de> Deserialize<'de> for AgentPolicyAnnotation {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = AgentPolicyAnnotationWire::deserialize(deserializer)?;
+        let value = Self {
+            violation_id: wire.violation_id,
+            rule_id: wire.rule_id,
+            level: wire.level,
+            path: wire.path,
+            start_line: wire.start_line,
+            start_column: wire.start_column,
+            end_line: wire.end_line,
+            end_column: wire.end_column,
+            title: wire.title,
+            message: wire.message,
+        };
+        value.validate().map_err(D::Error::custom)?;
+        Ok(value)
+    }
+}
+
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentPolicyEvaluationResponse {
+    pub from_snapshot_id: SnapshotId,
+    pub to_snapshot_id: SnapshotId,
+    pub result_id: PolicyEvaluationId,
+    pub policy_config_digest: PolicyConfigDigest,
+    pub passed: bool,
+    #[schemars(range(max = 1))]
+    pub exit_code: u8,
+    #[schemars(length(max = 50000))]
+    pub api_changes: Vec<AgentPolicyApiChange>,
+    #[schemars(length(max = 50000))]
+    pub violations: Vec<AgentPolicyViolation>,
+    #[schemars(length(max = 50000))]
+    pub annotations: Vec<AgentPolicyAnnotation>,
+    pub summary: AgentPolicySummary,
+    pub collection_digest: PolicyEvaluationCollectionDigest,
+}
+
+impl AgentPolicyEvaluationResponse {
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new(
+        from_snapshot_id: &str,
+        to_snapshot_id: &str,
+        result_id: &str,
+        policy_config_digest: &str,
+        passed: bool,
+        exit_code: u8,
+        api_changes: Vec<AgentPolicyApiChange>,
+        violations: Vec<AgentPolicyViolation>,
+        annotations: Vec<AgentPolicyAnnotation>,
+        summary: AgentPolicySummary,
+        collection_digest: &str,
+    ) -> Result<Self, ContractBuildError> {
+        let value = Self {
+            from_snapshot_id: SnapshotId::parse(from_snapshot_id)
+                .map_err(|_| ContractBuildError::AgentDtoValue)?,
+            to_snapshot_id: SnapshotId::parse(to_snapshot_id)
+                .map_err(|_| ContractBuildError::AgentDtoValue)?,
+            result_id: PolicyEvaluationId::parse(result_id)
+                .map_err(|_| ContractBuildError::AgentDtoValue)?,
+            policy_config_digest: PolicyConfigDigest::parse(policy_config_digest)
+                .map_err(|_| ContractBuildError::AgentDtoValue)?,
+            passed,
+            exit_code,
+            api_changes,
+            violations,
+            annotations,
+            summary,
+            collection_digest: PolicyEvaluationCollectionDigest::parse(collection_digest)
+                .map_err(|_| ContractBuildError::AgentDtoValue)?,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    fn validate(&self) -> Result<(), ContractBuildError> {
+        let items = self
+            .api_changes
+            .len()
+            .saturating_add(self.violations.len())
+            .saturating_add(self.annotations.len());
+        if self.api_changes.len() > MAX_AGENT_ARTIFACT_ITEMS
+            || self.violations.len() > MAX_AGENT_ARTIFACT_ITEMS
+            || self.annotations.len() > MAX_AGENT_ARTIFACT_ITEMS
+            || items > MAX_AGENT_ARTIFACT_ITEMS
+        {
+            return Err(ContractBuildError::TooManyArtifactItems);
+        }
+
+        let mut errors = 0_u64;
+        let mut warnings = 0_u64;
+        let mut suppressed = 0_u64;
+        let mut violation_by_id = BTreeMap::new();
+        for violation in &self.violations {
+            if violation_by_id
+                .insert(violation.id.as_str(), violation)
+                .is_some()
+            {
+                return Err(ContractBuildError::PolicyEvaluationState);
+            }
+            if violation.suppressed {
+                suppressed += 1;
+            } else {
+                match violation.severity {
+                    AgentPolicySeverity::Warning => warnings += 1,
+                    AgentPolicySeverity::Error => errors += 1,
+                }
+            }
+        }
+        if self.summary
+            != (AgentPolicySummary {
+                errors,
+                warnings,
+                suppressed,
+            })
+            || self.passed != (errors == 0)
+            || self.exit_code != u8::from(errors > 0)
+        {
+            return Err(ContractBuildError::PolicyEvaluationState);
+        }
+
+        let changes = self
+            .api_changes
+            .iter()
+            .map(|change| (change.id.as_str(), change.rule_id.as_str()))
+            .collect::<BTreeMap<_, _>>();
+        if changes.len() != self.api_changes.len()
+            || self.violations.iter().any(|violation| {
+                violation.change_id.as_ref().is_some_and(|change_id| {
+                    changes.get(change_id.as_str()).copied() != Some(violation.rule_id.as_str())
+                })
+            })
+        {
+            return Err(ContractBuildError::PolicyEvaluationState);
+        }
+
+        let mut annotated = BTreeSet::new();
+        for annotation in &self.annotations {
+            let Some(violation) = violation_by_id.get(annotation.violation_id.as_str()) else {
+                return Err(ContractBuildError::PolicyEvaluationState);
+            };
+            let expected_level = match violation.severity {
+                AgentPolicySeverity::Warning => AgentPolicyAnnotationLevel::Warning,
+                AgentPolicySeverity::Error => AgentPolicyAnnotationLevel::Error,
+            };
+            if violation.suppressed
+                || annotation.rule_id != violation.rule_id
+                || annotation.level != expected_level
+                || !annotated.insert(annotation.violation_id.as_str())
+            {
+                return Err(ContractBuildError::PolicyEvaluationState);
+            }
+        }
+        if self
+            .violations
+            .iter()
+            .any(|violation| !violation.suppressed && !annotated.contains(violation.id.as_str()))
+        {
+            return Err(ContractBuildError::PolicyEvaluationState);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentPolicyEvaluationResponseWire {
+    from_snapshot_id: SnapshotId,
+    to_snapshot_id: SnapshotId,
+    result_id: PolicyEvaluationId,
+    policy_config_digest: PolicyConfigDigest,
+    passed: bool,
+    exit_code: u8,
+    api_changes: Vec<AgentPolicyApiChange>,
+    violations: Vec<AgentPolicyViolation>,
+    annotations: Vec<AgentPolicyAnnotation>,
+    summary: AgentPolicySummary,
+    collection_digest: PolicyEvaluationCollectionDigest,
+}
+
+impl<'de> Deserialize<'de> for AgentPolicyEvaluationResponse {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = AgentPolicyEvaluationResponseWire::deserialize(deserializer)?;
+        let value = Self {
+            from_snapshot_id: wire.from_snapshot_id,
+            to_snapshot_id: wire.to_snapshot_id,
+            result_id: wire.result_id,
+            policy_config_digest: wire.policy_config_digest,
+            passed: wire.passed,
+            exit_code: wire.exit_code,
+            api_changes: wire.api_changes,
+            violations: wire.violations,
+            annotations: wire.annotations,
+            summary: wire.summary,
+            collection_digest: wire.collection_digest,
+        };
+        value.validate().map_err(D::Error::custom)?;
+        Ok(value)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+pub enum AgentGraphExportSchemaVersion {
+    #[serde(rename = "depgraph-graph-export-service-v1")]
+    V1,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentGraphExportFormat {
+    Json,
+    Dot,
+    Mermaid,
+    Graphml,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+pub enum AgentGraphExportMediaType {
+    #[serde(rename = "application/json")]
+    Json,
+    #[serde(rename = "text/vnd.graphviz")]
+    Graphviz,
+    #[serde(rename = "text/vnd.mermaid")]
+    Mermaid,
+    #[serde(rename = "application/graphml+xml")]
+    Graphml,
+}
+
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentGraphExportResponse {
+    pub schema_version: AgentGraphExportSchemaVersion,
+    pub snapshot_id: SnapshotId,
+    pub format: AgentGraphExportFormat,
+    pub media_type: AgentGraphExportMediaType,
+    pub content: AgentGraphExportContent,
+    pub content_sha256: Sha256Digest,
+    pub output_bytes: u64,
+    #[schemars(range(max = 50000))]
+    pub node_count: u64,
+    #[schemars(range(max = 100000))]
+    pub edge_count: u64,
+}
+
+impl AgentGraphExportResponse {
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new(
+        schema_version: &str,
+        snapshot_id: &str,
+        format: AgentGraphExportFormat,
+        media_type: AgentGraphExportMediaType,
+        content: String,
+        content_sha256: &str,
+        output_bytes: u64,
+        node_count: u64,
+        edge_count: u64,
+    ) -> Result<Self, ContractBuildError> {
+        if schema_version != depgraph_core::service::GRAPH_EXPORT_SERVICE_SCHEMA_VERSION {
+            return Err(ContractBuildError::AgentDtoValue);
+        }
+        let value = Self {
+            schema_version: AgentGraphExportSchemaVersion::V1,
+            snapshot_id: SnapshotId::parse(snapshot_id)
+                .map_err(|_| ContractBuildError::AgentDtoValue)?,
+            format,
+            media_type,
+            content: AgentGraphExportContent::parse(content)
+                .map_err(|_| ContractBuildError::AgentDtoValue)?,
+            content_sha256: Sha256Digest::parse(content_sha256)
+                .map_err(|_| ContractBuildError::AgentDtoValue)?,
+            output_bytes,
+            node_count,
+            edge_count,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    fn validate(&self) -> Result<(), ContractBuildError> {
+        let expected_media_type = match self.format {
+            AgentGraphExportFormat::Json => AgentGraphExportMediaType::Json,
+            AgentGraphExportFormat::Dot => AgentGraphExportMediaType::Graphviz,
+            AgentGraphExportFormat::Mermaid => AgentGraphExportMediaType::Mermaid,
+            AgentGraphExportFormat::Graphml => AgentGraphExportMediaType::Graphml,
+        };
+        let digest = hex::encode(Sha256::digest(self.content.as_str().as_bytes()));
+        if self.media_type != expected_media_type
+            || self.output_bytes != u64::try_from(self.content.as_str().len()).unwrap_or(u64::MAX)
+            || self.content_sha256.as_str() != digest
+            || self.node_count > depgraph_core::service::MAX_GRAPH_EXPORT_NODES as u64
+            || self.edge_count > depgraph_core::service::MAX_GRAPH_EXPORT_EDGES as u64
+        {
+            return Err(ContractBuildError::GraphExportState);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentGraphExportResponseWire {
+    schema_version: AgentGraphExportSchemaVersion,
+    snapshot_id: SnapshotId,
+    format: AgentGraphExportFormat,
+    media_type: AgentGraphExportMediaType,
+    content: AgentGraphExportContent,
+    content_sha256: Sha256Digest,
+    output_bytes: u64,
+    node_count: u64,
+    edge_count: u64,
+}
+
+impl<'de> Deserialize<'de> for AgentGraphExportResponse {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = AgentGraphExportResponseWire::deserialize(deserializer)?;
+        let value = Self {
+            schema_version: wire.schema_version,
+            snapshot_id: wire.snapshot_id,
+            format: wire.format,
+            media_type: wire.media_type,
+            content: wire.content,
+            content_sha256: wire.content_sha256,
+            output_bytes: wire.output_bytes,
+            node_count: wire.node_count,
+            edge_count: wire.edge_count,
+        };
+        value.validate().map_err(D::Error::custom)?;
+        Ok(value)
     }
 }
 

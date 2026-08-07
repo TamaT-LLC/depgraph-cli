@@ -12,6 +12,18 @@ pub use crate::service_agent::{
     CurrentSnapshotAvailability, DepgraphContext, FindNodesPageResult, FindNodesResult,
     MAX_FIND_NODES_QUERY_BYTES, NamedCompletedSnapshot, NodeMatchMode, NodeProjection,
 };
+pub use crate::service_artifacts::{
+    ClosedChangedRecord, ClosedRecordDiff, DEFAULT_GRAPH_EXPORT_MAX_EDGES,
+    DEFAULT_GRAPH_EXPORT_MAX_NODES, GRAPH_EXPORT_SERVICE_SCHEMA_VERSION, GraphExportFormat,
+    GraphExportRequest, GraphExportResult, MAX_GRAPH_EXPORT_EDGES, MAX_GRAPH_EXPORT_NODES,
+    MAX_SHARED_ARTIFACT_ITEMS, MAX_SHARED_ARTIFACT_WORK_ITEMS,
+    POLICY_EVALUATION_SERVICE_SCHEMA_VERSION, PolicyEvaluateRequest, PolicyEvaluationResult,
+    RecordChangeSummary, RenameSummary, SNAPSHOT_DIFF_SERVICE_SCHEMA_VERSION,
+    ServicePolicyAnnotation, ServicePolicyApiChange, ServicePolicyResult, ServicePolicySuppression,
+    ServicePolicyViolation, SnapshotDiffCoverage, SnapshotDiffEdge, SnapshotDiffEvidence,
+    SnapshotDiffFilters, SnapshotDiffNode, SnapshotDiffProfile, SnapshotDiffRename,
+    SnapshotDiffRequest, SnapshotDiffResult, SnapshotDiffSite, SnapshotDiffSummary,
+};
 pub use crate::service_bounded::{
     BoundedQueryMode, BoundedQueryRequest, BoundedQueryServiceResult, RuntimeValidateRequest,
     RuntimeValidateServiceResult, ServiceSnapshotSelector,
@@ -633,6 +645,8 @@ pub enum DepgraphServiceError {
         #[source]
         source: anyhow::Error,
     },
+    #[error("policy input is invalid")]
+    PolicyInput,
     #[error("requested service resource was not found")]
     NotFound,
     #[error("request conflicts with the current service state")]
@@ -641,6 +655,8 @@ pub enum DepgraphServiceError {
     SnapshotWorktreeMismatch,
     #[error("request exhausted a service resource limit")]
     ResourceExhausted,
+    #[error("inline graph export exceeds the configured service output limit")]
+    InlineExportTooLarge { maximum: usize },
     #[error("request was cancelled")]
     Cancelled,
     #[error("read-only store is unavailable")]
@@ -675,12 +691,15 @@ impl DepgraphServiceError {
             | Self::ProfilePlan { .. }
             | Self::GraphQuery { .. }
             | Self::BoundedQueryInput { .. }
-            | Self::RuntimeTraceInput { .. } => DepgraphServiceErrorCategory::Input,
+            | Self::RuntimeTraceInput { .. }
+            | Self::PolicyInput => DepgraphServiceErrorCategory::Input,
             Self::RepositoryFile { reason } => reason.category(),
             Self::NotFound => DepgraphServiceErrorCategory::NotFound,
             Self::Conflict => DepgraphServiceErrorCategory::Conflict,
             Self::SnapshotWorktreeMismatch => DepgraphServiceErrorCategory::Input,
-            Self::QueryRejected | Self::ResourceExhausted => DepgraphServiceErrorCategory::Resource,
+            Self::QueryRejected | Self::ResourceExhausted | Self::InlineExportTooLarge { .. } => {
+                DepgraphServiceErrorCategory::Resource
+            }
             Self::Cancelled => DepgraphServiceErrorCategory::Cancelled,
             Self::ReadStoreUnavailable { .. }
             | Self::MutatingStoreUnavailable { .. }

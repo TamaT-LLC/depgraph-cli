@@ -1969,6 +1969,163 @@ RETURN source.id, target.id LIMIT 10"#;
 }
 
 #[test]
+fn issue_305_diff_policy_and_inline_export_have_cli_mcp_parity_and_shared_schema_coverage() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("repository");
+    let store_path = temporary.path().join("store.sqlite");
+    fs::create_dir(&root).unwrap();
+    let snapshot_id = seed_issue_302_store(&store_path, &root);
+    let before = store_invariant(&store_path);
+
+    let mut mcp = InteractiveMcp::start(&root, &store_path);
+    mcp.request(json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2026-07-28",
+            "capabilities": {},
+            "clientInfo": {"name": "issue-305-test", "version": "1"}
+        }
+    }));
+    let listed = mcp.request(json!({
+        "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}
+    }));
+    let tools = listed["result"]["tools"].as_array().unwrap();
+    let common = json!({
+        "contract_version": "depgraph-mcp-tools-v1",
+        "repository_id": "repository",
+        "from": "current",
+        "to": "current"
+    });
+    let diff = interactive_tool_call(&mut mcp, 3, "snapshot_diff_get", common.clone());
+    assert_eq!(diff["isError"], false, "{diff}");
+    assert_tool_text_matches_structured(&diff);
+    assert_eq!(diff["structuredContent"]["snapshot_id"], snapshot_id);
+    let policy = interactive_tool_call(&mut mcp, 4, "policy_evaluate", common);
+    assert_eq!(policy["isError"], false, "{policy}");
+    assert_tool_text_matches_structured(&policy);
+    let export = interactive_tool_call(
+        &mut mcp,
+        5,
+        "graph_export",
+        json!({
+            "contract_version": "depgraph-mcp-tools-v1",
+            "repository_id": "repository",
+            "snapshot": "current",
+            "format": "json"
+        }),
+    );
+    assert_eq!(export["isError"], false, "{export}");
+    assert_tool_text_matches_structured(&export);
+
+    let shared_schema: Value = serde_json::from_slice(include_bytes!(
+        "../../../schemas/depgraph-mcp-tools-v1.schema.json"
+    ))
+    .unwrap();
+    let shared = jsonschema::draft202012::new(&shared_schema).unwrap();
+    for (name, result) in [
+        ("snapshot_diff_get", &diff),
+        ("policy_evaluate", &policy),
+        ("graph_export", &export),
+    ] {
+        let structured = &result["structuredContent"];
+        let advertised =
+            tools.iter().find(|tool| tool["name"] == name).unwrap()["outputSchema"].clone();
+        jsonschema::draft202012::new(&advertised)
+            .unwrap()
+            .validate(structured)
+            .unwrap_or_else(|error| panic!("{name} advertised schema: {error}"));
+        shared
+            .validate(structured)
+            .unwrap_or_else(|error| panic!("{name} shared schema: {error}"));
+    }
+    mcp.finish();
+
+    let cli = |arguments: &[&str]| {
+        let binary = AssertCommand::cargo_bin("depgraph").unwrap();
+        let output = Command::new(binary.get_program())
+            .args(binary.get_args())
+            .current_dir(&root)
+            .arg("--store")
+            .arg(&store_path)
+            .args(arguments)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "CLI {arguments:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    };
+
+    let cli_diff: Value =
+        serde_json::from_slice(&cli(&["diff", "current", "current", "--json"])).unwrap();
+    assert_eq!(
+        cli_diff["data"]["from_snapshot_id"],
+        diff["structuredContent"]["result"]["from_snapshot_id"]
+    );
+    assert_eq!(
+        cli_diff["data"]["to_snapshot_id"],
+        diff["structuredContent"]["result"]["to_snapshot_id"]
+    );
+    assert_eq!(
+        cli_diff["data"]["summary"]["total_changes"],
+        diff["structuredContent"]["result"]["total_changes"]
+    );
+    assert_eq!(
+        cli_diff["data"]["collection_digest"],
+        diff["structuredContent"]["result"]["collection_digest"]
+    );
+
+    let cli_policy: Value =
+        serde_json::from_slice(&cli(&["policy", "current", "current", "--json"])).unwrap();
+    for field in ["from_snapshot_id", "to_snapshot_id", "collection_digest"] {
+        assert_eq!(
+            cli_policy["data"][field], policy["structuredContent"]["result"][field],
+            "policy field {field}"
+        );
+    }
+    for field in ["result_id", "policy_config_digest", "summary"] {
+        assert_eq!(
+            cli_policy["data"]["result"][field], policy["structuredContent"]["result"][field],
+            "policy result field {field}"
+        );
+    }
+    let cli_export_bytes = cli(&["export", "--format", "json"]);
+    let cli_export_content = String::from_utf8(cli_export_bytes).expect("CLI JSON export is UTF-8");
+    let cli_export: Value =
+        serde_json::from_str(&cli_export_content).expect("CLI JSON export is valid JSON");
+    let mcp_export = &export["structuredContent"]["result"];
+    assert_eq!(mcp_export["snapshot_id"], snapshot_id);
+    assert_eq!(mcp_export["format"], "json");
+    let mcp_content = mcp_export["content"].as_str().unwrap();
+    let mcp_graph = serde_json::from_str::<Value>(mcp_content).unwrap();
+    assert_eq!(cli_export_content, mcp_content);
+    assert_eq!(cli_export, mcp_graph);
+    let digest = sha2::Sha256::digest(cli_export_content.as_bytes());
+    assert_eq!(mcp_export["content_sha256"], format!("{digest:x}"));
+    assert_eq!(
+        mcp_export["output_bytes"],
+        u64::try_from(cli_export_content.len()).unwrap()
+    );
+    let root_text = root.to_string_lossy().into_owned();
+    for forbidden in [
+        "properties",
+        "PROCESS_GRAPH_SECRET",
+        "PRIVATE_DETAIL",
+        root_text.as_str(),
+    ] {
+        assert!(
+            !cli_export_content.contains(forbidden),
+            "canonical CLI/MCP export disclosed {forbidden}"
+        );
+    }
+    assert_eq!(before, store_invariant(&store_path));
+}
+
+#[test]
 fn issue_304_hostile_inputs_are_rejected_before_missing_store_access_without_echo() {
     let temporary = tempfile::tempdir().unwrap();
     let root = temporary.path().join("repository");

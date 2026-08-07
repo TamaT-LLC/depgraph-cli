@@ -2,11 +2,13 @@ use std::io;
 
 use depgraph_core::{DepgraphCapability, DepgraphServiceError, RepositoryFileError};
 use depgraph_mcp_tools::{
-    AgentCapability, AgentContext, AgentCurrentSnapshot, AgentErrorCode, AgentNode, AgentSnapshot,
-    CanonicalResponseMapper, CursorKey, LogicalRepositoryId, OperationAccepted, PageByteLimit,
-    PageRequest, PageSize, PaginationContext, SnapshotId, SuccessEnvelope,
+    AgentCapability, AgentContext, AgentCurrentSnapshot, AgentErrorCode, AgentGraphExportFormat,
+    AgentGraphExportMediaType, AgentGraphExportResponse, AgentNode, AgentSnapshot,
+    CanonicalResponseMapper, CursorKey, LogicalRepositoryId, MAX_PAGE_BYTES, OperationAccepted,
+    PageByteLimit, PageRequest, PageSize, PaginationContext, SnapshotId, SuccessEnvelope,
 };
 use serde_json::{Value, json};
+use sha2::{Digest as _, Sha256};
 
 const SNAPSHOT_ID: &str =
     "snapshot:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -85,6 +87,38 @@ fn canonical_mapper_keeps_structured_content_and_single_text_content_byte_identi
     assert_eq!(text_content(result).as_bytes(), canonical_structured);
     assert_eq!(mapped.output_bytes(), canonical_structured.len());
     assert_eq!(result.is_error, Some(false));
+}
+
+#[test]
+fn graph_export_mapper_preserves_export_file_remediation_after_envelope_overflow() {
+    let content = "x".repeat(MAX_PAGE_BYTES as usize);
+    let content_sha256 = format!("{:x}", Sha256::digest(content.as_bytes()));
+    let export = AgentGraphExportResponse::try_new(
+        depgraph_core::service::GRAPH_EXPORT_SERVICE_SCHEMA_VERSION,
+        SNAPSHOT_ID,
+        AgentGraphExportFormat::Json,
+        AgentGraphExportMediaType::Json,
+        content,
+        &content_sha256,
+        u64::from(MAX_PAGE_BYTES),
+        1,
+        0,
+    )
+    .expect("valid maximum-size export DTO");
+    let envelope = SuccessEnvelope::new(repository_id(), Some(snapshot_id()), export);
+
+    let mapped = CanonicalResponseMapper::export_success(&envelope)
+        .expect("oversized export maps to a bounded typed error");
+    let structured = mapped
+        .result()
+        .structured_content
+        .as_ref()
+        .expect("structured error content");
+
+    assert_eq!(mapped.result().is_error, Some(true));
+    assert_eq!(structured["error"]["code"], "RESOURCE_EXHAUSTED");
+    assert_eq!(structured["error"]["remediation"], "export_file");
+    assert!(structured.get("result").is_none());
 }
 
 #[test]

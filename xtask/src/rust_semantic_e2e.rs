@@ -252,14 +252,20 @@ impl Runner<'_> {
     }
 
     fn export_text(&self, store: &Path, format: &str) -> Result<String> {
+        let output_path = store.with_extension(format!("export.{format}"));
         let mut command = self.command();
         command
             .arg("--store")
             .arg(store)
-            .args(["export", "--format", format]);
-        let output = checked_output(&mut command, &format!("export the Rust graph as {format}"))?;
-        String::from_utf8(output.stdout)
-            .with_context(|| format!("depgraph {format} export returned non-UTF-8 output"))
+            .args(["export", "--format", format, "--output"])
+            .arg(&output_path);
+        checked_output(&mut command, &format!("export the Rust graph as {format}"))?;
+        std::fs::read_to_string(&output_path).with_context(|| {
+            format!(
+                "read {format} export from {} as UTF-8",
+                output_path.display()
+            )
+        })
     }
 }
 

@@ -9,9 +9,12 @@ use std::{
 use anyhow::{Context as _, Result, bail};
 use clap::{Parser, ValueEnum};
 use depgraph_core::service::{
-    BoundedQueryMode, BoundedQueryRequest, CyclesRequest, DependenciesRequest, DependencyDirection,
-    DoctorRequest, ExplainPathRequest, ImpactRequest, NodeMatchMode, ProfilePlanRequest,
-    RuntimeValidateRequest, ServiceSnapshotSelector, UnresolvedRequest,
+    BoundedQueryMode, BoundedQueryRequest, ClosedRecordDiff, CyclesRequest,
+    DEFAULT_GRAPH_EXPORT_MAX_EDGES, DEFAULT_GRAPH_EXPORT_MAX_NODES, DependenciesRequest,
+    DependencyDirection, DoctorRequest, ExplainPathRequest, GraphExportFormat, GraphExportRequest,
+    GraphExportResult, ImpactRequest, NodeMatchMode, PolicyEvaluateRequest, PolicyEvaluationResult,
+    ProfilePlanRequest, RuntimeValidateRequest, ServiceSnapshotSelector, SnapshotDiffFilters,
+    SnapshotDiffRequest, SnapshotDiffResult, UnresolvedRequest,
 };
 use depgraph_core::{
     CancellationToken, CycleLevel, DepgraphCapability, DepgraphCapabilitySet, DepgraphService,
@@ -22,12 +25,17 @@ use depgraph_core::{
 use depgraph_mcp::runtime::{AuditLogger, RuntimeClass, RuntimeConfig, RuntimeController};
 use depgraph_mcp_tools::{
     AgentCompletedSnapshot, AgentContext, AgentCycleLevel, AgentDaemonStatus,
-    AgentDependencyDirection, AgentDoctor, AgentError, AgentLocator, AgentNamedSnapshot,
-    AgentNodeSummary, AgentPathResponse, AgentProfilePlan, AgentRuntimeTraceEvent,
-    AgentRuntimeValidationResponse, AgentToken, BoundedQueryProjectionFailure,
-    CanonicalResponseMapper, ContractBuildError, ContractVersion, Cursor, CursorKey, ErrorEnvelope,
-    LogicalRepositoryId, MappedToolResult, PageByteLimit, PageRequest, PageSize, PaginationContext,
-    RepositoryRelativePath, ResponseMappingError, SnapshotId, SuccessEnvelope, ToolCatalog,
+    AgentDependencyDirection, AgentDoctor, AgentError, AgentGraphExportFormat,
+    AgentGraphExportMediaType, AgentGraphExportResponse, AgentLocator, AgentNamedSnapshot,
+    AgentNodeSummary, AgentPathResponse, AgentPolicyAnnotation, AgentPolicyAnnotationLevel,
+    AgentPolicyApiChange, AgentPolicyApiChangeKind, AgentPolicyEvaluationResponse,
+    AgentPolicySeverity, AgentPolicySummary, AgentPolicyViolation, AgentProfilePlan,
+    AgentRuntimeTraceEvent, AgentRuntimeValidationResponse, AgentSnapshotDiffChange,
+    AgentSnapshotDiffChangeType, AgentSnapshotDiffRecordType, AgentSnapshotDiffResponse,
+    AgentToken, BoundedQueryProjectionFailure, CanonicalResponseMapper, ContractBuildError,
+    ContractVersion, Cursor, CursorKey, ErrorEnvelope, LogicalRepositoryId, MappedToolResult,
+    PageByteLimit, PageRequest, PageSize, PaginationContext, RepositoryRelativePath,
+    ResponseMappingError, SnapshotId, SuccessEnvelope, ToolCatalog,
     project_bounded_query_rows_cancellable, project_cycles_page_cancellable,
     project_dependencies_page_cancellable, project_impact_response_cancellable,
     project_unresolved_page_cancellable,
@@ -378,6 +386,295 @@ struct RuntimeValidateArguments {
     limit: Option<u16>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SnapshotDiffArguments {
+    contract_version: ContractVersion,
+    repository_id: LogicalRepositoryId,
+    from: String,
+    to: String,
+    #[serde(default)]
+    kinds: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PolicyEvaluateArguments {
+    contract_version: ContractVersion,
+    repository_id: LogicalRepositoryId,
+    from: String,
+    to: String,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum GraphExportFormatArgument {
+    Json,
+    Dot,
+    Mermaid,
+    Graphml,
+}
+
+impl From<GraphExportFormatArgument> for GraphExportFormat {
+    fn from(value: GraphExportFormatArgument) -> Self {
+        match value {
+            GraphExportFormatArgument::Json => Self::Json,
+            GraphExportFormatArgument::Dot => Self::Dot,
+            GraphExportFormatArgument::Mermaid => Self::Mermaid,
+            GraphExportFormatArgument::Graphml => Self::Graphml,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GraphExportArguments {
+    contract_version: ContractVersion,
+    repository_id: LogicalRepositoryId,
+    format: GraphExportFormatArgument,
+    #[serde(default)]
+    snapshot: Option<String>,
+    #[serde(default)]
+    selector: Option<AgentLocator>,
+    #[serde(default)]
+    max_nodes: Option<usize>,
+    #[serde(default)]
+    max_edges: Option<usize>,
+}
+
+fn append_closed_diff<T>(
+    output: &mut Vec<AgentSnapshotDiffChange>,
+    record_type: AgentSnapshotDiffRecordType,
+    records: &ClosedRecordDiff<T>,
+    id: impl Fn(&T) -> String + Copy,
+) -> Result<(), ContractBuildError> {
+    for record in &records.added {
+        output.push(AgentSnapshotDiffChange::try_new(
+            record_type,
+            AgentSnapshotDiffChangeType::Added,
+            id(record),
+            Vec::new(),
+        )?);
+    }
+    for record in &records.removed {
+        output.push(AgentSnapshotDiffChange::try_new(
+            record_type,
+            AgentSnapshotDiffChangeType::Removed,
+            id(record),
+            Vec::new(),
+        )?);
+    }
+    for record in &records.changed {
+        output.push(AgentSnapshotDiffChange::try_new(
+            record_type,
+            AgentSnapshotDiffChangeType::Changed,
+            record.id.clone(),
+            record.changed_fields.clone(),
+        )?);
+    }
+    Ok(())
+}
+
+fn project_snapshot_diff(
+    result: SnapshotDiffResult,
+) -> Result<AgentSnapshotDiffResponse, ContractBuildError> {
+    let mut changes = Vec::with_capacity(result.item_count());
+    append_closed_diff(
+        &mut changes,
+        AgentSnapshotDiffRecordType::Node,
+        &result.nodes,
+        |record| record.id.clone(),
+    )?;
+    append_closed_diff(
+        &mut changes,
+        AgentSnapshotDiffRecordType::Site,
+        &result.sites,
+        |record| record.id.clone(),
+    )?;
+    append_closed_diff(
+        &mut changes,
+        AgentSnapshotDiffRecordType::Edge,
+        &result.edges,
+        |record| record.id.clone(),
+    )?;
+    append_closed_diff(
+        &mut changes,
+        AgentSnapshotDiffRecordType::Evidence,
+        &result.evidence,
+        |record| record.id(),
+    )?;
+    append_closed_diff(
+        &mut changes,
+        AgentSnapshotDiffRecordType::Profile,
+        &result.profiles,
+        |record| record.id.clone(),
+    )?;
+    if let Some(coverage) = &result.coverage {
+        changes.push(AgentSnapshotDiffChange::try_new(
+            AgentSnapshotDiffRecordType::Coverage,
+            AgentSnapshotDiffChangeType::Changed,
+            coverage.id.clone(),
+            coverage.changed_fields.clone(),
+        )?);
+    }
+    for rename in &result.renames {
+        changes.push(AgentSnapshotDiffChange::try_new(
+            AgentSnapshotDiffRecordType::Node,
+            AgentSnapshotDiffChangeType::Renamed,
+            format!("{}->{}", rename.old_id, rename.new_id),
+            rename.changed_fields.clone(),
+        )?);
+    }
+    for rename in &result.rename_candidates {
+        changes.push(AgentSnapshotDiffChange::try_new(
+            AgentSnapshotDiffRecordType::Node,
+            AgentSnapshotDiffChangeType::RenameCandidate,
+            format!("{}->{}", rename.old_id, rename.new_id),
+            rename.changed_fields.clone(),
+        )?);
+    }
+    changes.sort_by(|left, right| {
+        (&left.record_type, &left.change_type, &left.id).cmp(&(
+            &right.record_type,
+            &right.change_type,
+            &right.id,
+        ))
+    });
+    AgentSnapshotDiffResponse::try_new(
+        &result.schema_version,
+        &result.from_snapshot_id,
+        &result.to_snapshot_id,
+        result.summary.total_changes,
+        result.summary.empty,
+        changes,
+        &result.collection_digest,
+    )
+}
+
+fn project_policy_result(
+    result: PolicyEvaluationResult,
+) -> Result<AgentPolicyEvaluationResponse, ContractBuildError> {
+    let api_changes = result
+        .result
+        .api_changes
+        .iter()
+        .map(|change| {
+            AgentPolicyApiChange::try_new(
+                &change.id,
+                &change.rule_id,
+                match change.kind {
+                    depgraph_core::policy::PublicApiChangeKind::Added => {
+                        AgentPolicyApiChangeKind::Added
+                    }
+                    depgraph_core::policy::PublicApiChangeKind::Removed => {
+                        AgentPolicyApiChangeKind::Removed
+                    }
+                    depgraph_core::policy::PublicApiChangeKind::Changed => {
+                        AgentPolicyApiChangeKind::Changed
+                    }
+                },
+                change.breaking,
+                change.changed_fields.clone(),
+                change.before.as_ref().map(|entity| entity.id.as_str()),
+                change.after.as_ref().map(|entity| entity.id.as_str()),
+                change.profile_id.as_deref(),
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let violations = result
+        .result
+        .violations
+        .iter()
+        .map(|violation| {
+            AgentPolicyViolation::try_new(
+                &violation.id,
+                &violation.rule_id,
+                match violation.severity {
+                    depgraph_core::policy::PolicySeverity::Warning => AgentPolicySeverity::Warning,
+                    depgraph_core::policy::PolicySeverity::Error => AgentPolicySeverity::Error,
+                },
+                &violation.message,
+                &violation.source.id,
+                &violation.target.id,
+                violation.profile_id.as_deref(),
+                violation.change_id.as_deref(),
+                violation.suppression.is_some(),
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let annotations = result
+        .annotations
+        .iter()
+        .map(|annotation| {
+            AgentPolicyAnnotation::try_new(
+                &annotation.violation_id,
+                &annotation.rule_id,
+                match annotation.level {
+                    depgraph_core::policy::PolicyAnnotationLevel::Warning => {
+                        AgentPolicyAnnotationLevel::Warning
+                    }
+                    depgraph_core::policy::PolicyAnnotationLevel::Error => {
+                        AgentPolicyAnnotationLevel::Error
+                    }
+                },
+                &annotation.path,
+                annotation.start_line,
+                annotation.start_column,
+                annotation.end_line,
+                annotation.end_column,
+                &annotation.title,
+                &annotation.message,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    AgentPolicyEvaluationResponse::try_new(
+        &result.from_snapshot_id,
+        &result.to_snapshot_id,
+        &result.result.result_id,
+        &result.result.policy_config_digest,
+        result.result.exit_code == 0,
+        result.result.exit_code,
+        api_changes,
+        violations,
+        annotations,
+        AgentPolicySummary {
+            errors: result.result.summary.errors,
+            warnings: result.result.summary.warnings,
+            suppressed: result.result.summary.suppressed,
+        },
+        &result.collection_digest,
+    )
+}
+
+fn project_graph_export(
+    result: GraphExportResult,
+) -> Result<AgentGraphExportResponse, ContractBuildError> {
+    let format = match result.format {
+        GraphExportFormat::Json => AgentGraphExportFormat::Json,
+        GraphExportFormat::Dot => AgentGraphExportFormat::Dot,
+        GraphExportFormat::Mermaid => AgentGraphExportFormat::Mermaid,
+        GraphExportFormat::Graphml => AgentGraphExportFormat::Graphml,
+    };
+    let media_type = match result.media_type.as_str() {
+        "application/json" => AgentGraphExportMediaType::Json,
+        "text/vnd.graphviz" => AgentGraphExportMediaType::Graphviz,
+        "text/vnd.mermaid" => AgentGraphExportMediaType::Mermaid,
+        "application/graphml+xml" => AgentGraphExportMediaType::Graphml,
+        _ => return Err(ContractBuildError::AgentDtoValue),
+    };
+    AgentGraphExportResponse::try_new(
+        &result.schema_version,
+        &result.snapshot_id,
+        format,
+        media_type,
+        result.content,
+        &result.content_sha256,
+        result.output_bytes,
+        result.node_count,
+        result.edge_count,
+    )
+}
+
 enum ToolExecutionFailure {
     Service(DepgraphServiceError),
     Agent(AgentError),
@@ -450,6 +747,9 @@ impl ServerHandler for DepgraphMcpServer {
                 | "graph_impact_get"
                 | "graph_cycles_list"
                 | "graph_unresolved_list"
+                | "snapshot_diff_get"
+                | "policy_evaluate"
+                | "graph_export"
                 | "graph_query"
                 | "runtime_trace_validate"
         ) {
@@ -1086,6 +1386,80 @@ fn execute_catalog_read_tool(
             ))
             .map_err(Into::into)
         }
+        "snapshot_diff_get" => {
+            let arguments = decode_arguments::<SnapshotDiffArguments>(arguments)?;
+            authorize_repository(
+                arguments.contract_version,
+                &arguments.repository_id,
+                repository_id,
+            )?;
+            let request = SnapshotDiffRequest::new(
+                SnapshotLocator::parse(&arguments.from)?,
+                SnapshotLocator::parse(&arguments.to)?,
+                SnapshotDiffFilters::try_new(arguments.kinds, Vec::new(), Vec::new(), Vec::new())?,
+            );
+            let result = project_snapshot_diff(service.snapshot_diff(&request, cancellation)?)
+                .map_err(contract_mapping_error)?;
+            let snapshot_id = result.to_snapshot_id.clone();
+            CanonicalResponseMapper::success(&SuccessEnvelope::new(
+                repository_id.clone(),
+                Some(snapshot_id),
+                result,
+            ))
+            .map_err(Into::into)
+        }
+        "policy_evaluate" => {
+            let arguments = decode_arguments::<PolicyEvaluateArguments>(arguments)?;
+            authorize_repository(
+                arguments.contract_version,
+                &arguments.repository_id,
+                repository_id,
+            )?;
+            let request = PolicyEvaluateRequest::new(
+                SnapshotLocator::parse(&arguments.from)?,
+                SnapshotLocator::parse(&arguments.to)?,
+            );
+            let result = project_policy_result(service.policy_evaluate(&request, cancellation)?)
+                .map_err(contract_mapping_error)?;
+            let snapshot_id = result.to_snapshot_id.clone();
+            CanonicalResponseMapper::success(&SuccessEnvelope::new(
+                repository_id.clone(),
+                Some(snapshot_id),
+                result,
+            ))
+            .map_err(Into::into)
+        }
+        "graph_export" => {
+            let arguments = decode_arguments::<GraphExportArguments>(arguments)?;
+            authorize_repository(
+                arguments.contract_version,
+                &arguments.repository_id,
+                repository_id,
+            )?;
+            let request = GraphExportRequest::try_new(
+                SnapshotLocator::parse(arguments.snapshot.as_deref().unwrap_or("current"))?,
+                arguments.format.into(),
+                arguments
+                    .selector
+                    .map(|selector| selector.as_str().to_owned()),
+                GraphQueryFilter::default(),
+                arguments
+                    .max_nodes
+                    .unwrap_or(DEFAULT_GRAPH_EXPORT_MAX_NODES),
+                arguments
+                    .max_edges
+                    .unwrap_or(DEFAULT_GRAPH_EXPORT_MAX_EDGES),
+            )?;
+            let result = project_graph_export(service.graph_export(&request, cancellation)?)
+                .map_err(contract_mapping_error)?;
+            let snapshot_id = result.snapshot_id.clone();
+            CanonicalResponseMapper::export_success(&SuccessEnvelope::new(
+                repository_id.clone(),
+                Some(snapshot_id),
+                result,
+            ))
+            .map_err(Into::into)
+        }
         "graph_query" => {
             let arguments = decode_arguments::<GraphQueryArguments>(arguments)?;
             authorize_repository(
@@ -1229,7 +1603,9 @@ fn contract_mapping_error(error: ContractBuildError) -> ToolExecutionFailure {
         | ContractBuildError::TooManyPhases
         | ContractBuildError::TooManyEvidenceItems
         | ContractBuildError::TooManyTargetItems
-        | ContractBuildError::TooManyQueryValues => DepgraphServiceError::ResourceExhausted,
+        | ContractBuildError::TooManyQueryValues
+        | ContractBuildError::TooManyArtifactItems
+        | ContractBuildError::TooManyChangedFields => DepgraphServiceError::ResourceExhausted,
         _ => DepgraphServiceError::Integrity,
     })
 }

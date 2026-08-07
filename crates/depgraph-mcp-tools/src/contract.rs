@@ -447,6 +447,7 @@ pub enum AgentRemediation {
     SelectCompletedSnapshot,
     RestartFromFirstPage,
     NarrowQuery,
+    ExportFile,
     IncreaseLimit,
     EnableRequiredCapability,
     Retry,
@@ -672,4 +673,14 @@ pub enum ContractBuildError {
     TooManyQueryValues,
     #[error("Agent query value is outside the closed projection contract")]
     QueryValue,
+    #[error("Agent artifact response contains too many items")]
+    TooManyArtifactItems,
+    #[error("Agent artifact change contains too many changed fields")]
+    TooManyChangedFields,
+    #[error("Agent snapshot diff state is inconsistent")]
+    SnapshotDiffState,
+    #[error("Agent policy evaluation state is inconsistent")]
+    PolicyEvaluationState,
+    #[error("Agent graph export state is inconsistent")]
+    GraphExportState,
 }

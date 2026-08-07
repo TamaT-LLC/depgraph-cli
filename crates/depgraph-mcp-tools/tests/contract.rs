@@ -5,20 +5,23 @@ use depgraph_mcp_tools::{
     AgentContext, AgentCorrelationDifference, AgentCorrelationStatus, AgentCoverage,
     AgentCurrentSnapshot, AgentCycle, AgentCycleLevel, AgentDependenciesResponse,
     AgentDependencyDirection, AgentEdge, AgentError, AgentErrorCategory, AgentErrorCode,
-    AgentErrorDetails, AgentEvidence, AgentEvidenceKind, AgentImpact, AgentImpactResponse,
-    AgentLocator, AgentNamedSnapshot, AgentNode, AgentNodeSummary, AgentPathResponse,
-    AgentPathStep, AgentPhase, AgentPrecision, AgentQueryRow, AgentRemediation,
-    AgentResolutionStatus, AgentResourceLimit, AgentRuntimeValidationResponse, AgentSite,
-    AgentSnapshot, AgentSourcePosition, AgentSourceSpan, AgentUnresolved, CommonRequest,
-    ContractBuildError, Cursor, DurableSubmitResult, ErrorEnvelope, LogicalRepositoryId,
-    MAX_AGENT_CORRELATION_REASONS, MAX_AGENT_CYCLE_NODES, MAX_AGENT_PHASES, MAX_AGENT_QUERY_VALUES,
-    MAX_PAGE_BYTES, MAX_PAGE_ITEMS, MAX_TASK_TTL_MS, MIN_TASK_TTL_MS, OperationAccepted,
-    OperationRecoveryTools, Page, PageByteLimit, PageRequest, PageSize, RepositoryRelativePath,
-    SnapshotId, SnapshotSelector, SuccessEnvelope, TASK_POLL_INTERVAL_MS, TaskAccepted,
-    TasksNegotiation, canonical_json_bytes,
+    AgentErrorDetails, AgentEvidence, AgentEvidenceKind, AgentGraphExportResponse, AgentImpact,
+    AgentImpactResponse, AgentLocator, AgentNamedSnapshot, AgentNode, AgentNodeSummary,
+    AgentPathResponse, AgentPathStep, AgentPhase, AgentPolicyAnnotation, AgentPolicyApiChange,
+    AgentPolicyEvaluationResponse, AgentPolicyViolation, AgentPrecision, AgentQueryRow,
+    AgentRemediation, AgentResolutionStatus, AgentResourceLimit, AgentRuntimeValidationResponse,
+    AgentSite, AgentSnapshot, AgentSnapshotDiffResponse, AgentSourcePosition, AgentSourceSpan,
+    AgentUnresolved, CommonRequest, ContractBuildError, Cursor, DurableSubmitResult, ErrorEnvelope,
+    LogicalRepositoryId, MAX_AGENT_CHANGED_FIELDS, MAX_AGENT_CORRELATION_REASONS,
+    MAX_AGENT_CYCLE_NODES, MAX_AGENT_PHASES, MAX_AGENT_QUERY_VALUES, MAX_PAGE_BYTES,
+    MAX_PAGE_ITEMS, MAX_TASK_TTL_MS, MIN_TASK_TTL_MS, OperationAccepted, OperationRecoveryTools,
+    Page, PageByteLimit, PageRequest, PageSize, RepositoryRelativePath, SnapshotId,
+    SnapshotSelector, SuccessEnvelope, TASK_POLL_INTERVAL_MS, TaskAccepted, TasksNegotiation,
+    canonical_json_bytes,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
+use sha2::Digest as _;
 
 const OPERATION_ID: &str = "op_0123456789abcdef0123456789abcdef";
 const SNAPSHOT_ID: &str =
@@ -686,6 +689,151 @@ fn issue_304_query_and_runtime_dtos_reject_forged_shapes_and_counts() {
     let mut page_mismatch = valid;
     page_mismatch["summary"]["events"] = json!(2);
     assert!(serde_json::from_value::<AgentRuntimeValidationResponse>(page_mismatch).is_err());
+}
+
+#[test]
+fn issue_305_artifact_dtos_reject_unbounded_or_forged_wire_values() {
+    let digest = "a".repeat(64);
+    let snapshot_diff = json!({
+        "schema_version":"depgraph-snapshot-diff-service-v1",
+        "from_snapshot_id":SNAPSHOT_ID,
+        "to_snapshot_id":SNAPSHOT_ID,
+        "total_changes":0,
+        "empty":true,
+        "changes":[],
+        "collection_digest":format!("snapshot-diff-collection:sha256:{digest}")
+    });
+    assert!(serde_json::from_value::<AgentSnapshotDiffResponse>(snapshot_diff.clone()).is_ok());
+    for (field, value) in [
+        ("schema_version", json!("1.0")),
+        (
+            "from_snapshot_id",
+            json!(format!("snapshot:sha256:{}", "A".repeat(64))),
+        ),
+        ("collection_digest", json!(digest.clone())),
+    ] {
+        let mut invalid = snapshot_diff.clone();
+        invalid[field] = value;
+        assert!(
+            serde_json::from_value::<AgentSnapshotDiffResponse>(invalid).is_err(),
+            "snapshot diff accepted invalid {field}"
+        );
+    }
+    let mut oversized_fields = snapshot_diff.clone();
+    oversized_fields["total_changes"] = json!(1);
+    oversized_fields["empty"] = json!(false);
+    oversized_fields["changes"] = json!([{
+        "record_type":"node",
+        "change_type":"changed",
+        "id":"node:a",
+        "changed_fields":(0..=MAX_AGENT_CHANGED_FIELDS)
+            .map(|index| format!("field_{index:03}"))
+            .collect::<Vec<_>>()
+    }]);
+    assert!(
+        serde_json::from_value::<AgentSnapshotDiffResponse>(oversized_fields).is_err(),
+        "snapshot diff accepted an oversized changed_fields vector"
+    );
+
+    let policy = json!({
+        "from_snapshot_id":SNAPSHOT_ID,
+        "to_snapshot_id":SNAPSHOT_ID,
+        "result_id":format!("policy-evaluation:sha256:{digest}"),
+        "policy_config_digest":format!("policy-config:sha256:{digest}"),
+        "passed":true,
+        "exit_code":0,
+        "api_changes":[],
+        "violations":[],
+        "annotations":[],
+        "summary":{"errors":0,"warnings":0,"suppressed":0},
+        "collection_digest":format!("policy-evaluation-collection:sha256:{digest}")
+    });
+    assert!(serde_json::from_value::<AgentPolicyEvaluationResponse>(policy.clone()).is_ok());
+    for (field, value) in [
+        (
+            "result_id",
+            json!(format!("policy-evaluation:sha256:{}", "0".repeat(63))),
+        ),
+        (
+            "policy_config_digest",
+            json!(format!("other:sha256:{digest}")),
+        ),
+        ("exit_code", json!(2)),
+    ] {
+        let mut invalid = policy.clone();
+        invalid[field] = value;
+        assert!(
+            serde_json::from_value::<AgentPolicyEvaluationResponse>(invalid).is_err(),
+            "policy response accepted invalid {field}"
+        );
+    }
+    assert!(
+        serde_json::from_value::<AgentPolicyViolation>(json!({
+            "id":format!("policy-violation:sha256:{digest}"),
+            "rule_id":"rule-a",
+            "severity":"fatal",
+            "message":"bounded message",
+            "source_id":"node:a",
+            "target_id":"node:b",
+            "suppressed":false
+        }))
+        .is_err()
+    );
+    assert!(
+        serde_json::from_value::<AgentPolicyApiChange>(json!({
+            "id":format!("policy-api-change:sha256:{digest}"),
+            "rule_id":"rule-a",
+            "kind":"added",
+            "breaking":true,
+            "changed_fields":[],
+            "after_id":"node:b"
+        }))
+        .is_err(),
+        "compatible addition accepted a forged breaking flag"
+    );
+    assert!(
+        serde_json::from_value::<AgentPolicyAnnotation>(json!({
+            "violation_id":format!("policy-violation:sha256:{digest}"),
+            "rule_id":"rule-a",
+            "level":"warning",
+            "path":"../private.rs",
+            "start_line":1,
+            "start_column":1,
+            "end_line":1,
+            "end_column":2,
+            "title":"policy warning",
+            "message":"bounded message"
+        }))
+        .is_err()
+    );
+
+    let content = "{}";
+    let content_digest = format!("{:x}", sha2::Sha256::digest(content.as_bytes()));
+    let graph_export = json!({
+        "schema_version":"depgraph-graph-export-service-v1",
+        "snapshot_id":SNAPSHOT_ID,
+        "format":"json",
+        "media_type":"application/json",
+        "content":content,
+        "content_sha256":content_digest,
+        "output_bytes":2,
+        "node_count":0,
+        "edge_count":0
+    });
+    assert!(serde_json::from_value::<AgentGraphExportResponse>(graph_export.clone()).is_ok());
+    for (field, value) in [
+        ("media_type", json!("text/vnd.graphviz")),
+        ("content_sha256", json!(digest)),
+        ("output_bytes", json!(3)),
+        ("node_count", json!(50_001)),
+    ] {
+        let mut invalid = graph_export.clone();
+        invalid[field] = value;
+        assert!(
+            serde_json::from_value::<AgentGraphExportResponse>(invalid).is_err(),
+            "graph export accepted invalid {field}"
+        );
+    }
 }
 
 #[test]

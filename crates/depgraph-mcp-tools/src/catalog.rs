@@ -1,5 +1,6 @@
 use std::{collections::BTreeSet, fmt::Write as _};
 
+use depgraph_core::service::{MAX_GRAPH_EXPORT_EDGES, MAX_GRAPH_EXPORT_NODES};
 use depgraph_core::{DepgraphCapability, DepgraphCapabilitySet};
 use schemars::{JsonSchema, SchemaGenerator, generate::SchemaSettings};
 use serde_json::{Map, Value, json};
@@ -7,9 +8,10 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     AgentCompletedSnapshot, AgentContext, AgentCycle, AgentCycleLevel, AgentDaemonStatus,
-    AgentDependenciesResponse, AgentDoctor, AgentId, AgentImpactResponse, AgentLabel, AgentLocator,
-    AgentNamedSnapshot, AgentNodeSummary, AgentPathResponse, AgentProfilePlan, AgentQueryRow,
-    AgentRuntimeValidationResponse, AgentUnresolved, Cursor, LogicalRepositoryId,
+    AgentDependenciesResponse, AgentDoctor, AgentGraphExportResponse, AgentId, AgentImpactResponse,
+    AgentLabel, AgentLocator, AgentNamedSnapshot, AgentNodeSummary, AgentPathResponse,
+    AgentPolicyEvaluationResponse, AgentProfilePlan, AgentQueryRow, AgentRuntimeValidationResponse,
+    AgentSnapshotDiffResponse, AgentUnresolved, Cursor, LogicalRepositoryId,
     MCP_TOOLS_CONTRACT_VERSION, OperationId, Page, RepositoryRelativePath, SnapshotId,
     SnapshotName, SuccessEnvelope,
 };
@@ -523,11 +525,11 @@ const TOOL_SPECS: &[ToolSpec] = &[
     tool_spec!(
         "snapshot_diff_get",
         "Compare two immutable completed snapshots.",
-        ["from", "to", "kinds", "cursor", "limit"],
+        ["from", "to", "kinds"],
         [CliAction::Diff],
         READ,
         ToolAuthorization::FixedCapabilities,
-        OperationBehavior::MayCreateDurableOperation
+        OperationBehavior::Immediate
     ),
     tool_spec!(
         "policy_evaluate",
@@ -545,7 +547,7 @@ const TOOL_SPECS: &[ToolSpec] = &[
         [CliAction::Export],
         READ,
         ToolAuthorization::FixedCapabilities,
-        OperationBehavior::MayCreateDurableOperation
+        OperationBehavior::Immediate
     ),
     tool_spec!(
         "operation_get",
@@ -764,6 +766,15 @@ fn output_schema(spec: &ToolSpec) -> Map<String, Value> {
         "runtime_trace_validate" => {
             return exact_success_output_schema::<AgentRuntimeValidationResponse>(spec.name);
         }
+        "snapshot_diff_get" => {
+            return exact_success_output_schema::<AgentSnapshotDiffResponse>(spec.name);
+        }
+        "policy_evaluate" => {
+            return exact_success_output_schema::<AgentPolicyEvaluationResponse>(spec.name);
+        }
+        "graph_export" => {
+            return exact_success_output_schema::<AgentGraphExportResponse>(spec.name);
+        }
         _ => {}
     }
     let immediate = json!({
@@ -884,17 +895,18 @@ fn field_schema(tool_name: &str, field: &str) -> Value {
         "cursor" => scalar_schema::<Cursor>(),
         "operation_id" => scalar_schema::<OperationId>(),
         "node_id" | "site_id" => scalar_schema::<AgentId>(),
-        "selector" | "from" | "to" => scalar_schema::<AgentLocator>(),
+        "selector" => scalar_schema::<AgentLocator>(),
+        "from" | "to" if matches!(tool_name, "snapshot_diff_get" | "policy_evaluate") => {
+            snapshot_selector_schema()
+        }
+        "from" | "to" => scalar_schema::<AgentLocator>(),
         "changed_since" => scalar_schema::<AgentLabel>(),
         "level" => scalar_schema::<AgentCycleLevel>(),
         "name" => scalar_schema::<SnapshotName>(),
-        "snapshot" => json!({
-            "oneOf": [
-                {"type": "string", "pattern": "^[Cc][Uu][Rr][Rr][Ee][Nn][Tt]$"},
-                scalar_schema::<SnapshotId>(),
-                scalar_schema::<SnapshotName>()
-            ]
-        }),
+        "snapshot" => snapshot_selector_schema(),
+        "format" if tool_name == "graph_export" => {
+            json!({"type": "string", "enum": ["json", "dot", "mermaid", "graphml"]})
+        }
         "strict" | "no_cache" | "force" | "details" | "rust_compiler_precise" | "transitive" => {
             json!({"type": "boolean"})
         }
@@ -902,6 +914,12 @@ fn field_schema(tool_name: &str, field: &str) -> Value {
         "depth" => json!({"type": "integer", "minimum": 0}),
         "limit" | "max_depth" | "max_paths" => {
             json!({"type": "integer", "minimum": 1})
+        }
+        "max_nodes" if tool_name == "graph_export" => {
+            json!({"type": "integer", "minimum": 1, "maximum": MAX_GRAPH_EXPORT_NODES})
+        }
+        "max_edges" if tool_name == "graph_export" => {
+            json!({"type": "integer", "minimum": 1, "maximum": MAX_GRAPH_EXPORT_EDGES})
         }
         "max_nodes" | "max_edges" => {
             json!({"type": "integer", "minimum": 1, "maximum": 1000000})
@@ -927,6 +945,16 @@ fn field_schema(tool_name: &str, field: &str) -> Value {
         }),
         _ => json!({"type": "string", "minLength": 1, "maxLength": 1048576}),
     }
+}
+
+fn snapshot_selector_schema() -> Value {
+    json!({
+        "oneOf": [
+            {"type": "string", "pattern": "^[Cc][Uu][Rr][Rr][Ee][Nn][Tt]$"},
+            scalar_schema::<SnapshotId>(),
+            scalar_schema::<SnapshotName>()
+        ]
+    })
 }
 
 fn scalar_schema<T: JsonSchema>() -> Value {

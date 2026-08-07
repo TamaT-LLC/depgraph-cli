@@ -105,6 +105,18 @@ impl Default for ProfileConfig {
 }
 
 impl Config {
+    pub(crate) fn parse(raw: &str) -> Result<Self> {
+        let config: Self = toml::from_str(raw).context("failed to parse repository config")?;
+        if config.schema_version != 1 {
+            bail!(
+                "unsupported config schema_version {}; expected 1",
+                config.schema_version
+            );
+        }
+        config.validate()?;
+        Ok(config)
+    }
+
     pub fn load(root: &Path) -> Result<Self> {
         let path = root.join(CONFIG_FILE);
         match std::fs::symlink_metadata(&path) {
@@ -129,18 +141,7 @@ impl Config {
         }
         let raw = std::fs::read_to_string(&canonical_path)
             .with_context(|| format!("failed to read {}", path.display()))?;
-        let config: Config =
-            toml::from_str(&raw).with_context(|| format!("failed to parse {}", path.display()))?;
-        if config.schema_version != 1 {
-            bail!(
-                "unsupported config schema_version {}; expected 1",
-                config.schema_version
-            );
-        }
-        config
-            .validate()
-            .with_context(|| format!("invalid {}", path.display()))?;
-        Ok(config)
+        Self::parse(&raw).with_context(|| format!("invalid {}", path.display()))
     }
 
     fn validate(&self) -> Result<()> {

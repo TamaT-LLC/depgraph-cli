@@ -1,9 +1,9 @@
 use std::{path::Path, process::Command};
 
 use depgraph_mcp_tools::{
-    AgentContext, AgentError, AgentLocator, AgentNode, AgentNodeSummary, AgentSourceSpan,
-    MCP_TOOLS_SCHEMA_ID, Page, RepositoryRelativePath, TaskAccepted, canonical_schema_bytes,
-    canonical_schema_sha256, mcp_tools_v1_schema,
+    AgentArtifactId, AgentContext, AgentError, AgentLocator, AgentNode, AgentNodeSummary,
+    AgentSourceSpan, MCP_TOOLS_SCHEMA_ID, Page, RepositoryRelativePath, TaskAccepted,
+    canonical_schema_bytes, canonical_schema_sha256, mcp_tools_v1_schema,
 };
 use serde_json::{Value, json};
 
@@ -16,6 +16,164 @@ const SNAPSHOT_ID: &str =
 
 fn schema_value() -> Value {
     serde_json::to_value(mcp_tools_v1_schema()).expect("schema is serializable")
+}
+
+#[test]
+fn issue_305_shared_schema_publishes_new_closed_response_definitions() {
+    let schema = schema_value();
+    let definitions = schema["$defs"].as_object().expect("schema definitions");
+
+    for definition in [
+        "AgentSnapshotDiffResponse",
+        "AgentPolicyEvaluationResponse",
+        "AgentGraphExportResponse",
+    ] {
+        let value = definitions
+            .get(definition)
+            .unwrap_or_else(|| panic!("missing {definition} definition"));
+        assert_eq!(value["additionalProperties"], false);
+    }
+}
+
+#[test]
+fn issue_305_schema_closes_artifact_enums_scalars_and_collection_bounds() {
+    let schema = schema_value();
+    let definitions = schema["$defs"].as_object().unwrap();
+    assert_eq!(
+        definitions["SnapshotId"]["pattern"],
+        r"^snapshot:sha256:[0-9a-f]{64}$"
+    );
+    assert_eq!(
+        definitions["SnapshotDiffCollectionDigest"]["pattern"],
+        r"^snapshot-diff-collection:sha256:[0-9a-f]{64}$"
+    );
+    assert_eq!(
+        definitions["PolicyConfigDigest"]["pattern"],
+        r"^policy-config:sha256:[0-9a-f]{64}$"
+    );
+    assert_eq!(definitions["Sha256Digest"]["pattern"], r"^[0-9a-f]{64}$");
+    for (definition, max_bytes) in [
+        ("AgentArtifactId", 1_024_u64),
+        ("AgentPolicyText", 4_096_u64),
+        (
+            "AgentGraphExportContent",
+            u64::from(depgraph_mcp_tools::MAX_PAGE_BYTES),
+        ),
+    ] {
+        assert_eq!(
+            definitions[definition]["x-depgraph-maxUtf8Bytes"], max_bytes,
+            "missing UTF-8 byte bound for {definition}"
+        );
+        assert!(
+            definitions[definition]["description"]
+                .as_str()
+                .is_some_and(|description| description.contains("UTF-8 bytes")),
+            "missing UTF-8 byte description for {definition}"
+        );
+        assert!(
+            definitions[definition].get("maxLength").is_none(),
+            "JSON Schema maxLength counts Unicode characters, not UTF-8 bytes"
+        );
+    }
+    assert_eq!(
+        definitions["AgentSnapshotDiffResponse"]["properties"]["changes"]["maxItems"],
+        50_000
+    );
+    for field in ["api_changes", "violations", "annotations"] {
+        assert_eq!(
+            definitions["AgentPolicyEvaluationResponse"]["properties"][field]["maxItems"], 50_000,
+            "missing policy {field} maxItems"
+        );
+    }
+
+    let validator_for = |definition: &str| {
+        let wrapper = json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$defs": schema["$defs"].clone(),
+            "$ref": format!("#/$defs/{definition}"),
+        });
+        jsonschema::draft202012::new(&wrapper).unwrap()
+    };
+    let over_byte_limit = "あ".repeat(342);
+    assert!(validator_for("AgentArtifactId").is_valid(&json!(&over_byte_limit)));
+    assert!(
+        serde_json::from_value::<AgentArtifactId>(json!(&over_byte_limit)).is_err(),
+        "Serde must enforce the authoritative UTF-8 byte bound"
+    );
+    let digest = "a".repeat(64);
+    let diff = validator_for("AgentSnapshotDiffResponse");
+    let valid_diff = json!({
+        "schema_version":"depgraph-snapshot-diff-service-v1",
+        "from_snapshot_id":SNAPSHOT_ID,
+        "to_snapshot_id":SNAPSHOT_ID,
+        "total_changes":0,
+        "empty":true,
+        "changes":[],
+        "collection_digest":format!("snapshot-diff-collection:sha256:{digest}")
+    });
+    assert!(diff.is_valid(&valid_diff));
+    for (field, value) in [
+        ("schema_version", json!("v1")),
+        ("to_snapshot_id", json!("current")),
+        ("collection_digest", json!(digest.clone())),
+    ] {
+        let mut invalid = valid_diff.clone();
+        invalid[field] = value;
+        assert!(!diff.is_valid(&invalid), "schema accepted invalid {field}");
+    }
+
+    let change = validator_for("AgentSnapshotDiffChange");
+    assert!(!change.is_valid(&json!({
+        "record_type":"raw_record",
+        "change_type":"changed",
+        "id":"node:a",
+        "changed_fields":[]
+    })));
+    assert!(!change.is_valid(&json!({
+        "record_type":"node",
+        "change_type":"changed",
+        "id":"node:a",
+        "changed_fields":(0..=256).map(|index| format!("field_{index}")).collect::<Vec<_>>()
+    })));
+
+    let violation = validator_for("AgentPolicyViolation");
+    assert!(!violation.is_valid(&json!({
+        "id":format!("policy-violation:sha256:{digest}"),
+        "rule_id":"rule-a",
+        "severity":"fatal",
+        "message":"bounded",
+        "source_id":"node:a",
+        "target_id":"node:b",
+        "suppressed":false
+    })));
+
+    let export = validator_for("AgentGraphExportResponse");
+    let valid_export = json!({
+        "schema_version":"depgraph-graph-export-service-v1",
+        "snapshot_id":SNAPSHOT_ID,
+        "format":"json",
+        "media_type":"application/json",
+        "content":"{}",
+        "content_sha256":digest,
+        "output_bytes":2,
+        "node_count":0,
+        "edge_count":0
+    });
+    assert!(export.is_valid(&valid_export));
+    for (field, value) in [
+        ("format", json!("raw")),
+        ("media_type", json!("text/plain")),
+        ("content_sha256", json!("A".repeat(64))),
+        ("node_count", json!(50_001)),
+        ("edge_count", json!(100_001)),
+    ] {
+        let mut invalid = valid_export.clone();
+        invalid[field] = value;
+        assert!(
+            !export.is_valid(&invalid),
+            "schema accepted invalid {field}"
+        );
+    }
 }
 
 fn inject_unknown(mut instance: Value) -> Value {
@@ -450,7 +608,7 @@ fn every_generated_object_schema_has_additional_properties_false() {
     let schema = schema_value();
     let mut objects = 0;
     assert_all_object_schemas_are_closed(&schema, "#", &mut objects);
-    assert_eq!(objects, 129, "review newly added object schemas explicitly");
+    assert_eq!(objects, 140, "review newly added object schemas explicitly");
 }
 
 #[test]

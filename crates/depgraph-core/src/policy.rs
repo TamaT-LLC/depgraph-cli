@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 
 use anyhow::{Context, Result, bail};
 use depgraph_protocol::{
-    Condition, EvidenceKind, Precision, ResolutionStatus, stable_id_from_value,
+    Condition, EvidenceKind, Precision, ResolutionStatus, canonical_json, stable_id_from_value,
 };
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
@@ -67,6 +67,84 @@ impl PolicyConfig {
         }
         Ok(())
     }
+
+    /// Returns the normalized semantic identity used to address policy results.
+    ///
+    /// Policy evaluation treats rules, suppressions, selector exclusions and
+    /// filter operands as sets. Keep the source configuration intact for
+    /// diagnostics and evaluation, but sort those set-like collections and
+    /// canonicalize commutative conditions before hashing their identity.
+    pub fn normalized_identity(&self) -> Result<Value> {
+        self.validate()?;
+        let mut rules = self
+            .rules
+            .iter()
+            .map(normalized_rule_identity)
+            .collect::<Result<Vec<_>>>()?;
+        let mut suppressions = self
+            .suppressions
+            .iter()
+            .map(normalized_suppression_identity)
+            .collect::<Result<Vec<_>>>()?;
+        sort_identity_values(&mut rules);
+        sort_identity_values(&mut suppressions);
+        Ok(json!({
+            "schema_version": self.schema_version,
+            "rules": rules,
+            "suppressions": suppressions,
+        }))
+    }
+}
+
+fn normalized_rule_identity(rule: &PolicyRule) -> Result<Value> {
+    let mut value = serde_json::to_value(rule)?;
+    normalize_selector_identity(&mut value, "/source")?;
+    normalize_selector_identity(&mut value, "/target")?;
+    normalize_profile_filter_identity(&mut value, "/profiles")?;
+    sort_identity_array(&mut value, "/precisions")?;
+    sort_identity_array(&mut value, "/resolution_statuses")?;
+    sort_identity_array(&mut value, "/evidence/kinds")?;
+    value["condition"] = serde_json::to_value(rule.condition.canonicalized())?;
+    Ok(value)
+}
+
+fn normalized_suppression_identity(suppression: &PolicySuppression) -> Result<Value> {
+    let mut value = serde_json::to_value(suppression)?;
+    if suppression.scope.source.is_some() {
+        normalize_selector_identity(&mut value, "/scope/source")?;
+    }
+    if suppression.scope.target.is_some() {
+        normalize_selector_identity(&mut value, "/scope/target")?;
+    }
+    normalize_profile_filter_identity(&mut value, "/scope/profiles")?;
+    if let Some(condition) = &suppression.scope.condition {
+        value["scope"]["condition"] = serde_json::to_value(condition.canonicalized())?;
+    }
+    Ok(value)
+}
+
+fn normalize_selector_identity(value: &mut Value, base: &str) -> Result<()> {
+    sort_identity_array(value, &format!("{base}/exclude"))?;
+    sort_identity_array(value, &format!("{base}/scope/paths"))?;
+    sort_identity_array(value, &format!("{base}/scope/packages"))
+}
+
+fn normalize_profile_filter_identity(value: &mut Value, base: &str) -> Result<()> {
+    sort_identity_array(value, &format!("{base}/include"))?;
+    sort_identity_array(value, &format!("{base}/exclude"))
+}
+
+fn sort_identity_array(value: &mut Value, pointer: &str) -> Result<()> {
+    let values = value
+        .pointer_mut(pointer)
+        .and_then(Value::as_array_mut)
+        .with_context(|| format!("policy identity field {pointer} is not an array"))?;
+    sort_identity_values(values);
+    Ok(())
+}
+
+fn sort_identity_values(values: &mut [Value]) {
+    values.sort_by_cached_key(canonical_json);
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

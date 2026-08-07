@@ -14,6 +14,10 @@ pub const MAX_AGENT_ID_BYTES: usize = 256;
 pub const MAX_AGENT_TOKEN_BYTES: usize = 64;
 pub const MAX_AGENT_LOCATOR_BYTES: usize = 1_024;
 pub const MAX_AGENT_LABEL_BYTES: usize = 256;
+pub const MAX_AGENT_ARTIFACT_ID_BYTES: usize = 1_024;
+pub const MAX_AGENT_FIELD_NAME_BYTES: usize = 256;
+pub const MAX_AGENT_POLICY_TEXT_BYTES: usize = 4_096;
+pub const MAX_AGENT_GRAPH_EXPORT_CONTENT_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum ContractValueError {
@@ -37,6 +41,28 @@ pub enum ContractValueError {
     AgentLocator,
     #[error("Agent label is outside the closed contract")]
     AgentLabel,
+    #[error("Agent artifact identifier is outside the closed contract")]
+    AgentArtifactId,
+    #[error("Agent field name is outside the closed contract")]
+    AgentFieldName,
+    #[error("Agent policy text is outside the closed contract")]
+    AgentPolicyText,
+    #[error("snapshot diff collection digest is outside the closed contract")]
+    SnapshotDiffCollectionDigest,
+    #[error("policy configuration digest is outside the closed contract")]
+    PolicyConfigDigest,
+    #[error("policy evaluation identifier is outside the closed contract")]
+    PolicyEvaluationId,
+    #[error("policy evaluation collection digest is outside the closed contract")]
+    PolicyEvaluationCollectionDigest,
+    #[error("policy violation identifier is outside the closed contract")]
+    PolicyViolationId,
+    #[error("policy API change identifier is outside the closed contract")]
+    PolicyApiChangeId,
+    #[error("SHA-256 digest is outside the closed contract")]
+    Sha256Digest,
+    #[error("Agent graph export content is outside the closed contract")]
+    AgentGraphExportContent,
 }
 
 macro_rules! string_newtype {
@@ -280,6 +306,126 @@ string_newtype!(
     })
 );
 
+string_newtype!(
+    AgentArtifactId,
+    ContractValueError::AgentArtifactId,
+    valid_agent_artifact_id,
+    json_schema!({
+        "type": "string",
+        "minLength": 1,
+        "description": "Artifact identifiers are limited to 1024 UTF-8 bytes by the contract; JSON Schema maxLength is intentionally omitted because it counts Unicode characters.",
+        "x-depgraph-maxUtf8Bytes": MAX_AGENT_ARTIFACT_ID_BYTES,
+        "pattern": r"^[^\u0000-\u001f\u007f]+$"
+    })
+);
+
+string_newtype!(
+    AgentFieldName,
+    ContractValueError::AgentFieldName,
+    valid_agent_field_name,
+    json_schema!({
+        "type": "string",
+        "minLength": 1,
+        "maxLength": MAX_AGENT_FIELD_NAME_BYTES,
+        "pattern": r"^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    })
+);
+
+string_newtype!(
+    AgentPolicyText,
+    ContractValueError::AgentPolicyText,
+    valid_agent_policy_text,
+    json_schema!({
+        "type": "string",
+        "minLength": 1,
+        "description": "Policy text is limited to 4096 UTF-8 bytes by the contract; JSON Schema maxLength is intentionally omitted because it counts Unicode characters.",
+        "x-depgraph-maxUtf8Bytes": MAX_AGENT_POLICY_TEXT_BYTES,
+        "pattern": r"^[^\u0000-\u001f\u007f]+$"
+    })
+);
+
+string_newtype!(
+    SnapshotDiffCollectionDigest,
+    ContractValueError::SnapshotDiffCollectionDigest,
+    valid_snapshot_diff_collection_digest,
+    json_schema!({
+        "type": "string",
+        "pattern": r"^snapshot-diff-collection:sha256:[0-9a-f]{64}$"
+    })
+);
+
+string_newtype!(
+    PolicyConfigDigest,
+    ContractValueError::PolicyConfigDigest,
+    valid_policy_config_digest,
+    json_schema!({
+        "type": "string",
+        "pattern": r"^policy-config:sha256:[0-9a-f]{64}$"
+    })
+);
+
+string_newtype!(
+    PolicyEvaluationId,
+    ContractValueError::PolicyEvaluationId,
+    valid_policy_evaluation_id,
+    json_schema!({
+        "type": "string",
+        "pattern": r"^policy-evaluation:sha256:[0-9a-f]{64}$"
+    })
+);
+
+string_newtype!(
+    PolicyEvaluationCollectionDigest,
+    ContractValueError::PolicyEvaluationCollectionDigest,
+    valid_policy_evaluation_collection_digest,
+    json_schema!({
+        "type": "string",
+        "pattern": r"^policy-evaluation-collection:sha256:[0-9a-f]{64}$"
+    })
+);
+
+string_newtype!(
+    PolicyViolationId,
+    ContractValueError::PolicyViolationId,
+    valid_policy_violation_id,
+    json_schema!({
+        "type": "string",
+        "pattern": r"^policy-violation:sha256:[0-9a-f]{64}$"
+    })
+);
+
+string_newtype!(
+    PolicyApiChangeId,
+    ContractValueError::PolicyApiChangeId,
+    valid_policy_api_change_id,
+    json_schema!({
+        "type": "string",
+        "pattern": r"^policy-api-change:sha256:[0-9a-f]{64}$"
+    })
+);
+
+string_newtype!(
+    Sha256Digest,
+    ContractValueError::Sha256Digest,
+    valid_sha256_digest,
+    json_schema!({
+        "type": "string",
+        "pattern": r"^[0-9a-f]{64}$"
+    })
+);
+
+string_newtype!(
+    AgentGraphExportContent,
+    ContractValueError::AgentGraphExportContent,
+    valid_agent_graph_export_content,
+    json_schema!({
+        "type": "string",
+        "minLength": 1,
+        "description": "Inline graph export content is limited to 16777216 UTF-8 bytes by the contract; JSON Schema maxLength is intentionally omitted because it counts Unicode characters.",
+        "x-depgraph-maxUtf8Bytes": MAX_AGENT_GRAPH_EXPORT_CONTENT_BYTES
+    })
+);
+
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 pub struct TaskId(OperationId);
@@ -507,4 +653,70 @@ fn valid_agent_label(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= MAX_AGENT_LABEL_BYTES
         && !value.chars().any(char::is_control)
+}
+
+fn valid_agent_artifact_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_AGENT_ARTIFACT_ID_BYTES
+        && !value.chars().any(char::is_control)
+}
+
+fn valid_agent_field_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_AGENT_FIELD_NAME_BYTES
+        && value
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
+}
+
+fn valid_agent_policy_text(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_AGENT_POLICY_TEXT_BYTES
+        && !value.chars().any(char::is_control)
+}
+
+fn valid_snapshot_diff_collection_digest(value: &str) -> bool {
+    valid_prefixed_sha256(value, "snapshot-diff-collection")
+}
+
+fn valid_policy_config_digest(value: &str) -> bool {
+    valid_prefixed_sha256(value, "policy-config")
+}
+
+fn valid_policy_evaluation_id(value: &str) -> bool {
+    valid_prefixed_sha256(value, "policy-evaluation")
+}
+
+fn valid_policy_evaluation_collection_digest(value: &str) -> bool {
+    valid_prefixed_sha256(value, "policy-evaluation-collection")
+}
+
+fn valid_policy_violation_id(value: &str) -> bool {
+    valid_prefixed_sha256(value, "policy-violation")
+}
+
+fn valid_policy_api_change_id(value: &str) -> bool {
+    valid_prefixed_sha256(value, "policy-api-change")
+}
+
+fn valid_prefixed_sha256(value: &str, namespace: &str) -> bool {
+    value
+        .strip_prefix(namespace)
+        .and_then(|value| value.strip_prefix(":sha256:"))
+        .is_some_and(valid_sha256_digest)
+}
+
+fn valid_sha256_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn valid_agent_graph_export_content(value: &str) -> bool {
+    !value.is_empty() && value.len() <= MAX_AGENT_GRAPH_EXPORT_CONTENT_BYTES
 }
