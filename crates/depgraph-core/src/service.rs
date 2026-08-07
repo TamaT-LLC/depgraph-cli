@@ -9,8 +9,10 @@ use depgraph_store::Store;
 
 pub use crate::service_agent::{
     CompletedSnapshotView, CompletedSnapshotsPage, CoverageRecord, CurrentSnapshot,
-    CurrentSnapshotAvailability, DepgraphContext, FindNodesPageResult, FindNodesResult,
-    MAX_FIND_NODES_QUERY_BYTES, NamedCompletedSnapshot, NodeMatchMode, NodeProjection,
+    CurrentSnapshotAvailability, DepgraphContext, EdgeDirection, EdgeProjection,
+    EvidenceProjection, FindNodesPageResult, FindNodesResult, GraphEdgesPageResult,
+    GraphEvidencePageResult, GraphSitesPageResult, MAX_FIND_NODES_QUERY_BYTES,
+    NamedCompletedSnapshot, NodeMatchMode, NodeProjection, SiteProjection,
 };
 pub use crate::service_artifacts::{
     ClosedChangedRecord, ClosedRecordDiff, DEFAULT_GRAPH_EXPORT_MAX_EDGES,

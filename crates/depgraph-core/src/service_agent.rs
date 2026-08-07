@@ -324,6 +324,202 @@ impl DepgraphContext {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EvidenceProjection {
+    kind: String,
+    extractor: String,
+    extractor_version: String,
+    path: String,
+    start_line: u64,
+    start_column: u64,
+    end_line: u64,
+    end_column: u64,
+}
+
+impl EvidenceProjection {
+    #[must_use]
+    pub fn kind(&self) -> &str {
+        &self.kind
+    }
+    #[must_use]
+    pub fn extractor(&self) -> &str {
+        &self.extractor
+    }
+    #[must_use]
+    pub fn extractor_version(&self) -> &str {
+        &self.extractor_version
+    }
+    #[must_use]
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+    #[must_use]
+    pub const fn start_line(&self) -> u64 {
+        self.start_line
+    }
+    #[must_use]
+    pub const fn start_column(&self) -> u64 {
+        self.start_column
+    }
+    #[must_use]
+    pub const fn end_line(&self) -> u64 {
+        self.end_line
+    }
+    #[must_use]
+    pub const fn end_column(&self) -> u64 {
+        self.end_column
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SiteProjection {
+    id: String,
+    source: String,
+    kind: String,
+    specifier: Option<String>,
+    profile_id: String,
+    resolution_status: String,
+    target_ids: Vec<String>,
+    reason: Option<String>,
+    evidence: Vec<EvidenceProjection>,
+}
+impl SiteProjection {
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+    #[must_use]
+    pub fn source(&self) -> &str {
+        &self.source
+    }
+    #[must_use]
+    pub fn kind(&self) -> &str {
+        &self.kind
+    }
+    #[must_use]
+    pub fn specifier(&self) -> Option<&str> {
+        self.specifier.as_deref()
+    }
+    #[must_use]
+    pub fn profile_id(&self) -> &str {
+        &self.profile_id
+    }
+    #[must_use]
+    pub fn resolution_status(&self) -> &str {
+        &self.resolution_status
+    }
+    #[must_use]
+    pub fn target_ids(&self) -> &[String] {
+        &self.target_ids
+    }
+    #[must_use]
+    pub fn reason(&self) -> Option<&str> {
+        self.reason.as_deref()
+    }
+    #[must_use]
+    pub fn evidence(&self) -> &[EvidenceProjection] {
+        &self.evidence
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EdgeProjection {
+    id: String,
+    site_id: Option<String>,
+    source: String,
+    target: String,
+    kind: String,
+    phase: String,
+    profile_id: String,
+    resolution_status: String,
+    precision: String,
+    evidence: Vec<EvidenceProjection>,
+}
+impl EdgeProjection {
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+    #[must_use]
+    pub fn site_id(&self) -> Option<&str> {
+        self.site_id.as_deref()
+    }
+    #[must_use]
+    pub fn source(&self) -> &str {
+        &self.source
+    }
+    #[must_use]
+    pub fn target(&self) -> &str {
+        &self.target
+    }
+    #[must_use]
+    pub fn kind(&self) -> &str {
+        &self.kind
+    }
+    #[must_use]
+    pub fn phase(&self) -> &str {
+        &self.phase
+    }
+    #[must_use]
+    pub fn profile_id(&self) -> &str {
+        &self.profile_id
+    }
+    #[must_use]
+    pub fn resolution_status(&self) -> &str {
+        &self.resolution_status
+    }
+    #[must_use]
+    pub fn precision(&self) -> &str {
+        &self.precision
+    }
+    #[must_use]
+    pub fn evidence(&self) -> &[EvidenceProjection] {
+        &self.evidence
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EdgeDirection {
+    Incoming,
+    Outgoing,
+    Both,
+}
+
+macro_rules! graph_page {
+    ($name:ident, $item:ty) => {
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub struct $name {
+            snapshot_id: ResolvedSnapshotId,
+            items: Vec<$item>,
+            total_items: u64,
+        }
+        impl $name {
+            fn new(snapshot_id: ResolvedSnapshotId, items: Vec<$item>, total_items: u64) -> Self {
+                Self {
+                    snapshot_id,
+                    items,
+                    total_items,
+                }
+            }
+            #[must_use]
+            pub const fn snapshot_id(&self) -> &ResolvedSnapshotId {
+                &self.snapshot_id
+            }
+            #[must_use]
+            pub fn items(&self) -> &[$item] {
+                &self.items
+            }
+            #[must_use]
+            pub const fn total_items(&self) -> u64 {
+                self.total_items
+            }
+        }
+    };
+}
+graph_page!(GraphSitesPageResult, SiteProjection);
+graph_page!(GraphEdgesPageResult, EdgeProjection);
+graph_page!(GraphEvidencePageResult, EvidenceProjection);
+
 impl DepgraphService {
     pub fn get_context(&self) -> DepgraphServiceResult<DepgraphContext> {
         self.get_context_cancellable(&CancellationToken::new())
@@ -558,6 +754,193 @@ impl DepgraphService {
         }
         CompletedSnapshotView::from_store(details.map_err(DepgraphServiceError::store_operation)?)
     }
+
+    pub fn list_sites_page(
+        &self,
+        snapshot_id: &ResolvedSnapshotId,
+        node_id: Option<&str>,
+        offset: usize,
+        limit: usize,
+        cancellation: &CancellationToken,
+    ) -> DepgraphServiceResult<GraphSitesPageResult> {
+        validate_page_limit(self, limit)?;
+        let snapshot = self.load_agent_snapshot(snapshot_id, cancellation)?;
+        let mut items = snapshot
+            .sites
+            .into_iter()
+            .filter(|site| node_id.is_none_or(|id| site.source == id))
+            .map(|site| {
+                let mut evidence = site_evidence(&snapshot.evidence, "site", &site.id);
+                evidence.sort_by(evidence_order);
+                SiteProjection {
+                    id: site.id,
+                    source: site.source,
+                    kind: site.kind,
+                    specifier: site.specifier,
+                    profile_id: site.profile_id,
+                    resolution_status: site.resolution_status,
+                    target_ids: site.target_ids,
+                    reason: site.reason,
+                    evidence,
+                }
+            })
+            .collect::<Vec<_>>();
+        items.sort_by(|left, right| left.id.cmp(&right.id));
+        graph_page_from_items(snapshot_id, items, offset, limit, GraphSitesPageResult::new)
+    }
+
+    pub fn list_edges_page(
+        &self,
+        snapshot_id: &ResolvedSnapshotId,
+        node_id: &str,
+        direction: EdgeDirection,
+        offset: usize,
+        limit: usize,
+        cancellation: &CancellationToken,
+    ) -> DepgraphServiceResult<GraphEdgesPageResult> {
+        validate_page_limit(self, limit)?;
+        let snapshot = self.load_agent_snapshot(snapshot_id, cancellation)?;
+        let mut items = snapshot
+            .edges
+            .into_iter()
+            .filter(|edge| match direction {
+                EdgeDirection::Incoming => edge.target == node_id,
+                EdgeDirection::Outgoing => edge.source == node_id,
+                EdgeDirection::Both => edge.source == node_id || edge.target == node_id,
+            })
+            .map(|edge| {
+                let mut evidence = site_evidence(&snapshot.evidence, "edge", &edge.id);
+                evidence.sort_by(evidence_order);
+                EdgeProjection {
+                    id: edge.id,
+                    site_id: edge.site_id,
+                    source: edge.source,
+                    target: edge.target,
+                    kind: edge.kind,
+                    phase: edge.phase,
+                    profile_id: edge.profile_id,
+                    resolution_status: edge.resolution_status,
+                    precision: edge.precision,
+                    evidence,
+                }
+            })
+            .collect::<Vec<_>>();
+        items.sort_by(|left, right| left.id.cmp(&right.id));
+        graph_page_from_items(snapshot_id, items, offset, limit, GraphEdgesPageResult::new)
+    }
+
+    pub fn list_site_evidence_page(
+        &self,
+        snapshot_id: &ResolvedSnapshotId,
+        site_id: &str,
+        offset: usize,
+        limit: usize,
+        cancellation: &CancellationToken,
+    ) -> DepgraphServiceResult<GraphEvidencePageResult> {
+        validate_page_limit(self, limit)?;
+        let snapshot = self.load_agent_snapshot(snapshot_id, cancellation)?;
+        if !snapshot.sites.iter().any(|site| site.id == site_id) {
+            return Err(DepgraphServiceError::NotFound);
+        }
+        let mut items = site_evidence(&snapshot.evidence, "site", site_id);
+        items.sort_by(evidence_order);
+        graph_page_from_items(
+            snapshot_id,
+            items,
+            offset,
+            limit,
+            GraphEvidencePageResult::new,
+        )
+    }
+
+    fn load_agent_snapshot(
+        &self,
+        snapshot_id: &ResolvedSnapshotId,
+        cancellation: &CancellationToken,
+    ) -> DepgraphServiceResult<depgraph_store::GraphSnapshot> {
+        if cancellation.is_cancelled() {
+            return Err(DepgraphServiceError::Cancelled);
+        }
+        let mut read_store = self.read_store_factory().open()?;
+        let cancellation_check = cancellation.clone();
+        let snapshot = read_store.store().interruptible_read(
+            move || cancellation_check.is_cancelled(),
+            |store| store.load_completed_snapshot(snapshot_id.as_str()),
+        );
+        if cancellation.is_cancelled() {
+            return Err(DepgraphServiceError::Cancelled);
+        }
+        snapshot.map_err(DepgraphServiceError::store_operation)
+    }
+}
+
+fn evidence_projection(record: &depgraph_store::EvidenceRecord) -> EvidenceProjection {
+    EvidenceProjection {
+        kind: record.kind.clone(),
+        extractor: record.extractor.clone(),
+        extractor_version: record.extractor_version.clone(),
+        path: record.path.clone(),
+        start_line: record.start_line,
+        start_column: record.start_column,
+        end_line: record.end_line,
+        end_column: record.end_column,
+    }
+}
+
+fn site_evidence(
+    records: &[depgraph_store::EvidenceRecord],
+    owner_type: &str,
+    owner_id: &str,
+) -> Vec<EvidenceProjection> {
+    records
+        .iter()
+        .filter(|record| record.owner_type == owner_type && record.owner_id == owner_id)
+        .map(evidence_projection)
+        .collect()
+}
+
+fn evidence_order(left: &EvidenceProjection, right: &EvidenceProjection) -> std::cmp::Ordering {
+    (
+        &left.path,
+        left.start_line,
+        left.start_column,
+        left.end_line,
+        left.end_column,
+        &left.extractor,
+        &left.extractor_version,
+        &left.kind,
+    )
+        .cmp(&(
+            &right.path,
+            right.start_line,
+            right.start_column,
+            right.end_line,
+            right.end_column,
+            &right.extractor,
+            &right.extractor_version,
+            &right.kind,
+        ))
+}
+
+fn graph_page_from_items<T, R>(
+    snapshot_id: &ResolvedSnapshotId,
+    mut items: Vec<T>,
+    offset: usize,
+    limit: usize,
+    build: impl FnOnce(ResolvedSnapshotId, Vec<T>, u64) -> R,
+) -> DepgraphServiceResult<R> {
+    let total_items =
+        u64::try_from(items.len()).map_err(|_| DepgraphServiceError::ResourceExhausted)?;
+    let end = offset
+        .checked_add(limit)
+        .ok_or(DepgraphServiceError::ResourceExhausted)?
+        .min(items.len());
+    if offset > items.len() {
+        items.clear();
+    } else {
+        items = items.drain(offset..end).collect();
+    }
+    Ok(build(snapshot_id.clone(), items, total_items))
 }
 
 fn validate_find_nodes_query(query: &str) -> DepgraphServiceResult<()> {

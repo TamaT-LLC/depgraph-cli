@@ -2137,6 +2137,129 @@ impl TryFrom<&depgraph_core::query::TraversalPageItem> for AgentPathStep {
     }
 }
 
+impl TryFrom<&depgraph_core::service::NodeProjection> for AgentNode {
+    type Error = ContractBuildError;
+
+    fn try_from(source: &depgraph_core::service::NodeProjection) -> Result<Self, Self::Error> {
+        agent_node_from_fields(
+            source.id(),
+            source.kind(),
+            source.locator(),
+            source.display_name(),
+            &serde_json::Value::Null,
+        )
+    }
+}
+
+impl TryFrom<&depgraph_core::service::EvidenceProjection> for AgentEvidence {
+    type Error = ContractBuildError;
+
+    fn try_from(source: &depgraph_core::service::EvidenceProjection) -> Result<Self, Self::Error> {
+        agent_evidence(
+            source.kind(),
+            source.extractor(),
+            source.extractor_version(),
+            source.path(),
+            source.start_line(),
+            source.start_column(),
+            source.end_line(),
+            source.end_column(),
+        )
+    }
+}
+
+impl TryFrom<&depgraph_core::service::SiteProjection> for AgentSite {
+    type Error = ContractBuildError;
+
+    fn try_from(source: &depgraph_core::service::SiteProjection) -> Result<Self, Self::Error> {
+        let evidence = source
+            .evidence()
+            .iter()
+            .map(AgentEvidence::try_from)
+            .collect::<Result<Vec<_>, _>>()?;
+        let targets = source
+            .target_ids()
+            .iter()
+            .map(|id| parse_agent_value(id))
+            .collect::<Result<Vec<_>, _>>()?;
+        let span = source.evidence().first().and_then(|evidence| {
+            safe_source_span(
+                evidence.path(),
+                evidence.start_line(),
+                evidence.start_column(),
+                evidence.end_line(),
+                evidence.end_column(),
+            )
+        });
+        let specifier = source
+            .specifier()
+            .and_then(|value| AgentLocator::parse(value).ok())
+            .or_else(|| AgentLocator::parse(format!("id:{}", source.id())).ok())
+            .ok_or(ContractBuildError::AgentDtoValue)?;
+        let status = match source.resolution_status() {
+            "resolved" => AgentResolutionStatus::Resolved,
+            "candidates" => AgentResolutionStatus::Candidates,
+            "external" => AgentResolutionStatus::External,
+            "unresolved" => AgentResolutionStatus::Unresolved,
+            _ => return Err(ContractBuildError::AgentDtoValue),
+        };
+        AgentSite::new_with_reason(
+            parse_agent_value(source.id())?,
+            parse_agent_value(source.source())?,
+            parse_agent_value(source.kind())?,
+            specifier,
+            status,
+            parse_agent_value(source.profile_id())?,
+            source
+                .reason()
+                .and_then(|value| AgentLabel::parse(value).ok()),
+            targets,
+            span,
+            evidence,
+        )
+    }
+}
+
+impl TryFrom<&depgraph_core::service::EdgeProjection> for AgentEdge {
+    type Error = ContractBuildError;
+
+    fn try_from(source: &depgraph_core::service::EdgeProjection) -> Result<Self, Self::Error> {
+        let evidence = source
+            .evidence()
+            .iter()
+            .map(AgentEvidence::try_from)
+            .collect::<Result<Vec<_>, _>>()?;
+        let phase = agent_phase(source.phase())?;
+        let status = match source.resolution_status() {
+            "resolved" => AgentResolutionStatus::Resolved,
+            "candidates" => AgentResolutionStatus::Candidates,
+            "external" => AgentResolutionStatus::External,
+            "unresolved" => AgentResolutionStatus::Unresolved,
+            _ => return Err(ContractBuildError::AgentDtoValue),
+        };
+        let precision = match source.precision() {
+            "exact" => AgentPrecision::Exact,
+            "overapprox" => AgentPrecision::Overapprox,
+            "heuristic" => AgentPrecision::Heuristic,
+            "observed" => AgentPrecision::Observed,
+            _ => return Err(ContractBuildError::AgentDtoValue),
+        };
+        AgentEdge::new(
+            parse_agent_value(source.id())?,
+            parse_agent_value(source.source())?,
+            parse_agent_value(source.target())?,
+            parse_agent_value(source.kind())?,
+            phase,
+            status,
+            precision,
+            parse_agent_value(source.profile_id())?,
+            parse_optional_agent_value(source.site_id())?,
+            None,
+            evidence,
+        )
+    }
+}
+
 impl TryFrom<&depgraph_core::service::DependenciesResult> for AgentNode {
     type Error = ContractBuildError;
 

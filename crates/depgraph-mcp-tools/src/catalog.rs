@@ -8,13 +8,21 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     AgentCompletedSnapshot, AgentContext, AgentCycle, AgentCycleLevel, AgentDaemonStatus,
-    AgentDependenciesResponse, AgentDoctor, AgentGraphExportResponse, AgentId, AgentImpactResponse,
-    AgentLabel, AgentLocator, AgentNamedSnapshot, AgentNodeSummary, AgentPathResponse,
-    AgentPolicyEvaluationResponse, AgentProfilePlan, AgentQueryRow, AgentRuntimeValidationResponse,
-    AgentSnapshotDiffResponse, AgentUnresolved, Cursor, LogicalRepositoryId,
-    MCP_TOOLS_CONTRACT_VERSION, OperationId, Page, RepositoryRelativePath, SnapshotId,
-    SnapshotName, SuccessEnvelope,
+    AgentDependenciesResponse, AgentDoctor, AgentEdge, AgentEvidence, AgentGraphExportResponse,
+    AgentId, AgentImpactResponse, AgentLabel, AgentLocator, AgentNamedSnapshot, AgentNode,
+    AgentNodeSummary, AgentPathResponse, AgentPolicyEvaluationResponse, AgentProfilePlan,
+    AgentQueryRow, AgentRuntimeValidationResponse, AgentSite, AgentSnapshotDiffResponse,
+    AgentUnresolved, Cursor, ErrorEnvelope, LogicalRepositoryId, MCP_TOOLS_CONTRACT_VERSION,
+    OperationId, Page, RepositoryRelativePath, SnapshotId, SnapshotName, SuccessEnvelope,
 };
+
+#[allow(dead_code)]
+#[derive(JsonSchema)]
+#[serde(untagged)]
+enum ExactToolOutput<T> {
+    Success(SuccessEnvelope<T>),
+    Error(ErrorEnvelope),
+}
 
 macro_rules! define_cli_actions {
     ($($variant:ident => $stable_id:literal),+ $(,)?) => {
@@ -727,6 +735,18 @@ fn output_schema(spec: &ToolSpec) -> Map<String, Value> {
         "get_context" => {
             return exact_success_output_schema::<AgentContext>(spec.name);
         }
+        "agent_node_get" => {
+            return exact_success_output_schema::<AgentNode>(spec.name);
+        }
+        "agent_sites_list" => {
+            return exact_success_output_schema::<Page<AgentSite>>(spec.name);
+        }
+        "agent_edges_list" => {
+            return exact_success_output_schema::<Page<AgentEdge>>(spec.name);
+        }
+        "agent_evidence_list" => {
+            return exact_success_output_schema::<Page<AgentEvidence>>(spec.name);
+        }
         "agent_nodes_list" => {
             return exact_success_output_schema::<Page<AgentNodeSummary>>(spec.name);
         }
@@ -801,7 +821,7 @@ fn output_schema(spec: &ToolSpec) -> Map<String, Value> {
         "required": ["contract_version", "repository_id", "result", "diagnostics", "pagination"],
         "additionalProperties": false
     });
-    let schema = match spec.operation_behavior {
+    let mut schema = match spec.operation_behavior {
         OperationBehavior::Immediate => json!({
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "title": format!("{}_output", spec.name),
@@ -827,7 +847,57 @@ fn output_schema(spec: &ToolSpec) -> Map<String, Value> {
             "$defs": {"accepted_operation": accepted_operation_output_schema()}
         }),
     };
+    add_error_output_branch(&mut schema);
     json_object(schema)
+}
+
+fn add_error_output_branch(schema: &mut Value) {
+    let mut error_schema = serde_json::to_value(
+        SchemaSettings::draft2020_12()
+            .for_serialize()
+            .into_generator()
+            .into_root_schema_for::<ErrorEnvelope>(),
+    )
+    .expect("closed error envelope schema serializes");
+    let error = error_schema
+        .as_object_mut()
+        .expect("error envelope schema is an object");
+    error.remove("$schema");
+    error.remove("title");
+    let error_definitions = error.remove("$defs").unwrap_or_else(|| json!({}));
+
+    let root = schema
+        .as_object_mut()
+        .expect("operation output schema is an object");
+    let definitions = root
+        .get_mut("$defs")
+        .and_then(Value::as_object_mut)
+        .expect("operation output schema has definitions");
+    for (name, definition) in error_definitions
+        .as_object()
+        .expect("error definitions are an object")
+    {
+        assert!(
+            definitions
+                .insert(name.clone(), definition.clone())
+                .is_none(),
+            "error definition {name} collides with an operation output definition"
+        );
+    }
+    definitions.insert("error_envelope".to_owned(), Value::Object(error.clone()));
+
+    let error_reference = json!({"$ref": "#/$defs/error_envelope"});
+    if let Some(reference) = root.remove("$ref") {
+        root.insert(
+            "oneOf".to_owned(),
+            json!([{ "$ref": reference }, error_reference]),
+        );
+    } else {
+        root.get_mut("oneOf")
+            .and_then(Value::as_array_mut)
+            .expect("multi-shape operation output uses oneOf")
+            .push(error_reference);
+    }
 }
 
 fn exact_success_output_schema<T: JsonSchema>(tool_name: &str) -> Map<String, Value> {
@@ -835,7 +905,7 @@ fn exact_success_output_schema<T: JsonSchema>(tool_name: &str) -> Map<String, Va
         SchemaSettings::draft2020_12()
             .for_serialize()
             .into_generator()
-            .into_root_schema_for::<SuccessEnvelope<T>>(),
+            .into_root_schema_for::<ExactToolOutput<T>>(),
     )
     .expect("closed success envelope schemas serialize");
     schema
@@ -891,6 +961,9 @@ fn field_schema(tool_name: &str, field: &str) -> Value {
         }),
         "match_mode" => {
             json!({"type": "string", "enum": ["exact", "prefix", "contains"]})
+        }
+        "direction" => {
+            json!({"type": "string", "enum": ["incoming", "outgoing"]})
         }
         "cursor" => scalar_schema::<Cursor>(),
         "operation_id" => scalar_schema::<OperationId>(),

@@ -11,10 +11,10 @@ use clap::{Parser, ValueEnum};
 use depgraph_core::service::{
     BoundedQueryMode, BoundedQueryRequest, ClosedRecordDiff, CyclesRequest,
     DEFAULT_GRAPH_EXPORT_MAX_EDGES, DEFAULT_GRAPH_EXPORT_MAX_NODES, DependenciesRequest,
-    DependencyDirection, DoctorRequest, ExplainPathRequest, GraphExportFormat, GraphExportRequest,
-    GraphExportResult, ImpactRequest, NodeMatchMode, PolicyEvaluateRequest, PolicyEvaluationResult,
-    ProfilePlanRequest, RuntimeValidateRequest, ServiceSnapshotSelector, SnapshotDiffFilters,
-    SnapshotDiffRequest, SnapshotDiffResult, UnresolvedRequest,
+    DependencyDirection, DoctorRequest, EdgeDirection, ExplainPathRequest, GraphExportFormat,
+    GraphExportRequest, GraphExportResult, ImpactRequest, NodeMatchMode, PolicyEvaluateRequest,
+    PolicyEvaluationResult, ProfilePlanRequest, RuntimeValidateRequest, ServiceSnapshotSelector,
+    SnapshotDiffFilters, SnapshotDiffRequest, SnapshotDiffResult, UnresolvedRequest,
 };
 use depgraph_core::{
     CancellationToken, CycleLevel, DepgraphCapability, DepgraphCapabilitySet, DepgraphService,
@@ -25,12 +25,13 @@ use depgraph_core::{
 use depgraph_mcp::runtime::{AuditLogger, RuntimeClass, RuntimeConfig, RuntimeController};
 use depgraph_mcp_tools::{
     AgentCompletedSnapshot, AgentContext, AgentCycleLevel, AgentDaemonStatus,
-    AgentDependencyDirection, AgentDoctor, AgentError, AgentGraphExportFormat,
-    AgentGraphExportMediaType, AgentGraphExportResponse, AgentLocator, AgentNamedSnapshot,
-    AgentNodeSummary, AgentPathResponse, AgentPolicyAnnotation, AgentPolicyAnnotationLevel,
-    AgentPolicyApiChange, AgentPolicyApiChangeKind, AgentPolicyEvaluationResponse,
-    AgentPolicySeverity, AgentPolicySummary, AgentPolicyViolation, AgentProfilePlan,
-    AgentRuntimeTraceEvent, AgentRuntimeValidationResponse, AgentSnapshotDiffChange,
+    AgentDependencyDirection, AgentDoctor, AgentEdge, AgentError, AgentEvidence,
+    AgentGraphExportFormat, AgentGraphExportMediaType, AgentGraphExportResponse, AgentId,
+    AgentLocator, AgentNamedSnapshot, AgentNode, AgentNodeSummary, AgentPathResponse,
+    AgentPolicyAnnotation, AgentPolicyAnnotationLevel, AgentPolicyApiChange,
+    AgentPolicyApiChangeKind, AgentPolicyEvaluationResponse, AgentPolicySeverity,
+    AgentPolicySummary, AgentPolicyViolation, AgentProfilePlan, AgentRuntimeTraceEvent,
+    AgentRuntimeValidationResponse, AgentSite, AgentSnapshotDiffChange,
     AgentSnapshotDiffChangeType, AgentSnapshotDiffRecordType, AgentSnapshotDiffResponse,
     AgentToken, BoundedQueryProjectionFailure, CanonicalResponseMapper, ContractBuildError,
     ContractVersion, Cursor, CursorKey, ErrorEnvelope, LogicalRepositoryId, MappedToolResult,
@@ -181,6 +182,81 @@ struct FindNodesArguments {
     snapshot: Option<String>,
     #[serde(default)]
     kinds: Vec<String>,
+    #[serde(default)]
+    cursor: Option<Cursor>,
+    #[serde(default)]
+    limit: Option<u16>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentNodeGetArguments {
+    contract_version: ContractVersion,
+    repository_id: LogicalRepositoryId,
+    node_id: String,
+    #[serde(default)]
+    snapshot: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentSitesListArguments {
+    contract_version: ContractVersion,
+    repository_id: LogicalRepositoryId,
+    #[serde(default)]
+    snapshot: Option<String>,
+    #[serde(default)]
+    node_id: Option<String>,
+    #[serde(default)]
+    cursor: Option<Cursor>,
+    #[serde(default)]
+    limit: Option<u16>,
+}
+
+#[derive(Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum AgentEdgesDirection {
+    Incoming,
+    Outgoing,
+    Both,
+}
+impl From<AgentEdgesDirection> for EdgeDirection {
+    fn from(value: AgentEdgesDirection) -> Self {
+        match value {
+            AgentEdgesDirection::Incoming => Self::Incoming,
+            AgentEdgesDirection::Outgoing => Self::Outgoing,
+            AgentEdgesDirection::Both => Self::Both,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentEdgesListArguments {
+    contract_version: ContractVersion,
+    repository_id: LogicalRepositoryId,
+    node_id: String,
+    #[serde(default)]
+    snapshot: Option<String>,
+    #[serde(default = "default_agent_edges_direction")]
+    direction: AgentEdgesDirection,
+    #[serde(default)]
+    cursor: Option<Cursor>,
+    #[serde(default)]
+    limit: Option<u16>,
+}
+fn default_agent_edges_direction() -> AgentEdgesDirection {
+    AgentEdgesDirection::Both
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentEvidenceListArguments {
+    contract_version: ContractVersion,
+    repository_id: LogicalRepositoryId,
+    site_id: String,
+    #[serde(default)]
+    snapshot: Option<String>,
     #[serde(default)]
     cursor: Option<Cursor>,
     #[serde(default)]
@@ -736,6 +812,10 @@ impl ServerHandler for DepgraphMcpServer {
             tool.as_str(),
             "get_context"
                 | "agent_nodes_list"
+                | "agent_node_get"
+                | "agent_sites_list"
+                | "agent_edges_list"
+                | "agent_evidence_list"
                 | "snapshot_list"
                 | "snapshot_get"
                 | "profile_plan_get"
@@ -752,6 +832,9 @@ impl ServerHandler for DepgraphMcpServer {
                 | "graph_export"
                 | "graph_query"
                 | "runtime_trace_validate"
+                | "operation_get"
+                | "operation_result"
+                | "operation_cancel"
         ) {
             return Err(McpError::invalid_params(
                 "tool handler is unavailable",
@@ -958,6 +1041,207 @@ fn execute_catalog_read_tool(
                 .nodes()
                 .iter()
                 .map(AgentNodeSummary::try_from)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| ToolExecutionFailure::Service(DepgraphServiceError::Integrity))?;
+            let page = pagination
+                .paginate_window(&items, offset, found.total_items(), &request)
+                .map_err(ToolExecutionFailure::Agent)?;
+            CanonicalResponseMapper::success(&SuccessEnvelope::new(
+                repository_id.clone(),
+                Some(snapshot_id),
+                page,
+            ))
+            .map_err(Into::into)
+        }
+        "agent_node_get" => {
+            let arguments = decode_arguments::<AgentNodeGetArguments>(arguments)?;
+            authorize_repository(
+                arguments.contract_version,
+                &arguments.repository_id,
+                repository_id,
+            )?;
+            let node_id = AgentId::parse(&arguments.node_id)
+                .map_err(|_| ToolExecutionFailure::Service(DepgraphServiceError::InvalidInput))?;
+            let snapshot =
+                SnapshotLocator::parse(arguments.snapshot.as_deref().unwrap_or("current"))?;
+            let resolved_snapshot_id =
+                service.resolve_snapshot_id_cancellable(&snapshot, cancellation)?;
+            let snapshot_id = parse_snapshot_id(resolved_snapshot_id.as_str())?;
+            let found = service.find_nodes_page(
+                &resolved_snapshot_id,
+                node_id.as_str(),
+                NodeMatchMode::Exact,
+                &[],
+                0,
+                service.config().limits().max_page_items(),
+                cancellation,
+            )?;
+            let matches = found
+                .nodes()
+                .iter()
+                .filter(|node| node.id() == node_id.as_str())
+                .collect::<Vec<_>>();
+            let node = match matches.as_slice() {
+                [node] => AgentNode::try_from(*node)
+                    .map_err(|_| ToolExecutionFailure::Service(DepgraphServiceError::Integrity))?,
+                [] => {
+                    return Err(ToolExecutionFailure::Service(
+                        DepgraphServiceError::NotFound,
+                    ));
+                }
+                _ => {
+                    return Err(ToolExecutionFailure::Service(
+                        DepgraphServiceError::Integrity,
+                    ));
+                }
+            };
+            CanonicalResponseMapper::success(&SuccessEnvelope::new(
+                repository_id.clone(),
+                Some(snapshot_id),
+                node,
+            ))
+            .map_err(Into::into)
+        }
+        "agent_sites_list" => {
+            let arguments = decode_arguments::<AgentSitesListArguments>(arguments)?;
+            authorize_repository(
+                arguments.contract_version,
+                &arguments.repository_id,
+                repository_id,
+            )?;
+            if let Some(node_id) = arguments.node_id.as_deref() {
+                AgentId::parse(node_id).map_err(|_| {
+                    ToolExecutionFailure::Service(DepgraphServiceError::InvalidInput)
+                })?;
+            }
+            let snapshot =
+                SnapshotLocator::parse(arguments.snapshot.as_deref().unwrap_or("current"))?;
+            let resolved_snapshot_id =
+                service.resolve_snapshot_id_cancellable(&snapshot, cancellation)?;
+            let snapshot_id = parse_snapshot_id(resolved_snapshot_id.as_str())?;
+            let normalized = serde_json::json!({"node_id": arguments.node_id});
+            let pagination = PaginationContext::new(
+                cursor_key,
+                "agent_sites_list",
+                repository_id.clone(),
+                snapshot_id.clone(),
+                &normalized,
+            )?;
+            let request = page_request(arguments.limit, arguments.cursor)?;
+            let offset = pagination
+                .cursor_offset(&request)
+                .map_err(ToolExecutionFailure::Agent)?;
+            let found = service.list_sites_page(
+                &resolved_snapshot_id,
+                arguments.node_id.as_deref(),
+                offset,
+                usize::from(request.max_items().get()),
+                cancellation,
+            )?;
+            let items = found
+                .items()
+                .iter()
+                .map(AgentSite::try_from)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| ToolExecutionFailure::Service(DepgraphServiceError::Integrity))?;
+            let page = pagination
+                .paginate_window(&items, offset, found.total_items(), &request)
+                .map_err(ToolExecutionFailure::Agent)?;
+            CanonicalResponseMapper::success(&SuccessEnvelope::new(
+                repository_id.clone(),
+                Some(snapshot_id),
+                page,
+            ))
+            .map_err(Into::into)
+        }
+        "agent_edges_list" => {
+            let arguments = decode_arguments::<AgentEdgesListArguments>(arguments)?;
+            authorize_repository(
+                arguments.contract_version,
+                &arguments.repository_id,
+                repository_id,
+            )?;
+            AgentId::parse(&arguments.node_id)
+                .map_err(|_| ToolExecutionFailure::Service(DepgraphServiceError::InvalidInput))?;
+            let snapshot =
+                SnapshotLocator::parse(arguments.snapshot.as_deref().unwrap_or("current"))?;
+            let resolved_snapshot_id =
+                service.resolve_snapshot_id_cancellable(&snapshot, cancellation)?;
+            let snapshot_id = parse_snapshot_id(resolved_snapshot_id.as_str())?;
+            let normalized =
+                serde_json::json!({"node_id": arguments.node_id, "direction": arguments.direction});
+            let pagination = PaginationContext::new(
+                cursor_key,
+                "agent_edges_list",
+                repository_id.clone(),
+                snapshot_id.clone(),
+                &normalized,
+            )?;
+            let request = page_request(arguments.limit, arguments.cursor)?;
+            let offset = pagination
+                .cursor_offset(&request)
+                .map_err(ToolExecutionFailure::Agent)?;
+            let found = service.list_edges_page(
+                &resolved_snapshot_id,
+                &arguments.node_id,
+                arguments.direction.into(),
+                offset,
+                usize::from(request.max_items().get()),
+                cancellation,
+            )?;
+            let items = found
+                .items()
+                .iter()
+                .map(AgentEdge::try_from)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| ToolExecutionFailure::Service(DepgraphServiceError::Integrity))?;
+            let page = pagination
+                .paginate_window(&items, offset, found.total_items(), &request)
+                .map_err(ToolExecutionFailure::Agent)?;
+            CanonicalResponseMapper::success(&SuccessEnvelope::new(
+                repository_id.clone(),
+                Some(snapshot_id),
+                page,
+            ))
+            .map_err(Into::into)
+        }
+        "agent_evidence_list" => {
+            let arguments = decode_arguments::<AgentEvidenceListArguments>(arguments)?;
+            authorize_repository(
+                arguments.contract_version,
+                &arguments.repository_id,
+                repository_id,
+            )?;
+            AgentId::parse(&arguments.site_id)
+                .map_err(|_| ToolExecutionFailure::Service(DepgraphServiceError::InvalidInput))?;
+            let snapshot =
+                SnapshotLocator::parse(arguments.snapshot.as_deref().unwrap_or("current"))?;
+            let resolved_snapshot_id =
+                service.resolve_snapshot_id_cancellable(&snapshot, cancellation)?;
+            let snapshot_id = parse_snapshot_id(resolved_snapshot_id.as_str())?;
+            let normalized = serde_json::json!({"site_id": arguments.site_id});
+            let pagination = PaginationContext::new(
+                cursor_key,
+                "agent_evidence_list",
+                repository_id.clone(),
+                snapshot_id.clone(),
+                &normalized,
+            )?;
+            let request = page_request(arguments.limit, arguments.cursor)?;
+            let offset = pagination
+                .cursor_offset(&request)
+                .map_err(ToolExecutionFailure::Agent)?;
+            let found = service.list_site_evidence_page(
+                &resolved_snapshot_id,
+                &arguments.site_id,
+                offset,
+                usize::from(request.max_items().get()),
+                cancellation,
+            )?;
+            let items = found
+                .items()
+                .iter()
+                .map(AgentEvidence::try_from)
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|_| ToolExecutionFailure::Service(DepgraphServiceError::Integrity))?;
             let page = pagination
