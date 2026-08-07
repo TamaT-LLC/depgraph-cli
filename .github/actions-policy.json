@@ -30,6 +30,11 @@
       "identity": "pnpm/action-setup",
       "sha": "b906affcce14559ad1aafd4ab0e942779e9f58b1",
       "reviewed_upstream_ref": "v4"
+    },
+    {
+      "identity": "Swatinem/rust-cache",
+      "sha": "6323deb102c322ba6fcbdcafc7e3dddab59af2b6",
+      "reviewed_upstream_ref": "v2"
     }
   ]
 }
