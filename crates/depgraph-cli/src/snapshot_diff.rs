@@ -980,6 +980,7 @@ fn write_service_evidence_changes(
             record.changed_fields.join(","),
         )
         .expect("writing to String cannot fail");
+        write_service_evidence(output, "before", &record.before);
         write_service_evidence(output, "after", &record.after);
     }
 }
@@ -1035,6 +1036,47 @@ mod tests {
             condition: json!({"op":"all","conditions":[]}),
             generated: false,
         }
+    }
+
+    fn service_evidence(path: &str, extractor: &str, line: u64) -> SnapshotDiffEvidence {
+        SnapshotDiffEvidence {
+            owner_type: "edge".to_owned(),
+            owner_id: "edge:changed".to_owned(),
+            ordinal: 0,
+            kind: "semantic".to_owned(),
+            extractor: extractor.to_owned(),
+            extractor_version: "1.0".to_owned(),
+            path: path.to_owned(),
+            start_line: line,
+            start_column: 1,
+            end_line: line,
+            end_column: 8,
+        }
+    }
+
+    #[test]
+    fn service_human_output_preserves_both_sides_of_changed_evidence() {
+        let records = ClosedRecordDiff {
+            added: Vec::new(),
+            removed: Vec::new(),
+            changed: vec![ClosedChangedRecord {
+                id: "edge:edge:changed#0".to_owned(),
+                changed_fields: vec!["path".to_owned(), "extractor".to_owned()],
+                before: service_evidence("src/before.rs", "before-extractor", 3),
+                after: service_evidence("src/after.rs", "after-extractor", 7),
+            }],
+        };
+        let mut rendered = String::new();
+
+        write_service_evidence_changes(&mut rendered, &records);
+
+        assert!(rendered.contains("fields=path,extractor"));
+        assert!(rendered.contains(
+            "before evidence: edge:edge:changed#0 [semantic before-extractor@1.0] src/before.rs:3:1-3:8"
+        ));
+        assert!(rendered.contains(
+            "after evidence: edge:edge:changed#0 [semantic after-extractor@1.0] src/after.rs:7:1-7:8"
+        ));
     }
 
     #[test]
