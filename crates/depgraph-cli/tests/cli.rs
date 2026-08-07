@@ -2606,11 +2606,7 @@ fn impact_changed_since_error_never_discloses_raw_git_stderr() {
     assert!(private_alternate.is_absolute());
     let alternates = root.path().join(".git/objects/info/alternates");
     fs::create_dir_all(alternates.parent().unwrap()).unwrap();
-    fs::write(
-        &alternates,
-        format!("{}\n", private_alternate.display()),
-    )
-    .unwrap();
+    fs::write(&alternates, format!("{}\n", private_alternate.display())).unwrap();
     let leaky = std::process::Command::new("git")
         .arg("-C")
         .arg(root.path())

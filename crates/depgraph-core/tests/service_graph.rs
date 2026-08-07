@@ -909,10 +909,7 @@ fn changed_since_service_error_never_discloses_raw_git_stderr() -> Result<()> {
     assert!(private_alternate.is_absolute());
     let alternates = root.join(".git/objects/info/alternates");
     fs::create_dir_all(alternates.parent().unwrap())?;
-    fs::write(
-        &alternates,
-        format!("{}\n", private_alternate.display()),
-    )?;
+    fs::write(&alternates, format!("{}\n", private_alternate.display()))?;
     let leaky = run_git(&root, &["cat-file", "-p", "HEAD"]);
     let leaky_stderr = String::from_utf8_lossy(&leaky.stderr);
     assert!(
