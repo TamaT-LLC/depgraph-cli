@@ -8,6 +8,21 @@ use depgraph_mcp_tools::{
 
 use serde_json::Value;
 
+fn success_output_schema(output: &serde_json::Map<String, Value>) -> &Value {
+    let branches = output
+        .get("oneOf")
+        .or_else(|| output.get("anyOf"))
+        .and_then(Value::as_array)
+        .expect("output schema has success/error branches");
+    let reference = branches[0]["$ref"]
+        .as_str()
+        .expect("first output branch is the success reference");
+    let definition = reference
+        .strip_prefix("#/$defs/")
+        .expect("success reference resolves in root definitions");
+    &output["$defs"][definition]
+}
+
 const EXPECTED_TOOL_NAMES: &[&str] = &[
     "agent_edges_list",
     "agent_evidence_list",
@@ -106,6 +121,22 @@ fn every_cli_leaf_action_has_a_catalog_mapping() {
 }
 
 #[test]
+fn agent_projection_inputs_encode_runtime_id_and_direction_validation() {
+    let catalog = ToolCatalog::for_capabilities(&DepgraphCapabilitySet::read_only()).unwrap();
+    let sites = catalog.tool("agent_sites_list").unwrap();
+    let edges = catalog.tool("agent_edges_list").unwrap();
+
+    assert_eq!(
+        sites.input_schema()["properties"]["node_id"]["pattern"],
+        "^[A-Za-z0-9][A-Za-z0-9._:@+-]*$"
+    );
+    assert_eq!(
+        edges.input_schema()["properties"]["direction"],
+        serde_json::json!({"type": "string", "enum": ["both", "incoming", "outgoing"]})
+    );
+}
+
+#[test]
 fn graph_dependency_and_path_tools_advertise_their_exact_closed_contracts() {
     let catalog = ToolCatalog::for_capabilities(&DepgraphCapabilitySet::read_only()).unwrap();
     for name in ["graph_dependencies_list", "graph_dependents_list"] {
@@ -136,7 +167,7 @@ fn graph_dependency_and_path_tools_advertise_their_exact_closed_contracts() {
         );
         assert_eq!(tool.operation_behavior(), OperationBehavior::Immediate);
         assert_eq!(
-            tool.output_schema()["properties"]["result"]["$ref"],
+            success_output_schema(tool.output_schema())["properties"]["result"]["$ref"],
             "#/$defs/AgentDependenciesResponse"
         );
     }
@@ -166,7 +197,7 @@ fn graph_dependency_and_path_tools_advertise_their_exact_closed_contracts() {
     );
     assert_eq!(path.operation_behavior(), OperationBehavior::Immediate);
     assert_eq!(
-        path.output_schema()["properties"]["result"]["$ref"],
+        success_output_schema(path.output_schema())["properties"]["result"]["$ref"],
         "#/$defs/AgentPathResponse"
     );
 }
@@ -234,7 +265,7 @@ fn issue_303_graph_tools_advertise_exact_closed_immediate_contracts() {
         assert_eq!(fields, expected_fields);
         assert_eq!(tool.operation_behavior(), OperationBehavior::Immediate);
         assert_eq!(
-            tool.output_schema()["properties"]["result"]["$ref"],
+            success_output_schema(tool.output_schema())["properties"]["result"]["$ref"],
             result_ref
         );
     }
@@ -297,7 +328,7 @@ fn issue_304_query_and_runtime_validate_advertise_exact_one_confined_inputs() {
         assert_eq!(tool.operation_behavior(), OperationBehavior::Immediate);
         assert_eq!(tool.input_schema()["oneOf"].as_array().unwrap().len(), 2);
         assert_eq!(
-            tool.output_schema()["properties"]["result"]["$ref"],
+            success_output_schema(tool.output_schema())["properties"]["result"]["$ref"],
             result_ref
         );
     }

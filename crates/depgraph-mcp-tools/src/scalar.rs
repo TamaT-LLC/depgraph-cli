@@ -14,6 +14,7 @@ pub const MAX_AGENT_ID_BYTES: usize = 256;
 pub const MAX_AGENT_TOKEN_BYTES: usize = 64;
 pub const MAX_AGENT_LOCATOR_BYTES: usize = 1_024;
 pub const MAX_AGENT_LABEL_BYTES: usize = 256;
+pub const MAX_AGENT_CONDITION_BYTES: usize = 64 * 1024;
 pub const MAX_AGENT_ARTIFACT_ID_BYTES: usize = 1_024;
 pub const MAX_AGENT_FIELD_NAME_BYTES: usize = 256;
 pub const MAX_AGENT_POLICY_TEXT_BYTES: usize = 4_096;
@@ -305,6 +306,26 @@ string_newtype!(
         "pattern": r"^[^\u0000-\u001f\u007f]+$"
     })
 );
+
+string_newtype!(
+    AgentCondition,
+    ContractValueError::AgentLabel,
+    valid_agent_condition,
+    json_schema!({
+        "type": "string",
+        "minLength": 1,
+        "maxLength": MAX_AGENT_CONDITION_BYTES,
+        "description": "Rendered edge conditions are limited to 65536 UTF-8 bytes so a maximally sized condition remains routable within the fixed 1 MiB MCP page budget; maxLength is a conservative character cap while x-depgraph-maxUtf8Bytes carries the exact byte contract.",
+        "x-depgraph-maxUtf8Bytes": MAX_AGENT_CONDITION_BYTES,
+        "pattern": r"^[^\u0000-\u001f\u007f-\u009f]+$"
+    })
+);
+
+impl From<AgentLabel> for AgentCondition {
+    fn from(value: AgentLabel) -> Self {
+        Self(value.0)
+    }
+}
 
 string_newtype!(
     AgentArtifactId,
@@ -652,6 +673,12 @@ fn valid_agent_locator(value: &str) -> bool {
 fn valid_agent_label(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= MAX_AGENT_LABEL_BYTES
+        && !value.chars().any(char::is_control)
+}
+
+fn valid_agent_condition(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_AGENT_CONDITION_BYTES
         && !value.chars().any(char::is_control)
 }
 

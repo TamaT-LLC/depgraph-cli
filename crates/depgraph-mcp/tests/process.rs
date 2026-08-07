@@ -69,6 +69,34 @@ fn store_invariant(path: &Path) -> StoreInvariant {
     }
 }
 
+fn source_tree_digest(root: &Path) -> String {
+    fn collect_files(root: &Path, directory: &Path, files: &mut Vec<PathBuf>) {
+        let mut entries = fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        entries.sort();
+        for path in entries {
+            if path.is_dir() {
+                collect_files(root, &path, files);
+            } else if path.is_file() {
+                files.push(path.strip_prefix(root).unwrap().to_owned());
+            }
+        }
+    }
+
+    let mut files = Vec::new();
+    collect_files(root, root, &mut files);
+    let mut digest = Sha256::new();
+    for relative in files {
+        digest.update(relative.to_string_lossy().as_bytes());
+        digest.update([0]);
+        digest.update(fs::read(root.join(&relative)).unwrap());
+        digest.update([0]);
+    }
+    format!("{:x}", digest.finalize())
+}
+
 fn seed_issue_300_store(path: &Path, root: &Path) -> String {
     let mut store = Store::open(path).unwrap();
     store
@@ -279,6 +307,25 @@ fn seed_issue_302_store(path: &Path, root: &Path) -> String {
     snapshot_id
 }
 
+fn issue_306_long_condition() -> Value {
+    let values = (0..40)
+        .map(|index| Value::String(format!("enabled-{index:02}")))
+        .collect::<Vec<_>>();
+    json!({
+        "op": "in",
+        "key": "feature",
+        "values": values
+    })
+}
+
+fn issue_306_oversized_condition() -> Value {
+    json!({
+        "op": "eq",
+        "key": "oversized",
+        "value": "x".repeat(64 * 1024 + 1)
+    })
+}
+
 fn seed_issue_303_store(path: &Path, root: &Path, source_revision: &str) -> String {
     let mut store = Store::open(path).unwrap();
     store
@@ -289,11 +336,11 @@ fn seed_issue_303_store(path: &Path, root: &Path, source_revision: &str) -> Stri
         "files_discovered": 0,
         "files_analyzed": 0,
         "files_skipped": 0,
-        "dependency_sites": 1,
+        "dependency_sites": 3,
         "resolved": 0,
         "candidates": 0,
         "external": 0,
-        "unresolved": 1,
+        "unresolved": 3,
         "unsupported_syntax": 0,
         "project_code_executed": false,
         "completeness": ["syntax-complete"],
@@ -353,6 +400,11 @@ fn seed_issue_303_store(path: &Path, root: &Path, source_revision: &str) -> Stri
     .into_iter()
     .enumerate()
     {
+        let condition = if id == "edge:impact-a" {
+            issue_306_long_condition()
+        } else {
+            json!({"op": "all", "conditions": []})
+        };
         let mut edge = common("edge_upsert", offset as u64 + 9);
         edge["edge"] = json!({
             "id": id,
@@ -364,7 +416,7 @@ fn seed_issue_303_store(path: &Path, root: &Path, source_revision: &str) -> Stri
             "profile_id": "fixture:safe",
             "resolution_status": "resolved",
             "precision": "exact",
-            "condition": {"op": "all", "conditions": []},
+            "condition": condition,
             "generated": false,
             "evidence": [{
                 "kind": "semantic",
@@ -383,17 +435,18 @@ fn seed_issue_303_store(path: &Path, root: &Path, source_revision: &str) -> Stri
     }
     let mut site = common("dependency_site", 13);
     site["site"] = json!({
-        "id": "site:missing",
-        "source": "node:dependent-b",
-        "kind": "import",
-        "specifier": "fixture:missing",
-        "resolution_status": "unresolved",
-        "target_ids": ["unknown:missing"],
-        "profile_id": "fixture:safe",
-        "condition": {"op": "all", "conditions": []},
-        "precision": "exact",
-        "reason": "package_not_found",
-        "evidence": [{
+    "id": "site:missing",
+    "source": "node:dependent-b",
+    "kind": "import",
+    "specifier": "fixture:missing",
+    "resolution_status": "unresolved",
+    "target_ids": ["unknown:missing"],
+    "profile_id": "fixture:safe",
+    "condition": {"op": "all", "conditions": []},
+    "precision": "exact",
+    "reason": "package_not_found",
+    "evidence": [
+        {
             "kind": "source",
             "extractor": "fixture",
             "extractor_version": "1.0",
@@ -404,13 +457,60 @@ fn seed_issue_303_store(path: &Path, root: &Path, source_revision: &str) -> Stri
             "end_column": 9,
             "detail": "PROCESS_303_SITE_DETAIL_SECRET",
             "properties": {"secret": "PROCESS_303_SITE_PROPERTY_SECRET", "absolute": root}
-        }]
+        },
+        {
+            "kind": "source",
+            "extractor": "fixture",
+            "extractor_version": "1.0",
+            "path": "src/dependent-b.rs",
+            "start_line": 4,
+            "start_column": 1,
+            "end_line": 4,
+            "end_column": 9,
+            "detail": "PROCESS_303_SITE_DETAIL_SECRET",
+            "properties": {"secret": "PROCESS_303_SITE_PROPERTY_SECRET", "absolute": root}
+        },
+        {
+            "kind": "source",
+            "extractor": "fixture",
+            "extractor_version": "1.0",
+            "path": "src/dependent-b.rs",
+            "start_line": 5,
+            "start_column": 1,
+            "end_line": 5,
+            "end_column": 9,
+            "detail": "PROCESS_303_SITE_DETAIL_SECRET",
+            "properties": {"secret": "PROCESS_303_SITE_PROPERTY_SECRET", "absolute": root}
+        }
+    ]
     });
     store.ingest_event(&site).unwrap();
-    let mut unresolved_edge = common("edge_upsert", 14);
-    unresolved_edge["edge"] = json!({
-        "id": "edge:missing",
-        "site_id": "site:missing",
+    for (seq, id) in [(14, "site:omega"), (15, "site:zeta")] {
+        let mut extra_site = common("dependency_site", seq);
+        extra_site["site"] = json!({
+        "id": id,
+        "source": "node:dependent-b",
+        "kind": "import",
+        "specifier": format!("fixture:{id}"),
+        "resolution_status": "unresolved",
+        "target_ids": ["unknown:missing"],
+        "profile_id": "fixture:safe",
+        "condition": {"op": "all", "conditions": []},
+        "precision": "exact",
+        "reason": "package_not_found",
+        "evidence": []
+        });
+        store.ingest_event(&extra_site).unwrap();
+    }
+    for (seq, id, site_id) in [
+        (16, "edge:missing", "site:missing"),
+        (17, "edge:omega", "site:omega"),
+        (18, "edge:zeta", "site:zeta"),
+    ] {
+        let mut unresolved_edge = common("edge_upsert", seq);
+        unresolved_edge["edge"] = json!({
+        "id": id,
+        "site_id": site_id,
         "source": "node:dependent-b",
         "target": "unknown:missing",
         "kind": "imports",
@@ -421,13 +521,40 @@ fn seed_issue_303_store(path: &Path, root: &Path, source_revision: &str) -> Stri
         "precision": "exact",
         "condition": {"op": "all", "conditions": []},
         "generated": false
+        });
+        store.ingest_event(&unresolved_edge).unwrap();
+    }
+    for (seq, id) in [(19, "node:oversized-source"), (20, "node:oversized-target")] {
+        let mut node = common("node_upsert", seq);
+        node["node"] = json!({
+            "id": id,
+            "kind": "file",
+            "locator": format!("repo://src/{id}.rs"),
+            "display_name": id,
+            "properties": {"path": format!("src/{id}.rs")}
+        });
+        store.ingest_event(&node).unwrap();
+    }
+    let mut oversized_edge = common("edge_upsert", 21);
+    oversized_edge["edge"] = json!({
+        "id": "edge:oversized",
+        "source": "node:oversized-source",
+        "target": "node:oversized-target",
+        "kind": "imports",
+        "phase": "semantic",
+        "environment": "host",
+        "profile_id": "fixture:safe",
+        "resolution_status": "resolved",
+        "precision": "exact",
+        "condition": issue_306_oversized_condition(),
+        "generated": false
     });
-    store.ingest_event(&unresolved_edge).unwrap();
-    let mut profile_completed = common("profile_completed", 15);
+    store.ingest_event(&oversized_edge).unwrap();
+    let mut profile_completed = common("profile_completed", 22);
     profile_completed["profile_id"] = json!("fixture:safe");
     profile_completed["coverage"] = coverage.clone();
     store.ingest_event(&profile_completed).unwrap();
-    let mut completed = common("scan_completed", 16);
+    let mut completed = common("scan_completed", 23);
     completed["coverage"] = coverage;
     store.ingest_event(&completed).unwrap();
     store
@@ -766,6 +893,11 @@ impl InteractiveMcp {
         self.stdout.read_line(&mut line).unwrap();
         assert!(!line.is_empty(), "MCP server closed before responding");
         serde_json::from_str(&line).expect("MCP stdout response is JSON")
+    }
+
+    fn notify(&mut self, notification: Value) {
+        writeln!(self.stdin, "{notification}").unwrap();
+        self.stdin.flush().unwrap();
     }
 
     fn finish(mut self) {
@@ -2610,6 +2742,100 @@ fn cursor_paging_traverses_more_than_one_thousand_filtered_nodes_and_snapshot_na
 }
 
 #[test]
+fn cursor_paging_stays_pinned_when_current_snapshot_advances_concurrently() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("repository");
+    let store_path = temporary.path().join("store.sqlite");
+    fs::create_dir(&root).unwrap();
+    seed_issue_300_store(&store_path, &root);
+    let pinned_snapshot = seed_issue_300_bulk_rows(&store_path, &root);
+
+    let mut mcp = InteractiveMcp::start(&root, &store_path);
+    let initialized = mcp.request(json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2026-07-28",
+            "capabilities": {},
+            "clientInfo": {"name": "issue-306-snapshot-pinning", "version": "1"}
+        }
+    }));
+    assert_eq!(initialized["id"], 1);
+
+    let first = interactive_tool_call(
+        &mut mcp,
+        2,
+        "agent_nodes_list",
+        json!({
+            "contract_version": "depgraph-mcp-tools-v1",
+            "repository_id": "repository",
+            "snapshot": pinned_snapshot,
+            "query": "bulk",
+            "match_mode": "contains",
+            "kinds": ["module"],
+            "limit": 1000
+        }),
+    );
+    assert_eq!(first["isError"], false, "{first}");
+    assert_eq!(
+        first["structuredContent"]["result"]["items"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1000
+    );
+    let cursor = first["structuredContent"]["result"]["next_cursor"].clone();
+    assert!(cursor.is_string());
+
+    let advanced_snapshot = seed_issue_302_store(&store_path, &root);
+    assert_ne!(advanced_snapshot, pinned_snapshot);
+    assert_eq!(
+        Store::open_read_only(&store_path)
+            .unwrap()
+            .current_snapshot_id()
+            .unwrap()
+            .unwrap(),
+        advanced_snapshot
+    );
+
+    let second = interactive_tool_call(
+        &mut mcp,
+        3,
+        "agent_nodes_list",
+        json!({
+            "contract_version": "depgraph-mcp-tools-v1",
+            "repository_id": "repository",
+            "snapshot": pinned_snapshot,
+            "query": "bulk",
+            "match_mode": "contains",
+            "kinds": ["module"],
+            "cursor": cursor,
+            "limit": 1000
+        }),
+    );
+    assert_eq!(second["isError"], false, "{second}");
+    let second_ids = second["structuredContent"]["result"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["id"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        second_ids,
+        [
+            "node:bulk:1100",
+            "node:bulk:1101",
+            "node:bulk:1102",
+            "node:bulk:1103",
+            "node:bulk:1104",
+        ]
+    );
+    assert_eq!(second["structuredContent"]["result"]["complete"], true);
+    mcp.finish();
+}
+
+#[test]
 fn issue_300_handler_maps_oversized_utf8_query_to_a_typed_error() {
     let temporary = tempfile::tempdir().unwrap();
     let root = temporary.path().join("repository");
@@ -3078,6 +3304,592 @@ fn oversized_partial_frame_is_rejected_before_deserialization() {
             "depgraph-mcp: inbound message rejected\n"
         );
     }
+}
+
+#[test]
+fn issue_306_protocol_revisions_share_catalog_and_schema_valid_typed_errors() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("repository");
+    let store_path = temporary.path().join("store.sqlite");
+    fs::create_dir(&root).unwrap();
+    seed_issue_300_store(&store_path, &root);
+    let pinned_snapshot = seed_issue_303_store(&store_path, &root, "revision-306");
+    let store_before = store_invariant(&store_path);
+    let source_before = source_tree_digest(&root);
+    let shared_schema: Value = serde_json::from_slice(include_bytes!(
+        "../../../schemas/depgraph-mcp-tools-v1.schema.json"
+    ))
+    .unwrap();
+    let shared = jsonschema::draft202012::new(&shared_schema).unwrap();
+    let mut catalogs = Vec::new();
+
+    for protocol_version in ["2025-11-25", "2026-07-28"] {
+        let mut mcp = InteractiveMcp::start(&root, &store_path);
+        let initialized = mcp.request(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": protocol_version,
+                "capabilities": {},
+                "clientInfo": {"name": "issue-306-test", "version": "1"}
+            }
+        }));
+        assert_eq!(initialized["result"]["protocolVersion"], protocol_version);
+        mcp.notify(json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/cancelled",
+            "params": {"requestId": 999_999, "reason": "fixture cancellation"}
+        }));
+        let listed = mcp.request(json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}
+        }));
+        let tools = listed["result"]["tools"].as_array().unwrap().clone();
+        let context_arguments = json!({
+            "contract_version": "depgraph-mcp-tools-v1",
+            "repository_id": "repository"
+        });
+        let context = interactive_tool_call(&mut mcp, 3, "get_context", context_arguments.clone());
+        let repeated_context = interactive_tool_call(&mut mcp, 4, "get_context", context_arguments);
+        assert_eq!(context, repeated_context, "{protocol_version} determinism");
+        assert_eq!(context["isError"], false, "{protocol_version}: {context}");
+        assert_tool_text_matches_structured(&context);
+        let context_schema = tools
+            .iter()
+            .find(|tool| tool["name"] == "get_context")
+            .unwrap()["outputSchema"]
+            .clone();
+        jsonschema::draft202012::new(&context_schema)
+            .unwrap()
+            .validate(&context["structuredContent"])
+            .unwrap_or_else(|validation| {
+                panic!("{protocol_version} advertised success schema: {validation}")
+            });
+        shared
+            .validate(&context["structuredContent"])
+            .unwrap_or_else(|validation| {
+                panic!("{protocol_version} shared success schema: {validation}")
+            });
+        let read_only_calls = [
+            (
+                "agent_edges_list",
+                json!({"contract_version":"depgraph-mcp-tools-v1", "repository_id":"repository", "node_id":"node:root", "snapshot":pinned_snapshot, "limit":1}),
+                Some(false),
+            ),
+            (
+                "agent_evidence_list",
+                json!({"contract_version":"depgraph-mcp-tools-v1", "repository_id":"repository", "site_id":"site:missing", "snapshot":pinned_snapshot, "limit":1}),
+                Some(false),
+            ),
+            (
+                "agent_node_get",
+                json!({"contract_version":"depgraph-mcp-tools-v1", "repository_id":"repository", "node_id":"node:root", "snapshot":pinned_snapshot}),
+                Some(false),
+            ),
+            (
+                "agent_nodes_list",
+                json!({"contract_version":"depgraph-mcp-tools-v1", "repository_id":"repository", "query":"node:", "match_mode":"prefix", "snapshot":pinned_snapshot, "limit":1}),
+                None,
+            ),
+            (
+                "agent_sites_list",
+                json!({"contract_version":"depgraph-mcp-tools-v1", "repository_id":"repository", "snapshot":pinned_snapshot, "limit":1}),
+                Some(false),
+            ),
+            (
+                "daemon_get",
+                json!({"contract_version":"depgraph-mcp-tools-v1", "repository_id":"repository"}),
+                None,
+            ),
+            (
+                "doctor_get",
+                json!({"contract_version":"depgraph-mcp-tools-v1", "repository_id":"repository", "details":false}),
+                None,
+            ),
+            (
+                "get_context",
+                json!({"contract_version":"depgraph-mcp-tools-v1", "repository_id":"repository"}),
+                Some(false),
+            ),
+            (
+                "graph_cycles_list",
+                json!({"contract_version":"depgraph-mcp-tools-v1", "repository_id":"repository", "snapshot":pinned_snapshot, "limit":1}),
+                None,
+            ),
+            (
+                "graph_dependencies_list",
+                json!({"contract_version":"depgraph-mcp-tools-v1", "repository_id":"repository", "selector":"node:root", "snapshot":pinned_snapshot, "limit":1}),
+                None,
+            ),
+            (
+                "graph_dependents_list",
+                json!({"contract_version":"depgraph-mcp-tools-v1", "repository_id":"repository", "selector":"node:root", "snapshot":pinned_snapshot, "limit":1}),
+                Some(false),
+            ),
+            (
+                "graph_export",
+                json!({"contract_version":"depgraph-mcp-tools-v1", "repository_id":"repository", "format":"json", "snapshot":pinned_snapshot}),
+                None,
+            ),
+            (
+                "graph_impact_get",
+                json!({"contract_version":"depgraph-mcp-tools-v1", "repository_id":"repository", "selector":"node:root", "snapshot":pinned_snapshot, "limit":1}),
+                None,
+            ),
+            (
+                "graph_path_get",
+                json!({"contract_version":"depgraph-mcp-tools-v1", "repository_id":"repository", "from":"node:dependent-a", "to":"node:root", "snapshot":pinned_snapshot}),
+                Some(false),
+            ),
+            (
+                "graph_query",
+                json!({"contract_version":"depgraph-mcp-tools-v1", "repository_id":"repository"}),
+                None,
+            ),
+            (
+                "graph_unresolved_list",
+                json!({"contract_version":"depgraph-mcp-tools-v1", "repository_id":"repository", "snapshot":pinned_snapshot, "limit":1}),
+                None,
+            ),
+            (
+                "operation_cancel",
+                json!({"contract_version":"depgraph-mcp-tools-v1", "repository_id":"repository", "operation_id":"op_00000000000000000000000000000000"}),
+                None,
+            ),
+            (
+                "operation_get",
+                json!({"contract_version":"depgraph-mcp-tools-v1", "repository_id":"repository", "operation_id":"op_00000000000000000000000000000000"}),
+                None,
+            ),
+            (
+                "operation_result",
+                json!({"contract_version":"depgraph-mcp-tools-v1", "repository_id":"repository", "operation_id":"op_00000000000000000000000000000000"}),
+                None,
+            ),
+            (
+                "policy_evaluate",
+                json!({"contract_version":"depgraph-mcp-tools-v1", "repository_id":"repository", "from":pinned_snapshot, "to":pinned_snapshot}),
+                None,
+            ),
+            (
+                "profile_plan_get",
+                json!({"contract_version":"depgraph-mcp-tools-v1", "repository_id":"repository"}),
+                None,
+            ),
+            (
+                "runtime_trace_validate",
+                json!({"contract_version":"depgraph-mcp-tools-v1", "repository_id":"repository"}),
+                None,
+            ),
+            (
+                "snapshot_diff_get",
+                json!({"contract_version":"depgraph-mcp-tools-v1", "repository_id":"repository", "from":pinned_snapshot, "to":pinned_snapshot}),
+                None,
+            ),
+            (
+                "snapshot_get",
+                json!({"contract_version":"depgraph-mcp-tools-v1", "repository_id":"repository", "snapshot":pinned_snapshot}),
+                None,
+            ),
+            (
+                "snapshot_list",
+                json!({"contract_version":"depgraph-mcp-tools-v1", "repository_id":"repository", "limit":1}),
+                None,
+            ),
+        ];
+        let advertised_names = tools
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        let called_names = read_only_calls
+            .iter()
+            .map(|(tool_name, _, _)| *tool_name)
+            .collect::<Vec<_>>();
+        assert_eq!(called_names, advertised_names, "{protocol_version}");
+        for (offset, (tool_name, arguments, expected_error)) in
+            read_only_calls.into_iter().enumerate()
+        {
+            let response =
+                interactive_tool_call(&mut mcp, 100 + offset as u64, tool_name, arguments);
+            assert!(response["isError"].is_boolean(), "{tool_name}: {response}");
+            if let Some(expected_error) = expected_error {
+                assert_eq!(
+                    response["isError"], expected_error,
+                    "{protocol_version} {tool_name}: {response}"
+                );
+            }
+            if matches!(
+                tool_name,
+                "agent_edges_list"
+                    | "graph_dependents_list"
+                    | "graph_impact_get"
+                    | "graph_path_get"
+            ) {
+                let expected_condition =
+                    depgraph_core::query::render_condition(&issue_306_long_condition());
+                assert!(
+                    expected_condition.len() > depgraph_mcp_tools::MAX_AGENT_LABEL_BYTES,
+                    "fixture must cover the former label boundary"
+                );
+                let projected_condition = match tool_name {
+                    "agent_edges_list" => {
+                        &response["structuredContent"]["result"]["items"][0]["condition"]
+                    }
+                    "graph_dependents_list" => {
+                        &response["structuredContent"]["result"]["edges"]["items"][0]["condition"]
+                    }
+                    "graph_impact_get" => {
+                        response["structuredContent"]["result"]["impacts"]["items"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .flat_map(|impact| {
+                                impact["dependency_path"].as_array().into_iter().flatten()
+                            })
+                            .map(|step| &step["edge"]["condition"])
+                            .next()
+                            .expect("impact fixture contains the conditional dependency edge")
+                    }
+                    "graph_path_get" => {
+                        &response["structuredContent"]["result"]["steps"][0]["edge"]["condition"]
+                    }
+                    _ => unreachable!(),
+                };
+                assert_eq!(
+                    projected_condition.as_str(),
+                    Some(expected_condition.as_str()),
+                    "{protocol_version} {tool_name}: long conditional edge metadata must be preserved"
+                );
+            }
+            assert_tool_text_matches_structured(&response);
+            let schema =
+                tools.iter().find(|tool| tool["name"] == tool_name).unwrap()["outputSchema"]
+                    .clone();
+            jsonschema::draft202012::new(&schema)
+                .unwrap()
+                .validate(&response["structuredContent"])
+                .unwrap_or_else(|validation| {
+                    panic!("{protocol_version} {tool_name} schema: {validation}")
+                });
+        }
+        let invalid_sites = interactive_tool_call(
+            &mut mcp,
+            29,
+            "agent_sites_list",
+            json!({"contract_version":"depgraph-mcp-tools-v1", "repository_id":"repository", "node_id":"not an agent id", "limit":1}),
+        );
+        assert_eq!(invalid_sites["isError"], true, "{invalid_sites}");
+        assert_eq!(
+            invalid_sites["structuredContent"]["error"]["code"],
+            "INVALID_ARGUMENT"
+        );
+        assert_tool_text_matches_structured(&invalid_sites);
+        let node = interactive_tool_call(
+            &mut mcp,
+            30,
+            "agent_node_get",
+            json!({"contract_version":"depgraph-mcp-tools-v1", "repository_id":"repository", "node_id":"node:missing"}),
+        );
+        assert_eq!(node["isError"], true);
+        assert_eq!(node["structuredContent"]["error"]["code"], "NOT_FOUND");
+        let zero_sites = interactive_tool_call(
+            &mut mcp,
+            31,
+            "agent_sites_list",
+            json!({"contract_version":"depgraph-mcp-tools-v1", "repository_id":"repository", "node_id":"node:root", "limit":1}),
+        );
+        assert_eq!(zero_sites["isError"], false, "{zero_sites}");
+        assert_eq!(
+            zero_sites["structuredContent"]["result"]["items"],
+            json!([])
+        );
+        let missing_evidence = interactive_tool_call(
+            &mut mcp,
+            32,
+            "agent_evidence_list",
+            json!({"contract_version":"depgraph-mcp-tools-v1", "repository_id":"repository", "site_id":"site:absent", "limit":1}),
+        );
+        assert_eq!(missing_evidence["isError"], true, "{missing_evidence}");
+        assert_eq!(
+            missing_evidence["structuredContent"]["error"]["code"],
+            "NOT_FOUND"
+        );
+        let error = interactive_tool_call(
+            &mut mcp,
+            5,
+            "snapshot_get",
+            json!({
+                "contract_version": "depgraph-mcp-tools-v1",
+                "repository_id": "repository",
+                "snapshot": "does-not-exist"
+            }),
+        );
+        assert_eq!(error["isError"], true, "{protocol_version}: {error}");
+        assert_eq!(
+            error["structuredContent"]["error"]["code"], "NOT_FOUND",
+            "{protocol_version}: {error}"
+        );
+        assert_tool_text_matches_structured(&error);
+        for tool in &tools {
+            let tool_name = tool["name"].as_str().unwrap();
+            jsonschema::draft202012::new(&tool["outputSchema"])
+                .unwrap_or_else(|validation| {
+                    panic!("{protocol_version} {tool_name} schema compile: {validation}")
+                })
+                .validate(&error["structuredContent"])
+                .unwrap_or_else(|validation| {
+                    panic!("{protocol_version} {tool_name} error schema: {validation}")
+                });
+        }
+        shared
+            .validate(&error["structuredContent"])
+            .unwrap_or_else(|validation| {
+                panic!("{protocol_version} shared error schema: {validation}")
+            });
+        catalogs.push(Value::Array(tools));
+        mcp.finish();
+    }
+
+    assert_eq!(catalogs[0].to_string(), catalogs[1].to_string());
+    assert_eq!(store_before, store_invariant(&store_path));
+    assert_eq!(source_before, source_tree_digest(&root));
+}
+
+#[test]
+fn issue_306_oversized_conditions_fail_closed_with_exact_limit_across_protocol_revisions() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("repository");
+    let store_path = temporary.path().join("store.sqlite");
+    fs::create_dir(&root).unwrap();
+    seed_issue_300_store(&store_path, &root);
+    let pinned_snapshot = seed_issue_303_store(&store_path, &root, "revision-306-oversized");
+    let store_before = store_invariant(&store_path);
+    let source_before = source_tree_digest(&root);
+
+    for protocol_version in ["2025-11-25", "2026-07-28"] {
+        let mut mcp = InteractiveMcp::start(&root, &store_path);
+        let initialized = mcp.request(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": protocol_version,
+                "capabilities": {},
+                "clientInfo": {"name": "issue-306-oversized-test", "version": "1"}
+            }
+        }));
+        assert_eq!(initialized["result"]["protocolVersion"], protocol_version);
+        let listed = mcp.request(json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}
+        }));
+        let tools = listed["result"]["tools"].as_array().unwrap();
+
+        for (offset, (tool_name, arguments)) in [
+            (
+                "agent_edges_list",
+                json!({"contract_version":"depgraph-mcp-tools-v1", "repository_id":"repository", "node_id":"node:oversized-source", "snapshot":pinned_snapshot, "limit":1}),
+            ),
+            (
+                "graph_dependents_list",
+                json!({"contract_version":"depgraph-mcp-tools-v1", "repository_id":"repository", "selector":"node:oversized-target", "snapshot":pinned_snapshot, "limit":1}),
+            ),
+            (
+                "graph_impact_get",
+                json!({"contract_version":"depgraph-mcp-tools-v1", "repository_id":"repository", "selector":"node:oversized-target", "snapshot":pinned_snapshot, "limit":1}),
+            ),
+            (
+                "graph_path_get",
+                json!({"contract_version":"depgraph-mcp-tools-v1", "repository_id":"repository", "from":"node:oversized-source", "to":"node:oversized-target", "snapshot":pinned_snapshot}),
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let response =
+                interactive_tool_call(&mut mcp, 10 + offset as u64, tool_name, arguments);
+            assert_eq!(
+                response["isError"], true,
+                "{protocol_version} {tool_name}: {response}"
+            );
+            assert_eq!(
+                response["structuredContent"]["error"]["code"],
+                "RESOURCE_EXHAUSTED"
+            );
+            assert_eq!(
+                response["structuredContent"]["error"]["details"],
+                json!({
+                    "kind": "resource_limit",
+                    "limit": "output_bytes",
+                    "maximum": 64 * 1024
+                }),
+                "{protocol_version} {tool_name}: {response}"
+            );
+            assert_tool_text_matches_structured(&response);
+            let schema = tools
+                .iter()
+                .find(|tool| tool["name"] == tool_name)
+                .unwrap()["outputSchema"]
+                .clone();
+            jsonschema::draft202012::new(&schema)
+                .unwrap()
+                .validate(&response["structuredContent"])
+                .unwrap_or_else(|validation| {
+                    panic!("{protocol_version} {tool_name} oversized schema: {validation}")
+                });
+        }
+        mcp.finish();
+    }
+
+    assert_eq!(store_before, store_invariant(&store_path));
+    assert_eq!(source_before, source_tree_digest(&root));
+}
+
+#[test]
+fn issue_306_agent_list_pages_are_stable_and_reject_current_cursor_after_advance() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("repository");
+    let store_path = temporary.path().join("store.sqlite");
+    fs::create_dir(&root).unwrap();
+    let pinned_snapshot = seed_issue_303_store(&store_path, &root, "revision-306-pages");
+    let common = json!({
+        "contract_version": "depgraph-mcp-tools-v1",
+        "repository_id": "repository",
+        "limit": 1
+    });
+    let mut mcp = InteractiveMcp::start(&root, &store_path);
+    assert_eq!(
+        mcp.request(json!({"jsonrpc":"2.0", "id":1, "method":"initialize", "params": {
+            "protocolVersion":"2026-07-28", "capabilities":{}, "clientInfo":{"name":"issue-306-pages", "version":"1"}
+        }}))["id"],
+        1
+    );
+    let requests = [
+        (
+            "agent_sites_list",
+            json!({}),
+            json!({"node_id":"node:root"}),
+            3,
+        ),
+        (
+            "agent_edges_list",
+            json!({"node_id":"node:dependent-b"}),
+            json!({"node_id":"node:dependent-b", "direction":"incoming"}),
+            4,
+        ),
+        (
+            "agent_evidence_list",
+            json!({"site_id":"site:missing"}),
+            json!({"site_id":"site:omega"}),
+            3,
+        ),
+    ];
+    let mut cursors = Vec::new();
+    let mut first_pages = Vec::new();
+    for (offset, (tool, extra, _, total_items)) in requests.iter().enumerate() {
+        let mut arguments = common.clone();
+        arguments["snapshot"] = json!(pinned_snapshot);
+        arguments
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let first = interactive_tool_call(&mut mcp, 2 + offset as u64, tool, arguments.clone());
+        assert_eq!(first["isError"], false, "{tool}: {first}");
+        assert_tool_text_matches_structured(&first);
+        assert_eq!(
+            first["structuredContent"]["result"]["total_items"], *total_items,
+            "{tool}"
+        );
+        assert_eq!(
+            first["structuredContent"]["result"]["items"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        let repeated = interactive_tool_call(&mut mcp, 10 + offset as u64, tool, arguments);
+        assert_eq!(
+            repeated["structuredContent"], first["structuredContent"],
+            "{tool}"
+        );
+        cursors.push(first["structuredContent"]["result"]["next_cursor"].clone());
+        first_pages.push(first);
+    }
+
+    let advanced_snapshot = seed_issue_302_store(&store_path, &root);
+    assert_ne!(advanced_snapshot, pinned_snapshot);
+    for (offset, ((tool, extra, changed_filter, total_items), cursor)) in
+        requests.iter().zip(&cursors).enumerate()
+    {
+        let mut ids = first_pages[offset]["structuredContent"]["result"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>();
+        let mut next_cursor = cursor.clone();
+        let mut page_index = 0_u64;
+        while !next_cursor.is_null() {
+            let mut pinned = common.clone();
+            pinned["snapshot"] = json!(pinned_snapshot);
+            pinned["cursor"] = next_cursor;
+            pinned
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let continued = interactive_tool_call(
+                &mut mcp,
+                100 + offset as u64 * 10 + page_index,
+                tool,
+                pinned,
+            );
+            assert_eq!(continued["isError"], false, "pinned {tool}: {continued}");
+            ids.extend(
+                continued["structuredContent"]["result"]["items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(Value::to_string),
+            );
+            next_cursor = continued["structuredContent"]["result"]["next_cursor"].clone();
+            page_index += 1;
+        }
+        assert_eq!(ids.len(), *total_items as usize, "{tool}");
+        let mut sorted_ids = ids.clone();
+        sorted_ids.sort();
+        assert_eq!(ids, sorted_ids, "{tool} ordering");
+
+        let mut changed = common.clone();
+        changed["snapshot"] = json!(pinned_snapshot);
+        changed["cursor"] = cursor.clone();
+        changed
+            .as_object_mut()
+            .unwrap()
+            .extend(changed_filter.as_object().unwrap().clone());
+        let filter_mismatch = interactive_tool_call(&mut mcp, 200 + offset as u64, tool, changed);
+        assert_eq!(
+            filter_mismatch["isError"], true,
+            "filter {tool}: {filter_mismatch}"
+        );
+        assert_eq!(
+            filter_mismatch["structuredContent"]["error"]["code"], "CURSOR_MISMATCH",
+            "filter {tool}"
+        );
+
+        let mut current = common.clone();
+        current["snapshot"] = json!("current");
+        current["cursor"] = cursor.clone();
+        current
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let mismatched = interactive_tool_call(&mut mcp, 30 + offset as u64, tool, current);
+        assert_eq!(mismatched["isError"], true, "current {tool}: {mismatched}");
+        assert_eq!(
+            mismatched["structuredContent"]["error"]["code"], "CURSOR_MISMATCH",
+            "current {tool}"
+        );
+    }
+    mcp.finish();
 }
 
 #[test]
