@@ -963,7 +963,7 @@ fn field_schema(tool_name: &str, field: &str) -> Value {
             json!({"type": "string", "enum": ["exact", "prefix", "contains"]})
         }
         "direction" => {
-            json!({"type": "string", "enum": ["incoming", "outgoing"]})
+            json!({"type": "string", "enum": ["both", "incoming", "outgoing"]})
         }
         "cursor" => scalar_schema::<Cursor>(),
         "operation_id" => scalar_schema::<OperationId>(),

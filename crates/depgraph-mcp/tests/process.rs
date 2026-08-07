@@ -3468,6 +3468,12 @@ fn issue_306_protocol_revisions_share_catalog_and_schema_valid_typed_errors() {
                     "{protocol_version} {tool_name}: {response}"
                 );
             }
+            if tool_name == "agent_edges_list" {
+                assert_eq!(
+                    response["structuredContent"]["result"]["items"][0]["condition"], "true",
+                    "{protocol_version}: conditional edge metadata must be preserved"
+                );
+            }
             assert_tool_text_matches_structured(&response);
             let schema =
                 tools.iter().find(|tool| tool["name"] == tool_name).unwrap()["outputSchema"]

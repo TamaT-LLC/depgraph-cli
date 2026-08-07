@@ -132,7 +132,7 @@ fn agent_projection_inputs_encode_runtime_id_and_direction_validation() {
     );
     assert_eq!(
         edges.input_schema()["properties"]["direction"],
-        serde_json::json!({"type": "string", "enum": ["incoming", "outgoing"]})
+        serde_json::json!({"type": "string", "enum": ["both", "incoming", "outgoing"]})
     );
 }
 

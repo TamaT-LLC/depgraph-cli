@@ -433,6 +433,7 @@ pub struct EdgeProjection {
     profile_id: String,
     resolution_status: String,
     precision: String,
+    condition: String,
     evidence: Vec<EvidenceProjection>,
 }
 impl EdgeProjection {
@@ -471,6 +472,10 @@ impl EdgeProjection {
     #[must_use]
     pub fn precision(&self) -> &str {
         &self.precision
+    }
+    #[must_use]
+    pub fn condition(&self) -> &str {
+        &self.condition
     }
     #[must_use]
     pub fn evidence(&self) -> &[EvidenceProjection] {
@@ -821,6 +826,7 @@ impl DepgraphService {
                     profile_id: edge.profile_id,
                     resolution_status: edge.resolution_status,
                     precision: edge.precision,
+                    condition: crate::query::render_condition(&edge.condition),
                     evidence,
                 }
             })

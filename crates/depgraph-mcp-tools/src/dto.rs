@@ -2254,7 +2254,10 @@ impl TryFrom<&depgraph_core::service::EdgeProjection> for AgentEdge {
             precision,
             parse_agent_value(source.profile_id())?,
             parse_optional_agent_value(source.site_id())?,
-            None,
+            Some(
+                AgentLabel::parse(source.condition())
+                    .map_err(|_| ContractBuildError::AgentDtoValue)?,
+            ),
             evidence,
         )
     }
