@@ -9,10 +9,11 @@ use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use sha2::{Digest as _, Sha256};
 
 use crate::{
-    AgentArtifactId, AgentFieldName, AgentGraphExportContent, AgentId, AgentLabel, AgentLocator,
-    AgentPolicyText, AgentToken, ContractBuildError, Page, PolicyApiChangeId, PolicyConfigDigest,
-    PolicyEvaluationCollectionDigest, PolicyEvaluationId, PolicyViolationId,
-    RepositoryRelativePath, Sha256Digest, SnapshotDiffCollectionDigest, SnapshotId, SnapshotName,
+    AgentArtifactId, AgentCondition, AgentFieldName, AgentGraphExportContent, AgentId, AgentLabel,
+    AgentLocator, AgentPolicyText, AgentToken, ContractBuildError, MAX_AGENT_CONDITION_BYTES, Page,
+    PolicyApiChangeId, PolicyConfigDigest, PolicyEvaluationCollectionDigest, PolicyEvaluationId,
+    PolicyViolationId, RepositoryRelativePath, Sha256Digest, SnapshotDiffCollectionDigest,
+    SnapshotId, SnapshotName,
 };
 
 pub const MAX_AGENT_EVIDENCE_ITEMS: usize = depgraph_core::service::MAX_GRAPH_EVIDENCE_ITEMS;
@@ -1052,7 +1053,7 @@ pub struct AgentEdge {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     site_id: Option<AgentId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    condition: Option<AgentLabel>,
+    condition: Option<AgentCondition>,
     #[schemars(length(max = 64))]
     #[serde(deserialize_with = "deserialize_agent_evidence")]
     evidence: Vec<AgentEvidence>,
@@ -1071,6 +1072,35 @@ impl AgentEdge {
         profile_id: AgentId,
         site_id: Option<AgentId>,
         condition: Option<AgentLabel>,
+        evidence: Vec<AgentEvidence>,
+    ) -> Result<Self, ContractBuildError> {
+        Self::new_with_condition(
+            id,
+            source_id,
+            target_id,
+            kind,
+            phase,
+            resolution_status,
+            precision,
+            profile_id,
+            site_id,
+            condition.map(AgentCondition::from),
+            evidence,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_condition(
+        id: AgentId,
+        source_id: AgentId,
+        target_id: AgentId,
+        kind: AgentToken,
+        phase: AgentPhase,
+        resolution_status: AgentResolutionStatus,
+        precision: AgentPrecision,
+        profile_id: AgentId,
+        site_id: Option<AgentId>,
+        condition: Option<AgentCondition>,
         evidence: Vec<AgentEvidence>,
     ) -> Result<Self, ContractBuildError> {
         validate_agent_evidence(&evidence)?;
@@ -1426,6 +1456,7 @@ impl AgentImpact {
 #[derive(Debug)]
 pub(crate) enum ImpactProjectionFailure {
     Cancelled,
+    ConditionTooLarge,
     TooManyItems,
     TooManyMaterializedPathSteps,
     Contract(ContractBuildError),
@@ -2031,6 +2062,7 @@ fn agent_site_from_core_cancellable(
 fn projection_contract_error(error: ImpactProjectionFailure) -> ContractBuildError {
     match error {
         ImpactProjectionFailure::Contract(error) => error,
+        ImpactProjectionFailure::ConditionTooLarge => ContractBuildError::PageByteLimit,
         ImpactProjectionFailure::Cancelled
         | ImpactProjectionFailure::TooManyItems
         | ImpactProjectionFailure::TooManyMaterializedPathSteps => {
@@ -2085,7 +2117,7 @@ impl AgentEdge {
             "observed" => AgentPrecision::Observed,
             _ => return Err(ContractBuildError::AgentDtoValue.into()),
         };
-        let projected = Self::new(
+        let projected = Self::new_with_condition(
             parse_agent_value(&edge.id)?,
             parse_agent_value(&edge.source)?,
             parse_agent_value(&edge.target)?,
@@ -2095,7 +2127,7 @@ impl AgentEdge {
             precision,
             parse_agent_value(&edge.profile_id)?,
             parse_optional_agent_value(edge.site_id.as_deref())?,
-            AgentLabel::parse(&source.condition_text).ok(),
+            Some(parse_projected_agent_condition(&source.condition_text)?),
             evidence,
         )?;
         if is_cancelled() {
@@ -2244,7 +2276,7 @@ impl TryFrom<&depgraph_core::service::EdgeProjection> for AgentEdge {
             "observed" => AgentPrecision::Observed,
             _ => return Err(ContractBuildError::AgentDtoValue),
         };
-        AgentEdge::new(
+        AgentEdge::new_with_condition(
             parse_agent_value(source.id())?,
             parse_agent_value(source.source())?,
             parse_agent_value(source.target())?,
@@ -2254,10 +2286,7 @@ impl TryFrom<&depgraph_core::service::EdgeProjection> for AgentEdge {
             precision,
             parse_agent_value(source.profile_id())?,
             parse_optional_agent_value(source.site_id())?,
-            Some(
-                AgentLabel::parse(source.condition())
-                    .map_err(|_| ContractBuildError::AgentDtoValue)?,
-            ),
+            Some(parse_agent_condition(source.condition())?),
             evidence,
         )
     }
@@ -2511,6 +2540,21 @@ where
     let targets = Vec::<AgentId>::deserialize(deserializer)?;
     validate_agent_targets(&targets).map_err(D::Error::custom)?;
     Ok(targets)
+}
+
+fn parse_projected_agent_condition(value: &str) -> Result<AgentCondition, ImpactProjectionFailure> {
+    if value.len() > MAX_AGENT_CONDITION_BYTES {
+        return Err(ImpactProjectionFailure::ConditionTooLarge);
+    }
+    AgentCondition::parse(value)
+        .map_err(|_| ImpactProjectionFailure::Contract(ContractBuildError::AgentDtoValue))
+}
+
+fn parse_agent_condition(value: &str) -> Result<AgentCondition, ContractBuildError> {
+    if value.len() > MAX_AGENT_CONDITION_BYTES {
+        return Err(ContractBuildError::PageByteLimit);
+    }
+    AgentCondition::parse(value).map_err(|_| ContractBuildError::AgentDtoValue)
 }
 
 fn parse_agent_value<T>(value: &str) -> Result<T, ContractBuildError>

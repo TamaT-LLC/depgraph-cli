@@ -307,6 +307,25 @@ fn seed_issue_302_store(path: &Path, root: &Path) -> String {
     snapshot_id
 }
 
+fn issue_306_long_condition() -> Value {
+    let values = (0..40)
+        .map(|index| Value::String(format!("enabled-{index:02}")))
+        .collect::<Vec<_>>();
+    json!({
+        "op": "in",
+        "key": "feature",
+        "values": values
+    })
+}
+
+fn issue_306_oversized_condition() -> Value {
+    json!({
+        "op": "eq",
+        "key": "oversized",
+        "value": "x".repeat(64 * 1024 + 1)
+    })
+}
+
 fn seed_issue_303_store(path: &Path, root: &Path, source_revision: &str) -> String {
     let mut store = Store::open(path).unwrap();
     store
@@ -381,6 +400,11 @@ fn seed_issue_303_store(path: &Path, root: &Path, source_revision: &str) -> Stri
     .into_iter()
     .enumerate()
     {
+        let condition = if id == "edge:impact-a" {
+            issue_306_long_condition()
+        } else {
+            json!({"op": "all", "conditions": []})
+        };
         let mut edge = common("edge_upsert", offset as u64 + 9);
         edge["edge"] = json!({
             "id": id,
@@ -392,7 +416,7 @@ fn seed_issue_303_store(path: &Path, root: &Path, source_revision: &str) -> Stri
             "profile_id": "fixture:safe",
             "resolution_status": "resolved",
             "precision": "exact",
-            "condition": {"op": "all", "conditions": []},
+            "condition": condition,
             "generated": false,
             "evidence": [{
                 "kind": "semantic",
@@ -500,11 +524,37 @@ fn seed_issue_303_store(path: &Path, root: &Path, source_revision: &str) -> Stri
         });
         store.ingest_event(&unresolved_edge).unwrap();
     }
-    let mut profile_completed = common("profile_completed", 19);
+    for (seq, id) in [(19, "node:oversized-source"), (20, "node:oversized-target")] {
+        let mut node = common("node_upsert", seq);
+        node["node"] = json!({
+            "id": id,
+            "kind": "file",
+            "locator": format!("repo://src/{id}.rs"),
+            "display_name": id,
+            "properties": {"path": format!("src/{id}.rs")}
+        });
+        store.ingest_event(&node).unwrap();
+    }
+    let mut oversized_edge = common("edge_upsert", 21);
+    oversized_edge["edge"] = json!({
+        "id": "edge:oversized",
+        "source": "node:oversized-source",
+        "target": "node:oversized-target",
+        "kind": "imports",
+        "phase": "semantic",
+        "environment": "host",
+        "profile_id": "fixture:safe",
+        "resolution_status": "resolved",
+        "precision": "exact",
+        "condition": issue_306_oversized_condition(),
+        "generated": false
+    });
+    store.ingest_event(&oversized_edge).unwrap();
+    let mut profile_completed = common("profile_completed", 22);
     profile_completed["profile_id"] = json!("fixture:safe");
     profile_completed["coverage"] = coverage.clone();
     store.ingest_event(&profile_completed).unwrap();
-    let mut completed = common("scan_completed", 20);
+    let mut completed = common("scan_completed", 23);
     completed["coverage"] = coverage;
     store.ingest_event(&completed).unwrap();
     store
@@ -3374,7 +3424,7 @@ fn issue_306_protocol_revisions_share_catalog_and_schema_valid_typed_errors() {
             (
                 "graph_dependents_list",
                 json!({"contract_version":"depgraph-mcp-tools-v1", "repository_id":"repository", "selector":"node:root", "snapshot":pinned_snapshot, "limit":1}),
-                None,
+                Some(false),
             ),
             (
                 "graph_export",
@@ -3388,8 +3438,8 @@ fn issue_306_protocol_revisions_share_catalog_and_schema_valid_typed_errors() {
             ),
             (
                 "graph_path_get",
-                json!({"contract_version":"depgraph-mcp-tools-v1", "repository_id":"repository", "from":"node:root", "to":"node:dependent-a", "snapshot":pinned_snapshot}),
-                None,
+                json!({"contract_version":"depgraph-mcp-tools-v1", "repository_id":"repository", "from":"node:dependent-a", "to":"node:root", "snapshot":pinned_snapshot}),
+                Some(false),
             ),
             (
                 "graph_query",
@@ -3468,10 +3518,47 @@ fn issue_306_protocol_revisions_share_catalog_and_schema_valid_typed_errors() {
                     "{protocol_version} {tool_name}: {response}"
                 );
             }
-            if tool_name == "agent_edges_list" {
+            if matches!(
+                tool_name,
+                "agent_edges_list"
+                    | "graph_dependents_list"
+                    | "graph_impact_get"
+                    | "graph_path_get"
+            ) {
+                let expected_condition =
+                    depgraph_core::query::render_condition(&issue_306_long_condition());
+                assert!(
+                    expected_condition.len() > depgraph_mcp_tools::MAX_AGENT_LABEL_BYTES,
+                    "fixture must cover the former label boundary"
+                );
+                let projected_condition = match tool_name {
+                    "agent_edges_list" => {
+                        &response["structuredContent"]["result"]["items"][0]["condition"]
+                    }
+                    "graph_dependents_list" => {
+                        &response["structuredContent"]["result"]["edges"]["items"][0]["condition"]
+                    }
+                    "graph_impact_get" => {
+                        response["structuredContent"]["result"]["impacts"]["items"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .flat_map(|impact| {
+                                impact["dependency_path"].as_array().into_iter().flatten()
+                            })
+                            .map(|step| &step["edge"]["condition"])
+                            .next()
+                            .expect("impact fixture contains the conditional dependency edge")
+                    }
+                    "graph_path_get" => {
+                        &response["structuredContent"]["result"]["steps"][0]["edge"]["condition"]
+                    }
+                    _ => unreachable!(),
+                };
                 assert_eq!(
-                    response["structuredContent"]["result"]["items"][0]["condition"], "true",
-                    "{protocol_version}: conditional edge metadata must be preserved"
+                    projected_condition.as_str(),
+                    Some(expected_condition.as_str()),
+                    "{protocol_version} {tool_name}: long conditional edge metadata must be preserved"
                 );
             }
             assert_tool_text_matches_structured(&response);
@@ -3538,7 +3625,10 @@ fn issue_306_protocol_revisions_share_catalog_and_schema_valid_typed_errors() {
             }),
         );
         assert_eq!(error["isError"], true, "{protocol_version}: {error}");
-        assert_eq!(error["structuredContent"]["error"]["code"], "NOT_FOUND");
+        assert_eq!(
+            error["structuredContent"]["error"]["code"], "NOT_FOUND",
+            "{protocol_version}: {error}"
+        );
         assert_tool_text_matches_structured(&error);
         for tool in &tools {
             let tool_name = tool["name"].as_str().unwrap();
@@ -3561,6 +3651,95 @@ fn issue_306_protocol_revisions_share_catalog_and_schema_valid_typed_errors() {
     }
 
     assert_eq!(catalogs[0].to_string(), catalogs[1].to_string());
+    assert_eq!(store_before, store_invariant(&store_path));
+    assert_eq!(source_before, source_tree_digest(&root));
+}
+
+#[test]
+fn issue_306_oversized_conditions_fail_closed_with_exact_limit_across_protocol_revisions() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("repository");
+    let store_path = temporary.path().join("store.sqlite");
+    fs::create_dir(&root).unwrap();
+    seed_issue_300_store(&store_path, &root);
+    let pinned_snapshot = seed_issue_303_store(&store_path, &root, "revision-306-oversized");
+    let store_before = store_invariant(&store_path);
+    let source_before = source_tree_digest(&root);
+
+    for protocol_version in ["2025-11-25", "2026-07-28"] {
+        let mut mcp = InteractiveMcp::start(&root, &store_path);
+        let initialized = mcp.request(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": protocol_version,
+                "capabilities": {},
+                "clientInfo": {"name": "issue-306-oversized-test", "version": "1"}
+            }
+        }));
+        assert_eq!(initialized["result"]["protocolVersion"], protocol_version);
+        let listed = mcp.request(json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}
+        }));
+        let tools = listed["result"]["tools"].as_array().unwrap();
+
+        for (offset, (tool_name, arguments)) in [
+            (
+                "agent_edges_list",
+                json!({"contract_version":"depgraph-mcp-tools-v1", "repository_id":"repository", "node_id":"node:oversized-source", "snapshot":pinned_snapshot, "limit":1}),
+            ),
+            (
+                "graph_dependents_list",
+                json!({"contract_version":"depgraph-mcp-tools-v1", "repository_id":"repository", "selector":"node:oversized-target", "snapshot":pinned_snapshot, "limit":1}),
+            ),
+            (
+                "graph_impact_get",
+                json!({"contract_version":"depgraph-mcp-tools-v1", "repository_id":"repository", "selector":"node:oversized-target", "snapshot":pinned_snapshot, "limit":1}),
+            ),
+            (
+                "graph_path_get",
+                json!({"contract_version":"depgraph-mcp-tools-v1", "repository_id":"repository", "from":"node:oversized-source", "to":"node:oversized-target", "snapshot":pinned_snapshot}),
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let response =
+                interactive_tool_call(&mut mcp, 10 + offset as u64, tool_name, arguments);
+            assert_eq!(
+                response["isError"], true,
+                "{protocol_version} {tool_name}: {response}"
+            );
+            assert_eq!(
+                response["structuredContent"]["error"]["code"],
+                "RESOURCE_EXHAUSTED"
+            );
+            assert_eq!(
+                response["structuredContent"]["error"]["details"],
+                json!({
+                    "kind": "resource_limit",
+                    "limit": "output_bytes",
+                    "maximum": 64 * 1024
+                }),
+                "{protocol_version} {tool_name}: {response}"
+            );
+            assert_tool_text_matches_structured(&response);
+            let schema = tools
+                .iter()
+                .find(|tool| tool["name"] == tool_name)
+                .unwrap()["outputSchema"]
+                .clone();
+            jsonschema::draft202012::new(&schema)
+                .unwrap()
+                .validate(&response["structuredContent"])
+                .unwrap_or_else(|validation| {
+                    panic!("{protocol_version} {tool_name} oversized schema: {validation}")
+                });
+        }
+        mcp.finish();
+    }
+
     assert_eq!(store_before, store_invariant(&store_path));
     assert_eq!(source_before, source_tree_digest(&root));
 }

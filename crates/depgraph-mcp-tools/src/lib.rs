@@ -57,11 +57,11 @@ pub use response::{
     project_unresolved_page_cancellable,
 };
 pub use scalar::{
-    AgentArtifactId, AgentFieldName, AgentGraphExportContent, AgentId, AgentLabel, AgentLocator,
-    AgentPolicyText, AgentToken, ContractValueError, Cursor, LogicalRepositoryId,
-    MAX_AGENT_ARTIFACT_ID_BYTES, MAX_AGENT_FIELD_NAME_BYTES, MAX_AGENT_GRAPH_EXPORT_CONTENT_BYTES,
-    MAX_AGENT_ID_BYTES, MAX_AGENT_LABEL_BYTES, MAX_AGENT_LOCATOR_BYTES,
-    MAX_AGENT_POLICY_TEXT_BYTES, MAX_AGENT_TOKEN_BYTES, MAX_CURSOR_BYTES,
+    AgentArtifactId, AgentCondition, AgentFieldName, AgentGraphExportContent, AgentId, AgentLabel,
+    AgentLocator, AgentPolicyText, AgentToken, ContractValueError, Cursor, LogicalRepositoryId,
+    MAX_AGENT_ARTIFACT_ID_BYTES, MAX_AGENT_CONDITION_BYTES, MAX_AGENT_FIELD_NAME_BYTES,
+    MAX_AGENT_GRAPH_EXPORT_CONTENT_BYTES, MAX_AGENT_ID_BYTES, MAX_AGENT_LABEL_BYTES,
+    MAX_AGENT_LOCATOR_BYTES, MAX_AGENT_POLICY_TEXT_BYTES, MAX_AGENT_TOKEN_BYTES, MAX_CURSOR_BYTES,
     MAX_LOGICAL_REPOSITORY_ID_BYTES, MAX_OPERATION_ID_HEX_BYTES, OperationId, PolicyApiChangeId,
     PolicyConfigDigest, PolicyEvaluationCollectionDigest, PolicyEvaluationId, PolicyViolationId,
     RepositoryRelativePath, Sha256Digest, SnapshotDiffCollectionDigest, SnapshotId, SnapshotName,

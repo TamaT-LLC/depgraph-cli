@@ -27,8 +27,9 @@ use crate::{
     AgentResourceLimit, AgentRuntimeTraceEvent, AgentRuntimeValidationResponse, AgentSite,
     AgentSnapshot, AgentSnapshotDiffResponse, AgentUnresolved, CanonicalJsonError,
     ContractBuildError, Cursor, DurableSubmitResult, ErrorEnvelope, LogicalRepositoryId,
-    MAX_PAGE_BYTES, MAX_PAGE_ITEMS, MCP_TOOLS_CONTRACT_VERSION, OperationAccepted, Page,
-    PageRequest, SnapshotId, SuccessEnvelope, TaskAccepted, canonical_json_bytes,
+    MAX_AGENT_CONDITION_BYTES, MAX_PAGE_BYTES, MAX_PAGE_ITEMS, MCP_TOOLS_CONTRACT_VERSION,
+    OperationAccepted, Page, PageRequest, SnapshotId, SuccessEnvelope, TaskAccepted,
+    canonical_json_bytes,
 };
 
 const CURSOR_VERSION: &str = "v1";
@@ -1102,6 +1103,13 @@ pub fn project_impact_response_cancellable(
     if is_cancelled() {
         return Err(cancelled_error());
     }
+    validate_aggregate_condition_bytes(
+        impact
+            .impacts
+            .iter()
+            .flat_map(|impact| impact.dependency_path.iter())
+            .map(|step| step.condition_text.as_str()),
+    )?;
     let projection = AgentImpactProjection::try_new(impact, &mut is_cancelled)
         .map_err(impact_projection_error)?;
     let items = projection
@@ -1156,6 +1164,12 @@ pub fn project_dependencies_page_cancellable(
     if is_cancelled() {
         return Err(cancelled_error());
     }
+    validate_aggregate_condition_bytes(
+        source
+            .items()
+            .iter()
+            .map(|item| item.step.condition_text.as_str()),
+    )?;
     let items = convert_dependency_items_cancellable(
         source.items(),
         depgraph_core::MAX_INTERACTIVE_QUERY_TRAVERSAL,
@@ -1218,6 +1232,24 @@ fn validate_dependency_item_count(
             AgentResourceLimit::TraversalItems,
             maximum_items.try_into().unwrap_or(u64::MAX),
         ));
+    }
+    Ok(())
+}
+
+fn validate_aggregate_condition_bytes<'a>(
+    conditions: impl IntoIterator<Item = &'a str>,
+) -> Result<(), AgentError> {
+    let mut total = 0_usize;
+    for condition in conditions {
+        total = total.checked_add(condition.len()).ok_or_else(|| {
+            resource_error(AgentResourceLimit::OutputBytes, u64::from(MAX_PAGE_BYTES))
+        })?;
+        if total > MAX_PAGE_BYTES as usize {
+            return Err(resource_error(
+                AgentResourceLimit::OutputBytes,
+                u64::from(MAX_PAGE_BYTES),
+            ));
+        }
     }
     Ok(())
 }
@@ -1285,6 +1317,10 @@ pub fn project_unresolved_page_cancellable(
 fn impact_projection_error(error: ImpactProjectionFailure) -> AgentError {
     match error {
         ImpactProjectionFailure::Cancelled => cancelled_error(),
+        ImpactProjectionFailure::ConditionTooLarge => resource_error(
+            AgentResourceLimit::OutputBytes,
+            MAX_AGENT_CONDITION_BYTES as u64,
+        ),
         ImpactProjectionFailure::TooManyItems => resource_error(
             AgentResourceLimit::TraversalItems,
             depgraph_core::MAX_INTERACTIVE_QUERY_TRAVERSAL as u64,
@@ -1299,6 +1335,9 @@ fn impact_projection_error(error: ImpactProjectionFailure) -> AgentError {
 
 fn impact_contract_error(error: ContractBuildError) -> AgentError {
     match error {
+        ContractBuildError::PageByteLimit => {
+            resource_error(AgentResourceLimit::OutputBytes, u64::from(MAX_PAGE_BYTES))
+        }
         ContractBuildError::TooManyPathSteps
         | ContractBuildError::TooManyPageItems
         | ContractBuildError::TooManyCorrelationReasons
@@ -1518,17 +1557,29 @@ fn sensitive_string(text: &str) -> bool {
         ]
         .iter()
         .any(|marker| lower.contains(marker))
-        || [
-            "akia",
-            "asia",
-            concat!("gh", "p_"),
-            "github_pat_",
-            "xoxb-",
-            "xoxp-",
-        ]
-        .iter()
-        .any(|prefix| trimmed.starts_with(prefix))
+        || contains_credential_prefix(trimmed)
         || looks_like_raw_query(trimmed)
+}
+
+fn contains_credential_prefix(text: &str) -> bool {
+    [
+        "akia",
+        "asia",
+        concat!("gh", "p_"),
+        "github_pat_",
+        "xoxb-",
+        "xoxp-",
+    ]
+    .iter()
+    .any(|prefix| {
+        text.match_indices(prefix).any(|(offset, _)| {
+            offset == 0
+                || text[..offset]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|character| !character.is_ascii_alphanumeric())
+        })
+    })
 }
 
 fn looks_like_raw_query(mut trimmed: &str) -> bool {
@@ -1633,13 +1684,14 @@ mod tests {
         AgentErrorCode, AgentNode, CanonicalResponseMapper, CursorKey, LogicalRepositoryId,
         PageRequest, PaginationContext, ResponseMappingError, SnapshotId,
         WrappedPageByteProjection, bounded_json_value, canonical_json_bytes,
-        convert_dependency_items_cancellable, empty_projection_page, impact_contract_error,
-        looks_like_raw_query, public_result_digest, public_result_digest_bounded_cancellable,
-        redact_public_value, sensitive_field, validate_dependency_item_count,
+        contains_credential_prefix, convert_dependency_items_cancellable, empty_projection_page,
+        impact_contract_error, looks_like_raw_query, public_result_digest,
+        public_result_digest_bounded_cancellable, redact_public_value, sensitive_field,
+        validate_aggregate_condition_bytes, validate_dependency_item_count,
     };
     use crate::{
         AgentDependenciesResponse, AgentDependencyDirection, AgentImpact, AgentImpactResponse,
-        ContractBuildError, Page, PageByteLimit, PageSize, SuccessEnvelope,
+        ContractBuildError, MAX_PAGE_BYTES, Page, PageByteLimit, PageSize, SuccessEnvelope,
     };
     use depgraph_core::CancellationToken;
 
@@ -1678,6 +1730,30 @@ mod tests {
                 "query was not recognized: {query}"
             );
         }
+    }
+
+    #[test]
+    fn credential_prefixes_are_detected_at_token_boundaries_inside_rendered_conditions() {
+        assert!(contains_credential_prefix(
+            r#"feature == \"ghp_examplecredential\""#
+        ));
+        assert!(contains_credential_prefix(
+            r#"feature == \"github_pat_examplecredential\""#
+        ));
+        assert!(!contains_credential_prefix("paragraphp_example"));
+        assert!(!contains_credential_prefix("euthanasia"));
+    }
+
+    #[test]
+    fn aggregate_condition_bytes_are_bounded_before_projection_materialization() {
+        let exact = "x".repeat(MAX_PAGE_BYTES as usize);
+        validate_aggregate_condition_bytes([exact.as_str()])
+            .expect("the exact aggregate byte ceiling is accepted");
+
+        let overflow = "y".repeat(MAX_PAGE_BYTES as usize + 1);
+        let error = validate_aggregate_condition_bytes([overflow.as_str()])
+            .expect_err("one byte beyond the aggregate ceiling fails closed");
+        assert_eq!(error.code(), AgentErrorCode::ResourceExhausted);
     }
 
     #[test]

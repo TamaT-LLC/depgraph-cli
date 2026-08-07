@@ -25,21 +25,21 @@ use depgraph_core::{
 use depgraph_mcp::runtime::{AuditLogger, RuntimeClass, RuntimeConfig, RuntimeController};
 use depgraph_mcp_tools::{
     AgentCompletedSnapshot, AgentContext, AgentCycleLevel, AgentDaemonStatus,
-    AgentDependencyDirection, AgentDoctor, AgentEdge, AgentError, AgentEvidence,
-    AgentGraphExportFormat, AgentGraphExportMediaType, AgentGraphExportResponse, AgentId,
-    AgentLocator, AgentNamedSnapshot, AgentNode, AgentNodeSummary, AgentPathResponse,
-    AgentPolicyAnnotation, AgentPolicyAnnotationLevel, AgentPolicyApiChange,
-    AgentPolicyApiChangeKind, AgentPolicyEvaluationResponse, AgentPolicySeverity,
-    AgentPolicySummary, AgentPolicyViolation, AgentProfilePlan, AgentRuntimeTraceEvent,
-    AgentRuntimeValidationResponse, AgentSite, AgentSnapshotDiffChange,
-    AgentSnapshotDiffChangeType, AgentSnapshotDiffRecordType, AgentSnapshotDiffResponse,
-    AgentToken, BoundedQueryProjectionFailure, CanonicalResponseMapper, ContractBuildError,
-    ContractVersion, Cursor, CursorKey, ErrorEnvelope, LogicalRepositoryId, MappedToolResult,
-    PageByteLimit, PageRequest, PageSize, PaginationContext, RepositoryRelativePath,
-    ResponseMappingError, SnapshotId, SuccessEnvelope, ToolCatalog,
-    project_bounded_query_rows_cancellable, project_cycles_page_cancellable,
-    project_dependencies_page_cancellable, project_impact_response_cancellable,
-    project_unresolved_page_cancellable,
+    AgentDependencyDirection, AgentDoctor, AgentEdge, AgentError, AgentErrorCode,
+    AgentErrorDetails, AgentEvidence, AgentGraphExportFormat, AgentGraphExportMediaType,
+    AgentGraphExportResponse, AgentId, AgentLocator, AgentNamedSnapshot, AgentNode,
+    AgentNodeSummary, AgentPathResponse, AgentPolicyAnnotation, AgentPolicyAnnotationLevel,
+    AgentPolicyApiChange, AgentPolicyApiChangeKind, AgentPolicyEvaluationResponse,
+    AgentPolicySeverity, AgentPolicySummary, AgentPolicyViolation, AgentProfilePlan,
+    AgentRemediation, AgentResourceLimit, AgentRuntimeTraceEvent, AgentRuntimeValidationResponse,
+    AgentSite, AgentSnapshotDiffChange, AgentSnapshotDiffChangeType, AgentSnapshotDiffRecordType,
+    AgentSnapshotDiffResponse, AgentToken, BoundedQueryProjectionFailure, CanonicalResponseMapper,
+    ContractBuildError, ContractVersion, Cursor, CursorKey, ErrorEnvelope, LogicalRepositoryId,
+    MAX_AGENT_CONDITION_BYTES, MAX_PAGE_BYTES, MappedToolResult, PageByteLimit, PageRequest,
+    PageSize, PaginationContext, RepositoryRelativePath, ResponseMappingError, SnapshotId,
+    SuccessEnvelope, ToolCatalog, project_bounded_query_rows_cancellable,
+    project_cycles_page_cancellable, project_dependencies_page_cancellable,
+    project_impact_response_cancellable, project_unresolved_page_cancellable,
 };
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler, ServiceExt,
@@ -1189,12 +1189,13 @@ fn execute_catalog_read_tool(
                 usize::from(request.max_items().get()),
                 cancellation,
             )?;
+            validate_agent_condition_projection(found.items().iter().map(|edge| edge.condition()))?;
             let items = found
                 .items()
                 .iter()
                 .map(AgentEdge::try_from)
                 .collect::<Result<Vec<_>, _>>()
-                .map_err(|_| ToolExecutionFailure::Service(DepgraphServiceError::Integrity))?;
+                .map_err(contract_mapping_error)?;
             let page = pagination
                 .paginate_window(&items, offset, found.total_items(), &request)
                 .map_err(ToolExecutionFailure::Agent)?;
@@ -1497,6 +1498,12 @@ fn execute_catalog_read_tool(
                 service.start_snapshot_request_at_cancellable(&locator, cancellation)?;
             let snapshot_id = parse_snapshot_id(snapshot_request.snapshot_id().as_str())?;
             let found = service.explain_path(&mut snapshot_request, &request, cancellation)?;
+            validate_agent_condition_projection(
+                found
+                    .items()
+                    .iter()
+                    .map(|item| item.step.condition_text.as_str()),
+            )?;
             let result = AgentPathResponse::try_from(&found).map_err(contract_mapping_error)?;
             CanonicalResponseMapper::success(&SuccessEnvelope::new(
                 repository_id.clone(),
@@ -1879,9 +1886,42 @@ fn graph_max_traversal(value: Option<usize>) -> Result<usize, ToolExecutionFailu
     Ok(value)
 }
 
+fn validate_agent_condition_projection<'a>(
+    conditions: impl IntoIterator<Item = &'a str>,
+) -> Result<(), ToolExecutionFailure> {
+    let mut total = 0_usize;
+    for condition in conditions {
+        if condition.len() > MAX_AGENT_CONDITION_BYTES {
+            return Err(agent_condition_limit_error(
+                MAX_AGENT_CONDITION_BYTES as u64,
+            ));
+        }
+        total = total
+            .checked_add(condition.len())
+            .ok_or_else(|| agent_condition_limit_error(u64::from(MAX_PAGE_BYTES)))?;
+        if total > MAX_PAGE_BYTES as usize {
+            return Err(agent_condition_limit_error(u64::from(MAX_PAGE_BYTES)));
+        }
+    }
+    Ok(())
+}
+
+fn agent_condition_limit_error(maximum: u64) -> ToolExecutionFailure {
+    ToolExecutionFailure::Agent(AgentError::new(
+        AgentErrorCode::ResourceExhausted,
+        false,
+        AgentRemediation::NarrowQuery,
+        Some(AgentErrorDetails::ResourceLimit {
+            limit: AgentResourceLimit::OutputBytes,
+            maximum,
+        }),
+    ))
+}
+
 fn contract_mapping_error(error: ContractBuildError) -> ToolExecutionFailure {
     ToolExecutionFailure::Service(match error {
-        ContractBuildError::TooManyPathSteps
+        ContractBuildError::PageByteLimit
+        | ContractBuildError::TooManyPathSteps
         | ContractBuildError::TooManyCycleNodes
         | ContractBuildError::TooManyCorrelationReasons
         | ContractBuildError::TooManyPhases
@@ -2212,6 +2252,7 @@ mod tests {
     #[test]
     fn dto_collection_caps_map_to_service_resource_exhaustion() {
         for error in [
+            ContractBuildError::PageByteLimit,
             ContractBuildError::TooManyEvidenceItems,
             ContractBuildError::TooManyCorrelationReasons,
             ContractBuildError::TooManyPhases,

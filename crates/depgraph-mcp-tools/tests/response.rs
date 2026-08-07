@@ -232,6 +232,7 @@ fn mapper_redacts_sensitive_strings_from_closed_success_dtos() {
         "EXPLAIN SELECT * FROM credentials",
         "/* audit */ SELECT * FROM credentials",
         "g.V().has('password', 'top-secret')",
+        r#"feature == \"ghp_examplecredential\""#,
         "C:/private/key",
         concat!("file", ":///Users/alice/private.db"),
         r"\Windows\System32\config\SAM",

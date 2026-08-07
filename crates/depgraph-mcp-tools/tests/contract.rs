@@ -2,8 +2,8 @@ use std::num::NonZeroU32;
 
 use depgraph_mcp_tools::{
     AcceptedOperationStatus, AgentCapability, AgentChangedSince, AgentCompletedSnapshot,
-    AgentContext, AgentCorrelationDifference, AgentCorrelationStatus, AgentCoverage,
-    AgentCurrentSnapshot, AgentCycle, AgentCycleLevel, AgentDependenciesResponse,
+    AgentCondition, AgentContext, AgentCorrelationDifference, AgentCorrelationStatus,
+    AgentCoverage, AgentCurrentSnapshot, AgentCycle, AgentCycleLevel, AgentDependenciesResponse,
     AgentDependencyDirection, AgentEdge, AgentError, AgentErrorCategory, AgentErrorCode,
     AgentErrorDetails, AgentEvidence, AgentEvidenceKind, AgentGraphExportResponse, AgentImpact,
     AgentImpactResponse, AgentLocator, AgentNamedSnapshot, AgentNode, AgentNodeSummary,
@@ -12,12 +12,12 @@ use depgraph_mcp_tools::{
     AgentRemediation, AgentResolutionStatus, AgentResourceLimit, AgentRuntimeValidationResponse,
     AgentSite, AgentSnapshot, AgentSnapshotDiffResponse, AgentSourcePosition, AgentSourceSpan,
     AgentUnresolved, CommonRequest, ContractBuildError, Cursor, DurableSubmitResult, ErrorEnvelope,
-    LogicalRepositoryId, MAX_AGENT_CHANGED_FIELDS, MAX_AGENT_CORRELATION_REASONS,
-    MAX_AGENT_CYCLE_NODES, MAX_AGENT_PHASES, MAX_AGENT_QUERY_VALUES, MAX_PAGE_BYTES,
-    MAX_PAGE_ITEMS, MAX_TASK_TTL_MS, MIN_TASK_TTL_MS, OperationAccepted, OperationRecoveryTools,
-    Page, PageByteLimit, PageRequest, PageSize, RepositoryRelativePath, SnapshotId,
-    SnapshotSelector, SuccessEnvelope, TASK_POLL_INTERVAL_MS, TaskAccepted, TasksNegotiation,
-    canonical_json_bytes,
+    LogicalRepositoryId, MAX_AGENT_CHANGED_FIELDS, MAX_AGENT_CONDITION_BYTES,
+    MAX_AGENT_CORRELATION_REASONS, MAX_AGENT_CYCLE_NODES, MAX_AGENT_PHASES, MAX_AGENT_QUERY_VALUES,
+    MAX_PAGE_BYTES, MAX_PAGE_ITEMS, MAX_TASK_TTL_MS, MIN_TASK_TTL_MS, OperationAccepted,
+    OperationRecoveryTools, Page, PageByteLimit, PageRequest, PageSize, RepositoryRelativePath,
+    SnapshotId, SnapshotSelector, SuccessEnvelope, TASK_POLL_INTERVAL_MS, TaskAccepted,
+    TasksNegotiation, canonical_json_bytes,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -194,6 +194,60 @@ fn edge() -> AgentEdge {
         vec![evidence()],
     )
     .expect("bounded edge")
+}
+
+#[test]
+fn agent_edge_accepts_a_rendered_condition_larger_than_an_agent_label() {
+    let values: Vec<Value> = (0..40)
+        .map(|index| Value::String(format!("enabled-{index:02}")))
+        .collect();
+    let condition = depgraph_core::query::render_condition(&json!({
+        "op": "in",
+        "key": "feature",
+        "values": values,
+    }));
+    assert!(condition.len() > depgraph_mcp_tools::MAX_AGENT_LABEL_BYTES);
+
+    AgentEdge::new_with_condition(
+        parse("edge:long-condition"),
+        parse("node:src"),
+        parse("node:dependency"),
+        parse("imports"),
+        AgentPhase::Semantic,
+        AgentResolutionStatus::Resolved,
+        AgentPrecision::Exact,
+        parse("profile:default"),
+        None,
+        Some(parse(&condition)),
+        vec![],
+    )
+    .expect("valid persisted conditions must not be constrained by label length");
+}
+
+#[test]
+fn agent_condition_enforces_the_routable_utf8_byte_boundary() {
+    assert!(AgentCondition::parse("x".repeat(MAX_AGENT_CONDITION_BYTES)).is_ok());
+    assert!(AgentCondition::parse("é".repeat(MAX_AGENT_CONDITION_BYTES / 2)).is_ok());
+    assert!(AgentCondition::parse("x".repeat(MAX_AGENT_CONDITION_BYTES + 1)).is_err());
+    assert!(AgentCondition::parse("feature\u{0085}enabled").is_err());
+}
+
+#[test]
+fn agent_edge_legacy_constructor_accepts_agent_labels() {
+    AgentEdge::new(
+        parse("edge:legacy-condition"),
+        parse("node:src"),
+        parse("node:dependency"),
+        parse("imports"),
+        AgentPhase::Semantic,
+        AgentResolutionStatus::Resolved,
+        AgentPrecision::Exact,
+        parse("profile:default"),
+        None,
+        Some(parse("true")),
+        vec![],
+    )
+    .expect("the original AgentLabel constructor remains source-compatible");
 }
 
 fn unresolved_site() -> AgentSite {
