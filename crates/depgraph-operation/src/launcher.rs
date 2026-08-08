@@ -372,6 +372,17 @@ fn executable_name(base: &str) -> String {
 mod tests {
     use super::*;
 
+    fn write_test_executable(path: &Path) {
+        std::fs::write(path, b"test runner fixture").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mut permissions = std::fs::metadata(path).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(path, permissions).unwrap();
+        }
+    }
+
     fn sha256(path: &Path) -> String {
         format!("{:x}", Sha256::digest(std::fs::read(path).unwrap()))
     }
@@ -383,11 +394,10 @@ mod tests {
         let libexec = root.path().join("libexec");
         std::fs::create_dir_all(&bin).unwrap();
         std::fs::create_dir_all(&libexec).unwrap();
-        let source = std::env::current_exe().unwrap();
         let current = bin.join(executable_name("depgraph"));
         let runner = libexec.join(executable_name(RUNNER_BASENAME));
-        std::fs::copy(&source, &current).unwrap();
-        std::fs::copy(&source, &runner).unwrap();
+        write_test_executable(&current);
+        write_test_executable(&runner);
         let manifest = serde_json::json!({
             "release_version": env!("CARGO_PKG_VERSION"),
             "operation_runner": {
@@ -425,11 +435,10 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let deps = root.path().join("deps");
         std::fs::create_dir(&deps).unwrap();
-        let source = std::env::current_exe().unwrap();
         let current = deps.join("operation-tests");
         let runner = root.path().join(executable_name(RUNNER_BASENAME));
-        std::fs::copy(&source, &current).unwrap();
-        std::fs::copy(&source, &runner).unwrap();
+        write_test_executable(&current);
+        write_test_executable(&runner);
 
         let resolved = resolve_for_executable(&current).unwrap();
         assert_eq!(
