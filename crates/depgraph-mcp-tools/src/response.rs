@@ -136,6 +136,15 @@ impl MappedToolResult {
 pub struct CanonicalResponseMapper;
 
 impl CanonicalResponseMapper {
+    /// Maps the closed durable-submit union without wrapping it in a repository
+    /// success envelope. The baseline wire contract is the accepted handle
+    /// itself; native MCP Tasks uses the transport-level result union instead.
+    pub fn durable_submit(
+        result: &DurableSubmitResult,
+    ) -> Result<MappedToolResult, ResponseMappingError> {
+        map_envelope(result, false, MAX_PAGE_BYTES as usize)
+    }
+
     pub fn success<T>(
         envelope: &SuccessEnvelope<T>,
     ) -> Result<MappedToolResult, ResponseMappingError>
@@ -328,12 +337,14 @@ fn map_service_error(source: &DepgraphServiceError) -> AgentError {
             AgentRemediation::CorrectInput,
             None,
         ),
-        DepgraphServiceError::Conflict => AgentError::new(
-            AgentErrorCode::Conflict,
-            false,
-            AgentRemediation::CorrectInput,
-            None,
-        ),
+        DepgraphServiceError::Conflict | DepgraphServiceError::StoreWriterConflict => {
+            AgentError::new(
+                AgentErrorCode::Conflict,
+                false,
+                AgentRemediation::CorrectInput,
+                None,
+            )
+        }
         DepgraphServiceError::SnapshotWorktreeMismatch => AgentError::new(
             AgentErrorCode::SnapshotWorktreeMismatch,
             false,

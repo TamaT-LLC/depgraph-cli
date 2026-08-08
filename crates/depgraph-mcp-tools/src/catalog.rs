@@ -596,7 +596,7 @@ const TOOL_SPECS: &[ToolSpec] = &[
     tool_spec!(
         "scan_submit",
         "Start a bounded repository scan and persist its immutable result.",
-        ["strict", "no_cache"],
+        ["idempotency_key", "strict", "no_cache"],
         [CliAction::Scan],
         STORE_WRITE,
         ToolAuthorization::FixedCapabilities,
@@ -764,6 +764,9 @@ fn output_schema(spec: &ToolSpec) -> Map<String, Value> {
         }
         "snapshot_get" => {
             return exact_success_output_schema::<AgentCompletedSnapshot>(spec.name);
+        }
+        "snapshot_name_create" => {
+            return exact_success_output_schema::<AgentNamedSnapshot>(spec.name);
         }
         "profile_plan_get" => {
             return exact_success_output_schema::<AgentProfilePlan>(spec.name);
@@ -995,6 +998,12 @@ fn field_schema(tool_name: &str, field: &str) -> Value {
         }
         "cursor" => scalar_schema::<Cursor>(),
         "operation_id" => scalar_schema::<OperationId>(),
+        "idempotency_key" => json!({
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256,
+            "pattern": "^[^\\u0000-\\u001f\\u007f-\\u009f]+$"
+        }),
         "node_id" | "site_id" => scalar_schema::<AgentId>(),
         "selector" => scalar_schema::<AgentLocator>(),
         "from" | "to" if matches!(tool_name, "snapshot_diff_get" | "policy_evaluate") => {
@@ -1073,6 +1082,7 @@ fn required_input_fields(tool_name: &str) -> &'static [&'static str] {
         "graph_path_get" | "snapshot_diff_get" | "policy_evaluate" => &["from", "to"],
         "graph_export" => &["format"],
         "operation_get" | "operation_result" | "operation_cancel" => &["operation_id"],
+        "scan_submit" => &["idempotency_key"],
         "snapshot_name_create" => &["name"],
         _ => &[],
     }

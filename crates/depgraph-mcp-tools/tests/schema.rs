@@ -72,10 +72,24 @@ fn issue_310_shared_schema_publishes_the_closed_operation_projection() {
             .as_array()
             .expect("terminal output is a closed union")
             .len(),
-        1
+        2
     );
     let terminal_schema = terminal_output.to_string();
     assert!(!terminal_schema.contains("AgentOperation"));
+    let terminal_branches = terminal_output["anyOf"]
+        .as_array()
+        .expect("terminal output is a closed union")
+        .iter()
+        .map(|branch| {
+            branch["$ref"]
+                .as_str()
+                .and_then(|reference| reference.strip_prefix("#/$defs/"))
+                .and_then(|definition| definitions.get(definition))
+                .expect("terminal output branch resolves to a definition")
+                .to_string()
+        })
+        .collect::<String>();
+    assert!(terminal_branches.contains("AgentScanOutcome"));
 }
 
 #[test]
@@ -651,7 +665,7 @@ fn every_generated_object_schema_has_additional_properties_false() {
     let schema = schema_value();
     let mut objects = 0;
     assert_all_object_schemas_are_closed(&schema, "#", &mut objects);
-    assert_eq!(objects, 145, "review newly added object schemas explicitly");
+    assert_eq!(objects, 148, "review newly added object schemas explicitly");
 }
 
 #[test]

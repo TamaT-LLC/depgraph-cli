@@ -9,12 +9,13 @@ use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use depgraph_core::service::{
     BoundedQueryMode, BoundedQueryRequest, CompletedSnapshotView, CyclesRequest,
-    DependenciesRequest, DependencyDirection, DepgraphCapabilitySet, DepgraphService,
-    DepgraphServiceConfig, DepgraphServiceError, DepgraphServiceLimits, DoctorRequest,
-    ExplainPathRequest, GraphExportFormat, GraphExportRequest, ImpactRequest,
+    DependenciesRequest, DependencyDirection, DepgraphCapability, DepgraphCapabilitySet,
+    DepgraphService, DepgraphServiceConfig, DepgraphServiceError, DepgraphServiceLimits,
+    DoctorRequest, ExplainPathRequest, GraphExportFormat, GraphExportRequest, ImpactRequest,
     MAX_GRAPH_EXPORT_EDGES, MAX_GRAPH_EXPORT_NODES, PolicyEvaluateRequest, ProfilePlanRequest,
-    RepositoryRelativePath, RuntimeValidateRequest, ServiceSnapshotSelector, SnapshotDiffFilters,
-    SnapshotDiffRequest, SnapshotLocator, SnapshotReadRequest, UnresolvedRequest,
+    RepositoryRelativePath, RuntimeValidateRequest, ScanRequest, ServiceSnapshotSelector,
+    SnapshotDiffFilters, SnapshotDiffRequest, SnapshotLocator, SnapshotNameCreateRequest,
+    SnapshotNameCreateSelector, SnapshotReadRequest, UnresolvedRequest,
 };
 use depgraph_core::{
     BoundedQueryExecutionError, BoundedQueryPlan, BoundedQueryResult, BuildAudit, BuildOutcomeKind,
@@ -30,16 +31,15 @@ use depgraph_core::{
     export_graphml_filtered_to_writer, init_config, match_runtime_trace, open_store,
     paginate_interactive_query, prepare_build_cache_input, prepare_compiler_precise_cache_input,
     profile_selection_human_summary, read_compiler_pack_requirement, read_runtime_trace,
-    render_condition, render_github_annotations, run_scan_with_cache_mode, runtime_session_delta,
-    rust_build_protocol_ndjson, snapshot_profile_plan_id, stage_build_evidence,
-    start_repository_daemon, traversal_summary, unresolved_summary, validate_build_cache_input,
-    validate_build_cache_source, validate_compiler_precise_cache_input,
-    validate_compiler_precise_cached_evidence, validate_interactive_query_bounds,
-    web_build_protocol_ndjson,
+    render_condition, render_github_annotations, runtime_session_delta, rust_build_protocol_ndjson,
+    snapshot_profile_plan_id, stage_build_evidence, start_repository_daemon, traversal_summary,
+    unresolved_summary, validate_build_cache_input, validate_build_cache_source,
+    validate_compiler_precise_cache_input, validate_compiler_precise_cached_evidence,
+    validate_interactive_query_bounds, web_build_protocol_ndjson,
 };
 use depgraph_mcp_tools::{AgentDaemonStatus, AgentDoctor, CliAction};
 use depgraph_protocol::canonical_json;
-use depgraph_store::{CompletedSnapshotDetails, CoverageRecord};
+use depgraph_store::CoverageRecord;
 use serde::Serialize;
 
 mod snapshot_diff;
@@ -520,24 +520,6 @@ struct SnapshotCommandEnvelope<'a, T: Serialize> {
     data: &'a T,
 }
 
-#[derive(Serialize)]
-struct SnapshotView {
-    id: String,
-    names: Vec<String>,
-    status: String,
-    source_kind: String,
-    source_attempt_id: String,
-    scan_id: String,
-    build_attempt_id: Option<String>,
-    runtime_import_id: Option<String>,
-    runtime_session_ids: Vec<String>,
-    parent_snapshot_id: Option<String>,
-    source_revision: Option<String>,
-    profile_ids: Vec<String>,
-    created_at: String,
-    coverage: CoverageRecord,
-}
-
 #[derive(Debug)]
 struct QuerySnapshotUnavailable;
 
@@ -551,33 +533,11 @@ impl std::fmt::Display for QuerySnapshotUnavailable {
 
 impl std::error::Error for QuerySnapshotUnavailable {}
 
-impl From<CompletedSnapshotDetails> for SnapshotView {
-    fn from(details: CompletedSnapshotDetails) -> Self {
-        let snapshot = details.snapshot;
-        Self {
-            id: snapshot.id,
-            names: details.names,
-            status: snapshot.status,
-            source_kind: snapshot.source_kind,
-            source_attempt_id: snapshot.source_attempt_id,
-            scan_id: snapshot.scan_id,
-            build_attempt_id: snapshot.build_attempt_id,
-            runtime_import_id: snapshot.runtime_import_id,
-            runtime_session_ids: snapshot.runtime_session_ids,
-            parent_snapshot_id: snapshot.parent_snapshot_id,
-            source_revision: snapshot.source_revision,
-            profile_ids: snapshot.profile_ids,
-            created_at: snapshot.created_at,
-            coverage: details.coverage,
-        }
-    }
-}
-
 #[derive(Serialize)]
-struct SnapshotCreatedOutput {
-    name: String,
-    named_at: String,
-    snapshot: SnapshotView,
+struct SnapshotCreatedOutput<'a> {
+    name: &'a str,
+    named_at: &'a str,
+    snapshot: &'a CompletedSnapshotView,
 }
 
 #[tokio::main]
@@ -697,22 +657,19 @@ async fn run(cli: Cli) -> Result<u8> {
             no_cache,
         } => {
             let root = canonical_directory(path)?;
-            let config = Config::load(&root)?;
             let store_path = store_path(cli.store, &root)?;
-            let _store_writer_lock = acquire_store_writer_lock(&store_path)?;
-            let mut store = open_store(&store_path)?;
-            let outcome = run_scan_with_cache_mode(
-                &mut store,
-                root,
-                &config,
-                strict,
-                if no_cache {
-                    ScanCacheMode::Disabled
-                } else {
-                    ScanCacheMode::Enabled
-                },
-            )
-            .await?;
+            let service = store_write_service(&root, &store_path)?;
+            let result = service
+                .scan(&ScanRequest::new(
+                    strict,
+                    if no_cache {
+                        ScanCacheMode::Disabled
+                    } else {
+                        ScanCacheMode::Enabled
+                    },
+                ))
+                .await?;
+            let outcome = result.outcome();
             if json {
                 println!("{}", serde_json::to_string_pretty(&outcome)?);
             } else {
@@ -1926,35 +1883,56 @@ async fn run(cli: Cli) -> Result<u8> {
         Commands::Snapshot { command } => {
             let root = std::env::current_dir()?;
             let store_path = std::path::absolute(store_path(cli.store, &root)?)?;
-            let _store_writer_lock = matches!(&command, SnapshotCommands::Create { .. })
-                .then(|| acquire_store_writer_lock(&store_path))
-                .transpose()?;
             match command {
                 SnapshotCommands::Create { name, json } => {
-                    let mut store = open_store(&store_path)?;
-                    let snapshot_id = if let Some(scan_id) = cli.scan_id.as_deref() {
-                        store
-                            .snapshot_id_for_scan_selection(scan_id)?
-                            .with_context(|| {
-                                format!("scan attempt {scan_id} has no completed snapshot")
-                            })?
+                    let service = store_write_service(&root, &store_path)?;
+                    let request = if let Some(scan_id) = cli.scan_id {
+                        SnapshotNameCreateRequest::for_scan(name, scan_id)
                     } else {
-                        store
-                            .current_snapshot_id()?
-                            .context("no current completed snapshot is available")?
+                        SnapshotNameCreateRequest::new(name, SnapshotLocator::Current)
                     };
-                    let named = store.create_snapshot_name(&name, &snapshot_id)?;
+                    let named =
+                        match service.snapshot_name_create(&request, &CancellationToken::new()) {
+                            Ok(named) => named,
+                            Err(DepgraphServiceError::Conflict) => {
+                                return Err(anyhow::anyhow!(
+                                    "snapshot name {} already exists",
+                                    request.name()
+                                ));
+                            }
+                            Err(DepgraphServiceError::InvalidInput) => {
+                                return Err(anyhow::anyhow!(
+                                    "snapshot name {} is invalid",
+                                    request.name()
+                                ));
+                            }
+                            Err(DepgraphServiceError::NotFound) => {
+                                let message = match request.selector() {
+                                    SnapshotNameCreateSelector::CompletedForScan(scan_id) => {
+                                        format!("scan {scan_id} has no completed snapshot")
+                                    }
+                                    SnapshotNameCreateSelector::Completed(
+                                        SnapshotLocator::Current,
+                                    ) => "no current completed snapshot is available".to_owned(),
+                                    SnapshotNameCreateSelector::Completed(selector) => {
+                                        format!("completed snapshot {selector:?} was not found")
+                                    }
+                                };
+                                return Err(anyhow::anyhow!(message));
+                            }
+                            Err(error) => return Err(error.into()),
+                        };
                     let output = SnapshotCreatedOutput {
-                        name: named.name,
-                        named_at: named.named_at,
-                        snapshot: store.completed_snapshot_details(&snapshot_id)?.into(),
+                        name: named.name(),
+                        named_at: named.named_at(),
+                        snapshot: named.snapshot(),
                     };
                     if json {
                         print_snapshot_json("snapshot.create", &output)?;
                     } else {
                         println!("created snapshot name: {}", output.name);
                         println!("named at: {}", output.named_at);
-                        print_snapshot_view(&output.snapshot);
+                        print_completed_snapshot_view(output.snapshot);
                     }
                 }
                 SnapshotCommands::List { json } => {
@@ -3124,40 +3102,6 @@ fn print_snapshot_json<T: Serialize>(command: &'static str, data: &T) -> Result<
     Ok(())
 }
 
-fn print_snapshot_view(snapshot: &SnapshotView) {
-    println!("snapshot: {}", snapshot.id);
-    println!("names: {}", display_list(&snapshot.names));
-    println!("status: {}", snapshot.status);
-    println!(
-        "source: {} {}",
-        snapshot.source_kind, snapshot.source_attempt_id
-    );
-    println!("scan: {}", snapshot.scan_id);
-    if let Some(build_attempt_id) = &snapshot.build_attempt_id {
-        println!("build attempt: {build_attempt_id}");
-    }
-    if let Some(runtime_import_id) = &snapshot.runtime_import_id {
-        println!("runtime import: {runtime_import_id}");
-    }
-    if !snapshot.runtime_session_ids.is_empty() {
-        println!(
-            "runtime sessions: {}",
-            display_list(&snapshot.runtime_session_ids)
-        );
-    }
-    println!(
-        "parent: {}",
-        snapshot.parent_snapshot_id.as_deref().unwrap_or("none")
-    );
-    println!(
-        "revision: {}",
-        display_revision(snapshot.source_revision.as_deref())
-    );
-    println!("profiles: {}", display_list(&snapshot.profile_ids));
-    println!("created at: {}", snapshot.created_at);
-    println!("{}", coverage_summary(&snapshot.coverage));
-}
-
 fn print_completed_snapshot_view(snapshot: &CompletedSnapshotView) {
     println!("snapshot: {}", snapshot.id());
     println!("names: {}", display_list(snapshot.names()));
@@ -3196,6 +3140,17 @@ fn snapshot_read_service(root: &Path, store_path: &Path) -> Result<DepgraphServi
         root,
         &store_path,
         DepgraphCapabilitySet::read_only(),
+        DepgraphServiceLimits::default(),
+    )?;
+    Ok(DepgraphService::new(config))
+}
+
+fn store_write_service(root: &Path, store_path: &Path) -> Result<DepgraphService> {
+    let store_path = std::path::absolute(store_path).context("store path is unavailable")?;
+    let config = DepgraphServiceConfig::new(
+        root,
+        &store_path,
+        DepgraphCapabilitySet::try_new([DepgraphCapability::Read, DepgraphCapability::StoreWrite])?,
         DepgraphServiceLimits::default(),
     )?;
     Ok(DepgraphService::new(config))

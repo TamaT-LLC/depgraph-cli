@@ -3703,6 +3703,194 @@ fn issue_311_tasks_request_cancellation_prevents_mutation_and_server_recovers() 
 }
 
 #[test]
+fn issue_312_scan_submit_is_quick_durable_recoverable_and_snapshot_naming_is_closed() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("repository");
+    let store_path = temporary.path().join("graph.sqlite");
+    fs::create_dir(&root).unwrap();
+    fs::write(
+        root.join("README.md"),
+        "source tree must remain unchanged\n",
+    )
+    .unwrap();
+    let before_source = source_tree_digest(&root);
+
+    let mut read_only = InteractiveMcp::start(&root, &store_path);
+    initialize_interactive_mcp(&mut read_only, 1);
+    let listed = read_only.request(json!({
+        "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}
+    }));
+    let names = listed["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert!(!names.contains(&"scan_submit"));
+    assert!(!names.contains(&"snapshot_name_create"));
+    let denied = read_only.request(json!({
+        "jsonrpc":"2.0","id":3,"method":"tools/call",
+        "params":{"name":"scan_submit","arguments":{
+            "contract_version":"depgraph-mcp-tools-v1",
+            "repository_id":"repository",
+            "idempotency_key":"issue-312-denied"
+        }}
+    }));
+    assert_eq!(denied["error"]["code"], -32602);
+    read_only.finish();
+
+    let mut submit = InteractiveMcp::start_with_capabilities(&root, &store_path, &["store-write"]);
+    initialize_tasks_mcp(&mut submit, 10, "2026-07-28", true);
+    let started = Instant::now();
+    let accepted = submit.request(json!({
+        "jsonrpc":"2.0","id":11,"method":"tools/call",
+        "params":{"name":"scan_submit","arguments":{
+            "contract_version":"depgraph-mcp-tools-v1",
+            "repository_id":"repository",
+            "idempotency_key":"issue-312-quick-accepted",
+            "strict":false,
+            "no_cache":false
+        }}
+    }));
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "submit was not quick: {:?}",
+        started.elapsed()
+    );
+    let task_id = accepted["result"]["taskId"].as_str().unwrap().to_owned();
+    assert!(task_id.starts_with("op_"));
+    submit.finish();
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let terminal = loop {
+        let mut reconnected =
+            InteractiveMcp::start_with_capabilities(&root, &store_path, &["store-write"]);
+        initialize_tasks_mcp(&mut reconnected, 20, "2026-07-28", true);
+        let status = reconnected.request(json!({
+            "jsonrpc":"2.0","id":21,"method":"tasks/get",
+            "params":{"taskId":task_id}
+        }));
+        reconnected.finish();
+        if status["result"]["status"] == "completed" {
+            break status;
+        }
+        assert_ne!(
+            status["result"]["status"], "failed",
+            "durable scan failed: {status}"
+        );
+        assert_ne!(
+            status["result"]["status"], "cancelled",
+            "durable scan was cancelled: {status}"
+        );
+        assert!(Instant::now() < deadline, "durable scan did not complete");
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    assert_eq!(
+        terminal["result"]["result"]["structuredContent"]["result"]["status"],
+        "completed"
+    );
+    assert_eq!(
+        terminal["result"]["result"]["structuredContent"]["result"]["project_code_executed"],
+        false
+    );
+    let snapshot_id = terminal["result"]["result"]["structuredContent"]["snapshot_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(snapshot_id.starts_with("snapshot:sha256:"));
+    assert_eq!(
+        terminal["result"]["result"]["structuredContent"]["result"]["cache"]["hits"],
+        0
+    );
+    assert!(
+        terminal["result"]["result"]["structuredContent"]["result"]["cache"]["misses"]
+            .as_u64()
+            .is_some_and(|misses| misses > 0)
+    );
+    assert_eq!(source_tree_digest(&root), before_source);
+
+    let mut warm = InteractiveMcp::start_with_capabilities(&root, &store_path, &["store-write"]);
+    initialize_tasks_mcp(&mut warm, 25, "2026-07-28", true);
+    let warm_accepted = warm.request(json!({
+        "jsonrpc":"2.0","id":26,"method":"tools/call",
+        "params":{"name":"scan_submit","arguments":{
+            "contract_version":"depgraph-mcp-tools-v1",
+            "repository_id":"repository",
+            "idempotency_key":"issue-312-warm-cache",
+            "strict":false,
+            "no_cache":false
+        }}
+    }));
+    let warm_task_id = warm_accepted["result"]["taskId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    warm.finish();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let warm_terminal = loop {
+        let mut reconnected =
+            InteractiveMcp::start_with_capabilities(&root, &store_path, &["store-write"]);
+        initialize_tasks_mcp(&mut reconnected, 27, "2026-07-28", true);
+        let status = reconnected.request(json!({
+            "jsonrpc":"2.0","id":28,"method":"tasks/get",
+            "params":{"taskId":warm_task_id}
+        }));
+        reconnected.finish();
+        if status["result"]["status"] == "completed" {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "warm durable scan did not complete"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    assert!(
+        warm_terminal["result"]["result"]["structuredContent"]["result"]["cache"]["hits"]
+            .as_u64()
+            .is_some_and(|hits| hits > 0)
+    );
+    assert_eq!(
+        warm_terminal["result"]["result"]["structuredContent"]["result"]["cache"]["misses"],
+        0
+    );
+    assert_eq!(source_tree_digest(&root), before_source);
+
+    let mut naming = InteractiveMcp::start_with_capabilities(&root, &store_path, &["store-write"]);
+    initialize_interactive_mcp(&mut naming, 30);
+    let named = interactive_tool_call(
+        &mut naming,
+        31,
+        "snapshot_name_create",
+        json!({
+            "contract_version":"depgraph-mcp-tools-v1",
+            "repository_id":"repository",
+            "name":"baseline",
+            "snapshot":snapshot_id
+        }),
+    );
+    assert_eq!(named["structuredContent"]["result"]["name"], "baseline");
+    assert_eq!(
+        named["structuredContent"]["result"]["snapshot"]["snapshot_id"],
+        snapshot_id
+    );
+    let duplicate = interactive_tool_call(
+        &mut naming,
+        32,
+        "snapshot_name_create",
+        json!({
+            "contract_version":"depgraph-mcp-tools-v1",
+            "repository_id":"repository",
+            "name":"BASELINE",
+            "snapshot":snapshot_id
+        }),
+    );
+    assert_eq!(duplicate["structuredContent"]["error"]["code"], "CONFLICT");
+    naming.finish();
+    assert_eq!(source_tree_digest(&root), before_source);
+}
+
+#[test]
 fn tools_list_is_profile_filtered_static_sorted_and_repeatable() {
     let root = tempfile::tempdir().unwrap();
     let requirement = requirement();

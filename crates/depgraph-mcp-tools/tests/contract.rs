@@ -10,7 +10,7 @@ use depgraph_mcp_tools::{
     AgentNodeSummary, AgentOperation, AgentOperationStatus, AgentPathResponse, AgentPathStep,
     AgentPhase, AgentPolicyAnnotation, AgentPolicyApiChange, AgentPolicyEvaluationResponse,
     AgentPolicyViolation, AgentPrecision, AgentQueryRow, AgentRemediation, AgentResolutionStatus,
-    AgentResourceLimit, AgentRuntimeValidationResponse, AgentSite, AgentSnapshot,
+    AgentResourceLimit, AgentRuntimeValidationResponse, AgentScanOutcome, AgentSite, AgentSnapshot,
     AgentSnapshotDiffResponse, AgentSourcePosition, AgentSourceSpan, AgentUnresolved,
     CommonRequest, ContractBuildError, Cursor, DurableSubmitResult, ErrorEnvelope,
     LogicalRepositoryId, MAX_AGENT_CHANGED_FIELDS, MAX_AGENT_CONDITION_BYTES,
@@ -167,7 +167,46 @@ fn portable_terminal_output_is_deserialized_only_by_its_originating_tool_contrac
     let daemon =
         PortableTerminalOutputContract::for_originating_tool("daemon_start_submit").unwrap();
     assert!(daemon.deserialize(value.clone()).is_ok());
-    assert!(PortableTerminalOutputContract::for_originating_tool("scan_submit").is_none());
+    let scan = PortableTerminalOutputContract::for_originating_tool("scan_submit").unwrap();
+    let scan_outcome: AgentScanOutcome = serde_json::from_value(json!({
+        "scan_id": "scan:fixture",
+        "status": "completed",
+        "project_code_executed": false,
+        "cache": {"hits": 1, "misses": 2},
+        "coverage": {
+            "profiles": 1,
+            "files_discovered": 1,
+            "files_analyzed": 1,
+            "files_skipped": 0,
+            "dependency_sites": 0,
+            "resolved": 0,
+            "candidates": 0,
+            "external": 0,
+            "unresolved": 0,
+            "unsupported_syntax": 0,
+            "project_code_executed": false,
+            "completeness": ["syntax-complete"],
+            "reasons": []
+        }
+    }))
+    .unwrap();
+    assert_eq!(scan_outcome.cache().hits(), 1);
+    assert_eq!(scan_outcome.cache().misses(), 2);
+    let scan_envelope =
+        SuccessEnvelope::new(parse("repo-1"), Some(parse(SNAPSHOT_ID)), scan_outcome);
+    assert!(
+        scan.deserialize(serde_json::to_value(&scan_envelope).unwrap())
+            .is_ok()
+    );
+    let mut unsafe_scan = serde_json::to_value(&scan_envelope).unwrap();
+    unsafe_scan["result"]["project_code_executed"] = json!(true);
+    assert!(scan.deserialize(unsafe_scan).is_err());
+    let mut snapshotless_scan = serde_json::to_value(&scan_envelope).unwrap();
+    snapshotless_scan
+        .as_object_mut()
+        .unwrap()
+        .remove("snapshot_id");
+    assert!(scan.deserialize(snapshotless_scan).is_err());
 
     let mut mismatched_envelope = value;
     mismatched_envelope["snapshot_id"] = json!(SNAPSHOT_ID);

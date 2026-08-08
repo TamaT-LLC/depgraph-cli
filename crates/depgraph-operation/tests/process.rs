@@ -131,7 +131,7 @@ fn accepted_operation_survives_stdin_eof_and_launcher_process_exit() {
         .submit(
             &SubmitRequest::new(
                 &config,
-                OperationKind::ScanSubmit,
+                OperationKind::RuntimeTraceImportSubmit,
                 &json!({"private_payload": "must-never-reach-stdio"}),
                 b"detached-launch-acceptance",
                 submitted_at + 60_000,
@@ -272,6 +272,54 @@ fn runner_reports_the_packaged_version_handshake() {
 }
 
 #[test]
+fn runner_executes_cache_enabled_scan_to_closed_terminal_result() {
+    let root = tempfile::tempdir().unwrap();
+    let repository_root = root.path().join("repository");
+    fs::create_dir(&repository_root).unwrap();
+    fs::write(repository_root.join("README.md"), b"cache fixture\n").unwrap();
+    let store = root.path().join("graph.sqlite");
+    let config = config(&repository_root, &store);
+    let repository = LogicalRepositoryId::parse(config.logical_repository_id()).unwrap();
+    let submitted_at = now_ms();
+    let mut journal = OperationJournal::open(&config).unwrap();
+    let operation_id = journal
+        .submit(
+            &SubmitRequest::new(
+                &config,
+                OperationKind::ScanSubmit,
+                &json!({"strict": false, "no_cache": false}),
+                b"cache-enabled-scan",
+                submitted_at + 60_000,
+            )
+            .unwrap(),
+            submitted_at,
+        )
+        .unwrap()
+        .operation_id()
+        .clone();
+    drop(journal);
+
+    let output = runner_command(&repository_root, &store).output().unwrap();
+    assert!(
+        output.status.success(),
+        "runner failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let journal = OperationJournal::open(&config).unwrap();
+    match journal
+        .result(&repository, &operation_id, now_ms())
+        .unwrap()
+    {
+        OperationOutcome::Completed(result) => {
+            let value: serde_json::Value = serde_json::from_str(result.as_str()).unwrap();
+            assert_eq!(value["result"]["status"], "completed");
+            assert!(value["result"]["cache"]["misses"].as_u64().is_some());
+        }
+        other => panic!("unexpected cache-enabled scan outcome: {other:?}"),
+    }
+}
+
+#[test]
 fn two_runner_processes_claim_one_record_only_once() {
     let root = tempfile::tempdir().unwrap();
     let repository_root = root.path().join("repository");
@@ -285,7 +333,7 @@ fn two_runner_processes_claim_one_record_only_once() {
         .submit(
             &SubmitRequest::new(
                 &config,
-                OperationKind::ScanSubmit,
+                OperationKind::RuntimeTraceImportSubmit,
                 &json!({"claim": "once"}),
                 b"two-runner-process-claim",
                 submitted_at + 60_000,

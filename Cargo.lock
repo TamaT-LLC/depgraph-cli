@@ -571,6 +571,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "thiserror",
+ "tokio",
  "windows-sys 0.61.2",
 ]
 

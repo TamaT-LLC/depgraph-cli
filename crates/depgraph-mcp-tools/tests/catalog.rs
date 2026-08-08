@@ -2,8 +2,8 @@ use std::path::PathBuf;
 
 use depgraph_core::{DepgraphCapability, DepgraphCapabilitySet};
 use depgraph_mcp_tools::{
-    ALL_CLI_ACTIONS, CapabilityProfile, CliAction, OperationAccepted, OperationBehavior,
-    OperationId, ToolAuthorization, ToolCatalog,
+    ALL_CLI_ACTIONS, AgentNamedSnapshot, CapabilityProfile, CliAction, OperationAccepted,
+    OperationBehavior, OperationId, SuccessEnvelope, ToolAuthorization, ToolCatalog,
 };
 
 use serde_json::Value;
@@ -688,6 +688,60 @@ fn durable_operation_output_schema_accepts_the_v1_wire_contract() {
     let operation_id = OperationId::parse(format!("op_{}", "a".repeat(32))).unwrap();
     let payload = serde_json::to_value(OperationAccepted::new(operation_id)).unwrap();
     assert!(validator.is_valid(&payload));
+}
+
+#[test]
+fn store_write_tools_have_closed_inputs_outputs_and_remain_capability_filtered() {
+    let catalog = ToolCatalog::for_capabilities(&full_capabilities()).unwrap();
+    let scan = catalog.tool("scan_submit").unwrap();
+    assert_eq!(
+        scan.input_schema()["required"],
+        serde_json::json!(["contract_version", "repository_id", "idempotency_key"])
+    );
+    assert_eq!(
+        scan.input_schema()["properties"]["idempotency_key"]["maxLength"],
+        256
+    );
+
+    let create = catalog.tool("snapshot_name_create").unwrap();
+    let output = Value::Object(create.output_schema().clone());
+    let validator = jsonschema::validator_for(&output).unwrap();
+    let named: AgentNamedSnapshot = serde_json::from_value(serde_json::json!({
+        "name": "baseline",
+        "named_at": "2026-08-08T00:00:00.000Z",
+        "snapshot": {
+            "snapshot_id": format!("snapshot:sha256:{}", "a".repeat(64)),
+            "names": ["baseline"],
+            "status": "completed",
+            "source_kind": "scan",
+            "source_attempt_id": "scan:fixture",
+            "scan_id": "scan:fixture",
+            "runtime_session_ids": [],
+            "profile_ids": [],
+            "created_at": "2026-08-08T00:00:00.000Z",
+            "coverage": {
+                "profiles":0,"files_discovered":0,"files_analyzed":0,"files_skipped":0,
+                "dependency_sites":0,"resolved":0,"candidates":0,"external":0,
+                "unresolved":0,"unsupported_syntax":0,"project_code_executed":false,
+                "completeness":["syntax-complete"],"reasons":[]
+            }
+        }
+    }))
+    .unwrap();
+    let envelope = SuccessEnvelope::new(
+        "repository".parse().unwrap(),
+        Some(
+            format!("snapshot:sha256:{}", "a".repeat(64))
+                .parse()
+                .unwrap(),
+        ),
+        named,
+    );
+    assert!(validator.is_valid(&serde_json::to_value(envelope).unwrap()));
+
+    let read_only = ToolCatalog::for_capabilities(&DepgraphCapabilitySet::read_only()).unwrap();
+    assert!(read_only.tool("scan_submit").is_none());
+    assert!(read_only.tool("snapshot_name_create").is_none());
 }
 
 #[test]

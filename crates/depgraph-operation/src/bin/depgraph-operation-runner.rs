@@ -6,7 +6,7 @@ use depgraph_core::{
 };
 use depgraph_operation::{
     OPERATION_RUNNER_STARTUP_CONTRACT, OperationRunner, RunnerStartupConfig,
-    UnsupportedOperationDispatcher,
+    ScanOperationDispatcher,
 };
 
 const STARTUP_FAILURE: &str = "depgraph-operation-runner: startup rejected";
@@ -79,7 +79,8 @@ fn main() -> ExitCode {
         eprintln!("{STARTUP_FAILURE}");
         return ExitCode::FAILURE;
     };
-    match OperationRunner::new(startup, UnsupportedOperationDispatcher).run_until_idle() {
+    let dispatcher = ScanOperationDispatcher::new(startup.service_config().clone());
+    match OperationRunner::new(startup, dispatcher).run_until_idle() {
         Ok(_) => ExitCode::SUCCESS,
         Err(_) => {
             eprintln!("{EXECUTION_FAILURE}");

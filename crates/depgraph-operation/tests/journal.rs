@@ -609,7 +609,7 @@ fn current_schema_integrity_binding_metadata_and_required_objects_are_validated(
     drop(second);
     Connection::open(&path)
         .unwrap()
-        .execute_batch("PRAGMA user_version = 3")
+        .execute_batch("PRAGMA user_version = 4")
         .unwrap();
     assert!(matches!(
         OperationJournal::open(&config),
@@ -639,13 +639,56 @@ fn empty_issue_307_schema_migrates_atomically() {
     Connection::open(&path)
         .unwrap()
         .execute_batch(
-            "DROP TABLE operation_journal_metadata;
+            "DROP TABLE operation_completion_intents;
+             DROP TABLE operation_journal_metadata;
              PRAGMA user_version = 1;",
         )
         .unwrap();
 
     let migrated = OperationJournal::open(&config).unwrap();
     assert_eq!(migrated.schema_version().unwrap(), JOURNAL_SCHEMA_VERSION);
+    migrated.validate().unwrap();
+}
+
+#[test]
+fn root_bound_v2_journal_with_queued_work_migrates_completion_intents_atomically() {
+    let root = tempfile::tempdir().unwrap();
+    let graph_store = root.path().join("graph.sqlite");
+    let config = service_config(root.path(), &graph_store);
+    let mut journal = OperationJournal::open(&config).unwrap();
+    let operation_id = journal
+        .submit(
+            &request(
+                &config,
+                json!({"migration": "v2-to-v3"}),
+                b"v2-completion-intent-migration",
+                DEADLINE,
+            ),
+            NOW,
+        )
+        .unwrap()
+        .operation_id()
+        .clone();
+    let path = journal.path().to_path_buf();
+    drop(journal);
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "DROP TABLE operation_completion_intents;
+             PRAGMA user_version = 2;",
+        )
+        .unwrap();
+
+    let migrated = OperationJournal::open(&config).unwrap();
+
+    assert_eq!(migrated.schema_version().unwrap(), JOURNAL_SCHEMA_VERSION);
+    assert_eq!(
+        migrated
+            .get(&repository(), &operation_id, NOW + 1)
+            .unwrap()
+            .status(),
+        OperationStatus::Queued
+    );
     migrated.validate().unwrap();
 }
 
