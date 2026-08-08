@@ -22,14 +22,14 @@ use crate::{
     AgentCapability, AgentCompletedSnapshot, AgentContext, AgentCycle, AgentDaemonStatus,
     AgentDependenciesResponse, AgentDoctor, AgentEdge, AgentError, AgentErrorCode,
     AgentErrorDetails, AgentEvidence, AgentGraphExportResponse, AgentImpact, AgentImpactResponse,
-    AgentNamedSnapshot, AgentNode, AgentNodeSummary, AgentPathResponse, AgentPathStep,
-    AgentPolicyEvaluationResponse, AgentProfilePlan, AgentQueryRow, AgentRemediation,
-    AgentResourceLimit, AgentRuntimeTraceEvent, AgentRuntimeValidationResponse, AgentSite,
-    AgentSnapshot, AgentSnapshotDiffResponse, AgentUnresolved, CanonicalJsonError,
+    AgentNamedSnapshot, AgentNode, AgentNodeSummary, AgentOperation, AgentPathResponse,
+    AgentPathStep, AgentPolicyEvaluationResponse, AgentProfilePlan, AgentQueryRow,
+    AgentRemediation, AgentResourceLimit, AgentRuntimeTraceEvent, AgentRuntimeValidationResponse,
+    AgentSite, AgentSnapshot, AgentSnapshotDiffResponse, AgentUnresolved, CanonicalJsonError,
     ContractBuildError, Cursor, DurableSubmitResult, ErrorEnvelope, LogicalRepositoryId,
     MAX_AGENT_CONDITION_BYTES, MAX_PAGE_BYTES, MAX_PAGE_ITEMS, MCP_TOOLS_CONTRACT_VERSION,
-    OperationAccepted, Page, PageRequest, SnapshotId, SuccessEnvelope, TaskAccepted,
-    canonical_json_bytes,
+    OperationAccepted, Page, PageRequest, PortableTerminalOutput, SnapshotId, SuccessEnvelope,
+    TaskAccepted, canonical_json_bytes,
 };
 
 const CURSOR_VERSION: &str = "v1";
@@ -84,6 +84,7 @@ public_result!(
     AgentSnapshotDiffResponse,
     AgentPolicyEvaluationResponse,
     AgentGraphExportResponse,
+    AgentOperation,
     DurableSubmitResult,
     OperationAccepted,
     TaskAccepted,
@@ -177,6 +178,20 @@ impl CanonicalResponseMapper {
 
     pub fn error(envelope: &ErrorEnvelope) -> Result<MappedToolResult, ResponseMappingError> {
         map_envelope(envelope, true, MAX_PAGE_BYTES as usize)
+    }
+
+    /// Map a terminal success only after it crossed the originating tool's
+    /// closed portable-output contract.
+    pub fn terminal_output(
+        output: &PortableTerminalOutput,
+    ) -> Result<MappedToolResult, ResponseMappingError> {
+        match map_envelope(output, false, MAX_PAGE_BYTES as usize) {
+            Err(ResponseMappingError::OutputTooLarge) => Self::error(&ErrorEnvelope::new(
+                output.repository_id().clone(),
+                resource_error(AgentResourceLimit::OutputBytes, u64::from(MAX_PAGE_BYTES)),
+            )),
+            mapped => mapped,
+        }
     }
 
     pub fn service_error(

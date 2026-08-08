@@ -46,9 +46,12 @@ pub use lifecycle::{
     AgentDaemonStatus, AgentDaemonTrace, AgentDoctor, AgentProfilePlan, AgentRecoveredAttempts,
 };
 pub use operation::{
-    AcceptedOperationStatus, AcceptedTaskStatus, BaselineOperationTool, DurableSubmitResult,
-    MAX_TASK_TTL_MS, MIN_TASK_TTL_MS, OperationAccepted, OperationAcceptedResultType,
-    OperationRecoveryTools, TASK_POLL_INTERVAL_MS, TaskAccepted, TaskResultType, TasksNegotiation,
+    AcceptedOperationStatus, AcceptedTaskStatus, AgentOperation, AgentOperationProgress,
+    AgentOperationRetention, AgentOperationStatus, AgentOperationTimestamps, BaselineOperationTool,
+    DurableSubmitResult, MAX_TASK_TTL_MS, MIN_TASK_TTL_MS, OperationAccepted,
+    OperationAcceptedResultType, OperationRecoveryTools, PortableTerminalOutput,
+    PortableTerminalOutputContract, PortableTerminalOutputError, TASK_POLL_INTERVAL_MS,
+    TaskAccepted, TaskResultType, TasksNegotiation,
 };
 pub use response::{
     CanonicalResponseMapper, CursorKey, MappedToolResult, PaginationContext, PublicPageItem,

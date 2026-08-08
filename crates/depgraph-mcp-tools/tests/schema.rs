@@ -2,8 +2,8 @@ use std::{path::Path, process::Command};
 
 use depgraph_mcp_tools::{
     AgentArtifactId, AgentContext, AgentError, AgentLocator, AgentNode, AgentNodeSummary,
-    AgentSourceSpan, MCP_TOOLS_SCHEMA_ID, Page, RepositoryRelativePath, TaskAccepted,
-    canonical_schema_bytes, canonical_schema_sha256, mcp_tools_v1_schema,
+    AgentOperation, AgentSourceSpan, MCP_TOOLS_SCHEMA_ID, Page, RepositoryRelativePath,
+    TaskAccepted, canonical_schema_bytes, canonical_schema_sha256, mcp_tools_v1_schema,
 };
 use serde_json::{Value, json};
 
@@ -33,6 +33,49 @@ fn issue_305_shared_schema_publishes_new_closed_response_definitions() {
             .unwrap_or_else(|| panic!("missing {definition} definition"));
         assert_eq!(value["additionalProperties"], false);
     }
+}
+
+#[test]
+fn issue_310_shared_schema_publishes_the_closed_operation_projection() {
+    let schema = schema_value();
+    let definitions = schema["$defs"].as_object().expect("schema definitions");
+    for definition in [
+        "AgentOperation",
+        "AgentOperationProgress",
+        "AgentOperationTimestamps",
+        "AgentOperationRetention",
+    ] {
+        assert_eq!(
+            definitions[definition]["additionalProperties"], false,
+            "{definition} is not closed"
+        );
+    }
+    let valid = json!({
+        "operation_id": OPERATION_ID,
+        "status": "queued",
+        "progress": {"completed_units": 0, "total_units": 1},
+        "timestamps": {"created_at_ms": 1000, "updated_at_ms": 1000},
+        "retention": {"execution_deadline_ms": 2000, "retain_until_ms": 3000}
+    });
+    let wrapper = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$defs": schema["$defs"].clone(),
+        "$ref": "#/$defs/AgentOperation"
+    });
+    let validator = jsonschema::draft202012::new(&wrapper).unwrap();
+    assert!(validator.is_valid(&valid));
+    assert!(serde_json::from_value::<AgentOperation>(valid).is_ok());
+
+    let terminal_output = &definitions["PortableTerminalOutput"];
+    assert_eq!(
+        terminal_output["anyOf"]
+            .as_array()
+            .expect("terminal output is a closed union")
+            .len(),
+        1
+    );
+    let terminal_schema = terminal_output.to_string();
+    assert!(!terminal_schema.contains("AgentOperation"));
 }
 
 #[test]
@@ -608,7 +651,7 @@ fn every_generated_object_schema_has_additional_properties_false() {
     let schema = schema_value();
     let mut objects = 0;
     assert_all_object_schemas_are_closed(&schema, "#", &mut objects);
-    assert_eq!(objects, 140, "review newly added object schemas explicitly");
+    assert_eq!(objects, 145, "review newly added object schemas explicitly");
 }
 
 #[test]

@@ -467,6 +467,20 @@ workflowを維持し、inline MCP responseだけにhard byte boundと`export_fil
 | MCP contract/schema/catalogがexactかつclosed | catalog golden、shared schema/digest golden、unknown-field rejectionとresponse definition tests |
 | repository validation | focused core/CLI/MCP tests、`cargo fmt`、Clippy `-D warnings`、`cargo xtask test` |
 
+## Issue #310 portable operation recovery evidence
+
+Issue [#310](https://github.com/TamaT-LLC/depgraph-cli/issues/310)はportable baselineの
+三toolをproduction MCP handlerからrepository-bound operation managerへ接続する。
+
+| Boundary | Frozen behavior and evidence |
+| --- | --- |
+| Closed status projection | `AgentOperation`はoperation ID、closed status、bounded progress、timestamps、retentionだけを公開する。constructorとDeserializerはprogress、terminal status/timestamp、deadline順序を検証し、journal input、kind、capability digest、lease、runner handoffを型に持たない |
+| Exact contract artifacts | `operation_get`、`operation_result`、`operation_cancel`はgeneric `result: true`を使わず、closed success/error envelopeだけをadvertiseする。catalog、shared schema、contract sampleとSHA-256 fixtureをexact comparisonで固定する |
+| Repository and capability authority | handlerはrequest repository identityをmanager open前に検証する。status/resultは毎回sealed repositoryと`Read`を検証し、cancelはrecordへ固定された全required capabilityの包含を再検証する。read-only denialとterminal no-opではlogical journal stateが不変である |
+| Terminal result boundary | terminal payloadはregistered closed success envelopeまたはtyped error envelopeへdeserializeし、repository、operation ID、terminal stateとの一致を再検証してからsole canonical response mapperへ渡す。unknown shape、identity mismatch、raw journal payloadは`INTEGRITY_FAILURE`となり公開されない |
+| Fail-closed error mapping | 全`JournalError` variantをexhaustive matchでtyped Agent errorへ変換する。SQLite/I/O source text、journal payload、path、lease情報をerrorへ反射しない |
+| Restart and idempotency | process E2Eはqueued/running/not-ready、stdio EOF、別server processからのterminal status/result回収、same-key manager retryによる同一ID回収、denied/allowed cancel、terminal no-opを同じSQLite journalで検証する |
+
 ## Issue #292 acceptance mapping
 
 | Acceptance criterion | Evidence in this document |

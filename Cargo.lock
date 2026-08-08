@@ -522,6 +522,7 @@ dependencies = [
  "clap",
  "depgraph-core",
  "depgraph-mcp-tools",
+ "depgraph-operation",
  "depgraph-store",
  "jsonschema",
  "rmcp",
