@@ -272,6 +272,54 @@ pub struct DepgraphServiceConfig {
     limits: DepgraphServiceLimits,
 }
 
+/// Opaque server-side seal for one exact repository root.
+///
+/// This type exists for trusted service components that must persist and
+/// revalidate repository authority. It intentionally exposes neither the
+/// canonical path nor the platform file identity used to derive the seal.
+#[doc(hidden)]
+#[derive(Clone, Eq, PartialEq)]
+pub struct RepositoryRootSeal {
+    canonical_root: PathBuf,
+    root_identity: crate::service_repository::RepositoryFileIdentity,
+    binding_digest: [u8; 32],
+}
+
+impl RepositoryRootSeal {
+    fn new(
+        canonical_root: &Path,
+        root_identity: &crate::service_repository::RepositoryFileIdentity,
+    ) -> Self {
+        use sha2::{Digest as _, Sha256};
+
+        let path = canonical_root.as_os_str().as_encoded_bytes();
+        let mut digest = Sha256::new();
+        digest.update(b"depgraph-repository-root-seal-v1\0");
+        digest.update((path.len() as u64).to_le_bytes());
+        digest.update(path);
+        digest.update(root_identity.opaque_bytes());
+        Self {
+            canonical_root: canonical_root.to_path_buf(),
+            root_identity: root_identity.clone(),
+            binding_digest: digest.finalize().into(),
+        }
+    }
+
+    /// Return only the opaque digest suitable for durable server metadata.
+    #[must_use]
+    pub const fn binding_digest(&self) -> [u8; 32] {
+        self.binding_digest
+    }
+
+    /// Re-open and compare the canonical path and platform file identity.
+    #[must_use]
+    pub fn matches_live_root(&self) -> bool {
+        canonical_repository_root(&self.canonical_root).is_ok_and(|(canonical_root, identity)| {
+            canonical_root == self.canonical_root && identity == self.root_identity
+        })
+    }
+}
+
 impl DepgraphServiceConfig {
     pub fn new(
         root: impl AsRef<Path>,
@@ -323,6 +371,13 @@ impl DepgraphServiceConfig {
     #[must_use]
     pub const fn limits(&self) -> &DepgraphServiceLimits {
         &self.limits
+    }
+
+    /// Derive an opaque server-side authority seal from this validated config.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn repository_root_seal(&self) -> RepositoryRootSeal {
+        RepositoryRootSeal::new(&self.canonical_root, &self.root_identity)
     }
 }
 

@@ -214,6 +214,15 @@ pub(crate) struct RepositoryFileIdentity {
     object: u64,
 }
 
+impl RepositoryFileIdentity {
+    pub(crate) fn opaque_bytes(&self) -> [u8; 16] {
+        let mut bytes = [0_u8; 16];
+        bytes[..8].copy_from_slice(&self.namespace.to_le_bytes());
+        bytes[8..].copy_from_slice(&self.object.to_le_bytes());
+        bytes
+    }
+}
+
 impl DepgraphService {
     pub fn normalize_repository_path(
         &self,
