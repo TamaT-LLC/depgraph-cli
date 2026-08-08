@@ -53,6 +53,7 @@ mod service_lifecycle;
 mod service_limits;
 mod service_repository;
 mod service_snapshot;
+mod service_store_write;
 pub mod worker;
 
 use std::{

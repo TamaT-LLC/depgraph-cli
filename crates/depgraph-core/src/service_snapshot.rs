@@ -45,6 +45,14 @@ impl std::str::FromStr for SnapshotLocator {
 pub struct ResolvedSnapshotId(String);
 
 impl ResolvedSnapshotId {
+    pub(crate) fn from_completed(value: String) -> DepgraphServiceResult<Self> {
+        if is_stable_snapshot_id(&value) {
+            Ok(Self(value))
+        } else {
+            Err(DepgraphServiceError::Integrity)
+        }
+    }
+
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0

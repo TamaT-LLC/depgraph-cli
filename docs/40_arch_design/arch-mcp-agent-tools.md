@@ -481,6 +481,33 @@ Issue [#310](https://github.com/TamaT-LLC/depgraph-cli/issues/310)はportable ba
 | Fail-closed error mapping | 全`JournalError` variantをexhaustive matchでtyped Agent errorへ変換する。SQLite/I/O source text、journal payload、path、lease情報をerrorへ反射しない |
 | Restart and idempotency | process E2Eはqueued/running/not-ready、stdio EOF、別server processからのterminal status/result回収、same-key manager retryによる同一ID回収、denied/allowed cancel、terminal no-opを同じSQLite journalで検証する |
 
+## Issue #312 scan / snapshot store-write evidence
+
+Issue [#312](https://github.com/TamaT-LLC/depgraph-cli/issues/312)はCLI固有だったsafe scanとcompleted snapshot namingを共有`DepgraphService`のstore-write境界へ移し、`scan_submit`をdurable operation runnerへ接続する。
+
+| Boundary | Frozen behavior and evidence |
+| --- | --- |
+| Shared store-write service | CLI、portable operation runner、MCP snapshot namingは同じ`DepgraphService` use caseを呼ぶ。serviceは`Read + StoreWrite` capability、canonical repository root、store writer lock、cooperative cancellationを一度だけ適用し、frontendへstore internalsを公開しない |
+| Safe scan semantics | scanはcancellation-aware safe pathだけを実行し、`project_code_executed: false`をclosed terminal resultへ固定する。cancelled、failed、partial scanはcompleted/current snapshotを置換せず、source tree digestも変更しない |
+| Durable handoff | `scan_submit`はbounded canonical inputとidempotency keyをoperation journalへcommitし、fresh observerからhandoff visibilityを確認してdetached runnerを起動する。request cancellationがrunner launchより先にlinearizeした場合はunclaimed handoffを同じjournalでterminal `cancelled`にしてlaunchを抑止する。launchが先またはtransportが切断済みの場合にresponse deliveryは保証せず、same-key retryで同じoperationを回収する |
+| Cancellation precedence | operation scanはvalidation後もstore writer lockを保持し、current promotionをdeferする。runnerは最終poll後、journalのIMMEDIATE transactionでcancel/deadline/leaseと成功completion intentを直列化し、cancelが先ならscanをnon-promoted `cancelled`へ、completion intentが先なら後続cancelをno-opにしてからcurrentをpromoteする。したがってpoll追加だけに依存せず、cancelled/failed/partial operationはcurrentを置換しない |
+| Completion crash recovery | completion intentはclosed terminal payloadをjournalへ先にdurable化するがpublic statusを増やさない。runnerがintent commitとstore promotionの間、またはpromotionとjournal terminalizationの間で停止しても、再起動runnerはdeadline purgeと次work claimより先にintentを読み、staging scanのsnapshot identityを再検証してpromotionをidempotentに完了し、同じpayloadでjournalを`completed`へ進める |
+| Closed scan result | `AgentScanOutcome`はcompleted status、scan ID、`project_code_executed`、bounded coverage、closed cache summary（hit/miss件数）だけを公開する。cache key、reason、worker log、journal payloadは投影せず、cold/warm process testでmiss/hitを検証する |
+| Immutable completed naming | `snapshot_name_create`はcurrent、stable snapshot ID、またはcompleted scan selectionだけを受理し、completed snapshotへimmutable nameを一度だけ作成する。failed/partial attemptとduplicate/case-folded duplicateはtyped failureになりcurrent pointerを変更しない |
+| Capability and contract gating | `scan_submit`と`snapshot_name_create`はstore-write capabilityなしの`tools/list`へ現れず、直接callもfail closedに拒否する。exact advertised schema、shared schema、catalog/contract JSONとdigest fixtureをcanonical generatorで固定する |
+
+### Issue #312 acceptance mapping
+
+| Acceptance criterion | Evidence |
+| --- | --- |
+| journal commitとrunner handoff後2秒以内にhandleを返す | MCP process testのelapsed bound、fresh-manager visibility、stdio EOF後のreconnect polling |
+| safe scanはproject codeを実行せずsource treeを変更しない | core service test、durable runner terminal DTO assertion、scan前後source digest equality |
+| cancelled/failed/partialはcurrent completed snapshotを置換しない | core cancellation regression、runner cancel-vs-complete race test、existing scan promotion regressions |
+| terminal resultからcoverageとcache hit/missを取得できる | closed DTO/Serde/schema tests、cold miss→warm hitのMCP process test |
+| namingはcompleted-only、immutable、writer serialized | service missing/partial/duplicate/lock testsとMCP duplicate-name process test |
+| store-write capabilityなしではdiscover/call不可 | catalog capability filterとread-only MCP process test |
+| repository validation | Rust 1.93.1 format、workspace Clippy `-D warnings`、focused suites、`cargo xtask test` |
+
 ## Issue #292 acceptance mapping
 
 | Acceptance criterion | Evidence in this document |

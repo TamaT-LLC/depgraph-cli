@@ -125,7 +125,7 @@ pub struct CompletedSnapshotView {
 }
 
 impl CompletedSnapshotView {
-    fn from_store(details: CompletedSnapshotDetails) -> DepgraphServiceResult<Self> {
+    pub(crate) fn from_store(details: CompletedSnapshotDetails) -> DepgraphServiceResult<Self> {
         let snapshot = details.snapshot;
         if snapshot.status != "completed" {
             return Err(DepgraphServiceError::Integrity);
@@ -247,6 +247,18 @@ impl CompletedSnapshotsPage {
 }
 
 impl NamedCompletedSnapshot {
+    pub(crate) fn from_created_name(
+        name: String,
+        named_at: String,
+        snapshot: CompletedSnapshotView,
+    ) -> Self {
+        Self {
+            name,
+            named_at,
+            snapshot,
+        }
+    }
+
     #[must_use]
     pub fn name(&self) -> &str {
         &self.name

@@ -60,7 +60,10 @@ impl CancellationToken {
         }
     }
 
-    pub(crate) fn run_if_active<T>(&self, operation: impl FnOnce() -> T) -> Option<T> {
+    /// Run one handoff atomically with respect to cancellation. If cancellation
+    /// linearizes first the closure is not called; otherwise cancellation waits
+    /// until the closure has handed off its work.
+    pub fn run_if_active<T>(&self, operation: impl FnOnce() -> T) -> Option<T> {
         let _completion = self
             .inner
             .completion

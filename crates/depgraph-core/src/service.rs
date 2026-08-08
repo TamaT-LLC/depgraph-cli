@@ -47,6 +47,10 @@ pub use crate::service_repository::{
     RepositoryRelativePath,
 };
 pub use crate::service_snapshot::{ResolvedSnapshotId, SnapshotLocator, SnapshotReadRequest};
+pub use crate::service_store_write::{
+    DeferredScanCompletion, DeferredScanServiceOutcome, ScanRequest, ScanServiceOutcome,
+    SnapshotNameCreateRequest, SnapshotNameCreateSelector,
+};
 
 pub const DEPGRAPH_SERVICE_LIMITS_VERSION: &str = "depgraph-service-limits-v1";
 pub const DEFAULT_SERVICE_MAX_INLINE_INPUT_BYTES: usize = 1024 * 1024;
@@ -708,6 +712,8 @@ pub enum DepgraphServiceError {
     NotFound,
     #[error("request conflicts with the current service state")]
     Conflict,
+    #[error("another store writer is already running for store")]
+    StoreWriterConflict,
     #[error("current snapshot source revision does not match the repository worktree HEAD")]
     SnapshotWorktreeMismatch,
     #[error("request exhausted a service resource limit")]
@@ -752,7 +758,7 @@ impl DepgraphServiceError {
             | Self::PolicyInput => DepgraphServiceErrorCategory::Input,
             Self::RepositoryFile { reason } => reason.category(),
             Self::NotFound => DepgraphServiceErrorCategory::NotFound,
-            Self::Conflict => DepgraphServiceErrorCategory::Conflict,
+            Self::Conflict | Self::StoreWriterConflict => DepgraphServiceErrorCategory::Conflict,
             Self::SnapshotWorktreeMismatch => DepgraphServiceErrorCategory::Input,
             Self::QueryRejected | Self::ResourceExhausted | Self::InlineExportTooLarge { .. } => {
                 DepgraphServiceErrorCategory::Resource
@@ -851,6 +857,10 @@ mod tests {
             ),
             (
                 DepgraphServiceError::Conflict,
+                DepgraphServiceErrorCategory::Conflict,
+            ),
+            (
+                DepgraphServiceError::StoreWriterConflict,
                 DepgraphServiceErrorCategory::Conflict,
             ),
             (

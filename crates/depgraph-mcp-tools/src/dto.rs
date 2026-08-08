@@ -704,6 +704,154 @@ impl TryFrom<&depgraph_core::service::CoverageRecord> for AgentCoverage {
     }
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentScanStatus {
+    Completed,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentScanCacheSummary {
+    hits: u64,
+    misses: u64,
+}
+
+impl AgentScanCacheSummary {
+    #[must_use]
+    pub const fn new(hits: u64, misses: u64) -> Self {
+        Self { hits, misses }
+    }
+
+    #[must_use]
+    pub const fn hits(self) -> u64 {
+        self.hits
+    }
+
+    #[must_use]
+    pub const fn misses(self) -> u64 {
+        self.misses
+    }
+}
+
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentScanOutcome {
+    scan_id: AgentId,
+    status: AgentScanStatus,
+    project_code_executed: bool,
+    cache: AgentScanCacheSummary,
+    coverage: AgentCoverage,
+}
+
+impl AgentScanOutcome {
+    pub fn new(
+        scan_id: AgentId,
+        project_code_executed: bool,
+        cache: AgentScanCacheSummary,
+        coverage: AgentCoverage,
+    ) -> Result<Self, ContractBuildError> {
+        if project_code_executed || coverage.project_code_executed {
+            return Err(ContractBuildError::AgentDtoValue);
+        }
+        Ok(Self {
+            scan_id,
+            status: AgentScanStatus::Completed,
+            project_code_executed,
+            cache,
+            coverage,
+        })
+    }
+
+    #[must_use]
+    pub const fn scan_id(&self) -> &AgentId {
+        &self.scan_id
+    }
+
+    #[must_use]
+    pub const fn status(&self) -> AgentScanStatus {
+        self.status
+    }
+
+    #[must_use]
+    pub const fn project_code_executed(&self) -> bool {
+        self.project_code_executed
+    }
+
+    #[must_use]
+    pub const fn cache(&self) -> AgentScanCacheSummary {
+        self.cache
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentScanOutcomeWire {
+    scan_id: AgentId,
+    status: AgentScanStatus,
+    project_code_executed: bool,
+    cache: AgentScanCacheSummary,
+    coverage: AgentCoverage,
+}
+
+impl<'de> Deserialize<'de> for AgentScanOutcome {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = AgentScanOutcomeWire::deserialize(deserializer)?;
+        let outcome = Self::new(
+            wire.scan_id,
+            wire.project_code_executed,
+            wire.cache,
+            wire.coverage,
+        )
+        .map_err(D::Error::custom)?;
+        if wire.status != outcome.status {
+            return Err(D::Error::custom(ContractBuildError::AgentDtoValue));
+        }
+        Ok(outcome)
+    }
+}
+
+impl TryFrom<&depgraph_core::service::ScanServiceOutcome> for AgentScanOutcome {
+    type Error = ContractBuildError;
+
+    fn try_from(source: &depgraph_core::service::ScanServiceOutcome) -> Result<Self, Self::Error> {
+        let outcome = source.outcome();
+        if outcome.status != "completed"
+            || outcome.exit_code != 0
+            || source.completed_snapshot_id().is_none()
+        {
+            return Err(ContractBuildError::AgentDtoValue);
+        }
+        let cache = AgentScanCacheSummary::new(
+            u64::try_from(
+                outcome
+                    .cache_events
+                    .iter()
+                    .filter(|event| event.outcome == "hit")
+                    .count(),
+            )
+            .map_err(|_| ContractBuildError::AgentDtoValue)?,
+            u64::try_from(
+                outcome
+                    .cache_events
+                    .iter()
+                    .filter(|event| event.outcome == "miss")
+                    .count(),
+            )
+            .map_err(|_| ContractBuildError::AgentDtoValue)?,
+        );
+        Self::new(
+            parse_agent_value(&outcome.scan_id)?,
+            outcome.coverage.project_code_executed,
+            cache,
+            AgentCoverage::try_from(&outcome.coverage)?,
+        )
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentCompletedSnapshot {
@@ -785,6 +933,16 @@ impl AgentNamedSnapshot {
             named_at,
             snapshot,
         }
+    }
+
+    #[must_use]
+    pub const fn name(&self) -> &SnapshotName {
+        &self.name
+    }
+
+    #[must_use]
+    pub const fn snapshot(&self) -> &AgentCompletedSnapshot {
+        &self.snapshot
     }
 }
 

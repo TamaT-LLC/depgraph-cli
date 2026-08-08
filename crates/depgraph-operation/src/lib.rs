@@ -14,8 +14,9 @@ pub use launcher::{
     RunnerLaunchError, RunnerResolutionPolicy,
 };
 pub use runner::{
-    DispatchOutcome, ExecutionCheckpoint, ExecutionControl, OperationDispatcher, OperationRunner,
-    RunnerError, RunnerReport, RunnerStartupConfig, RunnerWork, UNSUPPORTED_OPERATION_ERROR_JSON,
+    CompletionRecovery, DispatchOutcome, ExecutionCheckpoint, ExecutionControl,
+    OperationDispatcher, OperationRunner, RunnerError, RunnerReport, RunnerStartupConfig,
+    RunnerWork, ScanOperationDispatcher, UNSUPPORTED_OPERATION_ERROR_JSON,
     UnsupportedOperationDispatcher,
 };
 
@@ -38,8 +39,9 @@ use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 
 /// SQLite schema version owned by this crate.
-pub const JOURNAL_SCHEMA_VERSION: i64 = 2;
+pub const JOURNAL_SCHEMA_VERSION: i64 = 3;
 const LEGACY_JOURNAL_SCHEMA_VERSION: i64 = 1;
+const ROOT_BOUND_JOURNAL_SCHEMA_VERSION: i64 = 2;
 /// Suffix appended to the graph-store path to obtain the separate journal path.
 pub const OPERATION_JOURNAL_SUFFIX: &str = ".operations.sqlite";
 /// Minimum duration for which a terminal record remains retrievable.
@@ -922,6 +924,42 @@ pub enum CancelOutcome {
     TerminalNoOp,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CompletionDecision {
+    Committed,
+    CancellationWon,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompletionIntent {
+    operation_id: OperationId,
+    kind: OperationKind,
+    result: CanonicalJson,
+    decided_at_ms: i64,
+}
+
+impl CompletionIntent {
+    #[must_use]
+    pub const fn operation_id(&self) -> &OperationId {
+        &self.operation_id
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> OperationKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub const fn result(&self) -> &CanonicalJson {
+        &self.result
+    }
+
+    #[must_use]
+    pub const fn decided_at_ms(&self) -> i64 {
+        self.decided_at_ms
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum OperationOutcome {
     Completed(CanonicalJson),
@@ -1612,6 +1650,10 @@ impl OperationJournal {
         {
             return Err(JournalError::CapabilityDenied);
         }
+        if completion_intent_exists(&transaction, operation_id)? {
+            commit_authorized(transaction, &root_seal)?;
+            return Ok(CancelOutcome::TerminalNoOp);
+        }
         if record.status.is_terminal() {
             commit_authorized(transaction, &root_seal)?;
             return Ok(CancelOutcome::TerminalNoOp);
@@ -1637,6 +1679,87 @@ impl OperationJournal {
             params![now_ms, operation_id.as_str()],
         )?;
         commit_authorized(transaction, &root_seal)?;
+        Ok(CancelOutcome::Requested)
+    }
+
+    /// Cancel a durable submission when request cancellation wins before this
+    /// caller launches its runner handoff. A still-unclaimed queued record is
+    /// made terminal in this transaction; work already claimed elsewhere is
+    /// moved to cooperative cancellation.
+    pub fn cancel_before_launch(
+        &mut self,
+        repository_id: &LogicalRepositoryId,
+        operation_id: &OperationId,
+        current_capabilities: &CapabilitySet,
+        now_ms: i64,
+    ) -> Result<CancelOutcome, JournalError> {
+        validate_timestamp(now_ms)?;
+        self.validate_requested_repository(repository_id)?;
+        let enabled_capabilities = self.enabled_capabilities.clone();
+        let root_seal = self.repository_root_seal.clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        validate_transaction_root(&transaction, &root_seal)?;
+        let record = load_active_record(&transaction, repository_id, operation_id, now_ms)?;
+        if !enabled_capabilities.contains_all(&record.required_capabilities)
+            || !current_capabilities.contains_all(&record.required_capabilities)
+        {
+            return Err(JournalError::CapabilityDenied);
+        }
+        if completion_intent_exists(&transaction, operation_id)? || record.status.is_terminal() {
+            commit_authorized(transaction, &root_seal)?;
+            return Ok(CancelOutcome::TerminalNoOp);
+        }
+        if record.status != OperationStatus::Queued {
+            if record.status == OperationStatus::Cancelling {
+                commit_authorized(transaction, &root_seal)?;
+                return Ok(CancelOutcome::AlreadyRequested);
+            }
+            validate_update_time(&record, now_ms)?;
+            validate_before_deadline(&record, now_ms)?;
+            transaction.execute(
+                "UPDATE operations SET status='cancelling', updated_at_ms=?1
+                 WHERE operation_id=?2",
+                params![now_ms, operation_id.as_str()],
+            )?;
+            commit_authorized(transaction, &root_seal)?;
+            return Ok(CancelOutcome::Requested);
+        }
+        validate_update_time(&record, now_ms)?;
+        validate_before_deadline(&record, now_ms)?;
+        let handoff = select_handoff_by_id(&transaction, operation_id.as_str())?
+            .ok_or(JournalError::IntegrityFailure)?;
+        if handoff.claimed_at_ms.is_some() || record.lease.is_some() {
+            return Err(JournalError::IntegrityFailure);
+        }
+        // The schema transition trigger intentionally retains the ordinary
+        // queued -> cancelling -> cancelled path. Both writes are private to
+        // this transaction, so observers see only the terminal cancellation.
+        transaction.execute(
+            "UPDATE operations SET status='cancelling', updated_at_ms=?1
+             WHERE operation_id=?2",
+            params![now_ms, operation_id.as_str()],
+        )?;
+        let retain_until_ms = record
+            .retain_until_ms
+            .max(checked_add(now_ms, TERMINAL_RETENTION_MS)?);
+        transaction.execute(
+            "UPDATE operations
+             SET status='cancelled', updated_at_ms=?1, terminal_at_ms=?1,
+                 retain_until_ms=?2
+             WHERE operation_id=?3",
+            params![now_ms, retain_until_ms, operation_id.as_str()],
+        )?;
+        transaction.execute(
+            "UPDATE runner_handoffs
+             SET claimed_at_ms=COALESCE(claimed_at_ms, ?1), completed_at_ms=?1
+             WHERE operation_id=?2",
+            params![now_ms, operation_id.as_str()],
+        )?;
+        let cancelled = select_validated_by_id(&transaction, operation_id)?;
+        commit_authorized(transaction, &root_seal)?;
+        debug_assert_eq!(cancelled.status(), OperationStatus::Cancelled);
         Ok(CancelOutcome::Requested)
     }
 
@@ -1841,6 +1964,147 @@ impl OperationJournal {
         )
     }
 
+    /// Atomically decide that a running operation will complete successfully.
+    /// The result becomes durable in an internal intent before any external
+    /// store finalizer runs. Cancellation that commits first wins; cancellation
+    /// after this decision is a no-op even though the public status stays
+    /// `running` until finalization finishes.
+    pub fn commit_completion_intent(
+        &mut self,
+        repository_id: &LogicalRepositoryId,
+        operation_id: &OperationId,
+        lease_token: impl AsRef<[u8]>,
+        result: CanonicalJson,
+        now_ms: i64,
+    ) -> Result<CompletionDecision, JournalError> {
+        validate_timestamp(now_ms)?;
+        self.validate_requested_repository(repository_id)?;
+        let token_digest = digest_lease_token(lease_token.as_ref())?;
+        let enabled_capabilities = self.enabled_capabilities.clone();
+        let root_seal = self.repository_root_seal.clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        validate_transaction_root(&transaction, &root_seal)?;
+        let record = load_active_record(&transaction, repository_id, operation_id, now_ms)?;
+        validate_enabled_capabilities(&enabled_capabilities, &record)?;
+        validate_update_time(&record, now_ms)?;
+        validate_before_deadline(&record, now_ms)?;
+        validate_active_lease(&record, token_digest, now_ms)?;
+        if record.status == OperationStatus::Cancelling {
+            let retain_until_ms = record
+                .retain_until_ms
+                .max(checked_add(now_ms, TERMINAL_RETENTION_MS)?);
+            transaction.execute(
+                "UPDATE operations
+                 SET status='cancelled', lease_owner=NULL, lease_token_digest=NULL,
+                     lease_expires_at_ms=NULL, updated_at_ms=?1, terminal_at_ms=?1,
+                     retain_until_ms=?2
+                 WHERE operation_id=?3",
+                params![now_ms, retain_until_ms, operation_id.as_str()],
+            )?;
+            transaction.execute(
+                "UPDATE runner_handoffs SET completed_at_ms=?1 WHERE operation_id=?2",
+                params![now_ms, operation_id.as_str()],
+            )?;
+            commit_authorized(transaction, &root_seal)?;
+            return Ok(CompletionDecision::CancellationWon);
+        }
+        if record.status != OperationStatus::Running
+            || completion_intent_exists(&transaction, operation_id)?
+        {
+            return Err(JournalError::InvalidTransition);
+        }
+        let result_digest = JournalDigest::sha256(result.as_str().as_bytes());
+        transaction.execute(
+            "INSERT INTO operation_completion_intents(
+                 operation_id, result_json, result_digest, decided_at_ms
+             ) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                operation_id.as_str(),
+                result.as_str(),
+                result_digest.as_bytes().as_slice(),
+                now_ms,
+            ],
+        )?;
+        transaction.execute(
+            "UPDATE operations SET updated_at_ms=?1 WHERE operation_id=?2",
+            params![now_ms, operation_id.as_str()],
+        )?;
+        commit_authorized(transaction, &root_seal)?;
+        Ok(CompletionDecision::Committed)
+    }
+
+    /// Return the oldest durable completion intent. Runners recover this before
+    /// purging deadlines or claiming new work, closing both crash gaps around
+    /// graph-store promotion.
+    pub fn next_completion_intent(
+        &self,
+        repository_id: &LogicalRepositoryId,
+    ) -> Result<Option<CompletionIntent>, JournalError> {
+        self.validate_requested_repository(repository_id)?;
+        let transaction = self.connection.unchecked_transaction()?;
+        self.validate_transaction_root(&transaction)?;
+        let intent = select_next_completion_intent(&transaction, repository_id)?;
+        commit_authorized(transaction, &self.repository_root_seal)?;
+        Ok(intent)
+    }
+
+    /// Publish a previously committed completion intent after its idempotent
+    /// external finalizer has succeeded. The decision may finish after the
+    /// original execution deadline because it linearized at `decided_at_ms`.
+    pub fn finish_completion_intent(
+        &mut self,
+        repository_id: &LogicalRepositoryId,
+        operation_id: &OperationId,
+        now_ms: i64,
+    ) -> Result<OperationRecord, JournalError> {
+        validate_timestamp(now_ms)?;
+        self.validate_requested_repository(repository_id)?;
+        let root_seal = self.repository_root_seal.clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        validate_transaction_root(&transaction, &root_seal)?;
+        let record = load_active_record(&transaction, repository_id, operation_id, now_ms)?;
+        let intent = select_completion_intent(&transaction, operation_id)?
+            .ok_or(JournalError::InvalidTransition)?;
+        if record.status != OperationStatus::Running
+            || intent.kind != record.kind
+            || intent.decided_at_ms > now_ms
+        {
+            return Err(JournalError::IntegrityFailure);
+        }
+        let retain_until_ms = record
+            .retain_until_ms
+            .max(checked_add(now_ms, TERMINAL_RETENTION_MS)?);
+        transaction.execute(
+            "UPDATE operations
+             SET status='completed', progress_completed=progress_total,
+                 result_json=?1, error_json=NULL, lease_owner=NULL,
+                 lease_token_digest=NULL, lease_expires_at_ms=NULL,
+                 updated_at_ms=?2, terminal_at_ms=?2, retain_until_ms=?3
+             WHERE operation_id=?4",
+            params![
+                intent.result.as_str(),
+                now_ms,
+                retain_until_ms,
+                operation_id.as_str(),
+            ],
+        )?;
+        transaction.execute(
+            "UPDATE runner_handoffs SET completed_at_ms=?1 WHERE operation_id=?2",
+            params![now_ms, operation_id.as_str()],
+        )?;
+        transaction.execute(
+            "DELETE FROM operation_completion_intents WHERE operation_id=?1",
+            params![operation_id.as_str()],
+        )?;
+        let completed = select_validated_by_id(&transaction, operation_id)?;
+        commit_authorized(transaction, &root_seal)?;
+        Ok(completed)
+    }
+
     pub fn fail(
         &mut self,
         repository_id: &LogicalRepositoryId,
@@ -1896,6 +2160,9 @@ impl OperationJournal {
         let record =
             load_record_for_deadline_failure(&transaction, repository_id, operation_id, now_ms)?;
         validate_enabled_capabilities(&enabled_capabilities, &record)?;
+        if completion_intent_exists(&transaction, operation_id)? {
+            return Err(JournalError::InvalidTransition);
+        }
         if now_ms < record.execution_deadline_ms {
             return Err(JournalError::InvalidArgument);
         }
@@ -1926,6 +2193,10 @@ impl OperationJournal {
                 "SELECT substr(operation_id, 1, 36) FROM operations
                  WHERE status IN ('queued', 'running', 'cancelling')
                    AND execution_deadline_ms <= ?1
+                   AND NOT EXISTS (
+                       SELECT 1 FROM operation_completion_intents AS intent
+                       WHERE intent.operation_id=operations.operation_id
+                   )
                  ORDER BY execution_deadline_ms, operation_id
                  LIMIT ?2",
             )?;
@@ -2059,6 +2330,10 @@ impl OperationJournal {
                  SELECT 1 FROM operations
                  WHERE status IN ('queued', 'running', 'cancelling')
                    AND execution_deadline_ms <= ?1
+                   AND NOT EXISTS (
+                       SELECT 1 FROM operation_completion_intents AS intent
+                       WHERE intent.operation_id=operations.operation_id
+                   )
              ) OR EXISTS(
                  SELECT 1 FROM operations
                  WHERE status IN ('completed', 'failed', 'cancelled')
@@ -2185,6 +2460,7 @@ impl OperationJournal {
         if version == 0 {
             transaction.execute_batch(SCHEMA_V1)?;
             transaction.execute_batch(SCHEMA_V2_METADATA)?;
+            transaction.execute_batch(SCHEMA_V3_COMPLETION_INTENTS)?;
             insert_repository_binding(&transaction, JournalDigest(root_seal.binding_digest()))?;
             transaction.pragma_update(None, "user_version", JOURNAL_SCHEMA_VERSION)?;
         } else if version == LEGACY_JOURNAL_SCHEMA_VERSION {
@@ -2202,7 +2478,12 @@ impl OperationJournal {
             validate_no_operation_tombstone_overlap(&transaction)?;
             validate_operation_handoff_cardinality(&transaction)?;
             transaction.execute_batch(SCHEMA_V2_METADATA)?;
+            transaction.execute_batch(SCHEMA_V3_COMPLETION_INTENTS)?;
             insert_repository_binding(&transaction, JournalDigest(root_seal.binding_digest()))?;
+            transaction.pragma_update(None, "user_version", JOURNAL_SCHEMA_VERSION)?;
+        } else if version == ROOT_BOUND_JOURNAL_SCHEMA_VERSION {
+            validate_v2_schema(&transaction)?;
+            transaction.execute_batch(SCHEMA_V3_COMPLETION_INTENTS)?;
             transaction.pragma_update(None, "user_version", JOURNAL_SCHEMA_VERSION)?;
         } else if version != JOURNAL_SCHEMA_VERSION {
             return Err(JournalError::UnsupportedSchemaVersion);
@@ -2365,6 +2646,24 @@ impl OperationManager {
         Ok(outcome)
     }
 
+    /// Terminally cancel a queued durable operation when request cancellation
+    /// wins before this caller's runner launch handoff.
+    pub fn cancel_before_launch(
+        &mut self,
+        operation_id: &OperationId,
+        now_ms: i64,
+    ) -> Result<CancelOutcome, JournalError> {
+        self.revalidate_root()?;
+        let outcome = self.journal.cancel_before_launch(
+            &self.authority.repository_id,
+            operation_id,
+            &self.authority.capabilities,
+            now_ms,
+        )?;
+        self.revalidate_root()?;
+        Ok(outcome)
+    }
+
     fn authorized_read(
         &self,
         operation_id: &OperationId,
@@ -2450,7 +2749,15 @@ fn validate_schema(connection: &Connection) -> Result<(), JournalError> {
     if version != JOURNAL_SCHEMA_VERSION {
         return Err(JournalError::UnsupportedSchemaVersion);
     }
-    validate_schema_surface(connection, true)
+    validate_schema_surface(connection, true, true)
+}
+
+fn validate_v2_schema(connection: &Connection) -> Result<(), JournalError> {
+    let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version != ROOT_BOUND_JOURNAL_SCHEMA_VERSION {
+        return Err(JournalError::UnsupportedSchemaVersion);
+    }
+    validate_schema_surface(connection, true, false)
 }
 
 fn validate_legacy_schema(connection: &Connection) -> Result<(), JournalError> {
@@ -2458,12 +2765,13 @@ fn validate_legacy_schema(connection: &Connection) -> Result<(), JournalError> {
     if version != LEGACY_JOURNAL_SCHEMA_VERSION {
         return Err(JournalError::UnsupportedSchemaVersion);
     }
-    validate_schema_surface(connection, false)
+    validate_schema_surface(connection, false, false)
 }
 
 fn validate_schema_surface(
     connection: &Connection,
     include_repository_binding: bool,
+    include_completion_intents: bool,
 ) -> Result<(), JournalError> {
     validate_columns(
         connection,
@@ -2527,10 +2835,25 @@ fn validate_schema_surface(
             &["singleton", "metadata_version", "repository_binding_digest"],
         )?;
     }
+    if include_completion_intents {
+        validate_columns(
+            connection,
+            "operation_completion_intents",
+            &[
+                "operation_id",
+                "result_json",
+                "result_digest",
+                "decided_at_ms",
+            ],
+        )?;
+    }
     let reference = Connection::open_in_memory()?;
     reference.execute_batch(SCHEMA_V1)?;
     if include_repository_binding {
         reference.execute_batch(SCHEMA_V2_METADATA)?;
+    }
+    if include_completion_intents {
+        reference.execute_batch(SCHEMA_V3_COMPLETION_INTENTS)?;
     }
     validate_schema_objects(connection, &reference)?;
     Ok(())
@@ -2716,6 +3039,26 @@ fn validate_journal_rows(
             }
         }
     }
+
+    {
+        let mut statement = connection.prepare(
+            "SELECT intent.operation_id, operation.kind, intent.result_json,
+                    intent.result_digest, intent.decided_at_ms,
+                    operation.status, operation.updated_at_ms
+             FROM operation_completion_intents AS intent
+             JOIN operations AS operation USING(operation_id)
+             ORDER BY intent.operation_id",
+        )?;
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next().map_err(map_database_decode_error)? {
+            let intent = completion_intent_from_row(row).map_err(map_database_decode_error)?;
+            let status = OperationStatus::parse(&row.get::<_, String>(5)?)?;
+            let updated_at_ms: i64 = row.get(6)?;
+            if status != OperationStatus::Running || intent.decided_at_ms != updated_at_ms {
+                return Err(JournalError::IntegrityFailure);
+            }
+        }
+    }
     Ok(())
 }
 
@@ -2729,6 +3072,7 @@ fn validate_columns(
         "runner_handoffs" => "PRAGMA table_info(runner_handoffs)",
         "operation_tombstones" => "PRAGMA table_info(operation_tombstones)",
         "operation_journal_metadata" => "PRAGMA table_info(operation_journal_metadata)",
+        "operation_completion_intents" => "PRAGMA table_info(operation_completion_intents)",
         _ => return Err(JournalError::IntegrityFailure),
     };
     let mut statement = connection.prepare(sql)?;
@@ -3299,6 +3643,90 @@ fn select_operation_by_scope(
         .map_err(map_database_decode_error)
 }
 
+fn completion_intent_exists(
+    connection: &Connection,
+    operation_id: &OperationId,
+) -> Result<bool, JournalError> {
+    connection
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM operation_completion_intents WHERE operation_id=?1
+             )",
+            params![operation_id.as_str()],
+            |row| row.get(0),
+        )
+        .map_err(JournalError::from)
+}
+
+fn select_completion_intent(
+    connection: &Connection,
+    operation_id: &OperationId,
+) -> Result<Option<CompletionIntent>, JournalError> {
+    connection
+        .query_row(
+            "SELECT intent.operation_id, operation.kind, intent.result_json,
+                    intent.result_digest, intent.decided_at_ms
+             FROM operation_completion_intents AS intent
+             JOIN operations AS operation USING(operation_id)
+             WHERE intent.operation_id=?1",
+            params![operation_id.as_str()],
+            completion_intent_from_row,
+        )
+        .optional()
+        .map_err(map_database_decode_error)
+}
+
+fn select_next_completion_intent(
+    connection: &Connection,
+    repository_id: &LogicalRepositoryId,
+) -> Result<Option<CompletionIntent>, JournalError> {
+    connection
+        .query_row(
+            "SELECT intent.operation_id, operation.kind, intent.result_json,
+                    intent.result_digest, intent.decided_at_ms
+             FROM operation_completion_intents AS intent
+             JOIN operations AS operation USING(operation_id)
+             WHERE operation.repository_id=?1
+             ORDER BY intent.decided_at_ms, intent.operation_id
+             LIMIT 1",
+            params![repository_id.as_str()],
+            completion_intent_from_row,
+        )
+        .optional()
+        .map_err(map_database_decode_error)
+}
+
+fn completion_intent_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CompletionIntent> {
+    let operation_id = OperationId::parse(row.get::<_, String>(0)?).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    let kind = OperationKind::parse(&row.get::<_, String>(1)?).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    let encoded: String = row.get(2)?;
+    let stored_digest: Vec<u8> = row.get(3)?;
+    let observed_digest = JournalDigest::sha256(encoded.as_bytes());
+    let expected_digest = JournalDigest::from_database(stored_digest).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Blob, Box::new(error))
+    })?;
+    if observed_digest != expected_digest {
+        return Err(rusqlite::Error::FromSqlConversionFailure(
+            3,
+            rusqlite::types::Type::Blob,
+            Box::new(JournalError::IntegrityFailure),
+        ));
+    }
+    let result = CanonicalJson::from_database(encoded).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    Ok(CompletionIntent {
+        operation_id,
+        kind,
+        result,
+        decided_at_ms: row.get(4)?,
+    })
+}
+
 fn select_next_claim_candidate(
     connection: &Connection,
     repository_id: &str,
@@ -3310,6 +3738,7 @@ fn select_next_claim_candidate(
             &format!(
                 "SELECT {OPERATION_COLUMNS} FROM operations AS candidate
                  WHERE candidate.repository_id = ?4
+                   AND NOT EXISTS (SELECT 1 FROM operation_completion_intents)
                    AND candidate.status IN ('queued', 'running', 'cancelling')
                    AND candidate.execution_deadline_ms > ?5
                    AND (
@@ -3935,6 +4364,20 @@ CREATE TABLE operation_journal_metadata (
         AND length(repository_binding_digest) = 32
     )
 );
+"#;
+
+const SCHEMA_V3_COMPLETION_INTENTS: &str = r#"
+CREATE TABLE operation_completion_intents (
+    operation_id TEXT PRIMARY KEY REFERENCES operations(operation_id) ON DELETE CASCADE,
+    result_json TEXT NOT NULL CHECK(
+        typeof(result_json) = 'text'
+        AND octet_length(result_json) BETWEEN 1 AND 16777216
+    ),
+    result_digest BLOB NOT NULL CHECK(length(result_digest) = 32),
+    decided_at_ms INTEGER NOT NULL
+);
+CREATE INDEX operation_completion_intents_order
+    ON operation_completion_intents(decided_at_ms, operation_id);
 "#;
 
 #[cfg(test)]

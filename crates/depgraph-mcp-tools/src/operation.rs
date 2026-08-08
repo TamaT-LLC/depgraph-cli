@@ -5,8 +5,8 @@ use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use serde_json::Value;
 
 use crate::{
-    AgentDaemonStatus, ContractBuildError, ContractVersion, LogicalRepositoryId, OperationId,
-    SuccessEnvelope, TaskId,
+    AgentDaemonStatus, AgentScanOutcome, ContractBuildError, ContractVersion, LogicalRepositoryId,
+    OperationId, SuccessEnvelope, TaskId,
 };
 
 /// Closed terminal output contracts registered for durable submit tools.
@@ -18,6 +18,7 @@ use crate::{
 /// closed until that originating tool registers its exact output contract.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PortableTerminalOutputContract {
+    ScanSubmit,
     DaemonStartSubmit,
     DaemonStop,
 }
@@ -26,6 +27,7 @@ impl PortableTerminalOutputContract {
     #[must_use]
     pub fn for_originating_tool(tool_name: &str) -> Option<Self> {
         match tool_name {
+            "scan_submit" => Some(Self::ScanSubmit),
             "daemon_start_submit" => Some(Self::DaemonStartSubmit),
             "daemon_stop" => Some(Self::DaemonStop),
             _ => None,
@@ -40,6 +42,16 @@ impl PortableTerminalOutputContract {
         value: Value,
     ) -> Result<PortableTerminalOutput, PortableTerminalOutputError> {
         match self {
+            Self::ScanSubmit => {
+                let envelope = serde_json::from_value::<SuccessEnvelope<AgentScanOutcome>>(value)
+                    .map_err(|_| PortableTerminalOutputError)?;
+                if envelope.snapshot_id().is_none() {
+                    return Err(PortableTerminalOutputError);
+                }
+                Ok(PortableTerminalOutput(
+                    PortableTerminalOutputEnvelope::Scan(Box::new(envelope)),
+                ))
+            }
             Self::DaemonStartSubmit | Self::DaemonStop => {
                 let envelope = serde_json::from_value::<SuccessEnvelope<AgentDaemonStatus>>(value)
                     .map_err(|_| PortableTerminalOutputError)?;
@@ -47,7 +59,7 @@ impl PortableTerminalOutputContract {
                     return Err(PortableTerminalOutputError);
                 }
                 Ok(PortableTerminalOutput(
-                    PortableTerminalOutputEnvelope::DaemonStatus(envelope),
+                    PortableTerminalOutputEnvelope::DaemonStatus(Box::new(envelope)),
                 ))
             }
         }
@@ -63,7 +75,8 @@ pub struct PortableTerminalOutput(PortableTerminalOutputEnvelope);
 #[derive(Clone, Debug, JsonSchema, Serialize)]
 #[serde(untagged)]
 enum PortableTerminalOutputEnvelope {
-    DaemonStatus(SuccessEnvelope<AgentDaemonStatus>),
+    Scan(Box<SuccessEnvelope<AgentScanOutcome>>),
+    DaemonStatus(Box<SuccessEnvelope<AgentDaemonStatus>>),
 }
 
 impl JsonSchema for PortableTerminalOutput {
@@ -84,6 +97,7 @@ impl PortableTerminalOutput {
     #[must_use]
     pub const fn repository_id(&self) -> &LogicalRepositoryId {
         match &self.0 {
+            PortableTerminalOutputEnvelope::Scan(envelope) => envelope.repository_id(),
             PortableTerminalOutputEnvelope::DaemonStatus(envelope) => envelope.repository_id(),
         }
     }

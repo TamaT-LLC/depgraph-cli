@@ -8,13 +8,14 @@ use std::{
 };
 
 use depgraph_core::{
-    DepgraphCapability, DepgraphCapabilitySet, DepgraphServiceConfig, DepgraphServiceLimits,
+    DepgraphCapability, DepgraphCapabilitySet, DepgraphService, DepgraphServiceConfig,
+    DepgraphServiceLimits,
 };
 use depgraph_mcp_tools::LogicalRepositoryId;
 use depgraph_operation::{
     CanonicalJson, DispatchOutcome, EXECUTION_STATE_UNKNOWN_ERROR_JSON, ExecutionControl,
     OperationDispatcher, OperationJournal, OperationKind, OperationOutcome, OperationRunner,
-    OperationStatus, RunnerStartupConfig, RunnerWork, SubmitRequest,
+    OperationStatus, RunnerStartupConfig, RunnerWork, ScanOperationDispatcher, SubmitRequest,
     UNSUPPORTED_OPERATION_ERROR_JSON, UnsupportedOperationDispatcher,
 };
 use serde_json::json;
@@ -228,5 +229,65 @@ fn production_dispatcher_fails_unwired_operations_with_a_closed_error() {
             assert_eq!(error.as_str(), UNSUPPORTED_OPERATION_ERROR_JSON);
         }
         other => panic!("unwired operation fabricated an outcome: {other:?}"),
+    }
+}
+
+#[test]
+fn production_scan_dispatcher_executes_safe_scan_and_persists_closed_terminal_output() {
+    let root = tempfile::tempdir().unwrap();
+    let config = config(root.path());
+    let repository = repository(&config);
+    let now = now_ms() - 1_000;
+    let mut journal = OperationJournal::open(&config).unwrap();
+    let operation_id = journal
+        .submit(
+            &SubmitRequest::new(
+                &config,
+                OperationKind::ScanSubmit,
+                &json!({"strict": false, "no_cache": true}),
+                b"real-production-scan",
+                now + 60_000,
+            )
+            .unwrap(),
+            now,
+        )
+        .unwrap()
+        .operation_id()
+        .clone();
+    drop(journal);
+
+    OperationRunner::new(
+        RunnerStartupConfig::new(config.clone()).unwrap(),
+        ScanOperationDispatcher::new(config.clone()),
+    )
+    .run_until_idle()
+    .unwrap();
+
+    let journal = OperationJournal::open(&config).unwrap();
+    match journal
+        .result(&repository, &operation_id, now_ms())
+        .unwrap()
+    {
+        OperationOutcome::Completed(output) => {
+            let value: serde_json::Value = serde_json::from_str(output.as_str()).unwrap();
+            assert_eq!(value["result"]["status"], "completed");
+            assert_eq!(value["result"]["project_code_executed"], false);
+            assert!(
+                value["snapshot_id"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("snapshot:sha256:")
+            );
+            assert!(value.get("raw_journal_payload").is_none());
+            assert_eq!(
+                DepgraphService::new(config)
+                    .start_snapshot_request("current")
+                    .unwrap()
+                    .snapshot_id()
+                    .as_str(),
+                value["snapshot_id"].as_str().unwrap()
+            );
+        }
+        other => panic!("unexpected scan outcome: {other:?}"),
     }
 }

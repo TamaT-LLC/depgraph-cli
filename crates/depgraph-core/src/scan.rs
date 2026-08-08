@@ -6,7 +6,8 @@ use std::{
 
 use anyhow::{Context, Result};
 use depgraph_store::{
-    CacheEventRecord, CacheLayer, CoverageRecord, DiagnosticRecord, Store, ValidatedScanCacheHit,
+    CacheEventRecord, CacheLayer, CompletedScanSnapshot, CoverageRecord, DiagnosticRecord, Store,
+    ValidatedScan, ValidatedScanCacheHit,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -66,6 +67,55 @@ pub struct ScanPhasePerformance {
 pub enum ScanCacheMode {
     Enabled,
     Disabled,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScanPromotionMode {
+    Immediate,
+    Deferred,
+}
+
+struct ScanPromotionContext<'a> {
+    mode: ScanPromotionMode,
+    pending: &'a mut Option<PendingScanPromotion>,
+}
+
+pub(crate) struct PendingScanPromotion {
+    validation: ValidatedScan,
+    cache_plan: Option<ScanCachePlan>,
+}
+
+impl PendingScanPromotion {
+    pub(crate) fn promote(
+        self,
+        store: &mut Store,
+        outcome: &mut ScanOutcome,
+    ) -> Result<CompletedScanSnapshot> {
+        let completed = store.finish_validated_scan(self.validation, true)?;
+        if let Some(plan) = self.cache_plan.as_ref()
+            && let Err(error) = store_completed_scan_cache(store, plan, &completed)
+        {
+            tracing::warn!(
+                scan_id = outcome.scan_id,
+                error = %error,
+                "completed scan cache population failed"
+            );
+        }
+        match store.cache_events_for_scan(&outcome.scan_id) {
+            Ok(cache_events) => outcome.cache_events = cache_events,
+            Err(error) => tracing::warn!(
+                scan_id = outcome.scan_id,
+                error = %error,
+                "failed to refresh cache events for completed scan outcome"
+            ),
+        }
+        Ok(completed)
+    }
+}
+
+pub(crate) struct PreparedScan {
+    pub(crate) outcome: ScanOutcome,
+    pub(crate) promotion: Option<PendingScanPromotion>,
 }
 
 #[derive(Debug)]
@@ -205,7 +255,55 @@ pub async fn run_scan_with_cache_mode_and_cancellation(
     cache_mode: ScanCacheMode,
     cancellation: CancellationToken,
 ) -> Result<ScanOutcome> {
+    let prepared = prepare_scan_with_cache_mode_and_cancellation(
+        store,
+        root,
+        config,
+        strict,
+        cache_mode,
+        cancellation,
+        ScanPromotionMode::Immediate,
+    )
+    .await?;
+    debug_assert!(prepared.promotion.is_none());
+    Ok(prepared.outcome)
+}
+
+pub(crate) async fn prepare_deferred_scan_with_cache_mode_and_cancellation(
+    store: &mut Store,
+    root: PathBuf,
+    config: &Config,
+    strict: bool,
+    cache_mode: ScanCacheMode,
+    cancellation: CancellationToken,
+) -> Result<PreparedScan> {
+    prepare_scan_with_cache_mode_and_cancellation(
+        store,
+        root,
+        config,
+        strict,
+        cache_mode,
+        cancellation,
+        ScanPromotionMode::Deferred,
+    )
+    .await
+}
+
+async fn prepare_scan_with_cache_mode_and_cancellation(
+    store: &mut Store,
+    root: PathBuf,
+    config: &Config,
+    strict: bool,
+    cache_mode: ScanCacheMode,
+    cancellation: CancellationToken,
+    promotion_mode: ScanPromotionMode,
+) -> Result<PreparedScan> {
     let total_started = Instant::now();
+    let mut pending_promotion = None;
+    let mut promotion = ScanPromotionContext {
+        mode: promotion_mode,
+        pending: &mut pending_promotion,
+    };
     let mut outcome = run_scan_with_cache_mode_and_cancellation_inner(
         store,
         root,
@@ -213,6 +311,7 @@ pub async fn run_scan_with_cache_mode_and_cancellation(
         strict,
         cache_mode,
         cancellation,
+        &mut promotion,
     )
     .await?;
     if scan_profile_enabled() {
@@ -227,7 +326,10 @@ pub async fn run_scan_with_cache_mode_and_cancellation(
             bytes: 0,
         });
     }
-    Ok(outcome)
+    Ok(PreparedScan {
+        outcome,
+        promotion: pending_promotion,
+    })
 }
 
 async fn run_scan_with_cache_mode_and_cancellation_inner(
@@ -237,6 +339,7 @@ async fn run_scan_with_cache_mode_and_cancellation_inner(
     strict: bool,
     cache_mode: ScanCacheMode,
     cancellation: CancellationToken,
+    promotion: &mut ScanPromotionContext<'_>,
 ) -> Result<ScanOutcome> {
     let setup_started = Instant::now();
     let root = root
@@ -381,16 +484,32 @@ async fn run_scan_with_cache_mode_and_cancellation_inner(
                                             hit.snapshot_id(),
                                             &scan_id,
                                         )?;
-                                        return complete_scan(
+                                        return complete_scan_with_mode(
                                             store,
                                             &scan_id,
                                             strict,
                                             config,
                                             None,
                                             &cancellation,
+                                            promotion,
                                         );
                                     }
                                 } else {
+                                    if promotion.mode == ScanPromotionMode::Deferred {
+                                        store.clone_completed_scan_into_staging(
+                                            hit.snapshot_id(),
+                                            &scan_id,
+                                        )?;
+                                        return complete_scan_with_mode(
+                                            store,
+                                            &scan_id,
+                                            strict,
+                                            config,
+                                            None,
+                                            &cancellation,
+                                            promotion,
+                                        );
+                                    }
                                     let mut outcome = ScanOutcome {
                                         scan_id: scan_id.clone(),
                                         status: "completed".to_owned(),
@@ -683,13 +802,14 @@ async fn run_scan_with_cache_mode_and_cancellation_inner(
     }
 
     let promotion_started = Instant::now();
-    let mut outcome = complete_scan(
+    let mut outcome = complete_scan_with_mode(
         store,
         &scan_id,
         strict,
         config,
         cache_plan.as_ref(),
         &cancellation,
+        promotion,
     )?;
     if profiling {
         performance_phases.push(ScanPhasePerformance {
@@ -862,6 +982,33 @@ pub(crate) fn complete_scan(
     cache_plan: Option<&ScanCachePlan>,
     cancellation: &CancellationToken,
 ) -> Result<ScanOutcome> {
+    let mut pending_promotion = None;
+    let mut promotion = ScanPromotionContext {
+        mode: ScanPromotionMode::Immediate,
+        pending: &mut pending_promotion,
+    };
+    let outcome = complete_scan_with_mode(
+        store,
+        scan_id,
+        strict,
+        config,
+        cache_plan,
+        cancellation,
+        &mut promotion,
+    )?;
+    debug_assert!(pending_promotion.is_none());
+    Ok(outcome)
+}
+
+fn complete_scan_with_mode(
+    store: &mut Store,
+    scan_id: &str,
+    strict: bool,
+    config: &Config,
+    cache_plan: Option<&ScanCachePlan>,
+    cancellation: &CancellationToken,
+    promotion: &mut ScanPromotionContext<'_>,
+) -> Result<ScanOutcome> {
     if cancellation.is_cancelled() {
         return cancel_scan(store, scan_id);
     }
@@ -984,6 +1131,14 @@ pub(crate) fn complete_scan(
         policy,
         performance: None,
     };
+
+    if promotion.mode == ScanPromotionMode::Deferred {
+        *promotion.pending = Some(PendingScanPromotion {
+            validation,
+            cache_plan: cache_plan.cloned(),
+        });
+        return Ok(outcome);
+    }
 
     let Some(promotion) =
         cancellation.run_if_active(|| store.finish_validated_scan(validation, true))

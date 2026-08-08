@@ -16,7 +16,8 @@ use depgraph_core::service::{
     DependencyDirection, DoctorRequest, EdgeDirection, ExplainPathRequest, GraphExportFormat,
     GraphExportRequest, GraphExportResult, ImpactRequest, NodeMatchMode, PolicyEvaluateRequest,
     PolicyEvaluationResult, ProfilePlanRequest, RuntimeValidateRequest, ServiceSnapshotSelector,
-    SnapshotDiffFilters, SnapshotDiffRequest, SnapshotDiffResult, UnresolvedRequest,
+    SnapshotDiffFilters, SnapshotDiffRequest, SnapshotDiffResult, SnapshotNameCreateRequest,
+    UnresolvedRequest,
 };
 use depgraph_core::{
     CancellationToken, CycleLevel, DepgraphCapability, DepgraphCapabilitySet, DepgraphService,
@@ -37,17 +38,19 @@ use depgraph_mcp_tools::{
     AgentResourceLimit, AgentRuntimeTraceEvent, AgentRuntimeValidationResponse, AgentSite,
     AgentSnapshotDiffChange, AgentSnapshotDiffChangeType, AgentSnapshotDiffRecordType,
     AgentSnapshotDiffResponse, AgentToken, BoundedQueryProjectionFailure, CanonicalResponseMapper,
-    ContractBuildError, ContractVersion, Cursor, CursorKey, ErrorEnvelope, LogicalRepositoryId,
-    MAX_AGENT_CONDITION_BYTES, MAX_PAGE_BYTES, MappedToolResult, OperationId, PageByteLimit,
-    PageRequest, PageSize, PaginationContext, PortableTerminalOutputContract,
-    RepositoryRelativePath, ResponseMappingError, SnapshotId, SuccessEnvelope,
-    TASK_POLL_INTERVAL_MS, ToolCatalog, project_bounded_query_rows_cancellable,
-    project_cycles_page_cancellable, project_dependencies_page_cancellable,
-    project_impact_response_cancellable, project_unresolved_page_cancellable,
+    ContractBuildError, ContractVersion, Cursor, CursorKey, DurableSubmitResult, ErrorEnvelope,
+    LogicalRepositoryId, MAX_AGENT_CONDITION_BYTES, MAX_PAGE_BYTES, MappedToolResult,
+    OperationAccepted, OperationId, PageByteLimit, PageRequest, PageSize, PaginationContext,
+    PortableTerminalOutputContract, RepositoryRelativePath, ResponseMappingError, SnapshotId,
+    SnapshotName, SuccessEnvelope, TASK_POLL_INTERVAL_MS, ToolCatalog,
+    project_bounded_query_rows_cancellable, project_cycles_page_cancellable,
+    project_dependencies_page_cancellable, project_impact_response_cancellable,
+    project_unresolved_page_cancellable,
 };
 use depgraph_operation::{
     DEADLINE_EXCEEDED_ERROR_JSON, EXECUTION_STATE_UNKNOWN_ERROR_JSON, JournalError,
-    OperationManager, OperationOutcome, OperationResultView, OperationStatus, OperationView,
+    OperationHandle, OperationKind, OperationManager, OperationOutcome, OperationResultView,
+    OperationRunnerLauncher, OperationStatus, OperationView, RunnerStartupConfig, SubmitRequest,
     UNSUPPORTED_OPERATION_ERROR_JSON,
 };
 use rmcp::{
@@ -76,6 +79,7 @@ const MAX_STDERR_RECORD_BYTES: usize = 1024;
 const MAX_STDERR_TOTAL_BYTES: usize = 16 * 1024;
 const STARTUP_ERROR: &str = "depgraph-mcp: invalid startup configuration\n";
 const INBOUND_ERROR: &str = "depgraph-mcp: inbound message rejected\n";
+const SCAN_EXECUTION_DEADLINE_MS: i64 = 60 * 60 * 1_000;
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum CapabilityArg {
@@ -182,6 +186,28 @@ struct OperationArguments {
     contract_version: ContractVersion,
     repository_id: LogicalRepositoryId,
     operation_id: OperationId,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScanSubmitArguments {
+    contract_version: ContractVersion,
+    repository_id: LogicalRepositoryId,
+    idempotency_key: String,
+    #[serde(default)]
+    strict: bool,
+    #[serde(default)]
+    no_cache: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SnapshotNameCreateArguments {
+    contract_version: ContractVersion,
+    repository_id: LogicalRepositoryId,
+    name: SnapshotName,
+    #[serde(default)]
+    snapshot: Option<String>,
 }
 
 #[derive(Clone, Copy, Deserialize, Serialize)]
@@ -1048,6 +1074,70 @@ impl ServerHandler for DepgraphMcpServer {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
         let tool = request.name.into_owned();
+        if self.get_tool(&tool).is_none() {
+            return Err(McpError::invalid_params(
+                "tool handler is unavailable",
+                None,
+            ));
+        }
+        if tool == "scan_submit" {
+            let tasks_negotiated = EFFECTIVE_PROTOCOL_VERSION
+                .try_with(|version| *version == ProtocolVersion::V_2026_07_28)
+                .unwrap_or(false)
+                && context
+                    .client_capabilities()
+                    .is_some_and(|capabilities| capabilities.supports_tasks());
+            let arguments = request.arguments.unwrap_or_default();
+            let operation_config = self.operation_config.clone();
+            let repository_id = self.repository_id.clone();
+            let cancellation = CancellationToken::new();
+            let request_cancellation = context.ct;
+            if request_cancellation.is_cancelled() {
+                cancellation.cancel();
+            }
+            let cancellation_bridge = tokio::spawn({
+                let cancellation = cancellation.clone();
+                async move {
+                    request_cancellation.cancelled().await;
+                    cancellation.cancel();
+                }
+            });
+            let execution = self
+                .runtime
+                .execute_blocking(RuntimeClass::Submit, cancellation, move |cancellation| {
+                    execute_scan_submit(&operation_config, &repository_id, arguments, &cancellation)
+                })
+                .await;
+            cancellation_bridge.abort();
+
+            let handle = match execution {
+                Ok(Ok(handle)) => handle,
+                Ok(Err(failure)) => {
+                    return Ok(map_tool_failure(&self.repository_id, failure)?
+                        .into_result()
+                        .into());
+                }
+                Err(error) => {
+                    let mapped = CanonicalResponseMapper::error(&ErrorEnvelope::new(
+                        self.repository_id.clone(),
+                        error.agent_error(self.runtime.deadline(RuntimeClass::Submit)),
+                    ))
+                    .map_err(internal_mapping_error)?;
+                    return Ok(mapped.into_result().into());
+                }
+            };
+            if tasks_negotiated {
+                return Ok(CallToolResponse::Task(create_task_result(
+                    handle.operation(),
+                )?));
+            }
+            let accepted = DurableSubmitResult::baseline(OperationAccepted::new(
+                handle.operation_id().clone(),
+            ));
+            let mapped = CanonicalResponseMapper::durable_submit(&accepted)
+                .map_err(internal_mapping_error)?;
+            return Ok(mapped.into_result().into());
+        }
         if !matches!(
             tool.as_str(),
             "get_context"
@@ -1075,13 +1165,15 @@ impl ServerHandler for DepgraphMcpServer {
                 | "operation_get"
                 | "operation_result"
                 | "operation_cancel"
+                | "snapshot_name_create"
         ) {
             return Err(McpError::invalid_params(
                 "tool handler is unavailable",
                 None,
             ));
         }
-        let runtime_class = if tool == "operation_cancel" {
+        let runtime_class = if matches!(tool.as_str(), "operation_cancel" | "snapshot_name_create")
+        {
             RuntimeClass::Submit
         } else {
             RuntimeClass::Read
@@ -1117,6 +1209,8 @@ impl ServerHandler for DepgraphMcpServer {
                     "operation_get" | "operation_result" | "operation_cancel"
                 ) {
                     execute_operation_tool(&operation_config, &repository_id, &tool, arguments)
+                } else if tool == "snapshot_name_create" {
+                    execute_snapshot_name_create(&service, &repository_id, arguments, &cancellation)
                 } else {
                     execute_catalog_read_tool(
                         &service,
@@ -1141,25 +1235,7 @@ impl ServerHandler for DepgraphMcpServer {
 
         let mapped = match execution {
             Ok(Ok(mapped)) => mapped,
-            Ok(Err(ToolExecutionFailure::Service(error))) => {
-                CanonicalResponseMapper::service_error(self.repository_id.clone(), &error)
-                    .map_err(internal_mapping_error)?
-            }
-            Ok(Err(ToolExecutionFailure::Agent(error))) => CanonicalResponseMapper::error(
-                &ErrorEnvelope::new(self.repository_id.clone(), error),
-            )
-            .map_err(internal_mapping_error)?,
-            Ok(Err(ToolExecutionFailure::Journal {
-                error,
-                operation_id,
-            })) => CanonicalResponseMapper::error(&ErrorEnvelope::new(
-                self.repository_id.clone(),
-                map_journal_error(&error, operation_id),
-            ))
-            .map_err(internal_mapping_error)?,
-            Ok(Err(ToolExecutionFailure::Response(error))) => {
-                return Err(internal_mapping_error(error));
-            }
+            Ok(Err(failure)) => map_tool_failure(&self.repository_id, failure)?,
             Err(error) => CanonicalResponseMapper::error(&ErrorEnvelope::new(
                 self.repository_id.clone(),
                 error.agent_error(self.runtime.deadline(runtime_class)),
@@ -1172,6 +1248,31 @@ impl ServerHandler for DepgraphMcpServer {
 
 fn internal_mapping_error(_error: ResponseMappingError) -> McpError {
     McpError::internal_error("canonical tool response mapping failed", None)
+}
+
+fn map_tool_failure(
+    repository_id: &LogicalRepositoryId,
+    failure: ToolExecutionFailure,
+) -> Result<MappedToolResult, McpError> {
+    match failure {
+        ToolExecutionFailure::Service(error) => {
+            CanonicalResponseMapper::service_error(repository_id.clone(), &error)
+                .map_err(internal_mapping_error)
+        }
+        ToolExecutionFailure::Agent(error) => {
+            CanonicalResponseMapper::error(&ErrorEnvelope::new(repository_id.clone(), error))
+                .map_err(internal_mapping_error)
+        }
+        ToolExecutionFailure::Journal {
+            error,
+            operation_id,
+        } => CanonicalResponseMapper::error(&ErrorEnvelope::new(
+            repository_id.clone(),
+            map_journal_error(&error, operation_id),
+        ))
+        .map_err(internal_mapping_error),
+        ToolExecutionFailure::Response(error) => Err(internal_mapping_error(error)),
+    }
 }
 
 /// Resolve a durable operation through the MCP Tasks wire contract. Task IDs are
@@ -1230,11 +1331,20 @@ fn task_cancel(
 }
 
 fn create_task_result(operation: &OperationView) -> Result<CreateTaskResult, McpError> {
+    let (status, polling) = create_task_status(operation.status());
     Ok(CreateTaskResult::new(task_metadata(
-        operation,
-        TaskStatus::Working,
-        true,
+        operation, status, polling,
     )?))
+}
+
+fn create_task_status(status: OperationStatus) -> (TaskStatus, bool) {
+    match status {
+        OperationStatus::Queued | OperationStatus::Running | OperationStatus::Cancelling => {
+            (TaskStatus::Working, true)
+        }
+        OperationStatus::Cancelled => (TaskStatus::Cancelled, false),
+        OperationStatus::Completed | OperationStatus::Failed => (TaskStatus::Completed, false),
+    }
 }
 
 fn task_from_operation(
@@ -1366,6 +1476,170 @@ fn page_request(
         PageByteLimit::default(),
         cursor,
     ))
+}
+
+fn execute_scan_submit(
+    config: &DepgraphServiceConfig,
+    repository_id: &LogicalRepositoryId,
+    arguments: serde_json::Map<String, serde_json::Value>,
+    cancellation: &CancellationToken,
+) -> Result<OperationHandle, ToolExecutionFailure> {
+    let arguments = decode_arguments::<ScanSubmitArguments>(arguments)?;
+    authorize_repository(
+        arguments.contract_version,
+        &arguments.repository_id,
+        repository_id,
+    )?;
+    if cancellation.is_cancelled() {
+        return Err(ToolExecutionFailure::Service(
+            DepgraphServiceError::Cancelled,
+        ));
+    }
+
+    // Resolve and validate the executable before the durable commit. Once the
+    // record and handoff are visible, launch failure is reported without ever
+    // returning an accepted handle for work that was not handed to a runner.
+    let launcher = OperationRunnerLauncher::resolve()
+        .map_err(|_| ToolExecutionFailure::Agent(internal_agent_error()))?;
+    let startup = RunnerStartupConfig::new(config.clone())
+        .map_err(|_| ToolExecutionFailure::Agent(internal_agent_error()))?;
+    let now_ms = system_now_ms()?;
+    let deadline_ms = now_ms
+        .checked_add(SCAN_EXECUTION_DEADLINE_MS)
+        .ok_or_else(|| ToolExecutionFailure::Agent(internal_agent_error()))?;
+    let normalized_input = serde_json::json!({
+        "no_cache": arguments.no_cache,
+        "strict": arguments.strict,
+    });
+    let request = SubmitRequest::new(
+        config,
+        OperationKind::ScanSubmit,
+        &normalized_input,
+        arguments.idempotency_key.as_bytes(),
+        deadline_ms,
+    )
+    .map_err(|error| ToolExecutionFailure::Journal {
+        error,
+        operation_id: None,
+    })?;
+    let mut manager =
+        OperationManager::open(config).map_err(|error| ToolExecutionFailure::Journal {
+            error,
+            operation_id: None,
+        })?;
+    let handle =
+        manager
+            .submit(&request, now_ms)
+            .map_err(|error| ToolExecutionFailure::Journal {
+                error,
+                operation_id: None,
+            })?;
+
+    // A fresh manager proves that the committed operation/handoff is already
+    // reconnect-visible before the transport receives its durable identity.
+    let observer =
+        OperationManager::open(config).map_err(|error| ToolExecutionFailure::Journal {
+            error,
+            operation_id: Some(handle.operation_id().clone()),
+        })?;
+    let visible = observer
+        .get(handle.operation_id(), now_ms)
+        .map_err(|error| ToolExecutionFailure::Journal {
+            error,
+            operation_id: Some(handle.operation_id().clone()),
+        })?;
+    if visible.operation_id() != handle.operation_id() {
+        return Err(ToolExecutionFailure::Journal {
+            error: JournalError::IntegrityFailure,
+            operation_id: Some(handle.operation_id().clone()),
+        });
+    }
+    handoff_submitted_scan(&mut manager, &startup, &handle, cancellation, |startup| {
+        launcher
+            .launch(startup)
+            .map(|_| ())
+            .map_err(|_| ToolExecutionFailure::Agent(internal_agent_error()))
+    })?;
+    Ok(handle)
+}
+
+fn handoff_submitted_scan(
+    manager: &mut OperationManager,
+    startup: &RunnerStartupConfig,
+    handle: &OperationHandle,
+    cancellation: &CancellationToken,
+    launch: impl FnOnce(&RunnerStartupConfig) -> Result<(), ToolExecutionFailure>,
+) -> Result<(), ToolExecutionFailure> {
+    if handle.status().is_terminal() {
+        return if handle.status() == OperationStatus::Cancelled {
+            Err(ToolExecutionFailure::Service(
+                DepgraphServiceError::Cancelled,
+            ))
+        } else {
+            Ok(())
+        };
+    }
+    let Some(launch) = cancellation.run_if_active(|| launch(startup)) else {
+        // Only this request's newly-created handoff may be terminalized here.
+        // A replay observes pre-existing durable work; cancelling the transport
+        // retry must not mutate that operation.
+        if handle.created() {
+            manager
+                .cancel_before_launch(handle.operation_id(), system_now_ms()?)
+                .map_err(|error| ToolExecutionFailure::Journal {
+                    error,
+                    operation_id: Some(handle.operation_id().clone()),
+                })?;
+        }
+        return Err(ToolExecutionFailure::Service(
+            DepgraphServiceError::Cancelled,
+        ));
+    };
+    match launch {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            // A fresh operation whose runner failed to launch has not been
+            // handed off and its ID will not reach the client. Terminalize it
+            // so a later runner cannot claim and execute orphaned work.
+            if handle.created() {
+                manager
+                    .cancel_before_launch(handle.operation_id(), system_now_ms()?)
+                    .map_err(|journal_error| ToolExecutionFailure::Journal {
+                        error: journal_error,
+                        operation_id: Some(handle.operation_id().clone()),
+                    })?;
+            }
+            Err(error)
+        }
+    }
+}
+
+fn execute_snapshot_name_create(
+    service: &DepgraphService,
+    repository_id: &LogicalRepositoryId,
+    arguments: serde_json::Map<String, serde_json::Value>,
+    cancellation: &CancellationToken,
+) -> Result<MappedToolResult, ToolExecutionFailure> {
+    let arguments = decode_arguments::<SnapshotNameCreateArguments>(arguments)?;
+    authorize_repository(
+        arguments.contract_version,
+        &arguments.repository_id,
+        repository_id,
+    )?;
+    let selector = SnapshotLocator::parse(arguments.snapshot.as_deref().unwrap_or("current"))?;
+    let named = service.snapshot_name_create(
+        &SnapshotNameCreateRequest::new(arguments.name.as_str(), selector),
+        cancellation,
+    )?;
+    let snapshot_id = parse_snapshot_id(named.snapshot().id())?;
+    let result = AgentNamedSnapshot::try_from(&named)
+        .map_err(|_| ToolExecutionFailure::Service(DepgraphServiceError::Integrity))?;
+    CanonicalResponseMapper::success(&SuccessEnvelope::new(
+        repository_id.clone(),
+        Some(snapshot_id),
+        result,
+    ))
+    .map_err(Into::into)
 }
 
 fn execute_operation_tool(
@@ -2939,7 +3213,29 @@ async fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
     use super::*;
+    use depgraph_operation::OperationJournal;
+
+    fn operation_test_config(root: &Path) -> DepgraphServiceConfig {
+        let repository = root.join("repository");
+        std::fs::create_dir_all(&repository).unwrap();
+        DepgraphServiceConfig::new(
+            repository,
+            root.join("graph.sqlite"),
+            DepgraphCapabilitySet::try_new([
+                DepgraphCapability::Read,
+                DepgraphCapability::StoreWrite,
+            ])
+            .unwrap(),
+            DepgraphServiceLimits::default(),
+        )
+        .unwrap()
+    }
 
     #[test]
     fn bounded_stderr_limits_each_record_and_total_output() {
@@ -3087,5 +3383,191 @@ mod tests {
             .unwrap();
             assert!(!encoded.contains("TOP_SECRET"));
         }
+    }
+
+    #[test]
+    fn task_creation_projects_replayed_operation_status_without_regressing_to_working() {
+        for status in [
+            OperationStatus::Queued,
+            OperationStatus::Running,
+            OperationStatus::Cancelling,
+        ] {
+            assert_eq!(create_task_status(status), (TaskStatus::Working, true));
+        }
+        assert_eq!(
+            create_task_status(OperationStatus::Cancelled),
+            (TaskStatus::Cancelled, false)
+        );
+        for status in [OperationStatus::Completed, OperationStatus::Failed] {
+            assert_eq!(create_task_status(status), (TaskStatus::Completed, false));
+        }
+    }
+
+    #[test]
+    fn cancellation_after_durable_scan_submit_cancels_without_launching() {
+        let root = tempfile::tempdir().unwrap();
+        let config = operation_test_config(root.path());
+        let repository_id = LogicalRepositoryId::parse(config.logical_repository_id()).unwrap();
+        let now_ms = system_now_ms().ok().unwrap();
+        let request = SubmitRequest::new(
+            &config,
+            OperationKind::ScanSubmit,
+            &serde_json::json!({"no_cache": true, "strict": false}),
+            b"cancel-after-durable-submit",
+            now_ms + SCAN_EXECUTION_DEADLINE_MS,
+        )
+        .unwrap();
+        let mut manager = OperationManager::open(&config).unwrap();
+        let handle = manager.submit(&request, now_ms).unwrap();
+        let startup = RunnerStartupConfig::new(config.clone()).unwrap();
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let launches = Arc::new(AtomicUsize::new(0));
+
+        let result = handoff_submitted_scan(&mut manager, &startup, &handle, &cancellation, {
+            let launches = Arc::clone(&launches);
+            move |_| {
+                launches.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        });
+
+        assert!(matches!(
+            result,
+            Err(ToolExecutionFailure::Service(
+                DepgraphServiceError::Cancelled
+            ))
+        ));
+        assert_eq!(launches.load(Ordering::SeqCst), 0);
+        let journal = OperationJournal::open(&config).unwrap();
+        assert_eq!(
+            journal
+                .get(
+                    &repository_id,
+                    handle.operation_id(),
+                    system_now_ms().ok().unwrap(),
+                )
+                .unwrap()
+                .status(),
+            OperationStatus::Cancelled
+        );
+    }
+
+    #[test]
+    fn launch_failure_after_durable_scan_submit_cancels_orphaned_work() {
+        let root = tempfile::tempdir().unwrap();
+        let config = operation_test_config(root.path());
+        let repository_id = LogicalRepositoryId::parse(config.logical_repository_id()).unwrap();
+        let now_ms = system_now_ms().ok().unwrap();
+        let request = SubmitRequest::new(
+            &config,
+            OperationKind::ScanSubmit,
+            &serde_json::json!({"no_cache": true, "strict": false}),
+            b"launch-failure-after-durable-submit",
+            now_ms + SCAN_EXECUTION_DEADLINE_MS,
+        )
+        .unwrap();
+        let mut manager = OperationManager::open(&config).unwrap();
+        let handle = manager.submit(&request, now_ms).unwrap();
+        let startup = RunnerStartupConfig::new(config.clone()).unwrap();
+        let cancellation = CancellationToken::new();
+        let launches = Arc::new(AtomicUsize::new(0));
+
+        let result = handoff_submitted_scan(&mut manager, &startup, &handle, &cancellation, {
+            let launches = Arc::clone(&launches);
+            move |_| {
+                launches.fetch_add(1, Ordering::SeqCst);
+                Err(ToolExecutionFailure::Agent(internal_agent_error()))
+            }
+        });
+
+        assert!(matches!(result, Err(ToolExecutionFailure::Agent(_))));
+        assert_eq!(launches.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            OperationJournal::open(&config)
+                .unwrap()
+                .get(
+                    &repository_id,
+                    handle.operation_id(),
+                    system_now_ms().ok().unwrap(),
+                )
+                .unwrap()
+                .status(),
+            OperationStatus::Cancelled
+        );
+
+        let replay = manager
+            .submit(&request, system_now_ms().ok().unwrap())
+            .unwrap();
+        assert!(!replay.created());
+        assert_eq!(replay.status(), OperationStatus::Cancelled);
+        let replay_result =
+            handoff_submitted_scan(&mut manager, &startup, &replay, &cancellation, {
+                let launches = Arc::clone(&launches);
+                move |_| {
+                    launches.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }
+            });
+        assert!(matches!(
+            replay_result,
+            Err(ToolExecutionFailure::Service(
+                DepgraphServiceError::Cancelled
+            ))
+        ));
+        assert_eq!(launches.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn cancelled_scan_submit_retry_does_not_cancel_existing_durable_work() {
+        let root = tempfile::tempdir().unwrap();
+        let config = operation_test_config(root.path());
+        let repository_id = LogicalRepositoryId::parse(config.logical_repository_id()).unwrap();
+        let now_ms = system_now_ms().ok().unwrap();
+        let request = SubmitRequest::new(
+            &config,
+            OperationKind::ScanSubmit,
+            &serde_json::json!({"no_cache": true, "strict": false}),
+            b"cancelled-idempotent-retry",
+            now_ms + SCAN_EXECUTION_DEADLINE_MS,
+        )
+        .unwrap();
+        let mut manager = OperationManager::open(&config).unwrap();
+        let original = manager.submit(&request, now_ms).unwrap();
+        assert!(original.created());
+        let replay = manager.submit(&request, now_ms).unwrap();
+        assert!(!replay.created());
+        let startup = RunnerStartupConfig::new(config.clone()).unwrap();
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let launches = Arc::new(AtomicUsize::new(0));
+
+        let result = handoff_submitted_scan(&mut manager, &startup, &replay, &cancellation, {
+            let launches = Arc::clone(&launches);
+            move |_| {
+                launches.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        });
+
+        assert!(matches!(
+            result,
+            Err(ToolExecutionFailure::Service(
+                DepgraphServiceError::Cancelled
+            ))
+        ));
+        assert_eq!(launches.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            OperationJournal::open(&config)
+                .unwrap()
+                .get(
+                    &repository_id,
+                    original.operation_id(),
+                    system_now_ms().ok().unwrap(),
+                )
+                .unwrap()
+                .status(),
+            OperationStatus::Queued
+        );
     }
 }
