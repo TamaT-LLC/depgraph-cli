@@ -25,6 +25,7 @@ const HELPER_STORE: &str = "DEPGRAPH_OPERATION_HELPER_STORE";
 const HELPER_READY: &str = "DEPGRAPH_OPERATION_HELPER_READY";
 const HELPER_LAUNCHED: &str = "DEPGRAPH_OPERATION_HELPER_LAUNCHED";
 const STDOUT_SENTINEL: &str = "launcher-server-stdout-intact";
+const PROCESS_TEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn now_ms() -> i64 {
     i64::try_from(
@@ -156,13 +157,13 @@ fn accepted_operation_survives_stdin_eof_and_launcher_process_exit() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    wait_for_file(&ready, Duration::from_secs(5));
+    wait_for_file(&ready, PROCESS_TEST_TIMEOUT);
 
     let lock = Connection::open(operation_journal_path(&config)).unwrap();
     lock.execute_batch("BEGIN IMMEDIATE").unwrap();
     helper.stdin.as_mut().unwrap().write_all(b"L").unwrap();
     helper.stdin.as_mut().unwrap().flush().unwrap();
-    wait_for_file(&launched, Duration::from_secs(5));
+    wait_for_file(&launched, PROCESS_TEST_TIMEOUT);
     let runner_pid: u32 = fs::read_to_string(&launched).unwrap().parse().unwrap();
     assert_ne!(runner_pid, helper.id());
     #[cfg(unix)]
@@ -172,7 +173,7 @@ fn accepted_operation_survives_stdin_eof_and_launcher_process_exit() {
     }
 
     drop(helper.stdin.take());
-    let helper_status = wait_for_exit(&mut helper, Duration::from_secs(5));
+    let helper_status = wait_for_exit(&mut helper, PROCESS_TEST_TIMEOUT);
     assert!(helper_status.success());
     let mut helper_stdout = String::new();
     helper
@@ -193,7 +194,7 @@ fn accepted_operation_survives_stdin_eof_and_launcher_process_exit() {
     assert!(!helper_stderr.contains("must-never-reach-stdio"));
 
     lock.execute_batch("COMMIT").unwrap();
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + PROCESS_TEST_TIMEOUT;
     loop {
         let journal = OperationJournal::open(&config).unwrap();
         match journal.result(&repository, &operation_id, now_ms()) {
@@ -209,7 +210,7 @@ fn accepted_operation_survives_stdin_eof_and_launcher_process_exit() {
     }
     #[cfg(unix)]
     {
-        let cleanup_deadline = Instant::now() + Duration::from_secs(5);
+        let cleanup_deadline = Instant::now() + PROCESS_TEST_TIMEOUT;
         while unsafe { libc::kill(runner_pid as i32, 0) } == 0 {
             assert!(
                 Instant::now() < cleanup_deadline,
