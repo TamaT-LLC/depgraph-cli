@@ -4,6 +4,7 @@ use std::{
     path::{Path, PathBuf},
     process::ExitCode,
     sync::{Arc, Mutex},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context as _, Result, bail};
@@ -28,18 +29,25 @@ use depgraph_mcp_tools::{
     AgentDependencyDirection, AgentDoctor, AgentEdge, AgentError, AgentErrorCode,
     AgentErrorDetails, AgentEvidence, AgentGraphExportFormat, AgentGraphExportMediaType,
     AgentGraphExportResponse, AgentId, AgentLocator, AgentNamedSnapshot, AgentNode,
-    AgentNodeSummary, AgentPathResponse, AgentPolicyAnnotation, AgentPolicyAnnotationLevel,
-    AgentPolicyApiChange, AgentPolicyApiChangeKind, AgentPolicyEvaluationResponse,
-    AgentPolicySeverity, AgentPolicySummary, AgentPolicyViolation, AgentProfilePlan,
-    AgentRemediation, AgentResourceLimit, AgentRuntimeTraceEvent, AgentRuntimeValidationResponse,
-    AgentSite, AgentSnapshotDiffChange, AgentSnapshotDiffChangeType, AgentSnapshotDiffRecordType,
+    AgentNodeSummary, AgentOperation, AgentOperationStatus, AgentPathResponse,
+    AgentPolicyAnnotation, AgentPolicyAnnotationLevel, AgentPolicyApiChange,
+    AgentPolicyApiChangeKind, AgentPolicyEvaluationResponse, AgentPolicySeverity,
+    AgentPolicySummary, AgentPolicyViolation, AgentProfilePlan, AgentRemediation,
+    AgentResourceLimit, AgentRuntimeTraceEvent, AgentRuntimeValidationResponse, AgentSite,
+    AgentSnapshotDiffChange, AgentSnapshotDiffChangeType, AgentSnapshotDiffRecordType,
     AgentSnapshotDiffResponse, AgentToken, BoundedQueryProjectionFailure, CanonicalResponseMapper,
     ContractBuildError, ContractVersion, Cursor, CursorKey, ErrorEnvelope, LogicalRepositoryId,
-    MAX_AGENT_CONDITION_BYTES, MAX_PAGE_BYTES, MappedToolResult, PageByteLimit, PageRequest,
-    PageSize, PaginationContext, RepositoryRelativePath, ResponseMappingError, SnapshotId,
-    SuccessEnvelope, ToolCatalog, project_bounded_query_rows_cancellable,
-    project_cycles_page_cancellable, project_dependencies_page_cancellable,
-    project_impact_response_cancellable, project_unresolved_page_cancellable,
+    MAX_AGENT_CONDITION_BYTES, MAX_PAGE_BYTES, MappedToolResult, OperationId, PageByteLimit,
+    PageRequest, PageSize, PaginationContext, PortableTerminalOutputContract,
+    RepositoryRelativePath, ResponseMappingError, SnapshotId, SuccessEnvelope, ToolCatalog,
+    project_bounded_query_rows_cancellable, project_cycles_page_cancellable,
+    project_dependencies_page_cancellable, project_impact_response_cancellable,
+    project_unresolved_page_cancellable,
+};
+use depgraph_operation::{
+    DEADLINE_EXCEEDED_ERROR_JSON, EXECUTION_STATE_UNKNOWN_ERROR_JSON, JournalError,
+    OperationManager, OperationOutcome, OperationStatus, OperationView,
+    UNSUPPORTED_OPERATION_ERROR_JSON,
 };
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler, ServiceExt,
@@ -137,6 +145,7 @@ struct Args {
 struct DepgraphMcpServer {
     // Retained as immutable server state so tool handlers share one validated setup and runtime.
     service: DepgraphService,
+    operation_config: DepgraphServiceConfig,
     compiler_pack: VerifiedCompilerPack,
     compiler_pack_requirement: PathBuf,
     runtime: RuntimeController,
@@ -151,6 +160,14 @@ struct DepgraphMcpServer {
 struct ContextArguments {
     contract_version: ContractVersion,
     repository_id: LogicalRepositoryId,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OperationArguments {
+    contract_version: ContractVersion,
+    repository_id: LogicalRepositoryId,
+    operation_id: OperationId,
 }
 
 #[derive(Clone, Copy, Deserialize, Serialize)]
@@ -754,6 +771,10 @@ fn project_graph_export(
 enum ToolExecutionFailure {
     Service(DepgraphServiceError),
     Agent(AgentError),
+    Journal {
+        error: JournalError,
+        operation_id: Option<OperationId>,
+    },
     Response(ResponseMappingError),
 }
 
@@ -841,8 +862,14 @@ impl ServerHandler for DepgraphMcpServer {
                 None,
             ));
         }
+        let runtime_class = if tool == "operation_cancel" {
+            RuntimeClass::Submit
+        } else {
+            RuntimeClass::Read
+        };
         let arguments = request.arguments.unwrap_or_default();
         let service = self.service.clone();
+        let operation_config = self.operation_config.clone();
         let repository_id = self.repository_id.clone();
         let compiler_pack_requirement = self.compiler_pack_requirement.clone();
         let cursor_key = self.cursor_key.clone();
@@ -860,21 +887,28 @@ impl ServerHandler for DepgraphMcpServer {
         });
         let execution = self
             .runtime
-            .execute_blocking(RuntimeClass::Read, cancellation, move |cancellation| {
+            .execute_blocking(runtime_class, cancellation, move |cancellation| {
                 if cancellation.is_cancelled() {
                     return Err(ToolExecutionFailure::Service(
                         DepgraphServiceError::Cancelled,
                     ));
                 }
-                let result = execute_catalog_read_tool(
-                    &service,
-                    &repository_id,
-                    &cursor_key,
-                    &compiler_pack_requirement,
-                    &tool,
-                    arguments,
-                    &cancellation,
-                );
+                let result = if matches!(
+                    tool.as_str(),
+                    "operation_get" | "operation_result" | "operation_cancel"
+                ) {
+                    execute_operation_tool(&operation_config, &repository_id, &tool, arguments)
+                } else {
+                    execute_catalog_read_tool(
+                        &service,
+                        &repository_id,
+                        &cursor_key,
+                        &compiler_pack_requirement,
+                        &tool,
+                        arguments,
+                        &cancellation,
+                    )
+                };
                 if cancellation.is_cancelled() {
                     Err(ToolExecutionFailure::Service(
                         DepgraphServiceError::Cancelled,
@@ -896,12 +930,20 @@ impl ServerHandler for DepgraphMcpServer {
                 &ErrorEnvelope::new(self.repository_id.clone(), error),
             )
             .map_err(internal_mapping_error)?,
+            Ok(Err(ToolExecutionFailure::Journal {
+                error,
+                operation_id,
+            })) => CanonicalResponseMapper::error(&ErrorEnvelope::new(
+                self.repository_id.clone(),
+                map_journal_error(&error, operation_id),
+            ))
+            .map_err(internal_mapping_error)?,
             Ok(Err(ToolExecutionFailure::Response(error))) => {
                 return Err(internal_mapping_error(error));
             }
             Err(error) => CanonicalResponseMapper::error(&ErrorEnvelope::new(
                 self.repository_id.clone(),
-                error.agent_error(self.runtime.deadline(RuntimeClass::Read)),
+                error.agent_error(self.runtime.deadline(runtime_class)),
             ))
             .map_err(internal_mapping_error)?,
         };
@@ -951,6 +993,272 @@ fn page_request(
         PageByteLimit::default(),
         cursor,
     ))
+}
+
+fn execute_operation_tool(
+    config: &DepgraphServiceConfig,
+    repository_id: &LogicalRepositoryId,
+    tool: &str,
+    arguments: serde_json::Map<String, serde_json::Value>,
+) -> Result<MappedToolResult, ToolExecutionFailure> {
+    let arguments = decode_arguments::<OperationArguments>(arguments)?;
+    let _ = arguments.contract_version;
+    if &arguments.repository_id != repository_id {
+        return Err(ToolExecutionFailure::Agent(AgentError::new(
+            AgentErrorCode::CapabilityDenied,
+            false,
+            AgentRemediation::EnableRequiredCapability,
+            None,
+        )));
+    }
+    let operation_id = arguments.operation_id;
+    let now_ms = system_now_ms()?;
+    let journal_failure = |error| ToolExecutionFailure::Journal {
+        error,
+        operation_id: Some(operation_id.clone()),
+    };
+
+    match tool {
+        "operation_get" => {
+            let manager = OperationManager::open(config).map_err(&journal_failure)?;
+            let operation = manager
+                .get(&operation_id, now_ms)
+                .map_err(&journal_failure)?;
+            map_operation_success(repository_id, &operation)
+        }
+        "operation_result" => {
+            let manager = OperationManager::open(config).map_err(&journal_failure)?;
+            let result = manager
+                .result(&operation_id, now_ms)
+                .map_err(&journal_failure)?;
+            match result.outcome() {
+                OperationOutcome::Completed(payload) => {
+                    let contract = PortableTerminalOutputContract::for_originating_tool(
+                        result.operation_kind().as_str(),
+                    )
+                    .ok_or_else(|| journal_failure(JournalError::IntegrityFailure))?;
+                    let output = contract
+                        .deserialize(payload.value().clone())
+                        .map_err(|_| journal_failure(JournalError::IntegrityFailure))?;
+                    if output.repository_id() != repository_id {
+                        return Err(journal_failure(JournalError::IntegrityFailure));
+                    }
+                    CanonicalResponseMapper::terminal_output(&output).map_err(Into::into)
+                }
+                OperationOutcome::Failed(payload) => {
+                    map_stored_operation_error(repository_id, &operation_id, payload.as_str())
+                }
+                OperationOutcome::Cancelled => CanonicalResponseMapper::error(&ErrorEnvelope::new(
+                    repository_id.clone(),
+                    AgentError::new(
+                        AgentErrorCode::Cancelled,
+                        false,
+                        AgentRemediation::Retry,
+                        Some(AgentErrorDetails::Operation {
+                            operation_id: operation_id.clone(),
+                        }),
+                    ),
+                ))
+                .map_err(Into::into),
+            }
+        }
+        "operation_cancel" => {
+            let mut manager = OperationManager::open(config).map_err(&journal_failure)?;
+            manager
+                .cancel(&operation_id, now_ms)
+                .map_err(&journal_failure)?;
+            let operation = manager
+                .get(&operation_id, now_ms)
+                .map_err(&journal_failure)?;
+            map_operation_success(repository_id, &operation)
+        }
+        _ => Err(ToolExecutionFailure::Service(
+            DepgraphServiceError::NotFound,
+        )),
+    }
+}
+
+fn map_operation_success(
+    repository_id: &LogicalRepositoryId,
+    operation: &OperationView,
+) -> Result<MappedToolResult, ToolExecutionFailure> {
+    let operation = project_operation(operation)?;
+    CanonicalResponseMapper::success(&SuccessEnvelope::new(
+        repository_id.clone(),
+        None,
+        operation,
+    ))
+    .map_err(Into::into)
+}
+
+fn project_operation(operation: &OperationView) -> Result<AgentOperation, ToolExecutionFailure> {
+    let timestamps = operation.timestamps();
+    let retention = operation.retention();
+    let to_u64 = |value: i64| {
+        u64::try_from(value).map_err(|_| ToolExecutionFailure::Journal {
+            error: JournalError::IntegrityFailure,
+            operation_id: Some(operation.operation_id().clone()),
+        })
+    };
+    AgentOperation::new(
+        operation.operation_id().clone(),
+        match operation.status() {
+            OperationStatus::Queued => AgentOperationStatus::Queued,
+            OperationStatus::Running => AgentOperationStatus::Running,
+            OperationStatus::Cancelling => AgentOperationStatus::Cancelling,
+            OperationStatus::Completed => AgentOperationStatus::Completed,
+            OperationStatus::Failed => AgentOperationStatus::Failed,
+            OperationStatus::Cancelled => AgentOperationStatus::Cancelled,
+        },
+        operation.progress().completed_units(),
+        operation.progress().total_units(),
+        to_u64(timestamps.created_at_ms())?,
+        to_u64(timestamps.updated_at_ms())?,
+        timestamps.terminal_at_ms().map(to_u64).transpose()?,
+        to_u64(retention.execution_deadline_ms())?,
+        to_u64(retention.retain_until_ms())?,
+    )
+    .map_err(|_| ToolExecutionFailure::Journal {
+        error: JournalError::IntegrityFailure,
+        operation_id: Some(operation.operation_id().clone()),
+    })
+}
+
+fn map_stored_operation_error(
+    repository_id: &LogicalRepositoryId,
+    operation_id: &OperationId,
+    payload: &str,
+) -> Result<MappedToolResult, ToolExecutionFailure> {
+    let error = match payload {
+        DEADLINE_EXCEEDED_ERROR_JSON => AgentError::new(
+            AgentErrorCode::ResourceExhausted,
+            false,
+            AgentRemediation::Retry,
+            Some(AgentErrorDetails::Operation {
+                operation_id: operation_id.clone(),
+            }),
+        ),
+        EXECUTION_STATE_UNKNOWN_ERROR_JSON => AgentError::new(
+            AgentErrorCode::IntegrityFailure,
+            false,
+            AgentRemediation::ContactOperator,
+            Some(AgentErrorDetails::Operation {
+                operation_id: operation_id.clone(),
+            }),
+        ),
+        UNSUPPORTED_OPERATION_ERROR_JSON => AgentError::new(
+            AgentErrorCode::Internal,
+            false,
+            AgentRemediation::ContactOperator,
+            Some(AgentErrorDetails::Operation {
+                operation_id: operation_id.clone(),
+            }),
+        ),
+        _ => {
+            let envelope = serde_json::from_str::<ErrorEnvelope>(payload).map_err(|_| {
+                ToolExecutionFailure::Journal {
+                    error: JournalError::IntegrityFailure,
+                    operation_id: Some(operation_id.clone()),
+                }
+            })?;
+            if envelope.repository_id() != repository_id {
+                return Err(ToolExecutionFailure::Journal {
+                    error: JournalError::IntegrityFailure,
+                    operation_id: Some(operation_id.clone()),
+                });
+            }
+            if matches!(
+                envelope.error().details(),
+                Some(AgentErrorDetails::Operation {
+                    operation_id: stored_operation_id,
+                }) if stored_operation_id != operation_id
+            ) {
+                return Err(ToolExecutionFailure::Journal {
+                    error: JournalError::IntegrityFailure,
+                    operation_id: Some(operation_id.clone()),
+                });
+            }
+            return CanonicalResponseMapper::error(&envelope).map_err(Into::into);
+        }
+    };
+    CanonicalResponseMapper::error(&ErrorEnvelope::new(repository_id.clone(), error))
+        .map_err(Into::into)
+}
+
+fn map_journal_error(error: &JournalError, operation_id: Option<OperationId>) -> AgentError {
+    let operation_details = || {
+        operation_id
+            .clone()
+            .map(|operation_id| AgentErrorDetails::Operation { operation_id })
+    };
+    match error {
+        JournalError::InvalidArgument => AgentError::new(
+            AgentErrorCode::InvalidArgument,
+            false,
+            AgentRemediation::CorrectInput,
+            None,
+        ),
+        JournalError::NotFound | JournalError::Expired => AgentError::new(
+            AgentErrorCode::NotFound,
+            false,
+            AgentRemediation::CorrectInput,
+            operation_details(),
+        ),
+        JournalError::RepositoryMismatch | JournalError::CapabilityDenied => AgentError::new(
+            AgentErrorCode::CapabilityDenied,
+            false,
+            AgentRemediation::EnableRequiredCapability,
+            None,
+        ),
+        JournalError::IdempotencyConflict => AgentError::new(
+            AgentErrorCode::IdempotencyConflict,
+            false,
+            AgentRemediation::CorrectInput,
+            operation_details(),
+        ),
+        JournalError::OperationNotReady | JournalError::DeadlineExceeded => AgentError::new(
+            AgentErrorCode::OperationNotReady,
+            true,
+            AgentRemediation::PollOperation,
+            operation_details(),
+        ),
+        JournalError::UnsupportedSchemaVersion
+        | JournalError::IntegrityFailure
+        | JournalError::InvalidTransition
+        | JournalError::LeaseHeld
+        | JournalError::LeaseMismatch
+        | JournalError::LeaseExpired => AgentError::new(
+            AgentErrorCode::IntegrityFailure,
+            false,
+            AgentRemediation::ContactOperator,
+            operation_details(),
+        ),
+        JournalError::Storage(_) | JournalError::Io(_) | JournalError::EntropyUnavailable => {
+            AgentError::new(
+                AgentErrorCode::Internal,
+                true,
+                AgentRemediation::ContactOperator,
+                operation_details(),
+            )
+        }
+    }
+}
+
+fn system_now_ms() -> Result<i64, ToolExecutionFailure> {
+    let milliseconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| ToolExecutionFailure::Agent(internal_agent_error()))?
+        .as_millis();
+    i64::try_from(milliseconds).map_err(|_| ToolExecutionFailure::Agent(internal_agent_error()))
+}
+
+const fn internal_agent_error() -> AgentError {
+    AgentError::new(
+        AgentErrorCode::Internal,
+        false,
+        AgentRemediation::ContactOperator,
+        None,
+    )
 }
 
 fn execute_catalog_read_tool(
@@ -2152,6 +2460,7 @@ fn build_server(args: &Args) -> Result<DepgraphMcpServer> {
     let runtime = RuntimeController::new(RuntimeConfig::default())
         .context("invalid MCP runtime configuration")?;
     Ok(DepgraphMcpServer {
+        operation_config: config.clone(),
         service: DepgraphService::new(config),
         compiler_pack,
         compiler_pack_requirement: args.compiler_pack_requirement.clone(),
@@ -2267,5 +2576,123 @@ mod tests {
             contract_mapping_error(ContractBuildError::CycleTopology),
             ToolExecutionFailure::Service(DepgraphServiceError::Integrity)
         ));
+    }
+
+    #[test]
+    fn journal_errors_map_exhaustively_without_reflecting_sources() {
+        let operation_id = OperationId::parse("op_0123456789abcdef0123456789abcdef").unwrap();
+        for (error, code, remediation, retryable) in [
+            (
+                JournalError::InvalidArgument,
+                AgentErrorCode::InvalidArgument,
+                AgentRemediation::CorrectInput,
+                false,
+            ),
+            (
+                JournalError::UnsupportedSchemaVersion,
+                AgentErrorCode::IntegrityFailure,
+                AgentRemediation::ContactOperator,
+                false,
+            ),
+            (
+                JournalError::IntegrityFailure,
+                AgentErrorCode::IntegrityFailure,
+                AgentRemediation::ContactOperator,
+                false,
+            ),
+            (
+                JournalError::NotFound,
+                AgentErrorCode::NotFound,
+                AgentRemediation::CorrectInput,
+                false,
+            ),
+            (
+                JournalError::Expired,
+                AgentErrorCode::NotFound,
+                AgentRemediation::CorrectInput,
+                false,
+            ),
+            (
+                JournalError::RepositoryMismatch,
+                AgentErrorCode::CapabilityDenied,
+                AgentRemediation::EnableRequiredCapability,
+                false,
+            ),
+            (
+                JournalError::CapabilityDenied,
+                AgentErrorCode::CapabilityDenied,
+                AgentRemediation::EnableRequiredCapability,
+                false,
+            ),
+            (
+                JournalError::IdempotencyConflict,
+                AgentErrorCode::IdempotencyConflict,
+                AgentRemediation::CorrectInput,
+                false,
+            ),
+            (
+                JournalError::OperationNotReady,
+                AgentErrorCode::OperationNotReady,
+                AgentRemediation::PollOperation,
+                true,
+            ),
+            (
+                JournalError::InvalidTransition,
+                AgentErrorCode::IntegrityFailure,
+                AgentRemediation::ContactOperator,
+                false,
+            ),
+            (
+                JournalError::LeaseHeld,
+                AgentErrorCode::IntegrityFailure,
+                AgentRemediation::ContactOperator,
+                false,
+            ),
+            (
+                JournalError::LeaseMismatch,
+                AgentErrorCode::IntegrityFailure,
+                AgentRemediation::ContactOperator,
+                false,
+            ),
+            (
+                JournalError::LeaseExpired,
+                AgentErrorCode::IntegrityFailure,
+                AgentRemediation::ContactOperator,
+                false,
+            ),
+            (
+                JournalError::DeadlineExceeded,
+                AgentErrorCode::OperationNotReady,
+                AgentRemediation::PollOperation,
+                true,
+            ),
+            (
+                JournalError::EntropyUnavailable,
+                AgentErrorCode::Internal,
+                AgentRemediation::ContactOperator,
+                true,
+            ),
+        ] {
+            let mapped = map_journal_error(&error, Some(operation_id.clone()));
+            assert_eq!(mapped.code(), code);
+            assert_eq!(mapped.remediation(), remediation);
+            assert_eq!(mapped.retryable(), retryable);
+        }
+
+        for source in [
+            JournalError::Io(io::Error::other("TOP_SECRET_IO")),
+            JournalError::Storage(rusqlite::Error::InvalidParameterName(
+                "TOP_SECRET_SQL".to_owned(),
+            )),
+        ] {
+            let mapped = map_journal_error(&source, Some(operation_id.clone()));
+            assert_eq!(mapped.code(), AgentErrorCode::Internal);
+            let encoded = serde_json::to_string(&ErrorEnvelope::new(
+                LogicalRepositoryId::parse("repository").unwrap(),
+                mapped,
+            ))
+            .unwrap();
+            assert!(!encoded.contains("TOP_SECRET"));
+        }
     }
 }

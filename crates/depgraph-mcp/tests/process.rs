@@ -4,14 +4,22 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
     sync::OnceLock,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use assert_cmd::Command as AssertCommand;
 use depgraph_core::{
-    CompilerPackBuildComponent, CompilerPackBuildSpec, CompilerPackRequirement,
-    build_compiler_pack, compiler_pack_host_target, read_compiler_pack_requirement,
-    verify_compiler_pack,
+    CompilerPackBuildComponent, CompilerPackBuildSpec, CompilerPackRequirement, DepgraphCapability,
+    DepgraphCapabilitySet, DepgraphServiceConfig, DepgraphServiceLimits, build_compiler_pack,
+    compiler_pack_host_target, read_compiler_pack_requirement, verify_compiler_pack,
+};
+use depgraph_mcp_tools::{
+    AgentDaemonStatus, AgentError, AgentErrorCode, AgentErrorDetails, AgentRemediation,
+    ErrorEnvelope, LogicalRepositoryId, SuccessEnvelope,
+};
+use depgraph_operation::{
+    CanonicalJson, LeaseOwner, OperationJournal, OperationKind, OperationManager, SubmitRequest,
+    operation_journal_path,
 };
 use depgraph_store::Store;
 use rusqlite::Connection;
@@ -876,7 +884,15 @@ struct InteractiveMcp {
 
 impl InteractiveMcp {
     fn start(root: &Path, store: &Path) -> Self {
-        let mut child = command(root, store, requirement().path()).spawn().unwrap();
+        Self::start_with_capabilities(root, store, &[])
+    }
+
+    fn start_with_capabilities(root: &Path, store: &Path, capabilities: &[&str]) -> Self {
+        let mut command = command(root, store, requirement().path());
+        for capability in capabilities {
+            command.args(["--capability", capability]);
+        }
+        let mut child = command.spawn().unwrap();
         let stdin = child.stdin.take().unwrap();
         let stdout = BufReader::new(child.stdout.take().unwrap());
         Self {
@@ -931,6 +947,104 @@ fn interactive_tool_call(mcp: &mut InteractiveMcp, id: u64, name: &str, argument
         "params": {"name": name, "arguments": arguments}
     }))["result"]
         .clone()
+}
+
+fn initialize_interactive_mcp(mcp: &mut InteractiveMcp, id: u64) {
+    let initialized = mcp.request(json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2026-07-28",
+            "capabilities": {},
+            "clientInfo": {"name": "operation-recovery-test", "version": "1"}
+        }
+    }));
+    assert_eq!(initialized["result"]["protocolVersion"], "2026-07-28");
+}
+
+fn process_now_ms() -> i64 {
+    i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap()
+}
+
+fn operation_service_config(
+    root: &Path,
+    store: &Path,
+    capabilities: impl IntoIterator<Item = DepgraphCapability>,
+) -> DepgraphServiceConfig {
+    DepgraphServiceConfig::new(
+        root,
+        store,
+        DepgraphCapabilitySet::try_new(capabilities).unwrap(),
+        DepgraphServiceLimits::default(),
+    )
+    .unwrap()
+}
+
+fn operation_journal_state_digest(config: &DepgraphServiceConfig) -> [u8; 32] {
+    let connection = Connection::open(operation_journal_path(config)).unwrap();
+    let mut digest = Sha256::new();
+    for query in [
+        "SELECT * FROM operations ORDER BY operation_id",
+        "SELECT * FROM runner_handoffs ORDER BY operation_id",
+        "SELECT * FROM operation_tombstones ORDER BY operation_id",
+    ] {
+        digest.update((query.len() as u64).to_le_bytes());
+        digest.update(query.as_bytes());
+        let mut statement = connection.prepare(query).unwrap();
+        let column_count = statement.column_count();
+        let mut rows = statement.query([]).unwrap();
+        while let Some(row) = rows.next().unwrap() {
+            use rusqlite::types::ValueRef;
+            digest.update([0xff]);
+            for index in 0..column_count {
+                match row.get_ref(index).unwrap() {
+                    ValueRef::Null => digest.update([0]),
+                    ValueRef::Integer(value) => {
+                        digest.update([1]);
+                        digest.update(value.to_le_bytes());
+                    }
+                    ValueRef::Real(value) => {
+                        digest.update([2]);
+                        digest.update(value.to_bits().to_le_bytes());
+                    }
+                    ValueRef::Text(value) => {
+                        digest.update([3]);
+                        digest.update((value.len() as u64).to_le_bytes());
+                        digest.update(value);
+                    }
+                    ValueRef::Blob(value) => {
+                        digest.update([4]);
+                        digest.update((value.len() as u64).to_le_bytes());
+                        digest.update(value);
+                    }
+                }
+            }
+        }
+    }
+    digest.finalize().into()
+}
+
+fn issue_310_daemon_status() -> AgentDaemonStatus {
+    serde_json::from_value(json!({
+        "schema_version": "depgraph-daemon-v1",
+        "phase": "stopped",
+        "started_at": "2026-08-08T00:00:00.000Z",
+        "stopped_at": "2026-08-08T00:00:01.000Z",
+        "debounce_milliseconds": 0,
+        "pending_change_count": 0,
+        "recovered_attempts": {
+            "scan_attempt_ids": [],
+            "build_attempt_ids": []
+        }
+    }))
+    .unwrap()
 }
 
 fn seed_issue_300_bulk_rows(store_path: &Path, root: &Path) -> String {
@@ -3041,6 +3155,441 @@ fn tools_list_is_profile_filtered_static_sorted_and_repeatable() {
     assert!(full.contains(&"repository_init".to_owned()));
     assert!(full.contains(&"daemon_start_submit".to_owned()));
     assert!(full.contains(&"resolve_build_submit".to_owned()));
+}
+
+#[test]
+fn issue_310_operation_baseline_recovers_across_processes_and_reauthorizes_cancel() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("repository");
+    let store_path = temporary.path().join("graph.sqlite");
+    fs::create_dir(&root).unwrap();
+    let full_config = operation_service_config(
+        &root,
+        &store_path,
+        [
+            DepgraphCapability::Read,
+            DepgraphCapability::StoreWrite,
+            DepgraphCapability::DaemonControl,
+        ],
+    );
+    let repository_id = LogicalRepositoryId::parse(full_config.logical_repository_id()).unwrap();
+    let submitted_at_ms = process_now_ms();
+    let deadline_ms = submitted_at_ms + 120_000;
+    let recoverable_request = SubmitRequest::new(
+        &full_config,
+        OperationKind::DaemonStop,
+        &json!({"fixture": "reconnect"}),
+        b"issue-310-reconnect",
+        deadline_ms,
+    )
+    .unwrap();
+    let mut manager = OperationManager::open(&full_config).unwrap();
+    let recoverable = manager
+        .submit(&recoverable_request, submitted_at_ms)
+        .unwrap();
+    let recoverable_id = recoverable.operation_id().clone();
+    let cancellable_id = manager
+        .submit(
+            &SubmitRequest::new(
+                &full_config,
+                OperationKind::ScanSubmit,
+                &json!({"fixture": "cancel"}),
+                b"issue-310-cancel",
+                deadline_ms,
+            )
+            .unwrap(),
+            submitted_at_ms + 1,
+        )
+        .unwrap()
+        .operation_id()
+        .clone();
+    let hostile_id = manager
+        .submit(
+            &SubmitRequest::new(
+                &full_config,
+                OperationKind::DaemonStop,
+                &json!({"fixture": "hostile-terminal"}),
+                b"issue-310-hostile-terminal",
+                deadline_ms,
+            )
+            .unwrap(),
+            submitted_at_ms + 2,
+        )
+        .unwrap()
+        .operation_id()
+        .clone();
+    let mismatched_id = manager
+        .submit(
+            &SubmitRequest::new(
+                &full_config,
+                OperationKind::ScanSubmit,
+                &json!({"fixture": "mismatched-terminal"}),
+                b"issue-310-mismatched-terminal",
+                deadline_ms,
+            )
+            .unwrap(),
+            submitted_at_ms + 3,
+        )
+        .unwrap()
+        .operation_id()
+        .clone();
+    let typed_failure_id = manager
+        .submit(
+            &SubmitRequest::new(
+                &full_config,
+                OperationKind::ScanSubmit,
+                &json!({"fixture": "typed-terminal-error"}),
+                b"issue-310-typed-terminal-error",
+                deadline_ms,
+            )
+            .unwrap(),
+            submitted_at_ms + 4,
+        )
+        .unwrap()
+        .operation_id()
+        .clone();
+    drop(manager);
+
+    let mut retried_manager = OperationManager::open(&full_config).unwrap();
+    let retried = retried_manager
+        .submit(&recoverable_request, submitted_at_ms + 5)
+        .unwrap();
+    assert!(!retried.created());
+    assert_eq!(retried.operation_id(), &recoverable_id);
+    drop(retried_manager);
+
+    let mut journal = OperationJournal::open(&full_config).unwrap();
+    journal
+        .acquire_lease(
+            &repository_id,
+            &cancellable_id,
+            &LeaseOwner::parse("issue-310-running").unwrap(),
+            b"issue-310-running-lease",
+            submitted_at_ms + 5,
+            submitted_at_ms + 60_000,
+        )
+        .unwrap();
+    journal
+        .acquire_lease(
+            &repository_id,
+            &hostile_id,
+            &LeaseOwner::parse("issue-310-hostile").unwrap(),
+            b"issue-310-hostile-lease",
+            submitted_at_ms + 5,
+            submitted_at_ms + 60_000,
+        )
+        .unwrap();
+    journal
+        .complete(
+            &repository_id,
+            &hostile_id,
+            b"issue-310-hostile-lease",
+            CanonicalJson::new(json!({
+                "raw_journal_secret": "MUST_NOT_REACH_AGENT"
+            }))
+            .unwrap(),
+            submitted_at_ms + 6,
+        )
+        .unwrap();
+    journal
+        .acquire_lease(
+            &repository_id,
+            &mismatched_id,
+            &LeaseOwner::parse("issue-310-mismatched").unwrap(),
+            b"issue-310-mismatched-lease",
+            submitted_at_ms + 5,
+            submitted_at_ms + 60_000,
+        )
+        .unwrap();
+    let mismatched_envelope =
+        SuccessEnvelope::new(repository_id.clone(), None, issue_310_daemon_status());
+    journal
+        .complete(
+            &repository_id,
+            &mismatched_id,
+            b"issue-310-mismatched-lease",
+            CanonicalJson::new(serde_json::to_value(&mismatched_envelope).unwrap()).unwrap(),
+            submitted_at_ms + 6,
+        )
+        .unwrap();
+    journal
+        .acquire_lease(
+            &repository_id,
+            &typed_failure_id,
+            &LeaseOwner::parse("issue-310-typed-failure").unwrap(),
+            b"issue-310-typed-failure-lease",
+            submitted_at_ms + 5,
+            submitted_at_ms + 60_000,
+        )
+        .unwrap();
+    let typed_failure_envelope = ErrorEnvelope::new(
+        repository_id.clone(),
+        AgentError::new(
+            AgentErrorCode::ResourceExhausted,
+            false,
+            AgentRemediation::Retry,
+            Some(AgentErrorDetails::Operation {
+                operation_id: typed_failure_id.clone(),
+            }),
+        ),
+    );
+    journal
+        .fail(
+            &repository_id,
+            &typed_failure_id,
+            b"issue-310-typed-failure-lease",
+            CanonicalJson::new(serde_json::to_value(&typed_failure_envelope).unwrap()).unwrap(),
+            submitted_at_ms + 6,
+        )
+        .unwrap();
+    drop(journal);
+
+    let operation_arguments = |operation_id: &depgraph_mcp_tools::OperationId| {
+        json!({
+            "contract_version": "depgraph-mcp-tools-v1",
+            "repository_id": "repository",
+            "operation_id": operation_id
+        })
+    };
+
+    let mut first_server = InteractiveMcp::start(&root, &store_path);
+    initialize_interactive_mcp(&mut first_server, 1);
+    let queued = interactive_tool_call(
+        &mut first_server,
+        2,
+        "operation_get",
+        operation_arguments(&recoverable_id),
+    );
+    assert_eq!(queued["isError"], false);
+    assert_eq!(queued["structuredContent"]["result"]["status"], "queued");
+    assert_eq!(
+        queued["structuredContent"]["result"]["operation_id"],
+        recoverable_id.as_str()
+    );
+    assert_tool_text_matches_structured(&queued);
+
+    let not_ready = interactive_tool_call(
+        &mut first_server,
+        3,
+        "operation_result",
+        operation_arguments(&recoverable_id),
+    );
+    assert_eq!(not_ready["isError"], true);
+    assert_eq!(
+        not_ready["structuredContent"]["error"]["code"],
+        "OPERATION_NOT_READY"
+    );
+    assert_eq!(
+        not_ready["structuredContent"]["error"]["details"]["operation_id"],
+        recoverable_id.as_str()
+    );
+    assert_tool_text_matches_structured(&not_ready);
+
+    let running = interactive_tool_call(
+        &mut first_server,
+        4,
+        "operation_get",
+        operation_arguments(&cancellable_id),
+    );
+    assert_eq!(running["structuredContent"]["result"]["status"], "running");
+
+    let before_denied = operation_journal_state_digest(&full_config);
+    let denied = interactive_tool_call(
+        &mut first_server,
+        5,
+        "operation_cancel",
+        operation_arguments(&cancellable_id),
+    );
+    assert_eq!(denied["isError"], true);
+    assert_eq!(
+        denied["structuredContent"]["error"]["code"],
+        "CAPABILITY_DENIED"
+    );
+    assert_eq!(operation_journal_state_digest(&full_config), before_denied);
+
+    let repository_denied = interactive_tool_call(
+        &mut first_server,
+        6,
+        "operation_get",
+        json!({
+            "contract_version": "depgraph-mcp-tools-v1",
+            "repository_id": "foreign-repository",
+            "operation_id": recoverable_id
+        }),
+    );
+    assert_eq!(
+        repository_denied["structuredContent"]["error"]["code"],
+        "CAPABILITY_DENIED"
+    );
+    assert_eq!(operation_journal_state_digest(&full_config), before_denied);
+
+    let hostile = interactive_tool_call(
+        &mut first_server,
+        7,
+        "operation_result",
+        operation_arguments(&hostile_id),
+    );
+    assert_eq!(hostile["isError"], true);
+    assert_eq!(
+        hostile["structuredContent"]["error"]["code"],
+        "INTEGRITY_FAILURE"
+    );
+    assert!(!hostile.to_string().contains("MUST_NOT_REACH_AGENT"));
+
+    let mismatched = interactive_tool_call(
+        &mut first_server,
+        8,
+        "operation_result",
+        operation_arguments(&mismatched_id),
+    );
+    assert_eq!(mismatched["isError"], true);
+    assert_eq!(
+        mismatched["structuredContent"]["error"]["code"],
+        "INTEGRITY_FAILURE"
+    );
+    assert!(!mismatched.to_string().contains("depgraph-daemon-v1"));
+
+    let typed_failure = interactive_tool_call(
+        &mut first_server,
+        9,
+        "operation_result",
+        operation_arguments(&typed_failure_id),
+    );
+    assert_eq!(typed_failure["isError"], true);
+    assert_eq!(
+        typed_failure["structuredContent"],
+        serde_json::to_value(&typed_failure_envelope).unwrap()
+    );
+    assert_tool_text_matches_structured(&typed_failure);
+    first_server.finish();
+
+    let terminal_at_ms = submitted_at_ms + 7;
+    let terminal_envelope =
+        SuccessEnvelope::new(repository_id.clone(), None, issue_310_daemon_status());
+    let mut journal = OperationJournal::open(&full_config).unwrap();
+    journal
+        .acquire_lease(
+            &repository_id,
+            &recoverable_id,
+            &LeaseOwner::parse("issue-310-reconnected-runner").unwrap(),
+            b"issue-310-reconnected-lease",
+            terminal_at_ms - 1,
+            terminal_at_ms + 30_000,
+        )
+        .unwrap();
+    journal
+        .complete(
+            &repository_id,
+            &recoverable_id,
+            b"issue-310-reconnected-lease",
+            CanonicalJson::new(serde_json::to_value(&terminal_envelope).unwrap()).unwrap(),
+            terminal_at_ms,
+        )
+        .unwrap();
+    drop(journal);
+
+    let mut restarted = InteractiveMcp::start(&root, &store_path);
+    initialize_interactive_mcp(&mut restarted, 10);
+    let terminal = interactive_tool_call(
+        &mut restarted,
+        11,
+        "operation_get",
+        operation_arguments(&recoverable_id),
+    );
+    assert_eq!(
+        terminal["structuredContent"]["result"]["status"],
+        "completed"
+    );
+    let recovered_result = interactive_tool_call(
+        &mut restarted,
+        12,
+        "operation_result",
+        operation_arguments(&recoverable_id),
+    );
+    assert_eq!(recovered_result["isError"], false);
+    assert_eq!(
+        recovered_result["structuredContent"],
+        serde_json::to_value(&terminal_envelope).unwrap()
+    );
+    assert_tool_text_matches_structured(&recovered_result);
+    restarted.finish();
+
+    let mut privileged = InteractiveMcp::start_with_capabilities(
+        &root,
+        &store_path,
+        &["store-write", "daemon-control"],
+    );
+    initialize_interactive_mcp(&mut privileged, 20);
+    let before_unknown = operation_journal_state_digest(&full_config);
+    let unknown_cancel = interactive_tool_call(
+        &mut privileged,
+        21,
+        "operation_cancel",
+        json!({
+            "contract_version": "depgraph-mcp-tools-v1",
+            "repository_id": "repository",
+            "operation_id": "op_ffffffffffffffffffffffffffffffff"
+        }),
+    );
+    assert_eq!(unknown_cancel["isError"], true);
+    assert_eq!(
+        unknown_cancel["structuredContent"]["error"]["code"],
+        "NOT_FOUND"
+    );
+    assert_eq!(operation_journal_state_digest(&full_config), before_unknown);
+
+    let cancelled = interactive_tool_call(
+        &mut privileged,
+        22,
+        "operation_cancel",
+        operation_arguments(&cancellable_id),
+    );
+    assert_eq!(cancelled["isError"], false);
+    assert_eq!(
+        cancelled["structuredContent"]["result"]["status"],
+        "cancelling"
+    );
+
+    let mut journal = OperationJournal::open(&full_config).unwrap();
+    journal
+        .mark_cancelled(
+            &repository_id,
+            &cancellable_id,
+            b"issue-310-running-lease",
+            process_now_ms(),
+        )
+        .unwrap();
+    drop(journal);
+    let cancelled_result = interactive_tool_call(
+        &mut privileged,
+        23,
+        "operation_result",
+        operation_arguments(&cancellable_id),
+    );
+    assert_eq!(cancelled_result["isError"], true);
+    assert_eq!(
+        cancelled_result["structuredContent"]["error"]["code"],
+        "CANCELLED"
+    );
+    assert_tool_text_matches_structured(&cancelled_result);
+
+    let before_terminal_noop = operation_journal_state_digest(&full_config);
+    let terminal_noop = interactive_tool_call(
+        &mut privileged,
+        24,
+        "operation_cancel",
+        operation_arguments(&recoverable_id),
+    );
+    assert_eq!(terminal_noop["isError"], false);
+    assert_eq!(
+        terminal_noop["structuredContent"]["result"]["status"],
+        "completed"
+    );
+    assert_eq!(
+        operation_journal_state_digest(&full_config),
+        before_terminal_noop
+    );
+    privileged.finish();
 }
 
 const EXPECTED_READ_ONLY_TOOLS: &[&str] = &[

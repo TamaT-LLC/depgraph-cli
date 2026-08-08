@@ -448,6 +448,75 @@ fn operation_cancel_is_always_discoverable_but_requires_record_capabilities() {
 }
 
 #[test]
+fn operation_baseline_tools_advertise_their_exact_closed_outputs() {
+    let catalog = ToolCatalog::for_capabilities(&DepgraphCapabilitySet::read_only()).unwrap();
+    let operation_id = format!("op_{}", "a".repeat(32));
+    let operation = serde_json::json!({
+        "contract_version": "depgraph-mcp-tools-v1",
+        "repository_id": "repository",
+        "result": {
+            "operation_id": operation_id,
+            "status": "queued",
+            "progress": {"completed_units": 0, "total_units": 1},
+            "timestamps": {"created_at_ms": 1000, "updated_at_ms": 1000},
+            "retention": {"execution_deadline_ms": 2000, "retain_until_ms": 3000}
+        }
+    });
+    for name in ["operation_get", "operation_cancel"] {
+        let tool = catalog.tool(name).unwrap();
+        let output = Value::Object(tool.output_schema().clone());
+        let encoded = output.to_string();
+        assert!(encoded.contains("AgentOperation"), "{name}: {encoded}");
+        assert!(!encoded.contains("\"result\":true"), "{name}: {encoded}");
+        let validator = jsonschema::draft202012::new(&output).unwrap();
+        assert!(
+            validator.is_valid(&operation),
+            "{name} rejected {operation}"
+        );
+        let mut raw = operation.clone();
+        raw["result"]["journal_payload"] = serde_json::json!({"arbitrary": true});
+        assert!(
+            !validator.is_valid(&raw),
+            "{name} accepted raw journal data"
+        );
+    }
+
+    let terminal_daemon = serde_json::json!({
+        "contract_version": "depgraph-mcp-tools-v1",
+        "repository_id": "repository",
+        "result": {
+            "schema_version": "depgraph-daemon-v1",
+            "phase": "stopped",
+            "started_at": "2026-08-08T00:00:00.000Z",
+            "stopped_at": "2026-08-08T00:00:01.000Z",
+            "debounce_milliseconds": 0,
+            "pending_change_count": 0,
+            "recovered_attempts": {
+                "scan_attempt_ids": [],
+                "build_attempt_ids": []
+            }
+        }
+    });
+    let result_tool = catalog.tool("operation_result").unwrap();
+    let result_output = Value::Object(result_tool.output_schema().clone());
+    let encoded = result_output.to_string();
+    assert!(encoded.contains("AgentDaemonStatus"), "{encoded}");
+    assert!(!encoded.contains("AgentOperation\""), "{encoded}");
+    assert!(!encoded.contains("\"result\":true"), "{encoded}");
+    let validator = jsonschema::draft202012::new(&result_output).unwrap();
+    assert!(validator.is_valid(&terminal_daemon));
+    assert!(
+        !validator.is_valid(&operation),
+        "operation_result advertised AgentOperation"
+    );
+    assert!(!validator.is_valid(&serde_json::json!({
+        "contract_version": "depgraph-mcp-tools-v1",
+        "repository_id": "repository",
+        "result": {"arbitrary": true}
+    })));
+}
+
+#[test]
 fn catalog_schemas_compile_are_closed_and_are_deterministic() {
     let capabilities = full_capabilities();
     let first = ToolCatalog::for_capabilities(&capabilities).unwrap();

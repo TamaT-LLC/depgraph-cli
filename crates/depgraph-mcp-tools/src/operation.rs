@@ -2,8 +2,301 @@ use std::borrow::Cow;
 
 use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
+use serde_json::Value;
 
-use crate::{ContractBuildError, ContractVersion, OperationId, TaskId};
+use crate::{
+    AgentDaemonStatus, ContractBuildError, ContractVersion, LogicalRepositoryId, OperationId,
+    SuccessEnvelope, TaskId,
+};
+
+/// Closed terminal output contracts registered for durable submit tools.
+///
+/// This enum is intentionally separate from the journal's operation kind so
+/// `depgraph-mcp-tools` remains the owner of public tool shapes. Callers must
+/// derive it from the validated journal kind's stable tool name. Kinds whose
+/// future domain outcome DTO is not frozen are deliberately absent and fail
+/// closed until that originating tool registers its exact output contract.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PortableTerminalOutputContract {
+    DaemonStartSubmit,
+    DaemonStop,
+}
+
+impl PortableTerminalOutputContract {
+    #[must_use]
+    pub fn for_originating_tool(tool_name: &str) -> Option<Self> {
+        match tool_name {
+            "daemon_start_submit" => Some(Self::DaemonStartSubmit),
+            "daemon_stop" => Some(Self::DaemonStop),
+            _ => None,
+        }
+    }
+
+    /// Deserialize only the closed envelope shape assigned to the originating
+    /// submit tool. Unknown fields, another tool's output, and arbitrary JSON
+    /// are rejected before the value can reach the canonical response mapper.
+    pub fn deserialize(
+        self,
+        value: Value,
+    ) -> Result<PortableTerminalOutput, PortableTerminalOutputError> {
+        match self {
+            Self::DaemonStartSubmit | Self::DaemonStop => {
+                let envelope = serde_json::from_value::<SuccessEnvelope<AgentDaemonStatus>>(value)
+                    .map_err(|_| PortableTerminalOutputError)?;
+                if envelope.snapshot_id().is_some() {
+                    return Err(PortableTerminalOutputError);
+                }
+                Ok(PortableTerminalOutput(
+                    PortableTerminalOutputEnvelope::DaemonStatus(envelope),
+                ))
+            }
+        }
+    }
+}
+
+/// A validated terminal success envelope. Serde is intentionally one-way:
+/// journal JSON can enter this type only through a kind-specific contract.
+#[derive(Clone, Debug, Serialize)]
+#[serde(transparent)]
+pub struct PortableTerminalOutput(PortableTerminalOutputEnvelope);
+
+#[derive(Clone, Debug, JsonSchema, Serialize)]
+#[serde(untagged)]
+enum PortableTerminalOutputEnvelope {
+    DaemonStatus(SuccessEnvelope<AgentDaemonStatus>),
+}
+
+impl JsonSchema for PortableTerminalOutput {
+    fn schema_name() -> Cow<'static, str> {
+        "PortableTerminalOutput".into()
+    }
+
+    fn schema_id() -> Cow<'static, str> {
+        concat!(module_path!(), "::PortableTerminalOutput").into()
+    }
+
+    fn json_schema(generator: &mut SchemaGenerator) -> Schema {
+        PortableTerminalOutputEnvelope::json_schema(generator)
+    }
+}
+
+impl PortableTerminalOutput {
+    #[must_use]
+    pub const fn repository_id(&self) -> &LogicalRepositoryId {
+        match &self.0 {
+            PortableTerminalOutputEnvelope::DaemonStatus(envelope) => envelope.repository_id(),
+        }
+    }
+}
+
+/// Closed failure for a stored terminal payload that does not satisfy its
+/// originating tool contract. The error deliberately carries no source JSON.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[error("terminal operation output does not match its closed tool contract")]
+pub struct PortableTerminalOutputError;
+
+/// Portable, agent-safe state of a durable operation. Journal input, digests,
+/// capability sets, leases, and runner handoff data are intentionally absent.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentOperation {
+    operation_id: OperationId,
+    status: AgentOperationStatus,
+    progress: AgentOperationProgress,
+    timestamps: AgentOperationTimestamps,
+    retention: AgentOperationRetention,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentOperationStatus {
+    Queued,
+    Running,
+    Cancelling,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl AgentOperationStatus {
+    #[must_use]
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentOperationProgress {
+    completed_units: u64,
+    total_units: u64,
+}
+
+impl AgentOperationProgress {
+    #[must_use]
+    pub const fn completed_units(self) -> u64 {
+        self.completed_units
+    }
+
+    #[must_use]
+    pub const fn total_units(self) -> u64 {
+        self.total_units
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentOperationTimestamps {
+    created_at_ms: u64,
+    updated_at_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    terminal_at_ms: Option<u64>,
+}
+
+impl AgentOperationTimestamps {
+    #[must_use]
+    pub const fn created_at_ms(self) -> u64 {
+        self.created_at_ms
+    }
+
+    #[must_use]
+    pub const fn updated_at_ms(self) -> u64 {
+        self.updated_at_ms
+    }
+
+    #[must_use]
+    pub const fn terminal_at_ms(self) -> Option<u64> {
+        self.terminal_at_ms
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentOperationRetention {
+    execution_deadline_ms: u64,
+    retain_until_ms: u64,
+}
+
+impl AgentOperationRetention {
+    #[must_use]
+    pub const fn execution_deadline_ms(self) -> u64 {
+        self.execution_deadline_ms
+    }
+
+    #[must_use]
+    pub const fn retain_until_ms(self) -> u64 {
+        self.retain_until_ms
+    }
+}
+
+impl AgentOperation {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        operation_id: OperationId,
+        status: AgentOperationStatus,
+        completed_units: u64,
+        total_units: u64,
+        created_at_ms: u64,
+        updated_at_ms: u64,
+        terminal_at_ms: Option<u64>,
+        execution_deadline_ms: u64,
+        retain_until_ms: u64,
+    ) -> Result<Self, ContractBuildError> {
+        let terminal_timing_is_valid = match terminal_at_ms {
+            Some(terminal_at_ms) => {
+                status.is_terminal()
+                    && terminal_at_ms == updated_at_ms
+                    && terminal_at_ms <= execution_deadline_ms
+            }
+            None => !status.is_terminal(),
+        };
+        if total_units == 0
+            || completed_units > total_units
+            || (status == AgentOperationStatus::Completed && completed_units != total_units)
+            || created_at_ms > updated_at_ms
+            || updated_at_ms > execution_deadline_ms
+            || execution_deadline_ms <= created_at_ms
+            || retain_until_ms < execution_deadline_ms
+            || retain_until_ms < terminal_at_ms.unwrap_or(0)
+            || !terminal_timing_is_valid
+        {
+            return Err(ContractBuildError::AgentDtoValue);
+        }
+        Ok(Self {
+            operation_id,
+            status,
+            progress: AgentOperationProgress {
+                completed_units,
+                total_units,
+            },
+            timestamps: AgentOperationTimestamps {
+                created_at_ms,
+                updated_at_ms,
+                terminal_at_ms,
+            },
+            retention: AgentOperationRetention {
+                execution_deadline_ms,
+                retain_until_ms,
+            },
+        })
+    }
+
+    #[must_use]
+    pub const fn operation_id(&self) -> &OperationId {
+        &self.operation_id
+    }
+
+    #[must_use]
+    pub const fn status(&self) -> AgentOperationStatus {
+        self.status
+    }
+
+    #[must_use]
+    pub const fn progress(&self) -> AgentOperationProgress {
+        self.progress
+    }
+
+    #[must_use]
+    pub const fn timestamps(&self) -> AgentOperationTimestamps {
+        self.timestamps
+    }
+
+    #[must_use]
+    pub const fn retention(&self) -> AgentOperationRetention {
+        self.retention
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentOperationWire {
+    operation_id: OperationId,
+    status: AgentOperationStatus,
+    progress: AgentOperationProgress,
+    timestamps: AgentOperationTimestamps,
+    retention: AgentOperationRetention,
+}
+
+impl<'de> Deserialize<'de> for AgentOperation {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = AgentOperationWire::deserialize(deserializer)?;
+        Self::new(
+            wire.operation_id,
+            wire.status,
+            wire.progress.completed_units,
+            wire.progress.total_units,
+            wire.timestamps.created_at_ms,
+            wire.timestamps.updated_at_ms,
+            wire.timestamps.terminal_at_ms,
+            wire.retention.execution_deadline_ms,
+            wire.retention.retain_until_ms,
+        )
+        .map_err(D::Error::custom)
+    }
+}
 
 pub const TASK_POLL_INTERVAL_MS: u32 = 1_000;
 pub const MIN_TASK_TTL_MS: u64 = 7 * 24 * 60 * 60 * 1_000;

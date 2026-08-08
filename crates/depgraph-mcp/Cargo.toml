@@ -14,6 +14,7 @@ anyhow.workspace = true
 clap.workspace = true
 depgraph-core = { path = "../depgraph-core" }
 depgraph-mcp-tools = { path = "../depgraph-mcp-tools" }
+depgraph-operation = { path = "../depgraph-operation" }
 rmcp = { version = "=3.1.0", default-features = false, features = ["server", "transport-io"] }
 serde.workspace = true
 serde_json.workspace = true

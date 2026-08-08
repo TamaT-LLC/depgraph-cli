@@ -9,11 +9,12 @@ use crate::{
     AgentCorrelationStatus, AgentCoverage, AgentCurrentSnapshot, AgentCycle, AgentCycleLevel,
     AgentDaemonStatus, AgentDependenciesResponse, AgentDoctor, AgentEdge, AgentEvidence,
     AgentGraphExportResponse, AgentImpact, AgentImpactResponse, AgentNamedSnapshot, AgentNode,
-    AgentNodeSummary, AgentPathResponse, AgentPathStep, AgentPolicyEvaluationResponse,
-    AgentProfilePlan, AgentQueryRow, AgentQueryValue, AgentRuntimeTraceEvent,
-    AgentRuntimeValidationResponse, AgentSite, AgentSnapshot, AgentSnapshotDiffResponse,
-    AgentUnresolved, CommonRequest, DurableSubmitResult, ErrorEnvelope, OperationAccepted, Page,
-    PageRequest, SnapshotSelector, SuccessEnvelope, TaskAccepted,
+    AgentNodeSummary, AgentOperation, AgentPathResponse, AgentPathStep,
+    AgentPolicyEvaluationResponse, AgentProfilePlan, AgentQueryRow, AgentQueryValue,
+    AgentRuntimeTraceEvent, AgentRuntimeValidationResponse, AgentSite, AgentSnapshot,
+    AgentSnapshotDiffResponse, AgentUnresolved, CommonRequest, DurableSubmitResult, ErrorEnvelope,
+    OperationAccepted, Page, PageRequest, PortableTerminalOutput, SnapshotSelector,
+    SuccessEnvelope, TaskAccepted,
 };
 
 pub const MCP_TOOLS_SCHEMA_ID: &str =
@@ -63,6 +64,7 @@ impl JsonSchema for McpToolsV1Schema {
             generator.subschema_for::<SuccessEnvelope<AgentSnapshotDiffResponse>>(),
             generator.subschema_for::<SuccessEnvelope<AgentPolicyEvaluationResponse>>(),
             generator.subschema_for::<SuccessEnvelope<AgentGraphExportResponse>>(),
+            generator.subschema_for::<SuccessEnvelope<AgentOperation>>(),
             generator.subschema_for::<SuccessEnvelope<Page<AgentNode>>>(),
             generator.subschema_for::<SuccessEnvelope<Page<AgentNodeSummary>>>(),
             generator.subschema_for::<SuccessEnvelope<Page<AgentNamedSnapshot>>>(),
@@ -70,6 +72,7 @@ impl JsonSchema for McpToolsV1Schema {
             generator.subschema_for::<OperationAccepted>(),
             generator.subschema_for::<TaskAccepted>(),
             generator.subschema_for::<DurableSubmitResult>(),
+            generator.subschema_for::<PortableTerminalOutput>(),
             generator.subschema_for::<AgentNode>(),
             generator.subschema_for::<AgentNodeSummary>(),
             generator.subschema_for::<AgentCoverage>(),
@@ -98,6 +101,7 @@ impl JsonSchema for McpToolsV1Schema {
             generator.subschema_for::<AgentSnapshotDiffResponse>(),
             generator.subschema_for::<AgentPolicyEvaluationResponse>(),
             generator.subschema_for::<AgentGraphExportResponse>(),
+            generator.subschema_for::<AgentOperation>(),
             generator.subschema_for::<AgentSnapshot>(),
         ];
         json_schema!({

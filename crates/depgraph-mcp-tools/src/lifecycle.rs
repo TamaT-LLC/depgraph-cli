@@ -5,7 +5,7 @@ use depgraph_core::{
     IncrementalChangeKind, IncrementalFileChange, RepositoryProfilePlanPreview,
 };
 use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
-use serde::Serialize;
+use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use serde_json::Value;
 
 use crate::{
@@ -77,7 +77,7 @@ impl JsonSchema for AgentProfilePlan {
     }
 }
 
-#[derive(Clone, Copy, Debug, JsonSchema, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, JsonSchema, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentDaemonPhase {
     Idle,
@@ -101,7 +101,7 @@ impl From<DaemonPhase> for AgentDaemonPhase {
     }
 }
 
-#[derive(Clone, Copy, Debug, JsonSchema, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, JsonSchema, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentDaemonChangeKind {
     Added,
@@ -121,7 +121,7 @@ impl From<IncrementalChangeKind> for AgentDaemonChangeKind {
     }
 }
 
-#[derive(Clone, Debug, JsonSchema, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentDaemonChange {
     kind: AgentDaemonChangeKind,
@@ -151,7 +151,7 @@ impl TryFrom<IncrementalFileChange> for AgentDaemonChange {
     }
 }
 
-#[derive(Clone, Debug, JsonSchema, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentDaemonTrace {
     schema_version: AgentToken,
@@ -179,7 +179,7 @@ impl TryFrom<DaemonIncrementalTrace> for AgentDaemonTrace {
     }
 }
 
-#[derive(Clone, Debug, JsonSchema, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentDaemonAttempt {
     attempt_id: AgentId,
@@ -189,6 +189,7 @@ pub struct AgentDaemonAttempt {
     started_at: AgentLabel,
     finished_at: AgentLabel,
     #[schemars(length(max = 100000))]
+    #[serde(deserialize_with = "deserialize_daemon_changes")]
     changes: Vec<AgentDaemonChange>,
     #[serde(skip_serializing_if = "Option::is_none")]
     base_snapshot_id: Option<SnapshotId>,
@@ -226,16 +227,18 @@ impl TryFrom<DaemonAttempt> for AgentDaemonAttempt {
     }
 }
 
-#[derive(Clone, Debug, JsonSchema, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentRecoveredAttempts {
     #[schemars(length(max = 1024))]
+    #[serde(deserialize_with = "deserialize_lifecycle_ids")]
     scan_attempt_ids: Vec<AgentId>,
     #[schemars(length(max = 1024))]
+    #[serde(deserialize_with = "deserialize_lifecycle_ids")]
     build_attempt_ids: Vec<AgentId>,
 }
 
-#[derive(Clone, Debug, JsonSchema, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentDaemonStatus {
     schema_version: AgentToken,
@@ -254,6 +257,28 @@ pub struct AgentDaemonStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     last_cancelled_attempt: Option<AgentDaemonAttempt>,
     recovered_attempts: AgentRecoveredAttempts,
+}
+
+fn deserialize_daemon_changes<'de, D>(deserializer: D) -> Result<Vec<AgentDaemonChange>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let changes = Vec::deserialize(deserializer)?;
+    if changes.len() > MAX_DAEMON_CHANGES {
+        return Err(D::Error::custom("too many daemon changes"));
+    }
+    Ok(changes)
+}
+
+fn deserialize_lifecycle_ids<'de, D>(deserializer: D) -> Result<Vec<AgentId>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let ids = Vec::deserialize(deserializer)?;
+    if ids.len() > MAX_LIFECYCLE_ITEMS {
+        return Err(D::Error::custom("too many lifecycle identifiers"));
+    }
+    Ok(ids)
 }
 
 impl TryFrom<DaemonStatus> for AgentDaemonStatus {

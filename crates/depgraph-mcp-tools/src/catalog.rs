@@ -10,10 +10,11 @@ use crate::{
     AgentCompletedSnapshot, AgentContext, AgentCycle, AgentCycleLevel, AgentDaemonStatus,
     AgentDependenciesResponse, AgentDoctor, AgentEdge, AgentEvidence, AgentGraphExportResponse,
     AgentId, AgentImpactResponse, AgentLabel, AgentLocator, AgentNamedSnapshot, AgentNode,
-    AgentNodeSummary, AgentPathResponse, AgentPolicyEvaluationResponse, AgentProfilePlan,
-    AgentQueryRow, AgentRuntimeValidationResponse, AgentSite, AgentSnapshotDiffResponse,
-    AgentUnresolved, Cursor, ErrorEnvelope, LogicalRepositoryId, MCP_TOOLS_CONTRACT_VERSION,
-    OperationId, Page, RepositoryRelativePath, SnapshotId, SnapshotName, SuccessEnvelope,
+    AgentNodeSummary, AgentOperation, AgentPathResponse, AgentPolicyEvaluationResponse,
+    AgentProfilePlan, AgentQueryRow, AgentRuntimeValidationResponse, AgentSite,
+    AgentSnapshotDiffResponse, AgentUnresolved, Cursor, ErrorEnvelope, LogicalRepositoryId,
+    MCP_TOOLS_CONTRACT_VERSION, OperationId, Page, PortableTerminalOutput, RepositoryRelativePath,
+    SnapshotId, SnapshotName, SuccessEnvelope,
 };
 
 #[allow(dead_code)]
@@ -21,6 +22,14 @@ use crate::{
 #[serde(untagged)]
 enum ExactToolOutput<T> {
     Success(SuccessEnvelope<T>),
+    Error(ErrorEnvelope),
+}
+
+#[allow(dead_code)]
+#[derive(JsonSchema)]
+#[serde(untagged)]
+enum ExactOperationResultOutput {
+    Success(Box<PortableTerminalOutput>),
     Error(ErrorEnvelope),
 }
 
@@ -568,8 +577,8 @@ const TOOL_SPECS: &[ToolSpec] = &[
     ),
     tool_spec!(
         "operation_result",
-        "Read a completed durable operation result with pagination.",
-        ["operation_id", "cursor", "limit"],
+        "Read a completed durable operation result.",
+        ["operation_id"],
         [],
         READ,
         ToolAuthorization::FixedCapabilities,
@@ -795,6 +804,10 @@ fn output_schema(spec: &ToolSpec) -> Map<String, Value> {
         "graph_export" => {
             return exact_success_output_schema::<AgentGraphExportResponse>(spec.name);
         }
+        "operation_get" | "operation_cancel" => {
+            return exact_success_output_schema::<AgentOperation>(spec.name);
+        }
+        "operation_result" => return exact_operation_result_output_schema(spec.name),
         _ => {}
     }
     let immediate = json!({
@@ -911,6 +924,21 @@ fn exact_success_output_schema<T: JsonSchema>(tool_name: &str) -> Map<String, Va
     schema
         .as_object_mut()
         .expect("root success envelope schema is an object")
+        .insert("title".to_owned(), json!(format!("{tool_name}_output")));
+    json_object(schema)
+}
+
+fn exact_operation_result_output_schema(tool_name: &str) -> Map<String, Value> {
+    let mut schema = serde_json::to_value(
+        SchemaSettings::draft2020_12()
+            .for_serialize()
+            .into_generator()
+            .into_root_schema_for::<ExactOperationResultOutput>(),
+    )
+    .expect("closed terminal output schemas serialize");
+    schema
+        .as_object_mut()
+        .expect("root terminal output schema is an object")
         .insert("title".to_owned(), json!(format!("{tool_name}_output")));
     json_object(schema)
 }

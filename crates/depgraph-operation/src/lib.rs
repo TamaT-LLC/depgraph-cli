@@ -1082,6 +1082,7 @@ impl OperationHandle {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OperationResultView {
     operation: OperationView,
+    operation_kind: OperationKind,
     outcome: OperationOutcome,
 }
 
@@ -1089,6 +1090,13 @@ impl OperationResultView {
     #[must_use]
     pub const fn operation(&self) -> &OperationView {
         &self.operation
+    }
+
+    /// Originating durable submit kind used to validate the stored terminal
+    /// payload against the corresponding closed tool contract.
+    #[must_use]
+    pub const fn operation_kind(&self) -> OperationKind {
+        self.operation_kind
     }
 
     #[must_use]
@@ -2277,9 +2285,14 @@ impl OperationManager {
     ) -> Result<OperationResultView, JournalError> {
         let record = self.authorized_read(operation_id, now_ms)?;
         let operation = OperationView::from_record(&record);
+        let operation_kind = record.kind;
         let outcome = terminal_outcome(record)?;
         self.revalidate_root()?;
-        Ok(OperationResultView { operation, outcome })
+        Ok(OperationResultView {
+            operation,
+            operation_kind,
+            outcome,
+        })
     }
 
     /// Record cooperative cancellation only when the sealed current authority

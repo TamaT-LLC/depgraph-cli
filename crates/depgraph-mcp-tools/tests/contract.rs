@@ -3,21 +3,22 @@ use std::num::NonZeroU32;
 use depgraph_mcp_tools::{
     AcceptedOperationStatus, AgentCapability, AgentChangedSince, AgentCompletedSnapshot,
     AgentCondition, AgentContext, AgentCorrelationDifference, AgentCorrelationStatus,
-    AgentCoverage, AgentCurrentSnapshot, AgentCycle, AgentCycleLevel, AgentDependenciesResponse,
-    AgentDependencyDirection, AgentEdge, AgentError, AgentErrorCategory, AgentErrorCode,
-    AgentErrorDetails, AgentEvidence, AgentEvidenceKind, AgentGraphExportResponse, AgentImpact,
-    AgentImpactResponse, AgentLocator, AgentNamedSnapshot, AgentNode, AgentNodeSummary,
-    AgentPathResponse, AgentPathStep, AgentPhase, AgentPolicyAnnotation, AgentPolicyApiChange,
-    AgentPolicyEvaluationResponse, AgentPolicyViolation, AgentPrecision, AgentQueryRow,
-    AgentRemediation, AgentResolutionStatus, AgentResourceLimit, AgentRuntimeValidationResponse,
-    AgentSite, AgentSnapshot, AgentSnapshotDiffResponse, AgentSourcePosition, AgentSourceSpan,
-    AgentUnresolved, CommonRequest, ContractBuildError, Cursor, DurableSubmitResult, ErrorEnvelope,
+    AgentCoverage, AgentCurrentSnapshot, AgentCycle, AgentCycleLevel, AgentDaemonStatus,
+    AgentDependenciesResponse, AgentDependencyDirection, AgentEdge, AgentError, AgentErrorCategory,
+    AgentErrorCode, AgentErrorDetails, AgentEvidence, AgentEvidenceKind, AgentGraphExportResponse,
+    AgentImpact, AgentImpactResponse, AgentLocator, AgentNamedSnapshot, AgentNode,
+    AgentNodeSummary, AgentOperation, AgentOperationStatus, AgentPathResponse, AgentPathStep,
+    AgentPhase, AgentPolicyAnnotation, AgentPolicyApiChange, AgentPolicyEvaluationResponse,
+    AgentPolicyViolation, AgentPrecision, AgentQueryRow, AgentRemediation, AgentResolutionStatus,
+    AgentResourceLimit, AgentRuntimeValidationResponse, AgentSite, AgentSnapshot,
+    AgentSnapshotDiffResponse, AgentSourcePosition, AgentSourceSpan, AgentUnresolved,
+    CommonRequest, ContractBuildError, Cursor, DurableSubmitResult, ErrorEnvelope,
     LogicalRepositoryId, MAX_AGENT_CHANGED_FIELDS, MAX_AGENT_CONDITION_BYTES,
     MAX_AGENT_CORRELATION_REASONS, MAX_AGENT_CYCLE_NODES, MAX_AGENT_PHASES, MAX_AGENT_QUERY_VALUES,
     MAX_PAGE_BYTES, MAX_PAGE_ITEMS, MAX_TASK_TTL_MS, MIN_TASK_TTL_MS, OperationAccepted,
-    OperationRecoveryTools, Page, PageByteLimit, PageRequest, PageSize, RepositoryRelativePath,
-    SnapshotId, SnapshotSelector, SuccessEnvelope, TASK_POLL_INTERVAL_MS, TaskAccepted,
-    TasksNegotiation, canonical_json_bytes,
+    OperationRecoveryTools, Page, PageByteLimit, PageRequest, PageSize,
+    PortableTerminalOutputContract, RepositoryRelativePath, SnapshotId, SnapshotSelector,
+    SuccessEnvelope, TASK_POLL_INTERVAL_MS, TaskAccepted, TasksNegotiation, canonical_json_bytes,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -145,6 +146,36 @@ fn completed_snapshot() -> AgentCompletedSnapshot {
         }
     }))
     .expect("representative completed snapshot")
+}
+
+#[test]
+fn portable_terminal_output_is_deserialized_only_by_its_originating_tool_contract() {
+    let repository_id: LogicalRepositoryId = parse("repo-1");
+    let daemon_status: AgentDaemonStatus = serde_json::from_value(json!({
+        "schema_version": "depgraph-daemon-v1",
+        "phase": "stopped",
+        "started_at": "2026-08-08T00:00:00.000Z",
+        "stopped_at": "2026-08-08T00:00:01.000Z",
+        "debounce_milliseconds": 0,
+        "pending_change_count": 0,
+        "recovered_attempts": {"scan_attempt_ids": [], "build_attempt_ids": []}
+    }))
+    .unwrap();
+    let envelope = SuccessEnvelope::new(repository_id, None, daemon_status);
+    let value = serde_json::to_value(&envelope).unwrap();
+
+    let daemon =
+        PortableTerminalOutputContract::for_originating_tool("daemon_start_submit").unwrap();
+    assert!(daemon.deserialize(value.clone()).is_ok());
+    assert!(PortableTerminalOutputContract::for_originating_tool("scan_submit").is_none());
+
+    let mut mismatched_envelope = value;
+    mismatched_envelope["snapshot_id"] = json!(SNAPSHOT_ID);
+    assert!(daemon.deserialize(mismatched_envelope).is_err());
+    let mut unknown_field = serde_json::to_value(&envelope).unwrap();
+    unknown_field["result"]["raw_journal_payload"] = json!(true);
+    assert!(daemon.deserialize(unknown_field).is_err());
+    assert!(daemon.deserialize(json!({"arbitrary": true})).is_err());
 }
 
 fn context() -> AgentContext {
@@ -1070,6 +1101,71 @@ fn operation_and_task_wire_invariants_fail_closed() {
 }
 
 #[test]
+fn agent_operation_is_closed_and_validates_status_progress_and_timestamps() {
+    let valid = json!({
+        "operation_id": OPERATION_ID,
+        "status": "running",
+        "progress": {"completed_units": 2, "total_units": 4},
+        "timestamps": {"created_at_ms": 1000, "updated_at_ms": 1100},
+        "retention": {"execution_deadline_ms": 2000, "retain_until_ms": 3000}
+    });
+    let operation = serde_json::from_value::<AgentOperation>(valid.clone()).unwrap();
+    assert_eq!(operation.operation_id().as_str(), OPERATION_ID);
+    assert_eq!(operation.status(), AgentOperationStatus::Running);
+    assert_eq!(operation.progress().completed_units(), 2);
+    assert_eq!(operation.progress().total_units(), 4);
+    assert_eq!(operation.timestamps().created_at_ms(), 1000);
+    assert_eq!(operation.timestamps().updated_at_ms(), 1100);
+    assert_eq!(operation.timestamps().terminal_at_ms(), None);
+    assert_eq!(operation.retention().execution_deadline_ms(), 2000);
+    assert_eq!(operation.retention().retain_until_ms(), 3000);
+
+    let mut unknown = valid.clone();
+    unknown["journal"] = json!({"lease": "must-not-be-public"});
+    assert!(serde_json::from_value::<AgentOperation>(unknown).is_err());
+
+    for invalid in [
+        json!({
+            "operation_id": OPERATION_ID,
+            "status": "completed",
+            "progress": {"completed_units": 3, "total_units": 4},
+            "timestamps": {"created_at_ms": 1000, "updated_at_ms": 1100, "terminal_at_ms": 1100},
+            "retention": {"execution_deadline_ms": 2000, "retain_until_ms": 3000}
+        }),
+        json!({
+            "operation_id": OPERATION_ID,
+            "status": "failed",
+            "progress": {"completed_units": 2, "total_units": 4},
+            "timestamps": {"created_at_ms": 1000, "updated_at_ms": 1100},
+            "retention": {"execution_deadline_ms": 2000, "retain_until_ms": 3000}
+        }),
+        json!({
+            "operation_id": OPERATION_ID,
+            "status": "running",
+            "progress": {"completed_units": 2, "total_units": 4},
+            "timestamps": {"created_at_ms": 1000, "updated_at_ms": 1100, "terminal_at_ms": 1100},
+            "retention": {"execution_deadline_ms": 2000, "retain_until_ms": 3000}
+        }),
+        json!({
+            "operation_id": OPERATION_ID,
+            "status": "running",
+            "progress": {"completed_units": 5, "total_units": 4},
+            "timestamps": {"created_at_ms": 1000, "updated_at_ms": 1100},
+            "retention": {"execution_deadline_ms": 2000, "retain_until_ms": 3000}
+        }),
+        json!({
+            "operation_id": OPERATION_ID,
+            "status": "running",
+            "progress": {"completed_units": 2, "total_units": 4},
+            "timestamps": {"created_at_ms": 1200, "updated_at_ms": 1100},
+            "retention": {"execution_deadline_ms": 2000, "retain_until_ms": 3000}
+        }),
+    ] {
+        assert!(serde_json::from_value::<AgentOperation>(invalid).is_err());
+    }
+}
+
+#[test]
 fn typed_error_category_is_derived_and_deserialization_cannot_forge_it() {
     let cases = [
         (AgentErrorCode::InvalidArgument, AgentErrorCategory::Input),
@@ -1268,6 +1364,18 @@ fn repository_paths_reject_non_portable_and_escaping_forms() {
 fn contract_samples() -> Value {
     let repository_id: LogicalRepositoryId = parse("repo-1");
     let snapshot_id: SnapshotId = parse(SNAPSHOT_ID);
+    let agent_operation = AgentOperation::new(
+        parse(OPERATION_ID),
+        AgentOperationStatus::Running,
+        1,
+        2,
+        1_700_000_000_000,
+        1_700_000_000_100,
+        None,
+        1_700_000_060_000,
+        1_700_604_860_000,
+    )
+    .expect("sample Agent operation");
     let page = Page::new(vec![node()], 2, false, Some(parse("cursor-2"))).expect("sample page");
     let success = SuccessEnvelope::new(repository_id.clone(), Some(snapshot_id.clone()), node());
     let error_envelope = ErrorEnvelope::new(repository_id.clone(), error());
@@ -1297,6 +1405,7 @@ fn contract_samples() -> Value {
         "agent_unresolved": unresolved(),
         "agent_node": node(),
         "agent_node_summary": node_summary(),
+        "agent_operation": agent_operation,
         "agent_path_response": AgentPathResponse::new(
             node(), dependency_node(), true, 1, vec![path_step()]
         ).expect("sample path response"),
