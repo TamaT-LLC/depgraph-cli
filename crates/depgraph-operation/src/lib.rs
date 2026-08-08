@@ -12,19 +12,21 @@ use std::{
     time::Duration,
 };
 
-use depgraph_core::DepgraphServiceConfig;
+use depgraph_core::{DepgraphServiceConfig, service::RepositoryRootSeal};
 use depgraph_mcp_tools::{
     AgentCapability, CapabilityProfile, LogicalRepositoryId, MAX_TASK_TTL_MS, OperationId,
     canonical_json_bytes,
 };
 use rusqlite::{
-    Connection, OpenFlags, OptionalExtension, TransactionBehavior, limits::Limit, params,
+    Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, limits::Limit,
+    params,
 };
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 
 /// SQLite schema version owned by this crate.
-pub const JOURNAL_SCHEMA_VERSION: i64 = 1;
+pub const JOURNAL_SCHEMA_VERSION: i64 = 2;
+const LEGACY_JOURNAL_SCHEMA_VERSION: i64 = 1;
 /// Suffix appended to the graph-store path to obtain the separate journal path.
 pub const OPERATION_JOURNAL_SUFFIX: &str = ".operations.sqlite";
 /// Minimum duration for which a terminal record remains retrievable.
@@ -696,9 +698,10 @@ impl OperationRecord {
 }
 
 /// Canonical submission ready for a transactional operation and handoff insert.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct SubmitRequest {
     repository_id: LogicalRepositoryId,
+    repository_binding_digest: JournalDigest,
     kind: OperationKind,
     required_capabilities: CapabilitySet,
     normalized_input: CanonicalInput,
@@ -706,6 +709,22 @@ pub struct SubmitRequest {
     idempotency_key_digest: JournalDigest,
     execution_deadline_ms: i64,
     initial_progress: OperationProgress,
+}
+
+impl fmt::Debug for SubmitRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SubmitRequest")
+            .field("repository_id", &self.repository_id)
+            .field("kind", &self.kind)
+            .field("required_capabilities", &self.required_capabilities)
+            .field("normalized_input", &self.normalized_input)
+            .field("input_digest", &self.input_digest)
+            .field("idempotency_key_digest", &self.idempotency_key_digest)
+            .field("execution_deadline_ms", &self.execution_deadline_ms)
+            .field("initial_progress", &self.initial_progress)
+            .finish_non_exhaustive()
+    }
 }
 
 impl SubmitRequest {
@@ -716,6 +735,8 @@ impl SubmitRequest {
         idempotency_key: impl AsRef<[u8]>,
         execution_deadline_ms: i64,
     ) -> Result<Self, JournalError> {
+        let root_seal = config.repository_root_seal();
+        validate_live_root(&root_seal)?;
         let required = kind.capability_profile().required_capabilities();
         if !config.capabilities().contains_all(required) {
             return Err(JournalError::CapabilityDenied);
@@ -728,6 +749,7 @@ impl SubmitRequest {
         let normalized_input = CanonicalInput::new(normalized_input)?;
         Ok(Self {
             repository_id,
+            repository_binding_digest: JournalDigest(root_seal.binding_digest()),
             kind,
             required_capabilities,
             input_digest: normalized_input.digest(),
@@ -889,6 +911,191 @@ pub enum OperationOutcome {
     Cancelled,
 }
 
+/// Closed timestamps exposed by the operation manager.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OperationTimestamps {
+    created_at_ms: i64,
+    updated_at_ms: i64,
+    terminal_at_ms: Option<i64>,
+}
+
+impl OperationTimestamps {
+    #[must_use]
+    pub const fn created_at_ms(self) -> i64 {
+        self.created_at_ms
+    }
+
+    #[must_use]
+    pub const fn updated_at_ms(self) -> i64 {
+        self.updated_at_ms
+    }
+
+    #[must_use]
+    pub const fn terminal_at_ms(self) -> Option<i64> {
+        self.terminal_at_ms
+    }
+}
+
+/// Closed execution and retention bounds exposed by the operation manager.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OperationRetention {
+    execution_deadline_ms: i64,
+    retain_until_ms: i64,
+}
+
+impl OperationRetention {
+    #[must_use]
+    pub const fn execution_deadline_ms(self) -> i64 {
+        self.execution_deadline_ms
+    }
+
+    #[must_use]
+    pub const fn retain_until_ms(self) -> i64 {
+        self.retain_until_ms
+    }
+}
+
+/// Agent-safe operation state. Raw input, digests, leases, and handoff data are
+/// intentionally absent.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OperationView {
+    operation_id: OperationId,
+    status: OperationStatus,
+    progress: OperationProgress,
+    timestamps: OperationTimestamps,
+    retention: OperationRetention,
+}
+
+impl OperationView {
+    fn from_record(record: &OperationRecord) -> Self {
+        Self {
+            operation_id: record.operation_id.clone(),
+            status: record.status,
+            progress: record.progress,
+            timestamps: OperationTimestamps {
+                created_at_ms: record.created_at_ms,
+                updated_at_ms: record.updated_at_ms,
+                terminal_at_ms: record.terminal_at_ms,
+            },
+            retention: OperationRetention {
+                execution_deadline_ms: record.execution_deadline_ms,
+                retain_until_ms: record.retain_until_ms,
+            },
+        }
+    }
+
+    #[must_use]
+    pub const fn operation_id(&self) -> &OperationId {
+        &self.operation_id
+    }
+
+    #[must_use]
+    pub const fn status(&self) -> OperationStatus {
+        self.status
+    }
+
+    #[must_use]
+    pub const fn progress(&self) -> OperationProgress {
+        self.progress
+    }
+
+    #[must_use]
+    pub const fn timestamps(&self) -> OperationTimestamps {
+        self.timestamps
+    }
+
+    #[must_use]
+    pub const fn retention(&self) -> OperationRetention {
+        self.retention
+    }
+}
+
+/// Closed submission handle returned only after the journal transaction commits.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OperationHandle {
+    operation: OperationView,
+    created: bool,
+}
+
+impl OperationHandle {
+    fn from_submit_outcome(outcome: SubmitOutcome) -> Self {
+        Self {
+            operation: OperationView::from_record(&outcome.record),
+            created: outcome.created,
+        }
+    }
+
+    #[must_use]
+    pub const fn operation(&self) -> &OperationView {
+        &self.operation
+    }
+
+    #[must_use]
+    pub const fn operation_id(&self) -> &OperationId {
+        self.operation.operation_id()
+    }
+
+    #[must_use]
+    pub const fn status(&self) -> OperationStatus {
+        self.operation.status()
+    }
+
+    #[must_use]
+    pub const fn progress(&self) -> OperationProgress {
+        self.operation.progress()
+    }
+
+    #[must_use]
+    pub const fn timestamps(&self) -> OperationTimestamps {
+        self.operation.timestamps()
+    }
+
+    #[must_use]
+    pub const fn retention(&self) -> OperationRetention {
+        self.operation.retention()
+    }
+
+    #[must_use]
+    pub const fn created(&self) -> bool {
+        self.created
+    }
+}
+
+/// Closed terminal result paired with the validated operation state used to
+/// resolve it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OperationResultView {
+    operation: OperationView,
+    outcome: OperationOutcome,
+}
+
+impl OperationResultView {
+    #[must_use]
+    pub const fn operation(&self) -> &OperationView {
+        &self.operation
+    }
+
+    #[must_use]
+    pub const fn outcome(&self) -> &OperationOutcome {
+        &self.outcome
+    }
+}
+
+fn terminal_outcome(record: OperationRecord) -> Result<OperationOutcome, JournalError> {
+    match record.status {
+        OperationStatus::Completed => Ok(OperationOutcome::Completed(
+            record.result.ok_or(JournalError::IntegrityFailure)?,
+        )),
+        OperationStatus::Failed => Ok(OperationOutcome::Failed(
+            record.error.ok_or(JournalError::IntegrityFailure)?,
+        )),
+        OperationStatus::Cancelled => Ok(OperationOutcome::Cancelled),
+        OperationStatus::Queued | OperationStatus::Running | OperationStatus::Cancelling => {
+            Err(JournalError::OperationNotReady)
+        }
+    }
+}
+
 enum FinishPayload {
     Completed(CanonicalJson),
     Failed(CanonicalJson),
@@ -955,26 +1162,44 @@ pub struct OperationJournal {
     connection: Connection,
     repository_id: LogicalRepositoryId,
     enabled_capabilities: CapabilitySet,
+    repository_root_seal: RepositoryRootSeal,
 }
 
 impl OperationJournal {
     /// Open the journal associated with the configuration's validated graph-store path.
     pub fn open(config: &DepgraphServiceConfig) -> Result<Self, JournalError> {
+        let root_seal = config.repository_root_seal();
+        Self::open_with_root_seal(config, &root_seal)
+    }
+
+    fn open_with_root_seal(
+        config: &DepgraphServiceConfig,
+        root_seal: &RepositoryRootSeal,
+    ) -> Result<Self, JournalError> {
+        if !root_seal.matches_live_root() {
+            return Err(JournalError::RepositoryMismatch);
+        }
         let repository_id = LogicalRepositoryId::parse(config.logical_repository_id())
             .map_err(|_| JournalError::IntegrityFailure)?;
         let enabled_capabilities =
             CapabilitySet::new(config.capabilities().iter().map(Into::into))?;
-        Self::open_at(
+        let journal = Self::open_at(
             operation_journal_path(config),
             repository_id,
             enabled_capabilities,
-        )
+            root_seal.clone(),
+        )?;
+        if !root_seal.matches_live_root() {
+            return Err(JournalError::RepositoryMismatch);
+        }
+        Ok(journal)
     }
 
     fn open_at(
         path: impl AsRef<Path>,
         repository_id: LogicalRepositoryId,
         enabled_capabilities: CapabilitySet,
+        repository_root_seal: RepositoryRootSeal,
     ) -> Result<Self, JournalError> {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent() {
@@ -1008,6 +1233,7 @@ impl OperationJournal {
             connection,
             repository_id,
             enabled_capabilities,
+            repository_root_seal,
         };
         journal.initialize_schema()?;
         journal.validate()?;
@@ -1020,55 +1246,24 @@ impl OperationJournal {
     }
 
     pub fn schema_version(&self) -> Result<i64, JournalError> {
-        self.connection
-            .query_row("PRAGMA user_version", [], |row| row.get(0))
-            .map_err(JournalError::from)
+        let transaction = self.connection.unchecked_transaction()?;
+        self.validate_transaction_root(&transaction)?;
+        let version = transaction.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        commit_authorized(transaction, &self.repository_root_seal)?;
+        Ok(version)
     }
 
-    /// Validate SQLite integrity, the exact v1 schema surface, and all durable rows.
+    /// Validate SQLite integrity, the exact current schema, root binding, and all durable rows.
     pub fn validate(&self) -> Result<(), JournalError> {
         let transaction = self.connection.unchecked_transaction()?;
+        self.validate_transaction_root(&transaction)?;
         validate_connection_integrity(&transaction)?;
         validate_schema(&transaction)?;
         validate_foreign_keys(&transaction)?;
         validate_no_operation_tombstone_overlap(&transaction)?;
         validate_operation_handoff_cardinality(&transaction)?;
-
-        {
-            let operation_columns = qualified_columns(OPERATION_COLUMNS, "operation");
-            let handoff_columns = qualified_columns(HANDOFF_COLUMNS, "handoff");
-            let mut statement = transaction.prepare(&format!(
-                "SELECT {operation_columns}, {handoff_columns}
-                 FROM operations AS operation
-                 JOIN runner_handoffs AS handoff USING(operation_id)
-                 ORDER BY operation.operation_id"
-            ))?;
-            let mut rows = statement.query([])?;
-            while let Some(row) = rows.next().map_err(map_database_decode_error)? {
-                let operation = raw_operation_from_row(row).map_err(map_database_decode_error)?;
-                let raw_handoff =
-                    raw_handoff_from_row_at(row, 21).map_err(map_database_decode_error)?;
-                let record = decode_operation(operation)?;
-                self.validate_record_repository(&record)?;
-                let handoff = decode_handoff(raw_handoff)?;
-                validate_operation_handoff(&record, &handoff)?;
-            }
-        }
-
-        {
-            let mut statement = transaction.prepare(&format!(
-                "SELECT {TOMBSTONE_COLUMNS} FROM operation_tombstones ORDER BY operation_id"
-            ))?;
-            let mut rows = statement.query([])?;
-            while let Some(row) = rows.next().map_err(map_database_decode_error)? {
-                let tombstone = raw_tombstone_from_row(row).map_err(map_database_decode_error)?;
-                validate_tombstone(&tombstone)?;
-                if tombstone.repository_id != self.repository_id.as_str() {
-                    return Err(JournalError::IntegrityFailure);
-                }
-            }
-        }
-        transaction.commit()?;
+        validate_journal_rows(&transaction, &self.repository_id)?;
+        commit_authorized(transaction, &self.repository_root_seal)?;
         Ok(())
     }
 
@@ -1081,9 +1276,19 @@ impl OperationJournal {
         validate_timestamp(now_ms)?;
         self.validate_submit_request(request)?;
         let required_capabilities_json = request.required_capabilities.canonical_json()?;
+        let repository_id = self.repository_id.clone();
+        let enabled_capabilities = self.enabled_capabilities.clone();
+        let root_seal = self.repository_root_seal.clone();
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        validate_transaction_root(&transaction, &root_seal)?;
+        validate_submit_request_authority(
+            request,
+            &repository_id,
+            &enabled_capabilities,
+            &root_seal,
+        )?;
 
         if let Some(raw) = select_operation_by_scope(
             &transaction,
@@ -1098,7 +1303,7 @@ impl OperationJournal {
             if now_ms >= record.retain_until_ms {
                 return Err(JournalError::Expired);
             }
-            transaction.commit()?;
+            commit_authorized(transaction, &root_seal)?;
             return Ok(SubmitOutcome {
                 record,
                 created: false,
@@ -1185,7 +1390,7 @@ impl OperationJournal {
         let raw = select_operation_by_id(&transaction, operation_id.as_str())?
             .ok_or(JournalError::IntegrityFailure)?;
         let record = validated_record(&transaction, raw)?;
-        transaction.commit()?;
+        commit_authorized(transaction, &root_seal)?;
         Ok(SubmitOutcome {
             record,
             created: true,
@@ -1201,9 +1406,10 @@ impl OperationJournal {
         validate_timestamp(now_ms)?;
         self.validate_requested_repository(repository_id)?;
         let transaction = self.connection.unchecked_transaction()?;
+        self.validate_transaction_root(&transaction)?;
         let record = load_record_or_tombstone(&transaction, repository_id, operation_id, now_ms)?;
         self.validate_record_repository(&record)?;
-        transaction.commit()?;
+        commit_authorized(transaction, &self.repository_root_seal)?;
         Ok(record)
     }
 
@@ -1218,6 +1424,7 @@ impl OperationJournal {
         validate_timestamp(now_ms)?;
         self.validate_requested_repository(repository_id)?;
         let transaction = self.connection.unchecked_transaction()?;
+        self.validate_transaction_root(&transaction)?;
         let record = load_record_or_tombstone(&transaction, repository_id, operation_id, now_ms)?;
         self.validate_record_repository(&record)?;
         validate_enabled_capabilities(&self.enabled_capabilities, &record)?;
@@ -1225,7 +1432,7 @@ impl OperationJournal {
             .ok_or(JournalError::IntegrityFailure)?;
         let handoff = decode_handoff(raw)?;
         validate_operation_handoff(&record, &handoff)?;
-        transaction.commit()?;
+        commit_authorized(transaction, &self.repository_root_seal)?;
         Ok(handoff)
     }
 
@@ -1252,9 +1459,11 @@ impl OperationJournal {
         let token_digest = digest_lease_token(lease_token.as_ref())?;
         let enabled_capabilities = self.enabled_capabilities.clone();
         let enabled_kinds = EnabledOperationKinds::new(&enabled_capabilities)?;
+        let root_seal = self.repository_root_seal.clone();
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        validate_transaction_root(&transaction, &root_seal)?;
         let Some(raw) = select_next_claim_candidate(
             &transaction,
             repository_id.as_str(),
@@ -1263,7 +1472,7 @@ impl OperationJournal {
             enabled_kinds,
         )?
         else {
-            transaction.commit()?;
+            commit_authorized(transaction, &root_seal)?;
             return Ok(None);
         };
         let record = validated_record(&transaction, raw)?;
@@ -1314,7 +1523,7 @@ impl OperationJournal {
             .ok_or(JournalError::IntegrityFailure)?;
         let handoff = decode_handoff(raw_handoff)?;
         validate_operation_handoff(&record, &handoff)?;
-        transaction.commit()?;
+        commit_authorized(transaction, &root_seal)?;
         Ok(Some(ClaimedRunnerHandoff { record, handoff }))
     }
 
@@ -1324,19 +1533,9 @@ impl OperationJournal {
         operation_id: &OperationId,
         now_ms: i64,
     ) -> Result<OperationOutcome, JournalError> {
-        let record = self.get(repository_id, operation_id, now_ms)?;
-        match record.status {
-            OperationStatus::Completed => Ok(OperationOutcome::Completed(
-                record.result.ok_or(JournalError::IntegrityFailure)?,
-            )),
-            OperationStatus::Failed => Ok(OperationOutcome::Failed(
-                record.error.ok_or(JournalError::IntegrityFailure)?,
-            )),
-            OperationStatus::Cancelled => Ok(OperationOutcome::Cancelled),
-            OperationStatus::Queued | OperationStatus::Running | OperationStatus::Cancelling => {
-                Err(JournalError::OperationNotReady)
-            }
-        }
+        let outcome = terminal_outcome(self.get(repository_id, operation_id, now_ms)?)?;
+        self.validate_live_root()?;
+        Ok(outcome)
     }
 
     /// Record cooperative cancellation. Terminal and already-cancelling states
@@ -1351,9 +1550,11 @@ impl OperationJournal {
         validate_timestamp(now_ms)?;
         self.validate_requested_repository(repository_id)?;
         let enabled_capabilities = self.enabled_capabilities.clone();
+        let root_seal = self.repository_root_seal.clone();
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        validate_transaction_root(&transaction, &root_seal)?;
         let record = load_active_record(&transaction, repository_id, operation_id, now_ms)?;
         if !enabled_capabilities.contains_all(&record.required_capabilities)
             || !current_capabilities.contains_all(&record.required_capabilities)
@@ -1361,11 +1562,11 @@ impl OperationJournal {
             return Err(JournalError::CapabilityDenied);
         }
         if record.status.is_terminal() {
-            transaction.commit()?;
+            commit_authorized(transaction, &root_seal)?;
             return Ok(CancelOutcome::TerminalNoOp);
         }
         if record.status == OperationStatus::Cancelling {
-            transaction.commit()?;
+            commit_authorized(transaction, &root_seal)?;
             return Ok(CancelOutcome::AlreadyRequested);
         }
         validate_update_time(&record, now_ms)?;
@@ -1381,7 +1582,7 @@ impl OperationJournal {
              WHERE operation_id = ?2",
             params![now_ms, operation_id.as_str()],
         )?;
-        transaction.commit()?;
+        commit_authorized(transaction, &root_seal)?;
         Ok(CancelOutcome::Requested)
     }
 
@@ -1400,9 +1601,11 @@ impl OperationJournal {
         self.validate_requested_repository(repository_id)?;
         let token_digest = digest_lease_token(lease_token.as_ref())?;
         let enabled_capabilities = self.enabled_capabilities.clone();
+        let root_seal = self.repository_root_seal.clone();
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        validate_transaction_root(&transaction, &root_seal)?;
         let record = load_active_record(&transaction, repository_id, operation_id, now_ms)?;
         validate_enabled_capabilities(&enabled_capabilities, &record)?;
         validate_update_time(&record, now_ms)?;
@@ -1446,7 +1649,7 @@ impl OperationJournal {
             params![now_ms, operation_id.as_str()],
         )?;
         let record = select_validated_by_id(&transaction, operation_id)?;
-        transaction.commit()?;
+        commit_authorized(transaction, &root_seal)?;
         Ok(record)
     }
 
@@ -1463,9 +1666,11 @@ impl OperationJournal {
         let lease_token = lease_token.as_ref();
         let token_digest = digest_lease_token(lease_token)?;
         let enabled_capabilities = self.enabled_capabilities.clone();
+        let root_seal = self.repository_root_seal.clone();
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        validate_transaction_root(&transaction, &root_seal)?;
         let record = load_active_record(&transaction, repository_id, operation_id, now_ms)?;
         validate_enabled_capabilities(&enabled_capabilities, &record)?;
         validate_update_time(&record, now_ms)?;
@@ -1477,7 +1682,7 @@ impl OperationJournal {
             params![lease_expires_at_ms, now_ms, operation_id.as_str()],
         )?;
         let record = select_validated_by_id(&transaction, operation_id)?;
-        transaction.commit()?;
+        commit_authorized(transaction, &root_seal)?;
         Ok(record)
     }
 
@@ -1492,9 +1697,11 @@ impl OperationJournal {
         self.validate_requested_repository(repository_id)?;
         let token_digest = digest_lease_token(lease_token.as_ref())?;
         let enabled_capabilities = self.enabled_capabilities.clone();
+        let root_seal = self.repository_root_seal.clone();
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        validate_transaction_root(&transaction, &root_seal)?;
         let record = load_active_record(&transaction, repository_id, operation_id, now_ms)?;
         validate_enabled_capabilities(&enabled_capabilities, &record)?;
         validate_update_time(&record, now_ms)?;
@@ -1511,7 +1718,7 @@ impl OperationJournal {
             params![now_ms, operation_id.as_str()],
         )?;
         let record = select_validated_by_id(&transaction, operation_id)?;
-        transaction.commit()?;
+        commit_authorized(transaction, &root_seal)?;
         Ok(record)
     }
 
@@ -1527,9 +1734,11 @@ impl OperationJournal {
         self.validate_requested_repository(repository_id)?;
         let token_digest = digest_lease_token(lease_token.as_ref())?;
         let enabled_capabilities = self.enabled_capabilities.clone();
+        let root_seal = self.repository_root_seal.clone();
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        validate_transaction_root(&transaction, &root_seal)?;
         let record = load_active_record(&transaction, repository_id, operation_id, now_ms)?;
         validate_enabled_capabilities(&enabled_capabilities, &record)?;
         validate_update_time(&record, now_ms)?;
@@ -1557,7 +1766,7 @@ impl OperationJournal {
             ],
         )?;
         let record = select_validated_by_id(&transaction, operation_id)?;
-        transaction.commit()?;
+        commit_authorized(transaction, &root_seal)?;
         Ok(record)
     }
 
@@ -1625,9 +1834,11 @@ impl OperationJournal {
         validate_timestamp(now_ms)?;
         self.validate_requested_repository(repository_id)?;
         let enabled_capabilities = self.enabled_capabilities.clone();
+        let root_seal = self.repository_root_seal.clone();
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        validate_transaction_root(&transaction, &root_seal)?;
         let record =
             load_record_for_deadline_failure(&transaction, repository_id, operation_id, now_ms)?;
         validate_enabled_capabilities(&enabled_capabilities, &record)?;
@@ -1639,7 +1850,7 @@ impl OperationJournal {
         }
         let error = CanonicalJson::from_database(DEADLINE_EXCEEDED_ERROR_JSON.to_owned())?;
         let record = transition_to_deadline_failure(&transaction, &record, &error)?;
-        transaction.commit()?;
+        commit_authorized(transaction, &root_seal)?;
         Ok(record)
     }
 
@@ -1650,9 +1861,11 @@ impl OperationJournal {
         validate_timestamp(now_ms)?;
         let repository_id = self.repository_id.clone();
         let deadline_error = CanonicalJson::from_database(DEADLINE_EXCEEDED_ERROR_JSON.to_owned())?;
+        let root_seal = self.repository_root_seal.clone();
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        validate_transaction_root(&transaction, &root_seal)?;
 
         let deadline_expired_operation_ids = {
             let mut statement = transaction.prepare(
@@ -1802,7 +2015,7 @@ impl OperationJournal {
             params![now_ms],
             |row| row.get(0),
         )?;
-        transaction.commit()?;
+        commit_authorized(transaction, &root_seal)?;
         Ok(PurgeReport {
             reaped_operations,
             purged_operations,
@@ -1826,9 +2039,11 @@ impl OperationJournal {
         let status = payload.status();
         let (result, error) = payload.into_columns();
         let enabled_capabilities = self.enabled_capabilities.clone();
+        let root_seal = self.repository_root_seal.clone();
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        validate_transaction_root(&transaction, &root_seal)?;
         let record = load_active_record(&transaction, repository_id, operation_id, now_ms)?;
         validate_enabled_capabilities(&enabled_capabilities, &record)?;
         validate_update_time(&record, now_ms)?;
@@ -1868,7 +2083,7 @@ impl OperationJournal {
             params![now_ms, operation_id.as_str()],
         )?;
         let record = select_validated_by_id(&transaction, operation_id)?;
-        transaction.commit()?;
+        commit_authorized(transaction, &root_seal)?;
         Ok(record)
     }
 
@@ -1890,36 +2105,270 @@ impl OperationJournal {
     }
 
     fn validate_submit_request(&self, request: &SubmitRequest) -> Result<(), JournalError> {
-        if request.repository_id != self.repository_id {
-            return Err(JournalError::RepositoryMismatch);
+        validate_submit_request_authority(
+            request,
+            &self.repository_id,
+            &self.enabled_capabilities,
+            &self.repository_root_seal,
+        )
+    }
+
+    fn validate_live_root(&self) -> Result<(), JournalError> {
+        validate_live_root(&self.repository_root_seal)
+    }
+
+    fn validate_transaction_root(&self, connection: &Connection) -> Result<(), JournalError> {
+        validate_transaction_root(connection, &self.repository_root_seal)
+    }
+
+    fn initialize_schema(&mut self) -> Result<(), JournalError> {
+        let root_seal = self.repository_root_seal.clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        validate_live_root(&root_seal)?;
+        let version: i64 = transaction.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if version == 0 {
+            transaction.execute_batch(SCHEMA_V1)?;
+            transaction.execute_batch(SCHEMA_V2_METADATA)?;
+            insert_repository_binding(&transaction, JournalDigest(root_seal.binding_digest()))?;
+            transaction.pragma_update(None, "user_version", JOURNAL_SCHEMA_VERSION)?;
+        } else if version == LEGACY_JOURNAL_SCHEMA_VERSION {
+            // Schema v1 stored only the basename-derived logical repository ID.
+            // Distinct exact roots can have that same ID, so retained v1 rows carry
+            // insufficient information to determine their originating root. Any
+            // automatic binding would therefore guess at provenance and is
+            // information-theoretically unsafe. Only a journal with no retained
+            // operations, handoffs, or tombstones can be bound without attribution.
+            validate_legacy_schema(&transaction)?;
+            if !legacy_journal_is_empty(&transaction)? {
+                return Err(JournalError::IntegrityFailure);
+            }
+            validate_foreign_keys(&transaction)?;
+            validate_no_operation_tombstone_overlap(&transaction)?;
+            validate_operation_handoff_cardinality(&transaction)?;
+            transaction.execute_batch(SCHEMA_V2_METADATA)?;
+            insert_repository_binding(&transaction, JournalDigest(root_seal.binding_digest()))?;
+            transaction.pragma_update(None, "user_version", JOURNAL_SCHEMA_VERSION)?;
+        } else if version != JOURNAL_SCHEMA_VERSION {
+            return Err(JournalError::UnsupportedSchemaVersion);
+        } else {
+            validate_repository_binding(&transaction, JournalDigest(root_seal.binding_digest()))?;
         }
-        let required_capabilities = request.kind.required_capabilities()?;
-        if request.required_capabilities != required_capabilities {
-            return Err(JournalError::IntegrityFailure);
-        }
+        commit_authorized(transaction, &root_seal)?;
+        Ok(())
+    }
+}
+
+/// Authorized, closed operation lifecycle API over the durable journal.
+///
+/// This type deliberately has no operation enumeration or raw journal accessor.
+/// Runner recovery continues to use [`OperationJournal`] as an internal Rust
+/// boundary, while Agent-facing callers receive only bounded projections.
+///
+/// ```compile_fail
+/// use depgraph_operation::OperationManager;
+///
+/// fn enumerate_operations(manager: &OperationManager) {
+///     let _ = manager.list();
+/// }
+/// ```
+///
+/// Lifecycle callers cannot inject repository or capability authority:
+///
+/// ```compile_fail
+/// use depgraph_mcp_tools::{LogicalRepositoryId, OperationId};
+/// use depgraph_operation::{CapabilitySet, OperationManager};
+///
+/// fn inject_authority(
+///     manager: &OperationManager,
+///     repository: &LogicalRepositoryId,
+///     capabilities: &CapabilitySet,
+///     operation: &OperationId,
+/// ) {
+///     let _ = manager.get(repository, capabilities, operation, 0);
+/// }
+/// ```
+pub struct OperationManager {
+    journal: OperationJournal,
+    authority: OperationManagerAuthority,
+}
+
+struct OperationManagerAuthority {
+    repository_id: LogicalRepositoryId,
+    capabilities: CapabilitySet,
+    root_seal: RepositoryRootSeal,
+}
+
+impl OperationManager {
+    /// Open the durable journal using the current service repository and
+    /// capability configuration.
+    pub fn open(config: &DepgraphServiceConfig) -> Result<Self, JournalError> {
+        let root_seal = config.repository_root_seal();
+        let repository_id = LogicalRepositoryId::parse(config.logical_repository_id())
+            .map_err(|_| JournalError::IntegrityFailure)?;
+        let capabilities = CapabilitySet::new(config.capabilities().iter().map(Into::into))?;
+        let manager = Self {
+            journal: OperationJournal::open_with_root_seal(config, &root_seal)?,
+            authority: OperationManagerAuthority {
+                repository_id,
+                capabilities,
+                root_seal,
+            },
+        };
+        manager.revalidate_root()?;
+        Ok(manager)
+    }
+
+    /// Submit validated normalized work and return only after the operation and
+    /// its runner handoff are committed atomically.
+    pub fn submit(
+        &mut self,
+        request: &SubmitRequest,
+        now_ms: i64,
+    ) -> Result<OperationHandle, JournalError> {
+        self.revalidate_root()?;
+        self.validate_submit_request_root(request)?;
+        let handle = self
+            .journal
+            .submit(request, now_ms)
+            .map(OperationHandle::from_submit_outcome)?;
+        self.revalidate_root()?;
+        Ok(handle)
+    }
+
+    /// Resolve an Agent-safe operation status under the sealed open authority.
+    pub fn get(
+        &self,
+        operation_id: &OperationId,
+        now_ms: i64,
+    ) -> Result<OperationView, JournalError> {
+        let record = self.authorized_read(operation_id, now_ms)?;
+        let view = OperationView::from_record(&record);
+        self.revalidate_root()?;
+        Ok(view)
+    }
+
+    /// Resolve a closed terminal result. Non-terminal operations return
+    /// [`JournalError::OperationNotReady`].
+    pub fn result(
+        &self,
+        operation_id: &OperationId,
+        now_ms: i64,
+    ) -> Result<OperationResultView, JournalError> {
+        let record = self.authorized_read(operation_id, now_ms)?;
+        let operation = OperationView::from_record(&record);
+        let outcome = terminal_outcome(record)?;
+        self.revalidate_root()?;
+        Ok(OperationResultView { operation, outcome })
+    }
+
+    /// Record cooperative cancellation only when the sealed current authority
+    /// contains every immutable capability recorded at submit.
+    pub fn cancel(
+        &mut self,
+        operation_id: &OperationId,
+        now_ms: i64,
+    ) -> Result<CancelOutcome, JournalError> {
+        self.revalidate_root()?;
+        let record = self
+            .journal
+            .get(&self.authority.repository_id, operation_id, now_ms)?;
         if !self
-            .enabled_capabilities
-            .contains_all(&required_capabilities)
+            .authority
+            .capabilities
+            .contains_all(record.required_capabilities())
         {
             return Err(JournalError::CapabilityDenied);
+        }
+        let outcome = self.journal.cancel(
+            &self.authority.repository_id,
+            operation_id,
+            &self.authority.capabilities,
+            now_ms,
+        )?;
+        self.revalidate_root()?;
+        Ok(outcome)
+    }
+
+    fn authorized_read(
+        &self,
+        operation_id: &OperationId,
+        now_ms: i64,
+    ) -> Result<OperationRecord, JournalError> {
+        self.revalidate_root()?;
+        if !self.authority.capabilities.contains(AgentCapability::Read) {
+            return Err(JournalError::CapabilityDenied);
+        }
+        let record = self
+            .journal
+            .get(&self.authority.repository_id, operation_id, now_ms)?;
+        self.revalidate_root()?;
+        Ok(record)
+    }
+
+    fn validate_submit_request_root(&self, request: &SubmitRequest) -> Result<(), JournalError> {
+        if request.repository_binding_digest
+            != JournalDigest(self.authority.root_seal.binding_digest())
+        {
+            return Err(JournalError::RepositoryMismatch);
         }
         Ok(())
     }
 
-    fn initialize_schema(&mut self) -> Result<(), JournalError> {
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let version: i64 = transaction.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if version == 0 {
-            transaction.execute_batch(SCHEMA_V1)?;
-            transaction.pragma_update(None, "user_version", JOURNAL_SCHEMA_VERSION)?;
-        } else if version != JOURNAL_SCHEMA_VERSION {
-            return Err(JournalError::UnsupportedSchemaVersion);
+    fn revalidate_root(&self) -> Result<(), JournalError> {
+        if !self.authority.root_seal.matches_live_root() {
+            return Err(JournalError::RepositoryMismatch);
         }
-        transaction.commit()?;
         Ok(())
     }
+}
+
+fn validate_live_root(root_seal: &RepositoryRootSeal) -> Result<(), JournalError> {
+    if !root_seal.matches_live_root() {
+        return Err(JournalError::RepositoryMismatch);
+    }
+    Ok(())
+}
+
+fn validate_transaction_root(
+    connection: &Connection,
+    root_seal: &RepositoryRootSeal,
+) -> Result<(), JournalError> {
+    validate_live_root(root_seal)?;
+    validate_repository_binding(connection, JournalDigest(root_seal.binding_digest()))
+}
+
+fn commit_authorized(
+    transaction: Transaction<'_>,
+    root_seal: &RepositoryRootSeal,
+) -> Result<(), JournalError> {
+    // This check is deliberately adjacent to commit. Returning an error drops
+    // the still-open transaction, rolling back every mutation in it.
+    validate_live_root(root_seal)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn validate_submit_request_authority(
+    request: &SubmitRequest,
+    repository_id: &LogicalRepositoryId,
+    enabled_capabilities: &CapabilitySet,
+    root_seal: &RepositoryRootSeal,
+) -> Result<(), JournalError> {
+    if request.repository_id != *repository_id
+        || request.repository_binding_digest != JournalDigest(root_seal.binding_digest())
+    {
+        return Err(JournalError::RepositoryMismatch);
+    }
+    let required_capabilities = request.kind.required_capabilities()?;
+    if request.required_capabilities != required_capabilities {
+        return Err(JournalError::IntegrityFailure);
+    }
+    if !enabled_capabilities.contains_all(&required_capabilities) {
+        return Err(JournalError::CapabilityDenied);
+    }
+    Ok(())
 }
 
 fn validate_schema(connection: &Connection) -> Result<(), JournalError> {
@@ -1927,6 +2376,21 @@ fn validate_schema(connection: &Connection) -> Result<(), JournalError> {
     if version != JOURNAL_SCHEMA_VERSION {
         return Err(JournalError::UnsupportedSchemaVersion);
     }
+    validate_schema_surface(connection, true)
+}
+
+fn validate_legacy_schema(connection: &Connection) -> Result<(), JournalError> {
+    let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version != LEGACY_JOURNAL_SCHEMA_VERSION {
+        return Err(JournalError::UnsupportedSchemaVersion);
+    }
+    validate_schema_surface(connection, false)
+}
+
+fn validate_schema_surface(
+    connection: &Connection,
+    include_repository_binding: bool,
+) -> Result<(), JournalError> {
     validate_columns(
         connection,
         "operations",
@@ -1982,9 +2446,60 @@ fn validate_schema(connection: &Connection) -> Result<(), JournalError> {
             "tombstone_until_ms",
         ],
     )?;
+    if include_repository_binding {
+        validate_columns(
+            connection,
+            "operation_journal_metadata",
+            &["singleton", "metadata_version", "repository_binding_digest"],
+        )?;
+    }
     let reference = Connection::open_in_memory()?;
     reference.execute_batch(SCHEMA_V1)?;
+    if include_repository_binding {
+        reference.execute_batch(SCHEMA_V2_METADATA)?;
+    }
     validate_schema_objects(connection, &reference)?;
+    Ok(())
+}
+
+fn insert_repository_binding(
+    connection: &Connection,
+    binding_digest: JournalDigest,
+) -> Result<(), JournalError> {
+    let inserted = connection.execute(
+        "INSERT INTO operation_journal_metadata (
+             singleton, metadata_version, repository_binding_digest
+         ) VALUES (1, 1, ?1)",
+        params![binding_digest.as_bytes().as_slice()],
+    )?;
+    if inserted != 1 {
+        return Err(JournalError::IntegrityFailure);
+    }
+    Ok(())
+}
+
+fn validate_repository_binding(
+    connection: &Connection,
+    expected: JournalDigest,
+) -> Result<(), JournalError> {
+    let stored: Option<(i64, Vec<u8>)> = connection
+        .query_row(
+            "SELECT metadata_version, repository_binding_digest
+             FROM operation_journal_metadata WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((metadata_version, digest)) = stored else {
+        return Err(JournalError::IntegrityFailure);
+    };
+    if metadata_version != 1 {
+        return Err(JournalError::IntegrityFailure);
+    }
+    let actual = JournalDigest::from_database(digest)?;
+    if actual != expected {
+        return Err(JournalError::RepositoryMismatch);
+    }
     Ok(())
 }
 
@@ -2075,6 +2590,61 @@ fn validate_operation_handoff_cardinality(connection: &Connection) -> Result<(),
     Ok(())
 }
 
+fn legacy_journal_is_empty(connection: &Connection) -> Result<bool, JournalError> {
+    connection
+        .query_row(
+            "SELECT NOT EXISTS(SELECT 1 FROM operations LIMIT 1)
+                    AND NOT EXISTS(SELECT 1 FROM runner_handoffs LIMIT 1)
+                    AND NOT EXISTS(SELECT 1 FROM operation_tombstones LIMIT 1)",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(JournalError::from)
+}
+
+fn validate_journal_rows(
+    connection: &Connection,
+    repository_id: &LogicalRepositoryId,
+) -> Result<(), JournalError> {
+    {
+        let operation_columns = qualified_columns(OPERATION_COLUMNS, "operation");
+        let handoff_columns = qualified_columns(HANDOFF_COLUMNS, "handoff");
+        let mut statement = connection.prepare(&format!(
+            "SELECT {operation_columns}, {handoff_columns}
+             FROM operations AS operation
+             JOIN runner_handoffs AS handoff USING(operation_id)
+             ORDER BY operation.operation_id"
+        ))?;
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next().map_err(map_database_decode_error)? {
+            let operation = raw_operation_from_row(row).map_err(map_database_decode_error)?;
+            let raw_handoff =
+                raw_handoff_from_row_at(row, 21).map_err(map_database_decode_error)?;
+            let record = decode_operation(operation)?;
+            if record.repository_id != *repository_id {
+                return Err(JournalError::IntegrityFailure);
+            }
+            let handoff = decode_handoff(raw_handoff)?;
+            validate_operation_handoff(&record, &handoff)?;
+        }
+    }
+
+    {
+        let mut statement = connection.prepare(&format!(
+            "SELECT {TOMBSTONE_COLUMNS} FROM operation_tombstones ORDER BY operation_id"
+        ))?;
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next().map_err(map_database_decode_error)? {
+            let tombstone = raw_tombstone_from_row(row).map_err(map_database_decode_error)?;
+            validate_tombstone(&tombstone)?;
+            if tombstone.repository_id != repository_id.as_str() {
+                return Err(JournalError::IntegrityFailure);
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_columns(
     connection: &Connection,
     table: &'static str,
@@ -2084,6 +2654,7 @@ fn validate_columns(
         "operations" => "PRAGMA table_info(operations)",
         "runner_handoffs" => "PRAGMA table_info(runner_handoffs)",
         "operation_tombstones" => "PRAGMA table_info(operation_tombstones)",
+        "operation_journal_metadata" => "PRAGMA table_info(operation_journal_metadata)",
         _ => return Err(JournalError::IntegrityFailure),
     };
     let mut statement = connection.prepare(sql)?;
@@ -3177,9 +3748,122 @@ BEGIN
 END;
 "#;
 
+const SCHEMA_V2_METADATA: &str = r#"
+CREATE TABLE operation_journal_metadata (
+    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+    metadata_version INTEGER NOT NULL CHECK(metadata_version = 1),
+    repository_binding_digest BLOB NOT NULL CHECK(
+        typeof(repository_binding_digest) = 'blob'
+        AND length(repository_binding_digest) = 32
+    )
+);
+"#;
+
 #[cfg(test)]
 mod unit_tests {
     use super::*;
+
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    static ROOT_TOCTOU_TEST_LOCK: Mutex<()> = Mutex::new(());
+    static SQLITE_BUSY_REACHED: AtomicBool = AtomicBool::new(false);
+
+    fn signal_sqlite_busy(_attempts: i32) -> bool {
+        SQLITE_BUSY_REACHED.store(true, Ordering::SeqCst);
+        true
+    }
+
+    fn wait_until_sqlite_busy() {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !SQLITE_BUSY_REACHED.load(Ordering::SeqCst) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "journal mutation never reached the external SQLite lock"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    fn toctou_config(root: &Path) -> DepgraphServiceConfig {
+        use depgraph_core::{DepgraphCapability, DepgraphCapabilitySet, DepgraphServiceLimits};
+
+        let repository_root = root.join("repository");
+        std::fs::create_dir(&repository_root).unwrap();
+        DepgraphServiceConfig::new(
+            repository_root,
+            root.join("graph.sqlite"),
+            DepgraphCapabilitySet::try_new([
+                DepgraphCapability::Read,
+                DepgraphCapability::StoreWrite,
+            ])
+            .unwrap(),
+            DepgraphServiceLimits::default(),
+        )
+        .unwrap()
+    }
+
+    fn toctou_request(config: &DepgraphServiceConfig, key: &[u8]) -> SubmitRequest {
+        SubmitRequest::new(
+            config,
+            OperationKind::ScanSubmit,
+            &serde_json::json!({"value": 1}),
+            key,
+            1_800_000_060_000,
+        )
+        .unwrap()
+    }
+
+    fn journal_rows_digest(path: &Path) -> [u8; 32] {
+        use rusqlite::types::ValueRef;
+
+        let connection = Connection::open(path).unwrap();
+        let mut digest = Sha256::new();
+        for query in [
+            "SELECT * FROM operations ORDER BY operation_id",
+            "SELECT * FROM runner_handoffs ORDER BY operation_id",
+            "SELECT * FROM operation_tombstones ORDER BY operation_id",
+        ] {
+            let mut statement = connection.prepare(query).unwrap();
+            let column_count = statement.column_count();
+            let mut rows = statement.query([]).unwrap();
+            while let Some(row) = rows.next().unwrap() {
+                digest.update([0xff]);
+                for index in 0..column_count {
+                    match row.get_ref(index).unwrap() {
+                        ValueRef::Null => digest.update([0]),
+                        ValueRef::Integer(value) => {
+                            digest.update([1]);
+                            digest.update(value.to_le_bytes());
+                        }
+                        ValueRef::Real(value) => {
+                            digest.update([2]);
+                            digest.update(value.to_bits().to_le_bytes());
+                        }
+                        ValueRef::Text(value) => {
+                            digest.update([3]);
+                            digest.update((value.len() as u64).to_le_bytes());
+                            digest.update(value);
+                        }
+                        ValueRef::Blob(value) => {
+                            digest.update([4]);
+                            digest.update((value.len() as u64).to_le_bytes());
+                            digest.update(value);
+                        }
+                    }
+                }
+            }
+        }
+        digest.finalize().into()
+    }
+
+    fn replace_repository_root(config: &DepgraphServiceConfig, parent: &Path) {
+        let original_root = config.canonical_root();
+        std::fs::rename(original_root, parent.join("original-repository")).unwrap();
+        std::fs::create_dir(original_root).unwrap();
+    }
 
     #[test]
     fn transition_matrix_is_closed() {
@@ -3274,5 +3958,70 @@ mod unit_tests {
                 .unwrap(),
             i32::try_from(SQLITE_ALLOCATION_LIMIT_BYTES).unwrap()
         );
+    }
+
+    #[test]
+    fn submit_waiting_for_immediate_lock_revalidates_root_before_mutation() {
+        let _serial = ROOT_TOCTOU_TEST_LOCK.lock().unwrap();
+        SQLITE_BUSY_REACHED.store(false, Ordering::SeqCst);
+        let root = tempfile::tempdir().unwrap();
+        let config = toctou_config(root.path());
+        let request = toctou_request(&config, b"submit-root-toctou");
+        let mut manager = OperationManager::open(&config).unwrap();
+        manager
+            .journal
+            .connection
+            .busy_handler(Some(signal_sqlite_busy))
+            .unwrap();
+        let journal_path = operation_journal_path(&config);
+        let before_digest = journal_rows_digest(journal_path.as_path());
+        let blocker = Connection::open(journal_path.as_path()).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let pending = std::thread::spawn(move || manager.submit(&request, 1_800_000_000_000));
+        wait_until_sqlite_busy();
+        replace_repository_root(&config, root.path());
+        blocker.execute_batch("COMMIT").unwrap();
+
+        assert!(matches!(
+            pending.join().unwrap(),
+            Err(JournalError::RepositoryMismatch)
+        ));
+        assert_eq!(journal_rows_digest(journal_path.as_path()), before_digest);
+    }
+
+    #[test]
+    fn cancel_waiting_for_immediate_lock_revalidates_root_before_mutation() {
+        let _serial = ROOT_TOCTOU_TEST_LOCK.lock().unwrap();
+        SQLITE_BUSY_REACHED.store(false, Ordering::SeqCst);
+        let root = tempfile::tempdir().unwrap();
+        let config = toctou_config(root.path());
+        let request = toctou_request(&config, b"cancel-root-toctou");
+        let mut manager = OperationManager::open(&config).unwrap();
+        let operation_id = manager
+            .submit(&request, 1_800_000_000_000)
+            .unwrap()
+            .operation_id()
+            .clone();
+        manager
+            .journal
+            .connection
+            .busy_handler(Some(signal_sqlite_busy))
+            .unwrap();
+        let journal_path = operation_journal_path(&config);
+        let before_digest = journal_rows_digest(journal_path.as_path());
+        let blocker = Connection::open(journal_path.as_path()).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let pending = std::thread::spawn(move || manager.cancel(&operation_id, 1_800_000_000_001));
+        wait_until_sqlite_busy();
+        replace_repository_root(&config, root.path());
+        blocker.execute_batch("COMMIT").unwrap();
+
+        assert!(matches!(
+            pending.join().unwrap(),
+            Err(JournalError::RepositoryMismatch)
+        ));
+        assert_eq!(journal_rows_digest(journal_path.as_path()), before_digest);
     }
 }
