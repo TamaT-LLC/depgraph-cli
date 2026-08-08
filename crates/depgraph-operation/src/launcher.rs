@@ -13,7 +13,8 @@ use crate::RunnerStartupConfig;
 
 pub const OPERATION_RUNNER_STARTUP_CONTRACT: &str = "depgraph-operation-runner-v1";
 const RUNNER_BASENAME: &str = "depgraph-operation-runner";
-const MAX_VERIFIED_RUNNER_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_VERIFIED_RELEASE_RUNNER_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_VERIFIED_DEVELOPMENT_RUNNER_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_RELEASE_MANIFEST_BYTES: u64 = 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -255,9 +256,14 @@ fn verify_runner_file(
     expected_sha256: Option<&str>,
 ) -> Result<VerifiedRunnerExecutable, ()> {
     let metadata = std::fs::symlink_metadata(path).map_err(|_| ())?;
+    let max_bytes = if expected_sha256.is_some() {
+        MAX_VERIFIED_RELEASE_RUNNER_BYTES
+    } else {
+        MAX_VERIFIED_DEVELOPMENT_RUNNER_BYTES
+    };
     if metadata.file_type().is_symlink()
         || !metadata.is_file()
-        || metadata.len() > MAX_VERIFIED_RUNNER_BYTES
+        || metadata.len() > max_bytes
         || !is_executable_file(path)
     {
         return Err(());
@@ -266,7 +272,7 @@ fn verify_runner_file(
     if let Some(expected) = expected_sha256 {
         let mut file = File::open(&canonical).map_err(|_| ())?;
         let observed_length = file.seek(std::io::SeekFrom::End(0)).map_err(|_| ())?;
-        if observed_length != metadata.len() || observed_length > MAX_VERIFIED_RUNNER_BYTES {
+        if observed_length != metadata.len() || observed_length > max_bytes {
             return Err(());
         }
         file.rewind().map_err(|_| ())?;
@@ -374,6 +380,10 @@ mod tests {
 
     fn write_test_executable(path: &Path) {
         std::fs::write(path, b"test runner fixture").unwrap();
+        make_test_executable(path);
+    }
+
+    fn make_test_executable(path: &Path) {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
@@ -385,6 +395,22 @@ mod tests {
 
     fn sha256(path: &Path) -> String {
         format!("{:x}", Sha256::digest(std::fs::read(path).unwrap()))
+    }
+
+    #[test]
+    fn release_and_development_runner_size_bounds_are_distinct_and_closed() {
+        let root = tempfile::tempdir().unwrap();
+        let runner = root.path().join(executable_name(RUNNER_BASENAME));
+        let file = File::create(&runner).unwrap();
+        file.set_len(MAX_VERIFIED_RELEASE_RUNNER_BYTES + 1).unwrap();
+        make_test_executable(&runner);
+
+        assert!(verify_runner_file(&runner, Some("unused-digest")).is_err());
+        assert!(verify_runner_file(&runner, None).is_ok());
+
+        file.set_len(MAX_VERIFIED_DEVELOPMENT_RUNNER_BYTES + 1)
+            .unwrap();
+        assert!(verify_runner_file(&runner, None).is_err());
     }
 
     #[test]

@@ -67,9 +67,13 @@ fn runner_command(repository: &Path, store: &Path) -> Command {
     command
 }
 
-fn wait_for_file(path: &Path, timeout: Duration) {
+fn wait_for_file(path: &Path, timeout: Duration, child: &mut Child) {
     let deadline = Instant::now() + timeout;
     while !path.is_file() {
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "marker helper exited before publishing its marker"
+        );
         assert!(Instant::now() < deadline, "marker protocol timed out");
         thread::sleep(Duration::from_millis(10));
     }
@@ -157,13 +161,13 @@ fn accepted_operation_survives_stdin_eof_and_launcher_process_exit() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    wait_for_file(&ready, PROCESS_TEST_TIMEOUT);
+    wait_for_file(&ready, PROCESS_TEST_TIMEOUT, &mut helper);
 
     let lock = Connection::open(operation_journal_path(&config)).unwrap();
     lock.execute_batch("BEGIN IMMEDIATE").unwrap();
     helper.stdin.as_mut().unwrap().write_all(b"L").unwrap();
     helper.stdin.as_mut().unwrap().flush().unwrap();
-    wait_for_file(&launched, PROCESS_TEST_TIMEOUT);
+    wait_for_file(&launched, PROCESS_TEST_TIMEOUT, &mut helper);
     let runner_pid: u32 = fs::read_to_string(&launched).unwrap().parse().unwrap();
     assert_ne!(runner_pid, helper.id());
     #[cfg(unix)]
