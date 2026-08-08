@@ -6,7 +6,12 @@ license.workspace = true
 rust-version.workspace = true
 description = "Durable SQLite operation journal for depgraph Agent operations"
 
+[[bin]]
+name = "depgraph-operation-runner"
+path = "src/bin/depgraph-operation-runner.rs"
+
 [dependencies]
+clap.workspace = true
 depgraph-core = { path = "../depgraph-core" }
 depgraph-mcp-tools = { path = "../depgraph-mcp-tools" }
 getrandom.workspace = true
@@ -16,5 +21,9 @@ serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Threading"] }
+
 [dev-dependencies]
+libc.workspace = true
 tempfile.workspace = true

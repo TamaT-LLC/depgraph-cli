@@ -558,15 +558,18 @@ dependencies = [
 name = "depgraph-operation"
 version = "0.4.0"
 dependencies = [
+ "clap",
  "depgraph-core",
  "depgraph-mcp-tools",
  "getrandom 0.3.4",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",
  "sha2",
  "tempfile",
  "thiserror",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

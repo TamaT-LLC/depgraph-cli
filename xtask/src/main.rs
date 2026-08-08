@@ -61,6 +61,14 @@ const RELEASE_TARGETS: &[(&str, &str)] = &[
     ("aarch64-apple-darwin", "tar.gz"),
     ("x86_64-pc-windows-msvc", "zip"),
 ];
+const RELEASE_CARGO_BUILD_TARGETS: &[(&str, Option<&str>, Option<&str>)] = &[
+    ("depgraph-cli", Some("depgraph"), Some("packaged")),
+    (
+        "depgraph-operation",
+        Some("depgraph-operation-runner"),
+        None,
+    ),
+];
 struct TargetNativeSmokeExpectation {
     target: &'static str,
     query_plan_digest: &'static str,
@@ -237,6 +245,7 @@ struct ReleaseManifest {
     license_expression: String,
     project_licenses: Vec<Artifact>,
     core: Artifact,
+    operation_runner: OperationRunnerArtifact,
     schema: Artifact,
     query_fixture: Artifact,
     cross_language_fixture: Artifact,
@@ -251,6 +260,13 @@ type ReleaseCompatibility = depgraph_core::ReleaseCompatibilityHealth;
 
 #[derive(Clone, Debug, serde::Deserialize, Serialize)]
 struct Artifact {
+    path: String,
+    sha256: String,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, Serialize)]
+struct OperationRunnerArtifact {
+    version: String,
     path: String,
     sha256: String,
 }
@@ -2228,15 +2244,17 @@ fn package() -> Result<()> {
     build(true)?;
     // The distributed CLI must never fall back to development worker
     // overrides when its signed layout is incomplete.
-    run(Command::new("cargo").args([
-        "build",
-        "--locked",
-        "--release",
-        "-p",
-        "depgraph-cli",
-        "--features",
-        "packaged",
-    ]))?;
+    for (package, binary, features) in RELEASE_CARGO_BUILD_TARGETS {
+        let mut command = Command::new("cargo");
+        command.args(["build", "--locked", "--release", "-p", package]);
+        if let Some(binary) = binary {
+            command.args(["--bin", binary]);
+        }
+        if let Some(features) = features {
+            command.args(["--features", features]);
+        }
+        run(&mut command)?;
+    }
     let host = host_target()?;
     let target = std::env::var("DEPGRAPH_TARGET").unwrap_or_else(|_| host.clone());
     if target != host {
@@ -2274,6 +2292,12 @@ fn package() -> Result<()> {
         &staging
             .join("libexec")
             .join(executable_name("depgraph-rust-worker")),
+    )?;
+    copy(
+        &release_dir.join(executable_name("depgraph-operation-runner")),
+        &staging
+            .join("libexec")
+            .join(executable_name("depgraph-operation-runner")),
     )?;
     copy(
         &Path::new("workers/go/bin").join(executable_name("depgraph-go-worker")),
@@ -2355,6 +2379,9 @@ fn package() -> Result<()> {
         )?,
     ];
     let core_path = staging.join("bin").join(executable_name("depgraph"));
+    let operation_runner_path = staging
+        .join("libexec")
+        .join(executable_name("depgraph-operation-runner"));
     let manifest = ReleaseManifest {
         release_version: VERSION.to_owned(),
         protocol_version: "1.0".to_owned(),
@@ -2367,6 +2394,7 @@ fn package() -> Result<()> {
             path: relative_slash(&staging, &core_path)?,
             sha256: sha256_file(&core_path)?,
         },
+        operation_runner: operation_runner_artifact(&operation_runner_path, &staging)?,
         schema: Artifact {
             path: relative_slash(&staging, &schema_path)?,
             sha256: sha256_file(&schema_path)?,
@@ -2650,6 +2678,19 @@ fn worker_artifact(adapter: &'static str, path: &Path, staging: &Path) -> Result
         sha256: sha256_file(path)?,
         backend,
         semantic,
+    })
+}
+
+fn operation_runner_artifact(path: &Path, staging: &Path) -> Result<OperationRunnerArtifact> {
+    let output = Command::new(path).arg("--version").output()?;
+    let expected = format!("depgraph-operation-runner {VERSION}");
+    if !output.status.success() || String::from_utf8(output.stdout)?.trim() != expected {
+        bail!("operation runner version handshake failed");
+    }
+    Ok(OperationRunnerArtifact {
+        version: VERSION.to_owned(),
+        path: relative_slash(staging, path)?,
+        sha256: sha256_file(path)?,
     })
 }
 
@@ -3660,7 +3701,9 @@ fn cargo_runtime_packages(metadata: &Value) -> Result<Vec<DependencyPackage>> {
         .filter_map(|node| Some((node["id"].as_str()?.to_owned(), node)))
         .collect::<BTreeMap<_, _>>();
 
-    let root_names = ["depgraph-cli", "depgraph-rust-worker"];
+    // Every Rust executable shipped in the release archive must be a root so
+    // its runtime-only dependencies are represented in licenses and the SBOM.
+    let root_names = ["depgraph-cli", "depgraph-rust-worker", "depgraph-operation"];
     let mut pending = VecDeque::new();
     for root_name in root_names {
         let roots = packages
@@ -5086,6 +5129,27 @@ fn verify_published_release_tree(
     let core = verify_release_artifact(extracted, &manifest.core, "core")?;
     if !expected_target.contains("windows") && !is_executable(&core)? {
         bail!("published release core is not executable");
+    }
+    let expected_operation_runner = format!(
+        "libexec/{}",
+        executable_name_for_target("depgraph-operation-runner", expected_target)
+    );
+    if manifest.operation_runner.version != VERSION
+        || manifest.operation_runner.path != expected_operation_runner
+        || !artifact_paths.insert(manifest.operation_runner.path.as_str())
+    {
+        bail!("published release operation runner metadata is incompatible or duplicated");
+    }
+    let operation_runner = verify_release_artifact(
+        extracted,
+        &Artifact {
+            path: manifest.operation_runner.path.clone(),
+            sha256: manifest.operation_runner.sha256.clone(),
+        },
+        "operation runner",
+    )?;
+    if !expected_target.contains("windows") && !is_executable(&operation_runner)? {
+        bail!("published release operation runner is not executable");
     }
     if manifest.schema.path != "schemas/depgraph-protocol-v1.schema.json" {
         bail!("published release schema path is not the protocol 1.0 schema");
@@ -11411,6 +11475,24 @@ fn verify_release_metadata(extracted: &Path) -> Result<ReleaseManifest> {
     if core != expected_core || !is_executable(&core)? {
         bail!("release manifest core must be the packaged executable");
     }
+    let expected_operation_runner_path =
+        format!("libexec/{}", executable_name("depgraph-operation-runner"));
+    if manifest.operation_runner.version != VERSION
+        || manifest.operation_runner.path != expected_operation_runner_path
+    {
+        bail!("release manifest operation runner metadata is incompatible");
+    }
+    let operation_runner = verify_release_artifact(
+        extracted,
+        &Artifact {
+            path: manifest.operation_runner.path.clone(),
+            sha256: manifest.operation_runner.sha256.clone(),
+        },
+        "operation runner",
+    )?;
+    if !is_executable(&operation_runner)? {
+        bail!("release manifest operation runner must be executable");
+    }
     if manifest.schema.path != "schemas/depgraph-protocol-v1.schema.json" {
         bail!("release manifest schema path does not match the packaged protocol schema");
     }
@@ -12393,17 +12475,17 @@ mod tests {
         ARCHIVE_MTIME, BENCHMARK_REPORT_SCHEMA_VERSION, BOUNDED_QUERY_PACKAGE_SMOKE_SCHEMA_VERSION,
         BoundedQueryPackageSmokeReport, CROSS_LANGUAGE_PACKAGE_SMOKE_SCHEMA_VERSION, Cli,
         CrossLanguagePackageSmokeReport, DependencyPackage, GithubActionsPolicy,
-        PROJECT_LICENSE_EXPRESSION, RELEASE_TARGETS, RUNTIME_COLLECTOR_CONTRACT_VERSION,
-        RUST_SYSROOT_COMPONENT_SHA256, ReleaseVerificationReport, STABLE_BENCHMARK_METRICS,
-        STABLE_RELEASE_BASELINE_COMMIT, STABLE_RELEASE_BASELINE_DIGEST, STABLE_RELEASE_VERSION,
-        STABLE_UPGRADE_SOURCE_VERSION, StableReleaseDecision, TYPESCRIPT_VERSION,
-        TargetVerificationReport, Task, VERSION, WEB_SEMANTIC_CAPABILITIES,
-        WEB_SEMANTIC_RUNTIME_ARTIFACTS, WEB_SEMANTIC_RUNTIME_COMPONENTS, WebSemanticAttestation,
-        WorkerBackend, archive_entries, cargo_runtime_packages, compiler_pack_identity_binding,
-        create_tar_archive, create_zip_archive, evaluate_stable_release_gate,
-        executable_name_for_target, extract_archive, github_settings_verify,
-        has_windows_executable_extension, normalized_spdx_license, package_url,
-        parse_worker_handshake, release_compatibility, remove_transient_build_run_ids,
+        PROJECT_LICENSE_EXPRESSION, RELEASE_CARGO_BUILD_TARGETS, RELEASE_TARGETS,
+        RUNTIME_COLLECTOR_CONTRACT_VERSION, RUST_SYSROOT_COMPONENT_SHA256,
+        ReleaseVerificationReport, STABLE_BENCHMARK_METRICS, STABLE_RELEASE_BASELINE_COMMIT,
+        STABLE_RELEASE_BASELINE_DIGEST, STABLE_RELEASE_VERSION, STABLE_UPGRADE_SOURCE_VERSION,
+        StableReleaseDecision, TYPESCRIPT_VERSION, TargetVerificationReport, Task, VERSION,
+        WEB_SEMANTIC_CAPABILITIES, WEB_SEMANTIC_RUNTIME_ARTIFACTS, WEB_SEMANTIC_RUNTIME_COMPONENTS,
+        WebSemanticAttestation, WorkerBackend, archive_entries, cargo_runtime_packages,
+        compiler_pack_identity_binding, create_tar_archive, create_zip_archive,
+        evaluate_stable_release_gate, executable_name_for_target, extract_archive,
+        github_settings_verify, has_windows_executable_extension, normalized_spdx_license,
+        package_url, parse_worker_handshake, release_compatibility, remove_transient_build_run_ids,
         rust_backend_from_handshake, rustc_source_identity, stable_release_baseline_digest,
         target_native_smoke_expectation, validate_bounded_query_package_smoke,
         validate_cross_language_package_smoke, verify_checksum_sidecar,
@@ -13363,6 +13445,17 @@ jobs:
             executable_name_for_target("depgraph", "aarch64-apple-darwin"),
             "depgraph"
         );
+        assert_eq!(
+            RELEASE_CARGO_BUILD_TARGETS,
+            [
+                ("depgraph-cli", Some("depgraph"), Some("packaged")),
+                (
+                    "depgraph-operation",
+                    Some("depgraph-operation-runner"),
+                    None,
+                ),
+            ]
+        );
     }
 
     #[test]
@@ -13908,9 +14001,11 @@ jobs:
             "packages": [
                 {"id":"cli","name":"depgraph-cli","version":"0.1.0","source":null,"license":"MIT"},
                 {"id":"worker","name":"depgraph-rust-worker","version":"0.1.0","source":null,"license":"MIT"},
+                {"id":"operation","name":"depgraph-operation","version":"0.1.0","source":null,"license":"MIT"},
                 {"id":"internal","name":"depgraph-core","version":"0.1.0","source":null,"license":"MIT"},
                 {"id":"xtask","name":"xtask","version":"0.1.0","source":null,"license":"MIT"},
                 {"id":"runtime","name":"runtime-crate","version":"1.0.0","source":"registry+test","license":"MIT"},
+                {"id":"runner-runtime","name":"runner-runtime-crate","version":"1.0.0","source":"registry+test","license":"MIT"},
                 {"id":"build","name":"bundled-source-build","version":"2.0.0","source":"registry+test","license":"Apache-2.0"},
                 {"id":"dev","name":"test-only","version":"3.0.0","source":"registry+test","license":"MIT"},
                 {"id":"spdx","name":"spdx","version":"4.0.0","source":"registry+test","license":"MIT"}
@@ -13922,9 +14017,11 @@ jobs:
                     {"pkg":"dev","dep_kinds":[{"kind":"dev"}]}
                 ]},
                 {"id":"worker","deps":[{"pkg":"runtime","dep_kinds":[{"kind":null}]}]},
+                {"id":"operation","deps":[{"pkg":"runner-runtime","dep_kinds":[{"kind":null}]}]},
                 {"id":"internal","deps":[{"pkg":"build","dep_kinds":[{"kind":"build"}]}]},
                 {"id":"xtask","deps":[{"pkg":"spdx","dep_kinds":[{"kind":null}]}]},
                 {"id":"runtime","deps":[]},
+                {"id":"runner-runtime","deps":[]},
                 {"id":"build","deps":[]},
                 {"id":"dev","deps":[]},
                 {"id":"spdx","deps":[]}
@@ -13936,7 +14033,10 @@ jobs:
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(
             names,
-            std::collections::BTreeSet::from(["runtime-crate".to_owned()])
+            std::collections::BTreeSet::from([
+                "runner-runtime-crate".to_owned(),
+                "runtime-crate".to_owned(),
+            ])
         );
         Ok(())
     }

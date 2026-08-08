@@ -6,6 +6,19 @@
 //! repository identity plus every canonical payload digest whenever an operation
 //! crosses the journal boundary.
 
+mod launcher;
+mod runner;
+
+pub use launcher::{
+    LaunchedOperationRunner, OPERATION_RUNNER_STARTUP_CONTRACT, OperationRunnerLauncher,
+    RunnerLaunchError, RunnerResolutionPolicy,
+};
+pub use runner::{
+    DispatchOutcome, ExecutionCheckpoint, ExecutionControl, OperationDispatcher, OperationRunner,
+    RunnerError, RunnerReport, RunnerStartupConfig, RunnerWork, UNSUPPORTED_OPERATION_ERROR_JSON,
+    UnsupportedOperationDispatcher,
+};
+
 use std::{
     fmt, io,
     path::{Path, PathBuf},
@@ -53,6 +66,9 @@ pub const MAX_PURGE_BATCH_SIZE: usize = 256;
 /// Canonical non-secret error recorded when purge reaps deadline-expired work.
 pub const DEADLINE_EXCEEDED_ERROR_JSON: &str =
     r#"{"code":"operation_execution_deadline_exceeded"}"#;
+/// Canonical non-secret terminal error for a project-exec operation whose
+/// external execution state cannot be proven after lease loss.
+pub const EXECUTION_STATE_UNKNOWN_ERROR_JSON: &str = r#"{"code":"EXECUTION_STATE_UNKNOWN"}"#;
 
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_TASK_TTL_MS_I64: i64 = MAX_TASK_TTL_MS as i64;
@@ -1464,11 +1480,13 @@ impl OperationJournal {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         validate_transaction_root(&transaction, &root_seal)?;
+        if enabled_kinds.project_exec {
+            fail_lost_project_exec_leases(&transaction, repository_id, now_ms)?;
+        }
         let Some(raw) = select_next_claim_candidate(
             &transaction,
             repository_id.as_str(),
             now_ms,
-            lease_expires_at_ms,
             enabled_kinds,
         )?
         else {
@@ -1479,6 +1497,7 @@ impl OperationJournal {
         validate_repository(&record, repository_id)?;
         validate_enabled_capabilities(&enabled_capabilities, &record)?;
         validate_update_time(&record, now_ms)?;
+        let lease_expires_at_ms = lease_expires_at_ms.min(record.execution_deadline_ms);
         validate_lease_window(&record, now_ms, lease_expires_at_ms)?;
         if record.status.is_terminal()
             || (record.status == OperationStatus::Queued && record.lease.is_some())
@@ -2965,6 +2984,64 @@ fn transition_to_deadline_failure(
     select_validated_by_id(connection, &record.operation_id)
 }
 
+fn transition_to_execution_state_unknown(
+    connection: &Connection,
+    record: &OperationRecord,
+    now_ms: i64,
+) -> Result<OperationRecord, JournalError> {
+    if record.kind != OperationKind::ResolveBuildSubmit
+        || !matches!(
+            record.status,
+            OperationStatus::Running | OperationStatus::Cancelling
+        )
+        || record.updated_at_ms > now_ms
+        || record.execution_deadline_ms <= now_ms
+        || record
+            .lease
+            .as_ref()
+            .is_some_and(|lease| lease.expires_at_ms > now_ms)
+    {
+        return Err(JournalError::IntegrityFailure);
+    }
+    let error = CanonicalJson::from_database(EXECUTION_STATE_UNKNOWN_ERROR_JSON.to_owned())?;
+    let retain_until_ms = record
+        .retain_until_ms
+        .max(checked_add(now_ms, TERMINAL_RETENTION_MS)?);
+    let maximum_retain_until_ms = checked_add(record.created_at_ms, MAX_TASK_TTL_MS_I64)
+        .map_err(|_| JournalError::IntegrityFailure)?;
+    if retain_until_ms > maximum_retain_until_ms {
+        return Err(JournalError::IntegrityFailure);
+    }
+    let updated = connection.execute(
+        "UPDATE operations
+         SET status = 'failed', error_json = ?1,
+             lease_owner = NULL, lease_token_digest = NULL,
+             lease_expires_at_ms = NULL, updated_at_ms = ?2,
+             terminal_at_ms = ?2, retain_until_ms = ?3
+         WHERE operation_id = ?4 AND status = ?5",
+        params![
+            error.as_str(),
+            now_ms,
+            retain_until_ms,
+            record.operation_id.as_str(),
+            record.status.as_str(),
+        ],
+    )?;
+    if updated != 1 {
+        return Err(JournalError::IntegrityFailure);
+    }
+    let completed = connection.execute(
+        "UPDATE runner_handoffs
+         SET completed_at_ms = ?1
+         WHERE operation_id = ?2 AND completed_at_ms IS NULL",
+        params![now_ms, record.operation_id.as_str()],
+    )?;
+    if completed != 1 {
+        return Err(JournalError::IntegrityFailure);
+    }
+    select_validated_by_id(connection, &record.operation_id)
+}
+
 fn load_active_record(
     connection: &Connection,
     repository_id: &LogicalRepositoryId,
@@ -3167,39 +3244,51 @@ fn select_operation_by_scope(
         .map_err(map_database_decode_error)
 }
 
-const ENABLED_OPERATION_KIND_PREDICATE: &str = "(
-    (?1 AND kind IN ('scan_submit', 'runtime_trace_import_submit'))
-    OR (?2 AND kind IN ('daemon_start_submit', 'daemon_stop'))
-    OR (?3 AND kind = 'resolve_build_submit')
-)";
-
 fn select_next_claim_candidate(
     connection: &Connection,
     repository_id: &str,
     now_ms: i64,
-    lease_expires_at_ms: i64,
     enabled_kinds: EnabledOperationKinds,
 ) -> Result<Option<RawOperation>, JournalError> {
     connection
         .query_row(
             &format!(
-                "SELECT {OPERATION_COLUMNS} FROM operations
-                 WHERE repository_id = ?4
-                   AND status IN ('queued', 'running', 'cancelling')
-                   AND execution_deadline_ms > ?5
-                   AND execution_deadline_ms >= ?6
-                   AND {ENABLED_OPERATION_KIND_PREDICATE}
+                "SELECT {OPERATION_COLUMNS} FROM operations AS candidate
+                 WHERE candidate.repository_id = ?4
+                   AND candidate.status IN ('queued', 'running', 'cancelling')
+                   AND candidate.execution_deadline_ms > ?5
                    AND (
-                       status = 'queued'
+                       (?1 AND candidate.kind IN ('scan_submit', 'runtime_trace_import_submit')
+                           AND NOT EXISTS (
+                               SELECT 1 FROM operations AS active_writer
+                               WHERE active_writer.repository_id = candidate.repository_id
+                                 AND active_writer.kind IN (
+                                     'scan_submit', 'runtime_trace_import_submit'
+                                 )
+                                 AND active_writer.status IN ('running', 'cancelling')
+                                 AND active_writer.lease_expires_at_ms > ?5
+                           ))
+                       OR (?2 AND candidate.kind IN ('daemon_start_submit', 'daemon_stop'))
+                       OR (?3 AND candidate.kind = 'resolve_build_submit'
+                           AND NOT EXISTS (
+                               SELECT 1 FROM operations AS active_project_exec
+                               WHERE active_project_exec.repository_id = candidate.repository_id
+                                 AND active_project_exec.kind = 'resolve_build_submit'
+                                 AND active_project_exec.status IN ('running', 'cancelling')
+                                 AND active_project_exec.lease_expires_at_ms > ?5
+                           ))
+                   )
+                   AND (
+                       candidate.status = 'queued'
                        OR (
-                           status IN ('running', 'cancelling')
+                           candidate.status IN ('running', 'cancelling')
                            AND (
-                               lease_expires_at_ms IS NULL
-                               OR lease_expires_at_ms <= ?5
+                               candidate.lease_expires_at_ms IS NULL
+                               OR candidate.lease_expires_at_ms <= ?5
                            )
                        )
                    )
-                 ORDER BY created_at_ms, operation_id
+                 ORDER BY candidate.created_at_ms, candidate.operation_id
                  LIMIT 1"
             ),
             params![
@@ -3208,12 +3297,46 @@ fn select_next_claim_candidate(
                 enabled_kinds.project_exec,
                 repository_id,
                 now_ms,
-                lease_expires_at_ms,
             ],
             raw_operation_from_row,
         )
         .optional()
         .map_err(map_database_decode_error)
+}
+
+fn fail_lost_project_exec_leases(
+    connection: &Connection,
+    repository_id: &LogicalRepositoryId,
+    now_ms: i64,
+) -> Result<(), JournalError> {
+    let operation_ids = {
+        let mut statement = connection.prepare(
+            "SELECT substr(operation_id, 1, 36) FROM operations
+             WHERE repository_id = ?1
+               AND kind = 'resolve_build_submit'
+               AND status IN ('running', 'cancelling')
+               AND execution_deadline_ms > ?2
+               AND (lease_expires_at_ms IS NULL OR lease_expires_at_ms <= ?2)
+             ORDER BY created_at_ms, operation_id
+             LIMIT ?3",
+        )?;
+        let rows = statement.query_map(
+            params![repository_id.as_str(), now_ms, MAX_PURGE_BATCH_SIZE as i64],
+            |row| row.get::<_, String>(0),
+        )?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(map_database_decode_error)?
+    };
+    for operation_id in operation_ids {
+        let operation_id =
+            OperationId::parse(operation_id).map_err(|_| JournalError::IntegrityFailure)?;
+        let record = select_validated_by_id(connection, &operation_id)?;
+        if &record.repository_id != repository_id {
+            return Err(JournalError::IntegrityFailure);
+        }
+        transition_to_execution_state_unknown(connection, &record, now_ms)?;
+    }
+    Ok(())
 }
 
 fn validated_record(
