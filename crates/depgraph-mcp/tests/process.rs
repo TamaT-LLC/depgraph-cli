@@ -3235,6 +3235,149 @@ fn issue_311_tasks_negotiation_preserves_modern_and_legacy_baselines() {
         }
         baseline.finish();
     }
+
+    let request_meta = |protocol: &str, declares_tasks: bool| {
+        let client_capabilities = if declares_tasks {
+            json!({"extensions": {"io.modelcontextprotocol/tasks": {}}})
+        } else {
+            json!({})
+        };
+        json!({
+            "io.modelcontextprotocol/protocolVersion": protocol,
+            "io.modelcontextprotocol/clientCapabilities": client_capabilities
+        })
+    };
+
+    let mut request_scoped =
+        InteractiveMcp::start(root.path(), &root.path().join("request-scoped.sqlite"));
+    initialize_tasks_mcp(&mut request_scoped, 20, "2026-07-28", false);
+    let declared_on_request = request_scoped.request(json!({
+        "jsonrpc": "2.0",
+        "id": 21,
+        "method": "tasks/get",
+        "params": {
+            "taskId": "op_ffffffffffffffffffffffffffffffff",
+            "_meta": request_meta("2026-07-28", true)
+        }
+    }));
+    assert_eq!(declared_on_request["error"]["code"], -32602);
+    for (id, method, params) in [
+        (
+            22,
+            "tasks/update",
+            json!({
+                "taskId": "op_ffffffffffffffffffffffffffffffff",
+                "inputResponses": {},
+                "_meta": request_meta("2026-07-28", true)
+            }),
+        ),
+        (
+            23,
+            "tasks/cancel",
+            json!({
+                "taskId": "op_ffffffffffffffffffffffffffffffff",
+                "_meta": request_meta("2026-07-28", true)
+            }),
+        ),
+    ] {
+        let response = request_scoped
+            .request(json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}));
+        assert_eq!(response["error"]["code"], -32602);
+    }
+    request_scoped.finish();
+
+    let mut no_carry = InteractiveMcp::start(root.path(), &root.path().join("no-carry.sqlite"));
+    initialize_tasks_mcp(&mut no_carry, 30, "2026-07-28", true);
+    let omitted_on_request = no_carry.request(json!({
+        "jsonrpc": "2.0",
+        "id": 31,
+        "method": "tasks/get",
+        "params": {
+            "taskId": "op_ffffffffffffffffffffffffffffffff",
+            "_meta": request_meta("2026-07-28", false)
+        }
+    }));
+    assert_eq!(omitted_on_request["error"]["code"], -32021);
+    for (id, method, params) in [
+        (
+            33,
+            "tasks/update",
+            json!({
+                "taskId": "op_ffffffffffffffffffffffffffffffff",
+                "inputResponses": {},
+                "_meta": request_meta("2026-07-28", false)
+            }),
+        ),
+        (
+            34,
+            "tasks/cancel",
+            json!({
+                "taskId": "op_ffffffffffffffffffffffffffffffff",
+                "_meta": request_meta("2026-07-28", false)
+            }),
+        ),
+    ] {
+        let response = no_carry
+            .request(json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}));
+        assert_eq!(response["error"]["code"], -32021);
+    }
+    let legacy_on_request = no_carry.request(json!({
+        "jsonrpc": "2.0",
+        "id": 32,
+        "method": "tasks/get",
+        "params": {
+            "taskId": "op_ffffffffffffffffffffffffffffffff",
+            "_meta": request_meta("2025-11-25", true)
+        }
+    }));
+    assert_eq!(legacy_on_request["error"]["code"], -32601);
+    for (id, method, params) in [
+        (
+            35,
+            "tasks/update",
+            json!({
+                "taskId": "op_ffffffffffffffffffffffffffffffff",
+                "inputResponses": {},
+                "_meta": request_meta("2025-11-25", true)
+            }),
+        ),
+        (
+            36,
+            "tasks/cancel",
+            json!({
+                "taskId": "op_ffffffffffffffffffffffffffffffff",
+                "_meta": request_meta("2025-11-25", true)
+            }),
+        ),
+    ] {
+        let response = no_carry
+            .request(json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}));
+        assert_eq!(response["error"]["code"], -32601);
+    }
+    no_carry.finish();
+
+    let mut stateless = InteractiveMcp::start(root.path(), &root.path().join("stateless.sqlite"));
+    let discovered = stateless.request(json!({
+        "jsonrpc": "2.0",
+        "id": 40,
+        "method": "server/discover",
+        "params": {"_meta": request_meta("2026-07-28", false)}
+    }));
+    assert!(
+        discovered["result"]["capabilities"]["extensions"]["io.modelcontextprotocol/tasks"]
+            .is_object()
+    );
+    let stateless_task = stateless.request(json!({
+        "jsonrpc": "2.0",
+        "id": 41,
+        "method": "tasks/get",
+        "params": {
+            "taskId": "op_ffffffffffffffffffffffffffffffff",
+            "_meta": request_meta("2026-07-28", true)
+        }
+    }));
+    assert_eq!(stateless_task["error"]["code"], -32602);
+    stateless.finish();
 }
 
 #[test]

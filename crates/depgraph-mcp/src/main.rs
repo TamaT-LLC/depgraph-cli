@@ -3,10 +3,7 @@ use std::{
     io::{self, Write as _},
     path::{Path, PathBuf},
     process::ExitCode,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -54,15 +51,17 @@ use depgraph_operation::{
     UNSUPPORTED_OPERATION_ERROR_JSON,
 };
 use rmcp::{
-    ErrorData as McpError, RoleServer, ServerHandler, ServiceExt,
+    ErrorData as McpError, RoleServer, ServerHandler, Service, ServiceExt,
     model::{
-        CallToolRequestParams, CallToolResponse, CancelTaskParams, CreateTaskResult, DetailedTask,
-        ErrorCode, GetTaskParams, GetTaskResult, Implementation, InitializeRequestParams,
-        InitializeResult, ListToolsResult, PaginatedRequestParams, ProtocolVersion,
-        ServerCapabilities, ServerInfo, Task, TaskPayload, TaskStatus, Tool, ToolsCapability,
-        UpdateTaskParams,
+        CallToolRequestParams, CallToolResponse, CancelTaskParams, ClientRequest, CreateTaskResult,
+        DetailedTask, ErrorCode, GetTaskParams, GetTaskResult, Implementation,
+        InitializeRequestParams, InitializeResult, ListToolsResult, PaginatedRequestParams,
+        ProtocolVersion, ServerCapabilities, ServerInfo, Task, TaskPayload, TaskStatus, Tool,
+        ToolsCapability, UpdateTaskParams,
     },
-    service::{RequestContext, RxJsonRpcMessage, TxJsonRpcMessage},
+    service::{
+        NotificationContext, RequestContext, RxJsonRpcMessage, ServiceRole, TxJsonRpcMessage,
+    },
     transport::Transport,
 };
 use serde::{Deserialize, Serialize};
@@ -160,8 +159,14 @@ struct DepgraphMcpServer {
     repository_id: LogicalRepositoryId,
     cursor_key: CursorKey,
     tools: Arc<[Tool]>,
-    modern_tasks_protocol: AtomicBool,
-    client_tasks_capability: AtomicBool,
+}
+
+struct RequestScopedDepgraphMcpServer {
+    inner: DepgraphMcpServer,
+}
+
+tokio::task_local! {
+    static EFFECTIVE_PROTOCOL_VERSION: ProtocolVersion;
 }
 
 #[derive(Deserialize)]
@@ -799,6 +804,54 @@ impl From<ResponseMappingError> for ToolExecutionFailure {
     }
 }
 
+fn request_protocol_version(
+    server: &DepgraphMcpServer,
+    request: &ClientRequest,
+    context: &RequestContext<RoleServer>,
+) -> ProtocolVersion {
+    let requested = match request {
+        ClientRequest::InitializeRequest(request) => Some(request.params.protocol_version.clone()),
+        _ => context.protocol_version(),
+    };
+    requested
+        .filter(|version| ServerHandler::supported_protocol_versions(server).contains(version))
+        .unwrap_or_else(|| ServerHandler::get_info(server).protocol_version)
+}
+
+impl Service<RoleServer> for RequestScopedDepgraphMcpServer {
+    fn handle_request(
+        &self,
+        request: <RoleServer as ServiceRole>::PeerReq,
+        context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<<RoleServer as ServiceRole>::Resp, McpError>> + '_ {
+        let protocol = request_protocol_version(&self.inner, &request, &context);
+        async move {
+            EFFECTIVE_PROTOCOL_VERSION
+                .scope(
+                    protocol,
+                    Service::<RoleServer>::handle_request(&self.inner, request, context),
+                )
+                .await
+        }
+    }
+
+    fn handle_notification(
+        &self,
+        notification: <RoleServer as ServiceRole>::PeerNot,
+        context: NotificationContext<RoleServer>,
+    ) -> impl Future<Output = Result<(), McpError>> + '_ {
+        Service::<RoleServer>::handle_notification(&self.inner, notification, context)
+    }
+
+    fn get_info(&self) -> <RoleServer as ServiceRole>::Info {
+        ServerHandler::get_info(&self.inner)
+    }
+
+    fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
+        ServerHandler::supported_protocol_versions(&self.inner)
+    }
+}
+
 impl ServerHandler for DepgraphMcpServer {
     fn get_info(&self) -> ServerInfo {
         let _ = (
@@ -811,7 +864,10 @@ impl ServerHandler for DepgraphMcpServer {
         tools.list_changed = Some(false);
         let mut capabilities = ServerCapabilities::default();
         capabilities.tools = Some(tools);
-        if self.modern_tasks_protocol.load(Ordering::Relaxed) {
+        if EFFECTIVE_PROTOCOL_VERSION
+            .try_with(|version| *version == ProtocolVersion::V_2026_07_28)
+            .unwrap_or(false)
+        {
             capabilities.extensions = ServerCapabilities::builder()
                 .enable_tasks()
                 .build()
@@ -829,21 +885,14 @@ impl ServerHandler for DepgraphMcpServer {
         context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<InitializeResult, McpError>> + '_ {
         context.peer.set_peer_info(request.clone());
-        let tasks_declared = request.capabilities.supports_tasks();
         let requested = request.protocol_version;
-        let fallback = self.get_info().protocol_version;
-        let negotiated = if self.supported_protocol_versions().contains(&requested) {
+        let fallback = ServerHandler::get_info(self).protocol_version;
+        let negotiated = if ServerHandler::supported_protocol_versions(self).contains(&requested) {
             requested
         } else {
             fallback
         };
-        self.modern_tasks_protocol.store(
-            negotiated == ProtocolVersion::V_2026_07_28,
-            Ordering::Relaxed,
-        );
-        self.client_tasks_capability
-            .store(tasks_declared, Ordering::Relaxed);
-        let mut info = self.get_info();
+        let mut info = ServerHandler::get_info(self);
         info.protocol_version = negotiated;
         std::future::ready(Ok(info))
     }
@@ -856,7 +905,9 @@ impl ServerHandler for DepgraphMcpServer {
         let config = self.operation_config.clone();
         let repository_id = self.repository_id.clone();
         let runtime = self.runtime.clone();
-        let client_tasks_capability = self.client_tasks_capability.load(Ordering::Relaxed);
+        let client_tasks_capability = context
+            .client_capabilities()
+            .is_some_and(|capabilities| capabilities.supports_tasks());
         async move {
             require_client_tasks_capability(client_tasks_capability)?;
             let cancellation = CancellationToken::new();
@@ -896,7 +947,9 @@ impl ServerHandler for DepgraphMcpServer {
     ) -> impl Future<Output = Result<(), McpError>> + '_ {
         let config = self.operation_config.clone();
         let runtime = self.runtime.clone();
-        let client_tasks_capability = self.client_tasks_capability.load(Ordering::Relaxed);
+        let client_tasks_capability = context
+            .client_capabilities()
+            .is_some_and(|capabilities| capabilities.supports_tasks());
         async move {
             require_client_tasks_capability(client_tasks_capability)?;
             let cancellation = CancellationToken::new();
@@ -937,7 +990,9 @@ impl ServerHandler for DepgraphMcpServer {
         let config = self.operation_config.clone();
         let repository_id = self.repository_id.clone();
         let runtime = self.runtime.clone();
-        let client_tasks_capability = self.client_tasks_capability.load(Ordering::Relaxed);
+        let client_tasks_capability = context
+            .client_capabilities()
+            .is_some_and(|capabilities| capabilities.supports_tasks());
         async move {
             require_client_tasks_capability(client_tasks_capability)?;
             let cancellation = CancellationToken::new();
@@ -1169,7 +1224,7 @@ fn task_cancel(
         return Err(task_request_cancelled());
     }
     manager
-        .cancel(&operation_id, now_ms)
+        .cancel_if(&operation_id, now_ms, || !cancellation.is_cancelled())
         .map_err(task_journal_error)?;
     Ok(())
 }
@@ -1238,6 +1293,7 @@ fn task_timestamp(timestamp_ms: i64) -> Result<String, McpError> {
 
 fn task_journal_error(error: JournalError) -> McpError {
     match error {
+        JournalError::RequestCancelled => task_request_cancelled(),
         JournalError::NotFound | JournalError::Expired => {
             McpError::invalid_params("unknown taskId", None)
         }
@@ -1561,6 +1617,12 @@ fn map_journal_error(error: &JournalError, operation_id: Option<OperationId>) ->
             false,
             AgentRemediation::ContactOperator,
             operation_details(),
+        ),
+        JournalError::RequestCancelled => AgentError::new(
+            AgentErrorCode::Internal,
+            true,
+            AgentRemediation::Retry,
+            None,
         ),
         JournalError::Storage(_) | JournalError::Io(_) | JournalError::EntropyUnavailable => {
             AgentError::new(
@@ -2798,13 +2860,13 @@ fn build_server(args: &Args) -> Result<DepgraphMcpServer> {
         repository_id,
         cursor_key: CursorKey::generate(),
         tools,
-        modern_tasks_protocol: AtomicBool::new(false),
-        client_tasks_capability: AtomicBool::new(false),
     })
 }
 
 async fn run(args: Args) -> Result<()> {
-    let server = build_server(&args)?;
+    let server = RequestScopedDepgraphMcpServer {
+        inner: build_server(&args)?,
+    };
     let state = Arc::new(TransportState::default());
     let transport =
         BoundedStdioTransport::new(tokio::io::stdin(), tokio::io::stdout(), Arc::clone(&state));
