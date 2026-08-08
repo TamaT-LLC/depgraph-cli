@@ -8,6 +8,7 @@ use std::{
 };
 
 use anyhow::{Context as _, Result, bail};
+use chrono::{DateTime, Utc};
 use clap::{Parser, ValueEnum};
 use depgraph_core::service::{
     BoundedQueryMode, BoundedQueryRequest, ClosedRecordDiff, CyclesRequest,
@@ -39,23 +40,28 @@ use depgraph_mcp_tools::{
     ContractBuildError, ContractVersion, Cursor, CursorKey, ErrorEnvelope, LogicalRepositoryId,
     MAX_AGENT_CONDITION_BYTES, MAX_PAGE_BYTES, MappedToolResult, OperationId, PageByteLimit,
     PageRequest, PageSize, PaginationContext, PortableTerminalOutputContract,
-    RepositoryRelativePath, ResponseMappingError, SnapshotId, SuccessEnvelope, ToolCatalog,
-    project_bounded_query_rows_cancellable, project_cycles_page_cancellable,
-    project_dependencies_page_cancellable, project_impact_response_cancellable,
-    project_unresolved_page_cancellable,
+    RepositoryRelativePath, ResponseMappingError, SnapshotId, SuccessEnvelope,
+    TASK_POLL_INTERVAL_MS, ToolCatalog, project_bounded_query_rows_cancellable,
+    project_cycles_page_cancellable, project_dependencies_page_cancellable,
+    project_impact_response_cancellable, project_unresolved_page_cancellable,
 };
 use depgraph_operation::{
     DEADLINE_EXCEEDED_ERROR_JSON, EXECUTION_STATE_UNKNOWN_ERROR_JSON, JournalError,
-    OperationManager, OperationOutcome, OperationStatus, OperationView,
+    OperationManager, OperationOutcome, OperationResultView, OperationStatus, OperationView,
     UNSUPPORTED_OPERATION_ERROR_JSON,
 };
 use rmcp::{
-    ErrorData as McpError, RoleServer, ServerHandler, ServiceExt,
+    ErrorData as McpError, RoleServer, ServerHandler, Service, ServiceExt,
     model::{
-        CallToolRequestParams, CallToolResponse, Implementation, ListToolsResult,
-        PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool, ToolsCapability,
+        CallToolRequestParams, CallToolResponse, CancelTaskParams, ClientRequest, CreateTaskResult,
+        DetailedTask, ErrorCode, GetTaskParams, GetTaskResult, Implementation,
+        InitializeRequestParams, InitializeResult, ListToolsResult, PaginatedRequestParams,
+        ProtocolVersion, ServerCapabilities, ServerInfo, Task, TaskPayload, TaskStatus, Tool,
+        ToolsCapability, UpdateTaskParams,
     },
-    service::{RequestContext, RxJsonRpcMessage, TxJsonRpcMessage},
+    service::{
+        NotificationContext, RequestContext, RxJsonRpcMessage, ServiceRole, TxJsonRpcMessage,
+    },
     transport::Transport,
 };
 use serde::{Deserialize, Serialize};
@@ -153,6 +159,14 @@ struct DepgraphMcpServer {
     repository_id: LogicalRepositoryId,
     cursor_key: CursorKey,
     tools: Arc<[Tool]>,
+}
+
+struct RequestScopedDepgraphMcpServer {
+    inner: DepgraphMcpServer,
+}
+
+tokio::task_local! {
+    static EFFECTIVE_PROTOCOL_VERSION: ProtocolVersion;
 }
 
 #[derive(Deserialize)]
@@ -790,6 +804,54 @@ impl From<ResponseMappingError> for ToolExecutionFailure {
     }
 }
 
+fn request_protocol_version(
+    server: &DepgraphMcpServer,
+    request: &ClientRequest,
+    context: &RequestContext<RoleServer>,
+) -> ProtocolVersion {
+    let requested = match request {
+        ClientRequest::InitializeRequest(request) => Some(request.params.protocol_version.clone()),
+        _ => context.protocol_version(),
+    };
+    requested
+        .filter(|version| ServerHandler::supported_protocol_versions(server).contains(version))
+        .unwrap_or_else(|| ServerHandler::get_info(server).protocol_version)
+}
+
+impl Service<RoleServer> for RequestScopedDepgraphMcpServer {
+    fn handle_request(
+        &self,
+        request: <RoleServer as ServiceRole>::PeerReq,
+        context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<<RoleServer as ServiceRole>::Resp, McpError>> + '_ {
+        let protocol = request_protocol_version(&self.inner, &request, &context);
+        async move {
+            EFFECTIVE_PROTOCOL_VERSION
+                .scope(
+                    protocol,
+                    Service::<RoleServer>::handle_request(&self.inner, request, context),
+                )
+                .await
+        }
+    }
+
+    fn handle_notification(
+        &self,
+        notification: <RoleServer as ServiceRole>::PeerNot,
+        context: NotificationContext<RoleServer>,
+    ) -> impl Future<Output = Result<(), McpError>> + '_ {
+        Service::<RoleServer>::handle_notification(&self.inner, notification, context)
+    }
+
+    fn get_info(&self) -> <RoleServer as ServiceRole>::Info {
+        ServerHandler::get_info(&self.inner)
+    }
+
+    fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
+        ServerHandler::supported_protocol_versions(&self.inner)
+    }
+}
+
 impl ServerHandler for DepgraphMcpServer {
     fn get_info(&self) -> ServerInfo {
         let _ = (
@@ -802,10 +864,167 @@ impl ServerHandler for DepgraphMcpServer {
         tools.list_changed = Some(false);
         let mut capabilities = ServerCapabilities::default();
         capabilities.tools = Some(tools);
+        if EFFECTIVE_PROTOCOL_VERSION
+            .try_with(|version| *version == ProtocolVersion::V_2026_07_28)
+            .unwrap_or(false)
+        {
+            capabilities.extensions = ServerCapabilities::builder()
+                .enable_tasks()
+                .build()
+                .extensions;
+        }
         ServerInfo::new(capabilities).with_server_info(
             Implementation::new("depgraph-mcp", env!("CARGO_PKG_VERSION"))
                 .with_description("depgraph MCP server"),
         )
+    }
+
+    fn initialize(
+        &self,
+        request: InitializeRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<InitializeResult, McpError>> + '_ {
+        context.peer.set_peer_info(request.clone());
+        let requested = request.protocol_version;
+        let fallback = ServerHandler::get_info(self).protocol_version;
+        let negotiated = if ServerHandler::supported_protocol_versions(self).contains(&requested) {
+            requested
+        } else {
+            fallback
+        };
+        let mut info = ServerHandler::get_info(self);
+        info.protocol_version = negotiated;
+        std::future::ready(Ok(info))
+    }
+
+    fn get_task(
+        &self,
+        request: GetTaskParams,
+        context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<GetTaskResult, McpError>> + '_ {
+        let config = self.operation_config.clone();
+        let repository_id = self.repository_id.clone();
+        let runtime = self.runtime.clone();
+        let client_tasks_capability = context
+            .client_capabilities()
+            .is_some_and(|capabilities| capabilities.supports_tasks());
+        async move {
+            require_client_tasks_capability(client_tasks_capability)?;
+            let cancellation = CancellationToken::new();
+            let request_cancellation = context.ct;
+            if request_cancellation.is_cancelled() {
+                cancellation.cancel();
+            }
+            let cancellation_bridge = tokio::spawn({
+                let cancellation = cancellation.clone();
+                async move {
+                    request_cancellation.cancelled().await;
+                    cancellation.cancel();
+                }
+            });
+            let execution = runtime
+                .execute_blocking(RuntimeClass::Read, cancellation, move |cancellation| {
+                    if cancellation.is_cancelled() {
+                        return Err(task_request_cancelled());
+                    }
+                    let result = task_get(&config, &repository_id, &request.task_id);
+                    if cancellation.is_cancelled() {
+                        Err(task_request_cancelled())
+                    } else {
+                        result
+                    }
+                })
+                .await;
+            cancellation_bridge.abort();
+            execution.unwrap_or_else(|_| Err(task_request_unavailable()))
+        }
+    }
+
+    fn cancel_task(
+        &self,
+        request: CancelTaskParams,
+        context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<(), McpError>> + '_ {
+        let config = self.operation_config.clone();
+        let runtime = self.runtime.clone();
+        let client_tasks_capability = context
+            .client_capabilities()
+            .is_some_and(|capabilities| capabilities.supports_tasks());
+        async move {
+            require_client_tasks_capability(client_tasks_capability)?;
+            let cancellation = CancellationToken::new();
+            let request_cancellation = context.ct;
+            if request_cancellation.is_cancelled() {
+                cancellation.cancel();
+            }
+            let cancellation_bridge = tokio::spawn({
+                let cancellation = cancellation.clone();
+                async move {
+                    request_cancellation.cancelled().await;
+                    cancellation.cancel();
+                }
+            });
+            let execution = runtime
+                .execute_blocking(RuntimeClass::Submit, cancellation, move |cancellation| {
+                    if cancellation.is_cancelled() {
+                        return Err(task_request_cancelled());
+                    }
+                    let result = task_cancel(&config, &request.task_id, &cancellation);
+                    if cancellation.is_cancelled() {
+                        Err(task_request_cancelled())
+                    } else {
+                        result
+                    }
+                })
+                .await;
+            cancellation_bridge.abort();
+            execution.unwrap_or_else(|_| Err(task_request_unavailable()))
+        }
+    }
+
+    fn update_task(
+        &self,
+        request: UpdateTaskParams,
+        context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<(), McpError>> + '_ {
+        let config = self.operation_config.clone();
+        let repository_id = self.repository_id.clone();
+        let runtime = self.runtime.clone();
+        let client_tasks_capability = context
+            .client_capabilities()
+            .is_some_and(|capabilities| capabilities.supports_tasks());
+        async move {
+            require_client_tasks_capability(client_tasks_capability)?;
+            let cancellation = CancellationToken::new();
+            let request_cancellation = context.ct;
+            if request_cancellation.is_cancelled() {
+                cancellation.cancel();
+            }
+            let cancellation_bridge = tokio::spawn({
+                let cancellation = cancellation.clone();
+                async move {
+                    request_cancellation.cancelled().await;
+                    cancellation.cancel();
+                }
+            });
+            let execution = runtime
+                .execute_blocking(RuntimeClass::Read, cancellation, move |cancellation| {
+                    if cancellation.is_cancelled() {
+                        return Err(task_request_cancelled());
+                    }
+                    // v1 tools never request mid-task input. Unknown response keys are ignored,
+                    // but durable identity and current read authorization are still revalidated.
+                    let result = task_get(&config, &repository_id, &request.task_id).map(|_| ());
+                    if cancellation.is_cancelled() {
+                        Err(task_request_cancelled())
+                    } else {
+                        result
+                    }
+                })
+                .await;
+            cancellation_bridge.abort();
+            execution.unwrap_or_else(|_| Err(task_request_unavailable()))
+        }
     }
 
     fn list_tools(
@@ -955,6 +1174,160 @@ fn internal_mapping_error(_error: ResponseMappingError) -> McpError {
     McpError::internal_error("canonical tool response mapping failed", None)
 }
 
+/// Resolve a durable operation through the MCP Tasks wire contract. Task IDs are
+/// deliberately identical to operation IDs so polling survives process restart.
+fn task_get(
+    config: &DepgraphServiceConfig,
+    repository_id: &LogicalRepositoryId,
+    task_id: &str,
+) -> Result<GetTaskResult, McpError> {
+    let operation_id = OperationId::parse(task_id)
+        .map_err(|_| McpError::invalid_params("invalid taskId", None))?;
+    let now_ms = system_now_ms().map_err(|_| McpError::internal_error("clock failure", None))?;
+    let manager = OperationManager::open(config).map_err(task_journal_error)?;
+    let operation = manager
+        .get(&operation_id, now_ms)
+        .map_err(task_journal_error)?;
+    let payload = match operation.status() {
+        OperationStatus::Queued | OperationStatus::Running | OperationStatus::Cancelling => {
+            TaskPayload::Working
+        }
+        OperationStatus::Cancelled => TaskPayload::Cancelled,
+        OperationStatus::Completed | OperationStatus::Failed => {
+            let terminal = manager
+                .result(&operation_id, now_ms)
+                .map_err(task_journal_error)?;
+            let mapped = map_terminal_operation_result(repository_id, &terminal)
+                .map_err(task_mapping_error)?;
+            TaskPayload::Completed {
+                result: call_tool_result_object(mapped)?,
+            }
+        }
+    };
+    Ok(GetTaskResult::new(task_from_operation(
+        &operation, payload,
+    )?))
+}
+
+/// `tasks/cancel` intentionally delegates to the same sealed operation manager
+/// used by `operation_cancel`; terminal and repeated cancellation are no-ops.
+fn task_cancel(
+    config: &DepgraphServiceConfig,
+    task_id: &str,
+    cancellation: &CancellationToken,
+) -> Result<(), McpError> {
+    let operation_id = OperationId::parse(task_id)
+        .map_err(|_| McpError::invalid_params("invalid taskId", None))?;
+    let now_ms = system_now_ms().map_err(|_| McpError::internal_error("clock failure", None))?;
+    let mut manager = OperationManager::open(config).map_err(task_journal_error)?;
+    if cancellation.is_cancelled() {
+        return Err(task_request_cancelled());
+    }
+    manager
+        .cancel_if(&operation_id, now_ms, || !cancellation.is_cancelled())
+        .map_err(task_journal_error)?;
+    Ok(())
+}
+
+fn create_task_result(operation: &OperationView) -> Result<CreateTaskResult, McpError> {
+    Ok(CreateTaskResult::new(task_metadata(
+        operation,
+        TaskStatus::Working,
+        true,
+    )?))
+}
+
+fn task_from_operation(
+    operation: &OperationView,
+    payload: TaskPayload,
+) -> Result<DetailedTask, McpError> {
+    let task = if matches!(payload, TaskPayload::Working) {
+        create_task_result(operation)?.task
+    } else {
+        task_metadata(operation, payload.status(), false)?
+    };
+    Ok(DetailedTask::new(task, payload))
+}
+
+fn task_metadata(
+    operation: &OperationView,
+    status: TaskStatus,
+    polling: bool,
+) -> Result<Task, McpError> {
+    let timestamps = operation.timestamps();
+    let retention = operation.retention();
+    let created_at = task_timestamp(timestamps.created_at_ms())?;
+    let updated_at = task_timestamp(timestamps.updated_at_ms())?;
+    let ttl_ms = retention
+        .retain_until_ms()
+        .checked_sub(timestamps.created_at_ms())
+        .and_then(|value| u64::try_from(value).ok())
+        .ok_or_else(|| McpError::internal_error("invalid operation retention", None))?;
+    let mut task = Task::new(
+        operation.operation_id().as_str(),
+        status,
+        created_at,
+        updated_at,
+    )
+    .with_ttl_ms(ttl_ms);
+    if polling {
+        task = task.with_poll_interval_ms(u64::from(TASK_POLL_INTERVAL_MS));
+    }
+    Ok(task)
+}
+
+fn call_tool_result_object(
+    mapped: MappedToolResult,
+) -> Result<serde_json::Map<String, serde_json::Value>, McpError> {
+    serde_json::to_value(mapped.into_result())
+        .ok()
+        .and_then(|value| value.as_object().cloned())
+        .ok_or_else(|| McpError::internal_error("canonical task result mapping failed", None))
+}
+
+fn task_timestamp(timestamp_ms: i64) -> Result<String, McpError> {
+    DateTime::<Utc>::from_timestamp_millis(timestamp_ms)
+        .map(|timestamp| timestamp.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+        .ok_or_else(|| McpError::internal_error("invalid operation timestamp", None))
+}
+
+fn task_journal_error(error: JournalError) -> McpError {
+    match error {
+        JournalError::RequestCancelled => task_request_cancelled(),
+        JournalError::NotFound | JournalError::Expired => {
+            McpError::invalid_params("unknown taskId", None)
+        }
+        JournalError::RepositoryMismatch | JournalError::CapabilityDenied => {
+            McpError::invalid_request("task access denied", None)
+        }
+        _ => McpError::internal_error("durable operation journal failure", None),
+    }
+}
+
+fn task_mapping_error(_error: ToolExecutionFailure) -> McpError {
+    McpError::internal_error("canonical task result mapping failed", None)
+}
+
+fn task_request_cancelled() -> McpError {
+    McpError::internal_error("task request cancelled", None)
+}
+
+fn task_request_unavailable() -> McpError {
+    McpError::internal_error("task request unavailable", None)
+}
+
+fn require_client_tasks_capability(declared: bool) -> Result<(), McpError> {
+    if declared {
+        Ok(())
+    } else {
+        Err(McpError::new(
+            ErrorCode::MISSING_REQUIRED_CLIENT_CAPABILITY,
+            "missing required client capability",
+            None,
+        ))
+    }
+}
+
 fn decode_arguments<T>(
     arguments: serde_json::Map<String, serde_json::Value>,
 ) -> Result<T, ToolExecutionFailure>
@@ -1031,36 +1404,7 @@ fn execute_operation_tool(
             let result = manager
                 .result(&operation_id, now_ms)
                 .map_err(&journal_failure)?;
-            match result.outcome() {
-                OperationOutcome::Completed(payload) => {
-                    let contract = PortableTerminalOutputContract::for_originating_tool(
-                        result.operation_kind().as_str(),
-                    )
-                    .ok_or_else(|| journal_failure(JournalError::IntegrityFailure))?;
-                    let output = contract
-                        .deserialize(payload.value().clone())
-                        .map_err(|_| journal_failure(JournalError::IntegrityFailure))?;
-                    if output.repository_id() != repository_id {
-                        return Err(journal_failure(JournalError::IntegrityFailure));
-                    }
-                    CanonicalResponseMapper::terminal_output(&output).map_err(Into::into)
-                }
-                OperationOutcome::Failed(payload) => {
-                    map_stored_operation_error(repository_id, &operation_id, payload.as_str())
-                }
-                OperationOutcome::Cancelled => CanonicalResponseMapper::error(&ErrorEnvelope::new(
-                    repository_id.clone(),
-                    AgentError::new(
-                        AgentErrorCode::Cancelled,
-                        false,
-                        AgentRemediation::Retry,
-                        Some(AgentErrorDetails::Operation {
-                            operation_id: operation_id.clone(),
-                        }),
-                    ),
-                ))
-                .map_err(Into::into),
-            }
+            map_terminal_operation_result(repository_id, &result)
         }
         "operation_cancel" => {
             let mut manager = OperationManager::open(config).map_err(&journal_failure)?;
@@ -1075,6 +1419,47 @@ fn execute_operation_tool(
         _ => Err(ToolExecutionFailure::Service(
             DepgraphServiceError::NotFound,
         )),
+    }
+}
+
+fn map_terminal_operation_result(
+    repository_id: &LogicalRepositoryId,
+    result: &OperationResultView,
+) -> Result<MappedToolResult, ToolExecutionFailure> {
+    let operation_id = result.operation().operation_id();
+    let journal_failure = || ToolExecutionFailure::Journal {
+        error: JournalError::IntegrityFailure,
+        operation_id: Some(operation_id.clone()),
+    };
+    match result.outcome() {
+        OperationOutcome::Completed(payload) => {
+            let contract = PortableTerminalOutputContract::for_originating_tool(
+                result.operation_kind().as_str(),
+            )
+            .ok_or_else(&journal_failure)?;
+            let output = contract
+                .deserialize(payload.value().clone())
+                .map_err(|_| journal_failure())?;
+            if output.repository_id() != repository_id {
+                return Err(journal_failure());
+            }
+            CanonicalResponseMapper::terminal_output(&output).map_err(Into::into)
+        }
+        OperationOutcome::Failed(payload) => {
+            map_stored_operation_error(repository_id, operation_id, payload.as_str())
+        }
+        OperationOutcome::Cancelled => CanonicalResponseMapper::error(&ErrorEnvelope::new(
+            repository_id.clone(),
+            AgentError::new(
+                AgentErrorCode::Cancelled,
+                false,
+                AgentRemediation::Retry,
+                Some(AgentErrorDetails::Operation {
+                    operation_id: operation_id.clone(),
+                }),
+            ),
+        ))
+        .map_err(Into::into),
     }
 }
 
@@ -1232,6 +1617,12 @@ fn map_journal_error(error: &JournalError, operation_id: Option<OperationId>) ->
             false,
             AgentRemediation::ContactOperator,
             operation_details(),
+        ),
+        JournalError::RequestCancelled => AgentError::new(
+            AgentErrorCode::Internal,
+            true,
+            AgentRemediation::Retry,
+            None,
         ),
         JournalError::Storage(_) | JournalError::Io(_) | JournalError::EntropyUnavailable => {
             AgentError::new(
@@ -2473,7 +2864,9 @@ fn build_server(args: &Args) -> Result<DepgraphMcpServer> {
 }
 
 async fn run(args: Args) -> Result<()> {
-    let server = build_server(&args)?;
+    let server = RequestScopedDepgraphMcpServer {
+        inner: build_server(&args)?,
+    };
     let state = Arc::new(TransportState::default());
     let transport =
         BoundedStdioTransport::new(tokio::io::stdin(), tokio::io::stdout(), Arc::clone(&state));

@@ -139,6 +139,8 @@ pub enum JournalError {
     LeaseExpired,
     #[error("operation execution deadline has elapsed")]
     DeadlineExceeded,
+    #[error("operation request was cancelled")]
+    RequestCancelled,
     #[error("operation journal storage failed")]
     Storage(#[source] rusqlite::Error),
     #[error("operation journal filesystem access failed")]
@@ -1574,6 +1576,28 @@ impl OperationJournal {
         current_capabilities: &CapabilitySet,
         now_ms: i64,
     ) -> Result<CancelOutcome, JournalError> {
+        self.cancel_if(
+            repository_id,
+            operation_id,
+            current_capabilities,
+            now_ms,
+            || true,
+        )
+    }
+
+    /// Record cooperative cancellation only if the caller still wants the
+    /// mutation after authorization and transaction acquisition complete.
+    pub fn cancel_if<F>(
+        &mut self,
+        repository_id: &LogicalRepositoryId,
+        operation_id: &OperationId,
+        current_capabilities: &CapabilitySet,
+        now_ms: i64,
+        should_commit: F,
+    ) -> Result<CancelOutcome, JournalError>
+    where
+        F: FnOnce() -> bool,
+    {
         validate_timestamp(now_ms)?;
         self.validate_requested_repository(repository_id)?;
         let enabled_capabilities = self.enabled_capabilities.clone();
@@ -1603,6 +1627,9 @@ impl OperationJournal {
             .allows_transition_to(OperationStatus::Cancelling)
         {
             return Err(JournalError::InvalidTransition);
+        }
+        if !should_commit() {
+            return Err(JournalError::RequestCancelled);
         }
         transaction.execute(
             "UPDATE operations SET status = 'cancelling', updated_at_ms = ?1
@@ -2302,6 +2329,20 @@ impl OperationManager {
         operation_id: &OperationId,
         now_ms: i64,
     ) -> Result<CancelOutcome, JournalError> {
+        self.cancel_if(operation_id, now_ms, || true)
+    }
+
+    /// Record cooperative cancellation only when authorization remains valid
+    /// and `should_commit` still permits the mutation at the journal boundary.
+    pub fn cancel_if<F>(
+        &mut self,
+        operation_id: &OperationId,
+        now_ms: i64,
+        should_commit: F,
+    ) -> Result<CancelOutcome, JournalError>
+    where
+        F: FnOnce() -> bool,
+    {
         self.revalidate_root()?;
         let record = self
             .journal
@@ -2313,11 +2354,12 @@ impl OperationManager {
         {
             return Err(JournalError::CapabilityDenied);
         }
-        let outcome = self.journal.cancel(
+        let outcome = self.journal.cancel_if(
             &self.authority.repository_id,
             operation_id,
             &self.authority.capabilities,
             now_ms,
+            should_commit,
         )?;
         self.revalidate_root()?;
         Ok(outcome)
@@ -3900,7 +3942,7 @@ mod unit_tests {
     use super::*;
 
     use std::sync::{
-        Mutex,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     };
 
@@ -4157,6 +4199,47 @@ mod unit_tests {
         assert!(matches!(
             pending.join().unwrap(),
             Err(JournalError::RepositoryMismatch)
+        ));
+        assert_eq!(journal_rows_digest(journal_path.as_path()), before_digest);
+    }
+
+    #[test]
+    fn cancel_waiting_for_immediate_lock_rechecks_request_before_mutation() {
+        let _serial = ROOT_TOCTOU_TEST_LOCK.lock().unwrap();
+        SQLITE_BUSY_REACHED.store(false, Ordering::SeqCst);
+        let root = tempfile::tempdir().unwrap();
+        let config = toctou_config(root.path());
+        let request = toctou_request(&config, b"cancel-request-toctou");
+        let mut manager = OperationManager::open(&config).unwrap();
+        let operation_id = manager
+            .submit(&request, 1_800_000_000_000)
+            .unwrap()
+            .operation_id()
+            .clone();
+        manager
+            .journal
+            .connection
+            .busy_handler(Some(signal_sqlite_busy))
+            .unwrap();
+        let journal_path = operation_journal_path(&config);
+        let before_digest = journal_rows_digest(journal_path.as_path());
+        let blocker = Connection::open(journal_path.as_path()).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
+
+        let pending = std::thread::spawn(move || {
+            manager.cancel_if(&operation_id, 1_800_000_000_001, || {
+                !worker_cancelled.load(Ordering::SeqCst)
+            })
+        });
+        wait_until_sqlite_busy();
+        cancelled.store(true, Ordering::SeqCst);
+        blocker.execute_batch("COMMIT").unwrap();
+
+        assert!(matches!(
+            pending.join().unwrap(),
+            Err(JournalError::RequestCancelled)
         ));
         assert_eq!(journal_rows_digest(journal_path.as_path()), before_digest);
     }
