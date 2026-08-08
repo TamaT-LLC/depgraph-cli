@@ -17,10 +17,11 @@ use depgraph_mcp_tools::{
 };
 use depgraph_operation::{
     CancelOutcome, CanonicalJson, CapabilitySet, DEADLINE_EXCEEDED_ERROR_JSON,
-    JOURNAL_SCHEMA_VERSION, JournalDigest, JournalError, LeaseOwner, MAX_CAPABILITY_JSON_BYTES,
-    MAX_OPERATION_INPUT_BYTES, MAX_PURGE_BATCH_SIZE, MAX_TERMINAL_PAYLOAD_BYTES, OperationJournal,
-    OperationKind, OperationOutcome, OperationProgress, OperationStatus, SubmitRequest,
-    TERMINAL_RETENTION_MS, TOMBSTONE_RETENTION_MS, operation_journal_path,
+    EXECUTION_STATE_UNKNOWN_ERROR_JSON, JOURNAL_SCHEMA_VERSION, JournalDigest, JournalError,
+    LeaseOwner, MAX_CAPABILITY_JSON_BYTES, MAX_OPERATION_INPUT_BYTES, MAX_PURGE_BATCH_SIZE,
+    MAX_TERMINAL_PAYLOAD_BYTES, OperationJournal, OperationKind, OperationOutcome,
+    OperationProgress, OperationStatus, SubmitRequest, TERMINAL_RETENTION_MS,
+    TOMBSTONE_RETENTION_MS, operation_journal_path,
 };
 use rusqlite::{Connection, params};
 use serde_json::json;
@@ -3119,7 +3120,7 @@ fn claim_next_recovers_deterministically_after_restart_and_expired_crash_lease()
     drop(restarted);
 
     let mut restarted = open_journal(root.path(), &graph_store);
-    let second = restarted
+    let competing = restarted
         .claim_next_runner_handoff(
             &repository(),
             &LeaseOwner::parse("runner-while-first-live").unwrap(),
@@ -3127,11 +3128,8 @@ fn claim_next_recovers_deterministically_after_restart_and_expired_crash_lease()
             NOW + 2,
             NOW + 11,
         )
-        .unwrap()
         .unwrap();
-    assert_eq!(second.record().operation_id(), &operation_ids[1]);
-    assert_eq!(second.handoff().operation_id(), &operation_ids[1]);
-    assert_eq!(second.handoff().claimed_at_ms(), Some(NOW + 2));
+    assert!(competing.is_none());
     restarted
         .cancel(
             &repository(),
@@ -3164,6 +3162,27 @@ fn claim_next_recovers_deterministically_after_restart_and_expired_crash_lease()
         reclaimed.record().lease().unwrap().token_digest(),
         JournalDigest::sha256(b"lease-after-crash")
     );
+    restarted
+        .mark_cancelled(
+            &repository(),
+            &operation_ids[0],
+            b"lease-after-crash",
+            NOW + 11,
+        )
+        .unwrap();
+    let second = restarted
+        .claim_next_runner_handoff(
+            &repository(),
+            &LeaseOwner::parse("runner-after-recovery").unwrap(),
+            b"second-recovered-lease",
+            NOW + 12,
+            NOW + 22,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(second.record().operation_id(), &operation_ids[1]);
+    assert_eq!(second.handoff().operation_id(), &operation_ids[1]);
+    assert_eq!(second.handoff().claimed_at_ms(), Some(NOW + 12));
     assert_eq!(reclaimed.handoff().claimed_at_ms(), Some(NOW + 1));
     assert!(
         restarted
@@ -3281,13 +3300,22 @@ fn claim_next_recovers_released_running_and_cancelling_work_after_restart() {
         OperationStatus::Running
     );
     assert_eq!(reclaimed_running.handoff().claimed_at_ms(), Some(NOW + 2));
+    restarted
+        .fail(
+            &repository(),
+            &running_id,
+            b"reclaimed-running-lease",
+            CanonicalJson::new(json!({"code": "test_recovery_complete"})).unwrap(),
+            NOW + 8,
+        )
+        .unwrap();
 
     let reclaimed_cancelling = restarted
         .claim_next_runner_handoff(
             &repository(),
             &LeaseOwner::parse("reclaimed-cancelling-runner").unwrap(),
             b"reclaimed-cancelling-lease",
-            NOW + 8,
+            NOW + 9,
             NOW + 200,
         )
         .unwrap()
@@ -3356,6 +3384,38 @@ fn claim_next_skips_deadline_expired_work_without_exposing_an_operation_list() {
 }
 
 #[test]
+fn claim_next_clamps_the_lease_to_a_near_operation_deadline() {
+    let (_root, _graph_store, config, mut journal) = journal();
+    let operation_id = journal
+        .submit(
+            &request(
+                &config,
+                json!({"deadline": "near"}),
+                b"near-deadline-claim",
+                NOW + 50,
+            ),
+            NOW,
+        )
+        .unwrap()
+        .operation_id()
+        .clone();
+
+    let claimed = journal
+        .claim_next_runner_handoff(
+            &repository(),
+            &LeaseOwner::parse("near-deadline-runner").unwrap(),
+            b"near-deadline-token",
+            NOW + 25,
+            NOW + 1_000,
+        )
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(claimed.record().operation_id(), &operation_id);
+    assert_eq!(claimed.record().lease().unwrap().expires_at_ms(), NOW + 50);
+}
+
+#[test]
 fn claim_next_skips_an_older_unauthorized_kind_after_capability_downgrade() {
     let root = tempfile::tempdir().unwrap();
     let graph_store = root.path().join("graph.sqlite");
@@ -3418,6 +3478,184 @@ fn claim_next_skips_an_older_unauthorized_kind_after_capability_downgrade() {
         journal.runner_handoff(&repository(), &unauthorized_id, NOW + 2),
         Err(JournalError::CapabilityDenied)
     ));
+}
+
+#[test]
+fn claim_next_enforces_one_global_store_writer_slot_across_runners() {
+    let (_root, _graph_store, config, mut journal) = journal();
+    let first = journal
+        .submit(
+            &request(
+                &config,
+                json!({"writer": 1}),
+                b"writer-slot-first",
+                DEADLINE,
+            ),
+            NOW,
+        )
+        .unwrap()
+        .operation_id()
+        .clone();
+    let second = journal
+        .submit(
+            &request(
+                &config,
+                json!({"writer": 2}),
+                b"writer-slot-second",
+                DEADLINE,
+            ),
+            NOW + 1,
+        )
+        .unwrap()
+        .operation_id()
+        .clone();
+
+    let claimed = journal
+        .claim_next_runner_handoff(
+            &repository(),
+            &LeaseOwner::parse("writer-runner-one").unwrap(),
+            b"writer-runner-one-token",
+            NOW + 2,
+            NOW + 1_000,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(claimed.record().operation_id(), &first);
+
+    let competing = journal
+        .claim_next_runner_handoff(
+            &repository(),
+            &LeaseOwner::parse("writer-runner-two").unwrap(),
+            b"writer-runner-two-token",
+            NOW + 3,
+            NOW + 1_000,
+        )
+        .unwrap();
+    assert!(competing.is_none());
+    assert_eq!(
+        journal
+            .get(&repository(), &second, NOW + 3)
+            .unwrap()
+            .status(),
+        OperationStatus::Queued
+    );
+}
+
+#[test]
+fn claim_next_enforces_one_global_project_exec_slot_across_runners() {
+    let (_root, _graph_store, config, mut journal) = journal();
+    let first = journal
+        .submit(
+            &request_for_kind(
+                &config,
+                OperationKind::ResolveBuildSubmit,
+                json!({"execution": 1}),
+                b"project-slot-first",
+                DEADLINE,
+            ),
+            NOW,
+        )
+        .unwrap()
+        .operation_id()
+        .clone();
+    let second = journal
+        .submit(
+            &request_for_kind(
+                &config,
+                OperationKind::ResolveBuildSubmit,
+                json!({"execution": 2}),
+                b"project-slot-second",
+                DEADLINE,
+            ),
+            NOW + 1,
+        )
+        .unwrap()
+        .operation_id()
+        .clone();
+
+    let claimed = journal
+        .claim_next_runner_handoff(
+            &repository(),
+            &LeaseOwner::parse("project-runner-one").unwrap(),
+            b"project-runner-one-token",
+            NOW + 2,
+            NOW + 1_000,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(claimed.record().operation_id(), &first);
+
+    let competing = journal
+        .claim_next_runner_handoff(
+            &repository(),
+            &LeaseOwner::parse("project-runner-two").unwrap(),
+            b"project-runner-two-token",
+            NOW + 3,
+            NOW + 1_000,
+        )
+        .unwrap();
+    assert!(competing.is_none());
+    assert_eq!(
+        journal
+            .get(&repository(), &second, NOW + 3)
+            .unwrap()
+            .status(),
+        OperationStatus::Queued
+    );
+}
+
+#[test]
+fn project_exec_lease_loss_fails_closed_without_reclaiming_the_handoff() {
+    let (_root, _graph_store, config, mut journal) = journal();
+    let operation_id = journal
+        .submit(
+            &request_for_kind(
+                &config,
+                OperationKind::ResolveBuildSubmit,
+                json!({"execution": "unsafe"}),
+                b"unsafe-lease-loss",
+                DEADLINE,
+            ),
+            NOW,
+        )
+        .unwrap()
+        .operation_id()
+        .clone();
+    journal
+        .acquire_lease(
+            &repository(),
+            &operation_id,
+            &LeaseOwner::parse("lost-project-runner").unwrap(),
+            b"lost-project-token",
+            NOW + 1,
+            NOW + 10,
+        )
+        .unwrap();
+
+    let reclaimed = journal
+        .claim_next_runner_handoff(
+            &repository(),
+            &LeaseOwner::parse("replacement-project-runner").unwrap(),
+            b"replacement-project-token",
+            NOW + 10,
+            NOW + 1_000,
+        )
+        .unwrap();
+
+    assert!(reclaimed.is_none());
+    let record = journal.get(&repository(), &operation_id, NOW + 10).unwrap();
+    assert_eq!(record.status(), OperationStatus::Failed);
+    assert_eq!(
+        record.error().unwrap().as_str(),
+        EXECUTION_STATE_UNKNOWN_ERROR_JSON
+    );
+    assert_eq!(
+        journal
+            .runner_handoff(&repository(), &operation_id, NOW + 10)
+            .unwrap()
+            .completed_at_ms(),
+        Some(NOW + 10)
+    );
 }
 
 #[test]
