@@ -902,18 +902,40 @@ impl InteractiveMcp {
         }
     }
 
-    fn request(&mut self, request: Value) -> Value {
-        writeln!(self.stdin, "{request}").unwrap();
+    fn send(&mut self, message: Value) {
+        writeln!(self.stdin, "{message}").unwrap();
         self.stdin.flush().unwrap();
+    }
+
+    fn read_response(&mut self) -> Value {
         let mut line = String::new();
         self.stdout.read_line(&mut line).unwrap();
-        assert!(!line.is_empty(), "MCP server closed before responding");
+        if line.is_empty() {
+            let status = self.child.try_wait().unwrap();
+            let mut stderr = Vec::new();
+            if status.is_some() {
+                self.child
+                    .stderr
+                    .as_mut()
+                    .unwrap()
+                    .read_to_end(&mut stderr)
+                    .unwrap();
+            }
+            panic!(
+                "MCP server closed before responding: status={status:?}, stderr={}",
+                String::from_utf8_lossy(&stderr)
+            );
+        }
         serde_json::from_str(&line).expect("MCP stdout response is JSON")
     }
 
+    fn request(&mut self, request: Value) -> Value {
+        self.send(request);
+        self.read_response()
+    }
+
     fn notify(&mut self, notification: Value) {
-        writeln!(self.stdin, "{notification}").unwrap();
-        self.stdin.flush().unwrap();
+        self.send(notification);
     }
 
     fn finish(mut self) {
@@ -961,6 +983,29 @@ fn initialize_interactive_mcp(mcp: &mut InteractiveMcp, id: u64) {
         }
     }));
     assert_eq!(initialized["result"]["protocolVersion"], "2026-07-28");
+}
+
+fn initialize_tasks_mcp(
+    mcp: &mut InteractiveMcp,
+    id: u64,
+    protocol_version: &str,
+    declares_tasks: bool,
+) -> Value {
+    let capabilities = if declares_tasks {
+        json!({"extensions": {"io.modelcontextprotocol/tasks": {}}})
+    } else {
+        json!({})
+    };
+    mcp.request(json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": protocol_version,
+            "capabilities": capabilities,
+            "clientInfo": {"name": "tasks-test", "version": "1"}
+        }
+    }))
 }
 
 fn process_now_ms() -> i64 {
@@ -3112,6 +3157,406 @@ fn initializes_legacy_2025_11_25() {
 #[test]
 fn initializes_modern_2026_07_28() {
     initializes("2026-07-28");
+}
+
+#[test]
+fn issue_311_tasks_negotiation_preserves_modern_and_legacy_baselines() {
+    let root = tempfile::tempdir().unwrap();
+
+    let mut tasks = InteractiveMcp::start(root.path(), &root.path().join("tasks.sqlite"));
+    let initialized = initialize_tasks_mcp(&mut tasks, 1, "2026-07-28", true);
+    assert_eq!(
+        initialized["result"]["capabilities"]["extensions"]["io.modelcontextprotocol/tasks"],
+        json!({})
+    );
+    let tasks_tools = tasks.request(json!({
+        "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}
+    }))["result"]["tools"]
+        .clone();
+    let unknown = tasks.request(json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "tasks/get",
+        "params": {"taskId": "op_ffffffffffffffffffffffffffffffff"}
+    }));
+    assert_eq!(unknown["error"]["code"], -32602);
+    tasks.finish();
+
+    for (index, protocol) in ["2026-07-28", "2025-11-25"].into_iter().enumerate() {
+        let store = root.path().join(format!("baseline-{index}.sqlite"));
+        let mut baseline = InteractiveMcp::start(root.path(), &store);
+        let initialized =
+            initialize_tasks_mcp(&mut baseline, 10, protocol, protocol == "2025-11-25");
+        let advertised =
+            &initialized["result"]["capabilities"]["extensions"]["io.modelcontextprotocol/tasks"];
+        if protocol == "2026-07-28" {
+            assert!(advertised.is_object());
+        } else {
+            assert!(advertised.is_null());
+        }
+        let baseline_tools = baseline.request(json!({
+            "jsonrpc": "2.0", "id": 11, "method": "tools/list", "params": {}
+        }))["result"]["tools"]
+            .clone();
+        assert_eq!(baseline_tools, tasks_tools);
+        let unavailable = baseline.request(json!({
+            "jsonrpc": "2.0",
+            "id": 12,
+            "method": "tasks/get",
+            "params": {"taskId": "op_ffffffffffffffffffffffffffffffff"}
+        }));
+        assert_eq!(
+            unavailable["error"]["code"],
+            if protocol == "2026-07-28" {
+                -32021
+            } else {
+                -32601
+            }
+        );
+        for (id, method, params) in [
+            (
+                13,
+                "tasks/update",
+                json!({
+                    "taskId": "op_ffffffffffffffffffffffffffffffff",
+                    "inputResponses": {}
+                }),
+            ),
+            (
+                14,
+                "tasks/cancel",
+                json!({"taskId": "op_ffffffffffffffffffffffffffffffff"}),
+            ),
+        ] {
+            let response = baseline.request(json!({
+                "jsonrpc": "2.0", "id": id, "method": method, "params": params
+            }));
+            assert_eq!(response["error"]["code"], unavailable["error"]["code"]);
+        }
+        baseline.finish();
+    }
+}
+
+#[test]
+fn issue_311_tasks_reconnect_result_idempotency_and_authorized_cancel_conform() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("repository");
+    let store_path = temporary.path().join("graph.sqlite");
+    fs::create_dir(&root).unwrap();
+    let full_config = operation_service_config(
+        &root,
+        &store_path,
+        [
+            DepgraphCapability::Read,
+            DepgraphCapability::StoreWrite,
+            DepgraphCapability::DaemonControl,
+        ],
+    );
+    let repository_id = LogicalRepositoryId::parse(full_config.logical_repository_id()).unwrap();
+    let submitted_at_ms = process_now_ms();
+    let deadline_ms = submitted_at_ms + 120_000;
+    let completed_request = SubmitRequest::new(
+        &full_config,
+        OperationKind::DaemonStop,
+        &json!({"fixture": "tasks-completed"}),
+        b"issue-311-completed",
+        deadline_ms,
+    )
+    .unwrap();
+    let cancel_request = SubmitRequest::new(
+        &full_config,
+        OperationKind::DaemonStop,
+        &json!({"fixture": "tasks-cancel"}),
+        b"issue-311-cancel",
+        deadline_ms,
+    )
+    .unwrap();
+    let failed_request = SubmitRequest::new(
+        &full_config,
+        OperationKind::DaemonStop,
+        &json!({"fixture": "tasks-failed"}),
+        b"issue-311-failed",
+        deadline_ms,
+    )
+    .unwrap();
+    let mut manager = OperationManager::open(&full_config).unwrap();
+    let completed_id = manager
+        .submit(&completed_request, submitted_at_ms)
+        .unwrap()
+        .operation_id()
+        .clone();
+    let cancel_id = manager
+        .submit(&cancel_request, submitted_at_ms + 1)
+        .unwrap()
+        .operation_id()
+        .clone();
+    let failed_id = manager
+        .submit(&failed_request, submitted_at_ms + 2)
+        .unwrap()
+        .operation_id()
+        .clone();
+    let retried = manager
+        .submit(&completed_request, submitted_at_ms + 3)
+        .unwrap();
+    assert!(!retried.created());
+    assert_eq!(retried.operation_id(), &completed_id);
+    drop(manager);
+
+    let mut journal = OperationJournal::open(&full_config).unwrap();
+    journal
+        .acquire_lease(
+            &repository_id,
+            &cancel_id,
+            &LeaseOwner::parse("issue-311-cancel").unwrap(),
+            b"issue-311-cancel-lease",
+            submitted_at_ms + 3,
+            submitted_at_ms + 60_000,
+        )
+        .unwrap();
+    journal
+        .acquire_lease(
+            &repository_id,
+            &completed_id,
+            &LeaseOwner::parse("issue-311-complete").unwrap(),
+            b"issue-311-complete-lease",
+            submitted_at_ms + 3,
+            submitted_at_ms + 60_000,
+        )
+        .unwrap();
+    journal
+        .acquire_lease(
+            &repository_id,
+            &failed_id,
+            &LeaseOwner::parse("issue-311-failed").unwrap(),
+            b"issue-311-failed-lease",
+            submitted_at_ms + 4,
+            submitted_at_ms + 60_000,
+        )
+        .unwrap();
+    let envelope = SuccessEnvelope::new(repository_id.clone(), None, issue_310_daemon_status());
+    journal
+        .complete(
+            &repository_id,
+            &completed_id,
+            b"issue-311-complete-lease",
+            CanonicalJson::new(serde_json::to_value(&envelope).unwrap()).unwrap(),
+            submitted_at_ms + 4,
+        )
+        .unwrap();
+    let failure = ErrorEnvelope::new(
+        repository_id.clone(),
+        AgentError::new(
+            AgentErrorCode::ResourceExhausted,
+            false,
+            AgentRemediation::Retry,
+            Some(AgentErrorDetails::Operation {
+                operation_id: failed_id.clone(),
+            }),
+        ),
+    );
+    journal
+        .fail(
+            &repository_id,
+            &failed_id,
+            b"issue-311-failed-lease",
+            CanonicalJson::new(serde_json::to_value(&failure).unwrap()).unwrap(),
+            submitted_at_ms + 5,
+        )
+        .unwrap();
+    drop(journal);
+
+    let mut denied = InteractiveMcp::start(&root, &store_path);
+    initialize_tasks_mcp(&mut denied, 1, "2026-07-28", true);
+    let completed = denied.request(json!({
+        "jsonrpc": "2.0", "id": 2, "method": "tasks/get",
+        "params": {"taskId": completed_id.as_str()}
+    }));
+    assert_eq!(completed["result"]["taskId"], completed_id.as_str());
+    assert_eq!(completed["result"]["status"], "completed");
+    assert_eq!(completed["result"]["result"]["isError"], false);
+    assert_eq!(
+        completed["result"]["result"]["structuredContent"]["result"]["phase"],
+        "stopped"
+    );
+    assert!(
+        completed["result"]["createdAt"]
+            .as_str()
+            .unwrap()
+            .ends_with('Z')
+    );
+    assert!(completed["result"]["ttlMs"].as_u64().is_some());
+
+    let before_update = operation_journal_state_digest(&full_config);
+    let updated = denied.request(json!({
+        "jsonrpc": "2.0", "id": 19, "method": "tasks/update",
+        "params": {
+            "taskId": completed_id.as_str(),
+            "inputResponses": {"unknown-response-key": {"secret": "ignored"}}
+        }
+    }));
+    assert!(updated.get("error").is_none());
+    assert_eq!(operation_journal_state_digest(&full_config), before_update);
+    let unknown_update = denied.request(json!({
+        "jsonrpc": "2.0", "id": 21, "method": "tasks/update",
+        "params": {
+            "taskId": "op_ffffffffffffffffffffffffffffffff",
+            "inputResponses": {}
+        }
+    }));
+    assert_eq!(unknown_update["error"]["code"], -32602);
+    assert_eq!(operation_journal_state_digest(&full_config), before_update);
+
+    let failed = denied.request(json!({
+        "jsonrpc": "2.0", "id": 20, "method": "tasks/get",
+        "params": {"taskId": failed_id.as_str()}
+    }));
+    assert_eq!(failed["result"]["status"], "completed");
+    assert_eq!(failed["result"]["result"]["isError"], true);
+    assert_eq!(
+        failed["result"]["result"]["structuredContent"]["error"]["code"],
+        "RESOURCE_EXHAUSTED"
+    );
+
+    let working = denied.request(json!({
+        "jsonrpc": "2.0", "id": 3, "method": "tasks/get",
+        "params": {"taskId": cancel_id.as_str()}
+    }));
+    assert_eq!(working["result"]["taskId"], cancel_id.as_str());
+    assert_eq!(working["result"]["status"], "working");
+    assert_eq!(working["result"]["pollIntervalMs"], 1_000);
+
+    let before_denied = operation_journal_state_digest(&full_config);
+    let cancel_denied = denied.request(json!({
+        "jsonrpc": "2.0", "id": 4, "method": "tasks/cancel",
+        "params": {"taskId": cancel_id.as_str()}
+    }));
+    assert_eq!(cancel_denied["error"]["code"], -32600);
+    assert_eq!(operation_journal_state_digest(&full_config), before_denied);
+    denied.finish();
+
+    let mut authorized = InteractiveMcp::start_with_capabilities(
+        &root,
+        &store_path,
+        &["store-write", "daemon-control"],
+    );
+    initialize_tasks_mcp(&mut authorized, 10, "2026-07-28", true);
+    let reconnected = authorized.request(json!({
+        "jsonrpc": "2.0", "id": 11, "method": "tasks/get",
+        "params": {"taskId": completed_id.as_str()}
+    }));
+    assert_eq!(reconnected["result"], completed["result"]);
+
+    let cancelled = authorized.request(json!({
+        "jsonrpc": "2.0", "id": 12, "method": "tasks/cancel",
+        "params": {"taskId": cancel_id.as_str()}
+    }));
+    assert!(cancelled.get("error").is_none());
+    let after_first_cancel = operation_journal_state_digest(&full_config);
+    let repeated = authorized.request(json!({
+        "jsonrpc": "2.0", "id": 13, "method": "tasks/cancel",
+        "params": {"taskId": cancel_id.as_str()}
+    }));
+    assert!(repeated.get("error").is_none());
+    assert_eq!(
+        operation_journal_state_digest(&full_config),
+        after_first_cancel
+    );
+    let cancellation_requested = authorized.request(json!({
+        "jsonrpc": "2.0", "id": 14, "method": "tasks/get",
+        "params": {"taskId": cancel_id.as_str()}
+    }));
+    assert_eq!(cancellation_requested["result"]["status"], "working");
+    let mut journal = OperationJournal::open(&full_config).unwrap();
+    journal
+        .mark_cancelled(
+            &repository_id,
+            &cancel_id,
+            b"issue-311-cancel-lease",
+            process_now_ms(),
+        )
+        .unwrap();
+    drop(journal);
+    let terminal = authorized.request(json!({
+        "jsonrpc": "2.0", "id": 15, "method": "tasks/get",
+        "params": {"taskId": cancel_id.as_str()}
+    }));
+    assert_eq!(terminal["result"]["status"], "cancelled");
+    authorized.finish();
+}
+
+#[test]
+fn issue_311_tasks_request_cancellation_prevents_mutation_and_server_recovers() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("repository");
+    let store_path = temporary.path().join("graph.sqlite");
+    fs::create_dir(&root).unwrap();
+    let config = operation_service_config(
+        &root,
+        &store_path,
+        [
+            DepgraphCapability::Read,
+            DepgraphCapability::StoreWrite,
+            DepgraphCapability::DaemonControl,
+        ],
+    );
+    let request = SubmitRequest::new(
+        &config,
+        OperationKind::DaemonStop,
+        &json!({"fixture": "tasks-runtime-cancellation"}),
+        b"issue-311-runtime-cancellation",
+        process_now_ms() + 60_000,
+    )
+    .unwrap();
+    let task_id = OperationManager::open(&config)
+        .unwrap()
+        .submit(&request, process_now_ms())
+        .unwrap()
+        .operation_id()
+        .clone();
+    let before = operation_journal_state_digest(&config);
+
+    for (id, method, params) in [
+        (30, "tasks/get", json!({"taskId": task_id.as_str()})),
+        (
+            31,
+            "tasks/update",
+            json!({"taskId": task_id.as_str(), "inputResponses": {}}),
+        ),
+        (32, "tasks/cancel", json!({"taskId": task_id.as_str()})),
+    ] {
+        let mut mcp = InteractiveMcp::start_with_capabilities(
+            &root,
+            &store_path,
+            &["store-write", "daemon-control"],
+        );
+        initialize_tasks_mcp(&mut mcp, 1, "2026-07-28", true);
+
+        let blocker = Connection::open(operation_journal_path(&config)).unwrap();
+        blocker
+            .execute_batch("PRAGMA journal_mode = DELETE; BEGIN EXCLUSIVE;")
+            .unwrap();
+        mcp.send(json!({
+            "jsonrpc": "2.0", "id": id, "method": method, "params": params
+        }));
+        std::thread::sleep(Duration::from_millis(75));
+        mcp.notify(json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/cancelled",
+            "params": {"requestId": id, "reason": "issue-311-fixture"}
+        }));
+        std::thread::sleep(Duration::from_millis(75));
+        blocker.execute_batch("ROLLBACK").unwrap();
+        let probe_id = id + 100;
+        mcp.send(json!({
+            "jsonrpc": "2.0", "id": probe_id, "method": "tools/list", "params": {}
+        }));
+        let recovered = mcp.read_response();
+        assert_eq!(recovered["id"], probe_id);
+        assert!(recovered["result"]["tools"].is_array());
+        std::thread::sleep(Duration::from_millis(75));
+        mcp.finish();
+        assert_eq!(operation_journal_state_digest(&config), before);
+    }
 }
 
 #[test]

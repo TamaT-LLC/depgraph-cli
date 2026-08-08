@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+chrono.workspace = true
 clap.workspace = true
 depgraph-core = { path = "../depgraph-core" }
 depgraph-mcp-tools = { path = "../depgraph-mcp-tools" }
