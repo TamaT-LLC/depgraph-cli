@@ -1,0 +1,20 @@
+[package]
+name = "depgraph-operation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Durable SQLite operation journal for depgraph Agent operations"
+
+[dependencies]
+depgraph-core = { path = "../depgraph-core" }
+depgraph-mcp-tools = { path = "../depgraph-mcp-tools" }
+getrandom.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

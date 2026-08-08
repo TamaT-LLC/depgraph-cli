@@ -555,6 +555,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "depgraph-operation"
+version = "0.4.0"
+dependencies = [
+ "depgraph-core",
+ "depgraph-mcp-tools",
+ "getrandom 0.3.4",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "depgraph-protocol"
 version = "0.4.0"
 dependencies = [
