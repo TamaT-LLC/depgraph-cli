@@ -1460,6 +1460,8 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "sudo apt-get install --yes --no-install-recommends bubblewrap",
         "scripts/compiler-precise-hostile-e2e.sh",
         "compiler-precise-hostile-${{ github.sha }}",
+        "steps.decide.outputs.run",
+        "crates/depgraph-rustc-wrapper/",
     ] {
         if !ci_workflow.contains(required) {
             bail!("CI is missing compiler-precise hostile gate {required:?}");

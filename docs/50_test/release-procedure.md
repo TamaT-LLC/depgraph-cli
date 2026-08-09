@@ -7,13 +7,14 @@ PRと`main` pushでは高速CIを実行し、手動CIと`v*`タグではフル�
 
 | イベント | Workflow | 実行内容 | 目的 |
 | --- | --- | --- | --- |
-| PR | CI | Rust、Go、Web、compiler-precise hostile E2E | マージ前の回帰検出 |
-| `main` push | CI | PRと同じ4ジョブ | マージ結果の確認 |
-| `workflow_dispatch` | CI | 上記4ジョブ、benchmark、Linux / macOS integration、Windows smoke | タグ作成前のフルCI |
+| PR | CI | Rust、Go、Web、compiler-precise hostile E2E（hostile は関連 path 変更時のみ。main push / workflow_dispatch は常時） | マージ前の回帰検出 |
+| `main` push | CI | Rust、Go、Web、compiler-precise hostile E2E（hostile 含む4ジョブを常時） | マージ結果の確認 |
+| `workflow_dispatch` | CI | 上記4ジョブ（hostile 常時）、benchmark、Linux / macOS integration、Windows smoke | タグ作成前のフルCI |
 | `v*`タグのpush | Release | quality、hostile E2E、benchmark、全5 targetのarchiveとcompiler pack、aggregate verification | 配布物の構築と公開 |
 
 GreptileはGitHub Actionsのジョブではないが、PRをマージする前に未解決の指摘を残さない。
 PRまたは`main` pushでbenchmark、integration、windows-smokeが`skipped`になるのは正常である。
+PRで compiler-precise hostile が関連 path 変更なしにより重いステップを実行しない場合も、ジョブ自体は success を返す（required check を壊さない）。
 
 ## リリース準備
 

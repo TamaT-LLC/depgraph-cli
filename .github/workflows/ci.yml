@@ -80,16 +80,45 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - run: rustup toolchain install 1.93.1 --profile minimal
-      - run: rustup default 1.93.1
+        with:
+          # Full history so pull_request path filtering can diff base..head.
+          fetch-depth: 0
+      - name: Decide whether compiler-precise-hostile must run
+        id: decide
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] || [ "${{ github.event_name }}" = "push" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          changed="$(git diff --name-only "${{ github.event.pull_request.base.sha }}" "${{ github.event.pull_request.head.sha }}")"
+          if printf '%s\n' "$changed" | grep -qE '^(crates/depgraph-core/|crates/depgraph-rustc-wrapper/|crates/depgraph-rustc-query/|crates/depgraph-cli/|crates/depgraph-store/|scripts/compiler-precise-hostile|docs/50_test/compiler-precise-hostile|\.github/workflows/ci\.yml)'; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Skip compiler-precise-hostile when unrelated
+        if: steps.decide.outputs.run != 'true'
+        run: echo "Skipping compiler-precise-hostile (no relevant path changes)"
+      - if: steps.decide.outputs.run == 'true'
+        run: rustup toolchain install 1.93.1 --profile minimal
+      - if: steps.decide.outputs.run == 'true'
+        run: rustup default 1.93.1
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        if: steps.decide.outputs.run == 'true'
         with:
           # Separate from rust job: CARGO_INCREMENTAL=0 and hostile e2e path.
           key: compiler-precise-hostile
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        if: steps.decide.outputs.run == 'true'
         with:
           node-version: 24.18.0
       - name: Install the enforced Linux namespace boundary
+        if: steps.decide.outputs.run == 'true'
         run: |
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends bubblewrap
@@ -97,12 +126,15 @@ jobs:
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
       - name: Populate the locked dependency cache before network isolation
+        if: steps.decide.outputs.run == 'true'
         run: cargo fetch --locked
       - name: Compiler-precise hostile execution and rollback E2E
+        if: steps.decide.outputs.run == 'true'
         env:
           DEPGRAPH_COMPILER_HOSTILE_REPORT: dist/compiler-precise-hostile-e2e.json
         run: scripts/compiler-precise-hostile-e2e.sh
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: steps.decide.outputs.run == 'true'
         with:
           name: compiler-precise-hostile-${{ github.sha }}
           path: dist/compiler-precise-hostile-e2e.json
