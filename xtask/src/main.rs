@@ -1460,6 +1460,23 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "sudo apt-get install --yes --no-install-recommends bubblewrap",
         "scripts/compiler-precise-hostile-e2e.sh",
         "compiler-precise-hostile-${{ github.sha }}",
+        "id: decide",
+        "steps.decide.outputs.run",
+        r#"github.event_name }}" = "workflow_dispatch""#,
+        r#"github.event_name }}" = "push""#,
+        "github.event.pull_request.base.sha",
+        "github.event.pull_request.head.sha",
+        r#"Cargo\.(toml|lock)"#,
+        "crates/depgraph-core/",
+        "crates/depgraph-rustc-wrapper/",
+        "crates/depgraph-rustc-query/",
+        "crates/depgraph-cli/",
+        "crates/depgraph-store/",
+        "scripts/compiler-precise-hostile",
+        "docs/50_test/compiler-precise-hostile",
+        r#"\.github/workflows/ci\.yml"#,
+        "if: steps.decide.outputs.run == 'true'",
+        "if: steps.decide.outputs.run != 'true'",
     ] {
         if !ci_workflow.contains(required) {
             bail!("CI is missing compiler-precise hostile gate {required:?}");
