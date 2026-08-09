@@ -9,10 +9,10 @@
 - process isolation: enforced
 
 CI path filter: on pull requests the job reports the required check name but
-runs the expensive hostile steps only when related paths change (compiler
-crates, hostile scripts/docs, or `.github/workflows/ci.yml`). `main` push and
-`workflow_dispatch` always run the full gate; unrelated PRs skip heavy steps
-and still succeed.
+runs the expensive hostile steps only when related paths change (`Cargo.toml` /
+`Cargo.lock`, compiler crates, hostile scripts/docs, or `.github/workflows/ci.yml`).
+`main` push and `workflow_dispatch` always run the full gate; unrelated PRs skip
+heavy steps and still succeed.
 
 ## Enforced boundary
 
