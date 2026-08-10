@@ -14,19 +14,24 @@ pub use launcher::{
     RunnerLaunchError, RunnerResolutionPolicy,
 };
 pub use runner::{
-    CompletionRecovery, DispatchOutcome, ExecutionCheckpoint, ExecutionControl,
-    OperationDispatcher, OperationRunner, RunnerError, RunnerReport, RunnerStartupConfig,
-    RunnerWork, ScanOperationDispatcher, UNSUPPORTED_OPERATION_ERROR_JSON,
+    CompletionRecovery, DeferredOperationCompletion, DispatchOutcome, ExecutionCheckpoint,
+    ExecutionControl, OperationDispatcher, OperationRunner, RunnerError, RunnerReport,
+    RunnerStartupConfig, RunnerWork, ScanOperationDispatcher, UNSUPPORTED_OPERATION_ERROR_JSON,
     UnsupportedOperationDispatcher,
 };
 
 use std::{
-    fmt, io,
+    fmt,
+    fs::{File, OpenOptions},
+    io,
     path::{Path, PathBuf},
     time::Duration,
 };
 
-use depgraph_core::{DepgraphServiceConfig, service::RepositoryRootSeal};
+use depgraph_core::{
+    DepgraphServiceConfig, RUNTIME_TRACE_MAX_EVENTS,
+    service::{DEFAULT_SERVICE_MAX_INLINE_INPUT_BYTES, RepositoryRootSeal},
+};
 use depgraph_mcp_tools::{
     AgentCapability, CapabilityProfile, LogicalRepositoryId, MAX_TASK_TTL_MS, OperationId,
     canonical_json_bytes,
@@ -39,9 +44,10 @@ use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 
 /// SQLite schema version owned by this crate.
-pub const JOURNAL_SCHEMA_VERSION: i64 = 3;
+pub const JOURNAL_SCHEMA_VERSION: i64 = 4;
 const LEGACY_JOURNAL_SCHEMA_VERSION: i64 = 1;
 const ROOT_BOUND_JOURNAL_SCHEMA_VERSION: i64 = 2;
+const COMPLETION_INTENT_JOURNAL_SCHEMA_VERSION: i64 = 3;
 /// Suffix appended to the graph-store path to obtain the separate journal path.
 pub const OPERATION_JOURNAL_SUFFIX: &str = ".operations.sqlite";
 /// Minimum duration for which a terminal record remains retrievable.
@@ -54,9 +60,10 @@ pub const MAX_PROGRESS_UNITS: u64 = 1_000_000_000;
 pub const MAX_TERMINAL_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 /// Maximum canonical normalized input retained inline for a durable operation.
 ///
-/// This matches the service's 1 MiB inline input ceiling. Larger inputs must be
-/// represented by an already-normalized bounded locator rather than embedded data.
-pub const MAX_OPERATION_INPUT_BYTES: usize = 1024 * 1024;
+/// The established 16 MiB closed-payload ceiling safely contains every inline
+/// runtime trace admitted by MCP's 1 MiB raw-input boundary after normalization
+/// and addition of its durable binding envelope. See the closed derivation below.
+pub const MAX_OPERATION_INPUT_BYTES: usize = MAX_TERMINAL_PAYLOAD_BYTES;
 /// Maximum canonical capability-set JSON size accepted from durable storage.
 pub const MAX_CAPABILITY_JSON_BYTES: usize = 256;
 /// Maximum accepted idempotency-key size before hashing.
@@ -74,8 +81,25 @@ pub const EXECUTION_STATE_UNKNOWN_ERROR_JSON: &str = r#"{"code":"EXECUTION_STATE
 
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_TASK_TTL_MS_I64: i64 = MAX_TASK_TTL_MS as i64;
+// Runtime trace normalization can only add omitted serde defaults and normalize
+// timestamps. Per event, the complete redaction object plus count and separators
+// consume 107 bytes; RFC 3339 UTC normalization adds at most 10 bytes, so 128 is
+// a closed ceiling. The fixed 512 bytes cover the same session-level defaults
+// and timestamps. Stable binding IDs, field names, and punctuation fit within
+// the separate 1 KiB envelope. Applying the independent 100,000-event cap is
+// deliberately conservative because a 1 MiB raw document cannot contain that
+// many valid events.
+const MAX_RUNTIME_TRACE_NORMALIZATION_BYTES_PER_EVENT: usize = 128;
+const MAX_RUNTIME_TRACE_FIXED_NORMALIZATION_BYTES: usize = 512;
+const MAX_RUNTIME_DURABLE_BINDING_ENVELOPE_BYTES: usize = 1024;
+const MAX_RUNTIME_IMPORT_NORMALIZED_INPUT_BYTES: usize = DEFAULT_SERVICE_MAX_INLINE_INPUT_BYTES
+    + RUNTIME_TRACE_MAX_EVENTS * MAX_RUNTIME_TRACE_NORMALIZATION_BYTES_PER_EVENT
+    + MAX_RUNTIME_TRACE_FIXED_NORMALIZATION_BYTES
+    + MAX_RUNTIME_DURABLE_BINDING_ENVELOPE_BYTES;
+const _: () = assert!(MAX_RUNTIME_IMPORT_NORMALIZED_INPUT_BYTES <= MAX_OPERATION_INPUT_BYTES);
 const SQLITE_ALLOCATION_LIMIT_BYTES: usize =
     MAX_TERMINAL_PAYLOAD_BYTES + MAX_OPERATION_INPUT_BYTES + MAX_CAPABILITY_JSON_BYTES + 64 * 1024;
+const _: () = assert!(SQLITE_ALLOCATION_LIMIT_BYTES <= i32::MAX as usize);
 
 /// Journal path derived from a service configuration's validated immutable store path.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -627,6 +651,7 @@ pub struct OperationRecord {
     created_at_ms: i64,
     updated_at_ms: i64,
     terminal_at_ms: Option<i64>,
+    retention_anchor_ms: i64,
     retain_until_ms: i64,
 }
 
@@ -934,6 +959,7 @@ pub enum CompletionDecision {
 pub struct CompletionIntent {
     operation_id: OperationId,
     kind: OperationKind,
+    normalized_input: CanonicalInput,
     result: CanonicalJson,
     decided_at_ms: i64,
 }
@@ -947,6 +973,11 @@ impl CompletionIntent {
     #[must_use]
     pub const fn kind(&self) -> OperationKind {
         self.kind
+    }
+
+    #[must_use]
+    pub const fn normalized_input(&self) -> &CanonicalInput {
+        &self.normalized_input
     }
 
     #[must_use]
@@ -1117,6 +1148,21 @@ impl OperationHandle {
     }
 }
 
+/// Existing immutable input binding for an idempotent submission scope.
+/// Callers use this before resolving dynamic selectors, then revalidate the
+/// request against the originally pinned input before submitting it unchanged.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExistingSubmissionBinding {
+    normalized_input: CanonicalInput,
+}
+
+impl ExistingSubmissionBinding {
+    #[must_use]
+    pub const fn normalized_input(&self) -> &CanonicalInput {
+        &self.normalized_input
+    }
+}
+
 /// Closed terminal result paired with the validated operation state used to
 /// resolve it.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1227,6 +1273,39 @@ pub struct OperationJournal {
     repository_id: LogicalRepositoryId,
     enabled_capabilities: CapabilitySet,
     repository_root_seal: RepositoryRootSeal,
+    has_retention_anchor: bool,
+}
+
+pub(crate) struct RunnerPurgeGuard {
+    _file: File,
+}
+
+fn runner_purge_lock_path(journal_path: &Path) -> PathBuf {
+    let mut path = journal_path.as_os_str().to_os_string();
+    path.push(".runner-purge-lock");
+    PathBuf::from(path)
+}
+
+fn try_acquire_runner_purge_guard(
+    journal_path: &Path,
+) -> Result<Option<RunnerPurgeGuard>, JournalError> {
+    let lock_path = runner_purge_lock_path(journal_path);
+    if let Ok(metadata) = std::fs::symlink_metadata(&lock_path)
+        && !metadata.file_type().is_file()
+    {
+        return Err(JournalError::IntegrityFailure);
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_path)?;
+    match file.try_lock() {
+        Ok(()) => Ok(Some(RunnerPurgeGuard { _file: file })),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(error)) => Err(error.into()),
+    }
 }
 
 impl OperationJournal {
@@ -1257,6 +1336,64 @@ impl OperationJournal {
             return Err(JournalError::RepositoryMismatch);
         }
         Ok(journal)
+    }
+
+    fn open_existing_read_only_with_root_seal(
+        config: &DepgraphServiceConfig,
+        root_seal: &RepositoryRootSeal,
+    ) -> Result<Option<Self>, JournalError> {
+        if !root_seal.matches_live_root() {
+            return Err(JournalError::RepositoryMismatch);
+        }
+        let repository_id = LogicalRepositoryId::parse(config.logical_repository_id())
+            .map_err(|_| JournalError::IntegrityFailure)?;
+        let enabled_capabilities =
+            CapabilitySet::new(config.capabilities().iter().map(Into::into))?;
+        let path = operation_journal_path(config).as_path().to_path_buf();
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata)
+                if metadata.file_type().is_symlink() || !metadata.file_type().is_file() =>
+            {
+                return Err(JournalError::Io(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "operation journal entry must be a regular file",
+                )));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(JournalError::Io(error)),
+        }
+        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW;
+        let connection = Connection::open_with_flags(&path, flags)?;
+        validate_journal_entry(&path)?;
+        let allocation_limit = i32::try_from(SQLITE_ALLOCATION_LIMIT_BYTES)
+            .map_err(|_| JournalError::IntegrityFailure)?;
+        connection.set_limit(Limit::SQLITE_LIMIT_LENGTH, allocation_limit)?;
+        if connection.limit(Limit::SQLITE_LIMIT_LENGTH)? != allocation_limit {
+            return Err(JournalError::IntegrityFailure);
+        }
+        connection.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
+        connection.execute_batch(
+            "PRAGMA foreign_keys = ON;
+             PRAGMA trusted_schema = OFF;
+             PRAGMA query_only = ON;",
+        )?;
+        let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        let journal = Self {
+            path,
+            connection,
+            repository_id,
+            enabled_capabilities,
+            repository_root_seal: root_seal.clone(),
+            has_retention_anchor: version == JOURNAL_SCHEMA_VERSION,
+        };
+        journal.validate_supported_read_only()?;
+        if !root_seal.matches_live_root() {
+            return Err(JournalError::RepositoryMismatch);
+        }
+        Ok(Some(journal))
     }
 
     fn open_at(
@@ -1298,6 +1435,7 @@ impl OperationJournal {
             repository_id,
             enabled_capabilities,
             repository_root_seal,
+            has_retention_anchor: true,
         };
         journal.initialize_schema()?;
         journal.validate()?;
@@ -1307,6 +1445,12 @@ impl OperationJournal {
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub(crate) fn try_acquire_runner_purge_guard(
+        &self,
+    ) -> Result<Option<RunnerPurgeGuard>, JournalError> {
+        try_acquire_runner_purge_guard(&self.path)
     }
 
     pub fn schema_version(&self) -> Result<i64, JournalError> {
@@ -1326,7 +1470,43 @@ impl OperationJournal {
         validate_foreign_keys(&transaction)?;
         validate_no_operation_tombstone_overlap(&transaction)?;
         validate_operation_handoff_cardinality(&transaction)?;
-        validate_journal_rows(&transaction, &self.repository_id)?;
+        validate_journal_rows(&transaction, &self.repository_id, true, true)?;
+        commit_authorized(transaction, &self.repository_root_seal)?;
+        Ok(())
+    }
+
+    /// Validate a supported root-bound schema without changing it. Runtime
+    /// submit prevalidation uses this view before ordinary writable open is
+    /// authorized to migrate a genuine v2 or v3 journal to v4.
+    fn validate_supported_read_only(&self) -> Result<(), JournalError> {
+        let transaction = self.connection.unchecked_transaction()?;
+        self.validate_transaction_root(&transaction)?;
+        validate_connection_integrity(&transaction)?;
+        let version: i64 = transaction.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        let include_completion_intents = match version {
+            ROOT_BOUND_JOURNAL_SCHEMA_VERSION => {
+                validate_v2_schema(&transaction)?;
+                false
+            }
+            COMPLETION_INTENT_JOURNAL_SCHEMA_VERSION => {
+                validate_v3_schema(&transaction)?;
+                true
+            }
+            JOURNAL_SCHEMA_VERSION => {
+                validate_schema(&transaction)?;
+                true
+            }
+            _ => return Err(JournalError::UnsupportedSchemaVersion),
+        };
+        validate_foreign_keys(&transaction)?;
+        validate_no_operation_tombstone_overlap(&transaction)?;
+        validate_operation_handoff_cardinality(&transaction)?;
+        validate_journal_rows(
+            &transaction,
+            &self.repository_id,
+            include_completion_intents,
+            self.has_retention_anchor,
+        )?;
         commit_authorized(transaction, &self.repository_root_seal)?;
         Ok(())
     }
@@ -1417,10 +1597,11 @@ impl OperationJournal {
                 progress_completed, progress_total,
                 lease_owner, lease_token_digest, lease_expires_at_ms,
                 execution_deadline_ms, result_json, error_json,
-                created_at_ms, updated_at_ms, terminal_at_ms, retain_until_ms
+                created_at_ms, updated_at_ms, terminal_at_ms,
+                retention_anchor_ms, retain_until_ms
              ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'queued', ?9, ?10,
-                NULL, NULL, NULL, ?11, NULL, NULL, ?12, ?12, NULL, ?13
+                NULL, NULL, NULL, ?11, NULL, NULL, ?12, ?12, NULL, ?11, ?13
              )",
             params![
                 operation_id.as_str(),
@@ -1565,11 +1746,11 @@ impl OperationJournal {
         if status != record.status && !record.status.allows_transition_to(status) {
             return Err(JournalError::InvalidTransition);
         }
-        transaction.execute(
+        let updated = transaction.execute(
             "UPDATE operations
              SET status = ?1, lease_owner = ?2, lease_token_digest = ?3,
                  lease_expires_at_ms = ?4, updated_at_ms = ?5
-             WHERE operation_id = ?6",
+             WHERE operation_id = ?6 AND status = ?7",
             params![
                 status.as_str(),
                 owner.as_str(),
@@ -1577,14 +1758,21 @@ impl OperationJournal {
                 lease_expires_at_ms,
                 now_ms,
                 record.operation_id.as_str(),
+                record.status.as_str(),
             ],
         )?;
-        transaction.execute(
+        if updated != 1 {
+            return Err(JournalError::IntegrityFailure);
+        }
+        let claimed_handoff = transaction.execute(
             "UPDATE runner_handoffs
              SET claimed_at_ms = COALESCE(claimed_at_ms, ?1)
              WHERE operation_id = ?2",
             params![now_ms, record.operation_id.as_str()],
         )?;
+        if claimed_handoff != 1 {
+            return Err(JournalError::IntegrityFailure);
+        }
         let record = select_validated_by_id(&transaction, &record.operation_id)?;
         let raw_handoff = select_handoff_by_id(&transaction, record.operation_id.as_str())?
             .ok_or(JournalError::IntegrityFailure)?;
@@ -1736,27 +1924,36 @@ impl OperationJournal {
         // The schema transition trigger intentionally retains the ordinary
         // queued -> cancelling -> cancelled path. Both writes are private to
         // this transaction, so observers see only the terminal cancellation.
-        transaction.execute(
+        let cancelling = transaction.execute(
             "UPDATE operations SET status='cancelling', updated_at_ms=?1
-             WHERE operation_id=?2",
+             WHERE operation_id=?2 AND status='queued'",
             params![now_ms, operation_id.as_str()],
         )?;
+        if cancelling != 1 {
+            return Err(JournalError::IntegrityFailure);
+        }
         let retain_until_ms = record
             .retain_until_ms
             .max(checked_add(now_ms, TERMINAL_RETENTION_MS)?);
-        transaction.execute(
+        let updated = transaction.execute(
             "UPDATE operations
              SET status='cancelled', updated_at_ms=?1, terminal_at_ms=?1,
                  retain_until_ms=?2
-             WHERE operation_id=?3",
+             WHERE operation_id=?3 AND status='cancelling'",
             params![now_ms, retain_until_ms, operation_id.as_str()],
         )?;
-        transaction.execute(
+        if updated != 1 {
+            return Err(JournalError::IntegrityFailure);
+        }
+        let completed_handoff = transaction.execute(
             "UPDATE runner_handoffs
              SET claimed_at_ms=COALESCE(claimed_at_ms, ?1), completed_at_ms=?1
-             WHERE operation_id=?2",
+             WHERE operation_id=?2 AND completed_at_ms IS NULL",
             params![now_ms, operation_id.as_str()],
         )?;
+        if completed_handoff != 1 {
+            return Err(JournalError::IntegrityFailure);
+        }
         let cancelled = select_validated_by_id(&transaction, operation_id)?;
         commit_authorized(transaction, &root_seal)?;
         debug_assert_eq!(cancelled.status(), OperationStatus::Cancelled);
@@ -1992,21 +2189,6 @@ impl OperationJournal {
         validate_before_deadline(&record, now_ms)?;
         validate_active_lease(&record, token_digest, now_ms)?;
         if record.status == OperationStatus::Cancelling {
-            let retain_until_ms = record
-                .retain_until_ms
-                .max(checked_add(now_ms, TERMINAL_RETENTION_MS)?);
-            transaction.execute(
-                "UPDATE operations
-                 SET status='cancelled', lease_owner=NULL, lease_token_digest=NULL,
-                     lease_expires_at_ms=NULL, updated_at_ms=?1, terminal_at_ms=?1,
-                     retain_until_ms=?2
-                 WHERE operation_id=?3",
-                params![now_ms, retain_until_ms, operation_id.as_str()],
-            )?;
-            transaction.execute(
-                "UPDATE runner_handoffs SET completed_at_ms=?1 WHERE operation_id=?2",
-                params![now_ms, operation_id.as_str()],
-            )?;
             commit_authorized(transaction, &root_seal)?;
             return Ok(CompletionDecision::CancellationWon);
         }
@@ -2041,13 +2223,112 @@ impl OperationJournal {
     pub fn next_completion_intent(
         &self,
         repository_id: &LogicalRepositoryId,
+        now_ms: i64,
     ) -> Result<Option<CompletionIntent>, JournalError> {
+        validate_timestamp(now_ms)?;
         self.validate_requested_repository(repository_id)?;
         let transaction = self.connection.unchecked_transaction()?;
         self.validate_transaction_root(&transaction)?;
-        let intent = select_next_completion_intent(&transaction, repository_id)?;
+        let intent = select_next_completion_intent(&transaction)?;
+        if let Some(intent) = intent.as_ref() {
+            let record = load_completion_intent_record(
+                &transaction,
+                repository_id,
+                intent.operation_id(),
+                now_ms,
+            )?;
+            validate_completion_intent(&record, intent, now_ms)?;
+        }
         commit_authorized(transaction, &self.repository_root_seal)?;
         Ok(intent)
+    }
+
+    /// Internal cross-store acknowledgement used to retire a cancelled scan's
+    /// durable ownership proof. Retention expiry does not hide the terminal
+    /// state from this reconciliation path; purge runs only after reconciliation.
+    pub(crate) fn scan_cleanup_acknowledged(
+        &self,
+        repository_id: &LogicalRepositoryId,
+        operation_id: &OperationId,
+    ) -> Result<bool, JournalError> {
+        self.validate_requested_repository(repository_id)?;
+        let transaction = self.connection.unchecked_transaction()?;
+        self.validate_transaction_root(&transaction)?;
+        let raw = select_operation_by_id(&transaction, operation_id.as_str())?
+            .ok_or(JournalError::IntegrityFailure)?;
+        let record = validated_record(&transaction, raw)?;
+        validate_repository(&record, repository_id)?;
+        validate_enabled_capabilities(&self.enabled_capabilities, &record)?;
+        if record.kind != OperationKind::ScanSubmit {
+            return Err(JournalError::IntegrityFailure);
+        }
+        let acknowledged = match record.status {
+            OperationStatus::Failed | OperationStatus::Cancelled => true,
+            OperationStatus::Queued | OperationStatus::Running | OperationStatus::Cancelling => {
+                false
+            }
+            OperationStatus::Completed => return Err(JournalError::IntegrityFailure),
+        };
+        commit_authorized(transaction, &self.repository_root_seal)?;
+        Ok(acknowledged)
+    }
+
+    /// Return the oldest expired external-store operation that has no committed
+    /// completion intent. This internal recovery read intentionally bypasses
+    /// public observability retention only for a validated nonterminal record;
+    /// the operation and its one durable handoff are authenticated together.
+    pub(crate) fn next_expired_external_store_operation(
+        &self,
+        repository_id: &LogicalRepositoryId,
+        now_ms: i64,
+    ) -> Result<Option<ClaimedRunnerHandoff>, JournalError> {
+        validate_timestamp(now_ms)?;
+        self.validate_requested_repository(repository_id)?;
+        let transaction = self.connection.unchecked_transaction()?;
+        self.validate_transaction_root(&transaction)?;
+        let operation_id = transaction
+            .query_row(
+                "SELECT operation_id FROM operations
+                  WHERE repository_id=?1
+                    AND kind IN ('scan_submit', 'runtime_trace_import_submit')
+                    AND status IN ('queued', 'running', 'cancelling')
+                    AND execution_deadline_ms<=?2
+                    AND NOT EXISTS (
+                        SELECT 1 FROM operation_completion_intents AS intent
+                         WHERE intent.operation_id=operations.operation_id
+                    )
+                  ORDER BY execution_deadline_ms, operation_id
+                  LIMIT 1",
+                params![repository_id.as_str(), now_ms],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let claimed = operation_id
+            .map(|operation_id| {
+                let operation_id =
+                    OperationId::parse(operation_id).map_err(|_| JournalError::IntegrityFailure)?;
+                let record = select_validated_by_id(&transaction, &operation_id)?;
+                if &record.repository_id != repository_id
+                    || !matches!(
+                        record.kind,
+                        OperationKind::ScanSubmit | OperationKind::RuntimeTraceImportSubmit
+                    )
+                    || record.status.is_terminal()
+                    || record.execution_deadline_ms > now_ms
+                    || completion_intent_exists(&transaction, &operation_id)?
+                {
+                    return Err(JournalError::IntegrityFailure);
+                }
+                validate_enabled_capabilities(&self.enabled_capabilities, &record)?;
+                let raw_handoff = select_handoff_by_id(&transaction, operation_id.as_str())?
+                    .ok_or(JournalError::IntegrityFailure)?;
+                let handoff = decode_handoff(raw_handoff)?;
+                validate_operation_handoff(&record, &handoff)?;
+                Ok(ClaimedRunnerHandoff { record, handoff })
+            })
+            .transpose()?;
+        commit_authorized(transaction, &self.repository_root_seal)?;
+        Ok(claimed)
     }
 
     /// Publish a previously committed completion intent after its idempotent
@@ -2066,40 +2347,47 @@ impl OperationJournal {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         validate_transaction_root(&transaction, &root_seal)?;
-        let record = load_active_record(&transaction, repository_id, operation_id, now_ms)?;
         let intent = select_completion_intent(&transaction, operation_id)?
             .ok_or(JournalError::InvalidTransition)?;
-        if record.status != OperationStatus::Running
-            || intent.kind != record.kind
-            || intent.decided_at_ms > now_ms
-        {
-            return Err(JournalError::IntegrityFailure);
-        }
-        let retain_until_ms = record
-            .retain_until_ms
-            .max(checked_add(now_ms, TERMINAL_RETENTION_MS)?);
-        transaction.execute(
+        let record =
+            load_completion_intent_record(&transaction, repository_id, operation_id, now_ms)?;
+        validate_completion_intent(&record, &intent, now_ms)?;
+        let retention_anchor_ms = record.retention_anchor_ms.max(now_ms);
+        let retain_until_ms = checked_add(retention_anchor_ms, TERMINAL_RETENTION_MS)?;
+        let updated = transaction.execute(
             "UPDATE operations
              SET status='completed', progress_completed=progress_total,
                  result_json=?1, error_json=NULL, lease_owner=NULL,
                  lease_token_digest=NULL, lease_expires_at_ms=NULL,
-                 updated_at_ms=?2, terminal_at_ms=?2, retain_until_ms=?3
-             WHERE operation_id=?4",
+                 updated_at_ms=?2, terminal_at_ms=?2,
+                 retention_anchor_ms=?3, retain_until_ms=?4
+             WHERE operation_id=?5 AND status='running' AND updated_at_ms=?2",
             params![
                 intent.result.as_str(),
-                now_ms,
+                intent.decided_at_ms,
+                retention_anchor_ms,
                 retain_until_ms,
                 operation_id.as_str(),
             ],
         )?;
-        transaction.execute(
-            "UPDATE runner_handoffs SET completed_at_ms=?1 WHERE operation_id=?2",
-            params![now_ms, operation_id.as_str()],
+        if updated != 1 {
+            return Err(JournalError::IntegrityFailure);
+        }
+        let completed = transaction.execute(
+            "UPDATE runner_handoffs SET completed_at_ms=?1
+             WHERE operation_id=?2 AND claimed_at_ms IS NOT NULL AND completed_at_ms IS NULL",
+            params![intent.decided_at_ms, operation_id.as_str()],
         )?;
-        transaction.execute(
+        if completed != 1 {
+            return Err(JournalError::IntegrityFailure);
+        }
+        let deleted = transaction.execute(
             "DELETE FROM operation_completion_intents WHERE operation_id=?1",
             params![operation_id.as_str()],
         )?;
+        if deleted != 1 {
+            return Err(JournalError::IntegrityFailure);
+        }
         let completed = select_validated_by_id(&transaction, operation_id)?;
         commit_authorized(transaction, &root_seal)?;
         Ok(completed)
@@ -2177,8 +2465,24 @@ impl OperationJournal {
 
     /// Transactionally reap one bounded batch of deadline-expired work, replace
     /// one bounded batch of expired terminal records with tombstones, and remove
-    /// one bounded batch of elapsed tombstones.
+    /// one bounded batch of elapsed tombstones. Purge defers while a runner owns
+    /// the cross-process cleanup/terminal/acknowledgement window.
     pub fn purge(&mut self, now_ms: i64) -> Result<PurgeReport, JournalError> {
+        validate_timestamp(now_ms)?;
+        let Some(guard) = self.try_acquire_runner_purge_guard()? else {
+            return Ok(PurgeReport {
+                more_work: true,
+                ..PurgeReport::default()
+            });
+        };
+        self.purge_with_runner_guard(now_ms, &guard)
+    }
+
+    pub(crate) fn purge_with_runner_guard(
+        &mut self,
+        now_ms: i64,
+        _guard: &RunnerPurgeGuard,
+    ) -> Result<PurgeReport, JournalError> {
         validate_timestamp(now_ms)?;
         let repository_id = self.repository_id.clone();
         let deadline_error = CanonicalJson::from_database(DEADLINE_EXCEEDED_ERROR_JSON.to_owned())?;
@@ -2192,6 +2496,7 @@ impl OperationJournal {
             let mut statement = transaction.prepare(
                 "SELECT substr(operation_id, 1, 36) FROM operations
                  WHERE status IN ('queued', 'running', 'cancelling')
+                   AND kind NOT IN ('scan_submit', 'runtime_trace_import_submit')
                    AND execution_deadline_ms <= ?1
                    AND NOT EXISTS (
                        SELECT 1 FROM operation_completion_intents AS intent
@@ -2329,6 +2634,7 @@ impl OperationJournal {
             "SELECT EXISTS(
                  SELECT 1 FROM operations
                  WHERE status IN ('queued', 'running', 'cancelling')
+                   AND kind NOT IN ('scan_submit', 'runtime_trace_import_submit')
                    AND execution_deadline_ms <= ?1
                    AND NOT EXISTS (
                        SELECT 1 FROM operation_completion_intents AS intent
@@ -2389,14 +2695,14 @@ impl OperationJournal {
         } else {
             record.progress.completed_units
         };
-        transaction.execute(
+        let updated = transaction.execute(
             "UPDATE operations
              SET status = ?1, progress_completed = ?2,
                  result_json = ?3, error_json = ?4,
                  lease_owner = NULL, lease_token_digest = NULL,
                  lease_expires_at_ms = NULL, updated_at_ms = ?5,
                  terminal_at_ms = ?5, retain_until_ms = ?6
-             WHERE operation_id = ?7",
+             WHERE operation_id = ?7 AND status = ?8",
             params![
                 status.as_str(),
                 u64_to_i64(progress_completed)?,
@@ -2405,12 +2711,21 @@ impl OperationJournal {
                 now_ms,
                 retain_until_ms,
                 operation_id.as_str(),
+                record.status.as_str(),
             ],
         )?;
-        transaction.execute(
-            "UPDATE runner_handoffs SET completed_at_ms = ?1 WHERE operation_id = ?2",
+        if updated != 1 {
+            return Err(JournalError::IntegrityFailure);
+        }
+        let completed = transaction.execute(
+            "UPDATE runner_handoffs SET completed_at_ms = ?1
+              WHERE operation_id = ?2
+                AND claimed_at_ms IS NOT NULL AND completed_at_ms IS NULL",
             params![now_ms, operation_id.as_str()],
         )?;
+        if completed != 1 {
+            return Err(JournalError::IntegrityFailure);
+        }
         let record = select_validated_by_id(&transaction, operation_id)?;
         commit_authorized(transaction, &root_seal)?;
         Ok(record)
@@ -2452,13 +2767,14 @@ impl OperationJournal {
 
     fn initialize_schema(&mut self) -> Result<(), JournalError> {
         let root_seal = self.repository_root_seal.clone();
+        let repository_id = self.repository_id.clone();
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         validate_live_root(&root_seal)?;
         let version: i64 = transaction.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         if version == 0 {
-            transaction.execute_batch(SCHEMA_V1)?;
+            transaction.execute_batch(&schema_v4_base()?)?;
             transaction.execute_batch(SCHEMA_V2_METADATA)?;
             transaction.execute_batch(SCHEMA_V3_COMPLETION_INTENTS)?;
             insert_repository_binding(&transaction, JournalDigest(root_seal.binding_digest()))?;
@@ -2480,11 +2796,23 @@ impl OperationJournal {
             transaction.execute_batch(SCHEMA_V2_METADATA)?;
             transaction.execute_batch(SCHEMA_V3_COMPLETION_INTENTS)?;
             insert_repository_binding(&transaction, JournalDigest(root_seal.binding_digest()))?;
-            transaction.pragma_update(None, "user_version", JOURNAL_SCHEMA_VERSION)?;
+            transaction.pragma_update(
+                None,
+                "user_version",
+                COMPLETION_INTENT_JOURNAL_SCHEMA_VERSION,
+            )?;
+            migrate_v3_to_v4(&transaction, &root_seal, &repository_id)?;
         } else if version == ROOT_BOUND_JOURNAL_SCHEMA_VERSION {
             validate_v2_schema(&transaction)?;
             transaction.execute_batch(SCHEMA_V3_COMPLETION_INTENTS)?;
-            transaction.pragma_update(None, "user_version", JOURNAL_SCHEMA_VERSION)?;
+            transaction.pragma_update(
+                None,
+                "user_version",
+                COMPLETION_INTENT_JOURNAL_SCHEMA_VERSION,
+            )?;
+            migrate_v3_to_v4(&transaction, &root_seal, &repository_id)?;
+        } else if version == COMPLETION_INTENT_JOURNAL_SCHEMA_VERSION {
+            migrate_v3_to_v4(&transaction, &root_seal, &repository_id)?;
         } else if version != JOURNAL_SCHEMA_VERSION {
             return Err(JournalError::UnsupportedSchemaVersion);
         } else {
@@ -2555,6 +2883,44 @@ impl OperationManager {
         Ok(manager)
     }
 
+    /// Look up an existing submission using an existing, current journal only.
+    /// This path never creates a journal and never migrates an older schema.
+    pub fn existing_submission_binding_read_only(
+        config: &DepgraphServiceConfig,
+        kind: OperationKind,
+        idempotency_key: impl AsRef<[u8]>,
+        now_ms: i64,
+    ) -> Result<Option<ExistingSubmissionBinding>, JournalError> {
+        validate_timestamp(now_ms)?;
+        let idempotency_key = idempotency_key.as_ref();
+        validate_secret_input(idempotency_key, MAX_IDEMPOTENCY_KEY_BYTES)?;
+        let root_seal = config.repository_root_seal();
+        let repository_id = LogicalRepositoryId::parse(config.logical_repository_id())
+            .map_err(|_| JournalError::IntegrityFailure)?;
+        let capabilities = CapabilitySet::new(config.capabilities().iter().map(Into::into))?;
+        let required_capabilities = kind.required_capabilities()?;
+        if !capabilities.contains_all(&required_capabilities) {
+            return Err(JournalError::CapabilityDenied);
+        }
+        let Some(journal) =
+            OperationJournal::open_existing_read_only_with_root_seal(config, &root_seal)?
+        else {
+            if !root_seal.matches_live_root() {
+                return Err(JournalError::RepositoryMismatch);
+            }
+            return Ok(None);
+        };
+        let manager = Self {
+            journal,
+            authority: OperationManagerAuthority {
+                repository_id,
+                capabilities,
+                root_seal,
+            },
+        };
+        manager.existing_submission_binding(kind, idempotency_key, now_ms)
+    }
+
     /// Submit validated normalized work and return only after the operation and
     /// its runner handoff are committed atomically.
     pub fn submit(
@@ -2570,6 +2936,69 @@ impl OperationManager {
             .map(OperationHandle::from_submit_outcome)?;
         self.revalidate_root()?;
         Ok(handle)
+    }
+
+    /// Look up an existing repository/kind/idempotency binding without first
+    /// constructing new normalized input. This preserves dynamic-selector
+    /// replay while keeping the normal submit binding validation authoritative.
+    pub fn existing_submission_binding(
+        &self,
+        kind: OperationKind,
+        idempotency_key: impl AsRef<[u8]>,
+        now_ms: i64,
+    ) -> Result<Option<ExistingSubmissionBinding>, JournalError> {
+        validate_timestamp(now_ms)?;
+        self.revalidate_root()?;
+        let required_capabilities = kind.required_capabilities()?;
+        if !self
+            .authority
+            .capabilities
+            .contains_all(&required_capabilities)
+        {
+            return Err(JournalError::CapabilityDenied);
+        }
+        let idempotency_key = idempotency_key.as_ref();
+        validate_secret_input(idempotency_key, MAX_IDEMPOTENCY_KEY_BYTES)?;
+        let idempotency_key_digest = JournalDigest::sha256(idempotency_key);
+        let transaction = self.journal.connection.unchecked_transaction()?;
+        validate_transaction_root(&transaction, &self.authority.root_seal)?;
+        let binding = if let Some(raw) = select_operation_by_scope_for_schema(
+            &transaction,
+            self.authority.repository_id.as_str(),
+            kind.as_str(),
+            idempotency_key_digest,
+            self.journal.has_retention_anchor,
+        )? {
+            let record = validated_record(&transaction, raw)?;
+            validate_record_not_from_future(&record, now_ms)?;
+            validate_repository(&record, &self.authority.repository_id)?;
+            validate_enabled_capabilities(&self.authority.capabilities, &record)?;
+            if record.kind != kind || record.idempotency_key_digest != idempotency_key_digest {
+                return Err(JournalError::IntegrityFailure);
+            }
+            if now_ms >= record.retain_until_ms {
+                return Err(JournalError::Expired);
+            }
+            Some(ExistingSubmissionBinding {
+                normalized_input: record.normalized_input,
+            })
+        } else if let Some(tombstone) = select_tombstone_by_scope(
+            &transaction,
+            self.authority.repository_id.as_str(),
+            kind.as_str(),
+            idempotency_key_digest,
+        )? {
+            validate_tombstone(&tombstone)?;
+            if now_ms < tombstone.tombstone_until_ms {
+                return Err(JournalError::Expired);
+            }
+            None
+        } else {
+            None
+        };
+        commit_authorized(transaction, &self.authority.root_seal)?;
+        self.revalidate_root()?;
+        Ok(binding)
     }
 
     /// Resolve an Agent-safe operation status under the sealed open authority.
@@ -2749,7 +3178,15 @@ fn validate_schema(connection: &Connection) -> Result<(), JournalError> {
     if version != JOURNAL_SCHEMA_VERSION {
         return Err(JournalError::UnsupportedSchemaVersion);
     }
-    validate_schema_surface(connection, true, true)
+    validate_schema_surface(connection, true, true, true, &schema_v4_base()?)
+}
+
+fn validate_v3_schema(connection: &Connection) -> Result<(), JournalError> {
+    let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version != COMPLETION_INTENT_JOURNAL_SCHEMA_VERSION {
+        return Err(JournalError::UnsupportedSchemaVersion);
+    }
+    validate_schema_surface(connection, true, true, false, SCHEMA_V1)
 }
 
 fn validate_v2_schema(connection: &Connection) -> Result<(), JournalError> {
@@ -2757,7 +3194,7 @@ fn validate_v2_schema(connection: &Connection) -> Result<(), JournalError> {
     if version != ROOT_BOUND_JOURNAL_SCHEMA_VERSION {
         return Err(JournalError::UnsupportedSchemaVersion);
     }
-    validate_schema_surface(connection, true, false)
+    validate_schema_surface(connection, true, false, false, SCHEMA_V1)
 }
 
 fn validate_legacy_schema(connection: &Connection) -> Result<(), JournalError> {
@@ -2765,41 +3202,43 @@ fn validate_legacy_schema(connection: &Connection) -> Result<(), JournalError> {
     if version != LEGACY_JOURNAL_SCHEMA_VERSION {
         return Err(JournalError::UnsupportedSchemaVersion);
     }
-    validate_schema_surface(connection, false, false)
+    validate_schema_surface(connection, false, false, false, SCHEMA_V1)
 }
 
 fn validate_schema_surface(
     connection: &Connection,
     include_repository_binding: bool,
     include_completion_intents: bool,
+    include_retention_anchor: bool,
+    base_schema: &str,
 ) -> Result<(), JournalError> {
-    validate_columns(
-        connection,
-        "operations",
-        &[
-            "operation_id",
-            "repository_id",
-            "kind",
-            "required_capabilities_json",
-            "required_capabilities_digest",
-            "input_json",
-            "input_digest",
-            "idempotency_key_digest",
-            "status",
-            "progress_completed",
-            "progress_total",
-            "lease_owner",
-            "lease_token_digest",
-            "lease_expires_at_ms",
-            "execution_deadline_ms",
-            "result_json",
-            "error_json",
-            "created_at_ms",
-            "updated_at_ms",
-            "terminal_at_ms",
-            "retain_until_ms",
-        ],
-    )?;
+    let mut operation_columns = vec![
+        "operation_id",
+        "repository_id",
+        "kind",
+        "required_capabilities_json",
+        "required_capabilities_digest",
+        "input_json",
+        "input_digest",
+        "idempotency_key_digest",
+        "status",
+        "progress_completed",
+        "progress_total",
+        "lease_owner",
+        "lease_token_digest",
+        "lease_expires_at_ms",
+        "execution_deadline_ms",
+        "result_json",
+        "error_json",
+        "created_at_ms",
+        "updated_at_ms",
+        "terminal_at_ms",
+    ];
+    if include_retention_anchor {
+        operation_columns.push("retention_anchor_ms");
+    }
+    operation_columns.push("retain_until_ms");
+    validate_columns(connection, "operations", &operation_columns)?;
     validate_columns(
         connection,
         "runner_handoffs",
@@ -2848,7 +3287,7 @@ fn validate_schema_surface(
         )?;
     }
     let reference = Connection::open_in_memory()?;
-    reference.execute_batch(SCHEMA_V1)?;
+    reference.execute_batch(base_schema)?;
     if include_repository_binding {
         reference.execute_batch(SCHEMA_V2_METADATA)?;
     }
@@ -2856,6 +3295,94 @@ fn validate_schema_surface(
         reference.execute_batch(SCHEMA_V3_COMPLETION_INTENTS)?;
     }
     validate_schema_objects(connection, &reference)?;
+    Ok(())
+}
+
+fn migrate_v3_to_v4(
+    connection: &Connection,
+    root_seal: &RepositoryRootSeal,
+    repository_id: &LogicalRepositoryId,
+) -> Result<(), JournalError> {
+    // Authenticate the complete v3 surface and every retained row before
+    // creating a copy. A malformed journal must remain logically unchanged on
+    // its existing version path when this transaction rolls back.
+    validate_v3_schema(connection)?;
+    validate_repository_binding(connection, JournalDigest(root_seal.binding_digest()))?;
+    validate_connection_integrity(connection)?;
+    validate_foreign_keys(connection)?;
+    validate_no_operation_tombstone_overlap(connection)?;
+    validate_operation_handoff_cardinality(connection)?;
+    validate_journal_rows(connection, repository_id, true, false)?;
+
+    // SQLite cannot alter CHECK constraints in place. Retain all five tables in
+    // transactional temporary copies, drop children before parents, recreate
+    // the exact v4 surface, then restore parents before their dependent rows.
+    connection.execute_batch(
+        "CREATE TEMP TABLE operation_journal_v4_operations AS
+             SELECT * FROM operations;
+         CREATE TEMP TABLE operation_journal_v4_runner_handoffs AS
+             SELECT * FROM runner_handoffs;
+         CREATE TEMP TABLE operation_journal_v4_tombstones AS
+             SELECT * FROM operation_tombstones;
+         CREATE TEMP TABLE operation_journal_v4_metadata AS
+             SELECT * FROM operation_journal_metadata;
+         CREATE TEMP TABLE operation_journal_v4_completion_intents AS
+             SELECT * FROM operation_completion_intents;
+
+         DROP TRIGGER operations_reject_tombstone_overlap_insert;
+         DROP TRIGGER operations_reject_tombstone_overlap_update;
+         DROP TRIGGER tombstones_reject_operation_overlap_insert;
+         DROP TRIGGER tombstones_reject_operation_overlap_update;
+         DROP TABLE operation_completion_intents;
+         DROP TABLE runner_handoffs;
+         DROP TABLE operations;
+         DROP TABLE operation_tombstones;
+         DROP TABLE operation_journal_metadata;",
+    )?;
+    connection.execute_batch(&schema_v4_base()?)?;
+    connection.execute_batch(SCHEMA_V2_METADATA)?;
+    connection.execute_batch(SCHEMA_V3_COMPLETION_INTENTS)?;
+    connection.execute_batch(
+        "INSERT INTO operations(
+             operation_id, repository_id, kind,
+             required_capabilities_json, required_capabilities_digest,
+             input_json, input_digest, idempotency_key_digest, status,
+             progress_completed, progress_total,
+             lease_owner, lease_token_digest, lease_expires_at_ms,
+             execution_deadline_ms, result_json, error_json,
+             created_at_ms, updated_at_ms, terminal_at_ms,
+             retention_anchor_ms, retain_until_ms
+         )
+         SELECT operation_id, repository_id, kind,
+                required_capabilities_json, required_capabilities_digest,
+                input_json, input_digest, idempotency_key_digest, status,
+                progress_completed, progress_total,
+                lease_owner, lease_token_digest, lease_expires_at_ms,
+                execution_deadline_ms, result_json, error_json,
+                created_at_ms, updated_at_ms, terminal_at_ms,
+                execution_deadline_ms, retain_until_ms
+           FROM operation_journal_v4_operations;
+         INSERT INTO operation_tombstones SELECT * FROM operation_journal_v4_tombstones;
+         INSERT INTO operation_journal_metadata SELECT * FROM operation_journal_v4_metadata;
+         INSERT INTO runner_handoffs SELECT * FROM operation_journal_v4_runner_handoffs;
+         INSERT INTO operation_completion_intents
+             SELECT * FROM operation_journal_v4_completion_intents;
+
+         DROP TABLE operation_journal_v4_completion_intents;
+         DROP TABLE operation_journal_v4_runner_handoffs;
+         DROP TABLE operation_journal_v4_operations;
+         DROP TABLE operation_journal_v4_tombstones;
+         DROP TABLE operation_journal_v4_metadata;",
+    )?;
+    connection.pragma_update(None, "user_version", JOURNAL_SCHEMA_VERSION)?;
+
+    validate_schema(connection)?;
+    validate_repository_binding(connection, JournalDigest(root_seal.binding_digest()))?;
+    validate_connection_integrity(connection)?;
+    validate_foreign_keys(connection)?;
+    validate_no_operation_tombstone_overlap(connection)?;
+    validate_operation_handoff_cardinality(connection)?;
+    validate_journal_rows(connection, repository_id, true, true)?;
     Ok(())
 }
 
@@ -3002,21 +3529,36 @@ fn legacy_journal_is_empty(connection: &Connection) -> Result<bool, JournalError
 fn validate_journal_rows(
     connection: &Connection,
     repository_id: &LogicalRepositoryId,
+    include_completion_intents: bool,
+    include_retention_anchor: bool,
 ) -> Result<(), JournalError> {
     {
-        let operation_columns = qualified_columns(OPERATION_COLUMNS, "operation");
+        let operation_columns = qualified_columns(
+            if include_retention_anchor {
+                OPERATION_COLUMNS
+            } else {
+                LEGACY_OPERATION_COLUMNS
+            },
+            "operation",
+        );
         let handoff_columns = qualified_columns(HANDOFF_COLUMNS, "handoff");
         let mut statement = connection.prepare(&format!(
             "SELECT {operation_columns}, {handoff_columns}
              FROM operations AS operation
-             JOIN runner_handoffs AS handoff USING(operation_id)
+             LEFT JOIN runner_handoffs AS handoff USING(operation_id)
              ORDER BY operation.operation_id"
         ))?;
         let mut rows = statement.query([])?;
         while let Some(row) = rows.next().map_err(map_database_decode_error)? {
-            let operation = raw_operation_from_row(row).map_err(map_database_decode_error)?;
+            let operation = if include_retention_anchor {
+                raw_operation_from_row(row)
+            } else {
+                raw_legacy_operation_from_row(row)
+            }
+            .map_err(map_database_decode_error)?;
             let raw_handoff =
-                raw_handoff_from_row_at(row, 21).map_err(map_database_decode_error)?;
+                raw_handoff_from_row_at(row, if include_retention_anchor { 22 } else { 21 })
+                    .map_err(map_database_decode_error)?;
             let record = decode_operation(operation)?;
             if record.repository_id != *repository_id {
                 return Err(JournalError::IntegrityFailure);
@@ -3040,21 +3582,38 @@ fn validate_journal_rows(
         }
     }
 
-    {
+    if include_completion_intents {
         let mut statement = connection.prepare(
-            "SELECT intent.operation_id, operation.kind, intent.result_json,
-                    intent.result_digest, intent.decided_at_ms,
-                    operation.status, operation.updated_at_ms
+            "SELECT intent.operation_id, operation.kind,
+                    operation.input_json, operation.input_digest,
+                    handoff.operation_kind, handoff.payload_json, handoff.payload_digest,
+                    intent.result_json, intent.result_digest, intent.decided_at_ms,
+                    operation.status, operation.updated_at_ms,
+                    operation.created_at_ms, operation.execution_deadline_ms,
+                    operation.lease_expires_at_ms, handoff.claimed_at_ms
              FROM operation_completion_intents AS intent
              JOIN operations AS operation USING(operation_id)
+             LEFT JOIN runner_handoffs AS handoff USING(operation_id)
              ORDER BY intent.operation_id",
         )?;
         let mut rows = statement.query([])?;
         while let Some(row) = rows.next().map_err(map_database_decode_error)? {
             let intent = completion_intent_from_row(row).map_err(map_database_decode_error)?;
-            let status = OperationStatus::parse(&row.get::<_, String>(5)?)?;
-            let updated_at_ms: i64 = row.get(6)?;
-            if status != OperationStatus::Running || intent.decided_at_ms != updated_at_ms {
+            let status = OperationStatus::parse(&row.get::<_, String>(10)?)?;
+            let updated_at_ms: i64 = row.get(11)?;
+            let created_at_ms: i64 = row.get(12)?;
+            let execution_deadline_ms: i64 = row.get(13)?;
+            let lease_expires_at_ms: Option<i64> = row.get(14)?;
+            let claimed_at_ms: Option<i64> = row.get(15)?;
+            if validate_timestamp(intent.decided_at_ms).is_err()
+                || status != OperationStatus::Running
+                || intent.decided_at_ms != updated_at_ms
+                || intent.decided_at_ms < created_at_ms
+                || intent.decided_at_ms >= execution_deadline_ms
+                || lease_expires_at_ms
+                    .is_none_or(|expires_at_ms| intent.decided_at_ms >= expires_at_ms)
+                || claimed_at_ms.is_none_or(|claimed_at_ms| intent.decided_at_ms < claimed_at_ms)
+            {
                 return Err(JournalError::IntegrityFailure);
             }
         }
@@ -3460,6 +4019,45 @@ fn load_active_record(
     Ok(record)
 }
 
+fn load_completion_intent_record(
+    connection: &Connection,
+    repository_id: &LogicalRepositoryId,
+    operation_id: &OperationId,
+    now_ms: i64,
+) -> Result<OperationRecord, JournalError> {
+    let raw =
+        select_operation_by_id(connection, operation_id.as_str())?.ok_or(JournalError::NotFound)?;
+    let record = validated_record(connection, raw)?;
+    validate_record_not_from_future(&record, now_ms)?;
+    if &record.repository_id != repository_id {
+        return Err(JournalError::IntegrityFailure);
+    }
+    Ok(record)
+}
+
+fn validate_completion_intent(
+    record: &OperationRecord,
+    intent: &CompletionIntent,
+    now_ms: i64,
+) -> Result<(), JournalError> {
+    validate_timestamp(intent.decided_at_ms).map_err(|_| JournalError::IntegrityFailure)?;
+    if intent.operation_id != record.operation_id
+        || intent.kind != record.kind
+        || intent.normalized_input != record.normalized_input
+        || record.status != OperationStatus::Running
+        || intent.decided_at_ms != record.updated_at_ms
+        || intent.decided_at_ms >= record.execution_deadline_ms
+        || intent.decided_at_ms > now_ms
+        || record
+            .lease
+            .as_ref()
+            .is_none_or(|lease| intent.decided_at_ms >= lease.expires_at_ms)
+    {
+        return Err(JournalError::IntegrityFailure);
+    }
+    Ok(())
+}
+
 fn load_record_for_deadline_failure(
     connection: &Connection,
     repository_id: &LogicalRepositoryId,
@@ -3538,13 +4136,21 @@ fn select_validated_by_id(
     validated_record(connection, raw)
 }
 
-const OPERATION_COLUMNS: &str = "operation_id, repository_id, kind,
+const LEGACY_OPERATION_COLUMNS: &str = "operation_id, repository_id, kind,
     required_capabilities_json, required_capabilities_digest,
     input_json, input_digest, idempotency_key_digest, status,
     progress_completed, progress_total,
     lease_owner, lease_token_digest, lease_expires_at_ms,
     execution_deadline_ms, result_json, error_json,
     created_at_ms, updated_at_ms, terminal_at_ms, retain_until_ms";
+const OPERATION_COLUMNS: &str = "operation_id, repository_id, kind,
+    required_capabilities_json, required_capabilities_digest,
+    input_json, input_digest, idempotency_key_digest, status,
+    progress_completed, progress_total,
+    lease_owner, lease_token_digest, lease_expires_at_ms,
+    execution_deadline_ms, result_json, error_json,
+    created_at_ms, updated_at_ms, terminal_at_ms,
+    retention_anchor_ms, retain_until_ms";
 
 fn qualified_columns(columns: &str, table: &str) -> String {
     columns
@@ -3577,6 +4183,7 @@ struct RawOperation {
     created_at_ms: i64,
     updated_at_ms: i64,
     terminal_at_ms: Option<i64>,
+    retention_anchor_ms: i64,
     retain_until_ms: i64,
 }
 
@@ -3602,6 +4209,35 @@ fn raw_operation_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawOperat
         created_at_ms: row.get(17)?,
         updated_at_ms: row.get(18)?,
         terminal_at_ms: row.get(19)?,
+        retention_anchor_ms: row.get(20)?,
+        retain_until_ms: row.get(21)?,
+    })
+}
+
+fn raw_legacy_operation_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawOperation> {
+    let execution_deadline_ms = row.get(14)?;
+    Ok(RawOperation {
+        operation_id: row.get(0)?,
+        repository_id: row.get(1)?,
+        kind: row.get(2)?,
+        required_capabilities_json: row.get(3)?,
+        required_capabilities_digest: row.get(4)?,
+        input_json: row.get(5)?,
+        input_digest: row.get(6)?,
+        idempotency_key_digest: row.get(7)?,
+        status: row.get(8)?,
+        progress_completed: row.get(9)?,
+        progress_total: row.get(10)?,
+        lease_owner: row.get(11)?,
+        lease_token_digest: row.get(12)?,
+        lease_expires_at_ms: row.get(13)?,
+        execution_deadline_ms,
+        result_json: row.get(15)?,
+        error_json: row.get(16)?,
+        created_at_ms: row.get(17)?,
+        updated_at_ms: row.get(18)?,
+        terminal_at_ms: row.get(19)?,
+        retention_anchor_ms: execution_deadline_ms,
         retain_until_ms: row.get(20)?,
     })
 }
@@ -3643,6 +4279,41 @@ fn select_operation_by_scope(
         .map_err(map_database_decode_error)
 }
 
+fn select_operation_by_scope_for_schema(
+    connection: &Connection,
+    repository_id: &str,
+    kind: &str,
+    idempotency_key_digest: JournalDigest,
+    include_retention_anchor: bool,
+) -> Result<Option<RawOperation>, JournalError> {
+    let columns = if include_retention_anchor {
+        OPERATION_COLUMNS
+    } else {
+        LEGACY_OPERATION_COLUMNS
+    };
+    connection
+        .query_row(
+            &format!(
+                "SELECT {columns} FROM operations
+                 WHERE repository_id = ?1 AND kind = ?2 AND idempotency_key_digest = ?3"
+            ),
+            params![
+                repository_id,
+                kind,
+                idempotency_key_digest.as_bytes().as_slice()
+            ],
+            |row| {
+                if include_retention_anchor {
+                    raw_operation_from_row(row)
+                } else {
+                    raw_legacy_operation_from_row(row)
+                }
+            },
+        )
+        .optional()
+        .map_err(map_database_decode_error)
+}
+
 fn completion_intent_exists(
     connection: &Connection,
     operation_id: &OperationId,
@@ -3664,10 +4335,13 @@ fn select_completion_intent(
 ) -> Result<Option<CompletionIntent>, JournalError> {
     connection
         .query_row(
-            "SELECT intent.operation_id, operation.kind, intent.result_json,
-                    intent.result_digest, intent.decided_at_ms
+            "SELECT intent.operation_id, operation.kind,
+                    operation.input_json, operation.input_digest,
+                    handoff.operation_kind, handoff.payload_json, handoff.payload_digest,
+                    intent.result_json, intent.result_digest, intent.decided_at_ms
              FROM operation_completion_intents AS intent
              JOIN operations AS operation USING(operation_id)
+             LEFT JOIN runner_handoffs AS handoff USING(operation_id)
              WHERE intent.operation_id=?1",
             params![operation_id.as_str()],
             completion_intent_from_row,
@@ -3678,18 +4352,19 @@ fn select_completion_intent(
 
 fn select_next_completion_intent(
     connection: &Connection,
-    repository_id: &LogicalRepositoryId,
 ) -> Result<Option<CompletionIntent>, JournalError> {
     connection
         .query_row(
-            "SELECT intent.operation_id, operation.kind, intent.result_json,
-                    intent.result_digest, intent.decided_at_ms
+            "SELECT intent.operation_id, operation.kind,
+                    operation.input_json, operation.input_digest,
+                    handoff.operation_kind, handoff.payload_json, handoff.payload_digest,
+                    intent.result_json, intent.result_digest, intent.decided_at_ms
              FROM operation_completion_intents AS intent
              JOIN operations AS operation USING(operation_id)
-             WHERE operation.repository_id=?1
+             LEFT JOIN runner_handoffs AS handoff USING(operation_id)
              ORDER BY intent.decided_at_ms, intent.operation_id
              LIMIT 1",
-            params![repository_id.as_str()],
+            [],
             completion_intent_from_row,
         )
         .optional()
@@ -3703,27 +4378,58 @@ fn completion_intent_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Compl
     let kind = OperationKind::parse(&row.get::<_, String>(1)?).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, Box::new(error))
     })?;
-    let encoded: String = row.get(2)?;
-    let stored_digest: Vec<u8> = row.get(3)?;
+    let input_encoded: String = row.get(2)?;
+    let input_stored_digest: Vec<u8> = row.get(3)?;
+    let normalized_input = CanonicalInput::from_database(input_encoded, input_stored_digest)
+        .map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                3,
+                rusqlite::types::Type::Blob,
+                Box::new(error),
+            )
+        })?;
+    let handoff_kind = OperationKind::parse(&row.get::<_, String>(4)?).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    let handoff_encoded: String = row.get(5)?;
+    let handoff_stored_digest: Vec<u8> = row.get(6)?;
+    let handoff_input = CanonicalInput::from_database(handoff_encoded, handoff_stored_digest)
+        .map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                6,
+                rusqlite::types::Type::Blob,
+                Box::new(error),
+            )
+        })?;
+    if handoff_kind != kind || handoff_input != normalized_input {
+        return Err(rusqlite::Error::FromSqlConversionFailure(
+            6,
+            rusqlite::types::Type::Blob,
+            Box::new(JournalError::IntegrityFailure),
+        ));
+    }
+    let encoded: String = row.get(7)?;
+    let stored_digest: Vec<u8> = row.get(8)?;
     let observed_digest = JournalDigest::sha256(encoded.as_bytes());
     let expected_digest = JournalDigest::from_database(stored_digest).map_err(|error| {
-        rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Blob, Box::new(error))
+        rusqlite::Error::FromSqlConversionFailure(8, rusqlite::types::Type::Blob, Box::new(error))
     })?;
     if observed_digest != expected_digest {
         return Err(rusqlite::Error::FromSqlConversionFailure(
-            3,
+            8,
             rusqlite::types::Type::Blob,
             Box::new(JournalError::IntegrityFailure),
         ));
     }
     let result = CanonicalJson::from_database(encoded).map_err(|error| {
-        rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(error))
+        rusqlite::Error::FromSqlConversionFailure(7, rusqlite::types::Type::Text, Box::new(error))
     })?;
     Ok(CompletionIntent {
         operation_id,
         kind,
+        normalized_input,
         result,
-        decided_at_ms: row.get(4)?,
+        decided_at_ms: row.get(9)?,
     })
 }
 
@@ -3863,15 +4569,18 @@ fn decode_operation(raw: RawOperation) -> Result<OperationRecord, JournalError> 
     )
     .map_err(|_| JournalError::IntegrityFailure)?;
     validate_timestamp(raw.created_at_ms).map_err(|_| JournalError::IntegrityFailure)?;
-    let maximum_retain_until_ms = checked_add(raw.created_at_ms, MAX_TASK_TTL_MS_I64)
+    let maximum_submitted_retain_until_ms = checked_add(raw.created_at_ms, MAX_TASK_TTL_MS_I64)
+        .map_err(|_| JournalError::IntegrityFailure)?;
+    let submitted_retain_until_ms = checked_add(raw.execution_deadline_ms, TERMINAL_RETENTION_MS)
+        .map_err(|_| JournalError::IntegrityFailure)?;
+    let anchored_retain_until_ms = checked_add(raw.retention_anchor_ms, TERMINAL_RETENTION_MS)
         .map_err(|_| JournalError::IntegrityFailure)?;
     if raw.updated_at_ms < raw.created_at_ms
         || raw.updated_at_ms > raw.execution_deadline_ms
         || raw.execution_deadline_ms <= raw.created_at_ms
-        || raw.retain_until_ms
-            < checked_add(raw.execution_deadline_ms, TERMINAL_RETENTION_MS)
-                .map_err(|_| JournalError::IntegrityFailure)?
-        || raw.retain_until_ms > maximum_retain_until_ms
+        || submitted_retain_until_ms > maximum_submitted_retain_until_ms
+        || raw.retention_anchor_ms < raw.execution_deadline_ms
+        || raw.retain_until_ms != anchored_retain_until_ms
     {
         return Err(JournalError::IntegrityFailure);
     }
@@ -3935,10 +4644,16 @@ fn decode_operation(raw: RawOperation) -> Result<OperationRecord, JournalError> 
         && (terminal_at_ms < raw.created_at_ms
             || terminal_at_ms > raw.execution_deadline_ms
             || terminal_at_ms != raw.updated_at_ms
-            || raw.retain_until_ms
-                < checked_add(terminal_at_ms, TERMINAL_RETENTION_MS)
-                    .map_err(|_| JournalError::IntegrityFailure)?)
+            || raw.retention_anchor_ms < terminal_at_ms)
     {
+        return Err(JournalError::IntegrityFailure);
+    }
+    if raw.retention_anchor_ms != raw.execution_deadline_ms
+        && (status != OperationStatus::Completed || raw.terminal_at_ms.is_none())
+    {
+        // Only completion decisions can be recovered after their submitted
+        // retention window. The separately durable anchor keeps that late
+        // observability finite without weakening accepted task TTL bounds.
         return Err(JournalError::IntegrityFailure);
     }
 
@@ -3959,6 +4674,7 @@ fn decode_operation(raw: RawOperation) -> Result<OperationRecord, JournalError> 
         created_at_ms: raw.created_at_ms,
         updated_at_ms: raw.updated_at_ms,
         terminal_at_ms: raw.terminal_at_ms,
+        retention_anchor_ms: raw.retention_anchor_ms,
         retain_until_ms: raw.retain_until_ms,
     })
 }
@@ -4175,6 +4891,8 @@ fn validate_tombstone(tombstone: &RawTombstone) -> Result<(), JournalError> {
     Ok(())
 }
 
+// Immutable base schema shared by journal versions 1 through 3. Migration
+// validation deliberately compares old journals against this exact surface.
 const SCHEMA_V1: &str = r#"
 CREATE TABLE operations (
     operation_id TEXT PRIMARY KEY CHECK(
@@ -4354,6 +5072,30 @@ BEGIN
     SELECT RAISE(ABORT, 'terminal operation is immutable');
 END;
 "#;
+
+fn schema_v4_base() -> Result<String, JournalError> {
+    const V3_INPUT_CHECK: &str =
+        "typeof(input_json) = 'text' AND octet_length(input_json) <= 1048576";
+    const V4_INPUT_CHECK: &str =
+        "typeof(input_json) = 'text' AND octet_length(input_json) <= 16777216";
+    const V3_HANDOFF_CHECK: &str =
+        "typeof(payload_json) = 'text' AND octet_length(payload_json) <= 1048576";
+    const V4_HANDOFF_CHECK: &str =
+        "typeof(payload_json) = 'text' AND octet_length(payload_json) <= 16777216";
+    const V3_RETENTION_COLUMNS: &str =
+        "    terminal_at_ms INTEGER,\n    retain_until_ms INTEGER NOT NULL,";
+    const V4_RETENTION_COLUMNS: &str = "    terminal_at_ms INTEGER,\n    retention_anchor_ms INTEGER NOT NULL,\n    retain_until_ms INTEGER NOT NULL,";
+    if SCHEMA_V1.matches(V3_INPUT_CHECK).count() != 1
+        || SCHEMA_V1.matches(V3_HANDOFF_CHECK).count() != 1
+        || SCHEMA_V1.matches(V3_RETENTION_COLUMNS).count() != 1
+    {
+        return Err(JournalError::IntegrityFailure);
+    }
+    Ok(SCHEMA_V1
+        .replacen(V3_INPUT_CHECK, V4_INPUT_CHECK, 1)
+        .replacen(V3_HANDOFF_CHECK, V4_HANDOFF_CHECK, 1)
+        .replacen(V3_RETENTION_COLUMNS, V4_RETENTION_COLUMNS, 1))
+}
 
 const SCHEMA_V2_METADATA: &str = r#"
 CREATE TABLE operation_journal_metadata (

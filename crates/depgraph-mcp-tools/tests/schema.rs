@@ -72,7 +72,7 @@ fn issue_310_shared_schema_publishes_the_closed_operation_projection() {
             .as_array()
             .expect("terminal output is a closed union")
             .len(),
-        2
+        3
     );
     let terminal_schema = terminal_output.to_string();
     assert!(!terminal_schema.contains("AgentOperation"));
@@ -90,6 +90,39 @@ fn issue_310_shared_schema_publishes_the_closed_operation_projection() {
         })
         .collect::<String>();
     assert!(terminal_branches.contains("AgentScanOutcome"));
+    assert!(terminal_branches.contains("AgentRuntimeOutcome"));
+}
+
+#[test]
+fn issue_313_schema_closes_runtime_import_outcome_and_terminal_union() {
+    let schema = schema_value();
+    let definitions = schema["$defs"].as_object().expect("schema definitions");
+    let outcome = &definitions["AgentRuntimeOutcome"];
+    assert_eq!(outcome["additionalProperties"], false);
+    assert_eq!(
+        outcome["required"],
+        json!([
+            "import_id",
+            "session_id",
+            "snapshot_id",
+            "status",
+            "deduplicated"
+        ])
+    );
+    assert_eq!(
+        definitions["AgentRuntimeStatus"]["enum"],
+        json!(["completed", "partial"])
+    );
+    assert!(
+        definitions["PortableTerminalOutput"]["anyOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|branch| branch["$ref"].as_str())
+            .filter_map(|reference| reference.strip_prefix("#/$defs/"))
+            .filter_map(|definition| definitions.get(definition))
+            .any(|branch| branch.to_string().contains("AgentRuntimeOutcome"))
+    );
 }
 
 #[test]
@@ -665,7 +698,7 @@ fn every_generated_object_schema_has_additional_properties_false() {
     let schema = schema_value();
     let mut objects = 0;
     assert_all_object_schemas_are_closed(&schema, "#", &mut objects);
-    assert_eq!(objects, 148, "review newly added object schemas explicitly");
+    assert_eq!(objects, 150, "review newly added object schemas explicitly");
 }
 
 #[test]
@@ -795,7 +828,7 @@ fn lifecycle_agent_schemas_are_closed_and_prohibit_sensitive_doctor_fields() {
         "diagnostic_root_source": "explicit",
         "protocol_version": "1.0",
         "graph_schema_version": "1.0",
-        "store_schema_version": 15,
+        "store_schema_version": 16,
         "cache_contract_version": 2,
         "cache_entries": {"syntax":0,"semantic":0,"build":0,"compiler_precise":0},
         "impact_query_cache_contract_version": 1,

@@ -27,7 +27,8 @@ pub use crate::service_artifacts::{
     SnapshotDiffRequest, SnapshotDiffResult, SnapshotDiffSite, SnapshotDiffSummary,
 };
 pub use crate::service_bounded::{
-    BoundedQueryMode, BoundedQueryRequest, BoundedQueryServiceResult, RuntimeValidateRequest,
+    BoundedQueryMode, BoundedQueryRequest, BoundedQueryServiceResult,
+    RuntimeTraceSourcePrevalidation, RuntimeTraceSourceRequest, RuntimeValidateRequest,
     RuntimeValidateServiceResult, ServiceSnapshotSelector,
 };
 pub use crate::service_graph::{
@@ -48,8 +49,11 @@ pub use crate::service_repository::{
 };
 pub use crate::service_snapshot::{ResolvedSnapshotId, SnapshotLocator, SnapshotReadRequest};
 pub use crate::service_store_write::{
-    DeferredScanCompletion, DeferredScanServiceOutcome, ScanRequest, ScanServiceOutcome,
-    SnapshotNameCreateRequest, SnapshotNameCreateSelector,
+    DeferredRuntimeImportCompletion, DeferredRuntimeImportRecovery,
+    DeferredRuntimeImportServiceOutcome, DeferredScanCompletion, DeferredScanRecovery,
+    DeferredScanServiceOutcome, RuntimeImportDurableBinding, RuntimeImportPreparation,
+    RuntimeImportServiceOutcome, ScanRequest, ScanServiceOutcome, SnapshotNameCreateRequest,
+    SnapshotNameCreateSelector,
 };
 
 pub const DEPGRAPH_SERVICE_LIMITS_VERSION: &str = "depgraph-service-limits-v1";
@@ -556,6 +560,12 @@ pub struct RequestReadStoreFactory {
 impl RequestReadStoreFactory {
     pub fn open(&self) -> DepgraphServiceResult<RequestReadStore> {
         let store = Store::open_read_only(&self.config.store_path)
+            .map_err(|source| DepgraphServiceError::ReadStoreUnavailable { source })?;
+        Ok(RequestReadStore { store })
+    }
+
+    pub(crate) fn open_for_migration(&self) -> DepgraphServiceResult<RequestReadStore> {
+        let store = Store::open_read_only_for_migration(&self.config.store_path)
             .map_err(|source| DepgraphServiceError::ReadStoreUnavailable { source })?;
         Ok(RequestReadStore { store })
     }

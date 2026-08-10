@@ -50,3 +50,4 @@ windows-sys = { version = "0.61", features = [
 
 [dev-dependencies]
 jsonschema = { version = "0.47", default-features = false }
+rusqlite.workspace = true

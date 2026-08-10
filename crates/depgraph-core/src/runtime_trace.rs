@@ -473,6 +473,20 @@ pub(crate) fn expected_validated_runtime_event_id(
     )
 }
 
+pub(crate) fn runtime_trace_identity(
+    validated: &ValidatedRuntimeTrace,
+) -> Result<(String, String)> {
+    let trace_digest = stable_id_from_value("runtime-trace", &serde_json::to_value(validated)?);
+    let session_id = stable_id_from_value(
+        "runtime-session",
+        &json!({
+            "source_session_id": validated.session.id,
+            "trace_digest": trace_digest,
+        }),
+    );
+    Ok((session_id, trace_digest))
+}
+
 /// Converts a validated collector document into an immutable runtime graph
 /// delta. Stable graph identities deliberately exclude the collector session
 /// ID, so repeated observations share nodes/sites/edges while their evidence
@@ -482,14 +496,7 @@ pub fn runtime_session_delta(
     base_snapshot_id: &str,
     snapshot: &GraphSnapshot,
 ) -> Result<RuntimeSessionDelta> {
-    let trace_digest = stable_id_from_value("runtime-trace", &serde_json::to_value(&validated)?);
-    let session_id = stable_id_from_value(
-        "runtime-session",
-        &json!({
-            "source_session_id": validated.session.id,
-            "trace_digest": trace_digest,
-        }),
-    );
+    let (session_id, trace_digest) = runtime_trace_identity(&validated)?;
     let parent = validated
         .profile_match
         .parent_profile_id

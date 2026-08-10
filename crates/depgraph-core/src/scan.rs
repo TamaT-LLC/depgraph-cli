@@ -6,8 +6,8 @@ use std::{
 
 use anyhow::{Context, Result};
 use depgraph_store::{
-    CacheEventRecord, CacheLayer, CompletedScanSnapshot, CoverageRecord, DiagnosticRecord, Store,
-    ValidatedScan, ValidatedScanCacheHit,
+    CacheEventRecord, CacheLayer, CompletedScanSnapshot, CoverageRecord, DiagnosticRecord,
+    ScanOperationStagingIdentity, Store, ValidatedScan, ValidatedScanCacheHit,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -75,9 +75,28 @@ enum ScanPromotionMode {
     Deferred,
 }
 
-struct ScanPromotionContext<'a> {
+struct ScanPreparationMode<'a> {
+    promotion: ScanPromotionMode,
+    operation_id: Option<&'a str>,
+    operation_identity: Option<&'a DeferredScanOperationIdentity>,
+}
+
+struct ScanPromotionContext<'pending, 'operation_id> {
     mode: ScanPromotionMode,
-    pending: &'a mut Option<PendingScanPromotion>,
+    pending: &'pending mut Option<PendingScanPromotion>,
+    operation_id: Option<&'operation_id str>,
+    operation_identity: Option<&'operation_id DeferredScanOperationIdentity>,
+}
+
+pub(crate) struct DeferredScanOperationIdentity {
+    pub(crate) repository_binding_digest: [u8; 32],
+    pub(crate) configuration_digest: [u8; 32],
+    pub(crate) cache_enabled: bool,
+}
+
+pub(crate) struct DeferredScanOperation<'a> {
+    pub(crate) operation_id: &'a str,
+    pub(crate) identity: &'a DeferredScanOperationIdentity,
 }
 
 pub(crate) struct PendingScanPromotion {
@@ -86,6 +105,10 @@ pub(crate) struct PendingScanPromotion {
 }
 
 impl PendingScanPromotion {
+    pub(crate) const fn validation(&self) -> &ValidatedScan {
+        &self.validation
+    }
+
     pub(crate) fn promote(
         self,
         store: &mut Store,
@@ -262,7 +285,11 @@ pub async fn run_scan_with_cache_mode_and_cancellation(
         strict,
         cache_mode,
         cancellation,
-        ScanPromotionMode::Immediate,
+        ScanPreparationMode {
+            promotion: ScanPromotionMode::Immediate,
+            operation_id: None,
+            operation_identity: None,
+        },
     )
     .await?;
     debug_assert!(prepared.promotion.is_none());
@@ -276,6 +303,7 @@ pub(crate) async fn prepare_deferred_scan_with_cache_mode_and_cancellation(
     strict: bool,
     cache_mode: ScanCacheMode,
     cancellation: CancellationToken,
+    operation: Option<DeferredScanOperation<'_>>,
 ) -> Result<PreparedScan> {
     prepare_scan_with_cache_mode_and_cancellation(
         store,
@@ -284,7 +312,11 @@ pub(crate) async fn prepare_deferred_scan_with_cache_mode_and_cancellation(
         strict,
         cache_mode,
         cancellation,
-        ScanPromotionMode::Deferred,
+        ScanPreparationMode {
+            promotion: ScanPromotionMode::Deferred,
+            operation_id: operation.as_ref().map(|operation| operation.operation_id),
+            operation_identity: operation.map(|operation| operation.identity),
+        },
     )
     .await
 }
@@ -296,13 +328,15 @@ async fn prepare_scan_with_cache_mode_and_cancellation(
     strict: bool,
     cache_mode: ScanCacheMode,
     cancellation: CancellationToken,
-    promotion_mode: ScanPromotionMode,
+    mode: ScanPreparationMode<'_>,
 ) -> Result<PreparedScan> {
     let total_started = Instant::now();
     let mut pending_promotion = None;
     let mut promotion = ScanPromotionContext {
-        mode: promotion_mode,
+        mode: mode.promotion,
         pending: &mut pending_promotion,
+        operation_id: mode.operation_id,
+        operation_identity: mode.operation_identity,
     };
     let mut outcome = run_scan_with_cache_mode_and_cancellation_inner(
         store,
@@ -339,7 +373,7 @@ async fn run_scan_with_cache_mode_and_cancellation_inner(
     strict: bool,
     cache_mode: ScanCacheMode,
     cancellation: CancellationToken,
-    promotion: &mut ScanPromotionContext<'_>,
+    promotion: &mut ScanPromotionContext<'_, '_>,
 ) -> Result<ScanOutcome> {
     let setup_started = Instant::now();
     let root = root
@@ -352,9 +386,36 @@ async fn run_scan_with_cache_mode_and_cancellation_inner(
     }
     let profile_plan = plan_repository_profiles(&root, config, None)?.plan;
     validate_profile_selection_plan(&profile_plan)?;
-    let scan_id = Uuid::new_v4().to_string();
+    let scan_id = match promotion.operation_id {
+        Some(operation_id)
+            if !operation_id.is_empty()
+                && operation_id.len() <= 512
+                && !operation_id.chars().any(char::is_control) =>
+        {
+            scan_attempt_id(operation_id)
+        }
+        Some(_) => anyhow::bail!("deferred scan operation identity is invalid"),
+        None => Uuid::new_v4().to_string(),
+    };
     let source_revision = git_source_revision(&root);
-    store.start_scan_with_revision(&scan_id, &root, strict, source_revision.as_deref())?;
+    if let Some(identity) = promotion.operation_identity {
+        store.start_scan_for_operation(
+            &scan_id,
+            &root,
+            strict,
+            source_revision.as_deref(),
+            &ScanOperationStagingIdentity {
+                operation_id: promotion
+                    .operation_id
+                    .context("operation-owned scan has no operation identity")?,
+                repository_binding_digest: &identity.repository_binding_digest,
+                configuration_digest: &identity.configuration_digest,
+                cache_enabled: identity.cache_enabled,
+            },
+        )?;
+    } else {
+        store.start_scan_with_revision(&scan_id, &root, strict, source_revision.as_deref())?;
+    }
     let profile_status = profile_selection_doctor_status(&profile_plan, strict)?;
     if !profile_status.default_profile_matrix_complete {
         add_core_diagnostic(
@@ -959,6 +1020,11 @@ pub(crate) fn cancel_scan(store: &mut Store, scan_id: &str) -> Result<ScanOutcom
     snapshot_outcome(store, scan_id, 3)
 }
 
+fn scan_attempt_id(operation_id: &str) -> String {
+    let owner_digest = Sha256::digest(operation_id.as_bytes());
+    format!("scan-attempt:{owner_digest:x}:{}", Uuid::new_v4().simple())
+}
+
 fn promote_validated_scan_cache_hit_if_active(
     store: &mut Store,
     scan_id: &str,
@@ -986,6 +1052,8 @@ pub(crate) fn complete_scan(
     let mut promotion = ScanPromotionContext {
         mode: ScanPromotionMode::Immediate,
         pending: &mut pending_promotion,
+        operation_id: None,
+        operation_identity: None,
     };
     let outcome = complete_scan_with_mode(
         store,
@@ -1007,7 +1075,7 @@ fn complete_scan_with_mode(
     config: &Config,
     cache_plan: Option<&ScanCachePlan>,
     cancellation: &CancellationToken,
-    promotion: &mut ScanPromotionContext<'_>,
+    promotion: &mut ScanPromotionContext<'_, '_>,
 ) -> Result<ScanOutcome> {
     if cancellation.is_cancelled() {
         return cancel_scan(store, scan_id);

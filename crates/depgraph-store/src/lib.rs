@@ -45,12 +45,71 @@ pub use profile_matrix::{
     refresh_profile_matrix_view,
 };
 pub use runtime::{
-    RuntimeEdgeContext, RuntimeImportResult, RuntimeSessionDelta, RuntimeSessionRecord,
-    runtime_context_for_edge,
+    PreparedRuntimeImport, RuntimeEdgeContext, RuntimeImportRecoveryIdentity, RuntimeImportResult,
+    RuntimeSessionDelta, RuntimeSessionRecord, runtime_context_for_edge,
 };
 
-pub const STORE_SCHEMA_VERSION: i64 = 15;
+pub const STORE_SCHEMA_VERSION: i64 = 17;
 const COMPLETED_SNAPSHOT_SEAL_VERSION: i64 = 1;
+const MAX_PENDING_CANCELLED_SCAN_OPERATIONS: usize = 64;
+// This namespace is not a real operation ID and is rejected by attach/release APIs.
+const LEGACY_RUNTIME_IMPORT_OWNER_PREFIX: &str =
+    "__depgraph_reserved_legacy_runtime_import_owner__:";
+// A v17 migration records legacy scan candidates under an identity that can
+// never be supplied by an operation. The row is not an ownership assertion:
+// it carries zeroed authority fields and must either be adopted from a
+// validated completion decision or cancelled by coordinated reconciliation.
+const LEGACY_SCAN_OPERATION_CANDIDATE_PREFIX: &str =
+    "__depgraph_reserved_legacy_scan_operation_candidate__:";
+const RUNTIME_IMPORT_OPERATION_OWNERS_TABLE_SQL: &str =
+    "CREATE TABLE runtime_import_operation_owners (
+        import_id TEXT NOT NULL
+            REFERENCES runtime_imports(id) ON DELETE CASCADE,
+        operation_id TEXT NOT NULL UNIQUE
+            CHECK (length(operation_id) BETWEEN 1 AND 512),
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (import_id, operation_id)
+     )";
+const RUNTIME_IMPORT_OPERATION_OWNERS_INDEX_SQL: &str =
+    "CREATE INDEX runtime_import_operation_owners_import
+        ON runtime_import_operation_owners(import_id, operation_id)";
+const SCAN_OPERATION_STAGING_TABLE_SQL: &str = "CREATE TABLE scan_operation_staging (
+        operation_id TEXT PRIMARY KEY
+            CHECK (length(operation_id) BETWEEN 1 AND 512),
+        scan_id TEXT NOT NULL UNIQUE
+            REFERENCES scans(id) ON DELETE CASCADE,
+        repository_binding_digest BLOB NOT NULL
+            CHECK (typeof(repository_binding_digest)='blob'
+                AND length(repository_binding_digest)=32),
+        configuration_digest BLOB NOT NULL
+            CHECK (typeof(configuration_digest)='blob'
+                AND length(configuration_digest)=32),
+        strict INTEGER NOT NULL CHECK (strict IN (0, 1)),
+        cache_enabled INTEGER NOT NULL CHECK (cache_enabled IN (0, 1)),
+        base_snapshot_id TEXT,
+        validated_mutation_count INTEGER
+            CHECK (validated_mutation_count IS NULL
+                OR validated_mutation_count >= 0),
+        prospective_snapshot_id TEXT,
+        result_digest BLOB
+            CHECK (result_digest IS NULL
+                OR (typeof(result_digest)='blob' AND length(result_digest)=32)),
+        decision_authorization_digest BLOB
+            CHECK (decision_authorization_digest IS NULL
+                OR (typeof(decision_authorization_digest)='blob'
+                    AND length(decision_authorization_digest)=32)),
+        created_at TEXT NOT NULL,
+        CHECK ((validated_mutation_count IS NULL
+                    AND prospective_snapshot_id IS NULL
+                    AND result_digest IS NULL)
+            OR (validated_mutation_count IS NOT NULL
+                    AND prospective_snapshot_id IS NOT NULL))
+     )";
+const SCAN_OPERATION_STAGING_SCAN_INDEX_SQL: &str = "CREATE INDEX scan_operation_staging_scan
+        ON scan_operation_staging(scan_id, operation_id)";
+const SCAN_OPERATION_STAGING_PENDING_INDEX_SQL: &str =
+    "CREATE INDEX scan_operation_staging_pending_cancelled
+        ON scan_operation_staging(operation_id COLLATE BINARY, scan_id)";
 // Larger pages keep the representative semantic graph's multi-kilobyte rows
 // from forcing one B-tree page per row. Existing stores retain their page size.
 const STORE_PAGE_SIZE_BYTES: i64 = 16 * 1024;
@@ -156,6 +215,103 @@ pub type ScanAttemptRecord = ScanRecord;
 pub struct ValidatedScan {
     scan_id: String,
     mutation_count: i64,
+}
+
+struct FinishedScan {
+    completed_snapshot_id: Option<String>,
+    promoted: bool,
+}
+
+/// Immutable service authority and request identity recorded with an
+/// operation-owned staging scan before graph ingestion begins.
+pub struct ScanOperationStagingIdentity<'a> {
+    pub operation_id: &'a str,
+    pub repository_binding_digest: &'a [u8; 32],
+    pub configuration_digest: &'a [u8; 32],
+    pub cache_enabled: bool,
+}
+
+/// Complete proof supplied when recovering one operation-owned scan result.
+pub struct ScanCompletionRecoveryIdentity<'a> {
+    pub operation_id: &'a str,
+    pub scan_id: &'a str,
+    pub repository_root: &'a Path,
+    pub repository_binding_digest: &'a [u8; 32],
+    pub strict: bool,
+    pub cache_enabled: bool,
+    pub snapshot_id: &'a str,
+    pub result_digest: &'a [u8; 32],
+}
+
+struct ScanOperationRecoveryBinding {
+    operation_id: String,
+    scan_id: String,
+    repository_binding_digest: Vec<u8>,
+    configuration_digest: Vec<u8>,
+    strict: bool,
+    cache_enabled: bool,
+    base_snapshot_id: Option<String>,
+    validated_mutation_count: Option<i64>,
+    prospective_snapshot_id: Option<String>,
+    result_digest: Option<Vec<u8>>,
+    decision_authorization_digest: Option<Vec<u8>>,
+    root: String,
+    status: String,
+    scan_strict: bool,
+    parent_snapshot_id: Option<String>,
+    mutation_count: i64,
+}
+
+struct LegacyRuntimeImportCandidate {
+    import_id: String,
+    created_at: String,
+}
+
+struct LegacyScanOperationCandidate {
+    scan_id: String,
+    strict: bool,
+    parent_snapshot_id: Option<String>,
+    validated_mutation_count: Option<i64>,
+    prospective_snapshot_id: Option<String>,
+    started_at: String,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct PendingCancelledScanOperations {
+    operation_ids: Vec<String>,
+    more_work: bool,
+    next_after_operation_id: Option<String>,
+}
+
+impl PendingCancelledScanOperations {
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self {
+            operation_ids: Vec::new(),
+            more_work: false,
+            next_after_operation_id: None,
+        }
+    }
+
+    #[must_use]
+    pub fn operation_ids(&self) -> &[String] {
+        &self.operation_ids
+    }
+
+    #[must_use]
+    pub const fn more_work(&self) -> bool {
+        self.more_work
+    }
+
+    #[must_use]
+    pub fn next_after_operation_id(&self) -> Option<&str> {
+        self.next_after_operation_id.as_deref()
+    }
+
+    #[must_use]
+    pub fn into_operation_ids(self) -> Vec<String> {
+        self.operation_ids
+    }
 }
 
 #[derive(Debug)]
@@ -524,6 +680,22 @@ impl Store {
     }
 
     pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_read_only_with_schema_range(path, STORE_SCHEMA_VERSION, STORE_SCHEMA_VERSION)
+    }
+
+    /// Open a read-only handle for semantic validation immediately before a
+    /// writer migration. Schema 15 is the oldest compatible layout because it
+    /// introduced the completed-snapshot seals required by this read path; the
+    /// later operation-ownership migrations do not change snapshot semantics.
+    pub fn open_read_only_for_migration(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_read_only_with_schema_range(path, 15, STORE_SCHEMA_VERSION)
+    }
+
+    fn open_read_only_with_schema_range(
+        path: impl AsRef<Path>,
+        minimum_schema: i64,
+        maximum_schema: i64,
+    ) -> Result<Self> {
         let connection = Connection::open_with_flags(
             path.as_ref(),
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -536,9 +708,10 @@ impl Store {
         })?;
         let store = Self { connection };
         let current = store.schema_version()?;
-        if current != STORE_SCHEMA_VERSION {
+        if !(minimum_schema..=maximum_schema).contains(&current) {
             bail!(
-                "store schema {current} does not match supported read-only schema {STORE_SCHEMA_VERSION}"
+                "store schema {current} is outside supported read-only schema range \
+                 {minimum_schema}..={maximum_schema}"
             );
         }
         Ok(store)
@@ -549,6 +722,69 @@ impl Store {
         let mut store = Self { connection };
         store.migrate()?;
         Ok(store)
+    }
+
+    /// Decide under an external writer exclusion whether exact operation-ID
+    /// runtime cleanup can be proven empty without migrating a legacy store.
+    /// Schema 15 predates the operation owner table, so it cannot contain a
+    /// runtime staging row authorized by a durable operation ID. A forbidden
+    /// pre-existing future table is deliberately not treated as empty; the
+    /// writable open must authenticate and reject it.
+    pub fn runtime_operation_cleanup_requires_writable_store(&self) -> Result<bool> {
+        let version = self.schema_version()?;
+        Ok(version >= 16 || table_exists(&self.connection, "runtime_import_operation_owners")?)
+    }
+
+    /// Decide under an external writer exclusion whether exact operation-ID
+    /// scan cleanup can be proven empty without migrating a legacy store.
+    /// Before schema 17, a scan whose ID equals the operation ID is retained as
+    /// ambiguous evidence and must go through authenticated migration. If no
+    /// such scan and no forbidden future ownership table exists, there is no
+    /// operation-owned staging state to clean.
+    pub fn scan_operation_cleanup_requires_writable_store(
+        &self,
+        operation_id: &str,
+    ) -> Result<bool> {
+        let version = self.schema_version()?;
+        if version >= 17 || table_exists(&self.connection, "scan_operation_staging")? {
+            return Ok(true);
+        }
+        if !table_exists(&self.connection, "scans")? {
+            return Ok(false);
+        }
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT 1 FROM scans WHERE id=?1",
+                [operation_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    /// Decide under an external writer exclusion whether legacy scan
+    /// reconciliation needs a writable migration. Completed history alone is
+    /// immutable and can wait until a later authorized store mutation; active
+    /// staging must be migrated so it can be adopted or cancelled. A forbidden
+    /// future ownership table is deliberately sent through authenticated open.
+    pub fn legacy_scan_reconciliation_requires_writable_store(&self) -> Result<bool> {
+        let version = self.schema_version()?;
+        if version >= 17 || table_exists(&self.connection, "scan_operation_staging")? {
+            return Ok(true);
+        }
+        if !table_exists(&self.connection, "scans")?
+            || !table_has_column(&self.connection, "scans", "status")?
+        {
+            return Ok(false);
+        }
+        self.connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM scans WHERE status='staging')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
     }
 
     /// Run read-only store work with a SQLite progress callback.
@@ -1294,6 +1530,71 @@ impl Store {
             tx.execute_batch("PRAGMA user_version = 15;")?;
             tx.commit()?;
         }
+        if current < 17 {
+            let tx = self.connection.transaction()?;
+            let legacy_runtime_imports = if current < 16 {
+                authenticate_store_schema_before_v16(&tx)?;
+                validate_store_foreign_keys(&tx, 16)?;
+                authenticate_legacy_runtime_import_candidates(&tx)?
+            } else {
+                authenticate_store_schema_before_v17(&tx)?;
+                validate_store_foreign_keys(&tx, 17)?;
+                Vec::new()
+            };
+            let legacy_scans = authenticate_legacy_scan_operation_candidates(&tx)?;
+
+            if current < 16 {
+                tx.execute_batch(RUNTIME_IMPORT_OPERATION_OWNERS_TABLE_SQL)?;
+                tx.execute_batch(RUNTIME_IMPORT_OPERATION_OWNERS_INDEX_SQL)?;
+                for candidate in legacy_runtime_imports {
+                    let operation_id = legacy_runtime_import_owner_id(&candidate.import_id);
+                    tx.execute(
+                        "INSERT INTO runtime_import_operation_owners(
+                             import_id, operation_id, created_at
+                         ) VALUES (?1, ?2, ?3)",
+                        params![candidate.import_id, operation_id, candidate.created_at],
+                    )?;
+                }
+                validate_runtime_import_operation_ownership_schema_and_rows(&tx)?;
+                validate_store_foreign_keys(&tx, 16)?;
+                tx.execute_batch("PRAGMA user_version = 16;")?;
+            }
+
+            tx.execute_batch(SCAN_OPERATION_STAGING_TABLE_SQL)?;
+            tx.execute_batch(SCAN_OPERATION_STAGING_SCAN_INDEX_SQL)?;
+            tx.execute_batch(SCAN_OPERATION_STAGING_PENDING_INDEX_SQL)?;
+            for candidate in legacy_scans {
+                let operation_id = legacy_scan_operation_candidate_id(&candidate.scan_id);
+                tx.execute(
+                    "INSERT INTO scan_operation_staging(
+                         operation_id, scan_id, repository_binding_digest,
+                         configuration_digest, strict, cache_enabled,
+                         base_snapshot_id, validated_mutation_count,
+                         prospective_snapshot_id, result_digest,
+                         decision_authorization_digest, created_at
+                     ) VALUES (?1, ?2, zeroblob(32), zeroblob(32), ?3, 0,
+                               ?4, ?5, ?6, NULL, zeroblob(32), ?7)",
+                    params![
+                        operation_id,
+                        candidate.scan_id,
+                        candidate.strict,
+                        candidate.parent_snapshot_id,
+                        candidate.validated_mutation_count,
+                        candidate.prospective_snapshot_id,
+                        candidate.started_at,
+                    ],
+                )?;
+            }
+            validate_runtime_import_operation_ownership_schema_and_rows(&tx)?;
+            validate_scan_operation_staging_schema_and_rows(&tx)?;
+            validate_store_foreign_keys(&tx, 17)?;
+            tx.execute_batch("PRAGMA user_version = 17;")?;
+            tx.commit()?;
+            return Ok(());
+        }
+        validate_runtime_import_operation_ownership_schema_and_rows(&self.connection)?;
+        validate_scan_operation_staging_schema_and_rows(&self.connection)?;
+        validate_store_foreign_keys(&self.connection, STORE_SCHEMA_VERSION)?;
         Ok(())
     }
 
@@ -2500,11 +2801,56 @@ ORDER BY id COLLATE BINARY
         strict: bool,
         source_revision: Option<&str>,
     ) -> Result<()> {
+        self.start_scan_with_revision_and_operation(scan_id, root, strict, source_revision, None)
+    }
+
+    pub fn start_scan_for_operation(
+        &mut self,
+        scan_id: &str,
+        root: &Path,
+        strict: bool,
+        source_revision: Option<&str>,
+        identity: &ScanOperationStagingIdentity<'_>,
+    ) -> Result<()> {
+        self.start_scan_with_revision_and_operation(
+            scan_id,
+            root,
+            strict,
+            source_revision,
+            Some(identity),
+        )
+    }
+
+    fn start_scan_with_revision_and_operation(
+        &mut self,
+        scan_id: &str,
+        root: &Path,
+        strict: bool,
+        source_revision: Option<&str>,
+        identity: Option<&ScanOperationStagingIdentity<'_>>,
+    ) -> Result<()> {
         if source_revision.is_some_and(|revision| revision.trim().is_empty()) {
             bail!("source revision must not be empty");
         }
+        if let Some(identity) = identity
+            && (identity.operation_id.is_empty()
+                || identity.operation_id.len() > 512
+                || identity.operation_id.chars().any(char::is_control)
+                || identity
+                    .operation_id
+                    .starts_with(LEGACY_SCAN_OPERATION_CANDIDATE_PREFIX)
+                || !scan_attempt_is_bound_to_operation(scan_id, identity.operation_id, false))
+        {
+            bail!("operation-owned scan attempt identity is invalid");
+        }
+        if identity.is_some() && self.legacy_scan_operation_candidate_exists()? {
+            bail!("legacy scan operation staging must be reconciled before new operation scans");
+        }
         let parent_snapshot_id = self.current_snapshot_id()?;
         let tx = self.connection.transaction()?;
+        if let Some(identity) = identity {
+            replace_abandoned_scan_attempt(&tx, root, strict, identity)?;
+        }
         tx.execute(
             "INSERT INTO scans(
                 id, root, status, strict, started_at, protocol_version,
@@ -2519,6 +2865,28 @@ ORDER BY id COLLATE BINARY
                 source_revision,
             ],
         )?;
+        if let Some(identity) = identity {
+            tx.execute(
+                "INSERT INTO scan_operation_staging(
+                     operation_id, scan_id, repository_binding_digest,
+                     configuration_digest, strict, cache_enabled,
+                     base_snapshot_id, validated_mutation_count,
+                     prospective_snapshot_id, result_digest,
+                     decision_authorization_digest, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7,
+                           NULL, NULL, NULL, NULL, ?8)",
+                params![
+                    identity.operation_id,
+                    scan_id,
+                    identity.repository_binding_digest.as_slice(),
+                    identity.configuration_digest.as_slice(),
+                    strict,
+                    identity.cache_enabled,
+                    parent_snapshot_id,
+                    Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+                ],
+            )?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -2913,14 +3281,15 @@ ORDER BY id COLLATE BINARY
         validation: ValidatedScan,
         promote: bool,
     ) -> Result<CompletedScanSnapshot> {
-        let snapshot_id = self
-            .finish_scan_inner(
-                &validation.scan_id,
-                "completed",
-                None,
-                promote,
-                Some(validation.mutation_count),
-            )?
+        let finished = self.finish_scan_inner(
+            &validation.scan_id,
+            "completed",
+            None,
+            promote,
+            Some(validation.mutation_count),
+        )?;
+        let snapshot_id = finished
+            .completed_snapshot_id
             .context("validated completed scan did not create a snapshot")?;
         Ok(CompletedScanSnapshot {
             scan_id: validation.scan_id,
@@ -2963,6 +3332,462 @@ ORDER BY id COLLATE BINARY
         })
     }
 
+    /// Seal the mutation and prospective snapshot identities of an
+    /// operation-owned staging scan after complete graph validation.
+    pub fn seal_scan_operation_staging(
+        &mut self,
+        operation_id: &str,
+        validation: &ValidatedScan,
+        prospective_snapshot_id: &str,
+    ) -> Result<()> {
+        if prospective_snapshot_id.is_empty()
+            || !scan_attempt_is_bound_to_operation(&validation.scan_id, operation_id, true)
+        {
+            bail!("operation-owned scan staging seal is invalid");
+        }
+        let tx = self.connection.transaction()?;
+        let updated = tx.execute(
+            "UPDATE scan_operation_staging
+                SET validated_mutation_count=?1, prospective_snapshot_id=?2
+              WHERE operation_id=?3 AND scan_id=?4
+                AND validated_mutation_count IS NULL
+                AND prospective_snapshot_id IS NULL
+                AND result_digest IS NULL
+                AND EXISTS (
+                    SELECT 1 FROM scans
+                     WHERE id=scan_operation_staging.scan_id
+                       AND status='staging' AND mutation_count=?1
+                       AND parent_snapshot_id IS base_snapshot_id
+                )",
+            params![
+                validation.mutation_count,
+                prospective_snapshot_id,
+                operation_id,
+                validation.scan_id,
+            ],
+        )?;
+        if updated != 1 {
+            bail!("operation-owned scan staging seal does not match durable staging");
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Bind the complete canonical journal result to a previously sealed scan
+    /// before its completion intent can be committed.
+    pub fn bind_scan_operation_result(
+        &mut self,
+        operation_id: &str,
+        result_digest: &[u8; 32],
+    ) -> Result<()> {
+        let binding = self.load_scan_operation_recovery_binding(operation_id)?;
+        validate_internal_scan_operation_binding(&binding)?;
+        let validated_mutation_count = binding
+            .validated_mutation_count
+            .context("operation-owned scan result has no sealed mutation count")?;
+        let prospective_snapshot_id = binding
+            .prospective_snapshot_id
+            .as_deref()
+            .context("operation-owned scan result has no sealed snapshot")?;
+        if binding.operation_id != operation_id
+            || binding.status != "staging"
+            || validated_mutation_count != binding.mutation_count
+        {
+            bail!("operation-owned scan result does not match sealed staging");
+        }
+        let decision_authorization_digest = scan_decision_authorization_digest_from_parts(
+            operation_id,
+            &binding.scan_id,
+            &binding.root,
+            &binding.repository_binding_digest,
+            &binding.configuration_digest,
+            binding.strict,
+            binding.cache_enabled,
+            binding.base_snapshot_id.as_deref(),
+            validated_mutation_count,
+            prospective_snapshot_id,
+            result_digest,
+        );
+        let tx = self.connection.transaction()?;
+        let updated = tx.execute(
+            "UPDATE scan_operation_staging
+                SET result_digest=?1, decision_authorization_digest=?2
+              WHERE operation_id=?3
+                AND validated_mutation_count IS NOT NULL
+                AND prospective_snapshot_id IS NOT NULL
+                AND (result_digest IS NULL OR result_digest=?1)
+                AND (decision_authorization_digest IS NULL
+                     OR decision_authorization_digest=?2)
+                AND EXISTS (
+                    SELECT 1 FROM scans
+                     WHERE id=scan_operation_staging.scan_id
+                       AND status='staging'
+                       AND mutation_count=validated_mutation_count
+                       AND parent_snapshot_id IS base_snapshot_id
+                )",
+            params![
+                result_digest.as_slice(),
+                decision_authorization_digest.as_slice(),
+                operation_id,
+            ],
+        )?;
+        if updated != 1 {
+            bail!("operation-owned scan result does not match sealed staging");
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn load_scan_operation_recovery_binding(
+        &self,
+        operation_id: &str,
+    ) -> Result<ScanOperationRecoveryBinding> {
+        load_scan_operation_recovery_binding_from(&self.connection, operation_id)
+    }
+
+    /// Recover and promote only after every operation, request, repository,
+    /// staging, snapshot, and complete-result binding has matched.
+    pub fn recover_scan_completion_for_operation(
+        &mut self,
+        identity: &ScanCompletionRecoveryIdentity<'_>,
+    ) -> Result<()> {
+        if !self.scan_operation_owner_exists(identity.operation_id)? {
+            self.adopt_legacy_scan_completion_for_operation(identity)?;
+        }
+        let binding = self.load_scan_operation_recovery_binding(identity.operation_id)?;
+        validate_scan_operation_recovery_binding(&binding, identity)?;
+        match binding.status.as_str() {
+            "staging" => {
+                let validation = self.validate_scan_for_completion(identity.scan_id)?;
+                if Some(validation.mutation_count) != binding.validated_mutation_count {
+                    bail!("scan staging changed after its operation result was bound");
+                }
+                let prospective = self.prospective_scan_snapshot_id(identity.scan_id)?;
+                if prospective != identity.snapshot_id
+                    || binding.prospective_snapshot_id.as_deref() != Some(prospective.as_str())
+                {
+                    bail!("scan staging prospective snapshot does not match recovery");
+                }
+                let finished = self.finish_scan_inner(
+                    &validation.scan_id,
+                    "completed",
+                    None,
+                    true,
+                    Some(validation.mutation_count),
+                )?;
+                if finished.completed_snapshot_id.as_deref() != Some(identity.snapshot_id) {
+                    bail!("recovered scan created an unexpected completed snapshot");
+                }
+                if !finished.promoted
+                    && self.current_snapshot_id()?.as_deref() == binding.base_snapshot_id.as_deref()
+                {
+                    bail!("recovered scan promotion did not update current snapshot");
+                }
+            }
+            "completed" => {
+                let snapshot_id = self
+                    .snapshot_id_for_source("scan", identity.scan_id)?
+                    .context("completed operation-owned scan has no snapshot source")?;
+                if snapshot_id != identity.snapshot_id {
+                    bail!("completed scan snapshot does not match recovery");
+                }
+            }
+            _ => bail!("operation-owned scan is not recoverably promotable"),
+        }
+        // A completed scan may have been superseded before or after its
+        // promotion. The expected-parent CAS above leaves that newer current
+        // snapshot unchanged while still finishing the intended scan.
+        Ok(())
+    }
+
+    fn scan_operation_owner_exists(&self, operation_id: &str) -> Result<bool> {
+        self.connection
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM scan_operation_staging WHERE operation_id=?1
+                 )",
+                [operation_id],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
+    fn legacy_scan_operation_candidate_exists(&self) -> Result<bool> {
+        self.connection
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM scan_operation_staging
+                      WHERE substr(operation_id, 1, length(?1))=?1
+                 )",
+                [LEGACY_SCAN_OPERATION_CANDIDATE_PREFIX],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
+    /// Convert one migration sentinel into strict operation ownership only
+    /// after complete immutable journal evidence has selected the exact scan.
+    fn adopt_legacy_scan_completion_for_operation(
+        &mut self,
+        identity: &ScanCompletionRecoveryIdentity<'_>,
+    ) -> Result<()> {
+        let candidate_id = legacy_scan_operation_candidate_id(identity.scan_id);
+        let candidate = self.load_scan_operation_recovery_binding(&candidate_id)?;
+        validate_legacy_scan_operation_candidate(&candidate)?;
+        if candidate.scan_id != identity.scan_id {
+            bail!("legacy scan candidate identity does not match recovery");
+        }
+        let (validated_mutation_count, prospective_snapshot_id) = match candidate.status.as_str() {
+            "staging" => {
+                let validation = self.validate_scan_for_completion(identity.scan_id)?;
+                let prospective = self.prospective_scan_snapshot_id(identity.scan_id)?;
+                (validation.mutation_count, prospective)
+            }
+            "completed" => (
+                candidate
+                    .validated_mutation_count
+                    .context("completed legacy scan candidate has no sealed mutation count")?,
+                candidate
+                    .prospective_snapshot_id
+                    .clone()
+                    .context("completed legacy scan candidate has no immutable snapshot")?,
+            ),
+            _ => bail!("legacy scan candidate is not recoverably promotable"),
+        };
+        if prospective_snapshot_id != identity.snapshot_id {
+            bail!("legacy scan candidate snapshot does not match durable recovery");
+        }
+        let zero_configuration_digest = [0_u8; 32];
+        let authorization_digest = scan_decision_authorization_digest_from_parts(
+            identity.operation_id,
+            identity.scan_id,
+            &identity.repository_root.to_string_lossy(),
+            identity.repository_binding_digest,
+            &zero_configuration_digest,
+            identity.strict,
+            identity.cache_enabled,
+            candidate.base_snapshot_id.as_deref(),
+            validated_mutation_count,
+            &prospective_snapshot_id,
+            identity.result_digest,
+        );
+        let tx = self.connection.transaction()?;
+        let updated = tx.execute(
+            "UPDATE scan_operation_staging
+                SET operation_id=?1, repository_binding_digest=?2,
+                    configuration_digest=?3, cache_enabled=?4,
+                    validated_mutation_count=?5, prospective_snapshot_id=?6,
+                    result_digest=?7, decision_authorization_digest=?8
+              WHERE operation_id=?9 AND scan_id=?10
+                AND repository_binding_digest=zeroblob(32)
+                AND configuration_digest=zeroblob(32)
+                AND decision_authorization_digest=zeroblob(32)",
+            params![
+                identity.operation_id,
+                identity.repository_binding_digest.as_slice(),
+                zero_configuration_digest.as_slice(),
+                identity.cache_enabled,
+                validated_mutation_count,
+                prospective_snapshot_id,
+                identity.result_digest.as_slice(),
+                authorization_digest.as_slice(),
+                candidate_id,
+                identity.scan_id,
+            ],
+        )?;
+        if updated != 1 {
+            bail!("legacy scan candidate changed before durable adoption");
+        }
+        tx.commit()?;
+        let adopted = self.load_scan_operation_recovery_binding(identity.operation_id)?;
+        validate_scan_operation_recovery_binding(&adopted, identity)
+    }
+
+    /// Cancel one bounded page of migration sentinels that no validated
+    /// completion decision adopted. Completed historical candidates only lose
+    /// their sentinel; immutable snapshots are never deleted or republished.
+    pub fn reconcile_legacy_scan_operation_candidates(&mut self) -> Result<bool> {
+        let tx = self.connection.transaction()?;
+        let candidate_ids = {
+            let mut statement = tx.prepare(
+                "SELECT operation_id FROM scan_operation_staging
+                  WHERE substr(operation_id, 1, length(?1))=?1
+                  ORDER BY operation_id COLLATE BINARY
+                  LIMIT ?2",
+            )?;
+            statement
+                .query_map(
+                    params![
+                        LEGACY_SCAN_OPERATION_CANDIDATE_PREFIX,
+                        (MAX_PENDING_CANCELLED_SCAN_OPERATIONS + 1) as i64,
+                    ],
+                    |row| row.get::<_, String>(0),
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let more_work = candidate_ids.len() > MAX_PENDING_CANCELLED_SCAN_OPERATIONS;
+        for candidate_id in candidate_ids
+            .iter()
+            .take(MAX_PENDING_CANCELLED_SCAN_OPERATIONS)
+        {
+            let candidate = load_scan_operation_recovery_binding_from(&tx, candidate_id)?;
+            validate_legacy_scan_operation_candidate(&candidate)?;
+            if candidate.status == "staging" {
+                let completed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+                tx.execute(
+                    "UPDATE incremental_deltas
+                        SET status='cancelled', completed_at=?2,
+                            error='unclaimed legacy operation scan staging reconciled'
+                      WHERE scan_id=?1 AND status='staging'",
+                    params![candidate.scan_id, completed_at],
+                )?;
+                let updated = tx.execute(
+                    "UPDATE scans
+                        SET status='cancelled', completed_at=?2,
+                            error='unclaimed legacy operation scan staging reconciled'
+                      WHERE id=?1 AND status='staging'",
+                    params![candidate.scan_id, completed_at],
+                )?;
+                if updated != 1 {
+                    bail!("legacy scan candidate changed before cancellation");
+                }
+            }
+            let deleted = tx.execute(
+                "DELETE FROM scan_operation_staging
+                  WHERE operation_id=?1 AND scan_id=?2
+                    AND decision_authorization_digest=zeroblob(32)",
+                params![candidate_id, candidate.scan_id],
+            )?;
+            if deleted != 1 {
+                bail!("legacy scan candidate changed before reconciliation");
+            }
+        }
+        tx.commit()?;
+        Ok(more_work)
+    }
+
+    /// Cancel only a scan selected by its durable operation ownership record.
+    /// Absence is safe only when no scan with that operation identity exists.
+    pub fn cancel_scan_for_operation(&mut self, operation_id: &str) -> Result<()> {
+        let scan_id = self
+            .connection
+            .query_row(
+                "SELECT scan_id FROM scan_operation_staging WHERE operation_id=?1",
+                [operation_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let Some(scan_id) = scan_id else {
+            if self.scan(operation_id)?.is_some() {
+                bail!("scan has no durable operation-owned staging binding");
+            }
+            return Ok(());
+        };
+        let binding = self.load_scan_operation_recovery_binding(operation_id)?;
+        validate_internal_scan_operation_binding(&binding)?;
+        if binding.scan_id != scan_id {
+            bail!("scan staging operation identity changed during cancellation");
+        }
+        match binding.status.as_str() {
+            "staging" => self.finish_scan(
+                &scan_id,
+                "cancelled",
+                Some("operation cancelled before scan promotion"),
+                false,
+            ),
+            "cancelled" => Ok(()),
+            _ => bail!("operation-owned scan is already terminal"),
+        }
+    }
+
+    /// Return one fixed-size page of cancellation ownership proofs awaiting a
+    /// terminal journal acknowledgement. Each row remains until explicitly
+    /// finalized after the journal transition commits.
+    pub fn pending_cancelled_scan_operations(&self) -> Result<PendingCancelledScanOperations> {
+        self.pending_cancelled_scan_operations_after(None)
+    }
+
+    pub fn pending_cancelled_scan_operations_after(
+        &self,
+        after_operation_id: Option<&str>,
+    ) -> Result<PendingCancelledScanOperations> {
+        let mut statement = self.connection.prepare(
+            "SELECT substr(CAST(owner.operation_id AS BLOB), 1, 513)
+               FROM scan_operation_staging AS owner
+                    INDEXED BY scan_operation_staging_pending_cancelled
+               JOIN scans AS scan ON scan.id=owner.scan_id
+              WHERE scan.status='cancelled'
+                AND (?1 IS NULL OR owner.operation_id COLLATE BINARY > ?1)
+              ORDER BY owner.operation_id COLLATE BINARY
+              LIMIT ?2",
+        )?;
+        let limit = i64::try_from(MAX_PENDING_CANCELLED_SCAN_OPERATIONS + 1)
+            .context("cancelled scan reconciliation batch limit overflowed")?;
+        let mut rows = statement.query(params![after_operation_id, limit])?;
+        let mut operation_ids = Vec::with_capacity(MAX_PENDING_CANCELLED_SCAN_OPERATIONS);
+        let mut more_work = false;
+        while let Some(row) = rows.next()? {
+            let bounded = row.get::<_, Vec<u8>>(0)?;
+            if bounded.len() > 512 {
+                bail!("cancelled scan operation ID exceeds its storage bound");
+            }
+            let operation_id = String::from_utf8(bounded)
+                .context("cancelled scan operation ID is not valid UTF-8")?;
+            if operation_ids.len() == MAX_PENDING_CANCELLED_SCAN_OPERATIONS {
+                more_work = true;
+                break;
+            }
+            operation_ids.push(operation_id);
+        }
+        let next_after_operation_id = more_work.then(|| {
+            operation_ids
+                .last()
+                .expect("a full reconciliation page has a final operation ID")
+                .clone()
+        });
+        Ok(PendingCancelledScanOperations {
+            operation_ids,
+            more_work,
+            next_after_operation_id,
+        })
+    }
+
+    /// Acknowledge a terminal journal cancellation/failure and remove only its
+    /// already-cancelled scan ownership proof. Replays after removal are safe
+    /// no-ops; active or forged bindings fail closed.
+    pub fn finalize_cancelled_scan_for_operation(&mut self, operation_id: &str) -> Result<bool> {
+        let exists: bool = self.connection.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM scan_operation_staging WHERE operation_id=?1
+             )",
+            [operation_id],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Ok(false);
+        }
+        let binding = self.load_scan_operation_recovery_binding(operation_id)?;
+        validate_internal_scan_operation_binding(&binding)?;
+        if binding.status != "cancelled" {
+            bail!("scan cancellation cannot be finalized before store cancellation");
+        }
+        let tx = self.connection.transaction()?;
+        let deleted = tx.execute(
+            "DELETE FROM scan_operation_staging
+              WHERE operation_id=?1 AND scan_id=?2
+                AND EXISTS (
+                    SELECT 1 FROM scans
+                     WHERE id=?2 AND status='cancelled'
+                )",
+            params![operation_id, binding.scan_id],
+        )?;
+        if deleted != 1 {
+            bail!("scan cancellation ownership changed before acknowledgement");
+        }
+        tx.commit()?;
+        Ok(true)
+    }
+
     pub fn finish_scan(
         &mut self,
         scan_id: &str,
@@ -2995,7 +3820,7 @@ ORDER BY id COLLATE BINARY
         error: Option<&str>,
         promote: bool,
         validated_mutation_count: Option<i64>,
-    ) -> Result<Option<String>> {
+    ) -> Result<FinishedScan> {
         let tx = self.connection.transaction()?;
         ensure_scan_staging(&tx, scan_id)?;
         if status == "completed" {
@@ -3077,19 +3902,40 @@ ORDER BY id COLLATE BINARY
         } else {
             None
         };
+        let mut promoted = false;
         if promote {
             let snapshot_id = completed_snapshot_id
                 .as_deref()
                 .context("completed scan did not create a snapshot")?;
+            let expected_parent = tx.query_row(
+                "SELECT parent_snapshot_id FROM scans WHERE id=?1",
+                [scan_id],
+                |row| row.get::<_, Option<String>>(0),
+            )?;
+            promoted = promote_completed_snapshot_if_current_parent(
+                &tx,
+                snapshot_id,
+                expected_parent.as_deref(),
+            )?;
+            if promoted {
+                tx.execute(
+                    "INSERT INTO current_successful(singleton, scan_id) VALUES (1, ?1)
+                     ON CONFLICT(singleton) DO UPDATE SET scan_id = excluded.scan_id",
+                    [scan_id],
+                )?;
+            }
+        }
+        if !matches!(status, "completed" | "cancelled") {
             tx.execute(
-                "INSERT INTO current_successful(singleton, scan_id) VALUES (1, ?1)
-                 ON CONFLICT(singleton) DO UPDATE SET scan_id = excluded.scan_id",
+                "DELETE FROM scan_operation_staging WHERE scan_id=?1",
                 [scan_id],
             )?;
-            promote_completed_snapshot(&tx, snapshot_id)?;
         }
         tx.commit()?;
-        Ok(completed_snapshot_id)
+        Ok(FinishedScan {
+            completed_snapshot_id,
+            promoted,
+        })
     }
 
     pub fn latest_attempt_id(&self) -> Result<Option<String>> {
@@ -4275,6 +5121,41 @@ fn promote_completed_snapshot(connection: &Connection, snapshot_id: &str) -> Res
     Ok(())
 }
 
+fn promote_completed_snapshot_if_current_parent(
+    connection: &Connection,
+    snapshot_id: &str,
+    expected_parent_snapshot_id: Option<&str>,
+) -> Result<bool> {
+    let status = connection
+        .query_row(
+            "SELECT status FROM completed_snapshots WHERE id=?1",
+            [snapshot_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .with_context(|| format!("completed snapshot {snapshot_id} was not found"))?;
+    if status != "completed" {
+        bail!("snapshot {snapshot_id} cannot be promoted from status {status}");
+    }
+    if completed_snapshot_seal_table_exists(connection)? {
+        verify_completed_snapshot_seal(connection, snapshot_id)?;
+    }
+    let updated = if let Some(expected_parent_snapshot_id) = expected_parent_snapshot_id {
+        connection.execute(
+            "UPDATE current_completed_snapshot SET snapshot_id=?1
+              WHERE singleton=1 AND snapshot_id=?2",
+            params![snapshot_id, expected_parent_snapshot_id],
+        )?
+    } else {
+        connection.execute(
+            "INSERT OR IGNORE INTO current_completed_snapshot(singleton, snapshot_id)
+             VALUES (1, ?1)",
+            [snapshot_id],
+        )?
+    };
+    Ok(updated == 1)
+}
+
 fn backfill_completed_snapshots(connection: &Connection) -> Result<()> {
     // Early development fixtures used a deliberately reduced v1 `scans`
     // table. Real v1 stores have these columns, but an empty reduced store can
@@ -4400,6 +5281,513 @@ fn backfill_completed_snapshots(connection: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn authenticate_store_schema_before_v16(connection: &Connection) -> Result<()> {
+    ensure_schema_objects_absent(
+        connection,
+        &[
+            "runtime_import_operation_owners",
+            "runtime_import_operation_owners_import",
+            "scan_operation_staging",
+            "scan_operation_staging_scan",
+            "scan_operation_staging_pending_cancelled",
+            "legacy_scan_operation_candidates",
+        ],
+        15,
+    )
+}
+
+fn authenticate_store_schema_before_v17(connection: &Connection) -> Result<()> {
+    validate_runtime_import_operation_ownership_schema_and_rows(connection)?;
+    ensure_schema_objects_absent(
+        connection,
+        &[
+            "scan_operation_staging",
+            "scan_operation_staging_scan",
+            "scan_operation_staging_pending_cancelled",
+            "legacy_scan_operation_candidates",
+        ],
+        16,
+    )
+}
+
+fn authenticate_legacy_runtime_import_candidates(
+    connection: &Connection,
+) -> Result<Vec<LegacyRuntimeImportCandidate>> {
+    // Minimal early-development migration fixtures can omit the runtime
+    // tables entirely; every real pre-v16 runtime table is authenticated and
+    // its staging rows are captured before migration DDL begins.
+    if !table_exists(connection, "runtime_imports")? {
+        return Ok(Vec::new());
+    }
+    let candidates = connection
+        .prepare(
+            "SELECT id, created_at, result_snapshot_id IS NULL
+               FROM runtime_imports
+              WHERE status='staging'
+              ORDER BY id COLLATE BINARY",
+        )?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, bool>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    candidates
+        .into_iter()
+        .map(|(import_id, created_at, result_snapshot_id_is_null)| {
+            if !(1..=512).contains(&import_id.len())
+                || created_at.is_empty()
+                || !result_snapshot_id_is_null
+            {
+                bail!("legacy runtime import candidate is inconsistent");
+            }
+            Ok(LegacyRuntimeImportCandidate {
+                import_id,
+                created_at,
+            })
+        })
+        .collect()
+}
+
+fn authenticate_legacy_scan_operation_candidates(
+    connection: &Connection,
+) -> Result<Vec<LegacyScanOperationCandidate>> {
+    if !table_exists(connection, "scans")?
+        || !table_has_column(connection, "scans", "status")?
+        || !table_has_column(connection, "scans", "strict")?
+        || !table_has_column(connection, "scans", "parent_snapshot_id")?
+        || !table_has_column(connection, "scans", "mutation_count")?
+        || !table_has_column(connection, "scans", "started_at")?
+    {
+        return Ok(Vec::new());
+    }
+    let candidates = connection
+        .prepare(
+            "SELECT id, status, strict, parent_snapshot_id, mutation_count, started_at
+               FROM scans
+              WHERE status IN ('staging', 'completed')
+              ORDER BY id COLLATE BINARY",
+        )?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    candidates
+        .into_iter()
+        .map(
+            |(scan_id, status, strict, parent_snapshot_id, mutation_count, started_at)| {
+                if !(1..=512).contains(&scan_id.len())
+                    || !matches!(strict, 0 | 1)
+                    || started_at.is_empty()
+                    || (status == "completed" && mutation_count < 0)
+                {
+                    bail!("legacy scan operation candidate is inconsistent");
+                }
+                let (validated_mutation_count, prospective_snapshot_id) = if status == "completed" {
+                    let snapshot_id = connection
+                        .query_row(
+                            "SELECT snapshot_id FROM snapshot_sources
+                                  WHERE source_kind='scan' AND source_attempt_id=?1",
+                            [&scan_id],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .with_context(|| {
+                            format!("completed legacy scan {scan_id} has no immutable snapshot")
+                        })?;
+                    (Some(mutation_count), Some(snapshot_id))
+                } else {
+                    (None, None)
+                };
+                Ok(LegacyScanOperationCandidate {
+                    scan_id,
+                    strict: strict != 0,
+                    parent_snapshot_id,
+                    validated_mutation_count,
+                    prospective_snapshot_id,
+                    started_at,
+                })
+            },
+        )
+        .collect()
+}
+
+fn ensure_schema_objects_absent(
+    connection: &Connection,
+    names: &[&str],
+    version: i64,
+) -> Result<()> {
+    for name in names {
+        let object_type = connection
+            .query_row(
+                "SELECT type FROM sqlite_schema WHERE name=?1",
+                [name],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if let Some(object_type) = object_type {
+            bail!("store schema {version} contains forbidden future {object_type} object {name}");
+        }
+    }
+    Ok(())
+}
+
+fn normalized_schema_sql(sql: &str) -> String {
+    sql.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn validate_schema_object_sql(
+    connection: &Connection,
+    object_type: &str,
+    name: &str,
+    expected_sql: &str,
+) -> Result<()> {
+    let actual = connection
+        .query_row(
+            "SELECT sql FROM sqlite_schema WHERE type=?1 AND name=?2",
+            params![object_type, name],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten()
+        .with_context(|| format!("store schema is missing {object_type} {name}"))?;
+    if normalized_schema_sql(&actual) != normalized_schema_sql(expected_sql) {
+        bail!("store schema {object_type} {name} does not have its exact expected shape");
+    }
+    Ok(())
+}
+
+fn validate_named_table_indexes(
+    connection: &Connection,
+    table: &str,
+    expected: &[(&str, &str)],
+) -> Result<()> {
+    let actual = connection
+        .prepare(
+            "SELECT name, sql FROM sqlite_schema
+              WHERE type='index' AND tbl_name=?1 AND sql IS NOT NULL
+              ORDER BY name COLLATE BINARY",
+        )?
+        .query_map([table], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let expected = expected
+        .iter()
+        .map(|(name, sql)| ((*name).to_owned(), normalized_schema_sql(sql)))
+        .collect::<Vec<_>>();
+    let normalized_actual = actual
+        .into_iter()
+        .map(|(name, sql)| (name, normalized_schema_sql(&sql)))
+        .collect::<Vec<_>>();
+    if normalized_actual != expected {
+        bail!("store schema table {table} does not have its exact expected named indexes");
+    }
+    Ok(())
+}
+
+fn validate_single_foreign_key(
+    connection: &Connection,
+    table: &str,
+    from: &str,
+    parent_table: &str,
+    to: &str,
+) -> Result<()> {
+    let foreign_keys = connection
+        .prepare(&format!("PRAGMA foreign_key_list({table})"))?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if foreign_keys
+        != [(
+            parent_table.to_owned(),
+            from.to_owned(),
+            to.to_owned(),
+            "NO ACTION".to_owned(),
+            "CASCADE".to_owned(),
+            "NONE".to_owned(),
+        )]
+    {
+        bail!("store schema table {table} does not have its exact expected foreign key");
+    }
+    Ok(())
+}
+
+fn validate_runtime_import_operation_ownership_schema_and_rows(
+    connection: &Connection,
+) -> Result<()> {
+    validate_schema_object_sql(
+        connection,
+        "table",
+        "runtime_import_operation_owners",
+        RUNTIME_IMPORT_OPERATION_OWNERS_TABLE_SQL,
+    )?;
+    validate_named_table_indexes(
+        connection,
+        "runtime_import_operation_owners",
+        &[(
+            "runtime_import_operation_owners_import",
+            RUNTIME_IMPORT_OPERATION_OWNERS_INDEX_SQL,
+        )],
+    )?;
+    validate_single_foreign_key(
+        connection,
+        "runtime_import_operation_owners",
+        "import_id",
+        "runtime_imports",
+        "id",
+    )?;
+    if !table_exists(connection, "runtime_imports")? {
+        let owner_count: u64 = connection.query_row(
+            "SELECT COUNT(*) FROM runtime_import_operation_owners",
+            [],
+            |row| row.get(0),
+        )?;
+        if owner_count != 0 {
+            bail!("runtime import ownership exists without the runtime import table");
+        }
+        return Ok(());
+    }
+    let invalid_rows: u64 = connection.query_row(
+        "SELECT COUNT(*)
+           FROM runtime_import_operation_owners AS owner
+           LEFT JOIN runtime_imports AS import ON import.id=owner.import_id
+          WHERE typeof(owner.import_id)!='text'
+             OR length(CAST(owner.import_id AS BLOB)) NOT BETWEEN 1 AND 512
+             OR typeof(owner.operation_id)!='text'
+             OR length(CAST(owner.operation_id AS BLOB)) NOT BETWEEN 1 AND 512
+             OR typeof(owner.created_at)!='text' OR length(owner.created_at)=0
+             OR import.id IS NULL OR import.status!='staging'
+             OR import.result_snapshot_id IS NOT NULL",
+        [],
+        |row| row.get(0),
+    )?;
+    let unowned_staging: u64 = connection.query_row(
+        "SELECT COUNT(*) FROM runtime_imports AS import
+          WHERE import.status='staging'
+            AND import.result_snapshot_id IS NULL
+            AND NOT EXISTS (
+                SELECT 1 FROM runtime_import_operation_owners AS owner
+                 WHERE owner.import_id=import.id
+            )",
+        [],
+        |row| row.get(0),
+    )?;
+    if invalid_rows != 0 || unowned_staging != 0 {
+        bail!(
+            "runtime import operation ownership rows are inconsistent: \
+             {invalid_rows} invalid owners, {unowned_staging} unowned staging imports"
+        );
+    }
+    let mut statement = connection.prepare(
+        "SELECT substr(CAST(import_id AS BLOB), 1, 513),
+                substr(CAST(operation_id AS BLOB), 1, 513)
+           FROM runtime_import_operation_owners
+          ORDER BY import_id COLLATE BINARY, operation_id COLLATE BINARY",
+    )?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        let import_id = String::from_utf8(row.get::<_, Vec<u8>>(0)?)
+            .context("runtime import ownership import ID is not valid UTF-8")?;
+        let operation_id = String::from_utf8(row.get::<_, Vec<u8>>(1)?)
+            .context("runtime import ownership operation ID is not valid UTF-8")?;
+        if import_id.len() > 512
+            || operation_id.len() > 512
+            || (operation_id.starts_with(LEGACY_RUNTIME_IMPORT_OWNER_PREFIX)
+                && operation_id != legacy_runtime_import_owner_id(&import_id))
+        {
+            bail!("runtime import operation ownership identity is inconsistent");
+        }
+    }
+    Ok(())
+}
+
+fn validate_scan_operation_staging_schema_and_rows(connection: &Connection) -> Result<()> {
+    validate_schema_object_sql(
+        connection,
+        "table",
+        "scan_operation_staging",
+        SCAN_OPERATION_STAGING_TABLE_SQL,
+    )?;
+    validate_named_table_indexes(
+        connection,
+        "scan_operation_staging",
+        &[
+            (
+                "scan_operation_staging_pending_cancelled",
+                SCAN_OPERATION_STAGING_PENDING_INDEX_SQL,
+            ),
+            (
+                "scan_operation_staging_scan",
+                SCAN_OPERATION_STAGING_SCAN_INDEX_SQL,
+            ),
+        ],
+    )?;
+    validate_single_foreign_key(
+        connection,
+        "scan_operation_staging",
+        "scan_id",
+        "scans",
+        "id",
+    )?;
+    let owner_count: u64 =
+        connection.query_row("SELECT COUNT(*) FROM scan_operation_staging", [], |row| {
+            row.get(0)
+        })?;
+    let has_full_parent_schema = table_exists(connection, "snapshot_sources")?
+        && table_has_column(connection, "scans", "status")?
+        && table_has_column(connection, "scans", "strict")?
+        && table_has_column(connection, "scans", "parent_snapshot_id")?
+        && table_has_column(connection, "scans", "mutation_count")?;
+    if !has_full_parent_schema {
+        if owner_count != 0 {
+            bail!("scan operation staging exists without its complete parent schema");
+        }
+        return Ok(());
+    }
+    let invalid_rows: u64 = connection.query_row(
+        "SELECT COUNT(*)
+           FROM scan_operation_staging AS owner
+           LEFT JOIN scans AS scan ON scan.id=owner.scan_id
+          WHERE typeof(owner.operation_id)!='text'
+             OR length(CAST(owner.operation_id AS BLOB)) NOT BETWEEN 1 AND 512
+             OR typeof(owner.scan_id)!='text'
+             OR length(CAST(owner.scan_id AS BLOB)) NOT BETWEEN 1 AND 512
+             OR typeof(owner.repository_binding_digest)!='blob'
+             OR length(owner.repository_binding_digest)!=32
+             OR typeof(owner.configuration_digest)!='blob'
+             OR length(owner.configuration_digest)!=32
+             OR owner.strict NOT IN (0, 1) OR owner.cache_enabled NOT IN (0, 1)
+             OR typeof(owner.created_at)!='text' OR length(owner.created_at)=0
+             OR scan.id IS NULL OR scan.status NOT IN ('staging', 'completed', 'cancelled')
+             OR owner.strict!=scan.strict
+             OR owner.base_snapshot_id IS NOT scan.parent_snapshot_id
+             OR (owner.validated_mutation_count IS NULL
+                 AND (owner.prospective_snapshot_id IS NOT NULL
+                      OR owner.result_digest IS NOT NULL))
+             OR (owner.validated_mutation_count IS NOT NULL
+                 AND (owner.validated_mutation_count<0
+                      OR owner.validated_mutation_count!=scan.mutation_count
+                      OR owner.prospective_snapshot_id IS NULL))
+             OR (owner.result_digest IS NOT NULL
+                 AND (typeof(owner.result_digest)!='blob'
+                      OR length(owner.result_digest)!=32))
+             OR (owner.decision_authorization_digest IS NOT NULL
+                 AND (typeof(owner.decision_authorization_digest)!='blob'
+                      OR length(owner.decision_authorization_digest)!=32))",
+        [],
+        |row| row.get(0),
+    )?;
+    if invalid_rows != 0 {
+        bail!("scan operation staging contains {invalid_rows} inconsistent ownership rows");
+    }
+    let operation_ids = connection
+        .prepare(
+            "SELECT substr(CAST(operation_id AS BLOB), 1, 513)
+               FROM scan_operation_staging
+              ORDER BY operation_id COLLATE BINARY",
+        )?
+        .query_map([], |row| row.get::<_, Vec<u8>>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for operation_id in operation_ids {
+        let operation_id = String::from_utf8(operation_id)
+            .context("scan operation staging operation ID is not valid UTF-8")?;
+        let binding = load_scan_operation_recovery_binding_from(connection, &operation_id)?;
+        if operation_id.starts_with(LEGACY_SCAN_OPERATION_CANDIDATE_PREFIX) {
+            validate_legacy_scan_operation_candidate(&binding)?;
+        } else {
+            validate_internal_scan_operation_binding(&binding)?;
+            if binding.status == "completed" {
+                let snapshot_id = connection
+                    .query_row(
+                        "SELECT snapshot_id FROM snapshot_sources
+                          WHERE source_kind='scan' AND source_attempt_id=?1",
+                        [&binding.scan_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?
+                    .context("completed operation-owned scan has no snapshot source")?;
+                if binding.validated_mutation_count.is_none()
+                    || binding.result_digest.is_none()
+                    || binding.prospective_snapshot_id.as_deref() != Some(snapshot_id.as_str())
+                {
+                    bail!("completed scan operation staging is not durably sealed");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn load_scan_operation_recovery_binding_from(
+    connection: &Connection,
+    operation_id: &str,
+) -> Result<ScanOperationRecoveryBinding> {
+    connection
+        .query_row(
+            "SELECT owner.operation_id, owner.scan_id,
+                    owner.repository_binding_digest, owner.configuration_digest,
+                    owner.strict, owner.cache_enabled, owner.base_snapshot_id,
+                    owner.validated_mutation_count, owner.prospective_snapshot_id,
+                    owner.result_digest, owner.decision_authorization_digest,
+                    scan.root, scan.status, scan.strict, scan.parent_snapshot_id,
+                    scan.mutation_count
+               FROM scan_operation_staging AS owner
+               JOIN scans AS scan ON scan.id=owner.scan_id
+              WHERE owner.operation_id=?1",
+            [operation_id],
+            |row| {
+                Ok(ScanOperationRecoveryBinding {
+                    operation_id: row.get(0)?,
+                    scan_id: row.get(1)?,
+                    repository_binding_digest: row.get(2)?,
+                    configuration_digest: row.get(3)?,
+                    strict: row.get(4)?,
+                    cache_enabled: row.get(5)?,
+                    base_snapshot_id: row.get(6)?,
+                    validated_mutation_count: row.get(7)?,
+                    prospective_snapshot_id: row.get(8)?,
+                    result_digest: row.get(9)?,
+                    decision_authorization_digest: row.get(10)?,
+                    root: row.get(11)?,
+                    status: row.get(12)?,
+                    scan_strict: row.get(13)?,
+                    parent_snapshot_id: row.get(14)?,
+                    mutation_count: row.get(15)?,
+                })
+            },
+        )
+        .optional()?
+        .context("scan completion has no durable operation-owned staging binding")
+}
+
+fn validate_store_foreign_keys(connection: &Connection, version: i64) -> Result<()> {
+    let violations =
+        connection.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get::<_, u64>(0)
+        })?;
+    if violations != 0 {
+        bail!("store schema {version} migration left {violations} foreign key violations");
+    }
+    Ok(())
+}
+
 fn table_has_column(connection: &Connection, table: &str, column: &str) -> Result<bool> {
     let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
     let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
@@ -4409,6 +5797,76 @@ fn table_has_column(connection: &Connection, table: &str, column: &str) -> Resul
         }
     }
     Ok(false)
+}
+
+fn table_exists(connection: &Connection, table: &str) -> Result<bool> {
+    Ok(connection
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
+            [table],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
+fn legacy_runtime_import_owner_id(import_id: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"depgraph-legacy-runtime-import-owner-v1");
+    digest.update((import_id.len() as u64).to_be_bytes());
+    digest.update(import_id.as_bytes());
+    let digest = digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("{LEGACY_RUNTIME_IMPORT_OWNER_PREFIX}{digest}")
+}
+
+fn legacy_scan_operation_candidate_id(scan_id: &str) -> String {
+    format!(
+        "{LEGACY_SCAN_OPERATION_CANDIDATE_PREFIX}{:x}",
+        Sha256::digest(scan_id.as_bytes())
+    )
+}
+
+fn append_scan_authorization_digest_part(hasher: &mut Sha256, value: &[u8]) {
+    hasher.update((value.len() as u64).to_be_bytes());
+    hasher.update(value);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_decision_authorization_digest_from_parts(
+    operation_id: &str,
+    scan_id: &str,
+    repository_root: &str,
+    repository_binding_digest: &[u8],
+    configuration_digest: &[u8],
+    strict: bool,
+    cache_enabled: bool,
+    base_snapshot_id: Option<&str>,
+    validated_mutation_count: i64,
+    prospective_snapshot_id: &str,
+    result_digest: &[u8],
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"depgraph:scan-operation-completion-decision:v1\0");
+    for value in [
+        operation_id.as_bytes(),
+        scan_id.as_bytes(),
+        repository_root.as_bytes(),
+        repository_binding_digest,
+        configuration_digest,
+        &[u8::from(strict)],
+        &[u8::from(cache_enabled)],
+        base_snapshot_id.unwrap_or_default().as_bytes(),
+        &validated_mutation_count.to_be_bytes(),
+        prospective_snapshot_id.as_bytes(),
+        result_digest,
+    ] {
+        append_scan_authorization_digest_part(&mut hasher, value);
+    }
+    hasher.finalize().into()
 }
 
 fn build_delta_from_protocol(protocol: &ValidatedProtocol) -> Result<BuildGraphDelta> {
@@ -5130,6 +6588,222 @@ fn ensure_scan_staging(tx: &Transaction<'_>, scan_id: &str) -> Result<()> {
         .with_context(|| format!("scan {scan_id} was not started"))?;
     if status != "staging" {
         bail!("scan {scan_id} is immutable after reaching status {status}");
+    }
+    Ok(())
+}
+
+fn replace_abandoned_scan_attempt(
+    tx: &Transaction<'_>,
+    root: &Path,
+    strict: bool,
+    identity: &ScanOperationStagingIdentity<'_>,
+) -> Result<()> {
+    let existing = tx
+        .query_row(
+            "SELECT owner.scan_id, owner.repository_binding_digest,
+                    owner.configuration_digest, owner.strict, owner.cache_enabled,
+                    owner.base_snapshot_id, scan.root, scan.status, scan.strict,
+                    scan.parent_snapshot_id
+               FROM scan_operation_staging AS owner
+               JOIN scans AS scan ON scan.id=owner.scan_id
+              WHERE owner.operation_id=?1",
+            [identity.operation_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, bool>(3)?,
+                    row.get::<_, bool>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, bool>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        scan_id,
+        repository_binding_digest,
+        configuration_digest,
+        owner_strict,
+        cache_enabled,
+        base_snapshot_id,
+        stored_root,
+        status,
+        scan_strict,
+        parent_snapshot_id,
+    )) = existing
+    else {
+        return Ok(());
+    };
+    if !scan_attempt_is_bound_to_operation(&scan_id, identity.operation_id, true)
+        || repository_binding_digest.as_slice() != identity.repository_binding_digest.as_slice()
+        || configuration_digest.as_slice() != identity.configuration_digest.as_slice()
+        || owner_strict != strict
+        || scan_strict != strict
+        || cache_enabled != identity.cache_enabled
+        || stored_root != root.to_string_lossy()
+        || base_snapshot_id != parent_snapshot_id
+    {
+        bail!("abandoned scan attempt does not match its durable operation owner");
+    }
+    let completed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+    match status.as_str() {
+        "staging" => {
+            tx.execute(
+                "UPDATE incremental_deltas
+                    SET status='cancelled', completed_at=?2,
+                        error='operation reclaimed abandoned scan attempt'
+                  WHERE scan_id=?1 AND status='staging'",
+                params![scan_id, completed_at],
+            )?;
+            let updated = tx.execute(
+                "UPDATE scans
+                    SET status='cancelled', completed_at=?2,
+                        error='operation reclaimed abandoned scan attempt'
+                  WHERE id=?1 AND status='staging'",
+                params![scan_id, completed_at],
+            )?;
+            if updated != 1 {
+                bail!("abandoned scan attempt changed before replacement");
+            }
+        }
+        "cancelled" => {}
+        _ => bail!("operation-owned scan attempt is not replaceable"),
+    }
+    let deleted = tx.execute(
+        "DELETE FROM scan_operation_staging
+          WHERE operation_id=?1 AND scan_id=?2",
+        params![identity.operation_id, scan_id],
+    )?;
+    if deleted != 1 {
+        bail!("abandoned scan attempt ownership changed before replacement");
+    }
+    Ok(())
+}
+
+fn scan_attempt_is_bound_to_operation(
+    scan_id: &str,
+    operation_id: &str,
+    allow_legacy_identity: bool,
+) -> bool {
+    if allow_legacy_identity && scan_id == operation_id {
+        return true;
+    }
+    let owner_digest = Sha256::digest(operation_id.as_bytes());
+    let prefix = format!("scan-attempt:{owner_digest:x}:");
+    scan_id.strip_prefix(&prefix).is_some_and(|nonce| {
+        nonce.len() == 32
+            && nonce
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
+}
+
+fn validate_internal_scan_operation_binding(binding: &ScanOperationRecoveryBinding) -> Result<()> {
+    let unsealed_native_identity = binding.decision_authorization_digest.is_none()
+        && scan_attempt_is_bound_to_operation(&binding.scan_id, &binding.operation_id, true);
+    let authorized_decision = binding
+        .decision_authorization_digest
+        .as_deref()
+        .filter(|digest| *digest != [0_u8; 32])
+        .and_then(|digest| {
+            Some((
+                digest,
+                binding.validated_mutation_count?,
+                binding.prospective_snapshot_id.as_deref()?,
+                binding.result_digest.as_deref()?,
+            ))
+        })
+        .is_some_and(
+            |(digest, mutation_count, prospective_snapshot_id, result_digest)| {
+                digest
+                    == scan_decision_authorization_digest_from_parts(
+                        &binding.operation_id,
+                        &binding.scan_id,
+                        &binding.root,
+                        &binding.repository_binding_digest,
+                        &binding.configuration_digest,
+                        binding.strict,
+                        binding.cache_enabled,
+                        binding.base_snapshot_id.as_deref(),
+                        mutation_count,
+                        prospective_snapshot_id,
+                        result_digest,
+                    )
+                    .as_slice()
+            },
+        );
+    if (!unsealed_native_identity && !authorized_decision)
+        || binding
+            .operation_id
+            .starts_with(LEGACY_SCAN_OPERATION_CANDIDATE_PREFIX)
+        || binding.repository_binding_digest.len() != 32
+        || binding.configuration_digest.len() != 32
+        || binding.strict != binding.scan_strict
+        || binding.base_snapshot_id != binding.parent_snapshot_id
+    {
+        bail!("scan staging operation ownership is inconsistent");
+    }
+    Ok(())
+}
+
+fn validate_legacy_scan_operation_candidate(binding: &ScanOperationRecoveryBinding) -> Result<()> {
+    let zero_digest = [0_u8; 32];
+    let exact_identity =
+        binding.operation_id == legacy_scan_operation_candidate_id(&binding.scan_id);
+    let exact_authority = binding.repository_binding_digest.as_slice() == zero_digest
+        && binding.configuration_digest.as_slice() == zero_digest
+        && binding.decision_authorization_digest.as_deref() == Some(zero_digest.as_slice())
+        && !binding.cache_enabled;
+    let exact_scan = binding.strict == binding.scan_strict
+        && binding.base_snapshot_id == binding.parent_snapshot_id;
+    let exact_state = match binding.status.as_str() {
+        "staging" => {
+            binding.validated_mutation_count.is_none()
+                && binding.prospective_snapshot_id.is_none()
+                && binding.result_digest.is_none()
+        }
+        "completed" => {
+            binding.validated_mutation_count == Some(binding.mutation_count)
+                && binding.prospective_snapshot_id.is_some()
+                && binding.result_digest.is_none()
+        }
+        _ => false,
+    };
+    if !exact_identity || !exact_authority || !exact_scan || !exact_state {
+        bail!("legacy scan operation candidate is inconsistent");
+    }
+    Ok(())
+}
+
+fn validate_scan_operation_recovery_binding(
+    binding: &ScanOperationRecoveryBinding,
+    identity: &ScanCompletionRecoveryIdentity<'_>,
+) -> Result<()> {
+    validate_internal_scan_operation_binding(binding)?;
+    let repository_root = identity.repository_root.to_string_lossy();
+    if binding.operation_id != identity.operation_id
+        || binding.scan_id != identity.scan_id
+        || binding.repository_binding_digest.as_slice()
+            != identity.repository_binding_digest.as_slice()
+        || binding
+            .decision_authorization_digest
+            .as_deref()
+            .is_none_or(|digest| digest == [0_u8; 32])
+        || binding.strict != identity.strict
+        || binding.scan_strict != identity.strict
+        || binding.cache_enabled != identity.cache_enabled
+        || binding.base_snapshot_id != binding.parent_snapshot_id
+        || binding.validated_mutation_count != Some(binding.mutation_count)
+        || binding.prospective_snapshot_id.as_deref() != Some(identity.snapshot_id)
+        || binding.result_digest.as_deref() != Some(identity.result_digest.as_slice())
+        || binding.root != repository_root
+    {
+        bail!("scan completion recovery does not match durable operation staging");
     }
     Ok(())
 }
@@ -6449,6 +8123,78 @@ mod tests {
         "../../depgraph-protocol/tests/fixtures/protocol-v1.rust-semantic.golden.ndjson"
     );
 
+    #[derive(Debug, Eq, PartialEq)]
+    struct StoreSemanticSnapshot {
+        version: i64,
+        schema: Vec<(String, String, String, Option<String>)>,
+        rows: Vec<(String, Vec<Vec<String>>)>,
+    }
+
+    fn store_semantic_snapshot(path: &Path) -> Result<StoreSemanticSnapshot> {
+        let connection = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        let version = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        let schema = connection
+            .prepare(
+                "SELECT type, name, tbl_name, sql FROM sqlite_schema
+                 ORDER BY type, name, tbl_name",
+            )?
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let table_names = connection
+            .prepare(
+                "SELECT name FROM sqlite_schema
+                  WHERE type='table' AND name NOT LIKE 'sqlite_%'
+                  ORDER BY name",
+            )?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut tables = Vec::with_capacity(table_names.len());
+        for table_name in table_names {
+            let escaped = table_name.replace('"', "\"\"");
+            let mut statement = connection.prepare(&format!("SELECT * FROM \"{escaped}\""))?;
+            let column_count = statement.column_count();
+            let mut query = statement.query([])?;
+            let mut rows = Vec::new();
+            while let Some(row) = query.next()? {
+                let mut encoded = Vec::with_capacity(column_count);
+                for column in 0..column_count {
+                    use rusqlite::types::ValueRef;
+                    let value = match row.get_ref(column)? {
+                        ValueRef::Null => "null".to_owned(),
+                        ValueRef::Integer(value) => format!("integer:{value}"),
+                        ValueRef::Real(value) => format!("real:{:016x}", value.to_bits()),
+                        ValueRef::Text(value) => format!("text:{}", encode_hex(value)),
+                        ValueRef::Blob(value) => format!("blob:{}", encode_hex(value)),
+                    };
+                    encoded.push(value);
+                }
+                rows.push(encoded);
+            }
+            rows.sort();
+            tables.push((table_name, rows));
+        }
+        Ok(StoreSemanticSnapshot {
+            version,
+            schema,
+            rows: tables,
+        })
+    }
+
+    fn encode_hex(bytes: &[u8]) -> String {
+        use std::fmt::Write as _;
+
+        let mut encoded = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            write!(&mut encoded, "{byte:02x}").expect("writing to a String cannot fail");
+        }
+        encoded
+    }
+
     fn common(event: &str, seq: u64) -> Value {
         json!({
             "event": event,
@@ -6458,6 +8204,45 @@ mod tests {
             "adapter_version": "0.1.0",
             "seq": seq
         })
+    }
+
+    fn empty_scan_events(scan_id: &str) -> [Value; 2] {
+        [
+            json!({
+                "event": "scan_started",
+                "protocol_version": "1.0",
+                "scan_id": scan_id,
+                "adapter": "fixture",
+                "adapter_version": "0.1.0",
+                "seq": 1,
+                "root": "/fixture",
+                "project_code_executed": false,
+                "safe_mode": true
+            }),
+            json!({
+                "event": "scan_completed",
+                "protocol_version": "1.0",
+                "scan_id": scan_id,
+                "adapter": "fixture",
+                "adapter_version": "0.1.0",
+                "seq": 2,
+                "coverage": {
+                    "profiles": 0,
+                    "files_discovered": 0,
+                    "files_analyzed": 0,
+                    "files_skipped": 0,
+                    "dependency_sites": 0,
+                    "resolved": 0,
+                    "candidates": 0,
+                    "external": 0,
+                    "unresolved": 0,
+                    "unsupported_syntax": 0,
+                    "project_code_executed": false,
+                    "completeness": ["syntax-complete"],
+                    "reasons": []
+                }
+            }),
+        ]
     }
 
     fn assert_node_page_matches_snapshot(
@@ -6496,6 +8281,327 @@ mod tests {
         let error = Store::open_read_only(&path).err().expect("missing store");
         assert!(error.to_string().contains("read-only"));
         assert!(!path.exists());
+    }
+
+    fn operation_scan_attempt_id(operation_id: &str, nonce: char) -> String {
+        let owner_digest = Sha256::digest(operation_id.as_bytes());
+        format!(
+            "scan-attempt:{owner_digest:x}:{}",
+            nonce.to_string().repeat(32)
+        )
+    }
+
+    #[test]
+    fn operation_scan_cancellation_retains_idempotent_proof_until_acknowledged() -> Result<()> {
+        let mut store = Store::open_in_memory()?;
+        let operation_id = "op_00000000000000000000000000000001";
+        let scan_id = operation_scan_attempt_id(operation_id, '1');
+        let identity = ScanOperationStagingIdentity {
+            operation_id,
+            repository_binding_digest: &[2; 32],
+            configuration_digest: &[3; 32],
+            cache_enabled: false,
+        };
+        store.start_scan_for_operation(
+            &scan_id,
+            Path::new("/fixture"),
+            false,
+            Some("revision"),
+            &identity,
+        )?;
+
+        store.cancel_scan_for_operation(operation_id)?;
+        store.cancel_scan_for_operation(operation_id)?;
+        assert_eq!(store.scan(&scan_id)?.unwrap().status, "cancelled");
+        let pending = store.pending_cancelled_scan_operations()?;
+        assert_eq!(pending.operation_ids(), [operation_id]);
+        assert!(!pending.more_work());
+        assert_eq!(
+            store.connection.query_row(
+                "SELECT scan_id FROM scan_operation_staging WHERE operation_id=?1",
+                [operation_id],
+                |row| row.get::<_, String>(0),
+            )?,
+            scan_id
+        );
+
+        assert!(store.finalize_cancelled_scan_for_operation(operation_id)?);
+        assert!(!store.finalize_cancelled_scan_for_operation(operation_id)?);
+        assert!(
+            store
+                .pending_cancelled_scan_operations()?
+                .operation_ids()
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cancelled_scan_reconciliation_is_stably_bounded_across_multiple_pages() -> Result<()> {
+        let mut store = Store::open_in_memory()?;
+        let query_plan = store
+            .connection
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT substr(CAST(owner.operation_id AS BLOB), 1, 513)
+                   FROM scan_operation_staging AS owner
+                        INDEXED BY scan_operation_staging_pending_cancelled
+                   JOIN scans AS scan ON scan.id=owner.scan_id
+                  WHERE scan.status='cancelled'
+                    AND (?1 IS NULL OR owner.operation_id COLLATE BINARY > ?1)
+                  ORDER BY owner.operation_id COLLATE BINARY
+                  LIMIT ?2",
+            )?
+            .query_map(params![Option::<String>::None, 65_i64], |row| {
+                row.get::<_, String>(3)
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        assert!(
+            query_plan
+                .iter()
+                .any(|detail| { detail.contains("scan_operation_staging_pending_cancelled") }),
+            "unexpected cancellation query plan: {query_plan:?}"
+        );
+        assert!(
+            !query_plan
+                .iter()
+                .any(|detail| detail.contains("TEMP B-TREE"))
+        );
+        let total = MAX_PENDING_CANCELLED_SCAN_OPERATIONS + 5;
+        for index in 0..total {
+            let operation_id = format!("op_{index:032x}");
+            let owner_digest = Sha256::digest(operation_id.as_bytes());
+            let scan_id = format!("scan-attempt:{owner_digest:x}:{index:032x}");
+            store.start_scan_for_operation(
+                &scan_id,
+                Path::new("/fixture"),
+                false,
+                None,
+                &ScanOperationStagingIdentity {
+                    operation_id: &operation_id,
+                    repository_binding_digest: &[9; 32],
+                    configuration_digest: &[10; 32],
+                    cache_enabled: false,
+                },
+            )?;
+            store.cancel_scan_for_operation(&operation_id)?;
+        }
+
+        let first = store.pending_cancelled_scan_operations()?;
+        assert_eq!(
+            first.operation_ids().len(),
+            MAX_PENDING_CANCELLED_SCAN_OPERATIONS
+        );
+        assert!(first.more_work());
+        let next_after = first
+            .next_after_operation_id()
+            .context("full reconciliation page cursor")?
+            .to_owned();
+        let second = store.pending_cancelled_scan_operations_after(Some(&next_after))?;
+        assert_eq!(second.operation_ids().len(), 5);
+        assert!(!second.more_work());
+        for operation_id in first.into_operation_ids() {
+            assert!(store.finalize_cancelled_scan_for_operation(&operation_id)?);
+        }
+        for operation_id in second.into_operation_ids() {
+            assert!(store.finalize_cancelled_scan_for_operation(&operation_id)?);
+        }
+        assert!(
+            store
+                .pending_cancelled_scan_operations()?
+                .operation_ids()
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cancelled_scan_reconciliation_rejects_oversized_corrupt_ids_at_a_fixed_bound() -> Result<()>
+    {
+        let mut store = Store::open_in_memory()?;
+        let operation_id = "op_00000000000000000000000000000004";
+        let scan_id = operation_scan_attempt_id(operation_id, '5');
+        store.start_scan_for_operation(
+            &scan_id,
+            Path::new("/fixture"),
+            false,
+            None,
+            &ScanOperationStagingIdentity {
+                operation_id,
+                repository_binding_digest: &[11; 32],
+                configuration_digest: &[12; 32],
+                cache_enabled: false,
+            },
+        )?;
+        store.cancel_scan_for_operation(operation_id)?;
+        store
+            .connection
+            .execute_batch("PRAGMA ignore_check_constraints=ON")?;
+        store.connection.execute(
+            "UPDATE scan_operation_staging SET operation_id=?1 WHERE operation_id=?2",
+            params!["x".repeat(4096), operation_id],
+        )?;
+
+        let error = store
+            .pending_cancelled_scan_operations()
+            .expect_err("oversized cancellation proof must fail closed");
+        assert!(error.to_string().contains("exceeds its storage bound"));
+        Ok(())
+    }
+
+    #[test]
+    fn p1a_reserved_legacy_scan_sentinel_cannot_be_attached_as_operation_owner() -> Result<()> {
+        let mut store = Store::open_in_memory()?;
+        let operation_id = format!("{LEGACY_SCAN_OPERATION_CANDIDATE_PREFIX}forged-owner");
+        let scan_id = operation_scan_attempt_id(&operation_id, 'a');
+        let identity = ScanOperationStagingIdentity {
+            operation_id: &operation_id,
+            repository_binding_digest: &[6; 32],
+            configuration_digest: &[7; 32],
+            cache_enabled: false,
+        };
+
+        let error = store
+            .start_scan_for_operation(&scan_id, Path::new("/fixture"), false, None, &identity)
+            .expect_err("reserved migration sentinel must not become an operation owner");
+        assert!(error.to_string().contains("identity is invalid"));
+        assert!(store.scan(&scan_id)?.is_none());
+        assert_eq!(
+            store.connection.query_row(
+                "SELECT COUNT(*) FROM scan_operation_staging WHERE operation_id=?1",
+                [&operation_id],
+                |row| row.get::<_, u64>(0),
+            )?,
+            0
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reclaimed_operation_replaces_only_its_canonically_bound_scan_attempt() -> Result<()> {
+        let mut store = Store::open_in_memory()?;
+        let operation_id = "op_00000000000000000000000000000002";
+        let first_scan_id = operation_scan_attempt_id(operation_id, '2');
+        let second_scan_id = operation_scan_attempt_id(operation_id, '3');
+        let identity = ScanOperationStagingIdentity {
+            operation_id,
+            repository_binding_digest: &[4; 32],
+            configuration_digest: &[5; 32],
+            cache_enabled: true,
+        };
+        store.start_scan_for_operation(
+            &first_scan_id,
+            Path::new("/fixture"),
+            true,
+            Some("revision"),
+            &identity,
+        )?;
+        store.start_scan_for_operation(
+            &second_scan_id,
+            Path::new("/fixture"),
+            true,
+            Some("revision"),
+            &identity,
+        )?;
+        assert_eq!(store.scan(&first_scan_id)?.unwrap().status, "cancelled");
+        assert_eq!(store.scan(&second_scan_id)?.unwrap().status, "staging");
+        assert_eq!(
+            store.connection.query_row(
+                "SELECT scan_id FROM scan_operation_staging WHERE operation_id=?1",
+                [operation_id],
+                |row| row.get::<_, String>(0),
+            )?,
+            second_scan_id
+        );
+
+        store.start_scan("foreign-scan", Path::new("/fixture"), true)?;
+        store.connection.execute(
+            "UPDATE scan_operation_staging SET scan_id='foreign-scan'
+              WHERE operation_id=?1",
+            [operation_id],
+        )?;
+        let error = store
+            .cancel_scan_for_operation(operation_id)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("ownership is inconsistent"));
+        assert_eq!(store.scan("foreign-scan")?.unwrap().status, "staging");
+        assert_eq!(store.scan(&second_scan_id)?.unwrap().status, "staging");
+        Ok(())
+    }
+
+    #[test]
+    fn scan_completion_recovery_finishes_without_replacing_a_later_current_snapshot() -> Result<()>
+    {
+        let mut store = Store::open_in_memory()?;
+        ingest_protocol_fixture(
+            &mut store,
+            include_str!("../../depgraph-protocol/tests/fixtures/protocol-v1.golden.ndjson"),
+        )?;
+        let base_snapshot_id = store.current_snapshot_id()?.context("base snapshot")?;
+
+        let operation_id = "op_00000000000000000000000000000003";
+        let scan_id = operation_scan_attempt_id(operation_id, '4');
+        let repository_binding_digest = [6; 32];
+        let configuration_digest = [7; 32];
+        let result_digest = [8; 32];
+        let identity = ScanOperationStagingIdentity {
+            operation_id,
+            repository_binding_digest: &repository_binding_digest,
+            configuration_digest: &configuration_digest,
+            cache_enabled: false,
+        };
+        store.start_scan_for_operation(
+            &scan_id,
+            Path::new("/fixture"),
+            false,
+            Some("older-revision"),
+            &identity,
+        )?;
+        for event in empty_scan_events(&scan_id) {
+            store.ingest_event(&event)?;
+        }
+        let validation = store.validate_scan_for_completion(&scan_id)?;
+        let older_snapshot_id = store.prospective_scan_snapshot_id(&scan_id)?;
+        store.seal_scan_operation_staging(operation_id, &validation, &older_snapshot_id)?;
+        store.bind_scan_operation_result(operation_id, &result_digest)?;
+
+        let later_scan_id = "later-current-scan";
+        store.start_scan_with_revision(
+            later_scan_id,
+            Path::new("/fixture"),
+            false,
+            Some("later-revision"),
+        )?;
+        for event in empty_scan_events(later_scan_id) {
+            store.ingest_event(&event)?;
+        }
+        store.finish_scan(later_scan_id, "completed", None, true)?;
+        let later_snapshot_id = store.current_snapshot_id()?.context("later snapshot")?;
+        assert_ne!(later_snapshot_id, base_snapshot_id);
+        assert_ne!(later_snapshot_id, older_snapshot_id);
+
+        store.recover_scan_completion_for_operation(&ScanCompletionRecoveryIdentity {
+            operation_id,
+            scan_id: &scan_id,
+            repository_root: Path::new("/fixture"),
+            repository_binding_digest: &repository_binding_digest,
+            strict: false,
+            cache_enabled: false,
+            snapshot_id: &older_snapshot_id,
+            result_digest: &result_digest,
+        })?;
+
+        assert_eq!(store.scan(&scan_id)?.unwrap().status, "completed");
+        assert_eq!(
+            store.snapshot_id_for_source("scan", &scan_id)?.as_deref(),
+            Some(older_snapshot_id.as_str())
+        );
+        assert_eq!(
+            store.current_snapshot_id()?.as_deref(),
+            Some(later_snapshot_id.as_str())
+        );
+        Ok(())
     }
 
     #[test]
@@ -7760,6 +9866,8 @@ mod tests {
         let connection = Connection::open(&path)?;
         connection.execute_batch(
             "PRAGMA foreign_keys=OFF;
+             DROP TABLE scan_operation_staging;
+             DROP TABLE runtime_import_operation_owners;
              DROP TABLE impact_query_cache;
              DROP TABLE cache_events;
              DROP TABLE syntax_cache;
@@ -7811,7 +9919,9 @@ mod tests {
         };
         let connection = Connection::open(&path)?;
         connection.execute_batch(
-            "DROP TABLE impact_query_cache;
+            "DROP TABLE scan_operation_staging;
+             DROP TABLE runtime_import_operation_owners;
+             DROP TABLE impact_query_cache;
              DROP TABLE incremental_deltas;
              DROP TABLE cache_events;
              DROP TABLE syntax_cache;
@@ -7852,7 +9962,9 @@ mod tests {
         };
         let connection = Connection::open(&path)?;
         connection.execute_batch(
-            "DROP TABLE completed_snapshot_seals;
+            "DROP TABLE scan_operation_staging;
+             DROP TABLE runtime_import_operation_owners;
+             DROP TABLE completed_snapshot_seals;
              PRAGMA user_version=14;",
         )?;
         drop(connection);
@@ -7906,7 +10018,9 @@ mod tests {
         }
         let connection = Connection::open(&path)?;
         connection.execute_batch(
-            "DROP TABLE completed_snapshot_seals;
+            "DROP TABLE scan_operation_staging;
+             DROP TABLE runtime_import_operation_owners;
+             DROP TABLE completed_snapshot_seals;
              UPDATE build_attempts
                 SET delta_json=json_set(delta_json, '$.coverage.profiles', 'invalid')
               WHERE id='v14-corrupt-build';
@@ -7930,6 +10044,301 @@ mod tests {
             |row| row.get(0),
         )?;
         assert_eq!(seal_table_count, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn v15_foreign_key_violation_rolls_back_the_entire_v16_migration() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("v15-foreign-key-violation.db");
+        drop(Store::open(&path)?);
+        let connection = Connection::open(&path)?;
+        connection.execute_batch(
+            "PRAGMA foreign_keys=OFF;
+             DROP TABLE scan_operation_staging;
+             DROP TABLE runtime_import_operation_owners;
+             INSERT INTO snapshot_names(name, snapshot_id, named_at)
+             VALUES ('orphan', 'snapshot:sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff',
+                     '2026-08-09T00:00:00.000Z');
+             PRAGMA user_version=15;",
+        )?;
+        drop(connection);
+        let before = store_semantic_snapshot(&path)?;
+
+        let error = Store::open(&path)
+            .err()
+            .context("v15 foreign key violation must reject migration")?;
+        assert!(
+            format!("{error:#}").contains("migration left 1 foreign key violations"),
+            "unexpected migration error: {error:#}"
+        );
+        assert_eq!(store_semantic_snapshot(&path)?, before);
+
+        let connection = Connection::open_with_flags(
+            &path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        assert_eq!(
+            connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?,
+            15
+        );
+        assert_eq!(
+            connection.query_row(
+                "SELECT COUNT(*) FROM sqlite_schema
+                  WHERE type='table' AND name='runtime_import_operation_owners'",
+                [],
+                |row| row.get::<_, u64>(0),
+            )?,
+            0
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn genuine_v15_store_migrates_to_exact_v17_staging_schema() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("v15-genuine.db");
+        let current_snapshot_id = {
+            let mut store = Store::open(&path)?;
+            ingest_protocol_fixture(
+                &mut store,
+                include_str!("../../depgraph-protocol/tests/fixtures/protocol-v1.golden.ndjson"),
+            )?;
+            store.current_snapshot_id()?.context("current snapshot")?
+        };
+        let connection = Connection::open(&path)?;
+        connection.execute_batch(
+            "DROP TABLE scan_operation_staging;
+             DROP TABLE runtime_import_operation_owners;
+             PRAGMA user_version=15;",
+        )?;
+        drop(connection);
+
+        let store = Store::open(&path)?;
+        assert_eq!(store.schema_version()?, STORE_SCHEMA_VERSION);
+        validate_runtime_import_operation_ownership_schema_and_rows(&store.connection)?;
+        validate_scan_operation_staging_schema_and_rows(&store.connection)?;
+        validate_store_foreign_keys(&store.connection, STORE_SCHEMA_VERSION)?;
+        assert_eq!(
+            store.current_snapshot_id()?.as_deref(),
+            Some(current_snapshot_id.as_str())
+        );
+        assert_eq!(
+            store.connection.query_row(
+                "SELECT COUNT(*) FROM scan_operation_staging
+                  WHERE substr(operation_id, 1, length(?1))=?1",
+                [LEGACY_SCAN_OPERATION_CANDIDATE_PREFIX],
+                |row| row.get::<_, u64>(0),
+            )?,
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn v15_late_v17_candidate_failure_rolls_back_the_entire_migration() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("v15-late-v17-candidate-failure.db");
+        {
+            let mut store = Store::open(&path)?;
+            ingest_protocol_fixture(
+                &mut store,
+                include_str!("../../depgraph-protocol/tests/fixtures/protocol-v1.golden.ndjson"),
+            )?;
+        }
+        let connection = Connection::open(&path)?;
+        connection.execute_batch(
+            "DROP TABLE scan_operation_staging;
+             DROP TABLE runtime_import_operation_owners;
+             DELETE FROM snapshot_sources
+              WHERE source_kind='scan' AND source_attempt_id='scan-golden';
+             PRAGMA user_version=15;",
+        )?;
+        drop(connection);
+        let before = store_semantic_snapshot(&path)?;
+        assert_eq!(before.version, 15);
+
+        let error = Store::open(&path)
+            .err()
+            .context("late-invalid v15 legacy candidate must reject migration")?;
+        assert!(
+            format!("{error:#}")
+                .contains("completed legacy scan scan-golden has no immutable snapshot"),
+            "unexpected migration error: {error:#}"
+        );
+        let after = store_semantic_snapshot(&path)?;
+        assert_eq!(after.version, 15);
+        assert_eq!(after, before);
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_preexisting_v15_runtime_ownership_is_rejected_without_mutation() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("v15-malformed-runtime-ownership.db");
+        drop(Store::open(&path)?);
+        let connection = Connection::open(&path)?;
+        connection.execute_batch(
+            "DROP TABLE scan_operation_staging;
+             DROP TABLE runtime_import_operation_owners;
+             CREATE TABLE runtime_import_operation_owners(operation_id TEXT);
+             PRAGMA user_version=15;",
+        )?;
+        drop(connection);
+        let before = store_semantic_snapshot(&path)?;
+
+        for _ in 0..2 {
+            let error = Store::open(&path)
+                .err()
+                .context("malformed v15 future ownership table must reject migration")?;
+            assert!(format!("{error:#}").contains("forbidden future table object"));
+            assert_eq!(store_semantic_snapshot(&path)?, before);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_preexisting_v16_scan_staging_is_rejected_without_mutation() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("v16-malformed-scan-staging.db");
+        drop(Store::open(&path)?);
+        let connection = Connection::open(&path)?;
+        connection.execute_batch(
+            "DROP TABLE scan_operation_staging;
+             CREATE TABLE scan_operation_staging(operation_id TEXT PRIMARY KEY);
+             PRAGMA user_version=16;",
+        )?;
+        drop(connection);
+        let before = store_semantic_snapshot(&path)?;
+
+        for _ in 0..2 {
+            let error = Store::open(&path)
+                .err()
+                .context("malformed v16 future staging table must reject migration")?;
+            assert!(format!("{error:#}").contains("forbidden future table object"));
+            assert_eq!(store_semantic_snapshot(&path)?, before);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn p1a_v16_legacy_candidate_state_conflicts_roll_back_without_mutation() -> Result<()> {
+        for (case, future_schema) in [
+            (
+                "malformed",
+                "CREATE TABLE legacy_scan_operation_candidates(scan_id INTEGER PRIMARY KEY);",
+            ),
+            (
+                "conflicting",
+                "CREATE TABLE legacy_scan_operation_candidates(
+                    scan_id TEXT PRIMARY KEY REFERENCES scans(id) ON DELETE CASCADE,
+                    migrated_status TEXT NOT NULL
+                        CHECK(migrated_status IN ('staging', 'completed')),
+                    migrated_mutation_count INTEGER NOT NULL
+                        CHECK(migrated_mutation_count >= 0)
+                 );",
+            ),
+        ] {
+            let temp = tempfile::tempdir()?;
+            let path = temp.path().join(format!("v16-{case}-legacy-candidates.db"));
+            drop(Store::open(&path)?);
+            let connection = Connection::open(&path)?;
+            connection.execute_batch("DROP TABLE scan_operation_staging;")?;
+            connection.execute_batch(future_schema)?;
+            connection.execute_batch("PRAGMA user_version=16;")?;
+            drop(connection);
+            let before = store_semantic_snapshot(&path)?;
+
+            for _ in 0..2 {
+                let error = Store::open(&path).err().with_context(|| {
+                    format!("{case} legacy candidate state must reject migration")
+                })?;
+                assert!(
+                    format!("{error:#}").contains("forbidden future table object"),
+                    "unexpected {case} migration error: {error:#}"
+                );
+                assert_eq!(store_semantic_snapshot(&path)?, before, "{case}");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn p1a_completed_historical_snapshot_is_untouched_by_sentinel_reconciliation() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("v16-completed-history.db");
+        let mut store = Store::open(&path)?;
+        ingest_protocol_fixture(
+            &mut store,
+            include_str!("../../depgraph-protocol/tests/fixtures/protocol-v1.golden.ndjson"),
+        )?;
+        let current_snapshot_id = store.current_snapshot_id()?.context("current snapshot")?;
+        let current_snapshot = store.load_completed_snapshot(&current_snapshot_id)?;
+        let completed_scan_id = current_snapshot.scan.id.clone();
+        drop(store);
+
+        let connection = Connection::open(&path)?;
+        connection.execute_batch(
+            "DROP TABLE scan_operation_staging;
+             PRAGMA user_version=16;",
+        )?;
+        drop(connection);
+
+        let mut store = Store::open(&path)?;
+        assert_eq!(
+            store.connection.query_row(
+                "SELECT COUNT(*) FROM scan_operation_staging
+                  WHERE substr(operation_id, 1, length(?1))=?1",
+                [LEGACY_SCAN_OPERATION_CANDIDATE_PREFIX],
+                |row| row.get::<_, u64>(0),
+            )?,
+            1
+        );
+        assert!(!store.reconcile_legacy_scan_operation_candidates()?);
+        assert_eq!(
+            store.current_snapshot_id()?.as_deref(),
+            Some(current_snapshot_id.as_str())
+        );
+        assert_eq!(
+            store.load_completed_snapshot(&current_snapshot_id)?,
+            current_snapshot
+        );
+        assert_eq!(
+            store
+                .scan(&completed_scan_id)?
+                .context("completed scan")?
+                .status,
+            "completed"
+        );
+        assert_eq!(
+            store.connection.query_row(
+                "SELECT COUNT(*) FROM scan_operation_staging
+                  WHERE substr(operation_id, 1, length(?1))=?1",
+                [LEGACY_SCAN_OPERATION_CANDIDATE_PREFIX],
+                |row| row.get::<_, u64>(0),
+            )?,
+            0
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn genuine_v16_store_migrates_to_exact_v17_staging_schema() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("v16-genuine.db");
+        drop(Store::open(&path)?);
+        let connection = Connection::open(&path)?;
+        connection.execute_batch(
+            "DROP TABLE scan_operation_staging;
+             PRAGMA user_version=16;",
+        )?;
+        drop(connection);
+
+        let store = Store::open(&path)?;
+        assert_eq!(store.schema_version()?, STORE_SCHEMA_VERSION);
+        validate_runtime_import_operation_ownership_schema_and_rows(&store.connection)?;
+        validate_scan_operation_staging_schema_and_rows(&store.connection)?;
+        validate_store_foreign_keys(&store.connection, STORE_SCHEMA_VERSION)?;
         Ok(())
     }
 

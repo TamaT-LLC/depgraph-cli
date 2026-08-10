@@ -19,8 +19,8 @@ use depgraph_operation::{
     CancelOutcome, CanonicalJson, CapabilitySet, DEADLINE_EXCEEDED_ERROR_JSON,
     EXECUTION_STATE_UNKNOWN_ERROR_JSON, JOURNAL_SCHEMA_VERSION, JournalDigest, JournalError,
     LeaseOwner, MAX_CAPABILITY_JSON_BYTES, MAX_OPERATION_INPUT_BYTES, MAX_PURGE_BATCH_SIZE,
-    MAX_TERMINAL_PAYLOAD_BYTES, OperationJournal, OperationKind, OperationOutcome,
-    OperationProgress, OperationStatus, SubmitRequest, TERMINAL_RETENTION_MS,
+    MAX_TERMINAL_PAYLOAD_BYTES, OperationJournal, OperationKind, OperationManager,
+    OperationOutcome, OperationProgress, OperationStatus, SubmitRequest, TERMINAL_RETENTION_MS,
     TOMBSTONE_RETENTION_MS, operation_journal_path,
 };
 use rusqlite::{Connection, params};
@@ -49,6 +49,19 @@ fn read_capabilities() -> CapabilitySet {
 
 fn write_capabilities() -> CapabilitySet {
     CapabilitySet::new([AgentCapability::StoreWrite, AgentCapability::Read]).unwrap()
+}
+
+fn generic_purge_kind() -> OperationKind {
+    OperationKind::DaemonStop
+}
+
+fn generic_purge_capabilities() -> CapabilitySet {
+    CapabilitySet::new([
+        AgentCapability::Read,
+        AgentCapability::StoreWrite,
+        AgentCapability::DaemonControl,
+    ])
+    .unwrap()
 }
 
 fn request(
@@ -111,6 +124,98 @@ fn journal() -> (TempDir, PathBuf, DepgraphServiceConfig, OperationJournal) {
     (root, graph_store, config, journal)
 }
 
+fn downgrade_current_journal_to_genuine_v3(path: &Path) {
+    let connection = Connection::open(path).unwrap();
+    connection
+        .execute_batch("ALTER TABLE operations DROP COLUMN retention_anchor_ms;")
+        .unwrap();
+    let operations_sql: String = connection
+        .query_row(
+            "SELECT sql FROM sqlite_schema WHERE type='table' AND name='operations'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let handoffs_sql: String = connection
+        .query_row(
+            "SELECT sql FROM sqlite_schema
+             WHERE type='table' AND name='runner_handoffs'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let legacy_operations_sql = operations_sql.replace(
+        "typeof(input_json) = 'text' AND octet_length(input_json) <= 16777216",
+        "typeof(input_json) = 'text' AND octet_length(input_json) <= 1048576",
+    );
+    let legacy_handoffs_sql = handoffs_sql.replace(
+        "typeof(payload_json) = 'text' AND octet_length(payload_json) <= 16777216",
+        "typeof(payload_json) = 'text' AND octet_length(payload_json) <= 1048576",
+    );
+    assert_ne!(legacy_operations_sql, operations_sql);
+    assert_ne!(legacy_handoffs_sql, handoffs_sql);
+
+    connection
+        .execute_batch("PRAGMA writable_schema = ON")
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE sqlite_schema SET sql=?1
+             WHERE type='table' AND name='operations'",
+            [&legacy_operations_sql],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE sqlite_schema SET sql=?1
+             WHERE type='table' AND name='runner_handoffs'",
+            [&legacy_handoffs_sql],
+        )
+        .unwrap();
+    connection
+        .pragma_update(None, "user_version", 3_i64)
+        .unwrap();
+    connection
+        .execute_batch("PRAGMA writable_schema = OFF")
+        .unwrap();
+    drop(connection);
+
+    let verification = Connection::open(path).unwrap();
+    let version: i64 = verification
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 3);
+    let input_limit: i64 = verification
+        .query_row(
+            "SELECT instr(sql, 'octet_length(input_json) <= 1048576')
+             FROM sqlite_schema WHERE type='table' AND name='operations'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let handoff_limit: i64 = verification
+        .query_row(
+            "SELECT instr(sql, 'octet_length(payload_json) <= 1048576')
+             FROM sqlite_schema WHERE type='table' AND name='runner_handoffs'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(input_limit > 0);
+    assert!(handoff_limit > 0);
+}
+
+fn downgrade_current_journal_to_genuine_v2(path: &Path) {
+    downgrade_current_journal_to_genuine_v3(path);
+    let connection = Connection::open(path).unwrap();
+    connection
+        .execute_batch(
+            "DROP TABLE operation_completion_intents;
+             PRAGMA user_version = 2;",
+        )
+        .unwrap();
+}
+
 fn assert_integrity_failure(journal: &OperationJournal, operation_id: &OperationId) {
     assert!(matches!(
         journal.get(&repository(), operation_id, NOW + 1),
@@ -129,11 +234,31 @@ fn assert_integrity_failure(journal: &OperationJournal, operation_id: &Operation
 fn journal_state_digest(path: &Path) -> [u8; 32] {
     let connection = Connection::open(path).unwrap();
     let mut digest = Sha256::new();
-    for query in [
-        "SELECT * FROM operations ORDER BY operation_id",
-        "SELECT * FROM runner_handoffs ORDER BY operation_id",
-        "SELECT * FROM operation_tombstones ORDER BY operation_id",
+    for (table, query) in [
+        (
+            "operations",
+            "SELECT * FROM operations ORDER BY operation_id",
+        ),
+        (
+            "runner_handoffs",
+            "SELECT * FROM runner_handoffs ORDER BY operation_id",
+        ),
+        (
+            "operation_tombstones",
+            "SELECT * FROM operation_tombstones ORDER BY operation_id",
+        ),
+        (
+            "operation_journal_metadata",
+            "SELECT * FROM operation_journal_metadata ORDER BY singleton",
+        ),
+        (
+            "operation_completion_intents",
+            "SELECT * FROM operation_completion_intents ORDER BY operation_id",
+        ),
     ] {
+        if !connection.table_exists(None, table).unwrap() {
+            continue;
+        }
         digest.update((query.len() as u64).to_le_bytes());
         digest.update(query.as_bytes());
         let mut statement = connection.prepare(query).unwrap();
@@ -377,12 +502,53 @@ fn submit_request_retains_bounded_canonical_normalized_input() {
     assert_eq!(request.normalized_input().digest(), request.input_digest());
 
     let maximum = json!("x".repeat(MAX_OPERATION_INPUT_BYTES - 2));
+    assert_eq!(
+        depgraph_mcp_tools::canonical_json_bytes(&maximum)
+            .unwrap()
+            .len(),
+        MAX_OPERATION_INPUT_BYTES
+    );
     assert!(SubmitRequest::new(&config, kind(), &maximum, b"maximum-input", DEADLINE,).is_ok());
     let oversized = json!("x".repeat(MAX_OPERATION_INPUT_BYTES - 1));
+    assert_eq!(
+        depgraph_mcp_tools::canonical_json_bytes(&oversized)
+            .unwrap()
+            .len(),
+        MAX_OPERATION_INPUT_BYTES + 1
+    );
     assert!(matches!(
         SubmitRequest::new(&config, kind(), &oversized, b"oversized-input", DEADLINE,),
         Err(JournalError::InvalidArgument)
     ));
+}
+
+#[test]
+fn canonical_input_above_legacy_limit_submits_and_reconnects_with_duplicate_handoff() {
+    let (_root, _graph_store, config, mut journal) = journal();
+    let submission = request(
+        &config,
+        json!({"payload": "x".repeat(1024 * 1024)}),
+        b"above-legacy-input-limit",
+        DEADLINE,
+    );
+    assert!(submission.normalized_input().as_str().len() > 1024 * 1024);
+    let expected_input = submission.normalized_input().clone();
+    let operation_id = journal
+        .submit(&submission, NOW)
+        .unwrap()
+        .operation_id()
+        .clone();
+    drop(journal);
+
+    let reopened = OperationJournal::open(&config).unwrap();
+    let record = reopened.get(&repository(), &operation_id, NOW + 1).unwrap();
+    let handoff = reopened
+        .runner_handoff(&repository(), &operation_id, NOW + 1)
+        .unwrap();
+    assert_eq!(record.normalized_input(), &expected_input);
+    assert_eq!(handoff.payload(), &expected_input);
+    assert_eq!(handoff.payload(), record.normalized_input());
+    reopened.validate().unwrap();
 }
 
 #[test]
@@ -609,7 +775,7 @@ fn current_schema_integrity_binding_metadata_and_required_objects_are_validated(
     drop(second);
     Connection::open(&path)
         .unwrap()
-        .execute_batch("PRAGMA user_version = 4")
+        .execute_batch("PRAGMA user_version = 5")
         .unwrap();
     assert!(matches!(
         OperationJournal::open(&config),
@@ -635,6 +801,7 @@ fn empty_issue_307_schema_migrates_atomically() {
     let journal = OperationJournal::open(&config).unwrap();
     let path = journal.path().to_path_buf();
     drop(journal);
+    downgrade_current_journal_to_genuine_v3(&path);
 
     Connection::open(&path)
         .unwrap()
@@ -651,7 +818,7 @@ fn empty_issue_307_schema_migrates_atomically() {
 }
 
 #[test]
-fn root_bound_v2_journal_with_queued_work_migrates_completion_intents_atomically() {
+fn root_bound_v2_journal_with_queued_work_migrates_through_v3_to_v4_atomically() {
     let root = tempfile::tempdir().unwrap();
     let graph_store = root.path().join("graph.sqlite");
     let config = service_config(root.path(), &graph_store);
@@ -660,8 +827,8 @@ fn root_bound_v2_journal_with_queued_work_migrates_completion_intents_atomically
         .submit(
             &request(
                 &config,
-                json!({"migration": "v2-to-v3"}),
-                b"v2-completion-intent-migration",
+                json!({"migration": "v2-to-v4"}),
+                b"v2-to-v4-migration",
                 DEADLINE,
             ),
             NOW,
@@ -671,6 +838,7 @@ fn root_bound_v2_journal_with_queued_work_migrates_completion_intents_atomically
         .clone();
     let path = journal.path().to_path_buf();
     drop(journal);
+    downgrade_current_journal_to_genuine_v3(&path);
     Connection::open(&path)
         .unwrap()
         .execute_batch(
@@ -690,6 +858,149 @@ fn root_bound_v2_journal_with_queued_work_migrates_completion_intents_atomically
         OperationStatus::Queued
     );
     migrated.validate().unwrap();
+}
+
+#[test]
+fn read_only_submission_lookup_validates_genuine_v2_and_v3_before_writable_migration() {
+    for version in [2_i64, 3_i64] {
+        let root = tempfile::tempdir().unwrap();
+        let graph_store = root.path().join("graph.sqlite");
+        let config = service_config(root.path(), &graph_store);
+        let input = json!({"legacy_lookup": version});
+        let key = format!("legacy-read-only-v{version}");
+        let mut journal = OperationJournal::open(&config).unwrap();
+        let existing_operation_id = journal
+            .submit(
+                &request_for_kind(
+                    &config,
+                    OperationKind::RuntimeTraceImportSubmit,
+                    input.clone(),
+                    key.as_bytes(),
+                    DEADLINE,
+                ),
+                NOW,
+            )
+            .unwrap()
+            .operation_id()
+            .clone();
+        let path = journal.path().to_path_buf();
+        drop(journal);
+        if version == 2 {
+            downgrade_current_journal_to_genuine_v2(&path);
+        } else {
+            downgrade_current_journal_to_genuine_v3(&path);
+        }
+        let before = legacy_database_snapshot(&path);
+
+        let binding = OperationManager::existing_submission_binding_read_only(
+            &config,
+            OperationKind::RuntimeTraceImportSubmit,
+            key.as_bytes(),
+            NOW + 1,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(binding.normalized_input().value(), &input);
+        assert!(
+            OperationManager::existing_submission_binding_read_only(
+                &config,
+                OperationKind::RuntimeTraceImportSubmit,
+                format!("absent-v{version}").as_bytes(),
+                NOW + 1,
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert_eq!(legacy_database_snapshot(&path), before);
+
+        let mut manager = OperationManager::open(&config).unwrap();
+        let replayed = manager
+            .submit(
+                &request_for_kind(
+                    &config,
+                    OperationKind::RuntimeTraceImportSubmit,
+                    input,
+                    key.as_bytes(),
+                    DEADLINE,
+                ),
+                NOW + 1,
+            )
+            .unwrap();
+        assert!(!replayed.created());
+        assert_eq!(replayed.operation_id(), &existing_operation_id);
+        let created = manager
+            .submit(
+                &request_for_kind(
+                    &config,
+                    OperationKind::RuntimeTraceImportSubmit,
+                    json!({"legacy_new_submit": version}),
+                    format!("new-v{version}").as_bytes(),
+                    DEADLINE,
+                ),
+                NOW + 1,
+            )
+            .unwrap();
+        assert!(created.created());
+        drop(manager);
+        assert_eq!(
+            Connection::open(&path)
+                .unwrap()
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            JOURNAL_SCHEMA_VERSION
+        );
+    }
+}
+
+#[test]
+fn malformed_genuine_v2_and_v3_read_only_lookup_fails_closed_without_migration() {
+    for version in [2_i64, 3_i64] {
+        let root = tempfile::tempdir().unwrap();
+        let graph_store = root.path().join("graph.sqlite");
+        let config = service_config(root.path(), &graph_store);
+        let key = format!("malformed-legacy-v{version}");
+        let mut journal = OperationJournal::open(&config).unwrap();
+        journal
+            .submit(
+                &request_for_kind(
+                    &config,
+                    OperationKind::RuntimeTraceImportSubmit,
+                    json!({"malformed_lookup": version}),
+                    key.as_bytes(),
+                    DEADLINE,
+                ),
+                NOW,
+            )
+            .unwrap();
+        let path = journal.path().to_path_buf();
+        drop(journal);
+        if version == 2 {
+            downgrade_current_journal_to_genuine_v2(&path);
+        } else {
+            downgrade_current_journal_to_genuine_v3(&path);
+        }
+        Connection::open(&path)
+            .unwrap()
+            .execute("UPDATE operations SET input_digest=zeroblob(32)", [])
+            .unwrap();
+        let before = legacy_database_snapshot(&path);
+
+        assert!(matches!(
+            OperationManager::existing_submission_binding_read_only(
+                &config,
+                OperationKind::RuntimeTraceImportSubmit,
+                key.as_bytes(),
+                NOW + 1,
+            ),
+            Err(JournalError::IntegrityFailure)
+        ));
+        assert_eq!(legacy_database_snapshot(&path), before);
+        assert!(matches!(
+            OperationManager::open(&config),
+            Err(JournalError::IntegrityFailure)
+        ));
+        assert_eq!(legacy_database_snapshot(&path), before);
+    }
 }
 
 type LegacySchemaObject = (String, String, String, String);
@@ -725,6 +1036,278 @@ fn legacy_database_snapshot(path: &Path) -> LegacyDatabaseSnapshot {
     }
 }
 
+#[test]
+fn genuine_v3_journal_migrates_every_retained_lifecycle_row_to_v4() {
+    let root = tempfile::tempdir().unwrap();
+    let graph_store = root.path().join("graph.sqlite");
+    let config = service_config(root.path(), &graph_store);
+    let mut journal = OperationJournal::open(&config).unwrap();
+    let migration_deadline = NOW + 2 * TERMINAL_RETENTION_MS;
+
+    let tombstone_id = journal
+        .submit(
+            &request(
+                &config,
+                json!({"migration": "tombstone"}),
+                b"v3-retained-tombstone",
+                DEADLINE,
+            ),
+            NOW,
+        )
+        .unwrap()
+        .operation_id()
+        .clone();
+    journal
+        .acquire_lease(
+            &repository(),
+            &tombstone_id,
+            &LeaseOwner::parse("v3-tombstone-runner").unwrap(),
+            b"v3-tombstone-lease",
+            NOW + 1,
+            DEADLINE,
+        )
+        .unwrap();
+    journal
+        .complete(
+            &repository(),
+            &tombstone_id,
+            b"v3-tombstone-lease",
+            CanonicalJson::new(json!({"migration": "tombstone-result"})).unwrap(),
+            NOW + 2,
+        )
+        .unwrap();
+
+    let queued_id = journal
+        .submit(
+            &request(
+                &config,
+                json!({"migration": "queued"}),
+                b"v3-retained-queued",
+                migration_deadline,
+            ),
+            NOW,
+        )
+        .unwrap()
+        .operation_id()
+        .clone();
+    let terminal_id = journal
+        .submit(
+            &request(
+                &config,
+                json!({"migration": "terminal"}),
+                b"v3-retained-terminal",
+                migration_deadline,
+            ),
+            NOW + 1,
+        )
+        .unwrap()
+        .operation_id()
+        .clone();
+    journal
+        .acquire_lease(
+            &repository(),
+            &terminal_id,
+            &LeaseOwner::parse("v3-terminal-runner").unwrap(),
+            b"v3-terminal-lease",
+            NOW + 2,
+            migration_deadline,
+        )
+        .unwrap();
+    journal
+        .complete(
+            &repository(),
+            &terminal_id,
+            b"v3-terminal-lease",
+            CanonicalJson::new(json!({"migration": "terminal-result"})).unwrap(),
+            NOW + 3,
+        )
+        .unwrap();
+
+    let intent_id = journal
+        .submit(
+            &request(
+                &config,
+                json!({"migration": "completion-intent"}),
+                b"v3-retained-completion-intent",
+                migration_deadline,
+            ),
+            NOW + 4,
+        )
+        .unwrap()
+        .operation_id()
+        .clone();
+    journal
+        .acquire_lease(
+            &repository(),
+            &intent_id,
+            &LeaseOwner::parse("v3-intent-runner").unwrap(),
+            b"v3-intent-lease",
+            NOW + 5,
+            migration_deadline,
+        )
+        .unwrap();
+    journal
+        .commit_completion_intent(
+            &repository(),
+            &intent_id,
+            b"v3-intent-lease",
+            CanonicalJson::new(json!({"migration": "intent-result"})).unwrap(),
+            NOW + 6,
+        )
+        .unwrap();
+
+    let migration_read_time = DEADLINE + TERMINAL_RETENTION_MS + 1;
+    let purge = journal.purge(migration_read_time - 1).unwrap();
+    assert_eq!(purge.created_tombstones(), 1);
+    assert!(matches!(
+        journal.get(&repository(), &tombstone_id, migration_read_time),
+        Err(JournalError::Expired)
+    ));
+    let expected_queued = journal
+        .get(&repository(), &queued_id, migration_read_time)
+        .unwrap();
+    let expected_queued_handoff = journal
+        .runner_handoff(&repository(), &queued_id, migration_read_time)
+        .unwrap();
+    let expected_terminal = journal
+        .get(&repository(), &terminal_id, migration_read_time)
+        .unwrap();
+    let expected_terminal_handoff = journal
+        .runner_handoff(&repository(), &terminal_id, migration_read_time)
+        .unwrap();
+    let expected_intent_record = journal
+        .get(&repository(), &intent_id, migration_read_time)
+        .unwrap();
+    let expected_intent_handoff = journal
+        .runner_handoff(&repository(), &intent_id, migration_read_time)
+        .unwrap();
+    let expected_intent = journal
+        .next_completion_intent(&repository(), migration_read_time)
+        .unwrap()
+        .unwrap();
+    let path = journal.path().to_path_buf();
+    drop(journal);
+
+    downgrade_current_journal_to_genuine_v3(&path);
+    let v3_snapshot = legacy_database_snapshot(&path);
+    assert_eq!(v3_snapshot.version, 3);
+
+    let migrated = OperationJournal::open(&config).unwrap();
+    assert_eq!(migrated.schema_version().unwrap(), JOURNAL_SCHEMA_VERSION);
+    assert_eq!(
+        migrated
+            .get(&repository(), &queued_id, migration_read_time)
+            .unwrap(),
+        expected_queued
+    );
+    assert_eq!(
+        migrated
+            .runner_handoff(&repository(), &queued_id, migration_read_time)
+            .unwrap(),
+        expected_queued_handoff
+    );
+    assert_eq!(
+        migrated
+            .get(&repository(), &terminal_id, migration_read_time)
+            .unwrap(),
+        expected_terminal
+    );
+    assert_eq!(
+        migrated
+            .runner_handoff(&repository(), &terminal_id, migration_read_time)
+            .unwrap(),
+        expected_terminal_handoff
+    );
+    assert_eq!(
+        migrated
+            .get(&repository(), &intent_id, migration_read_time)
+            .unwrap(),
+        expected_intent_record
+    );
+    assert_eq!(
+        migrated
+            .runner_handoff(&repository(), &intent_id, migration_read_time)
+            .unwrap(),
+        expected_intent_handoff
+    );
+    assert_eq!(
+        migrated
+            .next_completion_intent(&repository(), migration_read_time)
+            .unwrap()
+            .unwrap(),
+        expected_intent
+    );
+    assert!(matches!(
+        migrated.get(&repository(), &tombstone_id, migration_read_time),
+        Err(JournalError::Expired)
+    ));
+    assert_eq!(
+        Connection::open(&path)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM operations
+                  WHERE retention_anchor_ms != execution_deadline_ms",
+                [],
+                |row| row.get::<_, u64>(0),
+            )
+            .unwrap(),
+        0
+    );
+    migrated.validate().unwrap();
+}
+
+#[test]
+fn tampered_or_malformed_v3_migration_fails_closed_without_partial_rebuild() {
+    let tampered_root = tempfile::tempdir().unwrap();
+    let tampered_store = tampered_root.path().join("graph.sqlite");
+    let tampered_config = service_config(tampered_root.path(), &tampered_store);
+    let mut journal = OperationJournal::open(&tampered_config).unwrap();
+    journal
+        .submit(
+            &request(
+                &tampered_config,
+                json!({"migration": "tampered-row"}),
+                b"v3-tampered-row",
+                DEADLINE,
+            ),
+            NOW,
+        )
+        .unwrap();
+    let tampered_path = journal.path().to_path_buf();
+    drop(journal);
+    downgrade_current_journal_to_genuine_v3(&tampered_path);
+    Connection::open(&tampered_path)
+        .unwrap()
+        .execute("UPDATE operations SET input_digest=zeroblob(32)", [])
+        .unwrap();
+    let tampered_before = legacy_database_snapshot(&tampered_path);
+
+    assert!(matches!(
+        OperationJournal::open(&tampered_config),
+        Err(JournalError::IntegrityFailure)
+    ));
+    assert_eq!(legacy_database_snapshot(&tampered_path), tampered_before);
+
+    let malformed_root = tempfile::tempdir().unwrap();
+    let malformed_store = malformed_root.path().join("graph.sqlite");
+    let malformed_config = service_config(malformed_root.path(), &malformed_store);
+    let journal = OperationJournal::open(&malformed_config).unwrap();
+    let malformed_path = journal.path().to_path_buf();
+    drop(journal);
+    downgrade_current_journal_to_genuine_v3(&malformed_path);
+    Connection::open(&malformed_path)
+        .unwrap()
+        .execute_batch("CREATE INDEX unexpected_v3_index ON operations(status)")
+        .unwrap();
+    let malformed_before = legacy_database_snapshot(&malformed_path);
+
+    assert!(matches!(
+        OperationJournal::open(&malformed_config),
+        Err(JournalError::IntegrityFailure)
+    ));
+    assert_eq!(legacy_database_snapshot(&malformed_path), malformed_before);
+}
+
 fn assert_nonempty_v1_fails_closed(config: &DepgraphServiceConfig, path: &Path) {
     let before = legacy_database_snapshot(path);
     assert!(matches!(
@@ -757,6 +1340,7 @@ fn nonempty_issue_307_operations_and_handoffs_fail_closed_without_migration() {
     journal.submit(&request, NOW).unwrap();
     let path = journal.path().to_path_buf();
     drop(journal);
+    downgrade_current_journal_to_genuine_v3(&path);
     Connection::open(&path)
         .unwrap()
         .execute_batch(
@@ -810,6 +1394,7 @@ fn nonempty_issue_307_tombstones_fail_closed_without_migration() {
     journal.purge(DEADLINE + TERMINAL_RETENTION_MS).unwrap();
     let path = journal.path().to_path_buf();
     drop(journal);
+    downgrade_current_journal_to_genuine_v3(&path);
     Connection::open(&path)
         .unwrap()
         .execute_batch(
@@ -846,6 +1431,7 @@ fn same_basename_wrong_root_cannot_claim_a_nonempty_issue_307_journal() {
     journal.submit(&request, NOW).unwrap();
     let path = journal.path().to_path_buf();
     drop(journal);
+    downgrade_current_journal_to_genuine_v3(&path);
     Connection::open(&path)
         .unwrap()
         .execute_batch(
@@ -948,6 +1534,7 @@ fn issue_307_migration_rejects_unexpected_schema_without_partial_metadata() {
     let journal = OperationJournal::open(&config).unwrap();
     let path = journal.path().to_path_buf();
     drop(journal);
+    downgrade_current_journal_to_genuine_v3(&path);
     Connection::open(&path)
         .unwrap()
         .execute_batch(
@@ -998,7 +1585,7 @@ fn schema_enforces_octet_limits_before_canonical_payload_decoding() {
         )
         .unwrap();
     assert!(operations_sql.contains("octet_length(required_capabilities_json)"));
-    assert!(operations_sql.contains("octet_length(input_json)"));
+    assert!(operations_sql.contains("octet_length(input_json) <= 16777216"));
     assert!(operations_sql.contains("octet_length(result_json)"));
     assert!(operations_sql.contains("octet_length(error_json)"));
     let handoff_sql: String = connection
@@ -1008,7 +1595,7 @@ fn schema_enforces_octet_limits_before_canonical_payload_decoding() {
             |row| row.get(0),
         )
         .unwrap();
-    assert!(handoff_sql.contains("octet_length(payload_json)"));
+    assert!(handoff_sql.contains("octet_length(payload_json) <= 16777216"));
     let tombstone_sql: String = connection
         .query_row(
             "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'operation_tombstones'",
@@ -1017,15 +1604,14 @@ fn schema_enforces_octet_limits_before_canonical_payload_decoding() {
         )
         .unwrap();
     assert!(tombstone_sql.contains("octet_length(required_capabilities_json)"));
+    let oversized_input = format!("\"{}\"", "x".repeat(MAX_OPERATION_INPUT_BYTES - 1));
+    assert_eq!(oversized_input.len(), MAX_OPERATION_INPUT_BYTES + 1);
 
     assert!(
         connection
             .execute(
                 "UPDATE operations SET input_json = ?1 WHERE operation_id = ?2",
-                params![
-                    "x".repeat(MAX_OPERATION_INPUT_BYTES + 1),
-                    operation_id.as_str()
-                ],
+                params![&oversized_input, operation_id.as_str()],
             )
             .is_err()
     );
@@ -1044,10 +1630,7 @@ fn schema_enforces_octet_limits_before_canonical_payload_decoding() {
         connection
             .execute(
                 "UPDATE runner_handoffs SET payload_json = ?1 WHERE operation_id = ?2",
-                params![
-                    "x".repeat(MAX_OPERATION_INPUT_BYTES + 1),
-                    operation_id.as_str()
-                ],
+                params![&oversized_input, operation_id.as_str()],
             )
             .is_err()
     );
@@ -1358,8 +1941,9 @@ fn canonical_but_wrong_capability_binding_fails_closed_for_operations_and_tombst
     let (_tombstone_root, _tombstone_store, tombstone_config, mut tombstone_journal) = journal();
     let submitted = tombstone_journal
         .submit(
-            &request(
+            &request_for_kind(
                 &tombstone_config,
+                generic_purge_kind(),
                 json!({"value": 1}),
                 b"wrong-tombstone-binding",
                 DEADLINE,
@@ -1446,6 +2030,459 @@ fn canonical_operation_input_tampering_fails_closed() {
         )
         .unwrap();
     assert_integrity_failure(&digest_journal, &digest_operation_id);
+}
+
+#[test]
+fn completion_intent_retains_and_cross_checks_the_operation_input_binding() {
+    let (_root, _graph_store, config, mut journal) = journal();
+    let operation_id = journal
+        .submit(
+            &request(
+                &config,
+                json!({"durable": "runtime-input"}),
+                b"completion-input-binding",
+                DEADLINE,
+            ),
+            NOW,
+        )
+        .unwrap()
+        .operation_id()
+        .clone();
+    let lease = b"completion-input-binding-lease";
+    journal
+        .acquire_lease(
+            &repository(),
+            &operation_id,
+            &LeaseOwner::parse("completion-input-binding-runner").unwrap(),
+            lease,
+            NOW + 1,
+            DEADLINE,
+        )
+        .unwrap();
+    journal
+        .commit_completion_intent(
+            &repository(),
+            &operation_id,
+            lease,
+            CanonicalJson::new(json!({"closed": "result"})).unwrap(),
+            NOW + 2,
+        )
+        .unwrap();
+    let intent = journal
+        .next_completion_intent(&repository(), NOW + 2)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        intent.normalized_input().as_str(),
+        r#"{"durable":"runtime-input"}"#
+    );
+
+    let forged = r#"{"durable":"different-input"}"#;
+    let forged_digest = JournalDigest::sha256(forged);
+    Connection::open(journal.path())
+        .unwrap()
+        .execute(
+            "UPDATE operations SET input_json=?1, input_digest=?2 WHERE operation_id=?3",
+            params![
+                forged,
+                forged_digest.as_bytes().as_slice(),
+                operation_id.as_str()
+            ],
+        )
+        .unwrap();
+    assert!(matches!(
+        journal.next_completion_intent(&repository(), NOW + 2),
+        Err(JournalError::IntegrityFailure)
+    ));
+}
+
+#[test]
+fn completion_intent_finishes_after_deadline_and_original_retention_at_decision_time() {
+    let (_root, _graph_store, config, mut journal) = journal();
+    let submitted = journal
+        .submit(
+            &request(
+                &config,
+                json!({"durable": "late-completion-recovery"}),
+                b"late-completion-recovery",
+                DEADLINE,
+            ),
+            NOW,
+        )
+        .unwrap();
+    let operation_id = submitted.operation_id().clone();
+    let original_retain_until_ms = submitted.record().retain_until_ms();
+    let lease = b"late-completion-recovery-lease";
+    journal
+        .acquire_lease(
+            &repository(),
+            &operation_id,
+            &LeaseOwner::parse("late-completion-recovery-runner").unwrap(),
+            lease,
+            NOW + 1,
+            DEADLINE,
+        )
+        .unwrap();
+    let decided_at_ms = NOW + 2;
+    journal
+        .commit_completion_intent(
+            &repository(),
+            &operation_id,
+            lease,
+            CanonicalJson::new(json!({"closed": "before-deadline"})).unwrap(),
+            decided_at_ms,
+        )
+        .unwrap();
+
+    let recovery_now_ms = original_retain_until_ms + 1;
+    let intent = journal
+        .next_completion_intent(&repository(), recovery_now_ms)
+        .unwrap()
+        .unwrap();
+    assert_eq!(intent.operation_id(), &operation_id);
+    assert_eq!(intent.decided_at_ms(), decided_at_ms);
+    let completed = journal
+        .finish_completion_intent(&repository(), &operation_id, recovery_now_ms)
+        .unwrap();
+
+    assert_eq!(completed.status(), OperationStatus::Completed);
+    assert_eq!(completed.updated_at_ms(), decided_at_ms);
+    assert_eq!(completed.terminal_at_ms(), Some(decided_at_ms));
+    assert_eq!(
+        completed.retain_until_ms(),
+        recovery_now_ms + TERMINAL_RETENTION_MS
+    );
+    assert_eq!(
+        journal
+            .runner_handoff(&repository(), &operation_id, recovery_now_ms)
+            .unwrap()
+            .completed_at_ms(),
+        Some(decided_at_ms)
+    );
+    assert!(
+        journal
+            .next_completion_intent(&repository(), recovery_now_ms)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        Connection::open(journal.path())
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM operation_completion_intents WHERE operation_id=?1",
+                [operation_id.as_str()],
+                |row| row.get::<_, u64>(0),
+            )
+            .unwrap(),
+        0
+    );
+    journal.validate().unwrap();
+}
+
+#[test]
+fn completion_intent_recovers_beyond_maximum_submitted_ttl_and_purges_normally() {
+    let (_root, _graph_store, config, mut journal) = journal();
+    let maximum_ttl = i64::try_from(MAX_TASK_TTL_MS).unwrap();
+    let deadline_ms = NOW + maximum_ttl - TERMINAL_RETENTION_MS;
+    let submitted = journal
+        .submit(
+            &request(
+                &config,
+                json!({"durable": "maximum-ttl-late-recovery"}),
+                b"maximum-ttl-late-recovery",
+                deadline_ms,
+            ),
+            NOW,
+        )
+        .unwrap();
+    let operation_id = submitted.operation_id().clone();
+    assert_eq!(submitted.record().retain_until_ms(), NOW + maximum_ttl);
+    let lease = b"maximum-ttl-late-recovery-lease";
+    journal
+        .acquire_lease(
+            &repository(),
+            &operation_id,
+            &LeaseOwner::parse("maximum-ttl-late-recovery-runner").unwrap(),
+            lease,
+            NOW + 1,
+            deadline_ms,
+        )
+        .unwrap();
+    journal
+        .commit_completion_intent(
+            &repository(),
+            &operation_id,
+            lease,
+            CanonicalJson::new(json!({"closed": "maximum-ttl-result"})).unwrap(),
+            NOW + 2,
+        )
+        .unwrap();
+
+    let recovery_now_ms = NOW + maximum_ttl + 2 * TERMINAL_RETENTION_MS;
+    let completed = journal
+        .finish_completion_intent(&repository(), &operation_id, recovery_now_ms)
+        .unwrap();
+    assert_eq!(completed.terminal_at_ms(), Some(NOW + 2));
+    assert_eq!(
+        completed.retain_until_ms(),
+        recovery_now_ms + TERMINAL_RETENTION_MS
+    );
+    journal.validate().unwrap();
+    drop(journal);
+
+    let mut reopened = OperationJournal::open(&config).unwrap();
+    reopened.validate().unwrap();
+    assert!(matches!(
+        reopened
+            .result(&repository(), &operation_id, recovery_now_ms)
+            .unwrap(),
+        OperationOutcome::Completed(_)
+    ));
+    let retain_until_ms = completed.retain_until_ms();
+    assert_eq!(
+        reopened
+            .purge(retain_until_ms - 1)
+            .unwrap()
+            .purged_operations(),
+        0
+    );
+    assert_eq!(
+        reopened.purge(retain_until_ms).unwrap().purged_operations(),
+        1
+    );
+    assert!(matches!(
+        reopened.get(&repository(), &operation_id, retain_until_ms),
+        Err(JournalError::Expired)
+    ));
+}
+
+#[test]
+fn late_completion_retention_overflow_and_anchor_tamper_fail_closed() {
+    let (_root, _graph_store, config, mut journal) = journal();
+    let operation_id = journal
+        .submit(
+            &request(
+                &config,
+                json!({"durable": "overflow-safe-late-recovery"}),
+                b"overflow-safe-late-recovery",
+                DEADLINE,
+            ),
+            NOW,
+        )
+        .unwrap()
+        .operation_id()
+        .clone();
+    let lease = b"overflow-safe-late-recovery-lease";
+    journal
+        .acquire_lease(
+            &repository(),
+            &operation_id,
+            &LeaseOwner::parse("overflow-safe-late-recovery-runner").unwrap(),
+            lease,
+            NOW + 1,
+            DEADLINE,
+        )
+        .unwrap();
+    journal
+        .commit_completion_intent(
+            &repository(),
+            &operation_id,
+            lease,
+            CanonicalJson::new(json!({"closed": "overflow-safe-result"})).unwrap(),
+            NOW + 2,
+        )
+        .unwrap();
+    let before = journal_state_digest(journal.path());
+    assert!(matches!(
+        journal.finish_completion_intent(
+            &repository(),
+            &operation_id,
+            i64::MAX - TERMINAL_RETENTION_MS + 1,
+        ),
+        Err(JournalError::InvalidArgument)
+    ));
+    assert_eq!(journal_state_digest(journal.path()), before);
+
+    journal
+        .finish_completion_intent(&repository(), &operation_id, DEADLINE + 1)
+        .unwrap();
+    let connection = Connection::open(journal.path()).unwrap();
+    connection
+        .execute_batch("DROP TRIGGER operations_terminal_immutable;")
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE operations SET retention_anchor_ms=retention_anchor_ms+1
+              WHERE operation_id=?1",
+            [operation_id.as_str()],
+        )
+        .unwrap();
+    assert!(matches!(
+        journal.get(&repository(), &operation_id, DEADLINE + 1),
+        Err(JournalError::IntegrityFailure)
+    ));
+    assert!(matches!(
+        journal.validate(),
+        Err(JournalError::IntegrityFailure)
+    ));
+}
+
+#[test]
+fn tampered_completion_decision_after_deadline_or_recovery_time_fails_closed() {
+    for (case, tampered_decided_at_ms, recovery_now_ms) in [
+        ("after-deadline", DEADLINE, DEADLINE + 1),
+        ("future", NOW + 3, NOW + 2),
+    ] {
+        let (_root, _graph_store, config, mut journal) = journal();
+        let operation_id = journal
+            .submit(
+                &request(&config, json!({"tamper": case}), case.as_bytes(), DEADLINE),
+                NOW,
+            )
+            .unwrap()
+            .operation_id()
+            .clone();
+        let lease = case.as_bytes();
+        journal
+            .acquire_lease(
+                &repository(),
+                &operation_id,
+                &LeaseOwner::parse(format!("{case}-runner")).unwrap(),
+                lease,
+                NOW + 1,
+                DEADLINE,
+            )
+            .unwrap();
+        journal
+            .commit_completion_intent(
+                &repository(),
+                &operation_id,
+                lease,
+                CanonicalJson::new(json!({"closed": case})).unwrap(),
+                NOW + 2,
+            )
+            .unwrap();
+        let tamper = Connection::open(journal.path()).unwrap();
+        tamper
+            .execute(
+                "UPDATE operation_completion_intents SET decided_at_ms=?1
+                 WHERE operation_id=?2",
+                params![tampered_decided_at_ms, operation_id.as_str()],
+            )
+            .unwrap();
+        tamper
+            .execute(
+                "UPDATE operations SET updated_at_ms=?1 WHERE operation_id=?2",
+                params![tampered_decided_at_ms, operation_id.as_str()],
+            )
+            .unwrap();
+        drop(tamper);
+
+        assert!(matches!(
+            journal.next_completion_intent(&repository(), recovery_now_ms),
+            Err(JournalError::IntegrityFailure)
+        ));
+        assert!(matches!(
+            journal.finish_completion_intent(&repository(), &operation_id, recovery_now_ms),
+            Err(JournalError::IntegrityFailure)
+        ));
+        assert_eq!(
+            Connection::open(journal.path())
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM operation_completion_intents WHERE operation_id=?1",
+                    [operation_id.as_str()],
+                    |row| row.get::<_, u64>(0),
+                )
+                .unwrap(),
+            1,
+            "{case} intent must remain retryable for diagnosis"
+        );
+        assert_eq!(
+            Connection::open(journal.path())
+                .unwrap()
+                .query_row(
+                    "SELECT status FROM operations WHERE operation_id=?1",
+                    [operation_id.as_str()],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "running"
+        );
+        if case == "after-deadline" {
+            assert!(matches!(
+                journal.validate(),
+                Err(JournalError::IntegrityFailure)
+            ));
+        } else {
+            journal.validate().unwrap();
+        }
+    }
+}
+
+#[test]
+fn cancellation_winning_completion_intent_keeps_the_lease_and_handoff_retryable() {
+    let (_root, _graph_store, config, mut journal) = journal();
+    let operation_id = journal
+        .submit(
+            &request(
+                &config,
+                json!({"durable": "cancellation-won"}),
+                b"completion-cancellation-won",
+                DEADLINE,
+            ),
+            NOW,
+        )
+        .unwrap()
+        .operation_id()
+        .clone();
+    let lease = b"completion-cancellation-won-lease";
+    journal
+        .acquire_lease(
+            &repository(),
+            &operation_id,
+            &LeaseOwner::parse("completion-cancellation-won-runner").unwrap(),
+            lease,
+            NOW + 1,
+            DEADLINE,
+        )
+        .unwrap();
+    journal
+        .cancel(&repository(), &operation_id, &write_capabilities(), NOW + 2)
+        .unwrap();
+    let before = journal.get(&repository(), &operation_id, NOW + 2).unwrap();
+    let before_handoff = journal
+        .runner_handoff(&repository(), &operation_id, NOW + 2)
+        .unwrap();
+
+    assert_eq!(
+        journal
+            .commit_completion_intent(
+                &repository(),
+                &operation_id,
+                lease,
+                CanonicalJson::new(json!({"closed": "result"})).unwrap(),
+                NOW + 3,
+            )
+            .unwrap(),
+        depgraph_operation::CompletionDecision::CancellationWon
+    );
+
+    let after = journal.get(&repository(), &operation_id, NOW + 3).unwrap();
+    let after_handoff = journal
+        .runner_handoff(&repository(), &operation_id, NOW + 3)
+        .unwrap();
+    assert_eq!(after.status(), OperationStatus::Cancelling);
+    assert_eq!(after.lease(), before.lease());
+    assert_eq!(after.terminal_at_ms(), None);
+    assert_eq!(after_handoff, before_handoff);
+    assert_eq!(after_handoff.completed_at_ms(), None);
+    assert!(
+        journal
+            .next_completion_intent(&repository(), NOW + 3)
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[test]
@@ -2330,8 +3367,9 @@ fn purge_reaps_queued_running_and_cancelling_before_terminal_only_deletion() {
     let (_root, _graph_store, config, mut journal) = journal();
     let queued_id = journal
         .submit(
-            &request(
+            &request_for_kind(
                 &config,
+                generic_purge_kind(),
                 json!({"state": "queued"}),
                 b"purge-queued",
                 DEADLINE,
@@ -2343,8 +3381,9 @@ fn purge_reaps_queued_running_and_cancelling_before_terminal_only_deletion() {
         .clone();
     let running_id = journal
         .submit(
-            &request(
+            &request_for_kind(
                 &config,
+                generic_purge_kind(),
                 json!({"state": "running"}),
                 b"purge-running",
                 DEADLINE,
@@ -2366,8 +3405,9 @@ fn purge_reaps_queued_running_and_cancelling_before_terminal_only_deletion() {
         .unwrap();
     let cancelling_id = journal
         .submit(
-            &request(
+            &request_for_kind(
                 &config,
+                generic_purge_kind(),
                 json!({"state": "cancelling"}),
                 b"purge-cancelling",
                 DEADLINE,
@@ -2391,7 +3431,7 @@ fn purge_reaps_queued_running_and_cancelling_before_terminal_only_deletion() {
         .cancel(
             &repository(),
             &cancelling_id,
-            &write_capabilities(),
+            &generic_purge_capabilities(),
             NOW + 5,
         )
         .unwrap();
@@ -2450,13 +3490,112 @@ fn purge_reaps_queued_running_and_cancelling_before_terminal_only_deletion() {
 }
 
 #[test]
+fn purge_leaves_expired_runtime_imports_for_runner_cleanup_and_still_purges_tombstones() {
+    let (_root, _graph_store, config, mut journal) = journal();
+    let runtime_id = journal
+        .submit(
+            &request_for_kind(
+                &config,
+                OperationKind::RuntimeTraceImportSubmit,
+                json!({"runtime": "runner-cleanup-required"}),
+                b"purge-runtime-runner-cleanup",
+                DEADLINE,
+            ),
+            NOW,
+        )
+        .unwrap()
+        .operation_id()
+        .clone();
+    let active_scan_id = journal
+        .submit(
+            &request(
+                &config,
+                json!({"scan": "runner-cleanup-required"}),
+                b"purge-active-scan-runner-cleanup",
+                DEADLINE,
+            ),
+            NOW + 1,
+        )
+        .unwrap()
+        .operation_id()
+        .clone();
+    let scan_id = journal
+        .submit(
+            &request(
+                &config,
+                json!({"scan": "terminal-tombstone"}),
+                b"purge-scan-tombstone",
+                DEADLINE,
+            ),
+            NOW + 2,
+        )
+        .unwrap()
+        .operation_id()
+        .clone();
+    journal
+        .fail_deadline(&repository(), &scan_id, DEADLINE)
+        .unwrap();
+
+    let report = journal.purge(DEADLINE + TERMINAL_RETENTION_MS).unwrap();
+    assert_eq!(report.reaped_operations(), 0);
+    assert_eq!(report.purged_operations(), 1);
+    assert_eq!(report.created_tombstones(), 1);
+    assert_eq!(report.purged_tombstones(), 0);
+    assert!(!report.more_work());
+    assert_eq!(
+        Connection::open(journal.path())
+            .unwrap()
+            .query_row(
+                "SELECT status FROM operations WHERE operation_id=?1",
+                [runtime_id.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        OperationStatus::Queued.as_str()
+    );
+    assert_eq!(
+        Connection::open(journal.path())
+            .unwrap()
+            .query_row(
+                "SELECT status FROM operations WHERE operation_id=?1",
+                [active_scan_id.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        OperationStatus::Queued.as_str()
+    );
+
+    let report = journal
+        .purge(DEADLINE + TERMINAL_RETENTION_MS + TOMBSTONE_RETENTION_MS)
+        .unwrap();
+    assert_eq!(report.reaped_operations(), 0);
+    assert_eq!(report.purged_operations(), 0);
+    assert_eq!(report.created_tombstones(), 0);
+    assert_eq!(report.purged_tombstones(), 1);
+    assert!(!report.more_work());
+    assert_eq!(
+        Connection::open(journal.path())
+            .unwrap()
+            .query_row(
+                "SELECT status FROM operations WHERE operation_id=?1",
+                [runtime_id.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        OperationStatus::Queued.as_str()
+    );
+    journal.validate().unwrap();
+}
+
+#[test]
 fn purge_rolls_back_the_whole_reap_batch_when_handoff_completion_fails() {
     let (_root, _graph_store, config, mut journal) = journal();
     for index in 0..2 {
         journal
             .submit(
-                &request(
+                &request_for_kind(
                     &config,
+                    generic_purge_kind(),
                     json!({"index": index}),
                     format!("purge-rollback-{index}").as_bytes(),
                     DEADLINE,
@@ -2768,8 +3907,9 @@ fn purge_batches_operations_and_tombstones_in_exact_deterministic_bounds() {
         operation_ids.push(
             journal
                 .submit(
-                    &request(
+                    &request_for_kind(
                         &config,
+                        generic_purge_kind(),
                         json!({"index": index}),
                         format!("purge-batch-{index}").as_bytes(),
                         DEADLINE,
@@ -2919,10 +4059,11 @@ fn cross_table_triggers_reject_operation_id_and_idempotency_scope_overlap() {
                 progress_completed, progress_total,
                 lease_owner, lease_token_digest, lease_expires_at_ms,
                 execution_deadline_ms, result_json, error_json,
-                created_at_ms, updated_at_ms, terminal_at_ms, retain_until_ms
+                created_at_ms, updated_at_ms, terminal_at_ms,
+                retention_anchor_ms, retain_until_ms
              ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'queued', 0, 1,
-                NULL, NULL, NULL, ?9, NULL, NULL, ?10, ?10, NULL, ?11
+                NULL, NULL, NULL, ?9, NULL, NULL, ?10, ?10, NULL, ?9, ?11
              )",
                 params![
                     "op_22222222222222222222222222222222",
@@ -2947,8 +4088,9 @@ fn validation_detects_preexisting_cross_table_overlap_in_one_snapshot() {
     let (_root, _graph_store, config, mut journal) = journal();
     let submitted = journal
         .submit(
-            &request(
+            &request_for_kind(
                 &config,
+                generic_purge_kind(),
                 json!({"value": 1}),
                 b"validation-overlap",
                 DEADLINE,
@@ -3006,10 +4148,11 @@ fn validation_detects_preexisting_cross_table_overlap_in_one_snapshot() {
                 progress_completed, progress_total,
                 lease_owner, lease_token_digest, lease_expires_at_ms,
                 execution_deadline_ms, result_json, error_json,
-                created_at_ms, updated_at_ms, terminal_at_ms, retain_until_ms
+                created_at_ms, updated_at_ms, terminal_at_ms,
+                retention_anchor_ms, retain_until_ms
              ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'queued', 0, 1,
-                NULL, NULL, NULL, ?9, NULL, NULL, ?10, ?10, NULL, ?11
+                NULL, NULL, NULL, ?9, NULL, NULL, ?10, ?10, NULL, ?9, ?11
              )",
             params![
                 operation_id.as_str(),

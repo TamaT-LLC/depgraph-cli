@@ -852,6 +852,77 @@ impl TryFrom<&depgraph_core::service::ScanServiceOutcome> for AgentScanOutcome {
     }
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentRuntimeStatus {
+    Completed,
+    Partial,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentRuntimeOutcome {
+    import_id: AgentId,
+    session_id: AgentId,
+    snapshot_id: SnapshotId,
+    status: AgentRuntimeStatus,
+    deduplicated: bool,
+}
+
+impl AgentRuntimeOutcome {
+    #[must_use]
+    pub const fn import_id(&self) -> &AgentId {
+        &self.import_id
+    }
+
+    #[must_use]
+    pub const fn session_id(&self) -> &AgentId {
+        &self.session_id
+    }
+
+    #[must_use]
+    pub const fn snapshot_id(&self) -> &SnapshotId {
+        &self.snapshot_id
+    }
+
+    #[must_use]
+    pub const fn status(&self) -> AgentRuntimeStatus {
+        self.status
+    }
+
+    #[must_use]
+    pub const fn deduplicated(&self) -> bool {
+        self.deduplicated
+    }
+}
+
+impl TryFrom<&depgraph_core::service::RuntimeImportServiceOutcome> for AgentRuntimeOutcome {
+    type Error = ContractBuildError;
+
+    fn try_from(
+        source: &depgraph_core::service::RuntimeImportServiceOutcome,
+    ) -> Result<Self, Self::Error> {
+        let result = source.result();
+        let status = match result.status.as_str() {
+            "completed" => AgentRuntimeStatus::Completed,
+            "partial" => AgentRuntimeStatus::Partial,
+            _ => return Err(ContractBuildError::AgentDtoValue),
+        };
+        let snapshot_id = SnapshotId::parse(&result.snapshot_id)
+            .map_err(|_| ContractBuildError::AgentDtoValue)?;
+        if snapshot_id.as_str() != source.completed_snapshot_id().as_str() {
+            return Err(ContractBuildError::AgentDtoValue);
+        }
+        Ok(Self {
+            import_id: parse_agent_value(&result.import_id)?,
+            session_id: parse_agent_value(&result.session_id)?,
+            snapshot_id,
+            status,
+            deduplicated: result.deduplicated,
+        })
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentCompletedSnapshot {

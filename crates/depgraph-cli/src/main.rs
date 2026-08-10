@@ -28,16 +28,16 @@ use depgraph_core::{
     compiler_precise_cache_key, compiler_precise_graph_ndjson, create_build_execution_request,
     create_compiler_precise_invocation_request, create_compiler_precise_unit_graph_request,
     default_store_path, execute_build_request_with_cancellation, export_filtered,
-    export_graphml_filtered_to_writer, init_config, match_runtime_trace, open_store,
-    paginate_interactive_query, prepare_build_cache_input, prepare_compiler_precise_cache_input,
-    profile_selection_human_summary, read_compiler_pack_requirement, read_runtime_trace,
-    render_condition, render_github_annotations, runtime_session_delta, rust_build_protocol_ndjson,
-    snapshot_profile_plan_id, stage_build_evidence, start_repository_daemon, traversal_summary,
-    unresolved_summary, validate_build_cache_input, validate_build_cache_source,
-    validate_compiler_precise_cache_input, validate_compiler_precise_cached_evidence,
-    validate_interactive_query_bounds, web_build_protocol_ndjson,
+    export_graphml_filtered_to_writer, init_config, open_store, paginate_interactive_query,
+    prepare_build_cache_input, prepare_compiler_precise_cache_input,
+    profile_selection_human_summary, read_compiler_pack_requirement, render_condition,
+    render_github_annotations, rust_build_protocol_ndjson, snapshot_profile_plan_id,
+    stage_build_evidence, start_repository_daemon, traversal_summary, unresolved_summary,
+    validate_build_cache_input, validate_build_cache_source, validate_compiler_precise_cache_input,
+    validate_compiler_precise_cached_evidence, validate_interactive_query_bounds,
+    web_build_protocol_ndjson,
 };
-use depgraph_mcp_tools::{AgentDaemonStatus, AgentDoctor, CliAction};
+use depgraph_mcp_tools::{AgentDaemonStatus, AgentDoctor, AgentRuntimeOutcome, CliAction};
 use depgraph_protocol::canonical_json;
 use depgraph_store::CoverageRecord;
 use serde::Serialize;
@@ -440,7 +440,21 @@ enum RuntimeCommands {
     },
     /// Atomically union a validated trace into a new immutable snapshot.
     Import {
-        trace: PathBuf,
+        /// Read the runtime trace from one confined repository-relative regular file.
+        #[arg(
+            value_name = "TRACE_FILE",
+            required_unless_present = "trace",
+            conflicts_with = "trace"
+        )]
+        trace_file: Option<PathBuf>,
+        /// Supply the complete bounded runtime trace JSON inline.
+        #[arg(
+            long,
+            value_name = "TRACE",
+            required_unless_present = "trace_file",
+            conflicts_with = "trace_file"
+        )]
+        trace: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -1836,46 +1850,41 @@ async fn run(cli: Cli) -> Result<u8> {
                 }
                 Ok(0)
             }
-            RuntimeCommands::Import { trace, json } => {
-                let metadata = inspect_runtime_trace_input(&trace)?;
-                if !metadata.file_type().is_file() {
-                    anyhow::bail!("runtime trace input must be a regular file");
-                }
-                let input =
-                    std::fs::File::open(&trace).context("failed to open runtime trace input")?;
-                // Parse and bound untrusted input before acquiring the writer
-                // lock or opening a mutable store.
-                let trace = read_runtime_trace(input)?;
-                let root = std::env::current_dir()?;
+            RuntimeCommands::Import {
+                trace_file,
+                trace,
+                json,
+            } => {
+                let root = canonical_directory(std::env::current_dir()?)?;
                 let store_path = store_path(cli.store, &root)?;
-                let _store_writer_lock = acquire_store_writer_lock(&store_path)?;
-                let mut store = open_store(&store_path)?;
-                let base_snapshot_id = if let Some(scan_id) = cli.scan_id.as_deref() {
-                    store
-                        .snapshot_id_for_scan_selection(scan_id)?
-                        .with_context(|| {
-                            format!("scan attempt {scan_id} has no completed snapshot")
-                        })?
-                } else {
-                    store
-                        .current_snapshot_id()?
-                        .context("no current completed snapshot is available")?
+                let service = store_write_service(&root, &store_path)?;
+                let request = RuntimeValidateRequest {
+                    trace,
+                    trace_file: trace_file
+                        .map(|path| repository_relative_cli_input(&path))
+                        .transpose()?,
+                    snapshot: cli_snapshot_selector(cli.scan_id),
                 };
-                let base = store
-                    .completed_snapshot(&base_snapshot_id)?
-                    .with_context(|| {
-                        format!("completed snapshot {base_snapshot_id} was not found")
-                    })?;
-                let snapshot = store.load_completed_snapshot(&base_snapshot_id)?;
-                let validated = match_runtime_trace(trace, &snapshot)?;
-                let delta = runtime_session_delta(validated, &base_snapshot_id, &snapshot)?;
-                let result = store.import_runtime_session(&base_snapshot_id, delta)?;
-                print_structured("runtime.import", base.scan_id, &result, json)?;
+                let imported = service.runtime_import(&request, &CancellationToken::new())?;
+                let result = AgentRuntimeOutcome::try_from(&imported)
+                    .map_err(|_| anyhow::anyhow!("runtime import result is invalid"))?;
+                print_structured(
+                    "runtime.import",
+                    imported.scan_id().to_owned(),
+                    &result,
+                    json,
+                )?;
                 if !json {
-                    println!("runtime session: {}", result.session_id);
-                    println!("snapshot: {}", result.snapshot_id);
-                    println!("status: {}", result.status);
-                    println!("deduplicated: {}", result.deduplicated);
+                    println!("runtime session: {}", result.session_id().as_str());
+                    println!("snapshot: {}", result.snapshot_id().as_str());
+                    println!(
+                        "status: {}",
+                        match result.status() {
+                            depgraph_mcp_tools::AgentRuntimeStatus::Completed => "completed",
+                            depgraph_mcp_tools::AgentRuntimeStatus::Partial => "partial",
+                        }
+                    );
+                    println!("deduplicated: {}", result.deduplicated());
                 }
                 Ok(0)
             }
@@ -3055,6 +3064,7 @@ fn print_unresolved_items(items: &[UnresolvedResult]) {
     }
 }
 
+#[cfg(test)]
 fn inspect_runtime_trace_input(path: &Path) -> Result<std::fs::Metadata> {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) => Ok(metadata),
@@ -3062,6 +3072,7 @@ fn inspect_runtime_trace_input(path: &Path) -> Result<std::fs::Metadata> {
     }
 }
 
+#[cfg(test)]
 fn runtime_trace_metadata_error(error: std::io::Error) -> anyhow::Error {
     if error.kind() == std::io::ErrorKind::NotFound {
         anyhow::Error::new(error).context("runtime trace input was not found")

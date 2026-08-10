@@ -10,8 +10,8 @@ use serde_json::{Value, json};
 use super::{
     CoverageRecord, DiagnosticRecord, EdgeRecord, EvidenceRecord, GraphSnapshot, NodeRecord,
     ProfileRecord, SiteRecord, SnapshotSource, Store, canonical_effective_input_id,
-    create_completed_snapshot, declared_effective_input_id, declared_parent_profile_id,
-    promote_completed_snapshot, refresh_profile_matrix,
+    completed_snapshot_identity, create_completed_snapshot, declared_effective_input_id,
+    declared_parent_profile_id, promote_completed_snapshot, refresh_profile_matrix,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -62,6 +62,101 @@ pub struct RuntimeImportResult {
     pub deduplicated: bool,
 }
 
+/// Complete durable binding used by operation-owned runtime import recovery.
+pub struct RuntimeImportRecoveryIdentity<'a> {
+    import_id: &'a str,
+    session_id: &'a str,
+    snapshot_id: &'a str,
+    parent_snapshot_id: &'a str,
+    trace_digest: Option<&'a str>,
+    status: &'a str,
+    operation_id: &'a str,
+}
+
+impl<'a> RuntimeImportRecoveryIdentity<'a> {
+    #[must_use]
+    pub const fn new(
+        import_id: &'a str,
+        session_id: &'a str,
+        snapshot_id: &'a str,
+        parent_snapshot_id: &'a str,
+        trace_digest: &'a str,
+        status: &'a str,
+        operation_id: &'a str,
+    ) -> Self {
+        Self {
+            import_id,
+            session_id,
+            snapshot_id,
+            parent_snapshot_id,
+            trace_digest: Some(trace_digest),
+            status,
+            operation_id,
+        }
+    }
+
+    /// Bind recovery to the identities in a validated immutable completion
+    /// outcome when legacy normalized input did not retain a trace digest. The
+    /// selected stored session must reproduce its deterministic session ID from
+    /// its source-session ID and trace digest before it can be promoted.
+    #[must_use]
+    pub const fn from_validated_outcome(
+        import_id: &'a str,
+        session_id: &'a str,
+        snapshot_id: &'a str,
+        parent_snapshot_id: &'a str,
+        status: &'a str,
+        operation_id: &'a str,
+    ) -> Self {
+        Self {
+            import_id,
+            session_id,
+            snapshot_id,
+            parent_snapshot_id,
+            trace_digest: None,
+            status,
+            operation_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedRuntimeImport {
+    result: RuntimeImportResult,
+    pending: bool,
+}
+
+impl PreparedRuntimeImport {
+    #[must_use]
+    pub const fn result(&self) -> &RuntimeImportResult {
+        &self.result
+    }
+
+    #[must_use]
+    pub const fn is_pending(&self) -> bool {
+        self.pending
+    }
+
+    #[must_use]
+    pub fn into_result(self) -> RuntimeImportResult {
+        self.result
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RuntimeImportMode {
+    Immediate,
+    Deferred,
+}
+
+#[derive(Clone, Copy)]
+struct RuntimeImportRecoveryBinding<'a> {
+    operation_id: &'a str,
+    parent_snapshot_id: &'a str,
+    trace_digest: Option<&'a str>,
+    status: &'a str,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RuntimeEdgeContext {
     pub session_ids: Vec<String>,
@@ -82,8 +177,53 @@ impl Store {
     pub fn import_runtime_session(
         &mut self,
         base_snapshot_id: &str,
-        mut delta: RuntimeSessionDelta,
+        delta: RuntimeSessionDelta,
     ) -> Result<RuntimeImportResult> {
+        let prepared = self.import_runtime_session_with_mode(
+            base_snapshot_id,
+            delta,
+            RuntimeImportMode::Immediate,
+            None,
+        )?;
+        if prepared.is_pending() {
+            bail!("immediate runtime import was not promoted");
+        }
+        Ok(prepared.into_result())
+    }
+
+    /// Validate and durably stage one runtime session without creating or
+    /// publishing a completed snapshot. The caller must retain the external
+    /// store-writer lock until it either promotes or cancels this preparation.
+    pub fn prepare_runtime_session_import(
+        &mut self,
+        base_snapshot_id: &str,
+        delta: RuntimeSessionDelta,
+        operation_id: &str,
+    ) -> Result<PreparedRuntimeImport> {
+        self.import_runtime_session_with_mode(
+            base_snapshot_id,
+            delta,
+            RuntimeImportMode::Deferred,
+            Some(operation_id),
+        )
+    }
+
+    fn import_runtime_session_with_mode(
+        &mut self,
+        base_snapshot_id: &str,
+        mut delta: RuntimeSessionDelta,
+        mode: RuntimeImportMode,
+        operation_id: Option<&str>,
+    ) -> Result<PreparedRuntimeImport> {
+        match (mode, operation_id) {
+            (RuntimeImportMode::Immediate, None) => {}
+            (RuntimeImportMode::Deferred, Some(operation_id))
+                if valid_runtime_import_operation_id(operation_id) => {}
+            (RuntimeImportMode::Deferred, Some(_)) => {
+                bail!("runtime import operation identity is invalid");
+            }
+            _ => bail!("runtime import staging ownership is invalid"),
+        }
         normalize_runtime_delta(&mut delta);
         if delta.session.base_snapshot_id != base_snapshot_id {
             bail!("runtime session base snapshot does not match the selected snapshot");
@@ -114,14 +254,17 @@ impl Store {
                     delta.session.id
                 );
             }
-            return Ok(RuntimeImportResult {
-                import_id: base_record
-                    .runtime_import_id
-                    .unwrap_or_else(|| "runtime-import:deduplicated".to_owned()),
-                session_id: delta.session.id,
-                snapshot_id: base_snapshot_id.to_owned(),
-                status: existing.status,
-                deduplicated: true,
+            return Ok(PreparedRuntimeImport {
+                result: RuntimeImportResult {
+                    import_id: base_record
+                        .runtime_import_id
+                        .unwrap_or_else(|| "runtime-import:deduplicated".to_owned()),
+                    session_id: delta.session.id,
+                    snapshot_id: base_snapshot_id.to_owned(),
+                    status: existing.status,
+                    deduplicated: true,
+                },
+                pending: false,
             });
         }
         let base = self.load_completed_snapshot(base_snapshot_id)?;
@@ -131,14 +274,105 @@ impl Store {
         runtime_session_ids.push(delta.session.id.clone());
         runtime_session_ids.sort();
         runtime_session_ids.dedup();
-        let import_id = stable_id_from_value(
-            "runtime-import",
-            &json!({
-                "parent_snapshot_id": base_snapshot_id,
-                "session_id": delta.session.id,
-                "runtime_session_ids": runtime_session_ids,
-            }),
-        );
+        let import_id =
+            runtime_import_identity(base_snapshot_id, &delta.session.id, &runtime_session_ids);
+        if let Some((existing_parent, existing_session, status, result_snapshot_id)) = self
+            .connection
+            .query_row(
+                "SELECT parent_snapshot_id, session_id, status, result_snapshot_id
+                   FROM runtime_imports WHERE id=?1",
+                [&import_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                },
+            )
+            .optional()?
+        {
+            if existing_parent != base_snapshot_id || existing_session != delta.session.id {
+                bail!("runtime import identity collision for {import_id}");
+            }
+            let stored_delta = load_runtime_delta(&self.connection, &existing_session)?;
+            let mut comparable_stored_delta = stored_delta.clone();
+            // Import preparation time is audit metadata, not trace identity.
+            // Every other stored field must reproduce exactly on replay.
+            comparable_stored_delta.session.created_at = delta.session.created_at.clone();
+            if comparable_stored_delta != delta {
+                bail!("runtime import replay delta does not match staged evidence");
+            }
+            match status.as_str() {
+                "completed" => {
+                    let snapshot_id = result_snapshot_id
+                        .context("completed runtime import has no result snapshot")?;
+                    let snapshot = self
+                        .completed_snapshot(&snapshot_id)?
+                        .context("completed runtime import result snapshot was not found")?;
+                    if snapshot.parent_snapshot_id.as_deref() != Some(base_snapshot_id)
+                        || snapshot.runtime_import_id.as_deref() != Some(import_id.as_str())
+                        || !snapshot.runtime_session_ids.contains(&existing_session)
+                        || !self.verify_snapshot_integrity(&snapshot_id)?.valid
+                    {
+                        bail!("completed runtime import result snapshot identity does not match");
+                    }
+                    clear_runtime_import_operation_owners(&mut self.connection, &import_id)?;
+                    return Ok(PreparedRuntimeImport {
+                        result: RuntimeImportResult {
+                            import_id,
+                            session_id: existing_session,
+                            snapshot_id,
+                            status: stored_delta.session.status,
+                            deduplicated: true,
+                        },
+                        pending: false,
+                    });
+                }
+                "staging" if result_snapshot_id.is_none() => {
+                    let expected_snapshot_id = completed_snapshot_identity(
+                        &self.connection,
+                        &base_record.scan_id,
+                        base_record.build_attempt_id.as_deref(),
+                        &runtime_session_ids,
+                        Some(base_snapshot_id),
+                        base_record.source_revision.as_deref(),
+                    )?
+                    .0;
+                    if mode == RuntimeImportMode::Immediate {
+                        let result = self.promote_staged_runtime_session_import(
+                            &import_id,
+                            &existing_session,
+                            &expected_snapshot_id,
+                            None,
+                        )?;
+                        return Ok(PreparedRuntimeImport {
+                            result,
+                            pending: false,
+                        });
+                    }
+                    attach_runtime_import_operation_owner(
+                        &mut self.connection,
+                        &import_id,
+                        base_snapshot_id,
+                        &existing_session,
+                        operation_id.context("deferred runtime import has no operation owner")?,
+                    )?;
+                    return Ok(PreparedRuntimeImport {
+                        result: RuntimeImportResult {
+                            import_id,
+                            session_id: existing_session,
+                            snapshot_id: expected_snapshot_id,
+                            status: stored_delta.session.status,
+                            deduplicated: false,
+                        },
+                        pending: true,
+                    });
+                }
+                _ => bail!("runtime import replay found an invalid operation state"),
+            }
+        }
         let created_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
         let tx = self.connection.transaction()?;
         store_runtime_session(&tx, &delta)?;
@@ -148,35 +382,444 @@ impl Store {
              ) VALUES (?1, ?2, ?3, 'staging', ?4)",
             params![import_id, base_snapshot_id, delta.session.id, created_at],
         )?;
+        if let Some(operation_id) = operation_id {
+            tx.execute(
+                "INSERT INTO runtime_import_operation_owners(
+                    import_id, operation_id, created_at
+                 ) VALUES (?1, ?2, ?3)",
+                params![import_id, operation_id, created_at],
+            )?;
+        }
+        // For a deferred import, parent_snapshot_id is also the durable
+        // compare-and-publish identity. It is captured with the staged session
+        // in this transaction and checked again in the completion transaction.
+        let snapshot_id = match mode {
+            RuntimeImportMode::Immediate => {
+                let snapshot_id = create_completed_snapshot(
+                    &tx,
+                    SnapshotSource {
+                        source_kind: "runtime",
+                        source_attempt_id: &import_id,
+                        scan_id: &base_record.scan_id,
+                        build_attempt_id: base_record.build_attempt_id.as_deref(),
+                        runtime_import_id: Some(&import_id),
+                        runtime_session_ids: &runtime_session_ids,
+                        parent_snapshot_id: Some(base_snapshot_id),
+                        source_revision: base_record.source_revision.as_deref(),
+                        created_at: &created_at,
+                    },
+                )?;
+                tx.execute(
+                    "UPDATE runtime_imports
+                        SET status='completed', result_snapshot_id=?2, completed_at=?3
+                      WHERE id=?1 AND status='staging'",
+                    params![import_id, snapshot_id, created_at],
+                )?;
+                promote_runtime_snapshot_if_parent_is_current(&tx, base_snapshot_id, &snapshot_id)?;
+                snapshot_id
+            }
+            RuntimeImportMode::Deferred => {
+                completed_snapshot_identity(
+                    &tx,
+                    &base_record.scan_id,
+                    base_record.build_attempt_id.as_deref(),
+                    &runtime_session_ids,
+                    Some(base_snapshot_id),
+                    base_record.source_revision.as_deref(),
+                )?
+                .0
+            }
+        };
+        tx.commit()?;
+        Ok(PreparedRuntimeImport {
+            result: RuntimeImportResult {
+                import_id,
+                session_id: delta.session.id,
+                snapshot_id,
+                status: delta.session.status,
+                deduplicated: false,
+            },
+            pending: matches!(mode, RuntimeImportMode::Deferred),
+        })
+    }
+
+    /// Atomically turn a staged runtime import into a completed immutable
+    /// snapshot and publish it only while its parent is still current.
+    /// Replaying an already-completed import verifies identity without moving
+    /// current backwards.
+    pub fn promote_runtime_session_import(
+        &mut self,
+        import_id: &str,
+        expected_session_id: &str,
+        expected_snapshot_id: &str,
+    ) -> Result<RuntimeImportResult> {
+        self.promote_staged_runtime_session_import(
+            import_id,
+            expected_session_id,
+            expected_snapshot_id,
+            None,
+        )
+    }
+
+    /// Recover a deferred promotion only when the complete durable operation
+    /// binding matches the staged import. A pre-v16 staging row may instead be
+    /// owned by the one deterministic migration sentinel for this exact
+    /// import; caller-supplied operation IDs can never use that reserved form.
+    pub fn recover_runtime_session_import_for_operation(
+        &mut self,
+        recovery: &RuntimeImportRecoveryIdentity<'_>,
+    ) -> Result<RuntimeImportResult> {
+        reject_reserved_runtime_import_operation_id(recovery.operation_id)?;
+        self.promote_staged_runtime_session_import(
+            recovery.import_id,
+            recovery.session_id,
+            recovery.snapshot_id,
+            Some(RuntimeImportRecoveryBinding {
+                operation_id: recovery.operation_id,
+                parent_snapshot_id: recovery.parent_snapshot_id,
+                trace_digest: recovery.trace_digest,
+                status: recovery.status,
+            }),
+        )
+    }
+
+    fn promote_staged_runtime_session_import(
+        &mut self,
+        import_id: &str,
+        expected_session_id: &str,
+        expected_snapshot_id: &str,
+        recovery: Option<RuntimeImportRecoveryBinding<'_>>,
+    ) -> Result<RuntimeImportResult> {
+        let (parent_snapshot_id, session_id, import_status, result_snapshot_id) =
+            self.connection.query_row(
+                "SELECT parent_snapshot_id, session_id, status, result_snapshot_id
+                   FROM runtime_imports WHERE id=?1",
+                [import_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                },
+            )?;
+        if session_id != expected_session_id {
+            bail!("runtime import session identity does not match");
+        }
+        let session = load_runtime_session_record(&self.connection, &session_id)?
+            .context("runtime import session was not found")?;
+        if let Some(recovery) = recovery
+            && (parent_snapshot_id != recovery.parent_snapshot_id
+                || session.base_snapshot_id != recovery.parent_snapshot_id
+                || !runtime_recovery_trace_matches(
+                    &session.id,
+                    &session.source_session_id,
+                    &session.trace_digest,
+                    recovery.trace_digest,
+                )
+                || session.status != recovery.status)
+        {
+            bail!("runtime import durable input identity does not match");
+        }
+        let base_record = self
+            .completed_snapshot(&parent_snapshot_id)?
+            .context("runtime import parent snapshot was not found")?;
+        let mut expected_runtime_session_ids = base_record.runtime_session_ids.clone();
+        expected_runtime_session_ids.push(session_id.clone());
+        expected_runtime_session_ids.sort();
+        expected_runtime_session_ids.dedup();
+        if runtime_import_identity(
+            &parent_snapshot_id,
+            &session_id,
+            &expected_runtime_session_ids,
+        ) != import_id
+        {
+            bail!("runtime import identity does not match durable input");
+        }
+        if import_status == "completed" {
+            if result_snapshot_id.as_deref() != Some(expected_snapshot_id) {
+                bail!("completed runtime import snapshot identity does not match");
+            }
+            let snapshot = self
+                .completed_snapshot(expected_snapshot_id)?
+                .context("completed runtime import result snapshot was not found")?;
+            if snapshot.parent_snapshot_id.as_deref() != Some(parent_snapshot_id.as_str())
+                || snapshot.runtime_import_id.as_deref() != Some(import_id)
+                || !snapshot.runtime_session_ids.contains(&session_id)
+                || !self.verify_snapshot_integrity(expected_snapshot_id)?.valid
+            {
+                bail!("completed runtime import evidence failed integrity validation");
+            }
+            clear_runtime_import_operation_owners(&mut self.connection, import_id)?;
+            return Ok(RuntimeImportResult {
+                import_id: import_id.to_owned(),
+                session_id,
+                snapshot_id: expected_snapshot_id.to_owned(),
+                status: session.status,
+                deduplicated: false,
+            });
+        }
+        if import_status != "staging" || result_snapshot_id.is_some() {
+            bail!("runtime import is not promotable");
+        }
+        if !self.verify_snapshot_integrity(&parent_snapshot_id)?.valid {
+            bail!("runtime import parent snapshot failed integrity validation");
+        }
+        let delta = load_runtime_delta(&self.connection, &session_id)?;
+        let base = self.load_completed_snapshot(&parent_snapshot_id)?;
+        validate_runtime_union(&base, &delta)?;
+        let mut runtime_session_ids = base_record.runtime_session_ids.clone();
+        runtime_session_ids.push(session_id.clone());
+        runtime_session_ids.sort();
+        runtime_session_ids.dedup();
+        let completed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+        let tx = self.connection.transaction()?;
+        if let Some(recovery) = recovery {
+            let (
+                transaction_parent,
+                transaction_session,
+                transaction_import_status,
+                transaction_result_snapshot,
+                transaction_session_parent,
+                transaction_source_session,
+                transaction_trace_digest,
+                transaction_session_status,
+            ) = tx.query_row(
+                "SELECT import.parent_snapshot_id, import.session_id, import.status,
+                        import.result_snapshot_id, session.base_snapshot_id,
+                        session.source_session_id, session.trace_digest, session.status
+                   FROM runtime_imports AS import
+                   JOIN runtime_sessions AS session ON session.id=import.session_id
+                  WHERE import.id=?1",
+                [import_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, String>(7)?,
+                    ))
+                },
+            )?;
+            if transaction_parent != recovery.parent_snapshot_id
+                || transaction_session != expected_session_id
+                || transaction_import_status != "staging"
+                || transaction_result_snapshot.is_some()
+                || transaction_session_parent != recovery.parent_snapshot_id
+                || transaction_session_status != recovery.status
+                || !runtime_recovery_trace_matches(
+                    &transaction_session,
+                    &transaction_source_session,
+                    &transaction_trace_digest,
+                    recovery.trace_digest,
+                )
+            {
+                bail!("runtime import recovery identity changed before promotion");
+            }
+            let operation_owned: bool = tx.query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM runtime_import_operation_owners
+                      WHERE import_id=?1 AND operation_id=?2
+                 )",
+                params![import_id, recovery.operation_id],
+                |row| row.get(0),
+            )?;
+            let legacy_owner = crate::legacy_runtime_import_owner_id(import_id);
+            let legacy_owned: bool = tx.query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM runtime_import_operation_owners
+                      WHERE import_id=?1 AND operation_id=?2
+                 )",
+                params![import_id, legacy_owner],
+                |row| row.get(0),
+            )?;
+            if !operation_owned && !legacy_owned {
+                bail!("runtime import completion operation does not own staging");
+            }
+        }
         let snapshot_id = create_completed_snapshot(
             &tx,
             SnapshotSource {
                 source_kind: "runtime",
-                source_attempt_id: &import_id,
+                source_attempt_id: import_id,
                 scan_id: &base_record.scan_id,
                 build_attempt_id: base_record.build_attempt_id.as_deref(),
-                runtime_import_id: Some(&import_id),
+                runtime_import_id: Some(import_id),
                 runtime_session_ids: &runtime_session_ids,
-                parent_snapshot_id: Some(base_snapshot_id),
+                parent_snapshot_id: Some(&parent_snapshot_id),
                 source_revision: base_record.source_revision.as_deref(),
-                created_at: &created_at,
+                created_at: &completed_at,
             },
         )?;
-        tx.execute(
+        if snapshot_id != expected_snapshot_id {
+            bail!("runtime import prospective snapshot identity changed");
+        }
+        let updated = tx.execute(
             "UPDATE runtime_imports
                 SET status='completed', result_snapshot_id=?2, completed_at=?3
-              WHERE id=?1 AND status='staging'",
-            params![import_id, snapshot_id, created_at],
+              WHERE id=?1 AND status='staging' AND result_snapshot_id IS NULL",
+            params![import_id, snapshot_id, completed_at],
         )?;
-        promote_completed_snapshot(&tx, &snapshot_id)?;
+        if updated != 1 {
+            bail!("runtime import staging transition was not applied");
+        }
+        tx.execute(
+            "DELETE FROM runtime_import_operation_owners WHERE import_id=?1",
+            [import_id],
+        )?;
+        promote_runtime_snapshot_if_parent_is_current(&tx, &parent_snapshot_id, &snapshot_id)?;
         tx.commit()?;
         Ok(RuntimeImportResult {
-            import_id,
-            session_id: delta.session.id,
+            import_id: import_id.to_owned(),
+            session_id,
             snapshot_id,
-            status: delta.session.status,
+            status: session.status,
             deduplicated: false,
         })
+    }
+
+    /// Discard a staged runtime import. No completed snapshot or current
+    /// pointer has been created at this point.
+    pub fn cancel_runtime_session_import_for_operation(
+        &mut self,
+        import_id: &str,
+        operation_id: &str,
+    ) -> Result<bool> {
+        reject_reserved_runtime_import_operation_id(operation_id)?;
+        let tx = self.connection.transaction()?;
+        let session_id = tx
+            .query_row(
+                "SELECT session_id FROM runtime_imports
+                  WHERE id=?1 AND status='staging' AND result_snapshot_id IS NULL",
+                [import_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let Some(session_id) = session_id else {
+            tx.commit()?;
+            return Ok(false);
+        };
+        let released = tx.execute(
+            "DELETE FROM runtime_import_operation_owners
+              WHERE import_id=?1 AND operation_id=?2",
+            params![import_id, operation_id],
+        )?;
+        if released == 0 {
+            // Absence fails safe: retain the stage for another durable owner or
+            // recovery instead of guessing that this caller owns deletion.
+            tx.commit()?;
+            return Ok(false);
+        }
+        if released != 1 {
+            bail!("runtime import owner release was not unique");
+        }
+        delete_unowned_staged_runtime_import(&tx, import_id, &session_id)?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Idempotently remove only the staged evidence bound to a durable runtime
+    /// operation. Completed imports and sessions referenced by another import
+    /// are never deleted.
+    pub fn cancel_matching_staged_runtime_session_import(
+        &mut self,
+        base_snapshot_id: &str,
+        session_id: &str,
+        trace_digest: &str,
+        operation_id: &str,
+    ) -> Result<bool> {
+        reject_reserved_runtime_import_operation_id(operation_id)?;
+        let tx = self.connection.transaction()?;
+        let matching = tx
+            .query_row(
+                "SELECT import.id, session.trace_digest
+                   FROM runtime_imports AS import
+                   JOIN runtime_sessions AS session ON session.id=import.session_id
+                  WHERE import.parent_snapshot_id=?1
+                    AND import.session_id=?2
+                    AND import.status='staging'
+                    AND import.result_snapshot_id IS NULL",
+                params![base_snapshot_id, session_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        let Some((import_id, stored_trace_digest)) = matching else {
+            tx.commit()?;
+            return Ok(false);
+        };
+        if stored_trace_digest != trace_digest {
+            bail!("staged runtime import trace identity does not match");
+        }
+        let released = tx.execute(
+            "DELETE FROM runtime_import_operation_owners
+              WHERE import_id=?1 AND operation_id=?2",
+            params![import_id, operation_id],
+        )?;
+        if released == 0 {
+            tx.commit()?;
+            return Ok(false);
+        }
+        if released != 1 {
+            bail!("runtime import owner release was not unique");
+        }
+        delete_unowned_staged_runtime_import(&tx, &import_id, session_id)?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Idempotently release staging selected solely through the unique durable
+    /// operation owner. This is the cleanup path for legacy journal input that
+    /// did not retain an external session or trace selector.
+    pub fn cancel_staged_runtime_session_import_for_operation(
+        &mut self,
+        operation_id: &str,
+    ) -> Result<bool> {
+        reject_reserved_runtime_import_operation_id(operation_id)?;
+        if !valid_runtime_import_operation_id(operation_id) {
+            bail!("runtime import operation identity is invalid");
+        }
+        let tx = self.connection.transaction()?;
+        let owned = tx
+            .query_row(
+                "SELECT owner.import_id, import.session_id, import.status,
+                        import.result_snapshot_id
+                   FROM runtime_import_operation_owners AS owner
+                   JOIN runtime_imports AS import ON import.id=owner.import_id
+                  WHERE owner.operation_id=?1",
+                [operation_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((import_id, session_id, status, result_snapshot_id)) = owned else {
+            tx.commit()?;
+            return Ok(false);
+        };
+        if status != "staging" || result_snapshot_id.is_some() {
+            bail!("runtime import operation owner does not select mutable staging");
+        }
+        let released = tx.execute(
+            "DELETE FROM runtime_import_operation_owners
+              WHERE import_id=?1 AND operation_id=?2",
+            params![import_id, operation_id],
+        )?;
+        if released != 1 {
+            bail!("runtime import operation owner release was not unique");
+        }
+        delete_unowned_staged_runtime_import(&tx, &import_id, &session_id)?;
+        tx.commit()?;
+        Ok(true)
     }
 
     pub fn runtime_session(&self, session_id: &str) -> Result<Option<RuntimeSessionRecord>> {
@@ -200,6 +843,177 @@ impl Store {
             })
             .collect()
     }
+}
+
+fn promote_runtime_snapshot_if_parent_is_current(
+    connection: &Connection,
+    parent_snapshot_id: &str,
+    snapshot_id: &str,
+) -> Result<bool> {
+    let current_snapshot_id = connection
+        .query_row(
+            "SELECT snapshot_id FROM current_completed_snapshot WHERE singleton=1",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if current_snapshot_id.as_deref() != Some(parent_snapshot_id) {
+        return Ok(false);
+    }
+    promote_completed_snapshot(connection, snapshot_id)?;
+    Ok(true)
+}
+
+fn attach_runtime_import_operation_owner(
+    connection: &mut Connection,
+    import_id: &str,
+    base_snapshot_id: &str,
+    session_id: &str,
+    operation_id: &str,
+) -> Result<()> {
+    if !valid_runtime_import_operation_id(operation_id) {
+        bail!("runtime import operation identity is invalid");
+    }
+    let created_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+    let tx = connection.transaction()?;
+    let state = tx
+        .query_row(
+            "SELECT parent_snapshot_id, session_id, status, result_snapshot_id
+               FROM runtime_imports WHERE id=?1",
+            [import_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((stored_parent, stored_session, status, result_snapshot_id)) = state else {
+        bail!("staged runtime import disappeared before owner attachment");
+    };
+    if stored_parent != base_snapshot_id
+        || stored_session != session_id
+        || status != "staging"
+        || result_snapshot_id.is_some()
+    {
+        bail!("runtime import is not eligible for owner attachment");
+    }
+    tx.execute(
+        "INSERT INTO runtime_import_operation_owners(import_id, operation_id, created_at)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT(import_id, operation_id) DO NOTHING",
+        params![import_id, operation_id, created_at],
+    )?;
+    let attached: u64 = tx.query_row(
+        "SELECT COUNT(*) FROM runtime_import_operation_owners
+          WHERE import_id=?1 AND operation_id=?2",
+        params![import_id, operation_id],
+        |row| row.get(0),
+    )?;
+    if attached != 1 {
+        bail!("runtime import operation owner was not attached");
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+fn valid_runtime_import_operation_id(operation_id: &str) -> bool {
+    !operation_id.is_empty()
+        && operation_id.len() <= 512
+        && !operation_id.starts_with(crate::LEGACY_RUNTIME_IMPORT_OWNER_PREFIX)
+}
+
+fn runtime_import_identity(
+    parent_snapshot_id: &str,
+    session_id: &str,
+    runtime_session_ids: &[String],
+) -> String {
+    stable_id_from_value(
+        "runtime-import",
+        &json!({
+            "parent_snapshot_id": parent_snapshot_id,
+            "session_id": session_id,
+            "runtime_session_ids": runtime_session_ids,
+        }),
+    )
+}
+
+fn runtime_recovery_trace_matches(
+    session_id: &str,
+    source_session_id: &str,
+    stored_trace_digest: &str,
+    retained_trace_digest: Option<&str>,
+) -> bool {
+    match retained_trace_digest {
+        Some(retained_trace_digest) => stored_trace_digest == retained_trace_digest,
+        None => {
+            stable_id_from_value(
+                "runtime-session",
+                &json!({
+                    "source_session_id": source_session_id,
+                    "trace_digest": stored_trace_digest,
+                }),
+            ) == session_id
+        }
+    }
+}
+
+fn reject_reserved_runtime_import_operation_id(operation_id: &str) -> Result<()> {
+    if operation_id.starts_with(crate::LEGACY_RUNTIME_IMPORT_OWNER_PREFIX) {
+        bail!("runtime import operation identity uses a reserved prefix");
+    }
+    Ok(())
+}
+
+fn clear_runtime_import_operation_owners(
+    connection: &mut Connection,
+    import_id: &str,
+) -> Result<()> {
+    let tx = connection.transaction()?;
+    tx.execute(
+        "DELETE FROM runtime_import_operation_owners WHERE import_id=?1",
+        [import_id],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn delete_unowned_staged_runtime_import(
+    tx: &Transaction<'_>,
+    import_id: &str,
+    session_id: &str,
+) -> Result<()> {
+    let remaining_owners: u64 = tx.query_row(
+        "SELECT COUNT(*) FROM runtime_import_operation_owners WHERE import_id=?1",
+        [import_id],
+        |row| row.get(0),
+    )?;
+    if remaining_owners != 0 {
+        return Ok(());
+    }
+    let deleted = tx.execute(
+        "DELETE FROM runtime_imports
+          WHERE id=?1
+            AND session_id=?2
+            AND status='staging'
+            AND result_snapshot_id IS NULL",
+        params![import_id, session_id],
+    )?;
+    if deleted != 1 {
+        bail!("unowned staged runtime import cleanup changed concurrently");
+    }
+    tx.execute(
+        "DELETE FROM runtime_sessions
+          WHERE id=?1
+            AND NOT EXISTS (
+                SELECT 1 FROM runtime_imports WHERE session_id=?1
+            )",
+        [session_id],
+    )?;
+    Ok(())
 }
 
 fn normalize_runtime_delta(delta: &mut RuntimeSessionDelta) {
@@ -1293,6 +2107,221 @@ mod tests {
             |row| row.get(0),
         )?;
         assert_eq!(runtime_snapshots, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn deferred_recovery_completes_import_without_replacing_newer_current_snapshot() -> Result<()> {
+        let (mut store, base_snapshot_id, base) = seeded_store()?;
+        let staged = store
+            .prepare_runtime_session_import(
+                &base_snapshot_id,
+                valid_delta(&base_snapshot_id, &base),
+                "op_store_deferred_recovery",
+            )?
+            .into_result();
+
+        let mut newer_delta = valid_delta(&base_snapshot_id, &base);
+        newer_delta.session.id = "runtime-session:newer".to_owned();
+        newer_delta.session.source_session_id = "collector-session-newer".to_owned();
+        newer_delta.session.trace_digest = "runtime-trace:sha256:newer".to_owned();
+        for evidence in &mut newer_delta.evidence {
+            evidence.properties["session_id"] = json!(newer_delta.session.id);
+            evidence.properties["source_session_id"] = json!(newer_delta.session.source_session_id);
+        }
+        let newer = store.import_runtime_session(&base_snapshot_id, newer_delta)?;
+        assert_ne!(newer.snapshot_id, staged.snapshot_id);
+        assert_eq!(
+            store.current_snapshot_id()?.as_deref(),
+            Some(newer.snapshot_id.as_str())
+        );
+
+        let recovered = store.promote_runtime_session_import(
+            &staged.import_id,
+            &staged.session_id,
+            &staged.snapshot_id,
+        )?;
+
+        assert_eq!(recovered.snapshot_id, staged.snapshot_id);
+        let completed = store
+            .completed_snapshot(&staged.snapshot_id)?
+            .context("recovered runtime snapshot")?;
+        assert_eq!(completed.status, "completed");
+        assert_eq!(
+            completed.runtime_import_id.as_deref(),
+            Some(staged.import_id.as_str())
+        );
+        assert_eq!(
+            store.current_snapshot_id()?.as_deref(),
+            Some(newer.snapshot_id.as_str())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn operation_only_runtime_cleanup_is_idempotent_and_rejects_reserved_owners() -> Result<()> {
+        let (mut store, base_snapshot_id, base) = seeded_store()?;
+        let operation_id = "op_00000000000000000000000000000003";
+        let staged = store
+            .prepare_runtime_session_import(
+                &base_snapshot_id,
+                valid_delta(&base_snapshot_id, &base),
+                operation_id,
+            )?
+            .into_result();
+
+        assert!(store.cancel_staged_runtime_session_import_for_operation(operation_id)?);
+        assert!(!store.cancel_staged_runtime_session_import_for_operation(operation_id)?);
+        assert!(store.runtime_session(&staged.session_id)?.is_none());
+        assert_eq!(
+            store.connection.query_row(
+                "SELECT COUNT(*) FROM runtime_imports WHERE id=?1",
+                [&staged.import_id],
+                |row| row.get::<_, u64>(0),
+            )?,
+            0
+        );
+
+        let sentinel = crate::legacy_runtime_import_owner_id(&staged.import_id);
+        assert!(
+            store
+                .cancel_staged_runtime_session_import_for_operation(&sentinel)
+                .unwrap_err()
+                .to_string()
+                .contains("reserved prefix")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn v15_staging_migrates_with_a_reserved_owner_until_recovery_promotion() -> Result<()> {
+        let (mut store, base_snapshot_id, base) = seeded_store()?;
+        let staged = store
+            .prepare_runtime_session_import(
+                &base_snapshot_id,
+                valid_delta(&base_snapshot_id, &base),
+                "op_pre_v16_owner_not_persisted",
+            )?
+            .into_result();
+        store.connection.execute_batch(
+            "DROP TABLE scan_operation_staging;
+             DROP TABLE runtime_import_operation_owners;
+             PRAGMA user_version=15;",
+        )?;
+
+        store.migrate()?;
+        assert_eq!(store.schema_version()?, crate::STORE_SCHEMA_VERSION);
+        let sentinel = crate::legacy_runtime_import_owner_id(&staged.import_id);
+        assert_eq!(
+            store.connection.query_row(
+                "SELECT operation_id FROM runtime_import_operation_owners
+                  WHERE import_id=?1",
+                [&staged.import_id],
+                |row| row.get::<_, String>(0),
+            )?,
+            sentinel
+        );
+        assert!(!store.cancel_runtime_session_import_for_operation(
+            &staged.import_id,
+            "op_pre_v16_owner_not_persisted"
+        )?);
+
+        let attached = store
+            .prepare_runtime_session_import(
+                &base_snapshot_id,
+                valid_delta(&base_snapshot_id, &base),
+                "op_post_v16_owner",
+            )?
+            .into_result();
+        assert_eq!(attached.import_id, staged.import_id);
+        assert!(
+            store.cancel_runtime_session_import_for_operation(
+                &staged.import_id,
+                "op_post_v16_owner"
+            )?
+        );
+        assert_eq!(
+            store.connection.query_row(
+                "SELECT COUNT(*) FROM runtime_imports WHERE id=?1 AND status='staging'",
+                [&staged.import_id],
+                |row| row.get::<_, u64>(0),
+            )?,
+            1
+        );
+        let session = store
+            .runtime_session(&staged.session_id)?
+            .context("legacy staged runtime session")?;
+        assert_eq!(
+            store.connection.query_row(
+                "SELECT operation_id FROM runtime_import_operation_owners
+                  WHERE import_id=?1",
+                [&staged.import_id],
+                |row| row.get::<_, String>(0),
+            )?,
+            sentinel
+        );
+        assert!(
+            store
+                .cancel_runtime_session_import_for_operation(&staged.import_id, &sentinel)
+                .unwrap_err()
+                .to_string()
+                .contains("reserved prefix")
+        );
+        assert!(
+            store
+                .cancel_matching_staged_runtime_session_import(
+                    &base_snapshot_id,
+                    &staged.session_id,
+                    &session.trace_digest,
+                    &sentinel,
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("reserved prefix")
+        );
+        assert!(
+            store
+                .cancel_staged_runtime_session_import_for_operation(&sentinel)
+                .unwrap_err()
+                .to_string()
+                .contains("reserved prefix")
+        );
+
+        assert!(
+            store
+                .recover_runtime_session_import_for_operation(&RuntimeImportRecoveryIdentity::new(
+                    &staged.import_id,
+                    &staged.session_id,
+                    &staged.snapshot_id,
+                    &base_snapshot_id,
+                    &session.trace_digest,
+                    &session.status,
+                    &sentinel,
+                ))
+                .unwrap_err()
+                .to_string()
+                .contains("reserved prefix")
+        );
+        let promoted = store.recover_runtime_session_import_for_operation(
+            &RuntimeImportRecoveryIdentity::new(
+                &staged.import_id,
+                &staged.session_id,
+                &staged.snapshot_id,
+                &base_snapshot_id,
+                &session.trace_digest,
+                &session.status,
+                "op_pre_v16_recovery_intent",
+            ),
+        )?;
+        assert_eq!(promoted.snapshot_id, staged.snapshot_id);
+        assert_eq!(
+            store.connection.query_row(
+                "SELECT COUNT(*) FROM runtime_import_operation_owners",
+                [],
+                |row| row.get::<_, u64>(0),
+            )?,
+            0
+        );
         Ok(())
     }
 

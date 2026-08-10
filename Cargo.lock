@@ -500,6 +500,7 @@ dependencies = [
  "petgraph",
  "prost",
  "prost-types",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2",

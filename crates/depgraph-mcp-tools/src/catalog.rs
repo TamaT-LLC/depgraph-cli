@@ -12,9 +12,9 @@ use crate::{
     AgentId, AgentImpactResponse, AgentLabel, AgentLocator, AgentNamedSnapshot, AgentNode,
     AgentNodeSummary, AgentOperation, AgentPathResponse, AgentPolicyEvaluationResponse,
     AgentProfilePlan, AgentQueryRow, AgentRuntimeValidationResponse, AgentSite,
-    AgentSnapshotDiffResponse, AgentUnresolved, Cursor, ErrorEnvelope, LogicalRepositoryId,
-    MCP_TOOLS_CONTRACT_VERSION, OperationId, Page, PortableTerminalOutput, RepositoryRelativePath,
-    SnapshotId, SnapshotName, SuccessEnvelope,
+    AgentSnapshotDiffResponse, AgentUnresolved, Cursor, ErrorEnvelope, IdempotencyKey,
+    LogicalRepositoryId, MCP_TOOLS_CONTRACT_VERSION, OperationId, Page, PortableTerminalOutput,
+    RepositoryRelativePath, SnapshotId, SnapshotName, SuccessEnvelope,
 };
 
 #[allow(dead_code)]
@@ -614,7 +614,7 @@ const TOOL_SPECS: &[ToolSpec] = &[
     tool_spec!(
         "runtime_trace_import_submit",
         "Validate and import runtime trace evidence into the store.",
-        ["trace", "strict"],
+        ["idempotency_key", "trace", "trace_file", "snapshot"],
         [CliAction::RuntimeImport],
         STORE_WRITE,
         ToolAuthorization::FixedCapabilities,
@@ -722,7 +722,10 @@ fn input_schema(spec: &ToolSpec) -> Map<String, Value> {
                 ]),
             );
     }
-    if matches!(spec.name, "graph_query" | "runtime_trace_validate") {
+    if matches!(
+        spec.name,
+        "graph_query" | "runtime_trace_validate" | "runtime_trace_import_submit"
+    ) {
         let (inline, file) = if spec.name == "graph_query" {
             ("query", "query_file")
         } else {
@@ -998,12 +1001,7 @@ fn field_schema(tool_name: &str, field: &str) -> Value {
         }
         "cursor" => scalar_schema::<Cursor>(),
         "operation_id" => scalar_schema::<OperationId>(),
-        "idempotency_key" => json!({
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 256,
-            "pattern": "^[^\\u0000-\\u001f\\u007f-\\u009f]+$"
-        }),
+        "idempotency_key" => scalar_schema::<IdempotencyKey>(),
         "node_id" | "site_id" => scalar_schema::<AgentId>(),
         "selector" => scalar_schema::<AgentLocator>(),
         "from" | "to" if matches!(tool_name, "snapshot_diff_get" | "policy_evaluate") => {
@@ -1082,7 +1080,7 @@ fn required_input_fields(tool_name: &str) -> &'static [&'static str] {
         "graph_path_get" | "snapshot_diff_get" | "policy_evaluate" => &["from", "to"],
         "graph_export" => &["format"],
         "operation_get" | "operation_result" | "operation_cancel" => &["operation_id"],
-        "scan_submit" => &["idempotency_key"],
+        "scan_submit" | "runtime_trace_import_submit" => &["idempotency_key"],
         "snapshot_name_create" => &["name"],
         _ => &[],
     }

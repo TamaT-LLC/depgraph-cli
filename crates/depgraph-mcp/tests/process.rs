@@ -315,6 +315,33 @@ fn seed_issue_302_store(path: &Path, root: &Path) -> String {
     snapshot_id
 }
 
+fn issue_313_runtime_trace(session_id: &str) -> String {
+    json!({
+        "schema_version":"1.0",
+        "repository":{
+            "identity":"workspace:repository",
+            "revision":"revision-302"
+        },
+        "session":{
+            "id":session_id,
+            "started_at":"2026-08-08T00:00:00Z",
+            "ended_at":"2026-08-08T00:00:01Z",
+            "profile":{"language":"fixture","features":[]},
+            "environment":{"name":"test"},
+            "redaction":{"redacted_value_count":0}
+        },
+        "events":[{
+            "sequence":1,
+            "timestamp":"2026-08-08T00:00:00Z",
+            "dependency_kind":"imports",
+            "source":{"kind":"node","node_id":"node:a"},
+            "target":{"kind":"node","node_id":"node:b"},
+            "count":1
+        }]
+    })
+    .to_string()
+}
+
 fn issue_306_long_condition() -> Value {
     let values = (0..40)
         .map(|index| Value::String(format!("enabled-{index:02}")))
@@ -1033,7 +1060,11 @@ fn operation_service_config(
 }
 
 fn operation_journal_state_digest(config: &DepgraphServiceConfig) -> [u8; 32] {
-    let connection = Connection::open(operation_journal_path(config)).unwrap();
+    let connection = Connection::open_with_flags(
+        operation_journal_path(config),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .unwrap();
     let mut digest = Sha256::new();
     for query in [
         "SELECT * FROM operations ORDER BY operation_id",
@@ -1074,6 +1105,146 @@ fn operation_journal_state_digest(config: &DepgraphServiceConfig) -> [u8; 32] {
         }
     }
     digest.finalize().into()
+}
+
+type JournalSchemaRow = (String, String, String, Option<String>);
+type JournalSchemaState = (Vec<JournalSchemaRow>, u64, i64);
+
+fn operation_journal_schema_rows_and_version(path: &Path) -> JournalSchemaState {
+    let connection = Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .unwrap();
+    let schema = {
+        let mut statement = connection
+            .prepare(
+                "SELECT type, name, tbl_name, sql FROM sqlite_schema
+                  ORDER BY type, name, tbl_name",
+            )
+            .unwrap();
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    };
+    let tables = schema
+        .iter()
+        .filter(|(kind, name, _, _)| kind == "table" && !name.starts_with("sqlite_"))
+        .map(|(_, name, _, _)| name.clone())
+        .collect::<Vec<_>>();
+    let row_count = tables
+        .iter()
+        .map(|table| {
+            let quoted = table.replace('"', "\"\"");
+            connection
+                .query_row(&format!("SELECT COUNT(*) FROM \"{quoted}\""), [], |row| {
+                    row.get::<_, u64>(0)
+                })
+                .unwrap()
+        })
+        .sum();
+    let version = connection
+        .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+        .unwrap();
+    (schema, row_count, version)
+}
+
+fn downgrade_operation_journal_to_genuine_legacy(path: &Path, version: i64) {
+    assert!(matches!(version, 2 | 3));
+    let connection = Connection::open(path).unwrap();
+    connection
+        .execute_batch(
+            "PRAGMA journal_mode=DELETE;
+             ALTER TABLE operations DROP COLUMN retention_anchor_ms;",
+        )
+        .unwrap();
+    let operations_sql: String = connection
+        .query_row(
+            "SELECT sql FROM sqlite_schema WHERE type='table' AND name='operations'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let handoffs_sql: String = connection
+        .query_row(
+            "SELECT sql FROM sqlite_schema WHERE type='table' AND name='runner_handoffs'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let legacy_operations_sql = operations_sql.replace(
+        "typeof(input_json) = 'text' AND octet_length(input_json) <= 16777216",
+        "typeof(input_json) = 'text' AND octet_length(input_json) <= 1048576",
+    );
+    let legacy_handoffs_sql = handoffs_sql.replace(
+        "typeof(payload_json) = 'text' AND octet_length(payload_json) <= 16777216",
+        "typeof(payload_json) = 'text' AND octet_length(payload_json) <= 1048576",
+    );
+    assert_ne!(legacy_operations_sql, operations_sql);
+    assert_ne!(legacy_handoffs_sql, handoffs_sql);
+    connection
+        .execute_batch("PRAGMA writable_schema=ON;")
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE sqlite_schema SET sql=?1 WHERE type='table' AND name='operations'",
+            [&legacy_operations_sql],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE sqlite_schema SET sql=?1
+              WHERE type='table' AND name='runner_handoffs'",
+            [&legacy_handoffs_sql],
+        )
+        .unwrap();
+    connection
+        .execute_batch("PRAGMA writable_schema=OFF;")
+        .unwrap();
+    if version == 2 {
+        connection
+            .execute_batch("DROP TABLE operation_completion_intents;")
+            .unwrap();
+    }
+    connection
+        .pragma_update(None, "user_version", version)
+        .unwrap();
+    connection.execute_batch("VACUUM;").unwrap();
+}
+
+fn sqlite_user_version(path: &Path) -> i64 {
+    Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .unwrap()
+    .query_row("PRAGMA user_version", [], |row| row.get(0))
+    .unwrap()
+}
+
+fn downgrade_issue_313_store_to_v15(path: &Path) {
+    let connection = Connection::open(path).unwrap();
+    connection
+        .execute_batch(
+            "PRAGMA journal_mode=DELETE;
+             DROP TABLE scan_operation_staging;
+             DROP TABLE runtime_import_operation_owners;
+             PRAGMA user_version=15;
+             VACUUM;",
+        )
+        .unwrap();
+    drop(connection);
+    assert_eq!(sqlite_user_version(path), 15);
+    assert!(Store::open_read_only(path).is_err());
 }
 
 fn issue_310_daemon_status() -> AgentDaemonStatus {
@@ -3888,6 +4059,398 @@ fn issue_312_scan_submit_is_quick_durable_recoverable_and_snapshot_naming_is_clo
     assert_eq!(duplicate["structuredContent"]["error"]["code"], "CONFLICT");
     naming.finish();
     assert_eq!(source_tree_digest(&root), before_source);
+}
+
+#[test]
+fn issue_313_v2_runtime_replay_migrates_only_after_complete_prevalidation() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("repository");
+    let store_path = temporary.path().join("graph.sqlite");
+    fs::create_dir_all(root.join("traces")).unwrap();
+    let base_snapshot_id = seed_issue_302_store(&store_path, &root);
+    let valid_trace = issue_313_runtime_trace("issue-313-old-journal-session");
+    let config = operation_service_config(
+        &root,
+        &store_path,
+        [DepgraphCapability::Read, DepgraphCapability::StoreWrite],
+    );
+    let service = depgraph_core::service::DepgraphService::new(config.clone());
+    let durable_input = service
+        .prepare_runtime_import(
+            &depgraph_core::service::RuntimeValidateRequest {
+                trace: Some(valid_trace.clone()),
+                trace_file: None,
+                snapshot: depgraph_core::service::ServiceSnapshotSelector::Locator(
+                    depgraph_core::service::SnapshotLocator::StableId(base_snapshot_id.clone()),
+                ),
+            },
+            &depgraph_core::CancellationToken::new(),
+        )
+        .unwrap()
+        .durable_input();
+    let now_ms = process_now_ms();
+    let mut manager = OperationManager::open(&config).unwrap();
+    manager
+        .submit(
+            &SubmitRequest::new(
+                &config,
+                OperationKind::RuntimeTraceImportSubmit,
+                &durable_input,
+                b"issue-313-existing-v2-binding",
+                now_ms + 30_000,
+            )
+            .unwrap(),
+            now_ms,
+        )
+        .unwrap();
+    drop(manager);
+
+    let journal_path = operation_journal_path(&config);
+    downgrade_operation_journal_to_genuine_legacy(journal_path.as_path(), 2);
+    let before_bytes = fs::read(journal_path.as_path()).unwrap();
+    let before_rows = operation_journal_state_digest(&config);
+    let before_schema = operation_journal_schema_rows_and_version(journal_path.as_path());
+    assert_eq!(before_schema.2, 2);
+    downgrade_issue_313_store_to_v15(&store_path);
+    let before_store_bytes = fs::read(&store_path).unwrap();
+    assert_eq!(sqlite_user_version(&store_path), 15);
+
+    fs::write(
+        root.join("traces/secret.json"),
+        r#"{"authorization":"Bearer file-secret"}"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("traces/oversized.json"),
+        vec![b' '; depgraph_core::RUNTIME_TRACE_MAX_BYTES + 1],
+    )
+    .unwrap();
+    for (request_id, source, expected_code) in [
+        (2_u64, json!({"trace":"{"}), "INVALID_ARGUMENT"),
+        (
+            3_u64,
+            json!({"trace_file":"traces/secret.json"}),
+            "INVALID_ARGUMENT",
+        ),
+        (
+            4_u64,
+            json!({"trace_file":"traces/oversized.json"}),
+            "RESOURCE_EXHAUSTED",
+        ),
+        (
+            5_u64,
+            json!({"trace_file":"../outside.json"}),
+            "INVALID_ARGUMENT",
+        ),
+    ] {
+        let mut arguments = json!({
+            "contract_version":"depgraph-mcp-tools-v1",
+            "repository_id":"repository",
+            "idempotency_key":"issue-313-existing-v2-binding",
+            "snapshot":base_snapshot_id
+        });
+        arguments
+            .as_object_mut()
+            .unwrap()
+            .extend(source.as_object().unwrap().clone());
+        let mut invalid =
+            InteractiveMcp::start_with_capabilities(&root, &store_path, &["store-write"]);
+        initialize_interactive_mcp(&mut invalid, request_id * 10);
+        let rejected = interactive_tool_call(
+            &mut invalid,
+            request_id * 10 + 1,
+            "runtime_trace_import_submit",
+            arguments,
+        );
+        assert_eq!(
+            rejected["structuredContent"]["error"]["code"],
+            expected_code
+        );
+        invalid.finish();
+
+        assert_eq!(fs::read(journal_path.as_path()).unwrap(), before_bytes);
+        assert_eq!(operation_journal_state_digest(&config), before_rows);
+        assert_eq!(
+            operation_journal_schema_rows_and_version(journal_path.as_path()),
+            before_schema
+        );
+        assert_eq!(fs::read(&store_path).unwrap(), before_store_bytes);
+        assert_eq!(sqlite_user_version(&store_path), 15);
+    }
+
+    let mut valid = InteractiveMcp::start_with_capabilities(&root, &store_path, &["store-write"]);
+    initialize_interactive_mcp(&mut valid, 60);
+    let replayed = interactive_tool_call(
+        &mut valid,
+        61,
+        "runtime_trace_import_submit",
+        json!({
+            "contract_version":"depgraph-mcp-tools-v1",
+            "repository_id":"repository",
+            "idempotency_key":"issue-313-existing-v2-binding",
+            "trace":valid_trace,
+            "snapshot":base_snapshot_id
+        }),
+    );
+    assert!(replayed["structuredContent"]["operation_id"].is_string());
+    valid.finish();
+
+    assert_eq!(sqlite_user_version(journal_path.as_path()), 4);
+    assert_eq!(sqlite_user_version(&store_path), 17);
+}
+
+#[test]
+fn issue_313_valid_new_runtime_submit_migrates_genuine_v3_after_absence_lookup() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("repository");
+    let store_path = temporary.path().join("graph.sqlite");
+    fs::create_dir_all(&root).unwrap();
+    let base_snapshot_id = seed_issue_302_store(&store_path, &root);
+    let config = operation_service_config(
+        &root,
+        &store_path,
+        [DepgraphCapability::Read, DepgraphCapability::StoreWrite],
+    );
+    let now_ms = process_now_ms();
+    let mut journal = OperationJournal::open(&config).unwrap();
+    let old_operation = journal
+        .submit(
+            &SubmitRequest::new(
+                &config,
+                OperationKind::ScanSubmit,
+                &json!({"strict": false, "no_cache": true}),
+                b"issue-313-retained-v3-row",
+                now_ms + 30_000,
+            )
+            .unwrap(),
+            now_ms,
+        )
+        .unwrap()
+        .operation_id()
+        .clone();
+    journal
+        .acquire_lease(
+            &LogicalRepositoryId::parse(config.logical_repository_id()).unwrap(),
+            &old_operation,
+            &LeaseOwner::parse("issue-313-v3-fixture").unwrap(),
+            b"issue-313-v3-fixture-lease",
+            now_ms + 1,
+            now_ms + 30_000,
+        )
+        .unwrap();
+    journal
+        .complete(
+            &LogicalRepositoryId::parse(config.logical_repository_id()).unwrap(),
+            &old_operation,
+            b"issue-313-v3-fixture-lease",
+            CanonicalJson::new(json!({"fixture": "retained-v3-terminal"})).unwrap(),
+            now_ms + 2,
+        )
+        .unwrap();
+    let journal_path = journal.path().to_path_buf();
+    drop(journal);
+    downgrade_operation_journal_to_genuine_legacy(&journal_path, 3);
+    downgrade_issue_313_store_to_v15(&store_path);
+    assert_eq!(sqlite_user_version(&journal_path), 3);
+    assert_eq!(sqlite_user_version(&store_path), 15);
+
+    let mut submit = InteractiveMcp::start_with_capabilities(&root, &store_path, &["store-write"]);
+    initialize_interactive_mcp(&mut submit, 70);
+    let accepted = interactive_tool_call(
+        &mut submit,
+        71,
+        "runtime_trace_import_submit",
+        json!({
+            "contract_version":"depgraph-mcp-tools-v1",
+            "repository_id":"repository",
+            "idempotency_key":"issue-313-new-v3-runtime",
+            "trace":issue_313_runtime_trace("issue-313-new-v3-runtime"),
+            "snapshot":base_snapshot_id
+        }),
+    );
+    assert!(accepted["structuredContent"]["operation_id"].is_string());
+    submit.finish();
+    assert_eq!(sqlite_user_version(&journal_path), 4);
+    assert_eq!(sqlite_user_version(&store_path), 17);
+}
+
+#[test]
+fn issue_313_invalid_submit_scalars_cannot_create_a_journal_or_migrate_the_store() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("repository");
+    let store_path = temporary.path().join("graph.sqlite");
+    fs::create_dir_all(&root).unwrap();
+    let base_snapshot_id = seed_issue_302_store(&store_path, &root);
+    let config = operation_service_config(
+        &root,
+        &store_path,
+        [DepgraphCapability::Read, DepgraphCapability::StoreWrite],
+    );
+    let journal_path = operation_journal_path(&config);
+    assert!(!journal_path.as_path().exists());
+    downgrade_issue_313_store_to_v15(&store_path);
+    let before_store_bytes = fs::read(&store_path).unwrap();
+    let valid_trace = issue_313_runtime_trace("issue-313-invalid-scalars");
+    let cases = [
+        ("".to_owned(), base_snapshot_id.clone()),
+        ("x".repeat(257), base_snapshot_id.clone()),
+        ("has\u{0000}control".to_owned(), base_snapshot_id.clone()),
+        ("valid-key".to_owned(), "not a snapshot".to_owned()),
+    ];
+
+    for (index, (idempotency_key, snapshot)) in cases.into_iter().enumerate() {
+        let request_id = u64::try_from(index).unwrap() * 10 + 1;
+        let mut invalid =
+            InteractiveMcp::start_with_capabilities(&root, &store_path, &["store-write"]);
+        initialize_interactive_mcp(&mut invalid, request_id);
+        let rejected = interactive_tool_call(
+            &mut invalid,
+            request_id + 1,
+            "runtime_trace_import_submit",
+            json!({
+                "contract_version":"depgraph-mcp-tools-v1",
+                "repository_id":"repository",
+                "idempotency_key":idempotency_key,
+                "trace":valid_trace,
+                "snapshot":snapshot
+            }),
+        );
+        assert_eq!(
+            rejected["structuredContent"]["error"]["code"],
+            "INVALID_ARGUMENT"
+        );
+        invalid.finish();
+        assert!(!journal_path.as_path().exists());
+        assert_eq!(fs::read(&store_path).unwrap(), before_store_bytes);
+        assert_eq!(sqlite_user_version(&store_path), 15);
+    }
+}
+
+#[test]
+fn issue_313_runtime_import_is_prevalidated_idempotent_durable_and_closed() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("repository");
+    let store_path = temporary.path().join("graph.sqlite");
+    fs::create_dir_all(root.join("traces")).unwrap();
+    let base_snapshot_id = seed_issue_302_store(&store_path, &root);
+    fs::write(
+        root.join("traces/runtime.json"),
+        issue_313_runtime_trace("issue-313-session"),
+    )
+    .unwrap();
+    let config = operation_service_config(
+        &root,
+        &store_path,
+        [DepgraphCapability::Read, DepgraphCapability::StoreWrite],
+    );
+    let before_invalid = store_invariant(&store_path);
+    let journal_path = operation_journal_path(&config);
+    assert!(!journal_path.as_path().exists());
+
+    let mut invalid = InteractiveMcp::start_with_capabilities(&root, &store_path, &["store-write"]);
+    initialize_interactive_mcp(&mut invalid, 1);
+    let rejected = interactive_tool_call(
+        &mut invalid,
+        2,
+        "runtime_trace_import_submit",
+        json!({
+            "contract_version":"depgraph-mcp-tools-v1",
+            "repository_id":"repository",
+            "idempotency_key":"issue-313-invalid",
+            "trace":"{\"authorization\":\"Bearer process-secret\"}",
+            "snapshot":base_snapshot_id
+        }),
+    );
+    assert_eq!(
+        rejected["structuredContent"]["error"]["code"],
+        "INVALID_ARGUMENT"
+    );
+    invalid.finish();
+    assert_eq!(store_invariant(&store_path), before_invalid);
+    assert!(!journal_path.as_path().exists());
+
+    downgrade_issue_313_store_to_v15(&store_path);
+
+    let mut submit = InteractiveMcp::start_with_capabilities(&root, &store_path, &["store-write"]);
+    initialize_tasks_mcp(&mut submit, 10, "2026-07-28", true);
+    let arguments = json!({
+        "contract_version":"depgraph-mcp-tools-v1",
+        "repository_id":"repository",
+        "idempotency_key":"issue-313-runtime-import",
+        "trace_file":"traces/runtime.json"
+    });
+    let accepted = submit.request(json!({
+        "jsonrpc":"2.0","id":11,"method":"tools/call",
+        "params":{"name":"runtime_trace_import_submit","arguments":arguments}
+    }));
+    let task_id = accepted["result"]["taskId"].as_str().unwrap().to_owned();
+    assert_eq!(sqlite_user_version(&store_path), 17);
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let terminal = loop {
+        let mut reconnected =
+            InteractiveMcp::start_with_capabilities(&root, &store_path, &["store-write"]);
+        initialize_tasks_mcp(&mut reconnected, 20, "2026-07-28", true);
+        let status = reconnected.request(json!({
+            "jsonrpc":"2.0","id":21,"method":"tasks/get",
+            "params":{"taskId":task_id}
+        }));
+        reconnected.finish();
+        if status["result"]["status"] == "completed" {
+            break status;
+        }
+        assert_ne!(
+            status["result"]["status"], "failed",
+            "runtime import failed: {status}"
+        );
+        assert_ne!(status["result"]["status"], "cancelled");
+        assert!(Instant::now() < deadline, "runtime import did not complete");
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    let replay = submit.request(json!({
+        "jsonrpc":"2.0","id":12,"method":"tools/call",
+        "params":{"name":"runtime_trace_import_submit","arguments":arguments}
+    }));
+    assert_eq!(replay["result"]["taskId"], task_id);
+    submit.finish();
+    let structured = &terminal["result"]["result"]["structuredContent"];
+    assert_eq!(structured["result"]["status"], "completed");
+    assert_eq!(structured["result"]["deduplicated"], false);
+    assert!(
+        structured["result"]["import_id"]
+            .as_str()
+            .unwrap()
+            .starts_with("runtime-import:sha256:")
+    );
+    assert!(
+        structured["result"]["session_id"]
+            .as_str()
+            .unwrap()
+            .starts_with("runtime-session:sha256:")
+    );
+    assert_eq!(
+        structured["snapshot_id"],
+        structured["result"]["snapshot_id"]
+    );
+    assert_eq!(
+        Store::open_read_only(&store_path)
+            .unwrap()
+            .current_snapshot_id()
+            .unwrap()
+            .as_deref(),
+        structured["snapshot_id"].as_str()
+    );
+
+    let mut terminal_replay =
+        InteractiveMcp::start_with_capabilities(&root, &store_path, &["store-write"]);
+    initialize_tasks_mcp(&mut terminal_replay, 30, "2026-07-28", true);
+    let replay = terminal_replay.request(json!({
+        "jsonrpc":"2.0","id":31,"method":"tools/call",
+        "params":{"name":"runtime_trace_import_submit","arguments":arguments}
+    }));
+    terminal_replay.finish();
+    assert_eq!(replay["result"]["taskId"], task_id);
+    assert_eq!(replay["result"]["status"], "completed");
 }
 
 #[test]

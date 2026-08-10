@@ -8,6 +8,7 @@ use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 
 pub const MAX_LOGICAL_REPOSITORY_ID_BYTES: usize = 128;
+pub const MAX_IDEMPOTENCY_KEY_CHARS: usize = 256;
 pub const MAX_CURSOR_BYTES: usize = 4_096;
 pub const MAX_OPERATION_ID_HEX_BYTES: usize = 128;
 pub const MAX_AGENT_ID_BYTES: usize = 256;
@@ -28,6 +29,8 @@ pub enum ContractValueError {
     Cursor,
     #[error("operation id is outside the closed contract")]
     OperationId,
+    #[error("idempotency key is outside the closed contract")]
+    IdempotencyKey,
     #[error("snapshot name is outside the closed contract")]
     SnapshotName,
     #[error("snapshot id is outside the closed contract")]
@@ -158,6 +161,18 @@ string_newtype!(
     json_schema!({
         "type": "string",
         "pattern": r"^op_[0-9a-f]{32,128}$"
+    })
+);
+
+string_newtype!(
+    IdempotencyKey,
+    ContractValueError::IdempotencyKey,
+    valid_idempotency_key,
+    json_schema!({
+        "type": "string",
+        "minLength": 1,
+        "maxLength": MAX_IDEMPOTENCY_KEY_CHARS,
+        "pattern": r"^[^\u0000-\u001f\u007f-\u009f]+$"
     })
 );
 
@@ -597,6 +612,12 @@ fn valid_operation_id(value: &str) -> bool {
                 .bytes()
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     })
+}
+
+fn valid_idempotency_key(value: &str) -> bool {
+    !value.is_empty()
+        && value.chars().count() <= MAX_IDEMPOTENCY_KEY_CHARS
+        && !value.chars().any(char::is_control)
 }
 
 fn valid_snapshot_name(value: &str) -> bool {

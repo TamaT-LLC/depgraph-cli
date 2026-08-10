@@ -331,6 +331,23 @@ fn runtime_validate_accepts_only_one_bounded_source_and_mutates_nothing() -> Res
     assert_eq!(store_before, digest(&store_path));
     assert_eq!(trace_before, digest(&root.join("trace.json")));
 
+    let file_source = runtime_request(None, Some("trace.json")).source();
+    let prevalidated =
+        service.prevalidate_runtime_trace_source(&file_source, &CancellationToken::new())?;
+    fs::write(
+        root.join("trace.json"),
+        trace().replace("session-304", "session-304-drift"),
+    )?;
+    assert!(matches!(
+        service.revalidate_runtime_trace_source(
+            &file_source,
+            &prevalidated,
+            &CancellationToken::new()
+        ),
+        Err(DepgraphServiceError::Conflict)
+    ));
+    fs::write(root.join("trace.json"), trace())?;
+
     fs::write(
         root.join("oversize.trace"),
         vec![b' '; RUNTIME_TRACE_MAX_BYTES + 1],
@@ -364,6 +381,50 @@ fn runtime_validate_accepts_only_one_bounded_source_and_mutates_nothing() -> Res
         );
     }
     assert_eq!(store_before, digest(&store_path));
+    Ok(())
+}
+
+#[test]
+fn retained_normalized_runtime_trace_has_explicit_bound_and_exact_form() -> Result<()> {
+    let temporary = tempfile::tempdir()?;
+    let root = temporary.path().join("repository");
+    fs::create_dir(&root)?;
+    let missing_store = temporary.path().join("missing.sqlite");
+    let service = service(&root, &missing_store)?;
+    let source = runtime_request(Some(trace()), None).source();
+    let public = service.prevalidate_runtime_trace_source(&source, &CancellationToken::new())?;
+    let normalized = serde_json::to_value(depgraph_core::read_runtime_trace(trace().as_bytes())?)?;
+    let retained_bytes = serde_json::to_vec(&normalized)?.len();
+
+    let retained = service.prevalidate_retained_normalized_runtime_trace(
+        &normalized,
+        retained_bytes,
+        &CancellationToken::new(),
+    )?;
+    assert_eq!(retained.input_digest(), public.input_digest());
+    assert!(matches!(
+        service.prevalidate_retained_normalized_runtime_trace(
+            &normalized,
+            retained_bytes - 1,
+            &CancellationToken::new()
+        ),
+        Err(DepgraphServiceError::ResourceExhausted)
+    ));
+
+    let mut denormalized = normalized;
+    denormalized["events"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("redaction");
+    assert!(matches!(
+        service.prevalidate_retained_normalized_runtime_trace(
+            &denormalized,
+            retained_bytes,
+            &CancellationToken::new()
+        ),
+        Err(DepgraphServiceError::Integrity)
+    ));
+    assert!(!missing_store.exists());
     Ok(())
 }
 
