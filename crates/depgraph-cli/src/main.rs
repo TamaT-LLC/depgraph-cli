@@ -11,8 +11,9 @@ use depgraph_core::service::{
     BoundedQueryMode, BoundedQueryRequest, CompletedSnapshotView, CyclesRequest,
     DependenciesRequest, DependencyDirection, DepgraphCapability, DepgraphCapabilitySet,
     DepgraphService, DepgraphServiceConfig, DepgraphServiceError, DepgraphServiceLimits,
-    DoctorRequest, ExplainPathRequest, GraphExportFormat, GraphExportRequest, ImpactRequest,
-    MAX_GRAPH_EXPORT_EDGES, MAX_GRAPH_EXPORT_NODES, PolicyEvaluateRequest, ProfilePlanRequest,
+    DoctorRequest, ExplainPathRequest, ExportFileRequest, GraphExportFormat, GraphExportRequest,
+    ImpactRequest, MAX_GRAPH_EXPORT_EDGES, MAX_GRAPH_EXPORT_NODES, PolicyEvaluateRequest,
+    ProfilePlanRequest, RepositoryFileError, RepositoryInitRequest, RepositoryOverwritePolicy,
     RepositoryRelativePath, RuntimeValidateRequest, ScanRequest, ServiceSnapshotSelector,
     SnapshotDiffFilters, SnapshotDiffRequest, SnapshotLocator, SnapshotNameCreateRequest,
     SnapshotNameCreateSelector, SnapshotReadRequest, UnresolvedRequest,
@@ -28,7 +29,7 @@ use depgraph_core::{
     compiler_precise_cache_key, compiler_precise_graph_ndjson, create_build_execution_request,
     create_compiler_precise_invocation_request, create_compiler_precise_unit_graph_request,
     default_store_path, execute_build_request_with_cancellation, export_filtered,
-    export_graphml_filtered_to_writer, init_config, open_store, paginate_interactive_query,
+    export_graphml_filtered_to_writer, open_store, paginate_interactive_query,
     prepare_build_cache_input, prepare_compiler_precise_cache_input,
     profile_selection_human_summary, read_compiler_pack_requirement, render_condition,
     render_github_annotations, rust_build_protocol_ndjson, snapshot_profile_plan_id,
@@ -660,8 +661,22 @@ async fn run(cli: Cli) -> Result<u8> {
     match cli.command {
         Commands::Init { path, force } => {
             let root = canonical_directory(path)?;
-            let path = init_config(&root, force)?;
-            println!("initialized {}", path.display());
+            let store_path = store_path(cli.store, &root)?;
+            let service = repository_write_service(&root, &store_path)?;
+            let initialized = match service.repository_init(
+                &RepositoryInitRequest::new(force),
+                &CancellationToken::new(),
+            ) {
+                Ok(initialized) => initialized,
+                Err(DepgraphServiceError::RepositoryFile {
+                    reason: RepositoryFileError::AlreadyExists,
+                }) => anyhow::bail!(".depgraph.toml already exists; use --force to overwrite"),
+                Err(error) => return Err(error.into()),
+            };
+            println!(
+                "initialized {}",
+                root.join(initialized.output_path().as_str()).display()
+            );
             Ok(0)
         }
         Commands::Scan {
@@ -2107,10 +2122,14 @@ async fn run(cli: Cli) -> Result<u8> {
                 ExportFormatArg::Mermaid => ExportFormat::Mermaid,
                 ExportFormatArg::Graphml => ExportFormat::Graphml,
             };
-            if output.is_none() {
+            {
                 let root = canonical_directory(std::env::current_dir()?)?;
                 let store_path = store_path(cli.store.clone(), &root)?;
-                let service = snapshot_read_service(&root, &store_path)?;
+                let service = if output.is_some() {
+                    repository_write_service(&root, &store_path)?
+                } else {
+                    snapshot_read_service(&root, &store_path)?
+                };
                 let snapshot = if let Some(scan_id) = cli.scan_id.as_deref() {
                     match service
                         .start_snapshot_request_for_scan(scan_id, &CancellationToken::new())
@@ -2143,18 +2162,45 @@ async fn run(cli: Cli) -> Result<u8> {
                         MAX_GRAPH_EXPORT_NODES,
                         MAX_GRAPH_EXPORT_EDGES,
                     )?;
-                    let rendered = service.graph_export(&request, &CancellationToken::new())?;
-                    print!("{}", rendered.content);
+                    if let Some(output) = output.as_ref() {
+                        let output_path = normalize_cli_repository_output(&root, output)?;
+                        service.export_file(
+                            &ExportFileRequest::raw_compatible(
+                                request,
+                                output_path,
+                                RepositoryOverwritePolicy::Overwrite,
+                            ),
+                            &CancellationToken::new(),
+                        )?;
+                    } else {
+                        let rendered = service.graph_export(&request, &CancellationToken::new())?;
+                        print!("{}", rendered.content);
+                    }
                     return Ok(0);
                 }
             }
-            let (snapshot, _) = load_snapshot(cli.store, cli.scan_id.as_deref(), false)?;
+            let (snapshot, _) = load_snapshot(cli.store.clone(), cli.scan_id.as_deref(), false)?;
+            let service_format = match format {
+                ExportFormat::Json => GraphExportFormat::Json,
+                ExportFormat::Dot => GraphExportFormat::Dot,
+                ExportFormat::Mermaid => GraphExportFormat::Mermaid,
+                ExportFormat::Graphml => GraphExportFormat::Graphml,
+            };
             if format == ExportFormat::Graphml {
-                if let Some(path) = output {
-                    write_file_atomically(&path, |writer| {
-                        let mut writer = writer;
-                        export_graphml_filtered_to_writer(&snapshot, &filter, &mut writer)
-                    })?;
+                if let Some(path) = output.as_ref() {
+                    let root = canonical_directory(std::env::current_dir()?)?;
+                    let store_path = store_path(cli.store.clone(), &root)?;
+                    let service = repository_write_service(&root, &store_path)?;
+                    let output_path = normalize_cli_repository_output(&root, path)?;
+                    let mut rendered = Vec::new();
+                    export_graphml_filtered_to_writer(&snapshot, &filter, &mut rendered)?;
+                    service.export_rendered_file(
+                        &output_path,
+                        RepositoryOverwritePolicy::Overwrite,
+                        service_format,
+                        &rendered,
+                        &CancellationToken::new(),
+                    )?;
                 } else {
                     let stdout = std::io::stdout();
                     let mut writer = stdout.lock();
@@ -2166,9 +2212,18 @@ async fn run(cli: Cli) -> Result<u8> {
                 return Ok(0);
             }
             let rendered = export_filtered(&snapshot, format, &filter)?;
-            if let Some(path) = output {
-                std::fs::write(&path, rendered)
-                    .with_context(|| format!("failed to write {}", path.display()))?;
+            if let Some(path) = output.as_ref() {
+                let root = canonical_directory(std::env::current_dir()?)?;
+                let store_path = store_path(cli.store, &root)?;
+                let service = repository_write_service(&root, &store_path)?;
+                let output_path = normalize_cli_repository_output(&root, path)?;
+                service.export_rendered_file(
+                    &output_path,
+                    RepositoryOverwritePolicy::Overwrite,
+                    service_format,
+                    rendered.as_bytes(),
+                    &CancellationToken::new(),
+                )?;
             } else {
                 print!("{rendered}");
             }
@@ -2177,6 +2232,7 @@ async fn run(cli: Cli) -> Result<u8> {
     }
 }
 
+#[cfg(test)]
 fn write_file_atomically(
     path: &Path,
     write_contents: impl FnOnce(&mut dyn Write) -> Result<()>,
@@ -2321,6 +2377,13 @@ fn repository_relative_cli_input(
         .to_str()
         .ok_or(DepgraphServiceError::InvalidInput)?;
     RepositoryRelativePath::parse(supplied)
+}
+
+fn normalize_cli_repository_output(
+    _canonical_root: &Path,
+    supplied: &Path,
+) -> std::result::Result<RepositoryRelativePath, DepgraphServiceError> {
+    repository_relative_cli_input(supplied)
 }
 
 fn cli_snapshot_selector(scan_id: Option<String>) -> ServiceSnapshotSelector {
@@ -3162,6 +3225,20 @@ fn store_write_service(root: &Path, store_path: &Path) -> Result<DepgraphService
         root,
         &store_path,
         DepgraphCapabilitySet::try_new([DepgraphCapability::Read, DepgraphCapability::StoreWrite])?,
+        DepgraphServiceLimits::default(),
+    )?;
+    Ok(DepgraphService::new(config))
+}
+
+fn repository_write_service(root: &Path, store_path: &Path) -> Result<DepgraphService> {
+    let store_path = std::path::absolute(store_path).context("store path is unavailable")?;
+    let config = DepgraphServiceConfig::new(
+        root,
+        &store_path,
+        DepgraphCapabilitySet::try_new([
+            DepgraphCapability::Read,
+            DepgraphCapability::RepositoryWrite,
+        ])?,
         DepgraphServiceLimits::default(),
     )?;
     Ok(DepgraphService::new(config))

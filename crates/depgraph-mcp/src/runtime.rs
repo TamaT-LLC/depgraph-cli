@@ -284,6 +284,12 @@ pub struct RuntimeController {
     submit_rate: Arc<TokenBucket>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BlockingSettlement {
+    ReturnOnSignal,
+    SettleWorker,
+}
+
 impl RuntimeController {
     pub fn new(config: RuntimeConfig) -> Result<Self, RuntimeConfigurationError> {
         config.validate()?;
@@ -340,6 +346,49 @@ impl RuntimeController {
         E: Send + 'static,
         F: FnOnce(CancellationToken) -> Result<T, E> + Send + 'static,
     {
+        self.execute_blocking_with_settlement(
+            class,
+            cancellation,
+            BlockingSettlement::ReturnOnSignal,
+            operation,
+        )
+        .await
+    }
+
+    /// Execute an irreversible mutation and settle the blocking worker after
+    /// cancellation or deadline notification so a committed success is not
+    /// rewritten as a transport-level failure.
+    pub async fn execute_mutation_blocking<T, E, F>(
+        &self,
+        cancellation: CancellationToken,
+        operation: F,
+    ) -> Result<Result<T, E>, RuntimeFailure>
+    where
+        T: Send + 'static,
+        E: Send + 'static,
+        F: FnOnce(CancellationToken) -> Result<T, E> + Send + 'static,
+    {
+        self.execute_blocking_with_settlement(
+            RuntimeClass::Submit,
+            cancellation,
+            BlockingSettlement::SettleWorker,
+            operation,
+        )
+        .await
+    }
+
+    async fn execute_blocking_with_settlement<T, E, F>(
+        &self,
+        class: RuntimeClass,
+        cancellation: CancellationToken,
+        settlement: BlockingSettlement,
+        operation: F,
+    ) -> Result<Result<T, E>, RuntimeFailure>
+    where
+        T: Send + 'static,
+        E: Send + 'static,
+        F: FnOnce(CancellationToken) -> Result<T, E> + Send + 'static,
+    {
         if cancellation.is_cancelled() {
             return Err(RuntimeFailure::Cancelled);
         }
@@ -389,11 +438,23 @@ impl RuntimeController {
             biased;
             () = cancellation.cancelled() => {
                 cancellation.cancel();
-                Err(RuntimeFailure::Cancelled)
+                if settlement == BlockingSettlement::SettleWorker {
+                    let joined = (&mut worker).await;
+                    cancellation_on_drop.disarm();
+                    joined.map_err(|_| RuntimeFailure::WorkerFailed)
+                } else {
+                    Err(RuntimeFailure::Cancelled)
+                }
             }
             () = tokio::time::sleep_until(deadline_at) => {
                 cancellation.cancel();
-                Err(RuntimeFailure::DeadlineExceeded)
+                if settlement == BlockingSettlement::SettleWorker {
+                    let joined = (&mut worker).await;
+                    cancellation_on_drop.disarm();
+                    joined.map_err(|_| RuntimeFailure::WorkerFailed)
+                } else {
+                    Err(RuntimeFailure::DeadlineExceeded)
+                }
             }
             joined = &mut worker => {
                 cancellation_on_drop.disarm();

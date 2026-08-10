@@ -253,12 +253,17 @@ impl Runner<'_> {
 
     fn export_text(&self, store: &Path, format: &str) -> Result<String> {
         let output_path = store.with_extension(format!("export.{format}"));
+        let output_argument = output_path
+            .strip_prefix(self.neutral_cwd)
+            .with_context(|| {
+                format!("Rust semantic {format} export path is outside the repository root")
+            })?;
         let mut command = self.command();
         command
             .arg("--store")
             .arg(store)
             .args(["export", "--format", format, "--output"])
-            .arg(&output_path);
+            .arg(output_argument);
         checked_output(&mut command, &format!("export the Rust graph as {format}"))?;
         std::fs::read_to_string(&output_path).with_context(|| {
             format!(

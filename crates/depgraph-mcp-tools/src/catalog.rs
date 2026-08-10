@@ -11,8 +11,8 @@ use crate::{
     AgentDependenciesResponse, AgentDoctor, AgentEdge, AgentEvidence, AgentGraphExportResponse,
     AgentId, AgentImpactResponse, AgentLabel, AgentLocator, AgentNamedSnapshot, AgentNode,
     AgentNodeSummary, AgentOperation, AgentPathResponse, AgentPolicyEvaluationResponse,
-    AgentProfilePlan, AgentQueryRow, AgentRuntimeValidationResponse, AgentSite,
-    AgentSnapshotDiffResponse, AgentUnresolved, Cursor, ErrorEnvelope, IdempotencyKey,
+    AgentProfilePlan, AgentQueryRow, AgentRepositoryInitOutcome, AgentRuntimeValidationResponse,
+    AgentSite, AgentSnapshotDiffResponse, AgentUnresolved, Cursor, ErrorEnvelope, IdempotencyKey,
     LogicalRepositoryId, MCP_TOOLS_CONTRACT_VERSION, OperationId, Page, PortableTerminalOutput,
     RepositoryRelativePath, SnapshotId, SnapshotName, SuccessEnvelope,
 };
@@ -630,6 +630,24 @@ const TOOL_SPECS: &[ToolSpec] = &[
         OperationBehavior::Immediate
     ),
     tool_spec!(
+        "export_file",
+        "Render a bounded graph export to a confined repository-relative file.",
+        [
+            "idempotency_key",
+            "output_path",
+            "overwrite",
+            "format",
+            "snapshot",
+            "selector",
+            "max_nodes",
+            "max_edges"
+        ],
+        [],
+        REPOSITORY_WRITE,
+        ToolAuthorization::FixedCapabilities,
+        OperationBehavior::AlwaysCreatesDurableOperation
+    ),
+    tool_spec!(
         "daemon_start_submit",
         "Start the repository daemon with store-write and daemon-control consent.",
         ["strict"],
@@ -809,6 +827,9 @@ fn output_schema(spec: &ToolSpec) -> Map<String, Value> {
         }
         "graph_export" => {
             return exact_success_output_schema::<AgentGraphExportResponse>(spec.name);
+        }
+        "repository_init" => {
+            return exact_success_output_schema::<AgentRepositoryInitOutcome>(spec.name);
         }
         "operation_get" | "operation_cancel" => {
             return exact_success_output_schema::<AgentOperation>(spec.name);
@@ -1012,10 +1033,16 @@ fn field_schema(tool_name: &str, field: &str) -> Value {
         "level" => scalar_schema::<AgentCycleLevel>(),
         "name" => scalar_schema::<SnapshotName>(),
         "snapshot" => snapshot_selector_schema(),
-        "format" if tool_name == "graph_export" => {
+        "format" if matches!(tool_name, "graph_export" | "export_file") => {
             json!({"type": "string", "enum": ["json", "dot", "mermaid", "graphml"]})
         }
-        "strict" | "no_cache" | "force" | "details" | "rust_compiler_precise" | "transitive" => {
+        "strict"
+        | "no_cache"
+        | "force"
+        | "overwrite"
+        | "details"
+        | "rust_compiler_precise"
+        | "transitive" => {
             json!({"type": "boolean"})
         }
         "profile_budget" => json!({"type": "integer", "minimum": 1, "maximum": 32}),
@@ -1023,10 +1050,10 @@ fn field_schema(tool_name: &str, field: &str) -> Value {
         "limit" | "max_depth" | "max_paths" => {
             json!({"type": "integer", "minimum": 1})
         }
-        "max_nodes" if tool_name == "graph_export" => {
+        "max_nodes" if matches!(tool_name, "graph_export" | "export_file") => {
             json!({"type": "integer", "minimum": 1, "maximum": MAX_GRAPH_EXPORT_NODES})
         }
-        "max_edges" if tool_name == "graph_export" => {
+        "max_edges" if matches!(tool_name, "graph_export" | "export_file") => {
             json!({"type": "integer", "minimum": 1, "maximum": MAX_GRAPH_EXPORT_EDGES})
         }
         "max_nodes" | "max_edges" => {
@@ -1039,7 +1066,7 @@ fn field_schema(tool_name: &str, field: &str) -> Value {
             "description": "Inline profile JSON is limited to 1048576 UTF-8 bytes by the handler.",
             "x-depgraph-maxUtf8Bytes": 1048576
         }),
-        "profiles_file" => scalar_schema::<RepositoryRelativePath>(),
+        "profiles_file" | "output_path" => scalar_schema::<RepositoryRelativePath>(),
         "query_file" | "trace_file" => scalar_schema::<RepositoryRelativePath>(),
         "selectors" => json!({
             "type": "array",
@@ -1081,6 +1108,7 @@ fn required_input_fields(tool_name: &str) -> &'static [&'static str] {
         "graph_export" => &["format"],
         "operation_get" | "operation_result" | "operation_cancel" => &["operation_id"],
         "scan_submit" | "runtime_trace_import_submit" => &["idempotency_key"],
+        "export_file" => &["idempotency_key", "output_path", "format"],
         "snapshot_name_create" => &["name"],
         _ => &[],
     }

@@ -90,6 +90,7 @@ fn service_config(root: &Path, graph_store: &Path) -> DepgraphServiceConfig {
         [
             DepgraphCapability::Read,
             DepgraphCapability::StoreWrite,
+            DepgraphCapability::RepositoryWrite,
             DepgraphCapability::DaemonControl,
             DepgraphCapability::ProjectExec,
         ],
@@ -125,6 +126,8 @@ fn journal() -> (TempDir, PathBuf, DepgraphServiceConfig, OperationJournal) {
 }
 
 fn downgrade_current_journal_to_genuine_v3(path: &Path) {
+    const CURRENT_KINDS: &str = "'scan_submit', 'runtime_trace_import_submit', 'export_file', 'daemon_start_submit', 'daemon_stop', 'resolve_build_submit'";
+    const LEGACY_KINDS: &str = "'scan_submit', 'runtime_trace_import_submit', 'daemon_start_submit', 'daemon_stop', 'resolve_build_submit'";
     let connection = Connection::open(path).unwrap();
     connection
         .execute_batch("ALTER TABLE operations DROP COLUMN retention_anchor_ms;")
@@ -144,16 +147,30 @@ fn downgrade_current_journal_to_genuine_v3(path: &Path) {
             |row| row.get(0),
         )
         .unwrap();
-    let legacy_operations_sql = operations_sql.replace(
-        "typeof(input_json) = 'text' AND octet_length(input_json) <= 16777216",
-        "typeof(input_json) = 'text' AND octet_length(input_json) <= 1048576",
-    );
-    let legacy_handoffs_sql = handoffs_sql.replace(
-        "typeof(payload_json) = 'text' AND octet_length(payload_json) <= 16777216",
-        "typeof(payload_json) = 'text' AND octet_length(payload_json) <= 1048576",
-    );
+    let tombstones_sql: String = connection
+        .query_row(
+            "SELECT sql FROM sqlite_schema
+             WHERE type='table' AND name='operation_tombstones'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let legacy_operations_sql = operations_sql
+        .replace(
+            "typeof(input_json) = 'text' AND octet_length(input_json) <= 16777216",
+            "typeof(input_json) = 'text' AND octet_length(input_json) <= 1048576",
+        )
+        .replace(CURRENT_KINDS, LEGACY_KINDS);
+    let legacy_handoffs_sql = handoffs_sql
+        .replace(
+            "typeof(payload_json) = 'text' AND octet_length(payload_json) <= 16777216",
+            "typeof(payload_json) = 'text' AND octet_length(payload_json) <= 1048576",
+        )
+        .replace(CURRENT_KINDS, LEGACY_KINDS);
+    let legacy_tombstones_sql = tombstones_sql.replace(CURRENT_KINDS, LEGACY_KINDS);
     assert_ne!(legacy_operations_sql, operations_sql);
     assert_ne!(legacy_handoffs_sql, handoffs_sql);
+    assert_ne!(legacy_tombstones_sql, tombstones_sql);
 
     connection
         .execute_batch("PRAGMA writable_schema = ON")
@@ -163,6 +180,13 @@ fn downgrade_current_journal_to_genuine_v3(path: &Path) {
             "UPDATE sqlite_schema SET sql=?1
              WHERE type='table' AND name='operations'",
             [&legacy_operations_sql],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE sqlite_schema SET sql=?1
+             WHERE type='table' AND name='operation_tombstones'",
+            [&legacy_tombstones_sql],
         )
         .unwrap();
     connection
@@ -367,6 +391,7 @@ fn operation_kind_is_closed_over_the_durable_submit_catalog() {
             OperationKind::RuntimeTraceImportSubmit,
             "runtime_trace_import_submit",
         ),
+        (OperationKind::ExportFile, "export_file"),
         (OperationKind::DaemonStartSubmit, "daemon_start_submit"),
         (OperationKind::DaemonStop, "daemon_stop"),
         (OperationKind::ResolveBuildSubmit, "resolve_build_submit"),
@@ -775,7 +800,7 @@ fn current_schema_integrity_binding_metadata_and_required_objects_are_validated(
     drop(second);
     Connection::open(&path)
         .unwrap()
-        .execute_batch("PRAGMA user_version = 5")
+        .execute_batch("PRAGMA user_version = 6")
         .unwrap();
     assert!(matches!(
         OperationJournal::open(&config),
@@ -3121,7 +3146,13 @@ fn only_deadline_reaping_can_fail_unclaimed_queued_work() {
     let (_root, _graph_store, config, mut journal) = journal();
     let operation_id = journal
         .submit(
-            &request(&config, json!({"value": 1}), b"queued-deadline", DEADLINE),
+            &request_for_kind(
+                &config,
+                generic_purge_kind(),
+                json!({"value": 1}),
+                b"queued-deadline",
+                DEADLINE,
+            ),
             NOW,
         )
         .unwrap()
@@ -3153,6 +3184,44 @@ fn only_deadline_reaping_can_fail_unclaimed_queued_work() {
         .unwrap();
     assert_eq!(handoff.claimed_at_ms(), None);
     assert_eq!(handoff.completed_at_ms(), Some(DEADLINE));
+}
+
+#[test]
+fn direct_deadline_failure_rejects_runner_cleanup_owned_export() {
+    let (_root, _graph_store, config, mut journal) = journal();
+    let operation_id = journal
+        .submit(
+            &request_for_kind(
+                &config,
+                OperationKind::ExportFile,
+                json!({"output_path": "artifacts/graph.json"}),
+                b"export-direct-deadline",
+                DEADLINE,
+            ),
+            NOW,
+        )
+        .unwrap()
+        .operation_id()
+        .clone();
+
+    assert!(matches!(
+        journal.fail_deadline(&repository(), &operation_id, DEADLINE),
+        Err(JournalError::InvalidTransition)
+    ));
+    assert_eq!(
+        journal
+            .get(&repository(), &operation_id, DEADLINE)
+            .unwrap()
+            .status(),
+        OperationStatus::Queued
+    );
+    assert_eq!(
+        journal
+            .runner_handoff(&repository(), &operation_id, DEADLINE)
+            .unwrap()
+            .completed_at_ms(),
+        None
+    );
 }
 
 #[test]
@@ -3334,8 +3403,9 @@ fn late_deadline_sweep_uses_hard_deadline_at_the_exact_maximum_ttl_bound() {
     let boundary_deadline = NOW + maximum_ttl - TERMINAL_RETENTION_MS;
     let operation_id = journal
         .submit(
-            &request(
+            &request_for_kind(
                 &config,
+                generic_purge_kind(),
                 json!({"boundary": "late-deadline"}),
                 b"late-deadline-boundary",
                 boundary_deadline,
@@ -3490,7 +3560,7 @@ fn purge_reaps_queued_running_and_cancelling_before_terminal_only_deletion() {
 }
 
 #[test]
-fn purge_leaves_expired_runtime_imports_for_runner_cleanup_and_still_purges_tombstones() {
+fn purge_leaves_expired_external_writes_for_runner_cleanup_and_still_purges_tombstones() {
     let (_root, _graph_store, config, mut journal) = journal();
     let runtime_id = journal
         .submit(
@@ -3502,6 +3572,20 @@ fn purge_leaves_expired_runtime_imports_for_runner_cleanup_and_still_purges_tomb
                 DEADLINE,
             ),
             NOW,
+        )
+        .unwrap()
+        .operation_id()
+        .clone();
+    let export_id = journal
+        .submit(
+            &request_for_kind(
+                &config,
+                OperationKind::ExportFile,
+                json!({"export": "runner-cleanup-required"}),
+                b"purge-export-runner-cleanup",
+                DEADLINE,
+            ),
+            NOW + 1,
         )
         .unwrap()
         .operation_id()
@@ -3521,8 +3605,9 @@ fn purge_leaves_expired_runtime_imports_for_runner_cleanup_and_still_purges_tomb
         .clone();
     let scan_id = journal
         .submit(
-            &request(
+            &request_for_kind(
                 &config,
+                generic_purge_kind(),
                 json!({"scan": "terminal-tombstone"}),
                 b"purge-scan-tombstone",
                 DEADLINE,
@@ -3548,6 +3633,17 @@ fn purge_leaves_expired_runtime_imports_for_runner_cleanup_and_still_purges_tomb
             .query_row(
                 "SELECT status FROM operations WHERE operation_id=?1",
                 [runtime_id.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        OperationStatus::Queued.as_str()
+    );
+    assert_eq!(
+        Connection::open(journal.path())
+            .unwrap()
+            .query_row(
+                "SELECT status FROM operations WHERE operation_id=?1",
+                [export_id.as_str()],
                 |row| row.get::<_, String>(0),
             )
             .unwrap(),

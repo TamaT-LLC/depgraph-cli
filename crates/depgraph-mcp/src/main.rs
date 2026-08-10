@@ -15,7 +15,8 @@ use depgraph_core::service::{
     DEFAULT_GRAPH_EXPORT_MAX_EDGES, DEFAULT_GRAPH_EXPORT_MAX_NODES, DependenciesRequest,
     DependencyDirection, DoctorRequest, EdgeDirection, ExplainPathRequest, GraphExportFormat,
     GraphExportRequest, GraphExportResult, ImpactRequest, NodeMatchMode, PolicyEvaluateRequest,
-    PolicyEvaluationResult, ProfilePlanRequest, RuntimeValidateRequest, ServiceSnapshotSelector,
+    PolicyEvaluationResult, ProfilePlanRequest, RepositoryInitRequest,
+    RepositoryOutputPrecondition, RuntimeValidateRequest, ServiceSnapshotSelector,
     SnapshotDiffFilters, SnapshotDiffRequest, SnapshotDiffResult, SnapshotNameCreateRequest,
     UnresolvedRequest,
 };
@@ -35,15 +36,16 @@ use depgraph_mcp_tools::{
     AgentPolicyAnnotation, AgentPolicyAnnotationLevel, AgentPolicyApiChange,
     AgentPolicyApiChangeKind, AgentPolicyEvaluationResponse, AgentPolicySeverity,
     AgentPolicySummary, AgentPolicyViolation, AgentProfilePlan, AgentRemediation,
-    AgentResourceLimit, AgentRuntimeTraceEvent, AgentRuntimeValidationResponse, AgentSite,
-    AgentSnapshotDiffChange, AgentSnapshotDiffChangeType, AgentSnapshotDiffRecordType,
-    AgentSnapshotDiffResponse, AgentToken, BoundedQueryProjectionFailure, CanonicalResponseMapper,
-    ContractBuildError, ContractVersion, Cursor, CursorKey, DurableSubmitResult, ErrorEnvelope,
-    IdempotencyKey, LogicalRepositoryId, MAX_AGENT_CONDITION_BYTES, MAX_PAGE_BYTES,
-    MappedToolResult, OperationAccepted, OperationId, PageByteLimit, PageRequest, PageSize,
-    PaginationContext, PortableTerminalOutputContract, RepositoryRelativePath,
-    ResponseMappingError, SnapshotId, SnapshotName, SuccessEnvelope, TASK_POLL_INTERVAL_MS,
-    ToolCatalog, project_bounded_query_rows_cancellable, project_cycles_page_cancellable,
+    AgentRepositoryInitOutcome, AgentResourceLimit, AgentRuntimeTraceEvent,
+    AgentRuntimeValidationResponse, AgentSite, AgentSnapshotDiffChange,
+    AgentSnapshotDiffChangeType, AgentSnapshotDiffRecordType, AgentSnapshotDiffResponse,
+    AgentToken, BoundedQueryProjectionFailure, CanonicalResponseMapper, ContractBuildError,
+    ContractVersion, Cursor, CursorKey, DurableSubmitResult, ErrorEnvelope, IdempotencyKey,
+    LogicalRepositoryId, MAX_AGENT_CONDITION_BYTES, MAX_PAGE_BYTES, MappedToolResult,
+    OperationAccepted, OperationId, PageByteLimit, PageRequest, PageSize, PaginationContext,
+    PortableTerminalOutputContract, RepositoryRelativePath, ResponseMappingError, SnapshotId,
+    SnapshotName, SuccessEnvelope, TASK_POLL_INTERVAL_MS, ToolCatalog,
+    project_bounded_query_rows_cancellable, project_cycles_page_cancellable,
     project_dependencies_page_cancellable, project_impact_response_cancellable,
     project_unresolved_page_cancellable,
 };
@@ -198,6 +200,15 @@ struct ScanSubmitArguments {
     strict: bool,
     #[serde(default)]
     no_cache: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RepositoryInitArguments {
+    contract_version: ContractVersion,
+    repository_id: LogicalRepositoryId,
+    #[serde(default)]
+    force: bool,
 }
 
 #[derive(Deserialize)]
@@ -578,6 +589,26 @@ impl From<GraphExportFormatArgument> for GraphExportFormat {
 struct GraphExportArguments {
     contract_version: ContractVersion,
     repository_id: LogicalRepositoryId,
+    format: GraphExportFormatArgument,
+    #[serde(default)]
+    snapshot: Option<String>,
+    #[serde(default)]
+    selector: Option<AgentLocator>,
+    #[serde(default)]
+    max_nodes: Option<usize>,
+    #[serde(default)]
+    max_edges: Option<usize>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExportFileSubmitArguments {
+    contract_version: ContractVersion,
+    repository_id: LogicalRepositoryId,
+    idempotency_key: IdempotencyKey,
+    output_path: RepositoryRelativePath,
+    #[serde(default)]
+    overwrite: bool,
     format: GraphExportFormatArgument,
     #[serde(default)]
     snapshot: Option<String>,
@@ -1006,16 +1037,11 @@ impl ServerHandler for DepgraphMcpServer {
                 }
             });
             let execution = runtime
-                .execute_blocking(RuntimeClass::Submit, cancellation, move |cancellation| {
+                .execute_mutation_blocking(cancellation, move |cancellation| {
                     if cancellation.is_cancelled() {
                         return Err(task_request_cancelled());
                     }
-                    let result = task_cancel(&config, &request.task_id, &cancellation);
-                    if cancellation.is_cancelled() {
-                        Err(task_request_cancelled())
-                    } else {
-                        result
-                    }
+                    task_cancel(&config, &request.task_id, &cancellation)
                 })
                 .await;
             cancellation_bridge.abort();
@@ -1095,7 +1121,10 @@ impl ServerHandler for DepgraphMcpServer {
                 None,
             ));
         }
-        if matches!(tool.as_str(), "scan_submit" | "runtime_trace_import_submit") {
+        if matches!(
+            tool.as_str(),
+            "scan_submit" | "runtime_trace_import_submit" | "export_file"
+        ) {
             let tasks_negotiated = EFFECTIVE_PROTOCOL_VERSION
                 .try_with(|version| *version == ProtocolVersion::V_2026_07_28)
                 .unwrap_or(false)
@@ -1120,7 +1149,7 @@ impl ServerHandler for DepgraphMcpServer {
             });
             let execution = self
                 .runtime
-                .execute_blocking(RuntimeClass::Submit, cancellation, move |cancellation| {
+                .execute_mutation_blocking(cancellation, move |cancellation| {
                     match submit_tool.as_str() {
                         "scan_submit" => execute_scan_submit(
                             &operation_config,
@@ -1129,6 +1158,12 @@ impl ServerHandler for DepgraphMcpServer {
                             &cancellation,
                         ),
                         "runtime_trace_import_submit" => execute_runtime_import_submit(
+                            &operation_config,
+                            &repository_id,
+                            arguments,
+                            &cancellation,
+                        ),
+                        "export_file" => execute_export_file_submit(
                             &operation_config,
                             &repository_id,
                             arguments,
@@ -1196,14 +1231,15 @@ impl ServerHandler for DepgraphMcpServer {
                 | "operation_result"
                 | "operation_cancel"
                 | "snapshot_name_create"
+                | "repository_init"
         ) {
             return Err(McpError::invalid_params(
                 "tool handler is unavailable",
                 None,
             ));
         }
-        let runtime_class = if matches!(tool.as_str(), "operation_cancel" | "snapshot_name_create")
-        {
+        let mutation_settlement = tool_uses_mutation_settlement(tool.as_str());
+        let runtime_class = if mutation_settlement {
             RuntimeClass::Submit
         } else {
             RuntimeClass::Read
@@ -1226,41 +1262,43 @@ impl ServerHandler for DepgraphMcpServer {
                 cancellation.cancel();
             }
         });
-        let execution = self
-            .runtime
-            .execute_blocking(runtime_class, cancellation, move |cancellation| {
-                if cancellation.is_cancelled() {
-                    return Err(ToolExecutionFailure::Service(
-                        DepgraphServiceError::Cancelled,
-                    ));
-                }
-                let result = if matches!(
-                    tool.as_str(),
-                    "operation_get" | "operation_result" | "operation_cancel"
-                ) {
-                    execute_operation_tool(&operation_config, &repository_id, &tool, arguments)
-                } else if tool == "snapshot_name_create" {
-                    execute_snapshot_name_create(&service, &repository_id, arguments, &cancellation)
-                } else {
-                    execute_catalog_read_tool(
-                        &service,
-                        &repository_id,
-                        &cursor_key,
-                        &compiler_pack_requirement,
-                        &tool,
-                        arguments,
-                        &cancellation,
-                    )
-                };
-                if cancellation.is_cancelled() {
-                    Err(ToolExecutionFailure::Service(
-                        DepgraphServiceError::Cancelled,
-                    ))
-                } else {
-                    result
-                }
-            })
-            .await;
+        let operation = move |cancellation: CancellationToken| {
+            if cancellation.is_cancelled() {
+                return Err(ToolExecutionFailure::Service(
+                    DepgraphServiceError::Cancelled,
+                ));
+            }
+            let result = if matches!(
+                tool.as_str(),
+                "operation_get" | "operation_result" | "operation_cancel"
+            ) {
+                execute_operation_tool(&operation_config, &repository_id, &tool, arguments)
+            } else if tool == "snapshot_name_create" {
+                execute_snapshot_name_create(&service, &repository_id, arguments, &cancellation)
+            } else if tool == "repository_init" {
+                execute_repository_init(&service, &repository_id, arguments, &cancellation)
+            } else {
+                execute_catalog_read_tool(
+                    &service,
+                    &repository_id,
+                    &cursor_key,
+                    &compiler_pack_requirement,
+                    &tool,
+                    arguments,
+                    &cancellation,
+                )
+            };
+            finalize_completed_tool_call(&cancellation, result)
+        };
+        let execution = if mutation_settlement {
+            self.runtime
+                .execute_mutation_blocking(cancellation, operation)
+                .await
+        } else {
+            self.runtime
+                .execute_blocking(runtime_class, cancellation, operation)
+                .await
+        };
         cancellation_bridge.abort();
 
         let mapped = match execution {
@@ -1278,6 +1316,25 @@ impl ServerHandler for DepgraphMcpServer {
 
 fn internal_mapping_error(_error: ResponseMappingError) -> McpError {
     McpError::internal_error("canonical tool response mapping failed", None)
+}
+
+fn tool_uses_mutation_settlement(tool: &str) -> bool {
+    matches!(
+        tool,
+        "scan_submit"
+            | "runtime_trace_import_submit"
+            | "export_file"
+            | "operation_cancel"
+            | "snapshot_name_create"
+            | "repository_init"
+    )
+}
+
+fn finalize_completed_tool_call<T>(
+    _cancellation: &CancellationToken,
+    result: Result<T, ToolExecutionFailure>,
+) -> Result<T, ToolExecutionFailure> {
+    result
 }
 
 fn map_tool_failure(
@@ -1539,6 +1596,183 @@ fn execute_scan_submit(
     )
 }
 
+fn execute_export_file_submit(
+    config: &DepgraphServiceConfig,
+    repository_id: &LogicalRepositoryId,
+    arguments: serde_json::Map<String, serde_json::Value>,
+    cancellation: &CancellationToken,
+) -> Result<OperationHandle, ToolExecutionFailure> {
+    let arguments = decode_arguments::<ExportFileSubmitArguments>(arguments)?;
+    authorize_repository(
+        arguments.contract_version,
+        &arguments.repository_id,
+        repository_id,
+    )?;
+    if cancellation.is_cancelled() {
+        return Err(ToolExecutionFailure::Service(
+            DepgraphServiceError::Cancelled,
+        ));
+    }
+
+    let service = DepgraphService::new(config.clone());
+    let confined_output_path =
+        depgraph_core::service::RepositoryRelativePath::parse(arguments.output_path.as_str())?;
+    let selector = arguments.selector.map(|value| value.as_str().to_owned());
+    let format: GraphExportFormat = arguments.format.into();
+    let requested_snapshot =
+        SnapshotLocator::parse(arguments.snapshot.as_deref().unwrap_or("current"))?;
+    let existing_input = existing_export_file_submission_input(config, &arguments.idempotency_key)?;
+    let replay_snapshot;
+    let snapshot_to_resolve = match (&requested_snapshot, existing_input.as_ref()) {
+        (SnapshotLocator::Current, Some(input)) => {
+            replay_snapshot = retained_stable_snapshot_locator(input)?;
+            &replay_snapshot
+        }
+        _ => &requested_snapshot,
+    };
+    let resolved_snapshot =
+        service.resolve_snapshot_id_cancellable(snapshot_to_resolve, cancellation)?;
+    let snapshot_id = parse_snapshot_id(resolved_snapshot.as_str())?;
+    let max_nodes = arguments
+        .max_nodes
+        .unwrap_or(DEFAULT_GRAPH_EXPORT_MAX_NODES);
+    let max_edges = arguments
+        .max_edges
+        .unwrap_or(DEFAULT_GRAPH_EXPORT_MAX_EDGES);
+    GraphExportRequest::try_new(
+        SnapshotLocator::StableId(resolved_snapshot.as_str().to_owned()),
+        format,
+        selector.clone(),
+        GraphQueryFilter::default(),
+        max_nodes,
+        max_edges,
+    )?;
+    let destination_precondition = match existing_input.as_ref() {
+        Some(input) => match input.get("destination_precondition") {
+            Some(value) => Some(
+                serde_json::from_value::<RepositoryOutputPrecondition>(value.clone()).map_err(
+                    |_| ToolExecutionFailure::Journal {
+                        error: JournalError::IntegrityFailure,
+                        operation_id: None,
+                    },
+                )?,
+            ),
+            None if !arguments.overwrite => None,
+            None => {
+                return Err(ToolExecutionFailure::Journal {
+                    error: JournalError::IntegrityFailure,
+                    operation_id: None,
+                });
+            }
+        },
+        None => Some(service.repository_output_precondition(&confined_output_path, cancellation)?),
+    };
+    let mut normalized_input = serde_json::json!({
+        "output_path": arguments.output_path.as_str(),
+        "overwrite": arguments.overwrite,
+        "format": format,
+        "snapshot_id": snapshot_id,
+        "selector": selector,
+        "max_nodes": max_nodes,
+        "max_edges": max_edges,
+    });
+    if let Some(destination_precondition) = destination_precondition {
+        normalized_input["destination_precondition"] =
+            serde_json::to_value(destination_precondition)
+                .map_err(|_| ToolExecutionFailure::Service(DepgraphServiceError::Internal))?;
+    }
+    submit_export_file_with_conflict_recovery(
+        &normalized_input,
+        &requested_snapshot,
+        || existing_export_file_submission_input(config, &arguments.idempotency_key),
+        |input| {
+            submit_durable_operation(
+                config,
+                OperationKind::ExportFile,
+                input,
+                &arguments.idempotency_key,
+                cancellation,
+            )
+        },
+    )
+}
+
+fn submit_export_file_with_conflict_recovery<T>(
+    normalized_input: &serde_json::Value,
+    requested_snapshot: &SnapshotLocator,
+    mut existing_input: impl FnMut() -> Result<Option<serde_json::Value>, ToolExecutionFailure>,
+    mut submit: impl FnMut(&serde_json::Value) -> Result<T, ToolExecutionFailure>,
+) -> Result<T, ToolExecutionFailure> {
+    let conflict = match submit(normalized_input) {
+        Ok(handle) => return Ok(handle),
+        Err(
+            error @ ToolExecutionFailure::Journal {
+                error: JournalError::IdempotencyConflict,
+                ..
+            },
+        ) => error,
+        Err(error) => return Err(error),
+    };
+    let Some(winner_input) = existing_input()? else {
+        return Err(conflict);
+    };
+    if !export_file_inputs_are_exact_replay(normalized_input, &winner_input, requested_snapshot) {
+        return Err(conflict);
+    }
+    submit(&winner_input)
+}
+
+fn export_file_inputs_are_exact_replay(
+    candidate: &serde_json::Value,
+    winner: &serde_json::Value,
+    requested_snapshot: &SnapshotLocator,
+) -> bool {
+    const STATIC_FIELDS: [&str; 7] = [
+        "output_path",
+        "overwrite",
+        "format",
+        "selector",
+        "max_nodes",
+        "max_edges",
+        "destination_precondition",
+    ];
+    if STATIC_FIELDS
+        .iter()
+        .any(|field| candidate.get(field) != winner.get(field))
+    {
+        return false;
+    }
+    if !matches!(requested_snapshot, SnapshotLocator::Current)
+        && candidate.get("snapshot_id") != winner.get("snapshot_id")
+    {
+        return false;
+    }
+    matches!(
+        winner.get("snapshot_id").and_then(serde_json::Value::as_str),
+        Some(snapshot_id) if SnapshotLocator::parse(snapshot_id).is_ok_and(|locator| {
+            matches!(locator, SnapshotLocator::StableId(_))
+        })
+    ) && winner.get("destination_precondition").is_some()
+}
+
+fn existing_export_file_submission_input(
+    config: &DepgraphServiceConfig,
+    idempotency_key: &IdempotencyKey,
+) -> Result<Option<serde_json::Value>, ToolExecutionFailure> {
+    let now_ms = system_now_ms()?;
+    OperationManager::existing_submission_binding_read_only(
+        config,
+        OperationKind::ExportFile,
+        idempotency_key.as_str().as_bytes(),
+        now_ms,
+    )
+    .map_err(|error| ToolExecutionFailure::Journal {
+        error,
+        operation_id: None,
+    })
+    .map(|binding| binding.map(|binding| binding.normalized_input().value().clone()))
+}
+
 fn execute_runtime_import_submit(
     config: &DepgraphServiceConfig,
     repository_id: &LogicalRepositoryId,
@@ -1649,7 +1883,7 @@ fn existing_runtime_import_submission_input(
     .map(|binding| binding.map(|binding| binding.normalized_input().value().clone()))
 }
 
-fn retained_runtime_snapshot_locator(
+fn retained_stable_snapshot_locator(
     input: &serde_json::Value,
 ) -> Result<SnapshotLocator, ToolExecutionFailure> {
     let snapshot_id = input
@@ -1687,7 +1921,7 @@ fn prepare_runtime_import_submission_input(
     let locator = match (binding_resolution, requested_locator, existing_input) {
         (RuntimeBindingResolution::RetainedStable, _, Some(input))
         | (RuntimeBindingResolution::Requested, SnapshotLocator::Current, Some(input)) => {
-            retained_runtime_snapshot_locator(input)?
+            retained_stable_snapshot_locator(input)?
         }
         (RuntimeBindingResolution::RetainedStable, _, None) => {
             return Err(ToolExecutionFailure::Journal {
@@ -1724,7 +1958,7 @@ fn prepare_runtime_import_replay_candidate_read_only(
             service.revalidate_runtime_trace_source(source, &prevalidated, cancellation)?;
     }
     let locator = if matches!(requested_locator, SnapshotLocator::Current) {
-        retained_runtime_snapshot_locator(existing_input)?
+        retained_stable_snapshot_locator(existing_input)?
     } else {
         requested_locator.clone()
     };
@@ -1938,6 +2172,26 @@ fn handoff_submitted_scan(
             Err(error)
         }
     }
+}
+
+fn execute_repository_init(
+    service: &DepgraphService,
+    repository_id: &LogicalRepositoryId,
+    arguments: serde_json::Map<String, serde_json::Value>,
+    cancellation: &CancellationToken,
+) -> Result<MappedToolResult, ToolExecutionFailure> {
+    let arguments = decode_arguments::<RepositoryInitArguments>(arguments)?;
+    authorize_repository(
+        arguments.contract_version,
+        &arguments.repository_id,
+        repository_id,
+    )?;
+    let initialized =
+        service.repository_init(&RepositoryInitRequest::new(arguments.force), cancellation)?;
+    let result =
+        AgentRepositoryInitOutcome::try_from(&initialized).map_err(contract_mapping_error)?;
+    CanonicalResponseMapper::success(&SuccessEnvelope::new(repository_id.clone(), None, result))
+        .map_err(Into::into)
 }
 
 fn execute_snapshot_name_create(
@@ -3539,16 +3793,200 @@ async fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-        mpsc,
+    use std::{
+        cell::Cell,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+            mpsc,
+        },
     };
 
     use super::*;
     use depgraph_operation::OperationJournal;
     use depgraph_store::Store;
     use serde_json::json;
+
+    #[test]
+    fn completed_tool_result_survives_late_cancellation() {
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+
+        assert!(finalize_completed_tool_call(&cancellation, Ok(())).is_ok());
+    }
+
+    #[test]
+    fn irreversible_tools_require_mutation_worker_settlement() {
+        for tool in [
+            "scan_submit",
+            "runtime_trace_import_submit",
+            "export_file",
+            "operation_cancel",
+            "snapshot_name_create",
+            "repository_init",
+        ] {
+            assert!(tool_uses_mutation_settlement(tool), "{tool}");
+        }
+        for tool in ["get_context", "snapshot_get", "graph_query"] {
+            assert!(!tool_uses_mutation_settlement(tool), "{tool}");
+        }
+    }
+
+    #[test]
+    fn concurrent_current_export_submission_adopts_a_winner_with_the_exact_precondition() {
+        let initial = json!({
+            "output_path":"artifacts/current.json",
+            "overwrite":false,
+            "format":"json",
+            "snapshot_id":"snapshot:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "selector":null,
+            "max_nodes":100,
+            "max_edges":100,
+            "destination_precondition":{"kind":"missing"}
+        });
+        let winner = json!({
+            "output_path":"artifacts/current.json",
+            "overwrite":false,
+            "format":"json",
+            "snapshot_id":"snapshot:sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "selector":null,
+            "max_nodes":100,
+            "max_edges":100,
+            "destination_precondition":{"kind":"missing"}
+        });
+        let attempts = Cell::new(0_u8);
+
+        let result = submit_export_file_with_conflict_recovery(
+            &initial,
+            &SnapshotLocator::Current,
+            || Ok(Some(winner.clone())),
+            |input| {
+                attempts.set(attempts.get() + 1);
+                if attempts.get() == 1 {
+                    Err(ToolExecutionFailure::Journal {
+                        error: JournalError::IdempotencyConflict,
+                        operation_id: None,
+                    })
+                } else {
+                    assert_eq!(input, &winner);
+                    Ok("winning-operation")
+                }
+            },
+        )
+        .expect("an exact concurrent replay adopts the winning binding");
+
+        assert_eq!(result, "winning-operation");
+        assert_eq!(attempts.get(), 2);
+    }
+
+    #[test]
+    fn concurrent_current_export_submission_rejects_a_different_destination_precondition() {
+        let initial = json!({
+            "output_path":"artifacts/current.json",
+            "overwrite":false,
+            "format":"json",
+            "snapshot_id":"snapshot:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "selector":null,
+            "max_nodes":100,
+            "max_edges":100,
+            "destination_precondition":{"kind":"missing"}
+        });
+        let winner = json!({
+            "output_path":"artifacts/current.json",
+            "overwrite":false,
+            "format":"json",
+            "snapshot_id":"snapshot:sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "selector":null,
+            "max_nodes":100,
+            "max_edges":100,
+            "destination_precondition":{
+                "kind":"regular",
+                "identity_sha256":"c".repeat(64),
+                "output_bytes":1,
+                "content_sha256":"d".repeat(64)
+            }
+        });
+        let attempts = Cell::new(0_u8);
+
+        let error = submit_export_file_with_conflict_recovery(
+            &initial,
+            &SnapshotLocator::Current,
+            || Ok(Some(winner.clone())),
+            |_| {
+                attempts.set(attempts.get() + 1);
+                if attempts.get() == 1 {
+                    Err(ToolExecutionFailure::Journal {
+                        error: JournalError::IdempotencyConflict,
+                        operation_id: None,
+                    })
+                } else {
+                    Ok("wrong-precondition-operation")
+                }
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ToolExecutionFailure::Journal {
+                error: JournalError::IdempotencyConflict,
+                ..
+            }
+        ));
+        assert_eq!(attempts.get(), 1);
+    }
+
+    #[test]
+    fn named_export_submission_conflict_rejects_a_different_resolved_snapshot_binding() {
+        let initial = json!({
+            "output_path":"artifacts/named.json",
+            "overwrite":false,
+            "format":"json",
+            "snapshot_id":"snapshot:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "selector":null,
+            "max_nodes":100,
+            "max_edges":100,
+            "destination_precondition":{"kind":"missing"}
+        });
+        let winner = json!({
+            "output_path":"artifacts/named.json",
+            "overwrite":false,
+            "format":"json",
+            "snapshot_id":"snapshot:sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "selector":null,
+            "max_nodes":100,
+            "max_edges":100,
+            "destination_precondition":{"kind":"missing"}
+        });
+        let attempts = Cell::new(0_u8);
+
+        let error = submit_export_file_with_conflict_recovery(
+            &initial,
+            &SnapshotLocator::Name("release-a".to_owned()),
+            || Ok(Some(winner.clone())),
+            |_| {
+                attempts.set(attempts.get() + 1);
+                if attempts.get() == 1 {
+                    Err(ToolExecutionFailure::Journal {
+                        error: JournalError::IdempotencyConflict,
+                        operation_id: None,
+                    })
+                } else {
+                    Ok("wrong-snapshot-operation")
+                }
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ToolExecutionFailure::Journal {
+                error: JournalError::IdempotencyConflict,
+                ..
+            }
+        ));
+        assert_eq!(attempts.get(), 1);
+    }
 
     fn operation_test_config(root: &Path) -> DepgraphServiceConfig {
         let repository = root.join("repository");

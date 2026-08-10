@@ -11,10 +11,11 @@ use crate::{
     AgentGraphExportResponse, AgentImpact, AgentImpactResponse, AgentNamedSnapshot, AgentNode,
     AgentNodeSummary, AgentOperation, AgentPathResponse, AgentPathStep,
     AgentPolicyEvaluationResponse, AgentProfilePlan, AgentQueryRow, AgentQueryValue,
-    AgentRuntimeOutcome, AgentRuntimeTraceEvent, AgentRuntimeValidationResponse, AgentScanOutcome,
-    AgentSite, AgentSnapshot, AgentSnapshotDiffResponse, AgentUnresolved, CommonRequest,
-    DurableSubmitResult, ErrorEnvelope, OperationAccepted, Page, PageRequest,
-    PortableTerminalOutput, SnapshotSelector, SuccessEnvelope, TaskAccepted,
+    AgentRepositoryInitOutcome, AgentRuntimeOutcome, AgentRuntimeTraceEvent,
+    AgentRuntimeValidationResponse, AgentScanOutcome, AgentSite, AgentSnapshot,
+    AgentSnapshotDiffResponse, AgentUnresolved, CommonRequest, DurableSubmitResult, ErrorEnvelope,
+    OperationAccepted, Page, PageRequest, PortableTerminalOutput, SnapshotSelector,
+    SuccessEnvelope, TaskAccepted,
 };
 
 pub const MCP_TOOLS_SCHEMA_ID: &str =
@@ -63,6 +64,7 @@ impl JsonSchema for McpToolsV1Schema {
             generator.subschema_for::<SuccessEnvelope<Page<AgentQueryRow>>>(),
             generator.subschema_for::<SuccessEnvelope<AgentRuntimeValidationResponse>>(),
             generator.subschema_for::<SuccessEnvelope<AgentRuntimeOutcome>>(),
+            generator.subschema_for::<SuccessEnvelope<AgentRepositoryInitOutcome>>(),
             generator.subschema_for::<SuccessEnvelope<AgentSnapshotDiffResponse>>(),
             generator.subschema_for::<SuccessEnvelope<AgentPolicyEvaluationResponse>>(),
             generator.subschema_for::<SuccessEnvelope<AgentGraphExportResponse>>(),
@@ -101,6 +103,7 @@ impl JsonSchema for McpToolsV1Schema {
             generator.subschema_for::<AgentRuntimeTraceEvent>(),
             generator.subschema_for::<AgentRuntimeValidationResponse>(),
             generator.subschema_for::<AgentRuntimeOutcome>(),
+            generator.subschema_for::<AgentRepositoryInitOutcome>(),
             generator.subschema_for::<AgentSnapshotDiffResponse>(),
             generator.subschema_for::<AgentPolicyEvaluationResponse>(),
             generator.subschema_for::<AgentGraphExportResponse>(),

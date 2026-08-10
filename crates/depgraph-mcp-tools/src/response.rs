@@ -24,12 +24,13 @@ use crate::{
     AgentErrorDetails, AgentEvidence, AgentGraphExportResponse, AgentImpact, AgentImpactResponse,
     AgentNamedSnapshot, AgentNode, AgentNodeSummary, AgentOperation, AgentPathResponse,
     AgentPathStep, AgentPolicyEvaluationResponse, AgentProfilePlan, AgentQueryRow,
-    AgentRemediation, AgentResourceLimit, AgentRuntimeOutcome, AgentRuntimeTraceEvent,
-    AgentRuntimeValidationResponse, AgentSite, AgentSnapshot, AgentSnapshotDiffResponse,
-    AgentUnresolved, CanonicalJsonError, ContractBuildError, Cursor, DurableSubmitResult,
-    ErrorEnvelope, LogicalRepositoryId, MAX_AGENT_CONDITION_BYTES, MAX_PAGE_BYTES, MAX_PAGE_ITEMS,
-    MCP_TOOLS_CONTRACT_VERSION, OperationAccepted, Page, PageRequest, PortableTerminalOutput,
-    SnapshotId, SuccessEnvelope, TaskAccepted, canonical_json_bytes,
+    AgentRemediation, AgentRepositoryInitOutcome, AgentResourceLimit, AgentRuntimeOutcome,
+    AgentRuntimeTraceEvent, AgentRuntimeValidationResponse, AgentSite, AgentSnapshot,
+    AgentSnapshotDiffResponse, AgentUnresolved, CanonicalJsonError, ContractBuildError, Cursor,
+    DurableSubmitResult, ErrorEnvelope, LogicalRepositoryId, MAX_AGENT_CONDITION_BYTES,
+    MAX_PAGE_BYTES, MAX_PAGE_ITEMS, MCP_TOOLS_CONTRACT_VERSION, OperationAccepted, Page,
+    PageRequest, PortableTerminalOutput, SnapshotId, SuccessEnvelope, TaskAccepted,
+    canonical_json_bytes,
 };
 
 const CURSOR_VERSION: &str = "v1";
@@ -85,6 +86,7 @@ public_result!(
     AgentSnapshotDiffResponse,
     AgentPolicyEvaluationResponse,
     AgentGraphExportResponse,
+    AgentRepositoryInitOutcome,
     AgentOperation,
     DurableSubmitResult,
     OperationAccepted,

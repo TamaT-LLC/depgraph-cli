@@ -1169,6 +1169,122 @@ fn init_writes_only_the_versioned_config() {
 }
 
 #[test]
+fn init_existing_config_is_a_usage_error_with_force_remediation() {
+    let root = tempfile::tempdir().unwrap();
+    let config_path = root.path().join(".depgraph.toml");
+    fs::write(&config_path, "existing-canary\n").unwrap();
+
+    Command::cargo_bin("depgraph")
+        .unwrap()
+        .args(["init", root.path().to_str().unwrap()])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("already exists; use --force"));
+
+    assert_eq!(
+        fs::read_to_string(config_path).unwrap(),
+        "existing-canary\n"
+    );
+}
+
+#[test]
+fn export_output_rejects_parent_traversal_outside_the_repository() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("repository");
+    let store = temporary.path().join("graph.sqlite");
+    let outside = temporary.path().join("outside.json");
+    fs::create_dir(&root).unwrap();
+    seed_safe_rust_scan(&store, &root, "Cargo.toml");
+
+    Command::cargo_bin("depgraph")
+        .unwrap()
+        .current_dir(&root)
+        .args([
+            "--store",
+            store.to_str().unwrap(),
+            "export",
+            "--format",
+            "json",
+            "--output",
+            "../outside.json",
+        ])
+        .assert()
+        .code(2);
+    assert!(!outside.exists());
+}
+
+#[test]
+fn export_output_rejects_absolute_and_dot_component_paths() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("repository");
+    let store = temporary.path().join("graph.sqlite");
+    let absolute_output = root.join("artifacts/absolute.json");
+    let dot_output = root.join("artifacts/dot.json");
+    fs::create_dir_all(root.join("artifacts")).unwrap();
+    seed_safe_rust_scan(&store, &root, "Cargo.toml");
+
+    for supplied in [absolute_output.to_str().unwrap(), "./artifacts/dot.json"] {
+        Command::cargo_bin("depgraph")
+            .unwrap()
+            .current_dir(&root)
+            .args([
+                "--store",
+                store.to_str().unwrap(),
+                "export",
+                "--format",
+                "json",
+                "--output",
+                supplied,
+            ])
+            .assert()
+            .code(2);
+    }
+
+    assert!(!absolute_output.exists());
+    assert!(!dot_output.exists());
+}
+
+#[test]
+fn partial_scan_export_output_rejects_parent_traversal_outside_the_repository() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("repository");
+    let store_path = temporary.path().join("graph.sqlite");
+    let outside = temporary.path().join("outside.json");
+    fs::create_dir(&root).unwrap();
+    let mut store = depgraph_store::Store::open(&store_path).unwrap();
+    store.start_scan("partial-export", &root, false).unwrap();
+    for event in [
+        json!({"event":"scan_started","protocol_version":"1.0","scan_id":"partial-export","adapter":"fixture","adapter_version":"1.0","seq":1,"root":root,"project_code_executed":false,"safe_mode":true}),
+        json!({"event":"profile_declared","protocol_version":"1.0","scan_id":"partial-export","adapter":"fixture","adapter_version":"1.0","seq":2,"profile":{"id":"fixture:safe","language":"fixture","features":[],"environment":{},"properties":{}}}),
+        json!({"event":"node_upsert","protocol_version":"1.0","scan_id":"partial-export","adapter":"fixture","adapter_version":"1.0","seq":3,"node":{"id":"file:partial","kind":"file","locator":"file://partial.rs","properties":{}}}),
+    ] {
+        store.ingest_event(&event).unwrap();
+    }
+    store
+        .finish_scan("partial-export", "failed", Some("fixture failure"), false)
+        .unwrap();
+    drop(store);
+
+    Command::cargo_bin("depgraph")
+        .unwrap()
+        .current_dir(&root)
+        .args([
+            "--store",
+            store_path.to_str().unwrap(),
+            "--scan-id",
+            "partial-export",
+            "export",
+            "--format",
+            "json",
+            "--output",
+            "../outside.json",
+        ])
+        .assert()
+        .code(2);
+    assert!(!outside.exists());
+}
+
+#[test]
 fn runtime_validate_matches_golden_trace_without_mutating_the_store() {
     let root = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();
@@ -3197,6 +3313,7 @@ fn consented_build_mode_runs_project_code_only_in_the_supervised_staging_area() 
     let legacy_export_path = root.path().join("profile-matrix-export.json");
     Command::cargo_bin("depgraph")
         .unwrap()
+        .current_dir(root.path())
         .args([
             "--store",
             store_path.to_str().unwrap(),
@@ -3204,7 +3321,7 @@ fn consented_build_mode_runs_project_code_only_in_the_supervised_staging_area() 
             "--format",
             "json",
             "--output",
-            legacy_export_path.to_str().unwrap(),
+            "profile-matrix-export.json",
         ])
         .assert()
         .success();
@@ -5319,6 +5436,7 @@ fn semantic_selectors_cycles_and_query_evidence_are_exposed() {
     let query = |arguments: &[&str]| {
         let output = Command::cargo_bin("depgraph")
             .unwrap()
+            .current_dir(root.path())
             .args(["--store", store.to_str().unwrap()])
             .args(arguments)
             .output()
@@ -5417,7 +5535,7 @@ fn semantic_selectors_cycles_and_query_evidence_are_exposed() {
         "--format",
         "json",
         "--output",
-        legacy_export_path.to_str().unwrap(),
+        "semantic-evidence-export.json",
     ]);
     let exported: serde_json::Value =
         serde_json::from_slice(&fs::read(&legacy_export_path).unwrap()).unwrap();
@@ -5868,6 +5986,7 @@ fn exports_are_byte_identical_across_scan_ids_and_event_order() {
     let graphml_path = temp.path().join("graph.graphml");
     let graphml_file = Command::cargo_bin("depgraph")
         .unwrap()
+        .current_dir(temp.path())
         .args([
             "--store",
             store.to_str().unwrap(),
@@ -5877,7 +5996,7 @@ fn exports_are_byte_identical_across_scan_ids_and_event_order() {
             "--format",
             "graphml",
             "--output",
-            graphml_path.to_str().unwrap(),
+            "graph.graphml",
         ])
         .output()
         .unwrap();
@@ -5885,7 +6004,10 @@ fn exports_are_byte_identical_across_scan_ids_and_event_order() {
     assert!(graphml_file.stdout.is_empty());
     let graphml = std::fs::read_to_string(graphml_path).unwrap();
     assert!(graphml.starts_with("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"));
-    assert!(graphml.contains("attr.name=\"depgraph.edge.condition\""));
+    assert!(
+        graphml.contains("attr.name=\"depgraph.edge.condition\""),
+        "{graphml}"
+    );
 }
 
 fn write_profile_plan_fixture(root: &Path) {

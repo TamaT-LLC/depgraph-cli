@@ -1359,18 +1359,34 @@ fn failed_resolve(cli: &Path, checkout: &Path, store: &Path, requirement: &Path)
 }
 
 fn export_graph(cli: &Path, store: &Path, export: &Path) -> Result<()> {
-    run_cli(
-        cli,
-        [
+    let repository_root = export
+        .parent()
+        .context("compiler-pack export path has no repository root")?;
+    let output_argument = export
+        .strip_prefix(repository_root)
+        .context("compiler-pack export path is outside the repository root")?;
+    let output = Command::new(cli)
+        .current_dir(repository_root)
+        .args([
             OsStr::new("--store"),
             store.as_os_str(),
             OsStr::new("export"),
             OsStr::new("--format"),
             OsStr::new("json"),
             OsStr::new("--output"),
-            export.as_os_str(),
-        ],
-    )
+            output_argument.as_os_str(),
+        ])
+        .env("CARGO_NET_OFFLINE", "true")
+        .output()?;
+    if !output.status.success() {
+        bail!(
+            "{} failed: {}{}",
+            cli.display(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(())
 }
 
 fn run_cli<'a>(cli: &Path, arguments: impl IntoIterator<Item = &'a OsStr>) -> Result<()> {

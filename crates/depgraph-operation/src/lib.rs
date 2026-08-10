@@ -9,6 +9,7 @@
 mod launcher;
 mod runner;
 
+pub use depgraph_core::service::{OPERATION_JOURNAL_SUFFIX, RUNNER_PURGE_LOCK_SUFFIX};
 pub use launcher::{
     LaunchedOperationRunner, OPERATION_RUNNER_STARTUP_CONTRACT, OperationRunnerLauncher,
     RunnerLaunchError, RunnerResolutionPolicy,
@@ -44,12 +45,11 @@ use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 
 /// SQLite schema version owned by this crate.
-pub const JOURNAL_SCHEMA_VERSION: i64 = 4;
+pub const JOURNAL_SCHEMA_VERSION: i64 = 5;
 const LEGACY_JOURNAL_SCHEMA_VERSION: i64 = 1;
 const ROOT_BOUND_JOURNAL_SCHEMA_VERSION: i64 = 2;
 const COMPLETION_INTENT_JOURNAL_SCHEMA_VERSION: i64 = 3;
-/// Suffix appended to the graph-store path to obtain the separate journal path.
-pub const OPERATION_JOURNAL_SUFFIX: &str = ".operations.sqlite";
+const RETENTION_ANCHOR_JOURNAL_SCHEMA_VERSION: i64 = 4;
 /// Minimum duration for which a terminal record remains retrievable.
 pub const TERMINAL_RETENTION_MS: i64 = 7 * 24 * 60 * 60 * 1_000;
 /// Duration for which a purged operation's identity and idempotency scope remain reserved.
@@ -239,15 +239,17 @@ impl fmt::Debug for JournalDigest {
 pub enum OperationKind {
     ScanSubmit,
     RuntimeTraceImportSubmit,
+    ExportFile,
     DaemonStartSubmit,
     DaemonStop,
     ResolveBuildSubmit,
 }
 
 impl OperationKind {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::ScanSubmit,
         Self::RuntimeTraceImportSubmit,
+        Self::ExportFile,
         Self::DaemonStartSubmit,
         Self::DaemonStop,
         Self::ResolveBuildSubmit,
@@ -257,6 +259,7 @@ impl OperationKind {
         match value.as_ref() {
             "scan_submit" => Ok(Self::ScanSubmit),
             "runtime_trace_import_submit" => Ok(Self::RuntimeTraceImportSubmit),
+            "export_file" => Ok(Self::ExportFile),
             "daemon_start_submit" => Ok(Self::DaemonStartSubmit),
             "daemon_stop" => Ok(Self::DaemonStop),
             "resolve_build_submit" => Ok(Self::ResolveBuildSubmit),
@@ -269,6 +272,7 @@ impl OperationKind {
         match self {
             Self::ScanSubmit => "scan_submit",
             Self::RuntimeTraceImportSubmit => "runtime_trace_import_submit",
+            Self::ExportFile => "export_file",
             Self::DaemonStartSubmit => "daemon_start_submit",
             Self::DaemonStop => "daemon_stop",
             Self::ResolveBuildSubmit => "resolve_build_submit",
@@ -279,9 +283,17 @@ impl OperationKind {
     pub const fn capability_profile(self) -> CapabilityProfile {
         match self {
             Self::ScanSubmit | Self::RuntimeTraceImportSubmit => CapabilityProfile::StoreWrite,
+            Self::ExportFile => CapabilityProfile::RepositoryWrite,
             Self::DaemonStartSubmit | Self::DaemonStop => CapabilityProfile::DaemonControl,
             Self::ResolveBuildSubmit => CapabilityProfile::ProjectExec,
         }
+    }
+
+    pub(crate) const fn requires_runner_cleanup(self) -> bool {
+        matches!(
+            self,
+            Self::ScanSubmit | Self::RuntimeTraceImportSubmit | Self::ExportFile
+        )
     }
 
     fn required_capabilities(self) -> Result<CapabilitySet, JournalError> {
@@ -395,6 +407,7 @@ impl CapabilitySet {
 #[derive(Clone, Copy)]
 struct EnabledOperationKinds {
     store_write: bool,
+    repository_write: bool,
     daemon_control: bool,
     project_exec: bool,
 }
@@ -404,6 +417,8 @@ impl EnabledOperationKinds {
         Ok(Self {
             store_write: enabled_capabilities
                 .contains_all(&OperationKind::ScanSubmit.required_capabilities()?),
+            repository_write: enabled_capabilities
+                .contains_all(&OperationKind::ExportFile.required_capabilities()?),
             daemon_control: enabled_capabilities
                 .contains_all(&OperationKind::DaemonStartSubmit.required_capabilities()?),
             project_exec: enabled_capabilities
@@ -1282,12 +1297,19 @@ pub(crate) struct RunnerPurgeGuard {
 
 fn runner_purge_lock_path(journal_path: &Path) -> PathBuf {
     let mut path = journal_path.as_os_str().to_os_string();
-    path.push(".runner-purge-lock");
+    path.push(RUNNER_PURGE_LOCK_SUFFIX);
     PathBuf::from(path)
 }
 
 fn try_acquire_runner_purge_guard(
     journal_path: &Path,
+) -> Result<Option<RunnerPurgeGuard>, JournalError> {
+    try_acquire_runner_purge_guard_after_validation(journal_path, |_| Ok(()))
+}
+
+fn try_acquire_runner_purge_guard_after_validation(
+    journal_path: &Path,
+    after_validation: impl FnOnce(&Path) -> Result<(), JournalError>,
 ) -> Result<Option<RunnerPurgeGuard>, JournalError> {
     let lock_path = runner_purge_lock_path(journal_path);
     if let Ok(metadata) = std::fs::symlink_metadata(&lock_path)
@@ -1295,16 +1317,73 @@ fn try_acquire_runner_purge_guard(
     {
         return Err(JournalError::IntegrityFailure);
     }
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(lock_path)?;
+    after_validation(&lock_path)?;
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+
+        options
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(&lock_path)?;
+    let opened_metadata = file.metadata()?;
+    let path_metadata = std::fs::symlink_metadata(&lock_path)?;
+    if !opened_metadata.file_type().is_file() || !path_metadata.file_type().is_file() {
+        return Err(JournalError::IntegrityFailure);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+
+        if opened_metadata.dev() != path_metadata.dev()
+            || opened_metadata.ino() != path_metadata.ino()
+        {
+            return Err(JournalError::IntegrityFailure);
+        }
+    }
     match file.try_lock() {
         Ok(()) => Ok(Some(RunnerPurgeGuard { _file: file })),
         Err(std::fs::TryLockError::WouldBlock) => Ok(None),
         Err(std::fs::TryLockError::Error(error)) => Err(error.into()),
+    }
+}
+
+#[cfg(all(test, unix))]
+mod runner_purge_lock_tests {
+    use std::os::unix::fs::symlink;
+
+    use super::*;
+
+    #[test]
+    fn runner_purge_lock_open_does_not_follow_a_post_validation_symlink() {
+        let repository = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let journal_path = repository.path().join("graph.operations.sqlite");
+        let lock_path = runner_purge_lock_path(&journal_path);
+        let outside_target = outside.path().join("must-not-be-created");
+        std::fs::write(&lock_path, b"validated-lock").unwrap();
+
+        let result =
+            try_acquire_runner_purge_guard_after_validation(&journal_path, |validated_lock_path| {
+                std::fs::remove_file(validated_lock_path)?;
+                symlink(&outside_target, validated_lock_path)?;
+                Ok(())
+            });
+
+        assert!(result.is_err());
+        assert!(!outside_target.exists());
     }
 }
 
@@ -1387,7 +1466,7 @@ impl OperationJournal {
             repository_id,
             enabled_capabilities,
             repository_root_seal: root_seal.clone(),
-            has_retention_anchor: version == JOURNAL_SCHEMA_VERSION,
+            has_retention_anchor: version >= RETENTION_ANCHOR_JOURNAL_SCHEMA_VERSION,
         };
         journal.validate_supported_read_only()?;
         if !root_seal.matches_live_root() {
@@ -1490,6 +1569,10 @@ impl OperationJournal {
             }
             COMPLETION_INTENT_JOURNAL_SCHEMA_VERSION => {
                 validate_v3_schema(&transaction)?;
+                true
+            }
+            RETENTION_ANCHOR_JOURNAL_SCHEMA_VERSION => {
+                validate_v4_schema(&transaction)?;
                 true
             }
             JOURNAL_SCHEMA_VERSION => {
@@ -2290,7 +2373,7 @@ impl OperationJournal {
             .query_row(
                 "SELECT operation_id FROM operations
                   WHERE repository_id=?1
-                    AND kind IN ('scan_submit', 'runtime_trace_import_submit')
+                    AND kind IN ('scan_submit', 'runtime_trace_import_submit', 'export_file')
                     AND status IN ('queued', 'running', 'cancelling')
                     AND execution_deadline_ms<=?2
                     AND NOT EXISTS (
@@ -2311,7 +2394,9 @@ impl OperationJournal {
                 if &record.repository_id != repository_id
                     || !matches!(
                         record.kind,
-                        OperationKind::ScanSubmit | OperationKind::RuntimeTraceImportSubmit
+                        OperationKind::ScanSubmit
+                            | OperationKind::RuntimeTraceImportSubmit
+                            | OperationKind::ExportFile
                     )
                     || record.status.is_terminal()
                     || record.execution_deadline_ms > now_ms
@@ -2437,6 +2522,25 @@ impl OperationJournal {
         operation_id: &OperationId,
         now_ms: i64,
     ) -> Result<OperationRecord, JournalError> {
+        self.fail_deadline_inner(repository_id, operation_id, now_ms, false)
+    }
+
+    pub(crate) fn fail_deadline_after_runner_cleanup(
+        &mut self,
+        repository_id: &LogicalRepositoryId,
+        operation_id: &OperationId,
+        now_ms: i64,
+    ) -> Result<OperationRecord, JournalError> {
+        self.fail_deadline_inner(repository_id, operation_id, now_ms, true)
+    }
+
+    fn fail_deadline_inner(
+        &mut self,
+        repository_id: &LogicalRepositoryId,
+        operation_id: &OperationId,
+        now_ms: i64,
+        runner_cleanup_completed: bool,
+    ) -> Result<OperationRecord, JournalError> {
         validate_timestamp(now_ms)?;
         self.validate_requested_repository(repository_id)?;
         let enabled_capabilities = self.enabled_capabilities.clone();
@@ -2448,6 +2552,9 @@ impl OperationJournal {
         let record =
             load_record_for_deadline_failure(&transaction, repository_id, operation_id, now_ms)?;
         validate_enabled_capabilities(&enabled_capabilities, &record)?;
+        if record.kind.requires_runner_cleanup() && !runner_cleanup_completed {
+            return Err(JournalError::InvalidTransition);
+        }
         if completion_intent_exists(&transaction, operation_id)? {
             return Err(JournalError::InvalidTransition);
         }
@@ -2496,7 +2603,7 @@ impl OperationJournal {
             let mut statement = transaction.prepare(
                 "SELECT substr(operation_id, 1, 36) FROM operations
                  WHERE status IN ('queued', 'running', 'cancelling')
-                   AND kind NOT IN ('scan_submit', 'runtime_trace_import_submit')
+                   AND kind NOT IN ('scan_submit', 'runtime_trace_import_submit', 'export_file')
                    AND execution_deadline_ms <= ?1
                    AND NOT EXISTS (
                        SELECT 1 FROM operation_completion_intents AS intent
@@ -2634,7 +2741,7 @@ impl OperationJournal {
             "SELECT EXISTS(
                  SELECT 1 FROM operations
                  WHERE status IN ('queued', 'running', 'cancelling')
-                   AND kind NOT IN ('scan_submit', 'runtime_trace_import_submit')
+                   AND kind NOT IN ('scan_submit', 'runtime_trace_import_submit', 'export_file')
                    AND execution_deadline_ms <= ?1
                    AND NOT EXISTS (
                        SELECT 1 FROM operation_completion_intents AS intent
@@ -2774,7 +2881,7 @@ impl OperationJournal {
         validate_live_root(&root_seal)?;
         let version: i64 = transaction.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         if version == 0 {
-            transaction.execute_batch(&schema_v4_base()?)?;
+            transaction.execute_batch(&schema_current_base()?)?;
             transaction.execute_batch(SCHEMA_V2_METADATA)?;
             transaction.execute_batch(SCHEMA_V3_COMPLETION_INTENTS)?;
             insert_repository_binding(&transaction, JournalDigest(root_seal.binding_digest()))?;
@@ -2802,6 +2909,7 @@ impl OperationJournal {
                 COMPLETION_INTENT_JOURNAL_SCHEMA_VERSION,
             )?;
             migrate_v3_to_v4(&transaction, &root_seal, &repository_id)?;
+            migrate_v4_to_v5(&transaction, &root_seal, &repository_id)?;
         } else if version == ROOT_BOUND_JOURNAL_SCHEMA_VERSION {
             validate_v2_schema(&transaction)?;
             transaction.execute_batch(SCHEMA_V3_COMPLETION_INTENTS)?;
@@ -2811,8 +2919,12 @@ impl OperationJournal {
                 COMPLETION_INTENT_JOURNAL_SCHEMA_VERSION,
             )?;
             migrate_v3_to_v4(&transaction, &root_seal, &repository_id)?;
+            migrate_v4_to_v5(&transaction, &root_seal, &repository_id)?;
         } else if version == COMPLETION_INTENT_JOURNAL_SCHEMA_VERSION {
             migrate_v3_to_v4(&transaction, &root_seal, &repository_id)?;
+            migrate_v4_to_v5(&transaction, &root_seal, &repository_id)?;
+        } else if version == RETENTION_ANCHOR_JOURNAL_SCHEMA_VERSION {
+            migrate_v4_to_v5(&transaction, &root_seal, &repository_id)?;
         } else if version != JOURNAL_SCHEMA_VERSION {
             return Err(JournalError::UnsupportedSchemaVersion);
         } else {
@@ -3178,6 +3290,14 @@ fn validate_schema(connection: &Connection) -> Result<(), JournalError> {
     if version != JOURNAL_SCHEMA_VERSION {
         return Err(JournalError::UnsupportedSchemaVersion);
     }
+    validate_schema_surface(connection, true, true, true, &schema_current_base()?)
+}
+
+fn validate_v4_schema(connection: &Connection) -> Result<(), JournalError> {
+    let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version != RETENTION_ANCHOR_JOURNAL_SCHEMA_VERSION {
+        return Err(JournalError::UnsupportedSchemaVersion);
+    }
     validate_schema_surface(connection, true, true, true, &schema_v4_base()?)
 }
 
@@ -3373,6 +3493,68 @@ fn migrate_v3_to_v4(
          DROP TABLE operation_journal_v4_operations;
          DROP TABLE operation_journal_v4_tombstones;
          DROP TABLE operation_journal_v4_metadata;",
+    )?;
+    connection.pragma_update(
+        None,
+        "user_version",
+        RETENTION_ANCHOR_JOURNAL_SCHEMA_VERSION,
+    )?;
+
+    validate_v4_schema(connection)?;
+    validate_repository_binding(connection, JournalDigest(root_seal.binding_digest()))?;
+    validate_connection_integrity(connection)?;
+    validate_foreign_keys(connection)?;
+    validate_no_operation_tombstone_overlap(connection)?;
+    validate_operation_handoff_cardinality(connection)?;
+    validate_journal_rows(connection, repository_id, true, true)?;
+    Ok(())
+}
+
+fn migrate_v4_to_v5(
+    connection: &Connection,
+    root_seal: &RepositoryRootSeal,
+    repository_id: &LogicalRepositoryId,
+) -> Result<(), JournalError> {
+    validate_v4_schema(connection)?;
+    validate_repository_binding(connection, JournalDigest(root_seal.binding_digest()))?;
+    validate_connection_integrity(connection)?;
+    validate_foreign_keys(connection)?;
+    validate_no_operation_tombstone_overlap(connection)?;
+    validate_operation_handoff_cardinality(connection)?;
+    validate_journal_rows(connection, repository_id, true, true)?;
+
+    connection.execute_batch(
+        "CREATE TEMP TABLE operation_journal_v5_operations AS SELECT * FROM operations;
+         CREATE TEMP TABLE operation_journal_v5_runner_handoffs AS SELECT * FROM runner_handoffs;
+         CREATE TEMP TABLE operation_journal_v5_tombstones AS SELECT * FROM operation_tombstones;
+         CREATE TEMP TABLE operation_journal_v5_metadata AS SELECT * FROM operation_journal_metadata;
+         CREATE TEMP TABLE operation_journal_v5_completion_intents AS SELECT * FROM operation_completion_intents;
+
+         DROP TRIGGER operations_reject_tombstone_overlap_insert;
+         DROP TRIGGER operations_reject_tombstone_overlap_update;
+         DROP TRIGGER tombstones_reject_operation_overlap_insert;
+         DROP TRIGGER tombstones_reject_operation_overlap_update;
+         DROP TABLE operation_completion_intents;
+         DROP TABLE runner_handoffs;
+         DROP TABLE operations;
+         DROP TABLE operation_tombstones;
+         DROP TABLE operation_journal_metadata;",
+    )?;
+    connection.execute_batch(&schema_current_base()?)?;
+    connection.execute_batch(SCHEMA_V2_METADATA)?;
+    connection.execute_batch(SCHEMA_V3_COMPLETION_INTENTS)?;
+    connection.execute_batch(
+        "INSERT INTO operations SELECT * FROM operation_journal_v5_operations;
+         INSERT INTO operation_tombstones SELECT * FROM operation_journal_v5_tombstones;
+         INSERT INTO operation_journal_metadata SELECT * FROM operation_journal_v5_metadata;
+         INSERT INTO runner_handoffs SELECT * FROM operation_journal_v5_runner_handoffs;
+         INSERT INTO operation_completion_intents SELECT * FROM operation_journal_v5_completion_intents;
+
+         DROP TABLE operation_journal_v5_completion_intents;
+         DROP TABLE operation_journal_v5_runner_handoffs;
+         DROP TABLE operation_journal_v5_operations;
+         DROP TABLE operation_journal_v5_tombstones;
+         DROP TABLE operation_journal_v5_metadata;",
     )?;
     connection.pragma_update(None, "user_version", JOURNAL_SCHEMA_VERSION)?;
 
@@ -4443,10 +4625,10 @@ fn select_next_claim_candidate(
         .query_row(
             &format!(
                 "SELECT {OPERATION_COLUMNS} FROM operations AS candidate
-                 WHERE candidate.repository_id = ?4
+                 WHERE candidate.repository_id = ?5
                    AND NOT EXISTS (SELECT 1 FROM operation_completion_intents)
                    AND candidate.status IN ('queued', 'running', 'cancelling')
-                   AND candidate.execution_deadline_ms > ?5
+                   AND candidate.execution_deadline_ms > ?6
                    AND (
                        (?1 AND candidate.kind IN ('scan_submit', 'runtime_trace_import_submit')
                            AND NOT EXISTS (
@@ -4456,16 +4638,17 @@ fn select_next_claim_candidate(
                                      'scan_submit', 'runtime_trace_import_submit'
                                  )
                                  AND active_writer.status IN ('running', 'cancelling')
-                                 AND active_writer.lease_expires_at_ms > ?5
+                                 AND active_writer.lease_expires_at_ms > ?6
                            ))
-                       OR (?2 AND candidate.kind IN ('daemon_start_submit', 'daemon_stop'))
-                       OR (?3 AND candidate.kind = 'resolve_build_submit'
+                       OR (?2 AND candidate.kind = 'export_file')
+                       OR (?3 AND candidate.kind IN ('daemon_start_submit', 'daemon_stop'))
+                       OR (?4 AND candidate.kind = 'resolve_build_submit'
                            AND NOT EXISTS (
                                SELECT 1 FROM operations AS active_project_exec
                                WHERE active_project_exec.repository_id = candidate.repository_id
                                  AND active_project_exec.kind = 'resolve_build_submit'
                                  AND active_project_exec.status IN ('running', 'cancelling')
-                                 AND active_project_exec.lease_expires_at_ms > ?5
+                                 AND active_project_exec.lease_expires_at_ms > ?6
                            ))
                    )
                    AND (
@@ -4474,7 +4657,7 @@ fn select_next_claim_candidate(
                            candidate.status IN ('running', 'cancelling')
                            AND (
                                candidate.lease_expires_at_ms IS NULL
-                               OR candidate.lease_expires_at_ms <= ?5
+                               OR candidate.lease_expires_at_ms <= ?6
                            )
                        )
                    )
@@ -4483,6 +4666,7 @@ fn select_next_claim_candidate(
             ),
             params![
                 enabled_kinds.store_write,
+                enabled_kinds.repository_write,
                 enabled_kinds.daemon_control,
                 enabled_kinds.project_exec,
                 repository_id,
@@ -5095,6 +5279,16 @@ fn schema_v4_base() -> Result<String, JournalError> {
         .replacen(V3_INPUT_CHECK, V4_INPUT_CHECK, 1)
         .replacen(V3_HANDOFF_CHECK, V4_HANDOFF_CHECK, 1)
         .replacen(V3_RETENTION_COLUMNS, V4_RETENTION_COLUMNS, 1))
+}
+
+fn schema_current_base() -> Result<String, JournalError> {
+    const V4_KINDS: &str = "'scan_submit', 'runtime_trace_import_submit', 'daemon_start_submit', 'daemon_stop', 'resolve_build_submit'";
+    const V5_KINDS: &str = "'scan_submit', 'runtime_trace_import_submit', 'export_file', 'daemon_start_submit', 'daemon_stop', 'resolve_build_submit'";
+    let schema = schema_v4_base()?;
+    if schema.matches(V4_KINDS).count() != 3 {
+        return Err(JournalError::IntegrityFailure);
+    }
+    Ok(schema.replace(V4_KINDS, V5_KINDS))
 }
 
 const SCHEMA_V2_METADATA: &str = r#"

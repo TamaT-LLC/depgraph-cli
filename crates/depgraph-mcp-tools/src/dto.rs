@@ -3715,6 +3715,173 @@ pub enum AgentGraphExportFormat {
     Graphml,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentRepositoryInitOutcome {
+    output_path: RepositoryRelativePath,
+}
+
+impl JsonSchema for AgentRepositoryInitOutcome {
+    fn schema_name() -> Cow<'static, str> {
+        "AgentRepositoryInitOutcome".into()
+    }
+
+    fn schema_id() -> Cow<'static, str> {
+        concat!(module_path!(), "::AgentRepositoryInitOutcome").into()
+    }
+
+    fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
+        json_schema!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "output_path": {
+                    "type": "string",
+                    "const": depgraph_core::config::CONFIG_FILE,
+                },
+            },
+            "required": ["output_path"],
+        })
+    }
+}
+
+impl AgentRepositoryInitOutcome {
+    pub fn new(output_path: impl AsRef<str>) -> Result<Self, ContractBuildError> {
+        let output_path = RepositoryRelativePath::parse(output_path)
+            .map_err(|_| ContractBuildError::AgentDtoValue)?;
+        if output_path.as_str() != depgraph_core::config::CONFIG_FILE {
+            return Err(ContractBuildError::AgentDtoValue);
+        }
+        Ok(Self { output_path })
+    }
+
+    #[must_use]
+    pub const fn output_path(&self) -> &RepositoryRelativePath {
+        &self.output_path
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentRepositoryInitOutcomeWire {
+    output_path: RepositoryRelativePath,
+}
+
+impl<'de> Deserialize<'de> for AgentRepositoryInitOutcome {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = AgentRepositoryInitOutcomeWire::deserialize(deserializer)?;
+        Self::new(wire.output_path.as_str()).map_err(D::Error::custom)
+    }
+}
+
+impl TryFrom<&depgraph_core::service::RepositoryInitResult> for AgentRepositoryInitOutcome {
+    type Error = ContractBuildError;
+
+    fn try_from(
+        source: &depgraph_core::service::RepositoryInitResult,
+    ) -> Result<Self, Self::Error> {
+        Self::new(source.output_path().as_str())
+    }
+}
+
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentExportOutcome {
+    output_path: RepositoryRelativePath,
+    format: AgentGraphExportFormat,
+    #[schemars(range(min = 1))]
+    output_bytes: u64,
+    content_sha256: Sha256Digest,
+}
+
+impl AgentExportOutcome {
+    pub fn new(
+        output_path: impl AsRef<str>,
+        format: AgentGraphExportFormat,
+        output_bytes: u64,
+        content_sha256: impl AsRef<str>,
+    ) -> Result<Self, ContractBuildError> {
+        if output_bytes == 0 {
+            return Err(ContractBuildError::AgentDtoValue);
+        }
+        Ok(Self {
+            output_path: RepositoryRelativePath::parse(output_path)
+                .map_err(|_| ContractBuildError::AgentDtoValue)?,
+            format,
+            output_bytes,
+            content_sha256: Sha256Digest::parse(content_sha256)
+                .map_err(|_| ContractBuildError::AgentDtoValue)?,
+        })
+    }
+
+    #[must_use]
+    pub const fn output_path(&self) -> &RepositoryRelativePath {
+        &self.output_path
+    }
+
+    #[must_use]
+    pub const fn format(&self) -> AgentGraphExportFormat {
+        self.format
+    }
+
+    #[must_use]
+    pub const fn output_bytes(&self) -> u64 {
+        self.output_bytes
+    }
+
+    #[must_use]
+    pub const fn content_sha256(&self) -> &Sha256Digest {
+        &self.content_sha256
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentExportOutcomeWire {
+    output_path: RepositoryRelativePath,
+    format: AgentGraphExportFormat,
+    output_bytes: u64,
+    content_sha256: Sha256Digest,
+}
+
+impl<'de> Deserialize<'de> for AgentExportOutcome {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = AgentExportOutcomeWire::deserialize(deserializer)?;
+        Self::new(
+            wire.output_path.as_str(),
+            wire.format,
+            wire.output_bytes,
+            wire.content_sha256.as_str(),
+        )
+        .map_err(D::Error::custom)
+    }
+}
+
+impl TryFrom<&depgraph_core::service::ExportFileResult> for AgentExportOutcome {
+    type Error = ContractBuildError;
+
+    fn try_from(source: &depgraph_core::service::ExportFileResult) -> Result<Self, Self::Error> {
+        let format = match source.format() {
+            depgraph_core::service::GraphExportFormat::Json => AgentGraphExportFormat::Json,
+            depgraph_core::service::GraphExportFormat::Dot => AgentGraphExportFormat::Dot,
+            depgraph_core::service::GraphExportFormat::Mermaid => AgentGraphExportFormat::Mermaid,
+            depgraph_core::service::GraphExportFormat::Graphml => AgentGraphExportFormat::Graphml,
+        };
+        Self::new(
+            source.output_path().as_str(),
+            format,
+            source.output_bytes(),
+            source.content_sha256(),
+        )
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 pub enum AgentGraphExportMediaType {
     #[serde(rename = "application/json")]

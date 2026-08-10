@@ -5,17 +5,21 @@ use std::{
 };
 
 use depgraph_core::{
-    CancellationToken, DepgraphService, DepgraphServiceConfig, DepgraphServiceError, ScanCacheMode,
+    CancellationToken, DepgraphCapability, DepgraphService, DepgraphServiceConfig,
+    DepgraphServiceError, GraphQueryFilter, ScanCacheMode,
     service::{
-        DeferredRuntimeImportCompletion, DeferredRuntimeImportRecovery,
-        DeferredRuntimeImportServiceOutcome, DeferredScanCompletion, DeferredScanRecovery,
-        DeferredScanServiceOutcome, RepositoryRelativePath, RuntimeValidateRequest, ScanRequest,
-        ServiceSnapshotSelector, SnapshotLocator,
+        DeferredExportFileCompletion, DeferredExportFileRecovery, DeferredRuntimeImportCompletion,
+        DeferredRuntimeImportRecovery, DeferredRuntimeImportServiceOutcome, DeferredScanCompletion,
+        DeferredScanRecovery, DeferredScanServiceOutcome, ExportFileRequest, GraphExportFormat,
+        GraphExportRequest, RepositoryOutputPrecondition, RepositoryOverwritePolicy,
+        RepositoryRelativePath, RuntimeValidateRequest, ScanRequest, ServiceSnapshotSelector,
+        SnapshotLocator,
     },
 };
 use depgraph_mcp_tools::{
-    AgentError, AgentErrorCode, AgentRemediation, AgentRuntimeOutcome, AgentRuntimeStatus,
-    AgentScanOutcome, ErrorEnvelope, LogicalRepositoryId, OperationId, SnapshotId, SuccessEnvelope,
+    AgentError, AgentErrorCode, AgentExportOutcome, AgentGraphExportFormat, AgentRemediation,
+    AgentRuntimeOutcome, AgentRuntimeStatus, AgentScanOutcome, ErrorEnvelope, LogicalRepositoryId,
+    OperationId, SnapshotId, SuccessEnvelope,
 };
 
 use crate::{
@@ -123,6 +127,7 @@ pub enum DispatchOutcome {
 pub enum DeferredOperationCompletion {
     Scan(Box<DeferredScanCompletion>),
     RuntimeImport(Box<DeferredRuntimeImportCompletion>),
+    ExportFile(Box<DeferredExportFileCompletion>),
 }
 
 impl DeferredOperationCompletion {
@@ -138,15 +143,21 @@ impl DeferredOperationCompletion {
         match self {
             Self::Scan(completion) => completion.promote().map(|_| ()).map_err(Into::into),
             Self::RuntimeImport(completion) => completion.promote().map(|_| ()).map_err(Into::into),
+            Self::ExportFile(completion) => completion.promote().map_err(Into::into),
         }
     }
 
-    fn cancel(self) -> Result<std::fs::File, RunnerError> {
+    fn cancel(self) -> Result<Option<std::fs::File>, RunnerError> {
         match self {
-            Self::Scan(completion) => completion.cancel_with_writer_guard().map_err(Into::into),
-            Self::RuntimeImport(completion) => {
-                completion.cancel_with_writer_guard().map_err(Into::into)
-            }
+            Self::Scan(completion) => completion
+                .cancel_with_writer_guard()
+                .map(Some)
+                .map_err(Into::into),
+            Self::RuntimeImport(completion) => completion
+                .cancel_with_writer_guard()
+                .map(Some)
+                .map_err(Into::into),
+            Self::ExportFile(completion) => completion.cancel().map(|()| None).map_err(Into::into),
         }
     }
 }
@@ -229,10 +240,16 @@ pub struct ExecutionControl<'a> {
     operation_id: &'a OperationId,
     lease_token: &'a [u8],
     execution_deadline_ms: i64,
+    cancellation: &'a CancellationToken,
     now: &'a dyn Fn() -> Result<i64, RunnerError>,
 }
 
 impl ExecutionControl<'_> {
+    #[must_use]
+    pub const fn cancellation_token(&self) -> &CancellationToken {
+        self.cancellation
+    }
+
     pub fn checkpoint(&mut self) -> Result<ExecutionCheckpoint, RunnerError> {
         let now_ms = (self.now)()?;
         if now_ms >= self.execution_deadline_ms {
@@ -536,6 +553,7 @@ impl<D: OperationDispatcher> OperationRunner<D> {
                 .lease()
                 .ok_or(RunnerError::Journal(JournalError::IntegrityFailure))?
                 .expires_at_ms();
+            let execution_cancellation = CancellationToken::new();
             let guardian = match LeaseGuardian::start(
                 self.startup.clone(),
                 repository_id.clone(),
@@ -544,10 +562,26 @@ impl<D: OperationDispatcher> OperationRunner<D> {
                 initial_lease_expires_at_ms,
                 work.execution_deadline_ms(),
                 self.lease_timing,
+                execution_cancellation.clone(),
                 #[cfg(test)]
                 self.guardian_events.clone(),
             )? {
                 LeaseGuardianStart::Active(guardian) => guardian,
+                LeaseGuardianStart::Inactive(LeaseGuardianExit::CancellationRequested) => {
+                    let terminal_at_ms = system_now_ms()?;
+                    self.terminalize_after_cleanup(&work, None, || {
+                        journal
+                            .mark_cancelled(
+                                &repository_id,
+                                work.operation_id(),
+                                token.as_ref(),
+                                terminal_at_ms,
+                            )
+                            .map_err(RunnerError::from)
+                    })?;
+                    report.cancelled += 1;
+                    continue;
+                }
                 LeaseGuardianStart::Inactive(LeaseGuardianExit::DeadlineExceeded) => {
                     self.terminalize_after_cleanup(&work, None, || {
                         record_deadline_failure(
@@ -580,6 +614,7 @@ impl<D: OperationDispatcher> OperationRunner<D> {
                     operation_id: work.operation_id(),
                     lease_token: token.as_ref(),
                     execution_deadline_ms: work.execution_deadline_ms(),
+                    cancellation: &execution_cancellation,
                     now: &system_now_ms,
                 };
                 Ok(match control.checkpoint()? {
@@ -601,6 +636,27 @@ impl<D: OperationDispatcher> OperationRunner<D> {
             let controlled_dispatch = controlled_dispatch?;
             match guardian_exit {
                 LeaseGuardianExit::Stopped => {}
+                LeaseGuardianExit::CancellationRequested => {
+                    let cleanup_guard =
+                        if let ControlledDispatch::Outcome(outcome, _) = controlled_dispatch {
+                            discard_pending_completion(outcome)?
+                        } else {
+                            None
+                        };
+                    let terminal_at_ms = system_now_ms()?;
+                    self.terminalize_after_cleanup(&work, cleanup_guard, || {
+                        journal
+                            .mark_cancelled(
+                                &repository_id,
+                                work.operation_id(),
+                                token.as_ref(),
+                                terminal_at_ms,
+                            )
+                            .map_err(RunnerError::from)
+                    })?;
+                    report.cancelled += 1;
+                    continue;
+                }
                 LeaseGuardianExit::DeadlineExceeded => {
                     let cleanup_guard =
                         if let ControlledDispatch::Outcome(outcome, _) = controlled_dispatch {
@@ -739,27 +795,23 @@ impl<D: OperationDispatcher> OperationRunner<D> {
                                 }
                                 CompletionDecision::CancellationWon => {
                                     let cleanup_guard = completion.cancel()?;
-                                    self.terminalize_after_cleanup(
-                                        &work,
-                                        Some(cleanup_guard),
-                                        || {
-                                            journal
-                                                .mark_cancelled(
-                                                    &repository_id,
-                                                    work.operation_id(),
-                                                    token.as_ref(),
-                                                    system_now_ms()?,
-                                                )
-                                                .map_err(RunnerError::from)
-                                        },
-                                    )?;
+                                    self.terminalize_after_cleanup(&work, cleanup_guard, || {
+                                        journal
+                                            .mark_cancelled(
+                                                &repository_id,
+                                                work.operation_id(),
+                                                token.as_ref(),
+                                                system_now_ms()?,
+                                            )
+                                            .map_err(RunnerError::from)
+                                    })?;
                                     report.cancelled += 1;
                                 }
                             }
                         }
                         DispatchOutcome::CancellationCleanupPending { completion } => {
                             let cleanup_guard = completion.cancel()?;
-                            self.terminalize_after_cleanup(&work, Some(cleanup_guard), || {
+                            self.terminalize_after_cleanup(&work, cleanup_guard, || {
                                 journal
                                     .mark_cancelled(
                                         &repository_id,
@@ -773,7 +825,7 @@ impl<D: OperationDispatcher> OperationRunner<D> {
                         }
                         DispatchOutcome::FailureCleanupPending { error, completion } => {
                             let cleanup_guard = completion.cancel()?;
-                            self.terminalize_after_cleanup(&work, Some(cleanup_guard), || {
+                            self.terminalize_after_cleanup(&work, cleanup_guard, || {
                                 journal
                                     .fail(
                                         &repository_id,
@@ -826,9 +878,7 @@ fn discard_pending_completion(
     match outcome {
         DispatchOutcome::CompletionPending { completion, .. }
         | DispatchOutcome::CancellationCleanupPending { completion }
-        | DispatchOutcome::FailureCleanupPending { completion, .. } => {
-            completion.cancel().map(Some)
-        }
+        | DispatchOutcome::FailureCleanupPending { completion, .. } => completion.cancel(),
         DispatchOutcome::Completed(_) | DispatchOutcome::Failed(_) | DispatchOutcome::Cancelled => {
             Ok(None)
         }
@@ -863,6 +913,7 @@ impl LeaseTiming {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LeaseGuardianExit {
     Stopped,
+    CancellationRequested,
     DeadlineExceeded,
     LeaseLost,
 }
@@ -899,6 +950,7 @@ impl LeaseGuardian {
         initial_lease_expires_at_ms: i64,
         execution_deadline_ms: i64,
         timing: LeaseTiming,
+        cancellation: CancellationToken,
         #[cfg(test)] events: Option<mpsc::Sender<LeaseGuardianEvent>>,
     ) -> Result<LeaseGuardianStart, RunnerError> {
         let stop = Arc::new((Mutex::new(false), Condvar::new()));
@@ -921,10 +973,14 @@ impl LeaseGuardian {
                 }
                 let renewed_at_ms = system_now_ms()?;
                 if renewed_at_ms >= execution_deadline_ms {
+                    let exit = signal_execution_cancellation(
+                        &cancellation,
+                        LeaseGuardianExit::DeadlineExceeded,
+                    );
                     startup_ready
-                        .send(Err(LeaseGuardianExit::DeadlineExceeded))
+                        .send(Err(exit))
                         .map_err(|_| guardian_failure())?;
-                    return Ok(LeaseGuardianExit::DeadlineExceeded);
+                    return Ok(exit);
                 }
                 let renewed_until_ms = renewed_at_ms
                     .checked_add(timing.duration_ms)
@@ -939,19 +995,37 @@ impl LeaseGuardian {
                 ) {
                     Ok(record) => record,
                     Err(JournalError::DeadlineExceeded) => {
+                        let exit = signal_execution_cancellation(
+                            &cancellation,
+                            LeaseGuardianExit::DeadlineExceeded,
+                        );
                         startup_ready
-                            .send(Err(LeaseGuardianExit::DeadlineExceeded))
+                            .send(Err(exit))
                             .map_err(|_| guardian_failure())?;
-                        return Ok(LeaseGuardianExit::DeadlineExceeded);
+                        return Ok(exit);
                     }
                     Err(JournalError::LeaseExpired | JournalError::LeaseMismatch) => {
+                        let exit = signal_execution_cancellation(
+                            &cancellation,
+                            LeaseGuardianExit::LeaseLost,
+                        );
                         startup_ready
-                            .send(Err(LeaseGuardianExit::LeaseLost))
+                            .send(Err(exit))
                             .map_err(|_| guardian_failure())?;
-                        return Ok(LeaseGuardianExit::LeaseLost);
+                        return Ok(exit);
                     }
                     Err(error) => return Err(RunnerError::Journal(error)),
                 };
+                if record.status() == OperationStatus::Cancelling {
+                    let exit = signal_execution_cancellation(
+                        &cancellation,
+                        LeaseGuardianExit::CancellationRequested,
+                    );
+                    startup_ready
+                        .send(Err(exit))
+                        .map_err(|_| guardian_failure())?;
+                    return Ok(exit);
+                }
                 let lease_expires_at_ms = record
                     .lease()
                     .ok_or(RunnerError::Journal(JournalError::IntegrityFailure))?
@@ -973,6 +1047,7 @@ impl LeaseGuardian {
                     execution_deadline_ms,
                     timing,
                     &thread_stop,
+                    &cancellation,
                     #[cfg(test)]
                     events.as_ref(),
                 )
@@ -1031,6 +1106,7 @@ fn guard_lease(
     execution_deadline_ms: i64,
     timing: LeaseTiming,
     stop: &Arc<(Mutex<bool>, Condvar)>,
+    cancellation: &CancellationToken,
     #[cfg(test)] events: Option<&mpsc::Sender<LeaseGuardianEvent>>,
 ) -> Result<LeaseGuardianExit, RunnerError> {
     loop {
@@ -1039,7 +1115,10 @@ fn guard_lease(
         }
         let now_ms = system_now_ms()?;
         if now_ms >= execution_deadline_ms {
-            return Ok(LeaseGuardianExit::DeadlineExceeded);
+            return Ok(signal_execution_cancellation(
+                cancellation,
+                LeaseGuardianExit::DeadlineExceeded,
+            ));
         }
         let wake_at_ms = if lease_expires_at_ms >= execution_deadline_ms {
             execution_deadline_ms
@@ -1057,7 +1136,10 @@ fn guard_lease(
 
         let renewed_at_ms = system_now_ms()?;
         if renewed_at_ms >= execution_deadline_ms {
-            return Ok(LeaseGuardianExit::DeadlineExceeded);
+            return Ok(signal_execution_cancellation(
+                cancellation,
+                LeaseGuardianExit::DeadlineExceeded,
+            ));
         }
         let renewed_until_ms = renewed_at_ms
             .checked_add(timing.duration_ms)
@@ -1072,13 +1154,25 @@ fn guard_lease(
         ) {
             Ok(record) => record,
             Err(JournalError::DeadlineExceeded) => {
-                return Ok(LeaseGuardianExit::DeadlineExceeded);
+                return Ok(signal_execution_cancellation(
+                    cancellation,
+                    LeaseGuardianExit::DeadlineExceeded,
+                ));
             }
             Err(JournalError::LeaseExpired | JournalError::LeaseMismatch) => {
-                return Ok(LeaseGuardianExit::LeaseLost);
+                return Ok(signal_execution_cancellation(
+                    cancellation,
+                    LeaseGuardianExit::LeaseLost,
+                ));
             }
             Err(error) => return Err(RunnerError::Journal(error)),
         };
+        if record.status() == OperationStatus::Cancelling {
+            return Ok(signal_execution_cancellation(
+                cancellation,
+                LeaseGuardianExit::CancellationRequested,
+            ));
+        }
         lease_expires_at_ms = record
             .lease()
             .ok_or(RunnerError::Journal(JournalError::IntegrityFailure))?
@@ -1120,6 +1214,14 @@ fn join_guardian(
     join.join().map_err(|_| guardian_failure())?
 }
 
+fn signal_execution_cancellation(
+    cancellation: &CancellationToken,
+    exit: LeaseGuardianExit,
+) -> LeaseGuardianExit {
+    cancellation.cancel();
+    exit
+}
+
 fn guardian_failure() -> RunnerError {
     RunnerError::Journal(JournalError::IntegrityFailure)
 }
@@ -1136,7 +1238,11 @@ fn record_deadline_failure(
         report.lease_lost += 1;
         return Ok(());
     }
-    match journal.fail_deadline(repository_id, operation_id, execution_deadline_ms) {
+    match journal.fail_deadline_after_runner_cleanup(
+        repository_id,
+        operation_id,
+        execution_deadline_ms,
+    ) {
         Ok(_) => report.failed += 1,
         Err(JournalError::InvalidTransition) => {
             let record = journal.get(repository_id, operation_id, execution_deadline_ms)?;
@@ -1203,6 +1309,22 @@ struct ScanInput {
     no_cache: bool,
 }
 
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExportFileInput {
+    output_path: String,
+    #[serde(default)]
+    overwrite: bool,
+    format: GraphExportFormat,
+    snapshot_id: SnapshotId,
+    #[serde(default)]
+    selector: Option<String>,
+    max_nodes: usize,
+    max_edges: usize,
+    #[serde(default)]
+    destination_precondition: Option<RepositoryOutputPrecondition>,
+}
+
 impl RuntimeImportInput {
     fn retained_runtime_identity(&self) -> Result<Option<(String, String)>, ()> {
         match (
@@ -1231,6 +1353,41 @@ struct RuntimeCompletionRecoveryBinding {
 }
 
 impl ScanOperationDispatcher {
+    fn export_file_request(
+        &self,
+        input: &ExportFileInput,
+    ) -> Result<ExportFileRequest, DepgraphServiceError> {
+        if input.overwrite && input.destination_precondition.is_none() {
+            return Err(DepgraphServiceError::InvalidInput);
+        }
+        let snapshot = match SnapshotLocator::parse(input.snapshot_id.as_str())? {
+            SnapshotLocator::StableId(snapshot_id) => SnapshotLocator::StableId(snapshot_id),
+            _ => return Err(DepgraphServiceError::Integrity),
+        };
+        let graph = GraphExportRequest::try_new(
+            snapshot,
+            input.format,
+            input.selector.clone(),
+            GraphQueryFilter::default(),
+            input.max_nodes,
+            input.max_edges,
+        )?;
+        let output_path = RepositoryRelativePath::parse(&input.output_path)?;
+        let request = ExportFileRequest::new(
+            graph,
+            output_path,
+            if input.overwrite {
+                RepositoryOverwritePolicy::Overwrite
+            } else {
+                RepositoryOverwritePolicy::NoReplace
+            },
+        );
+        Ok(match &input.destination_precondition {
+            Some(precondition) => request.with_destination_precondition(precondition.clone()),
+            None => request,
+        })
+    }
+
     #[must_use]
     pub const fn new(config: DepgraphServiceConfig) -> Self {
         Self {
@@ -1347,6 +1504,53 @@ impl ScanOperationDispatcher {
                 self.failed(AgentErrorCode::CapabilityDenied)
             }
             Err(_) => self.failed(AgentErrorCode::Internal),
+        }
+    }
+
+    fn dispatch_export_file(
+        &self,
+        work: &RunnerWork,
+        control: &mut ExecutionControl<'_>,
+    ) -> DispatchOutcome {
+        let input = match serde_json::from_str::<ExportFileInput>(work.input().as_str()) {
+            Ok(input) => input,
+            Err(_) => return self.failed(AgentErrorCode::InvalidArgument),
+        };
+        if !matches!(control.checkpoint(), Ok(ExecutionCheckpoint::Continue)) {
+            return DispatchOutcome::Cancelled;
+        }
+        let request = match self.export_file_request(&input) {
+            Ok(request) => request,
+            Err(error) => return self.failed_service(&error),
+        };
+        let service = DepgraphService::new(self.config.clone());
+        let cancellation = control.cancellation_token().clone();
+        let completion = match service.export_file_deferred_for_operation(
+            &request,
+            work.operation_id().as_str(),
+            &cancellation,
+        ) {
+            Ok(completion) => completion,
+            Err(DepgraphServiceError::Cancelled) => return DispatchOutcome::Cancelled,
+            Err(error) => return self.failed_service(&error),
+        };
+        if !matches!(control.checkpoint(), Ok(ExecutionCheckpoint::Continue)) {
+            return DispatchOutcome::CancellationCleanupPending {
+                completion: DeferredOperationCompletion::ExportFile(Box::new(completion)),
+            };
+        }
+        let result = match self.completed_export_output(&completion) {
+            Ok(result) => result,
+            Err(error) => {
+                return DispatchOutcome::FailureCleanupPending {
+                    error,
+                    completion: DeferredOperationCompletion::ExportFile(Box::new(completion)),
+                };
+            }
+        };
+        DispatchOutcome::CompletionPending {
+            result,
+            completion: DeferredOperationCompletion::ExportFile(Box::new(completion)),
         }
     }
 
@@ -1553,6 +1757,27 @@ impl ScanOperationDispatcher {
         .map_err(|_| self.canonical_error(AgentErrorCode::IntegrityFailure))
     }
 
+    fn completed_export_output(
+        &self,
+        completion: &DeferredExportFileCompletion,
+    ) -> Result<CanonicalJson, CanonicalJson> {
+        let outcome = AgentExportOutcome::try_from(completion.result())
+            .map_err(|_| self.canonical_error(AgentErrorCode::IntegrityFailure))?;
+        let snapshot_id = SnapshotId::parse(completion.snapshot_id())
+            .map_err(|_| self.canonical_error(AgentErrorCode::IntegrityFailure))?;
+        let repository_id = LogicalRepositoryId::parse(self.config.logical_repository_id())
+            .map_err(|_| self.canonical_error(AgentErrorCode::IntegrityFailure))?;
+        CanonicalJson::new(
+            serde_json::to_value(SuccessEnvelope::new(
+                repository_id,
+                Some(snapshot_id),
+                outcome,
+            ))
+            .expect("closed export output serializes"),
+        )
+        .map_err(|_| self.canonical_error(AgentErrorCode::IntegrityFailure))
+    }
+
     fn runtime_completion_recovery_binding(
         &self,
         intent: &CompletionIntent,
@@ -1594,17 +1819,26 @@ impl ScanOperationDispatcher {
     fn failed_service(&self, error: &DepgraphServiceError) -> DispatchOutcome {
         use depgraph_core::service::DepgraphServiceErrorCategory;
 
-        let code = match error.category() {
-            DepgraphServiceErrorCategory::Authorization => AgentErrorCode::CapabilityDenied,
-            DepgraphServiceErrorCategory::Input => AgentErrorCode::InvalidArgument,
-            DepgraphServiceErrorCategory::NotFound => AgentErrorCode::SnapshotNotFound,
-            DepgraphServiceErrorCategory::Conflict => AgentErrorCode::Conflict,
-            DepgraphServiceErrorCategory::Resource => AgentErrorCode::ResourceExhausted,
-            DepgraphServiceErrorCategory::Cancelled => return DispatchOutcome::Cancelled,
-            DepgraphServiceErrorCategory::Integrity => AgentErrorCode::IntegrityFailure,
-            DepgraphServiceErrorCategory::Configuration
-            | DepgraphServiceErrorCategory::Store
-            | DepgraphServiceErrorCategory::Internal => AgentErrorCode::Internal,
+        let code = if matches!(
+            error,
+            DepgraphServiceError::RepositoryFile {
+                reason: depgraph_core::service::RepositoryFileError::NotFound,
+            }
+        ) {
+            AgentErrorCode::NotFound
+        } else {
+            match error.category() {
+                DepgraphServiceErrorCategory::Authorization => AgentErrorCode::CapabilityDenied,
+                DepgraphServiceErrorCategory::Input => AgentErrorCode::InvalidArgument,
+                DepgraphServiceErrorCategory::NotFound => AgentErrorCode::SnapshotNotFound,
+                DepgraphServiceErrorCategory::Conflict => AgentErrorCode::Conflict,
+                DepgraphServiceErrorCategory::Resource => AgentErrorCode::ResourceExhausted,
+                DepgraphServiceErrorCategory::Cancelled => return DispatchOutcome::Cancelled,
+                DepgraphServiceErrorCategory::Integrity => AgentErrorCode::IntegrityFailure,
+                DepgraphServiceErrorCategory::Configuration
+                | DepgraphServiceErrorCategory::Store
+                | DepgraphServiceErrorCategory::Internal => AgentErrorCode::Internal,
+            }
         };
         self.failed(code)
     }
@@ -1645,6 +1879,7 @@ impl OperationDispatcher for ScanOperationDispatcher {
         match work.kind() {
             OperationKind::ScanSubmit => self.dispatch_scan(work, control),
             OperationKind::RuntimeTraceImportSubmit => self.dispatch_runtime_import(work, control),
+            OperationKind::ExportFile => self.dispatch_export_file(work, control),
             _ => UnsupportedOperationDispatcher.dispatch(work, control),
         }
     }
@@ -1653,6 +1888,48 @@ impl OperationDispatcher for ScanOperationDispatcher {
         &mut self,
         intent: &CompletionIntent,
     ) -> Result<CompletionRecovery, RunnerError> {
+        if intent.kind() == OperationKind::ExportFile {
+            let input = serde_json::from_str::<ExportFileInput>(intent.normalized_input().as_str())
+                .map_err(|_| RunnerError::Journal(JournalError::IntegrityFailure))?;
+            let envelope = serde_json::from_value::<SuccessEnvelope<AgentExportOutcome>>(
+                intent.result().value().clone(),
+            )
+            .map_err(|_| RunnerError::Journal(JournalError::IntegrityFailure))?;
+            let repository_id = LogicalRepositoryId::parse(self.config.logical_repository_id())
+                .map_err(|_| RunnerError::Journal(JournalError::IntegrityFailure))?;
+            let expected_format = match input.format {
+                GraphExportFormat::Json => AgentGraphExportFormat::Json,
+                GraphExportFormat::Dot => AgentGraphExportFormat::Dot,
+                GraphExportFormat::Mermaid => AgentGraphExportFormat::Mermaid,
+                GraphExportFormat::Graphml => AgentGraphExportFormat::Graphml,
+            };
+            let outcome = envelope.result();
+            if envelope.repository_id() != &repository_id
+                || envelope.snapshot_id() != Some(&input.snapshot_id)
+                || outcome.output_path().as_str() != input.output_path
+                || outcome.format() != expected_format
+            {
+                return Err(RunnerError::Journal(JournalError::IntegrityFailure));
+            }
+            let output_path = RepositoryRelativePath::parse(&input.output_path)
+                .map_err(|_| RunnerError::Journal(JournalError::IntegrityFailure))?;
+            DepgraphService::new(self.config.clone()).recover_deferred_export_file_completion(
+                &DeferredExportFileRecovery {
+                    operation_id: intent.operation_id().as_str(),
+                    output_path: &output_path,
+                    overwrite: if input.overwrite {
+                        RepositoryOverwritePolicy::Overwrite
+                    } else {
+                        RepositoryOverwritePolicy::NoReplace
+                    },
+                    format: input.format,
+                    output_bytes: outcome.output_bytes(),
+                    content_sha256: outcome.content_sha256().as_str(),
+                    destination_precondition: input.destination_precondition.as_ref(),
+                },
+            )?;
+            return Ok(CompletionRecovery::Finalized);
+        }
         if intent.kind() == OperationKind::RuntimeTraceImportSubmit {
             let binding = self.runtime_completion_recovery_binding(intent)?;
             let outcome = binding.envelope.result();
@@ -1721,6 +1998,17 @@ impl OperationDispatcher for ScanOperationDispatcher {
                 .map(Some)
                 .map_err(Into::into);
         }
+        if work.kind() == OperationKind::ExportFile {
+            let input = serde_json::from_str::<ExportFileInput>(work.input().as_str())
+                .map_err(|_| RunnerError::Journal(JournalError::IntegrityFailure))?;
+            let request = self.export_file_request(&input)?;
+            DepgraphService::new(self.config.clone()).cancel_deferred_export_file_for_operation(
+                &request,
+                work.operation_id().as_str(),
+                &CancellationToken::new(),
+            )?;
+            return Ok(None);
+        }
         if work.kind() != OperationKind::RuntimeTraceImportSubmit {
             return Ok(None);
         }
@@ -1734,6 +2022,13 @@ impl OperationDispatcher for ScanOperationDispatcher {
         &mut self,
         after_operation_id: Option<&str>,
     ) -> Result<(Vec<OperationId>, Option<String>), RunnerError> {
+        if !self
+            .config
+            .capabilities()
+            .contains(DepgraphCapability::StoreWrite)
+        {
+            return Ok((Vec::new(), None));
+        }
         let pending = DepgraphService::new(self.config.clone())
             .pending_deferred_scan_cancellations(after_operation_id)?;
         let next_after_operation_id = pending.next_after_operation_id().map(ToOwned::to_owned);
@@ -1749,6 +2044,13 @@ impl OperationDispatcher for ScanOperationDispatcher {
     }
 
     fn reconcile_legacy_staging(&mut self) -> Result<Option<bool>, RunnerError> {
+        if !self
+            .config
+            .capabilities()
+            .contains(DepgraphCapability::StoreWrite)
+        {
+            return Ok(Some(false));
+        }
         match DepgraphService::new(self.config.clone()).reconcile_legacy_scan_operation_staging() {
             Ok(more_work) => Ok(Some(more_work)),
             Err(DepgraphServiceError::StoreWriterConflict) => Ok(None),
@@ -1851,6 +2153,55 @@ mod tests {
             DepgraphServiceLimits::default(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn repository_file_not_found_is_distinct_from_snapshot_not_found() {
+        let root = tempfile::tempdir().unwrap();
+        let dispatcher = ScanOperationDispatcher::new(config(root.path()));
+        let error_code = |outcome| match outcome {
+            DispatchOutcome::Failed(error) => error.value()["error"]["code"].clone(),
+            _ => panic!("service error must produce a terminal failure"),
+        };
+
+        assert_eq!(
+            error_code(
+                dispatcher.failed_service(&DepgraphServiceError::RepositoryFile {
+                    reason: depgraph_core::service::RepositoryFileError::NotFound,
+                })
+            ),
+            json!("NOT_FOUND")
+        );
+        assert_eq!(
+            error_code(dispatcher.failed_service(&DepgraphServiceError::NotFound)),
+            json!("SNAPSHOT_NOT_FOUND")
+        );
+    }
+
+    #[test]
+    fn overwrite_export_input_requires_a_durable_destination_precondition() {
+        let root = tempfile::tempdir().unwrap();
+        let dispatcher = ScanOperationDispatcher::new(config(root.path()));
+        let input = ExportFileInput {
+            output_path: "artifacts/graph.json".to_owned(),
+            overwrite: true,
+            format: GraphExportFormat::Json,
+            snapshot_id: SnapshotId::parse(
+                "snapshot:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )
+            .unwrap(),
+            selector: None,
+            max_nodes: 100,
+            max_edges: 100,
+            destination_precondition: None,
+        };
+
+        let error = dispatcher.export_file_request(&input).unwrap_err();
+
+        assert_eq!(
+            error.category(),
+            depgraph_core::service::DepgraphServiceErrorCategory::Input
+        );
     }
 
     fn runtime_import_fixture(
@@ -2076,6 +2427,7 @@ mod tests {
                 operation_id: &operation_id,
                 lease_token: b"renewing-token",
                 execution_deadline_ms: NOW + 1_000,
+                cancellation: &CancellationToken::new(),
                 now: &now,
             };
 
@@ -2136,6 +2488,7 @@ mod tests {
             operation_id: &operation_id,
             lease_token: b"cooperative-token",
             execution_deadline_ms: NOW + 100,
+            cancellation: &CancellationToken::new(),
             now: &now,
         };
 
@@ -6987,6 +7340,98 @@ mod tests {
                 .unwrap(),
             "staging"
         );
+    }
+
+    #[test]
+    fn guardian_cancels_the_dispatch_token_when_cancellation_is_requested() {
+        const LEASE_DURATION_MS: i64 = 200;
+        const RENEWAL_MARGIN_MS: i64 = 150;
+
+        struct CancellationAwareDispatcher {
+            started: mpsc::SyncSender<()>,
+        }
+
+        impl OperationDispatcher for CancellationAwareDispatcher {
+            fn dispatch(
+                &mut self,
+                _work: &RunnerWork,
+                control: &mut ExecutionControl<'_>,
+            ) -> DispatchOutcome {
+                let cancellation = control.cancellation_token().clone();
+                self.started.send(()).expect("dispatcher start signal");
+                let timeout = std::time::Instant::now() + Duration::from_secs(5);
+                while !cancellation.is_cancelled() {
+                    assert!(
+                        std::time::Instant::now() < timeout,
+                        "guardian did not cancel the dispatch token"
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                DispatchOutcome::Cancelled
+            }
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let config = config(root.path());
+        let repository = LogicalRepositoryId::parse(config.logical_repository_id()).unwrap();
+        let submitted_at_ms = system_now_ms().unwrap();
+        let deadline_ms = submitted_at_ms + 10_000;
+        let mut journal = OperationJournal::open(&config).unwrap();
+        let operation_id = journal
+            .submit(
+                &SubmitRequest::new(
+                    &config,
+                    OperationKind::ScanSubmit,
+                    &json!({"guardian_cancellation": true}),
+                    b"guardian-cancellation-token",
+                    deadline_ms,
+                )
+                .unwrap(),
+                submitted_at_ms,
+            )
+            .unwrap()
+            .operation_id()
+            .clone();
+        drop(journal);
+
+        let (dispatch_started, wait_for_dispatch) = mpsc::sync_channel(0);
+        let (guardian_events, _wait_for_guardian) = mpsc::channel();
+        let runner = OperationRunner::new(
+            RunnerStartupConfig::new(config.clone()).unwrap(),
+            CancellationAwareDispatcher {
+                started: dispatch_started,
+            },
+        )
+        .with_lease_timing_for_test(LEASE_DURATION_MS, RENEWAL_MARGIN_MS, guardian_events);
+        let runner_thread = std::thread::spawn(move || runner.run_until_idle());
+        wait_for_dispatch
+            .recv_timeout(Duration::from_secs(5))
+            .expect("dispatcher starts");
+
+        let mut journal = OperationJournal::open(&config).unwrap();
+        journal
+            .cancel(
+                &repository,
+                &operation_id,
+                &CapabilitySet::new([
+                    depgraph_mcp_tools::AgentCapability::Read,
+                    depgraph_mcp_tools::AgentCapability::StoreWrite,
+                ])
+                .unwrap(),
+                system_now_ms().unwrap(),
+            )
+            .unwrap();
+
+        let report = runner_thread.join().unwrap().unwrap();
+        assert_eq!(report.claimed(), 1);
+        assert_eq!(report.cancelled(), 1);
+        assert_eq!(report.completed(), 0);
+        assert!(matches!(
+            journal
+                .result(&repository, &operation_id, system_now_ms().unwrap())
+                .unwrap(),
+            OperationOutcome::Cancelled
+        ));
     }
 
     #[test]
