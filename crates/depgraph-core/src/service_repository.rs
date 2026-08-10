@@ -2134,6 +2134,18 @@ fn rename_unix_at_no_replace(
 }
 
 #[cfg(unix)]
+fn unix_stat_device_namespace(metadata: &libc::stat) -> DepgraphServiceResult<u64> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        Ok(metadata.st_dev)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        u64::try_from(metadata.st_dev).map_err(|_| DepgraphServiceError::Integrity)
+    }
+}
+
+#[cfg(unix)]
 fn classify_unix_publication_target(
     parent: &File,
     name: &OsStr,
@@ -2168,7 +2180,7 @@ fn classify_unix_publication_target(
         libc::S_IFREG if overwrite == RepositoryOverwritePolicy::Overwrite => {
             Ok(UnixPublicationTarget::Regular {
                 identity: RepositoryFileIdentity {
-                    namespace: metadata.st_dev as u64,
+                    namespace: unix_stat_device_namespace(&metadata)?,
                     object: metadata.st_ino,
                 },
                 mode: metadata.st_mode & 0o777,
@@ -2227,7 +2239,7 @@ fn unix_entry_identity(
     // SAFETY: a successful fstatat call initialized the complete structure.
     let metadata = unsafe { metadata.assume_init() };
     Ok(Some(RepositoryFileIdentity {
-        namespace: metadata.st_dev as u64,
+        namespace: unix_stat_device_namespace(&metadata)?,
         object: metadata.st_ino,
     }))
 }
