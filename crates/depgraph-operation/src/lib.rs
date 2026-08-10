@@ -1601,6 +1601,19 @@ impl OperationJournal {
         now_ms: i64,
     ) -> Result<SubmitOutcome, JournalError> {
         validate_timestamp(now_ms)?;
+        self.submit_with_clock(request, || now_ms)
+    }
+
+    /// Atomically create or resolve an idempotent operation, sampling the
+    /// supplied clock only after the IMMEDIATE transaction owns its snapshot.
+    pub fn submit_with_clock<F>(
+        &mut self,
+        request: &SubmitRequest,
+        now_ms: F,
+    ) -> Result<SubmitOutcome, JournalError>
+    where
+        F: FnOnce() -> i64,
+    {
         self.validate_submit_request(request)?;
         let required_capabilities_json = request.required_capabilities.canonical_json()?;
         let repository_id = self.repository_id.clone();
@@ -1610,6 +1623,8 @@ impl OperationJournal {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         validate_transaction_root(&transaction, &root_seal)?;
+        let now_ms = now_ms();
+        validate_timestamp(now_ms)?;
         validate_submit_request_authority(
             request,
             &repository_id,
@@ -1732,9 +1747,25 @@ impl OperationJournal {
         now_ms: i64,
     ) -> Result<OperationRecord, JournalError> {
         validate_timestamp(now_ms)?;
+        self.get_with_clock(repository_id, operation_id, || now_ms)
+    }
+
+    /// Read one operation using a timestamp sampled after the transaction has
+    /// fixed its SQLite snapshot.
+    pub fn get_with_clock<F>(
+        &self,
+        repository_id: &LogicalRepositoryId,
+        operation_id: &OperationId,
+        now_ms: F,
+    ) -> Result<OperationRecord, JournalError>
+    where
+        F: FnOnce() -> i64,
+    {
         self.validate_requested_repository(repository_id)?;
         let transaction = self.connection.unchecked_transaction()?;
         self.validate_transaction_root(&transaction)?;
+        let now_ms = now_ms();
+        validate_timestamp(now_ms)?;
         let record = load_record_or_tombstone(&transaction, repository_id, operation_id, now_ms)?;
         self.validate_record_repository(&record)?;
         commit_authorized(transaction, &self.repository_root_seal)?;
@@ -1885,7 +1916,23 @@ impl OperationJournal {
         current_capabilities: &CapabilitySet,
         now_ms: i64,
     ) -> Result<CancelOutcome, JournalError> {
-        self.cancel_if(
+        validate_timestamp(now_ms)?;
+        self.cancel_with_clock(repository_id, operation_id, current_capabilities, || now_ms)
+    }
+
+    /// Cancel using a timestamp sampled after the IMMEDIATE transaction owns
+    /// its validated snapshot.
+    pub fn cancel_with_clock<C>(
+        &mut self,
+        repository_id: &LogicalRepositoryId,
+        operation_id: &OperationId,
+        current_capabilities: &CapabilitySet,
+        now_ms: C,
+    ) -> Result<CancelOutcome, JournalError>
+    where
+        C: FnOnce() -> i64,
+    {
+        self.cancel_if_with_clock(
             repository_id,
             operation_id,
             current_capabilities,
@@ -1908,6 +1955,29 @@ impl OperationJournal {
         F: FnOnce() -> bool,
     {
         validate_timestamp(now_ms)?;
+        self.cancel_if_with_clock(
+            repository_id,
+            operation_id,
+            current_capabilities,
+            || now_ms,
+            should_commit,
+        )
+    }
+
+    /// Conditionally cancel with both the clock and final mutation predicate
+    /// evaluated at the journal transaction boundary.
+    pub fn cancel_if_with_clock<C, F>(
+        &mut self,
+        repository_id: &LogicalRepositoryId,
+        operation_id: &OperationId,
+        current_capabilities: &CapabilitySet,
+        now_ms: C,
+        should_commit: F,
+    ) -> Result<CancelOutcome, JournalError>
+    where
+        C: FnOnce() -> i64,
+        F: FnOnce() -> bool,
+    {
         self.validate_requested_repository(repository_id)?;
         let enabled_capabilities = self.enabled_capabilities.clone();
         let root_seal = self.repository_root_seal.clone();
@@ -1915,6 +1985,8 @@ impl OperationJournal {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         validate_transaction_root(&transaction, &root_seal)?;
+        let now_ms = now_ms();
+        validate_timestamp(now_ms)?;
         let record = load_active_record(&transaction, repository_id, operation_id, now_ms)?;
         if !enabled_capabilities.contains_all(&record.required_capabilities)
             || !current_capabilities.contains_all(&record.required_capabilities)
@@ -1965,6 +2037,26 @@ impl OperationJournal {
         now_ms: i64,
     ) -> Result<CancelOutcome, JournalError> {
         validate_timestamp(now_ms)?;
+        self.cancel_before_launch_with_clock(
+            repository_id,
+            operation_id,
+            current_capabilities,
+            || now_ms,
+        )
+    }
+
+    /// Arbitrate pre-launch cancellation using a timestamp sampled after the
+    /// IMMEDIATE transaction owns its validated snapshot.
+    pub fn cancel_before_launch_with_clock<C>(
+        &mut self,
+        repository_id: &LogicalRepositoryId,
+        operation_id: &OperationId,
+        current_capabilities: &CapabilitySet,
+        now_ms: C,
+    ) -> Result<CancelOutcome, JournalError>
+    where
+        C: FnOnce() -> i64,
+    {
         self.validate_requested_repository(repository_id)?;
         let enabled_capabilities = self.enabled_capabilities.clone();
         let root_seal = self.repository_root_seal.clone();
@@ -1972,6 +2064,8 @@ impl OperationJournal {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         validate_transaction_root(&transaction, &root_seal)?;
+        let now_ms = now_ms();
+        validate_timestamp(now_ms)?;
         let record = load_active_record(&transaction, repository_id, operation_id, now_ms)?;
         if !enabled_capabilities.contains_all(&record.required_capabilities)
             || !current_capabilities.contains_all(&record.required_capabilities)
@@ -3004,6 +3098,25 @@ impl OperationManager {
         now_ms: i64,
     ) -> Result<Option<ExistingSubmissionBinding>, JournalError> {
         validate_timestamp(now_ms)?;
+        Self::existing_submission_binding_read_only_with_clock(
+            config,
+            kind,
+            idempotency_key,
+            || now_ms,
+        )
+    }
+
+    /// Look up an existing binding using a timestamp sampled only after the
+    /// read-only journal has fixed its validated SQLite snapshot.
+    pub fn existing_submission_binding_read_only_with_clock<F>(
+        config: &DepgraphServiceConfig,
+        kind: OperationKind,
+        idempotency_key: impl AsRef<[u8]>,
+        now_ms: F,
+    ) -> Result<Option<ExistingSubmissionBinding>, JournalError>
+    where
+        F: FnOnce() -> i64,
+    {
         let idempotency_key = idempotency_key.as_ref();
         validate_secret_input(idempotency_key, MAX_IDEMPOTENCY_KEY_BYTES)?;
         let root_seal = config.repository_root_seal();
@@ -3030,7 +3143,7 @@ impl OperationManager {
                 root_seal,
             },
         };
-        manager.existing_submission_binding(kind, idempotency_key, now_ms)
+        manager.existing_submission_binding_with_clock(kind, idempotency_key, now_ms)
     }
 
     /// Submit validated normalized work and return only after the operation and
@@ -3040,11 +3153,25 @@ impl OperationManager {
         request: &SubmitRequest,
         now_ms: i64,
     ) -> Result<OperationHandle, JournalError> {
+        validate_timestamp(now_ms)?;
+        self.submit_with_clock(request, || now_ms)
+    }
+
+    /// Submit work using a timestamp sampled after the journal's IMMEDIATE
+    /// transaction has acquired its snapshot.
+    pub fn submit_with_clock<F>(
+        &mut self,
+        request: &SubmitRequest,
+        now_ms: F,
+    ) -> Result<OperationHandle, JournalError>
+    where
+        F: FnOnce() -> i64,
+    {
         self.revalidate_root()?;
         self.validate_submit_request_root(request)?;
         let handle = self
             .journal
-            .submit(request, now_ms)
+            .submit_with_clock(request, now_ms)
             .map(OperationHandle::from_submit_outcome)?;
         self.revalidate_root()?;
         Ok(handle)
@@ -3060,6 +3187,20 @@ impl OperationManager {
         now_ms: i64,
     ) -> Result<Option<ExistingSubmissionBinding>, JournalError> {
         validate_timestamp(now_ms)?;
+        self.existing_submission_binding_with_clock(kind, idempotency_key, || now_ms)
+    }
+
+    /// Resolve an idempotency binding using a timestamp sampled after the
+    /// transaction has fixed its SQLite snapshot.
+    pub fn existing_submission_binding_with_clock<F>(
+        &self,
+        kind: OperationKind,
+        idempotency_key: impl AsRef<[u8]>,
+        now_ms: F,
+    ) -> Result<Option<ExistingSubmissionBinding>, JournalError>
+    where
+        F: FnOnce() -> i64,
+    {
         self.revalidate_root()?;
         let required_capabilities = kind.required_capabilities()?;
         if !self
@@ -3074,6 +3215,8 @@ impl OperationManager {
         let idempotency_key_digest = JournalDigest::sha256(idempotency_key);
         let transaction = self.journal.connection.unchecked_transaction()?;
         validate_transaction_root(&transaction, &self.authority.root_seal)?;
+        let now_ms = now_ms();
+        validate_timestamp(now_ms)?;
         let binding = if let Some(raw) = select_operation_by_scope_for_schema(
             &transaction,
             self.authority.repository_id.as_str(),
@@ -3119,7 +3262,20 @@ impl OperationManager {
         operation_id: &OperationId,
         now_ms: i64,
     ) -> Result<OperationView, JournalError> {
-        let record = self.authorized_read(operation_id, now_ms)?;
+        validate_timestamp(now_ms)?;
+        self.get_with_clock(operation_id, || now_ms)
+    }
+
+    /// Resolve status using a timestamp sampled after the read snapshot is fixed.
+    pub fn get_with_clock<F>(
+        &self,
+        operation_id: &OperationId,
+        now_ms: F,
+    ) -> Result<OperationView, JournalError>
+    where
+        F: FnOnce() -> i64,
+    {
+        let record = self.authorized_read_with_clock(operation_id, now_ms)?;
         let view = OperationView::from_record(&record);
         self.revalidate_root()?;
         Ok(view)
@@ -3132,7 +3288,21 @@ impl OperationManager {
         operation_id: &OperationId,
         now_ms: i64,
     ) -> Result<OperationResultView, JournalError> {
-        let record = self.authorized_read(operation_id, now_ms)?;
+        validate_timestamp(now_ms)?;
+        self.result_with_clock(operation_id, || now_ms)
+    }
+
+    /// Resolve a terminal result using a timestamp sampled after the read
+    /// snapshot is fixed.
+    pub fn result_with_clock<F>(
+        &self,
+        operation_id: &OperationId,
+        now_ms: F,
+    ) -> Result<OperationResultView, JournalError>
+    where
+        F: FnOnce() -> i64,
+    {
+        let record = self.authorized_read_with_clock(operation_id, now_ms)?;
         let operation = OperationView::from_record(&record);
         let operation_kind = record.kind;
         let outcome = terminal_outcome(record)?;
@@ -3151,7 +3321,21 @@ impl OperationManager {
         operation_id: &OperationId,
         now_ms: i64,
     ) -> Result<CancelOutcome, JournalError> {
-        self.cancel_if(operation_id, now_ms, || true)
+        validate_timestamp(now_ms)?;
+        self.cancel_with_clock(operation_id, || now_ms)
+    }
+
+    /// Cancel while sampling the clock separately for the authorization read
+    /// and the mutation transaction snapshots.
+    pub fn cancel_with_clock<C>(
+        &mut self,
+        operation_id: &OperationId,
+        now_ms: C,
+    ) -> Result<CancelOutcome, JournalError>
+    where
+        C: FnMut() -> i64,
+    {
+        self.cancel_if_with_clock(operation_id, now_ms, || true)
     }
 
     /// Record cooperative cancellation only when authorization remains valid
@@ -3165,10 +3349,27 @@ impl OperationManager {
     where
         F: FnOnce() -> bool,
     {
+        validate_timestamp(now_ms)?;
+        self.cancel_if_with_clock(operation_id, || now_ms, should_commit)
+    }
+
+    /// Conditionally cancel while sampling the clock at each journal boundary.
+    pub fn cancel_if_with_clock<C, F>(
+        &mut self,
+        operation_id: &OperationId,
+        mut now_ms: C,
+        should_commit: F,
+    ) -> Result<CancelOutcome, JournalError>
+    where
+        C: FnMut() -> i64,
+        F: FnOnce() -> bool,
+    {
         self.revalidate_root()?;
-        let record = self
-            .journal
-            .get(&self.authority.repository_id, operation_id, now_ms)?;
+        let record = self.journal.get_with_clock(
+            &self.authority.repository_id,
+            operation_id,
+            &mut now_ms,
+        )?;
         if !self
             .authority
             .capabilities
@@ -3176,7 +3377,7 @@ impl OperationManager {
         {
             return Err(JournalError::CapabilityDenied);
         }
-        let outcome = self.journal.cancel_if(
+        let outcome = self.journal.cancel_if_with_clock(
             &self.authority.repository_id,
             operation_id,
             &self.authority.capabilities,
@@ -3194,8 +3395,22 @@ impl OperationManager {
         operation_id: &OperationId,
         now_ms: i64,
     ) -> Result<CancelOutcome, JournalError> {
+        validate_timestamp(now_ms)?;
+        self.cancel_before_launch_with_clock(operation_id, || now_ms)
+    }
+
+    /// Arbitrate pre-launch cancellation with transaction-scoped clock
+    /// sampling.
+    pub fn cancel_before_launch_with_clock<C>(
+        &mut self,
+        operation_id: &OperationId,
+        now_ms: C,
+    ) -> Result<CancelOutcome, JournalError>
+    where
+        C: FnOnce() -> i64,
+    {
         self.revalidate_root()?;
-        let outcome = self.journal.cancel_before_launch(
+        let outcome = self.journal.cancel_before_launch_with_clock(
             &self.authority.repository_id,
             operation_id,
             &self.authority.capabilities,
@@ -3205,18 +3420,21 @@ impl OperationManager {
         Ok(outcome)
     }
 
-    fn authorized_read(
+    fn authorized_read_with_clock<F>(
         &self,
         operation_id: &OperationId,
-        now_ms: i64,
-    ) -> Result<OperationRecord, JournalError> {
+        now_ms: F,
+    ) -> Result<OperationRecord, JournalError>
+    where
+        F: FnOnce() -> i64,
+    {
         self.revalidate_root()?;
         if !self.authority.capabilities.contains(AgentCapability::Read) {
             return Err(JournalError::CapabilityDenied);
         }
-        let record = self
-            .journal
-            .get(&self.authority.repository_id, operation_id, now_ms)?;
+        let record =
+            self.journal
+                .get_with_clock(&self.authority.repository_id, operation_id, now_ms)?;
         self.revalidate_root()?;
         Ok(record)
     }

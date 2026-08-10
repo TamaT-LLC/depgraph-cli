@@ -171,6 +171,11 @@ durable toolをsubmitするとき、serverは応答前に次を一つのtransact
 `taskId == operation_id`を必須とし、二つのIDを結ぶmutable mappingは作らない。
 同じrepository、tool、capability、normalized input、idempotency keyのretryは同じ
 recordとIDを返す。keyを異なるinputへ再利用した場合は`IDEMPOTENCY_CONFLICT`で拒否する。
+status/result/idempotency lookup、submit、cancelのfuture-record検証に使うwall clockは、
+SQLite read snapshotまたは`IMMEDIATE` mutation transactionを確定した後にsampleする。
+これによりrequest開始後の正当なrunner更新をfuture corruptionと誤認しない一方、clock取得に
+失敗した場合はrequest開始時のsampleへfallbackしてfail closedとし、future-record検証自体は
+無効化しない。
 
 ### Baseline tools
 

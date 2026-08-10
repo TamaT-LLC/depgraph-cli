@@ -1374,7 +1374,7 @@ fn task_get(
     let now_ms = system_now_ms().map_err(|_| McpError::internal_error("clock failure", None))?;
     let manager = OperationManager::open(config).map_err(task_journal_error)?;
     let operation = manager
-        .get(&operation_id, now_ms)
+        .get_with_clock(&operation_id, || system_now_ms().unwrap_or(now_ms))
         .map_err(task_journal_error)?;
     let payload = match operation.status() {
         OperationStatus::Queued | OperationStatus::Running | OperationStatus::Cancelling => {
@@ -1383,7 +1383,7 @@ fn task_get(
         OperationStatus::Cancelled => TaskPayload::Cancelled,
         OperationStatus::Completed | OperationStatus::Failed => {
             let terminal = manager
-                .result(&operation_id, now_ms)
+                .result_with_clock(&operation_id, || system_now_ms().unwrap_or(now_ms))
                 .map_err(task_journal_error)?;
             let mapped = map_terminal_operation_result(repository_id, &terminal)
                 .map_err(task_mapping_error)?;
@@ -1412,7 +1412,11 @@ fn task_cancel(
         return Err(task_request_cancelled());
     }
     manager
-        .cancel_if(&operation_id, now_ms, || !cancellation.is_cancelled())
+        .cancel_if_with_clock(
+            &operation_id,
+            || system_now_ms().unwrap_or(now_ms),
+            || !cancellation.is_cancelled(),
+        )
         .map_err(task_journal_error)?;
     Ok(())
 }
@@ -1760,11 +1764,11 @@ fn existing_export_file_submission_input(
     idempotency_key: &IdempotencyKey,
 ) -> Result<Option<serde_json::Value>, ToolExecutionFailure> {
     let now_ms = system_now_ms()?;
-    OperationManager::existing_submission_binding_read_only(
+    OperationManager::existing_submission_binding_read_only_with_clock(
         config,
         OperationKind::ExportFile,
         idempotency_key.as_str().as_bytes(),
-        now_ms,
+        || system_now_ms().unwrap_or(now_ms),
     )
     .map_err(|error| ToolExecutionFailure::Journal {
         error,
@@ -1870,11 +1874,11 @@ fn existing_runtime_import_submission_input(
     idempotency_key: &IdempotencyKey,
 ) -> Result<Option<serde_json::Value>, ToolExecutionFailure> {
     let now_ms = system_now_ms()?;
-    OperationManager::existing_submission_binding_read_only(
+    OperationManager::existing_submission_binding_read_only_with_clock(
         config,
         OperationKind::RuntimeTraceImportSubmit,
         idempotency_key.as_str().as_bytes(),
-        now_ms,
+        || system_now_ms().unwrap_or(now_ms),
     )
     .map_err(|error| ToolExecutionFailure::Journal {
         error,
@@ -2087,13 +2091,12 @@ fn submit_durable_operation(
             error,
             operation_id: None,
         })?;
-    let handle =
-        manager
-            .submit(&request, now_ms)
-            .map_err(|error| ToolExecutionFailure::Journal {
-                error,
-                operation_id: None,
-            })?;
+    let handle = manager
+        .submit_with_clock(&request, || system_now_ms().unwrap_or(now_ms))
+        .map_err(|error| ToolExecutionFailure::Journal {
+            error,
+            operation_id: None,
+        })?;
 
     // A fresh manager proves that the committed operation/handoff is already
     // reconnect-visible before the transport receives its durable identity.
@@ -2103,7 +2106,7 @@ fn submit_durable_operation(
             operation_id: Some(handle.operation_id().clone()),
         })?;
     let visible = observer
-        .get(handle.operation_id(), now_ms)
+        .get_with_clock(handle.operation_id(), || system_now_ms().unwrap_or(now_ms))
         .map_err(|error| ToolExecutionFailure::Journal {
             error,
             operation_id: Some(handle.operation_id().clone()),
@@ -2144,8 +2147,11 @@ fn handoff_submitted_scan(
         // A replay observes pre-existing durable work; cancelling the transport
         // retry must not mutate that operation.
         if handle.created() {
+            let now_ms = system_now_ms()?;
             manager
-                .cancel_before_launch(handle.operation_id(), system_now_ms()?)
+                .cancel_before_launch_with_clock(handle.operation_id(), || {
+                    system_now_ms().unwrap_or(now_ms)
+                })
                 .map_err(|error| ToolExecutionFailure::Journal {
                     error,
                     operation_id: Some(handle.operation_id().clone()),
@@ -2162,8 +2168,11 @@ fn handoff_submitted_scan(
             // handed off and its ID will not reach the client. Terminalize it
             // so a later runner cannot claim and execute orphaned work.
             if handle.created() {
+                let now_ms = system_now_ms()?;
                 manager
-                    .cancel_before_launch(handle.operation_id(), system_now_ms()?)
+                    .cancel_before_launch_with_clock(handle.operation_id(), || {
+                        system_now_ms().unwrap_or(now_ms)
+                    })
                     .map_err(|journal_error| ToolExecutionFailure::Journal {
                         error: journal_error,
                         operation_id: Some(handle.operation_id().clone()),
@@ -2249,24 +2258,24 @@ fn execute_operation_tool(
         "operation_get" => {
             let manager = OperationManager::open(config).map_err(&journal_failure)?;
             let operation = manager
-                .get(&operation_id, now_ms)
+                .get_with_clock(&operation_id, || system_now_ms().unwrap_or(now_ms))
                 .map_err(&journal_failure)?;
             map_operation_success(repository_id, &operation)
         }
         "operation_result" => {
             let manager = OperationManager::open(config).map_err(&journal_failure)?;
             let result = manager
-                .result(&operation_id, now_ms)
+                .result_with_clock(&operation_id, || system_now_ms().unwrap_or(now_ms))
                 .map_err(&journal_failure)?;
             map_terminal_operation_result(repository_id, &result)
         }
         "operation_cancel" => {
             let mut manager = OperationManager::open(config).map_err(&journal_failure)?;
             manager
-                .cancel(&operation_id, now_ms)
+                .cancel_with_clock(&operation_id, || system_now_ms().unwrap_or(now_ms))
                 .map_err(&journal_failure)?;
             let operation = manager
-                .get(&operation_id, now_ms)
+                .get_with_clock(&operation_id, || system_now_ms().unwrap_or(now_ms))
                 .map_err(&journal_failure)?;
             map_operation_success(repository_id, &operation)
         }

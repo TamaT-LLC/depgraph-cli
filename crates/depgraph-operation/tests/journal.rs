@@ -4,8 +4,10 @@ use std::{
     sync::{
         Arc, Barrier,
         atomic::{AtomicBool, Ordering},
+        mpsc,
     },
     thread,
+    time::Duration,
 };
 
 use depgraph_core::{
@@ -123,6 +125,16 @@ fn journal() -> (TempDir, PathBuf, DepgraphServiceConfig, OperationJournal) {
     let config = service_config(root.path(), &graph_store);
     let journal = OperationJournal::open(&config).unwrap();
     (root, graph_store, config, journal)
+}
+
+fn clock_sampled_while_write_locked<T>(receiver: &mpsc::Receiver<T>) -> bool {
+    match receiver.recv_timeout(Duration::from_millis(500)) {
+        Ok(_) => true,
+        Err(mpsc::RecvTimeoutError::Timeout) => false,
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            panic!("clock observer disconnected while the SQLite write lock was held")
+        }
+    }
 }
 
 fn downgrade_current_journal_to_genuine_v3(path: &Path) {
@@ -975,6 +987,232 @@ fn read_only_submission_lookup_validates_genuine_v2_and_v3_before_writable_migra
             JOURNAL_SCHEMA_VERSION
         );
     }
+}
+
+#[test]
+fn transaction_scoped_clock_read_only_lookup_uses_the_snapshot_fixed_before_callback() {
+    let (_root, _graph_store, config, mut journal) = journal();
+    let key = b"read-only-lookup-concurrent-update";
+    let input = json!({"concurrent": "read-only-lookup"});
+    let operation_id = journal
+        .submit(&request(&config, input.clone(), key, DEADLINE), NOW)
+        .unwrap()
+        .operation_id()
+        .clone();
+    let mut concurrent_writer = OperationJournal::open(&config).unwrap();
+
+    let binding = OperationManager::existing_submission_binding_read_only_with_clock(
+        &config,
+        kind(),
+        key,
+        || {
+            concurrent_writer
+                .acquire_lease(
+                    &repository(),
+                    &operation_id,
+                    &LeaseOwner::parse("concurrent-read-only-runner").unwrap(),
+                    b"concurrent-read-only-lease",
+                    NOW + 2,
+                    DEADLINE - 1,
+                )
+                .unwrap();
+            NOW + 1
+        },
+    )
+    .unwrap()
+    .unwrap();
+
+    assert_eq!(binding.normalized_input().value(), &input);
+    assert_eq!(
+        journal
+            .get(&repository(), &operation_id, NOW + 3)
+            .unwrap()
+            .status(),
+        OperationStatus::Running
+    );
+}
+
+#[test]
+fn transaction_scoped_clock_idempotent_submit_waits_for_the_immediate_transaction() {
+    let (_root, _graph_store, config, mut journal) = journal();
+    let key = b"submit-concurrent-update";
+    let input = json!({"concurrent": "submit"});
+    let submit_request = request(&config, input, key, DEADLINE);
+    let operation_id = journal
+        .submit(&submit_request, NOW)
+        .unwrap()
+        .operation_id()
+        .clone();
+    journal
+        .acquire_lease(
+            &repository(),
+            &operation_id,
+            &LeaseOwner::parse("concurrent-submit-runner").unwrap(),
+            b"concurrent-submit-lease",
+            NOW + 1,
+            DEADLINE - 1,
+        )
+        .unwrap();
+    let journal_path = journal.path().to_path_buf();
+    drop(journal);
+    let mut manager = OperationManager::open(&config).unwrap();
+    let write_lock = Connection::open(journal_path).unwrap();
+    write_lock.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let (started_sender, started_receiver) = mpsc::channel();
+    let (clock_sender, clock_receiver) = mpsc::channel();
+
+    let submit = thread::spawn(move || {
+        started_sender.send(()).unwrap();
+        manager.submit_with_clock(&submit_request, || {
+            clock_sender.send(()).unwrap();
+            NOW + 2
+        })
+    });
+    started_receiver
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap();
+    let sampled_while_locked = clock_sampled_while_write_locked(&clock_receiver);
+    write_lock.execute_batch("COMMIT").unwrap();
+    let replay = submit.join().unwrap().unwrap();
+
+    assert!(!sampled_while_locked);
+    assert!(!replay.created());
+    assert_eq!(replay.operation_id(), &operation_id);
+}
+
+#[test]
+fn transaction_scoped_clock_manager_cancel_samples_each_transaction_after_its_boundary() {
+    let (_root, _graph_store, config, mut journal) = journal();
+    let operation_id = journal
+        .submit(
+            &request(
+                &config,
+                json!({"concurrent": "cancel"}),
+                b"cancel-concurrent-update",
+                DEADLINE,
+            ),
+            NOW,
+        )
+        .unwrap()
+        .operation_id()
+        .clone();
+    journal
+        .acquire_lease(
+            &repository(),
+            &operation_id,
+            &LeaseOwner::parse("concurrent-cancel-runner").unwrap(),
+            b"concurrent-cancel-lease",
+            NOW + 1,
+            DEADLINE - 1,
+        )
+        .unwrap();
+    let journal_path = journal.path().to_path_buf();
+    drop(journal);
+    let mut manager = OperationManager::open(&config).unwrap();
+    let mut concurrent_writer = OperationJournal::open(&config).unwrap();
+    let (lock_sender, lock_receiver) = mpsc::channel();
+    let (locked_sender, locked_receiver) = mpsc::channel();
+    let (release_sender, release_receiver) = mpsc::channel();
+    let blocker = thread::spawn(move || {
+        lock_receiver.recv().unwrap();
+        let write_lock = Connection::open(journal_path).unwrap();
+        write_lock.execute_batch("BEGIN IMMEDIATE").unwrap();
+        locked_sender.send(()).unwrap();
+        release_receiver.recv().unwrap();
+        write_lock.execute_batch("COMMIT").unwrap();
+    });
+    let (clock_sender, clock_receiver) = mpsc::channel();
+
+    let cancel = thread::spawn(move || {
+        let mut samples = 0_i64;
+        manager.cancel_with_clock(&operation_id, || {
+            samples += 1;
+            if samples == 1 {
+                concurrent_writer
+                    .renew_lease(
+                        &repository(),
+                        &operation_id,
+                        b"concurrent-cancel-lease",
+                        NOW + 3,
+                        DEADLINE - 1,
+                    )
+                    .unwrap();
+                lock_sender.send(()).unwrap();
+                locked_receiver
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap();
+            }
+            clock_sender.send(samples).unwrap();
+            NOW + 1 + samples
+        })
+    });
+    assert_eq!(
+        clock_receiver.recv_timeout(Duration::from_secs(5)).unwrap(),
+        1
+    );
+    let second_sampled_while_locked = clock_sampled_while_write_locked(&clock_receiver);
+    release_sender.send(()).unwrap();
+    blocker.join().unwrap();
+    assert_eq!(
+        clock_receiver.recv_timeout(Duration::from_secs(5)).unwrap(),
+        2
+    );
+    let outcome = cancel.join().unwrap().unwrap();
+
+    assert!(!second_sampled_while_locked);
+    assert_eq!(outcome, CancelOutcome::Requested);
+}
+
+#[test]
+fn transaction_scoped_clock_prelaunch_cancel_waits_for_the_immediate_transaction() {
+    let (_root, _graph_store, config, mut journal) = journal();
+    let operation_id = journal
+        .submit(
+            &request(
+                &config,
+                json!({"concurrent": "prelaunch-cancel"}),
+                b"prelaunch-cancel-concurrent-claim",
+                DEADLINE,
+            ),
+            NOW,
+        )
+        .unwrap()
+        .operation_id()
+        .clone();
+    journal
+        .acquire_lease(
+            &repository(),
+            &operation_id,
+            &LeaseOwner::parse("concurrent-prelaunch-runner").unwrap(),
+            b"concurrent-prelaunch-lease",
+            NOW + 1,
+            DEADLINE - 1,
+        )
+        .unwrap();
+    let journal_path = journal.path().to_path_buf();
+    drop(journal);
+    let mut manager = OperationManager::open(&config).unwrap();
+    let write_lock = Connection::open(journal_path).unwrap();
+    write_lock.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let (started_sender, started_receiver) = mpsc::channel();
+    let (clock_sender, clock_receiver) = mpsc::channel();
+
+    let cancel = thread::spawn(move || {
+        started_sender.send(()).unwrap();
+        manager.cancel_before_launch_with_clock(&operation_id, || {
+            clock_sender.send(()).unwrap();
+            NOW + 2
+        })
+    });
+    started_receiver
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap();
+    let sampled_while_locked = clock_sampled_while_write_locked(&clock_receiver);
+    write_lock.execute_batch("COMMIT").unwrap();
+    let outcome = cancel.join().unwrap().unwrap();
+
+    assert!(!sampled_while_locked);
+    assert_eq!(outcome, CancelOutcome::Requested);
 }
 
 #[test]
